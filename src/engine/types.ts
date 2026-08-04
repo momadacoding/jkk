@@ -1,3 +1,11 @@
+export interface Worktree {
+  name: string
+  path: string
+  head: string
+  branch: string
+  isMain: boolean
+}
+
 export interface RepoInfo {
   path: string
   head: string

@@ -52,6 +52,20 @@ fn read_diff_for_workdir() {
 }
 
 #[test]
+fn create_and_read_worktree() {
+    let dir = linear_repo();
+    let wt_dir = dir.path().parent().unwrap().join("wt");
+    let status = std::process::Command::new("git")
+        .current_dir(dir.path())
+        .args(["worktree", "add", wt_dir.to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let wts = engine::worktree::read_worktrees(dir.path().to_str().unwrap()).unwrap();
+    assert_eq!(wts.len(), 2);
+}
+
+#[test]
 fn open_invalid_repo_fails() {
     let dir = TempDir::new().unwrap();
     let result = engine::repo::open(dir.path().to_str().unwrap());
