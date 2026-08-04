@@ -1,4 +1,5 @@
-import type { CommitNode, RefPointer } from './types'
+import type { CommitNode } from './types'
+export type { RefPointer } from './types'
 
 export interface LayoutNode {
   commit: CommitNode

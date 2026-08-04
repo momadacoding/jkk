@@ -24,6 +24,8 @@ log = "0.4"
 tauri = { version = "2.11.3", features = [] }
 tauri-plugin-log = "2"
 git2 = "0.20"
+notify = "7"
+tauri-plugin-dialog = "2.7.2"
 
 [dev-dependencies]
 tempfile = "3.14"

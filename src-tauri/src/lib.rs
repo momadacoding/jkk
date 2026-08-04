@@ -5,6 +5,7 @@ pub mod error;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
+    .plugin(tauri_plugin_dialog::init())
     .setup(|app| {
       if cfg!(debug_assertions) {
         app.handle().plugin(
@@ -27,6 +28,9 @@ pub fn run() {
       commands::ops::stage,
       commands::ops::unstage,
       commands::repo::open_repo,
+      commands::repo::repo_state,
+      commands::watch::unwatch_repo,
+      commands::watch::watch_repo,
       commands::worktree::create_worktree,
       commands::worktree::delete_worktree,
       commands::worktree::read_worktrees_cmd,

@@ -11,7 +11,7 @@ export function createSvgRenderer(): GraphRenderer {
 
       return (
         <svg width={width} height={height} className="graph-svg">
-          {layout.paths.map((path) => renderPath(path, layout.rowHeight))}
+          {layout.paths.map((path) => renderPath(path))}
           {layout.rows.map((node) => renderNode(node, layout, refByHash[node.commit.id] ?? [], selectedId === node.commit.id))}
         </svg>
       )
@@ -27,7 +27,7 @@ function groupRefs(refs: RefPointer[]): Record<string, RefPointer[]> {
   return map
 }
 
-function renderPath(path: LanePath, rowHeight: number): ReactNode {
+function renderPath(path: LanePath): ReactNode {
   let d = ''
   for (const s of path.segments) {
     if (s.curve) {
@@ -40,7 +40,7 @@ function renderPath(path: LanePath, rowHeight: number): ReactNode {
   return <path key={path.id} d={d} stroke={path.color} fill="none" strokeWidth={2} />
 }
 
-function renderNode(node: LayoutNode, layout: GraphLayout, refs: RefPointer[], selected: boolean): ReactNode {
+function renderNode(node: LayoutNode, layout: GraphLayout, _refs: RefPointer[], selected: boolean): ReactNode {
   const cx = node.lane * layout.laneWidth + layout.laneWidth / 2
   const cy = node.row * layout.rowHeight + layout.rowHeight / 2
   const r = 5

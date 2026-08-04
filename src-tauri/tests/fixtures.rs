@@ -54,7 +54,7 @@ fn read_diff_for_workdir() {
 #[test]
 fn create_and_read_worktree() {
     let dir = linear_repo();
-    let wt_dir = dir.path().parent().unwrap().join("wt");
+    let wt_dir = dir.path().join("wt");
     let status = std::process::Command::new("git")
         .current_dir(dir.path())
         .args(["worktree", "add", wt_dir.to_str().unwrap()])

@@ -40,8 +40,8 @@ export function StagingView(props: StagingViewProps) {
   return (
     <div className="staging-view">
       <div className="staging-sidebar">
-        <FileList title="Unstaged" files={props.status.unstaged} onToggle={props.onStage} selected={props.selectedFile} onSelect={props.onSelectFile} />
-        <FileList title="Staged" files={props.status.staged} onToggle={props.onUnstage} selected={props.selectedFile} onSelect={props.onSelectFile} />
+        <FileList title="Unstaged" files={props.status.unstaged} onToggle={(path) => props.onStage([path])} selected={props.selectedFile} onSelect={props.onSelectFile} />
+        <FileList title="Staged" files={props.status.staged} onToggle={(path) => props.onUnstage([path])} selected={props.selectedFile} onSelect={props.onSelectFile} />
         <div className="commit-box">
           <textarea value={message} onChange={(e) => setMessage(e.target.value)} placeholder="Commit message" />
           <label><input type="checkbox" checked={amend} onChange={(e) => setAmend(e.target.checked)} /> Amend</label>

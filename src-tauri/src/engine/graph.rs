@@ -30,6 +30,7 @@ pub fn load(path: &str) -> Result<GraphData> {
     }
 
     let mut commits = Vec::new();
+    let limit = 5000;
     for oid in walk {
         let oid = oid?;
         let commit = repo.find_commit(oid)?;
@@ -40,6 +41,9 @@ pub fn load(path: &str) -> Result<GraphData> {
             time: commit.time().seconds(),
             message: commit.summary().unwrap_or("").to_string(),
         });
+        if commits.len() >= limit {
+            break;
+        }
     }
 
     if commits.is_empty() {
