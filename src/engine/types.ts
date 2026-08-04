@@ -21,3 +21,35 @@ export interface GraphData {
   commits: CommitNode[]
   refs: RefPointer[]
 }
+
+export interface FileChange {
+  path: string
+  status: 'modified' | 'added' | 'deleted' | 'renamed'
+  additions: number
+  deletions: number
+}
+
+export interface StatusData {
+  staged: FileChange[]
+  unstaged: FileChange[]
+}
+
+export interface DiffLine {
+  origin: '+' | '-' | ' '
+  content: string
+}
+
+export interface DiffHunk {
+  oldStart: number
+  newStart: number
+  lines: DiffLine[]
+}
+
+export interface FileDiff {
+  path: string
+  hunks: DiffHunk[]
+}
+
+export interface DiffData {
+  files: FileDiff[]
+}

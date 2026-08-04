@@ -35,6 +35,23 @@ fn load_linear_graph() {
 }
 
 #[test]
+fn read_status_detects_unstaged() {
+    let dir = linear_repo();
+    fs::write(dir.path().join("a.txt"), "changed").unwrap();
+    let status = engine::diff::read_status(dir.path().to_str().unwrap()).unwrap();
+    assert_eq!(status.unstaged.len(), 1);
+    assert_eq!(status.unstaged[0].status, "modified");
+}
+
+#[test]
+fn read_diff_for_workdir() {
+    let dir = linear_repo();
+    fs::write(dir.path().join("a.txt"), "changed").unwrap();
+    let diff = engine::diff::read_diff(dir.path().to_str().unwrap(), "workdir".to_string()).unwrap();
+    assert_eq!(diff.files.len(), 1);
+}
+
+#[test]
 fn open_invalid_repo_fails() {
     let dir = TempDir::new().unwrap();
     let result = engine::repo::open(dir.path().to_str().unwrap());
