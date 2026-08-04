@@ -2,7 +2,7 @@ use crate::error::{GitError, Result};
 use git2::Repository;
 use serde::Serialize;
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct RepoInfo {
     pub path: String,
     pub head: String,
