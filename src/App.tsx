@@ -1,166 +1,79 @@
-import { useCallback, useEffect, useState } from 'react'
-import { invoke } from '@tauri-apps/api/core'
+import { useCallback, useRef, useState } from 'react'
 import { open } from '@tauri-apps/plugin-dialog'
-import { Panel, Group, Separator } from 'react-resizable-panels'
-import { GraphView } from './components/GraphView'
-import { BranchView } from './components/BranchView'
-import { WorktreeView } from './components/WorktreeView'
-import { CommitDetailView } from './components/CommitDetailView'
-import { LocalChangesView } from './components/LocalChangesView'
-import { useRepoStore, useRepoEffects } from './store/repoStore'
+import { RepoTab } from './components/RepoTab'
+import { TabBar, type RepoTabInfo } from './components/TabBar'
+import { samePath } from './engine/path'
 import './styles.css'
 
 const DEFAULT_REPO_PATH = 'C:\\Users\\liuhao\\workspace\\dev\\Dev\\mygitclient'
-type ViewMode = 'commits' | 'changes'
-
-function LocalChangesIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.2">
-      <path d="M3.5 1.5h6l3 3v10h-9z" />
-      <path d="M8 7v4M6 9h4" />
-    </svg>
-  )
-}
-
-function AllCommitsIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.2">
-      <circle cx="5" cy="4" r="1.6" />
-      <circle cx="5" cy="12" r="1.6" />
-      <path d="M5 5.6v4.8M5 4h6" />
-    </svg>
-  )
-}
-
-function SidebarNav({ mode, changeCount, onChange }: { mode: ViewMode; changeCount: number; onChange: (m: ViewMode) => void }) {
-  return (
-    <div className="sidebar-nav">
-      <div
-        className={mode === 'changes' ? 'sidebar-nav-item selected' : 'sidebar-nav-item'}
-        onClick={() => onChange('changes')}
-      >
-        <LocalChangesIcon />
-        <span>Local Changes{changeCount > 0 ? ` (${changeCount})` : ''}</span>
-      </div>
-      <div
-        className={mode === 'commits' ? 'sidebar-nav-item selected' : 'sidebar-nav-item'}
-        onClick={() => onChange('commits')}
-      >
-        <AllCommitsIcon />
-        <span>All Commits</span>
-      </div>
-    </div>
-  )
-}
 
 function App() {
-  const { state, openRepo, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, selectCommit, clearError } = useRepoStore()
-  const [repoState, setRepoState] = useState<string>('normal')
-  const [viewMode, setViewMode] = useState<ViewMode>('commits')
+  const nextId = useRef(1)
+  const [tabs, setTabs] = useState<RepoTabInfo[]>([{ id: 'tab-0', path: DEFAULT_REPO_PATH }])
+  const [activeId, setActiveId] = useState('tab-0')
 
-  useRepoEffects(state, refreshGraph, refreshStatus, refreshDiff, viewMode)
+  // 供上面两个回调读取最新标签列表，避免把 tabs 放进依赖导致回调每次渲染都换新
+  const tabsRef = useRef(tabs)
+  tabsRef.current = tabs
 
-  useEffect(() => {
-    openRepo(DEFAULT_REPO_PATH)
-  }, [openRepo])
+  /**
+   * 同一路径不重复开标签，已开就切过去。
+   *
+   * id 自增和 setActiveId 都放在 updater 外面——StrictMode 会重复调用 updater，
+   * 在里面做副作用会多吃一个 id、并且用过期的 id 去激活标签。
+   */
+  const openInNewTab = useCallback((path: string) => {
+    const existing = tabsRef.current.find((t) => samePath(t.path, path))
+    if (existing) {
+      setActiveId(existing.id)
+      return
+    }
+    const id = `tab-${nextId.current++}`
+    setTabs((prev) => [...prev, { id, path }])
+    setActiveId(id)
+  }, [])
 
-  useEffect(() => {
-    if (!state.path) return
-    invoke('unwatch_repo')
-    invoke('watch_repo', { path: state.path })
-    invoke<string>('repo_state', { path: state.path }).then(setRepoState).catch(() => setRepoState('normal'))
-  }, [state.path])
+  const closeTab = useCallback((id: string) => {
+    const prev = tabsRef.current
+    if (prev.length === 1) return // 至少留一个标签，避免空窗口
+    const idx = prev.findIndex((t) => t.id === id)
+    if (idx < 0) return
+    const next = prev.filter((t) => t.id !== id)
+    setTabs(next)
+    setActiveId((cur) => (cur === id ? next[Math.min(idx, next.length - 1)].id : cur))
+  }, [])
 
   const handleOpenRepo = useCallback(async () => {
     const selected = await open({ directory: true, multiple: false })
-    if (typeof selected === 'string') {
-      await openRepo(selected)
-    }
-  }, [openRepo])
+    if (typeof selected === 'string') openInNewTab(selected)
+  }, [openInNewTab])
 
-  const handleCommit = useCallback(async (msg: string, amend: boolean) => {
-    if (!state.path) return
-    try {
-      await invoke('commit', { path: state.path, message: msg, amend })
-      await refreshGraph(state.path)
-      await refreshStatus(state.path)
-      await refreshDiff(state.path, 'workdir')
-    } catch (err) {
-      console.error(err)
-    }
-  }, [state.path, refreshGraph, refreshStatus, refreshDiff])
-
-  const runAndRefresh = useCallback(async (cmd: string, args: Record<string, unknown>, refresh: () => Promise<void>) => {
-    if (!state.path) return
-    try {
-      await invoke(cmd, { path: state.path, ...args })
-      await refresh()
-    } catch (err) {
-      console.error(err)
-    }
-  }, [state.path])
-
-  if (state.loading && state.commits.length === 0) return <div style={{ padding: 16 }}>Loading...</div>
+  const openPaths = tabs.map((t) => t.path)
 
   return (
-    <div className="app" style={{ display: 'flex', flexDirection: 'column', height: '100vh' }}>
-      {repoState !== 'normal' && <div style={{ padding: 8, background: '#ff8a65', color: '#000' }}>{repoState} in progress</div>}
-      {state.error && <div style={{ padding: 8, background: '#e57373', color: '#000', display: 'flex', justifyContent: 'space-between' }}>
-        <span>{state.error}</span>
-        <button onClick={clearError}>×</button>
-      </div>}
-      <header style={{ padding: 4, borderBottom: '1px solid #333', display: 'flex', alignItems: 'center', gap: 8 }}>
-        <button onClick={handleOpenRepo}>Open Repo</button>
-        <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{state.path} @ {state.head}</span>
-      </header>
-      <div style={{ flex: 1, overflow: 'hidden' }}>
-        <Group orientation="horizontal">
-          <Panel defaultSize="20%" minSize="15%" maxSize="40%" style={{ display: 'flex', flexDirection: 'column' }}>
-            <div style={{ flex: 1, overflow: 'auto' }}>
-              <SidebarNav
-                mode={viewMode}
-                changeCount={state.status.unstaged.length + state.status.staged.length}
-                onChange={setViewMode}
-              />
-              <BranchView refs={state.refs} head={state.head}
-                onCheckout={(name) => runAndRefresh('checkout', { rev: name }, async () => { await refreshGraph(state.path!); await refreshStatus(state.path!) })}
-                onCreate={(name) => runAndRefresh('create_branch', { name }, async () => await refreshGraph(state.path!))}
-                onDelete={(name) => runAndRefresh('delete_branch', { name }, async () => await refreshGraph(state.path!))}
-              />
-              <WorktreeView worktrees={state.worktrees} currentPath={state.path ?? ''}
-                onSwitch={async (path) => { await openRepo(path) }}
-                onCreate={(name) => runAndRefresh('create_worktree', { name }, async () => await refreshWorktrees(state.path!))}
-                onDelete={(name) => runAndRefresh('delete_worktree', { name }, async () => await refreshWorktrees(state.path!))}
-              />
-            </div>
-          </Panel>
-          <Separator style={{ width: 4, background: '#333' }} />
-          <Panel minSize="30%">
-            {viewMode === 'commits' ? (
-              <Group orientation="vertical">
-                <Panel minSize="30%">
-                  <GraphView commits={state.commits} refs={state.refs} selectedId={state.selectedId} onSelect={selectCommit} />
-                </Panel>
-                <Separator style={{ height: 4, background: '#333' }} />
-                <Panel defaultSize="35%" minSize="15%" maxSize="65%">
-                  <CommitDetailView
-                    commit={state.commits.find((c) => c.id === state.selectedId) ?? null}
-                    diff={state.diff}
-                  />
-                </Panel>
-              </Group>
-            ) : (
-              <LocalChangesView
-                status={state.status}
-                diff={state.diff}
-                onStage={(paths) => runAndRefresh('stage', { paths }, async () => { await refreshStatus(state.path!); await refreshDiff(state.path!, 'workdir') })}
-                onUnstage={(paths) => runAndRefresh('unstage', { paths }, async () => { await refreshStatus(state.path!); await refreshDiff(state.path!, 'workdir') })}
-                onCommit={handleCommit}
-              />
-            )}
-          </Panel>
-        </Group>
-      </div>
+    <div className="app">
+      <TabBar
+        tabs={tabs}
+        activeId={activeId}
+        onActivate={setActiveId}
+        onClose={closeTab}
+        onOpenRepo={handleOpenRepo}
+      />
+      {/* 所有标签保持挂载，非活动的用 display:none 藏起来——
+          卸载会丢掉该标签的 commits、选中态和滚动位置 */}
+      {tabs.map((tab) => (
+        <div
+          key={tab.id}
+          className="tab-panel"
+          style={{ display: tab.id === activeId ? 'flex' : 'none' }}
+        >
+          <RepoTab
+            repoPath={tab.path}
+            openPaths={openPaths}
+            onOpenInNewTab={openInNewTab}
+          />
+        </div>
+      ))}
     </div>
   )
 }

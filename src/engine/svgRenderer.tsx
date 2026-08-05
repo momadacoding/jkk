@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react'
 import type { GraphLayout, LanePath, LayoutNode, RefPointer } from './graphTypes'
 import type { GraphRenderer } from './renderer'
+import { laneColor } from './paths'
 
 export function createSvgRenderer(): GraphRenderer {
   return {
@@ -11,8 +12,11 @@ export function createSvgRenderer(): GraphRenderer {
 
       return (
         <svg width={width} height={height} className="graph-svg">
-          {layout.paths.map((path) => renderPath(path))}
-          {layout.rows.map((node) => renderNode(node, layout, refByHash[node.commit.id] ?? [], selectedId === node.commit.id))}
+          {/* 坐标是整条历史的绝对值，整体上移把条带对齐到 SVG 原点 */}
+          <g transform={`translate(0, ${-layout.offsetY})`}>
+            {layout.paths.map((path) => renderPath(path))}
+            {layout.rows.map((node) => renderNode(node, layout, refByHash[node.commit.id] ?? [], selectedId === node.commit.id))}
+          </g>
         </svg>
       )
     },
@@ -40,15 +44,17 @@ function renderPath(path: LanePath): ReactNode {
   return <path key={path.id} d={d} stroke={path.color} fill="none" strokeWidth={2} />
 }
 
-function renderNode(node: LayoutNode, layout: GraphLayout, _refs: RefPointer[], selected: boolean): ReactNode {
+function renderNode(node: LayoutNode, layout: GraphLayout, refs: RefPointer[], selected: boolean): ReactNode {
   const cx = node.lane * layout.laneWidth + layout.laneWidth / 2
   const cy = node.row * layout.rowHeight + layout.rowHeight / 2
-  const r = 5
+  const isHead = refs.some((r) => r.kind === 'head')
+  // 中空圆：分支色填充 + 白边；HEAD 所在 commit 加大加粗；选中行高亮由 DOM 行负责，圆点不变形
+  const r = isHead ? 6.5 : 5
+  const strokeWidth = isHead || selected ? 2.5 : 1.5
 
   return (
     <g key={node.commit.id} className={selected ? 'commit-node selected' : 'commit-node'} data-id={node.commit.id}>
-      {selected && <rect x={cx - 10} y={node.row * layout.rowHeight + 2} width={200} height={layout.rowHeight - 4} rx={4} className="selection-bg" />}
-      <circle cx={cx} cy={cy} r={r} stroke={selected ? '#fff' : '#888'} strokeWidth={2} fill={selected ? '#fff' : '#222'} />
+      <circle cx={cx} cy={cy} r={r} fill={laneColor(node.lane)} stroke="#fff" strokeWidth={strokeWidth} />
     </g>
   )
 }

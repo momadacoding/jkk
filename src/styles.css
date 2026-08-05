@@ -12,6 +12,142 @@ body {
   font-size: 12px;
 }
 
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+.tab-bar {
+  display: flex;
+  align-items: stretch;
+  gap: 1px;
+  background: #181818;
+  border-bottom: 1px solid #333;
+  min-height: 28px;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  max-width: 200px;
+  background: #242424;
+  border-right: 1px solid #333;
+  cursor: pointer;
+  user-select: none;
+}
+
+.tab.active {
+  background: var(--bg);
+  box-shadow: inset 0 2px 0 #4fc3f7;
+}
+
+.tab-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-close,
+.tab-open {
+  background: transparent;
+  border: none;
+  color: #888;
+  cursor: pointer;
+  padding: 0 4px;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.tab-close:hover,
+.tab-open:hover {
+  color: #fff;
+}
+
+.tab-panel {
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.repo-tab {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.repo-path-bar {
+  padding: 3px 6px;
+  color: #888;
+  border-bottom: 1px solid #333;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.banner-state {
+  padding: 8px;
+  background: #ff8a65;
+  color: #000;
+}
+
+.banner-error {
+  padding: 8px;
+  background: #e57373;
+  color: #000;
+  display: flex;
+  justify-content: space-between;
+}
+
+.context-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 180px;
+  padding: 4px 0;
+  background: #2a2a2a;
+  border: 1px solid #444;
+  border-radius: 4px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+}
+
+.context-menu-item {
+  display: block;
+  width: 100%;
+  padding: 5px 12px;
+  background: transparent;
+  border: none;
+  color: var(--fg);
+  text-align: left;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.context-menu-item:hover:not(:disabled) {
+  background: #3a6ea5;
+  color: #fff;
+}
+
+.context-menu-item:disabled {
+  color: #666;
+  cursor: default;
+}
+
+.context-menu-item.danger:not(:disabled) {
+  color: #e57373;
+}
+
+.worktree-badge {
+  margin-left: auto;
+  padding: 0 5px;
+  border: 1px solid #4fc3f7;
+  border-radius: 8px;
+  color: #4fc3f7;
+  font-size: 9px;
+}
+
 .graph-view {
   background: var(--bg);
 }
@@ -20,9 +156,6 @@ body {
   cursor: pointer;
 }
 
-.selection-bg {
-  fill: var(--selected-bg);
-}
 
 .commit-row {
   display: flex;
@@ -126,6 +259,23 @@ body {
 
 .branch-row.remote {
   color: #888;
+}
+
+.branch-row:hover,
+.worktree-row:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.branch-row.selected,
+.worktree-row.selected {
+  background: var(--selected-bg);
+}
+
+.branch-name,
+.worktree-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .worktree-row {
@@ -233,6 +383,10 @@ body {
 
 .changes-file.selected {
   background: var(--selected-bg);
+}
+
+.changes-file.conflicted .changes-file-path {
+  color: #ff8a65;
 }
 
 .changes-file-path {

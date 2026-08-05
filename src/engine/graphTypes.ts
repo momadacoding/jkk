@@ -34,6 +34,13 @@ export interface GraphLayout {
   laneCount: number
   rowHeight: number
   laneWidth: number
+  /**
+   * 条带顶端的绝对 y（像素）。
+   *
+   * rows / paths 里的坐标都是相对整条历史的绝对值，而 SVG 元素只有条带那么高。
+   * 渲染时整体上移 offsetY，条带内容才落在 SVG 自己的坐标系里。
+   */
+  offsetY: number
 }
 
 export interface ViewportConfig {
