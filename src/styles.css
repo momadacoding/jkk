@@ -1,0 +1,389 @@
+:root {
+  --bg: #1e1e1e;
+  --fg: #d4d4d4;
+  --selected-bg: rgba(255, 255, 255, 0.1);
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: system-ui, -apple-system, sans-serif;
+  font-size: 12px;
+}
+
+.graph-view {
+  background: var(--bg);
+}
+
+.commit-node {
+  cursor: pointer;
+}
+
+.selection-bg {
+  fill: var(--selected-bg);
+}
+
+.commit-row {
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  box-sizing: border-box;
+}
+
+.commit-row:hover,
+.commit-row.selected {
+  background: var(--selected-bg);
+}
+
+.commit-message {
+  font-family: system-ui, -apple-system, sans-serif;
+}
+
+.commit-meta {
+  font-size: 11px;
+}
+
+.ref-pill {
+  padding: 1px 6px;
+  border-radius: 10px;
+  font-size: 10px;
+  color: #fff;
+  background: #4fc3f7;
+  font-family: monospace;
+}
+
+.ref-pill.remote {
+  background: transparent;
+  border: 1px solid #aaa;
+  color: #aaa;
+}
+
+.ref-pill.head {
+  background: #fff;
+  color: #1e1e1e;
+}
+
+.file-stats {
+  margin-left: auto;
+  color: #888;
+  font-size: 10px;
+}
+
+.diff-view {
+  height: 100%;
+  overflow: auto;
+  font-family: monospace;
+  font-size: 12px;
+}
+
+.diff-file-header {
+  padding: 8px;
+  background: #2a2a2a;
+  border-bottom: 1px solid #333;
+}
+
+.diff-line {
+  padding: 0 8px;
+  white-space: pre;
+}
+
+.diff-line.add { background: rgba(129, 199, 132, 0.15); }
+.diff-line.del { background: rgba(229, 115, 115, 0.15); }
+
+.diff-origin {
+  display: inline-block;
+  width: 12px;
+  color: #888;
+}
+
+.empty-diff {
+  padding: 8px;
+  color: #666;
+}
+
+.sidebar-panel {
+  padding: 8px;
+  border-bottom: 1px solid #333;
+}
+
+.branch-section {
+  margin: 8px 0;
+}
+
+.branch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 4px;
+  cursor: pointer;
+}
+
+.branch-row.head {
+  font-weight: bold;
+  color: #fff;
+}
+
+.branch-row.remote {
+  color: #888;
+}
+
+.worktree-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 4px;
+  cursor: pointer;
+}
+
+.worktree-row.active {
+  font-weight: bold;
+  color: #fff;
+}
+
+.sidebar-nav {
+  padding: 4px 0;
+  border-bottom: 1px solid #333;
+}
+
+.sidebar-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  cursor: pointer;
+  color: var(--fg);
+}
+
+.sidebar-nav-item:hover {
+  background: var(--selected-bg);
+}
+
+.sidebar-nav-item.selected {
+  background: var(--selected-bg);
+  color: #fff;
+}
+
+/* resizable separators */
+.separator-v {
+  width: 4px;
+  background: #333;
+}
+
+.separator-h {
+  height: 4px;
+  background: #333;
+}
+
+/* Local Changes view (Fork-style) */
+.local-changes-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.changes-body {
+  flex: 1;
+  min-height: 0;
+}
+
+.changes-section {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.changes-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 8px;
+  background: #252525;
+  font-weight: bold;
+  border-bottom: 1px solid #333;
+  flex-shrink: 0;
+}
+
+.changes-action {
+  font-size: 11px;
+  padding: 1px 8px;
+  background: #333;
+  border: 1px solid #555;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.changes-section-files {
+  flex: 1;
+  overflow: auto;
+}
+
+.changes-empty {
+  padding: 8px;
+  color: #666;
+}
+
+.changes-file {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 4px;
+  cursor: pointer;
+}
+
+.changes-file.selected {
+  background: var(--selected-bg);
+}
+
+.changes-file-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.changes-file-stats {
+  margin-left: auto;
+  color: #888;
+  font-size: 10px;
+}
+
+.changes-toggle {
+  padding: 1px 4px;
+  font-size: 10px;
+  background: #333;
+  border: 1px solid #555;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.changes-commit-box {
+  border-top: 1px solid #333;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.commit-subject {
+  background: #222;
+  color: #d4d4d4;
+  border: 1px solid #444;
+  padding: 4px 6px;
+}
+
+.commit-description {
+  background: #222;
+  color: #d4d4d4;
+  border: 1px solid #444;
+  resize: vertical;
+  font-family: inherit;
+}
+
+.commit-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.changes-amend {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* Commit detail panel (All Commits bottom) */
+.commit-detail {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.commit-detail-empty {
+  padding: 8px;
+  color: #888;
+}
+
+.commit-detail-tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid #333;
+  padding: 0 8px;
+  flex-shrink: 0;
+}
+
+.commit-detail-tabs button {
+  padding: 6px 12px;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.commit-detail-tabs button.active {
+  border-bottom-color: #4fc3f7;
+  color: #fff;
+}
+
+.commit-info {
+  flex: 1;
+  overflow: auto;
+  padding: 8px;
+}
+
+.commit-info-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 0;
+}
+
+.commit-info-label {
+  width: 70px;
+  flex-shrink: 0;
+  color: #888;
+  font-size: 10px;
+}
+
+.commit-info-date {
+  color: #888;
+}
+
+.commit-info-sha {
+  font-family: monospace;
+}
+
+.commit-full-message {
+  margin: 8px 0;
+  font-weight: bold;
+  color: #fff;
+  white-space: pre-wrap;
+}
+
+.commit-files {
+  margin-top: 8px;
+  border-top: 1px solid #333;
+  padding-top: 4px;
+}
+
+.commit-file-row {
+  display: flex;
+  gap: 8px;
+  padding: 1px 0;
+}
+
+.commit-file-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.commit-changes {
+  flex: 1;
+  overflow: auto;
+}
