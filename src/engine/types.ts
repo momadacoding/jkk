@@ -32,7 +32,7 @@ export interface GraphData {
 
 export interface FileChange {
   path: string
-  status: 'modified' | 'added' | 'deleted' | 'renamed'
+  status: 'modified' | 'added' | 'deleted' | 'renamed' | 'conflicted'
   additions: number
   deletions: number
 }

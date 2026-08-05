@@ -25,6 +25,7 @@ pub fn collect(repo: &Repository) -> Result<Vec<RefPointer>> {
         } else {
             "other"
         };
+        // 符号引用（如 refs/remotes/origin/HEAD）的 target() 为 None，跳过
         if let Some(oid) = reference.target() {
             refs.push(RefPointer {
                 name: name.clone(),
@@ -33,5 +34,18 @@ pub fn collect(repo: &Repository) -> Result<Vec<RefPointer>> {
             });
         }
     }
+
+    // HEAD 不在 references() 的遍历范围内（那只列 refs/*），必须单独取。
+    // 少了它前端就认不出当前 commit，圆点强调和 .ref-pill.head 样式都用不上。
+    if let Ok(head) = repo.head() {
+        if let Some(oid) = head.resolve().ok().and_then(|r| r.target()) {
+            refs.push(RefPointer {
+                name: "HEAD".to_string(),
+                hash: oid.to_string(),
+                kind: "head".to_string(),
+            });
+        }
+    }
+
     Ok(refs)
 }

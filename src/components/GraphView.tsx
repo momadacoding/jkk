@@ -1,7 +1,7 @@
 import { useMemo, useRef, useState, useCallback, useEffect } from 'react'
 import type { CommitNode, RefPointer } from '../engine/types'
 import { computeLayout } from '../engine/layout'
-import { computePaths } from '../engine/paths'
+import { computePaths, filterPathsToBand } from '../engine/paths'
 import { createSvgRenderer } from '../engine/svgRenderer'
 import { CommitRow } from './CommitRow'
 
@@ -23,6 +23,8 @@ export function GraphView({ commits, refs, selectedId, onSelect }: GraphViewProp
   const [scrollTop, setScrollTop] = useState(0)
   const [viewportHeight, setViewportHeight] = useState(600)
 
+  // 布局与路径对全量历史只算一次：父 commit 可能在视口外，线段必须完整生成，
+  // 渲染阶段才按条带过滤（见下方 svg memo）。颜色按 lane 分配，与视口无关。
   const layout = useMemo(() => {
     const rows = computeLayout(commits)
     const paths = computePaths(rows, ROW_HEIGHT, LANE_WIDTH)
@@ -32,6 +34,7 @@ export function GraphView({ commits, refs, selectedId, onSelect }: GraphViewProp
       laneCount: Math.max(1, ...rows.map((r) => r.lane)) + 1,
       rowHeight: ROW_HEIGHT,
       laneWidth: LANE_WIDTH,
+      offsetY: 0,
     }
   }, [commits])
 
@@ -42,16 +45,54 @@ export function GraphView({ commits, refs, selectedId, onSelect }: GraphViewProp
   )
   const visibleRows = layout.rows.slice(startIndex, endIndex + 1)
 
-  const visibleLayout = useMemo(() => {
-    const paths = computePaths(visibleRows, ROW_HEIGHT, LANE_WIDTH)
-    return {
+  // SVG 只画条带内的线段与节点：元素高度 = 条带高度，容器放在条带顶端，
+  // 内容整体上移 offsetY。跨边界的线段保留下来，超出的部分由 SVG 边界裁掉，
+  // 视觉上是「延伸到边缘」而不是断头。
+  const bandTop = startIndex * ROW_HEIGHT
+  const svg = useMemo(() => {
+    const band = {
       ...layout,
       rows: visibleRows,
-      paths,
+      paths: filterPathsToBand(layout.paths, bandTop, (endIndex + 1) * ROW_HEIGHT),
+      offsetY: bandTop,
     }
-  }, [visibleRows, layout])
+    return renderer.render(band, refs, selectedId)
+  }, [layout, visibleRows, bandTop, endIndex, refs, selectedId])
+
+  // 标签用 display:none 隐藏时浏览器会把 scrollTop 清零，
+  // 重新显示后要按记住的值还原，所以这里留一份 ref 供观察者读取。
+  const scrollTopRef = useRef(0)
+
+  // 挂载后立即量一次真实高度，并跟随面板拖动 / 标签显隐更新——
+  // 否则首次滚动前一直按初始值估算可见行数。
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const update = () => {
+      const h = el.clientHeight
+      if (h === 0) return // 标签被隐藏，别把高度记成 0
+      setViewportHeight(h)
+      if (el.scrollTop !== scrollTopRef.current) el.scrollTop = scrollTopRef.current
+    }
+    update()
+    const observer = new ResizeObserver(update)
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [])
+
+  // 选中的提交不在可见范围内时把它滚到中间；已经可见就不动，避免点击行时画面乱跳
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el || !selectedId || el.clientHeight === 0) return
+    const idx = commits.findIndex((c) => c.id === selectedId)
+    if (idx < 0) return
+    const rowTop = idx * ROW_HEIGHT
+    if (rowTop >= el.scrollTop && rowTop + ROW_HEIGHT <= el.scrollTop + el.clientHeight) return
+    el.scrollTop = Math.max(0, rowTop - el.clientHeight / 2 + ROW_HEIGHT / 2)
+  }, [selectedId, commits])
 
   const handleScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {
+    scrollTopRef.current = e.currentTarget.scrollTop
     setScrollTop(e.currentTarget.scrollTop)
     setViewportHeight(e.currentTarget.clientHeight)
   }, [])
@@ -75,7 +116,6 @@ export function GraphView({ commits, refs, selectedId, onSelect }: GraphViewProp
 
   const totalHeight = layout.rows.length * ROW_HEIGHT
   const layoutWidth = layout.laneCount * LANE_WIDTH
-  const svg = renderer.render(visibleLayout, refs, selectedId)
   const refByHash = useMemo(() => {
     const map: Record<string, RefPointer[]> = {}
     for (const ref of refs) {
@@ -93,10 +133,10 @@ export function GraphView({ commits, refs, selectedId, onSelect }: GraphViewProp
       style={{ overflow: 'auto', height: '100%' }}
     >
       <div style={{ position: 'relative', height: totalHeight, minWidth: layoutWidth + 300 }}>
-        <div style={{ position: 'absolute', top: startIndex * ROW_HEIGHT, left: 0, zIndex: 1 }}>
+        <div style={{ position: 'absolute', top: bandTop, left: 0, zIndex: 1 }}>
           {svg}
         </div>
-        <div style={{ position: 'absolute', top: startIndex * ROW_HEIGHT, left: 0, right: 0, zIndex: 2 }}>
+        <div style={{ position: 'absolute', top: bandTop, left: 0, right: 0, zIndex: 2 }}>
           {visibleRows.map((node) => (
             <CommitRow
               key={node.commit.id}

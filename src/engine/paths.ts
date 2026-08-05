@@ -1,23 +1,44 @@
 import type { LayoutNode, LanePath, PathSegment } from './graphTypes'
 
-const PALETTE = [
+/** 按 lane 分配的高区分度调色板，12 色循环。 */
+export const LANE_PALETTE = [
   '#4fc3f7', '#81c784', '#ffb74d', '#ba68c8',
   '#e57373', '#64b5f6', '#fff176', '#4db6ac',
   '#ff8a65', '#90a4ae', '#a1887f', '#7986cb',
 ]
 
-export function computePaths(rows: LayoutNode[], rowHeight: number, laneWidth: number): LanePath[] {
-  const paths = new Map<string, LanePath>()
+/**
+ * lane 的确定性颜色。
+ *
+ * 曾经的实现按 path 的插入顺序取色（`PALETTE[paths.size % N]`），
+ * 可见切片一变颜色就重排。颜色只由 lane 决定，与计算顺序、视口无关。
+ */
+export function laneColor(lane: number): string {
+  return LANE_PALETTE[Math.abs(lane) % LANE_PALETTE.length]
+}
 
-  function getPath(id: string): LanePath {
-    if (!paths.has(id)) {
-      paths.set(id, {
-        id,
-        color: PALETTE[paths.size % PALETTE.length],
+/**
+ * 为整组行计算分支线。
+ *
+ * 必须传入完整的 rows（整条历史），不能传可见切片：
+ * 父 commit 在视口外时线段仍然要生成，渲染阶段再按条带过滤。
+ * 内部用 hash → 行号索引，整体 O(n)。
+ */
+export function computePaths(rows: LayoutNode[], rowHeight: number, laneWidth: number): LanePath[] {
+  const byHash = new Map<string, LayoutNode>()
+  for (const row of rows) byHash.set(row.commit.id, row)
+
+  const paths = new Map<number, LanePath>()
+
+  function getPath(lane: number): LanePath {
+    if (!paths.has(lane)) {
+      paths.set(lane, {
+        id: `lane-${lane}`,
+        color: laneColor(lane),
         segments: [],
       })
     }
-    return paths.get(id)!
+    return paths.get(lane)!
   }
 
   for (const node of rows) {
@@ -25,25 +46,47 @@ export function computePaths(rows: LayoutNode[], rowHeight: number, laneWidth: n
     const y = node.row * rowHeight + rowHeight / 2
 
     for (const parent of node.parents) {
-      const parentNode = rows.find((r) => r.commit.id === parent.hash)
-      if (!parentNode) continue
+      const parentNode = byHash.get(parent.hash)
+      if (!parentNode) continue // 数据缺失（如 5000 条上限截断）时画不了
 
-      const px = parent.lane * laneWidth + laneWidth / 2
+      // 必须用父提交**实际落到**的 lane，而不是 `parent.lane`。
+      // 后者只是布局遍历子节点时的预留，父提交真正被处理时可能认领了别的 lane
+      // （比如它同时是某个合并提交的第一父，早就被主干占住了）。
+      // 用预留值会把线画成本车道内一段悬空的竖线，接不到父提交的圆点上。
+      const px = parentNode.lane * laneWidth + laneWidth / 2
       const py = parentNode.row * rowHeight + rowHeight / 2
-      const sameLane = parent.lane === node.lane
-      const pathId = `${parent.lane}-${node.lane}`
-      const path = getPath(pathId)
+
+      // 第一父是本分支自身的延续，线归子节点的 lane；
+      // 其余父是被并入的分支，线归那个父所在的 lane。两者都保证一条拓扑线同色。
+      const path = getPath(parent.isMain ? node.lane : parentNode.lane)
 
       const segment: PathSegment = {
         x1: x,
         y1: y,
         x2: px,
         y2: py,
-        curve: !sameLane,
+        curve: parentNode.lane !== node.lane,
       }
       path.segments.push(segment)
     }
   }
 
   return Array.from(paths.values())
+}
+
+/**
+ * 只保留与视口条带相交的线段。
+ *
+ * 线段只要有一个端点在条带内就保留——父 commit 在条带下方时，
+ * 线段跨越边界，由 SVG 自身边界裁掉，视觉上「延伸到边缘」而不是断头。
+ */
+export function filterPathsToBand(paths: LanePath[], top: number, bottom: number): LanePath[] {
+  return paths
+    .map((p) => ({
+      ...p,
+      segments: p.segments.filter(
+        (s) => Math.max(s.y1, s.y2) >= top && Math.min(s.y1, s.y2) <= bottom,
+      ),
+    }))
+    .filter((p) => p.segments.length > 0)
 }

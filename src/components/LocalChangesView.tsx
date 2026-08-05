@@ -24,7 +24,11 @@ function FileSection({ title, files, actionLabel, selected, onSelect, onToggleOn
         {files.map((f) => (
           <div
             key={f.path}
-            className={selected === f.path ? 'changes-file selected' : 'changes-file'}
+            className={[
+              'changes-file',
+              selected === f.path ? 'selected' : '',
+              f.status === 'conflicted' ? 'conflicted' : '',
+            ].filter(Boolean).join(' ')}
             onClick={() => onSelect(f.path)}
           >
             <button
