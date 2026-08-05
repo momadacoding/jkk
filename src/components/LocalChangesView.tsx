@@ -1,58 +1,44 @@
-import { useState, useMemo } from 'react'
-import type { DiffData, DiffLine, FileChange, StatusData } from '../engine/types'
+import { useMemo, useState } from 'react'
+import { Panel, Group, Separator } from 'react-resizable-panels'
+import type { DiffData, FileChange, StatusData } from '../engine/types'
+import { DiffHunk } from './DiffHunk'
 
-function FileListGroup({ title, files, selected, onSelect, onToggle }: {
+function FileSection({ title, files, actionLabel, selected, onSelect, onToggleOne, onToggleAll }: {
   title: string
   files: FileChange[]
+  actionLabel: string
   selected: string | null
   onSelect: (path: string) => void
-  onToggle: (path: string) => void
+  onToggleOne: (path: string) => void
+  onToggleAll: () => void
 }) {
-  if (files.length === 0) return null
   return (
-    <div className="changes-file-group">
-      <div className="changes-group-title">{title}</div>
-      {files.map((f) => (
-        <div
-          key={f.path}
-          className={selected === f.path ? 'changes-file selected' : 'changes-file'}
-          onClick={() => onSelect(f.path)}
-        >
-          <button className="changes-toggle" onClick={(e) => { e.stopPropagation(); onToggle(f.path) }}>
-            {title === 'Unstaged' ? 'Stage' : 'Unstage'}
-          </button>
-          <span className="changes-file-path">{f.path}</span>
-          <span className="changes-file-stats">+{f.additions}/-{f.deletions}</span>
-        </div>
-      ))}
-    </div>
-  )
-}
-
-function DiffLineView({ line }: { line: DiffLine }) {
-  const className = line.origin === '+' ? 'diff-line add' : line.origin === '-' ? 'diff-line del' : 'diff-line'
-  return (
-    <div className={className}>
-      <span className="diff-origin">{line.origin}</span>
-      {line.content}
-    </div>
-  )
-}
-
-function DiffFile({ diff }: { diff: DiffData }) {
-  if (diff.files.length === 0) return <div className="empty-diff">No changes</div>
-  return (
-    <div className="diff-view">
-      {diff.files.map((file) => (
-        <div key={file.path} className="diff-file">
-          <div className="diff-file-header">{file.path}</div>
-          {file.hunks.map((hunk, i) => (
-            <div key={i} className="diff-hunk">
-              {hunk.lines.map((line, j) => <DiffLineView key={j} line={line} />)}
-            </div>
-          ))}
-        </div>
-      ))}
+    <div className="changes-section">
+      <div className="changes-section-header">
+        <span>{title} ({files.length})</span>
+        {files.length > 0 && (
+          <button className="changes-action" onClick={onToggleAll}>{actionLabel} All</button>
+        )}
+      </div>
+      <div className="changes-section-files">
+        {files.map((f) => (
+          <div
+            key={f.path}
+            className={selected === f.path ? 'changes-file selected' : 'changes-file'}
+            onClick={() => onSelect(f.path)}
+          >
+            <button
+              className="changes-toggle"
+              onClick={(e) => { e.stopPropagation(); onToggleOne(f.path) }}
+            >
+              {actionLabel}
+            </button>
+            <span className="changes-file-path">{f.path}</span>
+            <span className="changes-file-stats">+{f.additions}/-{f.deletions}</span>
+          </div>
+        ))}
+        {files.length === 0 && <div className="changes-empty">No files</div>}
+      </div>
     </div>
   )
 }
@@ -67,7 +53,8 @@ interface LocalChangesViewProps {
 
 export function LocalChangesView({ status, diff, onStage, onUnstage, onCommit }: LocalChangesViewProps) {
   const [selectedFile, setSelectedFile] = useState<string | null>(null)
-  const [message, setMessage] = useState('')
+  const [subject, setSubject] = useState('')
+  const [description, setDescription] = useState('')
   const [amend, setAmend] = useState(false)
 
   const allFiles = useMemo(() => [...status.unstaged, ...status.staged], [status])
@@ -76,39 +63,69 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onCommit }:
     files: diff.files.filter((f) => f.path === activeFile),
   }), [diff, activeFile])
 
+  const handleCommit = () => {
+    const msg = description.trim() ? `${subject.trim()}\n\n${description.trim()}` : subject.trim()
+    onCommit(msg, amend)
+    setSubject('')
+    setDescription('')
+  }
+
   return (
     <div className="local-changes-view">
-      <aside className="changes-sidebar">
-        <FileListGroup
-          title="Unstaged"
-          files={status.unstaged}
-          selected={activeFile}
-          onSelect={setSelectedFile}
-          onToggle={(path) => onStage([path])}
+      <div className="changes-body">
+        <Group orientation="horizontal">
+          <Panel defaultSize="25%" minSize="15%" maxSize="50%">
+            <Group orientation="vertical">
+              <Panel minSize="15%">
+                <FileSection
+                  title="Unstaged"
+                  files={status.unstaged}
+                  actionLabel="Stage"
+                  selected={activeFile}
+                  onSelect={setSelectedFile}
+                  onToggleOne={(path) => onStage([path])}
+                  onToggleAll={() => onStage(status.unstaged.map((f) => f.path))}
+                />
+              </Panel>
+              <Separator className="separator-h" />
+              <Panel minSize="15%">
+                <FileSection
+                  title="Staged"
+                  files={status.staged}
+                  actionLabel="Unstage"
+                  selected={activeFile}
+                  onSelect={setSelectedFile}
+                  onToggleOne={(path) => onUnstage([path])}
+                  onToggleAll={() => onUnstage(status.staged.map((f) => f.path))}
+                />
+              </Panel>
+            </Group>
+          </Panel>
+          <Separator className="separator-v" />
+          <Panel minSize="30%">
+            <DiffHunk diff={activeDiff} />
+          </Panel>
+        </Group>
+      </div>
+      <div className="changes-commit-box">
+        <input
+          className="commit-subject"
+          value={subject}
+          onChange={(e) => setSubject(e.target.value)}
+          placeholder="Commit subject"
         />
-        <FileListGroup
-          title="Staged"
-          files={status.staged}
-          selected={activeFile}
-          onSelect={setSelectedFile}
-          onToggle={(path) => onUnstage([path])}
+        <textarea
+          className="commit-description"
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+          placeholder="Description"
+          rows={3}
         />
-      </aside>
-      <div className="changes-main">
-        <div className="changes-diff">
-          <DiffFile diff={activeDiff} />
-        </div>
-        <div className="changes-commit-box">
-          <textarea
-            value={message}
-            onChange={(e) => setMessage(e.target.value)}
-            placeholder="Commit subject"
-            rows={2}
-          />
+        <div className="commit-actions">
           <label className="changes-amend">
             <input type="checkbox" checked={amend} onChange={(e) => setAmend(e.target.checked)} /> Amend
           </label>
-          <button onClick={() => onCommit(message, amend)}>Commit</button>
+          <button disabled={!subject.trim()} onClick={handleCommit}>Commit</button>
         </div>
       </div>
     </div>

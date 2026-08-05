@@ -5,7 +5,7 @@ import { Panel, Group, Separator } from 'react-resizable-panels'
 import { GraphView } from './components/GraphView'
 import { BranchView } from './components/BranchView'
 import { WorktreeView } from './components/WorktreeView'
-import { StagingView } from './components/StagingView'
+import { CommitDetailView } from './components/CommitDetailView'
 import { LocalChangesView } from './components/LocalChangesView'
 import { useRepoStore, useRepoEffects } from './store/repoStore'
 import './styles.css'
@@ -13,22 +13,52 @@ import './styles.css'
 const DEFAULT_REPO_PATH = 'C:\\Users\\liuhao\\workspace\\dev\\Dev\\mygitclient'
 type ViewMode = 'commits' | 'changes'
 
-function ViewModeSwitch({ mode, onChange }: { mode: ViewMode; onChange: (m: ViewMode) => void }) {
+function LocalChangesIcon() {
   return (
-    <div className="view-mode-switch">
-      <button className={mode === 'commits' ? 'active' : ''} onClick={() => onChange('commits')}>All Commits</button>
-      <button className={mode === 'changes' ? 'active' : ''} onClick={() => onChange('changes')}>Local Changes</button>
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.2">
+      <path d="M3.5 1.5h6l3 3v10h-9z" />
+      <path d="M8 7v4M6 9h4" />
+    </svg>
+  )
+}
+
+function AllCommitsIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.2">
+      <circle cx="5" cy="4" r="1.6" />
+      <circle cx="5" cy="12" r="1.6" />
+      <path d="M5 5.6v4.8M5 4h6" />
+    </svg>
+  )
+}
+
+function SidebarNav({ mode, changeCount, onChange }: { mode: ViewMode; changeCount: number; onChange: (m: ViewMode) => void }) {
+  return (
+    <div className="sidebar-nav">
+      <div
+        className={mode === 'changes' ? 'sidebar-nav-item selected' : 'sidebar-nav-item'}
+        onClick={() => onChange('changes')}
+      >
+        <LocalChangesIcon />
+        <span>Local Changes{changeCount > 0 ? ` (${changeCount})` : ''}</span>
+      </div>
+      <div
+        className={mode === 'commits' ? 'sidebar-nav-item selected' : 'sidebar-nav-item'}
+        onClick={() => onChange('commits')}
+      >
+        <AllCommitsIcon />
+        <span>All Commits</span>
+      </div>
     </div>
   )
 }
 
 function App() {
   const { state, openRepo, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, selectCommit, clearError } = useRepoStore()
-  const [selectedFile, setSelectedFile] = useState<string | null>(null)
   const [repoState, setRepoState] = useState<string>('normal')
   const [viewMode, setViewMode] = useState<ViewMode>('commits')
 
-  useRepoEffects(state, refreshGraph, refreshStatus, refreshDiff)
+  useRepoEffects(state, refreshGraph, refreshStatus, refreshDiff, viewMode)
 
   useEffect(() => {
     openRepo(DEFAULT_REPO_PATH)
@@ -54,10 +84,11 @@ function App() {
       await invoke('commit', { path: state.path, message: msg, amend })
       await refreshGraph(state.path)
       await refreshStatus(state.path)
+      await refreshDiff(state.path, 'workdir')
     } catch (err) {
       console.error(err)
     }
-  }, [state.path, refreshGraph, refreshStatus])
+  }, [state.path, refreshGraph, refreshStatus, refreshDiff])
 
   const runAndRefresh = useCallback(async (cmd: string, args: Record<string, unknown>, refresh: () => Promise<void>) => {
     if (!state.path) return
@@ -84,9 +115,13 @@ function App() {
       </header>
       <div style={{ flex: 1, overflow: 'hidden' }}>
         <Group orientation="horizontal">
-          <Panel defaultSize={20} minSize={15} maxSize={40} style={{ display: 'flex', flexDirection: 'column' }}>
-            <ViewModeSwitch mode={viewMode} onChange={setViewMode} />
+          <Panel defaultSize="20%" minSize="15%" maxSize="40%" style={{ display: 'flex', flexDirection: 'column' }}>
             <div style={{ flex: 1, overflow: 'auto' }}>
+              <SidebarNav
+                mode={viewMode}
+                changeCount={state.status.unstaged.length + state.status.staged.length}
+                onChange={setViewMode}
+              />
               <BranchView refs={state.refs} head={state.head}
                 onCheckout={(name) => runAndRefresh('checkout', { rev: name }, async () => { await refreshGraph(state.path!); await refreshStatus(state.path!) })}
                 onCreate={(name) => runAndRefresh('create_branch', { name }, async () => await refreshGraph(state.path!))}
@@ -100,22 +135,17 @@ function App() {
             </div>
           </Panel>
           <Separator style={{ width: 4, background: '#333' }} />
-          <Panel minSize={30}>
+          <Panel minSize="30%">
             {viewMode === 'commits' ? (
               <Group orientation="vertical">
-                <Panel minSize={30}>
+                <Panel minSize="30%">
                   <GraphView commits={state.commits} refs={state.refs} selectedId={state.selectedId} onSelect={selectCommit} />
                 </Panel>
                 <Separator style={{ height: 4, background: '#333' }} />
-                <Panel defaultSize={35} minSize={15} maxSize={65}>
-                  <StagingView
-                    status={state.status}
+                <Panel defaultSize="35%" minSize="15%" maxSize="65%">
+                  <CommitDetailView
+                    commit={state.commits.find((c) => c.id === state.selectedId) ?? null}
                     diff={state.diff}
-                    selectedFile={selectedFile}
-                    onSelectFile={setSelectedFile}
-                    onStage={(paths) => runAndRefresh('stage', { paths }, async () => await refreshStatus(state.path!))}
-                    onUnstage={(paths) => runAndRefresh('unstage', { paths }, async () => await refreshStatus(state.path!))}
-                    onCommit={handleCommit}
                   />
                 </Panel>
               </Group>
@@ -123,8 +153,8 @@ function App() {
               <LocalChangesView
                 status={state.status}
                 diff={state.diff}
-                onStage={(paths) => runAndRefresh('stage', { paths }, async () => await refreshStatus(state.path!))}
-                onUnstage={(paths) => runAndRefresh('unstage', { paths }, async () => await refreshStatus(state.path!))}
+                onStage={(paths) => runAndRefresh('stage', { paths }, async () => { await refreshStatus(state.path!); await refreshDiff(state.path!, 'workdir') })}
+                onUnstage={(paths) => runAndRefresh('unstage', { paths }, async () => { await refreshStatus(state.path!); await refreshDiff(state.path!, 'workdir') })}
                 onCommit={handleCommit}
               />
             )}

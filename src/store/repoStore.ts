@@ -94,11 +94,18 @@ export function useRepoEffects(
   refreshGraph: (path: string) => Promise<void>,
   refreshStatus: (path: string) => Promise<void>,
   refreshDiff: (path: string, scope: string) => Promise<void>,
+  viewMode: string,
 ) {
+  const diffScope = viewMode === 'changes'
+    ? 'workdir'
+    : state.selectedId
+      ? `commit:${state.selectedId}`
+      : null
+
   useEffect(() => {
-    if (!state.path || !state.selectedId) return
-    refreshDiff(state.path, `commit:${state.selectedId}`)
-  }, [state.selectedId, state.path])
+    if (!state.path || !diffScope) return
+    refreshDiff(state.path, diffScope)
+  }, [state.selectedId, state.path, diffScope])
 
   useEffect(() => {
     if (!state.path) return
@@ -106,7 +113,8 @@ export function useRepoEffects(
     listen<string>('repo-changed', () => {
       refreshGraph(state.path!)
       refreshStatus(state.path!)
+      if (diffScope) refreshDiff(state.path!, diffScope)
     }).then((fn) => { unlisten = fn })
     return () => { unlisten?.() }
-  }, [state.path])
+  }, [state.path, diffScope])
 }
