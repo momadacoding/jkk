@@ -300,7 +300,7 @@ fn make_dangling_link(link: &std::path::Path) -> bool {
 }
 
 #[test]
-fn status_survives_a_dangling_symlink_in_the_workdir() {
+fn status_survives_a_dangling_link_in_the_workdir() {
     // 工作区里一个悬空符号链接会让 libgit2 在**加载内容**时报
     // "could not stat"，进而让整个 read_status 失败——一个坏路径就把整个
     // 变更列表弄瞎了。原生 git 遇到同样的情况只打一条 warning 然后继续
@@ -314,17 +314,25 @@ fn status_survives_a_dangling_symlink_in_the_workdir() {
     }
 
     let status = engine::diff::read_status(dir.path().to_str().unwrap())
-        .expect("坏的符号链接不应该让整个 read_status 失败");
+        .expect("坏的链接不应该让整个 read_status 失败");
     // 正常文件仍然要出现在列表里
     assert!(
         status.unstaged.iter().any(|f| f.path == "real.txt"),
         "real.txt 不见了：{:?}",
         status.unstaged
     );
+    // 读不了的未跟踪项不该出现——原生 git 实测只打一条
+    // `warning: could not open directory 'broken-link/'` 而不列出它，
+    // 但 libgit2 会把它报成 WT_NEW，界面上就多出一条 git 不认的变更。
+    assert!(
+        !status.unstaged.iter().any(|f| f.path.contains("broken-link")),
+        "悬空链接被当成未跟踪变更列出来了：{:?}",
+        status.unstaged
+    );
 }
 
 #[test]
-fn read_diff_survives_a_dangling_symlink_in_the_workdir() {
+fn read_diff_survives_a_dangling_link_in_the_workdir() {
     let dir = linear_repo();
     fs::write(dir.path().join("real.txt"), "changed\n").unwrap();
     if !make_dangling_link(&dir.path().join("broken-link")) {
@@ -333,7 +341,7 @@ fn read_diff_survives_a_dangling_symlink_in_the_workdir() {
     }
 
     let diff = engine::diff::read_diff(dir.path().to_str().unwrap(), "workdir".to_string())
-        .expect("坏的符号链接不应该让整个 read_diff 失败");
+        .expect("坏的链接不应该让整个 read_diff 失败");
     assert!(
         diff.files.iter().any(|f| f.path == "real.txt"),
         "real.txt 的 diff 不见了：{:?}",

@@ -155,6 +155,18 @@ fn index_status(status: git2::Status) -> &'static str {
     }
 }
 
+/// 工作区里这个相对路径能不能读到。
+///
+/// 用来对齐原生 git：遇到读不了的目录项（悬空的符号链接/目录联接等），
+/// git 只打一条 `warning: could not open directory ...` 然后**不列出它**；
+/// 而 libgit2 会把它报成 `WT_NEW`，界面上就凭空多出一条 git 不认的未跟踪变更。
+fn is_readable(repo: &Repository, rel: &str) -> bool {
+    match repo.workdir() {
+        Some(wd) => std::fs::metadata(wd.join(rel)).is_ok(),
+        None => true,
+    }
+}
+
 /// 工作区相对 index 的状态（未暂存那一侧）。
 fn worktree_status(status: git2::Status) -> &'static str {
     if status.contains(git2::Status::WT_NEW) {
@@ -229,7 +241,12 @@ pub fn read_status(path: &str) -> Result<StatusData> {
                 | git2::Status::WT_DELETED
                 | git2::Status::WT_RENAMED,
         ) {
-            unstaged.push(make(path_str, worktree_status(status), &unstaged_stats));
+            // 只对未跟踪项做可读性检查。已跟踪文件被删掉走的是 WT_DELETED，
+            // 那是真实变更，即使工作区里已经没有这个路径也必须保留。
+            let phantom = status.contains(git2::Status::WT_NEW) && !is_readable(&repo, path_str);
+            if !phantom {
+                unstaged.push(make(path_str, worktree_status(status), &unstaged_stats));
+            }
         }
     }
 
@@ -323,3 +340,4 @@ fn diff_to_data(diff: git2::Diff) -> Result<DiffData> {
     }
     Ok(DiffData { files })
 }
+
