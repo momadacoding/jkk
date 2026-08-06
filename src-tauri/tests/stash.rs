@@ -9,6 +9,11 @@ fn run_git(dir: &std::path::Path, args: &[&str]) {
     assert!(status.success(), "git {args:?} failed");
 }
 
+fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = Command::new("git").current_dir(dir).args(args).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 fn repo() -> TempDir {
     let dir = TempDir::new().unwrap();
     run_git(dir.path(), &["init"]);
@@ -41,6 +46,25 @@ fn push_then_list_reports_the_entry() {
     assert_eq!(entries[0].hash.len(), 40);
     // 工作区已经被还原
     assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "1");
+}
+
+#[test]
+fn entry_carries_enough_metadata_for_the_detail_panel() {
+    // stash 提交不被任何分支引用，所以不在 load_graph 的输出里。详情面板靠
+    // author/time/parents 渲染，这些字段拿不到就只能显示一个空面板——
+    // 点了 stash 却什么都不出来。
+    let dir = repo();
+    let p = dir.path().to_str().unwrap().to_string();
+    fs::write(dir.path().join("a.txt"), "changed").unwrap();
+    cmd::stash_push(p.clone(), Some("meta".into()), false).unwrap();
+
+    let entries = stash::list(&p).unwrap();
+    let e = &entries[0];
+    assert_eq!(e.author, "Test");
+    assert!(e.time > 0, "time was {}", e.time);
+    // stash 是个 merge 提交，第一父就是 stash 时所在的那个提交
+    assert!(!e.parents.is_empty());
+    assert_eq!(e.parents[0], git_out(dir.path(), &["rev-parse", "HEAD"]));
 }
 
 #[test]

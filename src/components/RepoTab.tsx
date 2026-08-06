@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { Panel, Group, Separator } from 'react-resizable-panels'
@@ -178,6 +178,23 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
     selectCommit(headHash)
   }, [selectCommit, state.commits, reportError])
 
+  // stash 提交不被任何分支引用，所以不在 load_graph 的输出里。选中一条 stash 时
+  // 从它自己的元数据现搭一个 CommitNode，否则详情面板只会显示 "Select a commit"——
+  // diff 明明已经取回来了，却因为查不到提交而整片空白。
+  const detailCommit = useMemo(() => {
+    const fromGraph = state.commits.find((c) => c.id === state.selectedId)
+    if (fromGraph) return fromGraph
+    const stash = state.stashes.find((s) => s.hash === state.selectedId)
+    if (!stash) return null
+    return {
+      id: stash.hash,
+      parents: stash.parents,
+      author: stash.author,
+      time: stash.time,
+      message: stash.message,
+    }
+  }, [state.commits, state.stashes, state.selectedId])
+
   if (state.loading && state.commits.length === 0) return <div style={{ padding: 16 }}>Loading...</div>
 
   return (
@@ -264,7 +281,7 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
                 <Separator style={{ height: 4, background: '#333' }} />
                 <Panel defaultSize="35%" minSize="15%" maxSize="65%">
                   <CommitDetailView
-                    commit={state.commits.find((c) => c.id === state.selectedId) ?? null}
+                    commit={detailCommit}
                     diff={state.diff}
                   />
                 </Panel>

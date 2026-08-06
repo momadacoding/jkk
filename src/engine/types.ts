@@ -80,4 +80,9 @@ export interface StashEntry {
   message: string
   /** stash 本身是个提交，可直接用于 `commit:<hash>` diff scope。 */
   hash: string
+  author: string
+  /** 提交时间，Unix 秒。 */
+  time: number
+  /** 父提交。stash 是个 merge 提交，第一父是 stash 时所在的那个提交。 */
+  parents: string[]
 }
