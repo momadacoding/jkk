@@ -1,4 +1,5 @@
 import type { LayoutNode, RefPointer } from '../engine/graphTypes'
+import { laneTint } from '../engine/paths'
 import { WORKDIR_ID } from '../engine/workdir'
 
 interface CommitRowProps {
@@ -57,7 +58,10 @@ export function CommitRow({
           <span
             key={ref.name}
             className={`ref-pill ${ref.kind}`}
-            style={ref.kind === 'branch' ? { borderLeftColor: laneColor } : undefined}
+            // 本地分支的色条与底色都取车道色，标签才能和图上那条线对应起来
+            style={ref.kind === 'branch'
+              ? { borderLeftColor: laneColor, background: laneTint(laneColor, 0.22) }
+              : undefined}
             title={ref.name}
           >
             {shortName(ref.name)}

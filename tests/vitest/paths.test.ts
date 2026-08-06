@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { computeLayout } from '../../src/engine/layout'
-import { LANE_PALETTE, computePaths, filterPathsToBand, laneColor } from '../../src/engine/paths'
+import { LANE_PALETTE, computePaths, filterPathsToBand, laneColor, laneTint } from '../../src/engine/paths'
 import type { CommitNode } from '../../src/engine/types'
 
 function node(id: string, parents: string[]): CommitNode {
@@ -132,6 +132,23 @@ describe('computePaths', () => {
       .find((s) => s.x1 === byId.side.lane * 20 + 10 && s.x2 === byId.m1.lane * 20 + 10 && s.curve)
     expect(seg).toBeDefined()
     expect(seg!.cornerAtTop).toBe(false)
+  })
+})
+
+describe('laneTint', () => {
+  it('把车道色转成同色低透明度底色', () => {
+    expect(laneTint('#4fc3f7', 0.22)).toBe('rgba(79, 195, 247, 0.22)')
+  })
+
+  it('对整个调色板都不产生 NaN', () => {
+    for (const color of LANE_PALETTE) {
+      expect(laneTint(color, 0.22)).not.toContain('NaN')
+    }
+  })
+
+  it('底色的 RGB 与车道线颜色一致，标签才能对应到线', () => {
+    // 取值若和 laneColor 脱钩，标签底色就成了无意义的装饰
+    expect(laneTint(laneColor(1), 1)).toBe('rgba(129, 199, 132, 1)')
   })
 })
 

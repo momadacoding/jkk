@@ -50,8 +50,7 @@ body {
   white-space: nowrap;
 }
 
-.tab-close,
-.tab-open {
+.tab-close {
   background: transparent;
   border: none;
   color: #888;
@@ -61,9 +60,35 @@ body {
   line-height: 1;
 }
 
-.tab-close:hover,
-.tab-open:hover {
+.tab-close:hover {
   color: #fff;
+}
+
+/* 打开仓库是主要入口，给它文字和边框——原来只是个灰色小加号，找不到 */
+.tab-open {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 3px 0 3px 6px;
+  padding: 0 10px;
+  background: #2f2f2f;
+  border: 1px solid #555;
+  border-radius: 3px;
+  color: #cfcfcf;
+  cursor: pointer;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.tab-open:hover {
+  background: #3a6ea5;
+  border-color: #4fc3f7;
+  color: #fff;
+}
+
+.tab-open-icon {
+  font-size: 14px;
+  line-height: 1;
 }
 
 .tab-panel {
@@ -207,40 +232,45 @@ body {
   white-space: nowrap;
 }
 
+/* 分支名不用等宽字体——10px 的 monospace 字形窄、辨识度差，
+   而分支名里全是 `/` `-` 这类细笔画，正是最吃辨识度的地方 */
 .ref-pill {
-  padding: 1px 6px;
+  padding: 1px 7px;
   border-radius: 3px;
-  font-size: 10px;
-  font-family: monospace;
+  font-size: 11px;
+  line-height: 16px;
+  font-family: system-ui, -apple-system, sans-serif;
+  font-weight: 500;
   white-space: nowrap;
-  max-width: 220px;
+  max-width: 260px;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-/* 本地分支：左侧色条取该提交所在车道的颜色（内联 style 覆盖 borderLeftColor） */
+/* 本地分支：左侧色条与底色都取车道色（由内联 style 覆盖），
+   标签因此能和图上那条线对应起来 */
 .ref-pill.branch {
-  background: #33404d;
-  color: #dce8f5;
-  border-left: 3px solid #4fc3f7;
+  color: #f0f4f8;
+  border-left: 4px solid #4fc3f7;
 }
 
-/* 远程分支：纯灰、无色条，与本地一眼可分 */
+/* 远程分支：无色条、低饱和，明确弱于本地分支一档 */
 .ref-pill.remote {
-  background: #2f2f2f;
-  color: #9a9a9a;
+  background: #34383c;
+  color: #a8b0b8;
+  font-weight: 400;
 }
 
 .ref-pill.tag {
-  background: transparent;
-  border: 1px dashed #c9a227;
-  color: #d9b93a;
+  background: rgba(201, 162, 39, 0.15);
+  border: 1px solid #c9a227;
+  color: #e3c85a;
 }
 
 .ref-pill.head {
   background: #fff;
   color: #1e1e1e;
-  font-weight: bold;
+  font-weight: 700;
 }
 
 .file-stats {

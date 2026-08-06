@@ -19,6 +19,17 @@ export function laneColor(lane: number): string {
 }
 
 /**
+ * 把车道色转成低透明度底色，给 ref 标签用。
+ *
+ * 标签底色跟着车道走，眼睛才能把「这个分支名」和「图上哪条线」连起来；
+ * 统一的灰底做不到这一点。
+ */
+export function laneTint(color: string, alpha: number): string {
+  const n = Number.parseInt(color.slice(1), 16)
+  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`
+}
+
+/**
  * 为整组行计算分支线。
  *
  * 必须传入完整的 rows（整条历史），不能传可见切片：
