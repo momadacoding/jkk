@@ -238,3 +238,51 @@ Tauri dialog 与默认常量给反斜杠，两者永不相等。
 也通过行回调抛出，被当成内容渲染成 `Fdiff --git ...`、`H@@ -2,3 +2,4 @@`。
 改法：`diff_to_data` 只保留 origin 为 `' '` / `'+'` / `'-'` 的行。
 复验：workdir 与 commit 两种 scope 的 origin 集合都只剩内容字符。
+
+## 2026-08-06 Graph 车道重排（阶段一）
+
+分支 `feat/git-toolbar-and-graph-polish`。规格
+`docs/superpowers/specs/2026-08-06-toolbar-and-graph-lanes-design.md`，
+计划 `docs/superpowers/plans/2026-08-06-graph-lane-rework.md`。
+
+单测：`pnpm test` 53 passed（owners 12 / layout 12 / workdir 8 / paths 9 / path 6 / errors 6）。
+`cargo test` 12 passed。`tsc --noEmit` 无错误。
+`paths.test.ts` 与既有 3 条 layout 用例**未做任何改动**即通过。
+
+运行时验证走 CDP（WebView2 `--remote-debugging-port=9222`），打开本仓库自身。
+
+| # | 检查项 | 结果 | 证据 |
+| --- | --- | --- | --- |
+| 1 | master 在最左列 | 通过 | `master`/`ddd`（bc95955）圆点 cx=10，填充 `#4fc3f7` |
+| 2 | 分支 tip 不与 master 同车道 | 通过 | `feat/git-toolbar-and-graph-polish` cx=30、`feat/tabs-and-graph-fixes` cx=50，各自独立颜色 |
+| 3 | 工作区伪行 + 虚线 | 通过 | 顶行 `6 changes`，圆点 `fill=none` `stroke-dasharray=2 2`，虚线连到加粗行 |
+| 4 | 本地/远程标签可分 | 通过 | 本地 `border-left: 2.67px` 车道色 + 底色 `rgb(51,64,77)`；远程 `border-left: 0px`、底色 `rgb(47,47,47)` |
+| 5 | 标签紧跟消息 | 通过 | 截图 `g1-top.png`，标签在消息右侧而非窗口右缘 |
+| 6 | HEAD 行加粗 | 通过 | `.commit-row.head` 命中 bc95955 |
+| 7 | **切分支不改图** | 通过 | 见下方「双标签对照」 |
+| 8 | 点伪行进 Local Changes | 通过 | 导航项由 `All Commits` 变为 `Local Changes (6)`，`.local-changes-view` 出现 |
+| 9 | 上下键跳过伪行 | 通过 | `commits` 数组不含伪行，`findIndex` 返回 -1 时直接 return |
+| 10 | 滚到底部仍有圆点和线 | 通过 | 强制 260px 视口滚到底：15 行 / 15 圆点 / `dotsOutsideSvg: 0` / 行圆点偏移 0.00px，并截图 `g2-scrolled.png` 确认 |
+
+### 第 7 条的验证方法：双标签对照
+
+没有动用户的仓库做 checkout。改用一个更强的对照：主仓库与
+`.worktrees/git-toolbar` **共享同一份 refs 与提交**，但 HEAD 不同。
+两个标签同时打开，逐个提交比对圆点 x 坐标：
+
+- 标签 A：`mygitclient @ master`，加粗行 bc95955，伪行 cx=10
+- 标签 B：`.worktrees/git-toolbar @ feat/git-toolbar-and-graph-polish`，加粗行 7e5a881，伪行 cx=30
+- **29 个提交的车道全部相同（`laneDiffs: []`）**
+
+即 HEAD 只影响「哪一行加粗」和「伪行挂在哪」，不影响任何车道分配。
+
+### 遗留观察：本地 master 落后时主干不在 lane 0
+
+本仓库的本地 `master`（bc95955）比 `origin/master`（b61263e）落后 17 个提交。
+按当前的 tier 1 规则「本地 master 优先」，owner 0 只覆盖 bc95955 及其之前的
+3 个提交，lane 0 因此在图的上部是空的；真正的主干（`origin/master` 往上）
+落在 lane 1，与 `feat/git-toolbar-and-graph-polish` 共用车道和颜色。
+
+标签样式仍能区分两者（远程灰底无色条 vs 本地带色条），但「主干在最左」
+这个视觉目标在本地 master 落后时并没有达成。待定：tier 1 是否应改为
+「本地与远程 master 取更靠前的那个」。
