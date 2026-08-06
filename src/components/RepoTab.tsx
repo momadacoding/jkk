@@ -7,6 +7,8 @@ import { BranchView } from './BranchView'
 import { WorktreeView } from './WorktreeView'
 import { CommitDetailView } from './CommitDetailView'
 import { LocalChangesView } from './LocalChangesView'
+import { Toolbar } from './Toolbar'
+import { StashView } from './StashView'
 import { useRepoStore, useRepoEffects } from '../store/repoStore'
 import { samePath } from '../engine/path'
 
@@ -138,6 +140,23 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
     }
   }, [state.path, reportError])
 
+  /** 工具栏动作：跑完把所有受影响的状态刷一遍。 */
+  const runToolbar = useCallback(async (command: string, args: Record<string, unknown>) => {
+    const path = state.path
+    if (!path) return
+    try {
+      await invoke(command, { path, ...args })
+      // fetch/pull/push/stash 会同时影响图、状态、上游计数和 stash 列表
+      await refreshHead(path)
+      await refreshGraph(path)
+      await refreshStatus(path)
+      await refreshUpstream(path)
+      await refreshStashes(path)
+    } catch (err) {
+      reportError(err)
+    }
+  }, [state.path, refreshHead, refreshGraph, refreshStatus, refreshUpstream, refreshStashes, reportError])
+
   /** 单击分支：只选中并把 graph 定位到它的 tip，不碰工作区。 */
   const handleSelectBranch = useCallback((name: string, hash: string) => {
     setSelectedBranch(name)
@@ -170,6 +189,7 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
           <button onClick={clearError}>×</button>
         </div>
       )}
+      <Toolbar branch={state.head} upstream={state.upstream} onRun={runToolbar} />
       <div className="repo-path-bar" title={state.path ?? ''}>{state.path} @ {state.head}</div>
       <div style={{ flex: 1, overflow: 'hidden' }}>
         <Group orientation="horizontal">
@@ -208,6 +228,21 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
                 }
                 onCreate={(name) => runAndRefresh('create_worktree', { name }, async () => await refreshWorktrees(state.path!))}
                 onDelete={(name) => runAndRefresh('delete_worktree', { name }, async () => await refreshWorktrees(state.path!))}
+              />
+              <StashView
+                stashes={state.stashes}
+                onSelect={(hash) => { setViewMode('commits'); selectCommit(hash) }}
+                onApply={(index) => runAndRefresh('stash_apply', { index }, async () => {
+                  await refreshStatus(state.path!)
+                  await refreshStashes(state.path!)
+                })}
+                onPop={(index) => runAndRefresh('stash_pop', { index }, async () => {
+                  await refreshStatus(state.path!)
+                  await refreshStashes(state.path!)
+                })}
+                onDrop={(index) => runAndRefresh('stash_drop', { index }, async () => {
+                  await refreshStashes(state.path!)
+                })}
               />
             </div>
           </Panel>
