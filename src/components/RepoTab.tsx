@@ -74,6 +74,7 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
   const [repoState, setRepoState] = useState<string>('normal')
   const [viewMode, setViewMode] = useState<ViewMode>('commits')
   const [selectedBranch, setSelectedBranch] = useState<string | null>(null)
+  const [selectedWorktree, setSelectedWorktree] = useState<string | null>(null)
 
   useRepoEffects(state, { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff }, viewMode)
 
@@ -140,6 +141,20 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
     selectCommit(hash)
   }, [selectCommit])
 
+  /** 单击 worktree：把 graph 定位到它的 HEAD，同样不碰工作区。 */
+  const handleSelectWorktree = useCallback((headHash: string, name: string) => {
+    setSelectedWorktree(name)
+    setViewMode('commits')
+    // 游离 HEAD 指向的提交可能不在任何分支上，也就不在这张图里。
+    // 直接选中会留下一个悬空的 selectedId——详情面板空白且毫无解释，
+    // 所以先确认它在图上，不在就明说原因。
+    if (!state.commits.some((c) => c.id === headHash)) {
+      reportError(`worktree "${name}" 的 HEAD (${headHash.slice(0, 7)}) 不在当前提交图中`)
+      return
+    }
+    selectCommit(headHash)
+  }, [selectCommit, state.commits, reportError])
+
   if (state.loading && state.commits.length === 0) return <div style={{ padding: 16 }}>Loading...</div>
 
   return (
@@ -183,6 +198,10 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
                 currentPath={state.path ?? ''}
                 openPaths={openPaths}
                 onOpenInNewTab={onOpenInNewTab}
+                onSelect={handleSelectWorktree}
+                selectedPath={
+                  state.worktrees.find((w) => w.name === selectedWorktree)?.path ?? null
+                }
                 onCreate={(name) => runAndRefresh('create_worktree', { name }, async () => await refreshWorktrees(state.path!))}
                 onDelete={(name) => runAndRefresh('delete_worktree', { name }, async () => await refreshWorktrees(state.path!))}
               />

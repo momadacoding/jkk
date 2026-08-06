@@ -11,10 +11,14 @@ interface WorktreeViewProps {
   onOpenInNewTab: (path: string) => void
   onDelete: (name: string) => void
   onCreate: (name: string) => void
+  /** 单击：把 graph 定位到该 worktree 的 HEAD。传入完整 oid。 */
+  onSelect: (headHash: string, name: string) => void
+  /** 当前被单击选中的 worktree 路径。 */
+  selectedPath: string | null
 }
 
 export function WorktreeView({
-  worktrees, currentPath, openPaths, onOpenInNewTab, onDelete, onCreate,
+  worktrees, currentPath, openPaths, onOpenInNewTab, onDelete, onCreate, onSelect, selectedPath,
 }: WorktreeViewProps) {
   const { menu, open, close } = useContextMenu()
 
@@ -42,8 +46,14 @@ export function WorktreeView({
         return (
           <div
             key={wt.path}
-            className={isCurrent ? 'worktree-row active' : 'worktree-row'}
-            title={isOpen ? '双击切到它的标签页 · 右键更多操作' : '双击在新标签页打开 · 右键更多操作'}
+            className={[
+              'worktree-row',
+              isCurrent ? 'active' : '',
+              samePath(wt.path, selectedPath ?? '') ? 'selected' : '',
+            ].filter(Boolean).join(' ')}
+            title={`单击定位到它的 HEAD · ${isOpen ? '双击切到它的标签页' : '双击在新标签页打开'} · 右键更多操作`}
+            // 单击只定位，不碰工作区——与分支列表保持一致的交互
+            onClick={() => onSelect(wt.head, wt.name)}
             // 不加 isOpen 判断：App 的 openInNewTab 本来就会「已开就切过去」，
             // 在这里拦一道只会让双击已打开的 worktree 毫无反应
             onDoubleClick={() => onOpenInNewTab(wt.path)}
