@@ -1,17 +1,5 @@
-use std::process::Command;
-use crate::error::{GitError, Result};
-
-fn run_git(path: &str, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .current_dir(path)
-        .args(args)
-        .output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        return Err(GitError::new("git_cli", stderr));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
+use crate::engine::git_cli::run_git;
+use crate::error::Result;
 
 #[tauri::command]
 pub fn create_branch(path: String, name: String, start_point: Option<String>) -> Result<()> {
