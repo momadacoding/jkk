@@ -1,4 +1,5 @@
 import type { LayoutNode, LanePath, PathSegment } from './graphTypes'
+import { WORKDIR_ID } from './owners'
 
 /** 按 lane 分配的高区分度调色板，12 色循环。 */
 export const LANE_PALETTE = [
@@ -66,6 +67,8 @@ export function computePaths(rows: LayoutNode[], rowHeight: number, laneWidth: n
         x2: px,
         y2: py,
         curve: parentNode.lane !== node.lane,
+        // 伪行连到 HEAD 的边不是真实的父子关系，画成虚线
+        dashed: node.commit.id === WORKDIR_ID,
       }
       path.segments.push(segment)
     }

@@ -26,6 +26,8 @@ export interface PathSegment {
   x2: number
   y2: number
   curve: boolean // true for merge/fork curves
+  /** 工作区伪行连到 HEAD 的那条线画成虚线，与真实提交边区分。 */
+  dashed?: boolean
 }
 
 export interface GraphLayout {
