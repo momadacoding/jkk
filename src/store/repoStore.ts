@@ -7,7 +7,10 @@ import { samePath } from '../engine/path'
 
 export interface RepoState {
   path: string | null
+  /** 分支名，显示用。 */
   head: string
+  /** HEAD 的完整 oid，工作区伪行挂在它上面。别和 head 混用。 */
+  headHash: string
   commits: CommitNode[]
   refs: RefPointer[]
   worktrees: Worktree[]
@@ -21,6 +24,7 @@ export interface RepoState {
 const initialState: RepoState = {
   path: null,
   head: '',
+  headHash: '',
   commits: [],
   refs: [],
   worktrees: [],
@@ -38,7 +42,7 @@ export function useRepoStore() {
     setState((s) => ({ ...s, loading: true, error: null }))
     try {
       const info = await invoke<RepoInfo>('open_repo', { path })
-      setState((s) => ({ ...s, path, head: info.head, loading: false }))
+      setState((s) => ({ ...s, path, head: info.head, headHash: info.headHash, loading: false }))
       await refreshGraph(path)
       await refreshStatus(path)
       const wts = await invoke<Worktree[]>('read_worktrees_cmd', { path })
@@ -51,7 +55,7 @@ export function useRepoStore() {
   /** 重新读取 HEAD。checkout 之后必须调用，否则 header 与分支高亮会停在旧分支。 */
   const refreshHead = async (path: string) => {
     const info = await invoke<RepoInfo>('open_repo', { path })
-    setState((s) => ({ ...s, head: info.head }))
+    setState((s) => ({ ...s, head: info.head, headHash: info.headHash }))
   }
 
   const refreshGraph = async (path: string) => {

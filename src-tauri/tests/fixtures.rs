@@ -193,3 +193,16 @@ fn open_invalid_repo_fails() {
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().code, "not_repo");
 }
+
+#[test]
+fn open_repo_reports_both_head_name_and_hash() {
+    let dir = linear_repo();
+    let info = engine::repo::open(dir.path().to_str().unwrap()).unwrap();
+    // head 仍是给人看的分支名
+    assert!(info.head == "master" || info.head == "main", "head was {}", info.head);
+    // head_hash 是完整 oid，且必须等于图里最新的那条提交——
+    // 工作区伪行就是靠这个 hash 挂到 HEAD 上的
+    assert_eq!(info.head_hash.len(), 40);
+    let data = engine::graph::load(dir.path().to_str().unwrap()).unwrap();
+    assert_eq!(info.head_hash, data.commits[0].id);
+}
