@@ -270,3 +270,73 @@ fn graph_puts_newer_unmerged_tip_above_older_merge() {
     assert!(row("merge feature") < row("f1"));
     assert!(row("f1") < row("base"));
 }
+
+/// 造一个目标不存在的链接。
+///
+/// Windows 上用**目录联接**（junction）而不是符号链接：后者需要
+/// SeCreateSymbolicLinkPrivilege（开发者模式），普通账户下拿不到，
+/// 用例会静默跳过、变成什么都不测的假绿灯。junction 不需要提权。
+/// 先指向真实目录再把目标删掉，正好复现 pnpm store 里那种
+/// 「链接还在、目标已被删」的悬空状态。
+#[cfg(windows)]
+fn make_dangling_link(link: &std::path::Path) -> bool {
+    let target = link.with_file_name("junction-target");
+    if fs::create_dir_all(&target).is_err() {
+        return false;
+    }
+    let ok = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(&target)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    ok && fs::remove_dir_all(&target).is_ok()
+}
+
+#[cfg(not(windows))]
+fn make_dangling_link(link: &std::path::Path) -> bool {
+    std::os::unix::fs::symlink(link.with_file_name("nowhere-at-all"), link).is_ok()
+}
+
+#[test]
+fn status_survives_a_dangling_symlink_in_the_workdir() {
+    // 工作区里一个悬空符号链接会让 libgit2 在**加载内容**时报
+    // "could not stat"，进而让整个 read_status 失败——一个坏路径就把整个
+    // 变更列表弄瞎了。原生 git 遇到同样的情况只打一条 warning 然后继续
+    // （实测：`warning: could not open directory ...: No such file or directory`）。
+    // 我们要对齐 git 的行为：坏路径不该拖垮其余文件。
+    let dir = linear_repo();
+    fs::write(dir.path().join("real.txt"), "changed\n").unwrap();
+    if !make_dangling_link(&dir.path().join("broken-link")) {
+        eprintln!("跳过：本机无法创建目录联接");
+        return;
+    }
+
+    let status = engine::diff::read_status(dir.path().to_str().unwrap())
+        .expect("坏的符号链接不应该让整个 read_status 失败");
+    // 正常文件仍然要出现在列表里
+    assert!(
+        status.unstaged.iter().any(|f| f.path == "real.txt"),
+        "real.txt 不见了：{:?}",
+        status.unstaged
+    );
+}
+
+#[test]
+fn read_diff_survives_a_dangling_symlink_in_the_workdir() {
+    let dir = linear_repo();
+    fs::write(dir.path().join("real.txt"), "changed\n").unwrap();
+    if !make_dangling_link(&dir.path().join("broken-link")) {
+        eprintln!("跳过：本机无法创建目录联接");
+        return;
+    }
+
+    let diff = engine::diff::read_diff(dir.path().to_str().unwrap(), "workdir".to_string())
+        .expect("坏的符号链接不应该让整个 read_diff 失败");
+    assert!(
+        diff.files.iter().any(|f| f.path == "real.txt"),
+        "real.txt 的 diff 不见了：{:?}",
+        diff.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+    );
+}
