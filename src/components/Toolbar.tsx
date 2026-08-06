@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
+import { confirm } from '@tauri-apps/plugin-dialog'
 import type { UpstreamInfo } from '../engine/types'
 import { planToolbarAction, type ToolbarAction } from '../engine/toolbarActions'
 
@@ -26,6 +27,25 @@ export function useCtrlHeld(): boolean {
   return held
 }
 
+/**
+ * 弹一个确认框，返回用户是否点了确定。
+ *
+ * 必须用插件导出的 `confirm` 并 await 它：Tauri 的 dialog 插件把全局
+ * `window.confirm` 换成了 async 函数，`!window.confirm(...)` 拿到的是 Promise
+ * ——恒为真值，守卫会静默失效，强推照推不误。
+ *
+ * 弹框本身失败（权限没开、插件没注册）时一律当作「没确认」：
+ * 这是唯一不可逆的动作，宁可什么都不做，也不能在没问过的情况下推上去。
+ */
+async function askConfirm(message: string): Promise<boolean> {
+  try {
+    return await confirm(message, { title: 'Force push', kind: 'warning' })
+  } catch (err) {
+    console.error('确认框弹不出来，已按「取消」处理：', err)
+    return false
+  }
+}
+
 interface ToolbarProps {
   /** 当前分支名，来自 state.head。 */
   branch: string
@@ -42,7 +62,7 @@ export function Toolbar({ branch, upstream, onRun }: ToolbarProps) {
 
   const run = useCallback(async (action: ToolbarAction) => {
     const plan = planToolbarAction(action, ctrl, branch)
-    if (plan.confirm && !window.confirm(plan.confirm)) return
+    if (plan.confirm && !(await askConfirm(plan.confirm))) return
     setBusy(action)
     try {
       await onRun(plan.command, plan.args)
