@@ -213,7 +213,8 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
       <div className="repo-path-bar" title={state.path ?? ''}>{state.path} @ {state.head}</div>
       <div style={{ flex: 1, overflow: 'hidden' }}>
         <Group orientation="horizontal">
-          <Panel defaultSize="20%" minSize="15%" maxSize="40%" style={{ display: 'flex', flexDirection: 'column' }}>
+          {/* 22%：分支名普遍带 feat/ 前缀，20% 时连 worktree 名字都存不下 */}
+          <Panel defaultSize="22%" minSize="15%" maxSize="40%" style={{ display: 'flex', flexDirection: 'column' }}>
             <div style={{ flex: 1, overflow: 'auto' }}>
               <SidebarNav
                 mode={viewMode}
@@ -249,10 +250,11 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
                   state.worktrees.find((w) => w.name === selectedWorktree)?.path ?? null
                 }
                 onCreate={(name) => runAndRefresh('create_worktree', { name }, async () => await refreshWorktrees(state.path!))}
-                onDelete={(name) => runAndRefresh('delete_worktree', { name }, async () => await refreshWorktrees(state.path!))}
+                onDelete={(wtPath) => runAndRefresh('delete_worktree', { worktreePath: wtPath }, async () => await refreshWorktrees(state.path!))}
               />
               <StashView
                 stashes={state.stashes}
+                selectedId={state.selectedId}
                 onSelect={(hash) => { setViewMode('commits'); selectCommit(hash) }}
                 onApply={(index) => runAndRefresh('stash_apply', { index }, async () => {
                   await refreshStatus(state.path!)
