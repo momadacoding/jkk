@@ -64,3 +64,20 @@ export interface FileDiff {
 export interface DiffData {
   files: FileDiff[]
 }
+
+export interface UpstreamInfo {
+  /** 当前分支名，不带 refs/heads/ 前缀。 */
+  branch: string
+  /** 上游简称如 "origin/master"；没设上游时为 null。 */
+  upstream: string | null
+  ahead: number
+  behind: number
+}
+
+export interface StashEntry {
+  /** stash@{N} 里的 N，0 最新。 */
+  index: number
+  message: string
+  /** stash 本身是个提交，可直接用于 `commit:<hash>` diff scope。 */
+  hash: string
+}

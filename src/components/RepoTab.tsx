@@ -69,14 +69,18 @@ interface RepoTabProps {
 export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
   const {
     state, openRepo, refreshHead, refreshGraph, refreshStatus, refreshWorktrees,
-    refreshDiff, selectCommit, clearError, reportError,
+    refreshDiff, refreshUpstream, refreshStashes, selectCommit, clearError, reportError,
   } = useRepoStore()
   const [repoState, setRepoState] = useState<string>('normal')
   const [viewMode, setViewMode] = useState<ViewMode>('commits')
   const [selectedBranch, setSelectedBranch] = useState<string | null>(null)
   const [selectedWorktree, setSelectedWorktree] = useState<string | null>(null)
 
-  useRepoEffects(state, { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff }, viewMode)
+  useRepoEffects(
+    state,
+    { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes },
+    viewMode,
+  )
 
   useEffect(() => {
     openRepo(repoPath)

@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { useCallback, useEffect, useState } from 'react'
-import type { CommitNode, DiffData, GraphData, RefPointer, RepoInfo, StatusData, Worktree } from '../engine/types'
+import type { CommitNode, DiffData, GraphData, RefPointer, RepoInfo, StashEntry, StatusData, UpstreamInfo, Worktree } from '../engine/types'
 import { toErrorMessage } from '../engine/errors'
 import { samePath } from '../engine/path'
 
@@ -14,6 +14,8 @@ export interface RepoState {
   commits: CommitNode[]
   refs: RefPointer[]
   worktrees: Worktree[]
+  upstream: UpstreamInfo | null
+  stashes: StashEntry[]
   status: StatusData
   diff: DiffData
   selectedId: string | null
@@ -28,6 +30,8 @@ const initialState: RepoState = {
   commits: [],
   refs: [],
   worktrees: [],
+  upstream: null,
+  stashes: [],
   status: { staged: [], unstaged: [] },
   diff: { files: [] },
   selectedId: null,
@@ -50,6 +54,8 @@ export function useRepoStore() {
       await refreshStatus(path)
       const wts = await invoke<Worktree[]>('read_worktrees_cmd', { path })
       setState((s) => ({ ...s, worktrees: wts }))
+      await refreshUpstream(path)
+      await refreshStashes(path)
     } catch (err) {
       setState((s) => ({ ...s, loading: false, error: toErrorMessage(err) }))
     }
@@ -94,6 +100,16 @@ export function useRepoStore() {
     setState((s) => ({ ...s, worktrees: wts }))
   }
 
+  const refreshUpstream = async (path: string) => {
+    const upstream = await invoke<UpstreamInfo>('read_upstream', { path })
+    setState((s) => ({ ...s, upstream }))
+  }
+
+  const refreshStashes = async (path: string) => {
+    const stashes = await invoke<StashEntry[]>('read_stashes', { path })
+    setState((s) => ({ ...s, stashes }))
+  }
+
   const refreshDiff = async (path: string, scope: string) => {
     const diff = await invoke<DiffData>('read_diff', { path, scope })
     setState((s) => ({ ...s, diff }))
@@ -119,6 +135,8 @@ export function useRepoStore() {
     refreshStatus,
     refreshWorktrees,
     refreshDiff,
+    refreshUpstream,
+    refreshStashes,
     selectCommit,
     clearError,
     reportError,
@@ -132,6 +150,8 @@ export interface RepoRefreshers {
   refreshStatus: (path: string) => Promise<void>
   refreshWorktrees: (path: string) => Promise<void>
   refreshDiff: (path: string, scope: string) => Promise<void>
+  refreshUpstream: (path: string) => Promise<void>
+  refreshStashes: (path: string) => Promise<void>
 }
 
 export function useRepoEffects(
@@ -139,7 +159,7 @@ export function useRepoEffects(
   refreshers: RepoRefreshers,
   viewMode: string,
 ) {
-  const { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff } = refreshers
+  const { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes } = refreshers
   const diffScope = viewMode === 'changes'
     ? 'workdir'
     : state.selectedId
@@ -165,6 +185,9 @@ export function useRepoEffects(
       void refreshGraph(path).catch(ignore)
       void refreshStatus(path).catch(ignore)
       void refreshWorktrees(path).catch(ignore)
+      // 外部 push/fetch 会改变领先落后数，命令行 stash 也要反映到面板上
+      void refreshUpstream(path).catch(ignore)
+      void refreshStashes(path).catch(ignore)
       if (diffScope) void refreshDiff(path, diffScope).catch(ignore)
     }).then((fn) => { unlisten = fn })
     return () => { unlisten?.() }
