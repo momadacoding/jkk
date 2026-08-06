@@ -43,7 +43,10 @@ export function useRepoStore() {
     try {
       const info = await invoke<RepoInfo>('open_repo', { path })
       setState((s) => ({ ...s, path, head: info.head, headHash: info.headHash, loading: false }))
-      await refreshGraph(path)
+      // 打开一个 worktree 时想看的是「它在哪」，所以定位到它自己的 HEAD。
+      // 这里必须把 headHash 显式传下去——上面那次 setState 是异步的，
+      // refreshGraph 里的 updater 读不到刚写进去的值。
+      await refreshGraph(path, info.headHash)
       await refreshStatus(path)
       const wts = await invoke<Worktree[]>('read_worktrees_cmd', { path })
       setState((s) => ({ ...s, worktrees: wts }))
@@ -58,14 +61,27 @@ export function useRepoStore() {
     setState((s) => ({ ...s, head: info.head, headHash: info.headHash }))
   }
 
-  const refreshGraph = async (path: string) => {
+  /**
+   * 重新加载提交图。
+   *
+   * `preferredId` 只在还没有任何选中时生效，用来把首次打开的仓库定位到它自己的
+   * HEAD。不传的话会退回「图上第一条提交」——那是**全局最新**的提交，可能属于
+   * 另一条分支，跟你刚打开的这个 worktree 毫无关系。
+   */
+  const refreshGraph = async (path: string, preferredId?: string) => {
     const data = await invoke<GraphData>('load_graph', { path })
-    setState((s) => ({
-      ...s,
-      commits: data.commits,
-      refs: data.refs,
-      selectedId: s.selectedId ?? data.commits[0]?.id ?? null,
-    }))
+    setState((s) => {
+      // HEAD 万一不在这批数据里（5000 条上限截断）就退回最新一条
+      const preferred = preferredId && data.commits.some((c) => c.id === preferredId)
+        ? preferredId
+        : undefined
+      return {
+        ...s,
+        commits: data.commits,
+        refs: data.refs,
+        selectedId: s.selectedId ?? preferred ?? data.commits[0]?.id ?? null,
+      }
+    })
   }
 
   const refreshStatus = async (path: string) => {

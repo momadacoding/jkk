@@ -90,7 +90,15 @@ export function GraphView({
     return () => observer.disconnect()
   }, [])
 
-  // 选中的提交不在可见范围内时把它滚到中间；已经可见就不动，避免点击行时画面乱跳
+  // 选中的提交不在可见范围内时把它滚到中间；已经可见就不动，避免点击行时画面乱跳。
+  //
+  // 首次打开仓库时 store 会把 selectedId 预置成该 worktree 的 HEAD，于是这里顺带
+  // 完成「打开 worktree 就定位到它所在的提交」。
+  //
+  // 注意 clientHeight 为 0（标签被 display:none 隐藏）时这里直接放弃，且依赖数组里
+  // 没有高度——也就是说**只有在标签可见时才会定位**。目前成立是因为 `openInNewTab`
+  // 总会把新标签设为激活；之后若加「在后台打开标签」，新标签的定位会静默失效，
+  // 届时需要让 ResizeObserver 在拿到真实高度后补一次定位。
   useEffect(() => {
     const el = containerRef.current
     if (!el || !selectedId || el.clientHeight === 0) return
