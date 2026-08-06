@@ -99,7 +99,7 @@ export function Toolbar({ branch, upstream, onRun }: ToolbarProps) {
             {busy === action ? '…' : plan.label}
             {count > 0 && (
               <span className="toolbar-badge">
-                {action === 'pull' ? '↓' : '↑'}{count}
+                {action === 'pull' ? '↓' : '↑'}&thinsp;{count}
               </span>
             )}
           </button>

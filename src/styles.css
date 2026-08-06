@@ -372,78 +372,285 @@ body {
   color: #666;
 }
 
-.sidebar-panel {
-  padding: 8px;
-  border-bottom: 1px solid #333;
+/* ---------- 侧边栏（Fork 风格） ---------- */
+
+.sb-section {
+  border-bottom: 1px solid #2c2c2c;
 }
 
-.branch-section {
-  margin: 8px 0;
-}
-
-.branch-row {
+.sb-section-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 2px 4px;
-  cursor: pointer;
+  gap: 4px;
+  padding: 5px 8px 5px 6px;
+  cursor: default;
+  user-select: none;
+  color: #8a8a8a;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
 }
 
-.branch-row.head {
-  font-weight: bold;
+.sb-section-header:hover {
+  color: #c8c8c8;
+}
+
+.sb-caret {
+  width: 10px;
+  flex-shrink: 0;
+  font-size: 9px;
+  color: #6a6a6a;
+}
+
+.sb-section-title {
+  flex: 1;
+}
+
+.sb-count {
+  padding: 0 4px;
+  border-radius: 8px;
+  background: #2f2f2f;
+  color: #888;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+/* 新建按钮平时不占视觉，指到分区标题才出现 */
+.sb-section-action {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  border-radius: 3px;
+  color: #8a8a8a;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s, background 0.12s;
+}
+
+.sb-section-header:hover .sb-section-action {
+  opacity: 1;
+}
+
+.sb-section-action:hover {
+  background: #3a3a3a;
   color: #fff;
 }
 
-.branch-row.remote {
-  color: #888;
+.sb-section-body {
+  padding-bottom: 4px;
 }
 
-.branch-row:hover,
-.worktree-row:hover {
-  background: rgba(255, 255, 255, 0.05);
+.sb-group-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px 2px 12px;
+  cursor: default;
+  user-select: none;
+  color: #6f6f6f;
+  font-size: 11px;
 }
 
-.branch-row.selected,
-.worktree-row.selected {
+.sb-group-header:hover {
+  color: #a8a8a8;
+}
+
+.sb-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px 2px 22px;
+  height: 22px;
+  cursor: pointer;
+  color: #ccc;
+  position: relative;
+}
+
+.sb-row:hover {
+  background: rgba(255, 255, 255, 0.055);
+}
+
+.sb-row.selected {
   background: var(--selected-bg);
+  color: #fff;
 }
 
-.branch-name,
-.worktree-name {
+/* 当前分支/工作区：加粗提亮，不额外占一行说明 */
+.sb-row.current {
+  font-weight: 600;
+  color: #fff;
+}
+
+.sb-row.remote {
+  color: #7d7d7d;
+}
+
+.sb-icon {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+  opacity: 0.6;
+}
+
+.sb-row.current .sb-icon {
+  opacity: 0.95;
+}
+
+/* basis 用 auto 而不是 0：flex:1 的 basis 是 0%，会让主标题比右边的次要
+   信息先被压扁——worktree 名字曾经被压成一个字母 */
+.sb-label {
+  flex: 1 1 auto;
+  min-width: 2.5em;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.worktree-row {
+/* worktree 行的分支名，次要信息 */
+.sb-sub {
+  /* 极端优先让位：地方不够时先把分支名糊掉，worktree 名字要尽量看全 */
+  flex: 0 100 auto;
+  min-width: 0;
+  max-width: 50%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #777;
+  font-size: 11px;
+}
+
+.sb-index {
+  flex-shrink: 0;
+  color: #777;
+  font-family: monospace;
+  font-size: 11px;
+}
+
+.sb-sync {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+/* 箭头和数字之间必须留空隙，否则 ↑10 会被读成 110 */
+.sb-sync-ahead::before,
+.sb-sync-behind::before {
+  margin-right: 1.5px;
+}
+
+.sb-sync-ahead::before { content: '↑'; }
+.sb-sync-behind::before { content: '↓'; }
+
+.sb-sync-ahead {
+  color: #7fc97f;
+}
+
+.sb-sync-behind {
+  color: #e5a15c;
+}
+
+.sb-current-dot {
+  width: 5px;
+  height: 5px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: #4fc3f7;
+}
+
+/* 行内操作：平时隐藏，hover 才出现，避免一排常驻按钮把列表搅乱 */
+.sb-actions {
+  display: none;
+  gap: 1px;
+  flex-shrink: 0;
+}
+
+.sb-row:hover .sb-actions {
+  display: flex;
+}
+
+/* 露出操作按钮时把次要信息让位，否则窄侧边栏里会挤成一团 */
+.sb-row:hover .sb-sub,
+.sb-row:hover .sb-sync {
+  display: none;
+}
+
+.sb-actions button {
+  width: 18px;
+  height: 18px;
+  padding: 0;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 2px 4px;
+  justify-content: center;
+  background: none;
+  border: none;
+  border-radius: 3px;
+  color: #aaa;
+  font-size: 11px;
+  line-height: 1;
   cursor: pointer;
 }
 
-.worktree-row.active {
-  font-weight: bold;
+.sb-actions button:hover:not(:disabled) {
+  background: #3a3a3a;
   color: #fff;
 }
 
+.sb-actions button.danger:hover:not(:disabled) {
+  background: #6b2b2b;
+  color: #fff;
+}
+
+.sb-actions button:disabled {
+  color: #555;
+  cursor: default;
+}
+
+.sb-empty {
+  padding: 2px 8px 2px 22px;
+  color: #666;
+  font-size: 11px;
+}
+
+.sb-inline-form {
+  padding: 3px 8px 5px 22px;
+}
+
+.sb-inline-form input {
+  width: 100%;
+  padding: 3px 6px;
+  background: #1a1a1a;
+  border: 1px solid #4fc3f7;
+  border-radius: 3px;
+  color: var(--fg);
+  font-size: 12px;
+}
+
 .sidebar-nav {
-  padding: 4px 0;
-  border-bottom: 1px solid #333;
+  padding: 3px 0;
+  border-bottom: 1px solid #2c2c2c;
 }
 
 .sidebar-nav-item {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 3px 8px;
+  padding: 4px 8px;
   cursor: pointer;
-  color: var(--fg);
+  color: #ccc;
 }
 
 .sidebar-nav-item:hover {
-  background: var(--selected-bg);
+  background: rgba(255, 255, 255, 0.055);
 }
 
 .sidebar-nav-item.selected {
@@ -737,7 +944,9 @@ body {
 }
 
 .toolbar-badge {
-  padding: 0 4px;
+  /* 数字前留出空隙，否则挨着的箭头会被当成一个数字：↑10 读成 110 */
+  padding: 0 5px 0 4px;
+  letter-spacing: 0.5px;
   border-radius: 7px;
   background: #4fc3f7;
   color: #1e1e1e;
@@ -745,26 +954,3 @@ body {
   font-weight: bold;
 }
 
-.stash-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 2px 4px;
-  cursor: pointer;
-}
-
-.stash-row:hover {
-  background: rgba(255, 255, 255, 0.05);
-}
-
-.stash-index {
-  color: #888;
-  font-family: monospace;
-  flex-shrink: 0;
-}
-
-.stash-message {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}

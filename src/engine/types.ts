@@ -18,6 +18,13 @@ export interface RefPointer {
   name: string
   hash: string
   kind: 'head' | 'branch' | 'remote' | 'tag' | 'other'
+  /**
+   * 本地分支相对其上游的领先/落后数；没有上游或不是本地分支时为 null。
+   *
+   * null 和 0 含义不同：没上游时不画徽章，同步时画个 0 也是噪音。
+   */
+  ahead: number | null
+  behind: number | null
 }
 
 export interface CommitNode {
