@@ -1,6 +1,7 @@
 import type { Worktree } from '../engine/types'
 import { samePath } from '../engine/path'
 import { ContextMenu, useContextMenu } from './ContextMenu'
+import { SidebarSection } from './SidebarSection'
 
 interface WorktreeViewProps {
   worktrees: Worktree[]
@@ -9,12 +10,22 @@ interface WorktreeViewProps {
   /** 已在某个标签里打开的路径，用来提示「已打开」。 */
   openPaths: string[]
   onOpenInNewTab: (path: string) => void
-  onDelete: (name: string) => void
+  /** 收完整路径而不是名字——名字得靠拼，从主仓库删会拼到仓库外面去。 */
+  onDelete: (worktreePath: string) => void
   onCreate: (name: string) => void
   /** 单击：把 graph 定位到该 worktree 的 HEAD。传入完整 oid。 */
   onSelect: (headHash: string, name: string) => void
   /** 当前被单击选中的 worktree 路径。 */
   selectedPath: string | null
+}
+
+function WorktreeIcon() {
+  return (
+    <svg className="sb-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3">
+      <rect x="2.5" y="3.5" width="11" height="9" rx="1.5" />
+      <path d="M2.5 6.5h11" />
+    </svg>
+  )
 }
 
 export function WorktreeView({
@@ -23,8 +34,11 @@ export function WorktreeView({
   const { menu, open, close } = useContextMenu()
 
   return (
-    <div className="sidebar-panel">
-      <h3>Worktrees</h3>
+    <SidebarSection
+      title="WORKTREES"
+      count={worktrees.length}
+      action={{ title: 'New worktree', onClick: () => onCreate(`wt-${Date.now()}`) }}
+    >
       {worktrees.map((wt) => {
         const isCurrent = samePath(wt.path, currentPath)
         const isOpen = openPaths.some((p) => samePath(p, wt.path))
@@ -38,7 +52,7 @@ export function WorktreeView({
           },
           {
             label: 'Delete worktree',
-            onSelect: () => onDelete(wt.name),
+            onSelect: () => onDelete(wt.path),
             disabled: !canDelete,
             danger: true,
           },
@@ -47,11 +61,11 @@ export function WorktreeView({
           <div
             key={wt.path}
             className={[
-              'worktree-row',
-              isCurrent ? 'active' : '',
+              'sb-row',
+              isCurrent ? 'current' : '',
               samePath(wt.path, selectedPath ?? '') ? 'selected' : '',
             ].filter(Boolean).join(' ')}
-            title={`单击定位到它的 HEAD · ${isOpen ? '双击切到它的标签页' : '双击在新标签页打开'} · 右键更多操作`}
+            title={`${wt.path}\n单击定位到它的 HEAD · ${isOpen ? '双击切到它的标签页' : '双击在新标签页打开'} · 右键更多操作`}
             // 单击只定位，不碰工作区——与分支列表保持一致的交互
             onClick={() => onSelect(wt.head, wt.name)}
             // 不加 isOpen 判断：App 的 openInNewTab 本来就会「已开就切过去」，
@@ -59,15 +73,31 @@ export function WorktreeView({
             onDoubleClick={() => onOpenInNewTab(wt.path)}
             onContextMenu={(e) => open(e, items)}
           >
-            <span className="worktree-name">
-              {wt.name} {wt.branch && `(${wt.branch})`}
+            <WorktreeIcon />
+            <span className="sb-label">{wt.name}</span>
+            {wt.branch && <span className="sb-sub">{wt.branch}</span>}
+            {/* 行内操作平时不占视觉，hover 才出现 */}
+            <span className="sb-actions">
+              <button
+                title={isOpen ? '切到它的标签页' : '在新标签页打开'}
+                onClick={(e) => { e.stopPropagation(); onOpenInNewTab(wt.path) }}
+              >
+                ↗
+              </button>
+              <button
+                className="danger"
+                title={canDelete ? '删除这个 worktree' : wt.isMain ? '主工作区不能删' : '当前打开的工作区不能删'}
+                disabled={!canDelete}
+                onClick={(e) => { e.stopPropagation(); onDelete(wt.path) }}
+              >
+                ✕
+              </button>
             </span>
-            {isOpen && !isCurrent && <span className="worktree-badge">open</span>}
+            {isCurrent && <span className="sb-current-dot" title="当前工作区" />}
           </div>
         )
       })}
-      <button onClick={() => onCreate(`wt-${Date.now()}`)}>+ New worktree</button>
       <ContextMenu menu={menu} onClose={close} />
-    </div>
+    </SidebarSection>
   )
 }

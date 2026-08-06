@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { Panel, Group, Separator } from 'react-resizable-panels'
@@ -7,8 +7,11 @@ import { BranchView } from './BranchView'
 import { WorktreeView } from './WorktreeView'
 import { CommitDetailView } from './CommitDetailView'
 import { LocalChangesView } from './LocalChangesView'
+import { Toolbar } from './Toolbar'
+import { StashView } from './StashView'
 import { useRepoStore, useRepoEffects } from '../store/repoStore'
 import { samePath } from '../engine/path'
+import { askConfirm } from '../engine/confirm'
 
 type ViewMode = 'commits' | 'changes'
 
@@ -69,14 +72,18 @@ interface RepoTabProps {
 export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
   const {
     state, openRepo, refreshHead, refreshGraph, refreshStatus, refreshWorktrees,
-    refreshDiff, selectCommit, clearError, reportError,
+    refreshDiff, refreshUpstream, refreshStashes, selectCommit, clearError, reportError,
   } = useRepoStore()
   const [repoState, setRepoState] = useState<string>('normal')
   const [viewMode, setViewMode] = useState<ViewMode>('commits')
   const [selectedBranch, setSelectedBranch] = useState<string | null>(null)
   const [selectedWorktree, setSelectedWorktree] = useState<string | null>(null)
 
-  useRepoEffects(state, { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff }, viewMode)
+  useRepoEffects(
+    state,
+    { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes },
+    viewMode,
+  )
 
   useEffect(() => {
     openRepo(repoPath)
@@ -134,6 +141,59 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
     }
   }, [state.path, reportError])
 
+  /** 工具栏动作：跑完把所有受影响的状态刷一遍。 */
+  const runToolbar = useCallback(async (command: string, args: Record<string, unknown>) => {
+    const path = state.path
+    if (!path) return
+    const before = state.headHash
+    try {
+      await invoke(command, { path, ...args })
+      // fetch/pull/push/stash 会同时影响图、状态、上游计数和 stash 列表
+      const after = await refreshHead(path)
+      // HEAD 动了才把选中挪过去：pull 会动，fetch/push/stash 不会，
+      // 不加这个判断的话点 Fetch 也会把你正在看的提交拽走
+      await refreshGraph(path, after, after !== before)
+      await refreshStatus(path)
+      await refreshUpstream(path)
+      await refreshStashes(path)
+    } catch (err) {
+      reportError(err)
+    }
+  }, [state.path, state.headHash, refreshHead, refreshGraph, refreshStatus, refreshUpstream, refreshStashes, reportError])
+
+  /**
+   * 丢弃改动。这是界面上少数不可逆的操作之一，必须先确认。
+   *
+   * 未跟踪文件在 git 里没有任何副本，删了就找不回来了——确认框要把它们和
+   * 「能从 git 恢复」的那些分开列出来，否则用户没法判断这次点下去的代价。
+   */
+  const handleDiscard = useCallback(async (paths: string[], staged: boolean) => {
+    const path = state.path
+    if (!path || paths.length === 0) return
+    // Unstaged 区里 status 为 added 的就是未跟踪文件
+    const gone = staged
+      ? []
+      : state.status.unstaged.filter((f) => paths.includes(f.path) && f.status === 'added').map((f) => f.path)
+    const recoverable = paths.filter((p) => !gone.includes(p))
+
+    const lines = ['丢弃以下改动？']
+    if (recoverable.length > 0) {
+      lines.push('', `恢复到${staged ? ' HEAD' : '暂存区的内容'}（${recoverable.length}）：`, ...recoverable.map((p) => `  ${p}`))
+    }
+    if (gone.length > 0) {
+      lines.push('', `永久删除，无法恢复（${gone.length}）：`, ...gone.map((p) => `  ${p}`))
+    }
+    if (!(await askConfirm(lines.join('\n'), 'Discard changes'))) return
+
+    try {
+      await invoke('discard', { path, paths, staged })
+      await refreshStatus(path)
+      await refreshDiff(path, 'workdir')
+    } catch (err) {
+      reportError(err)
+    }
+  }, [state.path, state.status.unstaged, refreshStatus, refreshDiff, reportError])
+
   /** 单击分支：只选中并把 graph 定位到它的 tip，不碰工作区。 */
   const handleSelectBranch = useCallback((name: string, hash: string) => {
     setSelectedBranch(name)
@@ -155,6 +215,23 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
     selectCommit(headHash)
   }, [selectCommit, state.commits, reportError])
 
+  // stash 提交不被任何分支引用，所以不在 load_graph 的输出里。选中一条 stash 时
+  // 从它自己的元数据现搭一个 CommitNode，否则详情面板只会显示 "Select a commit"——
+  // diff 明明已经取回来了，却因为查不到提交而整片空白。
+  const detailCommit = useMemo(() => {
+    const fromGraph = state.commits.find((c) => c.id === state.selectedId)
+    if (fromGraph) return fromGraph
+    const stash = state.stashes.find((s) => s.hash === state.selectedId)
+    if (!stash) return null
+    return {
+      id: stash.hash,
+      parents: stash.parents,
+      author: stash.author,
+      time: stash.time,
+      message: stash.message,
+    }
+  }, [state.commits, state.stashes, state.selectedId])
+
   if (state.loading && state.commits.length === 0) return <div style={{ padding: 16 }}>Loading...</div>
 
   return (
@@ -166,10 +243,12 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
           <button onClick={clearError}>×</button>
         </div>
       )}
+      <Toolbar branch={state.head} upstream={state.upstream} onRun={runToolbar} />
       <div className="repo-path-bar" title={state.path ?? ''}>{state.path} @ {state.head}</div>
       <div style={{ flex: 1, overflow: 'hidden' }}>
         <Group orientation="horizontal">
-          <Panel defaultSize="20%" minSize="15%" maxSize="40%" style={{ display: 'flex', flexDirection: 'column' }}>
+          {/* 22%：分支名普遍带 feat/ 前缀，20% 时连 worktree 名字都存不下 */}
+          <Panel defaultSize="22%" minSize="15%" maxSize="40%" style={{ display: 'flex', flexDirection: 'column' }}>
             <div style={{ flex: 1, overflow: 'auto' }}>
               <SidebarNav
                 mode={viewMode}
@@ -182,8 +261,10 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
                 selectedBranch={selectedBranch}
                 onSelect={handleSelectBranch}
                 onCheckout={(name) => runAndRefresh('checkout', { rev: name }, async () => {
-                  await refreshHead(state.path!)
-                  await refreshGraph(state.path!)
+                  const before = state.headHash
+                  const after = await refreshHead(state.path!)
+                  // 切分支后选中要跟到新分支的 tip 上，否则图停在旧位置
+                  await refreshGraph(state.path!, after, after !== before)
                   await refreshStatus(state.path!)
                 })}
                 onCreate={(name, start) => runAndRefresh('create_branch', { name, startPoint: start ?? null }, async () => await refreshGraph(state.path!))}
@@ -203,7 +284,23 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
                   state.worktrees.find((w) => w.name === selectedWorktree)?.path ?? null
                 }
                 onCreate={(name) => runAndRefresh('create_worktree', { name }, async () => await refreshWorktrees(state.path!))}
-                onDelete={(name) => runAndRefresh('delete_worktree', { name }, async () => await refreshWorktrees(state.path!))}
+                onDelete={(wtPath) => runAndRefresh('delete_worktree', { worktreePath: wtPath }, async () => await refreshWorktrees(state.path!))}
+              />
+              <StashView
+                stashes={state.stashes}
+                selectedId={state.selectedId}
+                onSelect={(hash) => { setViewMode('commits'); selectCommit(hash) }}
+                onApply={(index) => runAndRefresh('stash_apply', { index }, async () => {
+                  await refreshStatus(state.path!)
+                  await refreshStashes(state.path!)
+                })}
+                onPop={(index) => runAndRefresh('stash_pop', { index }, async () => {
+                  await refreshStatus(state.path!)
+                  await refreshStashes(state.path!)
+                })}
+                onDrop={(index) => runAndRefresh('stash_drop', { index }, async () => {
+                  await refreshStashes(state.path!)
+                })}
               />
             </div>
           </Panel>
@@ -225,7 +322,7 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
                 <Separator style={{ height: 4, background: '#333' }} />
                 <Panel defaultSize="35%" minSize="15%" maxSize="65%">
                   <CommitDetailView
-                    commit={state.commits.find((c) => c.id === state.selectedId) ?? null}
+                    commit={detailCommit}
                     diff={state.diff}
                   />
                 </Panel>
@@ -236,6 +333,7 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
                 diff={state.diff}
                 onStage={(paths) => runAndRefresh('stage', { paths }, async () => { await refreshStatus(state.path!); await refreshDiff(state.path!, 'workdir') })}
                 onUnstage={(paths) => runAndRefresh('unstage', { paths }, async () => { await refreshStatus(state.path!); await refreshDiff(state.path!, 'workdir') })}
+                onDiscard={(paths, staged) => void handleDiscard(paths, staged)}
                 onCommit={handleCommit}
               />
             )}

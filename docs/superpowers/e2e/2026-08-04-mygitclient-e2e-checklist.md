@@ -342,3 +342,85 @@ owner 1（主干链）到第 12 行结束，owner 3（feat-mvp 链）从第 13 �
 的顶端、合并线改从环形节点侧向分出，不再穿过它的圆点。
 
 `cargo test` 13 passed，`pnpm test` 58 passed。
+
+---
+
+## 2026-08-06 Git 操作工具栏（阶段二）
+
+分支 `feat/git-ops-toolbar`，从 PR #3 合并后的 master 开出。
+
+测试用一次性仓库，**没有碰任何真实仓库**：scratchpad 下 `e2egit-remote`（bare）
++ `e2egit-local` + `e2egit-other`（第二个克隆，用来造远程侧的新提交）。
+push / force push 全在这套里跑。
+
+驱动方式同上一轮：`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222`
+起 `pnpm tauri dev`，用 CDP 的 `Runtime.evaluate` / `Page.captureScreenshot`。
+应用没有程序化开标签的入口（只有原生对话框和双击 worktree），所以临时把
+`DEFAULT_REPO_PATH` 指向测试仓库走 HMR，验完已还原。
+
+| # | 检查项 | 结果 | 证据 |
+|---|---|---|---|
+| 1 | 工具栏出现，显示分支名与四个按钮 | 通过 | `⎇ feature` + Fetch/Pull/Push/Stash；Stashes 面板显示 "No stashes" |
+| 2 | 按住 Ctrl 四个按钮文字同时变、整排换橙 | 通过 | 标签变 Fetch all / Pull (rebase) / Force push / Stash all；边框 `rgb(85,85,85)` → `rgb(255,183,77)` |
+| 3 | 松开 Ctrl 全部还原 | 通过 | 标签与边框色均回到默认 |
+| 4 | 按住 Ctrl 切走窗口再回来必须已还原 | 通过 | 只派发 `blur`、不派发 `keyup`，四个按钮全部复位 |
+| 5 | 点 Fetch，`origin/master` 移动 | 通过 | `d07eda6` → `8953583`，Pull 自动长出 `↓1` |
+| 6 | 点 Pull，远程文件进工作区、徽章消失 | 通过 | `remote-side.txt` 出现，`↓1` 消失 |
+| 7 | 本地提交出现 `↑1`，Push 后消失 | 通过 | 徽章由文件监听自动刷出（未点任何按钮）；push 后远程 = 本地 HEAD `b422f41` |
+| 8 | 无上游的新分支 Push 自动补 `-u` | 通过 | `git rev-parse --abbrev-ref feature@{upstream}` → `origin/feature` |
+| 9 | Ctrl+Push 弹确认框、文案带分支名；取消什么都不做 | 通过（**修复后**，见下） | 对话框标题 Force push、正文 `Force-push feature? This can overwrite commits on the remote.`；取消后远程仍为 `b5555e1f`；确定后强推生效，远程 = 本地 `da964eb` |
+| 10 | 改文件点 Stash，面板出现条目、工作区干净 | 通过 | `{0} WIP on feature: da964eb f2-rewritten`，`a.txt` 还原 |
+| 11 | 点 stash 条目，下方显示它的内容 | 通过（**修复后**，见下） | SHA `6de357f…`、作者 Test、`a.txt +1/-1`；Changes 页显示 `-hello` / `+modified content` |
+| 12 | 右键 → Pop，改动回工作区、条目消失 | 通过 | 菜单为 Apply/Pop/Drop；pop 后 `a.txt` = `modified content`，`git stash list` 为空 |
+| 13 | Ctrl+Stash 连未跟踪文件一起存 | 通过 | 按钮文字为 `Stash all`；`untracked.txt` 从工作区消失 |
+| 14 | 认证失败快速报错而非挂死 | 通过 | 见下 |
+
+### 第 9 条暴露的真 bug：强推确认从来没生效过
+
+第一次跑的时候一个对话框都没弹，**强推直接推上去了**。
+
+根因两层：
+
+1. 计划里写的是 `if (plan.confirm && !window.confirm(plan.confirm)) return`。
+   在标准浏览器里对，在 Tauri 里错——dialog 插件把全局 `window.confirm` 换成了
+   async 函数（CDP 读到的实现是
+   `async function(i){ return await n("plugin:dialog|confirm", { message: i.toString() }) }`）。
+   返回的是 Promise，恒为真值，`!promise` 永远是 `false`，守卫静默失效。
+2. `src-tauri/capabilities/default.json` 只授了 `dialog:allow-open`。就算 await 了，
+   `confirm` 也会被权限层拒掉——所以连框都出不来。
+
+改法：改用 `@tauri-apps/plugin-dialog` 导出的 `confirm` 并 `await`，补上
+`dialog:allow-confirm`，并把弹框失败一律当作「没确认」（fail-closed）——这是工具栏上
+唯一不可逆的动作，宁可什么都不做也不能在没问过的情况下推上去。
+
+原生对话框是 Rust 侧弹的模态子窗口，`Page.javascriptDialogOpening` 拦不到，
+所以用 Win32 `EnumWindows` 定位（class `#32770`、标题 `Force push`），
+再 `WM_COMMAND` 发 IDCANCEL(2) / IDOK(1) 分别验证取消与确定两条路径。
+
+### 第 11 条暴露的问题：点 stash 出现空白面板
+
+stash 提交不被任何分支引用，因此不在 `load_graph` 的输出里。`CommitDetailView` 靠
+`state.commits.find(...)` 拿提交，查不到就渲染 "Select a commit"——diff 明明已经取回来了，
+面板却整片空白。和上一轮 worktree 游离 HEAD 是同一类悬空 `selectedId` 问题。
+
+改法：`StashEntry` 补上 `author` / `time` / `parents`（libgit2 按 oid 查提交即可），
+`RepoTab` 在图里查不到时用这些元数据现搭一个 `CommitNode`。
+新增 Rust 用例 `entry_carries_enough_metadata_for_the_detail_panel` 覆盖。
+
+### 第 14 条：GIT_TERMINAL_PROMPT=0 的直接证据
+
+先用不可达地址（`https://example.invalid`）试了一次：1835ms 出红色横幅，按钮解禁。
+但那条走的是 TLS 失败，不是认证提示。于是起了一个只回 `401 WWW-Authenticate: Basic`
+的本地服务器（127.0.0.1:8899），并把仓库的 `credential.helper` 置空，逼 git 走终端提示：
+
+```
+[git_cli] fatal: could not read Username for 'http://127.0.0.1:8899': terminal prompts disabled
+```
+
+259ms 出横幅，按钮解禁。错误原文里的 "terminal prompts disabled" 就是这道防线生效的
+直接证据——没有它，git 会打印 `Username:` 然后无限等 stdin。
+
+### 测试统计
+
+`cargo test` 42 passed（git_cli 3 / upstream 4 / remote 6 / stash 9 / 既有 20）、
+`pnpm test` 71 passed、`pnpm exec tsc --noEmit` 无错误。

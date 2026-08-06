@@ -1,0 +1,91 @@
+import { useCallback, useEffect, useState } from 'react'
+import { askConfirm } from '../engine/confirm'
+import type { UpstreamInfo } from '../engine/types'
+import { planToolbarAction, type ToolbarAction } from '../engine/toolbarActions'
+
+/**
+ * 跟踪 Ctrl 是否按下。
+ *
+ * 必须在 blur 时强制复位：按着 Ctrl 切走窗口再切回来，keyup 事件不会送到
+ * 本窗口，按钮会永久卡在变体状态上——用户会在毫不知情的情况下强推。
+ */
+export function useCtrlHeld(): boolean {
+  const [held, setHeld] = useState(false)
+  useEffect(() => {
+    const down = (e: KeyboardEvent) => { if (e.key === 'Control') setHeld(true) }
+    const up = (e: KeyboardEvent) => { if (e.key === 'Control') setHeld(false) }
+    const reset = () => setHeld(false)
+    window.addEventListener('keydown', down)
+    window.addEventListener('keyup', up)
+    window.addEventListener('blur', reset)
+    return () => {
+      window.removeEventListener('keydown', down)
+      window.removeEventListener('keyup', up)
+      window.removeEventListener('blur', reset)
+    }
+  }, [])
+  return held
+}
+
+interface ToolbarProps {
+  /** 当前分支名，来自 state.head。 */
+  branch: string
+  upstream: UpstreamInfo | null
+  /** 执行一次工具栏动作；由 RepoTab 负责 invoke 与刷新。 */
+  onRun: (command: string, args: Record<string, unknown>) => Promise<void>
+}
+
+const ACTIONS: ToolbarAction[] = ['fetch', 'pull', 'push', 'stash']
+
+export function Toolbar({ branch, upstream, onRun }: ToolbarProps) {
+  const ctrl = useCtrlHeld()
+  const [busy, setBusy] = useState<ToolbarAction | null>(null)
+
+  const run = useCallback(async (action: ToolbarAction) => {
+    const plan = planToolbarAction(action, ctrl, branch)
+    if (plan.confirm && !(await askConfirm(plan.confirm, 'Force push'))) return
+    setBusy(action)
+    try {
+      await onRun(plan.command, plan.args)
+    } finally {
+      setBusy(null)
+    }
+  }, [ctrl, branch, onRun])
+
+  /** Pull 显示落后数、Push 显示领先数；没有上游就不显示。 */
+  const badge = (action: ToolbarAction): number => {
+    if (!upstream?.upstream) return 0
+    if (action === 'pull') return upstream.behind
+    if (action === 'push') return upstream.ahead
+    return 0
+  }
+
+  return (
+    <div className="toolbar">
+      <span className="toolbar-branch" title={upstream?.upstream ?? 'no upstream'}>
+        ⎇ {branch}
+      </span>
+      <span className="toolbar-sep" />
+      {ACTIONS.map((action) => {
+        const plan = planToolbarAction(action, ctrl, branch)
+        const count = badge(action)
+        return (
+          <button
+            key={action}
+            className={`toolbar-button${ctrl ? ' variant' : ''}`}
+            disabled={busy !== null}
+            onClick={() => void run(action)}
+            data-action={action}
+          >
+            {busy === action ? '…' : plan.label}
+            {count > 0 && (
+              <span className="toolbar-badge">
+                {action === 'pull' ? '↓' : '↑'}&thinsp;{count}
+              </span>
+            )}
+          </button>
+        )
+      })}
+    </div>
+  )
+}

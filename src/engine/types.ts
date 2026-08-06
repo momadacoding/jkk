@@ -18,6 +18,13 @@ export interface RefPointer {
   name: string
   hash: string
   kind: 'head' | 'branch' | 'remote' | 'tag' | 'other'
+  /**
+   * 本地分支相对其上游的领先/落后数；没有上游或不是本地分支时为 null。
+   *
+   * null 和 0 含义不同：没上游时不画徽章，同步时画个 0 也是噪音。
+   */
+  ahead: number | null
+  behind: number | null
 }
 
 export interface CommitNode {
@@ -63,4 +70,26 @@ export interface FileDiff {
 
 export interface DiffData {
   files: FileDiff[]
+}
+
+export interface UpstreamInfo {
+  /** 当前分支名，不带 refs/heads/ 前缀。 */
+  branch: string
+  /** 上游简称如 "origin/master"；没设上游时为 null。 */
+  upstream: string | null
+  ahead: number
+  behind: number
+}
+
+export interface StashEntry {
+  /** stash@{N} 里的 N，0 最新。 */
+  index: number
+  message: string
+  /** stash 本身是个提交，可直接用于 `commit:<hash>` diff scope。 */
+  hash: string
+  author: string
+  /** 提交时间，Unix 秒。 */
+  time: number
+  /** 父提交。stash 是个 merge 提交，第一父是 stash 时所在的那个提交。 */
+  parents: string[]
 }
