@@ -317,3 +317,28 @@ owner 1（主干链）到第 12 行结束，owner 3（feat-mvp 链）从第 13 �
 `-1 >= 0 - 2` 成立，空车道会被误判为已占用（已加单测锁住）。
 
 单测增至 58 passed（layout 15 / paths 11 / owners 12 / workdir 8 / path 6 / errors 6）。
+
+### 追加修复三：提交排序（用户发现 3a63421 位置不对，2026-08-06）
+
+用户问「3a63421 是不是漏掉了」。查下来它**没漏**——后端数据第 15 条、DOM 已渲染、
+带着 `refs/heads/feat-mvp`。但它被排在了 `Merge pull request #1` **下面**，
+而它的提交时间（8/6 2:25 AM）比那个合并提交（8/5 3:17 PM）更新。
+
+原因：`engine/graph.rs` 只设了 `Sort::TOPOLOGICAL`。该排序只保证「子在父之前」，
+**互不相关的两个提交之间顺序是任意的**，实际取决于 revwalk 的 push 顺序。
+
+视觉后果很具体：3a63421 与合并的第二父 2dbba11 同属 feat-mvp 那条链、同一车道，
+而它恰好夹在 `Merge PR #1` 与 2dbba11 之间。合并连向第二父的线于是**从 3a63421 的
+圆点上直接穿过去**——它看上去不是一个独立的分支 tip，而像合并线上的中转点。
+
+改法：`Sort::TOPOLOGICAL | Sort::TIME`，即 `git log --date-order` 的语义：
+不破坏拓扑的前提下按提交时间从新到旧。
+
+复验：新增 `graph_puts_newer_unmerged_tip_above_older_merge`，用固定
+`GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE` 构造「未合并 tip 比合并提交更新」的形状。
+改之前该用例失败并打印出实际顺序
+`[("merge feature", 1767398400), ("f2", 1767484800), ...]`，改之后通过。
+运行时复验：3a63421 索引由 15 移到 14，排到 fa43adf 之前；截图确认它成为紫色车道
+的顶端、合并线改从环形节点侧向分出，不再穿过它的圆点。
+
+`cargo test` 13 passed，`pnpm test` 58 passed。
