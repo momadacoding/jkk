@@ -144,18 +144,21 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
   const runToolbar = useCallback(async (command: string, args: Record<string, unknown>) => {
     const path = state.path
     if (!path) return
+    const before = state.headHash
     try {
       await invoke(command, { path, ...args })
       // fetch/pull/push/stash 会同时影响图、状态、上游计数和 stash 列表
-      await refreshHead(path)
-      await refreshGraph(path)
+      const after = await refreshHead(path)
+      // HEAD 动了才把选中挪过去：pull 会动，fetch/push/stash 不会，
+      // 不加这个判断的话点 Fetch 也会把你正在看的提交拽走
+      await refreshGraph(path, after, after !== before)
       await refreshStatus(path)
       await refreshUpstream(path)
       await refreshStashes(path)
     } catch (err) {
       reportError(err)
     }
-  }, [state.path, refreshHead, refreshGraph, refreshStatus, refreshUpstream, refreshStashes, reportError])
+  }, [state.path, state.headHash, refreshHead, refreshGraph, refreshStatus, refreshUpstream, refreshStashes, reportError])
 
   /** 单击分支：只选中并把 graph 定位到它的 tip，不碰工作区。 */
   const handleSelectBranch = useCallback((name: string, hash: string) => {
@@ -223,8 +226,10 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
                 selectedBranch={selectedBranch}
                 onSelect={handleSelectBranch}
                 onCheckout={(name) => runAndRefresh('checkout', { rev: name }, async () => {
-                  await refreshHead(state.path!)
-                  await refreshGraph(state.path!)
+                  const before = state.headHash
+                  const after = await refreshHead(state.path!)
+                  // 切分支后选中要跟到新分支的 tip 上，否则图停在旧位置
+                  await refreshGraph(state.path!, after, after !== before)
                   await refreshStatus(state.path!)
                 })}
                 onCreate={(name, start) => runAndRefresh('create_branch', { name, startPoint: start ?? null }, async () => await refreshGraph(state.path!))}

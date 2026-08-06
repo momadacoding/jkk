@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from 'react'
 import type { CommitNode, DiffData, GraphData, RefPointer, RepoInfo, StashEntry, StatusData, UpstreamInfo, Worktree } from '../engine/types'
 import { toErrorMessage } from '../engine/errors'
 import { samePath } from '../engine/path'
+import { nextSelection } from '../engine/selection'
 
 export interface RepoState {
   path: string | null
@@ -61,33 +62,36 @@ export function useRepoStore() {
     }
   }, [])
 
-  /** 重新读取 HEAD。checkout 之后必须调用，否则 header 与分支高亮会停在旧分支。 */
-  const refreshHead = async (path: string) => {
+  /**
+   * 重新读取 HEAD，返回新的 headHash。
+   *
+   * checkout 之后必须调用，否则 header 与分支高亮会停在旧分支。返回值让调用方
+   * 能判断 HEAD 有没有动——上面那次 setState 是异步的，读 state 拿到的是旧值。
+   */
+  const refreshHead = async (path: string): Promise<string> => {
     const info = await invoke<RepoInfo>('open_repo', { path })
     setState((s) => ({ ...s, head: info.head, headHash: info.headHash }))
+    return info.headHash
   }
 
   /**
    * 重新加载提交图。
    *
-   * `preferredId` 只在还没有任何选中时生效，用来把首次打开的仓库定位到它自己的
+   * `preferredId` 默认只在还没有任何选中时生效，用来把首次打开的仓库定位到它自己的
    * HEAD。不传的话会退回「图上第一条提交」——那是**全局最新**的提交，可能属于
    * 另一条分支，跟你刚打开的这个 worktree 毫无关系。
+   *
+   * `force` 让 preferredId 压过已有选中，用于 pull / checkout 这类由用户主动点出来、
+   * 且移动了 HEAD 的操作。选中判定见 `nextSelection`。
    */
-  const refreshGraph = async (path: string, preferredId?: string) => {
+  const refreshGraph = async (path: string, preferredId?: string, force = false) => {
     const data = await invoke<GraphData>('load_graph', { path })
-    setState((s) => {
-      // HEAD 万一不在这批数据里（5000 条上限截断）就退回最新一条
-      const preferred = preferredId && data.commits.some((c) => c.id === preferredId)
-        ? preferredId
-        : undefined
-      return {
-        ...s,
-        commits: data.commits,
-        refs: data.refs,
-        selectedId: s.selectedId ?? preferred ?? data.commits[0]?.id ?? null,
-      }
-    })
+    setState((s) => ({
+      ...s,
+      commits: data.commits,
+      refs: data.refs,
+      selectedId: nextSelection(s.selectedId, data.commits.map((c) => c.id), preferredId, force),
+    }))
   }
 
   const refreshStatus = async (path: string) => {
@@ -145,7 +149,7 @@ export function useRepoStore() {
 
 /** `useRepoEffects` 需要的刷新函数集合。 */
 export interface RepoRefreshers {
-  refreshHead: (path: string) => Promise<void>
+  refreshHead: (path: string) => Promise<string>
   refreshGraph: (path: string) => Promise<void>
   refreshStatus: (path: string) => Promise<void>
   refreshWorktrees: (path: string) => Promise<void>
