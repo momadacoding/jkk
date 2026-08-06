@@ -1,4 +1,5 @@
 import type { LayoutNode, LanePath, PathSegment } from './graphTypes'
+import { WORKDIR_ID } from './owners'
 
 /** 按 lane 分配的高区分度调色板，12 色循环。 */
 export const LANE_PALETTE = [
@@ -15,6 +16,17 @@ export const LANE_PALETTE = [
  */
 export function laneColor(lane: number): string {
   return LANE_PALETTE[Math.abs(lane) % LANE_PALETTE.length]
+}
+
+/**
+ * 把车道色转成低透明度底色，给 ref 标签用。
+ *
+ * 标签底色跟着车道走，眼睛才能把「这个分支名」和「图上哪条线」连起来；
+ * 统一的灰底做不到这一点。
+ */
+export function laneTint(color: string, alpha: number): string {
+  const n = Number.parseInt(color.slice(1), 16)
+  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`
 }
 
 /**
@@ -66,6 +78,11 @@ export function computePaths(rows: LayoutNode[], rowHeight: number, laneWidth: n
         x2: px,
         y2: py,
         curve: parentNode.lane !== node.lane,
+        // 线归谁的车道，拐角就在另一端：第一父的线在子节点车道里往下走，
+        // 到父节点那行才拐；第二父的线属于父节点车道，从子节点横出去后就竖下去。
+        cornerAtTop: !parent.isMain,
+        // 伪行连到 HEAD 的边不是真实的父子关系，画成虚线
+        dashed: node.commit.id === WORKDIR_ID,
       }
       path.segments.push(segment)
     }

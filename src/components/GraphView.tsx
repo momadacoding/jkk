@@ -1,8 +1,9 @@
 import { useMemo, useRef, useState, useCallback, useEffect } from 'react'
 import type { CommitNode, RefPointer } from '../engine/types'
 import { computeLayout } from '../engine/layout'
-import { computePaths, filterPathsToBand } from '../engine/paths'
+import { computePaths, filterPathsToBand, laneColor } from '../engine/paths'
 import { createSvgRenderer } from '../engine/svgRenderer'
+import { WORKDIR_ID, withWorkdirRow } from '../engine/workdir'
 import { CommitRow } from './CommitRow'
 
 const ROW_HEIGHT = 28
@@ -14,11 +15,19 @@ interface GraphViewProps {
   refs: RefPointer[]
   selectedId: string | null
   onSelect: (id: string) => void
+  /** 当前 HEAD 的完整 oid（不是分支名），用来挂工作区伪行。 */
+  headHash: string
+  /** 未提交改动数，显示在工作区伪行上。 */
+  changeCount: number
+  /** 点击工作区伪行时切到 Local Changes 视图。 */
+  onOpenChanges: () => void
 }
 
 const renderer = createSvgRenderer()
 
-export function GraphView({ commits, refs, selectedId, onSelect }: GraphViewProps) {
+export function GraphView({
+  commits, refs, selectedId, onSelect, headHash, changeCount, onOpenChanges,
+}: GraphViewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const [scrollTop, setScrollTop] = useState(0)
   const [viewportHeight, setViewportHeight] = useState(600)
@@ -26,7 +35,8 @@ export function GraphView({ commits, refs, selectedId, onSelect }: GraphViewProp
   // 布局与路径对全量历史只算一次：父 commit 可能在视口外，线段必须完整生成，
   // 渲染阶段才按条带过滤（见下方 svg memo）。颜色按 lane 分配，与视口无关。
   const layout = useMemo(() => {
-    const rows = computeLayout(commits)
+    const withWorkdir = withWorkdirRow(commits, headHash || null)
+    const rows = computeLayout(withWorkdir, refs)
     const paths = computePaths(rows, ROW_HEIGHT, LANE_WIDTH)
     return {
       rows,
@@ -36,7 +46,7 @@ export function GraphView({ commits, refs, selectedId, onSelect }: GraphViewProp
       laneWidth: LANE_WIDTH,
       offsetY: 0,
     }
-  }, [commits])
+  }, [commits, refs, headHash])
 
   const startIndex = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN)
   const endIndex = Math.min(
@@ -80,16 +90,26 @@ export function GraphView({ commits, refs, selectedId, onSelect }: GraphViewProp
     return () => observer.disconnect()
   }, [])
 
-  // 选中的提交不在可见范围内时把它滚到中间；已经可见就不动，避免点击行时画面乱跳
+  // 选中的提交不在可见范围内时把它滚到中间；已经可见就不动，避免点击行时画面乱跳。
+  //
+  // 首次打开仓库时 store 会把 selectedId 预置成该 worktree 的 HEAD，于是这里顺带
+  // 完成「打开 worktree 就定位到它所在的提交」。
+  //
+  // 注意 clientHeight 为 0（标签被 display:none 隐藏）时这里直接放弃，且依赖数组里
+  // 没有高度——也就是说**只有在标签可见时才会定位**。目前成立是因为 `openInNewTab`
+  // 总会把新标签设为激活；之后若加「在后台打开标签」，新标签的定位会静默失效，
+  // 届时需要让 ResizeObserver 在拿到真实高度后补一次定位。
   useEffect(() => {
     const el = containerRef.current
     if (!el || !selectedId || el.clientHeight === 0) return
     const idx = commits.findIndex((c) => c.id === selectedId)
     if (idx < 0) return
-    const rowTop = idx * ROW_HEIGHT
+    // 插了工作区伪行后真实提交整体下移一行
+    const rowOffset = headHash ? 1 : 0
+    const rowTop = (idx + rowOffset) * ROW_HEIGHT
     if (rowTop >= el.scrollTop && rowTop + ROW_HEIGHT <= el.scrollTop + el.clientHeight) return
     el.scrollTop = Math.max(0, rowTop - el.clientHeight / 2 + ROW_HEIGHT / 2)
-  }, [selectedId, commits])
+  }, [selectedId, commits, headHash])
 
   const handleScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {
     scrollTopRef.current = e.currentTarget.scrollTop
@@ -100,13 +120,18 @@ export function GraphView({ commits, refs, selectedId, onSelect }: GraphViewProp
   const handleClick = useCallback((e: React.MouseEvent) => {
     const target = e.target as HTMLElement
     const id = target.closest('[data-id]')?.getAttribute('data-id')
-    if (id) onSelect(id)
-  }, [onSelect])
+    if (!id) return
+    // 工作区伪行不是提交，选不了；点它等于进 Local Changes
+    if (id === WORKDIR_ID) onOpenChanges()
+    else onSelect(id)
+  }, [onSelect, onOpenChanges])
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (!selectedId) return
+      // commits 不含伪行，键盘导航天然跳过它
       const idx = commits.findIndex((c) => c.id === selectedId)
+      if (idx < 0) return
       if (e.key === 'ArrowUp' && idx > 0) onSelect(commits[idx - 1].id)
       if (e.key === 'ArrowDown' && idx < commits.length - 1) onSelect(commits[idx + 1].id)
     }
@@ -144,6 +169,9 @@ export function GraphView({ commits, refs, selectedId, onSelect }: GraphViewProp
               refs={refByHash[node.commit.id] ?? []}
               selected={selectedId === node.commit.id}
               layoutWidth={layoutWidth}
+              laneColor={laneColor(node.lane)}
+              changeCount={changeCount}
+              isHead={node.commit.id === headHash}
             />
           ))}
         </div>

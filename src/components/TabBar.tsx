@@ -40,7 +40,11 @@ export function TabBar({ tabs, activeId, onActivate, onClose, onOpenRepo }: TabB
           )}
         </div>
       ))}
-      <button className="tab-open" onClick={onOpenRepo} title="Open a repository in a new tab">+</button>
+      {/* 带文字标签：只有一个灰色小加号时用户找不到「打开仓库」在哪 */}
+      <button className="tab-open" onClick={onOpenRepo} title="Open a repository in a new tab">
+        <span className="tab-open-icon">+</span>
+        <span>Open Repo</span>
+      </button>
     </div>
   )
 }

@@ -20,7 +20,14 @@ pub struct GraphData {
 pub fn load(path: &str) -> Result<GraphData> {
     let repo = Repository::open(path)?;
     let mut walk = repo.revwalk()?;
-    walk.set_sorting(git2::Sort::TOPOLOGICAL)?;
+    // TOPOLOGICAL 只保证「子在父之前」，互不相关的两个提交之间顺序是任意的，
+    // 取决于下面 push 的顺序。加上 TIME 才是 `git log --date-order` 的语义：
+    // 在不破坏拓扑的前提下按提交时间从新到旧。
+    //
+    // 少了 TIME 会有具体的视觉后果：一个比合并提交更新的未合并分支 tip 会掉到
+    // 合并提交下面，而合并连向第二父的线正好经过该 tip 所在的车道，
+    // 于是那条线从它的圆点上穿过去，看上去它不是分支 tip 而是合并线的中转点。
+    walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
     walk.push_head()?;
     for branch in repo.branches(None)? {
         let (branch, _) = branch?;

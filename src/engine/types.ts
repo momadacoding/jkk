@@ -8,7 +8,10 @@ export interface Worktree {
 
 export interface RepoInfo {
   path: string
+  /** 给人看的分支名。 */
   head: string
+  /** HEAD 的完整 oid，工作区伪行挂在它上面。 */
+  headHash: string
 }
 
 export interface RefPointer {

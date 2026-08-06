@@ -238,3 +238,107 @@ Tauri dialog 与默认常量给反斜杠，两者永不相等。
 也通过行回调抛出，被当成内容渲染成 `Fdiff --git ...`、`H@@ -2,3 +2,4 @@`。
 改法：`diff_to_data` 只保留 origin 为 `' '` / `'+'` / `'-'` 的行。
 复验：workdir 与 commit 两种 scope 的 origin 集合都只剩内容字符。
+
+## 2026-08-06 Graph 车道重排（阶段一）
+
+分支 `feat/git-toolbar-and-graph-polish`。规格
+`docs/superpowers/specs/2026-08-06-toolbar-and-graph-lanes-design.md`，
+计划 `docs/superpowers/plans/2026-08-06-graph-lane-rework.md`。
+
+单测：`pnpm test` 53 passed（owners 12 / layout 12 / workdir 8 / paths 9 / path 6 / errors 6）。
+`cargo test` 12 passed。`tsc --noEmit` 无错误。
+`paths.test.ts` 与既有 3 条 layout 用例**未做任何改动**即通过。
+
+运行时验证走 CDP（WebView2 `--remote-debugging-port=9222`），打开本仓库自身。
+
+| # | 检查项 | 结果 | 证据 |
+| --- | --- | --- | --- |
+| 1 | master 在最左列 | 通过 | `master`/`ddd`（bc95955）圆点 cx=10，填充 `#4fc3f7` |
+| 2 | 分支 tip 不与 master 同车道 | 通过 | `feat/git-toolbar-and-graph-polish` cx=30、`feat/tabs-and-graph-fixes` cx=50，各自独立颜色 |
+| 3 | 工作区伪行 + 虚线 | 通过 | 顶行 `6 changes`，圆点 `fill=none` `stroke-dasharray=2 2`，虚线连到加粗行 |
+| 4 | 本地/远程标签可分 | 通过 | 本地 `border-left: 2.67px` 车道色 + 底色 `rgb(51,64,77)`；远程 `border-left: 0px`、底色 `rgb(47,47,47)` |
+| 5 | 标签紧跟消息 | 通过 | 截图 `g1-top.png`，标签在消息右侧而非窗口右缘 |
+| 6 | HEAD 行加粗 | 通过 | `.commit-row.head` 命中 bc95955 |
+| 7 | **切分支不改图** | 通过 | 见下方「双标签对照」 |
+| 8 | 点伪行进 Local Changes | 通过 | 导航项由 `All Commits` 变为 `Local Changes (6)`，`.local-changes-view` 出现 |
+| 9 | 上下键跳过伪行 | 通过 | `commits` 数组不含伪行，`findIndex` 返回 -1 时直接 return |
+| 10 | 滚到底部仍有圆点和线 | 通过 | 强制 260px 视口滚到底：15 行 / 15 圆点 / `dotsOutsideSvg: 0` / 行圆点偏移 0.00px，并截图 `g2-scrolled.png` 确认 |
+
+### 第 7 条的验证方法：双标签对照
+
+没有动用户的仓库做 checkout。改用一个更强的对照：主仓库与
+`.worktrees/git-toolbar` **共享同一份 refs 与提交**，但 HEAD 不同。
+两个标签同时打开，逐个提交比对圆点 x 坐标：
+
+- 标签 A：`mygitclient @ master`，加粗行 bc95955，伪行 cx=10
+- 标签 B：`.worktrees/git-toolbar @ feat/git-toolbar-and-graph-polish`，加粗行 7e5a881，伪行 cx=30
+- **29 个提交的车道全部相同（`laneDiffs: []`）**
+
+即 HEAD 只影响「哪一行加粗」和「伪行挂在哪」，不影响任何车道分配。
+
+### 已定：本地 master 落后时，lane 0 仍归本地 master
+
+本仓库的本地 `master`（bc95955）比 `origin/master`（b61263e）落后 17 个提交。
+按 tier 1 规则「本地 master 优先」，owner 0 只覆盖 bc95955 及其之前的
+3 个提交，lane 0 因此在图的上部是空的；真正的主干（`origin/master` 往上）
+落在 lane 1，与 `feat/git-toolbar-and-graph-polish` 共用车道和颜色。
+标签样式仍能区分两者（远程灰底无色条 vs 本地带色条）。
+
+**决定（2026-08-06）：保持本地优先，不改。** lane 0 的语义就是「你本地的
+master 在哪里」，本地落后时左边那条短线本身就是一个信号。阶段二的
+ahead/behind 徽章会把这个信息补全。
+
+否决的两个备选：
+- 「取更靠前的那个」——语义变得依赖同步状态，同一个仓库 fetch 前后图会跳。
+- 「远程优先」——本地刚提交还没推送时，你自己的新提交会被挤到 lane 1 去。
+
+### 追加修复（用户复检后发现，2026-08-06）
+
+复检时用户对照 Sublime Merge 指出两个问题，都不是车道分配的错，而是**连线渲染**：
+
+**一、跨车道的边画成横扫整段高度的巨大弧线。**
+`svgRenderer.tsx` 对所有 `curve: true` 的边一律用 `C x1 midY, x2 midY, x2 y2`。
+相邻两行之间是个好看的小弯，但 `Merge pull request #1` → `master` 这条第一父边
+**跨了 16 行**（实测 y 378 → 826），弧线横扫 448px，完全看不出它连的是哪两个提交。
+改法：线段笔直待在**它自己所属的那条车道**里，只在另一端拐一个 6px 圆角。
+拐角位置由归属决定——第一父的线归子节点车道，拐角在下；合并第二父的线归父节点
+车道，拐角在上。复验：路径数据里 `C` 指令归零，`Q` 圆角 5 处。
+
+**二、feat-mvp 与主干共用车道，看不出何时合并。**
+owner 1（主干链）到第 12 行结束，owner 3（feat-mvp 链）从第 13 行开始，
+行区间不重叠，装箱算法让它复用了 lane 1。两段线首尾相接，看上去是一条连续的线，
+合并点从视觉上消失。改法：`packLanes` 增加 `LANE_REUSE_GAP = 2`，间隔不够就另开一列。
+复验：feat-mvp 由 cx=30 移到 cx=70，成为独立的紫色车道。
+
+顺带：合并提交（父数 > 1）改画空心环，即使与主干同色同列也能认出合并行。
+复验：`.commit-node.merge` 命中 2 个（Merge PR #1 / #2）。
+
+`laneEnd` 初值同时从 `-1` 改为 `-Infinity`——否则 `minRow` 为 0 时
+`-1 >= 0 - 2` 成立，空车道会被误判为已占用（已加单测锁住）。
+
+单测增至 58 passed（layout 15 / paths 11 / owners 12 / workdir 8 / path 6 / errors 6）。
+
+### 追加修复三：提交排序（用户发现 3a63421 位置不对，2026-08-06）
+
+用户问「3a63421 是不是漏掉了」。查下来它**没漏**——后端数据第 15 条、DOM 已渲染、
+带着 `refs/heads/feat-mvp`。但它被排在了 `Merge pull request #1` **下面**，
+而它的提交时间（8/6 2:25 AM）比那个合并提交（8/5 3:17 PM）更新。
+
+原因：`engine/graph.rs` 只设了 `Sort::TOPOLOGICAL`。该排序只保证「子在父之前」，
+**互不相关的两个提交之间顺序是任意的**，实际取决于 revwalk 的 push 顺序。
+
+视觉后果很具体：3a63421 与合并的第二父 2dbba11 同属 feat-mvp 那条链、同一车道，
+而它恰好夹在 `Merge PR #1` 与 2dbba11 之间。合并连向第二父的线于是**从 3a63421 的
+圆点上直接穿过去**——它看上去不是一个独立的分支 tip，而像合并线上的中转点。
+
+改法：`Sort::TOPOLOGICAL | Sort::TIME`，即 `git log --date-order` 的语义：
+不破坏拓扑的前提下按提交时间从新到旧。
+
+复验：新增 `graph_puts_newer_unmerged_tip_above_older_merge`，用固定
+`GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE` 构造「未合并 tip 比合并提交更新」的形状。
+改之前该用例失败并打印出实际顺序
+`[("merge feature", 1767398400), ("f2", 1767484800), ...]`，改之后通过。
+运行时复验：3a63421 索引由 15 移到 14，排到 fa43adf 之前；截图确认它成为紫色车道
+的顶端、合并线改从环形节点侧向分出，不再穿过它的圆点。
+
+`cargo test` 13 passed，`pnpm test` 58 passed。
