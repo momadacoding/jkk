@@ -28,6 +28,7 @@ pub fn run() {
       commands::ops::stage,
       commands::ops::unstage,
       commands::repo::open_repo,
+      commands::repo::read_upstream,
       commands::repo::repo_state,
       commands::watch::unwatch_repo,
       commands::watch::watch_repo,
