@@ -26,6 +26,14 @@ export interface PathSegment {
   x2: number
   y2: number
   curve: boolean // true for merge/fork curves
+  /**
+   * 跨车道时圆角拐在上端还是下端。
+   *
+   * 线段总是笔直地待在**它自己所属的那条车道**里，只在另一端拐一次。
+   * 第一父的线属于子节点的车道 → 先竖下去，到父节点那行再拐（false）；
+   * 合并的第二父属于父节点的车道 → 先从子节点横出去，再竖下去（true）。
+   */
+  cornerAtTop?: boolean
   /** 工作区伪行连到 HEAD 的那条线画成虚线，与真实提交边区分。 */
   dashed?: boolean
 }

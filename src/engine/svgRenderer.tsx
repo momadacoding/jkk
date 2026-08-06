@@ -32,14 +32,33 @@ function groupRefs(refs: RefPointer[]): Record<string, RefPointer[]> {
   return map
 }
 
+/** 拐角半径（像素）。 */
+const CORNER = 6
+
+/**
+ * 把线段转成 path 数据。
+ *
+ * 跨车道的边画成「直线 + 小圆角」而不是跨越整段高度的贝塞尔：
+ * 后者在相邻两行之间还算好看，一旦跨十几行就变成一道横扫几百像素的巨大弧线，
+ * 完全看不出它连的是哪两个提交。线段始终笔直地待在它自己所属的车道里，
+ * 只在另一端拐一次弯。
+ */
 function toD(segments: PathSegment[]): string {
   let d = ''
   for (const s of segments) {
-    if (s.curve) {
-      const midY = (s.y1 + s.y2) / 2
-      d += `M ${s.x1} ${s.y1} C ${s.x1} ${midY}, ${s.x2} ${midY}, ${s.x2} ${s.y2} `
-    } else {
+    if (!s.curve) {
       d += `M ${s.x1} ${s.y1} L ${s.x2} ${s.y2} `
+      continue
+    }
+    // 拐角不能大于它要占用的横向/纵向距离，否则会画出反向的钩子
+    const r = Math.min(CORNER, Math.abs(s.x2 - s.x1), Math.abs(s.y2 - s.y1))
+    const dir = s.x2 > s.x1 ? 1 : -1
+    if (s.cornerAtTop) {
+      // 从子节点横出去，拐进父节点的车道，再一路竖下去
+      d += `M ${s.x1} ${s.y1} L ${s.x2 - dir * r} ${s.y1} Q ${s.x2} ${s.y1}, ${s.x2} ${s.y1 + r} L ${s.x2} ${s.y2} `
+    } else {
+      // 在子节点的车道里竖下去，到父节点那一行才拐过去
+      d += `M ${s.x1} ${s.y1} L ${s.x1} ${s.y2 - r} Q ${s.x1} ${s.y2}, ${s.x1 + dir * r} ${s.y2} L ${s.x2} ${s.y2} `
     }
   }
   return d
@@ -76,12 +95,26 @@ function renderNode(node: LayoutNode, layout: GraphLayout, refs: RefPointer[], s
   }
 
   const isHead = refs.some((r) => r.kind === 'head')
+  const isMerge = node.commit.parents.length > 1
+  const className = selected ? 'commit-node selected' : 'commit-node'
+
+  // 合并提交画成空心环。被并入的分支常常和主干共用车道与颜色，
+  // 光看线分不出哪一行是合并；环形标记与实心圆一眼可分。
+  // 填充色要和背景一致才成其为「环」，故与 --bg 保持同值。
+  if (isMerge) {
+    return (
+      <g key={node.commit.id} className={`${className} merge`} data-id={node.commit.id}>
+        <circle cx={cx} cy={cy} r={isHead ? 6.5 : 6} fill="#1e1e1e" stroke={color} strokeWidth={3} />
+      </g>
+    )
+  }
+
   // 中空圆：分支色填充 + 白边；HEAD 所在 commit 加大加粗；选中行高亮由 DOM 行负责，圆点不变形
   const r = isHead ? 6.5 : 5
   const strokeWidth = isHead || selected ? 2.5 : 1.5
 
   return (
-    <g key={node.commit.id} className={selected ? 'commit-node selected' : 'commit-node'} data-id={node.commit.id}>
+    <g key={node.commit.id} className={className} data-id={node.commit.id}>
       <circle cx={cx} cy={cy} r={r} fill={color} stroke="#fff" strokeWidth={strokeWidth} />
     </g>
   )

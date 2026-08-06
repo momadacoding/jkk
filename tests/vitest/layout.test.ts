@@ -66,6 +66,37 @@ describe('packLanes', () => {
     expect(new Set([lanes[0], lanes[1], lanes[2]]).size).toBe(3)
   })
 
+  it('紧挨着的两个 owner 不复用同一条车道', () => {
+    // owner 1 到第 13 行结束、owner 2 从第 14 行开始时，若复用同一列，
+    // 两段线会首尾相接成一条「假连续」的线，合并点从视觉上消失。
+    // 这正是真实仓库里 feat-mvp 看不出何时合并进 master 的原因。
+    const lanes = packLanes([
+      { index: 0, minRow: 0, maxRow: 30 },
+      { index: 1, minRow: 1, maxRow: 13 },
+      { index: 2, minRow: 14, maxRow: 25 },
+    ])
+    expect(lanes[1]).not.toBe(lanes[2])
+  })
+
+  it('相隔足够远的 owner 仍然复用车道', () => {
+    // 间隔机制不能把复用彻底关掉，否则分支一多车道就爆炸
+    const lanes = packLanes([
+      { index: 0, minRow: 0, maxRow: 30 },
+      { index: 1, minRow: 1, maxRow: 3 },
+      { index: 2, minRow: 10, maxRow: 15 },
+    ])
+    expect(lanes[1]).toBe(lanes[2])
+  })
+
+  it('第一条分支车道从 0 行开始也不会被误判为已占用', () => {
+    // laneEnd 的初值若用 -1，minRow=0 时 -1 >= 0-2 成立，空车道会被当成占用
+    const lanes = packLanes([
+      { index: 0, minRow: 5, maxRow: 30 },
+      { index: 1, minRow: 0, maxRow: 4 },
+    ])
+    expect(lanes[1]).toBe(1)
+  })
+
   it('主干的车道不被别的 owner 复用', () => {
     // owner 0 早早结束，但 lane 0 仍然只属于它
     const lanes = packLanes([

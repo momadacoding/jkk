@@ -12,13 +12,22 @@ import { computeOwners, WORKDIR_ID, type OwnerInfo } from './owners'
  * 互不重叠，会共享同一条车道。车道数只取决于**同时活跃**的分支数，
  * 而不是分支总数。
  */
+/**
+ * 复用车道前要求的垂直间隔（行）。
+ *
+ * 上一个占用者刚结束、下一条分支紧接着开始时，两段线在同一列里首尾相接，
+ * 看上去就是一条连续的线——合并点因此从视觉上消失。留出间隔可以避免这种
+ * 「假连续」。间隔不够就另开一列。
+ */
+const LANE_REUSE_GAP = 2
+
 export function packLanes(owners: OwnerInfo[]): number[] {
   const laneOf = new Array<number>(owners.length).fill(0)
-  /** lane 序号 → 当前占用者的 maxRow；-1 表示没被用过。 */
+  /** lane 序号 → 当前占用者的 maxRow；-Infinity 表示没被用过。 */
   const laneEnd: number[] = []
 
   const take = (lane: number, owner: OwnerInfo) => {
-    while (laneEnd.length <= lane) laneEnd.push(-1)
+    while (laneEnd.length <= lane) laneEnd.push(Number.NEGATIVE_INFINITY)
     laneEnd[lane] = owner.maxRow
     laneOf[owner.index] = lane
   }
@@ -31,7 +40,7 @@ export function packLanes(owners: OwnerInfo[]): number[] {
     }
     // 从 1 开始找：lane 0 是主干的专座
     let lane = 1
-    while (lane < laneEnd.length && laneEnd[lane] >= owner.minRow) lane++
+    while (lane < laneEnd.length && laneEnd[lane] >= owner.minRow - LANE_REUSE_GAP) lane++
     take(lane, owner)
   }
   return laneOf

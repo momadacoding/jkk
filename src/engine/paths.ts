@@ -67,6 +67,9 @@ export function computePaths(rows: LayoutNode[], rowHeight: number, laneWidth: n
         x2: px,
         y2: py,
         curve: parentNode.lane !== node.lane,
+        // 线归谁的车道，拐角就在另一端：第一父的线在子节点车道里往下走，
+        // 到父节点那行才拐；第二父的线属于父节点车道，从子节点横出去后就竖下去。
+        cornerAtTop: !parent.isMain,
         // 伪行连到 HEAD 的边不是真实的父子关系，画成虚线
         dashed: node.commit.id === WORKDIR_ID,
       }

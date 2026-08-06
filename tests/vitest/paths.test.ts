@@ -91,6 +91,48 @@ describe('computePaths', () => {
     const paths = computePaths(rows, 28, 20)
     expect(paths).toHaveLength(0)
   })
+
+  it('第一父的跨车道边拐角在下，合并第二父的拐角在上', () => {
+    // 线段要笔直地待在它自己所属的车道里，只在另一端拐一次。
+    // 第一父的线归子节点的车道 → 竖到父节点那行才拐（cornerAtTop=false）；
+    // 第二父的线归父节点的车道 → 从子节点横出去后立刻竖下去（cornerAtTop=true）。
+    const commits = [node('merge', ['m1', 'b1']), node('b1', ['m0']), node('m1', ['m0']), node('m0', [])]
+    const rows = computeLayout(commits)
+    const byId = Object.fromEntries(rows.map((r) => [r.commit.id, r]))
+    const paths = computePaths(rows, 28, 20)
+    const segs = paths.flatMap((p) => p.segments)
+    const at = (id: string) => ({ x: byId[id].lane * 20 + 10, y: byId[id].row * 28 + 14 })
+
+    const find = (from: string, to: string) => {
+      const a = at(from), b = at(to)
+      return segs.find((s) => s.x1 === a.x && s.y1 === a.y && s.x2 === b.x && s.y2 === b.y)
+    }
+
+    // merge 的第二父 b1 落在另一条车道上，这条边归 b1 的车道
+    const second = find('merge', 'b1')
+    expect(second).toBeDefined()
+    expect(second!.curve).toBe(true)
+    expect(second!.cornerAtTop).toBe(true)
+
+    // 同车道的边不拐弯，直接是直线
+    const first = find('merge', 'm1')
+    expect(first).toBeDefined()
+    expect(first!.cornerAtTop).toBe(false)
+  })
+
+  it('跨车道的第一父边把拐角放在下端', () => {
+    // 真实仓库里 Merge PR #1 → master 跨了 16 行，正是这条路径
+    const commits = [node('tip', ['m1']), node('side', ['m1']), node('m1', [])]
+    const rows = computeLayout(commits)
+    const byId = Object.fromEntries(rows.map((r) => [r.commit.id, r]))
+    // side 与 m1 不同车道时才构成跨车道的第一父边
+    const paths = computePaths(rows, 28, 20)
+    const seg = paths
+      .flatMap((p) => p.segments)
+      .find((s) => s.x1 === byId.side.lane * 20 + 10 && s.x2 === byId.m1.lane * 20 + 10 && s.curve)
+    expect(seg).toBeDefined()
+    expect(seg!.cornerAtTop).toBe(false)
+  })
 })
 
 describe('filterPathsToBand', () => {
