@@ -206,3 +206,67 @@ fn open_repo_reports_both_head_name_and_hash() {
     let data = engine::graph::load(dir.path().to_str().unwrap()).unwrap();
     assert_eq!(info.head_hash, data.commits[0].id);
 }
+
+/// 用固定时间戳提交，避免同一秒内多次提交导致排序断言不稳定。
+fn commit_at(dir: &std::path::Path, name: &str, date: &str) {
+    fs::write(dir.join(format!("{name}.txt")), name).unwrap();
+    run_git(dir, &["add", "."]);
+    let status = Command::new("git")
+        .current_dir(dir)
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_DATE", date)
+        .args(["commit", "-m", name])
+        .status()
+        .expect("git not found");
+    assert!(status.success());
+}
+
+#[test]
+fn graph_puts_newer_unmerged_tip_above_older_merge() {
+    // 未合并的分支 tip 如果比主干上的合并提交更新，它必须排在合并提交前面。
+    // 只用 Sort::TOPOLOGICAL 时，互不相关的提交之间顺序取决于 revwalk 的 push 顺序，
+    // 这个 tip 会掉到合并提交下面——而合并提交连向第二父的线正好经过它所在的车道，
+    // 于是那条线从它的圆点上穿过去，看上去它不是分支 tip 而是合并线的中转点。
+    let dir = TempDir::new().unwrap();
+    run_git(dir.path(), &["init"]);
+    run_git(dir.path(), &["config", "user.email", "test@test.com"]);
+    run_git(dir.path(), &["config", "user.name", "Test"]);
+
+    commit_at(dir.path(), "base", "2026-01-01T00:00:00+00:00");
+    run_git(dir.path(), &["checkout", "-b", "feature"]);
+    commit_at(dir.path(), "f1", "2026-01-02T00:00:00+00:00");
+
+    let main = String::from_utf8_lossy(
+        &Command::new("git").current_dir(dir.path())
+            .args(["rev-parse", "--abbrev-ref", "HEAD"]).output().unwrap().stdout,
+    ).trim().to_string();
+    assert_eq!(main, "feature");
+
+    run_git(dir.path(), &["checkout", "-"]);
+    // 合并提交：2026-01-03
+    let status = Command::new("git")
+        .current_dir(dir.path())
+        .env("GIT_AUTHOR_DATE", "2026-01-03T00:00:00+00:00")
+        .env("GIT_COMMITTER_DATE", "2026-01-03T00:00:00+00:00")
+        .args(["merge", "--no-ff", "-m", "merge feature", "feature"])
+        .status()
+        .expect("git not found");
+    assert!(status.success());
+
+    // 分支上再提交一次，比合并提交更新：2026-01-04
+    run_git(dir.path(), &["checkout", "feature"]);
+    commit_at(dir.path(), "f2", "2026-01-04T00:00:00+00:00");
+
+    let data = engine::graph::load(dir.path().to_str().unwrap()).unwrap();
+    let row = |msg: &str| data.commits.iter().position(|c| c.message == msg)
+        .unwrap_or_else(|| panic!("{msg} not found in {:?}", data.commits.iter().map(|c| &c.message).collect::<Vec<_>>()));
+
+    assert!(
+        row("f2") < row("merge feature"),
+        "更新的未合并 tip f2 排在了合并提交之后：{:?}",
+        data.commits.iter().map(|c| (&c.message, c.time)).collect::<Vec<_>>()
+    );
+    // 拓扑约束不能被破坏：父必须排在子之后
+    assert!(row("merge feature") < row("f1"));
+    assert!(row("f1") < row("base"));
+}
