@@ -24,6 +24,7 @@ pub fn run() {
       commands::ops::commit,
       commands::ops::create_branch,
       commands::ops::delete_branch,
+      commands::ops::discard,
       commands::ops::rename_branch,
       commands::ops::stage,
       commands::ops::unstage,

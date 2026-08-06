@@ -11,6 +11,7 @@ import { Toolbar } from './Toolbar'
 import { StashView } from './StashView'
 import { useRepoStore, useRepoEffects } from '../store/repoStore'
 import { samePath } from '../engine/path'
+import { askConfirm } from '../engine/confirm'
 
 type ViewMode = 'commits' | 'changes'
 
@@ -160,6 +161,39 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
     }
   }, [state.path, state.headHash, refreshHead, refreshGraph, refreshStatus, refreshUpstream, refreshStashes, reportError])
 
+  /**
+   * 丢弃改动。这是界面上少数不可逆的操作之一，必须先确认。
+   *
+   * 未跟踪文件在 git 里没有任何副本，删了就找不回来了——确认框要把它们和
+   * 「能从 git 恢复」的那些分开列出来，否则用户没法判断这次点下去的代价。
+   */
+  const handleDiscard = useCallback(async (paths: string[], staged: boolean) => {
+    const path = state.path
+    if (!path || paths.length === 0) return
+    // Unstaged 区里 status 为 added 的就是未跟踪文件
+    const gone = staged
+      ? []
+      : state.status.unstaged.filter((f) => paths.includes(f.path) && f.status === 'added').map((f) => f.path)
+    const recoverable = paths.filter((p) => !gone.includes(p))
+
+    const lines = ['丢弃以下改动？']
+    if (recoverable.length > 0) {
+      lines.push('', `恢复到${staged ? ' HEAD' : '暂存区的内容'}（${recoverable.length}）：`, ...recoverable.map((p) => `  ${p}`))
+    }
+    if (gone.length > 0) {
+      lines.push('', `永久删除，无法恢复（${gone.length}）：`, ...gone.map((p) => `  ${p}`))
+    }
+    if (!(await askConfirm(lines.join('\n'), 'Discard changes'))) return
+
+    try {
+      await invoke('discard', { path, paths, staged })
+      await refreshStatus(path)
+      await refreshDiff(path, 'workdir')
+    } catch (err) {
+      reportError(err)
+    }
+  }, [state.path, state.status.unstaged, refreshStatus, refreshDiff, reportError])
+
   /** 单击分支：只选中并把 graph 定位到它的 tip，不碰工作区。 */
   const handleSelectBranch = useCallback((name: string, hash: string) => {
     setSelectedBranch(name)
@@ -299,6 +333,7 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
                 diff={state.diff}
                 onStage={(paths) => runAndRefresh('stage', { paths }, async () => { await refreshStatus(state.path!); await refreshDiff(state.path!, 'workdir') })}
                 onUnstage={(paths) => runAndRefresh('unstage', { paths }, async () => { await refreshStatus(state.path!); await refreshDiff(state.path!, 'workdir') })}
+                onDiscard={(paths, staged) => void handleDiscard(paths, staged)}
                 onCommit={handleCommit}
               />
             )}

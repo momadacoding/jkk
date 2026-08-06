@@ -2,20 +2,43 @@ import { useMemo, useState } from 'react'
 import { Panel, Group, Separator } from 'react-resizable-panels'
 import type { DiffData, FileChange, StatusData } from '../engine/types'
 import { DiffHunk } from './DiffHunk'
+import { ContextMenu, useContextMenu, type MenuItem } from './ContextMenu'
+import {
+  emptyFileSelection,
+  nextFileSelection,
+  type FileSection,
+  type FileSelection,
+} from '../engine/fileSelection'
 
-function FileSection({ title, files, actionLabel, selected, onSelect, onToggleOne, onToggleAll }: {
+interface FileSectionProps {
   title: string
+  section: FileSection
   files: FileChange[]
   actionLabel: string
-  selected: string | null
-  onSelect: (path: string) => void
+  /** 当前选中（可能属于另一个区，那样本区就不该高亮任何行）。 */
+  selection: FileSelection
+  /** diff 面板正在显示的那个文件。 */
+  activePath: string | null
+  onRowClick: (section: FileSection, files: string[], path: string, e: React.MouseEvent) => void
+  onRowContextMenu: (section: FileSection, files: string[], path: string, e: React.MouseEvent) => void
   onToggleOne: (path: string) => void
   onToggleAll: () => void
-}) {
+}
+
+function FileSectionList({
+  title, section, files, actionLabel, selection, activePath,
+  onRowClick, onRowContextMenu, onToggleOne, onToggleAll,
+}: FileSectionProps) {
+  const paths = files.map((f) => f.path)
+  const selectedHere = selection.section === section ? selection.paths : []
+
   return (
     <div className="changes-section">
       <div className="changes-section-header">
-        <span>{title} ({files.length})</span>
+        <span>
+          {title} ({files.length})
+          {selectedHere.length > 1 && <span className="changes-selcount">已选 {selectedHere.length}</span>}
+        </span>
         {files.length > 0 && (
           <button className="changes-action" onClick={onToggleAll}>{actionLabel} All</button>
         )}
@@ -26,10 +49,13 @@ function FileSection({ title, files, actionLabel, selected, onSelect, onToggleOn
             key={f.path}
             className={[
               'changes-file',
-              selected === f.path ? 'selected' : '',
+              selectedHere.includes(f.path) ? 'selected' : '',
+              f.path === activePath && selection.section === section ? 'active' : '',
               f.status === 'conflicted' ? 'conflicted' : '',
             ].filter(Boolean).join(' ')}
-            onClick={() => onSelect(f.path)}
+            title={`${f.path}\nCtrl+单击多选 · Shift+单击选一段 · 右键更多操作`}
+            onClick={(e) => onRowClick(section, paths, f.path, e)}
+            onContextMenu={(e) => onRowContextMenu(section, paths, f.path, e)}
           >
             <button
               className="changes-toggle"
@@ -52,20 +78,58 @@ interface LocalChangesViewProps {
   diff: DiffData
   onStage: (paths: string[]) => void
   onUnstage: (paths: string[]) => void
+  onDiscard: (paths: string[], staged: boolean) => void
   onCommit: (msg: string, amend: boolean) => void
 }
 
-export function LocalChangesView({ status, diff, onStage, onUnstage, onCommit }: LocalChangesViewProps) {
-  const [selectedFile, setSelectedFile] = useState<string | null>(null)
+export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, onCommit }: LocalChangesViewProps) {
+  const [selection, setSelection] = useState<FileSelection>(emptyFileSelection)
   const [subject, setSubject] = useState('')
   const [description, setDescription] = useState('')
   const [amend, setAmend] = useState(false)
+  const { menu, open, close } = useContextMenu()
 
   const allFiles = useMemo(() => [...status.unstaged, ...status.staged], [status])
-  const activeFile = selectedFile ?? allFiles[0]?.path ?? null
+  // diff 面板显示最后点到的那一个；多选时看的是其中一个，不是拼在一起
+  const activeFile = selection.paths[selection.paths.length - 1] ?? allFiles[0]?.path ?? null
   const activeDiff: DiffData = useMemo(() => ({
     files: diff.files.filter((f) => f.path === activeFile),
   }), [diff, activeFile])
+
+  const click = (section: FileSection, files: string[], path: string, e: React.MouseEvent) => {
+    setSelection((cur) => nextFileSelection(cur, section, files, path, {
+      ctrl: e.ctrlKey || e.metaKey,
+      shift: e.shiftKey,
+    }))
+  }
+
+  const contextMenu = (section: FileSection, files: string[], path: string, e: React.MouseEvent) => {
+    // 右键点在已选中的项上不该把整片选中缩成一个——那是最容易误删的交互
+    const next = nextFileSelection(selection, section, files, path, {
+      ctrl: false, shift: false, keepIfSelected: true,
+    })
+    setSelection(next)
+
+    const targets = next.paths
+    const n = targets.length
+    const suffix = n > 1 ? ` (${n})` : ''
+    const staged = section === 'staged'
+    const items: MenuItem[] = [
+      staged
+        ? { label: `Unstage${suffix}`, onSelect: () => onUnstage(targets) }
+        : { label: `Stage${suffix}`, onSelect: () => onStage(targets) },
+      {
+        label: `Discard changes${suffix}…`,
+        onSelect: () => onDiscard(targets, staged),
+        danger: true,
+      },
+      {
+        label: n > 1 ? `Copy paths${suffix}` : 'Copy path',
+        onSelect: () => { void navigator.clipboard.writeText(targets.join('\n')) },
+      },
+    ]
+    open(e, items)
+  }
 
   const handleCommit = () => {
     const msg = description.trim() ? `${subject.trim()}\n\n${description.trim()}` : subject.trim()
@@ -81,24 +145,30 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onCommit }:
           <Panel defaultSize="25%" minSize="15%" maxSize="50%">
             <Group orientation="vertical">
               <Panel minSize="15%">
-                <FileSection
+                <FileSectionList
                   title="Unstaged"
+                  section="unstaged"
                   files={status.unstaged}
                   actionLabel="Stage"
-                  selected={activeFile}
-                  onSelect={setSelectedFile}
+                  selection={selection}
+                  activePath={activeFile}
+                  onRowClick={click}
+                  onRowContextMenu={contextMenu}
                   onToggleOne={(path) => onStage([path])}
                   onToggleAll={() => onStage(status.unstaged.map((f) => f.path))}
                 />
               </Panel>
               <Separator className="separator-h" />
               <Panel minSize="15%">
-                <FileSection
+                <FileSectionList
                   title="Staged"
+                  section="staged"
                   files={status.staged}
                   actionLabel="Unstage"
-                  selected={activeFile}
-                  onSelect={setSelectedFile}
+                  selection={selection}
+                  activePath={activeFile}
+                  onRowClick={click}
+                  onRowContextMenu={contextMenu}
                   onToggleOne={(path) => onUnstage([path])}
                   onToggleAll={() => onUnstage(status.staged.map((f) => f.path))}
                 />
@@ -132,6 +202,7 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onCommit }:
           <button disabled={!subject.trim()} onClick={handleCommit}>Commit</button>
         </div>
       </div>
+      <ContextMenu menu={menu} onClose={close} />
     </div>
   )
 }

@@ -721,12 +721,40 @@ body {
   display: flex;
   align-items: center;
   gap: 4px;
-  padding: 2px 4px;
+  padding: 2px 4px 2px 6px;
   cursor: pointer;
+  position: relative;
+  user-select: none;
+}
+
+.changes-file:hover {
+  background: rgba(255, 255, 255, 0.055);
 }
 
 .changes-file.selected {
   background: var(--selected-bg);
+}
+
+/* 多选时 diff 面板只显示其中一个文件，左边一道亮条标出是哪个——
+   否则「我选了五个，下面显示的是谁」完全靠猜 */
+.changes-file.active::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 2px;
+  bottom: 2px;
+  width: 2px;
+  background: #4fc3f7;
+}
+
+.changes-selcount {
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 8px;
+  background: #3a6ea5;
+  color: #fff;
+  font-size: 9.5px;
+  font-weight: 600;
 }
 
 .changes-file.conflicted .changes-file-path {
