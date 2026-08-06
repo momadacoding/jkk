@@ -193,7 +193,15 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
             {viewMode === 'commits' ? (
               <Group orientation="vertical">
                 <Panel minSize="30%">
-                  <GraphView commits={state.commits} refs={state.refs} selectedId={state.selectedId} onSelect={selectCommit} />
+                  <GraphView
+                    commits={state.commits}
+                    refs={state.refs}
+                    selectedId={state.selectedId}
+                    onSelect={selectCommit}
+                    headHash={state.headHash}
+                    changeCount={state.status.unstaged.length + state.status.staged.length}
+                    onOpenChanges={() => setViewMode('changes')}
+                  />
                 </Panel>
                 <Separator style={{ height: 4, background: '#333' }} />
                 <Panel defaultSize="35%" minSize="15%" maxSize="65%">
