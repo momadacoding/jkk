@@ -69,6 +69,39 @@ fn delete_surfaces_the_real_git_error() {
     );
     // 干净的拒绝：什么都不该被删
     assert!(wt.join("a.txt").exists());
+    // 这是「什么都没动」的失败，别把它说成孤儿目录吓唬人
+    assert_ne!(err.code, "worktree_partial");
+    assert!(!err.message.contains("手工删除"), "{}", err.message);
+}
+
+/// 登记还在的失败不该被改写。
+///
+/// `git worktree remove` 分两步：先解除登记、再删目录。第一步就被拒（有未提交
+/// 改动）和第二步栽了（目录没删干净、登记已经没了）是两种完全不同的处境，前者
+/// 原地重试就行，后者留下的目录已经不受 git 管了。混为一谈的话，要么白白吓唬
+/// 用户，要么让人看不出目录已经成了孤儿。
+#[test]
+fn a_failure_before_unregistering_keeps_the_worktree_usable() {
+    let (_dir, wt) = repo_with_worktree("feature");
+    let main = main_of(&wt);
+    fs::write(wt.join("scratch.txt"), "untracked").unwrap();
+
+    cmd::delete_worktree(
+        main.to_str().unwrap().to_string(),
+        wt.to_str().unwrap().to_string(),
+    )
+    .expect_err("有未跟踪文件时会被拒");
+
+    // 登记还在，worktree 还能正常用
+    let out = Command::new("git")
+        .current_dir(&main)
+        .args(["worktree", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("feature"),
+        "登记不该消失"
+    );
 }
 
 #[test]

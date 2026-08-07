@@ -657,6 +657,10 @@ body {
   border-left: 3px solid #e57373;
   border-radius: 2px;
   color: #e0a9a9;
+  /* git 的错误本来就是分行写的，删 worktree 失败那条还会带上剩余项数和路径。
+     压成一行会把结构全糊掉，长路径也得能断开 */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 /* ---------- 文件内容（File Tree 右侧，只读） ---------- */
