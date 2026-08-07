@@ -5,5 +5,6 @@ pub mod path;
 pub mod refs;
 pub mod repo;
 pub mod stash;
+pub mod tree;
 pub mod upstream;
 pub mod worktree;

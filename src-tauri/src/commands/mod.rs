@@ -4,5 +4,6 @@ pub mod ops;
 pub mod remote;
 pub mod repo;
 pub mod stash;
+pub mod tree;
 pub mod watch;
 pub mod worktree;

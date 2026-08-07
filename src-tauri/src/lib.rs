@@ -39,6 +39,8 @@ pub fn run() {
       commands::stash::stash_drop,
       commands::stash::stash_pop,
       commands::stash::stash_push,
+      commands::tree::list_tree,
+      commands::tree::read_blob,
       commands::watch::unwatch_repo,
       commands::watch::watch_repo,
       commands::worktree::create_worktree,

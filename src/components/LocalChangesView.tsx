@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import { Panel, Group, Separator } from 'react-resizable-panels'
 import type { DiffData, FileChange, StatusData } from '../engine/types'
-import { DiffHunk } from './DiffHunk'
+import { DiffView } from './DiffView'
 import { ContextMenu, useContextMenu, type MenuItem } from './ContextMenu'
 import {
   emptyFileSelection,
@@ -177,7 +177,7 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
           </Panel>
           <Separator className="separator-v" />
           <Panel minSize="30%">
-            <DiffHunk diff={activeDiff} />
+            <DiffView diff={activeDiff} />
           </Panel>
         </Group>
       </div>
