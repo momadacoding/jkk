@@ -195,28 +195,40 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
   }, [state.path, state.status.unstaged, refreshStatus, refreshDiff, reportError])
 
   /**
-   * 删除分支，可选连远程一起删。确认在 `DeleteBranchDialog` 里做过了。
+   * 删除分支，可选连远程和 worktree 一起删。确认在 `DeleteBranchDialog` 里做过了。
    *
-   * **先删远程再删本地。** 远程那一步才会因为外部原因失败（断网、没权限、
-   * 分支被保护），失败在动本地之前，留下的就是一个原样、可以直接重试的状态；
-   * 反过来的话本地引用已经没了，还得先去 reflog 里捞回来才能重试。
+   * **顺序是 worktree → 远程 → 本地分支**，按「最容易失败的放最前」排：
+   *
+   * - worktree 那一步最常被拒——只要里面有改动或未跟踪文件，`git worktree
+   *   remove` 就不干（这也意味着它不会偷偷毁掉未提交的东西）。它排第一，
+   *   失败时远程和本地都还没动过，原地重试就行。
+   * - 远程那一步会因为外部原因失败（断网、没权限、分支被保护），排在删本地
+   *   引用之前；反过来的话本地引用已经没了，还得先去 reflog 里捞回来才能重试。
+   * - 本地分支最后。它也**必须**在 worktree 之后：分支被 worktree 检出时
+   *   `git branch -D` 会直接拒绝。
    *
    * **失败不在这里吞掉，抛给确认框。** 那个框会留在原地把错误显示出来，用户
    * 就地就能重试；丢进顶部横幅的话框已经关了，还得重新右键走一遍。
    */
   const handleDeleteBranch = useCallback(async (
     name: string,
-    remote: { remote: string; branch: string } | null,
+    targets: { remote: { remote: string; branch: string } | null; worktreePath: string | null },
   ) => {
     const path = state.path
     if (!path) return
+    const { remote, worktreePath } = targets
+    if (worktreePath) {
+      await invoke('delete_worktree', { path, worktreePath })
+    }
     if (remote) {
       await invoke('delete_remote_branch', { path, remote: remote.remote, branch: remote.branch })
     }
     await invoke('delete_branch', { path, name })
     await refreshGraph(path)
     await refreshUpstream(path)
-  }, [state.path, refreshGraph, refreshUpstream])
+    // 删掉的 worktree 还挂在侧边栏上，得把那一栏也刷掉
+    if (worktreePath) await refreshWorktrees(path)
+  }, [state.path, refreshGraph, refreshUpstream, refreshWorktrees])
 
   /**
    * 检出一个远程分支。后端会建一条跟踪它的本地分支——直接检出远程引用会进

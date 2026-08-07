@@ -2,6 +2,16 @@ use crate::error::Result;
 use git2::{BranchType, Repository};
 use serde::Serialize;
 
+/// 检出了待删分支的那个 worktree。
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeTarget {
+    /// worktree 目录名，界面上显示这个。
+    pub name: String,
+    /// 完整路径，`git worktree remove` 要用它。
+    pub path: String,
+}
+
 #[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteInfo {
@@ -19,6 +29,12 @@ pub struct DeleteInfo {
     /// 界面拿它提示「删了就找不回来」。语义对齐 `git branch -d` 的判断：
     /// 它正是在这个数不为 0 时拒绝删除。
     pub unmerged: usize,
+    /// 检出了这个分支的 worktree（主工作区除外），没有就是 None。
+    ///
+    /// 这不是锦上添花的信息：分支被 worktree 占着时 `git branch -D` 会直接拒绝
+    /// （`cannot delete branch 'x' used by worktree at '...'`），非删掉那个
+    /// worktree 不可。界面据此多给一个勾选框。
+    pub worktree: Option<WorktreeTarget>,
 }
 
 /// 找出这个分支对应的远程分支。
@@ -57,6 +73,24 @@ fn find_remote_branch(repo: &Repository, short: &str) -> Option<(String, String,
         }
     }
     None
+}
+
+/// 找出检出了这个分支的 worktree。
+///
+/// **跳过主工作区**：它删不掉（`git worktree remove` 拒绝），给出勾选框只会
+/// 是个死路。主工作区占着某个分支时让 git 的原话直接报出来更诚实。
+///
+/// 查不出来（`git worktree list` 失败、仓库根本没有 worktree）就当作没有：
+/// 这一项只影响多不多一个勾选框，不该因为它让整个确认框打不开。
+fn find_worktree(path: &str, name: &str) -> Option<WorktreeTarget> {
+    crate::engine::worktree::read_worktrees(path)
+        .ok()?
+        .into_iter()
+        .find(|w| !w.is_main && w.branch == name)
+        .map(|w| WorktreeTarget {
+            name: w.name,
+            path: w.path,
+        })
 }
 
 /// 把 `origin/feat/x` 这种完整简称拆成（远程名, 远程上的分支名）。
@@ -115,5 +149,6 @@ pub fn delete_info(path: &str, name: &str) -> Result<DeleteInfo> {
         remote,
         remote_branch,
         unmerged,
+        worktree: find_worktree(path, name),
     })
 }

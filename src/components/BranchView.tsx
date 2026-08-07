@@ -3,7 +3,7 @@ import type { RefPointer } from '../engine/types'
 import { ContextMenu, useContextMenu } from './ContextMenu'
 import { SidebarSection, SidebarGroup } from './SidebarSection'
 import { usePrompt } from './PromptDialog'
-import { DeleteBranchDialog, type RemoteTarget } from './DeleteBranchDialog'
+import { DeleteBranchDialog, type DeleteTargets } from './DeleteBranchDialog'
 import { useConfirm } from './ConfirmDialog'
 
 interface BranchViewProps {
@@ -16,12 +16,12 @@ interface BranchViewProps {
   onCreate: (name: string, start?: string) => void
   onRename: (oldName: string, newName: string) => void
   /**
-   * `remote` 非 null 时连远程分支一起删。
+   * 删除本地分支，`targets` 说明要不要连远程分支和 worktree 一起删。
    *
    * 返回的 Promise 要等删完才 resolve，确认框靠它显示进度；失败要抛出，
    * 确认框据此留在原地显示错误。
    */
-  onDelete: (name: string, remote: RemoteTarget | null) => Promise<void>
+  onDelete: (name: string, targets: DeleteTargets) => Promise<void>
   /** 检出远程分支：建一条跟踪它的本地分支并切过去。 */
   onCheckoutRemote: (remoteBranch: string) => void
   /**
@@ -226,7 +226,7 @@ export function BranchView({
           name={deleting}
           onCancel={() => setDeleting(null)}
           // 成功才关；失败时 onDelete 抛出，确认框自己接住并留在原地
-          onConfirm={async (remote) => { await onDelete(deleting, remote); setDeleting(null) }}
+          onConfirm={async (targets) => { await onDelete(deleting, targets); setDeleting(null) }}
         />
       )}
     </SidebarSection>

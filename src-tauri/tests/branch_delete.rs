@@ -98,6 +98,64 @@ fn counts_commits_that_are_not_on_the_current_branch() {
 }
 
 #[test]
+fn reports_the_worktree_that_has_the_branch_checked_out() {
+    let (_remote, work) = repo_with_remote();
+    run_git(work.path(), &["branch", "feat/wt"]);
+    let wt = work.path().join("wt-dir");
+    run_git(
+        work.path(),
+        &["worktree", "add", wt.to_str().unwrap(), "feat/wt"],
+    );
+
+    let info = branch::delete_info(&p(&work), "feat/wt").unwrap();
+    let target = info.worktree.expect("被 worktree 检出的分支要报出来");
+    assert_eq!(target.name, "wt-dir");
+    // 路径要给全的：`git worktree remove` 收路径，靠名字拼是拼不出来的
+    assert!(target.path.ends_with("wt-dir"), "{}", target.path);
+}
+
+/// 这条断言的是这个功能存在的理由，不是锦上添花：分支被 worktree 占着时
+/// `git branch -D` 直接拒绝，没有那个勾选框这类分支在界面上根本删不掉。
+#[test]
+fn git_refuses_to_delete_a_branch_a_worktree_has_checked_out() {
+    let (_remote, work) = repo_with_remote();
+    run_git(work.path(), &["branch", "feat/busy"]);
+    let wt = work.path().join("busy-dir");
+    let wt_path = wt.to_str().unwrap();
+    run_git(work.path(), &["worktree", "add", wt_path, "feat/busy"]);
+
+    let refused = Command::new("git")
+        .current_dir(work.path())
+        .args(["branch", "-D", "feat/busy"])
+        .status()
+        .unwrap();
+    assert!(!refused.success(), "git 应当拒绝删除被检出的分支");
+
+    // 先把 worktree 摘掉，同一条命令就通了——界面走的正是这个顺序
+    run_git(work.path(), &["worktree", "remove", wt_path]);
+    run_git(work.path(), &["branch", "-D", "feat/busy"]);
+}
+
+/// 主工作区不给勾选框：它删不掉，给了也是死路。
+#[test]
+fn the_main_worktree_is_not_offered() {
+    let (_remote, work) = repo_with_remote();
+    run_git(work.path(), &["checkout", "-q", "-b", "feat/here"]);
+
+    let info = branch::delete_info(&p(&work), "feat/here").unwrap();
+    assert_eq!(info.worktree, None);
+}
+
+#[test]
+fn a_branch_without_a_worktree_reports_none() {
+    let (_remote, work) = repo_with_remote();
+    run_git(work.path(), &["branch", "plain"]);
+
+    let info = branch::delete_info(&p(&work), "plain").unwrap();
+    assert_eq!(info.worktree, None);
+}
+
+#[test]
 fn a_merged_branch_reports_nothing_unmerged() {
     let (_remote, work) = repo_with_remote();
     run_git(work.path(), &["checkout", "-q", "-b", "feat/merged"]);

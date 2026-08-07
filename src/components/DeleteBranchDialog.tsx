@@ -2,6 +2,14 @@ import { useEffect, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { toErrorMessage } from '../engine/errors'
 
+/** 检出了待删分支的 worktree（主工作区除外）。 */
+export interface WorktreeTarget {
+  /** 目录名，界面上显示这个。 */
+  name: string
+  /** 完整路径，删除时传给后端。 */
+  path: string
+}
+
 export interface DeleteInfo {
   /** 对应的远程分支简称，如 `origin/feat/x`；没有就不显示勾选框。 */
   upstream: string | null
@@ -11,12 +19,22 @@ export interface DeleteInfo {
   remoteBranch: string | null
   /** 只在这个分支上、不在当前 HEAD 上的提交数。 */
   unmerged: number
+  /** 检出了这个分支的 worktree；没有就不显示那个勾选框。 */
+  worktree: WorktreeTarget | null
 }
 
 /** 确认删除时回传的远程分支坐标；不删远程就是 null。 */
 export interface RemoteTarget {
   remote: string
   branch: string
+}
+
+/** 这一次删除都要动哪些东西。 */
+export interface DeleteTargets {
+  /** 非 null 时连远程分支一起删。 */
+  remote: RemoteTarget | null
+  /** 非 null 时先把这个 worktree 删掉，否则本地分支根本删不动。 */
+  worktreePath: string | null
 }
 
 function BranchGlyph() {
@@ -38,6 +56,14 @@ function RemoteGlyph() {
   )
 }
 
+function FolderGlyph() {
+  return (
+    <svg className="dlg-glyph" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3">
+      <path d="M1.8 12.8V3.7h4.1l1.4 1.8h6.9v7.3z" />
+    </svg>
+  )
+}
+
 function TrashGlyph() {
   return (
     <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" strokeWidth="1.6">
@@ -52,19 +78,29 @@ interface DeleteBranchDialogProps {
   name: string
   onCancel: () => void
   /** 失败时应当抛出——弹框据此留在原地并把错误显示出来，好让用户重试。 */
-  onConfirm: (remote: RemoteTarget | null) => Promise<void>
+  onConfirm: (targets: DeleteTargets) => Promise<void>
 }
 
 /**
  * 删除分支的确认框。
  *
  * 之前右键 Delete 是直接 `git branch -D`——没有任何确认，未合并的提交就那么
- * 没了。这个框把代价摆出来，顺带提供「同时删远程分支」。
+ * 没了。这个框把代价摆出来，顺带提供「同时删远程分支」和「同时删 worktree」。
+ *
+ * 后者不只是方便：分支被 worktree 检出时 `git branch -D` 直接拒绝，没有这个
+ * 勾选框的话这类分支在界面上根本删不掉。
  */
 export function DeleteBranchDialog({ repoPath, name, onCancel, onConfirm }: DeleteBranchDialogProps) {
   const [info, setInfo] = useState<DeleteInfo | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [alsoRemote, setAlsoRemote] = useState(false)
+  /**
+   * 是否连 worktree 一起删。有 worktree 时**默认勾上**。
+   *
+   * 这一项和「删远程」不同，它不是可选的附赠动作：git 拒绝删除被 worktree
+   * 检出的分支，不勾就是必然失败。默认勾上，再用下面那行说明讲清为什么。
+   */
+  const [alsoWorktree, setAlsoWorktree] = useState(false)
   /** 删除正在进行中。勾了远程时这一步要走网络，实测能到四五秒。 */
   const [busy, setBusy] = useState(false)
   const confirmRef = useRef<HTMLButtonElement>(null)
@@ -73,7 +109,11 @@ export function DeleteBranchDialog({ repoPath, name, onCancel, onConfirm }: Dele
     if (!repoPath) return
     let cancelled = false
     invoke<DeleteInfo>('branch_delete_info', { path: repoPath, name })
-      .then((data) => { if (!cancelled) setInfo(data) })
+      .then((data) => {
+        if (cancelled) return
+        setInfo(data)
+        setAlsoWorktree(data.worktree !== null)
+      })
       .catch((err) => { if (!cancelled) setError(toErrorMessage(err)) })
     return () => { cancelled = true }
   }, [repoPath, name])
@@ -91,13 +131,14 @@ export function DeleteBranchDialog({ repoPath, name, onCancel, onConfirm }: Dele
    */
   const confirm = async () => {
     if (!info || busy) return
-    const target = alsoRemote && info.remote && info.remoteBranch
+    const remote = alsoRemote && info.remote && info.remoteBranch
       ? { remote: info.remote, branch: info.remoteBranch }
       : null
+    const worktreePath = alsoWorktree && info.worktree ? info.worktree.path : null
     setBusy(true)
     setError(null)
     try {
-      await onConfirm(target)
+      await onConfirm({ remote, worktreePath })
     } catch (err) {
       setError(toErrorMessage(err))
       setBusy(false)
@@ -142,6 +183,28 @@ export function DeleteBranchDialog({ repoPath, name, onCancel, onConfirm }: Dele
             <span>Also delete remote branch</span>
             <span className="dlg-value"><RemoteGlyph />{info.upstream}</span>
           </label>
+        )}
+
+        {info?.worktree && (
+          <>
+            <label className="dlg-field dlg-check">
+              <input
+                type="checkbox"
+                checked={alsoWorktree}
+                disabled={busy}
+                onChange={(e) => setAlsoWorktree(e.target.checked)}
+              />
+              <span>Also delete worktree</span>
+              <span className="dlg-value"><FolderGlyph />{info.worktree.name}</span>
+            </label>
+            {/* 默认勾上是有原因的，说出来——否则用户会以为这只是个可选项，
+                取消勾选后撞上 git 那句 "used by worktree at ..." 一头雾水 */}
+            <div className="dlg-note">
+              {alsoWorktree
+                ? '该分支正被这个 worktree 检出，git 不允许删除被检出的分支，所以这一项默认勾上。'
+                : '不删掉这个 worktree 的话，git 会拒绝删除该分支。'}
+            </div>
+          </>
         )}
 
         {info !== null && info.unmerged > 0 && (
