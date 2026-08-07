@@ -51,7 +51,8 @@ interface DeleteBranchDialogProps {
   /** 要删除的本地分支名。 */
   name: string
   onCancel: () => void
-  onConfirm: (remote: RemoteTarget | null) => void
+  /** 失败时应当抛出——弹框据此留在原地并把错误显示出来，好让用户重试。 */
+  onConfirm: (remote: RemoteTarget | null) => Promise<void>
 }
 
 /**
@@ -64,6 +65,8 @@ export function DeleteBranchDialog({ repoPath, name, onCancel, onConfirm }: Dele
   const [info, setInfo] = useState<DeleteInfo | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [alsoRemote, setAlsoRemote] = useState(false)
+  /** 删除正在进行中。勾了远程时这一步要走网络，实测能到四五秒。 */
+  const [busy, setBusy] = useState(false)
   const confirmRef = useRef<HTMLButtonElement>(null)
 
   useEffect(() => {
@@ -79,12 +82,26 @@ export function DeleteBranchDialog({ repoPath, name, onCancel, onConfirm }: Dele
   // 用户根本没机会决定要不要连远程一起删
   const ready = info !== null
 
-  const confirm = () => {
-    if (!info) return
+  /**
+   * 跑删除，跑完之前弹框留在原地。
+   *
+   * 删远程要走一次网络往返（实测到 GitHub 四五秒）。以前这里是发出去就把
+   * 弹框关掉，于是界面上四五秒毫无动静，看着像卡死；现在把这段等待显示出来。
+   * 失败也不关，错误就地显示，用户可以直接再点一次。
+   */
+  const confirm = async () => {
+    if (!info || busy) return
     const target = alsoRemote && info.remote && info.remoteBranch
       ? { remote: info.remote, branch: info.remoteBranch }
       : null
-    onConfirm(target)
+    setBusy(true)
+    setError(null)
+    try {
+      await onConfirm(target)
+    } catch (err) {
+      setError(toErrorMessage(err))
+      setBusy(false)
+    }
   }
 
   // 信息回来之后再聚焦确认按钮：焦点得先落进弹框里，回车/Esc 才有着落，
@@ -92,13 +109,14 @@ export function DeleteBranchDialog({ repoPath, name, onCancel, onConfirm }: Dele
   useEffect(() => { if (ready) confirmRef.current?.focus() }, [ready])
 
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onCancel() }
+    // 删除跑起来之后 Esc 不再关闭：git 已经在动远程了，关掉只会让用户以为取消了
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !busy) onCancel() }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [onCancel])
+  }, [onCancel, busy])
 
   return (
-    <div className="dialog-overlay" onMouseDown={onCancel}>
+    <div className="dialog-overlay" onMouseDown={() => { if (!busy) onCancel() }}>
       <div className="dialog dialog-wide" onMouseDown={(e) => e.stopPropagation()}>
         <div className="dlg-head">
           <span className="dlg-icon danger"><TrashGlyph /></span>
@@ -118,6 +136,7 @@ export function DeleteBranchDialog({ repoPath, name, onCancel, onConfirm }: Dele
             <input
               type="checkbox"
               checked={alsoRemote}
+              disabled={busy}
               onChange={(e) => setAlsoRemote(e.target.checked)}
             />
             <span>Also delete remote branch</span>
@@ -133,10 +152,23 @@ export function DeleteBranchDialog({ repoPath, name, onCancel, onConfirm }: Dele
 
         {error && <div className="dlg-warning">{error}</div>}
 
+        {/* 联系远程要几秒钟，明说一句，免得用户以为界面卡了 */}
+        {busy && (
+          <div className="dlg-progress">
+            <span className="dlg-spinner" />
+            {alsoRemote ? '正在联系远程…' : '正在删除…'}
+          </div>
+        )}
+
         <div className="dialog-actions">
-          <button onClick={onCancel}>Cancel</button>
-          <button ref={confirmRef} className="primary danger" disabled={!ready} onClick={confirm}>
-            Delete
+          <button disabled={busy} onClick={onCancel}>Cancel</button>
+          <button
+            ref={confirmRef}
+            className="primary danger"
+            disabled={!ready || busy}
+            onClick={() => void confirm()}
+          >
+            {busy ? 'Deleting…' : 'Delete'}
           </button>
         </div>
       </div>

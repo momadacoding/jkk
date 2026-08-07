@@ -606,6 +606,35 @@ body {
   accent-color: #3a6ea5;
 }
 
+/* 进度条：删远程要走一次网络往返（实测到 GitHub 四五秒），
+   这几秒必须看得见，否则界面像卡死 */
+.dlg-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: 54px;
+  color: #bbb;
+}
+
+.dlg-spinner {
+  flex-shrink: 0;
+  width: 12px;
+  height: 12px;
+  border: 2px solid #4a4a4a;
+  border-top-color: #4fc3f7;
+  border-radius: 50%;
+  animation: dlg-spin 0.7s linear infinite;
+}
+
+@keyframes dlg-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* 关掉动画的用户看不到旋转，那就至少让它是个静止的进度标记 */
+@media (prefers-reduced-motion: reduce) {
+  .dlg-spinner { animation: none; }
+}
+
 .dlg-warning {
   margin-left: 54px;
   padding: 6px 8px;

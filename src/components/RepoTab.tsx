@@ -200,6 +200,9 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
    * **先删远程再删本地。** 远程那一步才会因为外部原因失败（断网、没权限、
    * 分支被保护），失败在动本地之前，留下的就是一个原样、可以直接重试的状态；
    * 反过来的话本地引用已经没了，还得先去 reflog 里捞回来才能重试。
+   *
+   * **失败不在这里吞掉，抛给确认框。** 那个框会留在原地把错误显示出来，用户
+   * 就地就能重试；丢进顶部横幅的话框已经关了，还得重新右键走一遍。
    */
   const handleDeleteBranch = useCallback(async (
     name: string,
@@ -207,17 +210,13 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
   ) => {
     const path = state.path
     if (!path) return
-    try {
-      if (remote) {
-        await invoke('delete_remote_branch', { path, remote: remote.remote, branch: remote.branch })
-      }
-      await invoke('delete_branch', { path, name })
-      await refreshGraph(path)
-      await refreshUpstream(path)
-    } catch (err) {
-      reportError(err)
+    if (remote) {
+      await invoke('delete_remote_branch', { path, remote: remote.remote, branch: remote.branch })
     }
-  }, [state.path, refreshGraph, refreshUpstream, reportError])
+    await invoke('delete_branch', { path, name })
+    await refreshGraph(path)
+    await refreshUpstream(path)
+  }, [state.path, refreshGraph, refreshUpstream])
 
   /**
    * 检出一个远程分支。后端会建一条跟踪它的本地分支——直接检出远程引用会进
@@ -239,19 +238,19 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
     }
   }, [state.path, state.headHash, refreshHead, refreshGraph, refreshStatus, refreshUpstream, reportError])
 
-  /** 删除远程分支。确认在 `BranchView` 的确认框里做过了。 */
+  /**
+   * 删除远程分支。确认在 `BranchView` 的确认框里做过了。
+   *
+   * 同 `handleDeleteBranch`：失败抛给确认框，它会留在原地显示错误让用户重试。
+   */
   const handleDeleteRemote = useCallback(async (remoteBranch: string) => {
     const path = state.path
     if (!path) return
-    try {
-      await invoke('delete_remote_ref', { path, remoteBranch })
-      // 远程引用没了，图上的标签和上游计数都要跟着变
-      await refreshGraph(path)
-      await refreshUpstream(path)
-    } catch (err) {
-      reportError(err)
-    }
-  }, [state.path, refreshGraph, refreshUpstream, reportError])
+    await invoke('delete_remote_ref', { path, remoteBranch })
+    // 远程引用没了，图上的标签和上游计数都要跟着变
+    await refreshGraph(path)
+    await refreshUpstream(path)
+  }, [state.path, refreshGraph, refreshUpstream])
 
   /** 单击分支：只选中并把 graph 定位到它的 tip，不碰工作区。 */
   const handleSelectBranch = useCallback((name: string, hash: string) => {
@@ -331,9 +330,9 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
                   await refreshHead(state.path!)
                   await refreshGraph(state.path!)
                 })}
-                onDelete={(name, remote) => void handleDeleteBranch(name, remote)}
+                onDelete={handleDeleteBranch}
                 onCheckoutRemote={(name) => void handleCheckoutRemote(name)}
-                onDeleteRemote={(name) => void handleDeleteRemote(name)}
+                onDeleteRemote={handleDeleteRemote}
                 repoPath={state.path}
               />
               <WorktreeView

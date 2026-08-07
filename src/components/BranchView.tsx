@@ -15,12 +15,21 @@ interface BranchViewProps {
   onCheckout: (name: string) => void
   onCreate: (name: string, start?: string) => void
   onRename: (oldName: string, newName: string) => void
-  /** `remote` 非 null 时连远程分支一起删。 */
-  onDelete: (name: string, remote: RemoteTarget | null) => void
+  /**
+   * `remote` 非 null 时连远程分支一起删。
+   *
+   * 返回的 Promise 要等删完才 resolve，确认框靠它显示进度；失败要抛出，
+   * 确认框据此留在原地显示错误。
+   */
+  onDelete: (name: string, remote: RemoteTarget | null) => Promise<void>
   /** 检出远程分支：建一条跟踪它的本地分支并切过去。 */
   onCheckoutRemote: (remoteBranch: string) => void
-  /** 删除远程分支，参数是 `origin/feat/x` 这种完整简称。 */
-  onDeleteRemote: (remoteBranch: string) => void
+  /**
+   * 删除远程分支，参数是 `origin/feat/x` 这种完整简称。
+   *
+   * 同 `onDelete`：Promise 要等删完才 resolve，失败要抛出。
+   */
+  onDeleteRemote: (remoteBranch: string) => Promise<void>
   /** 仓库路径，删除确认框要用它去查上游和未合并提交数。 */
   repoPath: string | null
 }
@@ -132,17 +141,17 @@ export function BranchView({
     },
     {
       label: 'Delete remote branch…',
-      onSelect: () => void (async () => {
-        const ok = await confirm({
-          title: 'Delete Remote Branch',
-          message: 'Delete this branch from the remote repository',
-          detail: { label: 'Branch:', value: full },
-          warning: '远程分支是共享的，删掉之后其他人下次 fetch --prune 也会跟着少这一条。',
-          confirmLabel: 'Delete',
-          danger: true,
-        })
-        if (ok) onDeleteRemote(full)
-      })(),
+      onSelect: () => void confirm({
+        title: 'Delete Remote Branch',
+        message: 'Delete this branch from the remote repository',
+        detail: { label: 'Branch:', value: full },
+        warning: '远程分支是共享的，删掉之后其他人下次 fetch --prune 也会跟着少这一条。',
+        confirmLabel: 'Delete',
+        danger: true,
+        // 交给弹框去跑：这一步要走网络，得让等待可见
+        action: () => onDeleteRemote(full),
+        busyLabel: '正在联系远程…',
+      }),
       danger: true,
     },
   ]
@@ -216,7 +225,8 @@ export function BranchView({
           repoPath={repoPath}
           name={deleting}
           onCancel={() => setDeleting(null)}
-          onConfirm={(remote) => { onDelete(deleting, remote); setDeleting(null) }}
+          // 成功才关；失败时 onDelete 抛出，确认框自己接住并留在原地
+          onConfirm={async (remote) => { await onDelete(deleting, remote); setDeleting(null) }}
         />
       )}
     </SidebarSection>
