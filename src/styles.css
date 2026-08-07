@@ -340,35 +340,229 @@ body {
   font-size: 10px;
 }
 
+/* ---------- diff（带行号栏，Fork 风格） ---------- */
+
 .diff-view {
   height: 100%;
   overflow: auto;
-  font-family: monospace;
+  font-family: Consolas, 'Courier New', monospace;
   font-size: 12px;
+  line-height: 18px;
+  tab-size: 4;
+}
+
+/* max-content 让整行跟着最长的一行走，min-width 保证容器更宽时高亮铺满 */
+.diff-file {
+  width: max-content;
+  min-width: 100%;
 }
 
 .diff-file-header {
+  padding: 5px 8px;
+  background: #2a2a2a;
+  border-bottom: 1px solid #333;
+  color: #ddd;
+}
+
+.diff-file-old {
+  color: #888;
+}
+
+.diff-hunk-header {
+  padding: 2px 8px;
+  background: #24303a;
+  color: #6e9ec9;
+  white-space: pre;
+}
+
+/* 两条头的文字横向吸附在左边。位移只能发生在包含块内部，而外层 div 和包含块
+   一样宽（都跟着最长的一行），所以必须由里面这层窄一点的 span 来吸。 */
+.diff-file-header > span,
+.diff-hunk-header > span {
+  position: sticky;
+  left: 8px;
+  display: inline-block;
+}
+
+.diff-line {
+  display: flex;
+  white-space: pre;
+}
+
+.diff-line.add { background: #1c3626; }
+.diff-line.del { background: #3b2326; }
+
+/* 行号和 +/- 一起横向吸附在左边，长行左右滚动时不会跟着跑掉。
+   背景必须是不透明的，否则代码会从底下透出来。 */
+.diff-gutter {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  display: flex;
+  flex-shrink: 0;
+  background: #212121;
+  border-right: 1px solid #2e2e2e;
+  color: #666;
+  user-select: none;
+}
+
+.diff-line.add .diff-gutter { background: #23482f; color: #7fae8c; }
+.diff-line.del .diff-gutter { background: #4a2a2e; color: #c08e92; }
+
+.diff-ln {
+  width: 44px;
+  padding-right: 8px;
+  text-align: right;
+}
+
+.diff-sign {
+  width: 16px;
+  text-align: center;
+}
+
+.diff-line.add .diff-sign { color: #81c784; }
+.diff-line.del .diff-sign { color: #e57373; }
+
+.diff-code {
+  padding: 0 8px;
+}
+
+.diff-note {
   padding: 8px;
+  color: #666;
+}
+
+/* ---------- 文件内容（File Tree 右侧，只读） ---------- */
+
+.file-content {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.fc-head {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+  padding: 5px 8px;
   background: #2a2a2a;
   border-bottom: 1px solid #333;
 }
 
-.diff-line {
-  padding: 0 8px;
-  white-space: pre;
+.fc-head-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #ddd;
 }
 
-.diff-line.add { background: rgba(129, 199, 132, 0.15); }
-.diff-line.del { background: rgba(229, 115, 115, 0.15); }
-
-.diff-origin {
-  display: inline-block;
-  width: 12px;
+.fc-head-meta {
+  flex-shrink: 0;
   color: #888;
 }
 
-.empty-diff {
-  padding: 8px;
+.fc-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  font-family: Consolas, 'Courier New', monospace;
+  font-size: 12px;
+  line-height: 18px;
+  tab-size: 4;
+}
+
+.fc-line {
+  display: flex;
+  white-space: pre;
+  width: max-content;
+  min-width: 100%;
+}
+
+/* 和 diff 一样，行号横向吸附在左边 */
+.fc-ln {
+  position: sticky;
+  left: 0;
+  flex-shrink: 0;
+  width: 52px;
+  padding-right: 8px;
+  text-align: right;
+  background: #212121;
+  border-right: 1px solid #2e2e2e;
+  color: #666;
+  user-select: none;
+}
+
+.fc-code {
+  padding: 0 8px;
+}
+
+/* ---------- 文件树 ---------- */
+
+.file-tree {
+  /* 不带 border-box 的话上下 padding 会顶出 4px 的溢出，白挂一条滚动条 */
+  box-sizing: border-box;
+  height: 100%;
+  overflow: auto;
+  padding: 2px 0;
+  user-select: none;
+}
+
+.ft-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px 1px 0;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.ft-row:hover { background: #2a2a2a; }
+.ft-file.selected { background: #37414d; }
+
+.ft-chevron {
+  flex-shrink: 0;
+  color: #888;
+  transition: transform 0.1s;
+}
+
+.ft-chevron.open { transform: rotate(90deg); }
+
+.ft-chevron-spacer { width: 10px; flex-shrink: 0; }
+
+.ft-icon { flex-shrink: 0; color: #9aa0a6; }
+.ft-icon.folder { color: #d9b45b; }
+
+.ft-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 状态角标：一眼看出这个文件是加的、改的还是删的 */
+.ft-badge {
+  flex-shrink: 0;
+  width: 13px;
+  height: 13px;
+  border-radius: 2px;
+  font-size: 10px;
+  line-height: 13px;
+  text-align: center;
+  font-weight: bold;
+  color: #1e1e1e;
+}
+
+.ft-badge-spacer { width: 13px; flex-shrink: 0; }
+
+.ft-badge.added { background: #81c784; }
+.ft-badge.modified { background: #e5a341; }
+.ft-badge.deleted { background: #e57373; }
+.ft-badge.renamed { background: #64b5f6; }
+.ft-badge.conflicted { background: #ba68c8; }
+
+.ft-empty,
+.ft-truncated {
+  padding: 6px 8px;
   color: #666;
 }
 
@@ -854,6 +1048,49 @@ body {
   color: #fff;
 }
 
+/* 提交信息条：三个标签共用，切换标签时它不动 */
+.commit-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  padding: 5px 8px;
+  border-bottom: 1px solid #333;
+  min-width: 0;
+}
+
+.commit-avatar {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  border-radius: 3px;
+  background: #3a6ea5;
+  color: #fff;
+  font-size: 11px;
+  line-height: 18px;
+  text-align: center;
+}
+
+.commit-head-author { color: #fff; }
+.commit-head-sha { font-family: monospace; color: #888; }
+.commit-head-date { color: #888; }
+
+.commit-head-subject {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: bold;
+  color: #fff;
+}
+
+/* 左树右 diff。Group 要有确定高度才撑得开，所以这里用 flex:1 + min-height:0 */
+.commit-split {
+  flex: 1;
+  min-height: 0;
+}
+
 .commit-info {
   flex: 1;
   overflow: auto;
@@ -897,9 +1134,25 @@ body {
 
 .commit-file-row {
   display: flex;
+  align-items: center;
   gap: 8px;
   padding: 1px 0;
 }
+
+.commit-file-status {
+  flex-shrink: 0;
+  width: 13px;
+  text-align: center;
+  font-size: 10px;
+  font-weight: bold;
+}
+
+.commit-file-status.added { color: #81c784; }
+.commit-file-status.modified { color: #e5a341; }
+.commit-file-status.deleted { color: #e57373; }
+.commit-file-status.renamed,
+.commit-file-status.copied { color: #64b5f6; }
+.commit-file-status.conflicted { color: #ba68c8; }
 
 .commit-file-path {
   flex: 1;
@@ -907,11 +1160,6 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.commit-changes {
-  flex: 1;
-  overflow: auto;
 }
 
 /* 顶部 Git 操作工具栏 */

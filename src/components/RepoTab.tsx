@@ -324,6 +324,7 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
                   <CommitDetailView
                     commit={detailCommit}
                     diff={state.diff}
+                    repoPath={state.path}
                   />
                 </Panel>
               </Group>

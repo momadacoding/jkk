@@ -1,30 +1,89 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import { invoke } from '@tauri-apps/api/core'
+import { Panel, Group, Separator } from 'react-resizable-panels'
 import type { CommitNode, DiffData } from '../engine/types'
-import { DiffHunk } from './DiffHunk'
+import { buildFileTree } from '../engine/fileTree'
+import { DiffView } from './DiffView'
+import { FileTree } from './FileTree'
+import { FileContentView } from './FileContentView'
+import { toErrorMessage } from '../engine/errors'
+
+type Tab = 'commit' | 'changes' | 'tree'
 
 interface CommitDetailViewProps {
   commit: CommitNode | null
   diff: DiffData
+  /** 仓库路径，File Tree 标签要用它去读这个提交的整棵树。 */
+  repoPath: string | null
 }
 
-interface FileStat {
-  path: string
-  additions: number
-  deletions: number
+interface TreeListing {
+  paths: string[]
+  truncated: boolean
 }
 
-export function CommitDetailView({ commit, diff }: CommitDetailViewProps) {
-  const [tab, setTab] = useState<'commit' | 'changes'>('commit')
+/** 提交信息条：头像、作者、短 hash、时间、标题。Fork 里三个标签共用这一条。 */
+function CommitHeader({ commit }: { commit: CommitNode }) {
+  const subject = commit.message.split('\n')[0]
+  return (
+    <div className="commit-head">
+      <span className="commit-avatar">{commit.author.slice(0, 1).toUpperCase()}</span>
+      <span className="commit-head-author">{commit.author}</span>
+      <span className="commit-head-sha">{commit.id.slice(0, 7)}</span>
+      <span className="commit-head-date">{new Date(commit.time * 1000).toLocaleString()}</span>
+      <span className="commit-head-subject" title={commit.message}>{subject}</span>
+    </div>
+  )
+}
 
-  const fileStats: FileStat[] = useMemo(
+export function CommitDetailView({ commit, diff, repoPath }: CommitDetailViewProps) {
+  const [tab, setTab] = useState<Tab>('commit')
+  const [picked, setPicked] = useState<string | null>(null)
+  const [listing, setListing] = useState<TreeListing | null>(null)
+  const [listError, setListError] = useState<string | null>(null)
+
+  const fileStats = useMemo(
     () =>
       diff.files.map((f) => ({
         path: f.path,
+        status: f.status,
         additions: f.hunks.reduce((n, h) => n + h.lines.filter((l) => l.origin === '+').length, 0),
         deletions: f.hunks.reduce((n, h) => n + h.lines.filter((l) => l.origin === '-').length, 0),
       })),
     [diff],
   )
+
+  const changesTree = useMemo(
+    () => buildFileTree(diff.files.map((f) => ({ path: f.path, status: f.status }))),
+    [diff],
+  )
+
+  const fullTree = useMemo(
+    () => buildFileTree((listing?.paths ?? []).map((path) => ({ path, status: null }))),
+    [listing],
+  )
+
+  // 选中项从当前 diff 推出来而不是存起来：换一个提交时上一个选中的文件多半
+  // 不在新 diff 里，存着的话右边会空白，还得再写一个 effect 去清它。
+  const activePath = picked && diff.files.some((f) => f.path === picked)
+    ? picked
+    : diff.files[0]?.path ?? null
+
+  const activeDiff: DiffData = useMemo(
+    () => ({ files: diff.files.filter((f) => f.path === activePath) }),
+    [diff, activePath],
+  )
+
+  const commitId = commit?.id ?? null
+  useEffect(() => {
+    if (tab !== 'tree' || !repoPath || !commitId) return
+    let cancelled = false
+    setListError(null)
+    invoke<TreeListing>('list_tree', { path: repoPath, rev: commitId })
+      .then((data) => { if (!cancelled) setListing(data) })
+      .catch((err) => { if (!cancelled) { setListing(null); setListError(toErrorMessage(err)) } })
+    return () => { cancelled = true }
+  }, [tab, repoPath, commitId])
 
   if (!commit) {
     return <div className="commit-detail commit-detail-empty">Select a commit</div>
@@ -34,15 +93,16 @@ export function CommitDetailView({ commit, diff }: CommitDetailViewProps) {
     <div className="commit-detail">
       <div className="commit-detail-tabs">
         <button className={tab === 'commit' ? 'active' : ''} onClick={() => setTab('commit')}>Commit</button>
-        <button className={tab === 'changes' ? 'active' : ''} onClick={() => setTab('changes')}>Changes</button>
+        <button className={tab === 'changes' ? 'active' : ''} onClick={() => setTab('changes')}>
+          Changes{diff.files.length > 0 ? ` (${diff.files.length})` : ''}
+        </button>
+        <button className={tab === 'tree' ? 'active' : ''} onClick={() => setTab('tree')}>File Tree</button>
       </div>
-      {tab === 'commit' ? (
+
+      <CommitHeader commit={commit} />
+
+      {tab === 'commit' && (
         <div className="commit-info">
-          <div className="commit-info-row">
-            <span className="commit-info-label">AUTHOR</span>
-            <span>{commit.author}</span>
-            <span className="commit-info-date">{new Date(commit.time * 1000).toLocaleString()}</span>
-          </div>
           <div className="commit-info-row">
             <span className="commit-info-label">SHA</span>
             <span className="commit-info-sha">{commit.id}</span>
@@ -57,15 +117,56 @@ export function CommitDetailView({ commit, diff }: CommitDetailViewProps) {
           <div className="commit-files">
             {fileStats.map((f) => (
               <div key={f.path} className="commit-file-row">
+                <span className={`commit-file-status ${f.status}`}>{f.status.slice(0, 1).toUpperCase()}</span>
                 <span className="commit-file-path">{f.path}</span>
                 <span className="file-stats">+{f.additions}/-{f.deletions}</span>
               </div>
             ))}
           </div>
         </div>
-      ) : (
-        <div className="commit-changes">
-          <DiffHunk diff={diff} />
+      )}
+
+      {tab === 'changes' && (
+        <div className="commit-split">
+          <Group orientation="horizontal">
+            <Panel defaultSize="30%" minSize="15%" maxSize="60%">
+              <FileTree nodes={changesTree} selectedPath={activePath} onSelect={setPicked} />
+            </Panel>
+            <Separator className="separator-v" />
+            <Panel minSize="30%">
+              <DiffView diff={activeDiff} showPath={false} />
+            </Panel>
+          </Group>
+        </div>
+      )}
+
+      {tab === 'tree' && (
+        <div className="commit-split">
+          <Group orientation="horizontal">
+            <Panel defaultSize="30%" minSize="15%" maxSize="60%">
+              {listError ? (
+                <div className="diff-note">{listError}</div>
+              ) : (
+                <>
+                  {listing?.truncated && (
+                    <div className="ft-truncated">文件太多，只显示前 {listing.paths.length} 条</div>
+                  )}
+                  {/* 整仓文件树可能上万条，默认收起，展开哪层由用户决定 */}
+                  <FileTree
+                    nodes={fullTree}
+                    selectedPath={picked}
+                    onSelect={setPicked}
+                    defaultOpen={false}
+                  />
+                </>
+              )}
+            </Panel>
+            <Separator className="separator-v" />
+            <Panel minSize="30%">
+              {/* 这里看的是文件在这个提交下的样子，不是它改了什么——那是 Changes 的事 */}
+              <FileContentView repoPath={repoPath} rev={commit.id} path={picked} />
+            </Panel>
+          </Group>
         </div>
       )}
     </div>

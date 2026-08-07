@@ -18,9 +18,14 @@ pub struct StatusData {
 }
 
 #[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct DiffLine {
     pub origin: char, // '+', '-', ' '
     pub content: String,
+    /// 该行在旧版本里的行号；新增行为 None。行号栏靠这两个字段。
+    pub old_lineno: Option<u32>,
+    /// 该行在新版本里的行号；删除行为 None。
+    pub new_lineno: Option<u32>,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -28,6 +33,8 @@ pub struct DiffLine {
 pub struct DiffHunk {
     pub old_start: u32,
     pub new_start: u32,
+    /// git 原样的 `@@ -a,b +c,d @@ 上下文` 头，界面上直接显示。
+    pub header: String,
     pub lines: Vec<DiffLine>,
 }
 
@@ -35,6 +42,12 @@ pub struct DiffHunk {
 #[serde(rename_all = "camelCase")]
 pub struct FileDiff {
     pub path: String,
+    /// 与 `FileChange::status` 同一套取值，文件树的状态角标靠它。
+    pub status: String,
+    /// 重命名前的路径；其余情况为 None。
+    pub old_path: Option<String>,
+    /// 二进制文件没有可显示的行，界面要换一种呈现方式。
+    pub binary: bool,
     pub hunks: Vec<DiffHunk>,
 }
 
@@ -263,7 +276,9 @@ pub fn read_diff(path: &str, scope: String) -> Result<DiffData> {
         } else {
             None
         };
-        let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
+        let mut diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
+        // 不做改名检测的话，一次重命名会摊成一加一删两条，文件树里看不出是同一个文件
+        diff.find_similar(None)?;
         return diff_to_data(diff);
     }
     // default: workdir vs HEAD（空仓库没有 HEAD，此时与空树比较）
@@ -284,51 +299,107 @@ pub fn read_diff(path: &str, scope: String) -> Result<DiffData> {
     }
 }
 
+/// delta 在界面上用哪个路径标识。重命名时用新路径，删除时退回旧路径。
+fn delta_path(delta: &git2::DiffDelta) -> String {
+    delta
+        .new_file()
+        .path()
+        .or_else(|| delta.old_file().path())
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+/// 与 `index_status` / `worktree_status` 保持同一套取值，前端只认这一套。
+fn delta_status(status: git2::Delta) -> &'static str {
+    match status {
+        git2::Delta::Added | git2::Delta::Untracked => "added",
+        git2::Delta::Deleted => "deleted",
+        git2::Delta::Renamed => "renamed",
+        git2::Delta::Copied => "copied",
+        git2::Delta::Conflicted => "conflicted",
+        _ => "modified",
+    }
+}
+
 /// 把 diff 摊平成前端要的结构。
 ///
-/// 与 `line_stats` 同理：`print` 会去打开工作区文件，个别坏路径（悬空链接、
-/// 权限不足、扫描途中被删）会让 libgit2 中止整个输出。这里保留已经收集到的
-/// 文件而不是整体报错——看得到大部分 diff，好过什么都看不到。
+/// 文件列表先从 `deltas()` 建好，再由 `print` 往里填 hunk。这个顺序是有意的：
+/// `print` 会去打开工作区文件，个别坏路径（悬空链接、权限不足、扫描途中被删）
+/// 会让 libgit2 中止整个输出；先建列表的话，即使输出中断，**文件树仍然是全的**，
+/// 只是部分文件没有行内容。二进制文件同理——它压根不产出 '+'/'-' 行，
+/// 只有列表能证明它变过。
 fn diff_to_data(diff: git2::Diff) -> Result<DiffData> {
     let mut files: Vec<FileDiff> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+
+    for delta in diff.deltas() {
+        let path = delta_path(&delta);
+        if index.contains_key(&path) {
+            continue;
+        }
+        let old_path = delta
+            .old_file()
+            .path()
+            .map(|p| p.to_string_lossy().to_string())
+            .filter(|p| *p != path);
+        index.insert(path.clone(), files.len());
+        files.push(FileDiff {
+            path,
+            status: delta_status(delta.status()).to_string(),
+            old_path,
+            binary: delta.flags().contains(git2::DiffFlags::BINARY),
+            hunks: Vec::new(),
+        });
+    }
+
     let outcome = diff.print(git2::DiffFormat::Patch, |delta, hunk, line| {
+        let Some(&i) = index.get(&delta_path(&delta)) else {
+            return true;
+        };
+        let file = &mut files[i];
+
+        // 二进制标记只在真正读了内容之后才立得起来，所以这里补一次：
+        // 建列表时 delta 的 BINARY 标志往往还没置上。
+        if line.origin() == 'B' || delta.flags().contains(git2::DiffFlags::BINARY) {
+            file.binary = true;
+        }
         // libgit2 会把文件头（'F'）、hunk 头（'H'）、二进制标记（'B'）
         // 也作为行回调抛出来，直接渲染就会出现 "F diff --git ..." 这种脏行。
         if !matches!(line.origin(), '+' | '-' | ' ') {
             return true;
         }
-        let path = delta
-            .new_file()
-            .path()
-            .unwrap_or(delta.old_file().path().unwrap_or(std::path::Path::new("")))
-            .to_string_lossy()
-            .to_string();
-        let hunk_info = hunk.map(|h| (h.old_start(), h.new_start())).unwrap_or((0, 0));
-        let origin = line.origin();
-        let content = std::str::from_utf8(line.content())
-            .unwrap_or("")
-            .trim_end_matches('\n')
-            .to_string();
 
-        if files.is_empty() || files.last().unwrap().path != path {
-            files.push(FileDiff {
-                path,
-                hunks: Vec::new(),
-            });
-        }
-        let file = files.last_mut().unwrap();
-        if file.hunks.is_empty() || file.hunks.last().unwrap().old_start != hunk_info.0 {
+        let (old_start, new_start, header) = match hunk {
+            Some(h) => (
+                h.old_start(),
+                h.new_start(),
+                String::from_utf8_lossy(h.header())
+                    .trim_end_matches('\n')
+                    .to_string(),
+            ),
+            None => (0, 0, String::new()),
+        };
+        let same_hunk = file
+            .hunks
+            .last()
+            .is_some_and(|h| h.old_start == old_start && h.new_start == new_start);
+        if !same_hunk {
             file.hunks.push(DiffHunk {
-                old_start: hunk_info.0,
-                new_start: hunk_info.1,
+                old_start,
+                new_start,
+                header,
                 lines: Vec::new(),
             });
         }
-        file.hunks
-            .last_mut()
-            .unwrap()
-            .lines
-            .push(DiffLine { origin, content });
+        file.hunks.last_mut().unwrap().lines.push(DiffLine {
+            origin: line.origin(),
+            content: std::str::from_utf8(line.content())
+                .unwrap_or("")
+                .trim_end_matches('\n')
+                .to_string(),
+            old_lineno: line.old_lineno(),
+            new_lineno: line.new_lineno(),
+        });
         true
     });
     if let Err(e) = outcome {

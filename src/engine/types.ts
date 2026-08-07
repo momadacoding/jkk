@@ -40,9 +40,15 @@ export interface GraphData {
   refs: RefPointer[]
 }
 
+/**
+ * 文件相对上一版本的状态。`FileChange`（工作区）和 `FileDiff`（任意 diff）
+ * 共用同一套取值，文件树的状态角标只认这一套。
+ */
+export type FileStatus = 'modified' | 'added' | 'deleted' | 'renamed' | 'copied' | 'conflicted'
+
 export interface FileChange {
   path: string
-  status: 'modified' | 'added' | 'deleted' | 'renamed' | 'conflicted'
+  status: FileStatus
   additions: number
   deletions: number
 }
@@ -55,16 +61,27 @@ export interface StatusData {
 export interface DiffLine {
   origin: '+' | '-' | ' '
   content: string
+  /** 旧版本里的行号；新增行为 null。 */
+  oldLineno: number | null
+  /** 新版本里的行号；删除行为 null。 */
+  newLineno: number | null
 }
 
 export interface DiffHunk {
   oldStart: number
   newStart: number
+  /** git 原样的 `@@ -a,b +c,d @@ 上下文` 头。 */
+  header: string
   lines: DiffLine[]
 }
 
 export interface FileDiff {
   path: string
+  status: FileStatus
+  /** 重命名前的路径；其余情况为 null。 */
+  oldPath: string | null
+  /** 二进制文件没有可显示的行。 */
+  binary: boolean
   hunks: DiffHunk[]
 }
 
