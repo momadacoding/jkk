@@ -19,6 +19,11 @@ export interface DeleteInfo {
   remoteBranch: string | null
   /** 只在这个分支上、不在当前 HEAD 上的提交数。 */
   unmerged: number
+  /**
+   * `unmerged` 不为 0，但内容其实已经全在当前分支上了——squash merge 的典型
+   * 表现。为真时那几个提交丢不了东西，警告降级成中性提示。
+   */
+  contentMerged: boolean
   /** 检出了这个分支的 worktree；没有就不显示那个勾选框。 */
   worktree: WorktreeTarget | null
 }
@@ -199,7 +204,7 @@ export function DeleteBranchDialog({ repoPath, name, onCancel, onConfirm }: Dele
             </label>
             {/* 默认勾上是有原因的，说出来——否则用户会以为这只是个可选项，
                 取消勾选后撞上 git 那句 "used by worktree at ..." 一头雾水 */}
-            <div className="dlg-note">
+            <div className="dlg-note under-check">
               {alsoWorktree
                 ? '该分支正被这个 worktree 检出，git 不允许删除被检出的分支，所以这一项默认勾上。'
                 : '不删掉这个 worktree 的话，git 会拒绝删除该分支。'}
@@ -207,10 +212,20 @@ export function DeleteBranchDialog({ repoPath, name, onCancel, onConfirm }: Dele
           </>
         )}
 
+        {/* 同一个数字，两种读法。squash merge 之后提交对象全换了新 SHA，这个数
+            必然大于 0，但内容早就进当前分支了——那种情况下喊「只能靠 reflog 找回」
+            纯属误报，而且每合并一个分支就误报一次，喊到最后真出事也没人看了 */}
         {info !== null && info.unmerged > 0 && (
-          <div className="dlg-warning">
-            该分支有 {info.unmerged} 个提交不在当前分支上，删除后只能靠 reflog 找回。
-          </div>
+          info.contentMerged ? (
+            <div className="dlg-note">
+              该分支有 {info.unmerged} 个提交不在当前分支上，但内容已经完全一致
+              （squash 或 rebase 合并后的正常现象），删掉不会丢东西。
+            </div>
+          ) : (
+            <div className="dlg-warning">
+              该分支有 {info.unmerged} 个提交不在当前分支上，删除后只能靠 reflog 找回。
+            </div>
+          )
         )}
 
         {error && <div className="dlg-warning">{error}</div>}

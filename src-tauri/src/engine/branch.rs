@@ -29,6 +29,17 @@ pub struct DeleteInfo {
     /// 界面拿它提示「删了就找不回来」。语义对齐 `git branch -d` 的判断：
     /// 它正是在这个数不为 0 时拒绝删除。
     pub unmerged: usize,
+    /// `unmerged` 不为 0，但分支的内容其实已经全在当前 HEAD 上了。
+    ///
+    /// squash merge 会把 N 个提交压成一个**全新的提交对象**，SHA 全变，于是
+    /// 原分支上那几个提交确实不是 HEAD 的祖先，`unmerged` 照实报了个大于 0 的
+    /// 数——数字是真的，它暗示的风险却是假的：内容早就进去了。GitHub 默认走
+    /// squash 的话，每合并一个分支就要误报一次，喊到最后真有未合并提交时也不会
+    /// 有人看了。
+    ///
+    /// 判据是两边的 tree 完全一致。特意不用 `git cherry` 那套 patch-id 比对：
+    /// squash 把 N 个补丁合成了 1 个，patch-id 根本对不上，它同样判不出来。
+    pub content_merged: bool,
     /// 检出了这个分支的 worktree（主工作区除外），没有就是 None。
     ///
     /// 这不是锦上添花的信息：分支被 worktree 占着时 `git branch -D` 会直接拒绝
@@ -73,6 +84,30 @@ fn find_remote_branch(repo: &Repository, short: &str) -> Option<(String, String,
         }
     }
     None
+}
+
+/// 分支的内容是不是和当前 HEAD 一模一样。
+///
+/// 只比最终的 tree，不看提交历史——squash / rebase 合并之后提交对象全换了，
+/// 唯一还能对上的就是内容本身。
+///
+/// 比不出来就当作 false：这一项只决定警告用什么颜色，宁可多喊一次狼来了，
+/// 也不要因为算不出来就把真正的未合并提交轻描淡写过去。
+fn content_matches_head(repo: &Repository, name: &str) -> bool {
+    (|| {
+        let branch_tree = repo
+            .find_branch(name, BranchType::Local)
+            .ok()?
+            .get()
+            .peel_to_tree()
+            .ok()?;
+        let head_tree = repo.head().ok()?.peel_to_tree().ok()?;
+        let diff = repo
+            .diff_tree_to_tree(Some(&head_tree), Some(&branch_tree), None)
+            .ok()?;
+        Some(diff.deltas().len() == 0)
+    })()
+    .unwrap_or(false)
 }
 
 /// 找出检出了这个分支的 worktree。
@@ -149,6 +184,8 @@ pub fn delete_info(path: &str, name: &str) -> Result<DeleteInfo> {
         remote,
         remote_branch,
         unmerged,
+        // unmerged 为 0 时这一项没有意义，别白跑一次 tree 比对
+        content_merged: unmerged > 0 && content_matches_head(&repo, name),
         worktree: find_worktree(path, name),
     })
 }
