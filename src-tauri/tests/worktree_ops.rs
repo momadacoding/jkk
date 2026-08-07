@@ -104,6 +104,124 @@ fn a_failure_before_unregistering_keeps_the_worktree_usable() {
     );
 }
 
+/// 造一个 junction（Windows 上 pnpm 就是用它连 node_modules 的）。
+#[cfg(windows)]
+fn junction(link: &std::path::Path, target: &std::path::Path) {
+    use std::os::windows::process::CommandExt;
+    // mklink 是 cmd 的内建命令，整条命令要当成一个字符串交给 /c
+    let out = Command::new("cmd")
+        .arg("/c")
+        .raw_arg(format!(
+            "mklink /J \"{}\" \"{}\"",
+            link.display(),
+            target.display()
+        ))
+        .output()
+        .expect("cmd 起不来");
+    assert!(
+        out.status.success(),
+        "mklink 失败: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+/// 复刻 pnpm 的结构：目标目录带个点，排序在指向它的链接前面。
+///
+/// git 递归删除时会先删掉目标，等走到 junction 时目标已经不在，它处理不了这种
+/// 死链接就整个放弃（`remove_dir_recurse` 遇到第一个失败就 break）。加 `--force`
+/// 也一样——那只跳过「工作区是否干净」的检查，删除路径完全相同。
+#[cfg(windows)]
+fn worktree_with_pnpm_style_links(name: &str) -> (TempDir, std::path::PathBuf) {
+    let (dir, wt) = repo_with_worktree(name);
+    let nm = wt.join("nm");
+    let store = nm.join(".store").join("pkg");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(store.join("index.js"), "1").unwrap();
+    junction(&nm.join("zlib"), &store);
+    // 不加 .gitignore 的话 git 会因为「有未跟踪文件」在解除登记之前就拒绝，
+    // 那就走不到我们要测的那一步了
+    fs::write(wt.join(".gitignore"), "nm/\n").unwrap();
+    let main = main_of(&wt);
+    run_git(&main, &["-C", wt.to_str().unwrap(), "add", ".gitignore"]);
+    run_git(&main, &["-C", wt.to_str().unwrap(), "commit", "-m", "ignore nm"]);
+    (dir, wt)
+}
+
+/// git 删到一半放弃时，我们接手把目录删完。
+#[cfg(windows)]
+#[test]
+fn cleans_up_after_git_gives_up_on_pnpm_junctions() {
+    let (_dir, wt) = worktree_with_pnpm_style_links("pnpmish");
+    let main = main_of(&wt);
+
+    cmd::delete_worktree(
+        main.to_str().unwrap().to_string(),
+        wt.to_str().unwrap().to_string(),
+    )
+    .expect("git 会栽在死链接上，但我们该接手删完");
+
+    assert!(!wt.exists(), "目录应该被清干净，实际还在：{wt:?}");
+    let out = Command::new("git")
+        .current_dir(&main)
+        .args(["worktree", "list"])
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("pnpmish"));
+}
+
+/// 接手删除依赖的那条不变量：**解链接，不跟进目标**。
+///
+/// node_modules 里几千个 junction，跟进去删等于把链接指向的东西一并抹掉——
+/// 这一条破了就是丢数据，不是体验问题。
+///
+/// 这里直接测 `remove_dir_all` 本身，不经过 `delete_worktree`。原因是没法让 git
+/// 稳定地在碰到外部链接**之前**失败：它的目录枚举顺序不受我们控制，实测它会跳过
+/// 删不掉的死链接继续处理后面的条目。既然把安全性完全押在这个标准库函数上，就
+/// 直接把它钉住。
+///
+/// 顺带记一笔：**`git worktree remove` 会跟进 junction 把目标里的东西删掉**。
+/// 单独验过——一个指向外部目录的 junction，git 删完 worktree 之后外部目录里的
+/// 文件就没了。pnpm 的链接都指向 node_modules 内部所以害不到人，但这正是我们
+/// 接手时绝不能照抄 git 做法的理由。
+#[cfg(windows)]
+#[test]
+fn our_cleanup_unlinks_junctions_instead_of_following_them() {
+    let dir = TempDir::new().unwrap();
+
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("important.txt"), "不能被删掉").unwrap();
+
+    let victim = dir.path().join("victim");
+    fs::create_dir_all(victim.join("nm")).unwrap();
+    junction(&victim.join("nm").join("external"), &outside);
+
+    fs::remove_dir_all(&victim).unwrap();
+
+    assert!(!victim.exists());
+    assert!(
+        outside.join("important.txt").exists(),
+        "链接指向的外部数据被删掉了"
+    );
+}
+
+/// 死链接（目标已经没了的 junction）也要能删掉——git 正是栽在这上面。
+#[cfg(windows)]
+#[test]
+fn our_cleanup_handles_dead_junctions() {
+    let dir = TempDir::new().unwrap();
+    let nm = dir.path().join("nm");
+    let store = nm.join(".store").join("pkg");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(store.join("index.js"), "1").unwrap();
+    junction(&nm.join("zlib"), &store);
+    fs::remove_dir_all(nm.join(".store")).unwrap(); // 制造死链接
+
+    fs::remove_dir_all(&nm).expect("含死链接的目录也该删得掉");
+    assert!(!nm.exists());
+}
+
 #[test]
 fn create_puts_the_worktree_under_dot_worktrees() {
     let (_dir, wt) = repo_with_worktree("first");
