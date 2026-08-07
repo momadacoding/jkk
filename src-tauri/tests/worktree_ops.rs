@@ -170,6 +170,73 @@ fn cleans_up_after_git_gives_up_on_pnpm_junctions() {
     assert!(!String::from_utf8_lossy(&out.stdout).contains("pnpmish"));
 }
 
+/// 接手删除**永远碰不到未提交的东西**——这条是整个回退方案的安全前提。
+///
+/// 道理在于顺序：git 的「工作区是否干净」检查排在解除登记之前，而我们只在
+/// 「登记已经没了」时才接手。所以工作区一脏，git 在动任何东西之前就拒绝了，
+/// 回退代码根本没机会运行。
+///
+/// 这里把两个条件叠在一起测：既有必然让 git 删目录失败的死链接，工作区又是脏的。
+/// 要是哪天检查顺序变了、或者我们放宽了接手条件，这个测试会立刻炸。
+#[cfg(windows)]
+#[test]
+fn cleanup_never_runs_while_there_is_uncommitted_work() {
+    let (_dir, wt) = worktree_with_pnpm_style_links("dirtylink");
+    let main = main_of(&wt);
+    fs::write(wt.join("a.txt"), "脏数据，绝不能丢").unwrap();
+
+    cmd::delete_worktree(
+        main.to_str().unwrap().to_string(),
+        wt.to_str().unwrap().to_string(),
+    )
+    .expect_err("工作区是脏的，应当被拒绝");
+
+    assert!(wt.exists(), "worktree 不该被删");
+    assert_eq!(
+        fs::read_to_string(wt.join("a.txt")).unwrap(),
+        "脏数据，绝不能丢",
+        "未提交的改动被动过了"
+    );
+    let out = Command::new("git")
+        .current_dir(&main)
+        .args(["worktree", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("dirtylink"),
+        "登记不该被解除"
+    );
+}
+
+/// 删掉 worktree 不会动里面做的提交——提交对象在共享的对象库里，
+/// 分支引用也在共享的 refs 里，worktree 目录只是一份检出。
+#[test]
+fn commits_made_in_the_worktree_survive_its_deletion() {
+    let (_dir, wt) = repo_with_worktree("hasWork");
+    let main = main_of(&wt);
+    fs::write(wt.join("work.txt"), "在 worktree 里做的活").unwrap();
+    run_git(&main, &["-C", wt.to_str().unwrap(), "add", "work.txt"]);
+    run_git(&main, &["-C", wt.to_str().unwrap(), "commit", "-m", "wt commit"]);
+
+    cmd::delete_worktree(
+        main.to_str().unwrap().to_string(),
+        wt.to_str().unwrap().to_string(),
+    )
+    .unwrap();
+
+    // 分支还在，内容还找得回来
+    let out = Command::new("git")
+        .current_dir(&main)
+        .args(["show", "hasWork:work.txt"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "分支上的提交该还在");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "在 worktree 里做的活"
+    );
+}
+
 /// 接手删除依赖的那条不变量：**解链接，不跟进目标**。
 ///
 /// node_modules 里几千个 junction，跟进去删等于把链接指向的东西一并抹掉——
