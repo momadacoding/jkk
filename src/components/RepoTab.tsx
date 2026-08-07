@@ -194,6 +194,31 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
     }
   }, [state.path, state.status.unstaged, refreshStatus, refreshDiff, reportError])
 
+  /**
+   * 删除分支，可选连远程一起删。确认在 `DeleteBranchDialog` 里做过了。
+   *
+   * **先删远程再删本地。** 远程那一步才会因为外部原因失败（断网、没权限、
+   * 分支被保护），失败在动本地之前，留下的就是一个原样、可以直接重试的状态；
+   * 反过来的话本地引用已经没了，还得先去 reflog 里捞回来才能重试。
+   */
+  const handleDeleteBranch = useCallback(async (
+    name: string,
+    remote: { remote: string; branch: string } | null,
+  ) => {
+    const path = state.path
+    if (!path) return
+    try {
+      if (remote) {
+        await invoke('delete_remote_branch', { path, remote: remote.remote, branch: remote.branch })
+      }
+      await invoke('delete_branch', { path, name })
+      await refreshGraph(path)
+      await refreshUpstream(path)
+    } catch (err) {
+      reportError(err)
+    }
+  }, [state.path, refreshGraph, refreshUpstream, reportError])
+
   /** 单击分支：只选中并把 graph 定位到它的 tip，不碰工作区。 */
   const handleSelectBranch = useCallback((name: string, hash: string) => {
     setSelectedBranch(name)
@@ -272,7 +297,8 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
                   await refreshHead(state.path!)
                   await refreshGraph(state.path!)
                 })}
-                onDelete={(name) => runAndRefresh('delete_branch', { name }, async () => await refreshGraph(state.path!))}
+                onDelete={(name, remote) => void handleDeleteBranch(name, remote)}
+                repoPath={state.path}
               />
               <WorktreeView
                 worktrees={state.worktrees}

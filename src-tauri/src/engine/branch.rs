@@ -1,0 +1,87 @@
+use crate::error::Result;
+use git2::{BranchType, Repository};
+use serde::Serialize;
+
+#[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteInfo {
+    /// 对应的远程分支简称，如 `origin/feat/x`；没有就是 None，界面上不显示勾选框。
+    pub upstream: Option<String>,
+    /// 上游所在的远程名，如 `origin`。删远程分支时要用。
+    pub remote: Option<String>,
+    /// 该分支在远程上的名字（去掉远程名前缀），如 `feat/x`。
+    ///
+    /// 不让前端去切 `origin/feat/x` 这个字符串：远程名本身可以带斜杠，
+    /// 按第一个 `/` 切会把分支名切错。
+    pub remote_branch: Option<String>,
+    /// 有多少提交只在这个分支上、不在当前 HEAD 上。
+    ///
+    /// 界面拿它提示「删了就找不回来」。语义对齐 `git branch -d` 的判断：
+    /// 它正是在这个数不为 0 时拒绝删除。
+    pub unmerged: usize,
+}
+
+/// 找出这个分支对应的远程分支。
+///
+/// 先看配置的上游；没配上游时再扫一遍各个远程下的同名引用——用
+/// `git push` 而不是 `git push -u` 推上去的分支就属于这种，
+/// 光看上游会以为它没有远程分支，勾选框就不会出现。
+fn find_remote_branch(repo: &Repository, short: &str) -> Option<(String, String, String)> {
+    let full = format!("refs/heads/{short}");
+
+    if let Ok(branch) = repo.find_branch(short, BranchType::Local) {
+        if let Ok(upstream) = branch.upstream() {
+            if let Ok(Some(shorthand)) = upstream.name() {
+                let remote = repo
+                    .branch_upstream_remote(&full)
+                    .ok()
+                    .and_then(|buf| buf.as_str().map(|s| s.to_string()));
+                if let Some(remote) = remote {
+                    let on_remote = shorthand
+                        .strip_prefix(&format!("{remote}/"))
+                        .unwrap_or(short)
+                        .to_string();
+                    return Some((shorthand.to_string(), remote, on_remote));
+                }
+            }
+        }
+    }
+
+    for remote in repo.remotes().ok()?.iter().flatten() {
+        let shorthand = format!("{remote}/{short}");
+        if repo
+            .find_reference(&format!("refs/remotes/{shorthand}"))
+            .is_ok()
+        {
+            return Some((shorthand, remote.to_string(), short.to_string()));
+        }
+    }
+    None
+}
+
+/// 删除分支前要在确认框里显示的信息。
+pub fn delete_info(path: &str, name: &str) -> Result<DeleteInfo> {
+    let repo = Repository::open(path)?;
+    let (upstream, remote, remote_branch) = match find_remote_branch(&repo, name) {
+        Some((u, r, b)) => (Some(u), Some(r), Some(b)),
+        None => (None, None, None),
+    };
+
+    // 算不出来就当作 0：这个数只用于多显示一行警告，
+    // 不该因为它失败而让整个确认框打不开
+    let unmerged = (|| {
+        let branch = repo.find_branch(name, BranchType::Local).ok()?;
+        let branch_oid = branch.get().target()?;
+        let head_oid = repo.head().ok()?.peel_to_commit().ok()?.id();
+        let (ahead, _) = repo.graph_ahead_behind(branch_oid, head_oid).ok()?;
+        Some(ahead)
+    })()
+    .unwrap_or(0);
+
+    Ok(DeleteInfo {
+        upstream,
+        remote,
+        remote_branch,
+        unmerged,
+    })
+}
