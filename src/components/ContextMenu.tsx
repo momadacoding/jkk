@@ -71,7 +71,10 @@ export function ContextMenu({ menu, onClose }: { menu: MenuState | null; onClose
           key={i}
           className={`context-menu-item${item.danger ? ' danger' : ''}`}
           disabled={item.disabled}
-          onClick={() => { onClose(); item.onSelect() }}
+          // 先让菜单真的从屏幕上消失，再跑动作。同步执行的话，动作里但凡有一步
+          // 卡住主线程（原生 prompt/confirm 就是），React 还没来得及重绘，
+          // 菜单就会一直留在弹框后面——曾经的 "New branch from here…" 就是这样。
+          onClick={() => { onClose(); setTimeout(() => item.onSelect(), 0) }}
         >
           {item.label}
         </button>

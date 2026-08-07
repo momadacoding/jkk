@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import type { RefPointer } from '../engine/types'
 import { ContextMenu, useContextMenu } from './ContextMenu'
 import { SidebarSection, SidebarGroup } from './SidebarSection'
+import { usePrompt } from './PromptDialog'
 
 interface BranchViewProps {
   refs: RefPointer[]
@@ -49,6 +50,7 @@ export function BranchView({
   const [newName, setNewName] = useState('')
   const inputRef = useRef<HTMLInputElement>(null)
   const { menu, open, close } = useContextMenu()
+  const { prompt, dialog } = usePrompt()
   const local = refs.filter((r) => r.kind === 'branch')
   const remote = refs.filter((r) => r.kind === 'remote')
 
@@ -70,17 +72,26 @@ export function BranchView({
     },
     {
       label: 'Rename…',
-      onSelect: () => {
-        const next = window.prompt(`Rename branch "${name}" to:`, name)
+      onSelect: () => void (async () => {
+        const next = await prompt({
+          title: 'Rename branch',
+          message: `Rename branch "${name}" to:`,
+          defaultValue: name,
+          confirmLabel: 'Rename',
+        })
         if (next && next !== name) onRename(name, next)
-      },
+      })(),
     },
     {
       label: 'New branch from here…',
-      onSelect: () => {
-        const child = window.prompt(`New branch starting at "${name}":`, '')
+      onSelect: () => void (async () => {
+        const child = await prompt({
+          title: 'New branch',
+          message: `New branch starting at "${name}":`,
+          confirmLabel: 'Create',
+        })
         if (child) onCreate(child, name)
-      },
+      })(),
     },
     {
       label: 'Delete',
@@ -151,6 +162,7 @@ export function BranchView({
       </SidebarGroup>
 
       <ContextMenu menu={menu} onClose={close} />
+      {dialog}
     </SidebarSection>
   )
 }

@@ -432,6 +432,97 @@ body {
   color: #666;
 }
 
+/* ---------- 应用内弹框（替代 window.prompt） ---------- */
+
+.dialog-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
+}
+
+.dialog {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 360px;
+  max-width: 90vw;
+  padding: 14px 16px;
+  background: #2b2b2b;
+  border: 1px solid #444;
+  border-radius: 5px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55);
+}
+
+.dialog-title {
+  font-weight: bold;
+  color: #fff;
+}
+
+.dialog-message {
+  color: #bbb;
+}
+
+.dialog input {
+  padding: 5px 7px;
+  background: #1e1e1e;
+  border: 1px solid #555;
+  border-radius: 3px;
+  color: var(--fg);
+  font-size: 12px;
+}
+
+.dialog input:focus {
+  outline: none;
+  border-color: #4fc3f7;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.dialog-actions button {
+  min-width: 72px;
+  padding: 4px 12px;
+  background: #3a3a3a;
+  border: 1px solid #555;
+  border-radius: 3px;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.dialog-actions button:hover:not(:disabled) {
+  background: #464646;
+}
+
+.dialog-actions button.primary {
+  background: #3a6ea5;
+  border-color: #4fc3f7;
+  color: #fff;
+}
+
+.dialog-actions button.primary:hover:not(:disabled) {
+  background: #4880bd;
+}
+
+.dialog-actions button:disabled {
+  color: #666;
+  cursor: default;
+}
+
+/* 主按钮置灰时得连底色一起收掉，不然蓝底配灰字根本看不清 */
+.dialog-actions button.primary:disabled {
+  background: #33455a;
+  border-color: #3f5a75;
+  color: #808d99;
+}
+
 /* ---------- 文件内容（File Tree 右侧，只读） ---------- */
 
 .file-content {
