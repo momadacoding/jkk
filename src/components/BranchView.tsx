@@ -3,6 +3,7 @@ import type { RefPointer } from '../engine/types'
 import { ContextMenu, useContextMenu } from './ContextMenu'
 import { SidebarSection, SidebarGroup } from './SidebarSection'
 import { usePrompt } from './PromptDialog'
+import { DeleteBranchDialog, type RemoteTarget } from './DeleteBranchDialog'
 
 interface BranchViewProps {
   refs: RefPointer[]
@@ -13,7 +14,10 @@ interface BranchViewProps {
   onCheckout: (name: string) => void
   onCreate: (name: string, start?: string) => void
   onRename: (oldName: string, newName: string) => void
-  onDelete: (name: string) => void
+  /** `remote` 非 null 时连远程分支一起删。 */
+  onDelete: (name: string, remote: RemoteTarget | null) => void
+  /** 仓库路径，删除确认框要用它去查上游和未合并提交数。 */
+  repoPath: string | null
 }
 
 const shortName = (ref: RefPointer) =>
@@ -44,10 +48,12 @@ function SyncBadge({ ahead, behind }: { ahead: number | null; behind: number | n
 }
 
 export function BranchView({
-  refs, head, selectedBranch, onSelect, onCheckout, onCreate, onRename, onDelete,
+  refs, head, selectedBranch, onSelect, onCheckout, onCreate, onRename, onDelete, repoPath,
 }: BranchViewProps) {
   const [creating, setCreating] = useState(false)
   const [newName, setNewName] = useState('')
+  /** 正在确认删除的分支名；null 表示没开确认框。 */
+  const [deleting, setDeleting] = useState<string | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const { menu, open, close } = useContextMenu()
   const { prompt, dialog } = usePrompt()
@@ -94,8 +100,8 @@ export function BranchView({
       })(),
     },
     {
-      label: 'Delete',
-      onSelect: () => onDelete(name),
+      label: 'Delete…',
+      onSelect: () => setDeleting(name),
       disabled: name === head,
       danger: true,
     },
@@ -163,6 +169,14 @@ export function BranchView({
 
       <ContextMenu menu={menu} onClose={close} />
       {dialog}
+      {deleting && (
+        <DeleteBranchDialog
+          repoPath={repoPath}
+          name={deleting}
+          onCancel={() => setDeleting(null)}
+          onConfirm={(remote) => { onDelete(deleting, remote); setDeleting(null) }}
+        />
+      )}
     </SidebarSection>
   )
 }

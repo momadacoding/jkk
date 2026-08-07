@@ -1,3 +1,4 @@
+pub mod branch;
 pub mod diff;
 pub mod git_cli;
 pub mod graph;

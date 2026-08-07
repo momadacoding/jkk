@@ -105,6 +105,21 @@ pub fn delete_branch(path: String, name: String) -> Result<()> {
     Ok(())
 }
 
+/// 删除分支前的确认框要显示的信息：对应的远程分支、还有多少提交没合并进来。
+#[tauri::command]
+pub fn branch_delete_info(
+    path: String,
+    name: String,
+) -> Result<crate::engine::branch::DeleteInfo> {
+    crate::engine::branch::delete_info(&path, &name)
+}
+
+#[tauri::command]
+pub fn delete_remote_branch(path: String, remote: String, branch: String) -> Result<()> {
+    run_git(&path, &["push", &remote, "--delete", &branch])?;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn rename_branch(path: String, old: String, new: String) -> Result<()> {
     run_git(&path, &["branch", "-m", &old, &new])?;

@@ -523,6 +523,98 @@ body {
   color: #808d99;
 }
 
+/* 删除类主按钮：红底，跟「确认要不可逆地删东西」对上 */
+.dialog-actions button.primary.danger {
+  background: #a1453f;
+  border-color: #e57373;
+}
+
+.dialog-actions button.primary.danger:hover:not(:disabled) {
+  background: #b8524b;
+}
+
+.dialog-actions button.primary.danger:disabled {
+  background: #55302e;
+  border-color: #6d3b39;
+  color: #9a8280;
+}
+
+/* 删除分支那个框要放得下 origin/feat/... 这种长名字 */
+.dialog-wide {
+  min-width: 460px;
+}
+
+.dlg-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.dlg-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  background: #3a2a2a;
+}
+
+.dlg-icon.danger {
+  color: #e57373;
+}
+
+.dlg-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: 54px;
+}
+
+.dlg-field-label {
+  color: #bbb;
+}
+
+.dlg-value {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #fff;
+}
+
+.dlg-glyph {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  color: #9aa0a6;
+}
+
+.dlg-check {
+  cursor: pointer;
+  user-select: none;
+}
+
+.dlg-check input {
+  margin: 0;
+  cursor: pointer;
+  /* 不设的话是系统默认的白底方框，在深色弹框里白得刺眼 */
+  accent-color: #3a6ea5;
+}
+
+.dlg-warning {
+  margin-left: 54px;
+  padding: 6px 8px;
+  background: rgba(229, 115, 115, 0.12);
+  border-left: 3px solid #e57373;
+  border-radius: 2px;
+  color: #e0a9a9;
+}
+
 /* ---------- 文件内容（File Tree 右侧，只读） ---------- */
 
 .file-content {
