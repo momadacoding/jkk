@@ -117,6 +117,54 @@ fn a_squash_merged_branch_still_counts_commits_but_matches_in_content() {
     assert!(info.content_merged);
 }
 
+/// squash 合并**之后主干又往前走了**——最常见的情形，也是全树对比栽跟头的地方。
+///
+/// 拿两边整棵 tree 比的话，主干上那些无关的新提交会让 diff 非空，于是判定
+/// 「没合并」，红色警告照样弹出来。真实仓库上复现过：一个已 squash 合并的分支
+/// 全树 diff 报 14 个文件有差异，全是合并之后主干上的新工作。
+#[test]
+fn a_squash_merged_branch_is_still_recognised_after_the_trunk_moves_on() {
+    let (_remote, work) = repo_with_remote();
+    run_git(work.path(), &["checkout", "-q", "-b", "feat/old"]);
+    commit(work.path(), "c2");
+    commit(work.path(), "c3");
+    run_git(work.path(), &["checkout", "-q", "-"]);
+    run_git(work.path(), &["merge", "--squash", "feat/old"]);
+    run_git(work.path(), &["commit", "-m", "squashed feat/old (#1)"]);
+    // 合并之后主干继续开发，还顺手删掉一个和这个分支无关的文件
+    commit(work.path(), "unrelated");
+    run_git(work.path(), &["rm", "-q", "c1.txt"]);
+    run_git(work.path(), &["commit", "-m", "drop c1"]);
+
+    let info = branch::delete_info(&p(&work), "feat/old").unwrap();
+    assert_eq!(info.unmerged, 2);
+    assert!(
+        info.content_merged,
+        "主干往前走了几步，不该把已合并的分支重新判成未合并"
+    );
+}
+
+/// 主干后来又改了这个分支碰过的文件——快路径（只比分支碰过的路径）会失效，
+/// 只有 patch-id 兜底认得出来。
+#[test]
+fn the_patchid_fallback_catches_it_when_the_trunk_edits_the_same_files() {
+    let (_remote, work) = repo_with_remote();
+    run_git(work.path(), &["checkout", "-q", "-b", "feat/same"]);
+    fs::write(work.path().join("shared.txt"), "from branch").unwrap();
+    run_git(work.path(), &["add", "."]);
+    run_git(work.path(), &["commit", "-m", "branch touches shared"]);
+    run_git(work.path(), &["checkout", "-q", "-"]);
+    run_git(work.path(), &["merge", "--squash", "feat/same"]);
+    run_git(work.path(), &["commit", "-m", "squashed (#2)"]);
+    // 主干把同一个文件又改了一遍，快路径这下比不出「一字不差」
+    fs::write(work.path().join("shared.txt"), "trunk changed it later").unwrap();
+    run_git(work.path(), &["commit", "-am", "trunk edits shared"]);
+
+    let info = branch::delete_info(&p(&work), "feat/same").unwrap();
+    assert_eq!(info.unmerged, 1);
+    assert!(info.content_merged, "patch-id 应当在主干上找到那个 squash 提交");
+}
+
 /// 真的有未合并提交时不能降级，红色警告必须留着。
 #[test]
 fn a_branch_with_real_unmerged_work_is_not_excused() {

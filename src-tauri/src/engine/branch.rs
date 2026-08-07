@@ -37,8 +37,7 @@ pub struct DeleteInfo {
     /// squash 的话，每合并一个分支就要误报一次，喊到最后真有未合并提交时也不会
     /// 有人看了。
     ///
-    /// 判据是两边的 tree 完全一致。特意不用 `git cherry` 那套 patch-id 比对：
-    /// squash 把 N 个补丁合成了 1 个，patch-id 根本对不上，它同样判不出来。
+    /// 判据见 [`content_is_already_in_head`]。
     pub content_merged: bool,
     /// 检出了这个分支的 worktree（主工作区除外），没有就是 None。
     ///
@@ -86,26 +85,112 @@ fn find_remote_branch(repo: &Repository, short: &str) -> Option<(String, String,
     None
 }
 
-/// 分支的内容是不是和当前 HEAD 一模一样。
+/// patch-id 兜底时最多往回扫多少个提交。
 ///
-/// 只比最终的 tree，不看提交历史——squash / rebase 合并之后提交对象全换了，
-/// 唯一还能对上的就是内容本身。
+/// 这一步只在快路径没结论时才跑，每个提交都要算一次 diff。删一个很旧的分支时
+/// `merge-base..HEAD` 可能上千，扫到底会把弹框卡住；扫不完就当作没合并，
+/// 顶多多显示一次警告。
+const PATCHID_SCAN_LIMIT: usize = 500;
+
+/// 分支自己的那部分改动，是不是已经在当前 HEAD 上了。
 ///
-/// 比不出来就当作 false：这一项只决定警告用什么颜色，宁可多喊一次狼来了，
+/// **不能拿两边的整棵 tree 去比。** 那只在分支不落后于主干时才成立，而最常见的
+/// 情形恰恰是「合并完主干继续往前走」——主干上随便多一个无关提交，整棵树就对
+/// 不上了。实测一个已 squash 合并的分支：全树 diff 报 14 个文件有差异，全是合并
+/// **之后**主干上的新工作，跟这个分支毫无关系。
+///
+/// 所以要问的是「分支的贡献进去了吗」，分两步：
+///
+/// 1. **只比分支碰过的那些路径**。便宜（不扫历史），且覆盖绝大多数「合并完就删」。
+///    分支改过的文件在 HEAD 上一字不差，就说明它的活已经落地。
+/// 2. 第一步不成立时才上 **patch-id**：把分支的净改动整体算一个指纹，去
+///    `merge-base..HEAD` 里找同指纹的提交。第一步失败有两种原因——主干后来又改了
+///    这些文件（其实早合并了），或者分支上有 squash 之后的新提交（真没合并）——
+///    只有 patch-id 分得开。
+///
+/// 注意第 2 步算的是**净改动的整体指纹**，不是逐个提交比对；`git cherry` 那样
+/// 逐个比对认不出 squash，因为 N 个补丁被合成了 1 个。
+///
+/// 任何一步出错都当作 false：这一项只决定警告用什么颜色，宁可多喊一次狼来了，
 /// 也不要因为算不出来就把真正的未合并提交轻描淡写过去。
-fn content_matches_head(repo: &Repository, name: &str) -> bool {
+fn content_is_already_in_head(repo: &Repository, name: &str) -> bool {
     (|| {
-        let branch_tree = repo
+        let branch_oid = repo
             .find_branch(name, BranchType::Local)
             .ok()?
             .get()
-            .peel_to_tree()
+            .target()?;
+        let head_oid = repo.head().ok()?.peel_to_commit().ok()?.id();
+        let base = repo.merge_base(head_oid, branch_oid).ok()?;
+
+        let base_tree = repo.find_commit(base).ok()?.tree().ok()?;
+        let branch_tree = repo.find_commit(branch_oid).ok()?.tree().ok()?;
+        let head_tree = repo.find_commit(head_oid).ok()?.tree().ok()?;
+
+        // 分支从分叉点以来碰过哪些路径
+        let own = repo
+            .diff_tree_to_tree(Some(&base_tree), Some(&branch_tree), None)
             .ok()?;
-        let head_tree = repo.head().ok()?.peel_to_tree().ok()?;
-        let diff = repo
-            .diff_tree_to_tree(Some(&head_tree), Some(&branch_tree), None)
+        if own.deltas().len() == 0 {
+            return Some(true); // 分支什么都没改，删了当然不丢东西
+        }
+        let paths: Vec<Vec<u8>> = own
+            .deltas()
+            .flat_map(|d| [d.old_file().path_bytes(), d.new_file().path_bytes()])
+            .flatten()
+            .map(|p| p.to_vec())
+            .collect();
+
+        let mut only_own_paths = git2::DiffOptions::new();
+        for p in &paths {
+            only_own_paths.pathspec(p.as_slice());
+        }
+
+        // 第一步：只比这些路径
+        let scoped = repo
+            .diff_tree_to_tree(
+                Some(&head_tree),
+                Some(&branch_tree),
+                Some(&mut only_own_paths),
+            )
             .ok()?;
-        Some(diff.deltas().len() == 0)
+        if scoped.deltas().len() == 0 {
+            return Some(true);
+        }
+
+        // 第二步：patch-id 兜底
+        let want = own.patchid(None).ok()?;
+        let mut walk = repo.revwalk().ok()?;
+        walk.push(head_oid).ok()?;
+        walk.hide(base).ok()?;
+        for oid in walk.take(PATCHID_SCAN_LIMIT).flatten() {
+            let commit = repo.find_commit(oid).ok()?;
+            // 合并提交没有单一的「这个提交改了什么」，跳过
+            if commit.parent_count() != 1 {
+                continue;
+            }
+            let parent_tree = commit.parent(0).ok()?.tree().ok()?;
+            let tree = commit.tree().ok()?;
+
+            // 先用限定路径的 diff 筛一道。要找的那个提交必定碰过分支改的文件，
+            // 碰都没碰过的连算 patch-id 都不用——主干上绝大多数提交都属于这类。
+            // 少了这一道筛，判「未合并」时要对 500 个提交逐个算完整 diff，
+            // 实测慢到两三秒，而这恰恰是最常见的情形。
+            let touched = repo
+                .diff_tree_to_tree(Some(&parent_tree), Some(&tree), Some(&mut only_own_paths))
+                .ok()?;
+            if touched.deltas().len() == 0 {
+                continue;
+            }
+
+            let diff = repo
+                .diff_tree_to_tree(Some(&parent_tree), Some(&tree), None)
+                .ok()?;
+            if diff.patchid(None).ok()? == want {
+                return Some(true);
+            }
+        }
+        Some(false)
     })()
     .unwrap_or(false)
 }
@@ -185,7 +270,7 @@ pub fn delete_info(path: &str, name: &str) -> Result<DeleteInfo> {
         remote_branch,
         unmerged,
         // unmerged 为 0 时这一项没有意义，别白跑一次 tree 比对
-        content_merged: unmerged > 0 && content_matches_head(&repo, name),
+        content_merged: unmerged > 0 && content_is_already_in_head(&repo, name),
         worktree: find_worktree(path, name),
     })
 }

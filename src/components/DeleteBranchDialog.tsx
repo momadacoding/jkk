@@ -218,7 +218,7 @@ export function DeleteBranchDialog({ repoPath, name, onCancel, onConfirm }: Dele
         {info !== null && info.unmerged > 0 && (
           info.contentMerged ? (
             <div className="dlg-note">
-              该分支有 {info.unmerged} 个提交不在当前分支上，但内容已经完全一致
+              该分支有 {info.unmerged} 个提交不在当前分支上，但它们的改动已经进了当前分支
               （squash 或 rebase 合并后的正常现象），删掉不会丢东西。
             </div>
           ) : (
