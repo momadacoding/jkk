@@ -219,6 +219,40 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
     }
   }, [state.path, refreshGraph, refreshUpstream, reportError])
 
+  /**
+   * 检出一个远程分支。后端会建一条跟踪它的本地分支——直接检出远程引用会进
+   * 游离 HEAD，那不是用户点这一下想要的。
+   */
+  const handleCheckoutRemote = useCallback(async (remoteBranch: string) => {
+    const path = state.path
+    if (!path) return
+    const before = state.headHash
+    try {
+      await invoke('checkout_remote_branch', { path, remoteBranch })
+      const after = await refreshHead(path)
+      // HEAD 动了就把选中跟过去，否则图还停在原来的位置
+      await refreshGraph(path, after, after !== before)
+      await refreshStatus(path)
+      await refreshUpstream(path)
+    } catch (err) {
+      reportError(err)
+    }
+  }, [state.path, state.headHash, refreshHead, refreshGraph, refreshStatus, refreshUpstream, reportError])
+
+  /** 删除远程分支。确认在 `BranchView` 的确认框里做过了。 */
+  const handleDeleteRemote = useCallback(async (remoteBranch: string) => {
+    const path = state.path
+    if (!path) return
+    try {
+      await invoke('delete_remote_ref', { path, remoteBranch })
+      // 远程引用没了，图上的标签和上游计数都要跟着变
+      await refreshGraph(path)
+      await refreshUpstream(path)
+    } catch (err) {
+      reportError(err)
+    }
+  }, [state.path, refreshGraph, refreshUpstream, reportError])
+
   /** 单击分支：只选中并把 graph 定位到它的 tip，不碰工作区。 */
   const handleSelectBranch = useCallback((name: string, hash: string) => {
     setSelectedBranch(name)
@@ -298,6 +332,8 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
                   await refreshGraph(state.path!)
                 })}
                 onDelete={(name, remote) => void handleDeleteBranch(name, remote)}
+                onCheckoutRemote={(name) => void handleCheckoutRemote(name)}
+                onDeleteRemote={(name) => void handleDeleteRemote(name)}
                 repoPath={state.path}
               />
               <WorktreeView

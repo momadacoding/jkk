@@ -59,6 +59,38 @@ fn find_remote_branch(repo: &Repository, short: &str) -> Option<(String, String,
     None
 }
 
+/// 把 `origin/feat/x` 这种完整简称拆成（远程名, 远程上的分支名）。
+///
+/// 不能简单按第一个 `/` 切：远程名本身可以带斜杠。所以拿仓库里真实配置的
+/// 远程名去匹配，并且**取最长的那个匹配**——同时存在 `origin` 和 `origin/mirror`
+/// 两个远程时，`origin/mirror/x` 只有取长的才切得对。
+pub fn split_remote_ref(path: &str, remote_ref: &str) -> Result<(String, String)> {
+    let repo = Repository::open(path)?;
+    let mut best: Option<(String, String)> = None;
+    for remote in repo.remotes()?.iter().flatten() {
+        if let Some(rest) = remote_ref.strip_prefix(&format!("{remote}/")) {
+            let better = best
+                .as_ref()
+                .map(|(r, _): &(String, String)| remote.len() > r.len())
+                .unwrap_or(true);
+            if better {
+                best = Some((remote.to_string(), rest.to_string()));
+            }
+        }
+    }
+    best.ok_or_else(|| {
+        crate::error::GitError::new("bad_ref", format!("{remote_ref} 不属于任何已配置的远程"))
+    })
+}
+
+/// 远程分支该检出成哪个本地分支名，以及这个本地分支是不是已经存在。
+pub fn local_target_for(path: &str, remote_ref: &str) -> Result<(String, bool)> {
+    let (_, local) = split_remote_ref(path, remote_ref)?;
+    let repo = Repository::open(path)?;
+    let exists = repo.find_branch(&local, BranchType::Local).is_ok();
+    Ok((local, exists))
+}
+
 /// 删除分支前要在确认框里显示的信息。
 pub fn delete_info(path: &str, name: &str) -> Result<DeleteInfo> {
     let repo = Repository::open(path)?;

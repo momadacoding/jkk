@@ -120,6 +120,34 @@ pub fn delete_remote_branch(path: String, remote: String, branch: String) -> Res
     Ok(())
 }
 
+/// 按 `origin/feat/x` 这种完整简称删除远程分支。
+///
+/// 侧边栏的远程分支那一栏拿到的就是这个形式，拆分放在后端做——远程名可以带
+/// 斜杠，前端按第一个 `/` 去切会切错。
+#[tauri::command]
+pub fn delete_remote_ref(path: String, remote_branch: String) -> Result<()> {
+    let (remote, branch) = crate::engine::branch::split_remote_ref(&path, &remote_branch)?;
+    delete_remote_branch(path, remote, branch)
+}
+
+/// 检出一个远程分支，返回落地的本地分支名。
+///
+/// **不能直接 `git checkout origin/x`**——那会进游离 HEAD，界面上看着像切过去了，
+/// 实际上此后的提交不属于任何分支。要建一条跟踪它的本地分支。
+///
+/// 同名本地分支已经存在时直接切过去，不去动它指向哪：那多半就是用户上次检出
+/// 留下的分支，静默把它重置到远程会丢掉本地提交。
+#[tauri::command]
+pub fn checkout_remote_branch(path: String, remote_branch: String) -> Result<String> {
+    let (local, exists) = crate::engine::branch::local_target_for(&path, &remote_branch)?;
+    if exists {
+        run_git(&path, &["checkout", &local])?;
+    } else {
+        run_git(&path, &["checkout", "-b", &local, "--track", &remote_branch])?;
+    }
+    Ok(local)
+}
+
 #[tauri::command]
 pub fn rename_branch(path: String, old: String, new: String) -> Result<()> {
     run_git(&path, &["branch", "-m", &old, &new])?;

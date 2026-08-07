@@ -866,8 +866,10 @@ body {
   color: #fff;
 }
 
+/* 远程分支比本地弱一档，但不能弱到看不清：原来的 #7d7d7d 对 #1e1e1e 只有
+   4.05:1，低于 WCAG AA 对正文的 4.5:1，而这里字号才 12px。#9a9a9a 约 5.9:1。 */
 .sb-row.remote {
-  color: #7d7d7d;
+  color: #9a9a9a;
 }
 
 .sb-icon {
