@@ -890,9 +890,33 @@ body {
 }
 
 /* 当前分支/工作区：加粗提亮，不额外占一行说明 */
+/**
+ * 当前分支 / 当前工作区。
+ *
+ * 光靠「加粗 + 白字」区分不出来：`.selected` 也是白字加背景，两者读起来
+ * 几乎一样，扫一眼根本看不出哪个是当前分支。所以加一条左侧竖条——和标签栏
+ * 活动标签（`.tab.active::before`）同一套视觉语言，而且它占的是背景色之外的
+ * 另一个通道，跟选中态叠加也不会互相盖掉。
+ */
 .sb-row.current {
   font-weight: 600;
   color: #fff;
+}
+
+.sb-row.current::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: #4fc3f7;
+}
+
+/* 图标也一起点亮，竖条之外再给一个近处的信号 */
+.sb-row.current .sb-icon {
+  opacity: 1;
+  color: #4fc3f7;
 }
 
 /* 远程分支比本地弱一档，但不能弱到看不清：原来的 #7d7d7d 对 #1e1e1e 只有
@@ -906,10 +930,6 @@ body {
   height: 13px;
   flex-shrink: 0;
   opacity: 0.6;
-}
-
-.sb-row.current .sb-icon {
-  opacity: 0.95;
 }
 
 /* basis 用 auto 而不是 0：flex:1 的 basis 是 0%，会让主标题比右边的次要
