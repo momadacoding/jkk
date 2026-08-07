@@ -165,6 +165,56 @@ fn the_patchid_fallback_catches_it_when_the_trunk_edits_the_same_files() {
     assert!(info.content_merged, "patch-id 应当在主干上找到那个 squash 提交");
 }
 
+/// HEAD 停在别处时，仍然要拿主干来判。
+///
+/// 真实踩过：主仓库处于游离 HEAD，停在某个功能分支的 tip 上，那个 tip 落后
+/// main 两个提交、正好缺了目标分支的 squash 合并提交，于是一个早就合并进 main
+/// 的分支被判成「有 2 个提交没合并」。用 worktree 的人常年如此——主仓库的 HEAD
+/// 停在哪儿基本是随机的。
+#[test]
+fn judges_against_the_trunk_even_when_head_is_detached_somewhere_else() {
+    let (_remote, work) = repo_with_remote();
+    run_git(work.path(), &["branch", "-m", "main"]);
+    run_git(work.path(), &["checkout", "-q", "-b", "feat/done"]);
+    commit(work.path(), "c2");
+    run_git(work.path(), &["checkout", "-q", "main"]);
+    run_git(work.path(), &["merge", "--squash", "feat/done"]);
+    run_git(work.path(), &["commit", "-m", "squashed feat/done (#1)"]);
+    // main 又往前走一步
+    commit(work.path(), "later");
+
+    // 把 HEAD 游离到合并之前的位置——那里当然看不到 feat/done 的活
+    let before = std::process::Command::new("git")
+        .current_dir(work.path())
+        .args(["rev-parse", "main~2"])
+        .output()
+        .unwrap();
+    let before = String::from_utf8(before.stdout).unwrap();
+    run_git(work.path(), &["checkout", "-q", "--detach", before.trim()]);
+
+    let info = branch::delete_info(&p(&work), "feat/done").unwrap();
+    assert_eq!(info.compared_to, "main", "该拿主干比，不是拿游离的 HEAD 比");
+    assert_eq!(info.unmerged, 1);
+    assert!(
+        info.content_merged,
+        "HEAD 停在哪儿不该影响「这个分支合并了没有」"
+    );
+}
+
+/// 报了几个未合并，就得说清楚是相对谁数的。
+#[test]
+fn says_which_ref_the_count_is_against() {
+    let (_remote, work) = repo_with_remote();
+    run_git(work.path(), &["branch", "-m", "main"]);
+    run_git(work.path(), &["checkout", "-q", "-b", "feat/wip"]);
+    commit(work.path(), "c2");
+    run_git(work.path(), &["checkout", "-q", "main"]);
+
+    let info = branch::delete_info(&p(&work), "feat/wip").unwrap();
+    assert_eq!(info.unmerged, 1);
+    assert_eq!(info.compared_to, "main");
+}
+
 /// 真的有未合并提交时不能降级，红色警告必须留着。
 #[test]
 fn a_branch_with_real_unmerged_work_is_not_excused() {

@@ -17,8 +17,15 @@ export interface DeleteInfo {
   remote: string | null
   /** 该分支在远程上的名字，如 `feat/x`。 */
   remoteBranch: string | null
-  /** 只在这个分支上、不在当前 HEAD 上的提交数。 */
+  /** 只在这个分支上、不在 `comparedTo` 上的提交数。 */
   unmerged: number
+  /**
+   * 上面那个数是拿哪个 ref 比出来的，如 `main`。
+   *
+   * 必须显示出来：用 worktree 时主仓库的 HEAD 常年停在不相干的地方甚至是游离的，
+   * 只说「不在当前分支上」等于什么都没说。
+   */
+  comparedTo: string
   /**
    * `unmerged` 不为 0，但内容其实已经全在当前分支上了——squash merge 的典型
    * 表现。为真时那几个提交丢不了东西，警告降级成中性提示。
@@ -218,12 +225,12 @@ export function DeleteBranchDialog({ repoPath, name, onCancel, onConfirm }: Dele
         {info !== null && info.unmerged > 0 && (
           info.contentMerged ? (
             <div className="dlg-note">
-              该分支有 {info.unmerged} 个提交不在当前分支上，但它们的改动已经进了当前分支
+              该分支有 {info.unmerged} 个提交不在 {info.comparedTo} 上，但改动已经进去了
               （squash 或 rebase 合并后的正常现象），删掉不会丢东西。
             </div>
           ) : (
             <div className="dlg-warning">
-              该分支有 {info.unmerged} 个提交不在当前分支上，删除后只能靠 reflog 找回。
+              该分支有 {info.unmerged} 个提交不在 {info.comparedTo} 上，删除后只能靠 reflog 找回。
             </div>
           )
         )}
