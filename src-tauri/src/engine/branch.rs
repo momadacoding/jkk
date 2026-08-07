@@ -2,6 +2,16 @@ use crate::error::Result;
 use git2::{BranchType, Repository};
 use serde::Serialize;
 
+/// 检出了待删分支的那个 worktree。
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeTarget {
+    /// worktree 目录名，界面上显示这个。
+    pub name: String,
+    /// 完整路径，`git worktree remove` 要用它。
+    pub path: String,
+}
+
 #[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteInfo {
@@ -19,6 +29,23 @@ pub struct DeleteInfo {
     /// 界面拿它提示「删了就找不回来」。语义对齐 `git branch -d` 的判断：
     /// 它正是在这个数不为 0 时拒绝删除。
     pub unmerged: usize,
+    /// `unmerged` 不为 0，但分支的内容其实已经全在当前 HEAD 上了。
+    ///
+    /// squash merge 会把 N 个提交压成一个**全新的提交对象**，SHA 全变，于是
+    /// 原分支上那几个提交确实不是 HEAD 的祖先，`unmerged` 照实报了个大于 0 的
+    /// 数——数字是真的，它暗示的风险却是假的：内容早就进去了。GitHub 默认走
+    /// squash 的话，每合并一个分支就要误报一次，喊到最后真有未合并提交时也不会
+    /// 有人看了。
+    ///
+    /// 判据是两边的 tree 完全一致。特意不用 `git cherry` 那套 patch-id 比对：
+    /// squash 把 N 个补丁合成了 1 个，patch-id 根本对不上，它同样判不出来。
+    pub content_merged: bool,
+    /// 检出了这个分支的 worktree（主工作区除外），没有就是 None。
+    ///
+    /// 这不是锦上添花的信息：分支被 worktree 占着时 `git branch -D` 会直接拒绝
+    /// （`cannot delete branch 'x' used by worktree at '...'`），非删掉那个
+    /// worktree 不可。界面据此多给一个勾选框。
+    pub worktree: Option<WorktreeTarget>,
 }
 
 /// 找出这个分支对应的远程分支。
@@ -59,6 +86,80 @@ fn find_remote_branch(repo: &Repository, short: &str) -> Option<(String, String,
     None
 }
 
+/// 分支的内容是不是和当前 HEAD 一模一样。
+///
+/// 只比最终的 tree，不看提交历史——squash / rebase 合并之后提交对象全换了，
+/// 唯一还能对上的就是内容本身。
+///
+/// 比不出来就当作 false：这一项只决定警告用什么颜色，宁可多喊一次狼来了，
+/// 也不要因为算不出来就把真正的未合并提交轻描淡写过去。
+fn content_matches_head(repo: &Repository, name: &str) -> bool {
+    (|| {
+        let branch_tree = repo
+            .find_branch(name, BranchType::Local)
+            .ok()?
+            .get()
+            .peel_to_tree()
+            .ok()?;
+        let head_tree = repo.head().ok()?.peel_to_tree().ok()?;
+        let diff = repo
+            .diff_tree_to_tree(Some(&head_tree), Some(&branch_tree), None)
+            .ok()?;
+        Some(diff.deltas().len() == 0)
+    })()
+    .unwrap_or(false)
+}
+
+/// 找出检出了这个分支的 worktree。
+///
+/// **跳过主工作区**：它删不掉（`git worktree remove` 拒绝），给出勾选框只会
+/// 是个死路。主工作区占着某个分支时让 git 的原话直接报出来更诚实。
+///
+/// 查不出来（`git worktree list` 失败、仓库根本没有 worktree）就当作没有：
+/// 这一项只影响多不多一个勾选框，不该因为它让整个确认框打不开。
+fn find_worktree(path: &str, name: &str) -> Option<WorktreeTarget> {
+    crate::engine::worktree::read_worktrees(path)
+        .ok()?
+        .into_iter()
+        .find(|w| !w.is_main && w.branch == name)
+        .map(|w| WorktreeTarget {
+            name: w.name,
+            path: w.path,
+        })
+}
+
+/// 把 `origin/feat/x` 这种完整简称拆成（远程名, 远程上的分支名）。
+///
+/// 不能简单按第一个 `/` 切：远程名本身可以带斜杠。所以拿仓库里真实配置的
+/// 远程名去匹配，并且**取最长的那个匹配**——同时存在 `origin` 和 `origin/mirror`
+/// 两个远程时，`origin/mirror/x` 只有取长的才切得对。
+pub fn split_remote_ref(path: &str, remote_ref: &str) -> Result<(String, String)> {
+    let repo = Repository::open(path)?;
+    let mut best: Option<(String, String)> = None;
+    for remote in repo.remotes()?.iter().flatten() {
+        if let Some(rest) = remote_ref.strip_prefix(&format!("{remote}/")) {
+            let better = best
+                .as_ref()
+                .map(|(r, _): &(String, String)| remote.len() > r.len())
+                .unwrap_or(true);
+            if better {
+                best = Some((remote.to_string(), rest.to_string()));
+            }
+        }
+    }
+    best.ok_or_else(|| {
+        crate::error::GitError::new("bad_ref", format!("{remote_ref} 不属于任何已配置的远程"))
+    })
+}
+
+/// 远程分支该检出成哪个本地分支名，以及这个本地分支是不是已经存在。
+pub fn local_target_for(path: &str, remote_ref: &str) -> Result<(String, bool)> {
+    let (_, local) = split_remote_ref(path, remote_ref)?;
+    let repo = Repository::open(path)?;
+    let exists = repo.find_branch(&local, BranchType::Local).is_ok();
+    Ok((local, exists))
+}
+
 /// 删除分支前要在确认框里显示的信息。
 pub fn delete_info(path: &str, name: &str) -> Result<DeleteInfo> {
     let repo = Repository::open(path)?;
@@ -83,5 +184,8 @@ pub fn delete_info(path: &str, name: &str) -> Result<DeleteInfo> {
         remote,
         remote_branch,
         unmerged,
+        // unmerged 为 0 时这一项没有意义，别白跑一次 tree 比对
+        content_merged: unmerged > 0 && content_matches_head(&repo, name),
+        worktree: find_worktree(path, name),
     })
 }

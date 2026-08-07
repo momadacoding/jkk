@@ -97,6 +97,115 @@ fn counts_commits_that_are_not_on_the_current_branch() {
     assert_eq!(info.unmerged, 2);
 }
 
+/// squash merge 之后 `unmerged` 必然大于 0（提交对象换了新 SHA），但内容早就
+/// 进主干了。界面靠 `content_merged` 把那句「只能靠 reflog 找回」降级成中性提示，
+/// 否则 GitHub 每 squash 合并一个分支就要误报一次。
+#[test]
+fn a_squash_merged_branch_still_counts_commits_but_matches_in_content() {
+    let (_remote, work) = repo_with_remote();
+    run_git(work.path(), &["checkout", "-q", "-b", "feat/squashed"]);
+    commit(work.path(), "c2");
+    commit(work.path(), "c3");
+    run_git(work.path(), &["checkout", "-q", "-"]);
+    run_git(work.path(), &["merge", "--squash", "feat/squashed"]);
+    run_git(work.path(), &["commit", "-m", "squashed (#1)"]);
+
+    let info = branch::delete_info(&p(&work), "feat/squashed").unwrap();
+    // 数字本身是对的——那两个提交对象确实不是 HEAD 的祖先
+    assert_eq!(info.unmerged, 2);
+    // ……但一点东西都丢不了
+    assert!(info.content_merged);
+}
+
+/// 真的有未合并提交时不能降级，红色警告必须留着。
+#[test]
+fn a_branch_with_real_unmerged_work_is_not_excused() {
+    let (_remote, work) = repo_with_remote();
+    run_git(work.path(), &["checkout", "-q", "-b", "feat/real"]);
+    commit(work.path(), "c2");
+    run_git(work.path(), &["checkout", "-q", "-"]);
+
+    let info = branch::delete_info(&p(&work), "feat/real").unwrap();
+    assert_eq!(info.unmerged, 1);
+    assert!(!info.content_merged);
+}
+
+/// squash 合并后又提交了新东西：旧的那些内容在主干上，新的不在，
+/// 两者混在同一个 unmerged 数里，只有内容对比能把它们分开。
+#[test]
+fn commits_made_after_the_squash_merge_break_the_content_match() {
+    let (_remote, work) = repo_with_remote();
+    run_git(work.path(), &["checkout", "-q", "-b", "feat/more"]);
+    commit(work.path(), "c2");
+    run_git(work.path(), &["checkout", "-q", "-"]);
+    run_git(work.path(), &["merge", "--squash", "feat/more"]);
+    run_git(work.path(), &["commit", "-m", "squashed"]);
+    run_git(work.path(), &["checkout", "-q", "feat/more"]);
+    commit(work.path(), "c3");
+    run_git(work.path(), &["checkout", "-q", "master"]);
+
+    let info = branch::delete_info(&p(&work), "feat/more").unwrap();
+    assert!(!info.content_merged, "c3 还没进主干，不能说内容一致");
+}
+
+#[test]
+fn reports_the_worktree_that_has_the_branch_checked_out() {
+    let (_remote, work) = repo_with_remote();
+    run_git(work.path(), &["branch", "feat/wt"]);
+    let wt = work.path().join("wt-dir");
+    run_git(
+        work.path(),
+        &["worktree", "add", wt.to_str().unwrap(), "feat/wt"],
+    );
+
+    let info = branch::delete_info(&p(&work), "feat/wt").unwrap();
+    let target = info.worktree.expect("被 worktree 检出的分支要报出来");
+    assert_eq!(target.name, "wt-dir");
+    // 路径要给全的：`git worktree remove` 收路径，靠名字拼是拼不出来的
+    assert!(target.path.ends_with("wt-dir"), "{}", target.path);
+}
+
+/// 这条断言的是这个功能存在的理由，不是锦上添花：分支被 worktree 占着时
+/// `git branch -D` 直接拒绝，没有那个勾选框这类分支在界面上根本删不掉。
+#[test]
+fn git_refuses_to_delete_a_branch_a_worktree_has_checked_out() {
+    let (_remote, work) = repo_with_remote();
+    run_git(work.path(), &["branch", "feat/busy"]);
+    let wt = work.path().join("busy-dir");
+    let wt_path = wt.to_str().unwrap();
+    run_git(work.path(), &["worktree", "add", wt_path, "feat/busy"]);
+
+    let refused = Command::new("git")
+        .current_dir(work.path())
+        .args(["branch", "-D", "feat/busy"])
+        .status()
+        .unwrap();
+    assert!(!refused.success(), "git 应当拒绝删除被检出的分支");
+
+    // 先把 worktree 摘掉，同一条命令就通了——界面走的正是这个顺序
+    run_git(work.path(), &["worktree", "remove", wt_path]);
+    run_git(work.path(), &["branch", "-D", "feat/busy"]);
+}
+
+/// 主工作区不给勾选框：它删不掉，给了也是死路。
+#[test]
+fn the_main_worktree_is_not_offered() {
+    let (_remote, work) = repo_with_remote();
+    run_git(work.path(), &["checkout", "-q", "-b", "feat/here"]);
+
+    let info = branch::delete_info(&p(&work), "feat/here").unwrap();
+    assert_eq!(info.worktree, None);
+}
+
+#[test]
+fn a_branch_without_a_worktree_reports_none() {
+    let (_remote, work) = repo_with_remote();
+    run_git(work.path(), &["branch", "plain"]);
+
+    let info = branch::delete_info(&p(&work), "plain").unwrap();
+    assert_eq!(info.worktree, None);
+}
+
 #[test]
 fn a_merged_branch_reports_nothing_unmerged() {
     let (_remote, work) = repo_with_remote();

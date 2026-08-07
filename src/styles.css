@@ -606,6 +606,50 @@ body {
   accent-color: #3a6ea5;
 }
 
+/* 中性说明。刻意不用 .dlg-warning 的红色：这里讲的是「为什么可以放心」，
+   红色会和真正的未合并提交警告抢注意力，而后者才是需要停下来看的。 */
+.dlg-note {
+  margin-left: 54px;
+  color: #9aa0a6;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* 挂在某个勾选框下面的说明，再缩进到和勾选框的文字对齐，
+   读起来才像是那一行的注解而不是另起的一段 */
+.dlg-note.under-check {
+  margin-left: 76px;
+}
+
+/* 进度条：删远程要走一次网络往返（实测到 GitHub 四五秒），
+   这几秒必须看得见，否则界面像卡死 */
+.dlg-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: 54px;
+  color: #bbb;
+}
+
+.dlg-spinner {
+  flex-shrink: 0;
+  width: 12px;
+  height: 12px;
+  border: 2px solid #4a4a4a;
+  border-top-color: #4fc3f7;
+  border-radius: 50%;
+  animation: dlg-spin 0.7s linear infinite;
+}
+
+@keyframes dlg-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* 关掉动画的用户看不到旋转，那就至少让它是个静止的进度标记 */
+@media (prefers-reduced-motion: reduce) {
+  .dlg-spinner { animation: none; }
+}
+
 .dlg-warning {
   margin-left: 54px;
   padding: 6px 8px;
@@ -861,13 +905,39 @@ body {
 }
 
 /* 当前分支/工作区：加粗提亮，不额外占一行说明 */
+/**
+ * 当前分支 / 当前工作区。
+ *
+ * 光靠「加粗 + 白字」区分不出来：`.selected` 也是白字加背景，两者读起来
+ * 几乎一样，扫一眼根本看不出哪个是当前分支。所以加一条左侧竖条——和标签栏
+ * 活动标签（`.tab.active::before`）同一套视觉语言，而且它占的是背景色之外的
+ * 另一个通道，跟选中态叠加也不会互相盖掉。
+ */
 .sb-row.current {
   font-weight: 600;
   color: #fff;
 }
 
+.sb-row.current::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: #4fc3f7;
+}
+
+/* 图标也一起点亮，竖条之外再给一个近处的信号 */
+.sb-row.current .sb-icon {
+  opacity: 1;
+  color: #4fc3f7;
+}
+
+/* 远程分支比本地弱一档，但不能弱到看不清：原来的 #7d7d7d 对 #1e1e1e 只有
+   4.05:1，低于 WCAG AA 对正文的 4.5:1，而这里字号才 12px。#9a9a9a 约 5.9:1。 */
 .sb-row.remote {
-  color: #7d7d7d;
+  color: #9a9a9a;
 }
 
 .sb-icon {
@@ -875,10 +945,6 @@ body {
   height: 13px;
   flex-shrink: 0;
   opacity: 0.6;
-}
-
-.sb-row.current .sb-icon {
-  opacity: 0.95;
 }
 
 /* basis 用 auto 而不是 0：flex:1 的 basis 是 0%，会让主标题比右边的次要

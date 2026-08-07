@@ -3,7 +3,8 @@ import type { RefPointer } from '../engine/types'
 import { ContextMenu, useContextMenu } from './ContextMenu'
 import { SidebarSection, SidebarGroup } from './SidebarSection'
 import { usePrompt } from './PromptDialog'
-import { DeleteBranchDialog, type RemoteTarget } from './DeleteBranchDialog'
+import { DeleteBranchDialog, type DeleteTargets } from './DeleteBranchDialog'
+import { useConfirm } from './ConfirmDialog'
 
 interface BranchViewProps {
   refs: RefPointer[]
@@ -14,8 +15,21 @@ interface BranchViewProps {
   onCheckout: (name: string) => void
   onCreate: (name: string, start?: string) => void
   onRename: (oldName: string, newName: string) => void
-  /** `remote` 非 null 时连远程分支一起删。 */
-  onDelete: (name: string, remote: RemoteTarget | null) => void
+  /**
+   * 删除本地分支，`targets` 说明要不要连远程分支和 worktree 一起删。
+   *
+   * 返回的 Promise 要等删完才 resolve，确认框靠它显示进度；失败要抛出，
+   * 确认框据此留在原地显示错误。
+   */
+  onDelete: (name: string, targets: DeleteTargets) => Promise<void>
+  /** 检出远程分支：建一条跟踪它的本地分支并切过去。 */
+  onCheckoutRemote: (remoteBranch: string) => void
+  /**
+   * 删除远程分支，参数是 `origin/feat/x` 这种完整简称。
+   *
+   * 同 `onDelete`：Promise 要等删完才 resolve，失败要抛出。
+   */
+  onDeleteRemote: (remoteBranch: string) => Promise<void>
   /** 仓库路径，删除确认框要用它去查上游和未合并提交数。 */
   repoPath: string | null
 }
@@ -48,7 +62,8 @@ function SyncBadge({ ahead, behind }: { ahead: number | null; behind: number | n
 }
 
 export function BranchView({
-  refs, head, selectedBranch, onSelect, onCheckout, onCreate, onRename, onDelete, repoPath,
+  refs, head, selectedBranch, onSelect, onCheckout, onCreate, onRename, onDelete,
+  onCheckoutRemote, onDeleteRemote, repoPath,
 }: BranchViewProps) {
   const [creating, setCreating] = useState(false)
   const [newName, setNewName] = useState('')
@@ -57,6 +72,7 @@ export function BranchView({
   const inputRef = useRef<HTMLInputElement>(null)
   const { menu, open, close } = useContextMenu()
   const { prompt, dialog } = usePrompt()
+  const { confirm, dialog: confirmDialog } = useConfirm()
   const local = refs.filter((r) => r.kind === 'branch')
   const remote = refs.filter((r) => r.kind === 'remote')
 
@@ -103,6 +119,39 @@ export function BranchView({
       label: 'Delete…',
       onSelect: () => setDeleting(name),
       disabled: name === head,
+      danger: true,
+    },
+  ]
+
+  /**
+   * 远程分支的右键菜单。
+   *
+   * 这里**没有** Checkout：直接 `git checkout origin/x` 会进游离 HEAD，
+   * 看着像切过去了，此后的提交却不属于任何分支。要建本地跟踪分支，
+   * 所以措辞是 "Checkout as local branch"。
+   */
+  const remoteMenu = (full: string) => [
+    {
+      label: 'Checkout as local branch',
+      onSelect: () => onCheckoutRemote(full),
+    },
+    {
+      label: 'Copy branch name',
+      onSelect: () => { void navigator.clipboard.writeText(full) },
+    },
+    {
+      label: 'Delete remote branch…',
+      onSelect: () => void confirm({
+        title: 'Delete Remote Branch',
+        message: 'Delete this branch from the remote repository',
+        detail: { label: 'Branch:', value: full },
+        warning: '远程分支是共享的，删掉之后其他人下次 fetch --prune 也会跟着少这一条。',
+        confirmLabel: 'Delete',
+        danger: true,
+        // 交给弹框去跑：这一步要走网络，得让等待可见
+        action: () => onDeleteRemote(full),
+        busyLabel: '正在联系远程…',
+      }),
       danger: true,
     },
   ]
@@ -158,8 +207,9 @@ export function BranchView({
           <div
             key={ref.name}
             className={shortName(ref) === selectedBranch ? 'sb-row remote selected' : 'sb-row remote'}
-            title={`${shortName(ref)}\n单击定位`}
+            title={`${shortName(ref)}\n单击定位 · 右键更多操作`}
             onClick={() => onSelect(shortName(ref), ref.hash)}
+            onContextMenu={(e) => open(e, remoteMenu(shortName(ref)))}
           >
             <BranchIcon />
             <span className="sb-label">{shortName(ref)}</span>
@@ -169,12 +219,14 @@ export function BranchView({
 
       <ContextMenu menu={menu} onClose={close} />
       {dialog}
+      {confirmDialog}
       {deleting && (
         <DeleteBranchDialog
           repoPath={repoPath}
           name={deleting}
           onCancel={() => setDeleting(null)}
-          onConfirm={(remote) => { onDelete(deleting, remote); setDeleting(null) }}
+          // 成功才关；失败时 onDelete 抛出，确认框自己接住并留在原地
+          onConfirm={async (targets) => { await onDelete(deleting, targets); setDeleting(null) }}
         />
       )}
     </SidebarSection>
