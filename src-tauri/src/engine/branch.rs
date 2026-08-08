@@ -24,11 +24,17 @@ pub struct DeleteInfo {
     /// 不让前端去切 `origin/feat/x` 这个字符串：远程名本身可以带斜杠，
     /// 按第一个 `/` 切会把分支名切错。
     pub remote_branch: Option<String>,
-    /// 有多少提交只在这个分支上、不在当前 HEAD 上。
+    /// 有多少提交只在这个分支上、不在 [`compared_to`](Self::compared_to) 上。
     ///
     /// 界面拿它提示「删了就找不回来」。语义对齐 `git branch -d` 的判断：
     /// 它正是在这个数不为 0 时拒绝删除。
     pub unmerged: usize,
+    /// 上面那个数是拿哪个 ref 比出来的，如 `main`、`origin/main`。
+    ///
+    /// 必须显示出来。**不写清楚的话这个数字无从判断**：用 worktree 时主仓库的
+    /// HEAD 常年停在某个不相干的地方，甚至是游离的，只说「不在当前分支上」
+    /// 等于什么都没说。挑的是候选目标里落下最少的那个，见 [`merge_targets`]。
+    pub compared_to: String,
     /// `unmerged` 不为 0，但分支的内容其实已经全在当前 HEAD 上了。
     ///
     /// squash merge 会把 N 个提交压成一个**全新的提交对象**，SHA 全变，于是
@@ -102,9 +108,9 @@ const PATCHID_SCAN_LIMIT: usize = 500;
 /// 所以要问的是「分支的贡献进去了吗」，分两步：
 ///
 /// 1. **只比分支碰过的那些路径**。便宜（不扫历史），且覆盖绝大多数「合并完就删」。
-///    分支改过的文件在 HEAD 上一字不差，就说明它的活已经落地。
+///    分支改过的文件在目标上一字不差，就说明它的活已经落地。
 /// 2. 第一步不成立时才上 **patch-id**：把分支的净改动整体算一个指纹，去
-///    `merge-base..HEAD` 里找同指纹的提交。第一步失败有两种原因——主干后来又改了
+///    `merge-base..目标` 里找同指纹的提交。第一步失败有两种原因——目标后来又改了
 ///    这些文件（其实早合并了），或者分支上有 squash 之后的新提交（真没合并）——
 ///    只有 patch-id 分得开。
 ///
@@ -113,19 +119,21 @@ const PATCHID_SCAN_LIMIT: usize = 500;
 ///
 /// 任何一步出错都当作 false：这一项只决定警告用什么颜色，宁可多喊一次狼来了，
 /// 也不要因为算不出来就把真正的未合并提交轻描淡写过去。
-fn content_is_already_in_head(repo: &Repository, name: &str) -> bool {
+/// `deep` 为假时只跑第一步。判「没合并」要把整个扫描跑完才收工，对每个候选目标
+/// 都跑一遍实测能到两秒多；深挖只留给最可能命中的那个目标，其余的用便宜的那一步
+/// 兜一下就够了。
+fn content_is_already_in(
+    repo: &Repository,
+    branch_oid: git2::Oid,
+    target: git2::Oid,
+    deep: bool,
+) -> bool {
     (|| {
-        let branch_oid = repo
-            .find_branch(name, BranchType::Local)
-            .ok()?
-            .get()
-            .target()?;
-        let head_oid = repo.head().ok()?.peel_to_commit().ok()?.id();
-        let base = repo.merge_base(head_oid, branch_oid).ok()?;
+        let base = repo.merge_base(target, branch_oid).ok()?;
 
         let base_tree = repo.find_commit(base).ok()?.tree().ok()?;
         let branch_tree = repo.find_commit(branch_oid).ok()?.tree().ok()?;
-        let head_tree = repo.find_commit(head_oid).ok()?.tree().ok()?;
+        let head_tree = repo.find_commit(target).ok()?.tree().ok()?;
 
         // 分支从分叉点以来碰过哪些路径
         let own = repo
@@ -157,11 +165,14 @@ fn content_is_already_in_head(repo: &Repository, name: &str) -> bool {
         if scoped.deltas().len() == 0 {
             return Some(true);
         }
+        if !deep {
+            return Some(false);
+        }
 
         // 第二步：patch-id 兜底
         let want = own.patchid(None).ok()?;
         let mut walk = repo.revwalk().ok()?;
-        walk.push(head_oid).ok()?;
+        walk.push(target).ok()?;
         walk.hide(base).ok()?;
         for oid in walk.take(PATCHID_SCAN_LIMIT).flatten() {
             let commit = repo.find_commit(oid).ok()?;
@@ -193,6 +204,61 @@ fn content_is_already_in_head(repo: &Repository, name: &str) -> bool {
         Some(false)
     })()
     .unwrap_or(false)
+}
+
+/// 「合并进哪里算数」的候选目标，按显示名 + commit 给出。
+///
+/// **不能只看 HEAD。** 实测踩过：主仓库处于游离 HEAD，停在某个功能分支的 tip 上，
+/// 那个 tip 落后主干两个提交、正好缺了目标分支的 squash 合并提交，于是一个早就
+/// 合并进 main 的分支被判成「有 2 个提交没合并」。数字相对 HEAD 是对的，但用户
+/// 想知道的从来都是「进主干了吗」。用 worktree 的人尤其容易撞上——主仓库的 HEAD
+/// 常年停在某个不相干的地方。
+///
+/// 候选顺序：主干（本地的默认分支优先，其次远程的），最后才是 HEAD。三个都算，
+/// 取最有利的结果——只要这些活在任何一处留着，删掉分支就不丢东西。
+fn merge_targets(repo: &Repository) -> Vec<(String, git2::Oid)> {
+    let mut out: Vec<(String, git2::Oid)> = Vec::new();
+    let mut push = |name: String, oid: git2::Oid| {
+        if !out.iter().any(|(_, o)| *o == oid) {
+            out.push((name, oid));
+        }
+    };
+
+    // 默认分支叫什么，先问 origin/HEAD，问不到再按常见名字猜
+    let default_name = repo
+        .find_reference("refs/remotes/origin/HEAD")
+        .ok()
+        .and_then(|r| r.resolve().ok())
+        .and_then(|r| r.shorthand().map(|s| s.to_string()))
+        .and_then(|s| s.strip_prefix("origin/").map(|s| s.to_string()));
+
+    let names: Vec<String> = match default_name {
+        Some(n) => vec![n],
+        None => vec!["main".to_string(), "master".to_string()],
+    };
+    for n in names {
+        if let Ok(b) = repo.find_branch(&n, BranchType::Local) {
+            if let Some(oid) = b.get().target() {
+                push(n.clone(), oid);
+            }
+        }
+        // 本地那条可能很久没 pull 了，远程跟踪分支一并算上
+        if let Ok(b) = repo.find_branch(&format!("origin/{n}"), BranchType::Remote) {
+            if let Some(oid) = b.get().target() {
+                push(format!("origin/{n}"), oid);
+            }
+        }
+    }
+
+    if let Some(oid) = repo.head().ok().and_then(|h| h.target()) {
+        let name = repo
+            .head()
+            .ok()
+            .and_then(|h| h.shorthand().map(|s| s.to_string()))
+            .unwrap_or_else(|| "HEAD".to_string());
+        push(name, oid);
+    }
+    out
 }
 
 /// 找出检出了这个分支的 worktree。
@@ -253,24 +319,56 @@ pub fn delete_info(path: &str, name: &str) -> Result<DeleteInfo> {
         None => (None, None, None),
     };
 
-    // 算不出来就当作 0：这个数只用于多显示一行警告，
-    // 不该因为它失败而让整个确认框打不开
-    let unmerged = (|| {
-        let branch = repo.find_branch(name, BranchType::Local).ok()?;
-        let branch_oid = branch.get().target()?;
-        let head_oid = repo.head().ok()?.peel_to_commit().ok()?.id();
-        let (ahead, _) = repo.graph_ahead_behind(branch_oid, head_oid).ok()?;
-        Some(ahead)
+    // 算不出来就当作「零个未合并、目标是 HEAD」：这两项只用于多显示一行提示，
+    // 不该因为它们失败而让整个确认框打不开
+    let (unmerged, compared_to, content_merged) = (|| {
+        let branch_oid = repo
+            .find_branch(name, BranchType::Local)
+            .ok()?
+            .get()
+            .target()?;
+        let targets = merge_targets(&repo);
+        if targets.is_empty() {
+            return None;
+        }
+
+        // 挑落下最少的那个目标来报数——这些活只要在任何一处留着就不算丢
+        let mut best: Option<(String, git2::Oid, usize)> = None;
+        for (label, oid) in &targets {
+            let ahead = repo
+                .graph_ahead_behind(branch_oid, *oid)
+                .map(|(a, _)| a)
+                .unwrap_or(usize::MAX);
+            if best.as_ref().is_none_or(|(_, _, n)| ahead < *n) {
+                best = Some((label.clone(), *oid, ahead));
+            }
+            if ahead == 0 {
+                break;
+            }
+        }
+        let (label, best_oid, ahead) = best?;
+        if ahead == 0 || ahead == usize::MAX {
+            return Some((0, label, false));
+        }
+
+        // 提交对象没进去，内容可能已经进去了（squash / rebase 合并）。落下最少的
+        // 那个目标最可能已经含着这些活，深挖它；其余的只跑便宜的第一步兜一下
+        let merged = content_is_already_in(&repo, branch_oid, best_oid, true)
+            || targets
+                .iter()
+                .filter(|(_, oid)| *oid != best_oid)
+                .any(|(_, oid)| content_is_already_in(&repo, branch_oid, *oid, false));
+        Some((ahead, label, merged))
     })()
-    .unwrap_or(0);
+    .unwrap_or((0, "HEAD".to_string(), false));
 
     Ok(DeleteInfo {
         upstream,
         remote,
         remote_branch,
         unmerged,
-        // unmerged 为 0 时这一项没有意义，别白跑一次 tree 比对
-        content_merged: unmerged > 0 && content_is_already_in_head(&repo, name),
+        compared_to,
+        content_merged,
         worktree: find_worktree(path, name),
     })
 }
