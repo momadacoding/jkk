@@ -339,7 +339,10 @@ pub fn delete_info(path: &str, name: &str) -> Result<DeleteInfo> {
                 .graph_ahead_behind(branch_oid, *oid)
                 .map(|(a, _)| a)
                 .unwrap_or(usize::MAX);
-            if best.as_ref().is_none_or(|(_, _, n)| ahead < *n) {
+            // 等价于 `is_none_or`，但那个方法 1.82 才稳定，而本项目的 MSRV 是
+            // 1.77.2（跟 Tauri 2 对齐）。用它会让 1.77~1.81 的人按 README 装完
+            // 环境却编译不过。
+            if best.as_ref().map_or(true, |(_, _, n)| ahead < *n) {
                 best = Some((label.clone(), *oid, ahead));
             }
             if ahead == 0 {
