@@ -17,10 +17,18 @@ pub fn git_command(path: &str) -> Command {
 
 /// 执行一条 git 命令，成功返回 stdout，失败把 stderr 包成 GitError。
 pub fn run_git(path: &str, args: &[&str]) -> Result<String> {
+    Ok(String::from_utf8_lossy(&run_git_bytes(path, args)?).to_string())
+}
+
+/// 同 [`run_git`]，但原样返回 stdout 的字节。
+///
+/// patch 要落成文件，不能过 `from_utf8_lossy`：非 UTF-8 的文件名或内容会被替换成
+/// U+FFFD，生成的 patch 打回去就对不上了。需要写文件的场景一律走这个。
+pub fn run_git_bytes(path: &str, args: &[&str]) -> Result<Vec<u8>> {
     let output = git_command(path).args(args).output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         return Err(GitError::new("git_cli", stderr));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok(output.stdout)
 }

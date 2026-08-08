@@ -1,6 +1,7 @@
 import type { LayoutNode, RefPointer } from '../engine/graphTypes'
 import { laneTint } from '../engine/paths'
 import { WORKDIR_ID } from '../engine/workdir'
+import { shortHash } from '../engine/commitActions'
 
 interface CommitRowProps {
   node: LayoutNode
@@ -68,8 +69,12 @@ export function CommitRow({
           </span>
         ))}
       </span>
+      {/* 三列定宽，各自左对齐——右对齐时 hash 和日期的起始位置每行都在跳，
+          竖着扫一列的时候很费眼。定宽后三列各自成一条直线。 */}
       <span className="commit-meta">
-        {node.commit.author} • {date}
+        <span className="commit-author" title={node.commit.author}>{node.commit.author}</span>
+        <span className="commit-hash" title={node.commit.id}>{shortHash(node.commit.id)}</span>
+        <span className="commit-date">{date}</span>
       </span>
     </div>
   )
