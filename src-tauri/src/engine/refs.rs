@@ -45,7 +45,11 @@ pub fn collect(repo: &Repository) -> Result<Vec<RefPointer>> {
         };
         // 符号引用（如 refs/remotes/origin/HEAD）的 target() 为 None，跳过
         if let Some(oid) = reference.target() {
-            let counts = if kind == "branch" { upstream_counts(repo, &name) } else { None };
+            let counts = if kind == "branch" {
+                upstream_counts(repo, &name)
+            } else {
+                None
+            };
             refs.push(RefPointer {
                 name: name.clone(),
                 hash: oid.to_string(),

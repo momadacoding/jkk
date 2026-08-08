@@ -14,7 +14,11 @@ fn run_git(dir: &std::path::Path, args: &[&str]) {
 }
 
 fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
-    let out = Command::new("git").current_dir(dir).args(args).output().unwrap();
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap();
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
@@ -78,7 +82,10 @@ fn checkout_creates_a_local_branch_that_tracks_the_remote() {
     assert_eq!(local, "feat/x");
 
     // 必须是真的在分支上，不能是游离 HEAD——那样之后的提交不属于任何分支
-    assert_eq!(git_out(work.path(), &["rev-parse", "--abbrev-ref", "HEAD"]), "feat/x");
+    assert_eq!(
+        git_out(work.path(), &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "feat/x"
+    );
     // 而且上游要设好，否则接下来 pull/push 都得手动指定
     assert_eq!(
         git_out(work.path(), &["rev-parse", "--abbrev-ref", "@{upstream}"]),
@@ -97,7 +104,10 @@ fn checkout_switches_to_an_existing_local_branch_without_resetting_it() {
 
     ops::checkout_remote_branch(p(&work), "origin/feat/x".into()).unwrap();
 
-    assert_eq!(git_out(work.path(), &["rev-parse", "--abbrev-ref", "HEAD"]), "feat/x");
+    assert_eq!(
+        git_out(work.path(), &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "feat/x"
+    );
     // 分支已经存在时只切过去，不去动它指向哪：静默重置到远程会丢掉这条本地提交
     assert_eq!(git_out(work.path(), &["rev-parse", "HEAD"]), tip);
 }

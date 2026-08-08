@@ -169,7 +169,11 @@ fn blocking_processes(path: &Path) -> Vec<BlockingProcess> {
                             .trim_end_matches('\0')
                             .to_string();
                         out.push(BlockingProcess {
-                            name: if name.is_empty() { "未知程序".into() } else { name },
+                            name: if name.is_empty() {
+                                "未知程序".into()
+                            } else {
+                                name
+                            },
                             pid: info.Process.dwProcessId,
                         });
                     }
@@ -207,7 +211,9 @@ pub fn describe(root: &Path, blockers: &[Blocker]) -> String {
         };
         if b.processes.is_empty() {
             // 查不出进程本身就是个结论，别让它看起来像「查了但没查到」
-            lines.push(format!("  {shown}  —— 查不出是哪个进程，多半是有程序的工作目录停在这里"));
+            lines.push(format!(
+                "  {shown}  —— 查不出是哪个进程，多半是有程序的工作目录停在这里"
+            ));
         } else {
             let who = b
                 .processes
@@ -350,10 +356,16 @@ mod tests {
     fn describe_shows_paths_relative_to_the_worktree() {
         let blockers = [Blocker {
             path: PathBuf::from("C:/repo/wt/src/App.tsx"),
-            processes: vec![BlockingProcess { name: "Code.exe".into(), pid: 1234 }],
+            processes: vec![BlockingProcess {
+                name: "Code.exe".into(),
+                pid: 1234,
+            }],
         }];
         let text = describe(Path::new("C:/repo/wt"), &blockers);
         assert!(text.contains("Code.exe (PID 1234)"), "{text}");
-        assert!(!text.contains("C:/repo/wt/src"), "不该再带绝对路径前缀：{text}");
+        assert!(
+            !text.contains("C:/repo/wt/src"),
+            "不该再带绝对路径前缀：{text}"
+        );
     }
 }

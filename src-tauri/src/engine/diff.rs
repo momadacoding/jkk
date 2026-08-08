@@ -283,10 +283,8 @@ pub fn read_diff(path: &str, scope: String) -> Result<DiffData> {
     }
     // default: workdir vs HEAD（空仓库没有 HEAD，此时与空树比较）
     let tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
-    let diff = repo.diff_tree_to_workdir_with_index(
-        tree.as_ref(),
-        Some(&mut workdir_diff_opts(None)),
-    )?;
+    let diff =
+        repo.diff_tree_to_workdir_with_index(tree.as_ref(), Some(&mut workdir_diff_opts(None)))?;
     match readable_only(&repo, &diff) {
         None => diff_to_data(diff),
         // 一个能读的都没有：返回空 diff 而不是让整个视图报错。
@@ -411,4 +409,3 @@ fn diff_to_data(diff: git2::Diff) -> Result<DiffData> {
     }
     Ok(DiffData { files })
 }
-

@@ -1,13 +1,13 @@
+use crate::engine::path::normalize;
+use crate::error::{GitError, Result};
+use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tauri::{AppHandle, Emitter};
-use crate::engine::path::normalize;
-use crate::error::{GitError, Result};
 
 /// 归一化路径 → (代号, 引用计数)。
 ///
@@ -66,7 +66,9 @@ pub fn watch_repo(handle: AppHandle, path: String) -> Result<()> {
     std::thread::spawn(move || {
         let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<Event, notify::Error>>();
         let mut watcher: RecommendedWatcher = match RecommendedWatcher::new(
-            move |res| { let _ = tx.send(res); },
+            move |res| {
+                let _ = tx.send(res);
+            },
             Config::default().with_poll_interval(Duration::from_millis(500)),
         ) {
             Ok(w) => w,

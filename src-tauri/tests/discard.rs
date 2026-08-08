@@ -4,7 +4,11 @@ use std::process::Command;
 use tempfile::TempDir;
 
 fn run_git(dir: &std::path::Path, args: &[&str]) {
-    let status = Command::new("git").current_dir(dir).args(args).status().expect("git not found");
+    let status = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .status()
+        .expect("git not found");
     assert!(status.success(), "git {args:?} failed");
 }
 
@@ -32,7 +36,10 @@ fn discards_a_worktree_modification() {
 
     ops::discard(p(&dir), vec!["tracked.txt".into()], false).unwrap();
 
-    assert_eq!(fs::read_to_string(dir.path().join("tracked.txt")).unwrap(), "original\n");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("tracked.txt")).unwrap(),
+        "original\n"
+    );
 }
 
 #[test]
@@ -46,7 +53,10 @@ fn discarding_unstaged_keeps_what_was_already_staged() {
 
     ops::discard(p(&dir), vec!["tracked.txt".into()], false).unwrap();
 
-    assert_eq!(fs::read_to_string(dir.path().join("tracked.txt")).unwrap(), "staged version\n");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("tracked.txt")).unwrap(),
+        "staged version\n"
+    );
 }
 
 #[test]
@@ -57,9 +67,19 @@ fn discarding_staged_goes_all_the_way_back_to_head() {
 
     ops::discard(p(&dir), vec!["tracked.txt".into()], true).unwrap();
 
-    assert_eq!(fs::read_to_string(dir.path().join("tracked.txt")).unwrap(), "original\n");
-    let out = Command::new("git").current_dir(dir.path()).args(["diff", "--cached", "--name-only"]).output().unwrap();
-    assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty(), "暂存区应该也干净了");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("tracked.txt")).unwrap(),
+        "original\n"
+    );
+    let out = Command::new("git")
+        .current_dir(dir.path())
+        .args(["diff", "--cached", "--name-only"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        "暂存区应该也干净了"
+    );
 }
 
 #[test]
@@ -82,8 +102,15 @@ fn discarding_a_staged_new_file_removes_it_from_index_and_disk() {
     ops::discard(p(&dir), vec!["fresh.txt".into()], true).unwrap();
 
     assert!(!dir.path().join("fresh.txt").exists());
-    let out = Command::new("git").current_dir(dir.path()).args(["diff", "--cached", "--name-only"]).output().unwrap();
-    assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty(), "索引里不该还留着它");
+    let out = Command::new("git")
+        .current_dir(dir.path())
+        .args(["diff", "--cached", "--name-only"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        "索引里不该还留着它"
+    );
 }
 
 #[test]
@@ -96,12 +123,19 @@ fn handles_a_mixed_selection_in_one_call() {
 
     ops::discard(
         p(&dir),
-        vec!["tracked.txt".into(), "scratch.png".into(), "second.txt".into()],
+        vec![
+            "tracked.txt".into(),
+            "scratch.png".into(),
+            "second.txt".into(),
+        ],
         false,
     )
     .unwrap();
 
-    assert_eq!(fs::read_to_string(dir.path().join("tracked.txt")).unwrap(), "original\n");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("tracked.txt")).unwrap(),
+        "original\n"
+    );
     assert!(!dir.path().join("scratch.png").exists());
     assert!(!dir.path().join("second.txt").exists());
 }
@@ -114,7 +148,10 @@ fn leaves_files_that_were_not_selected_alone() {
 
     ops::discard(p(&dir), vec!["tracked.txt".into()], false).unwrap();
 
-    assert_eq!(fs::read_to_string(dir.path().join("keep-me.txt")).unwrap(), "precious");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("keep-me.txt")).unwrap(),
+        "precious"
+    );
 }
 
 #[test]
@@ -125,7 +162,10 @@ fn an_empty_selection_is_a_no_op() {
 
     ops::discard(p(&dir), vec![], false).unwrap();
 
-    assert_eq!(fs::read_to_string(dir.path().join("tracked.txt")).unwrap(), "messed up\n");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("tracked.txt")).unwrap(),
+        "messed up\n"
+    );
 }
 
 #[test]
@@ -139,5 +179,8 @@ fn discards_a_file_inside_a_subdirectory() {
 
     ops::discard(p(&dir), vec!["src/deep/a.txt".into()], false).unwrap();
 
-    assert_eq!(fs::read_to_string(dir.path().join("src/deep/a.txt")).unwrap(), "v1\n");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("src/deep/a.txt")).unwrap(),
+        "v1\n"
+    );
 }

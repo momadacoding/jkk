@@ -4,12 +4,20 @@ use std::process::Command;
 use tempfile::TempDir;
 
 fn run_git(dir: &std::path::Path, args: &[&str]) {
-    let status = Command::new("git").current_dir(dir).args(args).status().expect("git not found");
+    let status = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .status()
+        .expect("git not found");
     assert!(status.success(), "git {args:?} failed");
 }
 
 fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
-    let out = Command::new("git").current_dir(dir).args(args).output().unwrap();
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap();
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
@@ -27,7 +35,10 @@ fn repo_with_worktree(name: &str) -> (TempDir, std::path::PathBuf) {
     run_git(&main, &["commit", "-m", "c1"]);
 
     let wt = main.join(".worktrees").join(name);
-    run_git(&main, &["worktree", "add", wt.to_str().unwrap(), "-b", name]);
+    run_git(
+        &main,
+        &["worktree", "add", wt.to_str().unwrap(), "-b", name],
+    );
     (dir, wt)
 }
 
@@ -71,7 +82,10 @@ fn delete_moves_a_clean_worktree_out_of_the_way() {
     );
     // 东西进了回收站，不是被抹掉
     let slot = std::path::Path::new(&deleted.trash_path);
-    assert!(slot.join("worktree").join("a.txt").exists(), "文件该在回收站里");
+    assert!(
+        slot.join("worktree").join("a.txt").exists(),
+        "文件该在回收站里"
+    );
     assert!(slot.join("admin").exists(), "管理目录也该一起进回收站");
 }
 
@@ -87,7 +101,10 @@ fn the_branch_can_be_checked_out_again_right_after_deletion() {
     delete(&main, &wt, false);
 
     let again = main.join(".worktrees").join("again");
-    run_git(&main, &["worktree", "add", again.to_str().unwrap(), "feature"]);
+    run_git(
+        &main,
+        &["worktree", "add", again.to_str().unwrap(), "feature"],
+    );
     assert!(again.join("a.txt").exists());
 }
 
@@ -103,7 +120,10 @@ fn a_dirty_worktree_is_refused_and_left_untouched() {
     assert_eq!(err.code, "worktree_dirty");
     // 干净的拒绝：目录、内容、登记全都原样
     assert!(wt.join("a.txt").exists());
-    assert_eq!(fs::read_to_string(wt.join("scratch.txt")).unwrap(), "untracked");
+    assert_eq!(
+        fs::read_to_string(wt.join("scratch.txt")).unwrap(),
+        "untracked"
+    );
     assert!(
         git_out(&main, &["worktree", "list"]).contains("feature"),
         "登记不该被解除"
@@ -126,7 +146,9 @@ fn force_deletes_a_dirty_worktree_but_keeps_the_work_in_the_trash() {
     let deleted = delete(&main, &wt, true);
 
     assert!(!wt.exists());
-    let saved = std::path::Path::new(&deleted.trash_path).join("worktree").join("scratch.txt");
+    let saved = std::path::Path::new(&deleted.trash_path)
+        .join("worktree")
+        .join("scratch.txt");
     assert_eq!(
         fs::read_to_string(&saved).unwrap(),
         "别弄丢我",
@@ -142,12 +164,25 @@ fn force_deletes_a_dirty_worktree_but_keeps_the_work_in_the_trash() {
 fn a_locked_worktree_is_refused_even_with_force() {
     let (_dir, wt) = repo_with_worktree("feature");
     let main = main_of(&wt);
-    run_git(&main, &["worktree", "lock", wt.to_str().unwrap(), "--reason", "别删我"]);
+    run_git(
+        &main,
+        &[
+            "worktree",
+            "lock",
+            wt.to_str().unwrap(),
+            "--reason",
+            "别删我",
+        ],
+    );
 
     for force in [false, true] {
         let err = try_delete(&main, &wt, force);
         assert_eq!(err.code, "worktree_locked", "force={force}");
-        assert!(err.message.contains("别删我"), "该带上锁的理由：{}", err.message);
+        assert!(
+            err.message.contains("别删我"),
+            "该带上锁的理由：{}",
+            err.message
+        );
         assert!(wt.exists(), "force={force} 时目录被动了");
     }
 }
@@ -197,7 +232,11 @@ fn undo_restores_the_exact_state_including_the_index() {
     assert!(before.contains("A  s.txt"), "前提没造对：{before}");
 
     let deleted = delete(&main, &wt, true);
-    cmd::restore_worktree(main.to_str().unwrap().to_string(), deleted.trash_path.clone()).unwrap();
+    cmd::restore_worktree(
+        main.to_str().unwrap().to_string(),
+        deleted.trash_path.clone(),
+    )
+    .unwrap();
 
     assert!(wt.exists(), "工作树该回来了");
     assert_eq!(
@@ -225,7 +264,10 @@ fn a_restored_worktree_still_works() {
     cmd::restore_worktree(main.to_str().unwrap().to_string(), deleted.trash_path).unwrap();
 
     run_git(&main, &["-C", wt.to_str().unwrap(), "add", "work.txt"]);
-    run_git(&main, &["-C", wt.to_str().unwrap(), "commit", "-m", "restored"]);
+    run_git(
+        &main,
+        &["-C", wt.to_str().unwrap(), "commit", "-m", "restored"],
+    );
     assert!(
         git_out(&main, &["log", "--oneline", "-1", "feature"]).contains("restored"),
         "主仓库该看得到这个提交"
@@ -242,9 +284,11 @@ fn undo_refuses_to_overwrite_whatever_took_the_place() {
     fs::create_dir_all(&wt).unwrap();
     fs::write(wt.join("someone-elses.txt"), "别覆盖我").unwrap();
 
-    let err =
-        cmd::restore_worktree(main.to_str().unwrap().to_string(), deleted.trash_path.clone())
-            .expect_err("原位置被占，该拒绝");
+    let err = cmd::restore_worktree(
+        main.to_str().unwrap().to_string(),
+        deleted.trash_path.clone(),
+    )
+    .expect_err("原位置被占，该拒绝");
 
     assert_eq!(err.code, "worktree_occupied");
     assert_eq!(
@@ -252,7 +296,9 @@ fn undo_refuses_to_overwrite_whatever_took_the_place() {
         "别覆盖我"
     );
     // 回收站里的东西还在，可以换个办法救
-    assert!(std::path::Path::new(&deleted.trash_path).join("worktree").exists());
+    assert!(std::path::Path::new(&deleted.trash_path)
+        .join("worktree")
+        .exists());
 }
 
 /// 撤销只认本仓库回收站底下的路径，不能被指使去搬别处的目录。
@@ -281,7 +327,10 @@ fn the_trash_keeps_only_the_most_recent_entries() {
     for i in 1..8 {
         let name = format!("w{i}");
         let path = main.join(".worktrees").join(&name);
-        run_git(&main, &["worktree", "add", path.to_str().unwrap(), "-b", &name]);
+        run_git(
+            &main,
+            &["worktree", "add", path.to_str().unwrap(), "-b", &name],
+        );
         delete(&main, &path, false);
     }
 
@@ -299,7 +348,10 @@ fn commits_made_in_the_worktree_survive_its_deletion() {
     let main = main_of(&wt);
     fs::write(wt.join("work.txt"), "在 worktree 里做的活").unwrap();
     run_git(&main, &["-C", wt.to_str().unwrap(), "add", "work.txt"]);
-    run_git(&main, &["-C", wt.to_str().unwrap(), "commit", "-m", "wt commit"]);
+    run_git(
+        &main,
+        &["-C", wt.to_str().unwrap(), "commit", "-m", "wt commit"],
+    );
 
     delete(&main, &wt, false);
 
@@ -344,14 +396,21 @@ fn deleting_never_touches_what_a_junction_points_at() {
 
     let outside = dir.path().join("outside");
     fs::create_dir_all(&outside).unwrap();
-    fs::write(outside.join("important.txt"), "仓库外的数据，跟进删就是事故").unwrap();
+    fs::write(
+        outside.join("important.txt"),
+        "仓库外的数据，跟进删就是事故",
+    )
+    .unwrap();
 
     let nm = wt.join("nm");
     fs::create_dir_all(&nm).unwrap();
     junction(&nm.join("external"), &outside);
     fs::write(wt.join(".gitignore"), "nm/\n").unwrap();
     run_git(&main, &["-C", wt.to_str().unwrap(), "add", ".gitignore"]);
-    run_git(&main, &["-C", wt.to_str().unwrap(), "commit", "-m", "ignore nm"]);
+    run_git(
+        &main,
+        &["-C", wt.to_str().unwrap(), "commit", "-m", "ignore nm"],
+    );
 
     delete(&main, &wt, false);
 
@@ -376,14 +435,22 @@ fn a_pnpm_style_worktree_moves_in_one_piece() {
     junction(&nm.join("zlib"), &store);
     fs::write(wt.join(".gitignore"), "nm/\n").unwrap();
     run_git(&main, &["-C", wt.to_str().unwrap(), "add", ".gitignore"]);
-    run_git(&main, &["-C", wt.to_str().unwrap(), "commit", "-m", "ignore nm"]);
+    run_git(
+        &main,
+        &["-C", wt.to_str().unwrap(), "commit", "-m", "ignore nm"],
+    );
 
     let deleted = delete(&main, &wt, false);
 
     assert!(!wt.exists(), "原位置该空出来");
     let moved = std::path::Path::new(&deleted.trash_path).join("worktree");
     assert!(
-        moved.join("nm").join(".store").join("pkg").join("index.js").exists(),
+        moved
+            .join("nm")
+            .join(".store")
+            .join("pkg")
+            .join("index.js")
+            .exists(),
         "整棵树该原样搬过去"
     );
 }
@@ -437,10 +504,18 @@ fn create_puts_the_worktree_under_dot_worktrees() {
     let (_dir, wt) = repo_with_worktree("first");
     let main = main_of(&wt);
 
-    cmd::create_worktree(main.to_str().unwrap().to_string(), "second".to_string(), None).unwrap();
+    cmd::create_worktree(
+        main.to_str().unwrap().to_string(),
+        "second".to_string(),
+        None,
+    )
+    .unwrap();
 
     let created = main.join(".worktrees").join("second");
-    assert!(created.exists(), "应该建在 .worktrees 下面，实际没有：{created:?}");
+    assert!(
+        created.exists(),
+        "应该建在 .worktrees 下面，实际没有：{created:?}"
+    );
     assert!(created.join("a.txt").exists(), "worktree 里应该有仓库内容");
 }
 
@@ -450,8 +525,12 @@ fn create_surfaces_the_real_git_error() {
     let main = main_of(&wt);
 
     // 同名再建一次，git 会说分支已被占用
-    let err = cmd::create_worktree(main.to_str().unwrap().to_string(), "feature".to_string(), None)
-        .expect_err("重名的 worktree 应该失败");
+    let err = cmd::create_worktree(
+        main.to_str().unwrap().to_string(),
+        "feature".to_string(),
+        None,
+    )
+    .expect_err("重名的 worktree 应该失败");
     assert_eq!(err.code, "git_cli");
     assert!(!err.message.is_empty());
     assert!(

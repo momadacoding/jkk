@@ -4,7 +4,11 @@ use std::process::Command;
 use tempfile::TempDir;
 
 fn run_git(dir: &std::path::Path, args: &[&str]) {
-    let status = Command::new("git").current_dir(dir).args(args).status().expect("git not found");
+    let status = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .status()
+        .expect("git not found");
     assert!(status.success(), "git {args:?} failed");
 }
 

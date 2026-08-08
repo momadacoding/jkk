@@ -8,7 +8,11 @@ use std::collections::HashSet;
 /// 那正是「HEAD 里什么都没有」，不是错误。
 fn path_set(path: &str, args: &[&str]) -> HashSet<String> {
     match run_git(path, args) {
-        Ok(out) => out.split('\0').filter(|s| !s.is_empty()).map(str::to_string).collect(),
+        Ok(out) => out
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
         Err(_) => HashSet::new(),
     }
 }
@@ -107,10 +111,7 @@ pub fn delete_branch(path: String, name: String) -> Result<()> {
 
 /// 删除分支前的确认框要显示的信息：对应的远程分支、还有多少提交没合并进来。
 #[tauri::command]
-pub fn branch_delete_info(
-    path: String,
-    name: String,
-) -> Result<crate::engine::branch::DeleteInfo> {
+pub fn branch_delete_info(path: String, name: String) -> Result<crate::engine::branch::DeleteInfo> {
     crate::engine::branch::delete_info(&path, &name)
 }
 
@@ -143,7 +144,10 @@ pub fn checkout_remote_branch(path: String, remote_branch: String) -> Result<Str
     if exists {
         run_git(&path, &["checkout", &local])?;
     } else {
-        run_git(&path, &["checkout", "-b", &local, "--track", &remote_branch])?;
+        run_git(
+            &path,
+            &["checkout", "-b", &local, "--track", &remote_branch],
+        )?;
     }
     Ok(local)
 }
@@ -157,6 +161,43 @@ pub fn rename_branch(path: String, old: String, new: String) -> Result<()> {
 #[tauri::command]
 pub fn checkout(path: String, rev: String) -> Result<()> {
     run_git(&path, &["checkout", &rev])?;
+    Ok(())
+}
+
+/// 在某条提交上打一个轻量 tag。
+#[tauri::command]
+pub fn create_tag(path: String, name: String, rev: String) -> Result<()> {
+    // 不带 -f：同名 tag 已存在时让 git 报错，静默改写一个 tag 的指向
+    // 是能把别人已经拉走的引用悄悄挪位置的操作
+    run_git(&path, &["tag", &name, &rev])?;
+    Ok(())
+}
+
+/// 把一条提交摘到当前分支上。
+#[tauri::command]
+pub fn cherry_pick(path: String, rev: String) -> Result<()> {
+    run_git(&path, &["cherry-pick", &rev])?;
+    Ok(())
+}
+
+/// 生成一条撤销指定提交的新提交。
+#[tauri::command]
+pub fn revert(path: String, rev: String) -> Result<()> {
+    // --no-edit：GUI 里没有终端，不加这个 git 会拉起编辑器等一个永远不会来的输入
+    run_git(&path, &["revert", "--no-edit", &rev])?;
+    Ok(())
+}
+
+/// 把一条提交导出成 `git am` 能回放的 .patch 文件。
+///
+/// 用 `format-patch --stdout` 自己写文件，而不是让 git 往目录里生成：
+/// git 会按提交说明自动编号命名，用户在存盘框里选的文件名就白选了。
+#[tauri::command]
+pub fn save_patch(path: String, rev: String, out: String) -> Result<()> {
+    // -1 限定只导出这一条，不带上它的祖先
+    let patch =
+        crate::engine::git_cli::run_git_bytes(&path, &["format-patch", "-1", "--stdout", &rev])?;
+    std::fs::write(&out, patch)?;
     Ok(())
 }
 

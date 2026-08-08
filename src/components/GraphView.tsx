@@ -5,6 +5,8 @@ import { computePaths, filterPathsToBand, laneColor } from '../engine/paths'
 import { createSvgRenderer } from '../engine/svgRenderer'
 import { WORKDIR_ID, withWorkdirRow } from '../engine/workdir'
 import { CommitRow } from './CommitRow'
+import { ContextMenu, useContextMenu } from './ContextMenu'
+import { commitMenu, type CommitAction } from '../engine/commitActions'
 
 const ROW_HEIGHT = 28
 const LANE_WIDTH = 20
@@ -21,14 +23,17 @@ interface GraphViewProps {
   changeCount: number
   /** 点击工作区伪行时切到 Local Changes 视图。 */
   onOpenChanges: () => void
+  /** 右键菜单选中某一项。确认框、输入框和实际调用都由上层处理。 */
+  onCommitAction: (action: CommitAction, commit: CommitNode) => void
 }
 
 const renderer = createSvgRenderer()
 
 export function GraphView({
-  commits, refs, selectedId, onSelect, headHash, changeCount, onOpenChanges,
+  commits, refs, selectedId, onSelect, headHash, changeCount, onOpenChanges, onCommitAction,
 }: GraphViewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
+  const { menu, open, close } = useContextMenu()
   const [scrollTop, setScrollTop] = useState(0)
   const [viewportHeight, setViewportHeight] = useState(600)
 
@@ -126,6 +131,22 @@ export function GraphView({
     else onSelect(id)
   }, [onSelect, onOpenChanges])
 
+  const handleContextMenu = useCallback((e: React.MouseEvent) => {
+    const target = e.target as HTMLElement
+    const id = target.closest('[data-id]')?.getAttribute('data-id')
+    // 工作区伪行不是提交，这些操作对它一个都不成立
+    if (!id || id === WORKDIR_ID) return
+    const commit = commits.find((c) => c.id === id)
+    if (!commit) return
+    // 右键先把这一行选上，菜单里的「哪一条」和 diff 面板显示的才是同一条
+    onSelect(id)
+    open(e, commitMenu(commit, { isHead: id === headHash }).map((entry) => ({
+      label: entry.label,
+      disabled: entry.disabled,
+      onSelect: () => onCommitAction(entry.action, commit),
+    })))
+  }, [commits, headHash, onSelect, onCommitAction, open])
+
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (!selectedId) return
@@ -155,6 +176,7 @@ export function GraphView({
       className="graph-view"
       onScroll={handleScroll}
       onClick={handleClick}
+      onContextMenu={handleContextMenu}
       style={{ overflow: 'auto', height: '100%' }}
     >
       <div style={{ position: 'relative', height: totalHeight, minWidth: layoutWidth + 300 }}>
@@ -176,6 +198,7 @@ export function GraphView({
           ))}
         </div>
       </div>
+      <ContextMenu menu={menu} onClose={close} />
     </div>
   )
 }

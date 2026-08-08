@@ -1,6 +1,6 @@
-use std::process::Command;
 use crate::error::{GitError, Result};
 use serde::Serialize;
+use std::process::Command;
 
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
