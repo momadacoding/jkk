@@ -283,14 +283,35 @@ body {
   gap: 4px;
 }
 
-/* 作者与时间靠右，标签留在消息旁边 */
+/* 元信息整体靠右，标签留在消息旁边；内部再分成定宽的三列 */
 .commit-meta {
   margin-left: auto;
   flex-shrink: 0;
+  display: flex;
+  gap: 12px;
   padding-right: 8px;
   color: #888;
   font-size: 11px;
   white-space: nowrap;
+}
+
+/* 三列都左对齐并定宽。作者名长短不一，靠右排的话 hash 列每行起点都在动 */
+.commit-author {
+  width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* hash 用等宽字体：这一列是要竖着扫、逐字符比对的，
+   比例字体下 0/O、1/l 的宽度不一，扫起来会串行 */
+.commit-hash {
+  width: 60px;
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  color: #9a9a9a;
+}
+
+.commit-date {
+  width: 140px;
 }
 
 /* 分支名不用等宽字体——10px 的 monospace 字形窄、辨识度差，
