@@ -78,6 +78,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-log",
  "tempfile",
+ "windows",
 ]
 
 [[package]]

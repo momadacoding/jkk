@@ -96,6 +96,13 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
   const [viewMode, setViewMode] = useState<ViewMode>('commits')
   const [selectedBranch, setSelectedBranch] = useState<string | null>(null)
   const [selectedWorktree, setSelectedWorktree] = useState<string | null>(null)
+  /**
+   * 刚删掉的 worktree，用来显示撤销提示条。
+   *
+   * 删除只是把目录搬进仓库内的回收站，所以撤销是真能撤的。提示条不自动消失：
+   * 用户可能正盯着别处，几秒钟就撤不了的「撤销」等于没有。
+   */
+  const [undoDelete, setUndoDelete] = useState<{ name: string; trashPath: string } | null>(null)
   const { prompt, dialog: promptDialog } = usePrompt()
   const { confirm, dialog: confirmDialog } = useConfirm()
 
@@ -309,7 +316,9 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
     if (!path) return
     const { remote, worktreePath } = targets
     if (worktreePath) {
-      await invoke('delete_worktree', { path, worktreePath })
+      // 不带 force：worktree 里有未提交的东西时要拦下来，这层保护和从侧边栏
+      // 删是一致的。错误会抛给确认框显示
+      await invoke('delete_worktree', { path, worktreePath, force: false })
     }
     if (remote) {
       await invoke('delete_remote_branch', { path, remote: remote.remote, branch: remote.branch })
@@ -320,6 +329,38 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
     // 删掉的 worktree 还挂在侧边栏上，得把那一栏也刷掉
     if (worktreePath) await refreshWorktrees(path)
   }, [state.path, refreshGraph, refreshUpstream, refreshWorktrees])
+
+  /**
+   * 删除一个 worktree。确认在 `DeleteWorktreeDialog` 里做过了。
+   *
+   * **失败不在这里吞掉，抛给确认框**：它会留在原地显示错误，并把「有未提交
+   * 改动」那种失败升级成「仍要删除」。丢进顶部横幅的话框已经关了，用户还得
+   * 重新走一遍才能确认。
+   */
+  const handleDeleteWorktree = useCallback(async (worktreePath: string, force: boolean) => {
+    const path = state.path
+    if (!path) return
+    const deleted = await invoke<{ name: string; trashPath: string }>('delete_worktree', {
+      path,
+      worktreePath,
+      force,
+    })
+    await refreshWorktrees(path)
+    setUndoDelete(deleted)
+  }, [state.path, refreshWorktrees])
+
+  /** 撤销刚才那次删除，把目录和登记从回收站搬回原位。 */
+  const handleUndoDelete = useCallback(async () => {
+    const path = state.path
+    if (!path || !undoDelete) return
+    try {
+      await invoke('restore_worktree', { path, trashPath: undoDelete.trashPath })
+      await refreshWorktrees(path)
+      setUndoDelete(null)
+    } catch (err) {
+      reportError(err)
+    }
+  }, [state.path, undoDelete, refreshWorktrees, reportError])
 
   /**
    * 检出一个远程分支。后端会建一条跟踪它的本地分支——直接检出远程引用会进
@@ -404,6 +445,15 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
           <button onClick={clearError}>×</button>
         </div>
       )}
+      {undoDelete && (
+        <div className="banner-undo">
+          <span>已删除 worktree「{undoDelete.name}」，目录还在仓库的回收站里。</span>
+          <span className="banner-undo-actions">
+            <button className="link" onClick={() => void handleUndoDelete()}>撤销</button>
+            <button onClick={() => setUndoDelete(null)}>×</button>
+          </span>
+        </div>
+      )}
       <Toolbar branch={state.head} upstream={state.upstream} onRun={runToolbar} />
       <div className="repo-path-bar" title={state.path ?? ''}>{state.path} @ {state.head}</div>
       <div style={{ flex: 1, overflow: 'hidden' }}>
@@ -448,7 +498,7 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
                   state.worktrees.find((w) => w.name === selectedWorktree)?.path ?? null
                 }
                 onCreate={(name) => runAndRefresh('create_worktree', { name }, async () => await refreshWorktrees(state.path!))}
-                onDelete={(wtPath) => runAndRefresh('delete_worktree', { worktreePath: wtPath }, async () => await refreshWorktrees(state.path!))}
+                onDelete={handleDeleteWorktree}
               />
               <StashView
                 stashes={state.stashes}

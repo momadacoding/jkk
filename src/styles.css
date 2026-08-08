@@ -188,6 +188,35 @@ body {
   justify-content: space-between;
 }
 
+/* 删完 worktree 的撤销条。用中性色而不是报错的红：这是一次成功的操作，
+   只是还能反悔。它不自动消失——几秒钟就撤不了的「撤销」等于没有 */
+.banner-undo {
+  padding: 8px;
+  background: #2d3a45;
+  color: #d6dde3;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.banner-undo-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.banner-undo button.link {
+  background: none;
+  border: none;
+  color: #7ab8f5;
+  text-decoration: underline;
+  cursor: pointer;
+  padding: 2px 6px;
+  font-size: inherit;
+}
+
 .context-menu {
   position: fixed;
   z-index: 1000;
@@ -640,6 +669,16 @@ body {
    读起来才像是那一行的注解而不是另起的一段 */
 .dlg-note.under-check {
   margin-left: 76px;
+}
+
+/* worktree 的完整路径。删之前得让人看清到底删的是哪个目录，
+   路径长得能横穿整个窗口，必须允许在任意位置断行 */
+.dlg-path {
+  margin-left: 54px;
+  color: #7e848a;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
 }
 
 /* 进度条：删远程要走一次网络往返（实测到 GitHub 四五秒），

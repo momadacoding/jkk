@@ -12,6 +12,15 @@ fn run_git(dir: &std::path::Path, args: &[&str]) {
     assert!(status.success(), "git {args:?} failed");
 }
 
+fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
 /// 主仓库 + 一个位于 `<主仓库>/.worktrees/<name>` 的 worktree，
 /// 复刻用户实际的目录布局。
 fn repo_with_worktree(name: &str) -> (TempDir, std::path::PathBuf) {
@@ -37,82 +46,317 @@ fn main_of(wt: &std::path::Path) -> std::path::PathBuf {
     wt.parent().unwrap().parent().unwrap().to_path_buf()
 }
 
-#[test]
-fn delete_removes_a_clean_worktree() {
-    let (_dir, wt) = repo_with_worktree("feature");
-    let main = main_of(&wt);
-
+fn delete(main: &std::path::Path, wt: &std::path::Path, force: bool) -> cmd::DeletedWorktree {
     cmd::delete_worktree(
         main.to_str().unwrap().to_string(),
         wt.to_str().unwrap().to_string(),
+        force,
+    )
+    .expect("删除应当成功")
+}
+
+fn try_delete(
+    main: &std::path::Path,
+    wt: &std::path::Path,
+    force: bool,
+) -> app_lib::error::GitError {
+    cmd::delete_worktree(
+        main.to_str().unwrap().to_string(),
+        wt.to_str().unwrap().to_string(),
+        force,
+    )
+    .expect_err("这一步应当被拒绝")
+}
+
+#[test]
+fn delete_moves_a_clean_worktree_out_of_the_way() {
+    let (_dir, wt) = repo_with_worktree("feature");
+    let main = main_of(&wt);
+
+    let deleted = delete(&main, &wt, false);
+
+    assert!(!wt.exists(), "原位置该空出来");
+    assert!(
+        !git_out(&main, &["worktree", "list"]).contains("feature"),
+        "登记该没了"
+    );
+    // 东西进了回收站，不是被抹掉
+    let slot = std::path::Path::new(&deleted.trash_path);
+    assert!(
+        slot.join("worktree").join("a.txt").exists(),
+        "文件该在回收站里"
+    );
+    assert!(slot.join("admin").exists(), "管理目录也该一起进回收站");
+}
+
+/// 删掉之后同名分支要能立刻重新建 worktree。
+///
+/// 这一条排除的是「只搬工作树、把登记留成 prunable」那种做法：那样 git 会说
+/// `'feature' is already used by worktree at ...`，用户删了马上重建就撞墙。
+#[test]
+fn the_branch_can_be_checked_out_again_right_after_deletion() {
+    let (_dir, wt) = repo_with_worktree("feature");
+    let main = main_of(&wt);
+
+    delete(&main, &wt, false);
+
+    let again = main.join(".worktrees").join("again");
+    run_git(
+        &main,
+        &["worktree", "add", again.to_str().unwrap(), "feature"],
+    );
+    assert!(again.join("a.txt").exists());
+}
+
+/// 脏的 worktree 默认拦下来，而且**什么都不动**。
+#[test]
+fn a_dirty_worktree_is_refused_and_left_untouched() {
+    let (_dir, wt) = repo_with_worktree("feature");
+    let main = main_of(&wt);
+    fs::write(wt.join("scratch.txt"), "untracked").unwrap();
+
+    let err = try_delete(&main, &wt, false);
+
+    assert_eq!(err.code, "worktree_dirty");
+    // 干净的拒绝：目录、内容、登记全都原样
+    assert!(wt.join("a.txt").exists());
+    assert_eq!(
+        fs::read_to_string(wt.join("scratch.txt")).unwrap(),
+        "untracked"
+    );
+    assert!(
+        git_out(&main, &["worktree", "list"]).contains("feature"),
+        "登记不该被解除"
+    );
+    // 也不该留下空的回收站槽位
+    let trash = main.join(".worktrees").join(".trash");
+    assert!(
+        !trash.exists() || fs::read_dir(&trash).unwrap().count() == 0,
+        "被拒绝的删除不该在回收站里留垃圾"
+    );
+}
+
+/// 用户确认之后（force）脏的也能删，而且未提交的东西完整躺在回收站里。
+#[test]
+fn force_deletes_a_dirty_worktree_but_keeps_the_work_in_the_trash() {
+    let (_dir, wt) = repo_with_worktree("feature");
+    let main = main_of(&wt);
+    fs::write(wt.join("scratch.txt"), "别弄丢我").unwrap();
+
+    let deleted = delete(&main, &wt, true);
+
+    assert!(!wt.exists());
+    let saved = std::path::Path::new(&deleted.trash_path)
+        .join("worktree")
+        .join("scratch.txt");
+    assert_eq!(
+        fs::read_to_string(&saved).unwrap(),
+        "别弄丢我",
+        "未提交的东西必须原样留在回收站里"
+    );
+}
+
+/// 被 `git worktree lock` 锁住的一律拒绝，force 也不放行。
+///
+/// 锁的判据在登记里而不在目录里。要是不预检就先搬目录，git 照样会因为锁拒绝，
+/// 那时候目录已经进回收站了——这个测试钉住的就是「预检必须排在搬移前面」。
+#[test]
+fn a_locked_worktree_is_refused_even_with_force() {
+    let (_dir, wt) = repo_with_worktree("feature");
+    let main = main_of(&wt);
+    run_git(
+        &main,
+        &[
+            "worktree",
+            "lock",
+            wt.to_str().unwrap(),
+            "--reason",
+            "别删我",
+        ],
+    );
+
+    for force in [false, true] {
+        let err = try_delete(&main, &wt, force);
+        assert_eq!(err.code, "worktree_locked", "force={force}");
+        assert!(
+            err.message.contains("别删我"),
+            "该带上锁的理由：{}",
+            err.message
+        );
+        assert!(wt.exists(), "force={force} 时目录被动了");
+    }
+}
+
+/// 主工作区一票否决——这一条破了就是把整个仓库的 `.git` 搬进回收站。
+///
+/// 原先这道保护是 git 给的（`fatal: '.' is a main working tree`）。改成由我们搬移
+/// 之后 git 不再参与，保护必须自己补上。界面上禁着按钮不算数：那拦不住直接调命令。
+#[test]
+fn the_main_worktree_can_never_be_deleted() {
+    let (_dir, wt) = repo_with_worktree("feature");
+    let main = main_of(&wt);
+
+    for force in [false, true] {
+        let err = try_delete(&main, &main, force);
+        assert_eq!(err.code, "worktree_is_main", "force={force}");
+    }
+
+    // 仓库还是完好的
+    assert!(main.join(".git").exists(), "仓库的 .git 被动了");
+    assert!(main.join("a.txt").exists());
+    assert!(
+        git_out(&main, &["worktree", "list"]).contains("feature"),
+        "别的 worktree 也不该受影响"
+    );
+    let trash = main.join(".worktrees").join(".trash");
+    assert!(
+        !trash.exists() || fs::read_dir(&trash).unwrap().count() == 0,
+        "不该在回收站里留下任何东西"
+    );
+}
+
+/// 撤销要把状态**原样**还回去，包括暂存区。
+///
+/// index 存在管理目录 `.git/worktrees/<name>/index` 里，不在工作树目录内。只搬
+/// 工作树的话 `A s.txt`（已暂存）会退化成 `?? s.txt`，实测过。这个测试钉住的是
+/// 「工作树和管理目录必须成对搬移」。
+#[test]
+fn undo_restores_the_exact_state_including_the_index() {
+    let (_dir, wt) = repo_with_worktree("feature");
+    let main = main_of(&wt);
+    fs::write(wt.join("a.txt"), "MODIFIED").unwrap();
+    fs::write(wt.join("new.txt"), "untracked").unwrap();
+    fs::write(wt.join("s.txt"), "staged").unwrap();
+    run_git(&main, &["-C", wt.to_str().unwrap(), "add", "s.txt"]);
+    let before = git_out(&wt, &["status", "--porcelain"]);
+    assert!(before.contains("A  s.txt"), "前提没造对：{before}");
+
+    let deleted = delete(&main, &wt, true);
+    cmd::restore_worktree(
+        main.to_str().unwrap().to_string(),
+        deleted.trash_path.clone(),
     )
     .unwrap();
 
-    assert!(!wt.exists(), "worktree directory should be gone");
-    let out = Command::new("git")
-        .current_dir(&main)
-        .args(["worktree", "list"])
-        .output()
-        .unwrap();
-    let listing = String::from_utf8_lossy(&out.stdout);
-    assert!(!listing.contains("feature"), "still listed: {listing}");
+    assert!(wt.exists(), "工作树该回来了");
+    assert_eq!(
+        git_out(&wt, &["status", "--porcelain"]),
+        before,
+        "撤销之后的状态该和删除前逐字一致"
+    );
+    assert_eq!(fs::read_to_string(wt.join("a.txt")).unwrap(), "MODIFIED");
+    assert!(
+        git_out(&main, &["worktree", "list"]).contains("feature"),
+        "登记该回来了"
+    );
+    // 槽位清空，不留垃圾
+    assert!(!std::path::Path::new(&deleted.trash_path).exists());
 }
 
+/// 撤销回来的 worktree 要能正常干活，不只是文件躺在那。
 #[test]
-fn delete_surfaces_the_real_git_error() {
-    // 界面只显示我们返回的 message。自造一句 "worktree remove failed" 等于把
-    // git 唯一说清楚原因的那句话扔了——用户只能靠猜。
+fn a_restored_worktree_still_works() {
     let (_dir, wt) = repo_with_worktree("feature");
     let main = main_of(&wt);
-    fs::write(wt.join("scratch.txt"), "untracked").unwrap();
+    fs::write(wt.join("work.txt"), "活").unwrap();
 
-    let err = cmd::delete_worktree(
-        main.to_str().unwrap().to_string(),
-        wt.to_str().unwrap().to_string(),
-    )
-    .expect_err("git 会拒绝删除有未跟踪文件的 worktree");
+    let deleted = delete(&main, &wt, true);
+    cmd::restore_worktree(main.to_str().unwrap().to_string(), deleted.trash_path).unwrap();
 
-    assert_eq!(err.code, "git_cli");
-    assert!(
-        err.message.contains("contains modified or untracked files"),
-        "拿到的是 git 的原文吗？实际是：{}",
-        err.message,
+    run_git(&main, &["-C", wt.to_str().unwrap(), "add", "work.txt"]);
+    run_git(
+        &main,
+        &["-C", wt.to_str().unwrap(), "commit", "-m", "restored"],
     );
-    // 干净的拒绝：什么都不该被删
-    assert!(wt.join("a.txt").exists());
-    // 这是「什么都没动」的失败，别把它说成孤儿目录吓唬人
-    assert_ne!(err.code, "worktree_partial");
-    assert!(!err.message.contains("手工删除"), "{}", err.message);
+    assert!(
+        git_out(&main, &["log", "--oneline", "-1", "feature"]).contains("restored"),
+        "主仓库该看得到这个提交"
+    );
 }
 
-/// 登记还在的失败不该被改写。
-///
-/// `git worktree remove` 分两步：先解除登记、再删目录。第一步就被拒（有未提交
-/// 改动）和第二步栽了（目录没删干净、登记已经没了）是两种完全不同的处境，前者
-/// 原地重试就行，后者留下的目录已经不受 git 管了。混为一谈的话，要么白白吓唬
-/// 用户，要么让人看不出目录已经成了孤儿。
+/// 原位置被占了就不许撤销——覆盖过去等于把别人的东西删了。
 #[test]
-fn a_failure_before_unregistering_keeps_the_worktree_usable() {
+fn undo_refuses_to_overwrite_whatever_took_the_place() {
     let (_dir, wt) = repo_with_worktree("feature");
     let main = main_of(&wt);
-    fs::write(wt.join("scratch.txt"), "untracked").unwrap();
 
-    cmd::delete_worktree(
+    let deleted = delete(&main, &wt, false);
+    fs::create_dir_all(&wt).unwrap();
+    fs::write(wt.join("someone-elses.txt"), "别覆盖我").unwrap();
+
+    let err = cmd::restore_worktree(
         main.to_str().unwrap().to_string(),
-        wt.to_str().unwrap().to_string(),
+        deleted.trash_path.clone(),
     )
-    .expect_err("有未跟踪文件时会被拒");
+    .expect_err("原位置被占，该拒绝");
 
-    // 登记还在，worktree 还能正常用
-    let out = Command::new("git")
-        .current_dir(&main)
-        .args(["worktree", "list"])
-        .output()
-        .unwrap();
-    assert!(
-        String::from_utf8_lossy(&out.stdout).contains("feature"),
-        "登记不该消失"
+    assert_eq!(err.code, "worktree_occupied");
+    assert_eq!(
+        fs::read_to_string(wt.join("someone-elses.txt")).unwrap(),
+        "别覆盖我"
     );
+    // 回收站里的东西还在，可以换个办法救
+    assert!(std::path::Path::new(&deleted.trash_path)
+        .join("worktree")
+        .exists());
+}
+
+/// 撤销只认本仓库回收站底下的路径，不能被指使去搬别处的目录。
+#[test]
+fn undo_only_accepts_paths_inside_this_repos_trash() {
+    let (dir, wt) = repo_with_worktree("feature");
+    let main = main_of(&wt);
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+
+    let err = cmd::restore_worktree(
+        main.to_str().unwrap().to_string(),
+        outside.to_str().unwrap().to_string(),
+    )
+    .expect_err("仓库外的路径该被拒绝");
+
+    assert_eq!(err.code, "trash_foreign");
+}
+
+/// 回收站只留固定个数，旧的自动清掉，否则装了 node_modules 的工作树会把盘吃光。
+#[test]
+fn the_trash_keeps_only_the_most_recent_entries() {
+    let (_dir, wt) = repo_with_worktree("w0");
+    let main = main_of(&wt);
+    delete(&main, &wt, false);
+    for i in 1..8 {
+        let name = format!("w{i}");
+        let path = main.join(".worktrees").join(&name);
+        run_git(
+            &main,
+            &["worktree", "add", path.to_str().unwrap(), "-b", &name],
+        );
+        delete(&main, &path, false);
+    }
+
+    let trash = main.join(".worktrees").join(".trash");
+    let kept = fs::read_dir(&trash).unwrap().count();
+    assert!(kept <= 5, "回收站该只留最近 5 个，实际留了 {kept} 个");
+    assert!(kept > 0, "不该清空");
+}
+
+/// 删掉 worktree 不会动里面做的提交——提交对象在共享的对象库里，
+/// 分支引用也在共享的 refs 里，worktree 目录只是一份检出。
+#[test]
+fn commits_made_in_the_worktree_survive_its_deletion() {
+    let (_dir, wt) = repo_with_worktree("hasWork");
+    let main = main_of(&wt);
+    fs::write(wt.join("work.txt"), "在 worktree 里做的活").unwrap();
+    run_git(&main, &["-C", wt.to_str().unwrap(), "add", "work.txt"]);
+    run_git(
+        &main,
+        &["-C", wt.to_str().unwrap(), "commit", "-m", "wt commit"],
+    );
+
+    delete(&main, &wt, false);
+
+    let out = git_out(&main, &["show", "hasWork:work.txt"]);
+    assert_eq!(out.trim(), "在 worktree 里做的活", "分支上的提交该还在");
 }
 
 /// 造一个 junction（Windows 上 pnpm 就是用它连 node_modules 的）。
@@ -137,140 +381,89 @@ fn junction(link: &std::path::Path, target: &std::path::Path) {
     );
 }
 
-/// 复刻 pnpm 的结构：目标目录带个点，排序在指向它的链接前面。
+/// **删除绝不能跟进 junction 去动链接指向的地方。**
 ///
-/// git 递归删除时会先删掉目标，等走到 junction 时目标已经不在，它处理不了这种
-/// 死链接就整个放弃（`remove_dir_recurse` 遇到第一个失败就 break）。加 `--force`
-/// 也一样——那只跳过「工作区是否干净」的检查，删除路径完全相同。
+/// 这是整个改造最重要的安全收益。原先走 `git worktree remove`，而 git **会**跟进
+/// junction 把目标里的东西删掉（改造前单独验证过）；worktree 里只要有一个指向仓库外
+/// 的链接，删 worktree 就会连累外面的数据。
+///
+/// 改成搬移之后 git 不再碰任何文件，rename 只动目录项本身，这条通道就断了。
 #[cfg(windows)]
-fn worktree_with_pnpm_style_links(name: &str) -> (TempDir, std::path::PathBuf) {
-    let (dir, wt) = repo_with_worktree(name);
-    let nm = wt.join("nm");
-    let store = nm.join(".store").join("pkg");
-    fs::create_dir_all(&store).unwrap();
-    fs::write(store.join("index.js"), "1").unwrap();
-    junction(&nm.join("zlib"), &store);
-    // 不加 .gitignore 的话 git 会因为「有未跟踪文件」在解除登记之前就拒绝，
-    // 那就走不到我们要测的那一步了
-    fs::write(wt.join(".gitignore"), "nm/\n").unwrap();
+#[test]
+fn deleting_never_touches_what_a_junction_points_at() {
+    let (dir, wt) = repo_with_worktree("linky");
     let main = main_of(&wt);
+
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(
+        outside.join("important.txt"),
+        "仓库外的数据，跟进删就是事故",
+    )
+    .unwrap();
+
+    let nm = wt.join("nm");
+    fs::create_dir_all(&nm).unwrap();
+    junction(&nm.join("external"), &outside);
+    fs::write(wt.join(".gitignore"), "nm/\n").unwrap();
     run_git(&main, &["-C", wt.to_str().unwrap(), "add", ".gitignore"]);
     run_git(
         &main,
         &["-C", wt.to_str().unwrap(), "commit", "-m", "ignore nm"],
     );
-    (dir, wt)
-}
 
-/// git 删到一半放弃时，我们接手把目录删完。
-#[cfg(windows)]
-#[test]
-fn cleans_up_after_git_gives_up_on_pnpm_junctions() {
-    let (_dir, wt) = worktree_with_pnpm_style_links("pnpmish");
-    let main = main_of(&wt);
+    delete(&main, &wt, false);
 
-    cmd::delete_worktree(
-        main.to_str().unwrap().to_string(),
-        wt.to_str().unwrap().to_string(),
-    )
-    .expect("git 会栽在死链接上，但我们该接手删完");
-
-    assert!(!wt.exists(), "目录应该被清干净，实际还在：{wt:?}");
-    let out = Command::new("git")
-        .current_dir(&main)
-        .args(["worktree", "list"])
-        .output()
-        .unwrap();
-    assert!(!String::from_utf8_lossy(&out.stdout).contains("pnpmish"));
-}
-
-/// 接手删除**永远碰不到未提交的东西**——这条是整个回退方案的安全前提。
-///
-/// 道理在于顺序：git 的「工作区是否干净」检查排在解除登记之前，而我们只在
-/// 「登记已经没了」时才接手。所以工作区一脏，git 在动任何东西之前就拒绝了，
-/// 回退代码根本没机会运行。
-///
-/// 这里把两个条件叠在一起测：既有必然让 git 删目录失败的死链接，工作区又是脏的。
-/// 要是哪天检查顺序变了、或者我们放宽了接手条件，这个测试会立刻炸。
-#[cfg(windows)]
-#[test]
-fn cleanup_never_runs_while_there_is_uncommitted_work() {
-    let (_dir, wt) = worktree_with_pnpm_style_links("dirtylink");
-    let main = main_of(&wt);
-    fs::write(wt.join("a.txt"), "脏数据，绝不能丢").unwrap();
-
-    cmd::delete_worktree(
-        main.to_str().unwrap().to_string(),
-        wt.to_str().unwrap().to_string(),
-    )
-    .expect_err("工作区是脏的，应当被拒绝");
-
-    assert!(wt.exists(), "worktree 不该被删");
-    assert_eq!(
-        fs::read_to_string(wt.join("a.txt")).unwrap(),
-        "脏数据，绝不能丢",
-        "未提交的改动被动过了"
-    );
-    let out = Command::new("git")
-        .current_dir(&main)
-        .args(["worktree", "list"])
-        .output()
-        .unwrap();
+    assert!(!wt.exists(), "worktree 该被搬走");
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("dirtylink"),
-        "登记不该被解除"
+        outside.join("important.txt").exists(),
+        "链接指向的外部数据被删掉了——这正是改造要消灭的事故"
     );
 }
 
-/// 删掉 worktree 不会动里面做的提交——提交对象在共享的对象库里，
-/// 分支引用也在共享的 refs 里，worktree 目录只是一份检出。
+/// pnpm 那种「目标带点、排序在链接前面」的布局，原先会让 git 递归删除栽在死链接上、
+/// 删一半放弃。改成搬移之后根本不存在「删一半」这个状态。
+#[cfg(windows)]
 #[test]
-fn commits_made_in_the_worktree_survive_its_deletion() {
-    let (_dir, wt) = repo_with_worktree("hasWork");
+fn a_pnpm_style_worktree_moves_in_one_piece() {
+    let (_dir, wt) = repo_with_worktree("pnpmish");
     let main = main_of(&wt);
-    fs::write(wt.join("work.txt"), "在 worktree 里做的活").unwrap();
-    run_git(&main, &["-C", wt.to_str().unwrap(), "add", "work.txt"]);
+    let nm = wt.join("nm");
+    let store = nm.join(".store").join("pkg");
+    fs::create_dir_all(&store).unwrap();
+    fs::write(store.join("index.js"), "1").unwrap();
+    junction(&nm.join("zlib"), &store);
+    fs::write(wt.join(".gitignore"), "nm/\n").unwrap();
+    run_git(&main, &["-C", wt.to_str().unwrap(), "add", ".gitignore"]);
     run_git(
         &main,
-        &["-C", wt.to_str().unwrap(), "commit", "-m", "wt commit"],
+        &["-C", wt.to_str().unwrap(), "commit", "-m", "ignore nm"],
     );
 
-    cmd::delete_worktree(
-        main.to_str().unwrap().to_string(),
-        wt.to_str().unwrap().to_string(),
-    )
-    .unwrap();
+    let deleted = delete(&main, &wt, false);
 
-    // 分支还在，内容还找得回来
-    let out = Command::new("git")
-        .current_dir(&main)
-        .args(["show", "hasWork:work.txt"])
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "分支上的提交该还在");
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout).trim(),
-        "在 worktree 里做的活"
+    assert!(!wt.exists(), "原位置该空出来");
+    let moved = std::path::Path::new(&deleted.trash_path).join("worktree");
+    assert!(
+        moved
+            .join("nm")
+            .join(".store")
+            .join("pkg")
+            .join("index.js")
+            .exists(),
+        "整棵树该原样搬过去"
     );
 }
 
-/// 接手删除依赖的那条不变量：**解链接，不跟进目标**。
+/// 回收站清理依赖的那条不变量：**解链接，不跟进目标**。
 ///
-/// node_modules 里几千个 junction，跟进去删等于把链接指向的东西一并抹掉——
-/// 这一条破了就是丢数据，不是体验问题。
+/// 槽位里存的是原样搬进来的工作树，node_modules 里几千个 junction，跟进去删等于
+/// 把链接指向的东西一并抹掉——这一条破了就是丢数据，不是体验问题。
 ///
-/// 这里直接测 `remove_dir_all` 本身，不经过 `delete_worktree`。原因是没法让 git
-/// 稳定地在碰到外部链接**之前**失败：它的目录枚举顺序不受我们控制，实测它会跳过
-/// 删不掉的死链接继续处理后面的条目。既然把安全性完全押在这个标准库函数上，就
-/// 直接把它钉住。
-///
-/// 顺带记一笔：**`git worktree remove` 会跟进 junction 把目标里的东西删掉**。
-/// 单独验过——一个指向外部目录的 junction，git 删完 worktree 之后外部目录里的
-/// 文件就没了。pnpm 的链接都指向 node_modules 内部所以害不到人，但这正是我们
-/// 接手时绝不能照抄 git 做法的理由。
+/// 直接测 `remove_dir_all` 本身：既然把安全性完全押在这个标准库函数上，就直接把它钉住。
 #[cfg(windows)]
 #[test]
-fn our_cleanup_unlinks_junctions_instead_of_following_them() {
+fn trash_pruning_unlinks_junctions_instead_of_following_them() {
     let dir = TempDir::new().unwrap();
 
     let outside = dir.path().join("outside");
@@ -293,7 +486,7 @@ fn our_cleanup_unlinks_junctions_instead_of_following_them() {
 /// 死链接（目标已经没了的 junction）也要能删掉——git 正是栽在这上面。
 #[cfg(windows)]
 #[test]
-fn our_cleanup_handles_dead_junctions() {
+fn trash_pruning_handles_dead_junctions() {
     let dir = TempDir::new().unwrap();
     let nm = dir.path().join("nm");
     let store = nm.join(".store").join("pkg");

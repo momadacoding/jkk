@@ -27,5 +27,14 @@ git2 = "0.20"
 notify = "7"
 tauri-plugin-dialog = "2.7.2"
 
+# 删 worktree 撞上「文件被占用」时，用 Restart Manager 查出到底是哪个进程占着。
+# 这个 crate 本来就在依赖树里（tao → tauri），这里只是显式声明并打开需要的
+# feature，不会新增下载。非 Windows 平台不引入。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_RestartManager",
+] }
+
 [dev-dependencies]
 tempfile = "3.14"
