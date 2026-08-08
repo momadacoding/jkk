@@ -12,8 +12,26 @@ import { StashView } from './StashView'
 import { useRepoStore, useRepoEffects } from '../store/repoStore'
 import { samePath } from '../engine/path'
 import { askConfirm } from '../engine/confirm'
+import { usePrompt } from './PromptDialog'
+import { useConfirm } from './ConfirmDialog'
+import { save } from '@tauri-apps/plugin-dialog'
+import type { CommitNode } from '../engine/types'
+import {
+  commitMenu,
+  formatCommitInfo,
+  planCommitCommand,
+  shortHash,
+  type CommitAction,
+} from '../engine/commitActions'
 
 type ViewMode = 'commits' | 'changes'
+
+/** 确认框上按钮的文字，照抄菜单项的动词，点下去做什么一目了然。 */
+const CONFIRM_LABELS: Partial<Record<CommitAction, string>> = {
+  checkout: 'Checkout',
+  'cherry-pick': 'Cherry Pick',
+  revert: 'Revert',
+}
 
 function LocalChangesIcon() {
   return (
@@ -78,6 +96,8 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
   const [viewMode, setViewMode] = useState<ViewMode>('commits')
   const [selectedBranch, setSelectedBranch] = useState<string | null>(null)
   const [selectedWorktree, setSelectedWorktree] = useState<string | null>(null)
+  const { prompt, dialog: promptDialog } = usePrompt()
+  const { confirm, dialog: confirmDialog } = useConfirm()
 
   useRepoEffects(
     state,
@@ -160,6 +180,77 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
       reportError(err)
     }
   }, [state.path, state.headHash, refreshHead, refreshGraph, refreshStatus, refreshUpstream, refreshStashes, reportError])
+
+  /**
+   * graph 行右键菜单的调度。
+   *
+   * 菜单长什么样由 `engine/commitActions` 决定，这里只负责补齐它拿不到的东西：
+   * 输入框、存盘框、确认框和真正的 invoke。会动工作区的三项（checkout /
+   * cherry-pick / revert）复用 `runToolbar` 的刷新语义——它们和 pull 一样会挪 HEAD。
+   */
+  const handleCommitAction = useCallback(async (action: CommitAction, commit: CommitNode) => {
+    const path = state.path
+    if (!path) return
+    const short = shortHash(commit.id)
+    try {
+      switch (action) {
+        case 'copy-hash':
+          // 复制完整 hash：短 hash 贴到别的仓库或以后可能不再唯一
+          await navigator.clipboard.writeText(commit.id)
+          return
+        case 'copy-info':
+          await navigator.clipboard.writeText(formatCommitInfo(commit))
+          return
+        case 'new-branch': {
+          const name = await prompt({
+            title: 'New Branch',
+            message: `在 ${short} 上创建分支`,
+            confirmLabel: 'Create',
+          })
+          if (!name) return
+          await invoke('create_branch', { path, name, startPoint: commit.id })
+          await refreshGraph(path)
+          return
+        }
+        case 'new-tag': {
+          const name = await prompt({
+            title: 'New Tag',
+            message: `在 ${short} 上创建标签`,
+            confirmLabel: 'Create',
+          })
+          if (!name) return
+          await invoke('create_tag', { path, name, rev: commit.id })
+          await refreshGraph(path)
+          return
+        }
+        case 'save-patch': {
+          const file = await save({
+            title: 'Save as Patch',
+            defaultPath: `${short}.patch`,
+            filters: [{ name: 'Patch', extensions: ['patch'] }],
+          })
+          if (!file) return
+          await invoke('save_patch', { path, rev: commit.id, out: file })
+          return
+        }
+        default: {
+          const plan = planCommitCommand(action, commit)
+          const entry = commitMenu(commit, { isHead: commit.id === state.headHash })
+            .find((e) => e.action === action)
+          if (!plan || !entry?.confirm) return
+          const ok = await confirm({
+            title: entry.label.replace(/…$/, ''),
+            message: entry.confirm,
+            confirmLabel: CONFIRM_LABELS[action] ?? 'OK',
+          })
+          if (!ok) return
+          await runToolbar(plan.command, plan.args)
+        }
+      }
+    } catch (err) {
+      reportError(err)
+    }
+  }, [state.path, state.headHash, prompt, confirm, runToolbar, refreshGraph, reportError])
 
   /**
    * 丢弃改动。这是界面上少数不可逆的操作之一，必须先确认。
@@ -390,6 +481,7 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
                     headHash={state.headHash}
                     changeCount={state.status.unstaged.length + state.status.staged.length}
                     onOpenChanges={() => setViewMode('changes')}
+                    onCommitAction={(action, commit) => void handleCommitAction(action, commit)}
                   />
                 </Panel>
                 <Separator style={{ height: 4, background: '#333' }} />
@@ -414,6 +506,8 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
           </Panel>
         </Group>
       </div>
+      {promptDialog}
+      {confirmDialog}
     </div>
   )
 }
