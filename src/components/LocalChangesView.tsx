@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import { Panel, Group, Separator } from 'react-resizable-panels'
 import type { DiffData, FileChange, StatusData } from '../engine/types'
 import { DiffView } from './DiffView'
@@ -9,6 +9,7 @@ import {
   type FileSection,
   type FileSelection,
 } from '../engine/fileSelection'
+import { commitKeyAction, type CommitField } from '../engine/commitKeys'
 
 interface FileSectionProps {
   title: string
@@ -87,6 +88,7 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
   const [subject, setSubject] = useState('')
   const [description, setDescription] = useState('')
   const [amend, setAmend] = useState(false)
+  const descriptionRef = useRef<HTMLTextAreaElement>(null)
   const { menu, open, close } = useContextMenu()
 
   const allFiles = useMemo(() => [...status.unstaged, ...status.staged], [status])
@@ -131,11 +133,33 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
     open(e, items)
   }
 
+  const canCommit = subject.trim().length > 0
+
   const handleCommit = () => {
     const msg = description.trim() ? `${subject.trim()}\n\n${description.trim()}` : subject.trim()
     onCommit(msg, amend)
     setSubject('')
     setDescription('')
+  }
+
+  const commitKeyDown = (field: CommitField) => (e: React.KeyboardEvent) => {
+    // isComposing 只在 nativeEvent 上，React 的合成事件没有透出来。
+    // 直接把 e 传下去能通过类型检查（该字段是可选的），但运行时永远是 undefined，
+    // 输入法那道防线就白写了——所以这里显式拼。
+    const action = commitKeyAction(field, {
+      key: e.key,
+      ctrlKey: e.ctrlKey,
+      metaKey: e.metaKey,
+      shiftKey: e.shiftKey,
+      altKey: e.altKey,
+      isComposing: e.nativeEvent.isComposing,
+    }, canCommit)
+    if (action === 'none') return
+    // 走到这里都是我们接管的组合：Ctrl+Enter 在 textarea 里默认会插一个换行，
+    // subject 的 Enter 也可能被外层当成表单提交，一律挡掉默认行为。
+    e.preventDefault()
+    if (action === 'commit') handleCommit()
+    else descriptionRef.current?.focus()
   }
 
   return (
@@ -186,20 +210,25 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
           className="commit-subject"
           value={subject}
           onChange={(e) => setSubject(e.target.value)}
+          onKeyDown={commitKeyDown('subject')}
           placeholder="Commit subject"
+          title="Enter 跳到 Description · Ctrl+Enter 提交"
         />
         <textarea
+          ref={descriptionRef}
           className="commit-description"
           value={description}
           onChange={(e) => setDescription(e.target.value)}
+          onKeyDown={commitKeyDown('description')}
           placeholder="Description"
           rows={3}
+          title="Ctrl+Enter 提交"
         />
         <div className="commit-actions">
           <label className="changes-amend">
             <input type="checkbox" checked={amend} onChange={(e) => setAmend(e.target.checked)} /> Amend
           </label>
-          <button disabled={!subject.trim()} onClick={handleCommit}>Commit</button>
+          <button disabled={!canCommit} onClick={handleCommit} title="Ctrl+Enter">Commit</button>
         </div>
       </div>
       <ContextMenu menu={menu} onClose={close} />
