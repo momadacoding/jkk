@@ -162,7 +162,10 @@ fn the_patchid_fallback_catches_it_when_the_trunk_edits_the_same_files() {
 
     let info = branch::delete_info(&p(&work), "feat/same").unwrap();
     assert_eq!(info.unmerged, 1);
-    assert!(info.content_merged, "patch-id 应当在主干上找到那个 squash 提交");
+    assert!(
+        info.content_merged,
+        "patch-id 应当在主干上找到那个 squash 提交"
+    );
 }
 
 /// HEAD 停在别处时，仍然要拿主干来判。
@@ -310,7 +313,10 @@ fn a_merged_branch_reports_nothing_unmerged() {
     run_git(work.path(), &["checkout", "-q", "-b", "feat/merged"]);
     commit(work.path(), "c2");
     run_git(work.path(), &["checkout", "-q", "-"]);
-    run_git(work.path(), &["merge", "--no-ff", "-m", "merge", "feat/merged"]);
+    run_git(
+        work.path(),
+        &["merge", "--no-ff", "-m", "merge", "feat/merged"],
+    );
 
     let info = branch::delete_info(&p(&work), "feat/merged").unwrap();
     assert_eq!(info.unmerged, 0);

@@ -96,7 +96,11 @@ fn read_blob_returns_the_content_at_that_commit() {
 fn read_blob_marks_binary_files_and_skips_the_text() {
     let dir = repo();
     // 带 NUL 字节，libgit2 据此判定为二进制
-    fs::write(dir.path().join("logo.png"), b"\x89PNG\r\n\x1a\n\x00\x00\x00rest").unwrap();
+    fs::write(
+        dir.path().join("logo.png"),
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00rest",
+    )
+    .unwrap();
     run_git(dir.path(), &["add", "."]);
     run_git(dir.path(), &["commit", "-m", "add binary"]);
 

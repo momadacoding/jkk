@@ -4,7 +4,11 @@ use std::process::Command;
 use tempfile::TempDir;
 
 fn run_git(dir: &std::path::Path, args: &[&str]) {
-    let status = Command::new("git").current_dir(dir).args(args).status().expect("git not found");
+    let status = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .status()
+        .expect("git not found");
     assert!(status.success(), "git {args:?} failed");
 }
 
@@ -22,7 +26,10 @@ fn repo_with_worktree(name: &str) -> (TempDir, std::path::PathBuf) {
     run_git(&main, &["commit", "-m", "c1"]);
 
     let wt = main.join(".worktrees").join(name);
-    run_git(&main, &["worktree", "add", wt.to_str().unwrap(), "-b", name]);
+    run_git(
+        &main,
+        &["worktree", "add", wt.to_str().unwrap(), "-b", name],
+    );
     (dir, wt)
 }
 
@@ -42,7 +49,11 @@ fn delete_removes_a_clean_worktree() {
     .unwrap();
 
     assert!(!wt.exists(), "worktree directory should be gone");
-    let out = Command::new("git").current_dir(&main).args(["worktree", "list"]).output().unwrap();
+    let out = Command::new("git")
+        .current_dir(&main)
+        .args(["worktree", "list"])
+        .output()
+        .unwrap();
     let listing = String::from_utf8_lossy(&out.stdout);
     assert!(!listing.contains("feature"), "still listed: {listing}");
 }
@@ -144,7 +155,10 @@ fn worktree_with_pnpm_style_links(name: &str) -> (TempDir, std::path::PathBuf) {
     fs::write(wt.join(".gitignore"), "nm/\n").unwrap();
     let main = main_of(&wt);
     run_git(&main, &["-C", wt.to_str().unwrap(), "add", ".gitignore"]);
-    run_git(&main, &["-C", wt.to_str().unwrap(), "commit", "-m", "ignore nm"]);
+    run_git(
+        &main,
+        &["-C", wt.to_str().unwrap(), "commit", "-m", "ignore nm"],
+    );
     (dir, wt)
 }
 
@@ -216,7 +230,10 @@ fn commits_made_in_the_worktree_survive_its_deletion() {
     let main = main_of(&wt);
     fs::write(wt.join("work.txt"), "在 worktree 里做的活").unwrap();
     run_git(&main, &["-C", wt.to_str().unwrap(), "add", "work.txt"]);
-    run_git(&main, &["-C", wt.to_str().unwrap(), "commit", "-m", "wt commit"]);
+    run_git(
+        &main,
+        &["-C", wt.to_str().unwrap(), "commit", "-m", "wt commit"],
+    );
 
     cmd::delete_worktree(
         main.to_str().unwrap().to_string(),
@@ -294,10 +311,18 @@ fn create_puts_the_worktree_under_dot_worktrees() {
     let (_dir, wt) = repo_with_worktree("first");
     let main = main_of(&wt);
 
-    cmd::create_worktree(main.to_str().unwrap().to_string(), "second".to_string(), None).unwrap();
+    cmd::create_worktree(
+        main.to_str().unwrap().to_string(),
+        "second".to_string(),
+        None,
+    )
+    .unwrap();
 
     let created = main.join(".worktrees").join("second");
-    assert!(created.exists(), "应该建在 .worktrees 下面，实际没有：{created:?}");
+    assert!(
+        created.exists(),
+        "应该建在 .worktrees 下面，实际没有：{created:?}"
+    );
     assert!(created.join("a.txt").exists(), "worktree 里应该有仓库内容");
 }
 
@@ -307,8 +332,12 @@ fn create_surfaces_the_real_git_error() {
     let main = main_of(&wt);
 
     // 同名再建一次，git 会说分支已被占用
-    let err = cmd::create_worktree(main.to_str().unwrap().to_string(), "feature".to_string(), None)
-        .expect_err("重名的 worktree 应该失败");
+    let err = cmd::create_worktree(
+        main.to_str().unwrap().to_string(),
+        "feature".to_string(),
+        None,
+    )
+    .expect_err("重名的 worktree 应该失败");
     assert_eq!(err.code, "git_cli");
     assert!(!err.message.is_empty());
     assert!(

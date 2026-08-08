@@ -8,7 +8,11 @@ use std::collections::HashSet;
 /// 那正是「HEAD 里什么都没有」，不是错误。
 fn path_set(path: &str, args: &[&str]) -> HashSet<String> {
     match run_git(path, args) {
-        Ok(out) => out.split('\0').filter(|s| !s.is_empty()).map(str::to_string).collect(),
+        Ok(out) => out
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
         Err(_) => HashSet::new(),
     }
 }
@@ -107,10 +111,7 @@ pub fn delete_branch(path: String, name: String) -> Result<()> {
 
 /// 删除分支前的确认框要显示的信息：对应的远程分支、还有多少提交没合并进来。
 #[tauri::command]
-pub fn branch_delete_info(
-    path: String,
-    name: String,
-) -> Result<crate::engine::branch::DeleteInfo> {
+pub fn branch_delete_info(path: String, name: String) -> Result<crate::engine::branch::DeleteInfo> {
     crate::engine::branch::delete_info(&path, &name)
 }
 
@@ -143,7 +144,10 @@ pub fn checkout_remote_branch(path: String, remote_branch: String) -> Result<Str
     if exists {
         run_git(&path, &["checkout", &local])?;
     } else {
-        run_git(&path, &["checkout", "-b", &local, "--track", &remote_branch])?;
+        run_git(
+            &path,
+            &["checkout", "-b", &local, "--track", &remote_branch],
+        )?;
     }
     Ok(local)
 }
@@ -191,7 +195,8 @@ pub fn revert(path: String, rev: String) -> Result<()> {
 #[tauri::command]
 pub fn save_patch(path: String, rev: String, out: String) -> Result<()> {
     // -1 限定只导出这一条，不带上它的祖先
-    let patch = crate::engine::git_cli::run_git_bytes(&path, &["format-patch", "-1", "--stdout", &rev])?;
+    let patch =
+        crate::engine::git_cli::run_git_bytes(&path, &["format-patch", "-1", "--stdout", &rev])?;
     std::fs::write(&out, patch)?;
     Ok(())
 }

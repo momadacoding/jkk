@@ -5,12 +5,20 @@ use std::process::Command;
 use tempfile::TempDir;
 
 fn run_git(dir: &std::path::Path, args: &[&str]) {
-    let status = Command::new("git").current_dir(dir).args(args).status().expect("git not found");
+    let status = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .status()
+        .expect("git not found");
     assert!(status.success(), "git {args:?} failed");
 }
 
 fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
-    let out = Command::new("git").current_dir(dir).args(args).output().unwrap();
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap();
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
@@ -28,7 +36,9 @@ fn repo() -> TempDir {
 #[test]
 fn list_is_empty_on_a_clean_repo() {
     let dir = repo();
-    assert!(stash::list(dir.path().to_str().unwrap()).unwrap().is_empty());
+    assert!(stash::list(dir.path().to_str().unwrap())
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -41,7 +51,11 @@ fn push_then_list_reports_the_entry() {
     let entries = stash::list(&p).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].index, 0);
-    assert!(entries[0].message.contains("my work"), "got {}", entries[0].message);
+    assert!(
+        entries[0].message.contains("my work"),
+        "got {}",
+        entries[0].message
+    );
     // hash 要能直接喂给现成的 commit:<hash> diff scope，所以必须是完整 oid
     assert_eq!(entries[0].hash.len(), 40);
     // 工作区已经被还原
@@ -86,7 +100,10 @@ fn include_untracked_captures_new_files() {
     fs::write(dir.path().join("new.txt"), "fresh").unwrap();
 
     cmd::stash_push(p.clone(), None, true).unwrap();
-    assert!(!dir.path().join("new.txt").exists(), "untracked file was not stashed");
+    assert!(
+        !dir.path().join("new.txt").exists(),
+        "untracked file was not stashed"
+    );
     assert_eq!(stash::list(&p).unwrap().len(), 1);
 }
 
@@ -101,7 +118,11 @@ fn newest_stash_is_index_zero() {
 
     let entries = stash::list(&p).unwrap();
     assert_eq!(entries.len(), 2);
-    assert!(entries[0].message.contains("second"), "got {}", entries[0].message);
+    assert!(
+        entries[0].message.contains("second"),
+        "got {}",
+        entries[0].message
+    );
     assert_eq!(entries[0].index, 0);
     assert_eq!(entries[1].index, 1);
 }
@@ -114,7 +135,10 @@ fn pop_restores_changes_and_removes_the_entry() {
     cmd::stash_push(p.clone(), None, false).unwrap();
 
     cmd::stash_pop(p.clone(), 0).unwrap();
-    assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "changed");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "changed"
+    );
     assert!(stash::list(&p).unwrap().is_empty());
 }
 
@@ -126,7 +150,10 @@ fn apply_restores_changes_but_keeps_the_entry() {
     cmd::stash_push(p.clone(), None, false).unwrap();
 
     cmd::stash_apply(p.clone(), 0).unwrap();
-    assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "changed");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "changed"
+    );
     assert_eq!(stash::list(&p).unwrap().len(), 1);
 }
 

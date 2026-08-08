@@ -5,7 +5,11 @@ use std::process::Command;
 use tempfile::TempDir;
 
 fn run_git(dir: &std::path::Path, args: &[&str]) {
-    let status = Command::new("git").current_dir(dir).args(args).status().expect("git not found");
+    let status = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .status()
+        .expect("git not found");
     assert!(status.success(), "git {args:?} failed");
 }
 
@@ -24,13 +28,18 @@ fn repo_with_remote() -> (TempDir, TempDir) {
     run_git(local.path(), &["config", "user.email", "test@test.com"]);
     run_git(local.path(), &["config", "user.name", "Test"]);
     commit(local.path(), "c1");
-    run_git(local.path(), &["remote", "add", "origin", remote.path().to_str().unwrap()]);
+    run_git(
+        local.path(),
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+    );
     run_git(local.path(), &["push", "-u", "origin", "HEAD"]);
     (local, remote)
 }
 
 fn find<'a>(refs: &'a [refs::RefPointer], name: &str) -> &'a refs::RefPointer {
-    refs.iter().find(|r| r.name == name).unwrap_or_else(|| panic!("no ref {name}"))
+    refs.iter()
+        .find(|r| r.name == name)
+        .unwrap_or_else(|| panic!("no ref {name}"))
 }
 
 #[test]
