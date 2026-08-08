@@ -22,7 +22,12 @@ pub fn read(path: &str) -> Result<UpstreamInfo> {
     let head = repo.head()?;
     let branch_name = head.shorthand().unwrap_or("HEAD").to_string();
 
-    let none = |branch: String| UpstreamInfo { branch, upstream: None, ahead: 0, behind: 0 };
+    let none = |branch: String| UpstreamInfo {
+        branch,
+        upstream: None,
+        ahead: 0,
+        behind: 0,
+    };
 
     // 游离 HEAD 没有分支，也就没有上游
     if !head.is_branch() {

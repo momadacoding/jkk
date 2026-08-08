@@ -14,7 +14,10 @@ pub fn read_worktrees_cmd(path: String) -> Result<Vec<Worktree>> {
 /// 都指向主仓库的 .git，它的父目录就是主仓库根。新 worktree 统一建在那下面的
 /// `.worktrees/`，否则从一个 worktree 里新建会建到仓库外面去。
 fn main_repo(path: &str) -> Result<std::path::PathBuf> {
-    let common = run_git(path, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+    let common = run_git(
+        path,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
     let git_dir = std::path::PathBuf::from(common.trim());
     Ok(git_dir.parent().unwrap_or(&git_dir).to_path_buf())
 }

@@ -54,7 +54,10 @@ pub fn load(path: &str) -> Result<GraphData> {
     }
 
     if commits.is_empty() {
-        return Err(GitError::new("empty_repo", "This repository has no commits yet"));
+        return Err(GitError::new(
+            "empty_repo",
+            "This repository has no commits yet",
+        ));
     }
 
     let refs = crate::engine::refs::collect(&repo)?;

@@ -6,7 +6,9 @@ pub fn open_repo(path: String) -> Result<crate::engine::repo::RepoInfo, crate::e
 }
 
 #[tauri::command]
-pub fn read_upstream(path: String) -> Result<crate::engine::upstream::UpstreamInfo, crate::error::GitError> {
+pub fn read_upstream(
+    path: String,
+) -> Result<crate::engine::upstream::UpstreamInfo, crate::error::GitError> {
     engine::upstream::read(&path)
 }
 

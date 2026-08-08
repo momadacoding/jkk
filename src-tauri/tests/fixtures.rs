@@ -57,7 +57,8 @@ fn read_status_detects_unstaged() {
 fn read_diff_for_workdir() {
     let dir = linear_repo();
     fs::write(dir.path().join("a.txt"), "changed").unwrap();
-    let diff = engine::diff::read_diff(dir.path().to_str().unwrap(), "workdir".to_string()).unwrap();
+    let diff =
+        engine::diff::read_diff(dir.path().to_str().unwrap(), "workdir".to_string()).unwrap();
     assert_eq!(diff.files.len(), 1);
 }
 
@@ -132,16 +133,17 @@ fn read_status_lists_conflicted_files() {
 fn read_diff_includes_untracked_content() {
     let dir = linear_repo();
     fs::write(dir.path().join("new.txt"), "hello\n").unwrap();
-    let diff = engine::diff::read_diff(dir.path().to_str().unwrap(), "workdir".to_string()).unwrap();
+    let diff =
+        engine::diff::read_diff(dir.path().to_str().unwrap(), "workdir".to_string()).unwrap();
     let file = diff
         .files
         .iter()
         .find(|f| f.path == "new.txt")
         .expect("未跟踪文件也要有 diff");
-    assert!(file
-        .hunks
+    assert!(file.hunks.iter().any(|h| h
+        .lines
         .iter()
-        .any(|h| h.lines.iter().any(|l| l.origin == '+' && l.content == "hello")));
+        .any(|l| l.origin == '+' && l.content == "hello")));
 }
 
 #[test]
@@ -149,7 +151,8 @@ fn read_diff_excludes_header_lines() {
     let dir = linear_repo();
     fs::write(dir.path().join("a.txt"), "changed\n").unwrap();
     fs::write(dir.path().join("new.txt"), "added\n").unwrap();
-    let diff = engine::diff::read_diff(dir.path().to_str().unwrap(), "workdir".to_string()).unwrap();
+    let diff =
+        engine::diff::read_diff(dir.path().to_str().unwrap(), "workdir".to_string()).unwrap();
     // libgit2 的文件头 'F' / hunk 头 'H' 曾经被当成内容行渲染出来
     for file in &diff.files {
         for hunk in &file.hunks {
@@ -199,7 +202,11 @@ fn open_repo_reports_both_head_name_and_hash() {
     let dir = linear_repo();
     let info = engine::repo::open(dir.path().to_str().unwrap()).unwrap();
     // head 仍是给人看的分支名
-    assert!(info.head == "master" || info.head == "main", "head was {}", info.head);
+    assert!(
+        info.head == "master" || info.head == "main",
+        "head was {}",
+        info.head
+    );
     // head_hash 是完整 oid，且必须等于图里最新的那条提交——
     // 工作区伪行就是靠这个 hash 挂到 HEAD 上的
     assert_eq!(info.head_hash.len(), 40);
@@ -237,9 +244,15 @@ fn graph_puts_newer_unmerged_tip_above_older_merge() {
     commit_at(dir.path(), "f1", "2026-01-02T00:00:00+00:00");
 
     let main = String::from_utf8_lossy(
-        &Command::new("git").current_dir(dir.path())
-            .args(["rev-parse", "--abbrev-ref", "HEAD"]).output().unwrap().stdout,
-    ).trim().to_string();
+        &Command::new("git")
+            .current_dir(dir.path())
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
     assert_eq!(main, "feature");
 
     run_git(dir.path(), &["checkout", "-"]);
@@ -258,13 +271,25 @@ fn graph_puts_newer_unmerged_tip_above_older_merge() {
     commit_at(dir.path(), "f2", "2026-01-04T00:00:00+00:00");
 
     let data = engine::graph::load(dir.path().to_str().unwrap()).unwrap();
-    let row = |msg: &str| data.commits.iter().position(|c| c.message == msg)
-        .unwrap_or_else(|| panic!("{msg} not found in {:?}", data.commits.iter().map(|c| &c.message).collect::<Vec<_>>()));
+    let row = |msg: &str| {
+        data.commits
+            .iter()
+            .position(|c| c.message == msg)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{msg} not found in {:?}",
+                    data.commits.iter().map(|c| &c.message).collect::<Vec<_>>()
+                )
+            })
+    };
 
     assert!(
         row("f2") < row("merge feature"),
         "更新的未合并 tip f2 排在了合并提交之后：{:?}",
-        data.commits.iter().map(|c| (&c.message, c.time)).collect::<Vec<_>>()
+        data.commits
+            .iter()
+            .map(|c| (&c.message, c.time))
+            .collect::<Vec<_>>()
     );
     // 拓扑约束不能被破坏：父必须排在子之后
     assert!(row("merge feature") < row("f1"));
@@ -325,7 +350,10 @@ fn status_survives_a_dangling_link_in_the_workdir() {
     // `warning: could not open directory 'broken-link/'` 而不列出它，
     // 但 libgit2 会把它报成 WT_NEW，界面上就多出一条 git 不认的变更。
     assert!(
-        !status.unstaged.iter().any(|f| f.path.contains("broken-link")),
+        !status
+            .unstaged
+            .iter()
+            .any(|f| f.path.contains("broken-link")),
         "悬空链接被当成未跟踪变更列出来了：{:?}",
         status.unstaged
     );

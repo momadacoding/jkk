@@ -4,12 +4,20 @@ use std::process::Command;
 use tempfile::TempDir;
 
 fn run_git(dir: &std::path::Path, args: &[&str]) {
-    let status = Command::new("git").current_dir(dir).args(args).status().expect("git not found");
+    let status = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .status()
+        .expect("git not found");
     assert!(status.success(), "git {args:?} failed");
 }
 
 fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
-    let out = Command::new("git").current_dir(dir).args(args).output().unwrap();
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap();
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
@@ -78,7 +86,10 @@ fn pull_with_rebase_keeps_history_linear() {
     // rebase 不产生 merge 提交：所有提交都只有一个父
     let parents = git_out(b.path(), &["log", "--pretty=%p"]);
     for line in parents.lines() {
-        assert!(line.split_whitespace().count() <= 1, "found a merge commit: {line}");
+        assert!(
+            line.split_whitespace().count() <= 1,
+            "found a merge commit: {line}"
+        );
     }
 }
 
@@ -90,7 +101,10 @@ fn push_sets_upstream_for_a_fresh_branch() {
     commit(b.path(), "f1");
 
     remote::push(b.path().to_str().unwrap().to_string(), false).unwrap();
-    let upstream = git_out(b.path(), &["rev-parse", "--abbrev-ref", "feature@{upstream}"]);
+    let upstream = git_out(
+        b.path(),
+        &["rev-parse", "--abbrev-ref", "feature@{upstream}"],
+    );
     assert_eq!(upstream, "origin/feature");
 }
 
@@ -119,5 +133,8 @@ fn force_push_overwrites_remote() {
     remote::push(b.path().to_str().unwrap().to_string(), true).unwrap();
     let local = git_out(b.path(), &["rev-parse", "HEAD"]);
     let pushed = git_out(a.path(), &["ls-remote", "origin", "HEAD"]);
-    assert!(pushed.starts_with(&local[..8]), "remote HEAD {pushed} != local {local}");
+    assert!(
+        pushed.starts_with(&local[..8]),
+        "remote HEAD {pushed} != local {local}"
+    );
 }

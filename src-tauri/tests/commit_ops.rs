@@ -4,16 +4,29 @@ use std::process::Command;
 use tempfile::TempDir;
 
 fn run_git(dir: &std::path::Path, args: &[&str]) {
-    let status = Command::new("git").current_dir(dir).args(args).status().expect("git not found");
+    let status = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .status()
+        .expect("git not found");
     assert!(status.success(), "git {args:?} failed");
 }
 
 fn try_git(dir: &std::path::Path, args: &[&str]) -> bool {
-    Command::new("git").current_dir(dir).args(args).status().expect("git not found").success()
+    Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .status()
+        .expect("git not found")
+        .success()
 }
 
 fn out(dir: &std::path::Path, args: &[&str]) -> String {
-    let o = Command::new("git").current_dir(dir).args(args).output().expect("git not found");
+    let o = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .expect("git not found");
     assert!(o.status.success(), "git {args:?} failed");
     String::from_utf8_lossy(&o.stdout).trim().to_string()
 }
@@ -88,10 +101,16 @@ fn cherry_picks_a_commit_from_another_branch() {
 
     ops::cherry_pick(p(&dir), side.clone()).unwrap();
 
-    assert_eq!(fs::read_to_string(dir.path().join("b.txt")).unwrap(), "from side\n");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+        "from side\n"
+    );
     // 落在新的父提交上，所以是另一条提交，原提交仍留在 side 上
     assert_ne!(out(dir.path(), &["rev-parse", "HEAD"]), side);
-    assert_eq!(out(dir.path(), &["log", "-1", "--format=%s"]), "side change");
+    assert_eq!(
+        out(dir.path(), &["log", "-1", "--format=%s"]),
+        "side change"
+    );
     // master 自己那步没有被踩掉
     assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "3\n");
 }
@@ -108,7 +127,10 @@ fn cherry_pick_conflict_surfaces_as_an_error() {
     run_git(dir.path(), &["commit", "-qam", "our edit"]);
 
     // 冲突不能被吞掉：界面要能显示出来，否则用户看不出仓库已经停在 cherry-pick 中途
-    assert!(ops::cherry_pick(p(&dir), side).is_err(), "冲突的 cherry-pick 报成了成功");
+    assert!(
+        ops::cherry_pick(p(&dir), side).is_err(),
+        "冲突的 cherry-pick 报成了成功"
+    );
 }
 
 // ---------- revert ----------
@@ -152,10 +174,16 @@ fn writes_a_patch_that_git_am_can_replay() {
         try_git(target.path(), &["am", patch.to_str().unwrap()]),
         "git am 打不上这个 patch"
     );
-    assert_eq!(fs::read_to_string(target.path().join("a.txt")).unwrap(), "2\n");
+    assert_eq!(
+        fs::read_to_string(target.path().join("a.txt")).unwrap(),
+        "2\n"
+    );
     // 作者和提交说明都要跟过来——这正是 format-patch 相对 `git show` 的意义
     assert_eq!(out(target.path(), &["log", "-1", "--format=%s"]), "c2");
-    assert_eq!(out(target.path(), &["log", "-1", "--format=%ae"]), "test@test.com");
+    assert_eq!(
+        out(target.path(), &["log", "-1", "--format=%ae"]),
+        "test@test.com"
+    );
 }
 
 #[test]
@@ -169,8 +197,14 @@ fn exports_only_the_selected_commit() {
 
     let text = fs::read_to_string(&patch).unwrap();
     // 不带 -1 的话 format-patch 会把这条提交的所有祖先一起导出来
-    assert!(text.contains("Subject: [PATCH] c2"), "patch 里没有 c2: {text}");
-    assert!(!text.contains("Subject: [PATCH] c1"), "patch 里混进了祖先提交 c1");
+    assert!(
+        text.contains("Subject: [PATCH] c2"),
+        "patch 里没有 c2: {text}"
+    );
+    assert!(
+        !text.contains("Subject: [PATCH] c1"),
+        "patch 里混进了祖先提交 c1"
+    );
 }
 
 #[test]
@@ -179,7 +213,11 @@ fn save_patch_reports_a_bad_rev_instead_of_writing_an_empty_file() {
     let store = TempDir::new().unwrap();
     let patch = store.path().join("nope.patch");
 
-    let result = ops::save_patch(p(&dir), "deadbeef".into(), patch.to_str().unwrap().to_string());
+    let result = ops::save_patch(
+        p(&dir),
+        "deadbeef".into(),
+        patch.to_str().unwrap().to_string(),
+    );
 
     assert!(result.is_err(), "无效的 rev 应当报错");
     assert!(!patch.exists(), "报错了却还是留下了一个空文件");

@@ -13,9 +13,8 @@ pub struct RepoInfo {
 }
 
 pub fn open(path: &str) -> Result<RepoInfo> {
-    let repo = Repository::open(path).map_err(|_| {
-        GitError::new("not_repo", format!("{} is not a git repository", path))
-    })?;
+    let repo = Repository::open(path)
+        .map_err(|_| GitError::new("not_repo", format!("{} is not a git repository", path)))?;
     let head = repo.head()?;
     let head_name = head.shorthand().unwrap_or("HEAD").to_string();
     // 符号引用要 resolve 之后才有 target

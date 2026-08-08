@@ -3,7 +3,9 @@ use crate::error::Result;
 
 /// 当前分支名。push 需要它来补 -u。
 fn current_branch(path: &str) -> Result<String> {
-    Ok(run_git(path, &["rev-parse", "--abbrev-ref", "HEAD"])?.trim().to_string())
+    Ok(run_git(path, &["rev-parse", "--abbrev-ref", "HEAD"])?
+        .trim()
+        .to_string())
 }
 
 /// 该分支是否已经设过上游。
