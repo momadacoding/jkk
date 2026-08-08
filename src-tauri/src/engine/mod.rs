@@ -1,5 +1,6 @@
 pub mod branch;
 pub mod diff;
+pub mod file_lock;
 pub mod git_cli;
 pub mod graph;
 pub mod path;

@@ -1,7 +1,9 @@
+import { useState } from 'react'
 import type { Worktree } from '../engine/types'
 import { samePath } from '../engine/path'
 import { ContextMenu, useContextMenu } from './ContextMenu'
 import { SidebarSection } from './SidebarSection'
+import { DeleteWorktreeDialog } from './DeleteWorktreeDialog'
 
 interface WorktreeViewProps {
   worktrees: Worktree[]
@@ -10,8 +12,13 @@ interface WorktreeViewProps {
   /** 已在某个标签里打开的路径，用来提示「已打开」。 */
   openPaths: string[]
   onOpenInNewTab: (path: string) => void
-  /** 收完整路径而不是名字——名字得靠拼，从主仓库删会拼到仓库外面去。 */
-  onDelete: (worktreePath: string) => void
+  /**
+   * 收完整路径而不是名字——名字得靠拼，从主仓库删会拼到仓库外面去。
+   *
+   * Promise 要等删完才 resolve，失败要抛出：确认框据此留在原地显示错误，
+   * 并把「有未提交改动」升级成「仍要删除」。
+   */
+  onDelete: (worktreePath: string, force: boolean) => Promise<void>
   onCreate: (name: string) => void
   /** 单击：把 graph 定位到该 worktree 的 HEAD。传入完整 oid。 */
   onSelect: (headHash: string, name: string) => void
@@ -32,6 +39,8 @@ export function WorktreeView({
   worktrees, currentPath, openPaths, onOpenInNewTab, onDelete, onCreate, onSelect, selectedPath,
 }: WorktreeViewProps) {
   const { menu, open, close } = useContextMenu()
+  /** 正在确认删除的 worktree。 */
+  const [deleting, setDeleting] = useState<Worktree | null>(null)
 
   return (
     <SidebarSection
@@ -52,7 +61,7 @@ export function WorktreeView({
           },
           {
             label: 'Delete worktree',
-            onSelect: () => onDelete(wt.path),
+            onSelect: () => setDeleting(wt),
             disabled: !canDelete,
             danger: true,
           },
@@ -88,7 +97,7 @@ export function WorktreeView({
                 className="danger"
                 title={canDelete ? '删除这个 worktree' : wt.isMain ? '主工作区不能删' : '当前打开的工作区不能删'}
                 disabled={!canDelete}
-                onClick={(e) => { e.stopPropagation(); onDelete(wt.path) }}
+                onClick={(e) => { e.stopPropagation(); setDeleting(wt) }}
               >
                 ✕
               </button>
@@ -98,6 +107,14 @@ export function WorktreeView({
         )
       })}
       <ContextMenu menu={menu} onClose={close} />
+      {deleting && (
+        <DeleteWorktreeDialog
+          worktree={deleting}
+          onCancel={() => setDeleting(null)}
+          // 成功才关；失败时 onDelete 抛出，确认框自己接住并留在原地
+          onConfirm={async (force) => { await onDelete(deleting.path, force); setDeleting(null) }}
+        />
+      )}
     </SidebarSection>
   )
 }
