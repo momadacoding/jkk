@@ -1,3 +1,4 @@
+use crate::engine::proc::hidden_command;
 use crate::error::{GitError, Result};
 use std::process::Command;
 
@@ -8,8 +9,10 @@ use std::process::Command;
 /// 关掉之后 git 会立即失败，错误能走到界面上的错误横幅。
 ///
 /// 凭据管理器（Windows 的 GCM）弹自己的 GUI 窗口不受影响——那条路径不经过终端。
+///
+/// 走 [`hidden_command`] 是为了不在装机版上闪出 console 黑框，理由见该函数。
 pub fn git_command(path: &str) -> Command {
-    let mut cmd = Command::new("git");
+    let mut cmd = hidden_command("git");
     cmd.current_dir(path);
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     cmd

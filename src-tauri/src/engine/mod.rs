@@ -6,6 +6,7 @@ pub mod git_cli;
 pub mod graph;
 pub mod launcher;
 pub mod path;
+pub mod proc;
 pub mod refs;
 pub mod repo;
 pub mod stash;
