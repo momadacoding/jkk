@@ -45,6 +45,8 @@ pub fn run() {
             commands::repo::open_repo,
             commands::repo::read_upstream,
             commands::repo::repo_state,
+            commands::session::load_session,
+            commands::session::save_session,
             commands::stash::read_stashes,
             commands::stash::stash_apply,
             commands::stash::stash_drop,

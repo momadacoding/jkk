@@ -13,3 +13,14 @@ export function normalizePath(path: string): string {
 export function samePath(a: string, b: string): boolean {
   return normalizePath(a) === normalizePath(b)
 }
+
+/**
+ * 取路径最后一段作为显示名。
+ *
+ * 和 `normalizePath` 不同，这里**不能**转小写：这是给人看的名字，
+ * 仓库目录名的大小写要原样保留。
+ */
+export function basename(path: string): string {
+  const parts = path.replace(/\\/g, '/').replace(/\/+$/, '').split('/')
+  return parts[parts.length - 1] || path
+}

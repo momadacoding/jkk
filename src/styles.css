@@ -158,6 +158,113 @@ body {
   flex-direction: column;
 }
 
+/* 一个标签都没开时的落地页 */
+/* 居中靠子元素的 margin:auto，不能用 align-items: center——
+   在可滚动容器上做 flex 居中时，溢出到上边的内容会滚不到，
+   最近列表填满 10 条又碰上矮窗口时，按钮和头几条就永远看不见了 */
+.empty-state {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  justify-content: center;
+  overflow-y: auto;
+}
+
+.empty-state-box {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  margin: auto;
+  width: 380px;
+  max-width: 80vw;
+  padding: 24px 0;
+}
+
+.empty-state-title {
+  margin-bottom: 14px;
+  color: #7d7d7d;
+  font-size: 15px;
+  text-align: center;
+}
+
+.empty-state-open {
+  align-self: center;
+  padding: 8px 18px;
+  background: #2f2f2f;
+  border: 1px solid #4fc3f7;
+  border-radius: 4px;
+  color: #fff;
+  cursor: pointer;
+  font-size: 12px;
+  transition: background 0.12s ease;
+}
+
+.empty-state-open:hover {
+  background: #3b3b3b;
+}
+
+.empty-state-recent {
+  display: flex;
+  flex-direction: column;
+  margin-top: 26px;
+}
+
+.empty-state-recent-label {
+  margin-bottom: 6px;
+  padding: 0 4px;
+  color: #6a6a6a;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+/* 每条两行：仓库名 + 完整路径。列表窄，路径必然要截断，
+   所以名字单独一行，不和路径抢宽度 */
+.recent-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  padding: 6px 8px;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.12s ease;
+}
+
+.recent-item:hover {
+  background: var(--selected-bg);
+}
+
+.recent-name {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+/* 不用 direction: rtl 从左边截断：bidi 会把 `C:` 和 `\` 这些中性字符
+   甩到行尾，Windows 路径显示成 `\Users\me\repo:C`。完整路径在 title 里 */
+.recent-path {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #6a6a6a;
+  font-size: 11px;
+}
+
+/* 目录已不存在：置灰但仍可点，可能只是盘没挂上 */
+.recent-item.missing .recent-name,
+.recent-item.missing .recent-path {
+  color: #545454;
+  text-decoration: line-through;
+}
+
 .repo-tab {
   display: flex;
   flex-direction: column;

@@ -1,20 +1,12 @@
-export interface RepoTabInfo {
-  id: string
-  path: string
-}
+import { basename } from '../engine/path'
+import type { RepoTabInfo } from '../engine/session'
 
 interface TabBarProps {
   tabs: RepoTabInfo[]
-  activeId: string
+  activeId: string | null
   onActivate: (id: string) => void
   onClose: (id: string) => void
   onOpenRepo: () => void
-}
-
-/** 取路径最后一段作为标签标题。 */
-export function basename(path: string): string {
-  const parts = path.replace(/\\/g, '/').replace(/\/+$/, '').split('/')
-  return parts[parts.length - 1] || path
 }
 
 export function TabBar({ tabs, activeId, onActivate, onClose, onOpenRepo }: TabBarProps) {
@@ -28,16 +20,14 @@ export function TabBar({ tabs, activeId, onActivate, onClose, onOpenRepo }: TabB
           onClick={() => onActivate(tab.id)}
         >
           <span className="tab-title">{basename(tab.path)}</span>
-          {/* 只剩一个标签时不给关，避免出现空窗口 */}
-          {tabs.length > 1 && (
-            <button
-              className="tab-close"
-              title="Close tab"
-              onClick={(e) => { e.stopPropagation(); onClose(tab.id) }}
-            >
-              ×
-            </button>
-          )}
+          {/* 最后一个标签也能关：关完落到空态页，不再需要「至少留一个」这条约束 */}
+          <button
+            className="tab-close"
+            title="Close tab"
+            onClick={(e) => { e.stopPropagation(); onClose(tab.id) }}
+          >
+            ×
+          </button>
         </div>
       ))}
       {/* 带文字标签：只有一个灰色小加号时用户找不到「打开仓库」在哪 */}

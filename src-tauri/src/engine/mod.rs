@@ -9,6 +9,7 @@ pub mod path;
 pub mod proc;
 pub mod refs;
 pub mod repo;
+pub mod session;
 pub mod stash;
 pub mod tree;
 pub mod upstream;
