@@ -1,18 +1,18 @@
 use crate::engine;
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn open_repo(path: String) -> Result<crate::engine::repo::RepoInfo, crate::error::GitError> {
     engine::repo::open(&path)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn read_upstream(
     path: String,
 ) -> Result<crate::engine::upstream::UpstreamInfo, crate::error::GitError> {
     engine::upstream::read(&path)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn repo_state(path: String) -> Result<String, crate::error::GitError> {
     let git_dir = std::path::Path::new(&path).join(".git");
     if git_dir.join("MERGE_HEAD").exists() {

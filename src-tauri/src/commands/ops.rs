@@ -28,7 +28,7 @@ fn path_set(path: &str, args: &[&str]) -> HashSet<String> {
 /// `staged` 决定恢复到哪一层：Unstaged 区的 Discard 只回退「工作区相对暂存区」的
 /// 部分（`git checkout --`），把已暂存的改动一起抹掉是 Staged 区的语义
 /// （`git checkout HEAD --`）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn discard(path: String, paths: Vec<String>, staged: bool) -> Result<()> {
     // 空 pathspec 会被 git 当成「全部」，那就成了一次误伤整个仓库的 discard
     if paths.is_empty() {
@@ -93,7 +93,7 @@ pub fn discard(path: String, paths: Vec<String>, staged: bool) -> Result<()> {
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn create_branch(path: String, name: String, start_point: Option<String>) -> Result<()> {
     let mut args = vec!["branch", &name];
     if let Some(start) = &start_point {
@@ -103,19 +103,19 @@ pub fn create_branch(path: String, name: String, start_point: Option<String>) ->
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_branch(path: String, name: String) -> Result<()> {
     run_git(&path, &["branch", "-D", &name])?;
     Ok(())
 }
 
 /// 删除分支前的确认框要显示的信息：对应的远程分支、还有多少提交没合并进来。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn branch_delete_info(path: String, name: String) -> Result<crate::engine::branch::DeleteInfo> {
     crate::engine::branch::delete_info(&path, &name)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_remote_branch(path: String, remote: String, branch: String) -> Result<()> {
     run_git(&path, &["push", &remote, "--delete", &branch])?;
     Ok(())
@@ -125,7 +125,7 @@ pub fn delete_remote_branch(path: String, remote: String, branch: String) -> Res
 ///
 /// 侧边栏的远程分支那一栏拿到的就是这个形式，拆分放在后端做——远程名可以带
 /// 斜杠，前端按第一个 `/` 去切会切错。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_remote_ref(path: String, remote_branch: String) -> Result<()> {
     let (remote, branch) = crate::engine::branch::split_remote_ref(&path, &remote_branch)?;
     delete_remote_branch(path, remote, branch)
@@ -138,7 +138,7 @@ pub fn delete_remote_ref(path: String, remote_branch: String) -> Result<()> {
 ///
 /// 同名本地分支已经存在时直接切过去，不去动它指向哪：那多半就是用户上次检出
 /// 留下的分支，静默把它重置到远程会丢掉本地提交。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn checkout_remote_branch(path: String, remote_branch: String) -> Result<String> {
     let (local, exists) = crate::engine::branch::local_target_for(&path, &remote_branch)?;
     if exists {
@@ -152,20 +152,20 @@ pub fn checkout_remote_branch(path: String, remote_branch: String) -> Result<Str
     Ok(local)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn rename_branch(path: String, old: String, new: String) -> Result<()> {
     run_git(&path, &["branch", "-m", &old, &new])?;
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn checkout(path: String, rev: String) -> Result<()> {
     run_git(&path, &["checkout", &rev])?;
     Ok(())
 }
 
 /// 在某条提交上打一个轻量 tag。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn create_tag(path: String, name: String, rev: String) -> Result<()> {
     // 不带 -f：同名 tag 已存在时让 git 报错，静默改写一个 tag 的指向
     // 是能把别人已经拉走的引用悄悄挪位置的操作
@@ -174,14 +174,14 @@ pub fn create_tag(path: String, name: String, rev: String) -> Result<()> {
 }
 
 /// 把一条提交摘到当前分支上。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn cherry_pick(path: String, rev: String) -> Result<()> {
     run_git(&path, &["cherry-pick", &rev])?;
     Ok(())
 }
 
 /// 生成一条撤销指定提交的新提交。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn revert(path: String, rev: String) -> Result<()> {
     // --no-edit：GUI 里没有终端，不加这个 git 会拉起编辑器等一个永远不会来的输入
     run_git(&path, &["revert", "--no-edit", &rev])?;
@@ -192,7 +192,7 @@ pub fn revert(path: String, rev: String) -> Result<()> {
 ///
 /// 用 `format-patch --stdout` 自己写文件，而不是让 git 往目录里生成：
 /// git 会按提交说明自动编号命名，用户在存盘框里选的文件名就白选了。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn save_patch(path: String, rev: String, out: String) -> Result<()> {
     // -1 限定只导出这一条，不带上它的祖先
     let patch =
@@ -201,7 +201,7 @@ pub fn save_patch(path: String, rev: String, out: String) -> Result<()> {
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn stage(path: String, paths: Vec<String>) -> Result<()> {
     let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
     let mut args: Vec<&str> = vec!["add"];
@@ -210,7 +210,7 @@ pub fn stage(path: String, paths: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn unstage(path: String, paths: Vec<String>) -> Result<()> {
     let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
     let mut args: Vec<&str> = vec!["reset", "HEAD"];
@@ -219,7 +219,7 @@ pub fn unstage(path: String, paths: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn commit(path: String, message: String, amend: bool) -> Result<()> {
     if amend {
         run_git(&path, &["commit", "--amend", "-m", &message])?;

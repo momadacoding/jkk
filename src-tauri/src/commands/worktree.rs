@@ -29,12 +29,12 @@ fn common_git_dir(path: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(out.trim()))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn read_worktrees_cmd(path: String) -> Result<Vec<Worktree>> {
     read_worktrees(&path)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn create_worktree(path: String, name: String, branch: Option<String>) -> Result<()> {
     let worktree_path = main_repo(&path)?.join(".worktrees").join(&name);
     let target = worktree_path.to_string_lossy().to_string();
@@ -169,7 +169,7 @@ fn new_trash_slot(trash_root: &Path, name: &str) -> Result<PathBuf> {
 /// worktree 了，`git worktree list` 干净、同名分支能立刻重建，不需要再跑 `remove`。
 ///
 /// 搬移绕过了 git 自带的脏检查和锁检查，所以这两道必须我们**先**做完再动手。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_worktree(
     path: String,
     worktree_path: String,
@@ -356,7 +356,7 @@ fn prune_trash(trash_root: &Path) {
 /// 搬回去之后 git 的登记自然就完好了（登记本来就是那个管理目录），不需要
 /// `worktree add` 或 `repair`：前者对已存在的目录一律拒绝，后者在管理目录丢失后
 /// 也救不回来，都验证过。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn restore_worktree(path: String, trash_path: String) -> Result<()> {
     let slot = PathBuf::from(&trash_path);
 
