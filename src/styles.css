@@ -1532,6 +1532,12 @@ body {
   color: #ffcc80;
 }
 
+/* 把自定义命令组推到工具栏右端 */
+.toolbar-spacer {
+  flex: 1;
+  min-width: 12px;
+}
+
 .toolbar-badge {
   /* 数字前留出空隙，否则挨着的箭头会被当成一个数字：↑10 读成 110 */
   padding: 0 5px 0 4px;
