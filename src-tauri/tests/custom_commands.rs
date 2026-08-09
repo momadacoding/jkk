@@ -194,6 +194,42 @@ fn spawn_detached_runs_with_the_given_args_and_cwd() {
     assert!(marker.exists(), "子进程没有在 cwd 里跑起来");
 }
 
+/// 本功能最关键的回归点：仓库路径含空格、`&` 和非 ASCII 字符时，
+/// 参数与 cwd 都必须原样送达。
+///
+/// `&` 是 shell 的命令分隔符——只要哪一层不小心把 argv 拼成了字符串再交给
+/// cmd/sh，这条就会失败，而且失败方式是「执行了半截路径当命令」这种难查的形态。
+/// argv 数组直传的全部意义就在这里。
+#[test]
+fn spawn_detached_survives_spaces_ampersands_and_non_ascii() {
+    let dir = TempDir::new().unwrap();
+    let nasty = dir.path().join("我的 repo & test");
+    fs::create_dir(&nasty).unwrap();
+
+    // 路径同时作为 cwd 和参数出现，两条路径都要覆盖
+    let target = nasty.join("sub dir & more");
+    launcher::spawn_detached(
+        "git",
+        &[
+            "init".to_string(),
+            "--quiet".to_string(),
+            target.to_str().unwrap().to_string(),
+        ],
+        Some(nasty.to_str().unwrap()),
+    )
+    .unwrap();
+
+    let marker = target.join(".git");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !marker.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        marker.exists(),
+        "含空格/&/非 ASCII 的路径没能正确送达：{marker:?}"
+    );
+}
+
 #[test]
 fn spawn_detached_reports_a_missing_executable() {
     let err = launcher::spawn_detached("definitely-not-a-real-program-xyz", &[], None).unwrap_err();

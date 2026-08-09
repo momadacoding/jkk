@@ -11,10 +11,10 @@ worktree：`.claude/worktrees/custom-toolbar-commands`，分支 `worktree-custom
 | 0 准备 worktree | 完成 | 本文件 | 切入确认：`pwd` 在 worktree 内，基点 `a0e1bb3` |
 | 1 配置解析 | 完成 `fc808c2` | `engine/custom_config.rs`、`tests/custom_commands.rs` | `cargo test --test custom_commands` 7/7；fmt + clippy 干净 |
 | 2 launcher | 完成 `47653f7` | `engine/launcher.rs` | 同上测试文件 13/13；fmt + clippy 干净 |
-| 3 Tauri 命令层 | 未开始 | | |
-| 4 前端纯逻辑 | 未开始 | | |
-| 5 前端接线与 UI | 未开始 | | |
-| 6 真机验证与文档 | 未开始 | | |
+| 3 Tauri 命令层 | 完成 `d20fca1` | `commands/custom.rs`、`commands/mod.rs`、`lib.rs` | `cargo test` 全套通过；fmt + clippy 干净 |
+| 4 前端纯逻辑 | 完成 `c09bb08` | `src/engine/customCommands.ts`、`tests/vitest/customCommands.test.ts` | `pnpm test` 159/159（新增 12）；`pnpm build` 通过 |
+| 5 前端接线与 UI | 完成 `1bad363` | `customCommandsStore.ts`、`CustomCommandBar.tsx`、`Toolbar.tsx`、`RepoTab.tsx`、`styles.css` | `pnpm build` + `pnpm test` 通过 |
+| 6 真机验证与文档 | 部分完成 | `README.md`、`e2e/2026-08-09-*.md` | 9 条 E2E 中 2 条已验证（1 条真机观测 + 1 条自动化），**7 条待人工点击** |
 
 ## 决策条目
 
@@ -137,3 +137,95 @@ Task 0 除新增本文件外没有任何改动，不涉及 git 写操作，无�
    不挡调用方；每次启动多一个线程，考虑到点击频率是人手速级别，可接受。
 3. 本 Task 的测试**不涉及任何 git 写操作**，`git init` 建的是 `TempDir` 里的全新仓库，
    随 `TempDir` 析构一并清理，不碰本仓库也不碰用户仓库。
+
+### Task 3：Tauri 命令层
+
+**偏离计划**
+
+一处：计划给的 `lib.rs` 补丁片段用了 6 空格缩进，实际文件是 12 空格
+（`1864d60` 全仓 cargo fmt 之后的形态）。按文件实际缩进插入，`cargo fmt --check` 通过。
+
+**计划的错误**
+
+无。
+
+**计划没写的坑**
+
+无。
+
+**为什么这么改是安全的**
+
+`open_custom_commands_config` **不接受路径参数**（这一点在写计划时就把 spec 从
+`open_in_default_app(path)` 收窄成了现在的形态）。它自己解析配置目录、
+确保文件存在，再交给系统默认程序打开。前端因此没有能力让系统去打开一个
+它自己拼出来的任意路径——把「用默认程序打开任意路径」这个能力挡在了 API 之外。
+
+### Task 4：前端纯逻辑
+
+**偏离计划**
+
+无。
+
+**计划没写的坑**
+
+`EnterWorktree` 建出来的新 worktree **没有 `node_modules`**，`pnpm test` 直接报
+`'vitest' is not recognized`。计划里没有 `pnpm install` 这一步。
+后续在新 worktree 里执行本计划的人需要先装依赖。
+
+**为什么这么改是安全的**
+
+占位符展开用**函数形式**的 `String.replace` 而不是字符串形式。字符串替换里
+`$&`、`$1` 有特殊含义，而仓库路径是用户给的、什么字符都可能有——
+`路径里的 $& $1 是字面量` 这条用例就是钉这个的。
+
+整段只扫一遍，替换进去的值不会被二次展开（`替换结果里的占位符不会被二次展开`），
+避免了「路径里恰好含 `$BRANCH` 就被再解释一次」这类注入形态。
+
+正则用 `\b` 收尾，`$HEADER` 不会被吃成 `$HEAD` + `ER`。
+
+### Task 5：前端接线与 UI
+
+**偏离计划**
+
+无。
+
+**为什么这么改是安全的**
+
+自定义命令是**全局**配置而不是仓库状态，所以单独开了 `customCommandsStore.ts`
+而没有塞进 `repoStore`——后者是 per-tab 的仓库状态，混进去会让两种生命周期纠缠。
+组件通过 store 拿数据，没有绕过 store 直接 `invoke`（AGENTS.md §7.5）。
+
+### Task 6：真机验证与文档
+
+**偏离计划（一）——E2E 第 9 条改为自动化**
+
+计划要求手工新建名为 `我的 repo & test` 的 fixture 仓库，在窗口里点按钮验证。
+改成了 Rust 集成测试 `spawn_detached_survives_spaces_ampersands_and_non_ascii`，
+路径**同时**作为 cwd 和参数传入。
+
+理由：手点一次只覆盖一次，回归时不会重做；而 `&` 一旦被某层拼进 shell 字符串，
+失败形态是「执行了半截路径当命令」，靠肉眼看窗口很难判定。自动化覆盖面更宽且可重复。
+
+**偏离计划（二）——E2E 第 2-8 条未执行**
+
+计划 Task 6 Step 2 要求在真实窗口里走完 9 条清单。**实际只完成了 2 条**：
+
+- 第 1 条：`pnpm tauri dev` 启动后，`%APPDATA%\com.tauri.dev\customCommands.json`
+  被创建且内容正确 —— 这同时证明了 invoke 链路全通（命令注册、
+  `app_config_dir()` 解析、serde 序列化）
+- 第 9 条：改为自动化测试
+
+第 2-8 条需要在窗口里点击，实现过程中无法操作 GUI，**未验证**。
+已在 E2E 文档里逐条标注为「⬜ 待人工」，没有当作通过。合并前需由人补完。
+
+**计划没写的坑**
+
+`read_custom_commands` 会在 `CustomCommandBar` 挂载时被调用，因此
+「配置文件是否被正确创建」这件事**不需要点任何按钮**就能观测到。
+这让第 1 条成了验证整条 invoke 链路最省力的探针。
+
+**为什么这么改是安全的**
+
+E2E 文档用三级标记（✅ 自动化 / ✅ 真机观测 / ⬜ 待人工）区分证据强度，
+未验证的条目没有被记成通过。README 同步了配置文件位置、字段、占位符
+和「配置坏了不覆盖」的行为（AGENTS.md §9.3）。

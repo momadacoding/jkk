@@ -102,6 +102,49 @@ cd src-tauri && cargo check
 - [x] 文件系统监听自动刷新
 - [x] merge / rebase / cherry-pick 状态横幅
 - [x] 大仓库提交数上限保护（5000 commits）
+- [x] 工具栏自定义命令（见下节）
+
+## 工具栏自定义命令
+
+工具栏右侧可以配置任意本地命令，用来把当前 worktree 交给外部程序，
+比如在编辑器里打开、在该目录起一个终端、或者在文件管理器里定位。
+
+配置文件位置：
+
+| 平台 | 路径 |
+|---|---|
+| Windows | `%APPDATA%\com.tauri.dev\customCommands.json` |
+| macOS | `~/Library/Application Support/com.tauri.dev/customCommands.json` |
+| Linux | `~/.config/com.tauri.dev/customCommands.json` |
+
+首次启动会写出一份当前平台的默认预设。点工具栏最右侧的 `⚙` →
+**Edit commands…** 用系统默认程序打开它，改完点 **Reload** 生效（不会自动重载）。
+
+```json
+{
+  "version": 1,
+  "commands": [
+    { "id": "vscode", "label": "VS Code", "program": "code", "args": ["$WORKTREE"] }
+  ]
+}
+```
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `id` | 是 | 稳定标识 |
+| `label` | 是 | 按钮上的文字 |
+| `program` | 是 | 可执行文件名或绝对路径 |
+| `args` | 否 | 参数数组，默认 `[]`。逐项做占位符替换 |
+| `cwd` | 否 | 子进程工作目录，默认 `"$WORKTREE"` |
+
+可用占位符：`$WORKTREE`（当前 worktree 绝对路径）、`$BRANCH`、`$HEAD`（完整 oid）。
+未知占位符原样保留。
+
+两点说明：
+
+- 参数以数组形式直接传给系统，**不经过 shell 解释**。含空格或 `&` 的仓库路径是安全的，
+  但也因此写不了 `cd x && y` 这类复合命令——需要的话把它包成一个脚本文件再调。
+- JSON 写错时程序**不会覆盖你的文件**，只会在 `⚙` 上显示 `⚠` 并把解析错误显示出来。
 
 ## 设计文档
 
@@ -111,6 +154,9 @@ cd src-tauri && cargo check
   - `docs/superpowers/plans/2026-08-04-mygitclient-graph-rendering-plan.md`
   - `docs/superpowers/plans/2026-08-04-mygitclient-ui-closure-plan.md`
 - E2E 验证清单：`docs/superpowers/e2e/2026-08-04-mygitclient-e2e-checklist.md`
+- 工具栏自定义命令：`docs/superpowers/specs/2026-08-09-custom-toolbar-commands-design.md`、
+  `docs/superpowers/plans/2026-08-09-custom-toolbar-commands.md`、
+  `docs/superpowers/e2e/2026-08-09-custom-toolbar-commands.md`
 
 ## 注意事项
 
