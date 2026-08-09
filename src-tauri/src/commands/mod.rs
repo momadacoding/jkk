@@ -1,3 +1,4 @@
+pub mod custom;
 pub mod diff;
 pub mod graph;
 pub mod ops;

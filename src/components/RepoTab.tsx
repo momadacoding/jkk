@@ -454,7 +454,12 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
           </span>
         </div>
       )}
-      <Toolbar branch={state.head} upstream={state.upstream} onRun={runToolbar} />
+      <Toolbar
+        branch={state.head}
+        upstream={state.upstream}
+        onRun={runToolbar}
+        commandContext={{ worktree: state.path, branch: state.head, headHash: state.headHash }}
+      />
       <div className="repo-path-bar" title={state.path ?? ''}>{state.path} @ {state.head}</div>
       <div style={{ flex: 1, overflow: 'hidden' }}>
         <Group orientation="horizontal">

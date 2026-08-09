@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useState } from 'react'
 import { askConfirm } from '../engine/confirm'
+import type { CommandContext } from '../engine/customCommands'
 import type { UpstreamInfo } from '../engine/types'
 import { planToolbarAction, type ToolbarAction } from '../engine/toolbarActions'
+import { CustomCommandBar } from './CustomCommandBar'
 
 /**
  * 跟踪 Ctrl 是否按下。
@@ -33,11 +35,13 @@ interface ToolbarProps {
   upstream: UpstreamInfo | null
   /** 执行一次工具栏动作；由 RepoTab 负责 invoke 与刷新。 */
   onRun: (command: string, args: Record<string, unknown>) => Promise<void>
+  /** 自定义命令的占位符取值来源；未打开仓库时 worktree 为 null。 */
+  commandContext: CommandContext
 }
 
 const ACTIONS: ToolbarAction[] = ['fetch', 'pull', 'push', 'stash']
 
-export function Toolbar({ branch, upstream, onRun }: ToolbarProps) {
+export function Toolbar({ branch, upstream, onRun, commandContext }: ToolbarProps) {
   const ctrl = useCtrlHeld()
   const [busy, setBusy] = useState<ToolbarAction | null>(null)
 
@@ -86,6 +90,8 @@ export function Toolbar({ branch, upstream, onRun }: ToolbarProps) {
           </button>
         )
       })}
+      <span className="toolbar-spacer" />
+      <CustomCommandBar context={commandContext} />
     </div>
   )
 }

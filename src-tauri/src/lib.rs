@@ -18,6 +18,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::diff::read_diff,
+            commands::custom::open_custom_commands_config,
+            commands::custom::read_custom_commands,
+            commands::custom::run_custom_command,
             commands::diff::read_status,
             commands::graph::load_graph,
             commands::ops::branch_delete_info,

@@ -102,6 +102,87 @@ cd src-tauri && cargo check
 - [x] 文件系统监听自动刷新
 - [x] merge / rebase / cherry-pick 状态横幅
 - [x] 大仓库提交数上限保护（5000 commits）
+- [x] 工具栏自定义命令（见下节）
+
+## 工具栏自定义命令
+
+工具栏右侧可以配置任意本地命令，用来把当前 worktree 交给外部程序，
+比如在编辑器里打开、在该目录起一个终端、或者在文件管理器里定位。
+
+配置文件位置：
+
+| 平台 | 路径 |
+|---|---|
+| Windows | `%APPDATA%\com.momadacoding.jkk\customCommands.json` |
+| macOS | `~/Library/Application Support/com.momadacoding.jkk/customCommands.json` |
+| Linux | `~/.config/com.momadacoding.jkk/customCommands.json` |
+
+首次启动会写出一份当前平台的默认预设。点工具栏最右侧的 `⚙` →
+**Edit commands…** 用系统默认程序打开它，改完点 **Reload** 生效（不会自动重载）。
+
+```json
+{
+  "version": 1,
+  "commands": [
+    { "id": "vscode", "label": "VS Code", "program": "code", "args": ["$WORKTREE"] }
+  ]
+}
+```
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `id` | 是 | 稳定标识 |
+| `label` | 是 | 按钮上的文字 |
+| `program` | 是 | 可执行文件名或绝对路径 |
+| `args` | 否 | 参数数组，默认 `[]`。逐项做占位符替换 |
+| `cwd` | 否 | 子进程工作目录，默认 `"$WORKTREE"` |
+
+可用占位符：`$WORKTREE`（当前 worktree 绝对路径）、`$BRANCH`、`$HEAD`（完整 oid）。
+未知占位符原样保留。
+
+### `args` 必须逐项拆开
+
+参数以数组形式直接传给系统，**不经过 shell 解释**。因此 `args` 的**每个元素就是一个
+命令行参数**，不能把一整条命令行塞进一个字符串——那会被目标程序当成**单个**参数。
+
+这是最容易踩的坑，且失败时界面**不会有任何提示**（原因见下）。
+
+❌ 错误——整串塞进一个元素：
+
+```json
+"args": ["-NoProfile -Command \"Write-Output hi\""]
+```
+
+PowerShell 收到的是一个参数，于是把整串当成脚本文件名去找：
+
+```
+The argument '-NoProfile -Command "Write-Output hi"' is not recognized as
+the name of a script file.
+```
+
+✅ 正确——逐项拆开：
+
+```json
+"args": ["-NoProfile", "-Command", "Write-Output hi"]
+```
+
+带空格的**单个**参数仍然写成一个元素，不需要加引号——不经过 shell，也就不存在
+被空格拆开的问题：
+
+```json
+"args": ["--folder-uri", "$WORKTREE", "--goto", "src/main.rs:42"]
+```
+
+### 已知限制
+
+- **写不了复合命令。** `cd x && y`、管道、重定向都依赖 shell，这里没有 shell。
+  需要的话把它包成一个 `.ps1` / `.cmd` / `.sh` 脚本文件再调用那个文件。
+- **程序启动之后的失败是静默的。** 本功能只负责把进程拉起来就返回，不等它退出
+  （否则点一下编辑器就会把界面卡到编辑器关闭为止），子进程的 stdout / stderr 也被丢弃。
+  所以「可执行文件找不到」会报错，但「程序起来了、自己参数没解析对」**不会有任何提示**，
+  表现就是点了按钮什么都没发生。遇到这种情况，先把同样的 `program` + `args`
+  在终端里手动跑一遍，看真实报错。
+- **JSON 写错时程序不会覆盖你的文件**，只会在 `⚙` 上显示 `⚠` 并把解析错误显示出来。
 
 ## 设计文档
 
@@ -111,6 +192,9 @@ cd src-tauri && cargo check
   - `docs/superpowers/plans/2026-08-04-mygitclient-graph-rendering-plan.md`
   - `docs/superpowers/plans/2026-08-04-mygitclient-ui-closure-plan.md`
 - E2E 验证清单：`docs/superpowers/e2e/2026-08-04-mygitclient-e2e-checklist.md`
+- 工具栏自定义命令：`docs/superpowers/specs/2026-08-09-custom-toolbar-commands-design.md`、
+  `docs/superpowers/plans/2026-08-09-custom-toolbar-commands.md`、
+  `docs/superpowers/e2e/2026-08-09-custom-toolbar-commands.md`
 
 ## 注意事项
 
