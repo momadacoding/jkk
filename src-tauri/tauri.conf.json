@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "mygitclient",
   "version": "0.1.0",
-  "identifier": "com.tauri.dev",
+  "identifier": "com.momadacoding.jkk",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://127.0.0.1:5174",

@@ -210,9 +210,10 @@ Task 0 除新增本文件外没有任何改动，不涉及 git 写操作，无�
 
 计划 Task 6 Step 2 要求在真实窗口里走完 9 条清单。**实际只完成了 2 条**：
 
-- 第 1 条：`pnpm tauri dev` 启动后，`%APPDATA%\com.tauri.dev\customCommands.json`
-  被创建且内容正确 —— 这同时证明了 invoke 链路全通（命令注册、
-  `app_config_dir()` 解析、serde 序列化）
+- 第 1 条：`pnpm tauri dev` 启动后，配置文件被创建且内容正确 —— 这同时证明了
+  invoke 链路全通（命令注册、`app_config_dir()` 解析、serde 序列化）。
+  首次观测时路径还是 `%APPDATA%\com.tauri.dev\`，之后 Task 7 改了 identifier，
+  已按新路径重新验证
 - 第 9 条：改为自动化测试
 
 第 2-8 条需要在窗口里点击，实现过程中无法操作 GUI，**未验证**。
@@ -229,3 +230,47 @@ Task 0 除新增本文件外没有任何改动，不涉及 git 写操作，无�
 E2E 文档用三级标记（✅ 自动化 / ✅ 真机观测 / ⬜ 待人工）区分证据强度，
 未验证的条目没有被记成通过。README 同步了配置文件位置、字段、占位符
 和「配置坏了不覆盖」的行为（AGENTS.md §9.3）。
+
+### Task 7（计划外）：把 bundle identifier 从模板默认值改掉
+
+**偏离计划**
+
+本 Task 不在原计划里，是实现完成后用户提出的追加改动：
+`tauri.conf.json` 的 `identifier` 从 Tauri 模板默认值 `com.tauri.dev`
+改为 `com.momadacoding.jkk`（与仓库名 `momadacoding/jkk` 对齐）。
+
+**为什么必须改，而不只是好看**
+
+`identifier` 决定 `app_config_dir()` 的落点（`config_dir()/${identifier}`），
+用户会在 `%APPDATA%` 下看到一个叫「com.tauri.dev」的目录，和 mygitclient 对不上号。
+
+更硬的理由：Tauri CLI 的 changelog 明确写着
+**"Prevent building when the bundle identifier is the default `com.tauri.dev`"**——
+保持默认值的话 `pnpm tauri build` 会被直接拒绝。这不是审美问题，是发布的前置条件。
+
+**计划没写的坑——这是一次破坏性变更**
+
+改 identifier 会让配置目录整体搬家：
+
+| | 旧 | 新 |
+|---|---|---|
+| Windows | `%APPDATA%\com.tauri.dev\` | `%APPDATA%\com.momadacoding.jkk\` |
+
+对已经写过配置的用户，表现是「我的自定义命令全没了」——实际上老文件还在老目录里，
+只是程序不再去那里找。**本次没有做迁移，也没有删除老目录下的文件。**
+
+选择不做迁移的理由：本功能尚未发布，唯一存在老配置的机器就是本开发机，
+为一个零真实用户的场景写迁移代码不划算。老目录下的
+`%APPDATA%\com.tauri.dev\customCommands.json` 属于仓库之外的用户数据，
+**没有删除**，留给用户自行处理。
+
+若将来在发布后再改 identifier，必须补迁移逻辑，不能照抄这次的做法。
+
+**为什么这么改是安全的**
+
+1. `identifier` 只影响配置目录位置与 bundle 身份，不影响任何命令行为、
+   argv 构造或权限模型。
+2. 全仓搜索 `com.tauri.dev` 已无残留（`node_modules` 下 Tauri CLI 自己的
+   changelog 不算）。README 三个平台的路径表、spec、E2E 清单、
+   `commands/custom.rs` 的文档注释同步更新。
+3. 改完重新跑了完整门槛并用 `pnpm tauri dev` 真机确认新路径下的配置文件被正确创建。

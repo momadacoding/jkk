@@ -18,7 +18,7 @@
 
 | # | 场景 | 结果 | 证据 |
 |---|---|---|---|
-| 1 | 首次启动创建 `%APPDATA%\com.tauri.dev\customCommands.json`，内容为三条默认预设 | ✅ 真机观测 | `pnpm tauri dev` 启动后该文件存在，内容为 vscode / terminal / explorer 三条，字段与序列化格式正确 |
+| 1 | 首次启动创建 `%APPDATA%\com.momadacoding.jkk\customCommands.json`，内容为三条默认预设 | ✅ 真机观测 | `pnpm tauri dev` 启动后该文件存在，内容为 vscode / terminal / explorer 三条，字段与序列化格式正确 |
 | 2 | 未打开仓库时三个按钮置灰，`⚙` 仍可点 | ⬜ 待人工 | 逻辑侧由 `planCustomCommand` 在 `worktree === null` 时返回 `null` 保证（vitest 覆盖），但**置灰的视觉效果未在窗口中确认** |
 | 3 | Explorer 按钮 → 文件管理器定位到当前 worktree | ⬜ 待人工 | — |
 | 4 | Terminal 按钮 → 终端在该 worktree 目录打开 | ⬜ 待人工 | — |

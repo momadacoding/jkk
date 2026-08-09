@@ -113,9 +113,9 @@ cd src-tauri && cargo check
 
 | 平台 | 路径 |
 |---|---|
-| Windows | `%APPDATA%\com.tauri.dev\customCommands.json` |
-| macOS | `~/Library/Application Support/com.tauri.dev/customCommands.json` |
-| Linux | `~/.config/com.tauri.dev/customCommands.json` |
+| Windows | `%APPDATA%\com.momadacoding.jkk\customCommands.json` |
+| macOS | `~/Library/Application Support/com.momadacoding.jkk/customCommands.json` |
+| Linux | `~/.config/com.momadacoding.jkk/customCommands.json` |
 
 首次启动会写出一份当前平台的默认预设。点工具栏最右侧的 `⚙` →
 **Edit commands…** 用系统默认程序打开它，改完点 **Reload** 生效（不会自动重载）。

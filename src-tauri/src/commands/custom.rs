@@ -6,7 +6,7 @@ use tauri::{AppHandle, Manager};
 /// 配置文件路径：`app_config_dir()/customCommands.json`。
 ///
 /// `app_config_dir()` 解析成 `config_dir()/${identifier}`，
-/// Windows 上即 `%APPDATA%\com.tauri.dev\`。
+/// Windows 上即 `%APPDATA%\com.momadacoding.jkk\`。
 fn config_path(app: &AppHandle) -> Result<PathBuf> {
     let dir = app
         .path()

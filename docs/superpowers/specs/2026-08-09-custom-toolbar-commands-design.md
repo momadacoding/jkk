@@ -28,7 +28,7 @@
 ### 2.1 位置与格式
 
 配置文件位于 `app_config_dir()/customCommands.json`。
-Windows 下即 `%APPDATA%\com.tauri.dev\customCommands.json`。
+Windows 下即 `%APPDATA%\com.momadacoding.jkk\customCommands.json`。
 
 ```json
 {

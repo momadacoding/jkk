@@ -724,7 +724,7 @@ use tauri::{AppHandle, Manager};
 /// 配置文件路径：`app_config_dir()/customCommands.json`。
 ///
 /// `app_config_dir()` 解析成 `config_dir()/${identifier}`，
-/// Windows 上即 `%APPDATA%\com.tauri.dev\`。
+/// Windows 上即 `%APPDATA%\com.momadacoding.jkk\`。
 fn config_path(app: &AppHandle) -> Result<PathBuf> {
     let dir = app
         .path()
@@ -1257,7 +1257,7 @@ pnpm tauri dev
 
 在真实窗口里确认：
 
-1. 首次启动后 `%APPDATA%\com.tauri.dev\customCommands.json` 被创建，内容是三条默认预设
+1. 首次启动后 `%APPDATA%\com.momadacoding.jkk\customCommands.json` 被创建，内容是三条默认预设
 2. 未打开仓库时三个按钮置灰，`⚙` 仍可点
 3. 打开一个仓库后按 Explorer → 文件管理器定位到该 worktree
 4. 按 Terminal → 终端在该 worktree 目录里打开
@@ -1292,9 +1292,9 @@ README 是对外主索引，新增了用户可见的配置文件就必须同步�
 
 | 平台 | 路径 |
 |---|---|
-| Windows | `%APPDATA%\com.tauri.dev\customCommands.json` |
-| macOS | `~/Library/Application Support/com.tauri.dev/customCommands.json` |
-| Linux | `~/.config/com.tauri.dev/customCommands.json` |
+| Windows | `%APPDATA%\com.momadacoding.jkk\customCommands.json` |
+| macOS | `~/Library/Application Support/com.momadacoding.jkk/customCommands.json` |
+| Linux | `~/.config/com.momadacoding.jkk/customCommands.json` |
 
 首次启动会写出一份当前平台的默认预设。点工具栏最右侧的 `⚙` →
 **Edit commands…** 用系统默认程序打开它，改完点 **Reload** 生效（不会自动重载）。
