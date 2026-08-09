@@ -1,4 +1,5 @@
 pub mod branch;
+pub mod custom_config;
 pub mod diff;
 pub mod file_lock;
 pub mod git_cli;
