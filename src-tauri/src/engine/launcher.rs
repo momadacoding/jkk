@@ -1,6 +1,7 @@
+use crate::engine::proc::hidden_command;
 use crate::error::{GitError, Result};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 fn not_found(program: &str) -> GitError {
     GitError::new(
@@ -45,14 +46,17 @@ pub fn resolve_program(program: &str) -> Result<PathBuf> {
 
 /// 启动一个外部程序并立即返回。
 ///
-/// 三个要点：
+/// 四个要点：
 /// 1. 只 `spawn` 不 `wait`——等编辑器退出会把整个 UI 卡死。
 /// 2. 标准流全部接到 null，不让子进程继承 GUI 进程的句柄。
 /// 3. args 是数组，直传给 CreateProcess/execvp，**不经过 shell**。
 ///    仓库路径里的空格、`&`、中文因此不会被解析成新命令。
+/// 4. 走 [`hidden_command`] 不分配 console 窗口。`code.cmd` 这类 `.cmd`/`.bat`
+///    由 std 经 cmd.exe 启动，在装机版上会闪黑框；反正标准流已经全接到 null，
+///    那个窗口里本来也看不到任何输出。
 pub fn spawn_detached(program: &str, args: &[String], cwd: Option<&str>) -> Result<()> {
     let resolved = resolve_program(program)?;
-    let mut command = Command::new(&resolved);
+    let mut command = hidden_command(&resolved);
     command
         .args(args)
         .stdin(Stdio::null())

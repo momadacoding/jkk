@@ -1,6 +1,6 @@
-use crate::error::{GitError, Result};
+use crate::engine::git_cli::run_git_bytes;
+use crate::error::Result;
 use serde::Serialize;
-use std::process::Command;
 
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -12,19 +12,12 @@ pub struct Worktree {
     pub is_main: bool,
 }
 
+/// 走 `run_git_bytes` 而不是自己拼 `Command`：这样才能一并拿到 `GIT_TERMINAL_PROMPT=0`
+/// 和 `CREATE_NO_WINDOW`。之前这里是全仓唯一绕开 `git_cli` 的 git 调用，装机版上
+/// 每次刷新 worktree 列表都会闪一个 console 黑框。
 pub fn read_worktrees(path: &str) -> Result<Vec<Worktree>> {
-    let output = Command::new("git")
-        .current_dir(path)
-        .args(["worktree", "list", "--porcelain", "-z"])
-        .output()?;
-    if !output.status.success() {
-        return Err(GitError::new(
-            "git_cli",
-            String::from_utf8_lossy(&output.stderr).to_string(),
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_worktrees(&stdout))
+    let stdout = run_git_bytes(path, &["worktree", "list", "--porcelain", "-z"])?;
+    Ok(parse_worktrees(&String::from_utf8_lossy(&stdout)))
 }
 
 /// 解析 `git worktree list --porcelain -z` 的输出。
