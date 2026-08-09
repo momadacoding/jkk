@@ -13,7 +13,7 @@ fn has_upstream(path: &str) -> bool {
     run_git(path, &["rev-parse", "--abbrev-ref", "@{upstream}"]).is_ok()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fetch(path: String, all: bool) -> Result<()> {
     // all 对应界面上按住 Ctrl 的变体
     if all {
@@ -24,7 +24,7 @@ pub fn fetch(path: String, all: bool) -> Result<()> {
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn pull(path: String, rebase: bool) -> Result<()> {
     // 默认不带参数，尊重用户自己的 pull.rebase 配置——
     // 这是 git 客户端最不意外的行为
@@ -36,7 +36,7 @@ pub fn pull(path: String, rebase: bool) -> Result<()> {
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn push(path: String, force: bool) -> Result<()> {
     let branch = current_branch(&path)?;
     // 新分支没有上游，裸 push 会直接失败，自动补 -u 省掉一次无谓的报错

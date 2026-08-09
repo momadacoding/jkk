@@ -1,6 +1,6 @@
 use crate::engine;
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_tree(
     path: String,
     rev: String,
@@ -8,7 +8,7 @@ pub fn list_tree(
     engine::tree::list_tree(&path, &rev)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn read_blob(
     path: String,
     rev: String,

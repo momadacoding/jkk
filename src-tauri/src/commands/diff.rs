@@ -1,13 +1,13 @@
 use crate::engine;
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn read_status(
     path: String,
 ) -> Result<crate::engine::diff::StatusData, crate::error::GitError> {
     engine::diff::read_status(&path)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn read_diff(
     path: String,
     scope: String,

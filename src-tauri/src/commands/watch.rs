@@ -49,7 +49,7 @@ fn is_relevant(repo: Option<&git2::Repository>, root: &Path, target: &Path) -> b
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn watch_repo(handle: AppHandle, path: String) -> Result<()> {
     let key = normalize(&path);
     let my_gen = {
@@ -124,7 +124,7 @@ pub fn watch_repo(handle: AppHandle, path: String) -> Result<()> {
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn unwatch_repo(path: String) -> Result<()> {
     let key = normalize(&path);
     let mut map = watchers().lock().map_err(|_| lock_err())?;
