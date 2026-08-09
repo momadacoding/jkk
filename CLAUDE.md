@@ -34,7 +34,10 @@ cargo clippy --all-targets
 cargo fmt --check
 ```
 
-本仓库**没有 lint 工具、没有 CI**。前端唯一的静态检查是 `pnpm build` 里的 `tsc`，且 `tsc` 只覆盖 `src/`，不覆盖 `tests/vitest/`。详见 `AGENTS.md` §5。
+本仓库**没有 lint 工具、没有 PR 门禁 CI**。前端唯一的静态检查是 `pnpm build` 里的 `tsc`，且 `tsc` 只覆盖 `src/`，不覆盖 `tests/vitest/`。详见 `AGENTS.md` §5。
+
+唯一的 workflow 是 `.github/workflows/release.yml`，只在打 `v*` tag 或手动触发时跑，
+不会因为 push 或开 PR 而运行。日常改动的验证仍然全靠本地手工执行。
 
 这些命令是速查，不替代 `AGENTS.md` 中的验证规则与命令发现规则。
 

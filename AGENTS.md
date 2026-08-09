@@ -166,7 +166,7 @@
 - MUST：创建 PR 默认为 Draft（`gh pr create --draft`）；仅当用户明确要求创建正式（ready）PR 时才省略 `--draft`。
 - MUST：**独立 review 门槛**：走 PR 流程的改动合并前，必须由**独立于本 PR 实现者的人或 agent** 完成一次 review（实现者的自查不满足该门槛，self-merge 不被接受）。可用 `/code-review`、独立 review subagent 或 Codex 二次意见满足。review 按 §13 rubric 执行，发现的高危问题合并前必须修复。下一条纯文档例外不受此门槛约束。
 - MUST：**纯文档提交例外**：仅新增或修改文档（改动完全落在 `docs/**`、`*.md`），允许直接在 `master` 分支提交并 push，无需 worktree、无需 PR。此例外**只适用于文档，不适用于任何代码改动**；一旦同一提交夹带任何代码变更，例外立即失效，必须回到 worktree + 分支 + PR 流程。
-- MUST：本仓库当前**没有配置 CI**（无 `.github/workflows/`）。禁止宣称「CI 通过」或等待 CI 结果；所有验证必须本地实际执行并如实报告（见 §5）。
+- MUST：本仓库**没有 PR 门禁 CI**。唯一的 workflow 是 `.github/workflows/release.yml`，它只在**打 `v*` tag** 或手动触发时运行，`push` 和 `pull_request` 都不会触发它。因此针对 PR 或分支改动，禁止宣称「CI 通过」或等待 CI 结果；所有验证必须本地实际执行并如实报告（见 §5）。只有在真的打了 tag、且实际查看过那次 run 的结论之后，才可以引用 CI 结果。
 
 ### 4.2 开始代码修改前的自检
 

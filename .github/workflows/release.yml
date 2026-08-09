@@ -1,0 +1,102 @@
+# 打 tag 触发构建并发 Release。
+#
+# 这**不是** PR 门禁：本仓库没有 PR CI，push 和 pull_request 都不会跑这个 workflow。
+# 合并前的验证仍然靠本地手工执行（见 AGENTS.md §5）。
+#
+# 手动跑（`workflow_dispatch`）时只构建、不发 Release，用来在真打 tag 之前
+# 确认 CI 环境能把包编出来。
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# 只需要建 Release 和传产物
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # MSRV 钉在 1.77.2（src-tauri/Cargo.toml 的 rust-version）。
+      # 这里用 stable 而不是钉死 1.77.2：钉死的话本地能过、CI 也能过，
+      # 但谁都不会发现依赖悄悄用了更新的语言特性。stable 编得过就说明真的能编。
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: pnpm install --frozen-lockfile
+
+      # 发版前把本地那套门槛在干净环境里再走一遍。
+      # 没有 PR CI，这是唯一一次「不是在我这台机器上」的验证。
+      - run: pnpm test
+      - run: pnpm build
+      - name: cargo fmt --check
+        run: cargo fmt --check --manifest-path src-tauri/Cargo.toml
+      - name: cargo clippy
+        run: cargo clippy --all-targets --manifest-path src-tauri/Cargo.toml -- -D warnings
+      - name: cargo test
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      # beforeBuildCommand 会再跑一次 pnpm build，这是 tauri.conf.json 里配好的，
+      # 重复一次几秒钟，不值得为省它去动配置
+      - name: tauri build
+        run: pnpm tauri build
+
+      - name: Collect installers
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path artifacts -Force | Out-Null
+          $bundle = 'src-tauri/target/release/bundle'
+          $found = Get-ChildItem $bundle -Recurse -Include *.exe, *.msi -ErrorAction SilentlyContinue
+          if (-not $found) { throw "在 $bundle 下没找到任何 .exe/.msi 产物" }
+          $found | ForEach-Object { Copy-Item $_.FullName artifacts/ }
+          Get-ChildItem artifacts | Select-Object Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jkk-windows
+          path: artifacts/*
+
+      # 只有 tag 触发时才发 Release；手动触发到上一步为止。
+      # 发成 draft：产物传上去之后由人过目一眼再点发布。
+      #
+      # 注意：这里**不能**用 PowerShell 的 here-string（@" ... "@）。YAML 块标量
+      # 要求每一行都带缩进，而 here-string 的结束符必须顶格，两者冲突，
+      # 整个 workflow 会解析失败。用数组 -join 拼多行文本。
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = '${{ github.ref_name }}'
+          $notes = @(
+            '安装包**未做代码签名**，Windows 会弹 SmartScreen「未知发布者」警告。'
+            '点「更多信息」→「仍要运行」即可。'
+            ''
+            '产物：'
+            '- `*-setup.exe` —— NSIS 安装器'
+            '- `*.msi` —— MSI 安装包'
+          ) -join "`n"
+          $files = @(Get-ChildItem artifacts | ForEach-Object { $_.FullName })
+          gh release create $tag @files --title $tag --notes $notes --draft
+          if ($LASTEXITCODE -ne 0) { throw "gh release create 失败：$LASTEXITCODE" }
