@@ -1,0 +1,56 @@
+Copyright (c) 2026 momadacoding. All rights reserved.
+
+This software and its source code are proprietary and confidential.
+
+No permission is granted to any person to use, copy, modify, merge, publish,
+distribute, sublicense, sell, or create derivative works of this software or
+its source code, in whole or in part, without the prior written permission of
+the copyright holder.
+
+Released binaries are provided for the copyright holder's own use and for
+people explicitly authorized by the copyright holder. Redistribution of those
+binaries is not permitted.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+---
+
+Third-party components
+
+The terms above apply to this project's own source code and assets only. This
+software links against third-party open-source components, each of which
+remains under its own license.
+
+THIRD_PARTY_NOTICES.md, distributed alongside this file and installed with the
+application, is the authoritative inventory. It is generated from the lockfiles
+by `scripts/gen-notices.mjs` and lists every component that is actually
+compiled into the distributed binary, together with the license texts and
+copyright notices those licenses require to be preserved on distribution.
+
+Some upstream packages ship no license file of their own and declare only an
+SPDX identifier. For those, the notices file reproduces the standard text of
+the declared license (kept in `scripts/license-texts/`) and derives the
+copyright attribution from the package's own metadata; each such component is
+listed explicitly in that file. The generator fails rather than emitting a
+notices file with a component it cannot cover, so a component silently missing
+its license text cannot reach a release.
+
+Two entries there are worth calling out because they shape the distribution
+terms above:
+
+  - libgit2, the C library vendored by the libgit2-sys crate, is under
+    GPL-2.0 WITH a linking exception. The exception grants "unlimited
+    permission to link the compiled version of this library into combinations
+    with other programs, and to distribute those combinations without any
+    restriction" - that exception is what permits distributing this binary
+    under the proprietary terms above. Note that the git2 and libgit2-sys
+    crates declare MIT OR Apache-2.0 in their own manifests; that covers the
+    Rust bindings, not the vendored C library.
+
+  - tao is Apache-2.0 only, not the MIT OR Apache-2.0 dual license used by
+    most of the surrounding Tauri crates.

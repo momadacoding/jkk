@@ -22,10 +22,13 @@
 
 ```
 .
+├── .github/workflows/
+│   └── release.yml   # 打 v* tag 触发构建并发 Release（不是 PR 门禁）
 ├── docs/superpowers/
 │   ├── specs/    # 设计规格文档
 │   ├── plans/    # 实现计划
 │   └── e2e/      # E2E 验证清单
+├── scripts/          # 一次性/维护脚本（图标生成等）
 ├── src/              # React 前端
 │   ├── components/   # UI 组件
 │   ├── engine/       # 提交图布局/路径/SVG 渲染
@@ -68,6 +71,63 @@ pnpm tauri build
 ```
 
 产物在 `src-tauri/target/release/bundle/`。
+
+## 发布
+
+打 `v*` tag 会触发 `.github/workflows/release.yml`：在 `windows-latest` 上跑一遍
+测试与 lint 门槛、`pnpm tauri build`，然后把安装包传上去建一个 **draft** Release，
+由人过目后再点发布。
+
+```bash
+# tag 必须打在 master 上。在功能分支或 worktree 里打 tag 同样能构建成功，
+# 发出去的却是没经过 review 的代码，而且从安装包上完全看不出来。
+git checkout master
+git pull --ff-only
+
+# 三处版本号必须一致
+#   package.json / src-tauri/tauri.conf.json / src-tauri/Cargo.toml
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+workflow 会在构建前自行校验三件事，任何一项不过都在几秒内失败：
+
+| 校验 | 拦住什么 |
+|---|---|
+| tag 名是严格 SemVer | 畸形 ref（含引号、分号的 tag 名是合法的 git ref） |
+| tag 版本 == 三个清单文件 | 漏改版本号导致 `v0.2.0` 的 Release 里装着 `0.1.0` 的包 |
+| tag 指向的提交已在 master 上 | 在功能分支上误打 tag，发出未经 review 的代码 |
+| 第三方许可清单与锁文件一致 | 依赖变动后忘了重新生成 `THIRD_PARTY_NOTICES.md` |
+| 目标 Release 不是「已发布」状态 | 重跑 workflow 覆盖掉已经公开的安装包 |
+
+同名 Release 若还是 draft（上次传到一半），重跑会复用它并覆盖资产；
+**若已经发布则直接失败** —— 同一版本号对应两份不同的二进制会让审计和回滚失去依据。
+要重发得先手动删掉那个 Release，或换新版本号。
+
+产物含 `SHA256SUMS.txt`，可用来核对下载到的是不是这次构建的东西。
+
+真打 tag 之前可以先在 Actions 页面手动触发一次（`workflow_dispatch`）：
+只构建、不发 Release，用来确认 CI 环境编得出来。
+
+> 这个 workflow **不是 PR 门禁**——`push` 和 `pull_request` 都不会触发它。
+> 日常改动的验证仍然全靠本地手工执行，见 `AGENTS.md` §5。
+
+### 已知：安装包未签名
+
+没有代码签名证书，所以 Windows 会对安装器弹 SmartScreen「未知发布者」警告，
+需要点「更多信息」→「仍要运行」。这是已知取舍，不是构建出了问题。
+
+### 应用图标
+
+`src-tauri/icons/` 下的整套图标由 `src-tauri/icons/source.png` 派生，**不要手工改**：
+
+```bash
+pwsh -File scripts/make-icon.ps1        # 重新生成 1024x1024 源图
+pnpm tauri icon src-tauri/icons/source.png   # 派生全套平台图标
+```
+
+`tauri icon` 会顺带生成 iOS / Android 图标，本项目只做桌面端，那两个目录已在
+`.gitignore` 里。
 
 ## 测试
 
@@ -215,3 +275,19 @@ the name of a script file.
 
 - 写入操作均通过 git CLI 执行，因此要求工作目录在有效的 git 仓库内。
 - 自动刷新监听整个工作区，但只响应 `.git/` 下的变更事件。
+
+## 许可
+
+专有软件，保留所有权利。详见 [LICENSE](LICENSE)。
+
+第三方组件的完整清单与许可正文见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)，
+由锁文件生成，随安装包一起分发（MIT / Apache-2.0 都要求分发物保留这些声明）：
+
+```bash
+node scripts/gen-notices.mjs          # 依赖变动后重新生成
+node scripts/gen-notices.mjs --check  # CI 用：检查有没有漂移
+```
+
+其中 libgit2 是 GPL-2.0 **带链接例外**，该例外正是本项目得以按专有条款分发二进制的依据。
+注意 `git2` / `libgit2-sys` 这两个 crate 自己声明的是 `MIT OR Apache-2.0`，
+那只覆盖 Rust binding，不覆盖它 vendor 进来的 C 代码。

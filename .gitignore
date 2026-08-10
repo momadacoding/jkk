@@ -5,3 +5,8 @@ node_modules/
 dist/
 src-tauri/target/
 .DS_Store
+
+# `pnpm tauri icon` 顺带生成移动端图标，本项目只做桌面端（没有 src-tauri/gen/），
+# 这几十个文件一个也用不上，但每次重跑都会冒出来
+src-tauri/icons/ios/
+src-tauri/icons/android/
