@@ -88,6 +88,19 @@
 5. **Release 建成 draft。** 产物传上去之后由人过目再点发布，
    避免一次手滑的 tag 直接对外可见。
 
+6. **tag 和清单里的版本号会各说各话。** 三个文件（`package.json` /
+   `tauri.conf.json` / `Cargo.toml`）里漏改任何一个，构建照样成功，
+   结果是一个叫 `v0.2.0` 的 Release 里装着 `jkk_0.1.0_x64-setup.exe`——
+   而且要等十几分钟构建跑完、Release 都建出来了才看得见。
+   已在 checkout 之后加一步版本一致性检查，对不上就在几秒内失败。
+   两个方向都实测过：`v0.1.0` 通过，`v0.2.0` 报出三个文件各自的实际版本。
+
+7. **`dtolnay/rust-toolchain@stable` + `-D warnings` 意味着 Rust 发新版可能挡住发版。**
+   新 stable 引入一条新 lint，就会让**已经推上去的 tag** 构建失败，
+   得删 tag 重来。缓解办法是发 tag 前先 `workflow_dispatch` 干跑一次
+   （只构建、不发 Release）。彻底解决要把工具链钉死，那又会让 CI 长期停在旧版本，
+   当前选择保留 `stable` + 干跑习惯。
+
 ### 为什么这么改是安全的
 
 - workflow 的触发条件只有 `v*` tag 和手动触发，不会因为日常 push 而消耗额度。
