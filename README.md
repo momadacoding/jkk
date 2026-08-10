@@ -94,6 +94,7 @@ cd src-tauri && cargo check
 ## MVP 功能范围
 
 - [x] 打开本地仓库，读取 HEAD
+- [x] 会话还原：重启后自动打开上次的标签，空态页列出最近打开过的仓库
 - [x] Sublime Merge 风格的 commit graph（SVG 渲染、viewport 裁剪）
 - [x] 点击提交查看 diff
 - [x] Staging / unstaging / commit / amend
@@ -196,8 +197,21 @@ the name of a script file.
   `docs/superpowers/plans/2026-08-09-custom-toolbar-commands.md`、
   `docs/superpowers/e2e/2026-08-09-custom-toolbar-commands.md`
 
+## 会话还原
+
+关闭应用时会记下当前打开的标签和活动标签，下次启动原样还原。一个标签都没有时
+（首次启动、或把标签全关掉了）显示空态页，上面有 **Open Repository…** 和最近打开列表。
+
+会话存在 `session.json`，和 `customCommands.json` 同一个目录（见上表）。这份文件由程序
+自己维护，**不需要手动编辑**；删掉它等于清空「上次会话 + 最近列表」，不影响任何仓库。
+
+| 行为 | 说明 |
+|---|---|
+| 标签还原 | 已经不是 git 仓库的路径会被跳过，不会还原出一个必然报错的标签 |
+| 最近列表 | 最多 10 条，最新在前。目录暂时不在（移动硬盘、网络盘没连上）只置灰，不删除 |
+| 路径去重 | 反斜杠/正斜杠、大小写、尾部斜杠视为同一个仓库 |
+
 ## 注意事项
 
-- 当前默认打开的路径是 `C:\Users\liuhao\workspace\dev\Dev\mygitclient`，在 `src/App.tsx` 中硬编码，后续会改成启动时选择或记忆上次路径。
 - 写入操作均通过 git CLI 执行，因此要求工作目录在有效的 git 仓库内。
 - 自动刷新监听整个工作区，但只响应 `.git/` 下的变更事件。
