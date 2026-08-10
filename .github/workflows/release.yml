@@ -24,13 +24,25 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+# 所有 action 一律钉到完整 commit SHA。
+#
+# 关键理由不是「防止它们改仓库」——build job 只有 contents: read。
+# 而是**这个 job 里的任何一个 action 都能改最终发出去的安装包**：
+# 它们经手工作区和 artifact，而 publish job 会无条件把 artifact 发布出去。
+# 可变 tag（@v4）随时可能被重新指向，`contents: read` 拦不住这条路径。
+#
+# 但要清楚这买到的是什么：构建期本来就有 257 个依赖的 build.rs 和 npm
+# 生命周期脚本在跑，钉定 action 只是关掉其中一扇门，不等于产物可信。
+#
+# 刷新 SHA（没有 dependabot，需要手工）：
+#   gh api repos/<owner>/<repo>/git/ref/tags/<tag> --jq '.object.sha'
 jobs:
   build:
     runs-on: windows-latest
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # 不把凭据留在 .git/config 里。后面整条链（pnpm 生命周期脚本、
           # build.rs、第三方 action）都能读到那个文件
@@ -87,11 +99,11 @@ jobs:
           }
           Write-Output "校验通过：$ref @ $env:SHA（相对 master：$cmp）"
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 10
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: pnpm
@@ -99,9 +111,16 @@ jobs:
       # MSRV 钉在 1.77.2（src-tauri/Cargo.toml 的 rust-version）。
       # 这里用 stable 而不是钉死 1.77.2：钉死的话本地能过、CI 也能过，
       # 但谁都不会发现依赖悄悄用了更新的语言特性。stable 编得过就说明真的能编。
-      - uses: dtolnay/rust-toolchain@stable
+      #
+      # 钉的是 stable **分支的 commit**，冻的是 action 代码，不是 Rust 版本；
+      # 装哪个 toolchain 由下面的 `toolchain: stable` 在运行时决定。
+      # 这个输入必须显式给：`@stable` 能省略是因为那个分支的 action.yml 给了默认值，
+      # 一旦按 SHA 引用就不能依赖它，而该输入是 required。
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: src-tauri
 
@@ -140,7 +159,7 @@ jobs:
           $found | ForEach-Object { Copy-Item $_.FullName artifacts/ }
           Get-ChildItem artifacts | Select-Object Name, Length
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: jkk-windows
           path: artifacts/*
@@ -156,11 +175,6 @@ jobs:
     permissions:
       contents: write
     steps:
-      # 这个 job 里的 action **钉到完整 commit SHA**。
-      # 它是整个 workflow 里唯一持有 contents: write 的地方，可变 tag（@v4）
-      # 一旦被重新指向，被换掉的代码就直接运行在能改 Release 和仓库内容的
-      # 令牌权限下。build job 的 action 仍用可变 tag：那边只有读权限，
-      # 收益不足以抵消没有 dependabot 时手工追 SHA 的维护成本。
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: jkk-windows
@@ -168,9 +182,13 @@ jobs:
 
       # 发成 draft：产物传上去之后由人过目一眼再点发布。
       #
-      # 幂等：`gh release create` 在同名 Release 已存在时会失败，而资产上传到一半
-      # 失败会留下一个「draft 已建、资产不全」的中间态——那时重跑 job 只会再次
-      # 报 already exists，救不回来。所以拆成「有就复用、没有才建」+ upload --clobber。
+      # 三种状态分开处理，**不能只判断「存在与否」**：
+      #   不存在      -> 建 draft
+      #   存在且是 draft -> 复用并覆盖资产（修复上次传到一半的中间态）
+      #   存在且已发布   -> 直接失败
+      # 最后一种是关键：`--clobber` 会静默替换已经公开的安装包。
+      # 加上 Rust 用的是 stable、同一 tag 重建结果本来就不保证一致，
+      # 覆盖之后「同一个版本号对应不同的二进制」，审计和回滚都失去依据。
       #
       # 注意：这里同样不能把 ${{ github.ref_name }} 直接展开进脚本，理由见 build job。
       # 多行文本用单引号字符串——反引号在其中是字面量，不会被当成命令替换。
@@ -186,14 +204,29 @@ jobs:
           产物：
           - `*-setup.exe` —— NSIS 安装器
           - `*.msi` —— MSI 安装包
+          - `SHA256SUMS.txt` —— 上面两个文件的校验和
 
           第三方组件的许可声明见安装目录下的 THIRD_PARTY_NOTICES.md。'
 
-          if gh release view "$REF_NAME" >/dev/null 2>&1; then
-            echo "Release $REF_NAME 已存在（上次可能传到一半），复用它并覆盖资产"
-          else
-            gh release create "$REF_NAME" --title "$REF_NAME" --notes "$notes" --draft
-          fi
+          # 校验和随包发布，便于核对下载到的是不是这次构建的产物
+          ( cd artifacts && sha256sum ./* > SHA256SUMS.txt )
+          cat artifacts/SHA256SUMS.txt
+
+          # `|| true` 不能少：release 不存在时 gh 返回非零，而这里开着 set -e
+          state=$(gh release view "$REF_NAME" --json isDraft --jq '.isDraft' 2>/dev/null || echo absent)
+          case "$state" in
+            absent)
+              gh release create "$REF_NAME" --title "$REF_NAME" --notes "$notes" --draft ;;
+            true)
+              echo "Release $REF_NAME 仍是 draft（上次可能传到一半），复用并覆盖资产" ;;
+            false)
+              echo "::error::Release $REF_NAME 已经发布，拒绝覆盖已公开的资产。"
+              echo "::error::要重发请先手动删除该 Release，或改用新的版本号。"
+              exit 1 ;;
+            *)
+              echo "::error::无法判断 Release $REF_NAME 的状态：$state"
+              exit 1 ;;
+          esac
 
           gh release upload "$REF_NAME" artifacts/* --clobber
 
@@ -201,5 +234,6 @@ jobs:
           assets=$(gh release view "$REF_NAME" --json assets --jq '.assets[].name')
           echo "已上传的资产："
           echo "$assets"
-          echo "$assets" | grep -q '\.msi$'      || { echo "::error::缺少 .msi 资产"; exit 1; }
-          echo "$assets" | grep -q 'setup\.exe$' || { echo "::error::缺少 setup.exe 资产"; exit 1; }
+          echo "$assets" | grep -q '\.msi$'         || { echo "::error::缺少 .msi 资产"; exit 1; }
+          echo "$assets" | grep -q 'setup\.exe$'    || { echo "::error::缺少 setup.exe 资产"; exit 1; }
+          echo "$assets" | grep -q '^SHA256SUMS.txt$' || { echo "::error::缺少 SHA256SUMS.txt"; exit 1; }

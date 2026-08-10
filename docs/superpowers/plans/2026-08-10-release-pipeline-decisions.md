@@ -279,3 +279,67 @@ pnpm test / fmt / clippy -D warnings / cargo test  ✓ 全 exit 0
 pnpm tauri build               ✓ msi + nsis
 MSI 文件表                      ✓ jkk.exe + THIRD_PARTY_NOTICES.md(564KB) + LICENSE
 ```
+
+---
+
+## Task 4 第三轮 review（Codex adversarial review）
+
+2 条全部核实属实并修复。两条都直接推翻了上一轮我自己的判断。
+
+### 1 [high] 可变 action 能替换最终发出去的安装包
+
+上一轮我只钉了 publish job 的 action，理由是「build job 只有 `contents: read`，
+风险不足以抵消维护成本」。**这个理由是错的**，因为它衡量错了爆炸半径：
+build job 里的 action 经手工作区和 artifact，而 publish job 会**无条件**把
+artifact 发布出去。所以那里的可变 tag 被重指，能直接换掉用户装的二进制，
+`contents: read` 完全拦不住这条路径——它限制的是仓库 API 权限，不是产物内容。
+
+**修复**：全部 7 个 action 一律钉到完整 commit SHA（经 `gh api` 解析各自当前指向）。
+
+一个必须显式处理的细节：`dtolnay/rust-toolchain@stable` 里的 `stable` 是**分支名**，
+该分支的 `action.yml` 给 `toolchain` 输入配了默认值，所以平时能省略。
+按 SHA 引用之后那个默认值不再可依赖，而该输入是 `required: true`
+（实测其 action.yml：为空会直接 `exit 1`），因此必须补 `with: toolchain: stable`。
+另外钉的是 **action 代码**，不是 Rust 版本——装哪个 toolchain 仍由运行时的
+`stable` 决定。
+
+**但要清楚这买到的是什么**：构建期本来就有 257 个依赖的 `build.rs` 和 npm
+生命周期脚本在跑，钉定 action 只关掉了其中一扇门，不等于产物可信。
+决策日志里写明这点，免得下次有人以为「钉了 SHA 就安全了」。
+
+### 2 [high] 重跑会覆盖已经公开发布的资产
+
+上一轮为了让「传到一半」可重试，改成了「存在就复用 + `upload --clobber`」。
+但它**只判断存在与否，不看是不是还在 draft**。于是：Release 已经发布出去、
+有人下载过之后，重跑 workflow（或删 tag 重推）会静默替换掉那些安装包。
+叠加 Rust 用的是 `stable`、同一 tag 重建结果本就不保证一致，
+后果是「同一个版本号对应两份不同的二进制」，审计和回滚都失去依据。
+
+**修复**：改成三态判断——
+
+| 目标 Release 状态 | 行为 |
+|---|---|
+| 不存在 | 建 draft |
+| 存在且仍是 draft | 复用并 `--clobber` 覆盖（修复传到一半的中间态） |
+| 存在且已发布 | **直接失败**，提示先删 Release 或换版本号 |
+
+同时把 `SHA256SUMS.txt` 作为资产一并发布，便于核对下载到的是不是这次构建的产物。
+
+`|| echo absent` 那一步不能省：release 不存在时 `gh` 返回非零，
+而脚本开着 `set -e`，不兜住的话会在判断状态之前就整步失败。
+
+### 修复后的复验
+
+桩 `gh` 覆盖四种状态（`bash -n` 先过语法）：
+
+| 情形 | 结果 |
+|---|---|
+| A 不存在 | create draft → upload → 校验通过，exit 0 |
+| B 仍是 draft、资产不全 | 跳过 create、`--clobber`，**自愈**，exit 0 |
+| C **已发布** | exit 1，且日志里**没有任何 upload**——在动资产之前就拦住了 |
+| D draft 但缺 `SHA256SUMS.txt` | exit 1 |
+
+```
+YAML + 权限 + 钉定           ✓ 7/7 action 全部 PINNED；build=read / publish=write
+publish 脚本四情形（桩 gh）    ✓ 见上表
+```

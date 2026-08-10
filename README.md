@@ -97,6 +97,14 @@ workflow 会在构建前自行校验三件事，任何一项不过都在几秒�
 | tag 名是严格 SemVer | 畸形 ref（含引号、分号的 tag 名是合法的 git ref） |
 | tag 版本 == 三个清单文件 | 漏改版本号导致 `v0.2.0` 的 Release 里装着 `0.1.0` 的包 |
 | tag 指向的提交已在 master 上 | 在功能分支上误打 tag，发出未经 review 的代码 |
+| 第三方许可清单与锁文件一致 | 依赖变动后忘了重新生成 `THIRD_PARTY_NOTICES.md` |
+| 目标 Release 不是「已发布」状态 | 重跑 workflow 覆盖掉已经公开的安装包 |
+
+同名 Release 若还是 draft（上次传到一半），重跑会复用它并覆盖资产；
+**若已经发布则直接失败** —— 同一版本号对应两份不同的二进制会让审计和回滚失去依据。
+要重发得先手动删掉那个 Release，或换新版本号。
+
+产物含 `SHA256SUMS.txt`，可用来核对下载到的是不是这次构建的东西。
 
 真打 tag 之前可以先在 Actions 页面手动触发一次（`workflow_dispatch`）：
 只构建、不发 Release，用来确认 CI 环境编得出来。
