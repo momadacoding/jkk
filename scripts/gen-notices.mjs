@@ -23,7 +23,75 @@ import { fileURLToPath } from 'node:url'
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const outFile = path.join(repoRoot, 'THIRD_PARTY_NOTICES.md')
+const textsDir = path.join(repoRoot, 'scripts', 'license-texts')
 const checkOnly = process.argv.includes('--check')
+
+/**
+ * 有些包（含 tauri 本身）在发布到 crates.io / npm 时**根本不带许可正文文件**，
+ * 只在清单里写一个 SPDX 标识。MIT / BSD 要求分发时保留版权与许可声明，
+ * 光有一个标识不满足要求。
+ *
+ * 对这些包，用 `scripts/license-texts/` 下的标准正文补上，版权归属取自包元数据。
+ * 优先级决定 `A OR B` 这类双许可下我们**选用**哪一个（双许可本来就允许择一）。
+ */
+const CANONICAL_PRIORITY = ['Apache-2.0', 'MIT', 'BSD-3-Clause', 'MPL-2.0']
+
+function loadCanonicalTexts() {
+  const out = new Map()
+  if (!existsSync(textsDir)) return out
+  for (const f of readdirSync(textsDir)) {
+    if (!f.endsWith('.txt')) continue
+    out.set(f.replace(/\.txt$/, ''), readFileSync(path.join(textsDir, f), 'utf8').replace(/\r\n/g, '\n').trim())
+  }
+  return out
+}
+const CANONICAL = loadCanonicalTexts()
+
+/**
+ * 把 SPDX 表达式拆成「必须全部满足的组」，每组内部是可择一的候选。
+ * 认得 `A OR B`、老式的 `A/B`、以及 `A AND B`。
+ */
+function parseLicense(expr) {
+  return String(expr)
+    .split(/\s+AND\s+/i)
+    .map((group) =>
+      group
+        .replace(/[()]/g, '')
+        .split(/\s+OR\s+|\//)
+        .map((s) => s.trim())
+        .filter(Boolean),
+    )
+    .filter((g) => g.length > 0)
+}
+
+/** 从包元数据拼出版权归属行。 */
+function attribution(pkg) {
+  const who = (pkg.authors ?? []).filter(Boolean).join(', ')
+  if (who) return `Copyright (c) ${who}`
+  if (pkg.repository) return `Copyright (c) the ${pkg.name} authors — ${pkg.repository}`
+  return `Copyright (c) the ${pkg.name} authors`
+}
+
+/**
+ * 给没带正文的包挑一份标准正文。
+ * 返回 null 表示补不上——调用方必须让整个流程失败，不能静默放行。
+ */
+function canonicalFor(pkg) {
+  const groups = parseLicense(pkg.license)
+  if (groups.length === 0) return null
+  const chosen = []
+  for (const group of groups) {
+    const pick =
+      CANONICAL_PRIORITY.find((id) => group.some((c) => c.toLowerCase() === id.toLowerCase())) ??
+      group.find((c) => CANONICAL.has(c))
+    if (!pick || !CANONICAL.has(pick)) return null
+    chosen.push(pick)
+  }
+  return chosen.map((id) => ({
+    id,
+    text: CANONICAL.get(id).replace('{{COPYRIGHT}}', attribution(pkg)),
+  }))
+}
 
 /** 许可正文文件的常见名字。 */
 const LICENSE_FILE = /^(LICENSE|LICENCE|COPYING|NOTICE)([-.].*)?$/i
@@ -131,6 +199,7 @@ function rustPackages() {
       version: p.version,
       license: p.license ?? (p.license_file ? `see ${p.license_file}` : 'UNKNOWN'),
       repository: p.repository ?? null,
+      authors: p.authors ?? [],
       // manifest_path 指向 Cargo.toml，许可正文在它旁边
       dir: p.manifest_path ? path.dirname(p.manifest_path) : null,
     }))
@@ -154,6 +223,7 @@ function npmPackages() {
       if (!found.has(key)) {
         let license = 'UNKNOWN'
         let repository = null
+        let authors = []
         const dir = info.path ?? null
         if (dir && existsSync(path.join(dir, 'package.json'))) {
           try {
@@ -163,9 +233,11 @@ function npmPackages() {
                 ? pj.license
                 : pj.license?.type ?? (Array.isArray(pj.licenses) ? pj.licenses.map((l) => l.type).join(' OR ') : 'UNKNOWN')
             repository = typeof pj.repository === 'string' ? pj.repository : pj.repository?.url ?? null
+            const one = (a) => (typeof a === 'string' ? a : a?.name ? `${a.name}${a.email ? ` <${a.email}>` : ''}` : null)
+            authors = [one(pj.author), ...(pj.contributors ?? []).map(one)].filter(Boolean)
           } catch {}
         }
-        found.set(key, { ecosystem: 'npm', name, version: info.version, license, repository, dir })
+        found.set(key, { ecosystem: 'npm', name, version: info.version, license, repository, authors, dir })
         walk(info.dependencies)
       }
     }
@@ -215,18 +287,39 @@ function render(packages) {
   lines.push('## 许可正文')
   lines.push('')
   const texts = new Map() // text -> package labels
-  const missing = []
+  const fallback = [] // 用标准正文补上的包
+  const uncovered = [] // 既没带正文、也补不上的包——必须让流程失败
   for (const p of sorted) {
+    const label = `${p.name} ${p.version} (${p.ecosystem})`
     const files = readLicenseTexts(p.dir)
-    if (files.length === 0) {
-      missing.push(p)
+    if (files.length > 0) {
+      for (const f of files) {
+        if (!texts.has(f.text)) texts.set(f.text, new Set())
+        texts.get(f.text).add(label)
+      }
       continue
     }
-    for (const f of files) {
-      const label = `${p.name} ${p.version} (${p.ecosystem})`
-      if (!texts.has(f.text)) texts.set(f.text, new Set())
-      texts.get(f.text).add(label)
+    // 包里没带正文：用标准正文补
+    const canon = canonicalFor(p)
+    if (!canon) {
+      uncovered.push(p)
+      continue
     }
+    fallback.push(p)
+    for (const c of canon) {
+      if (!texts.has(c.text)) texts.set(c.text, new Set())
+      texts.get(c.text).add(label)
+    }
+  }
+
+  if (uncovered.length) {
+    const detail = uncovered.map((p) => `  ${p.name} ${p.version} (${p.ecosystem}) — ${p.license}`).join('\n')
+    throw new Error(
+      '下列组件既没有随包附带许可正文，也没有对应的标准正文可用：\n' +
+        detail +
+        '\n\n把对应许可的标准正文放到 scripts/license-texts/<SPDX-ID>.txt 再重跑。\n' +
+        '不能就这么发出去——MIT / BSD 等许可要求分发物保留许可与版权声明。',
+    )
   }
 
   const blocks = [...texts.entries()]
@@ -248,13 +341,15 @@ function render(packages) {
     lines.push('')
   }
 
-  if (missing.length) {
-    lines.push('## 未随包附带许可正文的组件')
+  if (fallback.length) {
+    lines.push('## 关于其中部分组件的许可正文来源')
     lines.push('')
-    lines.push('下列组件在其分发包中未包含许可正文文件，只能依据其清单声明的 SPDX 标识；')
-    lines.push('对应许可的标准正文见上，或见该组件的源码仓库。')
+    lines.push('下列组件在其发布包中**没有附带**许可正文文件，只在清单里声明了 SPDX 标识。')
+    lines.push('上面收录的是该 SPDX 许可的标准正文（存放于 `scripts/license-texts/`），')
+    lines.push('版权归属行取自各自的包元数据（Cargo.toml 的 `authors` / package.json 的 `author`）。')
+    lines.push('对 `A OR B` 形式的双许可，按 Apache-2.0 → MIT → BSD-3-Clause → MPL-2.0 的顺序择一。')
     lines.push('')
-    for (const p of missing) {
+    for (const p of fallback) {
       lines.push(`- ${p.name} ${p.version} (${p.ecosystem}) — ${p.license}${p.repository ? ` — ${p.repository}` : ''}`)
     }
     lines.push('')

@@ -278,69 +278,23 @@ dev-dependencies 与 build-dependencies），npm 侧为 production 依赖
 ## 许可正文
 
 <details>
-<summary>5 个组件共用此许可正文：@tauri-apps/plugin-dialog 2.7.2 (npm) 等</summary>
+<summary>14 个组件共用此许可正文：@tauri-apps/api 2.11.1 (npm) 等</summary>
 
 适用于：
-- @tauri-apps/plugin-dialog 2.7.2 (npm)
-- @tauri-apps/plugin-shell 2.3.5 (npm)
-- tauri-plugin-dialog 2.7.2 (cargo)
-- tauri-plugin-fs 2.5.1 (cargo)
-- tauri-plugin-log 2.9.0 (cargo)
-
-```text
-SPDXVersion: SPDX-2.1
-DataLicense: CC0-1.0
-PackageName: tauri
-DataFormat: SPDXRef-1
-PackageSupplier: Organization: The Tauri Programme in the Commons Conservancy
-PackageHomePage: https://tauri.app
-PackageLicenseDeclared: Apache-2.0
-PackageLicenseDeclared: MIT
-PackageCopyrightText: 2019-2022, The Tauri Programme in the Commons Conservancy
-PackageSummary: <text>Tauri is a rust project that enables developers to make secure
-and small desktop applications using a web frontend.
-                </text>
-PackageComment: <text>The package includes the following libraries; see
-Relationship information.
-                </text>
-Created: 2019-05-20T09:00:00Z
-PackageDownloadLocation: git://github.com/tauri-apps/tauri
-PackageDownloadLocation: git+https://github.com/tauri-apps/tauri.git
-PackageDownloadLocation: git+ssh://github.com/tauri-apps/tauri.git
-Creator: Person: Daniel Thompson-Yvetot
-```
-
-</details>
-
-<details>
-<summary>1 个组件共用此许可正文：adler2 2.0.1 (cargo)</summary>
-
-适用于：
-- adler2 2.0.1 (cargo)
-
-```text
-Copyright (C) Jonas Schievink <jonasschievink@gmail.com>
-
-Permission to use, copy, modify, and/or distribute this software for
-any purpose with or without fee is hereby granted.
-
-THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
-WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
-MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
-ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
-WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN
-AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
-OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
-```
-
-</details>
-
-<details>
-<summary>2 个组件共用此许可正文：adler2 2.0.1 (cargo) 等</summary>
-
-适用于：
+- @tauri-apps/api 2.11.1 (npm)
 - adler2 2.0.1 (cargo)
 - cargo-platform 0.1.9 (cargo)
+- tauri 2.11.5 (cargo)
+- tauri-codegen 2.6.3 (cargo)
+- tauri-macros 2.6.3 (cargo)
+- tauri-runtime 2.11.3 (cargo)
+- tauri-runtime-wry 2.11.4 (cargo)
+- tauri-utils 2.9.3 (cargo)
+- unic-char-property 0.9.0 (cargo)
+- unic-char-range 0.9.0 (cargo)
+- unic-common 0.9.0 (cargo)
+- unic-ucd-ident 0.9.0 (cargo)
+- unic-ucd-version 0.9.0 (cargo)
 
 ```text
 Apache License
@@ -549,6 +503,64 @@ limitations under the License.
 </details>
 
 <details>
+<summary>5 个组件共用此许可正文：@tauri-apps/plugin-dialog 2.7.2 (npm) 等</summary>
+
+适用于：
+- @tauri-apps/plugin-dialog 2.7.2 (npm)
+- @tauri-apps/plugin-shell 2.3.5 (npm)
+- tauri-plugin-dialog 2.7.2 (cargo)
+- tauri-plugin-fs 2.5.1 (cargo)
+- tauri-plugin-log 2.9.0 (cargo)
+
+```text
+SPDXVersion: SPDX-2.1
+DataLicense: CC0-1.0
+PackageName: tauri
+DataFormat: SPDXRef-1
+PackageSupplier: Organization: The Tauri Programme in the Commons Conservancy
+PackageHomePage: https://tauri.app
+PackageLicenseDeclared: Apache-2.0
+PackageLicenseDeclared: MIT
+PackageCopyrightText: 2019-2022, The Tauri Programme in the Commons Conservancy
+PackageSummary: <text>Tauri is a rust project that enables developers to make secure
+and small desktop applications using a web frontend.
+                </text>
+PackageComment: <text>The package includes the following libraries; see
+Relationship information.
+                </text>
+Created: 2019-05-20T09:00:00Z
+PackageDownloadLocation: git://github.com/tauri-apps/tauri
+PackageDownloadLocation: git+https://github.com/tauri-apps/tauri.git
+PackageDownloadLocation: git+ssh://github.com/tauri-apps/tauri.git
+Creator: Person: Daniel Thompson-Yvetot
+```
+
+</details>
+
+<details>
+<summary>1 个组件共用此许可正文：adler2 2.0.1 (cargo)</summary>
+
+适用于：
+- adler2 2.0.1 (cargo)
+
+```text
+Copyright (C) Jonas Schievink <jonasschievink@gmail.com>
+
+Permission to use, copy, modify, and/or distribute this software for
+any purpose with or without fee is hereby granted.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN
+AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
+OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+```
+
+</details>
+
+<details>
 <summary>36 个组件共用此许可正文：adler2 2.0.1 (cargo) 等</summary>
 
 适用于：
@@ -692,6 +704,46 @@ Redistribution and use in source and binary forms, with or without modification,
 3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
 
 THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+</details>
+
+<details>
+<summary>1 个组件共用此许可正文：alloc-stdlib 0.2.4 (cargo)</summary>
+
+适用于：
+- alloc-stdlib 0.2.4 (cargo)
+
+```text
+BSD 3-Clause License
+
+Copyright (c) Daniel Reiter Horn <danielrh@dropbox.com>
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors
+   may be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
 </details>
@@ -3399,11 +3451,12 @@ DEALINGS IN THE SOFTWARE.
 </details>
 
 <details>
-<summary>2 个组件共用此许可正文：cssparser 0.36.0 (cargo) 等</summary>
+<summary>3 个组件共用此许可正文：cssparser 0.36.0 (cargo) 等</summary>
 
 适用于：
 - cssparser 0.36.0 (cargo)
 - cssparser-macros 0.6.1 (cargo)
+- selectors 0.36.1 (cargo)
 
 ```text
 Mozilla Public License Version 2.0
@@ -11804,6 +11857,102 @@ DEALINGS IN THE SOFTWARE.
 </details>
 
 <details>
+<summary>1 个组件共用此许可正文：webview2-com 0.38.2 (cargo)</summary>
+
+适用于：
+- webview2-com 0.38.2 (cargo)
+
+```text
+MIT License
+
+Copyright (c) the webview2-com authors — https://github.com/wravery/webview2-rs
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+</details>
+
+<details>
+<summary>1 个组件共用此许可正文：webview2-com-macros 0.8.1 (cargo)</summary>
+
+适用于：
+- webview2-com-macros 0.8.1 (cargo)
+
+```text
+MIT License
+
+Copyright (c) the webview2-com-macros authors — https://github.com/wravery/webview2-rs
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+</details>
+
+<details>
+<summary>1 个组件共用此许可正文：webview2-com-sys 0.38.2 (cargo)</summary>
+
+适用于：
+- webview2-com-sys 0.38.2 (cargo)
+
+```text
+MIT License
+
+Copyright (c) the webview2-com-sys authors — https://github.com/wravery/webview2-rs
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+</details>
+
+<details>
 <summary>1 个组件共用此许可正文：window-vibrancy 0.6.0 (cargo)</summary>
 
 适用于：
@@ -12241,10 +12390,12 @@ Creator: Person: Daniel Thompson-Yvetot
 
 </details>
 
-## 未随包附带许可正文的组件
+## 关于其中部分组件的许可正文来源
 
-下列组件在其分发包中未包含许可正文文件，只能依据其清单声明的 SPDX 标识；
-对应许可的标准正文见上，或见该组件的源码仓库。
+下列组件在其发布包中**没有附带**许可正文文件，只在清单里声明了 SPDX 标识。
+上面收录的是该 SPDX 许可的标准正文（存放于 `scripts/license-texts/`），
+版权归属行取自各自的包元数据（Cargo.toml 的 `authors` / package.json 的 `author`）。
+对 `A OR B` 形式的双许可，按 Apache-2.0 → MIT → BSD-3-Clause → MPL-2.0 的顺序择一。
 
 - alloc-stdlib 0.2.4 (cargo) — BSD-3-Clause — https://github.com/dropbox/rust-alloc-no-stdlib
 - selectors 0.36.1 (cargo) — MPL-2.0 — https://github.com/servo/stylo

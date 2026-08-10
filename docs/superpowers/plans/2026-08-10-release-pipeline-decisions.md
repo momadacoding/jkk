@@ -207,3 +207,75 @@ MSI 内文件表                           ✓ jkk.exe + THIRD_PARTY_NOTICES.md 
 `tauri.conf.json` 本次只改了 `bundle.resources`（构建期配置，不涉及任何
 invoke 或 capabilities），配置写坏会直接让 `tauri build` 失败——
 而它已成功产出两个安装包，这比 dev 模式更能证明该键有效。
+
+---
+
+## Task 4 第二轮 review（Codex adversarial review）
+
+3 条全部核实属实并修复。**上一轮的修复本身又引入/遗留了问题**，这轮是冲着它们来的。
+
+### 1 [high] 许可检查会把「缺正文」判成合格
+
+上一轮加的 `--check` 只比对生成物与提交物是否一致，**不检查内容完不完整**。
+生成器遇到没带许可正文的包时，只是把它写进一个说明章节然后照常返回 0。
+实际有 **17 个组件**处于这个状态，其中包括 **`tauri` 本身**；
+而 LICENSE 里却写着 notices 包含「分发所需的全部许可正文和版权声明」——
+直接矛盾。CI 全绿的同时，安装包缺着 MIT / BSD 要求保留的材料。
+
+**修复**：新增 `scripts/license-texts/`，收录 4 份标准正文；
+包里没带正文时用标准正文补上，版权归属取自包元数据
+（Cargo.toml `authors` / package.json `author`）；
+`A OR B` 双许可按 Apache-2.0 → MIT → BSD-3-Clause → MPL-2.0 择一
+（双许可本来就允许择一，且 Apache-2.0 正文不含逐项目版权行，最干净）。
+**补不上就抛错**，生成与 `--check` 两个模式都失败。
+
+标准正文的来源分两类，都做了核对：
+
+| 许可 | 来源 | 核对方式 |
+|---|---|---|
+| Apache-2.0 / MPL-2.0 | 从依赖树里现成的副本复制（`adler2` / `cssparser`） | 固定文本，正文里没有逐项目字段 |
+| MIT / BSD-3-Clause | 手写模板 + `{{COPYRIGHT}}` 占位 | 与树里真实分发的副本逐字比对：MIT **11/12 一致**（唯一不一致的 `android_system_properties` 自己的文件是残缺的），BSD-3-Clause 与 `alloc-no-stdlib` 一致——正是缺正文的 `alloc-stdlib` 的同作者 |
+
+阻断行为实测：抽掉 `MPL-2.0.txt` → `selectors` 补不上 → 生成和 `--check`
+都报错，`--check` **退出码 1**（专门单独验过退出码：先前用管道看时被
+`Select-Object -First N` 截断成空，差点误判成不会阻断 CI）。
+
+### 2 [high] 可变 action 跑在 `contents: write` 边界内
+
+上一轮把权限收进了独立的 publish job，但那个 job 里的
+`actions/download-artifact@v4` 仍是可变 tag。tag 一旦被重新指向，
+换掉的代码就直接运行在能改 Release 的令牌权限下——拆 job 并没有消除这个信任边界。
+
+**修复**：把它钉到完整 commit SHA `d3f86a1…`（经 `gh api` 解析 `v4` 当前指向）。
+build job 的 action 仍用可变 tag：那边只有 `contents: read`，
+收益不足以抵消没有 dependabot 时手工追 SHA 的维护成本——
+这是上一轮「不钉 SHA」判断的**修正版**：不是全不钉，而是只钉写权限边界内的。
+
+### 3 [medium] 发布流程无法安全重试
+
+`gh release create` 在同名 Release 已存在时直接失败。
+若 draft 建好了、资产传到一半挂掉，重跑 job 只会一直报 already exists，
+留下一个资产不全的 draft 需要人工收拾。
+
+**修复**：改成幂等——「有就复用、没有才建」+ `gh release upload --clobber`，
+上传后再核对 `.msi` 与 `setup.exe` 都在，缺了就 `::error::` 并失败。
+
+用桩 `gh` 跑了三种情形（`bash -n` 先过语法）：
+
+| 情形 | 结果 |
+|---|---|
+| A 首次发布（Release 不存在） | create → upload → 校验通过，exit 0 |
+| B 重跑（Release 已存在、资产不全） | 跳过 create、`--clobber` 覆盖，**自愈**，exit 0 |
+| C 资产缺 `.msi` | 报 `::error::缺少 .msi 资产`，exit 1 |
+
+### 修复后的复验
+
+```
+gen-notices                    ✓ 257 组件，17 个走标准正文兜底
+gen-notices --check            ✓ exit 0；抽掉标准正文时 exit 1
+YAML + 权限 + 钉定情况          ✓ publish 的 action 已 PINNED，build 的仍 mutable
+publish 脚本三情形（桩 gh）      ✓ A/B 自愈，C 失败
+pnpm test / fmt / clippy -D warnings / cargo test  ✓ 全 exit 0
+pnpm tauri build               ✓ msi + nsis
+MSI 文件表                      ✓ jkk.exe + THIRD_PARTY_NOTICES.md(564KB) + LICENSE
+```

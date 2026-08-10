@@ -32,6 +32,14 @@ by `scripts/gen-notices.mjs` and lists every component that is actually
 compiled into the distributed binary, together with the license texts and
 copyright notices those licenses require to be preserved on distribution.
 
+Some upstream packages ship no license file of their own and declare only an
+SPDX identifier. For those, the notices file reproduces the standard text of
+the declared license (kept in `scripts/license-texts/`) and derives the
+copyright attribution from the package's own metadata; each such component is
+listed explicitly in that file. The generator fails rather than emitting a
+notices file with a component it cannot cover, so a component silently missing
+its license text cannot reach a release.
+
 Two entries there are worth calling out because they shape the distribution
 terms above:
 

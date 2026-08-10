@@ -156,16 +156,25 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      # 这个 job 里的 action **钉到完整 commit SHA**。
+      # 它是整个 workflow 里唯一持有 contents: write 的地方，可变 tag（@v4）
+      # 一旦被重新指向，被换掉的代码就直接运行在能改 Release 和仓库内容的
+      # 令牌权限下。build job 的 action 仍用可变 tag：那边只有读权限，
+      # 收益不足以抵消没有 dependabot 时手工追 SHA 的维护成本。
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: jkk-windows
           path: artifacts
 
       # 发成 draft：产物传上去之后由人过目一眼再点发布。
       #
+      # 幂等：`gh release create` 在同名 Release 已存在时会失败，而资产上传到一半
+      # 失败会留下一个「draft 已建、资产不全」的中间态——那时重跑 job 只会再次
+      # 报 already exists，救不回来。所以拆成「有就复用、没有才建」+ upload --clobber。
+      #
       # 注意：这里同样不能把 ${{ github.ref_name }} 直接展开进脚本，理由见 build job。
       # 多行文本用单引号字符串——反引号在其中是字面量，不会被当成命令替换。
-      - name: Create draft release
+      - name: Create or update draft release
         env:
           GH_TOKEN: ${{ github.token }}
           REF_NAME: ${{ github.ref_name }}
@@ -179,5 +188,18 @@ jobs:
           - `*.msi` —— MSI 安装包
 
           第三方组件的许可声明见安装目录下的 THIRD_PARTY_NOTICES.md。'
-          gh release create "$REF_NAME" artifacts/* \
-            --title "$REF_NAME" --notes "$notes" --draft
+
+          if gh release view "$REF_NAME" >/dev/null 2>&1; then
+            echo "Release $REF_NAME 已存在（上次可能传到一半），复用它并覆盖资产"
+          else
+            gh release create "$REF_NAME" --title "$REF_NAME" --notes "$notes" --draft
+          fi
+
+          gh release upload "$REF_NAME" artifacts/* --clobber
+
+          # 传完核对一遍：两种安装包都必须在，否则等于发了个残缺的 Release
+          assets=$(gh release view "$REF_NAME" --json assets --jq '.assets[].name')
+          echo "已上传的资产："
+          echo "$assets"
+          echo "$assets" | grep -q '\.msi$'      || { echo "::error::缺少 .msi 资产"; exit 1; }
+          echo "$assets" | grep -q 'setup\.exe$' || { echo "::error::缺少 setup.exe 资产"; exit 1; }
