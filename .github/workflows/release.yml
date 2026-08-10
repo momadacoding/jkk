@@ -126,6 +126,30 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
+      # 临时诊断步骤，定位完就删：CI 上 gen-notices 只解析出 254 个组件，
+      # 少了 react / react-dom 的三个传递依赖，本地（含用同版本 pnpm 全新安装）
+      # 复现不出来。
+      - name: debug npm inventory
+        shell: bash
+        run: |
+          pnpm --version
+          node --version
+          echo "--- pnpm list 看到的 ---"
+          pnpm list --prod --depth Infinity --json > npm-list.json
+          node -e "
+            const r = require('./npm-list.json');
+            const s = new Set();
+            const w = (d) => { for (const [n, i] of Object.entries(d ?? {})) {
+              if (!i || typeof i !== 'object') continue;
+              s.add(n + '@' + i.version); w(i.dependencies);
+            } };
+            for (const x of r) w(x.dependencies);
+            console.log('count', s.size);
+            console.log([...s].sort().join('\n'));
+          "
+          echo "--- node_modules/.pnpm 里实际有什么 ---"
+          ls node_modules/.pnpm | head -40
+
       # 发版前把本地那套门槛在干净环境里再走一遍。
       # 没有 PR CI，这是唯一一次「不是在我这台机器上」的验证。
       - run: pnpm test
