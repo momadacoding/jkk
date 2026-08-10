@@ -427,9 +427,24 @@ pub fn restore_worktree(path: String, trash_path: String) -> Result<()> {
 ///
 /// `git worktree list` 给的是正斜杠，界面传回来的可能是反斜杠，直接比字符串
 /// 在 Windows 上会误判。
+///
+/// 但归一化分隔符和大小写还不够：**两个写法完全不同的字符串照样可能是同一个
+/// 目录**——junction / symlink、8.3 短名（`C:\Users\RUNNER~1\...`）、`subst` 出来的
+/// 盘符都会造成这种情况。字符串比不出来时必须问文件系统，它才是权威。
+///
+/// 这一条不是洁癖：`same_path` 同时撑着「锁住的 worktree 不许删」和「主工作区不许
+/// 删」两道保护，判错的方向是**放行**——保护会往不安全的方向失效。
 fn same_path(a: &str, b: &str) -> bool {
     let norm = |s: &str| s.replace('\\', "/").trim_end_matches('/').to_lowercase();
-    norm(a) == norm(b)
+    if norm(a) == norm(b) {
+        return true;
+    }
+    // 只在字符串已经不等时才走：canonicalize 要碰盘，而且路径不存在就会失败。
+    // 任一侧解析不出来就维持「不是同一个」，与原来的行为一致。
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -453,5 +468,44 @@ mod tests {
         assert!(!same_path("C:/repo/.worktrees/a", "C:/repo/.worktrees/b"));
         // 前缀相同也不能算同一个
         assert!(!same_path("C:/repo/wt", "C:/repo/wt2"));
+    }
+
+    /// 归一化解决不了的那一类：两个写法差得很远，却是同一个目录。
+    ///
+    /// junction 只是最好复现的代表，8.3 短名和 `subst` 盘符走的是同一条失效路径。
+    #[cfg(windows)]
+    #[test]
+    fn different_spellings_of_one_directory_are_the_same_path() {
+        use std::os::windows::process::CommandExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("inner")).unwrap();
+        let link = dir.path().join("link");
+        let out = std::process::Command::new("cmd")
+            .arg("/c")
+            .raw_arg(format!(
+                "mklink /J \"{}\" \"{}\"",
+                link.display(),
+                real.display()
+            ))
+            .output()
+            .expect("cmd 起不来");
+        assert!(
+            out.status.success(),
+            "mklink 失败: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // 字符串上毫无共同点，落到的是同一个目录
+        assert!(same_path(
+            real.join("inner").to_str().unwrap(),
+            link.join("inner").to_str().unwrap()
+        ));
+        // 但不能因此放宽成「沾边就算同一个」
+        assert!(!same_path(
+            real.join("inner").to_str().unwrap(),
+            link.join("elsewhere").to_str().unwrap()
+        ));
     }
 }
