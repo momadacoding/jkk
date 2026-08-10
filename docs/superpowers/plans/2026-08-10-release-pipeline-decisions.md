@@ -106,6 +106,104 @@
 - workflow 的触发条件只有 `v*` tag 和手动触发，不会因为日常 push 而消耗额度。
   仓库是 private，Actions 按分钟计费（Windows runner 2 倍系数），
   限制触发条件在这里既是行为正确性也是成本控制。
-- `permissions: contents: write` 是建 Release 所需的最小权限，没有开 packages / id-token。
 - 发布步骤带 `if: startsWith(github.ref, 'refs/tags/v')`，
   手动触发时只构建、不会误建 Release。
+- 权限与 tag 校验见下面的 review 轮次——初版在这两点上都不安全。
+
+---
+
+## Task 4 review 轮次（Codex adversarial review，独立于实现者）
+
+4 条全部核实属实并已修复。**初版 workflow 不该合并**。
+
+### 1 [high] `${{ github.ref_name }}` 直接展开进 PowerShell → 命令注入
+
+初版第 39 / 117 行写的是 `$tag = '${{ github.ref_name }}'`。
+GitHub 的 `${{ }}` 是在 shell 启动**之前**做纯文本替换的，
+所以 tag 名里的单引号会闭合那个字符串，后面的内容变成可执行代码。
+
+**实测确认前提**（一次性 fixture 仓库，`git check-ref-format` + `git tag`）：
+
+| tag 名 | 结果 |
+|---|---|
+| `v1.0.0'x` | **可创建** |
+| `v0.1.0';iwr$u;'` | **可创建** |
+| `v1'; echo PWNED; '` | 被拒 —— 因为**空格**，不是引号 |
+| `v1.0.0;whoami` / `v1.0.0$(whoami)` / ``v1.0.0`whoami` `` | 可创建 |
+
+也就是说 `v0.1.0';iwr$u;'` 是合法 tag，展开后得到
+`$tag = 'v0.1.0';iwr$u;''` —— 赋值，然后执行 `iwr$u`。注入成立。
+
+注意这里的细节：因为用的是**单引号**字符串，`;`、`$()`、反引号在其中都是字面量，
+唯一能逃出去的就是单引号本身；而单引号恰恰是 git 允许的。
+
+修复：`REF_NAME` 经 `env:` 传入，脚本只读 `$env:REF_NAME`；
+再加严格 SemVer 正则，畸形 ref 直接拒。publish job 同样处理。
+
+### 2 [high] `contents: write` 挂在 workflow 顶层
+
+初版整条构建链（checkout、pnpm 生命周期脚本、build.rs、一串用可变 tag 的
+第三方 action）都跑在能写仓库的权限边界里，而 `actions/checkout` 默认还会
+把凭据留在 `.git/config`。`workflow_dispatch` 明明不发布，也拿到同样的权限。
+
+修复：顶层降为 `contents: read`；拆出独立的 `publish` job 只在它上面开
+`contents: write`，它不 checkout、不构建，只把上一个 job 的产物挂上去；
+checkout 加 `persist-credentials: false`。
+publish 跑 ubuntu 而不是 windows —— 只是调一次 `gh`，而私有仓库的
+Windows runner 按 2 倍分钟数计费。
+
+**未采纳的建议**：把第三方 action 钉到完整 commit SHA。
+钉死之后没有 dependabot 的仓库会长期停在旧版本，对私有个人仓库
+不划算。保留 `@v4` 这类可变 tag，属明知的取舍。
+
+### 3 [high] 第三方许可材料不足以支撑二进制分发
+
+初版 LICENSE 自己写着「这份清单不完整，完整集合请自行从锁文件解析」——
+那正好是不合规的自白。MIT 要求「在所有副本或实质性部分中包含版权声明和许可声明」，
+Apache-2.0 §4 要求向接收者提供许可副本；而我们分发的 `.msi` / `.exe` 里
+编译进了这些代码，接收者拿不到 `node_modules` 和 `Cargo.toml`。
+
+修复：新增 `scripts/gen-notices.mjs`，从锁文件生成 `THIRD_PARTY_NOTICES.md`
+（257 个组件），并经 `bundle.resources` 随安装包分发。
+
+**收录范围**只取真正进二进制的：Rust 侧从 root package 出发只跟 normal 依赖
+（dev-dependencies 只在测试链接、build-dependencies 只在构建期跑，都不分发），
+npm 侧用 `pnpm list --prod`。实测核对：`git2` / `libgit2-sys` / `tauri` / `wry` /
+`tao` / `react` 等在列；`vitest` / `vite` / `typescript` / `esbuild` / `tempfile`
+均不在列。
+
+**生成器自己先踩了一次同样的坑**：第一版只扫 crate 根目录，结果
+`libgit2-sys` 只贡献了 `LICENSE-APACHE` / `LICENSE-MIT`（Rust binding 的），
+而真正约束分发的 GPL-2.0 + 链接例外在 `libgit2/COPYING` 这个**子目录**里——
+生成出来的 notices 里 GPL 正文一个字都没有，偏偏那是整棵树里最关键的一份。
+改成额外扫一层子目录（跳过 src/tests/examples 等）后确认 GPL 正文已收录。
+这正是 Task 3「crate 声明的 license 不等于它实际分发的东西的 license」那条坑的复发。
+
+CI 加 `node scripts/gen-notices.mjs --check`：依赖动了却忘了重新生成就失败。
+两个方向都实测（一致时 exit 0，篡改后 exit 1）。
+
+### 4 [medium] 任意分支上的 `v*` tag 都能成为发布来源
+
+`on: push: tags` 不区分 tag 打在哪个提交上。初版 README 还直接写
+「`git tag v0.1.0`」，而我当时正在一个功能分支的 worktree 里——
+照着 README 做就会发出未经 review 的代码，且从安装包上看不出来。
+
+修复：构建前用 `gh api repos/{repo}/compare/master...{sha}` 断言该提交
+与 master 的关系为 `identical` 或 `behind`（即已并入）。
+走 API 而不是 `git merge-base`：上面关掉了 `persist-credentials`，
+私有仓库的 `git fetch` 没有凭据可用。README 补上 `git checkout master` 与校验说明。
+
+### 修复后的复验
+
+```
+workflow YAML 解析                    ✓ 顶层 contents: read；build=read / publish=write
+所有 ${{ }} 均在 env / if / concurrency ✓ 逐行扫描确认
+gen-notices --check 两个方向           ✓ 一致 exit 0，篡改 exit 1
+pnpm test / cargo fmt / clippy -D warnings / cargo test  ✓ 全部 exit 0
+pnpm tauri build                      ✓ msi + nsis
+MSI 内文件表                           ✓ jkk.exe + THIRD_PARTY_NOTICES.md + LICENSE
+```
+
+`tauri.conf.json` 本次只改了 `bundle.resources`（构建期配置，不涉及任何
+invoke 或 capabilities），配置写坏会直接让 `tauri build` 失败——
+而它已成功产出两个安装包，这比 dev 模式更能证明该键有效。

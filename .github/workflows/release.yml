@@ -13,9 +13,11 @@ on:
       - 'v*'
   workflow_dispatch:
 
-# 只需要建 Release 和传产物
+# 默认只读。写权限只给真正要建 Release 的 publish job——
+# 构建链上跑着依赖安装脚本、构建脚本和一串第三方 action，
+# 没有任何理由让它们运行在能改仓库的权限边界里。
 permissions:
-  contents: write
+  contents: read
 
 # 同一个 tag 被重复推时不要并行跑两遍
 concurrency:
@@ -25,29 +27,65 @@ concurrency:
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 不把凭据留在 .git/config 里。后面整条链（pnpm 生命周期脚本、
+          # build.rs、第三方 action）都能读到那个文件
+          persist-credentials: false
 
-      # 放在最前面：版本对不上要在几秒内失败，而不是等构建跑完十几分钟，
-      # 更不能等到 Release 建出来才发现里面装的是别的版本的安装包。
-      # 三个清单文件谁漏改都会在这里被拦下。
-      - name: Check tag matches manifest versions
+      # 放在最前面：任何一项对不上都要在几秒内失败，而不是等构建跑完十几分钟，
+      # 更不能等到 Release 都建出来才发现装错了东西。
+      #
+      # 三道关：
+      #   1. tag 名必须是严格 SemVer——顺带挡掉带引号/分号的畸形 ref
+      #   2. tag 版本要和三个清单文件一致
+      #   3. tag 指向的提交必须已经在 master 上
+      - name: Validate tag
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
+        env:
+          # **必须**经 env 传进来，绝不能把 ${{ }} 直接展开进脚本文本。
+          # GitHub 的 ${{ }} 是在 shell 之前做文本替换的，而 git 允许 tag 名里
+          # 出现单引号（实测 `v0.1.0';iwr$u;'` 是合法 tag），
+          # 直接插进 '...' 会闭合字符串并执行后面的内容。
+          REF_NAME: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $tag = '${{ github.ref_name }}' -replace '^v', ''
+          $ref = $env:REF_NAME
+
+          if ($ref -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$') {
+            throw "tag 名不是合法的 SemVer：$ref"
+          }
+          $tag = $ref -replace '^v', ''
+
           $versions = [ordered]@{
-            'package.json'            = (Get-Content package.json -Raw | ConvertFrom-Json).version
+            'package.json'              = (Get-Content package.json -Raw | ConvertFrom-Json).version
             'src-tauri/tauri.conf.json' = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
-            'src-tauri/Cargo.toml'    = ((Select-String -Path src-tauri/Cargo.toml -Pattern '^version\s*=\s*"(.+)"').Matches[0].Groups[1].Value)
+            'src-tauri/Cargo.toml'      = ((Select-String -Path src-tauri/Cargo.toml -Pattern '^version\s*=\s*"(.+)"').Matches[0].Groups[1].Value)
           }
           $versions.GetEnumerator() | ForEach-Object { "{0,-28} {1}" -f $_.Key, $_.Value }
           $bad = $versions.GetEnumerator() | Where-Object { $_.Value -ne $tag }
           if ($bad) {
             throw "tag 是 v$tag，但这些文件对不上：$(($bad | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ', ')"
           }
-          Write-Output "版本一致：v$tag"
+
+          # 提交来源：tag 打在功能分支或过期提交上，同样能构建成功，
+          # 发出去的就是没经过 review 的代码，而且从安装包上看不出来。
+          # 走 API 而不是 git merge-base——上面关掉了 persist-credentials，
+          # 私有仓库的 git fetch 没有凭据可用。
+          $cmp = gh api "repos/$env:REPO/compare/master...$env:SHA" --jq '.status'
+          if ($LASTEXITCODE -ne 0) { throw "比对 master 失败" }
+          # master 与该提交相同，或该提交在 master 之后（即已并入）才放行
+          if ($cmp -notin @('identical', 'behind')) {
+            throw "tag 指向的提交不在 master 上（与 master 比对结果：$cmp）。请先把改动合进 master 再打 tag。"
+          }
+          Write-Output "校验通过：$ref @ $env:SHA（相对 master：$cmp）"
 
       - uses: pnpm/action-setup@v4
         with:
@@ -80,6 +118,12 @@ jobs:
       - name: cargo test
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
+      # 第三方许可清单必须和锁文件一致。生成物进了仓库（安装包要带上它），
+      # 所以这里只重算一遍看有没有漂移——依赖动了却忘了重新生成，会让
+      # 分发出去的安装包缺少 MIT / Apache-2.0 要求保留的声明。
+      - name: Check third-party notices are current
+        run: node scripts/gen-notices.mjs --check
+
       # beforeBuildCommand 会再跑一次 pnpm build，这是 tauri.conf.json 里配好的，
       # 重复一次几秒钟，不值得为省它去动配置
       - name: tauri build
@@ -101,28 +145,39 @@ jobs:
           name: jkk-windows
           path: artifacts/*
 
-      # 只有 tag 触发时才发 Release；手动触发到上一步为止。
+  # 拆成独立 job 的唯一目的：让 contents: write 只存在于这里。
+  # 它不 checkout 代码、不跑构建，只把上一个 job 的产物挂上去。
+  # 跑 ubuntu 而不是 windows：私有仓库的 Windows runner 按 2 倍分钟数计费，
+  # 而这一步只是调一次 gh。
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: jkk-windows
+          path: artifacts
+
       # 发成 draft：产物传上去之后由人过目一眼再点发布。
       #
-      # 注意：这里**不能**用 PowerShell 的 here-string（@" ... "@）。YAML 块标量
-      # 要求每一行都带缩进，而 here-string 的结束符必须顶格，两者冲突，
-      # 整个 workflow 会解析失败。用数组 -join 拼多行文本。
-      - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
+      # 注意：这里同样不能把 ${{ github.ref_name }} 直接展开进脚本，理由见 build job。
+      # 多行文本用单引号字符串——反引号在其中是字面量，不会被当成命令替换。
+      - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          $tag = '${{ github.ref_name }}'
-          $notes = @(
-            '安装包**未做代码签名**，Windows 会弹 SmartScreen「未知发布者」警告。'
-            '点「更多信息」→「仍要运行」即可。'
-            ''
-            '产物：'
-            '- `*-setup.exe` —— NSIS 安装器'
-            '- `*.msi` —— MSI 安装包'
-          ) -join "`n"
-          $files = @(Get-ChildItem artifacts | ForEach-Object { $_.FullName })
-          gh release create $tag @files --title $tag --notes $notes --draft
-          if ($LASTEXITCODE -ne 0) { throw "gh release create 失败：$LASTEXITCODE" }
+          set -euo pipefail
+          notes='安装包**未做代码签名**，Windows 会弹 SmartScreen「未知发布者」警告。
+          点「更多信息」→「仍要运行」即可。
+
+          产物：
+          - `*-setup.exe` —— NSIS 安装器
+          - `*.msi` —— MSI 安装包
+
+          第三方组件的许可声明见安装目录下的 THIRD_PARTY_NOTICES.md。'
+          gh release create "$REF_NAME" artifacts/* \
+            --title "$REF_NAME" --notes "$notes" --draft

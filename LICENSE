@@ -24,20 +24,25 @@ Third-party components
 
 The terms above apply to this project's own source code and assets only. This
 software links against third-party open-source components, each of which
-remains under its own license:
+remains under its own license.
 
-  - libgit2 (the C library vendored by the libgit2-sys crate)
-    GPL-2.0 WITH a linking exception. The exception gives "unlimited permission
-    to link the compiled version of this library into combinations with other
-    programs, and to distribute those combinations without any restriction" -
-    which is what permits distributing this binary under the terms above.
-    Note the git2 / libgit2-sys crates themselves declare MIT OR Apache-2.0;
-    that covers the Rust bindings, not the vendored C library.
-  - Tauri, wry - Apache-2.0 OR MIT
-  - tao - Apache-2.0
-  - React, React DOM, react-resizable-panels - MIT
+THIRD_PARTY_NOTICES.md, distributed alongside this file and installed with the
+application, is the authoritative inventory. It is generated from the lockfiles
+by `scripts/gen-notices.mjs` and lists every component that is actually
+compiled into the distributed binary, together with the license texts and
+copyright notices those licenses require to be preserved on distribution.
 
-This list names the components that shape the distribution terms; it is not an
-exhaustive dependency inventory. The full set, with each package's declared
-license, is resolvable from `package.json` / `pnpm-lock.yaml` and
-`src-tauri/Cargo.toml` / `src-tauri/Cargo.lock`.
+Two entries there are worth calling out because they shape the distribution
+terms above:
+
+  - libgit2, the C library vendored by the libgit2-sys crate, is under
+    GPL-2.0 WITH a linking exception. The exception grants "unlimited
+    permission to link the compiled version of this library into combinations
+    with other programs, and to distribute those combinations without any
+    restriction" - that exception is what permits distributing this binary
+    under the proprietary terms above. Note that the git2 and libgit2-sys
+    crates declare MIT OR Apache-2.0 in their own manifests; that covers the
+    Rust bindings, not the vendored C library.
+
+  - tao is Apache-2.0 only, not the MIT OR Apache-2.0 dual license used by
+    most of the surrounding Tauri crates.
