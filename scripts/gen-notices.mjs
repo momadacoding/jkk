@@ -370,10 +370,35 @@ if (checkOnly) {
   }
   const current = readFileSync(outFile, 'utf8').replace(/\r\n/g, '\n')
   if (current !== content) {
-    console.error(
-      'THIRD_PARTY_NOTICES.md 与当前依赖不一致——依赖动过但没重新生成。\n' +
-        '运行 node scripts/gen-notices.mjs 并提交结果。',
-    )
+    // 只说「不一致」等于没说。这个门槛会在 CI 上挡住发版，而依赖解析在别人的
+    // 机器上未必复现得出来——差异本身必须打印出来，否则只能靠猜。
+    const a = current.split('\n')
+    const b = content.split('\n')
+    const inA = new Set(a)
+    const inB = new Set(b)
+    const onlyInFile = a.filter((l) => l.trim() && !inB.has(l))
+    const onlyInFresh = b.filter((l) => l.trim() && !inA.has(l))
+
+    let firstDiff = 0
+    while (firstDiff < a.length && firstDiff < b.length && a[firstDiff] === b[firstDiff]) firstDiff++
+
+    const clip = (s) => (s === undefined ? '(没有这一行)' : s.length > 160 ? `${s.slice(0, 160)}…` : s)
+    const sample = (arr) => arr.slice(0, 20).map((l) => `      ${clip(l)}`).join('\n')
+
+    console.error('THIRD_PARTY_NOTICES.md 与当前依赖不一致——依赖动过但没重新生成。')
+    console.error(`  行数：文件 ${a.length} / 重新生成 ${b.length}；本次解析出 ${packages.length} 个组件`)
+    console.error(`  第一处不同在第 ${firstDiff + 1} 行：`)
+    console.error(`      文件：${clip(a[firstDiff])}`)
+    console.error(`      生成：${clip(b[firstDiff])}`)
+    if (onlyInFile.length) {
+      console.error(`  只出现在文件里的行（共 ${onlyInFile.length}，最多列 20）：`)
+      console.error(sample(onlyInFile))
+    }
+    if (onlyInFresh.length) {
+      console.error(`  只出现在新生成里的行（共 ${onlyInFresh.length}，最多列 20）：`)
+      console.error(sample(onlyInFresh))
+    }
+    console.error('\n运行 node scripts/gen-notices.mjs 并提交结果。')
     process.exit(1)
   }
   console.log(`THIRD_PARTY_NOTICES.md 是最新的（${packages.length} 个组件）。`)
