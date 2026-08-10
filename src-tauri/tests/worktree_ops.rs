@@ -187,6 +187,107 @@ fn a_locked_worktree_is_refused_even_with_force() {
     }
 }
 
+/// 同一个目录换个写法，锁照样要拦住。
+///
+/// 锁检查比的是两个**来源不同**的字符串：`git worktree list` 报的路径，和调用方
+/// 传进来的路径。只要它们指向同一个目录但写法不同，纯字符串比较就判成两个不同的
+/// worktree，锁被漏过去，删除照常执行——**保护是往不安全的方向失效的**。
+///
+/// 这不是假想：GitHub Windows runner 的 TEMP 是 8.3 短名（`C:\Users\RUNNER~1\...`），
+/// git 报的是展开后的长名，两边对不上，`a_locked_worktree_is_refused_even_with_force`
+/// 在 CI 上就是这么红的。真实机器上 junction、subst 盘符、8.3 短名都能触发。
+///
+/// 这里用 junction 造别名：它和短名走的是同一条失效路径（两个字符串、一个目录），
+/// 而且不需要提权、在本机就能复现。
+#[cfg(windows)]
+#[test]
+fn the_lock_holds_even_when_the_path_is_spelled_differently() {
+    let (_dir, wt) = repo_with_worktree("feature");
+    let main = main_of(&wt);
+    run_git(
+        &main,
+        &[
+            "worktree",
+            "lock",
+            wt.to_str().unwrap(),
+            "--reason",
+            "别删我",
+        ],
+    );
+
+    // main/alias -> main/.worktrees，于是 main/alias/feature 和 wt 是同一个目录
+    let link = main.join("alias");
+    junction(&link, &main.join(".worktrees"));
+    let aliased = link.join("feature");
+    assert!(aliased.join("a.txt").exists(), "别名路径该能读到同一份文件");
+
+    for force in [false, true] {
+        let err = cmd::delete_worktree(
+            main.to_str().unwrap().to_string(),
+            aliased.to_str().unwrap().to_string(),
+            force,
+        )
+        .expect_err("锁住的 worktree 换个写法也必须被拒绝");
+        assert_eq!(err.code, "worktree_locked", "force={force}");
+        assert!(wt.exists(), "force={force} 时目录被动了");
+    }
+}
+
+/// 取路径的 8.3 短名（`C:\Users\RUNNER~1\...`）。
+///
+/// 卷上可以关掉 8.3 名字生成，那种机器上 `%~sI` 原样吐回长名。返回 `None` 让用例
+/// 显式跳过，而不是拿「短名==长名」凑一次没测到东西的假绿灯。
+#[cfg(windows)]
+fn short_path(p: &std::path::Path) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    let out = Command::new("cmd")
+        .arg("/c")
+        .raw_arg(format!("for %I in (\"{}\") do @echo %~sI", p.display()))
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() || s.eq_ignore_ascii_case(&p.display().to_string()) {
+        return None;
+    }
+    Some(s)
+}
+
+/// CI 上那次红灯的原样复现：调用方拿到的是 8.3 短名，git 报的是展开后的长名。
+///
+/// `the_lock_holds_even_when_the_path_is_spelled_differently` 用 junction 覆盖的是
+/// 同一条失效路径，但短名才是 GitHub Windows runner 上的实际形态——两个都留着，
+/// junction 那个保证任何机器都跑得到，这个保证真实事故形态被钉住。
+#[cfg(windows)]
+#[test]
+fn the_lock_holds_when_the_caller_has_the_short_path() {
+    let (_dir, wt) = repo_with_worktree("feature");
+    let main = main_of(&wt);
+    run_git(
+        &main,
+        &[
+            "worktree",
+            "lock",
+            wt.to_str().unwrap(),
+            "--reason",
+            "别删我",
+        ],
+    );
+
+    let Some(short) = short_path(&wt) else {
+        eprintln!("这个卷关了 8.3 名字生成，跳过");
+        return;
+    };
+    assert!(
+        !short.eq_ignore_ascii_case(wt.to_str().unwrap()),
+        "短名该和长名不同，否则这个用例什么都没测：{short}"
+    );
+
+    let err = cmd::delete_worktree(main.to_str().unwrap().to_string(), short.clone(), true)
+        .expect_err("拿短名来删，锁一样要拦住");
+    assert_eq!(err.code, "worktree_locked");
+    assert!(wt.exists(), "目录被动了");
+}
+
 /// 主工作区一票否决——这一条破了就是把整个仓库的 `.git` 搬进回收站。
 ///
 /// 原先这道保护是 git 给的（`fatal: '.' is a main working tree`）。改成由我们搬移
