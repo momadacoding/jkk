@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { closeTabAt, restoreTabs, type RepoTabInfo, type SessionView } from '@/engine/session'
+import {
+  closeTabAt,
+  closeTabsByPath,
+  restoreTabs,
+  type RepoTabInfo,
+  type SessionView,
+} from '@/engine/session'
 
 function view(overrides: Partial<SessionView> = {}): SessionView {
   return { tabs: [], activeTab: null, recent: [], droppedTabs: [], ...overrides }
@@ -117,5 +123,84 @@ describe('closeTabAt', () => {
     const r = closeTabAt([], null, 'tab-0')
     expect(r.tabs).toEqual([])
     expect(r.activeId).toBeNull()
+  })
+})
+
+describe('closeTabsByPath', () => {
+  const tabs: RepoTabInfo[] = [
+    { id: 'tab-0', path: 'C:/repo' },
+    { id: 'tab-1', path: 'C:/repo/.worktrees/feat' },
+    { id: 'tab-2', path: 'C:/other' },
+  ]
+
+  it('删掉的 worktree 那个标签会被关掉', () => {
+    const r = closeTabsByPath(tabs, 'tab-0', 'C:/repo/.worktrees/feat')
+    expect(r.tabs.map((t) => t.id)).toEqual(['tab-0', 'tab-2'])
+    expect(r.activeId).toBe('tab-0')
+  })
+
+  it('关掉的正好是活动标签时接管右边那个', () => {
+    const r = closeTabsByPath(tabs, 'tab-1', 'C:/repo/.worktrees/feat')
+    expect(r.activeId).toBe('tab-2')
+  })
+
+  it('关掉最右边的活动标签时回落到左边', () => {
+    const r = closeTabsByPath(tabs, 'tab-2', 'C:/other')
+    expect(r.tabs.map((t) => t.id)).toEqual(['tab-0', 'tab-1'])
+    expect(r.activeId).toBe('tab-1')
+  })
+
+  // 删除走的是界面传回来的路径，标签的路径则可能来自 dialog 或 git，
+  // 两边写法不一致是常态；比不上就等于标签关不掉
+  it('反斜杠、大小写、尾部斜杠的写法都要认得', () => {
+    const r = closeTabsByPath(tabs, 'tab-0', 'c:\\REPO\\.worktrees\\Feat\\')
+    expect(r.tabs.map((t) => t.id)).toEqual(['tab-0', 'tab-2'])
+  })
+
+  it('前缀相同但不是同一个目录的标签不能误关', () => {
+    const near: RepoTabInfo[] = [
+      { id: 'tab-0', path: 'C:/repo/.worktrees/feat' },
+      { id: 'tab-1', path: 'C:/repo/.worktrees/feat2' },
+    ]
+    const r = closeTabsByPath(near, 'tab-0', 'C:/repo/.worktrees/feat')
+    expect(r.tabs.map((t) => t.id)).toEqual(['tab-1'])
+  })
+
+  it('没有标签开着那个路径时原样返回', () => {
+    const r = closeTabsByPath(tabs, 'tab-0', 'C:/never/opened')
+    expect(r.tabs).toBe(tabs)
+    expect(r.activeId).toBe('tab-0')
+  })
+
+  // normalizePath('/') 和 normalizePath('') 都是空串：空路径一旦参与比较，
+  // 会把所有只由斜杠组成的标签一起关掉。这类空输入在本项目的 discard 上出过事故。
+  // 三种写法都要挡住——只挡 '' 的话 '/' 和 '\' 照样能进来
+  it.each([['空串', ''], ['正斜杠根', '/'], ['反斜杠根', '\\']])(
+    '%s 不关任何标签',
+    (_label, path) => {
+      const withRoot: RepoTabInfo[] = [...tabs, { id: 'tab-3', path: '/' }]
+      const r = closeTabsByPath(withRoot, 'tab-0', path)
+      expect(r.tabs).toBe(withRoot)
+      expect(r.activeId).toBe('tab-0')
+    },
+  )
+
+  it('空标签列表上关不炸', () => {
+    const r = closeTabsByPath([], null, 'C:/repo')
+    expect(r.tabs).toEqual([])
+    expect(r.activeId).toBeNull()
+  })
+
+  // 同一路径理论上只会有一个标签（App 开标签时去重），但去重靠的也是 samePath，
+  // 真漂移了这里不能只关掉其中一个、留下另一个死标签
+  it('同一路径有多个标签时全部关掉', () => {
+    const dup: RepoTabInfo[] = [
+      { id: 'tab-0', path: 'C:/repo/wt' },
+      { id: 'tab-1', path: 'C:/other' },
+      { id: 'tab-2', path: 'c:\\repo\\wt' },
+    ]
+    const r = closeTabsByPath(dup, 'tab-2', 'C:/repo/wt')
+    expect(r.tabs.map((t) => t.id)).toEqual(['tab-1'])
+    expect(r.activeId).toBe('tab-1')
   })
 })

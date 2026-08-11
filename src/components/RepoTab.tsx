@@ -79,6 +79,16 @@ interface RepoTabProps {
   /** 所有标签已打开的路径，用于标记「已打开」。 */
   openPaths: string[]
   onOpenInNewTab: (path: string) => void
+  /**
+   * 这个目录已经被删掉了，开着它的标签该关掉；返回是否真有标签被关掉。
+   *
+   * 删 worktree 影响的是**别的**标签（当前标签自己的 worktree 删不了：侧边栏
+   * 禁着按钮，删分支那条路也被「不能删 HEAD 所在分支」挡住），所以只能由
+   * App 来关。返回值要和撤销凭据存在一起，撤销时才知道该不该把标签开回来。
+   */
+  onRepoRemoved: (path: string) => boolean
+  /** 删除被撤销了，把当时因此关掉的标签开回来（不抢焦点）。 */
+  onRepoRestored: (path: string) => void
 }
 
 /**
@@ -87,7 +97,9 @@ interface RepoTabProps {
  * 每个实例持有自己的 `useRepoStore`，所以标签之间的 commits / 选中 / staging
  * 互不影响；`repo-changed` 事件在 store 内按路径过滤。
  */
-export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
+export function RepoTab({
+  repoPath, openPaths, onOpenInNewTab, onRepoRemoved, onRepoRestored,
+}: RepoTabProps) {
   const {
     state, openRepo, refreshHead, refreshGraph, refreshStatus, refreshWorktrees,
     refreshDiff, refreshUpstream, refreshStashes, selectCommit, clearError, reportError,
@@ -102,7 +114,10 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
    * 删除只是把目录搬进仓库内的回收站，所以撤销是真能撤的。提示条不自动消失：
    * 用户可能正盯着别处，几秒钟就撤不了的「撤销」等于没有。
    */
-  const [undoDelete, setUndoDelete] = useState<{ name: string; trashPath: string } | null>(null)
+  const [undoDelete, setUndoDelete] = useState<
+    /** `reopen`：删的时候有标签开着它，撤销时要连标签一起开回来。 */
+    { name: string; trashPath: string; path: string; reopen: boolean } | null
+  >(null)
   const { prompt, dialog: promptDialog } = usePrompt()
   const { confirm, dialog: confirmDialog } = useConfirm()
 
@@ -319,6 +334,9 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
       // 不带 force：worktree 里有未提交的东西时要拦下来，这层保护和从侧边栏
       // 删是一致的。错误会抛给确认框显示
       await invoke('delete_worktree', { path, worktreePath, force: false })
+      // 就在这一步之后关，而不是等整套删完：后面的远程/本地分支还可能失败，
+      // 那时候目录已经没了，标签不关照样是个死标签
+      onRepoRemoved(worktreePath)
     }
     if (remote) {
       await invoke('delete_remote_branch', { path, remote: remote.remote, branch: remote.branch })
@@ -328,7 +346,7 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
     await refreshUpstream(path)
     // 删掉的 worktree 还挂在侧边栏上，得把那一栏也刷掉
     if (worktreePath) await refreshWorktrees(path)
-  }, [state.path, refreshGraph, refreshUpstream, refreshWorktrees])
+  }, [state.path, refreshGraph, refreshUpstream, refreshWorktrees, onRepoRemoved])
 
   /**
    * 删除一个 worktree。确认在 `DeleteWorktreeDialog` 里做过了。
@@ -345,9 +363,12 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
       worktreePath,
       force,
     })
+    // 目录已经不在了，开着它的标签必须跟着关：留着的话文件监听挂在空处、
+    // 刷新一路报错，那个死路径还会被存进会话，下次启动一直判成「还原不完整」
+    const reopen = onRepoRemoved(worktreePath)
     await refreshWorktrees(path)
-    setUndoDelete(deleted)
-  }, [state.path, refreshWorktrees])
+    setUndoDelete({ ...deleted, path: worktreePath, reopen })
+  }, [state.path, refreshWorktrees, onRepoRemoved])
 
   /** 撤销刚才那次删除，把目录和登记从回收站搬回原位。 */
   const handleUndoDelete = useCallback(async () => {
@@ -355,12 +376,16 @@ export function RepoTab({ repoPath, openPaths, onOpenInNewTab }: RepoTabProps) {
     if (!path || !undoDelete) return
     try {
       await invoke('restore_worktree', { path, trashPath: undoDelete.trashPath })
+      // 目录回来了，当时因此被关掉的标签也开回来。撤销要撤得干净，
+      // 否则用户看到工作树回来了、标签没回来，还得自己再开一遍。
+      // 当时没开着标签就什么都不做——撤销不该凭空多开一个
+      if (undoDelete.reopen) onRepoRestored(undoDelete.path)
       await refreshWorktrees(path)
       setUndoDelete(null)
     } catch (err) {
       reportError(err)
     }
-  }, [state.path, undoDelete, refreshWorktrees, reportError])
+  }, [state.path, undoDelete, refreshWorktrees, reportError, onRepoRestored])
 
   /**
    * 检出一个远程分支。后端会建一条跟踪它的本地分支——直接检出远程引用会进
