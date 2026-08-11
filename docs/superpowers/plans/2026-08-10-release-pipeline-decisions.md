@@ -10,7 +10,7 @@
 |---|---|---|---|---|
 | 3 | 替换默认 Tauri 图标、补 LICENSE | 已完成 | `scripts/make-icon.ps1`、`src-tauri/icons/*`、`LICENSE` | 16–256px 逐尺寸目视；`pnpm tauri build` 产物 |
 | 4 | release workflow | 已完成 | `.github/workflows/release.yml` | YAML 解析通过；`clippy -D warnings` 与 `pnpm tauri build` 本地实跑 |
-| 5 | 打 v0.1.0 | 待 PR 合并后执行 | — | — |
+| 5 | 打 v0.1.0 | 进行中 — 已修两个干跑 blocker，待合进 master 后打 tag | `src-tauri/src/commands/worktree.rs`、`scripts/gen-notices.mjs`、回归测试 | `cargo test`、`pnpm test`、`pnpm build`、`gen-notices --check` 全过 |
 
 「仓库转 public」一项**取消**：用户选择保持 private。
 
@@ -156,33 +156,7 @@ Windows runner 按 2 倍分钟数计费。
 钉死之后没有 dependabot 的仓库会长期停在旧版本，对私有个人仓库
 不划算。保留 `@v4` 这类可变 tag，属明知的取舍。
 
-### 3 [high] 第三方许可材料不足以支撑二进制分发
-
-初版 LICENSE 自己写着「这份清单不完整，完整集合请自行从锁文件解析」——
-那正好是不合规的自白。MIT 要求「在所有副本或实质性部分中包含版权声明和许可声明」，
-Apache-2.0 §4 要求向接收者提供许可副本；而我们分发的 `.msi` / `.exe` 里
-编译进了这些代码，接收者拿不到 `node_modules` 和 `Cargo.toml`。
-
-修复：新增 `scripts/gen-notices.mjs`，从锁文件生成 `THIRD_PARTY_NOTICES.md`
-（257 个组件），并经 `bundle.resources` 随安装包分发。
-
-**收录范围**只取真正进二进制的：Rust 侧从 root package 出发只跟 normal 依赖
-（dev-dependencies 只在测试链接、build-dependencies 只在构建期跑，都不分发），
-npm 侧用 `pnpm list --prod`。实测核对：`git2` / `libgit2-sys` / `tauri` / `wry` /
-`tao` / `react` 等在列；`vitest` / `vite` / `typescript` / `esbuild` / `tempfile`
-均不在列。
-
-**生成器自己先踩了一次同样的坑**：第一版只扫 crate 根目录，结果
-`libgit2-sys` 只贡献了 `LICENSE-APACHE` / `LICENSE-MIT`（Rust binding 的），
-而真正约束分发的 GPL-2.0 + 链接例外在 `libgit2/COPYING` 这个**子目录**里——
-生成出来的 notices 里 GPL 正文一个字都没有，偏偏那是整棵树里最关键的一份。
-改成额外扫一层子目录（跳过 src/tests/examples 等）后确认 GPL 正文已收录。
-这正是 Task 3「crate 声明的 license 不等于它实际分发的东西的 license」那条坑的复发。
-
-CI 加 `node scripts/gen-notices.mjs --check`：依赖动了却忘了重新生成就失败。
-两个方向都实测（一致时 exit 0，篡改后 exit 1）。
-
-### 4 [medium] 任意分支上的 `v*` tag 都能成为发布来源
+### 3 [high] 任意分支上的 `v*` tag 都能成为发布来源
 
 `on: push: tags` 不区分 tag 打在哪个提交上。初版 README 还直接写
 「`git tag v0.1.0`」，而我当时正在一个功能分支的 worktree 里——
@@ -342,4 +316,69 @@ artifact 发布出去。所以那里的可变 tag 被重指，能直接换掉用
 ```
 YAML + 权限 + 钉定           ✓ 7/7 action 全部 PINNED；build=read / publish=write
 publish 脚本四情形（桩 gh）    ✓ 见上表
+```
+
+---
+
+## Task 5 打 tag 前暴露的 blocker 与修复
+
+### 偏离计划
+
+- 原计划「PR 合并后打 tag」，但实际连续两次 workflow_dispatch 干跑都失败，
+  只好先修 blocker 再进 master。
+- 因此 Task 5 从「一个操作」扩展成「再修一轮 bug + 合进 master + 干跑 + 打 tag」。
+
+### 计划的错误
+
+- `same_path()` 最初以为「大小写 + 斜杠统一」就够了，没考虑到 Windows 8.3 短名
+  和 junction 会让同一个目录呈现出完全不同的字符串。
+- `gen-notices.mjs` 最初把递归写在 `if (!found.has(key))` 里，假设同一包只会
+  完整出现一次；pnpm 的 JSON 去重让这个假设在 CI 上直接失效。
+
+### 计划没写的坑
+
+1. **worktree 锁检查会被 8.3 短名 / junction 绕过。**
+   `same_path()` 只做字符串规范化时，`C:\Progra~1` 和 `C:\Program Files`、
+   以及 junction 入口和真实目录会被当成不同路径。
+   这会让 `a_locked_worktree_is_refused_even_with_force` 在特定拼写下跌倒，
+   也可能让主工作树保护在 junction 场景下失效。
+
+   修复：字符串比较失败后再 fallback 到 `std::fs::canonicalize()`。
+   测试补了 `the_lock_holds_even_when_the_path_is_spelled_differently`
+   （junction）和 `the_lock_holds_when_the_caller_has_the_short_path`（8.3）。
+
+2. **pnpm list --json 的 dedup 会让同一个包先以空壳出现。**
+   当 `react` 在树里出现多次时，pnpm 可能某次只给 `{ name, version }` 壳，
+   另一次才展开完整 `dependencies`。如果递归在「首次见到」时才执行，先撞上
+   壳的那次就把 key 写进 `found`，后面完整子树被跳过，
+   `loose-envify`、`js-tokens`、`scheduler` 就会从清单里消失。
+
+   修复：`walk()` 无论是否已记录都继续递归 `dependencies` / `optionalDependencies`。
+   JSON 树无环，无条件递归不会死循环。
+
+3. **vitest 不能 import 带 shebang 的 `.mjs`。**
+   把 `collectNpm()` 单独导出给 `tests/vitest/genNotices.test.ts` 单测时，
+   Vite 解析 `#!/usr/bin/env node` 抛 `SyntaxError`。
+   修复：去掉 shebang，改由 `node scripts/gen-notices.mjs` 调用（文档与 workflow
+   本来就这么用），顶部加注释说明原因。
+
+4. **CI 临时诊断步骤不能留到发版。**
+   修问题 #2 时在 `.github/workflows/release.yml` 加了 `debug npm inventory`，
+   验证通过后已删除。
+
+### 为什么这么改是安全的
+
+- `canonicalize()` 只在字符串比较失败后才调用，失败时回退到「不同路径」，
+  不会错误放行；它只读文件系统，不修改任何内容。
+- `collectNpm()` 的递归对象仍是 `pnpm list` 返回的树，无环；且收集结果
+  已经 `gen-notices --check` 验证为 257 个组件，与本地先前一致。
+- 去掉 shebang 不影响任何已有调用方式；工作流和文档都使用 `node ...`。
+- 两次干跑失败的问题都已用 fixture 仓库和回归测试覆盖，不会回退。
+
+### 修复后的复验
+
+```text
+cargo fmt --check / clippy -D warnings / cargo test  ✓ 全过
+pnpm test / pnpm build                                ✓ 全过
+node scripts/gen-notices.mjs --check                  ✓ 257 组件，exit 0
 ```
