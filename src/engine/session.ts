@@ -1,4 +1,4 @@
-import { samePath } from './path'
+import { normalizePath, samePath } from './path'
 
 /** 一个仓库标签。id 只在本次运行内有效，不落盘。 */
 export interface RepoTabInfo {
@@ -77,4 +77,36 @@ export function closeTabAt(
   const next = tabs.filter((t) => t.id !== id)
   if (activeId !== id) return { tabs: next, activeId }
   return { tabs: next, activeId: next[Math.min(idx, next.length - 1)]?.id ?? null }
+}
+
+/**
+ * 关掉所有指向某个路径的标签，用于那个目录已经不存在了的时候。
+ *
+ * 删掉一个 worktree 之后，开着它的标签必须跟着关：留着的话文件监听挂在不存在的
+ * 目录上、每次刷新都报错，而且那个死路径会被 `save_session` 原样写回存档——
+ * 下次启动它进 `droppedTabs`，`partial` 就一直误判成「本次还原不完整」。
+ *
+ * 只在**明确的删除动作**之后调用，不要接到「路径探测不到」上：网络盘和移动硬盘
+ * 临时离线是常事，那种情况下关掉标签等于把用户的会话悄悄删了。
+ *
+ * 判空要**归一化之后**再判：`normalizePath('')` 和 `normalizePath('/')` 都是空串，
+ * 只挡住 `''` 的话，`'/'`（或 `'\'`）照样能进来，把所有归一化后为空的标签一起关掉。
+ * 本项目已经在空 pathspec 上出过误伤事故。
+ *
+ * 同一路径正常只会有一个标签，这里仍然全部关掉——去重和这里用的是同一个
+ * `samePath`，真漂移了也不该留下关不掉的死标签。活动标签的接管规则复用
+ * [`closeTabAt`]，两条关闭路径的手感保持一致。
+ */
+export function closeTabsByPath(
+  tabs: RepoTabInfo[],
+  activeId: string | null,
+  path: string,
+): { tabs: RepoTabInfo[]; activeId: string | null } {
+  if (!normalizePath(path)) return { tabs, activeId }
+  const doomed = tabs.filter((t) => samePath(t.path, path))
+  if (doomed.length === 0) return { tabs, activeId }
+  return doomed.reduce(
+    (acc, t) => closeTabAt(acc.tabs, acc.activeId, t.id),
+    { tabs, activeId },
+  )
 }
