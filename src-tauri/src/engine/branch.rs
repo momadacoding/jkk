@@ -98,6 +98,27 @@ fn find_remote_branch(repo: &Repository, short: &str) -> Option<(String, String,
 /// 顶多多显示一次警告。
 const PATCHID_SCAN_LIMIT: usize = 500;
 
+/// 算 patch-id 用的 diff 选项：**不带上下文行**。
+///
+/// 这不是为了省字节，是正确性问题。patch-id 会剥掉 hunk 头里的行号，但**不剥
+/// 上下文行**。squash 提交的补丁是相对「合并时的主干」算出来的，分支的净改动是
+/// 相对**分叉点**算出来的；分叉之后、squash 之前主干动过的行会落进两边各自的
+/// 上下文，于是增删的行一字不差，指纹却不一样——而「合并之前主干先合了别的 PR」
+/// 正是 GitHub 上最普通的一天。
+///
+/// 真实仓库上复现过：分支改了 33 个文件，其中 32 个的补丁完全一致，只有 README
+/// 因为中间那个 PR 删掉了它的一行上下文而对不上。整体指纹是全有或全无的，一个
+/// 文件差一行上下文就把整个判定拖下水。压到零上下文后两边立刻一致。
+///
+/// 代价是判定略微放宽：同样的增删行出现在文件里的**另一个位置**也会算命中。
+/// 这一项只决定警告的措辞，真正的护栏是照实报出来的 `unmerged` 数；比起每
+/// squash 合并一个分支就误报一次、喊到最后没人再看，这个放宽是划算的。
+fn no_context_diff() -> git2::DiffOptions {
+    let mut opts = git2::DiffOptions::new();
+    opts.context_lines(0);
+    opts
+}
+
 /// 分支自己的那部分改动，是不是已经在当前 HEAD 上了。
 ///
 /// **不能拿两边的整棵 tree 去比。** 那只在分支不落后于主干时才成立，而最常见的
@@ -115,7 +136,8 @@ const PATCHID_SCAN_LIMIT: usize = 500;
 ///    只有 patch-id 分得开。
 ///
 /// 注意第 2 步算的是**净改动的整体指纹**，不是逐个提交比对；`git cherry` 那样
-/// 逐个比对认不出 squash，因为 N 个补丁被合成了 1 个。
+/// 逐个比对认不出 squash，因为 N 个补丁被合成了 1 个。而且这个指纹必须**在零
+/// 上下文下**算，见 [`no_context_diff`]。
 ///
 /// 任何一步出错都当作 false：这一项只决定警告用什么颜色，宁可多喊一次狼来了，
 /// 也不要因为算不出来就把真正的未合并提交轻描淡写过去。
@@ -135,9 +157,11 @@ fn content_is_already_in(
         let branch_tree = repo.find_commit(branch_oid).ok()?.tree().ok()?;
         let head_tree = repo.find_commit(target).ok()?.tree().ok()?;
 
-        // 分支从分叉点以来碰过哪些路径
+        // 分支从分叉点以来碰过哪些路径。零上下文只影响 patch-id，不影响这里要的
+        // 文件清单——delta 是按文件给的，跟带几行上下文无关。
+        let mut patch_opts = no_context_diff();
         let own = repo
-            .diff_tree_to_tree(Some(&base_tree), Some(&branch_tree), None)
+            .diff_tree_to_tree(Some(&base_tree), Some(&branch_tree), Some(&mut patch_opts))
             .ok()?;
         if own.deltas().len() == 0 {
             return Some(true); // 分支什么都没改，删了当然不丢东西
@@ -195,7 +219,7 @@ fn content_is_already_in(
             }
 
             let diff = repo
-                .diff_tree_to_tree(Some(&parent_tree), Some(&tree), None)
+                .diff_tree_to_tree(Some(&parent_tree), Some(&tree), Some(&mut patch_opts))
                 .ok()?;
             if diff.patchid(None).ok()? == want {
                 return Some(true);
