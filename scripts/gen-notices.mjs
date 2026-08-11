@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+// 顶部不写 shebang：这个文件同时被 vitest 从 .ts 测试导入，shebang 会让 Vite 解析报错。
 /**
  * 生成 THIRD_PARTY_NOTICES.md —— 随安装包分发的第三方许可声明。
  *
@@ -213,7 +213,15 @@ function npmPackages() {
     ['list', '--prod', '--depth', 'Infinity', '--json'],
     { cwd: repoRoot, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, shell: process.platform === 'win32' },
   )
-  const roots = JSON.parse(raw)
+  return collectNpm(JSON.parse(raw))
+}
+
+/**
+ * 从 `pnpm list --json` 的解析结果里收集全部 production 依赖。
+ *
+ * 单独导出是为了能单测——这里踩过一个只在特定树形下才暴露的坑，见 walk 内的注释。
+ */
+export function collectNpm(roots) {
   const found = new Map()
 
   const walk = (deps) => {
@@ -238,8 +246,21 @@ function npmPackages() {
           } catch {}
         }
         found.set(key, { ecosystem: 'npm', name, version: info.version, license, repository, authors, dir })
-        walk(info.dependencies)
       }
+      // 递归**必须**留在 if 外面。
+      //
+      // pnpm 的 list JSON 会对重复出现的子树去重：同一个包在树里出现多次时，
+      // 可能一次带着完整的 dependencies、另一次只有一个壳。把递归写进
+      // `if (!found.has(key))` 里的话，先撞上没壳的那次就把这个包记下了，
+      // 之后带完整子树的那次会被 found.has 挡掉，整棵子树永久丢失。
+      //
+      // 这不是假想：同一份代码在本地收到 257 个组件、在 CI 上只收到 254 个，
+      // 差的正是 react / react-dom 底下的 loose-envify、js-tokens、scheduler。
+      // 两边 pnpm list 的输出都是全的，差别只在子树在哪个位置展开。
+      //
+      // 无条件递归不会打转：JSON 解析出来的是树，不可能有环。
+      walk(info.dependencies)
+      walk(info.optionalDependencies)
     }
   }
   for (const r of roots) {
@@ -360,6 +381,11 @@ function render(packages) {
 
 // ---------------------------------------------------------------- main
 
+// 只在被直接执行时跑主流程。单测要 import collectNpm，那时不能顺带去调
+// cargo / pnpm——那既慢又会让测试依赖机器上的依赖安装状态。
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+
+if (isMain) {
 const packages = [...rustPackages(), ...npmPackages()]
 const content = render(packages)
 
@@ -405,4 +431,5 @@ if (checkOnly) {
 } else {
   writeFileSync(outFile, content)
   console.log(`wrote ${path.relative(repoRoot, outFile)} —— ${packages.length} 个组件`)
+}
 }
