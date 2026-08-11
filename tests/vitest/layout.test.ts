@@ -146,6 +146,81 @@ describe('computeLayout 按分支归属分车道', () => {
     expect(byId.f1.parents[0].lane).toBe(byId.m1.lane)
   })
 
+  it('短分支的出边跨过的行不会被别的分支复用车道', () => {
+    // 真实形状（readwise-alternative 的 worktree-ci-parallel-e2e）：
+    // a1 是很新的单提交分支，但它的 merge base m2 在很下面。a1 的线要在自己
+    // 的车道里从第 0 行一路竖到第 5 行才拐进 lane 0。b 分支若复用这条车道，
+    // 那条竖线就从 b1/b2 的圆点上穿过去——看上去 b2 凭空多出一个父节点。
+    const commits = [
+      node('a1', ['m2']),
+      node('m0', ['m1']),
+      node('m1', ['m2']),
+      node('b1', ['b2']),
+      node('b2', ['m2']),
+      node('m2', []),
+    ]
+    const refs = [
+      ref('refs/heads/master', 'm0', 'branch'),
+      ref('refs/heads/a', 'a1', 'branch'),
+      ref('refs/heads/b', 'b1', 'branch'),
+    ]
+    const lanes = laneById(computeLayout(commits, refs))
+    expect(lanes.a1).not.toBe(lanes.b1)
+    expect(lanes.a1).not.toBe(lanes.b2)
+  })
+
+  it('第二父边跨过的行不会被别的分支复用车道', () => {
+    // 同一个缺陷的对称面：第二父边画在**父**的车道里（`cornerAtTop`），
+    // 从合并那行横过来再一路竖到父那行。父的 owner 只从自己第一个提交起算，
+    // 上面这一大段就成了「空闲车道」，别的分支被塞进来后同样被线穿过。
+    const commits = [
+      node('c', ['m1', 'p1']),
+      node('y1', ['y2']),
+      node('y2', ['m1']),
+      node('m1', ['m2']),
+      node('m2', ['m3']),
+      node('m3', ['m4']),
+      node('m4', ['m5']),
+      node('m5', ['m6']),
+      node('m6', ['m7']),
+      node('m7', ['m8']),
+      node('p1', ['m8']),
+      node('m8', []),
+    ]
+    const refs = [
+      ref('refs/heads/master', 'c', 'branch'),
+      ref('refs/heads/y', 'y1', 'branch'),
+    ]
+    const lanes = laneById(computeLayout(commits, refs))
+    expect(lanes.p1).not.toBe(lanes.y1)
+    expect(lanes.p1).not.toBe(lanes.y2)
+  })
+
+  it('线跨度不重叠的两条分支仍然共用车道', () => {
+    // 上面两条把区间从「自有提交跨度」放大成「线跨度」，代价是车道数会涨。
+    // 这条钉住放大的边界：跨度真的不重叠时复用必须还在，否则每条历史分支
+    // 都独占一列，图会横向爆炸。
+    const commits = [
+      node('a1', ['m1']), // 线跨度 0..2
+      node('m0', ['m1']),
+      node('m1', ['m2']),
+      node('m2', ['m3']),
+      node('m3', ['m4']),
+      node('b1', ['m5']), // 线跨度 5..7
+      node('m4', ['m5']),
+      node('m5', ['m6']),
+      node('m6', []),
+    ]
+    const refs = [
+      ref('refs/heads/master', 'm0', 'branch'),
+      ref('refs/heads/a', 'a1', 'branch'),
+      ref('refs/heads/b', 'b1', 'branch'),
+    ]
+    const lanes = laneById(computeLayout(commits, refs))
+    expect(lanes.a1).toBe(lanes.b1)
+    expect(lanes.a1).not.toBe(0)
+  })
+
   it('没有 refs 时不崩溃，每行都有车道', () => {
     const rows = computeLayout([node('c2', ['c1']), node('c1', [])])
     expect(rows.map((r) => r.lane)).toEqual([0, 0])

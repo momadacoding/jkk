@@ -102,6 +102,15 @@ export function computeOwners(commits: CommitNode[], refs: RefPointer[]): OwnerA
       if (r > info.maxRow) info.maxRow = r
       cur = byId.get(cur)!.parents[0]
     }
+
+    // 这条线不止于最后一个自有提交：它还要在本车道里一直竖到分叉点（`cur`，
+    // 已归别人所有的第一父）那一行，才拐进对方车道。区间漏掉这段的话，装箱
+    // 会把车道判成空闲让给别人，那条竖线就从别人的圆点上穿过去——视觉上该
+    // 提交凭空多出一个父节点。tip 很新而 merge base 很老的短分支必然踩中。
+    if (cur !== undefined) {
+      const r = rowOf.get(cur)
+      if (r !== undefined && r > info.maxRow) info.maxRow = r
+    }
   }
 
   for (const tip of collectTips(commits, refs)) claim(tip)
@@ -109,7 +118,17 @@ export function computeOwners(commits: CommitNode[], refs: RefPointer[]): OwnerA
   // 合并提交的第二父及以后只能经由第二父边到达，上面的第一父链遍历覆盖不到。
   // 按行序补认领，保证结果与遍历顺序无关。
   for (const commit of commits) {
-    for (const parent of commit.parents.slice(1)) claim(parent)
+    const childRow = rowOf.get(commit.id)
+    for (const parent of commit.parents.slice(1)) {
+      claim(parent)
+      // 第二父边画在**父**的车道里：从合并那行横过来，再一路竖到父那行
+      // （`computePaths` 的 `cornerAtTop`）。所以父所属 owner 的车道从合并行
+      // 就开始被占用，区间要往上顶到这里——和上面的出边是同一个缺陷的两面。
+      // （第三面在工作区伪行上，见 `computeLayout` 里的「已知残留」。）
+      const owner = ownerOf.get(parent)
+      if (owner === undefined || childRow === undefined) continue
+      if (childRow < owners[owner].minRow) owners[owner].minRow = childRow
+    }
   }
 
   return { ownerOf, owners }
