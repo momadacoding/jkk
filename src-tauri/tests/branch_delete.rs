@@ -168,6 +168,48 @@ fn the_patchid_fallback_catches_it_when_the_trunk_edits_the_same_files() {
     );
 }
 
+/// GitHub 上的真实形态：分支开出去之后、squash 合并**之前**，主干先合了另一个
+/// PR，而那个 PR 动过同一个文件。
+///
+/// 上面那几个 squash 用例都是分叉后主干原地不动、立刻 `merge --squash`，于是
+/// squash 提交的补丁和分支净补丁天然一模一样，patch-id 怎么算都对得上——测的
+/// 不是 GitHub 的真实形态。真实情况下 squash 提交是相对**合并时的主干**算的，
+/// 分支净补丁是相对**分叉点**算的，中间主干动过的那些行会变成两边不同的
+/// **上下文行**，即使增删的行一字不差，整体 patch-id 也对不上。
+///
+/// 真实仓库上复现过：一个 33 文件的分支，32 个文件的补丁都能对上，只有 README
+/// 因为上一个 PR 删掉了它的一行上下文而对不上，整体指纹就此作废，红色的
+/// 「删除后只能靠 reflog 找回」照弹。
+#[test]
+fn a_squash_merge_is_recognised_when_the_trunk_moved_before_the_merge() {
+    let (_remote, work) = repo_with_remote();
+    let shared = work.path().join("shared.txt");
+    fs::write(&shared, "l1\nl2\nl3\nl4\nl5\n").unwrap();
+    run_git(work.path(), &["add", "."]);
+    run_git(work.path(), &["commit", "-m", "add shared"]);
+
+    // 分支从这里开出去，在文件末尾追加一行
+    run_git(work.path(), &["checkout", "-q", "-b", "feat/gh"]);
+    fs::write(&shared, "l1\nl2\nl3\nl4\nl5\nfrom branch\n").unwrap();
+    run_git(work.path(), &["commit", "-am", "branch appends"]);
+
+    // 主干先合了别的 PR，它改掉了 l3——那正是分支那个 hunk 的三行上下文之一
+    run_git(work.path(), &["checkout", "-q", "-"]);
+    fs::write(&shared, "l1\nl2\nl3-changed-by-another-pr\nl4\nl5\n").unwrap();
+    run_git(work.path(), &["commit", "-am", "another PR (#1)"]);
+
+    // 然后才 squash 合并本分支
+    run_git(work.path(), &["merge", "--squash", "feat/gh"]);
+    run_git(work.path(), &["commit", "-m", "squashed feat/gh (#2)"]);
+
+    let info = branch::delete_info(&p(&work), "feat/gh").unwrap();
+    assert_eq!(info.unmerged, 1);
+    assert!(
+        info.content_merged,
+        "分叉之后主干动过同一个文件，变的只是上下文行，不该判成未合并"
+    );
+}
+
 /// HEAD 停在别处时，仍然要拿主干来判。
 ///
 /// 真实踩过：主仓库处于游离 HEAD，停在某个功能分支的 tip 上，那个 tip 落后
