@@ -122,6 +122,91 @@ fn push_propagates_rejection_as_error() {
 }
 
 #[test]
+fn push_tag_puts_the_tag_on_the_remote() {
+    let (_remote, _a, b) = trio();
+    run_git(b.path(), &["tag", "-a", "v1", "-m", "release one"]);
+
+    remote::push_tag(b.path().to_str().unwrap().to_string(), "v1".into()).unwrap();
+
+    let listed = git_out(b.path(), &["ls-remote", "origin", "refs/tags/v1"]);
+    assert!(
+        listed.contains("refs/tags/v1"),
+        "远端没有这条 tag：{listed:?}"
+    );
+}
+
+#[test]
+fn push_tag_rejects_an_empty_name() {
+    // 空名不能交给 git：`git push origin refs/tags/:refs/tags/` 是删除远端引用的
+    // 形态，绝不能因为界面传了个空串就走到那里去
+    let (_remote, _a, b) = trio();
+    let path = b.path().to_str().unwrap().to_string();
+
+    for empty in ["", "   "] {
+        let err = remote::push_tag(path.clone(), empty.into())
+            .expect_err("empty tag name should be rejected");
+        assert_eq!(err.code, "bad_arg", "empty name {empty:?} 没被挡住");
+    }
+}
+
+#[test]
+fn push_tag_works_when_the_remote_is_not_named_origin() {
+    // 远端叫 upstream 的仓库不少（fork 工作流）。硬写 origin 会让这类仓库
+    // 永远推不出去，而界面上没有地方能改远端名。
+    let (_remote, _a, b) = trio();
+    run_git(b.path(), &["remote", "rename", "origin", "upstream"]);
+    run_git(b.path(), &["tag", "v1"]);
+
+    remote::push_tag(b.path().to_str().unwrap().to_string(), "v1".into()).unwrap();
+
+    let listed = git_out(b.path(), &["ls-remote", "upstream", "refs/tags/v1"]);
+    assert!(listed.contains("refs/tags/v1"), "tag 没推上去：{listed:?}");
+}
+
+#[test]
+fn push_tag_without_any_remote_reports_a_clear_error() {
+    let (_remote, _a, b) = trio();
+    run_git(b.path(), &["remote", "remove", "origin"]);
+    run_git(b.path(), &["tag", "v1"]);
+
+    let err = remote::push_tag(b.path().to_str().unwrap().to_string(), "v1".into())
+        .expect_err("没有远端时应当报错");
+    assert_eq!(err.code, "no_remote");
+}
+
+#[test]
+fn push_tag_refuses_to_guess_between_several_remotes() {
+    // 多个远端又没有 origin：猜哪个都可能把 tag 推到错的地方
+    let (_remote, _a, b) = trio();
+    run_git(b.path(), &["remote", "rename", "origin", "upstream"]);
+    run_git(
+        b.path(),
+        &["remote", "add", "fork", "https://example.invalid/x"],
+    );
+    run_git(b.path(), &["tag", "v1"]);
+
+    let err = remote::push_tag(b.path().to_str().unwrap().to_string(), "v1".into())
+        .expect_err("多个远端且没有 origin 时应当报错");
+    assert_eq!(err.code, "ambiguous_remote");
+}
+
+#[test]
+fn push_tag_does_not_push_a_same_named_branch() {
+    // 短名 `git push origin v1` 在同时存在分支 v1 和 tag v1 时是有歧义的。
+    // 必须用全限定 refspec，否则可能推错东西。
+    let (_remote, _a, b) = trio();
+    run_git(b.path(), &["branch", "v1"]);
+    run_git(b.path(), &["tag", "v1"]);
+
+    remote::push_tag(b.path().to_str().unwrap().to_string(), "v1".into()).unwrap();
+
+    let tag = git_out(b.path(), &["ls-remote", "origin", "refs/tags/v1"]);
+    assert!(tag.contains("refs/tags/v1"), "tag 没推上去：{tag:?}");
+    let branch = git_out(b.path(), &["ls-remote", "origin", "refs/heads/v1"]);
+    assert!(branch.is_empty(), "同名分支被一起推上去了：{branch:?}");
+}
+
+#[test]
 fn force_push_overwrites_remote() {
     let (_remote, a, b) = trio();
     commit(a.path(), "remote-side");

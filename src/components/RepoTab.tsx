@@ -4,6 +4,7 @@ import { listen } from '@tauri-apps/api/event'
 import { Panel, Group, Separator } from 'react-resizable-panels'
 import { GraphView } from './GraphView'
 import { BranchView } from './BranchView'
+import { TagView } from './TagView'
 import { WorktreeView } from './WorktreeView'
 import { CommitDetailView } from './CommitDetailView'
 import { LocalChangesView } from './LocalChangesView'
@@ -107,6 +108,7 @@ export function RepoTab({
   const [repoState, setRepoState] = useState<string>('normal')
   const [viewMode, setViewMode] = useState<ViewMode>('commits')
   const [selectedBranch, setSelectedBranch] = useState<string | null>(null)
+  const [selectedTag, setSelectedTag] = useState<string | null>(null)
   const [selectedWorktree, setSelectedWorktree] = useState<string | null>(null)
   /**
    * 刚删掉的 worktree，用来显示撤销提示条。
@@ -428,6 +430,45 @@ export function RepoTab({
     selectCommit(hash)
   }, [selectCommit])
 
+  /**
+   * 单击 tag：只选中并把 graph 定位到它指向的提交，不碰工作区。
+   *
+   * load_graph 现在会把 tag 也当 revwalk 起点，正常情况下目标提交一定在图里；
+   * 但提交数超过上限被截断时仍可能落空。同 `handleSelectWorktree`：宁可明说
+   * 原因，也不要留一个悬空的 selectedId 让详情面板莫名空白。
+   */
+  const handleSelectTag = useCallback((name: string, hash: string) => {
+    setSelectedTag(name)
+    setViewMode('commits')
+    if (!state.commits.some((c) => c.id === hash)) {
+      reportError(`tag "${name}" 指向的提交 (${hash.slice(0, 7)}) 不在当前提交图中`)
+      return
+    }
+    selectCommit(hash)
+  }, [selectCommit, state.commits, reportError])
+
+  /**
+   * 双击 tag：检出到它指向的提交。这会进入游离 HEAD，是 git 的正常语义。
+   *
+   * rev 用全限定的 `refs/tags/<name>`：同时存在同名分支时短名有歧义，
+   * git 会优先选分支，那就检出到了完全不同的地方。
+   */
+  const handleCheckoutTag = useCallback((name: string) => {
+    // 双击一定先触发两次 onClick，所以 handleSelectTag 可能刚报过
+    // 「不在当前提交图中」——那条提示对紧接着的 checkout 不成立（checkout 走
+    // git，不受图的 5000 条上限影响），留着会变成一条自相矛盾的红条。
+    clearError()
+    void runAndRefresh('checkout', { rev: `refs/tags/${name}` }, async () => {
+      const before = state.headHash
+      const after = await refreshHead(state.path!)
+      await refreshGraph(state.path!, after, after !== before)
+      await refreshStatus(state.path!)
+      // 检出 tag 会进游离 HEAD，此时不再有上游。不刷的话工具栏会继续显示
+      // 原分支的 ↑↓，看着像这个游离 HEAD 还在跟踪某个远程分支。
+      await refreshUpstream(state.path!)
+    })
+  }, [runAndRefresh, clearError, state.headHash, state.path, refreshHead, refreshGraph, refreshStatus, refreshUpstream])
+
   /** 单击 worktree：把 graph 定位到它的 HEAD，同样不碰工作区。 */
   const handleSelectWorktree = useCallback((headHash: string, name: string) => {
     setSelectedWorktree(name)
@@ -517,6 +558,14 @@ export function RepoTab({
                 onCheckoutRemote={(name) => void handleCheckoutRemote(name)}
                 onDeleteRemote={handleDeleteRemote}
                 repoPath={state.path}
+              />
+              <TagView
+                tags={state.refs.filter((r) => r.kind === 'tag')}
+                commits={state.commits}
+                selectedTag={selectedTag}
+                onSelect={handleSelectTag}
+                onCheckout={handleCheckoutTag}
+                onPush={(name) => void runToolbar('push_tag', { name })}
               />
               <WorktreeView
                 worktrees={state.worktrees}
