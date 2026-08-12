@@ -19,6 +19,9 @@ pub struct GraphData {
 
 pub fn load(path: &str) -> Result<GraphData> {
     let repo = Repository::open(path)?;
+    // 先收 refs：下面 revwalk 要用里面已经 peel 好的 tag 目标做起点，
+    // 在这里重新 peel 一遍等于把 refs.rs 的逻辑抄第二份。
+    let refs = crate::engine::refs::collect(&repo)?;
     let mut walk = repo.revwalk()?;
     // TOPOLOGICAL 只保证「子在父之前」，互不相关的两个提交之间顺序是任意的，
     // 取决于下面 push 的顺序。加上 TIME 才是 `git log --date-order` 的语义：
@@ -33,6 +36,18 @@ pub fn load(path: &str) -> Result<GraphData> {
         let (branch, _) = branch?;
         if let Some(oid) = branch.get().target() {
             walk.push(oid)?;
+        }
+    }
+    // tag 也当起点：一条提交可能只被 tag 指着（分支已经挪走），不 push 的话它不进图，
+    // 侧边栏点这个 tag 就会定位失败。
+    //
+    // 只取 tag，不顺手把 other 也 push 进来——refs/stash、refs/notes 会把一堆
+    // 与提交历史无关的东西拉进图里。
+    //
+    // push 失败就跳过：一条悬空或损坏的 tag 不该让整张图加载失败。
+    for r in refs.iter().filter(|r| r.kind == "tag") {
+        if let Ok(oid) = git2::Oid::from_str(&r.hash) {
+            let _ = walk.push(oid);
         }
     }
 
@@ -60,6 +75,5 @@ pub fn load(path: &str) -> Result<GraphData> {
         ));
     }
 
-    let refs = crate::engine::refs::collect(&repo)?;
     Ok(GraphData { commits, refs })
 }

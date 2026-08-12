@@ -45,6 +45,34 @@ fn load_linear_graph() {
 }
 
 #[test]
+fn graph_includes_a_commit_reachable_only_by_tag() {
+    // revwalk 只 push HEAD 和分支，所以一条「只被 tag 指向」的提交不会进图。
+    // 侧边栏点这种 tag 会定位失败，图上也看不到它。
+    let dir = linear_repo();
+    fs::write(dir.path().join("tagged.txt"), "x").unwrap();
+    run_git(dir.path(), &["add", "."]);
+    run_git(dir.path(), &["commit", "-m", "only-tagged"]);
+    run_git(dir.path(), &["tag", "-a", "v9", "-m", "orphan"]);
+    // 把分支退回去，让这条提交只剩 tag 指着它。
+    // 只在本用例自建的临时 fixture 仓库里做，不碰任何真实仓库。
+    run_git(dir.path(), &["reset", "--hard", "HEAD~1"]);
+
+    let data = engine::graph::load(dir.path().to_str().unwrap()).unwrap();
+    assert!(
+        data.commits.iter().any(|c| c.message == "only-tagged"),
+        "只被 tag 指向的提交不在图里：{:?}",
+        data.commits.iter().map(|c| &c.message).collect::<Vec<_>>()
+    );
+    // 而且这条 tag 的 hash 必须能在图里找到对应的行，否则前端仍然画不出 pill
+    let tag = data
+        .refs
+        .iter()
+        .find(|r| r.name == "refs/tags/v9")
+        .expect("refs/tags/v9");
+    assert!(data.commits.iter().any(|c| c.id == tag.hash));
+}
+
+#[test]
 fn read_status_detects_unstaged() {
     let dir = linear_repo();
     fs::write(dir.path().join("a.txt"), "changed").unwrap();

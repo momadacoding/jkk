@@ -43,8 +43,30 @@ pub fn collect(repo: &Repository) -> Result<Vec<RefPointer>> {
         } else {
             "other"
         };
-        // 符号引用（如 refs/remotes/origin/HEAD）的 target() 为 None，跳过
-        if let Some(oid) = reference.target() {
+        // 附注 tag 的 refs/tags/x 指向一个 tag object，不是提交；target() 拿到的
+        // oid 在提交图里根本不存在，前端按 hash 精确匹配提交行，这条 tag 就永远
+        // 画不出 pill。必须 peel 一层拿到真正的提交。
+        //
+        // peel 失败时退回 target()：tag 可以合法地指向 blob 或 tree
+        // （git.git 的 junio-gpg-pub 就是挂在一个 blob 上的），这种 tag 没有对应的
+        // 提交行，但它确实存在，侧边栏必须把它列出来。丢掉它会让 TAGS 的数量
+        // 和 `git tag` 对不上，而且没有任何报错解释为什么少了一条。
+        //
+        // 退回来的 oid 匹配不到提交行，前端画不出 pill、点击会提示「不在提交图中」，
+        // 这是准确的描述，比静默消失好。
+        //
+        // 只对 tag 做，分支和远程分支本来就直接指向提交。
+        let target = if kind == "tag" {
+            reference
+                .peel_to_commit()
+                .ok()
+                .map(|c| c.id())
+                .or_else(|| reference.target())
+        } else {
+            // 符号引用（如 refs/remotes/origin/HEAD）的 target() 为 None，跳过
+            reference.target()
+        };
+        if let Some(oid) = target {
             let counts = if kind == "branch" {
                 upstream_counts(repo, &name)
             } else {

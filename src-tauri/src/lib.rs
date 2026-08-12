@@ -42,6 +42,7 @@ pub fn run() {
             commands::remote::fetch,
             commands::remote::pull,
             commands::remote::push,
+            commands::remote::push_tag,
             commands::repo::open_repo,
             commands::repo::read_upstream,
             commands::repo::repo_state,
