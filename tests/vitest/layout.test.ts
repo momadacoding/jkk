@@ -221,6 +221,48 @@ describe('computeLayout 按分支归属分车道', () => {
     expect(lanes.a1).not.toBe(0)
   })
 
+  it('本地 master 落后 origin/master 时，主干仍然是 lane 0 上的一条线', () => {
+    // 真实形状：GitHub 上连着合了两个 PR，本地 master 还停在 m。
+    // om -> t -> m 是一条直线，必须整条落在 lane 0；两个 worktree 分支各出一条支线。
+    // 缺陷形态是主干被切成 om / t / m 三段三色，排成阶梯：本地 master 只认领到 m 及以下，
+    // 无主的 t 被普通本地分支 w1 沿第一父链吞掉，origin/master 轮到时只剩 om 一个提交。
+    const commits = [
+      node('om', ['t']), // origin/master
+      node('w1', ['t']),
+      node('t', ['m']),
+      node('w2', ['m']),
+      node('m', ['m0']), // 本地 master
+      node('m0', []),
+    ]
+    const refs = [
+      ref('refs/heads/master', 'm', 'branch'),
+      ref('refs/remotes/origin/master', 'om', 'remote'),
+      ref('refs/heads/w1', 'w1', 'branch'),
+      ref('refs/heads/w2', 'w2', 'branch'),
+    ]
+    const lanes = laneById(computeLayout(commits, refs))
+    expect(lanes.om).toBe(0)
+    expect(lanes.t).toBe(0)
+    expect(lanes.m).toBe(0)
+    expect(lanes.m0).toBe(0)
+    expect(lanes.w1).not.toBe(0)
+    expect(lanes.w2).not.toBe(0)
+  })
+
+  it('本地 master 与 origin/master 真分叉时，较新的一侧占 lane 0', () => {
+    // 本地有未 push 的提交、远程也有别人推的提交，两侧互不是对方祖先。
+    // 谁也不比谁更「主干」，按行序定：这里本地更新，origin/master 那截成一条支线。
+    const commits = [node('lm', ['base']), node('om', ['base']), node('base', [])]
+    const refs = [
+      ref('refs/heads/master', 'lm', 'branch'),
+      ref('refs/remotes/origin/master', 'om', 'remote'),
+    ]
+    const lanes = laneById(computeLayout(commits, refs))
+    expect(lanes.lm).toBe(0)
+    expect(lanes.base).toBe(0)
+    expect(lanes.om).not.toBe(0)
+  })
+
   it('没有 refs 时不崩溃，每行都有车道', () => {
     const rows = computeLayout([node('c2', ['c1']), node('c1', [])])
     expect(rows.map((r) => r.lane)).toEqual([0, 0])

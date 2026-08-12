@@ -30,6 +30,22 @@ describe('collectTips', () => {
     expect(collectTips(commits, refs)[0]).toBe('m1')
   })
 
+  it('本地 master 落后 origin/master 时，远程主干也要排在普通本地分支之前', () => {
+    // 在 GitHub 上合完 PR、本地还没 pull 的常态：om 领先本地 master 两个提交。
+    // 远程主干若只是「本地不存在时的回退」，它就排在所有本地分支之后：om 和 t
+    // 会被普通本地分支 w 先认领走，一条主干被切成三段（见 layout.test.ts 同名场景）。
+    const commits = [node('om', ['t']), node('w1', ['t']), node('t', ['m']), node('m', [])]
+    const refs = [
+      ref('refs/heads/master', 'm', 'branch'),
+      ref('refs/heads/w', 'w1', 'branch'),
+      ref('refs/remotes/origin/master', 'om', 'remote'),
+    ]
+    const tips = collectTips(commits, refs)
+    // 两个主干 tip 里较新的先认领，它沿第一父链一路吞下较旧的那个
+    expect(tips[0]).toBe('om')
+    expect(tips.indexOf('m')).toBeLessThan(tips.indexOf('w1'))
+  })
+
   it('本地和远程 master 都没有时，lane 0 归下一级的第一个 tip', () => {
     const commits = [node('d1', ['d0']), node('d0', [])]
     const refs = [ref('refs/heads/develop', 'd1', 'branch')]

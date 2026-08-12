@@ -49,9 +49,17 @@ export function collectTips(commits: CommitNode[], refs: RefPointer[]): string[]
   const mainRemote = named.filter((r) => MAIN_REMOTE.includes(r.name))
 
   const tiers: string[][] = [
-    // 主干永远吃 lane 0；本地 master/main 优先，没有才回退远程。
+    // 主干永远吃 lane 0。**本地和远程主干都算主干**，不是「本地优先、没有才回退远程」：
+    // 在 GitHub 上合完 PR、本地还没 pull 时本地 master 落后于 origin/master，是常态而非
+    // 异常。远程主干若排在普通本地分支之后，本地 master 之上那几个提交在轮到它之前就无主，
+    // 会被随便哪条本地分支沿第一父链吞掉，一条主干被切成三段三色，图上排成阶梯。
+    //
+    // 同级内按行序，较新的先认领：两者是祖先关系时（落后/领先），较新的那个沿第一父链
+    // 一路走过较旧的那个，整条主干合成一个 owner；真分叉时较新的一侧占 lane 0，另一侧
+    // 成为一条支线——两侧都是主干，谁占 lane 0 没有唯一正确答案，按行序是合理默认。
+    //
     // 两者都不存在时本级为空，lane 0 自然归下一级的第一个 tip。
-    byRow(mainLocal.length > 0 ? mainLocal : mainRemote),
+    byRow([...mainLocal, ...mainRemote]),
     byRow(local),
     byRow(named.filter((r) => r.kind === 'remote')),
     byRow(named.filter((r) => r.kind === 'tag')),
