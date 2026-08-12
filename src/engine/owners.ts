@@ -48,23 +48,37 @@ export function collectTips(commits: CommitNode[], refs: RefPointer[]): string[]
   const mainLocal = local.filter((r) => MAIN_LOCAL.includes(r.name))
   const mainRemote = named.filter((r) => MAIN_REMOTE.includes(r.name))
 
+  // 有子以它为第一父的提交**不独立成线**：那个子的线沿第一父链下来必然经过它，
+  // 让它另起一条线只会把一条本该竖直的父子边劈成跨列斜线。
+  //
+  // 这是「主干被切断」的真正根因：owner 只能从起点沿第一父链往**下**走，永远走不到
+  // 自己的子。所以只要有分支骑在某条线的起点头上（feature 骑在 origin/master 上、
+  // origin/master 骑在落后的 master 上），那条线就在起点处断开。收紧起点的定义之后，
+  // 骑在头上的那个子会把下面整条链一起认领走，父子边自然竖直。Sublime Merge 同此。
+  const hasFirstParentChild = new Set<string>()
+  for (const c of commits) if (c.parents[0]) hasFirstParentChild.add(c.parents[0])
+
+  // lane 0 的专座，也是上面那条规则的**唯一例外**：主干必须强制成为起点，哪怕有分支
+  // 骑在它头上。否则 master 会被那条分支的线吞掉，失去自己的车道——而 master 的位置
+  // 固定在最左列是这张图的锚点，不该随便哪条分支的存在与否而漂移。
+  // 本地主干优先，没有才回退远程主干；两者都没有时本级为空，lane 0 归下一级第一个 tip。
+  const trunk = byRow(mainLocal.length > 0 ? mainLocal : mainRemote)
+
   const tiers: string[][] = [
-    // 主干永远吃 lane 0。**本地和远程主干都算主干**，不是「本地优先、没有才回退远程」：
-    // 在 GitHub 上合完 PR、本地还没 pull 时本地 master 落后于 origin/master，是常态而非
-    // 异常。远程主干若排在普通本地分支之后，本地 master 之上那几个提交在轮到它之前就无主，
-    // 会被随便哪条本地分支沿第一父链吞掉，一条主干被切成三段三色，图上排成阶梯。
+    trunk,
+    // 远程主干排在**普通本地分支之前**。在 GitHub 上合完 PR、本地还没 pull 时，本地
+    // master 落后于 origin/master 是常态而非异常；远程主干若排在普通本地分支之后，
+    // 本地 master 之上那几个提交在轮到它之前就无主，会被随便哪条本地分支沿第一父链
+    // 吞掉，主干被切成几段几色，图上排成阶梯。
     //
-    // 同级内按行序，较新的先认领：两者是祖先关系时（落后/领先），较新的那个沿第一父链
-    // 一路走过较旧的那个，整条主干合成一个 owner；真分叉时较新的一侧占 lane 0，另一侧
-    // 成为一条支线——两侧都是主干，谁占 lane 0 没有唯一正确答案，按行序是合理默认。
-    //
-    // 两者都不存在时本级为空，lane 0 自然归下一级的第一个 tip。
-    byRow([...mainLocal, ...mainRemote]),
+    // 注意这一级只在 origin/master 自己就是线起点时才生效——有分支骑在它头上时它已被
+    // 上面的规则滤掉，由那条分支的线连着一起认领，效果一样是主干不断。
+    byRow(mainRemote),
     byRow(local),
     byRow(named.filter((r) => r.kind === 'remote')),
     byRow(named.filter((r) => r.kind === 'tag')),
     childless(commits),
-  ]
+  ].map((tier, i) => (i === 0 ? tier : tier.filter((h) => !hasFirstParentChild.has(h))))
 
   const seen = new Set<string>()
   const tips: string[] = []

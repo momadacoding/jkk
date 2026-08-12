@@ -221,11 +221,12 @@ describe('computeLayout 按分支归属分车道', () => {
     expect(lanes.a1).not.toBe(0)
   })
 
-  it('本地 master 落后 origin/master 时，主干仍然是 lane 0 上的一条线', () => {
+  it('本地 master 落后 origin/master 时，领先的那截是一条连续的线', () => {
     // 真实形状：GitHub 上连着合了两个 PR，本地 master 还停在 m。
-    // om -> t -> m 是一条直线，必须整条落在 lane 0；两个 worktree 分支各出一条支线。
-    // 缺陷形态是主干被切成 om / t / m 三段三色，排成阶梯：本地 master 只认领到 m 及以下，
-    // 无主的 t 被普通本地分支 w1 沿第一父链吞掉，origin/master 轮到时只剩 om 一个提交。
+    // master 独占 lane 0；om -> t 这截领先的主干是**一条**线，必须同车道且连续，
+    // 到 m 那行才拐进 lane 0。缺陷形态是它被切成 om / t 两段两色排成阶梯：
+    // 本地 master 只认领到 m 及以下，无主的 t 被普通本地分支 w1 沿第一父链吞掉，
+    // origin/master 轮到时只剩 om 一个提交，另占一条车道。
     const commits = [
       node('om', ['t']), // origin/master
       node('w1', ['t']),
@@ -241,12 +242,33 @@ describe('computeLayout 按分支归属分车道', () => {
       ref('refs/heads/w2', 'w2', 'branch'),
     ]
     const lanes = laneById(computeLayout(commits, refs))
-    expect(lanes.om).toBe(0)
-    expect(lanes.t).toBe(0)
     expect(lanes.m).toBe(0)
     expect(lanes.m0).toBe(0)
-    expect(lanes.w1).not.toBe(0)
-    expect(lanes.w2).not.toBe(0)
+    expect(lanes.om).toBe(lanes.t) // 一条线，不是两段
+    expect(lanes.om).not.toBe(0)
+    expect(lanes.w1).not.toBe(lanes.om)
+    expect(lanes.w2).not.toBe(lanes.om)
+  })
+
+  it('骑在 origin/master 头上的分支与它同车道', () => {
+    // 这是最初那张截图剩下的一段：f1 的第一父就是 om，两点必须竖直相连。
+    // om 若仍作为线的起点，f1 只能另开一列，这条父子边就成了跨列斜线。
+    const commits = [
+      node('f1', ['om']), // 骑在 origin/master 头上的 feature
+      node('om', ['t']),
+      node('t', ['m']),
+      node('m', []), // 本地 master
+    ]
+    const refs = [
+      ref('refs/heads/master', 'm', 'branch'),
+      ref('refs/remotes/origin/master', 'om', 'remote'),
+      ref('refs/heads/feature', 'f1', 'branch'),
+    ]
+    const lanes = laneById(computeLayout(commits, refs))
+    expect(lanes.m).toBe(0)
+    expect(lanes.f1).toBe(lanes.om)
+    expect(lanes.om).toBe(lanes.t)
+    expect(lanes.f1).not.toBe(0)
   })
 
   it('本地 master 与 origin/master 真分叉时，较新的一侧占 lane 0', () => {

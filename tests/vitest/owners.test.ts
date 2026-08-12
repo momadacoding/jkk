@@ -30,7 +30,7 @@ describe('collectTips', () => {
     expect(collectTips(commits, refs)[0]).toBe('m1')
   })
 
-  it('本地 master 落后 origin/master 时，远程主干也要排在普通本地分支之前', () => {
+  it('本地 master 落后 origin/master 时，远程主干排在普通本地分支之前', () => {
     // 在 GitHub 上合完 PR、本地还没 pull 的常态：om 领先本地 master 两个提交。
     // 远程主干若只是「本地不存在时的回退」，它就排在所有本地分支之后：om 和 t
     // 会被普通本地分支 w 先认领走，一条主干被切成三段（见 layout.test.ts 同名场景）。
@@ -41,9 +41,31 @@ describe('collectTips', () => {
       ref('refs/remotes/origin/master', 'om', 'remote'),
     ]
     const tips = collectTips(commits, refs)
-    // 两个主干 tip 里较新的先认领，它沿第一父链一路吞下较旧的那个
-    expect(tips[0]).toBe('om')
-    expect(tips.indexOf('m')).toBeLessThan(tips.indexOf('w1'))
+    // 本地 master 仍然吃 lane 0，但 om 要抢在 w1 之前，否则 t 会被 w1 吞掉
+    expect(tips[0]).toBe('m')
+    expect(tips.indexOf('om')).toBeLessThan(tips.indexOf('w1'))
+  })
+
+  it('有子以它为第一父的提交不独立成线', () => {
+    // f1 骑在 origin/master 头上。om 若仍作为起点，f1 只能另开一条线，
+    // 「f1 -> om」这条本该竖直的父子边就被劈成跨列斜线。
+    const commits = [node('f1', ['om']), node('om', ['t']), node('t', ['m']), node('m', [])]
+    const refs = [
+      ref('refs/heads/master', 'm', 'branch'),
+      ref('refs/heads/feature', 'f1', 'branch'),
+      ref('refs/remotes/origin/master', 'om', 'remote'),
+    ]
+    const tips = collectTips(commits, refs)
+    expect(tips).not.toContain('om')
+    expect(tips).toContain('f1')
+  })
+
+  it('主干是唯一例外：有分支骑在头上也照样独立成线', () => {
+    // t 的第一父是 m，按上一条规则 m 不该成为起点；但 m 是主干，
+    // 它必须保住自己的车道，否则 master 的位置会随分支的有无而漂移。
+    const commits = [node('t', ['m']), node('m', ['m0']), node('m0', [])]
+    const refs = [ref('refs/heads/master', 'm', 'branch'), ref('refs/heads/t', 't', 'branch')]
+    expect(collectTips(commits, refs)[0]).toBe('m')
   })
 
   it('本地和远程 master 都没有时，lane 0 归下一级的第一个 tip', () => {
