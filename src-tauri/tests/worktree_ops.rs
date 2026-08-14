@@ -419,6 +419,27 @@ fn undo_only_accepts_paths_inside_this_repos_trash() {
     assert_eq!(err.code, "trash_foreign");
 }
 
+/// 往 worktree 里塞 n 个小文件，模拟装了依赖的 node_modules。
+fn stuff(dir: &std::path::Path, n: usize) {
+    for i in 0..n {
+        let d = dir.join(format!("pkg{}", i / 100));
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join(format!("f{i}.js")), "1").unwrap();
+    }
+}
+
+/// 回收站条目数收敛到上限之内（清理在后台跑，给足等待时间）。
+fn wait_trash_converged(trash: &std::path::Path) -> usize {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let kept = fs::read_dir(trash).unwrap().count();
+        if kept <= 5 || std::time::Instant::now() >= deadline {
+            return kept;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 /// 回收站只留固定个数，旧的自动清掉，否则装了 node_modules 的工作树会把盘吃光。
 #[test]
 fn the_trash_keeps_only_the_most_recent_entries() {
@@ -436,9 +457,54 @@ fn the_trash_keeps_only_the_most_recent_entries() {
     }
 
     let trash = main.join(".worktrees").join(".trash");
-    let kept = fs::read_dir(&trash).unwrap().count();
+    let kept = wait_trash_converged(&trash);
     assert!(kept <= 5, "回收站该只留最近 5 个，实际留了 {kept} 个");
     assert!(kept > 0, "不该清空");
+}
+
+/// 删除本身必须毫秒级返回，哪怕这次删除触发了对旧槽位的清理。
+///
+/// 回归背景：清理曾在删除命令里同步执行，而清掉一个装了依赖的工作树是
+/// 分钟级操作（实测 10 万文件要两分多钟），用户的「删除」点击会替之前的
+/// 回收站买单。改成后台清理后，删除的耗时与回收站里躺了什么无关。
+///
+/// 时限取 2 秒：同步清理 2 万文件实测 6 秒以上，毫秒级的搬移离时限有一个
+/// 数量级的余量，正常负载下不会抖红。
+#[test]
+fn deleting_returns_fast_even_when_the_trash_needs_pruning() {
+    let (_dir, wt) = repo_with_worktree("w0");
+    let main = main_of(&wt);
+    // 第一个槽位塞成大树，它就是第 6 次删除时该被清掉的 victim
+    stuff(&wt.join("node_modules"), 20_000);
+    delete(&main, &wt, true);
+    for i in 1..5 {
+        let name = format!("w{i}");
+        let path = main.join(".worktrees").join(&name);
+        run_git(
+            &main,
+            &["worktree", "add", path.to_str().unwrap(), "-b", &name],
+        );
+        delete(&main, &path, false);
+    }
+
+    let name = "w5".to_string();
+    let path = main.join(".worktrees").join(&name);
+    run_git(
+        &main,
+        &["worktree", "add", path.to_str().unwrap(), "-b", &name],
+    );
+    let started = std::time::Instant::now();
+    delete(&main, &path, false);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "删除被回收站清理拖慢了：{:?}",
+        started.elapsed()
+    );
+
+    // 后台清理最终要把 victim 清掉，磁盘不会漏
+    let trash = main.join(".worktrees").join(".trash");
+    let kept = wait_trash_converged(&trash);
+    assert!(kept <= 5, "后台清理该把回收站收敛到 5 个，实际 {kept} 个");
 }
 
 /// 删掉 worktree 不会动里面做的提交——提交对象在共享的对象库里，

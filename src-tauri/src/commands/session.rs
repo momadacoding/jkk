@@ -23,7 +23,11 @@ fn session_path(app: &AppHandle) -> Result<PathBuf> {
 
 #[tauri::command(async)]
 pub fn load_session(app: AppHandle) -> Result<SessionView> {
-    Ok(session::to_view(session::load_from(&session_path(&app)?)))
+    let session = session::load_from(&session_path(&app)?);
+    // 上次退出若赶在后台清理完成之前，回收站会残留旧槽位；启动时后台接着收，
+    // 不阻塞还原流程
+    crate::commands::worktree::prune_trash_background(session.recent.clone());
+    Ok(session::to_view(session))
 }
 
 /// 保存当前标签与活动标签，返回更新后的最近列表。

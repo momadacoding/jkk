@@ -292,7 +292,7 @@ pub fn delete_worktree(
         return Err(err);
     }
 
-    prune_trash(&trash_root);
+    spawn_prune(trash_root);
 
     Ok(DeletedWorktree {
         name,
@@ -346,6 +346,40 @@ fn prune_trash(trash_root: &Path) {
     for (_, dir) in slots.iter().take(slots.len() - TRASH_KEEP) {
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+/// 把清理放到后台线程跑。
+///
+/// 清掉一个装了 node_modules 的旧槽位是分钟级操作（实测 10 万文件两分多钟）。
+/// 同步跑的话，用户的「删除」点击会替之前删除攒下的回收站买单；搬移本身只要
+/// 毫秒级，后台化之后删除的耗时就和回收站里躺了什么无关。清理快慢只影响磁盘
+/// 空间回收速度，用户感知不到。
+///
+/// 并发清理被容忍：两个线程可能选中同一个 victim，慢的那个 `remove_dir_all`
+/// 对着不存在的目录静默失败，没有副作用。应用中途退出最多残留一个旧槽位，
+/// 下次删除或启动清理会接着收。
+fn spawn_prune(trash_root: PathBuf) {
+    let _ = std::thread::Builder::new()
+        .name("trash-prune".into())
+        .spawn(move || prune_trash(&trash_root));
+}
+
+/// 启动时在后台清理这些仓库的回收站。
+///
+/// 兜住「上次退出时后台清理没跑完」的残留：用户不再删除的话，残留靠下次启动
+/// 收回。路径可能是主仓库也可能是 worktree，`main_repo` 各自归位；问不出来的
+/// 路径（盘没挂上之类）跳过，清理永远不算错误。
+pub fn prune_trash_background(paths: Vec<String>) {
+    let _ = std::thread::Builder::new()
+        .name("trash-prune-startup".into())
+        .spawn(move || {
+            for path in paths {
+                let Ok(main) = main_repo(&path) else {
+                    continue;
+                };
+                prune_trash(&main.join(".worktrees").join(".trash"));
+            }
+        });
 }
 
 /// 撤销一次删除：把工作树和管理目录原样搬回去。
