@@ -237,17 +237,12 @@ export function DeleteBranchDialog({ repoPath, name, onCancel, onConfirm }: Dele
 
         {error && <div className="dlg-warning">{error}</div>}
 
-        {/* 每一步都可能慢，明说在做什么，免得用户以为界面卡了。
-            worktree 排在最前所以先报它：装了依赖的目录动辄十几万个文件，
-            实测清掉一个 pnpm 工程要一百多秒，比联系远程还久得多 */}
+        {/* 删 worktree 只是把目录搬进回收站，毫秒级；真正要等网络的只有远程
+            那一步，单独报它，免得用户以为界面卡了 */}
         {busy && (
           <div className="dlg-progress">
             <span className="dlg-spinner" />
-            {alsoWorktree
-              ? '正在删除 worktree…（依赖目录很大时要等一两分钟）'
-              : alsoRemote
-                ? '正在联系远程…'
-                : '正在删除…'}
+            {alsoRemote ? '正在联系远程…' : '正在删除…'}
           </div>
         )}
 
