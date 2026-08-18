@@ -21,11 +21,28 @@ fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
+/// 盘上真实拼写。TempDir 给的是调用方拼写：CI runner 的 %TEMP% 带 8.3 短名
+///（`C:\Users\RUNNER~1\...`），而 git 写登记/gitdir 一律归一成盘上真实拼写
+///（实测：从别名路径进仓库，gitdir 里落的也是长名）。登记反查是精确匹配，
+/// 两种拼写对不上会被当成「找不到登记」拒删。生产里入参来自 git 自己的输出，
+/// 天然同族；测试要复刻这种形态，fixture 根目录必须先归一。
+///
+/// canonicalize 在 Windows 上返回 `\\?\` verbatim 前缀，git CLI 不认，剥掉；
+/// UNC（`\\?\UNC\...`）不能剥，保持原样。
+fn on_disk_spelling(path: &std::path::Path) -> std::path::PathBuf {
+    let canon = path.canonicalize().unwrap();
+    let s = canon.to_string_lossy();
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => std::path::PathBuf::from(rest),
+        _ => canon,
+    }
+}
+
 /// 主仓库 + 一个位于 `<主仓库>/.worktrees/<name>` 的 worktree，
 /// 复刻用户实际的目录布局。
 fn repo_with_worktree(name: &str) -> (TempDir, std::path::PathBuf) {
     let dir = TempDir::new().unwrap();
-    let main = dir.path().join("main");
+    let main = on_disk_spelling(dir.path()).join("main");
     fs::create_dir_all(&main).unwrap();
     run_git(&main, &["init"]);
     run_git(&main, &["config", "user.email", "test@test.com"]);
@@ -632,6 +649,53 @@ fn undo_of_a_gone_worktree_restores_the_registration() {
         "登记该回来"
     );
     assert!(!wt.exists(), "目录本来就是丢的，撤销不该造目录");
+}
+
+/// 同一目录可以有两种拼写：8.3 短名（`RUNNER~1`）和长名。CI runner 的 %TEMP%
+/// 就带短名，上面两个「目录已丢」的用例曾在那里红过——登记反查是精确匹配，
+/// 别名拼写必须**拒绝**（over-refusal 是安全方向，绝不猜着去搬别人的登记）；
+/// 归一回盘上真实拼写（= git 登记的拼写）后，同一个 worktree 必须删得掉。
+#[cfg(windows)]
+#[test]
+fn a_gone_worktree_refuses_an_aliased_spelling_of_its_path() {
+    let (_dir, wt) = repo_with_worktree("gone");
+    let main = main_of(&wt);
+    // 别名必须在目录还在盘上时取；删掉之后 8.3 解析无从谈起
+    let aliased = short_spelling(&wt);
+    if aliased == wt {
+        eprintln!("跳过：本机临时卷未启用 8.3 短名");
+        return;
+    }
+    fs::remove_dir_all(&wt).unwrap();
+
+    let err = try_delete(&main, &aliased, false);
+    assert_eq!(
+        err.code, "worktree_not_registered",
+        "别名拼写必须按「找不到登记」拒绝，不能折叠匹配：{} / {}",
+        err.code, err.message
+    );
+
+    // 归一成盘上真实拼写后（fixture 已经归一），同一个 worktree 删得掉
+    delete(&main, &wt, false);
+    assert!(
+        !git_out(&main, &["worktree", "list"]).contains("gone"),
+        "登记该清掉"
+    );
+}
+
+/// 盘上路径的 8.3 短名拼写。卷上没启用 8.3 时返回原样（调用方据此跳过）。
+#[cfg(windows)]
+fn short_spelling(path: &std::path::Path) -> std::path::PathBuf {
+    use std::os::windows::process::CommandExt;
+    // 必须 raw_arg：Rust 会把内嵌引号转义成 \"，cmd 不认反斜杠转义，
+    // 多出来的反斜杠会让路径变成非法名（os error 123）
+    let out = Command::new("cmd")
+        .arg("/c")
+        .raw_arg(format!("for %I in (\"{}\") do @echo %~sI", path.display()))
+        .output()
+        .expect("cmd 起不来");
+    assert!(out.status.success());
+    std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
 }
 
 /// pnpm 那种「目标带点、排序在链接前面」的布局，原先会让 git 递归删除栽在死链接上、
