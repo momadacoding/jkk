@@ -588,6 +588,48 @@ fn deleting_never_touches_what_a_junction_points_at() {
     );
 }
 
+/// 目录已经丢了（prunable）的 worktree 也必须删得掉，删完分支不再被登记挡着。
+///
+/// 真实形态：用户或别的工具手动删过目录，只剩登记。这种状态下 git 照样拒绝
+/// `branch -D`（实测），界面删分支勾上「连 worktree 一起删」时就得能收拾它。
+/// 此时盘上没有要保护的用户数据，但登记本身仍进回收站——撤销能还原回
+/// 「原样 prunable」的状态。
+#[test]
+fn a_worktree_whose_directory_is_gone_can_still_be_deleted() {
+    let (_dir, wt) = repo_with_worktree("gone");
+    let main = main_of(&wt);
+    fs::remove_dir_all(&wt).unwrap();
+
+    let deleted = delete(&main, &wt, false);
+
+    assert!(
+        !git_out(&main, &["worktree", "list"]).contains("gone"),
+        "登记该清掉，branch -D 不再被挡"
+    );
+    run_git(&main, &["branch", "-D", "gone"]);
+    // 槽位里只有管理目录，没有工作树部分
+    let slot = std::path::Path::new(&deleted.trash_path);
+    assert!(slot.join("admin").exists(), "管理目录该进回收站");
+    assert!(!slot.join("worktree").exists(), "丢了的工作树变不出来");
+}
+
+/// 撤销「目录已丢」的删除：把登记还原回 prunable 状态，不凭空造目录。
+#[test]
+fn undo_of_a_gone_worktree_restores_the_registration() {
+    let (_dir, wt) = repo_with_worktree("gone");
+    let main = main_of(&wt);
+    fs::remove_dir_all(&wt).unwrap();
+
+    let deleted = delete(&main, &wt, false);
+    cmd::restore_worktree(main.to_str().unwrap().to_string(), deleted.trash_path).unwrap();
+
+    assert!(
+        git_out(&main, &["worktree", "list"]).contains("gone"),
+        "登记该回来"
+    );
+    assert!(!wt.exists(), "目录本来就是丢的，撤销不该造目录");
+}
+
 /// pnpm 那种「目标带点、排序在链接前面」的布局，原先会让 git 递归删除栽在死链接上、
 /// 删一半放弃。改成搬移之后根本不存在「删一半」这个状态。
 #[cfg(windows)]

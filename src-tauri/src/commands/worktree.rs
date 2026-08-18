@@ -86,6 +86,32 @@ fn admin_dir(worktree_path: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(out.trim()))
 }
 
+/// 目录已经从盘上消失时，从登记里反查管理目录。
+///
+/// 每个 linked worktree 的登记目录（`.git/worktrees/<name>/`）里都有一个 `gitdir`
+/// 文件，写着那个工作树的 `.git` 文件的位置，它的父目录就是工作树本身。扫一遍按
+/// `same_path` 匹配——不靠目录名拼，同名被加过后缀的照样对得上。
+///
+/// 局限：目录没了之后 `same_path` 的 canonicalize 兜底失效（路径不存在），只剩
+/// 分隔符/大小写归一化后的字符串比较。前端传回的路径来自 `git worktree list`，
+/// 和 gitdir 文件里 git 自己写的写法同出一族，正常路径都能匹配。
+fn admin_from_registry(common: &Path, worktree_path: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(common.join("worktrees")).ok()?;
+    for entry in entries.flatten() {
+        let admin = entry.path();
+        let Ok(gitdir) = std::fs::read_to_string(admin.join("gitdir")) else {
+            continue;
+        };
+        let Some(dir) = Path::new(gitdir.trim()).parent() else {
+            continue;
+        };
+        if same_path(&dir.to_string_lossy(), worktree_path) {
+            return Some(admin);
+        }
+    }
+    None
+}
+
 /// 这个 worktree 被 `git worktree lock` 锁了吗？锁了就返回理由。
 ///
 /// 单独解析而不是扩展 `read_worktrees`：那个函数是喂给界面列表的，加字段要连着
@@ -175,6 +201,8 @@ pub fn delete_worktree(
     worktree_path: String,
     force: bool,
 ) -> Result<DeletedWorktree> {
+    let worktree_exists = Path::new(&worktree_path).exists();
+
     // 主工作区一票否决，而且要排在所有检查最前面。
     //
     // 这道保护原先是 git 给的（`fatal: '.' is a main working tree`）。现在 git 不再
@@ -184,16 +212,34 @@ pub fn delete_worktree(
     //
     // 判据：主工作区的 `--absolute-git-dir` 和 `--git-common-dir` 相等，linked
     // worktree 的前者是 `.git/worktrees/<name>`，不相等。
-    let admin = admin_dir(&worktree_path)?;
-    if same_path(
-        &admin.to_string_lossy(),
-        &common_git_dir(&worktree_path)?.to_string_lossy(),
-    ) {
-        return Err(GitError::new(
-            "worktree_is_main",
-            "这是仓库的主工作区，不能删。".to_string(),
-        ));
-    }
+    let admin = if worktree_exists {
+        let admin = admin_dir(&worktree_path)?;
+        if same_path(
+            &admin.to_string_lossy(),
+            &common_git_dir(&worktree_path)?.to_string_lossy(),
+        ) {
+            return Err(GitError::new(
+                "worktree_is_main",
+                "这是仓库的主工作区，不能删。".to_string(),
+            ));
+        }
+        admin
+    } else {
+        // 目录已丢（prunable）：git 进程没法在不存在的目录里启动（Windows 上 io
+        // error 267），`admin_dir` 走不通，改从登记里反查。主工作区不在
+        // `.git/worktrees/` 下登记，扫不到只会换来「找不到登记」的拒绝——
+        // 一票否决仍然成立，只是换个说法。
+        let common = common_git_dir(&path)?;
+        admin_from_registry(&common, &worktree_path).ok_or_else(|| {
+            GitError::new(
+                "worktree_not_registered",
+                format!(
+                    "git 的登记里找不到这个 worktree：\n{worktree_path}\n\n\
+                     目录已经不在盘上，登记也对不上，没什么可删的。"
+                ),
+            )
+        })?
+    };
 
     if let Some(reason) = lock_reason(&path, &worktree_path)? {
         let tail = if reason.is_empty() {
@@ -209,7 +255,9 @@ pub fn delete_worktree(
 
     // 脏就拦下来。跑不动 status 说明 worktree 本身已经坏了，那种情况下拦着反而
     // 让人没法收拾，交给 force 放行。
-    if !force {
+    //
+    // 目录已丢时不查：未提交内容随目录一起没了，没有可保护的数据，git 进程也起不来。
+    if !force && worktree_exists {
         match is_dirty(&worktree_path) {
             Ok(true) => {
                 return Err(GitError::new(
@@ -242,28 +290,47 @@ pub fn delete_worktree(
     let trash_root = main_repo(&path)?.join(".worktrees").join(".trash");
     let slot = new_trash_slot(&trash_root, &name)?;
 
-    // 先搬工作树。这一步失败什么都没动，直接把原因带回去。
+    // meta 必须在任何搬移之前落盘：后台清理把读不出元数据的槽位当成最旧的优先清，
+    // 等搬完再写的话，清理会在空窗里把这个正在搬移的槽位连同工作树一起删掉。
+    // 写不成时槽位还是空的，直接当作没删过。
+    let meta = TrashMeta {
+        worktree: worktree_path.clone(),
+        admin: admin.to_string_lossy().to_string(),
+        deleted_at: now_secs(),
+    };
+    if let Err(err) = write_meta(&slot, &meta) {
+        remove_slot(&slot);
+        return Err(err);
+    }
+
+    // 先搬工作树。这一步失败什么都没动，直接把原因带回去。目录已丢时无事可搬。
     let slot_worktree = slot.join("worktree");
-    if let Err(err) = std::fs::rename(&worktree_path, &slot_worktree) {
-        let _ = std::fs::remove_dir(&slot);
-        // 系统只会说 "used by another process"，不说是哪个。挨个探测一遍，
-        // 把话说到能动手为止——探测是只读的，此时目录一动未动。
-        let root = Path::new(&worktree_path);
-        let blockers = crate::engine::file_lock::find_blockers(root, 3);
-        return Err(GitError::new(
-            "worktree_busy",
-            format!(
-                "移不动这个 worktree：{err}\n\n{}",
-                crate::engine::file_lock::describe(root, &blockers)
-            ),
-        ));
+    if worktree_exists {
+        if let Err(err) = std::fs::rename(&worktree_path, &slot_worktree) {
+            remove_slot(&slot);
+            // 系统只会说 "used by another process"，不说是哪个。挨个探测一遍，
+            // 把话说到能动手为止——探测是只读的，此时目录一动未动。
+            let root = Path::new(&worktree_path);
+            let blockers = crate::engine::file_lock::find_blockers(root, 3);
+            return Err(GitError::new(
+                "worktree_busy",
+                format!(
+                    "移不动这个 worktree：{err}\n\n{}",
+                    crate::engine::file_lock::describe(root, &blockers)
+                ),
+            ));
+        }
     }
 
     // 再搬管理目录。失败就把工作树搬回原位——半搬状态下 git 看到的是个坏 worktree。
     let slot_admin = slot.join("admin");
     if let Err(err) = std::fs::rename(&admin, &slot_admin) {
-        let rolled_back = std::fs::rename(&slot_worktree, &worktree_path).is_ok();
-        let _ = std::fs::remove_dir(&slot);
+        let rolled_back =
+            !worktree_exists || std::fs::rename(&slot_worktree, &worktree_path).is_ok();
+        if rolled_back {
+            remove_slot(&slot);
+        }
+        // 工作树搬不回去时槽位连 meta 一起留着，它仍是一个可撤销的回收站条目。
         return Err(GitError::new(
             "worktree_admin_move_failed",
             if rolled_back {
@@ -279,19 +346,6 @@ pub fn delete_worktree(
         ));
     }
 
-    let meta = TrashMeta {
-        worktree: worktree_path.clone(),
-        admin: admin.to_string_lossy().to_string(),
-        deleted_at: now_secs(),
-    };
-    // meta 写不成就撤销整个删除：没有它撤不回来，不如当作没删过。
-    if let Err(err) = write_meta(&slot, &meta) {
-        let _ = std::fs::rename(&slot_admin, &admin);
-        let _ = std::fs::rename(&slot_worktree, &worktree_path);
-        let _ = std::fs::remove_dir(&slot);
-        return Err(err);
-    }
-
     spawn_prune(trash_root);
 
     Ok(DeletedWorktree {
@@ -305,6 +359,12 @@ fn write_meta(slot: &Path, meta: &TrashMeta) -> Result<()> {
         .map_err(|e| GitError::new("trash_meta", format!("写不出回收站元数据：{e}")))?;
     std::fs::write(slot.join("meta.json"), json)?;
     Ok(())
+}
+
+/// 清掉一个只写了 meta、还没搬进去东西的槽位（删除中途失败的收尾）。
+fn remove_slot(slot: &Path) {
+    let _ = std::fs::remove_file(slot.join("meta.json"));
+    let _ = std::fs::remove_dir(slot);
 }
 
 fn read_meta(slot: &Path) -> Result<TrashMeta> {
@@ -408,6 +468,8 @@ pub fn restore_worktree(path: String, trash_path: String) -> Result<()> {
     let admin = PathBuf::from(&meta.admin);
     let slot_worktree = slot.join("worktree");
     let slot_admin = slot.join("admin");
+    // 「目录已丢」的删除只搬了管理目录，槽位里没有工作树可还。
+    let has_worktree = slot_worktree.exists();
 
     if worktree.exists() {
         return Err(GitError::new(
@@ -428,24 +490,26 @@ pub fn restore_worktree(path: String, trash_path: String) -> Result<()> {
             ),
         ));
     }
-
     // 父目录可能已经因为空了被 git 收走，直接 rename 会 NotFound
-    if let Some(parent) = worktree.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     if let Some(parent) = admin.parent() {
         std::fs::create_dir_all(parent)?;
     }
-
-    std::fs::rename(&slot_worktree, &worktree).map_err(|e| {
-        GitError::new(
-            "restore_failed",
-            format!("搬不回工作树：{e}\n\n回收站里的东西没动，可以再试一次。"),
-        )
-    })?;
+    if has_worktree {
+        if let Some(parent) = worktree.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::rename(&slot_worktree, &worktree).map_err(|e| {
+            GitError::new(
+                "restore_failed",
+                format!("搬不回工作树：{e}\n\n回收站里的东西没动，可以再试一次。"),
+            )
+        })?;
+    }
     if let Err(e) = std::fs::rename(&slot_admin, &admin) {
         // 工作树已经回去了但登记没回去，那是个坏 worktree。搬回槽位保持原状。
-        let _ = std::fs::rename(&worktree, &slot_worktree);
+        if has_worktree {
+            let _ = std::fs::rename(&worktree, &slot_worktree);
+        }
         return Err(GitError::new(
             "restore_failed",
             format!("搬不回登记信息：{e}\n\n已经放回回收站，可以再试一次。"),
