@@ -83,6 +83,10 @@ fn delete_moves_a_clean_worktree_out_of_the_way() {
     // 东西进了回收站，不是被抹掉
     let slot = std::path::Path::new(&deleted.trash_path);
     assert!(
+        !deleted.trash_path.ends_with(".partial"),
+        "返回给前端的必须是落名后的正式槽位"
+    );
+    assert!(
         slot.join("worktree").join("a.txt").exists(),
         "文件该在回收站里"
     );
