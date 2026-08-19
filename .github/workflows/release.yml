@@ -99,6 +99,18 @@ jobs:
           }
           Write-Output "校验通过：$ref @ $env:SHA（相对 master：$cmp）"
 
+      # secrets 不能用在 if 里，先把「在不在」映射成 output。
+      # 只判存在性，值本身绝不写日志。
+      - name: Detect signing certificate
+        id: cert
+        shell: pwsh
+        env:
+          PFX_B64: ${{ secrets.SIGNING_CERT_PFX_BASE64 }}
+          PFX_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+        run: |
+          $has = -not [string]::IsNullOrEmpty($env:PFX_B64) -and -not [string]::IsNullOrEmpty($env:PFX_PASSWORD)
+          "has_cert=$($has.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 10
@@ -145,8 +157,54 @@ jobs:
 
       # beforeBuildCommand 会再跑一次 pnpm build，这是 tauri.conf.json 里配好的，
       # 重复一次几秒钟，不值得为省它去动配置
-      - name: tauri build
+      #
+      # pfx 解码后即导入用户证书库并立刻删文件——证书文件在盘上的存活窗口
+      # 压到这一步内部。密码全程只经 PowerShell 变量（SecureString），不进任何
+      # 命令行（signtool /p、certutil 都会把密码暴露给进程列表）。
+      - name: Import signing certificate
+        if: steps.cert.outputs.has_cert == 'true'
+        shell: pwsh
+        env:
+          PFX_B64: ${{ secrets.SIGNING_CERT_PFX_BASE64 }}
+          PFX_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX_B64))
+          $secure = ConvertTo-SecureString $env:PFX_PASSWORD -AsPlainText -Force
+          $imported = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $secure
+          Remove-Item $pfx -Force
+          "CERT_THUMB=$($imported.Thumbprint)" >> $env:GITHUB_ENV
+
+      - name: tauri build (signed)
+        if: steps.cert.outputs.has_cert == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # signCommand 完全静态：脚本路径是 checkout 下的绝对路径，指纹由脚本
+          # 自己从 CERT_THUMB 环境变量读。配置里零秘密。
+          $cfg = @{
+            bundle = @{ windows = @{ signCommand = @{
+              cmd  = 'pwsh'
+              args = @('-NoProfile', '-File', "$PWD/scripts/sign-windows.ps1", '-Target', '%1')
+            } } }
+          } | ConvertTo-Json -Depth 6 -Compress
+          $cfgPath = Join-Path $env:RUNNER_TEMP 'tauri-sign.conf.json'
+          [IO.File]::WriteAllText($cfgPath, $cfg)
+          pnpm tauri build -c $cfgPath
+          if ($LASTEXITCODE -ne 0) { throw 'tauri build (signed) 失败' }
+
+      # 无证书路径必须与接线前逐字节一致
+      - name: tauri build (unsigned)
+        if: steps.cert.outputs.has_cert == 'false'
         run: pnpm tauri build
+
+      # runner 是一次性 VM，但证书不该陪跑到 job 结束
+      - name: Remove signing certificate
+        if: ${{ always() && steps.cert.outputs.has_cert == 'true' }}
+        shell: pwsh
+        run: |
+          Remove-Item "Cert:\CurrentUser\My\$env:CERT_THUMB" -Force -ErrorAction SilentlyContinue
 
       # 绿色版：原始 exe 本身就是完整应用，zip 起来直接发。
       # 打包发生在 build 之后——有证书时 zip 里的 exe 也是签过名的。

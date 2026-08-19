@@ -16,7 +16,23 @@
   `Collect installers` 无冲突（后者只从 bundle 目录收 *.exe/*.msi）。
 - **为什么安全**：zip 找不到 exe 时 fail-fast；publish 资产核对把 zip 列为必需，
   缺了会阻断发布而不是发残缺 Release。
-| 3 release.yml 条件签名接线 | 未开始 | | |
+| 3 release.yml 条件签名接线 | 完成 | .github/workflows/release.yml | js-yaml 语法检查过；本地模拟 CI 形态跑通 base64→pfx→Import-PfxCertificate→指纹交接→signCommand 配置生成；真证书 verify 链路见 Limitation |
+
+## Task 3 决策
+
+- **本地模拟 CI 形态验证**：自签证书导出 pfx → base64（模拟 secrets）→ 照 Import
+  步骤原文执行 → pfx 即导即删、指纹入库交接成功；signCommand 配置 JSON 生成
+  正确（静态、零秘密）。
+- **计划没写的坑**：想把自签证书加进 `CurrentUser\Root` 让 `verify /pa` 本地全链
+  路通过——Windows 对 Root 库导入强制弹交互确认，非交互会话报
+  "UI is not allowed in this operation"。**放弃该路径**，不是脚本缺陷。
+- **Limitation**：真证书下 `signtool verify /pa` 的正向通过未在本地验证
+  （自签证书无法进入受信根）。已验证的部分：签名本身（Task 1 指纹匹配）、
+  verify 对不受信链的拦截（Task 1）、CI 形态的导入与交接（本 Task 模拟）。
+  真 OV 证书链接受信根，verify 预期通过；首次真证书构建时留意此点。
+- **为什么安全**：无证书路径与接线前逐字节一致（`run: pnpm tauri build` 原样
+  保留在 unsigned 分支）；证书文件存活窗口压在一个步骤内；job 末尾
+  `always()` 清理用户证书库。
 | 4 README 下载/签名说明 | 未开始 | | |
 | 5 分支 workflow_dispatch 空跑 + 产物检查 + PR | 未开始 | | |
 
