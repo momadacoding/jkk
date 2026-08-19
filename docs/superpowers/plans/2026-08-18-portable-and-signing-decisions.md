@@ -33,7 +33,7 @@
 - **为什么安全**：无证书路径与接线前逐字节一致（`run: pnpm tauri build` 原样
   保留在 unsigned 分支）；证书文件存活窗口压在一个步骤内；job 末尾
   `always()` 清理用户证书库。
-| 4 README 下载/签名说明 | 未开始 | | |
+| 4 README 下载/签名说明 | 完成 | README.md | 三处按计划原文：发布节加绿色版段、「已知未签名」小节改写为「流水线就位、证书未采购」、目录结构 scripts 行 |
 | 5 分支 workflow_dispatch 空跑 + 产物检查 + PR | 未开始 | | |
 
 ## Task 1 决策
