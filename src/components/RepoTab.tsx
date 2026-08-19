@@ -85,11 +85,9 @@ interface RepoTabProps {
    *
    * 删 worktree 影响的是**别的**标签（当前标签自己的 worktree 删不了：侧边栏
    * 禁着按钮，删分支那条路也被「不能删 HEAD 所在分支」挡住），所以只能由
-   * App 来关。返回值要和撤销凭据存在一起，撤销时才知道该不该把标签开回来。
+   * App 来关。
    */
-  onRepoRemoved: (path: string) => boolean
-  /** 删除被撤销了，把当时因此关掉的标签开回来（不抢焦点）。 */
-  onRepoRestored: (path: string) => void
+  onRepoRemoved: (path: string) => void
 }
 
 /**
@@ -99,7 +97,7 @@ interface RepoTabProps {
  * 互不影响；`repo-changed` 事件在 store 内按路径过滤。
  */
 export function RepoTab({
-  repoPath, openPaths, onOpenInNewTab, onRepoRemoved, onRepoRestored,
+  repoPath, openPaths, onOpenInNewTab, onRepoRemoved,
 }: RepoTabProps) {
   const {
     state, openRepo, refreshHead, refreshGraph, refreshStatus, refreshWorktrees,
@@ -110,16 +108,6 @@ export function RepoTab({
   const [selectedBranch, setSelectedBranch] = useState<string | null>(null)
   const [selectedTag, setSelectedTag] = useState<string | null>(null)
   const [selectedWorktree, setSelectedWorktree] = useState<string | null>(null)
-  /**
-   * 刚删掉的 worktree，用来显示撤销提示条。
-   *
-   * 删除只是把目录搬进仓库内的回收站，所以撤销是真能撤的。提示条不自动消失：
-   * 用户可能正盯着别处，几秒钟就撤不了的「撤销」等于没有。
-   */
-  const [undoDelete, setUndoDelete] = useState<
-    /** `reopen`：删的时候有标签开着它，撤销时要连标签一起开回来。 */
-    { name: string; trashPath: string; path: string; reopen: boolean } | null
-  >(null)
   const { prompt, dialog: promptDialog } = usePrompt()
   const { confirm, dialog: confirmDialog } = useConfirm()
 
@@ -360,34 +348,12 @@ export function RepoTab({
   const handleDeleteWorktree = useCallback(async (worktreePath: string, force: boolean) => {
     const path = state.path
     if (!path) return
-    const deleted = await invoke<{ name: string; trashPath: string }>('delete_worktree', {
-      path,
-      worktreePath,
-      force,
-    })
+    await invoke('delete_worktree', { path, worktreePath, force })
     // 目录已经不在了，开着它的标签必须跟着关：留着的话文件监听挂在空处、
     // 刷新一路报错，那个死路径还会被存进会话，下次启动一直判成「还原不完整」
-    const reopen = onRepoRemoved(worktreePath)
+    onRepoRemoved(worktreePath)
     await refreshWorktrees(path)
-    setUndoDelete({ ...deleted, path: worktreePath, reopen })
   }, [state.path, refreshWorktrees, onRepoRemoved])
-
-  /** 撤销刚才那次删除，把目录和登记从回收站搬回原位。 */
-  const handleUndoDelete = useCallback(async () => {
-    const path = state.path
-    if (!path || !undoDelete) return
-    try {
-      await invoke('restore_worktree', { path, trashPath: undoDelete.trashPath })
-      // 目录回来了，当时因此被关掉的标签也开回来。撤销要撤得干净，
-      // 否则用户看到工作树回来了、标签没回来，还得自己再开一遍。
-      // 当时没开着标签就什么都不做——撤销不该凭空多开一个
-      if (undoDelete.reopen) onRepoRestored(undoDelete.path)
-      await refreshWorktrees(path)
-      setUndoDelete(null)
-    } catch (err) {
-      reportError(err)
-    }
-  }, [state.path, undoDelete, refreshWorktrees, reportError, onRepoRestored])
 
   /**
    * 检出一个远程分支。后端会建一条跟踪它的本地分支——直接检出远程引用会进
@@ -509,15 +475,6 @@ export function RepoTab({
         <div className="banner-error">
           <span>{state.error}</span>
           <button onClick={clearError}>×</button>
-        </div>
-      )}
-      {undoDelete && (
-        <div className="banner-undo">
-          <span>已删除 worktree「{undoDelete.name}」，目录还在仓库的回收站里。</span>
-          <span className="banner-undo-actions">
-            <button className="link" onClick={() => void handleUndoDelete()}>撤销</button>
-            <button onClick={() => setUndoDelete(null)}>×</button>
-          </span>
         </div>
       )}
       <Toolbar
