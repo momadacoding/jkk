@@ -75,6 +75,65 @@ review 独立复跑了 fmt / clippy / `--lib` 19 项 / `worktree_ops` 24 项，�
 顺带修掉 review 的 cosmetic nit：`rename_retry` 实际是 1 次首发 + 10 次重试（10 段退避、合计 1 秒），
 注释原来含糊写成「最多重试几次」，已写精确。
 
+## Task 9 — 版本隔离：新槽位改写到 `.trash-v2`
+
+第二轮 review 指出一个**我漏掉的兼容方向**：Task 4 只保证了「新代码读旧槽位」，
+没保证「**旧代码读新槽位**」。核实后成立，且比「竞态」这个说法更确定。
+
+#### 问题（已用 `git show 809f1bb` 逐字核实）
+
+旧版 `prune_trash` 只按**目录名后缀**分类，其余一律进选举池：
+
+```rust
+if name.ends_with(PARTIAL_SUFFIX)  { ...; continue; }
+if name.ends_with(PRUNING_SUFFIX)  { ...; continue; }
+let ts = read_meta(&path).map(|m| m.deleted_at).unwrap_or(0);  // 读 meta.json
+slots.push((ts, path));
+```
+
+新版进行中槽位目录名不带 `.partial`，里面只有 `meta.json.partial` →
+旧版读不出 `meta.json` → `unwrap_or(0)` → 排序后是「最旧」→ 回收站一超限就
+**第一个**被认领并 `remove_dir_all`。
+
+危害面（这一层 review 意见没展开，实际比「全盘不兼容」窄）：
+
+| 新版状态 | 旧版拿到的 ts | 后果 |
+|---|---|---|
+| `Committed` | 真实时间戳 | ✅ 行为完全正确 |
+| `Deleting` | **0** | ❌ 超限时第一个被删 |
+| `Unknown` | **0** | ❌ 同上 |
+| `Pruning` | 0 | 被重复认领删除，本来就该死，无害 |
+
+两个窗口，严重度差很多：搬移中途只是毫秒级竞态；真正要命的是**回滚失败后
+保留的槽位**——长期停在 `Deleting`、装着未提交内容的唯一副本、新版承诺永久保留，
+而旧进程**每次启动清理都会命中**。那不是撞概率，是必然。
+
+触发前提是有 0.2.1 及更早的进程仍访问同一仓库（版本回退、两个安装并存）。
+0.2.1 已发布（`caec3b9`），旧二进制在野。
+
+#### 修法：目录隔离
+- 新槽位一律进 `.worktrees/.trash-v2/`（`TRASH_DIR`），旧版扫的是 `.trash`，
+  根本不会打开它 → 零歧义、零残留风险。
+- 新版认得两边：`prune_trash` 收**主仓库目录**，同时扫 `.trash-v2` 和 `.trash`
+  （旧格式条目在 `slot_state` 下判定本来就正确）。
+
+#### 计划没写的坑
+- **两个目录必须合并参与同一次选举**，不能各留 5 个。分开的话旧目录会永远
+  卡在 5 个不动、永不排空（`slots.len() <= TRASH_KEEP` 直接 return）。
+  合并之后旧目录里时间戳更早的条目先被清，旧回收站自然排空。
+  钉子：`both_trash_dirs_share_one_election`。
+- 备选方案都更差，记下来免得下一个人重走：让目录名永远带 `.partial`（旧版会
+  跳过）会产生新歧义——`.partial` + 只有 `meta.json` 分不清「新版正式条目」和
+  「旧版半截残留」，得再改标记名才能消歧；双写一份 `meta.json` 当诱饵只能把
+  「必定第一个被删」降级成「按时间轮换最终被删」，对「永久保留」的承诺仍不成立。
+
+#### 为什么这么改是安全的
+- 隔离方向是**新躲开旧**，不需要旧版配合任何事——旧版代码一行不用改就安全了。
+- 旧回收站只读不写，存量条目继续参与选举，不会因为改版而变成孤儿。
+- 新增两个钉子：`new_slots_never_land_in_the_legacy_trash_dir`（隔离不变量）、
+  `both_trash_dirs_share_one_election`（合并选举 + 排空顺序）。
+- 验证：`cargo fmt --check` OK、clippy 0 warning、`cargo test` 全绿。
+
 ## Task 8 — 删掉整条撤销链（用户决定）
 
 review 收尾后用户提出撤销功能多余、要求删掉，理由之一是「界面上没有操作入口」。
@@ -131,6 +190,7 @@ review 自己确认**这不是本次回归**——旧方案里同样的中断会
 **Task 8 之后这个遗留自动消失**：`Restoring` 状态本身已经不存在了。
 
 | 8 | 按用户要求删掉整条撤销链 | ✅ 完成 | 见下节 | 前后端全套复跑，全绿 |
+| 9 | 版本隔离：新槽位改写到 `.trash-v2` | ✅ 完成 | 见下节 | `cargo fmt/clippy/test` 全绿 |
 
 Task 1–7 期间前端零改动；Task 8 才动了 `src/**`（见下节）。
 

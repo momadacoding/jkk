@@ -150,7 +150,7 @@ fn a_dirty_worktree_is_refused_and_left_untouched() {
         "登记不该被解除"
     );
     // 也不该留下空的回收站槽位
-    let trash = main.join(".worktrees").join(".trash");
+    let trash = main.join(".worktrees").join(".trash-v2");
     assert!(
         !trash.exists() || fs::read_dir(&trash).unwrap().count() == 0,
         "被拒绝的删除不该在回收站里留垃圾"
@@ -330,7 +330,7 @@ fn the_main_worktree_can_never_be_deleted() {
         git_out(&main, &["worktree", "list"]).contains("feature"),
         "别的 worktree 也不该受影响"
     );
-    let trash = main.join(".worktrees").join(".trash");
+    let trash = main.join(".worktrees").join(".trash-v2");
     assert!(
         !trash.exists() || fs::read_dir(&trash).unwrap().count() == 0,
         "不该在回收站里留下任何东西"
@@ -401,7 +401,7 @@ fn the_trash_keeps_only_the_most_recent_entries() {
         delete(&main, &path, false);
     }
 
-    let trash = main.join(".worktrees").join(".trash");
+    let trash = main.join(".worktrees").join(".trash-v2");
     let kept = wait_trash_converged(&trash);
     assert!(kept <= 5, "回收站该只留最近 5 个，实际留了 {kept} 个");
     assert!(kept > 0, "不该清空");
@@ -447,7 +447,7 @@ fn deleting_returns_fast_even_when_the_trash_needs_pruning() {
     );
 
     // 后台清理最终要把 victim 清掉，磁盘不会漏
-    let trash = main.join(".worktrees").join(".trash");
+    let trash = main.join(".worktrees").join(".trash-v2");
     let kept = wait_trash_converged(&trash);
     assert!(kept <= 5, "后台清理该把回收站收敛到 5 个，实际 {kept} 个");
 }

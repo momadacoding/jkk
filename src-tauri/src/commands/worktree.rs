@@ -10,6 +10,29 @@ pub use crate::engine::worktree::{read_worktrees, Worktree};
 /// 这里存的是完整的工作树，装了 node_modules 的能到几个 GB，不能无限攒。
 const TRASH_KEEP: usize = 5;
 
+/// 新槽位落在这个目录，旧版（0.2.1 及更早）的回收站是隔壁的 [`TRASH_DIR_LEGACY`]。
+///
+/// # 为什么要换目录：旧进程会删掉新版的进行中槽位
+///
+/// 状态标记从目录名迁到标记文件之后，新版的进行中槽位目录名不再以 `.partial`
+/// 结尾。旧版清理器只按**目录名后缀**分类，于是会把它当成正式条目；而它读的
+/// `meta.json` 在新版进行中槽位里还不存在（那时叫 `meta.json.partial`），
+/// `read_meta(..).unwrap_or(0)` 就把时间戳当成 0 —— 排序后它是「最旧」的那个，
+/// 回收站一超限就**第一个**被认领并 `remove_dir_all`。
+///
+/// 撞上搬移中途只是毫秒级窗口，真正要命的是**回滚失败后保留的槽位**：那种槽位
+/// 长期停在进行中状态、装着未提交内容的唯一副本，新版承诺永久保留，而旧进程
+/// 每次启动清理都会命中它。
+///
+/// 换个目录名是最省事的隔离：旧版扫的是 `.trash`，根本不会打开 `.trash-v2`。
+/// 反过来新版认得两边（旧格式条目在 [`slot_state`] 下判定本来就正确），
+/// 两个目录合并参与同一次选举，旧回收站会随着条目被清自然排空。
+const TRASH_DIR: &str = ".trash-v2";
+
+/// 旧版的回收站目录。只读不写：新槽位一律进 [`TRASH_DIR`]，这里的存量条目
+/// 继续参与清理选举，清空之后这个目录就没用了。
+const TRASH_DIR_LEGACY: &str = ".trash";
+
 /// 槽位的状态标记文件。同一时刻一个槽位里**有且只有一个**标记存在，状态转换
 /// 就是在槽位内把这个小文件改名——原子、跨进程互斥。
 ///
@@ -510,8 +533,8 @@ pub fn delete_worktree(
         .to_string_lossy()
         .to_string();
 
-    let trash_root = main_repo(&path)?.join(".worktrees").join(".trash");
-    let slot = new_trash_slot(&trash_root, &name)?;
+    let main = main_repo(&path)?;
+    let slot = new_trash_slot(&main.join(".worktrees").join(TRASH_DIR), &name)?;
 
     // meta 在任何搬移之前落盘。进行中槽位靠 MARK_DELETING 标记对清理不可见，先写 meta
     // 是第二层防护：换成正式标记的那一刻，槽位内容（meta/worktree/admin）必须完整。
@@ -597,7 +620,7 @@ pub fn delete_worktree(
         ));
     }
 
-    spawn_prune(trash_root);
+    spawn_prune(&main);
 
     Ok(DeletedWorktree {
         name,
@@ -665,34 +688,40 @@ fn sort_slots(slots: &mut [(u64, PathBuf)]) {
 /// 这里用 `remove_dir_all`，它**解链接而不跟进目标**，这一条至关重要：槽位里存的是
 /// 原样搬进来的工作树，node_modules 里几千个 junction 要是被跟进去删，会连累链接
 /// 指向的地方。有测试钉着这个不变量。
-fn prune_trash(trash_root: &Path) {
-    let Ok(entries) = std::fs::read_dir(trash_root) else {
-        return;
-    };
+/// 新旧两个回收站目录**合并参与同一次选举**：`TRASH_KEEP` 是「回收站里一共留几个」，
+/// 不是每个目录各留几个。合并之后旧目录里时间戳更早的条目会先被选中，
+/// 旧回收站随之排空——分开各留 5 个的话它会永远卡在 5 个不动。
+fn prune_trash(main_repo_dir: &Path) {
+    let worktrees = main_repo_dir.join(".worktrees");
     let mut slots: Vec<(u64, PathBuf)> = Vec::new();
-    for entry in entries.flatten() {
-        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+    for root in [worktrees.join(TRASH_DIR), worktrees.join(TRASH_DIR_LEGACY)] {
+        let Ok(entries) = std::fs::read_dir(&root) else {
             continue;
-        }
-        let path = entry.path();
-        match slot_state(&path) {
-            SlotState::Deleting | SlotState::Unknown => {
-                let has_content = has_entry(&path, "worktree") || has_entry(&path, "admin");
-                if should_reap_partial(dir_age(&path), has_content) {
-                    let _ = std::fs::remove_dir_all(&path);
-                }
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
             }
-            SlotState::Pruning => {
-                if should_reap_pruning(dir_age(&path)) {
-                    let _ = std::fs::remove_dir_all(&path);
+            let path = entry.path();
+            match slot_state(&path) {
+                SlotState::Deleting | SlotState::Unknown => {
+                    let has_content = has_entry(&path, "worktree") || has_entry(&path, "admin");
+                    if should_reap_partial(dir_age(&path), has_content) {
+                        let _ = std::fs::remove_dir_all(&path);
+                    }
                 }
-            }
-            SlotState::Committed => {
-                // 读不出元数据的正式条目当成最旧的，优先清掉
-                let ts = read_meta(&path, MARK_COMMITTED)
-                    .map(|m| m.deleted_at)
-                    .unwrap_or(0);
-                slots.push((ts, path));
+                SlotState::Pruning => {
+                    if should_reap_pruning(dir_age(&path)) {
+                        let _ = std::fs::remove_dir_all(&path);
+                    }
+                }
+                SlotState::Committed => {
+                    // 读不出元数据的正式条目当成最旧的，优先清掉
+                    let ts = read_meta(&path, MARK_COMMITTED)
+                        .map(|m| m.deleted_at)
+                        .unwrap_or(0);
+                    slots.push((ts, path));
+                }
             }
         }
     }
@@ -733,10 +762,11 @@ fn claim_for_pruning(dir: &Path) -> Option<PathBuf> {
 /// 两个线程撞同一个 victim 时慢者 rename 失败直接放弃。应用中途退出留下的残留
 /// 分两类：空的进行中槽位和半截 [`SlotState::Pruning`] 由 24 小时后的清理回收；
 /// 含工作树/管理目录的进行中槽位是用户数据的唯一副本，永久保留。
-fn spawn_prune(trash_root: PathBuf) {
+fn spawn_prune(main_repo_dir: &Path) {
+    let main_repo_dir = main_repo_dir.to_path_buf();
     let _ = std::thread::Builder::new()
         .name("trash-prune".into())
-        .spawn(move || prune_trash(&trash_root));
+        .spawn(move || prune_trash(&main_repo_dir));
 }
 
 /// 启动时在后台清理这些仓库的回收站。
@@ -752,7 +782,7 @@ pub fn prune_trash_background(paths: Vec<String>) {
                 let Ok(main) = main_repo(&path) else {
                     continue;
                 };
-                prune_trash(&main.join(".worktrees").join(".trash"));
+                prune_trash(&main);
             }
         });
 }
@@ -784,6 +814,17 @@ fn same_path(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::same_path;
+
+    /// 造一个主仓库目录，里面备好新版回收站。返回 (主仓库目录, 新版回收站目录)。
+    ///
+    /// `prune_trash` 收的是**主仓库目录**而不是回收站目录——它要同时扫新旧两个
+    /// 回收站，路径由它自己拼。
+    fn trash_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let trash = dir.path().join(".worktrees").join(super::TRASH_DIR);
+        std::fs::create_dir_all(&trash).unwrap();
+        (dir, trash)
+    }
 
     /// 造一个「已经装进整棵工作树、并且里面有文件正被打开」的槽位。
     ///
@@ -857,8 +898,8 @@ mod tests {
     /// 带进行中 / 清理认领标记且年龄新的必须原样保留。
     #[test]
     fn prune_never_touches_in_progress_slots() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let trash = dir.path();
+        let (dir, trash) = trash_fixture();
+        let trash = trash.as_path();
         // 6 个正式条目，超出 TRASH_KEEP（5）一个
         for i in 0..6u64 {
             let slot = trash.join(format!("w{i}-100"));
@@ -885,7 +926,7 @@ mod tests {
         std::fs::write(pruning.join(super::MARK_PRUNING), "{}").unwrap();
         std::fs::write(pruning.join("half.txt"), "删了一半").unwrap();
 
-        super::prune_trash(trash);
+        super::prune_trash(dir.path());
 
         assert!(
             deleting.join("fragile.txt").exists(),
@@ -905,8 +946,8 @@ mod tests {
     /// 而且当成正式条目清掉等于误删一个**正在进行的删除**。
     #[test]
     fn slots_without_a_marker_are_never_treated_as_committed() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let trash = dir.path();
+        let (dir, trash) = trash_fixture();
+        let trash = trash.as_path();
         for i in 0..6u64 {
             let slot = trash.join(format!("w{i}-100"));
             std::fs::create_dir(&slot).unwrap();
@@ -926,7 +967,7 @@ mod tests {
         std::fs::write(bare.join("worktree").join("data.txt"), "唯一副本").unwrap();
 
         assert_eq!(super::slot_state(&bare), super::SlotState::Unknown);
-        super::prune_trash(trash);
+        super::prune_trash(dir.path());
 
         assert!(
             bare.join("worktree").join("data.txt").exists(),
@@ -943,8 +984,8 @@ mod tests {
     /// 后缀的优先级必须高于标记文件。
     #[test]
     fn legacy_suffixed_residue_is_never_treated_as_committed() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let trash = dir.path();
+        let (dir, trash) = trash_fixture();
+        let trash = trash.as_path();
         // 5 个正式条目，已经顶满 TRASH_KEEP
         for i in 0..5u64 {
             let slot = trash.join(format!("w{i}-200"));
@@ -985,7 +1026,7 @@ mod tests {
             super::SlotState::Deleting,
             "带旧 .partial 后缀的残留必须按进行中处理，哪怕里面躺着 meta.json"
         );
-        super::prune_trash(trash);
+        super::prune_trash(dir.path());
 
         assert!(
             legacy.join("worktree").join("data.txt").exists(),
@@ -999,6 +1040,76 @@ mod tests {
         assert_eq!(
             super::slot_state(&legacy_committed),
             super::SlotState::Committed
+        );
+    }
+
+    /// 新旧两个回收站合并参与同一次选举：`TRASH_KEEP` 是「一共留几个」，不是
+    /// 每个目录各留几个。分开各留 5 个的话旧回收站会永远卡在 5 个不动，
+    /// 而合并之后旧目录里时间戳更早的条目先被清，它会自然排空。
+    #[test]
+    fn both_trash_dirs_share_one_election() {
+        let (dir, trash) = trash_fixture();
+        let legacy = dir.path().join(".worktrees").join(super::TRASH_DIR_LEGACY);
+        std::fs::create_dir_all(&legacy).unwrap();
+
+        // 旧目录 3 个（更旧），新目录 4 个 —— 合计 7 个，超 TRASH_KEEP 两个
+        let mut made = Vec::new();
+        for (root, base_ts, count) in [(&legacy, 100u64, 3usize), (&trash, 200, 4)] {
+            for i in 0..count {
+                let slot = root.join(format!("w{base_ts}-{i}"));
+                std::fs::create_dir(&slot).unwrap();
+                super::write_meta(
+                    &slot,
+                    &super::TrashMeta {
+                        worktree: format!("w{i}"),
+                        admin: format!("a{i}"),
+                        deleted_at: base_ts + i as u64,
+                    },
+                )
+                .unwrap();
+                super::commit_slot(&slot).unwrap();
+                made.push(slot);
+            }
+        }
+
+        super::prune_trash(dir.path());
+
+        let alive = made.iter().filter(|p| p.exists()).count();
+        assert_eq!(alive, super::TRASH_KEEP, "两个目录合起来收敛到 TRASH_KEEP");
+        // 被清掉的必须是旧目录里最旧的两个，而不是各清各的
+        assert!(!made[0].exists(), "旧目录里最旧的该先被清");
+        assert!(!made[1].exists(), "旧目录里第二旧的该跟着被清");
+        assert!(made[2].exists(), "刚好卡在保留线内的该留着");
+        assert!(
+            made[3..].iter().all(|p| p.exists()),
+            "新目录里的都比旧目录新，一个都不该被清"
+        );
+    }
+
+    /// 新槽位绝不能落进旧版会扫描的 `.trash`。
+    ///
+    /// 旧版清理器只按目录名后缀分类：新版的进行中槽位不带 `.partial` 后缀，
+    /// 会被当成正式条目；而它读的 `meta.json` 那时还叫 `meta.json.partial`，
+    /// 读不出就把时间戳当 0，于是**第一个**被认领删掉。回滚失败保留下来的槽位
+    /// 长期停在这个状态、装着未提交内容的唯一副本，旧进程每次启动清理都会命中。
+    /// 隔离到另一个目录之后，旧版根本不会打开它。
+    #[test]
+    fn new_slots_never_land_in_the_legacy_trash_dir() {
+        let (dir, trash) = trash_fixture();
+
+        let slot = super::new_trash_slot(&trash, "feature").unwrap();
+
+        assert!(
+            slot.starts_with(&trash),
+            "新槽位必须落在 {} 里",
+            super::TRASH_DIR
+        );
+        assert!(
+            !dir.path()
+                .join(".worktrees")
+                .join(super::TRASH_DIR_LEGACY)
+                .exists(),
+            "连旧回收站目录都不该被建出来"
         );
     }
 
