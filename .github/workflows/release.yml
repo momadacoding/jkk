@@ -148,6 +148,46 @@ jobs:
       - name: tauri build
         run: pnpm tauri build
 
+      # 绿色版：原始 exe 本身就是完整应用，zip 起来直接发。
+      # 打包发生在 build 之后——有证书时 zip 里的 exe 也是签过名的。
+      - name: Pack portable zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $exe = 'src-tauri/target/release/jkk.exe'
+          if (-not (Test-Path $exe)) { throw "没找到 $exe" }
+
+          $stage = Join-Path $env:RUNNER_TEMP 'portable-stage'
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item $exe $stage
+          Copy-Item LICENSE, THIRD_PARTY_NOTICES.md $stage
+
+          # 使用说明内联生成，不进 repo（避免双维护）；\r\n + BOM 是旧版记事本兼容
+          $readme = @(
+            'jkk 绿色版（免安装）'
+            '===================='
+            ''
+            '解压后直接运行 jkk.exe 即可。'
+            ''
+            '* 本软件未做代码签名，首次运行 Windows 会弹 SmartScreen'
+            '  「未知发布者」警告：点「更多信息」→「仍要运行」。'
+            '* 若双击无反应或报错，说明系统缺少 WebView2 运行时'
+            '  （Win11 和保持更新的 Win10 自带），请从微软官网安装：'
+            '  https://developer.microsoft.com/microsoft-edge/webview2/'
+            '* 第三方组件许可声明见 THIRD_PARTY_NOTICES.md。'
+          ) -join "`r`n"
+          [IO.File]::WriteAllText(
+            (Join-Path $stage 'README-绿色版.txt'),
+            $readme,
+            [Text.UTF8Encoding]::new($true)
+          )
+
+          New-Item -ItemType Directory -Path artifacts -Force | Out-Null
+          $zip = "artifacts/jkk_${version}_x64-portable.zip"
+          Compress-Archive -Path "$stage\*" -DestinationPath $zip -Force
+          Get-Item $zip | Select-Object Name, Length
+
       - name: Collect installers
         shell: pwsh
         run: |
@@ -199,13 +239,15 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          notes='安装包**未做代码签名**，Windows 会弹 SmartScreen「未知发布者」警告。
+          notes='安装包**未做代码签名**时，Windows 会弹 SmartScreen「未知发布者」警告。
           点「更多信息」→「仍要运行」即可。
 
           产物：
           - `*-setup.exe` —— NSIS 安装器
           - `*.msi` —— MSI 安装包
-          - `SHA256SUMS.txt` —— 上面两个文件的校验和
+          - `*-portable.zip` —— 免安装绿色版（解压即用；缺 WebView2 运行时的旧系统
+            需先装 https://developer.microsoft.com/microsoft-edge/webview2/ ）
+          - `SHA256SUMS.txt` —— 上面文件的校验和
 
           第三方组件的许可声明见安装目录下的 THIRD_PARTY_NOTICES.md。'
 
@@ -231,10 +273,11 @@ jobs:
 
           gh release upload "$REF_NAME" artifacts/* --clobber
 
-          # 传完核对一遍：两种安装包都必须在，否则等于发了个残缺的 Release
+          # 传完核对一遍：两种安装包和绿色 zip 都必须在，否则等于发了个残缺的 Release
           assets=$(gh release view "$REF_NAME" --json assets --jq '.assets[].name')
           echo "已上传的资产："
           echo "$assets"
           echo "$assets" | grep -q '\.msi$'         || { echo "::error::缺少 .msi 资产"; exit 1; }
           echo "$assets" | grep -q 'setup\.exe$'    || { echo "::error::缺少 setup.exe 资产"; exit 1; }
+          echo "$assets" | grep -q 'portable\.zip$' || { echo "::error::缺少 portable zip 资产"; exit 1; }
           echo "$assets" | grep -q '^SHA256SUMS.txt$' || { echo "::error::缺少 SHA256SUMS.txt"; exit 1; }

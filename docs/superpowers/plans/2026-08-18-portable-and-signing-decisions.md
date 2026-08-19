@@ -5,7 +5,17 @@
 | Task | 状态 | 产出 | 验证 |
 |---|---|---|---|
 | 1 sign-windows.ps1 + 本地自签验证 | 完成 | scripts/sign-windows.ps1 | 自签证书端到端跑通（指纹匹配；verify 分支如期拦截不受信根） |
-| 2 release.yml 绿色 zip 打包 | 未开始 | | |
+| 2 release.yml 绿色 zip 打包 | 完成 | .github/workflows/release.yml | js-yaml 语法检查过；pwsh 打包块在本地沙盒完整跑通（zip 命名/四件内容/UTF-8 BOM/CRLF 均验证） |
+
+## Task 2 决策
+
+- **偏离计划**：无。计划中的 here-string 版本在写作时已改为数组 join（避免 YAML 缩进
+  污染 txt 内容），实现与计划终稿一致。
+- **计划没写的坑**：pwsh 控制台输出中文显示为 `?` 是控制台 GBK 显示问题，文件字节
+  本身是正确的 UTF-8（BOM EF BB BF 已字节级验证）；`Compress-Archive` 与
+  `Collect installers` 无冲突（后者只从 bundle 目录收 *.exe/*.msi）。
+- **为什么安全**：zip 找不到 exe 时 fail-fast；publish 资产核对把 zip 列为必需，
+  缺了会阻断发布而不是发残缺 Release。
 | 3 release.yml 条件签名接线 | 未开始 | | |
 | 4 README 下载/签名说明 | 未开始 | | |
 | 5 分支 workflow_dispatch 空跑 + 产物检查 + PR | 未开始 | | |
