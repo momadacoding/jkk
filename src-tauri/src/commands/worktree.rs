@@ -10,23 +10,137 @@ pub use crate::engine::worktree::{read_worktrees, Worktree};
 /// 这里存的是完整的工作树，装了 node_modules 的能到几个 GB，不能无限攒。
 const TRASH_KEEP: usize = 5;
 
-/// 进行中槽位的后缀：两次搬移和 meta 落盘全部完成之前，槽位名一直带着它；
-/// 撤销开始时也会把正式槽位改名带上它来认领。
+/// 新槽位落在这个目录，旧版（0.2.1 及更早）的回收站是隔壁的 [`TRASH_DIR_LEGACY`]。
 ///
-/// 清理线程看到带后缀的一律跳过——「清理绝不删掉正在搬移/正在撤销的槽位」
-/// 靠这个结构保证，不靠时序余量。改名是原子操作，认领互斥跨进程也成立。
+/// # 为什么要换目录：旧进程会删掉新版的进行中槽位
 ///
-/// 用后缀而不用前缀：worktree 名字是用户输入，名字本身可能以前缀开头，
-/// 而后缀是我们在时间戳之后追加的，任何用户名字都撞不上。
-const PARTIAL_SUFFIX: &str = ".partial";
+/// 状态标记从目录名迁到标记文件之后，新版的进行中槽位目录名不再以 `.partial`
+/// 结尾。旧版清理器只按**目录名后缀**分类，于是会把它当成正式条目；而它读的
+/// `meta.json` 在新版进行中槽位里还不存在（那时叫 `meta.json.partial`），
+/// `read_meta(..).unwrap_or(0)` 就把时间戳当成 0 —— 排序后它是「最旧」的那个，
+/// 回收站一超限就**第一个**被认领并 `remove_dir_all`。
+///
+/// 撞上搬移中途只是毫秒级窗口，真正要命的是**回滚失败后保留的槽位**：那种槽位
+/// 长期停在进行中状态、装着未提交内容的唯一副本，新版承诺永久保留，而旧进程
+/// 每次启动清理都会命中它。
+///
+/// 换个目录名是最省事的隔离：旧版扫的是 `.trash`，根本不会打开 `.trash-v2`。
+/// 反过来新版认得两边（旧格式条目在 [`slot_state`] 下判定本来就正确），
+/// 两个目录合并参与同一次选举，旧回收站会随着条目被清自然排空。
+const TRASH_DIR: &str = ".trash-v2";
 
-/// 清理线程认领 victim 时改名的后缀。认领后的目录只有认领者自己删；
-/// 别的清理线程和撤销都当它是别人的，跳过。
-const PRUNING_SUFFIX: &str = ".pruning";
+/// 旧版的回收站目录。只读不写：新槽位一律进 [`TRASH_DIR`]，这里的存量条目
+/// 继续参与清理选举，清空之后这个目录就没用了。
+const TRASH_DIR_LEGACY: &str = ".trash";
 
-/// 带后缀残留的自动回收时限。只适用于**能证明没有用户数据**的残留：
-/// 空的或只写了 meta 的 `.partial`、以及已被判定为垃圾的 `.pruning`。
-/// 含 `worktree/` 或 `admin/` 的 `.partial` 是未提交内容的唯一副本
+/// 槽位的状态标记文件。同一时刻一个槽位里**有且只有一个**标记存在，状态转换
+/// 就是在槽位内把这个小文件改名——原子、跨进程互斥。
+///
+/// # 为什么状态不编码在目录名上
+///
+/// 原先的做法是把状态写成目录名后缀（`.partial` / `.pruning`），转换靠重命名
+/// 整个槽位目录。这在 Windows 上是概率性失败：**重命名目录要求整棵子树没有任何
+/// 打开的句柄**（连带 `FILE_SHARE_DELETE` 的规矩开法也挡），而槽位里装的正是刚
+/// 搬进来的整棵工作树。任何扫描器、编辑器、watcher 在那几毫秒里碰一下里面的
+/// 文件，转换就报 `Access is denied. (os error 5)`。POSIX 的 rename 不看子树句柄，
+/// 所以这个缺陷只在 Windows 上暴露，Linux/macOS 上永远测不出来。
+///
+/// 改成标记文件之后，转换只重命名一个几十字节的小文件，与槽位里装了什么无关。
+/// 目录名一经创建永不改变。
+///
+/// 用 `meta.json` 的扩展名变体而不是独立文件名：这几个名字都在槽位内部，
+/// 撞不上用户数据（槽位里只有 `worktree/`、`admin/` 两个子目录）。
+const MARK_COMMITTED: &str = "meta.json";
+/// 删除搬移进行中：槽位已建、两次搬移尚未全部完成。
+const MARK_DELETING: &str = "meta.json.partial";
+/// 清理认领中：已被某个清理线程判了死刑，只有认领者自己删。
+const MARK_PRUNING: &str = "meta.json.pruning";
+
+/// 槽位状态。判据是槽位里存在哪个标记文件。
+#[derive(Debug, PartialEq, Eq)]
+enum SlotState {
+    /// 正式条目：删除已完成，参与清理选举。
+    Committed,
+    /// 删除搬移进行中。
+    Deleting,
+    /// 清理认领中。
+    Pruning,
+    /// 一个标记都没有。既可能是 `create_dir` 刚返回、标记还没落盘的微秒级窗口，
+    /// 也可能是异常残留。一律按残留里最保守的一档处理，绝不当正式条目清掉。
+    Unknown,
+}
+
+/// 0.2.1 及更早版本把状态编码在目录名后缀上时留下的残留。只用来识别，不再产生。
+const LEGACY_PARTIAL_SUFFIX: &str = ".partial";
+const LEGACY_PRUNING_SUFFIX: &str = ".pruning";
+
+/// 一个槽位现在是什么状态。
+///
+/// 探测出错（权限、盘在抖）会让判据滑向 [`SlotState::Unknown`]，那一档比
+/// `Committed` 更保守——错的方向必须是不删。
+///
+/// # 旧版本残留：后缀的优先级高于标记文件
+///
+/// 升级前留下的槽位里只有一个 `meta.json`，状态全靠目录名后缀区分。**带后缀的
+/// 半截槽位里同样有 `meta.json`**，只看标记文件会把它们判成正式条目——那意味着
+/// 一个「删除崩在搬移中途」的槽位会参与清理选举，连同里面未提交内容的唯一副本
+/// 一起被 `remove_dir_all` 掉。所以必须先看后缀。
+///
+/// 旧的**正式**条目（无后缀 + `meta.json`）本来就该判成 `Committed`，天然兼容：
+/// 照常参与清理选举，被认领时 `meta.json` 改名成新的标记，自动完成迁移。
+fn slot_state(slot: &Path) -> SlotState {
+    if let Some(name) = slot.file_name().and_then(|s| s.to_str()) {
+        if name.ends_with(LEGACY_PARTIAL_SUFFIX) {
+            return SlotState::Deleting;
+        }
+        if name.ends_with(LEGACY_PRUNING_SUFFIX) {
+            return SlotState::Pruning;
+        }
+    }
+    for (mark, state) in [
+        (MARK_COMMITTED, SlotState::Committed),
+        (MARK_PRUNING, SlotState::Pruning),
+        (MARK_DELETING, SlotState::Deleting),
+    ] {
+        if slot.join(mark).is_file() {
+            return state;
+        }
+    }
+    SlotState::Unknown
+}
+
+/// 首发失败之后最多再重试这么多次，每次之前等 [`RENAME_BACKOFF`]。
+/// 合计 1 + [`RENAME_RETRIES`] 次尝试、[`RENAME_RETRIES`] 段退避（共 1 秒）。
+///
+/// 兜的是**不可避免要搬移带内容目录**的那几处（工作树和管理目录本身的搬进搬出）：
+/// 标记文件改名已经不受子树句柄影响了，但数据搬移本身绕不开，只能等对方松手。
+/// 实测挡路的句柄是毫秒级瞬时的，1 秒的总窗口足够，又不至于让真正被占用的
+/// 情况卡住界面太久。
+const RENAME_RETRIES: usize = 10;
+const RENAME_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// 带退避重试的 `rename`。只对 `PermissionDenied` 重试——那正是 Windows 上
+/// 「子树里有人开着文件」的表现（`ERROR_ACCESS_DENIED`）。
+///
+/// `NotFound` 之类的错误重试没有意义，而且认领互斥依赖它**立刻**返回：
+/// 慢一秒会把「别人先拿到了」拖成假死。
+fn rename_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    for _ in 0..RENAME_RETRIES {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                std::thread::sleep(RENAME_BACKOFF);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    std::fs::rename(from, to)
+}
+
+/// 进行中残留的自动回收时限。只适用于**能证明没有用户数据**的残留：
+/// 空的或只写了 meta 的进行中槽位（[`SlotState::Deleting`] / [`SlotState::Unknown`]），
+/// 以及已被判定为垃圾的 [`SlotState::Pruning`]。
+/// 含 `worktree/` 或 `admin/` 的进行中槽位是未提交内容的唯一副本
 /// （删除崩在搬移中途、或回滚失败），永久保留等用户处理，绝不自动删。
 ///
 /// 取 24 小时：正常进行中窗口是毫秒级，这个余量同时兜住「两个应用实例
@@ -72,18 +186,23 @@ pub fn create_worktree(path: String, name: String, branch: Option<String>) -> Re
     Ok(())
 }
 
-/// 删除成功后交给前端的凭据，用来撤销。
+/// 一次删除的事实记录：删掉了谁、东西落在回收站的哪个槽位里。
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct DeletedWorktree {
     pub name: String,
-    /// 回收站槽位的绝对路径，`restore_worktree` 的唯一入参。
+    /// 回收站槽位的绝对路径。没有撤销入口之后它不再是「凭据」，而是让用户
+    /// （和集成测试）能定位到东西搬去哪了的唯一线索。
     pub trash_path: String,
 }
 
-/// 回收站槽位里的 `meta.json`。撤销时靠它知道两个目录该搬回哪。
+/// 回收站槽位里的 meta：这个槽位是从哪两个目录搬来的。
 ///
-/// 路径存绝对路径而不是相对：撤销时不需要再推导一遍，少一处能算错的地方。
+/// 没有撤销功能之后它不再被程序消费，但**必须继续写**：手工把 worktree 捞回去
+/// 需要知道原路径，尤其是 `admin`（`.git/worktrees/<name>`）——光看槽位内容
+/// 猜不出来。`deleted_at` 仍然是清理选举的排序依据。
+///
+/// 路径存绝对路径而不是相对：手工恢复的人不需要再推导一遍。
 #[derive(Serialize, Deserialize, Debug)]
 struct TrashMeta {
     /// 原工作树目录
@@ -210,21 +329,24 @@ fn is_dirty(worktree_path: &str) -> Result<bool> {
     Ok(!out.trim().is_empty())
 }
 
-/// 在回收站里开一个不重名的进行中槽位（带 [`PARTIAL_SUFFIX`] 后缀）。
+/// 在回收站里开一个不重名的槽位。目录名一经创建就固定，状态由里面的标记文件表示。
 ///
 /// 名字带秒级时间戳，同一秒删两个同名 worktree 会撞上，所以再加序号兜底。
+/// 用 `create_dir` 的 `AlreadyExists` 来避让而不是先 `exists()` 再建：后者中间有
+/// TOCTOU 窗口，两个并发删除会拿到同一个槽位路径。
 fn new_trash_slot(trash_root: &Path, name: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(trash_root)?;
     let stamp = now_secs();
     for n in 0..1000 {
         let slot = if n == 0 {
-            trash_root.join(format!("{name}-{stamp}{PARTIAL_SUFFIX}"))
+            trash_root.join(format!("{name}-{stamp}"))
         } else {
-            trash_root.join(format!("{name}-{stamp}-{n}{PARTIAL_SUFFIX}"))
+            trash_root.join(format!("{name}-{stamp}-{n}"))
         };
-        if !slot.exists() {
-            std::fs::create_dir(&slot)?;
-            return Ok(slot);
+        match std::fs::create_dir(&slot) {
+            Ok(()) => return Ok(slot),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
         }
     }
     Err(GitError::new(
@@ -233,41 +355,14 @@ fn new_trash_slot(trash_root: &Path, name: &str) -> Result<PathBuf> {
     ))
 }
 
-/// 把搬完了的槽位摘掉 `.partial` 后缀，变成正式的回收站条目。
+/// 落名：把 [`MARK_DELETING`] 改成 [`MARK_COMMITTED`]，槽位从这一刻起是正式条目。
 ///
-/// 同卷 rename 原子，清理线程要么看到带后缀的旧名（跳过），要么看到摘了后缀的
-/// 新名（meta 已在里面），不存在中间态。创建时避过让的是带后缀的名字，去后缀后
-/// 的名字可能被同秒同名的前一次删除占掉，所以这里再兜一轮序号（`-c{n}`，
-/// 和创建时的 `-{n}` 区分开）。
-fn commit_slot(slot: &Path) -> Result<PathBuf> {
-    let Some(file) = slot.file_name().and_then(|s| s.to_str()) else {
-        return Err(GitError::new(
-            "trash_slot",
-            "回收站槽位名不是合法 UTF-8".to_string(),
-        ));
-    };
-    let Some(base) = file.strip_suffix(PARTIAL_SUFFIX) else {
-        return Err(GitError::new(
-            "trash_slot",
-            format!("回收站槽位缺少进行中后缀：{file}"),
-        ));
-    };
-    let parent = slot.parent().unwrap_or(Path::new("."));
-    for n in 0..1000 {
-        let target = if n == 0 {
-            parent.join(base)
-        } else {
-            parent.join(format!("{base}-c{n}"))
-        };
-        if !target.exists() {
-            std::fs::rename(slot, &target)?;
-            return Ok(target);
-        }
-    }
-    Err(GitError::new(
-        "trash_slot",
-        "回收站里同名条目太多，落不了名".to_string(),
-    ))
+/// 只重命名一个小文件，与槽位里已经装了多大的工作树无关——这正是这个设计存在的
+/// 理由，见 [`MARK_COMMITTED`] 的说明。同目录内 rename 原子：清理线程要么看到
+/// 进行中标记（跳过），要么看到正式标记（meta 已完整），不存在中间态。
+fn commit_slot(slot: &Path) -> Result<()> {
+    rename_retry(&slot.join(MARK_DELETING), &slot.join(MARK_COMMITTED))?;
+    Ok(())
 }
 
 /// 目录在不在？探测**出错**（盘没挂上、权限不够、网络盘断连）不是「不在」：
@@ -297,14 +392,14 @@ fn dir_age(path: &Path) -> Option<std::time::Duration> {
 }
 
 /// 进行中残留什么时候可以清：超过宽限期、且**能证明里面没有用户数据**
-/// （既没有 `worktree/` 也没有 `admin/`）。含内容的 `.partial` 是未提交内容的
+/// （既没有 `worktree/` 也没有 `admin/`）。含内容的进行中槽位是未提交内容的
 /// 唯一副本——删除崩在搬移中途、或回滚失败——永久保留等用户处理，绝不自动删。
 fn should_reap_partial(age: Option<std::time::Duration>, has_content: bool) -> bool {
     !has_content && matches!(age, Some(a) if a >= std::time::Duration::from_secs(RESIDUE_TTL_SECS))
 }
 
-/// 已被认领为清理对象的 `.pruning` 残留：内容本来就是按策略判了死刑的旧条目，
-/// 超过宽限期（认领它的线程崩了/被抢占）就接着清。
+/// 已被认领为清理对象（[`SlotState::Pruning`]）的残留：内容本来就是按策略判了
+/// 死刑的旧条目，超过宽限期（认领它的线程崩了/被抢占）就接着清。
 fn should_reap_pruning(age: Option<std::time::Duration>) -> bool {
     matches!(age, Some(a) if a >= std::time::Duration::from_secs(RESIDUE_TTL_SECS))
 }
@@ -316,56 +411,6 @@ fn has_entry(dir: &Path, name: &str) -> bool {
         std::fs::metadata(dir.join(name)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound
     )
-}
-
-/// 认领一个正式回收站槽位：原子改名加上 [`PARTIAL_SUFFIX`]，清理器从这一刻起
-/// 结构性跳过它。与清理器的 victim 认领（改名 [`PRUNING_SUFFIX`]）互斥——
-/// 谁先改名成功谁拿到，另一方的 rename 必然 NotFound，跨进程也成立。
-///
-/// 撤销结束后槽位被删空；撤销失败时尽量改回原名，让前端持有的路径还能重试。
-fn claim_slot(slot: &Path) -> Result<PathBuf> {
-    let Some(name) = slot.file_name().and_then(|s| s.to_str()) else {
-        return Err(GitError::new(
-            "trash_slot",
-            "回收站槽位名不是合法 UTF-8".to_string(),
-        ));
-    };
-    if name.ends_with(PARTIAL_SUFFIX) || name.ends_with(PRUNING_SUFFIX) {
-        return Err(GitError::new(
-            "trash_state",
-            "这个回收站条目正被别的操作占用，稍后再试。".to_string(),
-        ));
-    }
-    // 认领养名可能撞上正在进行的同名删除（同秒同名），换序号再试
-    for n in 0..1000 {
-        let claimed = if n == 0 {
-            slot.with_file_name(format!("{name}{PARTIAL_SUFFIX}"))
-        } else {
-            slot.with_file_name(format!("{name}-r{n}{PARTIAL_SUFFIX}"))
-        };
-        if claimed.exists() {
-            continue;
-        }
-        match std::fs::rename(slot, &claimed) {
-            Ok(()) => return Ok(claimed),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(GitError::new(
-                    "trash_gone",
-                    "这个回收站条目已经不在了（可能刚被自动清理）。".to_string(),
-                ))
-            }
-            Err(e) => {
-                return Err(GitError::new(
-                    "restore_failed",
-                    format!("认领回收站条目失败：{e}"),
-                ))
-            }
-        }
-    }
-    Err(GitError::new(
-        "trash_slot",
-        "回收站里同名条目太多，认领不了".to_string(),
-    ))
 }
 
 /// 删除一个 worktree：搬进仓库内的回收站，而不是抹掉。
@@ -464,7 +509,7 @@ pub fn delete_worktree(
                 return Err(GitError::new(
                     "worktree_dirty",
                     "这个 worktree 里有未提交的改动或未跟踪的文件。\n\n\
-                     确认要删的话可以继续，删掉之后还能从回收站撤销。"
+                     确认要删的话可以继续，目录会被移到仓库内的回收站，不是直接抹掉。"
                         .to_string(),
                 ))
             }
@@ -488,11 +533,11 @@ pub fn delete_worktree(
         .to_string_lossy()
         .to_string();
 
-    let trash_root = main_repo(&path)?.join(".worktrees").join(".trash");
-    let slot = new_trash_slot(&trash_root, &name)?;
+    let main = main_repo(&path)?;
+    let slot = new_trash_slot(&main.join(".worktrees").join(TRASH_DIR), &name)?;
 
-    // meta 在任何搬移之前落盘。进行中槽位靠 .partial 后缀对清理不可见，先写 meta
-    // 是第二层防护：摘后缀落名的那一刻，槽位内容（meta/worktree/admin）必须完整。
+    // meta 在任何搬移之前落盘。进行中槽位靠 MARK_DELETING 标记对清理不可见，先写 meta
+    // 是第二层防护：换成正式标记的那一刻，槽位内容（meta/worktree/admin）必须完整。
     // 写不成时槽位还是空的，直接当作没删过。
     let meta = TrashMeta {
         worktree: worktree_path.clone(),
@@ -507,7 +552,7 @@ pub fn delete_worktree(
     // 先搬工作树。这一步失败什么都没动，直接把原因带回去。目录已丢时无事可搬。
     let slot_worktree = slot.join("worktree");
     if worktree_exists {
-        if let Err(err) = std::fs::rename(&worktree_path, &slot_worktree) {
+        if let Err(err) = rename_retry(Path::new(&worktree_path), &slot_worktree) {
             remove_slot(&slot);
             // 系统只会说 "used by another process"，不说是哪个。挨个探测一遍，
             // 把话说到能动手为止——探测是只读的，此时目录一动未动。
@@ -525,13 +570,13 @@ pub fn delete_worktree(
 
     // 再搬管理目录。失败就把工作树搬回原位——半搬状态下 git 看到的是个坏 worktree。
     let slot_admin = slot.join("admin");
-    if let Err(err) = std::fs::rename(&admin, &slot_admin) {
+    if let Err(err) = rename_retry(&admin, &slot_admin) {
         let rolled_back =
-            !worktree_exists || std::fs::rename(&slot_worktree, &worktree_path).is_ok();
+            !worktree_exists || rename_retry(&slot_worktree, Path::new(&worktree_path)).is_ok();
         if rolled_back {
             remove_slot(&slot);
         }
-        // 工作树搬不回去时槽位连 meta 一起留着，它仍是一个可撤销的回收站条目。
+        // 工作树搬不回去时槽位连 meta 一起留着：meta 里有原路径，是手工捞回去的线索。
         return Err(GitError::new(
             "worktree_admin_move_failed",
             if rolled_back {
@@ -547,79 +592,70 @@ pub fn delete_worktree(
         ));
     }
 
-    // 落名提交：摘掉 .partial 后缀，清理线程从这一刻起才把它当回收站条目。
+    // 落名提交：把进行中标记换成正式标记，清理线程从这一刻起才把它当回收站条目。
     // 失败就把两道工序都搬回去，当作没删过。
-    let committed = match commit_slot(&slot) {
-        Ok(committed) => committed,
-        Err(err) => {
-            let worktree_back =
-                !worktree_exists || std::fs::rename(&slot_worktree, &worktree_path).is_ok();
-            let admin_back = std::fs::rename(&slot_admin, &admin).is_ok();
-            if worktree_back && admin_back {
-                remove_slot(&slot);
-            }
-            return Err(GitError::new(
-                "trash_commit",
-                if worktree_back && admin_back {
-                    format!(
-                        "回收站条目落不了名：{}\n\n已经原样放回，什么都没改。",
-                        err.message
-                    )
-                } else {
-                    format!(
-                        "回收站条目落不了名：{}\n\n\
-                         也没能完整放回原位，剩下的东西在：\n{}\n\n\
-                         这个目录带 .partial 后缀，不会被自动清理，手工搬回即可。",
-                        err.message,
-                        slot.display()
-                    )
-                },
-            ));
+    if let Err(err) = commit_slot(&slot) {
+        let worktree_back =
+            !worktree_exists || rename_retry(&slot_worktree, Path::new(&worktree_path)).is_ok();
+        let admin_back = rename_retry(&slot_admin, &admin).is_ok();
+        if worktree_back && admin_back {
+            remove_slot(&slot);
         }
-    };
+        return Err(GitError::new(
+            "trash_commit",
+            if worktree_back && admin_back {
+                format!(
+                    "回收站条目落不了名：{}\n\n已经原样放回，什么都没改。",
+                    err.message
+                )
+            } else {
+                format!(
+                    "回收站条目落不了名：{}\n\n\
+                     也没能完整放回原位，剩下的东西在：\n{}\n\n\
+                     这个槽位没落名，不会被自动清理，手工搬回即可。",
+                    err.message,
+                    slot.display()
+                )
+            },
+        ));
+    }
 
-    spawn_prune(trash_root);
+    spawn_prune(&main);
 
     Ok(DeletedWorktree {
         name,
-        trash_path: committed.to_string_lossy().to_string(),
+        trash_path: slot.to_string_lossy().to_string(),
     })
 }
 
+/// 落 meta，槽位进入「删除进行中」状态（[`MARK_DELETING`]）。
+///
+/// 写的是进行中标记而不是正式标记：正式标记的出现就是提交点，必须留给
+/// [`commit_slot`]，在两次搬移都完成之后才允许出现。
 fn write_meta(slot: &Path, meta: &TrashMeta) -> Result<()> {
     let json = serde_json::to_string_pretty(meta)
         .map_err(|e| GitError::new("trash_meta", format!("写不出回收站元数据：{e}")))?;
-    std::fs::write(slot.join("meta.json"), json)?;
+    std::fs::write(slot.join(MARK_DELETING), json)?;
     Ok(())
 }
 
 /// 清掉一个只写了 meta、还没搬进去东西的槽位（删除中途失败的收尾）。
+///
+/// 四个标记都试着删一遍：收尾可能发生在任何一个状态上，而 `remove_dir` 要求
+/// 目录是空的。删不掉不追究——残留会被清理器按「无内容且超期」回收。
 fn remove_slot(slot: &Path) {
-    let _ = std::fs::remove_file(slot.join("meta.json"));
+    for mark in [MARK_DELETING, MARK_COMMITTED, MARK_PRUNING] {
+        let _ = std::fs::remove_file(slot.join(mark));
+    }
     let _ = std::fs::remove_dir(slot);
 }
 
-fn read_meta(slot: &Path) -> Result<TrashMeta> {
-    let raw = std::fs::read_to_string(slot.join("meta.json")).map_err(|e| {
-        GitError::new(
-            "trash_meta",
-            format!("这个回收站条目读不出元数据，撤销不了：{e}"),
-        )
-    })?;
+/// 从指定标记文件里读元数据。清理认领之后标记已经改名，调用方必须传对应的那个。
+fn read_meta(slot: &Path, mark: &str) -> Result<TrashMeta> {
+    let raw = std::fs::read_to_string(slot.join(mark))
+        .map_err(|e| GitError::new("trash_meta", format!("这个回收站条目读不出元数据：{e}")))?;
     serde_json::from_str(&raw)
-        .map_err(|e| GitError::new("trash_meta", format!("回收站元数据坏了，撤销不了：{e}")))
-}
-
-fn begin_restore(slot: &Path) -> Result<(PathBuf, TrashMeta)> {
-    let claimed = claim_slot(slot)?;
-    match read_meta(&claimed) {
-        Ok(meta) => Ok((claimed, meta)),
-        Err(error) => Err(restore_bail_with_error(&claimed, slot, error, true)),
-    }
-}
-
-fn rollback_restored_worktree(worktree: &Path, slot_worktree: &Path, has_worktree: bool) -> bool {
-    !has_worktree || std::fs::rename(worktree, slot_worktree).is_ok()
+        .map_err(|e| GitError::new("trash_meta", format!("回收站元数据坏了：{e}")))
 }
 
 fn sort_slots(slots: &mut [(u64, PathBuf)]) {
@@ -634,49 +670,60 @@ fn sort_slots(slots: &mut [(u64, PathBuf)]) {
 ///
 /// 清不掉不算错误——回收站塞不下顶多占地方，不该让删除操作本身失败。
 ///
-/// 回收站里有三种目录，分治：
-/// - 正式条目：参与 victim 选举，超限后最旧的被清。
-/// - 带 [`PARTIAL_SUFFIX`] 的：正在搬移（删除）或正在搬回（撤销）的槽位，
-///   **一律跳过、不计入条数**。只有超过宽限期、且能证明为空（无 worktree/
-///   admin 子项）的残留才清——含内容的是未提交内容的唯一副本，永久保留。
-/// - 带 [`PRUNING_SUFFIX`] 的：已被某个清理线程认领的 victim。跳过；
-///   超过宽限期的说明认领者崩了，内容本就判了死刑，接着清。
+/// 回收站里的槽位按 [`slot_state`] 分治：
+/// - [`SlotState::Committed`]：正式条目，参与 victim 选举，超限后最旧的被清。
+/// - [`SlotState::Deleting`]：正在搬移的槽位，**一律跳过、不计入条数**。只有超过
+///   宽限期、且能证明为空（无 worktree/ admin 子项）的残留才清——含内容的是
+///   未提交内容的唯一副本，永久保留。
+/// - [`SlotState::Pruning`]：已被某个清理线程认领的 victim。跳过；超过宽限期的
+///   说明认领者崩了，内容本就判了死刑，接着清。
+/// - [`SlotState::Unknown`]：既可能是 `create_dir` 刚返回、标记还没落盘的微秒级
+///   窗口，也可能是异常残留。按与进行中同样最保守的一档处理：**绝不当正式条目
+///   清掉**，否则会误删一个正在进行的删除。
 ///
-/// 删除 victim 前先原子改名认领：与撤销的认领互斥，谁先改名成功谁拿到，
-/// 另一方 rename 必 NotFound——「清理删掉别人正在用的槽位」这条竞态
+/// 删除 victim 前先原子改名认领：两个清理线程撞同一个 victim 时谁先改名成功谁
+/// 拿到，另一方 rename 必 NotFound——「两个清理者同时删同一个槽位」这条竞态
 /// 从结构上不存在，跨进程也成立。
 ///
 /// 这里用 `remove_dir_all`，它**解链接而不跟进目标**，这一条至关重要：槽位里存的是
 /// 原样搬进来的工作树，node_modules 里几千个 junction 要是被跟进去删，会连累链接
 /// 指向的地方。有测试钉着这个不变量。
-fn prune_trash(trash_root: &Path) {
-    let Ok(entries) = std::fs::read_dir(trash_root) else {
-        return;
-    };
+/// 新旧两个回收站目录**合并参与同一次选举**：`TRASH_KEEP` 是「回收站里一共留几个」，
+/// 不是每个目录各留几个。合并之后旧目录里时间戳更早的条目会先被选中，
+/// 旧回收站随之排空——分开各留 5 个的话它会永远卡在 5 个不动。
+fn prune_trash(main_repo_dir: &Path) {
+    let worktrees = main_repo_dir.join(".worktrees");
     let mut slots: Vec<(u64, PathBuf)> = Vec::new();
-    for entry in entries.flatten() {
-        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+    for root in [worktrees.join(TRASH_DIR), worktrees.join(TRASH_DIR_LEGACY)] {
+        let Ok(entries) = std::fs::read_dir(&root) else {
             continue;
-        }
-        let path = entry.path();
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.ends_with(PARTIAL_SUFFIX) {
-            let has_content = has_entry(&path, "worktree") || has_entry(&path, "admin");
-            if should_reap_partial(dir_age(&path), has_content) {
-                let _ = std::fs::remove_dir_all(&path);
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
             }
-            continue;
-        }
-        if name.ends_with(PRUNING_SUFFIX) {
-            if should_reap_pruning(dir_age(&path)) {
-                let _ = std::fs::remove_dir_all(&path);
+            let path = entry.path();
+            match slot_state(&path) {
+                SlotState::Deleting | SlotState::Unknown => {
+                    let has_content = has_entry(&path, "worktree") || has_entry(&path, "admin");
+                    if should_reap_partial(dir_age(&path), has_content) {
+                        let _ = std::fs::remove_dir_all(&path);
+                    }
+                }
+                SlotState::Pruning => {
+                    if should_reap_pruning(dir_age(&path)) {
+                        let _ = std::fs::remove_dir_all(&path);
+                    }
+                }
+                SlotState::Committed => {
+                    // 读不出元数据的正式条目当成最旧的，优先清掉
+                    let ts = read_meta(&path, MARK_COMMITTED)
+                        .map(|m| m.deleted_at)
+                        .unwrap_or(0);
+                    slots.push((ts, path));
+                }
             }
-            continue;
         }
-        // 读不出元数据的正式条目当成最旧的，优先清掉
-        let ts = read_meta(&path).map(|m| m.deleted_at).unwrap_or(0);
-        slots.push((ts, path));
     }
     if slots.len() <= TRASH_KEEP {
         return;
@@ -685,7 +732,7 @@ fn prune_trash(trash_root: &Path) {
     // 尝试认领同一组 victim，避免各自成功删除不同条目而跌破保留数量。
     sort_slots(&mut slots);
     for (_, dir) in slots.iter().take(slots.len() - TRASH_KEEP) {
-        // 认领失败 = 别人（撤销或另一个清理线程）先拿到了，放弃这个 victim
+        // 认领失败 = 另一个清理线程先拿到了，放弃这个 victim
         let Some(claimed) = claim_for_pruning(dir) else {
             continue;
         };
@@ -693,15 +740,15 @@ fn prune_trash(trash_root: &Path) {
     }
 }
 
-/// 清理线程认领 victim：原子改名加 [`PRUNING_SUFFIX`]。认领失败（被撤销拿走、
-/// 被别的清理线程认领、已不在）就放弃这个 victim，等下一轮清理。
+/// 清理线程认领 victim：把 [`MARK_COMMITTED`] 原子改名成 [`MARK_PRUNING`]。
+/// 认领失败（被别的清理线程认领、已不在）就放弃这个 victim，等下一轮清理。
+///
+/// 返回的路径就是 `dir` 本身：目录名不随状态变化，保留返回值只为让调用方
+/// 明确拿到「已认领」这个事实。
 fn claim_for_pruning(dir: &Path) -> Option<PathBuf> {
-    let name = dir.file_name()?.to_str()?;
-    let claimed = dir.with_file_name(format!("{name}{PRUNING_SUFFIX}"));
-    if claimed.exists() {
-        return None;
-    }
-    std::fs::rename(dir, &claimed).ok().map(|_| claimed)
+    std::fs::rename(dir.join(MARK_COMMITTED), dir.join(MARK_PRUNING))
+        .ok()
+        .map(|_| dir.to_path_buf())
 }
 
 /// 把清理放到后台线程跑。
@@ -711,14 +758,15 @@ fn claim_for_pruning(dir: &Path) -> Option<PathBuf> {
 /// 毫秒级，后台化之后删除的耗时就和回收站里躺了什么无关。清理快慢只影响磁盘
 /// 空间回收速度，用户感知不到。
 ///
-/// 并发清理由认领机制保证：victim 先原子改名（.pruning）再删，两个线程撞同一个
-/// victim 时慢者 rename 失败直接放弃。应用中途退出留下的残留分两类：空的
-/// `.partial` 和半截 `.pruning` 由 24 小时后的清理回收；含工作树/管理目录的
-/// `.partial` 是用户数据的唯一副本，永久保留。
-fn spawn_prune(trash_root: PathBuf) {
+/// 并发清理由认领机制保证：victim 先把标记原子改名成 [`MARK_PRUNING`] 再删，
+/// 两个线程撞同一个 victim 时慢者 rename 失败直接放弃。应用中途退出留下的残留
+/// 分两类：空的进行中槽位和半截 [`SlotState::Pruning`] 由 24 小时后的清理回收；
+/// 含工作树/管理目录的进行中槽位是用户数据的唯一副本，永久保留。
+fn spawn_prune(main_repo_dir: &Path) {
+    let main_repo_dir = main_repo_dir.to_path_buf();
     let _ = std::thread::Builder::new()
         .name("trash-prune".into())
-        .spawn(move || prune_trash(&trash_root));
+        .spawn(move || prune_trash(&main_repo_dir));
 }
 
 /// 启动时在后台清理这些仓库的回收站。
@@ -734,168 +782,9 @@ pub fn prune_trash_background(paths: Vec<String>) {
                 let Ok(main) = main_repo(&path) else {
                     continue;
                 };
-                prune_trash(&main.join(".worktrees").join(".trash"));
+                prune_trash(&main);
             }
         });
-}
-
-/// 撤销一次删除：把工作树和管理目录原样搬回去。
-///
-/// 只收回收站槽位的路径，原位置一律从槽位里的 `meta.json` 读——前端不该有机会
-/// 指定往哪写。
-///
-/// 搬回去之后 git 的登记自然就完好了（登记本来就是那个管理目录），不需要
-/// `worktree add` 或 `repair`：前者对已存在的目录一律拒绝，后者在管理目录丢失后
-/// 也救不回来，都验证过。
-#[tauri::command(async)]
-pub fn restore_worktree(path: String, trash_path: String) -> Result<()> {
-    let slot = PathBuf::from(&trash_path);
-
-    // 只认本仓库回收站底下的槽位，避免被指使去搬别处的目录
-    let trash_root = main_repo(&path)?.join(".worktrees").join(".trash");
-    if !slot.starts_with(&trash_root) {
-        return Err(GitError::new(
-            "trash_foreign",
-            "这个路径不在本仓库的回收站里，不能撤销。".to_string(),
-        ));
-    }
-
-    // 必须先认领再读取元数据；否则清理器能在两者之间删掉并重建同名槽位，
-    // 让本次恢复拿旧 meta 操作一个新的槽位（ABA）。
-    let (claimed, meta) = begin_restore(&slot)?;
-    let worktree = PathBuf::from(&meta.worktree);
-    let admin = PathBuf::from(&meta.admin);
-
-    match dir_exists(&worktree) {
-        Ok(true) => {
-            return Err(restore_bail_with_error(
-                &claimed,
-                &slot,
-                GitError::new(
-                    "worktree_occupied",
-                    format!(
-                        "原来的位置已经被占了，撤销会覆盖它：\n{}\n\n\
-                         先把那里挪开再撤销。",
-                        worktree.display()
-                    ),
-                ),
-                true,
-            ));
-        }
-        Ok(false) => {}
-        Err(error) => return Err(restore_bail_with_error(&claimed, &slot, error, true)),
-    }
-    match dir_exists(&admin) {
-        Ok(true) => {
-            return Err(restore_bail_with_error(
-                &claimed,
-                &slot,
-                GitError::new(
-                    "worktree_occupied",
-                    format!(
-                        "这个 worktree 的登记已经重新存在了，撤销会覆盖它：\n{}",
-                        admin.display()
-                    ),
-                ),
-                true,
-            ));
-        }
-        Ok(false) => {}
-        Err(error) => return Err(restore_bail_with_error(&claimed, &slot, error, true)),
-    }
-
-    let slot_worktree = claimed.join("worktree");
-    let slot_admin = claimed.join("admin");
-    // 「目录已丢」的删除只搬了管理目录，槽位里没有工作树可还。
-    // 必须用严格探测：I/O 错误折叠成 false 的话，会丢 meta 走人，残留槽位
-    // 就再也对不上前端持有的路径了。
-    let has_worktree = match dir_exists(&slot_worktree) {
-        Ok(v) => v,
-        Err(e) => {
-            return Err(restore_bail(
-                &claimed,
-                &slot,
-                format!("读不出回收站条目的状态：{}", e.message),
-            ))
-        }
-    };
-
-    // 父目录可能已经因为空了被 git 收走，直接 rename 会 NotFound
-    if let Some(parent) = admin.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return Err(restore_bail(
-                &claimed,
-                &slot,
-                format!("建不回登记目录的父目录：{e}"),
-            ));
-        }
-    }
-    if has_worktree {
-        if let Some(parent) = worktree.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                return Err(restore_bail(
-                    &claimed,
-                    &slot,
-                    format!("建不回工作树的父目录：{e}"),
-                ));
-            }
-        }
-        if let Err(e) = std::fs::rename(&slot_worktree, &worktree) {
-            return Err(restore_bail(&claimed, &slot, format!("搬不回工作树：{e}")));
-        }
-    }
-    if let Err(e) = std::fs::rename(&slot_admin, &admin) {
-        // 工作树已经回去了但登记没回去，那是个坏 worktree。搬回槽位保持原状。
-        let rollback_succeeded =
-            rollback_restored_worktree(&worktree, &slot_worktree, has_worktree);
-        let rollback_status = if rollback_succeeded {
-            "工作树已经放回回收站。".to_string()
-        } else {
-            format!("工作树也没能放回回收站，仍在：\n{}", worktree.display())
-        };
-        return Err(restore_bail_with_error(
-            &claimed,
-            &slot,
-            GitError::new(
-                "restore_failed",
-                format!("搬不回登记信息：{e}\n\n{rollback_status}"),
-            ),
-            rollback_succeeded,
-        ));
-    }
-
-    let _ = std::fs::remove_file(claimed.join("meta.json"));
-    let _ = std::fs::remove_dir(&claimed);
-    Ok(())
-}
-
-/// 撤销中途失败的收尾：把认领来的槽位改回正式名，前端持有的 trash_path 才能
-/// 原样重试；改不回去就在消息里给出新路径——带 .partial 后缀不会被清理碰。
-fn restore_bail(claimed: &Path, original: &Path, what: String) -> GitError {
-    restore_bail_with_error(
-        claimed,
-        original,
-        GitError::new("restore_failed", what),
-        true,
-    )
-}
-
-fn restore_bail_with_error(
-    claimed: &Path,
-    original: &Path,
-    error: GitError,
-    safe_to_unclaim: bool,
-) -> GitError {
-    let hint = if safe_to_unclaim && std::fs::rename(claimed, original).is_ok() {
-        "可以再试一次。".to_string()
-    } else {
-        format!(
-            "回收站条目现在在：\n{}\n\n\
-             带 .partial 后缀，不会被自动清理，改回原名或手工处理。",
-            claimed.display()
-        )
-    };
-    GitError::new(&error.code, format!("{}\n\n{hint}", error.message))
 }
 
 /// 比较两个路径是否指向同一个地方。
@@ -926,12 +815,91 @@ fn same_path(a: &str, b: &str) -> bool {
 mod tests {
     use super::same_path;
 
+    /// 造一个主仓库目录，里面备好新版回收站。返回 (主仓库目录, 新版回收站目录)。
+    ///
+    /// `prune_trash` 收的是**主仓库目录**而不是回收站目录——它要同时扫新旧两个
+    /// 回收站，路径由它自己拼。
+    fn trash_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let trash = dir.path().join(".worktrees").join(super::TRASH_DIR);
+        std::fs::create_dir_all(&trash).unwrap();
+        (dir, trash)
+    }
+
+    /// 造一个「已经装进整棵工作树、并且里面有文件正被打开」的槽位。
+    ///
+    /// 这是删除流程走到落名那一刻的**真实形态**：两次搬移刚做完，槽位里是完整的
+    /// 工作树，而扫描器 / 编辑器 / watcher 随时可能正打开着其中某个文件。
+    /// 返回的句柄必须由调用方持有到断言之后，提前 drop 就测不到东西了。
+    fn slot_with_open_handle(
+        trash: &std::path::Path,
+        name: &str,
+    ) -> (std::path::PathBuf, std::fs::File) {
+        let slot = super::new_trash_slot(trash, name).unwrap();
+        super::write_meta(
+            &slot,
+            &super::TrashMeta {
+                worktree: format!("/wt/{name}"),
+                admin: format!("/admin/{name}"),
+                deleted_at: 100,
+            },
+        )
+        .unwrap();
+        let inner = slot.join("worktree").join("node_modules").join("pkg");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::create_dir_all(slot.join("admin")).unwrap();
+        let file = inner.join("index.js");
+        std::fs::write(&file, "被别人打开着").unwrap();
+        let handle = std::fs::File::open(&file).unwrap();
+        (slot, handle)
+    }
+
+    /// 落名绝不能因为槽位子树里有打开的句柄而失败。
+    ///
+    /// Windows 上重命名目录要求**整棵子树没有任何打开的句柄**（连带
+    /// `FILE_SHARE_DELETE` 的规矩开法也挡）。把状态编码在目录名后缀上、靠重命名
+    /// 槽位目录来提交的做法，因此会在「刚把整棵工作树搬进来」的那一刻被随便哪个
+    /// 扫描器撞掉，报 `Access is denied. (os error 5)`。
+    ///
+    /// 这个用例只在 Windows 上有鉴别力：POSIX 的 rename 不看子树句柄，Unix 上恒过。
+    #[test]
+    fn commit_survives_open_handles_inside_the_slot() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (slot, _handle) = slot_with_open_handle(dir.path(), "feature");
+
+        super::commit_slot(&slot).expect("落名不能因为子树里有打开的句柄而失败");
+
+        assert_eq!(
+            super::slot_state(&slot),
+            super::SlotState::Committed,
+            "落名之后必须是正式条目"
+        );
+        assert!(
+            super::read_meta(&slot, super::MARK_COMMITTED).is_ok(),
+            "落名之后必须能按正式条目读出元数据"
+        );
+    }
+
+    /// 清理认领同样不能被子树里的句柄挡住：认领失败会被 `let _ =` 吞掉，
+    /// 表现为回收站悄悄超限、磁盘不回收。
+    #[test]
+    fn prune_claim_survives_open_handles_inside_the_slot() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (slot, _handle) = slot_with_open_handle(dir.path(), "feature");
+        super::commit_slot(&slot).unwrap();
+
+        assert!(
+            super::claim_for_pruning(&slot).is_some(),
+            "清理认领不能因为子树里有打开的句柄而失败"
+        );
+    }
+
     /// 进行中槽位对清理不可见：回收站超限时清理只动正式条目，
-    /// 带 .partial / .pruning 后缀且年龄新的必须原样保留。
+    /// 带进行中 / 清理认领标记且年龄新的必须原样保留。
     #[test]
     fn prune_never_touches_in_progress_slots() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let trash = dir.path();
+        let (dir, trash) = trash_fixture();
+        let trash = trash.as_path();
         // 6 个正式条目，超出 TRASH_KEEP（5）一个
         for i in 0..6u64 {
             let slot = trash.join(format!("w{i}-100"));
@@ -945,24 +913,229 @@ mod tests {
                 },
             )
             .unwrap();
+            super::commit_slot(&slot).unwrap();
         }
-        let partial = trash.join(format!("wip-100{}", super::PARTIAL_SUFFIX));
-        std::fs::create_dir(&partial).unwrap();
-        std::fs::write(partial.join("fragile.txt"), "搬了一半").unwrap();
-        let pruning = trash.join(format!("old-99{}", super::PRUNING_SUFFIX));
+        // 删除搬到一半：只有进行中标记
+        let deleting = trash.join("wip-100");
+        std::fs::create_dir(&deleting).unwrap();
+        std::fs::write(deleting.join(super::MARK_DELETING), "{}").unwrap();
+        std::fs::write(deleting.join("fragile.txt"), "搬了一半").unwrap();
+        // 别的清理线程认领中
+        let pruning = trash.join("old-99");
         std::fs::create_dir(&pruning).unwrap();
+        std::fs::write(pruning.join(super::MARK_PRUNING), "{}").unwrap();
         std::fs::write(pruning.join("half.txt"), "删了一半").unwrap();
 
-        super::prune_trash(trash);
+        super::prune_trash(dir.path());
 
-        assert!(partial.join("fragile.txt").exists(), "进行中槽位绝不能被清");
+        assert!(
+            deleting.join("fragile.txt").exists(),
+            "进行中槽位绝不能被清"
+        );
         assert!(pruning.join("half.txt").exists(), "别人认领中的槽位不能碰");
         assert!(!trash.join("w0-100").exists(), "清掉的该是最旧的正式条目");
         assert_eq!(
             std::fs::read_dir(trash).unwrap().count(),
             5 + 2,
-            "正式条目收敛到 5 个，带后缀的原样保留且不计入条数"
+            "正式条目收敛到 5 个，进行中/认领中的原样保留且不计入条数"
         );
+    }
+
+    /// 一个标记都没有的槽位既可能是 `create_dir` 刚返回、标记还没落盘的窗口，
+    /// 也可能是异常残留。含内容时永远不清——那是用户数据的唯一副本，
+    /// 而且当成正式条目清掉等于误删一个**正在进行的删除**。
+    #[test]
+    fn slots_without_a_marker_are_never_treated_as_committed() {
+        let (dir, trash) = trash_fixture();
+        let trash = trash.as_path();
+        for i in 0..6u64 {
+            let slot = trash.join(format!("w{i}-100"));
+            std::fs::create_dir(&slot).unwrap();
+            super::write_meta(
+                &slot,
+                &super::TrashMeta {
+                    worktree: format!("w{i}"),
+                    admin: format!("a{i}"),
+                    deleted_at: 100 + i,
+                },
+            )
+            .unwrap();
+            super::commit_slot(&slot).unwrap();
+        }
+        let bare = trash.join("bare-1");
+        std::fs::create_dir_all(bare.join("worktree")).unwrap();
+        std::fs::write(bare.join("worktree").join("data.txt"), "唯一副本").unwrap();
+
+        assert_eq!(super::slot_state(&bare), super::SlotState::Unknown);
+        super::prune_trash(dir.path());
+
+        assert!(
+            bare.join("worktree").join("data.txt").exists(),
+            "无标记且含内容的槽位绝不能被清"
+        );
+        assert!(
+            !trash.join("w0-100").exists(),
+            "该被清的仍是最旧的正式条目，无标记槽位不参与选举"
+        );
+    }
+
+    /// 升级前留下的半截槽位（状态编码在目录名后缀上）里同样有 `meta.json`，
+    /// 光看标记文件会把它判成正式条目、参与清理选举，把未提交内容的唯一副本删掉。
+    /// 后缀的优先级必须高于标记文件。
+    #[test]
+    fn legacy_suffixed_residue_is_never_treated_as_committed() {
+        let (dir, trash) = trash_fixture();
+        let trash = trash.as_path();
+        // 5 个正式条目，已经顶满 TRASH_KEEP
+        for i in 0..5u64 {
+            let slot = trash.join(format!("w{i}-200"));
+            std::fs::create_dir(&slot).unwrap();
+            super::write_meta(
+                &slot,
+                &super::TrashMeta {
+                    worktree: format!("w{i}"),
+                    admin: format!("a{i}"),
+                    deleted_at: 200 + i,
+                },
+            )
+            .unwrap();
+            super::commit_slot(&slot).unwrap();
+        }
+        // 旧版本崩在搬移中途留下的残留：时间戳最旧，会第一个被选中
+        let legacy = trash.join(format!("half-1{}", super::LEGACY_PARTIAL_SUFFIX));
+        std::fs::create_dir_all(legacy.join("worktree")).unwrap();
+        std::fs::write(legacy.join("worktree").join("data.txt"), "唯一副本").unwrap();
+        super::write_meta(
+            &legacy,
+            &super::TrashMeta {
+                worktree: "half".into(),
+                admin: "half-admin".into(),
+                deleted_at: 1,
+            },
+        )
+        .unwrap();
+        // 旧格式的 meta 就叫 meta.json，和新的正式标记同名——这正是误判的来源
+        std::fs::rename(
+            legacy.join(super::MARK_DELETING),
+            legacy.join(super::MARK_COMMITTED),
+        )
+        .unwrap();
+
+        assert_eq!(
+            super::slot_state(&legacy),
+            super::SlotState::Deleting,
+            "带旧 .partial 后缀的残留必须按进行中处理，哪怕里面躺着 meta.json"
+        );
+        super::prune_trash(dir.path());
+
+        assert!(
+            legacy.join("worktree").join("data.txt").exists(),
+            "旧格式的半截槽位含用户数据，绝不能被清"
+        );
+
+        // 旧的正式条目（无后缀 + meta.json）则天然兼容
+        let legacy_committed = trash.join("old-150");
+        std::fs::create_dir(&legacy_committed).unwrap();
+        std::fs::write(legacy_committed.join(super::MARK_COMMITTED), "{}").unwrap();
+        assert_eq!(
+            super::slot_state(&legacy_committed),
+            super::SlotState::Committed
+        );
+    }
+
+    /// 新旧两个回收站合并参与同一次选举：`TRASH_KEEP` 是「一共留几个」，不是
+    /// 每个目录各留几个。分开各留 5 个的话旧回收站会永远卡在 5 个不动，
+    /// 而合并之后旧目录里时间戳更早的条目先被清，它会自然排空。
+    #[test]
+    fn both_trash_dirs_share_one_election() {
+        let (dir, trash) = trash_fixture();
+        let legacy = dir.path().join(".worktrees").join(super::TRASH_DIR_LEGACY);
+        std::fs::create_dir_all(&legacy).unwrap();
+
+        // 旧目录 3 个（更旧），新目录 4 个 —— 合计 7 个，超 TRASH_KEEP 两个
+        let mut made = Vec::new();
+        for (root, base_ts, count) in [(&legacy, 100u64, 3usize), (&trash, 200, 4)] {
+            for i in 0..count {
+                let slot = root.join(format!("w{base_ts}-{i}"));
+                std::fs::create_dir(&slot).unwrap();
+                super::write_meta(
+                    &slot,
+                    &super::TrashMeta {
+                        worktree: format!("w{i}"),
+                        admin: format!("a{i}"),
+                        deleted_at: base_ts + i as u64,
+                    },
+                )
+                .unwrap();
+                super::commit_slot(&slot).unwrap();
+                made.push(slot);
+            }
+        }
+
+        super::prune_trash(dir.path());
+
+        let alive = made.iter().filter(|p| p.exists()).count();
+        assert_eq!(alive, super::TRASH_KEEP, "两个目录合起来收敛到 TRASH_KEEP");
+        // 被清掉的必须是旧目录里最旧的两个，而不是各清各的
+        assert!(!made[0].exists(), "旧目录里最旧的该先被清");
+        assert!(!made[1].exists(), "旧目录里第二旧的该跟着被清");
+        assert!(made[2].exists(), "刚好卡在保留线内的该留着");
+        assert!(
+            made[3..].iter().all(|p| p.exists()),
+            "新目录里的都比旧目录新，一个都不该被清"
+        );
+    }
+
+    /// 新槽位绝不能落进旧版会扫描的 `.trash`。
+    ///
+    /// 旧版清理器只按目录名后缀分类：新版的进行中槽位不带 `.partial` 后缀，
+    /// 会被当成正式条目；而它读的 `meta.json` 那时还叫 `meta.json.partial`，
+    /// 读不出就把时间戳当 0，于是**第一个**被认领删掉。回滚失败保留下来的槽位
+    /// 长期停在这个状态、装着未提交内容的唯一副本，旧进程每次启动清理都会命中。
+    /// 隔离到另一个目录之后，旧版根本不会打开它。
+    #[test]
+    fn new_slots_never_land_in_the_legacy_trash_dir() {
+        let (dir, trash) = trash_fixture();
+
+        let slot = super::new_trash_slot(&trash, "feature").unwrap();
+
+        assert!(
+            slot.starts_with(&trash),
+            "新槽位必须落在 {} 里",
+            super::TRASH_DIR
+        );
+        assert!(
+            !dir.path()
+                .join(".worktrees")
+                .join(super::TRASH_DIR_LEGACY)
+                .exists(),
+            "连旧回收站目录都不该被建出来"
+        );
+    }
+
+    /// 数据搬移本身绕不开重命名带内容的目录，只能等对方松手：Windows 上句柄没
+    /// 放开时 rename 报 `PermissionDenied`，重试窗口内应当熬过去。
+    /// 只在 Windows 上有鉴别力，Unix 上首次就成功。
+    #[test]
+    fn rename_retry_waits_out_a_transient_lock() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        let file = src.join("sub").join("held.txt");
+        std::fs::write(&file, "x").unwrap();
+
+        let handle = std::fs::File::open(&file).unwrap();
+        let holder = std::thread::spawn(move || {
+            // 明显短于 RENAME_RETRIES * RENAME_BACKOFF（1 秒）的占用窗口
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(handle);
+        });
+
+        let dst = dir.path().join("dst");
+        super::rename_retry(&src, &dst).expect("瞬时占用应当被重试熬过去");
+
+        holder.join().unwrap();
+        assert!(dst.join("sub").join("held.txt").exists());
     }
 
     /// 并发 prune 各自拿到的 read_dir 顺序可能不同；时间戳相同时还必须按路径打破
@@ -999,91 +1172,26 @@ mod tests {
         assert!(!super::should_reap_pruning(None));
     }
 
-    /// 认领是原子的：同一槽位只能被认领一次；原名被拿走后后来者得到
-    /// trash_gone，已认领/已被清理认领的目录不能被二次认领。
+    /// 清理认领是原子的：同一个 victim 只会被一个清理线程拿到。
     #[test]
-    fn a_slot_can_be_claimed_only_once() {
+    fn a_victim_can_be_claimed_only_once() {
         let dir = tempfile::TempDir::new().unwrap();
-        let slot = dir.path().join("x-100");
-        std::fs::create_dir(&slot).unwrap();
-
-        let claimed = super::claim_slot(&slot).unwrap();
-        assert!(claimed.ends_with(format!("x-100{}", super::PARTIAL_SUFFIX)));
-
-        let err = super::claim_slot(&slot).expect_err("原名已被拿走，后来者必须失败");
-        assert_eq!(err.code, "trash_gone");
-
-        let err = super::claim_slot(&claimed).expect_err("已认领的槽位不能被二次认领");
-        assert_eq!(err.code, "trash_state");
-
-        // 清理线程的认领同样互斥
         let victim = dir.path().join("y-100");
         std::fs::create_dir(&victim).unwrap();
-        let claimed = super::claim_for_pruning(&victim).unwrap();
-        assert!(claimed.ends_with(format!("y-100{}", super::PRUNING_SUFFIX)));
-        assert!(super::claim_for_pruning(&victim).is_none());
-        let err = super::claim_slot(&claimed).expect_err("清理认领中的槽位不能被撤销认领");
-        assert_eq!(err.code, "trash_state");
-    }
+        std::fs::write(victim.join(super::MARK_COMMITTED), "{}").unwrap();
 
-    /// restore 必须先原子认领槽位，再从被认领的目录读取 meta。返回值把目录身份
-    /// 和对应元数据绑在一起，调用方不能拿旧路径读出的 meta 去操作后来重建的槽位。
-    #[test]
-    fn restore_claim_binds_metadata_to_the_claimed_directory() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let slot = dir.path().join("x-100");
-        std::fs::create_dir(&slot).unwrap();
-        super::write_meta(
-            &slot,
-            &super::TrashMeta {
-                worktree: "old-worktree".into(),
-                admin: "old-admin".into(),
-                deleted_at: 100,
-            },
-        )
-        .unwrap();
+        let claimed = super::claim_for_pruning(&victim).expect("第一个认领者必须拿到");
+        assert_eq!(claimed, victim, "目录名不随认领变化");
+        assert_eq!(super::slot_state(&victim), super::SlotState::Pruning);
 
-        let (claimed, meta) = super::begin_restore(&slot).unwrap();
-
-        assert!(!slot.exists(), "返回 meta 时原路径必须已经被认领走");
-        assert!(claimed.exists());
-        assert_eq!(meta.worktree, "old-worktree");
-        assert_eq!(
-            super::read_meta(&claimed).unwrap().worktree,
-            meta.worktree,
-            "返回的 meta 必须来自被认领的目录"
+        assert!(
+            super::claim_for_pruning(&victim).is_none(),
+            "已被认领的 victim 不能被二次认领"
         );
-    }
-
-    /// worktree 已搬出槽位、admin 搬回失败且 worktree 回滚也失败时，claimed 目录
-    /// 是唯一能描述残缺状态的位置，绝不能改回会被 prune 选中的正式槽位名。
-    #[test]
-    fn failed_worktree_rollback_keeps_incomplete_slot_claimed() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let original = dir.path().join("x-100");
-        let claimed = dir.path().join(format!("x-100{}", super::PARTIAL_SUFFIX));
-        let slot_worktree = claimed.join("worktree");
-        let restored_worktree = dir.path().join("restored-worktree");
-        std::fs::create_dir_all(&slot_worktree).unwrap();
-        std::fs::write(slot_worktree.join("collision"), "占住回滚目标").unwrap();
-        std::fs::create_dir(&restored_worktree).unwrap();
-        std::fs::write(restored_worktree.join("uncommitted"), "用户数据").unwrap();
-
-        let rollback_succeeded =
-            super::rollback_restored_worktree(&restored_worktree, &slot_worktree, true);
-        assert!(!rollback_succeeded, "被占用的回滚目标必须使 rename 失败");
-        assert!(restored_worktree.join("uncommitted").exists());
-
-        let error = super::restore_bail_with_error(
-            &claimed,
-            &original,
-            super::GitError::new("restore_failed", "工作树回滚失败"),
-            rollback_succeeded,
+        assert!(
+            super::claim_for_pruning(&dir.path().join("z-100")).is_none(),
+            "不存在的条目认领不到"
         );
-
-        assert!(claimed.exists(), "残缺槽位必须保持为清理器不可见的 partial");
-        assert!(!original.exists(), "回滚失败时不能重新提交为正式槽位");
-        assert!(error.message.contains(&claimed.display().to_string()));
     }
 
     /// 「目录已丢」只认明确的 NotFound：在的报在，不在的报不在。

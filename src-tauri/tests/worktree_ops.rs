@@ -100,8 +100,8 @@ fn delete_moves_a_clean_worktree_out_of_the_way() {
     // 东西进了回收站，不是被抹掉
     let slot = std::path::Path::new(&deleted.trash_path);
     assert!(
-        !deleted.trash_path.ends_with(".partial"),
-        "返回给前端的必须是落名后的正式槽位"
+        slot.join("meta.json").exists(),
+        "返回给前端的必须是已落名的正式槽位（正式标记就是 meta.json）"
     );
     assert!(
         slot.join("worktree").join("a.txt").exists(),
@@ -150,7 +150,7 @@ fn a_dirty_worktree_is_refused_and_left_untouched() {
         "登记不该被解除"
     );
     // 也不该留下空的回收站槽位
-    let trash = main.join(".worktrees").join(".trash");
+    let trash = main.join(".worktrees").join(".trash-v2");
     assert!(
         !trash.exists() || fs::read_dir(&trash).unwrap().count() == 0,
         "被拒绝的删除不该在回收站里留垃圾"
@@ -330,114 +330,38 @@ fn the_main_worktree_can_never_be_deleted() {
         git_out(&main, &["worktree", "list"]).contains("feature"),
         "别的 worktree 也不该受影响"
     );
-    let trash = main.join(".worktrees").join(".trash");
+    let trash = main.join(".worktrees").join(".trash-v2");
     assert!(
         !trash.exists() || fs::read_dir(&trash).unwrap().count() == 0,
         "不该在回收站里留下任何东西"
     );
 }
 
-/// 撤销要把状态**原样**还回去，包括暂存区。
+/// 工作树和管理目录必须**成对**搬进回收站。
 ///
 /// index 存在管理目录 `.git/worktrees/<name>/index` 里，不在工作树目录内。只搬
-/// 工作树的话 `A s.txt`（已暂存）会退化成 `?? s.txt`，实测过。这个测试钉住的是
-/// 「工作树和管理目录必须成对搬移」。
+/// 工作树的话暂存状态会丢，实测过。撤销功能删掉之后这条不变量反而更要紧：
+/// 回收站里那份副本必须是完整的，用户手工捞回去才捞得全。
 #[test]
-fn undo_restores_the_exact_state_including_the_index() {
+fn the_worktree_and_its_admin_dir_move_together() {
     let (_dir, wt) = repo_with_worktree("feature");
     let main = main_of(&wt);
-    fs::write(wt.join("a.txt"), "MODIFIED").unwrap();
-    fs::write(wt.join("new.txt"), "untracked").unwrap();
     fs::write(wt.join("s.txt"), "staged").unwrap();
     run_git(&main, &["-C", wt.to_str().unwrap(), "add", "s.txt"]);
     let before = git_out(&wt, &["status", "--porcelain"]);
     assert!(before.contains("A  s.txt"), "前提没造对：{before}");
 
     let deleted = delete(&main, &wt, true);
-    cmd::restore_worktree(
-        main.to_str().unwrap().to_string(),
-        deleted.trash_path.clone(),
-    )
-    .unwrap();
 
-    assert!(wt.exists(), "工作树该回来了");
-    assert_eq!(
-        git_out(&wt, &["status", "--porcelain"]),
-        before,
-        "撤销之后的状态该和删除前逐字一致"
-    );
-    assert_eq!(fs::read_to_string(wt.join("a.txt")).unwrap(), "MODIFIED");
+    let slot = std::path::Path::new(&deleted.trash_path);
     assert!(
-        git_out(&main, &["worktree", "list"]).contains("feature"),
-        "登记该回来了"
-    );
-    // 槽位清空，不留垃圾
-    assert!(!std::path::Path::new(&deleted.trash_path).exists());
-}
-
-/// 撤销回来的 worktree 要能正常干活，不只是文件躺在那。
-#[test]
-fn a_restored_worktree_still_works() {
-    let (_dir, wt) = repo_with_worktree("feature");
-    let main = main_of(&wt);
-    fs::write(wt.join("work.txt"), "活").unwrap();
-
-    let deleted = delete(&main, &wt, true);
-    cmd::restore_worktree(main.to_str().unwrap().to_string(), deleted.trash_path).unwrap();
-
-    run_git(&main, &["-C", wt.to_str().unwrap(), "add", "work.txt"]);
-    run_git(
-        &main,
-        &["-C", wt.to_str().unwrap(), "commit", "-m", "restored"],
+        slot.join("worktree").join("s.txt").exists(),
+        "工作树该整个进回收站"
     );
     assert!(
-        git_out(&main, &["log", "--oneline", "-1", "feature"]).contains("restored"),
-        "主仓库该看得到这个提交"
+        slot.join("admin").join("index").exists(),
+        "暂存区存在管理目录的 index 里，必须跟着一起进回收站"
     );
-}
-
-/// 原位置被占了就不许撤销——覆盖过去等于把别人的东西删了。
-#[test]
-fn undo_refuses_to_overwrite_whatever_took_the_place() {
-    let (_dir, wt) = repo_with_worktree("feature");
-    let main = main_of(&wt);
-
-    let deleted = delete(&main, &wt, false);
-    fs::create_dir_all(&wt).unwrap();
-    fs::write(wt.join("someone-elses.txt"), "别覆盖我").unwrap();
-
-    let err = cmd::restore_worktree(
-        main.to_str().unwrap().to_string(),
-        deleted.trash_path.clone(),
-    )
-    .expect_err("原位置被占，该拒绝");
-
-    assert_eq!(err.code, "worktree_occupied");
-    assert_eq!(
-        fs::read_to_string(wt.join("someone-elses.txt")).unwrap(),
-        "别覆盖我"
-    );
-    // 回收站里的东西还在，可以换个办法救
-    assert!(std::path::Path::new(&deleted.trash_path)
-        .join("worktree")
-        .exists());
-}
-
-/// 撤销只认本仓库回收站底下的路径，不能被指使去搬别处的目录。
-#[test]
-fn undo_only_accepts_paths_inside_this_repos_trash() {
-    let (dir, wt) = repo_with_worktree("feature");
-    let main = main_of(&wt);
-    let outside = dir.path().join("outside");
-    fs::create_dir_all(&outside).unwrap();
-
-    let err = cmd::restore_worktree(
-        main.to_str().unwrap().to_string(),
-        outside.to_str().unwrap().to_string(),
-    )
-    .expect_err("仓库外的路径该被拒绝");
-
-    assert_eq!(err.code, "trash_foreign");
 }
 
 /// 往 worktree 里塞 n 个小文件，模拟装了依赖的 node_modules。
@@ -477,7 +401,7 @@ fn the_trash_keeps_only_the_most_recent_entries() {
         delete(&main, &path, false);
     }
 
-    let trash = main.join(".worktrees").join(".trash");
+    let trash = main.join(".worktrees").join(".trash-v2");
     let kept = wait_trash_converged(&trash);
     assert!(kept <= 5, "回收站该只留最近 5 个，实际留了 {kept} 个");
     assert!(kept > 0, "不该清空");
@@ -523,7 +447,7 @@ fn deleting_returns_fast_even_when_the_trash_needs_pruning() {
     );
 
     // 后台清理最终要把 victim 清掉，磁盘不会漏
-    let trash = main.join(".worktrees").join(".trash");
+    let trash = main.join(".worktrees").join(".trash-v2");
     let kept = wait_trash_converged(&trash);
     assert!(kept <= 5, "后台清理该把回收站收敛到 5 个，实际 {kept} 个");
 }
@@ -613,8 +537,7 @@ fn deleting_never_touches_what_a_junction_points_at() {
 ///
 /// 真实形态：用户或别的工具手动删过目录，只剩登记。这种状态下 git 照样拒绝
 /// `branch -D`（实测），界面删分支勾上「连 worktree 一起删」时就得能收拾它。
-/// 此时盘上没有要保护的用户数据，但登记本身仍进回收站——撤销能还原回
-/// 「原样 prunable」的状态。
+/// 此时盘上没有要保护的用户数据，但登记本身仍进回收站，不直接抹掉。
 #[test]
 fn a_worktree_whose_directory_is_gone_can_still_be_deleted() {
     let (_dir, wt) = repo_with_worktree("gone");
@@ -634,25 +557,8 @@ fn a_worktree_whose_directory_is_gone_can_still_be_deleted() {
     assert!(!slot.join("worktree").exists(), "丢了的工作树变不出来");
 }
 
-/// 撤销「目录已丢」的删除：把登记还原回 prunable 状态，不凭空造目录。
-#[test]
-fn undo_of_a_gone_worktree_restores_the_registration() {
-    let (_dir, wt) = repo_with_worktree("gone");
-    let main = main_of(&wt);
-    fs::remove_dir_all(&wt).unwrap();
-
-    let deleted = delete(&main, &wt, false);
-    cmd::restore_worktree(main.to_str().unwrap().to_string(), deleted.trash_path).unwrap();
-
-    assert!(
-        git_out(&main, &["worktree", "list"]).contains("gone"),
-        "登记该回来"
-    );
-    assert!(!wt.exists(), "目录本来就是丢的，撤销不该造目录");
-}
-
 /// 同一目录可以有两种拼写：8.3 短名（`RUNNER~1`）和长名。CI runner 的 %TEMP%
-/// 就带短名，上面两个「目录已丢」的用例曾在那里红过——登记反查是精确匹配，
+/// 就带短名，上面那个「目录已丢」的用例曾在那里红过——登记反查是精确匹配，
 /// 别名拼写必须**拒绝**（over-refusal 是安全方向，绝不猜着去搬别人的登记）；
 /// 归一回盘上真实拼写（= git 登记的拼写）后，同一个 worktree 必须删得掉。
 #[cfg(windows)]

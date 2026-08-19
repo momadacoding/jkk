@@ -295,35 +295,6 @@ body {
   justify-content: space-between;
 }
 
-/* 删完 worktree 的撤销条。用中性色而不是报错的红：这是一次成功的操作，
-   只是还能反悔。它不自动消失——几秒钟就撤不了的「撤销」等于没有 */
-.banner-undo {
-  padding: 8px;
-  background: #2d3a45;
-  color: #d6dde3;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 12px;
-}
-
-.banner-undo-actions {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  flex-shrink: 0;
-}
-
-.banner-undo button.link {
-  background: none;
-  border: none;
-  color: #7ab8f5;
-  text-decoration: underline;
-  cursor: pointer;
-  padding: 2px 6px;
-  font-size: inherit;
-}
-
 .context-menu {
   position: fixed;
   z-index: 1000;

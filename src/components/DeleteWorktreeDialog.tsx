@@ -102,10 +102,11 @@ export function DeleteWorktreeDialog({ worktree, onCancel, onConfirm }: DeleteWo
 
         <div className="dlg-path" title={worktree.path}>{worktree.path}</div>
 
-        {/* 说清楚代价的边界：目录能撤销，分支根本不动。不写的话用户会以为
-            删 worktree 会把分支上的提交一起带走 */}
+        {/* 说清楚代价的边界：分支根本不动。不写的话用户会以为删 worktree 会把
+            分支上的提交一起带走。回收站路径要写出来：没有撤销入口之后，它是
+            用户自己把东西捞回来的唯一线索 */}
         <div className="dlg-note">
-          目录会被移到仓库内的回收站，删完可以撤销。分支和它上面的提交不受影响。
+          目录会被移到仓库内的回收站（.worktrees/.trash），不是直接抹掉。分支和它上面的提交不受影响。
         </div>
 
         {error && <div className="dlg-warning">{error}</div>}

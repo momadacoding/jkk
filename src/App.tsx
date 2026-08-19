@@ -113,33 +113,17 @@ function App() {
   }, [])
 
   /**
-   * 某个仓库目录已经被删掉了，把开着它的标签关掉。返回是否真关掉了标签。
+   * 某个仓库目录已经被删掉了，把开着它的标签关掉。
    *
    * 只接明确的删除动作（删 worktree、删分支时连带删 worktree），**不要**接
    * 「路径探测不到」：网络盘和移动硬盘临时离线时那会把用户的会话悄悄清空。
-   *
-   * 返回值交给调用方连同它的撤销凭据一起存。「当时开着标签吗」这件事只在配着
-   * 撤销入口时才有意义，放在 App 里攒一份会一直留到会话结束：删分支那条路
-   * 没有撤销入口，它记下的路径永远没人来消，之后任何一次同路径的撤销都会
-   * 凭空开出一个用户根本没开过的标签。
    */
-  const handleRepoRemoved = useCallback((path: string): boolean => {
+  const handleRepoRemoved = useCallback((path: string) => {
     const next = closeTabsByPath(tabsRef.current, activeIdRef.current, path)
-    if (next.tabs === tabsRef.current) return false
+    if (next.tabs === tabsRef.current) return
     setTabs(next.tabs)
     setActiveId(next.activeId)
-    return true
   }, [])
-
-  /**
-   * 删除被撤销了，把当时因此关掉的那个标签开回来。
-   *
-   * **不激活它**。撤销按钮在执行删除的那个标签里，点的时候用户就在那儿；把视图
-   * 抢到恢复出来的标签上等于替他跳走，而那个标签在删除前本来也不是活动标签。
-   */
-  const handleRepoRestored = useCallback((path: string) => {
-    openInNewTab(path, { activate: false })
-  }, [openInNewTab])
 
   const handleOpenRepo = useCallback(async () => {
     const selected = await open({ directory: true, multiple: false })
@@ -178,7 +162,6 @@ function App() {
             openPaths={openPaths}
             onOpenInNewTab={openInNewTab}
             onRepoRemoved={handleRepoRemoved}
-            onRepoRestored={handleRepoRestored}
           />
         </div>
       ))}
