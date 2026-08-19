@@ -34,7 +34,25 @@
   保留在 unsigned 分支）；证书文件存活窗口压在一个步骤内；job 末尾
   `always()` 清理用户证书库。
 | 4 README 下载/签名说明 | 完成 | README.md | 三处按计划原文：发布节加绿色版段、「已知未签名」小节改写为「流水线就位、证书未采购」、目录结构 scripts 行 |
-| 5 分支 workflow_dispatch 空跑 + 产物检查 + PR | 未开始 | | |
+| 5 分支 workflow_dispatch 空跑 + 产物检查 + PR | 完成 | 分支已推送 | dispatch run 32229587339：build 绿、publish 按设计 skipped；has_cert=false 走 unsigned；签名/清理步骤 skipped；产物含 zip（四件齐全、txt 编码正确）；绿色 exe 真实启动 8 秒存活 |
+
+## Task 5 决策
+
+- **dispatch 验证（run 32229587339）**：`gh workflow run release.yml --ref
+  feat/portable-zip-signing` 空跑——build success、publish skipped（分支 ref 下
+  `startsWith(github.ref, 'refs/tags/v')` 为假，与设计一致）。步骤行为：
+  Detect signing certificate → has_cert=false；Import/sign build/Remove 全部
+  skipped；走了 `tauri build (unsigned)`；Pack portable zip success。
+- **产物核对**：下载 `jkk-windows` artifact，zip 内含 jkk.exe（12MB release
+  构建）、LICENSE、THIRD_PARTY_NOTICES.md、README-绿色版.txt 四件；
+  txt 为 UTF-8 BOM + CRLF，中文内容字节级正确。dispatch 不发 Release，
+  故无 SHA256SUMS（publish 才生成），属预期。
+- **绿色 exe 真实启动**：下载的 zip 解压后运行 jkk.exe，8 秒后进程存活
+  （窗口起来）。Stop-Process 后文件句柄短暂残留导致首次清理被拒，等待后
+  清干净——测试善后现象，非产物问题。
+- **Limitation（重申）**：真证书路径（signed 分支、tauri 真实调用 signCommand、
+  verify /pa 正向通过）未验证，等 secrets 就位后的首次 tag 构建见分晓；
+  已在 Task 1/3 记录机制层面的本地验证覆盖。
 
 ## Task 1 决策
 
