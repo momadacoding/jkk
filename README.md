@@ -28,7 +28,7 @@
 │   ├── specs/    # 设计规格文档
 │   ├── plans/    # 实现计划
 │   └── e2e/      # E2E 验证清单
-├── scripts/          # 一次性/维护脚本（图标生成等）
+├── scripts/          # 一次性/维护脚本（图标生成、CI 签名等）
 ├── src/              # React 前端
 │   ├── components/   # UI 组件
 │   ├── engine/       # 提交图布局/路径/SVG 渲染
@@ -112,10 +112,24 @@ workflow 会在构建前自行校验三件事，任何一项不过都在几秒�
 > 这个 workflow **不是 PR 门禁**——`push` 和 `pull_request` 都不会触发它。
 > 日常改动的验证仍然全靠本地手工执行，见 `AGENTS.md` §5。
 
-### 已知：安装包未签名
+### 绿色版（免安装）
 
-没有代码签名证书，所以 Windows 会对安装器弹 SmartScreen「未知发布者」警告，
-需要点「更多信息」→「仍要运行」。这是已知取舍，不是构建出了问题。
+每个 Release 另附 `jkk_<版本>_x64-portable.zip`：解压即用，不走安装流程。
+两点注意：
+
+- 未签名时首次运行同样会弹 SmartScreen（见下节）；
+- 绿色版不会像安装包那样自动补装 WebView2 运行时——Win11 和保持更新的
+  Win10 都自带；干净的旧系统双击无反应的话，装一下
+  [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)。
+
+### 代码签名：流水线已就位，证书未采购
+
+流水线支持「有证书就签」：secrets 配好 `SIGNING_CERT_PFX_BASE64` 和
+`SIGNING_CERT_PASSWORD` 后，构建会自动用 signtool 给 exe 和安装包签名
+（脚本：`scripts/sign-windows.ps1`）；没配就发未签名包。
+
+签名之前，Windows 会对安装器和绿色版弹 SmartScreen「未知发布者」警告，
+点「更多信息」→「仍要运行」即可。
 
 ### 应用图标
 

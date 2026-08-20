@@ -99,6 +99,18 @@ jobs:
           }
           Write-Output "校验通过：$ref @ $env:SHA（相对 master：$cmp）"
 
+      # secrets 不能用在 if 里，先把「在不在」映射成 output。
+      # 只判存在性，值本身绝不写日志。
+      - name: Detect signing certificate
+        id: cert
+        shell: pwsh
+        env:
+          PFX_B64: ${{ secrets.SIGNING_CERT_PFX_BASE64 }}
+          PFX_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+        run: |
+          $has = -not [string]::IsNullOrEmpty($env:PFX_B64) -and -not [string]::IsNullOrEmpty($env:PFX_PASSWORD)
+          "has_cert=$($has.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 10
@@ -145,8 +157,118 @@ jobs:
 
       # beforeBuildCommand 会再跑一次 pnpm build，这是 tauri.conf.json 里配好的，
       # 重复一次几秒钟，不值得为省它去动配置
-      - name: tauri build
+      #
+      # pfx 解码后即导入用户证书库并立刻删文件——证书文件在盘上的存活窗口
+      # 压到这一步内部。密码全程只经 PowerShell 变量（SecureString），不进任何
+      # 命令行（signtool /p、certutil 都会把密码暴露给进程列表）。
+      - name: Import signing certificate
+        if: steps.cert.outputs.has_cert == 'true'
+        shell: pwsh
+        env:
+          PFX_B64: ${{ secrets.SIGNING_CERT_PFX_BASE64 }}
+          PFX_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
+          # try/finally 不能省：密码填错时 Import 会抛在 Remove-Item 之前，
+          # 明文私钥会留在 RUNNER_TEMP 里陪跑到 job 结束，后面没有步骤兜底
+          try {
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX_B64))
+            $secure = ConvertTo-SecureString $env:PFX_PASSWORD -AsPlainText -Force
+            $imported = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $secure
+          } finally {
+            Remove-Item $pfx -Force -ErrorAction SilentlyContinue
+          }
+          # 带链的 pfx（CA 签发的代码签名证书默认带链）会导入多张证书，$imported
+          # 是数组——直接插值会成员枚举成 "AAAA BBBB"，signtool /sha1 认不了。
+          # 能用来签名的只有带私钥的那张。
+          $leaf = $imported | Where-Object HasPrivateKey | Select-Object -First 1
+          if (-not $leaf) { throw '导入结果里没有带私钥的证书，无法签名' }
+          "CERT_THUMB=$($leaf.Thumbprint)" >> $env:GITHUB_ENV
+
+      - name: tauri build (signed)
+        if: steps.cert.outputs.has_cert == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # signCommand 完全静态：脚本路径是 checkout 下的绝对路径，指纹由脚本
+          # 自己从 CERT_THUMB 环境变量读。配置里零秘密。
+          $cfg = @{
+            bundle = @{ windows = @{ signCommand = @{
+              cmd  = 'pwsh'
+              args = @('-NoProfile', '-File', "$PWD/scripts/sign-windows.ps1", '-Target', '%1')
+            } } }
+          } | ConvertTo-Json -Depth 6 -Compress
+          $cfgPath = Join-Path $env:RUNNER_TEMP 'tauri-sign.conf.json'
+          [IO.File]::WriteAllText($cfgPath, $cfg)
+          pnpm tauri build -c $cfgPath
+          if ($LASTEXITCODE -ne 0) { throw 'tauri build (signed) 失败' }
+
+      # 无证书路径必须与接线前逐字节一致
+      - name: tauri build (unsigned)
+        if: steps.cert.outputs.has_cert == 'false'
         run: pnpm tauri build
+
+      # runner 是一次性 VM，但证书不该陪跑到 job 结束
+      - name: Remove signing certificate
+        if: ${{ always() && steps.cert.outputs.has_cert == 'true' }}
+        shell: pwsh
+        run: |
+          # 守卫条件是 has_cert 而不是「导入成功」：导入抛异常时 CERT_THUMB 没写出，
+          # 路径会塌缩成 Cert:\CurrentUser\My\ ——瞄准整个存储容器而不是一张证书
+          if ([string]::IsNullOrEmpty($env:CERT_THUMB)) { return }
+          Remove-Item "Cert:\CurrentUser\My\$env:CERT_THUMB" -Force -ErrorAction SilentlyContinue
+
+      # 绿色版：原始 exe 本身就是完整应用，zip 起来直接发。
+      # 打包发生在 build 之后——有证书时 zip 里的 exe 也是签过名的。
+      - name: Pack portable zip
+        shell: pwsh
+        env:
+          HAS_CERT: ${{ steps.cert.outputs.has_cert }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $exe = 'src-tauri/target/release/jkk.exe'
+          if (-not (Test-Path $exe)) { throw "没找到 $exe" }
+
+          $stage = Join-Path $env:RUNNER_TEMP 'portable-stage'
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item $exe $stage
+          Copy-Item LICENSE, THIRD_PARTY_NOTICES.md $stage
+
+          # 使用说明内联生成，不进 repo（避免双维护）；\r\n + BOM 是旧版记事本兼容
+          $lines = @(
+            'jkk 绿色版（免安装）'
+            '===================='
+            ''
+            '解压后直接运行 jkk.exe 即可。'
+            ''
+          )
+          # 本步骤两条路径都跑，有证书时 zip 里的 exe 是签过名的——说明文字
+          # 必须跟着变，否则签名版会带着「未签名」的假话发出去
+          if ($env:HAS_CERT -eq 'true') {
+            $lines += '* 本软件已做代码签名，正常不会弹「未知发布者」警告。'
+          } else {
+            $lines += '* 本软件未做代码签名，首次运行 Windows 会弹 SmartScreen'
+            $lines += '  「未知发布者」警告：点「更多信息」→「仍要运行」。'
+          }
+          $lines += @(
+            '* 若双击无反应或报错，说明系统缺少 WebView2 运行时'
+            '  （Win11 和保持更新的 Win10 自带），请从微软官网安装：'
+            '  https://developer.microsoft.com/microsoft-edge/webview2/'
+            '* 第三方组件许可声明见 THIRD_PARTY_NOTICES.md。'
+          )
+          $readme = $lines -join "`r`n"
+          [IO.File]::WriteAllText(
+            (Join-Path $stage 'README-绿色版.txt'),
+            $readme,
+            [Text.UTF8Encoding]::new($true)
+          )
+
+          New-Item -ItemType Directory -Path artifacts -Force | Out-Null
+          $zip = "artifacts/jkk_${version}_x64-portable.zip"
+          Compress-Archive -Path "$stage\*" -DestinationPath $zip -Force
+          Get-Item $zip | Select-Object Name, Length
 
       - name: Collect installers
         shell: pwsh
@@ -199,13 +321,15 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          notes='安装包**未做代码签名**，Windows 会弹 SmartScreen「未知发布者」警告。
+          notes='安装包**未做代码签名**时，Windows 会弹 SmartScreen「未知发布者」警告。
           点「更多信息」→「仍要运行」即可。
 
           产物：
           - `*-setup.exe` —— NSIS 安装器
           - `*.msi` —— MSI 安装包
-          - `SHA256SUMS.txt` —— 上面两个文件的校验和
+          - `*-portable.zip` —— 免安装绿色版（解压即用；缺 WebView2 运行时的旧系统
+            需先装 https://developer.microsoft.com/microsoft-edge/webview2/ ）
+          - `SHA256SUMS.txt` —— 上面文件的校验和
 
           第三方组件的许可声明见安装目录下的 THIRD_PARTY_NOTICES.md。'
 
@@ -231,10 +355,11 @@ jobs:
 
           gh release upload "$REF_NAME" artifacts/* --clobber
 
-          # 传完核对一遍：两种安装包都必须在，否则等于发了个残缺的 Release
+          # 传完核对一遍：两种安装包和绿色 zip 都必须在，否则等于发了个残缺的 Release
           assets=$(gh release view "$REF_NAME" --json assets --jq '.assets[].name')
           echo "已上传的资产："
           echo "$assets"
           echo "$assets" | grep -q '\.msi$'         || { echo "::error::缺少 .msi 资产"; exit 1; }
           echo "$assets" | grep -q 'setup\.exe$'    || { echo "::error::缺少 setup.exe 资产"; exit 1; }
+          echo "$assets" | grep -q 'portable\.zip$' || { echo "::error::缺少 portable zip 资产"; exit 1; }
           echo "$assets" | grep -q '^SHA256SUMS.txt$' || { echo "::error::缺少 SHA256SUMS.txt"; exit 1; }
