@@ -106,6 +106,12 @@ workflow 会在构建前自行校验三件事，任何一项不过都在几秒�
 
 产物含 `SHA256SUMS.txt`，可用来核对下载到的是不是这次构建的东西。
 
+真打 tag 之前可以先在 Actions 页面手动触发一次（`workflow_dispatch`）：
+只构建、不发 Release，用来确认 CI 环境编得出来。
+
+> 这个 workflow **不是 PR 门禁**——`push` 和 `pull_request` 都不会触发它。
+> 日常改动的验证仍然全靠本地手工执行，见 `AGENTS.md` §5。
+
 ### 绿色版（免安装）
 
 每个 Release 另附 `jkk_<版本>_x64-portable.zip`：解压即用，不走安装流程。
@@ -115,12 +121,6 @@ workflow 会在构建前自行校验三件事，任何一项不过都在几秒�
 - 绿色版不会像安装包那样自动补装 WebView2 运行时——Win11 和保持更新的
   Win10 都自带；干净的旧系统双击无反应的话，装一下
   [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)。
-
-真打 tag 之前可以先在 Actions 页面手动触发一次（`workflow_dispatch`）：
-只构建、不发 Release，用来确认 CI 环境编得出来。
-
-> 这个 workflow **不是 PR 门禁**——`push` 和 `pull_request` 都不会触发它。
-> 日常改动的验证仍然全靠本地手工执行，见 `AGENTS.md` §5。
 
 ### 代码签名：流水线已就位，证书未采购
 

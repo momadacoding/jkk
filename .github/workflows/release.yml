@@ -170,11 +170,21 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
-          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX_B64))
-          $secure = ConvertTo-SecureString $env:PFX_PASSWORD -AsPlainText -Force
-          $imported = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $secure
-          Remove-Item $pfx -Force
-          "CERT_THUMB=$($imported.Thumbprint)" >> $env:GITHUB_ENV
+          # try/finally 不能省：密码填错时 Import 会抛在 Remove-Item 之前，
+          # 明文私钥会留在 RUNNER_TEMP 里陪跑到 job 结束，后面没有步骤兜底
+          try {
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX_B64))
+            $secure = ConvertTo-SecureString $env:PFX_PASSWORD -AsPlainText -Force
+            $imported = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $secure
+          } finally {
+            Remove-Item $pfx -Force -ErrorAction SilentlyContinue
+          }
+          # 带链的 pfx（CA 签发的代码签名证书默认带链）会导入多张证书，$imported
+          # 是数组——直接插值会成员枚举成 "AAAA BBBB"，signtool /sha1 认不了。
+          # 能用来签名的只有带私钥的那张。
+          $leaf = $imported | Where-Object HasPrivateKey | Select-Object -First 1
+          if (-not $leaf) { throw '导入结果里没有带私钥的证书，无法签名' }
+          "CERT_THUMB=$($leaf.Thumbprint)" >> $env:GITHUB_ENV
 
       - name: tauri build (signed)
         if: steps.cert.outputs.has_cert == 'true'
@@ -204,12 +214,17 @@ jobs:
         if: ${{ always() && steps.cert.outputs.has_cert == 'true' }}
         shell: pwsh
         run: |
+          # 守卫条件是 has_cert 而不是「导入成功」：导入抛异常时 CERT_THUMB 没写出，
+          # 路径会塌缩成 Cert:\CurrentUser\My\ ——瞄准整个存储容器而不是一张证书
+          if ([string]::IsNullOrEmpty($env:CERT_THUMB)) { return }
           Remove-Item "Cert:\CurrentUser\My\$env:CERT_THUMB" -Force -ErrorAction SilentlyContinue
 
       # 绿色版：原始 exe 本身就是完整应用，zip 起来直接发。
       # 打包发生在 build 之后——有证书时 zip 里的 exe 也是签过名的。
       - name: Pack portable zip
         shell: pwsh
+        env:
+          HAS_CERT: ${{ steps.cert.outputs.has_cert }}
         run: |
           $ErrorActionPreference = 'Stop'
           $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
@@ -222,19 +237,28 @@ jobs:
           Copy-Item LICENSE, THIRD_PARTY_NOTICES.md $stage
 
           # 使用说明内联生成，不进 repo（避免双维护）；\r\n + BOM 是旧版记事本兼容
-          $readme = @(
+          $lines = @(
             'jkk 绿色版（免安装）'
             '===================='
             ''
             '解压后直接运行 jkk.exe 即可。'
             ''
-            '* 本软件未做代码签名，首次运行 Windows 会弹 SmartScreen'
-            '  「未知发布者」警告：点「更多信息」→「仍要运行」。'
+          )
+          # 本步骤两条路径都跑，有证书时 zip 里的 exe 是签过名的——说明文字
+          # 必须跟着变，否则签名版会带着「未签名」的假话发出去
+          if ($env:HAS_CERT -eq 'true') {
+            $lines += '* 本软件已做代码签名，正常不会弹「未知发布者」警告。'
+          } else {
+            $lines += '* 本软件未做代码签名，首次运行 Windows 会弹 SmartScreen'
+            $lines += '  「未知发布者」警告：点「更多信息」→「仍要运行」。'
+          }
+          $lines += @(
             '* 若双击无反应或报错，说明系统缺少 WebView2 运行时'
             '  （Win11 和保持更新的 Win10 自带），请从微软官网安装：'
             '  https://developer.microsoft.com/microsoft-edge/webview2/'
             '* 第三方组件许可声明见 THIRD_PARTY_NOTICES.md。'
-          ) -join "`r`n"
+          )
+          $readme = $lines -join "`r`n"
           [IO.File]::WriteAllText(
             (Join-Path $stage 'README-绿色版.txt'),
             $readme,

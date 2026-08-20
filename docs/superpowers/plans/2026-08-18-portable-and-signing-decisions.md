@@ -35,6 +35,7 @@
   `always()` 清理用户证书库。
 | 4 README 下载/签名说明 | 完成 | README.md | 三处按计划原文：发布节加绿色版段、「已知未签名」小节改写为「流水线就位、证书未采购」、目录结构 scripts 行 |
 | 5 分支 workflow_dispatch 空跑 + 产物检查 + PR | 完成 | 分支已推送 | dispatch run 32229587339：build 绿、publish 按设计 skipped；has_cert=false 走 unsigned；签名/清理步骤 skipped；产物含 zip（四件齐全、txt 编码正确）；绿色 exe 真实启动 8 秒存活 |
+| 6 review 修复（7 项） | 完成 | release.yml / sign-windows.ps1 / README.md | 6 项代码缺陷各补了 pwsh 断言测试（含旧写法 bug 复现）：19+13 项全绿；signtool 定位在本机真实 SDK 布局上复跑 |
 
 ## Task 5 决策
 
@@ -70,3 +71,82 @@
   `-SkipVerify` 仅供本地自签验证，CI 不传。
 - **Limitation**：真 OV 证书路径（含 GITHUB_ENV 传递、tauri signCommand 真实
   调用链）只能等 secrets 就位后验证；本地验证的是脚本机制本身。
+
+## Task 6 决策（独立 review 修复）
+
+`/code-review` 在 Task 1~5 收尾后跑出 7 项，全部核实成立并修复。这一节记的是
+**为什么前面的验证没拦住它们**——比修复本身更值得留档。
+
+### 计划没写的坑（也是前序验证的盲区）
+
+- **自签证书没有链，掩盖了 `CERT_THUMB` 的数组 bug**：Task 3「本地模拟 CI 形态」
+  用的是自签证书，`Import-PfxCertificate` 只返回**一张**证书，
+  `"$($imported.Thumbprint)"` 插值正常。而 CA 签发的代码签名 pfx 默认带链，
+  返回**数组**，同样的插值会成员枚举成 `AAAA BBBB`，`signtool /sha1` 直接报
+  "No certificates were found"。也就是说**第一次真正配上证书的 tag 构建必死**，
+  而本地怎么测都测不出来。修法：`$imported | Where-Object HasPrivateKey |
+  Select-Object -First 1`，并在取不到叶子时 fail-fast。
+  **教训：用自签证书验证签名流水线时，「单证书 vs 带链」是结构性差异，不是细节。**
+- **`signtool` 定位按字符串排序**：`Windows Kitsin` 下混着 `x64`/`x86`/`arm64`
+  这些非版本目录，且字符串序会把 `10.0.9.0` 排到 `10.0.26100.0` 前面。本机
+  7 个 SDK 版本恰好都是 `10.0.<5位>.0`，新旧写法选中同一个 signtool——
+  **潜伏缺陷，本机复跑无法暴露**，只能靠构造 `10.0.9.0` 的假目录证伪。
+- **时间戳服务器是单点**：`/tr` 只有一个 TSA、无重试。TSA 限流/瞬时超时会让
+  `signtool sign` 失败 → bundler 失败 → 整个 tag 构建失败；而 `publish` 只在
+  `v*` tag 上跑，恢复要重跑那个 tag。改为 3 轮 × 2 个 TSA，轮间退避 5s/10s。
+  连续失败仍然抛出——不静默放行未签名产物。
+- **PowerShell 原生命令的退出码语义**：`$PSNativeCommandUseErrorActionPreference`
+  是 PS 7.3+ 引入的，部分版本默认 `$true`，此时 `& $signtool` 非零退出会**直接抛
+  异常**，重试循环形同虚设（本机 7.6.1 实测为 `False`，但 CI runner 的 pwsh 版本
+  不由我们控制）。脚本里显式设为 `$false`，退出码一律自己判。
+
+### 偏离计划
+
+- 计划里没有「review 修复」这一步，本节是 Task 5 之后按 §4.1 独立 review 门槛
+  追加的。修的是既有实现的缺陷，没有引入新功能、没有改变签名流水线的设计。
+
+### 为什么这么改是安全的
+
+- **无证书路径逐字节未动**：`tauri build (unsigned)` 步骤、`Detect signing
+  certificate` 的判定逻辑都没碰。Task 5 的 dispatch 空跑结论（has_cert=false
+  路径）继续成立，不需要重跑。
+- **明文私钥的存活窗口真正收敛了**：原实现「写 pfx → 导入 → 删文件」没有
+  try/finally，密码填错（首次配 secrets 时很可能）会让 `Import-PfxCertificate`
+  抛在 `Remove-Item` 之前，明文 pfx 留在 `RUNNER_TEMP` 里陪跑到 job 结束，
+  后面没有任何步骤兜底——这与该步骤注释里「存活窗口压到这一步内部」的声明
+  直接矛盾。改为 try/finally 后，导入失败也删。已用「模拟 Import 抛异常」
+  的测试双向验证（新写法删干净 / 旧写法确实留下文件）。
+- **清理步骤不再瞄准整个证书存储**：`Remove signing certificate` 的守卫是
+  `always() && has_cert == 'true'`，不是「导入成功」。导入抛异常时 `CERT_THUMB`
+  从未写入 `GITHUB_ENV`，路径塌缩成 `Cert:\CurrentUser\My\`——指向整个 `My`
+  容器而不是一张证书，且 `-ErrorAction SilentlyContinue` 会把后果吞掉。
+  加空值 `return` 守卫。runner 是一次性 VM，实际影响有限，但这种「删错目标还
+  静默」的形状不该留在仓库里。
+- **绿色版说明不再撒谎**：`Pack portable zip` 没有 `if:`，两条路径都跑，有证书时
+  zip 里的 exe 是签过名的（bundler 有二进制签名 pass），但生成的
+  `README-绿色版.txt` 恒定写「本软件未做代码签名」并教用户点「仍要运行」。
+  secrets 一落地，每个分发出去的绿色版都带着这句假话。改为由
+  `steps.cert.outputs.has_cert` 经 `HAS_CERT` 环境变量推导。
+
+### 验证
+
+真证书路径依旧无法在本地端到端验证（见 Task 3 Limitation），所以这轮把每项修复
+都拆成**可断言的最小片段**，从 workflow / 脚本里正则抽出真实文本执行，而不是
+复制一份代码去测：
+
+| 测试 | 覆盖 |
+|---|---|
+| T1 指纹选取 | 带链数组取到叶子；**旧写法确实产生空格拼接**（bug 复现）；单证书 pfx 不回归 |
+| T2 清理守卫 | `CERT_THUMB` 为空时不执行 `Remove-Item`；有值时照常删 |
+| T3 绿色版 README | `HAS_CERT=true/false` 两条路径的措辞；WebView2 段与许可声明在两条路径下都保留 |
+| T4 signtool 定位 | 构造含 `10.0.9.0` / `x64` / `x86` / `arm64` 的假 kits 目录，新写法选中 `10.0.26100.0`；**旧写法确实选错**（bug 复现） |
+| T5 pfx 清理 | 模拟 `Import-PfxCertificate` 抛异常：新写法删干净且异常不被吞；**旧写法确实留下明文**（bug 复现） |
+| T6 时间戳重试 | 桩 signtool：失败 2 次后第 3 次成功且不抛；持续失败时抛出且尝试上限为 6 次（3 轮 × 2 TSA） |
+
+结果 19 + 13 项全 PASS。另外：三个改动过的 pwsh 块 + `sign-windows.ps1` 过
+`[Parser]::ParseFile` 语法检查；signtool 定位在本机真实 SDK 布局（7 个版本目录）
+上复跑，选中 `10.0.26100.0\x64\signtool.exe` 并能正常调起。
+
+**仍未验证**：真 CA 证书下的完整链路（带链 pfx 的实际导入结果、tauri 真实调用
+signCommand、`verify /pa` 正向通过、真实 TSA 的重试行为）。等 secrets 就位后的
+首次 tag 构建见分晓。
