@@ -110,3 +110,31 @@ export function closeTabsByPath(
     { tabs, activeId },
   )
 }
+
+/**
+ * 标签右键菜单的「Close All」：全部关掉，落到空态页。
+ */
+export function closeAllTabs(
+  tabs: RepoTabInfo[],
+  activeId: string | null,
+): { tabs: RepoTabInfo[]; activeId: string | null } {
+  if (tabs.length === 0) return { tabs, activeId }
+  return { tabs: [], activeId: null }
+}
+
+/**
+ * 标签右键菜单的「Close All but This」：只留被右键的那个。
+ *
+ * 留下的标签接管为活动标签——哪怕之前它不是活动的：此刻只剩它一个，
+ * 活动标签还指着别处的话界面就是一块空白。无标签可关时返回原引用，
+ * 调用方可以靠引用比较跳过 setState（与 `closeTabAt` 的约定一致）。
+ */
+export function closeOtherTabs(
+  tabs: RepoTabInfo[],
+  activeId: string | null,
+  id: string,
+): { tabs: RepoTabInfo[]; activeId: string | null } {
+  const kept = tabs.find((t) => t.id === id)
+  if (!kept || tabs.length === 1) return { tabs, activeId }
+  return { tabs: [kept], activeId: kept.id }
+}

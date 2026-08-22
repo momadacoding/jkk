@@ -6,6 +6,8 @@ import { RepoTab } from './components/RepoTab'
 import { TabBar } from './components/TabBar'
 import { samePath } from './engine/path'
 import {
+  closeAllTabs,
+  closeOtherTabs,
   closeTabAt,
   closeTabsByPath,
   restoreTabs,
@@ -112,6 +114,21 @@ function App() {
     setActiveId(next.activeId)
   }, [])
 
+  // 标签右键菜单的两条批量关闭。引用没变就是无事发生，直接跳过 setState
+  const closeAll = useCallback(() => {
+    const next = closeAllTabs(tabsRef.current, activeIdRef.current)
+    if (next.tabs === tabsRef.current) return
+    setTabs(next.tabs)
+    setActiveId(next.activeId)
+  }, [])
+
+  const closeOthers = useCallback((id: string) => {
+    const next = closeOtherTabs(tabsRef.current, activeIdRef.current, id)
+    if (next.tabs === tabsRef.current) return
+    setTabs(next.tabs)
+    setActiveId(next.activeId)
+  }, [])
+
   /**
    * 某个仓库目录已经被删掉了，把开着它的标签关掉。
    *
@@ -139,6 +156,8 @@ function App() {
         activeId={activeId}
         onActivate={setActiveId}
         onClose={closeTab}
+        onCloseAll={closeAll}
+        onCloseOthers={closeOthers}
         onOpenRepo={handleOpenRepo}
       />
       {/* 还原完成前什么都不渲染：先闪一下空态页再跳出标签很难看 */}
