@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
+  closeAllTabs,
+  closeOtherTabs,
   closeTabAt,
   closeTabsByPath,
   restoreTabs,
@@ -202,5 +204,67 @@ describe('closeTabsByPath', () => {
     const r = closeTabsByPath(dup, 'tab-2', 'C:/repo/wt')
     expect(r.tabs.map((t) => t.id)).toEqual(['tab-1'])
     expect(r.activeId).toBe('tab-1')
+  })
+})
+
+describe('closeAllTabs', () => {
+  it('全部关掉后落到空态', () => {
+    const tabs: RepoTabInfo[] = [
+      { id: 'tab-0', path: 'C:/a' },
+      { id: 'tab-1', path: 'C:/b' },
+    ]
+    const r = closeAllTabs(tabs, 'tab-1')
+    expect(r.tabs).toEqual([])
+    expect(r.activeId).toBeNull()
+  })
+
+  it('本来就是空列表时不炸', () => {
+    const r = closeAllTabs([], null)
+    expect(r.tabs).toEqual([])
+    expect(r.activeId).toBeNull()
+  })
+})
+
+describe('closeOtherTabs', () => {
+  const tabs: RepoTabInfo[] = [
+    { id: 'tab-0', path: 'C:/a' },
+    { id: 'tab-1', path: 'C:/b' },
+    { id: 'tab-2', path: 'C:/c' },
+  ]
+
+  it('只留下被右键的那个标签', () => {
+    const r = closeOtherTabs(tabs, 'tab-0', 'tab-1')
+    expect(r.tabs).toEqual([{ id: 'tab-1', path: 'C:/b' }])
+    expect(r.activeId).toBe('tab-1')
+  })
+
+  it('活动标签是被关闭的那批时，留下的标签接管为活动', () => {
+    const r = closeOtherTabs(tabs, 'tab-2', 'tab-0')
+    expect(r.activeId).toBe('tab-0')
+  })
+
+  it('被右键的就是活动标签时活动不动', () => {
+    const r = closeOtherTabs(tabs, 'tab-1', 'tab-1')
+    expect(r.tabs.map((t) => t.id)).toEqual(['tab-1'])
+    expect(r.activeId).toBe('tab-1')
+  })
+
+  it('只有一个标签时等于什么都没发生', () => {
+    const one: RepoTabInfo[] = [{ id: 'tab-0', path: 'C:/a' }]
+    const r = closeOtherTabs(one, 'tab-0', 'tab-0')
+    expect(r.tabs).toBe(one)
+    expect(r.activeId).toBe('tab-0')
+  })
+
+  it('id 不存在时原样返回', () => {
+    const r = closeOtherTabs(tabs, 'tab-0', 'tab-99')
+    expect(r.tabs).toBe(tabs)
+    expect(r.activeId).toBe('tab-0')
+  })
+
+  it('空列表上不炸', () => {
+    const r = closeOtherTabs([], null, 'tab-0')
+    expect(r.tabs).toEqual([])
+    expect(r.activeId).toBeNull()
   })
 })
