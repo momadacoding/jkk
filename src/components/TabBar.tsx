@@ -1,15 +1,19 @@
 import { basename } from '../engine/path'
 import type { RepoTabInfo } from '../engine/session'
+import { ContextMenu, useContextMenu } from './ContextMenu'
 
 interface TabBarProps {
   tabs: RepoTabInfo[]
   activeId: string | null
   onActivate: (id: string) => void
   onClose: (id: string) => void
+  onCloseAll: () => void
+  onCloseOthers: (id: string) => void
   onOpenRepo: () => void
 }
 
-export function TabBar({ tabs, activeId, onActivate, onClose, onOpenRepo }: TabBarProps) {
+export function TabBar({ tabs, activeId, onActivate, onClose, onCloseAll, onCloseOthers, onOpenRepo }: TabBarProps) {
+  const { menu, open, close } = useContextMenu()
   return (
     <div className="tab-bar">
       {tabs.map((tab) => (
@@ -23,6 +27,12 @@ export function TabBar({ tabs, activeId, onActivate, onClose, onOpenRepo }: TabB
           // 点在 × 按钮上的中键也会冒泡到这里，同样关掉
           onMouseDown={(e) => { if (e.button === 1) e.preventDefault() }}
           onAuxClick={(e) => { if (e.button === 1) onClose(tab.id) }}
+          onContextMenu={(e) =>
+            open(e, [
+              { label: 'Close All', onSelect: onCloseAll },
+              { label: 'Close All but This', onSelect: () => onCloseOthers(tab.id) },
+            ])
+          }
         >
           <span className="tab-title">{basename(tab.path)}</span>
           {/* 最后一个标签也能关：关完落到空态页，不再需要「至少留一个」这条约束 */}
@@ -40,6 +50,7 @@ export function TabBar({ tabs, activeId, onActivate, onClose, onOpenRepo }: TabB
         <span className="tab-open-icon">+</span>
         <span>Open Repo</span>
       </button>
+      <ContextMenu menu={menu} onClose={close} />
     </div>
   )
 }
