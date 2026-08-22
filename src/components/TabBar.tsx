@@ -18,6 +18,11 @@ export function TabBar({ tabs, activeId, onActivate, onClose, onOpenRepo }: TabB
           className={tab.id === activeId ? 'tab active' : 'tab'}
           title={tab.path}
           onClick={() => onActivate(tab.id)}
+          // 中键关闭标签：mousedown 先 preventDefault 拦住 Windows 的自动滚动，
+          // auxclick（鼠标抬起）再关，和浏览器中键关标签的手感一致；
+          // 点在 × 按钮上的中键也会冒泡到这里，同样关掉
+          onMouseDown={(e) => { if (e.button === 1) e.preventDefault() }}
+          onAuxClick={(e) => { if (e.button === 1) onClose(tab.id) }}
         >
           <span className="tab-title">{basename(tab.path)}</span>
           {/* 最后一个标签也能关：关完落到空态页，不再需要「至少留一个」这条约束 */}
