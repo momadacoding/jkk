@@ -79,12 +79,20 @@ pub fn watch_repo(handle: AppHandle, path: String) -> Result<()> {
         };
 
         let root = std::path::PathBuf::from(&path);
-        if let Err(e) = watcher.watch(&root, RecursiveMode::Recursive) {
-            let _ = handle.emit("watch-error", e.to_string());
-            return;
-        }
-        // 只为判断 ignore 规则；打不开就退化成「所有事件都相关」
+        // 只在两处用：监听目标展开（linked worktree 的 git 元数据在工作区根之外，
+        // 必须一并挂监听，否则外部 commit 收不到事件）和 ignore 规则判断。
+        // 打不开就退化成「只盯根目录、所有事件都相关」。
         let repo = git2::Repository::open(&root).ok();
+        for target in crate::engine::watch::watch_targets(&root, repo.as_ref()) {
+            if let Err(e) = watcher.watch(&target, RecursiveMode::Recursive) {
+                let _ = handle.emit("watch-error", e.to_string());
+                // 根目录挂不上就没有继续的意义；额外的 git 目录挂不上时
+                // 保留其余监听，部分覆盖好过没有。
+                if target == root {
+                    return;
+                }
+            }
+        }
 
         let mut pending = false;
         let mut last_change = Instant::now();

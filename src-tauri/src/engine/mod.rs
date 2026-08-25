@@ -13,4 +13,5 @@ pub mod session;
 pub mod stash;
 pub mod tree;
 pub mod upstream;
+pub mod watch;
 pub mod worktree;
