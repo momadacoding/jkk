@@ -571,6 +571,7 @@ export function RepoTab({
                   <GraphView
                     commits={state.commits}
                     refs={state.refs}
+                    pullRequests={state.pullRequests}
                     selectedId={state.selectedId}
                     onSelect={selectCommit}
                     headHash={state.headHash}

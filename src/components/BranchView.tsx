@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { PullRequest, RefPointer } from '../engine/types'
-import { indexPullRequestsByBranch } from '../engine/prs'
+import { indexPullRequestsByBranch, pullRequestForRef } from '../engine/prs'
 import { ContextMenu, useContextMenu } from './ContextMenu'
 import { SidebarSection, SidebarGroup } from './SidebarSection'
 import { usePrompt } from './PromptDialog'
@@ -218,7 +218,7 @@ export function BranchView({
             >
               <BranchIcon />
               <span className="sb-label">{name}</span>
-              <PrBadge pr={prByBranch.get(name)} />
+              <PrBadge pr={pullRequestForRef(prByBranch, ref)} />
               <SyncBadge ahead={ref.ahead} behind={ref.behind} />
               {name === head && <span className="sb-current-dot" title="当前分支" />}
             </div>

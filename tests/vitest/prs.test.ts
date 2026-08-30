@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { indexPullRequestsByBranch } from '../../src/engine/prs'
-import type { PullRequest } from '../../src/engine/types'
+import { indexPullRequestsByBranch, pullRequestForRef } from '../../src/engine/prs'
+import type { PullRequest, RefPointer } from '../../src/engine/types'
 
 const pr = (number: number, headRefName: string, extra: Partial<PullRequest> = {}): PullRequest => ({
   number,
@@ -59,5 +59,42 @@ describe('indexPullRequestsByBranch', () => {
     const index = indexPullRequestsByBranch([pr(9, 'feat/d', { isDraft: true })])
     expect(index.get('feat/d')?.isDraft).toBe(true)
     expect(index.get('feat/d')?.url).toBe('https://github.com/o/r/pull/9')
+  })
+})
+
+describe('pullRequestForRef', () => {
+  const index = indexPullRequestsByBranch([pr(37, 'feat/x'), pr(9, 'master')])
+  const ref = (name: string, kind: RefPointer['kind']): RefPointer =>
+    ({ name, kind, hash: 'a'.repeat(40), ahead: null, behind: null })
+
+  it('本地分支剥掉前缀后精确命中', () => {
+    expect(pullRequestForRef(index, ref('refs/heads/feat/x', 'branch'))?.number).toBe(37)
+  })
+
+  it('远程分支不给编号——同一行上本地 pill 已经标过了，再标一次是重复噪音', () => {
+    // origin/feat/x 和 feat/x 常常并排出现在同一个提交上
+    expect(pullRequestForRef(index, ref('refs/remotes/origin/feat/x', 'remote'))).toBeUndefined()
+  })
+
+  it('tag 不给编号', () => {
+    expect(pullRequestForRef(index, ref('refs/tags/v1.0.0', 'tag'))).toBeUndefined()
+  })
+
+  it('HEAD 伪 ref 不给编号', () => {
+    expect(pullRequestForRef(index, ref('HEAD', 'head'))).toBeUndefined()
+  })
+
+  it('没有对应 PR 的分支返回 undefined', () => {
+    expect(pullRequestForRef(index, ref('refs/heads/chore/no-pr', 'branch'))).toBeUndefined()
+  })
+
+  it('前缀只剥一次，分支名里再出现同样的字样也原样保留', () => {
+    // 病态但合法的分支名，不能被多剥一层去撞到别的分支
+    const weird = indexPullRequestsByBranch([pr(1, 'refs/heads/x')])
+    expect(pullRequestForRef(weird, ref('refs/heads/refs/heads/x', 'branch'))?.number).toBe(1)
+  })
+
+  it('空索引上安全返回 undefined', () => {
+    expect(pullRequestForRef(new Map(), ref('refs/heads/feat/x', 'branch'))).toBeUndefined()
   })
 })

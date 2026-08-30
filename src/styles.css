@@ -443,6 +443,27 @@ body {
   border-left: 4px solid #4fc3f7;
 }
 
+/* 分支标签里内嵌的 PR 编号。
+   不另起一个 pill：那要多一份内边距和间隙，而这一行还挤着提交信息、作者、
+   hash 和日期。左边那点 margin 是必须的，`worktree-pr-badge#37` 会连成一坨。
+   注意底色继承自分支 pill 的车道色，所以这里只调字色和字重，不再铺一层背景。
+
+   这两个颜色是按对比度算出来的，不是挑好看的：pill 底色是**车道色**的 22%
+   叠加，12 条车道各不相同，最差的一条是黄色 `#fff176`（选中行上更亮）。
+   在那条车道上，原先的 `#7ee08a` / `#9aa4ae` 只有 4.05 / 2.60——draft 连次要
+   信息的 3.0 都不到。改用下面这两个值后最差 4.53 / 4.57，都过 WCAG AA 的 4.5，
+   同时仍明显弱于分支名本身（最差 5.96）。改色前请重算，不要凭眼睛在单一车道上判断。 */
+.ref-pill-pr {
+  margin-left: 5px;
+  color: #9ae8a4;
+  font-weight: 600;
+}
+
+/* draft PR 还没准备好被 review。用中性灰而不是压暗——压暗在亮车道上直接看不清 */
+.ref-pill-pr.draft {
+  color: #d0d8e0;
+}
+
 /* 远程分支：无色条、低饱和，明确弱于本地分支一档 */
 .ref-pill.remote {
   background: #34383c;
@@ -1161,10 +1182,12 @@ body {
 }
 
 /* draft PR 还没准备好被 review。颜色是这里唯一的区分手段——
-   徽章上再挤不下一个 "draft" 字样了。 */
+   徽章上再挤不下一个 "draft" 字样了。
+   字色比直觉的更亮：hover / selected 行会在底下再叠一层 10% 白，
+   原来的 #a2aab4 在那种状态下只有 4.04，够不上 AA 的 4.5。 */
 .sb-pr.draft {
   background: rgba(139, 148, 158, 0.18);
-  color: #a2aab4;
+  color: #b0b8c2;
 }
 
 .sb-current-dot {
