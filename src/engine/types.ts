@@ -110,3 +110,18 @@ export interface StashEntry {
   /** 父提交。stash 是个 merge 提交，第一父是 stash 时所在的那个提交。 */
   parents: string[]
 }
+
+/**
+ * 一条 open 状态的 GitHub Pull Request，字段对齐 `gh pr list --json` 的输出。
+ *
+ * 它不是 git 的概念，所以刻意不挂进 [`RefPointer`]：PR 走的是另一条会失败、
+ * 会超时的网络通道，塞进 graph 数据结构会让本地读图也背上网络状态。
+ */
+export interface PullRequest {
+  number: number
+  /** PR 的来源分支名，不带 refs/heads/ 前缀，如 `feat/x`。 */
+  headRefName: string
+  title: string
+  isDraft: boolean
+  url: string
+}

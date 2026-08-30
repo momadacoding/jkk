@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { useCallback, useEffect, useState } from 'react'
-import type { CommitNode, DiffData, GraphData, RefPointer, RepoInfo, StashEntry, StatusData, UpstreamInfo, Worktree } from '../engine/types'
+import type { CommitNode, DiffData, GraphData, PullRequest, RefPointer, RepoInfo, StashEntry, StatusData, UpstreamInfo, Worktree } from '../engine/types'
 import { toErrorMessage } from '../engine/errors'
 import { samePath } from '../engine/path'
 import { nextSelection } from '../engine/selection'
@@ -17,6 +17,11 @@ export interface RepoState {
   worktrees: Worktree[]
   upstream: UpstreamInfo | null
   stashes: StashEntry[]
+  /**
+   * 当前仓库的 open PR。空数组既表示「没有 PR」也表示「这台机器读不到」——
+   * 两者在界面上是同一件事：分支旁边不画徽章。
+   */
+  pullRequests: PullRequest[]
   status: StatusData
   diff: DiffData
   selectedId: string | null
@@ -33,6 +38,7 @@ const initialState: RepoState = {
   worktrees: [],
   upstream: null,
   stashes: [],
+  pullRequests: [],
   status: { staged: [], unstaged: [] },
   diff: { files: [] },
   selectedId: null,
@@ -57,6 +63,8 @@ export function useRepoStore() {
       setState((s) => ({ ...s, worktrees: wts }))
       await refreshUpstream(path)
       await refreshStashes(path)
+      // 不 await：这一步要走网络（gh 实测一两秒），让它拖住打开仓库的收尾没有意义
+      void refreshPullRequests(path)
     } catch (err) {
       setState((s) => ({ ...s, loading: false, error: toErrorMessage(err) }))
     }
@@ -114,6 +122,25 @@ export function useRepoStore() {
     setState((s) => ({ ...s, stashes }))
   }
 
+  /**
+   * 重新读取 open PR 列表。
+   *
+   * **只在打开仓库和用户主动 fetch/pull/push 之后调用**，绝不能挂进
+   * `repo-changed` 那条文件监听通道：那条通道一次编辑就触发一次，而这里要走网络。
+   *
+   * 失败只写 console 不上报：顶部错误横幅是留给 git 操作的，被这条锦上添花的信息
+   * 占住的话，真正的失败反而看不见。后端在 gh 缺失/未登录/非 GitHub 仓库时已经
+   * 返回空列表，所以走到 catch 的只剩「gh 输出解析不了」这种本项目自己的 bug。
+   */
+  const refreshPullRequests = async (path: string) => {
+    try {
+      const prs = await invoke<PullRequest[]>('list_pull_requests', { path })
+      setState((s) => ({ ...s, pullRequests: prs }))
+    } catch (err) {
+      console.warn('读取 PR 列表失败，分支旁不显示编号徽章：', err)
+    }
+  }
+
   const refreshDiff = async (path: string, scope: string) => {
     const diff = await invoke<DiffData>('read_diff', { path, scope })
     setState((s) => ({ ...s, diff }))
@@ -141,6 +168,7 @@ export function useRepoStore() {
     refreshDiff,
     refreshUpstream,
     refreshStashes,
+    refreshPullRequests,
     selectCommit,
     clearError,
     reportError,

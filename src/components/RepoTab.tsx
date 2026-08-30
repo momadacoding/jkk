@@ -101,7 +101,8 @@ export function RepoTab({
 }: RepoTabProps) {
   const {
     state, openRepo, refreshHead, refreshGraph, refreshStatus, refreshWorktrees,
-    refreshDiff, refreshUpstream, refreshStashes, selectCommit, clearError, reportError,
+    refreshDiff, refreshUpstream, refreshStashes, refreshPullRequests,
+    selectCommit, clearError, reportError,
   } = useRepoStore()
   const [repoState, setRepoState] = useState<string>('normal')
   const [viewMode, setViewMode] = useState<ViewMode>('commits')
@@ -188,10 +189,17 @@ export function RepoTab({
       await refreshStatus(path)
       await refreshUpstream(path)
       await refreshStashes(path)
+      // 只有这三个动作会改变「分支有没有 PR」的答案：push 常常紧跟着开 PR，
+      // fetch/pull 则可能带回别人刚开的。stash / cherry-pick 之类不碰远端，
+      // 让它们也发一次网络请求纯属浪费。不 await——徽章晚一两秒出现无所谓，
+      // 但不能让 push 的反馈被 gh 拖住。
+      if (command === 'fetch' || command === 'pull' || command === 'push') {
+        void refreshPullRequests(path)
+      }
     } catch (err) {
       reportError(err)
     }
-  }, [state.path, state.headHash, refreshHead, refreshGraph, refreshStatus, refreshUpstream, refreshStashes, reportError])
+  }, [state.path, state.headHash, refreshHead, refreshGraph, refreshStatus, refreshUpstream, refreshStashes, refreshPullRequests, reportError])
 
   /**
    * graph 行右键菜单的调度。
@@ -496,6 +504,7 @@ export function RepoTab({
               />
               <BranchView
                 refs={state.refs}
+                pullRequests={state.pullRequests}
                 head={state.head}
                 selectedBranch={selectedBranch}
                 onSelect={handleSelectBranch}

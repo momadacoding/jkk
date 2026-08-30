@@ -1144,6 +1144,29 @@ body {
   color: #e5a15c;
 }
 
+/* PR 编号徽章。
+   给了底色而不是像 ↑↓ 那样用纯文字：`#36` 紧挨着分支名时会被读成名字的一部分，
+   一个色块才能把它切开。
+   注意它**不跟着 .sb-sync 一起在 hover 时隐藏**——PR 标题只挂在 title 上，
+   一 hover 就消失的话那个提示永远看不到。分支行里也没有行内操作按钮要抢位置。 */
+.sb-pr {
+  flex-shrink: 0;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: rgba(63, 185, 80, 0.16);
+  color: #56c964;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 15px;
+}
+
+/* draft PR 还没准备好被 review。颜色是这里唯一的区分手段——
+   徽章上再挤不下一个 "draft" 字样了。 */
+.sb-pr.draft {
+  background: rgba(139, 148, 158, 0.18);
+  color: #a2aab4;
+}
+
 .sb-current-dot {
   width: 5px;
   height: 5px;
