@@ -1,6 +1,6 @@
 import type { LayoutNode, RefPointer } from '../engine/graphTypes'
 import type { PullRequest } from '../engine/types'
-import { pullRequestForRef } from '../engine/prs'
+import { prBadgeLabel, prBadgeVariant, prTooltip, pullRequestForRef } from '../engine/prs'
 import { laneTint } from '../engine/paths'
 import { WORKDIR_ID } from '../engine/workdir'
 import { shortHash } from '../engine/commitActions'
@@ -75,16 +75,14 @@ export function CommitRow({
               style={ref.kind === 'branch'
                 ? { borderLeftColor: laneColor, background: laneTint(laneColor, 0.22) }
                 : undefined}
-              title={pr
-                ? `${ref.name}\n${pr.isDraft ? 'Draft PR' : 'PR'} #${pr.number}: ${pr.title}`
-                : ref.name}
+              title={pr ? `${ref.name}\n${prTooltip(pr)}` : ref.name}
             >
               {shortName(ref.name)}
               {/* 编号内嵌在同一个 pill 里：另起一个 pill 要多一份边距和间隙，
                   而这一行还挤着提交信息、作者、hash 和日期 */}
               {pr && (
-                <span className={pr.isDraft ? 'ref-pill-pr draft' : 'ref-pill-pr'}>
-                  #{pr.number}
+                <span className={`ref-pill-pr ${prBadgeVariant(pr)}`}>
+                  {prBadgeLabel(pr)}
                 </span>
               )}
             </span>

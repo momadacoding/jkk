@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { PullRequest, RefPointer } from '../engine/types'
-import { indexPullRequestsByBranch, pullRequestForRef } from '../engine/prs'
+import { indexPullRequestsByBranch, prBadgeLabel, prBadgeVariant, prTooltip, pullRequestForRef } from '../engine/prs'
 import { ContextMenu, useContextMenu } from './ContextMenu'
 import { SidebarSection, SidebarGroup } from './SidebarSection'
 import { usePrompt } from './PromptDialog'
@@ -68,16 +68,12 @@ function SyncBadge({ ahead, behind }: { ahead: number | null; behind: number | n
   )
 }
 
-/** PR 编号微徽章。分支上没有 open PR（undefined）时什么都不画。 */
+/** PR 编号微徽章。分支上没有可显示的 PR（undefined）时什么都不画。 */
 function PrBadge({ pr }: { pr: PullRequest | undefined }) {
   if (!pr) return null
   return (
-    <span
-      className={pr.isDraft ? 'sb-pr draft' : 'sb-pr'}
-      // 光一个 #36 说不清是哪个 PR，标题挂在 title 上，鼠标停一下就能看到
-      title={`${pr.isDraft ? 'Draft PR' : 'PR'} #${pr.number}: ${pr.title}`}
-    >
-      #{pr.number}
+    <span className={`sb-pr ${prBadgeVariant(pr)}`} title={prTooltip(pr)}>
+      {prBadgeLabel(pr)}
     </span>
   )
 }

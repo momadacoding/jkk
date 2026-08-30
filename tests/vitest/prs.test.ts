@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { indexPullRequestsByBranch, pullRequestForRef } from '../../src/engine/prs'
+import { indexPullRequestsByBranch, prBadgeLabel, prBadgeVariant, pullRequestForRef } from '../../src/engine/prs'
 import type { PullRequest, RefPointer } from '../../src/engine/types'
 
 const pr = (number: number, headRefName: string, extra: Partial<PullRequest> = {}): PullRequest => ({
@@ -7,9 +7,14 @@ const pr = (number: number, headRefName: string, extra: Partial<PullRequest> = {
   headRefName,
   title: `PR ${number}`,
   isDraft: false,
+  state: 'OPEN',
   url: `https://github.com/o/r/pull/${number}`,
   ...extra,
 })
+const merged = (number: number, headRefName: string): PullRequest =>
+  pr(number, headRefName, { state: 'MERGED' })
+const closed = (number: number, headRefName: string): PullRequest =>
+  pr(number, headRefName, { state: 'CLOSED' })
 
 describe('indexPullRequestsByBranch', () => {
   it('空数组给出空索引，不抛异常', () => {
@@ -59,6 +64,70 @@ describe('indexPullRequestsByBranch', () => {
     const index = indexPullRequestsByBranch([pr(9, 'feat/d', { isDraft: true })])
     expect(index.get('feat/d')?.isDraft).toBe(true)
     expect(index.get('feat/d')?.url).toBe('https://github.com/o/r/pull/9')
+  })
+
+  it('已合并的 PR 也进索引——分支还在但内容已进主干，这正是要标出来的情况', () => {
+    const index = indexPullRequestsByBranch([merged(33, 'feat/portable-zip-signing')])
+    expect(index.get('feat/portable-zip-signing')?.number).toBe(33)
+  })
+
+  it('关闭但未合并的 PR 不进索引', () => {
+    // 被否掉的 PR 对「这条分支现在什么状态」没有信息量，标出来只会误导
+    expect(indexPullRequestsByBranch([closed(12, 'feat/abandoned')]).size).toBe(0)
+  })
+
+  it('同一分支同时有 open 和 merged 时，open 优先——哪怕它编号更小', () => {
+    // 老分支合过一次又重开 PR：当下正在进行的那个才是用户关心的
+    const index = indexPullRequestsByBranch([merged(50, 'feat/x'), pr(12, 'feat/x')])
+    expect(index.get('feat/x')?.number).toBe(12)
+    expect(index.get('feat/x')?.state).toBe('OPEN')
+  })
+
+  it('顺序颠倒也是 open 优先，不依赖 gh 的返回顺序', () => {
+    const index = indexPullRequestsByBranch([pr(12, 'feat/x'), merged(50, 'feat/x')])
+    expect(index.get('feat/x')?.number).toBe(12)
+  })
+
+  it('全是 merged 时取编号最大的那个', () => {
+    const index = indexPullRequestsByBranch([merged(10, 'feat/x'), merged(42, 'feat/x')])
+    expect(index.get('feat/x')?.number).toBe(42)
+  })
+
+  it('closed 不会顶掉同分支的 merged', () => {
+    const index = indexPullRequestsByBranch([closed(99, 'feat/x'), merged(10, 'feat/x')])
+    expect(index.get('feat/x')?.number).toBe(10)
+  })
+})
+
+describe('prBadgeVariant', () => {
+  it('open PR 是 open', () => {
+    expect(prBadgeVariant(pr(1, 'a'))).toBe('open')
+  })
+
+  it('draft PR 是 draft', () => {
+    expect(prBadgeVariant(pr(1, 'a', { isDraft: true }))).toBe('draft')
+  })
+
+  it('merged PR 是 merged', () => {
+    expect(prBadgeVariant(merged(1, 'a'))).toBe('merged')
+  })
+
+  it('merged 压过 isDraft——已合并就不再是草稿了', () => {
+    // gh 不该给出这种组合，但真给了也不能显示成灰色草稿
+    expect(prBadgeVariant(pr(1, 'a', { state: 'MERGED', isDraft: true }))).toBe('merged')
+  })
+})
+
+describe('prBadgeLabel', () => {
+  it('open 与 draft 只显示编号', () => {
+    expect(prBadgeLabel(pr(37, 'a'))).toBe('#37')
+    expect(prBadgeLabel(pr(37, 'a', { isDraft: true }))).toBe('#37')
+  })
+
+  it('merged 带 ✓ 前缀', () => {
+    // 颜色不能是唯一的区分手段：pill 底色是车道色，紫字在黄色车道上淡到
+    // 与 draft 灰分不开（实测最高 4.41）；符号这一路对色盲也成立
+    expect(prBadgeLabel(merged(33, 'a'))).toBe('✓#33')
   })
 })
 

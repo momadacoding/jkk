@@ -9,8 +9,8 @@ use tempfile::TempDir;
 #[test]
 fn parses_real_gh_output() {
     let json = r#"[
-      {"headRefName":"fix/watch","isDraft":false,"number":36,"title":"linked worktree 下外部 commit 不触发刷新","url":"https://github.com/o/r/pull/36"},
-      {"headRefName":"feat/tab","isDraft":true,"number":35,"title":"中键点击标签即关闭","url":"https://github.com/o/r/pull/35"}
+      {"headRefName":"fix/watch","isDraft":false,"number":36,"state":"OPEN","title":"linked worktree 下外部 commit 不触发刷新","url":"https://github.com/o/r/pull/36"},
+      {"headRefName":"feat/tab","isDraft":true,"number":35,"state":"OPEN","title":"中键点击标签即关闭","url":"https://github.com/o/r/pull/35"}
     ]"#;
 
     let prs = github::parse_pr_list(json).expect("真实形状的输出必须能解析");
@@ -22,10 +22,19 @@ fn parses_real_gh_output() {
             head_ref_name: "fix/watch".to_string(),
             title: "linked worktree 下外部 commit 不触发刷新".to_string(),
             is_draft: false,
+            state: "OPEN".to_string(),
             url: "https://github.com/o/r/pull/36".to_string(),
         }
     );
     assert!(prs[1].is_draft, "isDraft 必须映射到 is_draft");
+}
+
+#[test]
+fn parses_merged_state() {
+    // 已合并的 PR 是这个功能的第二个主场景：分支还在，内容早进主干了
+    let json = r#"[{"headRefName":"feat/portable-zip-signing","isDraft":false,"number":33,"state":"MERGED","title":"绿色版 zip","url":"u"}]"#;
+    let prs = github::parse_pr_list(json).unwrap();
+    assert_eq!(prs[0].state, "MERGED");
 }
 
 #[test]
@@ -52,8 +61,7 @@ fn malformed_json_is_an_error() {
 
 #[test]
 fn unicode_branch_names_survive() {
-    let json =
-        r#"[{"headRefName":"feat/中文-分支","isDraft":false,"number":1,"title":"标题","url":"u"}]"#;
+    let json = r#"[{"headRefName":"feat/中文-分支","isDraft":false,"number":1,"state":"OPEN","title":"标题","url":"u"}]"#;
     let prs = github::parse_pr_list(json).unwrap();
     assert_eq!(prs[0].head_ref_name, "feat/中文-分支");
 }
@@ -61,7 +69,7 @@ fn unicode_branch_names_survive() {
 #[test]
 fn unknown_fields_are_ignored() {
     // gh 升级后可能多吐字段；多一个字段不该让整条通道失效
-    let json = r#"[{"headRefName":"a","isDraft":false,"number":1,"title":"t","url":"u","baseRefName":"master"}]"#;
+    let json = r#"[{"headRefName":"a","isDraft":false,"number":1,"state":"OPEN","title":"t","url":"u","baseRefName":"master"}]"#;
     assert_eq!(github::parse_pr_list(json).unwrap().len(), 1);
 }
 
@@ -78,7 +86,7 @@ fn plain_git_repo_without_github_remote_yields_no_prs() {
         .status()
         .expect("git not found");
 
-    let prs = github::list_open_prs(&path).expect("gh 不可用时不该返回 Err");
+    let prs = github::list_branch_prs(&path).expect("gh 不可用时不该返回 Err");
     assert!(prs.is_empty());
 }
 
@@ -86,6 +94,6 @@ fn plain_git_repo_without_github_remote_yields_no_prs() {
 fn nonexistent_path_yields_no_prs() {
     // 仓库目录被删掉/盘符掉线时，子进程连 current_dir 都设不上，
     // 这条 io 错误同样只能降级，不能冒泡到界面
-    let prs = github::list_open_prs("Z:/definitely/not/here").expect("路径不存在时不该返回 Err");
+    let prs = github::list_branch_prs("Z:/definitely/not/here").expect("路径不存在时不该返回 Err");
     assert!(prs.is_empty());
 }

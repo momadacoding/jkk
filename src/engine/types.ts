@@ -123,5 +123,12 @@ export interface PullRequest {
   headRefName: string
   title: string
   isDraft: boolean
+  /**
+   * gh 原样返回的状态。
+   *
+   * `CLOSED` 指**关闭但没合并**，与 `MERGED` 是两回事——git 客户端里把这两者
+   * 混为一谈会给出完全相反的暗示（「可以删分支了」vs「这活白干了」）。
+   */
+  state: 'OPEN' | 'MERGED' | 'CLOSED'
   url: string
 }
