@@ -1,5 +1,6 @@
 use app_lib::engine;
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::channel;
@@ -58,6 +59,33 @@ fn watch_targets_of_a_plain_repo_is_just_the_root() {
     // 普通仓库的 gitdir 就是 <root>/.git，递归监听根目录已覆盖，不该重复挂
     let targets = engine::watch::watch_targets(dir.path(), Some(&repo));
     assert_eq!(targets, vec![dir.path().to_path_buf()]);
+}
+
+/// 调用方给的路径写法和 libgit2 返回的不一致时，去重不能失效。
+///
+/// 这不是假想场景：CI 上 `TempDir` 落在 `C:\Users\RUNNER~1\...`（8.3 短名），
+/// 而 `commondir()` 返回的是 `C:/Users/runneradmin/...`。两者按 `starts_with`
+/// 比对必然失配，`.git/` 就被当成独立目标多挂了一次——根目录本来就是递归监听，
+/// 于是每次 git 元数据变更触发两遍刷新。v0.4.0 的发版构建正是栽在这里。
+///
+/// 这里用 `sub/..` 制造同样的「写法不同、指向同一处」，好处是不依赖 Windows
+/// 的短名机制，Linux 上同样能复现。
+#[test]
+fn watch_targets_dedupes_across_different_spellings_of_the_same_path() {
+    let dir = TempDir::new().unwrap();
+    run_git(dir.path(), &["init"]);
+    fs::create_dir(dir.path().join("sub")).unwrap();
+
+    // 指向同一个目录，但多了一段 `..`，和 libgit2 解析出来的写法对不上
+    let noisy = dir.path().join("sub").join("..");
+    let repo = git2::Repository::open(&noisy).unwrap();
+    let targets = engine::watch::watch_targets(&noisy, Some(&repo));
+
+    assert_eq!(
+        targets.len(),
+        1,
+        "gitdir 落在根目录下，不该重复挂；实际拿到 {targets:?}"
+    );
 }
 
 #[test]
