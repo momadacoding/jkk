@@ -17,6 +17,13 @@ export interface DeleteInfo {
   remote: string | null
   /** 该分支在远程上的名字，如 `feat/x`。 */
   remoteBranch: string | null
+  /**
+   * 那条远程分支是该远程的默认分支——勾选框显示但禁用。
+   *
+   * 后端也会拦（`protected_branch`），但删除顺序是 worktree → 远程 → 本地分支，
+   * 等报错时 worktree 目录已经搬走、标签已经关了。
+   */
+  remoteProtected: boolean
   /** 只在这个分支上、不在 `comparedTo` 上的提交数。 */
   unmerged: number
   /**
@@ -143,7 +150,9 @@ export function DeleteBranchDialog({ repoPath, name, onCancel, onConfirm }: Dele
    */
   const confirm = async () => {
     if (!info || busy) return
-    const remote = alsoRemote && info.remote && info.remoteBranch
+    // `remoteProtected` 在这里再判一次：勾选框已经禁用了，但这一步是真正
+    // 发出破坏性动作的地方，不该依赖上游控件的状态是对的
+    const remote = alsoRemote && !info.remoteProtected && info.remote && info.remoteBranch
       ? { remote: info.remote, branch: info.remoteBranch }
       : null
     const worktreePath = alsoWorktree && info.worktree ? info.worktree.path : null
@@ -185,16 +194,24 @@ export function DeleteBranchDialog({ repoPath, name, onCancel, onConfirm }: Dele
         </div>
 
         {info?.upstream && (
-          <label className="dlg-field dlg-check">
-            <input
-              type="checkbox"
-              checked={alsoRemote}
-              disabled={busy}
-              onChange={(e) => setAlsoRemote(e.target.checked)}
-            />
-            <span>Also delete remote branch</span>
-            <span className="dlg-value"><RemoteGlyph />{info.upstream}</span>
-          </label>
+          <>
+            <label className="dlg-field dlg-check">
+              <input
+                type="checkbox"
+                checked={alsoRemote && !info.remoteProtected}
+                disabled={busy || info.remoteProtected}
+                onChange={(e) => setAlsoRemote(e.target.checked)}
+              />
+              <span>Also delete remote branch</span>
+              <span className="dlg-value"><RemoteGlyph />{info.upstream}</span>
+            </label>
+            {/* 灰着不说原因等于让用户以为界面坏了 */}
+            {info.remoteProtected && (
+              <div className="dlg-note under-check">
+                {info.upstream} 是该远程的默认分支，不提供删除。本地分支照样可以删。
+              </div>
+            )}
+          </>
         )}
 
         {info?.worktree && (

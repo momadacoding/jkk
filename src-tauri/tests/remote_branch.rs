@@ -53,6 +53,27 @@ fn cloned_repo() -> (TempDir, TempDir) {
     (remote, work)
 }
 
+/// bare 远程 + 用 `git remote add` 接上去的工作仓库——**没有**
+/// `refs/remotes/origin/HEAD`，那条 ref 只有 clone 才会写下。
+///
+/// fork 工作流里的 `upstream` 远程正是这么加的，而它恰恰是删错分支代价最大的
+/// 那个远程（那是别人的主仓库）。
+fn repo_with_added_remote() -> (TempDir, TempDir) {
+    let remote = TempDir::new().unwrap();
+    run_git(remote.path(), &["init", "--bare"]);
+    let url = remote.path().to_str().unwrap().to_string();
+
+    let work = TempDir::new().unwrap();
+    run_git(work.path(), &["init"]);
+    run_git(work.path(), &["config", "user.email", "test@test.com"]);
+    run_git(work.path(), &["config", "user.name", "Test"]);
+    commit(work.path(), "c1");
+    run_git(work.path(), &["remote", "add", "origin", &url]);
+    run_git(work.path(), &["push", "-u", "origin", "HEAD"]);
+
+    (remote, work)
+}
+
 fn p(dir: &TempDir) -> String {
     dir.path().to_str().unwrap().to_string()
 }
@@ -120,4 +141,100 @@ fn delete_remote_ref_removes_the_branch_from_the_remote() {
     ops::delete_remote_ref(p(&work), "origin/feat/x".into()).unwrap();
 
     assert!(git_out(work.path(), &["ls-remote", "--heads", "origin", "feat/x"]).is_empty());
+}
+
+/// 远程的默认分支一律不给删，push 都不发出去。
+///
+/// 这是算错要删哪条分支时的最后一道护栏，不能把安全性外包给服务端：GitHub 会
+/// 用 `refusing to delete the current branch` 挡住默认分支，但自建 Gitea/裸仓库
+/// 未必挡，而且**只有默认分支**受这个待遇——别的分支删了就是删了。
+#[test]
+fn refuses_to_delete_the_remotes_default_branch() {
+    let (_remote, work) = cloned_repo();
+    // 克隆下来的 refs/remotes/origin/HEAD 指着远程的默认分支
+    let default_ref = git_out(work.path(), &["rev-parse", "--abbrev-ref", "origin/HEAD"]);
+    let default_branch = default_ref
+        .strip_prefix("origin/")
+        .expect(&default_ref)
+        .to_string();
+
+    let err = ops::delete_remote_ref(p(&work), default_ref.clone()).unwrap_err();
+    assert_eq!(err.code, "protected_branch", "{}", err.message);
+
+    // 而且远程上它必须原封不动地还在
+    assert!(
+        !git_out(
+            work.path(),
+            &["ls-remote", "--heads", "origin", &default_branch]
+        )
+        .is_empty(),
+        "默认分支被删掉了"
+    );
+}
+
+/// 远程是 `git remote add` 接上去的（没有本地 HEAD 记录），护栏照样要挡住。
+///
+/// 只读 `refs/remotes/<remote>/HEAD` 的话这里会直接放行——而这正是最该拦住的
+/// 场景：fork 工作流里 `upstream` 指的是别人的主仓库，本地 `main` 跟踪
+/// `upstream/main` 时**名字是对得上的**，[`find_remote_branch`] 那层修复
+/// 拦不住它，只剩这道护栏。
+#[test]
+fn refuses_to_delete_the_default_branch_of_a_remote_added_by_hand() {
+    let (remote, work) = repo_with_added_remote();
+    // 拿远程自己的 HEAD 当事实来源，不去猜 init.defaultBranch 是什么
+    let default_ref = git_out(remote.path(), &["symbolic-ref", "HEAD"]);
+    let default_branch = default_ref
+        .strip_prefix("refs/heads/")
+        .expect(&default_ref)
+        .to_string();
+
+    // 前提确认：本地确实没有这条 ref，纯靠它判断必然放行
+    assert!(
+        git_out(
+            work.path(),
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/remotes/origin/HEAD"
+            ]
+        )
+        .is_empty(),
+        "这个 fixture 的前提是本地没有 origin/HEAD 记录"
+    );
+
+    let err = ops::delete_remote_ref(p(&work), format!("origin/{default_branch}")).unwrap_err();
+    assert_eq!(err.code, "protected_branch", "{}", err.message);
+    assert!(
+        !git_out(
+            work.path(),
+            &["ls-remote", "--heads", "origin", &default_branch]
+        )
+        .is_empty(),
+        "默认分支被删掉了"
+    );
+}
+
+/// 护栏只挡默认分支，别的分支该删还是要删得掉。
+///
+/// 加护栏最容易犯的错是拦过头——真拦过头的话用户所有的删远程分支操作都废了，
+/// 而这条路径上没有 CI 会告诉我们。
+#[test]
+fn an_ordinary_branch_is_still_deletable_on_a_remote_without_a_head_ref() {
+    let (_remote, work) = repo_with_added_remote();
+    run_git(work.path(), &["checkout", "-q", "-b", "feat/ordinary"]);
+    commit(work.path(), "c2");
+    run_git(
+        work.path(),
+        &["push", "-q", "-u", "origin", "feat/ordinary"],
+    );
+    run_git(work.path(), &["checkout", "-q", "-"]);
+
+    ops::delete_remote_ref(p(&work), "origin/feat/ordinary".into()).unwrap();
+
+    assert!(git_out(
+        work.path(),
+        &["ls-remote", "--heads", "origin", "feat/ordinary"]
+    )
+    .is_empty());
 }
