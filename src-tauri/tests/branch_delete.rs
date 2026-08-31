@@ -71,6 +71,157 @@ fn finds_the_remote_branch_even_without_a_configured_upstream() {
     assert_eq!(info.remote_branch.as_deref(), Some("feat/y"));
 }
 
+/// 读一个分支实际配置的上游简称，没配就是 None。
+fn upstream_of(dir: &std::path::Path, branch: &str) -> Option<String> {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args([
+            "rev-parse",
+            "--abbrev-ref",
+            &format!("{branch}@{{upstream}}"),
+        ])
+        .output()
+        .expect("git not found");
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8(out.stdout).unwrap().trim().to_string())
+}
+
+fn current_branch(dir: &std::path::Path) -> String {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .expect("git not found");
+    assert!(out.status.success());
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// 从别的远程分支开出来的分支，upstream 指向的是**主干**，不是它自己。
+///
+/// `git checkout -b <name> origin/master` 会把 `branch.<name>.merge` 设成
+/// `refs/heads/master`（autoSetupMerge 的默认行为）。把 upstream 当成「这个
+/// 分支在远程上的副本」，删除弹框就会提议删 `origin/master`——真实仓库上撞了
+/// GitHub 的默认分支保护才没删成（`refusing to delete the current branch`）。
+/// 换成从 `origin/develop` 开出来的分支，`push --delete` 会**成功**，直接把
+/// 远程的 develop 删掉。
+#[test]
+fn a_branch_forked_from_another_remote_branch_does_not_offer_to_delete_that_branch() {
+    let (_remote, work) = repo_with_remote();
+    let trunk = current_branch(work.path());
+    let start = format!("origin/{trunk}");
+    // 显式钉住 autoSetupMerge：它默认就是 true，但开发者的全局 gitconfig 里把它
+    // 设成 false / simple 都不罕见，那样上游根本不会被设上，这个用例就会在前提
+    // 断言处失败，报出来的还是一句「git 行为变了」，把人往错误的方向指
+    run_git(
+        work.path(),
+        &[
+            "-c",
+            "branch.autoSetupMerge=true",
+            "checkout",
+            "-q",
+            "-b",
+            "chore/release-0.4.0",
+            &start,
+        ],
+    );
+    commit(work.path(), "c2");
+    run_git(work.path(), &["checkout", "-q", &trunk]);
+
+    // 前提确认：git 真的把上游设成了主干。这条塌了说明 git 行为变了，
+    // 后面几条断言也就失去意义
+    assert_eq!(
+        upstream_of(work.path(), "chore/release-0.4.0").as_deref(),
+        Some(start.as_str()),
+        "git 应当把 checkout -b <name> <remote-branch> 的上游设成起点"
+    );
+
+    let info = branch::delete_info(&p(&work), "chore/release-0.4.0").unwrap();
+    assert_eq!(
+        info.remote_branch, None,
+        "远程上没有同名分支，一条都不该提议删"
+    );
+    assert_eq!(info.upstream, None, "勾选框不该出现");
+    assert_eq!(info.remote, None);
+}
+
+/// 上一条的另一半：上游指向主干，但这个分支**确实**用自己的名字推上去过。
+///
+/// 这时勾选框该出现，指的必须是同名的那条远程分支。堵跨名删除时不能把这种
+/// 正常情况一起堵掉——`git push origin <name>`（不带 `-u`）不改上游配置，
+/// 从主干开出来的分支推完之后就是这个形态。
+#[test]
+fn a_forked_branch_pushed_under_its_own_name_offers_that_branch() {
+    let (_remote, work) = repo_with_remote();
+    let trunk = current_branch(work.path());
+    let start = format!("origin/{trunk}");
+    run_git(
+        work.path(),
+        &[
+            "-c",
+            "branch.autoSetupMerge=true",
+            "checkout",
+            "-q",
+            "-b",
+            "feat/forked",
+            &start,
+        ],
+    );
+    commit(work.path(), "c2");
+    // 不带 -u：上游仍是主干。autoSetupRemote 只在分支**没有**上游时才生效，
+    // 这里已经有一个（origin/主干），所以全局开着它也不影响这条断言
+    run_git(work.path(), &["push", "-q", "origin", "feat/forked"]);
+    run_git(work.path(), &["checkout", "-q", &trunk]);
+
+    assert_eq!(
+        upstream_of(work.path(), "feat/forked").as_deref(),
+        Some(start.as_str())
+    );
+
+    let info = branch::delete_info(&p(&work), "feat/forked").unwrap();
+    assert_eq!(info.upstream.as_deref(), Some("origin/feat/forked"));
+    assert_eq!(info.remote.as_deref(), Some("origin"));
+    assert_eq!(info.remote_branch.as_deref(), Some("feat/forked"));
+}
+
+/// 远程的默认分支不给「同时删远程」这个勾选框。
+///
+/// 后端护栏会拦下这一刀，但那是**在删 worktree 之后**才发生的：
+/// `handleDeleteBranch` 的顺序是 worktree → 远程 → 本地分支，勾选框放着不管的话
+/// 用户会看到目录被搬走、标签被关掉，然后才收到一句「不能删」。必然失败的选项
+/// 一开始就不该摆出来。
+#[test]
+fn does_not_offer_to_delete_the_remotes_default_branch() {
+    let (_remote, work) = repo_with_remote();
+    let trunk = current_branch(work.path());
+    // clone 会写下 refs/remotes/origin/HEAD，`git remote add` 不会——补上它，
+    // 让这个 fixture 长得像一个 clone 出来的仓库
+    run_git(work.path(), &["remote", "set-head", "origin", "-a"]);
+    run_git(work.path(), &["checkout", "-q", "-b", "somewhere-else"]);
+
+    let info = branch::delete_info(&p(&work), &trunk).unwrap();
+    let expected_upstream = format!("origin/{trunk}");
+    // 上游本身照报——界面要能说清楚「有远程分支，但不给删」，而不是装作没有
+    assert_eq!(info.upstream.as_deref(), Some(expected_upstream.as_str()));
+    assert!(info.remote_protected, "远程默认分支必须标成不可删");
+}
+
+/// 别把普通分支一起标了——标过头的话所有「同时删远程」都废了。
+#[test]
+fn an_ordinary_branch_is_not_marked_protected() {
+    let (_remote, work) = repo_with_remote();
+    run_git(work.path(), &["remote", "set-head", "origin", "-a"]);
+    run_git(work.path(), &["checkout", "-q", "-b", "feat/plain"]);
+    commit(work.path(), "c2");
+    run_git(work.path(), &["push", "-q", "-u", "origin", "feat/plain"]);
+    run_git(work.path(), &["checkout", "-q", "-"]);
+
+    let info = branch::delete_info(&p(&work), "feat/plain").unwrap();
+    assert_eq!(info.remote_branch.as_deref(), Some("feat/plain"));
+    assert!(!info.remote_protected);
+}
+
 #[test]
 fn a_purely_local_branch_has_no_remote() {
     let (_remote, work) = repo_with_remote();

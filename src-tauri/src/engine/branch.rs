@@ -24,6 +24,15 @@ pub struct DeleteInfo {
     /// 不让前端去切 `origin/feat/x` 这个字符串：远程名本身可以带斜杠，
     /// 按第一个 `/` 切会把分支名切错。
     pub remote_branch: Option<String>,
+    /// 上面那条远程分支是该远程的**默认分支**，界面不该提供「同时删远程」。
+    ///
+    /// 后端护栏（[`ensure_deletable_on_remote`]）会拦下这一刀，但那太晚了：
+    /// 前端的删除顺序是 worktree → 远程 → 本地分支，勾选框放着不管的话用户会
+    /// 先看到 worktree 目录被搬走、标签被关掉，然后才收到一句「不能删」。
+    ///
+    /// 判据只查本地的 `refs/remotes/<remote>/HEAD`（弹框那条路径上不能走网络），
+    /// 所以是**尽力而为**：查不到就是 false，勾选框照常出现，届时由护栏兜底。
+    pub remote_protected: bool,
     /// 有多少提交只在这个分支上、不在 [`compared_to`](Self::compared_to) 上。
     ///
     /// 界面拿它提示「删了就找不回来」。语义对齐 `git branch -d` 的判断：
@@ -53,11 +62,22 @@ pub struct DeleteInfo {
     pub worktree: Option<WorktreeTarget>,
 }
 
-/// 找出这个分支对应的远程分支。
+/// 找出这个分支在远程上的**同名副本**。
 ///
-/// 先看配置的上游；没配上游时再扫一遍各个远程下的同名引用——用
-/// `git push` 而不是 `git push -u` 推上去的分支就属于这种，
-/// 光看上游会以为它没有远程分支，勾选框就不会出现。
+/// 返回值的用途只有一个：删本地分支时顺手把远程那条也删掉。所以这里要的不是
+/// 「我从哪儿 pull」，而是「远程上哪条 ref 是这个分支自己」，两者不是一回事。
+///
+/// **不能直接采信配置的上游。** `git checkout -b <name> origin/master` 会把
+/// `branch.<name>.merge` 设成 `refs/heads/master`（autoSetupMerge 的默认行为），
+/// 上游因此指向主干而不是这个分支自己。真实仓库上踩过：删 `chore/release-0.4.0`
+/// 时弹框提议删的是 `origin/master`，`push --delete` 真发出去了，靠 GitHub 的
+/// 默认分支保护（`refusing to delete the current branch`）才没删成——起点换成
+/// `origin/develop` 这类非默认分支的话，那一下会成功。
+///
+/// 所以上游只在**远程侧的名字和本地分支同名**时才采纳；不同名就当它没提供
+/// 任何信息，落到下面扫各远程同名 ref 的兜底。兜底本身也是必要的：用
+/// `git push` 而不是 `git push -u` 推上去的分支根本没有上游配置，只看上游会以为
+/// 它没有远程分支，勾选框就不会出现。
 fn find_remote_branch(repo: &Repository, short: &str) -> Option<(String, String, String)> {
     let full = format!("refs/heads/{short}");
 
@@ -69,11 +89,13 @@ fn find_remote_branch(repo: &Repository, short: &str) -> Option<(String, String,
                     .ok()
                     .and_then(|buf| buf.as_str().map(|s| s.to_string()));
                 if let Some(remote) = remote {
-                    let on_remote = shorthand
-                        .strip_prefix(&format!("{remote}/"))
-                        .unwrap_or(short)
-                        .to_string();
-                    return Some((shorthand.to_string(), remote, on_remote));
+                    // 前缀切不掉就说明这个上游根本不属于它自称的那个远程，
+                    // 同样按「拿不到可信信息」处理，交给下面的兜底
+                    if let Some(on_remote) = shorthand.strip_prefix(&format!("{remote}/")) {
+                        if on_remote == short {
+                            return Some((shorthand.to_string(), remote, on_remote.to_string()));
+                        }
+                    }
                 }
             }
         }
@@ -327,6 +349,73 @@ pub fn split_remote_ref(path: &str, remote_ref: &str) -> Result<(String, String)
     })
 }
 
+/// 本地记下的「这个远程的默认分支」——`refs/remotes/<remote>/HEAD` 指向谁。
+///
+/// **信不太过。** 这条 ref 只有 clone 会写、只有 `git remote set-head` 会更新，
+/// 所以它可能过期（远程把 master 改名成 main 之后本地还指着 master），也可能
+/// 压根不存在（`git remote add` 接上来的远程就没有）；它还可能是条直接 ref
+/// 而不是符号 ref，那样 `symbolic_target` 会返回 None。
+///
+/// 因此它只用在两个地方：一是弹框打开时的界面提示（那条路径上不能走网络），
+/// 二是 [`ensure_deletable_on_remote`] 问不到远程时的兜底。
+fn remote_default_branch(repo: &Repository, remote: &str) -> Option<String> {
+    let head = repo
+        .find_reference(&format!("refs/remotes/{remote}/HEAD"))
+        .ok()?;
+    head.symbolic_target()?
+        .strip_prefix(&format!("refs/remotes/{remote}/"))
+        .map(|s| s.to_string())
+}
+
+/// 直接问远程：你的 HEAD 指着哪条分支。
+///
+/// 输出形如 `ref: refs/heads/main\tHEAD`，后面还跟一行 oid，只取符号引用那行。
+/// 问不到（断网、没权限、远程 URL 是坏的）就是 None——那种情况下紧接着的
+/// `push` 本来也发不出去。
+fn remote_default_branch_from_network(path: &str, remote: &str) -> Option<String> {
+    let out =
+        crate::engine::git_cli::run_git(path, &["ls-remote", "--symref", remote, "HEAD"]).ok()?;
+    out.lines()
+        .find_map(|line| line.strip_prefix("ref: "))
+        .and_then(|rest| rest.split('\t').next())
+        .and_then(|r| r.strip_prefix("refs/heads/"))
+        .map(|s| s.to_string())
+}
+
+/// 删远程分支之前拦一道：远程的默认分支一律不给删。
+///
+/// 不能把这个判断外包给服务端。GitHub 确实会用 `refusing to delete the current
+/// branch` 挡住默认分支，但那是**运气**：自建的 Gitea / 裸仓库未必配了这条
+/// 拒绝规则，而且受保护的只有默认分支一条，删错成别的分支照样成功。
+///
+/// 这道护栏防的是「算错了要删哪条分支」这一类 bug——[`find_remote_branch`] 就
+/// 出过一次（把 upstream 当成同名远程分支，删 `chore/release-0.4.0` 时提议删
+/// `origin/master`）。那个具体的缺陷已经修掉，但代价是不对称的：拦错了用户去
+/// 命令行删一次就完事，放过了是别人的主干没了。
+///
+/// **先问远程，本地 ref 只当兜底。** 反过来的话 [`remote_default_branch`] 的
+/// 两个毛病会正好落在最坏的地方：`git remote add` 加的远程（fork 工作流里的
+/// `upstream`，也就是别人的主仓库）根本没有那条 ref，护栏直接放行；本地 ref
+/// 过期时护栏还会去保护一个已经不存在的旧名字，把现役的默认分支放过去。这里
+/// 多花的一次 ls-remote 往返，相对紧接着那次 push 可以忽略。
+///
+/// 两条路都问不出来时**放行**：这时候要么是断网（push 一样会失败），要么这个
+/// 远程真的没有默认分支，没有依据就不该拦着用户干活。
+pub fn ensure_deletable_on_remote(path: &str, remote: &str, branch: &str) -> Result<()> {
+    let default = remote_default_branch_from_network(path, remote).or_else(|| {
+        Repository::open(path)
+            .ok()
+            .and_then(|repo| remote_default_branch(&repo, remote))
+    });
+    if default.as_deref() == Some(branch) {
+        return Err(crate::error::GitError::new(
+            "protected_branch",
+            format!("{branch} 是 {remote} 的默认分支，不能删除。确实要删请在命令行操作。"),
+        ));
+    }
+    Ok(())
+}
+
 /// 远程分支该检出成哪个本地分支名，以及这个本地分支是不是已经存在。
 pub fn local_target_for(path: &str, remote_ref: &str) -> Result<(String, bool)> {
     let (_, local) = split_remote_ref(path, remote_ref)?;
@@ -341,6 +430,14 @@ pub fn delete_info(path: &str, name: &str) -> Result<DeleteInfo> {
     let (upstream, remote, remote_branch) = match find_remote_branch(&repo, name) {
         Some((u, r, b)) => (Some(u), Some(r), Some(b)),
         None => (None, None, None),
+    };
+
+    // 只查本地那条 ref，不走网络：这个函数是右键弹框打开时同步调的，
+    // 那条路径上加一次 ls-remote 往返就是几百毫秒的白屏。
+    // 查不到时勾选框照常出现，真正的护栏在 ensure_deletable_on_remote
+    let remote_protected = match (&remote, &remote_branch) {
+        (Some(r), Some(b)) => remote_default_branch(&repo, r).as_deref() == Some(b.as_str()),
+        _ => false,
     };
 
     // 算不出来就当作「零个未合并、目标是 HEAD」：这两项只用于多显示一行提示，
@@ -393,6 +490,7 @@ pub fn delete_info(path: &str, name: &str) -> Result<DeleteInfo> {
         upstream,
         remote,
         remote_branch,
+        remote_protected,
         unmerged,
         compared_to,
         content_merged,

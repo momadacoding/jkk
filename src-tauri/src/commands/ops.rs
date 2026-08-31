@@ -117,6 +117,8 @@ pub fn branch_delete_info(path: String, name: String) -> Result<crate::engine::b
 
 #[tauri::command(async)]
 pub fn delete_remote_branch(path: String, remote: String, branch: String) -> Result<()> {
+    // 护栏放在 push 之前：默认分支删掉就没了，不能等服务端心情好才挡
+    crate::engine::branch::ensure_deletable_on_remote(&path, &remote, &branch)?;
     run_git(&path, &["push", &remote, "--delete", &branch])?;
     Ok(())
 }
