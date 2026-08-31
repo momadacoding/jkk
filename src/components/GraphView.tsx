@@ -1,5 +1,6 @@
 import { useMemo, useRef, useState, useCallback, useEffect } from 'react'
-import type { CommitNode, RefPointer } from '../engine/types'
+import type { CommitNode, PullRequest, RefPointer } from '../engine/types'
+import { indexPullRequestsByBranch } from '../engine/prs'
 import { computeLayout } from '../engine/layout'
 import { computePaths, filterPathsToBand, laneColor } from '../engine/paths'
 import { createSvgRenderer } from '../engine/svgRenderer'
@@ -15,6 +16,8 @@ const OVERSCAN = 5
 interface GraphViewProps {
   commits: CommitNode[]
   refs: RefPointer[]
+  /** 当前仓库的 open PR，用来在分支标签上带出编号。读不到时是空数组。 */
+  pullRequests: PullRequest[]
   selectedId: string | null
   onSelect: (id: string) => void
   /** 当前 HEAD 的完整 oid（不是分支名），用来挂工作区伪行。 */
@@ -30,12 +33,16 @@ interface GraphViewProps {
 const renderer = createSvgRenderer()
 
 export function GraphView({
-  commits, refs, selectedId, onSelect, headHash, changeCount, onOpenChanges, onCommitAction,
+  commits, refs, pullRequests, selectedId, onSelect, headHash, changeCount, onOpenChanges, onCommitAction,
 }: GraphViewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const { menu, open, close } = useContextMenu()
   const [scrollTop, setScrollTop] = useState(0)
   const [viewportHeight, setViewportHeight] = useState(600)
+
+  // 索引建一次，供视口内每一行的每个标签查。虚拟滚动下几十行同时在场，
+  // 每行都遍历一遍 PR 列表是白费力气
+  const prByBranch = useMemo(() => indexPullRequestsByBranch(pullRequests), [pullRequests])
 
   // 布局与路径对全量历史只算一次：父 commit 可能在视口外，线段必须完整生成，
   // 渲染阶段才按条带过滤（见下方 svg memo）。颜色按 lane 分配，与视口无关。
@@ -189,6 +196,7 @@ export function GraphView({
               key={node.commit.id}
               node={node}
               refs={refByHash[node.commit.id] ?? []}
+              prByBranch={prByBranch}
               selected={selectedId === node.commit.id}
               layoutWidth={layoutWidth}
               laneColor={laneColor(node.lane)}

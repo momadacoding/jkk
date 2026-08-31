@@ -2,6 +2,7 @@ pub mod custom;
 pub mod diff;
 pub mod graph;
 pub mod ops;
+pub mod pr;
 pub mod remote;
 pub mod repo;
 pub mod session;

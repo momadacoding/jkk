@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
-import type { RefPointer } from '../engine/types'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import type { PullRequest, RefPointer } from '../engine/types'
+import { indexPullRequestsByBranch, prBadge, pullRequestForRef } from '../engine/prs'
 import { ContextMenu, useContextMenu } from './ContextMenu'
 import { SidebarSection, SidebarGroup } from './SidebarSection'
 import { usePrompt } from './PromptDialog'
@@ -8,6 +9,12 @@ import { useConfirm } from './ConfirmDialog'
 
 interface BranchViewProps {
   refs: RefPointer[]
+  /**
+   * 当前仓库的 open PR，用来在本地分支旁打编号徽章。
+   *
+   * 读不到（没装 gh、没登录、不是 GitHub 仓库）时是空数组，界面上就是没有徽章。
+   */
+  pullRequests: PullRequest[]
   head: string
   /** 当前选中的分支（仅用于高亮与定位，不改工作区）。 */
   selectedBranch: string | null
@@ -61,8 +68,23 @@ function SyncBadge({ ahead, behind }: { ahead: number | null; behind: number | n
   )
 }
 
+/**
+ * PR 编号微徽章。分支上没有可显示的 PR（undefined）时什么都不画。
+ *
+ * `branchHash` 是本地分支的 tip，用来区分「已全部合并」和「合并后又长了提交」。
+ */
+function PrBadge({ pr, branchHash }: { pr: PullRequest | undefined; branchHash: string }) {
+  if (!pr) return null
+  const badge = prBadge(pr, branchHash)
+  return (
+    <span className={`sb-pr ${badge.variant}`} title={badge.tooltip}>
+      {badge.label}
+    </span>
+  )
+}
+
 export function BranchView({
-  refs, head, selectedBranch, onSelect, onCheckout, onCreate, onRename, onDelete,
+  refs, pullRequests, head, selectedBranch, onSelect, onCheckout, onCreate, onRename, onDelete,
   onCheckoutRemote, onDeleteRemote, repoPath,
 }: BranchViewProps) {
   const [creating, setCreating] = useState(false)
@@ -75,6 +97,8 @@ export function BranchView({
   const { confirm, dialog: confirmDialog } = useConfirm()
   const local = refs.filter((r) => r.kind === 'branch')
   const remote = refs.filter((r) => r.kind === 'remote')
+  // 分支多的仓库里每行都遍历一遍 PR 列表是白费力气，建一次索引就够
+  const prByBranch = useMemo(() => indexPullRequestsByBranch(pullRequests), [pullRequests])
 
   // 展开输入框却不聚焦的话，用户得多点一次才能打字
   useEffect(() => { if (creating) inputRef.current?.focus() }, [creating])
@@ -195,6 +219,7 @@ export function BranchView({
             >
               <BranchIcon />
               <span className="sb-label">{name}</span>
+              <PrBadge pr={pullRequestForRef(prByBranch, ref)} branchHash={ref.hash} />
               <SyncBadge ahead={ref.ahead} behind={ref.behind} />
               {name === head && <span className="sb-current-dot" title="当前分支" />}
             </div>

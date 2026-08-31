@@ -39,6 +39,7 @@ pub fn run() {
             commands::ops::save_patch,
             commands::ops::stage,
             commands::ops::unstage,
+            commands::pr::list_pull_requests,
             commands::remote::fetch,
             commands::remote::pull,
             commands::remote::push,

@@ -110,3 +110,33 @@ export interface StashEntry {
   /** 父提交。stash 是个 merge 提交，第一父是 stash 时所在的那个提交。 */
   parents: string[]
 }
+
+/**
+ * 一条 open 状态的 GitHub Pull Request，字段对齐 `gh pr list --json` 的输出。
+ *
+ * 它不是 git 的概念，所以刻意不挂进 [`RefPointer`]：PR 走的是另一条会失败、
+ * 会超时的网络通道，塞进 graph 数据结构会让本地读图也背上网络状态。
+ */
+export interface PullRequest {
+  number: number
+  /** PR 的来源分支名，不带 refs/heads/ 前缀，如 `feat/x`。 */
+  headRefName: string
+  title: string
+  isDraft: boolean
+  /**
+   * gh 原样返回的状态。
+   *
+   * `CLOSED` 指**关闭但没合并**，与 `MERGED` 是两回事——git 客户端里把这两者
+   * 混为一谈会给出完全相反的暗示（「可以删分支了」vs「这活白干了」）。
+   */
+  state: 'OPEN' | 'MERGED' | 'CLOSED'
+  /**
+   * PR 的 head 分支在**合并时**的提交 oid。
+   *
+   * 和本地分支的 tip 一比，就知道 PR 合并之后分支有没有继续往前走。没有这个
+   * 判断的话，一条「合并后又加了提交」的分支会被画成普通的 ✓——照着它删分支
+   * 会把那些提交一起删掉。
+   */
+  headRefOid: string
+  url: string
+}

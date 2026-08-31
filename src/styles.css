@@ -443,6 +443,39 @@ body {
   border-left: 4px solid #4fc3f7;
 }
 
+/* 分支标签里内嵌的 PR 编号。
+   不另起一个 pill：那要多一份内边距和间隙，而这一行还挤着提交信息、作者、
+   hash 和日期。左边那点 margin 是必须的，`worktree-pr-badge#37` 会连成一坨。
+   注意底色继承自分支 pill 的车道色，所以这里只调字色和字重，不再铺一层背景。
+
+   下面三个颜色是按对比度算出来的，不是挑好看的：pill 底色是**车道色**的 22%
+   叠加，12 条车道各不相同，最差的一条是黄色 `#fff176`（选中行上更亮）。
+   在那条车道上，最初试的 `#7ee08a` / `#9aa4ae` 只有 4.05 / 2.60——draft 连次要
+   信息的 3.0 都不到。现在这三个值最差 4.53 / 4.57 / 4.60，都过 WCAG AA 的 4.5，
+   同时仍明显弱于分支名本身（最差 5.96）。改色前请重算，不要凭眼睛在单一车道上判断。 */
+.ref-pill-pr {
+  margin-left: 5px;
+  color: #9ae8a4;
+  font-weight: 600;
+}
+
+/* draft PR 还没准备好被 review。用中性灰而不是压暗——压暗在亮车道上直接看不清 */
+.ref-pill-pr.draft {
+  color: #d0d8e0;
+}
+
+/* 已合并：分支还在，但内容早就进主干了。
+   颜色在这里**当不了唯一的区分手段**——能过对比度的紫已经淡到跟上面那个灰
+   分不开（再深一档只有 4.41）。真正承担区分的是 prBadge 加的 `✓` 前缀，
+   这一路对色盲也成立。这里的浅紫只是辅助。
+
+   merged-ahead（PR 合了但分支又长了提交）沿用同一个紫：它和 merged 的区别由
+   标签末尾的 `↑` 表达，再引入第四种颜色只会让 24 种车道组合的对比度更难保证。 */
+.ref-pill-pr.merged,
+.ref-pill-pr.merged-ahead {
+  color: #e2d0fc;
+}
+
 /* 远程分支：无色条、低饱和，明确弱于本地分支一档 */
 .ref-pill.remote {
   background: #34383c;
@@ -1142,6 +1175,40 @@ body {
 
 .sb-sync-behind {
   color: #e5a15c;
+}
+
+/* PR 编号徽章。
+   给了底色而不是像 ↑↓ 那样用纯文字：`#36` 紧挨着分支名时会被读成名字的一部分，
+   一个色块才能把它切开。
+   注意它**不跟着 .sb-sync 一起在 hover 时隐藏**——PR 标题只挂在 title 上，
+   一 hover 就消失的话那个提示永远看不到。分支行里也没有行内操作按钮要抢位置。 */
+.sb-pr {
+  flex-shrink: 0;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: rgba(63, 185, 80, 0.16);
+  color: #56c964;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 15px;
+}
+
+/* draft PR 还没准备好被 review。颜色是这里唯一的区分手段——
+   徽章上再挤不下一个 "draft" 字样了。
+   字色比直觉的更亮：hover / selected 行会在底下再叠一层 10% 白，
+   原来的 #a2aab4 在那种状态下只有 4.04，够不上 AA 的 4.5。 */
+.sb-pr.draft {
+  background: rgba(139, 148, 158, 0.18);
+  color: #b0b8c2;
+}
+
+/* 已合并：分支还在，但内容早就进主干了——通常意味着这条分支可以删了。
+   这里的底色由我们自己定，不像 graph 那样受车道色摆布，所以紫可以更饱和一档
+   （实测最差 5.08）。`✓` 前缀仍然照打，两处形态保持一致。 */
+.sb-pr.merged,
+.sb-pr.merged-ahead {
+  background: rgba(137, 87, 224, 0.20);
+  color: #c8a8f5;
 }
 
 .sb-current-dot {
