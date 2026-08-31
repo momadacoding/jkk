@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { indexPullRequestsByBranch, prBadgeLabel, prBadgeVariant, pullRequestForRef } from '../../src/engine/prs'
+import { indexPullRequestsByBranch, prBadge, pullRequestForRef } from '../../src/engine/prs'
 import type { PullRequest, RefPointer } from '../../src/engine/types'
 
 const pr = (number: number, headRefName: string, extra: Partial<PullRequest> = {}): PullRequest => ({
@@ -8,11 +8,12 @@ const pr = (number: number, headRefName: string, extra: Partial<PullRequest> = {
   title: `PR ${number}`,
   isDraft: false,
   state: 'OPEN',
+  headRefOid: 'f'.repeat(40),
   url: `https://github.com/o/r/pull/${number}`,
   ...extra,
 })
-const merged = (number: number, headRefName: string): PullRequest =>
-  pr(number, headRefName, { state: 'MERGED' })
+const merged = (number: number, headRefName: string, headRefOid = 'f'.repeat(40)): PullRequest =>
+  pr(number, headRefName, { state: 'MERGED', headRefOid })
 const closed = (number: number, headRefName: string): PullRequest =>
   pr(number, headRefName, { state: 'CLOSED' })
 
@@ -99,35 +100,63 @@ describe('indexPullRequestsByBranch', () => {
   })
 })
 
-describe('prBadgeVariant', () => {
-  it('open PR 是 open', () => {
-    expect(prBadgeVariant(pr(1, 'a'))).toBe('open')
+describe('prBadge', () => {
+  const MERGED_AT = 'ac6e785eb547aadf74ff83993fe44b231aaf9b8a'
+  const MOVED_ON = '6e6f014513cd3cc520cfa3838228517af47ad3ef'
+
+  it('open PR：绿色，只显示编号', () => {
+    const badge = prBadge(pr(37, 'a'), MERGED_AT)
+    expect(badge.variant).toBe('open')
+    expect(badge.label).toBe('#37')
   })
 
-  it('draft PR 是 draft', () => {
-    expect(prBadgeVariant(pr(1, 'a', { isDraft: true }))).toBe('draft')
-  })
-
-  it('merged PR 是 merged', () => {
-    expect(prBadgeVariant(merged(1, 'a'))).toBe('merged')
+  it('draft PR：灰色，只显示编号', () => {
+    expect(prBadge(pr(37, 'a', { isDraft: true }), MERGED_AT).variant).toBe('draft')
   })
 
   it('merged 压过 isDraft——已合并就不再是草稿了', () => {
     // gh 不该给出这种组合，但真给了也不能显示成灰色草稿
-    expect(prBadgeVariant(pr(1, 'a', { state: 'MERGED', isDraft: true }))).toBe('merged')
-  })
-})
-
-describe('prBadgeLabel', () => {
-  it('open 与 draft 只显示编号', () => {
-    expect(prBadgeLabel(pr(37, 'a'))).toBe('#37')
-    expect(prBadgeLabel(pr(37, 'a', { isDraft: true }))).toBe('#37')
+    expect(prBadge(pr(1, 'a', { state: 'MERGED', isDraft: true })).variant).toBe('merged')
   })
 
-  it('merged 带 ✓ 前缀', () => {
+  it('分支头就停在合并点上：✓ 前缀，表示内容全在主干', () => {
     // 颜色不能是唯一的区分手段：pill 底色是车道色，紫字在黄色车道上淡到
     // 与 draft 灰分不开（实测最高 4.41）；符号这一路对色盲也成立
-    expect(prBadgeLabel(merged(33, 'a'))).toBe('✓#33')
+    const badge = prBadge(merged(33, 'a', MERGED_AT), MERGED_AT)
+    expect(badge.variant).toBe('merged')
+    expect(badge.label).toBe('✓#33')
+  })
+
+  it('PR 合并后分支又长了提交：必须区别对待，否则照着 ✓ 删分支会丢东西', () => {
+    // 真实案例：PR #20 合并于 ac6e785，之后分支上又加了 6e6f014，
+    // 而那个提交不在 master 里。画成 ✓ 等于告诉用户「可以删了」。
+    const badge = prBadge(merged(20, 'a', MERGED_AT), MOVED_ON)
+    expect(badge.variant).toBe('merged-ahead')
+    expect(badge.label).toBe('✓#20↑')
+  })
+
+  it('merged-ahead 的提示要把两个 SHA 都说出来', () => {
+    const tip = prBadge(merged(20, 'a', MERGED_AT), MOVED_ON).tooltip
+    expect(tip).toContain('ac6e785')
+    expect(tip).toContain('6e6f014')
+  })
+
+  it('拿不到分支头时退回普通 merged，不瞎猜', () => {
+    expect(prBadge(merged(33, 'a', MERGED_AT)).variant).toBe('merged')
+  })
+
+  it('gh 没给 headRefOid 时退回普通 merged', () => {
+    // 老版本 gh 或字段缺失：宁可少一个提示，也不能凭空报警
+    expect(prBadge(merged(33, 'a', ''), MOVED_ON).variant).toBe('merged')
+  })
+
+  it('SHA 比较不分大小写', () => {
+    expect(prBadge(merged(33, 'a', MERGED_AT.toUpperCase()), MERGED_AT).variant).toBe('merged')
+  })
+
+  it('open PR 的分支头对不上也还是 open', () => {
+    // 那种情况已经由分支行上的 ahead/behind 徽章表达了，不重复报警
+    expect(prBadge(pr(37, 'a', { headRefOid: MERGED_AT }), MOVED_ON).variant).toBe('open')
   })
 })
 

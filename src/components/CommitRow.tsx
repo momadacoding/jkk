@@ -1,6 +1,6 @@
 import type { LayoutNode, RefPointer } from '../engine/graphTypes'
 import type { PullRequest } from '../engine/types'
-import { prBadgeLabel, prBadgeVariant, prTooltip, pullRequestForRef } from '../engine/prs'
+import { prBadge, pullRequestForRef } from '../engine/prs'
 import { laneTint } from '../engine/paths'
 import { WORKDIR_ID } from '../engine/workdir'
 import { shortHash } from '../engine/commitActions'
@@ -67,6 +67,9 @@ export function CommitRow({
         {visible.map((ref) => {
           // 只有本地分支拿得到编号，判定在 engine 里，见 pullRequestForRef
           const pr = pullRequestForRef(prByBranch, ref)
+          // ref.hash 就是这一行的提交，也就是该分支的 tip——正好是判断
+          // 「PR 合并之后分支有没有再往前走」需要的那个值
+          const badge = pr ? prBadge(pr, ref.hash) : undefined
           return (
             <span
               key={ref.name}
@@ -75,15 +78,13 @@ export function CommitRow({
               style={ref.kind === 'branch'
                 ? { borderLeftColor: laneColor, background: laneTint(laneColor, 0.22) }
                 : undefined}
-              title={pr ? `${ref.name}\n${prTooltip(pr)}` : ref.name}
+              title={badge ? `${ref.name}\n${badge.tooltip}` : ref.name}
             >
               {shortName(ref.name)}
               {/* 编号内嵌在同一个 pill 里：另起一个 pill 要多一份边距和间隙，
                   而这一行还挤着提交信息、作者、hash 和日期 */}
-              {pr && (
-                <span className={`ref-pill-pr ${prBadgeVariant(pr)}`}>
-                  {prBadgeLabel(pr)}
-                </span>
+              {badge && (
+                <span className={`ref-pill-pr ${badge.variant}`}>{badge.label}</span>
               )}
             </span>
           )

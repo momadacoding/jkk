@@ -4,48 +4,77 @@ import type { PullRequest, RefPointer } from './types'
 const LOCAL_BRANCH_PREFIX = 'refs/heads/'
 
 /**
- * 徽章的三种形态。CLOSED（关闭未合并）不在其中，它根本不显示。
- */
-export type PrBadgeVariant = 'open' | 'draft' | 'merged'
-
-/**
- * 一条 PR 该画成哪种徽章。
+ * 徽章的形态。CLOSED（关闭未合并）不在其中，它根本不显示。
  *
- * `MERGED` 压过 `isDraft`：gh 不该给出「已合并的草稿」，但真给了也不能显示成
- * 灰色草稿——那会让一条已经进主干的分支看起来还没开始 review。
+ * `merged-ahead` 是 `merged` 的危险变体：PR 合并之后分支上又长了提交。
+ * 两者必须分开——把它画成普通的 ✓ 等于告诉用户「可以删了」，而那会丢东西。
  */
-export function prBadgeVariant(pr: PullRequest): PrBadgeVariant {
-  if (pr.state === 'MERGED') return 'merged'
-  return pr.isDraft ? 'draft' : 'open'
+export type PrBadgeVariant = 'open' | 'draft' | 'merged' | 'merged-ahead'
+
+/** 徽章渲染需要的全部东西。组件只调 [`prBadge`] 一次，不各自拼字符串。 */
+export interface PrBadgeView {
+  variant: PrBadgeVariant
+  /** 徽章上的文字，如 `#37`、`✓#33`、`✓#20↑`。 */
+  label: string
+  /** 悬停提示。 */
+  tooltip: string
+}
+
+/** 取前 7 位，和界面上别处显示 hash 的长度一致。 */
+const shortOid = (oid: string) => oid.slice(0, 7)
+
+function variantOf(pr: PullRequest, branchHash?: string): PrBadgeVariant {
+  // MERGED 压过 isDraft：gh 不该给出「已合并的草稿」，但真给了也不能显示成
+  // 灰色草稿——那会让一条已经进主干的分支看起来还没开始 review
+  if (pr.state !== 'MERGED') return pr.isDraft ? 'draft' : 'open'
+
+  // 分支头还停在合并点上吗？`headRefOid` 是 PR **合并时**的分支头，
+  // 和本地分支的 tip 一比就知道分支有没有继续往前走。
+  //
+  // 两个都拿得到才敢下判断：老版本 gh 可能没有这个字段，远程分支标签也没有
+  // 对应的本地 tip。宁可少一个提示，也不能凭空报警。
+  if (!branchHash || !pr.headRefOid) return 'merged'
+  return branchHash.toLowerCase() === pr.headRefOid.toLowerCase() ? 'merged' : 'merged-ahead'
+
+  // 只对 MERGED 做这个判断。open PR 的分支头对不上意味着有没推上去的提交，
+  // 那件事分支行上的 ahead/behind 徽章已经在说了，不重复报警。
 }
 
 /**
- * 徽章上的文字。
+ * 算出一条 PR 在分支上该画成什么样。
  *
- * merged 带一个 `✓` 前缀，**这不是装饰**。graph 里徽章的底色是车道色，12 条
- * 车道各不相同；紫色在最亮的黄色车道上淡到与 draft 灰分不开（实测最高只能到
- * 4.41，再深就过不了对比度）。颜色在这里当不了唯一的区分手段，符号才能，
- * 而且这一路对色盲同样成立。
- */
-export function prBadgeLabel(pr: PullRequest): string {
-  return prBadgeVariant(pr) === 'merged' ? `✓#${pr.number}` : `#${pr.number}`
-}
-
-/** 徽章形态到 tooltip 措辞。 */
-const VARIANT_TITLE: Record<PrBadgeVariant, string> = {
-  open: 'PR',
-  draft: 'Draft PR',
-  merged: '已合并的 PR',
-}
-
-/**
- * 徽章的悬停提示。
+ * `branchHash` 是**本地分支的 tip**（`RefPointer.hash`）。它只用来区分
+ * merged 与 merged-ahead，其余形态不需要。
  *
- * 光一个 `#37` 说不清是哪个 PR，标题必须能看到；merged 还要说清状态，
- * 否则用户会以为那是一个还开着的 PR。
+ * 标签里的 `✓` 和 `↑` **不是装饰**：graph 里徽章的底色是车道色，12 条车道各不
+ * 相同；能过对比度的紫已经淡到与 draft 灰分不开（实测最高 4.41）。颜色在这里
+ * 当不了唯一的区分手段，符号才能，而且这一路对色盲同样成立。`↑` 沿用侧边栏
+ * ahead 徽章的箭头，在这个界面里已经是「本地还领先」的意思。
  */
-export function prTooltip(pr: PullRequest): string {
-  return `${VARIANT_TITLE[prBadgeVariant(pr)]} #${pr.number}: ${pr.title}`
+export function prBadge(pr: PullRequest, branchHash?: string): PrBadgeView {
+  const variant = variantOf(pr, branchHash)
+  switch (variant) {
+    case 'merged':
+      return {
+        variant,
+        label: `✓#${pr.number}`,
+        tooltip: `已合并的 PR #${pr.number}: ${pr.title}\n分支内容已全部进入主干。`,
+      }
+    case 'merged-ahead':
+      return {
+        variant,
+        label: `✓#${pr.number}↑`,
+        // 两个 SHA 都要说出来，否则用户没法自己核对「到底多了什么」
+        tooltip:
+          `已合并的 PR #${pr.number}: ${pr.title}\n` +
+          `合并的是 ${shortOid(pr.headRefOid)}，本地分支已经走到 ${shortOid(branchHash ?? '')}——` +
+          `还有提交不在这个 PR 里，删分支前先确认。`,
+      }
+    case 'draft':
+      return { variant, label: `#${pr.number}`, tooltip: `Draft PR #${pr.number}: ${pr.title}` }
+    default:
+      return { variant, label: `#${pr.number}`, tooltip: `PR #${pr.number}: ${pr.title}` }
+  }
 }
 
 /** OPEN 优先于 MERGED。数字越大越优先，CLOSED 直接出局。 */

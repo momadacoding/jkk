@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::process::Command;
 
 /// 向 gh 索要的字段，和 [`PullRequest`] 一一对应。
-const PR_FIELDS: &str = "number,headRefName,title,isDraft,state,url";
+const PR_FIELDS: &str = "number,headRefName,headRefOid,title,isDraft,state,url";
 
 /// 每种状态各取多少条。
 ///
@@ -33,6 +33,15 @@ pub struct PullRequest {
     pub number: u64,
     /// PR 的来源分支名，不带 `refs/heads/` 前缀。前端拿它和本地分支精确匹配。
     pub head_ref_name: String,
+    /// head 分支在**合并时**的提交 oid。
+    ///
+    /// 前端拿它和本地分支的 tip 比，判断 PR 合并之后分支有没有继续往前走——
+    /// 走过的话不能画成「已全部合并」，那会诱导用户删掉还没合的提交。
+    ///
+    /// `#[serde(default)]`：老版本 gh 可能不给这个字段，缺了就退回普通 merged，
+    /// 不该让整条通道解析失败。
+    #[serde(default)]
+    pub head_ref_oid: String,
     pub title: String,
     pub is_draft: bool,
     /// gh 原样返回的 `OPEN` / `MERGED`（本模块不查 `CLOSED`，见 [`PR_STATES`]）。

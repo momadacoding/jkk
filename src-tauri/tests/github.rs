@@ -1,7 +1,8 @@
 //! `gh pr list --json` 输出的解析，以及 gh 不可用时的降级行为。
 //!
 //! 这里**不真跑网络**：断言的是解析层和失败路径，样例 JSON 取自
-//! `gh pr list --state open --json number,headRefName,title,isDraft,url` 的真实输出形状。
+//! `gh pr list --state <open|merged> --json number,headRefName,headRefOid,title,isDraft,state,url`
+//! 的真实输出形状。
 
 use app_lib::engine::github::{self, PullRequest};
 use tempfile::TempDir;
@@ -9,8 +10,8 @@ use tempfile::TempDir;
 #[test]
 fn parses_real_gh_output() {
     let json = r#"[
-      {"headRefName":"fix/watch","isDraft":false,"number":36,"state":"OPEN","title":"linked worktree 下外部 commit 不触发刷新","url":"https://github.com/o/r/pull/36"},
-      {"headRefName":"feat/tab","isDraft":true,"number":35,"state":"OPEN","title":"中键点击标签即关闭","url":"https://github.com/o/r/pull/35"}
+      {"headRefName":"fix/watch","headRefOid":"ac6e785eb547aadf74ff83993fe44b231aaf9b8a","isDraft":false,"number":36,"state":"OPEN","title":"linked worktree 下外部 commit 不触发刷新","url":"https://github.com/o/r/pull/36"},
+      {"headRefName":"feat/tab","headRefOid":"6e6f014513cd3cc520cfa3838228517af47ad3ef","isDraft":true,"number":35,"state":"OPEN","title":"中键点击标签即关闭","url":"https://github.com/o/r/pull/35"}
     ]"#;
 
     let prs = github::parse_pr_list(json).expect("真实形状的输出必须能解析");
@@ -20,6 +21,7 @@ fn parses_real_gh_output() {
         PullRequest {
             number: 36,
             head_ref_name: "fix/watch".to_string(),
+            head_ref_oid: "ac6e785eb547aadf74ff83993fe44b231aaf9b8a".to_string(),
             title: "linked worktree 下外部 commit 不触发刷新".to_string(),
             is_draft: false,
             state: "OPEN".to_string(),
@@ -30,11 +32,24 @@ fn parses_real_gh_output() {
 }
 
 #[test]
+fn missing_head_ref_oid_defaults_to_empty_not_a_parse_error() {
+    // 老版本 gh 可能不给这个字段。缺了就退回普通 merged 徽章，
+    // 不能让整条通道因为一个可选字段而哑掉。
+    let json = r#"[{"headRefName":"a","isDraft":false,"number":1,"state":"MERGED","title":"t","url":"u"}]"#;
+    let prs = github::parse_pr_list(json).expect("缺 headRefOid 不该是解析错误");
+    assert_eq!(prs[0].head_ref_oid, "");
+}
+
+#[test]
 fn parses_merged_state() {
     // 已合并的 PR 是这个功能的第二个主场景：分支还在，内容早进主干了
-    let json = r#"[{"headRefName":"feat/portable-zip-signing","isDraft":false,"number":33,"state":"MERGED","title":"绿色版 zip","url":"u"}]"#;
+    let json = r#"[{"headRefName":"feat/portable-zip-signing","headRefOid":"ac6e785eb547aadf74ff83993fe44b231aaf9b8a","isDraft":false,"number":33,"state":"MERGED","title":"绿色版 zip","url":"u"}]"#;
     let prs = github::parse_pr_list(json).unwrap();
     assert_eq!(prs[0].state, "MERGED");
+    assert_eq!(
+        prs[0].head_ref_oid,
+        "ac6e785eb547aadf74ff83993fe44b231aaf9b8a"
+    );
 }
 
 #[test]

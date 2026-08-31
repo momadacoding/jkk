@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { PullRequest, RefPointer } from '../engine/types'
-import { indexPullRequestsByBranch, prBadgeLabel, prBadgeVariant, prTooltip, pullRequestForRef } from '../engine/prs'
+import { indexPullRequestsByBranch, prBadge, pullRequestForRef } from '../engine/prs'
 import { ContextMenu, useContextMenu } from './ContextMenu'
 import { SidebarSection, SidebarGroup } from './SidebarSection'
 import { usePrompt } from './PromptDialog'
@@ -68,12 +68,17 @@ function SyncBadge({ ahead, behind }: { ahead: number | null; behind: number | n
   )
 }
 
-/** PR 编号微徽章。分支上没有可显示的 PR（undefined）时什么都不画。 */
-function PrBadge({ pr }: { pr: PullRequest | undefined }) {
+/**
+ * PR 编号微徽章。分支上没有可显示的 PR（undefined）时什么都不画。
+ *
+ * `branchHash` 是本地分支的 tip，用来区分「已全部合并」和「合并后又长了提交」。
+ */
+function PrBadge({ pr, branchHash }: { pr: PullRequest | undefined; branchHash: string }) {
   if (!pr) return null
+  const badge = prBadge(pr, branchHash)
   return (
-    <span className={`sb-pr ${prBadgeVariant(pr)}`} title={prTooltip(pr)}>
-      {prBadgeLabel(pr)}
+    <span className={`sb-pr ${badge.variant}`} title={badge.tooltip}>
+      {badge.label}
     </span>
   )
 }
@@ -214,7 +219,7 @@ export function BranchView({
             >
               <BranchIcon />
               <span className="sb-label">{name}</span>
-              <PrBadge pr={pullRequestForRef(prByBranch, ref)} />
+              <PrBadge pr={pullRequestForRef(prByBranch, ref)} branchHash={ref.hash} />
               <SyncBadge ahead={ref.ahead} behind={ref.behind} />
               {name === head && <span className="sb-current-dot" title="当前分支" />}
             </div>

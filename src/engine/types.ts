@@ -130,5 +130,13 @@ export interface PullRequest {
    * 混为一谈会给出完全相反的暗示（「可以删分支了」vs「这活白干了」）。
    */
   state: 'OPEN' | 'MERGED' | 'CLOSED'
+  /**
+   * PR 的 head 分支在**合并时**的提交 oid。
+   *
+   * 和本地分支的 tip 一比，就知道 PR 合并之后分支有没有继续往前走。没有这个
+   * 判断的话，一条「合并后又加了提交」的分支会被画成普通的 ✓——照着它删分支
+   * 会把那些提交一起删掉。
+   */
+  headRefOid: string
   url: string
 }
