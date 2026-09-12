@@ -18,7 +18,7 @@
 |---|---|---|---|
 | 1 只读四件套 | ✅ 完成 | `vcs/mod.rs`、`vcs/git.rs`、`tests/vcs_backend.rs`、`lib.rs`、`commands/{graph,diff,repo}.rs` | fmt ✓ clippy 零告警 ✓ `cargo test` **206 passed / 0 failed**（= 基线 200 + 新增 6） |
 | 2 discard 下沉 | ✅ 完成 | `engine/ops.rs`（新建）、`engine/mod.rs`、`commands/ops.rs` | fmt ✓ clippy 零告警 ✓ `--test discard` 9 passed（与搬家前逐条一致）✓ `cargo test` **206 passed / 0 failed** |
-| 3 暂存与提交 | 未开始 | | |
+| 3 暂存与提交 | ✅ 完成 | `vcs/mod.rs`、`vcs/git.rs`、`commands/ops.rs`、`tests/vcs_backend.rs` | fmt ✓ clippy 零告警 ✓ `cargo test` **210 passed / 0 failed**（= 206 + 新增 4） |
 | 4 分支操作 | 未开始 | | |
 | 5 stash | 未开始 | | |
 | 6 收尾验证 | 未开始 | | |
@@ -58,6 +58,17 @@
 
   另注：计划 Step 8 把 `cargo fmt --check && cargo clippy` 用 `&&` 串起来，
   fmt 一失败 clippy 就被短路跳过了。后续 Task 分开跑这两条。
+
+- **Task 3：计划里 `backend_unstage_removes_from_index` 的断言数字错了。**
+  计划写的是 unstage 之后 `unstaged.len() == 1`，实测是 **2**。
+
+  原因：本项目的 `engine::diff::read_status` **把未跟踪文件也算进 unstaged**
+  （与 `fixtures.rs` 的 `read_diff_includes_untracked_content` 是同一套约定），
+  而 fixture 里有一个 `untracked.txt`。是**计划的假设错**，不是实现错。
+
+  修法不是把 1 改成 2，而是改成**按路径断言**
+  （`after.unstaged.iter().any(|f| f.path == "a.txt")`）——数个数会随 fixture
+  里无关文件的增减而碎，按路径断言才真的在测「a.txt 退回了未暂存」。
 
 #### 计划没写的坑
 

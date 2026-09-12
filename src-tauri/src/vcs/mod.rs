@@ -31,6 +31,21 @@ pub trait Vcs: Send + Sync {
 
     /// 读取指定 scope 的 diff。scope 的取值形式由各后端自行解释。
     fn diff(&self, scope: &str) -> Result<DiffData>;
+
+    /// 把指定路径加入暂存区。
+    fn stage(&self, paths: &[String]) -> Result<()>;
+
+    /// 把指定路径移出暂存区。
+    fn unstage(&self, paths: &[String]) -> Result<()>;
+
+    /// 丢弃指定路径的改动。`staged` 决定回退到暂存区还是 HEAD。
+    ///
+    /// **空 paths 必须是 no-op**，不能退化成「全部」——那是一次误伤整个仓库的
+    /// 不可逆操作。各实现都要守住这条。
+    fn discard(&self, paths: &[String], staged: bool) -> Result<()>;
+
+    /// 提交暂存区内容。
+    fn commit(&self, message: &str, amend: bool) -> Result<()>;
 }
 
 /// 为某个工作目录挑一个后端。

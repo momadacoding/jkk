@@ -115,3 +115,70 @@ fn backend_for_rejects_non_repo() {
     let err = backend.open().unwrap_err();
     assert_eq!(err.code, "not_repo");
 }
+
+#[test]
+fn backend_stage_then_commit_advances_head() {
+    let dir = repo();
+    let path = p(&dir);
+    let backend = backend_for(&path).unwrap();
+    let before = backend.open().unwrap().head_hash;
+
+    backend.stage(&["a.txt".to_string()]).unwrap();
+    let staged = backend.status().unwrap();
+    assert_eq!(staged.staged.len(), 1, "a.txt 应当已进暂存区");
+
+    backend.commit("c3", false).unwrap();
+    let after = backend.open().unwrap().head_hash;
+    assert_ne!(before, after, "提交后 HEAD 必须前进");
+}
+
+#[test]
+fn backend_unstage_removes_from_index() {
+    let dir = repo();
+    let path = p(&dir);
+    let backend = backend_for(&path).unwrap();
+
+    backend.stage(&["a.txt".to_string()]).unwrap();
+    assert_eq!(backend.status().unwrap().staged.len(), 1);
+
+    backend.unstage(&["a.txt".to_string()]).unwrap();
+    let after = backend.status().unwrap();
+    assert_eq!(after.staged.len(), 0);
+    // 按路径断言而不是数个数：本项目的 read_status 把**未跟踪文件也算进
+    // unstaged**（与 fixtures.rs 的 read_diff_includes_untracked_content 同一约定），
+    // 所以 fixture 里的 untracked.txt 也在这一列，数个数会得到 2 而不是 1。
+    assert!(
+        after.unstaged.iter().any(|f| f.path == "a.txt"),
+        "a.txt 应退回未暂存：{:?}",
+        after.unstaged.iter().map(|f| &f.path).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn backend_discard_restores_tracked_file() {
+    let dir = repo();
+    let path = p(&dir);
+    let backend = backend_for(&path).unwrap();
+
+    backend.discard(&["a.txt".to_string()], false).unwrap();
+    let content = fs::read_to_string(dir.path().join("a.txt")).unwrap();
+    assert_eq!(content, "2\n", "应恢复到 c2 的内容");
+}
+
+#[test]
+fn backend_discard_with_empty_paths_is_a_noop() {
+    // 空 pathspec 会被 git 当成「全部」。这条守住的是一次误伤整个仓库的 discard，
+    // 是本项目已经踩过的坑（AGENTS.md §6.2）。
+    let dir = repo();
+    let path = p(&dir);
+    let backend = backend_for(&path).unwrap();
+
+    backend.discard(&[], false).unwrap();
+
+    // 工作区改动必须原封不动
+    assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "3\n");
+    assert!(
+        dir.path().join("untracked.txt").exists(),
+        "未跟踪文件不得被删"
+    );
+}

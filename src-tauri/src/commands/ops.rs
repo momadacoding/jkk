@@ -4,7 +4,7 @@ use crate::error::Result;
 /// 丢弃改动。分类逻辑在 `engine::ops::discard`。
 #[tauri::command(async)]
 pub fn discard(path: String, paths: Vec<String>, staged: bool) -> Result<()> {
-    crate::engine::ops::discard(&path, &paths, staged)
+    crate::vcs::backend_for(&path)?.discard(&paths, staged)
 }
 
 #[tauri::command(async)]
@@ -119,28 +119,15 @@ pub fn save_patch(path: String, rev: String, out: String) -> Result<()> {
 
 #[tauri::command(async)]
 pub fn stage(path: String, paths: Vec<String>) -> Result<()> {
-    let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
-    let mut args: Vec<&str> = vec!["add"];
-    args.extend(path_refs);
-    run_git(&path, &args)?;
-    Ok(())
+    crate::vcs::backend_for(&path)?.stage(&paths)
 }
 
 #[tauri::command(async)]
 pub fn unstage(path: String, paths: Vec<String>) -> Result<()> {
-    let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
-    let mut args: Vec<&str> = vec!["reset", "HEAD"];
-    args.extend(path_refs);
-    run_git(&path, &args)?;
-    Ok(())
+    crate::vcs::backend_for(&path)?.unstage(&paths)
 }
 
 #[tauri::command(async)]
 pub fn commit(path: String, message: String, amend: bool) -> Result<()> {
-    if amend {
-        run_git(&path, &["commit", "--amend", "-m", &message])?;
-    } else {
-        run_git(&path, &["commit", "-m", &message])?;
-    }
-    Ok(())
+    crate::vcs::backend_for(&path)?.commit(&message, amend)
 }

@@ -43,4 +43,31 @@ impl Vcs for GitBackend {
         // 多出来的这次分配相对一次 diff 计算可以忽略。
         engine::diff::read_diff(&self.root, scope.to_string())
     }
+
+    fn stage(&self, paths: &[String]) -> Result<()> {
+        let mut args: Vec<&str> = vec!["add"];
+        args.extend(paths.iter().map(String::as_str));
+        engine::git_cli::run_git(&self.root, &args)?;
+        Ok(())
+    }
+
+    fn unstage(&self, paths: &[String]) -> Result<()> {
+        let mut args: Vec<&str> = vec!["reset", "HEAD"];
+        args.extend(paths.iter().map(String::as_str));
+        engine::git_cli::run_git(&self.root, &args)?;
+        Ok(())
+    }
+
+    fn discard(&self, paths: &[String], staged: bool) -> Result<()> {
+        engine::ops::discard(&self.root, paths, staged)
+    }
+
+    fn commit(&self, message: &str, amend: bool) -> Result<()> {
+        if amend {
+            engine::git_cli::run_git(&self.root, &["commit", "--amend", "-m", message])?;
+        } else {
+            engine::git_cli::run_git(&self.root, &["commit", "-m", message])?;
+        }
+        Ok(())
+    }
 }
