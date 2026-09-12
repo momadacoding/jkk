@@ -102,6 +102,22 @@ git add                  （无参数）     → "Nothing specified, nothing add
 两条都应在 Phase 1 开工前处理掉——它们都落在 `engine::ops::discard` 上，而 Phase 2
 的 `sync_in` 会依赖 discard 的可靠性。
 
+#### 2026-09-13 结清：两条都已在分支 `worktree-discard-hardening` 修掉
+
+| # | 结论 | 实测支撑 |
+|---|---|---|
+| 1 | **确认是真缺陷，比 review 描述的更严重**。触发条件不是 `index.lock`，而是**对象库损坏**：删掉 HEAD 的 tree 对象后 `ls-tree -r HEAD` 报 `fatal: not a tree object`，而 `git rm -f` 照样退出 0 并把文件删掉。旧实现此时**整个调用返回 `Ok(())`**——用户点「丢弃改动」，文件没了，界面上没有任何异常 | 临时 fixture 实测 + 回归测试 `staged_discard_stops_instead_of_deleting_when_head_cannot_be_read`（修复前 `expect_err` 拿到的是 `Ok(())`） |
+| 4 | **「加回滚」做不到**，`git checkout` 抹掉的工作区内容没有副本可取回。改为「失败立刻停下 + `discard_partial` 说清已完成 / 可能已部分处理 / 未处理三类路径」。fail-fast 本来就有（靠 `?`），补的是那份交代 | 回归测试 `a_failed_stage_says_what_was_already_done_and_what_was_not`、`a_locked_untracked_file_reports_which_ones_were_already_deleted` |
+
+**空仓库必须与对象库损坏区分开**，这是 #1 修复的核心。不能用「`rev-parse --verify HEAD`
+失败」来判空仓库——实测场景 D（tree 对象丢失）里它照样退出 0，而别的损坏形态下它会
+失败，于是真损坏又被当成空仓库吞掉。正确判据是正向的：`symbolic-ref --quiet HEAD`
+成功且它指向的分支 ref 不存在。detached HEAD 下 `symbolic-ref` 退出 1，判为非空仓库，
+正确。
+
+顺带把 `staged == false` 时的 `ls-tree` 探测整条去掉——那种情况下 `in_head` 被
+`staged &&` 短路，本来就用不到，少一次进程也少一个失败面。
+
 ## 决策条目
 
 ### 全局
