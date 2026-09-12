@@ -7,11 +7,16 @@
 
 ## 进度总账
 
-**重构前测试基线**：待 P6 填入
+**重构前测试基线**（2026-09-12，worktree 内实测）：`cargo test` **200 passed / 0 failed**，
+21 个测试二进制。Task 6 拿它对账，最终应为 216。
+
+> 注：输出里那行 `error: cannot delete branch 'feat/busy' used by worktree` 是
+> `worktree_ops.rs` 某条失败路径测试的**预期 stderr**，不是测试失败——21 个二进制
+> 全部报 0 failed。
 
 | Task | 状态 | 产出文件 | 验证结果 |
 |---|---|---|---|
-| 1 只读四件套 | 未开始 | | |
+| 1 只读四件套 | ✅ 完成 | `vcs/mod.rs`、`vcs/git.rs`、`tests/vcs_backend.rs`、`lib.rs`、`commands/{graph,diff,repo}.rs` | fmt ✓ clippy 零告警 ✓ `cargo test` **206 passed / 0 failed**（= 基线 200 + 新增 6） |
 | 2 discard 下沉 | 未开始 | | |
 | 3 暂存与提交 | 未开始 | | |
 | 4 分支操作 | 未开始 | | |
@@ -42,9 +47,31 @@
 
 #### 计划的错误
 
-（实现时发现计划里写错的代码、命令、断言，记在这里。**没有就明确写「无」**。）
+- **Task 1：计划里给的测试代码不是 rustfmt-clean 的。**
+  `backend_diff_matches_engine` 里那句
+  `assert!(!via_backend.files.is_empty(), "fixture 应当有可 diff 的文件");`
+  超出行宽，rustfmt 要求拆成多行。`cargo fmt --check` 因此失败一次。
+
+  影响很小（跑一次 `cargo fmt` 即可），但对后续 Task 的含义是：**计划里的代码块
+  是语义正确的参考，不保证格式正确**——每个 Task 的验证步骤里先跑 `cargo fmt`
+  再跑 `cargo fmt --check`，不要指望粘贴即合规。
+
+  另注：计划 Step 8 把 `cargo fmt --check && cargo clippy` 用 `&&` 串起来，
+  fmt 一失败 clippy 就被短路跳过了。后续 Task 分开跑这两条。
 
 #### 计划没写的坑
+
+- **全冷 target 上第一次 `cargo test` 会以 rlib 链接错误失败，重跑即好。**
+  新 worktree 没有 `src-tauri/target/`，P6 的第一次 `cargo test` 有 12 个测试二进制
+  报 `crate 'windows' / 'tokio' / 'cookie' / 'tauri_runtime' … required to be
+  available in rlib format, but was not found in this form`。
+
+  这**不是代码缺陷**，是冷编译竞态：并行构建时部分依赖的 rlib 还没落地，测试二进制
+  就开始链接。判定方式——单跑一个最小测试（`cargo test --test git_cli`）立刻通过，
+  随后完整 `cargo test` 也全绿（200 passed / 0 failed）。
+
+  对后续每个 Task 的含义：**看到 rlib 类错误先重跑一次再怀疑代码**，按 `AGENTS.md`
+  §5.3「检查失败指向环境问题时不要直接判定为代码缺陷」。
 
 - **`EnterWorktree` 默认从 `origin/<默认分支>` 开分支，不是本地 HEAD。**
   切 worktree 前 `origin/master` 停在 `928923f`，而本地 master 已经领先 3 个文档

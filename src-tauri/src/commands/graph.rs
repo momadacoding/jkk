@@ -1,6 +1,6 @@
-use crate::engine;
+use crate::vcs::backend_for;
 
 #[tauri::command(async)]
 pub fn load_graph(path: String) -> Result<crate::engine::graph::GraphData, crate::error::GitError> {
-    engine::graph::load(&path)
+    backend_for(&path)?.graph()
 }

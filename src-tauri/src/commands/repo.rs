@@ -1,8 +1,9 @@
 use crate::engine;
+use crate::vcs::backend_for;
 
 #[tauri::command(async)]
 pub fn open_repo(path: String) -> Result<crate::engine::repo::RepoInfo, crate::error::GitError> {
-    engine::repo::open(&path)
+    backend_for(&path)?.open()
 }
 
 #[tauri::command(async)]
