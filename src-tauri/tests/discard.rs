@@ -287,6 +287,46 @@ fn staged_discard_stops_instead_of_deleting_when_the_branch_ref_is_corrupt() {
 }
 
 #[test]
+fn staged_discard_stops_instead_of_deleting_when_the_branch_ref_is_malformed() {
+    // 第三种形态：分支 ref 文件在，但内容不是合法的 OID。
+    //
+    // 这一条是对抗性 review 争议的焦点，所以断言的是**真实代码路径的结果**，
+    // 不是推理。实测（2026-09-13）：此时 `git symbolic-ref --quiet HEAD` 退出 128
+    // `fatal: No such ref: HEAD`——git 连 HEAD 都读不出来，根本走不到 `show-ref`。
+    // 于是 head_is_unborn 在第一步就返回 false，discard 抛出，文件保持不动。
+    let dir = repo();
+    fs::write(dir.path().join("tracked.txt"), "staged version\n").unwrap();
+    run_git(dir.path(), &["add", "tracked.txt"]);
+
+    let head_ref = git_out(dir.path(), &["symbolic-ref", "--quiet", "HEAD"]);
+    fs::write(dir.path().join(".git").join(&head_ref), "not-a-sha-at-all").unwrap();
+
+    let err = ops::discard(p(&dir), vec!["tracked.txt".into()], true)
+        .expect_err("HEAD 读不出来时必须报错");
+
+    assert!(
+        dir.path().join("tracked.txt").exists(),
+        "文件被删了：{}",
+        err.message
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("tracked.txt")).unwrap(),
+        "staged version\n",
+        "暂存的那一版内容必须原封不动"
+    );
+    // 索引也不能被动过
+    let staged = Command::new("git")
+        .current_dir(dir.path())
+        .args(["diff", "--cached", "--name-only"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&staged.stdout).contains("tracked.txt"),
+        "暂存区不该被清掉"
+    );
+}
+
+#[test]
 fn an_unborn_head_pointing_at_a_slash_prefixed_name_is_still_unborn() {
     // `for-each-ref refs/heads/svn` 会按路径前缀匹配到 `refs/heads/svn/base`，
     // 把「HEAD 指向的 ref 不存在」误判成「存在」。spec D10 的基线分支就叫

@@ -127,7 +127,6 @@ git add                  （无参数）     → "Nothing specified, nothing add
 |---|---|---|
 | 仓库还没有任何提交（ref 文件不存在） | **1** | unborn |
 | 分支 ref 指向不存在的 OID | **128** `bad ref` | **抛出** |
-| 分支 ref 内容是垃圾 | 1 | 按 unborn 处理，见下 |
 | ref 在 packed-refs 里 | **0** | 非 unborn |
 
 第二行就是漏掉的那条：只看成败会把它当成 unborn，而 `git rm -f` 在该状态下照样
@@ -144,10 +143,29 @@ HEAD 指向 `refs/heads/svn`（正是 spec D10 的基线分支名）而仓库里
 并留了 `an_unborn_head_pointing_at_a_slash_prefixed_name_is_still_unborn` 挡住这条路。
 `show-ref --verify` 是精确匹配，无此问题。
 
-**有意接受的行为**（第三行）：ref 内容是垃圾时 git 自己就当它不存在
-（`warning: ignoring broken ref`），`git checkout HEAD -- <file>` 同样取不到内容，
-没有可恢复的目标。实测后果是那一版**暂存内容**丢失，已提交的内容仍在对象库里、
-可经 fsck 取回。与 git 自身语义一致，不额外加特判。
+#### 第二轮对抗性 review：一条不成立，但根因是我的文档写错了
+
+第二轮 review 判 needs-attention，指「ref 内容是垃圾时仍会删文件」。**该结论不成立**，
+但责任在我——它读的是我上一版写错的文档。
+
+初版这里写着「ref 内容是垃圾 → `show-ref` 退出 1 → 按 unborn 处理 → 暂存内容丢失，
+有意接受」。**那个后果我从未端到端验证过**：探测脚本是先抓 `$h` 再损坏 ref，单独测了
+`show-ref` 这一个零件的退出码，然后就据此推断了整条路径的结果。
+
+补测真实路径后的事实：ref 内容不是合法 OID 时，`git symbolic-ref --quiet HEAD` 就已经
+退出 **128**（`fatal: No such ref: HEAD`），**根本走不到 `show-ref`**。判定在第一关就
+返回 false，`discard` 抛出，文件与索引都不动。
+
+违反的是 `AGENTS.md` §6.2：测的是零件，写的却是整机的结论。已补回归测试
+`staged_discard_stops_instead_of_deleting_when_the_branch_ref_is_malformed`，断言的是
+`ops::discard` 的真实返回与磁盘、索引状态，不是某条 git 命令的退出码。
+
+顺带修掉一处**碰巧正确**：第一关 `code != 0` 原本只注释了 detached HEAD，而「HEAD 读
+不出来」也落在同一分支、含义相反，只是恰好都返回 `Ok(false)` 才安全。现已写明
+`Ok(false)` 的语义是「**不能确认是 unborn**」而非「确认不是 unborn」，两种情况都归它，
+是有意设计。
+
+各形态的完整实测表见 `engine::ops::head_is_unborn` 的文档注释。
 
 ## 决策条目
 

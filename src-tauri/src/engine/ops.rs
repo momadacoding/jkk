@@ -25,31 +25,38 @@ fn path_set(path: &str, args: &[&str]) -> Result<HashSet<String>> {
 /// 「HEAD 里什么都没有」会让文件被 `git rm -f` 删掉。所以判定必须**正向**：
 /// HEAD 是个 symbolic ref，且它指向的那个分支 ref **确实不存在**。
 ///
-/// 判据是 `show-ref --verify --quiet` 的**退出码**，不是「它有没有失败」。
-/// 2026-09-13 在临时 fixture 上实测的四种形态：
+/// 判定分两关，**两关都必须正向通过**才算 unborn；任何一关说不清都返回
+/// 「不是 unborn」或直接抛出，让上层去走抛出路径。
 ///
-/// | 形态 | `show-ref --verify --quiet` | 结论 |
-/// |---|---|---|
-/// | 仓库还没有任何提交（ref 文件不存在） | **1** | unborn |
-/// | 分支 ref 指向不存在的 OID | **128** `bad ref` | **抛出** |
-/// | 分支 ref 内容是垃圾 | 1 | 见下 |
-/// | ref 在 packed-refs 里（松散文件不存在） | **0** | 非 unborn |
+/// 2026-09-13 在临时 fixture 上逐形态实测：
 ///
-/// 第二行是这条判定存在的全部理由：只看「失败与否」会把它当成 unborn，而此时
-/// `git rm -f` 照样退出 0 并删掉文件（实测）。
+/// | 形态 | `symbolic-ref --quiet HEAD` | `show-ref --verify --quiet` | 结论 |
+/// |---|---|---|---|
+/// | 仓库还没有任何提交（ref 文件不存在） | 0 | **1** | unborn |
+/// | 分支 ref 指向不存在的 OID | 0 | **128** `bad ref` | 抛出 |
+/// | 分支 ref 内容不是合法 OID | **128** `No such ref: HEAD` | 走不到 | 抛出 |
+/// | ref 在 packed-refs 里（松散文件不存在） | 0 | **0** | 非 unborn |
+/// | detached HEAD | **1** | 走不到 | 非 unborn |
 ///
-/// 第三行是有意接受的行为：git 自己就把内容损坏的 ref 当成不存在
-/// （`warning: ignoring broken ref`），`git checkout HEAD -- <file>` 同样取不到
-/// 内容，没有可恢复的目标。实测后果是那一版**暂存内容**丢失，已提交的内容仍在
-/// 对象库里、可经 fsck 取回。
+/// 第二行是第二关必须看**退出码**而不是「有没有失败」的全部理由：只看成败会把
+/// 它当成 unborn，而此时 `git rm -f` 照样退出 0 并删掉文件（实测）。
+///
+/// 第三行和第五行都落在第一关的 `code != 0`，但含义相反——一个是「HEAD 读不出来」
+/// （必须抛出），一个是「HEAD 指着某个提交」（本来就不是 unborn）。两者都返回
+/// `Ok(false)`，因为 `Ok(false)` 的语义是「**不能确认是 unborn**」，而不是
+/// 「确认不是 unborn」。上层拿到 false 就会抛出原始探测错误，两种情况都安全。
+/// 这一点是有意设计，不是碰巧：第三行若被当成 unborn，暂存内容会被 `git rm -f`
+/// 连同文件一起删掉。回归测试
+/// `staged_discard_stops_instead_of_deleting_when_the_branch_ref_is_malformed`
+/// 锁住的就是这个结果。
 ///
 /// 不能用 `for-each-ref` 判 ref 是否存在：它按路径前缀匹配。HEAD 指向
 /// `refs/heads/svn`（spec D10 的基线分支名）而仓库里有 `refs/heads/svn/base` 时，
 /// 它会吐出后者，把真 unborn 误判成「ref 存在」。`show-ref --verify` 是精确匹配。
-///
-/// detached HEAD 下 `symbolic-ref` 退出 1，那种状态必然已经指着某个提交，
-/// 返回 `Ok(false)` 正确。
 fn head_is_unborn(path: &str) -> Result<bool> {
+    // 第一关：HEAD 必须是个能读出来的 symbolic ref。
+    // 非零有两种含义（detached HEAD = 1，HEAD 读不出来 = 128），这里一律返回
+    // false —— 见上表第三、五行，`Ok(false)` 表示「不能确认是 unborn」。
     let (code, head_ref) = run_git_code(path, &["symbolic-ref", "--quiet", "HEAD"])?;
     if code != 0 {
         return Ok(false);
@@ -59,6 +66,7 @@ fn head_is_unborn(path: &str) -> Result<bool> {
         return Ok(false);
     }
 
+    // 第二关：那个分支 ref 必须**确实不存在**（退出码 1），不是「查它出了错」
     let (code, _) = run_git_code(path, &["show-ref", "--verify", "--quiet", head_ref])?;
     match code {
         0 => Ok(false),
