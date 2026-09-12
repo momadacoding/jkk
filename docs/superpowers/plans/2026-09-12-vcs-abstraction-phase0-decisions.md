@@ -21,7 +21,43 @@
 | 3 暂存与提交 | ✅ 完成 | `vcs/mod.rs`、`vcs/git.rs`、`commands/ops.rs`、`tests/vcs_backend.rs` | fmt ✓ clippy 零告警 ✓ `cargo test` **210 passed / 0 failed**（= 206 + 新增 4） |
 | 4 分支操作 | ✅ 完成 | `vcs/mod.rs`、`vcs/git.rs`、`commands/ops.rs`、`tests/vcs_backend.rs` | fmt ✓ clippy 零告警 ✓ `cargo test` **213 passed / 0 failed**（= 210 + 新增 3） |
 | 5 stash | ✅ 完成 | `engine/stash.rs`、`vcs/mod.rs`、`vcs/git.rs`、`commands/stash.rs`、`tests/vcs_backend.rs` | fmt ✓ clippy 零告警 ✓ `cargo test` **216 passed / 0 failed**（= 基线 200 + 新增 16，达标） |
-| 6 收尾验证 | 未开始 | | |
+| 6 收尾验证 | ✅ 完成（E2E 点击流程待用户） | 本文件 | 三重对账全过 + 两侧五项检查全过，详见下方「收尾验证结果」 |
+
+### 收尾验证结果
+
+**三重对账（证明「行为零变化」）**
+
+| 对账项 | 期望 | 实测 |
+|---|---|---|
+| `src/commands/` 的 `#[tauri::command]` 增删 | 0 / 0 | **0 新增 / 0 删除** ✓ |
+| 命令定义数 vs `lib.rs` 注册数 | 相等且与 master 一致 | **44 = 44** ✓（`grep` 数到的 45 是 `session.rs:9` 文档注释里的一句提及，非真命令） |
+| `git diff master -- src/lib.rs` | 只多 `pub mod vcs;` | **仅此一行**，`invoke_handler!` 44 行一字未动 ✓ |
+| `git diff master -- src/commands/` 里的 `pub fn` 行 | 增删配对 | **零输出**——44 个命令签名与 master 逐字节一致 ✓ |
+| `git diff master` 前端部分 | 空 | **空** ✓（`src/`、`tests/`、`package.json`、各 config 全无改动） |
+
+**五项检查**
+
+| 检查 | 结果 |
+|---|---|
+| `cargo fmt --check` | 通过 |
+| `cargo clippy --all-targets` | **0 告警 0 错误**（无 `#[allow]`） |
+| `cargo test` | **216 passed / 0 failed**（基线 200 + 新增 16） |
+| `pnpm build`（含 tsc） | 通过，80 modules |
+| `pnpm test` | **257 passed / 19 文件** |
+| `cargo build`（应用二进制） | 通过 |
+| `pnpm tauri dev` 启动冒烟 | 通过——Vite 就绪、`app.exe` 启动、无 panic 无启动期错误 |
+
+**未完成项（如实披露）**
+
+- **真实窗口里的 7 条点击流程未执行。** agent 无法在 Tauri 窗口里点击操作，
+  启动冒烟只证明「起得来」，不等于「每个命令在 UI 上仍然通」。
+  fixture 已备好在
+  `<scratchpad>/e2e-fixture`（两条提交、一条 `feat/demo` 分支、一个已改文件、
+  一个未跟踪文件），清单见计划 Task 6 Step 5。**需要用户执行。**
+
+  缓解证据：44 个命令签名逐字节未变、`invoke_handler!` 未动、前端零改动，
+  前后端契约不可能漂移；改动只在命令函数体，而那些路径由 216 个 Rust 测试覆盖
+  （其中 6 个测试文件直接调命令层）。
 
 ## 决策条目
 
@@ -102,6 +138,16 @@
   `invoke_handler!` 注册表。安全性论证的核心是**现有 18 个测试文件 4038 行集成测试
   全绿**——它们同时覆盖命令层（6 个文件直接调 `app_lib::commands::*`）和 engine 层
   （`fixtures.rs` 等直接调 `app_lib::engine::*`）两条路径，任何行为漂移都会被其中
-  一侧抓到。
+  一侧抓到。**实测：216 passed / 0 failed。**
 - 新增的 16 个测试是**等价性测试**而非「功能能跑」测试：每条都拿「经 trait 调用」
   与「直接调 engine」的结果对比。后者一个返回固定值的桩也能通过，前者不能。
+- **命令签名逐字节未变**（`git diff master -- src/commands/ | grep '^[-+]pub fn'`
+  零输出），`invoke_handler!` 未动，前端零改动——前后端契约结构上不可能漂移。
+  这是本次重构最强的一条安全论证：改动全部落在命令函数体内部。
+- **`discard` 的空 pathspec 守卫在两处都在**：`engine::ops::discard` 的
+  `paths.is_empty()` 提前返回原样保留，另外在 trait 文档里把「空 paths 必须是
+  no-op」写成了各实现的契约，并加了 `backend_discard_with_empty_paths_is_a_noop`
+  做断言。空 pathspec 退化成「全部」是本项目踩过的不可逆事故。
+- **本期没有引入任何破坏性 git 操作的新路径**：`delete_branch` 走的仍是原来的
+  `git branch -D`，没有改变确认流程或调用点；`branch_delete_info` 这个删除前的
+  信息查询命令刻意留在命令层未进 trait，护栏位置不变。
