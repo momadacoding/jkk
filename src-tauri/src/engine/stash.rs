@@ -1,3 +1,4 @@
+use crate::engine::git_cli::run_git;
 use crate::error::Result;
 use git2::Repository;
 use serde::Serialize;
@@ -43,4 +44,44 @@ pub fn list(path: &str) -> Result<Vec<StashEntry>> {
         });
     }
     Ok(entries)
+}
+
+/// 把当前改动压进 stash。
+///
+/// 写入走 git CLI 而不是 git2：`Repository::stash_save` 的语义与 CLI 的
+/// `stash push` 在未跟踪文件、pathspec 上有出入，而界面上那个「按住 Ctrl」
+/// 的变体对应的正是 CLI 的 `-u`。
+pub fn push(path: &str, message: Option<&str>, include_untracked: bool) -> Result<()> {
+    let mut args: Vec<&str> = vec!["stash", "push"];
+    // include_untracked 对应界面上按住 Ctrl 的变体
+    if include_untracked {
+        args.push("-u");
+    }
+    if let Some(msg) = message {
+        args.push("-m");
+        args.push(msg);
+    }
+    run_git(path, &args)?;
+    Ok(())
+}
+
+/// 应用第 index 条 stash，保留该条目。
+pub fn apply(path: &str, index: usize) -> Result<()> {
+    run_git(path, &["stash", "apply", &format!("stash@{{{index}}}")])?;
+    Ok(())
+}
+
+/// 应用第 index 条 stash 并删除它。
+pub fn pop(path: &str, index: usize) -> Result<()> {
+    run_git(path, &["stash", "pop", &format!("stash@{{{index}}}")])?;
+    Ok(())
+}
+
+/// 删除第 index 条 stash，不应用。
+///
+/// 函数名 `drop_entry` 而不是 `drop`：后者与 `Drop::drop` 同名，clippy 的
+/// `should_implement_trait` 会报，而 `AGENTS.md` §7.3 禁止用 `#[allow]` 掩盖。
+pub fn drop_entry(path: &str, index: usize) -> Result<()> {
+    run_git(path, &["stash", "drop", &format!("stash@{{{index}}}")])?;
+    Ok(())
 }

@@ -20,7 +20,7 @@
 | 2 discard 下沉 | ✅ 完成 | `engine/ops.rs`（新建）、`engine/mod.rs`、`commands/ops.rs` | fmt ✓ clippy 零告警 ✓ `--test discard` 9 passed（与搬家前逐条一致）✓ `cargo test` **206 passed / 0 failed** |
 | 3 暂存与提交 | ✅ 完成 | `vcs/mod.rs`、`vcs/git.rs`、`commands/ops.rs`、`tests/vcs_backend.rs` | fmt ✓ clippy 零告警 ✓ `cargo test` **210 passed / 0 failed**（= 206 + 新增 4） |
 | 4 分支操作 | ✅ 完成 | `vcs/mod.rs`、`vcs/git.rs`、`commands/ops.rs`、`tests/vcs_backend.rs` | fmt ✓ clippy 零告警 ✓ `cargo test` **213 passed / 0 failed**（= 210 + 新增 3） |
-| 5 stash | 未开始 | | |
+| 5 stash | ✅ 完成 | `engine/stash.rs`、`vcs/mod.rs`、`vcs/git.rs`、`commands/stash.rs`、`tests/vcs_backend.rs` | fmt ✓ clippy 零告警 ✓ `cargo test` **216 passed / 0 failed**（= 基线 200 + 新增 16，达标） |
 | 6 收尾验证 | 未开始 | | |
 
 ## 决策条目
@@ -69,6 +69,11 @@
   修法不是把 1 改成 2，而是改成**按路径断言**
   （`after.unstaged.iter().any(|f| f.path == "a.txt")`）——数个数会随 fixture
   里无关文件的增减而碎，按路径断言才真的在测「a.txt 退回了未暂存」。
+
+- **Task 5：`engine::stash::drop` 直接按计划预判改名为 `drop_entry`。**
+  计划 Step 8 里写了「clippy 可能报 `should_implement_trait`，若报了再改名」。
+  实现时直接取了 `drop_entry`，没有先撞一次告警——`Drop::drop` 同名冲突是确定的，
+  等 clippy 报再改属于明知故犯。trait 侧的方法名仍是 `stash_drop`，不受影响。
 
 #### 计划没写的坑
 

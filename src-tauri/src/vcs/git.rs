@@ -9,6 +9,7 @@ use crate::engine;
 use crate::engine::diff::{DiffData, StatusData};
 use crate::engine::graph::GraphData;
 use crate::engine::repo::RepoInfo;
+use crate::engine::stash::StashEntry;
 use crate::error::Result;
 
 pub struct GitBackend {
@@ -93,5 +94,25 @@ impl Vcs for GitBackend {
     fn checkout(&self, rev: &str) -> Result<()> {
         engine::git_cli::run_git(&self.root, &["checkout", rev])?;
         Ok(())
+    }
+
+    fn list_stashes(&self) -> Result<Vec<StashEntry>> {
+        engine::stash::list(&self.root)
+    }
+
+    fn stash_push(&self, message: Option<&str>, include_untracked: bool) -> Result<()> {
+        engine::stash::push(&self.root, message, include_untracked)
+    }
+
+    fn stash_apply(&self, index: usize) -> Result<()> {
+        engine::stash::apply(&self.root, index)
+    }
+
+    fn stash_pop(&self, index: usize) -> Result<()> {
+        engine::stash::pop(&self.root, index)
+    }
+
+    fn stash_drop(&self, index: usize) -> Result<()> {
+        engine::stash::drop_entry(&self.root, index)
     }
 }

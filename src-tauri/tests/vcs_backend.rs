@@ -234,3 +234,55 @@ fn backend_checkout_moves_head() {
     backend.checkout("other").unwrap();
     assert_eq!(backend.open().unwrap().head, "other");
 }
+
+#[test]
+fn backend_stash_push_then_list_then_pop() {
+    let dir = repo();
+    let path = p(&dir);
+    let backend = backend_for(&path).unwrap();
+
+    assert!(backend.list_stashes().unwrap().is_empty());
+
+    backend.stash_push(Some("wip"), false).unwrap();
+    let entries = backend.list_stashes().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].message.contains("wip"));
+    // stash 之后工作区应回到 HEAD 内容
+    assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "2\n");
+
+    backend.stash_pop(0).unwrap();
+    assert!(backend.list_stashes().unwrap().is_empty());
+    assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "3\n");
+}
+
+#[test]
+fn backend_stash_push_untracked_flag_takes_effect() {
+    let dir = repo();
+    let path = p(&dir);
+    let backend = backend_for(&path).unwrap();
+
+    backend.stash_push(Some("with-untracked"), true).unwrap();
+    // -u 生效的话未跟踪文件也被收走了
+    assert!(
+        !dir.path().join("untracked.txt").exists(),
+        "include_untracked=true 时未跟踪文件应被一并 stash"
+    );
+
+    backend.stash_apply(0).unwrap();
+    assert!(dir.path().join("untracked.txt").exists());
+}
+
+#[test]
+fn backend_stash_drop_removes_entry() {
+    let dir = repo();
+    let path = p(&dir);
+    let backend = backend_for(&path).unwrap();
+
+    backend.stash_push(None, false).unwrap();
+    assert_eq!(backend.list_stashes().unwrap().len(), 1);
+
+    backend.stash_drop(0).unwrap();
+    assert!(backend.list_stashes().unwrap().is_empty());
+    // drop 不恢复改动，工作区应仍是 HEAD 内容
+    assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "2\n");
+}

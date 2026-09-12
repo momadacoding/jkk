@@ -13,6 +13,7 @@ pub mod git;
 use crate::engine::diff::{DiffData, StatusData};
 use crate::engine::graph::GraphData;
 use crate::engine::repo::RepoInfo;
+use crate::engine::stash::StashEntry;
 use crate::error::Result;
 
 /// 绑定到某个工作目录的版本控制后端。
@@ -58,6 +59,21 @@ pub trait Vcs: Send + Sync {
 
     /// 切到指定 revision。
     fn checkout(&self, rev: &str) -> Result<()>;
+
+    /// 列出所有 stash，最新的在前。
+    fn list_stashes(&self) -> Result<Vec<StashEntry>>;
+
+    /// 把当前改动压进 stash。
+    fn stash_push(&self, message: Option<&str>, include_untracked: bool) -> Result<()>;
+
+    /// 应用第 index 条 stash，保留该条目。
+    fn stash_apply(&self, index: usize) -> Result<()>;
+
+    /// 应用第 index 条 stash 并删除它。
+    fn stash_pop(&self, index: usize) -> Result<()>;
+
+    /// 删除第 index 条 stash，不应用。
+    fn stash_drop(&self, index: usize) -> Result<()>;
 }
 
 /// 为某个工作目录挑一个后端。
