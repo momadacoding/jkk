@@ -1027,10 +1027,29 @@ exclude 生成与图合成都在 Rust 侧，由 cargo test 覆盖。
 
 ## 17. 环境前置
 
-- **`svn` CLI 必须在 PATH 上。** 开发机（2026-09-12 实测）当前没有 `svn` /
-  `svnadmin`，需先安装。TortoiseSVN 默认不装命令行工具，需在安装器里勾选
-  「command line client tools」；或用 `scoop install svn`（SlikSVN，自带 `svnadmin`）
+- **`svn` CLI 必须在 PATH 上。** 开发机现状（2026-09-12 实测）：SlikSVN `1.14.2`，
+  装在 `C:\Program Files\SlikSvn\bin`，已进 **Machine PATH**，`svn` 与 `svnadmin`
+  均可用
+- TortoiseSVN 默认**不装**命令行工具，需在安装器里勾选「command line client tools」；
+  SlikSVN 自带 `svnadmin`，fixture 测试需要它
 - 打开 SVN 仓库时若检测不到 `svn`，客户端必须给出明确的安装引导，而不是抛裸错误
+
+### 17.1 「装了但当前进程看不见」是一个必须单独处理的状态
+
+安装器写的是**持久** PATH（Machine / User），已经在跑的进程仍持有启动时的环境快照。
+2026-09-12 实测：SlikSVN 装好之后，本会话的 shell 与新起的 PowerShell 子进程
+**都**报 `svn: command not found`，而 Machine PATH 里明明已有该条目——因为子进程
+继承的是父进程的旧环境块。
+
+对客户端的含义：Tauri 应用如果在用户装 SVN **之前**就已启动，它同样看不见新装的
+`svn`，而用户会认为「我明明装了」。所以检测不到 `svn` 时的提示必须区分两种情况：
+
+- 持久 PATH 里**也没有** → 引导去安装
+- 持久 PATH 里**有**，但当前进程环境里没有 → 提示**重启应用**，不要让用户重装
+
+判定方式：读注册表 / `[Environment]::GetEnvironmentVariable("Path","Machine")` 对应的
+持久 PATH，与进程 PATH 比对。这条不实现的话，最常见的首次使用路径就会卡死在一个
+误导性的错误上。
 
 ## 18. 修订记录
 
