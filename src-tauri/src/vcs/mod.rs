@@ -34,15 +34,29 @@ pub trait Vcs: Send + Sync {
     fn diff(&self, scope: &str) -> Result<DiffData>;
 
     /// 把指定路径加入暂存区。
+    ///
+    /// 契约见 [`Vcs::discard`] 的空 paths 说明，同样适用。
     fn stage(&self, paths: &[String]) -> Result<()>;
 
     /// 把指定路径移出暂存区。
+    ///
+    /// 契约见 [`Vcs::discard`] 的空 paths 说明，同样适用。git 实现上这条尤其
+    /// 要紧：`git reset HEAD` 不带 pathspec 会清空整个暂存区且退出 0。
     fn unstage(&self, paths: &[String]) -> Result<()>;
 
     /// 丢弃指定路径的改动。`staged` 决定回退到暂存区还是 HEAD。
     ///
-    /// **空 paths 必须是 no-op**，不能退化成「全部」——那是一次误伤整个仓库的
-    /// 不可逆操作。各实现都要守住这条。
+    /// # 空 paths 契约
+    ///
+    /// **接收路径列表的每个方法，空列表都必须是 no-op**，绝不能退化成「全部」。
+    /// 这条对 `stage` / `unstage` / `discard` 一体适用。
+    ///
+    /// 理由是各命令行工具在这里的默认语义都危险且不一致：`git reset HEAD` 无
+    /// pathspec 清空整个暂存区并退出 0；`git checkout --` 无 pathspec 会覆盖整个
+    /// 工作区；Phase 3 的 `svn commit` 无 target 会提交整个工作副本且**不可撤销**。
+    /// 本项目已因空 pathspec 出过一次误伤整个仓库的事故（`AGENTS.md` §6.2）。
+    ///
+    /// 各实现在**进入命令行之前**挡住空列表，不要指望下游工具报错。
     fn discard(&self, paths: &[String], staged: bool) -> Result<()>;
 
     /// 提交暂存区内容。

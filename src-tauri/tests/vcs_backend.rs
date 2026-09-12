@@ -107,13 +107,75 @@ fn backend_diff_handles_commit_scope() {
 }
 
 #[test]
-fn backend_for_rejects_non_repo() {
+fn open_on_non_repo_reports_not_repo() {
     let dir = TempDir::new().unwrap();
-    // 空目录不是 git 仓库。backend_for 本身只是构造，错误在 open() 时才暴露——
-    // 这与重构前 open_repo 的行为一致，不能提前到构造时报错。
+    // 空目录不是 git 仓库。backend_for 本身不会失败——它只是构造，
+    // 错误在 open() 时才暴露。这与重构前 open_repo 的行为一致。
     let backend = backend_for(dir.path().to_str().unwrap()).unwrap();
     let err = backend.open().unwrap_err();
     assert_eq!(err.code, "not_repo");
+}
+
+#[test]
+fn backend_unstage_with_empty_paths_is_a_noop() {
+    // `git reset HEAD` 不带 pathspec 会**清空整个暂存区并退出 0**，静默成功。
+    // 实测确认（2026-09-12）。这与 discard 的空 pathspec 是同一类事故：
+    // 用户以为什么都没发生，实际上一批暂存被悄悄撤了。
+    let dir = repo();
+    let path = p(&dir);
+    let backend = backend_for(&path).unwrap();
+
+    backend.stage(&["a.txt".to_string()]).unwrap();
+    assert_eq!(backend.status().unwrap().staged.len(), 1);
+
+    backend.unstage(&[]).unwrap();
+
+    assert_eq!(
+        backend.status().unwrap().staged.len(),
+        1,
+        "空 paths 的 unstage 必须是 no-op，不能把整个暂存区清掉"
+    );
+}
+
+#[test]
+fn backend_stage_with_empty_paths_is_a_noop() {
+    let dir = repo();
+    let path = p(&dir);
+    let backend = backend_for(&path).unwrap();
+
+    // `git add` 无参数本身是安全的（报 "Nothing specified"），但它会以非零退出，
+    // 把一条无意义的报错弹到界面上。守卫让它安静地什么都不做。
+    backend.stage(&[]).unwrap();
+    assert_eq!(backend.status().unwrap().staged.len(), 0);
+}
+
+#[test]
+fn backend_stage_and_unstage_handle_dash_prefixed_paths() {
+    // 不带 `--` 的话，git 会把 `-dash.txt` 当成选项：
+    // `error: unknown switch 'd'`。实测确认（2026-09-12）。
+    let dir = repo();
+    let path = p(&dir);
+    let backend = backend_for(&path).unwrap();
+    fs::write(dir.path().join("-dash.txt"), "x\n").unwrap();
+
+    backend.stage(&["-dash.txt".to_string()]).unwrap();
+    let staged = backend.status().unwrap();
+    assert!(
+        staged.staged.iter().any(|f| f.path == "-dash.txt"),
+        "连字符开头的文件应能暂存：{:?}",
+        staged.staged.iter().map(|f| &f.path).collect::<Vec<_>>()
+    );
+
+    backend.unstage(&["-dash.txt".to_string()]).unwrap();
+    assert!(
+        !backend
+            .status()
+            .unwrap()
+            .staged
+            .iter()
+            .any(|f| f.path == "-dash.txt"),
+        "连字符开头的文件应能取消暂存"
+    );
 }
 
 #[test]

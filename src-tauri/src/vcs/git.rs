@@ -46,14 +46,27 @@ impl Vcs for GitBackend {
     }
 
     fn stage(&self, paths: &[String]) -> Result<()> {
-        let mut args: Vec<&str> = vec!["add"];
+        // 空 paths 直接返回：`git add` 无 pathspec 会打印 "Nothing specified,
+        // nothing added." 并把一条无意义的报错弹到界面上。
+        if paths.is_empty() {
+            return Ok(());
+        }
+        // `--` 不能省：没有它，`-dash.txt` 这种文件名会被 git 当成选项解析，
+        // 报 `error: unknown switch 'd'`（实测 2026-09-12）。
+        let mut args: Vec<&str> = vec!["add", "--"];
         args.extend(paths.iter().map(String::as_str));
         engine::git_cli::run_git(&self.root, &args)?;
         Ok(())
     }
 
     fn unstage(&self, paths: &[String]) -> Result<()> {
-        let mut args: Vec<&str> = vec!["reset", "HEAD"];
+        // 空 paths 必须提前返回：`git reset HEAD` 不带 pathspec 会**清空整个
+        // 暂存区并退出 0**（实测 2026-09-12），界面上看不出任何异常，用户以为
+        // 什么都没发生，实际上一批暂存被悄悄撤了。与 discard 的空 pathspec 同类。
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut args: Vec<&str> = vec!["reset", "HEAD", "--"];
         args.extend(paths.iter().map(String::as_str));
         engine::git_cli::run_git(&self.root, &args)?;
         Ok(())

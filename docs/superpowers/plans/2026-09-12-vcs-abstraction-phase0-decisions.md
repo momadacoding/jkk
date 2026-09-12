@@ -8,7 +8,8 @@
 ## 进度总账
 
 **重构前测试基线**（2026-09-12，worktree 内实测）：`cargo test` **200 passed / 0 failed**，
-21 个测试二进制。Task 6 拿它对账，最终应为 216。
+21 个测试二进制。Task 6 拿它对账，最终为 **219**（16 个等价性测试 + review 修复带来的
+3 个回归测试）。
 
 > 注：输出里那行 `error: cannot delete branch 'feat/busy' used by worktree` 是
 > `worktree_ops.rs` 某条失败路径测试的**预期 stderr**，不是测试失败——21 个二进制
@@ -47,17 +48,59 @@
 | `cargo build`（应用二进制） | 通过 |
 | `pnpm tauri dev` 启动冒烟 | 通过——Vite 就绪、`app.exe` 启动、无 panic 无启动期错误 |
 
-**未完成项（如实披露）**
+**E2E 点击验证：已完成（2026-09-12，用户在真实窗口执行）**
 
-- **真实窗口里的 7 条点击流程未执行。** agent 无法在 Tauri 窗口里点击操作，
-  启动冒烟只证明「起得来」，不等于「每个命令在 UI 上仍然通」。
-  fixture 已备好在
-  `<scratchpad>/e2e-fixture`（两条提交、一条 `feat/demo` 分支、一个已改文件、
-  一个未跟踪文件），清单见计划 Task 6 Step 5。**需要用户执行。**
+| # | 操作 | 结果 |
+|---|---|---|
+| 1–3 | 打开仓库 / 图渲染 / 点提交看 diff / Local Changes | ✅ 会话恢复时自动跑通，0 panic 0 ERROR |
+| 4 | 暂存 → 取消暂存 → 再暂存 → 提交 | ✅ |
+| 5 | 丢弃改动 | ✅ |
+| 6 | 新建分支 → 重命名 → 切过去 → 删掉 | ✅ |
+| 7 | stash → 列表 → pop | ✅ |
 
-  缓解证据：44 个命令签名逐字节未变、`invoke_handler!` 未动、前端零改动，
-  前后端契约不可能漂移；改动只在命令函数体，而那些路径由 216 个 Rust 测试覆盖
-  （其中 6 个测试文件直接调命令层）。
+用户在第 7 条观察到「stash 没有收走未跟踪文件」，**核实为设计行为、非回归**：
+`src/engine/toolbarActions.ts:54` 里普通点击传 `includeUntracked: false`，
+按住 Ctrl 时按钮变成 "Stash all" 才传 `true`（对应 `git stash push -u`）。
+master 上即如此，本次重构未触碰该路径。
+
+至此 `AGENTS.md` §5.1 要求的真实窗口验证已闭环。
+
+### 独立 review 结论（2026-09-12）
+
+按 `AGENTS.md` §4.1 的独立 review 门槛执行，6 条发现（2 medium / 4 low），无 blocking。
+reviewer 自行跑了 `cargo test`（216 passed），数字与本文件一致。
+
+**本 PR 内已修**
+
+| # | 问题 | 修法 |
+|---|---|---|
+| 2 | `unstage` 缺空参数守卫 | `GitBackend::stage` / `unstage` 加 `is_empty()` 提前返回；trait 文档把「空 paths 必须是 no-op」升级为**三个方法一体适用**的契约 |
+| 3 | `stage` / `unstage` 缺 `--` 分隔符 | 两处都补上 `--` |
+| 5 | `backend_for_rejects_non_repo` 名不符实 | 改名 `open_on_non_repo_reports_not_repo`——`backend_for` 根本不会失败，断言全在 `open()` 上，属 rubric #9 的虚假信心 |
+| 6 | 绕过接缝的写命令没记录 | 见上方「给 Phase 1 实现者的交接」整节 |
+
+新增 3 个回归测试（`backend_unstage_with_empty_paths_is_a_noop`、
+`backend_stage_with_empty_paths_is_a_noop`、
+`backend_stage_and_unstage_handle_dash_prefixed_paths`）。
+
+实测支撑（2026-09-12，临时 fixture）：
+
+```text
+git reset HEAD           （无 pathspec）→ 清空整个暂存区，退出码 0
+git add "-dash.txt"      （无 --）      → error: unknown switch 'd'
+git add -- "-dash.txt"                  → 退出码 0
+git add                  （无参数）     → "Nothing specified, nothing added."
+```
+
+**不在本 PR 修，另开 behavior-fix PR**
+
+| # | 问题 | 为什么不在这里修 |
+|---|---|---|
+| 1 | `engine::ops::path_set` 的 `Err(_) => HashSet::new()` 无差别吞掉所有 git 错误。`ls-tree` 探测若意外失败且 `staged=true`，HEAD 里本来存在的文件会落进 `remove` 桶被 `git rm -f`，变成「本想恢复、结果删掉」 | **从 master 原样搬来的既有行为**，修它会打破 Phase 0「行为零变化」这个整套验证赖以成立的前提。另：reviewer 给的触发条件（`index.lock` 竞争）**不成立**——`ls-tree` 读对象库，不拿 index.lock。底层担忧真实，触发路径需重新评估 |
+| 4 | `discard` 三阶段（restore → `rm -f` → unlink）无回滚，中途失败停在半丢弃状态 | 同为既有行为。顺序是「最不破坏优先」的有意设计，部分应用可接受，但缺一条说明注释 |
+
+两条都应在 Phase 1 开工前处理掉——它们都落在 `engine::ops::discard` 上，而 Phase 2
+的 `sync_in` 会依赖 discard 的可靠性。
 
 ## 决策条目
 
@@ -110,6 +153,29 @@
   计划 Step 8 里写了「clippy 可能报 `should_implement_trait`，若报了再改名」。
   实现时直接取了 `drop_entry`，没有先撞一次告警——`Drop::drop` 同名冲突是确定的，
   等 clippy 报再改属于明知故犯。trait 侧的方法名仍是 `stash_drop`，不受影响。
+
+#### 给 Phase 1 实现者的交接：接缝**不完整**，以下写命令仍直连 git
+
+这不是疏漏，是 spec §4.3 的有意范围划分。但 decisions 初版只列了
+`branch_delete_info` 一条，会让人误以为接缝已覆盖全部写操作。完整清单：
+
+| 命令 | 位置 | 为什么没进 trait |
+|---|---|---|
+| `checkout_remote_branch` | `commands/ops.rs` | 远程分支，SVN 侧无对应物 |
+| `delete_remote_branch` / `delete_remote_ref` | `commands/ops.rs` | 同上 |
+| `branch_delete_info` | `commands/ops.rs` | 删除前的护栏查询，位置刻意不动 |
+| `create_tag` / `push_tag` | `commands/ops.rs` / `remote.rs` | tag，SVN 侧无对应物 |
+| `cherry_pick` / `revert` | `commands/ops.rs` | 依赖 git 的 DAG 语义 |
+| `save_patch` | `commands/ops.rs` | `format-patch`，git 专属 |
+| `fetch` / `pull` / `push` | `commands/remote.rs` | Phase 2/3 会被 `sync_in`/`sync_out` 取代 |
+| `commands/worktree.rs` 全部（1359 行） | — | git worktree，SVN 模式下整块隐藏 |
+
+**Phase 1 的风险点**：一旦 `backend_for` 能返回非 git 后端，上面这些命令仍会对着
+同一个工作目录直接 `run_git`。Phase 1 必须同时做的是 `capabilities()` + 前端按能力
+隐藏入口，**而不是假定接缝已经拦住了它们**。
+
+另：`backend_for` 返回 `Result` 但当前实现永不失败，10 个调用点的 `?` 是死代码。
+这是**有意预留**——Phase 1 要在这里读并解析 `.git/mygitclient.json`，那一步会失败。
 
 #### 计划没写的坑
 
