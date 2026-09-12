@@ -1,7 +1,7 @@
 # SVN + Git 混合模式 设计规格
 
 - 日期：2026-09-12
-- 状态：设计已确认，未实现
+- 状态：设计已确认，未实现。已过一轮对抗性 review，五条 high 全部修入，见 §18
 - 分期：见 §16。本文覆盖全部 5 期的架构，各期另出实现计划
 
 ## 1. 背景与目标
@@ -249,14 +249,36 @@ SVN 没有类似 `.git/index.lock` 的工作副本级长效锁（`.svn/wc.db` �
 /Assets/*
 !/Assets/Scripts/
 /Assets/Scripts/**
+!/Assets/Scripts/**/          ← 必须有！重新纳入所有中间目录
 !/Assets/Scripts/**/*.cs
 !/Assets/Scripts/**/*.meta
 ```
 
-这套反转写法极易写错，因此**由代码生成、绝不让人手写**，并有独立单元测试
-（给定配置 → 断言哪些路径被纳入、哪些被剪掉，含 Windows 反斜杠形态的输入）。
+#### 为什么 `!/Assets/Scripts/**/` 这一行不能省
 
-目录级剪枝是性能的关键：git 不会递归进几十 GB 的美术目录，`git status` 保持秒回。
+git 的硬规则：**父目录被排除后，其中的文件无法再被重新纳入**。`/Assets/Scripts/**`
+会把 `Assets/Scripts/Player/` 这个**目录**一起排除掉，git 就不再往里递归，后面的
+`!/Assets/Scripts/**/*.cs` 对深层文件永远不会生效。
+
+2026-09-12 在临时 fixture 上实测（三层嵌套 + 干扰文件）：
+
+| 规则 | `Scripts/Top.cs` | `Scripts/Player/Mid.cs` | `Scripts/Player/Deep/Low.cs` | `Player/Junk.psd` | `Art/boss.fbx` |
+|---|---|---|---|---|---|
+| 缺 `!**/` | ✅ | ❌ **静默丢失** | ❌ **静默丢失** | 排除 ✓ | 排除 ✓ |
+| 补上 `!**/` | ✅ | ✅ | ✅ | 排除 ✓ | 排除 ✓ |
+
+这是本设计里最危险的一类缺陷：**用户以为文件受 git 保护，实际上没有**——切分支会
+丢改动、stash 存不进去、交付清单里不出现。Unity 工程的 `Assets/Scripts/` 底下必然
+有多层子目录，所以这条一定会被踩到。
+
+补上之后剪枝仍然有效：`Assets/Art/boss.fbx` 在 `/Assets/*` 这一层就被挡住，git
+根本不会递归进美术目录（`git check-ignore -v` 实测命中的是第 3 行）。被重新纳入的
+只有白名单**内部**的子目录，那里都是代码，递归代价可忽略。
+
+这套反转写法极易写错，因此**由代码生成、绝不让人手写**，并有独立单元测试：给定
+配置 → 用真实 git fixture 断言 `git ls-files` 的结果，**必须覆盖至少两层嵌套目录**，
+含 Windows 反斜杠形态的输入。断言对象是 git 的实际行为，不是生成出来的规则文本——
+测规则文本等于没测。
 
 ### 6.4 基线分支
 
@@ -296,22 +318,62 @@ git checkout -b work                 ← 立刻离开基线分支
 
 ### 6.6 状态判定
 
-每次刷新计算：
+#### 6.6.1 SVN 工作副本是 mixed-revision 的
+
+这是 SVN 与 git 最容易被忽略的差异，也是本节设计的全部理由。
+
+`svn commit` **只推进被提交节点的 revision**，工作副本里其余节点（包括根目录）留在
+原 revision。所以一次「提交了 `Assets/Scripts/Player.cs`」之后，工作副本是这样的：
 
 ```text
-baselineRev = svn/base 顶端 commit 的 Svn-Rev trailer   ← 权威记账
-wcRev       = svn info --xml 的 <entry revision>        ← 本地读，不联网，毫秒级
-remoteRev   = svn info --xml <URL> 的 revision          ← 走网络，异步，失败不阻塞
+根目录 .              r12345      ← 没动
+Assets/Scripts/Player.cs  r12346  ← 只有它前进了
+Assets/Art/boss.fbx       r12345
 ```
 
-| 判定 | 含义 | 界面 |
+**因此读工作副本根的单个 `<entry revision>` 不能证明任何事。** 外部只提交一个深层
+文件时，根的 revision 纹丝不动，`baselineRev == wcRev` 照样成立——§9 那道失同步门禁
+会被完整绕过，基线开始撒谎而界面上一片祥和。
+
+#### 6.6.2 分层检测
+
+```text
+baselineRev = svn/base 顶端 commit 的 Svn-Rev trailer     ← 权威记账
+rootRev     = svn info --xml 的 <entry revision>          ← O(1)，本地读，毫秒级
+nodeRevs    = svn status -v --xml -- <白名单路径>          ← 白名单内每个已版本控制
+                                                             节点的 revision 集合
+                                                             本地读，范围限于代码
+remoteRev   = svn info --xml <URL> 的 revision            ← 走网络，异步，失败不阻塞
+```
+
+**正常状态的不变量**：`nodeRevs` 是单元素集合，且等于 `{baselineRev}`。
+
+任何偏离都判为**基线失同步**：
+
+| 观察 | 含义 |
+|---|---|
+| `nodeRevs` 有多个值 | mixed revision，外部提交或局部 update 过 |
+| `nodeRevs = {N}` 但 `N != baselineRev` | 整体被外部推进或回退 |
+| `rootRev != baselineRev` | 根目录被动过 |
+
+未版本控制的文件（git 新增但还没 `svn add`）不参与该集合；已 `svn add` 尚未提交的
+节点没有 revision，同样跳过——但它们的存在本身就说明有外部登记，单独报警。
+
+#### 6.6.3 检查频次分层
+
+`svn status -v` 要走一遍白名单子树，比 `svn info` 贵得多（但仍是纯本地、范围限于
+代码文件，不是几十 GB 的美术）。所以分两档：
+
+| 时机 | 检查 | 理由 |
 |---|---|---|
-| `baselineRev == wcRev` | 正常 | — |
-| `baselineRev != wcRev` | **基线失同步**（外部动过工作副本） | 红色横幅，阻断同步操作，提供恢复向导 |
-| `remoteRev > wcRev` | 有新提交 | 「落后 N 个 revision」 |
+| 每次 `repo-changed` 刷新 | 只查 `rootRev`（O(1)） | 高频，抓得到大部分情况，代价可忽略 |
+| 打开仓库、`sync_in` / `sync_out` 第一步、恢复向导前 | **完整 `nodeRevs` 校验** | 这几处是正确性的闸门，必须问到底 |
+
+漏检的代价只是**延迟发现**——真正会造成数据损坏的操作全都在第二档后面，不存在
+「绕过闸门直接交付」的路径。
 
 `remoteRev` 走网络，按现有 `refreshPullRequests` 的模式处理：不 await、失败静默
-（读不到就不显示落后数，不弹错）。
+（读不到就不显示落后数，不弹错）。`remoteRev > rootRev` 时显示「落后 N 个 revision」。
 
 ## 7. 更新流程 sync_in
 
@@ -332,26 +394,44 @@ remoteRev   = svn info --xml <URL> 的 revision          ← 走网络，异步�
 任一不过则中止，且不做任何修改：
 
 1. 不在 rebase / merge 中途
-2. 基线未失同步
+2. 基线未失同步（走 §6.6.3 的**完整 `nodeRevs` 校验**，不是 O(1) 那档）
 3. 当前不在 `svn/base` 上
 4. `svn status` 里白名单外没有冲突态文件（`C`）
-5. 拿到该工作副本的独占锁
+5. **白名单外若有本地修改（`M` / `!`），列出来并要求用户确认**——见下
+6. 拿到该工作副本的独占锁
+
+#### 7.2.1 为什么第 5 条是确认而不是阻断
+
+白名单外的文件（美术资产、Unity 生成的 `.asset`）**git 完全不管**，客户端对它们
+没有任何恢复手段。S5 的全量 `svn update` 会把远端改动合并进这些本地修改，冲突时
+只会留下 SVN 的 `.mine` / `.rN` 文件，得回 TortoiseSVN 处理。
+
+但**不能因此阻断**：更新美术资产是程序同学的刚需（不更新 Unity 工程就跑不起来），
+而工作副本里常年挂着几个被 Unity 碰过的 `.meta` 是常态。阻断等于让这个功能不可用。
+
+所以：**如实列出来，说明风险，让用户决定**。确认后继续；S5 真冲突了就按 §13 报错
+并明确指出是白名单外的文件，引导去 TortoiseSVN——**不假装客户端能修**。
 
 ### 7.3 步骤
 
 ```text
 S0   挂起 watcher
-S1   工作区不干净 → git stash push -u -- <白名单>      记下 stashRef
-S2   记下 ORIG_BRANCH
+     写 operation journal（见 §7.6），phase=start          ← 任何修改之前
+S1   工作区不干净 → git stash push -u -- <白名单>
+     立刻 git rev-parse refs/stash 取不可变 OID
+     git update-ref refs/mygitclient/sync/<opid> <OID>
+     OID 写进 journal                                      ← 不记 stash@{0}，见 §7.6.1
+S2   ORIG_BRANCH 写进 journal
 S3   git checkout svn/base
-S4   svn status --xml 校验白名单内应为 0 修改          ← 双保险
+S4   svn status --xml 校验白名单内应为 0 修改              ← 双保险
 S5   svn update --accept postpone
-S6   svn info --xml 读新 revision
-S7   git add -A -- <白名单> && git commit               新基线
+S6   svn info --xml + svn status -v --xml 读新 revision
+S7   git add -A -- <白名单> && git commit --allow-empty     新基线
 S8   git checkout ORIG_BRANCH
-S9   git rebase --empty=drop svn/base                   ← 冲突在这里爆
-S10  git stash pop（若 S1 有 stash）
-S11  恢复 watcher + 主动发 repo-changed
+S9   git rebase --empty=drop svn/base                       ← 冲突在这里爆
+S10  git stash apply <OID>（若 S1 有 stash），成功后
+     git stash drop 对应条目 + 删掉 refs/mygitclient/sync/<opid>
+S11  删除 journal；恢复 watcher + 主动发 repo-changed
 ```
 
 ### 7.4 不显然的点
@@ -372,20 +452,62 @@ S2–S7 之间工作目录会短暂回到基线状态，Unity 会多触发一次
 只影响白名单内的代码文件，是一次编译的量级。相对于「SVN 冲突文件满地 + 可能丢
 改动」，这个代价可以接受。
 
-### 7.6 中断状态的持久化
+### 7.6 Operation journal（写前日志）
 
-S9 / S10 卡在冲突时，若客户端崩溃或被关闭，重开后必须知道上次同步没走完。
+`sync_in` 和 `sync_out` 共用这一套。它不是「冲突时才写的状态文件」，而是**写前
+日志**：任何一步修改落地之前，journal 必须已经在磁盘上。
 
-- rebase 中途：git 自己记在 `.git/rebase-merge/`，现有 `repo_state` 命令已能报出，
-  **复用**
-- stash 未 pop：git 不记，落 `.git/mygitclient-sync.json`：
+否则存在无法恢复的窗口——S1 完成 stash 之后、S2 写状态之前崩溃，用户的 WIP 就
+只剩一个匿名 stash 条目，客户端重开后对它一无所知；D4 登记完 `svn add` / `svn delete`
+之后崩溃，`.svn` 里挂着一批登记而没有任何记录说明它们是谁留下的。
+
+`.git/mygitclient-sync.json`：
 
 ```json
-{ "phase": "rebase", "origBranch": "work", "stashRef": "stash@{0}", "startedAt": 1757000000 }
+{
+  "opid": "0f3a…",
+  "flow": "sync_in",
+  "phase": "rebase",
+  "startedAt": 1757000000,
+  "origBranch": "work",
+  "origHead": "e5d3f77…",
+  "stashOid": "f2208125aad7d35d63ee9495ad0a6cc3c1ce21be",
+  "baselineRevBefore": 12345,
+  "svnAdded": ["Assets/Scripts/JumpConfig.cs"],
+  "svnDeleted": ["Assets/Scripts/Old.cs"],
+  "expectedStartRev": 12345,
+  "commitMessage": "…"
+}
 ```
 
-流程正常收尾时删除。打开仓库时发现它存在 → 界面顶部常驻「上次同步未完成」提示，
-提供继续 / 放弃两个入口。
+规则：
+
+- **原子写入**：写临时文件 → `fsync` → rename。半个 JSON 比没有 JSON 更糟
+- **每进入一个 phase 前先更新 `phase` 字段**，而不是事后补记
+- 流程正常收尾时删除；打开仓库时发现它存在 → 界面顶部常驻「上次同步未完成」，
+  提供继续 / 放弃两个入口
+- rebase 中途的状态**不重复记**：git 自己记在 `.git/rebase-merge/`，现有
+  `repo_state` 命令已能报出，复用它
+
+#### 7.6.1 stash 必须按不可变 OID 记，不能记 `stash@{N}`
+
+`stash@{0}` 是**栈位置，不是身份**。任何一次新的 stash（你自己、IDE、另一个打开
+同一仓库的标签页）都会把它挤走，随后按 `stash@{0}` 恢复会应用到**别人的 WIP**。
+
+2026-09-12 实测：
+
+```text
+git stash push -u          → refs/stash = f2208125…   （记下这个 OID）
+（模拟 IDE 又压了一个）     → stash@{0}  = 5072d1f2…   ⇒ 已漂移
+git stash apply f2208125…  → 取回的仍是正确的 WIP     ✓
+```
+
+所以：push 之后**立刻**取 `git rev-parse refs/stash` 得到 OID，用
+`git update-ref refs/mygitclient/sync/<opid> <OID>` 钉住（防止 stash 被外部 drop
+后对象被 gc），OID 写进 journal；恢复时用 `git stash apply <OID>`。
+
+恢复前必须先校验该 OID 对象仍然存在且是一个 stash 形状的 commit，不存在就报错停下，
+**不猜、不退回用 `stash@{0}`**。
 
 ## 8. 交付流程 sync_out
 
@@ -402,20 +524,65 @@ S9 / S10 卡在冲突时，若客户端崩溃或被关闭，重开后必须知�
 ### 8.2 步骤
 
 ```text
-D0   挂起 watcher
-D1   git diff --name-status --no-renames svn/base..HEAD    ← 净变更清单
-D2   按白名单过滤清单                                       ← 双保险
-D3   把清单给用户确认（A/M/D 分类、文件数、提交信息）        ← 不可撤销前的关口
-D3.5 再查一次 remoteRev                                     ← 压缩竞态窗口
-D4   A → svn add --parents <files>
+D0   挂起 watcher；写 journal，phase=prepare                ← 任何修改之前
+D1   git diff --name-status --no-renames svn/base..HEAD     ← 净变更清单
+D2   按白名单过滤清单                                        ← 双保险
+D3   把清单给用户确认（A/M/D 分类、文件数、提交信息）         ← 不可撤销前的关口
+D3.5 再查一次 remoteRev，写进 journal 的 expectedStartRev    ← 压缩竞态窗口 + 查证锚点
+D4   phase=svn-staged，svnAdded / svnDeleted 写进 journal
+     A → svn add --parents <files>
      D → svn delete <files>
      M → 无需操作
-D5   svn commit --non-interactive -m <msg> -- <显式 target 列表>
-D6   svn update（拿到自己刚提交的 revision）
-D7   落新基线 commit（--allow-empty）
-D8   提示「work 分支已交付，可删除」——不自动删
-D9   恢复 watcher
+D5   phase=committing
+     svn commit --non-interactive --with-revprop mygitclient:opid=<opid>
+       -m <msg> -- <显式 target 列表>
+D6   phase=post-commit  ← 过了这一步服务器状态已不可撤销
+     svn update --accept postpone -- <白名单路径>            ← 只更新白名单，见 §8.2.1
+D7   svn status -v --xml 读新的 nodeRevs → r_new
+D8   推进基线（见 §8.2.2）
+D9   提示「work 分支已交付，可删除」——不自动删
+D10  删除 journal；恢复 watcher
 ```
+
+#### 8.2.1 D6 为什么只更新白名单路径
+
+前置检查只要求 **git 工作区**干净，白名单外的文件（美术资产、Unity 生成的 `.asset`）
+完全可能有本地修改——§7.2.1 已经说明这是常态，不能阻断。
+
+D5 成功之后服务器状态**已经不可撤销**。此时若再跑一次全量 `svn update`，它会把
+别人的改动合并进那些白名单外的本地修改，冲突就留下 `.mine` / `.rN` 文件，而客户端
+对这些文件没有任何恢复手段——等于在「已经无法回头」之后又主动引入一类没法收拾的
+失败。
+
+所以 D6 用 `svn update -- <白名单路径>`：范围限定在 git 管得住的文件上，这些文件
+此刻的内容与服务器 base 完全一致（刚提交完），合并必然干净。
+
+代价是工作副本变成 mixed-revision，美术资产停在旧 revision。这**不是问题**：
+§6.6 的检测本来就按白名单节点判定，美术更新交给下一次 `sync_in`（那里有 §7.2.1
+的确认流程兜底）。
+
+#### 8.2.2 D8 推进基线：必须显式编排分支
+
+D5 成功之后，磁盘上白名单文件的内容 = **当前工作分支 tip 的内容** = 服务器 r_new
+的内容。新基线的树就应该是它。
+
+`svn/base` 是工作分支的祖先，所以可以纯快进：
+
+```text
+D8a  git branch -f svn/base HEAD        ← 只动指针，工作目录一个文件都不碰
+D8b  git checkout svn/base              ← 与 HEAD 同点，工作目录无变化
+D8c  git add -A -- <白名单>              ← 收进 D6 拉下来的他人改动（若有）
+     git commit --allow-empty -m "svn: r_new …  Svn-Rev: r_new"
+D8d  git checkout <ORIG_BRANCH>
+     git merge --ff-only svn/base       ← 纯快进，不可能冲突
+```
+
+D8a 先动指针再 checkout 是关键：**反过来先 `git checkout svn/base` 会把工作目录
+退回旧基线内容**，而此刻 SVN 的 base 已经是刚提交的新内容——SVN 会把这看成「你
+把自己刚提交的东西全撤了」，正是 §9.2 描述的基线撒谎场景，只不过是自己造出来的。
+
+D8d 的 `--ff-only` 是断言而非优化：走到这里必然是快进，不是快进就说明前面某步的
+假设崩了，应当报错停下而不是自作主张 merge。
 
 ### 8.3 空清单必须中止
 
@@ -477,21 +644,57 @@ D4 的两类登记，撤销方式**不对称**：
 没有。盲目回滚是错的——如果实际成功了，撤销 D4 会导致下次交付把同样内容再提交
 一遍。
 
-**先查证，再决定**：
+#### 8.6.1 查证必须靠幂等键，不能靠「作者 + 提交信息」
+
+「查最近 5 条里有没有作者是你、message 相同的 revision」两个方向都会错：
+
+| 误判 | 场景 | 后果 |
+|---|---|---|
+| 假阳性 | 你之前提交过同样的 message（重试过、或用了 `修复编译` 这类通用信息） | 把**真失败**当成功，跳过回滚并推进基线 → 基线撒谎 + `.svn` 里挂着未撤销的登记 |
+| 假阴性 | 断网时间长，服务器期间新增了超过 5 个 revision | 把**真成功**当失败，执行回滚 → 同样内容被重复交付一遍 |
+
+两者都会直接损坏本设计的核心不变量。所以查证必须建立在**唯一标识**上。
+
+#### 8.6.2 查证流程
+
+D3.5 / D4 已经把以下内容写进 journal（§7.6），它们是查证的全部依据：
+
+- `opid`：本次交付的 UUID
+- `expectedStartRev`：D3.5 读到的 remoteRev，即「提交前服务器的 HEAD」
+- `svnAdded` / `svnDeleted` + M 清单：本次提交的完整路径集合
 
 ```text
-D5 失败且错误属网络类
+D5 失败且错误属网络类（连接重置 / 超时 / 回执缺失）
    ↓
-恢复连通后，svn log --xml -l 5 <URL>
+恢复连通后，查 expectedStartRev+1 .. HEAD 的**完整区间**（不是「最近 N 条」）
+   svn log --xml -v --with-all-revprops -r <expectedStartRev+1>:HEAD <URL>
    ↓
-查最近几条 revision 里有没有「作者是你、提交信息是你刚输入的那条」
-   ├─ 有   → 提交其实成功了。不回滚，直接跳到 D6
-   ├─ 没有 → 真失败，按 §8.5 回滚
-   └─ 查不到（仍连不上）→ 什么都不做，进入「交付状态未知」，
-                          界面常驻警示，等网络恢复后再点一次查证
+按优先级匹配：
+   ① revprop mygitclient:opid == 本次 opid      ← 首选，精确幂等键
+   ② 无 revprop 时：作者相同 且 changed-paths 集合与本次清单完全一致
+   ↓
+   ├─ 命中 → 提交其实成功了。不回滚，记下命中的 revision，直接跳到 D6
+   ├─ 区间内无命中 → 真失败，按 §8.5 回滚
+   └─ 仍连不上 → 什么都不做，phase 停在 committing，
+                 界面常驻「交付状态未知」，等网络恢复后再点一次查证
 ```
 
-「交付状态未知」要落进 `.git/mygitclient-sync.json`，客户端重开也要记得。
+查**完整区间**而不是「最近 N 条」是硬要求：断网可能持续几小时，N 取多大都是猜。
+区间的起点来自提交前就已落盘的 `expectedStartRev`，不依赖任何事后推断。
+
+匹配 changed-paths 而不是 message，是因为路径集合由本次交付的净变更唯一确定，而
+message 是用户自由输入的文本。
+
+#### 8.6.3 关于 revprop 幂等键
+
+`svn commit --with-revprop mygitclient:opid=<uuid>` 在提交时写入自定义 revprop。
+按 SVN 的设计，`pre-revprop-change` 钩子管的是**事后修改** revprop，提交时携带
+revprop 不受该钩子限制——但**这一条必须在 fixture 里实测确认**，公司服务器也可能
+另有限制。
+
+因此实现上：revprop 是**首选**路径，changed-paths 匹配是**必须存在的兜底**。
+若服务器拒绝 revprop，客户端应降级到 ② 并在界面上说明查证精度降低，而不是让整个
+交付流程失败。
 
 ### 8.7 绝不自动重试
 
@@ -550,16 +753,20 @@ git add && git commit   → 落「新基线」，内容是旧的 r12345，却打
 ### 9.4 恢复流程
 
 ```text
-① git stash -u                          保护未提交改动，可逆
-② 记下当前分支
+⓪ 写 journal（flow=recover），phase=start            ← 任何修改之前，见 §7.6
+① git stash push -u -- <白名单>；立刻取 OID 并用
+   refs/mygitclient/sync/<opid> 钉住，写进 journal   保护未提交改动，可逆
+② 原分支与 origHead 写进 journal
 ③ git checkout svn/base                 磁盘 = 旧基线内容
-④ svn status --xml，取出白名单内、状态为 M/! 的**显式文件列表**
+④ svn status -v --xml，取出白名单内、状态为 M/! 的**显式文件列表**
    ⚠️ 列表为空 → 跳到 ⑥，绝不执行空参数的 svn revert
-⑤ svn revert <显式文件列表>              恢复到 r12346 的 base 内容
-⑥ git add <白名单> && git commit         新基线，Svn-Rev: 12346
+⑤ svn revert <显式文件列表>              恢复到服务器 base 内容
+⑥ git add -A -- <白名单> && git commit --allow-empty
+                                        新基线，Svn-Rev 取自 ⑤ 之后重读的 nodeRevs
 ⑦ git checkout <原分支>
    git rebase --empty=drop svn/base      已被误传上去的 commit 会变成空 commit，自动丢弃
-⑧ git stash pop
+⑧ git stash apply <OID>；成功后 drop 该条目并删掉钉住的 ref
+⑨ 删除 journal
 ```
 
 ### 9.5 第 ⑤ 步为什么安全
@@ -716,14 +923,17 @@ React 依赖、可直接单测。
 
 | 失败点 | 原因 | 回滚到 | 用户看到 |
 |---|---|---|---|
-| S3 `git checkout` 失败 | **Unity 开着锁住了 .cs / .dll** | `git stash pop` | 「Unity.exe (PID 1234) 占用了 X 文件」——复用现有 `engine/file_lock.rs` |
-| S4 校验不通过 | 外部改过工作副本 | 切回 ORIG_BRANCH + stash pop | 基线失同步，进 §9.4 恢复向导 |
-| S5 网络 / 认证失败 | VPN 没连、凭据过期 | 切回 ORIG_BRANCH + stash pop | 原样展示 svn stderr |
+| S3 `git checkout` 失败 | **Unity 开着锁住了 .cs / .dll** | `git stash apply <OID>` | 「Unity.exe (PID 1234) 占用了 X 文件」——复用现有 `engine/file_lock.rs` |
+| S4 校验不通过 | 外部改过工作副本 | 切回 ORIG_BRANCH + stash apply | 基线失同步，进 §9.4 恢复向导 |
+| S5 网络 / 认证失败 | VPN 没连、凭据过期 | 切回 ORIG_BRANCH + stash apply | 原样展示 svn stderr |
 | S5 树冲突 | 服务器删了 / 换掉了某个目录 | 同上 | 明确说明是树冲突，给出受影响路径 |
+| S5 白名单**外**文件冲突 | 美术资产有本地修改（§7.2.1 已确认过） | 同上 | 明确指出是 git 管不到的文件，**引导去 TortoiseSVN**，不假装能修 |
 | S9 rebase 冲突 | 正常的代码冲突 | **不回滚**，停在冲突态 | 进入冲突解决模式 |
-| S10 stash pop 冲突 | 未提交改动与新基线冲突 | 不回滚，**stash 保留不删** | 同上 + 明确告知 stash 还在 |
+| S10 stash apply 冲突 | 未提交改动与新基线冲突 | 不回滚，**stash 与钉住的 ref 都保留不删** | 同上 + 给出 stash 的 OID |
 | D5 各类失败 | 见 §8.6 | 见 §8.5 | 见 §8.6 |
-| 任意步骤客户端崩溃 | — | 靠 `mygitclient-sync.json` | 重开后提示「上次同步未完成」 |
+| **D6 update 失败 / 冲突** | 服务器在 D5 之后又有提交，且与白名单文件冲突 | **不可回滚**——D5 已落地 | 明确告知「提交已成功、基线尚未推进」，journal 停在 `post-commit`，提供「重试 D6 起」的入口 |
+| **D8d 不是快进** | 前面某步的假设崩了 | 停下不动 | 报错并导出 journal，**不自动 merge** |
+| 任意步骤客户端崩溃 | — | 靠 §7.6 的写前 journal | 重开后按 `phase` 给出对应的继续 / 放弃入口 |
 
 ## 14. 测试策略
 
@@ -758,12 +968,19 @@ svn checkout file:///<tmp>/repo  <tmp>/wc2     ← 「同事」，用来制造�
 | 3 | 交付含新增 + 删除，`svn commit` 因 out-of-date 失败后**回滚的精确性** | 1、2 |
 | 4 | 更新流程遇 rebase 冲突时停在正确状态，abort 能回到原样 | 2 |
 | 5 | 外部 `svn commit` 后的失同步检测 | 1 |
-| 6 | exclude 规则生成：Windows 反斜杠、盘符、大小写 | 11 |
-| 7 | 基线映射 → svn 节点的图合成，含孤儿 baseline | 8 |
-| 8 | `svn update` 带来的树冲突（wc2 删掉一个目录） | 1 |
-| 9 | 未初始化的 SVN 工作副本（有 `.svn` 无 `.git`）的识别 | 3 |
-| 10 | **白名单外的文件绝不出现在任何 git / svn 命令的参数里** | 3、4 |
-| 11 | 同步进行中的并发 invoke 被正确拒绝 | 5 |
+| 6 | **exclude 规则：至少两层嵌套目录的源码必须真的被 git 跟踪**（§6.3），断言 `git ls-files` 而非规则文本 | 9、11 |
+| 7 | exclude 规则生成：Windows 反斜杠、盘符、大小写 | 11 |
+| 8 | 基线映射 → svn 节点的图合成，含孤儿 baseline | 8 |
+| 9 | `svn update` 带来的树冲突（wc2 删掉一个目录） | 1 |
+| 10 | 未初始化的 SVN 工作副本（有 `.svn` 无 `.git`）的识别 | 3 |
+| 11 | **白名单外的文件绝不出现在任何 git / svn 命令的参数里** | 3、4 |
+| 12 | 同步进行中的并发 invoke 被正确拒绝 | 5 |
+| 13 | **mixed revision 检测**：wc2 只提交一个深层文件，wc1 的根 revision 不动，`nodeRevs` 校验必须报失同步（§6.6.1） | 1、3 |
+| 14 | **断网查证**：制造「提交成功但客户端认为失败」，用 opid / changed-paths 在完整区间内正确判定（§8.6.2）；另测假阳性场景——先用同样的 message 提交过一次 | 1、2 |
+| 15 | **D6 白名单外有本地修改时交付仍安全**：wc1 改一个美术文件不提交，wc2 提交别的内容，走完整交付，断言美术文件的本地修改**未被合并、未产生冲突文件**（§8.2.1） | 2、4 |
+| 16 | **逐 phase 崩溃恢复**：在 S1 后、D4 后、D5 后各杀一次进程，重开必须能按 journal 给出正确的继续 / 放弃路径（§7.6） | 2、5 |
+| 17 | **stash OID 抗漂移**：stash 之后由外部再压一个 stash，恢复必须仍取回正确的 WIP（§7.6.1） | 1、5 |
+| 18 | **D8 分支编排**：交付后基线确实推进到新内容，且工作分支是快进；断言不会出现「基线内容是旧的却标着新 revision」（§8.2.2） | 1 |
 
 ### 14.3 前端
 
@@ -783,6 +1000,11 @@ exclude 生成与图合成都在 Rust 侧，由 cargo test 覆盖。
 5. **`.prefab` / `.unity` 不归 git 管**（D7），这类文件的并行修改仍需团队人工协调
 6. **不能有名为 `svn` 的 git 分支**（§6.4）
 7. **本仓库没有 PR 门禁 CI**，所有验证靠本地实际执行
+8. **交付后工作副本是 mixed-revision**：D6 只更新白名单路径（§8.2.1），美术资产
+   停在旧 revision，要等下一次 `sync_in` 才跟上。这是刻意的取舍——换来的是「提交
+   已不可撤销之后不再引入无法收拾的冲突」
+9. **白名单外文件的冲突客户端修不了**：git 不管这些文件，`svn update` 在它们上面
+   产生的冲突只能回 TortoiseSVN 处理。客户端负责如实报告，不负责修复
 
 ## 16. 分期
 
@@ -809,3 +1031,29 @@ exclude 生成与图合成都在 Rust 侧，由 cargo test 覆盖。
   `svnadmin`，需先安装。TortoiseSVN 默认不装命令行工具，需在安装器里勾选
   「command line client tools」；或用 `scoop install svn`（SlikSVN，自带 `svnadmin`）
 - 打开 SVN 仓库时若检测不到 `svn`，客户端必须给出明确的安装引导，而不是抛裸错误
+
+## 18. 修订记录
+
+### 2026-09-12 · 对抗性 review 后的五处修正
+
+初版（commit `928923f`）经 Codex 对抗性 review，五条 high 全部成立，已修入本文。
+这些都是**会破坏数据保护与恢复不变量**的缺陷，不是措辞问题。
+
+| # | 缺陷 | 核验方式 | 修正 |
+|---|---|---|---|
+| 1 | 反向 ignore 规则漏掉嵌套源码：`/Assets/Scripts/**` 排除了子目录，git 不再递归，后续 `!…/*.cs` 对深层文件永不生效 | **临时 git fixture 实测**：3 个 `.cs` 只纳入 1 个 | §6.3 补 `!/Assets/Scripts/**/`；测试改为断言 `git ls-files`，必须覆盖两层嵌套 |
+| 2 | 单个根 revision 无法表示 SVN 的 mixed-revision 工作副本，外部提交深层文件时失同步门禁被完全绕过 | 未实测（本机无 svn），按 SVN 既定语义接受 | §6.6 改为白名单 `nodeRevs` 集合校验 + 检查频次分层 |
+| 3 | 断网后靠「作者 + message」查证不是唯一标识，假阳性会把真失败当成功、假阴性会重复交付 | 逻辑核验 | §8.6 改为 opid revprop 幂等键 + `expectedStartRev` 完整区间 + changed-paths 兜底 |
+| 4 | D5 之后的全量 `svn update` 会在「已不可撤销」之后合并白名单外的本地修改，且失败路径表未覆盖 D6 | 逻辑核验 | §8.2.1 D6 改为只更新白名单路径；§7.2.1 新增白名单外修改的确认关口；§13 补 D6 / D8 行 |
+| 4b | **review 未点破的更深缺陷**：原 D7「落新基线 commit」没写落在哪个分支，按字面会提交到工作分支上，基线根本不推进 | 自查时发现 | §8.2.2 新增显式分支编排（先 `branch -f` 再 checkout，`--ff-only` 作断言） |
+| 5 | 中断状态不是写前日志（S1→S2、D4→D5 之间崩溃无记录），且记录可变的 `stash@{0}` 会被外部 stash 挤走 | **实测确认漂移** | §7.6 改为原子写入的 operation journal；stash 按不可变 OID + 专用 ref 钉住 |
+
+§14.2 相应新增 6 个必测场景（#13–#18），覆盖 mixed revision、嵌套 ignore、断网
+查证的两个方向、D6 白名单外安全性、逐 phase 崩溃恢复、stash OID 抗漂移。
+
+**仍需 fixture 实测确认的假设**（本机尚无 `svn`，见 §17）：
+
+- `svn commit --with-revprop` 是否受服务器钩子限制（§8.6.3 已设计降级路径）
+- `svn status -v --xml` 在白名单子树上的实际性能与 `<wc-status revision>` 字段形状
+- `svn update -- <paths>` 造成的 mixed-revision 对后续 `svn commit` 的影响
+- §8.6 表中的 SVN 错误码（E155011 / E160028 / E170001 / E165001）按记忆写入，须校准
