@@ -182,6 +182,34 @@ worktree、tag、remote 分支、PR、cherry-pick、revert 在 SVN 模式下没�
 - **拒绝而不是排队**。排队会让用户点了没反应、几秒后突然生效，比明确报错更糟
 - 读操作（status / diff / graph）不阻塞，但要能返回「同步进行中」状态供 UI 显示
 
+#### 5.1.1 这把锁必须是跨进程的
+
+**`std::sync::Mutex` 不够——它的作用域只到进程边界。** 现有代码里的锁全是这一类
+（`commands/session.rs` 的 `SAVE_LOCK`、`commands/watch.rs` 的 `WATCHERS`），而且仓库
+**没有引入 `tauri-plugin-single-instance`**，所以同一个工作副本上完全可能开着两个
+mygitclient 进程。
+
+两个进程各自拿到自己那把进程内锁之后会发生什么：
+
+- 同时写 `.git/mygitclient-sync.json`，后写的把前一个的 journal 整个覆盖掉——被覆盖
+  那一方的 stash OID、`deliverRef`、`svnDelta` 全部丢失，等于失去恢复依据
+- 同时 `git checkout` / `svn add` / `svn commit`。git 自己的 `index.lock` 只保护
+  **单条命令**，保护不了整段编排；SVN 侧更是直接对着同一个 `.svn` 乱来
+
+所以锁必须落在**文件系统**上：
+
+```text
+锁文件：.git/mygitclient-sync.lock
+获取：  以「原子创建且必须不存在」的语义打开（POSIX O_EXCL / Windows CREATE_NEW）
+        写入 { pid, startedAt, opid }
+释放：  流程收尾时删除（§8.2.4 ⑤ / S11 / D10 都要包含这一步）
+陈旧锁：只有当记录的 pid 已不存在时才允许接管，接管必须写日志并告知用户
+        ⚠️ 不能只看时间戳——一次 svn commit 卡在网络上几分钟是正常的
+```
+
+**journal 的所有权由这把锁界定**：拿到锁才允许读写 journal。没有这条，§7.6 的写前
+日志在多进程下是没有意义的——另一个进程随时可能把它覆盖掉。
+
 ### 5.2 文件监听重入
 
 `svn update` 一次改动成百上千个文件。现有 `commands/watch.rs` 是 300ms 尾沿去抖，
@@ -231,6 +259,40 @@ SVN 没有类似 `.git/index.lock` 的工作副本级长效锁（`.svn/wc.db` �
 ```
 
 客户端提供「打开配置文件」入口，沿用现有 `open_custom_commands_config` 的模式。
+
+#### 6.2.1 配置是不可信输入，必须校验
+
+这个文件**用户手写**，所以它和用户在输入框里敲的字符串是同一个可信级别。每一个字段
+都会被送进 git 或 svn 的命令行，不校验就等于把命令构造交给了手滑。
+
+**`svnUrl` 是后果最重的一个。** 它只用于「问服务器」的那些操作（`remoteRev`、历史、
+**断网查证**），而提交是对着当前工作副本做的。两者指向不同仓库时不会有任何报错：
+
+```text
+svnUrl 写错（复制了另一个项目的地址）
+  → D3.5 读到的 expectedStartRev 是另一个仓库的 revision
+  → §8.6.2 的查证在另一个仓库的 log 里找路径集合
+  → 完全可能"找到"一个路径集合相同的 revision  → 判定本次提交成功
+  → 推进基线到一个根本没发生过的交付上          → 基线撒谎
+```
+
+所以：**`svnUrl` 必须与 `svn info` 读到的工作副本 URL 一致，并且比对 repository
+UUID**（`svn info --xml` 的 `<uuid>`）。UUID 才是仓库身份，URL 可能因为代理、镜像、
+`http` / `https` 而写法不同。不一致一律阻断，不猜、不自动改写。
+
+其余字段：
+
+| 字段 | 规则 |
+|---|---|
+| `baselineBranch` | **固定为 `svn/base`**，不再声称可配。全文所有流程都硬编码了这个名字，留一个可配字段只会让两者不一致。字段保留是为了向前兼容，值不是 `svn/base` 就阻断并说明 |
+| `whitelist` | 必须是**仓库内相对路径**。拒绝：绝对路径、盘符（`C:`）、UNC、`..` 段、空串、`/`、`.`、以 `.git` 或 `.svn` 开头的路径、以 `:` 开头的 pathspec magic（`:(exclude)` 之类）。分隔符统一规范化为 `/` |
+| `extensions` | 必须以 `.` 开头、不含路径分隔符和通配符 |
+| 两者皆空 | 阻断。空白名单会让 §12.2 的空参数保护在每一步都触发，等于功能不可用 |
+
+白名单条目同时会被当成 **git pathspec** 和 **SVN target** 用，两套语义都有自己的魔法
+字符。`AGENTS.md` §6.2 记的空 pathspec 教训就是这一类——git 把空 pathspec 当"全部"，
+而这里一个 `:(exclude)` 或一个 `..` 就能让命令作用到预期之外的范围。**校验必须在配置
+加载时一次做完，不要散落到各个调用点。**
 
 ### 6.3 白名单语义
 
@@ -315,7 +377,9 @@ Svn-Url: https://svn.company.com/game/trunk
 
 ```text
 P1  白名单内 svn status 必须干净
-      不允许存在 M / A / D / R / C / ! / ~ 任何一种
+      不允许存在 M / A / D / R / C / ! / ~ / ? 任何一种
+      ⚠️ 必须带 --no-ignore：svn status 默认隐藏 SVN-ignored 文件，而那些
+         文件 git 照收，不带这个参数就会漏检
       ⚠️ 不自动规范化——revert 用户的本地修改是破坏性的，只拦住并引导去
          TortoiseSVN 自己处理（提交或还原），对齐 §8.1 #2 的做法
 P2  nodeRevs 必须是单元素集合 {N}
@@ -379,7 +443,7 @@ Assets/Art/boss.fbx       r12345
 ```
 
 **因此读工作副本根的单个 `<entry revision>` 不能证明任何事。** 外部只提交一个深层
-文件时，根的 revision 纹丝不动，`baselineRev == wcRev` 照样成立——§9 那道失同步门禁
+文件时，根的 revision 纹丝不动，`baselineRev == rootRev` 照样成立——§9 那道失同步门禁
 会被完整绕过，基线开始撒谎而界面上一片祥和。
 
 #### 6.6.2 分层检测
@@ -555,7 +619,9 @@ S0   挂起 watcher
 S1   工作区不干净时：
      ① phase=stashing，stashRefBefore = git rev-parse refs/stash
         （不存在则记 null）                                ← 必须早于 push，见 §7.3.1
-     ② git stash push -u -- <白名单>                       ← 第一次改动工作区
+     ② git stash push -u -m "mygitclient-sync:<opid>" -- <白名单>
+                                                        ← 第一次改动工作区。message 里的
+                                                          opid 是恢复时的精确锚点，见 §7.3.1
      ③ 立刻 git rev-parse refs/stash 取不可变 OID
      ④ git update-ref refs/mygitclient/sync/<opid> <OID>
      ⑤ OID 写进 journal，phase=stashed                     ← 不记 stash@{0}，见 §7.6.1
@@ -591,25 +657,49 @@ refs/stash: 多了一条谁也不认识的条目，里面是用户的 WIP
 `phase=start` 的语义是「还没动任何东西」，恢复代码据此什么都不会做，用户的未提交改动
 就这样变成一个匿名 stash 条目躺在那里。
 
-**修法是把可先知的信息全部前置**，剩下那个真的无法前置的（stash 的 OID）改用**前后
-对比**来定：
+**修法有两半。** 一半是把可先知的信息全部前置（`origBranch` / `origHead` 提到 S0，
+`stashRefBefore` 提到 push 之前）；另一半是**给 stash 本身打上 opid 标记**，这样
+「栈顶那条是不是我的」就不再需要猜。
+
+`opid` 在 push 之前就已经存在，所以可以直接写进 stash 的 message：
+
+```text
+git stash push -u -m "mygitclient-sync:<opid>" -- <白名单>
+```
+
+恢复时按 opid 在 stash 的 reflog 里精确定位，**不依赖栈位置**：
 
 ```text
 恢复时读到 phase=stashing：
-  now = git rev-parse refs/stash（不存在则 null）
-  ├─ now != stashRefBefore → push 确实落地了，栈顶那条就是我们的。
-  │                          取它的 OID，补上 update-ref 和 journal，继续按 stashed 处理
-  └─ now == stashRefBefore → push 没有落地（崩在命令执行之前，或命令失败）。
-                             工作区未被改动，直接按放弃收尾即可
+  git log -g --format='%H %gs' refs/stash | grep "mygitclient-sync:<opid>"
+  ├─ 找到 → 就是本流程压的那条。取它的 OID，补上 update-ref 和 journal，
+  │          继续按 stashed 处理
+  └─ 没找到 → 再比对 refs/stash 与 stashRefBefore 确认 push 确实没落地
+              （两者相等 ⇒ 工作区未被改动，直接按放弃收尾）
 ```
 
-这个判定是**确定性**的，不依赖任何时间推断。
+实测（2026-09-13，临时 git fixture）——**外部工具在窗口内又压了一个 stash** 的场景：
 
-**残留风险要写明**：如果恰好在这个窗口里有外部工具（Rider、另一个终端）也压了一个
-stash，`now != stashRefBefore` 仍然成立，但栈顶那条是**别人的**。这与 §7.6.1 描述的
-漂移是同一类问题，且同样无法在客户端侧根除。缓解是恢复时**不要静默 apply**：把栈顶
-那条的 message、时间戳和改动文件列表展示出来，让用户确认这是不是自己的 WIP。窗口只有
-两三条命令的宽度，概率极低，但后果是把别人的 WIP 应用到工作区，必须由人点头。
+```text
+git stash push -m "mygitclient-sync:0f3adead-beef"    ← 我们的
+git stash push -m "someone else WIP"                  ← 外部工具的，挤到了栈顶
+
+git stash list
+  stash@{0}: On work: someone else WIP                ← 栈顶不是我们的
+  stash@{1}: On work: mygitclient-sync:0f3adead-beef
+
+git log -g --format='%H %gs' refs/stash | grep "mygitclient-sync:0f3adead-beef"
+  → bf4757c…  On work: mygitclient-sync:0f3adead-beef ✅ 精确命中
+  → git show bf4757c…:a.txt = WIP-MINE                ✅ 内容正确
+```
+
+所以这**是**确定性判定，不需要降级成人工辨认。`stashRefBefore` 仍然要记：它负责区分
+「push 没落地」和「push 落地了但 reflog 被外部 `stash clear` 抹掉了」这两种都找不到的
+情况——后者要报错停下，不能当成没事发生。
+
+剩余的真实风险只有一个：外部工具跑了 `git stash clear` 或 `drop`。那种情况下对象可能
+还在（我们在 ④ 用 `refs/mygitclient/sync/<opid>` 钉过），但若崩在 ④ 之前就没钉上，
+对象会被 gc 回收。这是 §7.6.1 那条「钉住」规则要尽早执行的原因。
 
 ### 7.4 不显然的点
 
@@ -740,7 +830,11 @@ git stash apply f2208125…  → 取回的仍是正确的 WIP     ✓
    Local-Only commit**（§6.7），不是留在工作区里
 3. 不在 rebase / merge 中途
 4. 当前分支不是 `svn/base`，且 **HEAD 必须附着在分支上**——detached HEAD 一律拒绝，见 §8.1.1
-5. `remoteRev == wcRev`（走一次网络）；不等则要求先更新
+5. `remoteRev == baselineRev`（走一次网络）；不等则要求先更新
+   ⚠️ 比的是 `baselineRev`，**不是 `rootRev`**。交付之后根节点会长期停在旧
+      revision（§6.6.2 实测），拿它来比会让**之后每一次交付都被这条挡住**。
+      第 1 条已经保证 `nodeRevs == {baselineRev}`，所以 `baselineRev` 就是
+      「工作副本当前所处的 revision」的正确表述
 6. **需要走慢路径时，待交付历史必须是线性的**：`localOnlyCommits` 非空且不全部
    位于分支顶端（即 §8.2.3 的慢路径）时，`git rev-list --merges svn/base..HEAD`
    必须为空。非空则拒绝交付，指出是哪个 merge commit，引导用户把本地补丁移到分支
@@ -813,7 +907,11 @@ D7   svn status -v --xml 读新的 nodeRevs → r_new
 D8   推进基线到交付树（见 §8.2.2）
 D9   提示「work 分支已交付，可删除」——不自动删
      **分支上还有 Local-Only commit 时禁止给出这个提示**，见 §8.2.3
-D10  收尾：删 deliverRef；删 journal；放锁；恢复 watcher     ← 与 §8.2.4 的 ③～⑤ 同一段代码
+D10  收尾：先跑成功路径自己的断言，再复用 §8.2.4 的 ③ 和 ⑤
+       断言：HEAD 在 origBranch 上，且 svn/base..origBranch 只剩
+             Local-Only commit（D8d 已经检查过，这里是收尾前复核）
+       ⚠️ **不能套用 §8.2.4 的 ④**——那条断言 origHead 未变，而 D8d 刚刚
+          推进过 origBranch。见 §8.2.4 末尾
 ```
 
 **D0.5 到 D3.5 之间的任何退出都走 §8.2.4 的统一收尾**，包括 D1/D2 空清单、D3 用户
@@ -1007,6 +1105,21 @@ cleanup_before_svn(journal):
 D5 之后的失败**不走**这条路径——那时 SVN 侧已经落地，收尾语义完全不同，见 §8.5（它在
 清完 SVN 登记之后复用本段的 ②～⑤）。
 
+**④ 只属于早退路径，成功路径不能套用。** 早退的定义就是「什么都没发生过」，所以
+`origHead 未变` 是对的不变量。但走到 D10 时 D8d 刚刚用 ff-only 或 rebase 把
+`origBranch` 推进到了新基线之上，`origHead` **必然**已经变了——把 ④ 原样套到 D10 上，
+每一次**成功**的交付都会在最后一步报错，然后留下 journal、锁和 watcher 不收。
+
+所以两条路径的断言必须分开：
+
+| 路径 | 断言什么 | 为什么 |
+|---|---|---|
+| 早退（§8.2.4 ④） | `HEAD == origBranch` 且 `origHead` **未变** | 什么都不该发生过 |
+| 成功（D10） | `HEAD` 在 `origBranch` 上，且 `svn/base..origBranch` 只剩 Local-Only commit | 该发生的都发生了，且没有漏交付 |
+
+共用的只有 ③（删 `deliverRef`）和 ⑤（删 journal、放锁、恢复 watcher）。①（临时
+worktree）在成功路径上早已在 D0.5 收尾时清掉，②（切回 `origBranch`）由 D8d 承担。
+
 #### 8.2.5 D4.9 为什么必须有：确认之后磁盘仍然可能被改
 
 D3.8 到 D5 之间有一个无法用锁关上的窗口。§5.1 的独占锁是**进程内**的——它拦得住
@@ -1049,7 +1162,7 @@ D1 / D2 任一步得到空清单立即中止，**绝不进入 D5**。
 
 ### 8.4 竞态窗口
 
-前置检查里的 `remoteRev == wcRev` 只是**快速失败的优化，不是保证**。真正的窗口在
+前置检查里的 `remoteRev == baselineRev` 只是**快速失败的优化，不是保证**。真正的窗口在
 D3 的确认对话框——用户可能开着它看几分钟，同事完全有时间提交两三次。
 
 **服务端的检查才是唯一真正的门。** D3.5 再查一次能砍掉这个大窗口，但消除不了竞态
@@ -1241,22 +1354,42 @@ svn propset --revprop -r 1 mygitclient:opid xyz <URL>
 不受它限制。
 
 **但公司服务器仍可能另有限制**（自定义 `pre-commit` 钩子拒绝未知 revprop、或走某种
-代理），所以必须有一次**开仓自检**：
+代理）。这里有两种完全不同的失败形态，必须分开处理：
+
+**形态 A：提交成功，但 revprop 被悄悄丢掉。** 开仓自检能抓到：
 
 ```text
 第一次交付成功之后（D6 之前，此时 revision 号已知）：
    svn propget --revprop -r <r_new> mygitclient:opid <URL>
    ├─ 读回本次 opid → 记 supportsRevprop=true 进 .git/mygitclient.json
-   └─ 读不到 / 报错 → 记 supportsRevprop=false，并在界面上一次性告知
-                       「本仓库不支持提交幂等键，断网查证精度降低」
+   └─ 读不到      → 记 supportsRevprop=false，一次性告知
+                     「本仓库不支持提交幂等键，断网查证精度降低」
 ```
 
-自检结果决定 §8.6.2 走哪条分支：`supportsRevprop=true` 时，区间内查不到 opid 就可以
-**确定地**判失败；`false` 时只能走兜底 ②，而兜底永远只给「疑似」，判定成功必须再比
-内容。
+**形态 B：提交直接被钩子拒绝。** 这一种**开仓自检永远跑不到**——D5 根本没成功过，
+`supportsRevprop` 也就永远写不进去。原来那句「客户端降级」在这种服务器上是空话：
+每一次交付都会失败，用户被卡死。
 
-因此实现上：revprop 是**首选**路径，changed-paths + 内容校验是**必须存在的兜底**。
-若服务器拒绝 revprop，客户端降级并说明精度降低，而不是让整个交付流程失败。
+形态 B 必须单独作为一类 D5 失败处理：
+
+```text
+D5 失败，且 stderr 指向 revprop / pre-commit 拒绝（而非网络类）
+   ↓
+按 §8.5 完整回滚 D4 登记（服务器侧什么都没发生，这是确定的）
+   ↓
+把 svn 的原始 stderr 原样展示给用户，并给出一个**需要用户明确点确认**的选项：
+   「本服务器拒绝提交幂等键。不带幂等键重试一次？
+     代价：断网时无法用幂等键查证，只能靠路径集合 + 内容比对（§8.6.2 兜底）」
+   ├─ 用户确认 → 不带 --with-revprop 重试一次，成功后记 supportsRevprop=false
+   └─ 用户不确认 → 停在这里，什么都不做
+```
+
+**这不违反 §8.7。** §8.7 禁止的是**自动**重试、以及「顺手修一下再试一次」。这里是把
+失败原因原样摆出来、把代价说清楚、由用户决定要不要换一种方式再来一次——正是 §8.7
+那句「一律停下来把事实摆给用户看」要求的行为。区别在于**谁做的决定**。
+
+因此实现上：revprop 是**首选**路径，changed-paths + 内容校验是**必须存在的兜底**，
+而形态 B 的用户确认重试是**让兜底真的可达**的那一步。
 
 ### 8.7 绝不自动重试
 
@@ -1306,11 +1439,34 @@ git add && git commit   → 落「新基线」，内容是旧的 r12345，却打
 
 ### 9.3 检测
 
-按 §6.6 比对 `baselineRev` 与 `wcRev`。检查点：打开仓库时、每次 `repo-changed`
-刷新时、更新 / 交付的第一步。`svn info` 纯本地读、不联网，成本可忽略。
+按 §6.6.2 的两条判据比对 `nodeRevs` 与 `baselineRev`。检查点：打开仓库时、每次
+`repo-changed` 刷新时（先过 §6.6.3 的 `rootRev` 变化提示）、更新 / 交付的第一步。
+`svn status` 纯本地读、不联网，成本可忽略。
 
-同一条检查还能抓住另外两种外部操作：在命令行跑了 `svn update`、用 TortoiseSVN 做了
-`svn revert`。
+同一条检查能抓住命令行 `svn update`、TortoiseSVN 的 update 和 commit——这些都推进
+revision。
+
+**但它抓不到 `svn revert`。** 实测（2026-09-13，真实 SVN fixture）：
+
+```text
+revert 前: rootRev=1  nodeRevs={1}
+（改文件，然后 svn revert -R）
+revert 后: rootRev=1  nodeRevs={1}     ← 完全没变
+```
+
+`svn revert` 只改磁盘内容，不动任何 revision，所以 `nodeRevs == baselineRev` 照样
+成立。**这类外部操作只能由 git 侧看见**：`svn revert` 把文件改回服务器 base 内容，
+在 git 那边表现为工作区出现修改（相对当前分支）或者「改动凭空消失」。
+
+所以检测分两条独立的路，不能互相冒充：
+
+| 外部操作 | 会不会推进 revision | 靠什么发现 |
+|---|---|---|
+| `svn update` / `svn commit`（含 TortoiseSVN） | 会 | §6.6.2 的 `nodeRevs` 判据 |
+| `svn revert` | **不会** | git 工作区状态——现有的 watcher + `git status` 已经能报出来，UI 上表现为「改动被外部还原」 |
+
+第二条不需要新机制，但**必须写明它不归失同步检测管**，否则容易误以为那道门禁什么都
+拦得住。
 
 ### 9.4 恢复流程
 
@@ -1321,13 +1477,18 @@ git add && git commit   → 落「新基线」，内容是旧的 r12345，却打
    （S1 那套写前顺序同样适用，见 §7.3.1）
 ② 原分支与 origHead 写进 journal
 ③ git checkout svn/base                 磁盘 = 旧基线内容
-④ svn status -v --xml -- <白名单>，按状态分四类，见 §9.4.1
-     (a) M / !            → svn revert   恢复服务器 base 内容
-     (b) R（replace）     → svn revert   同上
-     (c) A / A+（外部登记）→ svn revert   取消登记；文件留在磁盘，转 (d) 复判
-     (d) ?（SVN 已不再版本控制该路径） → **从磁盘删除**
-   ⚠️ 每一类都独立判空：列表为空则跳过该类，绝不执行空参数的 svn 命令
-⑤ 按 ④ 的分类执行，(a)(b)(c) 用显式文件列表，(d) 用显式文件删除
+④ 分两步定出要动的东西，见 §9.4.1
+   ④a svn status -v --xml --no-ignore -- <白名单>，按状态分类：
+        (a) M / !            → svn revert   恢复服务器 base 内容
+        (b) R（replace）     → svn revert   同上
+        (c) A / A+（外部登记）→ svn revert   取消登记
+   ④b 「服务器已删除」的集合**不看 svn status 的 ? 条目**，改用两个集合作差：
+        oldBaselineFiles = git ls-tree -r --name-only svn/base -- <白名单>
+        svnVersioned     = ④a 里 SVN 仍在版本控制的路径集合
+        toDelete = oldBaselineFiles - svnVersioned      ← 全是**具体文件**，没有目录
+   ⚠️ 每一类都独立判空：列表为空则跳过，绝不执行空参数的 svn 命令或删除
+⑤ 按 ④ 的结果执行：(a)(b)(c) 用显式文件列表 svn revert；
+   toDelete 逐个**文件**删除，**绝不递归删目录**；全部删完后可以清理变空的目录本身
 ⑥ git add -A -- <白名单> && git commit --allow-empty
                                         新基线，Svn-Rev 取自 ⑤ 之后重读的 nodeRevs
 ⑦ git checkout <原分支>
@@ -1355,24 +1516,52 @@ git add && git commit   → 落「新基线」，内容是旧的 r12345，却打
 基线和工作分支都有它，交付的净变更 diff 里永远不会出现，客户端也就永远不会告诉用户
 「你这里有个服务器上早就删掉的文件」。
 
-**为什么删 `?` 是安全的**（这一步会真的删磁盘文件，必须论证清楚）：
+**为什么删除集合要从旧 git tree 反推，而不是用 `svn status` 的 `?`**
 
-关键前提是**第 ① 步的 `git stash push -u` 带了 `-u`**。它把白名单内的未跟踪文件
-一并 stash 走，所以走到第 ④ 步时，磁盘上白名单内的文件 = `svn/base` 旧基线的内容，
-**一个不多一个不少**。因此第 ④ 步看到的每一个 `?`，必然满足：
+第一版这里写的是「`?` → 从磁盘删除」，论证是「① 的 `git stash push -u` 保证磁盘上
+白名单内的文件 = 旧基线内容，一个不多一个不少，所以每个 `?` 必然是服务器删掉的」。
 
-- 它在旧基线里（否则 ③ 之后不会出现在磁盘上）
-- 它不再被 SVN 版本控制（否则不会是 `?`）
+**这个论证是错的，前提不成立。** 两处实测（2026-09-13，真实 SVN + git fixture）：
 
-两条合起来只有一个解释：**服务器删掉了它**。所以删掉是把磁盘对齐到服务器，不是丢
-用户数据。
+```text
+场景：服务器删掉整个 Assets/Scripts/Feature 目录，
+      用户在该目录下有一个 git-ignored 的 local.log
 
-反过来，用户自己新建、还没交付的 `.cs` 文件**不会**走到这里——它在 ① 就被 `-u` 收进
-stash 了，第 ⑧ 步会原样还回来。这个区分完全依赖 `-u`：**如果哪天有人把 `-u` 去掉，
-第 ④ 步的 (d) 分类就会开始删用户的新文件**。两者必须一起改，代码里要有断言和注释。
+① git stash push -u -- <白名单>
+     local.log 仍在磁盘  ← -u 只收未跟踪文件，**不收 ignored 文件**（那要 -a）
+③ git checkout svn/base
+     磁盘: F1.cs  F2.cs  local.log
+④ svn status
+     ?  Assets\Scripts\Feature     ← 只有一个**目录**条目，不是逐个文件
+```
 
-`A` 登记（(c) 类）单独列出来的理由：`svn revert` 只取消登记，文件会留在磁盘上变成
-`?`，所以必须紧接着按 (d) 复判一次，否则同样漏。
+两个洞叠在一起：
+
+1. **`-u` 不收 ignored 文件**，所以「磁盘 = 旧基线内容」不成立，磁盘上可能有 git
+   完全不管、stash 也没带走的用户数据
+2. **SVN 按目录汇报**，`?` 条目可能是一个目录。按目录递归删就会连带删掉上面那个
+   `local.log`——那是用户的文件，不是服务器删掉的东西
+
+所以删除集合必须从**旧基线的 git tree** 反推（④b）：`git ls-tree -r` 给出的全是**受
+git 管理的具体文件**，一个目录都没有。差集里的每一条都同时满足：
+
+- 它在旧基线里 —— 所以它确实是「曾经的服务器内容」
+- SVN 现在不再版本控制它 —— 所以服务器把它删了
+
+这两条推出的结论只有一个：删掉它是把磁盘对齐到服务器。而 `local.log` 这类文件**根本
+不在 `git ls-tree` 的输出里**，因此永远不会进入删除集合——不管它躺在哪个被删掉的目录
+底下。
+
+**绝不递归删目录**这条要写死在实现里：删完文件之后若某个目录变空，删空目录本身是安全
+的（git 不跟踪空目录，SVN 也已经不版本控制它）；但「删目录及其全部内容」这个动作在
+本流程里永远没有正当理由。
+
+用户自己新建、还没交付的 `.cs` 文件同样不受影响：它不在旧基线的 tree 里，所以不在差集
+里；它在 ① 被 `-u` 收进 stash，第 ⑧ 步原样还回来。
+
+`A` 登记（(c) 类）单独列出来的理由：`svn revert` 只取消登记，文件会留在磁盘上。它是否
+该被删，由 ④b 的差集独立判定——如果它本来就不在旧基线里（用户新建的），差集里没有它，
+它就留在磁盘上，这是对的。
 
 ### 9.5 第 ⑤ 步为什么安全
 
@@ -1553,6 +1742,9 @@ React 依赖、可直接单测。
 | **D4.9 断言失败** | D3.8 之后有外部 git 工具动过工作副本（§8.2.5） | 按 §8.5 撤销 D4 登记，再走 §8.2.4 收尾 | 明确告知「工作副本在你确认之后被改动过」，列出 HEAD 与期望值的差异，**保留提交信息**，引导重新走一次 |
 | **初始化前置未过** | 工作副本脏或 mixed-revision（§6.5） | **不做任何修改**，不创建 `.git` | 按类型分别提示：有本地修改 → 去 TortoiseSVN 提交或还原；mixed-revision → 先跑一次完整 `svn update` |
 | **前置检查发现 detached HEAD** | 用户在 IDE 里切到了某个历史 commit（§8.1.1） | 不做任何修改 | 说明当前 HEAD 指向哪个 commit，建议 `git switch -c <name>` 或切回原分支 |
+| **D5 被 pre-commit 拒绝（revprop）** | 服务器不接受自定义 revprop（§8.6.3 形态 B） | 按 §8.5 完整回滚 D4 登记 | 原样展示 svn stderr，给出**需要用户明确确认**的「不带幂等键重试一次」选项；不确认就停下 |
+| **配置校验未过** | `svnUrl` UUID 不符、`baselineBranch` 非 `svn/base`、白名单含非法路径（§6.2.1） | **不做任何修改**，仓库不进入可用状态 | 指出是哪个字段、哪一条规则；`svnUrl` 不符时同时显示配置值与 `svn info` 实际值 |
+| **拿不到跨进程锁** | 同一工作副本上另一个 mygitclient 进程正在同步（§5.1.1） | 不做任何修改 | 显示持锁进程的 pid 与开始时间；pid 已不存在时提供「接管」入口并写日志 |
 | **D8d 不是快进**（无 Local-Only commit 时） | 前面某步的假设崩了 | 停下不动 | 报错并导出 journal，**不自动 merge** |
 | **D8d rebase 后仍有未标记 commit** | 该交付的东西没进交付树 | 停下不动 | 报错并导出 journal，列出这些 commit |
 | **D8d rebase 冲突**（有 Local-Only commit 时） | 本地补丁与他人在 D6 拉下来的改动冲突 | **不回滚**，停在冲突态 | 进入冲突解决模式；提交已成功，基线已推进，只剩补丁没落回去 |
@@ -1621,6 +1813,14 @@ svn checkout file:///<tmp>/repo  <tmp>/wc2     ← 「同事」，用来制造�
 | 33 | **查证不得被相同路径集合骗过**：制造「D5 真失败 + 用户随后用 TortoiseSVN 提交了同一批文件」，断言兜底 ② 只给「疑似」，内容校验后判定为**状态未知**而非成功（§8.6.2） | 1、2 |
 | 34 | **查证不得被目录路径骗过**：交付一个新增嵌套目录下的文件，断言 changed-paths 里的目录被剔除后仍能正确匹配（§8.6.2） | 1、2 |
 | 35 | **revprop 开仓自检**：断言首次交付后能读回 `mygitclient:opid`；再用一个拒绝 revprop 的仓库断言降级到兜底且界面有提示（§8.6.3） | 1、2 |
+| 36 | **成功路径能走完 D10**：跑一次完整成功交付，断言 D10 不报错、journal 已删、锁已释放、watcher 已恢复；显式覆盖「有 Local-Only commit（D8d 走 rebase）」和「没有（走 ff-only）」两种，两者 `origHead` 都变了（§8.2.4 末尾） | 2、5 |
+| 37 | **Phase 1 重建基线录的是新内容**：外部 TortoiseSVN update 之后跑重建，断言新基线 tree == 当前磁盘内容（**不是**旧基线）、HEAD 与工作目录全程未动、工作分支上的未提交改动完好（§16） | 1、3 |
+| 38 | **服务器删目录 + 目录内有 git-ignored 文件**：走 §9.4，断言被删的受管文件从新基线和磁盘上消失，而 `.gitignore` 掉的 `local.log` **原样还在**；断言实现从未对目录发起递归删除（§9.4.1） | 1、2、4 |
+| 39 | **revprop 被 pre-commit 拒绝**：给 fixture 仓库装一个拒绝未知 revprop 的 `pre-commit` 钩子，断言 D5 失败被归为形态 B、D4 登记完整回滚、**不自动重试**；模拟用户确认后重试成功并记 `supportsRevprop=false`（§8.6.3） | 1、2 |
+| 40 | **stash 按 opid 精确取回**：压完我们的 stash 后由外部再压一个，断言恢复时按 `mygitclient-sync:<opid>` 在 reflog 里命中的是我们那条、内容正确，且**不碰**外部那条（§7.3.1） | 1、5 |
+| 41 | **跨进程锁**：起两个进程同时对同一工作副本发起 `sync_out`，断言第二个被锁文件挡住并给出明确错误，journal 不被覆盖；再断言 pid 已消失的陈旧锁可被接管、pid 仍在的不可（§5.1.1） | 5 |
+| 42 | **配置校验**：`svnUrl` 指向另一个仓库（UUID 不符）、`baselineBranch` 非 `svn/base`、白名单含 `..` / 绝对路径 / `:(exclude)` / 空串——逐个断言在配置加载时就被拒绝，且**不发生任何 git / svn 命令**（§6.2.1） | 3、4 |
+| 43 | **`svn revert` 不被失同步检测发现**：外部 `svn revert` 后断言 `nodeRevs == baselineRev` 仍成立（即失同步检测**不报**），而 git 工作区状态变化能被报出（§9.3） | 1、3 |
 
 ### 14.3 前端
 
@@ -1669,6 +1869,11 @@ exclude 生成与图合成都在 Rust 侧，由 cargo test 覆盖。
 16. **`svn commit` 传输中断且服务器不支持 revprop 时，状态可能长期停在「未知」**
     （§8.6.2）。这是刻意的：把「疑似成功」当成功会推进假基线，当失败会重复交付，
     两者都比挂着一个「需要人工确认」的状态更糟
+17. **`svn revert` 不在失同步检测的能力范围内**（§9.3 实测）。它不推进任何 revision，
+    只能由 git 工作区状态间接看出来。客户端不会因此报「基线失同步」，这是正确的——
+    基线没错，错的是磁盘
+18. **Phase 1 的「重建基线」不会推进工作分支**。用户下次得自己 rebase 到新基线上。
+    Phase 2 的 §9.4 才做完整编排
 
 ## 16. 分期
 
@@ -1691,11 +1896,31 @@ exclude 生成与图合成都在 Rust 侧，由 cargo test 覆盖。
 `nodeRevs`，让 `svn/base` 立刻失同步（§6.6.2）。此时若只有红色横幅、没有任何出口，
 「相对上次更新改了什么」这个 §6.4 的核心收益就永久失效了。
 
-「重建基线」是 §9.4 的极简版：**要求白名单内 `svn status` 干净**（不干净就引导去
-TortoiseSVN 处理，不自动 revert），然后 `git checkout svn/base` → `git add -A -- <白名单>`
-→ 落一个新基线 commit，`Svn-Rev` 取自当前 `nodeRevs`。它不碰 stash、不碰工作分支、
-不做 rebase，因此不需要 Phase 2 的那套编排。代价是工作分支不会自动跟进新基线，用户
-下次自己 rebase——Phase 1 本来就是手工期，这个代价可以接受。
+「重建基线」的关键是**不要碰工作目录**。此时 `svn status` 干净，意味着磁盘上白名单
+内的内容**已经就是**新的服务器内容——要做的只是把它录成一个新的基线 commit：
+
+```text
+R1  校验：白名单内 svn status --no-ignore 干净、nodeRevs 单值 {N}
+      不干净就引导去 TortoiseSVN 处理，不自动 revert（同 §6.5 P1）
+R2  用一个**临时索引**把磁盘内容录成 tree，全程不碰真实 index、不碰 HEAD：
+      GIT_INDEX_FILE=<tmp> git add -A -- <白名单>
+      GIT_INDEX_FILE=<tmp> git write-tree                → TREE
+R3  git commit-tree TREE -p svn/base -m "svn: rN … Svn-Rev: N"   → NEWBASE
+R4  git update-ref refs/heads/svn/base NEWBASE          ← 只动指针
+R5  删掉临时索引文件
+```
+
+**为什么不能照抄 §9.4 的 `git checkout svn/base`。** §9.4 之所以先 checkout 旧基线是
+因为它后面紧跟着 `svn revert`——由 revert 把服务器内容重新铺回磁盘，checkout 只是把
+git 侧的状态清空。极简版没有 revert（前提就是工作副本干净），此时先 checkout 会把磁盘
+**换回旧基线内容**，随后录下来的就是旧内容却标着新 revision，正好造出这一节要防的那种
+撒谎基线。这条捷径删错了步骤：删掉的是让序列成立的那一步。
+
+顺带两个 checkout 自带的麻烦也一并没了：工作分支上若有未提交改动，`git checkout` 会
+直接失败；而 R1–R5 全程不动 HEAD，也就不存在「流程结束忘了切回原分支」。
+
+代价是工作分支不会自动跟进新基线，用户下次自己 rebase——Phase 1 本来就是手工期，这个
+代价可以接受。
 
 **Phase 1 结束时已是一个有意义的交付点**——本地 git 的暂存区、分支、stash 全部可用，
 只是 update / deliver 还得回 TortoiseSVN 手工做。
@@ -1732,6 +1957,46 @@ Phase 1 到 Phase 3 之间用户手工走 TortoiseSVN 交付时，本地补丁�
 误导性的错误上。
 
 ## 18. 修订记录
+
+### 2026-09-13（三）· 第三轮 review：修洞时新捅的洞
+
+第三轮 review 提了 10 条，全部成立。**其中 3 条是上一条修订记录（第二轮）引入的回归**
+——这一点比那 3 条本身更值得记：跨节复用一段逻辑时，没有逐条核对被复用方的前提。
+
+| 回归 | 怎么坏的 |
+|---|---|
+| D10 套用 §8.2.4 ④ | ④ 断言 `origHead 未变`，那是**早退**路径的不变量；D8d 刚推进过 `origBranch`，所以**每一次成功交付**都会在收尾时报错 |
+| Phase 1「重建基线」 | 照抄 §9.4 时删掉了 `svn revert`（让序列成立的那一步），却保留了 `git checkout svn/base`（让序列出错的那一步），结果把旧内容录成了新基线 |
+| 初始化前置漏 `?` | 同一节的风险表和测试项 27 都要求拒绝 `?`，唯独可执行的状态列表里没写 |
+
+另外 7 条中，两条推翻了上一轮写下的**论证**，不只是实现：
+
+- §9.4.1 原来的安全性论证建立在「`git stash push -u` 保证磁盘 = 旧基线内容，一个不多
+  一个不少」上。实测发现 **`-u` 不收 git-ignored 文件**，前提不成立；同时 SVN 对被删
+  目录只报一个 `?` 目录条目，按目录递归删会删掉用户的 ignored 文件。删除集合改为从
+  `git ls-tree svn/base` 反推，全是受管的具体文件，绕开这两个洞
+- §8.6.3 声称服务器拒绝 revprop 时「客户端降级」。但自检写在「第一次交付**成功之后**」，
+  而钩子拒绝的场景下 D5 永远不成功——降级路径根本不可达。补上形态 B：归为专门的失败
+  类型、完整回滚、由**用户明确确认**后不带 revprop 重试一次（这不违反 §8.7，§8.7 禁的
+  是自动重试）
+
+`wcRev` 那条 review 标的是 P2，我按 P1 处理：`§8.1 #5` 的 `remoteRev == wcRev` 里若
+`wcRev` 取 `rootRev`，交付之后根节点长期滞后，**之后每一次交付都会被这条前置检查挡住**
+——与 D10 那条同属「正常路径被自己的断言堵死」。
+
+| 改动点 | 内容 |
+|---|---|
+| §5.1.1（新增） | 锁必须跨进程：锁文件 + 原子创建 + pid 陈旧判定；journal 所有权由它界定。记录现状（无 `tauri-plugin-single-instance`，现有锁均为 `std::sync::Mutex`） |
+| §6.2.1（新增） | 配置是不可信输入：`svnUrl` 比对 repository UUID；`baselineBranch` 固定；白名单拒绝绝对路径 / `..` / pathspec magic / 空值；校验集中在加载时 |
+| §6.5 | P1 补上 `?`，并要求 `--no-ignore` |
+| §7.3 / §7.3.1 | stash message 写入 `mygitclient-sync:<opid>`；恢复改为在 stash reflog 里按 opid 精确定位（实测：外部 stash 挤到栈顶也不受影响），不再降级成人工辨认 |
+| §8.1 #5 | `wcRev` → `baselineRev`，并写明为什么不能用 `rootRev` |
+| §8.2 D10 / §8.2.4 | 成功路径改用自己的断言；§8.2.4 末尾写明 ④ 只属于早退路径，并列表对照两条路径的断言 |
+| §8.6.3 | 拆成形态 A（提交成功但 revprop 被丢）与形态 B（提交被拒），补形态 B 的用户确认重试路径 |
+| §9.3 | 删掉「revision 校验能发现 `svn revert`」这个假保证（实测 revision 完全不变），改为两条独立的检测路径 |
+| §9.4 / §9.4.1 | ④ 拆成 ④a（状态分类）与 ④b（删除集合从 `git ls-tree svn/base` 反推）；⑤ 明确逐文件删、绝不递归删目录；重写安全性论证 |
+| §16 | Phase 1「重建基线」改用临时索引 + `commit-tree` + `update-ref`，全程不动 HEAD 与工作目录 |
+| §13 / §14.2 / §15 | 新增 3 条失败路径、测试项 36–43、已知限制 17–18 |
 
 ### 2026-09-13（二）· 第二轮 review：基线真实性的四个漏口
 
