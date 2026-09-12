@@ -23,6 +23,23 @@ pub fn run_git(path: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&run_git_bytes(path, args)?).to_string())
 }
 
+/// 同 [`run_git`]，但把**退出码交给调用方判断**，非零不算失败。
+///
+/// 只在「不同的非零退出码意味着不同的事实」时才用它。git 的惯例是 1 表示
+/// 「查询没有结果」、128 表示 fatal，而 [`run_git`] 把任何非零都塌缩成同一个
+/// `GitError`，区分不出来。已知必须区分的地方：`show-ref --verify` 的
+/// 「ref 不存在」（1）与「ref 损坏」（128）——把后者当成前者会删用户的文件，
+/// 见 `engine::ops::head_is_unborn`。
+///
+/// 进程本身起不来（git 不在 PATH）仍然是错误，照常返回 `Err`。
+pub fn run_git_code(path: &str, args: &[&str]) -> Result<(i32, String)> {
+    let output = git_command(path).args(args).output()?;
+    // 正常退出时 code() 必有值；拿不到只可能是被信号杀掉（Windows 上不存在），
+    // 那种情况用 -1 表示「未知」，调用方不会把它误当成某个有意义的退出码
+    let code = output.status.code().unwrap_or(-1);
+    Ok((code, String::from_utf8_lossy(&output.stdout).to_string()))
+}
+
 /// 同 [`run_git`]，但原样返回 stdout 的字节。
 ///
 /// patch 要落成文件，不能过 `from_utf8_lossy`：非 UTF-8 的文件名或内容会被替换成

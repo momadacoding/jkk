@@ -102,6 +102,71 @@ git add                  （无参数）     → "Nothing specified, nothing add
 两条都应在 Phase 1 开工前处理掉——它们都落在 `engine::ops::discard` 上，而 Phase 2
 的 `sync_in` 会依赖 discard 的可靠性。
 
+#### 2026-09-13 结清：两条都已在分支 `worktree-discard-hardening` 修掉
+
+| # | 结论 | 实测支撑 |
+|---|---|---|
+| 1 | **确认是真缺陷，比 review 描述的更严重**。触发条件不是 `index.lock`，而是**对象库损坏**：删掉 HEAD 的 tree 对象后 `ls-tree -r HEAD` 报 `fatal: not a tree object`，而 `git rm -f` 照样退出 0 并把文件删掉。旧实现此时**整个调用返回 `Ok(())`**——用户点「丢弃改动」，文件没了，界面上没有任何异常 | 临时 fixture 实测 + 回归测试 `staged_discard_stops_instead_of_deleting_when_head_cannot_be_read`（修复前 `expect_err` 拿到的是 `Ok(())`） |
+| 4 | **「加回滚」做不到**，`git checkout` 抹掉的工作区内容没有副本可取回。改为「失败立刻停下 + `discard_partial` 说清已完成 / 可能已部分处理 / 未处理三类路径」。fail-fast 本来就有（靠 `?`），补的是那份交代 | 回归测试 `a_failed_stage_says_what_was_already_done_and_what_was_not`、`a_locked_untracked_file_reports_which_ones_were_already_deleted` |
+
+**空仓库必须与对象库损坏区分开**，这是 #1 修复的核心。不能用「`rev-parse --verify HEAD`
+失败」来判空仓库——实测场景 D（tree 对象丢失）里它照样退出 0，而别的损坏形态下它会
+失败，于是真损坏又被当成空仓库吞掉。正确判据是正向的：`symbolic-ref --quiet HEAD`
+成功且它指向的分支 ref 不存在。detached HEAD 下 `symbolic-ref` 退出 1，判为非空仓库，
+正确。
+
+顺带把 `staged == false` 时的 `ls-tree` 探测整条去掉——那种情况下 `in_head` 被
+`staged &&` 短路，本来就用不到，少一次进程也少一个失败面。
+
+#### 对抗性 review 的追加修正：判定必须看退出码，不是看成败
+
+第一版修复只判「`show-ref --verify` 有没有失败」，**漏掉了同一缺陷的第二种形态**，
+由 Codex 对抗性 review 指出并在 fixture 中复现。四种形态的实测退出码：
+
+| 形态 | `show-ref --verify --quiet` | 正确结论 |
+|---|---|---|
+| 仓库还没有任何提交（ref 文件不存在） | **1** | unborn |
+| 分支 ref 指向不存在的 OID | **128** `bad ref` | **抛出** |
+| ref 在 packed-refs 里 | **0** | 非 unborn |
+
+第二行就是漏掉的那条：只看成败会把它当成 unborn，而 `git rm -f` 在该状态下照样
+退出 0 并删掉文件。回归测试 `staged_discard_stops_instead_of_deleting_when_the_branch_ref_is_corrupt`
+在旧写法下确实失败（`expect_err` 拿到 `Ok(())`，已实际验证过一次）。
+
+`run_git` 把任何非零退出码塌缩成同一个 `GitError`，表达不了这个区别，因此在
+`engine::git_cli` 加了同族函数 `run_git_code`（与既有的 `run_git_bytes` 并列，
+不是另起一套进程调用，符合 `AGENTS.md` §7.3）。
+
+**否掉的备选方案**：用 `for-each-ref` 判 ref 是否存在。它按**路径前缀**匹配——
+HEAD 指向 `refs/heads/svn`（正是 spec D10 的基线分支名）而仓库里有
+`refs/heads/svn/base` 时，它会吐出后者，把真 unborn 误判成「ref 存在」。实测确认，
+并留了 `an_unborn_head_pointing_at_a_slash_prefixed_name_is_still_unborn` 挡住这条路。
+`show-ref --verify` 是精确匹配，无此问题。
+
+#### 第二轮对抗性 review：一条不成立，但根因是我的文档写错了
+
+第二轮 review 判 needs-attention，指「ref 内容是垃圾时仍会删文件」。**该结论不成立**，
+但责任在我——它读的是我上一版写错的文档。
+
+初版这里写着「ref 内容是垃圾 → `show-ref` 退出 1 → 按 unborn 处理 → 暂存内容丢失，
+有意接受」。**那个后果我从未端到端验证过**：探测脚本是先抓 `$h` 再损坏 ref，单独测了
+`show-ref` 这一个零件的退出码，然后就据此推断了整条路径的结果。
+
+补测真实路径后的事实：ref 内容不是合法 OID 时，`git symbolic-ref --quiet HEAD` 就已经
+退出 **128**（`fatal: No such ref: HEAD`），**根本走不到 `show-ref`**。判定在第一关就
+返回 false，`discard` 抛出，文件与索引都不动。
+
+违反的是 `AGENTS.md` §6.2：测的是零件，写的却是整机的结论。已补回归测试
+`staged_discard_stops_instead_of_deleting_when_the_branch_ref_is_malformed`，断言的是
+`ops::discard` 的真实返回与磁盘、索引状态，不是某条 git 命令的退出码。
+
+顺带修掉一处**碰巧正确**：第一关 `code != 0` 原本只注释了 detached HEAD，而「HEAD 读
+不出来」也落在同一分支、含义相反，只是恰好都返回 `Ok(false)` 才安全。现已写明
+`Ok(false)` 的语义是「**不能确认是 unborn**」而非「确认不是 unborn」，两种情况都归它，
+是有意设计。
+
+各形态的完整实测表见 `engine::ops::head_is_unborn` 的文档注释。
+
 ## 决策条目
 
 ### 全局
