@@ -537,15 +537,38 @@ S2–S7 之间工作目录会短暂回到基线状态，Unity 会多触发一次
   "svnDeleted": ["Assets/Scripts/Old.cs"],
   "expectedStartRev": 12345,
   "commitMessage": "…",
-  "deliverBranch": "deliver/0f3a…",
+  "deliverRef": "refs/mygitclient/deliver/0f3a…",
+  "tempWorktree": "C:/Users/x/AppData/Local/Temp/mygitclient-deliver-0f3a…",
   "localOnlyCommits": ["a1b2c3d…"]
 }
 ```
 
-后两个字段只有 `sync_out` 用：`deliverBranch` 是 D3.8 切上去的临时分支，回滚与崩溃
-恢复都要靠它切回 `origBranch` 并清理（§8.5）；`localOnlyCommits` 记下本次被摘掉的
-commit，用于崩溃重开后如实告诉用户「这 N 个本地补丁没有被交付，它们还在 `origBranch`
-上」——不记的话这个信息在 `deliverBranch` 被删之后就再也拼不回来了。
+最后三个字段只有 `sync_out` 用：
+
+- `deliverRef` 是 D0.5 构造出的交付树（§8.2.3），D3.8 detached 切上去的就是它；
+  早退、回滚与崩溃恢复都要靠它和 `origBranch` 收尾（§8.2.4、§8.5）
+- `tempWorktree` 只有慢路径有，是 cherry-pick 重放用的临时目录。**必须在建 worktree
+  之前就落盘**，否则崩在 `git worktree add` 和写 journal 之间就会留下一个谁也不认识
+  的 worktree 注册项
+- `localOnlyCommits` 记下本次被摘掉的 commit，用于崩溃重开后如实告诉用户「这 N 个
+  本地补丁没有被交付，它们还在 `origBranch` 上」——不记的话这个信息在 `deliverRef`
+  被删之后就再也拼不回来了
+
+`sync_out` 的 phase 取值与含义：
+
+| phase | 已经发生了什么 | 放弃时怎么收尾 |
+|---|---|---|
+| `prepare` | 只挂了 watcher、拿了锁 | §8.2.4（①②③ 均为 no-op） |
+| `building-deliver` | 可能有临时 worktree、可能有半途的 cherry-pick | §8.2.4 |
+| `deliver-built` | `deliverRef` 已存在，主工作副本未动 | §8.2.4 |
+| `checked-out` | D3.8 已切走，主工作副本是交付树的内容 | §8.2.4（② 会真的切回去） |
+| `svn-staged` | `.svn` 里挂着 add / delete 登记 | §8.5（先撤 SVN 登记，再复用 §8.2.4 ②～⑤） |
+| `committing` | `svn commit` 已发出，结果未知 | §8.6.2 查证，**不得盲目回滚** |
+| `post-commit` | 服务器已落地，基线未推进 | 不回滚，提供「重试 D6 起」入口 |
+
+`building-deliver` 与 `deliver-built` 必须分开：前者意味着可能存在半途状态（worktree、
+sequencer），后者意味着构造已完成、只剩一个干净的 ref。合成一个 phase 的话，恢复代码
+就得靠探测磁盘来猜自己停在哪，而写前日志的全部意义就是不用猜。
 
 规则：
 
@@ -588,23 +611,35 @@ git stash apply f2208125…  → 取回的仍是正确的 WIP     ✓
 3. 不在 rebase / merge 中途
 4. 当前分支不是 `svn/base`
 5. `remoteRev == wcRev`（走一次网络）；不等则要求先更新
-6. 拿锁
+6. **需要走慢路径时，待交付历史必须是线性的**：`localOnlyCommits` 非空且不全部
+   位于分支顶端（即 §8.2.3 的慢路径）时，`git rev-list --merges svn/base..HEAD`
+   必须为空。非空则拒绝交付，指出是哪个 merge commit，引导用户把本地补丁移到分支
+   顶端（转成快路径，merge 不受影响）或先线性化历史。
+   理由见 §8.2.3 的 T4 / T5：`cherry-pick` 对 merge commit 要么硬失败，要么在加
+   `-m` 之后重复应用已摘取过的父提交改动，没有安全的自动解法。**快路径不做这个
+   检查**——它只是给一个已有 commit 起名字，历史里有没有 merge 都无所谓
+7. 拿锁
 
 ### 8.2 步骤
 
 ```text
 D0   挂起 watcher；写 journal，phase=prepare                ← 任何修改之前
-D0.5 origBranch / deliverBranch / localOnlyCommits 先写进    ← 写前日志，见 §7.6
-     journal，再构造交付分支 deliver/<opid>：从 HEAD 摘掉
-     Local-Only commit。没有 Local-Only commit 时它等于 HEAD ← 见 §8.2.3
+     origBranch / origHead 此刻就落盘
+D0.5 deliverRef / localOnlyCommits / tempWorktree 先写进     ← 写前日志，见 §7.6
+     journal，phase=building-deliver，再构造交付树
+     refs/mygitclient/deliver/<opid>：从 HEAD 摘掉 Local-Only
+     commit。没有 Local-Only commit 时它等于 HEAD。
+     **主工作副本磁盘全程不动**，慢路径在临时 worktree 里
+     重放。构造完成后 phase=deliver-built                   ← 见 §8.2.3
 D1   git diff --name-status --no-renames
-       svn/base..deliver/<opid>                             ← 净变更清单
+       svn/base..refs/mygitclient/deliver/<opid>            ← 净变更清单
 D2   按白名单过滤清单                                        ← 双保险
 D3   把清单给用户确认（A/M/D 分类、文件数、提交信息）         ← 不可撤销前的关口
      **同时列出被摘掉的 Local-Only commit**                  ← 防漏标，见 §8.2.3
 D3.5 再查一次 remoteRev，写进 journal 的 expectedStartRev    ← 压缩竞态窗口 + 查证锚点
-D3.8 git checkout deliver/<opid>                            ← 磁盘上本地补丁消失。
-     phase=checked-out                                         尽量晚做，用户确认之后
+D3.8 git checkout --detach refs/mygitclient/deliver/<opid>  ← 磁盘上本地补丁消失。
+     phase=checked-out                                         这是全流程**第一次**动
+                                                               主工作副本，在用户确认之后
 D4   phase=svn-staged，svnAdded / svnDeleted 写进 journal
      A → svn add --parents <files>
      D → svn delete <files>
@@ -615,11 +650,15 @@ D5   phase=committing
 D6   phase=post-commit  ← 过了这一步服务器状态已不可撤销
      svn update --accept postpone -- <白名单路径>            ← 只更新白名单，见 §8.2.1
 D7   svn status -v --xml 读新的 nodeRevs → r_new
-D8   推进基线到 deliver/<opid>（见 §8.2.2）
+D8   推进基线到交付树（见 §8.2.2）
 D9   提示「work 分支已交付，可删除」——不自动删
      **分支上还有 Local-Only commit 时禁止给出这个提示**，见 §8.2.3
-D10  删除 deliver/<opid>；删除 journal；恢复 watcher
+D10  收尾：删 deliverRef；删 journal；放锁；恢复 watcher     ← 与 §8.2.4 的 ③～⑤ 同一段代码
 ```
+
+**D0.5 到 D3.5 之间的任何退出都走 §8.2.4 的统一收尾**，包括 D1/D2 空清单、D3 用户
+取消、D3.5 失败和进程崩溃。这些出口都在 D5 之前，代价为零，但**不清理就会留下临时
+ref 和临时 worktree**。
 
 #### 8.2.1 D6 为什么只更新白名单路径
 
@@ -640,13 +679,13 @@ D5 成功之后服务器状态**已经不可撤销**。此时若再跑一次全�
 
 #### 8.2.2 D8 推进基线：必须显式编排分支
 
-D5 成功之后，磁盘上白名单文件的内容 = **`deliver/<opid>` tip 的内容**（D3.8 已经切
+D5 成功之后，磁盘上白名单文件的内容 = **交付树 tip 的内容**（D3.8 已经切
 上去了）= 服务器 r_new 的内容。新基线的树就应该是它。
 
-`svn/base` 是 `deliver/<opid>` 的祖先，所以基线本身可以纯快进：
+`svn/base` 是交付树的祖先，所以基线本身可以纯快进：
 
 ```text
-D8a  git branch -f svn/base HEAD        ← HEAD 此刻是 deliver/<opid>；只动指针，
+D8a  git branch -f svn/base HEAD        ← HEAD 此刻 detached 在 deliverRef 上；只动指针，
                                            工作目录一个文件都不碰
 D8b  git checkout svn/base              ← 与 HEAD 同点，工作目录无变化
 D8c  git add -A -- <白名单>              ← 收进 D6 拉下来的他人改动（若有）
@@ -668,44 +707,103 @@ Local-Only commit 时工作分支必然不是快进（它带着基线上没有�
 之后的检查承担：**`svn/base..ORIG_BRANCH` 里必须只剩 Local-Only commit**，出现任何
 没标记的 commit 都说明有该交付的东西没交付出去，报错并导出 journal。
 
-#### 8.2.3 D0.5 构造交付分支：把本地补丁摘掉
+#### 8.2.3 D0.5 构造交付树：把本地补丁摘掉
 
-目标：得到一个「等于 HEAD 但不含任何 Local-Only commit」的分支，并在 D3.8 把它切到
+目标：得到一个「等于 HEAD 但不含任何 Local-Only commit」的 commit，并在 D3.8 把它切到
 磁盘上，让 `svn commit` 看到的字节里没有本地补丁（§6.7.2 结尾那条物理事实）。
+
+**两条硬约束**（下面所有设计都是为了同时满足它们）：
+
+1. **D0.5 绝不改动主工作副本的磁盘内容。** 磁盘切换是 D3.8 的事，必须晚于用户确认。
+   D0.5 在确认之前就把本地补丁从磁盘上抹掉，等于让用户对着一个已经被改过的工作副本
+   做决定，而且 Unity 会在确认对话框还开着的时候开始重编译
+2. **D0.5 之后的任何退出路径都必须经过 §8.2.4 的统一收尾。** 构造完成后 journal 里
+   多了一个临时 ref（可能还有一个临时 worktree），任何早退如果不清理它们，用户就会
+   在下一次交付时撞上残留
+
+**存放位置：`refs/mygitclient/deliver/<opid>`，不是分支 `deliver/<opid>`**
+
+用普通分支名会与用户自己的分支撞车。git 的 ref 是文件系统式的层级命名空间，
+`refs/heads/deliver` 和 `refs/heads/deliver/<opid>` 不可能共存：
+
+```text
+（实测 2026-09-13，临时 git fixture）
+已有 refs/heads/deliver → git checkout -b deliver/abc123
+  fatal: cannot lock ref 'refs/heads/deliver/abc123':
+         'refs/heads/deliver' exists; cannot create 'refs/heads/deliver/abc123'
+已有 refs/heads/deliver → git branch deliver/abc123            同样 fatal
+已有 deliver/abc123     → git branch deliver                   反向也 fatal
+git pack-refs --all 之后                                       依然 fatal
+```
+
+后果是**全部 `sync_out` 在 D0.5 硬失败**（快慢两条路径都要建这个 ref），而且反向也成立：
+一次崩溃泄漏出 `deliver/<opid>` 之后，用户从此再也建不出名为 `deliver` 的分支，错误
+信息还完全不指向本客户端。
+
+§6.4 给基线选可见分支 `refs/heads/svn/base` 的理由是「IDE 里能看见、能 diff」，那条
+理由在这里**不成立**：交付树是单次操作内创建并删除的中间产物，D9 也从不让用户与它
+交互。所以放进 `refs/mygitclient/` 内部命名空间，与 §7.6.1 钉 stash 用的
+`refs/mygitclient/sync/<opid>` 同一套做法。该命名空间不在 `refs/heads/` 下，与用户
+分支不可能冲突。
+
+初始化向导（§6.5）仍应保留 `svn` 这个分支名不被占用——那是 §6.4 已经记过的坑，与本节无关。
 
 **快路径（Local-Only commit 连续位于分支顶端）**
 
 ```text
-git branch deliver/<opid> <最后一个非 Local-Only commit>
+git update-ref refs/mygitclient/deliver/<opid> <最后一个非 Local-Only commit>
 ```
 
-只是给一个已有 commit 起个名字，**结构上不可能冲突**。客户端应提供一个「把本地补丁
-移到分支顶端」的整理操作（本质是一次交互式 rebase 的重排），把慢路径的风险变成用户
-可主动规避的。
+只是给一个已有 commit 起个名字，**不动 HEAD、不动磁盘、结构上不可能冲突**。客户端应
+提供一个「把本地补丁移到分支顶端」的整理操作（本质是一次交互式 rebase 的重排），把
+慢路径的风险变成用户可主动规避的。
 
-**慢路径（Local-Only commit 夹在中间）**
+**慢路径（Local-Only commit 夹在中间）：在临时 worktree 里重放**
 
 ```text
-git checkout -b deliver/<opid> svn/base
-git cherry-pick <按序的全部非 Local-Only commit>
+git worktree add --detach <tmp> svn/base          ← <tmp> 必须在 SVN 工作副本之外
+git -C <tmp> cherry-pick <按序的全部非 Local-Only commit>
+git update-ref refs/mygitclient/deliver/<opid> <tmp 的 HEAD>
+git worktree remove <tmp>
 ```
 
+**为什么不在主工作副本上直接 `git checkout -b`**：那会在 D3 确认之前就把磁盘切走，
+违反上面第 1 条硬约束；改成「切过去构造完再切回来」倒是能补救，但代价是主工作副本多
+翻转两次，按 §7.5 的口径就是**多两次 Unity 全量重编译**，而且全程发生在用户还没决定
+要不要交付的时候。临时 worktree 把重放隔离到另一个目录，主工作副本一个字节都不动，
+换来的成本只是一份白名单内代码文件的额外拷贝（白名单里没有美术资产，量级是 MB 不是 GB）。
+
+`<tmp>` 路径写进 journal 的 `tempWorktree` 字段，崩溃重开后按它清理；清理用
+`git worktree remove --force <tmp>` + `git worktree prune`，且**只允许清理 journal 里
+记着的这一个路径**——对齐 `AGENTS.md` §4.3「只清理本会话自己创建的 worktree」。
+
 **冲突必须中止整次交付**：报出是哪个 Local-Only commit 与哪个待交付 commit 打架，
-提示用户去拆分或重排，然后 `git cherry-pick --abort` + 删掉 `deliver/<opid>`。
-**绝不自动解冲突**——此时还没碰 SVN，中止是零代价的，而猜错的后果是把本地补丁送上
-服务器。
+提示用户去拆分或重排，然后 `git -C <tmp> cherry-pick --abort`，再走 §8.2.4 收尾。
+**绝不自动解冲突**——此时还没碰 SVN、也没碰主工作副本，中止是零代价的，而猜错的后果
+是把本地补丁送上服务器。
+
+**慢路径要求待交付历史是线性的**，这条在 §8.1 #6 前置拦截，理由见下。
 
 两条路径都在 D5 之前，此刻回滚不涉及任何 SVN 状态。
 
-**实测**（2026-09-13，临时 git fixture，三组场景）：
+**实测**（2026-09-13，临时 git fixture）：
 
 | # | 场景 | 结果 |
 |---|---|---|
-| T1 | 摘掉中间的 Local-Only commit，其 hunk 与后续 commit **不重叠** | `cherry-pick` 退出 0；`deliver` 分支磁盘上 log 行恢复为原文 ✅ |
+| T1 | 摘掉中间的 Local-Only commit，其 hunk 与后续 commit **不重叠** | `cherry-pick` 退出 0；交付树上 log 行恢复为原文 ✅ |
 | T2 | 摘掉中间的 Local-Only commit，其 hunk 与后续 commit **紧邻/重叠** | `cherry-pick` 退出 1，`CONFLICT` ⚠️ 必须中止 |
-| T3 | 基线推进到 `deliver` 后 `git rebase svn/base` | 退出 0；`svn/base..HEAD` **只剩那个 Local-Only commit**，磁盘上补丁回来了，基线里是干净原文 ✅ |
+| T3 | 基线推进到交付树后 `git rebase svn/base` | 退出 0；`svn/base..HEAD` **只剩那个 Local-Only commit**，磁盘上补丁回来了，基线里是干净原文 ✅ |
+| T4 | 待交付历史里有一个 **merge commit** | `cherry-pick` 退出 128：`is a merge but no -m option was given` ❌ 见 §8.1 #6 |
+| T5 | 对 T4 的 merge 补 `-m 1`（其两个父提交已被逐个摘过） | `CONFLICT` —— 改动被重复应用 ❌ 加 `-m` 不是解法 |
+| T6 | 慢路径在临时 worktree 里重放并制造 T2 冲突 | 主工作副本**磁盘内容、HEAD、HEAD OID 三者全部未变** ✅ 这是本节第 1 条硬约束的直接证据 |
+| T7 | worktree 里挂着半途的 cherry-pick 时直接 `git worktree remove --force` | 退出 0，`git worktree list` 干净；**不需要先 abort，也不需要 `prune`** ✅ |
 
 T3 是稳态的证据：已交付的 commit 被 rebase 按 patch-id 自动丢弃，补丁无需人工搬运。
+
+T4 / T5 是 §8.1 #6 存在的理由：`cherry-pick` 对 merge commit 没有「自动选一条边」的
+安全语义。不加 `-m` 直接硬失败；加 `-m 1` 则把 merge 的第一父 diff 整个重放一遍，而那
+部分改动在前面逐个摘取父提交时**已经应用过**，必然冲突。两条路都走不通，所以只能在
+动手之前拦住。
 
 **D9 不得提示删除带补丁的分支。** 交付后工作分支上仍挂着 Local-Only commit，它们是
 **唯一副本**——删掉分支就等于删掉用户攒了几个月的本地补丁。所以 `svn/base..ORIG_BRANCH`
@@ -716,6 +814,38 @@ T3 是稳态的证据：已交付的 commit 被 rebase 按 patch-id 自动丢弃
 两道防护：D3 的确认对话框必须**显式列出被摘掉的 Local-Only commit**（列表为空时也要
 说明「本次没有本地补丁被排除」，让用户在预期之外时能察觉）；以及 D3 本来就要展示完整
 的 A/M/D 文件清单与 diff 预览。
+
+#### 8.2.4 D0.5 之后所有早退共用一条收尾路径
+
+D0.5 建出临时 ref（慢路径还建过临时 worktree）之后，流程有**六个**出口会在碰 SVN 之前
+就结束：D0.5 冲突、D0.5 非冲突失败、D1/D2 空清单（§8.3）、D3 用户取消、D3.5 复查失败、
+以及任意时刻的进程崩溃。它们必须走**同一段**收尾代码，而不是各写各的：
+
+```text
+cleanup_before_svn(journal):
+  ① 若 journal.tempWorktree 存在
+       git worktree remove --force <tempWorktree>
+       ← 实测：worktree 里挂着半途的 cherry-pick 也能直接 remove，不必先 abort
+       ← **绝不跑仓库级的 git worktree prune**：用户可能同时开着 Rider 的
+         worktree，prune 会清掉别人的注册项。只按 journal 记着的这一个路径动
+  ② 若当前 HEAD 不在 journal.origBranch 上
+       git checkout <origBranch>                   ← 只有 D3.8 之后才会发生
+  ③ 若 journal.deliverRef 存在且前缀是 refs/mygitclient/deliver/
+       git update-ref -d <deliverRef>
+  ④ 断言：HEAD == origBranch 且 origHead 未变；不满足则**停下报错并导出 journal**，
+     不自作主张继续
+  ⑤ 删除 journal；释放锁；恢复 watcher 并发一次 repo-changed
+```
+
+每一步都必须**幂等**，因为崩溃恢复会把它重跑一遍：worktree 可能已经不在、ref 可能
+已经删掉、HEAD 可能本来就在 `origBranch` 上，这些都不算失败。
+
+④ 的断言是这段收尾的价值所在：它把「用户莫名其妙停在 detached HEAD、本地补丁看起来
+消失了」这个最吓人的失败形态挡在门外。`origHead` 在 D0 就写进了 journal，是唯一可信
+的对照基准。
+
+D5 之后的失败**不走**这条路径——那时 SVN 侧已经落地，收尾语义完全不同，见 §8.5（它在
+清完 SVN 登记之后复用本段的 ②～⑤）。
 
 ### 8.3 空清单必须中止
 
@@ -759,18 +889,18 @@ D4 的两类登记，撤销方式**不对称**：
 每条 svn delete  → svn revert <file>，然后删掉磁盘上被恢复出来的那个文件
                    （用显式文件删除，不用 git clean —— 那条命令语义太宽）
 撤销完断言：git status 与 D5 之前一致
-然后 git checkout <ORIG_BRANCH>；git branch -D deliver/<opid>
-                   ← D3.8 切走过，必须切回来；两者都从 journal 读
+然后走 §8.2.4 的统一收尾（切回 origBranch、删 deliverRef、删 journal、
+放锁、恢复 watcher）
 ```
 
 逐条精确撤销，不用任何批量恢复命令。
 
-**`git checkout <ORIG_BRANCH>` 这一步不能省。** D3.8 之后会话停在 `deliver/<opid>` 上，
-D5 失败若只清 SVN 登记就收手，用户会发现自己莫名其妙待在一个陌生分支上、本地补丁
-凭空消失——而补丁其实好好地躺在 ORIG_BRANCH 里。`origBranch` 与 `deliverBranch` 在
-**D0.5 就写进了 journal**（早于任何分支操作），崩溃重开后同样按这两个字段收尾。`deliver/<opid>` 是本流程自建的
-临时分支，删它不需要额外授权；但**删除前必须断言它确实是 `deliver/` 前缀**，别的分支
-一律不碰。
+**回到 `origBranch` 这一步不能省。** D3.8 之后会话是 detached 在 `deliverRef` 上的，
+D5 失败若只清 SVN 登记就收手，用户会发现自己莫名其妙处于 detached HEAD、本地补丁
+凭空消失——而补丁其实好好地躺在 `origBranch` 里。`origBranch` 与 `deliverRef` 在
+**D0.5 就写进了 journal**（早于任何 ref 操作），崩溃重开后同样按这两个字段收尾。
+`refs/mygitclient/deliver/<opid>` 是本流程自建的内部 ref，删它不需要额外授权；但
+**删除前必须断言它确实在 `refs/mygitclient/deliver/` 前缀下**，别的 ref 一律不碰。
 
 ### 8.6 D5 的五类失败
 
@@ -1081,11 +1211,16 @@ React 依赖、可直接单测。
 | S10 stash apply 冲突 | 未提交改动与新基线冲突 | 不回滚，**stash 与钉住的 ref 都保留不删** | 同上 + 给出 stash 的 OID |
 | D5 各类失败 | 见 §8.6 | 见 §8.5 | 见 §8.6 |
 | **D6 update 失败 / 冲突** | 服务器在 D5 之后又有提交，且与白名单文件冲突 | **不可回滚**——D5 已落地 | 明确告知「提交已成功、基线尚未推进」，journal 停在 `post-commit`，提供「重试 D6 起」的入口 |
-| **D0.5 cherry-pick 冲突** | Local-Only commit 与待交付 commit 改到相邻/同一处（§8.2.3 T2） | `cherry-pick --abort` + 删 `deliver/<opid>`，**零代价**（还没碰 SVN） | 指出是哪两个 commit 打架，引导拆分或把补丁移到分支顶端 |
+| **D0.5 前置：待交付历史含 merge commit** | 用户在 IDE 里 merge 过，且 Local-Only commit 夹在中间需走慢路径（§8.1 #6） | **不做任何修改**——检查在动手之前 | 指出是哪个 merge commit，引导把补丁移到顶端（走快路径）或线性化历史 |
+| **D0.5 cherry-pick 冲突** | Local-Only commit 与待交付 commit 改到相邻/同一处（§8.2.3 T2） | 在临时 worktree 里 `cherry-pick --abort`，然后走 §8.2.4 统一收尾，**零代价**（还没碰 SVN，主工作副本未动） | 指出是哪两个 commit 打架，引导拆分或把补丁移到分支顶端 |
+| **D0.5 非冲突失败**（worktree 建不出、磁盘满、ref 写不进） | 环境问题 | 同上，走 §8.2.4 统一收尾 | 原样展示 git stderr，不猜原因 |
+| **D1 / D2 空清单** | 净变更为空（§8.3） | 走 §8.2.4 统一收尾 | 说明「没有可交付的净变更」，并提示是否全部改动都被标成了 Local-Only |
+| **D3 用户取消** | 用户看了清单决定不交付 | 走 §8.2.4 统一收尾 | 正常退出，不报错；保留用户输入的提交信息 |
+| **D3.5 复查 remoteRev 失败 / 已变化** | 网络问题，或同事在确认对话框期间提交了（§8.4） | 走 §8.2.4 统一收尾 | 提示先更新再交付，**保留用户输入的提交信息** |
 | **D8d 不是快进**（无 Local-Only commit 时） | 前面某步的假设崩了 | 停下不动 | 报错并导出 journal，**不自动 merge** |
-| **D8d rebase 后仍有未标记 commit** | 该交付的东西没进 `deliver/<opid>` | 停下不动 | 报错并导出 journal，列出这些 commit |
+| **D8d rebase 后仍有未标记 commit** | 该交付的东西没进交付树 | 停下不动 | 报错并导出 journal，列出这些 commit |
 | **D8d rebase 冲突**（有 Local-Only commit 时） | 本地补丁与他人在 D6 拉下来的改动冲突 | **不回滚**，停在冲突态 | 进入冲突解决模式；提交已成功，基线已推进，只剩补丁没落回去 |
-| 任意步骤客户端崩溃 | — | 靠 §7.6 的写前 journal | 重开后按 `phase` 给出对应的继续 / 放弃入口 |
+| 任意步骤客户端崩溃 | — | 靠 §7.6 的写前 journal | 重开后按 `phase` 给出对应的继续 / 放弃入口；`prepare` / `building-deliver` / `deliver-built` / `checked-out` 四个 phase 的放弃入口一律走 §8.2.4 统一收尾 |
 
 ## 14. 测试策略
 
@@ -1130,13 +1265,16 @@ svn checkout file:///<tmp>/repo  <tmp>/wc2     ← 「同事」，用来制造�
 | 13 | **mixed revision 检测**：wc2 只提交一个深层文件，wc1 的根 revision 不动，`nodeRevs` 校验必须报失同步（§6.6.1） | 1、3 |
 | 14 | **断网查证**：制造「提交成功但客户端认为失败」，用 opid / changed-paths 在完整区间内正确判定（§8.6.2）；另测假阳性场景——先用同样的 message 提交过一次 | 1、2 |
 | 15 | **D6 白名单外有本地修改时交付仍安全**：wc1 改一个美术文件不提交，wc2 提交别的内容，走完整交付，断言美术文件的本地修改**未被合并、未产生冲突文件**（§8.2.1） | 2、4 |
-| 16 | **逐 phase 崩溃恢复**：在 S1 后、**D3.8 后**、D4 后、D5 后各杀一次进程，重开必须能按 journal 给出正确的继续 / 放弃路径；D3.8 后那次要断言能切回 `origBranch` 并清掉 `deliverBranch`（§7.6、§8.5） | 2、5 |
+| 16 | **逐 phase 崩溃恢复**：在 S1 后、**D0.5 构造中途**、**D0.5 完成后**、D3.8 后、D4 后、D5 后各杀一次进程，重开必须能按 journal 给出正确的继续 / 放弃路径；D0.5 那两次要断言临时 worktree 被清理、`deliverRef` 被删、HEAD 仍在 `origBranch`；D3.8 后那次要断言能切回 `origBranch` 并清掉 `deliverRef`（§7.6、§8.2.4、§8.5） | 2、5 |
 | 17 | **stash OID 抗漂移**：stash 之后由外部再压一个 stash，恢复必须仍取回正确的 WIP（§7.6.1） | 1、5 |
 | 18 | **D8 分支编排**：交付后基线确实推进到新内容，且工作分支是快进；断言不会出现「基线内容是旧的却标着新 revision」（§8.2.2） | 1 |
 | 19 | **Local-Only commit 绝不被交付**：同一文件里既有本地补丁又有待交付改动，走完整交付后断言服务器上是干净原文、磁盘上补丁还在、`svn/base..HEAD` 只剩那个补丁（§8.2.3 T1+T3） | 1、4 |
-| 20 | **Local-Only 与待交付 commit 重叠时交付必须中止**：断言 SVN 侧一个字节都没动、`deliver/<opid>` 已清理、原分支原样（§8.2.3 T2） | 1、2、4 |
+| 20 | **Local-Only 与待交付 commit 重叠时交付必须中止**：断言 SVN 侧一个字节都没动、`refs/mygitclient/deliver/<opid>` 与临时 worktree 已清理、原分支原样、**主工作副本磁盘内容全程未变**（§8.2.3 T2） | 1、2、4 |
 | 21 | **本地补丁跨 `sync_in` 存活**：wc2 提交别处改动，wc1 走 `sync_in`，断言补丁被 rebase 到新基线上且内容不变（§6.7.1） | 1 |
 | 22 | **恢复流程不误伤本地补丁**：带补丁的仓库触发 §9.4，断言 `svn revert` 的文件列表里没有补丁所在文件，且 ⑦ 之后补丁完好（§9.5） | 2、4 |
+| 23 | **早退闭环**：D1/D2 空清单、D3 用户取消、D3.5 失败三种早退各跑一次（其中至少一次走慢路径），断言 HEAD 在 `origBranch`、`deliverRef` 已删、临时 worktree 已清、journal 已删、锁已释放、watcher 已恢复（§8.2.4） | 2、5 |
+| 24 | **待交付历史含 merge commit 必须前置拒绝**：构造「Local-Only commit 夹在中间 + 历史里有一个 merge commit」的分支，断言 §8.1 #6 拒绝且**没有发生任何 git / svn 写操作**；再断言把补丁移到顶端后（走快路径）同一个仓库能正常交付（§8.1、§8.2.3） | 1、2、4 |
+| 25 | **临时 ref 不与用户分支冲突**：仓库里预先建一个名为 `deliver` 的普通分支，断言整条交付流程照常成功（§8.2.3 为什么不用 `deliver/<opid>` 分支） | 4 |
 
 ### 14.3 前端
 
@@ -1167,6 +1305,14 @@ exclude 生成与图合成都在 Rust 侧，由 cargo test 覆盖。
 11. **用 TortoiseSVN 直接提交会把本地补丁带上去**。`ignore-on-commit` changelist 原本
     还能挡一下，本设计挡不住——补丁就在磁盘上，外部工具看到的就是改过的文件。与第 2 条
     「外部工具无法阻止」同源；交付走客户端是这套方案的前提
+12. **`sync_in` 的 rebase 会压平 merge commit**。S9 和 D8d 用的都是
+    `git rebase --empty=drop svn/base`，不带 `--rebase-merges`，所以用户在 IDE 里
+    合出来的 merge 点会在下一次同步时被线性化。这不会报错也不会丢改动，但会**静默
+    改写历史形状**。之所以接受：基线侧是 SVN 的线性历史，工作分支迟早要被压成线性
+    才能交付；真要保留 merge 形状，就得先解决 §8.1 #6 拦下的那类问题
+13. **待交付历史含 merge commit 且需走慢路径时会被拒绝**（§8.1 #6）。`cherry-pick`
+    对 merge 没有安全的自动语义（§8.2.3 T4 / T5 实测）。缓解手段同第 10 条：把
+    Local-Only commit 移到分支顶端转成快路径，快路径不受 merge 影响
 
 ## 16. 分期
 
@@ -1220,6 +1366,38 @@ Phase 1 到 Phase 3 之间用户手工走 TortoiseSVN 交付时，本地补丁�
 
 ## 18. 修订记录
 
+### 2026-09-13 · review 核实后修正 D0.5 的三处缺陷
+
+对上一版新增的 D0.5 做了一轮独立 review，三条意见全部在临时 git fixture 里复现确认，
+全部成立。核心问题是 **D0.5 被当成「顺手加一步」写进流程，没有按它实际具备的破坏面
+配齐前置检查、早退路径和崩溃语义**。
+
+| # | 缺陷 | 实测证据 | 修正 |
+|---|---|---|---|
+| 1 | D0.5 之后缺早退与崩溃闭环，且 §13 已写的那条回滚步骤本身跑不通 | `cherry-pick --abort` 后 HEAD 仍在 `deliver/op1`，`git branch -D deliver/op1` → `cannot delete branch used by worktree` | 新增 §8.2.4 统一收尾；D0.5 拆出 `building-deliver` / `deliver-built` 两个 phase；慢路径改到临时 worktree 里重放，主工作副本全程不动 |
+| 2 | 慢路径遇 merge commit 直接崩 | 不加 `-m`：`is a merge but no -m option was given`（exit 128）；加 `-m 1`：`CONFLICT`，父提交改动被重复应用 | §8.1 新增第 6 条前置检查，在动手之前拒绝；快路径不受影响 |
+| 3 | `deliver/<opid>` 会与用户已有的 `deliver` 分支撞车 | `fatal: cannot lock ref 'refs/heads/deliver/abc123': 'refs/heads/deliver' exists`；反向、`pack-refs` 之后同样失败 | 改用内部 ref `refs/mygitclient/deliver/<opid>`，与 §7.6.1 钉 stash 的做法同一套 |
+
+三条里第 1 条的性质最重：它不只是漏了几个早退分支，而是**推翻了 D3.8「磁盘切换尽量晚做、
+要在用户确认之后」这条自己写下的不变量**——慢路径的 `git checkout -b` 在 D3 确认之前就
+把磁盘切走了，D3.8 在慢路径下退化成 no-op。所以修法不是补几条 `git checkout`，而是把
+构造过程整个挪出主工作副本。
+
+**顺带发现、一并记入**：S9 / D8d 的 `git rebase` 不带 `--rebase-merges`，会静默压平用户
+的 merge commit（§15 第 12 条）。与第 2 条同源，但不阻断流程，作为已知限制记录。
+
+| 改动点 | 内容 |
+|---|---|
+| §7.6 | `deliverBranch` → `deliverRef`；新增 `tempWorktree`；新增 `sync_out` 的 phase 取值表与「为何 `building-deliver` / `deliver-built` 必须分开」 |
+| §8.1 | 新增第 6 条：慢路径要求待交付历史线性 |
+| §8.2 | D0.5 改为构造交付树（不动磁盘）、标注两个 phase；D1 / D3.8 / D8 / D10 改用 `deliverRef`；补「D0.5→D3.5 之间所有退出走 §8.2.4」 |
+| §8.2.3 | 重写：两条硬约束、为何用内部 ref（含实测）、慢路径改临时 worktree、实测表补 T4 / T5 |
+| §8.2.4（新增） | 六个早退出口共用的 `cleanup_before_svn`，五步幂等，含 `origHead` 断言 |
+| §8.5 | 收尾改为复用 §8.2.4 ②～⑤；detached HEAD 的措辞修正 |
+| §13 | 修正 D0.5 冲突行；新增 merge 前置拒绝、D0.5 非冲突失败、空清单、用户取消、D3.5 失败五行；崩溃行补 phase 清单 |
+| §14.2 | 第 16、20 项补强；新增第 23（早退闭环）、24（merge 前置拒绝）、25（`deliver` 分支不冲突） |
+| §15 | 新增第 12、13 条已知限制 |
+
 ### 2026-09-13 · 补上「长期本地修改」这个缺失场景
 
 用户指出：受 SVN 管理的代码文件常有**不打算交付**的本地改动（注释掉刷屏的 log、临时
@@ -1240,7 +1418,7 @@ Phase 1 到 Phase 3 之间用户手工走 TortoiseSVN 交付时，本地补丁�
 commit，制造 §9.2 的「基线撒谎」。详见 §6.7.2。
 
 **采用的方案**：本地补丁放进带 `Local-Only: true` trailer 的 commit，交付时先构造不含
-这些 commit 的 `deliver/<opid>` 分支并切到磁盘上，`svn commit` 之后再 rebase 回来。不新增
+这些 commit 的交付树并在确认后切到磁盘上，`svn commit` 之后再 rebase 回来。不新增
 任何配置字段。
 
 | 改动点 | 内容 |
