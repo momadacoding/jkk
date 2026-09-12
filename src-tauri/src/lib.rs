@@ -1,6 +1,7 @@
 pub mod commands;
 pub mod engine;
 pub mod error;
+pub mod vcs;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
