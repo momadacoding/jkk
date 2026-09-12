@@ -46,6 +46,18 @@ pub trait Vcs: Send + Sync {
 
     /// 提交暂存区内容。
     fn commit(&self, message: &str, amend: bool) -> Result<()>;
+
+    /// 新建分支。`start_point` 为 None 时从当前 HEAD 开。
+    fn create_branch(&self, name: &str, start_point: Option<&str>) -> Result<()>;
+
+    /// 删除本地分支。
+    fn delete_branch(&self, name: &str) -> Result<()>;
+
+    /// 重命名本地分支。
+    fn rename_branch(&self, old: &str, new: &str) -> Result<()>;
+
+    /// 切到指定 revision。
+    fn checkout(&self, rev: &str) -> Result<()>;
 }
 
 /// 为某个工作目录挑一个后端。

@@ -70,4 +70,28 @@ impl Vcs for GitBackend {
         }
         Ok(())
     }
+
+    fn create_branch(&self, name: &str, start_point: Option<&str>) -> Result<()> {
+        let mut args = vec!["branch", name];
+        if let Some(start) = start_point {
+            args.push(start);
+        }
+        engine::git_cli::run_git(&self.root, &args)?;
+        Ok(())
+    }
+
+    fn delete_branch(&self, name: &str) -> Result<()> {
+        engine::git_cli::run_git(&self.root, &["branch", "-D", name])?;
+        Ok(())
+    }
+
+    fn rename_branch(&self, old: &str, new: &str) -> Result<()> {
+        engine::git_cli::run_git(&self.root, &["branch", "-m", old, new])?;
+        Ok(())
+    }
+
+    fn checkout(&self, rev: &str) -> Result<()> {
+        engine::git_cli::run_git(&self.root, &["checkout", rev])?;
+        Ok(())
+    }
 }

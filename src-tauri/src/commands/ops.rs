@@ -9,18 +9,12 @@ pub fn discard(path: String, paths: Vec<String>, staged: bool) -> Result<()> {
 
 #[tauri::command(async)]
 pub fn create_branch(path: String, name: String, start_point: Option<String>) -> Result<()> {
-    let mut args = vec!["branch", &name];
-    if let Some(start) = &start_point {
-        args.push(start);
-    }
-    run_git(&path, &args)?;
-    Ok(())
+    crate::vcs::backend_for(&path)?.create_branch(&name, start_point.as_deref())
 }
 
 #[tauri::command(async)]
 pub fn delete_branch(path: String, name: String) -> Result<()> {
-    run_git(&path, &["branch", "-D", &name])?;
-    Ok(())
+    crate::vcs::backend_for(&path)?.delete_branch(&name)
 }
 
 /// 删除分支前的确认框要显示的信息：对应的远程分支、还有多少提交没合并进来。
@@ -70,14 +64,12 @@ pub fn checkout_remote_branch(path: String, remote_branch: String) -> Result<Str
 
 #[tauri::command(async)]
 pub fn rename_branch(path: String, old: String, new: String) -> Result<()> {
-    run_git(&path, &["branch", "-m", &old, &new])?;
-    Ok(())
+    crate::vcs::backend_for(&path)?.rename_branch(&old, &new)
 }
 
 #[tauri::command(async)]
 pub fn checkout(path: String, rev: String) -> Result<()> {
-    run_git(&path, &["checkout", &rev])?;
-    Ok(())
+    crate::vcs::backend_for(&path)?.checkout(&rev)
 }
 
 /// 在某条提交上打一个轻量 tag。

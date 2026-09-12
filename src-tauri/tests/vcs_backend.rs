@@ -182,3 +182,55 @@ fn backend_discard_with_empty_paths_is_a_noop() {
         "未跟踪文件不得被删"
     );
 }
+
+#[test]
+fn backend_branch_lifecycle() {
+    let dir = repo();
+    let path = p(&dir);
+    let backend = backend_for(&path).unwrap();
+
+    backend.create_branch("feat/x", None).unwrap();
+    let refs = backend.graph().unwrap().refs;
+    assert!(
+        refs.iter().any(|r| r.name.ends_with("feat/x")),
+        "新分支应出现在 refs 里：{:?}",
+        refs.iter().map(|r| &r.name).collect::<Vec<_>>()
+    );
+
+    backend.rename_branch("feat/x", "feat/y").unwrap();
+    let refs = backend.graph().unwrap().refs;
+    assert!(refs.iter().any(|r| r.name.ends_with("feat/y")));
+    assert!(!refs.iter().any(|r| r.name.ends_with("feat/x")));
+
+    backend.delete_branch("feat/y").unwrap();
+    let refs = backend.graph().unwrap().refs;
+    assert!(!refs.iter().any(|r| r.name.ends_with("feat/y")));
+}
+
+#[test]
+fn backend_create_branch_honours_start_point() {
+    let dir = repo();
+    let path = p(&dir);
+    let backend = backend_for(&path).unwrap();
+
+    // 从 HEAD~1（也就是 c1）开分支，它的 tip 必须不等于当前 HEAD
+    backend.create_branch("from-c1", Some("HEAD~1")).unwrap();
+    let head = backend.open().unwrap().head_hash;
+    let refs = backend.graph().unwrap().refs;
+    let branch = refs
+        .iter()
+        .find(|r| r.name.ends_with("from-c1"))
+        .expect("分支不存在");
+    assert_ne!(branch.hash, head, "start_point 没生效，分支落在了 HEAD 上");
+}
+
+#[test]
+fn backend_checkout_moves_head() {
+    let dir = repo();
+    let path = p(&dir);
+    let backend = backend_for(&path).unwrap();
+
+    backend.create_branch("other", None).unwrap();
+    backend.checkout("other").unwrap();
+    assert_eq!(backend.open().unwrap().head, "other");
+}
