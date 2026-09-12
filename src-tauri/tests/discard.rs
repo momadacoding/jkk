@@ -244,6 +244,67 @@ fn staged_discard_stops_instead_of_deleting_when_head_cannot_be_read() {
 }
 
 #[test]
+fn staged_discard_stops_instead_of_deleting_when_the_branch_ref_is_corrupt() {
+    // 同一个缺陷的第二种形态，由对抗性 review 指出（2026-09-13）。
+    //
+    // 上一条测试删的是 tree 对象，此时 `show-ref --verify` 仍然成功；这里损坏的是
+    // **分支 ref 本身**（指向一个不存在的 OID），`show-ref --verify --quiet` 退出
+    // 128 `bad ref`。只判「show-ref 有没有失败」的写法会把它当成「ref 不存在」，
+    // 也就是空仓库，于是文件又落进 rm 桶——而 `git rm -f` 照样退出 0 并删掉它。
+    //
+    // 实测的退出码区分（这是判定必须看退出码而非成败的理由）：
+    //   ref 文件不存在（真 unborn）→ 1
+    //   ref 指向不存在的 OID       → 128
+    let dir = repo();
+    fs::write(dir.path().join("tracked.txt"), "staged version\n").unwrap();
+    run_git(dir.path(), &["add", "tracked.txt"]);
+
+    let head_ref = git_out(dir.path(), &["symbolic-ref", "--quiet", "HEAD"]);
+    fs::write(
+        dir.path().join(".git").join(&head_ref),
+        "0123456789012345678901234567890123456789",
+    )
+    .unwrap();
+
+    let err = ops::discard(p(&dir), vec!["tracked.txt".into()], true)
+        .expect_err("分支 ref 损坏时必须报错，不能当成空仓库");
+
+    assert!(
+        dir.path().join("tracked.txt").exists(),
+        "文件被删了：{}",
+        err.message
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("tracked.txt")).unwrap(),
+        "staged version\n"
+    );
+    // 病根要说出来：`ls-tree` 只会报 `not a tree object`，对用户没有信息量
+    assert!(
+        err.message.contains(&head_ref),
+        "错误里应指出是哪个 ref 坏了：{}",
+        err.message
+    );
+}
+
+#[test]
+fn an_unborn_head_pointing_at_a_slash_prefixed_name_is_still_unborn() {
+    // `for-each-ref refs/heads/svn` 会按路径前缀匹配到 `refs/heads/svn/base`，
+    // 把「HEAD 指向的 ref 不存在」误判成「存在」。spec D10 的基线分支就叫
+    // `svn/base`，所以这个形态在本项目里是会真实出现的，不是造出来的边界。
+    // `show-ref --verify` 是精确匹配，实测退出 1，判定正确。
+    let dir = repo();
+    run_git(dir.path(), &["branch", "svn/base"]);
+    run_git(dir.path(), &["symbolic-ref", "HEAD", "refs/heads/svn"]);
+    fs::write(dir.path().join("fresh.txt"), "new\n").unwrap();
+    run_git(dir.path(), &["add", "fresh.txt"]);
+
+    // HEAD 确实没有提交，fresh.txt 也确实不在任何 HEAD 树里 → 应当照常删掉
+    ops::discard(p(&dir), vec!["fresh.txt".into()], true).unwrap();
+
+    assert!(!dir.path().join("fresh.txt").exists());
+}
+
+#[test]
 fn staged_discard_of_a_new_file_still_works_in_a_repo_with_no_commits() {
     // 守住 finding #1 修复时最容易过度纠正的那条合法路径：
     // `git ls-tree HEAD` 在还没有任何提交的仓库里必然失败（实测退出 128

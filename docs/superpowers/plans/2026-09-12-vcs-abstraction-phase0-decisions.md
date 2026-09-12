@@ -118,6 +118,37 @@ git add                  （无参数）     → "Nothing specified, nothing add
 顺带把 `staged == false` 时的 `ls-tree` 探测整条去掉——那种情况下 `in_head` 被
 `staged &&` 短路，本来就用不到，少一次进程也少一个失败面。
 
+#### 对抗性 review 的追加修正：判定必须看退出码，不是看成败
+
+第一版修复只判「`show-ref --verify` 有没有失败」，**漏掉了同一缺陷的第二种形态**，
+由 Codex 对抗性 review 指出并在 fixture 中复现。四种形态的实测退出码：
+
+| 形态 | `show-ref --verify --quiet` | 正确结论 |
+|---|---|---|
+| 仓库还没有任何提交（ref 文件不存在） | **1** | unborn |
+| 分支 ref 指向不存在的 OID | **128** `bad ref` | **抛出** |
+| 分支 ref 内容是垃圾 | 1 | 按 unborn 处理，见下 |
+| ref 在 packed-refs 里 | **0** | 非 unborn |
+
+第二行就是漏掉的那条：只看成败会把它当成 unborn，而 `git rm -f` 在该状态下照样
+退出 0 并删掉文件。回归测试 `staged_discard_stops_instead_of_deleting_when_the_branch_ref_is_corrupt`
+在旧写法下确实失败（`expect_err` 拿到 `Ok(())`，已实际验证过一次）。
+
+`run_git` 把任何非零退出码塌缩成同一个 `GitError`，表达不了这个区别，因此在
+`engine::git_cli` 加了同族函数 `run_git_code`（与既有的 `run_git_bytes` 并列，
+不是另起一套进程调用，符合 `AGENTS.md` §7.3）。
+
+**否掉的备选方案**：用 `for-each-ref` 判 ref 是否存在。它按**路径前缀**匹配——
+HEAD 指向 `refs/heads/svn`（正是 spec D10 的基线分支名）而仓库里有
+`refs/heads/svn/base` 时，它会吐出后者，把真 unborn 误判成「ref 存在」。实测确认，
+并留了 `an_unborn_head_pointing_at_a_slash_prefixed_name_is_still_unborn` 挡住这条路。
+`show-ref --verify` 是精确匹配，无此问题。
+
+**有意接受的行为**（第三行）：ref 内容是垃圾时 git 自己就当它不存在
+（`warning: ignoring broken ref`），`git checkout HEAD -- <file>` 同样取不到内容，
+没有可恢复的目标。实测后果是那一版**暂存内容**丢失，已提交的内容仍在对象库里、
+可经 fsck 取回。与 git 自身语义一致，不额外加特判。
+
 ## 决策条目
 
 ### 全局

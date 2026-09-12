@@ -3,7 +3,7 @@
 //! 这段逻辑原本直接写在 `commands/ops.rs` 的命令函数里。下沉到 engine 是为了
 //! 让 `vcs::GitBackend` 能调用它——命令层往后只做分发，不放业务逻辑。
 
-use crate::engine::git_cli::run_git;
+use crate::engine::git_cli::{run_git, run_git_code};
 use crate::error::{GitError, Result};
 use std::collections::HashSet;
 
@@ -21,30 +21,53 @@ fn path_set(path: &str, args: &[&str]) -> Result<HashSet<String>> {
 
 /// HEAD 是否还没有指向任何提交（`git init` 之后、第一次 commit 之前）。
 ///
-/// 判定必须是**正向**的：HEAD 是个 symbolic ref，且它指向的那个分支 ref 不存在。
+/// `ls-tree HEAD` 失败有好几种原因，而在 `staged` 分支下把「读不出来」当成
+/// 「HEAD 里什么都没有」会让文件被 `git rm -f` 删掉。所以判定必须**正向**：
+/// HEAD 是个 symbolic ref，且它指向的那个分支 ref **确实不存在**。
 ///
-/// 不能反过来用「`git rev-parse --verify HEAD` 失败」来判。`ls-tree HEAD` 失败有
-/// 两种完全不同的原因，而把后一种当成前一种会删用户的文件：
+/// 判据是 `show-ref --verify --quiet` 的**退出码**，不是「它有没有失败」。
+/// 2026-09-13 在临时 fixture 上实测的四种形态：
 ///
-/// | 情形 | `ls-tree -r HEAD` | 该怎么办 |
+/// | 形态 | `show-ref --verify --quiet` | 结论 |
 /// |---|---|---|
-/// | 仓库还没有任何提交 | 退出 128 `Not a valid object name HEAD` | 当成空集，继续 |
-/// | 对象库损坏（tree 对象丢了） | 退出 128 `fatal: not a tree object` | **必须抛出** |
+/// | 仓库还没有任何提交（ref 文件不存在） | **1** | unborn |
+/// | 分支 ref 指向不存在的 OID | **128** `bad ref` | **抛出** |
+/// | 分支 ref 内容是垃圾 | 1 | 见下 |
+/// | ref 在 packed-refs 里（松散文件不存在） | **0** | 非 unborn |
 ///
-/// 2026-09-13 在临时 fixture 上实测第二种：删掉 HEAD 的 tree 对象之后，
-/// `ls-tree` 失败而 `git rm -f` 照样退出 0 并把文件删掉。旧实现在 `staged` 分支下
-/// 因此把「HEAD 里有、应当恢复」的文件分进了 rm 桶——用户点的是「丢弃改动」，
-/// 拿到的是「文件没了」，而且整个调用还返回成功。
+/// 第二行是这条判定存在的全部理由：只看「失败与否」会把它当成 unborn，而此时
+/// `git rm -f` 照样退出 0 并删掉文件（实测）。
 ///
-/// 两种情形下 `symbolic-ref` + `show-ref` 的结果不同（实测）：空仓库里分支 ref
-/// 不存在，损坏的仓库里它好好地在。detached HEAD 下 `symbolic-ref` 退出 1，
-/// 那种状态必然已经指着某个提交，返回 false 正确。
-fn head_is_unborn(path: &str) -> bool {
-    let Ok(head_ref) = run_git(path, &["symbolic-ref", "--quiet", "HEAD"]) else {
-        return false;
-    };
+/// 第三行是有意接受的行为：git 自己就把内容损坏的 ref 当成不存在
+/// （`warning: ignoring broken ref`），`git checkout HEAD -- <file>` 同样取不到
+/// 内容，没有可恢复的目标。实测后果是那一版**暂存内容**丢失，已提交的内容仍在
+/// 对象库里、可经 fsck 取回。
+///
+/// 不能用 `for-each-ref` 判 ref 是否存在：它按路径前缀匹配。HEAD 指向
+/// `refs/heads/svn`（spec D10 的基线分支名）而仓库里有 `refs/heads/svn/base` 时，
+/// 它会吐出后者，把真 unborn 误判成「ref 存在」。`show-ref --verify` 是精确匹配。
+///
+/// detached HEAD 下 `symbolic-ref` 退出 1，那种状态必然已经指着某个提交，
+/// 返回 `Ok(false)` 正确。
+fn head_is_unborn(path: &str) -> Result<bool> {
+    let (code, head_ref) = run_git_code(path, &["symbolic-ref", "--quiet", "HEAD"])?;
+    if code != 0 {
+        return Ok(false);
+    }
     let head_ref = head_ref.trim();
-    !head_ref.is_empty() && run_git(path, &["show-ref", "--verify", "--quiet", head_ref]).is_err()
+    if head_ref.is_empty() {
+        return Ok(false);
+    }
+
+    let (code, _) = run_git_code(path, &["show-ref", "--verify", "--quiet", head_ref])?;
+    match code {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(GitError::new(
+            "git_cli",
+            format!("git show-ref --verify {head_ref} 退出码 {other}，分支 ref 可能已损坏"),
+        )),
+    }
 }
 
 /// 组装一条把「已经做了什么、还没做什么」说清楚的错误。
@@ -115,9 +138,20 @@ pub fn discard(path: &str, paths: &[String], staged: bool) -> Result<()> {
         head_probe.extend(paths.iter().map(String::as_str));
         match path_set(path, &head_probe) {
             Ok(set) => set,
-            // 只有「仓库还没有任何提交」这一种失败是合法的，其余必须抛出
-            Err(_) if head_is_unborn(path) => HashSet::new(),
-            Err(err) => return Err(err),
+            // 只有「仓库还没有任何提交」这一种失败是合法的，其余必须抛出。
+            // 判不清也算抛出——这里的默认值会直接决定文件是被恢复还是被删掉。
+            Err(probe_err) => match head_is_unborn(path) {
+                Ok(true) => HashSet::new(),
+                Ok(false) => return Err(probe_err),
+                // 两条线索都留下：ls-tree 说了症状，show-ref 才指出病根
+                // （`not a tree object` 对用户毫无信息量，`bad ref <name>` 有）
+                Err(ref_err) => {
+                    return Err(GitError::new(
+                        "git_cli",
+                        format!("{}\n{}", probe_err.message.trim_end(), ref_err.message),
+                    ))
+                }
+            },
         }
     } else {
         HashSet::new()
