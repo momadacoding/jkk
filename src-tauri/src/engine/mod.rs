@@ -14,6 +14,7 @@ pub mod repo;
 pub mod session;
 pub mod stash;
 pub mod svn_cli;
+pub mod svn_xml;
 pub mod tree;
 pub mod upstream;
 pub mod watch;

@@ -21,7 +21,7 @@
 |---|---|---|---|
 | 0 开工自检与基线 | ✅ 完成 | 本文件 | 自检全过；基线 226 passed / 0 failed / 22 个二进制 |
 | 1 svn CLI 封装与可用性探测 | ✅ 完成 | `engine/svn_cli.rs`、`engine/mod.rs`、`tests/svn_cli.rs` | fmt ✓ clippy 零告警 ✓ `--test svn_cli` 4 passed ✓ `cargo test` **230 passed / 0 failed**（= 226 + 4） |
-| 2 `--xml` 解析（roxmltree） | ⬜ 未开始 | | |
+| 2 `--xml` 解析（roxmltree） | ✅ 完成 | `engine/svn_xml.rs`、`engine/mod.rs`、`Cargo.toml`、`tests/svn_xml.rs` | fmt ✓ clippy 零告警 ✓ `--test svn_xml` **8 passed**（计划写的是 6，对齐真实输出后加了 2）✓ `cargo test` **238 passed / 0 failed**（= 230 + 8） |
 | 3 配置文件读取与校验 | ⬜ 未开始 | | |
 | 4 嵌套 WC 枚举与 P4 | ⬜ 未开始 | | |
 | 5 exclude 规则生成 | ⬜ 未开始 | | |
@@ -154,6 +154,55 @@
   结构上不可能改变——实测也确实是 226 → 230（只多出本 Task 新增的 4 个）。
 - `run_svn` / `run_svn_code` 至今**没有任何调用方**，不会发出 svn 命令。
 - `probe_svn` 只跑 `svn --version` 与 `reg query`，两个都是只读。
+
+### Task 2：`--xml` 输出解析
+
+#### 偏离计划
+
+- **测试从 6 个加到 8 个。** 计划的 Step 2.6 只要求「人工核对真实输出的结构，
+  对不上就改测试常量」。核对后发现两处常量缺东西，就地补成了断言（见下）。
+
+#### 计划的错误
+
+- 计划给的 `INFO_XML` 常量**漏了 `<entry>` 底下的 `<commit revision>` 子节点**。
+  真实 `svn info --xml` 有它，而且它与 entry 自身的 `revision` 属性是两回事
+  （前者是「最后被改动于哪个 revision」）。按计划那个常量测，`parse_info` 取哪个
+  都能通过——**等于没测到这个取错点**，而它与 §6.6.4 陷阱二是同一类缺陷。
+  已补：常量里 entry `revision="9"` 与 commit `revision="4"` 故意不同，
+  新增 `info_takes_the_entry_revision_not_the_commit_child` 钉住。
+
+- 计划给的 `STATUS_XML` 里 external 根写的是 `path="Vendor"`，**没有路径分隔符**，
+  于是「Windows 上 svn 返回反斜杠」这件事一点都没覆盖到。已改成 `Code\Vendor`
+  并新增 `external_root_paths_come_back_with_windows_separators_verbatim`。
+
+#### 计划没写的坑（2026-09-13 真实 svn 输出实测）
+
+在临时 fixture（`svnadmin create` + checkout，跑完即删）上 dump 了两条命令的原始
+输出，与计划的常量逐项对照：
+
+| 观察 | 结果 |
+|---|---|
+| 行尾 | **CRLF**（`od -c` 见 `\r \n`），与 spec §6.6.4 陷阱三一致 |
+| 属性排列 | 逐行，`<entry` 与 `path=` 不在同一行 → 行内正则确实会扫空 |
+| `svn info` 的 entry 属性顺序 | 实际是 `kind, path, revision`，不是计划写的 `path, revision, kind`。DOM 解析不受影响，但常量已改成真实顺序 |
+| `svn info` 的 `<wc-info>` | 除 `<wcroot-abspath>` 外还有 `<schedule>` / `<depth>`。常量已补 |
+| `svn info` 的 `<entry>` 直接子节点 | **有 `<commit revision>`**（计划漏了，见上） |
+| `svn status -v --xml` 的 `path` 属性 | Windows 上是**反斜杠**（`Code\A.cs`） |
+| 目录节点本身 | 也是一条 `<entry>` 且带 revision，所以 `nodeRevs` 会含目录的 revision——这是对的，spec §6.6.2 说的就是「每个已版本控制**节点**」 |
+
+**分隔符规范化放在消费方，不放在解析层。** 解析层的职责是如实反映 svn 说了什么；
+`engine::svn_wc`（Task 4）要拿 external 路径和正斜杠形式的白名单比对，不转换就
+永远比不中，会把嵌套 external 反复塞回待处理队列。这个约定现在有断言兜着。
+
+#### 为什么这么改是安全的
+
+- 本 Task 仍然**只新增代码**，`svn_xml` 没有任何现有模块引用，既有测试 230 → 238
+  只多出本 Task 的 8 个。
+- 引入的 `roxmltree` 0.21.1 是**只读 DOM**，不执行任何外部内容；MIT/Apache-2.0，
+  `rust-version 1.60` 低于本 crate 声明的 1.77.2，依赖只有已在树里的 `memchr`。
+- 解析失败一律返回 `Err`，**绝不降级成空集**——空集会让「nodeRevs 单值」这条
+  不变量以看起来通过的方式被绕过，已由
+  `parse_node_revs_on_garbage_errors_instead_of_returning_empty` 钉住。
 
 ---
 
