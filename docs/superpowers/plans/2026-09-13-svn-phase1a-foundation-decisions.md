@@ -27,7 +27,7 @@
 | — review 修复（7 条） | ✅ 完成 | `svn_cli.rs`、`svn_config.rs`、`svn_xml.rs` + 各自测试 | 见「独立 review」一节。⚠️ **#3 分两次才修完**——第一次只加了文档契约就报了「全部已修」，等于没修。测试数 svn_cli 4→8、svn_config 14→16、svn_xml 8→11；`cargo test` **267 passed / 0 failed** |
 | 5 exclude 规则生成 | ✅ 完成 | `engine/svn_exclude.rs`、`engine/mod.rs`、`tests/svn_exclude.rs` | fmt ✓ clippy 零告警 ✓ `--test svn_exclude` **9 passed**（计划写的是 7，多的 2 条覆盖「白名单条目互相包含」，见下）✓ `cargo test` **276 passed / 0 failed / 27 个二进制**（= 267 + 9） |
 | 6 纳入集合核对 | ✅ 完成 | `engine/svn_include_check.rs`、`engine/mod.rs`、`tests/svn_exclude.rs`（追加） | fmt ✓ clippy 零告警 ✓ `--test svn_exclude` **17 passed**（9 + 8；计划写的是 3，多的 5 条见下）✓ `cargo test` **284 passed / 0 failed / 27 个二进制**（= 276 + 8） |
-| 7 仓库识别 / capabilities / backend_for 分流 | ⬜ 未开始 | | |
+| 7 仓库识别 / capabilities / backend_for 分流 | ✅ 完成 | `vcs/mod.rs`、`vcs/git.rs`、`vcs/svn.rs`、`commands/repo.rs`、`lib.rs`、`tests/svn_backend.rs` | fmt ✓ clippy 零告警 ✓ `--test svn_backend` **11 passed**（计划写的是 9）✓ `cargo test` **295 passed / 0 failed / 28 个二进制**（= 284 + 11）。⚠️ 两个新 Tauri 命令的真实窗口验证在 Task 9 |
 | 8 前端按能力隐藏入口 | ⬜ 未开始 | | |
 | 9 收尾验证 | ⬜ 未开始 | | |
 
@@ -520,6 +520,77 @@ X 的真实形态。修法是让它先真的 `git add -A` 把 `.svn/wc.db` 送�
   Task 3 的 `normalize_whitelist_entry` 已经挡了前导 `-`，这里是第二道。
 - 测试仓库全部是 `TempDir` 里 `git init` 出来的，跑完即删，不碰本仓库或用户仓库。
 - 两条防御性测试都做过**反向验证**（摘掉保护后必须变红），不是写完就算。
+
+---
+
+### Task 7：仓库识别、`capabilities()` 与 `backend_for` 分流
+
+#### 偏离计划
+
+- **`#[path = "svn_fixtures.rs"]` 改成 `common/svn_fixtures.rs`。** Task 4 已经
+  把 fixture 挪进 `common/`（理由见那一节），计划里这条路径没同步。
+
+- **测试从 9 条加到 11 条，且换掉了其中一条。**
+  - 删 `a_suspicious_repo_refuses_to_open`，换成
+    `the_two_blocking_states_carry_different_error_codes`：原测试只验证了
+    `svn_unconfigured_git` 一个码，而这两个状态存在的全部意义就是**引导相反**
+    （去初始化 vs 去查那个 `.git` 哪来的）。只测一半，另一半塌缩成同一个码也
+    不会有人发现。新测试把两个码都断言，外加一条 `assert_ne!`。
+  - 加 `a_directory_with_neither_marker_still_yields_a_backend`：本 Task 给
+    `backend_for` 新开了三条 `Err` 分支，而「打开任意文件夹」这条既有路径依赖
+    「任何目录都能拿到一个后端」。没有这条，新分支哪天多吃了一种目录也没人发现。
+  - 加 `a_hybrid_repo_with_a_broken_config_fails_at_open`：配置坏了既不是
+    「可疑」也不该让半个坏配置流到下游，错误码是 Task 3 的 `svn_config`。
+
+- **`hybrid()` 辅助函数会连 exclude 一起写。** 计划的 fixture 只有
+  `.svn` + `.git` + 配置，没有 `.git/info/exclude`——那不是混合仓库的真实形态。
+  顺带让 `an_svn_backend_still_delegates_git_reads` 能多断言一句
+  「`.svn` 不出现在状态列表里」；不写 exclude 的话 SVN 的工作副本数据库会摆在
+  「未跟踪文件」里等用户一键 stage 进去，而原测试根本看不见这件事。
+
+#### 计划的错误
+
+- **`expect_err` 在 `Result<Box<dyn Vcs>, _>` 上编译不过。** `expect_err` 要求
+  `T: Debug`，而 `Box<dyn Vcs>` 没有 `Debug`（给 `trait Vcs` 加 `Debug` 约束是
+  为了一条测试去动公共接口，不值当）。改用 `.err().expect(...)`，它不要求 `Debug`。
+
+- **计划的 Interfaces 块写「其余 16 个方法不变」，实际是 17 个。** `trait Vcs`
+  现有 17 个方法，`SvnGitBackend` 委托了全部 17 个。数字已在 `Capabilities`
+  的文档注释里改正。
+
+#### 计划没写的坑
+
+- **这里有一处会影响现有用户的行为变化，必须显式说出来。** Phase 0 在
+  `backend_for` 上留了一条注释：「**不要在这里加 `.svn` 判断**——现在加会改变
+  『一个同时有 `.svn` 和 `.git` 的目录』的现有行为（今天它就是个普通 git 仓库），
+  那就不是零行为变化了。SVN 分支在 Phase 1 连同配置文件识别一起加。」
+
+  本 Task 正是它说的那个时机，所以约束解除。**代价是**：一个今天能当普通 git
+  仓库打开的 `.svn` + `.git` 目录（比如有人自己在 SVN checkout 里 `git init` 过），
+  从此会被 `svn_unconfigured_git` 挡住。spec §6.1 明确要这个结果——那个 `.git`
+  的来历不明，猜错的后果是拿另一个人的基线去覆盖工作副本。这条已经写进
+  `backend_for` 的文档注释，不让它只活在决策日志里。
+
+- **`.git` 必须用 `exists()` 判断，不能用 `is_dir()`。** git worktree 里 `.git`
+  是一个**文件**。计划的代码用的就是 `exists()`，但没说为什么，容易在后续重构里
+  被「统一成 is_dir」掉。已补注释。
+
+- **所有 `backend_for` 调用点都用 `?` 直接向上抛**（`commands/{diff,graph,ops,repo,stash}.rs`
+  共 19 处），所以三条新 `Err` 分支会原样变成前端的错误横幅，不需要逐个改。
+  已 grep 核对过，没有吞错误的调用点。
+
+#### 为什么这么改是安全的
+
+- **`SvnGitBackend` 的 17 个方法全部原样委托给 `GitBackend`，零行为变化。**
+  它在 Phase 1a 唯一的自有逻辑是 `capabilities()`（纯返回常量）和 `open()` 里的
+  一次配置校验。
+- **`capabilities()` 是只读的**，不发任何命令、不碰磁盘。
+- 唯一的行为变化就是上面那条新增的阻断，且**是阻断而不是放行**——失败方向是
+  「打不开」，不是「用错后端去写」。
+- Phase 0 交接里点名的那批仍直连 git 的命令（`checkout_remote_branch` /
+  `create_tag` / `cherry_pick` / `save_patch` / `fetch` / `pull` / `push` 与整个
+  `commands/worktree.rs`）**本 Task 一行都没动**。它们靠 Task 8 的前端不渲染入口
+  来兜。这是一层**表现层**防线，不是接缝——如实记在这里，不要当成已经堵住了。
 
 ---
 
