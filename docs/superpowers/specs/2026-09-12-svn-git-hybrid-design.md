@@ -1,7 +1,7 @@
 # SVN + Git 混合模式 设计规格
 
 - 日期：2026-09-12
-- 状态：设计已确认，未实现。已过三轮对抗性 review + 一次 `git svn` 方案复核，结论全部修入，见 §18
+- 状态：设计已确认，未实现。已过三轮对抗性 review + 一次 `git svn` 方案复核 + 一次真实远端工作副本复核，结论全部修入，见 §18
 - 分期：见 §16。本文覆盖全部 5 期的架构，各期另出实现计划
 
 ## 1. 背景与目标
@@ -32,7 +32,8 @@ git 管白名单内的代码文件，负责暂存、分支、stash、本地提�
 
 - 给美术、策划使用。本客户端的 SVN 模式只服务程序职能
 - SVN 分支管理（`svn switch`、`svn merge`、分支创建）
-- SVN 文件锁（`svn lock` / `unlock`）、externals
+- SVN 文件锁（`svn lock` / `unlock`）、externals。⚠️ **「不支持」不等于「可以无视」**：
+  externals 物理存在于真实工作副本里并会污染状态判定，必须主动屏蔽，见 §6.6.4
 - git 历史与 SVN revision 的双向映射（git-svn 语义）。**不用 `git svn` 本身的完整论证见 §2.2**
 - 把本地 git 历史共享给同事（不需要 git remote）
 - 在 SVN 模式下提供 worktree、tag、PR、cherry-pick、revert
@@ -124,16 +125,28 @@ SVN 工作副本。于是同一批代码文件会被 `.svn` 和 `git svn` 同时
 | 换 fsfs format 6 / 7 / 8（`svnadmin create --compatible-version 1.8/1.9/1.10`） | ❌ 全部失败，**不是仓库格式问题** |
 | 同一批 URL 用 SlikSvn 的 `svn info` | ✅ 全部成功 |
 | 本机 `svnserve` | ❌ 不存在（SlikSvn 只装 `svn` + `svnadmin`） |
+| **`git svn clone -r HEAD svn://svn.code.sf.net/…/trunk/contrib`** | ✅ **成功**，11.4s（521 KB 子树，公网真实服务器） |
+| 克隆产物的 trailer | `git-svn-id: svn://…/contrib@29785 cc8e0003-…`，UUID 与 `svn info` 完全一致 |
+| `git svn find-rev r29785` | ✅ 返回对应 sha |
 
-即 **Git for Windows 自带的 `git svn` 打不开 `file://` 仓库**。含义是致命的：§14.1 的
-fixture 策略（`svnadmin create` + `file://` + 两个工作副本）对任何以 `git svn` 为核心的
-方案**当场失效**，必须另起一个真实 SVN 服务端（svnserve 或 Apache）才能跑自动化测试，
-而 `AGENTS.md` §8 把「git 写操作测试必须自建临时 fixture」定成硬约束。这笔成本是引入
-`git svn` 最贵的一项。
+结论必须说**精确**：不是「`git svn` 在本机不能用」，而是 **只有 `file://` 不能用**。
+同一个 `git svn` 对着真实远端（`svn://`）工作完全正常。
 
-**未验证**：公司服务器走 https（ra_serf），本机没有服务器可测，`git svn` 在 https 下的
-可用性与性能**没有实测依据**。不要把上表的结论外推成「`git svn` 完全不能用」——上表只
-证明了 `file://` 这一条路不通。
+这条边界决定了成本落在哪：
+
+- **生产侧：可用。** `-r HEAD` 浅克隆实测可行，D2 担心的「全量历史太贵」本来就有现成
+  解法。这一侧不构成否决理由
+- **测试侧：不可用，且不会随环境改善。** `file://` 不通意味着 §14.1 的 fixture 策略
+  （`svnadmin create` + `file://` + 两个工作副本）对任何以 `git svn` 为核心的方案
+  **当场失效**，必须另起一个真实 SVN 服务端（svnserve 或 Apache），而 `AGENTS.md` §8
+  把「git 写操作测试必须自建临时 fixture」定成硬约束。**这才是引入 `git svn` 最贵的
+  一项**
+
+**仍未验证**：https（ra_serf）下的行为。`svn://` 与 https 同属网络 RA 模块，风险已大幅
+下降，但没实测就是没实测。
+
+⚠️ 本设计**不采用** `git svn`，所以 §14.1 的 fixture 策略**照旧有效**。不要把上面这段
+读成「现有测试方案有问题」——它说的是「如果改用 `git svn`，测试方案要推倒重来」。
 
 #### 但 `git svn` 确实结构性地消灭了两个失败模式
 
@@ -252,6 +265,11 @@ worktree、tag、remote 分支、PR、cherry-pick、revert 在 SVN 模式下没�
 - 所有调用带 `--non-interactive`。理由与 `GIT_TERMINAL_PROMPT=0` 完全相同：
   GUI 应用没有终端，svn 一旦等待 stdin 输入凭据就会永久挂死并占住 Tauri 线程池
 - 需要机器可读输出的一律用 `--xml`（`info` / `status` / `log`）
+- **`status` / `info` / `update` 一律带 `--ignore-externals`**。不带会让 externals
+  指向的**另一个仓库**的节点混进状态判定，后果见 §6.6.4。`diff` 不接受这个选项，
+  也不需要（实测不递归进 externals）
+- **`--xml` 的输出必须用真正的 XML parser 解析，禁止行内正则。** svn 把每个属性单独
+  放一行，`<wc-status` 与 `revision="…"` 不在同一行，行内正则会静默扫出空集，见 §6.6.4
 - 错误映射为 `crate::error::GitError`，不向前端抛裸字符串
 
 ## 5. 并发与原子性
@@ -370,7 +388,7 @@ UUID**（`svn info --xml` 的 `<uuid>`）。UUID 才是仓库身份，URL 可能
 | 字段 | 规则 |
 |---|---|
 | `baselineBranch` | **固定为 `svn/base`**，不再声称可配。全文所有流程都硬编码了这个名字，留一个可配字段只会让两者不一致。字段保留是为了向前兼容，值不是 `svn/base` 就阻断并说明 |
-| `whitelist` | 必须是**仓库内相对路径**。拒绝：绝对路径、盘符（`C:`）、UNC、`..` 段、空串、`/`、`.`、以 `.git` 或 `.svn` 开头的路径、以 `:` 开头的 pathspec magic（`:(exclude)` 之类）。分隔符统一规范化为 `/` |
+| `whitelist` | 必须是**仓库内相对路径**。拒绝：绝对路径、盘符（`C:`）、UNC、`..` 段、空串、`/`、`.`、以 `.git` 或 `.svn` 开头的路径、以 `:` 开头的 pathspec magic（`:(exclude)` 之类）、**落在 `svn:externals` 内或本身就是 external 根的路径**（§6.5 P4、§6.6.4）。分隔符统一规范化为 `/` |
 | `extensions` | 必须以 `.` 开头、不含路径分隔符和通配符 |
 | 两者皆空 | 阻断。空白名单会让 §12.2 的空参数保护在每一步都触发，等于功能不可用 |
 
@@ -459,6 +477,14 @@ commit 不是 baseline（不猜、不部分接受）。
   IDE 与第三方工具也按这个格式识别 SVN 映射
 - **迁移锚点**。将来若 §2.2 的结论被推翻、真要迁到 `git svn`，历史里已有现成的映射
 
+格式不是照文档猜的，是拿真实 `git svn` 的产物核对过的（2026-09-13，`svn://` 真实远端）：
+
+```text
+git-svn-id: svn://svn.code.sf.net/p/tortoisesvn/code/trunk/contrib@29785 cc8e0003-5e82-43e2-9771-63201f7d8d9c
+                                                                         ↑ 与 svn info 的 Repository UUID 逐字符一致
+git svn find-rev r29785  →  a5a1476e3af2ae852bd2a62fcca3084a308ea31d     ← 互操作确认
+```
+
 ⚠️ **代价**：一个用户若在本仓库里手工跑 `git svn init`，`git svn` 会把这些 trailer
 当成自己的映射来解释，而 `.git/svn/` 里并没有对应的 `rev_map`。这不会损坏数据，但
 会产生令人困惑的行为。记为已知限制（§15 第 19 条）。
@@ -483,11 +509,20 @@ P1  白名单内 svn status 必须干净
       不允许存在 M / A / D / R / C / ! / ~ / ? 任何一种
       ⚠️ 必须带 --no-ignore：svn status 默认隐藏 SVN-ignored 文件，而那些
          文件 git 照收，不带这个参数就会漏检
+      ⚠️ 同时必须带 --ignore-externals，理由见 §6.6.4
       ⚠️ 不自动规范化——revert 用户的本地修改是破坏性的，只拦住并引导去
          TortoiseSVN 自己处理（提交或还原），对齐 §8.1 #2 的做法
 P2  nodeRevs 必须是单元素集合 {N}
+      读法按 §6.6.2：--ignore-externals，且取 <wc-status revision>
       多值说明工作副本是 mixed-revision，引导用户先跑一次完整 svn update
+      ⚠️ 读法错了这一条会**永远过不去**，且「先跑一次 svn update」是一条
+         **永远无效**的引导（external 的 revision 来自别的仓库），见 §6.6.4
 P3  不在 svn update / merge 中途（.svn 里没有未完成的操作）
+P4  白名单不得落在 externals 内
+      枚举 svn status --xml（不带 --ignore-externals）里 item="external" 的条目，
+      任一白名单路径等于某个 external 根或位于其下，即拒绝并指出是哪一条。
+      理由：那部分内容属于另一个仓库，而 §8 的交付对着当前工作副本的 URL 提交，
+      根本管不到它——放进白名单等于造一个永远交付不出去的文件集合
 ```
 
 三条全过之后才建库：
@@ -555,9 +590,13 @@ Assets/Art/boss.fbx       r12345
 ```text
 baselineRev = svn/base 顶端 commit 的 git-svn-id trailer 的 rev  ← 权威记账
 rootRev     = svn info --xml 的 <entry revision>          ← O(1)，本地读，毫秒级
-nodeRevs    = svn status -v --xml -- <白名单路径>          ← 白名单内每个已版本控制
-                                                             节点的 revision 集合
-                                                             本地读，范围限于代码
+nodeRevs    = svn status -v --xml --ignore-externals       ← 白名单内每个已版本控制
+                  -- <白名单路径>                             节点的 revision 集合。
+                                                             本地读，范围限于代码。
+                                                             取 <wc-status revision>，
+                                                             **不是** <commit revision>；
+                                                             `--ignore-externals` 也不能
+                                                             省。两条都见 §6.6.4
 remoteRev   = svn info --xml <URL> 的 revision            ← 走网络，异步，失败不阻塞
 ```
 
@@ -618,10 +657,78 @@ revision（§6.6.2 实测），若拿它跟 `baselineRev` 比，第一档就会*
 
 漏检的代价只是**延迟发现**——真正会造成数据损坏的操作全都在第二档后面，不存在
 「绕过闸门直接交付」的路径。
-「绕过闸门直接交付」的路径。
 
 `remoteRev` 走网络，按现有 `refreshPullRequests` 的模式处理：不 await、失败静默
 （读不到就不显示落后数，不弹错）。`remoteRev > rootRev` 时显示「落后 N 个 revision」。
+
+#### 6.6.4 两个会让 `nodeRevs` 整个失效的读法
+
+`nodeRevs` 是本节唯一的失同步判据，它一旦算错，§6.6 / §9 / §6.5 全线失效。
+2026-09-13 在**真实远端工作副本**（TortoiseSVN 源码树，`svn://svn.code.sf.net/p/tortoisesvn/code/trunk`
+@ r29825，16945 个文件，只读）上实测出两个读法陷阱，两个都会让判据永久误报。
+
+**陷阱一：externals 会把另一个仓库的 revision 混进来**
+
+```text
+svn status -v --xml .                    → entry 14689 个
+  wc-status@revision 取值 = {29825, 1938156}   ← 2 个值！
+svn status -v --xml --ignore-externals . → entry 10940 个
+  wc-status@revision 取值 = {29825}            ← 1 个值 ✅
+```
+
+`1938156` 来自 `svn:externals` 指向的 `https://svn.apache.org/repos/asf/...`——**另一个
+仓库**，revision 号在百万量级。该工作副本有 6 个 external（`ext/Subversion`、`ext/apr`、
+`ext/apr-util`、`ext/serf`、`ext/TortoiseOverlays`、`ext/CrashServer/external/zlib`）。
+
+不加 `--ignore-externals` 的后果，逐条对照：
+
+| 位置 | 后果 |
+|---|---|
+| §6.6.2 的判据「`nodeRevs` 有多个值 ⇒ mixed revision」 | **永久误报失同步**，红色横幅永远挂着 |
+| §6.5 P2「`nodeRevs` 必须是单元素集合」 | 初始化向导**永远过不去**，而它给的引导是「先跑一次完整 `svn update`」——**这条引导永远无效**，因为 external 的 revision 来自别的仓库，update 多少次都不会相等 |
+| §6.6.3 第二档的完整校验 | 每次都判失败 |
+| §9.3 / §9.4 | 恢复向导被无意义地反复触发 |
+
+**同仓库 external 更隐蔽。** 上面那 6 个里有一个是 `^/trunk/ext/zlib zlib`（相对 URL，
+指向本仓库），它的 revision 就在 29xxx 量级，靠「数值看起来不对」根本发现不了；若它
+带了 `-r` peg 固定在某个旧 revision，就会产生一个**稳定的、看起来很合理的**多值
+`nodeRevs`。所以判据不能靠数值启发式，只能靠 `--ignore-externals` 从源头排除。
+
+**§1.2 把 externals 列为非目标，但「不支持」不等于「可以无视」。** 它们物理存在于真实
+工作副本里，会主动污染状态判定。必须**主动屏蔽**：
+
+- 所有 `svn status` / `svn info` / `svn update` 调用带 `--ignore-externals`（§4.4）
+- §6.2.1 的白名单校验**拒绝落在 external 内（或本身就是 external 根）的路径**。
+  枚举方式：`svn status --xml`（**不带** `--ignore-externals`）里 `item="external"`
+  的条目就是 external 根，实测能干净列出那 6 个；这比解析 `svn:externals` 属性文本
+  可靠得多——后者要处理 `-r` peg、`^/` 相对 URL、引号和多行格式
+
+**陷阱二：一个 entry 里有两个 revision，取错就全盘误报**
+
+`svn status -v --xml` 的每个 entry 长这样：
+
+```xml
+<entry path=".clang-format">
+  <wc-status item="normal" revision="29825" props="none">   ← 节点基线 revision ✅ 要它
+    <commit revision="29293">                               ← 最后修改 revision ❌ 不是它
+```
+
+同一实测里两者的分布差了三个数量级：
+
+| 属性 | 含义 | 不同取值个数 | 用它做 `nodeRevs` 会怎样 |
+|---|---|---|---|
+| `<wc-status revision>` | 该节点在工作副本里处于哪个 revision | **1**（`{29825}`） | 正确，不变量成立 |
+| `<commit revision>` | 该节点最后被改动是哪个 revision | **2194**（1640–1938129） | 每次都多值 → 永久误报 |
+
+**陷阱三（连带）：XML 属性是逐行排列的，行内正则会静默扫空**
+
+```text
+<wc-status⏎   item="normal"⏎   revision="29825"⏎   props="normal">
+```
+
+`<wc-status` 与 `revision="…"` **不在同一行**（且是 CRLF）。`grep -o '<wc-status[^>]*revision="[0-9]*"'`
+这类写法**不会报错，只会返回空集**——于是 `nodeRevs` 变成空集合，「单值不变量」以一种
+看起来通过了的方式被绕过。所以 §4.4 规定 `--xml` 输出必须走真正的 XML parser。
 
 ### 6.7 本地补丁：Local-Only commit
 
@@ -718,6 +825,23 @@ svn diff --old=<svnUrl>@<baselineRev> --new=<工作副本根> --summarize -- <�
 | T5 | 同一时刻用正确的 `baselineRev=2` 比 | 无输出 ✅ |
 | T6 | 一次传入多个白名单根 | 接受多 target ✅ |
 | T7 | 服务器删掉 `Deep/D.cs` 后拿旧 rev 比 | `D <url>/Assets/Scripts/Deep/D.cs` ✅ 覆盖 §9.4.1 那类漏检 |
+
+在**真实远端服务器**上复测（2026-09-13，TortoiseSVN 源码树 @ r29825，只读，
+`svn://svn.code.sf.net/…/trunk/contrib`，521 KB 子树，公网）：
+
+| # | 场景 | 结果 |
+|---|---|---|
+| R1 | `baselineRev = 29825` 对干净工作副本 | 无输出，**3.1s** ✅ |
+| R2 | 拿旧的 `r29000` 比 | 报出 29 行差异，**3.3s** ✅ 抓住假基线 |
+| R3 | 对着**含 6 个 external 的目录**（`ext/`）体检 | 无输出，3.5s ✅ **`svn diff` 不递归进 externals** |
+
+R3 值得单独记：`svn diff` **不接受** `--ignore-externals`（`Subcommand 'diff' doesn't
+accept option '--ignore-externals'`），一开始以为是缺口，实测发现它**根本不需要**——
+URL 与工作副本目录比对时不会走进 externals。所以 §6.6.4 那条「统一加
+`--ignore-externals`」只约束 `status` / `info` / `update`，不约束 `diff`。
+
+三条的耗时都在 3 秒级，与 §6.8.5 末尾「成本是 MB 级而非 GB 级」的判断一致；公司服务器
+在内网，只会更快。
 
 #### 6.8.3 这条检查证明不了什么
 
@@ -1953,6 +2077,7 @@ React 依赖、可直接单测。
 | **前置检查发现 detached HEAD** | 用户在 IDE 里切到了某个历史 commit（§8.1.1） | 不做任何修改 | 说明当前 HEAD 指向哪个 commit，建议 `git switch -c <name>` 或切回原分支 |
 | **D5 被 pre-commit 拒绝（revprop）** | 服务器不接受自定义 revprop（§8.6.3 形态 B） | 按 §8.5 完整回滚 D4 登记 | 原样展示 svn stderr，给出**需要用户明确确认**的「不带幂等键重试一次」选项；不确认就停下 |
 | **配置校验未过** | `svnUrl` UUID 不符、`baselineBranch` 非 `svn/base`、白名单含非法路径（§6.2.1） | **不做任何修改**，仓库不进入可用状态 | 指出是哪个字段、哪一条规则；`svnUrl` 不符时同时显示配置值与 `svn info` 实际值 |
+| **白名单落在 `svn:externals` 内** | 用户把 external 根或其子路径写进白名单（§6.5 P4） | **不做任何修改**，仓库不进入可用状态 | 指出是哪一条白名单命中了哪个 external 根，说明那部分内容属于另一个仓库、本客户端的交付流程管不到它 |
 | **基线体检不通过**（§6.8） | 基线内容与服务器在 `baselineRev` 上的内容不符——假基线已经产生 | 按时机分：初始化时**整个回退、不创建 `.git`**；§9.4 第 ⑥b 步**停在那里不继续 ⑦**；Phase 1 R3b **中止，连 `svn/base` 指针都不动** | 列出差异文件（已剥掉 URL 前缀、剔除目录条目与纯属性条目，§6.8.4），说明是内容不符而非 revision 不符 |
 | **基线体检跑不成功** | 断网、认证失败、`svnUrl` 不可达 | **不阻断**，不做任何修改 | 标记「基线未经体检」并如实显示；**不得当成体检通过**（§6.8.6） |
 | **拿不到跨进程锁** | 同一工作副本上另一个 mygitclient 进程正在同步（§5.1.1） | 不做任何修改 | 显示持锁进程的 pid 与开始时间；pid 已不存在时提供「接管」入口并写日志 |
@@ -1979,6 +2104,16 @@ svn checkout file:///<tmp>/repo  <tmp>/wc2     ← 「同事」，用来制造�
 
 ⚠️ Windows 上 `file://` URL 是 `file:///C:/path`（三斜杠 + 盘符 + 正斜杠）。
 这是已知跨平台坑，fixture 里要专门处理，不能靠路径拼接碰运气。
+
+⚠️ **fixture 必须能造出 `svn:externals`**（测试项 48 / 49 依赖它）。用
+`svn propset svn:externals` 指向**同一个 fixture 仓库**的另一路径即可，不需要第二个
+仓库、不需要网络；加 `-r` peg 就能复现 §6.6.4 那种「稳定且看起来合理」的多值
+`nodeRevs`。
+
+⚠️ **fixture 是按设计者的预期造出来的**，它不会包含设计者没想到的东西。§18（五）那条
+阻断级缺陷（externals 打穿 `nodeRevs`）在自造 fixture 上跑了三轮都没露头，是拿真实远端
+工作副本一比就暴露的。所以自动化测试之外，**至少要在一个真实工作副本上做一次只读
+核对**，尤其是状态判定这类「读」的逻辑。
 
 真正需要线上 SVN server 的只有三件事，都是边缘路径，不进自动化测试：凭据提示行为、
 网络超时、大仓库性能。
@@ -2036,6 +2171,9 @@ svn checkout file:///<tmp>/repo  <tmp>/wc2     ← 「同事」，用来制造�
 | 45 | **体检输出解析**：断言实现只取第 1 列（内容）、**剔除目录条目与纯属性条目**、剥掉 URL 前缀还原成仓库相对路径；用「服务器删掉嵌套目录下的文件」断言 `D` 条目被正确识别（§6.8.4、T7） | 1、3、11 |
 | 46 | **「跑不成」不等于「不通过」**：把 `svnUrl` 指向不可达地址，断言初始化与恢复流程**不被阻断**、状态标为「基线未经体检」，且**没有**被当成通过（§6.8.6） | 1、3 |
 | 47 | **`git-svn-id` trailer 解析**：断言三字段缺一（少 uuid／rev 非数字／无 `@`）即视为**非 baseline**，不猜、不部分接受；断言 trailer 里的 UUID 与 `svn info` 不符时按 §6.2.1 阻断（§6.4.1） | 1、3 |
+| 48 | **externals 不得污染 `nodeRevs`**：fixture 里给白名单**外**的目录挂一个 `svn:externals`（指向同一 fixture 仓库的另一路径，并用 `-r` peg 固定在旧 revision），断言 `nodeRevs` 仍是单值、失同步检测**不报**；再断言去掉 `--ignore-externals` 时会误报——**两个方向都要测**，只测「加了之后对」证明不了这个参数是必需的（§6.6.4） | 1、3 |
+| 49 | **白名单落在 external 内必须被拒**：把 external 根及其子路径分别写进白名单，断言配置加载时就被拒绝、**不发生任何 git / svn 命令**，且错误信息指出命中的是哪个 external 根（§6.5 P4、§6.2.1） | 3、4 |
+| 50 | **`svn status -v --xml` 的解析**：断言取的是 `<wc-status revision>` 而非 `<commit revision>`——构造一个「所有文件 base 都是 rN、但最后修改 revision 各不相同」的 fixture，断言 `nodeRevs == {N}`；并断言解析走 XML parser（属性跨行的输入不会解析成空集）（§6.6.4） | 1、3 |
 
 ### 14.3 前端
 
@@ -2098,6 +2236,10 @@ exclude 生成与图合成都在 Rust 侧，由 cargo test 覆盖。
     也不要因为体检通过就认为 §6.3 的规则一定正确
 21. **体检需要联网**。离线时基线只能停在「未经体检」状态（§6.8.6）。这是刻意的：
     把「没能验证」当成「验证通过」等于这条检查根本不存在
+22. **白名单不能覆盖 `svn:externals` 里的内容**（§6.5 P4）。那部分属于另一个仓库，
+    §8 的交付对着当前工作副本的 URL 提交，管不到它。程序同学若真需要改 external 里的
+    代码，只能回 TortoiseSVN 对那个仓库单独提交。这是 §1.2「externals 是非目标」的
+    具体落地，不是新增限制
 
 ## 16. 分期
 
@@ -2184,6 +2326,73 @@ Phase 1 到 Phase 3 之间用户手工走 TortoiseSVN 交付时，本地补丁�
 误导性的错误上。
 
 ## 18. 修订记录
+
+### 2026-09-13（五）· 真实远端工作副本复核：externals 会打穿 `nodeRevs`
+
+用户提供了一个真实的 SVN 工作副本做验证：TortoiseSVN 官方源码树
+（`svn://svn.code.sf.net/p/tortoisesvn/code/trunk` @ r29825，16945 个文件，922 MB，
+UUID `cc8e0003-…`）。**全程只读**——没有在其中创建 `.git`，没有跑任何 `revert` /
+`commit` / `update` / `switch`。
+
+在此之前所有实测都跑在自己造的 fixture 上，而 fixture 是**按设计者的预期造出来的**，
+它天然不会包含设计者没想到的东西。这一轮的三个发现里，最重的一个正是 fixture 永远
+造不出来的。
+
+**① 关掉了两条「未验证」**
+
+| 原标注 | 实测结果 |
+|---|---|
+| `git svn` 在非 `file://` 下能不能用（§2.2） | ✅ `svn://` 完全正常，`-r HEAD` 浅克隆 11.4s。结论收窄为「**只有 `file://` 不能用**」，生产侧不构成否决理由，测试侧的成本结论不变 |
+| §6.4 选的 trailer 格式是不是真的（§6.4.1） | ✅ 真实 `git svn` 产物逐字符一致，UUID 与 `svn info` 相同，`git svn find-rev` 可用 |
+| §6.8 体检命令只在 `file://` 上验过 | ✅ 真实服务器上正向 3.1s 空输出、负向 3.3s 报 29 行差异，输出形态与 §6.8.4 记的两个坑完全吻合 |
+
+**② 发现一个阻断级缺陷：externals 污染 `nodeRevs`**（新增 §6.6.4）
+
+```text
+svn status -v --xml .                     → wc-status@revision = {29825, 1938156}  ← 2 个值
+svn status -v --xml --ignore-externals .  → wc-status@revision = {29825}           ← 1 个值
+```
+
+`1938156` 来自 `svn:externals` 指向的 `https://svn.apache.org/repos/asf/...`，**另一个
+仓库**。后果不是「显示不好看」，而是：
+
+- §6.6.2 的判据「`nodeRevs` 多值 ⇒ mixed revision」**永久误报**
+- §6.5 P2 的初始化前置**永远过不去**，而它给的引导「先跑一次完整 `svn update`」
+  **永远无效**——update 多少次，external 的 revision 都不会变成本仓库的 revision
+
+即：**带 externals 的仓库上，这个客户端连初始化都完成不了**，而提示还会把用户引向一个
+死路。§1.2 早就把 externals 写成「非目标」，但那句话被当成了「可以不管」——**「不支持」
+与「可以无视」是两件事**，物理存在的东西会主动污染判定。
+
+同仓库 external（`^/trunk/ext/zlib`）更隐蔽：revision 在同一量级，靠数值启发式发现
+不了；带 `-r` peg 时还会产生一个**稳定且看起来合理**的多值 `nodeRevs`。
+
+**③ 顺带发现两个解析陷阱**（并入 §6.6.4）
+
+- 一个 entry 里有**两个** revision：`<wc-status revision>`（节点基线，要它，实测 1 个
+  取值）与 `<commit revision>`（最后修改，实测 **2194** 个取值）。取错 = 永久误报
+- `svn status -v --xml` 把每个属性**单独放一行**（CRLF），`<wc-status` 与
+  `revision="…"` 不同行。行内正则**不报错、只返回空集**——`nodeRevs` 变成空集合，
+  「单值不变量」以一种看起来通过了的方式被绕过。这是本轮踩到的第一个坑，我自己就是
+  先写了行内 grep 才发现的
+
+另外确认：`svn diff` **不接受** `--ignore-externals`，但也**不需要**——实测它不递归进
+externals（对着含 6 个 external 的 `ext/` 体检，输出 0 行）。所以「统一加
+`--ignore-externals`」只约束 `status` / `info` / `update`。
+
+| 改动点 | 内容 |
+|---|---|
+| §1.2 | externals 那条加注「不支持 ≠ 可以无视」，指向 §6.6.4 |
+| §2.2 | 实测表补 `svn://` 成功的三行；结论收窄为「只有 `file://` 不通」，并拆成生产侧／测试侧两段；写明本设计不用 `git svn`、§14.1 照旧有效 |
+| §4.4 | `SvnClient` 新增两条硬规则：`status` / `info` / `update` 一律带 `--ignore-externals`；`--xml` 必须用真 XML parser，禁止行内正则 |
+| §6.2.1 | 白名单拒绝落在 `svn:externals` 内的路径 |
+| §6.4.1 | 补 trailer 格式的真实产物核对 |
+| §6.5 | P1 补 `--ignore-externals`；P2 写明读法与「无效引导」；**新增 P4**：白名单不得落在 externals 内，枚举方式用 `item="external"` |
+| §6.6.2 | `nodeRevs` 的定义补全：`--ignore-externals` + 取 `<wc-status revision>` |
+| §6.6.4（新增） | 三个读法陷阱的完整论证与实测 |
+| §6.8.2 | 补真实服务器上的 R1–R3 实测，含 `svn diff` 与 `--ignore-externals` 的关系 |
+| §13 / §14.2 / §15 | 新增失败路径 1 行、测试项 48–50、已知限制 22 |
+| §6.6.3 | 去掉一处重复行 |
 
 ### 2026-09-13（四）· 重新审视 `git svn`：论证被推翻，机制被借走
 
