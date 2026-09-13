@@ -13,7 +13,7 @@
 | Task | 状态 | 产出文件 | 验证结果 |
 |---|---|---|---|
 | 0 开工自检与基线数字 | ✅ 完成 | 本文件、`2026-09-14-svn-phase1b-baseline.md` | 改动前基线（新 worktree 内实测）：Rust **316 passed / 0 failed / 28 个二进制**、前端 `pnpm test` **272 passed / 21 files**、`pnpm build` ✓。与计划预期一致 |
-| 1 `git_cli` 支持环境变量 | ⬜ 未开始 | | |
+| 1 `git_cli` 支持环境变量 | ✅ 完成 | `src-tauri/src/engine/git_cli.rs`、`src-tauri/tests/git_cli.rs` | `cargo test --test git_cli` 5 passed；全量 `cargo test -j 2` **318 passed / 0 failed / 28 个二进制**（= 基线 316 + 新增 2）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓ |
 | 2 `svn_xml` 三个新解析器 | ⬜ 未开始 | | |
 | 3 P1/P2/P3 硬门槛 | ⬜ 未开始 | | |
 | 4 P5 externals 钉死检测 | ⬜ 未开始 | | |
@@ -119,3 +119,69 @@ spec §16 的 Phase 1 是一大坨（向导、基线、体检、重建、失同�
 
 Task 0 只读不写：跑测试、记数字、建两个 `docs/` 下的文件。没有任何代码改动，
 也没有发出任何 git / svn 写命令。
+
+---
+
+## Task 1：`git_cli` 支持带环境变量执行
+
+新增 `run_git_env(path, args, envs) -> Result<String>`，`GIT_INDEX_FILE` 有了合规入口。
+
+#### 偏离计划
+
+- **没有照计划那样把 `run_git_bytes` 的函数体抄一份**，而是抽出私有的
+  `output_or_error(cmd) -> Result<Vec<u8>>`，让 `run_git_bytes` 与 `run_git_env`
+  共用同一套失败映射。计划写的是复制粘贴版。
+
+  原因：两处各写一遍 `if !output.status.success()`，只要有一处日后被改漏，那条路径
+  就会把**失败当成空输出**。对本期而言这不是理论风险——基线录制里 `git add -A`
+  一旦静默失败，`write-tree` 会照常成功并录出一个**残缺但看起来合法**的 tree，
+  体检还未必拦得住（少的文件在 SVN 侧也不在 diff 里）。失败映射只留一份。
+
+  等价性：`run_git_bytes` 改写前后逐字相同（`git_command(path).args(args).output()`
+  → 同样的 cmd 交给 `output_or_error`），全量回归 318 passed 无变化。
+
+#### 计划的错误
+
+- **计划里的测试代码引用了三个不存在的 helper**：`repo_with_commit()`、
+  `fx.path_str()`、`fx.path()`。计划在旁边挂了个 ⚠️ 说「先读 `fixtures.rs` 确认真实
+  签名，不要照抄这里的名字」——这个提醒是对的，照抄会直接编译不过。实际情况是：
+
+  1. `src-tauri/tests/fixtures.rs` **本身就是一个测试文件**，不是共享模块，里面只有
+     私有的 `linear_repo() -> TempDir`，没有 `repo_with_commit`。
+  2. 更要命的是 `tests/` 下**每个 `.rs` 文件都是独立 crate**，彼此 import 不到。本仓库
+     共享 fixture 的唯一办法是 `#[path = "common/svn_fixtures.rs"] mod …`（见
+     `tests/svn_wc.rs`）。所以「从 `fixtures.rs` 里拿 helper」这条路根本不存在。
+
+  实际做法：按 `tests/tree.rs` 的既有写法，在 `tests/git_cli.rs` 内自建
+  `fixture_git()` + `repo_with_commit()`。目前只有这一个文件需要 git fixture，还不值得
+  为它建 `common/git_fixtures.rs`；等第二个文件也要时再抽。
+
+- 计划的测试里 `run_git(...)` 是裸调用，实际必须写成 `git_cli::run_git(...)`——该测试
+  文件只 `use app_lib::engine::git_cli;`，没有 glob import。
+
+#### 计划没写的坑
+
+- **fixture 自己发的 git 命令刻意不走被测的 `run_git`。** 用被测对象搭测试脚手架，
+  它坏了脚手架跟着一起坏，断言就失去意义（`run_git` 挂了的话 `repo_with_commit`
+  先 panic，根本走不到断言）。所以 `fixture_git` 是裸 `Command::new("git")`。
+
+- **rustfmt 会因为中文断言消息把单行 `assert!` 拆成三行**（CJK 字符宽度算 2，单行超
+  100）。1a 踩过一次，这次又踩。结论：改完 Rust 代码**先 `cargo fmt` 再
+  `cargo fmt --check`**，别只跑后者然后对着 diff 手工排版。
+
+- **`run_git_env` 走的是 `Command::output()`，子进程 stdin 是 null。**
+  → **Task 5 必须用 `git commit-tree -m <msg> <tree>`，不能用管道喂 message。**
+  走管道会立刻读到 EOF，`commit-tree` 照常成功，产出一个 **message 为空的基线提交**；
+  而 trailer 就写在 message 里（spec §6.4.1），等于基线丢掉 `git-svn-id:`，
+  `--grep` 再也找不回来，且**不报任何错**。这条现在记下，免得到 Task 5 现场才发现。
+
+#### 为什么这么改是安全的
+
+- 纯新增 + 一次等价重构：没有任何现有调用点的行为改变，`run_git` / `run_git_code`
+  完全没动。全量 `cargo test -j 2` = 318 passed / 0 failed / 28 个二进制，
+  相对基线 316 多的正好是本任务新增的两条测试，无回归。
+- 新入口仍然经过 `git_command()`，`GIT_TERMINAL_PROMPT=0` 与 `hidden_command`
+  两条防线都在（`AGENTS.md` §7.3 MUST：不许另起一套进程调用）。
+- 两条新测试都在 `TempDir` 里 `git init` 自建仓库，跑完即删，没有对本仓库或任何真实
+  仓库发出写命令（`AGENTS.md` 开篇最高优先级约束）。其中一条的断言本身就是
+  「真实索引前后逐字相同」，等于把「不碰用户暂存区」这条固化成了回归测试。

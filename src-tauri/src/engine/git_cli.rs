@@ -40,15 +40,46 @@ pub fn run_git_code(path: &str, args: &[&str]) -> Result<(i32, String)> {
     Ok((code, String::from_utf8_lossy(&output.stdout).to_string()))
 }
 
-/// 同 [`run_git`]，但原样返回 stdout 的字节。
+/// 跑一条已经组装好的 git 命令：成功返回 stdout 字节，失败把 stderr 包成 GitError。
 ///
-/// patch 要落成文件，不能过 `from_utf8_lossy`：非 UTF-8 的文件名或内容会被替换成
-/// U+FFFD，生成的 patch 打回去就对不上了。需要写文件的场景一律走这个。
-pub fn run_git_bytes(path: &str, args: &[&str]) -> Result<Vec<u8>> {
-    let output = git_command(path).args(args).output()?;
+/// 抽出来是为了让 [`run_git_bytes`] 和 [`run_git_env`] 共用**同一套失败映射**。
+/// 两处各写一遍 `if !status.success()`，迟早会有一处漏掉而把失败当成空输出——
+/// 对基线录制来说「`git add` 悄悄失败」会直接录出一个残缺的 tree。
+fn output_or_error(mut cmd: Command) -> Result<Vec<u8>> {
+    let output = cmd.output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         return Err(GitError::new("git_cli", stderr));
     }
     Ok(output.stdout)
+}
+
+/// 同 [`run_git`]，但原样返回 stdout 的字节。
+///
+/// patch 要落成文件，不能过 `from_utf8_lossy`：非 UTF-8 的文件名或内容会被替换成
+/// U+FFFD，生成的 patch 打回去就对不上了。需要写文件的场景一律走这个。
+pub fn run_git_bytes(path: &str, args: &[&str]) -> Result<Vec<u8>> {
+    let mut cmd = git_command(path);
+    cmd.args(args);
+    output_or_error(cmd)
+}
+
+/// 同 [`run_git`]，但额外注入一组环境变量。
+///
+/// # 为什么需要它
+///
+/// `GIT_INDEX_FILE` 是把 `git add` 引到**临时索引**上的唯一手段——`git add` 没有
+/// `--index-output`（只有 `git read-tree` 有），而基线录制的全部安全性都建立在
+/// 「不碰用户的真实暂存区」上（spec §16 R2）。
+///
+/// 走这里而不是在调用点自己 `Command::new("git")`，是因为那样会绕开
+/// [`git_command`] 里的 `GIT_TERMINAL_PROMPT=0` 与 `hidden_command`——前者防子进程
+/// 等 stdin 挂死，后者防装机版闪 console 黑框（`AGENTS.md` §7.3）。
+pub fn run_git_env(path: &str, args: &[&str], envs: &[(&str, &str)]) -> Result<String> {
+    let mut cmd = git_command(path);
+    cmd.args(args);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    Ok(String::from_utf8_lossy(&output_or_error(cmd)?).to_string())
 }
