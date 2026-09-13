@@ -35,8 +35,14 @@ pub struct SvnGitBackend {
 
 impl SvnGitBackend {
     /// 打开并校验。配置不合法时**这里就失败**，不要让半个坏配置流到下游。
+    ///
+    /// 两道校验缺一不可：`read_config` 只看字符串本身（纯函数），
+    /// `validate_whitelist_against_disk` 才能抓到「目录条目漏写尾斜杠」和
+    /// 「大小写写错」——这两种配置看着都没问题，但一个会让整棵子树绕过扩展名
+    /// 过滤进 git，另一个会让纳入集合核对在正常仓库上误报。
     pub fn open(path: &str) -> Result<Self> {
         let config = crate::engine::svn_config::read_config(path)?;
+        crate::engine::svn_config::validate_whitelist_against_disk(path, &config.whitelist)?;
         Ok(Self {
             git: GitBackend::new(path),
             config,

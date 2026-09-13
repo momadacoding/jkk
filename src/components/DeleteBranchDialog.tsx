@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { toErrorMessage } from '../engine/errors'
+import type { Capabilities } from '../engine/capabilities'
 
 /** 检出了待删分支的 worktree（主工作区除外）。 */
 export interface WorktreeTarget {
@@ -98,6 +99,11 @@ interface DeleteBranchDialogProps {
   onCancel: () => void
   /** 失败时应当抛出——弹框据此留在原地并把错误显示出来，好让用户重试。 */
   onConfirm: (targets: DeleteTargets) => Promise<void>
+  /**
+   * 后端能力。`BRANCHES` 分区在任何模式下都渲染，所以这个弹框是**唯一**一处
+   * 上层裁不到、却能触达 `delete_worktree` 的入口（2026-09-13 独立 review 抓到）。
+   */
+  capabilities: Capabilities
 }
 
 /**
@@ -109,7 +115,9 @@ interface DeleteBranchDialogProps {
  * 后者不只是方便：分支被 worktree 检出时 `git branch -D` 直接拒绝，没有这个
  * 勾选框的话这类分支在界面上根本删不掉。
  */
-export function DeleteBranchDialog({ repoPath, name, onCancel, onConfirm }: DeleteBranchDialogProps) {
+export function DeleteBranchDialog({
+  repoPath, name, onCancel, onConfirm, capabilities,
+}: DeleteBranchDialogProps) {
   const [info, setInfo] = useState<DeleteInfo | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [alsoRemote, setAlsoRemote] = useState(false)
@@ -131,11 +139,13 @@ export function DeleteBranchDialog({ repoPath, name, onCancel, onConfirm }: Dele
       .then((data) => {
         if (cancelled) return
         setInfo(data)
-        setAlsoWorktree(data.worktree !== null)
+        // 后端不支持 worktree 时**不能默认勾上**——那个勾选框根本不会渲染出来，
+        // 用户没有机会取消它，而 confirm() 会照着这个 state 发出 delete_worktree
+        setAlsoWorktree(capabilities.worktrees && data.worktree !== null)
       })
       .catch((err) => { if (!cancelled) setError(toErrorMessage(err)) })
     return () => { cancelled = true }
-  }, [repoPath, name])
+  }, [repoPath, name, capabilities.worktrees])
 
   // 远程信息还没回来就先不给删：这时候勾选框还没出现，
   // 用户根本没机会决定要不要连远程一起删
@@ -155,7 +165,11 @@ export function DeleteBranchDialog({ repoPath, name, onCancel, onConfirm }: Dele
     const remote = alsoRemote && !info.remoteProtected && info.remote && info.remoteBranch
       ? { remote: info.remote, branch: info.remoteBranch }
       : null
-    const worktreePath = alsoWorktree && info.worktree ? info.worktree.path : null
+    // 与上面 `remoteProtected` 同一个理由，再判一次能力：这一步是真正发出
+    // 破坏性动作的地方，不该依赖上游控件渲染没渲染
+    const worktreePath = capabilities.worktrees && alsoWorktree && info.worktree
+      ? info.worktree.path
+      : null
     setBusy(true)
     setError(null)
     try {
@@ -214,7 +228,16 @@ export function DeleteBranchDialog({ repoPath, name, onCancel, onConfirm }: Dele
           </>
         )}
 
-        {info?.worktree && (
+        {/* 后端不支持 worktree 时不给入口，但也不能一声不吭——那样用户点了删除
+            只会撞上 git 那句 "used by worktree at ..."，完全看不出该去做什么 */}
+        {info?.worktree && !capabilities.worktrees && (
+          <div className="dlg-note">
+            该分支正被 worktree「{info.worktree.name}」检出，git 不允许删除被检出的分支。
+            当前仓库模式下本应用不管理 worktree，请在别处移除它之后再回来删这个分支。
+          </div>
+        )}
+
+        {info?.worktree && capabilities.worktrees && (
           <>
             <label className="dlg-field dlg-check">
               <input

@@ -8,7 +8,7 @@
 mod svn_fixtures;
 
 use app_lib::engine::svn_cli::{
-    path_dirs_from_reg_output, probe_svn, run_svn, run_svn_code, SvnAvailability,
+    path_dirs_from_reg_output, probe_svn, run_svn, run_svn_code, with_global, SvnAvailability,
 };
 use svn_fixtures::svn_repo;
 
@@ -26,13 +26,33 @@ fn probe_reports_the_installed_version() {
 }
 
 #[test]
-fn run_svn_injects_non_interactive_for_every_subcommand() {
+fn with_global_actually_prepends_non_interactive() {
+    // 2026-09-13 独立 review：原来只有下面那条「各子命令都不因它失败」的测试，
+    // 名字却叫 "injects"。把 with_global 改成原样返回参数，那条**照样全绿**
+    // ——它证明的是「svn 接受这个参数」，不是「我们真的加了」。
+    //
+    // GUI 应用没有终端，svn 一旦要提示输入凭据就会永久挂在那里、占住 Tauri 的
+    // 线程池（与 git_cli 的 GIT_TERMINAL_PROMPT=0 同源）。漏掉注入不会有任何
+    // 编译期或运行期信号，只会在某个需要认证的仓库上表现为「点了没反应」。
+    assert_eq!(
+        with_global(&["status", "--xml"]),
+        vec!["--non-interactive", "status", "--xml"],
+        "全局选项必须排在子命令**之前**"
+    );
+    // 空参数表也要注入，否则 `svn` 裸跑时仍可能进交互
+    assert_eq!(with_global(&[]), vec!["--non-interactive"]);
+}
+
+#[test]
+fn every_subcommand_accepts_the_injected_global_option() {
     // --non-interactive 是**全局选项**，所有子命令都接受（2026-09-13 实测）。
     // 这条断言挡的是「把它错当成某个子命令专属参数」——那会让另一些子命令
     // 以 exit 1 失败，而失败点会远在仓库识别那一步。
     //
     // 名字说的是 every subcommand，就真的逐个跑一遍：只测 info 一个的话，
     // 名字比覆盖范围大，属 rubric #9 那类虚假信心。
+    //
+    // 「真的注入了」由上面那条负责——本条只管「注入之后不会把别的子命令搞挂」。
     let fx = svn_repo();
     let wc = fx.wc_str();
     for args in [

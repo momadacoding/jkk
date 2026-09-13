@@ -29,7 +29,7 @@
 | 6 纳入集合核对 | ✅ 完成 | `engine/svn_include_check.rs`、`engine/mod.rs`、`tests/svn_exclude.rs`（追加） | fmt ✓ clippy 零告警 ✓ `--test svn_exclude` **17 passed**（9 + 8；计划写的是 3，多的 5 条见下）✓ `cargo test` **284 passed / 0 failed / 27 个二进制**（= 276 + 8） |
 | 7 仓库识别 / capabilities / backend_for 分流 | ✅ 完成 | `vcs/mod.rs`、`vcs/git.rs`、`vcs/svn.rs`、`commands/repo.rs`、`lib.rs`、`tests/svn_backend.rs` | fmt ✓ clippy 零告警 ✓ `--test svn_backend` **11 passed**（计划写的是 9）✓ `cargo test` **295 passed / 0 failed / 28 个二进制**（= 284 + 11）。⚠️ 两个新 Tauri 命令的真实窗口验证在 Task 9 |
 | 8 前端按能力隐藏入口 | ✅ 完成 | `src/engine/capabilities.ts`、`src/engine/toolbarActions.ts`、`src/engine/commitActions.ts`、`src/store/repoStore.ts`、`RepoTab.tsx`、`BranchView.tsx`、`GraphView.tsx`、`Toolbar.tsx`、`tests/vitest/capabilities.test.ts`、`tests/vitest/commitActions.test.ts` | `pnpm build`（含 tsc）✓ `pnpm test` **266 passed / 20 files**（= 257 + 9；计划写的是 3）。⚠️ 真实窗口验证在 Task 9 |
-| 9 收尾验证 | 🟡 进行中 | 本文件、`tests/svn_backend.rs`（+3） | 9.1 ✓ 9.2 ✓ 9.3 ✓ 全套：Rust **298 passed / 0 failed / 28 个二进制**、fmt ✓ clippy 零告警；前端 `pnpm build` ✓ `pnpm test` **266 passed / 20 files**。9.4 真实窗口验证与 9.6 独立 review 见下 |
+| 9 收尾验证 | 🟡 进行中 | 本文件、`svn_xml.rs`、`svn_config.rs`、`svn_exclude.rs`、`svn_include_check.rs`、`svn_cli.rs`、`vcs/svn.rs`、`DeleteBranchDialog.tsx`、`BranchView.tsx` + 各自测试 | 9.1 ✓ 9.2 ✓ 9.3 ✓ **9.6 独立 review 已完成：2 条阻断 + 7 条应修，逐条核实全部成立，已全部修完**。全套：Rust **312 passed / 0 failed / 28 个二进制**、fmt ✓ clippy 零告警；前端 `pnpm build` ✓ `pnpm test` **266 passed / 20 files**。⬜ **9.4 真实窗口验证待用户执行**（fixture 已备好，见 9.4 一节） |
 
 ### 开工自检（`AGENTS.md` §4.2）
 
@@ -73,7 +73,12 @@ reviewer 的原话是「写进文档**并在类型上区分**……**别只靠�
 **第二次修法：让 `parse_node_revs` 自己检出违约。** 先实测了判据是否存在
 （2026-09-13 临时 fixture，`Code/` 底下一条跨仓库 external `Vendor`）：
 
-| entry path | 带 `--ignore-externals` | 不带 |
+> ⚠️ **下表两列都是带 `-v` 跑出来的**，只有 `--ignore-externals` 在变。9.6 独立
+> review 指出原表漏标了这一点——照表复现时不带 `-v` 会得到相反的结论，因为不带
+> `-v` 的 status 只报告有改动的节点，干净工作副本上两列都是空的。守卫当时也确实
+> 漏了这一半，见 9.6 的 B2。
+
+| entry path | `-v` + `--ignore-externals` | `-v`，不带 `--ignore-externals` |
 |---|---|---|
 | `Code` | normal | normal |
 | `Code\A.cs` | normal | normal |
@@ -159,6 +164,10 @@ reviewer 另外排除了两条疑虑，一并记下免得以后重新怀疑：`c
 
 ### Task 0：开工自检与基线
 
+#### 偏离计划
+
+无。自检与基线按计划执行，唯一的调整是 Step 0.5 的基线读取方式（见下方「计划的错误」）。
+
 #### 计划的错误
 
 - **Step 0.5 写的 `cargo test 2>&1 | tail -40` 量不出基线。** 本仓库有 22 个测试
@@ -211,6 +220,25 @@ reviewer 另外排除了两条疑虑，一并记下免得以后重新怀疑：`c
 #### 计划没写的坑
 
 - 无（本 Task 的实现与计划给的代码一致）。
+
+#### 计划的错误
+
+计划给的 `svn_cli.rs` 代码本身没错。但它给的**测试**有一条名不副实，
+2026-09-13 独立 review 抓到：`run_svn_injects_non_interactive_for_every_subcommand`
+只断言各子命令的 stderr 不含 `doesn't accept option`——**把 `with_global` 改成
+原样返回参数，它照样全绿**。它证明的是「svn 接受这个参数」，不是「我们真的加了」。
+
+漏掉注入没有任何编译期或运行期信号：GUI 应用没有终端，svn 一旦要提示输入凭据
+就会永久挂住并占掉 Tauri 的线程池，表现只是「点了没反应」（与 `git_cli` 的
+`GIT_TERMINAL_PROMPT=0` 同源）。
+
+修法：`with_global` 改成 `pub`，新增 `with_global_actually_prepends_non_interactive`
+直接断言参数表形状（含空参数表那一路）；原测试改名为
+`every_subcommand_accepts_the_injected_global_option`，名字回到它真正覆盖的范围。
+
+**把私有函数公开出来是否值得，这里与 review #3 的 newtype 结论不冲突**：那次拒绝
+是因为公开构造函数会让防护退化成命名约定；`with_global` 是纯函数，没有需要靠
+私有性保护的不变量，公开不损失任何东西。
 
 #### 已知覆盖盲区（**必须如实记，不得当成测过**）
 
@@ -323,6 +351,11 @@ reviewer 另外排除了两条疑虑，一并记下免得以后重新怀疑：`c
   改写」）。
 
 ### Task 4：嵌套工作副本枚举与 P4
+
+#### 计划的错误
+
+无。计划给的 `svn_wc.rs` 与 P4 的逻辑与实测行为一致，只有 fixture 路径需要调整
+（见下方「偏离计划」第一条）。
 
 #### 偏离计划
 
@@ -452,7 +485,7 @@ git 的裁决规则是「**最后一条**匹配的模式说了算」，所以规
 
 - **`actual_set` 改成纯读，不建临时索引。** spec §6.3.1 的原文是「在**临时索引**上
   `git add -A -- <白名单>` 之后读 `ls-files`」，意图是「git 会跟踪谁」而不要弄脏
-  用户的暂存区。实现走 `--cached` ∪ `--others --exclude-standard`：
+  用户的暂存区。实现走 `--cached` ∪ `--others --exclude-standard` **− `--deleted`**：
 
   | | 临时索引方案 | 纯读方案 |
   |---|---|---|
@@ -460,9 +493,12 @@ git 的裁决规则是「**最后一条**匹配的模式说了算」，所以规
   | 往 `.git/objects` 写松散对象 | 会（`git add` 要算 blob） | 不写 |
   | 结果 | —— | **实测相同** |
 
-  两者等价这件事没有当成推断——`the_actual_set_equals_what_git_add_would_have_produced`
-  在真实仓库上把两条路径的结果直接对了一遍，且断言「两边都不为空」，
-  免得退化成「空集 == 空集」的假绿。
+  ⚠️ **这条「实测相同」我一开始写早了，第三项 `− --deleted` 是 9.6 独立 review
+  补上的。** 原来只有前两项，而「等价」被当成实测事实写进了文档、测试名和这张表
+  ——但当时那条等价性测试跑在**空索引**上，`--cached` 恒为空，真正会分叉的那一半
+  根本没执行到。反例见 9.6 的 B1。现在有两条测试，其中
+  `the_actual_set_equals_git_add_even_when_the_index_is_already_populated`
+  专门跑在索引非空、且存在「删除未 stage」差异的时刻。
 
 - **`expected_set` 会读 `core.ignoreCase`**（计划里没有这个概念）。理由见下方
   「计划没写的坑」。
@@ -688,8 +724,18 @@ X 的真实形态。修法是让它先真的 `git add -A` 把 `.svn/wc.db` 送�
   `fetch` / `pull` / `push` 与整个 `commands/worktree.rs` 仍然直连 git CLI。
   隐藏入口只是不让人点到它们，不是它们变安全了。谁要是绕过 UI 直接 invoke，
   照样打得进去。
-- 已 grep 全部 `src/components` 与 `src/store`，确认这批命令的**唯一**入口都在
-  已裁剪的组件里，没有漏网的按钮。
+- 已 grep 全部 `src/components` 与 `src/store`，确认这批命令的入口都在已裁剪的
+  组件里。
+
+  ⚠️ **这句话我第一次写成了「唯一入口……没有漏网的按钮」，那是不准确的。**
+  9.6 独立 review 找到一个漏网的：`DeleteBranchDialog` 的「Also delete worktree」
+  勾选框只看 `info.worktree`、不看 `capabilities.worktrees`，而 `BRANCHES` 分区在
+  任何模式下都渲染，所以在 SVN 模式下它是可达的（分支被一个应用外建的 linked
+  worktree 检出时就会出现）。已修，见 9.6 的 A5。
+
+  教训：「我 grep 过了」证明的是**我搜的那些关键字**没有漏网，不是没有入口。
+  这次漏掉的原因是我按命令名 grep `src/components`，而这个入口是**弹框内部**的一个
+  勾选框，它的 `invoke` 在 `RepoTab` 的回调里——命令名和渲染条件隔着两个文件。
 
 ---
 
@@ -699,7 +745,7 @@ X 的真实形态。修法是让它先真的 `git add -A` 把 `.svn/wc.db` 送�
 
 | | 基线（master） | 本分支 | 增量 |
 |---|---|---|---|
-| Rust 测试 | 226 passed / 22 个二进制 | **298 passed / 0 failed / 28 个二进制** | +72 / +6 |
+| Rust 测试 | 226 passed / 22 个二进制 | **312 passed / 0 failed / 28 个二进制** | +86 / +6 |
 | `cargo fmt --check` | — | ✓ 干净 | |
 | `cargo clippy --all-targets` | — | ✓ 零告警 | |
 | 前端 vitest | 257 passed / 19 files | **266 passed / 20 files** | +9 / +1 |
@@ -709,15 +755,19 @@ Rust 增量按测试文件拆开对账：
 
 | 文件 | 计划预估 | 实际 |
 |---|---|---|
-| `svn_cli.rs` | 4 | 8 |
-| `svn_xml.rs` | 6 | 11 |
-| `svn_config.rs` | 8 | 16 |
+| `svn_cli.rs` | 4 | 9 |
+| `svn_xml.rs` | 6 | 13 |
+| `svn_config.rs` | 8 | 21 |
 | `svn_wc.rs` | 4 | 6 |
-| `svn_exclude.rs`（Task 5 + 6） | 7 + 3 | 9 + 8 = 17 |
+| `svn_exclude.rs`（Task 5 + 6） | 7 + 3 | 23 |
 | `svn_backend.rs` | 9 | 14 |
-| **合计** | **41** | **72** |
+| **合计** | **41** | **86** |
 
 计划自己写了「以实测为准，不要照抄这个数字——对不上就说明有 Task 的测试没写全或写多了，两种都要查」。这里是**每个文件都多**，逐条原因已记在各 Task 的「偏离计划」里，没有一处是少的。
+
+⚠️ **上表是 9.6 独立 review 修完之后重跑的数字。** review 前是 298，9 条发现修完
+涨到 312（+14）。计划把 9.1 排在 9.6 之前，等于默认 review 不会带来代码改动——
+实际它带来了两条阻断修复和六处行为改动，见下方 9.6 一节。
 
 #### 9.2 命令注册对账
 
@@ -743,12 +793,74 @@ grep -c "commands::" src-tauri/src/lib.rs                     → 46
 
 **只有这两条，都是只读。** fixture 构造里有 `svn add` / `commit` / `propset`，那在 `tests/common/` 下，不在 `src/`。
 
+#### 9.4 真实窗口验证（**待执行**）
+
+`AGENTS.md` §5.1：改了 Tauri 命令签名就必须实际跑 `pnpm tauri dev` 确认 invoke
+真的通。本期新增两个命令。**这一步尚未执行**，fixture 已用脚本备好（scratchpad 下
+`make-phase1a-fixtures.ps1`，四个目录覆盖六个场景）：
+
+| # | 目录 | 期望 |
+|---|---|---|
+| 1/2 | `git-plain` | 与改动前完全一致：worktree / tag / PR / remote 入口**都在**；暂存、提交、切分支、stash 全部照常 |
+| 3 | `wc-uninit`（有 `.svn` 无 `.git`） | 报 `svn_not_initialized`，**不崩** |
+| 4 | `wc-suspicious`（`.svn` + 无配置的 `.git`） | 报 `svn_unconfigured_git` |
+| 5/6 | `wc-hybrid`（完整混合仓库） | 能打开；tag / worktree / remote / PR 入口消失；分支与 stash 还在；暂存 → 提交 → 切分支 → stash 全部照常 |
+
+全部在临时 fixture 上做，**禁止拿任何真实 SVN 仓库试**（`AGENTS.md` 开篇的最高
+优先级约束）。
+
+#### 9.6 独立 review（`AGENTS.md` §4.1 的合并前门槛）
+
+由**独立于实现者**的 agent 按 §13 rubric 跑了一遍全量 diff，**2 条阻断 + 7 条应修，
+逐条核实全部成立，无一需要反驳**。两条阻断都先写成失败测试复现、再改实现。
+
+| # | 级别 | 问题 | 修法 |
+|---|---|---|---|
+| B1 | 阻断 | **「`--cached ∪ --others` 与 `git add -A` 等价」这个结论是错的，而它被当成实测事实写进了文档、测试名和本文件。** 反例：已跟踪文件被从工作树删掉、删除还没 stage 时，`--cached` 仍列它而 `git add -A` 之后不列，`expected_set` 走磁盘也不含它 → 核对报「不该被跟踪、实际跟踪了 X」并硬阻断，而用户只是删了个文件还没提交 | `actual_set` 减去 `git ls-files --deleted`。补两条测试，其中一条断言的是**索引非空**时刻的等价性——原来那条跑在空索引上，`--cached` 恒为空，真正会分叉的那一半根本没执行到 |
+| B2 | 阻断 | **`parse_node_revs` 的守卫只挡住了 `--ignore-externals` 那一半，漏了 `-v` 时完全不响。** 干净工作副本上不带 `-v` 的 status 只输出 external 标记，守卫沉默、返回 `Ok(空集)`——正是本模块开头写明的那个失败形态：「单值不变量」以看起来通过的方式被绕过 | 空集直接报 `svn_xml_empty_node_revs`。补一条对照测试证明判据不误伤最窄的合法输入（target 就是 external 根本身） |
+| A1 | 应修 | **白名单不挡 glob 元字符**（`extensions` 那侧早就挡了）。实测 `whitelist:["*"]` + `extensions:[".cs"]` 会把 `Art/boss.fbx`、`Code/Junk.psd` 一起收进 git——扩展名过滤被整个绕开、白名单退化成「全部」 | `normalize_whitelist_entry` 拒掉 `* ? [ ]`，测试表里加 5 个形态 |
+| A2 | 应修 | **目录条目漏写尾斜杠 → 静默变成「整棵树不过扩展名过滤」。** 尾斜杠是「目录 vs 单文件」的唯一区分，而单文件条目不过扩展名过滤，于是 `"Assets/Scripts"`（少一个 `/`）会把整棵子树收进 git。没有任何一层校验它和磁盘上的实际类型对不对得上 | 新增 `validate_whitelist_against_disk`，`SvnGitBackend::open` 里调用 |
+| A3 | 应修 | **Windows 大小写只处理了一半。** git 的忽略规则匹配大小写不敏感、**但 pathspec 匹配是敏感的**。`"code/"` 这种写法下 git 照常跟踪 `Code/Top.cs`，而 `git ls-files -- code/` 返回空 → 在一个工作完全正常的仓库上报「应当被跟踪、实际没有」 | 同上那道校验里逐段比对磁盘上的真实大小写。**不能用 `Path::exists()` 判**——NTFS 不区分大小写，只能列目录逐项比 |
+| A4 | 应修 | `p.is_dir()` 跟随 junction，junction 成环时递归没有出口 → 栈溢出 → Rust abort → **整个 Tauri 应用凭空消失** | 见下方「计划没写的坑」——reviewer 给的方向对一半，我实测后走了另一条路 |
+| A5 | 应修 | **前端能力裁剪漏了一个入口。** `DeleteBranchDialog` 的「Also delete worktree」勾选框只看 `info.worktree`、不看 `capabilities.worktrees`，确认后走 `invoke('delete_worktree')`。而 `BRANCHES` 分区在任何模式下都渲染，所以这个入口在 SVN 模式下是可达的。**Task 8 里我写的「已 grep 全部 src/，这批命令的唯一入口都在已裁剪的组件里」因此不准确** | 把 `capabilities` 传进弹框：不支持时不渲染勾选框、`useEffect` 里不默认勾上、`confirm()` 里再判一次（与已有的 `remoteProtected` 同一个模式），并给一条说明告诉用户该去哪儿处理 |
+| A6 | 应修 | `write_exclude` 用 `File::create` **先截断再写**，且无条件覆盖用户已有的 `.git/info/exclude`。写到一半失败留下的最坏形态是**缺了末尾那行 `.svn/`** ——之后一次 `git add -A` + `git checkout` 就会在正在使用的工作副本底下换掉 `wc.db` | 临时文件 + `sync_all` + `rename` 原子替换；首次接管时把含真实规则的原件备份成 `exclude.bak` |
+| A7 | 应修 | 记录瑕疵：四类条目有缺项（Task 0 缺「偏离计划」，Task 1/4/9 缺「计划的错误」）；Task 9「偏离计划」写「从 11 到 13」而实际是 14；`run_svn_injects_...` 名不副实 | 本次一并补齐，测试的修法记在 Task 1 的「计划的错误」里 |
+
+**A4 我没有照 reviewer 给的修法做，因为实测推翻了它的前提。** reviewer 说「git 把
+符号链接记成一个 blob、不往里递归，所以按一个文件处理即与 git 对齐」。我先照这个
+改了，结果 `a_directory_junction_inside_the_whitelist_does_not_cause_a_phantom_mismatch`
+立刻失败——**git 实际上会走进 junction**：
+
+| 实测项（2026-09-13，真实 git fixture） | 结果 |
+|---|---|
+| `Code/Mirror` 是指向仓库外目录的 junction，`git ls-files --others -- Code/` | 列出 `Code/Mirror/Linked.cs`，**走进去了** |
+| `symlink_metadata("Code/Mirror")` | `is_dir=false, is_symlink=true`（junction 也算 reparse point） |
+| 本机 `core.symlinks` | `false`；`symlink_dir()` 直接失败（没开开发者模式） |
+| `Code/Loop` → `Code` 成环时 git 的行为 | 一路递归到 **64 层**才放弃，吐出 64 条 `Code/Loop/…/Top.cs` 并打印 `could not open directory: Function not implemented`。**不挂、不崩** |
+| `canonicalize("Code/Loop")` | 与 `canonicalize("Code")` 相同——能识破环 |
+
+所以「符号链接记成 blob」那条对 `core.symlinks=true` 下的真符号链接成立，对 Windows
+的 junction 不成立。按那个方向改**反而制造了新的误报**（期望集合少一批文件）。
+
+最终修法：**跟随 junction（与 git 对齐），用祖先链的规范路径做环保护**。只查祖先链
+不做全局已访问集合——两条 junction 指向同一个目标是合法的，git 会把两边都列出来，
+全局去重会与它分叉。环存在时本函数与 git 仍会给出不同集合，那种工作树本来就是坏的，
+**报一次集合不一致是正确行为**；这里要保证的只是不崩。环保护做过反向验证（关掉它，
+loop 测试立刻失败）。
+
 #### 偏离计划
 
-- **多加了两条命令层测试**（`svn_backend.rs` 从 11 到 13）：
+- **多加了两条命令层测试**（`svn_backend.rs` 从 11 到 13，后又加 serde 那条到 14）：
   `the_read_capabilities_command_returns_what_the_backend_says` 与
   `the_probe_svn_environment_command_reports_one_of_three_states`。理由见下方
   「计划没写的坑」的第一条。
+
+#### 计划的错误
+
+计划的 Step 9.6 只写了「跑一次独立 review」，没写**跑完之后 9.1 的数字会变**——
+这次修完 9 条发现，Rust 测试从 298 涨到 312，9.1 那张表里的每个数字都要重算一遍。
+计划把 9.1 排在 9.6 之前，等于默认 review 不会带来代码改动。下次把「修完 review
+之后重跑并更新 9.1」写成一个独立步骤。
 
 #### 计划没写的坑
 

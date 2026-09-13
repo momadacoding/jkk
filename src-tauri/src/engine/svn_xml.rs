@@ -71,7 +71,7 @@ pub fn parse_info(xml: &str) -> Result<Vec<SvnInfoEntry>> {
 
 /// 从 `svn status -v --xml` 里取每个已版本控制节点的 revision 集合。
 ///
-/// # ⚠️ 输入必须来自带 `--ignore-externals` 的 status
+/// # ⚠️ 输入必须来自带 `-v` **和** `--ignore-externals` 的 status
 ///
 /// 本函数**不区分**节点属于哪个工作副本——它看到什么就收什么。调用方必须保证
 /// 输入是 `svn status -v --xml --ignore-externals -- <target>` 的产物。
@@ -114,6 +114,27 @@ pub fn parse_node_revs(xml: &str) -> Result<BTreeSet<i64>> {
             .parse::<i64>()
             .map_err(|_| GitError::new("svn_xml", format!("wc-status revision 不是整数: {raw}")))?;
         revs.insert(rev);
+    }
+    // 空集必须报错，不能 Ok 返回。
+    //
+    // 2026-09-13 独立 review 的阻断项：上面那道守卫只挡住了 `--ignore-externals`
+    // 那一半，**漏了 `-v` 时它完全不响**——干净工作副本上不带 `-v` 的 status 只
+    // 输出 external 标记与「有改动的」节点，一个带 revision 的 entry 都没有，
+    // 于是守卫沉默、这里返回空集。而空集正是本模块开头写明的那个失败形态：
+    // 「nodeRevs 单值」这条不变量以一种**看起来通过了**的方式被绕过。
+    //
+    // 判据不会误伤：合法输入里最窄的一种是「target 就是 external 根本身」，
+    // 它在自己的工作副本里是个正常节点，带 `-v` 跑出来仍有带 revision 的 entry
+    // （`node_revs_accepts_an_external_root_as_the_target` 拿真实 svn 钉住了这点）。
+    if revs.is_empty() {
+        return Err(GitError::new(
+            "svn_xml_empty_node_revs",
+            "这份 svn status 输出里一个带 revision 的节点都没有。\
+             最常见的原因是漏了 `-v`——不带它时 status 只报告有改动的节点，\
+             干净的工作副本会得到空输出。空集会让「nodeRevs 单值」这条不变量\
+             以看起来通过的方式被绕过，所以这里报错而不是返回空集。\
+             取数请走 engine::svn_wc，不要在调用点自己拼 svn 命令。",
+        ));
     }
     Ok(revs)
 }

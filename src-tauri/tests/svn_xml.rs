@@ -154,6 +154,61 @@ fn the_guard_holds_against_real_svn_output_in_both_directions() {
 }
 
 #[test]
+fn node_revs_refuses_a_status_that_was_run_without_dash_v() {
+    // 2026-09-13 独立 review 的阻断项 B2。
+    //
+    // 输入契约写的是 `svn status -v --xml --ignore-externals`，但守卫只挡住了
+    // `--ignore-externals` 那一半。**漏了 `-v` 时它完全不响**：干净工作副本上
+    // 不带 `-v` 的 status 只输出 external 标记，没有任何带 revision 的 entry，
+    // 于是守卫沉默、`parse_node_revs` 返回 `Ok(空集)`。
+    //
+    // 空集正是本模块开头写明的那个失败形态：「单值不变量」以一种看起来通过了的
+    // 方式被绕过。返回 Err 才是对的。
+    let fx = svn_repo_with_cross_repo_nested_external();
+    let wc = fx.wc_str();
+
+    let no_v = run_svn(
+        &wc,
+        &["status", "--xml", "--ignore-externals", "--", "Code"],
+    )
+    .unwrap();
+    let err = parse_node_revs(&no_v).expect_err("漏了 -v 的输出必须被拒，不能返回空集");
+    assert_eq!(err.code, "svn_xml_empty_node_revs");
+
+    // 对照组：加上 -v 之后同一条命令必须通过，且是单值。
+    // 没有这一半，上面那条也可能是被别的原因拒的。
+    let with_v = run_svn(
+        &wc,
+        &["status", "-v", "--xml", "--ignore-externals", "--", "Code"],
+    )
+    .unwrap();
+    let revs = parse_node_revs(&with_v).expect("带 -v 的输出必须被接受");
+    assert_eq!(revs.len(), 1, "实际 {revs:?}");
+}
+
+#[test]
+fn node_revs_accepts_an_external_root_as_the_target() {
+    // 上一条新加的「空集即报错」判据不能误伤合法输入。最窄的那种合法输入是
+    // 「target 就是 external 根本身」——它在自己的工作副本里是个正常节点，
+    // 带 `-v` 跑出来仍然有带 revision 的 entry。
+    let fx = svn_repo_with_cross_repo_nested_external();
+    let out = run_svn(
+        &fx.wc_str(),
+        &[
+            "status",
+            "-v",
+            "--xml",
+            "--ignore-externals",
+            "--",
+            "Code/Vendor",
+        ],
+    )
+    .unwrap();
+    let revs = parse_node_revs(&out).expect("external 根自己当 target 时必须通过");
+    assert!(!revs.is_empty(), "实际 {revs:?}");
+}
+
+#[test]
 fn parse_node_revs_on_garbage_errors_instead_of_returning_empty() {
     // 空集合会让「单值不变量」以看起来通过的方式被绕过。解析不了必须报错。
     let err = parse_node_revs("this is not xml").expect_err("非 XML 必须报错");

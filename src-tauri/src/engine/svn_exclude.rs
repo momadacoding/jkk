@@ -4,8 +4,13 @@
 //! 而写错的表现是**用户以为文件受 git 保护、实际上没有**——切分支丢改动、
 //! stash 存不进去、交付清单里不出现（spec §6.3）。
 
-use crate::error::Result;
+use crate::error::{GitError, Result};
 use std::io::Write;
+
+/// 生成文件的第一行。也是「这个 exclude 是不是我们写的」的唯一判据
+/// ——[`write_exclude`] 靠它决定要不要先备份用户原有的内容。
+pub const GENERATED_HEADER: &str =
+    "# 由 mygitclient 自动生成，请勿手工编辑——改动会在下次打开仓库时被覆盖。";
 
 /// 生成规则文本。
 ///
@@ -56,10 +61,7 @@ pub fn generate_exclude(whitelist: &[String], extensions: &[String]) -> String {
         entries.push((clean.split('/').map(str::to_string).collect(), is_dir));
     }
 
-    let mut lines: Vec<String> = vec![
-        "# 由 mygitclient 自动生成，请勿手工编辑——改动会在下次打开仓库时被覆盖。".to_string(),
-        "/*".to_string(),
-    ];
+    let mut lines: Vec<String> = vec![GENERATED_HEADER.to_string(), "/*".to_string()];
 
     // ① 逐层打开父目录。每一层都要「先反选目录本身、再排除其内容」，
     // 否则下一层的反选规则够不着——git 的硬规则是**父目录被排除后，
@@ -125,11 +127,58 @@ pub fn generate_exclude(whitelist: &[String], extensions: &[String]) -> String {
     s
 }
 
-/// 把规则写进 `<仓库根>/.git/info/exclude`，整文件覆盖。
+/// 把规则写进 `<仓库根>/.git/info/exclude`。
+///
+/// # 为什么不是直接 `File::create` + `write_all`
+///
+/// `File::create` **先截断再写**。写到一半失败（磁盘满、进程被杀、断电）留下的
+/// 是一个不完整的 exclude——最坏的形态是**缺了末尾那行 `.svn/`**：之后一次
+/// `git add -A` 会把 SVN 的 `wc.db` 收进 git，再一次 `git checkout` 就会在一个
+/// **正在使用的**工作副本底下把它换成另一个版本。写临时文件再 `rename` 把这一步
+/// 变成原子的：要么还是旧内容，要么已经是完整的新内容，没有中间态。
+///
+/// # 用户原有的 exclude 不会被静默吃掉
+///
+/// 首次写入时如果那里已经有一个**不是本工具生成的、且含真实规则的**文件，
+/// 先把它备份成 `exclude.bak`。`.git/info/exclude` 是 git 给用户自己用的地方，
+/// 无条件整文件覆盖等于删掉用户手写的规则且不留痕迹。
+///
+/// 「含真实规则」= 至少有一行既不是空行也不是 `#` 注释。`git init` 会在那里写
+/// 一份**纯注释**的模板（`# git ls-files --others --exclude-from=...`），按「非空」
+/// 判定的话每个新仓库都会多出一个什么也没保存的 `exclude.bak`。
+///
+/// 备份已存在则不再覆盖——那说明我们早就接管过一次，`exclude.bak` 里才是用户
+/// 真正的原件。
 pub fn write_exclude(repo_root: &str, content: &str) -> Result<()> {
     let info = std::path::Path::new(repo_root).join(".git").join("info");
     std::fs::create_dir_all(&info)?;
-    let mut f = std::fs::File::create(info.join("exclude"))?;
-    f.write_all(content.as_bytes())?;
+    let target = info.join("exclude");
+
+    if let Ok(existing) = std::fs::read_to_string(&target) {
+        let ours = existing.lines().next() == Some(GENERATED_HEADER);
+        let has_rules = existing
+            .lines()
+            .any(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'));
+        let backup = info.join("exclude.bak");
+        if !ours && has_rules && !backup.exists() {
+            std::fs::write(&backup, &existing)?;
+        }
+    }
+
+    // 临时文件要和目标**同目录**：跨卷时 rename 会失败（Windows 上
+    // ERROR_NOT_SAME_DEVICE），而 `%TEMP%` 完全可能在另一个盘上。
+    let tmp = info.join("exclude.mygitclient.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        // 显式 sync：rename 是原子的，但「新内容已经落盘」不是它保证的。
+        // 少了这一步，断电后可能 rename 生效了而内容还是空的。
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &target).map_err(|e| {
+        // rename 失败时把临时文件清掉，别在 .git/info 里留垃圾
+        let _ = std::fs::remove_file(&tmp);
+        GitError::new("io", format!("替换 .git/info/exclude 失败: {e}"))
+    })?;
     Ok(())
 }

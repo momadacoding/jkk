@@ -5,7 +5,7 @@
 //! 而这个模块存在的全部理由就是后者（spec §6.3）。
 
 use app_lib::engine::svn_exclude::{generate_exclude, write_exclude};
-use app_lib::engine::svn_include_check::{actual_set, verify_include_set};
+use app_lib::engine::svn_include_check::{actual_set, expected_set, verify_include_set};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -261,6 +261,56 @@ fn the_actual_set_equals_what_git_add_would_have_produced() {
 }
 
 #[test]
+fn a_deleted_but_unstaged_file_does_not_look_like_an_unexpected_file() {
+    // 2026-09-13 独立 review 的阻断项 B1。
+    //
+    // 上一条测试声称「纯读取数与 git add -A 等价」，但它在**空索引**上跑
+    // ——`--cached` 那一路恒为空，真正会分叉的那一半根本没执行到。
+    //
+    // 真正的分叉在这里：一个已跟踪文件被从工作树删掉、删除还没 stage 时
+    //   `--cached`     仍然列它（它还在索引里）
+    //   `git add -A`   会把删除入索引，之后 ls-files 不列它
+    //   `expected_set` 走磁盘，也不含它
+    // 于是核对会报「不该被跟踪、实际跟踪了 Code/Top.cs」并硬阻断——而用户
+    // 只是删了个文件还没提交，仓库状态完全正常。
+    let dir = workdir();
+    let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
+    write_rules(dir.path(), &w, &e);
+    run_git(dir.path(), &["add", "-A"]);
+    fs::remove_file(dir.path().join("Code/Top.cs")).unwrap();
+
+    verify_include_set(dir.path().to_str().unwrap(), &w, &e)
+        .expect("删了文件还没 stage 不该被判成「不该被跟踪」");
+}
+
+#[test]
+fn the_actual_set_equals_git_add_even_when_the_index_is_already_populated() {
+    // B1 的另一半：把等价性断言放到**索引非空**的时刻再跑一遍，
+    // 并制造一个删除未 stage 的差异。原来那条只覆盖了空索引。
+    let dir = workdir();
+    let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
+    write_rules(dir.path(), &w, &e);
+    run_git(dir.path(), &["add", "-A"]);
+    fs::remove_file(dir.path().join("Code/Sub/Mid.cs")).unwrap();
+    // 再放一个新文件进来，让 --others 那一路也有内容
+    fs::write(dir.path().join("Code/Fresh.cs"), "x").unwrap();
+
+    let read_only = actual_set(dir.path().to_str().unwrap(), &w).unwrap();
+    run_git(dir.path(), &["add", "-A"]);
+    let after_add: BTreeSet<String> = tracked(dir.path()).into_iter().collect();
+
+    assert_eq!(read_only, after_add, "索引非空时两条路径仍必须一致");
+    assert!(
+        !read_only.contains("Code/Sub/Mid.cs"),
+        "已删除的文件不该留在集合里：{read_only:?}"
+    );
+    assert!(
+        read_only.contains("Code/Fresh.cs"),
+        "新增未入索引的文件必须在集合里：{read_only:?}"
+    );
+}
+
+#[test]
 fn a_gitignore_in_the_working_tree_is_caught() {
     // spec §6.3.1：工作树里的 .gitignore 优先级**高于** .git/info/exclude。
     // 实测：Code/.gitignore 里一行 *.cs 会让 git ls-files 变成空。
@@ -349,6 +399,149 @@ fn non_ascii_filenames_do_not_produce_a_phantom_mismatch() {
     let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
     write_rules(dir.path(), &w, &e);
     verify_include_set(dir.path().to_str().unwrap(), &w, &e).unwrap();
+}
+
+/// 建一个 Windows 目录 junction。成功返回 true。
+///
+/// 用 junction 而不是 `std::os::windows::fs::symlink_dir`：后者要管理员权限或
+/// 开发者模式，前者不需要。
+///
+/// ⚠️ 路径里的正斜杠必须先换成反斜杠。`mklink` 是 cmd 的内建命令，cmd 按
+/// `/X` 切选项——`C:\…\Code/Mirror` 里的 `/Mirror` 会被当成一个未知选项，
+/// 命令失败且错误信息完全指不到这上面（实测踩过一次）。
+#[cfg(windows)]
+fn make_junction(link: &Path, target: &Path) -> bool {
+    let win = |p: &Path| p.to_string_lossy().replace('/', "\\");
+    Command::new("cmd")
+        .args(["/c", "mklink", "/J", &win(link), &win(target)])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+#[test]
+fn a_directory_junction_inside_the_whitelist_does_not_cause_a_phantom_mismatch() {
+    // 2026-09-13 独立 review 的 A4。
+    //
+    // 2026-09-13 实测：`git ls-files --others --exclude-standard -- Code/` 会列出
+    // `Code/Mirror/Linked.cs` ——**git 把 junction 当普通目录走进去了**。
+    // 所以 `expected_set` 也必须走进去；把它当成「一个文件」会让期望集合少一批
+    // 文件，在一个完全正常的仓库上误报阻断。
+    //
+    // （这与「git 把符号链接记成 blob、不递归」那条常识不矛盾：那条对
+    // `core.symlinks=true` 下的真符号链接成立，而 Windows 上该项默认 false。）
+    let dir = workdir();
+    let outside = TempDir::new().unwrap();
+    fs::write(outside.path().join("Linked.cs"), "x").unwrap();
+    let link = dir.path().join("Code").join("Mirror");
+    if !make_junction(&link, outside.path()) {
+        panic!("建 junction 失败——本条测试的前提没成立，不能当成通过");
+    }
+
+    let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
+    write_rules(dir.path(), &w, &e);
+    verify_include_set(dir.path().to_str().unwrap(), &w, &e).unwrap();
+
+    // 前提校验：junction 内部的文件确实两边都收到了，否则上面那条 unwrap
+    // 可能只是因为「两边都没看见它」而通过——那什么也没证明
+    let set = expected_set(dir.path().to_str().unwrap(), &w, &e).unwrap();
+    assert!(
+        set.contains("Code/Mirror/Linked.cs"),
+        "期望集合必须走进 junction：{set:?}"
+    );
+
+    // 拆掉 junction 再让 TempDir 清理，否则 remove_dir_all 会顺着它删掉
+    // outside 里的内容
+    fs::remove_dir(&link).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn a_junction_loop_terminates_instead_of_blowing_the_stack() {
+    // 同一条的另一半，后果更重：junction 指回自己的祖先时递归没有出口，
+    // 栈溢出会让 Rust 直接 abort——在 Tauri 里就是整个应用凭空消失，
+    // 连错误横幅都来不及显示。
+    //
+    // ⚠️ 这条要断言的是「**终止**」，不是「不进去」。上一条已经证明 junction
+    // 必须跟随（git 就是这么干的），所以出口只能靠环检测：`canonicalize` 在
+    // Windows 上会解开 reparse point，`Code/Loop` 与 `Code` 得到同一个规范路径。
+    //
+    // 集合与 git 对不上是允许的——实测 git 自己在这种工作树上也只是一路递归到
+    // 64 层才放弃、吐出一堆 `Code/Loop/Loop/…/Top.cs` 并打印
+    // `could not open directory` 警告。那种工作树本来就是坏的，报一次集合不一致
+    // 是正确行为；这里要保证的只是不崩。
+    let dir = workdir();
+    let code = dir.path().join("Code");
+    if !make_junction(&code.join("Loop"), &code) {
+        panic!("建 junction 失败——本条测试的前提没成立，不能当成通过");
+    }
+
+    let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
+    let set = expected_set(dir.path().to_str().unwrap(), &w, &e).unwrap();
+    assert!(set.contains("Code/Top.cs"), "正常文件仍要收进来：{set:?}");
+    // 环检测在第二次遇到同一个规范路径时停手，所以最多下探一层
+    assert!(
+        !set.iter().any(|f| f.contains("Loop/Loop/")),
+        "环必须被截断，不能一层层递归下去：{set:?}"
+    );
+
+    // junction 必须手工拆掉再让 TempDir 清理，否则 remove_dir_all 会顺着它
+    // 把目标目录的内容一起删了——这里目标就是 Code 自己，后果是测试互相打架
+    fs::remove_dir(code.join("Loop")).unwrap();
+}
+
+#[test]
+fn a_users_own_exclude_is_backed_up_before_we_take_over() {
+    // 2026-09-13 独立 review 的 A6。`.git/info/exclude` 是 git 留给用户自己用的
+    // 地方，无条件整文件覆盖等于删掉他手写的规则、且不留任何痕迹。
+    let dir = workdir();
+    let info = dir.path().join(".git").join("info");
+    fs::create_dir_all(&info).unwrap();
+    fs::write(info.join("exclude"), "# 我自己写的\n*.log\n").unwrap();
+
+    let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
+    write_rules(dir.path(), &w, &e);
+
+    let backup = fs::read_to_string(info.join("exclude.bak")).expect("原件必须被备份");
+    assert!(backup.contains("*.log"), "备份内容不对：{backup}");
+
+    // 再写一次：备份**不能**被我们自己生成的内容盖掉，否则用户的原件就没了
+    write_rules(dir.path(), &w, &e);
+    let backup2 = fs::read_to_string(info.join("exclude.bak")).unwrap();
+    assert_eq!(backup2, backup, "第二次写入不该覆盖备份");
+
+    // 一个刚 git init 的仓库不该产生备份。`git init` 会在那里写一份**纯注释**的
+    // 模板，按「非空」判定的话每个新仓库都会多出一个什么也没保存的 exclude.bak。
+    let dir2 = workdir();
+    let stock = fs::read_to_string(dir2.path().join(".git/info/exclude")).unwrap();
+    assert!(
+        !stock.trim().is_empty(),
+        "前提没成立：git init 本该写一份模板，这条测不到「纯注释」那一路"
+    );
+    write_rules(dir2.path(), &w, &e);
+    write_rules(dir2.path(), &w, &e);
+    assert!(
+        !dir2.path().join(".git/info/exclude.bak").exists(),
+        "纯注释的 git 模板和我们自己生成的内容都不该产生备份"
+    );
+}
+
+#[test]
+fn write_exclude_leaves_no_temp_file_behind() {
+    // 原子替换用的临时文件必须收干净——`.git/info/` 里留一个
+    // `exclude.mygitclient.tmp` 不会报错，但下次有人来看这个目录会一头雾水。
+    let dir = workdir();
+    let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
+    write_rules(dir.path(), &w, &e);
+
+    let leftovers: Vec<String> = fs::read_dir(dir.path().join(".git").join("info"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.contains("tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "残留了临时文件：{leftovers:?}");
 }
 
 #[test]

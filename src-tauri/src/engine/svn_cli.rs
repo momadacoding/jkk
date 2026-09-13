@@ -67,7 +67,13 @@ pub struct SvnOutput {
 }
 
 /// 把全局选项拼到调用方给的参数前面。
-fn with_global<'a>(args: &[&'a str]) -> Vec<&'a str> {
+/// 在参数表最前面插入全局选项。
+///
+/// **是 `pub` 的，为的是能被直接断言。** 只测「各子命令不因这个参数而失败」
+/// 证明不了注入真的发生了——把本函数改成原样返回，那种测试照样全绿
+/// （2026-09-13 独立 review 指出）。这是个纯函数，没有需要靠私有性保护的不变量，
+/// 公开出去不损失任何东西。
+pub fn with_global<'a>(args: &[&'a str]) -> Vec<&'a str> {
     let mut full: Vec<&str> = Vec::with_capacity(args.len() + 1);
     full.push("--non-interactive");
     full.extend_from_slice(args);

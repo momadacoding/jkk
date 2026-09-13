@@ -262,6 +262,7 @@ export function BranchView({
         <DeleteBranchDialog
           repoPath={repoPath}
           name={deleting}
+          capabilities={capabilities}
           onCancel={() => setDeleting(null)}
           // 成功才关；失败时 onDelete 抛出，确认框自己接住并留在原地
           onConfirm={async (targets) => { await onDelete(deleting, targets); setDeleting(null) }}

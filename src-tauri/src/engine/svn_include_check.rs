@@ -38,7 +38,8 @@ pub fn expected_set(
             continue;
         }
         if abs.is_dir() {
-            walk(&abs, root, extensions, fold, &mut out)?;
+            let mut chain = vec![std::fs::canonicalize(&abs)?];
+            walk(&abs, root, extensions, fold, &mut chain, &mut out)?;
         }
     }
     Ok(out)
@@ -72,11 +73,40 @@ fn matches_ext(path: &str, extensions: &[String], fold: bool) -> bool {
     extensions.iter().any(|e| path.ends_with(e.as_str()))
 }
 
+/// 递归遍历 `dir`，把符合扩展名的文件按仓库内相对路径收进 `out`。
+///
+/// # reparse point（Windows 的 junction 与符号链接）
+///
+/// **跟随它们，与 git 对齐。** 2026-09-13 实测：`Code/Mirror` 是一条指向仓库外
+/// 目录的 junction 时，`git ls-files --others --exclude-standard -- Code/` 会列出
+/// `Code/Mirror/Linked.cs` ——git 把 junction 当普通目录走进去了。所以这里也必须
+/// 走进去；把它当成「一个文件」反而会让期望集合少一批文件、在一个正常仓库上误报。
+///
+/// （这与「git 把**符号链接**记成 blob、不递归」那条常识不矛盾：那条对
+/// `core.symlinks=true` 下的真符号链接成立，而 Windows 上该项默认是 `false`，
+/// junction 走的也不是那条路径。）
+///
+/// # 环
+///
+/// `chain` 是当前**祖先链**的规范路径。junction 指回自己的祖先时递归没有出口，
+/// 栈溢出会让 Rust 直接 abort——在 Tauri 里就是整个应用凭空消失，连错误横幅都
+/// 来不及显示（2026-09-13 独立 review 指出）。`canonicalize` 在 Windows 上会解开
+/// reparse point，于是 `Code/Loop` 与 `Code` 得到同一个规范路径，环一眼就能看出来。
+///
+///
+/// 只查祖先链、不做全局已访问集合：两条 junction 指向同一个目标是合法的，
+/// git 会把两边的内容都列出来，全局去重会与它分叉。
+///
+/// 环存在时本函数与 git 仍会给出不同的集合（实测 git 会一路递归到 64 层才放弃，
+/// 吐出一堆 `Code/Loop/Loop/…/Top.cs` 并打印 `could not open directory` 警告）。
+/// 那种工作树本来就是坏的，**报一次集合不一致是正确行为**；这里要保证的只是
+/// 「不崩」，不是「与一个自己都放弃了的遍历逐条对齐」。
 fn walk(
     dir: &Path,
     root: &Path,
     extensions: &[String],
     fold: bool,
+    chain: &mut Vec<std::path::PathBuf>,
     out: &mut BTreeSet<String>,
 ) -> Result<()> {
     for ent in std::fs::read_dir(dir)? {
@@ -88,8 +118,19 @@ fn walk(
         if name.eq_ignore_ascii_case(".svn") || name.eq_ignore_ascii_case(".git") {
             continue;
         }
+        // `is_dir()` 会**跟随** junction，这是对的——见下方 `walk` 的 reparse 说明。
         if p.is_dir() {
-            walk(&p, root, extensions, fold, out)?;
+            // 环保护：`canonicalize` 在 Windows 上会解开 reparse point，于是
+            // `Code/Loop`（指回 `Code` 的 junction）与 `Code` 得到同一个规范路径。
+            // 只查**祖先链**而不是全局已访问集合：两条 junction 指向同一个目标是
+            // 合法的，git 会把两边的内容都列出来，全局去重会与它分叉。
+            let canon = std::fs::canonicalize(&p)?;
+            if chain.contains(&canon) {
+                continue;
+            }
+            chain.push(canon);
+            walk(&p, root, extensions, fold, chain, out)?;
+            chain.pop();
         } else {
             let rel = p
                 .strip_prefix(root)
@@ -109,18 +150,23 @@ fn walk(
 /// # 为什么是纯读，而不是 spec 字面写的「临时索引 + `git add -A`」
 ///
 /// spec §6.3.1 说的是「在临时索引上 `git add -A -- <白名单>` 之后读 `ls-files`」，
-/// 意图是「git 会跟踪谁」而**不要弄脏用户的暂存区**。
-/// `--cached` ∪ `--others --exclude-standard` 给出同一个集合，却连临时索引文件和
-/// 松散对象都不写：
+/// 意图是「git 会跟踪谁」而**不要弄脏用户的暂存区**。下面这三条 `ls-files`
+/// 给出同一个集合，却连临时索引文件和松散对象都不写：
 ///
-/// - `--cached`：已经在索引里的（包括那些「已跟踪但现在被忽略规则命中」的文件
-///   ——`git add -A` 同样会保留它们）
-/// - `--others --exclude-standard`：还没进索引、也没被忽略规则挡住的，
-///   即下一次 `git add -A` 会新收进来的那批。`--exclude-standard` 恰好就是
-///   「每层 `.gitignore` + `.git/info/exclude` + 全局 excludesFile」这三源
+/// | 取哪些 | 为什么 |
+/// |---|---|
+/// | `+ --cached` | 已经在索引里的（含「已跟踪但现在被忽略规则命中」的，`git add -A` 同样保留它们） |
+/// | `+ --others --exclude-standard` | 还没进索引、也没被忽略规则挡住的，即下一次 `git add -A` 会新收进来的那批。`--exclude-standard` 恰好就是「每层 `.gitignore` + `.git/info/exclude` + 全局 excludesFile」三源 |
+/// | `− --deleted` | **已在索引、但工作树上已被删掉的**。`git add -A` 会把这个删除也入索引，之后就不再列它了 |
 ///
-/// 等价性不是推断——`the_actual_set_equals_what_git_add_would_have_produced`
-/// 在真实仓库上把两条路径的结果对了一遍。
+/// # 第三条是 2026-09-13 独立 review 抓出来的
+///
+/// 原来只有前两条，而「等价」这个结论被当成实测事实写进了文档和决策日志——
+/// 但当时那条等价性测试跑在**空索引**上，`--cached` 恒为空，真正会分叉的那一半
+/// 根本没执行到。实测反例：已跟踪文件被从工作树删掉、删除还没 stage 时，
+/// `--cached` 仍列它而 `git add -A` 之后不列，`expected_set` 走磁盘也不含它
+/// ——核对于是报「不该被跟踪、实际跟踪了 X」并硬阻断，而用户只是删了个文件
+/// 还没提交。两条回归测试钉住这件事，其中一条断言的是**索引非空**时刻的等价性。
 pub fn actual_set(repo_root: &str, whitelist: &[String]) -> Result<BTreeSet<String>> {
     if whitelist.is_empty() {
         // G6：空列表绝不能退化成「全部」——`git ls-files` 不带 pathspec
@@ -134,6 +180,9 @@ pub fn actual_set(repo_root: &str, whitelist: &[String]) -> Result<BTreeSet<Stri
         &["--others", "--exclude-standard"],
         &paths,
     )?);
+    for gone in ls_files(repo_root, &["--deleted"], &paths)? {
+        set.remove(&gone);
+    }
     Ok(set)
 }
 

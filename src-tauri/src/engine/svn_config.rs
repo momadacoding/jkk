@@ -220,5 +220,104 @@ pub fn normalize_whitelist_entry(raw: &str) -> Result<String> {
     if first.eq_ignore_ascii_case(".git") || first.eq_ignore_ascii_case(".svn") {
         return reject("不能以 .git 或 .svn 开头");
     }
+    // glob 元字符：与上面的 pathspec magic 同源，但后果更重。
+    //
+    // 2026-09-13 独立 review 实测：`whitelist:["*"] extensions:[".cs"]` 生成的规则
+    // 会把 `Art/boss.fbx`、`Code/Junk.psd` 一起收进 git ——**扩展名过滤被整个绕开，
+    // 白名单退化成「全部」**。`Code/*`、`Code/**` 同样。`extensions` 那侧早就挡了
+    // `*` / `?`，白名单这侧漏了。
+    if let Some(c) = trimmed.chars().find(|c| matches!(c, '*' | '?' | '[' | ']')) {
+        return reject(&format!(
+            "不能含通配符 {c:?}（白名单条目是路径，不是 pattern；\
+             `*` 会让扩展名过滤整个失效、白名单退化成「整个仓库」）"
+        ));
+    }
     Ok(trimmed.to_string())
+}
+
+/// 拿白名单条目和磁盘对一遍：类型（目录 / 文件）与大小写都必须对得上。
+///
+/// # 为什么这是一道独立的校验，而不是 [`validate`] 的一部分
+///
+/// [`validate`] 是纯函数，只看字符串本身；这里要读盘，所以收 `repo_root`。
+///
+/// # 它挡的两件事，都是「配置看着没问题、行为完全不对」
+///
+/// **① 目录条目漏写尾斜杠。** 尾斜杠是「目录（递归）」与「单个文件」的**唯一**
+/// 区分（spec §6.3），而单文件条目**不过扩展名过滤**。于是 `"Assets/Scripts"`
+/// （少一个 `/`）会被当成单个文件反选，`!/Assets/Scripts` 把整棵树重新纳入且不受
+/// 任何后续规则约束——2026-09-13 实测 `whitelist:["Code"] extensions:[".cs"]` 连
+/// `Code/Junk.psd` 都跟踪了。漏一个斜杠是很自然的手误。
+///
+/// **② 大小写写错。** Windows 上 git 的忽略规则匹配大小写不敏感
+/// （`core.ignoreCase=true`），但 **pathspec 匹配是大小写敏感的**。于是 `"code/"`
+/// 这种写法下，git 照样按规则跟踪 `Code/Top.cs`，而 `git ls-files -- code/` 返回空
+/// ——`engine::svn_include_check` 的核对会在一个工作完全正常的仓库上报
+/// 「应当被跟踪、实际没有」。
+///
+/// # 路径不存在时**不报错**
+///
+/// 本函数只管「存在但对不上」。「配置指向了不存在的路径」是另一件事：条目可能是
+/// 用户刚从磁盘上删掉的目录，在这里硬阻断会把人锁在仓库外面。初始化向导
+/// （Phase 1b）该不该额外要求存在，由它自己决定。
+pub fn validate_whitelist_against_disk(repo_root: &str, whitelist: &[String]) -> Result<()> {
+    for entry in whitelist {
+        let wants_dir = entry.ends_with('/');
+        let clean = entry.trim_end_matches('/');
+        if clean.is_empty() {
+            continue;
+        }
+        let mut cursor = std::path::PathBuf::from(repo_root);
+        for seg in clean.split('/') {
+            let Some(real) = real_name(&cursor, seg) else {
+                // 这一段在磁盘上不存在 → 整条不判，见上方「路径不存在时不报错」
+                return Ok(());
+            };
+            if real != seg {
+                return Err(GitError::new(
+                    "svn_config",
+                    format!(
+                        "白名单条目 {entry:?} 的大小写与磁盘不一致：写的是 {seg:?}，\
+                         磁盘上是 {real:?}。git 的忽略规则在 Windows 上大小写不敏感、\
+                         但 pathspec 匹配是敏感的，两边会给出不同答案，\
+                         纳入集合核对会在一个正常仓库上误报。请改成磁盘上的写法。"
+                    ),
+                ));
+            }
+            cursor.push(seg);
+        }
+        let is_dir = cursor.is_dir();
+        if wants_dir && !is_dir {
+            return Err(GitError::new(
+                "svn_config",
+                format!("白名单条目 {entry:?} 以 / 结尾（表示目录），但磁盘上它不是目录。"),
+            ));
+        }
+        if !wants_dir && is_dir {
+            return Err(GitError::new(
+                "svn_config",
+                format!(
+                    "白名单条目 {entry:?} 在磁盘上是一个**目录**，但它没有以 / 结尾。\
+                     不带尾斜杠的条目会被当成单个文件处理、**不过扩展名过滤**，\
+                     结果是整棵子树都进 git。请写成 {entry:?}/ 。"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 在 `parent` 下找出与 `name` 大小写无关地相等的那一项，返回它在磁盘上的真实写法。
+///
+/// 不能直接用 `Path::exists()` 判大小写——NTFS 不区分大小写，`code` 对
+/// `Code` 返回 true。只能列目录逐项比。
+fn real_name(parent: &std::path::Path, name: &str) -> Option<String> {
+    let entries = std::fs::read_dir(parent).ok()?;
+    for ent in entries.flatten() {
+        let real = ent.file_name().to_string_lossy().to_string();
+        if real.eq_ignore_ascii_case(name) {
+            return Some(real);
+        }
+    }
+    None
 }

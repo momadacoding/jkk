@@ -3,7 +3,9 @@
 //! 这个文件**用户手写**，所以它和输入框里敲的字符串是同一个可信级别，
 //! 每个字段都会被送进 git 或 svn 的命令行（spec §6.2.1）。
 
-use app_lib::engine::svn_config::{normalize_whitelist_entry, read_config, validate, SvnConfig};
+use app_lib::engine::svn_config::{
+    normalize_whitelist_entry, read_config, validate, validate_whitelist_against_disk, SvnConfig,
+};
 use std::fs;
 use tempfile::TempDir;
 
@@ -69,6 +71,14 @@ fn dangerous_whitelist_entries_are_rejected() {
         ".Git/hooks",       // 同上
         "-rHEAD",           // 会被 svn 当成选项解析
         "--version",        // 同上
+        // 2026-09-13 独立 review：白名单漏挡 glob 元字符。实测 `["*"]` + `[".cs"]`
+        // 生成的规则连 Art/boss.fbx 和 Code/Junk.psd 都收——**扩展名过滤被整个
+        // 绕开、白名单退化成「整个仓库」**。extensions 那侧早就挡了 * 和 ?。
+        "*",
+        "Code/*",
+        "Code/**",
+        "Code/?.cs",
+        "Code/[ab].cs",
     ] {
         assert!(
             normalize_whitelist_entry(bad).is_err(),
@@ -208,4 +218,87 @@ fn read_config_accepts_a_good_file_and_normalizes_separators() {
     let cfg = read_config(dir.path().to_str().unwrap()).unwrap();
     assert_eq!(cfg.whitelist, vec!["Assets/Scripts/".to_string()]);
     assert_eq!(cfg.extensions, vec![".cs".to_string(), ".meta".to_string()]);
+}
+
+// ---------------------------------------------------------------------------
+// 白名单与磁盘对账（2026-09-13 独立 review 的 A2 / A3）
+//
+// 这两种配置**看着都没问题**，但行为完全不对，而且都不会报错：
+// 漏尾斜杠 → 整棵子树绕过扩展名过滤进 git；大小写写错 → 纳入集合核对在一个
+// 完全正常的仓库上误报阻断。
+// ---------------------------------------------------------------------------
+
+/// 造一个 `Code/` 目录 + 一个 `Code/Top.cs` 文件。
+fn disk_fixture() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join("Code/Sub")).unwrap();
+    fs::write(dir.path().join("Code/Top.cs"), "x").unwrap();
+    dir
+}
+
+#[test]
+fn a_directory_entry_without_a_trailing_slash_is_rejected() {
+    // 尾斜杠是「目录（递归）」与「单个文件」的唯一区分，而单文件条目**不过
+    // 扩展名过滤**。实测 whitelist:["Code"] + extensions:[".cs"] 会把
+    // Code/Junk.psd 也收进 git——少写一个 / 就是「整棵树全收」。
+    let dir = disk_fixture();
+    let root = dir.path().to_str().unwrap();
+    let err = validate_whitelist_against_disk(root, &["Code".to_string()])
+        .expect_err("目录条目漏尾斜杠必须被拒");
+    assert_eq!(err.code, "svn_config");
+    assert!(err.message.contains('/'), "错误信息要直说少了个斜杠");
+
+    // 写对了就放行
+    validate_whitelist_against_disk(root, &["Code/".to_string()]).unwrap();
+    validate_whitelist_against_disk(root, &["Code/Top.cs".to_string()]).unwrap();
+}
+
+#[test]
+fn a_file_entry_with_a_trailing_slash_is_rejected_too() {
+    // 反过来也要挡：`Code/Top.cs/` 会走目录分支，生成一堆对不上任何东西的规则。
+    let dir = disk_fixture();
+    assert!(validate_whitelist_against_disk(
+        dir.path().to_str().unwrap(),
+        &["Code/Top.cs/".to_string()]
+    )
+    .is_err());
+}
+
+#[test]
+fn a_case_mismatch_against_the_disk_is_rejected() {
+    // Windows 上 git 的忽略规则匹配大小写**不敏感**，但 pathspec 匹配是**敏感**的。
+    // 于是 "code/" 这种写法下 git 照常跟踪 Code/Top.cs，而
+    // `git ls-files -- code/` 返回空——核对会报「应当被跟踪、实际没有」。
+    //
+    // NTFS 不区分大小写，所以不能靠 Path::exists() 判，只能列目录逐项比。
+    let dir = disk_fixture();
+    let root = dir.path().to_str().unwrap();
+    let err = validate_whitelist_against_disk(root, &["code/".to_string()])
+        .expect_err("大小写对不上必须被拒");
+    assert_eq!(err.code, "svn_config");
+    assert!(
+        err.message.contains("Code"),
+        "错误信息要给出磁盘上的真实写法，实际：{}",
+        err.message
+    );
+
+    // 中间段的大小写同样要查
+    assert!(validate_whitelist_against_disk(root, &["Code/top.cs".to_string()]).is_err());
+}
+
+#[test]
+fn a_path_that_does_not_exist_on_disk_is_not_an_error_here() {
+    // 本函数只管「存在但对不上」。条目可能是用户刚删掉的目录，在这里硬阻断
+    // 会把人锁在仓库外面；「必须存在」是初始化向导（Phase 1b）自己的事。
+    let dir = disk_fixture();
+    let root = dir.path().to_str().unwrap();
+    validate_whitelist_against_disk(root, &["Nope/".to_string()]).unwrap();
+    validate_whitelist_against_disk(root, &["Code/Gone/".to_string()]).unwrap();
+}
+
+#[test]
+fn an_empty_whitelist_is_a_no_op_here() {
+    // G6：空列表一律 no-op。
+    let dir = disk_fixture();
+    validate_whitelist_against_disk(dir.path().to_str().unwrap(), &[]).unwrap();
 }
