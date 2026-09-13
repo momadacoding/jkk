@@ -1,7 +1,7 @@
 # SVN + Git 混合模式 设计规格
 
 - 日期：2026-09-12
-- 状态：设计已确认，未实现。已过一轮对抗性 review，五条 high 全部修入，见 §18
+- 状态：设计已确认，未实现。已过三轮对抗性 review + 一次 `git svn` 方案复核，结论全部修入，见 §18
 - 分期：见 §16。本文覆盖全部 5 期的架构，各期另出实现计划
 
 ## 1. 背景与目标
@@ -33,7 +33,7 @@ git 管白名单内的代码文件，负责暂存、分支、stash、本地提�
 - 给美术、策划使用。本客户端的 SVN 模式只服务程序职能
 - SVN 分支管理（`svn switch`、`svn merge`、分支创建）
 - SVN 文件锁（`svn lock` / `unlock`）、externals
-- git 历史与 SVN revision 的双向映射（git-svn 语义）
+- git 历史与 SVN revision 的双向映射（git-svn 语义）。**不用 `git svn` 本身的完整论证见 §2.2**
 - 把本地 git 历史共享给同事（不需要 git remote）
 - 在 SVN 模式下提供 worktree、tag、PR、cherry-pick、revert
 - `svn move`：git 的 rename 一律拆成 delete + add，见 §15
@@ -45,7 +45,7 @@ git 管白名单内的代码文件，负责暂存、分支、stash、本地提�
 | # | 决策 | 影响 |
 |---|---|---|
 | D1 | 只给程序 / 代码同学用 | 砍掉文件锁、externals、大资产工作流 |
-| D2 | 一份完整工作目录，代码 + 美术都在，可能几十 GB | 判死 `git svn clone`；git 只能覆盖代码子集 |
+| D2 | 一份完整工作目录，代码 + 美术都在，可能几十 GB | git 只能覆盖代码子集。⚠️ 这条**不构成**否决 git-svn 的理由，真正的死因见 §2.2 |
 | D3 | 本地 git 历史是脚手架，用完即弃，最终 squash 成一次 `svn commit` | 不需要 revision 映射；同步模型大幅简化 |
 | D4 | 只需本地多任务并行 + 实验性改动 | 砍掉全部 SVN 分支功能 |
 | D5 | 主视图是混合图：SVN 线性历史 + 本地 git 分支 | 见 §10 |
@@ -71,6 +71,91 @@ git 管白名单内的代码文件，负责暂存、分支、stash、本地提�
 changelist 无法让两份不同的文件内容同时存在，做不到分支，与 D4 直接冲突。
 （`ignore-on-commit` changelist 的**那个具体用途**——长期保留不打算交付的本地修改——
 是真需求，由 D11 单独承接，见 §6.7。）
+
+### 2.2 为什么不是 `git svn`
+
+git 自带 `git svn`，它能直接读写 SVN 仓库。本设计不用它。这一节把理由写透，因为
+**原来 D2 给的理由是错的**，而错的理由必然会被反复重新提出。
+
+#### 原来的理由站不住
+
+D2 曾写「几十 GB → 判死 `git svn clone`」。但 `--include-paths=<regex>` /
+`--ignore-paths=<regex>` 是 `git svn` 的正式选项，对 fetch / clone / rebase / dcommit
+全程生效（配置键 `svn-remote.<name>.include-paths`）：
+
+```gitconfig
+[svn-remote "svn"]
+    include-paths = ^Assets/Scripts
+```
+
+美术资产本来就永远不会进 git 对象库。**体积拦不住 `git svn`。**
+
+#### 真正的死因：`git svn` 没有工作副本
+
+`git svn` 通过 SVN 的 RA 层直连服务器，`git svn clone` 出来的目录里**没有 `.svn`**。
+
+而本设计的物理前提是「一个 Unity 能打开的目录，代码 + 美术都在」（D2），美术只能来自
+SVN 工作副本。于是同一批代码文件会被 `.svn` 和 `git svn` 同时认领，各有一套「磁盘现在
+是哪个 revision」的记账；而为了更新美术必跑的 `svn update` 会在 `git svn` 背后改写代码
+文件，`git svn` 对此一无所知。
+
+唯一的出路是把代码目录从 SVN 工作副本里摘掉——`svn update --set-depth=exclude <代码目录>`
+——让 svn 只管美术、`git svn` 只管代码。这条路在**结构上**能走通，但有一个致命细节：
+
+> **depth-exclude 的粒度是目录，而 D6 的白名单语义是「路径 AND 扩展名」。**
+>
+> `Assets/Scripts/` 底下那个别人扔进来的 `.psd`：被 depth-exclude 移出工作副本，
+> 又被 `include-paths` 的正则挡在 git 外——**它会直接从磁盘上消失**，两边都不认领。
+> 要避免就只能放弃扩展名过滤（`include-paths` 只有路径正则，没有扩展名维度），
+> 于是 D6 专门要防的「误吸一个 500MB 文件进对象库」原样回来。
+
+此外还丢掉两样东西：TortoiseSVN 对**代码**的兜底能力（§16 Phase 1 / Phase 2 的自洽前提
+就是「用户继续用 TortoiseSVN 更新和交付」），以及新增代码目录时 exclude 网会漏的问题。
+
+#### 实测：`git svn` 会打掉现有的测试策略
+
+2026-09-13 本机实测（临时 fixture，跑完即删）：
+
+| 观察 | 结果 |
+|---|---|
+| `git svn --version` | `2.51.2.windows.1 (svn 1.14.2)`，命令存在 |
+| `git svn clone file:///C:/…` | ❌ `Unable to open repository`（`Git/SVN.pm line 148`） |
+| 换 4 种 URL 写法（`file://localhost/`、小写盘符、尾斜杠、标准三斜杠） | ❌ 全部失败 |
+| 换 fsfs format 6 / 7 / 8（`svnadmin create --compatible-version 1.8/1.9/1.10`） | ❌ 全部失败，**不是仓库格式问题** |
+| 同一批 URL 用 SlikSvn 的 `svn info` | ✅ 全部成功 |
+| 本机 `svnserve` | ❌ 不存在（SlikSvn 只装 `svn` + `svnadmin`） |
+
+即 **Git for Windows 自带的 `git svn` 打不开 `file://` 仓库**。含义是致命的：§14.1 的
+fixture 策略（`svnadmin create` + `file://` + 两个工作副本）对任何以 `git svn` 为核心的
+方案**当场失效**，必须另起一个真实 SVN 服务端（svnserve 或 Apache）才能跑自动化测试，
+而 `AGENTS.md` §8 把「git 写操作测试必须自建临时 fixture」定成硬约束。这笔成本是引入
+`git svn` 最贵的一项。
+
+**未验证**：公司服务器走 https（ra_serf），本机没有服务器可测，`git svn` 在 https 下的
+可用性与性能**没有实测依据**。不要把上表的结论外推成「`git svn` 完全不能用」——上表只
+证明了 `file://` 这一条路不通。
+
+#### 但 `git svn` 确实结构性地消灭了两个失败模式
+
+这点必须如实承认，不能因为最终没选它就略过：
+
+| 本设计的失败模式 | `git svn` 下为什么不存在 |
+|---|---|
+| §8.3 空 target 的 `svn commit` 提交整个工作副本 | `git svn dcommit` 不吃 pathspec，它从 git 对象算 delta 经 RA 提交，没有「目标列表」这个概念 |
+| §8.2.5 D3.8→D5 之间磁盘字节被外部 IDE 改掉 | 同上：dcommit 提交的是 git commit 的内容，不是磁盘当时的字节 |
+
+这两条是本设计后果最重的两个风险，在本方案里只能靠断言（§8.3、§12.2、D4.9）挡住，
+而不是结构上不可能发生。**这是选择 Overlay 路线所付的代价，写在这里以免将来误以为
+两边等价。**
+
+#### 从 `git svn` 借来的东西
+
+不引入这个工具，但拿走它的两条设计性质：
+
+1. **基线必须能被服务器证伪。** `git svn` 的基线是从服务器 fetch 下来的，天然不会
+   撒谎；本设计的基线由 `git add -A` 收磁盘而来，磁盘不能自证等于服务器——这正是
+   §6.5.1 / §9.2 / §16 那一整族缺陷的共同根因。对策是 §6.8 的基线体检
+2. **记账用 `git svn` 的原生 trailer 格式**（§6.4），白送 UUID 记账与工具互操作
 
 ## 3. 总体架构
 
@@ -351,14 +436,32 @@ git 的硬规则：**父目录被排除后，其中的文件无法再被重新�
 
 - 每次成功 `svn update` 后在其上落一个 commit，内容 = 白名单内文件在该 revision
   的状态
-- commit message 携带权威记账：
+- commit message 携带权威记账，**沿用 `git svn` 的原生 trailer 格式**：
 
 ```text
 svn: r12346
 
-Svn-Rev: 12346
-Svn-Url: https://svn.company.com/game/trunk
+git-svn-id: https://svn.company.com/game/trunk@12346 8f3a1c7e-4b21-0410-9d2f-1a7b3c5d9e01
 ```
+
+#### 6.4.1 为什么用 `git-svn-id:` 而不是自定义的 `Svn-Rev:`
+
+格式固定为一行：`git-svn-id: <url>@<rev> <repository-uuid>`，解析正则
+`^git-svn-id: (\S+)@(\d+) ([0-9a-fA-F-]+)$`。三个字段缺一不可，解析失败即视为该
+commit 不是 baseline（不猜、不部分接受）。
+
+换用这个格式的收益：
+
+- **UUID 白送**。§6.2.1 要求比对 repository UUID（URL 可能因代理 / 镜像 / `http` 与
+  `https` 写法不同而不可靠），原来的 `Svn-Url:` 记的是 URL，帮不上忙；`git-svn-id`
+  自带 UUID，基线自己就带着仓库身份
+- **工具互操作**。`git log --grep=^git-svn-id` 是 `git svn` 文档里给出的标准用法，
+  IDE 与第三方工具也按这个格式识别 SVN 映射
+- **迁移锚点**。将来若 §2.2 的结论被推翻、真要迁到 `git svn`，历史里已有现成的映射
+
+⚠️ **代价**：一个用户若在本仓库里手工跑 `git svn init`，`git svn` 会把这些 trailer
+当成自己的映射来解释，而 `.git/svn/` 里并没有对应的 `rev_map`。这不会损坏数据，但
+会产生令人困惑的行为。记为已知限制（§15 第 19 条）。
 
 - **客户端 UI 禁止在基线分支上开发提交。** 流程内部会临时切上去，但任何流程结束时
   必须回到原分支
@@ -393,7 +496,8 @@ P3  不在 svn update / merge 中途（.svn 里没有未完成的操作）
 git init -b svn/base                 ← 显式指定，不吃 init.defaultBranch 的默认值
 写入 .git/mygitclient.json（用户编辑白名单）
 生成 .git/info/exclude
-git add -- <白名单> && git commit    ← 首个基线，Svn-Rev 取自 P2 读到的 N
+git add -- <白名单> && git commit    ← 首个基线，git-svn-id 的 rev 取自 P2 读到的 N
+基线体检（§6.8）                      ← 有差异则整个回退，删掉刚建的 .git
 git checkout -b work                 ← 立刻离开基线分支
 ```
 
@@ -412,7 +516,7 @@ git checkout -b work                 ← 立刻离开基线分支
 | `A` / `D` 待提交登记 | 登记状态没进 git | §8.5 的差量基准从一开始就是脏的（§8.5.1） |
 | mixed-revision | —— | 见下 |
 
-mixed-revision 那条最隐蔽：原设计 `Svn-Rev 取自 svn info`，读的是**根节点**的
+mixed-revision 那条最隐蔽：原设计「rev 取自 `svn info`」，读的是**根节点**的
 revision，而 §6.6.2 的判据比的是**白名单 `nodeRevs`**。两者在 mixed-revision 工作副本
 里本来就不相等——
 
@@ -420,11 +524,11 @@ revision，而 §6.6.2 的判据比的是**白名单 `nodeRevs`**。两者在 mi
 实测（2026-09-13，真实 SVN fixture）：
   rootRev（svn info .）  = 1
   白名单 nodeRevs        = {3}
-  → 若照原设计取 rootRev 作 Svn-Rev，baselineRev=1、nodeRevs={3}，
+  → 若照原设计取 rootRev 作 git-svn-id 的 rev，baselineRev=1、nodeRevs={3}，
     初始化**完成的那一瞬间**就判失同步
 ```
 
-所以 `Svn-Rev` 必须取自 `nodeRevs`，而且 `nodeRevs` 必须先是单值——这也是 P2 存在的
+所以 `git-svn-id` 的 rev 必须取自 `nodeRevs`，而且 `nodeRevs` 必须先是单值——这也是 P2 存在的
 全部理由。
 
 ### 6.6 状态判定
@@ -449,7 +553,7 @@ Assets/Art/boss.fbx       r12345
 #### 6.6.2 分层检测
 
 ```text
-baselineRev = svn/base 顶端 commit 的 Svn-Rev trailer     ← 权威记账
+baselineRev = svn/base 顶端 commit 的 git-svn-id trailer 的 rev  ← 权威记账
 rootRev     = svn info --xml 的 <entry revision>          ← O(1)，本地读，毫秒级
 nodeRevs    = svn status -v --xml -- <白名单路径>          ← 白名单内每个已版本控制
                                                              节点的 revision 集合
@@ -572,6 +676,107 @@ commit 被 rebase 按 patch-id 丢弃）。补丁自动跟着每一次 `sync_in`
 
 另一条绕不过去的物理事实：**`svn commit` 提交的是磁盘上的字节，不是 git 的某棵树。**
 要让 SVN 看不见补丁，磁盘在那一刻就必须真的没有它——这决定了交付流程的形状（§8.2.3）。
+
+### 6.8 基线体检：让基线可被服务器证伪
+
+#### 6.8.1 为什么需要它
+
+第二轮 review 的「四个切面」表（§18）已经把根因写出来了：**`svn/base` 是由
+`git add -A` 收磁盘而来的，而磁盘不能自证等于服务器。** §6.5 的初始化前置、§6.6 的
+`nodeRevs` 判据、§9.4 的恢复流程都是在**防止**假基线产生，但它们全是**间接**判据——
+检查的是 revision 号和工作副本的登记状态，**没有任何一条直接比对过「基线里的字节」与
+「服务器上的字节」**。
+
+于是每发现一个新的边界，就得再补一条间接判据，而且永远无法证明补全了。`git svn`
+没有这个问题（§2.2），因为它的基线是从服务器 fetch 下来的。本设计拿不到那个性质，
+但可以拿到它的**可证伪性**：加一条直接问服务器要事实的检查。
+
+#### 6.8.2 怎么做
+
+前提：**磁盘上白名单内的内容等于基线树的内容**。满足它的时刻有两类，§6.8.5 列的四个
+时机全部落在这两类里：
+
+- HEAD 在 `svn/base` 上且工作区干净（§6.5 首个基线之后、§9.4 第 ⑥ 步之后）
+- 基线树刚刚从磁盘录出来（§16 Phase 1 的 R2–R3，全程不动 HEAD）
+
+前提成立时就可以直接拿磁盘去跟服务器比：
+
+```bash
+svn diff --old=<svnUrl>@<baselineRev> --new=<工作副本根> --summarize -- <白名单根...>
+```
+
+有输出即「基线与服务器不符」，**直接证伪**，不需要任何关于 revision 号的推断。
+
+实测（2026-09-13，真实 SVN fixture）：
+
+| # | 场景 | 结果 |
+|---|---|---|
+| T1 | 基线 = r1，工作副本干净 | 无输出 ✅ |
+| T2 | 白名单内一个 `.cs` 被本地改过 | `M <url>/Assets/Scripts/A.cs` ✅ |
+| T3 | **美术文件被改**，体检只传白名单根 | 无输出 ✅ 不误报 |
+| T4 | 磁盘已是 r2，仍拿 `baselineRev=1` 比（假基线） | 报出差异 ✅ 正是要抓的那类 |
+| T5 | 同一时刻用正确的 `baselineRev=2` 比 | 无输出 ✅ |
+| T6 | 一次传入多个白名单根 | 接受多 target ✅ |
+| T7 | 服务器删掉 `Deep/D.cs` 后拿旧 rev 比 | `D <url>/Assets/Scripts/Deep/D.cs` ✅ 覆盖 §9.4.1 那类漏检 |
+
+#### 6.8.3 这条检查证明不了什么
+
+它比的是**磁盘**与服务器，不是**基线树**与服务器。两者之间隔着一个假设：「git 跟踪的
+文件集合 == 白名单内应跟踪的集合」，而这个假设正是 §6.3 那条 exclude 规则可能打破的
+（漏掉 `!/Assets/Scripts/**/` 时，深层 `.cs` 在磁盘上好好的，只是 git 不管）。
+
+所以分工是明确的，不要互相冒充：
+
+| 缺陷类型 | 谁抓 |
+|---|---|
+| 基线 rev 与服务器内容不符（假基线的四个切面，§18） | **本节的体检** |
+| git 跟踪的文件集合不对（exclude 规则写错） | §14.2 第 6 项，断言 `git ls-files` 的真实结果 |
+
+要一条命令同时覆盖两类，得把服务器子树 `svn export` 下来再与基线树逐文件比对，
+成本从「传一个 diff」变成「下一整棵子树」。**本期不做**，记在这里是为了说明边界在
+哪，而不是留一个 TODO。
+
+#### 6.8.4 解析输出的两个坑（实测）
+
+`--summarize` 的输出形态与直觉不一样，照着字面解析会错：
+
+```text
+M       file:///…/repo/Assets/Scripts/A.cs        ← 第 1 列 = 内容变更
+ M      file:///…/repo/Assets/Scripts             ← 第 2 列 = **属性**变更，且是**目录**
+```
+
+1. **路径是 URL，不是工作副本相对路径。** 必须剥掉 `<svnUrl>` 前缀才能和白名单、
+   `git ls-tree` 的输出对齐
+2. **输出里会混进目录条目，以及只有属性变更的条目。** 体检**只看第 1 列（内容）且
+   只看文件**；目录条目一律剔除——与 §8.6.2「比对前必须先剔除目录路径」同源，那里
+   不剔除会把真成功判成失败，这里不剔除会把正常仓库判成基线撒谎
+
+#### 6.8.5 什么时候跑
+
+只在**降级路径**和用户主动要求时跑，不进 `sync_in` / `sync_out` 热路径：
+
+| 时机 | 理由 |
+|---|---|
+| 初始化向导，`git commit` 首个基线之后、`git checkout -b work` 之前（§6.5） | 这是假基线的最大来源；此刻还没建工作分支，不通过就整个回退，代价最小 |
+| §9.4 恢复流程第 ⑥ 步之后、第 ⑦ 步之前 | 恢复的全部目的就是修好基线，不验证等于没修 |
+| §16 Phase 1「重建基线」R3 之后、R4 之前（R3b） | 同上；此时指针还没动，不通过就中止，代价为零 |
+| 用户手动点「体检」 | 怀疑基线不对时的唯一直接手段 |
+
+**不在 `sync_in` 的 S7 之后跑**：S5 的 `svn update` 刚成功，磁盘按构造就是服务器内容，
+再问一次是冗余的网络开销。
+
+成本是白名单子树的一次 diff——白名单里没有美术资产，量级是 MB 不是 GB。
+
+#### 6.8.6 失败与「没跑成」必须分开
+
+| 结果 | 处理 |
+|---|---|
+| 无输出 | 基线可信，记下体检时间与 revision |
+| 有输出（真差异） | **基线撒谎**。阻断并列出差异文件；初始化时整个回退，恢复流程时停在第 ⑥ 步报错 |
+| 命令失败（断网、认证、URL 不可达） | **不是基线有问题**。不阻断，标记「基线未经体检」并在 UI 上如实显示，对齐 §6.6.2 `remoteRev` 的「不 await、失败静默」模式 |
+
+把第三行单独列出来是必须的：把「没能验证」当成「验证不通过」会让离线场景寸步难行，
+当成「验证通过」则等于这条检查不存在。
 
 ## 7. 更新流程 sync_in
 
@@ -947,7 +1152,7 @@ D8a  git branch -f svn/base HEAD        ← HEAD 此刻 detached 在 deliverRef 
                                            工作目录一个文件都不碰
 D8b  git checkout svn/base              ← 与 HEAD 同点，工作目录无变化
 D8c  git add -A -- <白名单>              ← 收进 D6 拉下来的他人改动（若有）
-     git commit --allow-empty -m "svn: r_new …  Svn-Rev: r_new"
+     git commit --allow-empty -m "svn: r_new … git-svn-id: <svnUrl>@r_new <uuid>"
 D8d  git checkout <ORIG_BRANCH>
      无 Local-Only commit：git merge --ff-only svn/base   ← 纯快进，不可能冲突
      有 Local-Only commit：git rebase --empty=drop svn/base
@@ -1429,7 +1634,7 @@ r12346，而 r12346 的内容 = 用户工作分支的当前状态。若察觉不
 git checkout svn/base   → 磁盘回到 r12345 的内容
 svn status              → 显示一堆「修改」（实为把 r12346 撤回 r12345）
 svn update              → 服务器没新东西，无事发生
-git add && git commit   → 落「新基线」，内容是旧的 r12345，却打上 Svn-Rev: 12346
+git add && git commit   → 落「新基线」，内容是旧的 r12345，却打上 …@12346
                           ⚠️ 基线从此撒谎
 后续交付                → 净变更含「把已提交过的内容再提交一遍」
                           → 可能覆盖别人在 r12346 之后的改动
@@ -1490,7 +1695,11 @@ revert 后: rootRev=1  nodeRevs={1}     ← 完全没变
 ⑤ 按 ④ 的结果执行：(a)(b)(c) 用显式文件列表 svn revert；
    toDelete 逐个**文件**删除，**绝不递归删目录**；全部删完后可以清理变空的目录本身
 ⑥ git add -A -- <白名单> && git commit --allow-empty
-                                        新基线，Svn-Rev 取自 ⑤ 之后重读的 nodeRevs
+                                        新基线，rev 取自 ⑤ 之后重读的 nodeRevs
+⑥b 基线体检（§6.8）                     此刻 HEAD 在 svn/base、工作区干净，正是
+                                        体检的前提。有差异则停在这里报错，
+                                        **不继续 ⑦**——恢复流程的全部目的就是修好
+                                        基线，不验证等于没修
 ⑦ git checkout <原分支>
    git rebase --empty=drop svn/base      已被误传上去的 commit 会变成空 commit，自动丢弃
 ⑧ git stash apply <OID>；成功后 drop 该条目并删掉钉住的 ref
@@ -1613,7 +1822,7 @@ git 管理的具体文件**，一个目录都没有。差集里的每一条都�
 ① 从缓存拿 SVN 序列，节点 ID = "svn:12346"，parents = ["svn:12345"]
 
 ② git log --all 拿本地全部 commit
-   凡 message 带 Svn-Rev: N 的（baseline commit）
+   凡 message 带 `git-svn-id: <url>@N <uuid>` 的（baseline commit）
      → 建立映射 <git hash> → "svn:N"
 
 ③ 重写所有 git commit 的 parents，按映射表替换
@@ -1744,6 +1953,8 @@ React 依赖、可直接单测。
 | **前置检查发现 detached HEAD** | 用户在 IDE 里切到了某个历史 commit（§8.1.1） | 不做任何修改 | 说明当前 HEAD 指向哪个 commit，建议 `git switch -c <name>` 或切回原分支 |
 | **D5 被 pre-commit 拒绝（revprop）** | 服务器不接受自定义 revprop（§8.6.3 形态 B） | 按 §8.5 完整回滚 D4 登记 | 原样展示 svn stderr，给出**需要用户明确确认**的「不带幂等键重试一次」选项；不确认就停下 |
 | **配置校验未过** | `svnUrl` UUID 不符、`baselineBranch` 非 `svn/base`、白名单含非法路径（§6.2.1） | **不做任何修改**，仓库不进入可用状态 | 指出是哪个字段、哪一条规则；`svnUrl` 不符时同时显示配置值与 `svn info` 实际值 |
+| **基线体检不通过**（§6.8） | 基线内容与服务器在 `baselineRev` 上的内容不符——假基线已经产生 | 按时机分：初始化时**整个回退、不创建 `.git`**；§9.4 第 ⑥b 步**停在那里不继续 ⑦**；Phase 1 R3b **中止，连 `svn/base` 指针都不动** | 列出差异文件（已剥掉 URL 前缀、剔除目录条目与纯属性条目，§6.8.4），说明是内容不符而非 revision 不符 |
+| **基线体检跑不成功** | 断网、认证失败、`svnUrl` 不可达 | **不阻断**，不做任何修改 | 标记「基线未经体检」并如实显示；**不得当成体检通过**（§6.8.6） |
 | **拿不到跨进程锁** | 同一工作副本上另一个 mygitclient 进程正在同步（§5.1.1） | 不做任何修改 | 显示持锁进程的 pid 与开始时间；pid 已不存在时提供「接管」入口并写日志 |
 | **D8d 不是快进**（无 Local-Only commit 时） | 前面某步的假设崩了 | 停下不动 | 报错并导出 journal，**不自动 merge** |
 | **D8d rebase 后仍有未标记 commit** | 该交付的东西没进交付树 | 停下不动 | 报错并导出 journal，列出这些 commit |
@@ -1804,7 +2015,7 @@ svn checkout file:///<tmp>/repo  <tmp>/wc2     ← 「同事」，用来制造�
 | 24 | **待交付历史含 merge commit 必须前置拒绝**：构造「Local-Only commit 夹在中间 + 历史里有一个 merge commit」的分支，断言 §8.1 #6 拒绝且**没有发生任何 git / svn 写操作**；再断言把补丁移到顶端后（走快路径）同一个仓库能正常交付（§8.1、§8.2.3） | 1、2、4 |
 | 25 | **临时 ref 不与用户分支冲突**：仓库里预先建一个名为 `deliver` 的普通分支，断言整条交付流程照常成功（§8.2.3 为什么不用 `deliver/<opid>` 分支） | 4 |
 | 26 | **交付成功后不得误报失同步**：走完整交付，断言 `rootRev != baselineRev`（必然）但状态判定为**正常**；再断言第一档只在 `rootRev` 真的变化时才触发全量校验（§6.6.2、§6.6.3） | 1、3 |
-| 27 | **初始化前置校验**：分别在「白名单内有 `M`」「有 `?`」「有 `A` 登记」「mixed-revision」四种工作副本上跑初始化，断言**全部被拒绝**且未创建 `.git`；再断言干净仓库上 `Svn-Rev` 取自 `nodeRevs` 而非根 revision（§6.5、§6.5.1） | 3 |
+| 27 | **初始化前置校验**：分别在「白名单内有 `M`」「有 `?`」「有 `A` 登记」「mixed-revision」四种工作副本上跑初始化，断言**全部被拒绝**且未创建 `.git`；再断言干净仓库上 `git-svn-id` 的 rev 取自 `nodeRevs` 而非根 revision（§6.5、§6.5.1） | 3 |
 | 28 | **外部删除后的恢复**：wc2 删除白名单文件并提交，wc1 外部 `svn update`，走 §9.4，断言该文件**不在**新基线里、磁盘上也没有；另测「用户自建未交付的新文件」在同一流程后**完好无损**（§9.4.1） | 1、2、4 |
 | 29 | **`svn add --parents` 的父目录被完整撤销**：新增三层嵌套目录下的文件，制造 D5 失败，断言回滚后 `svn status` 与 `svnStatusBefore` **逐条一致**（§8.5.1） | 2、4 |
 | 30 | **D4.9 拦住确认后的外部改动**：D3.8 之后、D5 之前用外部 git 切回 `origBranch`，断言 D4.9 中止交付、SVN 侧一个字节没动、D4 登记被完整撤销（§8.2.5） | 1、2、4 |
@@ -1821,6 +2032,10 @@ svn checkout file:///<tmp>/repo  <tmp>/wc2     ← 「同事」，用来制造�
 | 41 | **跨进程锁**：起两个进程同时对同一工作副本发起 `sync_out`，断言第二个被锁文件挡住并给出明确错误，journal 不被覆盖；再断言 pid 已消失的陈旧锁可被接管、pid 仍在的不可（§5.1.1） | 5 |
 | 42 | **配置校验**：`svnUrl` 指向另一个仓库（UUID 不符）、`baselineBranch` 非 `svn/base`、白名单含 `..` / 绝对路径 / `:(exclude)` / 空串——逐个断言在配置加载时就被拒绝，且**不发生任何 git / svn 命令**（§6.2.1） | 3、4 |
 | 43 | **`svn revert` 不被失同步检测发现**：外部 `svn revert` 后断言 `nodeRevs == baselineRev` 仍成立（即失同步检测**不报**），而 git 工作区状态变化能被报出（§9.3） | 1、3 |
+| 44 | **基线体检抓住假基线**：构造「磁盘已到 r2 但 `baselineRev` 仍是 1」，断言体检报出差异、流程按 §13 停在正确状态（初始化不创建 `.git`／§9.4 停在 ⑥b／Phase 1 不动指针）；同一仓库里只改**美术**文件时断言体检**不误报**（§6.8 T3／T4） | 1、3 |
+| 45 | **体检输出解析**：断言实现只取第 1 列（内容）、**剔除目录条目与纯属性条目**、剥掉 URL 前缀还原成仓库相对路径；用「服务器删掉嵌套目录下的文件」断言 `D` 条目被正确识别（§6.8.4、T7） | 1、3、11 |
+| 46 | **「跑不成」不等于「不通过」**：把 `svnUrl` 指向不可达地址，断言初始化与恢复流程**不被阻断**、状态标为「基线未经体检」，且**没有**被当成通过（§6.8.6） | 1、3 |
+| 47 | **`git-svn-id` trailer 解析**：断言三字段缺一（少 uuid／rev 非数字／无 `@`）即视为**非 baseline**，不猜、不部分接受；断言 trailer 里的 UUID 与 `svn info` 不符时按 §6.2.1 阻断（§6.4.1） | 1、3 |
 
 ### 14.3 前端
 
@@ -1874,6 +2089,15 @@ exclude 生成与图合成都在 Rust 侧，由 cargo test 覆盖。
     基线没错，错的是磁盘
 18. **Phase 1 的「重建基线」不会推进工作分支**。用户下次得自己 rebase 到新基线上。
     Phase 2 的 §9.4 才做完整编排
+19. **baseline 上的 `git-svn-id` trailer 不是 `git svn` 生成的**（§6.4.1）。用这个格式
+    是为了白送 UUID 记账和工具互操作，但 `.git/svn/` 里没有对应的 `rev_map`。用户若
+    自己在本仓库跑 `git svn init`，`git svn` 会按这些 trailer 解释历史，产生令人困惑
+    的行为。不损坏数据，但客户端不支持这种混用，也不检测它
+20. **基线体检只证明「磁盘 == 服务器」，不证明「git 跟踪的文件集合是对的」**
+    （§6.8.3）。exclude 规则写错那一类由 §14.2 第 6 项覆盖。两条检查不可互相冒充，
+    也不要因为体检通过就认为 §6.3 的规则一定正确
+21. **体检需要联网**。离线时基线只能停在「未经体检」状态（§6.8.6）。这是刻意的：
+    把「没能验证」当成「验证通过」等于这条检查根本不存在
 
 ## 16. 分期
 
@@ -1882,7 +2106,7 @@ exclude 生成与图合成都在 Rust 侧，由 cargo test 覆盖。
 | 期 | 内容 | 验收 |
 |---|---|---|
 | **Phase 0** | `trait Vcs` + `GitBackend`（现有代码搬家，**行为零变化**） | 现有全部测试绿 + 手工 E2E 与改动前无差异 |
-| **Phase 1** | 仓库识别、配置、exclude 生成、初始化向导、`SvnClient`（info / status / log 的 XML 解析）、状态判定与失同步检测（**只报警**）、**「重建基线」最小手段**、混合图只读 | 能打开 SVN 仓库，本地 git 的暂存/分支/stash 可用，看得到 SVN 历史。**还不能 update / deliver**；基线会因外部 TortoiseSVN 操作而失同步，此期只报警 + 提供「重建基线」 |
+| **Phase 1** | 仓库识别、配置、exclude 生成、初始化向导、`SvnClient`（info / status / log 的 XML 解析）、状态判定与失同步检测（**只报警**）、**「重建基线」最小手段**、**基线体检（§6.8）**、混合图只读 | 能打开 SVN 仓库，本地 git 的暂存/分支/stash 可用，看得到 SVN 历史。**还不能 update / deliver**；基线会因外部 TortoiseSVN 操作而失同步，此期只报警 + 提供「重建基线」 |
 | **Phase 2** | `sync_in` 完整流程 + 全部失败路径 + 中断持久化 + 冲突解决 UI + **§9.4 基线恢复向导**（复用同一套 stash / checkout / rebase 编排） | 能更新 |
 | **Phase 3** | `sync_out` + 确认关口 + 精确回滚 + 传输中断查证 + **本地补丁的摘除与回落**（§8.2.3） | 能交付，闭环 |
 | **Phase 4** | 白名单外改动视图与 revert、`.git` 误提交三层防护、svn 节点 diff | 补齐日常缺口 |
@@ -1905,7 +2129,10 @@ R1  校验：白名单内 svn status --no-ignore 干净、nodeRevs 单值 {N}
 R2  用一个**临时索引**把磁盘内容录成 tree，全程不碰真实 index、不碰 HEAD：
       GIT_INDEX_FILE=<tmp> git add -A -- <白名单>
       GIT_INDEX_FILE=<tmp> git write-tree                → TREE
-R3  git commit-tree TREE -p svn/base -m "svn: rN … Svn-Rev: N"   → NEWBASE
+R3  git commit-tree TREE -p svn/base -m "svn: rN … git-svn-id: <svnUrl>@N <uuid>"  → NEWBASE
+R3b 基线体检（§6.8）                                    ← 此刻 TREE 就是磁盘内容，
+                                                          前提成立；**有差异就中止**，
+                                                          连指针都还没动，代价为零
 R4  git update-ref refs/heads/svn/base NEWBASE          ← 只动指针
 R5  删掉临时索引文件
 ```
@@ -1957,6 +2184,43 @@ Phase 1 到 Phase 3 之间用户手工走 TortoiseSVN 交付时，本地补丁�
 误导性的错误上。
 
 ## 18. 修订记录
+
+### 2026-09-13（四）· 重新审视 `git svn`：论证被推翻，机制被借走
+
+用户指出「git 本身就能操作 SVN 仓库」（`git-svn` 文档）。核实之后：**D2 用来否决
+`git svn` 的理由是错的，结论侥幸是对的。**
+
+| | 内容 |
+|---|---|
+| 错在哪 | D2 写「几十 GB → 判死 `git svn clone`」。但 `--include-paths` / `--ignore-paths` 是 `git svn` 的正式选项，美术本来就不会进 git 对象库。**体积拦不住它** |
+| 真死因 | `git svn` **没有工作副本**，它直连服务器。而本设计要一个 Unity 能打开的目录、美术只能来自 SVN 工作副本，于是两套系统争夺同一批代码文件。唯一出路 `svn update --set-depth=exclude` 与 D6 的「路径 AND 扩展名」语义冲突——`Assets/Scripts/` 底下的 `.psd` 会**两边都不认领、直接从磁盘消失** |
+| 新发现的硬约束 | **Git for Windows 的 `git svn` 打不开 `file://` 仓库**（4 种 URL 写法 × fsfs format 6/7/8 全败，同一批 URL 用 `svn` CLI 全部成功；本机无 `svnserve`）。任何以 `git svn` 为核心的方案都会让 §14.1 的 fixture 策略当场失效 |
+| 必须承认的收益 | `git svn dcommit` 不吃 pathspec，**§8.3 空 target 与 §8.2.5 D4.9 竞态在它那里结构上不存在**。本方案只能靠断言挡住，这是选 Overlay 付的代价 |
+
+这一轮的教训与第三轮同类：**论证不写透，等于没写。** 一条只写了「几十 GB」的否决理由，
+半年内就被重新提出来一次；补上真死因和实测之后才算关上。
+
+借走的两条性质（不引入 `git svn` 本身）：
+
+- **基线必须能被服务器证伪**。`git svn` 的基线是 fetch 下来的，天然不撒谎；本设计的
+  基线由 `git add -A` 收磁盘而来，§18 第二轮那张「四个切面」表全是这一个根因。新增
+  §6.8 的基线体检，用 `svn diff --old=<url>@<rev> --new=<wc> --summarize` 直接证伪，
+  7 组 fixture 实测通过
+- **记账改用 `git svn` 的原生 trailer**：`Svn-Rev:` / `Svn-Url:` → `git-svn-id:
+  <url>@<rev> <uuid>`，白送 §6.2.1 要的 UUID 记账
+
+| 改动点 | 内容 |
+|---|---|
+| §1.2 / §2 D2 | 指向 §2.2；D2 那条影响改为「不构成否决 `git svn` 的理由」 |
+| §2.2（新增） | 为什么不是 `git svn`：错误的旧理由、真死因（无工作副本 + depth-exclude 与 D6 冲突）、`file://` 实测表与测试成本、如实承认它消灭的两个失败模式、借走的两条性质 |
+| §6.4 / §6.4.1（新增） | trailer 换成 `git-svn-id: <url>@<rev> <uuid>`，给出解析正则与三字段全有才算 baseline 的规则；写明混用 `git svn init` 的代价 |
+| §6.8（新增） | 基线体检：为什么需要、怎么做（含 7 组实测）、**证明不了什么**、输出解析的两个坑（URL 前缀、目录与纯属性条目）、四个时机、「跑不成 ≠ 不通过」 |
+| §6.5 / §9.4 / §16 | 初始化在首个基线之后、`checkout -b work` 之前体检；§9.4 新增 ⑥b；Phase 1 新增 R3b（在动指针之前，中止代价为零） |
+| 全文 | `Svn-Rev` / `Svn-Url` 的 10 处引用同步改为 `git-svn-id`（§18 历史记录里的原文不动） |
+| §13 | 新增「基线体检不通过」「基线体检跑不成功」两行 |
+| §14.2 | 新增测试项 44–47 |
+| §15 | 新增已知限制 19–21 |
+| §16 | 基线体检归入 Phase 1 |
 
 ### 2026-09-13（三）· 第三轮 review：修洞时新捅的洞
 
