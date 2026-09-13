@@ -61,6 +61,14 @@ fn dangerous_whitelist_entries_are_rejected() {
         ":(exclude)Assets", // git pathspec magic
         ".git/hooks",       // 以 .git 开头
         ".svn/wc.db",       // 以 .svn 开头
+        "./",               // 精确比较挡不住它，而 ./ 两边都等于「全部」
+        ".//",              // 同上
+        "./Assets",         // 首段是 .
+        "Assets/./Scripts", // 中间段是 .
+        ".SVN/wc.db",       // NTFS 大小写不敏感，会命中真实的 .svn
+        ".Git/hooks",       // 同上
+        "-rHEAD",           // 会被 svn 当成选项解析
+        "--version",        // 同上
     ] {
         assert!(
             normalize_whitelist_entry(bad).is_err(),
@@ -121,6 +129,28 @@ fn extensions_must_start_with_a_dot_and_carry_no_separators() {
     let mut cfg = ok_config();
     cfg.extensions = vec!["*".to_string()];
     validate(&cfg).unwrap();
+}
+
+#[test]
+fn an_unknown_version_is_rejected() {
+    // 与 baselineBranch 被钉死同一条理由：留一个不校验的字段，只会让「文件里
+    // 写的」与「代码假设的」不一致。这里一个版本语义差异会直接改变白名单的
+    // 含义，进而改变哪些文件受保护——比 custom_config 那个 version 严重得多。
+    let mut cfg = ok_config();
+    cfg.version = 2;
+    let err = validate(&cfg).expect_err("未知 version 必须被拒");
+    assert_eq!(err.code, "svn_config");
+    assert!(err.message.contains("version"));
+}
+
+#[test]
+fn a_wrong_mode_is_rejected() {
+    // §6.1 的仓库识别据 mode 判定这是不是混合仓库。
+    for bad in ["", "git", "svn", "svn_git"] {
+        let mut cfg = ok_config();
+        cfg.mode = bad.to_string();
+        assert!(validate(&cfg).is_err(), "mode={bad:?} 应当被拒绝");
+    }
 }
 
 #[test]

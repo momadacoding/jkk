@@ -15,6 +15,12 @@ use std::path::{Path, PathBuf};
 /// 全文所有流程都硬编码了它；字段保留只为向前兼容，值不是它就阻断（spec §6.2.1）。
 pub const BASELINE_BRANCH: &str = "svn/base";
 
+/// 本客户端认识的配置格式版本。
+pub const SUPPORTED_VERSION: u32 = 1;
+
+/// `mode` 的唯一合法值。§6.1 的仓库识别据它判定这是不是一个混合仓库。
+pub const SVN_GIT_MODE: &str = "svn-git";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SvnConfig {
@@ -79,6 +85,32 @@ pub fn read_config(repo_root: &str) -> Result<SvnConfig> {
 
 /// 校验一份**已规范化**的配置。
 pub fn validate(cfg: &SvnConfig) -> Result<()> {
+    // `version` 与 `mode` 必须校验，理由与 `baselineBranch` 被钉死成 `svn/base`
+    // 一模一样：留一个不校验的字段，只会让「文件里写的」与「代码假设的」不一致。
+    //
+    // 这里与 `engine::custom_config` 的做法**有意不同**——那边的 `version` 明确
+    // 写了「解析时不校验其值」，因为它最坏的后果是一个工具栏按钮不对；而这里
+    // 一个版本语义差异会直接改变白名单的含义，进而改变哪些文件受保护。
+    if cfg.version != SUPPORTED_VERSION {
+        return Err(GitError::new(
+            "svn_config",
+            format!(
+                "不支持的 version：{}（本客户端只认 {SUPPORTED_VERSION}）。\
+                 请确认这个配置文件是不是给更新版本的客户端写的",
+                cfg.version
+            ),
+        ));
+    }
+    if cfg.mode != SVN_GIT_MODE {
+        return Err(GitError::new(
+            "svn_config",
+            format!(
+                "mode 必须是 {SVN_GIT_MODE}，实际是 {:?}。\
+                 §6.1 的仓库识别据它判定这是不是一个混合仓库",
+                cfg.mode
+            ),
+        ));
+    }
     if cfg.svn_url.trim().is_empty() {
         return Err(GitError::new("svn_config", "svnUrl 不能为空"));
     }
@@ -158,19 +190,34 @@ pub fn normalize_whitelist_entry(raw: &str) -> Result<String> {
     if trimmed.chars().nth(1) == Some(':') {
         return reject("不能含盘符");
     }
-    if trimmed == "." || trimmed == ".." {
-        return reject("不能是 . 或 ..");
+    // ⚠️ **逐段判 `.` 与 `..`，不能只跟整串比。**
+    // `trimmed == "."` 这种精确比较挡不住 `"./"`——它不以 `:` / `/` 开头、第二个
+    // 字符不是 `:`、不等于 `.` 也不等于 `..`，会被原样放行。而 `./` 当 git
+    // pathspec 和当 SVN target **两边都等于「全部」**，正是 §12.2 与
+    // `AGENTS.md` §6.2 那次空 pathspec 事故同一类的东西。
+    // 顺带也覆盖了 `Assets/../../etc` 这种中间段上跳。
+    for seg in trimmed.split('/') {
+        if seg == "." || seg == ".." {
+            return reject("路径里不能含 . 或 .. 段（`./` 会退化成「整个仓库」）");
+        }
     }
-    // 逐段检查，挡住 `Assets/../../etc` 这种中间段上跳。
-    if trimmed.split('/').any(|seg| seg == "..") {
-        return reject("不能含 .. 段");
+    // `-` 开头的条目当 git pathspec 时有 `--` 分隔符保护，但当 **SVN target** 时
+    // 会被 svn 当成选项解析（`-rHEAD`、`--version`）。与上面的 pathspec magic
+    // 同一类，一并挡掉。
+    if trimmed.starts_with('-') {
+        return reject("不能以 - 开头（会被 svn 当成选项解析）");
     }
     // `.git` / `.svn` 开头：前者会让客户端把自己的元数据交出去，后者会让 SVN 的
-    // 工作副本数据库进 git。注意这**只挡条目本身**——深层的 `.svn`（白名单落在
-    // external 根时里面就有一个）由 §6.3 生成的 exclude 末尾那条兜底规则负责，
-    // 见 `engine::svn_exclude`。
+    // 工作副本数据库进 git。
+    //
+    // **大小写不敏感比较**：NTFS 不区分大小写，`.SVN/wc.db` 会在磁盘上命中真实的
+    // `.svn` 目录，精确比较等于这条守卫在 Windows 上根本不生效
+    // （`AGENTS.md` §8 把大小写不敏感列为本项目高发缺陷区）。
+    //
+    // 注意这**只挡条目本身**——深层的 `.svn`（白名单落在 external 根时里面就有
+    // 一个）由 §6.3 生成的 exclude 末尾那条兜底规则负责，见 `engine::svn_exclude`。
     let first = trimmed.split('/').next().unwrap_or("");
-    if first == ".git" || first == ".svn" {
+    if first.eq_ignore_ascii_case(".git") || first.eq_ignore_ascii_case(".svn") {
         return reject("不能以 .git 或 .svn 开头");
     }
     Ok(trimmed.to_string())

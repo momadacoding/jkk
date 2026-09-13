@@ -38,16 +38,32 @@ pub fn run_svn(path: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// 同 [`run_svn`]，但把**退出码交给调用方判断**，非零不算失败。
+/// 同 [`run_svn`]，但把**退出码和 stderr 都交给调用方判断**，非零不算失败。
 ///
-/// 与 `git_cli::run_git_code` 同一个理由：有些地方「非零」本身就是答案，
-/// 塌缩成同一个 GitError 就分不出来了。进程本身起不来仍然返回 `Err`。
-pub fn run_svn_code(path: &str, args: &[&str]) -> Result<(i32, String)> {
+/// ⚠️ **不要照抄 `git_cli::run_git_code` 只返回 `(code, stdout)` 的形状。**
+/// 那个形状对 git 成立，因为 git 用 1 与 128 区分「查询无结果」和「fatal」；
+/// **svn 没有这层区分**——各类失败基本一律退出 1，光看退出码分不出任何两种
+/// 失败。所以这里必须把 stderr 一起给出去，否则调用方拿到的信息还不如
+/// [`run_svn`]（后者至少把 stderr 包进了 GitError）。
+///
+/// 进程本身起不来仍然返回 `Err`。
+pub fn run_svn_code(path: &str, args: &[&str]) -> Result<SvnOutput> {
     let output = svn_command(path).args(with_global(args)).output()?;
     // 正常退出时 code() 必有值；拿不到只可能是被信号杀掉（Windows 上不存在），
     // 那种情况用 -1 表示「未知」，调用方不会把它误当成某个有意义的退出码。
-    let code = output.status.code().unwrap_or(-1);
-    Ok((code, String::from_utf8_lossy(&output.stdout).to_string()))
+    Ok(SvnOutput {
+        code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+/// 一次 svn 调用的完整结果。
+#[derive(Debug, Clone)]
+pub struct SvnOutput {
+    pub code: i32,
+    pub stdout: String,
+    pub stderr: String,
 }
 
 /// 把全局选项拼到调用方给的参数前面。
@@ -122,14 +138,50 @@ fn persistent_path_has_svn() -> bool {
         if !out.status.success() {
             return false;
         }
-        // reg query 的输出形如 `Path    REG_EXPAND_SZ    C:\a;C:\b`。
-        // 取不到值时整行没有分号，split 之后也不会命中，安全。
-        String::from_utf8_lossy(&out.stdout)
-            .split(';')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .any(dir_has_svn_exe)
+        path_dirs_from_reg_output(&String::from_utf8_lossy(&out.stdout))
+            .iter()
+            .any(|d| dir_has_svn_exe(d))
     })
+}
+
+/// 从 `reg query … /v Path` 的输出里抽出目录列表。
+///
+/// **不能直接把整段 stdout 按 `;` 切。** 实测输出是三行：
+///
+/// ```text
+/// <空行>
+/// HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Session Manager\Environment
+///     Path    REG_EXPAND_SZ    C:\第一个目录;C:\第二个目录;…
+/// ```
+///
+/// 整段 split 之后，**第一个 chunk 是「注册表键名 + 换行 + `Path REG_EXPAND_SZ ` +
+/// 第一个目录」**（2026-09-13 实测，45 个 chunk 里第一个正是这个形态）。`trim()`
+/// 只去首尾空白，中间的换行和键名还在，于是 `join("svn.exe").is_file()` 恒为 false
+/// ——**PATH 的第一个条目被静默吞掉**。
+///
+/// 这不是理论问题：安装器把自己 prepend 到 PATH 是常见做法，SVN 恰好排第一时，
+/// `probe_svn()` 会报 `NotInstalled` 并引导用户「去安装」，而这个函数存在的**唯一
+/// 理由**就是要在这种情况下说「重启应用」——两种引导正好相反。
+///
+/// 正确做法：先定位值所在的那一行，切掉类型标记（`REG_SZ` / `REG_EXPAND_SZ`）
+/// 之前的部分，再按 `;` 切。
+///
+/// **有意不加 `#[cfg(windows)]`**：它是纯字符串处理，在任何平台上都能编译，
+/// 这样 `tests/svn_cli.rs` 不必按平台分叉就能覆盖它。调用方才是 Windows 专属的。
+pub fn path_dirs_from_reg_output(raw: &str) -> Vec<String> {
+    for line in raw.lines() {
+        // 类型标记两侧是若干空格；取标记之后的全部内容就是值本身。
+        for marker in ["REG_EXPAND_SZ", "REG_SZ"] {
+            if let Some(idx) = line.find(marker) {
+                return line[idx + marker.len()..]
+                    .split(';')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+        }
+    }
+    Vec::new()
 }
 
 /// 非 Windows 平台上没有「持久 PATH 与进程 PATH 不一致」这回事——shell 的 rc

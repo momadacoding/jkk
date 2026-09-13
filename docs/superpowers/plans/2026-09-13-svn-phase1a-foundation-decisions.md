@@ -23,7 +23,8 @@
 | 1 svn CLI 封装与可用性探测 | ✅ 完成 | `engine/svn_cli.rs`、`engine/mod.rs`、`tests/svn_cli.rs` | fmt ✓ clippy 零告警 ✓ `--test svn_cli` 4 passed ✓ `cargo test` **230 passed / 0 failed**（= 226 + 4） |
 | 2 `--xml` 解析（roxmltree） | ✅ 完成 | `engine/svn_xml.rs`、`engine/mod.rs`、`Cargo.toml`、`tests/svn_xml.rs` | fmt ✓ clippy 零告警 ✓ `--test svn_xml` **8 passed**（计划写的是 6，对齐真实输出后加了 2）✓ `cargo test` **238 passed / 0 failed**（= 230 + 8） |
 | 3 配置文件读取与校验 | ✅ 完成 | `engine/svn_config.rs`、`engine/mod.rs`、`tests/svn_config.rs` | fmt ✓ clippy 零告警 ✓ `--test svn_config` **14 passed**（计划写的是 8）✓ `cargo test` **252 passed / 0 failed**（= 238 + 14） |
-| 4 嵌套 WC 枚举与 P4 | ⬜ 未开始 | | |
+| 4 嵌套 WC 枚举与 P4 | ✅ 完成 | `engine/svn_wc.rs`、`engine/mod.rs`、`tests/svn_wc.rs`、`tests/common/svn_fixtures.rs` | fmt ✓ clippy 零告警 ✓ `--test svn_wc` **6 passed** ✓ `cargo test` **264 passed / 0 failed**（= 226 + 38） |
+| — review 修复（7 条） | ✅ 完成 | `svn_cli.rs`、`svn_config.rs`、`svn_xml.rs` + 各自测试 | 见下方「独立 review」一节；测试数 svn_cli 4→8、svn_config 14→16 |
 | 5 exclude 规则生成 | ⬜ 未开始 | | |
 | 6 纳入集合核对 | ⬜ 未开始 | | |
 | 7 仓库识别 / capabilities / backend_for 分流 | ⬜ 未开始 | | |
@@ -45,6 +46,32 @@
 `.claude/worktrees/` 已在 `.gitignore` 第 2 行（Phase 0 时加的），不需要再处理。
 
 ---
+
+## 独立 review（2026-09-13，Task 1–3 之后）
+
+按 CLAUDE.md「每完成一个非平凡里程碑先跑一次 review 再继续」，在 Task 1–3 落地、
+Task 4 开始真正调 svn 之前跑了一次 `/code-review high`。**7 条发现，逐条核实后
+全部成立，无一需要反驳，全部已修。**
+
+| # | 级别 | 问题 | 修法 |
+|---|---|---|---|
+| 1 | Medium | `persistent_path_has_svn` 把整段 `reg query` 输出按 `;` 切，**第一个 chunk 是「注册表键名 + 换行 + `Path REG_EXPAND_SZ ` + 第一个目录」**，`trim()` 去不掉中间的换行，于是 **PATH 的第一个条目被静默吞掉** | 抽出 `path_dirs_from_reg_output()`：先定位含 `REG_EXPAND_SZ` / `REG_SZ` 的那一行，切掉类型标记之前的部分再按 `;` 切。函数**有意不加 `#[cfg(windows)]`**（纯字符串处理），这样测试不必按平台分叉 |
+| 2 | Medium | `"./"` 绕过校验：`trimmed == "."` 是精确比较，`"./"` 不等于 `"."`，被原样放行——而 `./` 当 git pathspec 和当 SVN target **两边都等于「全部」** | `.` / `..` 改为**逐段**判断，顺带覆盖 `Assets/./Scripts` |
+| 3 | Medium | `parse_node_revs` 的注释说「external 根没有 revision，跳过」，会让人以为 externals 已被处理。实际那只对**根节点**成立，external **内部**节点都带 revision 且来自另一个仓库的序列 | 在函数文档里加「输入必须来自带 `--ignore-externals` 的 status」硬契约，并写明同模块的 `parse_external_roots` 要的恰恰相反、两者签名分不出来，取数统一走 `svn_wc` |
+| 4 | Medium | **我自己写的假绿测试**：`info_must_not_receive_ignore_externals` 在非工作副本上只断言 `code != 0`，而那种目录下不带该参数的 `svn info` 同样退出 1。就算哪天 svn 开始接受这个参数，测试照样绿 | 改到真实 fixture 工作副本上跑，加**对照组**（不带该参数必须成功）并断言 stderr 含 `doesn't accept option`；另加 `status_and_update_do_accept_ignore_externals` 覆盖表的另一半 |
+| 5 | Low-Med | `run_svn_code` 只返回 `(code, stdout)`，照抄了 `run_git_code` 的形状。但 git 靠 1 vs 128 区分失败类型，**svn 基本一律退出 1**，光看退出码分不出任何两种失败——这正是 #4 只能做无判别力断言的原因 | 改成返回 `SvnOutput { code, stdout, stderr }` |
+| 6 | Low | `version` / `mode` 声明了字段却从不校验。`"version": 2` 会被当 v1 语义静默接受 | 加 `SUPPORTED_VERSION` / `SVN_GIT_MODE` 两个常量并校验。**与 `engine::custom_config` 有意不同**——那边最坏后果是一个按钮不对，这里版本语义差异会直接改变哪些文件受保护 |
+| 7 | Low | `.git` / `.svn` 前缀判断大小写敏感，NTFS 下 `.SVN/wc.db` 会命中真实目录 | 改 `eq_ignore_ascii_case`；顺带补上「不能以 `-` 开头」（当 SVN target 时会被当成选项，git 侧有 `--` 保护但 svn 侧没有） |
+
+**#1 与 #4 的共同点值得单独记**：两者都落在我自己在 Task 1 就写明的覆盖盲区上
+（`StalePath` / `NotInstalled` 无测试）。盲区如实记了下来，但**记下来不等于挡住了**
+——真正让缺陷暴露的是 review。现在 #1 的解析逻辑已有直接测试覆盖，盲区缩小到
+「两条分支的端到端行为」，仍待 Task 9 的真实窗口验证。
+
+reviewer 另外排除了两条疑虑，一并记下免得以后重新怀疑：`child_text` 用
+`Node::text()` 只取第一个文本子节点，查过 roxmltree 0.21.1 的 `append_text` /
+`merge_text`，字符实体会被合并进同一个文本节点，不会截断 URL/UUID；`Cargo.lock`
+里 roxmltree 的依赖只有已在树里的 `memchr`，无 ghost dependency。
 
 ## 决策条目
 
@@ -245,6 +272,45 @@
 - 校验**只拒绝、不改写**用户的配置：`normalize_whitelist_entry` 唯一的改写是
   `\` → `/` 与去首尾空白，其余一律报错让用户自己改（对齐 §6.2.1「不猜、不自动
   改写」）。
+
+### Task 4：嵌套工作副本枚举与 P4
+
+#### 偏离计划
+
+- **fixture 从 `tests/svn_fixtures.rs` 挪到 `tests/common/svn_fixtures.rs`。**
+  cargo 会把 `tests/` 下的每个 `.rs` 都当成一个独立测试目标，而这个文件里一个
+  `#[test]` 都没有——照计划放会多出一个 0 测试的幽灵二进制，而 Task 9 要按
+  **二进制个数**与基线对账，那个幽灵会把数字搅混。cargo 不递归发现子目录，
+  放进 `common/` 既消除幽灵又是 Rust 的惯用做法。引用方式相应改成
+  `#[path = "common/svn_fixtures.rs"]`。
+
+- **测试从 4 个加到 6 个。** 多出来的两条都是在补 fixture 自身的可信度与边界：
+  - `the_two_nested_wcs_really_belong_to_different_repositories`：如果 fixture
+    造错了（external 指回同一个仓库），P4 那条断言会因为「本来就该通过」而假绿。
+    这条把 fixture 自身的正确性也钉住。
+  - `a_whitelist_entry_that_is_a_file_still_resolves_to_its_working_copy`：
+    白名单可以是单个文件（§6.3），`svn info` 对文件同样给 root 与 uuid。
+
+#### 计划没写的坑
+
+- **去重必须同时看 `out` 和 `pending`。** 计划的伪码只查了 `out`，但一个
+  external 可能被两条白名单同时覆盖到，两次都还没处理完就会被重复压栈。
+  实现里两个都查。
+
+- **`wc_root` 的尾斜杠必须去掉，而配置侧必须保留——两处规则相反，不能互相套用。**
+  `wc_root` 是拿来当 svn target 和做相等比较的键，`Code` 与 `Code/` 必须是同一个；
+  而配置里的尾斜杠承载「目录 vs 单文件」的语义（§6.3）。已在 `normalize()` 的
+  注释里写明这个区别。
+
+#### 为什么这么改是安全的
+
+- `enumerate_wcs` 与 `check_single_repository` **只发 `svn info` 与 `svn status`
+  两条只读命令**，不写任何东西。
+- 空白名单在函数开头就返回空列表，**一条 svn 命令都不发**（§12.2）。
+- P4 失败时**只报错不修改**任何状态——它的定位就是「不让用户白走完整个确认流程
+  才在 D5 撞墙」。
+- fixture 全部在 `TempDir` 里自建 `svnadmin create` 仓库，跑完即删，不碰本仓库、
+  用户仓库或任何仓库外的固定路径。
 
 ---
 

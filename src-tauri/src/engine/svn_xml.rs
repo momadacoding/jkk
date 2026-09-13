@@ -71,6 +71,23 @@ pub fn parse_info(xml: &str) -> Result<Vec<SvnInfoEntry>> {
 
 /// 从 `svn status -v --xml` 里取每个已版本控制节点的 revision 集合。
 ///
+/// # ⚠️ 输入必须来自带 `--ignore-externals` 的 status
+///
+/// 本函数**不区分**节点属于哪个工作副本——它看到什么就收什么。调用方必须保证
+/// 输入是 `svn status -v --xml --ignore-externals -- <target>` 的产物。
+///
+/// 不带那个参数的话，external **内部**的节点会一起进来，而它们的 revision 来自
+/// **另一个仓库的序列**（实测 `{29825, 1938156}`）。后果是 `nodeRevs` 永久多值
+/// → 永久误报失同步、初始化向导永远过不去，而且**看起来完全正常**
+/// （spec §6.6.4 陷阱一）。
+///
+/// 这个坑之所以容易踩：同模块的 [`parse_external_roots`] 要的恰恰是**不带**
+/// `--ignore-externals` 的输出，而两个函数都只收 `&str`，签名上分不出来。
+/// 拿同一份 status 输出喂给两者是最自然、也最危险的写法。
+/// **取数请统一走 `engine::svn_wc`，不要在调用点各自拼 svn 命令。**
+///
+/// # 取哪个 revision
+///
 /// **取 `<wc-status revision>`，不是 `<commit revision>`。** 前者是该节点在工作
 /// 副本里处于哪个 revision，后者是它最后被改动是哪个 revision；实测同一个工作
 /// 副本里前者 1 个取值、后者 2194 个取值，取错就是永久误报（spec §6.6.4 陷阱二）。
@@ -81,8 +98,12 @@ pub fn parse_node_revs(xml: &str) -> Result<BTreeSet<i64>> {
     let doc = parse_doc(xml)?;
     let mut revs = BTreeSet::new();
     for st in doc.descendants().filter(|n| n.has_tag_name("wc-status")) {
-        // external 根的 wc-status 没有 revision 属性。跳过而不是记成 0——
+        // external **根**的 wc-status 没有 revision 属性，跳过而不是记成 0——
         // 0 会凭空造出一个多值集合，把正常仓库判成 mixed-revision。
+        //
+        // ⚠️ 这条只处理 external 的**根节点**。它**不能**替代 `--ignore-externals`：
+        // external **内部**的节点都是带 revision 的，跳过逻辑碰不到它们。见上方
+        // 的输入契约。
         let Some(raw) = st.attribute("revision") else {
             continue;
         };
