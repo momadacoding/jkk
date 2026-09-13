@@ -16,7 +16,7 @@
 | 1 `git_cli` 支持环境变量 | ✅ 完成 | `src-tauri/src/engine/git_cli.rs`、`src-tauri/tests/git_cli.rs` | `cargo test --test git_cli` 5 passed；全量 `cargo test -j 2` **318 passed / 0 failed / 28 个二进制**（= 基线 316 + 新增 2）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓ |
 | 2 `svn_xml` 三个新解析器 | ✅ 完成 | `src-tauri/src/engine/svn_xml.rs`、`src-tauri/tests/svn_xml.rs` | `cargo test --test svn_xml` 27 passed；全量 **332 passed / 0 failed / 28 个二进制**（= 318 + 新增 14）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓ |
 | 3 P1/P2/P3 硬门槛 | ✅ 完成 | `svn_preflight.rs`（新）、`svn_xml.rs`、`svn_wc.rs`、`engine/mod.rs`、`tests/svn_preflight.rs`（新）、`tests/common/svn_fixtures.rs` | `cargo test --test svn_preflight` 10 passed；全量 **342 passed / 0 failed / 29 个二进制**（= 332 + 新增 10）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓；另做了一轮变异测试验证两条关键断言有牙 |
-| 4 P5 externals 钉死检测 | ⬜ 未开始 | | |
+| 4 P5 externals 钉死检测 | ✅ 完成 | `svn_externals.rs`（新）、`engine/mod.rs`、`tests/svn_externals.rs`（新）、`tests/common/svn_fixtures.rs` | `cargo test --test svn_externals` 10 passed；全量 **352 passed / 0 failed / 30 个二进制**（= 342 + 新增 10）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓；变异测试确认 `@N` peg 判据有牙 |
 | 5 基线录制（临时索引 / trailer） | ⬜ 未开始 | | |
 | 6 §6.8 基线体检 | ⬜ 未开始 | | |
 | 7 初始化向导编排与回退 | ⬜ 未开始 | | |
@@ -405,3 +405,85 @@ svn 输出的形态，手写理想 XML 等于没测」，而计划里那六段�
   `StatusEntry` 加字段。没有改动任何既有函数的行为。全量
   `cargo test -j 2` = 342 passed / 0 failed / 29 个二进制，相对 Task 2 的 332
   多的正好是新增的 10 条，无回归。
+
+---
+
+## Task 4：P5 —— `svn:externals` 钉死检测
+
+新增 `engine/svn_externals.rs`：`parse_external_line`（纯函数）+ `detect_pinned`。
+**全模块不返回阻断性错误**——P5 命中只是切到 pinned 模式（spec §6.5.3）。
+
+#### 偏离计划
+
+- **`detect_pinned` 的过滤条件做成了双向的。** 计划和 spec 的说法都是「白名单
+  **所在**的 external」（external 包住白名单）。实现里额外收了反方向：白名单包住
+  external 的情况也报。
+
+  理由：那条 external 的内容一样会进基线（白名单覆盖到它），一样会被项目根的递归
+  update 退回 peg（§6.5.3 测点 C），一样需要 pinned 模式的两步 update 显式点名它。
+  只收单向会在「`Code/` 底下挂着一条被钉死的 external」这种形态下漏掉。
+  与白名单**无交集**的 external 仍然不报——报了只是噪音，还会让用户以为得去改一个
+  跟自己无关的定义。
+
+- **计划的 Interfaces 里 `parse_external_line` 返回 `Option<ExternalDef>`，但
+  `ExternalDef` 本身没定义。** 补上了：`{ local_path, url, pinned_rev }`。
+  `url` 是剥掉 peg 后缀的原文，`local_path` 正斜杠归一。
+
+#### 计划的错误
+
+无。Task 4 的判据（`-r <N>` 记号**或** URL 带 `@<N>`）和五种写法的实测结论都对得上。
+
+#### 计划没写的坑
+
+- **`-r` 与 `@` 同时出现时取哪个。** `-r` 是 operative revision、`@` 是 peg，
+  内容来自前者，所以 `operative.or(peg)`。计划只说了「二者有其一即算钉死」，
+  没说都有时报哪个。补了一条测试 `an_operative_revision_wins_over_the_peg_...`。
+
+- **不能一见 `@` 就当 peg。** `^/team@home/lib` 是合法路径；按「有 `@` 就是 peg」
+  写会把 URL 截断成 `^/team`，还凭空报出一条「钉死」。判据必须是「最后一个 `@`
+  之后**全是数字**」。这和 1a 的 `peg_safe` 是同一族坑的两面：那边是「`@` 会被
+  SVN 当 peg 解析，所以要加空后缀」，这边是「不是每个 `@` 都是 peg」。
+  空 peg 后缀（`^/lib@`）也顺带处理成「不是钉死」。
+
+- **哪个 token 是 URL 只能看长相，不能看位置。** 新旧格式字段顺序相反且可以混在
+  同一个属性值里。实现用 `looks_like_url`（`^/` / `//` / `/` / `../` / 含 `://`），
+  并要求去掉 `-r N` 之后**正好剩两个 token、且其中正好一个像 URL**；
+  两个都像或都不像就返回 `None`，不猜。
+
+- **`propget svn:externals -R` 必须从仓库根跑，不能只查白名单子树。** 要找的那条
+  external 定义在白名单**上方**（`Code` 本身就是一条 external 时，定义在根上）。
+  代价是它会遍历整个工作副本；这是一次性的向导步骤，可接受。
+
+- **fixture 里 `svn update` 会失败，且是预期内的。** 五行定义里
+  `pinD -r1 ^/lib` 是旧格式配 `^/` 相对 URL，spec §6.5.2 实测说这种签出直接失败。
+  所以 fixture 用 `try_svn` 发这条 update 并忽略结果——检测走的是**属性文本**，
+  不是磁盘上签出来的东西，那条失败不影响被测行为。
+  用 `run`（断言成功）的话整个 fixture 会 panic。
+
+- **变异测试**：把 `split_peg` 的 peg 分支短路成 `None` →
+  只有 `all_five_pinning_forms_are_detected` 和
+  `detect_pinned_reports_the_four_pinned_ones_and_not_the_following_one` 失败，
+  `an_operative_revision_wins_over_the_peg_when_both_are_present` 仍通过
+  （它靠 `-r2`，不靠 peg）——三条的分工确实是分开的。变异已撤销。
+
+#### 为什么这么改是安全的
+
+- **只发一条只读命令**：`svn propget svn:externals -R --xml`。没有 `propset`、
+  没有 `update`、没有任何会改动工作副本或仓库的调用。
+- **本模块不返回阻断性错误**，符合 spec §6.5 对 P5 的定性（「命中不阻断」）。
+  唯一的 `Err` 来源是 `run_svn` 本身失败或 XML 解析失败。
+- 新 fixture `svn_repo_with_five_external_forms` 在 `TempDir` 里自建仓库，跑完即删；
+  写 externals 属性用 `std::fs::write` 写死 `\n`，避开 E10 那个「混合行尾 →
+  `E135000` → 属性静默没设上 → 测试假绿」的坑，而
+  `detect_pinned_reports_the_four_pinned_ones...` 这条测试本身就是该坑的守卫
+  （属性没设上时它返回空列表，测试立刻红）。
+- 纯新增模块，没有改动任何既有代码。全量 `cargo test -j 2` = 352 passed /
+  0 failed / 30 个二进制，相对 Task 3 的 342 多的正好是新增的 10 条，无回归。
+
+#### 记账给后面
+
+**spec §6.5.2「手段二：行为校验」本期不做。** 它要在一次真实 `svn update` 成功
+之后比对「白名单所属 WC 的 revision」与「该仓库当时的 HEAD」，而本期根本不发
+`update`（那是 §7.3 的 S5，属同步流程）。spec 说两条手段「都要实现」，所以这是一处
+**有意的未完成**，不是遗漏：手段一负责阻断/判定，手段二负责兜住手段一的盲区。
+已写进 `svn_externals.rs` 的模块注释，记账给 Phase 2。

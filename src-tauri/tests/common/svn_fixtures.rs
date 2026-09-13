@@ -249,6 +249,61 @@ pub fn svn_repo_with_svn_ignored_non_code_file() -> SvnFixture {
     fx
 }
 
+/// `Code/` 上挂五条 external，把 spec §6.5.2 的五种写法一次摆齐。
+///
+/// 一条跟随 HEAD（`follow`），四条用四种不同语法钉在 r1。
+///
+/// ⚠️ **属性值必须是一致的行尾。** 实测 E10：混合行尾会让 `svn propset` 报
+/// `E135000: Inconsistent line ending style`，属性静默没设上，测试会拿到一个
+/// 「这个仓库没有 externals」的假绿。Rust 侧 `std::fs::write` 写死 `\n` 即可。
+pub fn svn_repo_with_five_external_forms() -> SvnFixture {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    run(&root, "svnadmin", &["create", "repo"]);
+    let url = file_url(&root.join("repo"));
+    run(
+        &root,
+        "svn",
+        &["checkout", &url, "wc1", "--non-interactive"],
+    );
+    let wc = root.join("wc1");
+    std::fs::create_dir_all(wc.join("Code")).unwrap();
+    std::fs::create_dir_all(wc.join("lib")).unwrap();
+    std::fs::write(wc.join("Code/A.cs"), "a\n").unwrap();
+    std::fs::write(wc.join("lib/L.txt"), "l\n").unwrap();
+    run(&wc, "svn", &["add", "Code", "lib", "--non-interactive"]);
+    run(&wc, "svn", &["commit", "-m", "r1", "--non-interactive"]);
+    run(&wc, "svn", &["update", "--non-interactive"]);
+
+    let ext = root.join("externals.txt");
+    std::fs::write(
+        &ext,
+        "^/lib follow\n-r1 ^/lib pinA\n-r 1 ^/lib pinB\n^/lib@1 pinC\npinD -r1 ^/lib\n",
+    )
+    .unwrap();
+    run(
+        &wc,
+        "svn",
+        &[
+            "propset",
+            "svn:externals",
+            "-F",
+            ext.to_str().unwrap(),
+            "Code",
+            "--non-interactive",
+        ],
+    );
+    run(
+        &wc,
+        "svn",
+        &["commit", "-m", "five external forms", "--non-interactive"],
+    );
+    // 旧格式 + `^/` 相对 URL（`pinD -r1 ^/lib`）签出会失败，spec §6.5.2 记了这件事。
+    // 那条定义本来就没法用，不该让整个 fixture 挂掉——检测走的是属性文本，不是磁盘。
+    try_svn(&wc, &["update", "--non-interactive"]);
+    SvnFixture { dir }
+}
+
 /// 建一个有三个 revision 的仓库，返回它的 `file://` URL。`Code/A.cs` 每次都改。
 fn seed_three_revisions(root: &Path) -> String {
     run(root, "svnadmin", &["create", "repo"]);
