@@ -1,7 +1,7 @@
 # SVN + Git 混合模式 设计规格
 
 - 日期：2026-09-12
-- 状态：设计已确认，未实现。已过三轮对抗性 review + 三轮外部事实复核（`git svn` 方案 / 真实远端工作副本 / externals 布局），结论全部修入，见 §18
+- 状态：设计已确认，未实现。已过四轮对抗性 review + 三轮外部事实复核（`git svn` 方案 / 真实远端工作副本 / externals 布局），结论全部修入，见 §18
 - 前置可行性（P4 不跨仓库、P5 代码 external 未被钉住）**已于 2026-09-13 由用户确认通过**，见 §16.0
 - 分期：见 §16。本文覆盖全部 5 期的架构，各期另出实现计划
 
@@ -306,11 +306,28 @@ worktree、tag、remote 分支、PR、cherry-pick、revert 在 SVN 模式下没�
 - 所有调用带 `--non-interactive`。理由与 `GIT_TERMINAL_PROMPT=0` 完全相同：
   GUI 应用没有终端，svn 一旦等待 stdin 输入凭据就会永久挂死并占住 Tauri 线程池
 - 需要机器可读输出的一律用 `--xml`（`info` / `status` / `log`）
-- **`status` / `info` / `update` 一律带 `--ignore-externals`**。不带会让 externals
-  指向的**另一个仓库**的节点混进状态判定，后果见 §6.6.4。`diff` 不接受这个选项，
-  也不需要（实测不递归进 externals）。
-  ⚠️ 这条的作用域是「**在白名单所属的那个工作副本内部**」——白名单本身可能就落在
-  某个 external 里，那时从项目根加 `--ignore-externals` 会把白名单整个跳过，见 §6.6.5
+- **`--ignore-externals` 按子命令区分，不能「一律带」。** 实测（2026-09-13，
+  SlikSvn 1.14.2）各子命令的参数集：
+
+  | 子命令 | 接受 `--ignore-externals` | 本设计怎么用 |
+  |---|---|---|
+  | `status` | ✅ | **必须带**。不带会让 externals 指向的**另一个仓库**的节点混进 `nodeRevs`，后果见 §6.6.4 |
+  | `update` | ✅ | **必须带**（仅 pinned 模式下的根级 update，见 §6.5.3）；D6 / S5 的常规用法见各自章节 |
+  | `info` | ❌ **拒绝** | **绝不带**。它默认就不遍历 externals，externals 要靠 opt-in 的 `--include-externals` 才进来，所以本来就不需要这个参数 |
+  | `log` | ❌ 无此选项 | 不适用 |
+  | `diff` | ❌ **拒绝** | 不需要（实测不递归进 externals） |
+
+  ```text
+  svn info --xml --ignore-externals .
+    → Subcommand 'info' doesn't accept option '--ignore-externals'   exit 1
+  ```
+
+  这不是可有可无的写法问题：`svn info` 是仓库识别（§6.2.1 的 UUID 校验）、
+  `rootRev`（§6.6.2）和记账单位判定（§6.6.5）的唯一入口，**多带一个参数会让这三处
+  全部以 exit 1 失败**，仓库根本打不开。
+  ⚠️ `status` / `update` 那条的作用域是「**在白名单所属的那个工作副本内部**」——白名单
+  本身可能就落在某个 external 里，那时从项目根加 `--ignore-externals` 会把白名单整个
+  跳过，见 §6.6.5
 - **`--xml` 的输出必须用真正的 XML parser 解析，禁止行内正则。** svn 把每个属性单独
   放一行，`<wc-status` 与 `revision="…"` 不在同一行，行内正则会静默扫出空集，见 §6.6.4
 - 错误映射为 `crate::error::GitError`，不向前端抛裸字符串
@@ -426,6 +443,20 @@ svnUrl 写错（复制了另一个项目的地址）
 UUID**（`svn info --xml` 的 `<uuid>`）。UUID 才是仓库身份，URL 可能因为代理、镜像、
 `http` / `https` 而写法不同。不一致一律阻断，不猜、不自动改写。
 
+⚠️ **白名单落在多个嵌套工作副本里时，`svnUrl` 只是其中一个 WC 的 URL**（§6.6.5），
+它代表不了整体。所以：
+
+| 用途 | 用哪个 URL |
+|---|---|
+| 配置校验（UUID 比对） | **每个 `wc(P)`** 各比一次，全部 UUID 必须相同（§6.5 P4、§6.5.5） |
+| `remoteRev`（`svn info --xml <URL>`） | 任一 WC 的 URL 都可以——它返回的是**仓库 HEAD**，与子树无关 |
+| §6.8 基线体检的 `--old=` | **每个 `wc(P)` 用它自己的 `url(P)`**（§6.6.5） |
+| **§8.6.2 的断网查证** | **`Repository Root`**，不是 `svnUrl`。子树 URL 的 `svn log` 看不到只碰了别的 WC 的那次提交，实测见 §8.6.2 |
+| 基线 trailer 的 `<url>` | `Repository Root`（§6.4.1） |
+
+`svnUrl` 因此退化成「一个用来做 UUID 交叉校验的锚点」，**不要**再把它当成「这个仓库
+的地址」直接拼进命令。
+
 其余字段：
 
 | 字段 | 规则 |
@@ -463,7 +494,32 @@ UUID**（`svn info --xml` 的 `<uuid>`）。UUID 才是仓库身份，URL 可能
 !/Assets/Scripts/**/          ← 必须有！重新纳入所有中间目录
 !/Assets/Scripts/**/*.cs
 !/Assets/Scripts/**/*.meta
+.svn/                         ← 必须有，且必须在最后一行！见下
 ```
+
+#### 为什么 `.svn/` 必须排在最后一行
+
+白名单**可以**落在 external 内（§6.5 P4），而 external 根自己就有一个真实的 `.svn`
+目录（§6.6.5 E1）。上面那条 `!/Assets/Scripts/**/` 重新纳入了白名单内部的**所有**
+子目录，`.svn` 也在其中；之后只要有任何一条再入规则命中它里面的文件，SVN 的元数据
+就会进 git 对象库。
+
+`git check-ignore` 的裁决规则是**最后一条匹配的模式说了算**，所以 `.svn/` 必须放在
+所有再入规则**之后**；不带前导 `/` 则在任意深度生效。
+
+2026-09-13 临时 git fixture 实测，白名单 `Code/`：
+
+| 配置 | 无 `.svn/` 兜底时 `git ls-files` | 补上之后 |
+|---|---|---|
+| `extensions: [".cs", ".db"]` | 含 `Code/.svn/wc.db` ❌ | 只有 `.cs` ✅ |
+| `extensions: ["*"]`（§6.3 明文推荐的全纳入写法） | 含 `Code/.svn/wc.db`、`Code/.svn/pristine/aa/*.svn-base` ❌ | 只有代码文件 ✅ |
+
+补上之后 `git check-ignore -v Code/.svn/wc.db` → `.git/info/exclude:6:.svn/`。
+
+**后果不是「恢复一份旧的 SVN 数据库」，而是直接损坏工作副本。** 一旦 `wc.db` 被 git
+跟踪，任何一次 `git checkout` 都会在一个**正在使用的** SVN 工作副本底下把它换成另一个
+版本。§6.2.1 那条「拒绝以 `.svn` 开头的白名单路径」拦不住这种情况——它校验的是用户写的
+条目本身，而这里是递归再入规则在深层命中的。
 
 #### 为什么 `!/Assets/Scripts/**/` 这一行不能省
 
@@ -490,6 +546,72 @@ git 的硬规则：**父目录被排除后，其中的文件无法再被重新�
 配置 → 用真实 git fixture 断言 `git ls-files` 的结果，**必须覆盖至少两层嵌套目录**，
 含 Windows 反斜杠形态的输入。断言对象是 git 的实际行为，不是生成出来的规则文本——
 测规则文本等于没测。
+
+#### 6.3.1 工作目录里的 `.gitignore` 优先级高于 `.git/info/exclude`
+
+§3 那句「白名单配置和生成的忽略规则都放在 `.git/` 内部，**不用**工作目录里的
+`.gitignore`」说的是**我们不写**它，不是 git 不读它。git 的忽略源优先级是：
+
+```text
+命令行 pathspec  >  工作树里的 .gitignore（越深越优先）  >  .git/info/exclude  >  core.excludesFile
+```
+
+所以 `core.excludesFile`（用户全局配置）那侧不用管，**但工作树里任意一层的
+`.gitignore` 都会盖掉我们生成的再入规则**。SVN 工作副本里完全可能已经躺着一个——
+团队提交过、或者从别处拷来的 Unity 模板。
+
+2026-09-13 临时 git fixture 实测，白名单 `Code/` + `extensions: [".cs"]`：
+
+```text
+Code/.gitignore 内容为一行 *.cs
+  git ls-files                     → 空
+  git check-ignore -v Code/Top.cs  → Code/.gitignore:1:*.cs   Code/Top.cs
+```
+
+这正是上面刚说过的「最危险的一类缺陷」的另一条路径：**用户以为源码受 git 保护，
+实际上一个都没进去**。而且它不会让初始化失败——只要白名单里还剩别的可提交文件，
+`git commit` 照样成功；§6.8 的基线体检也查不出来（它比的是磁盘与服务器，不比
+git 跟踪了谁，见 §15 第 20 条）。
+
+**所以初始化必须做一次「纳入集合核对」**，放在生成 exclude 之后、录第一个基线之前：
+
+```text
+期望集合 = 遍历磁盘，白名单路径 AND 扩展名，且不在任何一层 .svn/ 下
+实际集合 = git ls-files（在临时索引上 git add -A -- <白名单> 之后读）
+两者不一致 → 阻断，不创建基线
+              用 git check-ignore -v --non-matching <差异文件> 指认裁决者，
+              原样显示给用户（它会直接告诉你是哪个文件的第几行干的）
+```
+
+这条核对是**行为断言**，不是针对 `.gitignore` 这一种成因写的特判——`core.excludesFile`、
+用户手工改过的 `.git/info/exclude`、规则生成器自己的 bug，全都会在这里暴露。与 §6.8
+的基线体检**互不替代**：体检证明「磁盘 == 服务器」，这条证明「git 跟踪的集合 == 配置
+声明的集合」（§15 第 20 条）。
+
+#### 6.3.2 「白名单」是两个不同的集合，全文必须分清
+
+这是本文档已经踩过的一个坑（§8.2.1 的论证就是这么写错的）。**「白名单」在两种粒度上
+被使用，它们不相等**：
+
+| 记号 | 定义 | 谁用它 |
+|---|---|---|
+| **W-path** | 配置里 `whitelist` 声明的**路径**（目录递归） | 所有 **SVN** 侧命令的 target：`svn status` / `svn update` / `svn revert`。SVN 不认识扩展名，target 只能是路径 |
+| **W-file** | W-path **AND** `extensions` 命中的**文件** | 所有 **git** 侧的事：exclude 规则、基线 tree、交付清单、stash 范围 |
+
+`W-file ⊊ W-path`，差集是**真实存在**的一类文件：§6.3 开头就说了 `Assets/Scripts/`
+底下迟早会混进 `.psd`、`.zip`、`.bak`。这个差集有一个要命的性质：
+
+> **它归 SVN 管，但 git 完全不管，客户端对它没有任何恢复手段。**
+
+也就是说它和「白名单外的美术资产」是同一类东西（§7.2.1），只是**位置在白名单目录
+里面**，所以极容易被误当成「git 保护得住的文件」。
+
+实现上的硬规则：
+
+- 构造 **git** 命令参数时用 W-file；构造 **SVN** 命令 target 时用 W-path
+- 任何一句形如「这些文件 git 管得住 / 有基线兜底 / 冲突能在 git 里解决」的论证，
+  **必须先确认说的是 W-file**。落在差集里的文件一条都不成立
+- §12.1 那个统一过滤函数要**同时导出两个集合**，不要让调用点自己拼
 
 ### 6.4 基线分支
 
@@ -571,8 +693,10 @@ P2  nodeRevs 必须是单元素集合 {N}
       ⚠️ 读法错了这一条会**永远过不去**，且「先跑一次 svn update」是一条
          **永远无效**的引导（external 的 revision 来自别的仓库），见 §6.6.4
 P3  不在 svn update / merge 中途（.svn 里没有未完成的操作）
-P4  白名单**可以**落在 external 内，但必须全部属于**同一个仓库**
-      对每个白名单根跑 svn info，取 (Working Copy Root Path, URL, Repository UUID)
+P4  白名单**可以**落在 external 内，但白名单**递归覆盖到的每一个工作副本**
+    都必须属于**同一个仓库**
+      ⚠️ 只查白名单根是不够的，见 §6.5.5。必须先枚举白名单子树内的**全部**嵌套
+         工作副本，再对每一个取 (Working Copy Root Path, URL, Repository UUID)
       所有 UUID 必须相同；不同则拒绝，并指出是哪两条分属哪两个仓库
       理由：svn commit 跨仓库会被**直接拒绝**（E200007，§6.6.5 实测），交付永远
       做不成。前置拦住是为了不让用户白走完整个确认流程才在 D5 撞墙
@@ -583,18 +707,24 @@ P5  检测白名单所在的 external 有没有被 `-r` 钉死
         见 §6.5.3）
 ```
 
-三条全过之后才建库：
+P1–P5 全部走完之后才建库（P1–P4 是硬门槛，P5 命中不阻断、只切换到 pinned 模式）：
 
 ```text
 git init -b svn/base                 ← 显式指定，不吃 init.defaultBranch 的默认值
 写入 .git/mygitclient.json（用户编辑白名单）
-生成 .git/info/exclude
+生成 .git/info/exclude               ← 含末尾的 .svn/ 兜底行，见 §6.3
+纳入集合核对（§6.3.1）                ← 期望集合 vs git ls-files，不一致就阻断、
+                                        不创建基线。挡的是工作树里的 .gitignore
+                                        盖掉再入规则这类静默失效
 git add -- <白名单> && git commit    ← 首个基线，git-svn-id 的 rev 取自 P2 读到的 N
 基线体检（§6.8）                      ← 有差异则整个回退，删掉刚建的 .git
 git checkout -b work                 ← 立刻离开基线分支
 ```
 
-#### 6.5.1 为什么这三条前置不能省
+⚠️ 「三条全过」是初版留下的说法，那时只有 P1–P3。现在是五条，**P4 与 P1–P3 一样
+是阻断级门槛**，不要照字面只跑前三条；P5 是分流不是门槛。
+
+#### 6.5.1 为什么 P1–P3 不能省
 
 `svn/base` 的语义是「白名单内的文件在 revision N 时**服务器上的样子**」。初始化直接
 `git add` 当前磁盘内容，等于宣称「磁盘 == 服务器」，而这个等式只有在工作副本干净且
@@ -736,6 +866,50 @@ update，那会把代码回退到 peg，而且工作副本看起来干净（测�
 定位是**防御性路径**：检测保留、诊断保留（§6.6.2 那条「`N` 恰等于 peg」），但正常流程
 一步都不走它。
 
+#### 6.5.5 P4 必须枚举白名单子树内的**全部**工作副本，不能只查白名单根
+
+P4 初版写的是「对每个白名单根跑 `svn info`」。**白名单根底下还可以再挂 external**，
+那时只查根会得到根所属仓库的 UUID，P4 干净通过，而一个**另一个仓库**的子树已经进了
+白名单。
+
+2026-09-13 临时 SVN fixture 实测（`repo1` 的 `Code/` 底下挂一条指向 `repo2` 的
+external `Vendor`）：
+
+```text
+svn info --show-item repos-uuid Code          → 0f098dbb-…      ← repo1，P4 通过 ✅
+svn info --show-item repos-uuid Code/Vendor   → 35647ab0-…      ← repo2！
+svn status -v --ignore-externals -- Code
+     9   9  Code           9  3  Code\A.cs      9  1  Code\B.cs
+     X       Code\Vendor                        ← 内容整个不在 nodeRevs 里
+磁盘实际有:  Code/A.cs  Code/B.cs  Code/Deep/Z.cs  Code/Vendor/V.cs
+```
+
+三个后果叠在一起：
+
+| 层面 | 发生了什么 |
+|---|---|
+| git | `Code/Vendor/V.cs` 命中白名单 + 扩展名，**被 git 跟踪**，进基线、进交付清单 |
+| 失同步检测 | §6.6.5 规定在 `wc(P)` 内部带 `--ignore-externals`，于是 `Vendor` 的节点**从不参与 `nodeRevs` 校验**——别人改了它，客户端一无所知 |
+| 交付 | D5 的 target 列表会同时含两个仓库的路径，`svn commit` 以 **E200007** 拒绝（§6.6.5 E5）——正是 P4 存在的意义，但 P4 没拦住 |
+
+**所以 P4 的枚举对象是「白名单递归覆盖到的全部工作副本」**：
+
+```text
+对每个白名单根 P：
+  svn status --xml -- P     （**不带** --ignore-externals）
+  取 item="external" 的条目 → 这些就是 P 底下的嵌套 external 根
+  对每一个再跑 svn info，取 (Working Copy Root Path, URL, Repository UUID)
+  递归，直到不再出现新的 external 根
+所有 UUID 必须相同；不同则拒绝，并指出是哪条嵌套 external 属于哪个仓库
+```
+
+枚举方式沿用 §6.6.4 那条结论（`item="external"` 比解析 `svn:externals` 属性文本可靠）。
+
+**同仓库的嵌套 external 不阻断**，但它必须被纳入 §6.6.5 的记账单位集合——也就是
+`nodeRevs` 要在它上面也跑一次并取并集，否则它就是一块 git 管着、SVN 侧却没人盯的
+盲区。这条与「在 `wc(P)` 内部带 `--ignore-externals`」不冲突：`--ignore-externals`
+负责不让**别的 WC** 的 revision 混进当前 WC 的集合，而每个 WC 自己都要被跑到。
+
 ### 6.6 状态判定
 
 #### 6.6.1 SVN 工作副本是 mixed-revision 的
@@ -771,6 +945,11 @@ remoteRev   = svn info --xml <URL> 的 revision            ← 走网络，异�
 ```
 
 **正常状态的不变量**：`nodeRevs` 是单元素集合，且等于 `{baselineRev}`。
+
+⚠️ **`nodeRevs` 的粒度是「白名单路径」，不是「白名单路径 AND 扩展名」。** `svn status`
+的 target 只能是路径，SVN 不认识扩展名过滤，所以 `Assets/Scripts/` 底下那个被 §6.3
+排除掉的 `.psd` **也在 `nodeRevs` 里**。全文出现「白名单」三个字的地方必须分清是哪一种
+（§6.3.2）——混用已经造成过 §8.2.1 的错误论证。
 
 失同步的判据**只有这两条**：
 
@@ -872,7 +1051,9 @@ svn status -v --xml --ignore-externals . → entry 10940 个
 **§1.2 把 externals 列为非目标，但「不支持」不等于「可以无视」。** 它们物理存在于真实
 工作副本里，会主动污染状态判定。必须**主动屏蔽**：
 
-- 所有 `svn status` / `svn info` / `svn update` 调用带 `--ignore-externals`（§4.4）
+- 所有 `svn status` / `svn update` 调用带 `--ignore-externals`（§4.4）。
+  ⚠️ **`svn info` 不在此列**——它拒绝这个参数（实测 exit 1），而且默认本来就不遍历
+  externals，见 §4.4 那张子命令表
 - §6.2.1 的白名单校验**拒绝落在 external 内（或本身就是 external 根）的路径**。
   枚举方式：`svn status --xml`（**不带** `--ignore-externals`）里 `item="external"`
   的条目就是 external 根，实测能干净列出那 6 个；这比解析 `svn:externals` 属性文本
@@ -966,6 +1147,10 @@ uuid(P) = Repository UUID
 | §6.6.2 的 `nodeRevs`：项目根跑一次 | **在每个 `wc(P)` 上各跑一次**，带 `--ignore-externals`（挡住更深层的嵌套 external），取并集 |
 | §6.6.3 的 `rootRev`（O(1) 提示档） | 每个 `wc(P)` 的根 revision，任一变化即触发全量校验 |
 | §6.8 体检的 `--old=<svnUrl>@<rev>` | 每个 `wc(P)` 各体检一次，用它自己的 `url(P)` |
+
+⚠️ 这里的「每个 `wc(P)`」指**白名单递归覆盖到的全部工作副本**，包括白名单根**底下**
+再挂的嵌套 external，不只是白名单根自己所在的那个 WC。枚举方式与判据见 §6.5.5——漏掉
+嵌套 WC 会造出一块「git 管着、SVN 侧没人盯」的盲区。
 
 **不变量相应地推广**：所有白名单所属工作副本的 `nodeRevs` **并集**必须是单元素集合
 `{N}`。E4 + E6 保证这是可达的——同仓库的多个 WC 在一次提交后拿到同一个 revision，
@@ -1082,8 +1267,10 @@ svn diff --old=<svnUrl>@<baselineRev> --new=<工作副本根> --summarize -- <�
 
 R3 值得单独记：`svn diff` **不接受** `--ignore-externals`（`Subcommand 'diff' doesn't
 accept option '--ignore-externals'`），一开始以为是缺口，实测发现它**根本不需要**——
-URL 与工作副本目录比对时不会走进 externals。所以 §6.6.4 那条「统一加
-`--ignore-externals`」只约束 `status` / `info` / `update`，不约束 `diff`。
+URL 与工作副本目录比对时不会走进 externals。
+
+⚠️ 当时由此得出的「所以这条只约束 `status` / `info` / `update`」**把 `info` 算错了**：
+`svn info` 和 `diff` 一样会拒绝这个参数，同样也不需要它。正确的子命令表见 §4.4。
 
 三条的耗时都在 3 秒级，与 §6.8.5 末尾「成本是 MB 级而非 GB 级」的判断一致；公司服务器
 在内网，只会更快。
@@ -1209,7 +1396,12 @@ S5   svn update --accept postpone                        ← 在项目根递归�
 S6   svn info --xml + svn status -v --xml 读新 revision
 S7   git add -A -- <白名单> && git commit --allow-empty     新基线
 S8   git checkout ORIG_BRANCH
+S8b  refTree = git merge-tree --write-tree svn/base ORIG_HEAD  ← rebase 的参考结果，
+                                                                 必须在 rebase 之前算，
+                                                                 见 §7.3.2
 S9   git rebase --empty=drop svn/base                       ← 冲突在这里爆
+S9b  git rev-parse HEAD^{tree} == refTree                   ← 内容守恒断言。不等则
+                                                               **停下不动**，见 §7.3.2
 S10  git stash apply <OID>（若 S1 有 stash），成功后
      git stash drop 对应条目 + 删掉 refs/mygitclient/sync/<opid>
 S11  删除 journal；恢复 watcher + 主动发 repo-changed
@@ -1278,6 +1470,60 @@ git log -g --format='%H %gs' refs/stash | grep "mygitclient-sync:0f3adead-beef"
 还在（我们在 ④ 用 `refs/mygitclient/sync/<opid>` 钉过），但若崩在 ④ 之前就没钉上，
 对象会被 gc 回收。这是 §7.6.1 那条「钉住」规则要尽早执行的原因。
 
+#### 7.3.2 S9 的 rebase 会静默吃掉 merge commit 里独有的改动
+
+§15 第 12 条原来写「压平 merge commit……**不会报错也不会丢改动**」。后半句是错的。
+
+`git rebase` 不带 `--rebase-merges` 时按 `--no-merges` 重放，**merge commit 本身承载的
+改动不在任何一个被重放的 commit 里**。只要那部分改动在线性重放时不产生冲突，它就会
+**无冲突、无告警地**从结果树里消失。2026-09-13 临时 git fixture 实测：
+
+```text
+work: base ──w1──┬──────────── merge topic（合并后又在这个 commit 里加了 evil.txt）
+                 └──t1────────┘
+rebase 前 tree:  a.txt  evil.txt  t.txt  w.txt
+git rebase --empty=drop base   →  Successfully rebased（无冲突、无告警）
+rebase 后 tree:  a.txt  b2.txt   t.txt  w.txt        ← evil.txt 没了
+```
+
+**触发面要写准，别写过头。** 冲突解决型的 merge **不**会静默丢——线性重放会再撞一次
+同样的冲突，用户看得见。真正静默丢的只有 **evil merge**：merge commit 里带着两个父
+提交都没有、且线性重放时不冲突的内容。用户在 IDE 里「合完顺手再改一点、`--amend`
+进去」就是这个形态。
+
+**守恒断言：拿三方合并的结果当参考树。** 对同一组输入，「把 `ORIG_HEAD` rebase 到
+`svn/base`」和「把 `ORIG_HEAD` 合并进 `svn/base`」在无冲突时应当得到**同一棵树**，而
+`git merge-tree --write-tree` 会把 merge commit 自己的内容算进去（它比的是树，不是
+commit 序列）。所以 S8b / S9b 那两步就能判定：
+
+```text
+refTree = git merge-tree --write-tree svn/base ORIG_HEAD
+rebase 之后：git rev-parse HEAD^{tree} == refTree ?
+```
+
+实测三个方向（2026-09-13，临时 git fixture）：
+
+| 场景 | 结果 |
+|---|---|
+| evil merge（上面那个） | 参考树含 `evil.txt`，rebase 树不含 → **不等，抓到** ✅ |
+| 普通线性分支 + 真实三方合并（服务器改 A 文件、本地改同文件另一处） | 两树**逐字节相等**，不误报 ✅ |
+| 已交付 commit 被 `--empty=drop` 丢弃 | 两树**逐字节相等**，不误报 ✅ |
+
+后两行是这条断言能不能用的关键——误报一次就等于每次 `sync_in` 都被拦。
+
+**不等时停下不动**，报「本次 rebase 会丢失 `<merge commit>` 里独有的改动」，把差异
+文件列出来，引导用户把那些改动提成一个普通 commit 再重来。**不自动 merge、不自动
+`--rebase-merges` 重试**（§8.7）。此时 rebase 已经完成，分支已被改写，所以恢复路径是
+`git reset --hard ORIG_HEAD`——`ORIG_HEAD` 在 S0 就已经落盘进 journal（§7.6），这是它
+在这里唯一的用途之外的第二个用途。
+
+⚠️ `git merge-tree --write-tree` 是较新的 git 才有的形式（本机 2.51.2 实测可用，引入
+版本未核实）。**实现必须显式探测它是否可用**，而不是按版本号猜；探测不到时按 §6.8.6
+的原则标记「本次 rebase 未经守恒校验」，**不得当成通过**（§15 第 27 条）。
+
+D8d 的那次 rebase（§8.2.2，有 Local-Only commit 时）走同一条断言，`refTree` 的两个
+输入换成 `svn/base` 与 D8d 之前的 `origHead`。
+
 ### 7.4 不显然的点
 
 - **S4 是双保险，不能省。** revision 比对能抓住「外部提交过」，抓不住「外部手工
@@ -1292,6 +1538,11 @@ git log -g --format='%H %gs' refs/stash | grep "mygitclient-sync:0f3adead-beef"
 - **本地补丁（§6.7）在这里不需要任何特殊处理。** Local-Only commit 就是普通 commit，
   S9 的 rebase 把它和其余 commit 一起搬到新基线上。它与服务器改动真冲突时，冲突就在
   S9 爆出来，和普通代码冲突走同一条路——这正是选 commit 而非未提交改动的收益
+- **S8b 必须在 rebase 之前算，S9b 必须在 rebase 之后比。** 参考树的两个输入
+  （`svn/base`、`ORIG_HEAD`）在 rebase 之后一个已经换了含义、一个已经不是分支尖端，
+  事后补算就不是同一个断言了。S9b 与 S9 的冲突出口是**两回事**：S9 冲突是正常出口
+  （停在冲突态等用户解），S9b 不等是**缺陷信号**（rebase 已经"成功"了但内容少了），
+  见 §7.3.2
 
 ### 7.5 代价
 
@@ -1325,6 +1576,7 @@ S2–S7 之间工作目录会短暂回到基线状态，Unity 会多触发一次
   "svnDeleted": ["Assets/Scripts/Old.cs"],
   "svnStatusBefore": [{"path": "…", "status": "…"}],
   "svnDelta": [{"path": "…", "status": "A"}],
+  "newParentDirs": ["Assets/Scripts/Deep", "Assets/Scripts/Deep/Nested"],
   "expectedStartRev": 12345,
   "commitMessage": "…",
   "deliverRef": "refs/mygitclient/deliver/0f3a…",
@@ -1332,6 +1584,14 @@ S2–S7 之间工作目录会短暂回到基线状态，Unity 会多触发一次
   "localOnlyCommits": ["a1b2c3d…"]
 }
 ```
+
+`newParentDirs` 是 `svnDelta` 里状态为 `A` 的**目录**条目。它有两个用途，都不能省：
+D5 的 target 列表必须带上它们，否则提交被 `E200009` 拒（§8.2.6）；回滚时要靠它把
+`svn add --parents` 带出来的父目录登记撤干净（§8.5.1）。
+
+⚠️ **S8b 的 `refTree` 不进 journal。** 它是 `svn/base` 与 `ORIG_HEAD` 的纯函数，两个
+输入都已经在 journal 里（`origHead` 在 S0 就落盘），崩溃重开后随时能重算——写进去只会
+多一份可能过期的副本。
 
 最后三个字段只有 `sync_out` 用：
 
@@ -1400,11 +1660,20 @@ git stash apply f2208125…  → 取回的仍是正确的 WIP     ✓
 
 ### 8.1 前置检查
 
+0. **当前分支必须已经包含最新的 `svn/base`**：`git merge-base --is-ancestor svn/base HEAD`
+   必须成立。不成立则拒绝交付，要求先对该分支跑一次 `sync_in`（或 `git rebase svn/base`）。
+   **这是全部前置检查里唯一挡得住「拿旧基线的分支交付」的一条**，见 §8.1.2
 1. 基线未失同步
-2. **工作区必须干净**。这里**不自动 stash**：交付的是 commit 过的内容，未提交的
-   改动不该被悄悄排除、也不该被悄悄带上。硬拦住，让用户自己决定。
-   若那些改动本来就不打算交付（注释掉的 log、临时测试代码），正确做法是**提交成
-   Local-Only commit**（§6.7），不是留在工作区里
+2. **工作区必须干净**，包含两层：
+   - **W-file（git 侧）**：`git status --porcelain -- <白名单>` 为空。这里**不自动 stash**：
+     交付的是 commit 过的内容，未提交的改动不该被悄悄排除、也不该被悄悄带上。硬拦住，
+     让用户自己决定。若那些改动本来就不打算交付（注释掉的 log、临时测试代码），正确
+     做法是**提交成 Local-Only commit**（§6.7），不是留在工作区里
+   - **W-path 减 W-file（SVN 侧、git 管不到的那部分）**：白名单目录里那些被扩展名过滤
+     排除掉的文件（`.psd` / `.zip` / `.bak`，§6.3.2）若有本地修改，**列出来并要求用户
+     确认**，形式与 §7.2.1 一致。理由见 §8.2.1：D6 的 `svn update` 会走到它们头上，而
+     那时已经在 D5 之后、不可撤销。初始化的 §6.5 P1 本来就是 W-path 粒度的干净要求，
+     这一条只是把同样的粒度补回交付侧
 3. 不在 rebase / merge 中途
 4. 当前分支不是 `svn/base`，且 **HEAD 必须附着在分支上**——detached HEAD 一律拒绝，见 §8.1.1
 5. `remoteRev == baselineRev`（走一次网络）；不等则要求先更新
@@ -1443,6 +1712,50 @@ Overlay 让外部 git 工具可用，所以 detached HEAD 是**合法可达**的
 交付本来就该从一个分支上做。所以：**明确拒绝，并告诉用户当前 HEAD 指向哪个 commit、
 建议 `git switch -c <name>` 或切回原分支**，而不是假装支持。`sync_in`（§7.2 #3）同理。
 
+#### 8.1.2 拿旧基线的分支交付会把别人刚交付的文件当成删除提上去
+
+§8.1 第 0 条是这一轮加的，它挡的是本设计**后果最重**的一条路径。
+
+D4 是「本地多任务并行」（§2 D4），所以同时存在两个从同一个旧基线分出来的任务分支是
+**正常用法**，不是误用：
+
+```text
+svn/base@r1 ──┬── 分支 A ── 交付成功 ── svn/base 前进到 r2（含 A 新增的 ANew.cs）
+              └── 分支 B ── 还停在 r1 的基线上
+```
+
+此刻切到分支 B 交付，**原有的前置检查一条都拦不住**：
+
+| 检查 | 为什么过得去 |
+|---|---|
+| #1 基线未失同步 | D6 已经把白名单更新到 r2，`nodeRevs == {r2} == baselineRev` ✅ |
+| #5 `remoteRev == baselineRev` | 没有别人提交，服务器 HEAD 就是 r2 ✅ |
+| SVN 自己的 out-of-date 检查 | 工作副本基线**确实是最新的**，服务器没有理由拒绝 ✅ |
+
+然后 D1 那条两点 diff 就出事了。`git diff A..B` 是**树对树**比较，不是三点的
+merge-base 比较：
+
+```text
+（2026-09-13 临时 git fixture 实测）
+D1: git diff --name-status --no-renames svn/base..B
+      D  ANew.cs       ← 分支 A 刚交付的文件，被算成「删除」
+      A  BOnly.cs
+对照 三点 diff（svn/base...B）：
+      A  BOnly.cs      ← 只有这一条才是分支 B 真正做的事
+```
+
+于是 D4 `svn delete ANew.cs`、D5 把删除提交回服务器——**把同事（或自己）上一次的交付
+撤销掉，且 D5 之后不可撤销**。
+
+**改成三点 diff 不是正确的修法。** 三点 diff 只是把删除藏起来，交付内容仍然是基于
+旧基线算出来的；而且 §8.2.2 的 D8a `git branch -f svn/base HEAD` 会把基线**倒退**回
+分支 B 的树，`ANew.cs` 从基线里消失。D8d 那个号称「断言」的 `--ff-only` 此时反而是
+成立的（基线刚被拽到交付树上），**抓不到**。
+
+所以唯一可靠的办法是在动手之前要求「当前分支已经包含最新基线」，也就是把
+§8.2.2 第一句「`svn/base` 是交付树的祖先」从**假设**变成**被检查过的前提**。
+用户看到的提示是「分支 B 还停在 r1，请先更新这个分支」，一次 `sync_in` 就解决。
+
 ### 8.2 步骤
 
 ```text
@@ -1470,16 +1783,21 @@ D4   phase=svn-staged
      M → 无需操作
      再记 svnStatusAfter；svnDelta = After - Before 写进 journal
      ⚠️ 差量里会包含 --parents 带出的**父目录**，回滚要靠它，见 §8.5.1
+     **newParentDirs = svnDelta 里状态为 A 的目录条目**，写进 journal ←
+       它们必须进 D5 的 target 列表，否则提交会被拒，见 §8.2.6
 D4.9 提交前最后一道断言（纯本地，毫秒级）：
        git rev-parse HEAD == journal.deliverRef 指向的 OID
        git status --porcelain -- <白名单> 为空
      任一不满足 → **中止**，按 §8.5 撤销 D4 登记，报「工作副本在你确认之后
      被外部工具改动过」。见 §8.2.5
 D5   phase=committing
-     svn commit --non-interactive --with-revprop mygitclient:opid=<opid>
-       -m <msg> -- <显式 target 列表>
+     svn commit --non-interactive --depth=empty              ← --depth=empty 见 §8.2.6
+       --with-revprop mygitclient:opid=<opid>
+       -m <msg> -- <newParentDirs + 显式文件 target 列表>
 D6   phase=post-commit  ← 过了这一步服务器状态已不可撤销
-     svn update --accept postpone -- <白名单路径>            ← 只更新白名单，见 §8.2.1
+     svn update --accept postpone -- <白名单路径>            ← W-path 粒度，不是 W-file。
+                                                               为什么只能这样、以及它
+                                                               带来的残余风险，见 §8.2.1
      ⚠️ 白名单落在 external 里时，target 必须**显式指到那个 external 目录**
         （或其内部路径）。实测：显式指名的 update **不认 peg**，会走到该仓库
         HEAD，这正是我们要的；而在项目根跑递归 update 会把它拽回 peg，把刚
@@ -1509,19 +1827,58 @@ D5 成功之后服务器状态**已经不可撤销**。此时若再跑一次全�
 对这些文件没有任何恢复手段——等于在「已经无法回头」之后又主动引入一类没法收拾的
 失败。
 
-所以 D6 用 `svn update -- <白名单路径>`：范围限定在 git 管得住的文件上，这些文件
-此刻的内容与服务器 base 完全一致（刚提交完），合并必然干净。
+所以 D6 用 `svn update -- <白名单路径>`，把范围从「整个工作副本」收窄到白名单。
 
 代价是工作副本变成 mixed-revision，美术资产停在旧 revision。这**不是问题**：
 §6.6 的检测本来就按白名单节点判定，美术更新交给下一次 `sync_in`（那里有 §7.2.1
 的确认流程兜底）。
+
+##### 原来那句论证是错的，残余风险必须写出来
+
+初版这里写的是「范围限定在 git 管得住的文件上，这些文件此刻的内容与服务器 base
+完全一致（刚提交完），合并必然干净」。**这句话把 W-path 当成了 W-file**（§6.3.2）。
+
+`svn update` 的 target 只能是路径，所以 `svn update -- Assets/Scripts/` 会**递归更新
+该目录下的一切**，包括被扩展名过滤排除掉的 `.psd` / `.zip` / `.bak`。那些文件 git
+一个字节都不管，"刚提交完、内容与服务器一致" 对它们不成立——它们可能带着用户的本地
+修改在那儿放了几个星期。
+
+2026-09-13 临时 SVN fixture 实测（`Code/Art.psd` 在白名单目录内、被扩展名排除，本地
+有修改，服务器上有另一次改动）：
+
+```text
+svn update --accept postpone -- Code
+  不重叠的改动 → G    Code\Art.psd                     ← 被合并了
+  重叠的改动   → C    Code\Art.psd
+                 ?    Code\Art.psd.mine
+                 ?    Code\Art.psd.r5
+                 ?    Code\Art.psd.r6
+```
+
+也就是说本节开头那条「绝不在 D5 之后引入没法收拾的失败」的目标，在这个差集上**并没有
+达成**。
+
+**为什么不能改成按文件 target 更新。** 只更新本次交付的文件，白名单里其余节点会停在
+`baselineRev`，`nodeRevs` 立刻变成 `{baselineRev, r_new}` 多值，§6.6.2 的失同步判据
+当场误报。W-path 粒度的 update 在结构上是必需的。
+
+**所以修法在前置，不在 D6**：§8.1 第 2 条把「W-path 减 W-file 的本地修改」补成一次
+显式确认（形式同 §7.2.1）。这样用户在**动手之前**就知道哪些不受保护的文件可能被
+合并，而不是在不可撤销之后才看到 `.mine` / `.rN`。
+
+**剩下的窗口是 D3.5 到 D6 之间的窄竞态**，消不掉：§8.1 #5 与 D3.5 都确认过
+`remoteRev == baselineRev`，所以只有「同事在我们 D5 之后、D6 之前提交了一次、且恰好
+碰了白名单目录里某个我们也改过的非 W-file 文件」才会触发。命中时按 §13 报错，明确
+指出是 git 管不到的文件，引导去 TortoiseSVN——与 §7.2.1 的收口一致，不假装客户端
+能修。记为 §15 第 25 条。
 
 #### 8.2.2 D8 推进基线：必须显式编排分支
 
 D5 成功之后，磁盘上白名单文件的内容 = **交付树 tip 的内容**（D3.8 已经切
 上去了）= 服务器 r_new 的内容。新基线的树就应该是它。
 
-`svn/base` 是交付树的祖先，所以基线本身可以纯快进：
+`svn/base` 是交付树的祖先（**由 §8.1 第 0 条保证**——这一条以前是个没人检查的假设，
+后果见 §8.1.2），所以基线本身可以纯快进：
 
 ```text
 D8a  git branch -f svn/base HEAD        ← HEAD 此刻 detached 在 deliverRef 上；只动指针，
@@ -1531,9 +1888,13 @@ D8c  git add -A -- <白名单>              ← 收进 D6 拉下来的他人改�
      git commit --allow-empty -m "svn: r_new … git-svn-id: <svnUrl>@r_new <uuid>"
 D8d  git checkout <ORIG_BRANCH>
      无 Local-Only commit：git merge --ff-only svn/base   ← 纯快进，不可能冲突
-     有 Local-Only commit：git rebase --empty=drop svn/base
+     有 Local-Only commit：
+       refTree = git merge-tree --write-tree svn/base ORIG_HEAD  ← 先算参考树
+       git rebase --empty=drop svn/base
                                         ← 已交付的 commit 按 patch-id 被丢弃，
                                           只剩本地补丁落到新基线之上
+       git rev-parse HEAD^{tree} == refTree                      ← 内容守恒断言，
+                                                                   同 §7.3.2
 ```
 
 D8a 先动指针再 checkout 是关键：**反过来先 `git checkout svn/base` 会把工作目录
@@ -1543,8 +1904,14 @@ D8a 先动指针再 checkout 是关键：**反过来先 `git checkout svn/base` 
 D8d 的 `--ff-only` 是断言而非优化：**在没有 Local-Only commit 的前提下**走到这里必然
 是快进，不是快进就说明前面某步的假设崩了，应当报错停下而不是自作主张 merge。有
 Local-Only commit 时工作分支必然不是快进（它带着基线上没有的补丁），断言改由 rebase
-之后的检查承担：**`svn/base..ORIG_BRANCH` 里必须只剩 Local-Only commit**，出现任何
-没标记的 commit 都说明有该交付的东西没交付出去，报错并导出 journal。
+之后的两条检查承担：**`svn/base..ORIG_BRANCH` 里必须只剩 Local-Only commit**（出现
+任何没标记的 commit 都说明有该交付的东西没交付出去），以及 §7.3.2 那条**内容守恒
+断言**（挡住 rebase 把 merge commit 里独有的改动吃掉）。两条任一不过都报错并导出
+journal。
+
+⚠️ 走到 D8d 时 D5 已经成功、基线已经推进，所以这里报错**不回滚**，语义与 §13 那行
+「D8d rebase 冲突」一致：提交是好的，只是补丁没落回工作分支。用户拿 journal 里的
+`origHead` 就能 `git reset --hard` 回到 rebase 之前重来。
 
 #### 8.2.3 D0.5 构造交付树：把本地补丁摘掉
 
@@ -1731,6 +2098,46 @@ git 命令，毫秒级。放在 D4 **之后**而不是之前，是为了让窗�
 真要根治，交付得从一个隔离的临时 SVN 工作副本里做（把 `deliverRef` 的内容导出到那里
 再提交），那是另一个量级的改动，记为 §15 第 15 条已知限制。
 
+#### 8.2.6 D5 的 target 列表必须带上新增的父目录
+
+D1 的清单来自 `git diff --name-status`，**git 不跟踪空目录，所以清单里只有文件**。
+而交付一个位于新目录下的文件时，`svn add --parents` 会把那些父目录也登记成 `A`。
+只把文件放进 D5 的 target 列表，`svn commit` 会**直接拒绝**：
+
+```text
+（2026-09-13 临时 SVN fixture 实测）
+svn add --parents Code/Deep/Nested/New.cs
+svn commit -m "only file" -- Code/Deep/Nested/New.cs
+  → svn: E200009: Commit failed (details follow):
+    svn: E200009: '…\Code\Deep\Nested' is not known to exist in the repository
+         and is not part of the commit, yet its child '…\New.cs' is part of the commit
+```
+
+这不是数据风险（服务器侧什么都没发生），但它让**任何涉及新增嵌套目录的交付永久失败**。
+
+**本文档自己早就有证据。** §8.6.2 那段「比对前必须先剔除目录路径」记的是一次**成功**
+提交之后 `svn log -v` 给出 `A /Assets/Scripts/Deep`、`A /…/Nested`、`A /…/New.cs`
+三条——那次提交的 target 里一定包含了父目录，否则根本提交不出来。两处对不上。
+
+所以 D4 把 `svnDelta` 里状态为 `A` 的**目录**条目单独记成 `newParentDirs`，D5 的
+target = `newParentDirs` + 文件清单。
+
+**必须同时加 `--depth=empty`。** `svn commit` 对目录 target 默认是递归的，直接把目录
+放进 target 会顺带提交该目录下**所有**已登记但不属于本次交付的东西——正好违反 §12.1
+「白名单外的文件绝不进入任何命令参数」的精神。实测 `--depth=empty` 精确到每个 target
+自身：
+
+```text
+已登记：Code/Deep2、Code/Deep2/Nested、Code/Deep2/Nested/New.cs、Code/Deep2/Stray.cs
+svn commit --depth=empty -- Code/Deep2 Code/Deep2/Nested Code/Deep2/Nested/New.cs
+  → Adding  Code\Deep2 / Code\Deep2\Nested / Code\Deep2\Nested\New.cs
+  → Committed revision 10.
+  svn log -v -r HEAD 只有那三条；Stray.cs 仍停在 A 状态未被提交 ✅
+```
+
+`newParentDirs` 本来就要写进 journal 供 §8.5.1 回滚用，这里是同一份数据的第二个
+用途，不额外增加状态。
+
 ### 8.3 空清单必须中止
 
 D1 / D2 任一步得到空清单立即中止，**绝不进入 D5**。
@@ -1828,6 +2235,11 @@ svn add --parents Assets/Scripts/Deep/Nested/New.cs
 这也是为什么断言要比 `svn status` 而不是 `git status`：git 完全看不见 `.svn` 里的登记，
 拿 git 的干净当证据是**虚假信心**。
 
+⚠️ **同一批父目录在成功路径上也必须被处理，而且方向相反**：回滚时要把它们的登记撤掉，
+成功时要把它们**放进 D5 的 target 列表**，否则提交根本发不出去（`E200009`，§8.2.6）。
+本节只写了失败侧，初版就漏了成功侧——所以 D4 把它们单独记成 `newParentDirs`（§7.6），
+一份数据两处用，不要各算各的。
+
 ### 8.6 D5 的五类失败
 
 | 失败 | 典型错误码 | 服务器状态 | 处理 |
@@ -1865,7 +2277,9 @@ D3.5 / D4 已经把以下内容写进 journal（§7.6），它们是查证的全
 D5 失败且错误属网络类（连接重置 / 超时 / 回执缺失）
    ↓
 恢复连通后，查 expectedStartRev+1 .. HEAD 的**完整区间**（不是「最近 N 条」）
-   svn log --xml -v --with-all-revprops -r <expectedStartRev+1>:HEAD <URL>
+   svn log --xml -v --with-all-revprops
+           -r <expectedStartRev+1>:HEAD <Repository Root>
+                                        ↑ **必须是仓库根**，不是 svnUrl，见下
    ↓
 ① revprop mygitclient:opid == 本次 opid
    ├─ 命中 → **判定成功**。不回滚，记下命中的 revision，直接跳到 D6
@@ -1889,6 +2303,31 @@ D5 失败且错误属网络类（连接重置 / 超时 / 回执缺失）
 
 查**完整区间**而不是「最近 N 条」是硬要求：断网可能持续几小时，N 取多大都是猜。
 区间的起点来自提交前就已落盘的 `expectedStartRev`，不依赖任何事后推断。
+
+**查证的 URL 必须是 `Repository Root`，不能用 `svnUrl`**
+
+`svn log <URL>` 只返回**该 URL 子树**的历史，它不跟随 externals。而 §6.2.1 的 `svnUrl`
+是一个**工作副本 URL**，§16.0 已经确认公司项目的代码分布在 `code` / `script` 两条
+不同 URL 的 external 里（§6.6.5）。于是：本次交付只碰了另一个 WC 的文件时，那个**真的
+成功了**的 revision 根本不会出现在 `svn log <svnUrl>` 的结果里。
+
+2026-09-13 临时 SVN fixture 实测（一次只碰 `Script/` 的提交，带 `mygitclient:opid`）：
+
+```text
+svn log --with-all-revprops -r 1:HEAD <Repository Root>        → opid 命中 1 次 ✅
+svn log --with-all-revprops -r 1:HEAD <Repository Root>/Code   → opid 命中 0 次 ❌
+逐条对照：root 列出 r1..r8；Code 只列出 r1..r6（r7 / r8 只碰了 Script/）
+```
+
+落进本节流程就是最坏的那条路径：①「区间内无任何 revision 带 opid」→ **判定失败** →
+按 §8.5 回滚 → 同一批内容被**重复交付**一遍。这正是 §8.6.1 那张表里「假阴性」那一行。
+
+`Repository Root` 本来就已经是基线 trailer 的 `<url>`（§6.4.1），取它零成本；P4 保证
+全部白名单同属一个仓库（§6.5 P4 / §6.5.5），所以「一个 Repository Root」这件事是成立的。
+
+⚠️ 兜底 ② 的 changed-paths 比对同理：路径要按 `Repository Root` 的仓库相对形式还原，
+不能按 `svnUrl` 剥前缀（§6.8.4 那条剥前缀规则是对 `svn diff --old=<url(P)>` 说的，
+两处的基准 URL 不同，不要互相套用）。
 
 **兜底 ② 为什么只能是「疑似」**
 
@@ -2075,8 +2514,12 @@ revert 后: rootRev=1  nodeRevs={1}     ← 完全没变
    ⚠️ 每一类都独立判空：列表为空则跳过，绝不执行空参数的 svn 命令或删除
 ⑤ 按 ④ 的结果执行：(a)(b)(c) 用显式文件列表 svn revert；
    toDelete 逐个**文件**删除，**绝不递归删目录**；全部删完后可以清理变空的目录本身
+⑤b **revision 归一**：重读 nodeRevs（全部 wc(P) 取并集，§6.6.5）
+      单值 {N} → 直接进 ⑥
+      多值     → svn update --accept postpone -- <白名单路径>   ← 见 §9.4.2
+                 再重读；仍多值则**停下报错**，绝不硬造基线
 ⑥ git add -A -- <白名单> && git commit --allow-empty
-                                        新基线，rev 取自 ⑤ 之后重读的 nodeRevs
+                                        新基线，rev 取自 ⑤b 归一后的那个 N
 ⑥b 基线体检（§6.8）                     此刻 HEAD 在 svn/base、工作区干净，正是
                                         体检的前提。有差异则停在这里报错，
                                         **不继续 ⑦**——恢复流程的全部目的就是修好
@@ -2152,6 +2595,41 @@ git 管理的具体文件**，一个目录都没有。差集里的每一条都�
 `A` 登记（(c) 类）单独列出来的理由：`svn revert` 只取消登记，文件会留在磁盘上。它是否
 该被删，由 ④b 的差集独立判定——如果它本来就不在旧基线里（用户新建的），差集里没有它，
 它就留在磁盘上，这是对的。
+
+#### 9.4.2 ⑤b 归一不能省：恢复流程的主场景本身就是 mixed-revision
+
+⑥ 原来写的是「rev 取自 ⑤ 之后重读的 nodeRevs」，而 `nodeRevs` 是个**集合**——这句话
+默认了它此刻是单值。**在本节的主场景里它不是。**
+
+§9.1 描述的就是「用户在 TortoiseSVN 里对整个工作副本点了 SVN Commit」。`svn commit`
+**只推进被提交节点的 revision**（§6.6.1），所以提交之后工作副本立刻是 mixed-revision。
+而 ①–⑤ 这几步**一个都不会动 revision**：`git checkout` 只改磁盘，`svn revert` 只把
+内容改回各节点自己的 base，删文件更不会。
+
+2026-09-13 临时 SVN fixture 实测：
+
+```text
+基线      nodeRevs = {1}
+外部只提交 Code/A.cs        → Committed revision 3
+                             nodeRevs = {1, 3}     ← mixed
+改一个文件再 svn revert -R   → nodeRevs = {1, 3}     ← **纹丝不动**
+svn update -- Code          → nodeRevs = {3}        ← 只有它能归一
+```
+
+不加 ⑤b 的后果：⑥ 拿不到一个合法的单值 `N` 写进 trailer。无论怎么凑（取最大值、取
+根的 revision），录下来的基线都会在**下一次刷新时立刻被 §6.6.2 判成失同步**——恢复
+向导跑完，红色横幅原地复现，而这正是它要修的东西。
+
+**⑤b 为什么放在 ⑤ 之后而不是之前。** `svn update` 会用三方合并处理本地修改；必须先由
+⑤ 把白名单内的内容 revert 成各节点的 base（此时 SVN 眼里白名单是干净的），update 才
+必然干净。顺序反过来就等于在一堆本地修改上跑 update，退回 §7.1 那三个问题。
+
+**⑤b 的 target 是 W-path，所以它带着 §8.2.1 同样的残余风险**：白名单目录里那些被扩展名
+排除掉的文件会被一起更新。区别是这里**还没有不可撤销的操作**——⑤b 失败或产生冲突就
+停下报错，用户去 TortoiseSVN 处理完再重来一次，代价只是白跑一趟。
+
+仍多值时**停下报错**，不要自作主张再 update 一次或换个 revision 凑数（§8.7）。
+常见成因是白名单跨了多个 WC 而其中一个 update 失败，错误信息要指明是哪个 WC。
 
 ### 9.5 第 ⑤ 步为什么安全
 
@@ -2280,6 +2758,11 @@ React 依赖、可直接单测。
 所有构造 git / svn 参数的地方走**同一个过滤函数**，然后专门测那个函数。这不是
 「测一下功能」，是给整个方案的安全边界上一道断言。
 
+⚠️ 这个函数必须**同时导出 W-path 与 W-file 两个集合**（§6.3.2），并且让调用点在签名
+层面就选定一个，不要让它自己从路径列表里现拼。混用这两个集合已经造成过 §8.2.1 的
+错误论证，而且那种错误**不会在任何测试里表现为失败**——命令照样跑通，只是作用范围
+比论证里说的大一圈。
+
 ### 12.2 空参数一律拒绝
 
 | 位置 | 空参数的后果 |
@@ -2344,6 +2827,13 @@ React 依赖、可直接单测。
 | **D8d 不是快进**（无 Local-Only commit 时） | 前面某步的假设崩了 | 停下不动 | 报错并导出 journal，**不自动 merge** |
 | **D8d rebase 后仍有未标记 commit** | 该交付的东西没进交付树 | 停下不动 | 报错并导出 journal，列出这些 commit |
 | **D8d rebase 冲突**（有 Local-Only commit 时） | 本地补丁与他人在 D6 拉下来的改动冲突 | **不回滚**，停在冲突态 | 进入冲突解决模式；提交已成功，基线已推进，只剩补丁没落回去 |
+| **交付分支不含最新基线** | 从旧基线分出的另一个任务分支已经交付过，当前分支还停在旧基线（§8.1 #0、§8.1.2） | **不做任何修改**——检查在动手之前 | 说明当前分支落后于 `svn/base`，提示先对这个分支跑一次 `sync_in`；明确告知若强行交付会把上一次交付的文件当成删除提上去 |
+| **白名单目录内有 git 管不到的本地修改** | W-path 减 W-file 的差集里有 `M`（§6.3.2、§8.1 #2） | **不做任何修改** | 列出这些文件，说明 D6 的 `svn update` 会走到它们头上、而客户端对它们没有恢复手段，要求用户确认后才继续（形式同 §7.2.1） |
+| **S9 / D8d rebase 吃掉 merge commit 独有的改动** | 内容守恒断言不过（§7.3.2） | **停下不动**；rebase 已完成，恢复靠 journal 里的 `origHead` 做 `git reset --hard` | 指出是哪个 merge commit、差异文件有哪些，引导把那部分改动提成普通 commit 再重来；**不自动 merge、不自动 `--rebase-merges` 重试** |
+| **D5 被拒：父目录不在提交里** | `newParentDirs` 没进 target 列表（§8.2.6） | 服务器侧什么都没发生；按 §8.5 完整回滚 D4 登记 | 原样展示 `E200009`；这是实现缺陷而非用户问题，导出 journal |
+| **⑤b revision 归一失败** | `svn update` 之后 `nodeRevs` 仍多值（§9.4.2） | **停在 ⑤b，不录基线** | 指出是哪个 `wc(P)` 没收敛、当前的多值集合是什么；引导去 TortoiseSVN 完整更新该目录后重来 |
+| **纳入集合核对不通过** | `git ls-files` 与配置声明的集合不符——工作树里的 `.gitignore` 盖掉了再入规则、或规则生成有 bug（§6.3.1） | **不创建基线**；初始化时整个回退、删掉刚建的 `.git` | 列出差异文件，并原样显示 `git check-ignore -v --non-matching` 的输出（它直接指出是哪个文件第几行干的） |
+| **白名单子树内有跨仓库的嵌套 external** | `Code/Vendor` 之类指向另一个仓库（§6.5 P4、§6.5.5） | **不做任何修改**，仓库不进入可用状态 | 指出是哪条嵌套 external 属于哪个仓库；说明它会被 git 跟踪却不受 `nodeRevs` 监控，且 D5 会以 E200007 被拒 |
 | 任意步骤客户端崩溃 | — | 靠 §7.6 的写前 journal | 重开后按 `phase` 给出对应的继续 / 放弃入口；`prepare` / `building-deliver` / `deliver-built` / `checked-out` 四个 phase 的放弃入口一律走 §8.2.4 统一收尾 |
 
 ## 14. 测试策略
@@ -2396,7 +2886,8 @@ svn checkout file:///<tmp>/repo  <tmp>/wc2     ← 「同事」，用来制造�
 | 10 | 未初始化的 SVN 工作副本（有 `.svn` 无 `.git`）的识别 | 3 |
 | 11 | **白名单外的文件绝不出现在任何 git / svn 命令的参数里** | 3、4 |
 | 12 | 同步进行中的并发 invoke 被正确拒绝 | 5 |
-| 13 | **mixed revision 检测**：wc2 只提交一个深层文件，wc1 的根 revision 不动，`nodeRevs` 校验必须报失同步（§6.6.1） | 1、3 |
+| 13 | **mixed revision 检测**：**在 wc1 自己身上**用外部 `svn` 命令只提交一个深层文件（`svn commit -- <单个文件>`），wc1 的根 revision 不动，断言 `nodeRevs` 变成**多值**、校验报失同步（§6.6.1）。⚠️ **不能用「wc2 提交、wc1 不动」来造这个场景**——实测那样做 wc1 的 `.svn` 元数据纹丝不动，`nodeRevs` 仍等于基线，正确实现**本就不该报**；那测的是「服务器有新提交」，不是本地 mixed-revision（`AGENTS.md` §8 测试名称与真实形态一致） | 1、3、9 |
+| 13b | **「服务器有新提交」不得被误报成失同步**：wc2 提交、wc1 完全不动，断言 `nodeRevs == {baselineRev}` 且**不报**失同步（这是 13 的对照组，两个方向都要测） | 1、3 |
 | 14 | **断网查证**：制造「提交成功但客户端认为失败」，用 opid / changed-paths 在完整区间内正确判定（§8.6.2）；另测假阳性场景——先用同样的 message 提交过一次 | 1、2 |
 | 15 | **D6 白名单外有本地修改时交付仍安全**：wc1 改一个美术文件不提交，wc2 提交别的内容，走完整交付，断言美术文件的本地修改**未被合并、未产生冲突文件**（§8.2.1） | 2、4 |
 | 16 | **逐 phase 崩溃恢复**：在 S1 后、**D0.5 构造中途**、**D0.5 完成后**、D3.8 后、D4 后、D5 后各杀一次进程，重开必须能按 journal 给出正确的继续 / 放弃路径；D0.5 那两次要断言临时 worktree 被清理、`deliverRef` 被删、HEAD 仍在 `origBranch`；D3.8 后那次要断言能切回 `origBranch` 并清掉 `deliverRef`（§7.6、§8.2.4、§8.5） | 2、5 |
@@ -2440,6 +2931,16 @@ svn checkout file:///<tmp>/repo  <tmp>/wc2     ← 「同事」，用来制造�
 | 56 | **未提交改动时的递归 update 不是静默丢失**：pinned external 里留未提交改动，跑根级递归 update，断言产生冲突标记而非无声回退——两种形态要分别处理，不能合并（§6.5.3 测点 D） | 1、2 |
 | 54 | **跨多个同仓库 WC 的交付是原子的**：白名单同时覆盖项目根与同仓库 external，一次交付触及两侧，断言产生**单个** revision，且 `nodeRevs` 并集在 update 之后收敛到同一个 N（§6.6.5 E4、E6） | 1、2 |
 | 50 | **`svn status -v --xml` 的解析**：断言取的是 `<wc-status revision>` 而非 `<commit revision>`——构造一个「所有文件 base 都是 rN、但最后修改 revision 各不相同」的 fixture，断言 `nodeRevs == {N}`；并断言解析走 XML parser（属性跨行的输入不会解析成空集）（§6.6.4） | 1、3 |
+| 57 | **旧基线分支交付必须被前置拒绝**：从同一基线开 A / B 两个分支，A 走完整交付推进 `svn/base`，再切到 B 发起交付。断言 §8.1 #0 拒绝、**SVN 侧一个字节没动**；再断言若绕过该检查，D1 的两点 diff 会把 A 新增的文件列成 `D`（**这一条作为反向证据单独断言，证明这道门禁拦的是真问题**）（§8.1.2） | 1、3、4 |
+| 58 | **`svn info` 不得带 `--ignore-externals`**：断言实现发出的 `svn info` 命令行里**没有**这个参数；再断言带上它时 svn 返回非零并被识别为实现缺陷而非仓库问题（§4.4） | 1、3 |
+| 59 | **`.svn` 在任何深度都不进 git**：白名单覆盖一个 external 根，分别用 `extensions: [".cs", ".db"]` 和 `extensions: ["*"]` 生成规则，断言 `git ls-files` 里**没有**任何 `.svn/` 下的路径（含 `wc.db` 与 `pristine/**/*.svn-base`），且 `git check-ignore -v` 指向兜底那一行（§6.3） | 4、9 |
+| 60 | **工作树里的 `.gitignore` 盖不掉再入规则**：在白名单目录里预置一个 `.gitignore`（内容 `*.cs`），断言初始化的纳入集合核对**阻断**、不创建基线，且错误信息里含 `git check-ignore -v --non-matching` 指认的那个文件与行号（§6.3.1） | 1、3、9 |
+| 61 | **白名单子树内的跨仓库嵌套 external 必须被拒**：fixture 造「`Code/` 是 repo1 的 external，`Code/Vendor` 是 repo2 的 external」，断言 P4 在**枚举到嵌套 WC 之后**拒绝、不发生任何 git / svn 写操作；再单独断言「只查白名单根」的旧写法会**放行**（反向证据，证明 §6.5.5 的枚举不是过度设计） | 3、4 |
+| 62 | **交付新增嵌套目录下的文件**：交付 `Code/Deep/Nested/New.cs`（两层父目录都是新的），断言 D5 成功、`svn log -v` 里三条 `A` 都在；再断言同目录下另一个**已 `svn add` 但不属于本次交付**的文件**没有**被顺带提交（`--depth=empty` 的作用）（§8.2.6） | 1、3、4 |
+| 63 | **rebase 内容守恒断言**：① 构造 evil merge（合并后在 merge commit 里 `--amend` 加一个文件），走 `sync_in`，断言 S9b **拦下**且分支可按 `origHead` 还原；② 普通线性分支 + 真实三方合并，断言**不误报**；③ 已交付 commit 被 `--empty=drop` 丢弃，断言**不误报**。三个方向缺一不可（§7.3.2） | 1、2、9 |
+| 64 | **恢复流程能修好 mixed-revision**：**在 wc1 自己身上**外部只提交一个文件造出 `nodeRevs` 多值，走 §9.4，断言 ⑤b 之后 `nodeRevs` 收敛到单值、新基线的 rev 取的就是它，且**流程结束后立刻重新检测不再报失同步**（§9.4.2） | 1、2、3 |
+| 65 | **D6 会碰到 git 管不到的文件**：白名单目录里放一个被扩展名排除的文件（`.psd`），wc1 改它不提交，断言 §8.1 #2 把它列进确认清单；再构造「D5 之后 wc2 提交了该文件的冲突改动」，断言 D6 产生 `C` + `.mine`/`.rN` 时按 §13 明确报成「git 管不到的文件」而不是普通冲突（§8.2.1、§6.3.2） | 1、2、4 |
+| 66 | **断网查证用的是 Repository Root**：fixture 造两条同仓库 external（`code` / `script`），只交付 `script` 下的文件并制造「提交成功但客户端认为失败」，断言查证**命中** opid、判定成功、不回滚；再断言若用 `svnUrl`（`code` 的 URL）查则**查不到**——两个方向都要测（§8.6.2） | 1、2、9 |
 
 ### 14.3 前端
 
@@ -2472,9 +2973,14 @@ exclude 生成与图合成都在 Rust 侧，由 cargo test 覆盖。
     「外部工具无法阻止」同源；交付走客户端是这套方案的前提
 12. **`sync_in` 的 rebase 会压平 merge commit**。S9 和 D8d 用的都是
     `git rebase --empty=drop svn/base`，不带 `--rebase-merges`，所以用户在 IDE 里
-    合出来的 merge 点会在下一次同步时被线性化。这不会报错也不会丢改动，但会**静默
-    改写历史形状**。之所以接受：基线侧是 SVN 的线性历史，工作分支迟早要被压成线性
-    才能交付；真要保留 merge 形状，就得先解决 §8.1 #6 拦下的那类问题
+    合出来的 merge 点会在下一次同步时被线性化，**静默改写历史形状**。之所以接受：
+    基线侧是 SVN 的线性历史，工作分支迟早要被压成线性才能交付；真要保留 merge 形状，
+    就得先解决 §8.1 #6 拦下的那类问题。
+    ⚠️ **初版这条还写了「也不会丢改动」，那半句是错的**——evil merge（改动只存在于
+    merge commit 自身、且线性重放时不冲突）会被无冲突、无告警地吃掉，2026-09-13 实测
+    见 §7.3.2。现在由 S9b / D8d 的**内容守恒断言**兜底：能检出并停下，但**不能自动
+    保住**那部分改动，用户仍要自己把它提成普通 commit。所以「形状会被改写」是接受的
+    取舍，「内容可能丢」是**被拦住的失败**，两者不是一回事
 13. **待交付历史含 merge commit 且需走慢路径时会被拒绝**（§8.1 #6）。`cherry-pick`
     对 merge 没有安全的自动语义（§8.2.3 T4 / T5 实测）。缓解手段同第 10 条：把
     Local-Only commit 移到分支顶端转成快路径，快路径不受 merge 影响
@@ -2517,6 +3023,21 @@ exclude 生成与图合成都在 Rust 侧，由 cargo test 覆盖。
 24. **`.git` 放项目根，而白名单文件可能在嵌套工作副本里**（§1.1.1）。git 不在乎这件事，
     但这意味着 §12.3 那三层「防 `.git` 被误提交」的防护要挂在**项目根**那个工作副本上，
     而失同步检测挂在**白名单所属**的工作副本上——两者不是同一个 WC，实现时不要合并
+25. **白名单目录里那些 git 管不到的文件，客户端保护不了**（§6.3.2 的 W-path 减 W-file
+    差集）。`svn update` 的 target 只能是路径，所以 D6 与 §9.4 ⑤b 都会递归走到它们
+    头上。已做的是把它们在**动手之前**列进确认清单（§8.1 #2）；消不掉的是 D3.5 到 D6
+    之间那个窄竞态——同事恰好在此期间提交了其中某个文件的冲突改动时，`.mine` / `.rN`
+    会出现在 D5 之后，客户端只能如实报告，引导去 TortoiseSVN。缩小这个差集的办法在
+    用户手里：把 `extensions` 配得更准，或者不要把非代码文件放进白名单目录
+26. **新增的 `svn:externals` 不在检测范围内。** P4 / P5 与 §6.5.5 的枚举都只在
+    **初始化时**跑一次。此后团队往白名单子树里新挂一条跨仓库 external，客户端不会
+    主动发现；表现是 git 开始跟踪一批不受 `nodeRevs` 监控的文件，直到某次交付撞上
+    E200007 才暴露。§16.0 建议的那条只读核对命令要在「团队改过 externals 之后」
+    重跑一次，这件事目前靠人记得，没有自动化
+27. **内容守恒断言依赖 `git merge-tree --write-tree`**（§7.3.2）。这是较新的 git 才有的
+    形式（本机 2.51.2 实测可用；具体从哪个版本引入**未核实，不要写死版本号**）。实现
+    必须**显式探测该子命令是否可用**，探测失败时按 §6.8.6 同样的原则处理：**标记
+    「本次 rebase 未经守恒校验」并如实显示，不得当成通过**
 
 ## 16. 分期
 
@@ -2565,9 +3086,9 @@ foreach ($d in 'Assets','Code','Script','Documents') {   # 换成实际的顶层
 | 期 | 内容 | 验收 |
 |---|---|---|
 | **Phase 0** | `trait Vcs` + `GitBackend`（现有代码搬家，**行为零变化**） | 现有全部测试绿 + 手工 E2E 与改动前无差异 |
-| **Phase 1** | 仓库识别、配置、exclude 生成、初始化向导、`SvnClient`（info / status / log 的 XML 解析）、状态判定与失同步检测（**只报警**）、**「重建基线」最小手段**、**基线体检（§6.8）**、混合图只读 | 能打开 SVN 仓库，本地 git 的暂存/分支/stash 可用，看得到 SVN 历史。**还不能 update / deliver**；基线会因外部 TortoiseSVN 操作而失同步，此期只报警 + 提供「重建基线」 |
-| **Phase 2** | `sync_in` 完整流程 + 全部失败路径 + 中断持久化 + 冲突解决 UI + **§9.4 基线恢复向导**（复用同一套 stash / checkout / rebase 编排） | 能更新 |
-| **Phase 3** | `sync_out` + 确认关口 + 精确回滚 + 传输中断查证 + **本地补丁的摘除与回落**（§8.2.3） | 能交付，闭环 |
+| **Phase 1** | 仓库识别、配置、exclude 生成、初始化向导、`SvnClient`（info / status / log 的 XML 解析）、状态判定与失同步检测（**只报警**）、**「重建基线」最小手段**、**基线体检（§6.8）**、**纳入集合核对（§6.3.1）**、**P4 的嵌套 WC 枚举（§6.5.5）**、混合图只读 | 能打开 SVN 仓库，本地 git 的暂存/分支/stash 可用，看得到 SVN 历史。**还不能 update / deliver**；基线会因外部 TortoiseSVN 操作而失同步，此期只报警 + 提供「重建基线」 |
+| **Phase 2** | `sync_in` 完整流程 + 全部失败路径 + 中断持久化 + 冲突解决 UI + **§9.4 基线恢复向导**（复用同一套 stash / checkout / rebase 编排，含 ⑤b 的 revision 归一，§9.4.2）+ **S8b/S9b 的内容守恒断言（§7.3.2）** | 能更新 |
+| **Phase 3** | `sync_out` + 确认关口 + 精确回滚 + 传输中断查证（按 `Repository Root` 查，§8.6.2）+ **本地补丁的摘除与回落**（§8.2.3）+ **§8.1 #0 的基线祖先前置**（§8.1.2）+ **`newParentDirs` 进 target**（§8.2.6） | 能交付，闭环 |
 | **Phase 4** | 白名单外改动视图与 revert、`.git` 误提交三层防护、svn 节点 diff | 补齐日常缺口 |
 
 **Phase 0 单独拆出是有意的。** 它是纯重构、零行为变化，可独立验证，风险最低；
@@ -2643,6 +3164,38 @@ Phase 1 到 Phase 3 之间用户手工走 TortoiseSVN 交付时，本地补丁�
 误导性的错误上。
 
 ## 18. 修订记录
+
+### 2026-09-13（九）· 第四轮对抗性 review：11 条全部复核成立并修入
+
+外部 review 提了 8 条 P1 + 3 条 P2。**逐条在临时 fixture 上实测复核，11 条全部成立，
+没有一条是误报**，全部修入。实测环境：SlikSvn 1.14.2 + `svnadmin create` 临时仓库、
+git 2.51.2 临时仓库，跑完即删。
+
+| # | 问题 | 实测证据 | 修在哪 |
+|---|---|---|---|
+| P1-1 | §4.4 要求 `svn info` 带 `--ignore-externals`，而该子命令**拒绝**这个参数 | `Subcommand 'info' doesn't accept option '--ignore-externals'`，exit 1 | §4.4 改成按子命令区分的表；`info` 默认就不遍历 externals，本来也不需要。§6.6.4 / §6.8.2 的重述同步修正 |
+| P1-2 | 从旧基线分出的另一个分支交付时，D1 的**两点** diff 把别人刚交付的文件算成删除并提交回服务器 | `git diff svn/base..B` → `D ANew.cs`；三点 diff 只有 `A BOnly.cs` | **新增 §8.1 #0**（`merge-base --is-ancestor`）与 §8.1.2。附带发现 D8a 会把基线**倒退**，而 D8d 的 `--ff-only` 此时反而成立、抓不到 |
+| P1-3 | §8.2.1 声称 D6 「范围限定在 git 管得住的文件上」——把 W-path 当成了 W-file | `svn update -- Code` 对被扩展名排除的 `.psd` 产出 `G`；重叠改动产出 `C` + `.mine`/`.r5`/`.r6` | **新增 §6.3.2** 把两种粒度定死；§8.2.1 重写论证并写出残余风险；§8.1 #2 补 W-path 侧的确认 |
+| P1-4 | §15 第 12 条声称压平 merge「不丢改动」 | evil merge 的 `evil.txt` 被 `rebase --empty=drop` **无冲突、无告警**吃掉 | **新增 §7.3.2** 的内容守恒断言（`merge-tree --write-tree` 当参考树），S9b / D8d 各挂一道；§15 第 12 条改写 |
+| P1-5 | D5 的 target 只有文件，`svn add --parents` 带出的父目录没进去 | `svn: E200009: '…Nested' is not known to exist in the repository and is not part of the commit, yet its child '…New.cs' is part of the commit` | **新增 §8.2.6**：D4 记 `newParentDirs`，D5 带上它并加 `--depth=empty`（实测不会顺带提交同目录下别的登记） |
+| P1-6 | §9.4 ⑥ 假定重读的 `nodeRevs` 是单值，而恢复流程的**主场景**本身就是 mixed-revision | 局部提交后 `{1,3}`；`svn revert -R` 后**仍是** `{1,3}`；只有 `svn update` 收敛到 `{3}` | **新增 ⑤b 归一步骤 + §9.4.2**；仍多值则停下报错，绝不硬造基线 |
+| P1-7 | P4 只查白名单根，白名单子树内的跨仓库嵌套 external 整个漏过 | `svn info Code` → repo1 的 uuid（P4 通过）；`svn info Code/Vendor` → repo2 的 uuid；`status --ignore-externals` 输出 `X Code\Vendor`，其内容既不在 `nodeRevs` 里、又被 git 跟踪 | **新增 §6.5.5**，P4 改成枚举白名单递归覆盖到的**全部** WC |
+| P1-8 | §8.6.2 的断网查证绑在 `svnUrl`（工作副本 URL）上，而代码分布在多条 external | 只碰 `Script/` 的提交：`svn log <Root>` 命中 opid 1 次，`svn log <Root>/Code` 命中 **0** 次 | §8.6.2 改用 `Repository Root`；§6.2.1 补一张「哪个用途用哪个 URL」的表 |
+| P2-9 | exclude 的递归再入规则会把 external 根里的 `.svn` 一起纳入 | `extensions: ["*"]`（§6.3 明文推荐的写法）下 `git ls-files` 含 `Code/.svn/wc.db` 与 `pristine/**/*.svn-base` | §6.3 的生成规则末尾**必须**有 `.svn/` 兜底行（最后一条匹配的模式说了算）。后果不只是恢复旧数据，是在活着的工作副本底下换掉 `wc.db` |
+| P2-10 | 工作目录里的 `.gitignore` 优先级高于 `.git/info/exclude`，§3 那句「不用它」只是声明 | `Code/.gitignore` 一行 `*.cs` → `git ls-files` **空**，`check-ignore -v` 指向它 | **新增 §6.3.1**：初始化加一道「纳入集合核对」（行为断言，顺带覆盖 `core.excludesFile` 与生成器 bug） |
+| P2-11 | 测试 13 名为「mixed revision 检测」，造的却是「服务器有新提交」 | wc2 提交后 wc1 的 `svn status -v` 全部仍是 revision 1，`nodeRevs == baselineRev`，正确实现**本就不该报** | 测试 13 改成「在 wc1 自己身上局部提交」，并**新增 13b 作为对照组**（`AGENTS.md` §8 测试形态一致性） |
+
+同时新增测试 57–66 覆盖以上每一条，多数带**反向断言**（旧写法必须放行 / 新检查必须
+不误报）——只测「改完之后对」证明不了这些门禁是必需的。
+
+两条需要留意的**修法边界**，不要照 review 的字面理解：
+
+- **P1-3 不能靠「D6 改成按文件 target 更新」解决。** 只更新交付过的文件会让白名单里
+  其余节点停在旧 revision，`nodeRevs` 立刻多值、失同步误报。W-path 粒度的 update 在
+  结构上是必需的，所以修法落在**前置确认**，残余竞态如实写进 §15 第 25 条
+- **P1-4 的触发面比字面窄。** 冲突解决型 merge **不**会静默丢（线性重放会再撞一次
+  同样的冲突），真正会丢的只有 evil merge。§15 第 12 条按这个精度改，不要写成
+  「所有 merge 都危险」
 
 ### 2026-09-13（八）· 前置可行性确认，并回退一次过度概括
 
@@ -2845,12 +3398,14 @@ svn status -v --xml --ignore-externals .  → wc-status@revision = {29825}      
 另外确认：`svn diff` **不接受** `--ignore-externals`，但也**不需要**——实测它不递归进
 externals（对着含 6 个 external 的 `ext/` 体检，输出 0 行）。所以「统一加
 `--ignore-externals`」只约束 `status` / `info` / `update`。
+~~（**这句把 `info` 算错了，已于下一轮（九）作废**：`svn info` 与 `diff` 一样拒绝这个
+参数，正确的子命令表见 §4.4）~~
 
 | 改动点 | 内容 |
 |---|---|
 | §1.2 | externals 那条加注「不支持 ≠ 可以无视」，指向 §6.6.4 |
 | §2.2 | 实测表补 `svn://` 成功的三行；结论收窄为「只有 `file://` 不通」，并拆成生产侧／测试侧两段；写明本设计不用 `git svn`、§14.1 照旧有效 |
-| §4.4 | `SvnClient` 新增两条硬规则：`status` / `info` / `update` 一律带 `--ignore-externals`；`--xml` 必须用真 XML parser，禁止行内正则 |
+| §4.4 | `SvnClient` 新增两条硬规则：`status` / `info` / `update` 一律带 `--ignore-externals` ~~（**`info` 已于下一轮（九）作废**，该子命令拒绝此参数，见 §4.4 的子命令表）~~；`--xml` 必须用真 XML parser，禁止行内正则 |
 | §6.2.1 | 白名单拒绝落在 `svn:externals` 内的路径 |
 | §6.4.1 | 补 trailer 格式的真实产物核对 |
 | §6.5 | P1 补 `--ignore-externals`；P2 写明读法与「无效引导」；**新增 P4**：白名单不得落在 externals 内 ~~（**已于下一轮（六）作废并重写**，见 §6.5 P4 / P5）~~ |
