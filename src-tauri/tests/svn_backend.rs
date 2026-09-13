@@ -3,6 +3,7 @@
 #[path = "common/svn_fixtures.rs"]
 mod svn_fixtures;
 
+use app_lib::commands::repo::{probe_svn_environment, read_capabilities};
 use app_lib::engine::svn_exclude::{generate_exclude, write_exclude};
 use app_lib::vcs::{backend_for, detect_repo_kind, RepoKind};
 use std::fs;
@@ -166,6 +167,78 @@ fn an_svn_backend_hides_the_git_only_entries() {
     assert!(!caps.pull_requests);
     assert!(!caps.cherry_pick);
     assert!(!caps.patches);
+}
+
+#[test]
+fn the_read_capabilities_command_returns_what_the_backend_says() {
+    // 直接调命令函数本体。这**不能**替代真实窗口验证——Tauri 的
+    // snake_case ↔ camelCase 参数名转换发生在 IPC 层，这里碰不到它
+    // （`AGENTS.md` §7.3）。它能证明的是命令体本身没有绕过 backend_for
+    // 自己拼一套判定，以及错误照常向上抛。
+    let fx = svn_repo();
+    hybrid(&fx);
+    let caps = read_capabilities(fx.wc_str()).unwrap();
+    assert_eq!(caps, backend_for(&fx.wc_str()).unwrap().capabilities());
+    assert!(!caps.worktrees);
+
+    let dir = TempDir::new().unwrap();
+    git_init(dir.path());
+    assert!(
+        read_capabilities(dir.path().to_string_lossy().to_string())
+            .unwrap()
+            .worktrees
+    );
+
+    // 打不开的仓库要报错，不能悄悄返回一个「全都不支持」的能力集合
+    // ——那会让界面变成一块空白，而不是一条错误横幅。
+    let blocked = svn_repo();
+    let err = read_capabilities(blocked.wc_str()).expect_err("未初始化的工作副本必须报错");
+    assert_eq!(err.code, "svn_not_initialized");
+}
+
+#[test]
+fn capabilities_serializes_to_the_exact_field_names_the_frontend_reads() {
+    // `AGENTS.md` §7.3：Rust 与 JS 之间的字段名转换**没有编译期检查**。
+    // `tsc` 只看 `src/engine/capabilities.ts` 里的接口声明，它不知道 Rust 那边
+    // 真正吐出来的是什么；`#[serde(rename_all = "camelCase")]` 哪天被删掉，
+    // JS 会拿到 `pull_requests` → 读 `caps.pullRequests` 得到 `undefined`
+    // → falsy → **入口莫名其妙全消失了**，而两侧都编译通过、没有任何报错。
+    //
+    // 这条把那层转换的结果钉死在一组字面量上。下面这六个键必须与
+    // `src/engine/capabilities.ts` 的 `interface Capabilities` 逐字一致。
+    let json = serde_json::to_value(app_lib::vcs::Capabilities::all()).unwrap();
+    let obj = json.as_object().expect("Capabilities 应当序列化成对象");
+    let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "cherryPick",
+            "patches",
+            "pullRequests",
+            "remotes",
+            "tags",
+            "worktrees",
+        ],
+        "字段名与前端 interface Capabilities 对不上"
+    );
+    assert!(obj.values().all(|v| v == &serde_json::Value::Bool(true)));
+}
+
+#[test]
+fn the_probe_svn_environment_command_reports_one_of_three_states() {
+    // ⚠️ 这个命令在 Phase 1a **没有前端调用方**（它是给 1b 的初始化向导准备的），
+    // 所以它的 invoke 路径没法在真实窗口里验证。这条至少把命令体和它的
+    // 三态契约钉住：前端要靠这三个字符串分流「去装 / 重启应用 / 正常」，
+    // 塌缩成两态就等于把「装完了但应用没重启」错报成「没装」（spec §17.1）。
+    let state = probe_svn_environment().unwrap();
+    assert!(
+        ["available", "stale_path", "not_installed"].contains(&state.as_str()),
+        "返回值必须是三态之一，实际 {state:?}"
+    );
+    // 开发机装了 SlikSvn（spec §17），这里应当是 available；不是的话说明
+    // 探测逻辑坏了，而不是环境变了——tests/svn_cli.rs 同一前提下是绿的。
+    assert_eq!(state, "available");
 }
 
 #[test]

@@ -29,7 +29,7 @@
 | 6 纳入集合核对 | ✅ 完成 | `engine/svn_include_check.rs`、`engine/mod.rs`、`tests/svn_exclude.rs`（追加） | fmt ✓ clippy 零告警 ✓ `--test svn_exclude` **17 passed**（9 + 8；计划写的是 3，多的 5 条见下）✓ `cargo test` **284 passed / 0 failed / 27 个二进制**（= 276 + 8） |
 | 7 仓库识别 / capabilities / backend_for 分流 | ✅ 完成 | `vcs/mod.rs`、`vcs/git.rs`、`vcs/svn.rs`、`commands/repo.rs`、`lib.rs`、`tests/svn_backend.rs` | fmt ✓ clippy 零告警 ✓ `--test svn_backend` **11 passed**（计划写的是 9）✓ `cargo test` **295 passed / 0 failed / 28 个二进制**（= 284 + 11）。⚠️ 两个新 Tauri 命令的真实窗口验证在 Task 9 |
 | 8 前端按能力隐藏入口 | ✅ 完成 | `src/engine/capabilities.ts`、`src/engine/toolbarActions.ts`、`src/engine/commitActions.ts`、`src/store/repoStore.ts`、`RepoTab.tsx`、`BranchView.tsx`、`GraphView.tsx`、`Toolbar.tsx`、`tests/vitest/capabilities.test.ts`、`tests/vitest/commitActions.test.ts` | `pnpm build`（含 tsc）✓ `pnpm test` **266 passed / 20 files**（= 257 + 9；计划写的是 3）。⚠️ 真实窗口验证在 Task 9 |
-| 9 收尾验证 | ⬜ 未开始 | | |
+| 9 收尾验证 | 🟡 进行中 | 本文件、`tests/svn_backend.rs`（+3） | 9.1 ✓ 9.2 ✓ 9.3 ✓ 全套：Rust **298 passed / 0 failed / 28 个二进制**、fmt ✓ clippy 零告警；前端 `pnpm build` ✓ `pnpm test` **266 passed / 20 files**。9.4 真实窗口验证与 9.6 独立 review 见下 |
 
 ### 开工自检（`AGENTS.md` §4.2）
 
@@ -115,11 +115,27 @@ reviewer 另外排除了两条疑虑，一并记下免得以后重新怀疑：`c
 
 #### 偏离计划
 
-（暂无）
+- **每个 Task 的测试数都比计划多，合计 72 对 41**（逐文件对账见 Task 9 的 9.1）。
+  没有一处是少的。多出来的绝大部分属两类：给「名字比覆盖范围大」的测试补齐真实
+  形态（`AGENTS.md` §13 rubric #9），以及给防御性改动补**反向验证**
+  ——摘掉保护后测试必须变红，否则它证明不了任何事。本期有三条做过反向验证：
+  `-z`、`core.ignoreCase`、`#[serde(rename_all)]`。
 
 #### 计划的错误
 
-（暂无）
+计划里的**测试代码**错得比实现代码多，且集中在同一类：**没有真的跑过**。
+逐条记在各 Task 下，共同点在这里说一次——
+
+| Task | 错在哪 | 会怎样 |
+|---|---|---|
+| 5 | 「按条目流水线输出」exclude 规则 | 白名单条目互相包含时静默丢文件 |
+| 6 | 两条测试漏了 `git add -A` | 一条必挂，一条以「报缺失」的错误理由变绿 |
+| 7 | `expect_err` 用在 `Result<Box<dyn Vcs>, _>` 上 | 编译不过（`Box<dyn Vcs>` 没有 `Debug`） |
+| 7 | `#[path = "svn_fixtures.rs"]` | 路径不对（Task 4 已挪进 `common/`） |
+| 8 | `visibleSections` 的六分区模型 | 对不上真实组件树，该关的两处一个都关不到 |
+
+**教训**：计划里的代码块是**未经执行的草稿**，不是可以照抄的实现。尤其是测试——
+一条从没跑过的测试，最可能的形态就是「能编译、能变绿、但测的不是它名字说的东西」。
 
 #### 计划没写的坑
 
@@ -674,6 +690,117 @@ X 的真实形态。修法是让它先真的 `git add -A` 把 `.svn/wc.db` 送�
   照样打得进去。
 - 已 grep 全部 `src/components` 与 `src/store`，确认这批命令的**唯一**入口都在
   已裁剪的组件里，没有漏网的按钮。
+
+---
+
+### Task 9：收尾验证
+
+#### 9.1 两侧全套检查（实测数字）
+
+| | 基线（master） | 本分支 | 增量 |
+|---|---|---|---|
+| Rust 测试 | 226 passed / 22 个二进制 | **298 passed / 0 failed / 28 个二进制** | +72 / +6 |
+| `cargo fmt --check` | — | ✓ 干净 | |
+| `cargo clippy --all-targets` | — | ✓ 零告警 | |
+| 前端 vitest | 257 passed / 19 files | **266 passed / 20 files** | +9 / +1 |
+| `pnpm build`（含 tsc） | — | ✓ 通过 | |
+
+Rust 增量按测试文件拆开对账：
+
+| 文件 | 计划预估 | 实际 |
+|---|---|---|
+| `svn_cli.rs` | 4 | 8 |
+| `svn_xml.rs` | 6 | 11 |
+| `svn_config.rs` | 8 | 16 |
+| `svn_wc.rs` | 4 | 6 |
+| `svn_exclude.rs`（Task 5 + 6） | 7 + 3 | 9 + 8 = 17 |
+| `svn_backend.rs` | 9 | 14 |
+| **合计** | **41** | **72** |
+
+计划自己写了「以实测为准，不要照抄这个数字——对不上就说明有 Task 的测试没写全或写多了，两种都要查」。这里是**每个文件都多**，逐条原因已记在各 Task 的「偏离计划」里，没有一处是少的。
+
+#### 9.2 命令注册对账
+
+```text
+grep -rn "#[tauri::command" src-tauri/src/commands/ | wc -l   → 47
+grep -c "commands::" src-tauri/src/lib.rs                     → 46
+```
+
+差的那 1 个是 `commands/session.rs:9` 的**文档注释**里提到了 `#[tauri::command(async)]`，不是命令定义——Phase 0 记过这个坑，实测确认还在。真实命令数 **46**，与注册数相等。
+
+`git show master:src-tauri/src/lib.rs` 的注册数是 **44**，差值正好 **+2**（`read_capabilities`、`probe_svn_environment`）。
+
+#### 9.3 确认没有 SVN 写操作混进来（G8）
+
+在 `src-tauri/src/engine/svn_*.rs` 与 `src-tauri/src/vcs/svn.rs` 上扫 `add|commit|update|revert|delete|propset|checkout|import|copy|move|mkdir|lock|unlock|merge|switch|relocate|cleanup|resolve|resolved` —— **零输出**。
+
+再正面列一遍这些模块实际发出的 svn 子命令：
+
+```text
+"info",   "--xml", "--", <target>
+"status", "--xml", "--", <target>
+```
+
+**只有这两条，都是只读。** fixture 构造里有 `svn add` / `commit` / `propset`，那在 `tests/common/` 下，不在 `src/`。
+
+#### 偏离计划
+
+- **多加了两条命令层测试**（`svn_backend.rs` 从 11 到 13）：
+  `the_read_capabilities_command_returns_what_the_backend_says` 与
+  `the_probe_svn_environment_command_reports_one_of_three_states`。理由见下方
+  「计划没写的坑」的第一条。
+
+#### 计划没写的坑
+
+- **`probe_svn_environment` 在 Phase 1a 没有任何前端调用方。** 它是给 1b 的初始化
+  向导准备的，本期只是注册上去。后果是**它的 invoke 路径没办法在真实窗口里验证**
+  ——`AGENTS.md` §5.1 要求新命令必须实际跑一次 `pnpm tauri dev` 确认 invoke 真的通，
+  而没有调用方就没有可点的入口。
+
+  已补一条 Rust 测试直接调命令体，把三态契约钉住（前端要靠这三个字符串分流
+  「去装 / 重启应用 / 正常」，塌缩成两态就等于把「装完了但应用没重启」错报成
+  「没装」，spec §17.1）。但**那不能替代 IPC 验证**，如实记在这里：
+  **`probe_svn_environment` 的 IPC 往返在本期属未验证**，1b 接上向导时必须补。
+
+- **命令层测试证明不了 snake_case ↔ camelCase。** 那层转换发生在 Tauri 的 IPC
+  边界上，Rust 测试直接调函数根本碰不到它。已写进测试注释，免得下一个人看到
+  「命令有测试」就以为 §7.3 的要求满足了。
+
+#### 为什么整期这么改是安全的
+
+1. **本期没有任何 SVN 写操作** —— 9.3 的 grep 是证据，且正面列出了实际只发
+   `svn info` 与 `svn status` 两条只读命令。
+
+2. **普通 git 仓库的行为零变化。**
+   - `detect_repo_kind` 在没有 `.svn` 时**第一个分支**就返回 `Git`，连配置文件都
+     不去读；`backend_for` 走的还是原来那条 `GitBackend::new(path)`。
+   - `GitBackend::capabilities()` 返回全 true，前端三个裁剪函数在
+     `ALL_CAPABILITIES` 下的输出都有测试逐项断言与改动前一致。
+   - 既有的 226 条 Rust 测试与 257 条 vitest **一条都没改行为**（只有
+     `commitActions.test.ts` 的 7 处调用加了必填参数，断言全部原样）。
+
+3. **唯一的行为变化是一条新增的阻断**（`.svn` + 无配置的 `.git` → `svn_unconfigured_git`），
+   spec §6.1 明确要求，方向是「打不开」而不是「用错后端去写」。已写进
+   `backend_for` 的文档注释。
+
+4. **新增的两个命令都是只读的**：`read_capabilities` 只返回常量结构体，
+   `probe_svn_environment` 只跑 `svn --version --quiet` 和一次 `reg query`。
+
+5. **空列表在每一处都提前返回，不会退化成「全部」**（G6 / `AGENTS.md` §6.2）：
+   - `svn_wc::enumerate_wcs`：空白名单直接返回空列表，一条 svn 命令都不发
+   - `svn_include_check::actual_set`：空白名单直接返回空集，不发 `git ls-files`
+   - `svn_include_check::ls_files`：参数里带 `--` 分隔符
+   - `svn_config::normalize_whitelist_entry`：空串、纯空白、`.`、`./`、`..`、
+     前导 `-`、`:` 前缀全部拒绝
+   - 这三处各有测试，其中 `an_empty_whitelist_never_degenerates_into_everything`
+     是在一个**确实有被跟踪文件**的仓库上断言的，不是恒真
+
+6. **所有 fixture 都是临时目录里自建的**（`TempDir` + `git init` / `svnadmin create`），
+   跑完即删，不碰本仓库、用户仓库或任何仓库外的固定路径。
+
+7. **前端那层是表现层防线，不是接缝** —— 已在 `capabilities.ts` 的模块注释里
+   明说。绕过 UI 直接 invoke 照样能打进那批直连 git 的命令。这一条是**已知缺口**，
+   不是已解决的问题。
 
 ---
 
