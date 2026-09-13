@@ -6,6 +6,7 @@ import { SidebarSection, SidebarGroup } from './SidebarSection'
 import { usePrompt } from './PromptDialog'
 import { DeleteBranchDialog, type DeleteTargets } from './DeleteBranchDialog'
 import { useConfirm } from './ConfirmDialog'
+import type { Capabilities } from '../engine/capabilities'
 
 interface BranchViewProps {
   refs: RefPointer[]
@@ -39,6 +40,12 @@ interface BranchViewProps {
   onDeleteRemote: (remoteBranch: string) => Promise<void>
   /** 仓库路径，删除确认框要用它去查上游和未合并提交数。 */
   repoPath: string | null
+  /**
+   * 后端能力。`Remote` 分组与 PR 徽章是 `BRANCHES` 分区**内部**的东西，
+   * 上层的 `visibleSections` 裁不掉，只能由本组件自己按
+   * `remotes` / `pullRequests` 决定。
+   */
+  capabilities: Capabilities
 }
 
 const shortName = (ref: RefPointer) =>
@@ -85,7 +92,7 @@ function PrBadge({ pr, branchHash }: { pr: PullRequest | undefined; branchHash: 
 
 export function BranchView({
   refs, pullRequests, head, selectedBranch, onSelect, onCheckout, onCreate, onRename, onDelete,
-  onCheckoutRemote, onDeleteRemote, repoPath,
+  onCheckoutRemote, onDeleteRemote, repoPath, capabilities,
 }: BranchViewProps) {
   const [creating, setCreating] = useState(false)
   const [newName, setNewName] = useState('')
@@ -219,7 +226,9 @@ export function BranchView({
             >
               <BranchIcon />
               <span className="sb-label">{name}</span>
-              <PrBadge pr={pullRequestForRef(prByBranch, ref)} branchHash={ref.hash} />
+              {capabilities.pullRequests && (
+                <PrBadge pr={pullRequestForRef(prByBranch, ref)} branchHash={ref.hash} />
+              )}
               <SyncBadge ahead={ref.ahead} behind={ref.behind} />
               {name === head && <span className="sb-current-dot" title="当前分支" />}
             </div>
@@ -227,6 +236,9 @@ export function BranchView({
         })}
       </SidebarGroup>
 
+      {/* 远程分支在 SVN 混合仓库里没有对应物，而 checkout_remote_branch /
+          delete_remote_branch 都还没进接缝，仍直接跑 git CLI。整组不渲染 */}
+      {capabilities.remotes && (
       <SidebarGroup label="Remote" count={remote.length} defaultOpen={false}>
         {remote.map((ref) => (
           <div
@@ -241,6 +253,7 @@ export function BranchView({
           </div>
         ))}
       </SidebarGroup>
+      )}
 
       <ContextMenu menu={menu} onClose={close} />
       {dialog}

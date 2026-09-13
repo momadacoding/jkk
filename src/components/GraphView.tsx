@@ -8,6 +8,7 @@ import { WORKDIR_ID, withWorkdirRow } from '../engine/workdir'
 import { CommitRow } from './CommitRow'
 import { ContextMenu, useContextMenu } from './ContextMenu'
 import { commitMenu, type CommitAction } from '../engine/commitActions'
+import type { Capabilities } from '../engine/capabilities'
 
 const ROW_HEIGHT = 28
 const LANE_WIDTH = 20
@@ -28,12 +29,15 @@ interface GraphViewProps {
   onOpenChanges: () => void
   /** 右键菜单选中某一项。确认框、输入框和实际调用都由上层处理。 */
   onCommitAction: (action: CommitAction, commit: CommitNode) => void
+  /** 后端能力。不支持的菜单项整条不出现，由 `commitMenu` 裁剪。 */
+  capabilities: Capabilities
 }
 
 const renderer = createSvgRenderer()
 
 export function GraphView({
   commits, refs, pullRequests, selectedId, onSelect, headHash, changeCount, onOpenChanges, onCommitAction,
+  capabilities,
 }: GraphViewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const { menu, open, close } = useContextMenu()
@@ -147,12 +151,12 @@ export function GraphView({
     if (!commit) return
     // 右键先把这一行选上，菜单里的「哪一条」和 diff 面板显示的才是同一条
     onSelect(id)
-    open(e, commitMenu(commit, { isHead: id === headHash }).map((entry) => ({
+    open(e, commitMenu(commit, { isHead: id === headHash, caps: capabilities }).map((entry) => ({
       label: entry.label,
       disabled: entry.disabled,
       onSelect: () => onCommitAction(entry.action, commit),
     })))
-  }, [commits, headHash, onSelect, onCommitAction, open])
+  }, [commits, headHash, onSelect, onCommitAction, open, capabilities])
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {

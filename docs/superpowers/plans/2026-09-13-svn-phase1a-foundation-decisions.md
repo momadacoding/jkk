@@ -28,7 +28,7 @@
 | 5 exclude 规则生成 | ✅ 完成 | `engine/svn_exclude.rs`、`engine/mod.rs`、`tests/svn_exclude.rs` | fmt ✓ clippy 零告警 ✓ `--test svn_exclude` **9 passed**（计划写的是 7，多的 2 条覆盖「白名单条目互相包含」，见下）✓ `cargo test` **276 passed / 0 failed / 27 个二进制**（= 267 + 9） |
 | 6 纳入集合核对 | ✅ 完成 | `engine/svn_include_check.rs`、`engine/mod.rs`、`tests/svn_exclude.rs`（追加） | fmt ✓ clippy 零告警 ✓ `--test svn_exclude` **17 passed**（9 + 8；计划写的是 3，多的 5 条见下）✓ `cargo test` **284 passed / 0 failed / 27 个二进制**（= 276 + 8） |
 | 7 仓库识别 / capabilities / backend_for 分流 | ✅ 完成 | `vcs/mod.rs`、`vcs/git.rs`、`vcs/svn.rs`、`commands/repo.rs`、`lib.rs`、`tests/svn_backend.rs` | fmt ✓ clippy 零告警 ✓ `--test svn_backend` **11 passed**（计划写的是 9）✓ `cargo test` **295 passed / 0 failed / 28 个二进制**（= 284 + 11）。⚠️ 两个新 Tauri 命令的真实窗口验证在 Task 9 |
-| 8 前端按能力隐藏入口 | ⬜ 未开始 | | |
+| 8 前端按能力隐藏入口 | ✅ 完成 | `src/engine/capabilities.ts`、`src/engine/toolbarActions.ts`、`src/engine/commitActions.ts`、`src/store/repoStore.ts`、`RepoTab.tsx`、`BranchView.tsx`、`GraphView.tsx`、`Toolbar.tsx`、`tests/vitest/capabilities.test.ts`、`tests/vitest/commitActions.test.ts` | `pnpm build`（含 tsc）✓ `pnpm test` **266 passed / 20 files**（= 257 + 9；计划写的是 3）。⚠️ 真实窗口验证在 Task 9 |
 | 9 收尾验证 | ⬜ 未开始 | | |
 
 ### 开工自检（`AGENTS.md` §4.2）
@@ -591,6 +591,89 @@ X 的真实形态。修法是让它先真的 `git add -A` 把 `.svn/wc.db` 送�
   `create_tag` / `cherry_pick` / `save_patch` / `fetch` / `pull` / `push` 与整个
   `commands/worktree.rs`）**本 Task 一行都没动**。它们靠 Task 8 的前端不渲染入口
   来兜。这是一层**表现层**防线，不是接缝——如实记在这里，不要当成已经堵住了。
+
+---
+
+### Task 8：前端按能力隐藏 git 专属入口
+
+#### 偏离计划
+
+- **`visibleSections` 的取值集合与计划不同。** 计划写的是六个平铺分区
+  `['branches','remotes','tags','stashes','worktrees','pullRequests']`，但实际的
+  组件树不是这个形状（见下方「计划的错误」）。改成与 `RepoTab` 渲染顺序一致的
+  四个：`['branches','tags','worktrees','stashes']`。
+
+- **多了两个纯函数，都放在 `src/engine/`**（本仓库的约定是纯逻辑下沉、组件只渲染）：
+  - `toolbarActions.ts` 的 `visibleToolbarActions(caps)`
+  - `commitActions.ts` 的 `commitMenu` 增加 `ctx.caps`，按项裁剪
+
+- **`CommitMenuContext.caps` 是必填，不是可选。** 设成可选、默认全开的话，新加的
+  调用点忘了传就会在 SVN 仓库上静默多出一个直连 git 的菜单项。必填让 `tsc` 在
+  编译期报出来——**而它真的报了**：`RepoTab.tsx:262` 那个第二调用点就是 tsc 抓到的，
+  不是我翻出来的。代价是 `tests/vitest/commitActions.test.ts` 的 7 处调用要跟着改
+  （`tests/vitest/**` 不在 tsc 覆盖范围内，靠 vitest 兜）。
+
+- **多了一个常量 `NO_GIT_ONLY_CAPABILITIES`。** 只有 `ALL_CAPABILITIES` 的话，
+  将来加一个新能力字段时，「忘了在 SVN 侧关掉」没有任何东西能抓到。
+  测试里有一条专门比对两个常量的键集合。
+
+- **测试从 3 条加到 9 条**：分区 4 条、工具栏 2 条、提交菜单 3 条。
+
+#### 计划的错误
+
+- **计划的 `visibleSections` 模型对不上真实组件树。** 侧边栏实际只有四个
+  `SidebarSection`：`BranchView`（BRANCHES）、`TagView`、`WorktreeView`、`StashView`。
+  **远程分支和 PR 不是独立分区**——前者是 `BranchView` 内部的 `SidebarGroup "Remote"`，
+  后者是本地分支行上的 `PrBadge`。照计划写出来的 `visibleSections` 返回两个
+  渲染层根本用不上的字符串，而真正该关掉的两处一个都关不到。
+  改法是让 `visibleSections` 只管分区，`remotes` / `pullRequests` 由 `BranchView`
+  自己按 props 决定。
+
+- **计划的 Step 8.5 说「在打开仓库的两处 `invoke('open_repo')` 之后各加一次」。**
+  实际只有 `openRepo` 一处是「打开仓库」；另一处是 `refreshHead`，它只重读 HEAD，
+  在 checkout / pull 之后调用，那里再读一次能力纯属多余的 IPC。
+
+#### 计划没写的坑
+
+- **worktree 里没有 `node_modules`，`pnpm test` 会静默跑到主工作区去。**
+  第一次跑 `pnpm test` 的输出里文件路径是
+  `.claude/worktrees/svn-phase1a/tests/vitest/...`、`Test Files 167 passed`
+  ——pnpm 沿目录向上找到了主仓库的 `node_modules` 和 `package.json`，于是
+  **vitest 的 root 是主工作区**：它同时收了主检出和 worktree 两份测试文件，
+  而 `@` 别名解析到的是**主检出的 `src/`**。
+
+  后果有两层：跑的不是本分支的代码（AGENTS.md §4.1 要求验证在 worktree 内进行），
+  以及新模块「找不到」的报错会被误诊成路径写错。在 worktree 里 `pnpm install`
+  之后恢复正常：`Test Files 20 passed / 266 tests`。**下次在新 worktree 里第一次
+  跑前端验证，先确认 `node_modules` 在不在。**
+
+- **`state.capabilities` 每次打开仓库都必须写回，不能只在成功时写。**
+  上一个仓库是 SVN 时留下的能力集合会把下一个普通 git 仓库的入口一起关掉。
+  `readCapabilities` 因此把失败也吃掉并返回 `ALL_CAPABILITIES`，保证 `openRepo`
+  的那次 `setState` 一定带着一个明确的值。
+
+- **PR 数据在 SVN 模式下天然是空的，不需要再加一层判断。** `refreshPullRequests`
+  只有两个触发点：`openRepo`（已按 `caps.pullRequests` 跳过）和 `runToolbar` 里的
+  fetch/pull/push（按钮本身已被 `visibleToolbarActions` 裁掉）。已 grep 核对。
+
+- **`DeleteBranchDialog` 的「Also delete remote branch」不用改。** 它挂在
+  `{info?.upstream && …}` 下面，而 SVN 混合仓库的 git 侧没有任何 remote，
+  没有分支有上游，勾选框根本不出现。已读代码确认，不是推断。
+
+#### 为什么这么改是安全的
+
+- **只隐藏入口，一行后端代码都没删。** 这些命令在普通 git 仓库上照常要用；
+  `ALL_CAPABILITIES` 下渲染出来的东西与改动前逐项一致（`visibleSections`、
+  `visibleToolbarActions`、`commitMenu` 三条全开路径都有测试断言）。
+- **失败方向是「多显示」而不是「误操作」**：读不到能力就退回全开，受影响的是
+  SVN 仓库上多露一个入口；反过来把普通 git 仓库搞成半残要糟得多。
+- **这是表现层防线，不是接缝——已经写进 `capabilities.ts` 的模块注释。**
+  `checkout_remote_branch` / `create_tag` / `cherry_pick` / `save_patch` /
+  `fetch` / `pull` / `push` 与整个 `commands/worktree.rs` 仍然直连 git CLI。
+  隐藏入口只是不让人点到它们，不是它们变安全了。谁要是绕过 UI 直接 invoke，
+  照样打得进去。
+- 已 grep 全部 `src/components` 与 `src/store`，确认这批命令的**唯一**入口都在
+  已裁剪的组件里，没有漏网的按钮。
 
 ---
 

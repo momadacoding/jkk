@@ -2,7 +2,8 @@ import { useCallback, useEffect, useState } from 'react'
 import { askConfirm } from '../engine/confirm'
 import type { CommandContext } from '../engine/customCommands'
 import type { UpstreamInfo } from '../engine/types'
-import { planToolbarAction, type ToolbarAction } from '../engine/toolbarActions'
+import { planToolbarAction, visibleToolbarActions, type ToolbarAction } from '../engine/toolbarActions'
+import type { Capabilities } from '../engine/capabilities'
 import { CustomCommandBar } from './CustomCommandBar'
 
 /**
@@ -37,11 +38,11 @@ interface ToolbarProps {
   onRun: (command: string, args: Record<string, unknown>) => Promise<void>
   /** 自定义命令的占位符取值来源；未打开仓库时 worktree 为 null。 */
   commandContext: CommandContext
+  /** 后端能力。不支持远程的后端不渲染 fetch/pull/push。 */
+  capabilities: Capabilities
 }
 
-const ACTIONS: ToolbarAction[] = ['fetch', 'pull', 'push', 'stash']
-
-export function Toolbar({ branch, upstream, onRun, commandContext }: ToolbarProps) {
+export function Toolbar({ branch, upstream, onRun, commandContext, capabilities }: ToolbarProps) {
   const ctrl = useCtrlHeld()
   const [busy, setBusy] = useState<ToolbarAction | null>(null)
 
@@ -70,7 +71,7 @@ export function Toolbar({ branch, upstream, onRun, commandContext }: ToolbarProp
         ⎇ {branch}
       </span>
       <span className="toolbar-sep" />
-      {ACTIONS.map((action) => {
+      {visibleToolbarActions(capabilities).map((action) => {
         const plan = planToolbarAction(action, ctrl, branch)
         const count = badge(action)
         return (
