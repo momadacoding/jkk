@@ -12,6 +12,7 @@ import { Toolbar } from './Toolbar'
 import { StashView } from './StashView'
 import { useRepoStore, useRepoEffects } from '../store/repoStore'
 import { samePath } from '../engine/path'
+import { visibleSections } from '../engine/capabilities'
 import { askConfirm } from '../engine/confirm'
 import { usePrompt } from './PromptDialog'
 import { useConfirm } from './ConfirmDialog'
@@ -105,6 +106,9 @@ export function RepoTab({
     selectCommit, clearError, reportError,
   } = useRepoStore()
   const [repoState, setRepoState] = useState<string>('normal')
+  // 侧边栏分区按后端能力裁剪。SVN 混合仓库下 tag / worktree 整块不渲染
+  // ——`create_tag` 与整个 commands/worktree.rs 都还没进接缝，仍直接跑 git CLI。
+  const sections = visibleSections(state.capabilities)
   const [viewMode, setViewMode] = useState<ViewMode>('commits')
   const [selectedBranch, setSelectedBranch] = useState<string | null>(null)
   const [selectedTag, setSelectedTag] = useState<string | null>(null)
@@ -255,8 +259,10 @@ export function RepoTab({
         }
         default: {
           const plan = planCommitCommand(action, commit)
-          const entry = commitMenu(commit, { isHead: commit.id === state.headHash })
-            .find((e) => e.action === action)
+          const entry = commitMenu(commit, {
+            isHead: commit.id === state.headHash,
+            caps: state.capabilities,
+          }).find((e) => e.action === action)
           if (!plan || !entry?.confirm) return
           const ok = await confirm({
             title: entry.label.replace(/…$/, ''),
@@ -490,6 +496,7 @@ export function RepoTab({
         upstream={state.upstream}
         onRun={runToolbar}
         commandContext={{ worktree: state.path, branch: state.head, headHash: state.headHash }}
+        capabilities={state.capabilities}
       />
       <div className="repo-path-bar" title={state.path ?? ''}>{state.path} @ {state.head}</div>
       <div style={{ flex: 1, overflow: 'hidden' }}>
@@ -524,7 +531,9 @@ export function RepoTab({
                 onCheckoutRemote={(name) => void handleCheckoutRemote(name)}
                 onDeleteRemote={handleDeleteRemote}
                 repoPath={state.path}
+                capabilities={state.capabilities}
               />
+              {sections.includes('tags') && (
               <TagView
                 tags={state.refs.filter((r) => r.kind === 'tag')}
                 commits={state.commits}
@@ -533,6 +542,8 @@ export function RepoTab({
                 onCheckout={handleCheckoutTag}
                 onPush={(name) => void runToolbar('push_tag', { name })}
               />
+              )}
+              {sections.includes('worktrees') && (
               <WorktreeView
                 worktrees={state.worktrees}
                 currentPath={state.path ?? ''}
@@ -545,6 +556,7 @@ export function RepoTab({
                 onCreate={(name) => runAndRefresh('create_worktree', { name }, async () => await refreshWorktrees(state.path!))}
                 onDelete={handleDeleteWorktree}
               />
+              )}
               <StashView
                 stashes={state.stashes}
                 selectedId={state.selectedId}
@@ -578,6 +590,7 @@ export function RepoTab({
                     changeCount={state.status.unstaged.length + state.status.staged.length}
                     onOpenChanges={() => setViewMode('changes')}
                     onCommitAction={(action, commit) => void handleCommitAction(action, commit)}
+                    capabilities={state.capabilities}
                   />
                 </Panel>
                 <Separator style={{ height: 4, background: '#333' }} />

@@ -1,0 +1,627 @@
+//! exclude 规则生成的测试。
+//!
+//! **断言对象是 git 的实际行为（`git ls-files`），不是生成出来的规则文本**
+//! ——测规则文本只能证明「生成了我以为的字符串」，证明不了 git 会怎么裁决，
+//! 而这个模块存在的全部理由就是后者（spec §6.3）。
+
+use app_lib::engine::svn_exclude::{generate_exclude, write_exclude};
+use app_lib::engine::svn_include_check::{actual_set, expected_set, verify_include_set};
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::Path;
+use std::process::Command;
+use tempfile::TempDir;
+
+fn run_git(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .expect("git not found");
+    assert!(
+        out.status.success(),
+        "git {args:?} 失败：{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn tracked(dir: &Path) -> Vec<String> {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(["ls-files"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// 一个模拟 Unity 布局的目录：白名单目录里有多层嵌套、干扰文件，
+/// 还有一个**真实存在的 `.svn` 目录**（白名单落在 external 根时就是这样）。
+fn workdir() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path();
+    run_git(p, &["init"]);
+    run_git(p, &["config", "user.email", "t@t"]);
+    run_git(p, &["config", "user.name", "T"]);
+    for sub in ["Code/Sub/Deep", "Code/.svn/pristine/aa", "Art"] {
+        fs::create_dir_all(p.join(sub)).unwrap();
+    }
+    fs::write(p.join("Code/Top.cs"), "x").unwrap();
+    fs::write(p.join("Code/Sub/Mid.cs"), "x").unwrap();
+    fs::write(p.join("Code/Sub/Deep/Low.cs"), "x").unwrap();
+    fs::write(p.join("Code/Junk.psd"), "x").unwrap();
+    fs::write(p.join("Code/.svn/wc.db"), "x").unwrap();
+    fs::write(p.join("Code/.svn/pristine/aa/d.svn-base"), "x").unwrap();
+    fs::write(p.join("Art/boss.fbx"), "x").unwrap();
+    dir
+}
+
+fn apply(dir: &Path, whitelist: &[&str], extensions: &[&str]) -> Vec<String> {
+    let w: Vec<String> = whitelist.iter().map(|s| s.to_string()).collect();
+    let e: Vec<String> = extensions.iter().map(|s| s.to_string()).collect();
+    write_exclude(dir.to_str().unwrap(), &generate_exclude(&w, &e)).unwrap();
+    run_git(dir, &["add", "-A"]);
+    tracked(dir)
+}
+
+#[test]
+fn nested_source_files_at_every_depth_are_tracked() {
+    // spec §6.3：缺 `!/Code/**/` 那一行时，深层文件**静默丢失**——用户以为
+    // 文件受 git 保护，实际没有。Unity 的 Scripts 底下必然有多层子目录。
+    let dir = workdir();
+    let files = apply(dir.path(), &["Code/"], &[".cs"]);
+    assert!(files.contains(&"Code/Top.cs".to_string()), "{files:?}");
+    assert!(files.contains(&"Code/Sub/Mid.cs".to_string()), "{files:?}");
+    assert!(
+        files.contains(&"Code/Sub/Deep/Low.cs".to_string()),
+        "{files:?}"
+    );
+}
+
+#[test]
+fn files_outside_the_whitelist_are_pruned() {
+    let dir = workdir();
+    let files = apply(dir.path(), &["Code/"], &[".cs"]);
+    assert!(!files.iter().any(|f| f.starts_with("Art/")), "{files:?}");
+}
+
+#[test]
+fn extension_filter_excludes_other_files_inside_the_whitelist() {
+    // W-file ⊊ W-path（spec §6.3.2）：.psd 在白名单目录里，但不归 git 管。
+    let dir = workdir();
+    let files = apply(dir.path(), &["Code/"], &[".cs"]);
+    assert!(!files.contains(&"Code/Junk.psd".to_string()), "{files:?}");
+}
+
+#[test]
+fn svn_metadata_never_enters_git_even_with_a_matching_extension() {
+    // spec §6.3：白名单落在 external 根时里面有真实的 .svn。一旦 wc.db 被 git
+    // 跟踪，任何一次 git checkout 都会在一个**正在使用的**工作副本底下换掉它
+    // ——那不是「恢复旧数据」，是直接损坏工作副本。
+    let dir = workdir();
+    let files = apply(dir.path(), &["Code/"], &[".cs", ".db"]);
+    assert!(
+        !files.iter().any(|f| f.contains(".svn/")),
+        "实际跟踪了：{files:?}"
+    );
+}
+
+#[test]
+fn svn_metadata_never_enters_git_with_the_wildcard_extension() {
+    // "*" 是 spec §6.3 明文推荐的全纳入写法，这条路径下 .svn 更容易漏进来。
+    let dir = workdir();
+    let files = apply(dir.path(), &["Code/"], &["*"]);
+    assert!(
+        !files.iter().any(|f| f.contains(".svn/")),
+        "实际跟踪了：{files:?}"
+    );
+    // 但普通代码文件仍要在——只证明「没收进 .svn」的话，一条把所有东西
+    // 都排除掉的规则也能过。
+    assert!(
+        files.contains(&"Code/Sub/Deep/Low.cs".to_string()),
+        "{files:?}"
+    );
+    assert!(files.contains(&"Code/Junk.psd".to_string()), "{files:?}");
+}
+
+#[test]
+fn a_single_file_whitelist_entry_tracks_only_that_file() {
+    let dir = workdir();
+    let files = apply(dir.path(), &["Code/Top.cs"], &[".cs"]);
+    assert_eq!(files, vec!["Code/Top.cs".to_string()]);
+}
+
+#[test]
+fn a_narrower_entry_does_not_silently_drop_files_of_the_broader_one() {
+    // 计划没覆盖的组合：白名单同时含「广的 `Code/`」和「窄的 `Code/Sub/`」。
+    //
+    // 窄条目为了打开 `Code/Sub` 必须先发一条 `/Code/*`（排除 Code 的直接子项），
+    // 而它排在广条目的 `!/Code/**/*.cs` **之后**——git 的裁决是「最后一条匹配的
+    // 模式说了算」，于是 `Code/Top.cs` 被静默剔除。
+    //
+    // 用户看到的是「我明明把整个 Code/ 加进了白名单，顶层的 .cs 却没受保护」，
+    // 而且**没有任何报错**。这正是本模块存在的理由所指的失败形态（spec §6.3）。
+    // 两种书写顺序都要测：顺序不该改变集合。
+    for order in [["Code/", "Code/Sub/"], ["Code/Sub/", "Code/"]] {
+        let dir = workdir();
+        let files = apply(dir.path(), &order, &[".cs"]);
+        assert!(
+            files.contains(&"Code/Top.cs".to_string()),
+            "order={order:?} 实际：{files:?}"
+        );
+        assert!(
+            files.contains(&"Code/Sub/Mid.cs".to_string()),
+            "order={order:?} 实际：{files:?}"
+        );
+        assert!(
+            files.contains(&"Code/Sub/Deep/Low.cs".to_string()),
+            "order={order:?} 实际：{files:?}"
+        );
+        assert!(
+            !files.contains(&"Code/Junk.psd".to_string()),
+            "order={order:?} 扩展名过滤不该被顺带放开：{files:?}"
+        );
+    }
+}
+
+#[test]
+fn a_file_entry_coexists_with_a_directory_entry_that_contains_it() {
+    // 「整个 Code/ 收 .cs，另外单独收一个 Code/Junk.psd」是合法配置——单文件
+    // 条目本来就不过扩展名过滤（spec §6.3）。它不能被目录条目的 `/Code/**`
+    // 重新盖掉，目录条目也不能被它那条 `/Code/*` 打断。同样两种顺序都测。
+    for order in [["Code/", "Code/Junk.psd"], ["Code/Junk.psd", "Code/"]] {
+        let dir = workdir();
+        let files = apply(dir.path(), &order, &[".cs"]);
+        assert!(
+            files.contains(&"Code/Junk.psd".to_string()),
+            "order={order:?} 单文件条目丢了：{files:?}"
+        );
+        assert!(
+            files.contains(&"Code/Top.cs".to_string()),
+            "order={order:?} 目录条目被打断了：{files:?}"
+        );
+        assert!(
+            files.contains(&"Code/Sub/Deep/Low.cs".to_string()),
+            "order={order:?} 深层文件丢了：{files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.contains(".svn/")),
+            "order={order:?} 实际跟踪了：{files:?}"
+        );
+    }
+}
+
+#[test]
+fn windows_backslash_input_produces_the_same_result() {
+    // 跨平台路径是本项目高发缺陷区（AGENTS.md §8）。
+    let dir = workdir();
+    let files = apply(dir.path(), &[r"Code\Sub\"], &[".cs"]);
+    assert!(files.contains(&"Code/Sub/Mid.cs".to_string()), "{files:?}");
+    assert!(
+        files.contains(&"Code/Sub/Deep/Low.cs".to_string()),
+        "{files:?}"
+    );
+    assert!(!files.contains(&"Code/Top.cs".to_string()), "{files:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Task 6：纳入集合核对
+//
+// 这一组证明的是「git 实际跟踪的集合 == 配置声明的集合」，与 exclude 生成本身
+// 是两回事：规则文本对了，工作树里一个 .gitignore 照样能把它整个盖掉（spec §6.3.1）。
+// ---------------------------------------------------------------------------
+
+fn strs(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
+fn write_rules(dir: &Path, w: &[String], e: &[String]) {
+    write_exclude(dir.to_str().unwrap(), &generate_exclude(w, e)).unwrap();
+}
+
+#[test]
+fn include_check_passes_before_anything_is_staged() {
+    // 核对发生在「生成 exclude 之后、录第一个基线之前」（spec §6.3.1），
+    // 那个时刻索引还是空的。所以实际集合不能只读索引。
+    let dir = workdir();
+    let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
+    write_rules(dir.path(), &w, &e);
+    verify_include_set(dir.path().to_str().unwrap(), &w, &e).unwrap();
+}
+
+#[test]
+fn include_check_passes_after_the_files_are_staged() {
+    // 另一半：文件已经进索引之后再核对，结论必须不变。只测上一条的话，
+    // 实际集合里读索引的那一路完全没被覆盖。
+    let dir = workdir();
+    let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
+    write_rules(dir.path(), &w, &e);
+    run_git(dir.path(), &["add", "-A"]);
+    verify_include_set(dir.path().to_str().unwrap(), &w, &e).unwrap();
+}
+
+#[test]
+fn the_actual_set_equals_what_git_add_would_have_produced() {
+    // spec §6.3.1 的原文是「在**临时索引**上 git add -A 之后读 ls-files」。
+    // 实现改成了纯读（--cached ∪ --others --exclude-standard），理由是它连
+    // 临时索引和松散对象都不写——但那只有在两者**真的等价**时才成立。
+    // 这条把等价性变成一条有断言兜着的事实，而不是我的推断。
+    let dir = workdir();
+    let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
+    write_rules(dir.path(), &w, &e);
+
+    let read_only = actual_set(dir.path().to_str().unwrap(), &w).unwrap();
+    run_git(dir.path(), &["add", "-A"]);
+    let after_add: BTreeSet<String> = tracked(dir.path()).into_iter().collect();
+
+    assert_eq!(read_only, after_add, "纯读取数与 git add -A 的结果必须一致");
+    assert!(!read_only.is_empty(), "两边都空的话这条断言什么也没证明");
+}
+
+#[test]
+fn a_deleted_but_unstaged_file_does_not_look_like_an_unexpected_file() {
+    // 2026-09-13 独立 review 的阻断项 B1。
+    //
+    // 上一条测试声称「纯读取数与 git add -A 等价」，但它在**空索引**上跑
+    // ——`--cached` 那一路恒为空，真正会分叉的那一半根本没执行到。
+    //
+    // 真正的分叉在这里：一个已跟踪文件被从工作树删掉、删除还没 stage 时
+    //   `--cached`     仍然列它（它还在索引里）
+    //   `git add -A`   会把删除入索引，之后 ls-files 不列它
+    //   `expected_set` 走磁盘，也不含它
+    // 于是核对会报「不该被跟踪、实际跟踪了 Code/Top.cs」并硬阻断——而用户
+    // 只是删了个文件还没提交，仓库状态完全正常。
+    let dir = workdir();
+    let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
+    write_rules(dir.path(), &w, &e);
+    run_git(dir.path(), &["add", "-A"]);
+    fs::remove_file(dir.path().join("Code/Top.cs")).unwrap();
+
+    verify_include_set(dir.path().to_str().unwrap(), &w, &e)
+        .expect("删了文件还没 stage 不该被判成「不该被跟踪」");
+}
+
+#[test]
+fn the_actual_set_equals_git_add_even_when_the_index_is_already_populated() {
+    // B1 的另一半：把等价性断言放到**索引非空**的时刻再跑一遍，
+    // 并制造一个删除未 stage 的差异。原来那条只覆盖了空索引。
+    let dir = workdir();
+    let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
+    write_rules(dir.path(), &w, &e);
+    run_git(dir.path(), &["add", "-A"]);
+    fs::remove_file(dir.path().join("Code/Sub/Mid.cs")).unwrap();
+    // 再放一个新文件进来，让 --others 那一路也有内容
+    fs::write(dir.path().join("Code/Fresh.cs"), "x").unwrap();
+
+    let read_only = actual_set(dir.path().to_str().unwrap(), &w).unwrap();
+    run_git(dir.path(), &["add", "-A"]);
+    let after_add: BTreeSet<String> = tracked(dir.path()).into_iter().collect();
+
+    assert_eq!(read_only, after_add, "索引非空时两条路径仍必须一致");
+    assert!(
+        !read_only.contains("Code/Sub/Mid.cs"),
+        "已删除的文件不该留在集合里：{read_only:?}"
+    );
+    assert!(
+        read_only.contains("Code/Fresh.cs"),
+        "新增未入索引的文件必须在集合里：{read_only:?}"
+    );
+}
+
+#[test]
+fn a_gitignore_in_the_working_tree_is_caught() {
+    // spec §6.3.1：工作树里的 .gitignore 优先级**高于** .git/info/exclude。
+    // 实测：Code/.gitignore 里一行 *.cs 会让 git ls-files 变成空。
+    // 它不会让初始化失败，§6.8 的基线体检也查不出来——只有这道核对能抓到。
+    let dir = workdir();
+    fs::write(dir.path().join("Code/.gitignore"), "*.cs\n").unwrap();
+    let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
+    write_rules(dir.path(), &w, &e);
+
+    let err = verify_include_set(dir.path().to_str().unwrap(), &w, &e)
+        .expect_err("被 .gitignore 盖掉必须阻断");
+    assert_eq!(err.code, "include_set_mismatch");
+    // 错误信息必须指认裁决者，否则用户只知道「不一致」，不知道去改哪个文件
+    assert!(
+        err.message.contains(".gitignore"),
+        "应当指出是 .gitignore 干的，实际：{}",
+        err.message
+    );
+    assert!(
+        err.message.contains("Code/Top.cs"),
+        "应当列出差异文件，实际：{}",
+        err.message
+    );
+}
+
+#[test]
+fn include_check_reports_unexpected_files_too() {
+    // 双向比对：不只查「该在的没在」，也查「不该在的在了」。
+    // 后者正是 .svn 兜底行失效那一类缺陷的表现，而它的后果比前者更重
+    // ——一次 git checkout 就能损坏一个正在使用的 SVN 工作副本。
+    let dir = workdir();
+    let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
+    // 故意写一份**缺少 .svn/ 兜底行**、且把 .db 也纳入的规则，再真的 add 进索引
+    let broken = generate_exclude(&w, &strs(&[".cs", ".db"])).replace(".svn/\n", "");
+    write_exclude(dir.path().to_str().unwrap(), &broken).unwrap();
+    run_git(dir.path(), &["add", "-A"]);
+    assert!(
+        tracked(dir.path()).iter().any(|f| f.contains(".svn/")),
+        "前置条件没成立：.svn 下的文件根本没进索引，这条测不到「多出来」那一侧"
+    );
+
+    let err = verify_include_set(dir.path().to_str().unwrap(), &w, &e)
+        .expect_err("多出 .svn 下的文件必须被报出来");
+    assert_eq!(err.code, "include_set_mismatch");
+    assert!(
+        err.message.contains("不该被跟踪"),
+        "必须走「多出来」那一侧，实际：{}",
+        err.message
+    );
+    assert!(
+        err.message.contains(".svn/wc.db"),
+        "应当点名是哪个文件，实际：{}",
+        err.message
+    );
+}
+
+#[test]
+fn an_empty_whitelist_never_degenerates_into_everything() {
+    // G6 / AGENTS.md §6.2：本项目已因空 pathspec 误伤过整个仓库。
+    // `git ls-files` 不带 pathspec 会列出整仓库，核对就变成「整仓库 vs 空集」。
+    let dir = workdir();
+    let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
+    write_rules(dir.path(), &w, &e);
+    run_git(dir.path(), &["add", "-A"]);
+    assert!(
+        !tracked(dir.path()).is_empty(),
+        "仓库里得真有被跟踪的文件，否则这条恒真"
+    );
+
+    assert!(
+        actual_set(dir.path().to_str().unwrap(), &[])
+            .unwrap()
+            .is_empty(),
+        "空白名单必须得到空集"
+    );
+}
+
+#[test]
+fn non_ascii_filenames_do_not_produce_a_phantom_mismatch() {
+    // `git ls-files` 默认按 core.quotePath 把非 ASCII 路径转义成
+    // `"Code/\350\247\222\350\211\262.cs"` 这种带引号的八进制形式，而期望集合
+    // 是遍历磁盘得到的原始字符串——两者**永远对不上**，于是每个装了中文文件名的
+    // 工程都会在初始化时被误报阻断。用 -z 读可以绕开引号转义。
+    let dir = workdir();
+    fs::write(dir.path().join("Code/角色.cs"), "x").unwrap();
+    let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
+    write_rules(dir.path(), &w, &e);
+    verify_include_set(dir.path().to_str().unwrap(), &w, &e).unwrap();
+}
+
+/// 建一个 Windows 目录 junction。成功返回 true。
+///
+/// 用 junction 而不是 `std::os::windows::fs::symlink_dir`：后者要管理员权限或
+/// 开发者模式，前者不需要。
+///
+/// ⚠️ 路径里的正斜杠必须先换成反斜杠。`mklink` 是 cmd 的内建命令，cmd 按
+/// `/X` 切选项——`C:\…\Code/Mirror` 里的 `/Mirror` 会被当成一个未知选项，
+/// 命令失败且错误信息完全指不到这上面（实测踩过一次）。
+#[cfg(windows)]
+fn make_junction(link: &Path, target: &Path) -> bool {
+    let win = |p: &Path| p.to_string_lossy().replace('/', "\\");
+    Command::new("cmd")
+        .args(["/c", "mklink", "/J", &win(link), &win(target)])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+#[test]
+fn a_directory_junction_inside_the_whitelist_does_not_cause_a_phantom_mismatch() {
+    // 2026-09-13 独立 review 的 A4。
+    //
+    // 2026-09-13 实测：`git ls-files --others --exclude-standard -- Code/` 会列出
+    // `Code/Mirror/Linked.cs` ——**git 把 junction 当普通目录走进去了**。
+    // 所以 `expected_set` 也必须走进去；把它当成「一个文件」会让期望集合少一批
+    // 文件，在一个完全正常的仓库上误报阻断。
+    //
+    // （这与「git 把符号链接记成 blob、不递归」那条常识不矛盾：那条对
+    // `core.symlinks=true` 下的真符号链接成立，而 Windows 上该项默认 false。）
+    let dir = workdir();
+    let outside = TempDir::new().unwrap();
+    fs::write(outside.path().join("Linked.cs"), "x").unwrap();
+    let link = dir.path().join("Code").join("Mirror");
+    if !make_junction(&link, outside.path()) {
+        panic!("建 junction 失败——本条测试的前提没成立，不能当成通过");
+    }
+
+    let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
+    write_rules(dir.path(), &w, &e);
+    verify_include_set(dir.path().to_str().unwrap(), &w, &e).unwrap();
+
+    // 前提校验：junction 内部的文件确实两边都收到了，否则上面那条 unwrap
+    // 可能只是因为「两边都没看见它」而通过——那什么也没证明
+    let set = expected_set(dir.path().to_str().unwrap(), &w, &e).unwrap();
+    assert!(
+        set.contains("Code/Mirror/Linked.cs"),
+        "期望集合必须走进 junction：{set:?}"
+    );
+
+    // 拆掉 junction 再让 TempDir 清理，否则 remove_dir_all 会顺着它删掉
+    // outside 里的内容
+    fs::remove_dir(&link).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn a_junction_loop_terminates_instead_of_blowing_the_stack() {
+    // 同一条的另一半，后果更重：junction 指回自己的祖先时递归没有出口，
+    // 栈溢出会让 Rust 直接 abort——在 Tauri 里就是整个应用凭空消失，
+    // 连错误横幅都来不及显示。
+    //
+    // ⚠️ 这条要断言的是「**终止**」，不是「不进去」。上一条已经证明 junction
+    // 必须跟随（git 就是这么干的），所以出口只能靠环检测：`canonicalize` 在
+    // Windows 上会解开 reparse point，`Code/Loop` 与 `Code` 得到同一个规范路径。
+    //
+    // 集合与 git 对不上是允许的——实测 git 自己在这种工作树上也只是一路递归到
+    // 64 层才放弃、吐出一堆 `Code/Loop/Loop/…/Top.cs` 并打印
+    // `could not open directory` 警告。那种工作树本来就是坏的，报一次集合不一致
+    // 是正确行为；这里要保证的只是不崩。
+    let dir = workdir();
+    let code = dir.path().join("Code");
+    if !make_junction(&code.join("Loop"), &code) {
+        panic!("建 junction 失败——本条测试的前提没成立，不能当成通过");
+    }
+
+    let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
+    let set = expected_set(dir.path().to_str().unwrap(), &w, &e).unwrap();
+    assert!(set.contains("Code/Top.cs"), "正常文件仍要收进来：{set:?}");
+    // 环检测在第二次遇到同一个规范路径时停手，所以最多下探一层
+    assert!(
+        !set.iter().any(|f| f.contains("Loop/Loop/")),
+        "环必须被截断，不能一层层递归下去：{set:?}"
+    );
+
+    // junction 必须手工拆掉再让 TempDir 清理，否则 remove_dir_all 会顺着它
+    // 把目标目录的内容一起删了——这里目标就是 Code 自己，后果是测试互相打架
+    fs::remove_dir(code.join("Loop")).unwrap();
+}
+
+#[test]
+fn a_users_own_exclude_is_backed_up_before_we_take_over() {
+    // 2026-09-13 独立 review 的 A6。`.git/info/exclude` 是 git 留给用户自己用的
+    // 地方，无条件整文件覆盖等于删掉他手写的规则、且不留任何痕迹。
+    let dir = workdir();
+    let info = dir.path().join(".git").join("info");
+    fs::create_dir_all(&info).unwrap();
+    fs::write(info.join("exclude"), "# 我自己写的\n*.log\n").unwrap();
+
+    let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
+    write_rules(dir.path(), &w, &e);
+
+    let backup = fs::read_to_string(info.join("exclude.bak")).expect("原件必须被备份");
+    assert!(backup.contains("*.log"), "备份内容不对：{backup}");
+
+    // 再写一次：备份**不能**被我们自己生成的内容盖掉，否则用户的原件就没了
+    write_rules(dir.path(), &w, &e);
+    let backup2 = fs::read_to_string(info.join("exclude.bak")).unwrap();
+    assert_eq!(backup2, backup, "第二次写入不该覆盖备份");
+
+    // 一个刚 git init 的仓库不该产生备份。`git init` 会在那里写一份**纯注释**的
+    // 模板，按「非空」判定的话每个新仓库都会多出一个什么也没保存的 exclude.bak。
+    let dir2 = workdir();
+    let stock = fs::read_to_string(dir2.path().join(".git/info/exclude")).unwrap();
+    assert!(
+        !stock.trim().is_empty(),
+        "前提没成立：git init 本该写一份模板，这条测不到「纯注释」那一路"
+    );
+    write_rules(dir2.path(), &w, &e);
+    write_rules(dir2.path(), &w, &e);
+    assert!(
+        !dir2.path().join(".git/info/exclude.bak").exists(),
+        "纯注释的 git 模板和我们自己生成的内容都不该产生备份"
+    );
+}
+
+#[test]
+fn write_exclude_leaves_no_temp_file_behind() {
+    // 原子替换用的临时文件必须收干净——`.git/info/` 里留一个
+    // `exclude.mygitclient.tmp` 不会报错，但下次有人来看这个目录会一头雾水。
+    let dir = workdir();
+    let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
+    write_rules(dir.path(), &w, &e);
+
+    let leftovers: Vec<String> = fs::read_dir(dir.path().join(".git").join("info"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.contains("tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "残留了临时文件：{leftovers:?}");
+}
+
+#[test]
+fn extension_matching_follows_gits_own_case_sensitivity() {
+    // Windows 上 `git init` 会把 core.ignoreCase 设成 true，忽略规则的匹配随之
+    // 变成大小写不敏感——`!/Code/**/*.cs` 会把 `Loud.CS` 也纳入。期望集合若死板地
+    // 按大小写敏感算，就会把它报成「不该被跟踪却跟踪了」，在一个完全正常的仓库上
+    // **误报阻断**。所以期望集合读 core.ignoreCase，跟 git 保持一致，而不是按平台猜。
+    //
+    // 这条在两种平台上都成立：大小写敏感的系统上 git 不收 Loud.CS，期望集合也不收。
+    let dir = workdir();
+    fs::write(dir.path().join("Code/Loud.CS"), "x").unwrap();
+    let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
+    write_rules(dir.path(), &w, &e);
+    verify_include_set(dir.path().to_str().unwrap(), &w, &e).unwrap();
+}
+
+#[test]
+fn core_ignorecase_is_read_with_gits_own_boolean_parsing() {
+    // 上一条只覆盖了 `git init` 自己写的字面量 `true`。git 的布尔解析还接受
+    // `1` / `yes` / `on`（2026-09-14 实测 `git config --bool` 把这三个都归一成
+    // `true`），而原来的实现只认字符串 "true"。
+    //
+    // 于是 `core.ignoreCase=1` 时：git 照常把 `Code/Loud.CS` 纳入，期望集合却
+    // 按大小写敏感算、不含它 → 核对报「不该被跟踪、实际跟踪了」并硬阻断，
+    // 而仓库完全正常。这是**误报阻断**，不是发现问题。
+    for truthy in ["1", "yes", "on", "TRUE"] {
+        let dir = workdir();
+        run_git(dir.path(), &["config", "core.ignoreCase", truthy]);
+        fs::write(dir.path().join("Code/Loud.CS"), "x").unwrap();
+        let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
+        write_rules(dir.path(), &w, &e);
+        verify_include_set(dir.path().to_str().unwrap(), &w, &e)
+            .unwrap_or_else(|err| panic!("core.ignoreCase={truthy} 时误报：{}", err.message));
+    }
+
+    // 反向：git 认的假值也要认，否则大小写敏感的卷上会反过来漏报
+    for falsy in ["0", "no", "off"] {
+        let dir = workdir();
+        run_git(dir.path(), &["config", "core.ignoreCase", falsy]);
+        fs::write(dir.path().join("Code/Loud.CS"), "x").unwrap();
+        let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
+        write_rules(dir.path(), &w, &e);
+        let set = expected_set(dir.path().to_str().unwrap(), &w, &e).unwrap();
+        assert!(
+            !set.contains("Code/Loud.CS"),
+            "core.ignoreCase={falsy} 时期望集合不该含 Loud.CS，实际 {set:?}"
+        );
+    }
+}
+
+#[test]
+fn the_mismatch_report_names_the_rule_for_files_that_are_tracked_but_should_not_be() {
+    // 「多收」方向原来只列文件名、不指认规则，而这正是最需要指认的一侧：
+    // 用户想知道的是「凭什么它进来了」。
+    //
+    // 而且这一侧的文件**必然已在索引里**，`git check-ignore` 不带 `--no-index`
+    // 时对已跟踪文件只吐一行空裁决 `::<TAB>路径`（2026-09-14 实测，exit 1）,
+    // 带上才会给出 `.git/info/exclude:3:/Code/**`。spec §6.3.1 新版已写明要带。
+    let dir = workdir();
+    let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
+    write_rules(dir.path(), &w, &e);
+    // 强行把一个被规则排除的文件塞进索引，制造「多收」
+    run_git(dir.path(), &["add", "-f", "--", "Code/Junk.psd"]);
+
+    let err = verify_include_set(dir.path().to_str().unwrap(), &w, &e).expect_err("多收必须被抓到");
+    assert_eq!(err.code, "include_set_mismatch");
+    assert!(
+        err.message.contains("Code/Junk.psd"),
+        "实际：{}",
+        err.message
+    );
+    assert!(
+        err.message.contains("exclude:"),
+        "多收方向必须指认是哪条规则本来该挡住它，实际：{}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("::\t"),
+        "拿到的是不带 --no-index 的空裁决，实际：{}",
+        err.message
+    );
+}

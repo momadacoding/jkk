@@ -4,7 +4,7 @@
 //! 文件直接调 `app_lib::engine::graph::load` 这类路径，搬动会连带改测试，
 //! 而 Phase 0 的验收标准就是现有测试一行不改还能全绿。
 
-use super::Vcs;
+use super::{Capabilities, Vcs};
 use crate::engine;
 use crate::engine::diff::{DiffData, StatusData};
 use crate::engine::graph::GraphData;
@@ -27,6 +27,10 @@ impl GitBackend {
 }
 
 impl Vcs for GitBackend {
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::all()
+    }
+
     fn open(&self) -> Result<RepoInfo> {
         engine::repo::open(&self.root)
     }

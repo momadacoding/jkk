@@ -6,6 +6,7 @@ import {
   shortHash,
   type CommitAction,
 } from '../../src/engine/commitActions'
+import { ALL_CAPABILITIES } from '../../src/engine/capabilities'
 import type { CommitNode } from '../../src/engine/types'
 
 const commit: CommitNode = {
@@ -48,7 +49,7 @@ describe('formatCommitInfo', () => {
 })
 
 describe('commitMenu', () => {
-  const actions = (isHead = false) => commitMenu(commit, { isHead }).map((e) => e.action)
+  const actions = (isHead = false) => commitMenu(commit, { isHead, caps: ALL_CAPABILITIES }).map((e) => e.action)
 
   it('给齐 8 个菜单项，顺序稳定', () => {
     expect(actions()).toEqual([
@@ -64,36 +65,36 @@ describe('commitMenu', () => {
   })
 
   it('标签里带上短 hash，弹出来能确认点的是哪一条', () => {
-    const entry = commitMenu(commit, { isHead: false }).find((e) => e.action === 'checkout')!
+    const entry = commitMenu(commit, { isHead: false, caps: ALL_CAPABILITIES }).find((e) => e.action === 'checkout')!
     expect(entry.label).toContain('d086703')
   })
 
   it('已经在这条提交上时 checkout 置灰，而不是消失', () => {
     // 消失会让菜单项位置每行都不一样，肌肉记忆全废
-    const entry = commitMenu(commit, { isHead: true }).find((e) => e.action === 'checkout')!
+    const entry = commitMenu(commit, { isHead: true, caps: ALL_CAPABILITIES }).find((e) => e.action === 'checkout')!
     expect(entry.disabled).toBe(true)
     expect(actions(true)).toHaveLength(8)
   })
 
   it('不是 HEAD 时 checkout 可用', () => {
-    const entry = commitMenu(commit, { isHead: false }).find((e) => e.action === 'checkout')!
+    const entry = commitMenu(commit, { isHead: false, caps: ALL_CAPABILITIES }).find((e) => e.action === 'checkout')!
     expect(entry.disabled).toBeFalsy()
   })
 
   it('会动工作区的三项都带确认文案', () => {
-    const menu = commitMenu(commit, { isHead: false })
+    const menu = commitMenu(commit, { isHead: false, caps: ALL_CAPABILITIES })
     for (const action of ['checkout', 'cherry-pick', 'revert'] as CommitAction[]) {
       expect(menu.find((e) => e.action === action)!.confirm).toBeTruthy()
     }
   })
 
   it('checkout 的确认文案要点明游离 HEAD——这是最容易让人懵的后果', () => {
-    const entry = commitMenu(commit, { isHead: false }).find((e) => e.action === 'checkout')!
+    const entry = commitMenu(commit, { isHead: false, caps: ALL_CAPABILITIES }).find((e) => e.action === 'checkout')!
     expect(entry.confirm).toMatch(/detached/i)
   })
 
   it('复制类和只读类不弹确认框', () => {
-    const menu = commitMenu(commit, { isHead: false })
+    const menu = commitMenu(commit, { isHead: false, caps: ALL_CAPABILITIES })
     for (const action of ['copy-hash', 'copy-info', 'new-branch', 'new-tag', 'save-patch'] as CommitAction[]) {
       expect(menu.find((e) => e.action === action)!.confirm).toBeUndefined()
     }

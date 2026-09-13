@@ -101,10 +101,32 @@ Expected: 顶端是本计划的提交，且与 `origin/master` 一致。
 
 - [ ] **Step 0.5: 记录重构前测试基线**
 
-Run: `cd src-tauri && cargo test 2>&1 | tail -40`
-把 passed 数记进决策日志。Task 9 拿它对账。
+Run: `cd src-tauri && cargo test -j 2 > /tmp/baseline.txt 2>&1`，然后
+`grep "^test result:" /tmp/baseline.txt` 逐行求和。
 
-⚠️ **全冷 target 上第一次 `cargo test` 可能以 rlib 链接错误失败，重跑即好**（Phase 0 实测）。看到 `crate 'windows' / 'tokio' … required to be available in rlib format` 先重跑一次再怀疑代码，按 `AGENTS.md` §5.3。
+⚠️ **不要用 `| tail -N` 看结果。** 本仓库有 22 个测试二进制，每个各打一行
+`test result:`，分散在整个输出里；`tail` 只会给你最后一两行——看起来像个结果，
+实际是错的数字（实测第一次就这么拿到过一个「20 passed」的假基线）。必须重定向到
+文件再 grep 汇总行。
+
+⚠️ **量基线时新增的测试文件必须还不存在。** 在 `cargo test` 跑的过程中往
+`tests/` 里写文件，下一次运行就会编译它并以 `unresolved import` 失败，基线就废了。
+
+把 passed 数与二进制个数都记进决策日志。Task 9 拿它对账。
+
+**2026-09-13 实测基线：226 passed / 0 failed / 22 个二进制。**
+
+⚠️ **看到下面这一串先判环境，不要怀疑代码**（`AGENTS.md` §5.3）：
+
+```text
+memory allocation of 1458192 bytes failed
+error: linking with `link.exe` failed: exit code: 0xc000012d   ← STATUS_COMMITMENT_LIMIT
+error: crate `windows_sys` required to be available in rlib format, but was not found in this form
+```
+
+三条是**同一个根因：提交内存不足**。Phase 0 把最后那条记成「冷编译竞态，重跑即好」
+——那只说对了一半，重跑如果仍然满并行仍会失败。用 **`cargo test -j 2`**。
+本期每一处 `cargo test` 都按 `-j 2` 跑。
 
 ---
 

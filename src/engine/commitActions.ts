@@ -1,3 +1,4 @@
+import type { Capabilities } from './capabilities'
 import type { CommitNode } from './types'
 
 /** graph 行右键菜单里的一项。 */
@@ -23,6 +24,18 @@ export interface CommitMenuEntry {
 export interface CommitMenuContext {
   /** 这条提交是不是当前 HEAD。 */
   isHead: boolean
+  /**
+   * 后端能力。不支持的项**整条去掉**，不是置灰。
+   *
+   * 与 `checkout` 那种「置灰但保留位置」的处理刻意不同：置灰表达的是
+   * 「这一项此刻做不了」，而这里表达的是「这个概念在当前后端不存在」，
+   * 留一个永远灰着的 `Cherry Pick` 只会让人反复去试。
+   *
+   * 这个字段**是必填的**。设成可选、默认全开的话，哪天新加一个调用点忘了传，
+   * SVN 仓库上就会静默出现一个直连 git 的菜单项——而 `tsc` 覆盖 `src/`，
+   * 必填能让它在编译期就报出来。
+   */
+  caps: Capabilities
 }
 
 /** 一次可以直接发出去的后端调用。 */
@@ -61,7 +74,7 @@ export function formatCommitInfo(commit: CommitNode): string {
  */
 export function commitMenu(commit: CommitNode, ctx: CommitMenuContext): CommitMenuEntry[] {
   const short = shortHash(commit.id)
-  return [
+  const all: CommitMenuEntry[] = [
     { action: 'new-branch', label: 'New Branch Here…' },
     { action: 'new-tag', label: 'New Tag Here…' },
     {
@@ -87,6 +100,14 @@ export function commitMenu(commit: CommitNode, ctx: CommitMenuContext): CommitMe
     { action: 'copy-hash', label: 'Copy Commit Hash' },
     { action: 'copy-info', label: 'Copy Commit Info' },
   ]
+
+  // 逐项独立判断，不是「一关全关」——将来 SVN 后端可能只关掉其中一部分。
+  const enabled: Record<string, boolean> = {
+    'new-tag': ctx.caps.tags,
+    'cherry-pick': ctx.caps.cherryPick,
+    'save-patch': ctx.caps.patches,
+  }
+  return all.filter((e) => enabled[e.action] ?? true)
 }
 
 /**

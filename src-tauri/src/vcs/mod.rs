@@ -9,18 +9,91 @@
 //! 这一期的目的是把接缝切出来，不是改行为。
 
 pub mod git;
+pub mod svn;
 
 use crate::engine::diff::{DiffData, StatusData};
 use crate::engine::graph::GraphData;
 use crate::engine::repo::RepoInfo;
 use crate::engine::stash::StashEntry;
 use crate::error::Result;
+use serde::Serialize;
+
+/// 后端支持哪些功能。前端据此决定**不渲染**哪些入口。
+///
+/// 为什么需要它：Phase 0 只把 17 个方法切进了 `trait Vcs`，而
+/// `checkout_remote_branch` / `create_tag` / `cherry_pick` / `save_patch` /
+/// `fetch` / `pull` / `push` 以及整个 `commands/worktree.rs`
+/// **仍然直连 `run_git`**。一旦 `backend_for` 能返回非 git 后端，这些命令会对着
+/// 同一个工作目录做 git 操作。接缝拦不住它们，只能靠「不给入口」。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Capabilities {
+    pub worktrees: bool,
+    pub tags: bool,
+    pub remotes: bool,
+    pub pull_requests: bool,
+    pub cherry_pick: bool,
+    pub patches: bool,
+}
+
+impl Capabilities {
+    /// 普通 git 仓库：全都支持。
+    pub fn all() -> Self {
+        Self {
+            worktrees: true,
+            tags: true,
+            remotes: true,
+            pull_requests: true,
+            cherry_pick: true,
+            patches: true,
+        }
+    }
+}
+
+/// 打开一个目录时的四种判定（spec §6.1）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RepoKind {
+    /// 只有 `.git`：现有行为，零变化。
+    Git,
+    /// `.svn` + `.git` + 配置文件。
+    SvnHybrid,
+    /// 有 `.svn` 无 `.git`：引导走初始化向导（Phase 1b）。
+    SvnUninitialized,
+    /// `.svn` + `.git`，但没有配置文件：可能是别人留下的 `.git`，阻断。
+    SvnSuspicious,
+}
+
+/// 判定目录类型。
+///
+/// **必须先查 `.svn`**：混合仓库两者都有，先查 `.git` 就会永远判成普通 git 仓库
+/// （spec §6.1）。
+///
+/// `.git` 用 `exists()` 而不是 `is_dir()`：git worktree 里它是一个**文件**。
+pub fn detect_repo_kind(path: &str) -> RepoKind {
+    let root = std::path::Path::new(path);
+    let has_svn = root.join(".svn").is_dir();
+    let has_git = root.join(".git").exists();
+    if !has_svn {
+        return RepoKind::Git;
+    }
+    if !has_git {
+        return RepoKind::SvnUninitialized;
+    }
+    if crate::engine::svn_config::config_path(path).is_file() {
+        RepoKind::SvnHybrid
+    } else {
+        RepoKind::SvnSuspicious
+    }
+}
 
 /// 绑定到某个工作目录的版本控制后端。
 ///
 /// `Send + Sync` 是给 Phase 2 的仓库级操作锁准备的：那个注册表要跨线程持有
 /// 后端实例。现在不加，到时候就是一次涉及所有实现的破坏性改动。
 pub trait Vcs: Send + Sync {
+    /// 本后端支持哪些功能。见 [`Capabilities`]。
+    fn capabilities(&self) -> Capabilities;
+
     /// 读取仓库基本信息（HEAD 名与 oid）。
     fn open(&self) -> Result<RepoInfo>;
 
@@ -108,9 +181,30 @@ pub trait Vcs: Send + Sync {
 
 /// 为某个工作目录挑一个后端。
 ///
-/// Phase 0 永远返回 GitBackend。**不要在这里加 `.svn` 判断**——现在加会改变
-/// 「一个同时有 .svn 和 .git 的目录」的现有行为（今天它就是个普通 git 仓库），
-/// 那就不是零行为变化了。SVN 分支在 Phase 1 连同配置文件识别一起加。
+/// # ⚠️ 这里有一处**有意为之**的行为变化
+///
+/// Phase 0 的注释写着「不要在这里加 `.svn` 判断——现在加会改变『一个同时有
+/// `.svn` 和 `.git` 的目录』的现有行为」。Phase 1 正是它说的「连同配置文件识别
+/// 一起加」的时机，所以那条约束在这里解除。代价是：一个今天能当普通 git 仓库
+/// 打开的 `.svn` + `.git` 目录，从此会被 `svn_unconfigured_git` 挡住。
+/// spec §6.1 明确要这个结果——那个 `.git` 的来历不明，猜错的后果是拿另一个人的
+/// 基线去覆盖工作副本。
 pub fn backend_for(path: &str) -> Result<Box<dyn Vcs>> {
-    Ok(Box::new(git::GitBackend::new(path)))
+    match detect_repo_kind(path) {
+        RepoKind::Git => Ok(Box::new(git::GitBackend::new(path))),
+        RepoKind::SvnHybrid => Ok(Box::new(svn::SvnGitBackend::open(path)?)),
+        // 这两种都不是「能工作的仓库」，但原因不同，错误码必须分开——
+        // 前端据此给出的引导完全相反（去初始化 vs 去查那个 .git 哪来的）。
+        RepoKind::SvnUninitialized => Err(crate::error::GitError::new(
+            "svn_not_initialized",
+            format!("{path} 是一个 SVN 工作副本，但还没有初始化为混合仓库"),
+        )),
+        RepoKind::SvnSuspicious => Err(crate::error::GitError::new(
+            "svn_unconfigured_git",
+            format!(
+                "{path} 同时有 .svn 和 .git，但没有 .git/mygitclient.json。\
+                 这个 .git 可能是别人留下的——请确认之后再初始化，不要直接使用"
+            ),
+        )),
+    }
 }

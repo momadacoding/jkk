@@ -46,6 +46,8 @@ pub fn run() {
             commands::remote::push,
             commands::remote::push_tag,
             commands::repo::open_repo,
+            commands::repo::probe_svn_environment,
+            commands::repo::read_capabilities,
             commands::repo::read_upstream,
             commands::repo::repo_state,
             commands::session::load_session,

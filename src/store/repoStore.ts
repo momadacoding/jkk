@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { useCallback, useEffect, useState } from 'react'
 import type { CommitNode, DiffData, GraphData, PullRequest, RefPointer, RepoInfo, StashEntry, StatusData, UpstreamInfo, Worktree } from '../engine/types'
+import { ALL_CAPABILITIES, type Capabilities } from '../engine/capabilities'
 import { toErrorMessage } from '../engine/errors'
 import { samePath } from '../engine/path'
 import { nextSelection } from '../engine/selection'
@@ -22,6 +23,13 @@ export interface RepoState {
    * 两者在界面上是同一件事：分支旁边不画徽章。
    */
   pullRequests: PullRequest[]
+  /**
+   * 当前后端支持哪些功能。组件据此**不渲染**对应入口。
+   *
+   * 默认（也是读取失败时的兜底）是全开：普通 git 仓库占绝大多数，
+   * 把它们因为一次后端读取失败搞成半残，比在 SVN 仓库上多露一个入口更糟。
+   */
+  capabilities: Capabilities
   status: StatusData
   diff: DiffData
   selectedId: string | null
@@ -39,11 +47,29 @@ const initialState: RepoState = {
   upstream: null,
   stashes: [],
   pullRequests: [],
+  capabilities: ALL_CAPABILITIES,
   status: { staged: [], unstaged: [] },
   diff: { files: [] },
   selectedId: null,
   loading: false,
   error: null,
+}
+
+/**
+ * 读取后端能力，失败时退回全开。
+ *
+ * 为什么不让失败冒泡：`read_capabilities` 走的是 `backend_for`，而打开仓库那条
+ * 路径上 `open_repo` 已经先跑过同一个 `backend_for` 了——真的打不开的仓库在那里
+ * 就报错了。能走到这里还失败的，只剩「命令没注册」这类本项目自己的 bug，
+ * 把普通 git 仓库因此搞成半残不值当。
+ */
+async function readCapabilities(path: string): Promise<Capabilities> {
+  try {
+    return await invoke<Capabilities>('read_capabilities', { path })
+  } catch (err) {
+    console.warn('读取后端能力失败，按普通 git 仓库渲染全部入口：', err)
+    return ALL_CAPABILITIES
+  }
 }
 
 export function useRepoStore() {
@@ -53,7 +79,17 @@ export function useRepoStore() {
     setState((s) => ({ ...s, loading: true, error: null }))
     try {
       const info = await invoke<RepoInfo>('open_repo', { path })
-      setState((s) => ({ ...s, path, head: info.head, headHash: info.headHash, loading: false }))
+      // 每次打开都重新读，且**必然写回**：上一个仓库是 SVN 时留下的能力集合
+      // 会把下一个普通 git 仓库的入口一起关掉。
+      const caps = await readCapabilities(path)
+      setState((s) => ({
+        ...s,
+        path,
+        head: info.head,
+        headHash: info.headHash,
+        capabilities: caps,
+        loading: false,
+      }))
       // 打开一个 worktree 时想看的是「它在哪」，所以定位到它自己的 HEAD。
       // 这里必须把 headHash 显式传下去——上面那次 setState 是异步的，
       // refreshGraph 里的 updater 读不到刚写进去的值。
@@ -63,8 +99,9 @@ export function useRepoStore() {
       setState((s) => ({ ...s, worktrees: wts }))
       await refreshUpstream(path)
       await refreshStashes(path)
-      // 不 await：这一步要走网络（gh 实测一两秒），让它拖住打开仓库的收尾没有意义
-      void refreshPullRequests(path)
+      // 不 await：这一步要走网络（gh 实测一两秒），让它拖住打开仓库的收尾没有意义。
+      // 不支持 PR 的后端连这次 gh 调用都省掉——界面上没有任何地方会用到结果。
+      if (caps.pullRequests) void refreshPullRequests(path)
     } catch (err) {
       setState((s) => ({ ...s, loading: false, error: toErrorMessage(err) }))
     }

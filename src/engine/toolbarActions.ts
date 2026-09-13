@@ -1,4 +1,20 @@
+import type { Capabilities } from './capabilities'
+
 export type ToolbarAction = 'fetch' | 'pull' | 'push' | 'stash'
+
+/** 工具栏按钮的完整顺序。顺序即肌肉记忆，不要改。 */
+const ALL_ACTIONS: ToolbarAction[] = ['fetch', 'pull', 'push', 'stash']
+
+/**
+ * 按后端能力裁剪工具栏按钮，保持原顺序。
+ *
+ * `fetch` / `pull` / `push` 都直连 git remote，且**没有**进 `trait Vcs` 的接缝。
+ * SVN 工作副本上它们要么报「没有远程」，要么对着一个别人留下的 remote 真的动起来。
+ * `stash` 是本地 git 操作，两种模式下都留着（§16 Phase 1 验收）。
+ */
+export function visibleToolbarActions(caps: Capabilities): ToolbarAction[] {
+  return ALL_ACTIONS.filter((a) => caps.remotes || a === 'stash')
+}
 
 export interface ToolbarPlan {
   /** 按钮上显示的文字。按住 Ctrl 时必须变化，否则变体功能无从发现。 */

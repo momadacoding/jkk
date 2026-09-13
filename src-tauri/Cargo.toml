@@ -27,6 +27,16 @@ git2 = "0.20"
 notify = "7"
 tauri-plugin-dialog = "2.7.2"
 
+# svn 的 --xml 输出必须用真 parser 解析：`<wc-status` 与 `revision="…"` 不在同一行
+# 且是 CRLF，行内正则**不报错、只返回空集**，于是「nodeRevs 单值」这条不变量会以
+# 一种看起来通过了的方式被绕过（spec §6.6.4 陷阱三）。
+#
+# 选 roxmltree 而非 quick-xml：我们只读不写，DOM 查询能直接表达「取 <wc-status> 的
+# revision 而不是内层 <commit> 的」，不必手写嵌套状态机——取错那一层正是 spec
+# §6.6.4 陷阱二记录的永久误报。0.21 的依赖只有 memchr（已在树里），
+# rust-version 1.60，低于本 crate 声明的 1.77.2。
+roxmltree = "0.21"
+
 # 删 worktree 撞上「文件被占用」时，用 Restart Manager 查出到底是哪个进程占着。
 # 这个 crate 本来就在依赖树里（tao → tauri），这里只是显式声明并打开需要的
 # feature，不会新增下载。非 Windows 平台不引入。
