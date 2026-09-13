@@ -1,7 +1,7 @@
 # SVN + Git 混合模式 设计规格
 
 - 日期：2026-09-12
-- 状态：设计已确认，未实现。已过四轮对抗性 review + 三轮外部事实复核（`git svn` 方案 / 真实远端工作副本 / externals 布局），结论全部修入，见 §18
+- 状态：设计已确认，未实现。已过五轮对抗性 review + 三轮外部事实复核（`git svn` 方案 / 真实远端工作副本 / externals 布局），结论与修法边界见 §18
 - 前置可行性（P4 不跨仓库、P5 代码 external 未被钉住）**已于 2026-09-13 由用户确认通过**，见 §16.0
 - 分期：见 §16。本文覆盖全部 5 期的架构，各期另出实现计划
 
@@ -553,12 +553,13 @@ git 的硬规则：**父目录被排除后，其中的文件无法再被重新�
 `.gitignore`」说的是**我们不写**它，不是 git 不读它。git 的忽略源优先级是：
 
 ```text
-命令行 pathspec  >  工作树里的 .gitignore（越深越优先）  >  .git/info/exclude  >  core.excludesFile
+工作树里的 .gitignore（越深越优先）  >  .git/info/exclude  >  core.excludesFile
 ```
 
-所以 `core.excludesFile`（用户全局配置）那侧不用管，**但工作树里任意一层的
-`.gitignore` 都会盖掉我们生成的再入规则**。SVN 工作副本里完全可能已经躺着一个——
-团队提交过、或者从别处拷来的 Unity 模板。
+`git add` 的 pathspec 限定扫描范围，不会取消上述忽略规则。`core.excludesFile` 的
+优先级较低，**工作树里的 `.gitignore` 却能盖掉我们生成的再入规则**。SVN 工作副本
+里完全可能已经躺着一个——团队提交过、或者从别处拷来的 Unity 模板；最终都以实际
+候选索引的集合核对为准。
 
 2026-09-13 临时 git fixture 实测，白名单 `Code/` + `extensions: [".cs"]`：
 
@@ -573,15 +574,48 @@ Code/.gitignore 内容为一行 *.cs
 `git commit` 照样成功；§6.8 的基线体检也查不出来（它比的是磁盘与服务器，不比
 git 跟踪了谁，见 §15 第 20 条）。
 
-**所以初始化必须做一次「纳入集合核对」**，放在生成 exclude 之后、录第一个基线之前：
+**每次录制基线都必须做「纳入集合核对」**，不能只在初始化时检查。正常初始化之后，
+同事也可能通过 SVN 新增 `Code/.gitignore`（`*.cs`）和 `Code/New.cs`；S5 拉下两者后，
+`git add -A` 仍会成功，却漏收 `New.cs`，而 `nodeRevs` 单值、§6.8 体检无差异。
+
+核对与录制必须使用同一份候选索引：
 
 ```text
-期望集合 = 遍历磁盘，白名单路径 AND 扩展名，且不在任何一层 .svn/ 下
-实际集合 = git ls-files（在临时索引上 git add -A -- <白名单> 之后读）
-两者不一致 → 阻断，不创建基线
-              用 git check-ignore -v --non-matching <差异文件> 指认裁决者，
-              原样显示给用户（它会直接告诉你是哪个文件的第几行干的）
+期望集合 = 磁盘上 W-file 的具体文件，永久排除任意深度的 .svn/ 与 .git/ 元数据
+候选索引 = 临时索引；初始化 / Phase 1 R2 从空索引开始，其余录制入口从当前 HEAD 树开始
+           在该索引上 git add -A -- <W-path>，不修改真实 index、HEAD 或工作文件
+实际集合 = 该索引的完整 git ls-files -z 结果（不能再按扩展名过滤，以免藏掉多收的文件）
+两者不一致 → 不录制、不推进基线；对漏收文件用
+              git check-ignore --no-index -v --non-matching -- <差异文件> 定位原因
+两者一致   → 该索引 git write-tree 得到 TREE，录制时直接使用这个 TREE
 ```
+
+路径统一为仓库相对形式再比较，集合必须同时检查**漏收**和**多收**。不使用 `git add -f`
+绕开检查，也不自动修改团队的 `.gitignore`。录制基线用 `git commit-tree TREE` 创建
+commit（父提交保持各流程原有定义，首个基线无父），再以旧 OID 作比较条件更新
+`refs/heads/svn/base`；**不得核对一次后又重新 `git add` 另录一棵树**。创建相同 tree 的
+新 revision 基线仍然合法，`commit-tree` 不要求内容变化。
+
+HEAD 已附着在 `svn/base` 的入口在发布后用 `git read-tree TREE` 对齐真实索引，**不带
+`-u`、不改磁盘**；Phase 1 R2–R5 全程不碰真实索引。`TREE`、新 commit OID 和发布前的
+基线 OID 在使用 operation journal 的流程中必须先落盘，重开时按 OID 判断发布是否已经
+完成，不重复录制。初始化与 Phase 1 的创建 / 更新也必须比较旧基线 OID，失败就停止。
+临时索引只在本次操作自己的路径下创建、清理。
+
+| 核对时机 | 失败时的状态 |
+|---|---|
+| 初始化，首个基线之前 | 不创建基线，回退本次初始化创建的 `.git` |
+| `sync_in` / `sync_out` / 恢复的前置检查，以及重新加载配置时 | 用真实索引的**副本**预演 add 后核对；失败就不启动流程。预演不代替 stash，也不能复用为后续基线的 TREE |
+| S7，S5 完成之后 | 保留旧基线与 journal / stash，停在录制阶段，提示修正规则后继续 |
+| D7a，D6 完成之后、D8 移动任何基线指针之前 | D5 已成功；停在 `post-commit`，保留交付 ref，不回滚、不重复提交 |
+| §9.4 ⑥，⑤b 完成之后 | 不推进旧基线，保留恢复 journal / stash，等待继续 |
+| Phase 1 R2，R3 创建 commit 之前 | 中止，只清理临时索引，HEAD / 真实 index / 工作目录及基线指针均不变 |
+
+录制阶段失败时保留原流程的恢复信息，释放操作锁、恢复 watcher 并显示「同步未完成」。
+继续入口在拿锁后复核原分支 / 基线 OID、W-file 的 SVN 内容状态及记录的单值 revision；
+有新代码修改或 revision 变化就停止，先处理这些变化，不能把等待期间的 WIP 录成基线。
+满足前提后才重建候选索引、重新核对；不能用一次新的 S0 / D0 覆盖旧 journal。
+已完成 SVN update 的流程不能把「停止录制」说成「工作副本没变」。
 
 这条核对是**行为断言**，不是针对 `.gitignore` 这一种成因写的特判——`core.excludesFile`、
 用户手工改过的 `.git/info/exclude`、规则生成器自己的 bug，全都会在这里暴露。与 §6.8
@@ -595,8 +629,8 @@ git 跟踪了谁，见 §15 第 20 条）。
 
 | 记号 | 定义 | 谁用它 |
 |---|---|---|
-| **W-path** | 配置里 `whitelist` 声明的**路径**（目录递归） | 所有 **SVN** 侧命令的 target：`svn status` / `svn update` / `svn revert`。SVN 不认识扩展名，target 只能是路径 |
-| **W-file** | W-path **AND** `extensions` 命中的**文件** | 所有 **git** 侧的事：exclude 规则、基线 tree、交付清单、stash 范围 |
+| **W-path** | 配置里 `whitelist` 声明的**路径**（目录递归） | SVN 状态扫描、revision 归一的 update 范围；扫描结果还要按操作目的过滤 |
+| **W-file** | W-path **AND** `extensions` 命中的**文件**，永久排除任意深度的 `.svn/` 与 `.git/` 元数据 | git 的跟踪、基线 tree、stash 范围；SVN 交付文件和恢复时自动 revert 的范围 |
 
 `W-file ⊊ W-path`，差集是**真实存在**的一类文件：§6.3 开头就说了 `Assets/Scripts/`
 底下迟早会混进 `.psd`、`.zip`、`.bak`。这个差集有一个要命的性质：
@@ -608,7 +642,13 @@ git 跟踪了谁，见 §15 第 20 条）。
 
 实现上的硬规则：
 
-- 构造 **git** 命令参数时用 W-file；构造 **SVN** 命令 target 时用 W-path
+- **范围由操作目的决定，不由命令叫 git 还是 svn 决定。** SVN 接受显式文件 target，
+  客户端可以先按扩展名过滤，再传入文件列表。`status` 扫描 W-path；恢复的 `revert`
+  必须从结果中取 W-file 且已有备份的具体文件，绝不把整个扫描结果交给它
+- git 的跟踪与快照限定为 W-file；候选索引可以用 W-path 递归执行 `add`，但必须通过
+  §6.3.1 的集合核对。`svn commit` 用交付文件清单，加必要新增父目录及 `--depth=empty`
+  （§8.2.6）。`svn update` 的 W-path 归一会碰到差集，事前确认适用 §7.2.1、§8.1 #2
+  及 §9.4；确认 update **不授权 revert** 这些文件
 - 任何一句形如「这些文件 git 管得住 / 有基线兜底 / 冲突能在 git 里解决」的论证，
   **必须先确认说的是 W-file**。落在差集里的文件一条都不成立
 - §12.1 那个统一过滤函数要**同时导出两个集合**，不要让调用点自己拼
@@ -713,10 +753,8 @@ P1–P5 全部走完之后才建库（P1–P4 是硬门槛，P5 命中不阻断�
 git init -b svn/base                 ← 显式指定，不吃 init.defaultBranch 的默认值
 写入 .git/mygitclient.json（用户编辑白名单）
 生成 .git/info/exclude               ← 含末尾的 .svn/ 兜底行，见 §6.3
-纳入集合核对（§6.3.1）                ← 期望集合 vs git ls-files，不一致就阻断、
-                                        不创建基线。挡的是工作树里的 .gitignore
-                                        盖掉再入规则这类静默失效
-git add -- <白名单> && git commit    ← 首个基线，git-svn-id 的 rev 取自 P2 读到的 N
+纳入集合核对（§6.3.1）                ← 临时索引，期望集合 vs git ls-files，得到 TREE
+用该 TREE 录制首个基线并对齐真实索引 ← git-svn-id 的 rev 取自 P2 读到的 N；无父提交
 基线体检（§6.8）                      ← 有差异则整个回退，删掉刚建的 .git
 git checkout -b work                 ← 立刻离开基线分支
 ```
@@ -1125,7 +1163,7 @@ externals 定义 = "-r5 ^/code-trunk code"
 ```
 
 提交**确实上了服务器**，但下一次 update 把它从磁盘无声抹掉，而且工作副本报干净。
-放进本设计：D6 的 `svn update` 之后，D8c 的 `git add -A` 会把**旧内容**录成标着
+放进本设计：若 D6 使用这种更新方式，D7a / D8 的录制会把**旧内容**录成标着
 **新 revision** 的基线——自己造出 §9.2 的基线撒谎，且 §6.6.2 的所有间接判据都显示正常。
 没有缓解手段，只能按 §6.5 P5 硬阻断。
 
@@ -1183,7 +1221,7 @@ Local-Only: true
 
 | 流程 | 为什么不受影响 |
 |---|---|
-| §7 `sync_in` | **零改动**。S9 的 `git rebase --empty=drop svn/base` 会把 Local-Only commit 和普通 commit 一起搬到新基线上 |
+| §7 `sync_in` | 通过 §7.3.2 的线性区间检查后，S9 将 Local-Only commit 和普通 commit 一起 rebase 到新基线上；不按 trailer 改变同步语义 |
 | §8.1 前置检查第 2 条「工作区必须干净」 | 依然成立。补丁已经 commit 了，工作区本来就是干净的 |
 | §9.4 恢复流程 | 第 ③ 步 `git checkout svn/base` 之后磁盘上不含补丁，第 ④ 步的 `svn status` 不会把它误判成需要 `svn revert` 的 `M` 文件 |
 | §6.6 失同步检测 | 按 `nodeRevs`（revision 号）判定，与文件内容无关 |
@@ -1206,8 +1244,8 @@ commit 被 rebase 按 patch-id 丢弃）。补丁自动跟着每一次 `sync_in`
 | 该文件还能交付真实改动吗 | 能 | 能（但会连补丁一起交付） | **永远不能** |
 | 白名单外的 `svn update` 冲突 | 不涉及 | 不涉及 | 产生 `.mine` / `.rN`，客户端无恢复手段（§15.9） |
 
-文件级清单破坏基线正确性的具体路径：§8.2.2 的 D8c 是 `git add -A -- <白名单>`，收的是
-**磁盘内容**。若某文件被排除在 `svn commit` 之外却带着补丁躺在磁盘上，这个补丁会被写进
+文件级清单破坏基线正确性的具体路径：§8.2.2 的候选基线收的是**磁盘内容**。若某文件
+被排除在 `svn commit` 之外却带着补丁躺在磁盘上，这个补丁会被写进
 基线 commit，而该 commit 声称自己等于服务器的 `r_new`——此后所有「我相对服务器改了什么」
 的判断全错。这正是 §9.2 的「基线撒谎」，只不过是自己造出来的。
 
@@ -1242,7 +1280,8 @@ commit 被 rebase 按 patch-id 丢弃）。补丁自动跟着每一次 `sync_in`
 svn diff --old=<svnUrl>@<baselineRev> --new=<工作副本根> --summarize -- <白名单根...>
 ```
 
-有输出即「基线与服务器不符」，**直接证伪**，不需要任何关于 revision 号的推断。
+输出还原为仓库相对路径后，**只检查 W-file 的文件内容差异**（§6.8.4）。存在这种差异
+即「基线与服务器不符」，直接证伪，不需要关于 revision 号的推断。
 
 实测（2026-09-13，真实 SVN fixture）：
 
@@ -1286,7 +1325,7 @@ URL 与工作副本目录比对时不会走进 externals。
 | 缺陷类型 | 谁抓 |
 |---|---|
 | 基线 rev 与服务器内容不符（假基线的四个切面，§18） | **本节的体检** |
-| git 跟踪的文件集合不对（exclude 规则写错） | §14.2 第 6 项，断言 `git ls-files` 的真实结果 |
+| git 跟踪的文件集合不对（exclude / `.gitignore` 等规则影响） | §6.3.1 在每次录制前核对候选索引；§14.2 第 6、60、70 项覆盖真实行为 |
 
 要一条命令同时覆盖两类，得把服务器子树 `svn export` 下来再与基线树逐文件比对，
 成本从「传一个 diff」变成「下一整棵子树」。**本期不做**，记在这里是为了说明边界在
@@ -1304,7 +1343,8 @@ M       file:///…/repo/Assets/Scripts/A.cs        ← 第 1 列 = 内容变更
 1. **路径是 URL，不是工作副本相对路径。** 必须剥掉 `<svnUrl>` 前缀才能和白名单、
    `git ls-tree` 的输出对齐
 2. **输出里会混进目录条目，以及只有属性变更的条目。** 体检**只看第 1 列（内容）且
-   只看文件**；目录条目一律剔除——与 §8.6.2「比对前必须先剔除目录路径」同源，那里
+   只看 W-file 文件**；目录、纯属性变更和扩展名排除文件一律剔除。否则恢复流程有意保留的
+   `Code/Art.psd` 本地修改会让体检误报。与 §8.6.2「比对前必须先剔除目录路径」同源，那里
    不剔除会把真成功判成失败，这里不剔除会把正常仓库判成基线撒谎
 
 #### 6.8.5 什么时候跑
@@ -1313,7 +1353,7 @@ M       file:///…/repo/Assets/Scripts/A.cs        ← 第 1 列 = 内容变更
 
 | 时机 | 理由 |
 |---|---|
-| 初始化向导，`git commit` 首个基线之后、`git checkout -b work` 之前（§6.5） | 这是假基线的最大来源；此刻还没建工作分支，不通过就整个回退，代价最小 |
+| 初始化向导，首个基线录制并发布之后、`git checkout -b work` 之前（§6.5） | 这是假基线的最大来源；此刻还没建工作分支，不通过就整个回退，代价最小 |
 | §9.4 恢复流程第 ⑥ 步之后、第 ⑦ 步之前 | 恢复的全部目的就是修好基线，不验证等于没修 |
 | §16 Phase 1「重建基线」R3 之后、R4 之前（R3b） | 同上；此时指针还没动，不通过就中止，代价为零 |
 | 用户手动点「体检」 | 怀疑基线不对时的唯一直接手段 |
@@ -1327,8 +1367,8 @@ M       file:///…/repo/Assets/Scripts/A.cs        ← 第 1 列 = 内容变更
 
 | 结果 | 处理 |
 |---|---|
-| 无输出 | 基线可信，记下体检时间与 revision |
-| 有输出（真差异） | **基线撒谎**。阻断并列出差异文件；初始化时整个回退，恢复流程时停在第 ⑥ 步报错 |
+| 命令成功，按 §6.8.4 过滤后无 W-file 内容差异 | 基线可信，记下体检时间与 revision |
+| 命令成功，过滤后仍有 W-file 内容差异 | **基线撒谎**。阻断并列出差异文件；初始化时整个回退，恢复流程时停在第 ⑥ 步报错 |
 | 命令失败（断网、认证、URL 不可达） | **不是基线有问题**。不阻断，标记「基线未经体检」并在 UI 上如实显示，对齐 §6.6.2 `remoteRev` 的「不 await、失败静默」模式 |
 
 把第三行单独列出来是必须的：把「没能验证」当成「验证不通过」会让离线场景寸步难行，
@@ -1346,7 +1386,8 @@ M       file:///…/repo/Assets/Scripts/A.cs        ← 第 1 列 = 内容变更
 3. **想放弃时 `svn revert` 会把文件恢复到 SVN base 而不是 git 分支的状态——
    未提交的改动会被直接吃掉**
 
-设计目标因此是：**让 `svn update` 永远不可能冲突，把全部冲突逼进 git 里解决。**
+设计目标因此是：**先移走 W-file 的本地改动，让代码内容冲突由 git rebase 处理。**
+SVN 树冲突，以及未受 git 保护文件的 update 冲突，仍按 §13 单独处理。
 
 ### 7.2 前置检查
 
@@ -1355,13 +1396,14 @@ M       file:///…/repo/Assets/Scripts/A.cs        ← 第 1 列 = 内容变更
 1. 不在 rebase / merge 中途
 2. 基线未失同步（走 §6.6.3 的**完整 `nodeRevs` 校验**，不是 O(1) 那档）
 3. 当前不在 `svn/base` 上，且 **HEAD 必须附着在分支上**（detached HEAD 拒绝，见 §8.1.1）
-4. `svn status` 里白名单外没有冲突态文件（`C`）
-5. **白名单外若有本地修改（`M` / `!`），列出来并要求用户确认**——见下
-6. 拿到该工作副本的独占锁
+4. `svn status` 里 W-file 外没有冲突态文件（`C`），包含 W-path 内被扩展名排除的文件
+5. **本次 update 会触及的 W-file 外文件若有本地修改（`M` / `!`），列出来并要求用户确认**——见下
+6. 待重放区间 `svn/base..HEAD` 没有 merge commit（§7.3.2），且通过当前磁盘的纳入集合预检（§6.3.1）
+7. 拿到该工作副本的独占锁；锁内复核 HEAD / 基线 OID 与上述检查时一致，变化则停止
 
 #### 7.2.1 为什么第 5 条是确认而不是阻断
 
-白名单外的文件（美术资产、Unity 生成的 `.asset`）**git 完全不管**，客户端对它们
+W-file 外的文件（含白名单目录内的 `.psd`，以及其他美术资产、Unity 生成的 `.asset`）**git 完全不管**，客户端对它们
 没有任何恢复手段。S5 的全量 `svn update` 会把远端改动合并进这些本地修改，冲突时
 只会留下 SVN 的 `.mine` / `.rN` 文件，得回 TortoiseSVN 处理。
 
@@ -1388,20 +1430,17 @@ S1   工作区不干净时：
      ⑤ OID 写进 journal，phase=stashed                     ← 不记 stash@{0}，见 §7.6.1
 S2   （origBranch 已在 S0 落盘，此处只推进 phase）
 S3   git checkout svn/base
-S4   svn status --xml 校验白名单内应为 0 修改              ← 双保险
+S4   svn status --xml 扫描后只校验 W-file 应为 0 修改        ← 不把已确认保留的差集修改当作失同步
 S5   svn update --accept postpone                        ← 在项目根递归跑，
                                                               连带更新所有 external
      **仅当**检测到白名单所属 external 被 `-r` 钉住时，改走 §6.5.3 的两步形式。
      默认不走两步，理由见 §6.5.4
 S6   svn info --xml + svn status -v --xml 读新 revision
-S7   git add -A -- <白名单> && git commit --allow-empty     新基线
+S7   临时索引纳入集合核对 → 用通过核对的 TREE 录制新基线   ← §6.3.1；失败保留旧基线和 journal
+     按 §7.6 写入录制 / 发布阶段；完成索引对齐后才进入 S8
 S8   git checkout ORIG_BRANCH
-S8b  refTree = git merge-tree --write-tree svn/base ORIG_HEAD  ← rebase 的参考结果，
-                                                                 必须在 rebase 之前算，
-                                                                 见 §7.3.2
-S9   git rebase --empty=drop svn/base                       ← 冲突在这里爆
-S9b  git rev-parse HEAD^{tree} == refTree                   ← 内容守恒断言。不等则
-                                                               **停下不动**，见 §7.3.2
+S9   复核 §7.3.2 的待重放区间，再 git rebase --empty=drop svn/base
+                                                         ← 普通内容冲突在这里处理，无 merge-tree 前置
 S10  git stash apply <OID>（若 S1 有 stash），成功后
      git stash drop 对应条目 + 删掉 refs/mygitclient/sync/<opid>
 S11  删除 journal；恢复 watcher + 主动发 repo-changed
@@ -1470,79 +1509,71 @@ git log -g --format='%H %gs' refs/stash | grep "mygitclient-sync:0f3adead-beef"
 还在（我们在 ④ 用 `refs/mygitclient/sync/<opid>` 钉过），但若崩在 ④ 之前就没钉上，
 对象会被 gc 回收。这是 §7.6.1 那条「钉住」规则要尽早执行的原因。
 
-#### 7.3.2 S9 的 rebase 会静默吃掉 merge commit 里独有的改动
+#### 7.3.2 重放范围内的 merge commit 必须在修改前阻断
 
-§15 第 12 条原来写「压平 merge commit……**不会报错也不会丢改动**」。后半句是错的。
+普通 `git rebase` 会跳过 merge commit；只存在于合并结果中的额外修改可能无冲突地
+消失。上一版试图在 rebase 后与 `git merge-tree --write-tree` 的结果整树比对，
+但第五轮 fixture 复核推翻了这个判据：
 
-`git rebase` 不带 `--rebase-merges` 时按 `--no-merges` 重放，**merge commit 本身承载的
-改动不在任何一个被重放的 commit 里**。只要那部分改动在线性重放时不产生冲突，它就会
-**无冲突、无告警地**从结果树里消失。2026-09-13 临时 git fixture 实测：
+| 输入 | 实测结果 | 对设计的含义 |
+|---|---|---|
+| 纯线性分支把 `A.cs` 从 `0→1→0`，新基线把它改成 `1` | merge 与 rebase 均退出 0，结果分别为 `1` 与 `0` | 无冲突不保证两树相等；差异不能证明 merge 内容丢失 |
+| 两边改同一行 | `merge-tree` 退出 1，输出的树含冲突标记 | 该树不能作为用户解完冲突后的预期结果，也不能提前挡住正常的 rebase 冲突流程 |
+| mixed-revision 恢复的原分支含 merge 独有的 `Evil.cs` | §9.4 ⑦ rebase 退出 0，但文件消失 | 保护必须覆盖恢复流程，不能只加在 S9 / D8d |
 
-```text
-work: base ──w1──┬──────────── merge topic（合并后又在这个 commit 里加了 evil.txt）
-                 └──t1────────┘
-rebase 前 tree:  a.txt  evil.txt  t.txt  w.txt
-git rebase --empty=drop base   →  Successfully rebased（无冲突、无告警）
-rebase 后 tree:  a.txt  b2.txt   t.txt  w.txt        ← evil.txt 没了
-```
-
-**触发面要写准，别写过头。** 冲突解决型的 merge **不**会静默丢——线性重放会再撞一次
-同样的冲突，用户看得见。真正静默丢的只有 **evil merge**：merge commit 里带着两个父
-提交都没有、且线性重放时不冲突的内容。用户在 IDE 里「合完顺手再改一点、`--amend`
-进去」就是这个形态。
-
-**守恒断言：拿三方合并的结果当参考树。** 对同一组输入，「把 `ORIG_HEAD` rebase 到
-`svn/base`」和「把 `ORIG_HEAD` 合并进 `svn/base`」在无冲突时应当得到**同一棵树**，而
-`git merge-tree --write-tree` 会把 merge commit 自己的内容算进去（它比的是树，不是
-commit 序列）。所以 S8b / S9b 那两步就能判定：
+因此本期**取消 S8b / S9b 及 D8d 的整树守恒断言**，采用修改前可判定的保守门槛。
+不尝试区分「这次 merge 恰好安全」与「包含独有改动」，也不以 `--rebase-merges` 自动
+重试；后者重建 merge 时同样不能保证保留原来的额外修改或冲突解决结果。
 
 ```text
-refTree = git merge-tree --write-tree svn/base ORIG_HEAD
-rebase 之后：git rev-parse HEAD^{tree} == refTree ?
+输入：已解析并固定的 targetOid、tipOid
+git rev-list --merges <targetOid>..<tipOid>
+  命令成功且输出为空 → 待重放区间线性，可以进入普通 rebase
+  输出非空           → 列出 merge OID，停止；不执行 stash / checkout / rebase / SVN 写操作
+  命令失败           → 检查未完成，停止；不能把失败当作空集合
 ```
 
-实测三个方向（2026-09-13，临时 git fixture）：
+| 调用入口 | 检查区间 | 必须在什么时候检查 |
+|---|---|---|
+| `sync_in` | 当前 `svn/base` OID .. 当前分支 OID | S0 / S1 之前；S9 前对新基线再复核 |
+| §9.4 恢复 | 当前 `svn/base` OID .. 当前分支 OID | ⓪ / ① 之前；⑦前再复核 |
+| `sync_out` 的 D8d（有 Local-Only commit） | `deliverRef` OID .. `origHead` | D0.5 构造完成后、D3 确认及 D5 之前；D8d 前对实际新基线再复核 |
 
-| 场景 | 结果 |
-|---|---|
-| evil merge（上面那个） | 参考树含 `evil.txt`，rebase 树不含 → **不等，抓到** ✅ |
-| 普通线性分支 + 真实三方合并（服务器改 A 文件、本地改同文件另一处） | 两树**逐字节相等**，不误报 ✅ |
-| 已交付 commit 被 `--empty=drop` 丢弃 | 两树**逐字节相等**，不误报 ✅ |
+S7 和恢复⑥的新基线都以旧基线为祖先，D8a 的新基线以 `deliverRef` 为祖先，因此正常
+推进不会把预检区间之外的 merge 突然加入重放范围。journal 记录检查用的不可变 OID；
+继续操作前若分支或基线被外部改动，停止并保留 journal，不能沿用旧检查结果。
 
-后两行是这条断言能不能用的关键——误报一次就等于每次 `sync_in` 都被拦。
+**只检查需要重放的区间，不扫描整条历史。** 已经在目标基线里的 merge 不受影响；
+没有 Local-Only 的快路径交付不做 rebase，也不受这条门槛限制。快路径顶端的 Local-Only
+后缀必须由单父提交组成；后缀内含 merge 时，D0.5 前即拒绝，不能把它当作普通补丁摘掉。
+慢路径仍受 §8.1 #6 的线性历史要求约束。
 
-**不等时停下不动**，报「本次 rebase 会丢失 `<merge commit>` 里独有的改动」，把差异
-文件列出来，引导用户把那些改动提成一个普通 commit 再重来。**不自动 merge、不自动
-`--rebase-merges` 重试**（§8.7）。此时 rebase 已经完成，分支已被改写，所以恢复路径是
-`git reset --hard ORIG_HEAD`——`ORIG_HEAD` 在 S0 就已经落盘进 journal（§7.6），这是它
-在这里唯一的用途之外的第二个用途。
+阻断提示应说明「本期不自动重放 merge 历史」，保留原分支及工作内容，供用户保留原历史
+后手工整理。**不能建议直接再跑一次普通 rebase，也不自动执行 reset 或历史改写。**
 
-⚠️ `git merge-tree --write-tree` 是较新的 git 才有的形式（本机 2.51.2 实测可用，引入
-版本未核实）。**实现必须显式探测它是否可用**，而不是按版本号猜；探测不到时按 §6.8.6
-的原则标记「本次 rebase 未经守恒校验」，**不得当成通过**（§15 第 27 条）。
-
-D8d 的那次 rebase（§8.2.2，有 Local-Only commit 时）走同一条断言，`refTree` 的两个
-输入换成 `svn/base` 与 D8d 之前的 `origHead`。
+线性区间继续使用 `git rebase --empty=drop svn/base`：退出 0 后进入下一步；非零时检查
+git 的 rebase 状态与未合并索引，确为冲突则释放操作锁、保留 journal / stash，进入
+现有冲突解决流程。用户明确继续 / 放弃时分别走 rebase 的 continue / abort；没有
+rebase 冲突状态的非零结果按命令错误处理。**不先运行 merge-tree，也不在用户解完冲突
+后拿含冲突标记的树作等值断言。** 这条分流由 S9、D8d、恢复⑦共同使用。
 
 ### 7.4 不显然的点
 
 - **S4 是双保险，不能省。** revision 比对能抓住「外部提交过」，抓不住「外部手工
   改了 base 文件」。这一步直接问 SVN 要事实
-- **S5 的 `--accept postpone` 是硬要求。** S4 保证了内容冲突不可能发生，但
+- **S5 的 `--accept postpone` 是硬要求。** S4 只验证 W-file 的内容干净；W-file 外的
+  本地修改仍可能在 update 时产生内容冲突（§7.2.1），而
   **SVN 树冲突**（服务器删掉某个目录、或把目录换成文件）与工作副本干净与否无关。
   `postpone` 让它停下来报错，而不是弹交互提示卡死子进程，也不替用户自动选
-- **S7 白名单内无变化时也要落 commit**（`--allow-empty`）。基线记账必须跟上
+- **S7 白名单内无变化时也要落 commit**（§6.3.1 的 `commit-tree` 允许相同 TREE）。基线记账必须跟上
   revision，否则下次 §6.6 的检测会误报失同步
 - **S9 / S10 的冲突不是失败，是正常出口之一。** 此时必须**释放锁**（用户要编辑
   文件解决冲突），仓库进入「同步未完成」状态
 - **本地补丁（§6.7）在这里不需要任何特殊处理。** Local-Only commit 就是普通 commit，
   S9 的 rebase 把它和其余 commit 一起搬到新基线上。它与服务器改动真冲突时，冲突就在
   S9 爆出来，和普通代码冲突走同一条路——这正是选 commit 而非未提交改动的收益
-- **S8b 必须在 rebase 之前算，S9b 必须在 rebase 之后比。** 参考树的两个输入
-  （`svn/base`、`ORIG_HEAD`）在 rebase 之后一个已经换了含义、一个已经不是分支尖端，
-  事后补算就不是同一个断言了。S9b 与 S9 的冲突出口是**两回事**：S9 冲突是正常出口
-  （停在冲突态等用户解），S9b 不等是**缺陷信号**（rebase 已经"成功"了但内容少了），
-  见 §7.3.2
+- **merge 历史门槛必须前置到 S0 之前，并在恢复入口同样执行**（§7.3.2）。线性分支的
+  正常冲突由 rebase 自己产生和记录，不设置另一套 merge 参考树作为完成条件
 
 ### 7.5 代价
 
@@ -1589,9 +1620,10 @@ S2–S7 之间工作目录会短暂回到基线状态，Unity 会多触发一次
 D5 的 target 列表必须带上它们，否则提交被 `E200009` 拒（§8.2.6）；回滚时要靠它把
 `svn add --parents` 带出来的父目录登记撤干净（§8.5.1）。
 
-⚠️ **S8b 的 `refTree` 不进 journal。** 它是 `svn/base` 与 `ORIG_HEAD` 的纯函数，两个
-输入都已经在 journal 里（`origHead` 在 S0 就落盘），崩溃重开后随时能重算——写进去只会
-多一份可能过期的副本。
+每次准备录制基线时，journal 另记 `baselineOidBefore`、`captureTree`、`newBaselineOid`
+及准备返回的流程阶段（§6.3.1）；这些是发布与重开恢复的锚点，不是 merge 参考树。
+rebase 预检使用的目标 OID 与 `origHead` 同样落盘，禁止用可能漂移的 `ORIG_HEAD`
+伪引用替代 journal 中的原始 OID。
 
 最后三个字段只有 `sync_out` 用：
 
@@ -1614,7 +1646,9 @@ D5 的 target 列表必须带上它们，否则提交被 `E200009` 拒（§8.2.6
 | `checked-out` | D3.8 已切走，主工作副本是交付树的内容 | §8.2.4（② 会真的切回去） |
 | `svn-staged` | `.svn` 里挂着 add / delete 登记，`svnDelta` 已落盘 | §8.5（先撤 SVN 登记，再复用 §8.2.4 ②～⑤） |
 | `committing` | `svn commit` 已发出，结果未知 | §8.6.2 查证，**不得盲目回滚** |
-| `post-commit` | 服务器已落地，基线未推进 | 不回滚，提供「重试 D6 起」入口 |
+| `post-commit` | 服务器已落地，基线未推进；D7a 可能因漏收文件而中止 | 不回滚；D6 失败可重试 D6，D7a 失败修正规则后重新核对候选 TREE，不重复 D5 |
+| `publishing-baseline` | TREE 已核对；新基线 commit 可能已创建或已发布，工作分支尚未恢复 | 比对 journal 的新旧 OID 判定发布状态，按 §8.2.2 继续；不重新提交 SVN、不覆盖外部推进的基线 |
+| `restoring-branch` | 基线已发布且索引已对齐；D8d 可能已切回原分支、正在 rebase 或已完成 | 按 HEAD、原分支 OID 与 Git 的 rebase 状态继续 D8d 或进入 D10；不得回到 D6 / D8c 覆盖冲突 |
 
 `sync_in` 另有两个 phase 与 stash 相关，见 §7.3.1：
 
@@ -1622,6 +1656,18 @@ D5 的 target 列表必须带上它们，否则提交被 `E200009` 拒（§8.2.6
 |---|---|---|
 | `stashing` | `stashRefBefore` 已落盘，`git stash push` 可能落地也可能没有 | 比对当前 `refs/stash` 与 `stashRefBefore` 判定，**不静默 apply** |
 | `stashed` | stash 已落地且 OID 已钉住 | 按 `stashOid` 恢复 |
+
+S7 与恢复⑥另共用以下录制阶段，以 `flow` 及 `captureReturnStep` 区分后续入口：
+
+| phase | 写前记录与继续规则 |
+|---|---|
+| `capturing-baseline` | 核对前记录旧基线 OID、目标 revision 与返回步骤；核对失败留在此处，继续时按 §6.3.1 重新验证前提、重建候选索引 |
+| `publishing-baseline` | 创建 commit 前记录通过核对的 `captureTree`、父 OID；移动 ref 前再记录 `newBaselineOid`。重开比较新旧 OID，仅补尚未完成的发布 / 索引对齐；无新 OID 表示尚未发布，为其他 OID 则停止 |
+| `baseline-ready` | 发布并对齐索引后、切走之前写入；S7 返回 S8，恢复⑥返回⑥b。此阶段起不得重新录制或对齐旧索引，后续 rebase 冲突由 Git 自身状态接管 |
+
+这些继续入口还要确认 HEAD、磁盘与记录阶段相符；外部改写时停下，不用 `read-tree`
+覆盖外部暂存，也不重新执行已经完成的 SVN 操作。`publishing-baseline` 是两个流程
+共用的阶段名，但 `sync_out` 的父提交与返回入口按 §8.2.2 解释，不能套用 S7 的旧基线父。
 
 `building-deliver` 与 `deliver-built` 必须分开：前者意味着可能存在半途状态（worktree、
 sequencer），后者意味着构造已完成、只剩一个干净的 ref。合成一个 phase 的话，恢复代码
@@ -1661,7 +1707,7 @@ git stash apply f2208125…  → 取回的仍是正确的 WIP     ✓
 ### 8.1 前置检查
 
 0. **当前分支必须已经包含最新的 `svn/base`**：`git merge-base --is-ancestor svn/base HEAD`
-   必须成立。不成立则拒绝交付，要求先对该分支跑一次 `sync_in`（或 `git rebase svn/base`）。
+   必须成立。不成立则拒绝交付，要求先对该分支跑一次 `sync_in`（同样受 §7.3.2 的 merge 门槛约束）。
    **这是全部前置检查里唯一挡得住「拿旧基线的分支交付」的一条**，见 §8.1.2
 1. 基线未失同步
 2. **工作区必须干净**，包含两层：
@@ -1684,11 +1730,12 @@ git stash apply f2208125…  → 取回的仍是正确的 WIP     ✓
 6. **需要走慢路径时，待交付历史必须是线性的**：`localOnlyCommits` 非空且不全部
    位于分支顶端（即 §8.2.3 的慢路径）时，`git rev-list --merges svn/base..HEAD`
    必须为空。非空则拒绝交付，指出是哪个 merge commit，引导用户把本地补丁移到分支
-   顶端（转成快路径，merge 不受影响）或先线性化历史。
+   顶端（转成快路径，已在交付树内的 merge 不受影响），或保留原分支后手工整理历史。
    理由见 §8.2.3 的 T4 / T5：`cherry-pick` 对 merge commit 要么硬失败，要么在加
    `-m` 之后重复应用已摘取过的父提交改动，没有安全的自动解法。**快路径不做这个
    检查**——它只是给一个已有 commit 起名字，历史里有没有 merge 都无所谓
-7. 拿锁
+7. 快路径顶端的 Local-Only 后缀必须是**单父提交**，其中有 merge 则前置拒绝（§7.3.2）
+8. 通过纳入集合预检（§6.3.1），再拿锁；锁内复核 HEAD / 基线 OID 没有变化
 
 #### 8.1.1 为什么 detached HEAD 必须拒绝而不是支持
 
@@ -1748,13 +1795,15 @@ D1: git diff --name-status --no-renames svn/base..B
 撤销掉，且 D5 之后不可撤销**。
 
 **改成三点 diff 不是正确的修法。** 三点 diff 只是把删除藏起来，交付内容仍然是基于
-旧基线算出来的；而且 §8.2.2 的 D8a `git branch -f svn/base HEAD` 会把基线**倒退**回
-分支 B 的树，`ANew.cs` 从基线里消失。D8d 那个号称「断言」的 `--ff-only` 此时反而是
-成立的（基线刚被拽到交付树上），**抓不到**。
+旧基线算出来的。修订前 D8a 的 `git branch -f svn/base HEAD` 还会把基线**倒退**回
+分支 B 的树，`ANew.cs` 从基线里消失，而 D8d 的 `--ff-only` 反而成立、抓不到。
+现行 §8.2.2 从已核对的 TREE 录制基线，但仍以交付树为父提交，仍依赖第 0 条祖先检查；
+不能靠换一种 diff 或发布顺序替代这道前置。
 
 所以唯一可靠的办法是在动手之前要求「当前分支已经包含最新基线」，也就是把
 §8.2.2 第一句「`svn/base` 是交付树的祖先」从**假设**变成**被检查过的前提**。
-用户看到的提示是「分支 B 还停在 r1，请先更新这个分支」，一次 `sync_in` 就解决。
+用户看到的提示是「分支 B 还停在 r1，请先更新这个分支」。线性历史可走 `sync_in`；
+待重放区间含 merge 时先按 §7.3.2 保留原分支并人工整理。
 
 ### 8.2 步骤
 
@@ -1767,6 +1816,8 @@ D0.5 deliverRef / localOnlyCommits / tempWorktree 先写进     ← 写前日志
      commit。没有 Local-Only commit 时它等于 HEAD。
      **主工作副本磁盘全程不动**，慢路径在临时 worktree 里
      重放。构造完成后 phase=deliver-built                   ← 见 §8.2.3
+     有 Local-Only 时检查 deliverRef..origHead 无 merge      ← D8d 的提前门槛，§7.3.2
+     不过则走 §8.2.4 收尾，绝不进入 D3 / D5
 D1   git diff --name-status --no-renames
        svn/base..refs/mygitclient/deliver/<opid>            ← 净变更清单
 D2   按白名单过滤清单                                        ← 双保险
@@ -1803,7 +1854,8 @@ D6   phase=post-commit  ← 过了这一步服务器状态已不可撤销
         HEAD，这正是我们要的；而在项目根跑递归 update 会把它拽回 peg，把刚
         交付的内容从磁盘抹掉。见 §6.5.3
 D7   svn status -v --xml 读新的 nodeRevs → r_new
-D8   推进基线到交付树（见 §8.2.2）
+D7a  临时索引纳入集合核对 → TREE（§6.3.1）                  ← 不过则留在 post-commit，基线不动
+D8   将 D7a 的 TREE 发布为新基线，并恢复原分支（见 §8.2.2）
 D9   提示「work 分支已交付，可删除」——不自动删
      **分支上还有 Local-Only commit 时禁止给出这个提示**，见 §8.2.3
 D10  收尾：先跑成功路径自己的断言，再复用 §8.2.4 的 ③ 和 ⑤
@@ -1874,44 +1926,45 @@ svn update --accept postpone -- Code
 
 #### 8.2.2 D8 推进基线：必须显式编排分支
 
-D5 成功之后，磁盘上白名单文件的内容 = **交付树 tip 的内容**（D3.8 已经切
-上去了）= 服务器 r_new 的内容。新基线的树就应该是它。
-
-`svn/base` 是交付树的祖先（**由 §8.1 第 0 条保证**——这一条以前是个没人检查的假设，
-后果见 §8.1.2），所以基线本身可以纯快进：
+D5 成功后，D6 可能又拉到他人的改动，所以新基线的内容取自 D7a **已核对的 TREE**，
+父提交取交付树 `deliverRef`。`svn/base` 是交付树的祖先（§8.1 第 0 条），因此新 commit
+仍是旧基线的后代，同时保留本次已交付的 git 历史。整个录制过程不得先 checkout 旧基线。
 
 ```text
-D8a  git branch -f svn/base HEAD        ← HEAD 此刻 detached 在 deliverRef 上；只动指针，
-                                           工作目录一个文件都不碰
-D8b  git checkout svn/base              ← 与 HEAD 同点，工作目录无变化
-D8c  git add -A -- <白名单>              ← 收进 D6 拉下来的他人改动（若有）
-     git commit --allow-empty -m "svn: r_new … git-svn-id: <svnUrl>@r_new <uuid>"
-D8d  git checkout <ORIG_BRANCH>
+D8a  先写 journal：phase=publishing-baseline、TREE、OLD_BASE_OID、deliverOid
+     git commit-tree TREE -p <deliverOid>
+        -m "svn: r_new … git-svn-id: <Repository Root>@r_new <uuid>" → NEWBASE
+     将 NEWBASE 写入 journal 并落盘，之后才允许移动 ref
+D8b  git update-ref refs/heads/svn/base NEWBASE OLD_BASE_OID  ← 比较旧 OID，变化则停止
+D8c  git read-tree TREE                  ← 只对齐索引，不带 -u，磁盘已是候选快照
+     git checkout svn/base               ← 此刻指向 NEWBASE，不会换回旧基线内容
+D8d  先写 journal：phase=restoring-branch、targetBaselineOid=NEWBASE
+     git checkout <ORIG_BRANCH>
      无 Local-Only commit：git merge --ff-only svn/base   ← 纯快进，不可能冲突
      有 Local-Only commit：
-       refTree = git merge-tree --write-tree svn/base ORIG_HEAD  ← 先算参考树
+       复核 svn/base..origHead 无 merge，且原分支 OID 未被外部改写（§7.3.2）
        git rebase --empty=drop svn/base
-                                        ← 已交付的 commit 按 patch-id 被丢弃，
-                                          只剩本地补丁落到新基线之上
-       git rev-parse HEAD^{tree} == refTree                      ← 内容守恒断言，
-                                                                   同 §7.3.2
+                                         ← 已交付的 commit 按 patch-id 被丢弃，
+                                           只剩本地补丁落到新基线之上
 ```
 
-D8a 先动指针再 checkout 是关键：**反过来先 `git checkout svn/base` 会把工作目录
-退回旧基线内容**，而此刻 SVN 的 base 已经是刚提交的新内容——SVN 会把这看成「你
-把自己刚提交的东西全撤了」，正是 §9.2 描述的基线撒谎场景，只不过是自己造出来的。
+先核对 TREE、从 TREE 创建 commit，再发布指针与对齐索引，保证 D7a 失败时旧基线还在。
+`publishing-baseline` 重开若尚未记录 NEWBASE，说明 ref 尚未发布，可从已记录的 TREE
+重建 commit；若 `svn/base == NEWBASE`，只继续索引对齐与 D8d；仍为 `OLD_BASE_OID`
+则尚未发布；为其他 OID 则停止，不覆盖外部改动。索引对齐前还须确认磁盘仍匹配已核对
+的候选快照，否则停下保留现场。`restoring-branch` 重开则按 D8d 当前状态继续，不能再
+从 D6 或 D8c 重放并覆盖用户正在解决的冲突。
 
 D8d 的 `--ff-only` 是断言而非优化：**在没有 Local-Only commit 的前提下**走到这里必然
 是快进，不是快进就说明前面某步的假设崩了，应当报错停下而不是自作主张 merge。有
-Local-Only commit 时工作分支必然不是快进（它带着基线上没有的补丁），断言改由 rebase
-之后的两条检查承担：**`svn/base..ORIG_BRANCH` 里必须只剩 Local-Only commit**（出现
-任何没标记的 commit 都说明有该交付的东西没交付出去），以及 §7.3.2 那条**内容守恒
-断言**（挡住 rebase 把 merge commit 里独有的改动吃掉）。两条任一不过都报错并导出
-journal。
+Local-Only commit 时，先由 §7.3.2 检查待重放区间；rebase 完成后仍要求
+**`svn/base..ORIG_BRANCH` 里只剩 Local-Only commit**（出现未标记 commit 就停止并导出
+journal）。不与另一种合并算法的结果做整树等值断言。rebase 冲突按 §7.3.2 分流，进入
+现有的用户解决 / 继续 / 放弃流程。
 
 ⚠️ 走到 D8d 时 D5 已经成功、基线已经推进，所以这里报错**不回滚**，语义与 §13 那行
-「D8d rebase 冲突」一致：提交是好的，只是补丁没落回工作分支。用户拿 journal 里的
-`origHead` 就能 `git reset --hard` 回到 rebase 之前重来。
+「D8d rebase 冲突」一致：提交是好的，只是补丁没落回工作分支。保留 journal 中的
+`origHead` 与 Git 的 rebase 状态，由用户选择后续操作，不自动 reset 或重试。
 
 #### 8.2.3 D0.5 构造交付树：把本地补丁摘掉
 
@@ -1954,15 +2007,15 @@ git pack-refs --all 之后                                       依然 fatal
 
 初始化向导（§6.5）仍应保留 `svn` 这个分支名不被占用——那是 §6.4 已经记过的坑，与本节无关。
 
-**快路径（Local-Only commit 连续位于分支顶端）**
+**快路径（全部 Local-Only commit 构成分支顶端连续的单父后缀）**
 
 ```text
 git update-ref refs/mygitclient/deliver/<opid> <最后一个非 Local-Only commit>
 ```
 
-只是给一个已有 commit 起个名字，**不动 HEAD、不动磁盘、结构上不可能冲突**。客户端应
-提供一个「把本地补丁移到分支顶端」的整理操作（本质是一次交互式 rebase 的重排），把
-慢路径的风险变成用户可主动规避的。
+只是给一个已有 commit 起个名字，**不动 HEAD、不动磁盘、结构上不可能冲突**。若用户
+需要整理成本地补丁后缀，应先保留原分支，再用熟悉的工具人工调整；本期不自动执行
+交互式 rebase，也不靠重排历史来绕过 merge 门槛。
 
 **慢路径（Local-Only commit 夹在中间）：在临时 worktree 里重放**
 
@@ -2495,39 +2548,55 @@ revert 后: rootRev=1  nodeRevs={1}     ← 完全没变
 
 ### 9.4 恢复流程
 
+**先做前置检查，再开始下面的修改。** HEAD 必须附着在非基线分支上，且不在现有的
+merge / rebase 中途；执行 §7.3.2 对 `svn/base..HEAD` 的 merge 检查与 §6.3.1 的纳入
+集合预检。任一不过，不 stash、不 checkout、不动 SVN。拿锁后复核检查用的 OID 没变。
+
+自动恢复只处理 **W-file 中已受保护的文件**。W-path 减 W-file 的本地修改不进入
+revert / 删除清单；若本次需要⑤b的目录 update，必须在⓪之前列出它会触及的差集本地
+修改（含 `M` / `!`）并按 §7.2.1 确认，已有冲突则先停止。该确认只授权 update 的
+合并风险，不能用它授权还原原文。开始⑤b前重新核对差集，出现未确认的新改动时停止。
+
 ```text
-⓪ 写 journal（flow=recover），phase=start            ← 任何修改之前，见 §7.6
+⓪ 挂起 watcher；写 journal（flow=recover），phase=start
+   origBranch / origHead / baselineOidBefore 此刻落盘 ← 任何修改之前，见 §7.6
 ① git stash push -u -- <白名单>；立刻取 OID 并用
-   refs/mygitclient/sync/<opid> 钉住，写进 journal   保护未提交改动，可逆
-   （S1 那套写前顺序同样适用，见 §7.3.1）
-② 原分支与 origHead 写进 journal
+    refs/mygitclient/sync/<opid> 钉住，写进 journal   保护未提交改动，可逆
+    （S1 那套写前顺序同样适用，见 §7.3.1）
+② 核实 W-file 的恢复前状态已由旧基线 / origHead / 本次 stash 记录
+   （含 staged / 未跟踪 / 删除状态）；无法取回的文件禁止进入自动恢复清单
 ③ git checkout svn/base                 磁盘 = 旧基线内容
 ④ 分两步定出要动的东西，见 §9.4.1
-   ④a svn status -v --xml --no-ignore -- <白名单>，按状态分类：
+   ④a 在各 wc(P) 扫描 svn status -v --xml --no-ignore --ignore-externals -- <W-path>
+      先保留完整结果供 revision / 版本控制集合使用；revert 候选只取
+      W-file 内且②确认已有备份的具体文件，剔除目录和扩展名排除文件，再按状态分类：
         (a) M / !            → svn revert   恢复服务器 base 内容
         (b) R（replace）     → svn revert   同上
         (c) A / A+（外部登记）→ svn revert   取消登记
    ④b 「服务器已删除」的集合**不看 svn status 的 ? 条目**，改用两个集合作差：
-        oldBaselineFiles = git ls-tree -r --name-only svn/base -- <白名单>
-        svnVersioned     = ④a 里 SVN 仍在版本控制的路径集合
+        oldBaselineFiles = 旧基线 tree 中属于 W-file 的文件
+        svnVersioned     = ④a 完整结果里 SVN 仍在版本控制的路径集合（不是 revert 候选）
         toDelete = oldBaselineFiles - svnVersioned      ← 全是**具体文件**，没有目录
    ⚠️ 每一类都独立判空：列表为空则跳过，绝不执行空参数的 svn 命令或删除
-⑤ 按 ④ 的结果执行：(a)(b)(c) 用显式文件列表 svn revert；
+⑤ 按 ④ 的结果执行：(a)(b)(c) 用已过滤的显式文件列表 svn revert -- <files>；
    toDelete 逐个**文件**删除，**绝不递归删目录**；全部删完后可以清理变空的目录本身
 ⑤b **revision 归一**：重读 nodeRevs（全部 wc(P) 取并集，§6.6.5）
       单值 {N} → 直接进 ⑥
-      多值     → svn update --accept postpone -- <白名单路径>   ← 见 §9.4.2
-                 再重读；仍多值则**停下报错**，绝不硬造基线
-⑥ git add -A -- <白名单> && git commit --allow-empty
-                                        新基线，rev 取自 ⑤b 归一后的那个 N
-⑥b 基线体检（§6.8）                     此刻 HEAD 在 svn/base、工作区干净，正是
+      多值     → 确认差集保护前置仍成立后，svn update --accept postpone -- <W-path>
+                 再读状态及 nodeRevs；失败、冲突或仍多值均停止，不录基线（§9.4.2）
+⑥ 临时索引纳入集合核对 → 使用通过核对的 TREE 录制新基线（§6.3.1）
+                                        父提交为旧基线，rev 取⑤b归一后的 N；
+                                        按 §7.6 记录录制 / 发布阶段，完成索引对齐后进⑥b
+⑥b 基线体检（§6.8）                     此刻 HEAD 在 svn/base、W-file 的 Git 状态干净，正是
                                         体检的前提。有差异则停在这里报错，
                                         **不继续 ⑦**——恢复流程的全部目的就是修好
                                         基线，不验证等于没修
 ⑦ git checkout <原分支>
+   复核待重放区间及 origHead 未被外部改写（§7.3.2）
    git rebase --empty=drop svn/base      已被误传上去的 commit 会变成空 commit，自动丢弃
+                                        冲突走 §7.3.2；保留 journal / stash，等待用户解决
 ⑧ git stash apply <OID>；成功后 drop 该条目并删掉钉住的 ref
-⑨ 删除 journal
+⑨ 删除 journal；释放锁；恢复 watcher 并发一次 repo-changed
 ```
 
 #### 9.4.1 为什么必须按「版本控制集合的变化」分类，而不是只看 M / !
@@ -2621,12 +2690,13 @@ svn update -- Code          → nodeRevs = {3}        ← 只有它能归一
 向导跑完，红色横幅原地复现，而这正是它要修的东西。
 
 **⑤b 为什么放在 ⑤ 之后而不是之前。** `svn update` 会用三方合并处理本地修改；必须先由
-⑤ 把白名单内的内容 revert 成各节点的 base（此时 SVN 眼里白名单是干净的），update 才
-必然干净。顺序反过来就等于在一堆本地修改上跑 update，退回 §7.1 那三个问题。
+⑤ 把已受保护的 W-file 内容还原成各节点的 base。这个结论**只覆盖 W-file**，不能把
+「整个 W-path 干净」当作⑤的目标，否则会顺带 revert 没有 Git 备份的 `.psd`。
 
 **⑤b 的 target 是 W-path，所以它带着 §8.2.1 同样的残余风险**：白名单目录里那些被扩展名
-排除掉的文件会被一起更新。区别是这里**还没有不可撤销的操作**——⑤b 失败或产生冲突就
-停下报错，用户去 TortoiseSVN 处理完再重来一次，代价只是白跑一趟。
+排除掉的文件会被一起更新。§9.4 的前置确认必须覆盖这些本地修改；⑤b仍可能合并它们、
+产生冲突或部分完成 update，不能宣称可由 Git 还原、或失败「只是白跑一趟」。失败时保留
+journal / stash，停止录制基线，指出受影响的 WC / 文件，交由 TortoiseSVN 处理。
 
 仍多值时**停下报错**，不要自作主张再 update 一次或换个 revision 凑数（§8.7）。
 常见成因是白名单跨了多个 WC 而其中一个 update 失败，错误信息要指明是哪个 WC。
@@ -2635,16 +2705,16 @@ svn update -- Code          → nodeRevs = {3}        ← 只有它能归一
 
 涉及破坏性命令，论证必须显式：
 
-- 只作用在白名单内的文件上，美术资产一个都不碰
-- 此刻这些文件的内容 = `svn/base` 分支的内容，而那个 commit 就在 git 对象库里，
-  随时能取回，因此**可逆**
-- 目标是从 `svn status` **显式枚举**出来的文件列表，不是 `svn revert -R <目录>`
-  ——递归 revert 会波及同目录下白名单外的文件
+- 自动 revert / 删除只作用在 **W-file 且已有恢复快照**的具体文件上。W-path 只是状态
+  扫描范围，`Code/Art.psd` 这类扩展名排除文件即使状态为 `M` 也不进入⑤
+- 恢复前的代码状态由旧基线、`origHead` 及钉住的 stash（含未跟踪文件）记录，②检查后
+  才可操作。`stash -u` 不保护 ignored 文件，所以不能仅凭「执行过 stash」声称可逆
+- 目标由 `svn status` 枚举后按上述条件**再次过滤**，不是 `svn revert -R <目录>`；
+  对 W-file 外文件的 update 确认不能替代 revert 所需的内容保护
 - 空列表短路，不执行
 - **本地补丁不会被误伤**：第 ③ 步已经切到 `svn/base`，Local-Only commit 活在工作分支
-  上、不在磁盘上（§6.7.1），第 ④ 步的 `svn status` 根本看不到它；第 ⑦ 步的 rebase 再
-  把它搬回来。若当初允许补丁以未提交改动的形态存在，这里就会把它当成「被外部改脏的
-  文件」直接 revert 掉，且不可逆
+  上、不在磁盘上（§6.7.1），因此不会因本地补丁本身而 revert 文件。第⑦步仅重放通过
+  §7.3.2 门槛的区间；merge 历史在⓪前就被阻断，不能恢复完基线后再静默丢掉合并结果
 
 ## 10. 混合图
 
@@ -2753,15 +2823,15 @@ React 依赖、可直接单测。
 
 本方案的破坏力集中在三处，每处都有结构性防护。
 
-### 12.1 白名单外的文件绝不进入任何命令参数
+### 12.1 按操作选择白名单粒度
 
 所有构造 git / svn 参数的地方走**同一个过滤函数**，然后专门测那个函数。这不是
 「测一下功能」，是给整个方案的安全边界上一道断言。
 
 ⚠️ 这个函数必须**同时导出 W-path 与 W-file 两个集合**（§6.3.2），并且让调用点在签名
 层面就选定一个，不要让它自己从路径列表里现拼。混用这两个集合已经造成过 §8.2.1 的
-错误论证，而且那种错误**不会在任何测试里表现为失败**——命令照样跑通，只是作用范围
-比论证里说的大一圈。
+错误论证。只检查命令退出码的测试发现不了它，必须用差集文件的真实本地修改验证：
+update 要事前确认，自动 revert 不得触及这些文件（§14.2 第 65、67 项）。
 
 ### 12.2 空参数一律拒绝
 
@@ -2802,11 +2872,11 @@ React 依赖、可直接单测。
 | S5 网络 / 认证失败 | VPN 没连、凭据过期 | 切回 ORIG_BRANCH + stash apply | 原样展示 svn stderr |
 | S5 树冲突 | 服务器删了 / 换掉了某个目录 | 同上 | 明确说明是树冲突，给出受影响路径 |
 | S5 白名单**外**文件冲突 | 美术资产有本地修改（§7.2.1 已确认过） | 同上 | 明确指出是 git 管不到的文件，**引导去 TortoiseSVN**，不假装能修 |
-| S9 rebase 冲突 | 正常的代码冲突 | **不回滚**，停在冲突态 | 进入冲突解决模式 |
+| S9 / 恢复⑦ rebase 冲突 | 线性提交与新基线发生正常的内容冲突 | **不回滚**，保留 journal / stash，停在 Git 的 rebase 冲突态并释放锁 | 进入冲突解决模式，按未合并索引列出文件；用户解决后继续，不做 `merge-tree` 整树等值断言 |
 | S10 stash apply 冲突 | 未提交改动与新基线冲突 | 不回滚，**stash 与钉住的 ref 都保留不删** | 同上 + 给出 stash 的 OID |
 | D5 各类失败 | 见 §8.6 | 见 §8.5 | 见 §8.6 |
 | **D6 update 失败 / 冲突** | 服务器在 D5 之后又有提交，且与白名单文件冲突 | **不可回滚**——D5 已落地 | 明确告知「提交已成功、基线尚未推进」，journal 停在 `post-commit`，提供「重试 D6 起」的入口 |
-| **D0.5 前置：待交付历史含 merge commit** | 用户在 IDE 里 merge 过，且 Local-Only commit 夹在中间需走慢路径（§8.1 #6） | **不做任何修改**——检查在动手之前 | 指出是哪个 merge commit，引导把补丁移到顶端（走快路径）或线性化历史 |
+| **D0.5 前置：慢路径历史含 merge，或 Local-Only 后缀含 merge** | 不满足 §8.1 #6 / #7 的单父提交约束 | **不做任何修改**——检查在动手之前 | 列出 merge commit；由用户保留原分支、确认改动后人工整理为受支持的历史，不自动重写 |
 | **D0.5 cherry-pick 冲突** | Local-Only commit 与待交付 commit 改到相邻/同一处（§8.2.3 T2） | 在临时 worktree 里 `cherry-pick --abort`，然后走 §8.2.4 统一收尾，**零代价**（还没碰 SVN，主工作副本未动） | 指出是哪两个 commit 打架，引导拆分或把补丁移到分支顶端 |
 | **D0.5 非冲突失败**（worktree 建不出、磁盘满、ref 写不进） | 环境问题 | 同上，走 §8.2.4 统一收尾 | 原样展示 git stderr，不猜原因 |
 | **D1 / D2 空清单** | 净变更为空（§8.3） | 走 §8.2.4 统一收尾 | 说明「没有可交付的净变更」，并提示是否全部改动都被标成了 Local-Only |
@@ -2826,13 +2896,16 @@ React 依赖、可直接单测。
 | **拿不到跨进程锁** | 同一工作副本上另一个 mygitclient 进程正在同步（§5.1.1） | 不做任何修改 | 显示持锁进程的 pid 与开始时间；pid 已不存在时提供「接管」入口并写日志 |
 | **D8d 不是快进**（无 Local-Only commit 时） | 前面某步的假设崩了 | 停下不动 | 报错并导出 journal，**不自动 merge** |
 | **D8d rebase 后仍有未标记 commit** | 该交付的东西没进交付树 | 停下不动 | 报错并导出 journal，列出这些 commit |
-| **D8d rebase 冲突**（有 Local-Only commit 时） | 本地补丁与他人在 D6 拉下来的改动冲突 | **不回滚**，停在冲突态 | 进入冲突解决模式；提交已成功，基线已推进，只剩补丁没落回去 |
+| **D8d rebase 冲突**（有 Local-Only commit 时） | 本地补丁与他人在 D6 拉下来的改动冲突 | **不回滚**，保留 journal，停在冲突态并释放锁 | 进入 Git 的冲突解决流程；提交已成功，基线已推进，只剩补丁没落回去，不从 D6 重新执行 |
 | **交付分支不含最新基线** | 从旧基线分出的另一个任务分支已经交付过，当前分支还停在旧基线（§8.1 #0、§8.1.2） | **不做任何修改**——检查在动手之前 | 说明当前分支落后于 `svn/base`，提示先对这个分支跑一次 `sync_in`；明确告知若强行交付会把上一次交付的文件当成删除提上去 |
-| **白名单目录内有 git 管不到的本地修改** | W-path 减 W-file 的差集里有 `M`（§6.3.2、§8.1 #2） | **不做任何修改** | 列出这些文件，说明 D6 的 `svn update` 会走到它们头上、而客户端对它们没有恢复手段，要求用户确认后才继续（形式同 §7.2.1） |
-| **S9 / D8d rebase 吃掉 merge commit 独有的改动** | 内容守恒断言不过（§7.3.2） | **停下不动**；rebase 已完成，恢复靠 journal 里的 `origHead` 做 `git reset --hard` | 指出是哪个 merge commit、差异文件有哪些，引导把那部分改动提成普通 commit 再重来；**不自动 merge、不自动 `--rebase-merges` 重试** |
+| **白名单目录内有 git 管不到的本地修改** | W-path 减 W-file 的差集里有 `M` / `!`（§6.3.2、§8.1 #2、§9.4 前置） | 未确认前**不做任何修改**；已存在冲突则先停止处理 | 列出 D6 / 恢复⑤b 会碰到的文件，说明 Git 没有恢复副本；确认只授权 update，不能据此对这些文件执行 revert |
+| **待重放区间含 merge commit** | 普通 rebase 可能跳过 merge 独有内容（§7.3.2） | `sync_in` / 恢复在 stash 前拒绝；交付在 D0.5 后、D3 / D5 前拒绝并清理本流程临时 ref，主工作副本不动 | 列出 merge OID，说明当前版本不能自动重放；保留原历史，由用户人工整理，不先 rebase 再尝试恢复丢失内容 |
+| **rebase 前复核失败** | 目标或原分支被外部工具改写，或 merge 查询失败 | 停止，保留 journal / stash；D5 之后不回滚 SVN | 如实说明状态变化或命令错误；不能把查询失败当作「没有 merge」，不能自动 reset 或换算法重试 |
+| **恢复的自动还原清单不受 Git 保护** | 文件不在 W-file 内，或旧基线 / origHead / stash 中没有可恢复状态（§9.4 ② / ④a） | 不把它加入 `svn revert` / 删除清单；受保护状态无法确认则停止 | 列出不能自动还原的文件，由用户先处理；目录 target 和扩展名排除项永不递归 revert |
+| **恢复⑤b 前出现新的未确认差集修改，或 update 产生差集冲突** | 编辑器 / 外部 SVN 在流程期间改变了 Git 不管理的文件 | 新修改在 update 前停止并重新确认；已有 update 冲突保留现场，不继续录基线 | 明确指出这些文件没有 Git 恢复副本；冲突转 TortoiseSVN 处理，不套用 Git stash 恢复承诺 |
 | **D5 被拒：父目录不在提交里** | `newParentDirs` 没进 target 列表（§8.2.6） | 服务器侧什么都没发生；按 §8.5 完整回滚 D4 登记 | 原样展示 `E200009`；这是实现缺陷而非用户问题，导出 journal |
 | **⑤b revision 归一失败** | `svn update` 之后 `nodeRevs` 仍多值（§9.4.2） | **停在 ⑤b，不录基线** | 指出是哪个 `wc(P)` 没收敛、当前的多值集合是什么；引导去 TortoiseSVN 完整更新该目录后重来 |
-| **纳入集合核对不通过** | `git ls-files` 与配置声明的集合不符——工作树里的 `.gitignore` 盖掉了再入规则、或规则生成有 bug（§6.3.1） | **不创建基线**；初始化时整个回退、删掉刚建的 `.git` | 列出差异文件，并原样显示 `git check-ignore -v --non-matching` 的输出（它直接指出是哪个文件第几行干的） |
+| **纳入集合核对不通过** | 候选临时索引的完整文件集合与 W-file 不符，可能漏收或多收（§6.3.1） | 不发布候选基线：初始化只回退本次创建的 `.git`；S7 / 恢复⑥保留旧基线、journal / stash；D7a 停在 `post-commit`，不回滚或重复 D5；Phase 1 R2 不动 HEAD / 真实索引 / 基线 | 列出漏收、多收文件及 `git check-ignore --no-index -v --non-matching` 的规则来源；修正后从对应录制阶段重新核对，不另起同步覆盖旧 journal |
 | **白名单子树内有跨仓库的嵌套 external** | `Code/Vendor` 之类指向另一个仓库（§6.5 P4、§6.5.5） | **不做任何修改**，仓库不进入可用状态 | 指出是哪条嵌套 external 属于哪个仓库；说明它会被 git 跟踪却不受 `nodeRevs` 监控，且 D5 会以 E200007 被拒 |
 | 任意步骤客户端崩溃 | — | 靠 §7.6 的写前 journal | 重开后按 `phase` 给出对应的继续 / 放弃入口；`prepare` / `building-deliver` / `deliver-built` / `checked-out` 四个 phase 的放弃入口一律走 §8.2.4 统一收尾 |
 
@@ -2896,7 +2969,7 @@ svn checkout file:///<tmp>/repo  <tmp>/wc2     ← 「同事」，用来制造�
 | 19 | **Local-Only commit 绝不被交付**：同一文件里既有本地补丁又有待交付改动，走完整交付后断言服务器上是干净原文、磁盘上补丁还在、`svn/base..HEAD` 只剩那个补丁（§8.2.3 T1+T3） | 1、4 |
 | 20 | **Local-Only 与待交付 commit 重叠时交付必须中止**：断言 SVN 侧一个字节都没动、`refs/mygitclient/deliver/<opid>` 与临时 worktree 已清理、原分支原样、**主工作副本磁盘内容全程未变**（§8.2.3 T2） | 1、2、4 |
 | 21 | **本地补丁跨 `sync_in` 存活**：wc2 提交别处改动，wc1 走 `sync_in`，断言补丁被 rebase 到新基线上且内容不变（§6.7.1） | 1 |
-| 22 | **恢复流程不误伤本地补丁**：带补丁的仓库触发 §9.4，断言 `svn revert` 的文件列表里没有补丁所在文件，且 ⑦ 之后补丁完好（§9.5） | 2、4 |
+| 22 | **恢复流程不误伤本地补丁**：在补丁文件没有其他外部修改的前提下触发 §9.4，断言 `svn revert` 清单不含该文件、⑦之后补丁完好；另造同文件有外部提交的情形，允许恢复已受保护的基线内容，但断言原分支 / stash 的补丁仍可取回（§9.5） | 2、4 |
 | 23 | **早退闭环**：D1/D2 空清单、D3 用户取消、D3.5 失败三种早退各跑一次（其中至少一次走慢路径），断言 HEAD 在 `origBranch`、`deliverRef` 已删、临时 worktree 已清、journal 已删、锁已释放、watcher 已恢复（§8.2.4） | 2、5 |
 | 24 | **待交付历史含 merge commit 必须前置拒绝**：构造「Local-Only commit 夹在中间 + 历史里有一个 merge commit」的分支，断言 §8.1 #6 拒绝且**没有发生任何 git / svn 写操作**；再断言把补丁移到顶端后（走快路径）同一个仓库能正常交付（§8.1、§8.2.3） | 1、2、4 |
 | 25 | **临时 ref 不与用户分支冲突**：仓库里预先建一个名为 `deliver` 的普通分支，断言整条交付流程照常成功（§8.2.3 为什么不用 `deliver/<opid>` 分支） | 4 |
@@ -2911,7 +2984,7 @@ svn checkout file:///<tmp>/repo  <tmp>/wc2     ← 「同事」，用来制造�
 | 34 | **查证不得被目录路径骗过**：交付一个新增嵌套目录下的文件，断言 changed-paths 里的目录被剔除后仍能正确匹配（§8.6.2） | 1、2 |
 | 35 | **revprop 开仓自检**：断言首次交付后能读回 `mygitclient:opid`；再用一个拒绝 revprop 的仓库断言降级到兜底且界面有提示（§8.6.3） | 1、2 |
 | 36 | **成功路径能走完 D10**：跑一次完整成功交付，断言 D10 不报错、journal 已删、锁已释放、watcher 已恢复；显式覆盖「有 Local-Only commit（D8d 走 rebase）」和「没有（走 ff-only）」两种，两者 `origHead` 都变了（§8.2.4 末尾） | 2、5 |
-| 37 | **Phase 1 重建基线录的是新内容**：外部 TortoiseSVN update 之后跑重建，断言新基线 tree == 当前磁盘内容（**不是**旧基线）、HEAD 与工作目录全程未动、工作分支上的未提交改动完好（§16） | 1、3 |
+| 37 | **Phase 1 重建基线录的是新内容**：外部 TortoiseSVN update 之后跑重建，断言新基线 tree == 通过集合核对的当前磁盘 W-file tree（**不是**旧基线）、HEAD / 真实索引 / 工作目录全程未动、工作分支上的未提交改动完好；核对失败时旧基线指针也不动（§16） | 1、3 |
 | 38 | **服务器删目录 + 目录内有 git-ignored 文件**：走 §9.4，断言被删的受管文件从新基线和磁盘上消失，而 `.gitignore` 掉的 `local.log` **原样还在**；断言实现从未对目录发起递归删除（§9.4.1） | 1、2、4 |
 | 39 | **revprop 被 pre-commit 拒绝**：给 fixture 仓库装一个拒绝未知 revprop 的 `pre-commit` 钩子，断言 D5 失败被归为形态 B、D4 登记完整回滚、**不自动重试**；模拟用户确认后重试成功并记 `supportsRevprop=false`（§8.6.3） | 1、2 |
 | 40 | **stash 按 opid 精确取回**：压完我们的 stash 后由外部再压一个，断言恢复时按 `mygitclient-sync:<opid>` 在 reflog 里命中的是我们那条、内容正确，且**不碰**外部那条（§7.3.1） | 1、5 |
@@ -2934,13 +3007,20 @@ svn checkout file:///<tmp>/repo  <tmp>/wc2     ← 「同事」，用来制造�
 | 57 | **旧基线分支交付必须被前置拒绝**：从同一基线开 A / B 两个分支，A 走完整交付推进 `svn/base`，再切到 B 发起交付。断言 §8.1 #0 拒绝、**SVN 侧一个字节没动**；再断言若绕过该检查，D1 的两点 diff 会把 A 新增的文件列成 `D`（**这一条作为反向证据单独断言，证明这道门禁拦的是真问题**）（§8.1.2） | 1、3、4 |
 | 58 | **`svn info` 不得带 `--ignore-externals`**：断言实现发出的 `svn info` 命令行里**没有**这个参数；再断言带上它时 svn 返回非零并被识别为实现缺陷而非仓库问题（§4.4） | 1、3 |
 | 59 | **`.svn` 在任何深度都不进 git**：白名单覆盖一个 external 根，分别用 `extensions: [".cs", ".db"]` 和 `extensions: ["*"]` 生成规则，断言 `git ls-files` 里**没有**任何 `.svn/` 下的路径（含 `wc.db` 与 `pristine/**/*.svn-base`），且 `git check-ignore -v` 指向兜底那一行（§6.3） | 4、9 |
-| 60 | **工作树里的 `.gitignore` 盖不掉再入规则**：在白名单目录里预置一个 `.gitignore`（内容 `*.cs`），断言初始化的纳入集合核对**阻断**、不创建基线，且错误信息里含 `git check-ignore -v --non-matching` 指认的那个文件与行号（§6.3.1） | 1、3、9 |
+| 60 | **初始化检测工作树 `.gitignore` 的覆盖**：在白名单目录里预置一个 `.gitignore`（内容 `*.cs`），断言初始化的纳入集合核对**阻断**、不创建基线，且错误信息里含 `git check-ignore --no-index -v --non-matching` 指认的那个文件与行号（§6.3.1） | 1、3、9 |
 | 61 | **白名单子树内的跨仓库嵌套 external 必须被拒**：fixture 造「`Code/` 是 repo1 的 external，`Code/Vendor` 是 repo2 的 external」，断言 P4 在**枚举到嵌套 WC 之后**拒绝、不发生任何 git / svn 写操作；再单独断言「只查白名单根」的旧写法会**放行**（反向证据，证明 §6.5.5 的枚举不是过度设计） | 3、4 |
 | 62 | **交付新增嵌套目录下的文件**：交付 `Code/Deep/Nested/New.cs`（两层父目录都是新的），断言 D5 成功、`svn log -v` 里三条 `A` 都在；再断言同目录下另一个**已 `svn add` 但不属于本次交付**的文件**没有**被顺带提交（`--depth=empty` 的作用）（§8.2.6） | 1、3、4 |
-| 63 | **rebase 内容守恒断言**：① 构造 evil merge（合并后在 merge commit 里 `--amend` 加一个文件），走 `sync_in`，断言 S9b **拦下**且分支可按 `origHead` 还原；② 普通线性分支 + 真实三方合并，断言**不误报**；③ 已交付 commit 被 `--empty=drop` 丢弃，断言**不误报**。三个方向缺一不可（§7.3.2） | 1、2、9 |
+| 63 | **同步在修改前拒绝重放 merge**：构造含独有文件的 merge commit，使其位于 `svn/base..HEAD`；调用 `sync_in`，断言在 S0 / stash 之前被拒绝，HEAD、索引、磁盘文件与 SVN 节点 revision 均未变化，独有文件仍在。另测 merge 查询非零退出必须停止，不能当作空结果（§7.3.2） | 1、2、4、9 |
 | 64 | **恢复流程能修好 mixed-revision**：**在 wc1 自己身上**外部只提交一个文件造出 `nodeRevs` 多值，走 §9.4，断言 ⑤b 之后 `nodeRevs` 收敛到单值、新基线的 rev 取的就是它，且**流程结束后立刻重新检测不再报失同步**（§9.4.2） | 1、2、3 |
 | 65 | **D6 会碰到 git 管不到的文件**：白名单目录里放一个被扩展名排除的文件（`.psd`），wc1 改它不提交，断言 §8.1 #2 把它列进确认清单；再构造「D5 之后 wc2 提交了该文件的冲突改动」，断言 D6 产生 `C` + `.mine`/`.rN` 时按 §13 明确报成「git 管不到的文件」而不是普通冲突（§8.2.1、§6.3.2） | 1、2、4 |
 | 66 | **断网查证用的是 Repository Root**：fixture 造两条同仓库 external（`code` / `script`），只交付 `script` 下的文件并制造「提交成功但客户端认为失败」，断言查证**命中** opid、判定成功、不回滚；再断言若用 `svnUrl`（`code` 的 URL）查则**查不到**——两个方向都要测（§8.6.2） | 1、2、9 |
+| 67 | **恢复不 revert 扩展名排除的本地文件**：在 wc1 自己局部提交造 mixed-revision，同时修改 `Code/Art.psd`（W-path 内、W-file 外）；确认⑤b 的 update 后恢复，断言 revert targets 只有受保护的代码文件、`.psd` 字节仍为原本地修改、`nodeRevs` 已归一且按 W-file 体检通过。另测未确认 / 差集已有冲突时修改前拒绝，以及无法证明恢复状态的文件不进入自动还原清单（§9.4） | 1、2、4、9 |
+| 68 | **恢复也在 stash 前拒绝重放 merge**：在 wc1 自己局部提交造 mixed-revision，Git 原分支含 merge 独有文件；调用恢复入口，断言在⓪ / ①之前被拒绝，原分支、索引、文件、SVN 节点 revision 均未变化（§9.4 前置、§7.3.2） | 1、2、4、9 |
+| 69 | **线性 rebase 的普通冲突可解决并继续**：分别在 S9、含 Local-Only 的 D8d、恢复⑦构造同一行的真实内容冲突；断言进入 Git 的 rebase 状态、索引存在未合并条目、锁释放且 journal / stash 保留；用户解决后继续成功，不拿含冲突标记的 `merge-tree` TREE 校验解决结果（§7.3.2） | 1、2、5、9 |
+| 70 | **后续新增 `.gitignore` 不能让基线漏文件**：初始化成功后由 wc2 提交 `Code/.gitignore`（`*.cs`）与 `Code/New.cs`，在 wc1 实际拉取后分别走 S7、D7a、恢复⑥与 Phase 1 R2；每个入口都必须检出遗漏、保持旧基线。D7a 保持已提交状态且不重复 D5；修正规则后从原录制阶段重新核对并纳入 New.cs。另测实际索引多收文件同样阻断，不能仅核对期望集合的子集（§6.3.1） | 1、2、3、9 |
+| 71 | **线性往返修改不被误报为内容丢失**：基线 A 为 `0`，本地两个普通 commit 依次 `0→1→0`，新基线 A 为 `1`；断言前置允许，rebase 成功后的 A 为 `0`，不要求等于端点 merge 的 `1`。另测已交付的相同补丁正常丢弃，不误报失败（§7.3.2） | 1、3、9 |
+| 72 | **merge 门槛只覆盖待重放区间**：① 无 Local-Only 时交付树包含 merge，仍可按快路径交付并快进；② merge 已在 deliverRef 内、其后只有连续单父 Local-Only 提交时，D8d 可成功重放且独有文件保留；③ Local-Only 后缀自身含 merge，或 D0.5 后待重放区间仍有 merge，必须在 D3 / D5 前拒绝。不能把「历史中存在 merge」一律当错误（§8.1、§7.3.2） | 1、2、4、9 |
+| 73 | **发布的基线必须使用核对过的同一 TREE**：在 D6 后引入服务器新文件，断言 D7a 的 TREE 与 D8 新基线 tree 相同、对齐索引不改磁盘，分别覆盖快进与 Local-Only rebase。注入旧基线 OID 改变时 CAS 拒绝覆盖；分别在 D8b 前后、D8d 切分支前后与冲突中中断重开，断言只续对应阶段、不重做 SVN commit、不用 D6 / D8c 覆盖冲突；S7 / 恢复⑥同样核对后不重新录另一棵树（§6.3.1、§7.6、§8.2.2） | 1、2、3、5、9 |
 
 ### 14.3 前端
 
@@ -2961,8 +3041,8 @@ exclude 生成与图合成都在 Rust 侧，由 cargo test 覆盖。
 6. **不能有名为 `svn` 的 git 分支**（§6.4）
 7. **本仓库没有 PR 门禁 CI**，所有验证靠本地实际执行
 8. **交付后工作副本是 mixed-revision**：D6 只更新白名单路径（§8.2.1），美术资产
-   停在旧 revision，要等下一次 `sync_in` 才跟上。这是刻意的取舍——换来的是「提交
-   已不可撤销之后不再引入无法收拾的冲突」
+   在这些路径之外的会停在旧 revision，要等下一次 `sync_in` 才跟上。D6 缩小了更新范围，
+   但白名单目录内仍可能有被扩展名排除的资产，其本地冲突风险见第 25 条
 9. **白名单外文件的冲突客户端修不了**：git 不管这些文件，`svn update` 在它们上面
    产生的冲突只能回 TortoiseSVN 处理。客户端负责如实报告，不负责修复
 10. **本地补丁与待交付改动挨得太近时交付会被拦下**（§8.2.3 T2 实测）。这是刻意的：
@@ -2971,19 +3051,16 @@ exclude 生成与图合成都在 Rust 侧，由 cargo test 覆盖。
 11. **用 TortoiseSVN 直接提交会把本地补丁带上去**。`ignore-on-commit` changelist 原本
     还能挡一下，本设计挡不住——补丁就在磁盘上，外部工具看到的就是改过的文件。与第 2 条
     「外部工具无法阻止」同源；交付走客户端是这套方案的前提
-12. **`sync_in` 的 rebase 会压平 merge commit**。S9 和 D8d 用的都是
-    `git rebase --empty=drop svn/base`，不带 `--rebase-merges`，所以用户在 IDE 里
-    合出来的 merge 点会在下一次同步时被线性化，**静默改写历史形状**。之所以接受：
-    基线侧是 SVN 的线性历史，工作分支迟早要被压成线性才能交付；真要保留 merge 形状，
-    就得先解决 §8.1 #6 拦下的那类问题。
-    ⚠️ **初版这条还写了「也不会丢改动」，那半句是错的**——evil merge（改动只存在于
-    merge commit 自身、且线性重放时不冲突）会被无冲突、无告警地吃掉，2026-09-13 实测
-    见 §7.3.2。现在由 S9b / D8d 的**内容守恒断言**兜底：能检出并停下，但**不能自动
-    保住**那部分改动，用户仍要自己把它提成普通 commit。所以「形状会被改写」是接受的
-    取舍，「内容可能丢」是**被拦住的失败**，两者不是一回事
+12. **本期不自动重放区间内的 merge commit**（§7.3.2）。普通 rebase 可能静默丢掉 merge
+    独有的改动，端点 `merge-tree` 也不能作为逐提交 rebase 的正确结果断言。因此
+    `sync_in` / 恢复在 stash 前拒绝此类分支；有 Local-Only 的交付在 D3 / D5 前拒绝
+    需要重放 merge 的历史。用户须保留原分支并人工整理后再继续；客户端不自动改写。
+    已包含在目标基线或交付树中的 merge 不受这条门槛影响，无 Local-Only 的快路径
+    仍可直接交付 merge 的完整结果，不声称所有工作分支都必须压平
 13. **待交付历史含 merge commit 且需走慢路径时会被拒绝**（§8.1 #6）。`cherry-pick`
     对 merge 没有安全的自动语义（§8.2.3 T4 / T5 实测）。缓解手段同第 10 条：把
-    Local-Only commit 移到分支顶端转成快路径，快路径不受 merge 影响
+    Local-Only commit 整理成分支顶端的连续单父后缀，且 merge 已在交付树内时可走快路径。
+    整理由用户在保留原分支后进行，不能让客户端自动线性化来绕过门槛
 14. **`rootRev` 只是提示，不是判据**（§6.6.2）。交付后根节点长期停在旧 revision 是
     正常的（§8.2.1 的刻意取舍，2026-09-13 实测确认），所以「根 revision 与基线不等」
     既不能证明有问题、也不能证明没问题。真正的判据只有白名单 `nodeRevs`
@@ -2997,15 +3074,16 @@ exclude 生成与图合成都在 Rust 侧，由 cargo test 覆盖。
 17. **`svn revert` 不在失同步检测的能力范围内**（§9.3 实测）。它不推进任何 revision，
     只能由 git 工作区状态间接看出来。客户端不会因此报「基线失同步」，这是正确的——
     基线没错，错的是磁盘
-18. **Phase 1 的「重建基线」不会推进工作分支**。用户下次得自己 rebase 到新基线上。
+18. **Phase 1 的「重建基线」不会推进工作分支**。用户下次需自己同步工作分支；准备
+    rebase 前同样要检查 §7.3.2 的待重放区间，含 merge 时先保留原历史并人工整理。
     Phase 2 的 §9.4 才做完整编排
 19. **baseline 上的 `git-svn-id` trailer 不是 `git svn` 生成的**（§6.4.1）。用这个格式
     是为了白送 UUID 记账和工具互操作，但 `.git/svn/` 里没有对应的 `rev_map`。用户若
     自己在本仓库跑 `git svn init`，`git svn` 会按这些 trailer 解释历史，产生令人困惑
     的行为。不损坏数据，但客户端不支持这种混用，也不检测它
 20. **基线体检只证明「磁盘 == 服务器」，不证明「git 跟踪的文件集合是对的」**
-    （§6.8.3）。exclude 规则写错那一类由 §14.2 第 6 项覆盖。两条检查不可互相冒充，
-    也不要因为体检通过就认为 §6.3 的规则一定正确
+    （§6.8.3），且只比较 W-file 的文件内容。文件集合另由 §6.3.1 在**每次录制**的
+    临时索引上核对，初始化检查不能代替后续检查；两条验证不可互相冒充
 21. **体检需要联网**。离线时基线只能停在「未经体检」状态（§6.8.6）。这是刻意的：
     把「没能验证」当成「验证通过」等于这条检查根本不存在
 22. **白名单不能跨仓库**（§6.5 P4）。`svn commit` 对跨仓库的 target 列表直接拒绝
@@ -3024,8 +3102,9 @@ exclude 生成与图合成都在 Rust 侧，由 cargo test 覆盖。
     但这意味着 §12.3 那三层「防 `.git` 被误提交」的防护要挂在**项目根**那个工作副本上，
     而失同步检测挂在**白名单所属**的工作副本上——两者不是同一个 WC，实现时不要合并
 25. **白名单目录里那些 git 管不到的文件，客户端保护不了**（§6.3.2 的 W-path 减 W-file
-    差集）。`svn update` 的 target 只能是路径，所以 D6 与 §9.4 ⑤b 都会递归走到它们
-    头上。已做的是把它们在**动手之前**列进确认清单（§8.1 #2）；消不掉的是 D3.5 到 D6
+    差集）。D6 与 §9.4 ⑤b 为了归一目录节点 revision 使用 W-path update，会递归走到
+    它们头上；这不允许恢复⑤也用目录 target revert。已做的是把差集本地修改在
+    **动手之前**列进确认清单（§8.1 #2、§9.4 前置）；消不掉的是 D3.5 到 D6
     之间那个窄竞态——同事恰好在此期间提交了其中某个文件的冲突改动时，`.mine` / `.rN`
     会出现在 D5 之后，客户端只能如实报告，引导去 TortoiseSVN。缩小这个差集的办法在
     用户手里：把 `extensions` 配得更准，或者不要把非代码文件放进白名单目录
@@ -3034,10 +3113,11 @@ exclude 生成与图合成都在 Rust 侧，由 cargo test 覆盖。
     主动发现；表现是 git 开始跟踪一批不受 `nodeRevs` 监控的文件，直到某次交付撞上
     E200007 才暴露。§16.0 建议的那条只读核对命令要在「团队改过 externals 之后」
     重跑一次，这件事目前靠人记得，没有自动化
-27. **内容守恒断言依赖 `git merge-tree --write-tree`**（§7.3.2）。这是较新的 git 才有的
-    形式（本机 2.51.2 实测可用；具体从哪个版本引入**未核实，不要写死版本号**）。实现
-    必须**显式探测该子命令是否可用**，探测失败时按 §6.8.6 同样的原则处理：**标记
-    「本次 rebase 未经守恒校验」并如实显示，不得当成通过**
+27. **线性 rebase 按逐提交语义执行，不保证等于端点 merge 的整树结果**（§7.3.2）。
+    已应用的补丁可以正常丢弃，普通冲突由用户解决后继续；不能把与 `merge-tree` 的
+    差异都当作内容丢失，也不能把含冲突标记的 TREE 当成用户应得到的结果。本设计
+    不再依赖 `merge-tree` 的能力探测或「未经校验仍继续」的降级路径；merge 门槛查询
+    失败必须停止
 
 ## 16. 分期
 
@@ -3087,8 +3167,8 @@ foreach ($d in 'Assets','Code','Script','Documents') {   # 换成实际的顶层
 |---|---|---|
 | **Phase 0** | `trait Vcs` + `GitBackend`（现有代码搬家，**行为零变化**） | 现有全部测试绿 + 手工 E2E 与改动前无差异 |
 | **Phase 1** | 仓库识别、配置、exclude 生成、初始化向导、`SvnClient`（info / status / log 的 XML 解析）、状态判定与失同步检测（**只报警**）、**「重建基线」最小手段**、**基线体检（§6.8）**、**纳入集合核对（§6.3.1）**、**P4 的嵌套 WC 枚举（§6.5.5）**、混合图只读 | 能打开 SVN 仓库，本地 git 的暂存/分支/stash 可用，看得到 SVN 历史。**还不能 update / deliver**；基线会因外部 TortoiseSVN 操作而失同步，此期只报警 + 提供「重建基线」 |
-| **Phase 2** | `sync_in` 完整流程 + 全部失败路径 + 中断持久化 + 冲突解决 UI + **§9.4 基线恢复向导**（复用同一套 stash / checkout / rebase 编排，含 ⑤b 的 revision 归一，§9.4.2）+ **S8b/S9b 的内容守恒断言（§7.3.2）** | 能更新 |
-| **Phase 3** | `sync_out` + 确认关口 + 精确回滚 + 传输中断查证（按 `Repository Root` 查，§8.6.2）+ **本地补丁的摘除与回落**（§8.2.3）+ **§8.1 #0 的基线祖先前置**（§8.1.2）+ **`newParentDirs` 进 target**（§8.2.6） | 能交付，闭环 |
+| **Phase 2** | `sync_in` 完整流程 + 全部失败路径 + 中断持久化 + 冲突解决 UI + **§9.4 基线恢复向导**（仅还原受保护 W-file、⑤b 前确认差集修改并归一 revision）+ **stash 前的 merge 门槛（§7.3.2）** + **S7 / 恢复⑥候选 TREE 核对（§6.3.1）** | 能更新 |
+| **Phase 3** | `sync_out` + 确认关口 + 精确回滚 + 传输中断查证（按 `Repository Root` 查，§8.6.2）+ **本地补丁的摘除与回落及提前检查重放区间**（§8.2.3、§7.3.2）+ **基线祖先前置**（§8.1.2）+ **`newParentDirs` 进 target**（§8.2.6）+ **D7a 核对同一 TREE、D8 按 journal 发布与恢复** | 能交付，闭环 |
 | **Phase 4** | 白名单外改动视图与 revert、`.git` 误提交三层防护、svn 节点 diff | 补齐日常缺口 |
 
 **Phase 0 单独拆出是有意的。** 它是纯重构、零行为变化，可独立验证，风险最低；
@@ -3106,15 +3186,19 @@ foreach ($d in 'Assets','Code','Script','Documents') {   # 换成实际的顶层
 ```text
 R1  校验：白名单内 svn status --no-ignore 干净、nodeRevs 单值 {N}
       不干净就引导去 TortoiseSVN 处理，不自动 revert（同 §6.5 P1）
+      记录不可变 OLD_BASE_OID；全程持锁，不允许覆盖尚未结束的同步 journal
 R2  用一个**临时索引**把磁盘内容录成 tree，全程不碰真实 index、不碰 HEAD：
-      GIT_INDEX_FILE=<tmp> git add -A -- <白名单>
+      GIT_INDEX_FILE=<tmp> git read-tree --empty
+      GIT_INDEX_FILE=<tmp> git add -A -- <W-path>
+      核对完整 git ls-files 集合 == 磁盘 W-file（§6.3.1），漏收 / 多收均停止
       GIT_INDEX_FILE=<tmp> git write-tree                → TREE
-R3  git commit-tree TREE -p svn/base -m "svn: rN … git-svn-id: <svnUrl>@N <uuid>"  → NEWBASE
+R3  git commit-tree TREE -p OLD_BASE_OID
+      -m "svn: rN … git-svn-id: <Repository Root>@N <uuid>" → NEWBASE
 R3b 基线体检（§6.8）                                    ← 此刻 TREE 就是磁盘内容，
                                                           前提成立；**有差异就中止**，
                                                           连指针都还没动，代价为零
-R4  git update-ref refs/heads/svn/base NEWBASE          ← 只动指针
-R5  删掉临时索引文件
+R4  git update-ref refs/heads/svn/base NEWBASE OLD_BASE_OID ← 只动指针；旧 OID 变化则拒绝
+R5  无论成功或失败都清理本次创建的临时索引文件，释放锁并恢复 watcher
 ```
 
 **为什么不能照抄 §9.4 的 `git checkout svn/base`。** §9.4 之所以先 checkout 旧基线是
@@ -3126,8 +3210,8 @@ git 侧的状态清空。极简版没有 revert（前提就是工作副本干净
 顺带两个 checkout 自带的麻烦也一并没了：工作分支上若有未提交改动，`git checkout` 会
 直接失败；而 R1–R5 全程不动 HEAD，也就不存在「流程结束忘了切回原分支」。
 
-代价是工作分支不会自动跟进新基线，用户下次自己 rebase——Phase 1 本来就是手工期，这个
-代价可以接受。
+代价是工作分支不会自动跟进新基线。用户下次自己同步分支；若选择 rebase，应先检查
+§7.3.2 的待重放区间，含 merge 时保留原分支并人工整理，不能给出无条件裸 rebase 的引导。
 
 **Phase 1 结束时已是一个有意义的交付点**——本地 git 的暂存区、分支、stash 全部可用，
 只是 update / deliver 还得回 TortoiseSVN 手工做。
@@ -3164,6 +3248,40 @@ Phase 1 到 Phase 3 之间用户手工走 TortoiseSVN 交付时，本地补丁�
 误导性的错误上。
 
 ## 18. 修订记录
+
+### 2026-09-13（十）· 第五轮 review：修复恢复范围与 rebase 校验，持续核对录制集合
+
+本轮修订只修改设计文档。下表记录当前采用的规则；后面的历史记录保留当时的决策，
+其中第四轮引入的 S8b / S9b 和 D8d `merge-tree` 守恒断言已被本轮取代。
+
+| 问题 | 本轮决策 | 修改位置 |
+|---|---|---|
+| 恢复把 W-path 下所有 `M` 都交给 `svn revert`，覆盖未受 Git 保护的 `.psd` | W-path 只用于扫描与 revision 归一；自动还原限于有恢复状态的 W-file 显式文件清单。⑤b update 前确认差集修改，确认不授权 revert；体检只看 W-file 内容 | §6.3.2、§6.8、§7.2、§9.4–9.5、§13；测试 67 |
+| 恢复⑦漏掉 merge 独有内容的保护 | 与 `sync_in` 统一，在写 journal / stash 前检查待重放区间，含 merge 则拒绝；rebase 前按实际目标 OID 再复核 | §7.3.2、§9.4；测试 63、68、72 |
+| `merge-tree` 普通冲突退出 1 阻断正常 rebase；冲突标记 TREE 也不能校验用户解决的结果 | 取消整树等值断言。受支持的线性历史直接进入 Git rebase，真实冲突保留 journal / stash 和未合并索引，由用户解决后继续 | §7.3、§7.3.2、§8.2.2、§13、§15 第 12 / 27 条；测试 69 |
+| 即便无冲突，线性 rebase 也可能与端点 merge 不同 | 不把两个算法的不同结果报作内容丢失；用 `0→1→0` 对新基线 `1` 的反例界定逐提交语义 | §7.3.2；测试 71 |
+| 只在初始化检查 `.gitignore`，后续录制仍可能漏收代码 | 所有录制入口在临时索引核对磁盘 W-file 与完整实际集合，直接从通过检查的同一 TREE 创建 commit；旧基线 OID 用 CAS 发布。失败保留对应阶段，D5 后绝不重复提交 | §6.3.1、S7、D7a / D8、恢复⑥、Phase 1 R2；测试 70、73 |
+
+**为什么采用前置拒绝 merge。** 这一版不尝试自动推断 merge 独有改动应如何拆成线性
+提交，也不把「rebase 退出 0」等同于保护了 merge 内容。只检查即将重放的区间，目标
+中已有的 merge 和无需 rebase 的快路径仍可使用。门槛查询失败即停止，不保留旧版
+「工具不可用就标记未经校验并继续」的分支。需要整理历史时，先保留原分支，由用户处理。
+
+**本轮实际验证。** 在临时 Git / SVN fixture 中通过 10 项命令级检查，结束后全部清理：
+
+- Git 侧 5 项：更新与恢复的 merge 门槛各自修改前拒绝；线性往返修改 rebase 成功且
+  结果为 `0`；普通冲突产生真实 rebase 状态和未合并索引；交付树已含 merge 时，单父
+  Local-Only 后缀可重放且 merge 独有文件保留。
+- SVN / Git 侧 3 项：在 **wc1 自己局部提交**制造 mixed-revision，按过滤后的文件清单
+  恢复并归一 revision，保留排除的 `.psd` 本地字节；后续拉到 `.gitignore` 与新 `.cs`
+  时核对阻断、不发布漏收基线；修正规则后重新核对可继续发布。
+- D8 发布 2 项：分别覆盖普通分支快进与 Local-Only rebase。`commit-tree TREE`、CAS
+  更新基线、`read-tree TREE`（不带 `-u`）及分支恢复均成功，D6 模拟拉下来的文件保留，
+  发布时磁盘字节不变且索引与基线 TREE 一致。
+
+普通冲突的 rebase 退出 1 是预期结果，验证的是冲突现场，没有自动 abort / reset 重试。
+这些检查证明了修法所依赖的 CLI 行为；§14.2 新增的是后续实现必须落地的回归用例，
+包含 journal 中断与故障注入，**不代表应用层流程或完整测试套件已经实现并通过**。
 
 ### 2026-09-13（九）· 第四轮对抗性 review：11 条全部复核成立并修入
 
