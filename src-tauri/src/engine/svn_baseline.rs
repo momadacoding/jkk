@@ -1,0 +1,335 @@
+//! 基线录制：临时索引、`git-svn-id` trailer、`commit-tree` + `update-ref`。
+//!
+//! **这是本设计里最不能写错的一段。** 基线是「上次与 SVN 对齐时的状态」这条事实
+//! 的唯一载体；它一旦录错，之后每一次失同步判定、每一次交付清单都建立在它之上，
+//! 而它本身看起来完全正常。
+//!
+//! 四条硬要求：
+//!
+//! 1. **全程不碰真实 index、不碰 HEAD、不碰工作目录文件**（spec §6.3.1）
+//! 2. **临时索引文件必须清理干净**，包括中途 `?` 早退的路径 → 靠 [`Drop`]
+//! 3. **trailer 三字段缺一不可**，解析失败即「这不是 baseline」（spec §6.4.1）
+//! 4. **`update-ref` 必须带旧 OID 作比较条件**
+
+use crate::engine::git_cli::{run_git, run_git_code, run_git_env};
+use crate::engine::svn_config::BASELINE_BRANCH;
+use crate::error::{GitError, Result};
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// `git update-ref` 用来表示「这个 ref 现在必须不存在」的哨兵旧值。
+///
+/// 2026-09-14 实测：ref 不存在时带这个值退出 0；ref 已存在时退出 128
+/// （`cannot lock ref …: reference already exists`）且 ref 不动。
+const ZERO_OID: &str = "0000000000000000000000000000000000000000";
+
+/// 同一进程内的序号，保证同一纳秒里建的两个临时索引也不同名。
+static SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 一次录制用的候选索引。
+///
+/// # 为什么必须是**同一份**索引贯穿核对与录制
+///
+/// spec §6.3.1：「核对与录制必须使用同一份候选索引」「不得核对一次后又重新
+/// `git add` 另录一棵树」。两次 `git add` 之间磁盘可能变了，于是核对通过的是 A、
+/// 录进基线的是 B——而两者都不报错。
+///
+/// # 为什么是 `GIT_INDEX_FILE`
+///
+/// `git add` 没有 `--index-output`（只有 `git read-tree` 有），环境变量是把
+/// `git add` 引到临时索引上的唯一手段。走 [`run_git_env`] 而不是自己起进程，
+/// 见 `AGENTS.md` §7.3。
+///
+/// # 清理
+///
+/// 靠 `Drop`，不靠调用点记得删：录制序列有五六步，任何一步 `?` 早退都不能在
+/// 用户的 `.git/` 里留下一个孤儿索引文件。
+#[derive(Debug)]
+pub struct TempIndex {
+    path: PathBuf,
+}
+
+impl TempIndex {
+    /// 从**空索引**起步。初始化向导与 Phase 1 的 R2 用它（spec §6.3.1）。
+    ///
+    /// 不预先创建文件——git 见到 `GIT_INDEX_FILE` 指向一个不存在的路径时会当成
+    /// 空索引，第一次写入时再建出来。
+    pub fn empty(repo_root: &str) -> Result<Self> {
+        let path = unique_index_path(repo_root)?;
+        // 理论上不会撞名（pid + 纳秒 + 进程内序号），但真撞上时留着上一份内容
+        // 会让这次录制从别人的索引起步，比多删一个文件危险得多。
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+        Ok(Self { path })
+    }
+
+    /// 从**当前 HEAD 树**起步。其余录制入口用它（spec §6.3.1）。
+    ///
+    /// HEAD 未出生时报错而不是退化成空索引：2026-09-14 实测
+    /// `git read-tree HEAD` 在那种情况下退出 128（`fatal: Not a valid object
+    /// name HEAD`）。静默当成空会让「从 HEAD 起步」的入口悄悄变成「从空起步」，
+    /// 两者录出来的 tree 未必相同——差别恰恰是「HEAD 里有、磁盘上没有」的文件。
+    pub fn from_head(repo_root: &str) -> Result<Self> {
+        let idx = Self::empty(repo_root)?;
+        idx.git(repo_root, &["read-tree", "HEAD"]).map_err(|e| {
+            GitError::new(
+                "svn_baseline_no_head",
+                format!(
+                    "读不到 HEAD，没法从 HEAD 树起步建候选索引。\
+                     首个基线与重建基线（R2）应当用 TempIndex::empty。原始错误：{}",
+                    e.message
+                ),
+            )
+        })?;
+        Ok(idx)
+    }
+
+    /// 在候选索引上 `git add -A -- <W-path>`。
+    ///
+    /// # 空列表是 no-op，绝不能退化成「全部」
+    ///
+    /// `git add -A` 不带 pathspec 会收整个仓库——包括任意深度的 `.svn/`，
+    /// 而那玩意被 git 跟踪之后一次 checkout 就能毁掉一个正在用的工作副本
+    /// （spec §6.3）。`AGENTS.md` §6.2 记过本仓库已经因空 pathspec 误伤过一次。
+    pub fn add_all(&self, repo_root: &str, w_paths: &[String]) -> Result<()> {
+        let paths: Vec<String> = w_paths
+            .iter()
+            .map(|w| w.replace('\\', "/"))
+            .filter(|w| !w.is_empty())
+            .collect();
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut args: Vec<&str> = vec!["add", "-A", "--"];
+        args.extend(paths.iter().map(String::as_str));
+        self.git(repo_root, &args)?;
+        Ok(())
+    }
+
+    /// 候选索引的**完整** `git ls-files -z` 结果。
+    ///
+    /// 故意不带 pathspec、也不按扩展名过滤（spec §6.3.1 原文：「不能再按扩展名
+    /// 过滤，以免藏掉多收的文件」）。核对要的正是「这个索引里到底有什么」。
+    ///
+    /// `-z` 不能省：不带它 git 会按 `core.quotePath` 把非 ASCII 路径转义成
+    /// `"Code/\350\247\222\350\211\262.cs"`，而期望集合是遍历磁盘得到的原始字符串，
+    /// 两者永远对不上——每个装了中文文件名的工程都会在初始化时被误报阻断。
+    pub fn ls_files(&self, repo_root: &str) -> Result<BTreeSet<String>> {
+        let out = self.git(repo_root, &["ls-files", "-z"])?;
+        Ok(out
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// 把候选索引写成一棵 tree，返回它的 OID。
+    pub fn write_tree(&self, repo_root: &str) -> Result<String> {
+        Ok(self.git(repo_root, &["write-tree"])?.trim().to_string())
+    }
+
+    /// 临时索引文件的位置。测试用来确认它被清掉了。
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn git(&self, repo_root: &str, args: &[&str]) -> Result<String> {
+        let p = self.path.to_string_lossy().to_string();
+        run_git_env(repo_root, args, &[("GIT_INDEX_FILE", &p)])
+    }
+}
+
+impl Drop for TempIndex {
+    fn drop(&mut self) {
+        // 删不掉也不能 panic——Drop 里 panic 会在展开途中直接 abort。
+        // 留一个孤儿索引文件是可容忍的，把应用干掉不是。
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn unique_index_path(repo_root: &str) -> Result<PathBuf> {
+    let dir = git_dir(repo_root)?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    Ok(dir.join(format!(
+        "mygitclient-{}-{}-{}.index",
+        std::process::id(),
+        nanos,
+        seq
+    )))
+}
+
+/// 临时索引放进 `.git/`：与真实索引同一个文件系统（`write_tree` 之后的对象要落在
+/// 同一个对象库），且随仓库一起被清理，不会留在用户的工作目录里被 TortoiseSVN
+/// 看见。位置问 git 要而不是拼 `repo_root/.git`——worktree 里 `.git` 是个文件。
+fn git_dir(repo_root: &str) -> Result<PathBuf> {
+    let out = run_git(repo_root, &["rev-parse", "--git-dir"])?;
+    let p = PathBuf::from(out.trim());
+    Ok(if p.is_absolute() {
+        p
+    } else {
+        Path::new(repo_root).join(p)
+    })
+}
+
+/// 基线 commit 里那一行权威记账（spec §6.4.1）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Trailer {
+    /// **Repository Root**，不是某个工作副本的 URL。
+    ///
+    /// 白名单可能分布在同一个仓库的多个嵌套工作副本里，各自 URL 不同，没有哪一个
+    /// 能代表整体；`Repository Root` + `uuid` 对它们是共有的（spec §6.4.1）。
+    pub url: String,
+    /// 记账单位 N，取自 `nodeRevs`（不是 `svn info .` 的 revision）。
+    pub rev: u64,
+    /// 仓库 UUID。URL 会因代理 / 镜像 / `http` 与 `https` 写法不同而不可靠，
+    /// UUID 是仓库身份的唯一可靠依据（spec §6.2.1）。
+    pub uuid: String,
+}
+
+/// 格式化成 `git svn` 的原生 trailer 行。
+///
+/// 沿用 `git svn` 的格式而不是自定义 `Svn-Rev:`：UUID 白送、
+/// `git log --grep=^git-svn-id` 这个标准用法照常可用、将来真要迁移时有现成锚点
+/// （spec §6.4.1）。
+pub fn format_trailer(t: &Trailer) -> String {
+    format!("git-svn-id: {}@{} {}", t.url, t.rev, t.uuid)
+}
+
+/// 从 commit message 里读回 trailer；读不出来就是 `None`。
+///
+/// 对应 spec §6.4.1 的正则 `^git-svn-id: (\S+)@(\d+) ([0-9a-fA-F-]+)$`。
+/// **三个字段缺一不可，解析失败即视为该 commit 不是 baseline——不猜、不部分接受。**
+/// 手写而不是引 `regex`：只为这一条式子加一个 crate 不划算（`AGENTS.md` §1.2）。
+///
+/// # 两处容易写错的地方
+///
+/// - **取最后一个 `@`**。`svn+ssh://user@host/repo` 是完全正常的 URL，
+///   按第一个 `@` 切会把 rev 读成 `host/repo@12346`，整条基线被判成「不是 baseline」。
+/// - **行尾可能有 `\r`**。message 经不同工具往返时会带上 CR，正则的 `$` 对不上
+///   就凭空少一条基线。这里先 `trim_end` 再判。
+pub fn parse_trailer(message: &str) -> Option<Trailer> {
+    for raw in message.lines() {
+        let Some(rest) = raw.trim_end().strip_prefix("git-svn-id: ") else {
+            continue;
+        };
+        // `<url>@<rev> <uuid>`：uuid 前只有一个空格，且 `$` 锚定意味着它后面
+        // 不能再有别的东西——所以按第一个空格切，右边整段都必须是 uuid。
+        let (left, uuid) = rest.split_once(' ')?;
+        if uuid.is_empty() || !uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+            return None;
+        }
+        // `(\S+)` 是贪婪的，等价于取**最后一个** `@`
+        let (url, rev) = left.rsplit_once('@')?;
+        if url.is_empty() || url.chars().any(char::is_whitespace) {
+            return None;
+        }
+        return Some(Trailer {
+            url: url.to_string(),
+            rev: rev.parse::<u64>().ok()?,
+            uuid: uuid.to_string(),
+        });
+    }
+    None
+}
+
+fn baseline_ref() -> String {
+    format!("refs/heads/{BASELINE_BRANCH}")
+}
+
+/// 用 `TREE` 建一个基线 commit，并**以旧 OID 作比较条件**更新基线分支。
+///
+/// - `parent`：首个基线传 `None`（无父提交）；其余入口按各自流程的定义传。
+/// - `expected_old`：调用方读到的基线当前值。`None` 表示「这个 ref 现在不该存在」。
+///
+/// # 为什么非得带旧值
+///
+/// 并发的第二个 mygitclient 进程、或用户在 IDE / 命令行里手工动了
+/// `svn/base`，都可能发生在「读取 → 核对 → 录制」与「发布」之间。无条件覆盖
+/// 等于**悄悄丢掉**那一次录制，而且两边都不报错。
+///
+/// 这里先自己读一次再比对，而不是只靠 `update-ref` 的报错：
+/// 这样常见情况能给出一条说得清的中文错误（`svn_baseline_moved` + 两个 OID），
+/// 而不是把 git 的英文 `cannot lock ref` 原样丢给用户。`update-ref` 那一层仍然
+/// 带着旧值，负责兜住这两步之间的窄竞态。
+pub fn publish_baseline(
+    repo_root: &str,
+    tree: &str,
+    parent: Option<&str>,
+    t: &Trailer,
+    expected_old: Option<&str>,
+) -> Result<String> {
+    let current = read_baseline(repo_root)?;
+    if current.as_deref() != expected_old {
+        return Err(moved_error(expected_old, current.as_deref()));
+    }
+
+    // `commit-tree` 的 message **必须走 `-m`，不能走 stdin**：`run_git*` 用的是
+    // `Command::output()`，子进程 stdin 是 null，管道那条路会立刻读到 EOF 并产出
+    // 一个 message 为空的 commit——而 trailer 就写在 message 里，等于基线丢掉
+    // 记账且不报任何错。
+    let msg = format!("svn: r{}\n\n{}\n", t.rev, format_trailer(t));
+    let mut args: Vec<&str> = vec!["commit-tree", tree];
+    if let Some(p) = parent {
+        args.push("-p");
+        args.push(p);
+    }
+    args.push("-m");
+    args.push(&msg);
+    let oid = run_git(repo_root, &args)?.trim().to_string();
+
+    let old = expected_old.unwrap_or(ZERO_OID);
+    run_git(repo_root, &["update-ref", &baseline_ref(), &oid, old]).map_err(|e| {
+        // 走到这里说明上面那次读取之后、这一行之前有人动了 ref。仍然归成
+        // 「基线被挪走了」，但把 git 的原话带上，免得掩盖掉别的失败原因
+        // （比如 ref 目录不可写）。
+        GitError::new(
+            "svn_baseline_moved",
+            format!(
+                "更新基线分支失败——发布前的一瞬间它被别人改了。\
+                 已经建好的 commit 是 {oid}（对象还在，没有丢）。git 原话：{}",
+                e.message
+            ),
+        )
+    })?;
+    Ok(oid)
+}
+
+/// 基线分支现在指着谁；不存在返回 `None`。
+fn read_baseline(repo_root: &str) -> Result<Option<String>> {
+    let (code, out) = run_git_code(repo_root, &["rev-parse", "-q", "--verify", &baseline_ref()])?;
+    match code {
+        0 => Ok(Some(out.trim().to_string())),
+        // 1 = 「ref 不存在」。**不能把 128 也算进来**：那是「ref 损坏」，
+        // 当成「不存在」会让我们以为这是首个基线，然后覆盖掉一段真实历史。
+        // 同一个坑 1a 在 `engine::ops::head_is_unborn` 上踩过一次。
+        1 => Ok(None),
+        _ => Err(GitError::new(
+            "svn_baseline",
+            format!(
+                "读取基线分支 {} 失败（rev-parse 退出 {code}）。\
+                 这不是「基线不存在」，更可能是 ref 损坏；\
+                 当成不存在会覆盖掉一段真实历史，所以这里直接报错。",
+                baseline_ref()
+            ),
+        )),
+    }
+}
+
+fn moved_error(expected: Option<&str>, actual: Option<&str>) -> GitError {
+    let want = expected.unwrap_or("（不存在）");
+    let got = actual.unwrap_or("（不存在）");
+    GitError::new(
+        "svn_baseline_moved",
+        format!(
+            "基线分支在本次录制期间被改动过：开始时是 {want}，现在是 {got}。\
+             继续写入会悄悄丢掉那一次改动，所以这里停下。\
+             请重新读取当前状态后再录一次。"
+        ),
+    )
+}

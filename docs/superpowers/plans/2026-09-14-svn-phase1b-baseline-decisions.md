@@ -17,7 +17,7 @@
 | 2 `svn_xml` 三个新解析器 | ✅ 完成 | `src-tauri/src/engine/svn_xml.rs`、`src-tauri/tests/svn_xml.rs` | `cargo test --test svn_xml` 27 passed；全量 **332 passed / 0 failed / 28 个二进制**（= 318 + 新增 14）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓ |
 | 3 P1/P2/P3 硬门槛 | ✅ 完成 | `svn_preflight.rs`（新）、`svn_xml.rs`、`svn_wc.rs`、`engine/mod.rs`、`tests/svn_preflight.rs`（新）、`tests/common/svn_fixtures.rs` | `cargo test --test svn_preflight` 10 passed；全量 **342 passed / 0 failed / 29 个二进制**（= 332 + 新增 10）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓；另做了一轮变异测试验证两条关键断言有牙 |
 | 4 P5 externals 钉死检测 | ✅ 完成 | `svn_externals.rs`（新）、`engine/mod.rs`、`tests/svn_externals.rs`（新）、`tests/common/svn_fixtures.rs` | `cargo test --test svn_externals` 10 passed；全量 **352 passed / 0 failed / 30 个二进制**（= 342 + 新增 10）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓；变异测试确认 `@N` peg 判据有牙 |
-| 5 基线录制（临时索引 / trailer） | ⬜ 未开始 | | |
+| 5 基线录制（临时索引 / trailer） | ✅ 完成 | `svn_baseline.rs`（新）、`svn_include_check.rs`、`engine/mod.rs`、`tests/svn_baseline.rs`（新）、`tests/svn_exclude.rs` | `cargo test --test svn_baseline` 13 passed、`--test svn_exclude` 25 passed；全量 **365 passed / 0 failed / 31 个二进制**（= 352 + 新增 13）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓ |
 | 6 §6.8 基线体检 | ⬜ 未开始 | | |
 | 7 初始化向导编排与回退 | ⬜ 未开始 | | |
 | 8 重建基线 R1–R5 | ⬜ 未开始 | | |
@@ -480,7 +480,118 @@ svn 输出的形态，手写理想 XML 等于没测」，而计划里那六段�
 - 纯新增模块，没有改动任何既有代码。全量 `cargo test -j 2` = 352 passed /
   0 failed / 30 个二进制，相对 Task 3 的 342 多的正好是新增的 10 条，无回归。
 
-#### 记账给后面
+---
+
+## Task 5：基线录制 —— 临时索引、trailer、`commit-tree`
+
+新增 `engine/svn_baseline.rs`（`TempIndex` / `Trailer` / `publish_baseline`），
+并按计划把 `svn_include_check` 的纯读模拟删掉。
+
+动手前先把五件不确定的 git 行为在临时 fixture 上实测掉（跑完即删），**没有一条是
+照文档猜的**：
+
+| # | 实测项 | 结果 |
+|---|---|---|
+| B1 | `GIT_INDEX_FILE` + `read-tree HEAD` 起步 | 成功；真实索引、HEAD、工作目录全不变 |
+| B2 | HEAD 未出生时 `read-tree HEAD` | **exit 128**，`fatal: Not a valid object name HEAD` |
+| B3 | `commit-tree <tree> -m <多行 message>` | 接受；`%B` 逐字读回，末尾补一个换行 |
+| B4 | `update-ref <ref> <new> <40个零>` | ref 不存在 → **exit 0**；ref 已存在 → **exit 128**（`reference already exists`）且 ref 不动 |
+| B5 | `update-ref` 旧值不符 | **exit 128**，`is at X but expected Y`，**ref 未被覆盖** |
+| B6 | `rev-parse -q --verify <不存在的 ref>` | exit 1，stdout 空 |
+
+#### 偏离计划
+
+- **「多收」的检测路径变了，计划没提这件事，第三条测试也得跟着改造。**
+
+  计划的 Step 5 只说要改写两条等价性测试。实际跑下来红的是第三条：
+  `the_mismatch_report_names_the_rule_for_files_that_are_tracked_but_should_not_be`。
+
+  原来它往**用户的真实索引**里 `git add -f -- Code/Junk.psd` 制造多收，1a 的纯读
+  模拟通过 `--cached` 能读到。新模型下候选索引从空索引（或 HEAD 树）起步，
+  用户暂存区里那一笔根本进不来——**而且确实不该进来**：它永远到不了基线。
+
+  新模型下多收的真实路径是「**HEAD 树里已经躺着**一个不该被跟踪的文件」
+  （比如以前被 `add -f` 之后提交了）：`from_head` 把它带进候选索引，
+  `add -A` 不会删掉它（磁盘上还在），于是它一路进到新基线里。测试改成这个形态。
+
+  这是**精度提升不是覆盖损失**：核对的对象从「用户的临时暂存区」变成了
+  「真正会被录进基线的那份索引」。
+
+- **改写后的两条等价性测试仍然不是恒等式**，值得说清楚。计划说「断言目标仍然成立」
+  ——对，但要补一句为什么：候选索引是「从**空**索引 + `-A -- Code`」，对照组是
+  「在**用户已有的**索引上 `git add -A`（整个仓库）」，两条路径的起点和 pathspec
+  都不同，相等是一个实打实的结论。若两边都写成「临时索引上 `add -A`」，那才成了
+  自己比自己。
+
+- **`TempIndex` 加了 `#[derive(Debug)]`**：`Result::expect_err` 要求 `T: Debug`。
+
+- **多写了 7 条计划没列的测试**，都对着实测来的坑：
+  `two_temp_indexes_do_not_collide`、`from_head_starts_from_the_head_tree_not_the_
+  users_staging_area`、`from_head_on_an_unborn_head_is_a_clear_error_not_an_empty_
+  index`、`add_all_with_an_empty_whitelist_adds_nothing`、
+  `the_url_may_itself_contain_an_at_sign`、`a_crlf_message_still_parses`、
+  `publishing_a_first_baseline_refuses_when_one_already_exists`、
+  `recording_the_same_tree_again_is_legal`。
+
+#### 计划的错误
+
+无。这一节的测试代码是对着 B1–B6 的实测写的，计划给的骨架直接可用。
+
+#### 计划没写的坑
+
+- **`commit-tree` 的 message 必须走 `-m`，不能走 stdin。** Task 1 就记过账，这里
+  兑现：`run_git*` 用 `Command::output()`，子进程 stdin 是 null，管道那条路会立刻
+  读到 EOF 并产出一个 **message 为空**的 commit——而 trailer 就写在 message 里，
+  等于基线丢掉全部记账，且**不报任何错**。B3 确认 `-m` 能带多行。
+
+- **`rev-parse -q --verify` 的退出码 1 和 128 必须分开。** 1 是「ref 不存在」，
+  128 是「ref 损坏」。把 128 也当成「不存在」，`publish_baseline` 会以为这是首个
+  基线，然后用 `expected_old = None` 那条路**覆盖掉一段真实历史**。
+  同一个坑 1a 在 `engine::ops::head_is_unborn` 上踩过（那次的后果是删用户的文件）。
+
+- **trailer 里的 URL 自身可能含 `@`。** `svn+ssh://user@host/repo` 是完全正常的
+  写法。按第一个 `@` 切会把 rev 读成 `host/repo@12346`、解析失败，整条基线被判成
+  「不是 baseline」。spec 的正则 `(\S+)@(\d+)` 里 `\S+` 是贪婪的，等价于取**最后
+  一个** `@`——手写解析必须用 `rsplit_once`。
+
+- **commit message 可能带 CRLF。** 经不同工具往返时会带上 CR，正则的 `$` 对不上
+  就凭空少一条基线。解析前先 `trim_end`。
+
+- **临时索引的位置问 `git rev-parse --git-dir`，不要拼 `repo_root/.git`。**
+  worktree 里 `.git` 是个**文件**不是目录，拼出来的路径写不进去。放 `.git/` 里
+  还有两个原因：与对象库同一个文件系统；不会出现在工作目录里被 TortoiseSVN 看见。
+
+- **`Drop` 里不能 panic。** 展开途中再 panic 会直接 abort——在 Tauri 里就是整个
+  应用凭空消失。删不掉临时索引文件是可容忍的，把应用干掉不是。
+
+- **文件名唯一性用 pid + 纳秒 + 进程内原子序号。** 只用纳秒不够：Windows 的时钟
+  粒度约 100ns，同一个流程里「先核对后录制」两次构造可能落在同一个刻度上，
+  撞名的后果是第二份索引从第一份的内容起步。
+
+#### 为什么这么改是安全的
+
+- **「不碰用户的任何东西」这条被三重断言钉死**
+  （`recording_touches_neither_the_real_index_nor_head_nor_the_worktree`）：
+  录制前后 `ls-files -s` 逐字节相同、`rev-parse HEAD` 的退出码与输出相同、
+  工作目录里那个不该被收的 `Code/B.psd` 仍在。B1 的实测和这条测试是两件事，
+  前者证明「git 做得到」，后者证明「我们的实现做到了」。
+- **本任务新增的写操作只有四类**：写临时索引文件（`.git/` 内，`Drop` 清理）、
+  往对象库写 blob/tree/commit（`add` / `write-tree` / `commit-tree`，只增不改）、
+  更新 `refs/heads/svn/base`（**带旧值**）。没有 `checkout`、`reset`、`clean`、
+  `rm`、`branch -D` 中的任何一个。
+- **`update-ref` 失败时不会丢东西**：commit 对象已经写进对象库了，错误信息里带着
+  它的 OID（`已经建好的 commit 是 …，对象还在，没有丢`），最坏是一个孤儿对象，
+  等 `gc` 回收。
+- **`add_all` 的空 pathspec 是 no-op**，不会退化成「收整个仓库」——那会把任意深度
+  的 `.svn/` 收进 git，而那玩意被跟踪之后一次 checkout 就能毁掉一个正在使用的
+  工作副本（spec §6.3）。有专门的测试守着。
+- 删掉纯读模拟属于**减少**事实源：原来「核对读的集合」与「录制写的树」是两条独立
+  推导出来的东西，现在是同一份索引的两次读取。全量 `cargo test -j 2` = 365 passed /
+  0 failed / 31 个二进制，相对 Task 4 的 352 多的正好是新增的 13 条，无回归。
+
+---
+
+## 记账给后面（Task 4 遗留）
 
 **spec §6.5.2「手段二：行为校验」本期不做。** 它要在一次真实 `svn update` 成功
 之后比对「白名单所属 WC 的 revision」与「该仓库当时的 HEAD」，而本期根本不发

@@ -13,6 +13,7 @@ pub mod refs;
 pub mod repo;
 pub mod session;
 pub mod stash;
+pub mod svn_baseline;
 pub mod svn_cli;
 pub mod svn_config;
 pub mod svn_exclude;

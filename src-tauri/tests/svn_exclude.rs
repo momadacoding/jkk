@@ -4,8 +4,9 @@
 //! ——测规则文本只能证明「生成了我以为的字符串」，证明不了 git 会怎么裁决，
 //! 而这个模块存在的全部理由就是后者（spec §6.3）。
 
+use app_lib::engine::svn_baseline::TempIndex;
 use app_lib::engine::svn_exclude::{generate_exclude, write_exclude};
-use app_lib::engine::svn_include_check::{actual_set, expected_set, verify_include_set};
+use app_lib::engine::svn_include_check::{expected_set, verify_include_set};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -221,6 +222,18 @@ fn write_rules(dir: &Path, w: &[String], e: &[String]) {
     write_exclude(dir.to_str().unwrap(), &generate_exclude(w, e)).unwrap();
 }
 
+/// 建候选索引 → `add -A -- <W-path>` → 核对。
+///
+/// spec §6.3.1 要求核对与录制共用**同一份**候选索引，所以 `verify_include_set`
+/// 收的是一个已经 `add_all` 过的 `TempIndex`，而不是自己现算实际集合。
+/// 这里从空索引起步，与初始化向导跑到这一步时的状态一致。
+fn check(dir: &Path, w: &[String], e: &[String]) -> app_lib::error::Result<()> {
+    let root = dir.to_str().unwrap();
+    let idx = TempIndex::empty(root)?;
+    idx.add_all(root, w)?;
+    verify_include_set(root, &idx, w, e)
+}
+
 #[test]
 fn include_check_passes_before_anything_is_staged() {
     // 核对发生在「生成 exclude 之后、录第一个基线之前」（spec §6.3.1），
@@ -228,7 +241,7 @@ fn include_check_passes_before_anything_is_staged() {
     let dir = workdir();
     let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
     write_rules(dir.path(), &w, &e);
-    verify_include_set(dir.path().to_str().unwrap(), &w, &e).unwrap();
+    check(dir.path(), &w, &e).unwrap();
 }
 
 #[test]
@@ -239,25 +252,32 @@ fn include_check_passes_after_the_files_are_staged() {
     let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
     write_rules(dir.path(), &w, &e);
     run_git(dir.path(), &["add", "-A"]);
-    verify_include_set(dir.path().to_str().unwrap(), &w, &e).unwrap();
+    check(dir.path(), &w, &e).unwrap();
 }
 
 #[test]
-fn the_actual_set_equals_what_git_add_would_have_produced() {
-    // spec §6.3.1 的原文是「在**临时索引**上 git add -A 之后读 ls-files」。
-    // 实现改成了纯读（--cached ∪ --others --exclude-standard），理由是它连
-    // 临时索引和松散对象都不写——但那只有在两者**真的等价**时才成立。
-    // 这条把等价性变成一条有断言兜着的事实，而不是我的推断。
+fn the_candidate_index_equals_what_git_add_would_have_produced() {
+    // 2026-09-14 改写。原来这条叫 `the_actual_set_equals_what_git_add_would_have_
+    // produced`，比的是 1a 那个**纯读模拟**与真实 `git add -A` 是否等价。模拟版
+    // 已随 spec §6.3.1 的新写法删掉（核对与录制必须共用同一份候选索引）。
+    //
+    // 断言目标仍然成立、也仍然有价值，只是被测对象换了：候选索引跑在**临时索引**
+    // 上，用户的真实索引跑 `git add -A`，两者收到的文件集合必须一致。
+    // 这不是恒等式——一个从空索引 + `-- Code` 起步，一个在用户索引上收整个仓库。
     let dir = workdir();
     let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
     write_rules(dir.path(), &w, &e);
 
-    let read_only = actual_set(dir.path().to_str().unwrap(), &w).unwrap();
+    let root = dir.path().to_str().unwrap();
+    let idx = TempIndex::empty(root).unwrap();
+    idx.add_all(root, &w).unwrap();
+    let candidate = idx.ls_files(root).unwrap();
+
     run_git(dir.path(), &["add", "-A"]);
     let after_add: BTreeSet<String> = tracked(dir.path()).into_iter().collect();
 
-    assert_eq!(read_only, after_add, "纯读取数与 git add -A 的结果必须一致");
-    assert!(!read_only.is_empty(), "两边都空的话这条断言什么也没证明");
+    assert_eq!(candidate, after_add, "候选索引与 git add -A 的结果必须一致");
+    assert!(!candidate.is_empty(), "两边都空的话这条断言什么也没证明");
 }
 
 #[test]
@@ -279,34 +299,38 @@ fn a_deleted_but_unstaged_file_does_not_look_like_an_unexpected_file() {
     run_git(dir.path(), &["add", "-A"]);
     fs::remove_file(dir.path().join("Code/Top.cs")).unwrap();
 
-    verify_include_set(dir.path().to_str().unwrap(), &w, &e)
-        .expect("删了文件还没 stage 不该被判成「不该被跟踪」");
+    check(dir.path(), &w, &e).expect("删了文件还没 stage 不该被判成「不该被跟踪」");
 }
 
 #[test]
-fn the_actual_set_equals_git_add_even_when_the_index_is_already_populated() {
-    // B1 的另一半：把等价性断言放到**索引非空**的时刻再跑一遍，
-    // 并制造一个删除未 stage 的差异。原来那条只覆盖了空索引。
+fn the_candidate_index_equals_git_add_even_when_the_users_index_is_already_populated() {
+    // B1 的另一半，同样改写（见上一条）。把等价性断言放到**用户索引非空**的时刻
+    // 再跑一遍，并制造一个删除未 stage 的差异——1a 那个 bug 就死在这个形态上：
+    // 模拟版的 `--cached` 仍列已删文件，`git add -A` 之后不列，于是核对报
+    // 「不该被跟踪、实际跟踪了 Code/Sub/Mid.cs」并硬阻断，而用户只是删了个文件。
     let dir = workdir();
     let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
     write_rules(dir.path(), &w, &e);
     run_git(dir.path(), &["add", "-A"]);
     fs::remove_file(dir.path().join("Code/Sub/Mid.cs")).unwrap();
-    // 再放一个新文件进来，让 --others 那一路也有内容
     fs::write(dir.path().join("Code/Fresh.cs"), "x").unwrap();
 
-    let read_only = actual_set(dir.path().to_str().unwrap(), &w).unwrap();
+    let root = dir.path().to_str().unwrap();
+    let idx = TempIndex::empty(root).unwrap();
+    idx.add_all(root, &w).unwrap();
+    let candidate = idx.ls_files(root).unwrap();
+
     run_git(dir.path(), &["add", "-A"]);
     let after_add: BTreeSet<String> = tracked(dir.path()).into_iter().collect();
 
-    assert_eq!(read_only, after_add, "索引非空时两条路径仍必须一致");
+    assert_eq!(candidate, after_add, "用户索引非空时两条路径仍必须一致");
     assert!(
-        !read_only.contains("Code/Sub/Mid.cs"),
-        "已删除的文件不该留在集合里：{read_only:?}"
+        !candidate.contains("Code/Sub/Mid.cs"),
+        "已删除的文件不该留在集合里：{candidate:?}"
     );
     assert!(
-        read_only.contains("Code/Fresh.cs"),
-        "新增未入索引的文件必须在集合里：{read_only:?}"
+        candidate.contains("Code/Fresh.cs"),
+        "新增未入索引的文件必须在集合里：{candidate:?}"
     );
 }
 
@@ -320,8 +344,7 @@ fn a_gitignore_in_the_working_tree_is_caught() {
     let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
     write_rules(dir.path(), &w, &e);
 
-    let err = verify_include_set(dir.path().to_str().unwrap(), &w, &e)
-        .expect_err("被 .gitignore 盖掉必须阻断");
+    let err = check(dir.path(), &w, &e).expect_err("被 .gitignore 盖掉必须阻断");
     assert_eq!(err.code, "include_set_mismatch");
     // 错误信息必须指认裁决者，否则用户只知道「不一致」，不知道去改哪个文件
     assert!(
@@ -352,8 +375,7 @@ fn include_check_reports_unexpected_files_too() {
         "前置条件没成立：.svn 下的文件根本没进索引，这条测不到「多出来」那一侧"
     );
 
-    let err = verify_include_set(dir.path().to_str().unwrap(), &w, &e)
-        .expect_err("多出 .svn 下的文件必须被报出来");
+    let err = check(dir.path(), &w, &e).expect_err("多出 .svn 下的文件必须被报出来");
     assert_eq!(err.code, "include_set_mismatch");
     assert!(
         err.message.contains("不该被跟踪"),
@@ -380,10 +402,13 @@ fn an_empty_whitelist_never_degenerates_into_everything() {
         "仓库里得真有被跟踪的文件，否则这条恒真"
     );
 
+    // 空白名单 → `add_all` 是 no-op → 候选索引为空。
+    // 退化成「全部」的那条路会在这里把整个仓库收进来。
+    let root = dir.path().to_str().unwrap();
+    let idx = TempIndex::empty(root).unwrap();
+    idx.add_all(root, &[]).unwrap();
     assert!(
-        actual_set(dir.path().to_str().unwrap(), &[])
-            .unwrap()
-            .is_empty(),
+        idx.ls_files(root).unwrap().is_empty(),
         "空白名单必须得到空集"
     );
 }
@@ -398,7 +423,7 @@ fn non_ascii_filenames_do_not_produce_a_phantom_mismatch() {
     fs::write(dir.path().join("Code/角色.cs"), "x").unwrap();
     let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
     write_rules(dir.path(), &w, &e);
-    verify_include_set(dir.path().to_str().unwrap(), &w, &e).unwrap();
+    check(dir.path(), &w, &e).unwrap();
 }
 
 /// 建一个 Windows 目录 junction。成功返回 true。
@@ -441,7 +466,7 @@ fn a_directory_junction_inside_the_whitelist_does_not_cause_a_phantom_mismatch()
 
     let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
     write_rules(dir.path(), &w, &e);
-    verify_include_set(dir.path().to_str().unwrap(), &w, &e).unwrap();
+    check(dir.path(), &w, &e).unwrap();
 
     // 前提校验：junction 内部的文件确实两边都收到了，否则上面那条 unwrap
     // 可能只是因为「两边都没看见它」而通过——那什么也没证明
@@ -556,7 +581,7 @@ fn extension_matching_follows_gits_own_case_sensitivity() {
     fs::write(dir.path().join("Code/Loud.CS"), "x").unwrap();
     let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
     write_rules(dir.path(), &w, &e);
-    verify_include_set(dir.path().to_str().unwrap(), &w, &e).unwrap();
+    check(dir.path(), &w, &e).unwrap();
 }
 
 #[test]
@@ -574,7 +599,7 @@ fn core_ignorecase_is_read_with_gits_own_boolean_parsing() {
         fs::write(dir.path().join("Code/Loud.CS"), "x").unwrap();
         let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
         write_rules(dir.path(), &w, &e);
-        verify_include_set(dir.path().to_str().unwrap(), &w, &e)
+        check(dir.path(), &w, &e)
             .unwrap_or_else(|err| panic!("core.ignoreCase={truthy} 时误报：{}", err.message));
     }
 
@@ -601,13 +626,23 @@ fn the_mismatch_report_names_the_rule_for_files_that_are_tracked_but_should_not_
     // 而且这一侧的文件**必然已在索引里**，`git check-ignore` 不带 `--no-index`
     // 时对已跟踪文件只吐一行空裁决 `::<TAB>路径`（2026-09-14 实测，exit 1）,
     // 带上才会给出 `.git/info/exclude:3:/Code/**`。spec §6.3.1 新版已写明要带。
+    //
+    // ⚠️ 2026-09-14 换了造「多收」的方式。原来是往**用户的真实索引**里
+    // `git add -f`，那在 1a 的纯读模拟下会被 `--cached` 读到。现在核对读的是
+    // 候选索引（从空或 HEAD 树起步），用户暂存区里那一笔根本进不来——也确实
+    // **不该**进来，它永远到不了基线。新模型下多收的真实路径是
+    // 「**HEAD 树里已经躺着**一个不该被跟踪的文件」：`from_head` 会把它带进候选
+    // 索引，`add -A` 不会删掉它（磁盘上还在），于是它一路进到基线里。
     let dir = workdir();
     let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
     write_rules(dir.path(), &w, &e);
-    // 强行把一个被规则排除的文件塞进索引，制造「多收」
     run_git(dir.path(), &["add", "-f", "--", "Code/Junk.psd"]);
+    run_git(dir.path(), &["commit", "-m", "误把 psd 提交了"]);
 
-    let err = verify_include_set(dir.path().to_str().unwrap(), &w, &e).expect_err("多收必须被抓到");
+    let root = dir.path().to_str().unwrap();
+    let idx = TempIndex::from_head(root).unwrap();
+    idx.add_all(root, &w).unwrap();
+    let err = verify_include_set(root, &idx, &w, &e).expect_err("多收必须被抓到");
     assert_eq!(err.code, "include_set_mismatch");
     assert!(
         err.message.contains("Code/Junk.psd"),
