@@ -12,7 +12,7 @@
 
 | Task | 状态 | 产出文件 | 验证结果 |
 |---|---|---|---|
-| 0 开工自检与基线数字 | 🟡 进行中 | 本文件 | 待填 |
+| 0 开工自检与基线数字 | ✅ 完成 | 本文件、`2026-09-14-svn-phase1b-baseline.md` | 改动前基线（新 worktree 内实测）：Rust **316 passed / 0 failed / 28 个二进制**、前端 `pnpm test` **272 passed / 21 files**、`pnpm build` ✓。与计划预期一致 |
 | 1 `git_cli` 支持环境变量 | ⬜ 未开始 | | |
 | 2 `svn_xml` 三个新解析器 | ⬜ 未开始 | | |
 | 3 P1/P2/P3 硬门槛 | ⬜ 未开始 | | |
@@ -79,18 +79,43 @@ spec §16 的 Phase 1 是一大坨（向导、基线、体检、重建、失同�
 
 ## Task 0：开工自检与基线数字
 
+**改动前基线（在本 worktree 内实测，不是抄上一期的）：**
+
+| 项 | 值 |
+|---|---|
+| `cargo test -j 2` | **316 passed / 0 failed / 28 个二进制** |
+| `pnpm test` | **272 passed / 21 files** |
+| `pnpm build`（含 `tsc`） | 通过 |
+
+三项与计划里写的预期一致，无需修正计划。
+
 #### 偏离计划
 
-（待填）
+无。Task 0 按计划执行。
 
 #### 计划的错误
 
-（待填）
+无。
 
 #### 计划没写的坑
 
-（待填）
+- **新 worktree 里 `node_modules` 不存在，必须先 `pnpm install`。** 实测
+  `Test-Path node_modules` → `False`。1a 踩过一次：不装的话 `pnpm test` 会**静默跑
+  主工作区**的测试（`@` 别名解析到主 checkout 的 `src/`），拿到一个看起来正常、
+  实际测的是另一份代码的数字。计划的 Task 0 Step 2 只写了跑命令，没写这一步。
+  **Task 10 的收尾验证同样适用**，换 worktree 之后要重来一次。
+
+- **PowerShell 的 `Select-String` 默认大小写不敏感。** 统计失败行时用
+  `-Pattern 'FAILED'` 会把 28 行 `0 failed;` 全部匹配进来，得到「30 个失败」
+  这种吓人又错误的结论。核对测试结果时必须加 `-CaseSensitive`，或者直接判
+  「非 `test result: ok.` 开头的行数」。本期后面每次统计数字都走后者。
+
+- **`cargo test` 的正常输出里混着两行看着像错误的东西**，是 fixture 故意造的形态，
+  不是失败：`error: cannot delete branch 'feat/busy' used by worktree at …`
+  （断言 git 会拒绝删被检出的分支）与 `Automatic merge failed; fix conflicts`
+  （冲突 fixture）。判读时不要被它们带偏——以 `test result:` 行和退出码为准。
 
 #### 为什么这么改是安全的
 
-（待填）
+Task 0 只读不写：跑测试、记数字、建两个 `docs/` 下的文件。没有任何代码改动，
+也没有发出任何 git / svn 写命令。
