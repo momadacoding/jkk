@@ -26,7 +26,7 @@
 | 4 嵌套 WC 枚举与 P4 | ✅ 完成 | `engine/svn_wc.rs`、`engine/mod.rs`、`tests/svn_wc.rs`、`tests/common/svn_fixtures.rs` | fmt ✓ clippy 零告警 ✓ `--test svn_wc` **6 passed** ✓ `cargo test` **264 passed / 0 failed**（= 226 + 38） |
 | — review 修复（7 条） | ✅ 完成 | `svn_cli.rs`、`svn_config.rs`、`svn_xml.rs` + 各自测试 | 见「独立 review」一节。⚠️ **#3 分两次才修完**——第一次只加了文档契约就报了「全部已修」，等于没修。测试数 svn_cli 4→8、svn_config 14→16、svn_xml 8→11；`cargo test` **267 passed / 0 failed** |
 | 5 exclude 规则生成 | ✅ 完成 | `engine/svn_exclude.rs`、`engine/mod.rs`、`tests/svn_exclude.rs` | fmt ✓ clippy 零告警 ✓ `--test svn_exclude` **9 passed**（计划写的是 7，多的 2 条覆盖「白名单条目互相包含」，见下）✓ `cargo test` **276 passed / 0 failed / 27 个二进制**（= 267 + 9） |
-| 6 纳入集合核对 | ⬜ 未开始 | | |
+| 6 纳入集合核对 | ✅ 完成 | `engine/svn_include_check.rs`、`engine/mod.rs`、`tests/svn_exclude.rs`（追加） | fmt ✓ clippy 零告警 ✓ `--test svn_exclude` **17 passed**（9 + 8；计划写的是 3，多的 5 条见下）✓ `cargo test` **284 passed / 0 failed / 27 个二进制**（= 276 + 8） |
 | 7 仓库识别 / capabilities / backend_for 分流 | ⬜ 未开始 | | |
 | 8 前端按能力隐藏入口 | ⬜ 未开始 | | |
 | 9 收尾验证 | ⬜ 未开始 | | |
@@ -427,6 +427,99 @@ git 的裁决规则是「**最后一条**匹配的模式说了算」，所以规
 - 末尾那条 `.svn/` 有两条测试兜着（`.db` 在扩展名列表里、以及 `extensions:["*"]`
   两条最容易漏的路径），因为它一旦失效就不是「少跟踪几个文件」，而是 git
   checkout 会在一个**正在使用的** SVN 工作副本底下换掉 `wc.db`。
+
+---
+
+### Task 6：纳入集合核对
+
+#### 偏离计划
+
+- **`actual_set` 改成纯读，不建临时索引。** spec §6.3.1 的原文是「在**临时索引**上
+  `git add -A -- <白名单>` 之后读 `ls-files`」，意图是「git 会跟踪谁」而不要弄脏
+  用户的暂存区。实现走 `--cached` ∪ `--others --exclude-standard`：
+
+  | | 临时索引方案 | 纯读方案 |
+  |---|---|---|
+  | 写临时索引文件 | 要（`GIT_INDEX_FILE` + 清理） | 不写 |
+  | 往 `.git/objects` 写松散对象 | 会（`git add` 要算 blob） | 不写 |
+  | 结果 | —— | **实测相同** |
+
+  两者等价这件事没有当成推断——`the_actual_set_equals_what_git_add_would_have_produced`
+  在真实仓库上把两条路径的结果直接对了一遍，且断言「两边都不为空」，
+  免得退化成「空集 == 空集」的假绿。
+
+- **`expected_set` 会读 `core.ignoreCase`**（计划里没有这个概念）。理由见下方
+  「计划没写的坑」。
+
+- **`ls_files` 一律带 `-z`**（计划里是按行读）。理由见下方。
+
+- **测试从 3 条加到 8 条。** 计划那 3 条里有 2 条是坏的（见「计划的错误」），
+  修好之后又补了 5 条：索引已填充的那一路、等价性、空白名单、非 ASCII 文件名、
+  大小写敏感性。
+
+#### 计划的错误
+
+**计划给的 3 条测试里，1 条必然失败、1 条会以错误的理由变绿。**
+
+计划的 `include_check_passes_on_a_clean_working_directory` 和
+`include_check_reports_unexpected_files_too` 都只 `write_exclude` 就直接
+`verify_include_set`，**中间没有 `git add -A`**。而计划版 `actual_set` 读的是
+`git ls-files`（索引），在一个刚 `git init` 的仓库里索引是空的：
+
+| 计划的测试 | 实际会发生什么 |
+|---|---|
+| `..._passes_on_a_clean_working_directory` | expected 有 3 个 `.cs`、actual 空 → `unwrap()` panic，**测试直接挂** |
+| `..._reports_unexpected_files_too` | 同样是 actual 空 → 报的是「**该在的没在**」，但它名字叫 *unexpected*。断言只查 `err.code`，于是**以完全错误的理由变绿** |
+
+后一条正是 `AGENTS.md` §13 rubric #9 说的虚假信心：名为「覆盖 X」的测试测的不是
+X 的真实形态。修法是让它先真的 `git add -A` 把 `.svn/wc.db` 送进索引，并加一条
+**前置条件断言**（`.svn` 下确实有文件进了索引）和两条内容断言（错误信息必须含
+「不该被跟踪」和 `.svn/wc.db`），这样它只能因为「多出来」那一侧而通过。
+
+顺带把「纯读」方案确定下来之后，第一条测试反而成立了——所以它改名为
+`include_check_passes_before_anything_is_staged`，名字直说它覆盖的是哪个时刻。
+
+#### 计划没写的坑
+
+- **`git ls-files` 默认会转义非 ASCII 路径。** `core.quotePath` 默认 `true`，
+  `Code/角色.cs` 读出来是 `"Code/\350\247\222\350\211\262.cs"`（带引号的八进制），
+  而期望集合是遍历磁盘得到的原始字符串——两者**永远对不上**。后果是每一个装了
+  中文文件名的工程都在初始化时被误报阻断，而这个项目面向的就是中文团队的 Unity
+  工程。修法是一律带 `-z`（同时关掉转义并用 NUL 分隔，顺带也扛住文件名里含换行）。
+  实测验证：把 `-z` 摘掉，`non_ascii_filenames_do_not_produce_a_phantom_mismatch`
+  立刻变红。
+
+- **`core.ignoreCase` 会改变忽略规则的匹配语义。** Windows 上 `git init` 会把它
+  探测成 `true`，于是 `!/Code/**/*.cs` 连 `Loud.CS` 一起纳入。期望集合若死板地按
+  大小写敏感算扩展名，就会把 `Loud.CS` 报成「不该被跟踪却跟踪了」——在一个完全
+  正常的仓库上**误报阻断**。所以 `expected_set` 去问 `git config --get
+  core.ignoreCase`，跟 git 保持一致，而**不是按平台猜**（同一台 Windows 上，仓库
+  落在大小写敏感的卷、或用户显式设成 `false` 时行为就反过来）。实测验证：强制
+  `fold = false`，`extension_matching_follows_gits_own_case_sensitivity` 立刻变红。
+
+- **单文件白名单条目不过扩展名过滤——`expected_set` 必须跟 `svn_exclude` 对齐。**
+  计划的 `expected_set` 对 `abs.is_file()` 的分支写了 `if matches_ext(...)`，但
+  `svn_exclude` 的第 ③ 段发的是光秃秃的 `!/Code/Junk.psd`，不过滤。两边不一致
+  会让「整个 `Code/` 收 `.cs` + 单独收一个 `build.gradle`」这种合法配置在核对时
+  被判成「多出来」。已把 `matches_ext` 从单文件分支去掉。
+
+- **白名单条目在磁盘上不存在时不报错。** 本函数的定义就是「磁盘上现在有什么」；
+  「配置指向了不存在的路径」是另一条独立校验，属初始化向导（Phase 1b）。
+  已写进函数注释，免得下一个人当成漏判补一个不该在这里的分支。
+
+#### 为什么这么改是安全的
+
+- **本模块一条写操作都没有。** `git ls-files` / `git check-ignore` / `git config
+  --get` 全是只读，不碰索引、不碰工作树、不碰 refs、连松散对象都不写
+  ——这也是放弃「临时索引」方案的主要理由。
+- **空白名单在 `actual_set` 开头就返回空集，一条 git 命令都不发**（G6）。
+  `an_empty_whitelist_never_degenerates_into_everything` 在一个**确实有被跟踪文件**
+  的仓库上断言这一点，所以它不是恒真的。
+- **`ls-files` 的参数里有 `--` 分隔符。** 白名单条目是用户手写的，没有它一个以
+  `-` 开头的条目会被 git 当成选项解析（`AGENTS.md` §6.2 的空 pathspec 事故同源）。
+  Task 3 的 `normalize_whitelist_entry` 已经挡了前导 `-`，这里是第二道。
+- 测试仓库全部是 `TempDir` 里 `git init` 出来的，跑完即删，不碰本仓库或用户仓库。
+- 两条防御性测试都做过**反向验证**（摘掉保护后必须变红），不是写完就算。
 
 ---
 

@@ -16,6 +16,7 @@ pub mod stash;
 pub mod svn_cli;
 pub mod svn_config;
 pub mod svn_exclude;
+pub mod svn_include_check;
 pub mod svn_wc;
 pub mod svn_xml;
 pub mod tree;
