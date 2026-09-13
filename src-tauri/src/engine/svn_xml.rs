@@ -84,7 +84,9 @@ pub fn parse_info(xml: &str) -> Result<Vec<SvnInfoEntry>> {
 /// 这个坑之所以容易踩：同模块的 [`parse_external_roots`] 要的恰恰是**不带**
 /// `--ignore-externals` 的输出，而两个函数都只收 `&str`，签名上分不出来。
 /// 拿同一份 status 输出喂给两者是最自然、也最危险的写法。
-/// **取数请统一走 `engine::svn_wc`，不要在调用点各自拼 svn 命令。**
+///
+/// **所以本函数自己检查这件事，不靠调用方记得**：违约时返回
+/// `svn_xml_externals_not_ignored`，见 [`assert_externals_were_ignored`]。
 ///
 /// # 取哪个 revision
 ///
@@ -96,6 +98,7 @@ pub fn parse_info(xml: &str) -> Result<Vec<SvnInfoEntry>> {
 /// ——这正是选 DOM 而不是流式 parser 的理由。
 pub fn parse_node_revs(xml: &str) -> Result<BTreeSet<i64>> {
     let doc = parse_doc(xml)?;
+    assert_externals_were_ignored(&doc)?;
     let mut revs = BTreeSet::new();
     for st in doc.descendants().filter(|n| n.has_tag_name("wc-status")) {
         // external **根**的 wc-status 没有 revision 属性，跳过而不是记成 0——
@@ -133,6 +136,80 @@ pub fn parse_external_roots(xml: &str) -> Result<Vec<String>> {
         }
     }
     Ok(roots)
+}
+
+/// 判定这份 status 输出是不是带 `--ignore-externals` 跑出来的，不是就报错。
+///
+/// **判据来自实测**（2026-09-13，临时 fixture：`Code/` 底下挂一条跨仓库 external
+/// `Vendor`）：
+///
+/// | entry path | 带 `--ignore-externals` | 不带 |
+/// |---|---|---|
+/// | `Code` | normal | normal |
+/// | `Code\A.cs` | normal | normal |
+/// | `Code\Vendor` | **external** | **external** |
+/// | `Code\Vendor` | — | normal ← external 自己的 WC 根 |
+/// | `Code\Vendor\V.cs` | — | normal ← external 的内容 |
+///
+/// 关键观察：`item="external"` **两种情况下都出现**，所以不能靠它的有无判定；
+/// 但带该参数时，external 根**及其底下**只有那一条 `item="external"` 条目。
+/// 于是判据是：**是否存在「位于某个 external 根之内、而自己不是那条 external
+/// 条目」的 entry**。
+///
+/// 为什么值得写这么一段而不是只写条注释：不带参数时 `nodeRevs` 会混进另一个仓库
+/// 的 revision 序列（实测 `{29825, 1938156}`），后果是永久误报失同步、初始化向导
+/// 永远过不去，**而且一切看起来都正常**（spec §6.6.4 陷阱一）。把它变成一个响亮的
+/// 错误，比指望下一个人读到文档可靠。
+pub fn assert_externals_were_ignored(doc: &Document) -> Result<()> {
+    let externals: Vec<String> = doc
+        .descendants()
+        .filter(|n| n.has_tag_name("entry"))
+        .filter(|n| {
+            n.children()
+                .find(|c| c.has_tag_name("wc-status"))
+                .and_then(|c| c.attribute("item"))
+                == Some("external")
+        })
+        .filter_map(|n| n.attribute("path"))
+        .map(norm_sep)
+        .collect();
+    if externals.is_empty() {
+        return Ok(());
+    }
+    for entry in doc.descendants().filter(|n| n.has_tag_name("entry")) {
+        let is_external_marker = entry
+            .children()
+            .find(|c| c.has_tag_name("wc-status"))
+            .and_then(|c| c.attribute("item"))
+            == Some("external");
+        if is_external_marker {
+            continue;
+        }
+        let Some(path) = entry.attribute("path").map(norm_sep) else {
+            continue;
+        };
+        if let Some(root) = externals
+            .iter()
+            .find(|r| path == **r || path.starts_with(&format!("{r}/")))
+        {
+            return Err(GitError::new(
+                "svn_xml_externals_not_ignored",
+                format!(
+                    "这份 svn status 输出里含 external `{root}` **内部**的节点（`{path}`），\
+                     说明它不是带 --ignore-externals 跑出来的。\
+                     直接拿它算 nodeRevs 会把另一个仓库的 revision 序列混进来，\
+                     造成永久误报失同步（spec §6.6.4 陷阱一）。\
+                     取数请走 engine::svn_wc，不要在调用点自己拼 svn 命令。"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// svn 在 Windows 上返回反斜杠，比较路径前统一成正斜杠。
+fn norm_sep(p: &str) -> String {
+    p.replace('\\', "/")
 }
 
 fn attr(node: &Node, name: &str) -> Result<String> {

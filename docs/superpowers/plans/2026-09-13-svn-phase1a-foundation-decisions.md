@@ -24,7 +24,7 @@
 | 2 `--xml` 解析（roxmltree） | ✅ 完成 | `engine/svn_xml.rs`、`engine/mod.rs`、`Cargo.toml`、`tests/svn_xml.rs` | fmt ✓ clippy 零告警 ✓ `--test svn_xml` **8 passed**（计划写的是 6，对齐真实输出后加了 2）✓ `cargo test` **238 passed / 0 failed**（= 230 + 8） |
 | 3 配置文件读取与校验 | ✅ 完成 | `engine/svn_config.rs`、`engine/mod.rs`、`tests/svn_config.rs` | fmt ✓ clippy 零告警 ✓ `--test svn_config` **14 passed**（计划写的是 8）✓ `cargo test` **252 passed / 0 failed**（= 238 + 14） |
 | 4 嵌套 WC 枚举与 P4 | ✅ 完成 | `engine/svn_wc.rs`、`engine/mod.rs`、`tests/svn_wc.rs`、`tests/common/svn_fixtures.rs` | fmt ✓ clippy 零告警 ✓ `--test svn_wc` **6 passed** ✓ `cargo test` **264 passed / 0 failed**（= 226 + 38） |
-| — review 修复（7 条） | ✅ 完成 | `svn_cli.rs`、`svn_config.rs`、`svn_xml.rs` + 各自测试 | 见下方「独立 review」一节；测试数 svn_cli 4→8、svn_config 14→16 |
+| — review 修复（7 条） | ✅ 完成 | `svn_cli.rs`、`svn_config.rs`、`svn_xml.rs` + 各自测试 | 见「独立 review」一节。⚠️ **#3 分两次才修完**——第一次只加了文档契约就报了「全部已修」，等于没修。测试数 svn_cli 4→8、svn_config 14→16、svn_xml 8→11；`cargo test` **267 passed / 0 failed** |
 | 5 exclude 规则生成 | ⬜ 未开始 | | |
 | 6 纳入集合核对 | ⬜ 未开始 | | |
 | 7 仓库识别 / capabilities / backend_for 分流 | ⬜ 未开始 | | |
@@ -57,11 +57,44 @@ Task 4 开始真正调 svn 之前跑了一次 `/code-review high`。**7 条发�
 |---|---|---|---|
 | 1 | Medium | `persistent_path_has_svn` 把整段 `reg query` 输出按 `;` 切，**第一个 chunk 是「注册表键名 + 换行 + `Path REG_EXPAND_SZ ` + 第一个目录」**，`trim()` 去不掉中间的换行，于是 **PATH 的第一个条目被静默吞掉** | 抽出 `path_dirs_from_reg_output()`：先定位含 `REG_EXPAND_SZ` / `REG_SZ` 的那一行，切掉类型标记之前的部分再按 `;` 切。函数**有意不加 `#[cfg(windows)]`**（纯字符串处理），这样测试不必按平台分叉 |
 | 2 | Medium | `"./"` 绕过校验：`trimmed == "."` 是精确比较，`"./"` 不等于 `"."`，被原样放行——而 `./` 当 git pathspec 和当 SVN target **两边都等于「全部」** | `.` / `..` 改为**逐段**判断，顺带覆盖 `Assets/./Scripts` |
-| 3 | Medium | `parse_node_revs` 的注释说「external 根没有 revision，跳过」，会让人以为 externals 已被处理。实际那只对**根节点**成立，external **内部**节点都带 revision 且来自另一个仓库的序列 | 在函数文档里加「输入必须来自带 `--ignore-externals` 的 status」硬契约，并写明同模块的 `parse_external_roots` 要的恰恰相反、两者签名分不出来，取数统一走 `svn_wc` |
+| 3 | Medium | `parse_node_revs` 的注释说「external 根没有 revision，跳过」，会让人以为 externals 已被处理。实际那只对**根节点**成立，external **内部**节点都带 revision 且来自另一个仓库的序列 | **分两次修**，见下方「#3 第一次只修了一半」 |
 | 4 | Medium | **我自己写的假绿测试**：`info_must_not_receive_ignore_externals` 在非工作副本上只断言 `code != 0`，而那种目录下不带该参数的 `svn info` 同样退出 1。就算哪天 svn 开始接受这个参数，测试照样绿 | 改到真实 fixture 工作副本上跑，加**对照组**（不带该参数必须成功）并断言 stderr 含 `doesn't accept option`；另加 `status_and_update_do_accept_ignore_externals` 覆盖表的另一半 |
 | 5 | Low-Med | `run_svn_code` 只返回 `(code, stdout)`，照抄了 `run_git_code` 的形状。但 git 靠 1 vs 128 区分失败类型，**svn 基本一律退出 1**，光看退出码分不出任何两种失败——这正是 #4 只能做无判别力断言的原因 | 改成返回 `SvnOutput { code, stdout, stderr }` |
 | 6 | Low | `version` / `mode` 声明了字段却从不校验。`"version": 2` 会被当 v1 语义静默接受 | 加 `SUPPORTED_VERSION` / `SVN_GIT_MODE` 两个常量并校验。**与 `engine::custom_config` 有意不同**——那边最坏后果是一个按钮不对，这里版本语义差异会直接改变哪些文件受保护 |
 | 7 | Low | `.git` / `.svn` 前缀判断大小写敏感，NTFS 下 `.SVN/wc.db` 会命中真实目录 | 改 `eq_ignore_ascii_case`；顺带补上「不能以 `-` 开头」（当 SVN target 时会被当成选项，git 侧有 `--` 保护但 svn 侧没有） |
+
+### #3 第一次只修了一半
+
+第一轮我只加了文档契约就在 checkpoint 里报了「7 条全部已修」。**那个说法不准确。**
+reviewer 的原话是「写进文档**并在类型上区分**……**别只靠调用方记得**」，而一条文档
+注释恰恰就是「靠调用方记得」——两个函数仍然都收 `&str`，签名上分不出来，陷阱原封
+不动。用户追问「那你全部修复了吗」时复查才发现。
+
+**第二次修法：让 `parse_node_revs` 自己检出违约。** 先实测了判据是否存在
+（2026-09-13 临时 fixture，`Code/` 底下一条跨仓库 external `Vendor`）：
+
+| entry path | 带 `--ignore-externals` | 不带 |
+|---|---|---|
+| `Code` | normal | normal |
+| `Code\A.cs` | normal | normal |
+| `Code\Vendor` | **external** | **external** |
+| `Code\Vendor` | — | normal ← external 自己的 WC 根 |
+| `Code\Vendor\V.cs` | — | normal ← external 的内容 |
+
+关键观察：**`item="external"` 两种情况下都出现**，所以第一个想法（靠它的有无判定）
+不成立；但带该参数时，external 根**及其底下**只有那一条 `item="external"` 条目。
+判据因此是「是否存在位于某个 external 根之内、而自己不是那条 external 条目的 entry」。
+
+实现为 `assert_externals_were_ignored()`，`parse_node_revs` 入口处调用，违约返回
+`svn_xml_externals_not_ignored`。配三条测试：手写常量的正反两向，**外加一条拿真实
+`svn status` 输出跑的双向测试**——手写常量是照实测抄的，但「照着抄」和「真的成立」
+是两回事（`AGENTS.md` §14.1）。
+
+**为什么没做 newtype。** reviewer 给的另一个选项是包两个 newtype。那要么把构造函数
+开成 public（测试要能构造，于是又能被误构造，防护退化成命名约定），要么把取数函数
+搬进 `svn_xml`——而 Phase 1a 根本没有 `nodeRevs` 的消费方（那是 1b 的失同步检测），
+现在搬等于把 1b 的范围提前拉进来。运行时判据在这里更划算：零 API 面积、覆盖所有
+调用方（包括将来 1b 新加的），且**有真实输入的测试兜着**。
 
 **#1 与 #4 的共同点值得单独记**：两者都落在我自己在 Task 1 就写明的覆盖盲区上
 （`StalePath` / `NotInstalled` 无测试）。盲区如实记了下来，但**记下来不等于挡住了**

@@ -4,7 +4,12 @@
 //! 逐行排列、CRLF 行尾、`<wc-status>` 里还嵌着一个同名属性的 `<commit>`。
 //! 用理想输入测这个模块等于没测（`AGENTS.md` §13 rubric #9）。
 
+#[path = "common/svn_fixtures.rs"]
+mod svn_fixtures;
+
+use app_lib::engine::svn_cli::run_svn;
 use app_lib::engine::svn_xml::{parse_external_roots, parse_info, parse_node_revs};
+use svn_fixtures::svn_repo_with_cross_repo_nested_external;
 
 /// 真实 `svn status -v --xml` 的形态：属性跨行 + CRLF + 内层 <commit>。
 const STATUS_XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
@@ -72,6 +77,80 @@ fn external_root_paths_come_back_with_windows_separators_verbatim() {
     // 某个人碰巧记得的细节。
     let roots = parse_external_roots(STATUS_XML).unwrap();
     assert_eq!(roots[0], r"Code\Vendor", "解析层不做分隔符转换");
+}
+
+/// 真实形态：**没带** `--ignore-externals` 的 status，external 内部节点混了进来。
+///
+/// 2026-09-13 临时 fixture 实测（`Code/` 底下一条跨仓库 external `Vendor`）：
+/// 带该参数时 `Code\Vendor` 只出现一次且是 `item="external"`；不带时它出现两次，
+/// 且多出一条 `Code\Vendor\V.cs`。下面照这个形态构造，external 内部的 revision
+/// 用另一个仓库那种百万量级的号（实测真实值就是 1938156）。
+const STATUS_XML_EXTERNALS_NOT_IGNORED: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
+<status>\r\n\
+<target\r\n   path=\"Code\">\r\n\
+<entry\r\n   path=\"Code\\A.cs\">\r\n\
+<wc-status\r\n   item=\"normal\"\r\n   revision=\"29825\"\r\n   props=\"none\">\r\n\
+</wc-status>\r\n\
+</entry>\r\n\
+<entry\r\n   path=\"Code\\Vendor\">\r\n\
+<wc-status\r\n   item=\"external\"\r\n   props=\"none\">\r\n\
+</wc-status>\r\n\
+</entry>\r\n\
+<entry\r\n   path=\"Code\\Vendor\">\r\n\
+<wc-status\r\n   item=\"normal\"\r\n   revision=\"1938156\"\r\n   props=\"none\">\r\n\
+</wc-status>\r\n\
+</entry>\r\n\
+<entry\r\n   path=\"Code\\Vendor\\V.cs\">\r\n\
+<wc-status\r\n   item=\"normal\"\r\n   revision=\"1938156\"\r\n   props=\"none\">\r\n\
+</wc-status>\r\n\
+</entry>\r\n\
+</target>\r\n\
+</status>\r\n";
+
+#[test]
+fn node_revs_refuses_input_that_was_not_run_with_ignore_externals() {
+    // 2026-09-13 review 的 finding 3：光在文档里写「输入必须带 --ignore-externals」
+    // 等于靠调用方记得，而 parse_external_roots 要的恰恰是**不带**的输出、两者
+    // 签名又分不出来——拿同一份输出喂给两者是最自然的写法。
+    //
+    // 不拦住的后果不是报错，而是 nodeRevs 静默混进另一个仓库的 revision 序列
+    // → 永久误报失同步、初始化向导永远过不去，一切看起来都正常（spec §6.6.4 陷阱一）。
+    let err = parse_node_revs(STATUS_XML_EXTERNALS_NOT_IGNORED)
+        .expect_err("含 external 内部节点的输入必须被拒");
+    assert_eq!(err.code, "svn_xml_externals_not_ignored");
+    assert!(err.message.contains("Vendor"), "实际：{}", err.message);
+}
+
+#[test]
+fn node_revs_still_accepts_a_properly_ignored_status_with_an_external_root() {
+    // 对照组：带 --ignore-externals 时 external 根**仍然出现**（只是没有内容），
+    // 所以判据不能是「有没有 item=external」——那会把正常输入也拒掉。
+    // STATUS_XML 里就有一条 Code\Vendor 的 external 根。
+    let revs = parse_node_revs(STATUS_XML).unwrap();
+    assert_eq!(revs.len(), 1);
+}
+
+#[test]
+fn the_guard_holds_against_real_svn_output_in_both_directions() {
+    // 上面两条用的是我手写的常量——常量是照实测抄的，但「照着抄」和「真的成立」
+    // 是两回事（`AGENTS.md` §14.1：自造 fixture 不会包含设计者没想到的东西）。
+    // 这条拿**真实 svn 输出**把两个方向都过一遍。
+    let fx = svn_repo_with_cross_repo_nested_external();
+    let wc = fx.wc_str();
+
+    // 正确用法：带 --ignore-externals → 通过，且是单值
+    let good = run_svn(
+        &wc,
+        &["status", "-v", "--xml", "--ignore-externals", "--", "Code"],
+    )
+    .unwrap();
+    let revs = parse_node_revs(&good).expect("带 --ignore-externals 的输出必须被接受");
+    assert_eq!(revs.len(), 1, "白名单内应当是单值，实际 {revs:?}");
+
+    // 错误用法：不带 → 必须被拦下，而不是静默算出一个多值集合
+    let bad = run_svn(&wc, &["status", "-v", "--xml", "--", "Code"]).unwrap();
+    let err = parse_node_revs(&bad).expect_err("不带 --ignore-externals 的输出必须被拒");
+    assert_eq!(err.code, "svn_xml_externals_not_ignored");
 }
 
 #[test]
