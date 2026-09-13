@@ -258,6 +258,14 @@ pub struct StatusEntry {
     /// `M`）。丢掉这个字段，P1 看到的就是一个「normal」的干净节点，于是带着
     /// 一处未提交的属性改动去录基线。
     pub props: String,
+    /// `<wc-status wc-locked="true">`：该节点上有一把**未释放的工作副本写锁**，
+    /// 说明上一次 svn 操作没跑完（文本版 status 的第三列 `L`）。
+    ///
+    /// 与 `item == "incomplete"` 是**两件不同的事**，P3 两个都要查
+    /// （2026-09-14 实测）：`svn cleanup` 清掉这把锁，却**不会**清掉
+    /// `incomplete`。只查锁的话，用户跑完 cleanup 就能带着一棵没更新完的树
+    /// 通过校验。
+    pub wc_locked: bool,
 }
 
 /// 解析 `svn status --xml`，列出每一条 entry。
@@ -299,6 +307,9 @@ pub fn parse_status_entries(xml: &str) -> Result<Vec<StatusEntry>> {
             path,
             item: attr(&st, "item")?,
             props: attr(&st, "props")?,
+            // 没锁时这个属性根本不出现，所以这里只能用「有且等于 true」判定，
+            // 不能像 item / props 那样要求它必须存在。
+            wc_locked: st.attribute("wc-locked") == Some("true"),
         });
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));

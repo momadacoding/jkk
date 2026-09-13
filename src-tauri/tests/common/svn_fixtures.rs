@@ -29,6 +29,17 @@ fn run(dir: &Path, program: &str, args: &[&str]) {
     );
 }
 
+/// 允许失败的 svn 调用，返回是否成功。构造「操作半路失败」的 fixture 要用。
+fn try_svn(dir: &Path, args: &[&str]) -> bool {
+    Command::new("svn")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("svn 起不来：{e}"))
+        .status
+        .success()
+}
+
 /// Windows 上 `file://` URL 是 `file:///C:/path`（三斜杠 + 盘符 + 正斜杠）。
 /// 这是已知跨平台坑，不能靠路径拼接碰运气（spec §14.1）。
 pub fn file_url(p: &Path) -> String {
@@ -137,5 +148,246 @@ pub fn svn_repo_with_cross_repo_nested_external() -> SvnFixture {
         &["commit", "-m", "nested external", "--non-interactive"],
     );
     run(&wc, "svn", &["update", "--non-interactive"]);
+    fx
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1b：初始化向导的前置校验（P1 / P2 / P3）要拦的各种形态
+// ---------------------------------------------------------------------------
+
+/// P1 要拦住的四种脏。逐个造出来，而不是只造一个 `M` 就宣称「覆盖了 P1」
+/// （`AGENTS.md` §13 rubric #9）。
+#[derive(Debug, Clone, Copy)]
+pub enum DirtyKind {
+    /// 内容被改过，没提交。
+    Modified,
+    /// 白名单目录里多出一个没纳入版本控制的 `.cs`。
+    Unversioned,
+    /// `svn add` 了但没提交。
+    Added,
+    /// `svn delete` 了但没提交。
+    Deleted,
+}
+
+/// 在 [`svn_repo`] 的基础上制造一种脏状态。
+pub fn svn_repo_dirty(kind: DirtyKind) -> SvnFixture {
+    let fx = svn_repo();
+    let wc = fx.wc();
+    match kind {
+        DirtyKind::Modified => {
+            std::fs::write(wc.join("Code/A.cs"), "changed\n").unwrap();
+        }
+        DirtyKind::Unversioned => {
+            std::fs::write(wc.join("Code/New.cs"), "n\n").unwrap();
+        }
+        DirtyKind::Added => {
+            std::fs::write(wc.join("Code/Added.cs"), "x\n").unwrap();
+            run(&wc, "svn", &["add", "Code/Added.cs", "--non-interactive"]);
+        }
+        DirtyKind::Deleted => {
+            run(&wc, "svn", &["delete", "Code/B.cs", "--non-interactive"]);
+        }
+    }
+    fx
+}
+
+/// `svn:ignore` 掉一个 `.cs`，再把那个文件造出来。
+///
+/// 这是 `--no-ignore` 存在的理由（spec §6.5）：不带它 `svn status` 根本不报这个
+/// 文件，而它匹配白名单的扩展名、**git 照收**——录进基线就是一个 SVN 里不存在
+/// 的文件，交付时必然对不上。
+pub fn svn_repo_with_svn_ignored_cs() -> SvnFixture {
+    let fx = svn_repo();
+    let wc = fx.wc();
+    run(
+        &wc,
+        "svn",
+        &[
+            "propset",
+            "svn:ignore",
+            "Generated.cs",
+            "Code",
+            "--non-interactive",
+        ],
+    );
+    run(
+        &wc,
+        "svn",
+        &["commit", "-m", "ignore Generated.cs", "--non-interactive"],
+    );
+    run(&wc, "svn", &["update", "--non-interactive"]);
+    std::fs::write(wc.join("Code/Generated.cs"), "g\n").unwrap();
+    fx
+}
+
+/// `svn:ignore` 掉构建产物目录，再把产物造出来。
+///
+/// **误报对照组。** 它同样是「SVN 忽略、且不在版本控制里」，但扩展名不在白名单里
+/// ——git 不会收它，录基线不受影响。P1 若一刀切地把所有 ignored 条目判成脏，
+/// 任何一个正常开发机上的工作副本都过不去，向导变成摆设。
+pub fn svn_repo_with_ignored_build_output() -> SvnFixture {
+    let fx = svn_repo();
+    let wc = fx.wc();
+    run(
+        &wc,
+        "svn",
+        &["propset", "svn:ignore", "obj", "Code", "--non-interactive"],
+    );
+    run(
+        &wc,
+        "svn",
+        &["commit", "-m", "ignore obj", "--non-interactive"],
+    );
+    run(&wc, "svn", &["update", "--non-interactive"]);
+    std::fs::create_dir_all(wc.join("Code/obj")).unwrap();
+    std::fs::write(wc.join("Code/obj/out.dll"), "bin\n").unwrap();
+    fx
+}
+
+/// 建一个有三个 revision 的仓库，返回它的 `file://` URL。`Code/A.cs` 每次都改。
+fn seed_three_revisions(root: &Path) -> String {
+    run(root, "svnadmin", &["create", "repo"]);
+    let url = file_url(&root.join("repo"));
+    run(
+        root,
+        "svn",
+        &["checkout", &url, "seed", "--non-interactive"],
+    );
+    let seed = root.join("seed");
+    std::fs::create_dir_all(seed.join("Code")).unwrap();
+    std::fs::write(seed.join("Code/A.cs"), "v1\n").unwrap();
+    std::fs::write(seed.join("Code/B.cs"), "v1\n").unwrap();
+    run(&seed, "svn", &["add", "Code", "--non-interactive"]);
+    run(&seed, "svn", &["commit", "-m", "r1", "--non-interactive"]);
+    std::fs::write(seed.join("Code/A.cs"), "v2\n").unwrap();
+    run(&seed, "svn", &["commit", "-m", "r2", "--non-interactive"]);
+    std::fs::write(seed.join("Code/A.cs"), "v3\n").unwrap();
+    run(&seed, "svn", &["commit", "-m", "r3", "--non-interactive"]);
+    url
+}
+
+/// **真正的 mixed-revision**：整体在 r3，`Code/A.cs` 被单独退回 r1。
+///
+/// 2026-09-14 实测：`svn info .` 的 revision = 3，`nodeRevs` = `{1, 3}`。
+/// P2 必须拒绝。
+pub fn svn_repo_mixed_revision() -> SvnFixture {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let url = seed_three_revisions(&root);
+    run(
+        &root,
+        "svn",
+        &["checkout", &url, "wc1", "--non-interactive"],
+    );
+    let wc = root.join("wc1");
+    run(
+        &wc,
+        "svn",
+        &["update", "-r1", "--non-interactive", "--", "Code/A.cs@"],
+    );
+    SvnFixture { dir }
+}
+
+/// **rootRev 落后，但 nodeRevs 是单值**：根留在 r1，只把 `Code` 子树更到 r3。
+///
+/// 2026-09-14 实测：`svn info .` 的 revision = 1，`nodeRevs` = `{3}`
+/// ——正是 spec §6.5.1 描述的那个形态。
+///
+/// P2 **必须放行**，而基线 trailer 的 rev 必须取 3。取成 `svn info .` 的 1，
+/// 初始化**完成的那一瞬间**就判失同步。
+pub fn svn_repo_root_rev_behind() -> SvnFixture {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let url = seed_three_revisions(&root);
+    run(
+        &root,
+        "svn",
+        &["checkout", "-r1", &url, "wc1", "--non-interactive"],
+    );
+    let wc = root.join("wc1");
+    run(&wc, "svn", &["update", "--non-interactive", "--", "Code@"]);
+    SvnFixture { dir }
+}
+
+/// 一个 `svn update` 被打断在半路的工作副本。
+///
+/// # 怎么稳定地造出来
+///
+/// Windows 上用 `FileShare::None` 独占占住一个**待更新**的文件，`svn update`
+/// 走到那一项时必然失败（2026-09-14 实测：`E155009: Failed to run the WC DB
+/// work queue` + `E720005: Can't move … Access is denied`）。不依赖时序、
+/// 不需要杀进程，每次都能复现。
+///
+/// 留下的痕迹（`svn status --depth=empty --xml` 打在工作副本根上）：
+/// `wc-locked="true"` **和** `item="incomplete"` 两个都在。
+#[cfg(windows)]
+pub fn svn_repo_interrupted_update() -> SvnFixture {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    run(&root, "svnadmin", &["create", "repo"]);
+    let url = file_url(&root.join("repo"));
+    run(
+        &root,
+        "svn",
+        &["checkout", &url, "wc1", "--non-interactive"],
+    );
+    let wc = root.join("wc1");
+    std::fs::create_dir_all(wc.join("Code")).unwrap();
+    for i in 1..=8 {
+        std::fs::write(wc.join(format!("Code/F{i}.cs")), "v1\n").unwrap();
+    }
+    run(&wc, "svn", &["add", "Code", "--non-interactive"]);
+    run(&wc, "svn", &["commit", "-m", "r1", "--non-interactive"]);
+    run(&wc, "svn", &["update", "--non-interactive"]);
+
+    // 另一个工作副本提交 r2，让 wc1 落后一个 revision，于是 update 真的有活干
+    run(
+        &root,
+        "svn",
+        &["checkout", &url, "wc2", "--non-interactive"],
+    );
+    let wc2 = root.join("wc2");
+    for i in 1..=8 {
+        std::fs::write(wc2.join(format!("Code/F{i}.cs")), "v2\n").unwrap();
+    }
+    run(&wc2, "svn", &["commit", "-m", "r2", "--non-interactive"]);
+
+    {
+        let _hold = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(wc.join("Code/F5.cs"))
+            .expect("独占打开失败");
+        assert!(
+            !try_svn(&wc, &["update", "--non-interactive"]),
+            "fixture 前提不成立：被独占占住的文件居然更新成功了"
+        );
+    }
+    SvnFixture { dir }
+}
+
+/// [`svn_repo_interrupted_update`] 之后又跑了一次 `svn cleanup` 的工作副本。
+///
+/// # 为什么单独造这一个
+///
+/// 这是**最现实**的那个场景：update 失败，SVN 提示 "run cleanup"，用户照做了，
+/// 以为好了。2026-09-14 实测，cleanup 之后：
+///
+/// | 观察点 | 结果 |
+/// |---|---|
+/// | `wc-locked` | **没了**（cleanup 就是干这个的） |
+/// | 工作副本根的 `item` | **仍然是 `incomplete`** |
+/// | 白名单根 `Code@` 的 status | **一条 entry 都没有，看起来完全干净** |
+/// | `nodeRevs` | 单值，P2 放行 |
+///
+/// 也就是说 P1、P2 全绿，只有工作副本根还写着 incomplete。P3 若只查白名单根，
+/// 就会在这个最该拦住的场景下放行。
+#[cfg(windows)]
+pub fn svn_repo_incomplete_after_cleanup() -> SvnFixture {
+    let fx = svn_repo_interrupted_update();
+    run(&fx.wc(), "svn", &["cleanup", "--non-interactive"]);
     fx
 }

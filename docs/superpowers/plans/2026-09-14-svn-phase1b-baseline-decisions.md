@@ -15,7 +15,7 @@
 | 0 开工自检与基线数字 | ✅ 完成 | 本文件、`2026-09-14-svn-phase1b-baseline.md` | 改动前基线（新 worktree 内实测）：Rust **316 passed / 0 failed / 28 个二进制**、前端 `pnpm test` **272 passed / 21 files**、`pnpm build` ✓。与计划预期一致 |
 | 1 `git_cli` 支持环境变量 | ✅ 完成 | `src-tauri/src/engine/git_cli.rs`、`src-tauri/tests/git_cli.rs` | `cargo test --test git_cli` 5 passed；全量 `cargo test -j 2` **318 passed / 0 failed / 28 个二进制**（= 基线 316 + 新增 2）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓ |
 | 2 `svn_xml` 三个新解析器 | ✅ 完成 | `src-tauri/src/engine/svn_xml.rs`、`src-tauri/tests/svn_xml.rs` | `cargo test --test svn_xml` 27 passed；全量 **332 passed / 0 failed / 28 个二进制**（= 318 + 新增 14）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓ |
-| 3 P1/P2/P3 硬门槛 | ⬜ 未开始 | | |
+| 3 P1/P2/P3 硬门槛 | ✅ 完成 | `svn_preflight.rs`（新）、`svn_xml.rs`、`svn_wc.rs`、`engine/mod.rs`、`tests/svn_preflight.rs`（新）、`tests/common/svn_fixtures.rs` | `cargo test --test svn_preflight` 10 passed；全量 **342 passed / 0 failed / 29 个二进制**（= 332 + 新增 10）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓；另做了一轮变异测试验证两条关键断言有牙 |
 | 4 P5 externals 钉死检测 | ⬜ 未开始 | | |
 | 5 基线录制（临时索引 / trailer） | ⬜ 未开始 | | |
 | 6 §6.8 基线体检 | ⬜ 未开始 | | |
@@ -274,3 +274,137 @@ svn 输出的形态，手写理想 XML 等于没测」，而计划里那六段�
   `svn_repo_with_cross_repo_nested_external()`，在 `TempDir` 里自建仓库、跑完即删，
   只发 `propget`（只读）。抓形状用的探针脚本也全程在 `%TEMP%` 的一次性 fixture 上，
   `finally` 里 `Remove-Item -Recurse`，没有碰本仓库或任何真实 SVN 工作副本。
+
+---
+
+## Task 3：P1 / P2 / P3 三道硬门槛
+
+新增 `engine/svn_preflight.rs`，对外只有
+`run_preflight(repo_root, cfg) -> Result<Preflight>`。
+
+### ⚠️ 需要用户确认的一个判断
+
+**P1 对 SVN-ignored 文件的判据，我按 spec 的理由而不是字面表述来实现了。**
+
+spec §6.5 写的是「不允许存在 M/A/D/R/C/!/~/? 任何一种」，并要求带 `--no-ignore`，
+理由原文是「svn status 默认隐藏 SVN-ignored 文件，**而那些文件 git 照收**」。
+
+照字面最省事的实现是「任何 ignored 条目都判脏」。但那样一来，任何一台装了 IDE 的
+开发机都过不去——`Code/obj/`、`Code/bin/` 这类构建产物几乎必然存在且被
+`svn:ignore`，而它们**根本不匹配白名单的扩展名，git 不会收**，录基线不受任何影响。
+硬拦的结果是向导在真实环境里变成摆设，而且给出的引导（「去 TortoiseSVN 提交或还原」）
+对一个构建产物目录毫无意义。
+
+所以实现成：**`ignored` / `unversioned` 只在该路径落在 `expected_set`（W-file 集合）
+里时才算脏**。这正好是 spec 给的理由——判据是 git 收不收。配了一对测试：
+
+| 测试 | fixture | 期望 |
+|---|---|---|
+| `p1_must_pass_no_ignore_or_svn_ignored_files_slip_through` | `svn:ignore Generated.cs` + 造出该文件 | **拒绝**（匹配 `.cs`，git 会收） |
+| `p1_does_not_false_alarm_on_ignored_files_git_would_not_take` | `svn:ignore obj` + 造出 `Code/obj/out.dll` | **放行**（git 不收） |
+
+能这么做的前提是 `expected_set` 不需要 `.git` 存在（`ignore_case` 有 `Err(_) => false`
+兜底），而 P1 跑在 `git init` **之前**——这一点是硬约束，改动 `expected_set` 时不能破坏。
+
+**这是我替 spec 做的一个收窄。如果 §6.5 的本意就是一刀切硬拦，这里要改回去。**
+
+#### 偏离计划
+
+- **签名从 `run_preflight(repo_root, whitelist: &[String])` 改成
+  `run_preflight(repo_root, cfg: &SvnConfig)`。** 上面那条判据要用 `extensions`
+  才能算出 W-file 集合，光有白名单不够。
+
+- **`WcIdentity` 加了 `wc_root_abspath: Option<String>`；`svn_wc::peg_safe` 改成
+  `pub`。** P3 要查的是**工作副本根**，而 `enumerate_wcs` 里 `parse_info` 早就把
+  `<wcroot-abspath>` 解析出来了、然后丢在地上。捡起来是零额外命令；不捡的话每条
+  白名单要多发一次 `svn info`。`WcIdentity` 只有一个构造点（`enumerate_wcs`），
+  测试里没有结构体字面量，加字段不破坏任何调用方。
+
+- **`StatusEntry` 又加了一个字段 `wc_locked: bool`**（Task 2 刚定的结构体）。
+  理由同 `props`：`svn_xml` 是唯一接触 XML 的地方，这里不取，P3 就拿不到。
+
+- **执行顺序不按 P1→P2→P3→P4 的编号，而是
+  枚举 → P4 → P3 → P1 → P2。** 理由写在 `run_preflight` 的 doc 表格里。
+  其中 **P1 必须先于 P2** 是 Task 2 实测出来的硬约束（`added` 节点带
+  `revision="-1"`，会进 `nodeRevs` 把它变成多值 → 用户拿到一条做了也没用的引导）。
+
+- **P3 没有走计划给的降级退路。** 计划写着「造一个中断的 update 很难，若确认造不出
+  稳定 fixture，就降级为读 `svn status` 是否报 `L`（locked）并如实写明覆盖范围」。
+  实测既造得出来，而且**证明了只读 `L` 是不够的**（见下）。所以没降级。
+
+#### 计划的错误
+
+- **Step 1 的测试代码编译不过。** 原文是：
+
+  ```rust
+  let err = run_preflight(...).unwrap_or_else(|e| panic!(...)).err().unwrap_or_else(...)
+  ```
+
+  对一个 `Result` 先 `unwrap_or_else` 拿到 `Preflight`，再对它调 `.err()` ——
+  类型就不对。实际改成 `let Err(err) = run_preflight(...) else { panic!(...) };`。
+
+- **Step 2 的 P2 测试自相矛盾。** 它同时断言「`nodeRevs` 多值，P2 必须拒绝」和
+  `assert_ne!(root_rev, 3)`（潜台词是 `nodeRevs == {3}` 单值）。这是**两个不同的
+  形态，需要两个 fixture**，一个计划里的测试同时做不到：
+
+  | fixture | 造法 | 实测结果 | P2 应当 |
+  |---|---|---|---|
+  | `svn_repo_mixed_revision` | 整体 r3，`Code/A.cs` 单独 `update -r1` | rootRev=3，nodeRevs={1,3} | **拒绝** |
+  | `svn_repo_root_rev_behind` | `checkout -r1`，只 `update Code` | rootRev=1，nodeRevs={3} | **放行**，且 `node_rev` 必须是 3 |
+
+  后者才是 spec §6.5.1 那个陷阱的真实形态（「照 rootRev 取 rev，初始化完成的那一
+  瞬间就判失同步」），也是更有价值的那条。拆成了两条测试。
+
+#### 计划没写的坑
+
+- **`svn cleanup` 清掉写锁，但清不掉 `incomplete`。** 这是 P3 的全部要害。
+  2026-09-14 实测（Windows 上用 `FileShare::None` 独占占住一个待更新的文件，
+  让 `svn update` 中途失败）：
+
+  | 状态 | 工作副本根 `--depth=empty` | 白名单根 `Code@` |
+  |---|---|---|
+  | 干净 | 无 entry | 无 entry |
+  | update 半路失败 | `wc-locked="true"` + `item="incomplete"` | 只有 `wc-locked` |
+  | **跑完 `svn cleanup`** | **仍是 `item="incomplete"`** | **一条 entry 都没有** |
+  | 再跑一次完整 update | 无 entry | 无 entry |
+
+  第三行是最现实的场景：update 失败 → SVN 提示 run cleanup → 用户照做 → 以为好了。
+  **那时 P1 全绿、P2 单值、白名单根 status 完全干净**，只有工作副本根还写着
+  incomplete。所以 P3 必须（a）查工作副本根而不是白名单根，（b）`wc-locked` 和
+  `incomplete` 两个都查。计划给的降级方案「只读 `L`」恰好在这个场景下失效。
+
+- **造「update 半路失败」的稳定办法**：Windows 上
+  `OpenOptions::new().share_mode(0).open(victim)` 独占占住一个待更新的文件，
+  `svn update` 走到那一项必然失败（`E155009: Failed to run the WC DB work queue`
+  + `E720005: Can't move … Access is denied`）。不依赖时序、不用杀进程，每次都复现。
+  这个 fixture 是 `#[cfg(windows)]` 的，与 `tests/fixtures.rs` 里
+  `make_dangling_link` 的做法一致。
+
+- **P2 的错误信息必须按「白名单是否落在 external 内」分两种说法。** 计划的 ⚠️ 提到了，
+  这里记下判据：`WcIdentity.wc_root_abspath` 与仓库根不同即说明落进了 external。
+  落在 external 里时「先跑一次完整 svn update」是一条**永远无效**的引导。
+
+- **我这一轮先写测试后写实现，中间没跑红**——十条测试第一次跑就全绿，这本身是个
+  不可信的信号。补做了一轮**变异测试**：
+  - 把 `item == "incomplete"` 那条判据短路掉 → 只有
+    `p3_still_rejects_after_the_user_ran_svn_cleanup` 失败，
+    `p3_rejects_a_working_copy_left_mid_update` 仍然通过（它被 `wc_locked` 兜住）。
+    这正好证明「cleanup 之后那条」是不可替代的。
+  - 把 `expected.contains(&e.path)` 短路成恒真 → 只有
+    `p1_does_not_false_alarm_on_ignored_files_git_would_not_take` 失败。
+
+  两次变异都只打掉对应的那一条，别的全绿。变异已撤销，撤销后全量 342 passed。
+
+#### 为什么这么改是安全的
+
+- **本任务不发任何写命令。** `run_preflight` 只跑 `svn info` 和 `svn status`
+  （三种参数组合），全是只读；没有 `update`、`revert`、`cleanup`、`commit`。
+  spec §6.5 明确要求「不自动规范化——revert 用户的本地修改是破坏性的」，
+  实现里没有任何一条会改动用户工作副本的路径。
+- 新 fixture 全部在 `TempDir` 里 `svnadmin create` 自建仓库，跑完即删；
+  `svn_repo_interrupted_update` 会**故意**让一次 update 失败，但那是在自己刚建的
+  一次性工作副本上，且 `assert!` 了「失败」正是预期（成功反而是 fixture 前提不成立）。
+- 对 1a 既有代码只做了加法：`WcIdentity` 加字段、`peg_safe` 提升可见性、
+  `StatusEntry` 加字段。没有改动任何既有函数的行为。全量
+  `cargo test -j 2` = 342 passed / 0 failed / 29 个二进制，相对 Task 2 的 332
+  多的正好是新增的 10 条，无回归。
