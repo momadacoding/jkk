@@ -52,9 +52,26 @@ pub fn expected_set(
 /// 期望集合若死板地按大小写敏感算，就会在一个完全正常的仓库上把它报成
 /// 「不该被跟踪却跟踪了」——**误报阻断**。同一台机器上仓库落在大小写敏感的卷、
 /// 或用户显式设成 `false` 时，行为又反过来，所以只能问 git。
+///
+/// # 必须让 git 自己做布尔解析（`--bool`）
+///
+/// git 认的真值不止字面量 `true`。2026-09-14 实测 `git config --bool` 的归一化：
+///
+/// | 配置值 | `--get` 原样返回 | `--bool --get` |
+/// |---|---|---|
+/// | `1` / `yes` / `on` / `True` | 原样 | `true` |
+/// | `0` / `no` / `off` / `false` | 原样 | `false` |
+/// | 非法值（如 `banana`） | 原样 | exit 128，stdout 空 |
+///
+/// 原来这里只认字符串 `"true"`，于是 `core.ignoreCase=1` 时：git 照常把
+/// `Code/Loud.CS` 纳入（实测 `ls-files` 列它），期望集合却按大小写敏感算、
+/// 不含它 → 核对报「不该被跟踪、实际跟踪了」并硬阻断，而仓库完全正常。
+///
+/// 非法值落到 `false`：stdout 为空，与「键不存在」同一条路径。git 自己也会
+/// 在别处对这个值报错，这里不必再造一种失败形态。
 fn ignore_case(repo_root: &str) -> bool {
-    // 键不存在时 `git config --get` 退出 1，走 run_git_code 免得被当成失败
-    match run_git_code(repo_root, &["config", "--get", "core.ignoreCase"]) {
+    // 键不存在时 `git config` 退出 1，走 run_git_code 免得被当成失败
+    match run_git_code(repo_root, &["config", "--bool", "--get", "core.ignoreCase"]) {
         Ok((_, out)) => out.trim().eq_ignore_ascii_case("true"),
         Err(_) => false,
     }
@@ -238,7 +255,10 @@ pub fn verify_include_set(
     if !unexpected.is_empty() {
         msg.push_str("\n不该被跟踪、实际跟踪了：\n");
         for f in unexpected.iter().take(20) {
-            msg.push_str(&format!("  {f}\n"));
+            // 这一侧同样要指认规则——用户想知道的正是「凭什么它进来了」。
+            // 这些文件必然已在索引里，所以 `blame_rule` 的 `--no-index` 是前提。
+            let who = blame_rule(repo_root, f).unwrap_or_else(|_| "（查不到裁决规则）".into());
+            msg.push_str(&format!("  {f}   ← {who}\n"));
         }
         if unexpected.len() > 20 {
             msg.push_str(&format!("  …还有 {} 条\n", unexpected.len() - 20));
@@ -251,10 +271,31 @@ pub fn verify_include_set(
 ///
 /// `--non-matching` 让它对**没被忽略**的文件也给出裁决规则（形如
 /// `.git/info/exclude:5:!/Code/**/*`），于是两个方向都能指认。
+///
+/// # `--no-index` 不能省
+///
+/// 「多收」方向的文件**必然已经在索引里**，而 `git check-ignore` 默认会先看
+/// 索引：已跟踪的文件它一律当成「没有规则管得着」。2026-09-14 实测同一个文件
+/// （`Code/Junk.psd`，被 `/Code/**` 排除，用 `git add -f` 强行入索引）：
+///
+/// | | 输出 | exit |
+/// |---|---|---|
+/// | 无 `--no-index` | `::<TAB>Code/Junk.psd`（空裁决） | 1 |
+/// | 有 `--no-index` | `.git/info/exclude:3:/Code/**<TAB>Code/Junk.psd` | 0 |
+///
+/// 也就是说，最需要指认规则的那一侧，不带这个参数恰好什么也指认不出来。
+/// spec §6.3.1 已写明要带。
 fn blame_rule(repo_root: &str, file: &str) -> Result<String> {
     let (_, out) = run_git_code(
         repo_root,
-        &["check-ignore", "-v", "--non-matching", "--", file],
+        &[
+            "check-ignore",
+            "--no-index",
+            "-v",
+            "--non-matching",
+            "--",
+            file,
+        ],
     )?;
     let line = out.lines().next().unwrap_or("").trim().to_string();
     if line.is_empty() {

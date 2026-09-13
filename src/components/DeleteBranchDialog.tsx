@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { toErrorMessage } from '../engine/errors'
 import type { Capabilities } from '../engine/capabilities'
+import { deleteBranchTargets } from '../engine/deleteBranchTargets'
 
 /** 检出了待删分支的 worktree（主工作区除外）。 */
 export interface WorktreeTarget {
@@ -160,16 +161,14 @@ export function DeleteBranchDialog({
    */
   const confirm = async () => {
     if (!info || busy) return
-    // `remoteProtected` 在这里再判一次：勾选框已经禁用了，但这一步是真正
-    // 发出破坏性动作的地方，不该依赖上游控件的状态是对的
-    const remote = alsoRemote && !info.remoteProtected && info.remote && info.remoteBranch
-      ? { remote: info.remote, branch: info.remoteBranch }
-      : null
-    // 与上面 `remoteProtected` 同一个理由，再判一次能力：这一步是真正发出
-    // 破坏性动作的地方，不该依赖上游控件渲染没渲染
-    const worktreePath = capabilities.worktrees && alsoWorktree && info.worktree
-      ? info.worktree.path
-      : null
+    // 两个目标一起交给 `deleteBranchTargets` 算：这一步是真正发出破坏性动作的
+    // 地方，不该依赖上游控件禁用没禁用、渲染没渲染。以前这里是两段分开写的
+    // 三元表达式，结果 worktree 那半接上了能力判断、远程那半没有——两轮 review
+    // 才把同一个缺口的两半抓齐（见该函数的注释）。
+    const { remote, worktreePath } = deleteBranchTargets(capabilities, info, {
+      alsoRemote,
+      alsoWorktree,
+    })
     setBusy(true)
     setError(null)
     try {
@@ -207,7 +206,16 @@ export function DeleteBranchDialog({
           <span className="dlg-value"><BranchGlyph />{name}</span>
         </div>
 
-        {info?.upstream && (
+        {/* 后端不声明 remotes 时不给入口。和下面 worktree 那半同一个理由：
+            灰着或干脆不出现都行，但不能一声不吭——用户会以为这个仓库没有上游 */}
+        {info?.upstream && !capabilities.remotes && (
+          <div className="dlg-note">
+            该分支有上游 {info.upstream}，但当前仓库模式下本应用不管理远程分支。
+            本地分支照样可以删；远程那条请在别处处理。
+          </div>
+        )}
+
+        {info?.upstream && capabilities.remotes && (
           <>
             <label className="dlg-field dlg-check">
               <input

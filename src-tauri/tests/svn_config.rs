@@ -302,3 +302,29 @@ fn an_empty_whitelist_is_a_no_op_here() {
     let dir = disk_fixture();
     validate_whitelist_against_disk(dir.path().to_str().unwrap(), &[]).unwrap();
 }
+
+#[test]
+fn a_missing_entry_only_skips_itself_and_the_rest_is_still_checked() {
+    // 「路径不存在时不报错」原本写成了 `return Ok(())`——那是**整函数返回**，
+    // 于是第一条不存在的条目会把它后面所有条目的校验一并放行。
+    // 独立 review 给的反例：`["Missing/", "Code"]` 通过，而 `Code` 单独送进来
+    // 是被拒的（漏尾斜杠 → 整棵树绕开扩展名过滤）。
+    let dir = disk_fixture();
+    let root = dir.path().to_str().unwrap();
+
+    // 前提断言：这条错误本身确实抓得到，否则下面测的就不是短路
+    validate_whitelist_against_disk(root, &["Code".to_string()])
+        .expect_err("前提不成立：Code 漏尾斜杠本就该被拒");
+
+    let err = validate_whitelist_against_disk(root, &["Missing/".to_string(), "Code".to_string()])
+        .expect_err("前面有条目不存在，不能让后面的错误蒙混过关");
+    assert_eq!(err.code, "svn_config");
+    assert!(err.message.contains("Code"), "实际：{}", err.message);
+
+    // 大小写错误同样不能被前面的缺失条目掩盖
+    validate_whitelist_against_disk(root, &["Missing/".to_string(), "code/".to_string()])
+        .expect_err("大小写错误不能被前面的缺失条目掩盖");
+
+    // 反向：缺失条目本身仍然不报错，跳过的只是它自己
+    validate_whitelist_against_disk(root, &["Missing/".to_string(), "Code/".to_string()]).unwrap();
+}

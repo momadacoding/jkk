@@ -29,7 +29,7 @@
 | 6 纳入集合核对 | ✅ 完成 | `engine/svn_include_check.rs`、`engine/mod.rs`、`tests/svn_exclude.rs`（追加） | fmt ✓ clippy 零告警 ✓ `--test svn_exclude` **17 passed**（9 + 8；计划写的是 3，多的 5 条见下）✓ `cargo test` **284 passed / 0 failed / 27 个二进制**（= 276 + 8） |
 | 7 仓库识别 / capabilities / backend_for 分流 | ✅ 完成 | `vcs/mod.rs`、`vcs/git.rs`、`vcs/svn.rs`、`commands/repo.rs`、`lib.rs`、`tests/svn_backend.rs` | fmt ✓ clippy 零告警 ✓ `--test svn_backend` **11 passed**（计划写的是 9）✓ `cargo test` **295 passed / 0 failed / 28 个二进制**（= 284 + 11）。⚠️ 两个新 Tauri 命令的真实窗口验证在 Task 9 |
 | 8 前端按能力隐藏入口 | ✅ 完成 | `src/engine/capabilities.ts`、`src/engine/toolbarActions.ts`、`src/engine/commitActions.ts`、`src/store/repoStore.ts`、`RepoTab.tsx`、`BranchView.tsx`、`GraphView.tsx`、`Toolbar.tsx`、`tests/vitest/capabilities.test.ts`、`tests/vitest/commitActions.test.ts` | `pnpm build`（含 tsc）✓ `pnpm test` **266 passed / 20 files**（= 257 + 9；计划写的是 3）。⚠️ 真实窗口验证在 Task 9 |
-| 9 收尾验证 | 🟡 进行中 | 本文件、`svn_xml.rs`、`svn_config.rs`、`svn_exclude.rs`、`svn_include_check.rs`、`svn_cli.rs`、`vcs/svn.rs`、`DeleteBranchDialog.tsx`、`BranchView.tsx` + 各自测试 | 9.1 ✓ 9.2 ✓ 9.3 ✓ **9.6 独立 review 已完成：2 条阻断 + 7 条应修，逐条核实全部成立，已全部修完**。全套：Rust **312 passed / 0 failed / 28 个二进制**、fmt ✓ clippy 零告警；前端 `pnpm build` ✓ `pnpm test` **266 passed / 20 files**。⬜ **9.4 真实窗口验证待用户执行**（fixture 已备好，见 9.4 一节） |
+| 9 收尾验证 | 🟡 进行中 | 本文件、`svn_xml.rs`、`svn_config.rs`、`svn_wc.rs`、`svn_exclude.rs`、`svn_include_check.rs`、`svn_cli.rs`、`vcs/svn.rs`、`engine/deleteBranchTargets.ts`、`DeleteBranchDialog.tsx`、`BranchView.tsx` + 各自测试 | 9.1 ✓ 9.2 ✓ 9.3 ✓ **9.6 第一轮独立 review：2 条阻断 + 7 条应修，全部核实成立并修完**。**9.7 第二轮独立 review：4 条 P2，全部实测复核成立并修完**。**9.8 master 上的 spec 更新（`310c17d`）已比对，三处落在本期地盘：一处已修入、一处不需改代码、一处记账给 1b**。全套：Rust **316 passed / 0 failed / 28 个二进制**、fmt ✓ clippy exit 0；前端 `pnpm build` ✓ `pnpm test` **272 passed / 21 files**。⬜ **9.4 真实窗口验证待用户执行**（fixture 已备好，见 9.4 一节） |
 
 ### 开工自检（`AGENTS.md` §4.2）
 
@@ -148,6 +148,19 @@ reviewer 另外排除了两条疑虑，一并记下免得以后重新怀疑：`c
   这条 Phase 0 已经记过一次，本期沿用同样的处理：切 worktree **之前**先把 spec 修订
   （`150ddad`）与本计划（`02f8d45`）push 到 `origin/master`，走 `AGENTS.md` §4.1 的
   纯文档例外。切入后已实测基点确实是 `02f8d45`，计划与修订后的 spec 都在。
+
+- **SVN 的 peg revision 解析吃掉路径里的 `@`，`--` 挡不住。** 计划全程把
+  `--` 当成「target 到此为止」的万能护栏，但那只管「这之后不是选项」。合法目录名
+  `Code/Team@Home` 会让 `svn info` 报 `E205000`、`svn status` 报 `E200009`。
+  修法是无条件追加空 peg 后缀 `@`——实测不含 `@` 的普通路径也接受这个后缀，
+  所以不需要条件分支（条件分支会被忘掉，恒等变换不会）。详见 9.7。
+
+- **git 的布尔配置不只有 `true` 这一种写法。** `1` / `yes` / `on` 都是真值。
+  凡是读 git 配置做判断的地方都要让 git 自己解析（`git config --bool`），
+  不要字符串比对。详见 9.7。
+
+- **`git check-ignore` 默认先看索引，对已跟踪文件一律吐空裁决。** 想问「这个
+  已经进了索引的文件凭什么进来」必须带 `--no-index`。详见 9.7。
 
 #### 为什么这么改是安全的
 
@@ -822,7 +835,7 @@ grep -c "commands::" src-tauri/src/lib.rs                     → 46
 | A2 | 应修 | **目录条目漏写尾斜杠 → 静默变成「整棵树不过扩展名过滤」。** 尾斜杠是「目录 vs 单文件」的唯一区分，而单文件条目不过扩展名过滤，于是 `"Assets/Scripts"`（少一个 `/`）会把整棵子树收进 git。没有任何一层校验它和磁盘上的实际类型对不对得上 | 新增 `validate_whitelist_against_disk`，`SvnGitBackend::open` 里调用 |
 | A3 | 应修 | **Windows 大小写只处理了一半。** git 的忽略规则匹配大小写不敏感、**但 pathspec 匹配是敏感的**。`"code/"` 这种写法下 git 照常跟踪 `Code/Top.cs`，而 `git ls-files -- code/` 返回空 → 在一个工作完全正常的仓库上报「应当被跟踪、实际没有」 | 同上那道校验里逐段比对磁盘上的真实大小写。**不能用 `Path::exists()` 判**——NTFS 不区分大小写，只能列目录逐项比 |
 | A4 | 应修 | `p.is_dir()` 跟随 junction，junction 成环时递归没有出口 → 栈溢出 → Rust abort → **整个 Tauri 应用凭空消失** | 见下方「计划没写的坑」——reviewer 给的方向对一半，我实测后走了另一条路 |
-| A5 | 应修 | **前端能力裁剪漏了一个入口。** `DeleteBranchDialog` 的「Also delete worktree」勾选框只看 `info.worktree`、不看 `capabilities.worktrees`，确认后走 `invoke('delete_worktree')`。而 `BRANCHES` 分区在任何模式下都渲染，所以这个入口在 SVN 模式下是可达的。**Task 8 里我写的「已 grep 全部 src/，这批命令的唯一入口都在已裁剪的组件里」因此不准确** | 把 `capabilities` 传进弹框：不支持时不渲染勾选框、`useEffect` 里不默认勾上、`confirm()` 里再判一次（与已有的 `remoteProtected` 同一个模式），并给一条说明告诉用户该去哪儿处理 |
+| A5 | 应修 | **前端能力裁剪漏了一个入口。** `DeleteBranchDialog` 的「Also delete worktree」勾选框只看 `info.worktree`、不看 `capabilities.worktrees`，确认后走 `invoke('delete_worktree')`。而 `BRANCHES` 分区在任何模式下都渲染，所以这个入口在 SVN 模式下是可达的。**Task 8 里我写的「已 grep 全部 src/，这批命令的唯一入口都在已裁剪的组件里」因此不准确** | 把 `capabilities` 传进弹框：不支持时不渲染勾选框、`useEffect` 里不默认勾上、`confirm()` 里再判一次（与已有的 `remoteProtected` 同一个模式），并给一条说明告诉用户该去哪儿处理。⚠️ **这个修法本身也只做了一半**——同一个 `confirm()` 里的远程那半仍然没判能力，下一轮 review 的 P2-2 抓到了，见 9.7 |
 | A6 | 应修 | `write_exclude` 用 `File::create` **先截断再写**，且无条件覆盖用户已有的 `.git/info/exclude`。写到一半失败留下的最坏形态是**缺了末尾那行 `.svn/`** ——之后一次 `git add -A` + `git checkout` 就会在正在使用的工作副本底下换掉 `wc.db` | 临时文件 + `sync_all` + `rename` 原子替换；首次接管时把含真实规则的原件备份成 `exclude.bak` |
 | A7 | 应修 | 记录瑕疵：四类条目有缺项（Task 0 缺「偏离计划」，Task 1/4/9 缺「计划的错误」）；Task 9「偏离计划」写「从 11 到 13」而实际是 14；`run_svn_injects_...` 名不副实 | 本次一并补齐，测试的修法记在 Task 1 的「计划的错误」里 |
 
@@ -847,6 +860,57 @@ grep -c "commands::" src-tauri/src/lib.rs                     → 46
 全局去重会与它分叉。环存在时本函数与 git 仍会给出不同集合，那种工作树本来就是坏的，
 **报一次集合不一致是正确行为**；这里要保证的只是不崩。环保护做过反向验证（关掉它，
 loop 测试立刻失败）。
+
+#### 9.7 第二轮独立 review（2026-09-14）
+
+又一轮独立 review，**4 条 P2，逐条实测复核全部成立，无一需要反驳，已全部修完**。
+前两条靠读代码就能确认，后两条各自在临时 fixture 上复现过。
+
+| # | 问题 | 修法 |
+|---|---|---|
+| P2-1 | **`validate_whitelist_against_disk` 遇到不存在的条目会整函数 `return Ok(())`**，把它**后面所有条目**的校验一并放行。反例 `["Missing/", "Code"]` 通过，而 `Code` 单独送进来是被拒的（漏尾斜杠 → 整棵树绕开扩展名过滤，正是上一轮 A2 要挡的东西）。「跳过这一条」写成了「跳过全部」 | 外层循环加标签，`return Ok(())` → `continue 'entries`。测试同时钉住三件事：后续条目的类型错误、大小写错误都要抓到，而缺失条目本身仍不报错 |
+| P2-2 | **能力裁剪的另一半**：`confirm()` 里 worktree 那半接了 `capabilities.worktrees`（上一轮 A5），**远程那半只看 `info.upstream`**，`remote` 的构造完全不判能力。混合仓库的 git 侧留着 remote 与上游是当前打开校验允许的，于是**正常的删除确认流程**就能调到 `delete_remote_branch`。这不是 PR 已披露的「绕过 UI 直接 invoke」，是 UI 自己走进去的 | 把两个目标的构造下沉成纯函数 `src/engine/deleteBranchTargets.ts`，勾选框渲染也加上 `capabilities.remotes` 的门与一条说明。**不是补上漏掉的那半就完**——分散写两段三元表达式正是缺口成因，收到一处才有测试可写（6 条 vitest） |
+| P2-3 | **SVN 把 target 里最后一个 `@` 之后的部分当 peg revision 解析，`--` 挡不住。** `Code/Team@Home` 是合法目录名、也过得了配置校验（`@` 不是通配符），但 `enumerate_wcs` 要发的两条命令**都**会失败 → 整个白名单条目不可用 | 新增 `peg_safe()`，两个 target 构造点都追加空 peg 后缀 `@`。递归发现的 external 从同一个 `pending` 出队，因此一并覆盖 |
+| P2-4 | **`core.ignoreCase` 只认字面量 `"true"`，而 git 的布尔解析还接受 `1` / `yes` / `on`。** 设成 `1` 时 git 照常纳入 `Code/Loud.CS`，期望集合却按大小写敏感算、不含它 → 核对在一个完全正常的仓库上报「不该被跟踪、实际跟踪了」并**硬阻断** | 改用 `git config --bool --get`，让 git 自己归一。测试把 4 个真值 + 3 个假值全跑一遍 |
+
+**实测记录（2026-09-14，临时 fixture，跑完即删）**
+
+| 实测项 | 结果 |
+|---|---|
+| `svn info --xml -- Code/Team@Home` | exit 1，`E205000: Syntax error parsing peg revision 'Home'` |
+| `svn status --xml -- Code/Team@Home` | exit 1，`E200009: a peg revision is not allowed here`（**和 info 不是同一个错**） |
+| 两者追加尾缀 `@` | 全部 exit 0，`<url>` 里没有多出来的 `@` |
+| **不含 `@` 的普通路径追加尾缀**（`svn info -- Code@`） | exit 0 —— 所以可以**无条件**追加，不必先探测 |
+| `git config --bool --get`：`1` / `yes` / `on` / `True` | 全部归一成 `true` |
+| 同上：`0` / `no` / `off` / `false` | 全部归一成 `false`；非法值 `banana` → exit 128、stdout 空 |
+| `core.ignoreCase=1` 时 `git ls-files --others -- Code` | 列出 `Code/Loud.CS` —— 误报阻断成立 |
+
+**顺带修入的一条 spec 对齐（不在 review 清单里）**：`blame_rule` 加 `--no-index`，
+并让「多收」方向也指认规则。实测同一个文件（`Code/Junk.psd`，被 `/Code/**` 排除、
+用 `git add -f` 强行入索引）：
+
+| | 输出 | exit |
+|---|---|---|
+| 无 `--no-index` | `::<TAB>Code/Junk.psd`（**空裁决**） | 1 |
+| 有 `--no-index` | `.git/info/exclude:3:/Code/**<TAB>Code/Junk.psd` | 0 |
+
+即：最需要指认规则的那一侧（用户想知道「凭什么它进来了」），不带这个参数恰好
+什么也指认不出来。原实现只在「漏收」方向调用 `blame_rule`，而那一侧的文件必然
+未跟踪，所以**今天还没踩到**——但它是个哑火的防线。新版 spec §6.3.1 已写明要带。
+
+#### 9.8 master 上的 spec 更新对本期的影响
+
+本分支基于 `02f8d45`（已含第四轮 review 的 `150ddad`），master 此后只多了
+**一个** spec 提交 `310c17d`。落在 Phase 1a 地盘的有三处：
+
+| # | spec 改动 | 对本期的影响 | 处置 |
+|---|---|---|---|
+| 1 | **§6.3.1 的核对机制重写**：从「`git ls-files` 读出实际集合」改成「**临时索引** + `git add -A -- <W-path>` + 同一份索引 `write-tree` 得到 TREE，录制时直接用这个 TREE」，并明确「不得核对一次后又重新 `git add` 另录一棵树」 | `actual_set` 走的是**纯读模拟**（`--cached ∪ --others − --deleted`），是 Task 6 就写明的偏离。Phase 1a 不录基线，TREE 那条耦合还不存在，**今天不产生错误行为** | **本期不改**。理由：临时索引的唯一消费者是 1b 的录制流程，现在建等于把 1b 的基础设施提前塞进这个 PR。但**必须记账**——1b 建了临时索引之后，模拟版就是第二个会分叉的事实源，那时删掉它、核对与录制共用一份索引。B1 已经证明「模拟 `git add -A`」这件事很容易写错 |
+| 2 | **§6.3.1 指定 `git check-ignore --no-index`** | 原实现没带，且只在「漏收」方向调用 | **已修入**，见 9.7 末尾 |
+| 3 | **§6.3.2 的 W-path / W-file 表重写**：旧硬规则「构造 git 命令参数时用 W-file，构造 SVN 命令 target 时用 W-path」被推翻，改成「**范围由操作目的决定，不由命令叫 git 还是 svn 决定**」；W-file 的定义补上「永久排除任意深度的 `.svn/` 与 `.git/`」 | 本期代码**恰好仍然符合新表**：`svn_wc` 用 W-path 做 status 扫描（新表里这仍是 W-path），`actual_set` 用 W-path 当 pathspec（新表写明「候选索引可以用 W-path 递归执行 add」），`walk` 早就在任意深度跳过 `.svn` 与 `.git` | 不需要改代码。但**旧硬规则不能再被当成判据引用**——1b 写 `revert` / `commit` 的 target 时按旧规则推理会得出错误结论（新表明确要求 `revert` 只取 W-file 且已有备份的具体文件） |
+
+§7.3.2（rebase 前置阻断）、§8（交付）、§9.4（恢复范围）的改动全部落在 Phase 1b/1c，
+本期不涉及。
 
 #### 偏离计划
 

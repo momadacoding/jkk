@@ -558,3 +558,70 @@ fn extension_matching_follows_gits_own_case_sensitivity() {
     write_rules(dir.path(), &w, &e);
     verify_include_set(dir.path().to_str().unwrap(), &w, &e).unwrap();
 }
+
+#[test]
+fn core_ignorecase_is_read_with_gits_own_boolean_parsing() {
+    // 上一条只覆盖了 `git init` 自己写的字面量 `true`。git 的布尔解析还接受
+    // `1` / `yes` / `on`（2026-09-14 实测 `git config --bool` 把这三个都归一成
+    // `true`），而原来的实现只认字符串 "true"。
+    //
+    // 于是 `core.ignoreCase=1` 时：git 照常把 `Code/Loud.CS` 纳入，期望集合却
+    // 按大小写敏感算、不含它 → 核对报「不该被跟踪、实际跟踪了」并硬阻断，
+    // 而仓库完全正常。这是**误报阻断**，不是发现问题。
+    for truthy in ["1", "yes", "on", "TRUE"] {
+        let dir = workdir();
+        run_git(dir.path(), &["config", "core.ignoreCase", truthy]);
+        fs::write(dir.path().join("Code/Loud.CS"), "x").unwrap();
+        let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
+        write_rules(dir.path(), &w, &e);
+        verify_include_set(dir.path().to_str().unwrap(), &w, &e)
+            .unwrap_or_else(|err| panic!("core.ignoreCase={truthy} 时误报：{}", err.message));
+    }
+
+    // 反向：git 认的假值也要认，否则大小写敏感的卷上会反过来漏报
+    for falsy in ["0", "no", "off"] {
+        let dir = workdir();
+        run_git(dir.path(), &["config", "core.ignoreCase", falsy]);
+        fs::write(dir.path().join("Code/Loud.CS"), "x").unwrap();
+        let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
+        write_rules(dir.path(), &w, &e);
+        let set = expected_set(dir.path().to_str().unwrap(), &w, &e).unwrap();
+        assert!(
+            !set.contains("Code/Loud.CS"),
+            "core.ignoreCase={falsy} 时期望集合不该含 Loud.CS，实际 {set:?}"
+        );
+    }
+}
+
+#[test]
+fn the_mismatch_report_names_the_rule_for_files_that_are_tracked_but_should_not_be() {
+    // 「多收」方向原来只列文件名、不指认规则，而这正是最需要指认的一侧：
+    // 用户想知道的是「凭什么它进来了」。
+    //
+    // 而且这一侧的文件**必然已在索引里**，`git check-ignore` 不带 `--no-index`
+    // 时对已跟踪文件只吐一行空裁决 `::<TAB>路径`（2026-09-14 实测，exit 1）,
+    // 带上才会给出 `.git/info/exclude:3:/Code/**`。spec §6.3.1 新版已写明要带。
+    let dir = workdir();
+    let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
+    write_rules(dir.path(), &w, &e);
+    // 强行把一个被规则排除的文件塞进索引，制造「多收」
+    run_git(dir.path(), &["add", "-f", "--", "Code/Junk.psd"]);
+
+    let err = verify_include_set(dir.path().to_str().unwrap(), &w, &e).expect_err("多收必须被抓到");
+    assert_eq!(err.code, "include_set_mismatch");
+    assert!(
+        err.message.contains("Code/Junk.psd"),
+        "实际：{}",
+        err.message
+    );
+    assert!(
+        err.message.contains("exclude:"),
+        "多收方向必须指认是哪条规则本来该挡住它，实际：{}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("::\t"),
+        "拿到的是不带 --no-index 的空裁决，实际：{}",
+        err.message
+    );
+}

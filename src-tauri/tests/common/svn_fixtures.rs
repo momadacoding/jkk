@@ -76,6 +76,24 @@ pub fn svn_repo() -> SvnFixture {
     SvnFixture { dir }
 }
 
+/// 在 [`svn_repo`] 的基础上加一个**名字里带 `@`** 的子目录。
+///
+/// SVN 把 target 里**最后一个** `@` 之后的部分当 peg revision 解析，`--` 挡不住
+/// （2026-09-14 实测：`svn info -- Code/Team@Home` → `E205000: Syntax error
+/// parsing peg revision 'Home'`；同一个 target 送给 `svn status` → `E200009:
+/// a peg revision is not allowed here`）。追加一个空的 peg 后缀 `@` 两者都通过。
+pub fn svn_repo_with_at_sign_in_path() -> SvnFixture {
+    let fx = svn_repo();
+    let wc = fx.wc();
+    std::fs::create_dir_all(wc.join("Code/Team@Home")).unwrap();
+    std::fs::write(wc.join("Code/Team@Home/C.cs"), "c\n").unwrap();
+    // fixture 自己的 `svn add` 也要过同一道坎，所以这里同样带尾缀
+    run(&wc, "svn", &["add", "Code/Team@Home@", "--non-interactive"]);
+    run(&wc, "svn", &["commit", "-m", "r2", "--non-interactive"]);
+    run(&wc, "svn", &["update", "--non-interactive"]);
+    fx
+}
+
 /// 在 [`svn_repo`] 的基础上，往 `Code/` 里挂一条指向**另一个仓库**的 external。
 ///
 /// 这是 spec §6.5.5 的场景：只查白名单根会拿到 repo1 的 UUID，P4 干净通过，

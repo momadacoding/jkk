@@ -40,7 +40,8 @@ pub fn enumerate_wcs(repo_root: &str, whitelist: &[String]) -> Result<Vec<WcIden
         }
         // ⚠️ `svn info` **不接受** `--ignore-externals`（spec §4.4）。它默认也
         // 不遍历 externals，所以这里本来就不需要那个参数。
-        let xml = run_svn(repo_root, &["info", "--xml", "--", &target])?;
+        let arg = peg_safe(&target);
+        let xml = run_svn(repo_root, &["info", "--xml", "--", &arg])?;
         let entry = parse_info(&xml)?
             .into_iter()
             .next()
@@ -54,7 +55,7 @@ pub fn enumerate_wcs(repo_root: &str, whitelist: &[String]) -> Result<Vec<WcIden
 
         // 找这棵子树里的嵌套 external 根。**这一次故意不带 `--ignore-externals`**
         // ——要的就是让它们出现（`item="external"`），见 spec §6.6.4 的枚举方式。
-        let st = run_svn(repo_root, &["status", "--xml", "--", &target])?;
+        let st = run_svn(repo_root, &["status", "--xml", "--", &arg])?;
         for rel in parse_external_roots(&st)? {
             // svn 在 Windows 上返回反斜杠（`Code\Vendor`，2026-09-13 实测）。
             // 不转换就和正斜杠形式的 `wc_root` 比不中，去重失效，这个 external
@@ -69,6 +70,33 @@ pub fn enumerate_wcs(repo_root: &str, whitelist: &[String]) -> Result<Vec<WcIden
     // 顺序稳定，便于测试与报错信息可复现
     out.sort_by(|a, b| a.wc_root.cmp(&b.wc_root));
     Ok(out)
+}
+
+/// 把一个工作副本内的路径变成安全的 svn target：**追加一个空的 peg revision
+/// 后缀 `@`**。
+///
+/// SVN 把 target 里**最后一个** `@` 之后的部分当 peg revision 解析，而 `--`
+/// 只管「这之后不是选项」，**挡不住 peg 解析**。`Code/Team@Home` 是一个完全
+/// 合法的目录名、也过得了配置校验（`@` 不是通配符），送进去却是：
+///
+/// | 命令 | 报错 |
+/// |---|---|
+/// | `svn info -- Code/Team@Home` | `E205000: Syntax error parsing peg revision 'Home'` |
+/// | `svn status -- Code/Team@Home` | `E200009: a peg revision is not allowed here` |
+///
+/// 两条 `enumerate_wcs` 都要发，所以整个白名单条目直接不可用。
+///
+/// # 为什么无条件追加，而不是「含 `@` 才加」
+///
+/// 2026-09-14 实测：**不含 `@` 的普通路径追加尾缀同样合法**（`svn info -- Code@`
+/// exit 0，`<url>` 里也没有多出来的 `@`）。无条件追加因此没有代价，却省掉了
+/// 「哪天新增一个 target 构造点忘了判断」这个缺口——条件分支是会被忘掉的，
+/// 恒等变换不会。
+///
+/// ⚠️ 只用在**命令行参数**上。`wc_root` 这类内部键必须保持原始路径：带上尾缀
+/// 会让去重比对失效，也会原样显示给用户。
+fn peg_safe(target: &str) -> String {
+    format!("{target}@")
 }
 
 /// 统一成正斜杠、去掉尾部 `/`。

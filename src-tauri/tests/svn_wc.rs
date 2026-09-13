@@ -4,7 +4,29 @@
 mod svn_fixtures;
 
 use app_lib::engine::svn_wc::{check_single_repository, enumerate_wcs};
-use svn_fixtures::{svn_repo, svn_repo_with_cross_repo_nested_external};
+use svn_fixtures::{
+    svn_repo, svn_repo_with_at_sign_in_path, svn_repo_with_cross_repo_nested_external,
+};
+
+#[test]
+fn a_whitelist_path_containing_an_at_sign_is_not_parsed_as_a_peg_revision() {
+    // `Code/Team@Home` 是完全合法的目录名，也过得了配置校验（`@` 不是通配符），
+    // 但 SVN 把 target 里最后一个 `@` 之后的部分当 peg revision 解析，**`--`
+    // 挡不住**。2026-09-14 实测：`svn info` 报 `E205000: Syntax error parsing
+    // peg revision 'Home'`，`svn status` 报 `E200009: a peg revision is not
+    // allowed here`——两条命令 `enumerate_wcs` 都要发，所以整个白名单条目不可用。
+    let fx = svn_repo_with_at_sign_in_path();
+    let wcs = enumerate_wcs(&fx.wc_str(), &["Code/Team@Home/".to_string()]).unwrap();
+    assert_eq!(wcs.len(), 1, "实际枚举到 {wcs:?}");
+    // 内部键必须是**原始**路径：那个 `@` 后缀只属于命令行，混进 wc_root 会让
+    // 去重比对失效，也会原样显示给用户
+    assert_eq!(wcs[0].wc_root, "Code/Team@Home");
+    assert!(
+        wcs[0].url.ends_with("Code/Team@Home"),
+        "实际 url={}",
+        wcs[0].url
+    );
+}
 
 #[test]
 fn a_plain_working_copy_yields_exactly_one_wc() {

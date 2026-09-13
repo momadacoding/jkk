@@ -260,8 +260,13 @@ pub fn normalize_whitelist_entry(raw: &str) -> Result<String> {
 /// 本函数只管「存在但对不上」。「配置指向了不存在的路径」是另一件事：条目可能是
 /// 用户刚从磁盘上删掉的目录，在这里硬阻断会把人锁在仓库外面。初始化向导
 /// （Phase 1b）该不该额外要求存在，由它自己决定。
+///
+/// ⚠️ **跳过的只是那一条**。这里原来写的是 `return Ok(())`，那是整函数返回：
+/// 第一条不存在的条目会把它**后面所有条目**的校验一并放行。2026-09-14 独立
+/// review 给的反例——`["Missing/", "Code"]` 通过，而 `Code` 单独送进来是被拒的
+/// （漏尾斜杠 → 整棵树绕开扩展名过滤）。
 pub fn validate_whitelist_against_disk(repo_root: &str, whitelist: &[String]) -> Result<()> {
-    for entry in whitelist {
+    'entries: for entry in whitelist {
         let wants_dir = entry.ends_with('/');
         let clean = entry.trim_end_matches('/');
         if clean.is_empty() {
@@ -270,8 +275,8 @@ pub fn validate_whitelist_against_disk(repo_root: &str, whitelist: &[String]) ->
         let mut cursor = std::path::PathBuf::from(repo_root);
         for seg in clean.split('/') {
             let Some(real) = real_name(&cursor, seg) else {
-                // 这一段在磁盘上不存在 → 整条不判，见上方「路径不存在时不报错」
-                return Ok(());
+                // 这一段在磁盘上不存在 → **这一条**不判，继续看下一条
+                continue 'entries;
             };
             if real != seg {
                 return Err(GitError::new(
