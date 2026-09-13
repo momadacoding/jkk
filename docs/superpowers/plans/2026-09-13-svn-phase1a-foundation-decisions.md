@@ -25,7 +25,7 @@
 | 3 配置文件读取与校验 | ✅ 完成 | `engine/svn_config.rs`、`engine/mod.rs`、`tests/svn_config.rs` | fmt ✓ clippy 零告警 ✓ `--test svn_config` **14 passed**（计划写的是 8）✓ `cargo test` **252 passed / 0 failed**（= 238 + 14） |
 | 4 嵌套 WC 枚举与 P4 | ✅ 完成 | `engine/svn_wc.rs`、`engine/mod.rs`、`tests/svn_wc.rs`、`tests/common/svn_fixtures.rs` | fmt ✓ clippy 零告警 ✓ `--test svn_wc` **6 passed** ✓ `cargo test` **264 passed / 0 failed**（= 226 + 38） |
 | — review 修复（7 条） | ✅ 完成 | `svn_cli.rs`、`svn_config.rs`、`svn_xml.rs` + 各自测试 | 见「独立 review」一节。⚠️ **#3 分两次才修完**——第一次只加了文档契约就报了「全部已修」，等于没修。测试数 svn_cli 4→8、svn_config 14→16、svn_xml 8→11；`cargo test` **267 passed / 0 failed** |
-| 5 exclude 规则生成 | ⬜ 未开始 | | |
+| 5 exclude 规则生成 | ✅ 完成 | `engine/svn_exclude.rs`、`engine/mod.rs`、`tests/svn_exclude.rs` | fmt ✓ clippy 零告警 ✓ `--test svn_exclude` **9 passed**（计划写的是 7，多的 2 条覆盖「白名单条目互相包含」，见下）✓ `cargo test` **276 passed / 0 failed / 27 个二进制**（= 267 + 9） |
 | 6 纳入集合核对 | ⬜ 未开始 | | |
 | 7 仓库识别 / capabilities / backend_for 分流 | ⬜ 未开始 | | |
 | 8 前端按能力隐藏入口 | ⬜ 未开始 | | |
@@ -344,6 +344,89 @@ reviewer 另外排除了两条疑虑，一并记下免得以后重新怀疑：`c
   才在 D5 撞墙」。
 - fixture 全部在 `TempDir` 里自建 `svnadmin create` 仓库，跑完即删，不碰本仓库、
   用户仓库或任何仓库外的固定路径。
+
+---
+
+### Task 5：exclude 规则生成
+
+#### 偏离计划
+
+- **`generate_exclude` 的结构从「按条目流水线输出」改成「分三段输出」**
+  （① 打开父目录，去重 + 按深度升序 ② 目录条目的叶子规则 ③ 单文件条目）。
+  原因见下方「计划没写的坑」——不改的话，白名单一旦出现互相包含的条目就会
+  静默丢文件。计划里的输出示例（单条白名单）在改动后**逐字节不变**，
+  三条既有测试可以作证。
+
+- **测试从 7 个加到 9 个。** 多出来的两条就是覆盖上述组合：
+  `a_narrower_entry_does_not_silently_drop_files_of_the_broader_one` 与
+  `a_file_entry_coexists_with_a_directory_entry_that_contains_it`，
+  两条都把**书写顺序的两个方向**都跑一遍——顺序不该改变纳入集合。
+
+- **`svn_metadata_never_enters_git_with_the_wildcard_extension` 多加了两条正向断言**
+  （`Code/Sub/Deep/Low.cs` 与 `Code/Junk.psd` 必须在）。只断言「没收进 `.svn`」
+  的话，一条把所有东西都排除掉的规则同样能过——那是 `AGENTS.md` §13 rubric #9
+  说的虚假信心。
+
+#### 计划的错误
+
+**计划给的 `generate_exclude` 会在白名单条目互相包含时静默丢文件。**
+
+git 的裁决规则是「**最后一条**匹配的模式说了算」，所以规则的先后顺序本身就是
+语义。计划那版按条目顺序流水线输出：后一个条目为打开自己的父目录要发一条
+`/Code/*`，它落在前一个条目的 `!/Code/**/*.cs` **之后**，把前者已经纳入的文件
+又剔了出去。2026-09-13 在真实 git 仓库里实测（断言的是 `git ls-files`）：
+
+| 白名单（扩展名 `.cs`） | 计划那版的实际结果 |
+|---|---|
+| `["Code/", "Code/Sub/"]` | `Code/Top.cs` 消失，只剩 `Sub` 底下两个 |
+| `["Code/", "Code/Junk.psd"]` | **只剩 `Code/Junk.psd`**，整个目录条目全没了 |
+
+后一行比我预判的还糟：单文件条目那条 `/Code/*` 把 `Code` 的所有直接子项（含
+子目录 `Sub`）都排除了，git 不再往里递归，目录条目的 `!/Code/**/*.cs` 一条都
+够不着。
+
+而且**全程没有任何报错**。用户看到的是「我明明把整个 `Code/` 加进了白名单，
+顶层的 `.cs` 却没受保护」——切分支丢改动、stash 存不进去、交付清单里不出现，
+正是 spec §6.3 说这个模块必须由代码生成的那个失败形态。
+
+修法：三段式。① 把所有条目的非末段前缀收集起来去重、按深度升序，每层发一次
+`!/P/` + `/P/*`；去重保证同一层只发一次，深度升序保证外层先于内层。② 再发目录
+条目的叶子规则，`/P/**` 与按扩展名的反选成对出现、互不干扰。③ 单文件条目**必须
+排在最后**，因为它不过扩展名过滤，排在目录条目之前会被 `/P/**` 重新盖掉。
+
+#### 计划没写的坑
+
+- **「单文件条目」与「目录条目 + 扩展名」不是同一种东西，不能互相替代。**
+  单文件条目发的是 `!/Code/Junk.psd`，**不过扩展名过滤**——这是它存在的意义
+  （「整个 `Code/` 收 `.cs`，另外单独收一个 `build.gradle`」是合法配置）。
+  所以「窄条目被广条目覆盖就可以丢掉」这条捷径只对**目录条目**成立，
+  对单文件条目不成立。最终没走「拒绝重叠条目」那条路，就是因为它会误伤
+  这种合法配置。
+
+- **`opens.sort_by_key` 必须是稳定排序。** Rust 的 `sort_by_key` 是稳定的，
+  所以同深度的前缀保持白名单里的书写顺序；换成 `sort_unstable_by_key` 会让
+  生成结果在同深度条目之间不可复现，而这个文件是要写进 `.git/info/exclude`
+  再被 diff 的。
+
+- **`write_exclude` 假定 `.git` 是目录。** git worktree 里 `.git` 是一个文件，
+  这时 `create_dir_all(".git/info")` 会失败并返回 `io` 错误。Phase 1a 没有任何
+  调用方（它要到 Phase 1b 的初始化向导才被用上），且本设计的形态就是 `.git`
+  直接落在 SVN 工作副本根上，所以**本阶段不处理，如实记在这里**。与 Task 3 的
+  `config_path` 是同一个假设，将来要改得一起改。
+
+#### 为什么这么改是安全的
+
+- **断言对象全部是 `git ls-files` 的实际输出，不是生成出来的规则文本。**
+  测规则文本只能证明「生成了我以为的字符串」，证明不了 git 会怎么裁决，
+  而这个模块存在的全部理由就是后者。
+- `generate_exclude` 是纯函数，不碰磁盘；`write_exclude` 只写
+  `<仓库根>/.git/info/exclude` 一个文件，**不动工作树、不动索引、不动 refs**。
+  写坏的最坏后果是「某些文件没被 git 跟踪」，不会丢已提交的数据。
+- 测试仓库全部是 `TempDir` 里 `git init` 出来的空仓库，`git add -A` 只在那里面
+  跑，跑完即删（`AGENTS.md` 最高优先级条款）。
+- 末尾那条 `.svn/` 有两条测试兜着（`.db` 在扩展名列表里、以及 `extensions:["*"]`
+  两条最容易漏的路径），因为它一旦失效就不是「少跟踪几个文件」，而是 git
+  checkout 会在一个**正在使用的** SVN 工作副本底下换掉 `wc.db`。
 
 ---
 
