@@ -22,7 +22,7 @@
 | 0 开工自检与基线 | ✅ 完成 | 本文件 | 自检全过；基线 226 passed / 0 failed / 22 个二进制 |
 | 1 svn CLI 封装与可用性探测 | ✅ 完成 | `engine/svn_cli.rs`、`engine/mod.rs`、`tests/svn_cli.rs` | fmt ✓ clippy 零告警 ✓ `--test svn_cli` 4 passed ✓ `cargo test` **230 passed / 0 failed**（= 226 + 4） |
 | 2 `--xml` 解析（roxmltree） | ✅ 完成 | `engine/svn_xml.rs`、`engine/mod.rs`、`Cargo.toml`、`tests/svn_xml.rs` | fmt ✓ clippy 零告警 ✓ `--test svn_xml` **8 passed**（计划写的是 6，对齐真实输出后加了 2）✓ `cargo test` **238 passed / 0 failed**（= 230 + 8） |
-| 3 配置文件读取与校验 | ⬜ 未开始 | | |
+| 3 配置文件读取与校验 | ✅ 完成 | `engine/svn_config.rs`、`engine/mod.rs`、`tests/svn_config.rs` | fmt ✓ clippy 零告警 ✓ `--test svn_config` **14 passed**（计划写的是 8）✓ `cargo test` **252 passed / 0 failed**（= 238 + 14） |
 | 4 嵌套 WC 枚举与 P4 | ⬜ 未开始 | | |
 | 5 exclude 规则生成 | ⬜ 未开始 | | |
 | 6 纳入集合核对 | ⬜ 未开始 | | |
@@ -203,6 +203,48 @@
 - 解析失败一律返回 `Err`，**绝不降级成空集**——空集会让「nodeRevs 单值」这条
   不变量以看起来通过的方式被绕过，已由
   `parse_node_revs_on_garbage_errors_instead_of_returning_empty` 钉住。
+
+### Task 3：配置文件读取与校验
+
+#### 偏离计划
+
+- **测试从 8 个加到 14 个**，多出来的 6 条都是计划漏掉的路径：
+  `read_config` 的四条（文件不存在报 `not_configured`、坏 JSON 报 `svn_config`、
+  读盘路径也要规范化后再校验、好文件能读出规范化后的白名单）、
+  反斜杠盘符 `C:\Windows`、尾斜杠保留。
+
+- **`validate` 对 whitelist 与 extensions 分别判空，不是「两者皆空才拒」。**
+  spec §6.2.1 的原话是「两者皆空 → 阻断」，但任一为空同样不可用：空白名单让每一步的
+  空参数保护触发，空扩展名让 W-file 恒为空集（§6.3.2），两种都表现为「功能装上了
+  但什么都管不到」。实现按更严的口径走，理由写在代码注释里。
+
+#### 计划的错误
+
+- 计划的 `normalize_whitelist_entry` **没有覆盖反斜杠写法的盘符**。
+  `C:\Windows` 只有先转成正斜杠才看得出第二个字符是 `:`；计划里规范化与校验的
+  先后顺序没写明，照字面实现很容易把校验放在 `replace('\\', "/")` 之前，于是
+  反斜杠写法从盘符检查底下整个溜过去。
+  已在实现里把顺序写死（先 replace 再逐条检查），并补
+  `a_backslash_drive_letter_is_rejected_too` 与 `read_config_normalizes_before_validating`
+  两条断言钉住——后者走的是真实读盘路径，不是只测那个纯函数。
+
+#### 计划没写的坑
+
+- **`//server/share`（UNC）不需要单独判。** 它以 `/` 开头，被「必须是仓库内相对
+  路径」那条一并挡掉了。计划把 UNC 单列成一类，实现上是同一条规则。
+
+- **尾斜杠必须原样保留。** 它是「目录（递归）」与「单个文件」在 §6.3 里的唯一
+  区分，规范化时顺手 `trim_end_matches('/')` 会让 exclude 生成走错分支。计划没
+  提这一点，已补 `a_trailing_slash_is_preserved`。
+
+#### 为什么这么改是安全的
+
+- 仍然**只新增代码**：`svn_config` 没有任何现有模块引用，既有测试 238 → 252
+  只多出本 Task 的 14 个。
+- 本模块**不执行任何外部命令**，只读一个 JSON 文件并做字符串校验。
+- 校验**只拒绝、不改写**用户的配置：`normalize_whitelist_entry` 唯一的改写是
+  `\` → `/` 与去首尾空白，其余一律报错让用户自己改（对齐 §6.2.1「不猜、不自动
+  改写」）。
 
 ---
 

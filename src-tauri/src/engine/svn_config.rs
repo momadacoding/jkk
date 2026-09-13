@@ -1,0 +1,177 @@
+//! `.git/mygitclient.json` 的读取与校验。
+//!
+//! 形状对齐 `engine::custom_config`：用户手写，客户端只读。
+//!
+//! **这个文件是不可信输入。** 每个字段都会被送进 git 或 svn 的命令行，不校验
+//! 就等于把命令构造交给了手滑。校验**集中在加载时一次做完**，不要散落到各个
+//! 调用点（spec §6.2.1）。
+
+use crate::error::{GitError, Result};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+/// 基线分支名是**固定值**，不是可配项。
+///
+/// 全文所有流程都硬编码了它；字段保留只为向前兼容，值不是它就阻断（spec §6.2.1）。
+pub const BASELINE_BRANCH: &str = "svn/base";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SvnConfig {
+    #[serde(default = "default_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub svn_url: String,
+    #[serde(default)]
+    pub whitelist: Vec<String>,
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    #[serde(default = "default_baseline_branch")]
+    pub baseline_branch: String,
+}
+
+fn default_version() -> u32 {
+    1
+}
+
+fn default_baseline_branch() -> String {
+    BASELINE_BRANCH.to_string()
+}
+
+/// 配置文件的位置：`<仓库根>/.git/mygitclient.json`。
+///
+/// 放在 `.git/` 内部而不是工作目录，是为了让工作目录**只多出 `.git` 一个条目**
+/// （spec §3）——多一个文件就多一个被 TortoiseSVN 误提交上去的东西。
+pub fn config_path(repo_root: &str) -> PathBuf {
+    Path::new(repo_root).join(".git").join("mygitclient.json")
+}
+
+/// 读取并校验配置。
+///
+/// 文件不存在时返回 `not_configured`，**与「配置坏了」（`svn_config`）分开**：
+/// §6.1 的分流据此区分「有 `.svn` 但还没初始化」与「配置文件有问题」，两者给用户
+/// 的引导完全不同。
+pub fn read_config(repo_root: &str) -> Result<SvnConfig> {
+    let path = config_path(repo_root);
+    if !path.is_file() {
+        return Err(GitError::new(
+            "not_configured",
+            format!("{} 不存在", path.display()),
+        ));
+    }
+    let raw = std::fs::read_to_string(&path)?;
+    let mut cfg: SvnConfig = serde_json::from_str(&raw)
+        .map_err(|e| GitError::new("svn_config", format!("配置文件不是合法 JSON: {e}")))?;
+    // **规范化必须在校验之前。** 反斜杠写法的 `C:\Windows` 只有转成正斜杠之后
+    // 才看得出是盘符；顺序反过来，那一类写法会从盘符检查底下溜过去。
+    // 而且后续所有比较都基于正斜杠形式，留两种写法会让「白名单里有没有这一条」
+    // 在 Windows 上时对时错。
+    let mut normalized = Vec::with_capacity(cfg.whitelist.len());
+    for entry in &cfg.whitelist {
+        normalized.push(normalize_whitelist_entry(entry)?);
+    }
+    cfg.whitelist = normalized;
+    validate(&cfg)?;
+    Ok(cfg)
+}
+
+/// 校验一份**已规范化**的配置。
+pub fn validate(cfg: &SvnConfig) -> Result<()> {
+    if cfg.svn_url.trim().is_empty() {
+        return Err(GitError::new("svn_config", "svnUrl 不能为空"));
+    }
+    if cfg.baseline_branch != BASELINE_BRANCH {
+        return Err(GitError::new(
+            "svn_config",
+            format!(
+                "baselineBranch 必须是 {BASELINE_BRANCH}，实际是 {}。\
+                 全文流程都硬编码了这个名字，改它会让基线与流程不一致",
+                cfg.baseline_branch
+            ),
+        ));
+    }
+    // spec §6.2.1 说的是「两者皆空则阻断」，但**任一为空同样不可用**：
+    // 空白名单会让每一步的空参数保护触发，空扩展名会让 W-file 恒为空集（§6.3.2），
+    // 两种都表现为「功能装上了但什么都管不到」。所以这里分别挡。
+    if cfg.whitelist.is_empty() {
+        return Err(GitError::new("svn_config", "whitelist 不能为空"));
+    }
+    if cfg.extensions.is_empty() {
+        return Err(GitError::new("svn_config", "extensions 不能为空"));
+    }
+    for e in &cfg.extensions {
+        // "*" 是 spec §6.3 明文给出的全纳入写法，单独放行。
+        if e == "*" {
+            continue;
+        }
+        if !e.starts_with('.') {
+            return Err(GitError::new(
+                "svn_config",
+                format!("扩展名必须以 . 开头：{e}"),
+            ));
+        }
+        if e.contains('/') || e.contains('\\') || e.contains('*') || e.contains('?') {
+            return Err(GitError::new(
+                "svn_config",
+                format!("扩展名不能含路径分隔符或通配符：{e}"),
+            ));
+        }
+    }
+    // 规范化过的条目再过一遍，挡住「直接构造 SvnConfig 绕开 read_config」的调用方。
+    for w in &cfg.whitelist {
+        normalize_whitelist_entry(w)?;
+    }
+    Ok(())
+}
+
+/// 把一条白名单路径规范化成「仓库内相对路径 + 正斜杠」，并挡掉危险形态。
+///
+/// 白名单条目同时被当成 **git pathspec** 和 **SVN target**，两套语义各有魔法字符。
+/// 一个 `:(exclude)` 或一个 `..` 就能让命令作用到预期之外的范围（spec §6.2.1）。
+///
+/// **尾部的 `/` 原样保留**：它是「目录（递归）」与「单个文件」的唯一区分
+/// （spec §6.3），吃掉它会让 exclude 生成走错分支。
+pub fn normalize_whitelist_entry(raw: &str) -> Result<String> {
+    let reject = |why: &str| {
+        Err(GitError::new(
+            "svn_config",
+            format!("白名单条目 {raw:?}：{why}"),
+        ))
+    };
+
+    let s = raw.replace('\\', "/");
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return reject("不能为空");
+    }
+    // pathspec magic 必须在最前面挡掉：`:(exclude)Assets` 会让 git 反选。
+    if trimmed.starts_with(':') {
+        return reject("不能以 : 开头（git pathspec magic）");
+    }
+    // 以 / 开头同时覆盖了绝对路径和 UNC（`//server/share`）。
+    if trimmed.starts_with('/') {
+        return reject("必须是仓库内相对路径，不能以 / 开头");
+    }
+    // 盘符：`C:/x`。上面已挡了以 : 开头，这里挡第二个字符是 : 的。
+    if trimmed.chars().nth(1) == Some(':') {
+        return reject("不能含盘符");
+    }
+    if trimmed == "." || trimmed == ".." {
+        return reject("不能是 . 或 ..");
+    }
+    // 逐段检查，挡住 `Assets/../../etc` 这种中间段上跳。
+    if trimmed.split('/').any(|seg| seg == "..") {
+        return reject("不能含 .. 段");
+    }
+    // `.git` / `.svn` 开头：前者会让客户端把自己的元数据交出去，后者会让 SVN 的
+    // 工作副本数据库进 git。注意这**只挡条目本身**——深层的 `.svn`（白名单落在
+    // external 根时里面就有一个）由 §6.3 生成的 exclude 末尾那条兜底规则负责，
+    // 见 `engine::svn_exclude`。
+    let first = trimmed.split('/').next().unwrap_or("");
+    if first == ".git" || first == ".svn" {
+        return reject("不能以 .git 或 .svn 开头");
+    }
+    Ok(trimmed.to_string())
+}
