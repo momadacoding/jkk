@@ -2,7 +2,7 @@
 
 - 日期：2026-09-12
 - 状态：设计已确认，未实现。已过三轮对抗性 review + 三轮外部事实复核（`git svn` 方案 / 真实远端工作副本 / externals 布局），结论全部修入，见 §18
-- ⚠️ **开工前有两条硬阻断尚未在公司项目上核对，见 §16.0**——结论直接决定 Phase 1 值不值得做
+- ⚠️ **开工前有一条硬阻断（P4 白名单不得跨仓库）尚未在公司项目上核对，见 §16.0**
 - 分期：见 §16。本文覆盖全部 5 期的架构，各期另出实现计划
 
 ## 1. 背景与目标
@@ -576,10 +576,11 @@ P4  白名单**可以**落在 external 内，但必须全部属于**同一个仓
       所有 UUID 必须相同；不同则拒绝，并指出是哪两条分属哪两个仓库
       理由：svn commit 跨仓库会被**直接拒绝**（E200007，§6.6.5 实测），交付永远
       做不成。前置拦住是为了不让用户白走完整个确认流程才在 D5 撞墙
-P5  白名单所在的 external 不得被 `-r` 钉死
-      检测方式见 §6.5.2；命中即硬阻断
-      理由：往被钉住的 external 提交会**成功**，但下一次 svn update 会把提交的
-      内容从磁盘**无声抹掉**，随后基线录下旧内容却标上新 revision（§6.6.5 实测）
+P5  检测白名单所在的 external 有没有被 `-r` 钉死
+      检测方式见 §6.5.2。命中**不阻断**，改为进入「pinned 模式」，见 §6.5.3
+      （初版写的是硬阻断 + 要求团队改 `svn:externals`。那条路走不通——改动别人的
+        externals 定义不是一个客户端能要求的事——而且实测表明客户端自己就能绕开，
+        见 §6.5.3）
 ```
 
 三条全过之后才建库：
@@ -662,6 +663,51 @@ sync_in 的 S5 之后：
 所以它的结论是**「疑似，需复核」，不单独用来阻断**——阻断归手段一，手段二只负责在
 手段一漏判时把问题暴露出来。
 
+#### 6.5.3 白名单所在的 external 被钉住时怎么办（pinned 模式）
+
+初版 P5 的处理是「硬阻断 + 请团队改 `svn:externals` 定义」。**那条路走不通**——改别人
+的 externals 定义不是一个客户端能要求的事，而且实测表明**根本不需要**。
+
+**实测**（2026-09-13，临时 SVN fixture，`externals = -r2 ^/code-trunk code`，
+服务器上该路径 HEAD 内容是 `v3`）：
+
+| # | 操作 | 结果 |
+|---|---|---|
+| A | 从父目录 `svn update code`（**显式指名** external 目录） | → r4 / `v3`，**不认 peg**，走到该仓库 HEAD ✅ |
+| B | `svn update --ignore-externals <根>` + `svn update art` | → 被钉住的 `code` 纹丝不动，`art` 正常更新 ✅ 可选择性更新 |
+| C | 在 `code` 里提交后，在项目根跑**递归** `svn update` | → `code` 退回 r2 / `v2`，`svn status` **仍报干净** ❌ 无声回退 |
+| D | 有**未提交**改动时跑 C | → 产生冲突标记 `.mine` / `.r4` / `.r2`，**不是静默丢失** |
+
+结论很直接：**peg 只在「父级递归处理 externals 定义」时生效。显式指名那个目录去
+update，就绕过去了。**
+
+**于是 pinned 模式只改三件事：**
+
+1. **update 一律拆成两步**（§7.3 S5、§8.2 D6）：项目根用 `--ignore-externals`，
+   然后对每个 external **显式**跑一次 `svn update <目录>`。对用户可见的行为不变
+   （美术照常更新），变的只是执行方式
+2. **新增一条失同步信号**（§6.6.2）：`nodeRevs` **掉回 peg revision**，说明有人在
+   项目根跑了递归 update。此时提供一键修复——就是 `svn update <白名单所属目录>`，
+   把它重新拉到 HEAD
+3. **UI 常驻说明**这条残余风险，见下
+
+**残余风险，以及为什么可以接受**
+
+无法阻止外部工具（TortoiseSVN 的「SVN Update」、命令行 `svn up`）在项目根跑递归
+update，那会把代码回退到 peg，而且工作副本看起来干净（测点 C）。
+
+但三条理由让它可接受：
+
+- **这个风险今天就存在，不是本设计引入的。** 若团队把承载代码的 external 钉死了，
+  任何人提交代码后再 update 都会看到自己的提交从工作副本消失
+- **双通道可检测。** SVN 侧 `nodeRevs` 掉回 peg（§6.6.2）；git 侧磁盘内容与
+  `svn/base` 不符，`git status` 直接显示出来。两条互相独立
+- **一条命令可修复**，且内容从未真正丢失——它在服务器上，也在 git 对象库里
+
+顺带一提：**一条承载活跃开发代码的 external 实际上很难是被钉住的**，因为那会让全组
+每个人的代码提交在下一次 update 后从工作副本消失，团队第一天就会发现。所以 pinned
+模式大概率只会作用在美术 / 文档那类 external 上，而本设计从不往那些地方写。
+
 ### 6.6 状态判定
 
 #### 6.6.1 SVN 工作副本是 mixed-revision 的
@@ -704,6 +750,11 @@ remoteRev   = svn info --xml <URL> 的 revision            ← 走网络，异�
 |---|---|
 | `nodeRevs` 有多个值 | mixed revision，外部提交或局部 update 过 |
 | `nodeRevs = {N}` 但 `N != baselineRev` | 整体被外部推进或回退 |
+
+第二条在 pinned 模式下有一个**具体且常见**的成因，UI 要能分辨并给出对应的修复：
+`N` 恰好等于该 external 的 peg revision ⇒ **有人在项目根跑了递归 `svn update`**，
+把白名单所在的 external 拽回了 peg（§6.5.3 测点 C）。此时不要引导用户进 §9.4 的
+完整恢复流程，一条 `svn update <白名单所属目录>` 就能拉回 HEAD（测点 A）。
 
 **`rootRev` 不是判据，只是变化提示。** §6.6.1 已经论证过「读根的单个
 `<entry revision>` 不能证明任何事」；把 `rootRev != baselineRev` 当成失同步的判据，是在
@@ -1123,7 +1174,10 @@ S1   工作区不干净时：
 S2   （origBranch 已在 S0 落盘，此处只推进 phase）
 S3   git checkout svn/base
 S4   svn status --xml 校验白名单内应为 0 修改              ← 双保险
-S5   svn update --accept postpone
+S5   按 §6.5.3 的方式更新（**不是**在项目根跑一次递归 svn update）：
+       ① svn update --accept postpone --ignore-externals <项目根>
+       ② 对每个 external 显式 svn update --accept postpone <external 目录>
+     对用户可见的行为不变（美术照常更新），变的只是执行方式
 S6   svn info --xml + svn status -v --xml 读新 revision
 S7   git add -A -- <白名单> && git commit --allow-empty     新基线
 S8   git checkout ORIG_BRANCH
@@ -1398,6 +1452,10 @@ D5   phase=committing
        -m <msg> -- <显式 target 列表>
 D6   phase=post-commit  ← 过了这一步服务器状态已不可撤销
      svn update --accept postpone -- <白名单路径>            ← 只更新白名单，见 §8.2.1
+     ⚠️ 白名单落在 external 里时，target 必须**显式指到那个 external 目录**
+        （或其内部路径）。实测：显式指名的 update **不认 peg**，会走到该仓库
+        HEAD，这正是我们要的；而在项目根跑递归 update 会把它拽回 peg，把刚
+        交付的内容从磁盘抹掉。见 §6.5.3
 D7   svn status -v --xml 读新的 nodeRevs → r_new
 D8   推进基线到交付树（见 §8.2.2）
 D9   提示「work 分支已交付，可删除」——不自动删
@@ -2249,7 +2307,8 @@ React 依赖、可直接单测。
 | **D5 被 pre-commit 拒绝（revprop）** | 服务器不接受自定义 revprop（§8.6.3 形态 B） | 按 §8.5 完整回滚 D4 登记 | 原样展示 svn stderr，给出**需要用户明确确认**的「不带幂等键重试一次」选项；不确认就停下 |
 | **配置校验未过** | `svnUrl` UUID 不符、`baselineBranch` 非 `svn/base`、白名单含非法路径（§6.2.1） | **不做任何修改**，仓库不进入可用状态 | 指出是哪个字段、哪一条规则；`svnUrl` 不符时同时显示配置值与 `svn info` 实际值 |
 | **白名单跨仓库** | 白名单根的 `Repository UUID` 不全相同（§6.5 P4） | **不做任何修改**，仓库不进入可用状态 | 指出是哪两条分属哪两个仓库；说明 `svn commit` 会以 E200007 直接拒绝，不是本客户端的限制 |
-| **白名单所在 external 被 `-r` 钉死** | `svn:externals` 里带 `-r N` 或 `URL@N`（§6.5 P5、§6.5.2） | **不做任何修改**，仓库不进入可用状态 | 指出是哪条 external 定义；说明往钉住的 external 提交会成功但随后被 update 抹掉，**无缓解手段**，需要团队改 `svn:externals` |
+| **白名单所在 external 被 `-r` 钉死** | `svn:externals` 里带 `-r N` 或 `URL@N`（§6.5 P5、§6.5.2） | **不阻断**，进入 pinned 模式（§6.5.3） | 说明客户端会改用「根 `--ignore-externals` + 显式更新各 external」的方式，并提示残余风险：外部工具在项目根跑递归 update 会把代码退回 peg |
+| **代码被外部递归 update 退回 peg** | 用户或 TortoiseSVN 在项目根跑了普通 `svn update`（§6.5.3 测点 C） | 不做任何修改 | `nodeRevs` 掉回 peg revision 时明确报出成因，提供一键「`svn update <目录>` 拉回 HEAD」；说明内容没丢（在服务器上，也在 git 对象库里） |
 | **行为校验发现疑似钉住的 external** | `svn update` 之后白名单所属 WC 的 revision ≠ 该仓库 HEAD（§6.5.2 手段二） | 不阻断当前流程 | 提示「疑似被钉住，请核对 `svn:externals`」，**不单独据此阻断**（存在窄竞态） |
 | **基线体检不通过**（§6.8） | 基线内容与服务器在 `baselineRev` 上的内容不符——假基线已经产生 | 按时机分：初始化时**整个回退、不创建 `.git`**；§9.4 第 ⑥b 步**停在那里不继续 ⑦**；Phase 1 R3b **中止，连 `svn/base` 指针都不动** | 列出差异文件（已剥掉 URL 前缀、剔除目录条目与纯属性条目，§6.8.4），说明是内容不符而非 revision 不符 |
 | **基线体检跑不成功** | 断网、认证失败、`svnUrl` 不可达 | **不阻断**，不做任何修改 | 标记「基线未经体检」并如实显示；**不得当成体检通过**（§6.8.6） |
@@ -2347,8 +2406,10 @@ svn checkout file:///<tmp>/repo  <tmp>/wc2     ← 「同事」，用来制造�
 | 48 | **externals 不得污染 `nodeRevs`**：fixture 里给白名单**外**的目录挂一个 `svn:externals`（指向同一 fixture 仓库的另一路径，并用 `-r` peg 固定在旧 revision），断言 `nodeRevs` 仍是单值、失同步检测**不报**；再断言去掉 `--ignore-externals` 时会误报——**两个方向都要测**，只测「加了之后对」证明不了这个参数是必需的（§6.6.4） | 1、3 |
 | 49 | **白名单落在 external 内必须能用**：fixture 造「项目根 + `code` 同仓库 external」，白名单只写 `code/`，断言初始化、`sync_in`、`sync_out` 全流程走通，且记账取的是 `code` 那个 WC 的 URL/revision 而非项目根（§6.6.5） | 1、3 |
 | 51 | **白名单跨仓库必须被拒**：白名单同时覆盖主仓库路径与跨仓库 external，断言配置加载时就拒绝、**不发生任何 git / svn 命令**；再单独断言真去提交会得到 E200007（证明这条前置拦的是真问题，不是想象出来的）（§6.5 P4、§6.6.5 E5） | 3、4 |
-| 52 | **pegged external 必须被拒**：`-r2 URL LOCAL`、`-r 2 URL LOCAL`、`URL@2 LOCAL`、`LOCAL -r2 URL` 四种写法各造一个，断言**全部**被识别为钉住并阻断；再断言无 peg 的定义不被误判（§6.5.2） | 3、4 |
-| 53 | **pegged external 的数据丢失场景**：在钉住的 external 里提交后跑 `svn update`，断言磁盘内容被改回且 `svn status` 干净——这条测的是**为什么必须阻断**，不是产品行为（§6.6.5 E7） | 1、4 |
+| 52 | **pegged 的四种写法都要被识别**：`-r2 URL LOCAL`、`-r 2 URL LOCAL`、`URL@2 LOCAL`、`LOCAL -r2 URL` 各造一个，断言**全部**被判定为钉住并进入 pinned 模式；再断言无 peg 的定义**不被误判**（§6.5.2） | 3、11 |
+| 53 | **pinned 模式下交付仍然走得通**：白名单落在被钉住的 external 里，走完整 `sync_in` + `sync_out`，断言 update 走的是「根 `--ignore-externals` + 显式指名 external」、交付内容在流程结束后**仍在磁盘上**、基线记的是 external 自己的 revision（§6.5.3 测点 A、B） | 1、2 |
+| 55 | **外部递归 update 导致的回退可被检出并修复**：pinned 模式下交付成功后，用外部 `svn update <项目根>` 制造回退，断言 ① `nodeRevs` 掉回 peg 且被识别为**这个具体成因**（而不是泛泛的失同步）② git 侧也能看出磁盘与基线不符 ③ 一键 `svn update <目录>` 之后两侧都恢复正常（§6.5.3、§6.6.2） | 1、2、5 |
+| 56 | **未提交改动时的递归 update 不是静默丢失**：pinned external 里留未提交改动，跑根级递归 update，断言产生冲突标记而非无声回退——两种形态要分别处理，不能合并（§6.5.3 测点 D） | 1、2 |
 | 54 | **跨多个同仓库 WC 的交付是原子的**：白名单同时覆盖项目根与同仓库 external，一次交付触及两侧，断言产生**单个** revision，且 `nodeRevs` 并集在 update 之后收敛到同一个 N（§6.6.5 E4、E6） | 1、2 |
 | 50 | **`svn status -v --xml` 的解析**：断言取的是 `<wc-status revision>` 而非 `<commit revision>`——构造一个「所有文件 base 都是 rN、但最后修改 revision 各不相同」的 fixture，断言 `nodeRevs == {N}`；并断言解析走 XML parser（属性跨行的输入不会解析成空集）（§6.6.4） | 1、3 |
 
@@ -2418,9 +2479,12 @@ exclude 生成与图合成都在 Rust 侧，由 cargo test 覆盖。
     拆在两个仓库里（例如 `Code/` 与 `Script/` 是指向不同仓库的 external），本方案
     只能覆盖其中一个，另一个继续走 TortoiseSVN——或者为它单独再开一套（两个独立的
     `.git` + 两份配置），但那超出本设计范围
-23. **白名单所在的 external 不得被 `-r` 钉死**（§6.5 P5）。钉死时往里提交会成功，
-    但下一次 `svn update` 把内容从磁盘无声抹掉（§6.6.5 E7 实测）。这条**没有缓解
-    手段**，只能阻断并要求团队改 `svn:externals` 定义
+23. **白名单所在的 external 被 `-r` 钉死时，客户端挡不住外部工具的递归 update**
+    （§6.5.3）。客户端自己的 update 会绕开 peg（显式指名目录即可，实测不认 peg），
+    但 TortoiseSVN 的「SVN Update」在项目根跑递归 update 会把代码退回 peg，且工作
+    副本看起来干净。**可检测**（`nodeRevs` 掉回 peg，且 git 侧磁盘与基线不符）、
+    **可一键修复**（`svn update <目录>`）、内容**从未真正丢失**。注意这个风险在没有
+    本客户端时同样存在——它是团队 externals 定义的固有行为
 24. **`.git` 放项目根，而白名单文件可能在嵌套工作副本里**（§1.1.1）。git 不在乎这件事，
     但这意味着 §12.3 那三层「防 `.git` 被误提交」的防护要挂在**项目根**那个工作副本上，
     而失同步检测挂在**白名单所属**的工作副本上——两者不是同一个 WC，实现时不要合并
@@ -2448,7 +2512,7 @@ foreach ($d in 'Assets','Code','Script','Documents') {   # 换成实际的顶层
 |---|---|
 | 代码相关目录的 `Repository UUID` **全部相同** | P4 通过，方案可用；记账单位按 §6.6.5 取那个 WC |
 | 代码分属**两个**仓库（例如 `Code/` 与 `Script/` 的 UUID 不同） | P4 阻断。本方案只能覆盖其中一个，另一个继续走 TortoiseSVN（§15 第 22 条） |
-| `svn:externals` 里出现 `-r N` 或 `URL@N` 且命中代码目录 | P5 阻断，**无缓解手段**，需要团队先改 externals 定义（§15 第 23 条） |
+| `svn:externals` 里出现 `-r N` 或 `URL@N` 且命中代码目录 | 进入 pinned 模式（§6.5.3），**不阻断**；update 改走显式指名的方式，并向用户说明外部递归 update 的残余风险（§15 第 23 条） |
 
 **这一步的结论直接决定 Phase 1 值不值得做**，必须在写 Phase 1 实现计划之前拿到。
 在此之前，下表的分期安排按「P4 / P5 都通过」的乐观假设成立。
@@ -2536,6 +2600,50 @@ Phase 1 到 Phase 3 之间用户手工走 TortoiseSVN 交付时，本地补丁�
 误导性的错误上。
 
 ## 18. 修订记录
+
+### 2026-09-13（七）· P5 从硬阻断降级为 pinned 模式
+
+用户否掉了上一轮 P5 的处理方式：**「让团队改 `svn:externals` 定义」这条路走不通。**
+
+这个否定是对的，而且指向一个更一般的毛病：**上一轮把「客户端做不到」直接翻译成了
+「让组织去改」**。那不是一个客户端能开的处方。正确的问法是「在不改变任何外部约定的
+前提下，客户端自己能做到什么」——一问就发现能做的比想象中多。
+
+**实测**（临时 SVN fixture，`externals = -r2 ^/code-trunk code`）：
+
+| # | 操作 | 结果 |
+|---|---|---|
+| A | 从父目录 `svn update code`（**显式指名**目录） | → HEAD，**不认 peg** ✅ |
+| B | `svn update --ignore-externals <根>` + `svn update art` | → 选择性更新成立，被钉的 `code` 不受影响 ✅ |
+| C | 提交进被钉的 external 后，在根跑**递归** update | → 退回 peg，`svn status` 仍报干净 ❌ |
+| D | 有**未提交**改动时跑 C | → 产生冲突标记，**不是**静默丢失 |
+
+**A 是关键**：peg 只在「父级递归处理 externals 定义」时生效。显式指名目录去 update
+就绕过去了。于是 pinned 只需要改三件事——update 拆成「根 `--ignore-externals` + 逐个
+显式更新 external」、把「`nodeRevs` 掉回 peg」识别成一个**具体成因**并给一键修复、
+以及把残余风险如实写在 UI 上。**对用户可见的行为不变，美术照常更新。**
+
+残余风险是外部工具在项目根跑递归 update（测点 C）。可接受的三条理由：这个风险**在
+没有本客户端时同样存在**；**双通道可检测**（SVN 侧 `nodeRevs` 掉回 peg，git 侧磁盘与
+基线不符）；**一条命令可修复**，内容从未真正丢失（在服务器上，也在 git 对象库里）。
+
+顺带记一条判断：**承载活跃开发代码的 external 实际上很难是被钉住的**——那会让全组
+每个人提交完代码、一 update 就看到自己的提交从工作副本消失。所以 pinned 模式大概率
+只作用在美术 / 文档那类 external 上，而本设计从不往那里写。
+
+测点 D 也单独记：**已提交**与**未提交**两种形态的后果完全不同（静默回退 vs 冲突标记），
+实现里不能合并处理。
+
+| 改动点 | 内容 |
+|---|---|
+| §6.5 P5 | 从「硬阻断 + 要求团队改定义」降级为「检测并进入 pinned 模式」，并写明初版为什么错 |
+| §6.5.3（新增） | pinned 模式的完整方案：四组实测、三处改动、残余风险论证 |
+| §7.3 S5 / §8.2 D6 | update 改为「根 `--ignore-externals` + 显式指名各 external」；D6 补「白名单在 external 里时 target 必须显式指到该目录」 |
+| §6.6.2 | 第二条判据补一个具体成因：`N` 恰等于 peg ⇒ 有人跑了根级递归 update，给一键修复而不是完整恢复流程 |
+| §13 | pinned 那行从「阻断」改为「进入 pinned 模式」；新增「代码被外部递归 update 退回 peg」一行 |
+| §14.2 | 第 52 / 53 项重写（从「必须被拒」改为「必须能用」）；新增 55、56 |
+| §15 | 第 23 条重写：不再是「无缓解手段」，而是「可检测、可一键修复、内容不丢」 |
+| §16.0 | 判读表第三行改为「进入 pinned 模式，不阻断」 |
 
 ### 2026-09-13（六）· 核心命题被推翻：代码本来就在 external 里
 
