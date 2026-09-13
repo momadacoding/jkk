@@ -14,7 +14,7 @@
 |---|---|---|---|
 | 0 开工自检与基线数字 | ✅ 完成 | 本文件、`2026-09-14-svn-phase1b-baseline.md` | 改动前基线（新 worktree 内实测）：Rust **316 passed / 0 failed / 28 个二进制**、前端 `pnpm test` **272 passed / 21 files**、`pnpm build` ✓。与计划预期一致 |
 | 1 `git_cli` 支持环境变量 | ✅ 完成 | `src-tauri/src/engine/git_cli.rs`、`src-tauri/tests/git_cli.rs` | `cargo test --test git_cli` 5 passed；全量 `cargo test -j 2` **318 passed / 0 failed / 28 个二进制**（= 基线 316 + 新增 2）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓ |
-| 2 `svn_xml` 三个新解析器 | ⬜ 未开始 | | |
+| 2 `svn_xml` 三个新解析器 | ✅ 完成 | `src-tauri/src/engine/svn_xml.rs`、`src-tauri/tests/svn_xml.rs` | `cargo test --test svn_xml` 27 passed；全量 **332 passed / 0 failed / 28 个二进制**（= 318 + 新增 14）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓ |
 | 3 P1/P2/P3 硬门槛 | ⬜ 未开始 | | |
 | 4 P5 externals 钉死检测 | ⬜ 未开始 | | |
 | 5 基线录制（临时索引 / trailer） | ⬜ 未开始 | | |
@@ -185,3 +185,92 @@ Task 0 只读不写：跑测试、记数字、建两个 `docs/` 下的文件。�
 - 两条新测试都在 `TempDir` 里 `git init` 自建仓库，跑完即删，没有对本仓库或任何真实
   仓库发出写命令（`AGENTS.md` 开篇最高优先级约束）。其中一条的断言本身就是
   「真实索引前后逐字相同」，等于把「不碰用户暂存区」这条固化成了回归测试。
+
+---
+
+## Task 2：`svn_xml` 三个新解析器
+
+新增 `parse_status_entries` / `parse_externals_props` / `parse_diff_summary`。
+
+**动手前先抓了一次真实 XML。** `tests/svn_xml.rs` 开头立的规矩是「输入必须是真实
+svn 输出的形态，手写理想 XML 等于没测」，而计划里那六段测试 XML 是我写计划时手写的。
+于是先在临时 fixture 上把三条命令的真实输出原样抓下来（跑完即删），再照抄进常量。
+**抓回来的形状和计划里写的有四处不一样**，下面逐条记。
+
+#### 偏离计划
+
+- **`StatusEntry` 多了一个 `props` 字段**（计划声明的是 `{ path, item }`）。
+
+  实测：只改属性、没改内容的节点是 `item="normal"` + `props="modified"`
+  （文本版 status 显示成第二列的 `M`）。计划的结构体只带 `item`，P1 拿到的就是一个
+  读起来完全干净的 `normal` 节点，于是**带着一处未提交的属性改动去录基线**。
+  `svn_xml` 是全项目唯一接触 XML 的地方，这里丢掉的字段下游再也拿不回来。
+
+- **entry 底下缺 `<wc-status>` 时报错，而不是跳过。** 计划的实现要点没提这件事，
+  按最自然的写法（`find(...)` 拿不到就 `continue`）会静默少一条。少一条的含义是
+  「这个节点不脏」，而 P1 的全部价值就在于没漏。最现实的触发方式是喂错输入——
+  `svn info --xml` 的 `<entry>` 也叫 entry，底下却没有 wc-status。
+
+- **`parse_diff_summary` 的缺字段策略与 `parse_info` 相反**（填空串而不是报错），
+  计划就是这么写的，但没写为什么可以。补上理由：体检判「没有差异」的条件是
+  `item == "none" && props == "none"`，**空串两个都不等于**，于是缺字段的条目被
+  当成「有差异」保守报出来。空串在这里是安全方向，在 `parse_info` 里不是
+  （空 uuid 会让 P4 的「所有 UUID 相同」在两个空串上通过）。
+
+#### 计划的错误
+
+- **计划 Task 2 的 status 测试 XML 里一条 `item="external"` 都没有，而真实输出里
+  有一大把——即使带了 `--ignore-externals`。** 实测那次挂了五条 external，
+  `svn status --no-ignore --ignore-externals --xml` 原样回了五条
+  `item="external"` 的 entry。
+
+  **这条直接决定 Task 3 的 P1 写法。** 计划里 P1 写的是「不允许存在 `M`/`A`/`D`/
+  `R`/`C`/`!`/`~`/`?` 任何一种」，照字面最容易写成「status 有输出即脏」——而本设计的
+  核心场景恰恰是**代码就在 external 里**，那样写向导在目标仓库上**永远过不去**，
+  且失败信息会指着五个完全正常的 external 根说「工作副本不干净」。
+
+  处置：解析层原样给出（不偷偷过滤，否则「external 根自己被 `svn add` 了」这种真脏
+  也会被吞），并且把这件事同时写进 `parse_status_entries` 的 doc 注释和一条名叫
+  `status_entries_keep_external_markers_because_they_are_not_dirt` 的测试里。
+  **Task 3 的 P1 必须显式剔除 `item == "external"`。**
+
+- **计划说 `--summarize --xml` 的 `item`/`props`/`kind` 是三个独立属性——对，但漏了
+  一件事：属性顺序在同一次输出里就不一致。** 实测同一次输出的前两条是
+  `kind, item, props`，第三条是 `item, props, kind`。计划给的示例 XML 三条顺序统一，
+  照那个形态写测试就测不出「按序取值」这个错法（第三条会被读成 `item="dir"`）。
+  常量里原样保留了顺序差异，并单列一条 `diff_summary_does_not_depend_on_attribute_order`。
+
+#### 计划没写的坑
+
+- **`item="added"` 的 entry 带 `revision="-1"`，`item="unversioned"` 则完全没有
+  revision 属性。** 前者有后果：`parse_node_revs` 只跳过「没有 revision 属性」的
+  entry，`-1` 会被正常收进集合。也就是说一个只有本地新增文件的工作副本，
+  `nodeRevs` = `{-1, 当前rev}` → 多值。
+
+  → **Task 3 的 `run_preflight` 必须 P1 先于 P2**。顺序反了的话，用户看到的是
+  「工作副本是 mixed-revision，请先跑一次完整 svn update」——而真实原因是他有个
+  没提交的新文件，那句引导做了也没用。顺序不是风格问题，是错误信息对不对的问题。
+
+- **`svn propget svn:externals -R --xml` 的 `<target path>` 是绝对路径 + 正斜杠，
+  而 `svn status --xml` 的 `path` 是相对 + 反斜杠。** 计划的 E7 记了这件事，但值得
+  在这里重申：同一个 CLI 两种写法，不是笔误。三个解析器的归一策略做成了一张表写进
+  `StatusEntry` 的 doc 注释，免得下一个人以为 externals 那个是漏了归一。
+
+- **没有任何 externals 的子树，`propget` 回的是空的 `<properties>`，退出码 0。**
+  不是报错、也不是空输出。空列表是正常结果。
+
+- **`propget svn:externals` 只会回这一个属性**，所以「只取 `name="svn:externals"`」
+  那条守卫在真实输出里根本不会被触发。它防的是将来有人改成 `proplist -v --xml`。
+  这条分支只能用合成 XML 覆盖，测试里写明了它是合成的以及为什么。
+
+#### 为什么这么改是安全的
+
+- 三个函数都是**纯新增**，没有改动 `parse_info` / `parse_node_revs` /
+  `parse_external_roots` / `assert_externals_were_ignored` 任何一行。全量
+  `cargo test -j 2` = 332 passed / 0 failed / 28 个二进制，相对 Task 1 的 318 多的
+  正好是本任务新增的 14 条，无回归。
+- 全部是「喂字符串、吐结构体」的纯函数，不发任何命令、不碰文件系统。
+- 唯一跑真实 svn 的测试 `externals_props_survive_real_svn_output` 复用 1a 已有的
+  `svn_repo_with_cross_repo_nested_external()`，在 `TempDir` 里自建仓库、跑完即删，
+  只发 `propget`（只读）。抓形状用的探针脚本也全程在 `%TEMP%` 的一次性 fixture 上，
+  `finally` 里 `Remove-Item -Recurse`，没有碰本仓库或任何真实 SVN 工作副本。
