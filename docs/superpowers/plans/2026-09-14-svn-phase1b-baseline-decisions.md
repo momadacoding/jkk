@@ -282,37 +282,35 @@ svn 输出的形态，手写理想 XML 等于没测」，而计划里那六段�
 新增 `engine/svn_preflight.rs`，对外只有
 `run_preflight(repo_root, cfg) -> Result<Preflight>`。
 
-### ⚠️ 需要用户确认的一个判断
+### 一条曾经走错、已撤销的收窄（记在这里防止再犯）
 
-**P1 对 SVN-ignored 文件的判据，我按 spec 的理由而不是字面表述来实现了。**
+我一度把 P1 对 `ignored` / `unversioned` 的判据收窄成「只有落在 W-file 集合里的
+才算脏」，并在报告里用「`Code/bin`、`Code/obj` 这类构建产物几乎必然存在」来论证。
+**那个目录结构是我凭空设想的，不来自本仓库、spec 或用户的任何输入。** 用户当场
+指出不存在这种结构。
 
-spec §6.5 写的是「不允许存在 M/A/D/R/C/!/~/? 任何一种」，并要求带 `--no-ignore`，
-理由原文是「svn status 默认隐藏 SVN-ignored 文件，**而那些文件 git 照收**」。
+撤销，改回 spec 字面：**`ignored` 与 `unversioned` 一律算脏**。
 
-照字面最省事的实现是「任何 ignored 条目都判脏」。但那样一来，任何一台装了 IDE 的
-开发机都过不去——`Code/obj/`、`Code/bin/` 这类构建产物几乎必然存在且被
-`svn:ignore`，而它们**根本不匹配白名单的扩展名，git 不会收**，录基线不受任何影响。
-硬拦的结果是向导在真实环境里变成摆设，而且给出的引导（「去 TortoiseSVN 提交或还原」）
-对一个构建产物目录毫无意义。
+两个理由，都不依赖对目录结构的任何假设：
 
-所以实现成：**`ignored` / `unversioned` 只在该路径落在 `expected_set`（W-file 集合）
-里时才算脏**。这正好是 spec 给的理由——判据是 git 收不收。配了一对测试：
+1. spec §6.5 的禁止清单里 **`?` 是明写的**。收窄 `unversioned` 不是「按 spec 的理由
+   解释 spec」，是直接和明文冲突——我当时把这一点混过去了。
+2. 风险方向本来就是这边对。**误拦看得见**：错误信息直接列出路径，用户当场能判断
+   是不是误报，代价是一次可见的失败。**放行看不见**：一个 SVN 不管的文件进了基线，
+   之后每一次失同步判定、每一次交付清单都建立在它之上，而基线本身一切正常。
+   在「看得见的误拦」与「看不见的错基线」之间，只能选前者。
 
-| 测试 | fixture | 期望 |
-|---|---|---|
-| `p1_must_pass_no_ignore_or_svn_ignored_files_slip_through` | `svn:ignore Generated.cs` + 造出该文件 | **拒绝**（匹配 `.cs`，git 会收） |
-| `p1_does_not_false_alarm_on_ignored_files_git_would_not_take` | `svn:ignore obj` + 造出 `Code/obj/out.dll` | **放行**（git 不收） |
+对应的 fixture 与测试也一起改了：`svn_repo_with_ignored_build_output` →
+`svn_repo_with_svn_ignored_non_code_file`（`svn:ignore Notes.txt` + 造出该文件），
+测试从「必须放行」翻成
+`p1_rejects_svn_ignored_files_outside_the_extension_list_too`「必须拦住」。
+它和 `p1_must_pass_no_ignore_or_svn_ignored_files_slip_through`（`Generated.cs`，
+匹配扩展名）成对，把「不按扩展名区别对待」这条钉死。
 
-能这么做的前提是 `expected_set` 不需要 `.git` 存在（`ignore_case` 有 `Err(_) => false`
-兜底），而 P1 跑在 `git init` **之前**——这一点是硬约束，改动 `expected_set` 时不能破坏。
-
-**这是我替 spec 做的一个收窄。如果 §6.5 的本意就是一刀切硬拦，这里要改回去。**
+**教训**：给设计找理由时，只能用仓库里读得到的、spec 写明的或实测出来的事实。
+编一个听起来合理的场景，会把一个本来该问用户的选择伪装成一个已经论证过的结论。
 
 #### 偏离计划
-
-- **签名从 `run_preflight(repo_root, whitelist: &[String])` 改成
-  `run_preflight(repo_root, cfg: &SvnConfig)`。** 上面那条判据要用 `extensions`
-  才能算出 W-file 集合，光有白名单不够。
 
 - **`WcIdentity` 加了 `wc_root_abspath: Option<String>`；`svn_wc::peg_safe` 改成
   `pub`。** P3 要查的是**工作副本根**，而 `enumerate_wcs` 里 `parse_info` 早就把
@@ -390,10 +388,9 @@ spec §6.5 写的是「不允许存在 M/A/D/R/C/!/~/? 任何一种」，并要�
     `p3_still_rejects_after_the_user_ran_svn_cleanup` 失败，
     `p3_rejects_a_working_copy_left_mid_update` 仍然通过（它被 `wc_locked` 兜住）。
     这正好证明「cleanup 之后那条」是不可替代的。
-  - 把 `expected.contains(&e.path)` 短路成恒真 → 只有
-    `p1_does_not_false_alarm_on_ignored_files_git_would_not_take` 失败。
+  - （当时还有一条针对上面那个已撤销收窄的变异，随收窄一起删了。）
 
-  两次变异都只打掉对应的那一条，别的全绿。变异已撤销，撤销后全量 342 passed。
+  变异只打掉对应的那一条，别的全绿。变异已撤销，撤销后全量 342 passed。
 
 #### 为什么这么改是安全的
 

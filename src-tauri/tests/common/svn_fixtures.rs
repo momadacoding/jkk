@@ -220,27 +220,32 @@ pub fn svn_repo_with_svn_ignored_cs() -> SvnFixture {
     fx
 }
 
-/// `svn:ignore` 掉构建产物目录，再把产物造出来。
+/// `svn:ignore` 掉一个**不匹配白名单扩展名**的文件，再把它造出来。
 ///
-/// **误报对照组。** 它同样是「SVN 忽略、且不在版本控制里」，但扩展名不在白名单里
-/// ——git 不会收它，录基线不受影响。P1 若一刀切地把所有 ignored 条目判成脏，
-/// 任何一个正常开发机上的工作副本都过不去，向导变成摆设。
-pub fn svn_repo_with_ignored_build_output() -> SvnFixture {
+/// 和 [`svn_repo_with_svn_ignored_cs`] 成对，用来钉住「P1 不按扩展名放行」：
+/// 这个文件 git 不会收，但它仍然是白名单目录里一个 SVN 不管的文件，
+/// spec §6.5 的禁止清单里 `?` 是明写的，一样要拦。
+pub fn svn_repo_with_svn_ignored_non_code_file() -> SvnFixture {
     let fx = svn_repo();
     let wc = fx.wc();
     run(
         &wc,
         "svn",
-        &["propset", "svn:ignore", "obj", "Code", "--non-interactive"],
+        &[
+            "propset",
+            "svn:ignore",
+            "Notes.txt",
+            "Code",
+            "--non-interactive",
+        ],
     );
     run(
         &wc,
         "svn",
-        &["commit", "-m", "ignore obj", "--non-interactive"],
+        &["commit", "-m", "ignore Notes.txt", "--non-interactive"],
     );
     run(&wc, "svn", &["update", "--non-interactive"]);
-    std::fs::create_dir_all(wc.join("Code/obj")).unwrap();
-    std::fs::write(wc.join("Code/obj/out.dll"), "bin\n").unwrap();
+    std::fs::write(wc.join("Code/Notes.txt"), "n\n").unwrap();
     fx
 }
 

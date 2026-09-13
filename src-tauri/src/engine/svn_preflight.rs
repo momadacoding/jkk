@@ -7,8 +7,6 @@
 //! 模式，属于另一条路径（`engine::svn_externals`）。
 
 use crate::engine::svn_cli::run_svn;
-use crate::engine::svn_config::SvnConfig;
-use crate::engine::svn_include_check::expected_set;
 use crate::engine::svn_wc::{check_single_repository, enumerate_wcs, peg_safe, WcIdentity};
 use crate::engine::svn_xml::{parse_node_revs, parse_status_entries};
 use crate::error::{GitError, Result};
@@ -46,8 +44,8 @@ pub struct Preflight {
 /// `revision="-1"`，它会正常进 `nodeRevs` 使其变成多值。顺序反了的话用户看到的
 /// 是「工作副本是 mixed-revision，请先跑一次完整 svn update」——而真实原因是他有
 /// 个没提交的新文件，那句引导做了也没用。
-pub fn run_preflight(repo_root: &str, cfg: &SvnConfig) -> Result<Preflight> {
-    let roots = whitelist_roots(cfg);
+pub fn run_preflight(repo_root: &str, whitelist: &[String]) -> Result<Preflight> {
+    let roots = whitelist_roots(whitelist);
     if roots.is_empty() {
         return Err(GitError::new(
             "svn_preflight_empty_whitelist",
@@ -57,10 +55,10 @@ pub fn run_preflight(repo_root: &str, cfg: &SvnConfig) -> Result<Preflight> {
         ));
     }
 
-    let wcs = enumerate_wcs(repo_root, &cfg.whitelist)?;
+    let wcs = enumerate_wcs(repo_root, whitelist)?;
     check_single_repository(&wcs)?; // P4
     check_no_operation_in_progress(repo_root, &wcs)?; // P3
-    check_clean(repo_root, cfg, &roots)?; // P1
+    check_clean(repo_root, &roots)?; // P1
     let node_rev = check_single_node_rev(repo_root, &roots, &wcs)?; // P2
 
     let first = wcs.first().ok_or_else(|| {
@@ -77,8 +75,8 @@ pub fn run_preflight(repo_root: &str, cfg: &SvnConfig) -> Result<Preflight> {
 }
 
 /// 白名单条目归一成 svn target：正斜杠、去尾斜杠、丢掉空条目。
-fn whitelist_roots(cfg: &SvnConfig) -> Vec<String> {
-    cfg.whitelist
+fn whitelist_roots(whitelist: &[String]) -> Vec<String> {
+    whitelist
         .iter()
         .map(|w| w.replace('\\', "/").trim_end_matches('/').to_string())
         .filter(|w| !w.is_empty())
@@ -172,19 +170,19 @@ fn operation_in_progress(target: &str, what: &str, how: &str) -> GitError {
 /// **不自动规范化。** revert 用户的本地修改是破坏性的，只拦住并引导去
 /// TortoiseSVN 自己处理（对齐 spec §8.1 #2）。
 ///
-/// # `ignored` / `unversioned` 只在「git 会收」时才算脏
+/// # `ignored` 与 `unversioned` 一律算脏
 ///
-/// spec 要求 `--no-ignore` 的理由原文是「那些文件 git 照收」——判据是 git 收不收，
-/// 不是 SVN 忽不忽略。一刀切地把所有 ignored 条目判脏，会让任何一台装了 IDE 的
-/// 开发机过不去（`Code/obj/` 之类构建产物几乎必然存在且被 `svn:ignore`），
-/// 向导变成摆设。这和「把 `item="external"` 当脏」是同一类误报。
+/// spec 的禁止清单里明写着 `?`，而 `--no-ignore` 的作用就是让被 `svn:ignore`
+/// 挡住的那些也现形。所以判据就是字面的「白名单内 status 必须干净」，
+/// 不按扩展名或别的条件放行。
 ///
-/// 判据用 [`expected_set`]：它按白名单 + 扩展名遍历磁盘算出 W-file 集合，
-/// **不需要 `.git` 存在**——P1 跑在 `git init` 之前，这一点是必须的。
-fn check_clean(repo_root: &str, cfg: &SvnConfig, roots: &[String]) -> Result<()> {
-    let expected = expected_set(repo_root, &cfg.whitelist, &cfg.extensions)?;
+/// 曾经想按「git 会不会收」收窄（只拦匹配白名单扩展名的那些），已撤销：
+/// 那既越过了 spec 的明文，风险方向也反了。误拦是**看得见**的——错误信息里
+/// 直接列出路径，用户当场就能判断；而放行一个 SVN 不管的文件是**看不见**的，
+/// 它会进基线、进交付清单，且基线本身一切正常。
+fn check_clean(repo_root: &str, roots: &[String]) -> Result<()> {
     let mut dirty: Vec<String> = Vec::new();
-    let mut has_ghost = false;
+    let mut has_untracked = false;
 
     for root in roots {
         let arg = peg_safe(root);
@@ -208,11 +206,8 @@ fn check_clean(repo_root: &str, cfg: &SvnConfig, roots: &[String]) -> Result<()>
             }
             match e.item.as_str() {
                 "unversioned" | "ignored" => {
-                    // 只有 git 会收的那些才算脏，理由见函数注释
-                    if expected.contains(&e.path) {
-                        has_ghost = true;
-                        dirty.push(format!("{} （{}，SVN 不管但 git 会收）", e.path, e.item));
-                    }
+                    has_untracked = true;
+                    dirty.push(format!("{} （{}，不在版本控制里）", e.path, e.item));
                 }
                 "normal" => {
                     if e.props != "none" {
@@ -234,10 +229,11 @@ fn check_clean(repo_root: &str, cfg: &SvnConfig, roots: &[String]) -> Result<()>
     } else {
         String::new()
     };
-    let ghost_hint = if has_ghost {
-        "\n带「SVN 不管但 git 会收」的那些：它们会被录进基线，\
-         而 SVN 里根本没有这个文件，交付时必然对不上。\
-         先 svn add 它们，或者把它们移出白名单目录。"
+    let ghost_hint = if has_untracked {
+        "\n带「不在版本控制里」的那些：该进版本控制的先 svn add，\
+         不该进的移出白名单目录。\
+         被 svn:ignore 挡住的文件也在此列——SVN 不管它，git 却可能照收，\
+         那样录进基线的就是一个 SVN 里根本不存在的文件，交付时必然对不上。"
     } else {
         ""
     };
