@@ -146,8 +146,10 @@ export default function SvnInitWizard({
           <strong>{error.message}</strong>
           {/* 空串时不渲染这一段——`wizardErrorHint` 对未知错误码返回 ''，
               直接渲染会变成一个空的提示块 */}
-          {wizardErrorHint(error.code) && (
-            <pre className="svn-notice-detail">{wizardErrorHint(error.code)}</pre>
+          {wizardErrorHint(error.code, error.message) && (
+            <pre className="svn-notice-detail">
+              {wizardErrorHint(error.code, error.message)}
+            </pre>
           )}
         </div>
       )}

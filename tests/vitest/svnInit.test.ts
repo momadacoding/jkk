@@ -126,4 +126,21 @@ describe('错误码到引导语的映射', () => {
     // 组件会直接把它渲染出来，undefined 会变成字符串 "undefined"
     expect(wizardErrorHint('something_unknown')).toBe('')
   })
+
+  it('后端消息已经说过的引导不再重复一遍', () => {
+    // 2026-09-14 真实窗口验证时撞见的：P1 拦截时后端消息本身就以
+    // 「白名单内的工作副本不干净，共 1 处…本应用不会替你 revert…」结尾，
+    // 而这张表又几乎逐字说了一遍，界面上并排两段一模一样的话
+    // ——用户会以为那是两条不同的提示，然后花时间找区别。
+    const backend =
+      '白名单内的工作副本不干净，共 1 处：\n  - Code/A.cs （modified）\n' +
+      '本应用不会替你 revert（那是破坏性操作），请先在 TortoiseSVN 里提交或还原这些改动，再回来建库。'
+    expect(wizardErrorHint('svn_preflight_dirty', backend)).toBe('')
+  })
+
+  it('后端消息没说的引导仍然显示', () => {
+    // 抑制只针对重复，不能把这张表整个变成摆设
+    const terse = '核对失败'
+    expect(wizardErrorHint('include_set_mismatch', terse)).toContain('.gitignore')
+  })
 })

@@ -3,7 +3,7 @@ import { listen } from '@tauri-apps/api/event'
 import { useCallback, useEffect, useState } from 'react'
 import type { CommitNode, DiffData, GraphData, PullRequest, RefPointer, RepoInfo, StashEntry, StatusData, UpstreamInfo, Worktree } from '../engine/types'
 import { ALL_CAPABILITIES, type Capabilities } from '../engine/capabilities'
-import { toErrorMessage } from '../engine/errors'
+import { toErrorCode, toErrorMessage } from '../engine/errors'
 import type { Health, InitReport, Preflight, RebuildReport } from '../engine/svnInit'
 import { samePath } from '../engine/path'
 import { nextSelection } from '../engine/selection'
@@ -36,6 +36,14 @@ export interface RepoState {
   selectedId: string | null
   loading: boolean
   error: string | null
+  /**
+   * 上一次失败的错误码；`null` 表示没失败、或那个异常不带 code。
+   *
+   * 与 `error` 分开存：`error` 是给人看的消息，这个是给**代码**分流用的。
+   * 目前唯一的消费方是 `svn_not_initialized` —— 「有 `.svn` 无 `.git`」不是错误，
+   * 是一个还没走的流程（spec §6.1），该显示初始化向导而不是一条红色横幅。
+   */
+  errorCode: string | null
 }
 
 const initialState: RepoState = {
@@ -54,6 +62,7 @@ const initialState: RepoState = {
   selectedId: null,
   loading: false,
   error: null,
+  errorCode: null,
 }
 
 /**
@@ -118,7 +127,7 @@ export function useRepoStore() {
   const [state, setState] = useState<RepoState>(initialState)
 
   const openRepo = useCallback(async (path: string) => {
-    setState((s) => ({ ...s, loading: true, error: null }))
+    setState((s) => ({ ...s, loading: true, error: null, errorCode: null }))
     try {
       const info = await invoke<RepoInfo>('open_repo', { path })
       // 每次打开都重新读，且**必然写回**：上一个仓库是 SVN 时留下的能力集合
@@ -145,7 +154,12 @@ export function useRepoStore() {
       // 不支持 PR 的后端连这次 gh 调用都省掉——界面上没有任何地方会用到结果。
       if (caps.pullRequests) void refreshPullRequests(path)
     } catch (err) {
-      setState((s) => ({ ...s, loading: false, error: toErrorMessage(err) }))
+      setState((s) => ({
+        ...s,
+        loading: false,
+        error: toErrorMessage(err),
+        errorCode: toErrorCode(err),
+      }))
     }
   }, [])
 
@@ -229,11 +243,15 @@ export function useRepoStore() {
     setState((s) => ({ ...s, selectedId: id }))
   }
 
-  const clearError = useCallback(() => setState((s) => ({ ...s, error: null })), [])
+  const clearError = useCallback(
+    () => setState((s) => ({ ...s, error: null, errorCode: null })),
+    [],
+  )
 
   /** 把一次失败呈现到顶部错误横幅。 */
   const reportError = useCallback(
-    (err: unknown) => setState((s) => ({ ...s, error: toErrorMessage(err) })),
+    (err: unknown) =>
+      setState((s) => ({ ...s, error: toErrorMessage(err), errorCode: toErrorCode(err) })),
     [],
   )
 

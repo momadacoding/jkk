@@ -10,7 +10,13 @@ import { CommitDetailView } from './CommitDetailView'
 import { LocalChangesView } from './LocalChangesView'
 import { Toolbar } from './Toolbar'
 import { StashView } from './StashView'
-import { useRepoStore, useRepoEffects } from '../store/repoStore'
+import {
+  useRepoStore,
+  useRepoEffects,
+  svnInitHybrid,
+  svnPreflightCheck,
+} from '../store/repoStore'
+import SvnInitWizard from './SvnInitWizard'
 import { samePath } from '../engine/path'
 import { visibleSections } from '../engine/capabilities'
 import { askConfirm } from '../engine/confirm'
@@ -481,6 +487,28 @@ export function RepoTab({
   }, [state.commits, state.stashes, state.selectedId])
 
   if (state.loading && state.commits.length === 0) return <div style={{ padding: 16 }}>Loading...</div>
+
+  // 「有 `.svn` 无 `.git`」不是错误，是一个还没走的流程（spec §6.1）。
+  // 显示成一条红色横幅只会让用户以为仓库坏了——这里直接给他初始化向导。
+  // ⚠️ 这里用 `repoPath` 而不是 `state.path`：后者只在 `open_repo` **成功**时才写入，
+  // 而走到这条分支恰恰是因为它失败了。
+  if (state.errorCode === 'svn_not_initialized') {
+    return (
+      <div className="repo-tab">
+        <SvnInitWizard
+          repoPath={repoPath}
+          onCancel={clearError}
+          onPreflight={(whitelist) => svnPreflightCheck(repoPath, whitelist)}
+          onInit={async (whitelist, extensions) => {
+            const report = await svnInitHybrid(repoPath, whitelist, extensions)
+            // 建完之后这个目录已经是混合仓库了，重开一次让整个界面接上
+            void openRepo(repoPath)
+            return report
+          }}
+        />
+      </div>
+    )
+  }
 
   return (
     <div className="repo-tab">

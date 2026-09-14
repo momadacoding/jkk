@@ -21,8 +21,8 @@
 | 6 §6.8 基线体检 | ✅ 完成 | `svn_health.rs`（新）、`svn_wc.rs`（`peg_safe` 文档）、`engine/mod.rs`、`tests/svn_health.rs`（新）、`tests/common/svn_fixtures.rs` | `cargo test --test svn_health` 15 passed；全量 **380 passed / 0 failed / 32 个二进制**（= 365 + 新增 15）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓ |
 | 7 初始化向导编排与回退 | ✅ 完成 | `svn_init.rs`（新）、`svn_config.rs`（加 `write_config`）、`engine/mod.rs`、`tests/svn_init.rs`（新） | 与 Task 8 合并计数 |
 | 8 重建基线 R1–R5 | ✅ 完成 | `svn_init.rs`、`tests/svn_init.rs` | `cargo test --test svn_init` 18 passed；全量 **398 passed / 0 failed / 33 个二进制**（= 380 + 新增 18）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓；变异测试确认「不 checkout 基线分支」这条有牙 |
-| 9 Tauri 命令与向导 UI | ⬜ 未开始 | | |
-| 10 收尾验证 | ⬜ 未开始 | | |
+| 9 Tauri 命令与向导 UI | ✅ 完成 | `commands/svn.rs`（新）、`lib.rs`、`commands/mod.rs`、`svn_init.rs`（加 `check_current_baseline`）、四个 engine 模块加 serde、`src/engine/svnInit.ts`（新）、`src/components/SvnInitWizard.tsx`（新）、`src/store/repoStore.ts`、`src/components/RepoTab.tsx`、`tests/vitest/svnInit.test.ts`（新）、`tests/svn_backend.rs` | Rust **401 passed / 33 个二进制**；前端 **290 passed / 22 files**、`pnpm build` ✓ |
+| 10 收尾验证 | ✅ 完成 | 本文件 | 命令对账 50 == 50；G8 零 SVN 写操作；**真实窗口验证 8 个场景 + 1a 遗留的 2 个命令全部通过**（详见下节） |
 
 ---
 
@@ -789,6 +789,106 @@ spec §6.8.2 的 T1–T7 逐条在临时 fixture 上复现，七条结论与 spe
   `rebuild_refuses_when_the_working_copy_is_dirty` 断言用户的改动原样还在。
 - 全量 `cargo test -j 2` = 398 passed / 0 failed / 33 个二进制，相对 Task 6 的 380
   多的正好是新增的 18 条，无回归。
+
+---
+
+## Task 9 + 10：命令层、向导 UI、收尾验证
+
+#### 偏离计划
+
+- **多了 `engine::svn_init::check_current_baseline`，命令层的 `svn_check_baseline`
+  走它。** 计划只写了「体检当前基线」，没说 rev 从哪来。这里取**基线自己的
+  trailer**，不是 `nodeRevs`——这是 `Health::Lying` **唯一真正可达**的入口
+  （理由见 Task 7+8 那节）。真实窗口验证里它确实报出了 `lying`。
+
+- **多改了 `RepoTab.tsx` 与 `repoStore` 的 `errorCode`。** 计划的 Modify 列表里
+  没有 `RepoTab.tsx`，但不接这一下向导就是**死代码**，Task 10 Step 4 要求的
+  窗口验证也就无从谈起。改动很小：`RepoState` 加一个 `errorCode`（`error` 是给人
+  看的消息，这个是给代码分流的），`RepoTab` 在 `svn_not_initialized` 时渲染向导
+  而不是红色横幅——「有 `.svn` 无 `.git`」不是错误，是一个还没走的流程（spec §6.1）。
+
+- **`Health` 用 `#[serde(tag = "status")]` 压平成判别联合**，而不是 serde 默认的
+  外部标签。默认会吐成 `{"Verified":{"rev":1}}`：键名带大写、前端还要多剥一层。
+
+#### 计划的错误
+
+无。Task 9 的清单与实际需要一致。
+
+#### 计划没写的坑
+
+- **`pnpm test` 在本 worktree 里会跑到主工作区。** Task 0 记的版本（「装了
+  `node_modules` 就好」）**不准确**：`node_modules` 装着，`pnpm test` 仍然跑出
+  193 个文件 / 2475 条。原因是这个 worktree 嵌在 `<主仓库>/.claude/worktrees/` 下，
+  vitest 的 root 解析走到了主仓库。**必须用 `pnpm exec vitest run --root .`**，
+  那才是这一份的 22 files / 290 tests。Task 10 的数字全部按后者记。
+
+- **`state.path` 在打开失败时是 `null`。** 向导那条分支恰恰是因为 `open_repo`
+  失败才走到的，所以路径必须取 `repoPath` prop。第一版写成 `state.path` 时向导
+  永远不会渲染。
+
+- **后端错误消息与前端引导会逐字重复。** 真实窗口里跑到 P1 拦截时看到的：
+  后端消息已经是「白名单内的工作副本不干净，共 1 处…本应用不会替你 revert…请先在
+  TortoiseSVN 里…」，而 `wizardErrorHint` 又几乎一字不差地说了一遍，界面上并排
+  两段一模一样的话——用户会以为是两条不同的提示然后去找区别。
+
+  修法：`wizardErrorHint(code, message)` 在后端消息已经包含该引导前 12 个字时返回
+  空串。表仍然保留（它是 UI 侧的保证：后端消息哪天改短了引导不会跟着消失），
+  只是不重复。配了两条测试：重复时抑制、不重复时照常显示。
+
+- **`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222` 能让
+  Tauri 窗口开出 CDP**，于是窗口验证可以脚本化。chrome-devtools MCP **接不上**
+  它（那个工具会自己起一个 Chrome），要自己用 `ClientWebSocket` 发
+  `Runtime.evaluate`。脚本在 scratchpad 的 `cdp.ps1`。
+  这条值得记：Phase 1a 的窗口验证就是因为「没法脚本化」而被跳过的。
+
+### 真实窗口验证（`AGENTS.md` §5.1，Task 10 Step 4）
+
+2026-09-14，`pnpm tauri dev` 的真实窗口，全部目标是 `%TEMP%` 下的一次性 SVN
+fixture，验完即删。**没有碰任何真实仓库。**
+
+命令全部经由 `window.__TAURI_INTERNALS__.invoke` 发出，所以 snake_case ↔ camelCase
+的参数名转换、序列化、错误对象形状都过了真实 IPC 层（`AGENTS.md` §7.3）。
+
+| # | 场景 | 结果 |
+|---|---|---|
+| 11 | 干净工作副本走完向导 | ✅ HEAD 在 `work`；基线树只有 `Code/A.cs`、`Code/B.cs`（`Art.psd` 与 `Art/boss.fbx` 都没进）；trailer = `Repository Root@1 + UUID`；`git status` 空；无临时索引残留；服务器 revision 未变 |
+| 12 | 白名单内有本地修改 | ✅ P1 拦住（`svn_preflight_dirty`），消息点名 `Code/A.cs （modified）` 并写明「不会替你 revert」；**没有创建 `.git`**，本地修改原样保留 |
+| 13 | mixed-revision | ✅ P2 拦住，报 `{1, 2}`；白名单不在 external 内，给的是「先跑一次完整 svn update」那条有效引导 |
+| 14 | 白名单跨仓库 | ✅ P4 拦住，消息里两个 UUID 都点了名；没有创建 `.git` |
+| 15 | externals 被 `-r` 钉死 | ✅ **不阻断**，`pinned: [Code/pinnedArt@r1]`，建库照常完成 |
+| 16 | 体检报 Lying | ✅ 磁盘已是 r2、基线 trailer 还写着 r1 时，`svn_check_baseline` 报 `{status:"lying", files:["Code/A.cs"]}` |
+| 17 | 断网时体检 | ✅ 仓库目录改名后得到 `{status:"notChecked", reason:"E170013 Unable to connect…"}`——**不是** `lying`，也没有 reject |
+| 18 | 外部 update 后重建基线 | ✅ `nodeRev: 2`、新旧基线 OID 不同、体检 `verified`；HEAD 仍在 `work` 且未移动 |
+| — | 重复初始化 | ✅ `svn_already_initialized`，已有的 `.git` 没被碰 |
+
+**UI 层也在窗口里走了一遍**（S12 的本地修改写回原内容后它变成一个干净的未初始化
+工作副本）：向导四个步骤的状态流转正确（`current → done`）；扩展名输入 `cs, cs, .cs`
+被正确归一成 `.cs`；P1–P5 通过后显示记账 revision / 仓库根 / UUID；点「建库」之后
+向导退场、主界面接上，分支只有 `svn/base` 与 `work`，**TAGS 与 WORKTREES 整块不
+渲染**（`read_capabilities` 在真窗口里生效）。
+
+### Phase 1a 遗留的窗口验证（用户 2026-09-14 确认并进本期）
+
+1a 的两个命令是在窗口验证没跑的情况下合并进 master 的（PR #41 的复选框一直空着，
+没有谎报）。这次一并验完：
+
+| 命令 | 结果 |
+|---|---|
+| `probe_svn_environment` | ✅ 返回 `"available"` |
+| `read_capabilities` | ✅ 六个键 `worktrees/tags/remotes/pullRequests/cherryPick/patches` 全部存在且为 `false`，camelCase 转换正确 |
+
+### G8：本期仍然零 SVN 写操作
+
+`run_svn` / `run_svn_code` 的全部调用点实际发出的子命令只有：
+`info`、`status`、`propget`、`diff`（加 `probe_svn` 的 `--version`）。
+没有 `add` / `commit` / `update` / `revert` / `propset` / `merge` 中的任何一个。
+`svn_baseline.rs` 里那个 `"add"` 是 **`git add`**，走 `run_git_env`。
+
+窗口验证里对 S11 / S12 各比对了一次服务器 HEAD revision，建库前后相等。
+
+### 命令注册对账
+
+`#[tauri::command]` 标注 **50** 个 == `lib.rs` 注册 **50** 个 == 1a 的 46 + 本期新增 4。
 
 ---
 

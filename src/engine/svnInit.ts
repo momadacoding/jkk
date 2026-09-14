@@ -195,8 +195,19 @@ export function describePinned(pinned: PinnedExternal[]): Notice | null {
  *
  * 没有对应条目时返回**空串**而不是 `undefined`：组件会直接渲染它，
  * `undefined` 会变成字符串 `"undefined"` 显示在界面上。
+ *
+ * # 为什么要收 `message`
+ *
+ * 2026-09-14 在真实窗口里跑到 P1 拦截时发现：后端的错误消息本身已经把
+ * 「不会替你 revert，请去 TortoiseSVN」说完了，这张表又几乎逐字说了一遍，
+ * 界面上并排显示两段一模一样的话——用户会以为那是两条不同的提示，
+ * 然后花时间去找区别。
+ *
+ * 所以这张表仍然保留（它是 UI 这一侧的保证：后端消息哪天改短了，引导不会跟着消失），
+ * 但**后端已经说过的就不再重复**。判据是前 12 个字——足够长到不会误伤，
+ * 又不依赖整句逐字相同。
  */
-export function wizardErrorHint(code: string): string {
+export function wizardErrorHint(code: string, message = ''): string {
   const table: Record<string, string> = {
     svn_preflight_dirty:
       '白名单内的工作副本不干净。本应用**不会**替你 revert（那是破坏性操作），' +
@@ -222,5 +233,8 @@ export function wizardErrorHint(code: string): string {
       '——最常见的原因是工作树里有一个 .gitignore 盖掉了本应用生成的规则。',
     svn_baseline_no_trailer: '基线分支上没有本应用写的记账信息，它不是本应用录出来的基线。请重建基线。',
   }
-  return table[code] ?? ''
+  const hint = table[code]
+  if (!hint) return ''
+  const head = hint.replace(/\*\*/g, '').slice(0, 12)
+  return message.replace(/\*\*/g, '').includes(head) ? '' : hint
 }
