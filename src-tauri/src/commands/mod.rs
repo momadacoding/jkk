@@ -7,6 +7,7 @@ pub mod remote;
 pub mod repo;
 pub mod session;
 pub mod stash;
+pub mod svn;
 pub mod tree;
 pub mod watch;
 pub mod worktree;

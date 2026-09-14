@@ -30,7 +30,8 @@ pub struct ExternalDef {
 }
 
 /// 一条被钉死、且与白名单有交集的 external。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PinnedExternal {
     /// 定义这条 external 的目录，仓库内相对路径（正斜杠）；定义在仓库根上时是空串。
     pub defined_in: String,

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from 'react'
 import type { CommitNode, DiffData, GraphData, PullRequest, RefPointer, RepoInfo, StashEntry, StatusData, UpstreamInfo, Worktree } from '../engine/types'
 import { ALL_CAPABILITIES, type Capabilities } from '../engine/capabilities'
 import { toErrorMessage } from '../engine/errors'
+import type { Health, InitReport, Preflight, RebuildReport } from '../engine/svnInit'
 import { samePath } from '../engine/path'
 import { nextSelection } from '../engine/selection'
 
@@ -70,6 +71,47 @@ async function readCapabilities(path: string): Promise<Capabilities> {
     console.warn('读取后端能力失败，按普通 git 仓库渲染全部入口：', err)
     return ALL_CAPABILITIES
   }
+}
+
+// ---------------------------------------------------------------------------
+// SVN 混合仓库（Phase 1b）
+//
+// 这四个是**薄壳**：不吞错误、不重试、不做判断。三个会改磁盘的命令失败时必须
+// 原样抛出去，让向导留在原地把错误显示给用户——`readCapabilities` 那种「失败就
+// 退回默认值」的写法在这里是灾难性的（用户会以为建库成功了）。
+//
+// ⚠️ 参数名是 `snake_case` → `camelCase` 转换后的形态，没有编译期检查
+// （AGENTS.md §7.3）。Rust 侧 `path` / `whitelist` / `extensions` 三个都是单词，
+// 转换后不变，但别因此以为这层不存在。
+// ---------------------------------------------------------------------------
+
+/** 只跑 P1–P4，什么都不创建。 */
+export function svnPreflightCheck(path: string, whitelist: string[]): Promise<Preflight> {
+  return invoke<Preflight>('svn_preflight_check', { path, whitelist })
+}
+
+/** 走完初始化向导。**会在工作副本里创建 `.git`**；任何一步失败后端会自己删干净。 */
+export function svnInitHybrid(
+  path: string,
+  whitelist: string[],
+  extensions: string[],
+): Promise<InitReport> {
+  return invoke<InitReport>('svn_init_hybrid', { path, whitelist, extensions })
+}
+
+/** 重建基线。**会移动基线指针**；不动 HEAD、不动索引、不动磁盘。 */
+export function svnRebuildBaseline(path: string): Promise<RebuildReport> {
+  return invoke<RebuildReport>('svn_rebuild_baseline', { path })
+}
+
+/**
+ * 体检当前基线。
+ *
+ * 三种结果都从 `Promise` 正常返回，**只有命令本身没跑起来才 reject**：
+ * 「没能验证」与「验证不通过」必须分开（spec §6.8.6）。
+ */
+export function svnCheckBaseline(path: string): Promise<Health> {
+  return invoke<Health>('svn_check_baseline', { path })
 }
 
 export function useRepoStore() {

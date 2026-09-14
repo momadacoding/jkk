@@ -34,7 +34,8 @@ pub struct InitRequest {
 }
 
 /// 初始化的结果。**`health` 与 `pinned` 都不是失败**，是要在 UI 上如实显示的状态。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InitReport {
     /// 记账单位 N，取自 P2 读到的 `nodeRevs`。
     pub node_rev: u64,
@@ -181,7 +182,8 @@ fn build_repo(
 }
 
 /// 重建基线的结果。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RebuildReport {
     /// 新的记账单位 N。
     pub node_rev: u64,
@@ -289,6 +291,50 @@ pub fn rebuild_baseline(repo_root: &str) -> Result<RebuildReport> {
         new_baseline,
         health,
     })
+}
+
+/// 体检当前基线——**rev 取自基线自己的 trailer**，不是 `nodeRevs`。
+///
+/// 这是 spec §6.8.5 那张表里「用户手动点体检」那一行，也是**唯一一个
+/// `Health::Lying` 真正可达的入口**：
+///
+/// `init_hybrid` 与 `rebuild_baseline` 的 rev 都取自 `nodeRevs`，而 P1–P3 已经
+///保证了工作副本与那个 revision 一致，于是体检在那两处结构上必然通过。
+/// 这里读的是基线**自称**的 revision——它可能早就过时了（有人在项目根跑了递归
+/// update 把 external 退回 peg、恢复流程没走完、或者基线本来就录错了），
+/// 这正是 §6.8.1 说的「让基线可被服务器证伪」。
+pub fn check_current_baseline(repo_root: &str) -> Result<Health> {
+    if detect_repo_kind(repo_root) != RepoKind::SvnHybrid {
+        return Err(GitError::new(
+            "svn_not_hybrid",
+            "这个目录不是已初始化的混合仓库，没有基线可体检。",
+        ));
+    }
+    let cfg = crate::engine::svn_config::read_config(repo_root)?;
+    let msg = run_git(
+        repo_root,
+        &[
+            "log",
+            "-1",
+            "--format=%B",
+            &format!("refs/heads/{BASELINE_BRANCH}"),
+        ],
+    )?;
+    let trailer = crate::engine::svn_baseline::parse_trailer(&msg).ok_or_else(|| {
+        // 「解析失败即视为该 commit 不是 baseline」（spec §6.4.1，不猜、不部分接受）。
+        GitError::new(
+            "svn_baseline_no_trailer",
+            "基线分支最新的 commit 上没有可解析的 git-svn-id trailer，\
+             它不是本应用录出来的基线。体检无从谈起——请重建基线。",
+        )
+    })?;
+    check_baseline(
+        repo_root,
+        &cfg.svn_url,
+        trailer.rev,
+        &cfg.whitelist,
+        &cfg.extensions,
+    )
 }
 
 fn read_baseline_oid(repo_root: &str) -> Result<String> {

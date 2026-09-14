@@ -225,6 +225,100 @@ fn capabilities_serializes_to_the_exact_field_names_the_frontend_reads() {
     assert!(obj.values().all(|v| v == &serde_json::Value::Bool(true)));
 }
 
+// ---------------------------------------------------------------------------
+// Phase 1b：四个新命令的返回类型也要把字段名钉住
+//
+// 同样的理由（`AGENTS.md` §7.3）：`tsc` 只看 `src/engine/svnInit.ts` 里的接口
+// 声明，它不知道 Rust 那边真正吐出来的是什么。
+// ---------------------------------------------------------------------------
+
+fn keys_of(v: &serde_json::Value) -> Vec<String> {
+    let mut k: Vec<String> = v
+        .as_object()
+        .expect("应当序列化成对象")
+        .keys()
+        .cloned()
+        .collect();
+    k.sort();
+    k
+}
+
+#[test]
+fn preflight_serializes_to_camel_case() {
+    let json = serde_json::to_value(app_lib::engine::svn_preflight::Preflight {
+        node_rev: 7,
+        repos_root: "file:///x".into(),
+        uuid: "u".into(),
+    })
+    .unwrap();
+    assert_eq!(keys_of(&json), vec!["nodeRev", "reposRoot", "uuid"]);
+    assert_eq!(json["nodeRev"], 7);
+}
+
+#[test]
+fn the_three_health_states_serialize_as_a_discriminated_union() {
+    // 前端要按结果分三种显示（spec §6.8.6），所以判别字段必须稳定。
+    // serde 默认的外部标签会吐成 `{"Verified":{"rev":1}}`——键名带大写、
+    // 还要多剥一层。这里用 `#[serde(tag = "status")]` 压平成前端好读的形状。
+    use app_lib::engine::svn_health::Health;
+
+    let v = serde_json::to_value(Health::Verified { rev: 12346 }).unwrap();
+    assert_eq!(v["status"], "verified");
+    assert_eq!(v["rev"], 12346);
+
+    let l = serde_json::to_value(Health::Lying {
+        files: vec!["Code/A.cs".into()],
+    })
+    .unwrap();
+    assert_eq!(l["status"], "lying");
+    assert_eq!(l["files"][0], "Code/A.cs");
+
+    let n = serde_json::to_value(Health::NotChecked {
+        reason: "断网了".into(),
+    })
+    .unwrap();
+    assert_eq!(n["status"], "notChecked");
+    assert_eq!(n["reason"], "断网了");
+}
+
+#[test]
+fn init_and_rebuild_reports_serialize_to_camel_case() {
+    use app_lib::engine::svn_health::Health;
+    use app_lib::engine::svn_init::{InitReport, RebuildReport};
+
+    let init = serde_json::to_value(InitReport {
+        node_rev: 1,
+        baseline: "abc".into(),
+        health: Health::Verified { rev: 1 },
+        pinned: vec![app_lib::engine::svn_externals::PinnedExternal {
+            defined_in: "Code".into(),
+            local_path: "Code/pinA".into(),
+            pinned_rev: 1,
+        }],
+    })
+    .unwrap();
+    assert_eq!(
+        keys_of(&init),
+        vec!["baseline", "health", "nodeRev", "pinned"]
+    );
+    assert_eq!(
+        keys_of(&init["pinned"][0]),
+        vec!["definedIn", "localPath", "pinnedRev"]
+    );
+
+    let rebuild = serde_json::to_value(RebuildReport {
+        node_rev: 2,
+        old_baseline: "a".into(),
+        new_baseline: "b".into(),
+        health: Health::NotChecked { reason: "x".into() },
+    })
+    .unwrap();
+    assert_eq!(
+        keys_of(&rebuild),
+        vec!["health", "newBaseline", "nodeRev", "oldBaseline"]
+    );
+}
+
 #[test]
 fn the_probe_svn_environment_command_reports_one_of_three_states() {
     // ⚠️ 这个命令在 Phase 1a **没有前端调用方**（它是给 1b 的初始化向导准备的），

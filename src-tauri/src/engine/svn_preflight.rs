@@ -13,7 +13,8 @@ use crate::error::{GitError, Result};
 use std::collections::BTreeSet;
 
 /// 录基线需要、而且只有走完校验才敢用的三个事实。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Preflight {
     /// 记账单位 N。**取自 `nodeRevs`，不是 `svn info .` 的 revision。**
     ///

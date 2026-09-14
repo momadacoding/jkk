@@ -20,7 +20,8 @@ use crate::engine::svn_xml::parse_diff_summary;
 use crate::error::{GitError, Result};
 
 /// 体检的三种结果。**必须分开**（spec §6.8.6）。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
 pub enum Health {
     /// 命令成功，按 §6.8.4 过滤后无 W-file 内容差异 —— 基线可信。
     Verified { rev: u64 },
