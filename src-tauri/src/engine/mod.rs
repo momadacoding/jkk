@@ -18,6 +18,7 @@ pub mod svn_cli;
 pub mod svn_config;
 pub mod svn_exclude;
 pub mod svn_externals;
+pub mod svn_health;
 pub mod svn_include_check;
 pub mod svn_preflight;
 pub mod svn_wc;

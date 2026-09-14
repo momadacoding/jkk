@@ -249,6 +249,57 @@ pub fn svn_repo_with_svn_ignored_non_code_file() -> SvnFixture {
     fx
 }
 
+/// §6.8 基线体检用的仓库：白名单内既有 `.cs` 也有 `.psd`，白名单外还有美术资产。
+///
+/// r1 的内容：
+///
+/// ```text
+/// Code/A.cs        ← 白名单内、匹配扩展名
+/// Code/Art.psd     ← 白名单内、**不**匹配扩展名（T3b 的误报对照组）
+/// Code/Deep/D.cs   ← 深层，服务器删掉它来覆盖 T7
+/// Art/boss.fbx     ← 白名单外（T3 的误报对照组）
+/// ```
+pub fn svn_repo_for_health() -> SvnFixture {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    run(&root, "svnadmin", &["create", "repo"]);
+    let url = file_url(&root.join("repo"));
+    run(
+        &root,
+        "svn",
+        &["checkout", &url, "wc1", "--non-interactive"],
+    );
+    let wc = root.join("wc1");
+    std::fs::create_dir_all(wc.join("Code/Deep")).unwrap();
+    std::fs::create_dir_all(wc.join("Art")).unwrap();
+    std::fs::write(wc.join("Code/A.cs"), "v1\n").unwrap();
+    std::fs::write(wc.join("Code/Art.psd"), "p1\n").unwrap();
+    std::fs::write(wc.join("Code/Deep/D.cs"), "d1\n").unwrap();
+    std::fs::write(wc.join("Art/boss.fbx"), "f1\n").unwrap();
+    run(&wc, "svn", &["add", "Code", "Art", "--non-interactive"]);
+    run(&wc, "svn", &["commit", "-m", "r1", "--non-interactive"]);
+    run(&wc, "svn", &["update", "--non-interactive"]);
+    SvnFixture { dir }
+}
+
+/// [`svn_repo_for_health`] 再往前走一个 revision：服务器上改了 `Code/A.cs`、
+/// **删掉了** `Code/Deep/D.cs`，工作副本已更新到 r2。
+///
+/// 拿它配 `baselineRev = 1` 就是 spec §6.8.2 的 T4（假基线）与 T7（服务器删文件）。
+pub fn svn_repo_for_health_at_r2() -> SvnFixture {
+    let fx = svn_repo_for_health();
+    let wc = fx.wc();
+    std::fs::write(wc.join("Code/A.cs"), "v2\n").unwrap();
+    run(
+        &wc,
+        "svn",
+        &["delete", "Code/Deep/D.cs", "--non-interactive"],
+    );
+    run(&wc, "svn", &["commit", "-m", "r2", "--non-interactive"]);
+    run(&wc, "svn", &["update", "--non-interactive"]);
+    fx
+}
+
 /// `Code/` 上挂五条 external，把 spec §6.5.2 的五种写法一次摆齐。
 ///
 /// 一条跟随 HEAD（`follow`），四条用四种不同语法钉在 r1。

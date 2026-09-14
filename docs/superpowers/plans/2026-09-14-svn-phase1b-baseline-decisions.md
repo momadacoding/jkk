@@ -18,7 +18,7 @@
 | 3 P1/P2/P3 硬门槛 | ✅ 完成 | `svn_preflight.rs`（新）、`svn_xml.rs`、`svn_wc.rs`、`engine/mod.rs`、`tests/svn_preflight.rs`（新）、`tests/common/svn_fixtures.rs` | `cargo test --test svn_preflight` 10 passed；全量 **342 passed / 0 failed / 29 个二进制**（= 332 + 新增 10）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓；另做了一轮变异测试验证两条关键断言有牙 |
 | 4 P5 externals 钉死检测 | ✅ 完成 | `svn_externals.rs`（新）、`engine/mod.rs`、`tests/svn_externals.rs`（新）、`tests/common/svn_fixtures.rs` | `cargo test --test svn_externals` 10 passed；全量 **352 passed / 0 failed / 30 个二进制**（= 342 + 新增 10）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓；变异测试确认 `@N` peg 判据有牙 |
 | 5 基线录制（临时索引 / trailer） | ✅ 完成 | `svn_baseline.rs`（新）、`svn_include_check.rs`、`engine/mod.rs`、`tests/svn_baseline.rs`（新）、`tests/svn_exclude.rs` | `cargo test --test svn_baseline` 13 passed、`--test svn_exclude` 25 passed；全量 **365 passed / 0 failed / 31 个二进制**（= 352 + 新增 13）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓ |
-| 6 §6.8 基线体检 | ⬜ 未开始 | | |
+| 6 §6.8 基线体检 | ✅ 完成 | `svn_health.rs`（新）、`svn_wc.rs`（`peg_safe` 文档）、`engine/mod.rs`、`tests/svn_health.rs`（新）、`tests/common/svn_fixtures.rs` | `cargo test --test svn_health` 15 passed；全量 **380 passed / 0 failed / 32 个二进制**（= 365 + 新增 15）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓ |
 | 7 初始化向导编排与回退 | ⬜ 未开始 | | |
 | 8 重建基线 R1–R5 | ⬜ 未开始 | | |
 | 9 Tauri 命令与向导 UI | ⬜ 未开始 | | |
@@ -588,6 +588,89 @@ svn 输出的形态，手写理想 XML 等于没测」，而计划里那六段�
 - 删掉纯读模拟属于**减少**事实源：原来「核对读的集合」与「录制写的树」是两条独立
   推导出来的东西，现在是同一份索引的两次读取。全量 `cargo test -j 2` = 365 passed /
   0 failed / 31 个二进制，相对 Task 4 的 352 多的正好是新增的 13 条，无回归。
+
+---
+
+## Task 6：§6.8 基线体检
+
+新增 `engine/svn_health.rs`：`check_baseline` + `Health::{Verified, Lying, NotChecked}`。
+spec §6.8.2 的 T1–T7 逐条在临时 fixture 上复现，七条结论与 spec 记的完全一致。
+
+#### 偏离计划
+
+- **白名单根不过 `peg_safe`，与计划的 Interfaces 相反。** 计划写着
+  「Consumes: … `svn_wc::peg_safe`」。实测这条会让命令直接失败，见下。
+
+- **多发一条 `svn info` 核对 `svnUrl`。** 计划没有这一步，是写测试时发现的
+  真实误报路径，见下。
+
+#### 计划的错误
+
+- **`svn diff` 的尾随 target **不接受**空 peg 后缀。**
+  2026-09-14 实测：`svn diff --old=… --new=. --summarize --xml -- Code@` 报
+  `E155010: The node '…\wc\Code@' was not found` —— 带 `--old` / `--new` 时尾随
+  target 是**纯路径**，`@` 被当成字面字符，不走 peg 解析。
+
+  这推翻了 1a 给 `peg_safe` 写的那句「不含 `@` 的普通路径追加尾缀同样合法，
+  无条件追加因此没有代价」——那条结论是在 `info` / `status` 上验的。
+  已把这个例外补进 `peg_safe` 的 doc 注释。
+
+  连带的**已知限制**：白名单路径含 `@` 时，`enumerate_wcs` **必须**加后缀而
+  `svn_health` **必须不加**，两边都能工作的写法目前不存在，所以那种路径没法做体检。
+  记在 `check_baseline` 的 doc 注释里。
+
+#### 计划没写的坑
+
+- **`svnUrl` 配成仓库子路径时会产出一份看起来完全合理的 `Lying` 清单。**
+  这是写 `a_url_that_does_not_match_the_output_is_not_checked_rather_than_lying`
+  这条测试时撞出来的：我原以为「前缀剥不掉」能拦住它，实测**前缀照样剥得掉**
+  ——输出路径就是 `<svnUrl>/<target>/…`，剥掉 `<svnUrl>/` 正好得到 `Code/A.cs`。
+  于是 `--old` 那侧指向一个不存在的 `<svnUrl>/Code`，白名单里每个文件都被报成差异。
+
+  按 spec §6.8.6，初始化时 `Lying` 会触发**整个回退**。把一处配置错误变成
+  「基线撒谎」是这条检查最坏的失败形态——比漏报糟得多，因为用户完全无从下手。
+
+  处置：跑 diff 之前先 `svn info` 核对 `svnUrl` 与工作副本根的实际 URL，
+  对不上返回 `NotChecked` 并说清楚该填什么。测试从「断言剥不掉前缀」改成
+  「断言这条真实误报路径被拦住」。
+
+- **命令失败时 svn 仍然往 stdout 打出部分 XML。** 实测 URL 不可达时 stdout 里
+  有 `<?xml …?>` 和 `<diff><paths>`，错误只在 stderr 和退出码里。
+  「解析得出来就算成功」的实现会在断网时拿到一个空的 paths 列表，于是
+  **报告基线健康**——这条检查等于不存在。专门写了一条测试守它，并配了
+  「同一个工作副本、同一处真实差异、只把 URL 指歪」的对照组，
+  证明 `NotChecked` 不是因为别的原因静默的。
+
+- **`rev` 大于服务器 HEAD 时是 exit 1 + `E160006: No such revision`**，
+  同样归 `NotChecked`（最可能的成因是 `svnUrl` 配错或指向了另一个仓库），
+  不是「基线撒谎」。
+
+- **W-file 判定必须是纯路径判断，不能走磁盘。** `expected_set` 遍历磁盘，
+  而 T7 那类差异（服务器上删掉了 `Code/Deep/D.cs`）的文件在磁盘上根本不存在，
+  走磁盘的判断会把它整个漏掉——那正是 §9.4.1 那类漏检要抓的东西。
+
+- **`Code/Art.psd` 确实会出现在输出里。** 计划和 spec 都说了要按扩展名剔除，
+  这里补一条实测确认：白名单根**底下**的非 W-file 文件被改过时，
+  `svn diff --summarize` 会报它。T3（白名单**外**的美术文件）和 T3b（白名单
+  **内**但扩展名不匹配）是两条不同的路径，各写了一条测试。
+
+- **空白名单返回 `Err` 而不是 `Verified`。** 不传 target 时 `svn diff` 会拿整个
+  工作副本去比——对 Unity 工程是几个 GB，且任何一处正常的本地改动都会报成撒谎。
+  返回 `Verified` 更糟：等于宣布一个空白名单的基线是健康的。
+
+#### 为什么这么改是安全的
+
+- **全部是只读命令**：`svn info --xml` 与 `svn diff --summarize --xml`。
+  没有 `update`、`revert`、`commit`、`propset`。
+- **三种结果严格分开**，且默认方向是保守的：任何跑不成的情况都落到 `NotChecked`
+  （不阻断、如实显示「未经体检」），只有「命令成功且过滤后仍有 W-file 内容差异」
+  才是 `Lying`。这与 spec §6.8.6 的三行表逐行对应。
+- **两条「不误报」测试（T3 / T3b）和一条「配置错误不当成撒谎」测试**共同守着
+  这条检查最危险的方向。误报会让一个完全正常的仓库永远建不起来，而且按 spec
+  它会触发整个初始化回退。
+- 纯新增模块 + 一处 doc 注释修正，没有改动任何既有函数的行为。全量
+  `cargo test -j 2` = 380 passed / 0 failed / 32 个二进制，相对 Task 5 的 365
+  多的正好是新增的 15 条，无回归。
 
 ---
 

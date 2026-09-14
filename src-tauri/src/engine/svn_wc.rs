@@ -108,6 +108,16 @@ pub fn enumerate_wcs(repo_root: &str, whitelist: &[String]) -> Result<Vec<WcIden
 ///
 /// ⚠️ 只用在**命令行参数**上。`wc_root` 这类内部键必须保持原始路径：带上尾缀
 /// 会让去重比对失效，也会原样显示给用户。
+///
+/// # ⚠️ `svn diff` 的尾随 target 是例外，**不要**用本函数
+///
+/// 上面「无条件追加没有代价」那条结论是在 `info` / `status` 上验的。2026-09-14
+/// 实测 `svn diff --old=… --new=. -- Code@` 报
+/// `E155010: The node '…\wc\Code@' was not found` —— 带 `--old` / `--new` 时
+/// 尾随 target 是**纯路径**，`@` 被当成字面字符，不走 peg 解析。
+///
+/// 于是两边的要求正好相反：`enumerate_wcs` 必须加后缀，`svn_health` 必须不加。
+/// 连带的已知限制是白名单路径含 `@` 时体检没法跑，见 `svn_health::check_baseline`。
 pub fn peg_safe(target: &str) -> String {
     format!("{target}@")
 }
