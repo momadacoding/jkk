@@ -203,6 +203,32 @@ fn an_empty_whitelist_is_rejected_before_anything_is_created() {
     assert!(!fx.wc().join(".git").exists());
 }
 
+#[test]
+fn init_refuses_a_whitelist_that_open_would_later_reject() {
+    // **独立 review 的 BL-1。**
+    //
+    // `SvnGitBackend::open` 每次打开混合仓库都跑 `validate_whitelist_against_disk`，
+    // 而 `init_hybrid` 是唯一**写入**配置的地方。两边不接上的话，向导能建出一个
+    // 自己打不开的仓库：
+    //
+    //   `Code`（漏尾斜杠，很自然的手误）+ 目录里恰好全是匹配扩展名的文件
+    //   → 期望集合与候选索引相等 → 纳入集合核对通过 → 初始化成功 → 配置落盘
+    //   → 下一次 open_repo 被拒 → 此刻目录已是 SvnHybrid，向导那条分支只认
+    //     `svn_not_initialized`，用户在应用内**没有任何出路**。
+    //
+    // `tests/svn_config.rs` 早就断言了 `["Code"]` 必被那个校验拒绝，
+    // 缺的只是把两条路径接上。
+    let fx = svn_repo(); // Code/ 底下只有 A.cs 与 B.cs，全部匹配 .cs
+    let err = init_hybrid(&InitRequest {
+        repo_root: fx.wc_str(),
+        whitelist: vec!["Code".to_string()], // ← 漏了尾斜杠
+        extensions: vec![".cs".to_string()],
+    })
+    .expect_err("漏尾斜杠的目录条目必须在建库前就被拒");
+    assert_eq!(err.code, "svn_config");
+    assert!(!fx.wc().join(".git").exists(), "校验没过却建了 .git");
+}
+
 // ---------------------------------------------------------------------------
 // Task 8：重建基线 R1–R5（spec §16）
 // ---------------------------------------------------------------------------

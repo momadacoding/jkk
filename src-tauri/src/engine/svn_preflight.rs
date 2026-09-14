@@ -231,8 +231,12 @@ fn check_clean(repo_root: &str, roots: &[String]) -> Result<()> {
         String::new()
     };
     let ghost_hint = if has_untracked {
-        "\n带「不在版本控制里」的那些：该进版本控制的先 svn add，\
-         不该进的移出白名单目录。\
+        // 三条出路都要给全。独立 review 指出：只说「svn add 或移出白名单目录」时，
+        // 对一个被 svn:ignore 挡住的构建产物目录来说两条都不可行，用户会卡死。
+        "\n带「不在版本控制里」的那些，三条出路：\
+         ① 该进版本控制的先 svn add；\
+         ② 不该进的从白名单目录里移走；\
+         ③ 把白名单收窄到不含它（比如从 `Code/` 改成 `Code/Scripts/`）。\n\
          被 svn:ignore 挡住的文件也在此列——SVN 不管它，git 却可能照收，\
          那样录进基线的就是一个 SVN 里根本不存在的文件，交付时必然对不上。"
     } else {

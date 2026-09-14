@@ -355,6 +355,89 @@ pub fn svn_repo_with_five_external_forms() -> SvnFixture {
     SvnFixture { dir }
 }
 
+/// 一个 `Code/` 子树被 `svn switch` 到了另一条分支的工作副本。
+///
+/// # 为什么这个形态是必须覆盖的
+///
+/// 2026-09-14 独立 review 给的反例，实测**四道前置门槛一个都拦不住**：
+/// `svn status` 对「target 就是被 switch 的那个目录」一条 entry 都不出（P1 过）、
+/// `nodeRevs` 单值（P2 过）、工作副本干净（P3 过）、同一仓库（P4 过），
+/// XML 里连 `switched` 属性都没有。
+///
+/// 而体检的 `--old=<工作副本根 URL>@N` 指向的是 trunk 的内容，磁盘上是分支的内容
+/// ——一个**完全合法**的工作副本会被报成「基线撒谎」，按 spec §6.8.6 初始化时
+/// 那会触发整个回退。
+///
+/// 布局：`trunk/Code/{A.cs,B.cs}`、`branches/feature`（从 trunk 拷），
+/// 分支上把 `A.cs` 改成别的内容。工作副本签出 trunk，再把 `Code` switch 到分支。
+pub fn svn_repo_with_switched_subtree() -> SvnFixture {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    run(&root, "svnadmin", &["create", "repo"]);
+    let url = file_url(&root.join("repo"));
+
+    let seed = root.join("seed");
+    run(
+        &root,
+        "svn",
+        &["checkout", &url, "seed", "--non-interactive"],
+    );
+    std::fs::create_dir_all(seed.join("trunk/Code")).unwrap();
+    std::fs::create_dir_all(seed.join("branches")).unwrap();
+    std::fs::write(seed.join("trunk/Code/A.cs"), "class A_trunk {}\n").unwrap();
+    std::fs::write(seed.join("trunk/Code/B.cs"), "class B {}\n").unwrap();
+    run(
+        &seed,
+        "svn",
+        &["add", "trunk", "branches", "--non-interactive"],
+    );
+    run(&seed, "svn", &["commit", "-m", "r1", "--non-interactive"]);
+    run(&seed, "svn", &["update", "--non-interactive"]);
+    run(
+        &seed,
+        "svn",
+        &[
+            "copy",
+            &format!("{url}/trunk"),
+            &format!("{url}/branches/feature"),
+            "-m",
+            "r2 branch",
+            "--non-interactive",
+        ],
+    );
+    run(&seed, "svn", &["update", "--non-interactive"]);
+    std::fs::write(
+        seed.join("branches/feature/Code/A.cs"),
+        "class A_FEATURE {}\n",
+    )
+    .unwrap();
+    run(&seed, "svn", &["commit", "-m", "r3", "--non-interactive"]);
+
+    run(
+        &root,
+        "svn",
+        &[
+            "checkout",
+            &format!("{url}/trunk"),
+            "wc1",
+            "--non-interactive",
+        ],
+    );
+    let wc = root.join("wc1");
+    run(
+        &wc,
+        "svn",
+        &[
+            "switch",
+            &format!("{url}/branches/feature/Code"),
+            "Code",
+            "--non-interactive",
+        ],
+    );
+    run(&wc, "svn", &["update", "--non-interactive"]);
+    SvnFixture { dir }
+}
+
 /// 建一个有三个 revision 的仓库，返回它的 `file://` URL。`Code/A.cs` 每次都改。
 fn seed_three_revisions(root: &Path) -> String {
     run(root, "svnadmin", &["create", "repo"]);

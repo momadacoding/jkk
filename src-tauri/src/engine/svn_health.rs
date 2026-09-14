@@ -82,6 +82,9 @@ pub fn check_baseline(
     if let Some(reason) = url_mismatch(repo_root, base)? {
         return Ok(Health::NotChecked { reason });
     }
+    if let Some(reason) = whitelist_not_under_base(repo_root, base, &roots)? {
+        return Ok(Health::NotChecked { reason });
+    }
 
     let old = format!("--old={base}@{rev}");
     let mut args: Vec<&str> = vec!["diff", &old, "--new=.", "--summarize", "--xml", "--"];
@@ -113,10 +116,22 @@ pub fn check_baseline(
             // 剥不掉前缀说明 svn_url 与输出的基准 URL 对不上（最常见是把它配成了
             // 仓库里的子路径）。此时无法判断哪些是 W-file，既不能说健康也不能说
             // 撒谎——只能说没验成。
+            // ⚠️ 这条分支实际上够不到：svn 打出来的路径恒为 `<--old 的 URL>/<target>/…`。
+            // 已知的几种「看起来会剥不掉」的情况都由前面两道守卫或 svn 自己的错误
+            // 拦掉了（svnUrl 配成子路径 → url_mismatch；白名单被 switch 或本身是
+            // external → whitelist_not_under_base；本地新增文件 → 实测打出来的
+            // 仍是旧侧 URL）。
+            //
+            // 留着是**防御**不是死代码：它守的是一个我们不控制的外部进程的输出形状，
+            // 而三种处置的安全方向不同——跳过该条会假 Verified，当成差异会假 Lying
+            // （初始化时直接整个回退），只有 NotChecked 两边都不赌。
+            //
+            // 所以文案不猜成因，只说「形状不认识」。
             return Ok(Health::NotChecked {
                 reason: format!(
-                    "svn diff 输出里的路径 `{}` 不在配置的 svnUrl `{base}` 之下，\
-                     没法还原成仓库相对路径。检查 svnUrl 是不是配成了子路径。",
+                    "svn diff 输出里的路径 `{}` 不在基准 URL `{base}` 之下，\
+                     没法还原成仓库相对路径。这是一个本应用没有预料到的输出形状，\
+                     为安全起见判为「未经体检」——既不宣称基线健康，也不指控它撒谎。",
                     entry.path
                 ),
             });
@@ -171,6 +186,55 @@ fn url_mismatch(repo_root: &str, base: &str) -> Result<Option<String>> {
     )))
 }
 
+/// 每个白名单根的实际 URL 必须就是 `<base>/<相对路径>`；不是的话体检没法做。
+///
+/// # 两种会走到这里的真实形态（2026-09-14 实测）
+///
+/// **一、白名单子树被 `svn switch` 到了别的分支。** 这是 SVN 的常规操作，
+/// 而且**四道前置门槛一个都拦不住**：`svn status` 对「target 就是被 switch 的那个
+/// 目录」这种情况一条 entry 都不出（P1 过）、`nodeRevs` 单值（P2 过）、
+/// 工作副本干净（P3 过）、同一个仓库（P4 过），XML 里连 `switched` 属性都没有。
+///
+/// 此时 `--old=<base>@N` 指向的是 trunk 的那份内容，而磁盘上是分支的内容，
+/// 体检会报出一串 `modified` —— 一个**完全合法**的工作副本被判成「基线撒谎」，
+/// 而按 spec §6.8.6 初始化时 `Lying` 会触发整个回退，给出的引导还是无效的。
+///
+/// **二、白名单根本身就是一条 external。** 那个路径在 `<base>` 底下根本不存在
+/// （实测 `E160005: Target path '/Proj/Code' does not exist`），命令直接失败。
+/// 走到这里可以给一句说得清的话，而不是把 svn 的英文错误码丢给用户。
+///
+/// 两种都属于「没能验证」而不是「验证不通过」（spec §6.8.6 第三行）：
+/// 基线本身没问题（它录的是磁盘内容配 `nodeRevs`），只是**这条检查的基准 URL
+/// 不适用**。所以返回 `NotChecked` 而不是 `Lying`，也不阻断。
+fn whitelist_not_under_base(
+    repo_root: &str,
+    base: &str,
+    roots: &[String],
+) -> Result<Option<String>> {
+    for root in roots {
+        let arg = crate::engine::svn_wc::peg_safe(root);
+        // 单个 target 一条命令：白名单通常只有个位数条目，而且这是降级路径不是热路径
+        let xml = match run_svn(repo_root, &["info", "--xml", "--", &arg]) {
+            Ok(x) => x,
+            Err(e) => return Ok(Some(e.message)),
+        };
+        let Some(entry) = crate::engine::svn_xml::parse_info(&xml)?.into_iter().next() else {
+            return Ok(Some(format!("svn info 对白名单根 `{root}` 没有输出")));
+        };
+        let actual = entry.url.trim_end_matches('/');
+        let expected = format!("{base}/{root}");
+        if !actual.eq_ignore_ascii_case(&expected) {
+            return Ok(Some(format!(
+                "白名单根 `{root}` 的实际 URL 是 `{actual}`，而体检要拿 `{expected}` 当基准。\
+                 最常见的成因是这个目录被 `svn switch` 到了别的分支，或者它本身是一条 external。\
+                 两种情况下基线本身都没问题（它录的是磁盘内容配 nodeRevs），\
+                 只是这条检查的基准 URL 不适用，所以判为「未经体检」而不是「基线撒谎」。"
+            )));
+        }
+    }
+    Ok(None)
+}
+
 fn normalize(whitelist: &[String]) -> Vec<String> {
     whitelist
         .iter()
@@ -190,9 +254,16 @@ fn normalize(whitelist: &[String]) -> Vec<String> {
 /// 扩展名比较大小写不敏感：Windows 上 git 会把 `A.CS` 一起收进来
 /// （`core.ignoreCase` 默认 true），那它就是 W-file，体检不该当它不存在。
 fn is_w_file(rel: &str, roots: &[String], extensions: &[String]) -> bool {
-    let under = roots
-        .iter()
-        .any(|r| rel == r || rel.starts_with(&format!("{r}/")));
+    // **单文件白名单条目不过扩展名过滤**，与 `svn_exclude` 的第 ③ 段和
+    // `svn_include_check::expected_set` 保持一致（spec §6.3）。
+    //
+    // 两边不一致的后果是假阴性：`whitelist:["Code/notes.txt"]` + `extensions:[".cs"]`
+    // 时，`notes.txt` 会被录进基线（那两处收它），而体检把它按扩展名滤掉
+    // ——服务器上改了它，体检照样报 `Verified`。
+    if roots.iter().any(|r| rel == r) {
+        return true;
+    }
+    let under = roots.iter().any(|r| rel.starts_with(&format!("{r}/")));
     if !under {
         return false;
     }

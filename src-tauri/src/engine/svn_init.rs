@@ -95,12 +95,35 @@ pub fn init_hybrid(req: &InitRequest) -> Result<InitReport> {
         }
     }
 
-    let cfg = build_config(req)?;
+    // 工作副本根的 URL 在一次运行里不会变，取一次传下去
+    // （配置要写它，体检要拿它当基准）。
+    let svn_url = working_copy_url(root)?;
+    let cfg = build_config(req, &svn_url)?;
 
     // ---- 前置校验：全部在创建 .git **之前**，失败时无需回退 ----
     let pre = run_preflight(root, &cfg.whitelist)?; // P1–P4
     let pinned = detect_pinned(root, &cfg.whitelist)?; // P5，命中不阻断
-    let svn_url = working_copy_url(root)?;
+
+    // ⚠️ **进入回退区之前，紧挨着再判一次 `.git` 不存在。**
+    //
+    // 函数开头那次判定之后，要经过 `build_config`（svn info）、`run_preflight`
+    // （若干条 svn status/info）、`detect_pinned`（`propget -R` **遍历整个工作
+    // 副本**，Unity 规模是分钟级）才走到这里。这个窗口里完全可能冒出一个 `.git`
+    // ——同一路径开了第二个标签页（向导的 busy 只护得住单个组件实例），
+    // 或者用户自己在命令行跑了 `git init`。
+    //
+    // 那时下面的 `git init` 会 re-init 那个已有仓库（不报错），而之后任一步失败，
+    // `rollback` 就会 `remove_dir_all` 一个**不是本次创建的** `.git`。
+    //
+    // 这道判定必须留在**回退区之外**：放进 `build_repo` 的话，它自己的 `Err`
+    // 就会触发 `rollback`，正好删掉那个刚发现的外来 `.git`。
+    if std::path::Path::new(root).join(".git").exists() {
+        return Err(GitError::new(
+            "svn_unconfigured_git",
+            "校验期间这个目录里出现了一个 .git（可能是另一个窗口、或者命令行建的）。\
+             本应用不会碰它——请确认来源后再重试。",
+        ));
+    }
 
     // ---- 从这里开始，失败必须删掉本次创建的 .git ----
     match build_repo(root, &cfg, &pre, &svn_url) {
@@ -337,6 +360,18 @@ pub fn check_current_baseline(repo_root: &str) -> Result<Health> {
     )
 }
 
+/// 当前仓库里被钉死、且与白名单有交集的 external（spec §6.5.3 的常驻说明用它）。
+///
+/// 不是混合仓库时返回**空列表**而不是报错：调用方是「打开仓库」那条热路径，
+/// 普通 git 仓库走到这里是正常的。
+pub fn pinned_externals(repo_root: &str) -> Result<Vec<PinnedExternal>> {
+    if detect_repo_kind(repo_root) != RepoKind::SvnHybrid {
+        return Ok(Vec::new());
+    }
+    let cfg = crate::engine::svn_config::read_config(repo_root)?;
+    detect_pinned(repo_root, &cfg.whitelist)
+}
+
 fn read_baseline_oid(repo_root: &str) -> Result<String> {
     let out = run_git(
         repo_root,
@@ -374,7 +409,7 @@ fn rollback(root: &str) {
 }
 
 /// 按请求组装并校验配置。规范化必须在校验之前（与 `read_config` 同序）。
-fn build_config(req: &InitRequest) -> Result<SvnConfig> {
+fn build_config(req: &InitRequest, svn_url: &str) -> Result<SvnConfig> {
     let mut whitelist = Vec::with_capacity(req.whitelist.len());
     for entry in &req.whitelist {
         whitelist.push(normalize_whitelist_entry(entry)?);
@@ -382,12 +417,24 @@ fn build_config(req: &InitRequest) -> Result<SvnConfig> {
     let cfg = SvnConfig {
         version: 1,
         mode: SVN_GIT_MODE.to_string(),
-        svn_url: working_copy_url(&req.repo_root)?,
+        svn_url: svn_url.to_string(),
         whitelist,
         extensions: req.extensions.clone(),
         baseline_branch: BASELINE_BRANCH.to_string(),
     };
     crate::engine::svn_config::validate(&cfg)?;
+    // ⚠️ 这一条**不能省**。`SvnGitBackend::open` 每次打开混合仓库都会跑它，
+    // 而这里是唯一**写入**配置的地方——两边不接上的话，向导能建出一个自己
+    // 打不开的仓库：
+    //
+    //   用户把 `Assets/Scripts/` 写成 `Assets/Scripts`（漏尾斜杠，是很自然的手误），
+    //   而该目录下的文件扩展名恰好全在 extensions 里 → 期望集合与候选索引相等 →
+    //   纳入集合核对通过 → 初始化成功 → 配置落盘 → 下一次 open_repo 被
+    //   `validate_whitelist_against_disk` 拒掉。此刻目录已经是 SvnHybrid，
+    //   向导那条分支只认 `svn_not_initialized`，用户在应用内**没有任何出路**。
+    //
+    // 放在 `git init` 之前，属于「失败无需回退」那一段。
+    crate::engine::svn_config::validate_whitelist_against_disk(&req.repo_root, &cfg.whitelist)?;
     Ok(cfg)
 }
 

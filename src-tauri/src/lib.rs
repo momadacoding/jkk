@@ -49,6 +49,7 @@ pub fn run() {
             commands::repo::probe_svn_environment,
             commands::svn::svn_check_baseline,
             commands::svn::svn_init_hybrid,
+            commands::svn::svn_pinned_externals,
             commands::svn::svn_preflight_check,
             commands::svn::svn_rebuild_baseline,
             commands::repo::read_capabilities,

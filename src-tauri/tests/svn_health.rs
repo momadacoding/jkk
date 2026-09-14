@@ -8,6 +8,7 @@
 #[path = "common/svn_fixtures.rs"]
 mod svn_fixtures;
 
+use app_lib::engine::svn_cli::run_svn;
 use app_lib::engine::svn_health::{check_baseline, Health};
 use svn_fixtures::{file_url, svn_repo_for_health, svn_repo_for_health_at_r2, SvnFixture};
 
@@ -200,6 +201,50 @@ fn an_empty_whitelist_is_an_error_not_a_clean_bill_of_health() {
     let err =
         check_baseline(&fx.wc_str(), &repo_url(&fx), 1, &[], &cs()).expect_err("空白名单必须报错");
     assert_eq!(err.code, "svn_health_empty_whitelist");
+}
+
+#[test]
+fn a_switched_whitelist_subtree_is_not_checked_rather_than_lying() {
+    // **独立 review 的 BL-3。** `svn switch` 一个子目录是 SVN 的常规操作，而且
+    // 四道前置门槛一个都拦不住它（P1 零条目、P2 单值、P3 干净、P4 同 UUID，
+    // XML 里连 switched 属性都没有）。
+    //
+    // 此时体检的 `--old=<工作副本根 URL>@N` 指向的是 trunk 的内容，磁盘上是分支的
+    // 内容，逐条比下去会报出一串 modified —— 一个**完全合法**的工作副本被判成
+    // 「基线撒谎」，而 spec §6.8.6 下初始化时 Lying 会触发整个回退，给出的引导
+    // （「跑一次完整 svn update」）还永远无效。
+    //
+    // 正确的结论是「没能验证」：基线本身没问题（它录的是磁盘内容配 nodeRevs），
+    // 只是这条检查的基准 URL 不适用。
+    use svn_fixtures::svn_repo_with_switched_subtree;
+    let fx = svn_repo_with_switched_subtree();
+    let wc_url = run_svn(&fx.wc_str(), &["info", "--show-item", "url"]).unwrap();
+    let got = check_baseline(&fx.wc_str(), wc_url.trim(), 3, &wl(&["Code/"]), &cs()).unwrap();
+    match got {
+        Health::NotChecked { reason } => {
+            assert!(reason.contains("switch"), "理由要点出成因：{reason}")
+        }
+        other => panic!("必须是 NotChecked，实际：{other:?}"),
+    }
+}
+
+#[test]
+fn a_single_file_whitelist_entry_is_not_filtered_out_by_extension() {
+    // **独立 review 的 NB-3。** 单文件白名单条目**不过**扩展名过滤
+    // （`svn_exclude` 的第 ③ 段与 `expected_set` 都是这么做的，spec §6.3）。
+    // 体检这边若照样过滤，就是一个假阴性：那个文件进了基线，服务器上改了它，
+    // 体检却报 Verified。
+    let fx = svn_repo_for_health();
+    std::fs::write(fx.wc().join("Code/Art.psd"), "CHANGED\n").unwrap();
+    let got = check_baseline(
+        &fx.wc_str(),
+        &repo_url(&fx),
+        1,
+        &wl(&["Code/Art.psd"]), // 单文件条目
+        &cs(),                  // 扩展名只有 .cs，psd 不在里面
+    )
+    .unwrap();
+    assert_eq!(lying_files(&got), vec!["Code/Art.psd"]);
 }
 
 #[test]

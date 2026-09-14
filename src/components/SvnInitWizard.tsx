@@ -13,7 +13,18 @@ import { toErrorCode, toErrorMessage } from '../engine/errors'
 
 interface SvnInitWizardProps {
   repoPath: string
+  /** 用户点「取消」：还没建库，什么都不做。 */
   onCancel: () => void
+  /**
+   * 用户在**完成页**点「关闭」：这时才把仓库重新打开。
+   *
+   * ⚠️ 不能在 `onInit` 返回前就重开。第一版是那么写的，结果
+   * `openRepo` 的第一条语句同步清掉 `errorCode`，RepoTab 立刻把向导卸载掉，
+   * `setStep('done')` 落在一个已卸载的组件上——**完成页一帧都没画出来**，
+   * 连带 spec §6.8.6 要求显示的「基线未经体检」和 §6.5.3 的 pinned 说明
+   * 一起变成死代码。窗口验证时看到「向导退场、主界面接上」，还把它当成了预期行为。
+   */
+  onFinish: () => void
   /** 只跑 P1–P4，什么都不创建。失败时应当抛出。 */
   onPreflight: (whitelist: string[]) => Promise<Preflight>
   /** 真正建库。失败时应当抛出——向导据此留在原地并显示错误，好让用户修完重试。 */
@@ -40,6 +51,7 @@ function NoticeBox({ notice }: { notice: Notice }) {
 export default function SvnInitWizard({
   repoPath,
   onCancel,
+  onFinish,
   onPreflight,
   onInit,
 }: SvnInitWizardProps) {
@@ -194,7 +206,7 @@ export default function SvnInitWizard({
           </button>
         )}
         {step === 'done' && (
-          <button type="button" onClick={onCancel}>
+          <button type="button" onClick={onFinish}>
             关闭
           </button>
         )}

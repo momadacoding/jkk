@@ -160,7 +160,7 @@ export function describeHealth(h: Health): Notice {
         tone: 'warn',
         // 这句文案是 spec §6.8.6 第三行的直接体现：不阻断，但必须如实显示
         title: '基线未经体检',
-        detail: `没能连上服务器核对，这**不代表基线有问题**。原因：${h.reason}`,
+        detail: `没能连上服务器核对，这不代表基线有问题。原因：${h.reason}`,
         blocking: false,
       }
   }
@@ -183,7 +183,7 @@ export function describePinned(pinned: PinnedExternal[]): Notice | null {
       `${list}\n\n` +
       '本应用更新时会改用「项目根 --ignore-externals + 逐个显式更新」的方式，' +
       '你看到的行为不变。\n' +
-      '残余风险：**其他工具**（TortoiseSVN 的 SVN Update、命令行 svn up）在项目根跑' +
+      '残余风险：其他工具（TortoiseSVN 的 SVN Update、命令行 svn up）在项目根跑' +
       '递归 update 时，会把这些目录退回被钉住的 revision，而工作副本看起来是干净的。' +
       '出现这种情况时本应用会报出来，一条 svn update 就能拉回。',
     blocking: false,
@@ -210,20 +210,20 @@ export function describePinned(pinned: PinnedExternal[]): Notice | null {
 export function wizardErrorHint(code: string, message = ''): string {
   const table: Record<string, string> = {
     svn_preflight_dirty:
-      '白名单内的工作副本不干净。本应用**不会**替你 revert（那是破坏性操作），' +
+      '白名单内的工作副本不干净。本应用不会替你 revert（那是破坏性操作），' +
       '请先在 TortoiseSVN 里提交或还原这些改动，再回来建库。',
     svn_preflight_mixed_revision:
       '工作副本里有多个 revision。先跑一次完整的 svn update 把它对齐。' +
       '如果白名单落在 external 里，update 解决不了——错误详情里会说明。',
     svn_preflight_operation_in_progress:
       '上一次 svn 操作没跑完。先跑 Cleanup 释放写锁；' +
-      '**只跑 Cleanup 往往不够**，还要再跑一次完整的 svn update 把没更新完的节点补齐。',
+      '只跑 Cleanup 往往不够，还要再跑一次完整的 svn update 把没更新完的节点补齐。',
     svn_cross_repo:
       '白名单跨了两个 SVN 仓库。svn commit 对跨仓库的 target 列表会直接拒绝，' +
       '交付永远做不成——请把白名单收到同一个仓库内。',
     svn_unconfigured_git:
       '这个 SVN 工作副本里已经有一个 .git，但没有本应用的配置文件。' +
-      '本应用**不会**碰它，请自行确认来源后处理。',
+      '本应用不会碰它，请自行确认来源后处理。',
     svn_already_initialized: '这个目录已经建过库了。要重建基线请用「重建基线」，不是重新初始化。',
     svn_baseline_lying:
       '首个基线没通过体检，已经整个回退，刚建的 .git 也删掉了。' +

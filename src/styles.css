@@ -1694,3 +1694,38 @@ body {
   font-weight: bold;
 }
 
+
+/* pinned 模式的常驻说明（spec §6.5.3 第 3 条）。
+   刻意用**黄色**不是红色：命中 pinned 不是错误、也不阻断任何操作，
+   它讲的是「有一条你控制不了的残余风险，长这样」。用红色会让用户以为仓库坏了。 */
+.banner-pinned {
+  padding: 8px 12px;
+  background: #4a3d16;
+  color: #f0e2b8;
+  border-bottom: 1px solid #6b5a20;
+  font-size: 12px;
+}
+.banner-pinned strong { display: block; margin-bottom: 4px; }
+.banner-pinned pre {
+  margin: 0;
+  white-space: pre-wrap;
+  font-family: inherit;
+  opacity: 0.9;
+}
+
+/* 向导里的三态提示。tone 与 engine/svnInit 的 Notice.tone 一一对应。 */
+.svn-notice.ok { border-left: 3px solid #3f7d4f; }
+.svn-notice.warn { border-left: 3px solid #8a7320; }
+.svn-notice.error { border-left: 3px solid #8a3030; }
+.svn-notice-detail {
+  margin: 4px 0 0;
+  white-space: pre-wrap;
+  font-family: inherit;
+  font-size: 12px;
+}
+.svn-steps { display: flex; gap: 12px; list-style: none; padding: 0; margin: 8px 0 12px; }
+.svn-step { flex: 1; font-size: 11px; opacity: 0.45; }
+.svn-step.current { opacity: 1; font-weight: 600; }
+.svn-step.done { opacity: 0.75; }
+.svn-step-title { display: block; }
+.svn-step-hint { display: block; opacity: 0.7; }

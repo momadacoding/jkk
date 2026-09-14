@@ -13,9 +13,11 @@
 //! `#[serde(rename_all = "camelCase")]`，并在 `tests/svn_backend.rs` 里用断言钉住
 //! 序列化后的字段名。
 
+use crate::engine::svn_externals::PinnedExternal;
 use crate::engine::svn_health::Health;
 use crate::engine::svn_init::{
-    check_current_baseline, init_hybrid, rebuild_baseline, InitReport, InitRequest, RebuildReport,
+    check_current_baseline, init_hybrid, pinned_externals, rebuild_baseline, InitReport,
+    InitRequest, RebuildReport,
 };
 use crate::engine::svn_preflight::{run_preflight, Preflight};
 use crate::error::GitError;
@@ -55,4 +57,19 @@ pub fn svn_rebuild_baseline(path: String) -> Result<RebuildReport, GitError> {
 #[tauri::command(async)]
 pub fn svn_check_baseline(path: String) -> Result<Health, GitError> {
     check_current_baseline(&path)
+}
+
+/// 当前仓库里被 `-r` 钉死、且与白名单有交集的 external。
+///
+/// spec §6.5.3 第 3 条要求 pinned 模式的残余风险**UI 常驻说明**——常驻就意味着
+/// 界面每次打开这个仓库都得能拿到这份清单，光在初始化向导里显示一次不算。
+///
+/// 不是混合仓库时返回空列表而不是报错：调用方是「打开仓库」那条热路径，
+/// 普通 git 仓库走到这里是正常的，不该在那儿制造一条错误。
+///
+/// ⚠️ 它要跑 `svn propget -R`，在几万文件的工作副本上不便宜。调用方**不要 await**
+/// （对齐 `refreshPullRequests` 的做法）。
+#[tauri::command(async)]
+pub fn svn_pinned_externals(path: String) -> Result<Vec<PinnedExternal>, GitError> {
+    pinned_externals(&path)
 }

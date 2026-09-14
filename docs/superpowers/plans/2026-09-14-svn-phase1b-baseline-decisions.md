@@ -892,6 +892,139 @@ fixture，验完即删。**没有碰任何真实仓库。**
 
 ---
 
+## 独立 review 的处置（`AGENTS.md` §4.1 合并前门槛）
+
+2026-09-14，由独立于实现者的 agent 按 §13 rubric 跑了一遍 `ca304d6..HEAD` 的全量
+diff，先读「偏离计划」再看代码（rubric #12）。它提了 **3 个阻断项 + 7 条建议**。
+每一条我都自己复核过，**没有一条是照单全收的**；三个阻断项全部复现并修掉。
+
+### BL-1 向导能建出一个自己打不开的仓库 —— 属实，已修
+
+`SvnGitBackend::open` 每次打开混合仓库都跑 `validate_whitelist_against_disk`
+（它专门挡「目录条目漏尾斜杠」和「大小写写错」），而 `init_hybrid` 这条**写入**
+配置的路径一次都没调它。
+
+复核确认：`tests/svn_config.rs` 早就断言了 `["Code"]`（漏尾斜杠）必被那个校验拒绝，
+缺的只是把两条路径接上。失败链是：用户漏一个斜杠 + 目录里恰好全是匹配扩展名的
+文件 → 期望集合与候选索引相等 → 纳入集合核对通过 → **初始化成功** → 配置落盘 →
+下一次 `open_repo` 被拒。此刻目录已是 `SvnHybrid`，而向导那条分支只认
+`svn_not_initialized`，用户在应用内**没有任何出路**。
+
+修法：`build_config` 里补一句 `validate_whitelist_against_disk`，放在 `git init`
+之前（失败无需回退）。补测试 `init_refuses_a_whitelist_that_open_would_later_reject`。
+
+### BL-2 向导的完成页不可达 —— 属实，已修，并补上了 spec 要求的「常驻」
+
+`onInit` 在返回前 `void openRepo(repoPath)`，而 `openRepo` 的**第一条语句**同步
+把 `errorCode` 清成 `null`，RepoTab 立刻卸载向导，`setStep('done')` 落在一个已卸载
+的组件上。后果是 spec §6.8.6 要求「在 UI 上如实显示」的 `NotChecked`、
+以及 §6.5.3 要求「UI 常驻说明」的 pinned 提示，**一帧都画不出来**。
+
+**这条我在窗口验证时看到了，却把它当成了预期行为**（记成了「向导退场、主界面
+接上」通过）。S15/S16/S17 三个涉及 health / pinned 的场景当时全是用 `invoke`
+直接验的，没有经过 UI——所以这个缺口没被任何一条验证碰到。
+
+修法两部分：
+
+1. 向导加一个 `onFinish` 回调，**用户在完成页点「关闭」时**才重开仓库。
+2. pinned 做成**真正的常驻**：新增 `svn_pinned_externals` 命令与 `refreshPinned`
+   （打开仓库时**不 await**，对齐 `refreshPullRequests` 的做法——它要跑
+   `propget -R`），store 持有 `pinned`，RepoTab 渲染一条常驻横幅。
+   只在向导里显示一次不算常驻，用户下次打开这个仓库就看不到了。
+
+真实窗口复验：完成页 `done/done/done/current`，体检结果（ok）与 pinned 说明（warn）
+两条都在；点「关闭」之后主界面仍显示 pinned 常驻横幅。
+
+### BL-3 `Lying` 在 init 上其实可达（`svn switch`）—— 属实，我的论证错了
+
+我在 Task 7+8 那节断言「`Health::Lying` 在这两个入口上结构上不可达」，理由是
+「P1–P3 全过 ⇒ 磁盘 == 服务器@nodeRevs」。**这个支柱是错的**，reviewer 给了反例，
+我自己复现确认：
+
+把白名单子树 `svn switch` 到另一条分支（SVN 的常规操作）之后——
+
+| 门槛 | 实测 |
+|---|---|
+| P1 `status --no-ignore --ignore-externals --xml -- Code@` | **零条目**，通过 |
+| P2 `nodeRevs` | `{3}` 单值，通过 |
+| P3 工作副本根 `--depth=empty` | 空，通过 |
+| P4 UUID | 同一仓库，通过 |
+| XML 里有没有 `switched` 属性 | **没有**（target 就是被 switch 的那个目录时不出） |
+| 体检 | `item="modified"` → **`Lying`** |
+
+也就是说一个**完全合法**的工作副本会被判成「基线撒谎」，而按 spec §6.8.6
+初始化时那会触发整个回退，给出的引导（「跑一次完整 svn update」）还永远无效。
+这正是 Task 6 自己认定的「这条检查最坏的失败形态」——`svnUrl` 子路径那一种当时
+加了守卫，switch 这一种漏了。
+
+修法：`check_baseline` 新增 `whitelist_not_under_base`——每个白名单根的实际 URL
+必须就是 `<base>/<相对路径>`，不是的话返回 `NotChecked` 并说清成因。
+返回 `NotChecked` 而不是 `Lying`：基线本身没问题（它录的是磁盘内容配 `nodeRevs`），
+只是**这条检查的基准 URL 不适用**。
+
+补 fixture `svn_repo_with_switched_subtree` 与测试
+`a_switched_whitelist_subtree_is_not_checked_rather_than_lying`，并做了变异测试
+——短路掉那道守卫，测试确实拿到 `Lying { files: ["Code/A.cs"] }` 而红。
+
+**同时订正上面那段论证**：「体检在 init / rebuild 上结构性不可达」这句话是错的，
+正确的说法是「`svn diff` 会吃本地 size+mtime 缓存，所以**元数据撒谎**那一类抓不到」
+——那一条仍然成立（实测过），但它推不出「不可达」。
+
+### 一并采纳的建议
+
+- **NB-1 白名单根本身是 external 时体检恒为 `NotChecked`**（实测 `E160005`）。
+  与 BL-3 同一个根因，被 `whitelist_not_under_base` 一起收编了——现在给的是一句
+  说得清的中文，而不是 svn 的英文错误码。
+- **NB-3 单文件白名单条目的扩展名语义两边不一致**：`expected_set` 与 `svn_exclude`
+  对单文件条目**不过**扩展名过滤，而 `is_w_file` 一律过 → 假阴性（那个文件进了
+  基线，服务器上改了它体检却报 `Verified`）。已对齐，补测试。
+- **NB-4 `remove_dir_all` 的 TOCTOU 窗口**：开头判完 `SvnUninitialized` 之后要经过
+  `detect_pinned`（`propget -R` 遍历整个工作副本，Unity 规模分钟级）才到 `git init`。
+  已在**进入回退区之前**再判一次 `.git` 不存在。⚠️ 这道判定必须留在回退区**之外**
+  ——放进 `build_repo` 的话它自己的 `Err` 会触发 `rollback`，正好删掉那个刚发现的
+  外来 `.git`（我第一版就是那么写的，当场改了）。
+- **NB-5 剥前缀失败那条分支的文案会把人引偏**（它猜的成因已被前面两道守卫覆盖）。
+  改成只说「这是一个没有预料到的输出形状」，并在注释里写明它是防御不是死代码。
+- **NB-7 一次运行里三次 `svn info` 取同一个值**。工作副本根 URL 现在取一次传下去。
+- 顺带修掉用户可见文案里的 `**` markdown 残留——它们渲染在 `<pre>` 里，
+  用户看到的就是字面的星号。
+
+### 未采纳 / 记账给后面
+
+- **NB-2 depth-excluded 子树全程无人察觉**（实测：`svn update --set-depth=exclude
+  Code/Deep` 之后 P1 零条目、P2 单值、P3 干净，体检只回一条被过滤掉的 `kind=dir`
+  → `Verified`，而基线静默少了服务器上确实存在的 `Code/Deep/D.cs`）。
+
+  **这一条我复现了，但本期不修**：可靠的检测要拿服务器侧的文件清单
+  （`svn ls -R <url>@N`）与磁盘比，那是一个本期没有的新机制，不是几行判断。
+  它与 spec §6.3.1 那句「最危险的一类缺陷——用户以为源码受 git 保护，实际没有」
+  同源，**记账给 Phase 1c**。
+
+- **NB-6 `svn_rebuild_baseline` / `svn_check_baseline` 没有 UI 入口**。按计划
+  Task 9 的范围这不算偏离（计划只要求向导 UI），但要注意后果：`check_current_baseline`
+  是 `Lying` 唯一真正可达的入口，而它没有界面入口 —— 本期交付形态下用户点不出来。
+  记账给 Phase 1c 一起做。
+
+### reviewer 对 B / C 两问的结论
+
+- **B（P1 对 `ignored`/`unversioned` 一律算脏）**：与 spec §6.5 一致，撤销收窄是对的。
+  它额外指出一处残余风险：判据比 spec 给的**理由**更严，被 `svn:ignore` 挡住且
+  扩展名不在白名单里的文件 git 其实不会收，却照样把向导拦死，而错误信息给的两条
+  出路（`svn add` / 移出白名单目录）对那种文件都不可行。
+  **已在 `check_clean` 的提示里补上第三条出路**（把白名单收窄到不含该目录）。
+- **C（`strip_prefix_ci` 剥不掉前缀那条分支）**：它按四条路径试着让那条分支响，
+  都没响，结论是「确实不可达，但该留，`NotChecked` 也是对的」。与我的判断一致；
+  只按它的意见改了文案（NB-5）。
+
+### 复核后的数字
+
+`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓、
+`cargo test -j 2` **404 passed / 0 failed / 33 个二进制**（修完新增 3 条测试）；
+`pnpm build` ✓、`pnpm exec vitest run --root .` **290 passed / 22 files**。
+命令注册对账 **51 == 51**（1a 的 46 + 本期 5）。
+
+---
+
 ## 记账给后面（Task 4 遗留）
 
 **spec §6.5.2「手段二：行为校验」本期不做。** 它要在一次真实 `svn update` 成功

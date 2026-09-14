@@ -4,7 +4,13 @@ import { useCallback, useEffect, useState } from 'react'
 import type { CommitNode, DiffData, GraphData, PullRequest, RefPointer, RepoInfo, StashEntry, StatusData, UpstreamInfo, Worktree } from '../engine/types'
 import { ALL_CAPABILITIES, type Capabilities } from '../engine/capabilities'
 import { toErrorCode, toErrorMessage } from '../engine/errors'
-import type { Health, InitReport, Preflight, RebuildReport } from '../engine/svnInit'
+import type {
+  Health,
+  InitReport,
+  PinnedExternal,
+  Preflight,
+  RebuildReport,
+} from '../engine/svnInit'
 import { samePath } from '../engine/path'
 import { nextSelection } from '../engine/selection'
 
@@ -44,6 +50,13 @@ export interface RepoState {
    * 是一个还没走的流程（spec §6.1），该显示初始化向导而不是一条红色横幅。
    */
   errorCode: string | null
+  /**
+   * 被 `-r` 钉死、且与白名单有交集的 external。非空即处于 pinned 模式。
+   *
+   * spec §6.5.3 第 3 条要求这条残余风险**UI 常驻说明**——只在初始化向导里显示
+   * 一次不算常驻，用户下次打开这个仓库就看不到了。所以它进 store，每次打开都读。
+   */
+  pinned: PinnedExternal[]
 }
 
 const initialState: RepoState = {
@@ -63,6 +76,7 @@ const initialState: RepoState = {
   loading: false,
   error: null,
   errorCode: null,
+  pinned: [],
 }
 
 /**
@@ -123,6 +137,16 @@ export function svnCheckBaseline(path: string): Promise<Health> {
   return invoke<Health>('svn_check_baseline', { path })
 }
 
+/**
+ * 当前仓库里被钉死、且与白名单有交集的 external。非混合仓库返回空列表。
+ *
+ * ⚠️ 后端要跑 `svn propget -R`，在几万文件的工作副本上不便宜。
+ * 调用方**不要 await**。
+ */
+export function svnPinnedExternals(path: string): Promise<PinnedExternal[]> {
+  return invoke<PinnedExternal[]>('svn_pinned_externals', { path })
+}
+
 export function useRepoStore() {
   const [state, setState] = useState<RepoState>(initialState)
 
@@ -153,6 +177,9 @@ export function useRepoStore() {
       // 不 await：这一步要走网络（gh 实测一两秒），让它拖住打开仓库的收尾没有意义。
       // 不支持 PR 的后端连这次 gh 调用都省掉——界面上没有任何地方会用到结果。
       if (caps.pullRequests) void refreshPullRequests(path)
+      // 同样不 await：后端要跑 `svn propget -R`，在几万文件的工作副本上是秒级。
+      // 常驻说明晚一两秒出现无所谓，但不能让打开仓库卡在这儿（spec §6.5.3）。
+      void refreshPinned(path)
     } catch (err) {
       setState((s) => ({
         ...s,
@@ -213,6 +240,23 @@ export function useRepoStore() {
   const refreshStashes = async (path: string) => {
     const stashes = await invoke<StashEntry[]>('read_stashes', { path })
     setState((s) => ({ ...s, stashes }))
+  }
+
+  /**
+   * 重新读取被钉死的 external（spec §6.5.3 的常驻说明）。
+   *
+   * 失败只写 console 不上报，理由与 `refreshPullRequests` 同：顶部错误横幅是留给
+   * git 操作的。**必须写回空数组**——上一个仓库处于 pinned 模式时留下的清单，
+   * 会挂在下一个完全无关的仓库上。
+   */
+  const refreshPinned = async (path: string) => {
+    try {
+      const pinned = await svnPinnedExternals(path)
+      setState((s) => ({ ...s, pinned }))
+    } catch (err) {
+      console.warn('读取 pinned external 失败，不显示 pinned 模式说明：', err)
+      setState((s) => ({ ...s, pinned: [] }))
+    }
   }
 
   /**
