@@ -19,8 +19,8 @@
 | 4 P5 externals 钉死检测 | ✅ 完成 | `svn_externals.rs`（新）、`engine/mod.rs`、`tests/svn_externals.rs`（新）、`tests/common/svn_fixtures.rs` | `cargo test --test svn_externals` 10 passed；全量 **352 passed / 0 failed / 30 个二进制**（= 342 + 新增 10）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓；变异测试确认 `@N` peg 判据有牙 |
 | 5 基线录制（临时索引 / trailer） | ✅ 完成 | `svn_baseline.rs`（新）、`svn_include_check.rs`、`engine/mod.rs`、`tests/svn_baseline.rs`（新）、`tests/svn_exclude.rs` | `cargo test --test svn_baseline` 13 passed、`--test svn_exclude` 25 passed；全量 **365 passed / 0 failed / 31 个二进制**（= 352 + 新增 13）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓ |
 | 6 §6.8 基线体检 | ✅ 完成 | `svn_health.rs`（新）、`svn_wc.rs`（`peg_safe` 文档）、`engine/mod.rs`、`tests/svn_health.rs`（新）、`tests/common/svn_fixtures.rs` | `cargo test --test svn_health` 15 passed；全量 **380 passed / 0 failed / 32 个二进制**（= 365 + 新增 15）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓ |
-| 7 初始化向导编排与回退 | ⬜ 未开始 | | |
-| 8 重建基线 R1–R5 | ⬜ 未开始 | | |
+| 7 初始化向导编排与回退 | ✅ 完成 | `svn_init.rs`（新）、`svn_config.rs`（加 `write_config`）、`engine/mod.rs`、`tests/svn_init.rs`（新） | 与 Task 8 合并计数 |
+| 8 重建基线 R1–R5 | ✅ 完成 | `svn_init.rs`、`tests/svn_init.rs` | `cargo test --test svn_init` 18 passed；全量 **398 passed / 0 failed / 33 个二进制**（= 380 + 新增 18）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓；变异测试确认「不 checkout 基线分支」这条有牙 |
 | 9 Tauri 命令与向导 UI | ⬜ 未开始 | | |
 | 10 收尾验证 | ⬜ 未开始 | | |
 
@@ -671,6 +671,124 @@ spec §6.8.2 的 T1–T7 逐条在临时 fixture 上复现，七条结论与 spe
 - 纯新增模块 + 一处 doc 注释修正，没有改动任何既有函数的行为。全量
   `cargo test -j 2` = 380 passed / 0 failed / 32 个二进制，相对 Task 5 的 365
   多的正好是新增的 15 条，无回归。
+
+---
+
+## Task 7 + 8：初始化向导编排、失败回退、重建基线
+
+新增 `engine/svn_init.rs`：`init_hybrid`（§6.5）与 `rebuild_baseline`（§16 R1–R5）。
+两者共用同一段录制序列，所以同一个文件、同一个提交。
+
+### ⚠️ 一个必须写明的结论：这两个入口上，体检结构上永远通过
+
+写 Task 7/8 的测试时想造一个「工作副本干净、但磁盘内容与服务器不符」的 fixture，
+造不出来。查下来是两件事叠加：
+
+1. **P1–P3 全过之后，磁盘按构造就等于服务器上的 `nodeRevs`。** 这两个入口的
+   `rev` 都取自 `nodeRevs`（不是 trailer），所以「rev 与磁盘不符」这个前提不成立。
+2. **`svn diff` 也吃本地的「大小 + mtime」缓存。** 2026-09-14 实测：把
+   `Code/A.cs` 换成**等长**的不同内容再把 mtime 还原回去，`svn status` 报干净
+   （预期之中），而 `svn diff --old=URL@1 --new=.` **同样报无差异**——它没去比
+   实际字节，直接按「本地未修改」短路了。
+
+   **这修正了 spec §6.8.3 的一句话。** 那里写的是「它比的是**磁盘**与服务器」，
+   准确说法是「比的是 **SVN 记录的本地状态**与服务器」。`.svn` 元数据自己撒谎的
+   那一类，体检抓不到。
+
+所以在 `init_hybrid` 与 `rebuild_baseline` 里，`Health::Lying` 是一条
+**结构上不可达**的分支。它仍然实现并保留，理由有三：兜住 P2 读数与体检之间的
+窄竞态；将来 `rev` 的来源一旦改变（比如改成读 trailer）它立刻变得可达；
+而 `svn_health` 自己的 T4/T7 已经覆盖了 rev 来源不同时的真实形态。
+
+**没有为它伪造 fixture。** 计划里点名要的 `svn_repo_whose_disk_lies()` /
+`hybrid_repo_whose_disk_lies()` 两个 fixture 都没有建——建一个名叫「磁盘撒谎」
+却其实在测别的东西的 fixture，正是 `AGENTS.md` §13 rubric #9 判为阻断的虚假信心。
+回退路径改用**真实可构造**的失败（纳入集合核对不过）来覆盖，它与体检 `Lying`
+走的是同一条 `Err` 分支。
+
+#### 偏离计划
+
+- **`init_hybrid` 多了一步 `git read-tree TREE`。** 计划的序列表里没有，但
+  spec §6.3.1 明写「HEAD 已附着在 `svn/base` 的入口在发布后用 `git read-tree TREE`
+  对齐真实索引，不带 `-u`、不改磁盘」。初始化正是这种入口：`git init -b svn/base`
+  之后 HEAD 就指着基线分支。漏掉这一步的话 HEAD 上有文件而真实索引是空的，
+  用户一打开就看到每个 W-file 都显示成「已删除」。有
+  `a_successful_init_leaves_a_clean_git_status` 守着。
+
+- **`InitRequest` 里没有 `svn_url` 字段**，改为初始化时自己 `svn info` 取工作副本
+  根的 URL 并写进配置。让用户手填一个必须与 `svn info` 完全一致的 URL 只会制造
+  Task 6 记的那种误报。
+
+- **新增 `svn_config::write_config`**，1a 只有读没有写。它**先 `validate` 再落盘**：
+  配置文件一存在，`detect_repo_kind` 就把目录判成 `SvnHybrid`，写进去一份过不了
+  校验的内容等于造出「识别成混合仓库、但每次读配置都报错」的死局。
+
+- **Task 8 的 `rebuild_never_moves_head_and_survives_uncommitted_work` 改了形态。**
+  计划里往 `Code/WIP.cs` 写一个未提交文件，但那是白名单里一个未版本控制的文件，
+  **R1 会直接拒绝重建**——那是 P1 的正确行为。改成把未提交文件放在白名单外
+  （`Art/scratch.txt`），并把断言扩到「HEAD 名字、HEAD OID、真实索引、磁盘内容
+  四样都不变」。
+
+- **`a_failing_r3b_leaves_the_baseline_pointer_untouched` 改成
+  `a_failure_before_r4_leaves_the_baseline_pointer_untouched`**，用纳入集合核对
+  触发。理由见上面那节：R3b 的 `Lying` 在这个入口不可达。
+
+#### 计划的错误
+
+- 计划的 Task 7 测试 `a_failing_health_check_rolls_the_whole_thing_back` 依赖
+  `svn_repo_whose_disk_lies()`，而那个 fixture 造不出来（见上）。
+
+#### 计划没写的坑
+
+- **回退用的 `.gitignore` 必须放在工作副本根，不能放 `Code/` 底下。**
+  第一版测试写的是 `Code/.gitignore`，结果它是白名单里一个未版本控制的文件，
+  **P1 在 `git init` 之前就拦住了**，走的是「无需回退」那条路——这条测试什么也
+  没测到（实际拿到的错误码是 `svn_preflight_dirty` 而不是 `include_set_mismatch`）。
+  放在根上时 P1 扫不到它（P1 只扫白名单根），而 git 照读，于是核对不过、
+  走回退。
+
+- **空白名单最早被 `svn_config::validate` 拦住**（`extensions 不能为空` 同理），
+  拿到的错误码是 `svn_config` 而不是 `svn_preflight_empty_whitelist`。三道拦截
+  都在建 `.git` 之前，测试断言的是「没建 `.git`」而不是具体哪一道。
+
+- **变异测试踩了两层坑，第二层才是真问题。**
+  把 spec 明令禁止的 `git checkout svn/base` 插进 `rebuild_baseline`：
+  1. 第一版 fixture（init + 一次外部 update）里 `work` 与 `svn/base` 是**同一个
+     commit**，checkout 是空操作 → 只有「HEAD 没动」那条红了，专门写来防它的
+     「反向证据」**抓不住**。
+  2. 第二版把三者错开了，但中间那次推进写成了 `rebuild_baseline(...)`
+     ——**fixture 调用了被测函数**，变异在搭 fixture 时就先把 HEAD 挪走，
+     等测试跑时已经自我中和，仍然抓不住。
+  3. 第三版改用**裸 git 管道命令**推进基线（`fixture_advance_baseline`），
+     变异这才被三条测试同时抓住。
+
+  结论与 Task 1 的 `fixture_git` 同源、但更隐蔽：**fixture 不能用被测对象搭**，
+  哪怕只是「顺手复用一下已经写好的函数」。
+
+#### 为什么这么改是安全的
+
+- **`remove_dir_all` 是全项目唯一一处，三道守卫叠着：**
+  ① `init_hybrid` 开头断言 `detect_repo_kind == SvnUninitialized`（**进来时没有
+  `.git`**，所以现在这个必然是本次建的）；② `rollback` 自己再查目标是不是目录
+  （worktree 里 `.git` 是文件，那种不该出现在这里）；③ 同级必须有 `.svn`
+  （证明确实在一个 SVN 工作副本里）。测试
+  `init_refuses_to_touch_a_directory_that_already_has_a_git` 往 `.git` 里放了一个
+  `PRECIOUS` 文件并断言它还在。
+- **回退只有一个出口。** `git init` 之后的全部步骤抽进 `build_repo`，
+  `init_hybrid` 只在它返回 `Err` 时调一次 `rollback`。中间任何一步 `?` 早退都
+  走同一条分支，不存在「某条路径忘了回退」。
+- **`rollback` 删不掉时不 panic、也不覆盖原始错误**：用户该看到的是「为什么失败」，
+  不是「回退时又失败了」。残留的 `.git` 会被 §6.1 识别成 `SvnSuspicious` 并阻断，
+  不会造成数据损坏。
+- **两个入口都一条 SVN 写命令都不发。** `a_successful_init_emits_no_svn_write_command`
+  与 `rebuild_emits_no_svn_write_command` 各自比对服务器 HEAD revision 前后不变。
+- **重建全程不动 HEAD、不动真实索引、不动磁盘**，有
+  `rebuild_never_moves_head_nor_touches_the_index_or_the_worktree` 四项断言守着；
+  R4（动指针）排在体检与核对之后，中止时指针原样。
+- **脏工作副本不自动 revert**（spec §8.1 #2）：
+  `rebuild_refuses_when_the_working_copy_is_dirty` 断言用户的改动原样还在。
+- 全量 `cargo test -j 2` = 398 passed / 0 failed / 33 个二进制，相对 Task 6 的 380
+  多的正好是新增的 18 条，无回归。
 
 ---
 

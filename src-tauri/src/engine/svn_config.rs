@@ -83,6 +83,23 @@ pub fn read_config(repo_root: &str) -> Result<SvnConfig> {
     Ok(cfg)
 }
 
+/// 把配置写进 `.git/mygitclient.json`。
+///
+/// **写之前先校验。** 这个文件是 §6.1 仓库识别的判据之一：它一存在，
+/// `detect_repo_kind` 就把目录判成 `SvnHybrid`。写进去一份过不了 `validate`
+/// 的内容，等于造出一个「识别成混合仓库、但每次读配置都报错」的死局。
+pub fn write_config(repo_root: &str, cfg: &SvnConfig) -> Result<()> {
+    validate(cfg)?;
+    let path = config_path(repo_root);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let json = serde_json::to_string_pretty(cfg)
+        .map_err(|e| GitError::new("svn_config", format!("配置序列化失败: {e}")))?;
+    std::fs::write(&path, format!("{json}\n"))?;
+    Ok(())
+}
+
 /// 校验一份**已规范化**的配置。
 pub fn validate(cfg: &SvnConfig) -> Result<()> {
     // `version` 与 `mode` 必须校验，理由与 `baselineBranch` 被钉死成 `svn/base`
