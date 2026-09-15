@@ -349,9 +349,17 @@ fn init_succeeds_on_a_clean_same_repo_nested_external_and_never_tracks_its_dot_s
         "把 external 自己的 .svn 录进基线了，checkout 会损坏工作副本：{listed}"
     );
 
+    // **Phase 1c 把这条的期望从 NotChecked 改成了 Verified。**
+    //
+    // 1b 时体检从项目根只跑一次 `svn diff`，而 `--old` 那侧是 URL，URL 上没有
+    // `Code/Vendor` 这个节点，diff 不下沉进去——一块被 git 收进基线的内容从没被
+    // 比对过，所以当时只能降级成 NotChecked，不宣称健康。
+    //
+    // 现在按 spec §6.6.5 改成**每个记账单位各发一条命令、各用自己的 `url(P)`**，
+    // 这块内容第一次真的被服务器验过了。干净就该说干净。
     match report.health {
-        Health::NotChecked { .. } => {}
-        other => panic!("体检覆盖不到 external，不能宣称健康，实际：{other:?}"),
+        Health::Verified { .. } => {}
+        other => panic!("嵌套 external 现在应当验得过，实际：{other:?}"),
     }
 }
 

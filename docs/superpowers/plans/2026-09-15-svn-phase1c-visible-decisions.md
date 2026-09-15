@@ -17,7 +17,7 @@
 | 2 `svn_log` 拉取编排 | ✅ 完成 | `src-tauri/src/engine/svn_log.rs`（新）、`engine/mod.rs`、`tests/svn_log.rs`（新）、`tests/common/svn_fixtures.rs` | `cargo test --test svn_log` **11 passed**；`cargo fmt --check` ✓、`cargo clippy --all-targets` **0 warning**；变异测试（删钳制）3 条变红并报 `E160006` |
 | 3 `svn_log_cache` 缓存与合并 | ⬜ 未开始 | | |
 | 4 `svn_sync` 失同步判定 | ✅ 完成 | `engine/svn_sync.rs`（新）、`engine/mod.rs`、`tests/svn_sync.rs`（新）、`tests/common/svn_fixtures.rs`（+3 个构造） | `cargo test --test svn_sync` **8 passed**；`cargo fmt --check` ✓、`cargo clippy --all-targets` **0 warning**；实现第一版就撞上 `wc_root` 语义那个坑，被测试当场抓住（详见下节） |
-| 5 基线体检按 WC 分组（§6.6.5 欠账） | ⬜ 未开始 | | |
+| 5 基线体检按 WC 分组（§6.6.5 欠账） | ✅ 完成 | `engine/svn_health.rs`、`tests/svn_health.rs`、`tests/svn_init.rs` | `cargo test --test svn_health` **20 passed**；**全量 460 passed / 0 failed / 36 个二进制**（= 基线 412 + 新增 48，二进制 33 + 3）；`cargo fmt --check` ✓、`cargo clippy --all-targets` **0 warning** |
 | 6 服务器侧清单证伪漏收（NB-2 欠账） | ⬜ 未开始 | | |
 | 7 Tauri 命令层与 `Capabilities.vcs` | ⬜ 未开始 | | |
 | 8 前端接合逻辑 `svnGraph.ts` | ⬜ 未开始 | | |
@@ -379,3 +379,64 @@ Phase 1 的验收语写着「此期只报警 + 提供**重建基线**」。1b �
 - `--ignore-externals` 的作用域是**每个 WC 内部**（挡住更深一层），而不是从项目根
   覆盖白名单——后者会把白名单整个跳过。这条差别写进了 `node_revs` 的文档。
 - 判定只读不改，任何误判的代价都止于「横幅文案不对」，不会动仓库状态。
+
+---
+
+## Task 5：基线体检按工作副本分组（§6.6.5 欠账）
+
+#### 偏离计划
+
+- **命令形态改成 `--old=<url(P)>@N --new=<P>`，不再是 `--new=. -- <targets…>`。**
+  计划写的是「对每组跑一次，尾随 target 给该组的根」。实际上 `enumerate_wcs`
+  返回的每一条本身就是一个记账单位（白名单条目，或其下的嵌套 external 根），
+  所以 `--new` 直接指向它、**不带任何尾随 target** 更简单，也少一处 peg 陷阱。
+
+- **没有按计划写「最长前缀匹配分组」那段。** 同 Task 4 的原因：`wc_root` 已经是
+  相对路径形式的记账单位，`enumerate_wcs` 的返回值就是分好组的结果。
+
+- **`whitelist_not_under_base` 保留未动。** 计划没提它。它守的是「白名单子树被
+  `svn switch` 到别的分支」——改成 per-unit URL 之后，那种情况其实能正确比对了
+  （用的就是它实际指向的 URL）。但放行它属于**行为扩大**，超出本 Task 的范围，
+  而且会让既有测试
+  `a_switched_whitelist_subtree_is_not_checked_rather_than_lying` 的期望反转。
+  **保持现状，记账给后面**：将来若要放开，需要先想清楚「分支上的 rN」与
+  「trunk 上的 rN」在基线语义下是不是同一个东西。
+
+- **多写了一条计划里没有的测试** `one_unit_failing_does_not_silently_verify_the_others`
+  （计划有这条的意图，但没给可行的 fixture 造法）。造法：跨仓库嵌套 external +
+  把 external 指向的仓库从磁盘删掉。工作副本仍在（`svn info` 是本地读，单位照样
+  列得出来），但它的 URL 已经不可达。
+
+#### 计划的错误
+
+- 计划说「`nested_external_not_covered` 这道守卫删掉」，但**没提它会连带推翻两条
+  既有断言**：
+  - `tests/svn_health.rs` 的 `a_nested_external_under_the_whitelist_is_never_claimed_verified`
+  - `tests/svn_init.rs` 的 `init_succeeds_on_a_clean_same_repo_nested_external_and_never_tracks_its_dot_svn`
+    里那句 `Health::NotChecked { .. } => {}`
+
+  第二条只有跑**全量** `cargo test` 才会暴露（只跑 `--test svn_health` 是绿的）。
+  计划的 Task 5 Step 5 要求跑全量，这一步救了场。
+
+#### 计划没写的坑
+
+- **单文件白名单条目在新命令形态下没有子路径可剥。** `--new=Code/notes.txt` 时
+  svn 打出来的路径**恰好等于** `unit_url` 本身，`strip_prefix_ci(path, "url/")`
+  会返回 `None`，于是走进「形状不认识」那条 `NotChecked` 分支——一个完全正常的
+  配置被判成未验。加了一个相等分支专门处理它，既有测试
+  `a_single_file_whitelist_entry_is_not_filtered_out_by_extension` 守着。
+
+- **删守卫时容易留下半截循环体。** 我第一次编辑时把新循环写完、旧循环体没删干净，
+  还顺手写了个占位函数去接住它——那是错的，当场删掉重来。改这种「整段替换」时
+  应当先读完整个函数再一次性替换，而不是分两次编辑。
+
+#### 为什么这么改是安全的（Task 5）
+
+- **方向只会变严，不会变松**：改动前嵌套 external 那块内容**从没被比对过**
+  （diff 不下沉），改动后它被服务器逐条验过。唯一「变松」的是结论从
+  `NotChecked` 变成 `Verified`——而那是因为**真的验过了**，不是因为跳过了检查。
+- 反向证据齐备：`a_lying_baseline_inside_a_nested_external_is_caught` 证明脏的
+  external 会被抓住。少了它，「见到 external 就返回 Verified」也能让干净那条变绿。
+- 一个单位失败即整体 `NotChecked`，不做「其余都干净所以 Verified」的部分担保。
+- 本 Task **不改任何写路径**：`check_baseline` 只发 `svn diff` / `svn info`，
+  它的三个调用方（初始化、重建、手动体检）对三种结论的处置逻辑一字未动。
