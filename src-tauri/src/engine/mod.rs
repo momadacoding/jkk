@@ -22,6 +22,7 @@ pub mod svn_health;
 pub mod svn_include_check;
 pub mod svn_init;
 pub mod svn_log;
+pub mod svn_log_cache;
 pub mod svn_preflight;
 pub mod svn_wc;
 pub mod svn_xml;

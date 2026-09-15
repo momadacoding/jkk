@@ -14,7 +14,7 @@
 |---|---|---|---|
 | 0 开工自检与基线数字 | ✅ 完成 | 本文件 | 改动前基线（本 worktree 内实测）：Rust **412 passed / 0 failed / 33 个二进制**、前端 `pnpm test` **290 passed / 22 files**、`pnpm build` ✓。三项与计划预期一字不差 |
 | 1 `svn_xml` 加 log / ls 解析器 | ✅ 完成 | `src-tauri/src/engine/svn_xml.rs`、`src-tauri/tests/svn_xml.rs` | `cargo test --test svn_xml` **37 passed**（基线 27 + 新增 10）；`cargo fmt --check` ✓、`cargo clippy --all-targets` **0 warning**；两轮变异测试（详见下节） |
-| 2 `svn_log` 拉取编排 | ⬜ 未开始 | | |
+| 2 `svn_log` 拉取编排 | ✅ 完成 | `src-tauri/src/engine/svn_log.rs`（新）、`engine/mod.rs`、`tests/svn_log.rs`（新）、`tests/common/svn_fixtures.rs` | `cargo test --test svn_log` **11 passed**；`cargo fmt --check` ✓、`cargo clippy --all-targets` **0 warning**；变异测试（删钳制）3 条变红并报 `E160006` |
 | 3 `svn_log_cache` 缓存与合并 | ⬜ 未开始 | | |
 | 4 `svn_sync` 失同步判定 | ⬜ 未开始 | | |
 | 5 基线体检按 WC 分组（§6.6.5 欠账） | ⬜ 未开始 | | |
@@ -210,7 +210,7 @@ Phase 1 的验收语写着「此期只报警 + 提供**重建基线**」。1b �
   手写时按可读性排版会导致 `cargo fmt --check` 失败。先跑 `cargo fmt` 再
   `--check`，不要手工对齐。
 
-#### 为什么这么改是安全的
+#### 为什么这么改是安全的（Task 1）
 
 - 本 Task **只新增**两个 `pub fn` 和三个结构体，没有改动任何既有函数的签名或
   行为。既有 27 条 `svn_xml` 测试一条没动，全部照常通过。
@@ -219,3 +219,58 @@ Phase 1 的验收语写着「此期只报警 + 提供**重建基线**」。1b �
 - `parse_list` 的文档里写明了「空清单不代表成功」这条契约由调用方的
   `run_svn` 退出码把守——这是 Task 6 最危险的失败形态，提前钉在解析层的注释里，
   让下一个人在写调用方之前就读到。
+
+---
+
+## Task 2：`svn_log` 拉取编排
+
+#### 偏离计划
+
+- **`SvnFixture` 没有扩展字段。** 计划的测试片段假设新 fixture 会额外暴露
+  `whitelist_url` / `repos_root` / `baseline_rev` 三个字段。实际 `SvnFixture`
+  只是 `TempDir` 的薄包装（`path()` / `repo()` / `wc()` / `wc_str()`），
+  加字段会动到全部 18 个既有 fixture 的构造。改成**测试自己推导**：
+  `repos_root = file_url(&fx.repo())`、`whitelist_url = "{repos_root}/Code"`、
+  `baseline_rev` 由 fixture 的构造过程固定为 4（写在 fixture 的文档注释里）。
+
+- **多写了 4 条计划里没有的测试**：
+  - `fetch_range_returns_entries_newest_first_for_a_descending_range`
+  - `fetch_range_clamps_only_the_out_of_range_end`（**半越界**：`3:999`。
+    计划只测了「整段越界」，而「拉到最新」最常见的写法恰恰是半越界，
+    只测整段越界会让「两端各自钳制」退化成「越界就整段丢掉」也能变绿）
+  - `fetch_anchor_returns_none_for_a_revision_above_head`
+  - `log_targets_dedupes_working_copies_that_share_a_url`
+
+- **`log_targets` 的测试自己调 `init_hybrid` 造配置**，没有新增
+  `svn_repo_initialized()` 共用 fixture。理由：既有 `tests/svn_init.rs` 就是这么
+  做的（本地 `req()` 辅助函数），跟着既有写法走；而把 `init_hybrid` 塞进
+  `svn_fixtures.rs` 会让纯 svn 的 fixture 模块反向依赖 engine 代码。
+
+#### 计划的错误
+
+- **计划假设了约 10 个并不存在的 fixture**（`svn_repo_initialized`、
+  `svn_repo_initialized_then_*`、`plain_git_repo`、
+  `svn_repo_initialized_with_*` 等），却没在任何一个 Task 里写「先建这些
+  fixture」。本 Task 只需要一个，自己补了；**Task 4/5/6/7 还要补更多，
+  那几个 Task 的工作量比计划写的大**。
+
+#### 计划没写的坑
+
+- **「整段越界」必须单独早退，光靠钳制不够。** 钳制会把 `5:9`（HEAD=4）压成
+  `4:4`，于是「没有新东西」被拉回一条早就有的记录——**比报错更糟，因为它看起来
+  是成功的**（增量合并会反复把同一条记录当成新的）。实现里加了
+  `if from > head && to > head { return Ok(vec![]) }` 早退。
+
+- **`svn info --show-item revision` 对 URL target 也成立。** 计划只实测过对
+  `.`（工作副本路径）的形态（P7），对 URL 是未经验证的假设。本 Task 的
+  `head_revision_reads_the_servers_latest` 实际跑通，假设成立，现在有测试守着。
+
+#### 为什么这么改是安全的（Task 2）
+
+- 本模块**只发 `svn log` 与 `svn info` 两个只读子命令**，不写磁盘、不碰 git、
+  不碰工作副本。最坏的失败是返回 `Err`，调用方（Task 7）按「不 await、失败静默」
+  处理。
+- 钳制**只会让查询范围变窄，不会变宽**：`clamp(1, head)` 的结果恒在仓库真实存在
+  的 revision 区间内。不存在「因为钳制而拉到了不该拉的东西」这条路径。
+- `fetch_anchor` 对越界 revision 返回 `None` 而不是 `Err`，是为了让一个坏锚点
+  只损失图上一个节点，而不是整条历史。
