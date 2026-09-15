@@ -56,6 +56,25 @@ export const NO_GIT_ONLY_CAPABILITIES: Capabilities = {
   patches: false,
 }
 
+/**
+ * 基线分支名。恒为 `svn/base`（spec §6.2.1：配置里那个字段只接受这一个值）。
+ */
+export const BASELINE_BRANCH = 'svn/base'
+
+/**
+ * 这个分支名是不是基线分支。
+ *
+ * # 为什么要精确匹配而不是 `startsWith`
+ *
+ * `svn/base-backup`、`feature/svn/base` 都是完全合法的分支名。把它们也当成基线
+ * 会让用户在自己的备份分支上发现「不能提交」，而且没有任何解释。
+ *
+ * 容忍 `refs/heads/` 前缀：ref 从后端过来时带前缀，用户输入时不带。
+ */
+export function isBaselineBranch(name: string): boolean {
+  return name.replace(/^refs\/heads\//, '') === BASELINE_BRANCH
+}
+
 /** 侧边栏分区。取值与 `RepoTab` 里的渲染顺序一致。 */
 export type SidebarSection = 'branches' | 'tags' | 'worktrees' | 'stashes'
 

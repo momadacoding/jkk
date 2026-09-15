@@ -88,9 +88,17 @@ interface LocalChangesViewProps {
    * 普通 git 仓库里这个标记没有任何含义——没有交付流程会去读它。
    */
   svnMode: boolean
+  /**
+   * HEAD 当前在不在基线分支上。
+   *
+   * spec §6.4：「客户端 UI 禁止在基线分支上开发提交。」流程内部会临时切上去，
+   * 但用户在那儿提交会让基线 commit 后面多出与服务器无关的内容——此后
+   * 「基线 == 服务器在 rN 的状态」这条前提就不成立了，而体检只比磁盘、发现不了。
+   */
+  onBaselineBranch: boolean
 }
 
-export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, onCommit, svnMode }: LocalChangesViewProps) {
+export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, onCommit, svnMode, onBaselineBranch }: LocalChangesViewProps) {
   const [selection, setSelection] = useState<FileSelection>(emptyFileSelection)
   const [subject, setSubject] = useState('')
   const [description, setDescription] = useState('')
@@ -141,7 +149,9 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
     open(e, items)
   }
 
-  const canCommit = subject.trim().length > 0
+  // 基线分支上一律不能提交（spec §6.4），连 Ctrl+Enter 也走这个判据
+  // ——只把按钮置灰而快捷键还通，等于没拦。
+  const canCommit = subject.trim().length > 0 && !onBaselineBranch
 
   const handleCommit = () => {
     onCommit(buildCommitMessage(subject, description, svnMode && localOnly), amend)
@@ -247,8 +257,20 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
               仅本地，不交付
             </label>
           )}
-          <button disabled={!canCommit} onClick={handleCommit} title="Ctrl+Enter">Commit</button>
+          <button
+            disabled={!canCommit}
+            onClick={handleCommit}
+            title={onBaselineBranch ? '基线分支不能用于开发提交' : 'Ctrl+Enter'}
+          >
+            Commit
+          </button>
         </div>
+        {onBaselineBranch && (
+          <p className="changes-baseline-warning">
+            当前在 <code>svn/base</code> 基线分支上。它记的是「上次与服务器对齐时的
+            内容」，<strong>不能用于开发提交</strong>（spec §6.4）。请先切回你的工作分支。
+          </p>
+        )}
         {/* spec §16 明确要求：Phase 1 到 Phase 3 之间这段窗口期必须在 UI 上写明，
             「不能让用户以为勾了『仅本地』就安全了」。
             **故意不做成 tooltip**——勾选框的 title 已经被占用，而这句话是本期

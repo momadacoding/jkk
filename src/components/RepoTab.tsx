@@ -22,7 +22,7 @@ import SvnInitWizard from './SvnInitWizard'
 import BaselineBanner from './BaselineBanner'
 import { describeHealth, describePinned } from '../engine/svnInit'
 import { samePath } from '../engine/path'
-import { visibleSections } from '../engine/capabilities'
+import { isBaselineBranch, visibleSections } from '../engine/capabilities'
 import { askConfirm } from '../engine/confirm'
 import { usePrompt } from './PromptDialog'
 import { useConfirm } from './ConfirmDialog'
@@ -725,6 +725,7 @@ export function RepoTab({
                 onDiscard={(paths, staged) => void handleDiscard(paths, staged)}
                 onCommit={handleCommit}
                 svnMode={state.capabilities.vcs === 'svn'}
+                onBaselineBranch={isBaselineBranch(state.head)}
               />
             )}
           </Panel>

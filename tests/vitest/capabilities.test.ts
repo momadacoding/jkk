@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { ALL_CAPABILITIES, NO_GIT_ONLY_CAPABILITIES, visibleSections } from '@/engine/capabilities'
+import {
+  ALL_CAPABILITIES,
+  NO_GIT_ONLY_CAPABILITIES,
+  isBaselineBranch,
+  visibleSections,
+} from '@/engine/capabilities'
 import { visibleToolbarActions } from '@/engine/toolbarActions'
 import { commitMenu } from '@/engine/commitActions'
 import type { CommitNode } from '@/engine/types'
@@ -43,6 +48,21 @@ describe('visibleSections', () => {
       'vcs',
       'worktrees',
     ])
+  })
+
+  it('识别基线分支，容忍 refs/heads/ 前缀', () => {
+    expect(isBaselineBranch('svn/base')).toBe(true)
+    expect(isBaselineBranch('refs/heads/svn/base')).toBe(true)
+  })
+
+  it('不把名字相近的分支当成基线', () => {
+    // 这些都是合法分支名。误判会让用户在自己的备份分支上发现「不能提交」，
+    // 而且没有任何解释。
+    expect(isBaselineBranch('svn/base-backup')).toBe(false)
+    expect(isBaselineBranch('feature/svn/base')).toBe(false)
+    expect(isBaselineBranch('svn/basement')).toBe(false)
+    expect(isBaselineBranch('master')).toBe(false)
+    expect(isBaselineBranch('')).toBe(false)
   })
 
   it('vcs 说清楚背后是哪种版本控制，不靠别的字段反推', () => {

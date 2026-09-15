@@ -1713,6 +1713,27 @@ body {
   opacity: 0.9;
 }
 
+/* 基线分支：侧边栏里加一个标记，并且不能在它上面提交（spec §6.4）。 */
+.sb-row.baseline .sb-label { color: #d8a657; }
+.sb-baseline-tag {
+  margin-left: 6px;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: #4a3d16;
+  color: #f0e2b8;
+  font-size: 10px;
+  line-height: 15px;
+}
+.changes-baseline-warning {
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  background: #4a1f1f;
+  color: #f3cdcd;
+  border-radius: 3px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
 /* 「仅本地，不交付」勾选框与它的窗口期警告（spec §6.7、§16）。 */
 .changes-local-only { display: flex; align-items: center; gap: 4px; font-size: 12px; }
 .changes-local-only-warning {
