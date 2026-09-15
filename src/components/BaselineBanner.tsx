@@ -59,6 +59,9 @@ export function BaselineBanner({ sync, audit, onRebuild, onCheck }: BaselineBann
                   else if (a.id === 'updateWhitelistDir' && model.command) {
                     void navigator.clipboard.writeText(model.command)
                     setCopied(true)
+                    // 复位，否则按钮永远停在「已复制」，用户再点一次
+                    // 不知道到底复制成功没有。
+                    window.setTimeout(() => setCopied(false), 1500)
                   }
                 }}
               >

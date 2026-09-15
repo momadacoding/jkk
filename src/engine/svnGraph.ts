@@ -89,6 +89,45 @@ function svnId(rev: number): string {
  * @param svnRevs 按 revision **降序**（后端 `merged_sequence` 已保证）
  * @param gitCommits 后端 `load_graph` 的产物，顺序是 `--date-order`
  */
+/**
+ * `<baseline commit 的 oid>` → `svn:<rev>` 的映射。
+ *
+ * [`spliceHistory`] 内部用它重写 parents；**调用方还要用它重映射两样东西**：
+ *
+ * - `refs`（`load_graph` 给的分支指针）。baseline commit 被从节点列表里删掉了，
+ *   而 `GraphView` 按 `refByHash[node.commit.id]` 渲染标签——不重映射的话
+ *   `svn/base` 匹配不到任何一行，**整个看不见**。
+ * - `headHash`。用户可以 checkout 到 `svn/base`（Task 13 明确放行），
+ *   那时 `headHash` 是 baseline 的 oid，在 commits 里找不到对应行：
+ *   HEAD 标记不画、侧边栏单击「定位」滚不过去。
+ */
+export function baselineMap(gitCommits: CommitNode[]): Map<string, string> {
+  const map = new Map<string, string>()
+  for (const c of gitCommits) {
+    const trailer = parseGitSvnId(c.message)
+    if (trailer) map.set(c.id, svnId(trailer.rev))
+  }
+  return map
+}
+
+/** 形状与 `engine/types` 的 `RefPointer` 一致，这里只关心 `hash`。 */
+interface HasHash {
+  hash: string
+}
+
+/**
+ * 把指向 baseline commit 的 ref 改指对应的 svn 节点。
+ *
+ * 映射不到的原样返回（普通分支、以及 baseline 但锚点还没拉到的情况）。
+ * 幂等：已经是 `svn:N` 的 hash 不在映射表的键里。
+ */
+export function remapRefs<T extends HasHash>(refs: T[], map: Map<string, string>): T[] {
+  return refs.map((r) => {
+    const mapped = map.get(r.hash)
+    return mapped ? { ...r, hash: mapped } : r
+  })
+}
+
 export function spliceHistory(svnRevs: SvnRevNode[], gitCommits: CommitNode[]): CommitNode[] {
   // ① SVN 序列 → 链
   const svnNodes: CommitNode[] = svnRevs.map((r, i) => ({
@@ -103,11 +142,7 @@ export function spliceHistory(svnRevs: SvnRevNode[], gitCommits: CommitNode[]): 
   }))
 
   // ② baseline commit → svn 节点 的映射
-  const baselineToSvn = new Map<string, string>()
-  for (const c of gitCommits) {
-    const trailer = parseGitSvnId(c.message)
-    if (trailer) baselineToSvn.set(c.id, svnId(trailer.rev))
-  }
+  const baselineToSvn = baselineMap(gitCommits)
 
   // ③ 重写 parents，并把 baseline commit 自身从输出里去掉
   const rewritten: CommitNode[] = gitCommits

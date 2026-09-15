@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
+  baselineMap,
   isLocalOnly,
   parseGitSvnId,
+  remapRefs,
   spliceHistory,
   type SvnRevNode,
 } from '@/engine/svnGraph'
@@ -168,5 +170,54 @@ describe('spliceHistory', () => {
 
   it('空输入返回空数组', () => {
     expect(spliceHistory([], [])).toEqual([])
+  })
+})
+
+describe('baselineMap / remapRefs', () => {
+  const refs = (items: Array<{ name: string; hash: string }>) =>
+    items.map((r) => ({
+      name: r.name,
+      hash: r.hash,
+      kind: 'branch' as const,
+      ahead: null,
+      behind: null,
+    }))
+
+  it('指向 baseline commit 的 ref 改指 svn 节点', () => {
+    // **独立 review 的发现。** spliceHistory 把 baseline commit 从节点列表里删掉、
+    // 并重写了 parents，但 refs 仍带着那个已经不存在的 oid。
+    // GraphView 按 `refByHash[node.commit.id]` 渲染标签，于是 `svn/base`
+    // 匹配不到任何一行、**整个看不见**。
+    const commits = [git('aaa', ['bbb']), baseline('bbb', [], 4)]
+    const map = baselineMap(commits)
+    const out = remapRefs(refs([{ name: 'refs/heads/svn/base', hash: 'bbb' }]), map)
+    expect(out[0].hash).toBe('svn:4')
+  })
+
+  it('指向普通 commit 的 ref 原样不动', () => {
+    const map = baselineMap([git('aaa', []), baseline('bbb', [], 4)])
+    const out = remapRefs(refs([{ name: 'refs/heads/work', hash: 'aaa' }]), map)
+    expect(out[0].hash).toBe('aaa')
+  })
+
+  it('重复映射是幂等的', () => {
+    // refs 只在 refreshGraph 里映射一次，但 svnRevs 变化会重接 commits。
+    // 万一哪天有人在别处又调一次，不能把已经映射过的再映射坏。
+    const map = baselineMap([baseline('bbb', [], 4)])
+    const once = remapRefs(refs([{ name: 'x', hash: 'bbb' }]), map)
+    expect(remapRefs(once, map)[0].hash).toBe('svn:4')
+  })
+
+  it('baselineMap 只认真正的 baseline', () => {
+    const map = baselineMap([git('aaa', [], '聊到了 git-svn-id 这个格式'), baseline('bbb', [], 7)])
+    expect(map.get('aaa')).toBeUndefined()
+    expect(map.get('bbb')).toBe('svn:7')
+  })
+
+  it('HEAD 落在 baseline 上时也能换算出图上的节点 id', () => {
+    // 用户可以 checkout 到 svn/base（Task 13 明确放行）。不换算的话
+    // headHash 在 commits 里找不到对应行 —— HEAD 标记不画、定位滚不过去。
+    const map = baselineMap([baseline('bbb', [], 4)])
+    expect(map.get('bbb') ?? 'bbb').toBe('svn:4')
   })
 })

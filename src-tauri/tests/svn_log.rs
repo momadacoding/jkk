@@ -9,7 +9,7 @@ mod svn_fixtures;
 use app_lib::engine::svn_init::{init_hybrid, InitRequest};
 use app_lib::engine::svn_log;
 use svn_fixtures::{
-    file_url, svn_repo, svn_repo_baseline_rev_outside_whitelist,
+    file_url, svn_repo, svn_repo_baseline_rev_outside_whitelist, svn_repo_three_revisions,
     svn_repo_with_same_repo_nested_external, NestedExternal, SvnFixture,
 };
 
@@ -138,6 +138,65 @@ fn log_targets_never_appends_the_peg_safe_suffix() {
     for t in &targets {
         assert!(!t.ends_with('@'), "log 的 target 不能带 peg 尾缀：{t}");
     }
+}
+
+#[test]
+fn fetch_log_brings_back_the_newest_revisions_not_the_oldest() {
+    // **独立 review 的阻断项，2026-09-16 实测确认。**
+    //
+    // `--limit` 是从**区间的起始方向**取的：
+    //   `svn log -r 1:8 --limit 3` → r1,r2,r3  （最旧的三条）
+    //   `svn log -r 8:1 --limit 3` → r8,r7,r6  （最新的三条）
+    //
+    // 增量拉取若用升序区间，在 revision 数超过一页的真实仓库上，首屏拿回来的
+    // 就是**最古老**的那一页——而 `PAGE_SIZE` 的文档写的是「首屏最近 200 条」。
+    // 后果不只是顺序难看：baseline 的 revision 在 HEAD 附近，不在那一页里，
+    // 于是工作分支挂在一个没有链的孤零零锚点上。
+    //
+    // 这里用**小 limit** 复现，不需要造 200 个 revision。
+    //
+    // ⚠️ fixture 要选**白名单自己被碰过多次**的那个：
+    // `svn_repo_baseline_rev_outside_whitelist` 的 `Code/` 只在 r1、r2 被动过
+    // （r3/r4 动的是 `Other/`），`limit 2` 对它根本咬不合，测不出方向。
+    // `svn_repo_three_revisions` 的 `Code/A.cs` 在 r1/r2/r3 都被改过。
+    let fx = svn_repo_three_revisions(); // Code 的历史 = r1, r2, r3
+    init(&fx);
+    let got = svn_log::fetch_log(&fx.wc_str(), None, 2).unwrap();
+    let revs: Vec<u64> = got.iter().map(|e| e.rev).collect();
+    assert!(
+        revs.contains(&3) && revs.contains(&2),
+        "首屏应当是**最新**的两条 r3/r2，实际 {revs:?}"
+    );
+    assert!(
+        !revs.contains(&1),
+        "r1 是最古老的那条，升序 + limit 才会把它取进来：{revs:?}"
+    );
+}
+
+#[test]
+fn fetch_log_paging_walks_towards_older_revisions() {
+    let fx = svn_repo_three_revisions();
+    init(&fx);
+    let first = svn_log::fetch_log(&fx.wc_str(), None, 2).unwrap();
+    let oldest = first.iter().map(|e| e.rev).min().unwrap();
+
+    let after = svn_log::fetch_log(&fx.wc_str(), Some(oldest), 2).unwrap();
+    let revs: Vec<u64> = after.iter().map(|e| e.rev).collect();
+    assert!(
+        revs.len() > first.len(),
+        "往下翻应当带回更早的 revision，实际 {revs:?}"
+    );
+    assert!(revs.contains(&1), "翻到底应当能拿到 r1：{revs:?}");
+}
+
+#[test]
+fn fetch_log_is_a_no_op_once_everything_is_cached() {
+    // 「没有新东西」时不该反复重查同一段区间。
+    let fx = svn_repo_baseline_rev_outside_whitelist();
+    init(&fx);
+    let first = svn_log::fetch_log(&fx.wc_str(), None, 200).unwrap();
+    let second = svn_log::fetch_log(&fx.wc_str(), None, 200).unwrap();
+    assert_eq!(first, second);
 }
 
 #[test]

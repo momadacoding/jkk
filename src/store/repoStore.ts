@@ -1,10 +1,21 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { CommitNode, DiffData, GraphData, PullRequest, RefPointer, RepoInfo, StashEntry, StatusData, UpstreamInfo, Worktree } from '../engine/types'
 import { ALL_CAPABILITIES, type Capabilities } from '../engine/capabilities'
 import type { ServerAudit, SyncStatus } from '../engine/svnSync'
-import { spliceHistory, type SvnRevNode } from '../engine/svnGraph'
+import { baselineMap, remapRefs, spliceHistory, type SvnRevNode } from '../engine/svnGraph'
+
+import { toErrorCode, toErrorMessage } from '../engine/errors'
+import type {
+  Health,
+  InitReport,
+  PinnedExternal,
+  Preflight,
+  RebuildReport,
+} from '../engine/svnInit'
+import { samePath } from '../engine/path'
+import { nextSelection } from '../engine/selection'
 
 /** 后端 `svn_sync::RootRev`。 */
 interface RootRev {
@@ -46,16 +57,6 @@ function merge(s: RepoState, gitCommits: CommitNode[], svnRevs: SvnRevNode[]): C
   if (s.capabilities.vcs !== 'svn') return gitCommits
   return spliceHistory(svnRevs, gitCommits)
 }
-import { toErrorCode, toErrorMessage } from '../engine/errors'
-import type {
-  Health,
-  InitReport,
-  PinnedExternal,
-  Preflight,
-  RebuildReport,
-} from '../engine/svnInit'
-import { samePath } from '../engine/path'
-import { nextSelection } from '../engine/selection'
 
 export interface RepoState {
   path: string | null
@@ -119,17 +120,14 @@ export interface RepoState {
    */
   gitCommits: CommitNode[]
   /**
-   * 上一次观测到的每个工作副本根的 revision，序列化成字符串好比对。
+   * 已经翻到最早的 revision 了，「加载更多」该禁用。
    *
-   * §6.6.3 第一档的判据是「与**上次观测值**比」，**不是**与 `baselineRev` 比：
-   * 交付之后根节点会长期停在旧 revision（spec §6.6.2 有实测），拿它跟
-   * `baselineRev` 比会每次刷新都判不等，于是每次刷新都触发全量校验，
-   * 分层的意义直接归零。
-   *
-   * 进程重启后是 `null`，第一次刷新当作「变了」跑一次全量——那正是打开仓库
-   * 本来就要做的事。
+   * **判据是「上一次翻页没带回任何新东西」，不是「最旧的那条是不是 r1」。**
+   * 后者两头都错：白名单最早的 revision 是 r5 时它永远到不了 1、按钮永远亮着
+   * 而每次点击什么都不发生；而只要序列里恰好有 r1（比如锚点补拉带回来的），
+   * 它又会在还有大把历史没拉的时候就把按钮禁掉。
    */
-  lastRootRevs: string | null
+  svnLogComplete: boolean
 }
 
 const initialState: RepoState = {
@@ -154,7 +152,7 @@ const initialState: RepoState = {
   svnAudit: null,
   svnRevs: [],
   gitCommits: [],
-  lastRootRevs: null,
+  svnLogComplete: false,
 }
 
 /**
@@ -257,6 +255,22 @@ export function svnServerAudit(path: string): Promise<ServerAudit> {
 
 export function useRepoStore() {
   const [state, setState] = useState<RepoState>(initialState)
+  /**
+   * 上一次观测到的每个工作副本根的 revision，序列化成字符串好比对。
+   *
+   * **放 ref 不放 state**：读它的是 `repo-changed` 监听器，而那个 `useEffect`
+   * 的依赖是 `[state.path, diffScope]`。放进 state 的话监听器会**永远闭包住
+   * 注册那一刻的值**（`null`），比较恒为不等，于是第二档的全量校验
+   * 每次文件变动都跑一遍——分层就白做了。这是独立 review 抓到的。
+   *
+   * §6.6.3 第一档的判据是「与**上次观测值**比」，**不是**与 `baselineRev` 比：
+   * 交付之后根节点会长期停在旧 revision（spec §6.6.2 有实测），拿它跟
+   * `baselineRev` 比会每次刷新都判不等，同样让分层归零。
+   *
+   * 进程重启后是 `null`，第一次刷新当作「变了」跑一次全量——那正是打开仓库
+   * 本来就要做的事。
+   */
+  const lastRootRevs = useRef<string | null>(null)
 
   const openRepo = useCallback(async (path: string) => {
     setState((s) => ({ ...s, loading: true, error: null, errorCode: null }))
@@ -305,7 +319,7 @@ export function useRepoStore() {
           svnSync: null,
           svnAudit: null,
           svnRevs: [],
-          lastRootRevs: null,
+          svnLogComplete: false,
           // gitCommits 不用清：refreshGraph 每次都整份覆盖它
         }))
       }
@@ -345,11 +359,18 @@ export function useRepoStore() {
     const data = await invoke<GraphData>('load_graph', { path })
     setState((s) => {
       const commits = merge(s, data.commits, s.svnRevs)
+      // refs 必须跟着一起重映射：baseline commit 被从节点列表里删掉了，而
+      // GraphView 按 `refByHash[node.commit.id]` 渲染标签——不映射的话
+      // `svn/base` 匹配不到任何一行，**整个看不见**。
+      const refs =
+        s.capabilities.vcs === 'svn'
+          ? remapRefs(data.refs, baselineMap(data.commits))
+          : data.refs
       return {
         ...s,
         gitCommits: data.commits,
         commits,
-        refs: data.refs,
+        refs,
         selectedId: nextSelection(s.selectedId, commits.map((c) => c.id), preferredId, force),
       }
     })
@@ -390,7 +411,21 @@ export function useRepoStore() {
    */
   const refreshSvnSync = async (path: string) => {
     const [st, revs] = await Promise.all([svnSyncStatus(path), svnRootRevs(path)])
-    setState((s) => ({ ...s, svnSync: st, lastRootRevs: serializeRootRevs(revs) }))
+    lastRootRevs.current = serializeRootRevs(revs)
+    setState((s) => ({ ...s, svnSync: st }))
+  }
+
+  /**
+   * 第一档（O(1)）：rootRev 与**上次观测值**比，变了才跑第二档。
+   *
+   * 返回是否真的跑了第二档，只为让调用方能读懂日志；调用方不依赖它。
+   */
+  const checkSvnSyncIfChanged = async (path: string) => {
+    const now = serializeRootRevs(await svnRootRevs(path))
+    if (now === lastRootRevs.current) return false
+    lastRootRevs.current = now
+    await refreshSvnSync(path)
+    return true
   }
 
   /** 读缓存里的 SVN 历史并接进图。不走网络。 */
@@ -409,9 +444,19 @@ export function useRepoStore() {
   const fetchSvnLog = async (path: string, beforeRev: number | null = null) => {
     try {
       const revs = await svnFetchLog(path, beforeRev, SVN_LOG_PAGE)
-        // svnRevs 一变就要重接一次：后台拉取是异步的，先画出来的图里
+      // svnRevs 一变就要重接一次：后台拉取是异步的，先画出来的图里
       // svn 节点还没到位，工作分支那时还挂在 baseline commit 上。
-      setState((s) => ({ ...s, svnRevs: revs, commits: merge(s, s.gitCommits, revs) }))
+      setState((s) => ({
+        ...s,
+        svnRevs: revs,
+        commits: merge(s, s.gitCommits, revs),
+        // **翻页没带回新东西 = 到底了。** 用「最旧的是不是 r1」判是错的：
+        // 白名单最早的 revision 是 r5 时永远到不了 1、按钮永远亮着而点了没反应；
+        // 反过来只要序列里恰好有 r1（锚点补拉带回来的也算），又会在还有大把
+        // 历史没拉时就把按钮禁掉。
+        svnLogComplete:
+          beforeRev !== null && revs.length === s.svnRevs.length ? true : s.svnLogComplete,
+      }))
     } catch (err) {
       console.warn('拉取 SVN 历史失败，图上只显示缓存里已有的部分：', err)
     }
@@ -490,6 +535,7 @@ export function useRepoStore() {
     refreshStashes,
     refreshPullRequests,
     refreshSvnSync,
+    checkSvnSyncIfChanged,
     refreshSvnLog,
     fetchSvnLog,
     refreshSvnAudit,
@@ -509,7 +555,8 @@ export interface RepoRefreshers {
   refreshUpstream: (path: string) => Promise<void>
   refreshStashes: (path: string) => Promise<void>
   /** §6.6.3 第二档。只在第一档报告「有人动过」之后才调。 */
-  refreshSvnSync: (path: string) => Promise<void>
+  /** §6.6.3 的第一档 + 条件触发第二档。挂在高频的 repo-changed 上。 */
+  checkSvnSyncIfChanged: (path: string) => Promise<boolean>
 }
 
 export function useRepoEffects(
@@ -517,7 +564,7 @@ export function useRepoEffects(
   refreshers: RepoRefreshers,
   viewMode: string,
 ) {
-  const { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes, refreshSvnSync } = refreshers
+  const { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged } = refreshers
   const diffScope = viewMode === 'changes'
     ? 'workdir'
     : state.selectedId
@@ -551,15 +598,13 @@ export function useRepoEffects(
       //
       // 不分层的话，每一次文件保存都会触发一遍白名单子树的 `svn status -v`
       // ——那是本地读，但在几万文件的工作副本上仍然是可感知的开销。
+      //
+      // 比对用的「上次观测值」存在 **ref** 里（见 `useRepoStore` 的
+      // `lastRootRevs`）：这个监听器的 `useEffect` 依赖是 `[state.path, diffScope]`，
+      // 把它放进 state 的话闭包会永远读到注册那一刻的值，比较恒为不等，
+      // 第二档还是每次都跑——分层白做。
       if (state.capabilities.vcs === 'svn') {
-        void svnRootRevs(path)
-          .then((revs) => {
-            const now = serializeRootRevs(revs)
-            // 比的是**上次观测值**，不是 baselineRev。理由见 lastRootRevs 的注释。
-            if (now === state.lastRootRevs) return
-            void refreshSvnSync(path).catch(ignore)
-          })
-          .catch(ignore)
+        void checkSvnSyncIfChanged(path).catch(ignore)
       }
     }).then((fn) => { unlisten = fn })
     return () => { unlisten?.() }

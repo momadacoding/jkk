@@ -187,6 +187,49 @@ fn a_revision_the_server_does_not_have_is_not_checked_either() {
 }
 
 #[test]
+fn a_single_file_whitelist_entry_does_not_produce_a_doubled_path() {
+    // **独立 review 的发现，2026-09-16 实测确认。**
+    //
+    // 单文件白名单条目（设计明确支持，见 `is_w_file` 的文档与 `svn_health` 里
+    // 那个相等分支）在 `enumerate_wcs` 里也是一个记账单位，它的 url 直接指向
+    // **那个文件**。实测 `svn ls -R --xml <url>/Code/notes.txt@N` 返回：
+    //
+    // ```text
+    // <list path=".../Code/notes.txt"><entry kind="file"><name>notes.txt</name>
+    // ```
+    //
+    // 于是 `format!("{}/{}", wc_root, name)` 拼出 `Code/notes.txt/notes.txt`
+    // —— 一个磁盘上永远不存在的路径，落进 missing 差集，
+    // 变成一条**对完全健康的仓库常挂不下的**「服务器上有代码文件不在本地」。
+    let fx = svn_repo_for_health();
+    // 白名单同时含目录和单文件条目；扩展名放开成 `*`，让 .txt 也算 W-file
+    // ——收窄成 `.cs` 的话这条路径会被扩展名过滤悄悄挡掉，测不出问题。
+    std::fs::write(fx.wc().join("Code/notes.txt"), "n\n").unwrap();
+    svn_cmd(
+        &fx.wc(),
+        &["add", "--non-interactive", "--", "Code/notes.txt@"],
+    );
+    svn_cmd(&fx.wc(), &["commit", "-m", "r2 notes", "--non-interactive"]);
+    svn_cmd(&fx.wc(), &["update", "--non-interactive"]);
+
+    init_hybrid(&InitRequest {
+        repo_root: fx.wc_str(),
+        whitelist: vec!["Code/".to_string(), "Code/notes.txt".to_string()],
+        extensions: vec!["*".to_string()],
+    })
+    .unwrap();
+
+    let got = svn_server_set::audit_server_set(&fx.wc_str(), 2).unwrap();
+    match got {
+        ServerAudit::Matched => {}
+        ServerAudit::Missing { files, .. } => {
+            panic!("单文件条目被拼成了不存在的路径，误报漏收：{files:?}")
+        }
+        other => panic!("实际 {other:?}"),
+    }
+}
+
+#[test]
 fn a_file_only_on_disk_is_not_reported() {
     // 反方向（磁盘有、服务器没有）是「本地新增还没 svn add」，完全正常。
     // 报了就是噪音，而噪音会让用户学会忽略这条提示。

@@ -109,6 +109,23 @@ pub fn audit_server_set(repo_root: &str, rev: u64) -> Result<ServerAudit> {
                 })
             }
         };
+        // **单文件记账单位**：白名单条目可以是一个具体文件（设计明确支持，
+        // 见 `is_w_file` 的文档）。那时这个单位的 url 直接指向那个文件，
+        // 2026-09-16 实测 `svn ls -R --xml <url>/Code/notes.txt@N` 返回：
+        //
+        // ```text
+        // <list path=".../Code/notes.txt"><entry kind="file"><name>notes.txt</name>
+        // ```
+        //
+        // 照「接前缀」的通则拼出来是 `Code/notes.txt/notes.txt` —— 一个磁盘上
+        // 永远不存在的路径，落进 missing 差集，变成一条对**完全健康的仓库**
+        // 常挂不下的误报。`svn_health` 里有同一个相等分支，这里补上。
+        let unit_is_file = listed.entries.len() == 1
+            && listed.entries[0].kind == "file"
+            && unit_url
+                .to_lowercase()
+                .ends_with(&format!("/{}", listed.entries[0].name.to_lowercase()));
+
         for entry in listed.entries {
             // 目录也是 entry（实测），只要文件。
             if entry.kind != "file" {
@@ -116,7 +133,11 @@ pub fn audit_server_set(repo_root: &str, rev: u64) -> Result<ServerAudit> {
             }
             // `<name>` 是**相对 `<list path>`** 的递归路径（实测 N4），
             // 接上这个单位在仓库里的位置才是仓库内相对路径。
-            let rel = format!("{}/{}", unit.wc_root.trim_end_matches('/'), entry.name);
+            let rel = if unit_is_file {
+                unit.wc_root.trim_end_matches('/').to_string()
+            } else {
+                format!("{}/{}", unit.wc_root.trim_end_matches('/'), entry.name)
+            };
             // 与 git 侧**同一套**判据过滤：服务器上的美术资产本来就不该进 git，
             // 不过滤的话每个真实工程一打开就报几千条。
             if is_w_file(&rel, &roots, &cfg.extensions) {

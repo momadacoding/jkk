@@ -26,6 +26,7 @@
 | 11 混合图接线与分页 | ✅ 完成 | `CommitRow.tsx`、`CommitDetailView.tsx`、`GraphView.tsx`、`RepoTab.tsx`、`styles.css` | **323 passed**、`pnpm build` ✓ |
 | 12 本地补丁标记 | ✅ 完成 | `src/engine/commitActions.ts`、`LocalChangesView.tsx`、`RepoTab.tsx`、`styles.css`、`tests/vitest/commitActions.test.ts` | **327 passed**（新增 4）、`pnpm build` ✓ |
 | 13 基线分支 UI 保护 | ✅ 完成 | `src/engine/capabilities.ts`、`BranchView.tsx`、`LocalChangesView.tsx`、`RepoTab.tsx`、`styles.css`、`tests/vitest/capabilities.test.ts` | **329 passed**（新增 2）、`pnpm build` ✓ |
+| 15 独立 review 的修复 | ✅ 完成 | `engine/svn_log.rs`、`engine/svn_server_set.rs`、`src/engine/svnGraph.ts`、`src/engine/svnSync.ts`、`src/store/repoStore.ts`、`src/components/{RepoTab,BaselineBanner}.tsx`、四个测试文件 | 5 条全部复现并修掉；Rust **480 passed / 0 failed / 37 个二进制**、`cargo fmt --check` ✓、`clippy` **0 warning**；前端 **334 passed / 24 files**、`pnpm build` ✓ |
 | 14 收尾验证 | 🟡 自动化部分完成 | 本文件、`docs/superpowers/e2e/2026-09-15-svn-phase1c-e2e.md`（新） | Rust **476 passed / 0 failed / 37 个二进制**、`cargo fmt --check` ✓、`cargo clippy --all-targets` **0 warning**；前端 **329 passed / 24 files**、`pnpm build` ✓；零 SVN 写操作核对通过；命令对账 **56 == 56**。**真实窗口的 10 个场景未执行**，见下 |
 
 ---
@@ -708,3 +709,93 @@ mkdir|copy|move|lock|unlock` 全文搜索，7 处命中逐条核对，**全部�
 | `git-svn-id` 正则两份 | Rust 与 TS 各一份，格式由 spec §6.4.1 钉死且两侧都有测试 |
 | `whitelist_not_under_base` 未放开 | 改成 per-unit URL 之后，被 `svn switch` 的子树其实能正确比对了，但放开属行为扩大，超出 Task 5 范围。记账给后面 |
 | worktree 的 `target/` 单调累积 | `AGENTS.md` §4.1 要求每任务开 worktree，§4.3 限制清理，两条合起来会填满磁盘（本期开工时就因此撞上 `LNK1318`）。可考虑给 worktree 配共享 `CARGO_TARGET_DIR` |
+
+---
+
+## Task 15：独立 review 的修复
+
+`AGENTS.md` §4.1 的独立 review 门槛。5 条发现**全部复现并修掉**，无一被驳回。
+两条最严重的（1、3）合起来会让**任何真实仓库**上的 SVN 图不可用。
+
+### R1（阻断）`fetch_log` 拿回来的是**最古老**的一页，不是最新的
+
+`--limit` 是从**区间的起始方向**取的。2026-09-16 实测：
+
+```text
+svn log -r 1:8 --limit 3  →  r1, r2, r3   （最旧的三条）
+svn log -r 8:1 --limit 3  →  r8, r7, r6   （最新的三条）
+```
+
+我的增量拉取用的是升序区间 `covered_max+1 : HEAD`，于是 revision 数超过一页的
+仓库首屏拿回来的是**最古老**的 200 条——而 `PAGE_SIZE` 的文档白纸黑字写着
+「首屏最近 200 条」。后果不只是顺序难看：baseline 的 revision 在 HEAD 附近、
+不在那一页里，工作分支会挂在一个没有链的孤零零锚点上。
+
+**修**：区间一律降序。顺带修掉「`got` 为空时不推进 `covered_max`」——那会让
+一个「这段没有提交」的 target 每次刷新都重查同一段越来越大的区间。
+
+**为什么既有测试没抓到**：所有 fixture 都只有 ≤4 个 revision，`--limit 200`
+永远咬不合。这正是 `AGENTS.md` §13 rubric #9 说的「测试的输入不是实际场景的形态」。
+
+⚠️ 补测试时我**第一次也选错了 fixture**：`svn_repo_baseline_rev_outside_whitelist`
+的白名单 `Code/` 只在 r1、r2 被动过，`limit 2` 对它同样咬不合，拿到 `[4,2,1]`
+是正确结果。换成 `svn_repo_three_revisions`（`Code/A.cs` 在 r1/r2/r3 都被改）才
+真的复现。**「造一个失败」和「造出那一种失败」不是一回事**——本期第二次栽在这上面。
+
+变异验证：把区间改回升序**并**去掉 `from < to` 早退（忠实复现原实现），两条测试
+双双变红。只改区间方向的话会先撞上早退，红得不是地方。
+
+### R2（阻断）stale closure 让 §6.6.3 的分层彻底失效
+
+`repo-changed` 的监听器注册在 `useEffect([state.path, diffScope])` 里，却读
+`state.lastRootRevs`。而 `lastRootRevs` 是 `refreshSvnSync` 写的，那不会让
+effect 重建——闭包**永远读到注册那一刻的 `null`**，比较恒为不等，
+于是第二档的全量 `svn status -v` 每次文件变动都跑一遍。
+
+**注释就写在上面两行说「分层就是为了避免这个开销」，而代码做的正相反。**
+
+**修**：`lastRootRevs` 改成 `useRef`，并把第一档整个收进
+`checkSvnSyncIfChanged`，监听器只调这一个函数。
+
+### R3（阻断）「加载更多」的禁用判据两头都错
+
+原判据是 `oldestSvnRev <= 1`。配合 R1，首屏必定带回 r1 → 按钮立刻变成
+「已到最早的 revision」并禁用，而最新的几千条根本没拉。反过来，白名单最早的
+revision 是 r5 时它永远到不了 1 → 按钮永远亮着，每次点击什么都不发生。
+
+**修**：判据改成「上一次翻页没带回任何新东西」。
+
+### R4 指向 baseline commit 的 ref 没跟着重映射
+
+`spliceHistory` 把 baseline commit 从节点列表里删掉、重写了 parents，但 `refs`
+仍带着那个已经不存在的 oid。`GraphView` 按 `refByHash[node.commit.id]` 渲染标签，
+于是 `svn/base` 匹配不到任何一行、**整个看不见**。
+
+而 Task 13 刚刚明确放行「checkout 到 `svn/base`」——切上去之后 `headHash` 也
+在 `commits` 里找不到对应行：HEAD 标记不画、侧边栏单击「定位」滚不过去。
+
+**修**：抽出 `baselineMap()` 与 `remapRefs()`，store 在 `refreshGraph` 里映射
+refs，`RepoTab` 用同一张表换算 `headHash`。两者都只在 `caps.vcs === 'svn'` 时做。
+
+### R5 单文件白名单条目拼出翻倍路径，误报漏收
+
+实测 `svn ls -R --xml <url>/Code/notes.txt@N` 返回
+`<list path=".../Code/notes.txt"><entry kind="file"><name>notes.txt</name>`，
+照「接前缀」的通则拼出 `Code/notes.txt/notes.txt` —— 磁盘上永远不存在，
+落进 missing 差集，变成一条对**完全健康的仓库**常挂不下的横幅。
+
+`svn_health` 有同一个相等分支，`svn_server_set` 漏了。**修**：补上。
+
+### 另外两条 cosmetic（review 标明未单独立项，一并修了）
+
+- `describeAudit` 的文案重复报数（「有 N 个…（共 N 个…）」）。
+- `BaselineBanner` 的「已复制」永不复位，用户再点一次不知道有没有成功。
+
+#### 为什么这些修改是安全的
+
+- R1/R3 只改**查询区间与按钮禁用条件**，不改任何写路径；方向改对之后
+  拉回来的是真实存在的 revision，不会凭空造节点。
+- R2 把 state 换成 ref，语义不变、只是让比较真的生效——改动方向是**少跑**
+  昂贵检查，不是少跑安全检查（第二档仍在打开仓库、重建基线后照常全量跑）。
+- R4 的映射只在 SVN 模式下做，且映射不到时原样返回；普通 git 仓库完全不受影响。
+- R5 是把 `svn_health` 里已有的判据搬过来，两处现在一致。

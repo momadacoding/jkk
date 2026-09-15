@@ -174,30 +174,57 @@ pub fn fetch_log(
     let targets = log_targets(repo_root)?;
     let mut failures: Vec<String> = Vec::new();
     for t in &targets {
-        let entry = cache.targets.entry(t.clone()).or_default();
-        let (from, to) = match before_rev {
-            // 增量拉新：从已覆盖上界的下一个起，拉到 HEAD。
-            // 越界由 fetch_range 自己钳制——「没有新东西」不是错误。
-            None => (entry.covered_max.saturating_add(1), u64::MAX),
-            // 往下翻页：拉比 before_rev 更旧的一段。
-            Some(b) => {
-                let to = b.saturating_sub(1);
-                if to == 0 {
-                    continue; // 已经翻到 r1 了
-                }
-                (to.saturating_sub(u64::from(limit)).max(1), to)
+        // 显式取一次 HEAD：下面要用它当区间上界，也要用它判断「有没有新东西」。
+        // 交给 fetch_range 去钳制哨兵值的写法看着省事，但那样这里就不知道
+        // 真实上界是多少，覆盖区间只能靠猜。
+        let head = match head_revision(repo_root, t) {
+            Ok(h) => h,
+            Err(e) => {
+                failures.push(format!("{t}: {}", e.message));
+                continue;
             }
         };
-        // `u64::MAX` 交给 fetch_range 钳成 HEAD，不在这里多发一次 head_revision
+        if head == 0 {
+            continue; // 空仓库
+        }
+        let entry = cache.targets.entry(t.clone()).or_default();
+
+        // ⚠️ **区间一律降序（from >= to）。**
+        //
+        // 2026-09-16 实测：`--limit` 是从**区间的起始方向**取的——
+        //   `svn log -r 1:8 --limit 3` → r1,r2,r3（最旧的）
+        //   `svn log -r 8:1 --limit 3` → r8,r7,r6（最新的）
+        //
+        // 用升序区间的话，revision 数超过一页的仓库首屏拿回来的是**最古老**的
+        // 那一页，而 baseline 的 revision 在 HEAD 附近、不在里面，于是工作分支
+        // 挂在一个没有链的孤零零锚点上。这是独立 review 抓到的阻断项。
+        let (from, to) = match before_rev {
+            // 增量拉新：HEAD 往下，拉到已覆盖上界的下一个。
+            None => (head, entry.covered_max.saturating_add(1)),
+            // 往下翻页：从 before_rev 的前一个往更旧的方向拉一页。
+            // 下界给 1，实际能拉多少由 limit 决定。
+            Some(b) => (b.saturating_sub(1), 1),
+        };
+        if from < to || from == 0 {
+            // 增量：covered_max 已经到 HEAD，没有新东西。
+            // 翻页：已经翻到 r1 了。两种都不用发命令。
+            continue;
+        }
+
         match fetch_range(repo_root, t, from, to, limit) {
             Ok(got) => {
-                let hi = got.iter().map(|e| e.revision).max().unwrap_or(to.min(from));
-                let lo = got.iter().map(|e| e.revision).min().unwrap_or(hi);
-                // 用**实际拿到的**区间记覆盖，不用请求的区间：请求上界是
-                // `u64::MAX` 这种哨兵值，记进去会谎称覆盖到了天边。
-                if !got.is_empty() {
-                    cache_mod::merge_into(entry, &got, lo, hi);
-                }
+                // 覆盖区间的上界就是 `from`：即使 got 里最新的一条小于它，
+                // 中间那些 revision 也只是没碰过这个 target，同样算查过了。
+                //
+                // 下界分两种：
+                // - got 非空 → 取 `min(got)`。**不能用 `to`**：降序 + limit 会从
+                //   下面截断，比 min(got) 更旧的那些根本没返回，声称覆盖到 `to`
+                //   会让下一次翻页直接跳过它们，那段历史永久缺失且无声。
+                // - got 为空 → 整段 `[to, from]` 确实没有属于这个 target 的
+                //   revision，可以如实记成已覆盖。少了这一条，「这段没有提交」
+                //   的 target 会在每次刷新时重查同一段越来越大的区间。
+                let lo = got.iter().map(|e| e.revision).min().unwrap_or(to);
+                cache_mod::merge_into(entry, &got, lo, from);
             }
             Err(e) => failures.push(format!("{t}: {}", e.message)),
         }

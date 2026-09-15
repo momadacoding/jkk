@@ -20,6 +20,7 @@ import {
 } from '../store/repoStore'
 import SvnInitWizard from './SvnInitWizard'
 import BaselineBanner from './BaselineBanner'
+import { baselineMap } from '../engine/svnGraph'
 import { describeHealth, describePinned } from '../engine/svnInit'
 import { samePath } from '../engine/path'
 import { isBaselineBranch, visibleSections } from '../engine/capabilities'
@@ -113,7 +114,7 @@ export function RepoTab({
   const {
     state, openRepo, refreshHead, refreshGraph, refreshStatus, refreshWorktrees,
     refreshDiff, refreshUpstream, refreshStashes, refreshPullRequests,
-    refreshSvnSync, fetchSvnLog, refreshSvnAudit,
+    refreshSvnSync, checkSvnSyncIfChanged, fetchSvnLog, refreshSvnAudit,
     selectCommit, clearError, reportError,
   } = useRepoStore()
   const [repoState, setRepoState] = useState<string>('normal')
@@ -129,7 +130,7 @@ export function RepoTab({
 
   useRepoEffects(
     state,
-    { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes, refreshSvnSync },
+    { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged },
     viewMode,
   )
 
@@ -573,6 +574,14 @@ export function RepoTab({
     ? state.svnRevs[state.svnRevs.length - 1].rev
     : null
 
+  // HEAD 落在 baseline commit 上时（用户可以 checkout 到 svn/base），
+  // 那个 oid 已经被接合从图上删掉了。换算成 `svn:N` 才找得到对应行 ——
+  // 否则 HEAD 标记不画、侧边栏单击「定位」滚不过去。
+  const graphHeadHash =
+    state.capabilities.vcs === 'svn'
+      ? baselineMap(state.gitCommits).get(state.headHash) ?? state.headHash
+      : state.headHash
+
   // pinned 模式的残余风险，spec §6.5.3 第 3 条要求**常驻说明**：
   // 别的工具在项目根跑递归 update 会把这些目录退回被钉住的 revision，
   // 而工作副本看起来是干净的。只在向导里显示一次不算常驻。
@@ -694,7 +703,7 @@ export function RepoTab({
                     pullRequests={state.pullRequests}
                     selectedId={state.selectedId}
                     onSelect={selectCommit}
-                    headHash={state.headHash}
+                    headHash={graphHeadHash}
                     changeCount={state.status.unstaged.length + state.status.staged.length}
                     onOpenChanges={() => setViewMode('changes')}
                     onCommitAction={(action, commit) => void handleCommitAction(action, commit)}
@@ -704,7 +713,7 @@ export function RepoTab({
                         ? () => void fetchSvnLog(repoPath, oldestSvnRev)
                         : undefined
                     }
-                    svnLogComplete={oldestSvnRev !== null && oldestSvnRev <= 1}
+                    svnLogComplete={state.svnLogComplete}
                   />
                 </Panel>
                 <Separator style={{ height: 4, background: '#333' }} />

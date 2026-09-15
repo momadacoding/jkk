@@ -133,7 +133,9 @@ export function describeSync(status: SyncStatus | null): BannerModel | null {
 export function describeAudit(audit: ServerAudit | null): AuditModel | null {
   if (!audit) return null
   if (audit.status !== 'missing') return null
-  const more = audit.total > audit.files.length ? `（共 ${audit.total} 个，以下列出前 ${audit.files.length} 个）` : ''
+  // 截断时才提列了几条；不截断时重复报一遍数字是噪音。
+  const more =
+    audit.total > audit.files.length ? `（以下只列出前 ${audit.files.length} 个）` : ''
   return {
     tone: 'warn',
     title: '服务器上有代码文件不在本地',
