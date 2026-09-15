@@ -404,6 +404,154 @@ pub fn parse_diff_summary(xml: &str) -> Result<Vec<DiffEntry>> {
     Ok(out)
 }
 
+/// `svn log --xml` 的一条 entry。
+///
+/// # 为什么 `author` / `message` 缺失算空，而 `revision` 缺失算错
+///
+/// `revision` 是这条记录的**身份**：猜一个出来会让缓存和图上多一个不存在的节点。
+/// 另外两个只是内容——匿名提交没有 `<author>`；`svn log -q` 的输出里 `<msg>`
+/// **整个元素不出现**（2026-09-15 实测，不是空元素）。本期不用 `-q`，但把
+/// 「缺失 = 空」钉死，是为了让将来有人为省流量加上 `-q` 时，不会得到一个
+/// 「历史拉取整体失败」。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SvnLogEntry {
+    pub revision: u64,
+    pub author: String,
+    /// ISO8601 原样（`2026-09-15T15:21:22.337313Z`）。
+    ///
+    /// **不在这里解析成时间戳**：归一化留给前端，免得 Rust 侧和 TS 侧各有一套
+    /// 时区处理，而图上显示的时间只由前端那套决定。
+    pub date: String,
+    pub message: String,
+}
+
+/// 解析 `svn log --xml`。
+///
+/// ⚠️ 属性逐行排列（`<logentry⏎   revision="3">`），行内正则会静默扫出空集，
+/// 见本文件头部与 spec §6.6.4 陷阱三。必须走 DOM。
+///
+/// 顺序**原样保留**，不在这里重排：svn 默认降序，而区间方向会改变它
+/// （`-r 2:3` 升序 / `-r 3:2` 降序，2026-09-15 实测）。排序是调用方按用途决定的事。
+pub fn parse_log(xml: &str) -> Result<Vec<SvnLogEntry>> {
+    let doc = parse_doc(xml)?;
+    let mut out = Vec::new();
+    for node in doc.descendants().filter(|n| n.has_tag_name("logentry")) {
+        let revision = node
+            .attribute("revision")
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or_else(|| {
+                GitError::new(
+                    "svn_xml_log_no_revision",
+                    "svn log 的 logentry 缺少可解析的 revision 属性。revision 是这条\
+                     记录的身份，猜不得——缺了只能整条拒绝。",
+                )
+            })?;
+        out.push(SvnLogEntry {
+            revision,
+            author: joined_child_text(&node, "author"),
+            date: joined_child_text(&node, "date"),
+            message: joined_child_text(&node, "msg"),
+        });
+    }
+    Ok(out)
+}
+
+/// `svn ls -R --xml` 的一条 entry。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SvnListEntry {
+    /// **相对 [`SvnListResult::base`] 的递归路径，正斜杠。**
+    ///
+    /// 2026-09-15 实测：target 换成子路径 URL 时，这里相对**那个子路径**重新
+    /// 编号（`<url>/Code` → `A.cs`、`Deep`、`Deep/D.cs`），**不是**仓库绝对路径。
+    /// 调用方必须自己接前缀。
+    ///
+    /// ⚠️ 同一个 CLI 在本模块里已经有三种路径写法了：`status` 的 `path` 属性是
+    /// **反斜杠相对路径**、`diff --summarize` 的 `<path>` 是**完整 URL**、
+    /// 这里是**相对基准 URL 的正斜杠路径**。不要凭印象套用。
+    pub name: String,
+    /// `"file"` 或 `"dir"`。**目录也是 entry**，调用方要自己筛。
+    pub kind: String,
+}
+
+/// `svn ls -R --xml` 的解析结果。
+pub struct SvnListResult {
+    /// `<list path="…">` 的值，即本次列举的基准 URL（已去尾斜杠）。
+    pub base: String,
+    pub entries: Vec<SvnListEntry>,
+}
+
+/// 解析 `svn ls -R --xml`。
+///
+/// # ⚠️ 空清单在这里是合法的，判「是不是失败」不归本函数
+///
+/// 2026-09-15 实测：路径不存在时 svn **exit 1**，但 stdout 仍是一份结构完整的
+/// 空 `<lists><list></list></lists>`，错误只在 stderr。而空仓库 `@0` 是
+/// **exit 0** 加同样的空清单——两者在 stdout 上**一模一样**。
+///
+/// 若调用方忽略退出码，一个打错的 URL 就会得到空的服务器清单；而
+/// 「服务器有、磁盘没有」的差集在空集上恒为空，于是**报告没有漏收**——正是
+/// 本期要修的 NB-2 被重新造一遍。
+///
+/// 所以：调用方必须走 [`crate::engine::svn_cli::run_svn`]（非零退出即 `Err`），
+/// **禁止**用 `run_svn_code` 自行判断。
+pub fn parse_list(xml: &str) -> Result<SvnListResult> {
+    let doc = parse_doc(xml)?;
+    let list = doc
+        .descendants()
+        .find(|n| n.has_tag_name("list"))
+        .ok_or_else(|| GitError::new("svn_xml_list_no_list", "svn ls 的输出里没有 <list> 元素"))?;
+    let base = list
+        .attribute("path")
+        .unwrap_or("")
+        .trim_end_matches('/')
+        .to_string();
+    let mut entries = Vec::new();
+    // 只认 <list> 的**直接子元素** entry，且只取 entry 的直接子 <name>：
+    // 每个 entry 里还嵌着 <commit><author>，全文 descendants 搜索会把别的捞进来。
+    for node in list.children().filter(|n| n.has_tag_name("entry")) {
+        let Some(name) = node.children().find(|c| c.has_tag_name("name")) else {
+            continue;
+        };
+        let Some(text) = name.text() else {
+            continue;
+        };
+        entries.push(SvnListEntry {
+            name: norm_sep(text),
+            kind: node.attribute("kind").unwrap_or("").to_string(),
+        });
+    }
+    Ok(SvnListResult { base, entries })
+}
+
+/// 取某个直接子元素的全部文本，缺失时返回空串。
+///
+/// # 为什么拼接而不是 `.text()`，以及这条**当前没有测试证明其必要性**
+///
+/// `Node::text()` 只返回**第一个**文本子节点。原本担心 commit message 里的实体
+/// （`&lt;`、`&amp;`）会把内容拆成多个文本节点、于是 `.text()` 静默截断。
+///
+/// **2026-09-15 变异测试证明这个担心在当前输入上不成立**：把本函数改回
+/// `child.text()` 之后，含 `&lt;` `&amp;` 的多行 message 那条测试**照样通过**——
+/// roxmltree 会把实体展开后仍合并成单个文本节点。
+///
+/// 保留拼接版是**防御**，防的是 CDATA、注释穿插这类真会产生多个文本节点的形态；
+/// 代价是零。但要说清楚：**现有测试挡不住有人把它改回 `.text()`**，不要以为
+/// 那条 message 测试在守着这件事。
+///
+/// CRLF → LF 的归一由 XML 规范保证（svn 在 Windows 上输出 CRLF，不归一的话每行
+/// 结尾会多一个 `\r`，前端渲染成一串空行），这里不需要再处理——那一条**有**
+/// 测试守着（`log_decodes_entities_and_normalizes_crlf_inside_the_message`）。
+fn joined_child_text(node: &Node, tag: &str) -> String {
+    let Some(child) = node.children().find(|n| n.has_tag_name(tag)) else {
+        return String::new();
+    };
+    child
+        .children()
+        .filter_map(|n| n.text())
+        .collect::<Vec<_>>()
+        .concat()
+}
+
 /// svn 在 Windows 上返回反斜杠，比较路径前统一成正斜杠。
 fn norm_sep(p: &str) -> String {
     p.replace('\\', "/")
