@@ -694,3 +694,77 @@ pub fn svn_repo_incomplete_after_cleanup() -> SvnFixture {
     run(&fx.wc(), "svn", &["cleanup", "--non-interactive"]);
     fx
 }
+
+/// **白名单所处的 revision 没有碰过白名单**——「孤儿 baseline」的成因。
+///
+/// # 这是常态，不是边界情况（2026-09-15 实测）
+///
+/// spec §10.3 把孤儿 baseline 描述成「若某个 baseline 的 revision **太老**」。
+/// 成因其实与新旧无关：`svn update` 会把工作副本内**所有**节点的
+/// `wc-status revision` 一律推到当时的 HEAD，**不管那个 revision 有没有动过它们**。
+/// 于是同事在别的目录上提交几次之后，白名单的 `nodeRevs` 就等于一个从没碰过
+/// 白名单的 revision，而 `baselineRev` 正是取自 `nodeRevs`。
+///
+/// 本 fixture 把这个形态固定下来：
+///
+/// ```text
+/// r1  建 Code/A.cs 与 Other/O.txt
+/// r2  只改 Code/A.cs          ← 白名单最后一次真正变化
+/// r3  只改 Other/O.txt        ← 同事的提交
+/// r4  只改 Other/O.txt        ← 同事的提交
+/// svn update
+///   → svn status -v -- Code   的 wc-status revision = 4
+///   → svn log -r 4:4 <url>/Code    **空**（实测 Q1）
+///   → svn log -r 4:4 <Repository Root>  拿得到 r4（实测 Q2）
+/// ```
+///
+/// 所以锚点补拉**必须打给 Repository Root**；打给白名单 URL 会拿到空结果，
+/// 图上那个 `svn:4` 节点就永远建不出来，工作分支挂不上主干。
+pub fn svn_repo_baseline_rev_outside_whitelist() -> SvnFixture {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    run(&root, "svnadmin", &["create", "repo"]);
+    let url = file_url(&root.join("repo"));
+    run(
+        &root,
+        "svn",
+        &["checkout", &url, "wc1", "--non-interactive"],
+    );
+    let wc = root.join("wc1");
+
+    std::fs::create_dir_all(wc.join("Code")).unwrap();
+    std::fs::create_dir_all(wc.join("Other")).unwrap();
+    std::fs::write(wc.join("Code/A.cs"), "a\n").unwrap();
+    std::fs::write(wc.join("Other/O.txt"), "o\n").unwrap();
+    run(&wc, "svn", &["add", "Code", "Other", "--non-interactive"]);
+    run(
+        &wc,
+        "svn",
+        &["commit", "-m", "r1 both", "--non-interactive"],
+    );
+
+    std::fs::write(wc.join("Code/A.cs"), "a2\n").unwrap();
+    run(
+        &wc,
+        "svn",
+        &["commit", "-m", "r2 code only", "--non-interactive"],
+    );
+
+    // r3 / r4：只动白名单**之外**的目录，模拟同事在别的项目上提交
+    std::fs::write(wc.join("Other/O.txt"), "o3\n").unwrap();
+    run(
+        &wc,
+        "svn",
+        &["commit", "-m", "r3 other only", "--non-interactive"],
+    );
+    std::fs::write(wc.join("Other/O.txt"), "o4\n").unwrap();
+    run(
+        &wc,
+        "svn",
+        &["commit", "-m", "r4 other only", "--non-interactive"],
+    );
+
+    // update 之后 Code 的 nodeRevs 才会被推到 4 —— 少了这一步整个形态不成立
+    run(&wc, "svn", &["update", "--non-interactive"]);
+    SvnFixture { dir }
+}
