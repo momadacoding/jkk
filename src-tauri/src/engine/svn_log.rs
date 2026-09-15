@@ -120,6 +120,159 @@ pub fn fetch_anchor(repo_root: &str, repos_root: &str, rev: u64) -> Result<Optio
     Ok(entries.into_iter().next())
 }
 
+/// 首屏与每次「加载更多」拉多少条（spec §10.2：首屏最近 200 条，不做无限滚动）。
+pub const PAGE_SIZE: u32 = 200;
+
+/// 补拉孤儿 baseline 锚点的条数上限。
+///
+/// spec §10.3 说 baseline commit 的 revision 列表「已知且有限（几十个）」。
+/// 但那是对一个刚起步的仓库说的——跑了三年的仓库可能有几百个基线 commit，
+/// 而每个锚点是**一次独立的网络往返**。没有上限的话，打开一次仓库要发几百次请求。
+///
+/// 超出时只补**最近的** N 个：图上越老的部分越少有人往下翻，而孤儿锚点缺失的
+/// 后果只是那一段的工作分支挂不上主干，不影响正确性。
+const MAX_ANCHORS: usize = 200;
+
+/// 读**缓存里**的 SVN 历史，不走网络。
+///
+/// 打开仓库时先用它把图画出来（spec §10.2）。读不到就是空列表——那只是
+/// 「还没拉过」，不是错误。
+pub fn read_log(repo_root: &str) -> Result<Vec<crate::engine::svn_log_cache::CachedRev>> {
+    let uuid = repo_uuid(repo_root)?;
+    let cache = crate::engine::svn_log_cache::read_cache(repo_root, &uuid);
+    Ok(crate::engine::svn_log_cache::merged_sequence(&cache))
+}
+
+/// 拉取 SVN 历史、并进缓存、返回合并后的序列。**走网络。**
+///
+/// `before_rev` 为 `None` 时拉「比已缓存的更新的那一段」；给了值就是往下翻页，
+/// 拉比它更旧的 `limit` 条。
+///
+/// # 单个 target 失败不中断其余的
+///
+/// 白名单可能分布在多个工作副本里（spec §6.6.5）。一条 external 的 URL 不可达
+/// 不该让整条历史都拉不到——那会让图直接空掉。**全部 target 都失败才算整次失败。**
+pub fn fetch_log(
+    repo_root: &str,
+    before_rev: Option<u64>,
+    limit: u32,
+) -> Result<Vec<crate::engine::svn_log_cache::CachedRev>> {
+    use crate::engine::svn_log_cache as cache_mod;
+
+    let cfg = crate::engine::svn_config::read_config(repo_root)?;
+    let wcs = crate::engine::svn_wc::enumerate_wcs(repo_root, &cfg.whitelist)?;
+    let Some(first) = wcs.first() else {
+        return Err(GitError::new(
+            "svn_log_no_working_copy",
+            "白名单没有覆盖到任何工作副本，拉不了历史。",
+        ));
+    };
+    let uuid = first.uuid.clone();
+    let repos_root = first.repos_root.trim_end_matches('/').to_string();
+    let mut cache = cache_mod::read_cache(repo_root, &uuid);
+
+    let targets = log_targets(repo_root)?;
+    let mut failures: Vec<String> = Vec::new();
+    for t in &targets {
+        let entry = cache.targets.entry(t.clone()).or_default();
+        let (from, to) = match before_rev {
+            // 增量拉新：从已覆盖上界的下一个起，拉到 HEAD。
+            // 越界由 fetch_range 自己钳制——「没有新东西」不是错误。
+            None => (entry.covered_max.saturating_add(1), u64::MAX),
+            // 往下翻页：拉比 before_rev 更旧的一段。
+            Some(b) => {
+                let to = b.saturating_sub(1);
+                if to == 0 {
+                    continue; // 已经翻到 r1 了
+                }
+                (to.saturating_sub(u64::from(limit)).max(1), to)
+            }
+        };
+        // `u64::MAX` 交给 fetch_range 钳成 HEAD，不在这里多发一次 head_revision
+        match fetch_range(repo_root, t, from, to, limit) {
+            Ok(got) => {
+                let hi = got.iter().map(|e| e.revision).max().unwrap_or(to.min(from));
+                let lo = got.iter().map(|e| e.revision).min().unwrap_or(hi);
+                // 用**实际拿到的**区间记覆盖，不用请求的区间：请求上界是
+                // `u64::MAX` 这种哨兵值，记进去会谎称覆盖到了天边。
+                if !got.is_empty() {
+                    cache_mod::merge_into(entry, &got, lo, hi);
+                }
+            }
+            Err(e) => failures.push(format!("{t}: {}", e.message)),
+        }
+    }
+    if !failures.is_empty() && failures.len() == targets.len() {
+        return Err(GitError::new(
+            "svn_log_fetch_failed",
+            format!("全部 target 的历史都没拉到：\n{}", failures.join("\n")),
+        ));
+    }
+
+    fetch_missing_anchors(repo_root, &repos_root, &mut cache)?;
+    cache_mod::write_cache(repo_root, &cache)?;
+    Ok(cache_mod::merged_sequence(&cache))
+}
+
+/// 把基线分支上那些**不在序列里**的 revision 逐个补拉成锚点。
+///
+/// 见 [`fetch_anchor`]：这不是边界情况，是常态。锚点缺失的表现是工作分支在图上
+/// 挂不到 SVN 主干，而不是报错，所以这里的失败**只跳过、不上抛**。
+fn fetch_missing_anchors(
+    repo_root: &str,
+    repos_root: &str,
+    cache: &mut crate::engine::svn_log_cache::SvnLogCache,
+) -> Result<()> {
+    use crate::engine::svn_log_cache as cache_mod;
+
+    let have: std::collections::BTreeSet<u64> = cache_mod::merged_sequence(cache)
+        .iter()
+        .map(|e| e.rev)
+        .collect();
+
+    // 基线分支不存在（还没建库）时这里拿不到输出，不是错误——直接没有锚点要补。
+    let Ok(log) = crate::engine::git_cli::run_git(
+        repo_root,
+        &["log", "--format=%B%x00", "refs/heads/svn/base"],
+    ) else {
+        return Ok(());
+    };
+    let mut wanted: Vec<u64> = log
+        .split('\0')
+        .filter_map(crate::engine::svn_baseline::parse_trailer)
+        .map(|t| t.rev)
+        .filter(|r| !have.contains(r) && !cache.anchors.contains_key(r))
+        .collect();
+    wanted.sort_unstable_by(|a, b| b.cmp(a)); // 新的在前
+    wanted.dedup();
+    wanted.truncate(MAX_ANCHORS);
+
+    for rev in wanted {
+        // 失败只跳过：一个拿不到的锚点只损失图上一个节点。
+        if let Ok(Some(entry)) = fetch_anchor(repo_root, repos_root, rev) {
+            cache.anchors.insert(
+                rev,
+                cache_mod::CachedRev {
+                    rev: entry.revision,
+                    author: entry.author,
+                    date: entry.date,
+                    message: entry.message,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+/// 仓库 UUID，缓存的身份键。
+fn repo_uuid(repo_root: &str) -> Result<String> {
+    let cfg = crate::engine::svn_config::read_config(repo_root)?;
+    let wcs = crate::engine::svn_wc::enumerate_wcs(repo_root, &cfg.whitelist)?;
+    wcs.first()
+        .map(|w| w.uuid.clone())
+        .ok_or_else(|| GitError::new("svn_log_no_working_copy", "白名单没有覆盖到任何工作副本。"))
+}
+
 /// 本仓库要拉哪些 target：每个白名单所属工作副本的 URL，各一条，已去重。
 ///
 /// 去重用大小写不敏感比较——同一个 URL 的大小写写法在 Windows 上会有出入，

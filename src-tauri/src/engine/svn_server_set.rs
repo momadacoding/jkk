@@ -50,6 +50,19 @@ pub enum ServerAudit {
     NotChecked { reason: String },
 }
 
+/// 用**当前基线的 revision** 跑一次服务器侧核对。
+///
+/// 基线还没建起来（或 trailer 读不出来）时返回 `NotChecked` 而不是 `Err`：
+/// 调用方是「打开仓库」那条热路径，没有基线是一个正常状态。
+pub fn audit_server_set_at_baseline(repo_root: &str) -> Result<ServerAudit> {
+    match crate::engine::svn_sync::read_baseline_rev(repo_root) {
+        Ok(rev) => audit_server_set(repo_root, rev),
+        Err(e) => Ok(ServerAudit::NotChecked {
+            reason: format!("读不到基线 revision，没法核对服务器内容：{}", e.message),
+        }),
+    }
+}
+
 /// 拿服务器在 `rev` 上的文件清单与磁盘上的 W-file 比一次。
 ///
 /// # ⚠️ 必须走 `run_svn`，退出码非零即 `Err`

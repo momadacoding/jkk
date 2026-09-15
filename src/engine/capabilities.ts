@@ -12,6 +12,15 @@
  * 不让人点到它们，不是它们变安全了。
  */
 export interface Capabilities {
+  /**
+   * 这个仓库背后是哪种版本控制。
+   *
+   * 前端据此决定要不要发 SVN 专属的 invoke。**不要**用「所有 git 专属能力都是
+   * false」去反推——那在今天成立纯属巧合，将来某个普通 git 仓库恰好关掉全部
+   * 可选能力（或者新增一个默认关闭的能力）时，它就会被当成 SVN 仓库，
+   * 于是每次刷新都发几个必然失败的 invoke。
+   */
+  vcs: 'git' | 'svn'
   worktrees: boolean
   tags: boolean
   remotes: boolean
@@ -22,6 +31,7 @@ export interface Capabilities {
 
 /** 普通 git 仓库：全支持。也是拿不到后端应答时的保守默认值。 */
 export const ALL_CAPABILITIES: Capabilities = {
+  vcs: 'git',
   worktrees: true,
   tags: true,
   remotes: true,
@@ -37,6 +47,7 @@ export const ALL_CAPABILITIES: Capabilities = {
  * ——只写 `ALL_CAPABILITIES` 的话，新字段默认就是开着的。
  */
 export const NO_GIT_ONLY_CAPABILITIES: Capabilities = {
+  vcs: 'svn',
   worktrees: false,
   tags: false,
   remotes: false,

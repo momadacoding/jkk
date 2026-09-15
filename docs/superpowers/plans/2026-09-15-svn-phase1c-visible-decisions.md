@@ -19,7 +19,7 @@
 | 4 `svn_sync` 失同步判定 | ✅ 完成 | `engine/svn_sync.rs`（新）、`engine/mod.rs`、`tests/svn_sync.rs`（新）、`tests/common/svn_fixtures.rs`（+3 个构造） | `cargo test --test svn_sync` **8 passed**；`cargo fmt --check` ✓、`cargo clippy --all-targets` **0 warning**；实现第一版就撞上 `wc_root` 语义那个坑，被测试当场抓住（详见下节） |
 | 5 基线体检按 WC 分组（§6.6.5 欠账） | ✅ 完成 | `engine/svn_health.rs`、`tests/svn_health.rs`、`tests/svn_init.rs` | `cargo test --test svn_health` **20 passed**；**全量 460 passed / 0 failed / 36 个二进制**（= 基线 412 + 新增 48，二进制 33 + 3）；`cargo fmt --check` ✓、`cargo clippy --all-targets` **0 warning** |
 | 6 服务器侧清单证伪漏收（NB-2 欠账） | ✅ 完成 | `engine/svn_server_set.rs`（新）、`engine/svn_include_check.rs`（提出 `is_w_file` / `normalize_roots`）、`engine/svn_health.rs`、`engine/mod.rs`、`tests/svn_server_set.rs`（新）、`tests/common/svn_fixtures.rs` | `cargo test --test svn_server_set` **8 passed**（+ svn_health 20、svn_exclude 25 无回归）；`cargo fmt --check` ✓、`cargo clippy --all-targets` **0 warning**；变异测试抓出一条**测试覆盖不足**（详见下节） |
-| 7 Tauri 命令层与 `Capabilities.vcs` | ⬜ 未开始 | | |
+| 7 Tauri 命令层与 `Capabilities.vcs` | ✅ 完成 | `commands/svn.rs`、`lib.rs`、`vcs/mod.rs`、`vcs/svn.rs`、`engine/svn_log.rs`（+编排层）、`engine/svn_server_set.rs`、`engine/svn_sync.rs`、`src/engine/capabilities.ts`、`tests/svn_backend.rs`、`tests/vitest/capabilities.test.ts` | Rust **全量 476 passed / 0 failed / 37 个二进制**；前端 **291 passed / 22 files**、`pnpm build` ✓；`cargo fmt --check` ✓、`cargo clippy --all-targets` **0 warning** |
 | 8 前端接合逻辑 `svnGraph.ts` | ⬜ 未开始 | | |
 | 9 前端展示逻辑 `svnSync.ts` | ⬜ 未开始 | | |
 | 10 `BaselineBanner` 与 store 接线（NB-6 欠账） | ⬜ 未开始 | | |
@@ -502,3 +502,59 @@ Phase 1 的验收语写着「此期只报警 + 提供**重建基线**」。1b �
 - 只报「服务器有、磁盘没有」一个方向。反方向是「本地新增还没 `svn add`」，
   完全正常；报了就是噪音，而噪音会让用户学会忽略这条提示。
 - 过滤复用 `is_w_file` 这**同一处**定义，不再有第二份「什么算 W-file」。
+
+---
+
+## Task 7：Tauri 命令层与 `Capabilities.vcs`
+
+#### 偏离计划
+
+- **编排逻辑放进 engine，不塞在命令体里。** 计划的 Task 7 Step 3 把
+  `svn_fetch_log` 的整段编排（读缓存 → 逐 target 拉 → 补锚点 → 写缓存）写在命令
+  函数里。那样它只能靠 `pnpm tauri dev` 手工验。改成
+  `engine::svn_log::{read_log, fetch_log}` 与
+  `engine::svn_server_set::audit_server_set_at_baseline`，命令体只剩一行转发
+  （`AGENTS.md` §7.2：纯逻辑下沉，可直接单测）。
+
+- **`Capabilities.vcs` 用 `&'static str` 而不是 enum。** serde 直接给出前端好判的
+  字符串，不必再约定一层 tag 名。TS 侧对应 `'git' | 'svn'` 联合类型。
+
+- **前端 `capabilities.ts` 在本 Task 就改了**（计划排在 Task 10）。理由：Rust 侧
+  一改，两侧的接口就不一致了，而这正是本仓库那两条「字段名钉死」测试在防的事。
+  隔着三个 Task 不同步，中间任何一次 `pnpm build` 都不会报错（`tsc` 看不见 Rust）。
+
+#### 计划的错误
+
+- 计划的 Task 7 测试片段写 `read_capabilities(&git.root)`，而实际签名是
+  `read_capabilities(path: String)`（命令函数按值收）。
+- 计划提到的 fixture `plain_git_repo` 不存在；`svn_backend.rs` 里本来就有
+  `git_init(dir)` 辅助函数，直接用它。
+
+#### 计划没写的坑
+
+- **加一个非布尔字段会把两条既有断言变成空话。**
+  - Rust 侧 `capabilities_serializes_to_the_exact_field_names_the_frontend_reads`
+    里有 `obj.values().all(|v| v == &Bool(true))`；
+  - 前端 `capabilities.test.ts` 里有
+    `Object.values(ALL_CAPABILITIES).every(v => v === true)`。
+
+  加了 `vcs: "git"` 之后，这两条会**直接变红**（好事，说明有牙）。但顺手改成
+  「排除 vcs 再断言」才是对的——如果图省事改成 `.every(v => v !== undefined)`，
+  那条测试就再也拦不住「某个开关被误设成 false」了。两侧都按前者改了。
+
+- **覆盖区间要用「实际拿到的 revision 范围」记，不能用请求区间。**
+  增量拉取的请求上界我写的是 `u64::MAX`（交给 `fetch_range` 钳成 HEAD），
+  直接把它记进 `covered_max` 会谎称「覆盖到了天边」，下一次增量拉取永远算出空区间
+  ——**历史从此不再更新，而且完全无声**。实现里改成取 `got` 里的 min/max。
+
+#### 为什么这么改是安全的（Task 7）
+
+- 五个新命令**全部只读**：`svn status` / `svn info` / `svn log` / `svn ls` 加
+  `git log`，外加写一个 `.git/` 内的缓存 JSON（原子写）。
+- `Capabilities` 加字段是**纯增量**：既有六个布尔字段的取值一个没动，
+  两侧的字段名对齐由两条测试各守一端。
+- `svn_fetch_log` 单个 target 失败不中断其余——一条 external 的 URL 不可达不该
+  让整张图空掉；**全部**失败才算整次失败。
+- 锚点补拉失败只跳过、不上抛：一个拿不到的锚点只损失图上一个节点。
+- 锚点数量有硬上限（200）。没有上限的话，一个跑了三年的仓库打开一次要发几百次
+  网络往返——spec §10.3 说「几十个」是对刚起步的仓库说的。

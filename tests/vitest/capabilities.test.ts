@@ -30,22 +30,40 @@ describe('visibleSections', () => {
   it('分支与 stash 没有对应的 capability 开关——它们在两种模式下都可用', () => {
     // §16 Phase 1 验收：「本地 git 的暂存/分支/stash 可用」。
     // 如果哪天给它们加了开关，这条会提醒去改验收标准而不是顺手关掉。
+    //
+    // 这份键列表必须与 Rust 侧 `vcs::Capabilities` 序列化出来的键**逐字一致**，
+    // 那一侧由 `tests/svn_backend.rs` 的
+    // `capabilities_serializes_to_the_exact_field_names_the_frontend_reads` 钉住。
     expect(Object.keys(ALL_CAPABILITIES).sort()).toEqual([
       'cherryPick',
       'patches',
       'pullRequests',
       'remotes',
       'tags',
+      'vcs',
       'worktrees',
     ])
+  })
+
+  it('vcs 说清楚背后是哪种版本控制，不靠别的字段反推', () => {
+    // 反推（「所有 git 专属能力都是 false ⇒ 是 SVN」）在今天成立纯属巧合：
+    // 将来某个普通 git 仓库恰好关掉全部可选能力时就会被误判，于是每次刷新
+    // 都对它发几个必然失败的 SVN invoke。
+    expect(ALL_CAPABILITIES.vcs).toBe('git')
+    expect(NO_GIT_ONLY_CAPABILITIES.vcs).toBe('svn')
   })
 
   it('两个常量的键完全一致——漏一个键就是漏一个没被关掉的入口', () => {
     expect(Object.keys(NO_GIT_ONLY_CAPABILITIES).sort()).toEqual(
       Object.keys(ALL_CAPABILITIES).sort(),
     )
-    expect(Object.values(ALL_CAPABILITIES).every((v) => v === true)).toBe(true)
-    expect(Object.values(NO_GIT_ONLY_CAPABILITIES).every((v) => v === false)).toBe(true)
+    // `vcs` 是字符串不是开关，单独排除掉再断言「其余全开 / 全关」。
+    // 直接 `Object.values(...).every(v => v === true)` 在加了非布尔字段之后
+    // 就永远为 false，那会把这条测试变成一句空话。
+    const switches = (c: typeof ALL_CAPABILITIES) =>
+      Object.entries(c).filter(([k]) => k !== 'vcs').map(([, v]) => v)
+    expect(switches(ALL_CAPABILITIES).every((v) => v === true)).toBe(true)
+    expect(switches(NO_GIT_ONLY_CAPABILITIES).every((v) => v === false)).toBe(true)
   })
 })
 

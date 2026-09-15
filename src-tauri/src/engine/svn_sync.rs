@@ -162,7 +162,7 @@ pub fn read_root_revs(repo_root: &str) -> Result<Vec<RootRev>> {
 }
 
 /// 基线分支顶端 commit 的 `git-svn-id` trailer 里记的 revision——**权威记账**。
-fn read_baseline_rev(repo_root: &str) -> Result<u64> {
+pub(crate) fn read_baseline_rev(repo_root: &str) -> Result<u64> {
     let msg = run_git(
         repo_root,
         &[

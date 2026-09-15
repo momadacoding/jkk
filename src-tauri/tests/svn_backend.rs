@@ -204,7 +204,7 @@ fn capabilities_serializes_to_the_exact_field_names_the_frontend_reads() {
     // JS 会拿到 `pull_requests` → 读 `caps.pullRequests` 得到 `undefined`
     // → falsy → **入口莫名其妙全消失了**，而两侧都编译通过、没有任何报错。
     //
-    // 这条把那层转换的结果钉死在一组字面量上。下面这六个键必须与
+    // 这条把那层转换的结果钉死在一组字面量上。下面这几个键必须与
     // `src/engine/capabilities.ts` 的 `interface Capabilities` 逐字一致。
     let json = serde_json::to_value(app_lib::vcs::Capabilities::all()).unwrap();
     let obj = json.as_object().expect("Capabilities 应当序列化成对象");
@@ -218,11 +218,18 @@ fn capabilities_serializes_to_the_exact_field_names_the_frontend_reads() {
             "pullRequests",
             "remotes",
             "tags",
+            "vcs",
             "worktrees",
         ],
         "字段名与前端 interface Capabilities 对不上"
     );
-    assert!(obj.values().all(|v| v == &serde_json::Value::Bool(true)));
+    // `vcs` 是字符串，其余仍然全是 true。分开断言而不是「所有值都是 true」——
+    // 后者在加了非布尔字段之后就不成立了。
+    assert_eq!(obj["vcs"], serde_json::Value::String("git".into()));
+    assert!(obj
+        .iter()
+        .filter(|(k, _)| k.as_str() != "vcs")
+        .all(|(_, v)| v == &serde_json::Value::Bool(true)));
 }
 
 // ---------------------------------------------------------------------------
@@ -356,4 +363,145 @@ fn an_svn_backend_still_delegates_git_reads() {
         "SVN 元数据不该出现在状态列表里，实际：{:?}",
         st.unstaged
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 1c 的五个命令
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 在 fixture 上跑完初始化，得到一个可用的混合仓库。
+fn init_hybrid_on(fx: &svn_fixtures::SvnFixture) {
+    app_lib::engine::svn_init::init_hybrid(&app_lib::engine::svn_init::InitRequest {
+        repo_root: fx.wc_str(),
+        whitelist: vec!["Code/".to_string()],
+        extensions: vec![".cs".to_string()],
+    })
+    .unwrap();
+}
+
+#[test]
+fn capabilities_declare_which_vcs_backs_the_repo() {
+    // 前端要据此决定「要不要发那几个 SVN 专属的 invoke」。靠「所有 git 专属能力
+    // 都是 false」反推是脆的——将来某个 git 仓库恰好关掉全部可选能力时就会被
+    // 当成 SVN，于是对一个普通 git 仓库每次刷新都发几个必然失败的 invoke。
+    let dir = TempDir::new().unwrap();
+    git_init(dir.path());
+    assert_eq!(
+        read_capabilities(dir.path().to_string_lossy().to_string())
+            .unwrap()
+            .vcs,
+        "git"
+    );
+
+    let fx = svn_repo();
+    init_hybrid_on(&fx);
+    assert_eq!(read_capabilities(fx.wc_str()).unwrap().vcs, "svn");
+}
+
+#[test]
+fn svn_read_log_never_touches_the_network() {
+    // 打开仓库要先用缓存把图画出来（spec §10.2）。这条命令必须是纯本地读，
+    // 缓存还不存在时返回空列表而不是报错——那只是「还没拉过」。
+    let fx = svn_repo();
+    init_hybrid_on(&fx);
+    let got = app_lib::commands::svn::svn_read_log(fx.wc_str()).unwrap();
+    assert!(got.is_empty(), "还没拉过，应当是空列表，实际 {got:?}");
+}
+
+#[test]
+fn svn_fetch_log_populates_the_cache_and_is_idempotent() {
+    let fx = svn_repo();
+    init_hybrid_on(&fx);
+    let first = app_lib::commands::svn::svn_fetch_log(fx.wc_str(), None, 200).unwrap();
+    assert!(!first.is_empty(), "拉完应当有历史");
+
+    // 再拉一次不该产生任何差异：SVN 历史不可变，增量区间也已经覆盖到 HEAD。
+    let second = app_lib::commands::svn::svn_fetch_log(fx.wc_str(), None, 200).unwrap();
+    assert_eq!(first, second);
+
+    // 缓存已落盘，纯本地读现在拿得到同一份
+    assert_eq!(
+        app_lib::commands::svn::svn_read_log(fx.wc_str()).unwrap(),
+        first
+    );
+}
+
+#[test]
+fn svn_fetch_log_includes_the_baseline_anchor_even_when_it_missed_the_whitelist() {
+    // C 组实测：baselineRev 通常就是一个没碰过白名单的 revision，所以孤儿 baseline
+    // 是**常态**。锚点不在序列里，工作分支在图上就挂不到 SVN 主干。
+    let fx = svn_fixtures::svn_repo_baseline_rev_outside_whitelist();
+    init_hybrid_on(&fx);
+    let baseline = app_lib::commands::svn::svn_sync_status(fx.wc_str())
+        .unwrap()
+        .baseline_rev;
+
+    // 白名单 URL 的历史里确实没有它
+    let got = app_lib::commands::svn::svn_fetch_log(fx.wc_str(), None, 200).unwrap();
+    assert!(
+        got.iter().any(|e| e.rev == baseline),
+        "baseline r{baseline} 必须在序列里（靠锚点补拉），实际 {:?}",
+        got.iter().map(|e| e.rev).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn svn_sync_status_and_root_revs_are_reachable_through_the_command_layer() {
+    let fx = svn_repo();
+    init_hybrid_on(&fx);
+    let st = app_lib::commands::svn::svn_sync_status(fx.wc_str()).unwrap();
+    assert_eq!(st.node_revs.len(), 1);
+    let revs = app_lib::commands::svn::svn_root_revs(fx.wc_str()).unwrap();
+    assert!(!revs.is_empty());
+}
+
+#[test]
+fn svn_server_audit_uses_the_current_baseline_revision() {
+    let fx = svn_repo();
+    init_hybrid_on(&fx);
+    let got = app_lib::commands::svn::svn_server_audit(fx.wc_str()).unwrap();
+    // 干净仓库：服务器内容与磁盘一致
+    let json = serde_json::to_value(&got).unwrap();
+    assert_eq!(json["status"], "matched", "实际 {json}");
+}
+
+#[test]
+fn svn_server_audit_on_a_repo_without_a_baseline_is_not_checked_rather_than_an_error() {
+    // 调用方是「打开仓库」那条热路径。没有基线是一个正常状态，不该在那儿
+    // 制造一条错误横幅。
+    let fx = svn_repo();
+    // 故意不建库
+    let got = app_lib::commands::svn::svn_server_audit(fx.wc_str());
+    match got {
+        Ok(v) => {
+            let json = serde_json::to_value(&v).unwrap();
+            assert_eq!(json["status"], "notChecked", "实际 {json}");
+        }
+        Err(e) => panic!("不该报错，实际 {e:?}"),
+    }
+}
+
+#[test]
+fn the_new_commands_serialize_with_the_field_names_the_frontend_reads() {
+    // 与 capabilities 那条同理：snake_case → camelCase 没有编译期检查。
+    // 这里把前端真正会读的键钉死。
+    let fx = svn_repo();
+    init_hybrid_on(&fx);
+
+    let st = serde_json::to_value(app_lib::commands::svn::svn_sync_status(fx.wc_str()).unwrap())
+        .unwrap();
+    assert!(st.get("baselineRev").is_some(), "实际 {st}");
+    assert!(st.get("nodeRevs").is_some(), "实际 {st}");
+    assert_eq!(st["verdict"]["kind"], "inSync", "实际 {st}");
+
+    let revs =
+        serde_json::to_value(app_lib::commands::svn::svn_root_revs(fx.wc_str()).unwrap()).unwrap();
+    assert!(revs[0].get("wcRoot").is_some(), "实际 {revs}");
+
+    let log = serde_json::to_value(
+        app_lib::commands::svn::svn_fetch_log(fx.wc_str(), None, 200).unwrap(),
+    )
+    .unwrap();
+    assert!(log[0].get("rev").is_some(), "实际 {log}");
+    assert!(log[0].get("message").is_some(), "实际 {log}");
 }
