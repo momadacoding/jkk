@@ -20,13 +20,13 @@
 | 5 基线体检按 WC 分组（§6.6.5 欠账） | ✅ 完成 | `engine/svn_health.rs`、`tests/svn_health.rs`、`tests/svn_init.rs` | `cargo test --test svn_health` **20 passed**；**全量 460 passed / 0 failed / 36 个二进制**（= 基线 412 + 新增 48，二进制 33 + 3）；`cargo fmt --check` ✓、`cargo clippy --all-targets` **0 warning** |
 | 6 服务器侧清单证伪漏收（NB-2 欠账） | ✅ 完成 | `engine/svn_server_set.rs`（新）、`engine/svn_include_check.rs`（提出 `is_w_file` / `normalize_roots`）、`engine/svn_health.rs`、`engine/mod.rs`、`tests/svn_server_set.rs`（新）、`tests/common/svn_fixtures.rs` | `cargo test --test svn_server_set` **8 passed**（+ svn_health 20、svn_exclude 25 无回归）；`cargo fmt --check` ✓、`cargo clippy --all-targets` **0 warning**；变异测试抓出一条**测试覆盖不足**（详见下节） |
 | 7 Tauri 命令层与 `Capabilities.vcs` | ✅ 完成 | `commands/svn.rs`、`lib.rs`、`vcs/mod.rs`、`vcs/svn.rs`、`engine/svn_log.rs`（+编排层）、`engine/svn_server_set.rs`、`engine/svn_sync.rs`、`src/engine/capabilities.ts`、`tests/svn_backend.rs`、`tests/vitest/capabilities.test.ts` | Rust **全量 476 passed / 0 failed / 37 个二进制**；前端 **291 passed / 22 files**、`pnpm build` ✓；`cargo fmt --check` ✓、`cargo clippy --all-targets` **0 warning** |
-| 8 前端接合逻辑 `svnGraph.ts` | ⬜ 未开始 | | |
-| 9 前端展示逻辑 `svnSync.ts` | ⬜ 未开始 | | |
-| 10 `BaselineBanner` 与 store 接线（NB-6 欠账） | ⬜ 未开始 | | |
-| 11 混合图接线与分页 | ⬜ 未开始 | | |
-| 12 本地补丁标记 | ⬜ 未开始 | | |
-| 13 基线分支 UI 保护 | ⬜ 未开始 | | |
-| 14 收尾验证 | ⬜ 未开始 | | |
+| 8 前端接合逻辑 `svnGraph.ts` | ✅ 完成 | `src/engine/svnGraph.ts`（新）、`src/engine/types.ts`、`tests/vitest/svnGraph.test.ts`（新） | `pnpm test` **311 passed / 23 files**（新增 20）、`pnpm build` ✓ |
+| 9 前端展示逻辑 `svnSync.ts` | ✅ 完成 | `src/engine/svnSync.ts`（新）、`tests/vitest/svnSync.test.ts`（新） | **323 passed / 24 files**（新增 12）、`pnpm build` ✓ |
+| 10 `BaselineBanner` 与 store 接线（NB-6 欠账） | ✅ 完成 | `src/components/BaselineBanner.tsx`（新）、`src/store/repoStore.ts`、`src/components/RepoTab.tsx`、`src/styles.css` | **323 passed**、`pnpm build` ✓ |
+| 11 混合图接线与分页 | ✅ 完成 | `CommitRow.tsx`、`CommitDetailView.tsx`、`GraphView.tsx`、`RepoTab.tsx`、`styles.css` | **323 passed**、`pnpm build` ✓ |
+| 12 本地补丁标记 | ✅ 完成 | `src/engine/commitActions.ts`、`LocalChangesView.tsx`、`RepoTab.tsx`、`styles.css`、`tests/vitest/commitActions.test.ts` | **327 passed**（新增 4）、`pnpm build` ✓ |
+| 13 基线分支 UI 保护 | ✅ 完成 | `src/engine/capabilities.ts`、`BranchView.tsx`、`LocalChangesView.tsx`、`RepoTab.tsx`、`styles.css`、`tests/vitest/capabilities.test.ts` | **329 passed**（新增 2）、`pnpm build` ✓ |
+| 14 收尾验证 | 🟡 自动化部分完成 | 本文件、`docs/superpowers/e2e/2026-09-15-svn-phase1c-e2e.md`（新） | Rust **476 passed / 0 failed / 37 个二进制**、`cargo fmt --check` ✓、`cargo clippy --all-targets` **0 warning**；前端 **329 passed / 24 files**、`pnpm build` ✓；零 SVN 写操作核对通过；命令对账 **56 == 56**。**真实窗口的 10 个场景未执行**，见下 |
 
 ---
 
@@ -558,3 +558,153 @@ Phase 1 的验收语写着「此期只报警 + 提供**重建基线**」。1b �
 - 锚点补拉失败只跳过、不上抛：一个拿不到的锚点只损失图上一个节点。
 - 锚点数量有硬上限（200）。没有上限的话，一个跑了三年的仓库打开一次要发几百次
   网络往返——spec §10.3 说「几十个」是对刚起步的仓库说的。
+
+---
+
+## Task 8–13：前端（接合、横幅、图、补丁标记、分支保护）
+
+这六个 Task 改动集中、互相咬合，决策条目合并记。
+
+#### 偏离计划
+
+- **没有单独建 `src/engine/svnLog.ts`。** 计划让它装「SVN 历史的前端类型与日期
+  归一」，实际只有一个类型和一个 `toEpochSeconds`，并进 `svnGraph.ts` 了。
+  为两样东西单开一个文件是噪音。
+
+- **`spliceHistory` 只在 `caps.vcs === 'svn'` 时调用**（计划没说条件）。理由见
+  下面「计划没写的坑」第一条——这是本期最大的一处回归风险。
+
+- **store 里多了一个 `gitCommits` 字段**（计划没提）。`commits` 现在是接合后的
+  结果，而 svnRevs 与 gitCommits 各自会被异步刷新，任一变化都要重接一次。
+  接合是纯函数，重算比增量维护更不容易错。
+
+- **Task 11 的 store 接线提前到 Task 10 做了**：Task 10 引入 `spliceHistory` 之后
+  不接线的话 `tsc` 会因为未使用的 import 直接失败（`noUnusedLocals`）。
+
+- **体检结果的文案复用 `svnInit.describeHealth`**，没有按计划在 `svnSync.ts` 里
+  另写一份。两份文案迟早说出不同的话。
+
+- **`describeAudit` 是计划里没有的**：计划让组件直接读 `ServerAudit`。
+  「漏收几条、要不要显示、显示成什么」是判断，散进组件就测不到了。
+
+- **`BaselineBanner` 的确认框走 `ConfirmDialog` 的 `action` 而不是「确认后自己跑」**：
+  重建要发一次走网络的体检，确认完就关框的话那几秒界面上毫无动静，看着像卡死
+  （这是 `ConfirmDialog` 里既有的注释写明的用法）。
+
+#### 计划的错误
+
+- 计划的 `ConfirmDialog` 调用写的是 `{ title, body, confirmLabel, hideCancel }`，
+  实际 API 是 `{ title, message, detail?, warning?, confirmLabel?, danger?,
+  action?, busyLabel? }`——**没有 `body`，也没有 `hideCancel`**。
+
+- 计划让 `useRepoEffects` 直接调 `refreshSvnSync`，但那个函数在 `useRepoStore`
+  里、`useRepoEffects` 是**另一个**函数，刷新函数是通过 `RepoRefreshers` 传进去的。
+  要在接口上加一条并在调用点补上。
+
+- 计划的 Task 14 Step 2 用
+  `(Select-String -Pattern '#\[tauri::command').Count` 与 `'commands::'` 的计数
+  对账，实测报 **57 vs 56 不一致**——多出来的那一处是 `session.rs` 的**文档注释**
+  里引用的 `#[tauri::command(async)]` 字样。**朴素计数会误报**，正确做法是
+  按函数名做集合 diff（实测 56 == 56，无差异）。
+
+#### 计划没写的坑
+
+- **`spliceHistory` 会误伤从 `git svn` 迁移过来的普通 git 仓库。**
+
+  它按 `git-svn-id` trailer 认 baseline，并把 baseline commit **从图上删掉**
+  （spec §10.3 ③：它在图上的位置由 SVN 序列决定）。而那个 trailer 格式**正是
+  照 `git svn` 抄的**（spec §6.4.1），所以一个用过 `git svn` 的普通 git 仓库
+  历史里遍地都是。
+
+  无条件接合的话，这类仓库一打开就少掉大半历史，而 svnRevs 是空的、没有任何
+  东西接住它们——图上那些提交**凭空消失且没有任何报错**。
+
+  判据必须是「这个仓库是不是 SVN 混合仓库」（`caps.vcs`），**不能**是
+  「svnRevs 空不空」。这也是 `Capabilities.vcs` 那个字段除了省 invoke 之外的
+  第二个理由。
+
+- **`rootRevs` 的比对字符串必须排序。** `enumerate_wcs` 的返回顺序没有契约，
+  顺序一飘就会被当成「有人动过」，于是每次刷新都触发全量校验——分层白做。
+
+- **基线分支判定必须精确匹配。** `svn/base-backup`、`feature/svn/base`、
+  `svn/basement` 都是合法分支名，`startsWith` 会把它们全判成基线，
+  用户会在自己的备份分支上发现「不能提交」且没有任何解释。
+
+- **禁用提交要同时挡住按钮和快捷键。** 只把按钮置灰而 `Ctrl+Enter` 还通，
+  等于没拦。判据放进 `canCommit`，两条路径共用。
+
+- **勾选框提交后不重置。** 连着提交几个本地补丁是常见做法，每次重勾很烦；
+  `amend` 的既有行为也是不重置，保持一致。
+
+#### 为什么这么改是安全的（Task 8–13）
+
+- 前端这六个 Task **不发任何新的写命令**。唯一会改变仓库状态的入口是
+  「重建基线」，它调的是 1b 就已经存在、已被 18 条测试覆盖的
+  `svn_rebuild_baseline`，而且前面加了一道确认框。
+- 接合是纯函数且只读：最坏的失败是图画得不对，不会动仓库。
+- 对普通 git 仓库的影响被 `caps.vcs` 这一道判据挡住：横幅不渲染、勾选框不渲染、
+  「加载更多」不渲染、接合直接原样返回。`spliceHistory([], commits)` 在纯 git
+  仓库上与输入拓扑等价，有测试钉住。
+- 基线分支保护是**只减不增**：禁用一个按钮、置灰一个菜单项，没有新增任何操作。
+  checkout 仍然放行——spec §6.4 选可见分支的核心收益就是那个 diff 要能看。
+
+---
+
+## Task 14：收尾验证
+
+#### 已完成的自动化验证
+
+| 项 | 结果 |
+|---|---|
+| `cargo test -j 1 --no-fail-fast` | **476 passed / 0 failed / 37 个二进制**（基线 412 / 33） |
+| `cargo fmt --check` | 通过 |
+| `cargo clippy --all-targets` | **0 warning** |
+| `pnpm test` | **329 passed / 24 files**（基线 290 / 22） |
+| `pnpm build`（含 `tsc`） | 通过 |
+| 零 SVN 写操作 | **通过**，见下 |
+| 命令对账 | **56 == 56** |
+
+#### 零 SVN 写操作的核对过程（不是一句「已确认」）
+
+对 `src-tauri/src/` 下所有 `run_svn` / `run_svn_code` 调用点提取子命令实参：
+
+```text
+6 info   3 status   1 propget   1 ls   1 log
+```
+
+加上 `svn_health.rs:114` 那条变量拼出来的 `diff`（正则抓不到，单独核对），
+以及 `svn_cli.rs:105` 的 `--version --quiet`（可用性探测）。
+**合计 7 个子命令，与 Global Constraints 允许的集合逐字相同。**
+
+另外对 `add|commit|update|revert|delete|propset|merge|switch|cleanup|import|
+mkdir|copy|move|lock|unlock` 全文搜索，7 处命中逐条核对，**全部是 git**：
+
+| 位置 | 实际是什么 |
+|---|---|
+| `commands/ops.rs:95` | `run_git(… "revert" …)` |
+| `commands/repo.rs:20` | `Ok("merge".to_string())`，仓库状态字符串，不是命令 |
+| `commands/worktree.rs:179` | `git worktree add` |
+| `engine/svn_baseline.rs:105` | `self.git(…)` 的 `git add -A`（临时索引） |
+| `vcs/git.rs:60/85/87` | `git add` / `git commit` |
+
+#### ⬜ 真实窗口验证：**未执行**
+
+清单见 `docs/superpowers/e2e/2026-09-15-svn-phase1c-e2e.md`，10 个场景全部未勾。
+
+**已完成的那部分**：`pnpm tauri dev` 能编译、能启动、不 panic
+（说明 5 个新命令的注册没问题）。**这不能替代 IPC 层的验证**——
+集成测试是直接调命令函数本体的，碰不到 `snake_case` → `camelCase` 那层转换，
+而那层没有编译期检查（`AGENTS.md` §7.3）。
+
+场景 1（普通 git 仓库不被误判成 SVN）**尤其不能省**：本期改了 `Capabilities`
+的形状，这是最容易出的回归。
+
+#### 遗留风险
+
+| 风险 | 说明 |
+|---|---|
+| `svn ls -R` 在大仓库上的代价未实测 | fixture 只有几个文件。真实 Unity 工程的白名单子树可能上万文件，一次全量列举的耗时没有数据。目前走「不 await、失败静默」，最坏是提示晚出现 |
+| 缓存文件无上限 | `.git/mygitclient-svnlog.json` 随历史单调增长 |
+| `git-svn-id` 正则两份 | Rust 与 TS 各一份，格式由 spec §6.4.1 钉死且两侧都有测试 |
+| `whitelist_not_under_base` 未放开 | 改成 per-unit URL 之后，被 `svn switch` 的子树其实能正确比对了，但放开属行为扩大，超出 Task 5 范围。记账给后面 |
+| worktree 的 `target/` 单调累积 | `AGENTS.md` §4.1 要求每任务开 worktree，§4.3 限制清理，两条合起来会填满磁盘（本期开工时就因此撞上 `LNK1318`）。可考虑给 worktree 配共享 `CARGO_TARGET_DIR` |
