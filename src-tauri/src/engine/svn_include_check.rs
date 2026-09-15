@@ -7,7 +7,8 @@
 //! 与 §6.8 的基线体检**互不替代**：体检证明「磁盘 == 服务器」，这条证明
 //! 「git 跟踪的集合 == 配置声明的集合」（spec §15 第 20 条）。
 
-use crate::engine::git_cli::{run_git, run_git_code};
+use crate::engine::git_cli::run_git_code;
+use crate::engine::svn_baseline::TempIndex;
 use crate::error::{GitError, Result};
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -162,77 +163,33 @@ fn walk(
     Ok(())
 }
 
-/// git **实际**会跟踪的集合，限定在白名单路径下（W-path 当 pathspec）。
-///
-/// # 为什么是纯读，而不是 spec 字面写的「临时索引 + `git add -A`」
-///
-/// spec §6.3.1 说的是「在临时索引上 `git add -A -- <白名单>` 之后读 `ls-files`」，
-/// 意图是「git 会跟踪谁」而**不要弄脏用户的暂存区**。下面这三条 `ls-files`
-/// 给出同一个集合，却连临时索引文件和松散对象都不写：
-///
-/// | 取哪些 | 为什么 |
-/// |---|---|
-/// | `+ --cached` | 已经在索引里的（含「已跟踪但现在被忽略规则命中」的，`git add -A` 同样保留它们） |
-/// | `+ --others --exclude-standard` | 还没进索引、也没被忽略规则挡住的，即下一次 `git add -A` 会新收进来的那批。`--exclude-standard` 恰好就是「每层 `.gitignore` + `.git/info/exclude` + 全局 excludesFile」三源 |
-/// | `− --deleted` | **已在索引、但工作树上已被删掉的**。`git add -A` 会把这个删除也入索引，之后就不再列它了 |
-///
-/// # 第三条是 2026-09-13 独立 review 抓出来的
-///
-/// 原来只有前两条，而「等价」这个结论被当成实测事实写进了文档和决策日志——
-/// 但当时那条等价性测试跑在**空索引**上，`--cached` 恒为空，真正会分叉的那一半
-/// 根本没执行到。实测反例：已跟踪文件被从工作树删掉、删除还没 stage 时，
-/// `--cached` 仍列它而 `git add -A` 之后不列，`expected_set` 走磁盘也不含它
-/// ——核对于是报「不该被跟踪、实际跟踪了 X」并硬阻断，而用户只是删了个文件
-/// 还没提交。两条回归测试钉住这件事，其中一条断言的是**索引非空**时刻的等价性。
-pub fn actual_set(repo_root: &str, whitelist: &[String]) -> Result<BTreeSet<String>> {
-    if whitelist.is_empty() {
-        // G6：空列表绝不能退化成「全部」——`git ls-files` 不带 pathspec
-        // 会列出整个仓库，比对就变成了拿整仓库对空集。
-        return Ok(BTreeSet::new());
-    }
-    let paths: Vec<String> = whitelist.iter().map(|w| w.replace('\\', "/")).collect();
-    let mut set = ls_files(repo_root, &["--cached"], &paths)?;
-    set.extend(ls_files(
-        repo_root,
-        &["--others", "--exclude-standard"],
-        &paths,
-    )?);
-    for gone in ls_files(repo_root, &["--deleted"], &paths)? {
-        set.remove(&gone);
-    }
-    Ok(set)
-}
-
-/// 跑一条 `git ls-files`，**始终带 `-z`**。
-///
-/// 不带 `-z` 时 git 按 `core.quotePath` 把非 ASCII 路径转义成
-/// `"Code/\350\247\222\350\211\262.cs"` 这种带引号的八进制形式，而期望集合是遍历
-/// 磁盘得到的原始字符串——两者永远对不上，每个装了中文文件名的工程都会在初始化时
-/// 被误报阻断。`-z` 同时关掉引号转义并用 NUL 分隔，顺带也解决了文件名里含换行的
-/// 情况。
-fn ls_files(repo_root: &str, flags: &[&str], paths: &[String]) -> Result<BTreeSet<String>> {
-    let mut args: Vec<&str> = vec!["ls-files", "-z"];
-    args.extend_from_slice(flags);
-    // `--` 必不可少：白名单条目是用户手写的，没有它一个以 `-` 开头的条目
-    // 会被 git 当成选项解析（`AGENTS.md` §6.2）
-    args.push("--");
-    args.extend(paths.iter().map(String::as_str));
-    let out = run_git(repo_root, &args)?;
-    Ok(out
-        .split('\0')
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect())
-}
-
 /// 核对两个集合，不一致则阻断并指认裁决者。
+///
+/// # 实际集合来自调用方给的**候选索引**，不是这里现算的
+///
+/// spec §6.3.1：「核对与录制必须使用同一份候选索引」「不得核对一次后又重新
+/// `git add` 另录一棵树」。所以本函数收一个已经 `add_all` 过的 [`TempIndex`]，
+/// 核对完之后由调用方在**同一个** `idx` 上 `write_tree`。
+///
+/// 两次 `git add` 之间磁盘可能变了，于是核对通过的是 A、录进基线的是 B，而两者
+/// 都不报错——这正是把索引当参数传进来而不是在函数里自建的理由。
+///
+/// # 这里曾经是一个「纯读模拟」，2026-09-14 删掉了
+///
+/// 1a 的实现用 `--cached ∪ --others --exclude-standard − --deleted` 三条只读
+/// `ls-files` **模拟** `git add -A`，当时写明是对 spec 的偏离，理由是它连临时索引
+/// 文件都不写。`TempIndex` 一到位，那个模拟就成了第二个会分叉的事实源——而 1a 的
+/// 独立 review 已经证明「模拟 `git add -A`」很容易写错：最初只有前两条，
+/// 漏掉的第三条会让「删了文件还没 stage」被误报成「不该被跟踪、实际跟踪了」。
+/// 现在核对读的就是真索引，不存在等价性问题。
 pub fn verify_include_set(
     repo_root: &str,
+    idx: &TempIndex,
     whitelist: &[String],
     extensions: &[String],
 ) -> Result<()> {
     let expected = expected_set(repo_root, whitelist, extensions)?;
-    let actual = actual_set(repo_root, whitelist)?;
+    let actual = idx.ls_files(repo_root)?;
     if expected == actual {
         return Ok(());
     }

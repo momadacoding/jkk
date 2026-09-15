@@ -1,0 +1,1180 @@
+# Phase 1b 实现日志：建库与基线录制
+
+> 配套 `2026-09-14-svn-phase1b-baseline.md`。按 `AGENTS.md` §2.1 建立。
+> **review 请先读每个 Task 的「偏离计划」再看 diff**（§13 rubric #12）。
+
+本文件只有两部分：**进度总账**（每完成一个 Task 立即更新）与**决策条目**
+（按 Task 分节，四类缺一不可）。
+
+---
+
+## 进度总账
+
+| Task | 状态 | 产出文件 | 验证结果 |
+|---|---|---|---|
+| 0 开工自检与基线数字 | ✅ 完成 | 本文件、`2026-09-14-svn-phase1b-baseline.md` | 改动前基线（新 worktree 内实测）：Rust **316 passed / 0 failed / 28 个二进制**、前端 `pnpm test` **272 passed / 21 files**、`pnpm build` ✓。与计划预期一致 |
+| 1 `git_cli` 支持环境变量 | ✅ 完成 | `src-tauri/src/engine/git_cli.rs`、`src-tauri/tests/git_cli.rs` | `cargo test --test git_cli` 5 passed；全量 `cargo test -j 2` **318 passed / 0 failed / 28 个二进制**（= 基线 316 + 新增 2）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓ |
+| 2 `svn_xml` 三个新解析器 | ✅ 完成 | `src-tauri/src/engine/svn_xml.rs`、`src-tauri/tests/svn_xml.rs` | `cargo test --test svn_xml` 27 passed；全量 **332 passed / 0 failed / 28 个二进制**（= 318 + 新增 14）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓ |
+| 3 P1/P2/P3 硬门槛 | ✅ 完成 | `svn_preflight.rs`（新）、`svn_xml.rs`、`svn_wc.rs`、`engine/mod.rs`、`tests/svn_preflight.rs`（新）、`tests/common/svn_fixtures.rs` | `cargo test --test svn_preflight` 10 passed；全量 **342 passed / 0 failed / 29 个二进制**（= 332 + 新增 10）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓；另做了一轮变异测试验证两条关键断言有牙 |
+| 4 P5 externals 钉死检测 | ✅ 完成 | `svn_externals.rs`（新）、`engine/mod.rs`、`tests/svn_externals.rs`（新）、`tests/common/svn_fixtures.rs` | `cargo test --test svn_externals` 10 passed；全量 **352 passed / 0 failed / 30 个二进制**（= 342 + 新增 10）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓；变异测试确认 `@N` peg 判据有牙 |
+| 5 基线录制（临时索引 / trailer） | ✅ 完成 | `svn_baseline.rs`（新）、`svn_include_check.rs`、`engine/mod.rs`、`tests/svn_baseline.rs`（新）、`tests/svn_exclude.rs` | `cargo test --test svn_baseline` 13 passed、`--test svn_exclude` 25 passed；全量 **365 passed / 0 failed / 31 个二进制**（= 352 + 新增 13）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓ |
+| 6 §6.8 基线体检 | ✅ 完成 | `svn_health.rs`（新）、`svn_wc.rs`（`peg_safe` 文档）、`engine/mod.rs`、`tests/svn_health.rs`（新）、`tests/common/svn_fixtures.rs` | `cargo test --test svn_health` 15 passed；全量 **380 passed / 0 failed / 32 个二进制**（= 365 + 新增 15）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓ |
+| 7 初始化向导编排与回退 | ✅ 完成 | `svn_init.rs`（新）、`svn_config.rs`（加 `write_config`）、`engine/mod.rs`、`tests/svn_init.rs`（新） | 与 Task 8 合并计数 |
+| 8 重建基线 R1–R5 | ✅ 完成 | `svn_init.rs`、`tests/svn_init.rs` | `cargo test --test svn_init` 18 passed；全量 **398 passed / 0 failed / 33 个二进制**（= 380 + 新增 18）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓；变异测试确认「不 checkout 基线分支」这条有牙 |
+| 9 Tauri 命令与向导 UI | ✅ 完成 | `commands/svn.rs`（新）、`lib.rs`、`commands/mod.rs`、`svn_init.rs`（加 `check_current_baseline`）、四个 engine 模块加 serde、`src/engine/svnInit.ts`（新）、`src/components/SvnInitWizard.tsx`（新）、`src/store/repoStore.ts`、`src/components/RepoTab.tsx`、`tests/vitest/svnInit.test.ts`（新）、`tests/svn_backend.rs` | Rust **401 passed / 33 个二进制**；前端 **290 passed / 22 files**、`pnpm build` ✓ |
+| 10 收尾验证 | ✅ 完成 | 本文件 | 命令对账 50 == 50；G8 零 SVN 写操作；**真实窗口验证 8 个场景 + 1a 遗留的 2 个命令全部通过**（详见下节） |
+| 11 第二轮独立 review 的修复 | ✅ 完成 | `svn_init.rs`、`svn_preflight.rs`、`svn_health.rs`、`tests/{svn_init,svn_preflight,svn_health}.rs`、`tests/common/svn_fixtures.rs` | 3 条（2 high + 1 medium）全部复现并修掉；全量 **412 passed / 0 failed / 33 个二进制**（= 404 + 新增 8）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓；AR-1 的并发测试做了变异测试并量了轮数（详见末节） |
+
+---
+
+## 开工自检（`AGENTS.md` §4.2）
+
+```text
+- 当前分支 / worktree：worktree-svn-phase1b
+    @ .claude/worktrees/svn-phase1b
+- 当前分支是否已合并进 master：否，全新分支
+- 是否允许在当前位置修改：是，独立 worktree，已用 EnterWorktree 会话级切入
+- 目标 worktree 是否在改动前已创建并切入：是
+- Get-Location 实测值：C:\Users\liuhao\workspace\dev\Dev\mygitclient\.claude\worktrees\svn-phase1b ✓
+- 基点 commit：ca304d6（Phase 1a 合并进 master 的那个 squash commit）
+    其父是 310c17d（spec 的最新修订），所以本 worktree 里的 spec 就是最新版
+- 是否存在未提交改动：无（建完即查，干净）
+```
+
+**上一期的收尾状态**：Phase 1a 的 PR #41 已 squash 合并为 `ca304d6`。
+`worktree-svn-phase1a` 那个 worktree 保留在磁盘上未删（其分支因 squash 合并不是
+`master` 的祖先，`git branch -d` 会拒绝，删除需要用户单独授权）。
+
+---
+
+## 全局
+
+### 本期的范围是用户在对话里定的
+
+spec §16 的 Phase 1 是一大坨（向导、基线、体检、重建、失同步检测、SVN log、混合图、
+本地补丁标记）。2026-09-14 用户选定切法：**本期 = 建库与基线录制**，剩下的「看得见」
+那半（失同步横幅、SVN log、混合图、补丁标记）留 Phase 1c。
+
+理由：录制机制（临时索引 → `write-tree` → `commit-tree` → 体检 → `update-ref`）被
+首个基线和重建基线共用，拆开会让这段最不能写错的序列被抄两遍；而失同步检测要有基线
+才有东西可比，天然排在后面。
+
+### Phase 1a 遗留的窗口验证并进本期
+
+1a 的两个命令（`read_capabilities` / `probe_svn_environment`）是在 `AGENTS.md` §5.1
+要求的真实窗口验证**没有执行**的情况下合并进 master 的（PR #41 里那两个复选框一直
+空着，没有谎报）。2026-09-14 用户确认并进本期一起验，清单见
+`2026-09-13-svn-phase1a-foundation-decisions.md` 的 9.4 一节。
+
+### 从 1a 记账过来的一条
+
+1a 决策日志 §9.8 记了：新版 spec §6.3.1 把纳入集合核对改成「临时索引 + `git add -A`
++ 同一份索引 `write-tree`」，而 1a 的 `actual_set` 是**纯读模拟**（当时写明的偏离）。
+当时判断「1a 不录基线，TREE 那条耦合还不存在，先不改」，并记账给 1b。
+
+本期 spec 的 R2 **字面要求** `GIT_INDEX_FILE`，所以临时索引一定会建起来。届时模拟版
+就是第二个会分叉的事实源——1a 的 B1 已经证明「模拟 `git add -A`」很容易写错。
+**处置写在计划的 Task 5 Step 5：删掉模拟版，核对与录制共用同一个 `TempIndex`。**
+
+---
+
+## Task 0：开工自检与基线数字
+
+**改动前基线（在本 worktree 内实测，不是抄上一期的）：**
+
+| 项 | 值 |
+|---|---|
+| `cargo test -j 2` | **316 passed / 0 failed / 28 个二进制** |
+| `pnpm test` | **272 passed / 21 files** |
+| `pnpm build`（含 `tsc`） | 通过 |
+
+三项与计划里写的预期一致，无需修正计划。
+
+#### 偏离计划
+
+无。Task 0 按计划执行。
+
+#### 计划的错误
+
+无。
+
+#### 计划没写的坑
+
+- **新 worktree 里 `node_modules` 不存在，必须先 `pnpm install`。** 实测
+  `Test-Path node_modules` → `False`。1a 踩过一次：不装的话 `pnpm test` 会**静默跑
+  主工作区**的测试（`@` 别名解析到主 checkout 的 `src/`），拿到一个看起来正常、
+  实际测的是另一份代码的数字。计划的 Task 0 Step 2 只写了跑命令，没写这一步。
+  **Task 10 的收尾验证同样适用**，换 worktree 之后要重来一次。
+
+- **PowerShell 的 `Select-String` 默认大小写不敏感。** 统计失败行时用
+  `-Pattern 'FAILED'` 会把 28 行 `0 failed;` 全部匹配进来，得到「30 个失败」
+  这种吓人又错误的结论。核对测试结果时必须加 `-CaseSensitive`，或者直接判
+  「非 `test result: ok.` 开头的行数」。本期后面每次统计数字都走后者。
+
+- **`cargo test` 的正常输出里混着两行看着像错误的东西**，是 fixture 故意造的形态，
+  不是失败：`error: cannot delete branch 'feat/busy' used by worktree at …`
+  （断言 git 会拒绝删被检出的分支）与 `Automatic merge failed; fix conflicts`
+  （冲突 fixture）。判读时不要被它们带偏——以 `test result:` 行和退出码为准。
+
+#### 为什么这么改是安全的
+
+Task 0 只读不写：跑测试、记数字、建两个 `docs/` 下的文件。没有任何代码改动，
+也没有发出任何 git / svn 写命令。
+
+---
+
+## Task 1：`git_cli` 支持带环境变量执行
+
+新增 `run_git_env(path, args, envs) -> Result<String>`，`GIT_INDEX_FILE` 有了合规入口。
+
+#### 偏离计划
+
+- **没有照计划那样把 `run_git_bytes` 的函数体抄一份**，而是抽出私有的
+  `output_or_error(cmd) -> Result<Vec<u8>>`，让 `run_git_bytes` 与 `run_git_env`
+  共用同一套失败映射。计划写的是复制粘贴版。
+
+  原因：两处各写一遍 `if !output.status.success()`，只要有一处日后被改漏，那条路径
+  就会把**失败当成空输出**。对本期而言这不是理论风险——基线录制里 `git add -A`
+  一旦静默失败，`write-tree` 会照常成功并录出一个**残缺但看起来合法**的 tree，
+  体检还未必拦得住（少的文件在 SVN 侧也不在 diff 里）。失败映射只留一份。
+
+  等价性：`run_git_bytes` 改写前后逐字相同（`git_command(path).args(args).output()`
+  → 同样的 cmd 交给 `output_or_error`），全量回归 318 passed 无变化。
+
+#### 计划的错误
+
+- **计划里的测试代码引用了三个不存在的 helper**：`repo_with_commit()`、
+  `fx.path_str()`、`fx.path()`。计划在旁边挂了个 ⚠️ 说「先读 `fixtures.rs` 确认真实
+  签名，不要照抄这里的名字」——这个提醒是对的，照抄会直接编译不过。实际情况是：
+
+  1. `src-tauri/tests/fixtures.rs` **本身就是一个测试文件**，不是共享模块，里面只有
+     私有的 `linear_repo() -> TempDir`，没有 `repo_with_commit`。
+  2. 更要命的是 `tests/` 下**每个 `.rs` 文件都是独立 crate**，彼此 import 不到。本仓库
+     共享 fixture 的唯一办法是 `#[path = "common/svn_fixtures.rs"] mod …`（见
+     `tests/svn_wc.rs`）。所以「从 `fixtures.rs` 里拿 helper」这条路根本不存在。
+
+  实际做法：按 `tests/tree.rs` 的既有写法，在 `tests/git_cli.rs` 内自建
+  `fixture_git()` + `repo_with_commit()`。目前只有这一个文件需要 git fixture，还不值得
+  为它建 `common/git_fixtures.rs`；等第二个文件也要时再抽。
+
+- 计划的测试里 `run_git(...)` 是裸调用，实际必须写成 `git_cli::run_git(...)`——该测试
+  文件只 `use app_lib::engine::git_cli;`，没有 glob import。
+
+#### 计划没写的坑
+
+- **fixture 自己发的 git 命令刻意不走被测的 `run_git`。** 用被测对象搭测试脚手架，
+  它坏了脚手架跟着一起坏，断言就失去意义（`run_git` 挂了的话 `repo_with_commit`
+  先 panic，根本走不到断言）。所以 `fixture_git` 是裸 `Command::new("git")`。
+
+- **rustfmt 会因为中文断言消息把单行 `assert!` 拆成三行**（CJK 字符宽度算 2，单行超
+  100）。1a 踩过一次，这次又踩。结论：改完 Rust 代码**先 `cargo fmt` 再
+  `cargo fmt --check`**，别只跑后者然后对着 diff 手工排版。
+
+- **`run_git_env` 走的是 `Command::output()`，子进程 stdin 是 null。**
+  → **Task 5 必须用 `git commit-tree -m <msg> <tree>`，不能用管道喂 message。**
+  走管道会立刻读到 EOF，`commit-tree` 照常成功，产出一个 **message 为空的基线提交**；
+  而 trailer 就写在 message 里（spec §6.4.1），等于基线丢掉 `git-svn-id:`，
+  `--grep` 再也找不回来，且**不报任何错**。这条现在记下，免得到 Task 5 现场才发现。
+
+#### 为什么这么改是安全的
+
+- 纯新增 + 一次等价重构：没有任何现有调用点的行为改变，`run_git` / `run_git_code`
+  完全没动。全量 `cargo test -j 2` = 318 passed / 0 failed / 28 个二进制，
+  相对基线 316 多的正好是本任务新增的两条测试，无回归。
+- 新入口仍然经过 `git_command()`，`GIT_TERMINAL_PROMPT=0` 与 `hidden_command`
+  两条防线都在（`AGENTS.md` §7.3 MUST：不许另起一套进程调用）。
+- 两条新测试都在 `TempDir` 里 `git init` 自建仓库，跑完即删，没有对本仓库或任何真实
+  仓库发出写命令（`AGENTS.md` 开篇最高优先级约束）。其中一条的断言本身就是
+  「真实索引前后逐字相同」，等于把「不碰用户暂存区」这条固化成了回归测试。
+
+---
+
+## Task 2：`svn_xml` 三个新解析器
+
+新增 `parse_status_entries` / `parse_externals_props` / `parse_diff_summary`。
+
+**动手前先抓了一次真实 XML。** `tests/svn_xml.rs` 开头立的规矩是「输入必须是真实
+svn 输出的形态，手写理想 XML 等于没测」，而计划里那六段测试 XML 是我写计划时手写的。
+于是先在临时 fixture 上把三条命令的真实输出原样抓下来（跑完即删），再照抄进常量。
+**抓回来的形状和计划里写的有四处不一样**，下面逐条记。
+
+#### 偏离计划
+
+- **`StatusEntry` 多了一个 `props` 字段**（计划声明的是 `{ path, item }`）。
+
+  实测：只改属性、没改内容的节点是 `item="normal"` + `props="modified"`
+  （文本版 status 显示成第二列的 `M`）。计划的结构体只带 `item`，P1 拿到的就是一个
+  读起来完全干净的 `normal` 节点，于是**带着一处未提交的属性改动去录基线**。
+  `svn_xml` 是全项目唯一接触 XML 的地方，这里丢掉的字段下游再也拿不回来。
+
+- **entry 底下缺 `<wc-status>` 时报错，而不是跳过。** 计划的实现要点没提这件事，
+  按最自然的写法（`find(...)` 拿不到就 `continue`）会静默少一条。少一条的含义是
+  「这个节点不脏」，而 P1 的全部价值就在于没漏。最现实的触发方式是喂错输入——
+  `svn info --xml` 的 `<entry>` 也叫 entry，底下却没有 wc-status。
+
+- **`parse_diff_summary` 的缺字段策略与 `parse_info` 相反**（填空串而不是报错），
+  计划就是这么写的，但没写为什么可以。补上理由：体检判「没有差异」的条件是
+  `item == "none" && props == "none"`，**空串两个都不等于**，于是缺字段的条目被
+  当成「有差异」保守报出来。空串在这里是安全方向，在 `parse_info` 里不是
+  （空 uuid 会让 P4 的「所有 UUID 相同」在两个空串上通过）。
+
+#### 计划的错误
+
+- **计划 Task 2 的 status 测试 XML 里一条 `item="external"` 都没有，而真实输出里
+  有一大把——即使带了 `--ignore-externals`。** 实测那次挂了五条 external，
+  `svn status --no-ignore --ignore-externals --xml` 原样回了五条
+  `item="external"` 的 entry。
+
+  **这条直接决定 Task 3 的 P1 写法。** 计划里 P1 写的是「不允许存在 `M`/`A`/`D`/
+  `R`/`C`/`!`/`~`/`?` 任何一种」，照字面最容易写成「status 有输出即脏」——而本设计的
+  核心场景恰恰是**代码就在 external 里**，那样写向导在目标仓库上**永远过不去**，
+  且失败信息会指着五个完全正常的 external 根说「工作副本不干净」。
+
+  处置：解析层原样给出（不偷偷过滤，否则「external 根自己被 `svn add` 了」这种真脏
+  也会被吞），并且把这件事同时写进 `parse_status_entries` 的 doc 注释和一条名叫
+  `status_entries_keep_external_markers_because_they_are_not_dirt` 的测试里。
+  **Task 3 的 P1 必须显式剔除 `item == "external"`。**
+
+- **计划说 `--summarize --xml` 的 `item`/`props`/`kind` 是三个独立属性——对，但漏了
+  一件事：属性顺序在同一次输出里就不一致。** 实测同一次输出的前两条是
+  `kind, item, props`，第三条是 `item, props, kind`。计划给的示例 XML 三条顺序统一，
+  照那个形态写测试就测不出「按序取值」这个错法（第三条会被读成 `item="dir"`）。
+  常量里原样保留了顺序差异，并单列一条 `diff_summary_does_not_depend_on_attribute_order`。
+
+#### 计划没写的坑
+
+- **`item="added"` 的 entry 带 `revision="-1"`，`item="unversioned"` 则完全没有
+  revision 属性。** 前者有后果：`parse_node_revs` 只跳过「没有 revision 属性」的
+  entry，`-1` 会被正常收进集合。也就是说一个只有本地新增文件的工作副本，
+  `nodeRevs` = `{-1, 当前rev}` → 多值。
+
+  → **Task 3 的 `run_preflight` 必须 P1 先于 P2**。顺序反了的话，用户看到的是
+  「工作副本是 mixed-revision，请先跑一次完整 svn update」——而真实原因是他有个
+  没提交的新文件，那句引导做了也没用。顺序不是风格问题，是错误信息对不对的问题。
+
+- **`svn propget svn:externals -R --xml` 的 `<target path>` 是绝对路径 + 正斜杠，
+  而 `svn status --xml` 的 `path` 是相对 + 反斜杠。** 计划的 E7 记了这件事，但值得
+  在这里重申：同一个 CLI 两种写法，不是笔误。三个解析器的归一策略做成了一张表写进
+  `StatusEntry` 的 doc 注释，免得下一个人以为 externals 那个是漏了归一。
+
+- **没有任何 externals 的子树，`propget` 回的是空的 `<properties>`，退出码 0。**
+  不是报错、也不是空输出。空列表是正常结果。
+
+- **`propget svn:externals` 只会回这一个属性**，所以「只取 `name="svn:externals"`」
+  那条守卫在真实输出里根本不会被触发。它防的是将来有人改成 `proplist -v --xml`。
+  这条分支只能用合成 XML 覆盖，测试里写明了它是合成的以及为什么。
+
+#### 为什么这么改是安全的
+
+- 三个函数都是**纯新增**，没有改动 `parse_info` / `parse_node_revs` /
+  `parse_external_roots` / `assert_externals_were_ignored` 任何一行。全量
+  `cargo test -j 2` = 332 passed / 0 failed / 28 个二进制，相对 Task 1 的 318 多的
+  正好是本任务新增的 14 条，无回归。
+- 全部是「喂字符串、吐结构体」的纯函数，不发任何命令、不碰文件系统。
+- 唯一跑真实 svn 的测试 `externals_props_survive_real_svn_output` 复用 1a 已有的
+  `svn_repo_with_cross_repo_nested_external()`，在 `TempDir` 里自建仓库、跑完即删，
+  只发 `propget`（只读）。抓形状用的探针脚本也全程在 `%TEMP%` 的一次性 fixture 上，
+  `finally` 里 `Remove-Item -Recurse`，没有碰本仓库或任何真实 SVN 工作副本。
+
+---
+
+## Task 3：P1 / P2 / P3 三道硬门槛
+
+新增 `engine/svn_preflight.rs`，对外只有
+`run_preflight(repo_root, cfg) -> Result<Preflight>`。
+
+### 一条曾经走错、已撤销的收窄（记在这里防止再犯）
+
+我一度把 P1 对 `ignored` / `unversioned` 的判据收窄成「只有落在 W-file 集合里的
+才算脏」，并在报告里用「`Code/bin`、`Code/obj` 这类构建产物几乎必然存在」来论证。
+**那个目录结构是我凭空设想的，不来自本仓库、spec 或用户的任何输入。** 用户当场
+指出不存在这种结构。
+
+撤销，改回 spec 字面：**`ignored` 与 `unversioned` 一律算脏**。
+
+两个理由，都不依赖对目录结构的任何假设：
+
+1. spec §6.5 的禁止清单里 **`?` 是明写的**。收窄 `unversioned` 不是「按 spec 的理由
+   解释 spec」，是直接和明文冲突——我当时把这一点混过去了。
+2. 风险方向本来就是这边对。**误拦看得见**：错误信息直接列出路径，用户当场能判断
+   是不是误报，代价是一次可见的失败。**放行看不见**：一个 SVN 不管的文件进了基线，
+   之后每一次失同步判定、每一次交付清单都建立在它之上，而基线本身一切正常。
+   在「看得见的误拦」与「看不见的错基线」之间，只能选前者。
+
+对应的 fixture 与测试也一起改了：`svn_repo_with_ignored_build_output` →
+`svn_repo_with_svn_ignored_non_code_file`（`svn:ignore Notes.txt` + 造出该文件），
+测试从「必须放行」翻成
+`p1_rejects_svn_ignored_files_outside_the_extension_list_too`「必须拦住」。
+它和 `p1_must_pass_no_ignore_or_svn_ignored_files_slip_through`（`Generated.cs`，
+匹配扩展名）成对，把「不按扩展名区别对待」这条钉死。
+
+**教训**：给设计找理由时，只能用仓库里读得到的、spec 写明的或实测出来的事实。
+编一个听起来合理的场景，会把一个本来该问用户的选择伪装成一个已经论证过的结论。
+
+#### 偏离计划
+
+- **`WcIdentity` 加了 `wc_root_abspath: Option<String>`；`svn_wc::peg_safe` 改成
+  `pub`。** P3 要查的是**工作副本根**，而 `enumerate_wcs` 里 `parse_info` 早就把
+  `<wcroot-abspath>` 解析出来了、然后丢在地上。捡起来是零额外命令；不捡的话每条
+  白名单要多发一次 `svn info`。`WcIdentity` 只有一个构造点（`enumerate_wcs`），
+  测试里没有结构体字面量，加字段不破坏任何调用方。
+
+- **`StatusEntry` 又加了一个字段 `wc_locked: bool`**（Task 2 刚定的结构体）。
+  理由同 `props`：`svn_xml` 是唯一接触 XML 的地方，这里不取，P3 就拿不到。
+
+- **执行顺序不按 P1→P2→P3→P4 的编号，而是
+  枚举 → P4 → P3 → P1 → P2。** 理由写在 `run_preflight` 的 doc 表格里。
+  其中 **P1 必须先于 P2** 是 Task 2 实测出来的硬约束（`added` 节点带
+  `revision="-1"`，会进 `nodeRevs` 把它变成多值 → 用户拿到一条做了也没用的引导）。
+
+- **P3 没有走计划给的降级退路。** 计划写着「造一个中断的 update 很难，若确认造不出
+  稳定 fixture，就降级为读 `svn status` 是否报 `L`（locked）并如实写明覆盖范围」。
+  实测既造得出来，而且**证明了只读 `L` 是不够的**（见下）。所以没降级。
+
+#### 计划的错误
+
+- **Step 1 的测试代码编译不过。** 原文是：
+
+  ```rust
+  let err = run_preflight(...).unwrap_or_else(|e| panic!(...)).err().unwrap_or_else(...)
+  ```
+
+  对一个 `Result` 先 `unwrap_or_else` 拿到 `Preflight`，再对它调 `.err()` ——
+  类型就不对。实际改成 `let Err(err) = run_preflight(...) else { panic!(...) };`。
+
+- **Step 2 的 P2 测试自相矛盾。** 它同时断言「`nodeRevs` 多值，P2 必须拒绝」和
+  `assert_ne!(root_rev, 3)`（潜台词是 `nodeRevs == {3}` 单值）。这是**两个不同的
+  形态，需要两个 fixture**，一个计划里的测试同时做不到：
+
+  | fixture | 造法 | 实测结果 | P2 应当 |
+  |---|---|---|---|
+  | `svn_repo_mixed_revision` | 整体 r3，`Code/A.cs` 单独 `update -r1` | rootRev=3，nodeRevs={1,3} | **拒绝** |
+  | `svn_repo_root_rev_behind` | `checkout -r1`，只 `update Code` | rootRev=1，nodeRevs={3} | **放行**，且 `node_rev` 必须是 3 |
+
+  后者才是 spec §6.5.1 那个陷阱的真实形态（「照 rootRev 取 rev，初始化完成的那一
+  瞬间就判失同步」），也是更有价值的那条。拆成了两条测试。
+
+#### 计划没写的坑
+
+- **`svn cleanup` 清掉写锁，但清不掉 `incomplete`。** 这是 P3 的全部要害。
+  2026-09-14 实测（Windows 上用 `FileShare::None` 独占占住一个待更新的文件，
+  让 `svn update` 中途失败）：
+
+  | 状态 | 工作副本根 `--depth=empty` | 白名单根 `Code@` |
+  |---|---|---|
+  | 干净 | 无 entry | 无 entry |
+  | update 半路失败 | `wc-locked="true"` + `item="incomplete"` | 只有 `wc-locked` |
+  | **跑完 `svn cleanup`** | **仍是 `item="incomplete"`** | **一条 entry 都没有** |
+  | 再跑一次完整 update | 无 entry | 无 entry |
+
+  第三行是最现实的场景：update 失败 → SVN 提示 run cleanup → 用户照做 → 以为好了。
+  **那时 P1 全绿、P2 单值、白名单根 status 完全干净**，只有工作副本根还写着
+  incomplete。所以 P3 必须（a）查工作副本根而不是白名单根，（b）`wc-locked` 和
+  `incomplete` 两个都查。计划给的降级方案「只读 `L`」恰好在这个场景下失效。
+
+- **造「update 半路失败」的稳定办法**：Windows 上
+  `OpenOptions::new().share_mode(0).open(victim)` 独占占住一个待更新的文件，
+  `svn update` 走到那一项必然失败（`E155009: Failed to run the WC DB work queue`
+  + `E720005: Can't move … Access is denied`）。不依赖时序、不用杀进程，每次都复现。
+  这个 fixture 是 `#[cfg(windows)]` 的，与 `tests/fixtures.rs` 里
+  `make_dangling_link` 的做法一致。
+
+- **P2 的错误信息必须按「白名单是否落在 external 内」分两种说法。** 计划的 ⚠️ 提到了，
+  这里记下判据：`WcIdentity.wc_root_abspath` 与仓库根不同即说明落进了 external。
+  落在 external 里时「先跑一次完整 svn update」是一条**永远无效**的引导。
+
+- **我这一轮先写测试后写实现，中间没跑红**——十条测试第一次跑就全绿，这本身是个
+  不可信的信号。补做了一轮**变异测试**：
+  - 把 `item == "incomplete"` 那条判据短路掉 → 只有
+    `p3_still_rejects_after_the_user_ran_svn_cleanup` 失败，
+    `p3_rejects_a_working_copy_left_mid_update` 仍然通过（它被 `wc_locked` 兜住）。
+    这正好证明「cleanup 之后那条」是不可替代的。
+  - （当时还有一条针对上面那个已撤销收窄的变异，随收窄一起删了。）
+
+  变异只打掉对应的那一条，别的全绿。变异已撤销，撤销后全量 342 passed。
+
+#### 为什么这么改是安全的
+
+- **本任务不发任何写命令。** `run_preflight` 只跑 `svn info` 和 `svn status`
+  （三种参数组合），全是只读；没有 `update`、`revert`、`cleanup`、`commit`。
+  spec §6.5 明确要求「不自动规范化——revert 用户的本地修改是破坏性的」，
+  实现里没有任何一条会改动用户工作副本的路径。
+- 新 fixture 全部在 `TempDir` 里 `svnadmin create` 自建仓库，跑完即删；
+  `svn_repo_interrupted_update` 会**故意**让一次 update 失败，但那是在自己刚建的
+  一次性工作副本上，且 `assert!` 了「失败」正是预期（成功反而是 fixture 前提不成立）。
+- 对 1a 既有代码只做了加法：`WcIdentity` 加字段、`peg_safe` 提升可见性、
+  `StatusEntry` 加字段。没有改动任何既有函数的行为。全量
+  `cargo test -j 2` = 342 passed / 0 failed / 29 个二进制，相对 Task 2 的 332
+  多的正好是新增的 10 条，无回归。
+
+---
+
+## Task 4：P5 —— `svn:externals` 钉死检测
+
+新增 `engine/svn_externals.rs`：`parse_external_line`（纯函数）+ `detect_pinned`。
+**全模块不返回阻断性错误**——P5 命中只是切到 pinned 模式（spec §6.5.3）。
+
+#### 偏离计划
+
+- **`detect_pinned` 的过滤条件做成了双向的。** 计划和 spec 的说法都是「白名单
+  **所在**的 external」（external 包住白名单）。实现里额外收了反方向：白名单包住
+  external 的情况也报。
+
+  理由：那条 external 的内容一样会进基线（白名单覆盖到它），一样会被项目根的递归
+  update 退回 peg（§6.5.3 测点 C），一样需要 pinned 模式的两步 update 显式点名它。
+  只收单向会在「`Code/` 底下挂着一条被钉死的 external」这种形态下漏掉。
+  与白名单**无交集**的 external 仍然不报——报了只是噪音，还会让用户以为得去改一个
+  跟自己无关的定义。
+
+- **计划的 Interfaces 里 `parse_external_line` 返回 `Option<ExternalDef>`，但
+  `ExternalDef` 本身没定义。** 补上了：`{ local_path, url, pinned_rev }`。
+  `url` 是剥掉 peg 后缀的原文，`local_path` 正斜杠归一。
+
+#### 计划的错误
+
+无。Task 4 的判据（`-r <N>` 记号**或** URL 带 `@<N>`）和五种写法的实测结论都对得上。
+
+#### 计划没写的坑
+
+- **`-r` 与 `@` 同时出现时取哪个。** `-r` 是 operative revision、`@` 是 peg，
+  内容来自前者，所以 `operative.or(peg)`。计划只说了「二者有其一即算钉死」，
+  没说都有时报哪个。补了一条测试 `an_operative_revision_wins_over_the_peg_...`。
+
+- **不能一见 `@` 就当 peg。** `^/team@home/lib` 是合法路径；按「有 `@` 就是 peg」
+  写会把 URL 截断成 `^/team`，还凭空报出一条「钉死」。判据必须是「最后一个 `@`
+  之后**全是数字**」。这和 1a 的 `peg_safe` 是同一族坑的两面：那边是「`@` 会被
+  SVN 当 peg 解析，所以要加空后缀」，这边是「不是每个 `@` 都是 peg」。
+  空 peg 后缀（`^/lib@`）也顺带处理成「不是钉死」。
+
+- **哪个 token 是 URL 只能看长相，不能看位置。** 新旧格式字段顺序相反且可以混在
+  同一个属性值里。实现用 `looks_like_url`（`^/` / `//` / `/` / `../` / 含 `://`），
+  并要求去掉 `-r N` 之后**正好剩两个 token、且其中正好一个像 URL**；
+  两个都像或都不像就返回 `None`，不猜。
+
+- **`propget svn:externals -R` 必须从仓库根跑，不能只查白名单子树。** 要找的那条
+  external 定义在白名单**上方**（`Code` 本身就是一条 external 时，定义在根上）。
+  代价是它会遍历整个工作副本；这是一次性的向导步骤，可接受。
+
+- **fixture 里 `svn update` 会失败，且是预期内的。** 五行定义里
+  `pinD -r1 ^/lib` 是旧格式配 `^/` 相对 URL，spec §6.5.2 实测说这种签出直接失败。
+  所以 fixture 用 `try_svn` 发这条 update 并忽略结果——检测走的是**属性文本**，
+  不是磁盘上签出来的东西，那条失败不影响被测行为。
+  用 `run`（断言成功）的话整个 fixture 会 panic。
+
+- **变异测试**：把 `split_peg` 的 peg 分支短路成 `None` →
+  只有 `all_five_pinning_forms_are_detected` 和
+  `detect_pinned_reports_the_four_pinned_ones_and_not_the_following_one` 失败，
+  `an_operative_revision_wins_over_the_peg_when_both_are_present` 仍通过
+  （它靠 `-r2`，不靠 peg）——三条的分工确实是分开的。变异已撤销。
+
+#### 为什么这么改是安全的
+
+- **只发一条只读命令**：`svn propget svn:externals -R --xml`。没有 `propset`、
+  没有 `update`、没有任何会改动工作副本或仓库的调用。
+- **本模块不返回阻断性错误**，符合 spec §6.5 对 P5 的定性（「命中不阻断」）。
+  唯一的 `Err` 来源是 `run_svn` 本身失败或 XML 解析失败。
+- 新 fixture `svn_repo_with_five_external_forms` 在 `TempDir` 里自建仓库，跑完即删；
+  写 externals 属性用 `std::fs::write` 写死 `\n`，避开 E10 那个「混合行尾 →
+  `E135000` → 属性静默没设上 → 测试假绿」的坑，而
+  `detect_pinned_reports_the_four_pinned_ones...` 这条测试本身就是该坑的守卫
+  （属性没设上时它返回空列表，测试立刻红）。
+- 纯新增模块，没有改动任何既有代码。全量 `cargo test -j 2` = 352 passed /
+  0 failed / 30 个二进制，相对 Task 3 的 342 多的正好是新增的 10 条，无回归。
+
+---
+
+## Task 5：基线录制 —— 临时索引、trailer、`commit-tree`
+
+新增 `engine/svn_baseline.rs`（`TempIndex` / `Trailer` / `publish_baseline`），
+并按计划把 `svn_include_check` 的纯读模拟删掉。
+
+动手前先把五件不确定的 git 行为在临时 fixture 上实测掉（跑完即删），**没有一条是
+照文档猜的**：
+
+| # | 实测项 | 结果 |
+|---|---|---|
+| B1 | `GIT_INDEX_FILE` + `read-tree HEAD` 起步 | 成功；真实索引、HEAD、工作目录全不变 |
+| B2 | HEAD 未出生时 `read-tree HEAD` | **exit 128**，`fatal: Not a valid object name HEAD` |
+| B3 | `commit-tree <tree> -m <多行 message>` | 接受；`%B` 逐字读回，末尾补一个换行 |
+| B4 | `update-ref <ref> <new> <40个零>` | ref 不存在 → **exit 0**；ref 已存在 → **exit 128**（`reference already exists`）且 ref 不动 |
+| B5 | `update-ref` 旧值不符 | **exit 128**，`is at X but expected Y`，**ref 未被覆盖** |
+| B6 | `rev-parse -q --verify <不存在的 ref>` | exit 1，stdout 空 |
+
+#### 偏离计划
+
+- **「多收」的检测路径变了，计划没提这件事，第三条测试也得跟着改造。**
+
+  计划的 Step 5 只说要改写两条等价性测试。实际跑下来红的是第三条：
+  `the_mismatch_report_names_the_rule_for_files_that_are_tracked_but_should_not_be`。
+
+  原来它往**用户的真实索引**里 `git add -f -- Code/Junk.psd` 制造多收，1a 的纯读
+  模拟通过 `--cached` 能读到。新模型下候选索引从空索引（或 HEAD 树）起步，
+  用户暂存区里那一笔根本进不来——**而且确实不该进来**：它永远到不了基线。
+
+  新模型下多收的真实路径是「**HEAD 树里已经躺着**一个不该被跟踪的文件」
+  （比如以前被 `add -f` 之后提交了）：`from_head` 把它带进候选索引，
+  `add -A` 不会删掉它（磁盘上还在），于是它一路进到新基线里。测试改成这个形态。
+
+  这是**精度提升不是覆盖损失**：核对的对象从「用户的临时暂存区」变成了
+  「真正会被录进基线的那份索引」。
+
+- **改写后的两条等价性测试仍然不是恒等式**，值得说清楚。计划说「断言目标仍然成立」
+  ——对，但要补一句为什么：候选索引是「从**空**索引 + `-A -- Code`」，对照组是
+  「在**用户已有的**索引上 `git add -A`（整个仓库）」，两条路径的起点和 pathspec
+  都不同，相等是一个实打实的结论。若两边都写成「临时索引上 `add -A`」，那才成了
+  自己比自己。
+
+- **`TempIndex` 加了 `#[derive(Debug)]`**：`Result::expect_err` 要求 `T: Debug`。
+
+- **多写了 7 条计划没列的测试**，都对着实测来的坑：
+  `two_temp_indexes_do_not_collide`、`from_head_starts_from_the_head_tree_not_the_
+  users_staging_area`、`from_head_on_an_unborn_head_is_a_clear_error_not_an_empty_
+  index`、`add_all_with_an_empty_whitelist_adds_nothing`、
+  `the_url_may_itself_contain_an_at_sign`、`a_crlf_message_still_parses`、
+  `publishing_a_first_baseline_refuses_when_one_already_exists`、
+  `recording_the_same_tree_again_is_legal`。
+
+#### 计划的错误
+
+无。这一节的测试代码是对着 B1–B6 的实测写的，计划给的骨架直接可用。
+
+#### 计划没写的坑
+
+- **`commit-tree` 的 message 必须走 `-m`，不能走 stdin。** Task 1 就记过账，这里
+  兑现：`run_git*` 用 `Command::output()`，子进程 stdin 是 null，管道那条路会立刻
+  读到 EOF 并产出一个 **message 为空**的 commit——而 trailer 就写在 message 里，
+  等于基线丢掉全部记账，且**不报任何错**。B3 确认 `-m` 能带多行。
+
+- **`rev-parse -q --verify` 的退出码 1 和 128 必须分开。** 1 是「ref 不存在」，
+  128 是「ref 损坏」。把 128 也当成「不存在」，`publish_baseline` 会以为这是首个
+  基线，然后用 `expected_old = None` 那条路**覆盖掉一段真实历史**。
+  同一个坑 1a 在 `engine::ops::head_is_unborn` 上踩过（那次的后果是删用户的文件）。
+
+- **trailer 里的 URL 自身可能含 `@`。** `svn+ssh://user@host/repo` 是完全正常的
+  写法。按第一个 `@` 切会把 rev 读成 `host/repo@12346`、解析失败，整条基线被判成
+  「不是 baseline」。spec 的正则 `(\S+)@(\d+)` 里 `\S+` 是贪婪的，等价于取**最后
+  一个** `@`——手写解析必须用 `rsplit_once`。
+
+- **commit message 可能带 CRLF。** 经不同工具往返时会带上 CR，正则的 `$` 对不上
+  就凭空少一条基线。解析前先 `trim_end`。
+
+- **临时索引的位置问 `git rev-parse --git-dir`，不要拼 `repo_root/.git`。**
+  worktree 里 `.git` 是个**文件**不是目录，拼出来的路径写不进去。放 `.git/` 里
+  还有两个原因：与对象库同一个文件系统；不会出现在工作目录里被 TortoiseSVN 看见。
+
+- **`Drop` 里不能 panic。** 展开途中再 panic 会直接 abort——在 Tauri 里就是整个
+  应用凭空消失。删不掉临时索引文件是可容忍的，把应用干掉不是。
+
+- **文件名唯一性用 pid + 纳秒 + 进程内原子序号。** 只用纳秒不够：Windows 的时钟
+  粒度约 100ns，同一个流程里「先核对后录制」两次构造可能落在同一个刻度上，
+  撞名的后果是第二份索引从第一份的内容起步。
+
+#### 为什么这么改是安全的
+
+- **「不碰用户的任何东西」这条被三重断言钉死**
+  （`recording_touches_neither_the_real_index_nor_head_nor_the_worktree`）：
+  录制前后 `ls-files -s` 逐字节相同、`rev-parse HEAD` 的退出码与输出相同、
+  工作目录里那个不该被收的 `Code/B.psd` 仍在。B1 的实测和这条测试是两件事，
+  前者证明「git 做得到」，后者证明「我们的实现做到了」。
+- **本任务新增的写操作只有四类**：写临时索引文件（`.git/` 内，`Drop` 清理）、
+  往对象库写 blob/tree/commit（`add` / `write-tree` / `commit-tree`，只增不改）、
+  更新 `refs/heads/svn/base`（**带旧值**）。没有 `checkout`、`reset`、`clean`、
+  `rm`、`branch -D` 中的任何一个。
+- **`update-ref` 失败时不会丢东西**：commit 对象已经写进对象库了，错误信息里带着
+  它的 OID（`已经建好的 commit 是 …，对象还在，没有丢`），最坏是一个孤儿对象，
+  等 `gc` 回收。
+- **`add_all` 的空 pathspec 是 no-op**，不会退化成「收整个仓库」——那会把任意深度
+  的 `.svn/` 收进 git，而那玩意被跟踪之后一次 checkout 就能毁掉一个正在使用的
+  工作副本（spec §6.3）。有专门的测试守着。
+- 删掉纯读模拟属于**减少**事实源：原来「核对读的集合」与「录制写的树」是两条独立
+  推导出来的东西，现在是同一份索引的两次读取。全量 `cargo test -j 2` = 365 passed /
+  0 failed / 31 个二进制，相对 Task 4 的 352 多的正好是新增的 13 条，无回归。
+
+---
+
+## Task 6：§6.8 基线体检
+
+新增 `engine/svn_health.rs`：`check_baseline` + `Health::{Verified, Lying, NotChecked}`。
+spec §6.8.2 的 T1–T7 逐条在临时 fixture 上复现，七条结论与 spec 记的完全一致。
+
+#### 偏离计划
+
+- **白名单根不过 `peg_safe`，与计划的 Interfaces 相反。** 计划写着
+  「Consumes: … `svn_wc::peg_safe`」。实测这条会让命令直接失败，见下。
+
+- **多发一条 `svn info` 核对 `svnUrl`。** 计划没有这一步，是写测试时发现的
+  真实误报路径，见下。
+
+#### 计划的错误
+
+- **`svn diff` 的尾随 target **不接受**空 peg 后缀。**
+  2026-09-14 实测：`svn diff --old=… --new=. --summarize --xml -- Code@` 报
+  `E155010: The node '…\wc\Code@' was not found` —— 带 `--old` / `--new` 时尾随
+  target 是**纯路径**，`@` 被当成字面字符，不走 peg 解析。
+
+  这推翻了 1a 给 `peg_safe` 写的那句「不含 `@` 的普通路径追加尾缀同样合法，
+  无条件追加因此没有代价」——那条结论是在 `info` / `status` 上验的。
+  已把这个例外补进 `peg_safe` 的 doc 注释。
+
+  连带的**已知限制**：白名单路径含 `@` 时，`enumerate_wcs` **必须**加后缀而
+  `svn_health` **必须不加**，两边都能工作的写法目前不存在，所以那种路径没法做体检。
+  记在 `check_baseline` 的 doc 注释里。
+
+#### 计划没写的坑
+
+- **`svnUrl` 配成仓库子路径时会产出一份看起来完全合理的 `Lying` 清单。**
+  这是写 `a_url_that_does_not_match_the_output_is_not_checked_rather_than_lying`
+  这条测试时撞出来的：我原以为「前缀剥不掉」能拦住它，实测**前缀照样剥得掉**
+  ——输出路径就是 `<svnUrl>/<target>/…`，剥掉 `<svnUrl>/` 正好得到 `Code/A.cs`。
+  于是 `--old` 那侧指向一个不存在的 `<svnUrl>/Code`，白名单里每个文件都被报成差异。
+
+  按 spec §6.8.6，初始化时 `Lying` 会触发**整个回退**。把一处配置错误变成
+  「基线撒谎」是这条检查最坏的失败形态——比漏报糟得多，因为用户完全无从下手。
+
+  处置：跑 diff 之前先 `svn info` 核对 `svnUrl` 与工作副本根的实际 URL，
+  对不上返回 `NotChecked` 并说清楚该填什么。测试从「断言剥不掉前缀」改成
+  「断言这条真实误报路径被拦住」。
+
+- **命令失败时 svn 仍然往 stdout 打出部分 XML。** 实测 URL 不可达时 stdout 里
+  有 `<?xml …?>` 和 `<diff><paths>`，错误只在 stderr 和退出码里。
+  「解析得出来就算成功」的实现会在断网时拿到一个空的 paths 列表，于是
+  **报告基线健康**——这条检查等于不存在。专门写了一条测试守它，并配了
+  「同一个工作副本、同一处真实差异、只把 URL 指歪」的对照组，
+  证明 `NotChecked` 不是因为别的原因静默的。
+
+- **`rev` 大于服务器 HEAD 时是 exit 1 + `E160006: No such revision`**，
+  同样归 `NotChecked`（最可能的成因是 `svnUrl` 配错或指向了另一个仓库），
+  不是「基线撒谎」。
+
+- **W-file 判定必须是纯路径判断，不能走磁盘。** `expected_set` 遍历磁盘，
+  而 T7 那类差异（服务器上删掉了 `Code/Deep/D.cs`）的文件在磁盘上根本不存在，
+  走磁盘的判断会把它整个漏掉——那正是 §9.4.1 那类漏检要抓的东西。
+
+- **`Code/Art.psd` 确实会出现在输出里。** 计划和 spec 都说了要按扩展名剔除，
+  这里补一条实测确认：白名单根**底下**的非 W-file 文件被改过时，
+  `svn diff --summarize` 会报它。T3（白名单**外**的美术文件）和 T3b（白名单
+  **内**但扩展名不匹配）是两条不同的路径，各写了一条测试。
+
+- **空白名单返回 `Err` 而不是 `Verified`。** 不传 target 时 `svn diff` 会拿整个
+  工作副本去比——对 Unity 工程是几个 GB，且任何一处正常的本地改动都会报成撒谎。
+  返回 `Verified` 更糟：等于宣布一个空白名单的基线是健康的。
+
+#### 为什么这么改是安全的
+
+- **全部是只读命令**：`svn info --xml` 与 `svn diff --summarize --xml`。
+  没有 `update`、`revert`、`commit`、`propset`。
+- **三种结果严格分开**，且默认方向是保守的：任何跑不成的情况都落到 `NotChecked`
+  （不阻断、如实显示「未经体检」），只有「命令成功且过滤后仍有 W-file 内容差异」
+  才是 `Lying`。这与 spec §6.8.6 的三行表逐行对应。
+- **两条「不误报」测试（T3 / T3b）和一条「配置错误不当成撒谎」测试**共同守着
+  这条检查最危险的方向。误报会让一个完全正常的仓库永远建不起来，而且按 spec
+  它会触发整个初始化回退。
+- 纯新增模块 + 一处 doc 注释修正，没有改动任何既有函数的行为。全量
+  `cargo test -j 2` = 380 passed / 0 failed / 32 个二进制，相对 Task 5 的 365
+  多的正好是新增的 15 条，无回归。
+
+---
+
+## Task 7 + 8：初始化向导编排、失败回退、重建基线
+
+新增 `engine/svn_init.rs`：`init_hybrid`（§6.5）与 `rebuild_baseline`（§16 R1–R5）。
+两者共用同一段录制序列，所以同一个文件、同一个提交。
+
+### ⚠️ 一个必须写明的结论：这两个入口上，体检结构上永远通过
+
+写 Task 7/8 的测试时想造一个「工作副本干净、但磁盘内容与服务器不符」的 fixture，
+造不出来。查下来是两件事叠加：
+
+1. **P1–P3 全过之后，磁盘按构造就等于服务器上的 `nodeRevs`。** 这两个入口的
+   `rev` 都取自 `nodeRevs`（不是 trailer），所以「rev 与磁盘不符」这个前提不成立。
+2. **`svn diff` 也吃本地的「大小 + mtime」缓存。** 2026-09-14 实测：把
+   `Code/A.cs` 换成**等长**的不同内容再把 mtime 还原回去，`svn status` 报干净
+   （预期之中），而 `svn diff --old=URL@1 --new=.` **同样报无差异**——它没去比
+   实际字节，直接按「本地未修改」短路了。
+
+   **这修正了 spec §6.8.3 的一句话。** 那里写的是「它比的是**磁盘**与服务器」，
+   准确说法是「比的是 **SVN 记录的本地状态**与服务器」。`.svn` 元数据自己撒谎的
+   那一类，体检抓不到。
+
+所以在 `init_hybrid` 与 `rebuild_baseline` 里，`Health::Lying` 是一条
+**结构上不可达**的分支。它仍然实现并保留，理由有三：兜住 P2 读数与体检之间的
+窄竞态；将来 `rev` 的来源一旦改变（比如改成读 trailer）它立刻变得可达；
+而 `svn_health` 自己的 T4/T7 已经覆盖了 rev 来源不同时的真实形态。
+
+**没有为它伪造 fixture。** 计划里点名要的 `svn_repo_whose_disk_lies()` /
+`hybrid_repo_whose_disk_lies()` 两个 fixture 都没有建——建一个名叫「磁盘撒谎」
+却其实在测别的东西的 fixture，正是 `AGENTS.md` §13 rubric #9 判为阻断的虚假信心。
+回退路径改用**真实可构造**的失败（纳入集合核对不过）来覆盖，它与体检 `Lying`
+走的是同一条 `Err` 分支。
+
+#### 偏离计划
+
+- **`init_hybrid` 多了一步 `git read-tree TREE`。** 计划的序列表里没有，但
+  spec §6.3.1 明写「HEAD 已附着在 `svn/base` 的入口在发布后用 `git read-tree TREE`
+  对齐真实索引，不带 `-u`、不改磁盘」。初始化正是这种入口：`git init -b svn/base`
+  之后 HEAD 就指着基线分支。漏掉这一步的话 HEAD 上有文件而真实索引是空的，
+  用户一打开就看到每个 W-file 都显示成「已删除」。有
+  `a_successful_init_leaves_a_clean_git_status` 守着。
+
+- **`InitRequest` 里没有 `svn_url` 字段**，改为初始化时自己 `svn info` 取工作副本
+  根的 URL 并写进配置。让用户手填一个必须与 `svn info` 完全一致的 URL 只会制造
+  Task 6 记的那种误报。
+
+- **新增 `svn_config::write_config`**，1a 只有读没有写。它**先 `validate` 再落盘**：
+  配置文件一存在，`detect_repo_kind` 就把目录判成 `SvnHybrid`，写进去一份过不了
+  校验的内容等于造出「识别成混合仓库、但每次读配置都报错」的死局。
+
+- **Task 8 的 `rebuild_never_moves_head_and_survives_uncommitted_work` 改了形态。**
+  计划里往 `Code/WIP.cs` 写一个未提交文件，但那是白名单里一个未版本控制的文件，
+  **R1 会直接拒绝重建**——那是 P1 的正确行为。改成把未提交文件放在白名单外
+  （`Art/scratch.txt`），并把断言扩到「HEAD 名字、HEAD OID、真实索引、磁盘内容
+  四样都不变」。
+
+- **`a_failing_r3b_leaves_the_baseline_pointer_untouched` 改成
+  `a_failure_before_r4_leaves_the_baseline_pointer_untouched`**，用纳入集合核对
+  触发。理由见上面那节：R3b 的 `Lying` 在这个入口不可达。
+
+#### 计划的错误
+
+- 计划的 Task 7 测试 `a_failing_health_check_rolls_the_whole_thing_back` 依赖
+  `svn_repo_whose_disk_lies()`，而那个 fixture 造不出来（见上）。
+
+#### 计划没写的坑
+
+- **回退用的 `.gitignore` 必须放在工作副本根，不能放 `Code/` 底下。**
+  第一版测试写的是 `Code/.gitignore`，结果它是白名单里一个未版本控制的文件，
+  **P1 在 `git init` 之前就拦住了**，走的是「无需回退」那条路——这条测试什么也
+  没测到（实际拿到的错误码是 `svn_preflight_dirty` 而不是 `include_set_mismatch`）。
+  放在根上时 P1 扫不到它（P1 只扫白名单根），而 git 照读，于是核对不过、
+  走回退。
+
+- **空白名单最早被 `svn_config::validate` 拦住**（`extensions 不能为空` 同理），
+  拿到的错误码是 `svn_config` 而不是 `svn_preflight_empty_whitelist`。三道拦截
+  都在建 `.git` 之前，测试断言的是「没建 `.git`」而不是具体哪一道。
+
+- **变异测试踩了两层坑，第二层才是真问题。**
+  把 spec 明令禁止的 `git checkout svn/base` 插进 `rebuild_baseline`：
+  1. 第一版 fixture（init + 一次外部 update）里 `work` 与 `svn/base` 是**同一个
+     commit**，checkout 是空操作 → 只有「HEAD 没动」那条红了，专门写来防它的
+     「反向证据」**抓不住**。
+  2. 第二版把三者错开了，但中间那次推进写成了 `rebuild_baseline(...)`
+     ——**fixture 调用了被测函数**，变异在搭 fixture 时就先把 HEAD 挪走，
+     等测试跑时已经自我中和，仍然抓不住。
+  3. 第三版改用**裸 git 管道命令**推进基线（`fixture_advance_baseline`），
+     变异这才被三条测试同时抓住。
+
+  结论与 Task 1 的 `fixture_git` 同源、但更隐蔽：**fixture 不能用被测对象搭**，
+  哪怕只是「顺手复用一下已经写好的函数」。
+
+#### 为什么这么改是安全的
+
+- **`remove_dir_all` 是全项目唯一一处，三道守卫叠着：**
+  ① `init_hybrid` 开头断言 `detect_repo_kind == SvnUninitialized`（**进来时没有
+  `.git`**，所以现在这个必然是本次建的）；② `rollback` 自己再查目标是不是目录
+  （worktree 里 `.git` 是文件，那种不该出现在这里）；③ 同级必须有 `.svn`
+  （证明确实在一个 SVN 工作副本里）。测试
+  `init_refuses_to_touch_a_directory_that_already_has_a_git` 往 `.git` 里放了一个
+  `PRECIOUS` 文件并断言它还在。
+- **回退只有一个出口。** `git init` 之后的全部步骤抽进 `build_repo`，
+  `init_hybrid` 只在它返回 `Err` 时调一次 `rollback`。中间任何一步 `?` 早退都
+  走同一条分支，不存在「某条路径忘了回退」。
+- **`rollback` 删不掉时不 panic、也不覆盖原始错误**：用户该看到的是「为什么失败」，
+  不是「回退时又失败了」。残留的 `.git` 会被 §6.1 识别成 `SvnSuspicious` 并阻断，
+  不会造成数据损坏。
+- **两个入口都一条 SVN 写命令都不发。** `a_successful_init_emits_no_svn_write_command`
+  与 `rebuild_emits_no_svn_write_command` 各自比对服务器 HEAD revision 前后不变。
+- **重建全程不动 HEAD、不动真实索引、不动磁盘**，有
+  `rebuild_never_moves_head_nor_touches_the_index_or_the_worktree` 四项断言守着；
+  R4（动指针）排在体检与核对之后，中止时指针原样。
+- **脏工作副本不自动 revert**（spec §8.1 #2）：
+  `rebuild_refuses_when_the_working_copy_is_dirty` 断言用户的改动原样还在。
+- 全量 `cargo test -j 2` = 398 passed / 0 failed / 33 个二进制，相对 Task 6 的 380
+  多的正好是新增的 18 条，无回归。
+
+---
+
+## Task 9 + 10：命令层、向导 UI、收尾验证
+
+#### 偏离计划
+
+- **多了 `engine::svn_init::check_current_baseline`，命令层的 `svn_check_baseline`
+  走它。** 计划只写了「体检当前基线」，没说 rev 从哪来。这里取**基线自己的
+  trailer**，不是 `nodeRevs`——这是 `Health::Lying` **唯一真正可达**的入口
+  （理由见 Task 7+8 那节）。真实窗口验证里它确实报出了 `lying`。
+
+- **多改了 `RepoTab.tsx` 与 `repoStore` 的 `errorCode`。** 计划的 Modify 列表里
+  没有 `RepoTab.tsx`，但不接这一下向导就是**死代码**，Task 10 Step 4 要求的
+  窗口验证也就无从谈起。改动很小：`RepoState` 加一个 `errorCode`（`error` 是给人
+  看的消息，这个是给代码分流的），`RepoTab` 在 `svn_not_initialized` 时渲染向导
+  而不是红色横幅——「有 `.svn` 无 `.git`」不是错误，是一个还没走的流程（spec §6.1）。
+
+- **`Health` 用 `#[serde(tag = "status")]` 压平成判别联合**，而不是 serde 默认的
+  外部标签。默认会吐成 `{"Verified":{"rev":1}}`：键名带大写、前端还要多剥一层。
+
+#### 计划的错误
+
+无。Task 9 的清单与实际需要一致。
+
+#### 计划没写的坑
+
+- **`pnpm test` 在本 worktree 里会跑到主工作区。** Task 0 记的版本（「装了
+  `node_modules` 就好」）**不准确**：`node_modules` 装着，`pnpm test` 仍然跑出
+  193 个文件 / 2475 条。原因是这个 worktree 嵌在 `<主仓库>/.claude/worktrees/` 下，
+  vitest 的 root 解析走到了主仓库。**必须用 `pnpm exec vitest run --root .`**，
+  那才是这一份的 22 files / 290 tests。Task 10 的数字全部按后者记。
+
+- **`state.path` 在打开失败时是 `null`。** 向导那条分支恰恰是因为 `open_repo`
+  失败才走到的，所以路径必须取 `repoPath` prop。第一版写成 `state.path` 时向导
+  永远不会渲染。
+
+- **后端错误消息与前端引导会逐字重复。** 真实窗口里跑到 P1 拦截时看到的：
+  后端消息已经是「白名单内的工作副本不干净，共 1 处…本应用不会替你 revert…请先在
+  TortoiseSVN 里…」，而 `wizardErrorHint` 又几乎一字不差地说了一遍，界面上并排
+  两段一模一样的话——用户会以为是两条不同的提示然后去找区别。
+
+  修法：`wizardErrorHint(code, message)` 在后端消息已经包含该引导前 12 个字时返回
+  空串。表仍然保留（它是 UI 侧的保证：后端消息哪天改短了引导不会跟着消失），
+  只是不重复。配了两条测试：重复时抑制、不重复时照常显示。
+
+- **`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222` 能让
+  Tauri 窗口开出 CDP**，于是窗口验证可以脚本化。chrome-devtools MCP **接不上**
+  它（那个工具会自己起一个 Chrome），要自己用 `ClientWebSocket` 发
+  `Runtime.evaluate`。脚本在 scratchpad 的 `cdp.ps1`。
+  这条值得记：Phase 1a 的窗口验证就是因为「没法脚本化」而被跳过的。
+
+### 真实窗口验证（`AGENTS.md` §5.1，Task 10 Step 4）
+
+2026-09-14，`pnpm tauri dev` 的真实窗口，全部目标是 `%TEMP%` 下的一次性 SVN
+fixture，验完即删。**没有碰任何真实仓库。**
+
+命令全部经由 `window.__TAURI_INTERNALS__.invoke` 发出，所以 snake_case ↔ camelCase
+的参数名转换、序列化、错误对象形状都过了真实 IPC 层（`AGENTS.md` §7.3）。
+
+| # | 场景 | 结果 |
+|---|---|---|
+| 11 | 干净工作副本走完向导 | ✅ HEAD 在 `work`；基线树只有 `Code/A.cs`、`Code/B.cs`（`Art.psd` 与 `Art/boss.fbx` 都没进）；trailer = `Repository Root@1 + UUID`；`git status` 空；无临时索引残留；服务器 revision 未变 |
+| 12 | 白名单内有本地修改 | ✅ P1 拦住（`svn_preflight_dirty`），消息点名 `Code/A.cs （modified）` 并写明「不会替你 revert」；**没有创建 `.git`**，本地修改原样保留 |
+| 13 | mixed-revision | ✅ P2 拦住，报 `{1, 2}`；白名单不在 external 内，给的是「先跑一次完整 svn update」那条有效引导 |
+| 14 | 白名单跨仓库 | ✅ P4 拦住，消息里两个 UUID 都点了名；没有创建 `.git` |
+| 15 | externals 被 `-r` 钉死 | ✅ **不阻断**，`pinned: [Code/pinnedArt@r1]`，建库照常完成 |
+| 16 | 体检报 Lying | ✅ 磁盘已是 r2、基线 trailer 还写着 r1 时，`svn_check_baseline` 报 `{status:"lying", files:["Code/A.cs"]}` |
+| 17 | 断网时体检 | ✅ 仓库目录改名后得到 `{status:"notChecked", reason:"E170013 Unable to connect…"}`——**不是** `lying`，也没有 reject |
+| 18 | 外部 update 后重建基线 | ✅ `nodeRev: 2`、新旧基线 OID 不同、体检 `verified`；HEAD 仍在 `work` 且未移动 |
+| — | 重复初始化 | ✅ `svn_already_initialized`，已有的 `.git` 没被碰 |
+
+**UI 层也在窗口里走了一遍**（S12 的本地修改写回原内容后它变成一个干净的未初始化
+工作副本）：向导四个步骤的状态流转正确（`current → done`）；扩展名输入 `cs, cs, .cs`
+被正确归一成 `.cs`；P1–P5 通过后显示记账 revision / 仓库根 / UUID；点「建库」之后
+向导退场、主界面接上，分支只有 `svn/base` 与 `work`，**TAGS 与 WORKTREES 整块不
+渲染**（`read_capabilities` 在真窗口里生效）。
+
+### Phase 1a 遗留的窗口验证（用户 2026-09-14 确认并进本期）
+
+1a 的两个命令是在窗口验证没跑的情况下合并进 master 的（PR #41 的复选框一直空着，
+没有谎报）。这次一并验完：
+
+| 命令 | 结果 |
+|---|---|
+| `probe_svn_environment` | ✅ 返回 `"available"` |
+| `read_capabilities` | ✅ 六个键 `worktrees/tags/remotes/pullRequests/cherryPick/patches` 全部存在且为 `false`，camelCase 转换正确 |
+
+### G8：本期仍然零 SVN 写操作
+
+`run_svn` / `run_svn_code` 的全部调用点实际发出的子命令只有：
+`info`、`status`、`propget`、`diff`（加 `probe_svn` 的 `--version`）。
+没有 `add` / `commit` / `update` / `revert` / `propset` / `merge` 中的任何一个。
+`svn_baseline.rs` 里那个 `"add"` 是 **`git add`**，走 `run_git_env`。
+
+窗口验证里对 S11 / S12 各比对了一次服务器 HEAD revision，建库前后相等。
+
+### 命令注册对账
+
+`#[tauri::command]` 标注 **50** 个 == `lib.rs` 注册 **50** 个 == 1a 的 46 + 本期新增 4。
+
+---
+
+## 独立 review 的处置（`AGENTS.md` §4.1 合并前门槛）
+
+2026-09-14，由独立于实现者的 agent 按 §13 rubric 跑了一遍 `ca304d6..HEAD` 的全量
+diff，先读「偏离计划」再看代码（rubric #12）。它提了 **3 个阻断项 + 7 条建议**。
+每一条我都自己复核过，**没有一条是照单全收的**；三个阻断项全部复现并修掉。
+
+### BL-1 向导能建出一个自己打不开的仓库 —— 属实，已修
+
+`SvnGitBackend::open` 每次打开混合仓库都跑 `validate_whitelist_against_disk`
+（它专门挡「目录条目漏尾斜杠」和「大小写写错」），而 `init_hybrid` 这条**写入**
+配置的路径一次都没调它。
+
+复核确认：`tests/svn_config.rs` 早就断言了 `["Code"]`（漏尾斜杠）必被那个校验拒绝，
+缺的只是把两条路径接上。失败链是：用户漏一个斜杠 + 目录里恰好全是匹配扩展名的
+文件 → 期望集合与候选索引相等 → 纳入集合核对通过 → **初始化成功** → 配置落盘 →
+下一次 `open_repo` 被拒。此刻目录已是 `SvnHybrid`，而向导那条分支只认
+`svn_not_initialized`，用户在应用内**没有任何出路**。
+
+修法：`build_config` 里补一句 `validate_whitelist_against_disk`，放在 `git init`
+之前（失败无需回退）。补测试 `init_refuses_a_whitelist_that_open_would_later_reject`。
+
+### BL-2 向导的完成页不可达 —— 属实，已修，并补上了 spec 要求的「常驻」
+
+`onInit` 在返回前 `void openRepo(repoPath)`，而 `openRepo` 的**第一条语句**同步
+把 `errorCode` 清成 `null`，RepoTab 立刻卸载向导，`setStep('done')` 落在一个已卸载
+的组件上。后果是 spec §6.8.6 要求「在 UI 上如实显示」的 `NotChecked`、
+以及 §6.5.3 要求「UI 常驻说明」的 pinned 提示，**一帧都画不出来**。
+
+**这条我在窗口验证时看到了，却把它当成了预期行为**（记成了「向导退场、主界面
+接上」通过）。S15/S16/S17 三个涉及 health / pinned 的场景当时全是用 `invoke`
+直接验的，没有经过 UI——所以这个缺口没被任何一条验证碰到。
+
+修法两部分：
+
+1. 向导加一个 `onFinish` 回调，**用户在完成页点「关闭」时**才重开仓库。
+2. pinned 做成**真正的常驻**：新增 `svn_pinned_externals` 命令与 `refreshPinned`
+   （打开仓库时**不 await**，对齐 `refreshPullRequests` 的做法——它要跑
+   `propget -R`），store 持有 `pinned`，RepoTab 渲染一条常驻横幅。
+   只在向导里显示一次不算常驻，用户下次打开这个仓库就看不到了。
+
+真实窗口复验：完成页 `done/done/done/current`，体检结果（ok）与 pinned 说明（warn）
+两条都在；点「关闭」之后主界面仍显示 pinned 常驻横幅。
+
+### BL-3 `Lying` 在 init 上其实可达（`svn switch`）—— 属实，我的论证错了
+
+我在 Task 7+8 那节断言「`Health::Lying` 在这两个入口上结构上不可达」，理由是
+「P1–P3 全过 ⇒ 磁盘 == 服务器@nodeRevs」。**这个支柱是错的**，reviewer 给了反例，
+我自己复现确认：
+
+把白名单子树 `svn switch` 到另一条分支（SVN 的常规操作）之后——
+
+| 门槛 | 实测 |
+|---|---|
+| P1 `status --no-ignore --ignore-externals --xml -- Code@` | **零条目**，通过 |
+| P2 `nodeRevs` | `{3}` 单值，通过 |
+| P3 工作副本根 `--depth=empty` | 空，通过 |
+| P4 UUID | 同一仓库，通过 |
+| XML 里有没有 `switched` 属性 | **没有**（target 就是被 switch 的那个目录时不出） |
+| 体检 | `item="modified"` → **`Lying`** |
+
+也就是说一个**完全合法**的工作副本会被判成「基线撒谎」，而按 spec §6.8.6
+初始化时那会触发整个回退，给出的引导（「跑一次完整 svn update」）还永远无效。
+这正是 Task 6 自己认定的「这条检查最坏的失败形态」——`svnUrl` 子路径那一种当时
+加了守卫，switch 这一种漏了。
+
+修法：`check_baseline` 新增 `whitelist_not_under_base`——每个白名单根的实际 URL
+必须就是 `<base>/<相对路径>`，不是的话返回 `NotChecked` 并说清成因。
+返回 `NotChecked` 而不是 `Lying`：基线本身没问题（它录的是磁盘内容配 `nodeRevs`），
+只是**这条检查的基准 URL 不适用**。
+
+补 fixture `svn_repo_with_switched_subtree` 与测试
+`a_switched_whitelist_subtree_is_not_checked_rather_than_lying`，并做了变异测试
+——短路掉那道守卫，测试确实拿到 `Lying { files: ["Code/A.cs"] }` 而红。
+
+**同时订正上面那段论证**：「体检在 init / rebuild 上结构性不可达」这句话是错的，
+正确的说法是「`svn diff` 会吃本地 size+mtime 缓存，所以**元数据撒谎**那一类抓不到」
+——那一条仍然成立（实测过），但它推不出「不可达」。
+
+### 一并采纳的建议
+
+- **NB-1 白名单根本身是 external 时体检恒为 `NotChecked`**（实测 `E160005`）。
+  与 BL-3 同一个根因，被 `whitelist_not_under_base` 一起收编了——现在给的是一句
+  说得清的中文，而不是 svn 的英文错误码。
+- **NB-3 单文件白名单条目的扩展名语义两边不一致**：`expected_set` 与 `svn_exclude`
+  对单文件条目**不过**扩展名过滤，而 `is_w_file` 一律过 → 假阴性（那个文件进了
+  基线，服务器上改了它体检却报 `Verified`）。已对齐，补测试。
+- **NB-4 `remove_dir_all` 的 TOCTOU 窗口**：开头判完 `SvnUninitialized` 之后要经过
+  `detect_pinned`（`propget -R` 遍历整个工作副本，Unity 规模分钟级）才到 `git init`。
+  已在**进入回退区之前**再判一次 `.git` 不存在。⚠️ 这道判定必须留在回退区**之外**
+  ——放进 `build_repo` 的话它自己的 `Err` 会触发 `rollback`，正好删掉那个刚发现的
+  外来 `.git`（我第一版就是那么写的，当场改了）。
+- **NB-5 剥前缀失败那条分支的文案会把人引偏**（它猜的成因已被前面两道守卫覆盖）。
+  改成只说「这是一个没有预料到的输出形状」，并在注释里写明它是防御不是死代码。
+- **NB-7 一次运行里三次 `svn info` 取同一个值**。工作副本根 URL 现在取一次传下去。
+- 顺带修掉用户可见文案里的 `**` markdown 残留——它们渲染在 `<pre>` 里，
+  用户看到的就是字面的星号。
+
+### 未采纳 / 记账给后面
+
+- **NB-2 depth-excluded 子树全程无人察觉**（实测：`svn update --set-depth=exclude
+  Code/Deep` 之后 P1 零条目、P2 单值、P3 干净，体检只回一条被过滤掉的 `kind=dir`
+  → `Verified`，而基线静默少了服务器上确实存在的 `Code/Deep/D.cs`）。
+
+  **这一条我复现了，但本期不修**：可靠的检测要拿服务器侧的文件清单
+  （`svn ls -R <url>@N`）与磁盘比，那是一个本期没有的新机制，不是几行判断。
+  它与 spec §6.3.1 那句「最危险的一类缺陷——用户以为源码受 git 保护，实际没有」
+  同源，**记账给 Phase 1c**。
+
+- **NB-6 `svn_rebuild_baseline` / `svn_check_baseline` 没有 UI 入口**。按计划
+  Task 9 的范围这不算偏离（计划只要求向导 UI），但要注意后果：`check_current_baseline`
+  是 `Lying` 唯一真正可达的入口，而它没有界面入口 —— 本期交付形态下用户点不出来。
+  记账给 Phase 1c 一起做。
+
+### reviewer 对 B / C 两问的结论
+
+- **B（P1 对 `ignored`/`unversioned` 一律算脏）**：与 spec §6.5 一致，撤销收窄是对的。
+  它额外指出一处残余风险：判据比 spec 给的**理由**更严，被 `svn:ignore` 挡住且
+  扩展名不在白名单里的文件 git 其实不会收，却照样把向导拦死，而错误信息给的两条
+  出路（`svn add` / 移出白名单目录）对那种文件都不可行。
+  **已在 `check_clean` 的提示里补上第三条出路**（把白名单收窄到不含该目录）。
+- **C（`strip_prefix_ci` 剥不掉前缀那条分支）**：它按四条路径试着让那条分支响，
+  都没响，结论是「确实不可达，但该留，`NotChecked` 也是对的」。与我的判断一致；
+  只按它的意见改了文案（NB-5）。
+
+### 复核后的数字
+
+`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓、
+`cargo test -j 2` **404 passed / 0 failed / 33 个二进制**（修完新增 3 条测试）；
+`pnpm build` ✓、`pnpm exec vitest run --root .` **290 passed / 22 files**。
+命令注册对账 **51 == 51**（1a 的 46 + 本期 5）。
+
+---
+
+## 记账给后面（Task 4 遗留）
+
+**spec §6.5.2「手段二：行为校验」本期不做。** 它要在一次真实 `svn update` 成功
+之后比对「白名单所属 WC 的 revision」与「该仓库当时的 HEAD」，而本期根本不发
+`update`（那是 §7.3 的 S5，属同步流程）。spec 说两条手段「都要实现」，所以这是一处
+**有意的未完成**，不是遗漏：手段一负责阻断/判定，手段二负责兜住手段一的盲区。
+已写进 `svn_externals.rs` 的模块注释，记账给 Phase 2。
+
+---
+
+## 第二轮独立 review（Codex 对抗式，针对 PR #42 的完整 diff）的处置
+
+给出 3 条（2 high + 1 medium）。**三条全部复现、全部修掉**，每条都先用临时 fixture
+或裸 `svn` / `git` 命令独立验过，没有直接采信报告。
+
+### AR-1（high）初始化未原子取得所有权，回退可能删掉另一条请求的仓库
+
+报告说第一轮补的 `.git` 存在性检查「只缩短了竞态窗口」。**属实。**
+
+2026-09-15 用两条线程 + `Barrier` 在 fixture 上实测，修复前 12 轮一组必现：
+
+```text
+round 2: ok=0 gitdir=false hybrid=SvnUninitialized
+    Err("git_cli / fatal: not a git repository …")
+    Err("git_cli / could not lock config file …/.git/config: File exists")
+```
+
+两条请求**同时**在同一个 `.git` 上跑 `git init`，撞在 config 锁上双双失败，
+然后各自 `rollback`，把目录删回未初始化。裸命令逐段复现的链条：
+
+| 探针 | 实测 |
+|---|---|
+| `git init -b svn/base` 打在已初始化的仓库上 | **exit 0**，静默 re-init，还 `warning: re-init: ignored --initial-branch=svn/base` |
+| 落败方的 `update-ref <ref> <new> <zero-oid>` | exit 128，`cannot lock ref 'refs/heads/svn/base': reference already exists` |
+| `git init -b svn/base` 打在**已存在的空 `.git` 目录**上 | **exit 0**，HEAD 正确指向 `refs/heads/svn/base` |
+| `create_dir` 打在已存在的目录上 | 以 `AlreadyExists` 失败 |
+
+所以更坏的交错是：赢家走完全程报「初始化成功」，落败方在 `update-ref` 上失败并
+`remove_dir_all` —— 删掉的正是**赢家刚建好的仓库**，而赢家那边界面显示成功。
+
+**修法**：新增 `claim_git_dir`，用 `std::fs::create_dir` **原子地创建并占有**
+`.git`，成功即证明「它在那一刻不存在、且是我们建的」。`git init` 随后照常打进这个
+空目录（上表第 3 行）。这比原来的「开头 `detect_repo_kind` 断言过没有 `.git`」强：
+后者与 `git init` 之间隔着整个前置校验（`detect_pinned` 的 `propget -R` 在 Unity
+规模是分钟级）。跨进程同样有效，因为它靠的是文件系统而不是进程内的锁。
+
+`rollback` 的安全性论证也随之换了地基：不再依赖「进来时没有 `.git`」这个**过期的**
+观察，而是依赖「这个目录是我 `create_dir` 出来的」这个**所有权**事实。
+
+**测试有牙的证据**：`two_concurrent_inits_never_delete_the_winner_s_repository`。
+断言是 `ok == 1`（恰好一条成功）而**不是** `ok <= 1` —— 上面那种「两条都失败」正好
+让 `ok <= 1` 通过，而它恰恰是 bug 的现场。轮数是量出来的：
+
+| 轮数 | 变异回修复前的写法之后 |
+|---|---|
+| 6 | 跑 3 次，**2 次**红（1 次假绿） |
+| 12 | 跑 4 次，**4 次**全红 |
+
+⚠️ 中途犯过一次错并纠正：第一版变异写成「`exists()` + `create_dir_all`」，那让
+`.git` 在检查后**几微秒**就出现，窗口塌缩，30 轮一次都没撞上，我差点据此以为测试
+没牙。真实的修复前形态是「只判存在、`.git` 交给 `git init` 去建」——窗口有**一次
+进程启动**那么宽。**变异必须忠于原形态，否则量出来的是另一个东西。**
+
+### AR-2（high）P1/P2 漏查白名单内的嵌套 external
+
+报告说 `enumerate_wcs` 已经枚举出嵌套 external，但 P1/P2 仍只遍历原始白名单根。
+**属实，而且这是一处 spec 违反，不只是设计缺口。**
+
+spec §6.5.5：「**同仓库的嵌套 external 不阻断**，但它必须被纳入 §6.6.5 的记账单位
+集合——也就是 `nodeRevs` 要在它上面也跑一次并取并集，否则它就是一块 git 管着、
+SVN 侧却没人盯的盲区。」
+spec §6.6.5：「在**每个 `wc(P)`** 上各跑一次……这里的『每个 `wc(P)`』指白名单递归
+覆盖到的全部工作副本，包括白名单根**底下**再挂的嵌套 external。」
+
+2026-09-15 实测（白名单 `Code/`，`Code/Vendor` 是**同仓库** external）：
+
+| 关卡 | 只查白名单根时 | 加上嵌套 WC 根之后 |
+|---|---|---|
+| P4 同 UUID | **通过**（按设计） | 同 |
+| P1 `status --no-ignore --ignore-externals -- Code@` | 只有一条 `item="external"`，`M` 看不见 | `Code/Vendor@` 报出 `item="modified"` |
+| P2 `status -v --ignore-externals -- Code@` | `{3}`，external 停在 r1 不在集合里 | 并集 `{1,3}` → 正确拒绝 |
+| 体检 `diff --old=URL@3 --new=. -- Code` | `<paths>` **空的** | 仍为空（见下） |
+| `git add -- Code` | `Code/Vendor/V.cs` **照收** | 同 |
+
+叠起来就是：一个未提交、或停在别的 revision 的子树被录进基线、标着根的 revision，
+而体检报 `Verified`。**为什么以前的测试没抓到**：已有的
+`svn_repo_with_cross_repo_nested_external` 是**跨**仓库的，P4 会先拦下；
+同仓库那条是唯一能走完全程的形态，而它没有 fixture。
+
+**修法分两半：**
+
+1. `svn_preflight::check_targets`：P1/P2 的目标 = 白名单根 ∪ 枚举出的嵌套 WC 根。
+   `--ignore-externals` 照加（它挡的是**更深**一层，那一层由 `enumerate_wcs` 递归
+   枚举出来各查一次，spec §6.6.5 末尾明确了这个分工）。
+2. `svn_health::nested_external_not_covered`：白名单底下有 external 时返回
+   `NotChecked` 并点名是哪条。**不能沿用 `Verified`** —— `Verified` 不是「没发现
+   问题」，是一句主动的保证，§6.6 的失同步判定与 §9 的恢复流程都建立在它之上。
+
+**没做完的那部分（记账给 Phase 1c）**：spec §6.6.5 第 4 行要求「每个 `wc(P)` 各体检
+一次，用它自己的 `url(P)`」。那要按 WC 分组重组整条 `svn diff`，是新的一块工作，
+本期只做到「不宣称自己没验过的东西」。P1/P2 已经覆盖了「脏」和「停在别的 revision」
+两种形态，缺的是**服务器侧**的二次证伪。
+
+**反向证据**：`a_clean_same_repo_nested_external_still_passes` —— 干净的同仓库嵌套
+external 必须放行。少了它，前两条测试用「见到 external 就拒绝」也能变绿，而那会
+砸掉本设计的核心场景（代码本来就在 external 里）。
+
+另外补了一条端到端
+`init_succeeds_on_a_clean_same_repo_nested_external_and_never_tracks_its_dot_svn`。
+这条路径现在才第一次真的走得通，于是也第一次暴露出「嵌套 external 有**自己的**
+`.svn`」——裸 `git add -- Code` 实测会把 `Code/Vendor/.svn/wc.db` 整个收进来。
+挡住它的是 `generate_exclude` 末尾那行不带前导 `/` 的 `.svn/`（设计时就想到了，
+但在这个形态下从没被测过）。
+
+### AR-3（medium）手动体检把工作目录差异误判成基线错误
+
+报告说 `check_current_baseline` 没有校验 `svn_health` 明确要求的前提。**属实。**
+
+`svn_health` 的模块头写着前提是「磁盘上白名单内的内容 == 基线树的内容」。
+spec §6.8.5 列的另外三个时机天然满足（树刚从磁盘录出来），**手动体检不满足**
+——用户就在 `work` 分支上改代码，那正是他会点这个按钮的时候。
+
+复现（修复前）：init → 改一行 `Code/A.cs` → `check_current_baseline` →
+`Lying { files: ["Code/A.cs"] }`。基线完全正确，被指控撒谎的是一个再普通不过的
+未提交改动。**指控错对象比不指控更糟**：用户会照着引导去重建基线，把一份好基线
+换掉，而他的改动还在原地。
+
+**为什么这条一直没被发现**：`check_current_baseline` **一条测试都没有**
+（全仓库只有 `commands/svn.rs` 里的命令包装引用它）。
+
+**修法**：调 `check_baseline` 之前先把磁盘上的 W-file 录成树（复用 `rebuild_baseline`
+那套 `TempIndex`，全程不碰真实 index / HEAD / 磁盘），与基线树比：一致则前提成立、
+照常返回；不一致则按 spec §6.8.6 第三行返回 `NotChecked`，并说明这通常不是问题。
+
+**反向证据**：`the_manual_health_check_still_catches_a_baseline_whose_rev_is_stale`
+—— 只有前一条的话，「永远返回 `NotChecked`」也能满足它，那等于把 §6.8 整条检查删掉。
+这条造的是它真正要抓的形态：磁盘与基线树**一致**（前提成立），但 trailer 自称 r1
+而内容其实是 r2 的 → 必须 `Lying`。fixture 用裸 git 管道推进基线并**手写** trailer
+文本，不走 `svn_baseline::format_trailer`（fixture 不能用被测对象搭）。
+
+### 这一轮之后修正的一处旧说法
+
+第一轮 NB-4 的处置写的是「已在进入回退区之前再判一次 `.git` 不存在」，当时把它当成
+问题已解决。AR-1 证明那只是把窗口变窄，没有消除——**判断与创建是两次系统调用**
+这一点没变。现在换成原子占有才算真正关上。旧条目保留，因为它记录了「这道判定必须
+留在回退区**之外**」那个仍然成立的位置约束。
+
+### 复核后的数字
+
+`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓（零告警）、
+`cargo test -j 2` **412 passed / 0 failed / 33 个二进制**（= 404 + 本轮新增 8）。
+前端未改动，`src/**` 与 `tests/vitest/**` 零 diff。

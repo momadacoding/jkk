@@ -8,7 +8,10 @@
 mod svn_fixtures;
 
 use app_lib::engine::svn_cli::run_svn;
-use app_lib::engine::svn_xml::{parse_external_roots, parse_info, parse_node_revs};
+use app_lib::engine::svn_xml::{
+    parse_diff_summary, parse_external_roots, parse_externals_props, parse_info, parse_node_revs,
+    parse_status_entries,
+};
 use svn_fixtures::svn_repo_with_cross_repo_nested_external;
 
 /// 真实 `svn status -v --xml` 的形态：属性跨行 + CRLF + 内层 <commit>。
@@ -274,4 +277,281 @@ fn info_distinguishes_repository_root_from_working_copy_url() {
     // 只碰了别的工作副本的那次提交。
     let e = &parse_info(INFO_XML).unwrap()[0];
     assert_ne!(e.url, e.repos_root);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1b Task 2：status / externals / diff --summarize 三个解析器
+//
+// 下面四个常量都是 2026-09-14 从**真实 svn 输出**逐字抄来的（临时 fixture，跑完
+// 即删）。属性逐行排列、markup 用 CRLF、属性值里保留仓库里存的 LF——手写理想 XML
+// 测不出这些形态（`AGENTS.md` §13 rubric #9）。
+// ---------------------------------------------------------------------------
+
+/// `svn status --no-ignore --ignore-externals --xml -- Code@` 的真实输出。
+///
+/// 三个脏状态各一条，外加 external 标记条目——**带了 `--ignore-externals` 它们
+/// 照样在**（见 `assert_externals_were_ignored` 的实测表）。
+const STATUS_DIRTY_XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
+<status>\r\n\
+<target\r\n   path=\"Code\">\r\n\
+<entry\r\n   path=\"Code\\A.cs\">\r\n\
+<wc-status\r\n   item=\"modified\"\r\n   revision=\"2\"\r\n   props=\"none\">\r\n\
+<commit\r\n   revision=\"1\">\r\n\
+<author>someone</author>\r\n\
+</commit>\r\n\
+</wc-status>\r\n\
+</entry>\r\n\
+<entry\r\n   path=\"Code\\Added.cs\">\r\n\
+<wc-status\r\n   item=\"added\"\r\n   revision=\"-1\"\r\n   props=\"none\">\r\n\
+</wc-status>\r\n\
+</entry>\r\n\
+<entry\r\n   path=\"Code\\New.cs\">\r\n\
+<wc-status\r\n   item=\"unversioned\"\r\n   props=\"none\">\r\n\
+</wc-status>\r\n\
+</entry>\r\n\
+<entry\r\n   path=\"Code\\follow\">\r\n\
+<wc-status\r\n   item=\"external\"\r\n   props=\"none\">\r\n\
+</wc-status>\r\n\
+</entry>\r\n\
+<entry\r\n   path=\"Code\\pinA\">\r\n\
+<wc-status\r\n   item=\"external\"\r\n   props=\"none\">\r\n\
+</wc-status>\r\n\
+</entry>\r\n\
+</target>\r\n\
+</status>\r\n";
+
+/// 只有属性被本地改过、内容没动的节点。文本版 status 显示为第二列的 `M`。
+const STATUS_PROPS_ONLY_XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
+<status>\r\n\
+<target\r\n   path=\"Code\">\r\n\
+<entry\r\n   path=\"Code\\A.cs\">\r\n\
+<wc-status\r\n   item=\"normal\"\r\n   revision=\"1\"\r\n   props=\"modified\">\r\n\
+<commit\r\n   revision=\"1\">\r\n\
+<author>someone</author>\r\n\
+</commit>\r\n\
+</wc-status>\r\n\
+</entry>\r\n\
+</target>\r\n\
+</status>\r\n";
+
+/// `svn propget svn:externals -R --xml` 的真实输出，五种钉死写法。
+///
+/// `<target path>` 是**绝对路径 + 正斜杠**，与 status 的相对 + 反斜杠完全不同形状
+/// ——同一个 CLI 两种写法（实测 E7）。属性值里的换行是仓库里存的 LF。
+const EXTERNALS_XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
+<properties>\r\n\
+<target\r\n   path=\"C:/Users/x/AppData/Local/Temp/probe/wc/Code\">\r\n\
+<property\r\n   name=\"svn:externals\">^/lib follow\n\
+-r1 ^/lib pinA\n\
+-r 1 ^/lib pinB\n\
+^/lib@1 pinC\n\
+pinD -r1 ^/lib\n\
+</property>\r\n\
+</target>\r\n\
+</properties>\r\n";
+
+/// `svn diff --old=URL/Code@1 --new=Code --summarize --xml` 的真实输出。
+///
+/// ⚠️ **注意前两条与第三条的属性顺序不同**（`kind,item,props` 对 `item,props,kind`）
+/// ——这是 svn 真实输出里就有的，原样保留。任何按顺序取值的写法都会错。
+const DIFF_SUMMARY_XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
+<diff>\r\n\
+<paths>\r\n\
+<path\r\n   kind=\"file\"\r\n   item=\"modified\"\r\n   props=\"none\">file:///C:/repo/Code/A.cs</path>\r\n\
+<path\r\n   kind=\"file\"\r\n   item=\"added\"\r\n   props=\"none\">file:///C:/repo/Code/Added.cs</path>\r\n\
+<path\r\n   item=\"none\"\r\n   props=\"modified\"\r\n   kind=\"dir\">file:///C:/repo/Code</path>\r\n\
+</paths>\r\n\
+</diff>\r\n";
+
+#[test]
+fn status_entries_come_back_with_forward_slashes() {
+    // 2026-09-14 实测：svn status --xml 的 path 用**反斜杠**，而白名单、
+    // git ls-files、期望集合全是正斜杠。不归一的话 P1 的比对永远对不上。
+    let got = parse_status_entries(STATUS_DIRTY_XML).unwrap();
+    let paths: Vec<&str> = got.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec![
+            "Code/A.cs",
+            "Code/Added.cs",
+            "Code/New.cs",
+            "Code/follow",
+            "Code/pinA",
+        ]
+    );
+    assert!(
+        !paths.iter().any(|p| p.contains('\\')),
+        "还有反斜杠漏出来：{paths:?}"
+    );
+}
+
+#[test]
+fn status_entries_report_each_dirty_item_verbatim() {
+    let got = parse_status_entries(STATUS_DIRTY_XML).unwrap();
+    let items: Vec<(&str, &str)> = got
+        .iter()
+        .map(|e| (e.path.as_str(), e.item.as_str()))
+        .collect();
+    assert_eq!(items[0], ("Code/A.cs", "modified"));
+    assert_eq!(items[1], ("Code/Added.cs", "added"));
+    assert_eq!(items[2], ("Code/New.cs", "unversioned"));
+}
+
+#[test]
+fn status_entries_keep_external_markers_because_they_are_not_dirt() {
+    // ⚠️ 这条是给 P1 的警告，不是给解析器的。`item="external"` 的条目**即使带了
+    // `--ignore-externals` 也照样出现**（2026-09-14 实测，五条 external 全在）。
+    // 本设计的核心场景恰恰是「代码就在 external 里」，所以 P1 若把「status 有
+    // 输出」等同于「工作副本脏」，向导在目标仓库上**永远过不去**。
+    //
+    // 解析层原样给出、由 P1 显式剔除，而不是在这里偷偷过滤：偷偷过滤会连
+    // 「external 根自己被 svn add 了」这种真脏也一起吞掉。
+    let got = parse_status_entries(STATUS_DIRTY_XML).unwrap();
+    let ext: Vec<&str> = got
+        .iter()
+        .filter(|e| e.item == "external")
+        .map(|e| e.path.as_str())
+        .collect();
+    assert_eq!(ext, vec!["Code/follow", "Code/pinA"]);
+}
+
+#[test]
+fn status_entries_carry_props_so_a_property_only_change_is_visible() {
+    // 2026-09-14 实测：只改属性不改内容的节点是 item="normal" + props="modified"
+    // （文本版显示成第二列的 M）。只看 item 的话它读起来是「干净」，而工作副本
+    // 确实脏着——P1 会放行，基线录下去就带着一处未提交的属性改动。
+    let got = parse_status_entries(STATUS_PROPS_ONLY_XML).unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].item, "normal", "内容确实没动");
+    assert_eq!(got[0].props, "modified", "脏在属性上");
+}
+
+#[test]
+fn a_clean_status_yields_no_entries() {
+    // 干净工作副本上不带 -v 的 status 只有 <target>，没有 <entry>。
+    // 这里**必须返回空列表而不是报错**——和 parse_node_revs 的空集守卫相反：
+    // 那边空集是「输入本身就不对」，这边空集是「工作副本是干净的」，是好消息。
+    let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
+<status>\r\n\
+<target\r\n   path=\"Code\">\r\n\
+</target>\r\n\
+</status>\r\n";
+    assert!(parse_status_entries(xml).unwrap().is_empty());
+}
+
+#[test]
+fn a_status_entry_without_wc_status_is_a_loud_error() {
+    // 悄悄跳过等于「这个节点不脏」，而 P1 的全部价值就在于没漏。
+    // 最现实的触发方式是喂错输入——`svn info --xml` 的 <entry> 也叫 entry。
+    let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
+<status>\r\n\
+<target\r\n   path=\"Code\">\r\n\
+<entry\r\n   path=\"Code\\A.cs\">\r\n\
+</entry>\r\n\
+</target>\r\n\
+</status>\r\n";
+    let err = parse_status_entries(xml).expect_err("缺 wc-status 必须报错");
+    assert_eq!(err.code, "svn_xml");
+}
+
+#[test]
+fn externals_props_keep_the_raw_text_verbatim() {
+    // 判定钉没钉住是 svn_externals 的事，这里只负责原样取出来——五行写法的字段
+    // 顺序不同（新格式 URL 在前、旧格式本地路径在前），解析层一旦试图分列就会分错。
+    let got = parse_externals_props(EXTERNALS_XML).unwrap();
+    assert_eq!(got.len(), 1);
+    // 绝对路径 + 正斜杠，**不归一**，原样保留（与 status 的反斜杠形状不同，实测 E7）
+    assert_eq!(got[0].target, "C:/Users/x/AppData/Local/Temp/probe/wc/Code");
+    let lines: Vec<&str> = got[0].raw.lines().collect();
+    assert_eq!(lines.len(), 5, "实际：{:?}", got[0].raw);
+    assert_eq!(lines[0], "^/lib follow");
+    assert_eq!(
+        lines[4], "pinD -r1 ^/lib",
+        "旧格式的本地路径在前，不能被重排"
+    );
+    assert!(got[0].raw.ends_with('\n'), "尾随换行也不许 trim");
+}
+
+#[test]
+fn externals_props_ignore_other_property_names() {
+    // 合成输入：真实的 `propget svn:externals` 只会回这一个属性，但调用方哪天
+    // 改成 `proplist -v --xml` 就会混进别的属性，那时候把 svn:ignore 当 externals
+    // 解析会凭空判出一堆「没钉死的 external」。守卫写在这里，不指望调用方记得。
+    let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
+<properties>\r\n\
+<target\r\n   path=\"C:/wc/lib\">\r\n\
+<property\r\n   name=\"svn:ignore\">nul.txt\n</property>\r\n\
+<property\r\n   name=\"svn:externals\">^/lib pinned\n</property>\r\n\
+</target>\r\n\
+</properties>\r\n";
+    let got = parse_externals_props(xml).unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].raw.trim_end(), "^/lib pinned");
+}
+
+#[test]
+fn no_externals_anywhere_is_an_empty_list_not_an_error() {
+    // 真实形状：一个没有任何 externals 的子树回的是空的 <properties>，不是报错。
+    let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n<properties>\r\n</properties>\r\n";
+    assert!(parse_externals_props(xml).unwrap().is_empty());
+}
+
+#[test]
+fn externals_props_survive_real_svn_output() {
+    // 端到端：真的跑一次 svn，别让上面那些常量变成「只测自己抄得对不对」。
+    let fx = svn_repo_with_cross_repo_nested_external();
+    let xml = run_svn(
+        &fx.wc_str(),
+        &["propget", "svn:externals", "-R", "--xml", "--", "Code@"],
+    )
+    .unwrap();
+    let got = parse_externals_props(&xml).unwrap();
+    assert_eq!(got.len(), 1, "实际：{got:?}");
+    assert!(
+        got[0].target.replace('\\', "/").ends_with("/Code"),
+        "target 应当是属性所在目录的绝对路径，实际 {}",
+        got[0].target
+    );
+    assert!(got[0].raw.contains("Vendor"), "实际 raw={:?}", got[0].raw);
+}
+
+#[test]
+fn diff_summary_separates_content_from_property_changes() {
+    // spec §6.8.4 讲的是文本版 --summarize 靠**列位置**区分内容变更与属性变更，
+    // 且会混进目录条目。2026-09-14 实测 --xml 被接受，且 item / props / kind
+    // 是三个独立属性——本期一律用 --xml，那个解析坑从结构上消失。
+    let got = parse_diff_summary(DIFF_SUMMARY_XML).unwrap();
+    assert_eq!(got.len(), 3);
+    assert_eq!(got[0].item, "modified");
+    assert_eq!(got[0].props, "none");
+    assert_eq!(got[0].kind, "file");
+    assert_eq!(got[1].item, "added");
+    // 目录的纯属性变更：内容没动、属性动了、kind 是 dir——三个事实各有归属
+    assert_eq!(got[2].item, "none");
+    assert_eq!(got[2].props, "modified");
+    assert_eq!(got[2].kind, "dir");
+}
+
+#[test]
+fn diff_summary_does_not_depend_on_attribute_order() {
+    // 实测发现：同一次输出里，前两条是 kind,item,props，第三条是 item,props,kind。
+    // svn 不保证属性顺序，按序取值会静默错位——第三条会被读成 item="dir"。
+    let got = parse_diff_summary(DIFF_SUMMARY_XML).unwrap();
+    assert_ne!(got[2].item, "dir", "按属性顺序取值了");
+    assert_eq!(got[2].kind, "dir");
+}
+
+#[test]
+fn diff_summary_keeps_the_path_as_a_url() {
+    // 剥 URL 前缀是 §6.8.4 调用方的事——解析层只说 XML 写了什么。
+    let got = parse_diff_summary(DIFF_SUMMARY_XML).unwrap();
+    assert!(got[0].path.starts_with("file:///"), "实际 {}", got[0].path);
+    assert!(got[0].path.ends_with("/Code/A.cs"));
+}
+
+#[test]
+fn an_empty_diff_is_an_empty_list() {
+    let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
+<diff>\r\n<paths>\r\n</paths>\r\n</diff>\r\n";
+    assert!(parse_diff_summary(xml).unwrap().is_empty());
 }

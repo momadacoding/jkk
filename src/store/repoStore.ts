@@ -3,7 +3,14 @@ import { listen } from '@tauri-apps/api/event'
 import { useCallback, useEffect, useState } from 'react'
 import type { CommitNode, DiffData, GraphData, PullRequest, RefPointer, RepoInfo, StashEntry, StatusData, UpstreamInfo, Worktree } from '../engine/types'
 import { ALL_CAPABILITIES, type Capabilities } from '../engine/capabilities'
-import { toErrorMessage } from '../engine/errors'
+import { toErrorCode, toErrorMessage } from '../engine/errors'
+import type {
+  Health,
+  InitReport,
+  PinnedExternal,
+  Preflight,
+  RebuildReport,
+} from '../engine/svnInit'
 import { samePath } from '../engine/path'
 import { nextSelection } from '../engine/selection'
 
@@ -35,6 +42,21 @@ export interface RepoState {
   selectedId: string | null
   loading: boolean
   error: string | null
+  /**
+   * 上一次失败的错误码；`null` 表示没失败、或那个异常不带 code。
+   *
+   * 与 `error` 分开存：`error` 是给人看的消息，这个是给**代码**分流用的。
+   * 目前唯一的消费方是 `svn_not_initialized` —— 「有 `.svn` 无 `.git`」不是错误，
+   * 是一个还没走的流程（spec §6.1），该显示初始化向导而不是一条红色横幅。
+   */
+  errorCode: string | null
+  /**
+   * 被 `-r` 钉死、且与白名单有交集的 external。非空即处于 pinned 模式。
+   *
+   * spec §6.5.3 第 3 条要求这条残余风险**UI 常驻说明**——只在初始化向导里显示
+   * 一次不算常驻，用户下次打开这个仓库就看不到了。所以它进 store，每次打开都读。
+   */
+  pinned: PinnedExternal[]
 }
 
 const initialState: RepoState = {
@@ -53,6 +75,8 @@ const initialState: RepoState = {
   selectedId: null,
   loading: false,
   error: null,
+  errorCode: null,
+  pinned: [],
 }
 
 /**
@@ -72,11 +96,62 @@ async function readCapabilities(path: string): Promise<Capabilities> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// SVN 混合仓库（Phase 1b）
+//
+// 这四个是**薄壳**：不吞错误、不重试、不做判断。三个会改磁盘的命令失败时必须
+// 原样抛出去，让向导留在原地把错误显示给用户——`readCapabilities` 那种「失败就
+// 退回默认值」的写法在这里是灾难性的（用户会以为建库成功了）。
+//
+// ⚠️ 参数名是 `snake_case` → `camelCase` 转换后的形态，没有编译期检查
+// （AGENTS.md §7.3）。Rust 侧 `path` / `whitelist` / `extensions` 三个都是单词，
+// 转换后不变，但别因此以为这层不存在。
+// ---------------------------------------------------------------------------
+
+/** 只跑 P1–P4，什么都不创建。 */
+export function svnPreflightCheck(path: string, whitelist: string[]): Promise<Preflight> {
+  return invoke<Preflight>('svn_preflight_check', { path, whitelist })
+}
+
+/** 走完初始化向导。**会在工作副本里创建 `.git`**；任何一步失败后端会自己删干净。 */
+export function svnInitHybrid(
+  path: string,
+  whitelist: string[],
+  extensions: string[],
+): Promise<InitReport> {
+  return invoke<InitReport>('svn_init_hybrid', { path, whitelist, extensions })
+}
+
+/** 重建基线。**会移动基线指针**；不动 HEAD、不动索引、不动磁盘。 */
+export function svnRebuildBaseline(path: string): Promise<RebuildReport> {
+  return invoke<RebuildReport>('svn_rebuild_baseline', { path })
+}
+
+/**
+ * 体检当前基线。
+ *
+ * 三种结果都从 `Promise` 正常返回，**只有命令本身没跑起来才 reject**：
+ * 「没能验证」与「验证不通过」必须分开（spec §6.8.6）。
+ */
+export function svnCheckBaseline(path: string): Promise<Health> {
+  return invoke<Health>('svn_check_baseline', { path })
+}
+
+/**
+ * 当前仓库里被钉死、且与白名单有交集的 external。非混合仓库返回空列表。
+ *
+ * ⚠️ 后端要跑 `svn propget -R`，在几万文件的工作副本上不便宜。
+ * 调用方**不要 await**。
+ */
+export function svnPinnedExternals(path: string): Promise<PinnedExternal[]> {
+  return invoke<PinnedExternal[]>('svn_pinned_externals', { path })
+}
+
 export function useRepoStore() {
   const [state, setState] = useState<RepoState>(initialState)
 
   const openRepo = useCallback(async (path: string) => {
-    setState((s) => ({ ...s, loading: true, error: null }))
+    setState((s) => ({ ...s, loading: true, error: null, errorCode: null }))
     try {
       const info = await invoke<RepoInfo>('open_repo', { path })
       // 每次打开都重新读，且**必然写回**：上一个仓库是 SVN 时留下的能力集合
@@ -102,8 +177,16 @@ export function useRepoStore() {
       // 不 await：这一步要走网络（gh 实测一两秒），让它拖住打开仓库的收尾没有意义。
       // 不支持 PR 的后端连这次 gh 调用都省掉——界面上没有任何地方会用到结果。
       if (caps.pullRequests) void refreshPullRequests(path)
+      // 同样不 await：后端要跑 `svn propget -R`，在几万文件的工作副本上是秒级。
+      // 常驻说明晚一两秒出现无所谓，但不能让打开仓库卡在这儿（spec §6.5.3）。
+      void refreshPinned(path)
     } catch (err) {
-      setState((s) => ({ ...s, loading: false, error: toErrorMessage(err) }))
+      setState((s) => ({
+        ...s,
+        loading: false,
+        error: toErrorMessage(err),
+        errorCode: toErrorCode(err),
+      }))
     }
   }, [])
 
@@ -160,6 +243,23 @@ export function useRepoStore() {
   }
 
   /**
+   * 重新读取被钉死的 external（spec §6.5.3 的常驻说明）。
+   *
+   * 失败只写 console 不上报，理由与 `refreshPullRequests` 同：顶部错误横幅是留给
+   * git 操作的。**必须写回空数组**——上一个仓库处于 pinned 模式时留下的清单，
+   * 会挂在下一个完全无关的仓库上。
+   */
+  const refreshPinned = async (path: string) => {
+    try {
+      const pinned = await svnPinnedExternals(path)
+      setState((s) => ({ ...s, pinned }))
+    } catch (err) {
+      console.warn('读取 pinned external 失败，不显示 pinned 模式说明：', err)
+      setState((s) => ({ ...s, pinned: [] }))
+    }
+  }
+
+  /**
    * 重新读取 open PR 列表。
    *
    * **只在打开仓库和用户主动 fetch/pull/push 之后调用**，绝不能挂进
@@ -187,11 +287,15 @@ export function useRepoStore() {
     setState((s) => ({ ...s, selectedId: id }))
   }
 
-  const clearError = useCallback(() => setState((s) => ({ ...s, error: null })), [])
+  const clearError = useCallback(
+    () => setState((s) => ({ ...s, error: null, errorCode: null })),
+    [],
+  )
 
   /** 把一次失败呈现到顶部错误横幅。 */
   const reportError = useCallback(
-    (err: unknown) => setState((s) => ({ ...s, error: toErrorMessage(err) })),
+    (err: unknown) =>
+      setState((s) => ({ ...s, error: toErrorMessage(err), errorCode: toErrorCode(err) })),
     [],
   )
 

@@ -228,6 +228,182 @@ pub fn assert_externals_were_ignored(doc: &Document) -> Result<()> {
     Ok(())
 }
 
+/// `svn status --xml` 里的一条 entry。
+///
+/// # 归一策略：**只有这一个解析器归一路径**
+///
+/// 本模块三个新解析器的路径形状互不相同（2026-09-14 实测）：
+///
+/// | 解析器 | 源 XML 里的形状 | 是否归一 |
+/// |---|---|---|
+/// | [`parse_status_entries`] | 相对 target + **反斜杠**（`Code\A.cs`） | **归一**成正斜杠 |
+/// | [`parse_externals_props`] | **绝对路径 + 正斜杠**（`C:/…/wc/Code`） | 不归一 |
+/// | [`parse_diff_summary`] | **URL**（`file:///…/repo/Code/A.cs`） | 不归一 |
+///
+/// 同一个 CLI 三种写法，不是笔误。解析层的规矩是「只说 XML 写了什么」，归一属于
+/// 知道上下文的调用方（[`parse_external_roots`] 立的规矩）；status 是唯一例外，
+/// 因为「相对 target 的反斜杠」没有任何调用方会想要原样保留——白名单、
+/// `git ls-files`、期望集合全是正斜杠。
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatusEntry {
+    /// 相对 target 的路径，已归一成**正斜杠**。
+    pub path: String,
+    /// `<wc-status item>` 原样：`modified` / `added` / `unversioned` /
+    /// `deleted` / `normal` / `external` …
+    pub item: String,
+    /// `<wc-status props>` 原样：`none` / `modified`。
+    ///
+    /// **单独留一个字段是必须的**：只改属性、没改内容的节点是
+    /// `item="normal" props="modified"`（2026-09-14 实测，文本版显示成第二列的
+    /// `M`）。丢掉这个字段，P1 看到的就是一个「normal」的干净节点，于是带着
+    /// 一处未提交的属性改动去录基线。
+    pub props: String,
+    /// `<wc-status wc-locked="true">`：该节点上有一把**未释放的工作副本写锁**，
+    /// 说明上一次 svn 操作没跑完（文本版 status 的第三列 `L`）。
+    ///
+    /// 与 `item == "incomplete"` 是**两件不同的事**，P3 两个都要查
+    /// （2026-09-14 实测）：`svn cleanup` 清掉这把锁，却**不会**清掉
+    /// `incomplete`。只查锁的话，用户跑完 cleanup 就能带着一棵没更新完的树
+    /// 通过校验。
+    pub wc_locked: bool,
+}
+
+/// 解析 `svn status --xml`，列出每一条 entry。
+///
+/// # ⚠️ `item="external"` 不是脏状态
+///
+/// external 标记条目**即使带了 `--ignore-externals` 也照样出现**（实测见
+/// [`assert_externals_were_ignored`] 的表）。本设计的核心场景恰恰是「代码就在
+/// external 里」，所以把「有输出」等同于「工作副本脏」的调用方，在目标仓库上
+/// **永远过不去**。P1 必须显式剔除 `item == "external"` 的条目。
+///
+/// 这里不偷偷过滤：偷偷过滤会连「external 根自己被 `svn add` 了」这种真脏
+/// 一起吞掉，而那是调用方看不见的。
+///
+/// # 空列表是好消息，不是错误
+///
+/// 与 [`parse_node_revs`] 的空集守卫相反。那边空集意味着输入本身就不对
+/// （漏了 `-v`），这边空集意味着工作副本是干净的——P1 想要的正是它。
+///
+/// 结果按 path 升序排，让报错信息可复现。
+pub fn parse_status_entries(xml: &str) -> Result<Vec<StatusEntry>> {
+    let doc = parse_doc(xml)?;
+    let mut out = Vec::new();
+    for entry in doc.descendants().filter(|n| n.has_tag_name("entry")) {
+        let path = norm_sep(&attr(&entry, "path")?);
+        // 缺 <wc-status> 一律报错，不跳过。悄悄跳过等于宣称「这个节点不脏」，
+        // 而 P1 的全部价值就在于没漏。最现实的触发方式是喂错输入——
+        // `svn info --xml` 的 <entry> 也叫 entry，但底下没有 wc-status。
+        let st = entry
+            .children()
+            .find(|n| n.has_tag_name("wc-status"))
+            .ok_or_else(|| {
+                GitError::new(
+                    "svn_xml",
+                    format!("svn status 的 entry `{path}` 底下没有 <wc-status>"),
+                )
+            })?;
+        out.push(StatusEntry {
+            path,
+            item: attr(&st, "item")?,
+            props: attr(&st, "props")?,
+            // 没锁时这个属性根本不出现，所以这里只能用「有且等于 true」判定，
+            // 不能像 item / props 那样要求它必须存在。
+            wc_locked: st.attribute("wc-locked") == Some("true"),
+        });
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+/// `svn propget svn:externals -R --xml` 里的一处属性。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExternalsProp {
+    /// 属性所在目录的**绝对路径 + 正斜杠**，原样保留（不归一，理由见
+    /// [`StatusEntry`] 的那张表）。调用方要拿它和仓库根求相对。
+    pub target: String,
+    /// 属性值原文，**一个字符都不动**。
+    ///
+    /// 不 trim、不按行 trim、不重排：`svn:externals` 有新旧两种格式，新格式是
+    /// `URL 本地路径`、旧格式是 `本地路径 URL`，两者靠空格分列且可以混在同一个
+    /// 属性里（实测五种写法共存）。解析层一旦试图分列就会把旧格式分反。
+    /// 判定钉没钉住是 `engine::svn_externals` 的事。
+    pub raw: String,
+}
+
+/// 解析 `svn propget svn:externals -R --xml`。
+///
+/// 只取 `name="svn:externals"` 的 property。真实的 `propget <属性名>` 只会回这
+/// 一个，但调用方哪天改成 `proplist -v --xml` 就会混进 `svn:ignore` 之类——
+/// 那时候把它们当 externals 解析会凭空判出一堆「没钉死的 external」。
+///
+/// 没有任何 externals 时 svn 回一个空的 `<properties>`（实测），这里返回空列表。
+pub fn parse_externals_props(xml: &str) -> Result<Vec<ExternalsProp>> {
+    let doc = parse_doc(xml)?;
+    let mut out = Vec::new();
+    for target in doc.descendants().filter(|n| n.has_tag_name("target")) {
+        let path = attr(&target, "path")?;
+        for prop in target
+            .children()
+            .filter(|n| n.has_tag_name("property"))
+            .filter(|n| n.attribute("name") == Some("svn:externals"))
+        {
+            out.push(ExternalsProp {
+                target: path.clone(),
+                // 属性被设成空串时没有文本子节点。空串是「这里没挂 external」，
+                // 是合法状态，不报错。
+                raw: prop.text().unwrap_or("").to_string(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// `svn diff --summarize --xml` 的一条。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiffEntry {
+    /// 仍然是 **URL**，剥前缀是调用方的事（spec §6.8.4）。
+    pub path: String,
+    /// 内容变更：`modified` / `added` / `deleted` / `none`。
+    pub item: String,
+    /// 属性变更：`modified` / `none`。
+    pub props: String,
+    /// `file` / `dir`。目录条目会混在结果里，调用方按需过滤。
+    pub kind: String,
+}
+
+/// 解析 `svn diff --summarize --xml`。
+///
+/// # 为什么用 `--xml`
+///
+/// spec §6.8.4 用一整节讲文本版 `--summarize` 的解析坑：内容变更与属性变更靠
+/// **列位置**区分，且输出里混着目录条目。2026-09-14 实测 `--summarize` 接受
+/// `--xml`，`item` / `props` / `kind` 是三个独立属性，那个坑从结构上消失。
+///
+/// # ⚠️ 属性顺序不固定
+///
+/// 同一次输出里实测出现过两种顺序（`kind,item,props` 与 `item,props,kind`）。
+/// 必须按名字取，任何按序取值的写法都会静默错位。
+///
+/// # 缺字段填空串而不是报错
+///
+/// 这里和 [`parse_info`] 的「缺字段一律报错」相反，因为**空串在下游是安全方向**：
+/// 体检判「没有差异」的条件是 `item == "none" && props == "none"`，空串两个都不
+/// 等于，于是缺字段的条目被当成「有差异」——保守地报出来，而不是悄悄放行。
+pub fn parse_diff_summary(xml: &str) -> Result<Vec<DiffEntry>> {
+    let doc = parse_doc(xml)?;
+    let mut out = Vec::new();
+    for p in doc.descendants().filter(|n| n.has_tag_name("path")) {
+        out.push(DiffEntry {
+            path: p.text().unwrap_or("").to_string(),
+            item: p.attribute("item").unwrap_or("").to_string(),
+            props: p.attribute("props").unwrap_or("").to_string(),
+            kind: p.attribute("kind").unwrap_or("").to_string(),
+        });
+    }
+    Ok(out)
+}
+
 /// svn 在 Windows 上返回反斜杠，比较路径前统一成正斜杠。
 fn norm_sep(p: &str) -> String {
     p.replace('\\', "/")

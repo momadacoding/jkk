@@ -10,7 +10,14 @@ import { CommitDetailView } from './CommitDetailView'
 import { LocalChangesView } from './LocalChangesView'
 import { Toolbar } from './Toolbar'
 import { StashView } from './StashView'
-import { useRepoStore, useRepoEffects } from '../store/repoStore'
+import {
+  useRepoStore,
+  useRepoEffects,
+  svnInitHybrid,
+  svnPreflightCheck,
+} from '../store/repoStore'
+import SvnInitWizard from './SvnInitWizard'
+import { describePinned } from '../engine/svnInit'
 import { samePath } from '../engine/path'
 import { visibleSections } from '../engine/capabilities'
 import { askConfirm } from '../engine/confirm'
@@ -482,9 +489,41 @@ export function RepoTab({
 
   if (state.loading && state.commits.length === 0) return <div style={{ padding: 16 }}>Loading...</div>
 
+  // 「有 `.svn` 无 `.git`」不是错误，是一个还没走的流程（spec §6.1）。
+  // 显示成一条红色横幅只会让用户以为仓库坏了——这里直接给他初始化向导。
+  // ⚠️ 这里用 `repoPath` 而不是 `state.path`：后者只在 `open_repo` **成功**时才写入，
+  // 而走到这条分支恰恰是因为它失败了。
+  if (state.errorCode === 'svn_not_initialized') {
+    return (
+      <div className="repo-tab">
+        <SvnInitWizard
+          repoPath={repoPath}
+          onCancel={clearError}
+          // 建完**不要**立刻重开：`openRepo` 的第一条语句同步清掉 errorCode，
+          // 上面那个条件立刻为假、向导被卸载，完成页一帧都画不出来。
+          // 等用户在完成页看完体检结果与 pinned 说明、点「关闭」再重开。
+          onFinish={() => void openRepo(repoPath)}
+          onPreflight={(whitelist) => svnPreflightCheck(repoPath, whitelist)}
+          onInit={(whitelist, extensions) => svnInitHybrid(repoPath, whitelist, extensions)}
+        />
+      </div>
+    )
+  }
+
+  // pinned 模式的残余风险，spec §6.5.3 第 3 条要求**常驻说明**：
+  // 别的工具在项目根跑递归 update 会把这些目录退回被钉住的 revision，
+  // 而工作副本看起来是干净的。只在向导里显示一次不算常驻。
+  const pinnedNotice = describePinned(state.pinned)
+
   return (
     <div className="repo-tab">
       {repoState !== 'normal' && <div className="banner-state">{repoState} in progress</div>}
+      {pinnedNotice && (
+        <div className="banner-pinned">
+          <strong>{pinnedNotice.title}</strong>
+          <pre>{pinnedNotice.detail}</pre>
+        </div>
+      )}
       {state.error && (
         <div className="banner-error">
           <span>{state.error}</span>

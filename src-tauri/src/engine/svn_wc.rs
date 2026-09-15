@@ -13,9 +13,21 @@ use crate::error::{GitError, Result};
 #[derive(Debug, Clone, PartialEq)]
 pub struct WcIdentity {
     /// 相对仓库根的路径，**正斜杠**。用它给用户报位置。
+    ///
+    /// ⚠️ 名字里的 `wc_root` 指的是「这条白名单条目/external 根」，**不是** SVN
+    /// 意义上的工作副本根。后者是下面的 [`Self::wc_root_abspath`]。一条落在主
+    /// 工作副本里的白名单（`Code`）两者完全不同：这里是 `Code`，那里是仓库根。
     pub wc_root: String,
     pub url: String,
     pub repos_root: String,
+    /// `svn info` 的 `<wcroot-abspath>`：这个节点**所属工作副本的根**的绝对路径。
+    ///
+    /// P3 要用它。「操作没跑完」的痕迹（`wc-locked` / `item="incomplete"`）落在
+    /// **工作副本根**上，而不是白名单根上——2026-09-14 实测，`svn cleanup` 之后
+    /// 白名单根的 status 一条 entry 都没有，工作副本根却仍写着 `incomplete`。
+    ///
+    /// target 是 URL 形式时没有这一节，故为 `Option`。
+    pub wc_root_abspath: Option<String>,
     /// 仓库身份的唯一可靠依据——URL 会因代理 / 镜像 / `http` 与 `https` 写法
     /// 不同而不可靠（spec §6.2.1）。
     pub uuid: String,
@@ -51,6 +63,7 @@ pub fn enumerate_wcs(repo_root: &str, whitelist: &[String]) -> Result<Vec<WcIden
             url: entry.url,
             repos_root: entry.repos_root,
             uuid: entry.uuid,
+            wc_root_abspath: entry.wc_root,
         });
 
         // 找这棵子树里的嵌套 external 根。**这一次故意不带 `--ignore-externals`**
@@ -95,7 +108,17 @@ pub fn enumerate_wcs(repo_root: &str, whitelist: &[String]) -> Result<Vec<WcIden
 ///
 /// ⚠️ 只用在**命令行参数**上。`wc_root` 这类内部键必须保持原始路径：带上尾缀
 /// 会让去重比对失效，也会原样显示给用户。
-fn peg_safe(target: &str) -> String {
+///
+/// # ⚠️ `svn diff` 的尾随 target 是例外，**不要**用本函数
+///
+/// 上面「无条件追加没有代价」那条结论是在 `info` / `status` 上验的。2026-09-14
+/// 实测 `svn diff --old=… --new=. -- Code@` 报
+/// `E155010: The node '…\wc\Code@' was not found` —— 带 `--old` / `--new` 时
+/// 尾随 target 是**纯路径**，`@` 被当成字面字符，不走 peg 解析。
+///
+/// 于是两边的要求正好相反：`enumerate_wcs` 必须加后缀，`svn_health` 必须不加。
+/// 连带的已知限制是白名单路径含 `@` 时体检没法跑，见 `svn_health::check_baseline`。
+pub fn peg_safe(target: &str) -> String {
     format!("{target}@")
 }
 
