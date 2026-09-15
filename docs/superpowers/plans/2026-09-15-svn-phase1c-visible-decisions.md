@@ -13,7 +13,7 @@
 | Task | 状态 | 产出文件 | 验证结果 |
 |---|---|---|---|
 | 0 开工自检与基线数字 | ✅ 完成 | 本文件 | 改动前基线（本 worktree 内实测）：Rust **412 passed / 0 failed / 33 个二进制**、前端 `pnpm test` **290 passed / 22 files**、`pnpm build` ✓。三项与计划预期一字不差 |
-| 1 `svn_xml` 加 log / ls 解析器 | ⬜ 未开始 | | |
+| 1 `svn_xml` 加 log / ls 解析器 | ✅ 完成 | `src-tauri/src/engine/svn_xml.rs`、`src-tauri/tests/svn_xml.rs` | `cargo test --test svn_xml` **37 passed**（基线 27 + 新增 10）；`cargo fmt --check` ✓、`cargo clippy --all-targets` **0 warning**；两轮变异测试（详见下节） |
 | 2 `svn_log` 拉取编排 | ⬜ 未开始 | | |
 | 3 `svn_log_cache` 缓存与合并 | ⬜ 未开始 | | |
 | 4 `svn_sync` 失同步判定 | ⬜ 未开始 | | |
@@ -166,4 +166,56 @@ Phase 1 的验收语写着「此期只报警 + 提供**重建基线**」。1b �
 
 ## Task 1：`svn_xml` 加 `parse_log` 与 `parse_list`
 
-（待填）
+#### 偏离计划
+
+- **多加了两条计划里没有的测试**：`log_treats_a_missing_author_as_empty`
+  （匿名提交 / revprop 被删时 `<author>` 不出现）与
+  `list_does_not_confuse_the_inner_commit_author_with_an_entry`
+  （每个 `<entry>` 里嵌着 `<commit><author>`，全文 `descendants()` 搜 `name`
+  会捞错东西）。后者是写实现时发现的真实风险——既有的 `parse_info` 正是用
+  `descendants()` 写的，照抄过来就会踩。
+
+- **`parse_list` 用 `list.children()` 而不是 `doc.descendants()`**，与同文件其他
+  解析器的写法不一致。理由见上一条：`<entry>` 是嵌套结构，这里必须限定层级。
+
+#### 计划的错误
+
+- 计划的测试片段里 crate 名写成 `mygitclient_lib`，实际是 **`app_lib`**；
+  fixture 引入写成 `mod common;`，实际是
+  **`#[path = "common/svn_fixtures.rs"] mod svn_fixtures;`**。
+  （已记在 Task 0 一节，Task 2 及以后的片段同样要改。）
+
+- 计划的实现片段里 `parse_log` 直接用 `child_text` 风格的闭包取文本。
+  实际本文件已有的 `child_text` **缺失即报错**，语义正好相反，不能复用——
+  新写了 `joined_child_text`（缺失返回空串）。
+
+#### 计划没写的坑
+
+- **变异测试有一次是「没变红」，这本身是结论。** 计划只安排了「把 `parse_log`
+  改成同行正则」这一个变异（结果 5 条 log 测试全红，断言有牙）。我另外试了
+  把 `joined_child_text` 改回 `child.text()`——**37 条全绿**。
+
+  说明 roxmltree 会把展开实体后的文本仍合并成**单个**文本节点，原先「`.text()`
+  会因为 `&lt;` 被静默截断」的担心在当前输入上**不成立**。拼接版保留下来是防御
+  （防 CDATA、注释穿插这类真会产生多文本节点的形态），但**现有测试挡不住有人
+  把它改回去**。这句话已经写进函数的文档注释——留一条自己都证明不了的断言在
+  注释里，比没有注释更坏。
+
+- **CRLF → LF 的归一确实由 XML 规范保证**，roxmltree 实现了，`<msg>` 里的
+  `\r\n` 读出来就是 `\n`。这条**有**测试守着
+  （`log_decodes_entities_and_normalizes_crlf_inside_the_message`），
+  与上一条的处境不同。
+
+- **`cargo fmt` 会把跨行的 `ok_or_else(|| GitError::new(...))` 压成一行**，
+  手写时按可读性排版会导致 `cargo fmt --check` 失败。先跑 `cargo fmt` 再
+  `--check`，不要手工对齐。
+
+#### 为什么这么改是安全的
+
+- 本 Task **只新增**两个 `pub fn` 和三个结构体，没有改动任何既有函数的签名或
+  行为。既有 27 条 `svn_xml` 测试一条没动，全部照常通过。
+- 两个新函数都是**纯函数**（`&str` → 结构），不发命令、不碰磁盘、不碰 git，
+  失败路径只有「返回 `Err`」一种。
+- `parse_list` 的文档里写明了「空清单不代表成功」这条契约由调用方的
+  `run_svn` 退出码把守——这是 Task 6 最危险的失败形态，提前钉在解析层的注释里，
+  让下一个人在写调用方之前就读到。
