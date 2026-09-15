@@ -16,7 +16,7 @@
 | 1 `svn_xml` 加 log / ls 解析器 | ✅ 完成 | `src-tauri/src/engine/svn_xml.rs`、`src-tauri/tests/svn_xml.rs` | `cargo test --test svn_xml` **37 passed**（基线 27 + 新增 10）；`cargo fmt --check` ✓、`cargo clippy --all-targets` **0 warning**；两轮变异测试（详见下节） |
 | 2 `svn_log` 拉取编排 | ✅ 完成 | `src-tauri/src/engine/svn_log.rs`（新）、`engine/mod.rs`、`tests/svn_log.rs`（新）、`tests/common/svn_fixtures.rs` | `cargo test --test svn_log` **11 passed**；`cargo fmt --check` ✓、`cargo clippy --all-targets` **0 warning**；变异测试（删钳制）3 条变红并报 `E160006` |
 | 3 `svn_log_cache` 缓存与合并 | ⬜ 未开始 | | |
-| 4 `svn_sync` 失同步判定 | ⬜ 未开始 | | |
+| 4 `svn_sync` 失同步判定 | ✅ 完成 | `engine/svn_sync.rs`（新）、`engine/mod.rs`、`tests/svn_sync.rs`（新）、`tests/common/svn_fixtures.rs`（+3 个构造） | `cargo test --test svn_sync` **8 passed**；`cargo fmt --check` ✓、`cargo clippy --all-targets` **0 warning**；实现第一版就撞上 `wc_root` 语义那个坑，被测试当场抓住（详见下节） |
 | 5 基线体检按 WC 分组（§6.6.5 欠账） | ⬜ 未开始 | | |
 | 6 服务器侧清单证伪漏收（NB-2 欠账） | ⬜ 未开始 | | |
 | 7 Tauri 命令层与 `Capabilities.vcs` | ⬜ 未开始 | | |
@@ -274,3 +274,108 @@ Phase 1 的验收语写着「此期只报警 + 提供**重建基线**」。1b �
   的 revision 区间内。不存在「因为钳制而拉到了不该拉的东西」这条路径。
 - `fetch_anchor` 对越界 revision 返回 `None` 而不是 `Err`，是为了让一个坏锚点
   只损失图上一个节点，而不是整条历史。
+
+---
+
+## Task 3：`svn_log_cache` 缓存与合并
+
+#### 偏离计划
+
+- **加了 `TargetLog::new()` 与 `is_fresh()`**。计划让调用方直接构造
+  `TargetLog { covered_min: 0, covered_max: 0, entries: vec![] }`，并在
+  `merge_into` 里判「`covered_max == 0 && entries.is_empty()`」。后半个条件是错的：
+  一个 target 可能先并进若干**条目**再确定区间。判据收窄成 `covered_max == 0`
+  （revision 从 1 起算，0 不是合法值），语义更干净。
+
+- **多写了 7 条计划里没有的测试**：相邻区间可并（`8` 之后拉 `9..10`）、降序区间
+  参数、重复 revision 保留先到的那条、uuid 大小写不敏感、未来版本号作废、
+  缓存文件不存在、覆写既有文件、缓存路径必须在 `.git/` 内。
+
+#### 计划的错误
+
+- 计划的 `write_cache` 片段用 `d.subsec_nanos()` 拼临时文件名。`subsec_nanos`
+  只有纳秒的小数部分（0–999999999，且每秒回绕一次），同一秒内两次写有真实的
+  碰撞概率。改成 `d.as_nanos()`。
+
+#### 计划没写的坑
+
+- **clippy 会拦 `sort_by(|a, b| b.rev.cmp(&a.rev))`**，要求换成
+  `sort_by_key(|e| Reverse(e.rev))`。按 `AGENTS.md` §7.3 处理掉了，没有用
+  `#[allow]` 掩盖。
+
+#### 为什么这么改是安全的（Task 3）
+
+- 本模块**不发任何命令**，只读写一个 `.git/` 内的 JSON。
+- 所有读失败（文件不存在、JSON 坏、版本不认、uuid 不符）都降级成**空缓存**，
+  绝不向上抛错——最坏的后果是「历史要重拉一次」，而不是仓库打不开。
+- 写是原子的（同目录临时文件 + rename），rename 失败时清理临时文件，
+  不会在 `.git/` 里堆出一地长得像合法缓存的垃圾。
+- uuid 不符时**整份作废**：这是唯一一个会产生**错误信息**而不是缺失信息的
+  失败形态（旧仓库的 revision 号在新仓库里指向别的提交），所以宁可多重拉一次。
+
+---
+
+## Task 4：`svn_sync` 失同步判定
+
+#### 偏离计划
+
+- **`node_revs` 的 targets 直接取 `WcIdentity::wc_root`**，没有按计划写的
+  「把白名单根按落在哪个 WC 内分组、取最长前缀匹配」。原因见下面「计划的错误」：
+  `wc_root` 本身就已经是仓库内相对路径形式的记账单位，`enumerate_wcs` 返回的
+  就是白名单条目 ∪ 其下嵌套 external 根，不需要再分组。
+
+- **`read_root_revs` 返回 `Vec<RootRev>` 而不是单个值**，且比对逻辑不在后端。
+  模块注释里写明了理由：后端保持无状态，上次观测值由前端 store 持有。
+
+- **多写了 2 条测试**：`root_revs_changes_when_someone_updates_outside`
+  （第一档的判据要求这个值真的会变，否则分层等于没分）与
+  `a_repo_without_a_baseline_branch_is_a_loud_error`。
+
+#### 计划的错误
+
+- **计划假设 `WcIdentity::wc_root` 是绝对路径。** 实际它是**仓库内相对路径**
+  （实测打印：`"Code"`、`"Code/Vendor"`），而且字段文档明确写着「名字里的
+  `wc_root` 指的是这条白名单条目 / external 根，**不是** SVN 意义上的工作副本根」
+  ——后者是 `wc_root_abspath`。
+
+  我按计划写了个 `relative_to(repo_root, wc.wc_root)` 去换算，结果**恒为 `None`**，
+  于是嵌套 external 从没进过 targets。详见下一节。
+
+- 计划的 fixture 假设同前几个 Task：`svn_repo_initialized_then_*` 一个都不存在，
+  全部要自己造。本 Task 新增了 `svn_cmd`（给测试发外部变更用）、
+  `svn_repo_three_revisions`、`svn_repo_pinned_external_updated_to_head` 三个。
+
+#### 计划没写的坑
+
+- **那个 `wc_root` 的误解造出来的是一个「看起来完全正常」的盲区。** 嵌套
+  external 漏掉之后，白名单根那一次查询照样返回**单值**，于是判定是 `InSync`
+  ——没有任何报错、没有任何异常，正是 §6.6.5 警告的那块「git 管着、SVN 侧没人盯」
+  的区域。
+
+  **计划安排的变异测试（只查第一个 WC）因此不用另做：实现的第一版就是那个变异。**
+  `node_revs_unions_every_working_copy_including_nested_externals` 当场变红，
+  报出 `SyncStatus { baseline_rev: 2, node_revs: [2], verdict: InSync }`。
+  断言有牙，有实据。
+
+- **排查时先去量了 svn 本身**（`AGENTS.md` §6.2）：临时 fixture 上确认
+  `svn update -r1 -- Code/Vendor@` 之后，`svn status -v --xml --ignore-externals
+  -- Code/Vendor@` 确实报 `revision="1"`。svn 侧没问题，才回头查自己的代码。
+  没有这一步很容易误判成「svn 不支持这么用」然后去改测试。
+
+- **`parse_node_revs` 返回 `BTreeSet<i64>`，而本模块对外用 `u64`。** 转换处显式
+  拒绝负数并报 `svn_sync_negative_rev`，不做静默 `as` 截断。
+
+- **`PinnedReset` 的 fixture 比想象中难造**：要先让 external 被**单独** update
+  到 HEAD（这样才能初始化出一个高的 baselineRev），再由测试在项目根跑递归
+  `svn update` 把它拽回 peg。直接造一个「已经被钉住」的仓库是不行的——
+  那种状态下 P2 会拦住初始化，根本走不到失同步判定。
+
+#### 为什么这么改是安全的（Task 4）
+
+- 本模块只发 `svn status` 与 `svn info` 两个**只读**子命令，外加一条
+  `git log -1 --format=%B` 读基线 message。不写任何东西。
+- 没有基线时返回 `Err(svn_no_baseline)` 而不是编一个 0：返回 0 会让「N != 0」把
+  **每一个**仓库都判成失同步，返回 `InSync` 则等于宣称一个不存在的基线是好的。
+- `--ignore-externals` 的作用域是**每个 WC 内部**（挡住更深一层），而不是从项目根
+  覆盖白名单——后者会把白名单整个跳过。这条差别写进了 `node_revs` 的文档。
+- 判定只读不改，任何误判的代价都止于「横幅文案不对」，不会动仓库状态。

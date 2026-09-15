@@ -40,6 +40,17 @@ fn try_svn(dir: &Path, args: &[&str]) -> bool {
         .success()
 }
 
+/// 在某个目录下跑一条 svn 命令，失败即 panic。
+///
+/// 给测试**构造外部变更**用——「有人用 TortoiseSVN 在外面提交 / update 了」
+/// 是本期一大半场景的前提，而那一步按定义发生在本应用之外，只能由测试自己发。
+///
+/// ⚠️ 这不违反本期「零 SVN 写操作」的约束：那条约束的作用域是
+/// `src-tauri/src/`（产品代码），不是测试。
+pub fn svn_cmd(dir: &Path, args: &[&str]) {
+    run(dir, "svn", args);
+}
+
 /// Windows 上 `file://` URL 是 `file:///C:/path`（三斜杠 + 盘符 + 正斜杠）。
 /// 这是已知跨平台坑，不能靠路径拼接碰运气（spec §14.1）。
 pub fn file_url(p: &Path) -> String {
@@ -588,6 +599,122 @@ pub fn svn_repo_mixed_revision() -> SvnFixture {
         "svn",
         &["update", "-r1", "--non-interactive", "--", "Code/A.cs@"],
     );
+    SvnFixture { dir }
+}
+
+/// 三个 revision、工作副本**干净地停在 r3**。
+///
+/// 失同步检测的测试都要从这里起步：先在一个干净仓库上初始化（P1/P2/P3 都得过），
+/// 再由测试自己制造外部变更。直接拿一个已经失同步的 fixture 去初始化是造不出来的
+/// ——向导会在前置校验那一步就把它拦下。
+///
+/// `seed/` 那个工作副本留着不删，测试可以用它扮演「同事的机器」发外部提交。
+pub fn svn_repo_three_revisions() -> SvnFixture {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let url = seed_three_revisions(&root);
+    run(
+        &root,
+        "svn",
+        &["checkout", &url, "wc1", "--non-interactive"],
+    );
+    SvnFixture { dir }
+}
+
+/// 白名单落在一条**被 `-r` 钉死、但已被单独 update 到 HEAD** 的 external 里。
+///
+/// # 这是 spec §6.6.2 点名的那个「具体且常见」的成因
+///
+/// 布局：`Code` 是一条 `-r2 ^/vendor Code` 的 external（钉在 r2），而仓库已经
+/// 走到 r4。fixture 最后把 `Code` **单独** update 到 HEAD，于是：
+///
+/// ```text
+/// nodeRevs(Code) = {4}      ← 可以初始化，baselineRev = 4
+/// externals 定义仍然写着 -r2
+/// ```
+///
+/// 测试接着在**项目根**跑一次递归 `svn update`，SVN 会按 externals 定义把 `Code`
+/// **拽回 r2**。此时 `nodeRevs = {2}`、`baselineRev = 4`，而 2 恰好等于该 external
+/// 的 peg —— 这正是 `PinnedReset` 要认出来的形态。
+///
+/// 认错的代价很具体：`Diverged` 给的引导是「重建基线」（重型，而且会把钉死的
+/// 旧内容录成新基线），`PinnedReset` 给的是一条 `svn update <目录>`（一步到位）。
+pub fn svn_repo_pinned_external_updated_to_head() -> SvnFixture {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    run(&root, "svnadmin", &["create", "repo"]);
+    let url = file_url(&root.join("repo"));
+    run(
+        &root,
+        "svn",
+        &["checkout", &url, "seed", "--non-interactive"],
+    );
+    let seed = root.join("seed");
+
+    // r1：建 vendor/ 与项目根 proj/
+    std::fs::create_dir_all(seed.join("vendor")).unwrap();
+    std::fs::create_dir_all(seed.join("proj")).unwrap();
+    std::fs::write(seed.join("vendor/A.cs"), "v1\n").unwrap();
+    std::fs::write(seed.join("proj/readme.txt"), "p\n").unwrap();
+    run(
+        &seed,
+        "svn",
+        &["add", "vendor", "proj", "--non-interactive"],
+    );
+    run(&seed, "svn", &["commit", "-m", "r1", "--non-interactive"]);
+
+    // r2：vendor 往前走一格 —— 这个 revision 就是后面要钉住的那个 peg
+    std::fs::write(seed.join("vendor/A.cs"), "v2\n").unwrap();
+    run(
+        &seed,
+        "svn",
+        &["commit", "-m", "r2 vendor", "--non-interactive"],
+    );
+
+    // r3：把 external 定义挂到 proj 上，钉死在 r2
+    //
+    // ⚠️ 属性值走 `-F` 文件：命令行传值遇到混合行尾会让 propset 报 E135000
+    // 而属性**静默没设上**，测试会拿到「这个仓库没有 externals」的假绿（1b 实测 E10）。
+    let ext = root.join("externals.txt");
+    std::fs::write(&ext, "-r2 ^/vendor Code\n").unwrap();
+    run(
+        &seed,
+        "svn",
+        &[
+            "propset",
+            "svn:externals",
+            "-F",
+            ext.to_str().unwrap(),
+            "proj",
+            "--non-interactive",
+        ],
+    );
+    run(
+        &seed,
+        "svn",
+        &["commit", "-m", "r3 pin", "--non-interactive"],
+    );
+
+    // r4：vendor 再往前走一格，让「HEAD」与「peg」真的错开
+    run(&seed, "svn", &["update", "--non-interactive"]);
+    std::fs::write(seed.join("vendor/A.cs"), "v4\n").unwrap();
+    run(
+        &seed,
+        "svn",
+        &["commit", "-m", "r4 vendor", "--non-interactive"],
+    );
+
+    // 把 proj 检出成 wc1，此时 external Code 会按定义停在 r2
+    let proj_url = format!("{url}/proj");
+    run(
+        &root,
+        "svn",
+        &["checkout", &proj_url, "wc1", "--non-interactive"],
+    );
+    let wc = root.join("wc1");
+
+    // 有人**单独**把 Code 更到了 HEAD —— 初始化就发生在这个状态下
+    run(&wc, "svn", &["update", "--non-interactive", "--", "Code@"]);
     SvnFixture { dir }
 }
 
