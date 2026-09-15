@@ -1,6 +1,33 @@
 import type { Capabilities } from './capabilities'
 import type { CommitNode } from './types'
 
+/** 「仅本地，不交付」的 trailer（spec §6.7）。判定只认这一条，不新增配置。 */
+export const LOCAL_ONLY_TRAILER = 'Local-Only: true'
+
+/**
+ * 把提交框的三个输入拼成最终的 commit message。
+ *
+ * # trailer 必须**单独成段**
+ *
+ * 前面要空一行，否则 `git interpret-trailers` 不认它是 trailer——而本设计的
+ * 判定（`svnGraph.isLocalOnly`）与将来 Phase 3 的摘除都按 trailer 语义走。
+ * 直接拼在正文末尾的话，标记看起来打上了，实际谁也读不到。
+ *
+ * 描述以空白结尾时要先 trim，否则会拼出三个连续换行，git 自己会把它规整掉，
+ * 但我们存进 message 的与 git 存下来的就不是同一个字符串了。
+ */
+export function buildCommitMessage(
+  subject: string,
+  description: string,
+  localOnly: boolean,
+): string {
+  const parts = [subject.trim()]
+  const body = description.trim()
+  if (body) parts.push(body)
+  if (localOnly) parts.push(LOCAL_ONLY_TRAILER)
+  return parts.join('\n\n')
+}
+
 /** graph 行右键菜单里的一项。 */
 export type CommitAction =
   | 'new-branch'

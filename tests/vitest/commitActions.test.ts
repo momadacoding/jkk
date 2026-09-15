@@ -1,11 +1,38 @@
 import { describe, expect, it } from 'vitest'
 import {
+  buildCommitMessage,
   commitMenu,
   formatCommitInfo,
   planCommitCommand,
   shortHash,
   type CommitAction,
 } from '../../src/engine/commitActions'
+import { isLocalOnly } from '../../src/engine/svnGraph'
+
+describe('buildCommitMessage', () => {
+  it('Local-Only trailer 单独成段', () => {
+    // 不空一行的话 git interpret-trailers 不认它是 trailer —— 标记看起来打上了，
+    // 实际谁也读不到。
+    expect(buildCommitMessage('s', '', true)).toBe('s\n\nLocal-Only: true')
+    expect(buildCommitMessage('s', 'body', true)).toBe('s\n\nbody\n\nLocal-Only: true')
+  })
+
+  it('不勾时不加任何东西', () => {
+    expect(buildCommitMessage('s', 'body', false)).toBe('s\n\nbody')
+    expect(buildCommitMessage('s', '', false)).toBe('s')
+  })
+
+  it('描述以空白结尾时不产生三个连续换行', () => {
+    expect(buildCommitMessage('s', 'body\n\n', true)).toBe('s\n\nbody\n\nLocal-Only: true')
+  })
+
+  it('拼出来的 message 能被 isLocalOnly 读回来', () => {
+    // 写和读是两个模块（commitActions 写、svnGraph 读）。这条把它们钉在一起——
+    // 少了它，两边各自改格式都不会有测试变红，而表现是「勾了但图上没角标」。
+    expect(isLocalOnly(buildCommitMessage('s', 'body', true))).toBe(true)
+    expect(isLocalOnly(buildCommitMessage('s', 'body', false))).toBe(false)
+  })
+})
 import { ALL_CAPABILITIES } from '../../src/engine/capabilities'
 import type { CommitNode } from '../../src/engine/types'
 

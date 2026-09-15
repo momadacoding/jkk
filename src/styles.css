@@ -1713,6 +1713,18 @@ body {
   opacity: 0.9;
 }
 
+/* 「仅本地，不交付」勾选框与它的窗口期警告（spec §6.7、§16）。 */
+.changes-local-only { display: flex; align-items: center; gap: 4px; font-size: 12px; }
+.changes-local-only-warning {
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  background: #4a3d16;
+  color: #f0e2b8;
+  border-radius: 3px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
 /* svn 节点：换配色，让人一眼看出它不是本地提交（点开没有 diff，也不能 checkout）。 */
 .commit-row.svn .commit-hash { color: #d8a657; }
 .commit-row.svn .commit-message { opacity: 0.88; }

@@ -724,6 +724,7 @@ export function RepoTab({
                 onUnstage={(paths) => runAndRefresh('unstage', { paths }, async () => { await refreshStatus(state.path!); await refreshDiff(state.path!, 'workdir') })}
                 onDiscard={(paths, staged) => void handleDiscard(paths, staged)}
                 onCommit={handleCommit}
+                svnMode={state.capabilities.vcs === 'svn'}
               />
             )}
           </Panel>
