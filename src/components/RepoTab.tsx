@@ -15,9 +15,12 @@ import {
   useRepoEffects,
   svnInitHybrid,
   svnPreflightCheck,
+  svnRebuildBaseline,
+  svnCheckBaseline,
 } from '../store/repoStore'
 import SvnInitWizard from './SvnInitWizard'
-import { describePinned } from '../engine/svnInit'
+import BaselineBanner from './BaselineBanner'
+import { describeHealth, describePinned } from '../engine/svnInit'
 import { samePath } from '../engine/path'
 import { visibleSections } from '../engine/capabilities'
 import { askConfirm } from '../engine/confirm'
@@ -110,6 +113,7 @@ export function RepoTab({
   const {
     state, openRepo, refreshHead, refreshGraph, refreshStatus, refreshWorktrees,
     refreshDiff, refreshUpstream, refreshStashes, refreshPullRequests,
+    refreshSvnSync, fetchSvnLog, refreshSvnAudit,
     selectCommit, clearError, reportError,
   } = useRepoStore()
   const [repoState, setRepoState] = useState<string>('normal')
@@ -125,7 +129,7 @@ export function RepoTab({
 
   useRepoEffects(
     state,
-    { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes },
+    { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes, refreshSvnSync },
     viewMode,
   )
 
@@ -510,6 +514,59 @@ export function RepoTab({
     )
   }
 
+  /**
+   * 重建基线（NB-6 的入口之一）。
+   *
+   * **必须先过确认对话框。** 它会移动 `svn/base` 指针——虽然不碰工作目录、
+   * 也不动工作分支（R1–R5 全程如此），但那是一个用户应当知情的状态变更，
+   * 而且旧基线只能从 reflog 找回来。
+   */
+  const handleRebuildBaseline = async () => {
+    await confirm({
+      title: '重建基线',
+      message: '把白名单内的当前磁盘内容录成一个新的基线 commit。',
+      warning:
+        '不会修改工作目录里的任何文件，也不会推进你的工作分支——' +
+        '分支要不要跟进新基线，由你之后自己决定。' +
+        '白名单内必须干净：有未提交的 SVN 改动会被拒绝。',
+      confirmLabel: '重建',
+      busyLabel: '正在重建…',
+      // 走 action 而不是「确认后自己跑」：重建要发 svn diff 体检（网络），
+      // 确认完就关框的话那几秒界面上毫无动静，看着像卡死。
+      action: async () => {
+        await svnRebuildBaseline(repoPath)
+        await refreshSvnSync(repoPath)
+        void fetchSvnLog(repoPath)
+        void refreshSvnAudit(repoPath)
+      },
+    })
+  }
+
+  /**
+   * 手动体检当前基线（NB-6 的入口之二）。
+   *
+   * `check_current_baseline` 是 `Lying`（基线撒谎）**唯一真正可达的入口**
+   * ——初始化与重建路径上的体检失败会直接中止流程，用户看不到那个结论。
+   */
+  const handleCheckBaseline = async () => {
+    try {
+      // 复用向导那边的同一份翻译，不另写一套——两份文案迟早说出不同的话。
+      const n = describeHealth(await svnCheckBaseline(repoPath))
+      await confirm({
+        title: n.title,
+        message:
+          n.tone === 'error'
+            ? '下面这些文件，基线记的内容与服务器上的不一致：'
+            : n.detail,
+        // `Lying` 的文件清单走红底警告条——「基线在撒谎」与普通说明不是一个分量。
+        warning: n.tone === 'error' ? n.detail : undefined,
+        confirmLabel: '知道了',
+      })
+    } catch (err) {
+      reportError(err)
+    }
+  }
+
   // pinned 模式的残余风险，spec §6.5.3 第 3 条要求**常驻说明**：
   // 别的工具在项目根跑递归 update 会把这些目录退回被钉住的 revision，
   // 而工作副本看起来是干净的。只在向导里显示一次不算常驻。
@@ -524,6 +581,12 @@ export function RepoTab({
           <pre>{pinnedNotice.detail}</pre>
         </div>
       )}
+      <BaselineBanner
+        sync={state.svnSync}
+        audit={state.svnAudit}
+        onRebuild={() => void handleRebuildBaseline()}
+        onCheck={() => void handleCheckBaseline()}
+      />
       {state.error && (
         <div className="banner-error">
           <span>{state.error}</span>

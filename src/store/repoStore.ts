@@ -3,6 +3,49 @@ import { listen } from '@tauri-apps/api/event'
 import { useCallback, useEffect, useState } from 'react'
 import type { CommitNode, DiffData, GraphData, PullRequest, RefPointer, RepoInfo, StashEntry, StatusData, UpstreamInfo, Worktree } from '../engine/types'
 import { ALL_CAPABILITIES, type Capabilities } from '../engine/capabilities'
+import type { ServerAudit, SyncStatus } from '../engine/svnSync'
+import { spliceHistory, type SvnRevNode } from '../engine/svnGraph'
+
+/** 后端 `svn_sync::RootRev`。 */
+interface RootRev {
+  wcRoot: string
+  rev: number
+}
+
+/** 首屏与每次「加载更多」拉多少条（spec §10.2：不做无限滚动）。 */
+const SVN_LOG_PAGE = 200
+
+/**
+ * 把一次 rootRev 观测压成一个可比字符串。
+ *
+ * 排序是必须的：`enumerate_wcs` 的返回顺序没有契约，顺序一飘就会被当成
+ * 「有人动过」，于是每次刷新都触发全量校验。
+ */
+function serializeRootRevs(revs: RootRev[]): string {
+  return revs
+    .map((r) => `${r.wcRoot}@${r.rev}`)
+    .sort()
+    .join('|')
+}
+
+/**
+ * 把 SVN 序列接进 git 历史——**只在 SVN 模式下**。
+ *
+ * # 为什么普通 git 仓库必须原样返回
+ *
+ * `spliceHistory` 会把带 `git-svn-id` trailer 的 commit 当成 baseline
+ * **从图上删掉**（spec §10.3 ③：它在图上的位置由 SVN 序列决定）。
+ *
+ * 而一个从 `git svn` 迁移过来的**普通 git 仓库**，历史里遍地都是这种 trailer
+ * ——那是 `git svn` 自己写的（spec §6.4.1 就是照它的格式设计的）。无条件接合的话，
+ * 这类仓库一打开就会发现大半历史凭空消失，而 svnRevs 是空的、没有任何东西接住它们。
+ *
+ * 所以判据必须是「这个仓库是不是 SVN 混合仓库」，而不是「svnRevs 空不空」。
+ */
+function merge(s: RepoState, gitCommits: CommitNode[], svnRevs: SvnRevNode[]): CommitNode[] {
+  if (s.capabilities.vcs !== 'svn') return gitCommits
+  return spliceHistory(svnRevs, gitCommits)
+}
 import { toErrorCode, toErrorMessage } from '../engine/errors'
 import type {
   Health,
@@ -57,6 +100,36 @@ export interface RepoState {
    * 一次不算常驻，用户下次打开这个仓库就看不到了。所以它进 store，每次打开都读。
    */
   pinned: PinnedExternal[]
+  /**
+   * 失同步的完整校验结果（spec §6.6.3 的**第二档**）。`null` = 还没读到。
+   *
+   * `null` 与「同步」是两回事：打开仓库的那一瞬间它是 `null`，那时挂任何横幅
+   * 都等于每次打开都闪一下。`describeSync(null)` 因此返回 `null`。
+   */
+  svnSync: SyncStatus | null
+  /** 服务器侧清单核对（§6.3.1 / NB-2）。走网络，失败静默。 */
+  svnAudit: ServerAudit | null
+  /** SVN 历史（缓存 + 已拉取的），按 revision 降序。 */
+  svnRevs: SvnRevNode[]
+  /**
+   * 后端 `load_graph` 原样给的 git 提交，**未接合**。
+   *
+   * `commits` 是接合后的结果；两者分开存是因为 svnRevs 与 gitCommits 各自会被
+   * 异步刷新，任一变化都要重新接一次，而接合是纯函数，重算比增量维护更不容易错。
+   */
+  gitCommits: CommitNode[]
+  /**
+   * 上一次观测到的每个工作副本根的 revision，序列化成字符串好比对。
+   *
+   * §6.6.3 第一档的判据是「与**上次观测值**比」，**不是**与 `baselineRev` 比：
+   * 交付之后根节点会长期停在旧 revision（spec §6.6.2 有实测），拿它跟
+   * `baselineRev` 比会每次刷新都判不等，于是每次刷新都触发全量校验，
+   * 分层的意义直接归零。
+   *
+   * 进程重启后是 `null`，第一次刷新当作「变了」跑一次全量——那正是打开仓库
+   * 本来就要做的事。
+   */
+  lastRootRevs: string | null
 }
 
 const initialState: RepoState = {
@@ -77,6 +150,11 @@ const initialState: RepoState = {
   error: null,
   errorCode: null,
   pinned: [],
+  svnSync: null,
+  svnAudit: null,
+  svnRevs: [],
+  gitCommits: [],
+  lastRootRevs: null,
 }
 
 /**
@@ -147,6 +225,36 @@ export function svnPinnedExternals(path: string): Promise<PinnedExternal[]> {
   return invoke<PinnedExternal[]>('svn_pinned_externals', { path })
 }
 
+/** 完整失同步校验（spec §6.6.3 第二档）。纯本地读，不走网络。 */
+export function svnSyncStatus(path: string): Promise<SyncStatus> {
+  return invoke<SyncStatus>('svn_sync_status', { path })
+}
+
+/** 每个工作副本根的 revision（第一档，O(1)）。挂在高频刷新上。 */
+export function svnRootRevs(path: string): Promise<RootRev[]> {
+  return invoke<RootRev[]>('svn_root_revs', { path })
+}
+
+/** 读缓存里的 SVN 历史，**不走网络**。打开仓库时先用它把图画出来。 */
+export function svnReadLog(path: string): Promise<SvnRevNode[]> {
+  return invoke<SvnRevNode[]>('svn_read_log', { path })
+}
+
+/**
+ * 拉取 SVN 历史，**走网络**。
+ *
+ * ⚠️ Rust 侧参数是 `before_rev`，JS 侧必须写 `beforeRev`（`AGENTS.md` §7.3）。
+ * 这层转换没有编译期检查，写错只会在运行时静默拿到 `undefined`。
+ */
+export function svnFetchLog(path: string, beforeRev: number | null, limit: number): Promise<SvnRevNode[]> {
+  return invoke<SvnRevNode[]>('svn_fetch_log', { path, beforeRev, limit })
+}
+
+/** 服务器侧清单核对（§6.3.1 / NB-2）。**走网络**，可能不便宜。 */
+export function svnServerAudit(path: string): Promise<ServerAudit> {
+  return invoke<ServerAudit>('svn_server_audit', { path })
+}
+
 export function useRepoStore() {
   const [state, setState] = useState<RepoState>(initialState)
 
@@ -180,6 +288,27 @@ export function useRepoStore() {
       // 同样不 await：后端要跑 `svn propget -R`，在几万文件的工作副本上是秒级。
       // 常驻说明晚一两秒出现无所谓，但不能让打开仓库卡在这儿（spec §6.5.3）。
       void refreshPinned(path)
+      if (caps.vcs === 'svn') {
+        // 第二档的完整校验：打开仓库是正确性的闸门之一，必须问到底（spec §6.6.3）。
+        // 纯本地读，await 得起。
+        await refreshSvnSync(path).catch(() => undefined)
+        // 先用**缓存**把图画出来，再后台拉新的（spec §10.2）。
+        await refreshSvnLog(path).catch(() => undefined)
+        // 这两条走网络，照 `refreshPullRequests` 的既有模式：不 await、失败静默。
+        void fetchSvnLog(path)
+        void refreshSvnAudit(path)
+      } else {
+        // **必须显式清空**：上一个仓库是 SVN 时留下的横幅与历史，会挂在下一个
+        // 完全无关的 git 仓库上（`refreshPinned` 的注释里记过同一个坑）。
+        setState((s) => ({
+          ...s,
+          svnSync: null,
+          svnAudit: null,
+          svnRevs: [],
+          lastRootRevs: null,
+          // gitCommits 不用清：refreshGraph 每次都整份覆盖它
+        }))
+      }
     } catch (err) {
       setState((s) => ({
         ...s,
@@ -214,12 +343,16 @@ export function useRepoStore() {
    */
   const refreshGraph = async (path: string, preferredId?: string, force = false) => {
     const data = await invoke<GraphData>('load_graph', { path })
-    setState((s) => ({
-      ...s,
-      commits: data.commits,
-      refs: data.refs,
-      selectedId: nextSelection(s.selectedId, data.commits.map((c) => c.id), preferredId, force),
-    }))
+    setState((s) => {
+      const commits = merge(s, data.commits, s.svnRevs)
+      return {
+        ...s,
+        gitCommits: data.commits,
+        commits,
+        refs: data.refs,
+        selectedId: nextSelection(s.selectedId, commits.map((c) => c.id), preferredId, force),
+      }
+    })
   }
 
   const refreshStatus = async (path: string) => {
@@ -249,6 +382,52 @@ export function useRepoStore() {
    * git 操作的。**必须写回空数组**——上一个仓库处于 pinned 模式时留下的清单，
    * 会挂在下一个完全无关的仓库上。
    */
+  /**
+   * 第二档：完整的 `nodeRevs` 校验（spec §6.6.3）。纯本地读。
+   *
+   * 顺带把观测到的 rootRevs 记下来当基准——不记的话下一次刷新会因为
+   * `lastRootRevs` 还是 `null` 而再跑一次全量。
+   */
+  const refreshSvnSync = async (path: string) => {
+    const [st, revs] = await Promise.all([svnSyncStatus(path), svnRootRevs(path)])
+    setState((s) => ({ ...s, svnSync: st, lastRootRevs: serializeRootRevs(revs) }))
+  }
+
+  /** 读缓存里的 SVN 历史并接进图。不走网络。 */
+  const refreshSvnLog = async (path: string) => {
+    const revs = await svnReadLog(path)
+      // svnRevs 一变就要重接一次：后台拉取是异步的，先画出来的图里
+      // svn 节点还没到位，工作分支那时还挂在 baseline commit 上。
+      setState((s) => ({ ...s, svnRevs: revs, commits: merge(s, s.gitCommits, revs) }))
+  }
+
+  /**
+   * 走网络拉 SVN 历史。**失败只写 console 不上报**——顶部错误横幅是留给 git
+   * 操作的，被这条锦上添花的信息占住的话，真正的失败反而看不见
+   * （与 `refreshPullRequests` 同一条理由）。
+   */
+  const fetchSvnLog = async (path: string, beforeRev: number | null = null) => {
+    try {
+      const revs = await svnFetchLog(path, beforeRev, SVN_LOG_PAGE)
+        // svnRevs 一变就要重接一次：后台拉取是异步的，先画出来的图里
+      // svn 节点还没到位，工作分支那时还挂在 baseline commit 上。
+      setState((s) => ({ ...s, svnRevs: revs, commits: merge(s, s.gitCommits, revs) }))
+    } catch (err) {
+      console.warn('拉取 SVN 历史失败，图上只显示缓存里已有的部分：', err)
+    }
+  }
+
+  /** 服务器侧清单核对。走网络，失败静默并**写回 null**（不是保留上一个仓库的）。 */
+  const refreshSvnAudit = async (path: string) => {
+    try {
+      const audit = await svnServerAudit(path)
+      setState((s) => ({ ...s, svnAudit: audit }))
+    } catch (err) {
+      console.warn('服务器侧清单核对失败，不显示漏收提示：', err)
+      setState((s) => ({ ...s, svnAudit: null }))
+    }
+  }
+
   const refreshPinned = async (path: string) => {
     try {
       const pinned = await svnPinnedExternals(path)
@@ -310,6 +489,10 @@ export function useRepoStore() {
     refreshUpstream,
     refreshStashes,
     refreshPullRequests,
+    refreshSvnSync,
+    refreshSvnLog,
+    fetchSvnLog,
+    refreshSvnAudit,
     selectCommit,
     clearError,
     reportError,
@@ -325,6 +508,8 @@ export interface RepoRefreshers {
   refreshDiff: (path: string, scope: string) => Promise<void>
   refreshUpstream: (path: string) => Promise<void>
   refreshStashes: (path: string) => Promise<void>
+  /** §6.6.3 第二档。只在第一档报告「有人动过」之后才调。 */
+  refreshSvnSync: (path: string) => Promise<void>
 }
 
 export function useRepoEffects(
@@ -332,7 +517,7 @@ export function useRepoEffects(
   refreshers: RepoRefreshers,
   viewMode: string,
 ) {
-  const { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes } = refreshers
+  const { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes, refreshSvnSync } = refreshers
   const diffScope = viewMode === 'changes'
     ? 'workdir'
     : state.selectedId
@@ -362,6 +547,20 @@ export function useRepoEffects(
       void refreshUpstream(path).catch(ignore)
       void refreshStashes(path).catch(ignore)
       if (diffScope) void refreshDiff(path, diffScope).catch(ignore)
+      // §6.6.3 的**分层**：高频通道上只跑 O(1) 的第一档，变了才跑第二档。
+      //
+      // 不分层的话，每一次文件保存都会触发一遍白名单子树的 `svn status -v`
+      // ——那是本地读，但在几万文件的工作副本上仍然是可感知的开销。
+      if (state.capabilities.vcs === 'svn') {
+        void svnRootRevs(path)
+          .then((revs) => {
+            const now = serializeRootRevs(revs)
+            // 比的是**上次观测值**，不是 baselineRev。理由见 lastRootRevs 的注释。
+            if (now === state.lastRootRevs) return
+            void refreshSvnSync(path).catch(ignore)
+          })
+          .catch(ignore)
+      }
     }).then((fn) => { unlisten = fn })
     return () => { unlisten?.() }
   }, [state.path, diffScope])

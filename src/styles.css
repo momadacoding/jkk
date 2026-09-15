@@ -1713,6 +1713,36 @@ body {
   opacity: 0.9;
 }
 
+/* 失同步横幅与服务器侧漏收提示。tone 与 engine/svnSync 的 BannerTone 对应。
+   两条是独立的信息，可能同时出现，所以各自是一个完整的块。 */
+.banner-baseline {
+  padding: 8px 12px;
+  border-bottom: 1px solid #333;
+  font-size: 12px;
+}
+.banner-baseline.warn { background: #4a3d16; color: #f0e2b8; border-bottom-color: #6b5a20; }
+.banner-baseline.danger { background: #4a1f1f; color: #f3cdcd; border-bottom-color: #7a3030; }
+.banner-baseline-head { margin-bottom: 4px; }
+.banner-baseline-detail { margin: 0 0 6px; opacity: 0.92; }
+.banner-baseline-note { margin: 0 0 6px; opacity: 0.75; font-size: 11px; }
+.banner-baseline-command {
+  margin: 0 0 6px;
+  padding: 4px 6px;
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: 3px;
+  font-family: var(--mono, monospace);
+  white-space: pre-wrap;
+}
+.banner-baseline-actions { display: flex; gap: 6px; }
+.banner-baseline-files {
+  margin: 0;
+  padding-left: 18px;
+  max-height: 120px;
+  overflow: auto;
+  font-family: var(--mono, monospace);
+  opacity: 0.9;
+}
+
 /* 向导里的三态提示。tone 与 engine/svnInit 的 Notice.tone 一一对应。 */
 .svn-notice.ok { border-left: 3px solid #3f7d4f; }
 .svn-notice.warn { border-left: 3px solid #8a7320; }
