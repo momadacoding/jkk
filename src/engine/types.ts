@@ -28,11 +28,21 @@ export interface RefPointer {
 }
 
 export interface CommitNode {
+  /** git 节点是 oid；svn 节点是 `svn:12346`（spec §10.4）。 */
   id: string
   parents: string[]
   author: string
   time: number
   message: string
+  /**
+   * 新增（spec §10.4）。**缺省视为 git**，所以现有 Git 模式零影响——
+   * 后端的 `load_graph` 一个字都没改，它吐出来的节点就是没有这三个字段的。
+   */
+  vcs?: 'git' | 'svn'
+  /** 新增；仅 svn 节点有。 */
+  svnRev?: number
+  /** 新增；message 带 `Local-Only: true` trailer（spec §6.7），不会被交付。 */
+  localOnly?: boolean
 }
 
 export interface GraphData {
