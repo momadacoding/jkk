@@ -104,26 +104,8 @@ pub fn init_hybrid(req: &InitRequest) -> Result<InitReport> {
     let pre = run_preflight(root, &cfg.whitelist)?; // P1–P4
     let pinned = detect_pinned(root, &cfg.whitelist)?; // P5，命中不阻断
 
-    // ⚠️ **进入回退区之前，紧挨着再判一次 `.git` 不存在。**
-    //
-    // 函数开头那次判定之后，要经过 `build_config`（svn info）、`run_preflight`
-    // （若干条 svn status/info）、`detect_pinned`（`propget -R` **遍历整个工作
-    // 副本**，Unity 规模是分钟级）才走到这里。这个窗口里完全可能冒出一个 `.git`
-    // ——同一路径开了第二个标签页（向导的 busy 只护得住单个组件实例），
-    // 或者用户自己在命令行跑了 `git init`。
-    //
-    // 那时下面的 `git init` 会 re-init 那个已有仓库（不报错），而之后任一步失败，
-    // `rollback` 就会 `remove_dir_all` 一个**不是本次创建的** `.git`。
-    //
-    // 这道判定必须留在**回退区之外**：放进 `build_repo` 的话，它自己的 `Err`
-    // 就会触发 `rollback`，正好删掉那个刚发现的外来 `.git`。
-    if std::path::Path::new(root).join(".git").exists() {
-        return Err(GitError::new(
-            "svn_unconfigured_git",
-            "校验期间这个目录里出现了一个 .git（可能是另一个窗口、或者命令行建的）。\
-             本应用不会碰它——请确认来源后再重试。",
-        ));
-    }
+    // ⚠️ **进入回退区之前，原子地「创建并占有」`.git`。**
+    claim_git_dir(root)?;
 
     // ---- 从这里开始，失败必须删掉本次创建的 .git ----
     match build_repo(root, &cfg, &pre, &svn_url) {
@@ -137,6 +119,55 @@ pub fn init_hybrid(req: &InitRequest) -> Result<InitReport> {
             rollback(root);
             Err(e)
         }
+    }
+}
+
+/// 原子地创建 `.git` 目录，作为「这次初始化拥有它」的凭据。
+///
+/// # 为什么不是「先判存在、再 `git init`」
+///
+/// 判断与创建是两次系统调用，中间的窗口足以让第二条请求也判出「不存在」。
+/// 2026-09-15 在 fixture 上用两条线程实测，6 轮里命中 2 轮：
+///
+/// ```text
+/// Err("git_cli / fatal: not a git repository …")
+/// Err("git_cli / could not lock config file …/.git/config: File exists")
+/// ```
+///
+/// ——两条请求**同时**在同一个 `.git` 上跑 `git init`，撞在 config 锁上双双失败，
+/// 然后各自 `rollback`，把目录删回未初始化。更坏的交错是其中一条走完全程报了成功，
+/// 另一条在 `publish_baseline` 的「该 ref 不该存在」前置条件上失败
+/// （实测 `cannot lock ref 'refs/heads/svn/base': reference already exists`）
+/// 并回退——`remove_dir_all` 删掉的就是**赢家刚建好的仓库**，而赢家那边界面上
+/// 显示「初始化成功」。
+///
+/// `git init` 自己挡不住这件事：对已初始化的仓库它**以 exit 0 静默 re-init**
+/// （实测还会 `warning: re-init: ignored --initial-branch=svn/base`，意味着
+/// HEAD 会留在别人建库时的分支上）。
+///
+/// `std::fs::create_dir` 是一次系统调用，目标已存在时以 `AlreadyExists` 失败，
+/// 「判断」与「占有」在其中不可分割。实测 `git init -b svn/base` 在一个**已存在的
+/// 空 `.git` 目录**上照常工作（exit 0，HEAD 指向 `refs/heads/svn/base`），
+/// 所以拿它当凭据不需要改动后面任何一步。
+///
+/// 这道判定必须留在**回退区之外**：放进 `build_repo` 的话，它自己的 `Err`
+/// 就会触发 `rollback`，正好删掉那个刚发现的外来 `.git`。
+///
+/// 跨进程同样有效（用户自己在命令行跑 `git init`），因为它靠的是文件系统而不是
+/// 进程内的锁。
+fn claim_git_dir(root: &str) -> Result<()> {
+    let git = std::path::Path::new(root).join(".git");
+    match std::fs::create_dir(&git) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(GitError::new(
+            "svn_unconfigured_git",
+            "校验期间这个目录里出现了一个 .git（可能是另一个窗口、或者命令行建的）。\
+             本应用不会碰它——请确认来源后再重试。",
+        )),
+        Err(e) => Err(GitError::new(
+            "svn_init",
+            format!("建不出 {} ：{e}", git.display()),
+        )),
     }
 }
 
@@ -326,6 +357,25 @@ pub fn rebuild_baseline(repo_root: &str) -> Result<RebuildReport> {
 /// 这里读的是基线**自称**的 revision——它可能早就过时了（有人在项目根跑了递归
 /// update 把 external 退回 peg、恢复流程没走完、或者基线本来就录错了），
 /// 这正是 §6.8.1 说的「让基线可被服务器证伪」。
+///
+/// # ⚠️ 必须先校验 `check_baseline` 的前提，不能直接调
+///
+/// `svn_health` 的模块头写着它的前提：**「磁盘上白名单内的内容 == 基线树的内容」**。
+/// spec §6.8.5 列的另外三个时机天然满足（树刚从磁盘录出来），**这一个不满足**
+/// ——用户就在 `work` 分支上改代码，那正是他会点这个按钮的时候。
+///
+/// 不校验前提的话，`check_baseline` 比的是「当前磁盘 vs 服务器」，而结论却被当成
+/// 「基线 vs 服务器」来汇报：一个再普通不过的未提交改动会被报成 `Lying`，
+/// 而基线完全正确。指控错对象比不指控更糟——用户会照着引导去**重建基线**，
+/// 把一份好基线换掉，而他的改动还在原地。
+///
+/// 所以这里先把磁盘上的 W-file 录成一棵树，和基线树比：
+///
+/// - 一致 → 前提成立，`check_baseline` 的结论就是关于基线的，照常返回；
+/// - 不一致 → 这条检查**分辨不出**「基线撒谎」和「我有未提交改动」，
+///   按 spec §6.8.6 第三行返回 `NotChecked`。
+///
+/// 录树复用 `rebuild_baseline` 那套临时索引，全程不碰真实 index、HEAD 和磁盘。
 pub fn check_current_baseline(repo_root: &str) -> Result<Health> {
     if detect_repo_kind(repo_root) != RepoKind::SvnHybrid {
         return Err(GitError::new(
@@ -351,6 +401,39 @@ pub fn check_current_baseline(repo_root: &str) -> Result<Health> {
              它不是本应用录出来的基线。体检无从谈起——请重建基线。",
         )
     })?;
+
+    // 前提校验：磁盘上的 W-file 录成树，必须与基线树逐字节相同。
+    // 用 `%T` 而不是 `<ref>^{tree}`——后者在若干 Windows shell 里要转义，
+    // 而 `run_git` 是直接 spawn 进程、不过 shell，两种写法这里都能用，
+    // 但 `%T` 不带任何需要转义的字符，少一处将来会被改错的地方。
+    let baseline_tree = run_git(
+        repo_root,
+        &[
+            "log",
+            "-1",
+            "--format=%T",
+            &format!("refs/heads/{BASELINE_BRANCH}"),
+        ],
+    )?
+    .trim()
+    .to_string();
+    let idx = TempIndex::empty(repo_root)?;
+    idx.add_all(repo_root, &cfg.whitelist)?;
+    let disk_tree = idx.write_tree(repo_root)?;
+    if disk_tree != baseline_tree {
+        return Ok(Health::NotChecked {
+            reason: format!(
+                "白名单内的磁盘内容与基线树不一致（基线树 {}，磁盘录出来是 {}）。\
+                 体检拿磁盘去跟服务器比，前提是这两者相同；不相同时它分不出\
+                 「基线记错了」和「你有未提交的改动」，所以这里不下结论。\n\
+                 这通常**不是**问题——在 work 分支上改代码本来就会这样。\
+                 想确认基线本身，请先提交或暂存改动，或者直接走「重建基线」。",
+                &baseline_tree[..baseline_tree.len().min(8)],
+                &disk_tree[..disk_tree.len().min(8)],
+            ),
+        });
+    }
+
     check_baseline(
         repo_root,
         &cfg.svn_url,
@@ -388,9 +471,11 @@ fn read_baseline_oid(repo_root: &str) -> Result<String> {
 ///
 /// # 为什么这里可以 `remove_dir_all`
 ///
-/// 调用点唯一：[`init_hybrid`] 在 `build_repo` 返回 `Err` 时。而 `init_hybrid`
-/// 开头已经断言过 `detect_repo_kind == SvnUninitialized`，也就是**进来时没有
-/// `.git`**——现在这个必然是本次 `git init` 建的。
+/// 调用点唯一：[`init_hybrid`] 在 `build_repo` 返回 `Err` 时。而在那之前
+/// [`claim_git_dir`] 已经**原子地创建**了这个目录——`create_dir` 成功即证明它
+/// 在那一刻不存在、且是我们建的。这比「开头 `detect_repo_kind` 断言过没有 `.git`」
+/// 强：后者与 `git init` 之间隔着整个前置校验，那段时间里别人可以插进来建一个
+/// （实测会发生，见 [`claim_git_dir`]）。
 ///
 /// 再加两道与那个判定无关的独立守卫，防止将来有人把这个函数接到别处：
 /// 目标必须是目录（worktree 里 `.git` 是文件，那种不该出现在这里），

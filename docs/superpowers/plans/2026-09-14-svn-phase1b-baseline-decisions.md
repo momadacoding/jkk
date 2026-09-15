@@ -23,6 +23,7 @@
 | 8 重建基线 R1–R5 | ✅ 完成 | `svn_init.rs`、`tests/svn_init.rs` | `cargo test --test svn_init` 18 passed；全量 **398 passed / 0 failed / 33 个二进制**（= 380 + 新增 18）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓；变异测试确认「不 checkout 基线分支」这条有牙 |
 | 9 Tauri 命令与向导 UI | ✅ 完成 | `commands/svn.rs`（新）、`lib.rs`、`commands/mod.rs`、`svn_init.rs`（加 `check_current_baseline`）、四个 engine 模块加 serde、`src/engine/svnInit.ts`（新）、`src/components/SvnInitWizard.tsx`（新）、`src/store/repoStore.ts`、`src/components/RepoTab.tsx`、`tests/vitest/svnInit.test.ts`（新）、`tests/svn_backend.rs` | Rust **401 passed / 33 个二进制**；前端 **290 passed / 22 files**、`pnpm build` ✓ |
 | 10 收尾验证 | ✅ 完成 | 本文件 | 命令对账 50 == 50；G8 零 SVN 写操作；**真实窗口验证 8 个场景 + 1a 遗留的 2 个命令全部通过**（详见下节） |
+| 11 第二轮独立 review 的修复 | ✅ 完成 | `svn_init.rs`、`svn_preflight.rs`、`svn_health.rs`、`tests/{svn_init,svn_preflight,svn_health}.rs`、`tests/common/svn_fixtures.rs` | 3 条（2 high + 1 medium）全部复现并修掉；全量 **412 passed / 0 failed / 33 个二进制**（= 404 + 新增 8）；`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓；AR-1 的并发测试做了变异测试并量了轮数（详见末节） |
 
 ---
 
@@ -1032,3 +1033,148 @@ diff，先读「偏离计划」再看代码（rubric #12）。它提了 **3 个�
 `update`（那是 §7.3 的 S5，属同步流程）。spec 说两条手段「都要实现」，所以这是一处
 **有意的未完成**，不是遗漏：手段一负责阻断/判定，手段二负责兜住手段一的盲区。
 已写进 `svn_externals.rs` 的模块注释，记账给 Phase 2。
+
+---
+
+## 第二轮独立 review（Codex 对抗式，针对 PR #42 的完整 diff）的处置
+
+给出 3 条（2 high + 1 medium）。**三条全部复现、全部修掉**，每条都先用临时 fixture
+或裸 `svn` / `git` 命令独立验过，没有直接采信报告。
+
+### AR-1（high）初始化未原子取得所有权，回退可能删掉另一条请求的仓库
+
+报告说第一轮补的 `.git` 存在性检查「只缩短了竞态窗口」。**属实。**
+
+2026-09-15 用两条线程 + `Barrier` 在 fixture 上实测，修复前 12 轮一组必现：
+
+```text
+round 2: ok=0 gitdir=false hybrid=SvnUninitialized
+    Err("git_cli / fatal: not a git repository …")
+    Err("git_cli / could not lock config file …/.git/config: File exists")
+```
+
+两条请求**同时**在同一个 `.git` 上跑 `git init`，撞在 config 锁上双双失败，
+然后各自 `rollback`，把目录删回未初始化。裸命令逐段复现的链条：
+
+| 探针 | 实测 |
+|---|---|
+| `git init -b svn/base` 打在已初始化的仓库上 | **exit 0**，静默 re-init，还 `warning: re-init: ignored --initial-branch=svn/base` |
+| 落败方的 `update-ref <ref> <new> <zero-oid>` | exit 128，`cannot lock ref 'refs/heads/svn/base': reference already exists` |
+| `git init -b svn/base` 打在**已存在的空 `.git` 目录**上 | **exit 0**，HEAD 正确指向 `refs/heads/svn/base` |
+| `create_dir` 打在已存在的目录上 | 以 `AlreadyExists` 失败 |
+
+所以更坏的交错是：赢家走完全程报「初始化成功」，落败方在 `update-ref` 上失败并
+`remove_dir_all` —— 删掉的正是**赢家刚建好的仓库**，而赢家那边界面显示成功。
+
+**修法**：新增 `claim_git_dir`，用 `std::fs::create_dir` **原子地创建并占有**
+`.git`，成功即证明「它在那一刻不存在、且是我们建的」。`git init` 随后照常打进这个
+空目录（上表第 3 行）。这比原来的「开头 `detect_repo_kind` 断言过没有 `.git`」强：
+后者与 `git init` 之间隔着整个前置校验（`detect_pinned` 的 `propget -R` 在 Unity
+规模是分钟级）。跨进程同样有效，因为它靠的是文件系统而不是进程内的锁。
+
+`rollback` 的安全性论证也随之换了地基：不再依赖「进来时没有 `.git`」这个**过期的**
+观察，而是依赖「这个目录是我 `create_dir` 出来的」这个**所有权**事实。
+
+**测试有牙的证据**：`two_concurrent_inits_never_delete_the_winner_s_repository`。
+断言是 `ok == 1`（恰好一条成功）而**不是** `ok <= 1` —— 上面那种「两条都失败」正好
+让 `ok <= 1` 通过，而它恰恰是 bug 的现场。轮数是量出来的：
+
+| 轮数 | 变异回修复前的写法之后 |
+|---|---|
+| 6 | 跑 3 次，**2 次**红（1 次假绿） |
+| 12 | 跑 4 次，**4 次**全红 |
+
+⚠️ 中途犯过一次错并纠正：第一版变异写成「`exists()` + `create_dir_all`」，那让
+`.git` 在检查后**几微秒**就出现，窗口塌缩，30 轮一次都没撞上，我差点据此以为测试
+没牙。真实的修复前形态是「只判存在、`.git` 交给 `git init` 去建」——窗口有**一次
+进程启动**那么宽。**变异必须忠于原形态，否则量出来的是另一个东西。**
+
+### AR-2（high）P1/P2 漏查白名单内的嵌套 external
+
+报告说 `enumerate_wcs` 已经枚举出嵌套 external，但 P1/P2 仍只遍历原始白名单根。
+**属实，而且这是一处 spec 违反，不只是设计缺口。**
+
+spec §6.5.5：「**同仓库的嵌套 external 不阻断**，但它必须被纳入 §6.6.5 的记账单位
+集合——也就是 `nodeRevs` 要在它上面也跑一次并取并集，否则它就是一块 git 管着、
+SVN 侧却没人盯的盲区。」
+spec §6.6.5：「在**每个 `wc(P)`** 上各跑一次……这里的『每个 `wc(P)`』指白名单递归
+覆盖到的全部工作副本，包括白名单根**底下**再挂的嵌套 external。」
+
+2026-09-15 实测（白名单 `Code/`，`Code/Vendor` 是**同仓库** external）：
+
+| 关卡 | 只查白名单根时 | 加上嵌套 WC 根之后 |
+|---|---|---|
+| P4 同 UUID | **通过**（按设计） | 同 |
+| P1 `status --no-ignore --ignore-externals -- Code@` | 只有一条 `item="external"`，`M` 看不见 | `Code/Vendor@` 报出 `item="modified"` |
+| P2 `status -v --ignore-externals -- Code@` | `{3}`，external 停在 r1 不在集合里 | 并集 `{1,3}` → 正确拒绝 |
+| 体检 `diff --old=URL@3 --new=. -- Code` | `<paths>` **空的** | 仍为空（见下） |
+| `git add -- Code` | `Code/Vendor/V.cs` **照收** | 同 |
+
+叠起来就是：一个未提交、或停在别的 revision 的子树被录进基线、标着根的 revision，
+而体检报 `Verified`。**为什么以前的测试没抓到**：已有的
+`svn_repo_with_cross_repo_nested_external` 是**跨**仓库的，P4 会先拦下；
+同仓库那条是唯一能走完全程的形态，而它没有 fixture。
+
+**修法分两半：**
+
+1. `svn_preflight::check_targets`：P1/P2 的目标 = 白名单根 ∪ 枚举出的嵌套 WC 根。
+   `--ignore-externals` 照加（它挡的是**更深**一层，那一层由 `enumerate_wcs` 递归
+   枚举出来各查一次，spec §6.6.5 末尾明确了这个分工）。
+2. `svn_health::nested_external_not_covered`：白名单底下有 external 时返回
+   `NotChecked` 并点名是哪条。**不能沿用 `Verified`** —— `Verified` 不是「没发现
+   问题」，是一句主动的保证，§6.6 的失同步判定与 §9 的恢复流程都建立在它之上。
+
+**没做完的那部分（记账给 Phase 1c）**：spec §6.6.5 第 4 行要求「每个 `wc(P)` 各体检
+一次，用它自己的 `url(P)`」。那要按 WC 分组重组整条 `svn diff`，是新的一块工作，
+本期只做到「不宣称自己没验过的东西」。P1/P2 已经覆盖了「脏」和「停在别的 revision」
+两种形态，缺的是**服务器侧**的二次证伪。
+
+**反向证据**：`a_clean_same_repo_nested_external_still_passes` —— 干净的同仓库嵌套
+external 必须放行。少了它，前两条测试用「见到 external 就拒绝」也能变绿，而那会
+砸掉本设计的核心场景（代码本来就在 external 里）。
+
+另外补了一条端到端
+`init_succeeds_on_a_clean_same_repo_nested_external_and_never_tracks_its_dot_svn`。
+这条路径现在才第一次真的走得通，于是也第一次暴露出「嵌套 external 有**自己的**
+`.svn`」——裸 `git add -- Code` 实测会把 `Code/Vendor/.svn/wc.db` 整个收进来。
+挡住它的是 `generate_exclude` 末尾那行不带前导 `/` 的 `.svn/`（设计时就想到了，
+但在这个形态下从没被测过）。
+
+### AR-3（medium）手动体检把工作目录差异误判成基线错误
+
+报告说 `check_current_baseline` 没有校验 `svn_health` 明确要求的前提。**属实。**
+
+`svn_health` 的模块头写着前提是「磁盘上白名单内的内容 == 基线树的内容」。
+spec §6.8.5 列的另外三个时机天然满足（树刚从磁盘录出来），**手动体检不满足**
+——用户就在 `work` 分支上改代码，那正是他会点这个按钮的时候。
+
+复现（修复前）：init → 改一行 `Code/A.cs` → `check_current_baseline` →
+`Lying { files: ["Code/A.cs"] }`。基线完全正确，被指控撒谎的是一个再普通不过的
+未提交改动。**指控错对象比不指控更糟**：用户会照着引导去重建基线，把一份好基线
+换掉，而他的改动还在原地。
+
+**为什么这条一直没被发现**：`check_current_baseline` **一条测试都没有**
+（全仓库只有 `commands/svn.rs` 里的命令包装引用它）。
+
+**修法**：调 `check_baseline` 之前先把磁盘上的 W-file 录成树（复用 `rebuild_baseline`
+那套 `TempIndex`，全程不碰真实 index / HEAD / 磁盘），与基线树比：一致则前提成立、
+照常返回；不一致则按 spec §6.8.6 第三行返回 `NotChecked`，并说明这通常不是问题。
+
+**反向证据**：`the_manual_health_check_still_catches_a_baseline_whose_rev_is_stale`
+—— 只有前一条的话，「永远返回 `NotChecked`」也能满足它，那等于把 §6.8 整条检查删掉。
+这条造的是它真正要抓的形态：磁盘与基线树**一致**（前提成立），但 trailer 自称 r1
+而内容其实是 r2 的 → 必须 `Lying`。fixture 用裸 git 管道推进基线并**手写** trailer
+文本，不走 `svn_baseline::format_trailer`（fixture 不能用被测对象搭）。
+
+### 这一轮之后修正的一处旧说法
+
+第一轮 NB-4 的处置写的是「已在进入回退区之前再判一次 `.git` 不存在」，当时把它当成
+问题已解决。AR-1 证明那只是把窗口变窄，没有消除——**判断与创建是两次系统调用**
+这一点没变。现在换成原子占有才算真正关上。旧条目保留，因为它记录了「这道判定必须
+留在回退区**之外**」那个仍然成立的位置约束。
+
+### 复核后的数字
+
+`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓（零告警）、
+`cargo test -j 2` **412 passed / 0 failed / 33 个二进制**（= 404 + 本轮新增 8）。
+前端未改动，`src/**` 与 `tests/vitest/**` 零 diff。

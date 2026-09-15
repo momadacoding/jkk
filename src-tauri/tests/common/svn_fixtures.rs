@@ -151,6 +151,115 @@ pub fn svn_repo_with_cross_repo_nested_external() -> SvnFixture {
     fx
 }
 
+/// 同仓库嵌套 external 的三种形态，配 [`svn_repo_with_same_repo_nested_external`]。
+///
+/// 这三种必须成组出现。只造 [`Self::Dirty`] / [`Self::PinnedOlder`] 会让「P1/P2 把
+/// 嵌套 external 也查一遍」看起来成立，却证明不了它**没有误拦**——而误拦砸的正是
+/// 本设计的核心场景（代码就在 external 里，spec §6.6.5）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NestedExternal {
+    /// 跟随 HEAD、内容干净。**必须放行。**
+    Clean,
+    /// 跟随 HEAD，但里面有一个未提交的改动。P1 必须拦住。
+    Dirty,
+    /// 用 `-r` 钉在旧 revision，与根的 revision 不一致。P2 必须拦住。
+    PinnedOlder,
+}
+
+/// 在白名单根 `Code/` 底下挂一条指向**同一个仓库**的嵌套 external `Code/Vendor`。
+///
+/// # 为什么必须单独造这一个
+///
+/// 已有的 [`svn_repo_with_cross_repo_nested_external`] 是**跨**仓库的，P4 会拦下。
+/// 同仓库那条 P4 按设计**放行**（spec §6.5.5：「同仓库的嵌套 external 不阻断」），
+/// 于是它成了唯一能走完全程的形态——2026-09-15 实测，这条路上：
+///
+/// | 关卡 | 实测结果 |
+/// |---|---|
+/// | P4 | 同 UUID，**通过** |
+/// | P1 `status --ignore-externals -- Code@` | 只报 `item="external"`，脏文件**看不见** |
+/// | P2 `status -v --ignore-externals -- Code@` | 只有根的 revision，external 的**不在里面** |
+/// | 体检 `diff --old=URL@N --new=. -- Code` | `<paths>` **空的**，diff 不下沉进 external |
+/// | `git add -- Code` | `Code/Vendor/V.cs` **照收** |
+///
+/// 叠起来就是：一个未提交（或停在旧 revision）的子树被录进基线、标着根的 revision、
+/// 体检报 `Verified`。这正是 §6.8 存在的理由被绕开的那种形态。
+///
+/// 布局：`Code/A.cs` + `vendor/V.cs`，`svn:externals` 挂在 `Code` 上。
+pub fn svn_repo_with_same_repo_nested_external(kind: NestedExternal) -> SvnFixture {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    run(&root, "svnadmin", &["create", "repo"]);
+    let url = file_url(&root.join("repo"));
+    run(
+        &root,
+        "svn",
+        &["checkout", &url, "seed", "--non-interactive"],
+    );
+    let seed = root.join("seed");
+    std::fs::create_dir_all(seed.join("Code")).unwrap();
+    std::fs::create_dir_all(seed.join("vendor")).unwrap();
+    std::fs::write(seed.join("Code/A.cs"), "a1\n").unwrap();
+    std::fs::write(seed.join("vendor/V.cs"), "v1\n").unwrap();
+    run(
+        &seed,
+        "svn",
+        &["add", "Code", "vendor", "--non-interactive"],
+    );
+    run(&seed, "svn", &["commit", "-m", "r1", "--non-interactive"]);
+
+    if kind == NestedExternal::PinnedOlder {
+        // 让 vendor 自己往前走一个 revision，这样 `-r1` 钉住的内容与根的 revision
+        // 真的错开——不错开的话「钉住」和「跟随」在 nodeRevs 上看不出区别。
+        run(&seed, "svn", &["update", "--non-interactive"]);
+        std::fs::write(seed.join("vendor/V.cs"), "v2\n").unwrap();
+        run(
+            &seed,
+            "svn",
+            &["commit", "-m", "r2 vendor moves on", "--non-interactive"],
+        );
+    }
+    run(&seed, "svn", &["update", "--non-interactive"]);
+
+    // ⚠️ 属性值走 `-F` 文件，不走命令行：行尾必须一致（实测 E10，混合行尾会让
+    // propset 报 E135000 而属性静默没设上，测试拿到「这个仓库没有 externals」的假绿）。
+    let peg = if kind == NestedExternal::PinnedOlder {
+        "-r1 "
+    } else {
+        ""
+    };
+    let ext = root.join("externals.txt");
+    std::fs::write(&ext, format!("{peg}{url}/vendor Vendor\n")).unwrap();
+    run(
+        &seed,
+        "svn",
+        &[
+            "propset",
+            "svn:externals",
+            "-F",
+            ext.to_str().unwrap(),
+            "Code",
+            "--non-interactive",
+        ],
+    );
+    run(
+        &seed,
+        "svn",
+        &["commit", "-m", "nested external", "--non-interactive"],
+    );
+
+    run(
+        &root,
+        "svn",
+        &["checkout", &url, "wc1", "--non-interactive"],
+    );
+    let wc = root.join("wc1");
+    if kind == NestedExternal::Dirty {
+        std::fs::write(wc.join("Code/Vendor/V.cs"), "LOCALLY MODIFIED\n").unwrap();
+    }
+    SvnFixture { dir }
+}
+
 // ---------------------------------------------------------------------------
 // Phase 1b：初始化向导的前置校验（P1 / P2 / P3）要拦的各种形态
 // ---------------------------------------------------------------------------

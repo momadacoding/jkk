@@ -85,6 +85,9 @@ pub fn check_baseline(
     if let Some(reason) = whitelist_not_under_base(repo_root, base, &roots)? {
         return Ok(Health::NotChecked { reason });
     }
+    if let Some(reason) = nested_external_not_covered(repo_root, &roots)? {
+        return Ok(Health::NotChecked { reason });
+    }
 
     let old = format!("--old={base}@{rev}");
     let mut args: Vec<&str> = vec!["diff", &old, "--new=.", "--summarize", "--xml", "--"];
@@ -229,6 +232,64 @@ fn whitelist_not_under_base(
                  最常见的成因是这个目录被 `svn switch` 到了别的分支，或者它本身是一条 external。\
                  两种情况下基线本身都没问题（它录的是磁盘内容配 nodeRevs），\
                  只是这条检查的基准 URL 不适用，所以判为「未经体检」而不是「基线撒谎」。"
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// 白名单底下挂着嵌套 external 时，这条检查覆盖不到它——必须说出来，不能报健康。
+///
+/// # 为什么这是「不能宣称」而不是「漏报」
+///
+/// 2026-09-15 实测（白名单 `Code/`，`Code/Vendor` 是同仓库 external）：
+///
+/// ```text
+/// svn diff --old=<base>@N --new=. --summarize --xml -- Code
+///   → <paths></paths>        ← 空的。哪怕 Code/Vendor/V.cs 正被本地改着
+/// ```
+///
+/// `--old` 那侧是 URL，URL 上根本没有 `Code/Vendor` 这个节点（它只是 `Code` 上的一条
+/// `svn:externals` 属性），所以 diff 直接不下沉。而 `git add -- Code` **会**把
+/// `Code/Vendor/V.cs` 收进基线。
+///
+/// 于是 `Verified` 会覆盖一块从没被比对过的内容。`Verified` 不是「没发现问题」，
+/// 它是一句主动的保证——§6.6 的失同步判定、§9 的恢复流程都建立在它之上。
+/// 所以按 spec §6.8.6 第三行降级成 `NotChecked`：不宣称健康，也不指控它撒谎。
+///
+/// P1/P2 那边已经把这些 WC 纳入检查（`svn_preflight::check_targets`），所以初始化
+/// 路径上「脏」和「停在别的 revision」两种形态仍然拦得住；缺的只是**服务器侧**的
+/// 二次证伪。真正的修法是 spec §6.6.5 的「每个 `wc(P)` 各体检一次，用它自己的
+/// `url(P)`」，那要按 WC 分组重组整条命令，记账给 Phase 1c。
+///
+/// 命令带 **`-N`**（`--depth=immediates` 的同族，这里用非递归）不行：external 根
+/// 可能挂在白名单根的深层子目录上。所以照样是递归 status，与 P1 同一量级的本地读，
+/// 而本函数的调用方随后要发一条**走网络**的 `svn diff`，这点开销在其阴影里。
+fn nested_external_not_covered(repo_root: &str, roots: &[String]) -> Result<Option<String>> {
+    for root in roots {
+        let arg = crate::engine::svn_wc::peg_safe(root);
+        // **故意不带 `--ignore-externals`**：要的就是让 external 根以
+        // `item="external"` 现形（spec §6.6.4 的结论：比解析属性文本可靠）。
+        let xml = match run_svn(repo_root, &["status", "--xml", "--", &arg]) {
+            Ok(x) => x,
+            Err(e) => return Ok(Some(e.message)),
+        };
+        let nested = crate::engine::svn_xml::parse_external_roots(&xml)?;
+        if !nested.is_empty() {
+            // svn 在 Windows 上返回反斜杠（`Code\Vendor`），显示前统一成正斜杠，
+            // 免得同一条路径在界面上有两种写法。
+            let list = nested
+                .iter()
+                .map(|p| p.replace('\\', "/"))
+                .collect::<Vec<_>>()
+                .join("、");
+            return Ok(Some(format!(
+                "白名单根 `{root}` 底下挂着嵌套 external：{list}。\
+                 `svn diff` 拿 URL 与工作副本比时**不会下沉进 external**（实测输出为空），\
+                 而 git 会把里面的文件照收进基线——体检若报「通过」，等于对一块\
+                 从没比对过的内容做担保。所以这里判为「未经体检」。\n\
+                 建库前的 P1/P2 已经把这些目录一并查过（干净、且与主树同一个 revision），\
+                 缺的只是服务器侧的二次核对。"
             )));
         }
     }

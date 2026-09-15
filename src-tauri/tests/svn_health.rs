@@ -10,7 +10,10 @@ mod svn_fixtures;
 
 use app_lib::engine::svn_cli::run_svn;
 use app_lib::engine::svn_health::{check_baseline, Health};
-use svn_fixtures::{file_url, svn_repo_for_health, svn_repo_for_health_at_r2, SvnFixture};
+use svn_fixtures::{
+    file_url, svn_repo_for_health, svn_repo_for_health_at_r2,
+    svn_repo_with_same_repo_nested_external, NestedExternal, SvnFixture,
+};
 
 fn wl(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| s.to_string()).collect()
@@ -245,6 +248,35 @@ fn a_single_file_whitelist_entry_is_not_filtered_out_by_extension() {
     )
     .unwrap();
     assert_eq!(lying_files(&got), vec!["Code/Art.psd"]);
+}
+
+#[test]
+fn a_nested_external_under_the_whitelist_is_never_claimed_verified() {
+    // 2026-09-15 实测：`svn diff --old=URL@N --new=. --summarize --xml -- Code`
+    // 在 `Code/Vendor` 是 external 时**不下沉进去**，`<paths>` 是空的。
+    //
+    // 而 `git add -- Code` 把 `Code/Vendor/V.cs` 照收进基线。两件事叠起来，
+    // 体检会对一块它**从没比过**的内容宣布 Verified —— 这比漏报更糟：Verified 是
+    // 一句主动的保证，用户与后续每一次失同步判定都建立在它之上。
+    //
+    // 修不了就别宣称：按 spec §6.8.6 第三行降级成 NotChecked。真正的修法是
+    // §6.6.5 那条「每个 wc(P) 各体检一次，用它自己的 url(P)」，记账给 Phase 1c。
+    let fx = svn_repo_with_same_repo_nested_external(NestedExternal::Clean);
+    let got = check_baseline(
+        &fx.wc_str(),
+        &file_url(&fx.repo()),
+        2,
+        &wl(&["Code/"]),
+        &cs(),
+    )
+    .unwrap();
+    match got {
+        Health::NotChecked { reason } => assert!(
+            reason.contains("Vendor"),
+            "理由必须点名是哪条 external 没覆盖到：{reason}"
+        ),
+        other => panic!("体检不能对没比过的内容宣布健康，实际：{other:?}"),
+    }
 }
 
 #[test]

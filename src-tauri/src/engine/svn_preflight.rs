@@ -38,6 +38,7 @@ pub struct Preflight {
 /// | 1 | 枚举工作副本 | 后面三步都要它的结果；也是第一次真正接触 svn |
 /// | 2 | P4 同一仓库 | 跨仓库时 `svn commit` 直接拒（E200007），交付永远做不成 |
 /// | 3 | P3 没有未完成操作 | 树没更新完时，P1 和 P2 读到的东西本身就不可信 |
+/// | 3.5 | 算出检查目标 | 白名单根 + 嵌套 external 根，见 [`check_targets`] |
 /// | 4 | P1 工作副本干净 | **必须先于 P2** |
 /// | 5 | P2 nodeRevs 单值 | |
 ///
@@ -59,8 +60,9 @@ pub fn run_preflight(repo_root: &str, whitelist: &[String]) -> Result<Preflight>
     let wcs = enumerate_wcs(repo_root, whitelist)?;
     check_single_repository(&wcs)?; // P4
     check_no_operation_in_progress(repo_root, &wcs)?; // P3
-    check_clean(repo_root, &roots)?; // P1
-    let node_rev = check_single_node_rev(repo_root, &roots, &wcs)?; // P2
+    let targets = check_targets(&roots, &wcs);
+    check_clean(repo_root, &targets)?; // P1
+    let node_rev = check_single_node_rev(repo_root, &targets, &wcs)?; // P2
 
     let first = wcs.first().ok_or_else(|| {
         GitError::new(
@@ -73,6 +75,41 @@ pub fn run_preflight(repo_root: &str, whitelist: &[String]) -> Result<Preflight>
         repos_root: first.repos_root.clone(),
         uuid: first.uuid.clone(),
     })
+}
+
+/// P1 / P2 的检查目标：白名单根，**外加白名单底下每一条嵌套 external 的根**。
+///
+/// # 为什么不能只查白名单根
+///
+/// P4 对**同仓库**的嵌套 external 按设计放行（spec §6.5.5：「同仓库的嵌套 external
+/// 不阻断」），于是它是唯一能走完全程的形态。2026-09-15 实测（白名单 `Code/`，
+/// `Code/Vendor` 是同仓库 external）：
+///
+/// | 关卡 | 只查白名单根时的实测结果 |
+/// |---|---|
+/// | P1 `status --no-ignore --ignore-externals -- Code@` | 只有一条 `item="external"`，里面的 `M` **看不见** |
+/// | P2 `status -v --ignore-externals -- Code@` | `{3}`，external 停在 r1 这件事**不在集合里** |
+/// | §6.8 体检 `diff --old=URL@3 --new=. -- Code` | `<paths>` 空的，diff **不下沉进 external** |
+/// | `git add -- Code` | `Code/Vendor/V.cs` **照收** |
+///
+/// 四条叠起来：一个未提交、或停在别的 revision 的子树被录进基线、标着根的
+/// revision，而体检报 `Verified`。spec §6.5.5 把这块叫「git 管着、SVN 侧却没人盯的
+/// 盲区」，§6.6.5 的对策是「在**每个 `wc(P)`** 上各跑一次……取并集」——本函数就是
+/// 那个「每个 `wc(P)`」。
+///
+/// `--ignore-externals` 仍然照加：它负责挡住**更深**一层的嵌套 external，而那一层
+/// 由 [`enumerate_wcs`] 递归枚举出来、作为独立 target 各查一次（spec §6.6.5 末尾
+/// 那条「在 `wc(P)` 内部用它是对的」）。
+fn check_targets(roots: &[String], wcs: &[WcIdentity]) -> Vec<String> {
+    let mut targets = roots.to_vec();
+    for w in wcs {
+        // `wc_root` 与 `roots` 都经过同一套归一（正斜杠 + 去尾斜杠），白名单根自己
+        // 也在 `wcs` 里，所以这里同时完成「去重」与「只补嵌套 external」两件事。
+        if !targets.iter().any(|t| t.eq_ignore_ascii_case(&w.wc_root)) {
+            targets.push(w.wc_root.clone());
+        }
+    }
+    targets
 }
 
 /// 白名单条目归一成 svn target：正斜杠、去尾斜杠、丢掉空条目。
@@ -181,11 +218,15 @@ fn operation_in_progress(target: &str, what: &str, how: &str) -> GitError {
 /// 那既越过了 spec 的明文，风险方向也反了。误拦是**看得见**的——错误信息里
 /// 直接列出路径，用户当场就能判断；而放行一个 SVN 不管的文件是**看不见**的，
 /// 它会进基线、进交付清单，且基线本身一切正常。
-fn check_clean(repo_root: &str, roots: &[String]) -> Result<()> {
+///
+/// `targets` 来自 [`check_targets`]：白名单根**加上**嵌套 external 的根。只传白名单
+/// 根的话，嵌套 external 里的改动在这条命令下只显示成一条 `item="external"`，
+/// 而下面正好把它跳过——等于完全没查。
+fn check_clean(repo_root: &str, targets: &[String]) -> Result<()> {
     let mut dirty: Vec<String> = Vec::new();
     let mut has_untracked = false;
 
-    for root in roots {
+    for root in targets {
         let arg = peg_safe(root);
         let xml = run_svn(
             repo_root,
@@ -264,9 +305,13 @@ fn check_clean(repo_root: &str, roots: &[String]) -> Result<()> {
 ///
 /// 读法按 spec §6.6.2：带 `-v` 和 `--ignore-externals`，取 `<wc-status revision>`。
 /// 这两条都由 [`parse_node_revs`] 自己把关，漏了会响亮报错而不是静默算错。
-fn check_single_node_rev(repo_root: &str, roots: &[String], wcs: &[WcIdentity]) -> Result<u64> {
+///
+/// `targets` 来自 [`check_targets`]，对应 spec §6.6.5 的「在**每个 `wc(P)`** 上各跑
+/// 一次……取并集」。被 `-r` 钉住的嵌套 external 正是靠这条并集才现形——它自己那份
+/// revision 不会出现在父目录的 status 里。
+fn check_single_node_rev(repo_root: &str, targets: &[String], wcs: &[WcIdentity]) -> Result<u64> {
     let mut all: BTreeSet<i64> = BTreeSet::new();
-    for root in roots {
+    for root in targets {
         let arg = peg_safe(root);
         let xml = run_svn(
             repo_root,

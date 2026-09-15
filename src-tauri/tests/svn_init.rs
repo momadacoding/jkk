@@ -11,10 +11,15 @@ use app_lib::engine::git_cli::run_git;
 use app_lib::engine::svn_baseline::parse_trailer;
 use app_lib::engine::svn_cli::run_svn;
 use app_lib::engine::svn_health::Health;
-use app_lib::engine::svn_init::{init_hybrid, rebuild_baseline, InitRequest};
+use app_lib::engine::svn_init::{
+    check_current_baseline, init_hybrid, rebuild_baseline, InitRequest,
+};
 use app_lib::engine::svn_xml::parse_info;
 use std::process::Command;
-use svn_fixtures::{svn_repo, svn_repo_dirty, svn_repo_for_health, DirtyKind, SvnFixture};
+use svn_fixtures::{
+    svn_repo, svn_repo_dirty, svn_repo_for_health, svn_repo_with_same_repo_nested_external,
+    DirtyKind, NestedExternal, SvnFixture,
+};
 
 fn svn(dir: &std::path::Path, args: &[&str]) {
     let out = Command::new("svn")
@@ -309,6 +314,226 @@ fn fixture_advance_baseline(wc: &std::path::Path) {
         None,
     );
     git(&["update-ref", "refs/heads/svn/base", &new, &old], None);
+}
+
+#[test]
+fn init_succeeds_on_a_clean_same_repo_nested_external_and_never_tracks_its_dot_svn() {
+    // P1/P2 现在会把嵌套 external 一并查过，于是这条路径**第一次真的走得通**，
+    // 也第一次把两件事暴露在同一个流程里：
+    //
+    // ① 嵌套 external 有**自己的 `.svn`**（`Code/Vendor/.svn/wc.db`）。
+    //    2026-09-15 实测，裸 `git add -- Code` 会把它整个收进来。一旦 `wc.db`
+    //    被 git 跟踪，任何一次 `git checkout` 都会在一个**正在使用的** SVN 工作
+    //    副本底下把它换成另一个版本——那不是恢复旧数据，是直接损坏工作副本。
+    //    挡住它的是 `generate_exclude` 末尾那行不带前导 `/` 的 `.svn/`。
+    // ② 体检覆盖不到 external，所以结论必须是 NotChecked 而**不是** Verified。
+    let fx = svn_repo_with_same_repo_nested_external(NestedExternal::Clean);
+    let report = init_hybrid(&InitRequest {
+        repo_root: fx.wc_str(),
+        whitelist: vec!["Code/".to_string()],
+        extensions: vec![".cs".to_string()],
+    })
+    .expect("干净的同仓库嵌套 external 必须能建库");
+
+    let listed = run_git(
+        &fx.wc_str(),
+        &["ls-tree", "-r", "--name-only", "refs/heads/svn/base"],
+    )
+    .unwrap();
+    assert!(
+        listed.contains("Code/Vendor/V.cs"),
+        "external 里的源码本来就该进基线：{listed}"
+    );
+    assert!(
+        !listed.contains(".svn"),
+        "把 external 自己的 .svn 录进基线了，checkout 会损坏工作副本：{listed}"
+    );
+
+    match report.health {
+        Health::NotChecked { .. } => {}
+        other => panic!("体检覆盖不到 external，不能宣称健康，实际：{other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 并发初始化：回退只许删自己建的 .git
+// ---------------------------------------------------------------------------
+
+#[test]
+fn two_concurrent_inits_never_delete_the_winner_s_repository() {
+    // **这条针对的是 remove_dir_all 那处的所有权问题**，不是一般的并发整洁度。
+    //
+    // 2026-09-15 实测的交错（用裸 git 复现过每一步）：
+    //
+    // ```text
+    // T1 判 .git 不存在 ─┐
+    // T2 判 .git 不存在 ─┘   两条都过，因为「判断」与「创建」是两次系统调用
+    // T2 git init            建出 .git
+    // T1 git init            **exit 0**，静默 re-init（还会 ignored --initial-branch）
+    // T2 publish_baseline    抢到 refs/heads/svn/base
+    // T1 publish_baseline    update-ref 带「该 ref 不存在」前置条件 → exit 128
+    // T1 rollback            remove_dir_all(.git) ← 删掉的是 T2 的仓库
+    // ```
+    //
+    // 于是 T2 拿到一份「初始化成功」的报告，而磁盘上 .git 已经没了。
+    //
+    // 2026-09-15 用一个临时探针跑 6 轮，修复前实测命中率约 1/3，长这样：
+    //
+    // ```text
+    // round 2: ok=0 gitdir=false hybrid=SvnUninitialized
+    //     Err("git_cli / fatal: not a git repository …")
+    //     Err("git_cli / could not lock config file …/.git/config: File exists")
+    // ```
+    //
+    // 两条线程**同时**在同一个 .git 上跑 git init，撞在 config 锁上双双失败，
+    // 于是两边都回退，目录被删回 SvnUninitialized。
+    //
+    // 断言必须是 **`ok == 1`**，不能写成 `ok <= 1`：上面那种「两条都失败」正好让
+    // `ok <= 1` 通过，而它恰恰是 bug 的现场。正确实现下这个数恒为 1——抢到的那条
+    // 往下走，没抢到的那条在**动任何东西之前**就退出。
+    //
+    // ⚠️ **这条测试靠撞窗口，轮数是量出来的，不是拍的。** 2026-09-15 把实现改回
+    // 修复前的原样（只判存在、`.git` 交给 `git init` 去建）做变异测试：
+    //
+    // | 轮数 | 变异后的结果 |
+    // |---|---|
+    // | 6  | 跑 3 次，**2 次**变红（另一次没撞上窗口，假绿） |
+    // | 12 | 跑 4 次，**4 次**全红，两条断言都触发过 |
+    //
+    // 6 轮会漏，所以定 12。修复后同样 12 轮跑 3 次全绿，没有反向的抖动。
+    for round in 0..12 {
+        let fx = svn_repo();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let b = std::sync::Arc::clone(&barrier);
+            let r = req(&fx);
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                init_hybrid(&r).map_err(|e| format!("{} / {}", e.code, e.message))
+            }));
+        }
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let ok = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(ok, 1, "第 {round} 轮：必须恰好一条成功，实际 {results:?}");
+
+        // 落败的那条必须是**被所有权挡下**的，而不是一头撞进 git 管道里才失败。
+        // 撞进去意味着它已经在动那个不属于它的仓库了。
+        let err = results.iter().find_map(|r| r.as_ref().err()).unwrap();
+        assert!(
+            err.starts_with("svn_unconfigured_git") || err.starts_with("svn_already_initialized"),
+            "第 {round} 轮：落败方应当在占有检查处干净退出，实际：{err}"
+        );
+
+        let git = fx.wc().join(".git");
+        assert!(
+            git.is_dir(),
+            "第 {round} 轮：有一条请求报了成功，但 .git 被另一条的回退删掉了"
+        );
+        // 光有目录不够——被 remove_dir_all 删完再由失败方 git init 重建的残骸
+        // 同样是个目录。要求它真的是一个可用的混合仓库。
+        assert_eq!(
+            app_lib::vcs::detect_repo_kind(&fx.wc_str()),
+            app_lib::vcs::RepoKind::SvnHybrid,
+            "第 {round} 轮：.git 还在，但已经不是一个完好的混合仓库"
+        );
+        let head = run_git(&fx.wc_str(), &["symbolic-ref", "--short", "HEAD"]).unwrap();
+        assert_eq!(head.trim(), "work", "第 {round} 轮");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 手动体检：它读的是基线自己的 trailer rev（spec §6.8.5 那张表的最后一行）
+// ---------------------------------------------------------------------------
+
+/// 用**裸 git 管道命令**把当前磁盘上的 `Code/` 录成一个新的 `svn/base`，
+/// trailer 的 rev 由调用方指定——用来造「基线自称 rN、内容其实是别的 revision」。
+///
+/// 和 [`fixture_advance_baseline`] 一样故意不调用被测代码：trailer 文本在这里
+/// 手写，不走 `svn_baseline::format_trailer`。
+fn fixture_record_baseline_claiming(wc: &std::path::Path, rev: i64) {
+    let git = |args: &[&str], idx: Option<&std::path::Path>| -> String {
+        let mut c = Command::new("git");
+        c.current_dir(wc).args(args);
+        if let Some(p) = idx {
+            c.env("GIT_INDEX_FILE", p);
+        }
+        let out = c.output().expect("git not found");
+        assert!(
+            out.status.success(),
+            "git {args:?} 失败：{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let xml = run_svn(&wc.to_string_lossy(), &["info", "--xml"]).unwrap();
+    let info = &parse_info(&xml).unwrap()[0];
+
+    let idx = wc.join(".git/fixture2.index");
+    let _ = std::fs::remove_file(&idx);
+    git(&["add", "-A", "--", "Code"], Some(&idx));
+    let tree = git(&["write-tree"], Some(&idx));
+    let _ = std::fs::remove_file(&idx);
+
+    let old = git(&["rev-parse", "refs/heads/svn/base"], None);
+    let msg = format!(
+        "svn: r{rev}\n\ngit-svn-id: {}@{rev} {}\n",
+        info.repos_root, info.uuid
+    );
+    let new = git(&["commit-tree", &tree, "-p", &old, "-m", &msg], None);
+    git(&["update-ref", "refs/heads/svn/base", &new, &old], None);
+}
+
+#[test]
+fn the_manual_health_check_does_not_call_ordinary_wip_a_lying_baseline() {
+    // `svn_health::check_baseline` 的前提写在它自己的模块头上：「磁盘上白名单内的
+    // 内容 == 基线树的内容」。初始化与重建都满足（树刚从磁盘录出来），手动体检
+    // **不满足**——用户就在 work 分支上改代码，这是这个命令最常见的调用时机。
+    //
+    // 不校验前提的话，一个再正常不过的未提交改动会被报成「基线与服务器不符」，
+    // 而基线本身完全正确。指控错对象比不指控更糟：用户会照着引导去重建基线，
+    // 把一份好基线换掉，改动却还在那儿。
+    let fx = svn_repo_for_health();
+    init_hybrid(&req(&fx)).unwrap();
+
+    std::fs::write(fx.wc().join("Code/A.cs"), "work in progress\n").unwrap();
+
+    match check_current_baseline(&fx.wc_str()).unwrap() {
+        Health::NotChecked { reason } => assert!(
+            reason.contains("基线树") || reason.contains("未提交") || reason.contains("工作区"),
+            "理由要说清是「没法验证」而不是「基线坏了」：{reason}"
+        ),
+        other => panic!("普通 WIP 不该被判成基线撒谎，实际：{other:?}"),
+    }
+}
+
+#[test]
+fn the_manual_health_check_still_catches_a_baseline_whose_rev_is_stale() {
+    // **反向证据。** 上一条要求「磁盘和基线树不一致时别下结论」，单独看它可以被
+    // 「永远返回 NotChecked」满足——那等于把 §6.8 整条检查删掉。
+    //
+    // 这里造的是它真正要抓的形态：磁盘与基线树**一致**（前提成立），但基线的
+    // trailer 自称 r1，而那份内容其实是 r2 的。这正是 §6.8.1「让基线可被服务器
+    // 证伪」的目标。
+    let fx = svn_repo_for_health();
+    init_hybrid(&req(&fx)).unwrap();
+
+    let url = svn_fixtures::file_url(&fx.repo());
+    svn(fx.path(), &["checkout", &url, "wc2", "--non-interactive"]);
+    let wc2 = fx.path().join("wc2");
+    std::fs::write(wc2.join("Code/A.cs"), "v2\n").unwrap();
+    svn(&wc2, &["commit", "-m", "r2", "--non-interactive"]);
+    svn(&fx.wc(), &["update", "--non-interactive"]);
+
+    // 磁盘现在是 r2 的内容；把基线树对齐到它，但 trailer 仍写 r1
+    fixture_record_baseline_claiming(&fx.wc(), 1);
+
+    match check_current_baseline(&fx.wc_str()).unwrap() {
+        Health::Lying { files } => {
+            assert!(files.contains(&"Code/A.cs".to_string()), "实际：{files:?}")
+        }
+        other => panic!("基线自称的 revision 已经过时，必须报 Lying，实际：{other:?}"),
+    }
 }
 
 #[test]
