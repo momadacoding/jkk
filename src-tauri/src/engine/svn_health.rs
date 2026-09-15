@@ -16,6 +16,11 @@
 //! 时机全部满足它：HEAD 在 `svn/base` 上且工作区干净，或基线树刚从磁盘录出来。
 
 use crate::engine::svn_cli::run_svn;
+// `is_w_file` / `normalize_roots` 原本是本模块的私有函数，Phase 1c 提到
+// `svn_include_check` 共用——`svn_server_set` 要用**同一套**判据去过滤服务器清单。
+// 两份「什么算 W-file」迟早分叉，而分叉的表现是「每次打开都报几千条漏收」或者
+// 「永远报没问题」，两头都很难查。
+use crate::engine::svn_include_check::{is_w_file, normalize_roots};
 use crate::engine::svn_xml::parse_diff_summary;
 use crate::error::{GitError, Result};
 
@@ -66,7 +71,7 @@ pub fn check_baseline(
     whitelist: &[String],
     extensions: &[String],
 ) -> Result<Health> {
-    let roots = normalize(whitelist);
+    let roots = normalize_roots(whitelist);
     if roots.is_empty() {
         // 不传 target 时 `svn diff` 会拿**整个工作副本**跟服务器比。对一个 Unity
         // 工程那是几个 GB 的美术资产，而且任何一处正常的本地改动都会报成基线撒谎。
@@ -271,47 +276,6 @@ fn whitelist_not_under_base(
 // 反向证据由 `a_lying_baseline_inside_a_nested_external_is_caught` 提供：
 // 少了它，「见到 external 就返回 Verified」也能让干净那条变绿。
 // ─────────────────────────────────────────────────────────────────────────
-
-fn normalize(whitelist: &[String]) -> Vec<String> {
-    whitelist
-        .iter()
-        .map(|w| w.replace('\\', "/").trim_end_matches('/').to_string())
-        .filter(|w| !w.is_empty())
-        .collect()
-}
-
-/// 这条仓库相对路径算不算 W-file。
-///
-/// # 为什么是纯路径判断，不走磁盘
-///
-/// `svn_include_check::expected_set` 遍历磁盘算 W-file，但这里**不能**用它：
-/// T7 那类差异（服务器上删掉了 `Code/Deep/D.cs`）的文件在磁盘上根本不存在，
-/// 走磁盘的判断会把它整个漏掉——而那正是 §9.4.1 那类漏检要抓的东西。
-///
-/// 扩展名比较大小写不敏感：Windows 上 git 会把 `A.CS` 一起收进来
-/// （`core.ignoreCase` 默认 true），那它就是 W-file，体检不该当它不存在。
-fn is_w_file(rel: &str, roots: &[String], extensions: &[String]) -> bool {
-    // **单文件白名单条目不过扩展名过滤**，与 `svn_exclude` 的第 ③ 段和
-    // `svn_include_check::expected_set` 保持一致（spec §6.3）。
-    //
-    // 两边不一致的后果是假阴性：`whitelist:["Code/notes.txt"]` + `extensions:[".cs"]`
-    // 时，`notes.txt` 会被录进基线（那两处收它），而体检把它按扩展名滤掉
-    // ——服务器上改了它，体检照样报 `Verified`。
-    if roots.iter().any(|r| rel == r) {
-        return true;
-    }
-    let under = roots.iter().any(|r| rel.starts_with(&format!("{r}/")));
-    if !under {
-        return false;
-    }
-    if extensions.iter().any(|e| e == "*") {
-        return true;
-    }
-    let lower = rel.to_lowercase();
-    extensions
-        .iter()
-        .any(|e| lower.ends_with(&e.to_lowercase()))
-}
 
 /// 大小写不敏感地剥前缀。`file:///C:/…` 里盘符的大小写不保证与配置里一致。
 fn strip_prefix_ci(path: &str, prefix: &str) -> Option<String> {

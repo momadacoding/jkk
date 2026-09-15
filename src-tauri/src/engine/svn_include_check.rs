@@ -13,6 +13,54 @@ use crate::error::{GitError, Result};
 use std::collections::BTreeSet;
 use std::path::Path;
 
+/// 白名单条目归一成「仓库内相对路径、正斜杠、无尾斜杠」。
+pub(crate) fn normalize_roots(whitelist: &[String]) -> Vec<String> {
+    whitelist
+        .iter()
+        .map(|w| w.replace('\\', "/").trim_end_matches('/').to_string())
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// 这条仓库相对路径算不算 W-file。
+///
+/// # 全项目只有这一处定义
+///
+/// 三个模块要问同一个问题：本模块（磁盘侧期望集合）、`svn_health`（服务器 diff
+/// 的过滤）、`svn_server_set`（服务器清单的过滤）。两份判据迟早分叉，而分叉的
+/// 表现很难查——要么「每次打开都报几千条漏收」，要么「永远报没问题」。
+///
+/// # 为什么是纯路径判断，不走磁盘
+///
+/// [`expected_set`] 遍历磁盘算 W-file，但那套在这里**不能**用：服务器上存在、
+/// 磁盘上不存在的文件（被删掉的、或被 depth-exclude 掉的）恰恰是要抓的东西，
+/// 走磁盘的判断会把它们整个漏掉。
+///
+/// 扩展名比较大小写不敏感：Windows 上 git 会把 `A.CS` 一起收进来
+/// （`core.ignoreCase` 默认 true），那它就是 W-file。
+pub(crate) fn is_w_file(rel: &str, roots: &[String], extensions: &[String]) -> bool {
+    // **单文件白名单条目不过扩展名过滤**，与 `svn_exclude` 的第 ③ 段和
+    // [`expected_set`] 保持一致（spec §6.3）。
+    //
+    // 两边不一致的后果是假阴性：`whitelist:["Code/notes.txt"]` + `extensions:[".cs"]`
+    // 时，`notes.txt` 会被录进基线（那两处收它），而体检把它按扩展名滤掉
+    // ——服务器上改了它，体检照样报 `Verified`。
+    if roots.iter().any(|r| rel == r) {
+        return true;
+    }
+    let under = roots.iter().any(|r| rel.starts_with(&format!("{r}/")));
+    if !under {
+        return false;
+    }
+    if extensions.iter().any(|e| e == "*") {
+        return true;
+    }
+    let lower = rel.to_lowercase();
+    extensions
+        .iter()
+        .any(|e| lower.ends_with(&e.to_lowercase()))
+}
+
 /// 按配置遍历磁盘算出**期望**被 git 跟踪的文件集合（W-file，spec §6.3.2）。
 ///
 /// 路径统一为仓库内相对路径 + 正斜杠，与 `git ls-files` 的输出形式对齐。

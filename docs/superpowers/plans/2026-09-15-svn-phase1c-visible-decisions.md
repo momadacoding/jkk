@@ -18,7 +18,7 @@
 | 3 `svn_log_cache` 缓存与合并 | ⬜ 未开始 | | |
 | 4 `svn_sync` 失同步判定 | ✅ 完成 | `engine/svn_sync.rs`（新）、`engine/mod.rs`、`tests/svn_sync.rs`（新）、`tests/common/svn_fixtures.rs`（+3 个构造） | `cargo test --test svn_sync` **8 passed**；`cargo fmt --check` ✓、`cargo clippy --all-targets` **0 warning**；实现第一版就撞上 `wc_root` 语义那个坑，被测试当场抓住（详见下节） |
 | 5 基线体检按 WC 分组（§6.6.5 欠账） | ✅ 完成 | `engine/svn_health.rs`、`tests/svn_health.rs`、`tests/svn_init.rs` | `cargo test --test svn_health` **20 passed**；**全量 460 passed / 0 failed / 36 个二进制**（= 基线 412 + 新增 48，二进制 33 + 3）；`cargo fmt --check` ✓、`cargo clippy --all-targets` **0 warning** |
-| 6 服务器侧清单证伪漏收（NB-2 欠账） | ⬜ 未开始 | | |
+| 6 服务器侧清单证伪漏收（NB-2 欠账） | ✅ 完成 | `engine/svn_server_set.rs`（新）、`engine/svn_include_check.rs`（提出 `is_w_file` / `normalize_roots`）、`engine/svn_health.rs`、`engine/mod.rs`、`tests/svn_server_set.rs`（新）、`tests/common/svn_fixtures.rs` | `cargo test --test svn_server_set` **8 passed**（+ svn_health 20、svn_exclude 25 无回归）；`cargo fmt --check` ✓、`cargo clippy --all-targets` **0 warning**；变异测试抓出一条**测试覆盖不足**（详见下节） |
 | 7 Tauri 命令层与 `Capabilities.vcs` | ⬜ 未开始 | | |
 | 8 前端接合逻辑 `svnGraph.ts` | ⬜ 未开始 | | |
 | 9 前端展示逻辑 `svnSync.ts` | ⬜ 未开始 | | |
@@ -440,3 +440,65 @@ Phase 1 的验收语写着「此期只报警 + 提供**重建基线**」。1b �
 - 一个单位失败即整体 `NotChecked`，不做「其余都干净所以 Verified」的部分担保。
 - 本 Task **不改任何写路径**：`check_baseline` 只发 `svn diff` / `svn info`，
   它的三个调用方（初始化、重建、手动体检）对三种结论的处置逻辑一字未动。
+
+---
+
+## Task 6：服务器侧清单证伪 depth-excluded 漏收（NB-2 欠账）
+
+#### 偏离计划
+
+- **`ServerAudit::Missing` 多了一个 `total` 字段。** 计划只有 `files`。真实工程
+  一旦漏收就可能是几千条，界面上只列前 20 条，但**总数必须说**——只列 20 条而
+  不说总数，用户会以为只漏了 20 个。
+- **多写了 3 条计划里没有的测试**：`a_file_only_on_disk_is_not_reported`
+  （反方向不该报）、`a_revision_the_server_does_not_have_is_not_checked_either`、
+  以及下面那条从变异测试里逼出来的
+  `a_path_missing_at_that_revision_is_not_checked_rather_than_matched`。
+- **`is_w_file` / `normalize_roots` 提到了 `svn_include_check`**（计划只说提
+  `is_w_file`）。`normalize_roots` 是它的前置，分开放两个模块没有意义。
+
+#### 计划的错误
+
+- 计划的 `an_unreachable_url_is_not_checked_rather_than_matched` 用的 fixture 是
+  `svn_repo_initialized_with_bad_url`（不存在）。我用「把仓库本体从磁盘删掉」
+  实现它——**而这个造法测不出计划真正想守的那条**，见下。
+
+#### 计划没写的坑
+
+- **变异测试抓出的不是实现缺陷，是「测试覆盖不足」。**
+
+  计划安排：把 `run_svn` 换成 `run_svn_code` 并忽略退出码，`an_unreachable_url…`
+  应当变红。实测**照样全绿**。
+
+  原因：「把整个仓库删掉」时 svn 吐出来的 XML 是**坏的**（截断），`parse_list`
+  报错，于是被解析失败那条路兜住了——**退出码那道门根本没被考验到**。
+
+  而实测 P1 真正危险的形态是另一种：**仓库存在、只是路径在该 revision 上不存在**。
+  那时 svn exit 1，但 stdout 是一份**结构完整的空** `<lists><list></list></lists>`，
+  `parse_list` 会**成功**解析出空清单 ⇒ 服务器集合为空 ⇒ 差集恒为空 ⇒
+  报告「没有漏收」。
+
+  补了 fixture `svn_repo_whitelist_added_in_r2`（`Code/` 在 r1 上还不存在）与测试
+  `a_path_missing_at_that_revision_is_not_checked_rather_than_matched`。
+  带着变异重跑：**变红，实际值就是 `Matched`** —— 正是「用修 NB-2 的代码重造一个
+  NB-2」那个失败形态。撤销变异后转绿。
+
+  **教训**：「制造一个失败」和「制造 spec 实测记录的那一种失败」不是一回事。
+  P1 的记录里写着「exit 1 **但 stdout 结构完整**」，我造的场景丢掉了后半句。
+
+- **Task 5 的改动没有顺带修掉 NB-2。** 一度以为按单位分开发 diff 之后，
+  `svn diff --old=URL@N --new=Code` 会把 depth-excluded 的 `Code/Deep/D.cs`
+  报成删除。实测**没有**——`the_existing_checks_really_do_miss_a_depth_excluded_subtree`
+  在 Task 5 改完之后仍然绿。这块新机制确实是唯一入口。
+
+#### 为什么这么改是安全的（Task 6）
+
+- 这是本期**唯一一处新增的检查**，所以单独论证：
+  1. **它只读。** 只发 `svn ls -R`（纯读）与 `expected_set`（遍历磁盘，不写）。
+  2. **它不参与任何既有门槛。** 结论不进初始化 / 重建 / 交付的任何判定，
+     只在界面上多挂一条说明（Task 10）。**误报的代价止于噪音**。
+  3. **漏报的代价与改动前相同**——改动前这块盲区完全没人看。
+  4. 失败一律落 `NotChecked`，不冒泡成 `Err`：它是锦上添花，不该让仓库打不开。
+- 只报「服务器有、磁盘没有」一个方向。反方向是「本地新增还没 `svn add`」，
+  完全正常；报了就是噪音，而噪音会让用户学会忽略这条提示。
+- 过滤复用 `is_w_file` 这**同一处**定义，不再有第二份「什么算 W-file」。

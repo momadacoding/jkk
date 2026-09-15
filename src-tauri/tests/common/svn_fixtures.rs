@@ -602,6 +602,54 @@ pub fn svn_repo_mixed_revision() -> SvnFixture {
     SvnFixture { dir }
 }
 
+/// 白名单目录**在 r1 上还不存在**，r2 才建出来。
+///
+/// # 干什么用的
+///
+/// 复现 2026-09-15 实测 P1 那个形态：`svn ls -R <url>/Code@1` 时路径不存在，
+/// svn **exit 1**，但 stdout 仍是一份**结构完整的空** `<lists><list></list></lists>`
+/// ——`parse_list` 会成功解析出一个空清单。
+///
+/// 这是服务器侧核对最危险的失败形态：忽略退出码的写法会拿到空的服务器集合，
+/// 而「服务器有、磁盘没有」的差集在空集上**恒为空** ⇒ 报告「没有漏收」。
+///
+/// 「把整个仓库删掉」那种造法**测不出这一条**：那时 XML 是坏的，解析会失败，
+/// 于是靠解析错误兜住了，退出码那道门根本没被考验到。
+pub fn svn_repo_whitelist_added_in_r2() -> SvnFixture {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    run(&root, "svnadmin", &["create", "repo"]);
+    let url = file_url(&root.join("repo"));
+    run(
+        &root,
+        "svn",
+        &["checkout", &url, "wc1", "--non-interactive"],
+    );
+    let wc = root.join("wc1");
+
+    // r1：只有 Other/，还没有 Code/
+    std::fs::create_dir_all(wc.join("Other")).unwrap();
+    std::fs::write(wc.join("Other/O.txt"), "o\n").unwrap();
+    run(&wc, "svn", &["add", "Other", "--non-interactive"]);
+    run(
+        &wc,
+        "svn",
+        &["commit", "-m", "r1 other", "--non-interactive"],
+    );
+
+    // r2：Code/ 这才出现
+    std::fs::create_dir_all(wc.join("Code")).unwrap();
+    std::fs::write(wc.join("Code/A.cs"), "a\n").unwrap();
+    run(&wc, "svn", &["add", "Code", "--non-interactive"]);
+    run(
+        &wc,
+        "svn",
+        &["commit", "-m", "r2 code", "--non-interactive"],
+    );
+    run(&wc, "svn", &["update", "--non-interactive"]);
+    SvnFixture { dir }
+}
+
 /// 三个 revision、工作副本**干净地停在 r3**。
 ///
 /// 失同步检测的测试都要从这里起步：先在一个干净仓库上初始化（P1/P2/P3 都得过），
