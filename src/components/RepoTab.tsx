@@ -567,6 +567,12 @@ export function RepoTab({
     }
   }
 
+  // 已拉到的最早那条 SVN revision，「加载更多」从它往下接。
+  // svnRevs 由后端保证降序，所以取最后一个。
+  const oldestSvnRev = state.svnRevs.length > 0
+    ? state.svnRevs[state.svnRevs.length - 1].rev
+    : null
+
   // pinned 模式的残余风险，spec §6.5.3 第 3 条要求**常驻说明**：
   // 别的工具在项目根跑递归 update 会把这些目录退回被钉住的 revision，
   // 而工作副本看起来是干净的。只在向导里显示一次不算常驻。
@@ -693,6 +699,12 @@ export function RepoTab({
                     onOpenChanges={() => setViewMode('changes')}
                     onCommitAction={(action, commit) => void handleCommitAction(action, commit)}
                     capabilities={state.capabilities}
+                    onLoadMoreSvn={
+                      state.capabilities.vcs === 'svn'
+                        ? () => void fetchSvnLog(repoPath, oldestSvnRev)
+                        : undefined
+                    }
+                    svnLogComplete={oldestSvnRev !== null && oldestSvnRev <= 1}
                   />
                 </Panel>
                 <Separator style={{ height: 4, background: '#333' }} />

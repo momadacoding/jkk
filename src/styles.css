@@ -1713,6 +1713,44 @@ body {
   opacity: 0.9;
 }
 
+/* svn 节点：换配色，让人一眼看出它不是本地提交（点开没有 diff，也不能 checkout）。 */
+.commit-row.svn .commit-hash { color: #d8a657; }
+.commit-row.svn .commit-message { opacity: 0.88; }
+
+/* 「仅本地，不交付」角标（spec §6.7）。 */
+.local-only-badge {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 0 5px;
+  border-radius: 3px;
+  background: #4a3d16;
+  color: #f0e2b8;
+  font-size: 10px;
+  line-height: 16px;
+  vertical-align: 1px;
+}
+
+/* 图底部的「加载更多」。SVN 历史每次都走网络，所以按需加载（spec §10.2）。 */
+.graph-load-more {
+  padding: 6px 12px;
+  text-align: center;
+  border-top: 1px solid #333;
+}
+
+.commit-detail-message {
+  margin: 8px 12px;
+  white-space: pre-wrap;
+  font-family: inherit;
+}
+.commit-detail-note {
+  margin: 8px 12px;
+  padding: 6px 8px;
+  background: #2a2a2a;
+  border-left: 3px solid #6b5a20;
+  font-size: 12px;
+  opacity: 0.85;
+}
+
 /* 失同步横幅与服务器侧漏收提示。tone 与 engine/svnSync 的 BannerTone 对应。
    两条是独立的信息，可能同时出现，所以各自是一个完整的块。 */
 .banner-baseline {
