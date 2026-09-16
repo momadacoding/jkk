@@ -9,7 +9,7 @@
 |---|---|---|---|---|
 | 0 | spec 修订（§6.5 P1 / §6.3.1 / §6.8.7 / §16.1 / §16.2 / §13 / §14.2 / §18） | ✅ `19ed981` | `specs/2026-09-12-svn-git-hybrid-design.md` | 纯文档；八条未知已实测（见下） |
 | 1 | `run_svn_bytes` + `svn cat -r BASE` | ✅ | `svn_cli.rs`、`svn_pristine.rs`（新）、`tests/svn_pristine.rs`（新，6 例）、fixture `svn_repo_with_gbk_source` | fmt ✓ / clippy 0 警告 / cargo test **497 passed, 0 failed, 39 个二进制**（基线 491/38） |
-| 2 | P2 忽略 `revision="-1"` | ⬜ 未开始 | | |
+| 2 | P2 忽略 `revision="-1"` | ✅ | `svn_xml.rs`、`svn_preflight.rs`、`tests/svn_xml.rs`（+2 例） | fmt ✓ / clippy 0 警告 / cargo test **499 passed, 0 failed** |
 | 3 | P1 收窄到只拦 `~` | ⬜ 未开始 | | |
 | 4 | R2a 分类 | ⬜ 未开始 | | |
 | 5 | `TempIndex` blob 替换 / 条目删除 | ⬜ 未开始 | | |
@@ -79,6 +79,31 @@
 
 - `cat_base` 只读。`cat_base_returns_server_bytes_for_a_locally_modified_file` 用「取数前后磁盘逐字节相同」+「用户的本地修改原样还在」两条断言钉住这一点，不是靠声明。
 - 离线可用由 `cat_base_works_without_the_server` 钉住：把仓库目录移走之后仍然返回服务器内容。这条测试同时也是「实现没写成 `-r <数字>`」的证明——写成数字的话它会是 `E170013`。
+
+---
+
+## Task 2（P2 忽略 `revision="-1"`）
+
+### 计划没写的坑
+
+- **「全部节点都还没提交」需要一条独立的错误。** 把负数滤掉之后，如果白名单指向的内容整个都是本地新增的（还没进过 SVN），`nodeRevs` 会变成空集，于是掉进既有的那条空集守卫——而它的文案是「最常见的原因是漏了 `-v`」。那句话在这里完全是误导。新增错误码 `svn_xml_all_nodes_uncommitted`，说清真实原因是「这些文件还没提交到 SVN，录不出服务器在 rN 的样子」。
+- **过滤放在 `parse_node_revs` 而不是调用点。** 理由是语义：`nodeRevs` 问的是「工作副本停在哪个**服务器** revision」，一个未提交的节点对这个问题无可奉告，它就不该进这个集合。放在调用点的话，将来任何一个新调用点都要自己记得滤一遍。
+
+### 实测（先测后改）
+
+计划 Step 1 要求先用真实 svn 确认形状，因为「未提交的 add 带 `revision="-1"`」是从代码注释里读来的、不是本会话验过的。实测确认属实：
+
+```xml
+<entry path="Code\Added.cs">
+<wc-status item="added" revision="-1" props="none">
+```
+
+`parse_node_revs` 改动前对这份真实输出返回 `[-1, 1]`，改动后返回 `[1]`。
+
+### 为什么这么改是安全的
+
+- `svn_preflight::check_single_node_rev` 里那条 `u64::try_from` 的失败分支**保留着**，只是含义变了：它从前意味着「P1 没有先于 P2 执行」，现在意味着「`parse_node_revs` 的过滤被人删了」——一个实现缺陷的警报，不是用户工作副本的问题。注释已同步改写，没有留下一句过期的论证。
+- mixed-revision 的正常拦截不受影响：39 个 `svn_xml` 测试与全量 499 个测试全绿，其中包含既有的 mixed-revision 回归。
 
 ---
 

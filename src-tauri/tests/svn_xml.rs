@@ -12,7 +12,7 @@ use app_lib::engine::svn_xml::{
     parse_diff_summary, parse_external_roots, parse_externals_props, parse_info, parse_list,
     parse_log, parse_node_revs, parse_status_entries,
 };
-use svn_fixtures::svn_repo_with_cross_repo_nested_external;
+use svn_fixtures::{svn_repo_dirty, svn_repo_with_cross_repo_nested_external, DirtyKind};
 
 /// 真实 `svn status -v --xml` 的形态：属性跨行 + CRLF + 内层 <commit>。
 const STATUS_XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
@@ -703,6 +703,57 @@ fn a_legitimately_empty_listing_is_not_an_error() {
     let got = parse_list(xml).unwrap();
     assert_eq!(got.base, "file:///C:/tmp/empty");
     assert!(got.entries.is_empty());
+}
+
+/// `svn add` 了没提交的节点**不能**参与 `nodeRevs`。
+///
+/// # 为什么这条现在才需要
+///
+/// spec §16.1 之前，P1 要求白名单干净，未提交的 add 在 P1 就被拦掉了，永远走不
+/// 到 P2。放松 P1（§16.1）之后它会正常出现在 status 里，如果照收进 `nodeRevs`
+/// 就会让集合变成多值，用户看到的是「工作副本是 mixed-revision，请先跑一次完整
+/// svn update」——一条**做了也没用**的引导，真实原因是他有个没提交的新文件。
+///
+/// 语义上也讲得通：`nodeRevs` 问的是「工作副本停在哪个服务器 revision」，而一个
+/// 还没提交的节点**没有**服务器 revision，它对这个问题无可奉告。
+#[test]
+fn node_revs_ignores_uncommitted_additions() {
+    let fx = svn_repo_dirty(DirtyKind::Added);
+    let xml = run_svn(
+        &fx.wc_str(),
+        &["status", "-v", "--xml", "--ignore-externals", "--", "Code@"],
+    )
+    .unwrap();
+
+    let revs: Vec<i64> = parse_node_revs(&xml).unwrap().into_iter().collect();
+
+    assert_eq!(
+        revs,
+        vec![1],
+        "未提交的 add 不该进 nodeRevs。真实 XML：\n{xml}"
+    );
+}
+
+/// 全部节点都还没提交时，报的必须是**这件事**，不是「漏了 -v」。
+///
+/// 输入是把上一条测试打出来的真实 `item="added" revision="-1"` 形状单独拎出来，
+/// 不是凭空捏的理想 XML。
+#[test]
+fn node_revs_says_so_when_every_node_is_uncommitted() {
+    let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
+<status>\r\n<target\r\n   path=\".\">\r\n\
+<entry\r\n   path=\"Code\\Added.cs\">\r\n\
+<wc-status\r\n   item=\"added\"\r\n   revision=\"-1\"\r\n   props=\"none\">\r\n\
+</wc-status>\r\n</entry>\r\n</target>\r\n</status>\r\n";
+
+    let err = parse_node_revs(xml).expect_err("全是未提交节点时必须报错，不能返回空集");
+
+    assert_eq!(
+        err.code, "svn_xml_all_nodes_uncommitted",
+        "不能套用「漏了 -v」那条说法——那会把用户引向一个完全无关的方向。\
+         实际报的是：{}",
+        err.message
+    );
 }
 
 #[test]

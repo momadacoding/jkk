@@ -350,11 +350,18 @@ fn check_single_node_rev(repo_root: &str, targets: &[String], wcs: &[WcIdentity]
         )
     })?;
     u64::try_from(rev).map_err(|_| {
-        // 负数只可能来自 `svn add` 了没提交的节点（`revision="-1"`），
-        // 而那种节点 P1 已经拦住了。走到这里说明顺序被人调过。
+        // 负数来自 `svn add` 了没提交的节点（`revision="-1"`，2026-09-16 实测）。
+        //
+        // 旧版靠「P1 先拦住那种节点」来保证这里不会收到负数；spec §16.1 放松 P1
+        // 之后那条保证没了，改由 `parse_node_revs` 自己把负数滤掉（它在语义上就
+        // 不该进 `nodeRevs`——未提交的节点没有服务器 revision）。所以走到这里说明
+        // 过滤被人删了，是实现缺陷，不是用户的工作副本有问题。
         GitError::new(
             "svn_preflight",
-            format!("读到一个负的 revision（{rev}），说明 P1 没有先于 P2 执行"),
+            format!(
+                "读到一个负的 revision（{rev}）。未提交节点的 revision=\"-1\" \
+                 本该在 parse_node_revs 里就被滤掉。"
+            ),
         )
     })
 }
