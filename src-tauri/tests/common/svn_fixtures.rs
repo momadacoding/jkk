@@ -994,3 +994,28 @@ pub fn svn_repo_working_copy_far_behind() -> SvnFixture {
 
     SvnFixture { dir }
 }
+
+/// 白名单内放一个 **GBK 编码**的 `.cs`，并在本地改脏它。
+///
+/// 国内 Unity 工程里 GBK 源码很常见。这个 fixture 钉住 spec §16.2 末那条约束：
+/// `svn cat` 的结果必须按字节接收。一旦过了 `String::from_utf8_lossy`，每个非法
+/// 字节会变成 U+FFFD，录进基线就是一棵被悄悄改坏的树——而基线体检**查不出来**
+/// （它比的是磁盘与服务器，不比基线树，spec §6.8.3）。
+pub fn svn_repo_with_gbk_source() -> SvnFixture {
+    let fx = svn_repo();
+    let wc = fx.wc();
+    // `// 中文` 的 GBK 字节：D6 D0 = 中，CE C4 = 文。D6 后面跟着的 D0 不是合法的
+    // UTF-8 续字节（续字节必须是 10xxxxxx），所以这串一定会触发 lossy 替换，
+    // 正是要钉的那种输入。
+    let gbk: Vec<u8> = vec![
+        0x2F, 0x2F, 0x20, 0xD6, 0xD0, 0xCE, 0xC4, 0x0A, 0x63, 0x6C, 0x61, 0x73, 0x73, 0x20, 0x47,
+        0x20, 0x7B, 0x7D, 0x0A,
+    ];
+    std::fs::write(wc.join("Code/Gbk.cs"), &gbk).unwrap();
+    run(&wc, "svn", &["add", "Code/Gbk.cs", "--non-interactive"]);
+    run(&wc, "svn", &["commit", "-m", "r2 gbk", "--non-interactive"]);
+    run(&wc, "svn", &["update", "--non-interactive"]);
+    // 本地改脏——这才是 R2b 真正会调用 cat 的形态
+    std::fs::write(wc.join("Code/Gbk.cs"), b"// local\n").unwrap();
+    fx
+}

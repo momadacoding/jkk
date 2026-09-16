@@ -8,7 +8,7 @@
 | Task | 内容 | 状态 | 产出文件 | 验证 |
 |---|---|---|---|---|
 | 0 | spec 修订（§6.5 P1 / §6.3.1 / §6.8.7 / §16.1 / §16.2 / §13 / §14.2 / §18） | ✅ `19ed981` | `specs/2026-09-12-svn-git-hybrid-design.md` | 纯文档；八条未知已实测（见下） |
-| 1 | `run_svn_bytes` + `svn cat -r BASE` | ⬜ 未开始 | | |
+| 1 | `run_svn_bytes` + `svn cat -r BASE` | ✅ | `svn_cli.rs`、`svn_pristine.rs`（新）、`tests/svn_pristine.rs`（新，6 例）、fixture `svn_repo_with_gbk_source` | fmt ✓ / clippy 0 警告 / cargo test **497 passed, 0 failed, 39 个二进制**（基线 491/38） |
 | 2 | P2 忽略 `revision="-1"` | ⬜ 未开始 | | |
 | 3 | P1 收窄到只拦 `~` | ⬜ 未开始 | | |
 | 4 | R2a 分类 | ⬜ 未开始 | | |
@@ -48,6 +48,37 @@
 - **窗口期竞态只会误拦，不会静默录错。** 四种情形逐一数过（§16.1 的表），最坏是用户重点一次按钮。再加 R3c 复查 `nodeRevs` 兜一层。
 - **判据被削弱时有唯一的警报。** Task 8 Step 4 的变异测试（把 `S` 放大成全集）必须能让测试 76(b) 由绿转红。这是「S 必须恰好」这条约束唯一的自动化保障，变异结果要记进本文件。
 - **为什么不直接放行脏工作副本（把磁盘录进去）。** 那会让用户自己的改动被算进基线，Phase 3 交付时因为「和基线一样」而不在交付集合里，**静默消失**。比拒绝糟得多。这是初版那条 clean 门槛存在的真正理由，本轮换的是录制来源，不是拆门槛。
+
+---
+
+## Task 1（`run_svn_bytes` + `cat_base`）
+
+### 偏离计划
+
+- 计划里 `cat_base` 的返回类型写的是 `Result<BaseContent>`，实现照此；但 `run_svn_bytes` 的返回从计划里的 `Result<Vec<u8>>` 改成了 `Result<SvnBytes>`（带 `code` / `stdout` / `stderr`）。原因见下——不给出 stderr 就分不出「服务器上没有这个文件」和「取数失败」，而这两者的处理完全相反。
+
+### 计划的错误
+
+- 计划 Task 1 Step 3 写着「`E195002` 从 stderr 识别」。**错的，而且是我自己的 B3 实测结论误导了自己。** B3 当时跑的是 `svn cat -r 1`，得到 `E195002: has no committed revision`；实现改用 `-r BASE` 之后错误码变成了 **`E200009: has no pristine version until it is committed`**。照 B3 的结论写死 `E195002`，一个未提交的新文件就会掉进「取数失败」分支，整条重建在最常见的开发状态下直接崩。
+  - 现在两个码都认，并在注释里写清它随 `-r` 的写法变化。
+  - 教训写在这里是因为它有普遍性：**换了参数形式就等于换了一条命令，之前的实测结论不自动适用。**
+
+### 计划没写的坑
+
+- **`E200009` 是个偏通用的错误码（ILLEGAL_TARGET），不能拿它当分类的权威来源。** 所以 `NotOnServer` 被降级成一层**交叉校验**：真正决定「哪些文件从树里剔除」的是 `svn status`（R2a，Task 4），那些文件根本不会走到 `cat_base`。调用方若对一个「本该在服务器上」的文件拿到 `NotOnServer`，说明分类与实际不符，必须**中止**而不是静默把文件丢掉。这一条要在 Task 6 的实现里兑现。
+- **`svn cat` 接受 `--` 分隔符**（实测通过），所以路径以 `-` 开头也安全。
+- 空路径显式拒绝（`svn_pristine_empty_path`）。`AGENTS.md` §6.2 记过本仓库因空 pathspec 误伤过一次，这类边界一律不交给外部命令去猜。
+
+### 我自己写错的测试（照实记）
+
+`cat_base_preserves_non_utf8_bytes` 第一版加了一条 `assert!(!String::from_utf8_lossy(&got).contains('\u{FFFD}'))`。**这条断言是反的**：那串字节本来就不是合法 UTF-8，对它做 lossy 转换必然产生 U+FFFD，任何正确实现都过不去。真正要证的是「没走 lossy 那条路」，所以改成比对 `got` 与「把 got 过一遍 lossy 之后的样子」不相等，再加一条长度断言（lossy 会把 2 个非法字节膨胀成 3 字节）。
+
+同一个文件里字节比对那条断言从头到尾是绿的——也就是说**实现一次就对了，红的是我的断言**。记下来是因为它正好是 `AGENTS.md` §13 第 9 条的反面教材：一条名字叫「保持非 UTF-8 字节」的断言，测的却不是那件事。
+
+### 为什么这么改是安全的
+
+- `cat_base` 只读。`cat_base_returns_server_bytes_for_a_locally_modified_file` 用「取数前后磁盘逐字节相同」+「用户的本地修改原样还在」两条断言钉住这一点，不是靠声明。
+- 离线可用由 `cat_base_works_without_the_server` 钉住：把仓库目录移走之后仍然返回服务器内容。这条测试同时也是「实现没写成 `-r <数字>`」的证明——写成数字的话它会是 `E170013`。
 
 ---
 
