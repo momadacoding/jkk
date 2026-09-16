@@ -33,26 +33,29 @@ pnpm tauri dev
 
 ### 造一个 fixture 仓库
 
+脚本在 `scripts/e2e-svn-fixture.ps1`（完整内容以文件为唯一事实来源，
+这里只写入口，`AGENTS.md` §10）。
+
 ```powershell
-$root = Join-Path $env:TEMP ("phase1c_" + [guid]::NewGuid().ToString("N").Substring(0,8))
-New-Item -ItemType Directory -Path $root | Out-Null
-svnadmin create "$root\repo"
-$url = "file:///" + (Resolve-Path "$root\repo").Path.Replace('\','/')
-svn checkout --non-interactive $url "$root\wc1"
-Set-Location "$root\wc1"
-New-Item -ItemType Directory -Path "Code","Code\Deep","Art" | Out-Null
-Set-Content "Code\A.cs"      -Value 'class A {}'  -NoNewline
-Set-Content "Code\Deep\D.cs" -Value 'class D {}'  -NoNewline
-Set-Content "Art\boss.psd"   -Value 'PSD'         -NoNewline
-svn add Code Art --non-interactive
-svn commit -m "r1" --non-interactive
-svn update --non-interactive
-# 另开一个工作副本扮演「同事的机器」
-svn checkout --non-interactive $url "$root\wc2"
-Write-Host "fixture: $root\wc1"
+# 场景 1-7、9、10 用这个：服务器和 wc1 都在 r1
+pwsh -File scripts/e2e-svn-fixture.ps1
+
+# 场景 8 用这个：服务器走到 r230，而 wc1 **停在 r1**
+pwsh -File scripts/e2e-svn-fixture.ps1 -Shape Deep
 ```
 
-用完删掉整个 `$root`。
+脚本最后会打出三样东西：在应用里要打开的 `wc1`、扮演同事的 `wc2`
+（在那里提交 = 外部变更），以及删除整个 fixture 的命令。用完删掉。
+
+两种形态都会造出这些文件，后三个是**故意**放的：
+
+| 路径 | 作用 |
+|---|---|
+| `Code/A.cs`、`Code/Deep/D.cs` | 白名单内的代码，应当进 git |
+| `Code/Art.psd` | 白名单内但扩展名不符 —— 场景 6 的漏收提示**不能**报它 |
+| `Art/boss.psd` | 白名单外 —— 同上 |
+
+向导里白名单填 `Code/`、扩展名填 `.cs`。
 
 ## 场景
 
@@ -69,10 +72,12 @@ Write-Host "fixture: $root\wc1"
   预期：向导正常完成；随后图上出现 `r1` 的 svn 节点（配色与 git 提交不同、
   hash 位置显示 `r1`）；无横幅。
 
-- [ ] **3. 外部提交一个深层文件后回到窗口**
+- [ ] **3. 外部提交一个深层文件后回到窗口**（用 Simple 形态）
+
+  `<fixture>` 是脚本最后打出来的那个根目录。
 
   ```powershell
-  Set-Location "$root\wc2"
+  Set-Location "<fixture>\wc2"
   svn update --non-interactive
   Set-Content "Code\Deep\D.cs" -Value 'class D { int y; }' -NoNewline
   svn commit -m "r2 外部改深层文件" --non-interactive
@@ -92,40 +97,48 @@ Write-Host "fixture: $root\wc1"
 
   预期：弹出体检结果。三态都要试到：
   - 正常时 → `基线已通过体检（rN）`
-  - 断网 / 把 `$root\repo` 临时改名 → `基线未经体检`，并说明原因
+  - 断网 / 把 `<fixture>\repo` 临时改名 → `基线未经体检`，并说明原因
   - 手改一个白名单内的 `.cs` 再 commit 到 git（不 svn commit）→ 应当仍是
     `NotChecked`（磁盘与基线树不一致，前提不成立），**不是** `Lying`
 
 - [ ] **6. depth-exclude 一个白名单子目录**
 
   ```powershell
-  Set-Location "$root\wc1"
+  Set-Location "<fixture>\wc1"
   svn update --set-depth=exclude --non-interactive -- "Code/Deep@"
   ```
+
+  ⚠️ `Code/Deep@` 末尾那个 `@` 不能省：SVN 把最后一个 `@` 之后的内容当
+  peg revision 解析，加一个空的后缀才是「这个路径本身」。
 
   预期：**失同步横幅不出现**（判据看不见它，这是设计如此），
   但**漏收提示出现**，点名 `Code/Deep/D.cs`，并说明 git 没在保护它。
 
 - [ ] **7. 断网后打开仓库**
 
-  把 `$root\repo` 临时改名，模拟服务器不可达。
+  把 `<fixture>\repo` 临时改名，模拟服务器不可达。
 
   预期：图仍能从缓存画出来；**不弹错误横幅**；控制台有一条 `console.warn`。
   漏收提示不出现（`NotChecked` 不打扰用户）。
 
 - [ ] **8. 点「加载更多 SVN 历史」**（本轮改动最大，**优先跑**）
 
-  需要一个 revision 数 > 200 的仓库才能真的翻页；小 fixture 上只验
-  「历史一页拉完时按钮显示『已到最早的 revision』并禁用」。
+  用 `-Shape Deep` 的 fixture（服务器 r230、wc1 停在 r1），在 wc1 上走完初始化。
 
-  ⚠️ 这条要验的不只是按钮状态，还有**翻页不跳号**：
-  多翻几页之后，图上 SVN 节点的 revision 应当是**连续递减**的，
-  中间不能出现一大段空白再接一个孤零零的老 revision
-  （那正是第二轮 review 的 A2：游标取自含锚点的并集，中间整段永久跳过）。
+  `PAGE_SIZE` 是 200，所以这个形态下每一步的预期是**可以精确对数**的：
 
-  最能暴露问题的形态是「工作副本停在很旧的 revision、服务器已经走了很远」——
-  自动化侧由 `svn_repo_working_copy_far_behind` 覆盖，真实窗口里可以
-  `svn update -r <很小的数>` 之后重开仓库来复现。
+  | 步骤 | 图上应当有 | 「加载更多」 |
+  |---|---|---|
+  | 刚初始化完 | r230…r31（首屏 200 条）**加一个孤零零的 r1**（基线靠锚点补进来） | 可点 |
+  | 点一次「加载更多」 | r230…r1 **连号无缺口** | 变灰，显示「已到最早的 revision」 |
+
+  ⚠️ **要看的是中间那段 r2..r30 有没有被填上**，不是只看按钮。
+  第二轮 review 的 A2 正是「游标取自含锚点的并集」：从 r1 往下翻 →
+  一条命令都不发 → 按钮直接变灰，而 **r2..r30 永远拿不到**。
+  只盯按钮的话，坏的和好的都表现为「点一下就变灰」，完全分不出来。
+
+  对数的办法：随便点开一个 SVN 节点看 revision，或者数一下图上 SVN 节点的总数
+  （修好了应当是 230 个）。
 
 - [ ] **9. 勾上「仅本地，不交付」提交**
 
