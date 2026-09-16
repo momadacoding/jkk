@@ -568,12 +568,6 @@ export function RepoTab({
     }
   }
 
-  // 已拉到的最早那条 SVN revision，「加载更多」从它往下接。
-  // svnRevs 由后端保证降序，所以取最后一个。
-  const oldestSvnRev = state.svnRevs.length > 0
-    ? state.svnRevs[state.svnRevs.length - 1].rev
-    : null
-
   // HEAD 落在 baseline commit 上时（用户可以 checkout 到 svn/base），
   // 那个 oid 已经被接合从图上删掉了。换算成 `svn:N` 才找得到对应行 ——
   // 否则 HEAD 标记不画、侧边栏单击「定位」滚不过去。
@@ -597,6 +591,7 @@ export function RepoTab({
         </div>
       )}
       <BaselineBanner
+        isSvn={state.capabilities.vcs === 'svn'}
         sync={state.svnSync}
         audit={state.svnAudit}
         onRebuild={() => void handleRebuildBaseline()}
@@ -710,7 +705,7 @@ export function RepoTab({
                     capabilities={state.capabilities}
                     onLoadMoreSvn={
                       state.capabilities.vcs === 'svn'
-                        ? () => void fetchSvnLog(repoPath, oldestSvnRev)
+                        ? () => void fetchSvnLog(repoPath, true)
                         : undefined
                     }
                     svnLogComplete={state.svnLogComplete}

@@ -4,6 +4,19 @@
  * 这一层是**纯函数**：无 React、无 Tauri 依赖，可直接单测（`AGENTS.md` §7.2）。
  * `engine/layout.ts` 与 `engine/svgRenderer.tsx` **一行都不用改**——它们只认
  * `parents`（spec §10.4）。
+ *
+ * # trailer 的解析不在这里，在 Rust 侧
+ *
+ * `git-svn-id:` 与 `Local-Only:` 都写在 commit message 的**正文**里，而
+ * `load_graph` 给前端的 `message` 是 `commit.summary()` —— 只有第一段。
+ * 2026-09-16 独立 review 发现：在前端逐行找 trailer **恒为 null**，接合、
+ * `svn/base` 的 ref 重映射、「仅本地」角标三样一起静默失效，而前端测试因为直接
+ * 手写带 trailer 的完整 message 全部照绿（`AGENTS.md` §13 第 9 条的「虚假信心」）。
+ *
+ * 现在由 `engine/graph.rs` 用 `svn_baseline::parse_trailer` 解析，送到这里时已经是
+ * `baselineRev` / `localOnly` 两个字段。那是录制基线时用的**同一份**实现，
+ * 两侧规则不会漂移，而之前这里是它的第二份拷贝。
+ * 契约由 `src-tauri/tests/svn_graph_contract.rs` 钉住。
  */
 import type { CommitNode } from './types'
 
@@ -16,51 +29,6 @@ export interface SvnRevNode {
   message: string
 }
 
-/**
- * `git-svn-id` trailer 的格式，spec §6.4.1 钉死：
- * `git-svn-id: <url>@<rev> <repository-uuid>`，**三个字段缺一不可**。
- *
- * ⚠️ Rust 侧 `svn_baseline::parse_trailer` 有同一条正则的另一份实现。
- * 格式由 spec 钉死且两侧各有测试，接受这处重复——把它做成一个跨语言的单一事实源
- * 需要代码生成，代价大于收益。
- */
-const GIT_SVN_ID = /^git-svn-id: (\S+)@(\d+) ([0-9a-fA-F-]+)$/
-
-/** `Local-Only: true`（spec §6.7）。键按 git 的惯例大小写不敏感。 */
-const LOCAL_ONLY = /^local-only:\s*true\s*$/i
-
-export interface GitSvnId {
-  url: string
-  rev: number
-  uuid: string
-}
-
-/**
- * 从 commit message 里解析 `git-svn-id` trailer。
- *
- * **逐行完整匹配，不用 `includes`。** 正文里顺口提到这个格式的 commit 会被
- * 误判成 baseline，而 baseline 在 [`spliceHistory`] 里是要**从图上删掉**的
- * ——一个普通提交会就此消失。
- *
- * 解析失败即视为该 commit 不是 baseline：不猜、不部分接受（spec §6.4.1）。
- */
-export function parseGitSvnId(message: string): GitSvnId | null {
-  for (const line of message.split('\n')) {
-    const m = GIT_SVN_ID.exec(line.trim())
-    if (m) return { url: m[1], rev: Number(m[2]), uuid: m[3] }
-  }
-  return null
-}
-
-/**
- * 这个 commit 是不是「仅本地，不交付」（spec §6.7）。
- *
- * 判定**只认这条 trailer**，不新增任何配置。同样逐行完整匹配。
- */
-export function isLocalOnly(message: string): boolean {
-  return message.split('\n').some((line) => LOCAL_ONLY.test(line.trim()))
-}
-
 /** svn 节点的 id 形式，spec §10.4。 */
 function svnId(rev: number): string {
   return `svn:${rev}`
@@ -71,7 +39,8 @@ function svnId(rev: number): string {
  *
  * ```text
  * ① SVN 序列 → 节点：id = `svn:<rev>`，parents = [下一个更小 rev]
- * ② 扫 git commit，凡能解析出 git-svn-id 的即 baseline，建 <git id> → svn:<rev> 映射
+ * ② 扫 git commit，凡带 `baselineRev`（后端解析出的 git-svn-id）的即 baseline，
+ *    建 <git id> → svn:<rev> 映射
  * ③ 重写所有 git commit 的 parents，按映射替换；baseline commit 自身从输出里删掉
  * ④ 剔除任何不在最终节点集合里的 parent id        ← spec 没写，见下
  * ```
@@ -104,8 +73,7 @@ function svnId(rev: number): string {
 export function baselineMap(gitCommits: CommitNode[]): Map<string, string> {
   const map = new Map<string, string>()
   for (const c of gitCommits) {
-    const trailer = parseGitSvnId(c.message)
-    if (trailer) map.set(c.id, svnId(trailer.rev))
+    if (c.baselineRev !== undefined) map.set(c.id, svnId(c.baselineRev))
   }
   return map
 }
@@ -151,7 +119,7 @@ export function spliceHistory(svnRevs: SvnRevNode[], gitCommits: CommitNode[]): 
       ...c,
       parents: c.parents.map((p) => baselineToSvn.get(p) ?? p),
       vcs: 'git' as const,
-      localOnly: isLocalOnly(c.message),
+      localOnly: c.localOnly ?? false,
     }))
 
   const all = [...rewritten, ...svnNodes]

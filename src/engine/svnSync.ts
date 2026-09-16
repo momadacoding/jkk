@@ -122,6 +122,24 @@ export function describeSync(status: SyncStatus | null): BannerModel | null {
 }
 
 /**
+ * 常驻的「体检基线」入口要不要渲染。
+ *
+ * # 为什么不能只把它挂在失同步横幅里
+ *
+ * `describeSync` 对 `InSync` 返回 `null`，整条横幅不渲染，连带把唯一的体检入口
+ * 也带走了（2026-09-16 独立 review）。而 **revision 一致根本不能证明基线内容
+ * 正确**——`check_current_baseline` 报的 `Lying`（基线记的内容与服务器不符）
+ * 恰恰发生在 revision 完全对得上的时候，`svn revert` 那类外部操作也不动 revision。
+ *
+ * 换句话说，把体检入口绑在失同步状态上，等于**只在不需要它的时候提供它**。
+ *
+ * 失同步横幅自己带了一个体检按钮，所以那时不重复渲染，保证任何时刻恰好一个入口。
+ */
+export function needsStandaloneCheck(isSvn: boolean, sync: SyncStatus | null): boolean {
+  return isSvn && describeSync(sync) === null
+}
+
+/**
  * 服务器侧核对结果 → 提示。
  *
  * # `notChecked` 与 `matched` 一样不挂提示，但含义**完全不同**

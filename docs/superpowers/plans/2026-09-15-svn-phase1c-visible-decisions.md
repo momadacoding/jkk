@@ -27,6 +27,7 @@
 | 12 本地补丁标记 | ✅ 完成 | `src/engine/commitActions.ts`、`LocalChangesView.tsx`、`RepoTab.tsx`、`styles.css`、`tests/vitest/commitActions.test.ts` | **327 passed**（新增 4）、`pnpm build` ✓ |
 | 13 基线分支 UI 保护 | ✅ 完成 | `src/engine/capabilities.ts`、`BranchView.tsx`、`LocalChangesView.tsx`、`RepoTab.tsx`、`styles.css`、`tests/vitest/capabilities.test.ts` | **329 passed**（新增 2）、`pnpm build` ✓ |
 | 15 独立 review 的修复 | ✅ 完成 | `engine/svn_log.rs`、`engine/svn_server_set.rs`、`src/engine/svnGraph.ts`、`src/engine/svnSync.ts`、`src/store/repoStore.ts`、`src/components/{RepoTab,BaselineBanner}.tsx`、四个测试文件 | 5 条全部复现并修掉；Rust **480 passed / 0 failed / 37 个二进制**、`cargo fmt --check` ✓、`clippy` **0 warning**；前端 **334 passed / 24 files**、`pnpm build` ✓ |
+| 16 第二轮独立 review（Codex adversarial）的修复 | ✅ 完成 | `engine/graph.rs`、`engine/svn_log.rs`、`engine/svn_sync.rs`、`commands/svn.rs`、`tests/svn_graph_contract.rs`（新）、`tests/svn_log.rs`、`tests/svn_backend.rs`、`tests/common/svn_fixtures.rs`、`src/engine/{svnGraph,svnSync,types}.ts`、`src/store/repoStore.ts`、`src/components/{RepoTab,BaselineBanner}.tsx`、`src/styles.css`、三个 vitest 文件 | 4 条全部复现并修掉；Rust **491 passed / 0 failed / 38 个二进制**、`cargo fmt --check` ✓、`clippy` **0 warning**；前端 **333 passed / 24 files**、`pnpm build` ✓；翻页那条做了忠实变异验证（详见下节） |
 | 14 收尾验证 | 🟡 自动化部分完成 | 本文件、`docs/superpowers/e2e/2026-09-15-svn-phase1c-e2e.md`（新） | Rust **476 passed / 0 failed / 37 个二进制**、`cargo fmt --check` ✓、`cargo clippy --all-targets` **0 warning**；前端 **329 passed / 24 files**、`pnpm build` ✓；零 SVN 写操作核对通过；命令对账 **56 == 56**。**真实窗口的 10 个场景未执行**，见下 |
 
 ---
@@ -799,3 +800,163 @@ refs，`RepoTab` 用同一张表换算 `headHash`。两者都只在 `caps.vcs ==
   昂贵检查，不是少跑安全检查（第二档仍在打开仓库、重建基线后照常全量跑）。
 - R4 的映射只在 SVN 模式下做，且映射不到时原样返回；普通 git 仓库完全不受影响。
 - R5 是把 `svn_health` 里已有的判据搬过来，两处现在一致。
+
+---
+
+## Task 16：第二轮独立 review（Codex adversarial）的修复
+
+第一轮 review 修完之后跑的第二轮，`verdict = needs-attention`，4 条（2 high / 2
+medium）。**四条全部自己复现确认后才动手**，无一驳回。
+
+第一轮修完就交付会漏掉 A1——那一条让本期最大的一块功能**从头到尾没生效过**，
+而两侧 814 条测试全绿。这是「修完 review 再跑一轮」这条规矩本身的价值证明。
+
+### A1（阻断）图数据只有标题，trailer 根本到不了前端 —— 混合图从未生效
+
+`graph.rs:64` 取的是 `commit.summary()`：git2 的 `summary()` 只返回 message 的
+**第一段**，还会折叠空白。而基线 commit 的 message 是
+
+```text
+svn: r5
+          ← 空行
+git-svn-id: <url>@5 <uuid>
+```
+
+于是 `git-svn-id:` 那一行**永远不在前端拿到的 `message` 里**。而 `svnGraph.ts`
+偏偏就从那个字段逐行找它：
+
+| 代码 | 实际行为 | 界面表现 |
+|---|---|---|
+| `baselineMap` | 恒为空 Map | SVN 历史与 git 历史**不接合**，两段各自悬着 |
+| `remapRefs` | 没有键可映射 | `svn/base` 标签留在一个本该消失的 commit 上 |
+| `isLocalOnly` | 恒为 `false` | 「仅本地，不交付」角标**永远不出现** |
+
+也就是说 Task 8、11、12 三个 Task 的可见产出**一个都没真正工作过**。
+
+**为什么既有测试全绿**：`tests/vitest/svnGraph.test.ts` 的 `baseline()` helper
+自己手写了一条带 trailer 的多行 message 喂进 `spliceHistory`。被测函数因此
+一直拿到正确输入，而真实链路里断掉的是**它上游那一环**。
+`AGENTS.md` §13 第 9 条「测试的输入是否真是实际场景的形态」说的就是这个。
+
+**修法为什么不是「把 message 换成全文」**：
+
+- `message` 会被 `CommitRow` 一行一条渲染，换成全文要连带改渲染，
+  而视觉回归我**没有真实窗口可验**（§6.1 禁止 headless 验视觉）；
+- 5000 条提交的正文是白给的传输量；
+- 更重要的是，`svn_baseline::parse_trailer` 已经是这条 trailer 的**权威实现**
+  （录制基线、`read_baseline_rev`、`fetch_missing_anchors` 都在用），
+  而 `svnGraph.ts` 那份正则是它的第二份拷贝——前端解析这条路本身就不该走。
+
+**修**：`CommitNode` 加 `baseline_rev: Option<u64>` 与 `local_only: bool`，
+在 `graph.rs` 里用 `parse_trailer` 解析后发给前端；`svnGraph.ts` 删掉
+`parseGitSvnId` / `isLocalOnly` 及其正则，改读这两个字段。两个字段都带
+`skip_serializing_if`，普通 git 仓库的 payload 一个字节都没多。
+
+**新增 `tests/svn_graph_contract.rs`**：这是本期唯一一个**跨前后端契约**的测试
+文件，从真实 fixture 的 `init_hybrid` 一路走到 `graph::load` 的输出，包括
+一条把事故本身钉住的 `the_trailer_is_not_reachable_through_message_alone`
+——将来有人想「简化」回前端解析时，它会立刻变红并说明为什么那条路走不通。
+
+`tests/vitest/svnGraph.test.ts` 的 helper 一并改成真实形态（`message` 只有标题，
+`baselineRev` 单独给），并在 helper 的文档里写明**不准**再手写多行 message。
+
+`commitActions.test.ts` 那条「拼出来的能被 isLocalOnly 读回来」也是同一个病：
+写和读**两头都是前端**，看着闭环，而真正的读者在 Rust 侧。改成两侧各钉一半——
+前端钉「最后一行逐字是 `Local-Only: true`、前面空一行」，
+`svn_graph_contract.rs` 用**同一个字面量**当 commit 正文去读。
+
+### A2（阻断）翻页游标取自含锚点的并集，中间整段历史永久跳过
+
+`RepoTab` 把 `svnRevs`（= 所有 target 的缓存 **∪** 孤儿锚点，去重降序）的最小值
+当 `before_rev` 传给后端。但那个列表**不代表任何一段连续覆盖**：
+
+```text
+工作副本停在 r1、服务器到 r900（「同事在推进，我还没 update」，日常形态）：
+  首屏      → 目标覆盖 [701, 900]
+  孤儿锚点  → 基线 r1 被单点补拉进来
+  序列      → [900..701, 1]          ← r2..r700 是空的
+  前端游标  → 1  ⇒ from = 0 ⇒ 一条命令都不发
+  store     → 「这一页没带回新东西」⇒ svnLogComplete = true，按钮变灰
+```
+
+**r2..r700 从此再也拉不到**，而界面上只表现为图里少了些节点，没有任何报错。
+多个 target 活跃程度不同时同样会犯：一个小目录早就翻到 r1，并集最小值就永远是 1。
+
+注意第一轮 R3 改过的「这一页没带回新东西 = 到底了」在这里**帮了倒忙**——
+它把一个「拉不到」忠实地翻译成了「拉完了」。判据本身没错，错在它上游的游标。
+
+**修**：游标与完整性判定整个下沉到后端。
+
+- `fetch_log` 的签名 `before_rev: Option<u64>` → `older: bool`；
+  每个 target 各用**自己的** `covered_min - 1` 当起点，锚点不参与；
+- 返回值 `Vec<CachedRev>` → `LogPage { revs, complete }`，
+  `complete` = 每个 target 的 `covered_min` 都到了 1；
+- `read_log` 同样返回 `LogPage`，这样**重开仓库时按钮状态也对**
+  （只有 `fetch_log` 会算的话，重开一次按钮就重新亮起来）。
+
+顺带修准了覆盖下界：原来 `got` 非空时一律取 `min(got)`，保守但会让
+「其实没被 `--limit` 截断」的那一页多付一次往返，而且 `complete` 要晚一轮才成立。
+改成看 `got.len() < limit`——那是**没被截断**的充分条件，可以如实记成覆盖到 `to`。
+
+**新增 fixture `svn_repo_working_copy_far_behind`**（wc 停在 r1、服务器到 r9，
+r2..r9 由第二个 checkout 提交）。**忠实变异验证**：把游标改回并集最小值，
+`paging_does_not_skip_the_gap_between_the_first_page_and_an_old_anchor` 立刻变红，
+错误消息里序列卡死在 `[9, 8, 1]` —— 与上面推演的形态逐字一致。
+
+### A3 `rename_all` 不重命名变体内部的字段
+
+serde 的 `rename_all` 放在**枚举**上时只重命名变体名。`SyncVerdict::Diverged`
+的 `node_rev` / `baseline_rev` 照原样发出，而 `svnSync.ts` 读 `nodeRev` /
+`baselineRev`：
+
+```ts
+const forward = v.nodeRev > v.baselineRev   // undefined > undefined → false
+```
+
+于是**工作副本前进被描述成「被回退到基线之前」**，方向正好反了，
+文案里还插值出 `r undefined`。
+
+`svn_backend.rs` 里那条序列化断言测不到它：干净 fixture 恒为 `InSync`，
+而 `InSync` 是唯一**没有字段**的变体。
+
+**修**：加 `rename_all_fields = "camelCase"`（serde 1.0.184+，本仓库 1.0.229），
+并补一条逐个变体的序列化断言。同批检查了 `Health` 与 `ServerAudit`：
+它们的变体字段都是单个单词（`rev` / `files` / `total` / `reason`），不受影响。
+
+### A4 同步正常时点不到「体检基线」
+
+`describeSync` 对 `InSync` 返回 `null`，整条横幅不渲染，而唯一的「体检基线」
+按钮就在那条横幅里。结果是：**正常仓库、以及只有漏收提示的仓库，都无法主动体检**。
+
+而 `Lying`（基线记的内容与服务器不符）**恰恰发生在 revision 完全对得上的时候**
+——`svn revert` 那类外部操作根本不动 revision（`svn_sync.rs` 模块文档里有实测）。
+把体检入口绑在失同步状态上，等于**只在不需要它的时候提供它**。
+
+**修**：判据下沉成纯函数 `needsStandaloneCheck(isSvn, sync)`，没有失同步横幅时
+渲染一条常驻的低调入口（`.banner-baseline.quiet`，与工具条同色、低透明度）。
+做成黄条的话每个健康仓库顶上都常年挂一条警告色，用户很快会连真正的警告一起忽略。
+保证**任何时刻恰好一个**体检入口：横幅在就不重复渲染（有测试钉住两种横幅都自带
+`check` 动作）。
+
+### 为什么这些修改是安全的
+
+- **A1 扩大了 payload 的字段，但只在有值时**：两个新字段都带
+  `skip_serializing_if`，普通 git 仓库序列化出来与改动前逐字节相同。
+  解析用的是已经跑了两期的 `parse_trailer`，不是新写的规则。
+- **A2 只改查询区间与返回结构，不碰任何写路径。** 新游标恒 ≤ 旧游标能到的位置，
+  也就是说它只会**多拉**、不会少拉；拉回来的都是服务器上真实存在的 revision。
+  缓存格式（`CACHE_VERSION`）没变，旧缓存照常可读——`covered_min/max` 的语义
+  本来就是「连续覆盖区间」，这次只是终于**按它的语义去用**它。
+- **A3 只改序列化字段名。** Rust 侧字段名不变，前端读的名字不变，
+  改的是两者之间那层映射——改之前它是错的。
+- **A4 只加一个渲染分支**，`isSvn` 为 false 时整条不渲染，普通 git 仓库零影响；
+  「体检」本身是只读命令（`svn diff --summarize`），多给一个入口不引入任何写风险。
+
+### 仍然没做的
+
+- **真实窗口 10 个场景依旧一个都没跑。** 本轮改了两个 Tauri 命令的签名与返回
+  形状（`svn_read_log`、`svn_fetch_log`），`AGENTS.md` §7.3 明确要求这类改动
+  **实际跑一次 `pnpm tauri dev`** 验证 invoke 真的通。我只验证了编译与启动，
+  碰不到 IPC 那层 `snake_case` ↔ `camelCase`。E2E 场景 8（「加载更多」）现在
+  是**最该先跑**的一条。
+- 本轮修复**没有再跑第三轮 review**。

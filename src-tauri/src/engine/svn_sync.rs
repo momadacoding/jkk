@@ -42,8 +42,24 @@ use std::collections::BTreeSet;
 const BASELINE_BRANCH: &str = "svn/base";
 
 /// 失同步判定的结论。
+///
+/// # ⚠️ `rename_all` 与 `rename_all_fields` 是两件事
+///
+/// 枚举上的 `rename_all` 只重命名**变体名**（`Diverged` → `diverged`），
+/// 变体**内部的字段**一律原样发出。2026-09-16 独立 review 发现：少了
+/// `rename_all_fields` 时这里发的是 `node_rev` / `baseline_rev`，而前端
+/// `svnSync.ts` 读 `nodeRev` / `baselineRev`，两个都拿到 `undefined`：
+/// `forward = undefined > undefined` 恒为 false，于是**工作副本前进被说成
+/// 「被回退到基线之前」**，方向正好反了，文案里还插值出 `r undefined`。
+///
+/// 这层没有编译期检查（`AGENTS.md` §7.3），只能靠 `svn_backend.rs` 里那条
+/// 逐个变体的序列化断言兜住——只测无字段的 `InSync` 是测不到的。
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum SyncVerdict {
     /// `nodeRevs` 是单值且等于 `baselineRev`。
     InSync,

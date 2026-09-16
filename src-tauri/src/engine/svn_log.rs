@@ -133,30 +133,80 @@ pub const PAGE_SIZE: u32 = 200;
 /// 后果只是那一段的工作分支挂不上主干，不影响正确性。
 const MAX_ANCHORS: usize = 200;
 
+/// 一页历史，外加「还能不能再往下翻」。
+///
+/// # 完整性判定必须由后端给
+///
+/// 它的依据是每个 target 的**连续覆盖区间**，而那个信息只存在于缓存里，
+/// 前端手上只有一个去重合并后的 revision 列表。2026-09-16 独立 review 之前，
+/// 前端拿「这一页有没有带回新东西」当判据，而翻页游标又取自含孤儿锚点的并集，
+/// 两个凑在一起会在中间还差一大段时就把「到底了」点亮（见 [`fetch_log`]）。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogPage {
+    /// 合并后的完整序列（不只是这一页新增的），按 revision 降序。
+    pub revs: Vec<crate::engine::svn_log_cache::CachedRev>,
+    /// 全部 target 的连续覆盖区间都已经到 r1——再翻也没有了。
+    pub complete: bool,
+}
+
 /// 读**缓存里**的 SVN 历史，不走网络。
 ///
 /// 打开仓库时先用它把图画出来（spec §10.2）。读不到就是空列表——那只是
 /// 「还没拉过」，不是错误。
-pub fn read_log(repo_root: &str) -> Result<Vec<crate::engine::svn_log_cache::CachedRev>> {
+pub fn read_log(repo_root: &str) -> Result<LogPage> {
     let uuid = repo_uuid(repo_root)?;
     let cache = crate::engine::svn_log_cache::read_cache(repo_root, &uuid);
-    Ok(crate::engine::svn_log_cache::merged_sequence(&cache))
+    let targets = log_targets(repo_root)?;
+    Ok(LogPage {
+        revs: crate::engine::svn_log_cache::merged_sequence(&cache),
+        complete: is_complete(&cache, &targets),
+    })
+}
+
+/// 每个 target 的连续覆盖区间都到 r1 了吗。
+///
+/// **锚点不参与。** 锚点是逐个 revision 单点补拉的，彼此之间不连续，
+/// 序列里有一个 r1 完全不代表 r2..r300 也拉过了。
+fn is_complete(cache: &crate::engine::svn_log_cache::SvnLogCache, targets: &[String]) -> bool {
+    !targets.is_empty()
+        && targets.iter().all(|t| {
+            cache
+                .targets
+                .get(t)
+                .is_some_and(|e| e.covered_min == 1 && e.covered_max > 0)
+        })
 }
 
 /// 拉取 SVN 历史、并进缓存、返回合并后的序列。**走网络。**
 ///
-/// `before_rev` 为 `None` 时拉「比已缓存的更新的那一段」；给了值就是往下翻页，
-/// 拉比它更旧的 `limit` 条。
+/// `older == false` 是增量拉新（比已缓存的更新的那一段）；`true` 是往下翻页。
+///
+/// # 翻页游标由这里算，不由调用方传
+///
+/// 2026-09-16 独立 review 的阻断项：原先的签名是 `before_rev: Option<u64>`，
+/// 前端传「序列里最旧的那条 revision」。但那个序列是
+/// **所有 target 的缓存 ∪ 孤儿锚点**，不代表任何一段连续覆盖：
+///
+/// ```text
+/// 工作副本停在 r1、服务器到 r900：
+///   首屏      → 目标覆盖 [701, 900]
+///   孤儿锚点  → 基线 r1 单点补拉进来
+///   序列      → [900..701, 1]        ← r2..r700 是空的
+///   前端游标  → 1  ⇒ from = 0 ⇒ 一条命令都不发，还点亮「到底了」
+/// ```
+///
+/// 多个 target 活跃程度不同时同样会发生：一个小目录早就翻到了 r1，
+/// 整份并集的最小值就永远是 1。
+///
+/// 正确的游标是**每个 target 自己**连续覆盖区间的下界，各算各的——这个信息
+/// 只在缓存里，所以只能由后端算。
 ///
 /// # 单个 target 失败不中断其余的
 ///
 /// 白名单可能分布在多个工作副本里（spec §6.6.5）。一条 external 的 URL 不可达
 /// 不该让整条历史都拉不到——那会让图直接空掉。**全部 target 都失败才算整次失败。**
-pub fn fetch_log(
-    repo_root: &str,
-    before_rev: Option<u64>,
-    limit: u32,
-) -> Result<Vec<crate::engine::svn_log_cache::CachedRev>> {
+pub fn fetch_log(repo_root: &str, older: bool, limit: u32) -> Result<LogPage> {
     use crate::engine::svn_log_cache as cache_mod;
 
     let cfg = crate::engine::svn_config::read_config(repo_root)?;
@@ -198,16 +248,21 @@ pub fn fetch_log(
         // 用升序区间的话，revision 数超过一页的仓库首屏拿回来的是**最古老**的
         // 那一页，而 baseline 的 revision 在 HEAD 附近、不在里面，于是工作分支
         // 挂在一个没有链的孤零零锚点上。这是独立 review 抓到的阻断项。
-        let (from, to) = match before_rev {
+        let (from, to) = if !older {
             // 增量拉新：HEAD 往下，拉到已覆盖上界的下一个。
-            None => (head, entry.covered_max.saturating_add(1)),
-            // 往下翻页：从 before_rev 的前一个往更旧的方向拉一页。
+            (head, entry.covered_max.saturating_add(1))
+        } else if entry.covered_max == 0 {
+            // 这个 target 还一次都没拉过（比如新加的 external）。
+            // 「往下翻」对它而言就是首屏，从 HEAD 开始。
+            (head, 1)
+        } else {
+            // 往下翻页：从**这个 target 自己**连续覆盖区间的下界再往下一个开始。
             // 下界给 1，实际能拉多少由 limit 决定。
-            Some(b) => (b.saturating_sub(1), 1),
+            (entry.covered_min.saturating_sub(1), 1)
         };
         if from < to || from == 0 {
             // 增量：covered_max 已经到 HEAD，没有新东西。
-            // 翻页：已经翻到 r1 了。两种都不用发命令。
+            // 翻页：这个 target 已经翻到 r1 了。两种都不用发命令。
             continue;
         }
 
@@ -216,14 +271,20 @@ pub fn fetch_log(
                 // 覆盖区间的上界就是 `from`：即使 got 里最新的一条小于它，
                 // 中间那些 revision 也只是没碰过这个 target，同样算查过了。
                 //
-                // 下界分两种：
-                // - got 非空 → 取 `min(got)`。**不能用 `to`**：降序 + limit 会从
-                //   下面截断，比 min(got) 更旧的那些根本没返回，声称覆盖到 `to`
-                //   会让下一次翻页直接跳过它们，那段历史永久缺失且无声。
-                // - got 为空 → 整段 `[to, from]` 确实没有属于这个 target 的
-                //   revision，可以如实记成已覆盖。少了这一条，「这段没有提交」
-                //   的 target 会在每次刷新时重查同一段越来越大的区间。
-                let lo = got.iter().map(|e| e.revision).min().unwrap_or(to);
+                // 下界看这一页**有没有被 `--limit` 截断**：
+                // - 返回条数少于 limit → 没截断，整段 `[to, from]` 都查过了，
+                //   如实记成覆盖到 `to`。got 为空（这段没有属于该 target 的
+                //   revision）也落在这一支；少了它，「这段没有提交」的 target
+                //   会在每次刷新时重查同一段越来越大的区间。
+                // - 返回条数正好等于 limit → **可能**被截断了，只能保守地取
+                //   `min(got)`。比它更旧的那些根本没返回，声称覆盖到 `to` 会让
+                //   下一次翻页直接跳过它们，那段历史永久缺失且无声。
+                //   恰好不多不少时会多付一次往返，比永久丢历史便宜得多。
+                let lo = if (got.len() as u32) < limit {
+                    to
+                } else {
+                    got.iter().map(|e| e.revision).min().unwrap_or(to)
+                };
                 cache_mod::merge_into(entry, &got, lo, from);
             }
             Err(e) => failures.push(format!("{t}: {}", e.message)),
@@ -238,7 +299,10 @@ pub fn fetch_log(
 
     fetch_missing_anchors(repo_root, &repos_root, &mut cache)?;
     cache_mod::write_cache(repo_root, &cache)?;
-    Ok(cache_mod::merged_sequence(&cache))
+    Ok(LogPage {
+        revs: cache_mod::merged_sequence(&cache),
+        complete: is_complete(&cache, &targets),
+    })
 }
 
 /// 把基线分支上那些**不在序列里**的 revision 逐个补拉成锚点。

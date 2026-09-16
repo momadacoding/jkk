@@ -10,7 +10,8 @@ use app_lib::engine::svn_init::{init_hybrid, InitRequest};
 use app_lib::engine::svn_log;
 use svn_fixtures::{
     file_url, svn_repo, svn_repo_baseline_rev_outside_whitelist, svn_repo_three_revisions,
-    svn_repo_with_same_repo_nested_external, NestedExternal, SvnFixture,
+    svn_repo_with_same_repo_nested_external, svn_repo_working_copy_far_behind, NestedExternal,
+    SvnFixture,
 };
 
 /// 仓库根 URL（= Repository Root）。
@@ -161,8 +162,8 @@ fn fetch_log_brings_back_the_newest_revisions_not_the_oldest() {
     // `svn_repo_three_revisions` 的 `Code/A.cs` 在 r1/r2/r3 都被改过。
     let fx = svn_repo_three_revisions(); // Code 的历史 = r1, r2, r3
     init(&fx);
-    let got = svn_log::fetch_log(&fx.wc_str(), None, 2).unwrap();
-    let revs: Vec<u64> = got.iter().map(|e| e.rev).collect();
+    let got = svn_log::fetch_log(&fx.wc_str(), false, 2).unwrap();
+    let revs: Vec<u64> = got.revs.iter().map(|e| e.rev).collect();
     assert!(
         revs.contains(&3) && revs.contains(&2),
         "首屏应当是**最新**的两条 r3/r2，实际 {revs:?}"
@@ -177,16 +178,63 @@ fn fetch_log_brings_back_the_newest_revisions_not_the_oldest() {
 fn fetch_log_paging_walks_towards_older_revisions() {
     let fx = svn_repo_three_revisions();
     init(&fx);
-    let first = svn_log::fetch_log(&fx.wc_str(), None, 2).unwrap();
-    let oldest = first.iter().map(|e| e.rev).min().unwrap();
+    let first = svn_log::fetch_log(&fx.wc_str(), false, 2).unwrap();
 
-    let after = svn_log::fetch_log(&fx.wc_str(), Some(oldest), 2).unwrap();
-    let revs: Vec<u64> = after.iter().map(|e| e.rev).collect();
+    let after = svn_log::fetch_log(&fx.wc_str(), true, 2).unwrap();
+    let revs: Vec<u64> = after.revs.iter().map(|e| e.rev).collect();
     assert!(
-        revs.len() > first.len(),
+        after.revs.len() > first.revs.len(),
         "往下翻应当带回更早的 revision，实际 {revs:?}"
     );
     assert!(revs.contains(&1), "翻到底应当能拿到 r1：{revs:?}");
+}
+
+#[test]
+fn paging_does_not_skip_the_gap_between_the_first_page_and_an_old_anchor() {
+    // **独立 review 的第二条阻断项，2026-09-16 复现确认。**
+    //
+    // 形态（`svn_repo_working_copy_far_behind`）：工作副本停在 r1，服务器到 r9。
+    //
+    // ```text
+    // 首屏 limit=2  → 目标覆盖 [8,9]
+    // 孤儿锚点      → 基线 r1 单点补拉进来
+    // 序列          → [9, 8, 1]        ← 中间 r2..r7 是**空的**
+    // ```
+    //
+    // 旧写法拿「序列里最旧的 revision」当翻页游标，于是从 r1 往下翻 ——
+    // `from = 0`，一条命令都不发，还把「到底了」点亮。
+    // **r2..r7 从此永远拿不到**，界面上只表现为图里少了几个节点。
+    //
+    // 正确的游标是每个 target 自己**连续覆盖区间**的下界，锚点不参与。
+    let fx = svn_repo_working_copy_far_behind();
+    init(&fx);
+
+    let first = svn_log::fetch_log(&fx.wc_str(), false, 2).unwrap();
+    let revs: Vec<u64> = first.revs.iter().map(|e| e.rev).collect();
+    assert!(
+        revs.contains(&9) && revs.contains(&8),
+        "前提：首屏是最新的两条，实际 {revs:?}"
+    );
+    assert!(
+        revs.contains(&1),
+        "前提：基线 r1 靠锚点进了序列，中间是空的，实际 {revs:?}"
+    );
+    assert!(!first.complete, "中间还差一大段，不能说「到底了」");
+
+    // 一路翻到底，每次一页
+    let mut page = first;
+    for _ in 0..10 {
+        if page.complete {
+            break;
+        }
+        page = svn_log::fetch_log(&fx.wc_str(), true, 2).unwrap();
+    }
+
+    let got: Vec<u64> = page.revs.iter().map(|e| e.rev).collect();
+    assert!(page.complete, "翻完之后必须报「到底了」，实际 {got:?}");
+    for r in 1..=9u64 {
+        assert!(got.contains(&r), "r{r} 被跳过了：{got:?}");
+    }
 }
 
 #[test]
@@ -194,9 +242,40 @@ fn fetch_log_is_a_no_op_once_everything_is_cached() {
     // 「没有新东西」时不该反复重查同一段区间。
     let fx = svn_repo_baseline_rev_outside_whitelist();
     init(&fx);
-    let first = svn_log::fetch_log(&fx.wc_str(), None, 200).unwrap();
-    let second = svn_log::fetch_log(&fx.wc_str(), None, 200).unwrap();
-    assert_eq!(first, second);
+    let first = svn_log::fetch_log(&fx.wc_str(), false, 200).unwrap();
+    let second = svn_log::fetch_log(&fx.wc_str(), false, 200).unwrap();
+    assert_eq!(first.revs, second.revs);
+}
+
+#[test]
+fn a_fully_fetched_history_reports_complete_on_the_first_page() {
+    // 一页就装得下的仓库，「加载更多」必须一开始就是灰的——按钮亮着而点了
+    // 没反应，用户只会以为程序坏了。
+    let fx = svn_repo_three_revisions();
+    init(&fx);
+    let got = svn_log::fetch_log(&fx.wc_str(), false, 200).unwrap();
+    assert!(got.complete, "r1..r3 一页拉完了，实际 {got:?}");
+}
+
+#[test]
+fn read_log_reports_the_same_completeness_as_the_fetch_that_filled_the_cache() {
+    // 打开仓库时先用缓存把图画出来，那一刻按钮的状态也得对。
+    // 只有 `fetch_log` 会算 complete 的话，重开仓库按钮就会重新亮起来。
+    let fx = svn_repo_three_revisions();
+    init(&fx);
+    let fetched = svn_log::fetch_log(&fx.wc_str(), false, 200).unwrap();
+    let cached = svn_log::read_log(&fx.wc_str()).unwrap();
+    assert_eq!(cached.revs, fetched.revs);
+    assert_eq!(cached.complete, fetched.complete);
+}
+
+#[test]
+fn a_partially_fetched_history_is_not_reported_complete_from_the_cache() {
+    let fx = svn_repo_working_copy_far_behind();
+    init(&fx);
+    svn_log::fetch_log(&fx.wc_str(), false, 2).unwrap();
+    let cached = svn_log::read_log(&fx.wc_str()).unwrap();
+    assert!(!cached.complete, "缓存里只有顶上两条，实际 {cached:?}");
 }
 
 #[test]

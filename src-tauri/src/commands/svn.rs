@@ -19,8 +19,7 @@ use crate::engine::svn_init::{
     check_current_baseline, init_hybrid, pinned_externals, rebuild_baseline, InitReport,
     InitRequest, RebuildReport,
 };
-use crate::engine::svn_log::{fetch_log, read_log};
-use crate::engine::svn_log_cache::CachedRev;
+use crate::engine::svn_log::{fetch_log, read_log, LogPage};
 use crate::engine::svn_preflight::{run_preflight, Preflight};
 use crate::engine::svn_server_set::{audit_server_set_at_baseline, ServerAudit};
 use crate::engine::svn_sync::{check_sync, read_root_revs, RootRev, SyncStatus};
@@ -110,21 +109,23 @@ pub fn svn_root_revs(path: String) -> Result<Vec<RootRev>, GitError> {
 /// 打开仓库时先用它把图画出来（spec §10.2），随后由 [`svn_fetch_log`] 异步拉新的。
 /// 缓存不存在或读坏了都返回空列表而不是报错——那只是「还没拉过」。
 #[tauri::command(async)]
-pub fn svn_read_log(path: String) -> Result<Vec<CachedRev>, GitError> {
+pub fn svn_read_log(path: String) -> Result<LogPage, GitError> {
     read_log(&path)
 }
 
 /// 拉取 SVN 历史并写回缓存。**走网络**，调用方不要 await。
 ///
-/// `before_rev`（JS 侧 `beforeRev`）为 `None` 时拉「比已缓存的更新的那一段」；
-/// 给了值就是往下翻页，拉比它更旧的 `limit` 条。
+/// `older == false` 是增量拉新；`true` 是往下翻一页。
+///
+/// # 翻页游标**不由前端传**
+///
+/// 曾经的签名是 `before_rev: Option<u64>`，前端传序列里最旧的那条 revision。
+/// 那个序列含孤儿锚点、也混了多个 target，不代表任何一段连续覆盖，会让中间
+/// 整段历史被永久跳过（详见 [`fetch_log`] 的文档）。游标改由后端按各 target
+/// 自己的覆盖区间算，前端只说「再往下翻一页」。
 #[tauri::command(async)]
-pub fn svn_fetch_log(
-    path: String,
-    before_rev: Option<u64>,
-    limit: u32,
-) -> Result<Vec<CachedRev>, GitError> {
-    fetch_log(&path, before_rev, limit)
+pub fn svn_fetch_log(path: String, older: bool, limit: u32) -> Result<LogPage, GitError> {
+    fetch_log(&path, older, limit)
 }
 
 /// 服务器侧清单核对：白名单内的代码文件有没有在本地漏收（§6.3.1 / NB-2）。

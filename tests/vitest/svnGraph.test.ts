@@ -1,16 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import {
-  baselineMap,
-  isLocalOnly,
-  parseGitSvnId,
-  remapRefs,
-  spliceHistory,
-  type SvnRevNode,
-} from '@/engine/svnGraph'
+import { baselineMap, remapRefs, spliceHistory, type SvnRevNode } from '@/engine/svnGraph'
 import type { CommitNode } from '@/engine/types'
-
-const UUID = '8f3a1c7e-4b21-0410-9d2f-1a7b3c5d9e01'
-const ROOT = 'https://svn.company.com/game'
 
 const svn = (rev: number): SvnRevNode => ({
   rev,
@@ -19,63 +9,29 @@ const svn = (rev: number): SvnRevNode => ({
   message: `r${rev}`,
 })
 
-const git = (id: string, parents: string[], message = 'work'): CommitNode => ({
+/**
+ * 后端 `load_graph` 给的一条 git 提交。
+ *
+ * ⚠️ `message` **只有标题**（后端取的是 `commit.summary()`）。
+ * 这里绝不能手写一条带 trailer 的多行 message —— 2026-09-16 之前这个 helper
+ * 就是那么写的，于是全部测试在「前端根本拿不到 trailer」的情况下照样全绿
+ * （`AGENTS.md` §13 第 9 条：测试的输入不是实际场景的形态 = 虚假信心）。
+ */
+const git = (id: string, parents: string[], extra: Partial<CommitNode> = {}): CommitNode => ({
   id,
   parents,
   author: 'me',
   time: 1_700_000_000,
-  message,
+  message: 'work',
+  ...extra,
 })
 
-/** 一个真正的 baseline commit：message 带合法的 git-svn-id trailer。 */
+/**
+ * 一条 baseline commit，形状与后端真实产物一致：标题是 `svn: rN`，
+ * trailer 已经由 Rust 侧解析成 `baselineRev`。
+ */
 const baseline = (id: string, parents: string[], rev: number): CommitNode =>
-  git(id, parents, `svn: r${rev}\n\ngit-svn-id: ${ROOT}@${rev} ${UUID}`)
-
-describe('parseGitSvnId', () => {
-  it('三个字段缺一不可——解析失败即视为不是 baseline', () => {
-    // spec §6.4.1：不猜、不部分接受。半解析出来的 trailer 会让一个普通 commit
-    // 被当成基线从图上删掉。
-    expect(parseGitSvnId(`svn: r12\n\ngit-svn-id: ${ROOT}@12 ${UUID}`)?.rev).toBe(12)
-    expect(parseGitSvnId(`svn: r12\n\ngit-svn-id: ${ROOT} ${UUID}`)).toBeNull()
-    expect(parseGitSvnId(`svn: r12\n\ngit-svn-id: @12 ${UUID}`)).toBeNull()
-    expect(parseGitSvnId(`svn: r12\n\ngit-svn-id: ${ROOT}@abc ${UUID}`)).toBeNull()
-    expect(parseGitSvnId(`svn: r12\n\ngit-svn-id: ${ROOT}@12`)).toBeNull()
-  })
-
-  it('取出 url 与 uuid', () => {
-    const got = parseGitSvnId(`svn: r12\n\ngit-svn-id: ${ROOT}@12 ${UUID}`)!
-    expect(got.url).toBe(ROOT)
-    expect(got.uuid).toBe(UUID)
-  })
-
-  it('只认独立成行的 trailer，不匹配正文里顺口提到的', () => {
-    // 用 includes 写会把这条误判成 baseline，于是它从图上消失。
-    expect(parseGitSvnId(`聊到了 git-svn-id: ${ROOT}@1 ${UUID} 这个格式`)).toBeNull()
-  })
-
-  it('普通 commit 返回 null', () => {
-    expect(parseGitSvnId('fix: 修一个空引用')).toBeNull()
-    expect(parseGitSvnId('')).toBeNull()
-  })
-})
-
-describe('isLocalOnly', () => {
-  it('只认 Local-Only: true 这一条 trailer（spec §6.7）', () => {
-    expect(isLocalOnly('local: mute spawn log\n\nLocal-Only: true')).toBe(true)
-    expect(isLocalOnly('local: mute spawn log\n\nLocal-Only: false')).toBe(false)
-    expect(isLocalOnly('plain commit')).toBe(false)
-  })
-
-  it('正文里提到不算', () => {
-    expect(isLocalOnly('讨论了 Local-Only: true 要怎么写\n\n真正的结尾')).toBe(false)
-  })
-
-  it('容忍行尾空白与大小写', () => {
-    // git 自己对 trailer 的键是大小写不敏感的，用户手打时大小写会飘。
-    expect(isLocalOnly('x\n\nLocal-Only: true  ')).toBe(true)
-    expect(isLocalOnly('x\n\nlocal-only: TRUE')).toBe(true)
-  })
-})
+  git(id, parents, { message: `svn: r${rev}`, baselineRev: rev })
 
 describe('spliceHistory', () => {
   it('SVN 序列连成一条链，parent 指向下一个更小的 revision', () => {
@@ -131,8 +87,12 @@ describe('spliceHistory', () => {
     expect(out.find((c) => c.id === 'merge')!.parents).toEqual(['aaa', 'svn:5'])
   })
 
-  it('localOnly 按 trailer 标出来，普通 commit 不标', () => {
-    const out = spliceHistory([], [git('aaa', [], 'local: x\n\nLocal-Only: true'), git('bbb', [])])
+  it('localOnly 原样带过来，后端没标的归一成 false', () => {
+    // 判定本身在 Rust 侧（`graph.rs` 的 parse_local_only，契约见
+    // `src-tauri/tests/svn_graph_contract.rs`）。这里只保证接合不会把它弄丢，
+    // 以及缺省归一成 false —— 角标按 falsy 渲染，undefined 虽然也不渲染，
+    // 但它会让「后端没说」和「后端说了不是」在下游混成一谈。
+    const out = spliceHistory([], [git('aaa', [], { localOnly: true }), git('bbb', [])])
     expect(out.find((c) => c.id === 'aaa')!.localOnly).toBe(true)
     expect(out.find((c) => c.id === 'bbb')!.localOnly).toBe(false)
   })
@@ -208,10 +168,21 @@ describe('baselineMap / remapRefs', () => {
     expect(remapRefs(once, map)[0].hash).toBe('svn:4')
   })
 
-  it('baselineMap 只认真正的 baseline', () => {
-    const map = baselineMap([git('aaa', [], '聊到了 git-svn-id 这个格式'), baseline('bbb', [], 7)])
+  it('没有 baselineRev 的提交不进映射表', () => {
+    // 「哪些 commit 算 baseline」由后端判（trailer 要逐行完整匹配，正文里顺口
+    // 提到不算，见 `svn_graph_contract.rs`）。这里保证前端不自己再猜一遍 ——
+    // 猜错的代价是一个普通提交连同它的分支线从图上凭空消失。
+    const map = baselineMap([git('aaa', []), baseline('bbb', [], 7)])
     expect(map.get('aaa')).toBeUndefined()
     expect(map.get('bbb')).toBe('svn:7')
+  })
+
+  it('baselineRev 为 0 也算 baseline，不能被真值判断吃掉', () => {
+    // `if (c.baselineRev)` 会把 0 当成「不是 baseline」。r0 在 SVN 里是空仓库的
+    // 初始 revision，实际拿不到基线，但这条守的是**写法**：用真值判断读可选数字
+    // 字段迟早会在别处咬人。
+    const map = baselineMap([git('zero', [], { baselineRev: 0 })])
+    expect(map.get('zero')).toBe('svn:0')
   })
 
   it('HEAD 落在 baseline 上时也能换算出图上的节点 id', () => {

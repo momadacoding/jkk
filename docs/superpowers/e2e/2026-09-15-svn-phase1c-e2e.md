@@ -6,6 +6,10 @@
 > Tauri 的 `snake_case` → `camelCase` 参数名转换**没有编译期检查**（`AGENTS.md` §7.3），
 > 写错只会在运行时静默拿到 `undefined`。集成测试是直接调命令函数本体的，
 > **碰不到 IPC 那一层**，所以下面这些必须在真实窗口里跑。
+>
+> 2026-09-16 第二轮独立 review 之后，`svn_read_log` / `svn_fetch_log` 两个命令的
+> **参数与返回形状都改了**（`beforeRev: number | null` → `older: boolean`，
+> 返回 `SvnRevNode[]` → `{ revs, complete }`），场景 8 因此是眼下最该先跑的一条。
 
 ## 状态
 
@@ -109,10 +113,19 @@ Write-Host "fixture: $root\wc1"
   预期：图仍能从缓存画出来；**不弹错误横幅**；控制台有一条 `console.warn`。
   漏收提示不出现（`NotChecked` 不打扰用户）。
 
-- [ ] **8. 点「加载更多 SVN 历史」**
+- [ ] **8. 点「加载更多 SVN 历史」**（本轮改动最大，**优先跑**）
 
   需要一个 revision 数 > 200 的仓库才能真的翻页；小 fixture 上只验
-  「按钮在 r1 时显示『已到最早的 revision』并禁用」。
+  「历史一页拉完时按钮显示『已到最早的 revision』并禁用」。
+
+  ⚠️ 这条要验的不只是按钮状态，还有**翻页不跳号**：
+  多翻几页之后，图上 SVN 节点的 revision 应当是**连续递减**的，
+  中间不能出现一大段空白再接一个孤零零的老 revision
+  （那正是第二轮 review 的 A2：游标取自含锚点的并集，中间整段永久跳过）。
+
+  最能暴露问题的形态是「工作副本停在很旧的 revision、服务器已经走了很远」——
+  自动化侧由 `svn_repo_working_copy_far_behind` 覆盖，真实窗口里可以
+  `svn update -r <很小的数>` 之后重开仓库来复现。
 
 - [ ] **9. 勾上「仅本地，不交付」提交**
 

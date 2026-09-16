@@ -120,12 +120,13 @@ export interface RepoState {
    */
   gitCommits: CommitNode[]
   /**
-   * 已经翻到最早的 revision 了，「加载更多」该禁用。
+   * 已经翻到最早的 revision 了，「加载更多」该禁用。**由后端算，这里只转发。**
    *
-   * **判据是「上一次翻页没带回任何新东西」，不是「最旧的那条是不是 r1」。**
-   * 后者两头都错：白名单最早的 revision 是 r5 时它永远到不了 1、按钮永远亮着
-   * 而每次点击什么都不发生；而只要序列里恰好有 r1（比如锚点补拉带回来的），
-   * 它又会在还有大把历史没拉的时候就把按钮禁掉。
+   * 判据是「每个 target 的**连续覆盖区间**都到了 r1」，而覆盖区间只存在于后端
+   * 缓存里。前端手上的 `svnRevs` 是所有 target ∪ 孤儿锚点去重后的列表，
+   * 既看不出连续性、也分不清哪条属于哪个 target，用它推断完整性怎么写都是错的
+   * （2026-09-16 独立 review：原先「这一页没带回新东西 = 到底了」的写法，
+   * 配上同样取自并集的翻页游标，会在中间还差几百个 revision 时就把按钮禁掉）。
    */
   svnLogComplete: boolean
 }
@@ -233,19 +234,25 @@ export function svnRootRevs(path: string): Promise<RootRev[]> {
   return invoke<RootRev[]>('svn_root_revs', { path })
 }
 
+/** 一页 SVN 历史 + 「还能不能再往下翻」，对应后端 `LogPage`。 */
+export interface SvnLogPage {
+  revs: SvnRevNode[]
+  complete: boolean
+}
+
 /** 读缓存里的 SVN 历史，**不走网络**。打开仓库时先用它把图画出来。 */
-export function svnReadLog(path: string): Promise<SvnRevNode[]> {
-  return invoke<SvnRevNode[]>('svn_read_log', { path })
+export function svnReadLog(path: string): Promise<SvnLogPage> {
+  return invoke<SvnLogPage>('svn_read_log', { path })
 }
 
 /**
- * 拉取 SVN 历史，**走网络**。
+ * 拉取 SVN 历史，**走网络**。`older = true` 是往下翻一页。
  *
- * ⚠️ Rust 侧参数是 `before_rev`，JS 侧必须写 `beforeRev`（`AGENTS.md` §7.3）。
- * 这层转换没有编译期检查，写错只会在运行时静默拿到 `undefined`。
+ * ⚠️ 翻页游标**不在这里传**：它由后端按各 target 自己的连续覆盖区间算
+ * （见 Rust 侧 `fetch_log` 的文档）。这里只说「再往下翻一页」。
  */
-export function svnFetchLog(path: string, beforeRev: number | null, limit: number): Promise<SvnRevNode[]> {
-  return invoke<SvnRevNode[]>('svn_fetch_log', { path, beforeRev, limit })
+export function svnFetchLog(path: string, older: boolean, limit: number): Promise<SvnLogPage> {
+  return invoke<SvnLogPage>('svn_fetch_log', { path, older, limit })
 }
 
 /** 服务器侧清单核对（§6.3.1 / NB-2）。**走网络**，可能不便宜。 */
@@ -430,10 +437,15 @@ export function useRepoStore() {
 
   /** 读缓存里的 SVN 历史并接进图。不走网络。 */
   const refreshSvnLog = async (path: string) => {
-    const revs = await svnReadLog(path)
-      // svnRevs 一变就要重接一次：后台拉取是异步的，先画出来的图里
-      // svn 节点还没到位，工作分支那时还挂在 baseline commit 上。
-      setState((s) => ({ ...s, svnRevs: revs, commits: merge(s, s.gitCommits, revs) }))
+    const page = await svnReadLog(path)
+    // svnRevs 一变就要重接一次：后台拉取是异步的，先画出来的图里
+    // svn 节点还没到位，工作分支那时还挂在 baseline commit 上。
+    setState((s) => ({
+      ...s,
+      svnRevs: page.revs,
+      commits: merge(s, s.gitCommits, page.revs),
+      svnLogComplete: page.complete,
+    }))
   }
 
   /**
@@ -441,21 +453,16 @@ export function useRepoStore() {
    * 操作的，被这条锦上添花的信息占住的话，真正的失败反而看不见
    * （与 `refreshPullRequests` 同一条理由）。
    */
-  const fetchSvnLog = async (path: string, beforeRev: number | null = null) => {
+  const fetchSvnLog = async (path: string, older = false) => {
     try {
-      const revs = await svnFetchLog(path, beforeRev, SVN_LOG_PAGE)
+      const page = await svnFetchLog(path, older, SVN_LOG_PAGE)
       // svnRevs 一变就要重接一次：后台拉取是异步的，先画出来的图里
       // svn 节点还没到位，工作分支那时还挂在 baseline commit 上。
       setState((s) => ({
         ...s,
-        svnRevs: revs,
-        commits: merge(s, s.gitCommits, revs),
-        // **翻页没带回新东西 = 到底了。** 用「最旧的是不是 r1」判是错的：
-        // 白名单最早的 revision 是 r5 时永远到不了 1、按钮永远亮着而点了没反应；
-        // 反过来只要序列里恰好有 r1（锚点补拉带回来的也算），又会在还有大把
-        // 历史没拉时就把按钮禁掉。
-        svnLogComplete:
-          beforeRev !== null && revs.length === s.svnRevs.length ? true : s.svnLogComplete,
+        svnRevs: page.revs,
+        commits: merge(s, s.gitCommits, page.revs),
+        svnLogComplete: page.complete,
       }))
     } catch (err) {
       console.warn('拉取 SVN 历史失败，图上只显示缓存里已有的部分：', err)

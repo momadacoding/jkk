@@ -7,7 +7,6 @@ import {
   shortHash,
   type CommitAction,
 } from '../../src/engine/commitActions'
-import { isLocalOnly } from '../../src/engine/svnGraph'
 
 describe('buildCommitMessage', () => {
   it('Local-Only trailer 单独成段', () => {
@@ -26,11 +25,18 @@ describe('buildCommitMessage', () => {
     expect(buildCommitMessage('s', 'body\n\n', true)).toBe('s\n\nbody\n\nLocal-Only: true')
   })
 
-  it('拼出来的 message 能被 isLocalOnly 读回来', () => {
-    // 写和读是两个模块（commitActions 写、svnGraph 读）。这条把它们钉在一起——
-    // 少了它，两边各自改格式都不会有测试变红，而表现是「勾了但图上没角标」。
-    expect(isLocalOnly(buildCommitMessage('s', 'body', true))).toBe(true)
-    expect(isLocalOnly(buildCommitMessage('s', 'body', false))).toBe(false)
+  it('trailer 那一行与 Rust 侧读它的形态逐字一致', () => {
+    // **写和读跨了语言**：这里写，`src-tauri/src/engine/graph.rs` 的
+    // parse_local_only 读。两边没有共享常量，也没有编译期检查。
+    //
+    // 原先这条是拿前端的 `isLocalOnly` 做往返，看着闭环、其实两头都是自己人；
+    // 而真正的读者在 Rust 侧，它压根读不到才是那个 bug（2026-09-16 独立 review）。
+    // 现在两侧各钉一半：这里钉「拼出来的最后一行长什么样」，
+    // `svn_graph_contract.rs` 那条用**同一个字面量**当 commit 正文去读。
+    const msg = buildCommitMessage('s', 'body', true)
+    expect(msg.split('\n').at(-1)).toBe('Local-Only: true')
+    expect(msg.split('\n').at(-2)).toBe('')
+    expect(buildCommitMessage('s', 'body', false)).not.toContain('Local-Only')
   })
 })
 import { ALL_CAPABILITIES } from '../../src/engine/capabilities'

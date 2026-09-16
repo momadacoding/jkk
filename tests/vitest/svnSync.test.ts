@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { describeAudit, describeSync, type SyncStatus } from '@/engine/svnSync'
+import {
+  describeAudit,
+  describeSync,
+  needsStandaloneCheck,
+  type SyncStatus,
+} from '@/engine/svnSync'
 
 const inSync: SyncStatus = { baselineRev: 4, nodeRevs: [4], verdict: { kind: 'inSync' } }
 
@@ -121,5 +126,46 @@ describe('describeAudit', () => {
     const files = Array.from({ length: 20 }, (_, i) => `Code/F${i}.cs`)
     const m = describeAudit({ status: 'missing', files, total: 137 })!
     expect(m.detail).toContain('137')
+  })
+})
+
+describe('needsStandaloneCheck', () => {
+  // 2026-09-16 独立 review：体检入口原先只挂在失同步横幅里，而 describeSync
+  // 对 InSync 返回 null，于是**正常仓库根本点不到体检**。
+  // 偏偏 `Lying`（基线记的内容与服务器不符）恰恰发生在 revision 完全对得上的
+  // 时候 —— 等于只在不需要它的时候提供它。
+
+  it('同步的 SVN 仓库要有常驻入口', () => {
+    expect(needsStandaloneCheck(true, inSync)).toBe(true)
+  })
+
+  it('还没读到状态时也要有——离线打开仓库照样得能体检', () => {
+    expect(needsStandaloneCheck(true, null)).toBe(true)
+  })
+
+  it('普通 git 仓库不渲染', () => {
+    expect(needsStandaloneCheck(false, null)).toBe(false)
+    expect(needsStandaloneCheck(false, inSync)).toBe(false)
+  })
+
+  it('失同步横幅在时不重复渲染——任何时刻恰好一个入口', () => {
+    const diverged: SyncStatus = {
+      baselineRev: 4,
+      nodeRevs: [9],
+      verdict: { kind: 'diverged', nodeRev: 9, baselineRev: 4 },
+    }
+    expect(needsStandaloneCheck(true, diverged)).toBe(false)
+    // 前提：那条横幅自己带着体检按钮
+    expect(describeSync(diverged)!.actions.map((a) => a.id)).toContain('check')
+  })
+
+  it('pinned reset 的横幅也带体检，所以同样不重复', () => {
+    const pinned: SyncStatus = {
+      baselineRev: 9,
+      nodeRevs: [4],
+      verdict: { kind: 'pinnedReset', nodeRev: 4, baselineRev: 9, external: 'Code/Vendor' },
+    }
+    expect(needsStandaloneCheck(true, pinned)).toBe(false)
+    expect(describeSync(pinned)!.actions.map((a) => a.id)).toContain('check')
   })
 })

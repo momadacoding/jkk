@@ -943,3 +943,54 @@ pub fn svn_repo_baseline_rev_outside_whitelist() -> SvnFixture {
     run(&wc, "svn", &["update", "--non-interactive"]);
     SvnFixture { dir }
 }
+
+/// 工作副本停在 r1，而服务器已经走到 r9 —— **基线的 revision 远低于历史顶端**。
+///
+/// # 这个形态是翻页游标的试金石
+///
+/// `svn update` 不是每天都跑。工作副本停在一个旧 revision 上时，基线记的也是那个
+/// 旧 revision，而它**不在首屏那一页里**——首屏拿的是最新的一页。于是基线只能
+/// 靠单点补拉的锚点进入序列，序列变成「顶上一段 + 底下一个孤零零的锚点」，
+/// 中间整段是空的。
+///
+/// 拿「序列里最旧的 revision」当翻页游标，就会直接从那个锚点往下翻，
+/// **中间那一大段永远拿不到**，而界面上只表现为图里少了些节点。
+pub fn svn_repo_working_copy_far_behind() -> SvnFixture {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    run(&root, "svnadmin", &["create", "repo"]);
+    let url = file_url(&root.join("repo"));
+
+    // r1：wc1 自己建出白名单内容，之后**再也不 update**
+    run(
+        &root,
+        "svn",
+        &["checkout", &url, "wc1", "--non-interactive"],
+    );
+    let wc = root.join("wc1");
+    std::fs::create_dir_all(wc.join("Code")).unwrap();
+    std::fs::write(wc.join("Code/A.cs"), "a\n").unwrap();
+    run(&wc, "svn", &["add", "Code", "--non-interactive"]);
+    run(&wc, "svn", &["commit", "-m", "r1", "--non-interactive"]);
+    run(&wc, "svn", &["update", "--non-interactive"]);
+
+    // r2..r9 由**另一个 checkout** 提交：wc1 的 nodeRevs 因此停在 1，
+    // 正是「同事在推进，我还没 update」的日常形态。
+    run(
+        &root,
+        "svn",
+        &["checkout", &url, "other", "--non-interactive"],
+    );
+    let other = root.join("other");
+    for n in 2..=9 {
+        std::fs::write(other.join("Code/A.cs"), format!("a{n}\n")).unwrap();
+        run(
+            &other,
+            "svn",
+            &["commit", "-m", &format!("r{n}"), "--non-interactive"],
+        );
+        run(&other, "svn", &["update", "--non-interactive"]);
+    }
+
+    SvnFixture { dir }
+}

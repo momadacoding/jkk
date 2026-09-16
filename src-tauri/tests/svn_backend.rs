@@ -405,18 +405,19 @@ fn svn_read_log_never_touches_the_network() {
     let fx = svn_repo();
     init_hybrid_on(&fx);
     let got = app_lib::commands::svn::svn_read_log(fx.wc_str()).unwrap();
-    assert!(got.is_empty(), "还没拉过，应当是空列表，实际 {got:?}");
+    assert!(got.revs.is_empty(), "还没拉过，应当是空列表，实际 {got:?}");
+    assert!(!got.complete, "「还没拉过」不是「已经拉完」，实际 {got:?}");
 }
 
 #[test]
 fn svn_fetch_log_populates_the_cache_and_is_idempotent() {
     let fx = svn_repo();
     init_hybrid_on(&fx);
-    let first = app_lib::commands::svn::svn_fetch_log(fx.wc_str(), None, 200).unwrap();
-    assert!(!first.is_empty(), "拉完应当有历史");
+    let first = app_lib::commands::svn::svn_fetch_log(fx.wc_str(), false, 200).unwrap();
+    assert!(!first.revs.is_empty(), "拉完应当有历史");
 
     // 再拉一次不该产生任何差异：SVN 历史不可变，增量区间也已经覆盖到 HEAD。
-    let second = app_lib::commands::svn::svn_fetch_log(fx.wc_str(), None, 200).unwrap();
+    let second = app_lib::commands::svn::svn_fetch_log(fx.wc_str(), false, 200).unwrap();
     assert_eq!(first, second);
 
     // 缓存已落盘，纯本地读现在拿得到同一份
@@ -437,11 +438,11 @@ fn svn_fetch_log_includes_the_baseline_anchor_even_when_it_missed_the_whitelist(
         .baseline_rev;
 
     // 白名单 URL 的历史里确实没有它
-    let got = app_lib::commands::svn::svn_fetch_log(fx.wc_str(), None, 200).unwrap();
+    let got = app_lib::commands::svn::svn_fetch_log(fx.wc_str(), false, 200).unwrap();
     assert!(
-        got.iter().any(|e| e.rev == baseline),
+        got.revs.iter().any(|e| e.rev == baseline),
         "baseline r{baseline} 必须在序列里（靠锚点补拉），实际 {:?}",
-        got.iter().map(|e| e.rev).collect::<Vec<_>>()
+        got.revs.iter().map(|e| e.rev).collect::<Vec<_>>()
     );
 }
 
@@ -499,9 +500,56 @@ fn the_new_commands_serialize_with_the_field_names_the_frontend_reads() {
     assert!(revs[0].get("wcRoot").is_some(), "实际 {revs}");
 
     let log = serde_json::to_value(
-        app_lib::commands::svn::svn_fetch_log(fx.wc_str(), None, 200).unwrap(),
+        app_lib::commands::svn::svn_fetch_log(fx.wc_str(), false, 200).unwrap(),
     )
     .unwrap();
-    assert!(log[0].get("rev").is_some(), "实际 {log}");
-    assert!(log[0].get("message").is_some(), "实际 {log}");
+    assert!(log.get("complete").is_some(), "实际 {log}");
+    assert!(log["revs"][0].get("rev").is_some(), "实际 {log}");
+    assert!(log["revs"][0].get("message").is_some(), "实际 {log}");
+}
+
+#[test]
+fn every_sync_verdict_variant_serializes_its_fields_in_camel_case() {
+    // **上面那条测不到这个。** 干净仓库恒为 `InSync`，而 `InSync` 没有字段；
+    // 带字段的三个变体一条都没被序列化过。
+    //
+    // 2026-09-16 独立 review 发现：枚举上的 `rename_all` 只重命名**变体名**，
+    // 不重命名变体**内部的字段**。于是 `Diverged` 实际发出 `node_rev` /
+    // `baseline_rev`，而前端 `svnSync.ts` 读的是 `nodeRev` / `baselineRev`：
+    //
+    // - `forward = v.nodeRev > v.baselineRev` → `undefined > undefined` = false
+    //   ⇒ **工作副本前进被说成「被回退到基线之前」**，方向正好反了；
+    // - 文案里插值出 `r undefined`。
+    //
+    // 这三个变体只能手工构造——要在集成测试里真造出 pinned 场景得另起一个
+    // fixture，而这里要钉的是序列化形状，不是判定逻辑（那个 `svn_sync.rs` 里有）。
+    use app_lib::engine::svn_sync::SyncVerdict;
+
+    let mixed = serde_json::to_value(SyncVerdict::MixedRevision { revs: vec![3, 5] }).unwrap();
+    assert_eq!(mixed["kind"], "mixedRevision", "实际 {mixed}");
+    assert_eq!(mixed["revs"][1], 5, "实际 {mixed}");
+
+    let diverged = serde_json::to_value(SyncVerdict::Diverged {
+        node_rev: 9,
+        baseline_rev: 4,
+    })
+    .unwrap();
+    assert_eq!(diverged["kind"], "diverged", "实际 {diverged}");
+    assert_eq!(diverged["nodeRev"], 9, "实际 {diverged}");
+    assert_eq!(diverged["baselineRev"], 4, "实际 {diverged}");
+    assert!(
+        diverged.get("node_rev").is_none(),
+        "不能同时留着 snake_case 的写法：{diverged}"
+    );
+
+    let pinned = serde_json::to_value(SyncVerdict::PinnedReset {
+        node_rev: 4,
+        baseline_rev: 9,
+        external: "Vendor/Lib".to_string(),
+    })
+    .unwrap();
+    assert_eq!(pinned["kind"], "pinnedReset", "实际 {pinned}");
+    assert_eq!(pinned["nodeRev"], 4, "实际 {pinned}");
+    assert_eq!(pinned["baselineRev"], 9, "实际 {pinned}");
+    assert_eq!(pinned["external"], "Vendor/Lib", "实际 {pinned}");
 }

@@ -2,11 +2,14 @@ import { useState } from 'react'
 import {
   describeAudit,
   describeSync,
+  needsStandaloneCheck,
   type ServerAudit,
   type SyncStatus,
 } from '../engine/svnSync'
 
 interface BaselineBannerProps {
+  /** 是不是 SVN 混合仓库。普通 git 仓库下整个组件什么都不渲染。 */
+  isSvn: boolean
   sync: SyncStatus | null
   audit: ServerAudit | null
   /** 重建基线。调用方负责先弹确认。 */
@@ -29,13 +32,21 @@ interface BaselineBannerProps {
  *
  * 失同步说的是「revision 对不上」，漏收说的是「文件根本没下来」。
  * 一个正常、另一个不正常是完全可能的组合，所以分两条渲染。
+ *
+ * # 体检入口必须**常驻**，不能只在失同步时出现
+ *
+ * revision 一致不代表基线内容正确：`Lying`（基线记的内容与服务器不符）恰恰发生在
+ * revision 完全对得上的时候。把入口绑在失同步横幅里，等于只在不需要它的时候
+ * 提供它（2026-09-16 独立 review）。判据下沉到 `needsStandaloneCheck`，
+ * 保证任何时刻**恰好一个**体检入口。
  */
-export function BaselineBanner({ sync, audit, onRebuild, onCheck }: BaselineBannerProps) {
+export function BaselineBanner({ isSvn, sync, audit, onRebuild, onCheck }: BaselineBannerProps) {
   const model = describeSync(sync)
   const auditModel = describeAudit(audit)
+  const standalone = needsStandaloneCheck(isSvn, sync)
   const [copied, setCopied] = useState(false)
 
-  if (!model && !auditModel) return null
+  if (!model && !auditModel && !standalone) return null
 
   return (
     <>
@@ -82,6 +93,16 @@ export function BaselineBanner({ sync, audit, onRebuild, onCheck }: BaselineBann
               <li key={f}>{f}</li>
             ))}
           </ul>
+        </div>
+      )}
+      {standalone && (
+        <div className="banner-baseline quiet">
+          <p className="banner-baseline-detail">
+            revision 对得上不代表基线记的内容是对的——体检会拿基线跟服务器逐个文件比一遍。
+          </p>
+          <div className="banner-baseline-actions">
+            <button onClick={onCheck}>体检基线</button>
+          </div>
         </div>
       )}
     </>

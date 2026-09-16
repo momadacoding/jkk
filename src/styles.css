@@ -1793,6 +1793,18 @@ body {
 }
 .banner-baseline.warn { background: #4a3d16; color: #f0e2b8; border-bottom-color: #6b5a20; }
 .banner-baseline.danger { background: #4a1f1f; color: #f3cdcd; border-bottom-color: #7a3030; }
+/* 常驻的体检入口：没出事的时候也一直在，所以必须**不抢眼**——用与工具条同色的
+   底，靠低透明度退到背景里。做成黄条的话每个健康仓库顶上都常年挂一条警告色，
+   用户很快就会连真正的警告一起忽略。 */
+.banner-baseline.quiet {
+  background: #252525;
+  color: #bdbdbd;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 12px;
+}
+.banner-baseline.quiet .banner-baseline-detail { margin: 0; font-size: 11px; opacity: 0.75; }
 .banner-baseline-head { margin-bottom: 4px; }
 .banner-baseline-detail { margin: 0 0 6px; opacity: 0.92; }
 .banner-baseline-note { margin: 0 0 6px; opacity: 0.75; font-size: 11px; }
