@@ -1534,6 +1534,37 @@ S10  git stash apply <OID>（若 S1 有 stash），成功后
 S11  删除 journal；恢复 watcher + 主动发 repo-changed
 ```
 
+#### 7.3.0 ⚠️ S1/S10 的 stash 往返会改行尾（Phase 2 开工前必须先处理）
+
+2026-09-17 在查另一个问题时顺带发现，**尚未在本流程里验证或修复**，先记下来。
+
+本机 `core.autocrlf=true`（多数 Windows 开发机的默认状态）。git 在 checkout /
+stash 还原时会把 LF 转成 CRLF，而 SVN 的 pristine 里存的可能是 LF。实测一个**没设
+`svn:eol-style`** 的文件走一次 `git stash push` 还原：
+
+```text
+还原前磁盘 = "v1\n"      LF
+还原后磁盘 = "v1\r\n"    CRLF        ← git 加的
+svn diff   = -v1 / +v1               ← 内容一样，行尾不同
+```
+
+对 `sync_in` 的影响面：
+
+- **S1 的 stash push** 会把白名单内每个 W-file 还原成 CRLF。随后 S3 `git checkout
+  svn/base`、S5 `svn update` 都在这个已经被改过行尾的磁盘上跑。
+- **S10 的 stash apply** 同理。
+- 最坏的下游后果在 Phase 3：交付清单按「工作分支 vs 基线」算，一整批只有行尾变化的
+  文件会被算成真改动**提交到 SVN**。
+
+设了 `svn:eol-style=native` 的文件不受影响（svn 自己在 Windows 上就放 CRLF，两边一致）。
+**风险集中在没设 eol-style 的文件上**，而 SVN 默认不设——要靠 `auto-props` 或手工
+`propset`，所以真实工程里两种都有。
+
+可能的出路（**都还没验证**）：写一个 `.gitattributes`（但 §3 明写「我们不写工作目录里的
+`.gitignore`」，`.gitattributes` 同理，且它会进用户的 SVN 仓库）；在混合仓库的
+`.git/config` 里把 `core.autocrlf` 设成 `false`（作用域是本仓库，不动用户全局配置，
+看起来最干净）；或者按文件读 `svn:eol-style` 逐个决定。Phase 2 开工时必须先定这一条。
+
 #### 7.3.1 S1 的 stash 崩溃窗口：写前日志必须写在 push 之前
 
 §7.6 开篇把这个窗口作为写前日志存在的理由写了出来——「S1 完成 stash 之后、S2 写状态
@@ -3440,6 +3471,77 @@ A.cs 本地改过、B.cs 本地 `svn delete`）：
 B5 值得多说一句：`svn cat` 展开的是**该 revision 的**关键字值（revision 号、作者、
 日期都取自服务器那一版），这正是基线该记的东西；若它不展开，基线里的 `$Id$` 会和同目录
 其他干净文件形态不同，工作分支上凭空多出一堆假 diff。
+
+#### 16.2.1 `hash-object` 必须带 `--path`，否则 `core.autocrlf` 会让两条录制路径分叉
+
+上面 B4–B6 比的都是「`svn cat` 的字节 vs 磁盘的字节」，**漏了一环**：那些字节最终要
+变成 git 的 blob，而两条录制路径对此的处理不一样。
+
+```text
+干净文件： git add -A            → 跑过滤器（autocrlf、.gitattributes 的 text/eol）
+脏文件：   hash-object --stdin   → **默认一个过滤器都不跑**
+```
+
+2026-09-17 实测（本机 `core.autocrlf=true`，多数 Windows 开发机的默认状态），
+一个设了 `svn:eol-style=native` 的文件：
+
+| | 字节 |
+|---|---|
+| 磁盘 | `"n1\r\n"` CRLF |
+| `git add -A` 进 blob | `"n1\n"` LF —— 归一过 |
+| `hash-object --stdin` | `"n1\r\n"` CRLF —— 没归一 |
+
+后果是**这个文件在基线里长什么样，取决于它当时脏不脏**：在脏工作副本上重建一次，
+行尾整个翻一遍，工作分支上凭空出现「每一行都改了」的假 diff。
+
+修法是 `git hash-object -w --path <该路径> --stdin`——`--path` 让它按该路径**应当
+适用的**属性跑过滤器。对齐的基准必须是 `git add`，因为树里绝大部分内容是它录进去的。
+
+由 `recording_a_file_produces_the_same_blob_whether_it_was_dirty_or_not` 钉住：同一个
+文件分别在干净与脏的状态下录一次，blob 必须逐字节相同。拿掉 `--path` 该测试立刻变红
+（实测 `left: [110,49,13,10]` vs `right: [110,49,10]`）。
+
+⚠️ **由此引出一条对整份设计成立的限定。** `autocrlf` 打开时，基线树里存的是 LF 归一
+后的内容，而服务器上可能是 CRLF。所以 §16.1 那句「树 == 服务器 rN」严格说是「**在
+git 自己的 eol 归一之下**相等」。这不是本期引入的——`git add -A` 从 Phase 1b 起就是
+这么录的——但既然这里查到了，就写明白：**凡是比较「基线树的字节」与「服务器的字节」
+的推理，都要先过一遍这层归一。**本设计里没有这样的比较（体检比的是磁盘与服务器，
+§6.8.3），所以结论不受影响。
+
+#### 16.2.2 为什么不能靠 `git stash` 让工作副本变干净
+
+一个自然的替代方案：录基线之前先 `git stash` 把本地改动收起来，工作副本干净了就能照旧
+从磁盘录，录完再 `git stash pop`。**实测证明这条路走不通**（2026-09-17，混合仓库
+fixture，白名单 `Code/`，四种脏各一例）：
+
+```text
+              stash 之前              git stash push -u -- Code/ 之后
+  M  Code/A.cs           →      M  Code/A.cs        ← 还在
+  A  Code/Added.cs       →      !  Code/Added.cs    ← 变得更糟
+  M  Code/Art.psd        →      M  Code/Art.psd     ← 还在
+  D  Code/Deep/D.cs      →      D  Code/Deep/D.cs   ← 还在
+
+  git status →  (空)                                ← git 这边确实干净了
+```
+
+四条一条都没解决，原因各不相同：
+
+| 条目 | 为什么 stash 清不掉 |
+|---|---|
+| `M Code/Art.psd` | **不是 W-file，git 根本不跟踪它**。而 P1 检查的是 `svn status` 的全部条目，不按扩展名放行（§6.5 P1） |
+| `A Code/Added.cs` | 文件被 `-u` 收走了，但 `A` 这个**登记状态记在 `.svn/` 里**，git 碰不到。结果从「已登记新增」退化成 `!`（已登记但文件没了）——比原来更糟 |
+| `D Code/Deep/D.cs` | 同上，删除登记在 `.svn/` 里 |
+| `M Code/A.cs` | 最意外的一条：git 确实把它还原成了 HEAD 的内容，但 `core.autocrlf=true` 让还原出来的是 **CRLF**，而 svn 的 pristine 是 LF → svn 照样报 `M`（`svn diff` 打出 `-v1` / `+v1`，内容一样行尾不同） |
+
+根因是一句话：**`git stash` 操作的是 git 的状态，而 P1 检查的是 SVN 的状态，两者共用
+一个工作目录但互不相通。** SVN 侧的「登记」（`A` / `D`）压根不在 git 的管辖范围内。
+
+`stash pop` 之后还留下了一条**新的**损坏：`! Code/Deep`（目录丢失）——git 在重放删除时
+把空目录一并删了，而 svn 还指望它在。
+
+所以 stash 这条路对**录基线**不成立。它对 **`sync_in`** 是成立的，而且本设计一直就是
+这么做的（§7.3 的 S1 / S9 / S10）——那里要清空的本来就是 git 侧的工作树，好让
+`svn update` 与随后的 rebase 各自在干净的地基上跑，不是为了骗过 P1。两件事只是看起来像。
 
 ## 17. 环境前置
 

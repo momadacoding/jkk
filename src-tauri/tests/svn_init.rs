@@ -17,8 +17,8 @@ use app_lib::engine::svn_init::{
 use app_lib::engine::svn_xml::parse_info;
 use std::process::Command;
 use svn_fixtures::{
-    svn_repo, svn_repo_for_health, svn_repo_obstructed, svn_repo_with_same_repo_nested_external,
-    NestedExternal, SvnFixture,
+    svn_repo, svn_repo_for_health, svn_repo_obstructed, svn_repo_with_native_eol,
+    svn_repo_with_same_repo_nested_external, NestedExternal, SvnFixture,
 };
 
 fn svn(dir: &std::path::Path, args: &[&str]) {
@@ -795,6 +795,42 @@ fn rebuild_records_server_content_on_a_dirty_working_copy() {
         git_status_before,
         run_git(&fx.wc_str(), &["status", "--porcelain"]).unwrap(),
         "重建改变了 git 工作区状态"
+    );
+}
+
+#[test]
+fn recording_a_file_produces_the_same_blob_whether_it_was_dirty_or_not() {
+    // **同一个文件在基线里长什么样，不该取决于它当时脏不脏。**
+    //
+    // 两条录制路径不一样：干净文件走 `git add -A`（会跑 autocrlf 等过滤器），
+    // 脏文件走 `hash-object --stdin`（默认**不跑**）。2026-09-17 实测，本机
+    // `core.autocrlf=true` 时一个 `svn:eol-style=native` 的文件：
+    //
+    //   磁盘 = "n1\r\n" → git add 得 "n1\n"，hash-object --stdin 得 "n1\r\n"
+    //
+    // 不对齐的话，在脏工作副本上重建一次就会把行尾整个翻一遍，工作分支上凭空
+    // 出现「每一行都改了」的假 diff。修法是给 hash-object 加 `--path`。
+    let fx = svn_repo_with_native_eol();
+    init_hybrid(&req(&fx)).unwrap();
+
+    // 干净时录的（走 git add -A）
+    let clean_nat = baseline_blob(&fx.wc_str(), "Code/Nat.cs");
+    let clean_plain = baseline_blob(&fx.wc_str(), "Code/Plain.cs");
+
+    // 改脏之后重建（走 hash-object）
+    std::fs::write(fx.wc().join("Code/Nat.cs"), "LOCAL\r\n").unwrap();
+    std::fs::write(fx.wc().join("Code/Plain.cs"), "LOCAL\n").unwrap();
+    rebuild_baseline(&fx.wc_str()).unwrap();
+
+    assert_eq!(
+        baseline_blob(&fx.wc_str(), "Code/Nat.cs"),
+        clean_nat,
+        "svn:eol-style=native 的文件：两条录制路径产出了不同的 blob"
+    );
+    assert_eq!(
+        baseline_blob(&fx.wc_str(), "Code/Plain.cs"),
+        clean_plain,
+        "无 eol-style 的文件：两条录制路径产出了不同的 blob"
     );
 }
 

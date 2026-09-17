@@ -156,9 +156,31 @@ impl TempIndex {
         let mode = self
             .stage_mode(repo_root, &p)?
             .unwrap_or_else(|| "100644".to_string());
-        let oid = run_git_stdin(repo_root, &["hash-object", "-w", "--stdin"], bytes)?
-            .trim()
-            .to_string();
+        // ⚠️ **`--path` 不能省。**
+        //
+        // `git hash-object --stdin` 默认**不跑任何过滤器**，而 `git add` 会。本机
+        // （以及多数 Windows 开发机）`core.autocrlf=true`，于是同一个文件走两条路会
+        // 得到两个不同的 blob。2026-09-17 实测，一个 `svn:eol-style=native` 的文件：
+        //
+        // ```text
+        // 磁盘                    = "n1\r\n"   CRLF
+        // git add -A 之后的 blob  = "n1\n"     LF    ← autocrlf 归一了
+        // hash-object --stdin     = "n1\r\n"   CRLF  ← 没归一
+        // ```
+        //
+        // 后果是**这个文件在基线里长什么样，取决于它当时脏不脏**：在脏工作副本上
+        // 重建一次，行尾整个翻一遍，工作分支上凭空出现「每一行都改了」的假 diff。
+        //
+        // `--path <路径>` 让 hash-object 按该路径**应当适用的**属性跑过滤器
+        // （autocrlf、`.gitattributes` 的 text/eol 规则都算），与 `git add` 对齐。
+        // 对齐的基准必须是 `git add`——树里绝大部分内容是它录进去的。
+        let oid = run_git_stdin(
+            repo_root,
+            &["hash-object", "-w", "--path", &p, "--stdin"],
+            bytes,
+        )?
+        .trim()
+        .to_string();
         if oid.is_empty() {
             return Err(GitError::new(
                 "svn_baseline_hash_object",

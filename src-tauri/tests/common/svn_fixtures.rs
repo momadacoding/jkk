@@ -995,6 +995,51 @@ pub fn svn_repo_working_copy_far_behind() -> SvnFixture {
     SvnFixture { dir }
 }
 
+/// 白名单里放两个 `.cs`：一个设了 `svn:eol-style=native`（Windows 上磁盘是 CRLF），
+/// 一个什么都不设（磁盘是 LF）。
+///
+/// 这个 fixture 钉住的是 **git 的 `core.autocrlf` 与录制路径的交互**。多数 Windows
+/// 开发机上 `core.autocrlf=true`，于是：
+///
+/// ```text
+/// 磁盘（native）          = "n1\r\n"   CRLF
+/// git add -A 进 blob      = "n1\n"     LF     ← 归一过
+/// hash-object --stdin     = "n1\r\n"   CRLF   ← 没归一
+/// ```
+///
+/// 两条录制路径产出不同的 blob，意味着「这个文件在基线里长什么样」取决于它当时
+/// 脏不脏——在脏工作副本上重建一次就会把行尾整个翻一遍（2026-09-17 实测）。
+pub fn svn_repo_with_native_eol() -> SvnFixture {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    run(&root, "svnadmin", &["create", "repo"]);
+    let url = file_url(&root.join("repo"));
+    run(
+        &root,
+        "svn",
+        &["checkout", &url, "wc1", "--non-interactive"],
+    );
+    let wc = root.join("wc1");
+    std::fs::create_dir_all(wc.join("Code")).unwrap();
+    std::fs::write(wc.join("Code/Nat.cs"), "n1\n").unwrap();
+    std::fs::write(wc.join("Code/Plain.cs"), "p1\n").unwrap();
+    run(&wc, "svn", &["add", "Code", "--non-interactive"]);
+    run(
+        &wc,
+        "svn",
+        &[
+            "propset",
+            "svn:eol-style",
+            "native",
+            "Code/Nat.cs",
+            "--non-interactive",
+        ],
+    );
+    run(&wc, "svn", &["commit", "-m", "r1", "--non-interactive"]);
+    run(&wc, "svn", &["update", "--non-interactive"]);
+    SvnFixture { dir }
+}
+
 /// 把一个白名单内的 `.cs` 换成**同名目录**——SVN 意义上的 obstructed（`~`）。
 ///
 /// 这是 spec §16.1 之后 P1 **唯一**仍然阻断的脏状态：svn 自己都说不清那个位置上

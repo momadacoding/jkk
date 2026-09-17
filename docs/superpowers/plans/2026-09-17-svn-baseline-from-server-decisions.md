@@ -213,6 +213,53 @@ Task 4–9 合并验证（它们是一个不可分割的交付单元，见下方
 
 ---
 
+## 补 Task（2026-09-18）：`hash-object` 漏了 `--path`，两条录制路径分叉
+
+### 计划的错误 / 我自己的错误
+
+用户提出「能不能靠 `git stash` 让工作副本干净，从而照旧从磁盘录基线」，去实测这条路的
+过程中**查出我已经写完并推上去的 B 里有一个真 bug**：
+
+```text
+干净文件： git add -A            → 跑过滤器（autocrlf 等）
+脏文件：   hash-object --stdin   → **默认一个都不跑**
+```
+
+本机 `core.autocrlf=true`。一个 `svn:eol-style=native` 的文件，磁盘是 `"n1\r\n"`，
+`git add` 进 blob 是 `"n1\n"`，`hash-object --stdin` 是 `"n1\r\n"`——**同一个文件在
+基线里长什么样，取决于它当时脏不脏**。在脏工作副本上重建一次就会把行尾整个翻一遍，
+工作分支上凭空出现「每一行都改了」的假 diff。
+
+**为什么 B4/B6 没抓住它**：那两条比的是「`svn cat` 的字节 vs 磁盘的字节」，而 bug 在
+下一环——那些字节变成 git blob 的过程。测到了链条的前半截就以为覆盖了整条链，这是
+这次的教训。
+
+修法：`git hash-object -w --path <该路径> --stdin`。对齐基准必须是 `git add`，因为树里
+绝大部分内容是它录进去的。
+
+回归测试 `recording_a_file_produces_the_same_blob_whether_it_was_dirty_or_not`：同一个
+文件分别在干净与脏的状态下各录一次，blob 必须逐字节相同。**变异验证已跑**——拿掉
+`--path` 立刻变红（`left: [110,49,13,10]` vs `right: [110,49,10]`）。
+
+### 计划没写的坑
+
+- **`git stash` 清不掉 SVN 侧的脏**，实测四种脏一种都没解决：`.psd` git 根本不跟踪；
+  `A` / `D` 的登记记在 `.svn/` 里 git 碰不到（`A` 还退化成了更糟的 `!`）；`M` 的那个
+  被 autocrlf 改了行尾，svn 照样报 `M`。`stash pop` 之后还多出一条新的损坏
+  `! Code/Deep`（git 重放删除时把空目录一并删了）。已写进 spec §16.2.2。
+- **同一个发现对 Phase 2 的 `sync_in` 也成立**：S1 的 `git stash push` 与 S10 的
+  `git stash apply` 都会把没设 `svn:eol-style` 的文件还原成 CRLF，最坏后果是 Phase 3
+  把一整批纯行尾变化提交到 SVN。已写进 spec §7.3.0，标注**尚未验证也未修复**，
+  列了三条可能的出路，要求 Phase 2 开工时先定。**不在本期修**——那是另一条流程。
+
+### 为什么这么改是安全的
+
+- 改动只有一处（多一个 `--path` 参数），影响面是「脏文件替换进去的 blob 会跑与
+  `git add` 相同的过滤器」，方向是让两条路径**一致**，不是引入新行为。
+- 全量 524 passed / 0 failed；clippy 0 警告。
+
+---
+
 ## 实测记录（Task 0 之前完成）
 
 八条未知全部在临时 fixture 上实测，探针用完即删，`git status` 已复核干净。
