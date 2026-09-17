@@ -525,11 +525,12 @@ export function RepoTab({
   const handleRebuildBaseline = async () => {
     await confirm({
       title: '重建基线',
-      message: '把白名单内的当前磁盘内容录成一个新的基线 commit。',
+      message: '把白名单内的内容按**服务器上当前 revision** 的样子录成一个新的基线 commit。',
       warning:
         '不会修改工作目录里的任何文件，也不会推进你的工作分支——' +
         '分支要不要跟进新基线，由你之后自己决定。' +
-        '白名单内必须干净：有未提交的 SVN 改动会被拒绝。',
+        '你未提交的 SVN 改动不影响重建：那些文件会按服务器上的版本录进基线，' +
+        '磁盘上的改动原样保留。',
       confirmLabel: '重建',
       busyLabel: '正在重建…',
       // 走 action 而不是「确认后自己跑」：重建要发 svn diff 体检（网络），

@@ -21,8 +21,8 @@
 Task 4–9 合并验证（它们是一个不可分割的交付单元，见下方「偏离计划」）：
 `cargo fmt` ✓ / `cargo clippy --all-targets` **0 警告** / `cargo test` **523 passed, 0 failed, 41 个二进制**（Task 3 时 501/39，改动前 491/38）。
 零 SVN 写操作审计复跑：产品代码实际发出的 svn 子命令是 `--version` / `cat` / `diff` / `info` / `log` / `ls` / `propget` / `status`，全部只读；grep 到的 `add` / `checkout` 经逐条核对都是 **git** 调用（`svn_baseline.rs:105` 走 `run_git_env`，`svn_init.rs:316` 走 `run_git`）。
-| 10 | 前端文案 | ⬜ 未开始 | | |
-| 11 | 文档收口 | ⬜ 未开始 | | |
+| 10 | 前端文案 | ✅ | `svnInit.ts`、`RepoTab.tsx`、`tests/vitest/svnInit.test.ts` | `pnpm build` ✓ / `pnpm test` **336 passed / 24 文件**（改动前 333/24） |
+| 11 | 文档收口 | ✅ | `e2e/2026-09-15-svn-phase1c-e2e.md`（新增场景 4′ / 5′）、本文件 | 纯文档 |
 
 ---
 
@@ -186,6 +186,30 @@ Task 4–9 合并验证（它们是一个不可分割的交付单元，见下方
 | 干净文件在抓拍后被改脏 | `a_file_that_got_dirty_after_s_was_captured_still_blocks`——直接喂一份**过期的 `S`**，断言判据中止。这就是该场景的真实形态 |
 | 外部 commit 把 BASE 推到 N+1 | `read_node_rev_reports_the_current_value_without_running_the_other_checks`——只验 R3c 这道守卫本身读得对、且不会被 obstructed 之类的无关状态干扰 |
 | 两者串起来的真实交错 | **没有自动化覆盖。** 需要在 `rebuild_baseline` 里开一个测试专用的注入点，那个代价（往产品代码里加一个只为测试存在的 seam）大于收益 |
+
+---
+
+## Task 10–11（前端文案与文档）
+
+### 偏离计划
+
+- 计划 Task 10 Step 4 写着「在真实 `pnpm tauri dev` 窗口里点一次重建」。**没有执行**，理由见下方「没有执行的验证」。
+
+### 计划没写的坑
+
+- **`svn_preflight_dirty` 这个错误码整条删掉了，而不是改文案。** 它对应的状态已经不存在。留着一条说「请先去 TortoiseSVN 提交或还原」的引导，会把用户推回那个已经不存在、而且从来就走不通的死胡同。加了一条 `不再有 svn_preflight_dirty 这个错误码的条目` 的断言守着。
+- **「后端消息已说过的就不重复」那条抑制逻辑按前 12 个字判重**，所以翻新测试时喂进去的后端消息必须与表里那条**开头一致**，否则测的就不是抑制逻辑而是别的东西。翻新时改对了，记在这里免得下一个人踩。
+- **`svn_baseline_lying` 的文案要先撇清「不是你的本地修改」。** §6.8.7 之后本地修改已被 `S` 排除在外，但一个手上有改动的用户看到「基线与服务器不符」会立刻把两件事联系起来，然后去做一件完全没用的事（清理工作区）。
+
+### 没有执行的验证（如实说明）
+
+**没有跑 `pnpm tauri dev` 的真实窗口。** 判断依据：
+
+- **没有任何 `#[tauri::command]` 的签名改动。** `Preflight` 新增的 `dirty` 字段带 `#[serde(skip)]`，IPC 上的 JSON 形状逐字不变，并由 `preflight_serializes_to_camel_case_and_keeps_the_dirty_list_off_the_wire` 断言（构造非空 `dirty` 再断言它不出现在 JSON 里）。所以 `AGENTS.md` §7.3 那条「签名改动必须实际跑一次 `pnpm tauri dev`」的触发条件不成立。
+- 改动的 UI 是一段确认对话框文案和一张错误码→引导语的映射表，不涉及布局、滚动或渲染，vitest 已覆盖文本本身。
+- 真实窗口的点击验证是用户正在做的 E2E，对应新写的**场景 4′ / 5′**。
+
+不写成「已验证」是因为它确实没验过。
 
 ---
 
