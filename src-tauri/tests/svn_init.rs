@@ -17,8 +17,8 @@ use app_lib::engine::svn_init::{
 use app_lib::engine::svn_xml::parse_info;
 use std::process::Command;
 use svn_fixtures::{
-    svn_repo, svn_repo_dirty, svn_repo_for_health, svn_repo_with_same_repo_nested_external,
-    DirtyKind, NestedExternal, SvnFixture,
+    svn_repo, svn_repo_for_health, svn_repo_obstructed, svn_repo_with_same_repo_nested_external,
+    NestedExternal, SvnFixture,
 };
 
 fn svn(dir: &std::path::Path, args: &[&str]) {
@@ -156,9 +156,13 @@ fn a_failure_after_git_init_rolls_the_whole_thing_back() {
 #[test]
 fn a_preflight_failure_never_creates_a_git_at_all() {
     // P1–P4 全部跑在创建 .git **之前**，所以这一侧根本不需要回退。
-    let fx = svn_repo_dirty(DirtyKind::Modified);
-    let err = init_hybrid(&req(&fx)).expect_err("脏工作副本必须被拦住");
-    assert_eq!(err.code, "svn_preflight_dirty");
+    //
+    // 用 obstructed 而不是普通的 `M`：spec §16.1 之后普通的脏**不再阻断**
+    // （那条门槛让建库和重建在真实开发节奏下永远做不成），`~` 是唯一仍然
+    // 阻断的状态，所以它才是现在唯一能触发「preflight 失败」的形态。
+    let fx = svn_repo_obstructed();
+    let err = init_hybrid(&req(&fx)).expect_err("obstructed 必须被拦住");
+    assert_eq!(err.code, "svn_preflight_obstructed");
     assert!(!fx.wc().join(".git").exists(), "校验没过却建了 .git");
 }
 
@@ -646,17 +650,25 @@ fn a_failure_before_r4_leaves_the_baseline_pointer_untouched() {
 }
 
 #[test]
-fn rebuild_refuses_when_the_working_copy_is_dirty() {
-    // R1 与 P1 同一套判据：不干净就引导去 TortoiseSVN，**不自动 revert**。
+fn rebuild_refuses_only_when_a_node_is_obstructed() {
+    // R1 与 P1 同一套判据。§16.1 之后那套判据只剩 `~` 一条——普通的本地修改
+    // **必须放行**（见 `rebuild_records_server_content_on_a_dirty_working_copy`）。
+    //
+    // 这条保留下来的核心断言是**不自动修复**：拦住之后磁盘必须原样。删目录、
+    // revert 都是破坏性的，本应用一律不替用户做（spec §6.5 P1 / §8.1 #2）。
     let fx = hybrid_repo_updated_externally();
-    std::fs::write(fx.wc().join("Code/A.cs"), "LOCAL\n").unwrap();
-    let err = rebuild_baseline(&fx.wc_str()).expect_err("脏工作副本必须被拒");
-    assert_eq!(err.code, "svn_preflight_dirty");
-    // 没有自动 revert：用户的改动原样还在
+    let obstructed = fx.wc().join("Code/A.cs");
+    std::fs::remove_file(&obstructed).unwrap();
+    std::fs::create_dir(&obstructed).unwrap();
+
+    let err = rebuild_baseline(&fx.wc_str()).expect_err("obstructed 必须被拒");
+
     assert_eq!(
-        std::fs::read_to_string(fx.wc().join("Code/A.cs")).unwrap(),
-        "LOCAL\n"
+        err.code, "svn_preflight_obstructed",
+        "实际：{}",
+        err.message
     );
+    assert!(obstructed.is_dir(), "拦住之后磁盘必须原样，不许替用户动手");
 }
 
 #[test]

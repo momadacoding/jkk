@@ -995,6 +995,18 @@ pub fn svn_repo_working_copy_far_behind() -> SvnFixture {
     SvnFixture { dir }
 }
 
+/// 把一个白名单内的 `.cs` 换成**同名目录**——SVN 意义上的 obstructed（`~`）。
+///
+/// 这是 spec §16.1 之后 P1 **唯一**仍然阻断的脏状态：svn 自己都说不清那个位置上
+/// 是什么，`svn cat -r BASE` 拿不到可信的内容，录不出「服务器在 rN 的样子」。
+pub fn svn_repo_obstructed() -> SvnFixture {
+    let fx = svn_repo();
+    let wc = fx.wc();
+    std::fs::remove_file(wc.join("Code/A.cs")).unwrap();
+    std::fs::create_dir(wc.join("Code/A.cs")).unwrap();
+    fx
+}
+
 /// 白名单内放一个 **GBK 编码**的 `.cs`，并在本地改脏它。
 ///
 /// 国内 Unity 工程里 GBK 源码很常见。这个 fixture 钉住 spec §16.2 末那条约束：

@@ -10,7 +10,7 @@
 | 0 | spec 修订（§6.5 P1 / §6.3.1 / §6.8.7 / §16.1 / §16.2 / §13 / §14.2 / §18） | ✅ `19ed981` | `specs/2026-09-12-svn-git-hybrid-design.md` | 纯文档；八条未知已实测（见下） |
 | 1 | `run_svn_bytes` + `svn cat -r BASE` | ✅ | `svn_cli.rs`、`svn_pristine.rs`（新）、`tests/svn_pristine.rs`（新，6 例）、fixture `svn_repo_with_gbk_source` | fmt ✓ / clippy 0 警告 / cargo test **497 passed, 0 failed, 39 个二进制**（基线 491/38） |
 | 2 | P2 忽略 `revision="-1"` | ✅ | `svn_xml.rs`、`svn_preflight.rs`、`tests/svn_xml.rs`（+2 例） | fmt ✓ / clippy 0 警告 / cargo test **499 passed, 0 failed** |
-| 3 | P1 收窄到只拦 `~` | ⬜ 未开始 | | |
+| 3 | P1 收窄到只拦 `~` | ✅ | `svn_preflight.rs`、`tests/svn_preflight.rs`、`tests/svn_init.rs`、`tests/svn_backend.rs`、fixture `svn_repo_obstructed` | fmt ✓ / clippy 0 警告 / cargo test **501 passed, 0 failed** |
 | 4 | R2a 分类 | ⬜ 未开始 | | |
 | 5 | `TempIndex` blob 替换 / 条目删除 | ⬜ 未开始 | | |
 | 6 | `record_server_tree`，init 与 rebuild 共用 | ⬜ 未开始 | | |
@@ -104,6 +104,35 @@
 
 - `svn_preflight::check_single_node_rev` 里那条 `u64::try_from` 的失败分支**保留着**，只是含义变了：它从前意味着「P1 没有先于 P2 执行」，现在意味着「`parse_node_revs` 的过滤被人删了」——一个实现缺陷的警报，不是用户工作副本的问题。注释已同步改写，没有留下一句过期的论证。
 - mixed-revision 的正常拦截不受影响：39 个 `svn_xml` 测试与全量 499 个测试全绿，其中包含既有的 mixed-revision 回归。
+
+---
+
+## Task 3（P1 收窄到只拦 `~`）
+
+### 偏离计划
+
+- **没有新建 `DirtyEntry` 类型，直接复用 `svn_xml::StatusEntry`。** 它已经带着 `path` / `item` / `props` / `wc_locked` 四个字段，而且 `path` 已经是**仓库相对 + 正斜杠**（实测：从 wc 根以 `Code@` 为 target 跑 status，得到的是 `Code\Added.cs`，解析层归一成 `Code/Added.cs`）——正好就是 R2a 要的形状。再造一个平行类型只会多一次转换和一处可能走偏的地方。
+- **`dirty` 字段带 `#[serde(skip)]`，不过 IPC。** 计划里没提这一层。真实工程上这份清单可能有几千条（白名单目录底下每个未版本控制文件都算），前端一条都不需要。`svn_backend.rs` 里那条 JSON 形状测试已改成**构造一个非空的 `dirty` 并断言它不出现在 JSON 里**——空 `Vec` 序列化出来也是看不见的，用空值测证明不了任何事。
+
+### 计划没写的坑
+
+- **有四条既有测试编码的是旧行为，必须翻面而不是删掉。** 它们每一条都还承载着一个仍然成立的不变量，删掉就等于把覆盖率悄悄降下去：
+
+  | 测试 | 原来证明什么 | 翻面后证明什么 |
+  |---|---|---|
+  | `p1_rejects_every_dirty_state` | 四种脏都被拒 | 四种脏都**放行**且如实进清单（覆盖面不变，仍是四种真实形态） |
+  | `p1_must_pass_no_ignore_…` | `--no-ignore` 没被删 | 同左——被 `svn:ignore` 挡住的 `.cs` 仍必须**被看见**，否则会被录进基线 |
+  | `p1_rejects_svn_ignored_files_outside_the_extension_list_too` | 非代码文件也拦 | 非代码文件也**进清单**（过滤是下游的事） |
+  | `p1_catches_a_dirty_file_inside_a_same_repo_nested_external` | `check_targets` 覆盖了嵌套 external | 同左，而且**比从前更要紧**——清单现在是 R2a 的输入，漏掉这条会让 external 里的脏文件被原样录进基线，直接产出假基线，不再只是「少了一道拦截」 |
+
+- **`item="normal" props="modified"`（纯属性变更）要进 `dirty`、但不能进 `S`。** 清单是「非 pristine」的如实转述，所以它进清单；而 R2a 会把它判成「不用动」——属性变了内容没变，换不换字节都一样，让它进 `S` 会**削弱**体检判据（§16.1「S 必须恰好」）。这两层的分工写在 `collect_dirty` 的注释里。
+- **`svn status` 报 obstructed 的 item 字面量就是 `"obstructed"`**（实测，`svn_repo_obstructed` fixture：把 `Code/A.cs` 换成同名目录）。
+
+### 为什么这么改是安全的
+
+- 放行本身不会让基线变松。真正的把关从「事前拒绝用户」移到了「事后证伪基线」——录制来源改成服务器内容（Task 6），体检判据改成 `D \ S == ∅`（Task 8）。**这三条必须一起成立**，所以 Task 3 单独落地时 `init_hybrid` 在脏工作副本上会录出错误的基线，这一段中间状态不可交付，已在计划里写明。
+- `~` 拦住之后**磁盘原样**，由 `p1_still_blocks_an_obstructed_node` 与 `rebuild_refuses_only_when_a_node_is_obstructed` 两条各自断言（前者查目录还在，后者查目录还在）。不自动修复这条立场没有松动。
+- `a_clean_working_copy_reports_an_empty_dirty_list` 钉住「干净时 `S = ∅`」——这是 §6.8.7 那条判据退化成 `D == ∅` 的前提，也是 S7 / 恢复⑥ / D7a 三个既有入口行为不变的依据。
 
 ---
 
