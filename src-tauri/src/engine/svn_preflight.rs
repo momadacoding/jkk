@@ -7,6 +7,7 @@
 //! 模式，属于另一条路径（`engine::svn_externals`）。
 
 use crate::engine::svn_cli::run_svn;
+use crate::engine::svn_dirty::read_dirty;
 use crate::engine::svn_wc::{check_single_repository, enumerate_wcs, peg_safe, WcIdentity};
 use crate::engine::svn_xml::{parse_node_revs, parse_status_entries, StatusEntry};
 use crate::error::{GitError, Result};
@@ -95,6 +96,27 @@ pub fn run_preflight(repo_root: &str, whitelist: &[String]) -> Result<Preflight>
     })
 }
 
+/// 只重读一次 `nodeRevs`，不做别的校验（spec §16 R3c）。
+///
+/// # 为什么需要单独一个入口
+///
+/// R2a 读脏清单与 R3b 跑体检之间隔着若干次子进程调用，期间用户可能在外部编辑器
+/// 或 TortoiseSVN 里继续动。最危险的一种是**外部 commit**：那会把某个文件的 BASE
+/// 推到 N+1，而 `svn cat -r BASE` 取回的就成了 N+1 的内容，trailer 却写着 rN。
+///
+/// 体检通常已经先一步拦下它（那个文件会进 `D`、不进 `S`），这里是第二道：
+/// 纯本地、不走网络，代价近乎为零，而它挡的是一种**静默**的错误。
+///
+/// 不复用 [`run_preflight`] 是因为那会把 P1/P3/P4 也重跑一遍，失败时报出来的是
+/// 「obstructed」或「操作未完成」，而真正发生的事是「录制期间工作副本被改了」——
+/// 给错原因比不给更糟。
+pub fn read_node_rev(repo_root: &str, whitelist: &[String]) -> Result<u64> {
+    let roots = whitelist_roots(whitelist);
+    let wcs = enumerate_wcs(repo_root, whitelist)?;
+    let targets = check_targets(&roots, &wcs);
+    check_single_node_rev(repo_root, &targets, &wcs)
+}
+
 /// P1 / P2 的检查目标：白名单根，**外加白名单底下每一条嵌套 external 的根**。
 ///
 /// # 为什么不能只查白名单根
@@ -118,7 +140,7 @@ pub fn run_preflight(repo_root: &str, whitelist: &[String]) -> Result<Preflight>
 /// `--ignore-externals` 仍然照加：它负责挡住**更深**一层的嵌套 external，而那一层
 /// 由 [`enumerate_wcs`] 递归枚举出来、作为独立 target 各查一次（spec §6.6.5 末尾
 /// 那条「在 `wc(P)` 内部用它是对的」）。
-fn check_targets(roots: &[String], wcs: &[WcIdentity]) -> Vec<String> {
+pub fn check_targets(roots: &[String], wcs: &[WcIdentity]) -> Vec<String> {
     let mut targets = roots.to_vec();
     for w in wcs {
         // `wc_root` 与 `roots` 都经过同一套归一（正斜杠 + 去尾斜杠），白名单根自己
@@ -251,43 +273,15 @@ fn operation_in_progress(target: &str, what: &str, how: &str) -> GitError {
 /// 根的话，嵌套 external 里的改动在这条命令下只显示成一条 `item="external"`，
 /// 而下面正好把它跳过——等于完全没查。
 fn collect_dirty(repo_root: &str, targets: &[String]) -> Result<Vec<StatusEntry>> {
-    let mut dirty: Vec<StatusEntry> = Vec::new();
-    let mut obstructed: Vec<String> = Vec::new();
-
-    for root in targets {
-        let arg = peg_safe(root);
-        let xml = run_svn(
-            repo_root,
-            &[
-                "status",
-                "--no-ignore",
-                "--ignore-externals",
-                "--xml",
-                "--",
-                &arg,
-            ],
-        )?;
-        for e in parse_status_entries(&xml)? {
-            // `item="external"` 即使带了 --ignore-externals 也照样出现（实测），
-            // 它不是脏状态。本设计的核心场景就是「代码在 external 里」，
-            // 把它判脏会让向导在目标仓库上永远过不去。
-            if e.item == "external" {
-                continue;
-            }
-            if e.item == "obstructed" {
-                obstructed.push(e.path);
-                continue;
-            }
-            // `normal` + `props == "none"` 才是真干净。只改了属性的节点是
-            // `item="normal" props="modified"`（2026-09-14 实测），它**要**进清单：
-            // 清单是「非 pristine」的如实转述。R2a 会把它判成「不用动」——属性变了
-            // 内容没变，换不换字节都一样，而让它进 `S` 会削弱体检判据（§16.1）。
-            if e.item == "normal" && e.props == "none" {
-                continue;
-            }
-            dirty.push(e);
-        }
-    }
+    // 读取本身下沉到了 `svn_dirty::read_dirty`——服务器侧核对要用同一份清单，
+    // 而它**不能**因为一处 obstructed 就让仓库打不开。所以「读」和「判」分开，
+    // 阻断判定留在这里。
+    let dirty = read_dirty(repo_root, targets)?;
+    let mut obstructed: Vec<String> = dirty
+        .iter()
+        .filter(|e| e.item == "obstructed")
+        .map(|e| e.path.clone())
+        .collect();
 
     if !obstructed.is_empty() {
         obstructed.sort();
@@ -319,10 +313,6 @@ fn collect_dirty(repo_root: &str, targets: &[String]) -> Result<Vec<StatusEntry>
         ));
     }
 
-    // 同一条路径不可能来自两个 target（`--ignore-externals` 让白名单根那次查询
-    // 不会下沉进 external），但去重的代价近乎为零，而重复会让 `S` 多出条目。
-    dirty.sort_by(|a, b| a.path.cmp(&b.path));
-    dirty.dedup_by(|a, b| a.path == b.path);
     Ok(dirty)
 }
 

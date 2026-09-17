@@ -99,6 +99,45 @@ fn a_successful_init_leaves_a_clean_git_status() {
 }
 
 #[test]
+fn after_init_git_status_is_exactly_the_users_existing_local_svn_changes() {
+    // spec §6.5.1 末。基线树是**服务器内容**，磁盘上是用户改过的内容，两者故意
+    // 不同；`git read-tree` 对齐索引之后，`git status` 显示的恰好就是用户原有的
+    // 那些本地 SVN 修改。旧做法下这里永远是空的（强制要求干净），现在它第一眼
+    // 就是对的。
+    //
+    // 这条同时是 `read-tree` **不能带 `-u`** 的守卫：带上会拿基线内容覆盖磁盘，
+    // 把用户的改动抹掉——本期最不能犯的错。
+    let fx = svn_repo_for_health();
+    let wc = fx.wc();
+    std::fs::write(wc.join("Code/A.cs"), "MY WORK\n").unwrap();
+    std::fs::write(wc.join("Code/New.cs"), "new file\n").unwrap();
+    svn(&wc, &["delete", "Code/Deep/D.cs", "--non-interactive"]);
+
+    init_hybrid(&req(&fx)).unwrap();
+
+    let status = run_git(&fx.wc_str(), &["status", "--porcelain"]).unwrap();
+    let lines: std::collections::BTreeSet<&str> = status
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        lines,
+        std::collections::BTreeSet::from([" M Code/A.cs", " D Code/Deep/D.cs", "?? Code/New.cs"]),
+        "git 该显示的正是这三处本地改动。实际：\n{status}"
+    );
+    // 内容必须原样——一个字节都不许被基线覆盖
+    assert_eq!(
+        std::fs::read_to_string(wc.join("Code/A.cs")).unwrap(),
+        "MY WORK\n"
+    );
+    assert!(
+        !wc.join("Code/Deep/D.cs").exists(),
+        "被删掉的文件不许被复活"
+    );
+}
+
+#[test]
 fn a_successful_init_emits_no_svn_write_command() {
     // G8 在本期的延续：整个初始化只读 SVN，服务器侧 revision 必须没变。
     let fx = svn_repo();
@@ -497,26 +536,34 @@ fn fixture_record_baseline_claiming(wc: &std::path::Path, rev: i64) {
 }
 
 #[test]
-fn the_manual_health_check_does_not_call_ordinary_wip_a_lying_baseline() {
-    // `svn_health::check_baseline` 的前提写在它自己的模块头上：「磁盘上白名单内的
-    // 内容 == 基线树的内容」。初始化与重建都满足（树刚从磁盘录出来），手动体检
-    // **不满足**——用户就在 work 分支上改代码，这是这个命令最常见的调用时机。
+fn the_manual_health_check_verifies_a_good_baseline_despite_ordinary_wip() {
+    // 用户就在 work 分支上改代码——这是「体检基线」最常见的调用时机。
     //
-    // 不校验前提的话，一个再正常不过的未提交改动会被报成「基线与服务器不符」，
-    // 而基线本身完全正确。指控错对象比不指控更糟：用户会照着引导去重建基线，
-    // 把一份好基线换掉，改动却还在那儿。
+    // 旧实现在这里返回 `NotChecked`（前提「磁盘 == 基线树」不成立）。那和
+    // spec §16.1 里那条「工作副本必须干净」是同一个病：程序员的工作区 99% 的时间
+    // 都是脏的，于是这颗按钮永远只会回答「没法下结论」，等于不存在。
+    //
+    // §6.8.7 的 `D \ S == ∅` 让它重新可用：这处改动进 `S`，被解释掉；其余文件
+    // 与服务器逐一对得上 → **Verified**。
+    //
+    // 这条测试原本的用意（别把普通 WIP 指控成假基线）没有变松，反而更强了：
+    // 从前只要求「别说它坏」，现在要求「能给出一个肯定的答案」。
     let fx = svn_repo_for_health();
     init_hybrid(&req(&fx)).unwrap();
 
     std::fs::write(fx.wc().join("Code/A.cs"), "work in progress\n").unwrap();
 
-    match check_current_baseline(&fx.wc_str()).unwrap() {
-        Health::NotChecked { reason } => assert!(
-            reason.contains("基线树") || reason.contains("未提交") || reason.contains("工作区"),
-            "理由要说清是「没法验证」而不是「基线坏了」：{reason}"
-        ),
-        other => panic!("普通 WIP 不该被判成基线撒谎，实际：{other:?}"),
-    }
+    let got = check_current_baseline(&fx.wc_str()).unwrap();
+
+    assert!(
+        matches!(got, Health::Verified { .. }),
+        "普通 WIP 不该妨碍体检下结论，实际：{got:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.wc().join("Code/A.cs")).unwrap(),
+        "work in progress\n",
+        "体检是只读的，用户的改动必须原样还在"
+    );
 }
 
 #[test]
@@ -646,6 +693,108 @@ fn a_failure_before_r4_leaves_the_baseline_pointer_untouched() {
         before,
         run_git(&fx.wc_str(), &["rev-parse", "refs/heads/svn/base"]).unwrap(),
         "指针被动了"
+    );
+}
+
+/// 某个路径在 `svn/base` 树里的 blob 字节。
+fn baseline_blob(wc: &str, path: &str) -> Vec<u8> {
+    app_lib::engine::git_cli::run_git_bytes(
+        wc,
+        &["cat-file", "blob", &format!("refs/heads/svn/base:{path}")],
+    )
+    .unwrap()
+}
+
+/// 白名单子树里每个文件的 (相对路径, 字节)。用来证明磁盘没被动过。
+fn snapshot_disk(wc: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
+        for e in std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok()) {
+            let p = e.path();
+            if p.file_name().is_some_and(|n| n == ".svn") {
+                continue;
+            }
+            if p.is_dir() {
+                walk(&p, base, out);
+            } else {
+                let rel = p
+                    .strip_prefix(base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.push((rel, std::fs::read(&p).unwrap()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&wc.join("Code"), wc, &mut out);
+    out.sort();
+    out
+}
+
+#[test]
+fn rebuild_records_server_content_on_a_dirty_working_copy() {
+    // **spec §16.1 的核心断言**，也是这一期存在的全部理由。
+    //
+    // 造齐六种真实的脏状态，重建之后逐条验：基线树里是**服务器 rN 的内容**，
+    // 而不是磁盘上用户改过的内容；`A` / `?` 这两种服务器上没有的不在树里。
+    let fx = svn_repo_for_health();
+    init_hybrid(&req(&fx)).unwrap();
+    let wc = fx.wc();
+
+    // M：改过内容
+    std::fs::write(wc.join("Code/A.cs"), "LOCAL EDIT\n").unwrap();
+    // ?：未版本控制
+    std::fs::write(wc.join("Code/Untracked.cs"), "brand new\n").unwrap();
+    // A：svn add 了没提交
+    std::fs::write(wc.join("Code/Added.cs"), "added\n").unwrap();
+    svn(&wc, &["add", "Code/Added.cs", "--non-interactive"]);
+    // D：svn delete 了没提交
+    svn(&wc, &["delete", "Code/Deep/D.cs", "--non-interactive"]);
+    // 非白名单扩展名的脏（`Code/Art.psd`），它既不该进树，也不该进 `S`
+    std::fs::write(wc.join("Code/Art.psd"), "LOCAL PSD\n").unwrap();
+
+    let before = snapshot_disk(&wc);
+    let git_status_before = run_git(&fx.wc_str(), &["status", "--porcelain"]).unwrap();
+
+    let report = rebuild_baseline(&fx.wc_str()).expect("脏工作副本必须能重建");
+
+    assert_eq!(report.node_rev, 1);
+    assert_eq!(
+        baseline_blob(&fx.wc_str(), "Code/A.cs"),
+        b"v1\n",
+        "M：基线里必须是服务器 r1 的内容，不是磁盘上那份 LOCAL EDIT"
+    );
+    assert_eq!(
+        baseline_blob(&fx.wc_str(), "Code/Deep/D.cs"),
+        b"d1\n",
+        "D：本地删掉的文件仍然要以服务器版本留在基线里——本地删除是一处待交付的\
+         改动，不是基线的一部分"
+    );
+    let listed = run_git(
+        &fx.wc_str(),
+        &["ls-tree", "-r", "--name-only", "refs/heads/svn/base"],
+    )
+    .unwrap();
+    assert!(
+        !listed.contains("Code/Added.cs"),
+        "A：服务器 r1 上没有它，不该进基线。实际树：\n{listed}"
+    );
+    assert!(
+        !listed.contains("Code/Untracked.cs"),
+        "?：同上。实际树：\n{listed}"
+    );
+    assert!(
+        !listed.contains("Code/Art.psd"),
+        "扩展名不在白名单里，本来就不归 git 管。实际树：\n{listed}"
+    );
+
+    // **磁盘一个字节都不许动。** 这是整条流程对工作目录只读的证明，
+    // 也是它与 `svn revert` 的本质区别（spec §16.1）。
+    assert_eq!(before, snapshot_disk(&wc), "重建动了磁盘");
+    assert_eq!(
+        git_status_before,
+        run_git(&fx.wc_str(), &["status", "--porcelain"]).unwrap(),
+        "重建改变了 git 工作区状态"
     );
 }
 

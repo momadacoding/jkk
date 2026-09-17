@@ -185,6 +185,29 @@ fn p2_reads_node_revs_not_the_root_revision() {
     assert_ne!(pre.node_rev as i64, root_rev);
 }
 
+#[test]
+fn read_node_rev_reports_the_current_value_without_running_the_other_checks() {
+    // spec §16 R3c 用它复查「录制期间工作副本有没有被外部改动」。
+    //
+    // 它必须**只查 nodeRevs**：复用 run_preflight 的话，失败时报出来的会是
+    // 「obstructed」或「操作未完成」，而真正发生的事是「录制期间被改了」——
+    // 给错原因比不给更糟。
+    use app_lib::engine::svn_preflight::read_node_rev;
+
+    // 脏工作副本上照样要能读出来（R3c 跑在录制之后，那时工作副本当然是脏的）
+    let fx = svn_repo_dirty(DirtyKind::Modified);
+    assert_eq!(read_node_rev(&fx.wc_str(), &wl(&["Code/"])).unwrap(), 1);
+
+    // obstructed 不该妨碍它——那是 P1 的职责，不是这一条的
+    let ob = svn_repo_obstructed();
+    assert_eq!(read_node_rev(&ob.wc_str(), &wl(&["Code/"])).unwrap(), 1);
+
+    // 但 mixed-revision 仍然要报错：那正是它要挡的形态
+    let mixed = svn_repo_mixed_revision();
+    let err = read_node_rev(&mixed.wc_str(), &wl(&["Code/"])).expect_err("多值必须报错");
+    assert_eq!(err.code, "svn_preflight_mixed_revision");
+}
+
 // ---------------------------------------------------------------------------
 // P3：不在 svn update / merge 中途
 // ---------------------------------------------------------------------------

@@ -24,13 +24,30 @@ fn cs() -> Vec<String> {
     vec![".cs".to_string()]
 }
 
+/// §6.8.7 的 `S = ∅`。
+///
+/// 本文件里每一条都跑在**干净**工作副本上，所以什么都不需要解释，判据退化成
+/// §6.8.2 的原判据 `D == ∅`。`S ≠ ∅` 的那两组（不误报 / 有牙齿）在
+/// `svn_health_dirty.rs` 里成对出现。
+fn nothing_explained() -> std::collections::BTreeSet<String> {
+    std::collections::BTreeSet::new()
+}
+
 fn repo_url(fx: &SvnFixture) -> String {
     file_url(&fx.repo())
 }
 
 /// 跑一次体检，白名单固定 `Code/`、扩展名固定 `.cs`。
 fn check(fx: &SvnFixture, rev: u64) -> Health {
-    check_baseline(&fx.wc_str(), &repo_url(fx), rev, &wl(&["Code/"]), &cs()).unwrap()
+    check_baseline(
+        &fx.wc_str(),
+        &repo_url(fx),
+        rev,
+        &wl(&["Code/"]),
+        &cs(),
+        &nothing_explained(),
+    )
+    .unwrap()
 }
 
 fn lying_files(h: &Health) -> Vec<String> {
@@ -101,6 +118,7 @@ fn t6_multiple_whitelist_roots_are_accepted() {
         1,
         &wl(&["Code/", "Art/"]),
         &cs(),
+        &nothing_explained(),
     )
     .unwrap();
     assert_eq!(got, Health::Verified { rev: 1 });
@@ -157,6 +175,7 @@ fn a_command_failure_is_not_reported_as_a_lying_baseline() {
         1,
         &wl(&["Code/"]),
         &cs(),
+        &nothing_explained(),
     )
     .unwrap();
     assert!(matches!(got, Health::NotChecked { .. }), "实际：{got:?}");
@@ -187,7 +206,8 @@ fn a_failing_command_still_emits_partial_xml_and_must_not_be_parsed_as_success()
             "file:///definitely/not/here",
             1,
             &wl(&["Code/"]),
-            &cs()
+            &cs(),
+            &nothing_explained(),
         )
         .unwrap(),
         Health::NotChecked { .. }
@@ -202,8 +222,15 @@ fn an_empty_whitelist_is_an_error_not_a_clean_bill_of_health() {
     // 工程那是几个 GB 的美术资产，而且任何一处正常的本地改动都会报成基线撒谎。
     // 返回 Verified 更糟——等于宣布一个空白名单的基线是健康的。
     let fx = svn_repo_for_health();
-    let err =
-        check_baseline(&fx.wc_str(), &repo_url(&fx), 1, &[], &cs()).expect_err("空白名单必须报错");
+    let err = check_baseline(
+        &fx.wc_str(),
+        &repo_url(&fx),
+        1,
+        &[],
+        &cs(),
+        &nothing_explained(),
+    )
+    .expect_err("空白名单必须报错");
     assert_eq!(err.code, "svn_health_empty_whitelist");
 }
 
@@ -223,7 +250,15 @@ fn a_switched_whitelist_subtree_is_not_checked_rather_than_lying() {
     use svn_fixtures::svn_repo_with_switched_subtree;
     let fx = svn_repo_with_switched_subtree();
     let wc_url = run_svn(&fx.wc_str(), &["info", "--show-item", "url"]).unwrap();
-    let got = check_baseline(&fx.wc_str(), wc_url.trim(), 3, &wl(&["Code/"]), &cs()).unwrap();
+    let got = check_baseline(
+        &fx.wc_str(),
+        wc_url.trim(),
+        3,
+        &wl(&["Code/"]),
+        &cs(),
+        &nothing_explained(),
+    )
+    .unwrap();
     match got {
         Health::NotChecked { reason } => {
             assert!(reason.contains("switch"), "理由要点出成因：{reason}")
@@ -246,6 +281,7 @@ fn a_single_file_whitelist_entry_is_not_filtered_out_by_extension() {
         1,
         &wl(&["Code/Art.psd"]), // 单文件条目
         &cs(),                  // 扩展名只有 .cs，psd 不在里面
+        &nothing_explained(),
     )
     .unwrap();
     assert_eq!(lying_files(&got), vec!["Code/Art.psd"]);
@@ -269,6 +305,7 @@ fn a_clean_nested_external_is_verified_not_merely_unchecked() {
         2,
         &wl(&["Code/"]),
         &cs(),
+        &nothing_explained(),
     )
     .unwrap();
     assert!(
@@ -297,6 +334,7 @@ fn one_unit_failing_does_not_silently_verify_the_others() {
         2,
         &wl(&["Code/"]),
         &cs(),
+        &nothing_explained(),
     )
     .unwrap();
     match got {
@@ -322,6 +360,7 @@ fn a_lying_baseline_inside_a_nested_external_is_caught() {
         2,
         &wl(&["Code/"]),
         &cs(),
+        &nothing_explained(),
     )
     .unwrap();
     let files = lying_files(&got);
@@ -344,7 +383,15 @@ fn an_svn_url_pointing_at_a_subpath_is_not_checked_rather_than_lying() {
     // 「基线撒谎」是这条检查最坏的失败形态，所以先核对 svnUrl 与工作副本根的 URL。
     let fx = svn_repo_for_health();
     let bogus = format!("{}/Code", repo_url(&fx));
-    let got = check_baseline(&fx.wc_str(), &bogus, 1, &wl(&["Code/"]), &cs()).unwrap();
+    let got = check_baseline(
+        &fx.wc_str(),
+        &bogus,
+        1,
+        &wl(&["Code/"]),
+        &cs(),
+        &nothing_explained(),
+    )
+    .unwrap();
     match got {
         Health::NotChecked { reason } => {
             assert!(reason.contains("svnUrl"), "理由要说得清：{reason}")
