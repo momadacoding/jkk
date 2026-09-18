@@ -504,14 +504,45 @@ pwsh -File scripts/e2e-svn-fixture.ps1 -Shape Deep
 > `complete=false`；翻一页后 230 条、缺口 0 个、`complete=true`。
 > 所以你在界面上**应该看到一模一样的数字**，对不上就是有问题。
 
-**怎么确认「中间没有缺口」**：往下滚到图的底部，看 r31 下面接的是什么。
+**怎么确认「中间没有缺口」**
+
+> 🚨 **最容易搞错的一步。** 看到顶上是 r230、底下是 r1，**不能**说明 230 条都在
+> ——缺的正是**中间**的 r2–r30 那 29 条。两端在这两种情况下长得一模一样。
+> 2026-09-19 用户就是在这里把「已经全了」看错了一次。
+
+办法一：往下滚到图的底部，看 **r31 下面接的是什么**。
 
 - 修好了 → 接的是 r30、r29、r28……一路连到 r1；
 - 没修好 → r31 下面**直接就是 r1**，中间的 r2–r30 凭空消失。
 
+办法二（不用数，直接读缓存）。终端 B：
+
+```powershell
+$c = Get-Content "$fx2\wc1\.git\mygitclient-svnlog.json" -Raw | ConvertFrom-Json
+$c.targets.PSObject.Properties | ForEach-Object {
+    '{0} coveredMin={1} coveredMax={2} entries={3}' -f `
+        $_.Name, $_.Value.coveredMin, $_.Value.coveredMax, $_.Value.entries.Count
+}
+```
+
+| 时机 | 应该打出来 |
+|---|---|
+| 点按钮之前 | `coveredMin=31 coveredMax=230 entries=200` |
+| 点过一次之后 | `coveredMin=1 coveredMax=230 entries=230` |
+
+`coveredMin` 是这条记录**连续**覆盖到哪里，缺口藏不住——图上数节点会看错，
+它不会。
+
+> 上面两张表里的数字，2026-09-19 在 B 分支的构建上拿真实的 230-revision fixture
+> 重新实测过一遍（直接调后端 `fetch_log`，limit 200）：首屏 **201 条**、
+> 缺口正好是 **r2–r30 共 29 个**、`complete=false`；翻一页后 **230 条**、
+> 缺口 0 个、`complete=true`。与 1c 当初测的完全一致。
+
 **看到别的说明什么**
 
 - 点完按钮变灰了，但 r31 下面还是直接接 r1 → **这就是那个 bug，没修好**；
+- 「感觉点了没变化」→ 先按上面的办法二读一次缓存再下结论。新增的 29 条出现在
+  **中间**，顶部和底部都不动，只看两端确实看不出变化；
 - 刚建完库按钮就是灰的 → 完整性判断错了，200 条根本没拉完；
 - 点了按钮什么都没发生、按钮还亮着 → 后端调用失败，看 Console。
 
