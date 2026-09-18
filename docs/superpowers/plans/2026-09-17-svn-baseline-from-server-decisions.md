@@ -260,6 +260,46 @@ Task 4–9 合并验证（它们是一个不可分割的交付单元，见下方
 
 ---
 
+## 补 Task（2026-09-19）：服务器侧核对把本地删除报成了漏收
+
+### 我自己的错误（用户在真实窗口里抓到的）
+
+用户跑测试指引的场景 2，`svn delete Code\Deep\D.cs` 之后界面弹出黄色横幅
+**「服务器上有代码文件不在本地，git 没有在保护它们」**，列着那个文件。
+
+误报，而且方向正好相反：那个文件**恰恰在基线里**——录制时 `svn cat -r BASE` 把它
+取回来了（§16 R2a 的「取回 BASE」）。git 保护得好好的，用户只是主动删了它。而这条
+提示的措辞指控的是 `--set-depth=exclude` 那类**用户不知情**的漏收。
+
+**根因是我做 Task 7 时的漏做。** 当时就识别出了这个风险，也为此写了
+`server_expected_set`（磁盘 − `{A,?}` + `{D,!}`），但只把 `verify_include_set`
+接了上去，**`audit_server_set` 忘了改**，它仍在用遍历磁盘的 `expected_set`。
+本地删掉的文件服务器上有、磁盘上没有，正好落进 `server − disk` 这个差集。
+
+修法：`audit_server_set` 改用 `server_expected_set`，脏清单经
+`read_dirty` + `classify` 取得——与录制路径**同一对函数**，两份一旦分叉，这条核对
+报的「缺失」就会和基线里的实际内容对不上。读不到脏清单时返回 `NotChecked` 而不是
+硬算一个可能误报的集合出来（这条检查是锦上添花，§6.3.1 明写它不参与任何门槛）。
+
+### 计划没写的坑
+
+- **误报的代价不止是噪音。** 这条提示要抓的那类缺陷（`--set-depth=exclude`，
+  磁盘上压根看不见的漏收）是四道检查全绿时**唯一**的信号。让它在每次本地删除时
+  都响一遍，用户很快就会学会忽略它，等于把那道信号也一起废了。
+
+### 为什么这么改是安全的
+
+- 两条新回归测试**成对**：`a_locally_deleted_file_is_not_reported_as_missing`
+  （不误报）与既有的 `a_depth_excluded_subtree_is_reported_as_missing`（真漏收
+  仍然要报）。另加 `a_locally_added_but_uncommitted_file_is_not_reported_either`
+  守住 `{A,?}` 那一项没被弄反。
+- **变异验证已跑**：把比对对象换回 `expected_set` 之后，新测试立刻变红并复现出
+  用户截图里那条 `Missing { files: ["Code/Deep/D.cs"], total: 1 }`；与此同时
+  depth-excluded 那条**仍然是绿的**——说明这次修复没有把该报的那类一起关掉。
+- 全量 526 passed / 0 failed；clippy 0 警告。
+
+---
+
 ## 实测记录（Task 0 之前完成）
 
 八条未知全部在临时 fixture 上实测，探针用完即删，`git status` 已复核干净。

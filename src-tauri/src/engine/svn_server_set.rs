@@ -23,12 +23,28 @@
 //! 只在界面上多挂一条说明。误报的代价止于噪音，漏报的代价与改动前相同。
 
 use crate::engine::svn_cli::run_svn;
-use crate::engine::svn_config::read_config;
-use crate::engine::svn_include_check::{expected_set, is_w_file, normalize_roots};
-use crate::engine::svn_wc::enumerate_wcs;
+use crate::engine::svn_config::{read_config, SvnConfig};
+use crate::engine::svn_dirty::{classify, read_dirty, Fix};
+use crate::engine::svn_include_check::{is_w_file, normalize_roots, server_expected_set};
+use crate::engine::svn_preflight::check_targets;
+use crate::engine::svn_wc::{enumerate_wcs, WcIdentity};
 use crate::engine::svn_xml::parse_list;
 use crate::error::Result;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+
+/// 白名单内当前的本地改动分类（spec §16 R2a 的那一份）。
+///
+/// 与录制路径走的是**同一对函数**（`read_dirty` + `classify`），所以这里算出来的
+/// 就是录制时会算出来的那一份，不是另编的一份。两份一旦分叉，这条核对报的
+/// 「缺失」就会和基线里的实际内容对不上。
+fn dirty_fixes(
+    repo_root: &str,
+    cfg: &SvnConfig,
+    units: &[WcIdentity],
+) -> Result<BTreeMap<String, Fix>> {
+    let targets = check_targets(&normalize_roots(&cfg.whitelist), units);
+    classify(&read_dirty(repo_root, &targets)?)
+}
 
 /// 列出来给用户看的上限。再多就只报个数——几千行的清单没人看，还会把界面撑爆。
 const MAX_LISTED: usize = 20;
@@ -146,11 +162,37 @@ pub fn audit_server_set(repo_root: &str, rev: u64) -> Result<ServerAudit> {
         }
     }
 
-    let disk = expected_set(repo_root, &cfg.whitelist, &cfg.extensions)?;
+    // 比的是**服务器该有的那个集合**，不是磁盘上现有的（spec §6.3.1）。
+    //
+    // # 为什么不能直接用 `expected_set`
+    //
+    // 它遍历磁盘。而 §16.1 放松「工作副本必须干净」之后，用户本地 `svn delete`
+    // 掉的文件**服务器上有、磁盘上没有**——正好落进 `server − disk` 这个差集，
+    // 于是每一次本地删除都会被报成「服务器上有代码文件不在本地，git 没在保护它」。
+    //
+    // 那是彻头彻尾的误报：那个文件恰恰**在基线里**（录制时从 BASE 取回来了），
+    // git 保护得好好的，用户只是主动删了它。而这条提示的措辞是在指控
+    // `--set-depth=exclude` 那类**用户不知情**的漏收——方向完全相反。
+    //
+    // 误报的代价不止是噪音：它会让用户学会忽略这条提示，而这条提示要抓的那类
+    // 缺陷（磁盘上压根看不见的漏收）是四道检查全绿时唯一的信号。
+    let expected = match dirty_fixes(repo_root, &cfg, &units) {
+        Ok(fixes) => server_expected_set(repo_root, &cfg.whitelist, &cfg.extensions, &fixes)?,
+        // 读不到脏清单（比如白名单里有 obstructed）时**不猜**。这条检查是锦上添花，
+        // 退回 `NotChecked` 比拿一个可能误报的集合去指控用户强。
+        Err(e) => {
+            return Ok(ServerAudit::NotChecked {
+                reason: format!(
+                    "读不到白名单内的本地改动，没法判断哪些缺失是你自己删的：{}",
+                    e.message
+                ),
+            })
+        }
+    };
 
     // **只报这一个方向。** 反方向（磁盘有、服务器没有）是「本地新增还没 svn add」，
     // 完全正常；报了就是噪音，而噪音会让用户学会忽略这条提示。
-    let missing: Vec<String> = server.difference(&disk).cloned().collect();
+    let missing: Vec<String> = server.difference(&expected).cloned().collect();
     if missing.is_empty() {
         return Ok(ServerAudit::Matched);
     }

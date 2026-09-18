@@ -246,3 +246,51 @@ fn a_file_only_on_disk_is_not_reported() {
         "本地新增不该被报成漏收，实际 {got:?}"
     );
 }
+
+#[test]
+fn a_locally_deleted_file_is_not_reported_as_missing() {
+    // **2026-09-18 用户在真实窗口里报的假警报。**
+    //
+    // 用户在 §16.1 放松「工作副本必须干净」之后 `svn delete` 了一个白名单内的
+    // `.cs`，界面上立刻弹出「服务器上有代码文件不在本地，git 没有在保护它们」。
+    //
+    // 那是彻头彻尾的误报，而且方向正好相反：这个文件**恰恰在基线里**——录制时
+    // `svn cat -r BASE` 把它取回来了（spec §16 R2a 的「取回 BASE」）。git 保护得
+    // 好好的，用户只是主动删了它。而这条提示的措辞指控的是
+    // `--set-depth=exclude` 那类**用户不知情**的漏收。
+    //
+    // 根因：比对用的是 `expected_set`（遍历**磁盘**）。本地删掉的文件服务器上有、
+    // 磁盘上没有，正好落进 `server − disk` 这个差集。改用 `server_expected_set`
+    // （磁盘 − {A,?} + {D,!}，spec §6.3.1）之后才对得上。
+    let fx = svn_repo_for_health();
+    init(&fx);
+    svn_cmd(&fx.wc(), &["delete", "Code/Deep/D.cs", "--non-interactive"]);
+    assert!(
+        !fx.wc().join("Code/Deep/D.cs").exists(),
+        "前提：这个文件已经被 svn delete 从磁盘上拿掉了"
+    );
+
+    let got = svn_server_set::audit_server_set(&fx.wc_str(), REV).unwrap();
+
+    assert!(
+        matches!(got, ServerAudit::Matched),
+        "你自己删掉的文件不该被报成「git 没在保护它」——它就在基线里。实际 {got:?}"
+    );
+}
+
+#[test]
+fn a_locally_added_but_uncommitted_file_is_not_reported_either() {
+    // 与上一条对称的另一半：`svn add` 了没提交的文件服务器上没有，本来就不该
+    // 出现在 `server` 那一侧。这条钉的是「修误报时没把 `{A,?}` 那一项弄反」。
+    let fx = svn_repo_for_health();
+    init(&fx);
+    std::fs::write(fx.wc().join("Code/Added.cs"), "a\n").unwrap();
+    svn_cmd(&fx.wc(), &["add", "Code/Added.cs", "--non-interactive"]);
+
+    let got = svn_server_set::audit_server_set(&fx.wc_str(), REV).unwrap();
+
+    assert!(
+        matches!(got, ServerAudit::Matched),
+        "未提交的新增不该影响服务器侧核对，实际 {got:?}"
+    );
+}
