@@ -165,3 +165,42 @@ export function describeAudit(audit: ServerAudit | null): AuditModel | null {
     files: audit.files,
   }
 }
+
+/**
+ * 后台重跑服务器侧核对的间隔（毫秒）。
+ *
+ * # 为什么必须自动跑，不能只给一颗按钮
+ *
+ * 这条检查要抓的是 `svn update --set-depth=exclude` 那类**用户不知情**的漏收。
+ * 「不知情」正是要害：不知道出了事的人不会去点一颗写着「检查一下有没有出事」的
+ * 按钮。把它做成手动入口，等于只在用户已经怀疑的时候才提供——而那时它多半已经
+ * 没用了（2026-09-19 用户原话：它不是工作流的一部分）。
+ */
+export const SVN_AUDIT_POLL_MS = 5 * 60_000
+
+/**
+ * 两次自动核对之间的最小间隔（毫秒）。
+ *
+ * 核对要发 `svn ls -R`，**走网络**，在几万文件的工作副本上是秒级。定时器本身
+ * 已经稀疏，但窗口获得焦点也是一个触发点（用户刚从 TortoiseSVN 切回来，正是
+ * 最可能出事的时刻），来回切窗口就会把它打成高频。这道闸把最坏情况钉在
+ * 每分钟一次。
+ */
+export const SVN_AUDIT_MIN_GAP_MS = 60_000
+
+/**
+ * 这一次自动触发该不该真的去核对。
+ *
+ * 判据下沉到这里而不是写在 effect 里：effect 里的分支在 vitest 中测不到
+ * （`AGENTS.md` §7.2），而这段逻辑恰恰是「会不会把服务器打爆」的那一段。
+ *
+ * ⚠️ `lastAt` 是**上一次核对开始**的时刻，由所有调用点共用——包括打开仓库和
+ * 重建基线之后那两次显式核对。它们不受这道闸限制，但会把闸的计时重置：刚开完
+ * 仓库就立刻再核对一遍是纯粹的浪费。
+ */
+export function auditIsDue(now: number, lastAt: number, inFlight: boolean): boolean {
+  // 上一次还没回来就不再发。慢仓库上间隔可能短于一次核对的耗时，
+  // 不挡的话请求会一层层叠起来。
+  if (inFlight) return false
+  return now - lastAt >= SVN_AUDIT_MIN_GAP_MS
+}
