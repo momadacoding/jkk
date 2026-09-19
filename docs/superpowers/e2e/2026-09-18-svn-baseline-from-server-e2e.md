@@ -19,18 +19,19 @@
 
 跑完一条就勾一条。**没跑的别勾——空着是如实，勾上是谎报。**
 
-- [ ] 场景 1：干净工作副本上初始化（回归）
-- [ ] 场景 2：**带着本地修改**初始化 ← 核心新行为之一
-- [ ] 场景 3：初始化完，`git status` 恰好是你原有的那三处修改
-- [ ] 场景 4：基线里存的是**服务器**那一版
-- [ ] 场景 5：同事提交 → 失同步 → **带着本地修改**重建，且磁盘分毫未动
-- [ ] 场景 6：`~`（obstructed）仍然被拦，且**不自动修复**
-- [ ] 场景 7：未提交的新文件**不再**被误报成 mixed-revision
-- [ ] 场景 8：真正的 mixed-revision **仍然**被拦
-- [ ] 场景 9：脏工作副本上点「体检基线」，能给出**明确结论**
-- [ ] 场景 10：体检抓得住**真的**假基线 ← 必须和场景 9 成对做
-- [ ] 场景 11：行尾一致性（`core.autocrlf`）
-- [ ] 场景 12：整个过程一条 SVN 写命令都没发
+- [x] 场景 1：干净工作副本上初始化（回归）
+- [x] 场景 2：**带着本地修改**初始化 ← 核心新行为之一
+- [x] 场景 3：初始化完，`git status` 恰好是你原有的那三处修改
+- [x] 场景 4：基线里存的是**服务器**那一版
+- [x] 场景 5：同事提交 → 失同步 → **带着本地修改**重建，且磁盘分毫未动
+- [x] 场景 6：`~`（obstructed）仍然被拦，且**不自动修复**
+- [x] 场景 7：未提交的新文件**不再**被误报成 mixed-revision
+- [x] 场景 8：真正的 mixed-revision **仍然**被拦
+- [x] 场景 9：脏工作副本上点「体检基线」，能给出**明确结论**
+- [x] 场景 10：体检抓得住**真的**假基线 ← 必须和场景 9 成对做
+- [x] 场景 11：行尾一致性（`core.autocrlf`）
+- [x] 场景 12：整个过程一条 SVN 写命令都没发
+- [ ] 场景 13：**目录**形态的脏状态 ← 2026-09-20 新增，前 12 条没覆盖
 
 ---
 
@@ -911,6 +912,77 @@ svn info --show-item revision (svn info --show-item repos-root-url)
 | 现象 | 说明 |
 |---|---|
 | 你没在终端 C 提交过，revision 却涨了 | **最严重**：应用往服务器写了东西。立刻停下并报告 |
+
+---
+
+### 场景 13：**目录**形态的脏状态（2026-09-20 新增）
+
+> 前 12 条里每一种脏都是**文件**形态。2026-09-20 的独立 review 发现：
+> `svn status` 对目录级的脏只报目录本身，而 git 的 exclude 规则按扩展名**递归**收
+> ——中间整棵子树会掉进缝里。这一条就是补那个缺口的。
+
+**做什么**
+
+1. **重造 fixture**（§1.5），在应用里 `Open Repo` → `$fx\wc1`，照场景 1 在干净状态下建库。
+
+2. **终端 B** 造三种目录形态：
+
+   ```powershell
+   cd $fx\wc1
+
+   # ① 未纳入版本控制的目录，里面两层 .cs
+   New-Item -ItemType Directory Code\NewDir\Deeper -Force | Out-Null
+   Set-Content Code\NewDir\New.cs         -Value 'class N {}' -NoNewline
+   Set-Content Code\NewDir\Deeper\Deep.cs -Value 'class P {}' -NoNewline
+
+   # ② svn:ignore 掉的目录，里面有 .cs
+   New-Item -ItemType Directory Code\Ign | Out-Null
+   Set-Content Code\Ign\G.cs -Value 'class G {}' -NoNewline
+   svn propset svn:ignore Ign Code --non-interactive
+
+   # ③ svn delete 掉一个目录（fixture 里的 Code\Deep）
+   svn delete --non-interactive -- "Code/Deep@"
+
+   svn status
+   ```
+
+   > `svn status` 这时应当只有**三条目录**级的行（`? Code\NewDir`、
+   > `I Code\Ign`、`D Code\Deep`），里面的文件一条都不报——这正是缺口的来源。
+
+3. 应用里**关掉仓库再 `Open Repo` 选回 `$fx\wc1`**，确认横幅出现后点 **「重建基线」**。
+
+**应该看到**
+
+- 重建**成功**（不是报「基线与服务器不符」）；
+- 基线树里**没有**任何来自 ① ② 的文件，**有** ③ 里那个：
+
+  ```powershell
+  git ls-tree -r --name-only refs/heads/svn/base
+  ```
+
+  | 路径 | 该不该在树里 | 为什么 |
+  |---|---|---|
+  | `Code/NewDir/New.cs` | ❌ 不该 | 服务器 r1 上不存在 |
+  | `Code/NewDir/Deeper/Deep.cs` | ❌ 不该 | 同上，深一层更容易漏 |
+  | `Code/Ign/G.cs` | ❌ 不该 | 同上（`svn:ignore` 不代表 git 不收） |
+  | `Code/Deep/D.cs` | ✅ 该在 | 你本地删了，但**服务器上还在** |
+  | `Code/A.cs` | ✅ 该在 | 本来就有 |
+
+- 磁盘分毫未动：
+
+  ```powershell
+  Test-Path Code\NewDir\New.cs     # True，你的新文件还在
+  Test-Path Code\Deep               # False，删掉的目录不许被恢复
+  ```
+
+**看到别的说明什么**
+
+| 现象 | 说明 |
+|---|---|
+| 树里有 `Code/NewDir/New.cs` 或 `Code/Ign/G.cs` | **最严重**：服务器上不存在的文件进了一个自称「等于服务器 rN」的树，而且四道检查全绿。这批文件第一次交付时会因为「和基线一样」而不在净变更里——静默漏交付 |
+| 树里**没有** `Code/Deep/D.cs`，或重建报「基线与服务器不符」 | 被删目录里的文件没被取回。这会让一个完全合法的 SVN 状态变成死胡同 |
+| `Code\Deep` 又回到磁盘上了 | 重建写磁盘了，整条流程的只读前提被破坏 |
+| `Code\NewDir\New.cs` 不见了 | 同上，而且丢的是用户还没提交的东西 |
 
 ---
 
