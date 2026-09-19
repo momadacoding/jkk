@@ -392,9 +392,40 @@ D       Code\Deep\D.cs   ?? Code/Colleague.cs
 ?       Code\New.cs      ?? Code/New.cs
 ```
 
-> `?? Code/Colleague.cs` 出现在 git 侧是**正常**的：同事的新文件已经通过
-> `svn update` 到了磁盘上，而你的 `work` 分支还没跟进新基线。
-> 「重建不自动推进工作分支」是设计里写明的代价。
+**为什么重建完了 `Code/Colleague.cs` 还挂在 `git status` 里**
+
+这一条最容易看不懂，先把三个地方分清楚：
+
+```text
+                    磁盘（git 和 svn 共用这一份）
+                     ↑                    ↑
+   git status 比这一对 │                    │ svn status 比这一对
+                     ↓                    ↓
+              work 分支的 HEAD      .svn\pristine（= 服务器 r2）
+
+              svn/base（基线）  ← 「重建基线」**只动这一个**
+```
+
+`git status` 比的是**磁盘 vs `work` 分支的 HEAD**，它**根本不看 `svn/base`**。
+而「重建基线」做的事只有一件：把 `svn/base` 指到一个内容等于服务器 r2 的新
+commit。它**不写磁盘**（这正是本场景要验的），也**不推进 `work` 分支**
+（spec §18 明写，R1–R5 全程不动 HEAD）。
+
+所以 `work` 的 HEAD 仍然停在 r1 的内容——没有 `Colleague.cs`、`A.cs` 是原版、
+`Deep\D.cs` 还在。磁盘上则是：`Colleague.cs` 有了（第 2 步 `svn update` 带来的）、
+`A.cs` 你改过、`Deep\D.cs` 你删了。两边的差正好就是上面那四行。
+
+**注意 `?? Code/Colleague.cs` 在 BEFORE 里就已经有了。** 把它带上磁盘的是
+第 2 步的 `svn update`，不是重建。重建前后这份输出逐字不变，恰恰是本场景的
+通过判据——重建什么都没碰。
+
+**为什么不顺手把 `work` 推进过去？** 那是往你自己的历史上写东西：merge 还是
+rebase、有未提交改动怎么办、历史里有 merge 提交怎么整理，都得你决定。顺带还
+避开了两个麻烦：`work` 上有未提交改动时 `git checkout` 会直接失败，以及
+「流程走完忘了切回原分支」。
+
+**什么时候它会消失？** 你自己把 `work` 跟进到新基线之后。Phase 2 的 `sync_in`
+会做完整编排（spec §9.4），这一期不做——这一期只负责让基线重新变诚实。
 
 再确认基线录对了：
 
@@ -413,6 +444,8 @@ git ls-tree -r --name-only refs/heads/svn/base
 | 点确认后报 `svn_preflight_dirty` | 你测的是 1c 的构建 |
 | **哈希变了 / `svn status` 少了几行** | **最严重**：重建写了磁盘。立刻停下，把 BEFORE / AFTER 两段原样贴出来 |
 | 报「重建过程中工作副本被外部改动了」 | R3c 触发了。你若确实在这期间动过 `wc1`，重点一次即可；没动过就记下来 |
+| 重建之后 `git status` 里还有 `?? Code/Colleague.cs` | **正常**，见上面那段。`git status` 比的是 `work` 分支不是基线，而重建按设计不推进 `work` |
+| 重建之后 `git status` **变干净了** | 反而是问题：说明重建推进了工作分支或写了磁盘，两者都超出了这一期的授权 |
 | 第 2 步出现 `Tree conflicts` | 同事动的不是新增文件，回第 1 步 |
 
 ---
