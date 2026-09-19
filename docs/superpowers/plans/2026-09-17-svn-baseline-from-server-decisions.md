@@ -428,6 +428,117 @@ Task 4–9 合并验证（它们是一个不可分割的交付单元，见下方
 
 ---
 
+## 补 Task（2026-09-20）：独立 review 的两条阻断项——svn 按目录报，git 按文件收
+
+### 计划没写的坑（独立 review 发现，实测复现）
+
+一个根因，两种表现。`svn status` 对**目录**级的脏状态只报目录本身，而 git 侧的
+exclude 规则是 `!/<白名单>/**/*.<扩展名>`，**按扩展名递归**。两边粒度不一致。
+
+2026-09-20 在一次性 fixture 上实测（跑完即删）：
+
+| 形态 | 不带 `-v` | 带 `-v` | 目录还在磁盘上吗 |
+|---|---|---|---|
+| 未版本控制的目录 | 只报目录 | **只报目录**（不下沉） | 在 |
+| `svn:ignore` 的目录 | 只报目录 | **只报目录**（不下沉） | 在 |
+| `svn delete` 的目录 | 只报目录 | **目录 + 每个子文件都报 `deleted`** | 不在 |
+| `svn add` 未提交的目录 | 目录 + 子文件都报 | 同左 | 在 |
+
+最后一行说明 `added` 本来就是对的，不用改。
+
+**B1（静默，最严重）**：未版本控制 / ignored 的目录 → `fixes = {"Code/NewDir": Drop}`
+→ `is_w_file("Code/NewDir")` 为 false（不以 `.cs` 结尾）→ `S = ∅` →
+`record_server_tree` 一次 `remove_path` 都不调。而 `git add -A -- Code` 把里面的
+`.cs` 全收了。`svn diff --summarize` 对未版本控制内容一条都不报 ⇒ `D = ∅` ⇒
+`D \ S = ∅` ⇒ **`Verified`**。服务器上不存在的文件躺在一个自称「等于服务器 rN」
+的树里，四道检查全绿。按 §8.5 / D1 这批文件首次交付时会因为「和基线一样」而不在
+净变更里——**静默漏交付**，与 Task 0 里论证「为什么不能直接放行脏工作副本」
+要防的后果逐字相同。
+
+**这是本轮引入的回归**：base 分支 1c 的 `check_clean` 把 `unversioned` 一律硬拦，
+这种工作副本根本进不了初始化。P1 放松之后这条路径第一次可达。
+
+**B2（会响但指错方向）**：`svn delete` 一个目录 → 子文件没进 `S`，而
+`svn diff --summarize` 那一侧**会**报它们 deleted ⇒ `D \ S != ∅` ⇒ `Lying` ⇒
+初始化回退 / 重建中止，文案却说「漏跑了一次完整的 svn update」——跑多少次都没用。
+
+### 做法
+
+改动集中在 `read_dirty` **一个函数**里，四个消费者（录制、录制后体检、手动体检、
+服务器侧核对）自动同步——这正是当初把 `read_dirty` + `classify` 抽成一对的收益。
+
+1. **加 `-v`**：把被 `svn delete` 的目录里的子文件捞出来。代价是干净条目也一并
+   返回，靠既有的 `normal` + `props=none` 过滤掉。
+2. **未版本控制 / ignored 的目录自己走一遍磁盘**（`-v` 帮不上忙，实测不下沉）。
+   新增 `is_plain_dir` + `expand_dir` 两个私有函数。
+
+### 为什么这么改是安全的
+
+- **`S` 仍然恰好**：展开出来的是磁盘上真实存在的**文件**，每一个都会被
+  `explained_paths` 按 `is_w_file` 再过一遍。目录条目本身保留在清单里但不是
+  W-file，自然落不进 `S`。
+- **不跟随符号链接**：`is_plain_dir` 用 `symlink_metadata`，`expand_dir` 用
+  `file_type().is_symlink()` 跳过。一条指向自己祖先的 junction 否则会让遍历
+  转不出来，而 Unity 工程里 junction 并不罕见。
+- **遍历失败报错而不是跳过**：悄悄跳过等于宣称「这里没有 W-file」，正好是这次
+  要消灭的那种静默。调用方各自决定——初始化中止，服务器侧核对退成 `NotChecked`。
+- **`-v` 不是新的开销量级**：`audit_server_set`（本轮刚改成 5 分钟定时重跑的那个）
+  本来就要发一次递归的**网络** `svn ls -R`，本地的 `svn status -v` 比它便宜。
+- **对工作目录仍然只读**：新增的只有 `read_dir` / `symlink_metadata`。
+
+### 测试
+
+先补三条**红的**测试再动代码，实际输出与 review 的描述逐字吻合：
+
+```
+未版本控制目录里的 .cs 进了基线树。实际树：
+Code/A.cs
+Code/B.cs
+Code/NewDir/Deeper/Deep.cs
+Code/NewDir/New.cs
+```
+
+```
+GitError { code: "svn_baseline_lying", message: "...共 1 处...\n  - Code/Deep/D.cs" }
+```
+
+`DirtyKind` 加了三个变体（`UnversionedDir` / `IgnoredDir` / `DeletedDir`）——
+review 指出原来四种脏**全是文件形态**，所以这个形态在单测、集成测试、手工清单
+三层都没被覆盖过，526 全绿说明不了它。
+
+**变异验证：两半正交，各自都有牙齿。**
+
+| 变异 | 结果 |
+|---|---|
+| 去掉 `-v` | `DeletedDir` 那条红，另外两条绿 |
+| 去掉磁盘展开 | `UnversionedDir` / `IgnoredDir` 两条红，`DeletedDir` 绿 |
+
+### 验证
+
+`cargo fmt --check` ✓、`cargo clippy --all-targets` **0 告警**、
+`cargo test` **529 passed / 0 failed / 41 个二进制**（改动前 526）。
+
+### 顺带修掉的（review 建议 1）
+
+`classify` 里 obstructed 的报错原文是「本该在 P1 就被拦下」，但
+`check_current_baseline`（手动体检那颗按钮）从来不跑 P1——用户在有 `~` 的仓库上
+点体检，会收到一条听起来像内部 bug 的话。改成面向用户的措辞。
+
+### 还没做的（review 的其余建议）
+
+- spec 第 3331 行的 `hash-object` 命令形状仍缺 `--path`，与 §16.2.1 矛盾（实现是对的）；
+- 白名单条目不带尾斜杠时，目录路径本身会通过 `is_w_file` 进入 `S`（目前无害，
+  但值得加断言钉住）；
+- `run_git_stdin` 的管道死锁前提没写进文档注释；
+- `svn_health_dirty.rs` 的辅助函数与产品路径在嵌套 external 下会分叉。
+
+### 覆盖面
+
+E2E 清单新增**场景 13**，把这三种目录形态搬到真实窗口里验一遍。前 12 条都是
+文件形态，覆盖不到。
+
+---
+
 ## 实测记录（Task 0 之前完成）
 
 八条未知全部在临时 fixture 上实测，探针用完即删，`git status` 已复核干净。

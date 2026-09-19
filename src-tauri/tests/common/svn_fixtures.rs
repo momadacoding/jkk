@@ -287,6 +287,35 @@ pub enum DirtyKind {
     Added,
     /// `svn delete` 了但没提交。
     Deleted,
+    /// 白名单目录里多出一个**没纳入版本控制的目录**，里面两层 `.cs`。
+    ///
+    /// # 这不是 [`DirtyKind::Unversioned`] 的换皮
+    ///
+    /// 2026-09-20 实测，`svn status --xml`（带不带 `-v` 都一样）对这种形态
+    /// **只报目录本身，里面一个文件都不报**：
+    ///
+    /// ```xml
+    /// <entry path="Code\NewDir">
+    ///   <wc-status item="unversioned" props="none"></wc-status>
+    /// </entry>
+    /// ```
+    ///
+    /// 而 git 的 exclude 规则按扩展名**递归**收（`!/Code/**/*.cs`），里面的
+    /// `.cs` 照样进基线树。分类层若只认 svn 报的那一条路径，这些文件就会以
+    /// 磁盘内容混进一个声称「等于服务器 rN」的树里，四道检查全绿——正是本期
+    /// 要消灭的那种假基线。
+    UnversionedDir,
+    /// 白名单目录里一个被 `svn:ignore` 挡掉的**目录**，里面有 `.cs`。
+    ///
+    /// 与 [`DirtyKind::UnversionedDir`] 同一个形态，只是 item 变成 `ignored`。
+    /// 单列是因为 `--no-ignore` 这一路的分支是独立的。
+    IgnoredDir,
+    /// `svn delete` 掉一个**目录**（里面有 `.cs`），没提交。
+    ///
+    /// 实测：不带 `-v` 的 `svn status` 只报目录本身；**带 `-v` 才会同时列出
+    /// `Code/Deep/D.cs` 也是 `deleted`**。目录本身在磁盘上已经没了，
+    /// 而 `svn cat -r BASE Code/Deep/D.cs@` 仍然取得到内容（exit 0）。
+    DeletedDir,
 }
 
 /// 在 [`svn_repo`] 的基础上制造一种脏状态。
@@ -306,6 +335,30 @@ pub fn svn_repo_dirty(kind: DirtyKind) -> SvnFixture {
         }
         DirtyKind::Deleted => {
             run(&wc, "svn", &["delete", "Code/B.cs", "--non-interactive"]);
+        }
+        DirtyKind::UnversionedDir => {
+            std::fs::create_dir_all(wc.join("Code/NewDir/Deeper")).unwrap();
+            std::fs::write(wc.join("Code/NewDir/New.cs"), "n\n").unwrap();
+            std::fs::write(wc.join("Code/NewDir/Deeper/Deep.cs"), "d\n").unwrap();
+            // 白名单内但扩展名不符：它不该进 `S`，也本来就进不了基线树。
+            std::fs::write(wc.join("Code/NewDir/note.txt"), "t\n").unwrap();
+        }
+        DirtyKind::IgnoredDir => {
+            std::fs::create_dir_all(wc.join("Code/Ign")).unwrap();
+            std::fs::write(wc.join("Code/Ign/G.cs"), "g\n").unwrap();
+            run(
+                &wc,
+                "svn",
+                &["propset", "svn:ignore", "Ign", "Code", "--non-interactive"],
+            );
+        }
+        DirtyKind::DeletedDir => {
+            std::fs::create_dir_all(wc.join("Code/Deep")).unwrap();
+            std::fs::write(wc.join("Code/Deep/D.cs"), "d\n").unwrap();
+            run(&wc, "svn", &["add", "Code/Deep", "--non-interactive"]);
+            run(&wc, "svn", &["commit", "-m", "r2", "--non-interactive"]);
+            run(&wc, "svn", &["update", "--non-interactive"]);
+            run(&wc, "svn", &["delete", "Code/Deep", "--non-interactive"]);
         }
     }
     fx

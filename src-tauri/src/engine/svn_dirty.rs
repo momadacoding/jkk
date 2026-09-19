@@ -13,6 +13,10 @@
 //! | 本地新增（已 add 或未版本控制） | **没有** | 从树里剔除 |
 //! | 只改了属性 | 同一份内容 | 不用动 |
 //!
+//! ⚠️ **这张表是按文件说的，而 svn 会按目录报。** 两边粒度对不上时整棵子树都会
+//! 掉进缝里——见 [`read_dirty`] 文档里那张实测表，那是 2026-09-20 两条阻断项的
+//! 根因。
+//!
 //! 判错一条就是一个假基线，而假基线看起来完全正常——这是整套设计里最贵的那类
 //! 错误（§6.8.1）。所以这里对没见过的 item **报错而不是跳过**。
 
@@ -22,6 +26,7 @@ use crate::engine::svn_wc::peg_safe;
 use crate::engine::svn_xml::{parse_status_entries, StatusEntry};
 use crate::error::{GitError, Result};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 /// 读出 `targets` 覆盖范围内所有**非 pristine** 的条目。**不做任何阻断判定。**
 ///
@@ -37,6 +42,31 @@ use std::collections::{BTreeMap, BTreeSet};
 /// 的话，external 里的改动在这条命令下只显示成一条 `item="external"`，而下面正好
 /// 把它跳过——等于完全没查（spec §6.5.5 / §6.6.5）。
 ///
+/// # ⚠️ svn 是按**目录**报的，而 git 是按**文件**递归收的
+///
+/// 2026-09-20 实测（独立 review 的两条阻断项）。`svn status` 对目录级的脏状态
+/// 只报目录本身：
+///
+/// | 形态 | 不带 `-v` | 带 `-v` | 目录还在磁盘上吗 |
+/// |---|---|---|---|
+/// | 未版本控制的目录 | 只报目录 | **只报目录**（不下沉） | 在 |
+/// | `svn:ignore` 的目录 | 只报目录 | **只报目录**（不下沉） | 在 |
+/// | `svn delete` 的目录 | 只报目录 | **目录 + 每个子文件都报 `deleted`** | 不在 |
+/// | `svn add` 未提交的目录 | 目录 + 子文件都报 | 同左 | 在 |
+///
+/// 而 git 侧的 exclude 规则是 `!/<白名单>/**/*.<扩展名>`——**按扩展名递归**。
+/// 两边粒度不一致，中间那些文件就会掉进缝里：
+///
+/// - 未版本控制 / ignored 的目录 → 里面的 `.cs` 被 `git add` 收进基线树，而
+///   分类层只认得那一条目录路径 ⇒ 服务器上不存在的文件混进一个自称「等于
+///   服务器 rN」的树，**四道检查全绿**（假基线，且静默）；
+/// - `svn delete` 的目录 → 子文件没被取回，而 `svn diff --summarize` 那一侧
+///   **会**报它们是 deleted ⇒ `D \ S != ∅` ⇒ 初始化 / 重建永远失败，
+///   错误文案还把原因指向「漏跑了 svn update」。
+///
+/// 所以这里做两件事：**加 `-v`**（把被删目录的子文件捞出来），以及对
+/// 未版本控制 / ignored 的目录**自己走一遍磁盘**（`-v` 帮不上忙）。
+///
 /// # 为什么读与判分开
 ///
 /// 两个调用方要的东西不一样：初始化 / 重建要在 `~` 上**阻断**，而打开仓库时的
@@ -50,6 +80,11 @@ pub fn read_dirty(repo_root: &str, targets: &[String]) -> Result<Vec<StatusEntry
             repo_root,
             &[
                 "status",
+                // `-v` 是为了**被 `svn delete` 掉的目录**：不带它，`svn status`
+                // 只报目录本身，里面那些服务器上还在的文件一条都拿不到。
+                // 代价是所有干净条目也一并返回，下面按 `normal` + `props=none`
+                // 滤掉；解析一遍的开销远小于漏掉整棵子树。
+                "-v",
                 "--no-ignore",
                 "--ignore-externals",
                 "--xml",
@@ -70,6 +105,18 @@ pub fn read_dirty(repo_root: &str, targets: &[String]) -> Result<Vec<StatusEntry
             if e.item == "normal" && e.props == "none" {
                 continue;
             }
+            // 未版本控制 / ignored 的**目录**：svn 连 `-v` 都不下沉进去，
+            // 必须自己走一遍磁盘，否则里面的 W-file 会被 git 收进基线树而
+            // 分类层完全不知道（见本函数文档里那张表）。
+            //
+            // 目录条目本身**保留**在清单里：这个函数的契约是「如实反映 svn
+            // 说了什么」，删掉它等于替下游做判断；而它不是 W-file，
+            // `explained_paths` 自然会把它滤掉。
+            if matches!(e.item.as_str(), "unversioned" | "ignored")
+                && is_plain_dir(repo_root, &e.path)
+            {
+                expand_dir(repo_root, &e, &mut dirty)?;
+            }
             dirty.push(e);
         }
     }
@@ -78,6 +125,80 @@ pub fn read_dirty(repo_root: &str, targets: &[String]) -> Result<Vec<StatusEntry
     dirty.sort_by(|a, b| a.path.cmp(&b.path));
     dirty.dedup_by(|a, b| a.path == b.path);
     Ok(dirty)
+}
+
+/// 这个相对路径在磁盘上是不是一个**真目录**（不跟随符号链接）。
+///
+/// 用 `symlink_metadata` 而不是 `Path::is_dir`：后者跟随链接，一条指向自己祖先
+/// 的 junction 就能让下面的遍历转不出来。Unity 工程里 junction 并不罕见。
+fn is_plain_dir(repo_root: &str, rel: &str) -> bool {
+    std::fs::symlink_metadata(Path::new(repo_root).join(rel))
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+}
+
+/// 把一个未版本控制 / ignored 的目录，摊平成它底下每一个**文件**的条目。
+///
+/// 合成出来的条目沿用目录的 `item`（`unversioned` 或 `ignored`），因为服务器 rN
+/// 上这整棵子树都不存在——每一个都该被 [`Fix::Drop`]。`props` 填 `none`：
+/// 未纳入版本控制的路径没有 svn 属性可言，而 [`classify`] 也只看 `item`。
+///
+/// # 出错就报错，不跳过
+///
+/// 读不动某个子目录（权限、被占用）时返回 `Err`。悄悄跳过等于宣称「这里没有
+/// W-file」，而那正好是本函数要消灭的那种静默假基线。调用方各自决定怎么处理：
+/// 初始化 / 重建会中止，服务器侧核对退成 `NotChecked`。
+fn expand_dir(repo_root: &str, dir: &StatusEntry, out: &mut Vec<StatusEntry>) -> Result<()> {
+    let mut stack = vec![dir.path.clone()];
+    while let Some(rel) = stack.pop() {
+        let abs = Path::new(repo_root).join(&rel);
+        let rd = std::fs::read_dir(&abs).map_err(|e| {
+            GitError::new(
+                "svn_dirty_walk_failed",
+                format!(
+                    "读不动 `{rel}`：{e}。它是一个未纳入版本控制的目录，\
+                     里面可能有会被 git 收进基线的源码文件，没读完就不能下结论。"
+                ),
+            )
+        })?;
+        for ent in rd {
+            let ent = ent.map_err(|e| {
+                GitError::new(
+                    "svn_dirty_walk_failed",
+                    format!("枚举 `{rel}` 的内容时失败：{e}"),
+                )
+            })?;
+            let ft = ent.file_type().map_err(|e| {
+                GitError::new(
+                    "svn_dirty_walk_failed",
+                    format!("读不到 `{rel}` 里某一项的类型：{e}"),
+                )
+            })?;
+            let name = ent.file_name().to_string_lossy().into_owned();
+            // `.svn` / `.git` 不该出现在未版本控制的目录里，但真出现了也绝不能
+            // 跟进去——那是另一套元数据，不是源码。
+            if name == ".svn" || name == ".git" {
+                continue;
+            }
+            let child = format!("{rel}/{name}");
+            if ft.is_symlink() {
+                // 不跟随。链接目标要么在这棵树里（会被单独遍历到），要么在外面
+                // （不归这个白名单管）。
+                continue;
+            }
+            if ft.is_dir() {
+                stack.push(child);
+            } else if ft.is_file() {
+                out.push(StatusEntry {
+                    path: child,
+                    item: dir.item.clone(),
+                    props: "none".to_string(),
+                    wc_locked: false,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 把分类结果收敛成体检判据里的 `S`（spec §6.8.7）。
@@ -156,8 +277,10 @@ pub fn classify(entries: &[StatusEntry]) -> Result<BTreeMap<String, Fix>> {
                 return Err(GitError::new(
                     "svn_dirty_obstructed",
                     format!(
-                        "`{path}` 是 obstructed，本该在 P1 就被拦下。\
-                         这个位置上 svn 自己都说不清是什么，取不到它在服务器上的内容。"
+                        "`{path}` 处在 obstructed 状态（svn status 的 `~`）：\
+                         那个位置上本该是文件的成了目录、或者反过来。\
+                         svn 自己都说不清它是什么，也就取不到它在服务器上的内容。\
+                         请先在 SVN 客户端里把这个路径理顺，本应用不会替你动它。"
                     ),
                 ))
             }

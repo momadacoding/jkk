@@ -17,8 +17,8 @@ use app_lib::engine::svn_init::{
 use app_lib::engine::svn_xml::parse_info;
 use std::process::Command;
 use svn_fixtures::{
-    svn_repo, svn_repo_for_health, svn_repo_obstructed, svn_repo_with_native_eol,
-    svn_repo_with_same_repo_nested_external, NestedExternal, SvnFixture,
+    svn_repo, svn_repo_dirty, svn_repo_for_health, svn_repo_obstructed, svn_repo_with_native_eol,
+    svn_repo_with_same_repo_nested_external, DirtyKind, NestedExternal, SvnFixture,
 };
 
 fn svn(dir: &std::path::Path, args: &[&str]) {
@@ -870,4 +870,108 @@ fn rebuild_emits_no_svn_write_command() {
     let before = server_head_rev(&fx);
     rebuild_baseline(&fx.wc_str()).unwrap();
     assert_eq!(before, server_head_rev(&fx), "重建动了服务器");
+}
+
+// ===========================================================================
+// 目录形态的脏状态（2026-09-20 独立 review 的两条阻断项 B1 / B2）
+//
+// `svn status` 对 unversioned / ignored / deleted 的**目录**只报目录本身。
+// 实测（`-v` 也一样不下沉进未版本控制目录）：
+//
+// ```xml
+// <entry path="Code\NewDir"><wc-status item="unversioned" props="none"/></entry>
+// ```
+//
+// 而 git 的 exclude 规则按扩展名**递归**收。两边粒度不一致，就是一个假基线。
+// ===========================================================================
+
+#[test]
+fn an_unversioned_directory_does_not_smuggle_its_cs_files_into_the_baseline() {
+    // **B1。** 这是本期最危险的一条：它静默。四道检查全绿，而基线树里躺着
+    // 服务器 r1 上根本不存在的文件，内容是磁盘内容。按 §8.5 / D1，这批文件
+    // 第一次交付时会因为「和基线一样」而不在净变更里——静默漏交付。
+    //
+    // Unity 工程里「新建个文件夹写几个 .cs、还没 svn add」是最常见的状态之一。
+    let fx = svn_repo_dirty(DirtyKind::UnversionedDir);
+    let report = init_hybrid(&req(&fx)).unwrap();
+
+    let listed = run_git(
+        &fx.wc_str(),
+        &["ls-tree", "-r", "--name-only", "refs/heads/svn/base"],
+    )
+    .unwrap();
+    assert!(
+        !listed.contains("Code/NewDir/New.cs"),
+        "未版本控制目录里的 .cs 进了基线树。实际树：\n{listed}"
+    );
+    assert!(
+        !listed.contains("Code/NewDir/Deeper/Deep.cs"),
+        "深一层的更容易漏。实际树：\n{listed}"
+    );
+    assert!(
+        listed.contains("Code/A.cs"),
+        "服务器上本来就有的必须还在。实际树：\n{listed}"
+    );
+    assert!(
+        matches!(report.health, Health::Verified { .. }),
+        "剔干净之后体检该通过，实际：{:?}",
+        report.health
+    );
+    // 磁盘只读：用户的新文件一个都不能少
+    assert!(fx.wc().join("Code/NewDir/New.cs").exists());
+    assert!(fx.wc().join("Code/NewDir/Deeper/Deep.cs").exists());
+}
+
+#[test]
+fn an_svn_ignored_directory_is_handled_the_same_way() {
+    // `--no-ignore` 让它出现在 status 里，item 是 `ignored` 而不是 `unversioned`。
+    // 被 svn:ignore 挡住**不代表 git 不收它**，所以两条分支都得走同一条路。
+    let fx = svn_repo_dirty(DirtyKind::IgnoredDir);
+    init_hybrid(&req(&fx)).unwrap();
+
+    let listed = run_git(
+        &fx.wc_str(),
+        &["ls-tree", "-r", "--name-only", "refs/heads/svn/base"],
+    )
+    .unwrap();
+    assert!(
+        !listed.contains("Code/Ign/G.cs"),
+        "svn:ignore 的目录里的 .cs 进了基线树。实际树：\n{listed}"
+    );
+}
+
+#[test]
+fn a_directory_deleted_with_svn_delete_is_taken_back_from_the_server() {
+    // **B2。** 不静默，但它让一个完全合法的 SVN 状态变成死胡同：
+    // 子文件没进 `S`，而 `svn diff --summarize` 那一侧**会**报它是 deleted，
+    // 于是 D \ S != ∅ → Lying → 初始化整个回退，错误文案还让用户去跑
+    // `svn update`（跑一百次也没用）。
+    let fx = svn_repo_dirty(DirtyKind::DeletedDir);
+    let report = init_hybrid(&req(&fx)).unwrap();
+
+    let listed = run_git(
+        &fx.wc_str(),
+        &["ls-tree", "-r", "--name-only", "refs/heads/svn/base"],
+    )
+    .unwrap();
+    assert!(
+        listed.contains("Code/Deep/D.cs"),
+        "被本地删掉的目录里的文件，服务器上还在，必须取回基线。实际树：\n{listed}"
+    );
+    let blob = run_git(
+        &fx.wc_str(),
+        &["cat-file", "blob", "refs/heads/svn/base:Code/Deep/D.cs"],
+    )
+    .unwrap();
+    assert_eq!(blob, "d\n", "取回的必须是服务器那一版");
+    assert!(
+        matches!(report.health, Health::Verified { .. }),
+        "取回之后体检该通过，实际：{:?}",
+        report.health
+    );
+    // 磁盘只读：删掉的目录不能被悄悄恢复
+    assert!(
+        !fx.wc().join("Code/Deep").exists(),
+        "重建/初始化不许写磁盘，被删的目录不该回来"
+    );
 }
