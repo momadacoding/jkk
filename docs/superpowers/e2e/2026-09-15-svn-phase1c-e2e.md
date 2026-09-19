@@ -1,5 +1,12 @@
 # Phase 1c 手工测试指引
 
+**对应分支：`feat/svn-phase1c`（PR #43）。** 「1c」就是指那个分支/那个 PR，
+不是文件里的什么功能。
+
+你在 `feat/svn-baseline-from-server`（PR #44）的 worktree 里也能看到这份文件
+——B 是从 1c 拉出来的，所以把它一起带过来了。**PR #44 自己的清单是同目录下的
+`2026-09-18-svn-baseline-from-server-e2e.md`，那份才验本期的改动。**
+
 > 配套 `docs/superpowers/plans/2026-09-15-svn-phase1c-visible.md`。
 >
 > 这份文档假设你**没看过这期的代码**，照着从上往下做就行。

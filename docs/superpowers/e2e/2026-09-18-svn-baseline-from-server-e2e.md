@@ -1,12 +1,17 @@
 # 基线改从服务器录 · 手工测试指引
 
-**对应分支：`feat/svn-baseline-from-server`（PR #44，base 是 `feat/svn-phase1c`）**
+**对应分支：`feat/svn-baseline-from-server`（PR #44，base 是 `feat/svn-phase1c` 不是 `master`）。**
+本地 worktree：`.claude/worktrees/svn-baseline-b`。
+
+> 同目录下的 `2026-09-15-svn-phase1c-e2e.md` 是**上一期**（PR #43，分支
+> `feat/svn-phase1c`）的清单。它验的不是本期的改动，两份都在这个 worktree 里，
+> 别弄混。
 
 ## 状态
 
 | | |
 |---|---|
-| 自动化测试 | Rust 524 passed / 0 failed；前端 336 passed |
+| 自动化测试 | Rust 526 passed / 0 failed；前端 341 passed（2026-09-19） |
 | 真实窗口 E2E | ⬜ **全部未执行**，本文件就是那份清单（勾选表在下面） |
 
 > 本文件里的每一条命令都在真实 fixture 上跑过，输出是实测值不是猜的。
