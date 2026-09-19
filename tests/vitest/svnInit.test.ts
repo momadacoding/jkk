@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   WIZARD_STEPS,
   describeHealth,
+  healthNeedsRebuild,
   describePinned,
   nextStep,
   parseExtensions,
@@ -169,5 +170,29 @@ describe('错误码到引导语的映射', () => {
     // 抑制只针对重复，不能把这张表整个变成摆设
     const terse = '核对失败'
     expect(wizardErrorHint('include_set_mismatch', terse)).toContain('.gitignore')
+  })
+})
+
+describe('healthNeedsRebuild', () => {
+  it('基线在撒谎时给出重建的入口', () => {
+    // 这是它存在的全部理由：`lying` 只在 revision 对得上时出现，而重建按钮
+    // 挂在失同步横幅上——那时横幅不在。不给入口的话，体检等于只负责报丧。
+    expect(healthNeedsRebuild({ status: 'lying', files: ['Code/A.cs'] })).toBe(true)
+  })
+
+  it('「没验成」不给——它不是「坏了」', () => {
+    // 断网、URL 不可达都落在 notChecked。那时推用户去重建，等于拿一次网络抖动
+    // 换一个新基线，而旧基线只能从 reflog 找回来。
+    expect(healthNeedsRebuild({ status: 'notChecked', reason: '断网' })).toBe(false)
+  })
+
+  it('体检通过时不给', () => {
+    expect(healthNeedsRebuild({ status: 'verified', rev: 7 })).toBe(false)
+  })
+
+  it('一处文件都没列出来的 lying 也照样给入口', () => {
+    // `describeHealth` 对这种形态的文案是「这本身不该发生，请重建基线」——
+    // 既然文案在劝重建，入口就不能反而消失。
+    expect(healthNeedsRebuild({ status: 'lying', files: [] })).toBe(true)
   })
 })

@@ -21,7 +21,7 @@ import {
 import SvnInitWizard from './SvnInitWizard'
 import BaselineBanner from './BaselineBanner'
 import { baselineMap } from '../engine/svnGraph'
-import { describeHealth, describePinned } from '../engine/svnInit'
+import { describeHealth, describePinned, healthNeedsRebuild } from '../engine/svnInit'
 import { samePath } from '../engine/path'
 import { isBaselineBranch, visibleSections } from '../engine/capabilities'
 import { askConfirm } from '../engine/confirm'
@@ -552,9 +552,13 @@ export function RepoTab({
    */
   const handleCheckBaseline = async () => {
     try {
+      const health = await svnCheckBaseline(repoPath)
       // 复用向导那边的同一份翻译，不另写一套——两份文案迟早说出不同的话。
-      const n = describeHealth(await svnCheckBaseline(repoPath))
-      await confirm({
+      const n = describeHealth(health)
+      // 报「基线在撒谎」时必须就地给出路：那个结论只在 revision 对得上时出现，
+      // 而重建按钮挂在失同步横幅上，那时横幅不在（判据见 `healthNeedsRebuild`）。
+      const offerRebuild = healthNeedsRebuild(health)
+      const ok = await confirm({
         title: n.title,
         message:
           n.tone === 'error'
@@ -562,8 +566,12 @@ export function RepoTab({
             : n.detail,
         // `Lying` 的文件清单走红底警告条——「基线在撒谎」与普通说明不是一个分量。
         warning: n.tone === 'error' ? n.detail : undefined,
-        confirmLabel: '知道了',
+        confirmLabel: offerRebuild ? '重建基线' : '知道了',
       })
+      // 接着弹重建自己那个确认框，而不是在这里直接动手：重建要说明「不碰工作
+      // 目录、不推进工作分支」，那段话只应有一份。两个框的代价是多点一次，
+      // 比两处文案迟早说出不同的话便宜。
+      if (offerRebuild && ok) await handleRebuildBaseline()
     } catch (err) {
       reportError(err)
     }

@@ -136,6 +136,28 @@ export interface Notice {
 }
 
 /** 把体检结果翻译成一条界面提示。 */
+/**
+ * 体检结论要不要顺带给一条「重建基线」的出路。
+ *
+ * # 只有 `lying` 给
+ *
+ * 「重建基线」在界面上**只有失同步横幅一个入口**，而 `lying` 恰恰发生在
+ * **revision 完全对得上**的时候——也就是那条横幅不在的时候。于是体检告诉你
+ * 基线坏了，界面上却没有任何地方能修它（2026-09-19 用户在手工测试中撞上）。
+ *
+ * 这与 2026-09-16 独立 review 修掉的那条是同一个毛病：体检入口当初也被绑在
+ * 失同步横幅上，「等于只在不需要它的时候提供它」。那次只解开了体检。
+ *
+ * # ⚠️ `notChecked` 绝不能给
+ *
+ * 「没验成」不是「坏了」。断网、URL 不可达都会落到这里，那时推着用户去重建，
+ * 等于拿一次网络抖动换一个新基线——而重建是要动 `svn/base` 指针的，旧基线只能
+ * 从 reflog 找回来。`verified` 同理，没有任何理由重建。
+ */
+export function healthNeedsRebuild(h: Health): boolean {
+  return h.status === 'lying'
+}
+
 export function describeHealth(h: Health): Notice {
   switch (h.status) {
     case 'verified':
