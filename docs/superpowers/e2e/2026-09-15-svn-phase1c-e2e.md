@@ -591,6 +591,35 @@ Add-Content "Code\A.cs" -Value "// 本地调试用，不要交付"
 > 基线分支记的是「上次和服务器对齐时的内容」。允许你切上去看，但**不能在上面做
 > 开发提交** —— 在它上面提交会让基线记的东西和实际对不上。
 
+**⚠️ 前置：先把工作区弄成能切过去的状态**
+
+走到这一步时 `Code/Deep/D.cs` 多半是「已改未提交」：场景 3 的 `svn update` 把磁盘
+换成了 r2 的内容，而工作分支最后一个提交记的还是 r1（场景 4 的 📌 已经提醒过）。
+这时切 `svn/base`，界面上会挂一条红条：
+
+```text
+Your local changes to the following files would be overwritten by checkout:
+Code/Deep/D.cs
+Please commit your changes or stash them before you switch branches. Aborting
+```
+
+**这是 git 在拦你，不是应用的 bug。** 2026-09-19 在一次性 fixture 上实测：
+
+| 工作区状态 | `git checkout <目标分支>` |
+|---|---|
+| 有未提交改动，内容与目标分支不同 | ❌ 拒绝 |
+| 有未提交改动，内容**恰好等于**目标分支 | ❌ **仍然拒绝** |
+| 改动已提交到当前分支 | ✅ 切过去 |
+
+第二行是要害：git 比的是 index/HEAD，**不比内容**。所以「磁盘已经和基线一模一样了
+为什么还不让切」是正常的，不用怀疑基线录错了。
+
+两条出路，选一条再往下走：
+
+- **在应用里把这处改动提交到工作分支**（最自然，顺带就把场景 9 做了）；
+- 或者**重造一次 fixture、只走完场景 2 就直接做场景 10** —— 那时工作分支与基线
+  内容一致，切换是干净的。
+
 **做什么**
 
 1. 左边侧边栏的分支列表里找到 `svn/base`；
@@ -612,6 +641,8 @@ Add-Content "Code\A.cs" -Value "// 本地调试用，不要交付"
 
 - 侧边栏里根本找不到 `svn/base` → 基线分支的标签没跟着图一起重映射，
   这是上一轮修过的一个 bug；
+- 红条写着 `Your local changes … would be overwritten by checkout` → **不是 bug**，
+  见上面的前置一节：先把改动提交掉，或者重造 fixture 从场景 2 直接过来；
 - Ctrl+Enter 能提交出去 → 禁用只做在按钮上，快捷键漏了。
 
 ---
