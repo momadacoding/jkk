@@ -943,11 +943,36 @@ svn info --show-item revision (svn info --show-item repos-root-url)
    # ③ svn delete 掉一个目录（fixture 里的 Code\Deep）
    svn delete --non-interactive -- "Code/Deep@"
 
-   svn status
+   svn status --no-ignore
    ```
 
-   > `svn status` 这时应当只有**三条目录**级的行（`? Code\NewDir`、
-   > `I Code\Ign`、`D Code\Deep`），里面的文件一条都不报——这正是缺口的来源。
+   **`--no-ignore` 不能省。** 裸 `svn status` **不显示 ignored 条目**，正好把这条
+   场景要测的那一项藏掉。应用自己用的就是带 `--no-ignore` 的那条命令
+   （`svn_dirty.rs` 的 `read_dirty`）——被 `svn:ignore` 挡住**不代表 git 不收它**。
+
+   2026-09-20 实测，两条命令逐字如下：
+
+   ```text
+   svn status                    svn status --no-ignore
+   ?       .git                  ?       .git
+    M      Code                   M      Code
+   D       Code\Deep             D       Code\Deep
+   ?       Code\NewDir           I       Code\Ign        ← 只有右边看得见
+                                 ?       Code\NewDir
+   ```
+
+   逐行说明：
+
+   | 行 | 什么意思 | 正常吗 |
+   |---|---|---|
+   | `? .git` | git 自己的目录在 SVN 工作副本里，SVN 不认识它 | 正常，而且它在白名单 `Code/` 之外，代码里没有任何地方会看到它 |
+   | ` M Code` | 第二列的 `M` 是**属性**改了——就是你刚才那条 `svn propset svn:ignore` | 正常 |
+   | `D Code\Deep` | 被 `svn delete` 的目录。**注意里面的 `D.cs` 一行都没有** | 正常，而且正是缺口的来源 |
+   | `I Code\Ign` | 被 `svn:ignore` 挡住的目录。**里面的 `G.cs` 同样一行都没有** | 正常 |
+   | `? Code\NewDir` | 未纳入版本控制的目录。**里面那两个 `.cs` 同样一行都没有** | 正常 |
+
+   > **三条目录级的行，里面一个文件都不报**——而 git 的 exclude 规则按扩展名
+   > 递归收。这就是 2026-09-20 那两条阻断项的全部根因。
 
 3. 应用里**关掉仓库再 `Open Repo` 选回 `$fx\wc1`**，确认横幅出现后点 **「重建基线」**。
 
