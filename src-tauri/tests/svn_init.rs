@@ -975,3 +975,60 @@ fn a_directory_deleted_with_svn_delete_is_taken_back_from_the_server() {
         "重建/初始化不许写磁盘，被删的目录不该回来"
     );
 }
+
+#[test]
+fn all_three_directory_shapes_at_once_still_record_correctly() {
+    // E2E 场景 13 的**完整形态**：三种目录级的脏同时存在。
+    //
+    // 单独各测一遍不等于测了它们的组合——`read_dirty` 对每个条目分别判断，
+    // 一条走 `-v` 那条路（deleted），两条走磁盘遍历那条路（unversioned /
+    // ignored），而 `Code` 本身还因为 `svn:ignore` 变成了 `props="modified"`。
+    // 手工清单要照着做的就是这个形态，所以这里先把它钉住。
+    let fx = svn_repo_dirty(DirtyKind::DeletedDir);
+    let wc = fx.wc();
+
+    // ① 未纳入版本控制的目录，两层
+    std::fs::create_dir_all(wc.join("Code/NewDir/Deeper")).unwrap();
+    std::fs::write(wc.join("Code/NewDir/New.cs"), "class N {}").unwrap();
+    std::fs::write(wc.join("Code/NewDir/Deeper/Deep.cs"), "class P {}").unwrap();
+    // ② svn:ignore 掉的目录
+    std::fs::create_dir_all(wc.join("Code/Ign")).unwrap();
+    std::fs::write(wc.join("Code/Ign/G.cs"), "class G {}").unwrap();
+    svn(
+        &wc,
+        &["propset", "svn:ignore", "Ign", "Code", "--non-interactive"],
+    );
+    // ③ 被 svn delete 的目录由 fixture 提供（Code/Deep）
+
+    let report = init_hybrid(&req(&fx)).unwrap();
+
+    let listed = run_git(
+        &fx.wc_str(),
+        &["ls-tree", "-r", "--name-only", "refs/heads/svn/base"],
+    )
+    .unwrap();
+    for gone in [
+        "Code/NewDir/New.cs",
+        "Code/NewDir/Deeper/Deep.cs",
+        "Code/Ign/G.cs",
+    ] {
+        assert!(
+            !listed.contains(gone),
+            "`{gone}` 服务器上不存在，不该进基线树。实际树：\n{listed}"
+        );
+    }
+    assert!(
+        listed.contains("Code/Deep/D.cs"),
+        "被本地删掉的目录里的文件，服务器上还在，必须取回。实际树：\n{listed}"
+    );
+    assert!(
+        matches!(report.health, Health::Verified { .. }),
+        "三种形态同时存在时体检仍该通过，实际：{:?}",
+        report.health
+    );
+
+    // 只读：用户的东西一件都不能动
+    assert!(wc.join("Code/NewDir/New.cs").exists());
+    assert!(wc.join("Code/Ign/G.cs").exists());
+    assert!(!wc.join("Code/Deep").exists(), "被删的目录不许被恢复");
+}

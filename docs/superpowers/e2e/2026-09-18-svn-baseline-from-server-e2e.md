@@ -923,7 +923,17 @@ svn info --show-item revision (svn info --show-item repos-root-url)
 
 **做什么**
 
-1. **重造 fixture**（§1.5），在应用里 `Open Repo` → `$fx\wc1`，照场景 1 在干净状态下建库。
+> ⚠️ **这一条走的是「初始化」，不是「重建基线」。** 先造脏，**再**在应用里建库。
+>
+> 两条路录基线用的是**同一个函数**（`record_server_tree`），而初始化的入口
+> **永远在**——打开一个还没建库的 SVN 工作副本就会自动弹向导，不需要先制造
+> 失同步。这一条只验录制，所以走更省事的那条路。
+>
+> （本文 2026-09-20 的第一版让你先建库再点「重建基线」，那是错的：全程没有
+> 任何东西让工作副本前进，判定始终是 `inSync`，横幅和那颗按钮根本不会出现。
+> 见 §2 开头那条。）
+
+1. **重造 fixture**（§1.5）。**先别在应用里打开它。**
 
 2. **终端 B** 造三种目录形态：
 
@@ -950,11 +960,11 @@ svn info --show-item revision (svn info --show-item repos-root-url)
    场景要测的那一项藏掉。应用自己用的就是带 `--no-ignore` 的那条命令
    （`svn_dirty.rs` 的 `read_dirty`）——被 `svn:ignore` 挡住**不代表 git 不收它**。
 
-   2026-09-20 实测，两条命令逐字如下：
+   2026-09-20 实测，两条命令逐字如下（**此时还没建库，所以没有 `.git` 那一行**；
+   在已经建过库的场景里会多一条 `?       .git`，那是正常的）：
 
    ```text
    svn status                    svn status --no-ignore
-   ?       .git                  ?       .git
     M      Code                   M      Code
    D       Code\Deep             D       Code\Deep
    ?       Code\NewDir           I       Code\Ign        ← 只有右边看得见
@@ -965,7 +975,6 @@ svn info --show-item revision (svn info --show-item repos-root-url)
 
    | 行 | 什么意思 | 正常吗 |
    |---|---|---|
-   | `? .git` | git 自己的目录在 SVN 工作副本里，SVN 不认识它 | 正常，而且它在白名单 `Code/` 之外，代码里没有任何地方会看到它 |
    | ` M Code` | 第二列的 `M` 是**属性**改了——就是你刚才那条 `svn propset svn:ignore` | 正常 |
    | `D Code\Deep` | 被 `svn delete` 的目录。**注意里面的 `D.cs` 一行都没有** | 正常，而且正是缺口的来源 |
    | `I Code\Ign` | 被 `svn:ignore` 挡住的目录。**里面的 `G.cs` 同样一行都没有** | 正常 |
@@ -974,11 +983,13 @@ svn info --show-item revision (svn info --show-item repos-root-url)
    > **三条目录级的行，里面一个文件都不报**——而 git 的 exclude 规则按扩展名
    > 递归收。这就是 2026-09-20 那两条阻断项的全部根因。
 
-3. 应用里**关掉仓库再 `Open Repo` 选回 `$fx\wc1`**，确认横幅出现后点 **「重建基线」**。
+3. 应用里 `Open Repo` → 选 `$fx\wc1`，向导自动弹出。第一栏填 `Code/`、
+   第二栏填 `.cs`，走完 **「检查工作副本」→「下一步」→「建库」→「关闭」**。
 
 **应该看到**
 
-- 重建**成功**（不是报「基线与服务器不符」）；
+- 向导一路走通，**「检查工作副本」不被这三种脏拦住**（只有 `~` 才拦，见场景 6）；
+- 建库**成功**，并显示 **「基线已通过体检」**（不是「基线与服务器不符」）；
 - 基线树里**没有**任何来自 ① ② 的文件，**有** ③ 里那个：
 
   ```powershell
@@ -1008,6 +1019,8 @@ svn info --show-item revision (svn info --show-item repos-root-url)
 | 树里**没有** `Code/Deep/D.cs`，或重建报「基线与服务器不符」 | 被删目录里的文件没被取回。这会让一个完全合法的 SVN 状态变成死胡同 |
 | `Code\Deep` 又回到磁盘上了 | 重建写磁盘了，整条流程的只读前提被破坏 |
 | `Code\NewDir\New.cs` 不见了 | 同上，而且丢的是用户还没提交的东西 |
+| 「检查工作副本」就被拦下 | P1 在 §16.1 之后只该拦 `~`（obstructed）。抄下错误码 |
+| 建库后报「基线与服务器不符」并点名 `Code/Deep/D.cs` | 被删目录里的文件没被取回——就是 2026-09-20 修的 B2，说明修复没生效 |
 
 ---
 
