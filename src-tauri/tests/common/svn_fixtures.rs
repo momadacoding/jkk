@@ -1129,3 +1129,25 @@ pub fn svn_repo_with_gbk_source() -> SvnFixture {
     std::fs::write(wc.join("Code/Gbk.cs"), b"// local\n").unwrap();
     fx
 }
+
+/// 建一个 Windows 目录 junction，成功返回 `true`。
+///
+/// 用 junction 而不是 `std::os::windows::fs::symlink_dir`：后者要管理员权限或
+/// 开发者模式，前者不需要。拿不到提权时用符号链接会让整条用例静默跳过，变成
+/// 什么都不测的假绿灯。
+///
+/// ⚠️ 路径里的正斜杠必须先换成反斜杠。`mklink` 是 cmd 的内建命令，cmd 按 `/X`
+/// 切选项——`C:\…\Code/Mirror` 里的 `/Mirror` 会被当成未知选项，命令失败且错误
+/// 信息完全指不到这上面（`tests/svn_exclude.rs` 里那一份记着同一个坑）。
+///
+/// 与 `tests/svn_exclude.rs` 里的同名 helper 同源。那边是另一个 test crate，
+/// 不引用本模块；重复一份比把那条测试改到依赖本模块的改动面小。
+#[cfg(windows)]
+pub fn make_junction(link: &Path, target: &Path) -> bool {
+    let win = |p: &Path| p.to_string_lossy().replace('/', "\\");
+    Command::new("cmd")
+        .args(["/c", "mklink", "/J", &win(link), &win(target)])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}

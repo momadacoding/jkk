@@ -164,7 +164,15 @@ fn a_successful_init_leaves_no_temp_index_behind() {
 fn the_health_check_runs_and_its_result_is_reported() {
     let fx = svn_repo_for_health();
     let report = init_hybrid(&req(&fx)).unwrap();
-    assert_eq!(report.health, Health::Verified { rev: 1 });
+    // `unverified` 空：刚录完那条路径走的是 `ExplainedOrigin::JustRecorded`
+    // ——那些 blob 是几毫秒前从 `svn cat -r BASE` 写进去的，由构造保证正确。
+    assert_eq!(
+        report.health,
+        Health::Verified {
+            rev: 1,
+            unverified: vec![]
+        }
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1031,4 +1039,151 @@ fn all_three_directory_shapes_at_once_still_record_correctly() {
     assert!(wc.join("Code/NewDir/New.cs").exists());
     assert!(wc.join("Code/Ign/G.cs").exists());
     assert!(!wc.join("Code/Deep").exists(), "被删的目录不许被恢复");
+}
+
+// ===========================================================================
+// junction（Windows 目录联接）—— 上面那三种形态的第四种，2026-09-21 独立 review
+//
+// 与它们同一个病根：**svn 按目录报、git 按扩展名递归收**，只是这一次 svn 连
+// 「这是个目录」都不算数——2026-09-21 实测：
+//
+// | 量的是什么 | 结果 |
+// |---|---|
+// | `svn status --no-ignore -v -- Code`（`Code/Mirror` 是 junction） | 只有 `?  Code\Mirror` 一行 |
+// | Rust `symlink_metadata("Code/Mirror").is_dir()` | **`false`**（`is_symlink()` 为 `true`） |
+// | `git add -A -- Code/` | 索引里出现 **`Code/Mirror/Linked.cs`** |
+//
+// 于是 `is_plain_dir` 返回 false ⇒ `expand_dir` 根本不会被调用 ⇒ 一条 `Fix::Drop`
+// 都没有 ⇒ 服务器上不存在的文件留在一棵自称「等于服务器 rN」的树里。
+//
+// 四道检查一道都不响：`?` 不阻断；`expected_set` 的 `walk` **故意跟随 junction**
+// （与 git 对齐），两边集合一致；`remove_path` 摘的是 `Code/Mirror` 这一条、不带
+// `-r`，对 `Code/Mirror/Linked.cs` 是 no-op；体检比的是 svn 看得见的差异，而 svn
+// 看不见它。服务器侧核对只报「服务器有、本地没有」那一个方向，反方向不报。
+//
+// `svn_dirty.rs` 自己的注释写着「Unity 工程里 junction 并不罕见」。
+// ===========================================================================
+
+#[cfg(windows)]
+#[test]
+fn a_junction_in_the_whitelist_does_not_smuggle_foreign_cs_files_into_the_baseline() {
+    // 最容易触发的形态：junction **自己就是**那条未版本控制的条目。
+    let fx = svn_repo();
+    let outside = tempfile::TempDir::new().unwrap();
+    std::fs::write(outside.path().join("Linked.cs"), "class Linked {}").unwrap();
+    let link = fx.wc().join("Code").join("Mirror");
+    if !svn_fixtures::make_junction(&link, outside.path()) {
+        panic!("建 junction 失败——本条测试的前提没成立，不能当成通过");
+    }
+
+    let report = init_hybrid(&req(&fx)).unwrap();
+
+    let listed = run_git(
+        &fx.wc_str(),
+        &["ls-tree", "-r", "--name-only", "refs/heads/svn/base"],
+    )
+    .unwrap();
+    assert!(
+        !listed.contains("Code/Mirror/Linked.cs"),
+        "junction 里的 .cs 服务器上不存在，不该进基线树。实际树：\n{listed}"
+    );
+    assert!(
+        listed.contains("Code/A.cs"),
+        "服务器上本来就有的必须还在。实际树：\n{listed}"
+    );
+    assert!(
+        matches!(report.health, Health::Verified { .. }),
+        "剔干净之后体检该通过，实际：{:?}",
+        report.health
+    );
+    // 只读：链接和它指向的内容一个字节都不能动
+    assert!(link.join("Linked.cs").exists());
+
+    // 拆掉 junction 再让 TempDir 清理，否则 remove_dir_all 会顺着它走出去
+    std::fs::remove_dir(&link).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn a_junction_nested_inside_an_unversioned_directory_is_walked_too() {
+    // 另一半：外层是普通的未版本控制目录（`is_plain_dir` 为 true，会进
+    // `expand_dir`），junction 藏在里面。遍历到它时若直接跳过，同样漏。
+    let fx = svn_repo();
+    let outside = tempfile::TempDir::new().unwrap();
+    std::fs::write(outside.path().join("Linked.cs"), "class Linked {}").unwrap();
+    let wc = fx.wc();
+    std::fs::create_dir_all(wc.join("Code/NewDir")).unwrap();
+    std::fs::write(wc.join("Code/NewDir/New.cs"), "class N {}").unwrap();
+    let link = wc.join("Code").join("NewDir").join("Mirror");
+    if !svn_fixtures::make_junction(&link, outside.path()) {
+        panic!("建 junction 失败——本条测试的前提没成立，不能当成通过");
+    }
+
+    init_hybrid(&req(&fx)).unwrap();
+
+    let listed = run_git(
+        &fx.wc_str(),
+        &["ls-tree", "-r", "--name-only", "refs/heads/svn/base"],
+    )
+    .unwrap();
+    for gone in ["Code/NewDir/New.cs", "Code/NewDir/Mirror/Linked.cs"] {
+        assert!(
+            !listed.contains(gone),
+            "`{gone}` 服务器上不存在，不该进基线树。实际树：\n{listed}"
+        );
+    }
+
+    std::fs::remove_dir(&link).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn a_junction_loop_never_yields_a_baseline_containing_the_loop() {
+    // 跟随 junction 就必须自带环保护——遍历转不出来在 Tauri 里就是整个应用凭空
+    // 消失（`svn_include_check.rs` 的 `walk` 记着同一条）。
+    //
+    // ⚠️ **这条不断言具体结局，因为结局不稳定。** 2026-09-21 在同一份 fixture 上
+    // 反复跑，多数次是「成功，基线树里只有服务器那两个文件」，也见过一次
+    // `include_set_mismatch` 阻断——差别在 `git add` 那一侧：它跟着环一路递归，
+    // 撞上 Windows 重解析点 63 层的上限才停（独立探针实测：65 个索引条目，
+    // 最后一条是 63 层深的 `Loop/…/New.cs`），而它到底走多深并不稳定。
+    //
+    // `svn_include_check.rs` 早就写明：环存在时本侧与 git 给出不同集合、**报一次
+    // 不一致是正确行为**。所以这里只钉两件**两种结局都必须成立**的事：
+    // 会返回（不挂死），以及绝不产出一棵含环形路径的基线。
+    //
+    // 遍历本身的终止性由 `tests/svn_dirty.rs` 那条直接打在 `read_dirty` 上的
+    // 用例钉住——那一条不受 git 行为影响，是确定性的。
+    let fx = svn_repo();
+    let wc = fx.wc();
+    std::fs::create_dir_all(wc.join("Code/NewDir")).unwrap();
+    std::fs::write(wc.join("Code/NewDir/New.cs"), "class N {}").unwrap();
+    let link = wc.join("Code").join("NewDir").join("Loop");
+    if !svn_fixtures::make_junction(&link, &wc.join("Code").join("NewDir")) {
+        panic!("建 junction 失败——本条测试的前提没成立，不能当成通过");
+    }
+
+    match init_hybrid(&req(&fx)) {
+        Ok(_) => {
+            let listed = run_git(
+                &fx.wc_str(),
+                &["ls-tree", "-r", "--name-only", "refs/heads/svn/base"],
+            )
+            .unwrap();
+            assert!(
+                !listed.contains("Loop"),
+                "基线树里出现了环形路径。实际树：\n{listed}"
+            );
+            assert!(
+                listed.contains("Code/A.cs"),
+                "服务器上本来就有的必须还在。实际树：\n{listed}"
+            );
+        }
+        Err(e) => {
+            assert!(!wc.join(".git").exists(), "阻断之后 .git 没删干净：{e:?}");
+        }
+    }
+    assert!(wc.join("Code/NewDir/New.cs").exists(), "用户的文件被删了");
+
+    std::fs::remove_dir(&link).unwrap();
 }

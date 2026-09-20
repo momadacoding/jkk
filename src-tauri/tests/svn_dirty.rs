@@ -2,6 +2,11 @@
 //!
 //! 这是一层纯逻辑，但它决定基线里每个文件的内容来源，判错一条就是一个假基线。
 //! 所以八种 item 逐个立一行，而不是测两三种就宣称覆盖了（`AGENTS.md` §13 #9）。
+//!
+//! 文件末尾那条例外：`read_dirty` 的磁盘遍历需要真工作副本，只能上 fixture。
+
+#[path = "common/svn_fixtures.rs"]
+mod svn_fixtures;
 
 use app_lib::engine::svn_dirty::{classify, Fix};
 use app_lib::engine::svn_xml::StatusEntry;
@@ -123,4 +128,50 @@ fn backslashes_are_normalized_so_the_keys_match_git_paths() {
         got.keys().map(String::as_str).collect::<Vec<_>>(),
         vec!["Code/Deep/D.cs"]
     );
+}
+
+// ---------------------------------------------------------------------------
+// `read_dirty` 的磁盘遍历：跟随 junction，但必须停得下来
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+#[test]
+fn read_dirty_follows_a_junction_but_stops_at_a_loop() {
+    // 2026-09-21 独立 review。这条钉的是**终止性**，而且刻意不经过 `git`——
+    // 端到端那条（`tests/svn_init.rs`）受 git 自己的递归深度影响，结局不稳定。
+    //
+    // 为什么非要有祖先链守卫：实测环形 junction 的**每一层** `Path::is_dir()`
+    // 都是 `true`，所以这个遍历除了守卫之外**没有任何终止条件**。git 自己也
+    // 只是撞上 Windows 重解析点 63 层的上限才停的（探针实测 65 个索引条目）。
+    // 拿「操作系统恰好会拦住」当终止性论证不成立——那是别人的实现细节。
+    let fx = svn_fixtures::svn_repo();
+    let wc = fx.wc();
+    std::fs::create_dir_all(wc.join("Code/NewDir")).unwrap();
+    std::fs::write(wc.join("Code/NewDir/New.cs"), "class N {}").unwrap();
+    let link = wc.join("Code").join("NewDir").join("Loop");
+    if !svn_fixtures::make_junction(&link, &wc.join("Code").join("NewDir")) {
+        panic!("建 junction 失败——本条测试的前提没成立，不能当成通过");
+    }
+
+    let dirty = app_lib::engine::svn_dirty::read_dirty(&fx.wc_str(), &["Code/".to_string()])
+        .expect("环形 junction 不该让读脏清单失败");
+    let paths: Vec<String> = dirty.iter().map(|e| e.path.replace('\\', "/")).collect();
+
+    // 跟随：未版本控制目录里的文件必须被摊出来（svn 只报那条目录）
+    assert!(
+        paths.iter().any(|p| p == "Code/NewDir/New.cs"),
+        "没跟进未版本控制目录，`New.cs` 不见了：{paths:?}"
+    );
+    // 停得下来：一层都不许绕进环里
+    assert!(
+        !paths.iter().any(|p| p.contains("Loop/")),
+        "环没被拦住，遍历绕进去了：{paths:?}"
+    );
+    assert!(
+        dirty.len() < 10,
+        "条目数爆了（{}），说明在环里转了很多圈：{paths:?}",
+        dirty.len()
+    );
+
+    std::fs::remove_dir(&link).unwrap();
 }

@@ -9,7 +9,7 @@
 mod svn_fixtures;
 
 use app_lib::engine::svn_cli::run_svn;
-use app_lib::engine::svn_health::{check_baseline, Health};
+use app_lib::engine::svn_health::{check_baseline, ExplainedOrigin, Health};
 use svn_fixtures::{
     file_url, svn_repo_for_health, svn_repo_for_health_at_r2,
     svn_repo_with_cross_repo_nested_external, svn_repo_with_same_repo_nested_external,
@@ -46,6 +46,7 @@ fn check(fx: &SvnFixture, rev: u64) -> Health {
         &wl(&["Code/"]),
         &cs(),
         &nothing_explained(),
+        ExplainedOrigin::Unknown,
     )
     .unwrap()
 }
@@ -64,7 +65,13 @@ fn lying_files(h: &Health) -> Vec<String> {
 #[test]
 fn t1_a_clean_working_copy_at_the_right_revision_is_verified() {
     let fx = svn_repo_for_health();
-    assert_eq!(check(&fx, 1), Health::Verified { rev: 1 });
+    assert_eq!(
+        check(&fx, 1),
+        Health::Verified {
+            rev: 1,
+            unverified: vec![]
+        }
+    );
 }
 
 #[test]
@@ -80,7 +87,13 @@ fn t3_a_modified_art_file_outside_the_whitelist_does_not_trigger_a_false_alarm()
     // 正常仓库永远建不起来。
     let fx = svn_repo_for_health();
     std::fs::write(fx.wc().join("Art/boss.fbx"), "CHANGED\n").unwrap();
-    assert_eq!(check(&fx, 1), Health::Verified { rev: 1 });
+    assert_eq!(
+        check(&fx, 1),
+        Health::Verified {
+            rev: 1,
+            unverified: vec![]
+        }
+    );
 }
 
 #[test]
@@ -90,7 +103,13 @@ fn t3b_a_modified_art_file_inside_the_whitelist_does_not_trigger_a_false_alarm()
     // （spec §6.8.4：「否则恢复流程有意保留的 Code/Art.psd 本地修改会让体检误报」）。
     let fx = svn_repo_for_health();
     std::fs::write(fx.wc().join("Code/Art.psd"), "CHANGED\n").unwrap();
-    assert_eq!(check(&fx, 1), Health::Verified { rev: 1 });
+    assert_eq!(
+        check(&fx, 1),
+        Health::Verified {
+            rev: 1,
+            unverified: vec![]
+        }
+    );
 }
 
 #[test]
@@ -106,7 +125,13 @@ fn t5_the_same_moment_with_the_correct_rev_is_verified() {
     // 与 T4 成对：同一个磁盘状态、只换 rev，结论必须翻过来。
     // 少了这一条，T4 也可能是因为别的原因报的差异。
     let fx = svn_repo_for_health_at_r2();
-    assert_eq!(check(&fx, 2), Health::Verified { rev: 2 });
+    assert_eq!(
+        check(&fx, 2),
+        Health::Verified {
+            rev: 2,
+            unverified: vec![]
+        }
+    );
 }
 
 #[test]
@@ -119,9 +144,16 @@ fn t6_multiple_whitelist_roots_are_accepted() {
         &wl(&["Code/", "Art/"]),
         &cs(),
         &nothing_explained(),
+        ExplainedOrigin::Unknown,
     )
     .unwrap();
-    assert_eq!(got, Health::Verified { rev: 1 });
+    assert_eq!(
+        got,
+        Health::Verified {
+            rev: 1,
+            unverified: vec![]
+        }
+    );
 }
 
 #[test]
@@ -176,6 +208,7 @@ fn a_command_failure_is_not_reported_as_a_lying_baseline() {
         &wl(&["Code/"]),
         &cs(),
         &nothing_explained(),
+        ExplainedOrigin::Unknown,
     )
     .unwrap();
     assert!(matches!(got, Health::NotChecked { .. }), "实际：{got:?}");
@@ -208,6 +241,7 @@ fn a_failing_command_still_emits_partial_xml_and_must_not_be_parsed_as_success()
             &wl(&["Code/"]),
             &cs(),
             &nothing_explained(),
+            ExplainedOrigin::Unknown,
         )
         .unwrap(),
         Health::NotChecked { .. }
@@ -229,6 +263,7 @@ fn an_empty_whitelist_is_an_error_not_a_clean_bill_of_health() {
         &[],
         &cs(),
         &nothing_explained(),
+        ExplainedOrigin::Unknown,
     )
     .expect_err("空白名单必须报错");
     assert_eq!(err.code, "svn_health_empty_whitelist");
@@ -257,6 +292,7 @@ fn a_switched_whitelist_subtree_is_not_checked_rather_than_lying() {
         &wl(&["Code/"]),
         &cs(),
         &nothing_explained(),
+        ExplainedOrigin::Unknown,
     )
     .unwrap();
     match got {
@@ -282,6 +318,7 @@ fn a_single_file_whitelist_entry_is_not_filtered_out_by_extension() {
         &wl(&["Code/Art.psd"]), // 单文件条目
         &cs(),                  // 扩展名只有 .cs，psd 不在里面
         &nothing_explained(),
+        ExplainedOrigin::Unknown,
     )
     .unwrap();
     assert_eq!(lying_files(&got), vec!["Code/Art.psd"]);
@@ -306,6 +343,7 @@ fn a_clean_nested_external_is_verified_not_merely_unchecked() {
         &wl(&["Code/"]),
         &cs(),
         &nothing_explained(),
+        ExplainedOrigin::Unknown,
     )
     .unwrap();
     assert!(
@@ -335,6 +373,7 @@ fn one_unit_failing_does_not_silently_verify_the_others() {
         &wl(&["Code/"]),
         &cs(),
         &nothing_explained(),
+        ExplainedOrigin::Unknown,
     )
     .unwrap();
     match got {
@@ -361,6 +400,7 @@ fn a_lying_baseline_inside_a_nested_external_is_caught() {
         &wl(&["Code/"]),
         &cs(),
         &nothing_explained(),
+        ExplainedOrigin::Unknown,
     )
     .unwrap();
     let files = lying_files(&got);
@@ -390,6 +430,7 @@ fn an_svn_url_pointing_at_a_subpath_is_not_checked_rather_than_lying() {
         &wl(&["Code/"]),
         &cs(),
         &nothing_explained(),
+        ExplainedOrigin::Unknown,
     )
     .unwrap();
     match got {

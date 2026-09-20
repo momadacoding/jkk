@@ -5,7 +5,10 @@ import type { CommitNode, DiffData, GraphData, PullRequest, RefPointer, RepoInfo
 import { ALL_CAPABILITIES, type Capabilities } from '../engine/capabilities'
 import {
   auditIsDue,
+  recordAfterSuccess,
+  syncIfRootRevChanged,
   SVN_AUDIT_POLL_MS,
+  type RootRevMemo,
   type ServerAudit,
   type SyncStatus,
 } from '../engine/svnSync'
@@ -281,8 +284,11 @@ export function useRepoStore() {
    *
    * 进程重启后是 `null`，第一次刷新当作「变了」跑一次全量——那正是打开仓库
    * 本来就要做的事。
+   *
+   * 盒子里那个 `value` **什么时候可以写**是 `svnSync.ts` 里
+   * `recordAfterSuccess` 的事：只有第二档真的跑成功了才记。
    */
-  const lastRootRevs = useRef<string | null>(null)
+  const lastRootRevs = useRef<RootRevMemo>({ value: null })
 
   /**
    * 上一次**开始**服务器侧核对的时刻，与 `auditInFlight` 一起构成
@@ -417,23 +423,24 @@ export function useRepoStore() {
     setState((s) => ({ ...s, stashes }))
   }
 
+  /** 第二档本身：完整的 `nodeRevs` 校验（spec §6.6.3）。纯本地读，不碰观测值。 */
+  const applySvnSync = async (path: string) => {
+    const st = await svnSyncStatus(path)
+    setState((s) => ({ ...s, svnSync: st }))
+  }
+
+  const readRootRevs = async (path: string) => serializeRootRevs(await svnRootRevs(path))
+
   /**
-   * 重新读取被钉死的 external（spec §6.5.3 的常驻说明）。
-   *
-   * 失败只写 console 不上报，理由与 `refreshPullRequests` 同：顶部错误横幅是留给
-   * git 操作的。**必须写回空数组**——上一个仓库处于 pinned 模式时留下的清单，
-   * 会挂在下一个完全无关的仓库上。
-   */
-  /**
-   * 第二档：完整的 `nodeRevs` 校验（spec §6.6.3）。纯本地读。
+   * 第二档的**无条件**入口：打开仓库、重建基线之后各用一次。
    *
    * 顺带把观测到的 rootRevs 记下来当基准——不记的话下一次刷新会因为
-   * `lastRootRevs` 还是 `null` 而再跑一次全量。
+   * `lastRootRevs` 还是 `null` 而再跑一次全量。**先读 revision 再跑校验**，
+   * 而且只在校验成功后才记，理由见 `recordAfterSuccess`。
    */
   const refreshSvnSync = async (path: string) => {
-    const [st, revs] = await Promise.all([svnSyncStatus(path), svnRootRevs(path)])
-    lastRootRevs.current = serializeRootRevs(revs)
-    setState((s) => ({ ...s, svnSync: st }))
+    const observed = await readRootRevs(path)
+    await recordAfterSuccess(lastRootRevs.current, observed, () => applySvnSync(path))
   }
 
   /**
@@ -441,13 +448,12 @@ export function useRepoStore() {
    *
    * 返回是否真的跑了第二档，只为让调用方能读懂日志；调用方不依赖它。
    */
-  const checkSvnSyncIfChanged = async (path: string) => {
-    const now = serializeRootRevs(await svnRootRevs(path))
-    if (now === lastRootRevs.current) return false
-    lastRootRevs.current = now
-    await refreshSvnSync(path)
-    return true
-  }
+  const checkSvnSyncIfChanged = (path: string) =>
+    syncIfRootRevChanged(
+      lastRootRevs.current,
+      () => readRootRevs(path),
+      () => applySvnSync(path),
+    )
 
   /** 读缓存里的 SVN 历史并接进图。不走网络。 */
   const refreshSvnLog = async (path: string) => {
@@ -524,6 +530,13 @@ export function useRepoStore() {
     }
   }
 
+  /**
+   * 重新读取被钉死的 external（spec §6.5.3 的常驻说明）。
+   *
+   * 失败只写 console 不上报，理由与 `refreshPullRequests` 同：顶部错误横幅是留给
+   * git 操作的。**必须写回空数组**——上一个仓库处于 pinned 模式时留下的清单，
+   * 会挂在下一个完全无关的仓库上。
+   */
   const refreshPinned = async (path: string) => {
     try {
       const pinned = await svnPinnedExternals(path)

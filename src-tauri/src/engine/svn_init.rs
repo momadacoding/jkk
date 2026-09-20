@@ -18,7 +18,7 @@ use crate::engine::svn_config::{
 use crate::engine::svn_dirty::{classify, explained_paths, read_dirty, Fix};
 use crate::engine::svn_exclude::{generate_exclude, write_exclude};
 use crate::engine::svn_externals::{detect_pinned, PinnedExternal};
-use crate::engine::svn_health::{check_baseline, Health};
+use crate::engine::svn_health::{check_baseline, ExplainedOrigin, Health};
 use crate::engine::svn_include_check::{normalize_roots, verify_include_set};
 use crate::engine::svn_preflight::{check_targets, read_node_rev, run_preflight, Preflight};
 use crate::engine::svn_pristine::{cat_base, BaseContent};
@@ -292,6 +292,9 @@ fn build_repo(
         &cfg.whitelist,
         &cfg.extensions,
         &explained,
+        // 刚刚由 R2b 从 `svn cat -r BASE` 写进去的，而 P2 保证 `BASE == node_rev`
+        // ——这批路径由构造保证正确，不必报成「未覆盖」。
+        ExplainedOrigin::JustRecorded,
     )?;
     if let Health::Lying { files } = &health {
         // spec §6.8.5：此刻还没建工作分支，整个回退代价最小。
@@ -385,6 +388,9 @@ pub fn rebuild_baseline(repo_root: &str) -> Result<RebuildReport> {
         &cfg.whitelist,
         &cfg.extensions,
         &explained,
+        // 刚刚由 R2b 从 `svn cat -r BASE` 写进去的，而 P2 保证 `BASE == node_rev`
+        // ——这批路径由构造保证正确，不必报成「未覆盖」。
+        ExplainedOrigin::JustRecorded,
     )?;
     if let Health::Lying { files } = &health {
         return Err(GitError::new(
@@ -564,13 +570,21 @@ pub fn check_current_baseline(repo_root: &str) -> Result<Health> {
         &cfg.whitelist,
         &cfg.extensions,
         &explained,
+        // 手动体检：基线是**什么时候、哪个版本**录的都不知道，这条检查覆盖不到
+        // `S` 里那些路径，必须如实报出去（2026-09-21 独立 review）。
+        ExplainedOrigin::Unknown,
     )?;
 
     // 合并两份证据。`NotChecked` 原样透传——那是「没能验证」，不是「验证不通过」，
     // 把它降级成 Lying 会让离线场景寸步难行（spec §6.8.6）。
+    //
+    // ⚠️ `unverified` 要原样带过去。第二份证据（基线树 vs 磁盘树）**同样**把
+    // `explained` 滤掉了，所以两份证据合起来仍然对那批路径一无所知。
     Ok(match health {
         Health::NotChecked { reason } => Health::NotChecked { reason },
-        Health::Verified { rev } if tree_evidence.is_empty() => Health::Verified { rev },
+        Health::Verified { rev, unverified } if tree_evidence.is_empty() => {
+            Health::Verified { rev, unverified }
+        }
         Health::Verified { .. } => Health::Lying {
             files: tree_evidence,
         },

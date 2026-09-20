@@ -38,7 +38,14 @@ export interface PinnedExternal {
  * 寸步难行，当成「验证通过」则等于这条检查不存在。
  */
 export type Health =
-  | { status: 'verified'; rev: number }
+  /**
+   * `unverified` 是这次检查**覆盖不到**的路径（§6.8.7 的 `S`）。空表示全覆盖。
+   *
+   * 判据 `D \ S == ∅` 比的是**磁盘与服务器**，而 `S` 里那些路径上的磁盘内容正是
+   * 用户改过的——这条检查对它们什么也证明不了。工作副本干净时才 `S = ∅`，
+   * 而「程序员的工作区 99% 的时间都是脏的」正是 §16.1 放松干净要求的理由。
+   */
+  | { status: 'verified'; rev: number; unverified: string[] }
   | { status: 'lying'; files: string[] }
   | { status: 'notChecked'; reason: string }
 
@@ -158,13 +165,42 @@ export function healthNeedsRebuild(h: Health): boolean {
   return h.status === 'lying'
 }
 
+/** 列给用户看的路径上限。几千条没人看，还会把对话框撑爆。 */
+export const HEALTH_MAX_LISTED = 10
+
+/** 把路径清单裁到 [`HEALTH_MAX_LISTED`] 条，多出来的只报个数。 */
+function capPaths(paths: string[]): string[] {
+  if (paths.length <= HEALTH_MAX_LISTED) return paths
+  return [
+    ...paths.slice(0, HEALTH_MAX_LISTED),
+    `…还有 ${paths.length - HEALTH_MAX_LISTED} 条`,
+  ]
+}
+
 export function describeHealth(h: Health): Notice {
   switch (h.status) {
     case 'verified':
+      // ⚠️ **不能无条件说「一致」。** 2026-09-21 独立 review：`unverified` 里的
+      // 路径被判据整批豁免了，这条检查对它们一无所知，而那正是用户此刻正在改的
+      // 那些文件。原来的文案把「部分覆盖」说成了「全覆盖」——用户看到绿色的
+      // 「已通过体检」，以为验的是全部。
       return {
         tone: 'ok',
-        title: `基线已通过体检（r${h.rev}）`,
-        detail: '磁盘内容与服务器上该 revision 一致。',
+        title:
+          h.unverified.length > 0
+            ? `基线已通过体检（r${h.rev}，${h.unverified.length} 个文件未覆盖）`
+            : `基线已通过体检（r${h.rev}）`,
+        detail:
+          h.unverified.length > 0
+            ? [
+                `磁盘内容与服务器上该 revision 一致——**你本地改过的这 ${h.unverified.length} 个文件除外**，`,
+                '这次检查对它们什么也证明不了（它比的是磁盘与服务器，而这些路径上的磁盘内容正是你改的）。',
+                '',
+                ...capPaths(h.unverified),
+                '',
+                '把这些改动提交或还原之后再体检一次，覆盖面才是完整的。',
+              ].join('\n')
+            : '磁盘内容与服务器上该 revision 一致。',
         blocking: false,
       }
     case 'lying':

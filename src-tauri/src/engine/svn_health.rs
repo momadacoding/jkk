@@ -30,7 +30,22 @@ use std::collections::BTreeSet;
 #[serde(tag = "status", rename_all = "camelCase")]
 pub enum Health {
     /// 命令成功，按 §6.8.4 过滤后无 W-file 内容差异 —— 基线可信。
-    Verified { rev: u64 },
+    Verified {
+        rev: u64,
+        /// 这次检查**覆盖不到**的路径（§6.8.7 的 `S` 里那些）。空表示全覆盖。
+        ///
+        /// # 为什么必须报出去
+        ///
+        /// 判据是 `D \ S == ∅`，而 `D` 比的是**磁盘与服务器**——`S` 里那些路径上
+        /// 的磁盘内容正是用户改过的，所以这条检查对它们什么也证明不了。工作副本
+        /// 干净时 `S = ∅`，覆盖面才完整；而「程序员的工作区 99% 的时间都是脏的」
+        /// 正是 §16.1 放松干净要求的理由，于是**不完整才是常态**。
+        ///
+        /// 2026-09-21 独立 review：后端一直知道这批路径，前端却无条件显示
+        /// 「磁盘内容与服务器上该 revision 一致」。那句话在 `S ≠ ∅` 时对这批路径
+        /// 就是假的。把它们带出去，文案才能如实说。
+        unverified: Vec<String>,
+    },
     /// 命令成功，仍有 W-file 内容差异 —— **基线撒谎**。阻断并列出差异文件。
     Lying { files: Vec<String> },
     /// 命令没跑成（断网 / 认证 / URL 不可达 / revision 不存在）。
@@ -38,6 +53,26 @@ pub enum Health {
     /// **这不是「基线有问题」。** 把「没能验证」当成「验证不通过」会让离线场景
     /// 寸步难行；当成「验证通过」则等于这条检查根本不存在。所以它是独立的第三种。
     NotChecked { reason: String },
+}
+
+/// `S`（`explained`）里那些路径的**基线内容**是哪来的。
+///
+/// 这条检查比的是磁盘与服务器，对 `S` 里的路径什么也证明不了；但「证明不了」
+/// 不等于「不可信」——要看基线上那些 blob 是谁写的。所以每个调用点必须表态，
+/// 不给默认值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplainedOrigin {
+    /// **刚刚由本次录制写进去的**（初始化 / 重建，spec §16 R2b）。
+    ///
+    /// 那些 blob 是几毫秒前从 `svn cat -r BASE` 取的字节，而 P2 要求
+    /// `nodeRevs` 单值、`rev` 就取的那个值——于是 `BASE == rev`，pristine 内容
+    /// 就是服务器 `rev` 上的内容。这批路径**由构造保证正确**，不需要再声明未覆盖。
+    JustRecorded,
+    /// **不知道是谁、什么时候写的**（用户手动点体检）。
+    ///
+    /// 基线可能是老版本录的、可能有人手工在 `svn/base` 上提交过。这条检查覆盖
+    /// 不到它们，必须如实报出去。
+    Unknown,
 }
 
 /// 拿磁盘跟服务器上的 `rev` 比一次。
@@ -78,6 +113,9 @@ pub fn check_baseline(
     // 而削弱它不会让任何测试变红（spec §16.1）。干净工作副本传空集，判据退化成
     // 原来的 `D == ∅`。
     explained: &BTreeSet<String>,
+    // `explained` 里那些路径的基线内容是谁写的。决定 `Verified` 要不要把它们
+    // 报成「未覆盖」，见 [`ExplainedOrigin`]。
+    origin: ExplainedOrigin,
 ) -> Result<Health> {
     let roots = normalize_roots(whitelist);
     if roots.is_empty() {
@@ -187,7 +225,13 @@ pub fn check_baseline(
     files.retain(|f| !explained.contains(f));
 
     if files.is_empty() {
-        return Ok(Health::Verified { rev });
+        // `S` 里的路径被上面那行**整批豁免**了，所以它们一条都没被验证。
+        // 报不报出去看它们是谁写的——见 [`ExplainedOrigin`]。
+        let unverified = match origin {
+            ExplainedOrigin::JustRecorded => Vec::new(),
+            ExplainedOrigin::Unknown => explained.iter().cloned().collect(),
+        };
+        return Ok(Health::Verified { rev, unverified });
     }
     files.sort();
     files.dedup();

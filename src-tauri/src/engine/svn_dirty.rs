@@ -53,6 +53,7 @@ use std::path::Path;
 /// | `svn:ignore` 的目录 | 只报目录 | **只报目录**（不下沉） | 在 |
 /// | `svn delete` 的目录 | 只报目录 | **目录 + 每个子文件都报 `deleted`** | 不在 |
 /// | `svn add` 未提交的目录 | 目录 + 子文件都报 | 同左 | 在 |
+/// | **junction / 符号链接**（2026-09-21 补） | 只报链接本身 | **只报链接本身** | 在 |
 ///
 /// 而 git 侧的 exclude 规则是 `!/<白名单>/**/*.<扩展名>`——**按扩展名递归**。
 /// 两边粒度不一致，中间那些文件就会掉进缝里：
@@ -66,6 +67,24 @@ use std::path::Path;
 ///
 /// 所以这里做两件事：**加 `-v`**（把被删目录的子文件捞出来），以及对
 /// 未版本控制 / ignored 的目录**自己走一遍磁盘**（`-v` 帮不上忙）。
+///
+/// # junction 是同一个病的第四种形态（2026-09-21，独立 review）
+///
+/// 表里最后那一行的代价和前两行一样，只是更隐蔽：**Windows 的目录联接在 Rust
+/// 的 `symlink_metadata().is_dir()` 下是 `false`**，于是下面那道「是不是目录」
+/// 的判断连 `expand_dir` 都不会调用，而 `git add` 照样走进去。2026-09-21 实测
+/// （`Code/Mirror` 是指向工作副本外的 junction）：
+///
+/// ```text
+/// svn status --no-ignore -v -- Code   →   ?  Code\Mirror      （就这一行）
+/// symlink_metadata("Code/Mirror")     →   is_dir()=false, is_symlink()=true
+/// git add -A -- Code/                 →   索引里出现 Code/Mirror/Linked.cs
+/// ```
+///
+/// 所以磁盘遍历这一侧**必须跟随 junction**，与 `git` 和
+/// [`crate::engine::svn_include_check`] 的 `walk` 对齐——那边早就是跟随的
+/// （2026-09-13 实测并有测试钉住），两侧不一致正是这条缺口的成因。
+/// 跟随就必须自带环保护，见 [`expand_dir`]。
 ///
 /// # 为什么读与判分开
 ///
@@ -113,7 +132,7 @@ pub fn read_dirty(repo_root: &str, targets: &[String]) -> Result<Vec<StatusEntry
             // 说了什么」，删掉它等于替下游做判断；而它不是 W-file，
             // `explained_paths` 自然会把它滤掉。
             if matches!(e.item.as_str(), "unversioned" | "ignored")
-                && is_plain_dir(repo_root, &e.path)
+                && is_dir_on_disk(repo_root, &e.path)
             {
                 expand_dir(repo_root, &e, &mut dirty)?;
             }
@@ -127,14 +146,24 @@ pub fn read_dirty(repo_root: &str, targets: &[String]) -> Result<Vec<StatusEntry
     Ok(dirty)
 }
 
-/// 这个相对路径在磁盘上是不是一个**真目录**（不跟随符号链接）。
+/// 这个相对路径在磁盘上**是不是一个目录**——junction / 符号链接**跟随**。
 ///
-/// 用 `symlink_metadata` 而不是 `Path::is_dir`：后者跟随链接，一条指向自己祖先
-/// 的 junction 就能让下面的遍历转不出来。Unity 工程里 junction 并不罕见。
-fn is_plain_dir(repo_root: &str, rel: &str) -> bool {
-    std::fs::symlink_metadata(Path::new(repo_root).join(rel))
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
+/// # 这里曾经用 `symlink_metadata`，那是错的
+///
+/// 原来的写法是 `symlink_metadata(..).is_dir()`，理由写的是「不跟随链接，免得
+/// 一条指回自己祖先的 junction 让遍历转不出来」。环的顾虑没错，**但把它放在这道
+/// 门上是把整扇门关死了**：2026-09-21 实测，Windows 目录联接在
+/// `symlink_metadata().is_dir()` 下就是 `false`，于是一条未版本控制的 junction
+/// 连 [`expand_dir`] 都进不去，而 `git add` 照样走进去把里面的 `.cs` 收进基线树
+/// ——服务器上没有的文件进了一棵自称「等于服务器 rN」的树，且四道检查全绿。
+///
+/// 环该在遍历里用祖先链解决（[`expand_dir`] 里就是这么做的，与
+/// [`crate::engine::svn_include_check`] 的 `walk` 同一套），不该靠「干脆不进去」。
+///
+/// 目标不存在的悬空链接这里是 `false`：进不去也没什么可摊平的，而 `git add`
+/// 同样收不到它。
+fn is_dir_on_disk(repo_root: &str, rel: &str) -> bool {
+    Path::new(repo_root).join(rel).is_dir()
 }
 
 /// 把一个未版本控制 / ignored 的目录，摊平成它底下每一个**文件**的条目。
@@ -148,54 +177,94 @@ fn is_plain_dir(repo_root: &str, rel: &str) -> bool {
 /// 读不动某个子目录（权限、被占用）时返回 `Err`。悄悄跳过等于宣称「这里没有
 /// W-file」，而那正好是本函数要消灭的那种静默假基线。调用方各自决定怎么处理：
 /// 初始化 / 重建会中止，服务器侧核对退成 `NotChecked`。
+///
+/// # junction / 符号链接：**跟随**，并用祖先链防环
+///
+/// 与 `git` 以及 [`crate::engine::svn_include_check`] 的 `walk` 对齐。这里原来
+/// 是 `if ft.is_symlink() { continue }`，理由写的是「链接目标要么在这棵树里、
+/// 要么在外面不归白名单管」——**那句话对 git 不成立**：2026-09-21 实测，
+/// `git add -A -- Code/` 会把 `Code/NewDir/Mirror/Linked.cs` 收进索引，哪怕
+/// `Mirror` 指到工作副本外面去。不跟随就漏掉这些条目的 [`Fix::Drop`]，于是它们
+/// 留在基线树里冒充服务器内容。
+///
+/// `chain` 是当前**祖先链**的规范路径，与 `walk` 同一套：`canonicalize` 在
+/// Windows 上会解开 reparse point，于是一条指回自己祖先的 junction 与那个祖先
+/// 得到同一个规范路径，环一眼就能看出来。只查祖先链、不做全局已访问集合——
+/// 两条 junction 指向同一个目标是合法的，git 会把两边的内容都列出来。
 fn expand_dir(repo_root: &str, dir: &StatusEntry, out: &mut Vec<StatusEntry>) -> Result<()> {
-    let mut stack = vec![dir.path.clone()];
-    while let Some(rel) = stack.pop() {
-        let abs = Path::new(repo_root).join(&rel);
-        let rd = std::fs::read_dir(&abs).map_err(|e| {
+    // 起点自己也要进祖先链，否则 `Code/NewDir/Loop -> Code/NewDir` 这种
+    // 「指回自己」的环在第一层就转不出来。
+    let mut chain = vec![canon(repo_root, &dir.path)?];
+    walk_expand(repo_root, &dir.path, &dir.item, &mut chain, out)
+}
+
+/// 一个相对路径的规范形式，失败映射成与遍历同一个错误码。
+fn canon(repo_root: &str, rel: &str) -> Result<std::path::PathBuf> {
+    std::fs::canonicalize(Path::new(repo_root).join(rel)).map_err(|e| {
+        GitError::new(
+            "svn_dirty_walk_failed",
+            format!(
+                "取不到 `{rel}` 的规范路径：{e}。跟随目录联接时要靠它发现环，\
+                 取不到就没法保证遍历会停下来。"
+            ),
+        )
+    })
+}
+
+fn walk_expand(
+    repo_root: &str,
+    rel: &str,
+    item: &str,
+    chain: &mut Vec<std::path::PathBuf>,
+    out: &mut Vec<StatusEntry>,
+) -> Result<()> {
+    let abs = Path::new(repo_root).join(rel);
+    let rd = std::fs::read_dir(&abs).map_err(|e| {
+        GitError::new(
+            "svn_dirty_walk_failed",
+            format!(
+                "读不动 `{rel}`：{e}。它是一个未纳入版本控制的目录，\
+                 里面可能有会被 git 收进基线的源码文件，没读完就不能下结论。"
+            ),
+        )
+    })?;
+    for ent in rd {
+        let ent = ent.map_err(|e| {
             GitError::new(
                 "svn_dirty_walk_failed",
-                format!(
-                    "读不动 `{rel}`：{e}。它是一个未纳入版本控制的目录，\
-                     里面可能有会被 git 收进基线的源码文件，没读完就不能下结论。"
-                ),
+                format!("枚举 `{rel}` 的内容时失败：{e}"),
             )
         })?;
-        for ent in rd {
-            let ent = ent.map_err(|e| {
-                GitError::new(
-                    "svn_dirty_walk_failed",
-                    format!("枚举 `{rel}` 的内容时失败：{e}"),
-                )
-            })?;
-            let ft = ent.file_type().map_err(|e| {
-                GitError::new(
-                    "svn_dirty_walk_failed",
-                    format!("读不到 `{rel}` 里某一项的类型：{e}"),
-                )
-            })?;
-            let name = ent.file_name().to_string_lossy().into_owned();
-            // `.svn` / `.git` 不该出现在未版本控制的目录里，但真出现了也绝不能
-            // 跟进去——那是另一套元数据，不是源码。
-            if name == ".svn" || name == ".git" {
+        let ft = ent.file_type().map_err(|e| {
+            GitError::new(
+                "svn_dirty_walk_failed",
+                format!("读不到 `{rel}` 里某一项的类型：{e}"),
+            )
+        })?;
+        let name = ent.file_name().to_string_lossy().into_owned();
+        // `.svn` / `.git` 不该出现在未版本控制的目录里，但真出现了也绝不能
+        // 跟进去——那是另一套元数据，不是源码。
+        if name == ".svn" || name == ".git" {
+            continue;
+        }
+        let child = format!("{rel}/{name}");
+        // `Path::is_dir()` **跟随**链接，这是对的——见本函数文档的 junction 一节。
+        // 悬空链接两个分支都不落，与改动前一致：`git add` 同样收不到它。
+        if ent.path().is_dir() {
+            let c = canon(repo_root, &child)?;
+            if chain.contains(&c) {
                 continue;
             }
-            let child = format!("{rel}/{name}");
-            if ft.is_symlink() {
-                // 不跟随。链接目标要么在这棵树里（会被单独遍历到），要么在外面
-                // （不归这个白名单管）。
-                continue;
-            }
-            if ft.is_dir() {
-                stack.push(child);
-            } else if ft.is_file() {
-                out.push(StatusEntry {
-                    path: child,
-                    item: dir.item.clone(),
-                    props: "none".to_string(),
-                    wc_locked: false,
-                });
-            }
+            chain.push(c);
+            walk_expand(repo_root, &child, item, chain, out)?;
+            chain.pop();
+        } else if ft.is_file() {
+            out.push(StatusEntry {
+                path: child,
+                item: item.to_string(),
+                props: "none".to_string(),
+                wc_locked: false,
+            });
         }
     }
     Ok(())

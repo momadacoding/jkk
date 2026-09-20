@@ -3,6 +3,7 @@ import {
   WIZARD_STEPS,
   describeHealth,
   healthNeedsRebuild,
+  HEALTH_MAX_LISTED,
   describePinned,
   nextStep,
   parseExtensions,
@@ -48,7 +49,7 @@ describe('扩展名输入的解析', () => {
 
 describe('体检三态的显示分类', () => {
   it('verified 是成功，不需要用户做任何事', () => {
-    const d = describeHealth({ status: 'verified', rev: 12346 })
+    const d = describeHealth({ status: 'verified', rev: 12346, unverified: [] })
     expect(d.tone).toBe('ok')
     expect(d.blocking).toBe(false)
     expect(d.title).toContain('12346')
@@ -71,10 +72,46 @@ describe('体检三态的显示分类', () => {
     expect(d.detail).toContain('连不上服务器')
   })
 
+  it('verified 但有未覆盖路径时，文案必须说清楚覆盖不全', () => {
+    // 2026-09-21 独立 review。判据 `D \ S == ∅` 比的是**磁盘与服务器**，而 S 里
+    // 那些路径上的磁盘内容正是用户改的——这条检查对它们什么也证明不了。
+    // 改之前这里无条件显示「磁盘内容与服务器上该 revision 一致」，是越权。
+    const d = describeHealth({
+      status: 'verified',
+      rev: 9,
+      unverified: ['Code/A.cs', 'Code/Deep/D.cs'],
+    })
+    expect(d.tone).toBe('ok')
+    expect(d.blocking).toBe(false)
+    expect(d.title).toContain('2')
+    expect(d.detail).toContain('Code/A.cs')
+    expect(d.detail).toContain('Code/Deep/D.cs')
+    // 不能再出现那句无保留的断言
+    expect(d.detail).not.toBe('磁盘内容与服务器上该 revision 一致。')
+  })
+
+  it('未覆盖清单为空时文案一个字都不多', () => {
+    // 另一半：干净工作副本上平白多一句「有 0 个文件未覆盖」是纯噪音。
+    // 缺了它，一个「永远显示未覆盖」的实现照样能让上面那条通过。
+    const d = describeHealth({ status: 'verified', rev: 9, unverified: [] })
+    expect(d.detail).toBe('磁盘内容与服务器上该 revision 一致。')
+    expect(d.title).toBe('基线已通过体检（r9）')
+  })
+
+  it('未覆盖路径很多时只列前 HEALTH_MAX_LISTED 条，其余报个数', () => {
+    // 真实工程里白名单目录底下随便就有几千个未版本控制文件，全列出来会把
+    // 对话框撑爆，而用户一条也读不完。
+    const many = Array.from({ length: HEALTH_MAX_LISTED + 7 }, (_, i) => `Code/F${i}.cs`)
+    const d = describeHealth({ status: 'verified', rev: 9, unverified: many })
+    expect(d.detail).toContain('Code/F0.cs')
+    expect(d.detail).toContain('…还有 7 条')
+    expect(d.detail).not.toContain(`Code/F${HEALTH_MAX_LISTED}.cs`)
+  })
+
   it('三种状态的 tone 互不相同', () => {
     // 防的是「都返回 warn 也能让上面三条通过」那种实现
     const tones = [
-      describeHealth({ status: 'verified', rev: 1 }).tone,
+      describeHealth({ status: 'verified', rev: 1, unverified: [] }).tone,
       describeHealth({ status: 'lying', files: [] }).tone,
       describeHealth({ status: 'notChecked', reason: 'x' }).tone,
     ]
@@ -187,7 +224,7 @@ describe('healthNeedsRebuild', () => {
   })
 
   it('体检通过时不给', () => {
-    expect(healthNeedsRebuild({ status: 'verified', rev: 7 })).toBe(false)
+    expect(healthNeedsRebuild({ status: 'verified', rev: 7, unverified: [] })).toBe(false)
   })
 
   it('一处文件都没列出来的 lying 也照样给入口', () => {

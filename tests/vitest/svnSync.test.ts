@@ -6,6 +6,9 @@ import {
   describeAudit,
   describeSync,
   needsStandaloneCheck,
+  recordAfterSuccess,
+  syncIfRootRevChanged,
+  type RootRevMemo,
   type SyncStatus,
 } from '@/engine/svnSync'
 
@@ -209,5 +212,95 @@ describe('auditIsDue', () => {
     // 不该把定时器自己也挡掉。反过来配的话定时器会变成隔一次跑一次。
     expect(SVN_AUDIT_POLL_MS).toBeGreaterThan(SVN_AUDIT_MIN_GAP_MS)
     expect(auditIsDue(NOW, NOW - SVN_AUDIT_POLL_MS, false)).toBe(true)
+  })
+})
+
+describe('§6.6.3 两档同步检测：什么时候才允许把观测值记下来', () => {
+  /** 一个可控的第二档：可以让它成功，也可以让它抛错，并记下被调了几次。 */
+  function fakeFullCheck() {
+    const calls: number[] = []
+    let fail = false
+    return {
+      calls,
+      failNext: (v: boolean) => {
+        fail = v
+      },
+      run: async () => {
+        calls.push(calls.length)
+        if (fail) throw new Error('svn status 撞上工作副本锁')
+      },
+    }
+  }
+
+  it('rootRevs 没变就不跑第二档', async () => {
+    const memo: RootRevMemo = { value: 'wc=7' }
+    const full = fakeFullCheck()
+    const ran = await syncIfRootRevChanged(memo, async () => 'wc=7', full.run)
+    expect(ran).toBe(false)
+    expect(full.calls).toHaveLength(0)
+    expect(memo.value).toBe('wc=7')
+  })
+
+  it('rootRevs 变了就跑第二档，成功后记下新值', async () => {
+    const memo: RootRevMemo = { value: 'wc=7' }
+    const full = fakeFullCheck()
+    const ran = await syncIfRootRevChanged(memo, async () => 'wc=8', full.run)
+    expect(ran).toBe(true)
+    expect(full.calls).toHaveLength(1)
+    expect(memo.value).toBe('wc=8')
+  })
+
+  it('第一次启动时 memo 是 null，第一档一律判「变了」', async () => {
+    // 进程刚起来没有基准，这一次全量正是打开仓库本来就要做的事。
+    const memo: RootRevMemo = { value: null }
+    const full = fakeFullCheck()
+    expect(await syncIfRootRevChanged(memo, async () => 'wc=1', full.run)).toBe(true)
+    expect(memo.value).toBe('wc=1')
+  })
+
+  it('第二档失败时不记观测值，**同一个 revision 第二次必须重试**', async () => {
+    // 这一条是这组测试存在的理由（2026-09-21 独立 review）。
+    // 改之前：观测值在 await 之前就推进了，失败之后下一次事件看到同一个
+    // revision 直接返回，失同步横幅永远停在旧值，直到 revision 再变或重开仓库。
+    const memo: RootRevMemo = { value: 'wc=7' }
+    const full = fakeFullCheck()
+    const read = async () => 'wc=8'
+
+    full.failNext(true)
+    await expect(syncIfRootRevChanged(memo, read, full.run)).rejects.toThrow()
+    expect(full.calls).toHaveLength(1)
+    expect(memo.value).toBe('wc=7') // ← 没推进
+
+    // 下一次文件变动事件：revision 还是 wc=8，但必须真的再跑一遍
+    full.failNext(false)
+    expect(await syncIfRootRevChanged(memo, read, full.run)).toBe(true)
+    expect(full.calls).toHaveLength(2)
+    expect(memo.value).toBe('wc=8')
+  })
+
+  it('第一档自己读不到 rootRevs 时，既不跑第二档也不动观测值', async () => {
+    const memo: RootRevMemo = { value: 'wc=7' }
+    const full = fakeFullCheck()
+    const boom = async (): Promise<string> => {
+      throw new Error('svn info 失败')
+    }
+    await expect(syncIfRootRevChanged(memo, boom, full.run)).rejects.toThrow()
+    expect(full.calls).toHaveLength(0)
+    expect(memo.value).toBe('wc=7')
+  })
+
+  it('无条件入口（打开仓库 / 重建之后）同样是成功才记', async () => {
+    // 这两个入口不经过第一档，但「失败就不记」这条规则必须共用一份实现，
+    // 否则迟早有一份会和另一份分叉。
+    const memo: RootRevMemo = { value: null }
+    const full = fakeFullCheck()
+
+    full.failNext(true)
+    await expect(recordAfterSuccess(memo, 'wc=9', full.run)).rejects.toThrow()
+    expect(memo.value).toBeNull()
+
+    full.failNext(false)
+    await recordAfterSuccess(memo, 'wc=9', full.run)
+    expect(memo.value).toBe('wc=9')
   })
 })

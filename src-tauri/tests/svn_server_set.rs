@@ -126,6 +126,7 @@ fn the_existing_checks_really_do_miss_a_depth_excluded_subtree() {
         // 这个 fixture 的工作副本是干净的，`S = ∅`：判据退化成 §6.8.2 的
         // `D == ∅`，正是这条测试要证明「体检看不见 set-depth=exclude」的前提。
         &std::collections::BTreeSet::new(),
+        app_lib::engine::svn_health::ExplainedOrigin::Unknown,
     )
     .unwrap();
     assert!(

@@ -13,7 +13,7 @@
 mod svn_fixtures;
 
 use app_lib::engine::svn_dirty::{classify, explained_paths, read_dirty};
-use app_lib::engine::svn_health::{check_baseline, Health};
+use app_lib::engine::svn_health::{check_baseline, ExplainedOrigin, Health};
 use app_lib::engine::svn_init::{init_hybrid, InitRequest};
 use std::collections::BTreeSet;
 use svn_fixtures::{file_url, svn_cmd, svn_repo_for_health, SvnFixture};
@@ -65,7 +65,16 @@ fn local_modifications_are_explained_and_do_not_accuse_the_baseline() {
         "前提：这些路径确实进了 S。实际 S = {s:?}"
     );
 
-    let got = check_baseline(&fx.wc_str(), &file_url(&fx.repo()), 1, &wl(), &cs(), &s).unwrap();
+    let got = check_baseline(
+        &fx.wc_str(),
+        &file_url(&fx.repo()),
+        1,
+        &wl(),
+        &cs(),
+        &s,
+        ExplainedOrigin::Unknown,
+    )
+    .unwrap();
 
     assert!(
         matches!(got, Health::Verified { .. }),
@@ -102,7 +111,16 @@ fn a_baseline_claiming_a_revision_the_disk_never_reached_is_caught() {
     );
 
     // 基线**自称** r2，而磁盘上是 r1 的内容
-    let got = check_baseline(&fx.wc_str(), &url, 2, &wl(), &cs(), &s).unwrap();
+    let got = check_baseline(
+        &fx.wc_str(),
+        &url,
+        2,
+        &wl(),
+        &cs(),
+        &s,
+        ExplainedOrigin::Unknown,
+    )
+    .unwrap();
 
     match got {
         Health::Lying { files } => assert!(
@@ -138,6 +156,7 @@ fn a_file_that_got_dirty_after_s_was_captured_still_blocks() {
         &wl(),
         &cs(),
         &stale_s,
+        ExplainedOrigin::Unknown,
     )
     .unwrap();
 
@@ -165,6 +184,7 @@ fn the_criterion_degenerates_to_the_original_one_on_a_clean_working_copy() {
         &wl(),
         &cs(),
         &BTreeSet::new(),
+        ExplainedOrigin::Unknown,
     )
     .unwrap();
     assert!(matches!(got, Health::Verified { .. }), "实际：{got:?}");
@@ -184,9 +204,137 @@ fn a_dirty_file_outside_the_whitelist_extensions_never_enters_s() {
         s.is_empty(),
         "非白名单扩展名的脏文件不该进 S。实际 S = {s:?}"
     );
-    let got = check_baseline(&fx.wc_str(), &file_url(&fx.repo()), 1, &wl(), &cs(), &s).unwrap();
+    let got = check_baseline(
+        &fx.wc_str(),
+        &file_url(&fx.repo()),
+        1,
+        &wl(),
+        &cs(),
+        &s,
+        ExplainedOrigin::Unknown,
+    )
+    .unwrap();
     assert!(
         matches!(got, Health::Verified { .. }),
         "美术文件的本地修改本来就不归体检管（§6.8.4 的不误报）。实际：{got:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// (c) 覆盖面必须如实报出去（2026-09-21 独立 review）
+//
+// 上面 (a) 那条只断言「没被冤枉」，而 `Verified` 是一句**主动的保证**。
+// `S` 里那批路径一条都没被验证过，判据把它们整批豁免了——不报出去，前端就会
+// 无条件显示「磁盘内容与服务器上该 revision 一致」，而那句话对它们是假的。
+// ---------------------------------------------------------------------------
+
+/// 摆出 (a) 里那四种本地状态，返回 `(fixture, S)`。
+fn dirty_with_four_shapes() -> (SvnFixture, BTreeSet<String>) {
+    let fx = svn_repo_for_health();
+    init_hybrid(&req(&fx)).unwrap();
+    let wc = fx.wc();
+    std::fs::write(wc.join("Code/A.cs"), "LOCAL EDIT\n").unwrap();
+    std::fs::write(wc.join("Code/Untracked.cs"), "new\n").unwrap();
+    std::fs::write(wc.join("Code/Added.cs"), "added\n").unwrap();
+    svn_cmd(&wc, &["add", "Code/Added.cs", "--non-interactive"]);
+    svn_cmd(&wc, &["delete", "Code/Deep/D.cs", "--non-interactive"]);
+    let s = explained_now(&fx);
+    assert!(!s.is_empty(), "前提：S 非空");
+    (fx, s)
+}
+
+#[test]
+fn a_manual_check_reports_exactly_which_paths_it_could_not_cover() {
+    let (fx, s) = dirty_with_four_shapes();
+
+    let got = check_baseline(
+        &fx.wc_str(),
+        &file_url(&fx.repo()),
+        1,
+        &wl(),
+        &cs(),
+        &s,
+        // 手动体检：基线是谁、什么时候录的都不知道
+        ExplainedOrigin::Unknown,
+    )
+    .unwrap();
+
+    match got {
+        Health::Verified { rev, unverified } => {
+            assert_eq!(rev, 1);
+            // **恰好是 S**，不是它的子集也不是超集：少报一条就是继续撒谎，
+            // 多报一条会让用户去查一个其实验过的文件。
+            assert_eq!(
+                unverified.iter().cloned().collect::<BTreeSet<String>>(),
+                s,
+                "未覆盖清单必须恰好等于 S"
+            );
+            assert!(
+                unverified.contains(&"Code/A.cs".to_string()),
+                "用户正在改的那个文件必须在清单里：{unverified:?}"
+            );
+        }
+        other => panic!("本地改动都能被 S 解释，应当 Verified。实际：{other:?}"),
+    }
+}
+
+#[test]
+fn right_after_recording_there_is_nothing_to_disclose() {
+    // 另一半，缺了它这组就只剩「永远报一堆未覆盖」也能全绿。
+    //
+    // 初始化 / 重建那条路径上，`S` 里的 blob 是几毫秒前由 R2b 从
+    // `svn cat -r BASE` 写进去的，而 P2 要求 `nodeRevs` 单值、`rev` 取的就是
+    // 那个值 ⇒ `BASE == rev` ⇒ 那些 blob 就是服务器 `rev` 上的内容。
+    // 由构造保证正确，没有什么要向用户声明的。
+    let (fx, s) = dirty_with_four_shapes();
+
+    let got = check_baseline(
+        &fx.wc_str(),
+        &file_url(&fx.repo()),
+        1,
+        &wl(),
+        &cs(),
+        &s,
+        ExplainedOrigin::JustRecorded,
+    )
+    .unwrap();
+
+    match got {
+        Health::Verified { unverified, .. } => assert!(
+            unverified.is_empty(),
+            "刚录完的路径由构造保证正确，不该报成未覆盖：{unverified:?}"
+        ),
+        other => panic!("应当 Verified。实际：{other:?}"),
+    }
+}
+
+#[test]
+fn a_clean_working_copy_has_nothing_to_disclose_either() {
+    // `S = ∅` 时两种 origin 都必须给出空清单——否则干净仓库上会平白多出一句
+    // 「有 0 个文件未覆盖」。
+    let fx = svn_repo_for_health();
+    init_hybrid(&req(&fx)).unwrap();
+    assert!(explained_now(&fx).is_empty(), "前提：工作副本是干净的");
+
+    for origin in [ExplainedOrigin::Unknown, ExplainedOrigin::JustRecorded] {
+        let got = check_baseline(
+            &fx.wc_str(),
+            &file_url(&fx.repo()),
+            1,
+            &wl(),
+            &cs(),
+            &BTreeSet::new(),
+            origin,
+        )
+        .unwrap();
+        match got {
+            Health::Verified { unverified, .. } => {
+                assert!(
+                    unverified.is_empty(),
+                    "{origin:?} 下应当为空：{unverified:?}"
+                )
+            }
+            other => panic!("{origin:?} 下应当 Verified。实际：{other:?}"),
+        }
+    }
 }

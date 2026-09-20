@@ -283,9 +283,24 @@ fn the_three_health_states_serialize_as_a_discriminated_union() {
     // 还要多剥一层。这里用 `#[serde(tag = "status")]` 压平成前端好读的形状。
     use app_lib::engine::svn_health::Health;
 
-    let v = serde_json::to_value(Health::Verified { rev: 12346 }).unwrap();
+    let v = serde_json::to_value(Health::Verified {
+        rev: 12346,
+        unverified: vec![],
+    })
+    .unwrap();
     assert_eq!(v["status"], "verified");
     assert_eq!(v["rev"], 12346);
+    // 空数组也必须**出现**：前端无条件读 `h.unverified.length`，
+    // 字段缺席会在运行时炸，而 TS 的类型检查看不到 IPC 这一层。
+    assert_eq!(v["unverified"], serde_json::json!([]));
+
+    let vu = serde_json::to_value(Health::Verified {
+        rev: 7,
+        unverified: vec!["Code/A.cs".into()],
+    })
+    .unwrap();
+    assert_eq!(vu["status"], "verified");
+    assert_eq!(vu["unverified"][0], "Code/A.cs");
 
     let l = serde_json::to_value(Health::Lying {
         files: vec!["Code/A.cs".into()],
@@ -310,7 +325,10 @@ fn init_and_rebuild_reports_serialize_to_camel_case() {
     let init = serde_json::to_value(InitReport {
         node_rev: 1,
         baseline: "abc".into(),
-        health: Health::Verified { rev: 1 },
+        health: Health::Verified {
+            rev: 1,
+            unverified: vec![],
+        },
         pinned: vec![app_lib::engine::svn_externals::PinnedExternal {
             defined_in: "Code".into(),
             local_path: "Code/pinA".into(),

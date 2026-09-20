@@ -204,3 +204,58 @@ export function auditIsDue(now: number, lastAt: number, inFlight: boolean): bool
   if (inFlight) return false
   return now - lastAt >= SVN_AUDIT_MIN_GAP_MS
 }
+
+/**
+ * §6.6.3 第一档比对用的「上次观测值」。
+ *
+ * 用可变盒子而不是返回值：它在 `repoStore` 里的真身是一个 `useRef`，而这里要
+ * 表达的恰恰是**什么时候允许写它**——那条规则写成纯函数才测得到（§7.2）。
+ */
+export interface RootRevMemo {
+  value: string | null
+}
+
+/**
+ * 跑一次第二档，**成功之后**才把这次观测值记进 memo。
+ *
+ * # 顺序就是这条函数存在的全部理由
+ *
+ * 2026-09-21 独立 review。原来的写法是「先把 `lastRootRevs` 更新成新值，再
+ * `await` 完整校验」，而挂在 `repo-changed` 上的调用点又是
+ * `.catch(ignore)`——完整校验一旦抛错（外部 `svn update` 中途工作副本被锁住
+ * 就够了），观测值已经推进到新 revision，下一次事件看到的是**同一个**
+ * revision，第一档直接返回，于是失同步状态**永远停在旧值**，直到 revision
+ * 再变一次或用户重开仓库。
+ *
+ * 反过来「失败就不记」最坏只是下一次事件再跑一遍完整校验——那是本地读，
+ * 而代价的另一头是横幅长期撒谎。
+ *
+ * `observed` 必须是**开跑之前**读到的值：校验期间工作副本要是又前进了，
+ * 记下这个偏旧的值会让下一次事件判不等、再校验一遍。多跑一次远好过漏一次。
+ */
+export async function recordAfterSuccess(
+  memo: RootRevMemo,
+  observed: string,
+  runFullCheck: () => Promise<void>,
+): Promise<void> {
+  await runFullCheck()
+  memo.value = observed
+}
+
+/**
+ * 第一档（O(1)）：rootRevs 与上次观测值比，变了才跑第二档。
+ *
+ * 返回是否真的跑了第二档。第二档抛错时本函数**一并抛出**，memo 不动——
+ * 调用点可以继续吞掉这个错误（横幅是留给 git 操作的），但吞掉之后下一次
+ * 事件仍然会重试。
+ */
+export async function syncIfRootRevChanged(
+  memo: RootRevMemo,
+  readRootRevs: () => Promise<string>,
+  runFullCheck: () => Promise<void>,
+): Promise<boolean> {
+  const now = await readRootRevs()
+  if (now === memo.value) return false
+  await recordAfterSuccess(memo, now, runFullCheck)
+  return true
+}
