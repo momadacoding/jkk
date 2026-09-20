@@ -7,8 +7,9 @@
 //! 模式，属于另一条路径（`engine::svn_externals`）。
 
 use crate::engine::svn_cli::run_svn;
+use crate::engine::svn_dirty::read_dirty;
 use crate::engine::svn_wc::{check_single_repository, enumerate_wcs, peg_safe, WcIdentity};
-use crate::engine::svn_xml::{parse_node_revs, parse_status_entries};
+use crate::engine::svn_xml::{parse_node_revs, parse_status_entries, StatusEntry};
 use crate::error::{GitError, Result};
 use std::collections::BTreeSet;
 
@@ -26,6 +27,18 @@ pub struct Preflight {
     pub repos_root: String,
     /// 仓库 UUID。trailer 的第三个字段。
     pub uuid: String,
+    /// 白名单内所有**非 pristine** 的条目，spec §16 R2a 的输入。
+    ///
+    /// # 为什么不过 IPC
+    ///
+    /// `#[serde(skip)]` 是有意的。这份清单在真实工程上可能有几千条（白名单目录
+    /// 底下的每一个未版本控制文件都算），而前端一条都不需要——它只关心校验过没过、
+    /// 记账单位是几。每次 preflight 都把几千条路径搬过 IPC 是纯粹的浪费。
+    ///
+    /// 需要给用户看的那一小部分（比如 obstructed 指名了哪几条）走错误信息，
+    /// 不走这个字段。
+    #[serde(skip)]
+    pub dirty: Vec<StatusEntry>,
 }
 
 /// 一次跑完 P1–P4；全过则返回录基线需要的三个事实，任一不过返回 `Err`。
@@ -39,13 +52,18 @@ pub struct Preflight {
 /// | 2 | P4 同一仓库 | 跨仓库时 `svn commit` 直接拒（E200007），交付永远做不成 |
 /// | 3 | P3 没有未完成操作 | 树没更新完时，P1 和 P2 读到的东西本身就不可信 |
 /// | 3.5 | 算出检查目标 | 白名单根 + 嵌套 external 根，见 [`check_targets`] |
-/// | 4 | P1 工作副本干净 | **必须先于 P2** |
+/// | 4 | P1 清点脏条目，只拦 `~` | obstructed 时后面都不用跑了 |
 /// | 5 | P2 nodeRevs 单值 | |
 ///
-/// P1 先于 P2 的理由是实测出来的：`svn add` 了但没提交的节点带
-/// `revision="-1"`，它会正常进 `nodeRevs` 使其变成多值。顺序反了的话用户看到的
-/// 是「工作副本是 mixed-revision，请先跑一次完整 svn update」——而真实原因是他有
-/// 个没提交的新文件，那句引导做了也没用。
+/// ⚠️ **P1 先于 P2 这条顺序曾经承载过一个不变量，现在不再承载了。** 旧版 P1 要求
+/// 工作副本干净，顺带把「`svn add` 了没提交、带 `revision="-1"` 的节点」挡在 P2
+/// 之外；spec §16.1 放松 P1 之后那层保护没了，改由 [`parse_node_revs`] 自己滤掉
+/// 负 revision（未提交的节点没有服务器 revision，本就不该进 `nodeRevs`）。
+///
+/// 记在这里是因为顺序看起来没变、含义却变了：**现在把 P1 和 P2 对调也不会出错**，
+/// 但没有理由去调。
+///
+/// [`parse_node_revs`]: crate::engine::svn_xml::parse_node_revs
 pub fn run_preflight(repo_root: &str, whitelist: &[String]) -> Result<Preflight> {
     let roots = whitelist_roots(whitelist);
     if roots.is_empty() {
@@ -61,7 +79,7 @@ pub fn run_preflight(repo_root: &str, whitelist: &[String]) -> Result<Preflight>
     check_single_repository(&wcs)?; // P4
     check_no_operation_in_progress(repo_root, &wcs)?; // P3
     let targets = check_targets(&roots, &wcs);
-    check_clean(repo_root, &targets)?; // P1
+    let dirty = collect_dirty(repo_root, &targets)?; // P1
     let node_rev = check_single_node_rev(repo_root, &targets, &wcs)?; // P2
 
     let first = wcs.first().ok_or_else(|| {
@@ -74,7 +92,29 @@ pub fn run_preflight(repo_root: &str, whitelist: &[String]) -> Result<Preflight>
         node_rev,
         repos_root: first.repos_root.clone(),
         uuid: first.uuid.clone(),
+        dirty,
     })
+}
+
+/// 只重读一次 `nodeRevs`，不做别的校验（spec §16 R3c）。
+///
+/// # 为什么需要单独一个入口
+///
+/// R2a 读脏清单与 R3b 跑体检之间隔着若干次子进程调用，期间用户可能在外部编辑器
+/// 或 TortoiseSVN 里继续动。最危险的一种是**外部 commit**：那会把某个文件的 BASE
+/// 推到 N+1，而 `svn cat -r BASE` 取回的就成了 N+1 的内容，trailer 却写着 rN。
+///
+/// 体检通常已经先一步拦下它（那个文件会进 `D`、不进 `S`），这里是第二道：
+/// 纯本地、不走网络，代价近乎为零，而它挡的是一种**静默**的错误。
+///
+/// 不复用 [`run_preflight`] 是因为那会把 P1/P3/P4 也重跑一遍，失败时报出来的是
+/// 「obstructed」或「操作未完成」，而真正发生的事是「录制期间工作副本被改了」——
+/// 给错原因比不给更糟。
+pub fn read_node_rev(repo_root: &str, whitelist: &[String]) -> Result<u64> {
+    let roots = whitelist_roots(whitelist);
+    let wcs = enumerate_wcs(repo_root, whitelist)?;
+    let targets = check_targets(&roots, &wcs);
+    check_single_node_rev(repo_root, &targets, &wcs)
 }
 
 /// P1 / P2 的检查目标：白名单根，**外加白名单底下每一条嵌套 external 的根**。
@@ -100,7 +140,7 @@ pub fn run_preflight(repo_root: &str, whitelist: &[String]) -> Result<Preflight>
 /// `--ignore-externals` 仍然照加：它负责挡住**更深**一层的嵌套 external，而那一层
 /// 由 [`enumerate_wcs`] 递归枚举出来、作为独立 target 各查一次（spec §6.6.5 末尾
 /// 那条「在 `wc(P)` 内部用它是对的」）。
-fn check_targets(roots: &[String], wcs: &[WcIdentity]) -> Vec<String> {
+pub fn check_targets(roots: &[String], wcs: &[WcIdentity]) -> Vec<String> {
     let mut targets = roots.to_vec();
     for w in wcs {
         // `wc_root` 与 `roots` 都经过同一套归一（正斜杠 + 去尾斜杠），白名单根自己
@@ -195,7 +235,7 @@ fn operation_in_progress(target: &str, what: &str, how: &str) -> GitError {
     )
 }
 
-/// P1：白名单内 `svn status` 必须干净。
+/// P1：收集白名单内所有**非 pristine** 的条目；只有 `~`（obstructed）阻断。
 ///
 /// 三个参数缺一不可（spec §6.5）：
 ///
@@ -205,100 +245,75 @@ fn operation_in_progress(target: &str, what: &str, how: &str) -> GitError {
 ///                        ↑ 不带它 external 内部的节点会混进来（§6.6.4）
 /// ```
 ///
-/// **不自动规范化。** revert 用户的本地修改是破坏性的，只拦住并引导去
+/// # 为什么不再要求干净
+///
+/// 初版这里要求「一条脏都不许有」。那条门槛让重建基线在真实开发节奏下**永远
+/// 点不动**：git 与 SVN 共用同一个工作目录，`git commit` 之后 `svn status` 仍然
+/// 是 `M`，所以只要用户干过活白名单就永远脏，而失同步横幅偏偏一直在推荐它
+/// （spec §16.1 有完整的复现记录）。
+///
+/// 修法是换掉**录制来源**，不是拆掉门槛：脏文件改取 `svn cat -r BASE` 的字节
+/// （§16 R2a/R2b）。所以这个函数从「拦住」变成「如实清点」——它的输出是那一步的
+/// 输入。放行本身不会让基线变松，真正的把关移到了体检的 `D \ S == ∅`（§6.8.7）。
+///
+/// # 唯一仍然阻断的是 `~`
+///
+/// obstructed 意味着 svn 自己都说不清那个位置上是什么（典型形态：一个版本控制下
+/// 的文件被换成了同名目录）。取不到可信的 BASE 内容，就录不出「服务器在 rN 的
+/// 样子」。**不自动修复**——revert 和删目录都是破坏性的，只拦住并引导去
 /// TortoiseSVN 自己处理（对齐 spec §8.1 #2）。
 ///
-/// # `ignored` 与 `unversioned` 一律算脏
+/// # 清点故意不按扩展名过滤
 ///
-/// spec 的禁止清单里明写着 `?`，而 `--no-ignore` 的作用就是让被 `svn:ignore`
-/// 挡住的那些也现形。所以判据就是字面的「白名单内 status 必须干净」，
-/// 不按扩展名或别的条件放行。
-///
-/// 曾经想按「git 会不会收」收窄（只拦匹配白名单扩展名的那些），已撤销：
-/// 那既越过了 spec 的明文，风险方向也反了。误拦是**看得见**的——错误信息里
-/// 直接列出路径，用户当场就能判断；而放行一个 SVN 不管的文件是**看不见**的，
-/// 它会进基线、进交付清单，且基线本身一切正常。
+/// 这一层是 `svn status` 的如实转述。按扩展名筛选是下游的事（R2a 只改写 W-file，
+/// 纳入集合核对另有判据）。这一层多报的代价是零——下游会忽略它；少报的代价是
+/// 漏掉一个该从基线里剔除的文件，而那种错误**看不见**。
 ///
 /// `targets` 来自 [`check_targets`]：白名单根**加上**嵌套 external 的根。只传白名单
 /// 根的话，嵌套 external 里的改动在这条命令下只显示成一条 `item="external"`，
 /// 而下面正好把它跳过——等于完全没查。
-fn check_clean(repo_root: &str, targets: &[String]) -> Result<()> {
-    let mut dirty: Vec<String> = Vec::new();
-    let mut has_untracked = false;
+fn collect_dirty(repo_root: &str, targets: &[String]) -> Result<Vec<StatusEntry>> {
+    // 读取本身下沉到了 `svn_dirty::read_dirty`——服务器侧核对要用同一份清单，
+    // 而它**不能**因为一处 obstructed 就让仓库打不开。所以「读」和「判」分开，
+    // 阻断判定留在这里。
+    let dirty = read_dirty(repo_root, targets)?;
+    let mut obstructed: Vec<String> = dirty
+        .iter()
+        .filter(|e| e.item == "obstructed")
+        .map(|e| e.path.clone())
+        .collect();
 
-    for root in targets {
-        let arg = peg_safe(root);
-        let xml = run_svn(
-            repo_root,
-            &[
-                "status",
-                "--no-ignore",
-                "--ignore-externals",
-                "--xml",
-                "--",
-                &arg,
-            ],
-        )?;
-        for e in parse_status_entries(&xml)? {
-            // `item="external"` 即使带了 --ignore-externals 也照样出现（实测），
-            // 它不是脏状态。本设计的核心场景就是「代码在 external 里」，
-            // 把它判脏会让向导在目标仓库上永远过不去。
-            if e.item == "external" {
-                continue;
-            }
-            match e.item.as_str() {
-                "unversioned" | "ignored" => {
-                    has_untracked = true;
-                    dirty.push(format!("{} （{}，不在版本控制里）", e.path, e.item));
-                }
-                "normal" => {
-                    if e.props != "none" {
-                        dirty.push(format!("{} （属性被改过，未提交）", e.path));
-                    }
-                }
-                other => dirty.push(format!("{} （{other}）", e.path)),
-            }
-        }
+    if !obstructed.is_empty() {
+        obstructed.sort();
+        let shown: Vec<&String> = obstructed.iter().take(20).collect();
+        let more = if obstructed.len() > shown.len() {
+            format!("\n……另有 {} 条未列出", obstructed.len() - shown.len())
+        } else {
+            String::new()
+        };
+        return Err(GitError::new(
+            "svn_preflight_obstructed",
+            format!(
+                "白名单内有 {} 处 obstructed（svn status 的 `~`）：\n{}{}\n\
+                 这种位置上 svn 自己都说不清是什么（典型情况：一个受版本控制的文件\
+                 被换成了同名目录），取不到它在服务器上的内容，也就录不出基线。\n\
+                 本应用不会替你动这些路径（删目录、revert 都是破坏性操作），\
+                 请先在 TortoiseSVN 里处理——通常是把多出来的目录挪走、\
+                 再对该路径跑一次 Update 或 Revert。\n\
+                 ⚠️ 除了 `~`，其余的本地修改（改过、新增、删除、未版本控制）\
+                 现在都**不再阻断**建库或重建基线。",
+                obstructed.len(),
+                shown
+                    .iter()
+                    .map(|s| format!("  - {s}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                more
+            ),
+        ));
     }
 
-    if dirty.is_empty() {
-        return Ok(());
-    }
-    dirty.sort();
-    let shown: Vec<&String> = dirty.iter().take(20).collect();
-    let more = if dirty.len() > shown.len() {
-        format!("\n……另有 {} 条未列出", dirty.len() - shown.len())
-    } else {
-        String::new()
-    };
-    let ghost_hint = if has_untracked {
-        // 三条出路都要给全。独立 review 指出：只说「svn add 或移出白名单目录」时，
-        // 对一个被 svn:ignore 挡住的构建产物目录来说两条都不可行，用户会卡死。
-        "\n带「不在版本控制里」的那些，三条出路：\
-         ① 该进版本控制的先 svn add；\
-         ② 不该进的从白名单目录里移走；\
-         ③ 把白名单收窄到不含它（比如从 `Code/` 改成 `Code/Scripts/`）。\n\
-         被 svn:ignore 挡住的文件也在此列——SVN 不管它，git 却可能照收，\
-         那样录进基线的就是一个 SVN 里根本不存在的文件，交付时必然对不上。"
-    } else {
-        ""
-    };
-    Err(GitError::new(
-        "svn_preflight_dirty",
-        format!(
-            "白名单内的工作副本不干净，共 {} 处：\n{}{}\n\
-             本应用不会替你 revert（那是破坏性操作），请先在 TortoiseSVN 里\
-             提交或还原这些改动，再回来建库。{}",
-            dirty.len(),
-            shown
-                .iter()
-                .map(|s| format!("  - {s}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            more,
-            ghost_hint
-        ),
-    ))
+    Ok(dirty)
 }
 
 /// P2：`nodeRevs` 必须是单元素集合 `{N}`。
@@ -350,11 +365,18 @@ fn check_single_node_rev(repo_root: &str, targets: &[String], wcs: &[WcIdentity]
         )
     })?;
     u64::try_from(rev).map_err(|_| {
-        // 负数只可能来自 `svn add` 了没提交的节点（`revision="-1"`），
-        // 而那种节点 P1 已经拦住了。走到这里说明顺序被人调过。
+        // 负数来自 `svn add` 了没提交的节点（`revision="-1"`，2026-09-16 实测）。
+        //
+        // 旧版靠「P1 先拦住那种节点」来保证这里不会收到负数；spec §16.1 放松 P1
+        // 之后那条保证没了，改由 `parse_node_revs` 自己把负数滤掉（它在语义上就
+        // 不该进 `nodeRevs`——未提交的节点没有服务器 revision）。所以走到这里说明
+        // 过滤被人删了，是实现缺陷，不是用户的工作副本有问题。
         GitError::new(
             "svn_preflight",
-            format!("读到一个负的 revision（{rev}），说明 P1 没有先于 P2 执行"),
+            format!(
+                "读到一个负的 revision（{rev}）。未提交节点的 revision=\"-1\" \
+                 本该在 parse_node_revs 里就被滤掉。"
+            ),
         )
     })
 }

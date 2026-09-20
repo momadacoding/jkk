@@ -23,6 +23,7 @@ use crate::engine::svn_cli::run_svn;
 use crate::engine::svn_include_check::{is_w_file, normalize_roots};
 use crate::engine::svn_xml::parse_diff_summary;
 use crate::error::{GitError, Result};
+use std::collections::BTreeSet;
 
 /// 体检的三种结果。**必须分开**（spec §6.8.6）。
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -70,6 +71,13 @@ pub fn check_baseline(
     rev: u64,
     whitelist: &[String],
     extensions: &[String],
+    // `explained` 是 §6.8.7 的 `S`——本次录制**实际动过**的路径。这些路径上的差异
+    // 已经被换成了服务器内容，不构成基线撒谎。
+    //
+    // ⚠️ **必须恰好是动过的那批，不能是超集。** `S` 越大 `D \ S` 越小，判据越弱，
+    // 而削弱它不会让任何测试变红（spec §16.1）。干净工作副本传空集，判据退化成
+    // 原来的 `D == ∅`。
+    explained: &BTreeSet<String>,
 ) -> Result<Health> {
     let roots = normalize_roots(whitelist);
     if roots.is_empty() {
@@ -168,6 +176,15 @@ pub fn check_baseline(
             files.push(repo_rel);
         }
     }
+
+    // §6.8.7：判据是 `D \ S == ∅`，不是 `D == ∅`。
+    //
+    // `D` 是刚刚收集的这批「磁盘与服务器 rN 有内容差异的 W-file」；`S`（`explained`）
+    // 是本次录制实际动过的路径——它们的差异**已经被换成服务器内容**，不构成
+    // 基线撒谎。剩下解释不了的每一条，才是真的证伪。
+    //
+    // 工作副本干净时 `S = ∅`，这一步退化成原来的 `D == ∅`，与 §6.8.2 逐字等价。
+    files.retain(|f| !explained.contains(f));
 
     if files.is_empty() {
         return Ok(Health::Verified { rev });

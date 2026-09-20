@@ -308,3 +308,135 @@ fn recording_the_same_tree_again_is_legal() {
         2
     );
 }
+
+// ---------------------------------------------------------------------------
+// §16 R2b：把「磁盘树」逐条改写成「服务器 rN 的树」
+//
+// 这几条只测 TempIndex 这一层的机械动作；内容从哪来（`svn cat -r BASE`）由
+// `svn_pristine` 负责，串起来由 `svn_init` 负责。
+// ---------------------------------------------------------------------------
+
+/// 读出某棵 tree 里某个路径的 blob **字节**。
+fn blob_in_tree(root: &str, tree: &str, path: &str) -> Vec<u8> {
+    app_lib::engine::git_cli::run_git_bytes(root, &["cat-file", "blob", &format!("{tree}:{path}")])
+        .unwrap()
+}
+
+#[test]
+fn replace_blob_puts_the_given_bytes_into_the_tree() {
+    let dir = workdir_with_exclude();
+    let root = dir.path().to_str().unwrap();
+    let idx = TempIndex::empty(root).unwrap();
+    idx.add_all(root, &wl()).unwrap();
+
+    idx.replace_blob(root, "Code/A.cs", b"from-server\n")
+        .unwrap();
+    let tree = idx.write_tree(root).unwrap();
+
+    assert_eq!(blob_in_tree(root, &tree, "Code/A.cs"), b"from-server\n");
+    assert_eq!(
+        fs::read(dir.path().join("Code/A.cs")).unwrap(),
+        b"a",
+        "磁盘一个字节都不许动——整条重建对工作目录只读（spec §16.1）"
+    );
+}
+
+#[test]
+fn replace_blob_round_trips_non_utf8_bytes() {
+    // GBK 的 `.cs`。这条和 `svn_pristine` 那头是一对：那边保证取出来的字节没被
+    // lossy 转换，这边保证写进 tree 的字节也没有。链条上任何一环过一次
+    // `from_utf8_lossy`，录进基线的就是一棵被悄悄改坏的树，而体检查不出来。
+    let dir = workdir_with_exclude();
+    let root = dir.path().to_str().unwrap();
+    let idx = TempIndex::empty(root).unwrap();
+    idx.add_all(root, &wl()).unwrap();
+
+    let gbk: &[u8] = &[0x2F, 0x2F, 0x20, 0xD6, 0xD0, 0xCE, 0xC4, 0x0A];
+    idx.replace_blob(root, "Code/A.cs", gbk).unwrap();
+    let tree = idx.write_tree(root).unwrap();
+
+    assert_eq!(blob_in_tree(root, &tree, "Code/A.cs"), gbk);
+}
+
+#[test]
+fn replace_blob_can_create_a_path_that_is_not_in_the_index_yet() {
+    // `deleted` / `missing` 的形态：磁盘上没有这个文件，所以 `git add -A` 收不到它，
+    // 但服务器 rN 上有，基线里必须有。
+    let dir = workdir_with_exclude();
+    let root = dir.path().to_str().unwrap();
+    let idx = TempIndex::empty(root).unwrap();
+    idx.add_all(root, &wl()).unwrap();
+    assert!(
+        !idx.ls_files(root).unwrap().contains("Code/Gone.cs"),
+        "前提：这个路径本来不在索引里"
+    );
+
+    idx.replace_blob(root, "Code/Gone.cs", b"still-on-server\n")
+        .unwrap();
+    let tree = idx.write_tree(root).unwrap();
+
+    assert_eq!(
+        blob_in_tree(root, &tree, "Code/Gone.cs"),
+        b"still-on-server\n"
+    );
+    assert!(
+        !dir.path().join("Code/Gone.cs").exists(),
+        "只进 tree，不许写回磁盘"
+    );
+}
+
+#[test]
+fn remove_path_takes_an_entry_out_of_the_candidate_index() {
+    // `added` / `unversioned` 的形态：磁盘上有、服务器 rN 上没有。
+    let dir = workdir_with_exclude();
+    let root = dir.path().to_str().unwrap();
+    let idx = TempIndex::empty(root).unwrap();
+    idx.add_all(root, &wl()).unwrap();
+    assert!(idx.ls_files(root).unwrap().contains("Code/A.cs"));
+
+    idx.remove_path(root, "Code/A.cs").unwrap();
+
+    assert!(!idx.ls_files(root).unwrap().contains("Code/A.cs"));
+    assert!(
+        dir.path().join("Code/A.cs").exists(),
+        "从索引里摘掉，不是从磁盘上删掉"
+    );
+}
+
+#[test]
+fn replace_blob_keeps_the_mode_the_entry_already_had() {
+    // 替换动作不该顺手改掉一个与本期无关的属性。索引里没有的路径退回 100644。
+    let dir = workdir_with_exclude();
+    let root = dir.path().to_str().unwrap();
+    let idx = TempIndex::empty(root).unwrap();
+    idx.add_all(root, &wl()).unwrap();
+    let before = idx.stage_mode(root, "Code/A.cs").unwrap();
+    assert!(before.is_some(), "前提：这个路径在索引里");
+
+    idx.replace_blob(root, "Code/A.cs", b"x\n").unwrap();
+
+    assert_eq!(idx.stage_mode(root, "Code/A.cs").unwrap(), before);
+    assert_eq!(
+        idx.stage_mode(root, "Code/Nope.cs").unwrap(),
+        None,
+        "不在索引里的路径必须返回 None，而不是编一个 mode 出来"
+    );
+}
+
+#[test]
+fn an_empty_path_is_refused_by_both_writers() {
+    // 空 pathspec 在本仓库已经误伤过一次（`AGENTS.md` §6.2）。
+    // `git update-index --force-remove -- ""` 的行为不该由我们去猜。
+    let dir = workdir_with_exclude();
+    let root = dir.path().to_str().unwrap();
+    let idx = TempIndex::empty(root).unwrap();
+
+    assert_eq!(
+        idx.replace_blob(root, "", b"x").unwrap_err().code,
+        "svn_baseline_empty_path"
+    );
+    assert_eq!(
+        idx.remove_path(root, "").unwrap_err().code,
+        "svn_baseline_empty_path"
+    );
+}

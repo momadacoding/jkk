@@ -100,6 +100,7 @@ pub fn parse_node_revs(xml: &str) -> Result<BTreeSet<i64>> {
     let doc = parse_doc(xml)?;
     assert_externals_were_ignored(&doc)?;
     let mut revs = BTreeSet::new();
+    let mut skipped_uncommitted = 0usize;
     for st in doc.descendants().filter(|n| n.has_tag_name("wc-status")) {
         // external **根**的 wc-status 没有 revision 属性，跳过而不是记成 0——
         // 0 会凭空造出一个多值集合，把正常仓库判成 mixed-revision。
@@ -113,7 +114,40 @@ pub fn parse_node_revs(xml: &str) -> Result<BTreeSet<i64>> {
         let rev = raw
             .parse::<i64>()
             .map_err(|_| GitError::new("svn_xml", format!("wc-status revision 不是整数: {raw}")))?;
+        // 负 revision 只可能来自**还没提交的节点**。2026-09-16 实测，`svn add` 了
+        // 没提交的文件在 `status -v --xml` 里是：
+        //
+        // ```xml
+        // <entry path="Code\Added.cs">
+        // <wc-status item="added" revision="-1" props="none">
+        // ```
+        //
+        // 它不能进集合。`nodeRevs` 问的是「工作副本停在哪个**服务器** revision」，
+        // 而一个还没提交的节点没有服务器 revision，对这个问题无可奉告；照收会让
+        // 集合变成多值，用户看到的是「工作副本是 mixed-revision，请先跑一次完整
+        // svn update」——一条做了也没用的引导，真实原因是他有个没提交的新文件。
+        //
+        // spec §16.1 之前这条不需要，因为 P1 要求白名单干净，未提交的 add 走不到
+        // 这一步；放松 P1 之后它会正常出现。
+        if rev < 0 {
+            skipped_uncommitted += 1;
+            continue;
+        }
         revs.insert(rev);
+    }
+    // 全被跳过、一个正 revision 都没剩：不能套用下面那条「漏了 -v」的说法，
+    // 那会把用户引向一个完全无关的方向。
+    if revs.is_empty() && skipped_uncommitted > 0 {
+        return Err(GitError::new(
+            "svn_xml_all_nodes_uncommitted",
+            format!(
+                "这份 svn status 输出里的 {skipped_uncommitted} 个节点**全都还没提交**\
+                 （revision=\"-1\"），一个有服务器 revision 的节点都没有。\
+                 白名单指向的内容整个都是本地新增的，还没进过 SVN——\
+                 这种工作副本上录不出「服务器在 rN 的样子」，\
+                 请先把这些文件提交到 SVN，再回来建库或重建基线。"
+            ),
+        ));
     }
     // 空集必须报错，不能 Ok 返回。
     //

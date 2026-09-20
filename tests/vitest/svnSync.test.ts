@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
+  auditIsDue,
+  SVN_AUDIT_MIN_GAP_MS,
+  SVN_AUDIT_POLL_MS,
   describeAudit,
   describeSync,
   needsStandaloneCheck,
@@ -167,5 +170,44 @@ describe('needsStandaloneCheck', () => {
     }
     expect(needsStandaloneCheck(true, pinned)).toBe(false)
     expect(describeSync(pinned)!.actions.map((a) => a.id)).toContain('check')
+  })
+})
+
+describe('auditIsDue', () => {
+  // `now` 的真实形态是 `Date.now()`，也就是一个 1.7e12 量级的数，不是 0。
+  // 拿 0 当 now 测出来的结论对不上实际行为（`AGENTS.md` §13 #9）。
+  const NOW = 1_770_000_000_000
+
+  it('从来没跑过时立刻放行', () => {
+    // 打开仓库那一次会把 lastAt 写成当时的时刻，所以 0 只出现在「这个仓库还
+    // 一次都没核对过」的情况下——那时不该等满一分钟。
+    expect(auditIsDue(NOW, 0, false)).toBe(true)
+  })
+
+  it('刚跑完就不再跑', () => {
+    const now = NOW
+    expect(auditIsDue(now, now, false)).toBe(false)
+    expect(auditIsDue(now, now - 1, false)).toBe(false)
+    expect(auditIsDue(now, now - (SVN_AUDIT_MIN_GAP_MS - 1), false)).toBe(false)
+  })
+
+  it('刚好到间隔就放行（边界取等号，不是严格大于）', () => {
+    const now = NOW
+    expect(auditIsDue(now, now - SVN_AUDIT_MIN_GAP_MS, false)).toBe(true)
+  })
+
+  it('上一次还没回来就一律不跑，哪怕已经过了很久', () => {
+    // 慢仓库上一次核对可能比间隔还长。不挡的话请求会一层层叠起来，
+    // 而这条检查本来就是「锦上添花」，没有任何理由把服务器压垮。
+    const now = NOW
+    expect(auditIsDue(now, 0, true)).toBe(false)
+    expect(auditIsDue(now, now - SVN_AUDIT_POLL_MS, true)).toBe(false)
+  })
+
+  it('定时器的间隔比闸宽，所以每一次滴答都真的会核对', () => {
+    // 这两个常数的关系是有意的：闸是用来限制**窗口焦点**那个触发点的，
+    // 不该把定时器自己也挡掉。反过来配的话定时器会变成隔一次跑一次。
+    expect(SVN_AUDIT_POLL_MS).toBeGreaterThan(SVN_AUDIT_MIN_GAP_MS)
+    expect(auditIsDue(NOW, NOW - SVN_AUDIT_POLL_MS, false)).toBe(true)
   })
 })

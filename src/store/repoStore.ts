@@ -3,7 +3,12 @@ import { listen } from '@tauri-apps/api/event'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { CommitNode, DiffData, GraphData, PullRequest, RefPointer, RepoInfo, StashEntry, StatusData, UpstreamInfo, Worktree } from '../engine/types'
 import { ALL_CAPABILITIES, type Capabilities } from '../engine/capabilities'
-import type { ServerAudit, SyncStatus } from '../engine/svnSync'
+import {
+  auditIsDue,
+  SVN_AUDIT_POLL_MS,
+  type ServerAudit,
+  type SyncStatus,
+} from '../engine/svnSync'
 import { baselineMap, remapRefs, spliceHistory, type SvnRevNode } from '../engine/svnGraph'
 
 import { toErrorCode, toErrorMessage } from '../engine/errors'
@@ -279,6 +284,15 @@ export function useRepoStore() {
    */
   const lastRootRevs = useRef<string | null>(null)
 
+  /**
+   * 上一次**开始**服务器侧核对的时刻，与 `auditInFlight` 一起构成
+   * `auditIsDue` 的输入。用 ref 而不是 state：写它不该引起重渲染，
+   * 而且定时器闭包读 state 会永远读到注册那一刻的值（`lastRootRevs`
+   * 的注释里记的是同一个坑）。
+   */
+  const lastAuditAt = useRef(0)
+  const auditInFlight = useRef(false)
+
   const openRepo = useCallback(async (path: string) => {
     setState((s) => ({ ...s, loading: true, error: null, errorCode: null }))
     try {
@@ -469,14 +483,44 @@ export function useRepoStore() {
     }
   }
 
-  /** 服务器侧清单核对。走网络，失败静默并**写回 null**（不是保留上一个仓库的）。 */
-  const refreshSvnAudit = async (path: string) => {
+  /**
+   * 服务器侧清单核对。走网络。
+   *
+   * `keepOnError` 分开两种调用场景，它们对失败的正确反应**相反**：
+   *
+   * - 打开仓库 / 重建之后（`false`）：必须**写回 null**。这次的结果是权威的，
+   *   失败时留着上一个仓库的结论，会把 A 仓库的漏收挂到 B 仓库头上。
+   * - 后台自动重跑（`true`）：必须**保留**上一次的结论。一次网络抖动就把一条
+   *   已经成立的漏收警告抹掉，是把真警报降级成沉默——而这条检查存在的全部理由
+   *   就是那个沉默很危险。
+   */
+  const refreshSvnAudit = async (path: string, keepOnError = false) => {
+    lastAuditAt.current = Date.now()
     try {
       const audit = await svnServerAudit(path)
-      setState((s) => ({ ...s, svnAudit: audit }))
+      // 核对期间用户可能已经切到别的仓库了。不比一下路径的话，这次的结果会写进
+      // 另一个完全无关的仓库的横幅里——后台定时重跑之后这个窗口大了很多。
+      setState((s) => (samePath(s.path ?? '', path) ? { ...s, svnAudit: audit } : s))
     } catch (err) {
-      console.warn('服务器侧清单核对失败，不显示漏收提示：', err)
-      setState((s) => ({ ...s, svnAudit: null }))
+      console.warn('服务器侧清单核对失败：', err)
+      if (keepOnError) return
+      setState((s) => (samePath(s.path ?? '', path) ? { ...s, svnAudit: null } : s))
+    }
+  }
+
+  /**
+   * 后台自动重跑的入口：过了闸才真的发请求（`auditIsDue`）。
+   *
+   * 这条检查要抓的是用户**不知情**的漏收，所以不能只靠手动入口——不知道出事的人
+   * 不会去点那颗按钮（2026-09-19 用户决定）。
+   */
+  const auditSvnIfDue = async (path: string) => {
+    if (!auditIsDue(Date.now(), lastAuditAt.current, auditInFlight.current)) return
+    auditInFlight.current = true
+    try {
+      await refreshSvnAudit(path, true)
+    } finally {
+      auditInFlight.current = false
     }
   }
 
@@ -546,6 +590,7 @@ export function useRepoStore() {
     refreshSvnLog,
     fetchSvnLog,
     refreshSvnAudit,
+    auditSvnIfDue,
     selectCommit,
     clearError,
     reportError,
@@ -564,6 +609,8 @@ export interface RepoRefreshers {
   /** §6.6.3 第二档。只在第一档报告「有人动过」之后才调。 */
   /** §6.6.3 的第一档 + 条件触发第二档。挂在高频的 repo-changed 上。 */
   checkSvnSyncIfChanged: (path: string) => Promise<boolean>
+  /** 服务器侧核对的**后台**入口，自带频率闸。挂定时器与窗口焦点。 */
+  auditSvnIfDue: (path: string) => Promise<void>
 }
 
 export function useRepoEffects(
@@ -571,7 +618,7 @@ export function useRepoEffects(
   refreshers: RepoRefreshers,
   viewMode: string,
 ) {
-  const { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged } = refreshers
+  const { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, auditSvnIfDue } = refreshers
   const diffScope = viewMode === 'changes'
     ? 'workdir'
     : state.selectedId
@@ -616,4 +663,44 @@ export function useRepoEffects(
     }).then((fn) => { unlisten = fn })
     return () => { unlisten?.() }
   }, [state.path, diffScope])
+
+  /**
+   * 服务器侧漏收核对的**自动**触发（2026-09-19）。
+   *
+   * # 为什么不挂在 repo-changed 上
+   *
+   * 那条通道一次文件保存就触发一次，而这里要走网络（`svn ls -R`）。
+   * `refreshPullRequests` 的注释里记的是同一条理由。
+   *
+   * # 为什么不能只留手动入口
+   *
+   * `--set-depth=exclude` 造成的漏收，SVN 侧四道检查全是绿的、磁盘上也看不见。
+   * 用户不知情，就不会去点「检查一下」。所以它必须自己跑起来。
+   *
+   * # 两个触发点
+   *
+   * - **定时器**：兜底，覆盖「应用一直开着、后台脚本动了工作副本」。
+   * - **窗口获得焦点**：用户刚从 TortoiseSVN / 终端切回来——最可能刚出事的时刻。
+   *   它会被 `SVN_AUDIT_MIN_GAP_MS` 那道闸限频，来回切窗口打不出高频请求。
+   *
+   * 页面不可见时跳过：最小化着的窗口每五分钟发一次网络请求没有意义。这不是
+   * 安全关键——闸本身已经把最坏情况钉住了，这里只是省掉明显的浪费。
+   */
+  useEffect(() => {
+    if (!state.path || state.capabilities.vcs !== 'svn') return
+    const path = state.path
+    const tick = () => {
+      if (document.hidden) return
+      void auditSvnIfDue(path).catch(() => undefined)
+    }
+    const timer = window.setInterval(tick, SVN_AUDIT_POLL_MS)
+    window.addEventListener('focus', tick)
+    return () => {
+      window.clearInterval(timer)
+      window.removeEventListener('focus', tick)
+    }
+    // ⚠️ 依赖里**不放** `auditSvnIfDue`：它每次渲染都是新函数，放进去会让这个
+    // effect 每渲染一次就重装一次定时器，五分钟的计时永远归零、一次都不会触发。
+    // 本文件里其它几个 effect 也是同一个写法。
+  }, [state.path, state.capabilities.vcs])
 }

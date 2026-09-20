@@ -231,7 +231,10 @@ fn check(dir: &Path, w: &[String], e: &[String]) -> app_lib::error::Result<()> {
     let root = dir.to_str().unwrap();
     let idx = TempIndex::empty(root)?;
     idx.add_all(root, w)?;
-    verify_include_set(root, &idx, w, e)
+    // 这些 fixture 是纯 git 目录、没有 SVN 工作副本，脏清单按定义为空。
+    // 空 `fixes` 时期望集合退化成「磁盘上的 W-file」，也就是 §16.1 之前的口径——
+    // 这批测试覆盖的正是那条不变的行为（spec §6.3.1）。
+    verify_include_set(root, &idx, w, e, &std::collections::BTreeMap::new())
 }
 
 #[test]
@@ -642,7 +645,8 @@ fn the_mismatch_report_names_the_rule_for_files_that_are_tracked_but_should_not_
     let root = dir.path().to_str().unwrap();
     let idx = TempIndex::from_head(root).unwrap();
     idx.add_all(root, &w).unwrap();
-    let err = verify_include_set(root, &idx, &w, &e).expect_err("多收必须被抓到");
+    let err = verify_include_set(root, &idx, &w, &e, &std::collections::BTreeMap::new())
+        .expect_err("多收必须被抓到");
     assert_eq!(err.code, "include_set_mismatch");
     assert!(
         err.message.contains("Code/Junk.psd"),

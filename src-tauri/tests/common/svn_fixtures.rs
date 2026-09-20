@@ -287,6 +287,35 @@ pub enum DirtyKind {
     Added,
     /// `svn delete` 了但没提交。
     Deleted,
+    /// 白名单目录里多出一个**没纳入版本控制的目录**，里面两层 `.cs`。
+    ///
+    /// # 这不是 [`DirtyKind::Unversioned`] 的换皮
+    ///
+    /// 2026-09-20 实测，`svn status --xml`（带不带 `-v` 都一样）对这种形态
+    /// **只报目录本身，里面一个文件都不报**：
+    ///
+    /// ```xml
+    /// <entry path="Code\NewDir">
+    ///   <wc-status item="unversioned" props="none"></wc-status>
+    /// </entry>
+    /// ```
+    ///
+    /// 而 git 的 exclude 规则按扩展名**递归**收（`!/Code/**/*.cs`），里面的
+    /// `.cs` 照样进基线树。分类层若只认 svn 报的那一条路径，这些文件就会以
+    /// 磁盘内容混进一个声称「等于服务器 rN」的树里，四道检查全绿——正是本期
+    /// 要消灭的那种假基线。
+    UnversionedDir,
+    /// 白名单目录里一个被 `svn:ignore` 挡掉的**目录**，里面有 `.cs`。
+    ///
+    /// 与 [`DirtyKind::UnversionedDir`] 同一个形态，只是 item 变成 `ignored`。
+    /// 单列是因为 `--no-ignore` 这一路的分支是独立的。
+    IgnoredDir,
+    /// `svn delete` 掉一个**目录**（里面有 `.cs`），没提交。
+    ///
+    /// 实测：不带 `-v` 的 `svn status` 只报目录本身；**带 `-v` 才会同时列出
+    /// `Code/Deep/D.cs` 也是 `deleted`**。目录本身在磁盘上已经没了，
+    /// 而 `svn cat -r BASE Code/Deep/D.cs@` 仍然取得到内容（exit 0）。
+    DeletedDir,
 }
 
 /// 在 [`svn_repo`] 的基础上制造一种脏状态。
@@ -306,6 +335,30 @@ pub fn svn_repo_dirty(kind: DirtyKind) -> SvnFixture {
         }
         DirtyKind::Deleted => {
             run(&wc, "svn", &["delete", "Code/B.cs", "--non-interactive"]);
+        }
+        DirtyKind::UnversionedDir => {
+            std::fs::create_dir_all(wc.join("Code/NewDir/Deeper")).unwrap();
+            std::fs::write(wc.join("Code/NewDir/New.cs"), "n\n").unwrap();
+            std::fs::write(wc.join("Code/NewDir/Deeper/Deep.cs"), "d\n").unwrap();
+            // 白名单内但扩展名不符：它不该进 `S`，也本来就进不了基线树。
+            std::fs::write(wc.join("Code/NewDir/note.txt"), "t\n").unwrap();
+        }
+        DirtyKind::IgnoredDir => {
+            std::fs::create_dir_all(wc.join("Code/Ign")).unwrap();
+            std::fs::write(wc.join("Code/Ign/G.cs"), "g\n").unwrap();
+            run(
+                &wc,
+                "svn",
+                &["propset", "svn:ignore", "Ign", "Code", "--non-interactive"],
+            );
+        }
+        DirtyKind::DeletedDir => {
+            std::fs::create_dir_all(wc.join("Code/Deep")).unwrap();
+            std::fs::write(wc.join("Code/Deep/D.cs"), "d\n").unwrap();
+            run(&wc, "svn", &["add", "Code/Deep", "--non-interactive"]);
+            run(&wc, "svn", &["commit", "-m", "r2", "--non-interactive"]);
+            run(&wc, "svn", &["update", "--non-interactive"]);
+            run(&wc, "svn", &["delete", "Code/Deep", "--non-interactive"]);
         }
     }
     fx
@@ -993,4 +1046,86 @@ pub fn svn_repo_working_copy_far_behind() -> SvnFixture {
     }
 
     SvnFixture { dir }
+}
+
+/// 白名单里放两个 `.cs`：一个设了 `svn:eol-style=native`（Windows 上磁盘是 CRLF），
+/// 一个什么都不设（磁盘是 LF）。
+///
+/// 这个 fixture 钉住的是 **git 的 `core.autocrlf` 与录制路径的交互**。多数 Windows
+/// 开发机上 `core.autocrlf=true`，于是：
+///
+/// ```text
+/// 磁盘（native）          = "n1\r\n"   CRLF
+/// git add -A 进 blob      = "n1\n"     LF     ← 归一过
+/// hash-object --stdin     = "n1\r\n"   CRLF   ← 没归一
+/// ```
+///
+/// 两条录制路径产出不同的 blob，意味着「这个文件在基线里长什么样」取决于它当时
+/// 脏不脏——在脏工作副本上重建一次就会把行尾整个翻一遍（2026-09-17 实测）。
+pub fn svn_repo_with_native_eol() -> SvnFixture {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    run(&root, "svnadmin", &["create", "repo"]);
+    let url = file_url(&root.join("repo"));
+    run(
+        &root,
+        "svn",
+        &["checkout", &url, "wc1", "--non-interactive"],
+    );
+    let wc = root.join("wc1");
+    std::fs::create_dir_all(wc.join("Code")).unwrap();
+    std::fs::write(wc.join("Code/Nat.cs"), "n1\n").unwrap();
+    std::fs::write(wc.join("Code/Plain.cs"), "p1\n").unwrap();
+    run(&wc, "svn", &["add", "Code", "--non-interactive"]);
+    run(
+        &wc,
+        "svn",
+        &[
+            "propset",
+            "svn:eol-style",
+            "native",
+            "Code/Nat.cs",
+            "--non-interactive",
+        ],
+    );
+    run(&wc, "svn", &["commit", "-m", "r1", "--non-interactive"]);
+    run(&wc, "svn", &["update", "--non-interactive"]);
+    SvnFixture { dir }
+}
+
+/// 把一个白名单内的 `.cs` 换成**同名目录**——SVN 意义上的 obstructed（`~`）。
+///
+/// 这是 spec §16.1 之后 P1 **唯一**仍然阻断的脏状态：svn 自己都说不清那个位置上
+/// 是什么，`svn cat -r BASE` 拿不到可信的内容，录不出「服务器在 rN 的样子」。
+pub fn svn_repo_obstructed() -> SvnFixture {
+    let fx = svn_repo();
+    let wc = fx.wc();
+    std::fs::remove_file(wc.join("Code/A.cs")).unwrap();
+    std::fs::create_dir(wc.join("Code/A.cs")).unwrap();
+    fx
+}
+
+/// 白名单内放一个 **GBK 编码**的 `.cs`，并在本地改脏它。
+///
+/// 国内 Unity 工程里 GBK 源码很常见。这个 fixture 钉住 spec §16.2 末那条约束：
+/// `svn cat` 的结果必须按字节接收。一旦过了 `String::from_utf8_lossy`，每个非法
+/// 字节会变成 U+FFFD，录进基线就是一棵被悄悄改坏的树——而基线体检**查不出来**
+/// （它比的是磁盘与服务器，不比基线树，spec §6.8.3）。
+pub fn svn_repo_with_gbk_source() -> SvnFixture {
+    let fx = svn_repo();
+    let wc = fx.wc();
+    // `// 中文` 的 GBK 字节：D6 D0 = 中，CE C4 = 文。D6 后面跟着的 D0 不是合法的
+    // UTF-8 续字节（续字节必须是 10xxxxxx），所以这串一定会触发 lossy 替换，
+    // 正是要钉的那种输入。
+    let gbk: Vec<u8> = vec![
+        0x2F, 0x2F, 0x20, 0xD6, 0xD0, 0xCE, 0xC4, 0x0A, 0x63, 0x6C, 0x61, 0x73, 0x73, 0x20, 0x47,
+        0x20, 0x7B, 0x7D, 0x0A,
+    ];
+    std::fs::write(wc.join("Code/Gbk.cs"), &gbk).unwrap();
+    run(&wc, "svn", &["add", "Code/Gbk.cs", "--non-interactive"]);
+    run(&wc, "svn", &["commit", "-m", "r2 gbk", "--non-interactive"]);
+    run(&wc, "svn", &["update", "--non-interactive"]);
+    // 本地改脏——这才是 R2b 真正会调用 cat 的形态
+    std::fs::write(wc.join("Code/Gbk.cs"), b"// local\n").unwrap();
+    fx
 }

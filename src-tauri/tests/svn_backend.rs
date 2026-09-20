@@ -251,15 +251,29 @@ fn keys_of(v: &serde_json::Value) -> Vec<String> {
 }
 
 #[test]
-fn preflight_serializes_to_camel_case() {
+fn preflight_serializes_to_camel_case_and_keeps_the_dirty_list_off_the_wire() {
     let json = serde_json::to_value(app_lib::engine::svn_preflight::Preflight {
         node_rev: 7,
         repos_root: "file:///x".into(),
         uuid: "u".into(),
+        // 非空，否则「它没被序列化」这件事证明不了——空 Vec 序列化出来也是看不见的
+        dirty: vec![app_lib::engine::svn_xml::StatusEntry {
+            path: "Code/A.cs".into(),
+            item: "modified".into(),
+            props: "none".into(),
+            wc_locked: false,
+        }],
     })
     .unwrap();
     assert_eq!(keys_of(&json), vec!["nodeRev", "reposRoot", "uuid"]);
     assert_eq!(json["nodeRev"], 7);
+    // `dirty` 带 `#[serde(skip)]` 是有意的：真实工程上它可能有几千条（白名单底下
+    // 每个未版本控制文件都算），而前端一条都不需要。这条断言防的是有人顺手把
+    // skip 去掉——那会让每次 preflight 都往 IPC 上搬几千条路径。
+    assert!(
+        json.get("dirty").is_none(),
+        "脏清单不该过 IPC。实际 JSON：{json}"
+    );
 }
 
 #[test]

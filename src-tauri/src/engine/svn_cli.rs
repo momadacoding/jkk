@@ -38,6 +38,37 @@ pub fn run_svn(path: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// 同 [`run_svn`]，但把 stdout 按**原始字节**返回，且把退出码和 stderr 一起给出去。
+///
+/// # 为什么不能复用 `run_svn`
+///
+/// [`run_svn`] 走 `String::from_utf8_lossy`。那对 `--xml` 输出是对的（svn 的 XML
+/// 声明是 UTF-8），但对 `svn cat` 是**破坏性**的：源码文件很可能不是 UTF-8——国内
+/// Unity 工程里 GBK 的 `.cs` 很常见——lossy 会把每一个非法字节换成 U+FFFD，
+/// 而那棵被悄悄改坏的树录进基线之后，**基线体检查不出来**（体检比的是磁盘与
+/// 服务器，不比基线树，spec §6.8.3）。
+///
+/// 返回 `SvnBytes` 而不是 `Result<Vec<u8>>`：`svn cat` 的失败里有一种
+/// （`E195002`，本地 add 了没提交）是**正常分类结果**而非错误，调用方必须看得到
+/// stderr 才能分辨，见 [`crate::engine::svn_pristine`]。
+pub fn run_svn_bytes(path: &str, args: &[&str]) -> Result<SvnBytes> {
+    let output = svn_command(path).args(with_global(args)).output()?;
+    Ok(SvnBytes {
+        code: output.status.code().unwrap_or(-1),
+        stdout: output.stdout,
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+/// [`run_svn_bytes`] 的结果。stdout 是字节，stderr 仍按字符串给——诊断信息是
+/// svn 自己产的、一定是 UTF-8，而且要拿去匹配错误码。
+#[derive(Debug, Clone)]
+pub struct SvnBytes {
+    pub code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: String,
+}
+
 /// 同 [`run_svn`]，但把**退出码和 stderr 都交给调用方判断**，非零不算失败。
 ///
 /// ⚠️ **不要照抄 `git_cli::run_git_code` 只返回 `(code, stdout)` 的形状。**

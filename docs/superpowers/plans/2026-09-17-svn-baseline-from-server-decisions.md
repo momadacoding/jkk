@@ -1,0 +1,557 @@
+# 基线改从服务器录 · 决策日志
+
+> 配套计划：`2026-09-17-svn-baseline-from-server.md`。按 `AGENTS.md` §2.1，本文件在动第一个 Task 之前建好，随实现进同一个 PR，是 review 的输入。
+> **Review 请先读「偏离计划」条目再看 diff。**
+
+## 进度总账
+
+| Task | 内容 | 状态 | 产出文件 | 验证 |
+|---|---|---|---|---|
+| 0 | spec 修订（§6.5 P1 / §6.3.1 / §6.8.7 / §16.1 / §16.2 / §13 / §14.2 / §18） | ✅ `19ed981` | `specs/2026-09-12-svn-git-hybrid-design.md` | 纯文档；八条未知已实测（见下） |
+| 1 | `run_svn_bytes` + `svn cat -r BASE` | ✅ | `svn_cli.rs`、`svn_pristine.rs`（新）、`tests/svn_pristine.rs`（新，6 例）、fixture `svn_repo_with_gbk_source` | fmt ✓ / clippy 0 警告 / cargo test **497 passed, 0 failed, 39 个二进制**（基线 491/38） |
+| 2 | P2 忽略 `revision="-1"` | ✅ | `svn_xml.rs`、`svn_preflight.rs`、`tests/svn_xml.rs`（+2 例） | fmt ✓ / clippy 0 警告 / cargo test **499 passed, 0 failed** |
+| 3 | P1 收窄到只拦 `~` | ✅ | `svn_preflight.rs`、`tests/svn_preflight.rs`、`tests/svn_init.rs`、`tests/svn_backend.rs`、fixture `svn_repo_obstructed` | fmt ✓ / clippy 0 警告 / cargo test **501 passed, 0 failed** |
+| 4 | R2a 分类 | ✅ | `svn_dirty.rs`（新）、`tests/svn_dirty.rs`（新，8 例） | 见下方合并验证 |
+| 5 | `TempIndex` blob 替换 / 条目删除 | ✅ | `git_cli.rs`（`run_git_stdin`）、`svn_baseline.rs`、`tests/svn_baseline.rs`（+6 例） | 同上 |
+| 6 | `record_server_tree`，init 与 rebuild 共用 | ✅ | `svn_init.rs`、`tests/svn_init.rs`（+2 例） | 同上 |
+| 7 | 期望集合改服务器口径 | ✅ | `svn_include_check.rs`（`server_expected_set`）、`tests/svn_exclude.rs` | 同上 |
+| 8 | 体检判据 `D \ S == ∅` | ✅ | `svn_health.rs`、`tests/svn_health_dirty.rs`（新，5 例）、`tests/svn_health.rs` | 同上；**变异测试已跑**，见下 |
+| 9 | R3c 复查 `nodeRevs` | ✅ | `svn_preflight.rs`（`read_node_rev`）、`svn_init.rs`、`tests/svn_preflight.rs`（+1 例） | 同上 |
+
+Task 4–9 合并验证（它们是一个不可分割的交付单元，见下方「偏离计划」）：
+`cargo fmt` ✓ / `cargo clippy --all-targets` **0 警告** / `cargo test` **523 passed, 0 failed, 41 个二进制**（Task 3 时 501/39，改动前 491/38）。
+零 SVN 写操作审计复跑：产品代码实际发出的 svn 子命令是 `--version` / `cat` / `diff` / `info` / `log` / `ls` / `propget` / `status`，全部只读；grep 到的 `add` / `checkout` 经逐条核对都是 **git** 调用（`svn_baseline.rs:105` 走 `run_git_env`，`svn_init.rs:316` 走 `run_git`）。
+| 10 | 前端文案 | ✅ | `svnInit.ts`、`RepoTab.tsx`、`tests/vitest/svnInit.test.ts` | `pnpm build` ✓ / `pnpm test` **336 passed / 24 文件**（改动前 333/24） |
+| 11 | 文档收口 | ✅ | `e2e/2026-09-15-svn-phase1c-e2e.md`（新增场景 4′ / 5′）、本文件 | 纯文档 |
+
+---
+
+## Task 0（spec 修订）
+
+### 偏离计划
+
+- **本轮没有走 brainstorming → spec → plan 的完整流程。** 方案 A/B/C 的比较、B 的选定都发生在 Phase 1c 的会话里（用户先问「解释一下方案 B」，再选「现在就开 B 的分支」），所以本轮直接从 spec 修订起步。
+- **计划文档没有按 `superpowers:writing-plans` 的惯例把每个 Step 的完整代码写进去。** 那个惯例是为「交给一个对本仓库零上下文的工程师」准备的；本期由本会话自己实现，且 §16.1/§16.2 已经把命令形状逐条写死在 spec 里，再抄一遍是双维护。计划里保留的是文件映射、接口签名和测试清单——那三样才是 review 真正要对的东西。
+
+### 计划的错误
+
+（本轮由 spec 直接生成计划，尚无。）
+
+### 计划没写的坑
+
+- **放松 P1 会直接打坏 P2。** `svn_preflight::check_single_node_rev` 把 `svn add` 未提交节点的 `revision="-1"` 收进 `nodeRevs`，靠「P1 先拦住这类节点」才没暴露；代码注释原文：「负数只可能来自 `svn add` 了没提交的节点，而那种节点 P1 已经拦住了」。P1 一放松，任何一个未提交的新文件都会让用户看到「mixed-revision，请先跑一次完整 svn update」——一条做了也没用的引导。因此计划里把它提成独立的 Task 2，排在 Task 3 之前。写 spec 时没看见这条，是读实现才发现的。
+- **`-r N` 会让重建变成联网操作。** 实测 `svn cat -r 1` 在仓库不可达时报 `E170013`，而 `-r BASE` 走 `.svn/pristine`、离线照常返回。差点按直觉把 `-r N` 写进 spec（trailer 里记的就是 N，看起来最自然）。等价性由 P2 的 `nodeRevs` 单值授权，已写进 §16.2。
+- **`svn cat` 会展开 `svn:keywords`，且展开的是该 revision 的值。** 原本担心它返回未展开的 `$Id$`，那样基线里的这类文件会和同目录干净文件形态不同，工作分支上凭空多出假 diff。实测不存在这个问题。
+- **`run_svn` 的 `String::from_utf8_lossy` 不能用于 `cat`。** 它是给 `--xml` 输出准备的。国内 Unity 工程的 `.cs` 很可能是 GBK，lossy 会把每个非法字节换成 U+FFFD，录进基线就是一棵被悄悄改坏的树，而且体检查不出来（`svn diff` 比的是磁盘与服务器，不比基线树）。
+- **`svn:executable` 与文件 mode。** Windows 上 `core.fileMode` 通常为 false，`git add` 一律给 100644。`replace_blob` 因此不自己判断 mode，而是沿用该路径在候选索引里已有的 mode，`D` / `!` 这类索引里没有的才退回 100644——避免替换动作顺手改掉一个与本期无关的属性。
+
+### 为什么这么改是安全的
+
+- **对工作目录全程只读。** 新增的唯一 svn 子命令是 `cat`，它只往 stdout 吐字节（B1 实测：磁盘前后逐字节相同）。本期仍然零 SVN 写操作，`revert` / `update` / `commit` 一行都不出现在 `src-tauri/src/` 里。这条要在每个 Task 结束时用 grep 复核，不能只在开头声明一次。
+- **「录出来的树 == 服务器 rN」有完整论证，不是直觉。** 见 §16.1：对 `f ∉ S` 由体检判据 `D \ S == ∅` 推出磁盘 == 服务器；对 `f ∈ S` 由构造保证；文件集合由 §6.3.1 单独管。三条合起来才成立，缺一条都不行——所以 Task 6、7、8 必须一起做完才算一个可交付点。
+- **窗口期竞态只会误拦，不会静默录错。** 四种情形逐一数过（§16.1 的表），最坏是用户重点一次按钮。再加 R3c 复查 `nodeRevs` 兜一层。
+- **判据被削弱时有唯一的警报。** Task 8 Step 4 的变异测试（把 `S` 放大成全集）必须能让测试 76(b) 由绿转红。这是「S 必须恰好」这条约束唯一的自动化保障，变异结果要记进本文件。
+- **为什么不直接放行脏工作副本（把磁盘录进去）。** 那会让用户自己的改动被算进基线，Phase 3 交付时因为「和基线一样」而不在交付集合里，**静默消失**。比拒绝糟得多。这是初版那条 clean 门槛存在的真正理由，本轮换的是录制来源，不是拆门槛。
+
+---
+
+## Task 1（`run_svn_bytes` + `cat_base`）
+
+### 偏离计划
+
+- 计划里 `cat_base` 的返回类型写的是 `Result<BaseContent>`，实现照此；但 `run_svn_bytes` 的返回从计划里的 `Result<Vec<u8>>` 改成了 `Result<SvnBytes>`（带 `code` / `stdout` / `stderr`）。原因见下——不给出 stderr 就分不出「服务器上没有这个文件」和「取数失败」，而这两者的处理完全相反。
+
+### 计划的错误
+
+- 计划 Task 1 Step 3 写着「`E195002` 从 stderr 识别」。**错的，而且是我自己的 B3 实测结论误导了自己。** B3 当时跑的是 `svn cat -r 1`，得到 `E195002: has no committed revision`；实现改用 `-r BASE` 之后错误码变成了 **`E200009: has no pristine version until it is committed`**。照 B3 的结论写死 `E195002`，一个未提交的新文件就会掉进「取数失败」分支，整条重建在最常见的开发状态下直接崩。
+  - 现在两个码都认，并在注释里写清它随 `-r` 的写法变化。
+  - 教训写在这里是因为它有普遍性：**换了参数形式就等于换了一条命令，之前的实测结论不自动适用。**
+
+### 计划没写的坑
+
+- **`E200009` 是个偏通用的错误码（ILLEGAL_TARGET），不能拿它当分类的权威来源。** 所以 `NotOnServer` 被降级成一层**交叉校验**：真正决定「哪些文件从树里剔除」的是 `svn status`（R2a，Task 4），那些文件根本不会走到 `cat_base`。调用方若对一个「本该在服务器上」的文件拿到 `NotOnServer`，说明分类与实际不符，必须**中止**而不是静默把文件丢掉。这一条要在 Task 6 的实现里兑现。
+- **`svn cat` 接受 `--` 分隔符**（实测通过），所以路径以 `-` 开头也安全。
+- 空路径显式拒绝（`svn_pristine_empty_path`）。`AGENTS.md` §6.2 记过本仓库因空 pathspec 误伤过一次，这类边界一律不交给外部命令去猜。
+
+### 我自己写错的测试（照实记）
+
+`cat_base_preserves_non_utf8_bytes` 第一版加了一条 `assert!(!String::from_utf8_lossy(&got).contains('\u{FFFD}'))`。**这条断言是反的**：那串字节本来就不是合法 UTF-8，对它做 lossy 转换必然产生 U+FFFD，任何正确实现都过不去。真正要证的是「没走 lossy 那条路」，所以改成比对 `got` 与「把 got 过一遍 lossy 之后的样子」不相等，再加一条长度断言（lossy 会把 2 个非法字节膨胀成 3 字节）。
+
+同一个文件里字节比对那条断言从头到尾是绿的——也就是说**实现一次就对了，红的是我的断言**。记下来是因为它正好是 `AGENTS.md` §13 第 9 条的反面教材：一条名字叫「保持非 UTF-8 字节」的断言，测的却不是那件事。
+
+### 为什么这么改是安全的
+
+- `cat_base` 只读。`cat_base_returns_server_bytes_for_a_locally_modified_file` 用「取数前后磁盘逐字节相同」+「用户的本地修改原样还在」两条断言钉住这一点，不是靠声明。
+- 离线可用由 `cat_base_works_without_the_server` 钉住：把仓库目录移走之后仍然返回服务器内容。这条测试同时也是「实现没写成 `-r <数字>`」的证明——写成数字的话它会是 `E170013`。
+
+---
+
+## Task 2（P2 忽略 `revision="-1"`）
+
+### 计划没写的坑
+
+- **「全部节点都还没提交」需要一条独立的错误。** 把负数滤掉之后，如果白名单指向的内容整个都是本地新增的（还没进过 SVN），`nodeRevs` 会变成空集，于是掉进既有的那条空集守卫——而它的文案是「最常见的原因是漏了 `-v`」。那句话在这里完全是误导。新增错误码 `svn_xml_all_nodes_uncommitted`，说清真实原因是「这些文件还没提交到 SVN，录不出服务器在 rN 的样子」。
+- **过滤放在 `parse_node_revs` 而不是调用点。** 理由是语义：`nodeRevs` 问的是「工作副本停在哪个**服务器** revision」，一个未提交的节点对这个问题无可奉告，它就不该进这个集合。放在调用点的话，将来任何一个新调用点都要自己记得滤一遍。
+
+### 实测（先测后改）
+
+计划 Step 1 要求先用真实 svn 确认形状，因为「未提交的 add 带 `revision="-1"`」是从代码注释里读来的、不是本会话验过的。实测确认属实：
+
+```xml
+<entry path="Code\Added.cs">
+<wc-status item="added" revision="-1" props="none">
+```
+
+`parse_node_revs` 改动前对这份真实输出返回 `[-1, 1]`，改动后返回 `[1]`。
+
+### 为什么这么改是安全的
+
+- `svn_preflight::check_single_node_rev` 里那条 `u64::try_from` 的失败分支**保留着**，只是含义变了：它从前意味着「P1 没有先于 P2 执行」，现在意味着「`parse_node_revs` 的过滤被人删了」——一个实现缺陷的警报，不是用户工作副本的问题。注释已同步改写，没有留下一句过期的论证。
+- mixed-revision 的正常拦截不受影响：39 个 `svn_xml` 测试与全量 499 个测试全绿，其中包含既有的 mixed-revision 回归。
+
+---
+
+## Task 3（P1 收窄到只拦 `~`）
+
+### 偏离计划
+
+- **没有新建 `DirtyEntry` 类型，直接复用 `svn_xml::StatusEntry`。** 它已经带着 `path` / `item` / `props` / `wc_locked` 四个字段，而且 `path` 已经是**仓库相对 + 正斜杠**（实测：从 wc 根以 `Code@` 为 target 跑 status，得到的是 `Code\Added.cs`，解析层归一成 `Code/Added.cs`）——正好就是 R2a 要的形状。再造一个平行类型只会多一次转换和一处可能走偏的地方。
+- **`dirty` 字段带 `#[serde(skip)]`，不过 IPC。** 计划里没提这一层。真实工程上这份清单可能有几千条（白名单目录底下每个未版本控制文件都算），前端一条都不需要。`svn_backend.rs` 里那条 JSON 形状测试已改成**构造一个非空的 `dirty` 并断言它不出现在 JSON 里**——空 `Vec` 序列化出来也是看不见的，用空值测证明不了任何事。
+
+### 计划没写的坑
+
+- **有四条既有测试编码的是旧行为，必须翻面而不是删掉。** 它们每一条都还承载着一个仍然成立的不变量，删掉就等于把覆盖率悄悄降下去：
+
+  | 测试 | 原来证明什么 | 翻面后证明什么 |
+  |---|---|---|
+  | `p1_rejects_every_dirty_state` | 四种脏都被拒 | 四种脏都**放行**且如实进清单（覆盖面不变，仍是四种真实形态） |
+  | `p1_must_pass_no_ignore_…` | `--no-ignore` 没被删 | 同左——被 `svn:ignore` 挡住的 `.cs` 仍必须**被看见**，否则会被录进基线 |
+  | `p1_rejects_svn_ignored_files_outside_the_extension_list_too` | 非代码文件也拦 | 非代码文件也**进清单**（过滤是下游的事） |
+  | `p1_catches_a_dirty_file_inside_a_same_repo_nested_external` | `check_targets` 覆盖了嵌套 external | 同左，而且**比从前更要紧**——清单现在是 R2a 的输入，漏掉这条会让 external 里的脏文件被原样录进基线，直接产出假基线，不再只是「少了一道拦截」 |
+
+- **`item="normal" props="modified"`（纯属性变更）要进 `dirty`、但不能进 `S`。** 清单是「非 pristine」的如实转述，所以它进清单；而 R2a 会把它判成「不用动」——属性变了内容没变，换不换字节都一样，让它进 `S` 会**削弱**体检判据（§16.1「S 必须恰好」）。这两层的分工写在 `collect_dirty` 的注释里。
+- **`svn status` 报 obstructed 的 item 字面量就是 `"obstructed"`**（实测，`svn_repo_obstructed` fixture：把 `Code/A.cs` 换成同名目录）。
+
+### 为什么这么改是安全的
+
+- 放行本身不会让基线变松。真正的把关从「事前拒绝用户」移到了「事后证伪基线」——录制来源改成服务器内容（Task 6），体检判据改成 `D \ S == ∅`（Task 8）。**这三条必须一起成立**，所以 Task 3 单独落地时 `init_hybrid` 在脏工作副本上会录出错误的基线，这一段中间状态不可交付，已在计划里写明。
+- `~` 拦住之后**磁盘原样**，由 `p1_still_blocks_an_obstructed_node` 与 `rebuild_refuses_only_when_a_node_is_obstructed` 两条各自断言（前者查目录还在，后者查目录还在）。不自动修复这条立场没有松动。
+- `a_clean_working_copy_reports_an_empty_dirty_list` 钉住「干净时 `S = ∅`」——这是 §6.8.7 那条判据退化成 `D == ∅` 的前提，也是 S7 / 恢复⑥ / D7a 三个既有入口行为不变的依据。
+
+---
+
+## Task 4–9（录制改从服务器取 + 新判据）
+
+### 偏离计划
+
+- **Task 6 与 Task 7 合并成一个提交。** `record_server_tree` 的测试离不开集合口径的改动：脏工作副本上 `verify_include_set` 会立刻报「多收 / 漏收」。硬拆的话 Task 6 只能带着一个红测试进仓库。
+- **Task 9（R3c）提前并入同一批。** 它只有几行，而且和 rebuild 的编排在同一个函数里，单独拆一个提交没有任何 review 收益。
+- **多出一个计划里没有的公开函数 `svn_dirty::explained_paths`。** 计划里「算 `S`」这件事散在三处（录制、录制后体检、手动体检）。三份各写一遍，迟早有一份会和另外两份不一致，而不一致的方向若是「多算了」，判据就被削弱且没有信号。抽成一个函数之后**录制和体检用的是同一个集合对象**，不是两次独立计算的结果。
+- **多出一个 `svn_dirty::read_dirty`（把读 status 从 `svn_preflight` 下沉）。** 原因见下面「计划没写的坑」第一条。
+
+### 计划的错误
+
+- **计划没发现「手动体检」有和重建一模一样的病。** `check_current_baseline` 的前置门槛是「磁盘内容必须与基线树逐字节相同，否则返回 `NotChecked`」——工作副本一脏就永远是「没法下结论」。那和 §16.1 里那条「工作副本必须干净」是**同一个死胡同，只是换了颗按钮**；Phase 1c 刚加上去的「体检基线」按钮等于从一开始就不可用。
+  - 已一并改用 §6.8.7 的判据，而且**比原来更强**：原来「基线树与磁盘不一致」一律落 `NotChecked`，现在解释不了的那些会被算成证据（`Health::Lying`）。
+  - 相应地，`the_manual_health_check_does_not_call_ordinary_wip_a_lying_baseline` 从「断言 NotChecked」改成「断言 Verified」——测试的用意（别把普通 WIP 指控成假基线）没变松，反而更强：从前只要求「别说它坏」，现在要求「能给出一个肯定的答案」。
+
+### 计划没写的坑
+
+- **`read_dirty` 必须与「判 `~`」分开。** 服务器侧核对（`svn_server_set`）也要这份清单，但它跑在「打开仓库」这条热路径上，**不能**因为一处 obstructed 就让仓库打不开。所以读取下沉到 `svn_dirty::read_dirty`，阻断判定留在 `svn_preflight`。
+- **`-r BASE` 下未提交的 add 报的是 `E200009` 而不是 `E195002`**（Task 1 已记）。由此引出一条设计决定：`BaseContent::NotOnServer` **不作为分类的权威来源**，因为 `E200009` 是个偏通用的错误码（ILLEGAL_TARGET）。真正决定「哪些文件剔除」的是 `svn status`；`record_server_tree` 若对一个「本该在服务器上」的文件拿到 `NotOnServer`，会以 `svn_baseline_classification_conflict` **中止**，而不是猜一个。
+- **`read-tree` 绝对不能带 `-u`。** 基线树现在是服务器内容、磁盘是用户改过的内容，带 `-u` 会拿前者覆盖后者——本期最不能犯的错。已由 `after_init_git_status_is_exactly_the_users_existing_local_svn_changes` 钉住（断言磁盘内容逐字节原样、被删的文件不许被复活）。
+- **`git diff-tree` 必须带 `-z`。** 不带的话 `core.quotePath` 会把非 ASCII 路径转义成 `"Code/\350\247\222..."`，与 svn 侧算出来的 `S` 永远对不上。
+
+### 为什么这么改是安全的
+
+- **`S` 只有一个来源。** `record_server_tree` 先用 `explained_paths` 算出 `S`，**再拿它驱动改写**（`if !touched.contains(path) { continue }`），最后把同一个集合交给体检。不存在「改写用一份、体检用另一份」的可能。
+- **变异测试已跑，结果与 §16.1 的预测逐字吻合。** 把 `S` 从 `∅` 放大成 `{Code/A.cs}`（模拟「取超集」这个最容易犯的错）之后：
+
+  ```text
+  a_baseline_claiming_a_revision_the_disk_never_reached_is_caught ... FAILED
+      实际：Verified { rev: 2 }          ← 谎话被 S 盖住了
+  其余三条 ... ok                        ← 包括「不误报」那条
+  ```
+
+  也就是说**只有有牙齿那条会响**。这正是这两组断言必须成对写在同一个文件里的理由：单独留下「不误报」那半，判据被削弱时没有任何信号。变异已撤销。
+- **磁盘只读有直接证据，不是靠声明。** `rebuild_records_server_content_on_a_dirty_working_copy` 对白名单子树做了完整的「重建前后逐文件字节快照」比对，外加 `git status --porcelain` 前后一致。
+- **既有行为没有被改松。** 干净工作副本上 `S = ∅`，判据退化成 §6.8.2 的 `D == ∅`，由 `the_criterion_degenerates_to_the_original_one_on_a_clean_working_copy` 钉住；`svn_health.rs` 里 11 处既有调用全部显式传空集并保持绿，`svn_exclude.rs` 的两处同理。
+
+### 没有自动化覆盖的部分（如实说明）
+
+**测试 81「重建窗口期的外部改动」只覆盖了一半。** `rebuild_baseline` 是一次调用，中间没有注入点，无法在「读完脏清单」和「跑体检」之间插入一次外部 commit。与其写一条名字叫「覆盖竞态」而实际测不到竞态的测试（`AGENTS.md` §13 第 9 条明写这属于阻断级的虚假信心），拆成两半各自真测：
+
+| 竞态表里的行 | 覆盖方式 |
+|---|---|
+| 干净文件在抓拍后被改脏 | `a_file_that_got_dirty_after_s_was_captured_still_blocks`——直接喂一份**过期的 `S`**，断言判据中止。这就是该场景的真实形态 |
+| 外部 commit 把 BASE 推到 N+1 | `read_node_rev_reports_the_current_value_without_running_the_other_checks`——只验 R3c 这道守卫本身读得对、且不会被 obstructed 之类的无关状态干扰 |
+| 两者串起来的真实交错 | **没有自动化覆盖。** 需要在 `rebuild_baseline` 里开一个测试专用的注入点，那个代价（往产品代码里加一个只为测试存在的 seam）大于收益 |
+
+---
+
+## Task 10–11（前端文案与文档）
+
+### 偏离计划
+
+- 计划 Task 10 Step 4 写着「在真实 `pnpm tauri dev` 窗口里点一次重建」。**没有执行**，理由见下方「没有执行的验证」。
+
+### 计划没写的坑
+
+- **`svn_preflight_dirty` 这个错误码整条删掉了，而不是改文案。** 它对应的状态已经不存在。留着一条说「请先去 TortoiseSVN 提交或还原」的引导，会把用户推回那个已经不存在、而且从来就走不通的死胡同。加了一条 `不再有 svn_preflight_dirty 这个错误码的条目` 的断言守着。
+- **「后端消息已说过的就不重复」那条抑制逻辑按前 12 个字判重**，所以翻新测试时喂进去的后端消息必须与表里那条**开头一致**，否则测的就不是抑制逻辑而是别的东西。翻新时改对了，记在这里免得下一个人踩。
+- **`svn_baseline_lying` 的文案要先撇清「不是你的本地修改」。** §6.8.7 之后本地修改已被 `S` 排除在外，但一个手上有改动的用户看到「基线与服务器不符」会立刻把两件事联系起来，然后去做一件完全没用的事（清理工作区）。
+
+### 没有执行的验证（如实说明）
+
+**没有跑 `pnpm tauri dev` 的真实窗口。** 判断依据：
+
+- **没有任何 `#[tauri::command]` 的签名改动。** `Preflight` 新增的 `dirty` 字段带 `#[serde(skip)]`，IPC 上的 JSON 形状逐字不变，并由 `preflight_serializes_to_camel_case_and_keeps_the_dirty_list_off_the_wire` 断言（构造非空 `dirty` 再断言它不出现在 JSON 里）。所以 `AGENTS.md` §7.3 那条「签名改动必须实际跑一次 `pnpm tauri dev`」的触发条件不成立。
+- 改动的 UI 是一段确认对话框文案和一张错误码→引导语的映射表，不涉及布局、滚动或渲染，vitest 已覆盖文本本身。
+- 真实窗口的点击验证是用户正在做的 E2E，对应新写的**场景 4′ / 5′**。
+
+不写成「已验证」是因为它确实没验过。
+
+---
+
+## 补 Task（2026-09-18）：`hash-object` 漏了 `--path`，两条录制路径分叉
+
+### 计划的错误 / 我自己的错误
+
+用户提出「能不能靠 `git stash` 让工作副本干净，从而照旧从磁盘录基线」，去实测这条路的
+过程中**查出我已经写完并推上去的 B 里有一个真 bug**：
+
+```text
+干净文件： git add -A            → 跑过滤器（autocrlf 等）
+脏文件：   hash-object --stdin   → **默认一个都不跑**
+```
+
+本机 `core.autocrlf=true`。一个 `svn:eol-style=native` 的文件，磁盘是 `"n1\r\n"`，
+`git add` 进 blob 是 `"n1\n"`，`hash-object --stdin` 是 `"n1\r\n"`——**同一个文件在
+基线里长什么样，取决于它当时脏不脏**。在脏工作副本上重建一次就会把行尾整个翻一遍，
+工作分支上凭空出现「每一行都改了」的假 diff。
+
+**为什么 B4/B6 没抓住它**：那两条比的是「`svn cat` 的字节 vs 磁盘的字节」，而 bug 在
+下一环——那些字节变成 git blob 的过程。测到了链条的前半截就以为覆盖了整条链，这是
+这次的教训。
+
+修法：`git hash-object -w --path <该路径> --stdin`。对齐基准必须是 `git add`，因为树里
+绝大部分内容是它录进去的。
+
+回归测试 `recording_a_file_produces_the_same_blob_whether_it_was_dirty_or_not`：同一个
+文件分别在干净与脏的状态下各录一次，blob 必须逐字节相同。**变异验证已跑**——拿掉
+`--path` 立刻变红（`left: [110,49,13,10]` vs `right: [110,49,10]`）。
+
+### 计划没写的坑
+
+- **`git stash` 清不掉 SVN 侧的脏**，实测四种脏一种都没解决：`.psd` git 根本不跟踪；
+  `A` / `D` 的登记记在 `.svn/` 里 git 碰不到（`A` 还退化成了更糟的 `!`）；`M` 的那个
+  被 autocrlf 改了行尾，svn 照样报 `M`。`stash pop` 之后还多出一条新的损坏
+  `! Code/Deep`（git 重放删除时把空目录一并删了）。已写进 spec §16.2.2。
+- **同一个发现对 Phase 2 的 `sync_in` 也成立**：S1 的 `git stash push` 与 S10 的
+  `git stash apply` 都会把没设 `svn:eol-style` 的文件还原成 CRLF，最坏后果是 Phase 3
+  把一整批纯行尾变化提交到 SVN。已写进 spec §7.3.0，标注**尚未验证也未修复**，
+  列了三条可能的出路，要求 Phase 2 开工时先定。**不在本期修**——那是另一条流程。
+
+### 为什么这么改是安全的
+
+- 改动只有一处（多一个 `--path` 参数），影响面是「脏文件替换进去的 blob 会跑与
+  `git add` 相同的过滤器」，方向是让两条路径**一致**，不是引入新行为。
+- 全量 524 passed / 0 failed；clippy 0 警告。
+
+---
+
+## 补 Task（2026-09-19）：服务器侧核对把本地删除报成了漏收
+
+### 我自己的错误（用户在真实窗口里抓到的）
+
+用户跑测试指引的场景 2，`svn delete Code\Deep\D.cs` 之后界面弹出黄色横幅
+**「服务器上有代码文件不在本地，git 没有在保护它们」**，列着那个文件。
+
+误报，而且方向正好相反：那个文件**恰恰在基线里**——录制时 `svn cat -r BASE` 把它
+取回来了（§16 R2a 的「取回 BASE」）。git 保护得好好的，用户只是主动删了它。而这条
+提示的措辞指控的是 `--set-depth=exclude` 那类**用户不知情**的漏收。
+
+**根因是我做 Task 7 时的漏做。** 当时就识别出了这个风险，也为此写了
+`server_expected_set`（磁盘 − `{A,?}` + `{D,!}`），但只把 `verify_include_set`
+接了上去，**`audit_server_set` 忘了改**，它仍在用遍历磁盘的 `expected_set`。
+本地删掉的文件服务器上有、磁盘上没有，正好落进 `server − disk` 这个差集。
+
+修法：`audit_server_set` 改用 `server_expected_set`，脏清单经
+`read_dirty` + `classify` 取得——与录制路径**同一对函数**，两份一旦分叉，这条核对
+报的「缺失」就会和基线里的实际内容对不上。读不到脏清单时返回 `NotChecked` 而不是
+硬算一个可能误报的集合出来（这条检查是锦上添花，§6.3.1 明写它不参与任何门槛）。
+
+### 计划没写的坑
+
+- **误报的代价不止是噪音。** 这条提示要抓的那类缺陷（`--set-depth=exclude`，
+  磁盘上压根看不见的漏收）是四道检查全绿时**唯一**的信号。让它在每次本地删除时
+  都响一遍，用户很快就会学会忽略它，等于把那道信号也一起废了。
+
+### 为什么这么改是安全的
+
+- 两条新回归测试**成对**：`a_locally_deleted_file_is_not_reported_as_missing`
+  （不误报）与既有的 `a_depth_excluded_subtree_is_reported_as_missing`（真漏收
+  仍然要报）。另加 `a_locally_added_but_uncommitted_file_is_not_reported_either`
+  守住 `{A,?}` 那一项没被弄反。
+- **变异验证已跑**：把比对对象换回 `expected_set` 之后，新测试立刻变红并复现出
+  用户截图里那条 `Missing { files: ["Code/Deep/D.cs"], total: 1 }`；与此同时
+  depth-excluded 那条**仍然是绿的**——说明这次修复没有把该报的那类一起关掉。
+- 全量 526 passed / 0 failed；clippy 0 警告。
+
+---
+
+## 补 Task（2026-09-19）：服务器侧核对改成自动重跑
+
+### 计划没写的坑（用户在真实窗口里抓到的）
+
+用户测 1c 清单的场景 6（`svn update --set-depth=exclude`）时，**黄条根本不出现**。
+
+后端没问题：`cargo test --test svn_server_set` 11 passed，其中
+`a_depth_excluded_subtree_is_reported_as_missing` 覆盖的正是这个形态，配套的
+`the_existing_checks_really_do_miss_a_depth_excluded_subtree` 还断言了 P1/P2/P3
+与体检确实都看不见它。
+
+真正的原因是**前端根本没重跑过这条检查**：`refreshSvnAudit` 只有两个调用点
+——打开仓库、点过「重建基线」之后。文件监听那条通道（`repo-changed`）上挂的是
+`checkSvnSyncIfChanged`，只刷失同步。E2E 文档里那句「存个文件或切标签」是
+写的时候就错的（那份清单一次都没跑过）。
+
+### 偏离计划
+
+计划里没有这一项。用户看到诊断后当场决定要补，并明确排除了手动按钮：
+
+> 手动点击来触发的方式是不行的，没人会记得去主动点击这个按钮，它不是工作流的
+> 一部分，所以不应该强制让用户去点击这个；后台定时检测估计也可以
+
+这条判断是对的，而且是这条检查的**根本约束**：它要抓的是 `--set-depth=exclude`
+那类**用户不知情**的漏收——SVN 侧四道检查全绿、磁盘上也看不见。不知道出事的人
+不会去点一颗写着「检查一下有没有出事」的按钮。做成手动入口，等于只在用户已经
+怀疑的时候才提供，而那时它多半已经晚了。
+
+### 做法
+
+| 触发点 | 限频 | 理由 |
+|---|---|---|
+| 打开仓库（既有） | 无 | 显式，权威 |
+| 重建基线之后（既有） | 无 | 同上 |
+| **窗口重新获得焦点**（新） | `SVN_AUDIT_MIN_GAP_MS` = 1 分钟 | 用户刚从 TortoiseSVN / 终端切回来，正是最可能刚出事的时刻 |
+| **定时器**（新） | `SVN_AUDIT_POLL_MS` = 5 分钟 | 兜底：应用一直开着、后台脚本动了工作副本 |
+
+限频判据下沉成 `src/engine/svnSync.ts` 的纯函数 `auditIsDue(now, lastAt, inFlight)`
+——写在 effect 里的分支在 vitest 里测不到，而这段恰恰是「会不会把服务器打爆」
+的那一段。
+
+### 为什么这么改是安全的
+
+- **最坏情况有界**：核对要发 `svn ls -R`（网络，大仓库上秒级）。闸把频率钉在
+  每分钟一次；`inFlight` 再挡住「上一次还没回来就又发一次」——慢仓库上一次核对
+  可能比间隔还长，不挡的话请求会一层层叠起来。页面不可见时直接跳过。
+- **后台重跑失败不再抹掉已成立的警告**。`refreshSvnAudit` 加了 `keepOnError`：
+  打开仓库/重建那两次仍然「失败写回 null」（那次结果是权威的，留着上一个仓库的
+  结论会把 A 的漏收挂到 B 头上）；后台那次改成**保留上一次结论**。一次网络抖动
+  就把一条真警告降级成沉默，正是这条检查存在的理由所要防的事。
+- **顺手补了一个既有的跨仓库竞态**：核对回来时用 `samePath` 比一下当前 `state.path`
+  再写。这个窗口原来就在（`void refreshSvnAudit(path)` 不 await），后台定时重跑
+  之后概率大了很多。
+- **effect 依赖里不放 `auditSvnIfDue`**：它每次渲染都是新函数，放进去会让定时器
+  每渲染一次重装一次，5 分钟的计时永远归零。本文件里其它 effect 也是同一写法。
+
+### 我自己的错误
+
+第一版 vitest 里写了 `auditIsDue(0, 0, false)` 并断言 `true`——`now` 的真实形态是
+`Date.now()`，1.7e12 量级，永远不会是 0。测试红了之后确认是**断言错**不是代码错，
+改成真实量级的时间戳（`AGENTS.md` §13 #9：测试输入必须是实际场景的形态）。
+
+### 验证
+
+- `pnpm build`（含 tsc）✅、`pnpm test` **341 passed / 0 failed**（改动前 336）。
+- **变异验证已跑**：把 `auditIsDue` 改成 `return true` 之后，`刚跑完就不再跑` 与
+  `上一次还没回来就一律不跑` 两条立刻变红——限频与 in-flight 两道闸都有牙齿。
+- ⚠️ **真实窗口未验证**：定时器与 `focus` 监听是否真的按预期触发，我没有在
+  `pnpm tauri dev` 里跑过。没有改任何 `#[tauri::command]` 签名，Rust 侧零改动。
+  1c 清单场景 6 已改写成可以手工验证这条路径（切窗口 → 黄条出现）。
+
+---
+
+## 补 Task（2026-09-19）：体检报「基线在撒谎」时没有出路
+
+### 计划没写的坑（用户在手工测试中牵出）
+
+用户测 E2E 场景 6 时反馈「app 里面根本就没有重建基线的按钮」。直接原因是文档的
+步骤顺序写错了（同事提交本身不产生失同步，得自己 `svn update`），但顺着查下去
+发现一个真缺口：
+
+**「重建基线」在界面上只由失同步横幅渲染**（`BaselineBanner` 里 `describeSync`
+的 `actions`），同步状态下走 `standalone` 分支，只有「体检基线」。
+
+而 `check_current_baseline` 报 `Lying` **恰恰发生在 revision 完全对得上的时候**
+——横幅不在。于是体检弹框告诉用户「基线与服务器不符，共 N 处」，然后只给一个
+「知道了」，界面上没有任何地方能修它。
+
+这与 2026-09-16 独立 review 修掉的那条是同一个毛病：当时体检入口也被绑在失同步
+横幅上，review 的原话是「等于只在不需要它的时候提供它」。那次只解开了体检。
+
+**本轮把它从理论问题变成了现实问题**：§16.2 之前 `check_current_baseline` 在脏
+工作副本上永远返回 `NotChecked`，`Lying` 基本不可达；现在它真的会报出来。
+
+### 偏离计划
+
+计划里没有这一项。用户看到诊断后决定要补。
+
+### 做法
+
+体检报 `Lying` 时，弹框的 `confirmLabel` 从「知道了」换成「重建基线」；确认后
+调用**已有的** `handleRebuildBaseline`，也就是接着弹重建自己那个确认框。
+
+**为什么是两个框而不是一个**：重建那句「不会修改工作目录里的任何文件，也不会
+推进你的工作分支」只应有一份。在体检这边复制一遍，两处文案迟早说出不同的话
+——这正是 `handleCheckBaseline` 里那句「复用向导那边的同一份翻译」的既有理由。
+代价是多点一次。
+
+### 为什么这么改是安全的
+
+- **`notChecked` 与 `verified` 不给这个入口。** 断网、URL 不可达都落在
+  `notChecked`，那时推用户去重建，等于拿一次网络抖动换一个新基线——而重建要动
+  `svn/base` 指针，旧基线只能从 reflog 找回来。判据下沉成
+  `healthNeedsRebuild`，vitest 覆盖三种状态。
+- **不新增常驻按钮，不动横幅逻辑。** 只改一个 label 和一个分支，
+  `needsStandaloneCheck` 保证的「任何时刻恰好一个体检入口」没有变。
+- **用户取消仍然什么都不做**：`confirm` 返回 `false` 时不调用重建。
+
+### 验证
+
+- `pnpm build`（含 tsc）✅、`pnpm test` **345 passed / 0 failed**（改动前 341）。
+- **变异验证已跑**：把判据改成 `h.status !== 'verified'`（即 `notChecked` 也给
+  入口）之后，`「没验成」不给——它不是「坏了」` 那条立刻变红。
+- ⚠️ **真实窗口未验证**：两个确认框的衔接我没有在 `pnpm tauri dev` 里点过。
+  E2E 场景 10 已改写成会验到它（要求按钮文字必须是「重建基线」）。
+
+---
+
+## 补 Task（2026-09-20）：独立 review 的两条阻断项——svn 按目录报，git 按文件收
+
+### 计划没写的坑（独立 review 发现，实测复现）
+
+一个根因，两种表现。`svn status` 对**目录**级的脏状态只报目录本身，而 git 侧的
+exclude 规则是 `!/<白名单>/**/*.<扩展名>`，**按扩展名递归**。两边粒度不一致。
+
+2026-09-20 在一次性 fixture 上实测（跑完即删）：
+
+| 形态 | 不带 `-v` | 带 `-v` | 目录还在磁盘上吗 |
+|---|---|---|---|
+| 未版本控制的目录 | 只报目录 | **只报目录**（不下沉） | 在 |
+| `svn:ignore` 的目录 | 只报目录 | **只报目录**（不下沉） | 在 |
+| `svn delete` 的目录 | 只报目录 | **目录 + 每个子文件都报 `deleted`** | 不在 |
+| `svn add` 未提交的目录 | 目录 + 子文件都报 | 同左 | 在 |
+
+最后一行说明 `added` 本来就是对的，不用改。
+
+**B1（静默，最严重）**：未版本控制 / ignored 的目录 → `fixes = {"Code/NewDir": Drop}`
+→ `is_w_file("Code/NewDir")` 为 false（不以 `.cs` 结尾）→ `S = ∅` →
+`record_server_tree` 一次 `remove_path` 都不调。而 `git add -A -- Code` 把里面的
+`.cs` 全收了。`svn diff --summarize` 对未版本控制内容一条都不报 ⇒ `D = ∅` ⇒
+`D \ S = ∅` ⇒ **`Verified`**。服务器上不存在的文件躺在一个自称「等于服务器 rN」
+的树里，四道检查全绿。按 §8.5 / D1 这批文件首次交付时会因为「和基线一样」而不在
+净变更里——**静默漏交付**，与 Task 0 里论证「为什么不能直接放行脏工作副本」
+要防的后果逐字相同。
+
+**这是本轮引入的回归**：base 分支 1c 的 `check_clean` 把 `unversioned` 一律硬拦，
+这种工作副本根本进不了初始化。P1 放松之后这条路径第一次可达。
+
+**B2（会响但指错方向）**：`svn delete` 一个目录 → 子文件没进 `S`，而
+`svn diff --summarize` 那一侧**会**报它们 deleted ⇒ `D \ S != ∅` ⇒ `Lying` ⇒
+初始化回退 / 重建中止，文案却说「漏跑了一次完整的 svn update」——跑多少次都没用。
+
+### 做法
+
+改动集中在 `read_dirty` **一个函数**里，四个消费者（录制、录制后体检、手动体检、
+服务器侧核对）自动同步——这正是当初把 `read_dirty` + `classify` 抽成一对的收益。
+
+1. **加 `-v`**：把被 `svn delete` 的目录里的子文件捞出来。代价是干净条目也一并
+   返回，靠既有的 `normal` + `props=none` 过滤掉。
+2. **未版本控制 / ignored 的目录自己走一遍磁盘**（`-v` 帮不上忙，实测不下沉）。
+   新增 `is_plain_dir` + `expand_dir` 两个私有函数。
+
+### 为什么这么改是安全的
+
+- **`S` 仍然恰好**：展开出来的是磁盘上真实存在的**文件**，每一个都会被
+  `explained_paths` 按 `is_w_file` 再过一遍。目录条目本身保留在清单里但不是
+  W-file，自然落不进 `S`。
+- **不跟随符号链接**：`is_plain_dir` 用 `symlink_metadata`，`expand_dir` 用
+  `file_type().is_symlink()` 跳过。一条指向自己祖先的 junction 否则会让遍历
+  转不出来，而 Unity 工程里 junction 并不罕见。
+- **遍历失败报错而不是跳过**：悄悄跳过等于宣称「这里没有 W-file」，正好是这次
+  要消灭的那种静默。调用方各自决定——初始化中止，服务器侧核对退成 `NotChecked`。
+- **`-v` 不是新的开销量级**：`audit_server_set`（本轮刚改成 5 分钟定时重跑的那个）
+  本来就要发一次递归的**网络** `svn ls -R`，本地的 `svn status -v` 比它便宜。
+- **对工作目录仍然只读**：新增的只有 `read_dir` / `symlink_metadata`。
+
+### 测试
+
+先补三条**红的**测试再动代码，实际输出与 review 的描述逐字吻合：
+
+```
+未版本控制目录里的 .cs 进了基线树。实际树：
+Code/A.cs
+Code/B.cs
+Code/NewDir/Deeper/Deep.cs
+Code/NewDir/New.cs
+```
+
+```
+GitError { code: "svn_baseline_lying", message: "...共 1 处...\n  - Code/Deep/D.cs" }
+```
+
+`DirtyKind` 加了三个变体（`UnversionedDir` / `IgnoredDir` / `DeletedDir`）——
+review 指出原来四种脏**全是文件形态**，所以这个形态在单测、集成测试、手工清单
+三层都没被覆盖过，526 全绿说明不了它。
+
+**变异验证：两半正交，各自都有牙齿。**
+
+| 变异 | 结果 |
+|---|---|
+| 去掉 `-v` | `DeletedDir` 那条红，另外两条绿 |
+| 去掉磁盘展开 | `UnversionedDir` / `IgnoredDir` 两条红，`DeletedDir` 绿 |
+
+### 验证
+
+`cargo fmt --check` ✓、`cargo clippy --all-targets` **0 告警**、
+`cargo test` **529 passed / 0 failed / 41 个二进制**（改动前 526）。
+
+### 顺带修掉的（review 建议 1）
+
+`classify` 里 obstructed 的报错原文是「本该在 P1 就被拦下」，但
+`check_current_baseline`（手动体检那颗按钮）从来不跑 P1——用户在有 `~` 的仓库上
+点体检，会收到一条听起来像内部 bug 的话。改成面向用户的措辞。
+
+### 还没做的（review 的其余建议）
+
+- spec 第 3331 行的 `hash-object` 命令形状仍缺 `--path`，与 §16.2.1 矛盾（实现是对的）；
+- 白名单条目不带尾斜杠时，目录路径本身会通过 `is_w_file` 进入 `S`（目前无害，
+  但值得加断言钉住）；
+- `run_git_stdin` 的管道死锁前提没写进文档注释；
+- `svn_health_dirty.rs` 的辅助函数与产品路径在嵌套 external 下会分叉。
+
+### 覆盖面
+
+E2E 清单新增**场景 13**，把这三种目录形态搬到真实窗口里验一遍。前 12 条都是
+文件形态，覆盖不到。
+
+---
+
+## 实测记录（Task 0 之前完成）
+
+八条未知全部在临时 fixture 上实测，探针用完即删，`git status` 已复核干净。
+
+| # | 问题 | 结果 |
+|---|---|---|
+| B1 | `svn cat` 会不会写磁盘 | ✅ 不写 |
+| B2 | 已 `svn delete` 的文件还取得到吗 | ✅ 取得到，磁盘上没有照样取 |
+| B3 | `svn add` 未提交的怎么判 | ✅ `E195002: has no committed revision` |
+| B4 | `svn:eol-style=native` 的字节一致吗 | ✅ 磁盘与 cat 都是 CRLF |
+| B5 | `svn:keywords` 会展开吗 | ✅ 会，`$Id: Kw.cs 1 … $` 与磁盘逐字节相同 |
+| B6 | 磁盘是 LF 的文件经 stdout 会被加 CR 吗 | ✅ 不会，4 字节进 4 字节出 |
+| B7 | `-r BASE` 离线可用吗 | ✅ 可用；`-r N` 报 `E170013` |
+| B8 | `D \ S == ∅` 会误报吗 / 有牙齿吗 | ✅ 不误报；✅ 对「基线声称 r2、磁盘停在 r1」报警 |
+
+⚠️ **一个负面结果照实记下。** 原本用来证明判据有牙齿的那条测试（同长度篡改一个字节 + 还原 mtime）**没有证成**：`svn status` 与 `svn diff` 双双被 svn 的「大小 + mtime 相同就跳过」捷径绕过。这是**既有**盲区——今天的 §6.8 体检跑的就是同一条 `svn diff`——不是本轮引入的。记在这里是为了不把体检的能力说得比实际强。

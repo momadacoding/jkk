@@ -9,8 +9,9 @@
 
 use crate::engine::git_cli::run_git_code;
 use crate::engine::svn_baseline::TempIndex;
+use crate::engine::svn_dirty::Fix;
 use crate::error::{GitError, Result};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// 白名单条目归一成「仓库内相对路径、正斜杠、无尾斜杠」。
@@ -92,6 +93,56 @@ pub fn expected_set(
         }
     }
     Ok(out)
+}
+
+/// **服务器在 rN 上**白名单内的 W-file 集合——基线树该有的文件集合（spec §6.3.1）。
+///
+/// # 为什么不是「磁盘上的 W-file」
+///
+/// 初版写的是磁盘，因为那时每个录制入口都要求工作副本干净，两者恒等。§16.1 放松
+/// 之后它们会分开，而基线的语义（§6.4）从头到尾说的都是**服务器**：
+///
+/// ```text
+/// 服务器集合 = 磁盘 W-file  −  { 状态为 A / ? 的 }  +  { 状态为 D / ! 的 }
+///                               服务器 rN 上还没有       磁盘上没有但服务器有
+/// ```
+///
+/// **求法不走网络**，全部由本地的 `svn status` 推导。走网络的那条独立核对在
+/// [`crate::engine::svn_server_set`]，它只出提示、不参与判定——两者不能互相顶替：
+/// 这里挡的是「录错了哪些文件」，那里挡的是 `--set-depth=exclude` 这类磁盘上压根
+/// 看不见的漏收。
+///
+/// 工作副本干净时 `fixes` 为空，退化成初版的「磁盘 W-file」，S7 / 恢复⑥ / D7a
+/// 三个入口行为逐字不变。
+pub fn server_expected_set(
+    repo_root: &str,
+    whitelist: &[String],
+    extensions: &[String],
+    fixes: &BTreeMap<String, Fix>,
+) -> Result<BTreeSet<String>> {
+    let mut set = expected_set(repo_root, whitelist, extensions)?;
+    let roots = normalize_roots(whitelist);
+    for (path, fix) in fixes {
+        match fix {
+            // 服务器 rN 上没有它。不在集合里时 `remove` 是 no-op——非 W-file
+            // （比如一个未版本控制的 `.txt`）本来就不在磁盘集合里。
+            Fix::Drop => {
+                set.remove(path);
+            }
+            // 服务器上有。磁盘上还在的（`M` / `R` / `C`）本来就在集合里，
+            // 这里真正补进来的是 `D` / `!` ——磁盘上已经没有、`expected_set`
+            // 遍历磁盘时看不见的那些。
+            //
+            // **必须过 W-file 判据**：一个被删掉的 `Code/Notes.txt` 不该因为
+            // 「服务器上有」就进基线树，它本来就不归 git 管。
+            Fix::TakeBase => {
+                if is_w_file(path, &roots, extensions) {
+                    set.insert(path.clone());
+                }
+            }
+        }
+    }
+    Ok(set)
 }
 
 /// git 的忽略规则匹配是否大小写不敏感。
@@ -235,8 +286,9 @@ pub fn verify_include_set(
     idx: &TempIndex,
     whitelist: &[String],
     extensions: &[String],
+    fixes: &BTreeMap<String, Fix>,
 ) -> Result<()> {
-    let expected = expected_set(repo_root, whitelist, extensions)?;
+    let expected = server_expected_set(repo_root, whitelist, extensions, fixes)?;
     let actual = idx.ls_files(repo_root)?;
     if expected == actual {
         return Ok(());

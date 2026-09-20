@@ -21,7 +21,7 @@ import {
 import SvnInitWizard from './SvnInitWizard'
 import BaselineBanner from './BaselineBanner'
 import { baselineMap } from '../engine/svnGraph'
-import { describeHealth, describePinned } from '../engine/svnInit'
+import { describeHealth, describePinned, healthNeedsRebuild } from '../engine/svnInit'
 import { samePath } from '../engine/path'
 import { isBaselineBranch, visibleSections } from '../engine/capabilities'
 import { askConfirm } from '../engine/confirm'
@@ -114,7 +114,7 @@ export function RepoTab({
   const {
     state, openRepo, refreshHead, refreshGraph, refreshStatus, refreshWorktrees,
     refreshDiff, refreshUpstream, refreshStashes, refreshPullRequests,
-    refreshSvnSync, checkSvnSyncIfChanged, fetchSvnLog, refreshSvnAudit,
+    refreshSvnSync, checkSvnSyncIfChanged, fetchSvnLog, refreshSvnAudit, auditSvnIfDue,
     selectCommit, clearError, reportError,
   } = useRepoStore()
   const [repoState, setRepoState] = useState<string>('normal')
@@ -130,7 +130,7 @@ export function RepoTab({
 
   useRepoEffects(
     state,
-    { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged },
+    { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, auditSvnIfDue },
     viewMode,
   )
 
@@ -525,11 +525,12 @@ export function RepoTab({
   const handleRebuildBaseline = async () => {
     await confirm({
       title: '重建基线',
-      message: '把白名单内的当前磁盘内容录成一个新的基线 commit。',
+      message: '把白名单内的内容按**服务器上当前 revision** 的样子录成一个新的基线 commit。',
       warning:
         '不会修改工作目录里的任何文件，也不会推进你的工作分支——' +
         '分支要不要跟进新基线，由你之后自己决定。' +
-        '白名单内必须干净：有未提交的 SVN 改动会被拒绝。',
+        '你未提交的 SVN 改动不影响重建：那些文件会按服务器上的版本录进基线，' +
+        '磁盘上的改动原样保留。',
       confirmLabel: '重建',
       busyLabel: '正在重建…',
       // 走 action 而不是「确认后自己跑」：重建要发 svn diff 体检（网络），
@@ -551,9 +552,13 @@ export function RepoTab({
    */
   const handleCheckBaseline = async () => {
     try {
+      const health = await svnCheckBaseline(repoPath)
       // 复用向导那边的同一份翻译，不另写一套——两份文案迟早说出不同的话。
-      const n = describeHealth(await svnCheckBaseline(repoPath))
-      await confirm({
+      const n = describeHealth(health)
+      // 报「基线在撒谎」时必须就地给出路：那个结论只在 revision 对得上时出现，
+      // 而重建按钮挂在失同步横幅上，那时横幅不在（判据见 `healthNeedsRebuild`）。
+      const offerRebuild = healthNeedsRebuild(health)
+      const ok = await confirm({
         title: n.title,
         message:
           n.tone === 'error'
@@ -561,8 +566,12 @@ export function RepoTab({
             : n.detail,
         // `Lying` 的文件清单走红底警告条——「基线在撒谎」与普通说明不是一个分量。
         warning: n.tone === 'error' ? n.detail : undefined,
-        confirmLabel: '知道了',
+        confirmLabel: offerRebuild ? '重建基线' : '知道了',
       })
+      // 接着弹重建自己那个确认框，而不是在这里直接动手：重建要说明「不碰工作
+      // 目录、不推进工作分支」，那段话只应有一份。两个框的代价是多点一次，
+      // 比两处文案迟早说出不同的话便宜。
+      if (offerRebuild && ok) await handleRebuildBaseline()
     } catch (err) {
       reportError(err)
     }

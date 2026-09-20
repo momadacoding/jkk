@@ -74,7 +74,7 @@ export interface WizardStep {
 /** 步骤顺序就是 spec §6.5 的序列，UI 不该自己排。 */
 export const WIZARD_STEPS: readonly WizardStep[] = [
   { id: 'choose', title: '选择范围', hint: '哪些目录交给 git 管，收哪些扩展名' },
-  { id: 'preflight', title: '检查工作副本', hint: 'P1–P5：干净、单一 revision、同一仓库' },
+  { id: 'preflight', title: '检查工作副本', hint: 'P1–P5：单一 revision、同一仓库（本地修改不影响）' },
   { id: 'confirm', title: '确认并建库', hint: '建 .git、录首个基线、体检' },
   { id: 'done', title: '完成', hint: '已切到 work 分支' },
 ] as const
@@ -136,6 +136,28 @@ export interface Notice {
 }
 
 /** 把体检结果翻译成一条界面提示。 */
+/**
+ * 体检结论要不要顺带给一条「重建基线」的出路。
+ *
+ * # 只有 `lying` 给
+ *
+ * 「重建基线」在界面上**只有失同步横幅一个入口**，而 `lying` 恰恰发生在
+ * **revision 完全对得上**的时候——也就是那条横幅不在的时候。于是体检告诉你
+ * 基线坏了，界面上却没有任何地方能修它（2026-09-19 用户在手工测试中撞上）。
+ *
+ * 这与 2026-09-16 独立 review 修掉的那条是同一个毛病：体检入口当初也被绑在
+ * 失同步横幅上，「等于只在不需要它的时候提供它」。那次只解开了体检。
+ *
+ * # ⚠️ `notChecked` 绝不能给
+ *
+ * 「没验成」不是「坏了」。断网、URL 不可达都会落到这里，那时推着用户去重建，
+ * 等于拿一次网络抖动换一个新基线——而重建是要动 `svn/base` 指针的，旧基线只能
+ * 从 reflog 找回来。`verified` 同理，没有任何理由重建。
+ */
+export function healthNeedsRebuild(h: Health): boolean {
+  return h.status === 'lying'
+}
+
 export function describeHealth(h: Health): Notice {
   switch (h.status) {
     case 'verified':
@@ -209,9 +231,11 @@ export function describePinned(pinned: PinnedExternal[]): Notice | null {
  */
 export function wizardErrorHint(code: string, message = ''): string {
   const table: Record<string, string> = {
-    svn_preflight_dirty:
-      '白名单内的工作副本不干净。本应用不会替你 revert（那是破坏性操作），' +
-      '请先在 TortoiseSVN 里提交或还原这些改动，再回来建库。',
+    svn_preflight_obstructed:
+      '白名单内有 obstructed（svn status 的 `~`）——通常是一个受版本控制的文件被' +
+      '换成了同名目录。这种位置上 svn 自己都说不清是什么，取不到它在服务器上的内容。' +
+      '本应用不会替你动这些路径（删目录、revert 都是破坏性操作）。' +
+      '除了 `~`，其余本地修改都不再阻断建库或重建基线。',
     svn_preflight_mixed_revision:
       '工作副本里有多个 revision。先跑一次完整的 svn update 把它对齐。' +
       '如果白名单落在 external 里，update 解决不了——错误详情里会说明。',
@@ -227,7 +251,15 @@ export function wizardErrorHint(code: string, message = ''): string {
     svn_already_initialized: '这个目录已经建过库了。要重建基线请用「重建基线」，不是重新初始化。',
     svn_baseline_lying:
       '首个基线没通过体检，已经整个回退，刚建的 .git 也删掉了。' +
-      '先确认工作副本确实与服务器一致（跑一次完整的 svn update），再重试。',
+      '注意这里说的**不是**你自己的本地修改——那些已经被排除在外了。' +
+      '报出来的文件是「磁盘与服务器对不上、而 svn 又说它没被改过」，' +
+      '最常见的原因是漏跑了一次完整的 svn update。',
+    svn_rebuild_revision_moved:
+      '重建过程中工作副本被外部改动了（多半是 TortoiseSVN 那边提交或更新了一次）。' +
+      '基线指针没有改动，重新点一次「重建基线」即可。',
+    svn_baseline_classification_conflict:
+      'svn status 说某个文件在服务器上有，取它的内容时 svn 又说它还没提交过。' +
+      '两个判断对不上，所以停下来了——多半是录制过程中工作副本被外部改动了，请重试一次。',
     include_set_mismatch:
       'git 实际跟踪的文件集合与配置声明的不一致。错误详情里指出了是哪条规则做的决定' +
       '——最常见的原因是工作树里有一个 .gitignore 盖掉了本应用生成的规则。',
