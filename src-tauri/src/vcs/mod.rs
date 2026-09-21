@@ -28,6 +28,18 @@ use serde::Serialize;
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Capabilities {
+    /// 这个仓库背后是哪种版本控制：`"git"` 或 `"svn"`。
+    ///
+    /// # 为什么要显式说，而不让前端从别的字段反推
+    ///
+    /// 前端需要知道「要不要发那几个 SVN 专属的 invoke」。靠
+    /// 「所有 git 专属能力都是 false」反推在今天成立纯属巧合——将来某个普通 git
+    /// 仓库恰好关掉全部可选能力（或者新增一个默认关闭的能力）时，它就会被当成
+    /// SVN 仓库，于是每次刷新都发几个必然失败的 invoke。
+    ///
+    /// 取值只有这两个，用 `&'static str` 而不是 enum 是为了让 serde 直接给出
+    /// 前端好判的字符串，不必再约定一层 tag 名。
+    pub vcs: &'static str,
     pub worktrees: bool,
     pub tags: bool,
     pub remotes: bool,
@@ -40,6 +52,7 @@ impl Capabilities {
     /// 普通 git 仓库：全都支持。
     pub fn all() -> Self {
         Self {
+            vcs: "git",
             worktrees: true,
             tags: true,
             remotes: true,

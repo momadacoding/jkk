@@ -1713,6 +1713,119 @@ body {
   opacity: 0.9;
 }
 
+/* 基线分支：侧边栏里加一个标记，并且不能在它上面提交（spec §6.4）。 */
+.sb-row.baseline .sb-label { color: #d8a657; }
+.sb-baseline-tag {
+  margin-left: 6px;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: #4a3d16;
+  color: #f0e2b8;
+  font-size: 10px;
+  line-height: 15px;
+}
+.changes-baseline-warning {
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  background: #4a1f1f;
+  color: #f3cdcd;
+  border-radius: 3px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* 「仅本地，不交付」勾选框与它的窗口期警告（spec §6.7、§16）。 */
+.changes-local-only { display: flex; align-items: center; gap: 4px; font-size: 12px; }
+.changes-local-only-warning {
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  background: #4a3d16;
+  color: #f0e2b8;
+  border-radius: 3px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* svn 节点：换配色，让人一眼看出它不是本地提交（点开没有 diff，也不能 checkout）。 */
+.commit-row.svn .commit-hash { color: #d8a657; }
+.commit-row.svn .commit-message { opacity: 0.88; }
+
+/* 「仅本地，不交付」角标（spec §6.7）。 */
+.local-only-badge {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 0 5px;
+  border-radius: 3px;
+  background: #4a3d16;
+  color: #f0e2b8;
+  font-size: 10px;
+  line-height: 16px;
+  vertical-align: 1px;
+}
+
+/* 图底部的「加载更多」。SVN 历史每次都走网络，所以按需加载（spec §10.2）。 */
+.graph-load-more {
+  padding: 6px 12px;
+  text-align: center;
+  border-top: 1px solid #333;
+}
+
+.commit-detail-message {
+  margin: 8px 12px;
+  white-space: pre-wrap;
+  font-family: inherit;
+}
+.commit-detail-note {
+  margin: 8px 12px;
+  padding: 6px 8px;
+  background: #2a2a2a;
+  border-left: 3px solid #6b5a20;
+  font-size: 12px;
+  opacity: 0.85;
+}
+
+/* 失同步横幅与服务器侧漏收提示。tone 与 engine/svnSync 的 BannerTone 对应。
+   两条是独立的信息，可能同时出现，所以各自是一个完整的块。 */
+.banner-baseline {
+  padding: 8px 12px;
+  border-bottom: 1px solid #333;
+  font-size: 12px;
+}
+.banner-baseline.warn { background: #4a3d16; color: #f0e2b8; border-bottom-color: #6b5a20; }
+.banner-baseline.danger { background: #4a1f1f; color: #f3cdcd; border-bottom-color: #7a3030; }
+/* 常驻的体检入口：没出事的时候也一直在，所以必须**不抢眼**——用与工具条同色的
+   底，靠低透明度退到背景里。做成黄条的话每个健康仓库顶上都常年挂一条警告色，
+   用户很快就会连真正的警告一起忽略。 */
+.banner-baseline.quiet {
+  background: #252525;
+  color: #bdbdbd;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 12px;
+}
+.banner-baseline.quiet .banner-baseline-detail { margin: 0; font-size: 11px; opacity: 0.75; }
+.banner-baseline-head { margin-bottom: 4px; }
+.banner-baseline-detail { margin: 0 0 6px; opacity: 0.92; }
+.banner-baseline-note { margin: 0 0 6px; opacity: 0.75; font-size: 11px; }
+.banner-baseline-command {
+  margin: 0 0 6px;
+  padding: 4px 6px;
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: 3px;
+  font-family: var(--mono, monospace);
+  white-space: pre-wrap;
+}
+.banner-baseline-actions { display: flex; gap: 6px; }
+.banner-baseline-files {
+  margin: 0;
+  padding-left: 18px;
+  max-height: 120px;
+  overflow: auto;
+  font-family: var(--mono, monospace);
+  opacity: 0.9;
+}
+
 /* 向导里的三态提示。tone 与 engine/svnInit 的 Notice.tone 一一对应。 */
 .svn-notice.ok { border-left: 3px solid #3f7d4f; }
 .svn-notice.warn { border-left: 3px solid #8a7320; }

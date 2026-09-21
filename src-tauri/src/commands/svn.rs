@@ -19,7 +19,10 @@ use crate::engine::svn_init::{
     check_current_baseline, init_hybrid, pinned_externals, rebuild_baseline, InitReport,
     InitRequest, RebuildReport,
 };
+use crate::engine::svn_log::{fetch_log, read_log, LogPage};
 use crate::engine::svn_preflight::{run_preflight, Preflight};
+use crate::engine::svn_server_set::{audit_server_set_at_baseline, ServerAudit};
+use crate::engine::svn_sync::{check_sync, read_root_revs, RootRev, SyncStatus};
 use crate::error::GitError;
 
 /// 只跑前置校验 P1–P4，**什么都不创建**。
@@ -72,4 +75,65 @@ pub fn svn_check_baseline(path: String) -> Result<Health, GitError> {
 #[tauri::command(async)]
 pub fn svn_pinned_externals(path: String) -> Result<Vec<PinnedExternal>, GitError> {
     pinned_externals(&path)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 1c：失同步状态、SVN 历史、服务器侧核对
+//
+// 这一组**全部只读**，一条 SVN 写命令都不发。
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 完整的失同步校验（spec §6.6.3 的**第二档**）。
+///
+/// 纯本地读（`svn status` / `svn info`），不走网络。时机：打开仓库、以及第一档
+/// 的 [`svn_root_revs`] 报告「有人动过」之后。
+#[tauri::command(async)]
+pub fn svn_sync_status(path: String) -> Result<SyncStatus, GitError> {
+    check_sync(&path)
+}
+
+/// 每个工作副本根的 revision（spec §6.6.3 的**第一档**，O(1)）。
+///
+/// 挂在高频的 `repo-changed` 刷新上。**与上次观测值比**，变了才跑第二档；
+/// 拿它跟 `baselineRev` 比是错的——交付之后根节点会长期停在旧 revision，
+/// 那样每次刷新都会判不等，分层的意义直接归零（spec §6.6.3 有实测）。
+///
+/// 上次观测值由前端 store 持有，后端保持无状态。
+#[tauri::command(async)]
+pub fn svn_root_revs(path: String) -> Result<Vec<RootRev>, GitError> {
+    read_root_revs(&path)
+}
+
+/// 读**缓存里**的 SVN 历史，**不走网络**。
+///
+/// 打开仓库时先用它把图画出来（spec §10.2），随后由 [`svn_fetch_log`] 异步拉新的。
+/// 缓存不存在或读坏了都返回空列表而不是报错——那只是「还没拉过」。
+#[tauri::command(async)]
+pub fn svn_read_log(path: String) -> Result<LogPage, GitError> {
+    read_log(&path)
+}
+
+/// 拉取 SVN 历史并写回缓存。**走网络**，调用方不要 await。
+///
+/// `older == false` 是增量拉新；`true` 是往下翻一页。
+///
+/// # 翻页游标**不由前端传**
+///
+/// 曾经的签名是 `before_rev: Option<u64>`，前端传序列里最旧的那条 revision。
+/// 那个序列含孤儿锚点、也混了多个 target，不代表任何一段连续覆盖，会让中间
+/// 整段历史被永久跳过（详见 [`fetch_log`] 的文档）。游标改由后端按各 target
+/// 自己的覆盖区间算，前端只说「再往下翻一页」。
+#[tauri::command(async)]
+pub fn svn_fetch_log(path: String, older: bool, limit: u32) -> Result<LogPage, GitError> {
+    fetch_log(&path, older, limit)
+}
+
+/// 服务器侧清单核对：白名单内的代码文件有没有在本地漏收（§6.3.1 / NB-2）。
+///
+/// **走网络**（`svn ls -R`），在大工作副本上可能不便宜，调用方不要 await。
+/// 三种结论都通过 `Ok` 返回；`NotChecked` 与 `Matched` 必须分开——把「没验成」
+/// 当成「没漏收」，就是用修这个缺陷的代码把它重新造一遍。
+#[tauri::command(async)]
+pub fn svn_server_audit(path: String) -> Result<ServerAudit, GitError> {
+    audit_server_set_at_baseline(&path)
 }

@@ -9,10 +9,10 @@ mod svn_fixtures;
 
 use app_lib::engine::svn_cli::run_svn;
 use app_lib::engine::svn_xml::{
-    parse_diff_summary, parse_external_roots, parse_externals_props, parse_info, parse_node_revs,
-    parse_status_entries,
+    parse_diff_summary, parse_external_roots, parse_externals_props, parse_info, parse_list,
+    parse_log, parse_node_revs, parse_status_entries,
 };
-use svn_fixtures::svn_repo_with_cross_repo_nested_external;
+use svn_fixtures::{svn_repo_dirty, svn_repo_with_cross_repo_nested_external, DirtyKind};
 
 /// 真实 `svn status -v --xml` 的形态：属性跨行 + CRLF + 内层 <commit>。
 const STATUS_XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
@@ -554,4 +554,214 @@ fn an_empty_diff_is_an_empty_list() {
     let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
 <diff>\r\n<paths>\r\n</paths>\r\n</diff>\r\n";
     assert!(parse_diff_summary(xml).unwrap().is_empty());
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 1c：svn log / svn ls 的解析
+//
+// 输入同样取自 2026-09-15 的真实实测输出（计划的 A 组 / D 组），
+// 属性逐行排列 + CRLF。
+// ─────────────────────────────────────────────────────────────────────────
+
+/// 真实 `svn log --xml` 的形态：`<logentry` 与 `revision="…"` 不在同一行。
+const LOG_XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
+<log>\r\n\
+<logentry\r\n   revision=\"3\">\r\n\
+<author>liuhao</author>\r\n\
+<date>2026-09-15T15:21:22.337313Z</date>\r\n\
+<msg>r3 deep change plus new dir</msg>\r\n\
+</logentry>\r\n\
+<logentry\r\n   revision=\"2\">\r\n\
+<author>liuhao</author>\r\n\
+<date>2026-09-15T15:21:22.106490Z</date>\r\n\
+<msg>r2 subject line\r\n\
+\r\n\
+body line with &lt;angle&gt; &amp; ampersand</msg>\r\n\
+</logentry>\r\n\
+</log>\r\n";
+
+#[test]
+fn log_reads_revision_author_and_date() {
+    let got = parse_log(LOG_XML).unwrap();
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0].revision, 3);
+    assert_eq!(got[0].author, "liuhao");
+    assert_eq!(got[0].date, "2026-09-15T15:21:22.337313Z");
+    // 默认降序（实测 M1b）。解析层原样保留顺序，不自己重排。
+    assert_eq!(got[1].revision, 2);
+}
+
+#[test]
+fn log_decodes_entities_and_normalizes_crlf_inside_the_message() {
+    // 两件事一起钉住：
+    // ① XML 实体必须已解码 —— 否则 commit message 里会显示字面的 `&lt;`
+    // ② CRLF 必须按 XML 规范归一成 LF —— svn 在 Windows 上输出 CRLF，
+    //    不归一的话每行结尾多一个 \r，前端渲染出来是一串空行
+    let got = parse_log(LOG_XML).unwrap();
+    assert_eq!(
+        got[1].message,
+        "r2 subject line\n\nbody line with <angle> & ampersand"
+    );
+}
+
+#[test]
+fn log_treats_a_missing_msg_as_empty_rather_than_an_error() {
+    // 实测 Q5：`svn log -q` 的输出里 <msg> **整个元素不出现**（不是空元素）。
+    // 本期不用 -q，但把「缺失 = 空」钉死，是为了让将来有人为省流量加上 -q 时
+    // 不会得到一个「历史拉取整体失败」。
+    let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
+<log>\r\n\
+<logentry\r\n   revision=\"4\">\r\n\
+<author>liuhao</author>\r\n\
+<date>2026-09-15T15:23:50.323496Z</date>\r\n\
+</logentry>\r\n\
+</log>\r\n";
+    let got = parse_log(xml).unwrap();
+    assert_eq!(got[0].message, "");
+    assert_eq!(got[0].revision, 4);
+}
+
+#[test]
+fn log_treats_a_missing_author_as_empty() {
+    // 匿名提交或 revprop 被删时 <author> 不出现。这是内容缺失，不是格式错误。
+    let xml = "<log>\r\n<logentry\r\n   revision=\"1\">\r\n\
+<date>2026-09-15T15:23:50Z</date>\r\n<msg>m</msg>\r\n</logentry>\r\n</log>";
+    assert_eq!(parse_log(xml).unwrap()[0].author, "");
+}
+
+#[test]
+fn an_empty_log_from_an_empty_repository_is_not_an_error() {
+    // 实测 P9：HEAD=0 的仓库返回 exit 0 + <log></log>。空历史是合法状态。
+    let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n<log>\r\n</log>\r\n";
+    assert!(parse_log(xml).unwrap().is_empty());
+}
+
+#[test]
+fn log_rejects_a_logentry_without_a_parsable_revision() {
+    // revision 是这条记录的身份，缺了或不是数字都只能报错 —— 猜一个出来会让
+    // 缓存和图上出现一个不存在的节点。
+    assert!(parse_log("<log><logentry><author>x</author></logentry></log>").is_err());
+    assert!(
+        parse_log("<log><logentry revision=\"abc\"><author>x</author></logentry></log>").is_err()
+    );
+}
+
+/// 真实 `svn ls -R --xml <url>@N` 的形态（实测 M8 / P3）。
+const LIST_XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
+<lists>\r\n\
+<list\r\n   path=\"file:///C:/tmp/repo\">\r\n\
+<entry\r\n   kind=\"dir\">\r\n\
+<name>Code</name>\r\n\
+<commit\r\n   revision=\"1\">\r\n\
+<author>liuhao</author>\r\n\
+<date>2026-09-15T15:22:51.983752Z</date>\r\n\
+</commit>\r\n\
+</entry>\r\n\
+<entry\r\n   kind=\"file\">\r\n\
+<name>Code/A.cs</name>\r\n\
+<size>10</size>\r\n\
+<commit\r\n   revision=\"1\">\r\n\
+<author>liuhao</author>\r\n\
+<date>2026-09-15T15:22:51.983752Z</date>\r\n\
+</commit>\r\n\
+</entry>\r\n\
+</list>\r\n\
+</lists>\r\n";
+
+#[test]
+fn list_reads_the_base_url_and_recursive_names_with_kind() {
+    let got = parse_list(LIST_XML).unwrap();
+    assert_eq!(got.base, "file:///C:/tmp/repo");
+    assert_eq!(got.entries.len(), 2);
+    assert_eq!(got.entries[0].kind, "dir");
+    assert_eq!(got.entries[0].name, "Code");
+    assert_eq!(got.entries[1].kind, "file");
+    // 实测 N4：<name> 是**相对 <list path> 的递归路径**，正斜杠，不是仓库绝对
+    // 路径。调用方要自己接前缀 —— 这与同模块 parse_diff_summary 给出完整 URL
+    // 的形状又不一样，同一个 CLI 三种路径写法。
+    assert_eq!(got.entries[1].name, "Code/A.cs");
+}
+
+#[test]
+fn list_does_not_confuse_the_inner_commit_author_with_an_entry() {
+    // 每个 entry 里嵌着 <commit><author>。按 tag 名做全文 descendants 搜索的
+    // 写法会把别的东西一起捞进来；这条钉住只取 entry 的直接子元素。
+    let got = parse_list(LIST_XML).unwrap();
+    assert!(got
+        .entries
+        .iter()
+        .all(|e| e.name == "Code" || e.name == "Code/A.cs"));
+}
+
+#[test]
+fn a_legitimately_empty_listing_is_not_an_error() {
+    // 实测 P10：空仓库 @0 返回 exit 0 + 空 <lists>。
+    // ⚠️ 路径不存在时（P1）stdout 也长这样，但那次 exit 是 1 —— 那道门由
+    // run_svn 的非零退出判定把守，不在本函数里。
+    let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
+<lists>\r\n<list\r\n   path=\"file:///C:/tmp/empty\">\r\n</list>\r\n</lists>\r\n";
+    let got = parse_list(xml).unwrap();
+    assert_eq!(got.base, "file:///C:/tmp/empty");
+    assert!(got.entries.is_empty());
+}
+
+/// `svn add` 了没提交的节点**不能**参与 `nodeRevs`。
+///
+/// # 为什么这条现在才需要
+///
+/// spec §16.1 之前，P1 要求白名单干净，未提交的 add 在 P1 就被拦掉了，永远走不
+/// 到 P2。放松 P1（§16.1）之后它会正常出现在 status 里，如果照收进 `nodeRevs`
+/// 就会让集合变成多值，用户看到的是「工作副本是 mixed-revision，请先跑一次完整
+/// svn update」——一条**做了也没用**的引导，真实原因是他有个没提交的新文件。
+///
+/// 语义上也讲得通：`nodeRevs` 问的是「工作副本停在哪个服务器 revision」，而一个
+/// 还没提交的节点**没有**服务器 revision，它对这个问题无可奉告。
+#[test]
+fn node_revs_ignores_uncommitted_additions() {
+    let fx = svn_repo_dirty(DirtyKind::Added);
+    let xml = run_svn(
+        &fx.wc_str(),
+        &["status", "-v", "--xml", "--ignore-externals", "--", "Code@"],
+    )
+    .unwrap();
+
+    let revs: Vec<i64> = parse_node_revs(&xml).unwrap().into_iter().collect();
+
+    assert_eq!(
+        revs,
+        vec![1],
+        "未提交的 add 不该进 nodeRevs。真实 XML：\n{xml}"
+    );
+}
+
+/// 全部节点都还没提交时，报的必须是**这件事**，不是「漏了 -v」。
+///
+/// 输入是把上一条测试打出来的真实 `item="added" revision="-1"` 形状单独拎出来，
+/// 不是凭空捏的理想 XML。
+#[test]
+fn node_revs_says_so_when_every_node_is_uncommitted() {
+    let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
+<status>\r\n<target\r\n   path=\".\">\r\n\
+<entry\r\n   path=\"Code\\Added.cs\">\r\n\
+<wc-status\r\n   item=\"added\"\r\n   revision=\"-1\"\r\n   props=\"none\">\r\n\
+</wc-status>\r\n</entry>\r\n</target>\r\n</status>\r\n";
+
+    let err = parse_node_revs(xml).expect_err("全是未提交节点时必须报错，不能返回空集");
+
+    assert_eq!(
+        err.code, "svn_xml_all_nodes_uncommitted",
+        "不能套用「漏了 -v」那条说法——那会把用户引向一个完全无关的方向。\
+         实际报的是：{}",
+        err.message
+    );
+}
+
+#[test]
+fn list_rejects_truncated_output() {
+    // 实测 P2：revision 不存在时 svn 把 XML 截断在半路（<list> 没闭合）。
+    // 必须报错，不能当成「空清单」—— 空清单会让漏收检测的差集恒为空，
+    // 于是用修 NB-2 的代码重新造一个 NB-2。
+    let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
+<lists>\r\n<list\r\n   path=\"file:///C:/tmp/repo\">\r\n";
+    assert!(parse_list(xml).is_err());
 }

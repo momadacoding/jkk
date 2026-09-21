@@ -10,6 +10,7 @@ import {
   type FileSelection,
 } from '../engine/fileSelection'
 import { commitKeyAction, type CommitField } from '../engine/commitKeys'
+import { buildCommitMessage } from '../engine/commitActions'
 
 interface FileSectionProps {
   title: string
@@ -81,13 +82,28 @@ interface LocalChangesViewProps {
   onUnstage: (paths: string[]) => void
   onDiscard: (paths: string[], staged: boolean) => void
   onCommit: (msg: string, amend: boolean) => void
+  /**
+   * SVN 混合仓库才显示「仅本地，不交付」勾选框（spec §6.7）。
+   *
+   * 普通 git 仓库里这个标记没有任何含义——没有交付流程会去读它。
+   */
+  svnMode: boolean
+  /**
+   * HEAD 当前在不在基线分支上。
+   *
+   * spec §6.4：「客户端 UI 禁止在基线分支上开发提交。」流程内部会临时切上去，
+   * 但用户在那儿提交会让基线 commit 后面多出与服务器无关的内容——此后
+   * 「基线 == 服务器在 rN 的状态」这条前提就不成立了，而体检只比磁盘、发现不了。
+   */
+  onBaselineBranch: boolean
 }
 
-export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, onCommit }: LocalChangesViewProps) {
+export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, onCommit, svnMode, onBaselineBranch }: LocalChangesViewProps) {
   const [selection, setSelection] = useState<FileSelection>(emptyFileSelection)
   const [subject, setSubject] = useState('')
   const [description, setDescription] = useState('')
   const [amend, setAmend] = useState(false)
+  const [localOnly, setLocalOnly] = useState(false)
   const descriptionRef = useRef<HTMLTextAreaElement>(null)
   const { menu, open, close } = useContextMenu()
 
@@ -133,13 +149,16 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
     open(e, items)
   }
 
-  const canCommit = subject.trim().length > 0
+  // 基线分支上一律不能提交（spec §6.4），连 Ctrl+Enter 也走这个判据
+  // ——只把按钮置灰而快捷键还通，等于没拦。
+  const canCommit = subject.trim().length > 0 && !onBaselineBranch
 
   const handleCommit = () => {
-    const msg = description.trim() ? `${subject.trim()}\n\n${description.trim()}` : subject.trim()
-    onCommit(msg, amend)
+    onCommit(buildCommitMessage(subject, description, svnMode && localOnly), amend)
     setSubject('')
     setDescription('')
+    // 勾选框**不**重置：连着提交几个本地补丁是常见做法，每次都要重勾很烦。
+    // amend 同理（既有行为就是不重置）。
   }
 
   const commitKeyDown = (field: CommitField) => (e: React.KeyboardEvent) => {
@@ -228,8 +247,41 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
           <label className="changes-amend">
             <input type="checkbox" checked={amend} onChange={(e) => setAmend(e.target.checked)} /> Amend
           </label>
-          <button disabled={!canCommit} onClick={handleCommit} title="Ctrl+Enter">Commit</button>
+          {svnMode && (
+            <label className="changes-local-only">
+              <input
+                type="checkbox"
+                checked={localOnly}
+                onChange={(e) => setLocalOnly(e.target.checked)}
+              />{' '}
+              仅本地，不交付
+            </label>
+          )}
+          <button
+            disabled={!canCommit}
+            onClick={handleCommit}
+            title={onBaselineBranch ? '基线分支不能用于开发提交' : 'Ctrl+Enter'}
+          >
+            Commit
+          </button>
         </div>
+        {onBaselineBranch && (
+          <p className="changes-baseline-warning">
+            当前在 <code>svn/base</code> 基线分支上。它记的是「上次与服务器对齐时的
+            内容」，<strong>不能用于开发提交</strong>（spec §6.4）。请先切回你的工作分支。
+          </p>
+        )}
+        {/* spec §16 明确要求：Phase 1 到 Phase 3 之间这段窗口期必须在 UI 上写明，
+            「不能让用户以为勾了『仅本地』就安全了」。
+            **故意不做成 tooltip**——勾选框的 title 已经被占用，而这句话是本期
+            唯一能防止误解的地方，藏在 hover 里等于没写。 */}
+        {svnMode && localOnly && (
+          <p className="changes-local-only-warning">
+            标记只是一条 commit message trailer。<strong>交付流程要到 Phase 3 才会读它</strong>
+            ——在那之前你手工用 TortoiseSVN 交付时，这个提交里的改动会和别的改动
+            一起被提交上去。
+          </p>
+        )}
       </div>
       <ContextMenu menu={menu} onClose={close} />
     </div>

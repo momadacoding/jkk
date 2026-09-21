@@ -31,13 +31,20 @@ interface GraphViewProps {
   onCommitAction: (action: CommitAction, commit: CommitNode) => void
   /** 后端能力。不支持的菜单项整条不出现，由 `commitMenu` 裁剪。 */
   capabilities: Capabilities
+  /**
+   * 往下多拉一页 SVN 历史（spec §10.2：首屏 200 条 + 「加载更多」按钮，
+   * **不做无限滚动**）。不是 SVN 仓库时传 `undefined`，按钮整个不渲染。
+   */
+  onLoadMoreSvn?: () => void
+  /** 已经拉到 r1 了，按钮禁用。 */
+  svnLogComplete?: boolean
 }
 
 const renderer = createSvgRenderer()
 
 export function GraphView({
   commits, refs, pullRequests, selectedId, onSelect, headHash, changeCount, onOpenChanges, onCommitAction,
-  capabilities,
+  capabilities, onLoadMoreSvn, svnLogComplete,
 }: GraphViewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const { menu, open, close } = useContextMenu()
@@ -210,6 +217,21 @@ export function GraphView({
           ))}
         </div>
       </div>
+      {onLoadMoreSvn && (
+        <div className="graph-load-more">
+          <button
+            disabled={svnLogComplete}
+            onClick={onLoadMoreSvn}
+            title={
+              svnLogComplete
+                ? '已经拉到 r1，没有更早的历史了'
+                : 'SVN 历史每次都走网络，所以按需加载（spec §10.1）'
+            }
+          >
+            {svnLogComplete ? '已到最早的 revision' : '加载更多 SVN 历史'}
+          </button>
+        </div>
+      )}
       <ContextMenu menu={menu} onClose={close} />
     </div>
   )

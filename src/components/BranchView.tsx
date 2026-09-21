@@ -6,7 +6,7 @@ import { SidebarSection, SidebarGroup } from './SidebarSection'
 import { usePrompt } from './PromptDialog'
 import { DeleteBranchDialog, type DeleteTargets } from './DeleteBranchDialog'
 import { useConfirm } from './ConfirmDialog'
-import type { Capabilities } from '../engine/capabilities'
+import { isBaselineBranch, type Capabilities } from '../engine/capabilities'
 
 interface BranchViewProps {
   refs: RefPointer[]
@@ -119,6 +119,8 @@ export function BranchView({
 
   const branchMenu = (name: string) => [
     {
+      // **checkout 到基线分支是允许的**：spec §6.4 选一个可见分支，核心收益
+      // 就是「我相对上次更新改了什么」这个 diff 要能看。禁止的只是在其上**提交**。
       label: `Checkout ${name}`,
       onSelect: () => onCheckout(name),
       disabled: name === head,
@@ -149,7 +151,10 @@ export function BranchView({
     {
       label: 'Delete…',
       onSelect: () => setDeleting(name),
-      disabled: name === head,
+      // 基线分支不给删。spec §6.4 说真删了能从 reflog 恢复、最坏重建一个基线，
+      // 但让它一键可删没有任何好处——删掉之后失同步检测、体检、重建全部失去
+      // 参照，而用户通常不知道自己删的是什么。
+      disabled: name === head || isBaselineBranch(name),
       danger: true,
     },
   ]
@@ -212,20 +217,28 @@ export function BranchView({
       <SidebarGroup label="Local" count={local.length}>
         {local.map((ref) => {
           const name = shortName(ref)
+          const isBaseline = isBaselineBranch(name)
           const classes = ['sb-row']
           if (name === head) classes.push('current')
           if (name === selectedBranch) classes.push('selected')
+          if (isBaseline) classes.push('baseline')
           return (
             <div
               key={ref.name}
               className={classes.join(' ')}
-              title={`${name}\n单击定位 · 双击 checkout · 右键更多操作`}
+              title={
+                isBaseline
+                  ? `${name}\n\nSVN 基线分支：它记着「上次与服务器对齐时的内容」。\n` +
+                    '可以 checkout 上去看 diff，但不能在它上面开发提交。'
+                  : `${name}\n单击定位 · 双击 checkout · 右键更多操作`
+              }
               onClick={() => onSelect(name, ref.hash)}
               onDoubleClick={() => { if (name !== head) onCheckout(name) }}
               onContextMenu={(e) => open(e, branchMenu(name))}
             >
               <BranchIcon />
               <span className="sb-label">{name}</span>
+              {isBaseline && <span className="sb-baseline-tag">基线</span>}
               {capabilities.pullRequests && (
                 <PrBadge pr={pullRequestForRef(prByBranch, ref)} branchHash={ref.hash} />
               )}

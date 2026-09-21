@@ -9,10 +9,11 @@
 mod svn_fixtures;
 
 use app_lib::engine::svn_cli::run_svn;
-use app_lib::engine::svn_health::{check_baseline, Health};
+use app_lib::engine::svn_health::{check_baseline, ExplainedOrigin, Health};
 use svn_fixtures::{
     file_url, svn_repo_for_health, svn_repo_for_health_at_r2,
-    svn_repo_with_same_repo_nested_external, NestedExternal, SvnFixture,
+    svn_repo_with_cross_repo_nested_external, svn_repo_with_same_repo_nested_external,
+    NestedExternal, SvnFixture,
 };
 
 fn wl(items: &[&str]) -> Vec<String> {
@@ -23,13 +24,31 @@ fn cs() -> Vec<String> {
     vec![".cs".to_string()]
 }
 
+/// §6.8.7 的 `S = ∅`。
+///
+/// 本文件里每一条都跑在**干净**工作副本上，所以什么都不需要解释，判据退化成
+/// §6.8.2 的原判据 `D == ∅`。`S ≠ ∅` 的那两组（不误报 / 有牙齿）在
+/// `svn_health_dirty.rs` 里成对出现。
+fn nothing_explained() -> std::collections::BTreeSet<String> {
+    std::collections::BTreeSet::new()
+}
+
 fn repo_url(fx: &SvnFixture) -> String {
     file_url(&fx.repo())
 }
 
 /// 跑一次体检，白名单固定 `Code/`、扩展名固定 `.cs`。
 fn check(fx: &SvnFixture, rev: u64) -> Health {
-    check_baseline(&fx.wc_str(), &repo_url(fx), rev, &wl(&["Code/"]), &cs()).unwrap()
+    check_baseline(
+        &fx.wc_str(),
+        &repo_url(fx),
+        rev,
+        &wl(&["Code/"]),
+        &cs(),
+        &nothing_explained(),
+        ExplainedOrigin::Unknown,
+    )
+    .unwrap()
 }
 
 fn lying_files(h: &Health) -> Vec<String> {
@@ -46,7 +65,13 @@ fn lying_files(h: &Health) -> Vec<String> {
 #[test]
 fn t1_a_clean_working_copy_at_the_right_revision_is_verified() {
     let fx = svn_repo_for_health();
-    assert_eq!(check(&fx, 1), Health::Verified { rev: 1 });
+    assert_eq!(
+        check(&fx, 1),
+        Health::Verified {
+            rev: 1,
+            unverified: vec![]
+        }
+    );
 }
 
 #[test]
@@ -62,7 +87,13 @@ fn t3_a_modified_art_file_outside_the_whitelist_does_not_trigger_a_false_alarm()
     // 正常仓库永远建不起来。
     let fx = svn_repo_for_health();
     std::fs::write(fx.wc().join("Art/boss.fbx"), "CHANGED\n").unwrap();
-    assert_eq!(check(&fx, 1), Health::Verified { rev: 1 });
+    assert_eq!(
+        check(&fx, 1),
+        Health::Verified {
+            rev: 1,
+            unverified: vec![]
+        }
+    );
 }
 
 #[test]
@@ -72,7 +103,13 @@ fn t3b_a_modified_art_file_inside_the_whitelist_does_not_trigger_a_false_alarm()
     // （spec §6.8.4：「否则恢复流程有意保留的 Code/Art.psd 本地修改会让体检误报」）。
     let fx = svn_repo_for_health();
     std::fs::write(fx.wc().join("Code/Art.psd"), "CHANGED\n").unwrap();
-    assert_eq!(check(&fx, 1), Health::Verified { rev: 1 });
+    assert_eq!(
+        check(&fx, 1),
+        Health::Verified {
+            rev: 1,
+            unverified: vec![]
+        }
+    );
 }
 
 #[test]
@@ -88,7 +125,13 @@ fn t5_the_same_moment_with_the_correct_rev_is_verified() {
     // 与 T4 成对：同一个磁盘状态、只换 rev，结论必须翻过来。
     // 少了这一条，T4 也可能是因为别的原因报的差异。
     let fx = svn_repo_for_health_at_r2();
-    assert_eq!(check(&fx, 2), Health::Verified { rev: 2 });
+    assert_eq!(
+        check(&fx, 2),
+        Health::Verified {
+            rev: 2,
+            unverified: vec![]
+        }
+    );
 }
 
 #[test]
@@ -100,9 +143,17 @@ fn t6_multiple_whitelist_roots_are_accepted() {
         1,
         &wl(&["Code/", "Art/"]),
         &cs(),
+        &nothing_explained(),
+        ExplainedOrigin::Unknown,
     )
     .unwrap();
-    assert_eq!(got, Health::Verified { rev: 1 });
+    assert_eq!(
+        got,
+        Health::Verified {
+            rev: 1,
+            unverified: vec![]
+        }
+    );
 }
 
 #[test]
@@ -156,6 +207,8 @@ fn a_command_failure_is_not_reported_as_a_lying_baseline() {
         1,
         &wl(&["Code/"]),
         &cs(),
+        &nothing_explained(),
+        ExplainedOrigin::Unknown,
     )
     .unwrap();
     assert!(matches!(got, Health::NotChecked { .. }), "实际：{got:?}");
@@ -186,7 +239,9 @@ fn a_failing_command_still_emits_partial_xml_and_must_not_be_parsed_as_success()
             "file:///definitely/not/here",
             1,
             &wl(&["Code/"]),
-            &cs()
+            &cs(),
+            &nothing_explained(),
+            ExplainedOrigin::Unknown,
         )
         .unwrap(),
         Health::NotChecked { .. }
@@ -201,8 +256,16 @@ fn an_empty_whitelist_is_an_error_not_a_clean_bill_of_health() {
     // 工程那是几个 GB 的美术资产，而且任何一处正常的本地改动都会报成基线撒谎。
     // 返回 Verified 更糟——等于宣布一个空白名单的基线是健康的。
     let fx = svn_repo_for_health();
-    let err =
-        check_baseline(&fx.wc_str(), &repo_url(&fx), 1, &[], &cs()).expect_err("空白名单必须报错");
+    let err = check_baseline(
+        &fx.wc_str(),
+        &repo_url(&fx),
+        1,
+        &[],
+        &cs(),
+        &nothing_explained(),
+        ExplainedOrigin::Unknown,
+    )
+    .expect_err("空白名单必须报错");
     assert_eq!(err.code, "svn_health_empty_whitelist");
 }
 
@@ -222,7 +285,16 @@ fn a_switched_whitelist_subtree_is_not_checked_rather_than_lying() {
     use svn_fixtures::svn_repo_with_switched_subtree;
     let fx = svn_repo_with_switched_subtree();
     let wc_url = run_svn(&fx.wc_str(), &["info", "--show-item", "url"]).unwrap();
-    let got = check_baseline(&fx.wc_str(), wc_url.trim(), 3, &wl(&["Code/"]), &cs()).unwrap();
+    let got = check_baseline(
+        &fx.wc_str(),
+        wc_url.trim(),
+        3,
+        &wl(&["Code/"]),
+        &cs(),
+        &nothing_explained(),
+        ExplainedOrigin::Unknown,
+    )
+    .unwrap();
     match got {
         Health::NotChecked { reason } => {
             assert!(reason.contains("switch"), "理由要点出成因：{reason}")
@@ -245,22 +317,24 @@ fn a_single_file_whitelist_entry_is_not_filtered_out_by_extension() {
         1,
         &wl(&["Code/Art.psd"]), // 单文件条目
         &cs(),                  // 扩展名只有 .cs，psd 不在里面
+        &nothing_explained(),
+        ExplainedOrigin::Unknown,
     )
     .unwrap();
     assert_eq!(lying_files(&got), vec!["Code/Art.psd"]);
 }
 
 #[test]
-fn a_nested_external_under_the_whitelist_is_never_claimed_verified() {
-    // 2026-09-15 实测：`svn diff --old=URL@N --new=. --summarize --xml -- Code`
-    // 在 `Code/Vendor` 是 external 时**不下沉进去**，`<paths>` 是空的。
+fn a_clean_nested_external_is_verified_not_merely_unchecked() {
+    // **Phase 1c 把这条的期望从 NotChecked 改成了 Verified。**
     //
-    // 而 `git add -- Code` 把 `Code/Vendor/V.cs` 照收进基线。两件事叠起来，
-    // 体检会对一块它**从没比过**的内容宣布 Verified —— 这比漏报更糟：Verified 是
-    // 一句主动的保证，用户与后续每一次失同步判定都建立在它之上。
+    // 1b 的做法是从项目根跑**一次** `svn diff`，而 `--old` 那侧是 URL，URL 上没有
+    // `Code/Vendor` 这个节点（它只是 `Code` 上的一条 `svn:externals` 属性），
+    // diff 不下沉进去、`<paths>` 是空的；而 `git add -- Code` 把
+    // `Code/Vendor/V.cs` 照收进基线。当时只能降级成 NotChecked，不宣称健康。
     //
-    // 修不了就别宣称：按 spec §6.8.6 第三行降级成 NotChecked。真正的修法是
-    // §6.6.5 那条「每个 wc(P) 各体检一次，用它自己的 url(P)」，记账给 Phase 1c。
+    // 现在按 spec §6.6.5 的要求，**每个记账单位各发一条命令、各用自己的 url(P)**，
+    // 嵌套 external 那块内容第一次真的被服务器验过了 —— 干净就该说干净。
     let fx = svn_repo_with_same_repo_nested_external(NestedExternal::Clean);
     let got = check_baseline(
         &fx.wc_str(),
@@ -268,15 +342,72 @@ fn a_nested_external_under_the_whitelist_is_never_claimed_verified() {
         2,
         &wl(&["Code/"]),
         &cs(),
+        &nothing_explained(),
+        ExplainedOrigin::Unknown,
+    )
+    .unwrap();
+    assert!(
+        matches!(got, Health::Verified { .. }),
+        "干净的嵌套 external 现在应当能验过，实际：{got:?}"
+    );
+}
+
+#[test]
+fn one_unit_failing_does_not_silently_verify_the_others() {
+    // 按单位分开发命令之后出现的**新失败形态**：某一个单位的 URL 不可达。
+    //
+    // 「其余的都干净，所以 Verified」是这条检查最坏的结论——`Verified` 不是
+    // 「没发现问题」，是一句主动的保证，§6.6 的失同步判定与 §9 的恢复流程都
+    // 建立在它之上。一个单位没验成，整体就只能是 NotChecked。
+    //
+    // 造法：跨仓库嵌套 external，然后把 external 指向的那个仓库从磁盘上删掉。
+    // 工作副本仍在（`svn info` 是本地读，照样列得出这个单位），但它的 URL 已经
+    // 指向一个不存在的仓库。
+    let fx = svn_repo_with_cross_repo_nested_external();
+    std::fs::remove_dir_all(fx.path().join("repo2")).unwrap();
+
+    let got = check_baseline(
+        &fx.wc_str(),
+        &file_url(&fx.repo()),
+        2,
+        &wl(&["Code/"]),
+        &cs(),
+        &nothing_explained(),
+        ExplainedOrigin::Unknown,
     )
     .unwrap();
     match got {
         Health::NotChecked { reason } => assert!(
             reason.contains("Vendor"),
-            "理由必须点名是哪条 external 没覆盖到：{reason}"
+            "理由要点名是哪个单位没验成：{reason}"
         ),
-        other => panic!("体检不能对没比过的内容宣布健康，实际：{other:?}"),
+        other => panic!("一个单位没验成时不能宣称健康，实际：{other:?}"),
     }
+}
+
+#[test]
+fn a_lying_baseline_inside_a_nested_external_is_caught() {
+    // **这条是上一条的反向证据，少了它上一条毫无意义**：
+    // 「见到 external 就直接返回 Verified」同样能让上一条变绿，而那会把嵌套
+    // external 变成一块无人盯防的盲区 —— 正是 1b 那道降级守卫要防的东西。
+    //
+    // Dirty 形态：external 里有一个未提交的改动，磁盘与服务器不符。
+    let fx = svn_repo_with_same_repo_nested_external(NestedExternal::Dirty);
+    let got = check_baseline(
+        &fx.wc_str(),
+        &file_url(&fx.repo()),
+        2,
+        &wl(&["Code/"]),
+        &cs(),
+        &nothing_explained(),
+        ExplainedOrigin::Unknown,
+    )
+    .unwrap();
+    let files = lying_files(&got);
+    assert!(
+        files.iter().any(|f| f.contains("Vendor")),
+        "差异文件要落在那条 external 里，实际 {files:?}"
+    );
 }
 
 #[test]
@@ -292,7 +423,16 @@ fn an_svn_url_pointing_at_a_subpath_is_not_checked_rather_than_lying() {
     // 「基线撒谎」是这条检查最坏的失败形态，所以先核对 svnUrl 与工作副本根的 URL。
     let fx = svn_repo_for_health();
     let bogus = format!("{}/Code", repo_url(&fx));
-    let got = check_baseline(&fx.wc_str(), &bogus, 1, &wl(&["Code/"]), &cs()).unwrap();
+    let got = check_baseline(
+        &fx.wc_str(),
+        &bogus,
+        1,
+        &wl(&["Code/"]),
+        &cs(),
+        &nothing_explained(),
+        ExplainedOrigin::Unknown,
+    )
+    .unwrap();
     match got {
         Health::NotChecked { reason } => {
             assert!(reason.contains("svnUrl"), "理由要说得清：{reason}")

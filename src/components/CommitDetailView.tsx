@@ -89,6 +89,32 @@ export function CommitDetailView({ commit, diff, repoPath }: CommitDetailViewPro
     return <div className="commit-detail commit-detail-empty">Select a commit</div>
   }
 
+  // svn 节点：只显示元信息，**不拉 diff**。
+  //
+  // spec §11 的前端改动表写着「svn 节点的 diff 走 `svn diff -c N`」，但 §16 的
+  // 分期表把「svn 节点 diff」明确列在 **Phase 4**。两处冲突时按分期表走
+  // （它更晚、更具体）。这里如实说明，而不是给一个空白的文件列表——
+  // 空白会让人以为这个 revision 什么都没改。
+  if (commit.vcs === 'svn') {
+    return (
+      <div className="commit-detail">
+        <div className="commit-head">
+          <span className="commit-avatar">{commit.author.slice(0, 1).toUpperCase()}</span>
+          <span className="commit-head-author">{commit.author}</span>
+          <span className="commit-head-sha">r{commit.svnRev}</span>
+          <span className="commit-head-date">
+            {new Date(commit.time * 1000).toLocaleString()}
+          </span>
+        </div>
+        <pre className="commit-detail-message">{commit.message}</pre>
+        <p className="commit-detail-note">
+          SVN 节点的文件差异要走一次网络请求（<code>svn diff -c {commit.svnRev}</code>），
+          属于 Phase 4，本期还没做。
+        </p>
+      </div>
+    )
+  }
+
   return (
     <div className="commit-detail">
       <div className="commit-detail-tabs">

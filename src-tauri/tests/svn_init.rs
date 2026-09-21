@@ -17,8 +17,8 @@ use app_lib::engine::svn_init::{
 use app_lib::engine::svn_xml::parse_info;
 use std::process::Command;
 use svn_fixtures::{
-    svn_repo, svn_repo_dirty, svn_repo_for_health, svn_repo_with_same_repo_nested_external,
-    DirtyKind, NestedExternal, SvnFixture,
+    svn_repo, svn_repo_dirty, svn_repo_for_health, svn_repo_obstructed, svn_repo_with_native_eol,
+    svn_repo_with_same_repo_nested_external, DirtyKind, NestedExternal, SvnFixture,
 };
 
 fn svn(dir: &std::path::Path, args: &[&str]) {
@@ -99,6 +99,45 @@ fn a_successful_init_leaves_a_clean_git_status() {
 }
 
 #[test]
+fn after_init_git_status_is_exactly_the_users_existing_local_svn_changes() {
+    // spec §6.5.1 末。基线树是**服务器内容**，磁盘上是用户改过的内容，两者故意
+    // 不同；`git read-tree` 对齐索引之后，`git status` 显示的恰好就是用户原有的
+    // 那些本地 SVN 修改。旧做法下这里永远是空的（强制要求干净），现在它第一眼
+    // 就是对的。
+    //
+    // 这条同时是 `read-tree` **不能带 `-u`** 的守卫：带上会拿基线内容覆盖磁盘，
+    // 把用户的改动抹掉——本期最不能犯的错。
+    let fx = svn_repo_for_health();
+    let wc = fx.wc();
+    std::fs::write(wc.join("Code/A.cs"), "MY WORK\n").unwrap();
+    std::fs::write(wc.join("Code/New.cs"), "new file\n").unwrap();
+    svn(&wc, &["delete", "Code/Deep/D.cs", "--non-interactive"]);
+
+    init_hybrid(&req(&fx)).unwrap();
+
+    let status = run_git(&fx.wc_str(), &["status", "--porcelain"]).unwrap();
+    let lines: std::collections::BTreeSet<&str> = status
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        lines,
+        std::collections::BTreeSet::from([" M Code/A.cs", " D Code/Deep/D.cs", "?? Code/New.cs"]),
+        "git 该显示的正是这三处本地改动。实际：\n{status}"
+    );
+    // 内容必须原样——一个字节都不许被基线覆盖
+    assert_eq!(
+        std::fs::read_to_string(wc.join("Code/A.cs")).unwrap(),
+        "MY WORK\n"
+    );
+    assert!(
+        !wc.join("Code/Deep/D.cs").exists(),
+        "被删掉的文件不许被复活"
+    );
+}
+
+#[test]
 fn a_successful_init_emits_no_svn_write_command() {
     // G8 在本期的延续：整个初始化只读 SVN，服务器侧 revision 必须没变。
     let fx = svn_repo();
@@ -125,7 +164,15 @@ fn a_successful_init_leaves_no_temp_index_behind() {
 fn the_health_check_runs_and_its_result_is_reported() {
     let fx = svn_repo_for_health();
     let report = init_hybrid(&req(&fx)).unwrap();
-    assert_eq!(report.health, Health::Verified { rev: 1 });
+    // `unverified` 空：刚录完那条路径走的是 `ExplainedOrigin::JustRecorded`
+    // ——那些 blob 是几毫秒前从 `svn cat -r BASE` 写进去的，由构造保证正确。
+    assert_eq!(
+        report.health,
+        Health::Verified {
+            rev: 1,
+            unverified: vec![]
+        }
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -156,9 +203,13 @@ fn a_failure_after_git_init_rolls_the_whole_thing_back() {
 #[test]
 fn a_preflight_failure_never_creates_a_git_at_all() {
     // P1–P4 全部跑在创建 .git **之前**，所以这一侧根本不需要回退。
-    let fx = svn_repo_dirty(DirtyKind::Modified);
-    let err = init_hybrid(&req(&fx)).expect_err("脏工作副本必须被拦住");
-    assert_eq!(err.code, "svn_preflight_dirty");
+    //
+    // 用 obstructed 而不是普通的 `M`：spec §16.1 之后普通的脏**不再阻断**
+    // （那条门槛让建库和重建在真实开发节奏下永远做不成），`~` 是唯一仍然
+    // 阻断的状态，所以它才是现在唯一能触发「preflight 失败」的形态。
+    let fx = svn_repo_obstructed();
+    let err = init_hybrid(&req(&fx)).expect_err("obstructed 必须被拦住");
+    assert_eq!(err.code, "svn_preflight_obstructed");
     assert!(!fx.wc().join(".git").exists(), "校验没过却建了 .git");
 }
 
@@ -349,9 +400,17 @@ fn init_succeeds_on_a_clean_same_repo_nested_external_and_never_tracks_its_dot_s
         "把 external 自己的 .svn 录进基线了，checkout 会损坏工作副本：{listed}"
     );
 
+    // **Phase 1c 把这条的期望从 NotChecked 改成了 Verified。**
+    //
+    // 1b 时体检从项目根只跑一次 `svn diff`，而 `--old` 那侧是 URL，URL 上没有
+    // `Code/Vendor` 这个节点，diff 不下沉进去——一块被 git 收进基线的内容从没被
+    // 比对过，所以当时只能降级成 NotChecked，不宣称健康。
+    //
+    // 现在按 spec §6.6.5 改成**每个记账单位各发一条命令、各用自己的 `url(P)`**，
+    // 这块内容第一次真的被服务器验过了。干净就该说干净。
     match report.health {
-        Health::NotChecked { .. } => {}
-        other => panic!("体检覆盖不到 external，不能宣称健康，实际：{other:?}"),
+        Health::Verified { .. } => {}
+        other => panic!("嵌套 external 现在应当验得过，实际：{other:?}"),
     }
 }
 
@@ -485,26 +544,34 @@ fn fixture_record_baseline_claiming(wc: &std::path::Path, rev: i64) {
 }
 
 #[test]
-fn the_manual_health_check_does_not_call_ordinary_wip_a_lying_baseline() {
-    // `svn_health::check_baseline` 的前提写在它自己的模块头上：「磁盘上白名单内的
-    // 内容 == 基线树的内容」。初始化与重建都满足（树刚从磁盘录出来），手动体检
-    // **不满足**——用户就在 work 分支上改代码，这是这个命令最常见的调用时机。
+fn the_manual_health_check_verifies_a_good_baseline_despite_ordinary_wip() {
+    // 用户就在 work 分支上改代码——这是「体检基线」最常见的调用时机。
     //
-    // 不校验前提的话，一个再正常不过的未提交改动会被报成「基线与服务器不符」，
-    // 而基线本身完全正确。指控错对象比不指控更糟：用户会照着引导去重建基线，
-    // 把一份好基线换掉，改动却还在那儿。
+    // 旧实现在这里返回 `NotChecked`（前提「磁盘 == 基线树」不成立）。那和
+    // spec §16.1 里那条「工作副本必须干净」是同一个病：程序员的工作区 99% 的时间
+    // 都是脏的，于是这颗按钮永远只会回答「没法下结论」，等于不存在。
+    //
+    // §6.8.7 的 `D \ S == ∅` 让它重新可用：这处改动进 `S`，被解释掉；其余文件
+    // 与服务器逐一对得上 → **Verified**。
+    //
+    // 这条测试原本的用意（别把普通 WIP 指控成假基线）没有变松，反而更强了：
+    // 从前只要求「别说它坏」，现在要求「能给出一个肯定的答案」。
     let fx = svn_repo_for_health();
     init_hybrid(&req(&fx)).unwrap();
 
     std::fs::write(fx.wc().join("Code/A.cs"), "work in progress\n").unwrap();
 
-    match check_current_baseline(&fx.wc_str()).unwrap() {
-        Health::NotChecked { reason } => assert!(
-            reason.contains("基线树") || reason.contains("未提交") || reason.contains("工作区"),
-            "理由要说清是「没法验证」而不是「基线坏了」：{reason}"
-        ),
-        other => panic!("普通 WIP 不该被判成基线撒谎，实际：{other:?}"),
-    }
+    let got = check_current_baseline(&fx.wc_str()).unwrap();
+
+    assert!(
+        matches!(got, Health::Verified { .. }),
+        "普通 WIP 不该妨碍体检下结论，实际：{got:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.wc().join("Code/A.cs")).unwrap(),
+        "work in progress\n",
+        "体检是只读的，用户的改动必须原样还在"
+    );
 }
 
 #[test]
@@ -637,18 +704,164 @@ fn a_failure_before_r4_leaves_the_baseline_pointer_untouched() {
     );
 }
 
+/// 某个路径在 `svn/base` 树里的 blob 字节。
+fn baseline_blob(wc: &str, path: &str) -> Vec<u8> {
+    app_lib::engine::git_cli::run_git_bytes(
+        wc,
+        &["cat-file", "blob", &format!("refs/heads/svn/base:{path}")],
+    )
+    .unwrap()
+}
+
+/// 白名单子树里每个文件的 (相对路径, 字节)。用来证明磁盘没被动过。
+fn snapshot_disk(wc: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
+        for e in std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok()) {
+            let p = e.path();
+            if p.file_name().is_some_and(|n| n == ".svn") {
+                continue;
+            }
+            if p.is_dir() {
+                walk(&p, base, out);
+            } else {
+                let rel = p
+                    .strip_prefix(base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.push((rel, std::fs::read(&p).unwrap()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&wc.join("Code"), wc, &mut out);
+    out.sort();
+    out
+}
+
 #[test]
-fn rebuild_refuses_when_the_working_copy_is_dirty() {
-    // R1 与 P1 同一套判据：不干净就引导去 TortoiseSVN，**不自动 revert**。
-    let fx = hybrid_repo_updated_externally();
-    std::fs::write(fx.wc().join("Code/A.cs"), "LOCAL\n").unwrap();
-    let err = rebuild_baseline(&fx.wc_str()).expect_err("脏工作副本必须被拒");
-    assert_eq!(err.code, "svn_preflight_dirty");
-    // 没有自动 revert：用户的改动原样还在
+fn rebuild_records_server_content_on_a_dirty_working_copy() {
+    // **spec §16.1 的核心断言**，也是这一期存在的全部理由。
+    //
+    // 造齐六种真实的脏状态，重建之后逐条验：基线树里是**服务器 rN 的内容**，
+    // 而不是磁盘上用户改过的内容；`A` / `?` 这两种服务器上没有的不在树里。
+    let fx = svn_repo_for_health();
+    init_hybrid(&req(&fx)).unwrap();
+    let wc = fx.wc();
+
+    // M：改过内容
+    std::fs::write(wc.join("Code/A.cs"), "LOCAL EDIT\n").unwrap();
+    // ?：未版本控制
+    std::fs::write(wc.join("Code/Untracked.cs"), "brand new\n").unwrap();
+    // A：svn add 了没提交
+    std::fs::write(wc.join("Code/Added.cs"), "added\n").unwrap();
+    svn(&wc, &["add", "Code/Added.cs", "--non-interactive"]);
+    // D：svn delete 了没提交
+    svn(&wc, &["delete", "Code/Deep/D.cs", "--non-interactive"]);
+    // 非白名单扩展名的脏（`Code/Art.psd`），它既不该进树，也不该进 `S`
+    std::fs::write(wc.join("Code/Art.psd"), "LOCAL PSD\n").unwrap();
+
+    let before = snapshot_disk(&wc);
+    let git_status_before = run_git(&fx.wc_str(), &["status", "--porcelain"]).unwrap();
+
+    let report = rebuild_baseline(&fx.wc_str()).expect("脏工作副本必须能重建");
+
+    assert_eq!(report.node_rev, 1);
     assert_eq!(
-        std::fs::read_to_string(fx.wc().join("Code/A.cs")).unwrap(),
-        "LOCAL\n"
+        baseline_blob(&fx.wc_str(), "Code/A.cs"),
+        b"v1\n",
+        "M：基线里必须是服务器 r1 的内容，不是磁盘上那份 LOCAL EDIT"
     );
+    assert_eq!(
+        baseline_blob(&fx.wc_str(), "Code/Deep/D.cs"),
+        b"d1\n",
+        "D：本地删掉的文件仍然要以服务器版本留在基线里——本地删除是一处待交付的\
+         改动，不是基线的一部分"
+    );
+    let listed = run_git(
+        &fx.wc_str(),
+        &["ls-tree", "-r", "--name-only", "refs/heads/svn/base"],
+    )
+    .unwrap();
+    assert!(
+        !listed.contains("Code/Added.cs"),
+        "A：服务器 r1 上没有它，不该进基线。实际树：\n{listed}"
+    );
+    assert!(
+        !listed.contains("Code/Untracked.cs"),
+        "?：同上。实际树：\n{listed}"
+    );
+    assert!(
+        !listed.contains("Code/Art.psd"),
+        "扩展名不在白名单里，本来就不归 git 管。实际树：\n{listed}"
+    );
+
+    // **磁盘一个字节都不许动。** 这是整条流程对工作目录只读的证明，
+    // 也是它与 `svn revert` 的本质区别（spec §16.1）。
+    assert_eq!(before, snapshot_disk(&wc), "重建动了磁盘");
+    assert_eq!(
+        git_status_before,
+        run_git(&fx.wc_str(), &["status", "--porcelain"]).unwrap(),
+        "重建改变了 git 工作区状态"
+    );
+}
+
+#[test]
+fn recording_a_file_produces_the_same_blob_whether_it_was_dirty_or_not() {
+    // **同一个文件在基线里长什么样，不该取决于它当时脏不脏。**
+    //
+    // 两条录制路径不一样：干净文件走 `git add -A`（会跑 autocrlf 等过滤器），
+    // 脏文件走 `hash-object --stdin`（默认**不跑**）。2026-09-17 实测，本机
+    // `core.autocrlf=true` 时一个 `svn:eol-style=native` 的文件：
+    //
+    //   磁盘 = "n1\r\n" → git add 得 "n1\n"，hash-object --stdin 得 "n1\r\n"
+    //
+    // 不对齐的话，在脏工作副本上重建一次就会把行尾整个翻一遍，工作分支上凭空
+    // 出现「每一行都改了」的假 diff。修法是给 hash-object 加 `--path`。
+    let fx = svn_repo_with_native_eol();
+    init_hybrid(&req(&fx)).unwrap();
+
+    // 干净时录的（走 git add -A）
+    let clean_nat = baseline_blob(&fx.wc_str(), "Code/Nat.cs");
+    let clean_plain = baseline_blob(&fx.wc_str(), "Code/Plain.cs");
+
+    // 改脏之后重建（走 hash-object）
+    std::fs::write(fx.wc().join("Code/Nat.cs"), "LOCAL\r\n").unwrap();
+    std::fs::write(fx.wc().join("Code/Plain.cs"), "LOCAL\n").unwrap();
+    rebuild_baseline(&fx.wc_str()).unwrap();
+
+    assert_eq!(
+        baseline_blob(&fx.wc_str(), "Code/Nat.cs"),
+        clean_nat,
+        "svn:eol-style=native 的文件：两条录制路径产出了不同的 blob"
+    );
+    assert_eq!(
+        baseline_blob(&fx.wc_str(), "Code/Plain.cs"),
+        clean_plain,
+        "无 eol-style 的文件：两条录制路径产出了不同的 blob"
+    );
+}
+
+#[test]
+fn rebuild_refuses_only_when_a_node_is_obstructed() {
+    // R1 与 P1 同一套判据。§16.1 之后那套判据只剩 `~` 一条——普通的本地修改
+    // **必须放行**（见 `rebuild_records_server_content_on_a_dirty_working_copy`）。
+    //
+    // 这条保留下来的核心断言是**不自动修复**：拦住之后磁盘必须原样。删目录、
+    // revert 都是破坏性的，本应用一律不替用户做（spec §6.5 P1 / §8.1 #2）。
+    let fx = hybrid_repo_updated_externally();
+    let obstructed = fx.wc().join("Code/A.cs");
+    std::fs::remove_file(&obstructed).unwrap();
+    std::fs::create_dir(&obstructed).unwrap();
+
+    let err = rebuild_baseline(&fx.wc_str()).expect_err("obstructed 必须被拒");
+
+    assert_eq!(
+        err.code, "svn_preflight_obstructed",
+        "实际：{}",
+        err.message
+    );
+    assert!(obstructed.is_dir(), "拦住之后磁盘必须原样，不许替用户动手");
 }
 
 #[test]
@@ -665,4 +878,312 @@ fn rebuild_emits_no_svn_write_command() {
     let before = server_head_rev(&fx);
     rebuild_baseline(&fx.wc_str()).unwrap();
     assert_eq!(before, server_head_rev(&fx), "重建动了服务器");
+}
+
+// ===========================================================================
+// 目录形态的脏状态（2026-09-20 独立 review 的两条阻断项 B1 / B2）
+//
+// `svn status` 对 unversioned / ignored / deleted 的**目录**只报目录本身。
+// 实测（`-v` 也一样不下沉进未版本控制目录）：
+//
+// ```xml
+// <entry path="Code\NewDir"><wc-status item="unversioned" props="none"/></entry>
+// ```
+//
+// 而 git 的 exclude 规则按扩展名**递归**收。两边粒度不一致，就是一个假基线。
+// ===========================================================================
+
+#[test]
+fn an_unversioned_directory_does_not_smuggle_its_cs_files_into_the_baseline() {
+    // **B1。** 这是本期最危险的一条：它静默。四道检查全绿，而基线树里躺着
+    // 服务器 r1 上根本不存在的文件，内容是磁盘内容。按 §8.5 / D1，这批文件
+    // 第一次交付时会因为「和基线一样」而不在净变更里——静默漏交付。
+    //
+    // Unity 工程里「新建个文件夹写几个 .cs、还没 svn add」是最常见的状态之一。
+    let fx = svn_repo_dirty(DirtyKind::UnversionedDir);
+    let report = init_hybrid(&req(&fx)).unwrap();
+
+    let listed = run_git(
+        &fx.wc_str(),
+        &["ls-tree", "-r", "--name-only", "refs/heads/svn/base"],
+    )
+    .unwrap();
+    assert!(
+        !listed.contains("Code/NewDir/New.cs"),
+        "未版本控制目录里的 .cs 进了基线树。实际树：\n{listed}"
+    );
+    assert!(
+        !listed.contains("Code/NewDir/Deeper/Deep.cs"),
+        "深一层的更容易漏。实际树：\n{listed}"
+    );
+    assert!(
+        listed.contains("Code/A.cs"),
+        "服务器上本来就有的必须还在。实际树：\n{listed}"
+    );
+    assert!(
+        matches!(report.health, Health::Verified { .. }),
+        "剔干净之后体检该通过，实际：{:?}",
+        report.health
+    );
+    // 磁盘只读：用户的新文件一个都不能少
+    assert!(fx.wc().join("Code/NewDir/New.cs").exists());
+    assert!(fx.wc().join("Code/NewDir/Deeper/Deep.cs").exists());
+}
+
+#[test]
+fn an_svn_ignored_directory_is_handled_the_same_way() {
+    // `--no-ignore` 让它出现在 status 里，item 是 `ignored` 而不是 `unversioned`。
+    // 被 svn:ignore 挡住**不代表 git 不收它**，所以两条分支都得走同一条路。
+    let fx = svn_repo_dirty(DirtyKind::IgnoredDir);
+    init_hybrid(&req(&fx)).unwrap();
+
+    let listed = run_git(
+        &fx.wc_str(),
+        &["ls-tree", "-r", "--name-only", "refs/heads/svn/base"],
+    )
+    .unwrap();
+    assert!(
+        !listed.contains("Code/Ign/G.cs"),
+        "svn:ignore 的目录里的 .cs 进了基线树。实际树：\n{listed}"
+    );
+}
+
+#[test]
+fn a_directory_deleted_with_svn_delete_is_taken_back_from_the_server() {
+    // **B2。** 不静默，但它让一个完全合法的 SVN 状态变成死胡同：
+    // 子文件没进 `S`，而 `svn diff --summarize` 那一侧**会**报它是 deleted，
+    // 于是 D \ S != ∅ → Lying → 初始化整个回退，错误文案还让用户去跑
+    // `svn update`（跑一百次也没用）。
+    let fx = svn_repo_dirty(DirtyKind::DeletedDir);
+    let report = init_hybrid(&req(&fx)).unwrap();
+
+    let listed = run_git(
+        &fx.wc_str(),
+        &["ls-tree", "-r", "--name-only", "refs/heads/svn/base"],
+    )
+    .unwrap();
+    assert!(
+        listed.contains("Code/Deep/D.cs"),
+        "被本地删掉的目录里的文件，服务器上还在，必须取回基线。实际树：\n{listed}"
+    );
+    let blob = run_git(
+        &fx.wc_str(),
+        &["cat-file", "blob", "refs/heads/svn/base:Code/Deep/D.cs"],
+    )
+    .unwrap();
+    assert_eq!(blob, "d\n", "取回的必须是服务器那一版");
+    assert!(
+        matches!(report.health, Health::Verified { .. }),
+        "取回之后体检该通过，实际：{:?}",
+        report.health
+    );
+    // 磁盘只读：删掉的目录不能被悄悄恢复
+    assert!(
+        !fx.wc().join("Code/Deep").exists(),
+        "重建/初始化不许写磁盘，被删的目录不该回来"
+    );
+}
+
+#[test]
+fn all_three_directory_shapes_at_once_still_record_correctly() {
+    // E2E 场景 13 的**完整形态**：三种目录级的脏同时存在。
+    //
+    // 单独各测一遍不等于测了它们的组合——`read_dirty` 对每个条目分别判断，
+    // 一条走 `-v` 那条路（deleted），两条走磁盘遍历那条路（unversioned /
+    // ignored），而 `Code` 本身还因为 `svn:ignore` 变成了 `props="modified"`。
+    // 手工清单要照着做的就是这个形态，所以这里先把它钉住。
+    let fx = svn_repo_dirty(DirtyKind::DeletedDir);
+    let wc = fx.wc();
+
+    // ① 未纳入版本控制的目录，两层
+    std::fs::create_dir_all(wc.join("Code/NewDir/Deeper")).unwrap();
+    std::fs::write(wc.join("Code/NewDir/New.cs"), "class N {}").unwrap();
+    std::fs::write(wc.join("Code/NewDir/Deeper/Deep.cs"), "class P {}").unwrap();
+    // ② svn:ignore 掉的目录
+    std::fs::create_dir_all(wc.join("Code/Ign")).unwrap();
+    std::fs::write(wc.join("Code/Ign/G.cs"), "class G {}").unwrap();
+    svn(
+        &wc,
+        &["propset", "svn:ignore", "Ign", "Code", "--non-interactive"],
+    );
+    // ③ 被 svn delete 的目录由 fixture 提供（Code/Deep）
+
+    let report = init_hybrid(&req(&fx)).unwrap();
+
+    let listed = run_git(
+        &fx.wc_str(),
+        &["ls-tree", "-r", "--name-only", "refs/heads/svn/base"],
+    )
+    .unwrap();
+    for gone in [
+        "Code/NewDir/New.cs",
+        "Code/NewDir/Deeper/Deep.cs",
+        "Code/Ign/G.cs",
+    ] {
+        assert!(
+            !listed.contains(gone),
+            "`{gone}` 服务器上不存在，不该进基线树。实际树：\n{listed}"
+        );
+    }
+    assert!(
+        listed.contains("Code/Deep/D.cs"),
+        "被本地删掉的目录里的文件，服务器上还在，必须取回。实际树：\n{listed}"
+    );
+    assert!(
+        matches!(report.health, Health::Verified { .. }),
+        "三种形态同时存在时体检仍该通过，实际：{:?}",
+        report.health
+    );
+
+    // 只读：用户的东西一件都不能动
+    assert!(wc.join("Code/NewDir/New.cs").exists());
+    assert!(wc.join("Code/Ign/G.cs").exists());
+    assert!(!wc.join("Code/Deep").exists(), "被删的目录不许被恢复");
+}
+
+// ===========================================================================
+// junction（Windows 目录联接）—— 上面那三种形态的第四种，2026-09-21 独立 review
+//
+// 与它们同一个病根：**svn 按目录报、git 按扩展名递归收**，只是这一次 svn 连
+// 「这是个目录」都不算数——2026-09-21 实测：
+//
+// | 量的是什么 | 结果 |
+// |---|---|
+// | `svn status --no-ignore -v -- Code`（`Code/Mirror` 是 junction） | 只有 `?  Code\Mirror` 一行 |
+// | Rust `symlink_metadata("Code/Mirror").is_dir()` | **`false`**（`is_symlink()` 为 `true`） |
+// | `git add -A -- Code/` | 索引里出现 **`Code/Mirror/Linked.cs`** |
+//
+// 于是 `is_plain_dir` 返回 false ⇒ `expand_dir` 根本不会被调用 ⇒ 一条 `Fix::Drop`
+// 都没有 ⇒ 服务器上不存在的文件留在一棵自称「等于服务器 rN」的树里。
+//
+// 四道检查一道都不响：`?` 不阻断；`expected_set` 的 `walk` **故意跟随 junction**
+// （与 git 对齐），两边集合一致；`remove_path` 摘的是 `Code/Mirror` 这一条、不带
+// `-r`，对 `Code/Mirror/Linked.cs` 是 no-op；体检比的是 svn 看得见的差异，而 svn
+// 看不见它。服务器侧核对只报「服务器有、本地没有」那一个方向，反方向不报。
+//
+// `svn_dirty.rs` 自己的注释写着「Unity 工程里 junction 并不罕见」。
+// ===========================================================================
+
+#[cfg(windows)]
+#[test]
+fn a_junction_in_the_whitelist_does_not_smuggle_foreign_cs_files_into_the_baseline() {
+    // 最容易触发的形态：junction **自己就是**那条未版本控制的条目。
+    let fx = svn_repo();
+    let outside = tempfile::TempDir::new().unwrap();
+    std::fs::write(outside.path().join("Linked.cs"), "class Linked {}").unwrap();
+    let link = fx.wc().join("Code").join("Mirror");
+    if !svn_fixtures::make_junction(&link, outside.path()) {
+        panic!("建 junction 失败——本条测试的前提没成立，不能当成通过");
+    }
+
+    let report = init_hybrid(&req(&fx)).unwrap();
+
+    let listed = run_git(
+        &fx.wc_str(),
+        &["ls-tree", "-r", "--name-only", "refs/heads/svn/base"],
+    )
+    .unwrap();
+    assert!(
+        !listed.contains("Code/Mirror/Linked.cs"),
+        "junction 里的 .cs 服务器上不存在，不该进基线树。实际树：\n{listed}"
+    );
+    assert!(
+        listed.contains("Code/A.cs"),
+        "服务器上本来就有的必须还在。实际树：\n{listed}"
+    );
+    assert!(
+        matches!(report.health, Health::Verified { .. }),
+        "剔干净之后体检该通过，实际：{:?}",
+        report.health
+    );
+    // 只读：链接和它指向的内容一个字节都不能动
+    assert!(link.join("Linked.cs").exists());
+
+    // 拆掉 junction 再让 TempDir 清理，否则 remove_dir_all 会顺着它走出去
+    std::fs::remove_dir(&link).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn a_junction_nested_inside_an_unversioned_directory_is_walked_too() {
+    // 另一半：外层是普通的未版本控制目录（`is_plain_dir` 为 true，会进
+    // `expand_dir`），junction 藏在里面。遍历到它时若直接跳过，同样漏。
+    let fx = svn_repo();
+    let outside = tempfile::TempDir::new().unwrap();
+    std::fs::write(outside.path().join("Linked.cs"), "class Linked {}").unwrap();
+    let wc = fx.wc();
+    std::fs::create_dir_all(wc.join("Code/NewDir")).unwrap();
+    std::fs::write(wc.join("Code/NewDir/New.cs"), "class N {}").unwrap();
+    let link = wc.join("Code").join("NewDir").join("Mirror");
+    if !svn_fixtures::make_junction(&link, outside.path()) {
+        panic!("建 junction 失败——本条测试的前提没成立，不能当成通过");
+    }
+
+    init_hybrid(&req(&fx)).unwrap();
+
+    let listed = run_git(
+        &fx.wc_str(),
+        &["ls-tree", "-r", "--name-only", "refs/heads/svn/base"],
+    )
+    .unwrap();
+    for gone in ["Code/NewDir/New.cs", "Code/NewDir/Mirror/Linked.cs"] {
+        assert!(
+            !listed.contains(gone),
+            "`{gone}` 服务器上不存在，不该进基线树。实际树：\n{listed}"
+        );
+    }
+
+    std::fs::remove_dir(&link).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn a_junction_loop_never_yields_a_baseline_containing_the_loop() {
+    // 跟随 junction 就必须自带环保护——遍历转不出来在 Tauri 里就是整个应用凭空
+    // 消失（`svn_include_check.rs` 的 `walk` 记着同一条）。
+    //
+    // ⚠️ **这条不断言具体结局，因为结局不稳定。** 2026-09-21 在同一份 fixture 上
+    // 反复跑，多数次是「成功，基线树里只有服务器那两个文件」，也见过一次
+    // `include_set_mismatch` 阻断——差别在 `git add` 那一侧：它跟着环一路递归，
+    // 撞上 Windows 重解析点 63 层的上限才停（独立探针实测：65 个索引条目，
+    // 最后一条是 63 层深的 `Loop/…/New.cs`），而它到底走多深并不稳定。
+    //
+    // `svn_include_check.rs` 早就写明：环存在时本侧与 git 给出不同集合、**报一次
+    // 不一致是正确行为**。所以这里只钉两件**两种结局都必须成立**的事：
+    // 会返回（不挂死），以及绝不产出一棵含环形路径的基线。
+    //
+    // 遍历本身的终止性由 `tests/svn_dirty.rs` 那条直接打在 `read_dirty` 上的
+    // 用例钉住——那一条不受 git 行为影响，是确定性的。
+    let fx = svn_repo();
+    let wc = fx.wc();
+    std::fs::create_dir_all(wc.join("Code/NewDir")).unwrap();
+    std::fs::write(wc.join("Code/NewDir/New.cs"), "class N {}").unwrap();
+    let link = wc.join("Code").join("NewDir").join("Loop");
+    if !svn_fixtures::make_junction(&link, &wc.join("Code").join("NewDir")) {
+        panic!("建 junction 失败——本条测试的前提没成立，不能当成通过");
+    }
+
+    match init_hybrid(&req(&fx)) {
+        Ok(_) => {
+            let listed = run_git(
+                &fx.wc_str(),
+                &["ls-tree", "-r", "--name-only", "refs/heads/svn/base"],
+            )
+            .unwrap();
+            assert!(
+                !listed.contains("Loop"),
+                "基线树里出现了环形路径。实际树：\n{listed}"
+            );
+            assert!(
+                listed.contains("Code/A.cs"),
+                "服务器上本来就有的必须还在。实际树：\n{listed}"
+            );
+        }
+        Err(e) => {
+            assert!(!wc.join(".git").exists(), "阻断之后 .git 没删干净：{e:?}");
+        }
+    }
+    assert!(wc.join("Code/NewDir/New.cs").exists(), "用户的文件被删了");
+
+    std::fs::remove_dir(&link).unwrap();
 }

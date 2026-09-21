@@ -1,8 +1,19 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { CommitNode, DiffData, GraphData, PullRequest, RefPointer, RepoInfo, StashEntry, StatusData, UpstreamInfo, Worktree } from '../engine/types'
 import { ALL_CAPABILITIES, type Capabilities } from '../engine/capabilities'
+import {
+  auditIsDue,
+  recordAfterSuccess,
+  syncIfRootRevChanged,
+  SVN_AUDIT_POLL_MS,
+  type RootRevMemo,
+  type ServerAudit,
+  type SyncStatus,
+} from '../engine/svnSync'
+import { baselineMap, remapRefs, spliceHistory, type SvnRevNode } from '../engine/svnGraph'
+
 import { toErrorCode, toErrorMessage } from '../engine/errors'
 import type {
   Health,
@@ -13,6 +24,47 @@ import type {
 } from '../engine/svnInit'
 import { samePath } from '../engine/path'
 import { nextSelection } from '../engine/selection'
+
+/** 后端 `svn_sync::RootRev`。 */
+interface RootRev {
+  wcRoot: string
+  rev: number
+}
+
+/** 首屏与每次「加载更多」拉多少条（spec §10.2：不做无限滚动）。 */
+const SVN_LOG_PAGE = 200
+
+/**
+ * 把一次 rootRev 观测压成一个可比字符串。
+ *
+ * 排序是必须的：`enumerate_wcs` 的返回顺序没有契约，顺序一飘就会被当成
+ * 「有人动过」，于是每次刷新都触发全量校验。
+ */
+function serializeRootRevs(revs: RootRev[]): string {
+  return revs
+    .map((r) => `${r.wcRoot}@${r.rev}`)
+    .sort()
+    .join('|')
+}
+
+/**
+ * 把 SVN 序列接进 git 历史——**只在 SVN 模式下**。
+ *
+ * # 为什么普通 git 仓库必须原样返回
+ *
+ * `spliceHistory` 会把带 `git-svn-id` trailer 的 commit 当成 baseline
+ * **从图上删掉**（spec §10.3 ③：它在图上的位置由 SVN 序列决定）。
+ *
+ * 而一个从 `git svn` 迁移过来的**普通 git 仓库**，历史里遍地都是这种 trailer
+ * ——那是 `git svn` 自己写的（spec §6.4.1 就是照它的格式设计的）。无条件接合的话，
+ * 这类仓库一打开就会发现大半历史凭空消失，而 svnRevs 是空的、没有任何东西接住它们。
+ *
+ * 所以判据必须是「这个仓库是不是 SVN 混合仓库」，而不是「svnRevs 空不空」。
+ */
+function merge(s: RepoState, gitCommits: CommitNode[], svnRevs: SvnRevNode[]): CommitNode[] {
+  if (s.capabilities.vcs !== 'svn') return gitCommits
+  return spliceHistory(svnRevs, gitCommits)
+}
 
 export interface RepoState {
   path: string | null
@@ -57,6 +109,34 @@ export interface RepoState {
    * 一次不算常驻，用户下次打开这个仓库就看不到了。所以它进 store，每次打开都读。
    */
   pinned: PinnedExternal[]
+  /**
+   * 失同步的完整校验结果（spec §6.6.3 的**第二档**）。`null` = 还没读到。
+   *
+   * `null` 与「同步」是两回事：打开仓库的那一瞬间它是 `null`，那时挂任何横幅
+   * 都等于每次打开都闪一下。`describeSync(null)` 因此返回 `null`。
+   */
+  svnSync: SyncStatus | null
+  /** 服务器侧清单核对（§6.3.1 / NB-2）。走网络，失败静默。 */
+  svnAudit: ServerAudit | null
+  /** SVN 历史（缓存 + 已拉取的），按 revision 降序。 */
+  svnRevs: SvnRevNode[]
+  /**
+   * 后端 `load_graph` 原样给的 git 提交，**未接合**。
+   *
+   * `commits` 是接合后的结果；两者分开存是因为 svnRevs 与 gitCommits 各自会被
+   * 异步刷新，任一变化都要重新接一次，而接合是纯函数，重算比增量维护更不容易错。
+   */
+  gitCommits: CommitNode[]
+  /**
+   * 已经翻到最早的 revision 了，「加载更多」该禁用。**由后端算，这里只转发。**
+   *
+   * 判据是「每个 target 的**连续覆盖区间**都到了 r1」，而覆盖区间只存在于后端
+   * 缓存里。前端手上的 `svnRevs` 是所有 target ∪ 孤儿锚点去重后的列表，
+   * 既看不出连续性、也分不清哪条属于哪个 target，用它推断完整性怎么写都是错的
+   * （2026-09-16 独立 review：原先「这一页没带回新东西 = 到底了」的写法，
+   * 配上同样取自并集的翻页游标，会在中间还差几百个 revision 时就把按钮禁掉）。
+   */
+  svnLogComplete: boolean
 }
 
 const initialState: RepoState = {
@@ -77,6 +157,11 @@ const initialState: RepoState = {
   error: null,
   errorCode: null,
   pinned: [],
+  svnSync: null,
+  svnAudit: null,
+  svnRevs: [],
+  gitCommits: [],
+  svnLogComplete: false,
 }
 
 /**
@@ -147,8 +232,72 @@ export function svnPinnedExternals(path: string): Promise<PinnedExternal[]> {
   return invoke<PinnedExternal[]>('svn_pinned_externals', { path })
 }
 
+/** 完整失同步校验（spec §6.6.3 第二档）。纯本地读，不走网络。 */
+export function svnSyncStatus(path: string): Promise<SyncStatus> {
+  return invoke<SyncStatus>('svn_sync_status', { path })
+}
+
+/** 每个工作副本根的 revision（第一档，O(1)）。挂在高频刷新上。 */
+export function svnRootRevs(path: string): Promise<RootRev[]> {
+  return invoke<RootRev[]>('svn_root_revs', { path })
+}
+
+/** 一页 SVN 历史 + 「还能不能再往下翻」，对应后端 `LogPage`。 */
+export interface SvnLogPage {
+  revs: SvnRevNode[]
+  complete: boolean
+}
+
+/** 读缓存里的 SVN 历史，**不走网络**。打开仓库时先用它把图画出来。 */
+export function svnReadLog(path: string): Promise<SvnLogPage> {
+  return invoke<SvnLogPage>('svn_read_log', { path })
+}
+
+/**
+ * 拉取 SVN 历史，**走网络**。`older = true` 是往下翻一页。
+ *
+ * ⚠️ 翻页游标**不在这里传**：它由后端按各 target 自己的连续覆盖区间算
+ * （见 Rust 侧 `fetch_log` 的文档）。这里只说「再往下翻一页」。
+ */
+export function svnFetchLog(path: string, older: boolean, limit: number): Promise<SvnLogPage> {
+  return invoke<SvnLogPage>('svn_fetch_log', { path, older, limit })
+}
+
+/** 服务器侧清单核对（§6.3.1 / NB-2）。**走网络**，可能不便宜。 */
+export function svnServerAudit(path: string): Promise<ServerAudit> {
+  return invoke<ServerAudit>('svn_server_audit', { path })
+}
+
 export function useRepoStore() {
   const [state, setState] = useState<RepoState>(initialState)
+  /**
+   * 上一次观测到的每个工作副本根的 revision，序列化成字符串好比对。
+   *
+   * **放 ref 不放 state**：读它的是 `repo-changed` 监听器，而那个 `useEffect`
+   * 的依赖是 `[state.path, diffScope]`。放进 state 的话监听器会**永远闭包住
+   * 注册那一刻的值**（`null`），比较恒为不等，于是第二档的全量校验
+   * 每次文件变动都跑一遍——分层就白做了。这是独立 review 抓到的。
+   *
+   * §6.6.3 第一档的判据是「与**上次观测值**比」，**不是**与 `baselineRev` 比：
+   * 交付之后根节点会长期停在旧 revision（spec §6.6.2 有实测），拿它跟
+   * `baselineRev` 比会每次刷新都判不等，同样让分层归零。
+   *
+   * 进程重启后是 `null`，第一次刷新当作「变了」跑一次全量——那正是打开仓库
+   * 本来就要做的事。
+   *
+   * 盒子里那个 `value` **什么时候可以写**是 `svnSync.ts` 里
+   * `recordAfterSuccess` 的事：只有第二档真的跑成功了才记。
+   */
+  const lastRootRevs = useRef<RootRevMemo>({ value: null })
+
+  /**
+   * 上一次**开始**服务器侧核对的时刻，与 `auditInFlight` 一起构成
+   * `auditIsDue` 的输入。用 ref 而不是 state：写它不该引起重渲染，
+   * 而且定时器闭包读 state 会永远读到注册那一刻的值（`lastRootRevs`
+   * 的注释里记的是同一个坑）。
+   */
+  const lastAuditAt = useRef(0)
+  const auditInFlight = useRef(false)
 
   const openRepo = useCallback(async (path: string) => {
     setState((s) => ({ ...s, loading: true, error: null, errorCode: null }))
@@ -180,6 +329,27 @@ export function useRepoStore() {
       // 同样不 await：后端要跑 `svn propget -R`，在几万文件的工作副本上是秒级。
       // 常驻说明晚一两秒出现无所谓，但不能让打开仓库卡在这儿（spec §6.5.3）。
       void refreshPinned(path)
+      if (caps.vcs === 'svn') {
+        // 第二档的完整校验：打开仓库是正确性的闸门之一，必须问到底（spec §6.6.3）。
+        // 纯本地读，await 得起。
+        await refreshSvnSync(path).catch(() => undefined)
+        // 先用**缓存**把图画出来，再后台拉新的（spec §10.2）。
+        await refreshSvnLog(path).catch(() => undefined)
+        // 这两条走网络，照 `refreshPullRequests` 的既有模式：不 await、失败静默。
+        void fetchSvnLog(path)
+        void refreshSvnAudit(path)
+      } else {
+        // **必须显式清空**：上一个仓库是 SVN 时留下的横幅与历史，会挂在下一个
+        // 完全无关的 git 仓库上（`refreshPinned` 的注释里记过同一个坑）。
+        setState((s) => ({
+          ...s,
+          svnSync: null,
+          svnAudit: null,
+          svnRevs: [],
+          svnLogComplete: false,
+          // gitCommits 不用清：refreshGraph 每次都整份覆盖它
+        }))
+      }
     } catch (err) {
       setState((s) => ({
         ...s,
@@ -214,12 +384,23 @@ export function useRepoStore() {
    */
   const refreshGraph = async (path: string, preferredId?: string, force = false) => {
     const data = await invoke<GraphData>('load_graph', { path })
-    setState((s) => ({
-      ...s,
-      commits: data.commits,
-      refs: data.refs,
-      selectedId: nextSelection(s.selectedId, data.commits.map((c) => c.id), preferredId, force),
-    }))
+    setState((s) => {
+      const commits = merge(s, data.commits, s.svnRevs)
+      // refs 必须跟着一起重映射：baseline commit 被从节点列表里删掉了，而
+      // GraphView 按 `refByHash[node.commit.id]` 渲染标签——不映射的话
+      // `svn/base` 匹配不到任何一行，**整个看不见**。
+      const refs =
+        s.capabilities.vcs === 'svn'
+          ? remapRefs(data.refs, baselineMap(data.commits))
+          : data.refs
+      return {
+        ...s,
+        gitCommits: data.commits,
+        commits,
+        refs,
+        selectedId: nextSelection(s.selectedId, commits.map((c) => c.id), preferredId, force),
+      }
+    })
   }
 
   const refreshStatus = async (path: string) => {
@@ -240,6 +421,113 @@ export function useRepoStore() {
   const refreshStashes = async (path: string) => {
     const stashes = await invoke<StashEntry[]>('read_stashes', { path })
     setState((s) => ({ ...s, stashes }))
+  }
+
+  /** 第二档本身：完整的 `nodeRevs` 校验（spec §6.6.3）。纯本地读，不碰观测值。 */
+  const applySvnSync = async (path: string) => {
+    const st = await svnSyncStatus(path)
+    setState((s) => ({ ...s, svnSync: st }))
+  }
+
+  const readRootRevs = async (path: string) => serializeRootRevs(await svnRootRevs(path))
+
+  /**
+   * 第二档的**无条件**入口：打开仓库、重建基线之后各用一次。
+   *
+   * 顺带把观测到的 rootRevs 记下来当基准——不记的话下一次刷新会因为
+   * `lastRootRevs` 还是 `null` 而再跑一次全量。**先读 revision 再跑校验**，
+   * 而且只在校验成功后才记，理由见 `recordAfterSuccess`。
+   */
+  const refreshSvnSync = async (path: string) => {
+    const observed = await readRootRevs(path)
+    await recordAfterSuccess(lastRootRevs.current, observed, () => applySvnSync(path))
+  }
+
+  /**
+   * 第一档（O(1)）：rootRev 与**上次观测值**比，变了才跑第二档。
+   *
+   * 返回是否真的跑了第二档，只为让调用方能读懂日志；调用方不依赖它。
+   */
+  const checkSvnSyncIfChanged = (path: string) =>
+    syncIfRootRevChanged(
+      lastRootRevs.current,
+      () => readRootRevs(path),
+      () => applySvnSync(path),
+    )
+
+  /** 读缓存里的 SVN 历史并接进图。不走网络。 */
+  const refreshSvnLog = async (path: string) => {
+    const page = await svnReadLog(path)
+    // svnRevs 一变就要重接一次：后台拉取是异步的，先画出来的图里
+    // svn 节点还没到位，工作分支那时还挂在 baseline commit 上。
+    setState((s) => ({
+      ...s,
+      svnRevs: page.revs,
+      commits: merge(s, s.gitCommits, page.revs),
+      svnLogComplete: page.complete,
+    }))
+  }
+
+  /**
+   * 走网络拉 SVN 历史。**失败只写 console 不上报**——顶部错误横幅是留给 git
+   * 操作的，被这条锦上添花的信息占住的话，真正的失败反而看不见
+   * （与 `refreshPullRequests` 同一条理由）。
+   */
+  const fetchSvnLog = async (path: string, older = false) => {
+    try {
+      const page = await svnFetchLog(path, older, SVN_LOG_PAGE)
+      // svnRevs 一变就要重接一次：后台拉取是异步的，先画出来的图里
+      // svn 节点还没到位，工作分支那时还挂在 baseline commit 上。
+      setState((s) => ({
+        ...s,
+        svnRevs: page.revs,
+        commits: merge(s, s.gitCommits, page.revs),
+        svnLogComplete: page.complete,
+      }))
+    } catch (err) {
+      console.warn('拉取 SVN 历史失败，图上只显示缓存里已有的部分：', err)
+    }
+  }
+
+  /**
+   * 服务器侧清单核对。走网络。
+   *
+   * `keepOnError` 分开两种调用场景，它们对失败的正确反应**相反**：
+   *
+   * - 打开仓库 / 重建之后（`false`）：必须**写回 null**。这次的结果是权威的，
+   *   失败时留着上一个仓库的结论，会把 A 仓库的漏收挂到 B 仓库头上。
+   * - 后台自动重跑（`true`）：必须**保留**上一次的结论。一次网络抖动就把一条
+   *   已经成立的漏收警告抹掉，是把真警报降级成沉默——而这条检查存在的全部理由
+   *   就是那个沉默很危险。
+   */
+  const refreshSvnAudit = async (path: string, keepOnError = false) => {
+    lastAuditAt.current = Date.now()
+    try {
+      const audit = await svnServerAudit(path)
+      // 核对期间用户可能已经切到别的仓库了。不比一下路径的话，这次的结果会写进
+      // 另一个完全无关的仓库的横幅里——后台定时重跑之后这个窗口大了很多。
+      setState((s) => (samePath(s.path ?? '', path) ? { ...s, svnAudit: audit } : s))
+    } catch (err) {
+      console.warn('服务器侧清单核对失败：', err)
+      if (keepOnError) return
+      setState((s) => (samePath(s.path ?? '', path) ? { ...s, svnAudit: null } : s))
+    }
+  }
+
+  /**
+   * 后台自动重跑的入口：过了闸才真的发请求（`auditIsDue`）。
+   *
+   * 这条检查要抓的是用户**不知情**的漏收，所以不能只靠手动入口——不知道出事的人
+   * 不会去点那颗按钮（2026-09-19 用户决定）。
+   */
+  const auditSvnIfDue = async (path: string) => {
+    if (!auditIsDue(Date.now(), lastAuditAt.current, auditInFlight.current)) return
+    auditInFlight.current = true
+    try {
+      await refreshSvnAudit(path, true)
+    } finally {
+      auditInFlight.current = false
+    }
   }
 
   /**
@@ -310,6 +598,12 @@ export function useRepoStore() {
     refreshUpstream,
     refreshStashes,
     refreshPullRequests,
+    refreshSvnSync,
+    checkSvnSyncIfChanged,
+    refreshSvnLog,
+    fetchSvnLog,
+    refreshSvnAudit,
+    auditSvnIfDue,
     selectCommit,
     clearError,
     reportError,
@@ -325,6 +619,11 @@ export interface RepoRefreshers {
   refreshDiff: (path: string, scope: string) => Promise<void>
   refreshUpstream: (path: string) => Promise<void>
   refreshStashes: (path: string) => Promise<void>
+  /** §6.6.3 第二档。只在第一档报告「有人动过」之后才调。 */
+  /** §6.6.3 的第一档 + 条件触发第二档。挂在高频的 repo-changed 上。 */
+  checkSvnSyncIfChanged: (path: string) => Promise<boolean>
+  /** 服务器侧核对的**后台**入口，自带频率闸。挂定时器与窗口焦点。 */
+  auditSvnIfDue: (path: string) => Promise<void>
 }
 
 export function useRepoEffects(
@@ -332,7 +631,7 @@ export function useRepoEffects(
   refreshers: RepoRefreshers,
   viewMode: string,
 ) {
-  const { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes } = refreshers
+  const { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, auditSvnIfDue } = refreshers
   const diffScope = viewMode === 'changes'
     ? 'workdir'
     : state.selectedId
@@ -362,7 +661,59 @@ export function useRepoEffects(
       void refreshUpstream(path).catch(ignore)
       void refreshStashes(path).catch(ignore)
       if (diffScope) void refreshDiff(path, diffScope).catch(ignore)
+      // §6.6.3 的**分层**：高频通道上只跑 O(1) 的第一档，变了才跑第二档。
+      //
+      // 不分层的话，每一次文件保存都会触发一遍白名单子树的 `svn status -v`
+      // ——那是本地读，但在几万文件的工作副本上仍然是可感知的开销。
+      //
+      // 比对用的「上次观测值」存在 **ref** 里（见 `useRepoStore` 的
+      // `lastRootRevs`）：这个监听器的 `useEffect` 依赖是 `[state.path, diffScope]`，
+      // 把它放进 state 的话闭包会永远读到注册那一刻的值，比较恒为不等，
+      // 第二档还是每次都跑——分层白做。
+      if (state.capabilities.vcs === 'svn') {
+        void checkSvnSyncIfChanged(path).catch(ignore)
+      }
     }).then((fn) => { unlisten = fn })
     return () => { unlisten?.() }
   }, [state.path, diffScope])
+
+  /**
+   * 服务器侧漏收核对的**自动**触发（2026-09-19）。
+   *
+   * # 为什么不挂在 repo-changed 上
+   *
+   * 那条通道一次文件保存就触发一次，而这里要走网络（`svn ls -R`）。
+   * `refreshPullRequests` 的注释里记的是同一条理由。
+   *
+   * # 为什么不能只留手动入口
+   *
+   * `--set-depth=exclude` 造成的漏收，SVN 侧四道检查全是绿的、磁盘上也看不见。
+   * 用户不知情，就不会去点「检查一下」。所以它必须自己跑起来。
+   *
+   * # 两个触发点
+   *
+   * - **定时器**：兜底，覆盖「应用一直开着、后台脚本动了工作副本」。
+   * - **窗口获得焦点**：用户刚从 TortoiseSVN / 终端切回来——最可能刚出事的时刻。
+   *   它会被 `SVN_AUDIT_MIN_GAP_MS` 那道闸限频，来回切窗口打不出高频请求。
+   *
+   * 页面不可见时跳过：最小化着的窗口每五分钟发一次网络请求没有意义。这不是
+   * 安全关键——闸本身已经把最坏情况钉住了，这里只是省掉明显的浪费。
+   */
+  useEffect(() => {
+    if (!state.path || state.capabilities.vcs !== 'svn') return
+    const path = state.path
+    const tick = () => {
+      if (document.hidden) return
+      void auditSvnIfDue(path).catch(() => undefined)
+    }
+    const timer = window.setInterval(tick, SVN_AUDIT_POLL_MS)
+    window.addEventListener('focus', tick)
+    return () => {
+      window.clearInterval(timer)
+      window.removeEventListener('focus', tick)
+    }
+    // ⚠️ 依赖里**不放** `auditSvnIfDue`：它每次渲染都是新函数，放进去会让这个
+    // effect 每渲染一次就重装一次定时器，五分钟的计时永远归零、一次都不会触发。
+    // 本文件里其它几个 effect 也是同一个写法。
+  }, [state.path, state.capabilities.vcs])
 }

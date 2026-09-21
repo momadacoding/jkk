@@ -12,6 +12,15 @@
  * 不让人点到它们，不是它们变安全了。
  */
 export interface Capabilities {
+  /**
+   * 这个仓库背后是哪种版本控制。
+   *
+   * 前端据此决定要不要发 SVN 专属的 invoke。**不要**用「所有 git 专属能力都是
+   * false」去反推——那在今天成立纯属巧合，将来某个普通 git 仓库恰好关掉全部
+   * 可选能力（或者新增一个默认关闭的能力）时，它就会被当成 SVN 仓库，
+   * 于是每次刷新都发几个必然失败的 invoke。
+   */
+  vcs: 'git' | 'svn'
   worktrees: boolean
   tags: boolean
   remotes: boolean
@@ -22,6 +31,7 @@ export interface Capabilities {
 
 /** 普通 git 仓库：全支持。也是拿不到后端应答时的保守默认值。 */
 export const ALL_CAPABILITIES: Capabilities = {
+  vcs: 'git',
   worktrees: true,
   tags: true,
   remotes: true,
@@ -37,12 +47,32 @@ export const ALL_CAPABILITIES: Capabilities = {
  * ——只写 `ALL_CAPABILITIES` 的话，新字段默认就是开着的。
  */
 export const NO_GIT_ONLY_CAPABILITIES: Capabilities = {
+  vcs: 'svn',
   worktrees: false,
   tags: false,
   remotes: false,
   pullRequests: false,
   cherryPick: false,
   patches: false,
+}
+
+/**
+ * 基线分支名。恒为 `svn/base`（spec §6.2.1：配置里那个字段只接受这一个值）。
+ */
+export const BASELINE_BRANCH = 'svn/base'
+
+/**
+ * 这个分支名是不是基线分支。
+ *
+ * # 为什么要精确匹配而不是 `startsWith`
+ *
+ * `svn/base-backup`、`feature/svn/base` 都是完全合法的分支名。把它们也当成基线
+ * 会让用户在自己的备份分支上发现「不能提交」，而且没有任何解释。
+ *
+ * 容忍 `refs/heads/` 前缀：ref 从后端过来时带前缀，用户输入时不带。
+ */
+export function isBaselineBranch(name: string): boolean {
+  return name.replace(/^refs\/heads\//, '') === BASELINE_BRANCH
 }
 
 /** 侧边栏分区。取值与 `RepoTab` 里的渲染顺序一致。 */

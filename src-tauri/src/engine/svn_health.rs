@@ -16,15 +16,36 @@
 //! 时机全部满足它：HEAD 在 `svn/base` 上且工作区干净，或基线树刚从磁盘录出来。
 
 use crate::engine::svn_cli::run_svn;
+// `is_w_file` / `normalize_roots` 原本是本模块的私有函数，Phase 1c 提到
+// `svn_include_check` 共用——`svn_server_set` 要用**同一套**判据去过滤服务器清单。
+// 两份「什么算 W-file」迟早分叉，而分叉的表现是「每次打开都报几千条漏收」或者
+// 「永远报没问题」，两头都很难查。
+use crate::engine::svn_include_check::{is_w_file, normalize_roots};
 use crate::engine::svn_xml::parse_diff_summary;
 use crate::error::{GitError, Result};
+use std::collections::BTreeSet;
 
 /// 体检的三种结果。**必须分开**（spec §6.8.6）。
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(tag = "status", rename_all = "camelCase")]
 pub enum Health {
     /// 命令成功，按 §6.8.4 过滤后无 W-file 内容差异 —— 基线可信。
-    Verified { rev: u64 },
+    Verified {
+        rev: u64,
+        /// 这次检查**覆盖不到**的路径（§6.8.7 的 `S` 里那些）。空表示全覆盖。
+        ///
+        /// # 为什么必须报出去
+        ///
+        /// 判据是 `D \ S == ∅`，而 `D` 比的是**磁盘与服务器**——`S` 里那些路径上
+        /// 的磁盘内容正是用户改过的，所以这条检查对它们什么也证明不了。工作副本
+        /// 干净时 `S = ∅`，覆盖面才完整；而「程序员的工作区 99% 的时间都是脏的」
+        /// 正是 §16.1 放松干净要求的理由，于是**不完整才是常态**。
+        ///
+        /// 2026-09-21 独立 review：后端一直知道这批路径，前端却无条件显示
+        /// 「磁盘内容与服务器上该 revision 一致」。那句话在 `S ≠ ∅` 时对这批路径
+        /// 就是假的。把它们带出去，文案才能如实说。
+        unverified: Vec<String>,
+    },
     /// 命令成功，仍有 W-file 内容差异 —— **基线撒谎**。阻断并列出差异文件。
     Lying { files: Vec<String> },
     /// 命令没跑成（断网 / 认证 / URL 不可达 / revision 不存在）。
@@ -32,6 +53,26 @@ pub enum Health {
     /// **这不是「基线有问题」。** 把「没能验证」当成「验证不通过」会让离线场景
     /// 寸步难行；当成「验证通过」则等于这条检查根本不存在。所以它是独立的第三种。
     NotChecked { reason: String },
+}
+
+/// `S`（`explained`）里那些路径的**基线内容**是哪来的。
+///
+/// 这条检查比的是磁盘与服务器，对 `S` 里的路径什么也证明不了；但「证明不了」
+/// 不等于「不可信」——要看基线上那些 blob 是谁写的。所以每个调用点必须表态，
+/// 不给默认值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplainedOrigin {
+    /// **刚刚由本次录制写进去的**（初始化 / 重建，spec §16 R2b）。
+    ///
+    /// 那些 blob 是几毫秒前从 `svn cat -r BASE` 取的字节，而 P2 要求
+    /// `nodeRevs` 单值、`rev` 就取的那个值——于是 `BASE == rev`，pristine 内容
+    /// 就是服务器 `rev` 上的内容。这批路径**由构造保证正确**，不需要再声明未覆盖。
+    JustRecorded,
+    /// **不知道是谁、什么时候写的**（用户手动点体检）。
+    ///
+    /// 基线可能是老版本录的、可能有人手工在 `svn/base` 上提交过。这条检查覆盖
+    /// 不到它们，必须如实报出去。
+    Unknown,
 }
 
 /// 拿磁盘跟服务器上的 `rev` 比一次。
@@ -65,8 +106,18 @@ pub fn check_baseline(
     rev: u64,
     whitelist: &[String],
     extensions: &[String],
+    // `explained` 是 §6.8.7 的 `S`——本次录制**实际动过**的路径。这些路径上的差异
+    // 已经被换成了服务器内容，不构成基线撒谎。
+    //
+    // ⚠️ **必须恰好是动过的那批，不能是超集。** `S` 越大 `D \ S` 越小，判据越弱，
+    // 而削弱它不会让任何测试变红（spec §16.1）。干净工作副本传空集，判据退化成
+    // 原来的 `D == ∅`。
+    explained: &BTreeSet<String>,
+    // `explained` 里那些路径的基线内容是谁写的。决定 `Verified` 要不要把它们
+    // 报成「未覆盖」，见 [`ExplainedOrigin`]。
+    origin: ExplainedOrigin,
 ) -> Result<Health> {
-    let roots = normalize(whitelist);
+    let roots = normalize_roots(whitelist);
     if roots.is_empty() {
         // 不传 target 时 `svn diff` 会拿**整个工作副本**跟服务器比。对一个 Unity
         // 工程那是几个 GB 的美术资产，而且任何一处正常的本地改动都会报成基线撒谎。
@@ -85,71 +136,105 @@ pub fn check_baseline(
     if let Some(reason) = whitelist_not_under_base(repo_root, base, &roots)? {
         return Ok(Health::NotChecked { reason });
     }
-    if let Some(reason) = nested_external_not_covered(repo_root, &roots)? {
-        return Ok(Health::NotChecked { reason });
-    }
 
-    let old = format!("--old={base}@{rev}");
-    let mut args: Vec<&str> = vec!["diff", &old, "--new=.", "--summarize", "--xml", "--"];
-    args.extend(roots.iter().map(String::as_str));
-
-    // 命令失败一律落到 NotChecked，**不能**当成「没有差异」。
+    // §6.6.5：**每个 `wc(P)` 各体检一次，用它自己的 `url(P)`**。
     //
-    // 这里不能用「解析得出来就算成功」：2026-09-14 实测，URL 不可达时 svn 仍然
-    // 往 stdout 打出 `<?xml …?>` 和 `<diff><paths>`，错误只在 stderr 和退出码里。
-    // 照那种写法，断网时会得到一个空的 paths 列表，于是**报告基线健康**。
-    let xml = match run_svn(repo_root, &args) {
-        Ok(x) => x,
-        Err(e) => return Ok(Health::NotChecked { reason: e.message }),
-    };
-
-    let prefix = format!("{base}/");
+    // 1b 的做法是从项目根跑**一次** diff，并在白名单底下有 external 时整个降级成
+    // `NotChecked`。那是因为 `--old` 那侧是 URL，而 URL 上根本没有 `Code/Vendor`
+    // 这个节点（它只是 `Code` 上的一条 `svn:externals` 属性），diff 直接不下沉；
+    // 而 `git add -- Code` 会把里面的文件照收进基线，于是 `Verified` 会覆盖一块
+    // 从没比对过的内容。
+    //
+    // 现在按记账单位分开发命令：`enumerate_wcs` 返回的每一条都自带 `url`，
+    // 嵌套 external 用它**自己的** URL 去比，那块内容第一次真的被服务器验过。
+    let units = crate::engine::svn_wc::enumerate_wcs(repo_root, whitelist)?;
     let mut files: Vec<String> = Vec::new();
-    for entry in parse_diff_summary(&xml)? {
-        // §6.8.4 的三条过滤，靠 --xml 的三个独立属性完成：
-        //   剔除目录条目
-        if entry.kind != "file" {
-            continue;
-        }
-        //   剔除纯属性变更（item="none" props="modified"）
-        if entry.item == "none" {
-            continue;
-        }
-        let Some(rel) = strip_prefix_ci(&entry.path, &prefix) else {
-            // 剥不掉前缀说明 svn_url 与输出的基准 URL 对不上（最常见是把它配成了
-            // 仓库里的子路径）。此时无法判断哪些是 W-file，既不能说健康也不能说
-            // 撒谎——只能说没验成。
-            // ⚠️ 这条分支实际上够不到：svn 打出来的路径恒为 `<--old 的 URL>/<target>/…`。
-            // 已知的几种「看起来会剥不掉」的情况都由前面两道守卫或 svn 自己的错误
-            // 拦掉了（svnUrl 配成子路径 → url_mismatch；白名单被 switch 或本身是
-            // external → whitelist_not_under_base；本地新增文件 → 实测打出来的
-            // 仍是旧侧 URL）。
-            //
-            // 留着是**防御**不是死代码：它守的是一个我们不控制的外部进程的输出形状，
-            // 而三种处置的安全方向不同——跳过该条会假 Verified，当成差异会假 Lying
-            // （初始化时直接整个回退），只有 NotChecked 两边都不赌。
-            //
-            // 所以文案不猜成因，只说「形状不认识」。
-            return Ok(Health::NotChecked {
-                reason: format!(
-                    "svn diff 输出里的路径 `{}` 不在基准 URL `{base}` 之下，\
-                     没法还原成仓库相对路径。这是一个本应用没有预料到的输出形状，\
-                     为安全起见判为「未经体检」——既不宣称基线健康，也不指控它撒谎。",
-                    entry.path
-                ),
-            });
+    for unit in &units {
+        let unit_url = unit.url.trim_end_matches('/');
+        let old = format!("--old={unit_url}@{rev}");
+        // `--new` 直接指向这个单位，不再用 `--new=.` + 尾随 target。
+        //
+        // ⚠️ 这里**不能**过 `peg_safe`：带 `--old` / `--new` 时路径是纯字面量，
+        // 追加 `@` 会得到 `E155010: The node '…Code@' was not found`（1b 实测）。
+        let new = format!("--new={}", unit.wc_root);
+        let args: Vec<&str> = vec!["diff", &old, &new, "--summarize", "--xml"];
+
+        // 命令失败一律落到 NotChecked，**不能**当成「没有差异」。
+        //
+        // 不能用「解析得出来就算成功」：2026-09-14 实测，URL 不可达时 svn 仍然
+        // 往 stdout 打出 `<?xml …?>` 和 `<diff><paths>`，错误只在 stderr 和退出码里。
+        // 照那种写法，断网时会得到一个空的 paths 列表，于是**报告基线健康**。
+        //
+        // 一个单位失败就整体 NotChecked，**不能**「其余都干净所以 Verified」：
+        // `Verified` 是一句主动的保证，不是「没发现问题」。
+        let xml = match run_svn(repo_root, &args) {
+            Ok(x) => x,
+            Err(e) => {
+                return Ok(Health::NotChecked {
+                    reason: format!("比对 `{}` 时失败：{}", unit.wc_root, e.message),
+                })
+            }
         };
-        //   剔除扩展名不在白名单里的文件
-        if !is_w_file(&rel, &roots, extensions) {
-            continue;
+
+        let prefix = format!("{unit_url}/");
+        for entry in parse_diff_summary(&xml)? {
+            // §6.8.4 的三条过滤，靠 --xml 的三个独立属性完成：
+            //   剔除目录条目
+            if entry.kind != "file" {
+                continue;
+            }
+            //   剔除纯属性变更（item="none" props="modified"）
+            if entry.item == "none" {
+                continue;
+            }
+            // 单文件白名单条目：`--new` 就是那个文件本身，svn 打出来的路径恰好
+            // 等于 `unit_url`，没有尾随的子路径可剥。
+            let repo_rel = if entry
+                .path
+                .trim_end_matches('/')
+                .eq_ignore_ascii_case(unit_url)
+            {
+                unit.wc_root.clone()
+            } else if let Some(sub) = strip_prefix_ci(&entry.path, &prefix) {
+                format!("{}/{}", unit.wc_root, sub)
+            } else {
+                return Ok(Health::NotChecked {
+                    reason: format!(
+                        "svn diff 输出里的路径 `{}` 不在本次比对的基准 URL `{unit_url}` 之下，\
+                         没法还原成仓库相对路径。这是一个本应用没有预料到的输出形状，\
+                         为安全起见判为「未经体检」——既不宣称基线健康，也不指控它撒谎。",
+                        entry.path
+                    ),
+                });
+            };
+            //   剔除扩展名不在白名单里的文件
+            if !is_w_file(&repo_rel, &roots, extensions) {
+                continue;
+            }
+            files.push(repo_rel);
         }
-        files.push(rel);
     }
+
+    // §6.8.7：判据是 `D \ S == ∅`，不是 `D == ∅`。
+    //
+    // `D` 是刚刚收集的这批「磁盘与服务器 rN 有内容差异的 W-file」；`S`（`explained`）
+    // 是本次录制实际动过的路径——它们的差异**已经被换成服务器内容**，不构成
+    // 基线撒谎。剩下解释不了的每一条，才是真的证伪。
+    //
+    // 工作副本干净时 `S = ∅`，这一步退化成原来的 `D == ∅`，与 §6.8.2 逐字等价。
+    files.retain(|f| !explained.contains(f));
 
     if files.is_empty() {
-        return Ok(Health::Verified { rev });
+        // `S` 里的路径被上面那行**整批豁免**了，所以它们一条都没被验证。
+        // 报不报出去看它们是谁写的——见 [`ExplainedOrigin`]。
+        let unverified = match origin {
+            ExplainedOrigin::JustRecorded => Vec::new(),
+            ExplainedOrigin::Unknown => explained.iter().cloned().collect(),
+        };
+        return Ok(Health::Verified { rev, unverified });
     }
     files.sort();
+    files.dedup();
     Ok(Health::Lying { files })
 }
 
@@ -238,104 +323,20 @@ fn whitelist_not_under_base(
     Ok(None)
 }
 
-/// 白名单底下挂着嵌套 external 时，这条检查覆盖不到它——必须说出来，不能报健康。
-///
-/// # 为什么这是「不能宣称」而不是「漏报」
-///
-/// 2026-09-15 实测（白名单 `Code/`，`Code/Vendor` 是同仓库 external）：
-///
-/// ```text
-/// svn diff --old=<base>@N --new=. --summarize --xml -- Code
-///   → <paths></paths>        ← 空的。哪怕 Code/Vendor/V.cs 正被本地改着
-/// ```
-///
-/// `--old` 那侧是 URL，URL 上根本没有 `Code/Vendor` 这个节点（它只是 `Code` 上的一条
-/// `svn:externals` 属性），所以 diff 直接不下沉。而 `git add -- Code` **会**把
-/// `Code/Vendor/V.cs` 收进基线。
-///
-/// 于是 `Verified` 会覆盖一块从没被比对过的内容。`Verified` 不是「没发现问题」，
-/// 它是一句主动的保证——§6.6 的失同步判定、§9 的恢复流程都建立在它之上。
-/// 所以按 spec §6.8.6 第三行降级成 `NotChecked`：不宣称健康，也不指控它撒谎。
-///
-/// P1/P2 那边已经把这些 WC 纳入检查（`svn_preflight::check_targets`），所以初始化
-/// 路径上「脏」和「停在别的 revision」两种形态仍然拦得住；缺的只是**服务器侧**的
-/// 二次证伪。真正的修法是 spec §6.6.5 的「每个 `wc(P)` 各体检一次，用它自己的
-/// `url(P)`」，那要按 WC 分组重组整条命令，记账给 Phase 1c。
-///
-/// 命令带 **`-N`**（`--depth=immediates` 的同族，这里用非递归）不行：external 根
-/// 可能挂在白名单根的深层子目录上。所以照样是递归 status，与 P1 同一量级的本地读，
-/// 而本函数的调用方随后要发一条**走网络**的 `svn diff`，这点开销在其阴影里。
-fn nested_external_not_covered(repo_root: &str, roots: &[String]) -> Result<Option<String>> {
-    for root in roots {
-        let arg = crate::engine::svn_wc::peg_safe(root);
-        // **故意不带 `--ignore-externals`**：要的就是让 external 根以
-        // `item="external"` 现形（spec §6.6.4 的结论：比解析属性文本可靠）。
-        let xml = match run_svn(repo_root, &["status", "--xml", "--", &arg]) {
-            Ok(x) => x,
-            Err(e) => return Ok(Some(e.message)),
-        };
-        let nested = crate::engine::svn_xml::parse_external_roots(&xml)?;
-        if !nested.is_empty() {
-            // svn 在 Windows 上返回反斜杠（`Code\Vendor`），显示前统一成正斜杠，
-            // 免得同一条路径在界面上有两种写法。
-            let list = nested
-                .iter()
-                .map(|p| p.replace('\\', "/"))
-                .collect::<Vec<_>>()
-                .join("、");
-            return Ok(Some(format!(
-                "白名单根 `{root}` 底下挂着嵌套 external：{list}。\
-                 `svn diff` 拿 URL 与工作副本比时**不会下沉进 external**（实测输出为空），\
-                 而 git 会把里面的文件照收进基线——体检若报「通过」，等于对一块\
-                 从没比对过的内容做担保。所以这里判为「未经体检」。\n\
-                 建库前的 P1/P2 已经把这些目录一并查过（干净、且与主树同一个 revision），\
-                 缺的只是服务器侧的二次核对。"
-            )));
-        }
-    }
-    Ok(None)
-}
-
-fn normalize(whitelist: &[String]) -> Vec<String> {
-    whitelist
-        .iter()
-        .map(|w| w.replace('\\', "/").trim_end_matches('/').to_string())
-        .filter(|w| !w.is_empty())
-        .collect()
-}
-
-/// 这条仓库相对路径算不算 W-file。
-///
-/// # 为什么是纯路径判断，不走磁盘
-///
-/// `svn_include_check::expected_set` 遍历磁盘算 W-file，但这里**不能**用它：
-/// T7 那类差异（服务器上删掉了 `Code/Deep/D.cs`）的文件在磁盘上根本不存在，
-/// 走磁盘的判断会把它整个漏掉——而那正是 §9.4.1 那类漏检要抓的东西。
-///
-/// 扩展名比较大小写不敏感：Windows 上 git 会把 `A.CS` 一起收进来
-/// （`core.ignoreCase` 默认 true），那它就是 W-file，体检不该当它不存在。
-fn is_w_file(rel: &str, roots: &[String], extensions: &[String]) -> bool {
-    // **单文件白名单条目不过扩展名过滤**，与 `svn_exclude` 的第 ③ 段和
-    // `svn_include_check::expected_set` 保持一致（spec §6.3）。
-    //
-    // 两边不一致的后果是假阴性：`whitelist:["Code/notes.txt"]` + `extensions:[".cs"]`
-    // 时，`notes.txt` 会被录进基线（那两处收它），而体检把它按扩展名滤掉
-    // ——服务器上改了它，体检照样报 `Verified`。
-    if roots.iter().any(|r| rel == r) {
-        return true;
-    }
-    let under = roots.iter().any(|r| rel.starts_with(&format!("{r}/")));
-    if !under {
-        return false;
-    }
-    if extensions.iter().any(|e| e == "*") {
-        return true;
-    }
-    let lower = rel.to_lowercase();
-    extensions
-        .iter()
-        .any(|e| lower.ends_with(&e.to_lowercase()))
-}
+// ─────────────────────────────────────────────────────────────────────────
+// 已删除：`nested_external_not_covered`（1b 引入）
+//
+// 它的职责是「白名单底下有 external 时，别宣称 Verified」——因为当时从项目根只跑
+// **一次** `svn diff`，而 `--old` 那侧是 URL，URL 上没有 `Code/Vendor` 这个节点
+// （它只是 `Code` 上的一条 `svn:externals` 属性），diff 不下沉进去。
+//
+// Phase 1c 把体检改成**按 `enumerate_wcs` 的每个记账单位各发一条命令、各用自己的
+// `url(P)`**（spec §6.6.5），嵌套 external 那块内容现在真的被服务器验过了，
+// 所以这道「不宣称」的降级不再需要——它会把一个已经验过的干净仓库判成未验。
+//
+// 反向证据由 `a_lying_baseline_inside_a_nested_external_is_caught` 提供：
+// 少了它，「见到 external 就返回 Verified」也能让干净那条变绿。
+// ─────────────────────────────────────────────────────────────────────────
 
 /// 大小写不敏感地剥前缀。`file:///C:/…` 里盘符的大小写不保证与配置里一致。
 fn strip_prefix_ci(path: &str, prefix: &str) -> Option<String> {

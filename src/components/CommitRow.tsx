@@ -54,14 +54,30 @@ export function CommitRow({
   const visible = refs.filter((r) => r.kind !== 'head')
   const detached = refs.some((r) => r.kind === 'head') && !refs.some((r) => r.kind === 'branch')
 
+  // svn 节点换一套配色：它们不是本地提交，点开也没有 diff 可看（Phase 4 才做），
+  // 与 git 提交长得一模一样会让人以为能对它做 checkout / revert 之类的操作。
+  const isSvn = node.commit.vcs === 'svn'
+
   return (
     <div
-      className={`commit-row${selected ? ' selected' : ''}${isHead ? ' head' : ''}`}
+      className={`commit-row${selected ? ' selected' : ''}${isHead ? ' head' : ''}${isSvn ? ' svn' : ''}`}
       style={{ height: 28, paddingLeft: layoutWidth + 8 }}
       data-id={node.commit.id}
     >
       {/* flex: 0 1 auto 让消息只占它需要的宽度，标签才能紧跟其后而不是被顶到窗口右缘 */}
-      <span className="commit-message">{node.commit.message}</span>
+      <span className="commit-message">
+        {/* 「仅本地」角标（spec §6.7）：这个提交带 Local-Only trailer，
+            标记本身不改变任何现有流程，摘除与回落属 Phase 3。 */}
+        {node.commit.localOnly && (
+          <span
+            className="local-only-badge"
+            title="仅本地，不交付。注意：交付流程要到 Phase 3 才会读这条标记。"
+          >
+            仅本地
+          </span>
+        )}
+        {node.commit.message}
+      </span>
       <span className="ref-pills">
         {detached && <span className="ref-pill head">HEAD</span>}
         {visible.map((ref) => {
@@ -94,7 +110,11 @@ export function CommitRow({
           竖着扫一列的时候很费眼。定宽后三列各自成一条直线。 */}
       <span className="commit-meta">
         <span className="commit-author" title={node.commit.author}>{node.commit.author}</span>
-        <span className="commit-hash" title={node.commit.id}>{shortHash(node.commit.id)}</span>
+        {/* svn 节点没有 hash，显示 revision 号（spec §11）。
+            拿 `svn:12346` 去截短会得到一串毫无意义的 `svn:123`。 */}
+        <span className="commit-hash" title={node.commit.id}>
+          {isSvn ? `r${node.commit.svnRev}` : shortHash(node.commit.id)}
+        </span>
         <span className="commit-date">{date}</span>
       </span>
     </div>

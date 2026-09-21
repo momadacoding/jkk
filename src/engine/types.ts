@@ -28,11 +28,38 @@ export interface RefPointer {
 }
 
 export interface CommitNode {
+  /** git 节点是 oid；svn 节点是 `svn:12346`（spec §10.4）。 */
   id: string
   parents: string[]
   author: string
   time: number
+  /**
+   * **只有标题。** 后端取的是 `commit.summary()`（第一段，空白已折叠），
+   * 正文不在里面。
+   *
+   * ⚠️ 不要在这里找 trailer。2026-09-16 独立 review 之前，混合图就是从这个字段
+   * 逐行找 `git-svn-id:` 的 —— 那一行永远不可能出现在这里，于是接合、
+   * `svn/base` 的 ref 重映射、「仅本地」角标**三样全部静默失效**，
+   * 而两侧测试全绿（前端测试直接手写带 trailer 的 message，跳过了断掉的那一环）。
+   * trailer 现在由 Rust 侧 `parse_trailer` 解析，结论见下面两个字段。
+   */
   message: string
+  /**
+   * 新增（spec §10.4）。**缺省视为 git**，所以现有 Git 模式零影响。
+   */
+  vcs?: 'git' | 'svn'
+  /** 新增；仅 svn 节点有，值是这个节点自己的 revision。 */
+  svnRev?: number
+  /**
+   * 后端解析出的 `git-svn-id` trailer 里记的 revision（spec §6.4.1）：
+   * 这个 git commit **是一条基线**，记的是那个 SVN revision。
+   *
+   * 与 `svnRev` 不是一回事：`svnRev` 说「我就是这条 revision」，
+   * 这个说「我是记录那条 revision 的基线 commit」。基线在接合时会被从图上删掉。
+   */
+  baselineRev?: number
+  /** 后端解析出的 `Local-Only: true`（spec §6.7），不会被交付。 */
+  localOnly?: boolean
 }
 
 export interface GraphData {

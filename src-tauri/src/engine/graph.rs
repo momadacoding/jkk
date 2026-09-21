@@ -3,12 +3,52 @@ use git2::Repository;
 use serde::Serialize;
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CommitNode {
     pub id: String,
     pub parents: Vec<String>,
     pub author: String,
     pub time: i64,
+    /// **只有标题**（`commit.summary()`，第一段且空白已折叠）。
+    ///
+    /// 提交列表一行一条，正文放不下也没人看。要正文里的东西请走下面两个字段，
+    /// 不要指望从这里解析——`svn_graph_contract.rs` 把这条约定钉成了测试。
     pub message: String,
+    /// 这个 commit 的 `git-svn-id` trailer 记的 revision（spec §6.4.1）；
+    /// 不是基线就是 `None`。
+    ///
+    /// # 为什么解析放在这里，而不是前端
+    ///
+    /// trailer 写在 message 的**正文**里，而上面的 `message` 是 `summary()`，
+    /// 只有第一段。前端拿到的数据里根本没有这一行，在那边解析必然恒为 None
+    /// ——2026-09-16 独立 review 发现的就是这个，整个混合图接合静默不生效。
+    ///
+    /// 解析用 `svn_baseline::parse_trailer`，与录制基线的是同一份实现，
+    /// 不存在两侧规则漂移的问题。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_rev: Option<u64>,
+    /// `Local-Only: true`（spec §6.7）：用户勾了「仅本地，不交付」。
+    /// 同样只能从正文里看出来。
+    #[serde(skip_serializing_if = "is_false")]
+    pub local_only: bool,
+}
+
+/// `skip_serializing_if` 用。普通 git 仓库的每一条提交都会带上这两个字段，
+/// 5000 条 × 两个恒定值是白给的传输量。
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// `Local-Only: true`（spec §6.7）。键按 git 的惯例大小写不敏感，
+/// 且**逐行完整匹配**——正文里顺口提到这个词的提交不算。
+fn parse_local_only(message: &str) -> bool {
+    message.lines().any(|line| {
+        let line = line.trim();
+        let Some((key, value)) = line.split_once(':') else {
+            return false;
+        };
+        key.eq_ignore_ascii_case("local-only") && value.trim().eq_ignore_ascii_case("true")
+    })
 }
 
 #[derive(Serialize)]
@@ -56,12 +96,16 @@ pub fn load(path: &str) -> Result<GraphData> {
     for oid in walk {
         let oid = oid?;
         let commit = repo.find_commit(oid)?;
+        // 正文只在这里用一次：解析完就丢，不进 payload。
+        let full = commit.message().unwrap_or("");
         commits.push(CommitNode {
             id: oid.to_string(),
             parents: commit.parent_ids().map(|id| id.to_string()).collect(),
             author: commit.author().name().unwrap_or("").to_string(),
             time: commit.time().seconds(),
             message: commit.summary().unwrap_or("").to_string(),
+            baseline_rev: crate::engine::svn_baseline::parse_trailer(full).map(|t| t.rev),
+            local_only: parse_local_only(full),
         });
         if commits.len() >= limit {
             break;

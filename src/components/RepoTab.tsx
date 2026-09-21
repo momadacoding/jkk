@@ -15,11 +15,15 @@ import {
   useRepoEffects,
   svnInitHybrid,
   svnPreflightCheck,
+  svnRebuildBaseline,
+  svnCheckBaseline,
 } from '../store/repoStore'
 import SvnInitWizard from './SvnInitWizard'
-import { describePinned } from '../engine/svnInit'
+import BaselineBanner from './BaselineBanner'
+import { baselineMap } from '../engine/svnGraph'
+import { describeHealth, describePinned, healthNeedsRebuild } from '../engine/svnInit'
 import { samePath } from '../engine/path'
-import { visibleSections } from '../engine/capabilities'
+import { isBaselineBranch, visibleSections } from '../engine/capabilities'
 import { askConfirm } from '../engine/confirm'
 import { usePrompt } from './PromptDialog'
 import { useConfirm } from './ConfirmDialog'
@@ -110,6 +114,7 @@ export function RepoTab({
   const {
     state, openRepo, refreshHead, refreshGraph, refreshStatus, refreshWorktrees,
     refreshDiff, refreshUpstream, refreshStashes, refreshPullRequests,
+    refreshSvnSync, checkSvnSyncIfChanged, fetchSvnLog, refreshSvnAudit, auditSvnIfDue,
     selectCommit, clearError, reportError,
   } = useRepoStore()
   const [repoState, setRepoState] = useState<string>('normal')
@@ -125,7 +130,7 @@ export function RepoTab({
 
   useRepoEffects(
     state,
-    { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes },
+    { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, auditSvnIfDue },
     viewMode,
   )
 
@@ -510,6 +515,76 @@ export function RepoTab({
     )
   }
 
+  /**
+   * 重建基线（NB-6 的入口之一）。
+   *
+   * **必须先过确认对话框。** 它会移动 `svn/base` 指针——虽然不碰工作目录、
+   * 也不动工作分支（R1–R5 全程如此），但那是一个用户应当知情的状态变更，
+   * 而且旧基线只能从 reflog 找回来。
+   */
+  const handleRebuildBaseline = async () => {
+    await confirm({
+      title: '重建基线',
+      message: '把白名单内的内容按**服务器上当前 revision** 的样子录成一个新的基线 commit。',
+      warning:
+        '不会修改工作目录里的任何文件，也不会推进你的工作分支——' +
+        '分支要不要跟进新基线，由你之后自己决定。' +
+        '你未提交的 SVN 改动不影响重建：那些文件会按服务器上的版本录进基线，' +
+        '磁盘上的改动原样保留。',
+      confirmLabel: '重建',
+      busyLabel: '正在重建…',
+      // 走 action 而不是「确认后自己跑」：重建要发 svn diff 体检（网络），
+      // 确认完就关框的话那几秒界面上毫无动静，看着像卡死。
+      action: async () => {
+        await svnRebuildBaseline(repoPath)
+        await refreshSvnSync(repoPath)
+        void fetchSvnLog(repoPath)
+        void refreshSvnAudit(repoPath)
+      },
+    })
+  }
+
+  /**
+   * 手动体检当前基线（NB-6 的入口之二）。
+   *
+   * `check_current_baseline` 是 `Lying`（基线撒谎）**唯一真正可达的入口**
+   * ——初始化与重建路径上的体检失败会直接中止流程，用户看不到那个结论。
+   */
+  const handleCheckBaseline = async () => {
+    try {
+      const health = await svnCheckBaseline(repoPath)
+      // 复用向导那边的同一份翻译，不另写一套——两份文案迟早说出不同的话。
+      const n = describeHealth(health)
+      // 报「基线在撒谎」时必须就地给出路：那个结论只在 revision 对得上时出现，
+      // 而重建按钮挂在失同步横幅上，那时横幅不在（判据见 `healthNeedsRebuild`）。
+      const offerRebuild = healthNeedsRebuild(health)
+      const ok = await confirm({
+        title: n.title,
+        message:
+          n.tone === 'error'
+            ? '下面这些文件，基线记的内容与服务器上的不一致：'
+            : n.detail,
+        // `Lying` 的文件清单走红底警告条——「基线在撒谎」与普通说明不是一个分量。
+        warning: n.tone === 'error' ? n.detail : undefined,
+        confirmLabel: offerRebuild ? '重建基线' : '知道了',
+      })
+      // 接着弹重建自己那个确认框，而不是在这里直接动手：重建要说明「不碰工作
+      // 目录、不推进工作分支」，那段话只应有一份。两个框的代价是多点一次，
+      // 比两处文案迟早说出不同的话便宜。
+      if (offerRebuild && ok) await handleRebuildBaseline()
+    } catch (err) {
+      reportError(err)
+    }
+  }
+
+  // HEAD 落在 baseline commit 上时（用户可以 checkout 到 svn/base），
+  // 那个 oid 已经被接合从图上删掉了。换算成 `svn:N` 才找得到对应行 ——
+  // 否则 HEAD 标记不画、侧边栏单击「定位」滚不过去。
+  const graphHeadHash =
+    state.capabilities.vcs === 'svn'
+      ? baselineMap(state.gitCommits).get(state.headHash) ?? state.headHash
+      : state.headHash
+
   // pinned 模式的残余风险，spec §6.5.3 第 3 条要求**常驻说明**：
   // 别的工具在项目根跑递归 update 会把这些目录退回被钉住的 revision，
   // 而工作副本看起来是干净的。只在向导里显示一次不算常驻。
@@ -524,6 +599,13 @@ export function RepoTab({
           <pre>{pinnedNotice.detail}</pre>
         </div>
       )}
+      <BaselineBanner
+        isSvn={state.capabilities.vcs === 'svn'}
+        sync={state.svnSync}
+        audit={state.svnAudit}
+        onRebuild={() => void handleRebuildBaseline()}
+        onCheck={() => void handleCheckBaseline()}
+      />
       {state.error && (
         <div className="banner-error">
           <span>{state.error}</span>
@@ -625,11 +707,17 @@ export function RepoTab({
                     pullRequests={state.pullRequests}
                     selectedId={state.selectedId}
                     onSelect={selectCommit}
-                    headHash={state.headHash}
+                    headHash={graphHeadHash}
                     changeCount={state.status.unstaged.length + state.status.staged.length}
                     onOpenChanges={() => setViewMode('changes')}
                     onCommitAction={(action, commit) => void handleCommitAction(action, commit)}
                     capabilities={state.capabilities}
+                    onLoadMoreSvn={
+                      state.capabilities.vcs === 'svn'
+                        ? () => void fetchSvnLog(repoPath, true)
+                        : undefined
+                    }
+                    svnLogComplete={state.svnLogComplete}
                   />
                 </Panel>
                 <Separator style={{ height: 4, background: '#333' }} />
@@ -649,6 +737,8 @@ export function RepoTab({
                 onUnstage={(paths) => runAndRefresh('unstage', { paths }, async () => { await refreshStatus(state.path!); await refreshDiff(state.path!, 'workdir') })}
                 onDiscard={(paths, staged) => void handleDiscard(paths, staged)}
                 onCommit={handleCommit}
+                svnMode={state.capabilities.vcs === 'svn'}
+                onBaselineBranch={isBaselineBranch(state.head)}
               />
             )}
           </Panel>

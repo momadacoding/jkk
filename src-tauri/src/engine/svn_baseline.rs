@@ -11,7 +11,7 @@
 //! 3. **trailer 三字段缺一不可**，解析失败即「这不是 baseline」（spec §6.4.1）
 //! 4. **`update-ref` 必须带旧 OID 作比较条件**
 
-use crate::engine::git_cli::{run_git, run_git_code, run_git_env};
+use crate::engine::git_cli::{run_git, run_git_code, run_git_env, run_git_stdin};
 use crate::engine::svn_config::BASELINE_BRANCH;
 use crate::error::{GitError, Result};
 use std::collections::BTreeSet;
@@ -125,6 +125,88 @@ impl TempIndex {
             .collect())
     }
 
+    /// 某个路径在候选索引里已有的 mode（`100644` / `100755` / `120000`…）。
+    ///
+    /// 不在索引里返回 `None`——**不要编一个默认值出来**：调用方要靠这个区分
+    /// 「替换一个已有条目」和「新建一个磁盘上没有的条目」（`deleted` / `missing`
+    /// 的形态，spec §16 R2a）。
+    pub fn stage_mode(&self, repo_root: &str, path: &str) -> Result<Option<String>> {
+        let p = normalize_entry_path(path)?;
+        // `-s` 的输出形如 `100644 <oid> 0\tCode/A.cs`。`--` 后面跟精确路径，
+        // 不是 glob，所以最多一行。
+        let out = self.git(repo_root, &["ls-files", "-s", "--", &p])?;
+        Ok(out
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().next())
+            .map(str::to_string))
+    }
+
+    /// 把 `bytes` 写成一个 blob，并挂到候选索引的 `path` 上。
+    ///
+    /// spec §16 R2b 的「取回 BASE」动作。**只动索引，不写磁盘**——这是整条重建
+    /// 流程对工作目录只读的关键，也是它与 `svn revert` 的本质区别。
+    ///
+    /// mode 沿用该路径在索引里已有的值；不在索引里（服务器上有、磁盘上没有）
+    /// 则用 `100644`。**不自己判断可执行位**：Windows 上 `core.fileMode` 通常是
+    /// false，`git add` 一律给 100644，替换动作没有理由顺手改掉一个与本期无关的
+    /// 属性。
+    pub fn replace_blob(&self, repo_root: &str, path: &str, bytes: &[u8]) -> Result<()> {
+        let p = normalize_entry_path(path)?;
+        let mode = self
+            .stage_mode(repo_root, &p)?
+            .unwrap_or_else(|| "100644".to_string());
+        // ⚠️ **`--path` 不能省。**
+        //
+        // `git hash-object --stdin` 默认**不跑任何过滤器**，而 `git add` 会。本机
+        // （以及多数 Windows 开发机）`core.autocrlf=true`，于是同一个文件走两条路会
+        // 得到两个不同的 blob。2026-09-17 实测，一个 `svn:eol-style=native` 的文件：
+        //
+        // ```text
+        // 磁盘                    = "n1\r\n"   CRLF
+        // git add -A 之后的 blob  = "n1\n"     LF    ← autocrlf 归一了
+        // hash-object --stdin     = "n1\r\n"   CRLF  ← 没归一
+        // ```
+        //
+        // 后果是**这个文件在基线里长什么样，取决于它当时脏不脏**：在脏工作副本上
+        // 重建一次，行尾整个翻一遍，工作分支上凭空出现「每一行都改了」的假 diff。
+        //
+        // `--path <路径>` 让 hash-object 按该路径**应当适用的**属性跑过滤器
+        // （autocrlf、`.gitattributes` 的 text/eol 规则都算），与 `git add` 对齐。
+        // 对齐的基准必须是 `git add`——树里绝大部分内容是它录进去的。
+        let oid = run_git_stdin(
+            repo_root,
+            &["hash-object", "-w", "--path", &p, "--stdin"],
+            bytes,
+        )?
+        .trim()
+        .to_string();
+        if oid.is_empty() {
+            return Err(GitError::new(
+                "svn_baseline_hash_object",
+                format!("`{p}` 的内容写成 blob 之后没拿到 OID"),
+            ));
+        }
+        // `--add` 让索引里没有的路径也能建出来；`--cacheinfo` 直接指定
+        // (mode, oid, path) 三元组，不经过磁盘。
+        let info = format!("{mode},{oid},{p}");
+        self.git(repo_root, &["update-index", "--add", "--cacheinfo", &info])?;
+        Ok(())
+    }
+
+    /// 把一条路径从候选索引里摘掉。
+    ///
+    /// spec §16 R2b 的「剔除」动作：服务器 rN 上没有这个文件（本地 `svn add` 了
+    /// 没提交，或者压根没版本控制）。**磁盘上的文件原样保留**——它是用户的内容，
+    /// 只是不属于基线。
+    pub fn remove_path(&self, repo_root: &str, path: &str) -> Result<()> {
+        let p = normalize_entry_path(path)?;
+        // `--force-remove` 才会在文件**仍然存在于磁盘上**时也把条目摘掉；
+        // 不带它的 `--remove` 只对磁盘上已消失的文件生效，而这里正相反。
+        self.git(repo_root, &["update-index", "--force-remove", "--", &p])?;
+        Ok(())
+    }
+
     /// 把候选索引写成一棵 tree，返回它的 OID。
     pub fn write_tree(&self, repo_root: &str) -> Result<String> {
         Ok(self.git(repo_root, &["write-tree"])?.trim().to_string())
@@ -139,6 +221,21 @@ impl TempIndex {
         let p = self.path.to_string_lossy().to_string();
         run_git_env(repo_root, args, &[("GIT_INDEX_FILE", &p)])
     }
+}
+
+/// 索引条目路径的归一：正斜杠、非空。
+///
+/// 空路径单独拦住，不交给 git 去解释。`git update-index --force-remove -- ""` 的
+/// 行为不该由我们去猜，而本仓库已经因为空 pathspec 误伤过一次（`AGENTS.md` §6.2）。
+fn normalize_entry_path(path: &str) -> Result<String> {
+    let p = path.replace('\\', "/");
+    if p.trim().is_empty() {
+        return Err(GitError::new(
+            "svn_baseline_empty_path",
+            "索引条目的路径是空的。空 pathspec 在本仓库造成过一次误伤，一律拒绝。",
+        ));
+    }
+    Ok(p)
 }
 
 impl Drop for TempIndex {

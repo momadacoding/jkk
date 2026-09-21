@@ -40,6 +40,17 @@ fn try_svn(dir: &Path, args: &[&str]) -> bool {
         .success()
 }
 
+/// 在某个目录下跑一条 svn 命令，失败即 panic。
+///
+/// 给测试**构造外部变更**用——「有人用 TortoiseSVN 在外面提交 / update 了」
+/// 是本期一大半场景的前提，而那一步按定义发生在本应用之外，只能由测试自己发。
+///
+/// ⚠️ 这不违反本期「零 SVN 写操作」的约束：那条约束的作用域是
+/// `src-tauri/src/`（产品代码），不是测试。
+pub fn svn_cmd(dir: &Path, args: &[&str]) {
+    run(dir, "svn", args);
+}
+
 /// Windows 上 `file://` URL 是 `file:///C:/path`（三斜杠 + 盘符 + 正斜杠）。
 /// 这是已知跨平台坑，不能靠路径拼接碰运气（spec §14.1）。
 pub fn file_url(p: &Path) -> String {
@@ -276,6 +287,35 @@ pub enum DirtyKind {
     Added,
     /// `svn delete` 了但没提交。
     Deleted,
+    /// 白名单目录里多出一个**没纳入版本控制的目录**，里面两层 `.cs`。
+    ///
+    /// # 这不是 [`DirtyKind::Unversioned`] 的换皮
+    ///
+    /// 2026-09-20 实测，`svn status --xml`（带不带 `-v` 都一样）对这种形态
+    /// **只报目录本身，里面一个文件都不报**：
+    ///
+    /// ```xml
+    /// <entry path="Code\NewDir">
+    ///   <wc-status item="unversioned" props="none"></wc-status>
+    /// </entry>
+    /// ```
+    ///
+    /// 而 git 的 exclude 规则按扩展名**递归**收（`!/Code/**/*.cs`），里面的
+    /// `.cs` 照样进基线树。分类层若只认 svn 报的那一条路径，这些文件就会以
+    /// 磁盘内容混进一个声称「等于服务器 rN」的树里，四道检查全绿——正是本期
+    /// 要消灭的那种假基线。
+    UnversionedDir,
+    /// 白名单目录里一个被 `svn:ignore` 挡掉的**目录**，里面有 `.cs`。
+    ///
+    /// 与 [`DirtyKind::UnversionedDir`] 同一个形态，只是 item 变成 `ignored`。
+    /// 单列是因为 `--no-ignore` 这一路的分支是独立的。
+    IgnoredDir,
+    /// `svn delete` 掉一个**目录**（里面有 `.cs`），没提交。
+    ///
+    /// 实测：不带 `-v` 的 `svn status` 只报目录本身；**带 `-v` 才会同时列出
+    /// `Code/Deep/D.cs` 也是 `deleted`**。目录本身在磁盘上已经没了，
+    /// 而 `svn cat -r BASE Code/Deep/D.cs@` 仍然取得到内容（exit 0）。
+    DeletedDir,
 }
 
 /// 在 [`svn_repo`] 的基础上制造一种脏状态。
@@ -295,6 +335,30 @@ pub fn svn_repo_dirty(kind: DirtyKind) -> SvnFixture {
         }
         DirtyKind::Deleted => {
             run(&wc, "svn", &["delete", "Code/B.cs", "--non-interactive"]);
+        }
+        DirtyKind::UnversionedDir => {
+            std::fs::create_dir_all(wc.join("Code/NewDir/Deeper")).unwrap();
+            std::fs::write(wc.join("Code/NewDir/New.cs"), "n\n").unwrap();
+            std::fs::write(wc.join("Code/NewDir/Deeper/Deep.cs"), "d\n").unwrap();
+            // 白名单内但扩展名不符：它不该进 `S`，也本来就进不了基线树。
+            std::fs::write(wc.join("Code/NewDir/note.txt"), "t\n").unwrap();
+        }
+        DirtyKind::IgnoredDir => {
+            std::fs::create_dir_all(wc.join("Code/Ign")).unwrap();
+            std::fs::write(wc.join("Code/Ign/G.cs"), "g\n").unwrap();
+            run(
+                &wc,
+                "svn",
+                &["propset", "svn:ignore", "Ign", "Code", "--non-interactive"],
+            );
+        }
+        DirtyKind::DeletedDir => {
+            std::fs::create_dir_all(wc.join("Code/Deep")).unwrap();
+            std::fs::write(wc.join("Code/Deep/D.cs"), "d\n").unwrap();
+            run(&wc, "svn", &["add", "Code/Deep", "--non-interactive"]);
+            run(&wc, "svn", &["commit", "-m", "r2", "--non-interactive"]);
+            run(&wc, "svn", &["update", "--non-interactive"]);
+            run(&wc, "svn", &["delete", "Code/Deep", "--non-interactive"]);
         }
     }
     fx
@@ -591,6 +655,170 @@ pub fn svn_repo_mixed_revision() -> SvnFixture {
     SvnFixture { dir }
 }
 
+/// 白名单目录**在 r1 上还不存在**，r2 才建出来。
+///
+/// # 干什么用的
+///
+/// 复现 2026-09-15 实测 P1 那个形态：`svn ls -R <url>/Code@1` 时路径不存在，
+/// svn **exit 1**，但 stdout 仍是一份**结构完整的空** `<lists><list></list></lists>`
+/// ——`parse_list` 会成功解析出一个空清单。
+///
+/// 这是服务器侧核对最危险的失败形态：忽略退出码的写法会拿到空的服务器集合，
+/// 而「服务器有、磁盘没有」的差集在空集上**恒为空** ⇒ 报告「没有漏收」。
+///
+/// 「把整个仓库删掉」那种造法**测不出这一条**：那时 XML 是坏的，解析会失败，
+/// 于是靠解析错误兜住了，退出码那道门根本没被考验到。
+pub fn svn_repo_whitelist_added_in_r2() -> SvnFixture {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    run(&root, "svnadmin", &["create", "repo"]);
+    let url = file_url(&root.join("repo"));
+    run(
+        &root,
+        "svn",
+        &["checkout", &url, "wc1", "--non-interactive"],
+    );
+    let wc = root.join("wc1");
+
+    // r1：只有 Other/，还没有 Code/
+    std::fs::create_dir_all(wc.join("Other")).unwrap();
+    std::fs::write(wc.join("Other/O.txt"), "o\n").unwrap();
+    run(&wc, "svn", &["add", "Other", "--non-interactive"]);
+    run(
+        &wc,
+        "svn",
+        &["commit", "-m", "r1 other", "--non-interactive"],
+    );
+
+    // r2：Code/ 这才出现
+    std::fs::create_dir_all(wc.join("Code")).unwrap();
+    std::fs::write(wc.join("Code/A.cs"), "a\n").unwrap();
+    run(&wc, "svn", &["add", "Code", "--non-interactive"]);
+    run(
+        &wc,
+        "svn",
+        &["commit", "-m", "r2 code", "--non-interactive"],
+    );
+    run(&wc, "svn", &["update", "--non-interactive"]);
+    SvnFixture { dir }
+}
+
+/// 三个 revision、工作副本**干净地停在 r3**。
+///
+/// 失同步检测的测试都要从这里起步：先在一个干净仓库上初始化（P1/P2/P3 都得过），
+/// 再由测试自己制造外部变更。直接拿一个已经失同步的 fixture 去初始化是造不出来的
+/// ——向导会在前置校验那一步就把它拦下。
+///
+/// `seed/` 那个工作副本留着不删，测试可以用它扮演「同事的机器」发外部提交。
+pub fn svn_repo_three_revisions() -> SvnFixture {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let url = seed_three_revisions(&root);
+    run(
+        &root,
+        "svn",
+        &["checkout", &url, "wc1", "--non-interactive"],
+    );
+    SvnFixture { dir }
+}
+
+/// 白名单落在一条**被 `-r` 钉死、但已被单独 update 到 HEAD** 的 external 里。
+///
+/// # 这是 spec §6.6.2 点名的那个「具体且常见」的成因
+///
+/// 布局：`Code` 是一条 `-r2 ^/vendor Code` 的 external（钉在 r2），而仓库已经
+/// 走到 r4。fixture 最后把 `Code` **单独** update 到 HEAD，于是：
+///
+/// ```text
+/// nodeRevs(Code) = {4}      ← 可以初始化，baselineRev = 4
+/// externals 定义仍然写着 -r2
+/// ```
+///
+/// 测试接着在**项目根**跑一次递归 `svn update`，SVN 会按 externals 定义把 `Code`
+/// **拽回 r2**。此时 `nodeRevs = {2}`、`baselineRev = 4`，而 2 恰好等于该 external
+/// 的 peg —— 这正是 `PinnedReset` 要认出来的形态。
+///
+/// 认错的代价很具体：`Diverged` 给的引导是「重建基线」（重型，而且会把钉死的
+/// 旧内容录成新基线），`PinnedReset` 给的是一条 `svn update <目录>`（一步到位）。
+pub fn svn_repo_pinned_external_updated_to_head() -> SvnFixture {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    run(&root, "svnadmin", &["create", "repo"]);
+    let url = file_url(&root.join("repo"));
+    run(
+        &root,
+        "svn",
+        &["checkout", &url, "seed", "--non-interactive"],
+    );
+    let seed = root.join("seed");
+
+    // r1：建 vendor/ 与项目根 proj/
+    std::fs::create_dir_all(seed.join("vendor")).unwrap();
+    std::fs::create_dir_all(seed.join("proj")).unwrap();
+    std::fs::write(seed.join("vendor/A.cs"), "v1\n").unwrap();
+    std::fs::write(seed.join("proj/readme.txt"), "p\n").unwrap();
+    run(
+        &seed,
+        "svn",
+        &["add", "vendor", "proj", "--non-interactive"],
+    );
+    run(&seed, "svn", &["commit", "-m", "r1", "--non-interactive"]);
+
+    // r2：vendor 往前走一格 —— 这个 revision 就是后面要钉住的那个 peg
+    std::fs::write(seed.join("vendor/A.cs"), "v2\n").unwrap();
+    run(
+        &seed,
+        "svn",
+        &["commit", "-m", "r2 vendor", "--non-interactive"],
+    );
+
+    // r3：把 external 定义挂到 proj 上，钉死在 r2
+    //
+    // ⚠️ 属性值走 `-F` 文件：命令行传值遇到混合行尾会让 propset 报 E135000
+    // 而属性**静默没设上**，测试会拿到「这个仓库没有 externals」的假绿（1b 实测 E10）。
+    let ext = root.join("externals.txt");
+    std::fs::write(&ext, "-r2 ^/vendor Code\n").unwrap();
+    run(
+        &seed,
+        "svn",
+        &[
+            "propset",
+            "svn:externals",
+            "-F",
+            ext.to_str().unwrap(),
+            "proj",
+            "--non-interactive",
+        ],
+    );
+    run(
+        &seed,
+        "svn",
+        &["commit", "-m", "r3 pin", "--non-interactive"],
+    );
+
+    // r4：vendor 再往前走一格，让「HEAD」与「peg」真的错开
+    run(&seed, "svn", &["update", "--non-interactive"]);
+    std::fs::write(seed.join("vendor/A.cs"), "v4\n").unwrap();
+    run(
+        &seed,
+        "svn",
+        &["commit", "-m", "r4 vendor", "--non-interactive"],
+    );
+
+    // 把 proj 检出成 wc1，此时 external Code 会按定义停在 r2
+    let proj_url = format!("{url}/proj");
+    run(
+        &root,
+        "svn",
+        &["checkout", &proj_url, "wc1", "--non-interactive"],
+    );
+    let wc = root.join("wc1");
+
+    // 有人**单独**把 Code 更到了 HEAD —— 初始化就发生在这个状态下
+    run(&wc, "svn", &["update", "--non-interactive", "--", "Code@"]);
+    SvnFixture { dir }
+}
+
 /// **rootRev 落后，但 nodeRevs 是单值**：根留在 r1，只把 `Code` 子树更到 r3。
 ///
 /// 2026-09-14 实测：`svn info .` 的 revision = 1，`nodeRevs` = `{3}`
@@ -693,4 +921,233 @@ pub fn svn_repo_incomplete_after_cleanup() -> SvnFixture {
     let fx = svn_repo_interrupted_update();
     run(&fx.wc(), "svn", &["cleanup", "--non-interactive"]);
     fx
+}
+
+/// **白名单所处的 revision 没有碰过白名单**——「孤儿 baseline」的成因。
+///
+/// # 这是常态，不是边界情况（2026-09-15 实测）
+///
+/// spec §10.3 把孤儿 baseline 描述成「若某个 baseline 的 revision **太老**」。
+/// 成因其实与新旧无关：`svn update` 会把工作副本内**所有**节点的
+/// `wc-status revision` 一律推到当时的 HEAD，**不管那个 revision 有没有动过它们**。
+/// 于是同事在别的目录上提交几次之后，白名单的 `nodeRevs` 就等于一个从没碰过
+/// 白名单的 revision，而 `baselineRev` 正是取自 `nodeRevs`。
+///
+/// 本 fixture 把这个形态固定下来：
+///
+/// ```text
+/// r1  建 Code/A.cs 与 Other/O.txt
+/// r2  只改 Code/A.cs          ← 白名单最后一次真正变化
+/// r3  只改 Other/O.txt        ← 同事的提交
+/// r4  只改 Other/O.txt        ← 同事的提交
+/// svn update
+///   → svn status -v -- Code   的 wc-status revision = 4
+///   → svn log -r 4:4 <url>/Code    **空**（实测 Q1）
+///   → svn log -r 4:4 <Repository Root>  拿得到 r4（实测 Q2）
+/// ```
+///
+/// 所以锚点补拉**必须打给 Repository Root**；打给白名单 URL 会拿到空结果，
+/// 图上那个 `svn:4` 节点就永远建不出来，工作分支挂不上主干。
+pub fn svn_repo_baseline_rev_outside_whitelist() -> SvnFixture {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    run(&root, "svnadmin", &["create", "repo"]);
+    let url = file_url(&root.join("repo"));
+    run(
+        &root,
+        "svn",
+        &["checkout", &url, "wc1", "--non-interactive"],
+    );
+    let wc = root.join("wc1");
+
+    std::fs::create_dir_all(wc.join("Code")).unwrap();
+    std::fs::create_dir_all(wc.join("Other")).unwrap();
+    std::fs::write(wc.join("Code/A.cs"), "a\n").unwrap();
+    std::fs::write(wc.join("Other/O.txt"), "o\n").unwrap();
+    run(&wc, "svn", &["add", "Code", "Other", "--non-interactive"]);
+    run(
+        &wc,
+        "svn",
+        &["commit", "-m", "r1 both", "--non-interactive"],
+    );
+
+    std::fs::write(wc.join("Code/A.cs"), "a2\n").unwrap();
+    run(
+        &wc,
+        "svn",
+        &["commit", "-m", "r2 code only", "--non-interactive"],
+    );
+
+    // r3 / r4：只动白名单**之外**的目录，模拟同事在别的项目上提交
+    std::fs::write(wc.join("Other/O.txt"), "o3\n").unwrap();
+    run(
+        &wc,
+        "svn",
+        &["commit", "-m", "r3 other only", "--non-interactive"],
+    );
+    std::fs::write(wc.join("Other/O.txt"), "o4\n").unwrap();
+    run(
+        &wc,
+        "svn",
+        &["commit", "-m", "r4 other only", "--non-interactive"],
+    );
+
+    // update 之后 Code 的 nodeRevs 才会被推到 4 —— 少了这一步整个形态不成立
+    run(&wc, "svn", &["update", "--non-interactive"]);
+    SvnFixture { dir }
+}
+
+/// 工作副本停在 r1，而服务器已经走到 r9 —— **基线的 revision 远低于历史顶端**。
+///
+/// # 这个形态是翻页游标的试金石
+///
+/// `svn update` 不是每天都跑。工作副本停在一个旧 revision 上时，基线记的也是那个
+/// 旧 revision，而它**不在首屏那一页里**——首屏拿的是最新的一页。于是基线只能
+/// 靠单点补拉的锚点进入序列，序列变成「顶上一段 + 底下一个孤零零的锚点」，
+/// 中间整段是空的。
+///
+/// 拿「序列里最旧的 revision」当翻页游标，就会直接从那个锚点往下翻，
+/// **中间那一大段永远拿不到**，而界面上只表现为图里少了些节点。
+pub fn svn_repo_working_copy_far_behind() -> SvnFixture {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    run(&root, "svnadmin", &["create", "repo"]);
+    let url = file_url(&root.join("repo"));
+
+    // r1：wc1 自己建出白名单内容，之后**再也不 update**
+    run(
+        &root,
+        "svn",
+        &["checkout", &url, "wc1", "--non-interactive"],
+    );
+    let wc = root.join("wc1");
+    std::fs::create_dir_all(wc.join("Code")).unwrap();
+    std::fs::write(wc.join("Code/A.cs"), "a\n").unwrap();
+    run(&wc, "svn", &["add", "Code", "--non-interactive"]);
+    run(&wc, "svn", &["commit", "-m", "r1", "--non-interactive"]);
+    run(&wc, "svn", &["update", "--non-interactive"]);
+
+    // r2..r9 由**另一个 checkout** 提交：wc1 的 nodeRevs 因此停在 1，
+    // 正是「同事在推进，我还没 update」的日常形态。
+    run(
+        &root,
+        "svn",
+        &["checkout", &url, "other", "--non-interactive"],
+    );
+    let other = root.join("other");
+    for n in 2..=9 {
+        std::fs::write(other.join("Code/A.cs"), format!("a{n}\n")).unwrap();
+        run(
+            &other,
+            "svn",
+            &["commit", "-m", &format!("r{n}"), "--non-interactive"],
+        );
+        run(&other, "svn", &["update", "--non-interactive"]);
+    }
+
+    SvnFixture { dir }
+}
+
+/// 白名单里放两个 `.cs`：一个设了 `svn:eol-style=native`（Windows 上磁盘是 CRLF），
+/// 一个什么都不设（磁盘是 LF）。
+///
+/// 这个 fixture 钉住的是 **git 的 `core.autocrlf` 与录制路径的交互**。多数 Windows
+/// 开发机上 `core.autocrlf=true`，于是：
+///
+/// ```text
+/// 磁盘（native）          = "n1\r\n"   CRLF
+/// git add -A 进 blob      = "n1\n"     LF     ← 归一过
+/// hash-object --stdin     = "n1\r\n"   CRLF   ← 没归一
+/// ```
+///
+/// 两条录制路径产出不同的 blob，意味着「这个文件在基线里长什么样」取决于它当时
+/// 脏不脏——在脏工作副本上重建一次就会把行尾整个翻一遍（2026-09-17 实测）。
+pub fn svn_repo_with_native_eol() -> SvnFixture {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    run(&root, "svnadmin", &["create", "repo"]);
+    let url = file_url(&root.join("repo"));
+    run(
+        &root,
+        "svn",
+        &["checkout", &url, "wc1", "--non-interactive"],
+    );
+    let wc = root.join("wc1");
+    std::fs::create_dir_all(wc.join("Code")).unwrap();
+    std::fs::write(wc.join("Code/Nat.cs"), "n1\n").unwrap();
+    std::fs::write(wc.join("Code/Plain.cs"), "p1\n").unwrap();
+    run(&wc, "svn", &["add", "Code", "--non-interactive"]);
+    run(
+        &wc,
+        "svn",
+        &[
+            "propset",
+            "svn:eol-style",
+            "native",
+            "Code/Nat.cs",
+            "--non-interactive",
+        ],
+    );
+    run(&wc, "svn", &["commit", "-m", "r1", "--non-interactive"]);
+    run(&wc, "svn", &["update", "--non-interactive"]);
+    SvnFixture { dir }
+}
+
+/// 把一个白名单内的 `.cs` 换成**同名目录**——SVN 意义上的 obstructed（`~`）。
+///
+/// 这是 spec §16.1 之后 P1 **唯一**仍然阻断的脏状态：svn 自己都说不清那个位置上
+/// 是什么，`svn cat -r BASE` 拿不到可信的内容，录不出「服务器在 rN 的样子」。
+pub fn svn_repo_obstructed() -> SvnFixture {
+    let fx = svn_repo();
+    let wc = fx.wc();
+    std::fs::remove_file(wc.join("Code/A.cs")).unwrap();
+    std::fs::create_dir(wc.join("Code/A.cs")).unwrap();
+    fx
+}
+
+/// 白名单内放一个 **GBK 编码**的 `.cs`，并在本地改脏它。
+///
+/// 国内 Unity 工程里 GBK 源码很常见。这个 fixture 钉住 spec §16.2 末那条约束：
+/// `svn cat` 的结果必须按字节接收。一旦过了 `String::from_utf8_lossy`，每个非法
+/// 字节会变成 U+FFFD，录进基线就是一棵被悄悄改坏的树——而基线体检**查不出来**
+/// （它比的是磁盘与服务器，不比基线树，spec §6.8.3）。
+pub fn svn_repo_with_gbk_source() -> SvnFixture {
+    let fx = svn_repo();
+    let wc = fx.wc();
+    // `// 中文` 的 GBK 字节：D6 D0 = 中，CE C4 = 文。D6 后面跟着的 D0 不是合法的
+    // UTF-8 续字节（续字节必须是 10xxxxxx），所以这串一定会触发 lossy 替换，
+    // 正是要钉的那种输入。
+    let gbk: Vec<u8> = vec![
+        0x2F, 0x2F, 0x20, 0xD6, 0xD0, 0xCE, 0xC4, 0x0A, 0x63, 0x6C, 0x61, 0x73, 0x73, 0x20, 0x47,
+        0x20, 0x7B, 0x7D, 0x0A,
+    ];
+    std::fs::write(wc.join("Code/Gbk.cs"), &gbk).unwrap();
+    run(&wc, "svn", &["add", "Code/Gbk.cs", "--non-interactive"]);
+    run(&wc, "svn", &["commit", "-m", "r2 gbk", "--non-interactive"]);
+    run(&wc, "svn", &["update", "--non-interactive"]);
+    // 本地改脏——这才是 R2b 真正会调用 cat 的形态
+    std::fs::write(wc.join("Code/Gbk.cs"), b"// local\n").unwrap();
+    fx
+}
+
+/// 建一个 Windows 目录 junction，成功返回 `true`。
+///
+/// 用 junction 而不是 `std::os::windows::fs::symlink_dir`：后者要管理员权限或
+/// 开发者模式，前者不需要。拿不到提权时用符号链接会让整条用例静默跳过，变成
+/// 什么都不测的假绿灯。
+///
+/// ⚠️ 路径里的正斜杠必须先换成反斜杠。`mklink` 是 cmd 的内建命令，cmd 按 `/X`
+/// 切选项——`C:\…\Code/Mirror` 里的 `/Mirror` 会被当成未知选项，命令失败且错误
+/// 信息完全指不到这上面（`tests/svn_exclude.rs` 里那一份记着同一个坑）。
+///
+/// 与 `tests/svn_exclude.rs` 里的同名 helper 同源。那边是另一个 test crate，
+/// 不引用本模块；重复一份比把那条测试改到依赖本模块的改动面小。
+#[cfg(windows)]
+pub fn make_junction(link: &Path, target: &Path) -> bool {
+    let win = |p: &Path| p.to_string_lossy().replace('/', "\\");
+    Command::new("cmd")
+        .args(["/c", "mklink", "/J", &win(link), &win(target)])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }

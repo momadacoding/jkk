@@ -15,14 +15,17 @@ use crate::engine::svn_cli::run_svn;
 use crate::engine::svn_config::{
     normalize_whitelist_entry, write_config, SvnConfig, BASELINE_BRANCH, SVN_GIT_MODE,
 };
+use crate::engine::svn_dirty::{classify, explained_paths, read_dirty, Fix};
 use crate::engine::svn_exclude::{generate_exclude, write_exclude};
 use crate::engine::svn_externals::{detect_pinned, PinnedExternal};
-use crate::engine::svn_health::{check_baseline, Health};
-use crate::engine::svn_include_check::verify_include_set;
-use crate::engine::svn_preflight::{run_preflight, Preflight};
+use crate::engine::svn_health::{check_baseline, ExplainedOrigin, Health};
+use crate::engine::svn_include_check::{normalize_roots, verify_include_set};
+use crate::engine::svn_preflight::{check_targets, read_node_rev, run_preflight, Preflight};
+use crate::engine::svn_pristine::{cat_base, BaseContent};
 use crate::engine::svn_xml::parse_info;
 use crate::error::{GitError, Result};
 use crate::vcs::{detect_repo_kind, RepoKind};
+use std::collections::BTreeSet;
 
 /// 初始化完成后立刻切上去的工作分支。UI 禁止在基线分支上开发提交（spec §6.4）。
 const WORK_BRANCH: &str = "work";
@@ -122,6 +125,78 @@ pub fn init_hybrid(req: &InitRequest) -> Result<InitReport> {
     }
 }
 
+/// 录出「**服务器 rN 的树**」（spec §16 R2a–R2c）。返回 `(TREE, S)`。
+///
+/// `S` 是本次**实际动过**的路径集合，交给体检当 §6.8.7 的 `S` 用。
+///
+/// # 三步
+///
+/// ```text
+/// R2a  按 svn status 把脏条目分成 取回BASE / 剔除 / 不用动
+/// R2b  先 git add -A 录下磁盘，再逐条改写成服务器内容
+/// R2c  核对文件集合 == 服务器 rN 的 W-file 集合
+/// ```
+///
+/// # 为什么不直接从服务器逐个取
+///
+/// 干净文件本来就等于服务器内容（`svn status` 说它是 pristine），绕道 `svn cat`
+/// 取一遍只是白花几万次子进程调用。真正需要换的只有脏的那几条，而那正是
+/// `svn status` 列出来的那份清单。
+///
+/// # `S` 必须恰好
+///
+/// 只有真正调用了 `replace_blob` / `remove_path` 的路径才进 `S`。非 W-file 的脏
+/// 条目（比如白名单目录里一个未版本控制的 `.txt`）在树里本来就不存在，对它动手
+/// 是 no-op——但把它记进 `S` 会让体检的 `D \ S` 变小，判据被悄悄削弱而没有任何
+/// 测试会变红（spec §16.1）。
+fn record_server_tree(
+    repo_root: &str,
+    cfg: &SvnConfig,
+    pre: &Preflight,
+) -> Result<(String, BTreeSet<String>)> {
+    let fixes = classify(&pre.dirty)?;
+    // `S` 先算出来，再拿它驱动改写——**同一个集合**既决定动哪些路径，也交给体检。
+    // 分两份算的话，两份迟早会不一致，而「体检那份更大」这个方向会悄悄削弱判据。
+    let touched = explained_paths(&fixes, &cfg.whitelist, &cfg.extensions);
+
+    let idx = TempIndex::empty(repo_root)?;
+    idx.add_all(repo_root, &cfg.whitelist)?;
+
+    for (path, fix) in &fixes {
+        if !touched.contains(path) {
+            // 不归 git 管，树里本来就没有它。见上面「`S` 必须恰好」。
+            continue;
+        }
+        match fix {
+            Fix::TakeBase => match cat_base(repo_root, path)? {
+                BaseContent::Bytes(bytes) => idx.replace_blob(repo_root, path, &bytes)?,
+                // 分类说「服务器上有」，服务器说「没有」。两边对不上时**停下**，
+                // 不能自作主张把它当成 Drop 处理掉——那等于用一个猜测悄悄改变
+                // 基线的内容集合。
+                BaseContent::NotOnServer => {
+                    return Err(GitError::new(
+                        "svn_baseline_classification_conflict",
+                        format!(
+                            "`{path}` 按 svn status 是「服务器上有」（{fix:?}），\
+                             但取它在服务器 r{} 上的内容时 svn 说这个文件还没提交过。\
+                             两个判断对不上，停下来而不是猜一个。\
+                             工作副本可能在录制过程中被外部改动了，请重试一次。",
+                            pre.node_rev
+                        ),
+                    ))
+                }
+            },
+            Fix::Drop => idx.remove_path(repo_root, path)?,
+        }
+    }
+
+    // R2c：核对与录制**共用同一份候选索引**（spec §6.3.1），核对完之后在同一个
+    // `idx` 上 `write_tree`——不得核对一次后又重新 add 另录一棵树。
+    verify_include_set(repo_root, &idx, &cfg.whitelist, &cfg.extensions, &fixes)?;
+    let tree = idx.write_tree(repo_root)?;
+    Ok((tree, touched))
+}
+
 /// 原子地创建 `.git` 目录，作为「这次初始化拥有它」的凭据。
 ///
 /// # 为什么不是「先判存在、再 `git init`」
@@ -185,12 +260,8 @@ fn build_repo(
     write_config(root, cfg)?;
     write_exclude(root, &generate_exclude(&cfg.whitelist, &cfg.extensions))?;
 
-    // 纳入集合核对与录制**共用同一个候选索引**（spec §6.3.1）。
-    // 首个基线从**空**索引起步。
-    let idx = TempIndex::empty(root)?;
-    idx.add_all(root, &cfg.whitelist)?;
-    verify_include_set(root, &idx, &cfg.whitelist, &cfg.extensions)?;
-    let tree = idx.write_tree(root)?;
+    // R2a–R2c：录出服务器 rN 的树。首个基线从**空**索引起步。
+    let (tree, explained) = record_server_tree(root, cfg, pre)?;
 
     let trailer = Trailer {
         // Repository Root，不是工作副本 URL（spec §6.4.1）
@@ -202,15 +273,29 @@ fn build_repo(
     // 刚 `git init` 出来的仓库正是如此。
     let baseline = publish_baseline(root, &tree, None, &trailer, None)?;
 
-    // 对齐真实索引（spec §6.3.1）。**不带 `-u`**：磁盘上已经是这份内容了，
-    // 带上只会多一次无谓的写盘，还可能改动文件时间戳。
+    // 对齐真实索引（spec §6.3.1）。**不带 `-u`**：绝不能用基线内容去覆盖磁盘。
     //
     // 这一步不能省：此刻 HEAD 已经附着在 svn/base 上并解析到刚才那个 commit，
     // 而真实索引还是空的——不对齐的话 `git status` 会把每个 W-file 都显示成
     // 「已删除」，用户一打开就看到满屏红色。
+    //
+    // §16.1 之后这一步还多了一层意义：基线树是**服务器内容**，磁盘上是用户改过的
+    // 内容，两者故意不同。对齐索引之后 `git status` 显示的恰好就是用户原有的那些
+    // 本地 SVN 修改（`M` → 已修改、`?` → 未跟踪、`D` → 已删除），第一眼就是对的。
+    // 带 `-u` 会把这些改动**抹掉**——那是本期最不能犯的错。
     run_git(root, &["read-tree", &tree])?;
 
-    let health = check_baseline(root, svn_url, pre.node_rev, &cfg.whitelist, &cfg.extensions)?;
+    let health = check_baseline(
+        root,
+        svn_url,
+        pre.node_rev,
+        &cfg.whitelist,
+        &cfg.extensions,
+        &explained,
+        // 刚刚由 R2b 从 `svn cat -r BASE` 写进去的，而 P2 保证 `BASE == node_rev`
+        // ——这批路径由构造保证正确，不必报成「未覆盖」。
+        ExplainedOrigin::JustRecorded,
+    )?;
     if let Health::Lying { files } = &health {
         // spec §6.8.5：此刻还没建工作分支，整个回退代价最小。
         return Err(GitError::new(
@@ -291,20 +376,21 @@ pub fn rebuild_baseline(repo_root: &str) -> Result<RebuildReport> {
     let pre = run_preflight(repo_root, &cfg.whitelist)?;
     let svn_url = working_copy_url(repo_root)?;
 
-    // R2：**从空索引起步**，录磁盘上现在的 W-file。核对与录制共用同一份索引。
-    let idx = TempIndex::empty(repo_root)?;
-    idx.add_all(repo_root, &cfg.whitelist)?;
-    verify_include_set(repo_root, &idx, &cfg.whitelist, &cfg.extensions)?;
-    let tree = idx.write_tree(repo_root)?;
+    // R2a–R2c：**从空索引起步**，录出服务器 rN 的树。
+    let (tree, explained) = record_server_tree(repo_root, &cfg, &pre)?;
 
-    // R3b：**在 R4 之前**。此刻 TREE 就是磁盘内容，体检的前提成立；
-    // 而指针还没动，中止的代价为零。
+    // R3b：**在 R4 之前**。判据是 §6.8.7 的 `D \ S == ∅`——磁盘与服务器的每一处
+    // 差异都必须被一条已知的本地修改解释。指针还没动，中止的代价为零。
     let health = check_baseline(
         repo_root,
         &svn_url,
         pre.node_rev,
         &cfg.whitelist,
         &cfg.extensions,
+        &explained,
+        // 刚刚由 R2b 从 `svn cat -r BASE` 写进去的，而 P2 保证 `BASE == node_rev`
+        // ——这批路径由构造保证正确，不必报成「未覆盖」。
+        ExplainedOrigin::JustRecorded,
     )?;
     if let Health::Lying { files } = &health {
         return Err(GitError::new(
@@ -320,6 +406,24 @@ pub fn rebuild_baseline(repo_root: &str) -> Result<RebuildReport> {
                     .map(|f| format!("  - {f}"))
                     .collect::<Vec<_>>()
                     .join("\n")
+            ),
+        ));
+    }
+
+    // R3c：复查 `nodeRevs` 仍是 {N}。纯本地，不走网络。
+    //
+    // 防的是 R2a 到此刻之间有人在 TortoiseSVN 里 commit / update，把 BASE 推到了
+    // N+1——那时 `svn cat -r BASE` 取回的是 N+1 的内容，而 trailer 写的是 rN
+    // （spec §16.1 末的竞态表）。体检通常已先一步拦下，这里是第二道。
+    let now = read_node_rev(repo_root, &cfg.whitelist)?;
+    if now != pre.node_rev {
+        return Err(GitError::new(
+            "svn_rebuild_revision_moved",
+            format!(
+                "重建过程中工作副本被外部改动了：开始时白名单停在 r{}，现在是 r{now}。\
+                 录下来的内容会对应错误的 revision，所以中止了——基线指针没有改动。\
+                 请重新点一次「重建基线」。",
+                pre.node_rev
             ),
         ));
     }
@@ -417,30 +521,80 @@ pub fn check_current_baseline(repo_root: &str) -> Result<Health> {
     )?
     .trim()
     .to_string();
+    // 这里曾经有一道门槛：「磁盘内容必须与基线树逐字节相同，否则不下结论」。
+    //
+    // **那道门槛和 §16.1 里那条「工作副本必须干净」是同一个病**：程序员的工作区
+    // 99% 的时间都是脏的，于是这颗「体检基线」按钮永远只会回答「没法下结论」。
+    // 换成 §6.8.7 的判据之后它重新变得可用，而且比原来**更强**——原来「基线树
+    // 与磁盘不一致」一律落 NotChecked，现在解释不了的那些会被算成证据。
+    //
+    // 现在的 `S` 取「此刻 svn 说哪些 W-file 是脏的」。它成立的理由：基线树若录得
+    // 正确就等于服务器 rN，而 `D \ S == ∅` 给出「磁盘在 S 之外等于服务器」，
+    // 两者合起来即「基线树在 S 之外等于服务器」。
+    //
+    // ⚠️ **代价要说清楚：`S` 里的那些文件，这条检查什么也证明不了。** 它比的是
+    // 磁盘与服务器，而那些路径上的磁盘内容本来就是用户改过的。工作副本干净时
+    // `S = ∅`，覆盖面才是完整的（spec §6.8.7）。
+    let wcs = crate::engine::svn_wc::enumerate_wcs(repo_root, &cfg.whitelist)?;
+    let targets = check_targets(&normalize_roots(&cfg.whitelist), &wcs);
+    let fixes = classify(&read_dirty(repo_root, &targets)?)?;
+    let explained = explained_paths(&fixes, &cfg.whitelist, &cfg.extensions);
+
+    // 基线树与磁盘树的差异里，**解释不了**的那些是独立的一份证据：它直接说明
+    // 基线树本身就不对（老版本录错了、有人手工在 svn/base 上提交过），而拿磁盘
+    // 去比服务器的那条路径看不见这种错误。
     let idx = TempIndex::empty(repo_root)?;
     idx.add_all(repo_root, &cfg.whitelist)?;
     let disk_tree = idx.write_tree(repo_root)?;
-    if disk_tree != baseline_tree {
-        return Ok(Health::NotChecked {
-            reason: format!(
-                "白名单内的磁盘内容与基线树不一致（基线树 {}，磁盘录出来是 {}）。\
-                 体检拿磁盘去跟服务器比，前提是这两者相同；不相同时它分不出\
-                 「基线记错了」和「你有未提交的改动」，所以这里不下结论。\n\
-                 这通常**不是**问题——在 work 分支上改代码本来就会这样。\
-                 想确认基线本身，请先提交或暂存改动，或者直接走「重建基线」。",
-                &baseline_tree[..baseline_tree.len().min(8)],
-                &disk_tree[..disk_tree.len().min(8)],
-            ),
-        });
-    }
+    let tree_evidence: Vec<String> = run_git(
+        repo_root,
+        &[
+            "diff-tree",
+            "-r",
+            "-z",
+            "--name-only",
+            &baseline_tree,
+            &disk_tree,
+        ],
+    )?
+    .split('\0')
+    .filter(|s| !s.is_empty())
+    .filter(|p| !explained.contains(*p))
+    .map(str::to_string)
+    .collect();
 
-    check_baseline(
+    let health = check_baseline(
         repo_root,
         &cfg.svn_url,
         trailer.rev,
         &cfg.whitelist,
         &cfg.extensions,
-    )
+        &explained,
+        // 手动体检：基线是**什么时候、哪个版本**录的都不知道，这条检查覆盖不到
+        // `S` 里那些路径，必须如实报出去（2026-09-21 独立 review）。
+        ExplainedOrigin::Unknown,
+    )?;
+
+    // 合并两份证据。`NotChecked` 原样透传——那是「没能验证」，不是「验证不通过」，
+    // 把它降级成 Lying 会让离线场景寸步难行（spec §6.8.6）。
+    //
+    // ⚠️ `unverified` 要原样带过去。第二份证据（基线树 vs 磁盘树）**同样**把
+    // `explained` 滤掉了，所以两份证据合起来仍然对那批路径一无所知。
+    Ok(match health {
+        Health::NotChecked { reason } => Health::NotChecked { reason },
+        Health::Verified { rev, unverified } if tree_evidence.is_empty() => {
+            Health::Verified { rev, unverified }
+        }
+        Health::Verified { .. } => Health::Lying {
+            files: tree_evidence,
+        },
+        Health::Lying { mut files } => {
+            files.extend(tree_evidence);
+            files.sort();
+            files.dedup();
+            Health::Lying { files }
+        }
+    })
 }
 
 /// 当前仓库里被钉死、且与白名单有交集的 external（spec §6.5.3 的常驻说明用它）。

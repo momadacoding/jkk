@@ -204,7 +204,7 @@ fn capabilities_serializes_to_the_exact_field_names_the_frontend_reads() {
     // JS 会拿到 `pull_requests` → 读 `caps.pullRequests` 得到 `undefined`
     // → falsy → **入口莫名其妙全消失了**，而两侧都编译通过、没有任何报错。
     //
-    // 这条把那层转换的结果钉死在一组字面量上。下面这六个键必须与
+    // 这条把那层转换的结果钉死在一组字面量上。下面这几个键必须与
     // `src/engine/capabilities.ts` 的 `interface Capabilities` 逐字一致。
     let json = serde_json::to_value(app_lib::vcs::Capabilities::all()).unwrap();
     let obj = json.as_object().expect("Capabilities 应当序列化成对象");
@@ -218,11 +218,18 @@ fn capabilities_serializes_to_the_exact_field_names_the_frontend_reads() {
             "pullRequests",
             "remotes",
             "tags",
+            "vcs",
             "worktrees",
         ],
         "字段名与前端 interface Capabilities 对不上"
     );
-    assert!(obj.values().all(|v| v == &serde_json::Value::Bool(true)));
+    // `vcs` 是字符串，其余仍然全是 true。分开断言而不是「所有值都是 true」——
+    // 后者在加了非布尔字段之后就不成立了。
+    assert_eq!(obj["vcs"], serde_json::Value::String("git".into()));
+    assert!(obj
+        .iter()
+        .filter(|(k, _)| k.as_str() != "vcs")
+        .all(|(_, v)| v == &serde_json::Value::Bool(true)));
 }
 
 // ---------------------------------------------------------------------------
@@ -244,15 +251,29 @@ fn keys_of(v: &serde_json::Value) -> Vec<String> {
 }
 
 #[test]
-fn preflight_serializes_to_camel_case() {
+fn preflight_serializes_to_camel_case_and_keeps_the_dirty_list_off_the_wire() {
     let json = serde_json::to_value(app_lib::engine::svn_preflight::Preflight {
         node_rev: 7,
         repos_root: "file:///x".into(),
         uuid: "u".into(),
+        // 非空，否则「它没被序列化」这件事证明不了——空 Vec 序列化出来也是看不见的
+        dirty: vec![app_lib::engine::svn_xml::StatusEntry {
+            path: "Code/A.cs".into(),
+            item: "modified".into(),
+            props: "none".into(),
+            wc_locked: false,
+        }],
     })
     .unwrap();
     assert_eq!(keys_of(&json), vec!["nodeRev", "reposRoot", "uuid"]);
     assert_eq!(json["nodeRev"], 7);
+    // `dirty` 带 `#[serde(skip)]` 是有意的：真实工程上它可能有几千条（白名单底下
+    // 每个未版本控制文件都算），而前端一条都不需要。这条断言防的是有人顺手把
+    // skip 去掉——那会让每次 preflight 都往 IPC 上搬几千条路径。
+    assert!(
+        json.get("dirty").is_none(),
+        "脏清单不该过 IPC。实际 JSON：{json}"
+    );
 }
 
 #[test]
@@ -262,9 +283,24 @@ fn the_three_health_states_serialize_as_a_discriminated_union() {
     // 还要多剥一层。这里用 `#[serde(tag = "status")]` 压平成前端好读的形状。
     use app_lib::engine::svn_health::Health;
 
-    let v = serde_json::to_value(Health::Verified { rev: 12346 }).unwrap();
+    let v = serde_json::to_value(Health::Verified {
+        rev: 12346,
+        unverified: vec![],
+    })
+    .unwrap();
     assert_eq!(v["status"], "verified");
     assert_eq!(v["rev"], 12346);
+    // 空数组也必须**出现**：前端无条件读 `h.unverified.length`，
+    // 字段缺席会在运行时炸，而 TS 的类型检查看不到 IPC 这一层。
+    assert_eq!(v["unverified"], serde_json::json!([]));
+
+    let vu = serde_json::to_value(Health::Verified {
+        rev: 7,
+        unverified: vec!["Code/A.cs".into()],
+    })
+    .unwrap();
+    assert_eq!(vu["status"], "verified");
+    assert_eq!(vu["unverified"][0], "Code/A.cs");
 
     let l = serde_json::to_value(Health::Lying {
         files: vec!["Code/A.cs".into()],
@@ -289,7 +325,10 @@ fn init_and_rebuild_reports_serialize_to_camel_case() {
     let init = serde_json::to_value(InitReport {
         node_rev: 1,
         baseline: "abc".into(),
-        health: Health::Verified { rev: 1 },
+        health: Health::Verified {
+            rev: 1,
+            unverified: vec![],
+        },
         pinned: vec![app_lib::engine::svn_externals::PinnedExternal {
             defined_in: "Code".into(),
             local_path: "Code/pinA".into(),
@@ -356,4 +395,193 @@ fn an_svn_backend_still_delegates_git_reads() {
         "SVN 元数据不该出现在状态列表里，实际：{:?}",
         st.unstaged
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 1c 的五个命令
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 在 fixture 上跑完初始化，得到一个可用的混合仓库。
+fn init_hybrid_on(fx: &svn_fixtures::SvnFixture) {
+    app_lib::engine::svn_init::init_hybrid(&app_lib::engine::svn_init::InitRequest {
+        repo_root: fx.wc_str(),
+        whitelist: vec!["Code/".to_string()],
+        extensions: vec![".cs".to_string()],
+    })
+    .unwrap();
+}
+
+#[test]
+fn capabilities_declare_which_vcs_backs_the_repo() {
+    // 前端要据此决定「要不要发那几个 SVN 专属的 invoke」。靠「所有 git 专属能力
+    // 都是 false」反推是脆的——将来某个 git 仓库恰好关掉全部可选能力时就会被
+    // 当成 SVN，于是对一个普通 git 仓库每次刷新都发几个必然失败的 invoke。
+    let dir = TempDir::new().unwrap();
+    git_init(dir.path());
+    assert_eq!(
+        read_capabilities(dir.path().to_string_lossy().to_string())
+            .unwrap()
+            .vcs,
+        "git"
+    );
+
+    let fx = svn_repo();
+    init_hybrid_on(&fx);
+    assert_eq!(read_capabilities(fx.wc_str()).unwrap().vcs, "svn");
+}
+
+#[test]
+fn svn_read_log_never_touches_the_network() {
+    // 打开仓库要先用缓存把图画出来（spec §10.2）。这条命令必须是纯本地读，
+    // 缓存还不存在时返回空列表而不是报错——那只是「还没拉过」。
+    let fx = svn_repo();
+    init_hybrid_on(&fx);
+    let got = app_lib::commands::svn::svn_read_log(fx.wc_str()).unwrap();
+    assert!(got.revs.is_empty(), "还没拉过，应当是空列表，实际 {got:?}");
+    assert!(!got.complete, "「还没拉过」不是「已经拉完」，实际 {got:?}");
+}
+
+#[test]
+fn svn_fetch_log_populates_the_cache_and_is_idempotent() {
+    let fx = svn_repo();
+    init_hybrid_on(&fx);
+    let first = app_lib::commands::svn::svn_fetch_log(fx.wc_str(), false, 200).unwrap();
+    assert!(!first.revs.is_empty(), "拉完应当有历史");
+
+    // 再拉一次不该产生任何差异：SVN 历史不可变，增量区间也已经覆盖到 HEAD。
+    let second = app_lib::commands::svn::svn_fetch_log(fx.wc_str(), false, 200).unwrap();
+    assert_eq!(first, second);
+
+    // 缓存已落盘，纯本地读现在拿得到同一份
+    assert_eq!(
+        app_lib::commands::svn::svn_read_log(fx.wc_str()).unwrap(),
+        first
+    );
+}
+
+#[test]
+fn svn_fetch_log_includes_the_baseline_anchor_even_when_it_missed_the_whitelist() {
+    // C 组实测：baselineRev 通常就是一个没碰过白名单的 revision，所以孤儿 baseline
+    // 是**常态**。锚点不在序列里，工作分支在图上就挂不到 SVN 主干。
+    let fx = svn_fixtures::svn_repo_baseline_rev_outside_whitelist();
+    init_hybrid_on(&fx);
+    let baseline = app_lib::commands::svn::svn_sync_status(fx.wc_str())
+        .unwrap()
+        .baseline_rev;
+
+    // 白名单 URL 的历史里确实没有它
+    let got = app_lib::commands::svn::svn_fetch_log(fx.wc_str(), false, 200).unwrap();
+    assert!(
+        got.revs.iter().any(|e| e.rev == baseline),
+        "baseline r{baseline} 必须在序列里（靠锚点补拉），实际 {:?}",
+        got.revs.iter().map(|e| e.rev).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn svn_sync_status_and_root_revs_are_reachable_through_the_command_layer() {
+    let fx = svn_repo();
+    init_hybrid_on(&fx);
+    let st = app_lib::commands::svn::svn_sync_status(fx.wc_str()).unwrap();
+    assert_eq!(st.node_revs.len(), 1);
+    let revs = app_lib::commands::svn::svn_root_revs(fx.wc_str()).unwrap();
+    assert!(!revs.is_empty());
+}
+
+#[test]
+fn svn_server_audit_uses_the_current_baseline_revision() {
+    let fx = svn_repo();
+    init_hybrid_on(&fx);
+    let got = app_lib::commands::svn::svn_server_audit(fx.wc_str()).unwrap();
+    // 干净仓库：服务器内容与磁盘一致
+    let json = serde_json::to_value(&got).unwrap();
+    assert_eq!(json["status"], "matched", "实际 {json}");
+}
+
+#[test]
+fn svn_server_audit_on_a_repo_without_a_baseline_is_not_checked_rather_than_an_error() {
+    // 调用方是「打开仓库」那条热路径。没有基线是一个正常状态，不该在那儿
+    // 制造一条错误横幅。
+    let fx = svn_repo();
+    // 故意不建库
+    let got = app_lib::commands::svn::svn_server_audit(fx.wc_str());
+    match got {
+        Ok(v) => {
+            let json = serde_json::to_value(&v).unwrap();
+            assert_eq!(json["status"], "notChecked", "实际 {json}");
+        }
+        Err(e) => panic!("不该报错，实际 {e:?}"),
+    }
+}
+
+#[test]
+fn the_new_commands_serialize_with_the_field_names_the_frontend_reads() {
+    // 与 capabilities 那条同理：snake_case → camelCase 没有编译期检查。
+    // 这里把前端真正会读的键钉死。
+    let fx = svn_repo();
+    init_hybrid_on(&fx);
+
+    let st = serde_json::to_value(app_lib::commands::svn::svn_sync_status(fx.wc_str()).unwrap())
+        .unwrap();
+    assert!(st.get("baselineRev").is_some(), "实际 {st}");
+    assert!(st.get("nodeRevs").is_some(), "实际 {st}");
+    assert_eq!(st["verdict"]["kind"], "inSync", "实际 {st}");
+
+    let revs =
+        serde_json::to_value(app_lib::commands::svn::svn_root_revs(fx.wc_str()).unwrap()).unwrap();
+    assert!(revs[0].get("wcRoot").is_some(), "实际 {revs}");
+
+    let log = serde_json::to_value(
+        app_lib::commands::svn::svn_fetch_log(fx.wc_str(), false, 200).unwrap(),
+    )
+    .unwrap();
+    assert!(log.get("complete").is_some(), "实际 {log}");
+    assert!(log["revs"][0].get("rev").is_some(), "实际 {log}");
+    assert!(log["revs"][0].get("message").is_some(), "实际 {log}");
+}
+
+#[test]
+fn every_sync_verdict_variant_serializes_its_fields_in_camel_case() {
+    // **上面那条测不到这个。** 干净仓库恒为 `InSync`，而 `InSync` 没有字段；
+    // 带字段的三个变体一条都没被序列化过。
+    //
+    // 2026-09-16 独立 review 发现：枚举上的 `rename_all` 只重命名**变体名**，
+    // 不重命名变体**内部的字段**。于是 `Diverged` 实际发出 `node_rev` /
+    // `baseline_rev`，而前端 `svnSync.ts` 读的是 `nodeRev` / `baselineRev`：
+    //
+    // - `forward = v.nodeRev > v.baselineRev` → `undefined > undefined` = false
+    //   ⇒ **工作副本前进被说成「被回退到基线之前」**，方向正好反了；
+    // - 文案里插值出 `r undefined`。
+    //
+    // 这三个变体只能手工构造——要在集成测试里真造出 pinned 场景得另起一个
+    // fixture，而这里要钉的是序列化形状，不是判定逻辑（那个 `svn_sync.rs` 里有）。
+    use app_lib::engine::svn_sync::SyncVerdict;
+
+    let mixed = serde_json::to_value(SyncVerdict::MixedRevision { revs: vec![3, 5] }).unwrap();
+    assert_eq!(mixed["kind"], "mixedRevision", "实际 {mixed}");
+    assert_eq!(mixed["revs"][1], 5, "实际 {mixed}");
+
+    let diverged = serde_json::to_value(SyncVerdict::Diverged {
+        node_rev: 9,
+        baseline_rev: 4,
+    })
+    .unwrap();
+    assert_eq!(diverged["kind"], "diverged", "实际 {diverged}");
+    assert_eq!(diverged["nodeRev"], 9, "实际 {diverged}");
+    assert_eq!(diverged["baselineRev"], 4, "实际 {diverged}");
+    assert!(
+        diverged.get("node_rev").is_none(),
+        "不能同时留着 snake_case 的写法：{diverged}"
+    );
+
+    let pinned = serde_json::to_value(SyncVerdict::PinnedReset {
+        node_rev: 4,
+        baseline_rev: 9,
+        external: "Vendor/Lib".to_string(),
+    })
+    .unwrap();
+    assert_eq!(pinned["kind"], "pinnedReset", "实际 {pinned}");
+    assert_eq!(pinned["nodeRev"], 4, "实际 {pinned}");
+    assert_eq!(pinned["baselineRev"], 9, "实际 {pinned}");
+    assert_eq!(pinned["external"], "Vendor/Lib", "实际 {pinned}");
 }

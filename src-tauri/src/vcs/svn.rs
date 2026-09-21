@@ -58,6 +58,7 @@ impl Vcs for SvnGitBackend {
     /// `save_patch` 是 `format-patch`，git 专属。
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            vcs: "svn",
             worktrees: false,
             tags: false,
             remotes: false,

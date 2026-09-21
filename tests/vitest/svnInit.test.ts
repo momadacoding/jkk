@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import {
   WIZARD_STEPS,
   describeHealth,
+  healthNeedsRebuild,
+  HEALTH_MAX_LISTED,
   describePinned,
   nextStep,
   parseExtensions,
@@ -47,7 +49,7 @@ describe('扩展名输入的解析', () => {
 
 describe('体检三态的显示分类', () => {
   it('verified 是成功，不需要用户做任何事', () => {
-    const d = describeHealth({ status: 'verified', rev: 12346 })
+    const d = describeHealth({ status: 'verified', rev: 12346, unverified: [] })
     expect(d.tone).toBe('ok')
     expect(d.blocking).toBe(false)
     expect(d.title).toContain('12346')
@@ -70,10 +72,46 @@ describe('体检三态的显示分类', () => {
     expect(d.detail).toContain('连不上服务器')
   })
 
+  it('verified 但有未覆盖路径时，文案必须说清楚覆盖不全', () => {
+    // 2026-09-21 独立 review。判据 `D \ S == ∅` 比的是**磁盘与服务器**，而 S 里
+    // 那些路径上的磁盘内容正是用户改的——这条检查对它们什么也证明不了。
+    // 改之前这里无条件显示「磁盘内容与服务器上该 revision 一致」，是越权。
+    const d = describeHealth({
+      status: 'verified',
+      rev: 9,
+      unverified: ['Code/A.cs', 'Code/Deep/D.cs'],
+    })
+    expect(d.tone).toBe('ok')
+    expect(d.blocking).toBe(false)
+    expect(d.title).toContain('2')
+    expect(d.detail).toContain('Code/A.cs')
+    expect(d.detail).toContain('Code/Deep/D.cs')
+    // 不能再出现那句无保留的断言
+    expect(d.detail).not.toBe('磁盘内容与服务器上该 revision 一致。')
+  })
+
+  it('未覆盖清单为空时文案一个字都不多', () => {
+    // 另一半：干净工作副本上平白多一句「有 0 个文件未覆盖」是纯噪音。
+    // 缺了它，一个「永远显示未覆盖」的实现照样能让上面那条通过。
+    const d = describeHealth({ status: 'verified', rev: 9, unverified: [] })
+    expect(d.detail).toBe('磁盘内容与服务器上该 revision 一致。')
+    expect(d.title).toBe('基线已通过体检（r9）')
+  })
+
+  it('未覆盖路径很多时只列前 HEALTH_MAX_LISTED 条，其余报个数', () => {
+    // 真实工程里白名单目录底下随便就有几千个未版本控制文件，全列出来会把
+    // 对话框撑爆，而用户一条也读不完。
+    const many = Array.from({ length: HEALTH_MAX_LISTED + 7 }, (_, i) => `Code/F${i}.cs`)
+    const d = describeHealth({ status: 'verified', rev: 9, unverified: many })
+    expect(d.detail).toContain('Code/F0.cs')
+    expect(d.detail).toContain('…还有 7 条')
+    expect(d.detail).not.toContain(`Code/F${HEALTH_MAX_LISTED}.cs`)
+  })
+
   it('三种状态的 tone 互不相同', () => {
     // 防的是「都返回 warn 也能让上面三条通过」那种实现
     const tones = [
-      describeHealth({ status: 'verified', rev: 1 }).tone,
+      describeHealth({ status: 'verified', rev: 1, unverified: [] }).tone,
       describeHealth({ status: 'lying', files: [] }).tone,
       describeHealth({ status: 'notChecked', reason: 'x' }).tone,
     ]
@@ -98,12 +136,37 @@ describe('pinned 模式的说明', () => {
 })
 
 describe('错误码到引导语的映射', () => {
-  it('P1 不干净时明确说「不会替你 revert」', () => {
-    // spec §8.1 #2：revert 用户的本地修改是破坏性的，只拦住并引导去 TortoiseSVN。
+  it('obstructed 时明确说本应用不会替你动那些路径', () => {
+    // spec §8.1 #2：revert / 删目录都是破坏性的，只拦住并引导，不自动修复。
     // 这句话必须出现在 UI 上，否则用户会以为点一下就能自动清理。
-    const h = wizardErrorHint('svn_preflight_dirty')
-    expect(h).toContain('TortoiseSVN')
+    const h = wizardErrorHint('svn_preflight_obstructed')
     expect(h).toContain('不会')
+    // 同时要说清「只有它阻断」——否则用户看到一条 preflight 失败，
+    // 会以为又回到了「工作区必须干净」那套（spec §16.1）。
+    expect(h).toContain('不再阻断')
+  })
+
+  it('不再有 svn_preflight_dirty 这个错误码的条目', () => {
+    // spec §16.1 把它整条删掉了：普通的本地修改不再阻断建库或重建基线。
+    // 留着一条说「请先去 TortoiseSVN 提交或还原」的引导，会把用户推回那个
+    // 已经不存在、而且从来就走不通的死胡同。
+    expect(wizardErrorHint('svn_preflight_dirty')).toBe('')
+  })
+
+  it('重建期间被外部改动时说清指针没动、重试即可', () => {
+    // R3c（spec §16 / §16.1 竞态表）。用户最关心的是「我的基线坏了吗」，
+    // 所以第一句必须是「没坏」。
+    const h = wizardErrorHint('svn_rebuild_revision_moved')
+    expect(h).toContain('没有改动')
+    expect(h).toContain('重新点')
+  })
+
+  it('体检不通过时先撇清「不是你的本地修改」', () => {
+    // §6.8.7 之后本地修改已经被 S 排除在外。不说这一句的话，一个手上有改动的
+    // 用户会立刻把两件事联系起来，然后去做一件完全没用的事（清理工作区）。
+    const h = wizardErrorHint('svn_baseline_lying')
+    expect(h).toContain('本地修改')
+    expect(h).toContain('update')
   })
 
   it('mixed-revision 给的是 svn update', () => {
@@ -128,19 +191,45 @@ describe('错误码到引导语的映射', () => {
   })
 
   it('后端消息已经说过的引导不再重复一遍', () => {
-    // 2026-09-14 真实窗口验证时撞见的：P1 拦截时后端消息本身就以
-    // 「白名单内的工作副本不干净，共 1 处…本应用不会替你 revert…」结尾，
-    // 而这张表又几乎逐字说了一遍，界面上并排两段一模一样的话
+    // 2026-09-14 真实窗口验证时撞见的：preflight 拦截时后端消息本身就把引导
+    // 说完了，而这张表又几乎逐字说了一遍，界面上并排两段一模一样的话
     // ——用户会以为那是两条不同的提示，然后花时间找区别。
+    //
+    // 判据是前 12 个字，所以这里给的后端消息必须与表里那条**开头一致**，
+    // 否则测的就不是抑制逻辑而是别的东西。
     const backend =
-      '白名单内的工作副本不干净，共 1 处：\n  - Code/A.cs （modified）\n' +
-      '本应用不会替你 revert（那是破坏性操作），请先在 TortoiseSVN 里提交或还原这些改动，再回来建库。'
-    expect(wizardErrorHint('svn_preflight_dirty', backend)).toBe('')
+      '白名单内有 obstructed（svn status 的 `~`）：\n  - Code/A.cs\n' +
+      '本应用不会替你动这些路径，请先在 TortoiseSVN 里处理。'
+    expect(wizardErrorHint('svn_preflight_obstructed', backend)).toBe('')
   })
 
   it('后端消息没说的引导仍然显示', () => {
     // 抑制只针对重复，不能把这张表整个变成摆设
     const terse = '核对失败'
     expect(wizardErrorHint('include_set_mismatch', terse)).toContain('.gitignore')
+  })
+})
+
+describe('healthNeedsRebuild', () => {
+  it('基线在撒谎时给出重建的入口', () => {
+    // 这是它存在的全部理由：`lying` 只在 revision 对得上时出现，而重建按钮
+    // 挂在失同步横幅上——那时横幅不在。不给入口的话，体检等于只负责报丧。
+    expect(healthNeedsRebuild({ status: 'lying', files: ['Code/A.cs'] })).toBe(true)
+  })
+
+  it('「没验成」不给——它不是「坏了」', () => {
+    // 断网、URL 不可达都落在 notChecked。那时推用户去重建，等于拿一次网络抖动
+    // 换一个新基线，而旧基线只能从 reflog 找回来。
+    expect(healthNeedsRebuild({ status: 'notChecked', reason: '断网' })).toBe(false)
+  })
+
+  it('体检通过时不给', () => {
+    expect(healthNeedsRebuild({ status: 'verified', rev: 7, unverified: [] })).toBe(false)
+  })
+
+  it('一处文件都没列出来的 lying 也照样给入口', () => {
+    // `describeHealth` 对这种形态的文案是「这本身不该发生，请重建基线」——
+    // 既然文案在劝重建，入口就不能反而消失。
+    expect(healthNeedsRebuild({ status: 'lying', files: [] })).toBe(true)
   })
 })

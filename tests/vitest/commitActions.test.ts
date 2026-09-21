@@ -1,11 +1,44 @@
 import { describe, expect, it } from 'vitest'
 import {
+  buildCommitMessage,
   commitMenu,
   formatCommitInfo,
   planCommitCommand,
   shortHash,
   type CommitAction,
 } from '../../src/engine/commitActions'
+
+describe('buildCommitMessage', () => {
+  it('Local-Only trailer 单独成段', () => {
+    // 不空一行的话 git interpret-trailers 不认它是 trailer —— 标记看起来打上了，
+    // 实际谁也读不到。
+    expect(buildCommitMessage('s', '', true)).toBe('s\n\nLocal-Only: true')
+    expect(buildCommitMessage('s', 'body', true)).toBe('s\n\nbody\n\nLocal-Only: true')
+  })
+
+  it('不勾时不加任何东西', () => {
+    expect(buildCommitMessage('s', 'body', false)).toBe('s\n\nbody')
+    expect(buildCommitMessage('s', '', false)).toBe('s')
+  })
+
+  it('描述以空白结尾时不产生三个连续换行', () => {
+    expect(buildCommitMessage('s', 'body\n\n', true)).toBe('s\n\nbody\n\nLocal-Only: true')
+  })
+
+  it('trailer 那一行与 Rust 侧读它的形态逐字一致', () => {
+    // **写和读跨了语言**：这里写，`src-tauri/src/engine/graph.rs` 的
+    // parse_local_only 读。两边没有共享常量，也没有编译期检查。
+    //
+    // 原先这条是拿前端的 `isLocalOnly` 做往返，看着闭环、其实两头都是自己人；
+    // 而真正的读者在 Rust 侧，它压根读不到才是那个 bug（2026-09-16 独立 review）。
+    // 现在两侧各钉一半：这里钉「拼出来的最后一行长什么样」，
+    // `svn_graph_contract.rs` 那条用**同一个字面量**当 commit 正文去读。
+    const msg = buildCommitMessage('s', 'body', true)
+    expect(msg.split('\n').at(-1)).toBe('Local-Only: true')
+    expect(msg.split('\n').at(-2)).toBe('')
+    expect(buildCommitMessage('s', 'body', false)).not.toContain('Local-Only')
+  })
+})
 import { ALL_CAPABILITIES } from '../../src/engine/capabilities'
 import type { CommitNode } from '../../src/engine/types'
 
