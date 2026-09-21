@@ -218,6 +218,7 @@ D:\Game\trunk\                    ← SVN 工作副本根，同时是 git 仓库
 ├── .svn\                         ← SVN 元数据（git 完全不碰）
 ├── .git\                         ← git 元数据
 │   ├── info\exclude              ← 由白名单生成的忽略规则
+│   ├── info\attributes           ← `* -text`，关掉 git 的 EOL 转换（§7.3.0）
 │   ├── mygitclient.json          ← 白名单配置（手写）
 │   ├── mygitclient-svnlog.json   ← SVN 历史缓存
 │   └── mygitclient-sync.json     ← 同步中断状态（流程完成后删除）
@@ -1534,36 +1535,110 @@ S10  git stash apply <OID>（若 S1 有 stash），成功后
 S11  删除 journal；恢复 watcher + 主动发 repo-changed
 ```
 
-#### 7.3.0 ⚠️ S1/S10 的 stash 往返会改行尾（Phase 2 开工前必须先处理）
+#### 7.3.0 行尾归一化：混合仓库一律关掉 git 的 EOL 转换（2026-09-21 实测定案）
 
-2026-09-17 在查另一个问题时顺带发现，**尚未在本流程里验证或修复**，先记下来。
+2026-09-17 发现，2026-09-21 在临时 fixture 上量完并定案。**这是 Phase 2 的前置**：
+`sync_in` 的 S1 / S3 / S10 每一步都会由 git 往磁盘写文件。
+
+##### 问题
 
 本机 `core.autocrlf=true`（多数 Windows 开发机的默认状态）。git 在 checkout /
-stash 还原时会把 LF 转成 CRLF，而 SVN 的 pristine 里存的可能是 LF。实测一个**没设
-`svn:eol-style`** 的文件走一次 `git stash push` 还原：
+stash 还原时会把 LF 转成 CRLF，而 SVN 的 pristine 里存的可能是 LF。实测一个
+**没设 `svn:eol-style`** 的 LF 文件走完一次 stash 往返：
 
-```text
-还原前磁盘 = "v1\n"      LF
-还原后磁盘 = "v1\r\n"    CRLF        ← git 加的
-svn diff   = -v1 / +v1               ← 内容一样，行尾不同
-```
+| 时点 | 磁盘 | `svn diff` |
+|---|---|---|
+| 改出 WIP，未 stash | LF | 1 行——就是那一行真改动 |
+| S1 `git stash push` 之后 | **CRLF** | 文件变脏（内容没动，只有行尾） |
+| S10 `git stash apply` 之后 | **CRLF** | **整文件重写** + 那 1 行真改动 |
 
-对 `sync_in` 的影响面：
+最坏的下游后果在 Phase 3：交付清单按「工作分支 vs 基线」算，一整批只有行尾变化的
+文件会被算成真改动**提交到 SVN**。
 
-- **S1 的 stash push** 会把白名单内每个 W-file 还原成 CRLF。随后 S3 `git checkout
-  svn/base`、S5 `svn update` 都在这个已经被改过行尾的磁盘上跑。
-- **S10 的 stash apply** 同理。
-- 最坏的下游后果在 Phase 3：交付清单按「工作分支 vs 基线」算，一整批只有行尾变化的
-  文件会被算成真改动**提交到 SVN**。
+**顺带修正 2026-09-17 那条记录的一处夸大。** 受影响的不是「白名单内每个 W-file」，
+而是**被 git 写过磁盘的那些**：stash push / apply 只碰进出 stash 的文件，S3
+`git checkout svn/base` 只碰两棵树有差异的文件。范围小于原记录，性质一样——
+只要 git 写过，那个文件对 svn 就变脏了。
 
-设了 `svn:eol-style=native` 的文件不受影响（svn 自己在 Windows 上就放 CRLF，两边一致）。
-**风险集中在没设 eol-style 的文件上**，而 SVN 默认不设——要靠 `auto-props` 或手工
-`propset`，所以真实工程里两种都有。
+设了 `svn:eol-style=native` 的文件不受影响（svn 在 Windows 上自己就放 CRLF，git
+转出来的也是 CRLF，两边一致）。风险集中在**没设 eol-style 且 pristine 是 LF** 的
+文件上，而 SVN 默认不设——要靠 `auto-props` 或手工 `propset`，所以真实工程里两种都有。
 
-可能的出路（**都还没验证**）：写一个 `.gitattributes`（但 §3 明写「我们不写工作目录里的
-`.gitignore`」，`.gitattributes` 同理，且它会进用户的 SVN 仓库）；在混合仓库的
-`.git/config` 里把 `core.autocrlf` 设成 `false`（作用域是本仓库，不动用户全局配置，
-看起来最干净）；或者按文件读 `svn:eol-style` 逐个决定。Phase 2 开工时必须先定这一条。
+##### 定案：`.git/info/attributes` 写 `* -text`
+
+三条出路的实测对比（同一份 fixture，只换这一项）：
+
+| 出路 | S1/S3/S10 之后 `svn status` | 进工作目录 | 会被提交进 SVN | 挡得住工作树里的 `.gitattributes` |
+|---|---|---|---|---|
+| 维持现状（`autocrlf=true`） | **脏** | — | — | — |
+| **B** `.git/config` 设 `core.autocrlf=false` | 干净 | 否 | 否 | ❌ **挡不住** |
+| **C** `.git/info/attributes` 写 `* -text` | 干净 | 否 | 否 | ✅ 挡得住 |
+| 逐文件读 `svn:eol-style` | 同 C，代价高得多 | 否 | 否 | 取决于实现 |
+
+**取 C。** 三条理由：
+
+1. **优先级最高。** gitattributes(5) 规定 `$GIT_DIR/info/attributes` 压过工作树里的
+   `.gitattributes`。实测：工作树里放一个 `* text=auto`（比如别人真把它提交进了
+   SVN），C 下 `git check-attr text` 仍然是 `unset`，**B 下变成 `auto`**——
+   `core.autocrlf=false` 被覆盖，归一化又回来了。B 是一道能被用户的仓库内容掀翻的闸。
+2. **不进工作目录，所以不会被提交进 SVN。** 与 §3「工作目录里只多出 `.git` 一个条目」
+   一致。「在工作树里写 `.gitattributes`」这条出路正是因此被排除的。
+3. **与既有做法同形。** `.git/info/exclude` 已经由 `svn_exclude.rs` 生成（含
+   `exclude.bak` 备份约定），`.git/info/attributes` 是它的邻居，走同一套写法和同一个
+   修复时机。
+
+逐文件读 `svn:eol-style` 不取。我们要的是**字节级相等**：磁盘上就是 svn 放下的那些
+字节。这一条 `* -text` 免费拿到；逐文件判别最好也只能追平它，换不来任何额外正确性，
+却要为每个文件读一次属性，还得跟着属性的变化重算。
+
+##### 对 R2b 没有副作用（实测）
+
+`svn_baseline.rs` 的 `hash-object` 之所以带 `--path`，是为了让「取回 BASE」与
+`git add` 落在同一套过滤器上（§16 R2b）。关掉转换之后这条对齐**仍然成立**，而且
+变成平凡成立：
+
+| arm | 文件 | `git add` 的 blob | `svn cat` 走 `hash-object --path` 的 blob | |
+|---|---|---|---|---|
+| A | `svn:eol-style=native` | LF | LF | 对得上 |
+| A | 无 eol-style（磁盘 CRLF） | LF | LF | 对得上 |
+| C | `svn:eol-style=native` | CRLF | CRLF | 对得上 |
+| C | 无 eol-style（磁盘 CRLF） | CRLF | CRLF | 对得上 |
+
+与 §18（十一）B4 那条实测一致，顺带把它的含义讲透：**`svn cat` 吐的不是 pristine 的原始字节，是翻译后的字节。**
+`svn:eol-style=native` 的文件 pristine 里存的是 LF，而 `svn cat -r BASE` 在 Windows
+上给的是 **CRLF**。所以 C 下两条录入路径仍然同形，不存在「干净文件录 CRLF、脏文件
+录 LF」的撕裂。
+
+##### 迁移：切换的那一刻必须强制重建基线
+
+**这是本条决策唯一有代价的地方，不能省。** 基线 blob 的形状由**录制时**的转换设置
+决定：`autocrlf=true` 录的基线全是 LF，关掉转换之后工作树读回来的是 CRLF。实测
+（5 个 CRLF 文件 + 2 个 LF 文件）：
+
+| 场景 | `git status` 脏文件数 |
+|---|---|
+| A 下录的基线，维持 A | 0 |
+| A 下录的基线，翻到 B | **5**（全部 CRLF 文件） |
+| A 下录的基线，翻到 C | **5** |
+| **C 下重录的基线，C** | **0**（`svn status` 也是 0） |
+
+⚠️ **这个故障是潜伏的，比立刻炸更糟。** 翻完设置立刻跑 `git status` 会报 **0**
+——git 的 stat cache 认为文件没动过，压根不去重算 hash。要等到某个文件的 mtime
+被碰一下（编辑一次、`svn update` 一次），它才单独冒出来。用户看到的因此是「文件
+一个一个地无故变脏」，而不是一次性的批量变更。**任何「切完看一眼 `git status`
+没事就放行」的验收都是假的。**
+
+所以切换必须与**重建基线**绑死，不能只翻配置。R1–R5 对工作目录是只读的（§16），
+代价只是一次 `svn cat` 往返，正是为这种场合准备的手段。落到实现上：
+
+- `init_hybrid` 建库时就写好 `.git/info/attributes`，此后录的基线天然是对的；
+- 打开一个**已存在**的混合仓库时，若 `.git/info/attributes` 里缺那条规则，说明这个
+  基线是旧设置下录的：补写规则 **+ 要求重建基线**，不能只补规则就放行；
+- 判据不能用 `git status` 干净与否（stat cache 会骗人）。要么看规则在不在，要么在
+  判定前先 `git update-index --really-refresh`。
+
+Phase 2 的 plan 必须把这条迁移列成一个独立 Task，并在 E2E 清单里覆盖「旧基线打开
+→ 被要求重建 → 重建后 `svn status` 干净」这条路径。
 
 #### 7.3.1 S1 的 stash 崩溃窗口：写前日志必须写在 push 之前
 
@@ -3570,6 +3645,34 @@ fixture，白名单 `Code/`，四种脏各一例）：
 误导性的错误上。
 
 ## 18. 修订记录
+
+### 2026-09-21（十二）· 行尾归一化定案：混合仓库关掉 git 的 EOL 转换
+
+Phase 1 全部合入 `master` 之后、Phase 2 开工之前的前置。§7.3.0 从 2026-09-17 起挂着
+「尚未验证也未修复 / Phase 2 开工时必须先定」，本轮在临时 fixture 上把三条出路逐条
+量完并定案。四支探针，跑完即删，不碰任何真实仓库。
+
+| 问题 | 本轮决策 | 修改位置 |
+|---|---|---|
+| `autocrlf=true` 下 git 写磁盘会把无 eol-style 的 LF 文件变成 CRLF，最坏让 Phase 3 把纯行尾变化提交进 SVN | 在 `.git/info/attributes` 写 `* -text`，混合仓库一律按字节读写 | §7.3.0、§3 架构图 |
+| 备选 B（`.git/config` 设 `core.autocrlf=false`） | **不取**。实测：工作树里一个 `* text=auto` 就能把它覆盖掉（`check-attr` 从 `unset` 变 `auto`）；`$GIT_DIR/info/attributes` 的优先级则压得住 | §7.3.0 对比表 |
+| 备选「工作树写 `.gitattributes`」 | **不取**。会进工作目录、会被提交进用户的 SVN 仓库，与 §3 冲突 | §7.3.0 |
+| 备选「逐文件读 `svn:eol-style`」 | **不取**。我们要的是字节级相等，`* -text` 免费拿到；逐文件判别最好也只能追平，代价却高得多 | §7.3.0 |
+| 关掉转换会不会打破 R2b「`svn cat` 与 `git add` 对齐」 | 不会，而且变成平凡成立。四种组合实测两条路产出同一个 blob | §7.3.0 对齐表 |
+| 已存在的基线怎么办 | **必须强制重建**。基线 blob 的形状由录制时的设置决定，旧基线在新设置下会让每个 CRLF 文件整文件变脏 | §7.3.0 迁移一节 |
+
+**两条实测纠正了原记录：**
+
+1. **范围被夸大了。** 原文写「S1 的 stash push 会把白名单内每个 W-file 还原成 CRLF」。
+   实测只有**被 git 写过磁盘的那些**才会——stash 只碰进出 stash 的文件，
+   `git checkout svn/base` 只碰两棵树有差异的文件。性质不变，范围小于原记录。
+2. **迁移故障是潜伏的，这一条原文完全没有。** 翻完设置立刻跑 `git status` 报 **0 个
+   脏文件**——git 的 stat cache 认为文件没动过，不去重算 hash。要等某个文件的 mtime
+   被碰一下才单独冒出来。**任何「切完看一眼 `git status` 没事就放行」的验收都是假的**，
+   判定前必须 `git update-index --really-refresh`，或者干脆只看规则在不在。
+
+本轮只动 spec，未改代码。实现（`init_hybrid` 写规则、打开旧仓库时补规则并要求重建）
+与配套的 E2E 路径列入 Phase 2 的 plan。
 
 ### 2026-09-16（十一）· 基线改从服务器录，不再要求工作副本干净
 
