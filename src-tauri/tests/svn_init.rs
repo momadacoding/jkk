@@ -13,7 +13,7 @@ use app_lib::engine::svn_baseline::parse_trailer;
 use app_lib::engine::svn_cli::run_svn;
 use app_lib::engine::svn_health::Health;
 use app_lib::engine::svn_init::{
-    check_current_baseline, init_hybrid, rebuild_baseline, InitRequest,
+    check_current_baseline, eol_status, init_hybrid, rebuild_baseline, InitRequest,
 };
 use app_lib::engine::svn_xml::parse_info;
 use std::process::Command;
@@ -1259,4 +1259,59 @@ fn a_new_repo_is_clean_on_both_sides_right_after_init() {
         "建完库 svn 侧除 .git 外必须干净，实际：\n{}",
         svn_dirty.join("\n")
     );
+}
+
+/// 把一个刚建好的库退回成「Phase 1 建的库」：删掉规则文件，等价于那时根本没写过。
+fn strip_eol_rule(fx: &SvnFixture) {
+    std::fs::remove_file(fx.wc().join(".git/info/attributes")).unwrap();
+}
+
+#[test]
+fn a_freshly_built_repo_needs_no_migration() {
+    let fx = svn_repo();
+    init_hybrid(&req(&fx)).unwrap();
+
+    let st = eol_status(&fx.wc_str()).unwrap();
+    assert!(st.rule_installed);
+    assert!(!st.needs_migration, "刚建的库不该要求迁移");
+}
+
+#[test]
+fn a_repo_built_before_the_rule_needs_migration() {
+    let fx = svn_repo();
+    init_hybrid(&req(&fx)).unwrap();
+    strip_eol_rule(&fx);
+
+    let st = eol_status(&fx.wc_str()).unwrap();
+    assert!(!st.rule_installed);
+    assert!(st.needs_migration, "旧形状的基线必须被指认出来");
+}
+
+#[test]
+fn detection_writes_nothing() {
+    // 判定必须是纯读。写了规则却没重建基线，仓库就停在 spec §7.3.0 说的那个
+    // 潜伏状态上：`git status` 因为 stat cache 还报干净，等某个文件的 mtime
+    // 被碰一下才一个一个地无故变脏。
+    let fx = svn_repo();
+    init_hybrid(&req(&fx)).unwrap();
+    let attrs = fx.wc().join(".git/info/attributes");
+    strip_eol_rule(&fx);
+    let before = run_git(&fx.wc_str(), &["status", "--porcelain"]).unwrap();
+
+    eol_status(&fx.wc_str()).unwrap();
+    eol_status(&fx.wc_str()).unwrap();
+
+    assert!(!attrs.exists(), "侦测不许写规则文件");
+    assert_eq!(
+        run_git(&fx.wc_str(), &["status", "--porcelain"]).unwrap(),
+        before,
+        "侦测不许改工作区"
+    );
+}
+
+#[test]
+fn detection_refuses_on_a_directory_that_is_not_a_hybrid_repo() {
+    let fx = svn_repo();
+    let err = eol_status(&fx.wc_str()).expect_err("没建过库就没有基线可谈");
+    assert_eq!(err.code, "svn_not_hybrid", "实际：{}", err.message);
 }

@@ -10,7 +10,7 @@
 //! `SvnSuspicious` 并阻断，用户完全不知道发生了什么。
 
 use crate::engine::git_cli::run_git;
-use crate::engine::svn_attributes::write_attributes;
+use crate::engine::svn_attributes::{has_eol_rule, write_attributes};
 use crate::engine::svn_baseline::{publish_baseline, TempIndex, Trailer};
 use crate::engine::svn_cli::run_svn;
 use crate::engine::svn_config::{
@@ -325,6 +325,39 @@ fn build_repo(
     // 立刻离开基线分支（spec §6.5 最后一步）。
     run_git(root, &["checkout", "-b", WORK_BRANCH])?;
     Ok((baseline, health))
+}
+
+/// 行尾规则的安装状态（spec §7.3.0）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EolStatus {
+    /// `.git/info/attributes` 里有没有我们写的那条规则。
+    pub rule_installed: bool,
+    /// 要不要走一次迁移。
+    ///
+    /// 等价于 `!rule_installed`——规则没装，说明这个仓库的基线是在旧的行尾设置
+    /// 下录的。**判据只能是这个**：spec §7.3.0 实测，翻完设置之后 `git status`
+    /// 会因为 git 的 stat cache 假报 0 个脏文件，要等某个文件的 mtime 被碰一下
+    /// 才单独冒出来。拿「现在看着没事」当判据必然漏判。
+    ///
+    /// 两个字段值恒定互补，看起来冗余，但前端要分别用：一个决定横幅挂不挂，
+    /// 一个用在文案里。留两个字段比让前端自己取反更难写错。
+    pub needs_migration: bool,
+}
+
+/// 读出行尾规则的安装状态。**纯读，一个字节都不写。**
+pub fn eol_status(repo_root: &str) -> Result<EolStatus> {
+    if detect_repo_kind(repo_root) != RepoKind::SvnHybrid {
+        return Err(GitError::new(
+            "svn_not_hybrid",
+            "这个目录不是已初始化的混合仓库。",
+        ));
+    }
+    let installed = has_eol_rule(repo_root);
+    Ok(EolStatus {
+        rule_installed: installed,
+        needs_migration: !installed,
+    })
 }
 
 /// 重建基线的结果。

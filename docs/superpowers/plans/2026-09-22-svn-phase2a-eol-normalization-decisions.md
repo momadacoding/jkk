@@ -14,7 +14,7 @@
 | 0 | 施工前复核计划 | ✅ 完成 | 本文件 | 抓到计划的 2 处错误，见下 |
 | 1 | `svn_attributes.rs` 模块 | ✅ 完成 | `svn_attributes.rs`、`tests/svn_attributes.rs`、`engine/mod.rs` | `cargo test` 544 passed（基线 537，新增 7）；变异验证已跑 |
 | 2 | `init_hybrid` 建库时写规则 | ✅ 完成 | `svn_init.rs`、`tests/svn_init.rs` | `cargo test` 547 passed（新增 3）；`--test svn_init` 36 passed |
-| 3 | `eol_status` 侦测（纯读） | ⬜ 未开始 | | |
+| 3 | `eol_status` 侦测（纯读） | ✅ 完成 | `svn_init.rs`、`commands/svn.rs`、`lib.rs`、`tests/svn_init.rs` | `cargo test` 551 passed（新增 4）；`commands_are_async` 变异验证已跑 |
 | 4 | `migrate_eol` 原子迁移 + 回滚 | ⬜ 未开始 | | |
 | 5 | 前端横幅与接线 | ⬜ 未开始 | | |
 | 收尾 | E2E 清单 + 独立 review | ⬜ 未开始 | | |
@@ -212,3 +212,51 @@ a_new_repo_records_the_baseline_byte_for_byte
   2026-09-21 的探针预测「关掉转换后这条仍成立，且变成平凡成立」，实测确认。
 - **建库仍然一条 svn 写命令都不发**：`a_successful_init_emits_no_svn_write_command`
   绿着，`write_attributes` 只碰 `.git/info/`。
+
+---
+
+## Task 3：`eol_status` 侦测（纯读）
+
+`EolStatus` + `eol_status` + `svn_eol_status` 命令 + 4 条测试。`cargo test` 全量
+**551 passed / 0 failed**（新增 4），fmt / clippy 零告警。
+
+### Task 0 那条修正被实测坐实
+
+把新命令按**计划原文**改回 `#[tauri::command]`（去掉 `(async)`）：
+
+```text
+test every_command_is_declared_async ... FAILED
+  svn.rs:70: #[tauri::command]
+```
+
+所以那不是纸上谈兵的顾虑，是计划照抄就会红的实错。改回 `(async)` 后通过。
+
+### 偏离计划
+
+1. **`EolStatus` 放在 `RebuildReport` 之前**，不是计划说的「附近」。理由：
+   `eol_status` 的函数体要用到 `detect_repo_kind`，和 `rebuild_baseline` 开头
+   那段守卫同形，挨着放读起来是一组。
+2. **测试里抽了一个 `strip_eol_rule(fx)` 辅助**。计划里三处都写成裸的
+   `std::fs::remove_file(...unwrap())`；Task 4 还要再用两次，共五处。抽出来
+   顺带能把「这是在模拟 Phase 1 建的库」这句话写在一个地方。
+3. **没加 `git_status_porcelain` helper**，直接用既有的 `run_git`（同 Task 2）。
+
+### 计划的错误
+
+（除 Task 0 已记的那条属性错误外，本 Task 无新增。）
+
+### 计划没写的坑
+
+- **`rule_installed` 与 `needs_migration` 恒定互补，看着冗余。** 留两个字段是
+  有意的：前端一个用来决定横幅挂不挂、一个用在文案里，让前端自己取反更容易
+  写错。已在字段注释里说明，免得下一个人「顺手精简」掉一个。
+
+### 为什么这么改是安全的
+
+- **`eol_status` 不含任何写操作**，函数体只有一次 `detect_repo_kind` 和一次
+  `has_eol_rule`（后者只 `read_to_string`）。`detection_writes_nothing` 连调
+  两次并断言规则文件仍不存在、`git status` 输出逐字节未变。
+- **不是混合仓库时报错而不是返回「不需要迁移」。** 后者会让一个普通 git 仓库
+  静默地被当成「已迁移」，将来若有人拿这个字段做别的判断就会踩空。
+- **命令写了 `(async)`**，不会阻塞 UI 线程——虽然这条只读、快，但规矩是一致的，
+  且 `commands_are_async` 会持续钉住。
