@@ -10,6 +10,7 @@
 //! `SvnSuspicious` 并阻断，用户完全不知道发生了什么。
 
 use crate::engine::git_cli::run_git;
+use crate::engine::svn_attributes::write_attributes;
 use crate::engine::svn_baseline::{publish_baseline, TempIndex, Trailer};
 use crate::engine::svn_cli::run_svn;
 use crate::engine::svn_config::{
@@ -259,6 +260,12 @@ fn build_repo(
     run_git(root, &["init", "-b", BASELINE_BRANCH])?;
     write_config(root, cfg)?;
     write_exclude(root, &generate_exclude(&cfg.whitelist, &cfg.extensions))?;
+    // **必须在 `record_server_tree` 之前。** 这条规则决定 `git add` 与
+    // `hash-object --path` 读磁盘时跑不跑行尾过滤器，也就决定了第一个基线里
+    // blob 长什么样。放到录制之后等于建库当场就造出一个需要迁移的旧形状基线
+    // ——而那种基线的故障是潜伏的：stat cache 会让 `git status` 一开始假报
+    // 干净，等某个文件的 mtime 被碰一下才单独冒出来（spec §7.3.0）。
+    write_attributes(root)?;
 
     // R2a–R2c：录出服务器 rN 的树。首个基线从**空**索引起步。
     let (tree, explained) = record_server_tree(root, cfg, pre)?;

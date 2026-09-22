@@ -13,7 +13,7 @@
 |---|---|---|---|---|
 | 0 | 施工前复核计划 | ✅ 完成 | 本文件 | 抓到计划的 2 处错误，见下 |
 | 1 | `svn_attributes.rs` 模块 | ✅ 完成 | `svn_attributes.rs`、`tests/svn_attributes.rs`、`engine/mod.rs` | `cargo test` 544 passed（基线 537，新增 7）；变异验证已跑 |
-| 2 | `init_hybrid` 建库时写规则 | ⬜ 未开始 | | |
+| 2 | `init_hybrid` 建库时写规则 | ✅ 完成 | `svn_init.rs`、`tests/svn_init.rs` | `cargo test` 547 passed（新增 3）；`--test svn_init` 36 passed |
 | 3 | `eol_status` 侦测（纯读） | ⬜ 未开始 | | |
 | 4 | `migrate_eol` 原子迁移 + 回滚 | ⬜ 未开始 | | |
 | 5 | 前端横幅与接线 | ⬜ 未开始 | | |
@@ -141,3 +141,74 @@ rule_turns_off_eol_conversion_for_every_path               ... FAILED
   （跨卷 rename 在 Windows 上报 `ERROR_NOT_SAME_DEVICE`）。半个规则文件比没有
   规则更难发现：`has_eol_rule` 会报 false，界面于是提示迁移，而迁移又会因为
   「规则已存在」的分支走岔。
+
+---
+
+## Task 2：`init_hybrid` 建库时写规则
+
+一行实现（`build_repo` 里 `write_exclude` 之后、`record_server_tree` 之前
+`write_attributes(root)?`）+ 3 条测试。`cargo test` 全量 **547 passed / 0 failed**，
+`--test svn_init` 单独 36 passed（改动前 33）。fmt / clippy 零告警。
+
+### 这一期真正的 bug 长什么样（失败测试的实测输出）
+
+```text
+a_new_repo_records_the_baseline_byte_for_byte
+  assertion `left == right` failed: 基线里的字节必须与磁盘完全一致
+   left: [110, 49, 10]        ← 基线 blob   "n1\n"    LF
+  right: [110, 49, 13, 10]    ← 磁盘        "n1\r\n"  CRLF
+```
+
+这就是 spec §7.3.0 描述的形状，第一次以**建库路径**的形式被钉住。此前仓库里
+唯一相关的测试（`recording_a_file_produces_the_same_blob_whether_it_was_dirty_or_not`）
+比的是「两条录制路径彼此一致」，两条**一起**错的时候它照样绿。
+
+### 偏离计划
+
+1. **没有新增 `baseline_blob_bytes` / `git_status_porcelain` / `svn_status_short`
+   三个 helper。** 按 Task 0 的错误 2，`baseline_blob` 本来就返回 `Vec<u8>`；
+   而 `run_git` / `run_svn` 在该测试文件里早已导入，直接用即可。计划里那三个
+   helper 全是多余的。
+2. **`a_new_repo_is_clean_on_both_sides_right_after_init` 的 svn 侧断言改成
+   「除 `.git` 外干净」**，理由见下面「计划没写的坑」。
+
+### 计划的错误
+
+- 计划 Task 2 Step 2 的预期写的是「两条失败」，实际**三条**都失败了。第三条
+  （`a_new_repo_is_clean_on_both_sides_right_after_init`）不是实现的问题，是
+  计划里那条断言本身写错了——见下。写计划时没想到 `svn status` 的常驻噪音。
+
+### 计划没写的坑
+
+- **`svn status` 在混合仓库里永远有一行 `?  .git`。** 实测：
+
+  ```text
+  建完库后 svn status  →  ?       .git
+  ```
+
+  初始化**一条 svn 写命令都不发**（`a_successful_init_emits_no_svn_write_command`
+  钉着这条），所以没机会设 `svn:ignore`，svn 必然把 `.git` 报成未版本控制。
+  把它当脏会让这条断言**永远红**，而真正要看的是白名单内有没有文件变脏。
+  断言因此改成过滤掉以 `.git` 结尾的行。
+
+  这条对 Plan 2b 的 `sync_in` 同样成立：S4 的「`svn status` 扫描后只校验 W-file
+  应为 0 修改」如果按「整个输出为空」实现，会在第一次运行时就误判。
+
+- **`a_new_repo_is_clean_on_both_sides_right_after_init` 在改动前后都绿**，不是
+  失败测试。原因：`git status` 比对时**也会**跑 autocrlf 转换，所以旧设置下
+  「磁盘 CRLF vs 索引 LF」经过归一后仍判为相等。它的价值是回归守卫（防索引
+  对齐跟不上 blob 形状变化），不是这一期 bug 的证据——证据是上面那条字节断言。
+  计划把它和另两条并列列成「预期失败」，是把守卫误当证据了。
+
+### 为什么这么改是安全的
+
+- **`write_attributes` 的位置有唯一正确解，且已被测试钉死。** 放在
+  `record_server_tree` 之前，第一个基线就是字节形态；放在之后，建库当场就造出
+  一个需要迁移的旧基线。`a_new_repo_records_the_baseline_byte_for_byte` 会在
+  顺序写反时立刻变红。
+- **既有 33 条 `svn_init` 测试一条没红**，其中包括本次改动影响面最大的
+  `recording_a_file_produces_the_same_blob_whether_it_was_dirty_or_not`
+  ——它断言干净路径（`git add`）与脏路径（`hash-object --path`）产出同一个 blob。
+  2026-09-21 的探针预测「关掉转换后这条仍成立，且变成平凡成立」，实测确认。
+- **建库仍然一条 svn 写命令都不发**：`a_successful_init_emits_no_svn_write_command`
+  绿着，`write_attributes` 只碰 `.git/info/`。

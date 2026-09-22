@@ -8,6 +8,7 @@
 mod svn_fixtures;
 
 use app_lib::engine::git_cli::run_git;
+use app_lib::engine::svn_attributes::has_eol_rule;
 use app_lib::engine::svn_baseline::parse_trailer;
 use app_lib::engine::svn_cli::run_svn;
 use app_lib::engine::svn_health::Health;
@@ -1186,4 +1187,76 @@ fn a_junction_loop_never_yields_a_baseline_containing_the_loop() {
     assert!(wc.join("Code/NewDir/New.cs").exists(), "用户的文件被删了");
 
     std::fs::remove_dir(&link).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 行尾归一化（spec §7.3.0）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_new_repo_records_the_baseline_byte_for_byte() {
+    // spec §7.3.0：建库时就得装上规则，此后录的基线天然是对的。
+    //
+    // `svn:eol-style=native` 的文件在 Windows 上磁盘是 CRLF。装规则之前
+    // `git add` 会把它归一成 LF 录进基线；装了之后录的必须是磁盘上那些字节。
+    //
+    // 这不是洁癖：基线与磁盘不同形，意味着任何一次 `git checkout svn/base`
+    // 都会把磁盘的行尾翻一遍，那个文件对 svn 立刻变脏。
+    let fx = svn_repo_with_native_eol();
+    init_hybrid(&req(&fx)).unwrap();
+
+    let disk = std::fs::read(fx.wc().join("Code/Nat.cs")).unwrap();
+    assert!(
+        disk.windows(2).any(|w| w == b"\r\n"),
+        "前提不成立：native 的文件在 Windows 上该是 CRLF"
+    );
+
+    assert_eq!(
+        baseline_blob(&fx.wc_str(), "Code/Nat.cs"),
+        disk,
+        "基线里的字节必须与磁盘完全一致"
+    );
+}
+
+#[test]
+fn a_new_repo_has_the_eol_rule_installed() {
+    let fx = svn_repo();
+    init_hybrid(&req(&fx)).unwrap();
+    assert!(
+        has_eol_rule(&fx.wc_str()),
+        "建库必须装上 EOL 规则，否则录出来的是旧形状的基线"
+    );
+}
+
+#[test]
+fn a_new_repo_is_clean_on_both_sides_right_after_init() {
+    // 规则生效之后最容易砸的就是这条：blob 形状变了，索引对齐要是没跟上，
+    // 用户一打开就看到满屏 M。既有的
+    // `a_successful_init_leaves_a_clean_git_status` 用的是普通 fixture，
+    // 那里磁盘本来就是 LF，看不到行尾问题；这条专挑 native eol 的形态，
+    // 并且**两侧都查**——svn 那一侧此前没人查过。
+    let fx = svn_repo_with_native_eol();
+    init_hybrid(&req(&fx)).unwrap();
+
+    let git_dirty = run_git(&fx.wc_str(), &["status", "--porcelain"]).unwrap();
+    assert!(
+        git_dirty.trim().is_empty(),
+        "建完库 git 工作区必须干净，实际：\n{git_dirty}"
+    );
+
+    // `?  .git` 是**常态**，必须排除：初始化一条 svn 写命令都不发
+    // （`a_successful_init_emits_no_svn_write_command` 钉着这条），所以没机会
+    // 设 `svn:ignore`，svn 永远会把 `.git` 报成未版本控制。把它当脏会让这条
+    // 断言永远红，而真正要看的是**白名单内有没有文件变脏**。
+    let svn_out = run_svn(&fx.wc_str(), &["status"]).unwrap();
+    let svn_dirty: Vec<&str> = svn_out
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty() && !l.ends_with(".git"))
+        .collect();
+    assert!(
+        svn_dirty.is_empty(),
+        "建完库 svn 侧除 .git 外必须干净，实际：\n{}",
+        svn_dirty.join("\n")
+    );
 }
