@@ -4,15 +4,20 @@ import {
   SVN_AUDIT_MIN_GAP_MS,
   SVN_AUDIT_POLL_MS,
   describeAudit,
+  describeEolMigration,
   describeSync,
   needsStandaloneCheck,
   recordAfterSuccess,
+  syncBannerIsSuppressed,
   syncIfRootRevChanged,
+  type EolStatus,
   type RootRevMemo,
   type SyncStatus,
 } from '@/engine/svnSync'
 
 const inSync: SyncStatus = { baselineRev: 4, nodeRevs: [4], verdict: { kind: 'inSync' } }
+const eolNeeds: EolStatus = { ruleInstalled: false, needsMigration: true }
+const eolDone: EolStatus = { ruleInstalled: true, needsMigration: false }
 
 describe('describeSync', () => {
   it('同步时不挂横幅', () => {
@@ -141,17 +146,20 @@ describe('needsStandaloneCheck', () => {
   // 偏偏 `Lying`（基线记的内容与服务器不符）恰恰发生在 revision 完全对得上的
   // 时候 —— 等于只在不需要它的时候提供它。
 
+  // 第三个参数是行尾迁移状态。下面这组传 `eolDone`（规则已装）＝ 迁移不介入，
+  // 于是这组断言测的仍然是原来那条判据。迁移介入时的行为单独一组，见文件末尾。
+
   it('同步的 SVN 仓库要有常驻入口', () => {
-    expect(needsStandaloneCheck(true, inSync)).toBe(true)
+    expect(needsStandaloneCheck(true, inSync, eolDone)).toBe(true)
   })
 
   it('还没读到状态时也要有——离线打开仓库照样得能体检', () => {
-    expect(needsStandaloneCheck(true, null)).toBe(true)
+    expect(needsStandaloneCheck(true, null, eolDone)).toBe(true)
   })
 
   it('普通 git 仓库不渲染', () => {
-    expect(needsStandaloneCheck(false, null)).toBe(false)
-    expect(needsStandaloneCheck(false, inSync)).toBe(false)
+    expect(needsStandaloneCheck(false, null, eolDone)).toBe(false)
+    expect(needsStandaloneCheck(false, inSync, eolDone)).toBe(false)
   })
 
   it('失同步横幅在时不重复渲染——任何时刻恰好一个入口', () => {
@@ -160,7 +168,7 @@ describe('needsStandaloneCheck', () => {
       nodeRevs: [9],
       verdict: { kind: 'diverged', nodeRev: 9, baselineRev: 4 },
     }
-    expect(needsStandaloneCheck(true, diverged)).toBe(false)
+    expect(needsStandaloneCheck(true, diverged, eolDone)).toBe(false)
     // 前提：那条横幅自己带着体检按钮
     expect(describeSync(diverged)!.actions.map((a) => a.id)).toContain('check')
   })
@@ -171,8 +179,13 @@ describe('needsStandaloneCheck', () => {
       nodeRevs: [4],
       verdict: { kind: 'pinnedReset', nodeRev: 4, baselineRev: 9, external: 'Code/Vendor' },
     }
-    expect(needsStandaloneCheck(true, pinned)).toBe(false)
+    expect(needsStandaloneCheck(true, pinned, eolDone)).toBe(false)
     expect(describeSync(pinned)!.actions.map((a) => a.id)).toContain('check')
+  })
+
+  it('行尾状态还没读到时按「不需要迁移」处理，常驻入口照常', () => {
+    // 打开仓库的那一瞬间它是 null。此时把体检入口藏起来，等于每次打开都闪一下。
+    expect(needsStandaloneCheck(true, inSync, null)).toBe(true)
   })
 })
 
@@ -302,5 +315,81 @@ describe('§6.6.3 两档同步检测：什么时候才允许把观测值记下�
     full.failNext(false)
     await recordAfterSuccess(memo, 'wc=9', full.run)
     expect(memo.value).toBe('wc=9')
+  })
+})
+
+describe('describeEolMigration', () => {
+  it('还没读到状态时不挂任何东西', () => {
+    // 打开仓库的那一瞬间它是 null。挂一条红条等于每次打开都闪一下。
+    expect(describeEolMigration(null, inSync)).toBeNull()
+  })
+
+  it('规则已装就不挂', () => {
+    expect(describeEolMigration(eolDone, inSync)).toBeNull()
+  })
+
+  it('需要迁移时给出重建入口', () => {
+    const b = describeEolMigration(eolNeeds, inSync)
+    expect(b).not.toBeNull()
+    expect(b!.tone).toBe('danger')
+    expect(b!.actions.map((a) => a.id)).toEqual(['migrateEol'])
+  })
+
+  it('revision 一致也照样挂——判据是规则在不在，不是同步与否', () => {
+    // spec §7.3.0：翻完设置后 git status 会因为 stat cache 假报干净。
+    // 任何基于「现在看着没事」的判据都会漏判，而漏判的表现正是用户最难
+    // 自查的那种——文件在 mtime 被碰之后一个一个地无故变脏。
+    expect(describeEolMigration(eolNeeds, inSync)).not.toBeNull()
+  })
+
+  it('pinnedReset 时让位——那种状态下重建基线是错的', () => {
+    // 迁移的动作就是重建基线，而 pinnedReset 下重建会把被 svn:externals
+    // 钉死的旧内容录成一个标着新 revision 的基线，自己造出 §9.2 的基线撒谎。
+    const pinned: SyncStatus = {
+      baselineRev: 9,
+      nodeRevs: [4],
+      verdict: { kind: 'pinnedReset', nodeRev: 4, baselineRev: 9, external: 'Code/Vendor' },
+    }
+    expect(describeEolMigration(eolNeeds, pinned)).toBeNull()
+  })
+
+  it('其余失同步状态下迁移横幅仍然出现', () => {
+    const diverged: SyncStatus = {
+      baselineRev: 4,
+      nodeRevs: [9],
+      verdict: { kind: 'diverged', nodeRev: 9, baselineRev: 4 },
+    }
+    expect(describeEolMigration(eolNeeds, diverged)).not.toBeNull()
+  })
+})
+
+describe('迁移横幅与失同步横幅互斥', () => {
+  const diverged: SyncStatus = {
+    baselineRev: 4,
+    nodeRevs: [9],
+    verdict: { kind: 'diverged', nodeRev: 9, baselineRev: 4 },
+  }
+  const pinned: SyncStatus = {
+    baselineRev: 9,
+    nodeRevs: [4],
+    verdict: { kind: 'pinnedReset', nodeRev: 4, baselineRev: 9, external: 'Code/Vendor' },
+  }
+
+  it('需要迁移时失同步横幅让位，避免两条红条', () => {
+    expect(syncBannerIsSuppressed(eolNeeds, diverged)).toBe(true)
+  })
+
+  it('不需要迁移时失同步横幅照常', () => {
+    expect(syncBannerIsSuppressed(eolDone, diverged)).toBe(false)
+  })
+
+  it('pinnedReset 不让位——那条横幅指的是另一件必须先做的事', () => {
+    expect(syncBannerIsSuppressed(eolNeeds, pinned)).toBe(false)
+    expect(describeSync(pinned)).not.toBeNull()
+  })
+
+  it('迁移未完成时不挂常驻「体检基线」——基线本来就不可信', () => {
+    expect(needsStandaloneCheck(true, inSync, eolNeeds)).toBe(false)
+    expect(needsStandaloneCheck(true, inSync, eolDone)).toBe(true)
   })
 })

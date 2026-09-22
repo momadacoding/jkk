@@ -1,8 +1,11 @@
 import { useState } from 'react'
 import {
   describeAudit,
+  describeEolMigration,
   describeSync,
   needsStandaloneCheck,
+  syncBannerIsSuppressed,
+  type EolStatus,
   type ServerAudit,
   type SyncStatus,
 } from '../engine/svnSync'
@@ -12,10 +15,14 @@ interface BaselineBannerProps {
   isSvn: boolean
   sync: SyncStatus | null
   audit: ServerAudit | null
+  /** 行尾规则装了没有（spec §7.3.0）。`null` = 还没读到。 */
+  eol: EolStatus | null
   /** 重建基线。调用方负责先弹确认。 */
   onRebuild: () => void
   /** 手动体检当前基线。 */
   onCheck: () => void
+  /** 走一次行尾迁移。调用方负责先弹确认。 */
+  onMigrateEol: () => void
 }
 
 /**
@@ -39,17 +46,51 @@ interface BaselineBannerProps {
  * revision 完全对得上的时候。把入口绑在失同步横幅里，等于只在不需要它的时候
  * 提供它（2026-09-16 独立 review）。判据下沉到 `needsStandaloneCheck`，
  * 保证任何时刻**恰好一个**体检入口。
+ *
+ * # 行尾迁移横幅会让另外两条让位
+ *
+ * 迁移未完成时基线的**形状**就是错的（spec §7.3.0），此时失同步横幅和常驻体检
+ * 入口给出的结论都不可靠，而且三者的出口都指向重建基线——挂三条只是噪音。
+ * 判据在 `syncBannerIsSuppressed` / `needsStandaloneCheck` 里，不散进这里。
+ *
+ * 唯一的例外是 `pinnedReset`：那时 `describeEolMigration` 自己返回 `null`，
+ * 失同步横幅照常渲染，因为它指的是另一件必须先做的事。
  */
-export function BaselineBanner({ isSvn, sync, audit, onRebuild, onCheck }: BaselineBannerProps) {
-  const model = describeSync(sync)
+export function BaselineBanner({
+  isSvn,
+  sync,
+  audit,
+  eol,
+  onRebuild,
+  onCheck,
+  onMigrateEol,
+}: BaselineBannerProps) {
+  const eolModel = describeEolMigration(eol, sync)
+  const model = syncBannerIsSuppressed(eol, sync) ? null : describeSync(sync)
   const auditModel = describeAudit(audit)
-  const standalone = needsStandaloneCheck(isSvn, sync)
+  const standalone = needsStandaloneCheck(isSvn, sync, eol)
   const [copied, setCopied] = useState(false)
 
-  if (!model && !auditModel && !standalone) return null
+  if (!eolModel && !model && !auditModel && !standalone) return null
 
   return (
     <>
+      {eolModel && (
+        <div className={`banner-baseline ${eolModel.tone}`}>
+          <div className="banner-baseline-head">
+            <strong>{eolModel.title}</strong>
+          </div>
+          <p className="banner-baseline-detail">{eolModel.detail}</p>
+          {eolModel.note && <p className="banner-baseline-note">{eolModel.note}</p>}
+          <div className="banner-baseline-actions">
+            {eolModel.actions.map((a) => (
+              <button key={a.id} onClick={onMigrateEol}>
+                {a.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
       {model && (
         <div className={`banner-baseline ${model.tone}`}>
           <div className="banner-baseline-head">

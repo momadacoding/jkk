@@ -16,19 +16,19 @@
 | 2 | `init_hybrid` 建库时写规则 | ✅ 完成 | `svn_init.rs`、`tests/svn_init.rs` | `cargo test` 547 passed（新增 3）；`--test svn_init` 36 passed |
 | 3 | `eol_status` 侦测（纯读） | ✅ 完成 | `svn_init.rs`、`commands/svn.rs`、`lib.rs`、`tests/svn_init.rs` | `cargo test` 551 passed（新增 4）；`commands_are_async` 变异验证已跑 |
 | 4 | `migrate_eol` 原子迁移 + 回滚 | ✅ 完成 | `svn_init.rs`、`commands/svn.rs`、`lib.rs`、`tests/svn_init.rs` | `cargo test` 556 passed（新增 5）；回滚变异验证已跑 |
-| 5 | 前端横幅与接线 | ⬜ 未开始 | | |
-| 收尾 | E2E 清单 + 独立 review | ⬜ 未开始 | | |
+| 5 | 前端横幅与接线 | 🟡 代码完成，**真实窗口未验** | `svnSync.ts`、`repoStore.ts`、`BaselineBanner.tsx`、`RepoTab.tsx`、`svnSync.test.ts` | `pnpm build` OK；`pnpm test` 365 passed（新增 11）；变异验证已跑。**Step 7 待用户实跑** |
+| 收尾 | E2E 清单 + 独立 review | 🟡 清单已写，待实跑 | `docs/superpowers/e2e/2026-09-22-svn-phase2a-eol-e2e.md` | 未跑 |
 
 ## 全量验证
 
 | 命令 | 结果 |
 |---|---|
-| `cargo fmt --check` | 未跑 |
-| `cargo clippy --all-targets` | 未跑 |
-| `cargo test` | 未跑（基线 537 passed） |
-| `pnpm build` | 未跑 |
-| `pnpm test` | 未跑（基线 354 passed） |
-| `pnpm tauri dev` 真实窗口 | 未跑 |
+| `cargo fmt --check` | ✅ OK |
+| `cargo clippy --all-targets` | ✅ **0 告警** |
+| `cargo test` | ✅ **556 passed / 0 failed**（基线 537，新增 19） |
+| `pnpm build` | ✅ OK（`tsc` + `vite build`） |
+| `pnpm test` | ✅ **365 passed**（基线 354，新增 11） |
+| `pnpm tauri dev` 真实窗口 | ⬜ **未跑** —— 需要人点、人看，清单见 `docs/superpowers/e2e/2026-09-22-svn-phase2a-eol-e2e.md` |
 
 > 本仓库没有 PR 门禁 CI（`AGENTS.md` §4.1）。以上全部要本地实跑，如实填。
 
@@ -326,3 +326,78 @@ a_failed_rebuild_restores_a_users_own_attributes_file ... FAILED
   obstruct 的路径仍然是目录——本应用一律不替用户动手（spec §6.5 P1）。
 - **`migrate_eol` 自己不实现重建**，直接复用 `rebuild_baseline`。R1–R5 那段是
   最不能写错的代码，抄一遍等于多一处会漂移的实现。
+
+---
+
+## Task 5：前端接线
+
+`svnSync.ts`（类型 + 两个判据函数 + `needsStandaloneCheck` 改签名）、`repoStore.ts`
+（两条 invoke + `svnEol` 状态 + `refreshSvnEol`）、`BaselineBanner.tsx`、
+`RepoTab.tsx` + 11 条 vitest。`pnpm build` OK，`pnpm test` **365 passed**。
+
+### ⚠️ 未完成的一步
+
+**`pnpm tauri dev` 真实窗口验证没有跑。** `AGENTS.md` §7.3 对新增 Tauri 命令是硬
+要求（`snake_case` ↔ `camelCase` 没有编译期检查），本期新增两条命令。清单已写成
+`docs/superpowers/e2e/2026-09-22-svn-phase2a-eol-e2e.md`，**由用户实跑，跑完才能
+把本 Task 标成完成**。在那之前不得宣称本期已验证。
+
+### 变异验证（已跑）
+
+删掉 `describeEolMigration` 里 `pinnedReset` 让位那一行：
+
+```text
+× describeEolMigration > pinnedReset 时让位——那种状态下重建基线是错的
+× 迁移横幅与失同步横幅互斥 > pinnedReset 不让位——那条横幅指的是另一件必须先做的事
+其余 363 条 ... ok
+```
+
+### 偏离计划
+
+1. **`refreshSvnEol` 放在 `refreshSvnSync` 之后、`refreshSvnLog` 之前，并且
+   `await`。** 计划只说「在打开仓库那条路径里顺带读一次」。实现时发现顺序有
+   讲究：迁移横幅会让失同步横幅和常驻体检入口**都**让位，所以它必须在第一帧
+   之前读到，否则界面会先挂出一条随后又被替换掉的横幅。
+2. **多加了一条测试**：`行尾状态还没读到时按「不需要迁移」处理，常驻入口照常`。
+   计划没有这条，但 `null` 是打开仓库那一瞬间的真实状态，不钉住的话很容易被
+   改成「读不到就藏起来」，表现为每次打开仓库体检入口闪一下。
+3. **`BaselineBanner` 里迁移横幅的按钮不走 `a.id` 分发**，直接绑 `onMigrateEol`。
+   那个 model 只有一个 action，走分发等于为一个分支写一套 switch。
+4. **`RepoTab` 的确认框文案不复用 `handleRebuildBaseline` 那一份。** 计划说
+   「和重建基线同等分量」，实现时意识到两者要回答的问题不同：重建那边说的是
+   「为什么要重建」，迁移这边要回答「**为什么突然要我重建**」——用户没做任何
+   事，横幅自己冒出来的。这与 Phase 1c「文案只应有一份」那条不冲突：那条讲的
+   是同一句话不要抄两遍，不是不同的话要合并成一句。
+
+### 计划的错误
+
+- **计划漏了 `pnpm install`。** 新建的 worktree 里没有 `node_modules`，
+  `pnpm test` 直接报 `'vitest' is not recognized`。而且 `pnpm install` 走网络，
+  在这套环境里**必须用 PowerShell 跑**（Bash 工具没有网络）。任何在新 worktree
+  里执行的计划都该把这一步写进去。
+
+### 计划没写的坑
+
+- **`needsStandaloneCheck` 的既有调用点有 7 处**（6 处在 vitest、1 处在
+  `BaselineBanner.tsx`）。按计划「不给默认值」办，`tsc` 只逼出了组件那一处
+  ——`tests/vitest/**` 不在 `tsconfig.json` 的 `include` 里（`AGENTS.md` §5.1
+  已记的覆盖盲区）。**测试里那 6 处是靠 `pnpm test` 跑出来才发现的**，不是
+  编译器。这条对 review 有直接影响：不能因为 `pnpm build` 绿就认为签名改动
+  的调用点都跟上了。
+- 那 6 处统一传 `eolDone`（规则已装）而不是 `null`，因为它们测的是**原来那条
+  判据**，传 `eolDone` 才能保证迁移逻辑不介入。传 `null` 效果相同但语义模糊。
+
+### 为什么这么改是安全的
+
+- **判据全部下沉到 `src/engine/svnSync.ts`**，组件只渲染，不自己判断哪种情况给
+  哪条出口（`AGENTS.md` §7.2）。三条互斥规则各有 vitest 覆盖。
+- **`pinnedReset` 的例外有测试钉住，且方向是两条**：迁移横幅不出现、失同步横幅
+  照常出现。只测一条的话，一个「pinnedReset 下什么都不挂」的实现也能骗过去。
+- **`refreshSvnEol` 失败时写回 `null` 而不是一个「不需要迁移」的值。** 两者在
+  界面上都不挂横幅，但把读失败当成「已经迁移过」会让这个仓库此后再也不提示。
+  同 `refreshSvnAudit` 的 `keepOnError=false` 分支的理由。
+- **`samePath` 守卫**：读的过程中用户可能已经切到别的仓库，不比路径的话这次结果
+  会写进另一个仓库的横幅里。
+- **切到非 SVN 仓库时显式清空 `svnEol`**，与既有的 `svnSync` / `svnAudit` 同处
+  一个 `setState`——不清的话上一个 SVN 仓库的迁移横幅会挂在下一个普通 git
+  仓库上（`refreshPinned` 的注释里记过同一个坑）。

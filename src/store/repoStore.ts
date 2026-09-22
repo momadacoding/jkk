@@ -8,6 +8,7 @@ import {
   recordAfterSuccess,
   syncIfRootRevChanged,
   SVN_AUDIT_POLL_MS,
+  type EolStatus,
   type RootRevMemo,
   type ServerAudit,
   type SyncStatus,
@@ -118,6 +119,11 @@ export interface RepoState {
   svnSync: SyncStatus | null
   /** 服务器侧清单核对（§6.3.1 / NB-2）。走网络，失败静默。 */
   svnAudit: ServerAudit | null
+  /**
+   * 行尾规则装了没有（spec §7.3.0）。`null` = 还没读到，**不等于**「不需要迁移」
+   * ——读失败时也是 `null`，那时不挂横幅，但同样不能当成「已经迁移过」。
+   */
+  svnEol: EolStatus | null
   /** SVN 历史（缓存 + 已拉取的），按 revision 降序。 */
   svnRevs: SvnRevNode[]
   /**
@@ -159,6 +165,7 @@ const initialState: RepoState = {
   pinned: [],
   svnSync: null,
   svnAudit: null,
+  svnEol: null,
   svnRevs: [],
   gitCommits: [],
   svnLogComplete: false,
@@ -230,6 +237,21 @@ export function svnCheckBaseline(path: string): Promise<Health> {
  */
 export function svnPinnedExternals(path: string): Promise<PinnedExternal[]> {
   return invoke<PinnedExternal[]>('svn_pinned_externals', { path })
+}
+
+/** 行尾规则装了没有（spec §7.3.0）。**纯读**，不走网络。 */
+export function svnEolStatus(path: string): Promise<EolStatus> {
+  return invoke<EolStatus>('svn_eol_status', { path })
+}
+
+/**
+ * 走一次行尾迁移：装规则 + 重录基线。
+ *
+ * **会移动基线指针**，与 `svnRebuildBaseline` 同等分量，调用前必须先弹确认。
+ * 重建失败时后端会把规则还原，仓库回到原状。
+ */
+export function svnMigrateEol(path: string): Promise<RebuildReport> {
+  return invoke<RebuildReport>('svn_migrate_eol', { path })
 }
 
 /** 完整失同步校验（spec §6.6.3 第二档）。纯本地读，不走网络。 */
@@ -333,6 +355,10 @@ export function useRepoStore() {
         // 第二档的完整校验：打开仓库是正确性的闸门之一，必须问到底（spec §6.6.3）。
         // 纯本地读，await 得起。
         await refreshSvnSync(path).catch(() => undefined)
+        // 同样是纯本地读，且它决定要不要挂迁移横幅——那条横幅会让失同步横幅
+        // 和常驻体检入口都让位，所以必须在第一帧之前读到，否则界面会先挂出
+        // 一条随后又被替换掉的横幅（spec §7.3.0）。
+        await refreshSvnEol(path)
         // 先用**缓存**把图画出来，再后台拉新的（spec §10.2）。
         await refreshSvnLog(path).catch(() => undefined)
         // 这两条走网络，照 `refreshPullRequests` 的既有模式：不 await、失败静默。
@@ -345,6 +371,7 @@ export function useRepoStore() {
           ...s,
           svnSync: null,
           svnAudit: null,
+          svnEol: null,
           svnRevs: [],
           svnLogComplete: false,
           // gitCommits 不用清：refreshGraph 每次都整份覆盖它
@@ -421,6 +448,25 @@ export function useRepoStore() {
   const refreshStashes = async (path: string) => {
     const stashes = await invoke<StashEntry[]>('read_stashes', { path })
     setState((s) => ({ ...s, stashes }))
+  }
+
+  /**
+   * 行尾规则装了没有（spec §7.3.0）。纯本地读。
+   *
+   * 失败时写回 `null` 而**不是**一个「不需要迁移」的值：两者在界面上都不挂横幅，
+   * 但含义完全不同，把读失败当成「已经迁移过」会让这个仓库此后再也不提示。
+   *
+   * `samePath` 守卫同 `refreshSvnAudit`：读的过程中用户可能已经切到别的仓库，
+   * 不比一下路径的话这次结果会写进另一个仓库的横幅里。
+   */
+  const refreshSvnEol = async (path: string) => {
+    try {
+      const eol = await svnEolStatus(path)
+      setState((s) => (samePath(s.path ?? '', path) ? { ...s, svnEol: eol } : s))
+    } catch (err) {
+      console.warn('读行尾规则状态失败：', err)
+      setState((s) => (samePath(s.path ?? '', path) ? { ...s, svnEol: null } : s))
+    }
   }
 
   /** 第二档本身：完整的 `nodeRevs` 校验（spec §6.6.3）。纯本地读，不碰观测值。 */
@@ -599,6 +645,7 @@ export function useRepoStore() {
     refreshStashes,
     refreshPullRequests,
     refreshSvnSync,
+    refreshSvnEol,
     checkSvnSyncIfChanged,
     refreshSvnLog,
     fetchSvnLog,
