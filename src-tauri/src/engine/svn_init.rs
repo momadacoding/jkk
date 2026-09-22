@@ -10,7 +10,7 @@
 //! `SvnSuspicious` 并阻断，用户完全不知道发生了什么。
 
 use crate::engine::git_cli::run_git;
-use crate::engine::svn_attributes::{has_eol_rule, write_attributes};
+use crate::engine::svn_attributes::{has_eol_rule, restore_attributes, write_attributes};
 use crate::engine::svn_baseline::{publish_baseline, TempIndex, Trailer};
 use crate::engine::svn_cli::run_svn;
 use crate::engine::svn_config::{
@@ -371,6 +371,59 @@ pub struct RebuildReport {
     /// 重建后指向谁。同一棵 tree 也会产出新的 commit（spec §6.3.1）。
     pub new_baseline: String,
     pub health: Health,
+}
+
+/// 行尾迁移：装上规则 + 按新规则重录基线（spec §7.3.0「迁移」）。
+///
+/// # 为什么是一条命令，不是「装规则」「重建」两步
+///
+/// 规则决定 git 读磁盘时跑不跑行尾过滤器，而基线 blob 的形状是**录制时**定下的。
+/// 只装规则不重建，仓库就停在「基线是旧形状、工作树按新规则读」的状态上，而
+/// `git status` 因为 stat cache 暂时还报干净——等某个文件的 mtime 被碰一下
+/// （编辑一次、`svn update` 一次）它才单独冒出来。用户看到的是「文件一个一个地
+/// 无故变脏」，比一次性报错难查得多。那不是一个可以让用户停留的状态。
+///
+/// # 失败时必须把规则还原
+///
+/// 同理：重建没成，规则就不能留着，否则留下的正是上面那个潜伏状态。回滚用
+/// [`write_attributes`] 返回的原始字节，用户自己原有的 attributes 也能逐字节还回去。
+pub fn migrate_eol(repo_root: &str) -> Result<RebuildReport> {
+    if detect_repo_kind(repo_root) != RepoKind::SvnHybrid {
+        return Err(GitError::new(
+            "svn_not_hybrid",
+            "这个目录不是已初始化的混合仓库，没有基线可迁移。",
+        ));
+    }
+    if has_eol_rule(repo_root) {
+        return Err(GitError::new(
+            "svn_eol_already_migrated",
+            "行尾规则已经装好了，不需要再迁移一次。\
+             重建会移动基线指针，没有理由时不该动它。",
+        ));
+    }
+
+    let previous = write_attributes(repo_root)?;
+    match rebuild_baseline(repo_root) {
+        Ok(report) => Ok(report),
+        Err(e) => {
+            // 回滚失败不能把原来那个错盖掉：用户要先知道重建**为什么**没成。
+            // 两个都失败时把回滚的情况附在消息里——否则仓库真的停在「规则装了
+            // 但基线是旧的」状态上，而界面此后会因为 has_eol_rule 报 true 而
+            // 不再提示迁移，等于无人知晓。
+            match restore_attributes(repo_root, previous.as_deref()) {
+                Ok(()) => Err(e),
+                Err(re) => Err(GitError::new(
+                    &e.code,
+                    format!(
+                        "{}\n\n另外：还原 .git/info/attributes 也失败了（{}）。\
+                         这个仓库的基线现在是旧形状、而行尾规则已生效，\
+                         请手工删掉 .git/info/attributes 后重试。",
+                        e.message, re.message
+                    ),
+                )),
+            }
+        }
+    }
 }
 
 /// 重建基线 R1–R5（spec §16 Phase 1）。

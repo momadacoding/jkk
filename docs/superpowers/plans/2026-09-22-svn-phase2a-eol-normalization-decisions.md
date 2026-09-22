@@ -15,7 +15,7 @@
 | 1 | `svn_attributes.rs` 模块 | ✅ 完成 | `svn_attributes.rs`、`tests/svn_attributes.rs`、`engine/mod.rs` | `cargo test` 544 passed（基线 537，新增 7）；变异验证已跑 |
 | 2 | `init_hybrid` 建库时写规则 | ✅ 完成 | `svn_init.rs`、`tests/svn_init.rs` | `cargo test` 547 passed（新增 3）；`--test svn_init` 36 passed |
 | 3 | `eol_status` 侦测（纯读） | ✅ 完成 | `svn_init.rs`、`commands/svn.rs`、`lib.rs`、`tests/svn_init.rs` | `cargo test` 551 passed（新增 4）；`commands_are_async` 变异验证已跑 |
-| 4 | `migrate_eol` 原子迁移 + 回滚 | ⬜ 未开始 | | |
+| 4 | `migrate_eol` 原子迁移 + 回滚 | ✅ 完成 | `svn_init.rs`、`commands/svn.rs`、`lib.rs`、`tests/svn_init.rs` | `cargo test` 556 passed（新增 5）；回滚变异验证已跑 |
 | 5 | 前端横幅与接线 | ⬜ 未开始 | | |
 | 收尾 | E2E 清单 + 独立 review | ⬜ 未开始 | | |
 
@@ -260,3 +260,69 @@ test every_command_is_declared_async ... FAILED
   静默地被当成「已迁移」，将来若有人拿这个字段做别的判断就会踩空。
 - **命令写了 `(async)`**，不会阻塞 UI 线程——虽然这条只读、快，但规矩是一致的，
   且 `commands_are_async` 会持续钉住。
+
+---
+
+## Task 4：`migrate_eol` 原子迁移 + 回滚
+
+`migrate_eol` + `svn_migrate_eol` 命令 + 5 条测试。`cargo test` 全量
+**556 passed / 0 failed**（新增 5），fmt / clippy 零告警。
+
+### 变异验证（已跑）
+
+把回滚那一臂换成 `match Ok::<(), GitError>(()) { … }`（即失败时**不**还原规则）：
+
+```text
+a_failed_rebuild_rolls_the_rule_back              ... FAILED
+a_failed_rebuild_restores_a_users_own_attributes_file ... FAILED
+其余 43 条                                          ... ok
+```
+
+只有这两条回滚断言变红，其余不动——变异作用域与预期一致。
+
+### 偏离计划
+
+1. **测试里抽了 `obstruct(fx)` 辅助**返回被 obstruct 的路径。两条失败路径测试
+   都要造同一种脏状态；顺手把「§16.1 之后 `~` 是 R1 唯一仍然阻断的脏状态」
+   这句理由写在辅助函数上，而不是抄两遍。
+2. **`a_failed_rebuild_restores_a_users_own_attributes_file` 没有先
+   `strip_eol_rule`**，而是直接用用户内容覆盖 `.git/info/attributes`。效果一样
+   （`has_eol_rule` 对 `*.psd binary\n` 报 false），但更贴近真实场景：用户本来
+   就有自己的 attributes，而不是「先有我们的规则再被删掉」。
+
+### 计划的错误
+
+- **`GitError::new` 的第一个参数是 `&str`，不是 `String`。** 计划里回滚失败那一
+  支写的是 `GitError::new(e.code, …)`，`e.code` 是 `String`，编译不过：
+
+  ```text
+  error[E0308]: expected `&str`, found `String`
+  ```
+
+  改成 `&e.code`。计划写代码块时没查 `error.rs` 的签名。
+
+- **计划的代码块不满足 `rustfmt`。** 两处 `assert_eq!(err.code, "…", "实际：{}", err.message)`
+  超宽，`cargo fmt --check` 报 diff。跑一次 `cargo fmt` 即可，但说明计划里的
+  代码块**不能当作可直接粘贴的成品**——粘完要跑 fmt。
+
+### 计划没写的坑
+
+- **回滚失败时不能把原错误盖掉。** 用户首先要知道重建**为什么**没成；回滚的
+  失败是附加信息。更关键的是：若回滚真的失败，仓库会停在「规则装了但基线是
+  旧的」状态，而此后 `has_eol_rule` 报 true，界面**不会再提示迁移**——等于
+  无人知晓。所以那条消息里必须明确告诉用户手工删掉
+  `.git/info/attributes` 后重试。这一点计划提了一句，实现时才看清它的分量：
+  它是这条路径上唯一的出口。
+
+### 为什么这么改是安全的
+
+- **失败路径已被两条测试逐一钉住**，且变异验证证明它们有牙齿。回滚用的是
+  `write_attributes` 返回的**原始字节**，用户自己的 attributes 逐字节还回去
+  （不是「删掉文件」了事）。
+- **拒绝重复迁移。** 规则已装时返回 `svn_eol_already_migrated` 而不是再跑一次
+  重建——重建会移动 `svn/base` 指针，旧基线只能从 reflog 找回来，没有理由时
+  不该动它。
+- **拦住之后磁盘原样。** `a_failed_rebuild_rolls_the_rule_back` 末尾断言那个被
+  obstruct 的路径仍然是目录——本应用一律不替用户动手（spec §6.5 P1）。
+- **`migrate_eol` 自己不实现重建**，直接复用 `rebuild_baseline`。R1–R5 那段是
+  最不能写错的代码，抄一遍等于多一处会漂移的实现。

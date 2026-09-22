@@ -13,7 +13,7 @@ use app_lib::engine::svn_baseline::parse_trailer;
 use app_lib::engine::svn_cli::run_svn;
 use app_lib::engine::svn_health::Health;
 use app_lib::engine::svn_init::{
-    check_current_baseline, eol_status, init_hybrid, rebuild_baseline, InitRequest,
+    check_current_baseline, eol_status, init_hybrid, migrate_eol, rebuild_baseline, InitRequest,
 };
 use app_lib::engine::svn_xml::parse_info;
 use std::process::Command;
@@ -1313,5 +1313,105 @@ fn detection_writes_nothing() {
 fn detection_refuses_on_a_directory_that_is_not_a_hybrid_repo() {
     let fx = svn_repo();
     let err = eol_status(&fx.wc_str()).expect_err("没建过库就没有基线可谈");
+    assert_eq!(err.code, "svn_not_hybrid", "实际：{}", err.message);
+}
+
+/// 把白名单内的一个 `.cs` 换成同名目录——SVN 意义上的 obstructed（`~`）。
+///
+/// §16.1 之后那是 R1 **唯一**仍然阻断的脏状态，所以它是让重建确定性失败的手段。
+fn obstruct(fx: &SvnFixture) -> std::path::PathBuf {
+    let p = fx.wc().join("Code/A.cs");
+    std::fs::remove_file(&p).unwrap();
+    std::fs::create_dir(&p).unwrap();
+    p
+}
+
+#[test]
+fn migration_installs_the_rule_and_rerecords_the_baseline() {
+    let fx = svn_repo_with_native_eol();
+    init_hybrid(&req(&fx)).unwrap();
+    // 退回成「Phase 1 建的库」：删规则 + 把基线按旧形状重录一遍
+    strip_eol_rule(&fx);
+    rebuild_baseline(&fx.wc_str()).unwrap();
+    let stale = baseline_blob(&fx.wc_str(), "Code/Nat.cs");
+    let disk = std::fs::read(fx.wc().join("Code/Nat.cs")).unwrap();
+    assert_ne!(stale, disk, "前提不成立：旧形状的基线本该与磁盘不同");
+
+    migrate_eol(&fx.wc_str()).unwrap();
+
+    assert!(has_eol_rule(&fx.wc_str()), "迁移后规则必须装上");
+    assert_eq!(
+        baseline_blob(&fx.wc_str(), "Code/Nat.cs"),
+        disk,
+        "迁移后基线必须与磁盘逐字节一致"
+    );
+    let dirty = run_git(&fx.wc_str(), &["status", "--porcelain"]).unwrap();
+    assert!(
+        dirty.trim().is_empty(),
+        "迁移后 git 工作区必须干净——这正是迁移要解决的问题。实际：\n{dirty}"
+    );
+}
+
+#[test]
+fn migration_refuses_when_the_rule_is_already_installed() {
+    // 重建会移动 svn/base 指针，旧基线只能从 reflog 找回来。已经迁移过还再来
+    // 一次，等于凭空动一次用户的基线。
+    let fx = svn_repo();
+    init_hybrid(&req(&fx)).unwrap();
+
+    let err = migrate_eol(&fx.wc_str()).expect_err("已经装过就不该再迁移");
+    assert_eq!(
+        err.code, "svn_eol_already_migrated",
+        "实际：{}",
+        err.message
+    );
+}
+
+#[test]
+fn a_failed_rebuild_rolls_the_rule_back() {
+    // **本组最重要的一条。** 重建失败时仓库必须回到「规则没装」的原状，不能停在
+    // 「规则装了但基线还是旧的」——那是 spec §7.3.0 说的潜伏故障：`git status`
+    // 因为 stat cache 还报干净，等文件 mtime 被碰一下才逐个变脏。
+    let fx = svn_repo();
+    init_hybrid(&req(&fx)).unwrap();
+    strip_eol_rule(&fx);
+    let obstructed = obstruct(&fx);
+
+    let err = migrate_eol(&fx.wc_str()).expect_err("obstructed 必须让迁移失败");
+
+    assert_eq!(
+        err.code, "svn_preflight_obstructed",
+        "实际：{}",
+        err.message
+    );
+    assert!(
+        !has_eol_rule(&fx.wc_str()),
+        "重建失败了，规则必须还原——否则仓库停在潜伏故障状态"
+    );
+    assert!(obstructed.is_dir(), "拦住之后磁盘必须原样，不许替用户动手");
+}
+
+#[test]
+fn a_failed_rebuild_restores_a_users_own_attributes_file() {
+    // 用户原本就有自己的 attributes 时，回滚要还回**他的**内容，不是删文件。
+    let fx = svn_repo();
+    init_hybrid(&req(&fx)).unwrap();
+    let attrs = fx.wc().join(".git/info/attributes");
+    std::fs::write(&attrs, "*.psd binary\n").unwrap();
+    obstruct(&fx);
+
+    migrate_eol(&fx.wc_str()).expect_err("obstructed 必须让迁移失败");
+
+    assert_eq!(
+        std::fs::read_to_string(&attrs).unwrap(),
+        "*.psd binary\n",
+        "回滚必须还回用户自己的内容"
+    );
+}
+
+#[test]
+fn migration_refuses_on_a_directory_that_is_not_a_hybrid_repo() {
+    let fx = svn_repo();
+    let err = migrate_eol(&fx.wc_str()).expect_err("没建过库就没有基线可迁移");
     assert_eq!(err.code, "svn_not_hybrid", "实际：{}", err.message);
 }

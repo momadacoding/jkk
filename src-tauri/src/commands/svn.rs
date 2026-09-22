@@ -16,8 +16,8 @@
 use crate::engine::svn_externals::PinnedExternal;
 use crate::engine::svn_health::Health;
 use crate::engine::svn_init::{
-    check_current_baseline, eol_status, init_hybrid, pinned_externals, rebuild_baseline, EolStatus,
-    InitReport, InitRequest, RebuildReport,
+    check_current_baseline, eol_status, init_hybrid, migrate_eol, pinned_externals,
+    rebuild_baseline, EolStatus, InitReport, InitRequest, RebuildReport,
 };
 use crate::engine::svn_log::{fetch_log, read_log, LogPage};
 use crate::engine::svn_preflight::{run_preflight, Preflight};
@@ -70,6 +70,15 @@ pub fn svn_check_baseline(path: String) -> Result<Health, GitError> {
 #[tauri::command(async)]
 pub fn svn_eol_status(path: String) -> Result<EolStatus, GitError> {
     eol_status(&path)
+}
+
+/// 走一次行尾迁移：装规则 + 重录基线（spec §7.3.0）。
+///
+/// **前端必须先过确认框**：这会移动 `svn/base` 指针，与 `svn_rebuild_baseline`
+/// 同等分量。重建失败时规则会被还原，仓库回到原状。
+#[tauri::command(async)]
+pub fn svn_migrate_eol(path: String) -> Result<RebuildReport, GitError> {
+    migrate_eol(&path)
 }
 
 /// 当前仓库里被 `-r` 钉死、且与白名单有交集的 external。

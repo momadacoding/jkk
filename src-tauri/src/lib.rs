@@ -51,6 +51,7 @@ pub fn run() {
             commands::svn::svn_eol_status,
             commands::svn::svn_fetch_log,
             commands::svn::svn_init_hybrid,
+            commands::svn::svn_migrate_eol,
             commands::svn::svn_pinned_externals,
             commands::svn::svn_preflight_check,
             commands::svn::svn_read_log,
