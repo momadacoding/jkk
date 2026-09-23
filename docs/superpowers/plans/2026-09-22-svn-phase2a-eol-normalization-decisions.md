@@ -16,8 +16,8 @@
 | 2 | `init_hybrid` 建库时写规则 | ✅ 完成 | `svn_init.rs`、`tests/svn_init.rs` | `cargo test` 547 passed（新增 3）；`--test svn_init` 36 passed |
 | 3 | `eol_status` 侦测（纯读） | ✅ 完成 | `svn_init.rs`、`commands/svn.rs`、`lib.rs`、`tests/svn_init.rs` | `cargo test` 551 passed（新增 4）；`commands_are_async` 变异验证已跑 |
 | 4 | `migrate_eol` 原子迁移 + 回滚 | ✅ 完成 | `svn_init.rs`、`commands/svn.rs`、`lib.rs`、`tests/svn_init.rs` | `cargo test` 556 passed（新增 5）；回滚变异验证已跑 |
-| 5 | 前端横幅与接线 | 🟡 代码完成，**真实窗口未验** | `svnSync.ts`、`repoStore.ts`、`BaselineBanner.tsx`、`RepoTab.tsx`、`svnSync.test.ts` | `pnpm build` OK；`pnpm test` 365 passed（新增 11）；变异验证已跑。**Step 7 待用户实跑** |
-| 收尾 | E2E 清单 + 独立 review | 🟡 清单已写，待实跑 | `docs/superpowers/e2e/2026-09-22-svn-phase2a-eol-e2e.md` | 未跑 |
+| 5 | 前端横幅与接线 | ✅ 完成 | `svnSync.ts`、`repoStore.ts`、`BaselineBanner.tsx`、`RepoTab.tsx`、`svnSync.test.ts` | `pnpm build` OK；`pnpm test` 365 passed（新增 11）；变异验证已跑；**真实窗口 3 个场景 2026-09-24 由用户跑通** |
+| 收尾 | E2E 清单 + 独立 review | 🟡 E2E 已通过，review 进行中 | `docs/superpowers/e2e/2026-09-22-svn-phase2a-eol-e2e.md` | 3/3 场景通过 |
 
 ## 全量验证
 
@@ -28,7 +28,7 @@
 | `cargo test` | ✅ **556 passed / 0 failed**（基线 537，新增 19） |
 | `pnpm build` | ✅ OK（`tsc` + `vite build`） |
 | `pnpm test` | ✅ **365 passed**（基线 354，新增 11） |
-| `pnpm tauri dev` 真实窗口 | ⬜ **未跑** —— 需要人点、人看，清单见 `docs/superpowers/e2e/2026-09-22-svn-phase2a-eol-e2e.md` |
+| `pnpm tauri dev` 真实窗口 | ✅ **2026-09-24 由用户实跑，3/3 场景通过**（清单见 `docs/superpowers/e2e/2026-09-22-svn-phase2a-eol-e2e.md`） |
 
 > 本仓库没有 PR 门禁 CI（`AGENTS.md` §4.1）。以上全部要本地实跑，如实填。
 
@@ -335,12 +335,12 @@ a_failed_rebuild_restores_a_users_own_attributes_file ... FAILED
 （两条 invoke + `svnEol` 状态 + `refreshSvnEol`）、`BaselineBanner.tsx`、
 `RepoTab.tsx` + 11 条 vitest。`pnpm build` OK，`pnpm test` **365 passed**。
 
-### ⚠️ 未完成的一步
+### 真实窗口验证（2026-09-24 由用户实跑，3/3 通过）
 
-**`pnpm tauri dev` 真实窗口验证没有跑。** `AGENTS.md` §7.3 对新增 Tauri 命令是硬
-要求（`snake_case` ↔ `camelCase` 没有编译期检查），本期新增两条命令。清单已写成
-`docs/superpowers/e2e/2026-09-22-svn-phase2a-eol-e2e.md`，**由用户实跑，跑完才能
-把本 Task 标成完成**。在那之前不得宣称本期已验证。
+`AGENTS.md` §7.3 对新增 Tauri 命令是硬要求：`snake_case` ↔ `camelCase` 这层转换
+没有编译期检查，556 + 365 条自动化测试一条都抓不到。三个场景——新建库不出现迁移
+横幅、删掉规则重开出现横幅且另外两条让位、点「重建基线…」后横幅消失且两侧干净
+——全部通过，两条新命令的参数名转换因此得到实测确认。
 
 ### 变异验证（已跑）
 
