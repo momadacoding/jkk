@@ -101,7 +101,18 @@ pub fn write_attributes(repo_root: &str) -> Result<Option<Vec<u8>>> {
 
     // 临时文件必须与目标**同目录**：跨卷 rename 在 Windows 上报
     // ERROR_NOT_SAME_DEVICE，而 %TEMP% 完全可能在另一个盘上。
-    let tmp = info.join("attributes.mygitclient.tmp");
+    //
+    // 名字带 pid + 纳秒：固定名字在两条并发请求下会互相截断对方写到一半的内容
+    // （Windows 上还可能直接撞上共享冲突）。与 `TempIndex` 的 `unique_index_path`
+    // 同一个理由（2026-09-25 PR #45 review）。
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = info.join(format!(
+        "attributes.mygitclient.{}.{nanos}.tmp",
+        std::process::id()
+    ));
     {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(generate_attributes().as_bytes())?;
@@ -121,15 +132,27 @@ pub fn write_attributes(repo_root: &str) -> Result<Option<Vec<u8>>> {
 ///
 /// `None` 表示原本不存在 —— 此时**删掉**文件，而不是留一个空文件：留空文件会让
 /// `.git/info` 里多出一个来路不明的条目，下一个人无从判断它是谁写的。
+///
+/// # 只有当文件仍是**我们写的那一份**时才回滚
+///
+/// 2026-09-25 PR #45 review 的并发场景（详见 `svn_init::MigrationLock`）：
+/// 落败的那条请求按自己记下的 `previous = None` 把文件删掉，而那一份其实是
+/// **胜者刚写好的规则**。胜者返回成功，规则却没了。
+///
+/// `MigrationLock` 已经让本应用不再制造这种交错，这里再加一道：回滚前确认
+/// 文件内容仍是我们生成的那份，不是就原样留着。锁防的是本应用自己，这一道
+/// 连外部改动也一并让开——回滚的语义本来就是「撤销我写的东西」，不是
+/// 「把这个路径恢复成我记得的样子」。
 pub fn restore_attributes(repo_root: &str, previous: Option<&[u8]>) -> Result<()> {
     let target = info_dir(repo_root).join("attributes");
+    let current = std::fs::read(&target).ok();
+    if current.as_deref() != Some(generate_attributes().as_bytes()) {
+        // 已经不是我们写的那份了（别人改过，或根本没写成功）。不碰。
+        return Ok(());
+    }
     match previous {
         Some(bytes) => std::fs::write(&target, bytes)?,
-        None => {
-            if target.exists() {
-                std::fs::remove_file(&target)?;
-            }
-        }
+        None => std::fs::remove_file(&target)?,
     }
     Ok(())
 }

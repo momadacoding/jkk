@@ -19,6 +19,7 @@
 | 5 | 前端横幅与接线 | ✅ 完成 | `svnSync.ts`、`repoStore.ts`、`BaselineBanner.tsx`、`RepoTab.tsx`、`svnSync.test.ts` | `pnpm build` OK；`pnpm test` 365 passed（新增 11）；变异验证已跑；**真实窗口 3 个场景 2026-09-24 由用户跑通** |
 | 6 | 修入独立 review 的阻断发现 | ✅ 完成 | `svn_init.rs`、`tests/svn_init.rs`、`tests/svn_attributes.rs` | `cargo test` 562 passed（新增 6）；对齐变异验证已跑 |
 | 7 | 修入第二轮独立 review 的三条阻断（PR #45） | ✅ 完成 | `svn_init.rs`、`svnSync.ts`、`RepoTab.tsx`、`tests/svn_init.rs`、`svnSync.test.ts` | `cargo test` 564 passed（新增 2）；`pnpm test` 369 passed（新增 4）；变异验证已跑 |
+| 8 | 第三轮 review：两条并发相关的 P1（PR #45） | ✅ 完成 | `svn_baseline.rs`、`svn_init.rs`、`svn_attributes.rs`、`tests/svn_init.rs` | `cargo test` 567 passed（新增 3）；并发变异验证已跑 |
 | 收尾 | E2E 清单 + 独立 review | ✅ 完成 | `docs/superpowers/e2e/2026-09-22-svn-phase2a-eol-e2e.md` | E2E 3/3 通过；review 1 条阻断已修 |
 
 ## 全量验证
@@ -27,7 +28,7 @@
 |---|---|
 | `cargo fmt --check` | ✅ OK |
 | `cargo clippy --all-targets` | ✅ **0 告警** |
-| `cargo test` | ✅ **564 passed / 0 failed**（基线 537，新增 27） |
+| `cargo test` | ✅ **567 passed / 0 failed**（基线 537，新增 30） |
 | `pnpm build` | ✅ OK（`tsc` + `vite build`） |
 | `pnpm test` | ✅ **369 passed**（基线 354，新增 15） |
 | `pnpm tauri dev` 真实窗口 | 🟡 **场景 1、4 已通过；2、3 的行为已通过、改过的文案待重看**（第二轮 review 改了横幅与确认框的文字，那是用户按下按钮前唯一能读到的东西，必须用眼睛确认。清单见 `docs/superpowers/e2e/2026-09-22-svn-phase2a-eol-e2e.md`） |
@@ -600,3 +601,111 @@ Task 6 把迁移从「只重录基线」改成「基线、工作分支、真实�
 - **缩窗不是消除竞态**，代码注释和本节都写明了这一点，不给下一个人「这里已经安全了」
   的错觉。
 - **文案改动由断言覆盖**，不依赖人记得同步。
+
+---
+
+## Task 8：第三轮 review 的两条并发 P1（2026-09-25，PR #45）
+
+两条都**先在 fixture 上复现，再动手**。第 2 条在没有修复的实现上第 1 轮就出现了。
+
+### 偏离计划
+
+计划里没有这一节——PR review 产物。
+
+### review 的两条与处理
+
+| # | 发现 | 处理 |
+|---|---|---|
+| 1 | 暂存区检查与 `read-tree` 之间仍是两个 git 进程，TOCTOU 未关 | **已修**，但不是用 review 建议的办法：见下 |
+| 2 | 两个并发 `migrate_eol` 会互相回滚，成功的那条可能缺规则 | **已修**：仓库级迁移锁 + 回滚 CAS + 唯一临时文件名 |
+
+### 计划没写的坑
+
+**一、review 建议的「仓库级锁」关不掉它自己举的那个 race。**
+
+第 1 条的复现场景是「**其他工具**在检查后、`read-tree` 前完成 `git add`」。应用级的
+仓库锁挡不住其他 git 工具——它们不看我们的锁。要真正关掉，只能用每个 git 进程都
+尊重的那一把：`.git/index.lock`。
+
+于是先去问 git 有没有现成的原子 CAS。**候选一 `git read-tree -m <old> <new>` 实测
+不可用**（probe-cas.sh）：
+
+```text
+A. 索引在 OLD、磁盘是 NEW 形状（迁移的正常起点，stat cache 新鲜）
+   → error: Entry 'f.txt' not uptodate. Cannot merge.   exit=128
+B. 同上，先碰过 mtime 打掉 stat cache
+   → 同样 128
+```
+
+它在**正常起点上就拒绝**：两树合并要求工作树对索引是 up-to-date，而「磁盘与索引
+不一致」正是这一期要修的那个状态。两种 stat cache 状态下结论一致，不是缓存假象。
+
+**候选二：自己持有 `.git/index.lock`**，实测三点全部成立（probe-lock.sh）：
+
+```text
+持锁期间 git add        → fatal: Unable to create '…/.git/index.lock'，退出 128，索引没动
+持锁期间 git diff-index → 退出 0（纯读不需要锁，所以校验照做）
+换索引                  → GIT_INDEX_FILE=<临时> read-tree 生成，再 rename 覆盖
+```
+
+「校验 + 换上」之间别的 git 进程进不来，这是**真正的 compare-and-swap**。落到
+`svn_baseline::swap_index_to_tree`，`align_branch` 的正向与回滚两条路径都走它。
+
+残锁形态与 git 自己留下的完全同形（下一次 git 写操作报「Another git process seems
+to be running」并指出路径），是用户已经见过、有现成处置办法的失败——所以**不做**
+超时或抢占：自动抢占别人的索引锁比留一个残锁危险得多。
+
+**二、并发迁移的互相回滚不是推演，第 1 轮就复现了。**
+
+`two_concurrent_migrations_never_leave_a_winner_without_the_rule` 在没有锁的实现上：
+
+```text
+第 1 轮：有一条报了迁移成功，但规则文件被另一条的回滚删掉了
+  [Ok(RebuildReport { … }),
+   Err("svn_baseline_moved / 基线分支在本次录制期间被改动过：…")]
+```
+
+正是 review 描述的交错。入口是真实的：两个仓库标签页各有一条横幅，而命令都是
+`#[tauri::command(async)]`，跑在线程池上。
+
+判据**不写成 `ok == 1`**：两条 svn 子进程抢同一个工作副本锁时双双失败是合法结果。
+真正不能发生的是「有人成功了，但规则没装」。最后再断言这一轮里确实出现过成功，
+否则这条测试什么也没测到——这正是 `AGENTS.md` §13 rubric #9 想防的形状。
+
+**三、两把锁分工不同，都要。**
+
+| 锁 | 挡谁 | 覆盖范围 |
+|---|---|---|
+| `MigrationLock`（`.git/mygitclient-migrate.lock`） | **本应用自己**的并发调用 | 整个 `migrate_eol` |
+| `IndexLock`（git 的 `.git/index.lock`） | **所有** git 工具 | 索引的校验 + 换上 |
+
+前者挡不住外部工具，后者覆盖不了「写 attributes → 重建基线」那一整段。少任何一把
+都有一条真实的失败路径。
+
+**四、回滚 CAS 与唯一临时文件名。**
+
+`restore_attributes` 现在只在文件仍是**我们写的那一份**时才动它。回滚的语义本来就是
+「撤销我写的东西」，不是「把这个路径恢复成我记得的样子」。`write_attributes` 的临时
+文件名也从固定名改成带 pid + 纳秒——固定名在并发下会互相截断对方写到一半的内容。
+
+### 变异验证（已跑）
+
+| 变异 | 结果 |
+|---|---|
+| 去掉 `MigrationLock` **且**去掉回滚 CAS | `two_concurrent_migrations_…` 第 2 轮变红，现场与 review 描述逐字吻合；`migration_refuses_while_another_one_holds_the_lock` 同时变红 |
+
+并发测试连跑 3 次全绿，无反向抖动（与 `two_concurrent_inits_…` 同样的稳定性要求）。
+
+### 为什么这么改是安全的
+
+- **`swap_index_to_tree` 不碰磁盘**：新索引由 `read-tree`（不带 `-u`）在独立临时
+  索引里生成，只 rename 覆盖 `.git/index`。磁盘文件一个都不动，这是本期的硬约束。
+- **rename 覆盖是安全的**，因为锁在我们手里：没有别的 git 进程会同时读写
+  `.git/index`。这正是 git 自己换索引的做法（写 `index.lock` 再 rename）。
+- **两把锁都靠 `Drop` 释放**，不靠调用点记得删；`Drop` 里不 panic。
+  `the_migration_lock_is_released_on_both_success_and_failure` 覆盖成功与失败两条路径
+  ——残锁的后果与本轮第 1 条阻断同类（仓库永久迁不动），不能只测成功路径。
+- **`detect_repo_kind` 仍在拿锁之前**：锁文件要落在 `.git` 里，而那一步正是在判断
+  `.git` 存不存在。顺序反过来，对着普通目录调用会先撞上 git 的错，用户就拿不到
+  「这不是混合仓库」这句话了。
+- **没有引入新依赖**，`create_new` 是 std 的 `OpenOptions`，O_EXCL 语义。

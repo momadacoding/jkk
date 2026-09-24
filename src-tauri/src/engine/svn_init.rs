@@ -11,7 +11,9 @@
 
 use crate::engine::git_cli::{run_git, run_git_code};
 use crate::engine::svn_attributes::{has_eol_rule, restore_attributes, write_attributes};
-use crate::engine::svn_baseline::{publish_baseline, TempIndex, Trailer};
+use crate::engine::svn_baseline::{
+    git_dir, publish_baseline, swap_index_to_tree, TempIndex, Trailer,
+};
 use crate::engine::svn_cli::run_svn;
 use crate::engine::svn_config::{
     normalize_whitelist_entry, write_config, SvnConfig, BASELINE_BRANCH, SVN_GIT_MODE,
@@ -419,13 +421,79 @@ pub struct RebuildReport {
 /// 「把一个分支重放到新基线上」本来就是 Phase 2 `sync_in` S9 的职责，那里有
 /// rebase 和完整的冲突解决流程兜底。本期不在这里另造一套会猜错的转换逻辑，
 /// 而是**在动任何东西之前**拒绝，并说清原因。
+/// 迁移期间的仓库级互斥锁。
+///
+/// # 为什么必须有
+///
+/// 2026-09-25 PR #45 第二轮 review。`has_eol_rule` 判定、写规则、重建基线之间
+/// 原先没有互斥，两条请求（两个仓库标签页各有一条横幅，命令又都是
+/// `#[tauri::command(async)]` 跑在线程池上）可以同时通过判定：
+///
+/// ```text
+/// A 写规则，记下 previous = None（原本没有这个文件）
+/// B 写规则，记下 previous = A 刚写的那份
+/// B 抢先 publish 基线 → 成功
+/// A 的 publish 撞上旧值守卫失败 → 按 previous = None 把文件删掉
+/// B 一路成功返回
+/// ```
+///
+/// 结果是 B 告诉用户「迁移成功」，而规则文件已经被 A 的回滚删了——仓库恰好停在
+/// 这一期要消灭的那个潜伏状态上。**这不是推演**：`two_concurrent_migrations_…`
+/// 那条测试在没有本锁的实现上第 1 轮就复现了它。
+///
+/// # 与 [`IndexLock`] 分工不同，两把都要
+///
+/// 这把挡的是**本应用自己的**并发调用。挡不住外部 git 工具——它们不看我们的锁，
+/// 那一段由 `swap_index_to_tree` 持有的 git 自己的索引锁负责。
+struct MigrationLock {
+    path: std::path::PathBuf,
+}
+
+impl MigrationLock {
+    fn acquire(repo_root: &str) -> Result<Self> {
+        let path = git_dir(repo_root)?.join("mygitclient-migrate.lock");
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => Ok(Self { path }),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(GitError::new(
+                "svn_migrate_busy",
+                format!(
+                    "这个仓库上已经有一次行尾迁移在进行中。请等它结束后再看；\
+                     如果确认没有迁移在跑，那是上一次中途退出留下的残锁——\
+                     此时仓库可能停在半迁移状态，建议先检查 `git status` 与 \
+                     `git log svn/base -1`，确认无误后手工删掉 {} 再重试。",
+                    path.display()
+                ),
+            )),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+impl Drop for MigrationLock {
+    fn drop(&mut self) {
+        // Drop 里不能 panic（展开途中 panic 会直接 abort）。
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 pub fn migrate_eol(repo_root: &str) -> Result<RebuildReport> {
+    // 这一条必须在拿锁**之前**：锁文件要落在 `.git` 里，而这里正是在判断
+    // `.git` 存不存在。顺序反过来的话，对着一个普通目录调用会先撞上 git 的错，
+    // 用户拿到的就不是「这不是混合仓库」这句话了。纯文件系统读，无竞态。
     if detect_repo_kind(repo_root) != RepoKind::SvnHybrid {
         return Err(GitError::new(
             "svn_not_hybrid",
             "这个目录不是已初始化的混合仓库，没有基线可迁移。",
         ));
     }
+    // **随后立刻拿锁**，在读 `has_eol_rule` 之前——判定与动手之间只要有缝，
+    // 两条请求就会双双通过判定（见 `MigrationLock` 的文档注释）。
+    let _lock = MigrationLock::acquire(repo_root)?;
+
     if has_eol_rule(repo_root) {
         return Err(GitError::new(
             "svn_eol_already_migrated",
@@ -607,27 +675,30 @@ fn check_can_align(repo_root: &str) -> Result<String> {
 /// 后面的 `update-ref` 自带旧值守卫、本身原子，万一失败就把索引 `read-tree`
 /// 回旧基线——每一步之前的状态都是可恢复的。
 fn align_branch(repo_root: &str, branch: &str, report: &RebuildReport) -> Result<()> {
-    // **覆盖索引之前再查一次**。`check_can_align` 那次发生在 `rebuild_baseline`
-    // 之前，而重建要跑完整的 SVN 往返（含网络）——这中间用户或别的 git 工具
-    // `git add` 进来的东西会被下面这句 `read-tree` 静默冲掉（磁盘内容还在，
-    // 但暂存状态没了）。这里查不掉竞态，只是把窗口从「整个重建」缩到微秒级；
-    // 真正的解法是仓库级操作锁，那是 Phase 2 `sync_in` 的既定范围。
-    let (code, _) = run_git_code(
-        repo_root,
-        &["diff-index", "--cached", "--quiet", &report.old_baseline],
-    )?;
-    if code != 0 {
-        return Err(GitError::new(
-            "svn_eol_migrate_index_changed",
-            "迁移过程中暂存区发生了变化（有别的 git 操作在同时进行？）。\
-             对齐索引会把这些暂存内容冲掉，所以这次迁移已中止，仓库回到了迁移前的样子。\
-             请先提交或取消暂存（`git restore --staged`）再重试。",
-        ));
-    }
-
-    // 对齐真实索引。**不带 `-u`**：绝不能用基线内容去覆盖磁盘，那会抹掉用户
-    // 未提交的 SVN 改动（`build_repo` 里记过同一条理由）。
-    run_git(repo_root, &["read-tree", &report.new_baseline])?;
+    // 对齐真实索引。**这一步是 compare-and-swap，不是「先查再写」。**
+    //
+    // `check_can_align` 那次检查发生在 `rebuild_baseline` 之前，而重建要跑完整的
+    // SVN 往返（含网络）——这中间用户或别的 git 工具 `git add` 进来的东西，
+    // 如果只是「再查一次然后 read-tree」，仍然会在那两个 git 进程之间的缝里被
+    // 静默冲掉（磁盘内容还在，但暂存状态没了）。`swap_index_to_tree` 全程持有
+    // git 自己的 `.git/index.lock`，校验与换上之间别的 git 进程进不来。
+    //
+    // 换上去的索引由 `read-tree`（**不带 `-u`**）在独立的临时索引里生成：
+    // 绝不能用基线内容去覆盖磁盘，那会抹掉用户未提交的 SVN 改动
+    //（`build_repo` 里记过同一条理由）。
+    swap_index_to_tree(repo_root, &report.old_baseline, &report.new_baseline).map_err(|e| {
+        if e.code == "svn_index_moved" {
+            GitError::new(
+                "svn_eol_migrate_index_changed",
+                "迁移过程中暂存区发生了变化（有别的 git 操作在同时进行？）。\
+                 对齐索引会把这些暂存内容冲掉，所以这次迁移已中止，\
+                 仓库回到了迁移前的样子。\
+                 请先提交或取消暂存（`git restore --staged`）再重试。",
+            )
+        } else {
+            e
+        }
+    })?;
 
     // 带旧值守卫：这中间若有外部把分支挪走了，宁可失败也不覆盖
     if let Err(e) = run_git(
@@ -640,9 +711,9 @@ fn align_branch(repo_root: &str, branch: &str, report: &RebuildReport) -> Result
         ],
     ) {
         // 索引已经换成新基线树了，退回去——否则 `git status` 会报一堆用户从没
-        // 暂存过的改动。
+        // 暂存过的改动。同样走 CAS：这中间若有别人动过索引，宁可不动也不覆盖。
         return Err(
-            match run_git(repo_root, &["read-tree", &report.old_baseline]) {
+            match swap_index_to_tree(repo_root, &report.new_baseline, &report.old_baseline) {
                 Ok(_) => e,
                 Err(re) => GitError::new(
                     &e.code,

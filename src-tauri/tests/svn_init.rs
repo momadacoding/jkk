@@ -1661,6 +1661,130 @@ fn migration_refuses_when_something_gets_staged_during_the_rebuild() {
     );
 }
 
+/// 迁移互斥锁的位置。测试要能造出「上一次没清干净」的现场，也要能确认它被清掉。
+fn migrate_lock(fx: &SvnFixture) -> std::path::PathBuf {
+    fx.wc().join(".git/mygitclient-migrate.lock")
+}
+
+#[test]
+fn two_concurrent_migrations_never_leave_a_winner_without_the_rule() {
+    // 2026-09-25 PR #45 第二轮 review 的第 2 条。`has_eol_rule` 判定、写规则、
+    // 重建之间原先没有互斥，两条请求可以同时通过判定：
+    //
+    // ```text
+    // A 写规则，记下 previous = None（原本没有这个文件）
+    // B 写规则，记下 previous = A 刚写的那份
+    // B 抢先 publish 基线 → 成功
+    // A 的 publish 撞上旧值守卫失败 → 按 previous = None 把文件**删掉**
+    // B 一路成功返回
+    // ```
+    //
+    // 于是 B 告诉用户「迁移成功」，而 `.git/info/attributes` 已经被 A 的回滚
+    // 删了——仓库恰好停在这一期要消灭的那个潜伏状态上，且界面此后会再次提示
+    // 迁移，用户完全不知道刚才发生了什么。
+    //
+    // 判据不写成 `ok == 1`：两条 svn 子进程抢同一个工作副本锁时，两条都失败是
+    // 合法结果。真正不能发生的是「有人成功了，但规则没装」。最后再确认这一轮
+    // 里确实出现过成功，否则这条测试什么也没测到。
+    let mut rounds_with_a_winner = 0;
+    for round in 0..8 {
+        let fx = svn_repo_with_native_eol();
+        init_hybrid(&req(&fx)).unwrap();
+        rewind_to_phase1(&fx);
+        let wc = fx.wc_str();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let b = std::sync::Arc::clone(&barrier);
+            let w = wc.clone();
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                migrate_eol(&w).map_err(|e| format!("{} / {}", e.code, e.message))
+            }));
+        }
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let ok = results.iter().filter(|r| r.is_ok()).count();
+        assert!(
+            ok <= 1,
+            "第 {round} 轮：两条都成功了，互斥根本没生效 {results:?}"
+        );
+
+        if ok == 1 {
+            rounds_with_a_winner += 1;
+            assert!(
+                has_eol_rule(&wc),
+                "第 {round} 轮：有一条报了迁移成功，但规则文件被另一条的回滚删掉了 {results:?}"
+            );
+            assert_eq!(
+                rev(&wc, "HEAD"),
+                rev(&wc, "refs/heads/svn/base"),
+                "第 {round} 轮：成功的那条没把工作分支对齐到新基线"
+            );
+        }
+        // 无论输赢，锁都必须放掉——否则这个仓库以后再也迁不了
+        assert!(
+            !migrate_lock(&fx).exists(),
+            "第 {round} 轮：迁移结束了但锁文件还在"
+        );
+    }
+    assert!(
+        rounds_with_a_winner > 0,
+        "8 轮里一次成功都没有——这条测试没有真正覆盖到「有人成功」的那条路径"
+    );
+}
+
+#[test]
+fn migration_refuses_while_another_one_holds_the_lock() {
+    // 锁文件残留（上一次迁移途中进程被杀）时的表现：干净拒绝，一个字节都不写。
+    let fx = svn_repo_with_native_eol();
+    init_hybrid(&req(&fx)).unwrap();
+    rewind_to_phase1(&fx);
+    let wc = fx.wc_str();
+    let base_before = rev(&wc, "refs/heads/svn/base");
+
+    std::fs::write(migrate_lock(&fx), b"").unwrap();
+    let err = migrate_eol(&wc).expect_err("已经有一次迁移在进行时必须拒绝");
+
+    assert_eq!(err.code, "svn_migrate_busy", "实际：{}", err.message);
+    assert!(
+        err.message.contains("mygitclient-migrate.lock"),
+        "拒绝时必须告诉用户那个文件在哪、怎么清掉，实际：{}",
+        err.message
+    );
+    assert!(!has_eol_rule(&wc), "被锁挡下时不许写规则文件");
+    assert_eq!(
+        rev(&wc, "refs/heads/svn/base"),
+        base_before,
+        "被锁挡下时不许动基线"
+    );
+    // 别人的锁不归我们清
+    assert!(migrate_lock(&fx).exists(), "不能把别人持有的锁删掉");
+}
+
+#[test]
+fn the_migration_lock_is_released_on_both_success_and_failure() {
+    // Drop 必须在每条路径上都跑到。留下锁文件会让仓库永久迁不动，
+    // 而那正是本轮第 1 条阻断（永久死角）的同一类后果。
+    let fx = svn_repo_with_native_eol();
+    init_hybrid(&req(&fx)).unwrap();
+    rewind_to_phase1(&fx);
+    let wc = fx.wc_str();
+
+    // 失败路径：detached HEAD，在 check_can_align 处被拒
+    let head = rev(&wc, "HEAD");
+    run_git(&wc, &["checkout", "--detach", &head]).unwrap();
+    migrate_eol(&wc).expect_err("detached HEAD 必须被拒");
+    assert!(!migrate_lock(&fx).exists(), "拒绝之后锁必须放掉");
+
+    // 成功路径
+    let branch = run_git(&wc, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+    assert_eq!(branch.trim(), "HEAD", "上面那步应当处于 detached 状态");
+    run_git(&wc, &["checkout", "work"]).unwrap();
+    migrate_eol(&wc).unwrap();
+    assert!(!migrate_lock(&fx).exists(), "成功之后锁必须放掉");
+}
+
 #[test]
 fn migration_refuses_on_a_detached_head() {
     let fx = svn_repo_with_native_eol();

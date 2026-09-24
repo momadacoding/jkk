@@ -264,7 +264,95 @@ fn unique_index_path(repo_root: &str) -> Result<PathBuf> {
 /// 临时索引放进 `.git/`：与真实索引同一个文件系统（`write_tree` 之后的对象要落在
 /// 同一个对象库），且随仓库一起被清理，不会留在用户的工作目录里被 TortoiseSVN
 /// 看见。位置问 git 要而不是拼 `repo_root/.git`——worktree 里 `.git` 是个文件。
-fn git_dir(repo_root: &str) -> Result<PathBuf> {
+/// 持有 git 自己的 `.git/index.lock` —— **索引的互斥量**。
+///
+/// # 为什么是 git 的锁，不是我们自己发明一把
+///
+/// 要防的是「校验完索引、还没写进去」这段时间里**别的 git 工具**（IDE 的 git
+/// 集成、用户的终端、另一个 GUI）往索引里 `git add` 东西。我们自己的应用级锁
+/// 它们根本不看，所以那种锁挡不住这件事——能挡住的只有每个 git 进程都尊重的
+/// 那一把。
+///
+/// 2026-09-25 实测确认这三点成立（probe-lock.sh）：
+///
+/// ```text
+/// 持锁期间 git add           → fatal: Unable to create '…/.git/index.lock'，退出 128，索引没动
+/// 持锁期间 git diff-index    → 退出 0，纯读不需要锁，所以校验照常做得了
+/// 换索引                     → GIT_INDEX_FILE=<临时> read-tree 生成，再 rename 覆盖
+/// ```
+///
+/// 于是「校验 + 换上」之间没有任何窗口，这是**真正的 compare-and-swap**，
+/// 不是把窗口缩小。
+///
+/// # 崩溃留下的残锁
+///
+/// 与 git 自己留下的残锁完全同形：下一次任何 git 写操作都会报
+/// 「Another git process seems to be running」并指出文件路径。这是用户已经见过
+/// 的、有现成处置办法的失败形态，所以这里不另造一套超时或抢占逻辑——
+/// 自动抢占别人的索引锁比留一个残锁危险得多。
+pub struct IndexLock {
+    path: PathBuf,
+}
+
+impl IndexLock {
+    pub fn acquire(repo_root: &str) -> Result<Self> {
+        let path = git_dir(repo_root)?.join("index.lock");
+        // `create_new` = O_EXCL：存在即失败，判断与创建是同一次系统调用。
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => Ok(Self { path }),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(GitError::new(
+                "svn_index_busy",
+                format!(
+                    "另一个 git 进程正在占用这个仓库的索引（{}）。\
+                     请等它结束后重试；如果确认没有 git 在跑，那是上一次崩溃留下的\
+                     残锁，手工删掉该文件即可。",
+                    path.display()
+                ),
+            )),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+impl Drop for IndexLock {
+    fn drop(&mut self) {
+        // 删不掉也不能 panic（见 TempIndex::drop 的同一条理由）。
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// 把真实索引换成 `target` 树，**但只在它此刻仍等于 `expect` 树时**。
+///
+/// 全程持有 [`IndexLock`]，所以「校验」与「换上」之间别的 git 进程进不来。
+/// 磁盘上的文件一个都不碰：新索引是用 `read-tree`（**不带 `-u`**）在一个独立的
+/// 临时索引文件里生成的，再整体 rename 覆盖 `.git/index`。
+pub fn swap_index_to_tree(repo_root: &str, expect: &str, target: &str) -> Result<()> {
+    let _lock = IndexLock::acquire(repo_root)?;
+
+    // 纯读，不需要索引锁；而锁在我们手里，所以这个结论一直有效到 rename 为止。
+    let (code, _) = run_git_code(repo_root, &["diff-index", "--cached", "--quiet", expect])?;
+    if code != 0 {
+        return Err(GitError::new(
+            "svn_index_moved",
+            "索引已经不是预期的样子了（有别的 git 操作动过它）。\
+             这次不会覆盖它。",
+        ));
+    }
+
+    let staging = TempIndex::empty(repo_root)?;
+    staging.git(repo_root, &["read-tree", target])?;
+    // rename 覆盖：锁在手里，没有别的 git 进程会同时读写 .git/index。
+    // 这正是 git 自己换索引的做法（写 index.lock 再 rename）。
+    std::fs::rename(staging.path(), git_dir(repo_root)?.join("index"))?;
+    // `staging` 的 Drop 会去删一个已经不存在的路径，`let _ =` 吃掉即可。
+    Ok(())
+}
+
+pub fn git_dir(repo_root: &str) -> Result<PathBuf> {
     let out = run_git(repo_root, &["rev-parse", "--git-dir"])?;
     let p = PathBuf::from(out.trim());
     Ok(if p.is_absolute() {

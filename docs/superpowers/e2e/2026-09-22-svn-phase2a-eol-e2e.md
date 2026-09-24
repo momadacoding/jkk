@@ -11,7 +11,7 @@
 
 | 项 | 状态 |
 |---|---|
-| 自动化验证（`cargo test` / `pnpm test` / `pnpm build` / `fmt` / `clippy`） | ✅ 已跑：564 + 369 passed，fmt / clippy 零告警 |
+| 自动化验证（`cargo test` / `pnpm test` / `pnpm build` / `fmt` / `clippy`） | ✅ 已跑：567 + 369 passed，fmt / clippy 零告警 |
 | 下面 4 个真实窗口场景 | 🟡 **1、4 已通过；2、3 因文案改动需再看一眼**（详见下方） |
 
 ⚠️ **没跑的别勾。** 空着是如实，勾上是谎报。
