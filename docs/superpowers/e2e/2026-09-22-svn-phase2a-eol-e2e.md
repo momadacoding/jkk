@@ -12,16 +12,24 @@
 | 项 | 状态 |
 |---|---|
 | 自动化验证（`cargo test` / `pnpm test` / `pnpm build` / `fmt` / `clippy`） | ✅ 已跑：556 + 365 passed，fmt / clippy 零告警 |
-| 下面 3 个真实窗口场景 | ✅ **2026-09-24 由用户在 `pnpm tauri dev` 里全部跑通** |
+| 下面 4 个真实窗口场景 | 🟡 场景 1、2 已通过；**场景 3 需重跑**，场景 4 新增待跑 |
 
 ⚠️ **没跑的别勾。** 空着是如实，勾上是谎报。
 
-- [x] 场景 1：新建库 —— 不该出现迁移横幅
-- [x] 场景 2：旧仓库打开 —— 该出现迁移横幅，且另外两条让位
-- [x] 场景 3：点「重建基线…」—— 横幅消失，两侧都干净
+- [x] 场景 1：新建库 —— 不该出现迁移横幅（2026-09-24 通过）
+- [x] 场景 2：旧仓库打开 —— 该出现迁移横幅，且另外两条让位（2026-09-24 通过）
+- [ ] 场景 3：点「重建基线…」—— 横幅消失，两侧都干净，**且工作分支跟上了新基线**
+- [ ] 场景 4：分支上有本地提交时 —— 必须拒绝，且一个字节都不写
 
+> **为什么场景 3 要重跑。** 2026-09-24 的独立 review 抓到一个阻断问题：迁移原先
+> 只重录了基线，没有把**工作分支 tip 和真实索引**一起搬过去，于是真实的 Phase 1
+> 仓库迁移完仍然是脏的。修掉之后迁移的行为变了，上一次跑的是旧行为。
+> 场景 3 因此多了一条判据（第 3 步的 `rev-parse` 比对），场景 4 是新增的拒绝路径。
+>
+> 场景 1、2 不受这次改动影响，保留原有结论。
+>
 > 两条新 Tauri 命令（`svn_eol_status` / `svn_migrate_eol`）的
-> `snake_case` ↔ `camelCase` 转换因此得到实测确认——这是自动化测试抓不到的那一层。
+> `snake_case` ↔ `camelCase` 转换已由 2026-09-24 那次实跑确认。
 
 ---
 
@@ -164,13 +172,15 @@ Remove-Item <FIX>\wc1\.git\info\attributes
 - 底部的「体检基线」灰条**回来了**；
 - 图和历史正常，工作分支没有被动过。
 
-3. 在 PowerShell 里核对：
+3. 在 PowerShell 里核对（**第 3 条是这次新增的，最关键**）：
 
 ```powershell
 cd <FIX>\wc1
 git status --porcelain
 svn status
 type .git\info\attributes
+git rev-parse HEAD
+git rev-parse refs/heads/svn/base
 ```
 
 **应该看到：**
@@ -178,7 +188,21 @@ type .git\info\attributes
 - `git status --porcelain` **完全为空**；
 - `svn status` 只有 `? .git` 一行；
 - `.git\info\attributes` 的内容是两行：一行 `# 由 mygitclient 自动生成…` 的注释，
-  一行 `* -text`。
+  一行 `* -text`；
+- **最后两条 `rev-parse` 输出的哈希完全相同** ← 工作分支必须跟着新基线一起前移。
+
+4. **再把 stat cache 打掉，确认不是假干净。** 这一步不能省：git 的 stat cache 会让
+   刚迁移完的 `git status` 即使有问题也先报干净，要等文件 mtime 被碰一下才冒出来
+   （spec §7.3.0）。所以要主动碰一遍：
+
+```powershell
+cd <FIX>\wc1
+Get-ChildItem -Recurse Code -Filter *.cs | ForEach-Object { $_.LastWriteTime = Get-Date }
+git update-index --refresh
+git status --porcelain
+```
+
+**最后那条 `git status --porcelain` 必须仍然完全为空。**
 
 **看到别的说明：**
 
@@ -186,15 +210,70 @@ type .git\info\attributes
 |---|---|
 | 点了没反应 / 报错 | `svn_migrate_eol` 的参数名或注册有问题 |
 | 横幅没消失 | 迁移成功了但 `refreshSvnEol` 没被调用，状态没刷新 |
-| `git status` 里冒出一堆 `M` | 基线重录了但索引没对齐——这是本期最该抓的回归 |
+| 两条 `rev-parse` 哈希**不同** | 工作分支没跟上新基线——正是 2026-09-24 review 抓到的那个阻断问题 |
+| 第 3 步干净，但第 4 步打掉 stat cache 后冒出 `M` | 同上。这就是那个「潜伏」故障的真面目 |
 | `attributes` 文件不在 | 迁移把规则回滚掉了，说明重建那一步其实失败了（但界面没报错？那是更严重的问题） |
 
-4. **再点一次**没有入口了——横幅已经消失。这是对的：规则已装时后端会拒绝重复迁移
+5. **再点一次**没有入口了——横幅已经消失。这是对的：规则已装时后端会拒绝重复迁移
    （`svn_eol_already_migrated`），因为重建会移动基线指针，没理由时不该动它。
 
 ---
 
-## 4. 全程看 console
+## 场景 4：分支上有本地提交时 —— 必须拒绝，且一个字节都不写
+
+**2026-09-24 新增。** 工作分支上有自己的 git 提交时，那些 commit 里记的内容是旧的
+行尾形状，光移动分支指针修不了；要修就得逐个文件改写你已有提交的内容，而判断目标
+行尾形态只能靠猜——猜错就是把你的历史改坏。所以本期**在动任何东西之前**拒绝。
+
+1. **重造 fixture**（§1.3），在应用里打开、走完初始化向导。
+2. 关掉应用，删规则文件造出「旧仓库」：
+
+```powershell
+Remove-Item <FIX>\wc1\.git\info\attributes
+```
+
+3. 在 PowerShell 里，在工作分支上造一笔本地提交：
+
+```powershell
+cd <FIX>\wc1
+Add-Content Code\A.cs "// my local change"
+git add Code/A.cs
+git commit -m "my local change"
+git rev-parse HEAD                      # 记下来，最后要比
+git rev-parse refs/heads/svn/base       # 记下来，最后要比
+```
+
+4. 重新 `pnpm tauri dev`，打开 `<FIX>\wc1`，点迁移横幅上的「重建基线…」，
+   在确认框里点「重建」。
+
+**应该看到：**
+
+- **确认框不关闭**，框里原地显示一条红色错误；
+- 错误文字里说清了「分支 `work` 上有 **1 笔**本地提交还没进基线」；
+- 后面解释了为什么不能迁移，以及这件事留给后续的 `sync_in`；
+- 关掉框之后，迁移横幅**还在**（什么都没发生，状态没变）。
+
+5. 在 PowerShell 里确认**一个字节都没写**：
+
+```powershell
+cd <FIX>\wc1
+Test-Path .git\info\attributes          # 必须是 False
+git rev-parse HEAD                      # 必须与第 3 步记下的一致
+git rev-parse refs/heads/svn/base       # 必须与第 3 步记下的一致
+```
+
+**看到别的说明：**
+
+| 现象 | 含义 |
+|---|---|
+| 迁移**成功**了 | 前置检查没生效——这会让分支和基线之间留下一批纯行尾差异，Phase 3 会把它们提交进 SVN |
+| `.git\info\attributes` 存在了 | 拒绝路径写了规则文件，仓库停在半迁移状态 |
+| 两个哈希有任何一个变了 | 拒绝路径动了不该动的东西 |
+| 错误说的是「落后基线 N 笔」 | 成因判反了（那是另一种情形：基线被单独重建过而分支没跟上） |
+
+---
+
+## 每个场景都要：全程看 console
 
 整个过程中打开 devtools（应用窗口里 F12 或右键检查），确认：
 
@@ -206,7 +285,7 @@ console 往往是唯一会说话的地方。
 
 ---
 
-## 5. 收尾
+## 收尾
 
 ```powershell
 Remove-Item -Recurse -Force <FIX>
