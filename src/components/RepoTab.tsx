@@ -23,6 +23,7 @@ import SvnInitWizard from './SvnInitWizard'
 import BaselineBanner from './BaselineBanner'
 import { baselineMap } from '../engine/svnGraph'
 import { describeHealth, describePinned, healthNeedsRebuild } from '../engine/svnInit'
+import { MIGRATE_EOL_WARNING } from '../engine/svnSync'
 import { samePath } from '../engine/path'
 import { isBaselineBranch, visibleSections } from '../engine/capabilities'
 import { askConfirm } from '../engine/confirm'
@@ -553,15 +554,17 @@ export function RepoTab({
    *
    * 文案不复用 `handleRebuildBaseline` 那一份：那边说的是「为什么要重建」，
    * 这边要回答的是「为什么突然要我重建」——用户没做任何事，横幅自己冒出来的。
+   *
+   * 但「按下去会发生什么」那一段**必须**来自 `svnSync.ts` 的同一个常量，不再
+   * 在这里另写一遍：原先两处各写一遍，后端行为改了只改到一处，确认框就对用户
+   * 说了反话（2026-09-25 PR #45 review）。
    */
   const handleMigrateEol = async () => {
     await confirm({
       title: '重建基线以对齐行尾',
       message:
         '这个仓库建库时还没有关掉 git 的行尾转换，基线里记的内容与磁盘上的字节对不上。',
-      warning:
-        '不会修改工作目录里的任何文件，也不会推进你的工作分支。' +
-        '不做的话，文件会在被编辑或 update 之后一个一个地无故显示成「已修改」。',
+      warning: MIGRATE_EOL_WARNING,
       confirmLabel: '重建',
       busyLabel: '正在重建…',
       action: async () => {

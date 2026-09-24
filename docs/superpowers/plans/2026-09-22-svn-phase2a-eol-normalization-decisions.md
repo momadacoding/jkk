@@ -18,6 +18,7 @@
 | 4 | `migrate_eol` 原子迁移 + 回滚 | ✅ 完成 | `svn_init.rs`、`commands/svn.rs`、`lib.rs`、`tests/svn_init.rs` | `cargo test` 556 passed（新增 5）；回滚变异验证已跑 |
 | 5 | 前端横幅与接线 | ✅ 完成 | `svnSync.ts`、`repoStore.ts`、`BaselineBanner.tsx`、`RepoTab.tsx`、`svnSync.test.ts` | `pnpm build` OK；`pnpm test` 365 passed（新增 11）；变异验证已跑；**真实窗口 3 个场景 2026-09-24 由用户跑通** |
 | 6 | 修入独立 review 的阻断发现 | ✅ 完成 | `svn_init.rs`、`tests/svn_init.rs`、`tests/svn_attributes.rs` | `cargo test` 562 passed（新增 6）；对齐变异验证已跑 |
+| 7 | 修入第二轮独立 review 的三条阻断（PR #45） | ✅ 完成 | `svn_init.rs`、`svnSync.ts`、`RepoTab.tsx`、`tests/svn_init.rs`、`svnSync.test.ts` | `cargo test` 564 passed（新增 2）；`pnpm test` 369 passed（新增 4）；变异验证已跑 |
 | 收尾 | E2E 清单 + 独立 review | ✅ 完成 | `docs/superpowers/e2e/2026-09-22-svn-phase2a-eol-e2e.md` | E2E 3/3 通过；review 1 条阻断已修 |
 
 ## 全量验证
@@ -26,10 +27,10 @@
 |---|---|
 | `cargo fmt --check` | ✅ OK |
 | `cargo clippy --all-targets` | ✅ **0 告警** |
-| `cargo test` | ✅ **562 passed / 0 failed**（基线 537，新增 25） |
+| `cargo test` | ✅ **564 passed / 0 failed**（基线 537，新增 27） |
 | `pnpm build` | ✅ OK（`tsc` + `vite build`） |
-| `pnpm test` | ✅ **365 passed**（基线 354，新增 11） |
-| `pnpm tauri dev` 真实窗口 | ✅ **4/4 场景由用户实跑通过**（1、2 于 2026-09-24；3、4 在 review 修复改变行为后于 2026-09-25 按新判据重跑。清单见 `docs/superpowers/e2e/2026-09-22-svn-phase2a-eol-e2e.md`） |
+| `pnpm test` | ✅ **369 passed**（基线 354，新增 15） |
+| `pnpm tauri dev` 真实窗口 | 🟡 **场景 1、4 已通过；2、3 的行为已通过、改过的文案待重看**（第二轮 review 改了横幅与确认框的文字，那是用户按下按钮前唯一能读到的东西，必须用眼睛确认。清单见 `docs/superpowers/e2e/2026-09-22-svn-phase2a-eol-e2e.md`） |
 
 > 本仓库没有 PR 门禁 CI（`AGENTS.md` §4.1）。以上全部要本地实跑，如实填。
 
@@ -486,3 +487,116 @@ Code/Plain.cs  旧 blob=LF  磁盘=LF    →  cat-file --filters 给 CRLF  ❌
 - **对齐失败会把基线也退回去**，不留「基线新、分支旧」的半迁移状态；退回也失败时
   把原错误保留并给出手工命令。
 - **变异验证已跑**：去掉 `align_branch` 之后，恰好那两条对齐断言变红。
+
+---
+
+## Task 7：修入第二轮独立 review 的三条阻断（2026-09-25，PR #45）
+
+Task 6 的修复本身带进了一个新缺口，另外两条是本期一直存在的。三条都由实测坐实，
+不是纸面推断。
+
+### 偏离计划
+
+计划里没有这一节——它是 PR #45 的 review 产物。
+
+### 计划的错误
+
+不适用（计划写于这些问题出现之前）。
+
+### review 的三条阻断与处理
+
+| # | 发现 | 处理 |
+|---|---|---|
+| 1 | `read-tree` 失败时工作分支没回滚 | **已修**：`align_branch` 换序 + 补回滚 |
+| 2 | 重建窗口内新产生的暂存会被静默冲掉 | **已修**：覆盖索引前重查一次，缩窗 |
+| 3 | 确认框对工作分支变更的说明与实现相反 | **已修**：两处文案改写并共用同一份常量，加断言钉住 |
+| 4 | 迁移静默停用用户已有的 attributes 规则（P2） | **已披露**：写进确认框文案，并由断言钉住 |
+
+### 计划没写的坑
+
+**一、`update-ref` 成功、`read-tree` 失败，留下的状态会让仓库永久迁不动。**
+
+原先的顺序是先移分支后 `read-tree`。fixture 复现（`.git/index.lock` 存在即可触发，
+任何一个并发 git 进程或崩溃残留都会造出它）：
+
+```text
+update-ref ok                        → work = 新基线
+read-tree  exit=128                  → 索引还是旧形状
+失败路径只退 svn/base                → base = 旧基线
+
+git status --short                   →  M  f.txt      ← 用户从没暂存过
+git rev-list --count base..HEAD      →  1
+```
+
+最后那个 `1` 才是真正致命的：下一次点迁移，`check_can_align` 会把它当成
+「分支上有 1 笔本地提交」而拒绝——**这个仓库从此在界面里迁不动了**，只能手工
+`git update-ref` 救。也就是说，一次普通的锁冲突会把可恢复的失败变成不可恢复的死角。
+
+换序之后：`read-tree` 是更容易失败的那一步，而它失败时一个 ref 都还没动，天然
+全或全无；后面的 `update-ref` 自带旧值守卫、本身原子，万一失败就把索引 `read-tree`
+回旧基线。每一步之前的状态都是可恢复的。
+
+**二、前置检查与真正覆盖索引之间隔着一整趟 SVN 往返。**
+
+`check_can_align` 在开头查一次索引，之后 `rebuild_baseline` 要跑完整的 SVN 网络
+往返，最后才 `read-tree`。这中间 `git add` 进来的东西会被冲掉。实测确认影响面：
+
+```text
+git add brandnew.txt   →  A  brandnew.txt
+git read-tree <new>    →  ?? brandnew.txt     ← 暂存状态没了
+cat brandnew.txt       →  new content         ← 磁盘内容还在
+```
+
+所以准确说法是**丢暂存状态，不丢文件内容**（`read-tree` 不带 `-u`，磁盘全程不碰）。
+另有一处不对称值得记下：同一窗口内如果用户**提交**了，`update-ref` 的旧值守卫会
+挡住并安全失败——ref 侧一直有守卫，index 侧一直没有。
+
+本期只做缩窗（覆盖前重查一次），不做锁。真正的解法是仓库级操作锁，那是 Plan 2b
+`sync_in` 的既定范围，在这里另造一套会和它打架。
+
+**三、注入测试必须用白名单内已跟踪的文件，否则平凡通过。**
+
+用 `reference-transaction` 钩子在 `rebuild_baseline` 的 R4（`update-ref` 基线指针）
+那一刻注入 `git add`，时序正好落在窗口正中，比任何「先 add 再调用」的模拟都真实。
+
+但第一版钩子新建了一个 `INJECTED.txt`——Phase 1 的 `.git/info/exclude` 是**白名单
+制**，这个文件被 git 直接忽略，`git add` 什么也没做，`git status` 一片空白，测试
+平凡通过（`AGENTS.md` §13 rubric #9 的又一个实例，这次在自己写的测试里）。改成
+改写已跟踪的 `Code/Nat.cs` 才真正构造出那个竞态。
+
+**四、后端行为改了，前端的承诺没跟着改。**
+
+Task 6 把迁移从「只重录基线」改成「基线、工作分支、真实索引一起搬」，但横幅和
+确认框仍写着「不会推进你的工作分支」——在用户按下按钮之前对他说了反话。E2E 清单
+里甚至同时写着「工作分支没有被动过」和「工作分支必须跟着新基线一起前移」，而那条
+场景已经被勾成通过：**矛盾摆在眼前也没被读出来**。
+
+这暴露的是结构问题，不是疏忽：同一个机械后果在 `svnSync.ts` 和 `RepoTab.tsx` 各写
+了一遍。现在「会发生什么」这一段收成 `MIGRATE_EOL_WARNING` 一个常量，两处共用；
+标题和正文仍各写各的（它们回答的是不同问题，横幅说「这是什么」，确认框说「你按下
+去会发生什么」）。另加一组断言钉住关键句，下一个改 `align_branch` 的人会在那里被
+拦下。
+
+### 变异验证（已跑）
+
+| 变异 | 结果 |
+|---|---|
+| 把 `align_branch` 换回「先 `update-ref` 后 `read-tree`」 | 只有 `migration_moves_nothing_when_the_index_cannot_be_written` 变红 |
+| 去掉覆盖索引前的重查 | 只有 `migration_refuses_when_something_gets_staged_during_the_rebuild` 变红 |
+| 把横幅文案改回「也不会推进你的工作分支」 | 恰好两条文案断言变红（「不得再声称」「要说明会前移」），其余 367 条全绿 |
+
+前两条是在写实现之前先让新测试对着旧实现跑出来的红，不是事后人为制造的。
+
+### 为什么这么改是安全的
+
+- **换序不改变成功路径的最终状态**：成功时索引和分支仍然都落在新基线上，
+  `migrating_a_faithful_phase1_repo_leaves_nothing_dirty` 与
+  `migration_installs_the_rule_and_rerecords_the_baseline` 均未改动且仍通过。
+- **每一步之前的状态都可恢复**：`read-tree` 失败 ⇒ 什么都没动；`update-ref` 失败
+  ⇒ 索引退回旧基线；两者失败都会把 `svn/base` 和 `attributes` 一并退回。
+- **两个回滚都不再吞错误**。原先 `restore_attributes` 的失败被 `let _` 吞掉，而
+  被吞掉的恰好是用户此后无从察觉的那一种——界面会因为 `has_eol_rule` 报 `true`
+  而不再提示迁移，等于无人知晓。现在两个回滚的失败都追加进错误消息并给出手工命令。
+- **缩窗不是消除竞态**，代码注释和本节都写明了这一点，不给下一个人「这里已经安全了」
+  的错觉。
+- **文案改动由断言覆盖**，不依赖人记得同步。

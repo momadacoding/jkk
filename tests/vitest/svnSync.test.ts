@@ -6,6 +6,7 @@ import {
   describeAudit,
   describeEolMigration,
   describeSync,
+  MIGRATE_EOL_WARNING,
   needsStandaloneCheck,
   recordAfterSuccess,
   syncBannerIsSuppressed,
@@ -360,6 +361,43 @@ describe('describeEolMigration', () => {
       verdict: { kind: 'diverged', nodeRev: 9, baselineRev: 4 },
     }
     expect(describeEolMigration(eolNeeds, diverged)).not.toBeNull()
+  })
+})
+
+describe('迁移文案必须与后端真实行为一致', () => {
+  // 2026-09-25 PR #45 review 抓到的。第一版后端只重录基线、确实不动工作分支，
+  // 文案照实写了「不会推进你的工作分支」；后来修阻断时改成了「基线、工作分支、
+  // 真实索引一起搬」，**文案没跟着改**，于是确认框对用户说了反话。
+  //
+  // 确认框是 git 状态变更前用户唯一的信息来源，这类矛盾必须由断言钉住：
+  // 下一个改 `align_branch` 的人会在这里被拦下。
+  const banner = describeEolMigration(eolNeeds, inSync)!
+
+  it('两处都不得再声称「不会推进你的工作分支」', () => {
+    for (const text of [banner.note, MIGRATE_EOL_WARNING]) {
+      expect(text).not.toContain('不会推进')
+    }
+  })
+
+  it('两处都要说明工作分支和暂存区会跟着一起前移', () => {
+    for (const text of [banner.note, MIGRATE_EOL_WARNING]) {
+      expect(text).toContain('工作分支和暂存区会跟着新基线一起前移')
+    }
+  })
+
+  it('两处都要继续保证不动工作目录里的文件', () => {
+    // 这一条是真的：`read-tree` 不带 `-u`，磁盘全程不碰。
+    for (const text of [banner.note, MIGRATE_EOL_WARNING]) {
+      expect(text).toContain('工作目录')
+    }
+  })
+
+  it('确认框要披露会接管 .git/info/attributes', () => {
+    // 迁移会把那个文件整体换成本工具生成的内容，用户原有的 filter / diff /
+    // merge 规则随之失效（原件备份成 attributes.bak）。这是用户自己的配置被
+    // 停用，不披露就是静默改了他的环境。
+    expect(MIGRATE_EOL_WARNING).toContain('.git/info/attributes')
+    expect(MIGRATE_EOL_WARNING).toContain('attributes.bak')
   })
 })
 

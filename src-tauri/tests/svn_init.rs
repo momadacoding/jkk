@@ -1538,6 +1538,129 @@ fn migration_refuses_when_something_is_staged() {
     );
 }
 
+/// `git rev-parse <rev>`，去掉换行。
+fn rev(repo: &str, what: &str) -> String {
+    run_git(repo, &["rev-parse", what])
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+#[test]
+fn migration_moves_nothing_when_the_index_cannot_be_written() {
+    // 2026-09-25 PR #45 review 抓到的回滚缺口。`align_branch` 原先**先**移工作
+    // 分支**再** `read-tree`，后者失败时只退了 `svn/base`，工作分支留在新基线上。
+    //
+    // 触发条件极普通：`.git/index.lock` 存在（另一个 git 进程、崩溃留下的陈旧锁、
+    // IDE 的 git 集成都会造出它）。留下的状态比「迁移没成」糟得多：
+    //
+    // ```text
+    // git status                        →  M <每个文本文件>   ← 用户从没暂存过
+    // git rev-list --count svn/base..HEAD →  1                ← 凭空多一笔提交
+    // ```
+    //
+    // 最后那个 `1` 是真正致命的地方：下一次点迁移，`check_can_align` 会把它当成
+    // 「分支上有 1 笔本地提交」而拒绝，**这个仓库从此在界面里迁不动了**。
+    let fx = svn_repo_with_native_eol();
+    init_hybrid(&req(&fx)).unwrap();
+    rewind_to_phase1(&fx);
+    let wc = fx.wc_str();
+
+    let branch = run_git(&wc, &["symbolic-ref", "--short", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let tip_before = rev(&wc, "HEAD");
+    let base_before = rev(&wc, "refs/heads/svn/base");
+
+    // `rebuild_baseline` 全程走 TempIndex（`GIT_INDEX_FILE`），不受这把锁影响；
+    // 被挡住的恰好只有「对齐真实索引」那一步——正是要测的那条失败路径。
+    let lock = fx.wc().join(".git/index.lock");
+    std::fs::write(&lock, b"").unwrap();
+    let err = migrate_eol(&wc).expect_err("真实索引写不进去时必须失败");
+    std::fs::remove_file(&lock).unwrap();
+
+    assert_eq!(
+        rev(&wc, &format!("refs/heads/{branch}")),
+        tip_before,
+        "失败后工作分支必须还在原处。实际报的错：{}",
+        err.message
+    );
+    assert_eq!(
+        rev(&wc, "refs/heads/svn/base"),
+        base_before,
+        "失败后基线必须还在原处"
+    );
+    assert!(!has_eol_rule(&wc), "失败后规则文件必须还原");
+    assert_eq!(
+        run_git(&wc, &["rev-list", "--count", "refs/heads/svn/base..HEAD"])
+            .unwrap()
+            .trim(),
+        "0",
+        "失败后不得在工作分支上留下一笔提交——那会让下次迁移被当成「有本地提交」而永久拒绝"
+    );
+}
+
+#[test]
+fn migration_refuses_when_something_gets_staged_during_the_rebuild() {
+    // 前置检查只在开头查一次索引，之后 `rebuild_baseline` 要跑完整的 SVN 往返
+    // （含网络），最后才无条件 `read-tree`。这中间用户或别的 git 工具 `git add`
+    // 进去的东西会被静默冲掉——磁盘内容还在，但暂存状态没了。
+    //
+    // 注入点用 `reference-transaction` 钩子：它在 `rebuild_baseline` 的 R4
+    // （`update-ref refs/heads/svn/base`）那一刻触发，正好落在窗口正中，比任何
+    // 「先 add 再调用」的模拟都更接近真实时序。
+    let fx = svn_repo_with_native_eol();
+    init_hybrid(&req(&fx)).unwrap();
+    rewind_to_phase1(&fx);
+    let wc = fx.wc_str();
+
+    let tip_before = rev(&wc, "HEAD");
+    let base_before = rev(&wc, "refs/heads/svn/base");
+
+    // 钩子会被触发多次（prepared / committed），所以写的是**固定内容**而不是
+    // 追加，重复执行幂等。
+    //
+    // 注入的必须是**白名单内已跟踪**的文件：Phase 1 的 `.git/info/exclude` 是
+    // 白名单制，新建一个 `INJECTED.txt` 会被 git 直接忽略，`git add` 什么也不做，
+    // 测试就变成了平凡通过（2026-09-25 实测踩到）。
+    let hook = fx.wc().join(".git/hooks/reference-transaction");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\nprintf 'n1\\r\\nn2\\r\\nINJECTED\\r\\n' > Code/Nat.cs\ngit add -- Code/Nat.cs\nexit 0\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let err = migrate_eol(&wc).expect_err("迁移过程中被塞进暂存区时必须拒绝，而不是冲掉它");
+
+    // 钩子还会在回滚那次 update-ref 上再触发一遍，所以先摘掉它再断言。
+    std::fs::remove_file(&hook).unwrap();
+
+    assert_eq!(
+        err.code, "svn_eol_migrate_index_changed",
+        "实际：{}",
+        err.message
+    );
+    assert_eq!(rev(&wc, "HEAD"), tip_before, "拒绝后工作分支必须还在原处");
+    assert_eq!(
+        rev(&wc, "refs/heads/svn/base"),
+        base_before,
+        "拒绝后基线必须退回原处，不许留下「基线新、分支旧」的半迁移状态"
+    );
+    assert!(!has_eol_rule(&wc), "拒绝了就不许留下规则文件");
+    assert!(
+        run_git(&wc, &["diff", "--cached", "--name-only"])
+            .unwrap()
+            .contains("Code/Nat.cs"),
+        "窗口内暂存的内容必须原样保留，不能被 read-tree 冲掉"
+    );
+}
+
 #[test]
 fn migration_refuses_on_a_detached_head() {
     let fx = svn_repo_with_native_eol();

@@ -471,19 +471,27 @@ pub fn migrate_eol(repo_root: &str) -> Result<RebuildReport> {
                 &report.new_baseline,
             ],
         );
-        let _ = restore_attributes(repo_root, previous.as_deref());
-        return Err(match undo {
-            Ok(_) => e,
-            Err(ue) => GitError::new(
-                &e.code,
-                format!(
-                    "{}\n\n另外：把基线退回旧 commit 也失败了（{}）。\
-                     仓库现在是「基线已换新形状、工作分支还是旧形状」的半迁移状态，\
-                     请手工执行 `git update-ref refs/heads/svn/base {}` 后重试。",
-                    e.message, ue.message, report.old_baseline
-                ),
-            ),
-        });
+        // 两个回滚都要做，且**都不能吞错误**：吞掉的那个恰好是用户此后无从察觉的
+        // 那种——界面会因为 `has_eol_rule` 报 true 而不再提示迁移。
+        let restored = restore_attributes(repo_root, previous.as_deref());
+        let mut msg = e.message.clone();
+        if let Err(ue) = undo {
+            msg.push_str(&format!(
+                "\n\n另外：把基线退回旧 commit 也失败了（{}）。\
+                 仓库现在是「基线已换新形状、工作分支还是旧形状」的半迁移状态，\
+                 请手工执行 `git update-ref refs/heads/svn/base {}` 后重试。",
+                ue.message, report.old_baseline
+            ));
+        }
+        if let Err(re) = restored {
+            msg.push_str(&format!(
+                "\n\n另外：还原 .git/info/attributes 也失败了（{}）。\
+                 行尾规则现在是生效的，而基线不是按它录的，\
+                 请手工删掉 .git/info/attributes 后重试。",
+                re.message
+            ));
+        }
+        return Err(GitError::new(&e.code, msg));
     }
     Ok(report)
 }
@@ -580,9 +588,49 @@ fn check_can_align(repo_root: &str) -> Result<String> {
 /// 前提由 [`check_can_align`] 保证：分支 tip == 旧基线、索引 == 旧基线树。
 /// 因此这里既不会丢提交，也不会丢暂存内容；磁盘全程不碰（`read-tree` **不带
 /// `-u`**，与 `build_repo` 里那句同样的理由）。
+///
+/// # 为什么先 `read-tree` 后 `update-ref`
+///
+/// 2026-09-25 PR #45 review。原先是反的，于是 `read-tree` 失败时分支已经移走了，
+/// 而失败路径只退得回基线——留下的状态**比迁移没成糟得多**：
+///
+/// ```text
+/// git status                          →  M <每个文本文件>   ← 用户从没暂存过
+/// git rev-list --count svn/base..HEAD →  1                  ← 凭空多一笔提交
+/// ```
+///
+/// 那个 `1` 会让下一次迁移撞进 [`check_can_align`] 的「分支上有本地提交」分支被
+/// 永久拒绝，仓库从此在界面里迁不动，只能手工 `git update-ref` 救。
+///
+/// 换成现在的顺序之后：`read-tree` 是更容易失败的一步（`.git/index.lock` 随便
+/// 一个 git 进程都会造出来），而它失败时**一个 ref 都还没动**，天然全或全无；
+/// 后面的 `update-ref` 自带旧值守卫、本身原子，万一失败就把索引 `read-tree`
+/// 回旧基线——每一步之前的状态都是可恢复的。
 fn align_branch(repo_root: &str, branch: &str, report: &RebuildReport) -> Result<()> {
+    // **覆盖索引之前再查一次**。`check_can_align` 那次发生在 `rebuild_baseline`
+    // 之前，而重建要跑完整的 SVN 往返（含网络）——这中间用户或别的 git 工具
+    // `git add` 进来的东西会被下面这句 `read-tree` 静默冲掉（磁盘内容还在，
+    // 但暂存状态没了）。这里查不掉竞态，只是把窗口从「整个重建」缩到微秒级；
+    // 真正的解法是仓库级操作锁，那是 Phase 2 `sync_in` 的既定范围。
+    let (code, _) = run_git_code(
+        repo_root,
+        &["diff-index", "--cached", "--quiet", &report.old_baseline],
+    )?;
+    if code != 0 {
+        return Err(GitError::new(
+            "svn_eol_migrate_index_changed",
+            "迁移过程中暂存区发生了变化（有别的 git 操作在同时进行？）。\
+             对齐索引会把这些暂存内容冲掉，所以这次迁移已中止，仓库回到了迁移前的样子。\
+             请先提交或取消暂存（`git restore --staged`）再重试。",
+        ));
+    }
+
+    // 对齐真实索引。**不带 `-u`**：绝不能用基线内容去覆盖磁盘，那会抹掉用户
+    // 未提交的 SVN 改动（`build_repo` 里记过同一条理由）。
+    run_git(repo_root, &["read-tree", &report.new_baseline])?;
+
     // 带旧值守卫：这中间若有外部把分支挪走了，宁可失败也不覆盖
-    run_git(
+    if let Err(e) = run_git(
         repo_root,
         &[
             "update-ref",
@@ -590,10 +638,24 @@ fn align_branch(repo_root: &str, branch: &str, report: &RebuildReport) -> Result
             &report.new_baseline,
             &report.old_baseline,
         ],
-    )?;
-    // 对齐真实索引。**不带 `-u`**：绝不能用基线内容去覆盖磁盘，那会抹掉用户
-    // 未提交的 SVN 改动（`build_repo` 里记过同一条理由）。
-    run_git(repo_root, &["read-tree", &report.new_baseline])?;
+    ) {
+        // 索引已经换成新基线树了，退回去——否则 `git status` 会报一堆用户从没
+        // 暂存过的改动。
+        return Err(
+            match run_git(repo_root, &["read-tree", &report.old_baseline]) {
+                Ok(_) => e,
+                Err(re) => GitError::new(
+                    &e.code,
+                    format!(
+                        "{}\n\n另外：把索引退回旧基线也失败了（{}）。\
+                     `git status` 现在会显示一批你从没暂存过的改动，\
+                     请手工执行 `git read-tree {}` 复位。",
+                        e.message, re.message, report.old_baseline
+                    ),
+                ),
+            },
+        );
+    }
     Ok(())
 }
 
