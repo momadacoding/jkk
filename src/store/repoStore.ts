@@ -709,6 +709,7 @@ export interface RepoRefreshers {
   /** §6.6.3 第二档。只在第一档报告「有人动过」之后才调。 */
   /** §6.6.3 的第一档 + 条件触发第二档。挂在高频的 repo-changed 上。 */
   checkSvnSyncIfChanged: (path: string) => Promise<boolean>
+  refreshSvnSyncState: (path: string) => Promise<void>
   /** 服务器侧核对的**后台**入口，自带频率闸。挂定时器与窗口焦点。 */
   auditSvnIfDue: (path: string) => Promise<void>
 }
@@ -718,7 +719,7 @@ export function useRepoEffects(
   refreshers: RepoRefreshers,
   viewMode: string,
 ) {
-  const { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, auditSvnIfDue } = refreshers
+  const { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, refreshSvnSyncState, auditSvnIfDue } = refreshers
   const diffScope = viewMode === 'changes'
     ? 'workdir'
     : state.selectedId
@@ -759,6 +760,13 @@ export function useRepoEffects(
       // 第二档还是每次都跑——分层白做。
       if (state.capabilities.vcs === 'svn') {
         void checkSvnSyncIfChanged(path).catch(ignore)
+        // 同步状态也要跟着刷（2026-09-25 独立 review）。只在打开仓库时读一次的话：
+        // 另一个进程开始或结束的同步永远不会出现 / 永远不会消失；更糟的是，
+        // 打开那一刻若恰好读到 `locked: true`，`otherBannersAreSuppressed` 会把
+        // 失同步 / 行尾 / 漏收横幅**压住整个标签页的生命周期**，除非关掉重开。
+        //
+        // 它是纯本地读（一次 stat + 一个小文件），挂在高频通道上不需要分层。
+        void refreshSvnSyncState(path).catch(ignore)
       }
     }).then((fn) => { unlisten = fn })
     return () => { unlisten?.() }

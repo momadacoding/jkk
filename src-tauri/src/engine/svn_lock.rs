@@ -90,21 +90,50 @@ fn exclusive_open(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
+/// 探测结果三态。**「判不出来」必须与「没人持有」分开**（2026-09-25 独立 review）。
+///
+/// 合成布尔的话只能二选一，而两个方向都错：当成「没人持有」会在一次真实的同步
+/// 进行中放行写操作；当成「有人持有」会让接管路径抢走一把可能真有人在用的锁。
+/// 分开之后，**守卫**可以保守地关门，**接管**可以保守地不动手。
+pub enum Liveness {
+    /// 确有进程持有（共享冲突）。
+    Held,
+    /// 确实没人持有：文件不存在，或独占打得开（= 残锁）。
+    Free,
+    /// 判不出来。权限、网络盘、ACL 等——不知道就是不知道，不许猜。
+    Unknown(std::io::Error),
+}
+
 /// 现在是不是真的有进程持有这把锁？
 ///
 /// 注意与「锁文件存不存在」的区别：崩溃之后文件还在，但没人持有（实测）。
 ///
-/// ⚠️ 非 Windows 上拿不到跨进程语义，这里恒返回 `false`（即「谁都能接管」）。
-/// 本项目主力平台是 Windows（`AGENTS.md` §10），与 `file_lock.rs` 的降级方式一致。
-pub fn is_held(repo_root: &str) -> bool {
+/// ⚠️ 非 Windows 上拿不到跨进程语义，`exclusive_open` 恒能打开，于是这里恒为
+/// `Free`（即「谁都能接管」）。本项目主力平台是 Windows（`AGENTS.md` §10），
+/// 与 `file_lock.rs` 的降级方式一致。
+pub fn probe(repo_root: &str) -> Liveness {
     let p = lock_path(repo_root);
     if !p.exists() {
-        return false;
+        return Liveness::Free;
     }
     match exclusive_open(&p) {
-        Ok(_) => false, // 独占拿得到 ⇒ 没人持有 ⇒ 残锁
-        Err(e) => matches!(e.raw_os_error(), Some(32) | Some(33)),
+        Ok(_) => Liveness::Free, // 独占拿得到 ⇒ 没人持有 ⇒ 残锁
+        Err(e) => match e.raw_os_error() {
+            // ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION，
+            // 与 `engine/file_lock.rs::is_occupied` 同一套判据。
+            Some(32) | Some(33) => Liveness::Held,
+            _ => Liveness::Unknown(e),
+        },
     }
+}
+
+/// 「有人持有吗」的**保守**答案：判不出来时算有人持有。
+///
+/// 守卫（[`assert_not_syncing`]）和界面显示都用它。拿不准时关门的代价是用户多
+/// 等一次、看到一条可能多余的提示；开门的代价是一次真实同步跑到一半被写操作
+/// 从中间插进来。两者不对等。
+pub fn is_held(repo_root: &str) -> bool {
+    !matches!(probe(repo_root), Liveness::Free)
 }
 
 /// 只读打开，且**允许**别的进程同时读写。
@@ -177,12 +206,26 @@ pub fn acquire(repo_root: &str, opid: &str) -> Result<SyncLock> {
     }
 
     // 先按「必须不存在」创建（§5.1.1 的 O_EXCL / CREATE_NEW 语义）。
-    let mut file = match create_new_exclusive(&path) {
+    let file = match create_new_exclusive(&path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             // 文件在。真有人拿着，还是上次崩溃留下的？
-            if is_held(repo_root) {
-                return Err(busy_error(repo_root));
+            match probe(repo_root) {
+                Liveness::Held => return Err(busy_error(repo_root)),
+                // 判不出来就**不接管**。抢走一把可能真有人在用的锁，比多报一次
+                // 「正忙」危险得多（2026-09-25 独立 review N2）。
+                Liveness::Unknown(io) => {
+                    return Err(GitError::new(
+                        "sync_lock_unreadable",
+                        format!(
+                            "这个工作副本上有一个同步锁文件（{}），但判断不出它是不是\
+                             还有人在用（{io}）。为安全起见这次不接管它。\
+                             常见成因：文件被设成只读、权限不足、或它在网络盘上。",
+                            path.display()
+                        ),
+                    ))
+                }
+                Liveness::Free => {}
             }
             // 残锁：接管。§5.1.1 要求接管必须写日志并告知用户。
             log::warn!(
@@ -191,9 +234,26 @@ pub fn acquire(repo_root: &str, opid: &str) -> Result<SyncLock> {
                 holder(repo_root)
             );
             std::fs::remove_file(&path)?;
-            create_new_exclusive(&path)?
+            match create_new_exclusive(&path) {
+                Ok(f) => f,
+                // 另一个进程在我们删完之后抢先建了——它赢了，如实报「正忙」而不是
+                // 把裸 io 错误抛给用户（2026-09-25 独立 review N11）。
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(busy_error(repo_root))
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
         Err(e) => return Err(e.into()),
+    };
+
+    // ⚠️ **先把 guard 建起来，再写元数据。** 顺序反过来的话，写元数据这几步里
+    // 任何一个 `?` 早退都会让**文件留在磁盘上而没有 guard 去删它**——下一次
+    // `acquire` 于是打出「上次同步没有正常收尾」，又是一条永远为假的告警
+    //（2026-09-25 独立 review N1；与 Task 1 修的那个 Drop bug 同一类后果）。
+    let mut guard = SyncLock {
+        file: Some(file),
+        path,
     };
 
     let meta = LockHolder {
@@ -201,27 +261,32 @@ pub fn acquire(repo_root: &str, opid: &str) -> Result<SyncLock> {
         started_at: now_secs(),
         opid: opid.to_string(),
     };
-    // ⚠️ `GitError` **没有** `From<serde_json::Error>`（`error.rs` 只实现了
-    // git2 与 io 两种），所以这里必须 `map_err`，不能用 `?`。
-    // 写法与 `svn_config::write_config` 保持一致。
+    // `GitError` **没有** `From<serde_json::Error>`（`error.rs` 只实现了 git2 与
+    // io 两种），所以这里必须 `map_err`，不能用 `?`。与 `svn_config::write_config`
+    // 同一写法。
     let body = serde_json::to_string(&meta)
         .map_err(|e| GitError::new("svn_lock", format!("锁元数据序列化失败: {e}")))?;
     // 元数据写进句柄本身，不另开一次——另开就要考虑「开不开得了」的分支，
     // 而我们此刻正独占着它。
-    file.rewind()?;
-    file.write_all(body.as_bytes())?;
-    file.flush()?;
+    let f = guard.file.as_mut().expect("刚建好，一定是 Some");
+    f.rewind()?;
+    f.write_all(body.as_bytes())?;
+    f.flush()?;
 
-    Ok(SyncLock {
-        file: Some(file),
-        path,
-    })
+    Ok(guard)
 }
 
 /// 写操作的守卫。**拒绝而不是排队**（spec §5.1）。
 ///
 /// 读操作不得调用它：同步期间界面还要照常显示状态，把读也挡掉等于在最需要看清
 /// 状况的时候把灯关了。`tests/svn_write_guard.rs` 两个方向都守着。
+///
+/// # ⚠️ 它也会挡住**持锁者自己**
+///
+/// 判据是「这把锁在不在」，不是「我是不是持有者」。所以 2c 的 `sync_in` **不能**
+/// 拿 `backend_for(..).stash_push(..)` / `.checkout(..)` 去干自己的活——那会被自己
+/// 的锁挡回来。它应当直接调 `engine` 层（`run_git`），那一层本来就不经过守卫。
+/// 这是有意的：守卫的职责是挡住**界面**发起的写，不是给编排层当便利函数。
 pub fn assert_not_syncing(repo_root: &str) -> Result<()> {
     if is_held(repo_root) {
         return Err(busy_error(repo_root));

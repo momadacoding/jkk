@@ -50,7 +50,10 @@ fn the_debounce_loop_actually_checks_the_suspension() {
         .expect("找不到发事件那一句——改名了？");
     let window = &src[emit.saturating_sub(400)..emit];
     assert!(
-        window.contains("is_watch_suspended"),
-        "发 repo-changed 之前没有查挂起状态（spec §5.2）"
+        // 断言带上那个 `!`：只查 `is_watch_suspended` 是不够的——去掉取反会让
+        // 事件**只在挂起期间**发出（功能恰好反过来），而那样的代码同样含有这个
+        // 标识符，测试照样绿（2026-09-25 独立 review）。
+        window.contains("!is_watch_suspended"),
+        "发 repo-changed 之前没有查挂起状态，或者判断被写反了（spec §5.2）"
     );
 }

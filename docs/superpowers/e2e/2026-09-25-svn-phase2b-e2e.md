@@ -52,10 +52,14 @@ pnpm tauri dev
 2. 在 PowerShell 里造一份「上次停在 stashed」的记录：
 
 ```powershell
-@'
-{"opid":"manual-test","flow":"sync_in","phase":"stashed","startedAt":1757000000,"origBranch":"work"}
-'@ | Set-Content -Encoding utf8 <WC>\.git\mygitclient-sync.json
+$j = '{"opid":"manual-test","flow":"sync_in","phase":"stashed","startedAt":1757000000,"origBranch":"work"}'
+[IO.File]::WriteAllText('<WC>\.git\mygitclient-sync.json', $j)
 ```
+
+> ⚠️ **别用 `Set-Content -Encoding utf8`。** Windows 自带的 PowerShell 5.1 会给
+> 它写上 **BOM**（PowerShell 7 不会），而 serde_json 见到 BOM 直接报
+> `expected value`——你会掉进下面那张表的「坏 JSON」那一行，而不是看到横幅。
+> `[IO.File]::WriteAllText` 两个版本都不写 BOM。
 
 3. 重新 `pnpm tauri dev`，打开 `<WC>`。
 

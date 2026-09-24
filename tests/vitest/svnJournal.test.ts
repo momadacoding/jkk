@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   describeUnfinishedSync,
   otherBannersAreSuppressed,
+  type SyncPhase,
   type SyncState,
 } from '@/engine/svnJournal'
 
@@ -103,6 +104,24 @@ describe('describeUnfinishedSync', () => {
       seen.add(b.detail)
     }
     expect(seen.size, '有 phase 共用了同一句说明').toBe(phases.length)
+  })
+
+  it('认不出的 phase 也要有话说，不能渲染一条没有正文的红条', () => {
+    // 后端的 Phase 枚举比前端这个联合类型宽（含 sync_out 的全部阶段），
+    // 手写的 journal 或 Phase 3 的流程都能让它们出现。
+    // `PHASE_DETAIL[未知]` 是 undefined，会渲染出只有标题的红条。
+    const b = describeUnfinishedSync({
+      locked: false,
+      holder: null,
+      unfinished: {
+        flow: 'sync_out',
+        phase: 'svn-staged' as SyncPhase,
+        opid: 'x',
+        startedAt: 1,
+      },
+    })!
+    expect(b.detail).toBeTruthy()
+    expect(b.detail).toContain('svn-staged')
   })
 
   it('stashing 阶段必须明确叫用户不要自己去 apply', () => {

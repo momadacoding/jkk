@@ -61,55 +61,68 @@ pub enum Phase {
 
 /// journal 的全部字段（spec §7.6 的 JSON 样例）。
 ///
-/// `sync_out` 专用字段现在就定义：本模块拥有这个文件格式，等 Phase 3 再加会让
-/// 两期写出的 journal 互相读不了。**空值一律 `skip_serializing_if`**，
+/// `sync_out` 的大部分字段现在就定义：本模块拥有这个文件格式，等 Phase 3 再加
+/// 会让两期写出的 journal 互相读不了。**空值一律 `skip_serializing_if`**，
 /// 让 `sync_in` 写出来的文件保持干净可读。
+///
+/// # ⚠️ `default` 只加在可选字段上，**绝不加在容器上**
+///
+/// 2026-09-25 独立 review 抓到：容器级 `#[serde(default)]` 会让**缺字段**的
+/// JSON 静默读成默认值。实测 `{"opid":"x","flow":"sync_out","startedAt":7}`
+/// 读回来是 `phase: Start`——而界面对 `start` 说的是「还没有动过工作目录里的
+/// 任何东西，可以直接当作没发生过」。对一次实际停在 `svn-staged`（`.svn` 里
+/// 挂着 add / delete 登记）的流程说这句话，是界面能说出的最有害的一句。
+///
+/// 下面四个「脊梁」字段没有 `skip_serializing_if`，所以我们写出去的 journal
+/// 一定带着它们；读的时候缺任何一个都应当是**硬错误**，走
+/// `svn_journal_corrupt` 那条路，与模块开头那条「三种结果必须分开」一致。
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "camelCase")]
 pub struct Journal {
+    // —— 脊梁四件：缺一即 corrupt，不得有 default ——
     pub opid: String,
     pub flow: Flow,
     pub phase: Phase,
     pub started_at: u64,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orig_branch: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orig_head: Option<String>,
     /// push **之前**的 `refs/stash`。负责区分「push 没落地」和「push 落地了但
     /// reflog 被外部 `stash clear` 抹掉了」——后者要报错停下，不能当成没事
     /// 发生（§7.3.1）。`None` 表示当时还没有 stash。
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stash_ref_before: Option<String>,
     /// **不可变 OID**，绝不是 `stash@{N}`（§7.6.1：那是栈位置，不是身份。
     /// 任何一次新的 stash 都会把 `stash@{0}` 挤走，按位置恢复会应用到别人的 WIP）。
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stash_oid: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_rev_before: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_oid_before: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_tree: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_baseline_oid: Option<String>,
 
     // —— 以下只有 sync_out 用（§7.6 末尾三段）——
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub svn_added: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub svn_deleted: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub new_parent_dirs: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_only_commits: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deliver_ref: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temp_worktree: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_message: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_start_rev: Option<u64>,
 }
 

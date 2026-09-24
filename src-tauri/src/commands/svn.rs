@@ -53,6 +53,9 @@ pub fn svn_init_hybrid(
 /// 重建基线 R1–R5。全程不动 HEAD、不动真实索引、不动磁盘。
 #[tauri::command(async)]
 pub fn svn_rebuild_baseline(path: String) -> Result<RebuildReport, GitError> {
+    // 它移动 `svn/base` 指针——正是一次同步全程依赖的那个指针（spec §5.1）。
+    // 不走 `trait Vcs`，所以 `vcs/svn.rs` 上的守卫拦不到，必须自己挡一道。
+    svn_lock::assert_not_syncing(&path)?;
     rebuild_baseline(&path)
 }
 
@@ -81,6 +84,9 @@ pub fn svn_eol_status(path: String) -> Result<EolStatus, GitError> {
 /// 同等分量。重建失败时规则会被还原，仓库回到原状。
 #[tauri::command(async)]
 pub fn svn_migrate_eol(path: String) -> Result<RebuildReport, GitError> {
+    // 同 `svn_rebuild_baseline`：它也移动基线指针。`migrate_eol` 自带的
+    // `MigrationLock` 只防本命令自己的并发，防不了「同步正在跑」。
+    svn_lock::assert_not_syncing(&path)?;
     migrate_eol(&path)
 }
 

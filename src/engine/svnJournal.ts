@@ -16,8 +16,10 @@ export interface LockHolder {
 /**
  * 后端 `svn_journal::Phase` 的线序名，逐字对应 spec §7.6 的两张表。
  *
- * 这里只列 `sync_in` 会停在的那些。`sync_out` 的阶段（`svn-staged`、
- * `committing`…）要等 Phase 3；本期的后端也写不出它们。
+ * 这里只列 `sync_in` 会停在的那些。**但后端的 `Phase` 枚举已经包含 `sync_out`
+ * 的全部阶段**（`svn-staged`、`committing`…），一份手工写的 journal 或 Phase 3
+ * 的流程都能让它们出现在这里——所以类型收窄不等于运行时收窄，
+ * `describeUnfinishedSync` 必须对认不出的 phase 有兜底（2026-09-25 独立 review）。
  */
 export type SyncPhase =
   | 'start'
@@ -94,10 +96,19 @@ export function describeUnfinishedSync(s: SyncState | null): BannerModel | null 
 
   if (!s.unfinished) return null
 
+  // 认不出的 phase 必须有话说。后端的 `Phase` 枚举比这里的联合类型宽
+  // （含 `sync_out` 的全部阶段），而 `PHASE_DETAIL[未知]` 是 `undefined`
+  // ——那会渲染出一条只有标题、没有正文的红条，比说「我不认识」更糟。
+  const detail =
+    PHASE_DETAIL[s.unfinished.phase] ??
+    `流程停在「${s.unfinished.phase}」这一步，这个版本的界面还不认识它` +
+      '（多半是更新之后留下的记录）。请不要手工去动 stash 或分支指针，' +
+      '记录都还在。'
+
   return {
     tone: 'danger',
     title: '上次同步没有正常结束',
-    detail: PHASE_DETAIL[s.unfinished.phase],
+    detail,
     actions: [],
     note: NOTE_NEXT_PHASE,
   }

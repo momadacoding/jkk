@@ -59,6 +59,33 @@ fn a_corrupt_journal_is_an_error_not_a_default() {
 }
 
 #[test]
+fn a_journal_missing_its_phase_is_an_error_not_a_default() {
+    // 2026-09-25 独立 review（B3）。`a_corrupt_journal_is_an_error_not_a_default`
+    // 只覆盖了**语法坏掉**的 JSON；容器级 `#[serde(default)]` 开出第二类：
+    // 语法合法但少了关键字段，serde 会静默填上默认值。
+    //
+    // 后果比语法坏掉更糟。少了 `phase` 会读成 `Phase::Start`，而界面对 `start`
+    // 说的是「还没有动过工作目录里的任何东西——可以直接当作没发生过」。对一次
+    // 实际停在 `svn-staged`（`.svn` 里挂着 add / delete 登记）的流程说这句话，
+    // 是整个界面能说出的最有害的一句。
+    let fx = git_dir_fixture();
+    let root = fx.path().to_string_lossy().to_string();
+
+    for bad in [
+        r#"{"opid":"x","flow":"sync_out","startedAt":7,"stashOid":"abc"}"#, // 少 phase
+        r#"{"flow":"sync_in","phase":"stashed","startedAt":7}"#,            // 少 opid
+        "{}",                                                               // 什么都没有
+    ] {
+        std::fs::write(journal_path(&root), bad).unwrap();
+        let err = read(&root).unwrap_err();
+        assert_eq!(
+            err.code, "svn_journal_corrupt",
+            "缺字段的 journal 必须报错而不是填默认值。输入：{bad}"
+        );
+    }
+}
+
+#[test]
 fn writing_leaves_no_temp_file_behind() {
     let fx = git_dir_fixture();
     let root = fx.path().to_string_lossy().to_string();

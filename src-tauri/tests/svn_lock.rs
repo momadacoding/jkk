@@ -70,6 +70,48 @@ fn a_normal_release_removes_the_lock_file_itself() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn an_unreadable_lock_file_is_treated_as_held_not_as_free() {
+    // 2026-09-25 独立 review（N2）。`is_held` 原先只把 errno 32/33 当成「有人持有」，
+    // **其余一切错误都当成「没人持有」**——包括权限错误（errno 5）。
+    //
+    // 那个方向是危险的那一边：`assert_not_syncing` 会因此放行写操作，而真相是
+    // 我们根本不知道有没有人在同步。判不出来时必须**关门**，不是开门。
+    //
+    // 用只读属性造 errno 5（review 实测过这条路径）。共享冲突之外的错误在现实里
+    // 还来自网络盘 / 多账户 ACL。
+    let fx = git_dir_fixture();
+    let root = fx.path().to_string_lossy().to_string();
+    let p = lock_path(&root);
+    std::fs::write(&p, br#"{"pid":1,"startedAt":1,"opid":"x"}"#).unwrap();
+
+    let mut perm = std::fs::metadata(&p).unwrap().permissions();
+    perm.set_readonly(true);
+    std::fs::set_permissions(&p, perm).unwrap();
+
+    let held = is_held(&root);
+
+    // 先恢复可写，否则 TempDir 的清理会失败。
+    //
+    // `#[allow]`：clippy 的 `permissions_set_readonly_false` 警告的是它在 Unix 上
+    // 会放开 all users 的写权限。这条测试是 `#[cfg(windows)]`，而 Windows 上
+    // `set_readonly(false)` 只是清掉 FILE_ATTRIBUTE_READONLY 这一个属性位，
+    // 不涉及 ACL；对象还是进程刚在 TempDir 里建的临时文件。
+    #[allow(clippy::permissions_set_readonly_false)]
+    {
+        let mut perm = std::fs::metadata(&p).unwrap().permissions();
+        perm.set_readonly(false);
+        std::fs::set_permissions(&p, perm).unwrap();
+    }
+
+    assert!(
+        held,
+        "判不出存活时必须当成「有人持有」。当成「没人持有」会让写操作在一次真实的\
+         同步进行中被放行——那正是这把锁存在的理由"
+    );
+}
+
 #[test]
 fn a_lock_file_left_behind_by_a_crash_is_not_held() {
     // **文件存在 ≠ 有人拿着**（2026-09-25 实测：杀掉持锁进程后文件仍在）。

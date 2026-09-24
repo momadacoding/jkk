@@ -19,7 +19,8 @@
 | 4 | 写前 journal | ✅ 完成 | `svn_journal.rs`、`tests/svn_journal.rs`、`engine/mod.rs` | `cargo test` **585 passed**（新增 9）；fmt / clippy 零告警；变异验证 ×2 |
 | 5 | 同步期间挂起文件监听 | ✅ 完成 | `commands/watch.rs`、`tests/svn_watch_suspend.rs` | `cargo test` **589 passed**（新增 4）；fmt / clippy 零告警；变异验证 ×2 |
 | 6 | 「上次同步未完成」的检测与展示 | 🟡 代码完成，待真实窗口验证 | `commands/svn.rs`、`lib.rs`、`svnJournal.ts`、`svnJournal.test.ts`、`repoStore.ts`、`BaselineBanner.tsx`、`RepoTab.tsx`、`tests/svn_backend.rs`、spec §5.1.2 + §18 | `cargo test` **590 passed**；`pnpm test` **378 passed**（新增 9）；`pnpm build` OK。**`pnpm tauri dev` 未跑** |
-| 收尾 | E2E 清单 + 独立 review | ⬜ 未开始 | | spec 回写已随 Task 6 完成 |
+| 7 | 修入独立 review 的 3 条阻断 + 7 条非阻断 | 完成 | svn_lock.rs、svn_journal.rs、commands/ops.rs、commands/svn.rs、svn_write_guard.rs、svn_lock.rs 测试、svnJournal.ts、repoStore.ts、RepoTab.tsx、E2E | cargo test 595 passed；pnpm test 379 passed；变异验证 x3 |
+| 收尾 | E2E 清单 + 独立 review | 完成 | E2E 清单已写；review 已跑并修入 | 真实窗口仍待用户实跑 |
 
 ## 全量验证
 
@@ -27,9 +28,9 @@
 |---|---|
 | `cargo fmt --check` | ✅ OK |
 | `cargo clippy --all-targets` | ✅ **0 告警** |
-| `cargo test` | ✅ **590 passed / 0 failed**（基线 567，新增 23） |
+| `cargo test` | ✅ **595 passed / 0 failed**（基线 567，新增 28） |
 | `pnpm build` | ✅ OK（含 `tsc`） |
-| `pnpm test` | ✅ **378 passed**（基线 369，新增 9） |
+| `pnpm test` | ✅ **379 passed**（基线 369，新增 10） |
 | `pnpm tauri dev` 真实窗口 | ⬜ **未跑** —— 新增命令 `svn_sync_state` 的 invoke 路径尚未验证（`AGENTS.md` §7.3 硬性要求），待用户实跑 |
 
 > 本仓库没有 PR 门禁 CI（`AGENTS.md` §4.1）。以上全部要本地实跑，如实填。
@@ -222,12 +223,9 @@ GitError { code: "svn_config", message: "扩展名必须以 . 开头：cs" }
 
 ### 计划没写的坑
 
-**一、`src/vcs/svn.rs` 是 CRLF，其余被改过的文件是 LF。** 用 `
-` 模式批量替换
-会一条都匹配不上（第一次尝试 12 条全部 `NOT FOUND`）。做法：读进来先
-`
- → 
-` 归一，改完再整体写回 CRLF，并在写回前断言「原文是纯 CRLF」——
+**一、`src/vcs/svn.rs` 是 CRLF，其余被改过的文件是 LF。** 用只含 LF 的模式批量
+替换会一条都匹配不上（第一次尝试 12 条全部 `NOT FOUND`）。做法：读进来先把
+CRLF 归一成 LF，改完再整体写回 CRLF，并在写回前断言「原文是纯 CRLF」——
 混合行尾的文件按这个流程会被悄悄统一，那是不该由本期顺手做的改动。
 
 改完复核 `CRLF=141 bare-LF=0`，没有混入 LF。
@@ -236,11 +234,16 @@ GitError { code: "svn_config", message: "扩展名必须以 . 开头：cs" }
 
 | 测试 | 抓得到 | 抓不到 |
 |---|---|---|
-| `svn_write_guard.rs`（扫源码） | 新增写方法时**忘了加** | 加了但没生效 |
+| `svn_write_guard.rs`（扫源码） | 清单里的方法出现回归 | 加了但没生效 |
 | `staging_is_refused_…`（真后端） | 加了但没生效 | 除 `stage` 外其余 11 个方法 |
 
 变异（只去掉 `stage` 的守卫）实测两边都红：扫描那条直接点名 `stage`，行为那条
 在真实 `backend_for` 路径上报错。只留任意一条都会留下一个真实的漏洞形态。
+
+> ⚠️ **本节第二条当时写得过于乐观，见 Task 7 的 B2。** 那张表里「新增写方法时
+> 忘了加」其实**抓不到**——`WRITE_METHODS` 是硬编码清单，新方法根本不在里面。
+> 独立 review 指出后已改成枚举实际存在的方法。上面保留原文不改，因为这正是
+> 「自己给自己的测试写了一句它做不到的承诺」的现场。
 
 **三、反向约束和正向一样重要。** `read_methods_are_not_guarded` 守住
 「读不阻塞」（spec §5.1）。没有它的话，下一个人「为了保险」给 `status` 也加上
@@ -435,3 +438,103 @@ stash 去 apply 极可能挑到别人的 WIP（§7.6.1 实测过 `stash@{0}` 会
 - **让位规则收敛在一处。** `otherBannersAreSuppressed` 与既有的
   `syncBannerIsSuppressed` 同形，由 vitest 钉住，不是散在组件里的 `&&`。
 - **前端读失败写 `null` 而不是编造状态**，与既有 `refreshSvnEol` 完全同形。
+
+---
+
+## Task 7：修入独立 review 的发现（2026-09-25）
+
+`AGENTS.md` §4.1 的独立 review 门槛，由一个全新上下文的 agent 按 §13 rubric 执行。
+报了 **3 条阻断 + 12 条非阻断**。三条阻断**逐条由我自己复现后确认成立**，
+不是照单全收。
+
+### 三条阻断（全部已修）
+
+**B1：三条会写仓库的命令绕过了 `trait Vcs`，完全没有守卫。**
+
+`assert_not_syncing` 只加在 `SvnGitBackend` 的 12 个方法上，而这三条不走那里：
+
+| 命令 | 它干什么 | 为什么可达 |
+|---|---|---|
+| `ops::revert` | `git revert --no-edit`，移动 HEAD + 重写工作目录 | **自己复核过**：`commitActions.ts` 的能力过滤只关掉 `new-tag` / `cherry-pick` / `save-patch`，`revert` 走 `?? true`，在 SVN 混合仓库上完全可用 |
+| `svn_rebuild_baseline` | 移动 `svn/base` 指针 | 失同步横幅上的按钮 |
+| `svn_migrate_eol` | 同上 | 行尾迁移横幅上的按钮 |
+
+后两条尤其刺眼：`svnJournal.ts` 里我自己写着「重建会移动基线指针，而此刻正有
+另一套流程依赖着那个指针」——**那个危险只在 UI 层挡住了**，后端无条件接受 invoke。
+
+`svn_init_hybrid` 不在此列：它只在 `SvnUninitialized` 上跑，那种目录里还没有
+`.git`，也就不可能有锁。
+
+**B2：`every_write_method_checks_the_sync_lock` 抓不到它自己声称要抓的那件事。**
+
+它的文档写着「新增一个写方法时忘记加守卫是无声的」，但 `WRITE_METHODS` 是一份
+**硬编码清单**——新增一个方法根本不在清单里，测试照样绿。rubric #9（虚假信心）。
+决策日志里那次变异（移除 `stage` 的守卫）只覆盖了「已在清单里的方法出现回归」
+这一种，正好是它唯一能覆盖的那种。
+
+改法：先枚举 `impl Vcs for SvnGitBackend` 里**实际存在**的方法，任何一个没归类到
+写 / 读的直接失败并要求作者归类。另加两条：`the_guard_runs_before_the_delegation_not_after`
+（守卫写在委托之后 = 活儿已经干完，守卫等于没有；原来只有 `stage` 有行为测试兜底，
+其余 11 个没人管）、`write_commands_outside_the_vcs_trait_are_guarded_too`（守 B1）。
+
+**B3：容器级 `#[serde(default)]` 让缺字段的 journal 静默读成默认值。**
+
+自己写测试复现，确认成立：
+
+```text
+{"opid":"x","flow":"sync_out","startedAt":7,"stashOid":"abc"}  →  Ok(phase: Start)
+{}                                                              →  Ok(opid:"", phase: Start)
+```
+
+`a_corrupt_journal_is_an_error_not_a_default` 只覆盖了**语法坏掉**的 JSON，
+留下「语法合法但缺字段」这一整类没测。而后果更糟：少了 `phase` 读成
+`Phase::Start`，界面对 `start` 说的是**「还没有动过工作目录里的任何东西——
+可以直接当作没发生过」**。对一次实际停在 `svn-staged`（`.svn` 里挂着 add /
+delete 登记）的流程说这句话，是整个界面能说出的最有害的一句。
+
+改法：`default` 从容器挪到每个可选字段上。脊梁四件（`opid` / `flow` / `phase` /
+`startedAt`）没有 `skip_serializing_if`，我们写出去的一定带着它们，读的时候缺
+任何一个都是硬错误，走 `svn_journal_corrupt`。
+
+### 非阻断里修了 7 条（各有具体失败场景）
+
+| # | 发现 | 处理 |
+|---|---|---|
+| N1 | `acquire` 在写元数据的四个 `?` 早退路径上**泄漏锁文件**（`file` 掉了但文件留着，没有 guard 去删） | **已修**：先建 `SyncLock` 再写元数据。与 Task 1 修的 `Drop` bug 同一类后果——又一条永远为假的「上次没有正常收尾」 |
+| N2 | `is_held` 对 32/33 之外的错误**一律当成「没人持有」**，于是权限错误（errno 5）会让守卫放行写操作 | **已修**：三态 `Held / Free / Unknown`。守卫 fail-closed（判不出当有人持有），接管 fail-safe（判不出就不抢）。新增只读属性造 errno 5 的测试 |
+| N4 | 去抖那条源码断言只查子串 `is_watch_suspended`，**去掉 `!` 仍然绿**（功能恰好反过来） | **已修**：断言改成 `!is_watch_suspended` |
+| N5 | `refreshSvnSyncState` 只在打开仓库时调一次 | **已修**：挂进 `repo-changed`。原来打开那一刻若读到 `locked: true`，让位规则会把其余横幅**压住整个标签页生命周期**，除非关掉重开 |
+| N7 | 前端 `SyncPhase` 联合类型比后端 `Phase` 窄，认不出的 phase 让 `PHASE_DETAIL[...]` 变 `undefined` | **已修**：加兜底文案 + 一条 `phase: 'svn-staged'` 的 vitest |
+| N10 | 守卫也会挡住**持锁者自己**，未记录 | **已修**：写进 `assert_not_syncing` 文档——2c 的 `sync_in` 要直接调 `engine` 层，不能用 `backend_for(..)` 干自己的活 |
+| N11 | 接管路径的 TOCTOU 落败方抛的是裸 io 错误 | **已修**：`AlreadyExists` 映射回 `sync_in_progress` |
+| N12 | E2E 场景 1 用 `Set-Content -Encoding utf8`，PowerShell 5.1 会写 **BOM**，serde_json 直接报错 | **已修**：改用 `[IO.File]::WriteAllText`，并写明为什么 |
+
+### 没修的（各有理由）
+
+| # | 发现 | 为什么不修 |
+|---|---|---|
+| N3 | watcher 挂起没有 RAII guard | **属 2c**。本期没有任何调用方（`suspend_watch` 的调用点在 S0 / S11），现在造一个 guard 是替一个还不存在的调用方设计。2c 接线时一并做，已记在此处备查 |
+| N6 | 让位是「藏起信息」而不是只藏危险按钮 | 有道理，但改成「灰化保留」要动四条横幅的渲染与色调，超出本期范围；且本期 journal 不会自己产生，实际暴露面为零。记为 2c 的待办 |
+| N8 | journal 缺 `svnDelta` / `svnStatusBefore` / `captureReturnStep`，且没有 schema `version` | 这三个字段的**语义**要等 `sync_out` 才定得下来（§8.2 / §8.5），现在照 spec 抄一遍字段名而不知道怎么填，是另一种形式的猜。已把注释里「等 Phase 3 再加会读不了」那句改成如实说明 |
+| N9 | `lock_path` 硬编码 `<root>/.git`，不像两个兄弟锁那样用 `git_dir()` | 混合仓库的 `.git` **必定**是工作副本根下的真实目录（`init_hybrid` 在那里跑 `git init`，§6.1 的识别也据此），`.git` 是文件的形态（worktree / submodule）进不了混合仓库。与邻居 `svn_attributes::info_dir` 同一约定。热路径省一次子进程是真实收益 |
+
+### 变异验证（本轮新增）
+
+| 变异 | 结果 |
+|---|---|
+| 从分类表里拿掉 `checkout`（模拟新增方法未归类） | `every_trait_method_is_classified_as_read_or_write` 点名 `checkout` 变红 |
+| 把 `checkout` 的守卫挪到委托之后 | 只有 `the_guard_runs_before_the_delegation_not_after` 变红；**`every_write_method_checks_the_sync_lock` 仍然绿**——正是 B2 指出的那个洞 |
+| 移除 `revert` 的守卫 | `write_commands_outside_the_vcs_trait_are_guarded_too` 变红 |
+| （B3 / N2 两条是先写测试跑出红再修的） | 见上 |
+
+### 为什么这么改是安全的
+
+- **B1 的三条守卫是纯前置判断**，没持锁时行为逐字不变；全量 595 passed 里既有的
+  567 条一条没动。
+- **B3 收紧了反序列化**，只会把「本来会被静默接受的坏输入」变成报错，不会让
+  任何合法 journal 读不回来——`a_journal_round_trips` 与 `a_stash_oid_survives_…`
+  仍绿。
+- **N2 的三态在两个方向上都选了保守的那边**，且两边保守的方向相反（守卫关门、
+  接管不动手），不存在「为了让一边安全而把另一边放开」。
+- **`tsc` 在 N5 的接线上抓到了一处漏传**（`RepoTab.tsx` 的 refreshers 对象缺字段），
+  说明那条类型约束是有效的，不是摆设。

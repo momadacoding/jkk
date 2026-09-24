@@ -91,6 +91,12 @@ pub fn cherry_pick(path: String, rev: String) -> Result<()> {
 /// 生成一条撤销指定提交的新提交。
 #[tauri::command(async)]
 pub fn revert(path: String, rev: String) -> Result<()> {
+    // 它移动 HEAD 并重写工作目录，是不折不扣的写操作（spec §5.1），
+    // 却不走 `trait Vcs`——`vcs/svn.rs` 上那 12 个守卫拦不到它。
+    // 2026-09-25 独立 review 抓到：`commitActions.ts` 的能力过滤只关掉
+    // `new-tag` / `cherry-pick` / `save-patch`，revert 走 `?? true`，
+    // 在 SVN 混合仓库上是**完全可用**的。
+    crate::engine::svn_lock::assert_not_syncing(&path)?;
     // --no-edit：GUI 里没有终端，不加这个 git 会拉起编辑器等一个永远不会来的输入
     run_git(&path, &["revert", "--no-edit", &rev])?;
     Ok(())
