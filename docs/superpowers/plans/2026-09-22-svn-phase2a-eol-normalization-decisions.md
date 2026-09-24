@@ -29,7 +29,7 @@
 | `cargo test` | ✅ **562 passed / 0 failed**（基线 537，新增 25） |
 | `pnpm build` | ✅ OK（`tsc` + `vite build`） |
 | `pnpm test` | ✅ **365 passed**（基线 354，新增 11） |
-| `pnpm tauri dev` 真实窗口 | ✅ **2026-09-24 由用户实跑，3/3 场景通过**（清单见 `docs/superpowers/e2e/2026-09-22-svn-phase2a-eol-e2e.md`） |
+| `pnpm tauri dev` 真实窗口 | ✅ **4/4 场景由用户实跑通过**（1、2 于 2026-09-24；3、4 在 review 修复改变行为后于 2026-09-25 按新判据重跑。清单见 `docs/superpowers/e2e/2026-09-22-svn-phase2a-eol-e2e.md`） |
 
 > 本仓库没有 PR 门禁 CI（`AGENTS.md` §4.1）。以上全部要本地实跑，如实填。
 
