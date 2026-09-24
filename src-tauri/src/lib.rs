@@ -58,6 +58,7 @@ pub fn run() {
             commands::svn::svn_rebuild_baseline,
             commands::svn::svn_root_revs,
             commands::svn::svn_server_audit,
+            commands::svn::svn_sync_state,
             commands::svn::svn_sync_status,
             commands::repo::read_capabilities,
             commands::repo::read_upstream,

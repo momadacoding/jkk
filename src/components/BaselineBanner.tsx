@@ -9,6 +9,11 @@ import {
   type ServerAudit,
   type SyncStatus,
 } from '../engine/svnSync'
+import {
+  describeUnfinishedSync,
+  otherBannersAreSuppressed,
+  type SyncState,
+} from '../engine/svnJournal'
 
 interface BaselineBannerProps {
   /** 是不是 SVN 混合仓库。普通 git 仓库下整个组件什么都不渲染。 */
@@ -17,6 +22,12 @@ interface BaselineBannerProps {
   audit: ServerAudit | null
   /** 行尾规则装了没有（spec §7.3.0）。`null` = 还没读到。 */
   eol: EolStatus | null
+  /**
+   * 同步锁与上次未收尾的 journal（spec §5.1、§7.6）。`null` = 还没读到。
+   *
+   * 它挂出来的横幅**排在最前，且其余横幅全部让位**——理由见组件里的注释。
+   */
+  syncState: SyncState | null
   /** 重建基线。调用方负责先弹确认。 */
   onRebuild: () => void
   /** 手动体检当前基线。 */
@@ -61,20 +72,37 @@ export function BaselineBanner({
   sync,
   audit,
   eol,
+  syncState,
   onRebuild,
   onCheck,
   onMigrateEol,
 }: BaselineBannerProps) {
-  const eolModel = describeEolMigration(eol, sync)
-  const model = syncBannerIsSuppressed(eol, sync) ? null : describeSync(sync)
-  const auditModel = describeAudit(audit)
-  const standalone = needsStandaloneCheck(isSvn, sync, eol)
+  // 未收尾 / 同步进行中排在最前，其余一律让位：那两种状态下仓库停在中间态，
+  // 别的横幅拿半推进的基线算出来的结论可能是错的，而它们的出口（重建基线）
+  // 此刻是危险的——会移动正被依赖的基线指针。
+  const unfinished = describeUnfinishedSync(syncState)
+  const hushed = otherBannersAreSuppressed(syncState)
+  const eolModel = hushed ? null : describeEolMigration(eol, sync)
+  const model = hushed || syncBannerIsSuppressed(eol, sync) ? null : describeSync(sync)
+  const auditModel = hushed ? null : describeAudit(audit)
+  const standalone = !hushed && needsStandaloneCheck(isSvn, sync, eol)
   const [copied, setCopied] = useState(false)
 
-  if (!eolModel && !model && !auditModel && !standalone) return null
+  if (!unfinished && !eolModel && !model && !auditModel && !standalone) return null
 
   return (
     <>
+      {unfinished && (
+        <div className={`banner-baseline ${unfinished.tone}`}>
+          <div className="banner-baseline-head">
+            <strong>{unfinished.title}</strong>
+          </div>
+          <p className="banner-baseline-detail">{unfinished.detail}</p>
+          {unfinished.note && (
+            <p className="banner-baseline-note">{unfinished.note}</p>
+          )}
+        </div>
+      )}
       {eolModel && (
         <div className={`banner-baseline ${eolModel.tone}`}>
           <div className="banner-baseline-head">

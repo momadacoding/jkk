@@ -13,6 +13,7 @@ import {
   type ServerAudit,
   type SyncStatus,
 } from '../engine/svnSync'
+import { type SyncState } from '../engine/svnJournal'
 import { baselineMap, remapRefs, spliceHistory, type SvnRevNode } from '../engine/svnGraph'
 
 import { toErrorCode, toErrorMessage } from '../engine/errors'
@@ -124,6 +125,13 @@ export interface RepoState {
    * ——读失败时也是 `null`，那时不挂横幅，但同样不能当成「已经迁移过」。
    */
   svnEol: EolStatus | null
+  /**
+   * 同步锁与上次未收尾的 journal（spec §5.1、§7.6）。`null` = 还没读到。
+   *
+   * 与 `svnEol` 同样的道理：读失败也是 `null`，那时不挂横幅，但不能当成
+   * 「上次干净收尾了」。
+   */
+  svnSyncState: SyncState | null
   /** SVN 历史（缓存 + 已拉取的），按 revision 降序。 */
   svnRevs: SvnRevNode[]
   /**
@@ -166,6 +174,7 @@ const initialState: RepoState = {
   svnSync: null,
   svnAudit: null,
   svnEol: null,
+  svnSyncState: null,
   svnRevs: [],
   gitCommits: [],
   svnLogComplete: false,
@@ -242,6 +251,14 @@ export function svnPinnedExternals(path: string): Promise<PinnedExternal[]> {
 /** 行尾规则装了没有（spec §7.3.0）。**纯读**，不走网络。 */
 export function svnEolStatus(path: string): Promise<EolStatus> {
   return invoke<EolStatus>('svn_eol_status', { path })
+}
+
+/**
+ * 同步锁与上次未收尾的 journal（spec §5.1、§7.6）。**纯读**，不走网络，也不拿锁
+ * ——它恰恰是用来观察锁的。
+ */
+export function svnSyncState(path: string): Promise<SyncState> {
+  return invoke<SyncState>('svn_sync_state', { path })
 }
 
 /**
@@ -359,6 +376,10 @@ export function useRepoStore() {
         // 和常驻体检入口都让位，所以必须在第一帧之前读到，否则界面会先挂出
         // 一条随后又被替换掉的横幅（spec §7.3.0）。
         await refreshSvnEol(path)
+        // 同理，且优先级更高：未收尾 / 同步进行中时**其余横幅全部让位**
+        // （中间态下它们的结论可能是错的，出口还是危险的）。必须在第一帧之前
+        // 读到，否则会先闪一条随后被撤掉的横幅。
+        await refreshSvnSyncState(path)
         // 先用**缓存**把图画出来，再后台拉新的（spec §10.2）。
         await refreshSvnLog(path).catch(() => undefined)
         // 这两条走网络，照 `refreshPullRequests` 的既有模式：不 await、失败静默。
@@ -372,6 +393,7 @@ export function useRepoStore() {
           svnSync: null,
           svnAudit: null,
           svnEol: null,
+          svnSyncState: null,
           svnRevs: [],
           svnLogComplete: false,
           // gitCommits 不用清：refreshGraph 每次都整份覆盖它
@@ -466,6 +488,23 @@ export function useRepoStore() {
     } catch (err) {
       console.warn('读行尾规则状态失败：', err)
       setState((s) => (samePath(s.path ?? '', path) ? { ...s, svnEol: null } : s))
+    }
+  }
+
+  /**
+   * 同步锁与上次未收尾的 journal（spec §5.1、§7.6）。
+   *
+   * `samePath` 守卫同上。失败写 `null`：读不到就不挂横幅——**但这不等于**
+   * 「上次干净收尾了」。后端的 journal 坏了会以 `svn_journal_corrupt` 抛上来，
+   * 那条错误由通用错误提示负责显示，不在这里吞成「一切正常」。
+   */
+  const refreshSvnSyncState = async (path: string) => {
+    try {
+      const st = await svnSyncState(path)
+      setState((s) => (samePath(s.path ?? '', path) ? { ...s, svnSyncState: st } : s))
+    } catch (err) {
+      console.warn('读同步状态失败：', err)
+      setState((s) => (samePath(s.path ?? '', path) ? { ...s, svnSyncState: null } : s))
     }
   }
 
@@ -646,6 +685,7 @@ export function useRepoStore() {
     refreshPullRequests,
     refreshSvnSync,
     refreshSvnEol,
+    refreshSvnSyncState,
     checkSvnSyncIfChanged,
     refreshSvnLog,
     fetchSvnLog,

@@ -18,19 +18,19 @@
 | 3 | 持锁期间拒绝写操作 | ✅ 完成 | `vcs/svn.rs`、`tests/svn_write_guard.rs`、`tests/svn_lock.rs`（+1） | `cargo test` **576 passed**（基线 567，新增 9）；fmt / clippy 零告警；变异验证已跑 |
 | 4 | 写前 journal | ✅ 完成 | `svn_journal.rs`、`tests/svn_journal.rs`、`engine/mod.rs` | `cargo test` **585 passed**（新增 9）；fmt / clippy 零告警；变异验证 ×2 |
 | 5 | 同步期间挂起文件监听 | ✅ 完成 | `commands/watch.rs`、`tests/svn_watch_suspend.rs` | `cargo test` **589 passed**（新增 4）；fmt / clippy 零告警；变异验证 ×2 |
-| 6 | 「上次同步未完成」的检测与展示 | ⬜ 未开始 | | |
-| 收尾 | E2E 清单 + 独立 review + spec 回写 | ⬜ 未开始 | | |
+| 6 | 「上次同步未完成」的检测与展示 | 🟡 代码完成，待真实窗口验证 | `commands/svn.rs`、`lib.rs`、`svnJournal.ts`、`svnJournal.test.ts`、`repoStore.ts`、`BaselineBanner.tsx`、`RepoTab.tsx`、`tests/svn_backend.rs`、spec §5.1.2 + §18 | `cargo test` **590 passed**；`pnpm test` **378 passed**（新增 9）；`pnpm build` OK。**`pnpm tauri dev` 未跑** |
+| 收尾 | E2E 清单 + 独立 review | ⬜ 未开始 | | spec 回写已随 Task 6 完成 |
 
 ## 全量验证
 
 | 命令 | 结果 |
 |---|---|
-| `cargo fmt --check` | 🟡 Task 5 时点：OK |
-| `cargo clippy --all-targets` | 🟡 Task 5 时点：**0 告警** |
-| `cargo test` | 🟡 Task 5 时点：**589 passed / 0 failed**（基线 567，新增 22） |
-| `pnpm build` | ⬜ 未跑 |
-| `pnpm test` | ⬜ 未跑（基线 369 passed） |
-| `pnpm tauri dev` 真实窗口 | ⬜ 未跑 |
+| `cargo fmt --check` | ✅ OK |
+| `cargo clippy --all-targets` | ✅ **0 告警** |
+| `cargo test` | ✅ **590 passed / 0 failed**（基线 567，新增 23） |
+| `pnpm build` | ✅ OK（含 `tsc`） |
+| `pnpm test` | ✅ **378 passed**（基线 369，新增 9） |
+| `pnpm tauri dev` 真实窗口 | ⬜ **未跑** —— 新增命令 `svn_sync_state` 的 invoke 路径尚未验证（`AGENTS.md` §7.3 硬性要求），待用户实跑 |
 
 > 本仓库没有 PR 门禁 CI（`AGENTS.md` §4.1）。以上全部要本地实跑，如实填。
 > **本期验收不是「能更新」**——`sync_in` 编排在 2c。
@@ -369,3 +369,69 @@ GitError { code: "svn_config", message: "扩展名必须以 . 开头：cs" }
   一行未改，多标签页共用 watcher 线程的行为不受影响。
 - **没有调用方**：本期只把能力做出来，`suspend_watch` / `resume_watch` 的实际
   调用点在 2c 的 S0 / S11。所以这一期不可能因为它改变任何现有行为。
+
+---
+
+## Task 6：「上次同步未完成」的检测与展示
+
+### 偏离计划
+
+**一、多了一条 Rust 测试 `sync_state_serializes_to_camel_case`。**
+`commands/svn.rs` 的模块头自己写着「全部结构体都带 `#[serde(rename_all =
+"camelCase")]`，并在 `tests/svn_backend.rs` 里用断言钉住序列化后的字段名」——
+新增两个结构体就得守这条既有约定，计划漏了它。这条钉住 `startedAt`
+（前端 `svnJournal.ts` 直接读这个名字），以及 `flow` / `phase` 的字面值。
+
+**二、多了一条 vitest「stashing 阶段必须明确叫用户不要自己去 apply」。**
+spec §7.6 的 phase 表对 `stashing` 写的是「**不静默 apply**」，而用户自己挑一条
+stash 去 apply 极可能挑到别人的 WIP（§7.6.1 实测过 `stash@{0}` 会被挤走）。
+这是整组文案里唯一一条「不照做会直接丢数据」的，值得单独钉住。
+
+**三、Step 3（后端命令）与 Step 4/5（前端）的顺序调换了。** 先写完前端纯逻辑
+和它的测试，再接后端。对结果没有影响——两侧的契约由上面那条序列化断言连起来。
+
+### 计划的错误
+
+无。Task 6 的代码一次通过；`BaselineBanner` 的真实形状（没有通用 `<Banner>`
+子组件、让位靠把 model 算成 `null`）在写计划的自审阶段就已核对并改正，
+施工时没再踩。
+
+### 计划没写的坑
+
+**一、`cargo fmt` 会把 `use` 语句重排，插在哪一行无所谓。** 我按「相关的放一起」
+插了四行 import，fmt 按字典序拆开重排了。与 Task 1 的 `pub mod` 同一回事。
+
+**二、`cargo fmt` 把 `commands/svn.rs` 整个文件的行尾从 CRLF 改成了 LF。**
+复核 `git diff --stat` 确认该文件只有 `+50`，没有产生整文件 diff——仓库是
+`core.autocrlf=true`，索引里本来就是 LF，磁盘形态的差异由 git 吸收掉了。
+（这正是 Phase 2a 那一期在处理的同一层机制。）
+
+**三、`locked` 与 `unfinished` 必须是两个字段，不能合并成一个布尔。**
+两者的出口完全相反：`locked` 要用户**等**，`unfinished` 要用户**决定继续还是
+放弃**。合并之后，界面会在一次正常同步进行中劝用户去「放弃」。已写进
+`SyncState` 的文档注释，并由 vitest 的「正在同步时说的是『进行中』，不是
+『未完成』」钉住。
+
+**四、本期的横幅没有按钮，这是有意的。** 「继续 / 放弃」要能真正收尾
+（apply stash、切回分支、退基线），那是 2c 的 `sync_in` 编排。挂两颗点不动的
+按钮比没有按钮更糟，所以 `actions: []` 并用 `note` 明说入口在下一期。
+有一条 vitest 钉住这一点，避免下一个人「顺手」加上去。
+
+### 待办：真实窗口验证（Step 8，**未跑**）
+
+`AGENTS.md` §7.3 硬性要求：新增 Tauri 命令的 `snake_case` ↔ `camelCase` 转换
+没有编译期检查，必须实跑一次 `pnpm tauri dev` 确认 invoke 真的通。
+
+`svn_sync_state` 目前**只经过了单测与序列化断言**，invoke 路径没验过。
+造现场的步骤写在 E2E 清单里。
+
+### 为什么这么改是安全的
+
+- **纯新增 + 纯读。** `svn_sync_state` 一个字节都不写，也不拿锁（它恰恰是用来
+  观察锁的）。既有 567 条 Rust 测试与 369 条前端测试一条没动。
+- **坏 journal 不被吞。** 命令里 `svn_journal::read(&path)?` 直接往上抛；
+  前端 `refreshSvnSyncState` 的 catch 只影响横幅显示，错误本身照常由通用错误
+  提示呈现。吞成「一切正常」正是 Task 4 那条测试守着的反面。
+- **让位规则收敛在一处。** `otherBannersAreSuppressed` 与既有的
+  `syncBannerIsSuppressed` 同形，由 vitest 钉住，不是散在组件里的 `&&`。
+- **前端读失败写 `null` 而不是编造状态**，与既有 `refreshSvnEol` 完全同形。

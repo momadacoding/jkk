@@ -19,10 +19,13 @@ use crate::engine::svn_init::{
     check_current_baseline, eol_status, init_hybrid, migrate_eol, pinned_externals,
     rebuild_baseline, EolStatus, InitReport, InitRequest, RebuildReport,
 };
+use crate::engine::svn_journal::{Flow, Phase};
+use crate::engine::svn_lock::LockHolder;
 use crate::engine::svn_log::{fetch_log, read_log, LogPage};
 use crate::engine::svn_preflight::{run_preflight, Preflight};
 use crate::engine::svn_server_set::{audit_server_set_at_baseline, ServerAudit};
 use crate::engine::svn_sync::{check_sync, read_root_revs, RootRev, SyncStatus};
+use crate::engine::{svn_journal, svn_lock};
 use crate::error::GitError;
 
 /// 只跑前置校验 P1–P4，**什么都不创建**。
@@ -155,4 +158,51 @@ pub fn svn_fetch_log(path: String, older: bool, limit: u32) -> Result<LogPage, G
 #[tauri::command(async)]
 pub fn svn_server_audit(path: String) -> Result<ServerAudit, GitError> {
     audit_server_set_at_baseline(&path)
+}
+
+/// 上次同步留下的痕迹：`phase` 与 `opid`。`flow` 决定恢复入口走哪条分支
+/// （spec §7.6：`publishing-baseline` 是两个流程共用的阶段名，父提交与返回
+/// 入口却完全不同，不能套用）。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnfinishedSync {
+    pub flow: Flow,
+    pub phase: Phase,
+    pub opid: String,
+    pub started_at: u64,
+}
+
+/// 同步状态。**`locked` 与 `unfinished` 是两件事，不能合并。**
+///
+/// `locked` 说的是「现在有人在跑」，`unfinished` 说的是「上次留下了记录」。
+/// 两者的出口完全相反：前者要等，后者要用户决定继续还是放弃。合成一个布尔值
+/// 会让界面在正常同步期间劝用户去「放弃」。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncState {
+    pub locked: bool,
+    pub holder: Option<LockHolder>,
+    pub unfinished: Option<UnfinishedSync>,
+}
+
+/// 同步状态：现在有没有人在跑，以及上次有没有留下没收尾的 journal。
+///
+/// **纯读**，且**不拿锁**——它恰恰是用来观察锁的。这也是 spec §5.1
+/// 「读操作不阻塞，但要能返回『同步进行中』状态供 UI 显示」那一条的落点。
+///
+/// ⚠️ `read` 返回 `Err`（journal 坏了）时**照常往上抛**，不在这里吞成 `None`。
+/// 吞掉等于把用户 stash 的 OID 悄悄丢掉，而界面会显示「一切正常」——
+/// 磁盘上工作区却已经被清空了。`tests/svn_journal.rs` 有一条测试守着这个语义。
+#[tauri::command(async)]
+pub fn svn_sync_state(path: String) -> Result<SyncState, GitError> {
+    Ok(SyncState {
+        locked: svn_lock::is_held(&path),
+        holder: svn_lock::holder(&path),
+        unfinished: svn_journal::read(&path)?.map(|j| UnfinishedSync {
+            flow: j.flow,
+            phase: j.phase,
+            opid: j.opid,
+            started_at: j.started_at,
+        }),
+    })
 }

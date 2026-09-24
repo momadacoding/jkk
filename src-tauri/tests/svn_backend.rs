@@ -359,6 +359,42 @@ fn init_and_rebuild_reports_serialize_to_camel_case() {
 }
 
 #[test]
+fn sync_state_serializes_to_camel_case() {
+    // 与上面那条同一个理由：`snake_case → camelCase` 没有编译期检查，
+    // 写错只会在运行时静默变成 `undefined`。前端 `svnJournal.ts` 的
+    // `LockHolder.startedAt` / `UnfinishedSync.startedAt` 全靠这层转换。
+    use app_lib::commands::svn::{SyncState, UnfinishedSync};
+    use app_lib::engine::svn_journal::{Flow, Phase};
+    use app_lib::engine::svn_lock::LockHolder;
+
+    let st = serde_json::to_value(SyncState {
+        locked: true,
+        holder: Some(LockHolder {
+            pid: 4242,
+            started_at: 1_757_000_000,
+            opid: "abc".into(),
+        }),
+        unfinished: Some(UnfinishedSync {
+            flow: Flow::SyncIn,
+            phase: Phase::Stashed,
+            opid: "abc".into(),
+            started_at: 1_757_000_000,
+        }),
+    })
+    .unwrap();
+
+    assert_eq!(keys_of(&st), vec!["holder", "locked", "unfinished"]);
+    assert_eq!(keys_of(&st["holder"]), vec!["opid", "pid", "startedAt"]);
+    assert_eq!(
+        keys_of(&st["unfinished"]),
+        vec!["flow", "opid", "phase", "startedAt"]
+    );
+    // 值本身也钉住：前端按这两个字符串分流（spec §7.6 的 phase 表）。
+    assert_eq!(st["unfinished"]["flow"], "sync_in");
+    assert_eq!(st["unfinished"]["phase"], "stashed");
+}
+
+#[test]
 fn the_probe_svn_environment_command_reports_one_of_three_states() {
     // ⚠️ 这个命令在 Phase 1a **没有前端调用方**（它是给 1b 的初始化向导准备的），
     // 所以它的 invoke 路径没法在真实窗口里验证。这条至少把命令体和它的
