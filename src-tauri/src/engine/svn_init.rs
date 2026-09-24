@@ -9,8 +9,11 @@
 //! 否则用户下次打开这个目录时会看到一个半成品混合仓库——而 §6.1 的识别会把它判成
 //! `SvnSuspicious` 并阻断，用户完全不知道发生了什么。
 
-use crate::engine::git_cli::run_git;
-use crate::engine::svn_baseline::{publish_baseline, TempIndex, Trailer};
+use crate::engine::git_cli::{run_git, run_git_code};
+use crate::engine::svn_attributes::{has_eol_rule, restore_attributes, write_attributes};
+use crate::engine::svn_baseline::{
+    git_dir, publish_baseline, swap_index_to_tree, TempIndex, Trailer,
+};
 use crate::engine::svn_cli::run_svn;
 use crate::engine::svn_config::{
     normalize_whitelist_entry, write_config, SvnConfig, BASELINE_BRANCH, SVN_GIT_MODE,
@@ -259,6 +262,12 @@ fn build_repo(
     run_git(root, &["init", "-b", BASELINE_BRANCH])?;
     write_config(root, cfg)?;
     write_exclude(root, &generate_exclude(&cfg.whitelist, &cfg.extensions))?;
+    // **必须在 `record_server_tree` 之前。** 这条规则决定 `git add` 与
+    // `hash-object --path` 读磁盘时跑不跑行尾过滤器，也就决定了第一个基线里
+    // blob 长什么样。放到录制之后等于建库当场就造出一个需要迁移的旧形状基线
+    // ——而那种基线的故障是潜伏的：stat cache 会让 `git status` 一开始假报
+    // 干净，等某个文件的 mtime 被碰一下才单独冒出来（spec §7.3.0）。
+    write_attributes(root)?;
 
     // R2a–R2c：录出服务器 rN 的树。首个基线从**空**索引起步。
     let (tree, explained) = record_server_tree(root, cfg, pre)?;
@@ -320,6 +329,39 @@ fn build_repo(
     Ok((baseline, health))
 }
 
+/// 行尾规则的安装状态（spec §7.3.0）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EolStatus {
+    /// `.git/info/attributes` 里有没有我们写的那条规则。
+    pub rule_installed: bool,
+    /// 要不要走一次迁移。
+    ///
+    /// 等价于 `!rule_installed`——规则没装，说明这个仓库的基线是在旧的行尾设置
+    /// 下录的。**判据只能是这个**：spec §7.3.0 实测，翻完设置之后 `git status`
+    /// 会因为 git 的 stat cache 假报 0 个脏文件，要等某个文件的 mtime 被碰一下
+    /// 才单独冒出来。拿「现在看着没事」当判据必然漏判。
+    ///
+    /// 两个字段值恒定互补，看起来冗余，但前端要分别用：一个决定横幅挂不挂，
+    /// 一个用在文案里。留两个字段比让前端自己取反更难写错。
+    pub needs_migration: bool,
+}
+
+/// 读出行尾规则的安装状态。**纯读，一个字节都不写。**
+pub fn eol_status(repo_root: &str) -> Result<EolStatus> {
+    if detect_repo_kind(repo_root) != RepoKind::SvnHybrid {
+        return Err(GitError::new(
+            "svn_not_hybrid",
+            "这个目录不是已初始化的混合仓库。",
+        ));
+    }
+    let installed = has_eol_rule(repo_root);
+    Ok(EolStatus {
+        rule_installed: installed,
+        needs_migration: !installed,
+    })
+}
+
 /// 重建基线的结果。
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -331,6 +373,361 @@ pub struct RebuildReport {
     /// 重建后指向谁。同一棵 tree 也会产出新的 commit（spec §6.3.1）。
     pub new_baseline: String,
     pub health: Health,
+}
+
+/// 行尾迁移：装上规则 + 按新规则重录基线（spec §7.3.0「迁移」）。
+///
+/// # 为什么是一条命令，不是「装规则」「重建」两步
+///
+/// 规则决定 git 读磁盘时跑不跑行尾过滤器，而基线 blob 的形状是**录制时**定下的。
+/// 只装规则不重建，仓库就停在「基线是旧形状、工作树按新规则读」的状态上，而
+/// `git status` 因为 stat cache 暂时还报干净——等某个文件的 mtime 被碰一下
+/// （编辑一次、`svn update` 一次）它才单独冒出来。用户看到的是「文件一个一个地
+/// 无故变脏」，比一次性报错难查得多。那不是一个可以让用户停留的状态。
+///
+/// # 失败时必须把规则还原
+///
+/// 同理：重建没成，规则就不能留着，否则留下的正是上面那个潜伏状态。回滚用
+/// [`write_attributes`] 返回的原始字节，用户自己原有的 attributes 也能逐字节还回去。
+///
+/// # 为什么光重录基线不够 —— 三样东西必须一起换形状
+///
+/// 2026-09-24 独立 review 发现并实测确认：`rebuild_baseline` 按设计**全程不动
+/// HEAD 和真实索引**（R1–R5 的核心约束），所以它只把 `svn/base` 换成了新形状。
+/// 而 Phase 1 建库时，`build_repo` 是靠一句 `read-tree` 把**真实索引**也对齐的，
+/// 工作分支 tip 又恰好指向那个基线 commit —— 也就是说真实的 Phase 1 仓库里，
+/// **基线树、工作分支 tip、真实索引三样同时是旧形状**。
+///
+/// 只换第一样的后果，正是本函数声称要消灭的那个潜伏故障：
+///
+/// ```text
+/// 迁移后 git status  →  M Code/Nat.cs     ← 内容一个字没改，只是索引里的 blob 还是 LF
+/// git diff svn/base HEAD → Code/Nat.cs    ← Phase 3 会把这批纯行尾差异提交进 SVN
+/// ```
+///
+/// 所以迁移成功后必须把工作分支与真实索引一起搬到新基线上。
+///
+/// # 工作分支上有自己的提交时，本期拒绝
+///
+/// 那些 commit 里的 blob 是旧形状，**移一下 ref 修不了它们**——要修得逐路径把
+/// 内容转成新的行尾形态，而目标形态只能靠数 `\r\n` 猜。猜错就是改坏用户已有的
+/// 提交，这是本项目最保守的那一类操作。
+///
+/// 2026-09-24 实测推翻了一个看似现成的办法：`git add --renormalize`（以及它背后
+/// 的 `cat-file --filters`）给出的是「git 会往磁盘写什么」，在 `autocrlf=true`
+/// 下**所有文本文件都是 CRLF**；而磁盘的真实形态由 SVN 决定。一个 SVN 存 LF 的
+/// 文件会被它改成 CRLF，凭空造出一批新的假阳性。
+///
+/// 「把一个分支重放到新基线上」本来就是 Phase 2 `sync_in` S9 的职责，那里有
+/// rebase 和完整的冲突解决流程兜底。本期不在这里另造一套会猜错的转换逻辑，
+/// 而是**在动任何东西之前**拒绝，并说清原因。
+/// 迁移期间的仓库级互斥锁。
+///
+/// # 为什么必须有
+///
+/// 2026-09-25 PR #45 第二轮 review。`has_eol_rule` 判定、写规则、重建基线之间
+/// 原先没有互斥，两条请求（两个仓库标签页各有一条横幅，命令又都是
+/// `#[tauri::command(async)]` 跑在线程池上）可以同时通过判定：
+///
+/// ```text
+/// A 写规则，记下 previous = None（原本没有这个文件）
+/// B 写规则，记下 previous = A 刚写的那份
+/// B 抢先 publish 基线 → 成功
+/// A 的 publish 撞上旧值守卫失败 → 按 previous = None 把文件删掉
+/// B 一路成功返回
+/// ```
+///
+/// 结果是 B 告诉用户「迁移成功」，而规则文件已经被 A 的回滚删了——仓库恰好停在
+/// 这一期要消灭的那个潜伏状态上。**这不是推演**：`two_concurrent_migrations_…`
+/// 那条测试在没有本锁的实现上第 1 轮就复现了它。
+///
+/// # 与 [`IndexLock`] 分工不同，两把都要
+///
+/// 这把挡的是**本应用自己的**并发调用。挡不住外部 git 工具——它们不看我们的锁，
+/// 那一段由 `swap_index_to_tree` 持有的 git 自己的索引锁负责。
+struct MigrationLock {
+    path: std::path::PathBuf,
+}
+
+impl MigrationLock {
+    fn acquire(repo_root: &str) -> Result<Self> {
+        let path = git_dir(repo_root)?.join("mygitclient-migrate.lock");
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => Ok(Self { path }),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(GitError::new(
+                "svn_migrate_busy",
+                format!(
+                    "这个仓库上已经有一次行尾迁移在进行中。请等它结束后再看；\
+                     如果确认没有迁移在跑，那是上一次中途退出留下的残锁——\
+                     此时仓库可能停在半迁移状态，建议先检查 `git status` 与 \
+                     `git log svn/base -1`，确认无误后手工删掉 {} 再重试。",
+                    path.display()
+                ),
+            )),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+impl Drop for MigrationLock {
+    fn drop(&mut self) {
+        // Drop 里不能 panic（展开途中 panic 会直接 abort）。
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+pub fn migrate_eol(repo_root: &str) -> Result<RebuildReport> {
+    // 这一条必须在拿锁**之前**：锁文件要落在 `.git` 里，而这里正是在判断
+    // `.git` 存不存在。顺序反过来的话，对着一个普通目录调用会先撞上 git 的错，
+    // 用户拿到的就不是「这不是混合仓库」这句话了。纯文件系统读，无竞态。
+    if detect_repo_kind(repo_root) != RepoKind::SvnHybrid {
+        return Err(GitError::new(
+            "svn_not_hybrid",
+            "这个目录不是已初始化的混合仓库，没有基线可迁移。",
+        ));
+    }
+    // **随后立刻拿锁**，在读 `has_eol_rule` 之前——判定与动手之间只要有缝，
+    // 两条请求就会双双通过判定（见 `MigrationLock` 的文档注释）。
+    let _lock = MigrationLock::acquire(repo_root)?;
+
+    if has_eol_rule(repo_root) {
+        return Err(GitError::new(
+            "svn_eol_already_migrated",
+            "行尾规则已经装好了，不需要再迁移一次。\
+             重建会移动基线指针，没有理由时不该动它。",
+        ));
+    }
+    // **在写任何东西之前**判定能不能对齐。全或全无：拒绝时磁盘一个字节没动。
+    let branch = check_can_align(repo_root)?;
+
+    let previous = write_attributes(repo_root)?;
+    let report = match rebuild_baseline(repo_root) {
+        Ok(r) => r,
+        Err(e) => {
+            // 回滚失败不能把原来那个错盖掉：用户要先知道重建**为什么**没成。
+            // 两个都失败时把回滚的情况附在消息里——否则仓库真的停在「规则装了
+            // 但基线是旧的」状态上，而界面此后会因为 has_eol_rule 报 true 而
+            // 不再提示迁移，等于无人知晓。
+            return Err(match restore_attributes(repo_root, previous.as_deref()) {
+                Ok(()) => e,
+                Err(re) => GitError::new(
+                    &e.code,
+                    format!(
+                        "{}\n\n另外：还原 .git/info/attributes 也失败了（{}）。\
+                         这个仓库的基线现在是旧形状、而行尾规则已生效，\
+                         请手工删掉 .git/info/attributes 后重试。",
+                        e.message, re.message
+                    ),
+                ),
+            });
+        }
+    };
+
+    if let Err(e) = align_branch(repo_root, &branch, &report) {
+        // 对齐没成 ⇒ 把基线也退回去，别留下「基线新、分支旧」这个半迁移状态。
+        // `update-ref` 带旧值守卫：基线被外部改动过就不动它，如实报出来。
+        let undo = run_git(
+            repo_root,
+            &[
+                "update-ref",
+                "refs/heads/svn/base",
+                &report.old_baseline,
+                &report.new_baseline,
+            ],
+        );
+        // 两个回滚都要做，且**都不能吞错误**：吞掉的那个恰好是用户此后无从察觉的
+        // 那种——界面会因为 `has_eol_rule` 报 true 而不再提示迁移。
+        let restored = restore_attributes(repo_root, previous.as_deref());
+        let mut msg = e.message.clone();
+        if let Err(ue) = undo {
+            msg.push_str(&format!(
+                "\n\n另外：把基线退回旧 commit 也失败了（{}）。\
+                 仓库现在是「基线已换新形状、工作分支还是旧形状」的半迁移状态，\
+                 请手工执行 `git update-ref refs/heads/svn/base {}` 后重试。",
+                ue.message, report.old_baseline
+            ));
+        }
+        if let Err(re) = restored {
+            msg.push_str(&format!(
+                "\n\n另外：还原 .git/info/attributes 也失败了（{}）。\
+                 行尾规则现在是生效的，而基线不是按它录的，\
+                 请手工删掉 .git/info/attributes 后重试。",
+                re.message
+            ));
+        }
+        return Err(GitError::new(&e.code, msg));
+    }
+    Ok(report)
+}
+
+/// `git rev-list --count <range>`。数不出来时返回 0 —— 这个数字只进错误文案，
+/// 不参与任何判定，拿它当判据才需要把失败区分出来。
+fn rev_count(repo_root: &str, range: &str) -> Result<u32> {
+    let (code, out) = run_git_code(repo_root, &["rev-list", "--count", range])?;
+    if code != 0 {
+        return Ok(0);
+    }
+    Ok(out.trim().parse().unwrap_or(0))
+}
+
+/// 迁移前置：能不能把工作分支与真实索引一起搬到新基线上？返回分支名。
+///
+/// 四条都必须成立，任一不成立就**在动任何东西之前**拒绝（见 [`migrate_eol`]
+/// 的文档注释）。判据全部是纯读。
+fn check_can_align(repo_root: &str) -> Result<String> {
+    // HEAD 必须附着在分支上：detached 时没有 ref 可移
+    let (code, out) = run_git_code(repo_root, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+    let branch = out.trim().to_string();
+    if code != 0 || branch.is_empty() {
+        return Err(GitError::new(
+            "svn_eol_migrate_head_detached",
+            "HEAD 没有附着在分支上（detached HEAD），迁移需要把工作分支一起搬到\
+             新基线上，没有分支可搬。请先 checkout 回你的工作分支再试。",
+        ));
+    }
+    if branch == BASELINE_BRANCH {
+        return Err(GitError::new(
+            "svn_eol_migrate_on_baseline",
+            format!(
+                "当前在基线分支 `{BASELINE_BRANCH}` 上。请先 checkout 回你的工作分支再迁移\
+                 ——基线分支由本应用维护，不该在它上面开发。"
+            ),
+        ));
+    }
+
+    let head = run_git(repo_root, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
+    let base = run_git(
+        repo_root,
+        &["rev-parse", &format!("refs/heads/{BASELINE_BRANCH}")],
+    )?
+    .trim()
+    .to_string();
+    if head != base {
+        // 两种都不能迁移，但成因完全不同，消息必须分开说——否则用户按着错的
+        // 提示去找不存在的「本地提交」。
+        //
+        // `behind` ≠ 0：工作分支落后于基线。这是 Phase 1 的**合法常态**，
+        // spec §16 明写「重建基线的代价是工作分支不会自动跟进」。
+        let ahead = rev_count(repo_root, &format!("{base}..HEAD"))?;
+        let behind = rev_count(repo_root, &format!("HEAD..{base}"))?;
+        let why = if ahead > 0 {
+            format!("分支 `{branch}` 上有 {ahead} 笔本地提交还没进基线")
+        } else {
+            format!(
+                "分支 `{branch}` 落后基线 {behind} 笔提交——基线被单独重建过，\
+                 而工作分支还没跟上（这是正常的，重建基线本来就不推进工作分支）"
+            )
+        };
+        return Err(GitError::new(
+            "svn_eol_migrate_branch_not_at_baseline",
+            format!(
+                "{why}，本期无法迁移。\n\n\
+                 工作分支上那些 commit 里记的内容是旧的行尾形状，光移动分支指针\
+                 修不了它们；而要修就得逐个文件改写你已有提交的内容，判断目标行尾\
+                 形态只能靠猜，猜错就是把你的历史改坏。\n\n\
+                 「把一个分支重放到新基线上」是后续 sync_in 的职责，那里有完整的\
+                 冲突解决流程。在那之前，这个仓库继续按现在的方式使用即可——\
+                 不迁移不会让情况变得更糟。"
+            ),
+        ));
+    }
+
+    // 索引里不能有暂存的改动：对齐要 `read-tree` 覆盖索引，有暂存就会丢掉
+    let (code, _) = run_git_code(repo_root, &["diff-index", "--cached", "--quiet", &base])?;
+    if code != 0 {
+        return Err(GitError::new(
+            "svn_eol_migrate_index_dirty",
+            "暂存区里有改动。迁移要重写索引，会把它们冲掉。\
+             请先提交或取消暂存（`git restore --staged`）再试。\
+             工作目录里未暂存的改动不受影响，不用管。",
+        ));
+    }
+    Ok(branch)
+}
+
+/// 把工作分支与真实索引一起搬到新基线上。
+///
+/// 前提由 [`check_can_align`] 保证：分支 tip == 旧基线、索引 == 旧基线树。
+/// 因此这里既不会丢提交，也不会丢暂存内容；磁盘全程不碰（`read-tree` **不带
+/// `-u`**，与 `build_repo` 里那句同样的理由）。
+///
+/// # 为什么先 `read-tree` 后 `update-ref`
+///
+/// 2026-09-25 PR #45 review。原先是反的，于是 `read-tree` 失败时分支已经移走了，
+/// 而失败路径只退得回基线——留下的状态**比迁移没成糟得多**：
+///
+/// ```text
+/// git status                          →  M <每个文本文件>   ← 用户从没暂存过
+/// git rev-list --count svn/base..HEAD →  1                  ← 凭空多一笔提交
+/// ```
+///
+/// 那个 `1` 会让下一次迁移撞进 [`check_can_align`] 的「分支上有本地提交」分支被
+/// 永久拒绝，仓库从此在界面里迁不动，只能手工 `git update-ref` 救。
+///
+/// 换成现在的顺序之后：`read-tree` 是更容易失败的一步（`.git/index.lock` 随便
+/// 一个 git 进程都会造出来），而它失败时**一个 ref 都还没动**，天然全或全无；
+/// 后面的 `update-ref` 自带旧值守卫、本身原子，万一失败就把索引 `read-tree`
+/// 回旧基线——每一步之前的状态都是可恢复的。
+fn align_branch(repo_root: &str, branch: &str, report: &RebuildReport) -> Result<()> {
+    // 对齐真实索引。**这一步是 compare-and-swap，不是「先查再写」。**
+    //
+    // `check_can_align` 那次检查发生在 `rebuild_baseline` 之前，而重建要跑完整的
+    // SVN 往返（含网络）——这中间用户或别的 git 工具 `git add` 进来的东西，
+    // 如果只是「再查一次然后 read-tree」，仍然会在那两个 git 进程之间的缝里被
+    // 静默冲掉（磁盘内容还在，但暂存状态没了）。`swap_index_to_tree` 全程持有
+    // git 自己的 `.git/index.lock`，校验与换上之间别的 git 进程进不来。
+    //
+    // 换上去的索引由 `read-tree`（**不带 `-u`**）在独立的临时索引里生成：
+    // 绝不能用基线内容去覆盖磁盘，那会抹掉用户未提交的 SVN 改动
+    //（`build_repo` 里记过同一条理由）。
+    swap_index_to_tree(repo_root, &report.old_baseline, &report.new_baseline).map_err(|e| {
+        if e.code == "svn_index_moved" {
+            GitError::new(
+                "svn_eol_migrate_index_changed",
+                "迁移过程中暂存区发生了变化（有别的 git 操作在同时进行？）。\
+                 对齐索引会把这些暂存内容冲掉，所以这次迁移已中止，\
+                 仓库回到了迁移前的样子。\
+                 请先提交或取消暂存（`git restore --staged`）再重试。",
+            )
+        } else {
+            e
+        }
+    })?;
+
+    // 带旧值守卫：这中间若有外部把分支挪走了，宁可失败也不覆盖
+    if let Err(e) = run_git(
+        repo_root,
+        &[
+            "update-ref",
+            &format!("refs/heads/{branch}"),
+            &report.new_baseline,
+            &report.old_baseline,
+        ],
+    ) {
+        // 索引已经换成新基线树了，退回去——否则 `git status` 会报一堆用户从没
+        // 暂存过的改动。同样走 CAS：这中间若有别人动过索引，宁可不动也不覆盖。
+        return Err(
+            match swap_index_to_tree(repo_root, &report.new_baseline, &report.old_baseline) {
+                Ok(_) => e,
+                Err(re) => GitError::new(
+                    &e.code,
+                    format!(
+                        "{}\n\n另外：把索引退回旧基线也失败了（{}）。\
+                     `git status` 现在会显示一批你从没暂存过的改动，\
+                     请手工执行 `git read-tree {}` 复位。",
+                        e.message, re.message, report.old_baseline
+                    ),
+                ),
+            },
+        );
+    }
+    Ok(())
 }
 
 /// 重建基线 R1–R5（spec §16 Phase 1）。

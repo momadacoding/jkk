@@ -33,8 +33,14 @@ export type ServerAudit =
 export type BannerTone = 'warn' | 'danger'
 
 export interface BannerAction {
-  id: 'rebuild' | 'check' | 'updateWhitelistDir'
+  id: 'rebuild' | 'check' | 'updateWhitelistDir' | 'migrateEol'
   label: string
+}
+
+/** 行尾规则的安装状态（spec §7.3.0），对应 Rust 的 `EolStatus`。 */
+export interface EolStatus {
+  ruleInstalled: boolean
+  needsMigration: boolean
 }
 
 export interface BannerModel {
@@ -135,8 +141,97 @@ export function describeSync(status: SyncStatus | null): BannerModel | null {
  *
  * 失同步横幅自己带了一个体检按钮，所以那时不重复渲染，保证任何时刻恰好一个入口。
  */
-export function needsStandaloneCheck(isSvn: boolean, sync: SyncStatus | null): boolean {
+export function needsStandaloneCheck(
+  isSvn: boolean,
+  sync: SyncStatus | null,
+  eol: EolStatus | null,
+): boolean {
+  // 迁移没做完时基线本来就不可信，挂一个「体检基线」只会给出误导性的结论
+  // ——体检比的是磁盘与服务器，而此刻的问题出在基线自己的形状上。
+  //
+  // 第三个参数**故意不给默认值**：给了默认值，漏传的调用点会被编译器放过，
+  // 而漏传的后果正是这条规则要防的。让 tsc 把每个调用点都逼出来。
+  if (describeEolMigration(eol, sync) !== null) return false
   return isSvn && describeSync(sync) === null
+}
+
+/**
+ * 迁移到底会动什么——横幅上的简版。
+ *
+ * # 这段话的历史，以及为什么有测试钉着它
+ *
+ * 第一版后端只重录基线、确实不推进工作分支，这里照实写了「不会推进你的工作分支」。
+ * 后来修 review 的阻断时改成了「基线、工作分支、真实索引一起搬到新基线」，
+ * **文案没跟着改**，于是确认框在用户按下按钮之前对他说了反话
+ * （2026-09-25 PR #45 review）。
+ *
+ * 确认框是 git 状态变更前用户唯一的信息来源，所以 `svnSync.test.ts` 里有一组
+ * 断言钉住这两段话的关键句——下一个改 `align_branch` 的人会在那里被拦下。
+ */
+const MIGRATE_EOL_NOTE =
+  '工作目录里的文件一个都不会动；工作分支和暂存区会跟着新基线一起前移一笔' +
+  '（迁移前它们本来就停在基线上）。' +
+  '不迁移的话，文件会在被编辑或 update 之后一个一个地无故显示成「已修改」。'
+
+/**
+ * 确认框里的警告条。与 [`MIGRATE_EOL_NOTE`] 说的是同一件事，多披露两点。
+ *
+ * 标题和正文不与横幅共用（那两处回答的是不同的问题：横幅说「这是什么」，
+ * 确认框说「你按下去会发生什么」），但**「会发生什么」这一段必须是同一份**
+ * ——同一个机械后果写两遍，迟早说出两种话，上面那段历史就是这么来的。
+ */
+export const MIGRATE_EOL_WARNING =
+  '工作目录里的文件一个都不会动；工作分支和暂存区会跟着新基线一起前移一笔' +
+  '（迁移前它们本来就停在基线上，不一起搬过去的话每个文本文件都会立刻显示成「已修改」）。' +
+  '本应用还会接管 .git/info/attributes：那里原有的内容会先备份成同目录的 attributes.bak，' +
+  '但其中的规则从此不再生效。' +
+  '不做的话，文件会在被编辑或 update 之后一个一个地无故显示成「已修改」。'
+
+/**
+ * 行尾迁移横幅。规则没装 ⇒ 这个仓库的基线是在旧的行尾设置下录的。
+ *
+ * # 为什么判据是「规则在不在」，不是「看起来有没有问题」
+ *
+ * spec §7.3.0 实测：规则生效之后 `git status` 会因为 git 的 stat cache 假报
+ * 0 个脏文件，要等某个文件的 mtime 被碰一下才单独冒出来。任何基于「现在看着
+ * 没事」的判据都会漏判，而漏判的表现正是用户最难自查的那种——文件一个一个地
+ * 无故变脏。
+ *
+ * # 为什么 `pinnedReset` 时让位
+ *
+ * 迁移的动作就是重建基线，而 `pinnedReset` 下重建是**明确错误**的：会把被
+ * `svn:externals` 钉死的旧内容录成一个标着新 revision 的基线，自己造出 §9.2
+ * 的基线撒谎。那种状态必须先把目录更新回来，迁移排在它后面。
+ */
+export function describeEolMigration(
+  eol: EolStatus | null,
+  sync: SyncStatus | null,
+): BannerModel | null {
+  if (!eol || !eol.needsMigration) return null
+  if (sync?.verdict.kind === 'pinnedReset') return null
+  return {
+    tone: 'danger',
+    title: '基线是在旧的行尾设置下录的',
+    detail:
+      '这个仓库建库时还没有关掉 git 的行尾转换，基线里记的内容与磁盘上的字节对不上。' +
+      '现在重建一次基线就能对齐，之后不会再出现这个问题。',
+    actions: [{ id: 'migrateEol', label: '重建基线…' }],
+    note: MIGRATE_EOL_NOTE,
+  }
+}
+
+/**
+ * 失同步横幅要不要让位给迁移横幅。
+ *
+ * 两者的出口都是重建基线，同时挂两条红条只是噪音。`pinnedReset` 不在此列
+ * ——那时 `describeEolMigration` 自己返回 `null`，失同步横幅照常渲染，因为
+ * 它指的是另一件**必须先做**的事。
+ */
+export function syncBannerIsSuppressed(
+  eol: EolStatus | null,
+  sync: SyncStatus | null,
+): boolean {
+  return describeEolMigration(eol, sync) !== null
 }
 
 /**

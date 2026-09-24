@@ -17,11 +17,13 @@ import {
   svnPreflightCheck,
   svnRebuildBaseline,
   svnCheckBaseline,
+  svnMigrateEol,
 } from '../store/repoStore'
 import SvnInitWizard from './SvnInitWizard'
 import BaselineBanner from './BaselineBanner'
 import { baselineMap } from '../engine/svnGraph'
 import { describeHealth, describePinned, healthNeedsRebuild } from '../engine/svnInit'
+import { MIGRATE_EOL_WARNING } from '../engine/svnSync'
 import { samePath } from '../engine/path'
 import { isBaselineBranch, visibleSections } from '../engine/capabilities'
 import { askConfirm } from '../engine/confirm'
@@ -114,7 +116,7 @@ export function RepoTab({
   const {
     state, openRepo, refreshHead, refreshGraph, refreshStatus, refreshWorktrees,
     refreshDiff, refreshUpstream, refreshStashes, refreshPullRequests,
-    refreshSvnSync, checkSvnSyncIfChanged, fetchSvnLog, refreshSvnAudit, auditSvnIfDue,
+    refreshSvnSync, refreshSvnEol, checkSvnSyncIfChanged, fetchSvnLog, refreshSvnAudit, auditSvnIfDue,
     selectCommit, clearError, reportError,
   } = useRepoStore()
   const [repoState, setRepoState] = useState<string>('normal')
@@ -545,6 +547,37 @@ export function RepoTab({
   }
 
   /**
+   * 走一次行尾迁移：装规则 + 重录基线（spec §7.3.0）。
+   *
+   * **必须先过确认框**，和重建基线同等分量——它就是一次重建，会移动
+   * `svn/base` 指针，旧基线只能从 reflog 找回来。
+   *
+   * 文案不复用 `handleRebuildBaseline` 那一份：那边说的是「为什么要重建」，
+   * 这边要回答的是「为什么突然要我重建」——用户没做任何事，横幅自己冒出来的。
+   *
+   * 但「按下去会发生什么」那一段**必须**来自 `svnSync.ts` 的同一个常量，不再
+   * 在这里另写一遍：原先两处各写一遍，后端行为改了只改到一处，确认框就对用户
+   * 说了反话（2026-09-25 PR #45 review）。
+   */
+  const handleMigrateEol = async () => {
+    await confirm({
+      title: '重建基线以对齐行尾',
+      message:
+        '这个仓库建库时还没有关掉 git 的行尾转换，基线里记的内容与磁盘上的字节对不上。',
+      warning: MIGRATE_EOL_WARNING,
+      confirmLabel: '重建',
+      busyLabel: '正在重建…',
+      action: async () => {
+        await svnMigrateEol(repoPath)
+        await refreshSvnEol(repoPath)
+        await refreshSvnSync(repoPath)
+        void fetchSvnLog(repoPath)
+        void refreshSvnAudit(repoPath)
+      },
+    })
+  }
+
+  /**
    * 手动体检当前基线（NB-6 的入口之二）。
    *
    * `check_current_baseline` 是 `Lying`（基线撒谎）**唯一真正可达的入口**
@@ -603,8 +636,10 @@ export function RepoTab({
         isSvn={state.capabilities.vcs === 'svn'}
         sync={state.svnSync}
         audit={state.svnAudit}
+        eol={state.svnEol}
         onRebuild={() => void handleRebuildBaseline()}
         onCheck={() => void handleCheckBaseline()}
+        onMigrateEol={() => void handleMigrateEol()}
       />
       {state.error && (
         <div className="banner-error">

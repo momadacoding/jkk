@@ -8,11 +8,12 @@
 mod svn_fixtures;
 
 use app_lib::engine::git_cli::run_git;
+use app_lib::engine::svn_attributes::has_eol_rule;
 use app_lib::engine::svn_baseline::parse_trailer;
 use app_lib::engine::svn_cli::run_svn;
 use app_lib::engine::svn_health::Health;
 use app_lib::engine::svn_init::{
-    check_current_baseline, init_hybrid, rebuild_baseline, InitRequest,
+    check_current_baseline, eol_status, init_hybrid, migrate_eol, rebuild_baseline, InitRequest,
 };
 use app_lib::engine::svn_xml::parse_info;
 use std::process::Command;
@@ -1186,4 +1187,686 @@ fn a_junction_loop_never_yields_a_baseline_containing_the_loop() {
     assert!(wc.join("Code/NewDir/New.cs").exists(), "用户的文件被删了");
 
     std::fs::remove_dir(&link).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 行尾归一化（spec §7.3.0）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_new_repo_records_the_baseline_byte_for_byte() {
+    // spec §7.3.0：建库时就得装上规则，此后录的基线天然是对的。
+    //
+    // `svn:eol-style=native` 的文件在 Windows 上磁盘是 CRLF。装规则之前
+    // `git add` 会把它归一成 LF 录进基线；装了之后录的必须是磁盘上那些字节。
+    //
+    // 这不是洁癖：基线与磁盘不同形，意味着任何一次 `git checkout svn/base`
+    // 都会把磁盘的行尾翻一遍，那个文件对 svn 立刻变脏。
+    let fx = svn_repo_with_native_eol();
+    init_hybrid(&req(&fx)).unwrap();
+
+    // **这条测试依赖 `core.autocrlf=true`。** 不是 true 的机器上，旧实现也会
+    // 录出 CRLF blob，断言平凡通过 —— 静默失去意义比直接失败糟得多
+    // （`AGENTS.md` §13 rubric #9）。`init_hybrid` 自己跑 `git init`，
+    // 没法在建库前设仓库级配置，所以把这条前提显式断出来。
+    let autocrlf = run_git(&fx.wc_str(), &["config", "--get", "core.autocrlf"])
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    assert_eq!(
+        autocrlf, "true",
+        "这条测试要求 core.autocrlf=true 才有意义，当前是 `{autocrlf}`"
+    );
+
+    let disk = std::fs::read(fx.wc().join("Code/Nat.cs")).unwrap();
+    assert!(
+        disk.windows(2).any(|w| w == b"\r\n"),
+        "前提不成立：native 的文件在 Windows 上该是 CRLF"
+    );
+
+    assert_eq!(
+        baseline_blob(&fx.wc_str(), "Code/Nat.cs"),
+        disk,
+        "基线里的字节必须与磁盘完全一致"
+    );
+}
+
+#[test]
+fn a_new_repo_has_the_eol_rule_installed() {
+    let fx = svn_repo();
+    init_hybrid(&req(&fx)).unwrap();
+    assert!(
+        has_eol_rule(&fx.wc_str()),
+        "建库必须装上 EOL 规则，否则录出来的是旧形状的基线"
+    );
+}
+
+#[test]
+fn a_new_repo_is_clean_on_both_sides_right_after_init() {
+    // 规则生效之后最容易砸的就是这条：blob 形状变了，索引对齐要是没跟上，
+    // 用户一打开就看到满屏 M。既有的
+    // `a_successful_init_leaves_a_clean_git_status` 用的是普通 fixture，
+    // 那里磁盘本来就是 LF，看不到行尾问题；这条专挑 native eol 的形态，
+    // 并且**两侧都查**——svn 那一侧此前没人查过。
+    let fx = svn_repo_with_native_eol();
+    init_hybrid(&req(&fx)).unwrap();
+
+    let git_dirty = run_git(&fx.wc_str(), &["status", "--porcelain"]).unwrap();
+    assert!(
+        git_dirty.trim().is_empty(),
+        "建完库 git 工作区必须干净，实际：\n{git_dirty}"
+    );
+
+    // `?  .git` 是**常态**，必须排除：初始化一条 svn 写命令都不发
+    // （`a_successful_init_emits_no_svn_write_command` 钉着这条），所以没机会
+    // 设 `svn:ignore`，svn 永远会把 `.git` 报成未版本控制。把它当脏会让这条
+    // 断言永远红，而真正要看的是**白名单内有没有文件变脏**。
+    let svn_out = run_svn(&fx.wc_str(), &["status"]).unwrap();
+    let svn_dirty: Vec<&str> = svn_out
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty() && !l.ends_with(".git"))
+        .collect();
+    assert!(
+        svn_dirty.is_empty(),
+        "建完库 svn 侧除 .git 外必须干净，实际：\n{}",
+        svn_dirty.join("\n")
+    );
+}
+
+/// 把一个刚建好的库退回成「Phase 1 建的库」：删掉规则文件，等价于那时根本没写过。
+fn strip_eol_rule(fx: &SvnFixture) {
+    std::fs::remove_file(fx.wc().join(".git/info/attributes")).unwrap();
+}
+
+#[test]
+fn a_freshly_built_repo_needs_no_migration() {
+    let fx = svn_repo();
+    init_hybrid(&req(&fx)).unwrap();
+
+    let st = eol_status(&fx.wc_str()).unwrap();
+    assert!(st.rule_installed);
+    assert!(!st.needs_migration, "刚建的库不该要求迁移");
+}
+
+#[test]
+fn a_repo_built_before_the_rule_needs_migration() {
+    let fx = svn_repo();
+    init_hybrid(&req(&fx)).unwrap();
+    strip_eol_rule(&fx);
+
+    let st = eol_status(&fx.wc_str()).unwrap();
+    assert!(!st.rule_installed);
+    assert!(st.needs_migration, "旧形状的基线必须被指认出来");
+}
+
+#[test]
+fn detection_writes_nothing() {
+    // 判定必须是纯读。写了规则却没重建基线，仓库就停在 spec §7.3.0 说的那个
+    // 潜伏状态上：`git status` 因为 stat cache 还报干净，等某个文件的 mtime
+    // 被碰一下才一个一个地无故变脏。
+    let fx = svn_repo();
+    init_hybrid(&req(&fx)).unwrap();
+    let attrs = fx.wc().join(".git/info/attributes");
+    strip_eol_rule(&fx);
+    let before = run_git(&fx.wc_str(), &["status", "--porcelain"]).unwrap();
+
+    eol_status(&fx.wc_str()).unwrap();
+    eol_status(&fx.wc_str()).unwrap();
+
+    assert!(!attrs.exists(), "侦测不许写规则文件");
+    assert_eq!(
+        run_git(&fx.wc_str(), &["status", "--porcelain"]).unwrap(),
+        before,
+        "侦测不许改工作区"
+    );
+}
+
+#[test]
+fn detection_refuses_on_a_directory_that_is_not_a_hybrid_repo() {
+    let fx = svn_repo();
+    let err = eol_status(&fx.wc_str()).expect_err("没建过库就没有基线可谈");
+    assert_eq!(err.code, "svn_not_hybrid", "实际：{}", err.message);
+}
+
+/// 把白名单内的一个 `.cs` 换成同名目录——SVN 意义上的 obstructed（`~`）。
+///
+/// §16.1 之后那是 R1 **唯一**仍然阻断的脏状态，所以它是让重建确定性失败的手段。
+fn obstruct(fx: &SvnFixture) -> std::path::PathBuf {
+    let p = fx.wc().join("Code/A.cs");
+    std::fs::remove_file(&p).unwrap();
+    std::fs::create_dir(&p).unwrap();
+    p
+}
+
+#[test]
+fn migration_installs_the_rule_and_rerecords_the_baseline() {
+    let fx = svn_repo_with_native_eol();
+    init_hybrid(&req(&fx)).unwrap();
+    rewind_to_phase1(&fx);
+    let stale = baseline_blob(&fx.wc_str(), "Code/Nat.cs");
+    let disk = std::fs::read(fx.wc().join("Code/Nat.cs")).unwrap();
+    assert_ne!(stale, disk, "前提不成立：旧形状的基线本该与磁盘不同");
+
+    migrate_eol(&fx.wc_str()).unwrap();
+
+    assert!(has_eol_rule(&fx.wc_str()), "迁移后规则必须装上");
+    assert_eq!(
+        baseline_blob(&fx.wc_str(), "Code/Nat.cs"),
+        disk,
+        "迁移后基线必须与磁盘逐字节一致"
+    );
+    // 工作分支与真实索引必须一起搬过来，否则只有基线换了形状——
+    // 那正是 2026-09-24 独立 review 抓到的阻断问题。
+    assert_eq!(
+        run_git(&fx.wc_str(), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim(),
+        run_git(&fx.wc_str(), &["rev-parse", "refs/heads/svn/base"])
+            .unwrap()
+            .trim(),
+        "工作分支必须随新基线一起前移"
+    );
+}
+
+/// 把一个刚建好的库退回成**真实的** Phase 1 形态。
+///
+/// # 只删规则文件是不够的
+///
+/// Phase 1 建的库，三样东西**同时**是旧形状：`svn/base` 的树、工作分支 tip、
+/// 以及真实索引（`build_repo` 用 `read-tree` 对齐过它）。只删规则 + 重录基线，
+/// 退回去的只有第一样——后两样仍然是新形状，于是迁移之后一切恰好对得上，
+/// 测试平凡通过，什么也没测到（`AGENTS.md` §13 rubric #9）。
+fn rewind_to_phase1(fx: &SvnFixture) {
+    let wc = fx.wc_str();
+    strip_eol_rule(fx);
+    // 基线退回旧形状
+    rebuild_baseline(&wc).unwrap();
+    let base = run_git(&wc, &["rev-parse", "refs/heads/svn/base"])
+        .unwrap()
+        .trim()
+        .to_string();
+    // 工作分支 tip 与真实索引也退回去——Phase 1 建库时它们就在这个形状上
+    run_git(&wc, &["reset", "--soft", &base]).unwrap();
+    run_git(&wc, &["read-tree", &base]).unwrap();
+}
+
+#[test]
+fn migrating_a_faithful_phase1_repo_leaves_nothing_dirty() {
+    // **这一期存在的全部理由。** 迁移之后必须没有任何文件显示成「已修改」——
+    // 包括 stat cache 失效之后。
+    //
+    // stat cache 会让刚迁移完的 `git status` 假报干净（spec §7.3.0），所以
+    // 断言之前必须把它打掉：碰一遍 mtime 再 `update-index --refresh`。
+    // 不打掉的话这条断言测的是 git 的缓存，不是迁移的正确性。
+    let fx = svn_repo_with_native_eol();
+    init_hybrid(&req(&fx)).unwrap();
+    rewind_to_phase1(&fx);
+
+    migrate_eol(&fx.wc_str()).unwrap();
+
+    // 打掉 stat cache
+    for f in ["Code/Nat.cs", "Code/Plain.cs"] {
+        let p = fx.wc().join(f);
+        let content = std::fs::read(&p).unwrap();
+        std::fs::write(&p, &content).unwrap();
+    }
+    let _ = run_git(&fx.wc_str(), &["update-index", "--refresh"]);
+
+    let dirty = run_git(&fx.wc_str(), &["status", "--porcelain"]).unwrap();
+    assert!(
+        dirty.trim().is_empty(),
+        "迁移之后仍有文件是脏的——这正是迁移要消灭的潜伏故障。实际：\n{dirty}"
+    );
+
+    // 工作分支与基线之间也不许有纯行尾差异：Phase 3 的交付清单按
+    // 「工作分支 vs 基线」算，这批差异会被当成真改动提交进 SVN。
+    let vs_base = run_git(&fx.wc_str(), &["diff", "--name-only", "svn/base", "HEAD"]).unwrap();
+    assert!(
+        vs_base.trim().is_empty(),
+        "工作分支与新基线之间还差着行尾。实际：\n{vs_base}"
+    );
+}
+
+#[test]
+fn migration_refuses_when_the_branch_has_local_commits_and_changes_nothing() {
+    // 情形 B（2026-09-24 独立 review）：work 上有自己的提交时，那些 commit 里的
+    // blob 是旧形状，移 ref 修不了。逐路径改写内容要靠猜目标行尾形态，猜错就是
+    // 改坏用户的历史，所以本期**在动任何东西之前**拒绝。
+    //
+    // 这条同时钉住「拒绝 = 一个字节都不写」：规则文件不许出现，基线不许动。
+    let fx = svn_repo_with_native_eol();
+    init_hybrid(&req(&fx)).unwrap();
+    rewind_to_phase1(&fx);
+    let wc = fx.wc_str();
+
+    std::fs::write(fx.wc().join("Code/Nat.cs"), "n1\r\nn2\r\nMY WORK\r\n").unwrap();
+    run_git(&wc, &["add", "-A", "--", "Code"]).unwrap();
+    run_git(&wc, &["commit", "-q", "-m", "my change"]).unwrap();
+    let base_before = run_git(&wc, &["rev-parse", "refs/heads/svn/base"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let head_before = run_git(&wc, &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let err = migrate_eol(&wc).expect_err("分支上有本地提交时必须拒绝");
+
+    assert_eq!(
+        err.code, "svn_eol_migrate_branch_not_at_baseline",
+        "实际：{}",
+        err.message
+    );
+    assert!(
+        err.message.contains("1 笔本地提交"),
+        "消息要说清是「有本地提交」这一种成因，实际：{}",
+        err.message
+    );
+    assert!(
+        !has_eol_rule(&wc),
+        "拒绝了就不许写规则文件——那会把仓库留在半迁移状态"
+    );
+    assert_eq!(
+        run_git(&wc, &["rev-parse", "refs/heads/svn/base"])
+            .unwrap()
+            .trim(),
+        base_before,
+        "拒绝了就不许动基线"
+    );
+    assert_eq!(
+        run_git(&wc, &["rev-parse", "HEAD"]).unwrap().trim(),
+        head_before,
+        "拒绝了就不许动工作分支"
+    );
+}
+
+#[test]
+fn migration_says_so_when_the_branch_merely_lags_behind_the_baseline() {
+    // **落后于基线是 Phase 1 的合法常态**：spec §16 明写「重建基线的代价是
+    // 工作分支不会自动跟进」。同样不能迁移，但成因与「有本地提交」相反——
+    // 消息说错的话，用户会按着提示去找不存在的本地提交。
+    let fx = svn_repo_with_native_eol();
+    init_hybrid(&req(&fx)).unwrap();
+    let wc = fx.wc_str();
+    // 只把基线单独重建一次（就是界面上那颗「重建基线」按钮做的事），
+    // 工作分支原地不动 —— 于是 HEAD 落在基线后面
+    strip_eol_rule(&fx);
+    rebuild_baseline(&wc).unwrap();
+
+    let err = migrate_eol(&wc).expect_err("落后于基线时同样不能迁移");
+
+    assert_eq!(
+        err.code, "svn_eol_migrate_branch_not_at_baseline",
+        "实际：{}",
+        err.message
+    );
+    assert!(
+        err.message.contains("落后基线"),
+        "不能把「落后」说成「有本地提交」，实际：{}",
+        err.message
+    );
+    assert!(!has_eol_rule(&wc), "拒绝了就不许写规则文件");
+}
+
+#[test]
+fn migration_refuses_when_something_is_staged() {
+    // 对齐要 `read-tree` 覆盖索引，有暂存内容就会被冲掉。
+    let fx = svn_repo_with_native_eol();
+    init_hybrid(&req(&fx)).unwrap();
+    rewind_to_phase1(&fx);
+    let wc = fx.wc_str();
+
+    std::fs::write(fx.wc().join("Code/Nat.cs"), "n1\r\nn2\r\nSTAGED\r\n").unwrap();
+    run_git(&wc, &["add", "--", "Code/Nat.cs"]).unwrap();
+
+    let err = migrate_eol(&wc).expect_err("有暂存内容时必须拒绝");
+
+    assert_eq!(
+        err.code, "svn_eol_migrate_index_dirty",
+        "实际：{}",
+        err.message
+    );
+    assert!(!has_eol_rule(&wc), "拒绝了就不许写规则文件");
+    // 暂存内容必须原样还在
+    assert!(
+        run_git(&wc, &["diff", "--cached", "--name-only"])
+            .unwrap()
+            .contains("Code/Nat.cs"),
+        "拒绝之后用户的暂存内容必须原样保留"
+    );
+}
+
+/// `git rev-parse <rev>`，去掉换行。
+fn rev(repo: &str, what: &str) -> String {
+    run_git(repo, &["rev-parse", what])
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+#[test]
+fn migration_moves_nothing_when_the_index_cannot_be_written() {
+    // 2026-09-25 PR #45 review 抓到的回滚缺口。`align_branch` 原先**先**移工作
+    // 分支**再** `read-tree`，后者失败时只退了 `svn/base`，工作分支留在新基线上。
+    //
+    // 触发条件极普通：`.git/index.lock` 存在（另一个 git 进程、崩溃留下的陈旧锁、
+    // IDE 的 git 集成都会造出它）。留下的状态比「迁移没成」糟得多：
+    //
+    // ```text
+    // git status                        →  M <每个文本文件>   ← 用户从没暂存过
+    // git rev-list --count svn/base..HEAD →  1                ← 凭空多一笔提交
+    // ```
+    //
+    // 最后那个 `1` 是真正致命的地方：下一次点迁移，`check_can_align` 会把它当成
+    // 「分支上有 1 笔本地提交」而拒绝，**这个仓库从此在界面里迁不动了**。
+    let fx = svn_repo_with_native_eol();
+    init_hybrid(&req(&fx)).unwrap();
+    rewind_to_phase1(&fx);
+    let wc = fx.wc_str();
+
+    let branch = run_git(&wc, &["symbolic-ref", "--short", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let tip_before = rev(&wc, "HEAD");
+    let base_before = rev(&wc, "refs/heads/svn/base");
+
+    // `rebuild_baseline` 全程走 TempIndex（`GIT_INDEX_FILE`），不受这把锁影响；
+    // 被挡住的恰好只有「对齐真实索引」那一步——正是要测的那条失败路径。
+    let lock = fx.wc().join(".git/index.lock");
+    std::fs::write(&lock, b"").unwrap();
+    let err = migrate_eol(&wc).expect_err("真实索引写不进去时必须失败");
+    std::fs::remove_file(&lock).unwrap();
+
+    assert_eq!(
+        rev(&wc, &format!("refs/heads/{branch}")),
+        tip_before,
+        "失败后工作分支必须还在原处。实际报的错：{}",
+        err.message
+    );
+    assert_eq!(
+        rev(&wc, "refs/heads/svn/base"),
+        base_before,
+        "失败后基线必须还在原处"
+    );
+    assert!(!has_eol_rule(&wc), "失败后规则文件必须还原");
+    assert_eq!(
+        run_git(&wc, &["rev-list", "--count", "refs/heads/svn/base..HEAD"])
+            .unwrap()
+            .trim(),
+        "0",
+        "失败后不得在工作分支上留下一笔提交——那会让下次迁移被当成「有本地提交」而永久拒绝"
+    );
+}
+
+#[test]
+fn migration_refuses_when_something_gets_staged_during_the_rebuild() {
+    // 前置检查只在开头查一次索引，之后 `rebuild_baseline` 要跑完整的 SVN 往返
+    // （含网络），最后才无条件 `read-tree`。这中间用户或别的 git 工具 `git add`
+    // 进去的东西会被静默冲掉——磁盘内容还在，但暂存状态没了。
+    //
+    // 注入点用 `reference-transaction` 钩子：它在 `rebuild_baseline` 的 R4
+    // （`update-ref refs/heads/svn/base`）那一刻触发，正好落在窗口正中，比任何
+    // 「先 add 再调用」的模拟都更接近真实时序。
+    let fx = svn_repo_with_native_eol();
+    init_hybrid(&req(&fx)).unwrap();
+    rewind_to_phase1(&fx);
+    let wc = fx.wc_str();
+
+    let tip_before = rev(&wc, "HEAD");
+    let base_before = rev(&wc, "refs/heads/svn/base");
+
+    // 钩子会被触发多次（prepared / committed），所以写的是**固定内容**而不是
+    // 追加，重复执行幂等。
+    //
+    // 注入的必须是**白名单内已跟踪**的文件：Phase 1 的 `.git/info/exclude` 是
+    // 白名单制，新建一个 `INJECTED.txt` 会被 git 直接忽略，`git add` 什么也不做，
+    // 测试就变成了平凡通过（2026-09-25 实测踩到）。
+    let hook = fx.wc().join(".git/hooks/reference-transaction");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\nprintf 'n1\\r\\nn2\\r\\nINJECTED\\r\\n' > Code/Nat.cs\ngit add -- Code/Nat.cs\nexit 0\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let err = migrate_eol(&wc).expect_err("迁移过程中被塞进暂存区时必须拒绝，而不是冲掉它");
+
+    // 钩子还会在回滚那次 update-ref 上再触发一遍，所以先摘掉它再断言。
+    std::fs::remove_file(&hook).unwrap();
+
+    assert_eq!(
+        err.code, "svn_eol_migrate_index_changed",
+        "实际：{}",
+        err.message
+    );
+    assert_eq!(rev(&wc, "HEAD"), tip_before, "拒绝后工作分支必须还在原处");
+    assert_eq!(
+        rev(&wc, "refs/heads/svn/base"),
+        base_before,
+        "拒绝后基线必须退回原处，不许留下「基线新、分支旧」的半迁移状态"
+    );
+    assert!(!has_eol_rule(&wc), "拒绝了就不许留下规则文件");
+    assert!(
+        run_git(&wc, &["diff", "--cached", "--name-only"])
+            .unwrap()
+            .contains("Code/Nat.cs"),
+        "窗口内暂存的内容必须原样保留，不能被 read-tree 冲掉"
+    );
+}
+
+/// 迁移互斥锁的位置。测试要能造出「上一次没清干净」的现场，也要能确认它被清掉。
+fn migrate_lock(fx: &SvnFixture) -> std::path::PathBuf {
+    fx.wc().join(".git/mygitclient-migrate.lock")
+}
+
+#[test]
+fn two_concurrent_migrations_never_leave_a_winner_without_the_rule() {
+    // 2026-09-25 PR #45 第二轮 review 的第 2 条。`has_eol_rule` 判定、写规则、
+    // 重建之间原先没有互斥，两条请求可以同时通过判定：
+    //
+    // ```text
+    // A 写规则，记下 previous = None（原本没有这个文件）
+    // B 写规则，记下 previous = A 刚写的那份
+    // B 抢先 publish 基线 → 成功
+    // A 的 publish 撞上旧值守卫失败 → 按 previous = None 把文件**删掉**
+    // B 一路成功返回
+    // ```
+    //
+    // 于是 B 告诉用户「迁移成功」，而 `.git/info/attributes` 已经被 A 的回滚
+    // 删了——仓库恰好停在这一期要消灭的那个潜伏状态上，且界面此后会再次提示
+    // 迁移，用户完全不知道刚才发生了什么。
+    //
+    // 判据不写成 `ok == 1`：两条 svn 子进程抢同一个工作副本锁时，两条都失败是
+    // 合法结果。真正不能发生的是「有人成功了，但规则没装」。最后再确认这一轮
+    // 里确实出现过成功，否则这条测试什么也没测到。
+    let mut rounds_with_a_winner = 0;
+    for round in 0..8 {
+        let fx = svn_repo_with_native_eol();
+        init_hybrid(&req(&fx)).unwrap();
+        rewind_to_phase1(&fx);
+        let wc = fx.wc_str();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let b = std::sync::Arc::clone(&barrier);
+            let w = wc.clone();
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                migrate_eol(&w).map_err(|e| format!("{} / {}", e.code, e.message))
+            }));
+        }
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let ok = results.iter().filter(|r| r.is_ok()).count();
+        assert!(
+            ok <= 1,
+            "第 {round} 轮：两条都成功了，互斥根本没生效 {results:?}"
+        );
+
+        if ok == 1 {
+            rounds_with_a_winner += 1;
+            assert!(
+                has_eol_rule(&wc),
+                "第 {round} 轮：有一条报了迁移成功，但规则文件被另一条的回滚删掉了 {results:?}"
+            );
+            assert_eq!(
+                rev(&wc, "HEAD"),
+                rev(&wc, "refs/heads/svn/base"),
+                "第 {round} 轮：成功的那条没把工作分支对齐到新基线"
+            );
+        }
+        // 无论输赢，锁都必须放掉——否则这个仓库以后再也迁不了
+        assert!(
+            !migrate_lock(&fx).exists(),
+            "第 {round} 轮：迁移结束了但锁文件还在"
+        );
+    }
+    assert!(
+        rounds_with_a_winner > 0,
+        "8 轮里一次成功都没有——这条测试没有真正覆盖到「有人成功」的那条路径"
+    );
+}
+
+#[test]
+fn migration_refuses_while_another_one_holds_the_lock() {
+    // 锁文件残留（上一次迁移途中进程被杀）时的表现：干净拒绝，一个字节都不写。
+    let fx = svn_repo_with_native_eol();
+    init_hybrid(&req(&fx)).unwrap();
+    rewind_to_phase1(&fx);
+    let wc = fx.wc_str();
+    let base_before = rev(&wc, "refs/heads/svn/base");
+
+    std::fs::write(migrate_lock(&fx), b"").unwrap();
+    let err = migrate_eol(&wc).expect_err("已经有一次迁移在进行时必须拒绝");
+
+    assert_eq!(err.code, "svn_migrate_busy", "实际：{}", err.message);
+    assert!(
+        err.message.contains("mygitclient-migrate.lock"),
+        "拒绝时必须告诉用户那个文件在哪、怎么清掉，实际：{}",
+        err.message
+    );
+    assert!(!has_eol_rule(&wc), "被锁挡下时不许写规则文件");
+    assert_eq!(
+        rev(&wc, "refs/heads/svn/base"),
+        base_before,
+        "被锁挡下时不许动基线"
+    );
+    // 别人的锁不归我们清
+    assert!(migrate_lock(&fx).exists(), "不能把别人持有的锁删掉");
+}
+
+#[test]
+fn the_migration_lock_is_released_on_both_success_and_failure() {
+    // Drop 必须在每条路径上都跑到。留下锁文件会让仓库永久迁不动，
+    // 而那正是本轮第 1 条阻断（永久死角）的同一类后果。
+    let fx = svn_repo_with_native_eol();
+    init_hybrid(&req(&fx)).unwrap();
+    rewind_to_phase1(&fx);
+    let wc = fx.wc_str();
+
+    // 失败路径：detached HEAD，在 check_can_align 处被拒
+    let head = rev(&wc, "HEAD");
+    run_git(&wc, &["checkout", "--detach", &head]).unwrap();
+    migrate_eol(&wc).expect_err("detached HEAD 必须被拒");
+    assert!(!migrate_lock(&fx).exists(), "拒绝之后锁必须放掉");
+
+    // 成功路径
+    let branch = run_git(&wc, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+    assert_eq!(branch.trim(), "HEAD", "上面那步应当处于 detached 状态");
+    run_git(&wc, &["checkout", "work"]).unwrap();
+    migrate_eol(&wc).unwrap();
+    assert!(!migrate_lock(&fx).exists(), "成功之后锁必须放掉");
+}
+
+#[test]
+fn migration_refuses_on_a_detached_head() {
+    let fx = svn_repo_with_native_eol();
+    init_hybrid(&req(&fx)).unwrap();
+    rewind_to_phase1(&fx);
+    let wc = fx.wc_str();
+    let head = run_git(&wc, &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    run_git(&wc, &["checkout", "-q", "--detach", &head]).unwrap();
+
+    let err = migrate_eol(&wc).expect_err("detached HEAD 时必须拒绝");
+
+    assert_eq!(
+        err.code, "svn_eol_migrate_head_detached",
+        "实际：{}",
+        err.message
+    );
+    assert!(!has_eol_rule(&wc), "拒绝了就不许写规则文件");
+}
+
+#[test]
+fn migration_refuses_when_the_rule_is_already_installed() {
+    // 重建会移动 svn/base 指针，旧基线只能从 reflog 找回来。已经迁移过还再来
+    // 一次，等于凭空动一次用户的基线。
+    let fx = svn_repo();
+    init_hybrid(&req(&fx)).unwrap();
+
+    let err = migrate_eol(&fx.wc_str()).expect_err("已经装过就不该再迁移");
+    assert_eq!(
+        err.code, "svn_eol_already_migrated",
+        "实际：{}",
+        err.message
+    );
+}
+
+#[test]
+fn a_failed_rebuild_rolls_the_rule_back() {
+    // **本组最重要的一条。** 重建失败时仓库必须回到「规则没装」的原状，不能停在
+    // 「规则装了但基线还是旧的」——那是 spec §7.3.0 说的潜伏故障：`git status`
+    // 因为 stat cache 还报干净，等文件 mtime 被碰一下才逐个变脏。
+    let fx = svn_repo();
+    init_hybrid(&req(&fx)).unwrap();
+    strip_eol_rule(&fx);
+    let obstructed = obstruct(&fx);
+
+    let err = migrate_eol(&fx.wc_str()).expect_err("obstructed 必须让迁移失败");
+
+    assert_eq!(
+        err.code, "svn_preflight_obstructed",
+        "实际：{}",
+        err.message
+    );
+    assert!(
+        !has_eol_rule(&fx.wc_str()),
+        "重建失败了，规则必须还原——否则仓库停在潜伏故障状态"
+    );
+    assert!(obstructed.is_dir(), "拦住之后磁盘必须原样，不许替用户动手");
+}
+
+#[test]
+fn a_failed_rebuild_restores_a_users_own_attributes_file() {
+    // 用户原本就有自己的 attributes 时，回滚要还回**他的**内容，不是删文件。
+    let fx = svn_repo();
+    init_hybrid(&req(&fx)).unwrap();
+    let attrs = fx.wc().join(".git/info/attributes");
+    std::fs::write(&attrs, "*.psd binary\n").unwrap();
+    obstruct(&fx);
+
+    migrate_eol(&fx.wc_str()).expect_err("obstructed 必须让迁移失败");
+
+    assert_eq!(
+        std::fs::read_to_string(&attrs).unwrap(),
+        "*.psd binary\n",
+        "回滚必须还回用户自己的内容"
+    );
+}
+
+#[test]
+fn migration_refuses_on_a_directory_that_is_not_a_hybrid_repo() {
+    let fx = svn_repo();
+    let err = migrate_eol(&fx.wc_str()).expect_err("没建过库就没有基线可迁移");
+    assert_eq!(err.code, "svn_not_hybrid", "实际：{}", err.message);
 }
