@@ -4,6 +4,10 @@
 //! 判定成「没人拿着」。所以本文件里最重要的不是 happy path，是那条真正杀掉
 //! 一个外部进程的测试（见 `a_lock_whose_holder_was_killed_is_not_held`）。
 
+#[path = "common/svn_fixtures.rs"]
+mod svn_fixtures;
+
+use app_lib::engine::svn_init::InitRequest;
 use app_lib::engine::svn_lock::{acquire, holder, is_held, lock_path};
 
 /// 锁只要求 `<repo>/.git` 存在，不需要是完整的混合仓库——
@@ -162,4 +166,37 @@ fn a_stale_lock_naming_a_live_unrelated_pid_is_still_takeable() {
 
     assert!(!is_held(&root), "pid 活着不等于这把锁有人拿着");
     acquire(&root, "mine").expect("必须可以接管");
+}
+
+#[test]
+fn staging_is_refused_while_a_sync_holds_the_lock() {
+    // 扫源码（`tests/svn_write_guard.rs`）能发现「忘了加」，发现不了「加了但没生效」。
+    // 这条走真实后端，从 `backend_for` 一路打到 `assert_not_syncing`。
+    let fx = svn_fixtures::svn_repo_with_native_eol();
+    app_lib::engine::svn_init::init_hybrid(&InitRequest {
+        repo_root: fx.wc_str(),
+        whitelist: vec!["Code/".into()],
+        // 扩展名**必须带前导点**：`svn_config` 会以 `svn_config / 扩展名必须以 . 开头`
+        // 直接拒绝（计划里写成了 `"cs"`）。
+        extensions: vec![".cs".into()],
+    })
+    .unwrap();
+    let root = fx.wc_str();
+
+    let backend = app_lib::vcs::backend_for(&root).unwrap();
+    backend
+        .stage(&["Code/Nat.cs".into()])
+        .expect("没持锁时 stage 必须正常");
+
+    let _guard = acquire(&root, "opid-sync").unwrap();
+    let err = backend
+        .stage(&["Code/Nat.cs".into()])
+        .expect_err("持锁期间 stage 必须被拒");
+    assert_eq!(err.code, "sync_in_progress", "实际：{}", err.message);
+
+    // 读必须照常可用（spec §5.1：读操作不阻塞，否则同步期间界面整个瞎掉，
+    // 而那恰恰是最需要显示状态的时候）。
+    backend
+        .status()
+        .expect("持锁期间读操作不得被阻塞（spec §5.1）");
 }

@@ -15,7 +15,7 @@
 | 0 | 建决策日志 + worktree | ✅ 完成 | 本文件 | §4.2 自检通过：分支 `worktree-svn-phase2b-lock`、基点 `821a735`、`pwd` 实测在 worktree 内、无未提交改动 |
 | 1 | 跨进程锁的获取与释放 | ✅ 完成 | `svn_lock.rs`、`tests/svn_lock.rs`、`engine/mod.rs` | `cargo test --test svn_lock` 4 passed（计划里是 3，见下）；fmt / clippy 零告警；变异验证 ×2 |
 | 2 | 崩溃后锁真的松开（跨进程实测） | ✅ 完成 | `tests/svn_lock.rs`（+2 条） | `cargo test --test svn_lock` 6 passed；对 spec 原方案（pid 探测）做变异，2 条变红 |
-| 3 | 持锁期间拒绝写操作 | ⬜ 未开始 | | |
+| 3 | 持锁期间拒绝写操作 | ✅ 完成 | `vcs/svn.rs`、`tests/svn_write_guard.rs`、`tests/svn_lock.rs`（+1） | `cargo test` **576 passed**（基线 567，新增 9）；fmt / clippy 零告警；变异验证已跑 |
 | 4 | 写前 journal | ⬜ 未开始 | | |
 | 5 | 同步期间挂起文件监听 | ⬜ 未开始 | | |
 | 6 | 「上次同步未完成」的检测与展示 | ⬜ 未开始 | | |
@@ -25,9 +25,9 @@
 
 | 命令 | 结果 |
 |---|---|
-| `cargo fmt --check` | ⬜ 未跑 |
-| `cargo clippy --all-targets` | ⬜ 未跑 |
-| `cargo test` | ⬜ 未跑（基线 567 passed） |
+| `cargo fmt --check` | 🟡 Task 3 时点：OK |
+| `cargo clippy --all-targets` | 🟡 Task 3 时点：**0 告警** |
+| `cargo test` | 🟡 Task 3 时点：**576 passed / 0 failed**（基线 567，新增 9） |
 | `pnpm build` | ⬜ 未跑 |
 | `pnpm test` | ⬜ 未跑（基线 369 passed） |
 | `pnpm tauri dev` 真实窗口 | ⬜ 未跑 |
@@ -197,3 +197,66 @@ powershell 只是 `File::Open` 把文件开着，**从没写过 pid 元数据**�
   `AGENTS.md` 最高优先级那条（不拿真实仓库当试验场）。
 - **`#[cfg(windows)]` 圈住**：非 Windows 上没有等价语义，不留一条在别的平台上
   必然假绿的测试。
+
+---
+
+## Task 3：持锁期间拒绝写操作
+
+### 偏离计划
+
+**一、`SvnGitBackend` 自己存了一份 `root: String`。** 计划已经预见到这一点并给了
+两个选项（「`GitBackend` 若没有公开访问器，就自己存一份」），实测确认
+`GitBackend::root` 是私有字段且没有访问器，所以走了后者。不去给 `GitBackend` 加
+public 访问器：那会扩大一个与本期无关的公开接口（`AGENTS.md` §1.2）。
+
+### 计划的错误
+
+**一、`extensions: vec!["cs".into()]` 少了前导点。**
+
+```text
+GitError { code: "svn_config", message: "扩展名必须以 . 开头：cs" }
+```
+
+`svn_config` 在校验阶段就拒了。正确写法是 `".cs"`，与 `tests/svn_init.rs::req`
+里那份一致。已修并在测试里就地注明。
+
+### 计划没写的坑
+
+**一、`src/vcs/svn.rs` 是 CRLF，其余被改过的文件是 LF。** 用 `
+` 模式批量替换
+会一条都匹配不上（第一次尝试 12 条全部 `NOT FOUND`）。做法：读进来先
+`
+ → 
+` 归一，改完再整体写回 CRLF，并在写回前断言「原文是纯 CRLF」——
+混合行尾的文件按这个流程会被悄悄统一，那是不该由本期顺手做的改动。
+
+改完复核 `CRLF=141 bare-LF=0`，没有混入 LF。
+
+**二、两层测试各自只能抓一半，缺一不可。**
+
+| 测试 | 抓得到 | 抓不到 |
+|---|---|---|
+| `svn_write_guard.rs`（扫源码） | 新增写方法时**忘了加** | 加了但没生效 |
+| `staging_is_refused_…`（真后端） | 加了但没生效 | 除 `stage` 外其余 11 个方法 |
+
+变异（只去掉 `stage` 的守卫）实测两边都红：扫描那条直接点名 `stage`，行为那条
+在真实 `backend_for` 路径上报错。只留任意一条都会留下一个真实的漏洞形态。
+
+**三、反向约束和正向一样重要。** `read_methods_are_not_guarded` 守住
+「读不阻塞」（spec §5.1）。没有它的话，下一个人「为了保险」给 `status` 也加上
+守卫是很自然的动作——而后果是同步期间界面整个瞎掉，恰恰在最需要看清状况的时候。
+
+### 变异验证（已跑）
+
+| 变异 | 结果 |
+|---|---|
+| 去掉 `stage` 的 `assert_not_syncing` | `every_write_method_checks_the_sync_lock` 点名 `stage` 变红；`staging_is_refused_while_a_sync_holds_the_lock` 同时变红。其余全绿 |
+
+### 为什么这么改是安全的
+
+- **只加前置判断，不改任何既有行为**。12 个方法的实现仍原样委托给 `GitBackend`，
+  没持锁时行为与改动前逐字相同（`cargo test` 全量 576 passed，既有 567 条无一变化）。
+- **读路径一个字没动**，spec §5.1 的「读不阻塞」由反向测试钉住。
+- **守卫用的是同一把 `is_held`**，与 `acquire` 判据一致，不存在「拿锁看一套、
+  拒绝看另一套」的分裂。
+- **普通 git 仓库不受影响**：守卫只加在 `SvnGitBackend` 上，`GitBackend` 没动。
