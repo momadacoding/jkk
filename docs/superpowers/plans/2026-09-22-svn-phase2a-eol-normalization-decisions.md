@@ -17,7 +17,8 @@
 | 3 | `eol_status` 侦测（纯读） | ✅ 完成 | `svn_init.rs`、`commands/svn.rs`、`lib.rs`、`tests/svn_init.rs` | `cargo test` 551 passed（新增 4）；`commands_are_async` 变异验证已跑 |
 | 4 | `migrate_eol` 原子迁移 + 回滚 | ✅ 完成 | `svn_init.rs`、`commands/svn.rs`、`lib.rs`、`tests/svn_init.rs` | `cargo test` 556 passed（新增 5）；回滚变异验证已跑 |
 | 5 | 前端横幅与接线 | ✅ 完成 | `svnSync.ts`、`repoStore.ts`、`BaselineBanner.tsx`、`RepoTab.tsx`、`svnSync.test.ts` | `pnpm build` OK；`pnpm test` 365 passed（新增 11）；变异验证已跑；**真实窗口 3 个场景 2026-09-24 由用户跑通** |
-| 收尾 | E2E 清单 + 独立 review | 🟡 E2E 已通过，review 进行中 | `docs/superpowers/e2e/2026-09-22-svn-phase2a-eol-e2e.md` | 3/3 场景通过 |
+| 6 | 修入独立 review 的阻断发现 | ✅ 完成 | `svn_init.rs`、`tests/svn_init.rs`、`tests/svn_attributes.rs` | `cargo test` 562 passed（新增 6）；对齐变异验证已跑 |
+| 收尾 | E2E 清单 + 独立 review | ✅ 完成 | `docs/superpowers/e2e/2026-09-22-svn-phase2a-eol-e2e.md` | E2E 3/3 通过；review 1 条阻断已修 |
 
 ## 全量验证
 
@@ -25,7 +26,7 @@
 |---|---|
 | `cargo fmt --check` | ✅ OK |
 | `cargo clippy --all-targets` | ✅ **0 告警** |
-| `cargo test` | ✅ **556 passed / 0 failed**（基线 537，新增 19） |
+| `cargo test` | ✅ **562 passed / 0 failed**（基线 537，新增 25） |
 | `pnpm build` | ✅ OK（`tsc` + `vite build`） |
 | `pnpm test` | ✅ **365 passed**（基线 354，新增 11） |
 | `pnpm tauri dev` 真实窗口 | ✅ **2026-09-24 由用户实跑，3/3 场景通过**（清单见 `docs/superpowers/e2e/2026-09-22-svn-phase2a-eol-e2e.md`） |
@@ -401,3 +402,87 @@ a_failed_rebuild_restores_a_users_own_attributes_file ... FAILED
 - **切到非 SVN 仓库时显式清空 `svnEol`**，与既有的 `svnSync` / `svnAudit` 同处
   一个 `setState`——不清的话上一个 SVN 仓库的迁移横幅会挂在下一个普通 git
   仓库上（`refreshPinned` 的注释里记过同一个坑）。
+
+---
+
+## Task 6：修入独立 review 的阻断发现（2026-09-24）
+
+`AGENTS.md` §4.1 的独立 review 门槛，由一个全新上下文的 agent 按 §13 rubric 执行。
+**1 条阻断 + 6 条非阻断。** 阻断那条由本会话独立复现后确认成立并修掉。
+
+### 阻断问题：迁移只换了三样东西里的一样
+
+Review 的原话是「迁移对**真实形态**的 Phase 1 仓库并没有把仓库对齐」。本会话
+独立复现（新写 `migrating_a_faithful_phase1_repo_leaves_nothing_dirty`）：
+
+```text
+迁移后 git status  →  M Code/Nat.cs
+```
+
+**根因。** `rebuild_baseline` 按设计全程不动 HEAD 和真实索引（R1–R5 的核心约束），
+所以它只把 `svn/base` 换成新形状。而 Phase 1 建库时 `build_repo` 是靠一句
+`read-tree` 把**真实索引**也对齐的，工作分支 tip 又恰好指向那个基线 commit
+——真实的 Phase 1 仓库里，**基线树、工作分支 tip、真实索引三样同时是旧形状**。
+只换第一样，留下的正是本期声称要消灭的那个潜伏故障。
+
+**为什么原来的测试没抓到（rubric #9，虚假信心）。** 原 fixture 只做
+「删规则 + `rebuild_baseline`」，而它的真实索引和 work tip 是在**规则已装**的
+情况下建的（新形状），于是迁移之后一切恰好对得上。测试名说「重录基线」，
+测的却不是 Phase 1 仓库的真实形态。新增 `rewind_to_phase1` 把三样都退回去。
+
+**修法。** 迁移成功后把工作分支与真实索引一起搬到新基线上
+（`update-ref` 带旧值守卫 + `read-tree`，**不带 `-u`**，磁盘全程不碰）。
+
+### 被实测推翻的方案：`git add --renormalize`
+
+工作分支上有自己的提交时（情形 B），移 ref 修不了那些 commit 里的旧形状 blob。
+用户最初选了「加一笔归一化提交」。**探针把这个方案推翻了：**
+
+```text
+Code/Nat.cs    旧 blob=LF  磁盘=CRLF  →  cat-file --filters 给 CRLF  ✅
+Code/Plain.cs  旧 blob=LF  磁盘=LF    →  cat-file --filters 给 CRLF  ❌
+```
+
+`--renormalize`（及其背后的 `cat-file --filters`）给出的是「git 会往磁盘写什么」，
+`autocrlf=true` 下**所有文本文件都是 CRLF**；而磁盘的真实形态由 SVN 决定。
+一个 SVN 存 LF 的文件会被它改成 CRLF，**凭空造出一批新的假阳性**。
+
+顺带验证了它的另一半确实没问题：从 HEAD 树构造不会卷进用户的 WIP
+（探针里磁盘的 `WIP-NOT-COMMITTED` 既没进提交也没被抹掉）。但取值来源错了，
+方案整体不成立。
+
+要做对就得逐路径定目标形态，而目标形态只能靠数 `\r\n` 猜——猜错就是改坏用户
+已有的提交。**改选：本期在动任何东西之前拒绝**，理由与出路写进错误消息。
+「把一个分支重放到新基线上」本来就是 `sync_in` S9 的职责，那里有 rebase 和
+完整的冲突解决流程兜底。
+
+### 计划的错误（本轮新增）
+
+- **「落后于基线」被我误报成「有本地提交」。** 第一版 `check_can_align` 只算
+  `base..HEAD`，于是 HEAD 是 base 祖先时报出「有 **0** 笔本地提交」。而
+  **落后于基线是 Phase 1 的合法常态**——spec §16 明写「重建基线的代价是工作分支
+  不会自动跟进」，界面上那颗「重建基线」按钮每按一次就会造出这个状态。两种成因
+  相反，消息必须分开说，否则用户按着提示去找不存在的本地提交。已补
+  `migration_says_so_when_the_branch_merely_lags_behind_the_baseline` 钉住。
+
+### 非阻断项的处理
+
+| review 发现 | 处理 |
+|---|---|
+| 「备份走原始字节」没有测试（变异后 52 条全绿） | **已修**：新增 `a_non_utf8_attributes_file_is_backed_up_byte_for_byte`，用 GBK 字节断言 `.bak` 逐字节相等 |
+| 两条 EOL 测试依赖本机全局 `core.autocrlf=true`，别的机器上会**静默平凡通过** | **已修**：显式断言这条前提。`init_hybrid` 自己跑 `git init`，没法在建库前设仓库级配置，所以只能把前提断出来而不是设出来 |
+| `write_attributes` 非 rename 失败路径会留下 `.tmp` | 未修。与 `write_exclude` 同病，属既有约定，单独处理 |
+| 回滚后 `attributes.bak` 留在原地 | 未修。留着不伤正确性，且它是用户原件的唯一副本，删它风险更大 |
+| 只有注释的 attributes 会被无备份覆盖；用户原有规则失效后 UI 未提示 | 未修，记为已知限制。建议在后续把「会接管 `.git/info/attributes`」写进确认框 |
+| `has_eol_rule` 对 BOM / 空文件 / 只有 header 的边界无测试 | 未修。三种行为均已确认正确（分别 false/false/false），补测试的收益低于本期收尾成本 |
+
+### 为什么这么改是安全的
+
+- **拒绝是全或全无的**：`check_can_align` 在 `write_attributes` **之前**跑，四条
+  判据全是纯读。三条拒绝测试都断言了「规则文件不许出现、基线不许动、工作分支
+  不许动、暂存内容原样保留」。
+- **对齐不会丢东西**：前置保证分支 tip == 旧基线且索引 == 旧基线树，所以
+  `update-ref`（带旧值守卫）不会丢提交，`read-tree` 不会丢暂存。
+- **对齐失败会把基线也退回去**，不留「基线新、分支旧」的半迁移状态；退回也失败时
+  把原错误保留并给出手工命令。
+- **变异验证已跑**：去掉 `align_branch` 之后，恰好那两条对齐断言变红。

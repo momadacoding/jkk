@@ -137,6 +137,34 @@ fn rewriting_our_own_file_does_not_create_a_second_backup() {
 }
 
 #[test]
+fn a_non_utf8_attributes_file_is_backed_up_byte_for_byte() {
+    // 用户的 `.git/info/attributes` 完全可能不是 UTF-8（GBK 注释的中文工程常见）。
+    // 判断要不要备份时过了一次 `from_utf8_lossy`，**写备份时绝不能用那个结果**
+    // ——否则原件里的字节会被 U+FFFD 替换字符污染，而且无人发现。
+    //
+    // 同 spec §16.2 末尾那条「`svn cat` 必须按字节接收」是一类坑。
+    let dir = repo();
+    let root = dir.path().to_str().unwrap();
+    let info = dir.path().join(".git/info");
+    fs::create_dir_all(&info).unwrap();
+    // GBK 的「中文」+ 一条真规则。这串字节在 UTF-8 下不合法。
+    let raw: Vec<u8> = b"# \xd6\xd0\xce\xc4\n*.psd binary\n".to_vec();
+    assert!(
+        String::from_utf8(raw.clone()).is_err(),
+        "前提不成立：这串字节本该不是合法 UTF-8"
+    );
+    fs::write(info.join("attributes"), &raw).unwrap();
+
+    write_attributes(root).unwrap();
+
+    assert_eq!(
+        fs::read(info.join("attributes.bak")).unwrap(),
+        raw,
+        "备份必须逐字节等于原件，不许过 UTF-8 转换"
+    );
+}
+
+#[test]
 fn restore_puts_back_exactly_what_was_there_before() {
     // Task 4 的回滚要靠它：迁移时重建基线失败，仓库必须回到「规则没装」的
     // 原状，不能停在「规则装了但基线还是旧的」——那正是 spec §7.3.0 说的
