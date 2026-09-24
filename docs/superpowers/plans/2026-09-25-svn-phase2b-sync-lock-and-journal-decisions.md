@@ -16,7 +16,7 @@
 | 1 | 跨进程锁的获取与释放 | ✅ 完成 | `svn_lock.rs`、`tests/svn_lock.rs`、`engine/mod.rs` | `cargo test --test svn_lock` 4 passed（计划里是 3，见下）；fmt / clippy 零告警；变异验证 ×2 |
 | 2 | 崩溃后锁真的松开（跨进程实测） | ✅ 完成 | `tests/svn_lock.rs`（+2 条） | `cargo test --test svn_lock` 6 passed；对 spec 原方案（pid 探测）做变异，2 条变红 |
 | 3 | 持锁期间拒绝写操作 | ✅ 完成 | `vcs/svn.rs`、`tests/svn_write_guard.rs`、`tests/svn_lock.rs`（+1） | `cargo test` **576 passed**（基线 567，新增 9）；fmt / clippy 零告警；变异验证已跑 |
-| 4 | 写前 journal | ⬜ 未开始 | | |
+| 4 | 写前 journal | ✅ 完成 | `svn_journal.rs`、`tests/svn_journal.rs`、`engine/mod.rs` | `cargo test` **585 passed**（新增 9）；fmt / clippy 零告警；变异验证 ×2 |
 | 5 | 同步期间挂起文件监听 | ⬜ 未开始 | | |
 | 6 | 「上次同步未完成」的检测与展示 | ⬜ 未开始 | | |
 | 收尾 | E2E 清单 + 独立 review + spec 回写 | ⬜ 未开始 | | |
@@ -25,9 +25,9 @@
 
 | 命令 | 结果 |
 |---|---|
-| `cargo fmt --check` | 🟡 Task 3 时点：OK |
-| `cargo clippy --all-targets` | 🟡 Task 3 时点：**0 告警** |
-| `cargo test` | 🟡 Task 3 时点：**576 passed / 0 failed**（基线 567，新增 9） |
+| `cargo fmt --check` | 🟡 Task 4 时点：OK |
+| `cargo clippy --all-targets` | 🟡 Task 4 时点：**0 告警** |
+| `cargo test` | 🟡 Task 4 时点：**585 passed / 0 failed**（基线 567，新增 18） |
 | `pnpm build` | ⬜ 未跑 |
 | `pnpm test` | ⬜ 未跑（基线 369 passed） |
 | `pnpm tauri dev` 真实窗口 | ⬜ 未跑 |
@@ -260,3 +260,64 @@ GitError { code: "svn_config", message: "扩展名必须以 . 开头：cs" }
 - **守卫用的是同一把 `is_held`**，与 `acquire` 判据一致，不存在「拿锁看一套、
   拒绝看另一套」的分裂。
 - **普通 git 仓库不受影响**：守卫只加在 `SvnGitBackend` 上，`GitBackend` 没动。
+
+---
+
+## Task 4：写前 journal
+
+### 偏离计划
+
+**一、多了两条测试。** 计划 7 条，实际 9 条：
+
+- `flow_uses_the_exact_strings_from_the_spec`——`Phase` 的线序名有测试钉着，
+  `Flow` 却没有。它同样是落盘格式，且它决定恢复入口走 `sync_in` 还是 `sync_out`
+  那条分支（§7.6 明写两者的 `publishing-baseline` 不能互相套用），写错的后果不比
+  `Phase` 轻。
+- `a_stash_oid_survives_the_round_trip`——§7.6.1 是整份 spec 里点名最重的一条
+  （「按不可变 OID 记，不能记 `stash@{N}`」），但计划里没有任何测试碰 `stash_oid`
+  字段。它是崩溃恢复唯一的锚点，必须证明它真的落盘并读得回来。
+
+**二、`Default` 用 `#[derive(Default)] + #[default]` 属性，不是手写 `impl`。**
+计划给的是手写 `impl Default for Phase / Flow`。手写版会被 clippy 的
+`derivable_impls` 盯上；`#[default]` 变体属性从 Rust 1.62 起可用，本 crate 的
+`rust-version` 是 1.77.2，够用。
+
+### 计划的错误
+
+无（Task 4 的计划代码一次编译通过）。
+
+### 计划没写的坑
+
+**一、`serde` 的 `skip_serializing_if` 与 `#[serde(default)]` 必须成对。**
+结构体上标了 `#[serde(rename_all = "camelCase", default)]`，字段上才能用
+`skip_serializing_if` ——否则写出去的 JSON 缺字段，读回来就报 `missing field`。
+这一对是 `sync_in` 写出的 journal 能保持干净（不含一堆 `sync_out` 的 null）
+同时又能被读回的前提。
+
+**二、计划担心「原子写那条测试可能撞不上窗口」，实测不用担心。**
+去掉原子写（改成 `std::fs::write` 直接覆盖）之后连跑 3 次**全红**，且报的是
+`EOF while parsing a value at line 1 column 0` ——读到的确实是被截断的文件，
+不是别的原因。所以计划里那条「撞不上就删掉并如实说明」的后备方案没有启用，
+测试保留。
+
+**三、`read` 是本模块唯一允许不持锁调用的函数。** 已写进模块文档：UI 要在
+没拿锁的情况下显示「上次同步未完成」（spec §5.1「读操作不阻塞」），但读到的
+可能是另一个进程正在推进的状态，所以它的结论**只能用来显示，不能用来决定动作**。
+不写明这一点的话，下一个人很自然会拿 `read` 的结果去驱动恢复逻辑。
+
+### 变异验证（已跑）
+
+| 变异 | 结果 |
+|---|---|
+| `read` 的坏 JSON 分支改成 `Ok(..ok())`（静默退化成"没有"） | 只有 `a_corrupt_journal_is_an_error_not_a_default` 变红 |
+| `write` 去掉临时文件 + rename，改成直接覆盖 | `overwriting_never_leaves_a_half_written_file` 连跑 3 次全红，报 `EOF while parsing` |
+
+### 为什么这么改是安全的
+
+- **纯新增模块**，没有任何既有调用方，全量 585 passed 里原有的 567 条一条没动。
+- **坏 journal 绝不静默吞掉**。这是整个模块最关键的一条不变量：吞掉它等于把
+  用户 stash 的 OID 丢了，而恢复代码会以为「上次什么都没做」——但磁盘上工作区
+  已经被清空了。由变异验证坐实。
+- **原子写已由变异坐实**，不是靠「代码看起来写对了」。
+- **`sync_out` 的字段现在就定义**，避免 Phase 3 改文件格式导致两期写出的 journal
+  互相读不了；但它们全部 `skip_serializing_if`，`sync_in` 写出来的文件不含它们。
