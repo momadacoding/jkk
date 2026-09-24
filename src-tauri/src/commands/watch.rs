@@ -1,7 +1,7 @@
 use crate::engine::path::normalize;
 use crate::error::{GitError, Result};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
@@ -22,6 +22,45 @@ fn watchers() -> &'static Mutex<HashMap<String, (u64, usize)>> {
 
 fn lock_err() -> GitError {
     GitError::new("mutex", "lock failed")
+}
+
+/// 同步期间被挂起的仓库（归一化路径）。
+///
+/// spec §5.2：`svn update` 一次改动成百上千个文件，300ms 去抖压不住；流程跑到
+/// 一半发出的 `repo-changed` 会让前端读到「已切到基线分支但还没落新基线」的
+/// 中间态，界面上闪出「改动全没了」的假象。
+///
+/// 用「挂起」而不是「停掉再重建」：停掉会丢掉引用计数（多个标签页共用一条线程），
+/// 重建还要重新遍历目录树。
+static SUSPENDED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn suspended() -> &'static Mutex<HashSet<String>> {
+    SUSPENDED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// 挂起某个仓库的刷新事件。**同步流程开始时调**（spec §5.2）。
+///
+/// 锁中毒时静默放弃：挂起失败的后果只是同步期间多刷新几次界面，而在这里 panic
+/// 会把整个同步流程带走。
+pub fn suspend_watch(path: &str) {
+    if let Ok(mut s) = suspended().lock() {
+        s.insert(normalize(path));
+    }
+}
+
+/// 恢复刷新事件。调用方在恢复之后**必须主动发一次 `repo-changed`**（§5.2），
+/// 否则挂起期间攒下的那一大批改动没有任何事件去告诉前端。
+pub fn resume_watch(path: &str) {
+    if let Ok(mut s) = suspended().lock() {
+        s.remove(&normalize(path));
+    }
+}
+
+pub fn is_watch_suspended(path: &str) -> bool {
+    suspended()
+        .lock()
+        .map(|s| s.contains(&normalize(path)))
+        .unwrap_or(false)
 }
 
 /// 变更静默这么久之后才发一次 `repo-changed`（尾沿去抖）。
@@ -123,8 +162,12 @@ pub fn watch_repo(handle: AppHandle, path: String) -> Result<()> {
             }
             if pending && last_change.elapsed() >= DEBOUNCE {
                 pending = false;
-                // 带上路径，前端各标签据此只刷新自己那个仓库
-                let _ = handle.emit("repo-changed", &path);
+                // 挂起期间**丢弃**事件而不是攒着：同步结束时调用方会主动发一次，
+                // 攒着只会在恢复的瞬间连发几百条。
+                if !is_watch_suspended(&path) {
+                    // 带上路径，前端各标签据此只刷新自己那个仓库
+                    let _ = handle.emit("repo-changed", &path);
+                }
             }
         }
     });

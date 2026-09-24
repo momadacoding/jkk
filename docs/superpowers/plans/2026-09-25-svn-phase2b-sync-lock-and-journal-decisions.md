@@ -17,7 +17,7 @@
 | 2 | 崩溃后锁真的松开（跨进程实测） | ✅ 完成 | `tests/svn_lock.rs`（+2 条） | `cargo test --test svn_lock` 6 passed；对 spec 原方案（pid 探测）做变异，2 条变红 |
 | 3 | 持锁期间拒绝写操作 | ✅ 完成 | `vcs/svn.rs`、`tests/svn_write_guard.rs`、`tests/svn_lock.rs`（+1） | `cargo test` **576 passed**（基线 567，新增 9）；fmt / clippy 零告警；变异验证已跑 |
 | 4 | 写前 journal | ✅ 完成 | `svn_journal.rs`、`tests/svn_journal.rs`、`engine/mod.rs` | `cargo test` **585 passed**（新增 9）；fmt / clippy 零告警；变异验证 ×2 |
-| 5 | 同步期间挂起文件监听 | ⬜ 未开始 | | |
+| 5 | 同步期间挂起文件监听 | ✅ 完成 | `commands/watch.rs`、`tests/svn_watch_suspend.rs` | `cargo test` **589 passed**（新增 4）；fmt / clippy 零告警；变异验证 ×2 |
 | 6 | 「上次同步未完成」的检测与展示 | ⬜ 未开始 | | |
 | 收尾 | E2E 清单 + 独立 review + spec 回写 | ⬜ 未开始 | | |
 
@@ -25,9 +25,9 @@
 
 | 命令 | 结果 |
 |---|---|
-| `cargo fmt --check` | 🟡 Task 4 时点：OK |
-| `cargo clippy --all-targets` | 🟡 Task 4 时点：**0 告警** |
-| `cargo test` | 🟡 Task 4 时点：**585 passed / 0 failed**（基线 567，新增 18） |
+| `cargo fmt --check` | 🟡 Task 5 时点：OK |
+| `cargo clippy --all-targets` | 🟡 Task 5 时点：**0 告警** |
+| `cargo test` | 🟡 Task 5 时点：**589 passed / 0 failed**（基线 567，新增 22） |
 | `pnpm build` | ⬜ 未跑 |
 | `pnpm test` | ⬜ 未跑（基线 369 passed） |
 | `pnpm tauri dev` 真实窗口 | ⬜ 未跑 |
@@ -321,3 +321,51 @@ GitError { code: "svn_config", message: "扩展名必须以 . 开头：cs" }
 - **原子写已由变异坐实**，不是靠「代码看起来写对了」。
 - **`sync_out` 的字段现在就定义**，避免 Phase 3 改文件格式导致两期写出的 journal
   互相读不了；但它们全部 `skip_serializing_if`，`sync_in` 写出来的文件不含它们。
+
+---
+
+## Task 5：同步期间挂起文件监听
+
+### 偏离计划
+
+无。四条测试与计划一致。
+
+### 计划的错误
+
+**一、计划 Step 2 说「若 `commands` 模块不是 `pub`，在 `lib.rs` 里改成
+`pub mod commands;`」，实际早就是 `pub`。** 这一条在写计划的自审阶段已经改掉了
+（连同 `pub mod proc;` 那条），施工时确认无需改动。
+
+### 计划没写的坑
+
+**一、`src/commands/watch.rs` 也是 CRLF。** 与 `src/vcs/svn.rs` 同样的坑
+（Task 3 记过）。这次直接用编辑工具而不是脚本批量替换，避开了行尾问题；
+改完复核 `CRLF=189 bare-LF=0`。
+
+**二、「丢弃」而不是「攒着」。** 挂起期间收到的事件直接扔掉，不缓存。攒着的话
+恢复的瞬间会连发几百条 `repo-changed` ——那正是挂起想避免的刷新风暴，只是推迟了
+几秒发生。恢复端由调用方主动发一次（spec §5.2 明写），一条就够。
+
+**三、`suspend` / `resume` 静默吞掉锁中毒。** 这两个函数返回 `()` 而不是
+`Result`：挂起失败的后果只是同步期间界面多刷新几次，而在这里往上抛错会让整个
+同步流程因为一件无关紧要的事中止。已在函数文档里写明这个取舍。
+
+### 变异验证（已跑）
+
+| 变异 | 结果 |
+|---|---|
+| A：发事件前不查挂起状态（`if true`） | 只有 `the_debounce_loop_actually_checks_the_suspension` 变红 |
+| B：三处 `normalize(path)` 换成 `path.to_string()` | 只有 `suspension_is_path_normalized` 变红 |
+
+变异 A 正是「集合写对了但没人查它」那种无声失效；变异 B 是 Windows 上
+`C:epo` 与 `C:/repo` 变成两个键、挂起静默失效。两条都只表现为「界面偶尔闪
+一下」，没有断言钉着就不会有人发现。
+
+### 为什么这么改是安全的
+
+- **默认行为完全不变**：`SUSPENDED` 空集时 `is_watch_suspended` 恒为 `false`，
+  去抖线程照原样发事件。全量 589 passed 里既有的 567 条一条没动。
+- **不碰引用计数**：挂起是另一个独立集合，`WATCHERS` 的登记 / 引用计数逻辑
+  一行未改，多标签页共用 watcher 线程的行为不受影响。
+- **没有调用方**：本期只把能力做出来，`suspend_watch` / `resume_watch` 的实际
+  调用点在 2c 的 S0 / S11。所以这一期不可能因为它改变任何现有行为。
