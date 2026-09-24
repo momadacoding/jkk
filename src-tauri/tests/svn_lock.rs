@@ -84,3 +84,82 @@ fn a_lock_file_left_behind_by_a_crash_is_not_held() {
     );
     acquire(&root, "opid-new").expect("残锁必须可以接管");
 }
+
+/// 用一个**真的外部进程**持锁，然后杀掉它。
+///
+/// 为什么非要跨进程：同进程内 drop 走的是我们自己的 `Drop`，验证的是「代码有没有
+/// 写对」；崩溃走的是操作系统回收句柄，验证的是「这个机制本身成不成立」。后者才是
+/// 这把锁敢用的理由，也是它区别于 pid 探测的地方。
+///
+/// 只在 Windows 上跑：非 Windows 分支是降级实现，没有等价语义可验。
+#[cfg(windows)]
+#[test]
+fn a_lock_whose_holder_was_killed_is_not_held() {
+    let fx = git_dir_fixture();
+    let root = fx.path().to_string_lossy().to_string();
+    let path = lock_path(&root);
+
+    // 外部进程：以「允许别人只读」的共享模式开着锁文件不放，正是 acquire 的形态
+    let script = format!(
+        "$f=[System.IO.File]::Open('{}','OpenOrCreate','ReadWrite','Read'); Start-Sleep 120",
+        path.to_string_lossy().replace('\\', "/")
+    );
+    let mut child = app_lib::engine::proc::hidden_command("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .spawn()
+        .expect("起不来 powershell");
+
+    // 等它真的把文件打开；轮询而不是固定 sleep，避免在慢机器上假失败
+    let mut opened = false;
+    for _ in 0..50 {
+        if is_held(&root) {
+            opened = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(opened, "外部进程没能在 5 秒内拿到锁，测试前提不成立");
+
+    assert!(
+        acquire(&root, "mine").is_err(),
+        "外部进程正持有时，本进程绝不能拿到锁"
+    );
+
+    child.kill().expect("杀不掉子进程");
+    child.wait().ok();
+
+    // 关键断言：没有任何清理代码跑过，但锁必须已经松开
+    let mut released = false;
+    for _ in 0..50 {
+        if !is_held(&root) {
+            released = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        released,
+        "持锁进程已被杀，锁却仍报「有人持有」——崩溃之后这个仓库就再也同步不了了"
+    );
+    assert!(
+        path.exists(),
+        "锁文件本身应当还在（残留），只是被判成无人持有"
+    );
+    acquire(&root, "mine").expect("崩溃留下的残锁必须可以接管");
+}
+
+#[test]
+fn a_stale_lock_naming_a_live_unrelated_pid_is_still_takeable() {
+    // pid 复用的现实后果：pid 探测会把这把残锁永远判成「活着」，仓库被永久卡死。
+    // 用当前测试进程自己的 pid 冒充——它当然活着，但它并没有持有这个句柄。
+    let fx = git_dir_fixture();
+    let root = fx.path().to_string_lossy().to_string();
+    let meta = format!(
+        r#"{{"pid":{},"startedAt":1,"opid":"recycled"}}"#,
+        std::process::id()
+    );
+    std::fs::write(lock_path(&root), meta).unwrap();
+
+    assert!(!is_held(&root), "pid 活着不等于这把锁有人拿着");
+    acquire(&root, "mine").expect("必须可以接管");
+}
