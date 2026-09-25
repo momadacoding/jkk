@@ -11,7 +11,7 @@
 | 1 | 2b 遗留：watcher RAII、锁释放重试、journal tmp 清理、持锁时长 | ✅ 完成 | `commands/watch.rs`、`svn_lock.rs`、`svn_journal.rs` + 5 条测试 | RED 已见（2 编译失败 + 1 断言失败）；3 条变异各自只红对应测试；fmt / clippy 0 告警 / `cargo test` 608 passed 0 failed |
 | 2 | 前置检查 | ✅ 完成 | `svn_xml::parse_update_status`、新模块 `svn_sync_check.rs`、fixture `hybrid_with_colleague` + 17 条测试 | RED 已见（两个测试文件编译失败）；4 条变异各自只红对应测试；fmt / clippy 0 告警 / `cargo test` 625 passed 0 failed |
 | 3 | WIP 压栈与取回 | ✅ 完成 | `svn_journal`（`ApplyingStash`、`stash_applied`）、新模块 `svn_sync_stash.rs` + 14 条测试、spec §7.3 S10 注记 / §7.6 phase 表 | RED 已见（两个测试文件编译失败）；8 条变异各自红对应测试；fmt / clippy 0 告警 / `cargo test` 639 passed 0 failed |
-| 4 | 基线录制零件拆分 | ⬜ | | |
+| 4 | 基线录制零件拆分 | ✅ 完成 | `svn_baseline::{create_baseline_commit, move_baseline_ref}`、`read_baseline` 改 `pub(crate)`；`svn_init::record_server_tree_into` + 5 条测试 | RED 已见（两个测试文件编译失败）；fmt / clippy 0 告警 / `cargo test` 644 passed 0 failed |
 | 5 | 编排主路径 S0–S11 + 冲突出口 | ⬜ | | |
 | 6 | 继续 / 放弃（含回原分支） | ⬜ | | |
 | 7 | S3 / S4 / S5 失败回退 | ⬜ | | |
@@ -203,3 +203,34 @@
 - push 失败后只有在「按 opid 找不到、且 `refs/stash` 与写 journal 前一致」时才删 journal；任何一条不满足都保留 journal，交给 `settle_stashing` 的判定树。
 - `restore_wip` 在 apply 前完成撞名判定；真撞名时返回 `Blocked`，此时**没有删任何文件、没有 apply**（变异 7 钉住）。A17 放行只删「磁盘 == stash == HEAD 同一 blob」的文件，删掉的字节在 HEAD 里原样存在；apply 中途失败时从 HEAD 取回。
 - `drop_wip` 按 OID 在 reflog 里定位；drop 输出里的 OID 与预期不符时把误删的那条 `stash store` 放回并报错（`sync_stash_drop_raced`），不吞别人的 WIP。
+
+---
+
+## Task 4：基线录制零件拆分
+
+### 验证记录
+
+| 步骤 | 实际结果 |
+|---|---|
+| RED | `create_baseline_commit` / `move_baseline_ref` / `record_server_tree_into` 不存在，两个测试文件编译失败，与计划期望一致 |
+| GREEN | `svn_baseline` 22 passed；`svn_init` 57 passed（既有用例一条不红，拆分不改行为） |
+| 全量 | `cargo fmt --check` 0；`cargo clippy --all-targets` 首轮 1 条 `needless_borrow`（`idx` 变成引用后 `&idx` 多余），改掉后 0 告警；`cargo test` 644 passed / 0 failed（48 个测试二进制，= Task 3 的 639 + 本 Task 5）。clippy 修正在全量之后，只删了一个 `&`，修正后重跑了 `svn_init` 57 passed |
+
+### 偏离计划
+
+- 无行为偏离。`create_baseline_commit` 的文档里补了一句 `parent` 的含义（原来在 `publish_baseline` 文档里，拆开后归到用它的函数）；`move_baseline_ref` 同理带上了 `expected_old` 的含义。
+
+### 计划的错误
+
+- 计划 Step 5 期望「既有 598 条一条不红」——598 是 2b 的基线，本分支此时已是 639。以实测 644（= 639 + 5）为准。
+
+### 计划没写的坑
+
+- `record_server_tree_into` 的 `idx` 改成引用后，函数体内 `verify_include_set(repo_root, &idx, …)` 会触发 clippy `needless_borrow`，计划的「其余 `idx.xxx(...)` 调用照旧」漏了这一处。
+- `svn_init.rs` 里「`let idx = TempIndex::empty(repo_root)?;` + `idx.add_all(...)`」这两行出现两次（另一处在体检相关函数里）；只删 `record_server_tree` 函数体里那一处，按上下文定位。
+- Git Bash 的 `sed -i` 会把 CRLF 文件写回 LF（本仓库 index 是 LF、提交时归一，`git diff --stat` 不受影响）。
+
+### 为什么这么改是安全的
+
+- `publish_baseline` 仍然先比对旧值、比对不过**不建 commit**，然后才调 `create_baseline_commit` + `move_baseline_ref`；`move_baseline_ref` 自己再比对一次、`update-ref` 带旧值兜住窄竞态——比拆分前多一次读取，语义不变（`publish_is_still_create_then_move` 与既有 `svn_baseline` / `svn_init` 用例钉住）。
+- `record_server_tree` 仍从空索引起步（包装里建 `TempIndex::empty`），初始化与 R2 的录制结果逐字不变；`recording_from_head_agrees_with_recording_from_empty_after_an_update` 证明「磁盘 = 服务器内容」时两种起点录出同一棵树，服务器删掉的文件不会被 HEAD 树带回来。

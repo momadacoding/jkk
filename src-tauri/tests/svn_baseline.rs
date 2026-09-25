@@ -440,3 +440,90 @@ fn an_empty_path_is_refused_by_both_writers() {
         "svn_baseline_empty_path"
     );
 }
+
+mod split_publish {
+    use app_lib::engine::git_cli::run_git;
+    use app_lib::engine::svn_baseline::{
+        create_baseline_commit, move_baseline_ref, publish_baseline, Trailer,
+    };
+
+    fn repo() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path().to_str().unwrap();
+        run_git(r, &["init", "-q", "-b", "svn/base"]).unwrap();
+        std::fs::write(d.path().join("A.cs"), "a\n").unwrap();
+        run_git(r, &["add", "A.cs"]).unwrap();
+        run_git(r, &["commit", "-qm", "base"]).unwrap();
+        d
+    }
+
+    fn t(rev: u64) -> Trailer {
+        Trailer {
+            url: "file:///C:/repo".into(),
+            rev,
+            uuid: "0f3a0000-0000-0000-0000-000000000000".into(),
+        }
+    }
+
+    #[test]
+    fn creating_a_commit_does_not_move_the_ref() {
+        // §7.6 publishing-baseline：commit 建好、ref 还没动之间要能落一次 journal
+        let d = repo();
+        let r = d.path().to_str().unwrap();
+        let old = run_git(r, &["rev-parse", "svn/base"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let tree = run_git(r, &["rev-parse", "svn/base^{tree}"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let c = create_baseline_commit(r, &tree, Some(&old), &t(2)).unwrap();
+        assert_eq!(run_git(r, &["rev-parse", "svn/base"]).unwrap().trim(), old);
+        move_baseline_ref(r, &c, Some(&old)).unwrap();
+        assert_eq!(run_git(r, &["rev-parse", "svn/base"]).unwrap().trim(), c);
+    }
+
+    #[test]
+    fn moving_refuses_when_the_baseline_moved_in_between() {
+        // 必测 #73：注入旧基线 OID 改变时 CAS 拒绝覆盖
+        let d = repo();
+        let r = d.path().to_str().unwrap();
+        let old = run_git(r, &["rev-parse", "svn/base"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let tree = run_git(r, &["rev-parse", "svn/base^{tree}"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let ours = create_baseline_commit(r, &tree, Some(&old), &t(2)).unwrap();
+        let theirs = create_baseline_commit(r, &tree, Some(&old), &t(3)).unwrap();
+        run_git(r, &["update-ref", "refs/heads/svn/base", &theirs]).unwrap();
+        let err = move_baseline_ref(r, &ours, Some(&old)).unwrap_err();
+        assert_eq!(err.code, "svn_baseline_moved");
+        assert_eq!(
+            run_git(r, &["rev-parse", "svn/base"]).unwrap().trim(),
+            theirs,
+            "别人的不被覆盖"
+        );
+    }
+
+    #[test]
+    fn publish_is_still_create_then_move() {
+        let d = repo();
+        let r = d.path().to_str().unwrap();
+        let old = run_git(r, &["rev-parse", "svn/base"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let tree = run_git(r, &["rev-parse", "svn/base^{tree}"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let c = publish_baseline(r, &tree, Some(&old), &t(2), Some(&old)).unwrap();
+        assert_eq!(run_git(r, &["rev-parse", "svn/base"]).unwrap().trim(), c);
+        let msg = run_git(r, &["log", "-1", "--format=%B", "svn/base"]).unwrap();
+        assert!(msg.contains("git-svn-id: file:///C:/repo@2 "), "{msg}");
+    }
+}

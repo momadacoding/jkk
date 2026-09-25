@@ -128,6 +128,16 @@ pub fn init_hybrid(req: &InitRequest) -> Result<InitReport> {
     }
 }
 
+/// 从**空索引**起步录服务器 rN 的树。初始化与 Phase 1 R2 用它（spec §6.3.1）。
+fn record_server_tree(
+    repo_root: &str,
+    cfg: &SvnConfig,
+    pre: &Preflight,
+) -> Result<(String, BTreeSet<String>)> {
+    let idx = TempIndex::empty(repo_root)?;
+    record_server_tree_into(repo_root, cfg, pre, &idx)
+}
+
 /// 录出「**服务器 rN 的树**」（spec §16 R2a–R2c）。返回 `(TREE, S)`。
 ///
 /// `S` 是本次**实际动过**的路径集合，交给体检当 §6.8.7 的 `S` 用。
@@ -152,17 +162,23 @@ pub fn init_hybrid(req: &InitRequest) -> Result<InitReport> {
 /// 条目（比如白名单目录里一个未版本控制的 `.txt`）在树里本来就不存在，对它动手
 /// 是 no-op——但把它记进 `S` 会让体检的 `D \ S` 变小，判据被悄悄削弱而没有任何
 /// 测试会变红（spec §16.1）。
-fn record_server_tree(
+///
+/// # 候选索引由调用方给
+///
+/// spec §6.3.1：「初始化 / Phase 1 R2 从空索引开始，其余录制入口从当前 HEAD 树
+/// 开始」。`sync_in` 的 S7 属于后者。起点不同、后面的改写与核对完全相同，所以
+/// 只把「从哪棵树起步」交出去。
+pub fn record_server_tree_into(
     repo_root: &str,
     cfg: &SvnConfig,
     pre: &Preflight,
+    idx: &TempIndex,
 ) -> Result<(String, BTreeSet<String>)> {
     let fixes = classify(&pre.dirty)?;
     // `S` 先算出来，再拿它驱动改写——**同一个集合**既决定动哪些路径，也交给体检。
     // 分两份算的话，两份迟早会不一致，而「体检那份更大」这个方向会悄悄削弱判据。
     let touched = explained_paths(&fixes, &cfg.whitelist, &cfg.extensions);
 
-    let idx = TempIndex::empty(repo_root)?;
     idx.add_all(repo_root, &cfg.whitelist)?;
 
     for (path, fix) in &fixes {
@@ -195,7 +211,7 @@ fn record_server_tree(
 
     // R2c：核对与录制**共用同一份候选索引**（spec §6.3.1），核对完之后在同一个
     // `idx` 上 `write_tree`——不得核对一次后又重新 add 另录一棵树。
-    verify_include_set(repo_root, &idx, &cfg.whitelist, &cfg.extensions, &fixes)?;
+    verify_include_set(repo_root, idx, &cfg.whitelist, &cfg.extensions, &fixes)?;
     let tree = idx.write_tree(repo_root)?;
     Ok((tree, touched))
 }

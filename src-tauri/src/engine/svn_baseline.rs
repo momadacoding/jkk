@@ -427,9 +427,44 @@ fn baseline_ref() -> String {
     format!("refs/heads/{BASELINE_BRANCH}")
 }
 
-/// 用 `TREE` 建一个基线 commit，并**以旧 OID 作比较条件**更新基线分支。
+/// 用 `TREE` 建一个基线 commit，**不动任何 ref**。
 ///
 /// - `parent`：首个基线传 `None`（无父提交）；其余入口按各自流程的定义传。
+///
+/// 与 [`move_baseline_ref`] 分开，是因为 `sync_in` 的 S7 要在两步之间落一次
+/// journal（spec §7.6 `publishing-baseline`：创建 commit 前记录 captureTree，
+/// 移动 ref 前再记录 newBaselineOid）。崩在两步之间时，重开就知道「commit 已建、
+/// ref 未动」，只补 update-ref，不重建另一个 commit。
+pub fn create_baseline_commit(
+    repo_root: &str,
+    tree: &str,
+    parent: Option<&str>,
+    t: &Trailer,
+) -> Result<String> {
+    // `commit-tree` 的 message **必须走 `-m`，不能走 stdin**：`run_git*` 用的是
+    // `Command::output()`，子进程 stdin 是 null，管道那条路会立刻读到 EOF 并产出
+    // 一个 message 为空的 commit——而 trailer 就写在 message 里，等于基线丢掉
+    // 记账且不报任何错。
+    let msg = format!(
+        "svn: r{}
+
+{}
+",
+        t.rev,
+        format_trailer(t)
+    );
+    let mut args: Vec<&str> = vec!["commit-tree", tree];
+    if let Some(p) = parent {
+        args.push("-p");
+        args.push(p);
+    }
+    args.push("-m");
+    args.push(&msg);
+    Ok(run_git(repo_root, &args)?.trim().to_string())
+}
+
+/// **以旧 OID 作比较条件**把基线分支移到 `oid`。
+///
 /// - `expected_old`：调用方读到的基线当前值。`None` 表示「这个 ref 现在不该存在」。
 ///
 /// # 为什么非得带旧值
@@ -442,6 +477,29 @@ fn baseline_ref() -> String {
 /// 这样常见情况能给出一条说得清的中文错误（`svn_baseline_moved` + 两个 OID），
 /// 而不是把 git 的英文 `cannot lock ref` 原样丢给用户。`update-ref` 那一层仍然
 /// 带着旧值，负责兜住这两步之间的窄竞态。
+pub fn move_baseline_ref(repo_root: &str, oid: &str, expected_old: Option<&str>) -> Result<()> {
+    let current = read_baseline(repo_root)?;
+    if current.as_deref() != expected_old {
+        return Err(moved_error(expected_old, current.as_deref()));
+    }
+    let old = expected_old.unwrap_or(ZERO_OID);
+    run_git(repo_root, &["update-ref", &baseline_ref(), oid, old]).map_err(|e| {
+        // 走到这里说明上面那次读取之后、这一行之前有人动了 ref。仍然归成
+        // 「基线被挪走了」，但把 git 的原话带上，免得掩盖掉别的失败原因
+        // （比如 ref 目录不可写）。
+        GitError::new(
+            "svn_baseline_moved",
+            format!(
+                "更新基线分支失败——发布前的一瞬间它被别人改了。                 已经建好的 commit 是 {oid}（对象还在，没有丢）。git 原话：{}",
+                e.message
+            ),
+        )
+    })?;
+    Ok(())
+}
+
+/// 建 commit 并发布。`init_hybrid` 与 `rebuild_baseline` 用它，行为与拆分前逐字相同：
+/// 先比对旧值，比对不过就不建 commit。
 pub fn publish_baseline(
     repo_root: &str,
     tree: &str,
@@ -453,40 +511,13 @@ pub fn publish_baseline(
     if current.as_deref() != expected_old {
         return Err(moved_error(expected_old, current.as_deref()));
     }
-
-    // `commit-tree` 的 message **必须走 `-m`，不能走 stdin**：`run_git*` 用的是
-    // `Command::output()`，子进程 stdin 是 null，管道那条路会立刻读到 EOF 并产出
-    // 一个 message 为空的 commit——而 trailer 就写在 message 里，等于基线丢掉
-    // 记账且不报任何错。
-    let msg = format!("svn: r{}\n\n{}\n", t.rev, format_trailer(t));
-    let mut args: Vec<&str> = vec!["commit-tree", tree];
-    if let Some(p) = parent {
-        args.push("-p");
-        args.push(p);
-    }
-    args.push("-m");
-    args.push(&msg);
-    let oid = run_git(repo_root, &args)?.trim().to_string();
-
-    let old = expected_old.unwrap_or(ZERO_OID);
-    run_git(repo_root, &["update-ref", &baseline_ref(), &oid, old]).map_err(|e| {
-        // 走到这里说明上面那次读取之后、这一行之前有人动了 ref。仍然归成
-        // 「基线被挪走了」，但把 git 的原话带上，免得掩盖掉别的失败原因
-        // （比如 ref 目录不可写）。
-        GitError::new(
-            "svn_baseline_moved",
-            format!(
-                "更新基线分支失败——发布前的一瞬间它被别人改了。\
-                 已经建好的 commit 是 {oid}（对象还在，没有丢）。git 原话：{}",
-                e.message
-            ),
-        )
-    })?;
+    let oid = create_baseline_commit(repo_root, tree, parent, t)?;
+    move_baseline_ref(repo_root, &oid, expected_old)?;
     Ok(oid)
 }
 
 /// 基线分支现在指着谁；不存在返回 `None`。
-fn read_baseline(repo_root: &str) -> Result<Option<String>> {
+pub(crate) fn read_baseline(repo_root: &str) -> Result<Option<String>> {
     let (code, out) = run_git_code(repo_root, &["rev-parse", "-q", "--verify", &baseline_ref()])?;
     match code {
         0 => Ok(Some(out.trim().to_string())),
