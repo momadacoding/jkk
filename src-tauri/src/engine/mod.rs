@@ -32,6 +32,7 @@ pub mod svn_pristine;
 pub mod svn_server_set;
 pub mod svn_sync;
 pub mod svn_sync_check;
+pub mod svn_sync_in;
 pub mod svn_sync_stash;
 pub mod svn_wc;
 pub mod svn_xml;

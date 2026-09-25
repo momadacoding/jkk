@@ -12,7 +12,7 @@
 | 2 | 前置检查 | ✅ 完成 | `svn_xml::parse_update_status`、新模块 `svn_sync_check.rs`、fixture `hybrid_with_colleague` + 17 条测试 | RED 已见（两个测试文件编译失败）；4 条变异各自只红对应测试；fmt / clippy 0 告警 / `cargo test` 625 passed 0 failed |
 | 3 | WIP 压栈与取回 | ✅ 完成 | `svn_journal`（`ApplyingStash`、`stash_applied`）、新模块 `svn_sync_stash.rs` + 14 条测试、spec §7.3 S10 注记 / §7.6 phase 表 | RED 已见（两个测试文件编译失败）；8 条变异各自红对应测试；fmt / clippy 0 告警 / `cargo test` 639 passed 0 failed |
 | 4 | 基线录制零件拆分 | ✅ 完成 | `svn_baseline::{create_baseline_commit, move_baseline_ref}`、`read_baseline` 改 `pub(crate)`；`svn_init::record_server_tree_into` + 5 条测试 | RED 已见（两个测试文件编译失败）；fmt / clippy 0 告警 / `cargo test` 644 passed 0 failed |
-| 5 | 编排主路径 S0–S11 + 冲突出口 | ⬜ | | |
+| 5 | 编排主路径 S0–S11 + 冲突出口 | ✅ 完成 | 新模块 `svn_sync_in.rs`、fixture `hybrid_whitelist_in_external` + 11 条测试 | RED 已见（模块不存在，编译失败）；5 条变异中 3 条红对应测试、2 条「覆盖不到」（见下）；fmt / clippy 0 告警 / `cargo test` 655 passed 0 failed |
 | 6 | 继续 / 放弃（含回原分支） | ⬜ | | |
 | 7 | S3 / S4 / S5 失败回退 | ⬜ | | |
 | 7A | 外部整体 update 之后由「更新」接管（A16） | ⬜ | | |
@@ -234,3 +234,41 @@
 
 - `publish_baseline` 仍然先比对旧值、比对不过**不建 commit**，然后才调 `create_baseline_commit` + `move_baseline_ref`；`move_baseline_ref` 自己再比对一次、`update-ref` 带旧值兜住窄竞态——比拆分前多一次读取，语义不变（`publish_is_still_create_then_move` 与既有 `svn_baseline` / `svn_init` 用例钉住）。
 - `record_server_tree` 仍从空索引起步（包装里建 `TempIndex::empty`），初始化与 R2 的录制结果逐字不变；`recording_from_head_agrees_with_recording_from_empty_after_an_update` 证明「磁盘 = 服务器内容」时两种起点录出同一棵树，服务器删掉的文件不会被 HEAD 树带回来。
+
+---
+
+## Task 5：编排主路径 S0–S11 + 冲突出口
+
+### 验证记录
+
+| 步骤 | 实际结果 |
+|---|---|
+| 接口核对 | Consumes 里 Task 2–4 与既有函数（`swap_index_to_tree`、`run_preflight` / `Preflight.{node_rev, repos_root, uuid}`、`read_node_rev`、`check_targets`、`enumerate_wcs`、`read_dirty` → `StatusEntry.{path, item, props}`、`run_svn_code` → `.code / .stderr`、`file_lock::{find_blockers, describe}`、`svn_lock::{acquire, is_held}`）签名均与实际一致 |
+| RED | `svn_sync_in` 模块不存在，编译失败，与计划期望一致 |
+| GREEN | `svn_sync_in` 11 passed，首轮全过（含必测 #49 external 形态） |
+| 变异 1：Conflicted 分支不写 `stash_applied = true` | 只红 `a_stash_conflict_keeps_the_stash_and_marks_it_applied` |
+| 变异 2：rebase 去掉 `--empty=drop` | **不红**——见「计划的错误」 |
+| 变异 3：`capture_and_publish` 改用 `TempIndex::empty` | 不红，计划已预期「覆盖不到」，由 Task 4 的对照测试守着 |
+| 变异 4：`align_index` 直接返回 | 红 `a_plain_update_advances_the_baseline_and_replays_the_branch`（目标），另红 6 条走到 S8 的用例——不对齐索引时 S8 切分支失败，所有走到 S8 的路径都会红，属预期 |
+| 变异 5：`verify_expect` 不比 outside | 只红 `new_outside_changes_since_the_preview_require_reconfirmation` |
+| 全量 | `cargo fmt --check` 0；`cargo clippy --all-targets` 0 告警（计划担心的 `dead_code` 没出现）；`cargo test` 655 passed / 0 failed（49 个测试二进制，= Task 4 的 644 + 本 Task 11） |
+
+### 偏离计划
+
+- 无代码偏离。
+
+### 计划的错误
+
+- 计划期望变异 2（去掉 `--empty=drop`）只红 `a_linear_round_trip_is_not_reported_as_lost`。**2026-09-26 实测（git 2.51.2.windows.1，scratchpad `p2`）**：非交互 `git rebase` 的默认行为本来就是丢弃「变空的提交」；那条用例里的 `to one` 还与新基线是同一个 patch，git 直接以 `patch contents already upstream` 跳过。即使构造「变空但 patch-id 不同」（上游一次改 A+B、本地只改 A），不带参数也照样 drop。所以这条变异在本机**不可观察**，记为「覆盖不到」。保留 `--empty=drop` 是为了不依赖默认值（`-i` 时默认是 `stop`，spec §7.3 S9 写明要显式带）。
+
+### 计划没写的坑
+
+- `tests/common/svn_fixtures.rs` 是纯 LF 文件，追加 fixture 时保持 LF。
+
+### 为什么这么改是安全的
+
+- 本 Task 的四个失败出口（S3 checkout / S4 基线不干净 / S5 update 失败 / S5 冲突）只如实报错、**journal 原样保留**，不做任何回退动作；回退在 Task 7 做。此时 WIP 在按 opid 钉住的 stash 里，不会丢。
+- 锁内先复核（`check_sync_in` + `verify_expect`），不过就在**写 journal 之前**返回：`a_branch_moved_since_the_preview_is_refused`、`new_outside_changes_…` 断言 journal 不存在、没有 stash。
+- S7 的 ref 移动走 `finish_publish` 的三态判断：已是新值（崩溃恢复）/ 仍是旧值（CAS 移动）/ 都不是（停下不覆盖）。
+- `align_index` 用 `swap_index_to_tree` 的 CAS：索引不是旧基线树就停下，不覆盖别的 git 操作留下的索引。
+- 每次 checkout 之后按 A15 核对「在目标分支上且白名单内无被跟踪改动」，不看退出码。
