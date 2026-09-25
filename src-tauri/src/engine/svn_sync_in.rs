@@ -17,7 +17,7 @@
 //! 结束后再补发一次 `repo-changed`（`commands/svn_sync.rs`）。
 
 use crate::engine::file_lock::{describe, find_blockers};
-use crate::engine::git_cli::{run_git, run_git_code};
+use crate::engine::git_cli::{run_git, run_git_code, run_git_env};
 use crate::engine::svn_baseline::{
     create_baseline_commit, git_dir, move_baseline_ref, parse_trailer, read_baseline,
     swap_index_to_tree, TempIndex, Trailer,
@@ -573,4 +573,283 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+// —— 继续 / 放弃（spec §7.6：「提供继续 / 放弃两个入口」）——
+
+/// 往回走的前提（计划 A5 / A12）。
+///
+/// A12 的「S5 还没跑、磁盘上全是 git 写的字节」那一种由 S3 / S4 失败回退引入
+/// （Task 7），在那之前没有构造它的路径，先不定义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Disk {
+    /// S5 可能跑过，或从崩溃里恢复、不知道跑没跑：磁盘上可能是服务器内容，
+    /// `-f` 之前必须先确认那确实是服务器内容（能从服务器取回）。
+    MaybeUpdated,
+}
+
+/// 从中断处接着走。
+pub fn continue_sync(repo: &str) -> Result<SyncInOutcome> {
+    let (_lock, mut j) = take_over(repo)?;
+    let cfg = read_config(repo)?;
+    let j = &mut j;
+    match j.phase {
+        // A10：`start` 的定义就是「还没动任何东西」
+        Phase::Start => {
+            svn_journal::remove(repo)?;
+            Ok(SyncInOutcome::Aborted)
+        }
+        Phase::Stashing => {
+            wip::settle_stashing(repo, j)?;
+            resume_stashed(repo, &cfg, j)
+        }
+        Phase::Stashed => resume_stashed(repo, &cfg, j),
+        Phase::CapturingBaseline => {
+            require_on_old_baseline(repo, j)?;
+            capture_and_publish(repo, &cfg, j)?;
+            from_baseline_ready(repo, &cfg, j)
+        }
+        Phase::PublishingBaseline => {
+            if j.new_baseline_oid.is_some() {
+                // commit 已建：只补发布与索引对齐，不重建另一个 commit（§7.6）
+                require_on_branch(repo, BASELINE_BRANCH)?;
+                finish_publish(repo, j)?;
+            } else {
+                // 没有新 OID = 尚未发布，重新验证前提、重建候选索引（§7.6）
+                require_on_old_baseline(repo, j)?;
+                capture_and_publish(repo, &cfg, j)?;
+            }
+            from_baseline_ready(repo, &cfg, j)
+        }
+        Phase::BaselineReady => from_baseline_ready(repo, &cfg, j),
+        Phase::Rebase => continue_rebase(repo, j),
+        Phase::ApplyingStash => finish_forward(repo, j),
+        _ => Err(sync_out_unsupported()),
+    }
+}
+
+/// 放弃这次同步：回到更新前的分支、放回 WIP。SVN 侧已做的不退回（计划 A5）。
+pub fn abort_sync(repo: &str) -> Result<SyncInOutcome> {
+    let (_lock, mut j) = take_over(repo)?;
+    let cfg = read_config(repo)?;
+    let j = &mut j;
+    let step = match j.phase {
+        Phase::Start => {
+            svn_journal::remove(repo)?;
+            return Ok(SyncInOutcome::Aborted);
+        }
+        Phase::Stashing => {
+            wip::settle_stashing(repo, j)?;
+            back_to_orig(repo, &cfg, j, Disk::MaybeUpdated)?
+        }
+        Phase::Stashed
+        | Phase::CapturingBaseline
+        | Phase::PublishingBaseline
+        | Phase::BaselineReady => back_to_orig(repo, &cfg, j, Disk::MaybeUpdated)?,
+        Phase::Rebase => {
+            if rebase_in_progress(repo)? {
+                run_git(repo, &["rebase", "--abort"])?;
+            }
+            back_to_orig(repo, &cfg, j, Disk::MaybeUpdated)?
+        }
+        Phase::ApplyingStash => {
+            // 放弃接管：stash 条目原样留在列表里（message 带 opid，认得出来），
+            // 只删钉住的 ref 与 journal
+            wip::unpin(repo, &j.opid)?;
+            svn_journal::remove(repo)?;
+            return Ok(SyncInOutcome::Aborted);
+        }
+        _ => return Err(sync_out_unsupported()),
+    };
+    Ok(match step {
+        RestoreStep::Finished => SyncInOutcome::Aborted,
+        RestoreStep::Conflict { files, oid } => SyncInOutcome::StashConflict {
+            files,
+            stash_oid: oid,
+        },
+        RestoreStep::Blocked { collisions, oid } => SyncInOutcome::StashBlocked {
+            collisions,
+            stash_oid: oid,
+        },
+    })
+}
+
+/// 回到原分支并取回 WIP（spec §13「回滚到」一列；计划 A5 / A12 / A15）。
+pub(crate) fn back_to_orig(
+    repo: &str,
+    cfg: &SvnConfig,
+    j: &mut Journal,
+    disk: Disk,
+) -> Result<RestoreStep> {
+    let orig = need(&j.orig_branch, "origBranch")?;
+    let orig_head = need(&j.orig_head, "origHead")?;
+    let branch = current_branch(repo)?;
+    if branch.as_deref() != Some(orig.as_str()) {
+        if branch.as_deref() != Some(BASELINE_BRANCH) {
+            return Err(state_changed(&format!(
+                "HEAD 在 {branch:?} 上，既不是原分支 `{orig}` 也不是基线分支"
+            )));
+        }
+        if disk == Disk::MaybeUpdated {
+            // A5：能 -f 的前提是 W-file 在 svn 看来全部干净 = 磁盘上就是服务器内容
+            let dirty = dirty_w_files(repo, cfg)?;
+            if !dirty.is_empty() {
+                return Err(GitError::new(
+                    "sync_in_unsafe_to_return",
+                    format!(
+                        "要回到分支 `{orig}` 就得覆盖工作区里的文件，而下面这些文件的内容\
+                         既不是 git 写的、也不是服务器上的——不知道是谁改的，不能覆盖：\n{}\n\
+                         记录已保留。请先确认这些改动（需要的话自己备份），再点「放弃」。",
+                        list_paths(&dirty)
+                    ),
+                ));
+            }
+        }
+        checkout_verified(repo, cfg, &orig, true)?;
+    }
+    // HEAD 仍在原分支上（S3 失败时 git 整体拒绝、一个字节没写——计划 A15）
+    // 或刚切回来：都要求分支本身没被动过
+    if rev_parse(repo, "HEAD")? != orig_head {
+        return Err(state_changed(&format!("分支 `{orig}` 的位置变了")));
+    }
+    restore_step(repo, j)
+}
+
+/// 拿锁并在锁内重读 journal。
+fn take_over(repo: &str) -> Result<(svn_lock::SyncLock, Journal)> {
+    let first = svn_journal::read(repo)?.ok_or_else(no_unfinished)?;
+    if first.flow != Flow::SyncIn {
+        return Err(sync_out_unsupported());
+    }
+    let lock = svn_lock::acquire(repo, &first.opid)?;
+    // 拿锁之前那份只用来取 opid；两次读之间可能被另一个进程推进过
+    let j = svn_journal::read(repo)?.ok_or_else(no_unfinished)?;
+    Ok((lock, j))
+}
+
+/// A11：从 `stashed` 接着走之前，确认中断期间没人动过。
+fn resume_stashed(repo: &str, cfg: &SvnConfig, j: &mut Journal) -> Result<SyncInOutcome> {
+    let orig = need(&j.orig_branch, "origBranch")?;
+    let orig_head = need(&j.orig_head, "origHead")?;
+    let base = need(&j.baseline_oid_before, "baselineOidBefore")?;
+    match current_branch(repo)?.as_deref() {
+        Some(b) if b == orig => {
+            if rev_parse(repo, "HEAD")? != orig_head {
+                return Err(state_changed(&format!("分支 `{orig}` 的位置变了")));
+            }
+            if !whitelist_clean(repo, cfg)? {
+                return Err(state_changed(
+                    "中断之后白名单里又有了新的改动（它们不在本次同步的 stash 里）",
+                ));
+            }
+        }
+        Some(b) if b == BASELINE_BRANCH => {
+            if rev_parse(repo, "HEAD")? != base {
+                return Err(state_changed("基线分支的位置变了"));
+            }
+        }
+        other => {
+            return Err(state_changed(&format!(
+                "HEAD 在 {other:?} 上，既不是原分支 `{orig}` 也不是基线分支"
+            )))
+        }
+    }
+    from_stashed(repo, cfg, j, false)
+}
+
+fn continue_rebase(repo: &str, j: &mut Journal) -> Result<SyncInOutcome> {
+    let orig = need(&j.orig_branch, "origBranch")?;
+    if rebase_in_progress(repo)? {
+        // A14：冲突期间锁是放开的，先确认进行中的正是本次同步发起的 rebase
+        let want = format!("refs/heads/{orig}");
+        if rebase_head_name(repo)?.as_deref() != Some(want.as_str()) {
+            return Err(state_changed("进行中的 rebase 不是本次同步发起的那一个"));
+        }
+        let files = unmerged_paths(repo)?;
+        if !files.is_empty() {
+            return Err(unresolved(&files));
+        }
+        // GIT_EDITOR=true：非交互地接受 git 给的提交信息（2026-09-25 实测可行；
+        // 冲突被解成与新基线相同时，--empty=drop 让这一笔直接丢掉，退出 0）
+        if let Err(e) = run_git_env(repo, &["rebase", "--continue"], &[("GIT_EDITOR", "true")]) {
+            return conflict_or_error(repo, e);
+        }
+    }
+    // 不论是我们续完的，还是用户在外面自己走完的，都必须落在同一个状态上
+    if current_branch(repo)?.as_deref() != Some(orig.as_str()) {
+        return Err(state_changed(&format!("HEAD 不在原分支 `{orig}` 上")));
+    }
+    let base = rev_parse(repo, &format!("refs/heads/{BASELINE_BRANCH}"))?;
+    if !is_ancestor(repo, &base, "HEAD")? {
+        return Err(state_changed(
+            "原分支还没有落到新基线上（rebase 可能在外面被中止了）；\
+             要回到更新之前，请点「放弃」",
+        ));
+    }
+    finish_forward(repo, j)
+}
+
+/// `.git/rebase-merge/head-name`（或 `rebase-apply/`）：rebase 的目标分支。
+fn rebase_head_name(repo: &str) -> Result<Option<String>> {
+    let d = git_dir(repo)?;
+    for sub in ["rebase-merge", "rebase-apply"] {
+        let p = d.join(sub).join("head-name");
+        if p.exists() {
+            return Ok(Some(std::fs::read_to_string(p)?.trim().to_string()));
+        }
+    }
+    Ok(None)
+}
+
+fn is_ancestor(repo: &str, a: &str, b: &str) -> Result<bool> {
+    let (code, _) = run_git_code(repo, &["merge-base", "--is-ancestor", a, b])?;
+    match code {
+        0 => Ok(true),
+        1 => Ok(false),
+        _ => Err(GitError::new(
+            "sync_in_state_changed",
+            format!("判断 {a} 是否在 {b} 的历史里失败了（merge-base 退出 {code}）"),
+        )),
+    }
+}
+
+fn whitelist_clean(repo: &str, cfg: &SvnConfig) -> Result<bool> {
+    let roots = normalize_roots(&cfg.whitelist);
+    if roots.is_empty() {
+        return Ok(false); // 空 pathspec 会变成「全部」（§12.2），宁可判不干净
+    }
+    let mut args: Vec<&str> = vec!["status", "--porcelain", "--"];
+    args.extend(roots.iter().map(String::as_str));
+    Ok(run_git(repo, &args)?.trim().is_empty())
+}
+
+fn require_on_branch(repo: &str, name: &str) -> Result<()> {
+    if current_branch(repo)?.as_deref() != Some(name) {
+        return Err(state_changed(&format!("HEAD 不在 `{name}` 上")));
+    }
+    Ok(())
+}
+
+fn require_on_old_baseline(repo: &str, j: &Journal) -> Result<()> {
+    require_on_branch(repo, BASELINE_BRANCH)?;
+    let base = need(&j.baseline_oid_before, "baselineOidBefore")?;
+    if rev_parse(repo, &format!("refs/heads/{BASELINE_BRANCH}"))? != base {
+        return Err(state_changed("基线分支已经不是更新前的位置"));
+    }
+    Ok(())
+}
+
+fn no_unfinished() -> GitError {
+    GitError::new(
+        "sync_no_unfinished",
+        "没有未收尾的同步记录，不需要继续或放弃。",
+    )
+}
+
+fn sync_out_unsupported() -> GitError {
+    GitError::new(
+        "sync_out_not_supported",
+        "这条记录是「交付」流程留下的，本版本还不能替你收尾（Phase 3 提供）。\
+         在那之前请不要手工去动 stash 或分支指针。",
+    )
 }

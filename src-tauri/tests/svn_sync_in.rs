@@ -5,11 +5,18 @@ mod svn_fixtures;
 
 use app_lib::engine::git_cli::run_git;
 use app_lib::engine::svn_baseline::parse_trailer;
+use app_lib::engine::svn_baseline::{create_baseline_commit, TempIndex, Trailer};
+use app_lib::engine::svn_config::read_config;
+use app_lib::engine::svn_init::record_server_tree_into;
 use app_lib::engine::svn_journal::{self, Phase};
+use app_lib::engine::svn_journal::{Flow, Journal};
 use app_lib::engine::svn_lock;
+use app_lib::engine::svn_preflight::run_preflight;
 use app_lib::engine::svn_sync::{check_sync, SyncVerdict};
 use app_lib::engine::svn_sync_check::preview_sync_in;
+use app_lib::engine::svn_sync_in::{abort_sync, continue_sync};
 use app_lib::engine::svn_sync_in::{run_sync_in, SyncInExpect, SyncInOutcome};
+use app_lib::engine::svn_sync_stash::stash_wip;
 use svn_fixtures::{hybrid_with_colleague, SvnFixture};
 
 fn git(fx: &SvnFixture, args: &[&str]) -> String {
@@ -245,5 +252,489 @@ fn a_whitelist_inside_a_same_repo_external_updates() {
         t.url.ends_with("/repo"),
         "trailer 记 Repository Root，不是 external 的 URL：{}",
         t.url
+    );
+}
+
+// —— 造现场 ——
+
+/// 同事改了 A.cs；你在 work 上提交过 B.cs，手上还有一份未提交的 B.cs 改动。
+fn with_wip(fx: &SvnFixture) {
+    fx.colleague_commits("Code/A.cs", "a2\n");
+    write(fx, "Code/B.cs", "b-local\n");
+    commit(fx, "local");
+    write(fx, "Code/B.cs", "b-wip\n");
+}
+
+/// 刚走完 S0。
+fn s0(fx: &SvnFixture, opid: &str) -> Journal {
+    let p = preview_sync_in(&fx.wc_str()).unwrap();
+    let j = Journal {
+        opid: opid.into(),
+        flow: Flow::SyncIn,
+        phase: Phase::Start,
+        started_at: 1,
+        orig_branch: Some(p.orig_branch),
+        orig_head: Some(p.orig_head),
+        baseline_rev_before: Some(p.baseline_rev),
+        baseline_oid_before: Some(p.baseline_oid),
+        ..Default::default()
+    };
+    svn_journal::write(&fx.wc_str(), &j).unwrap();
+    j
+}
+
+/// 刚走完 S1：WIP 已压栈，phase = stashed。
+fn s1(fx: &SvnFixture, opid: &str) -> Journal {
+    let mut j = s0(fx, opid);
+    stash_wip(&fx.wc_str(), &mut j, &["Code/".to_string()]).unwrap();
+    j
+}
+
+/// 刚走完 S5：HEAD 在 svn/base、工作副本已更新，phase = capturing-baseline。
+fn s5(fx: &SvnFixture, opid: &str) -> Journal {
+    let mut j = s1(fx, opid);
+    git(fx, &["checkout", "-q", "svn/base"]);
+    svn_fixtures::svn_cmd(&fx.wc(), &["update", "--non-interactive"]);
+    j.phase = Phase::CapturingBaseline;
+    svn_journal::write(&fx.wc_str(), &j).unwrap();
+    j
+}
+
+/// 按 S7 的做法录出新基线 commit（不发布）。
+fn built_commit(fx: &SvnFixture, j: &Journal, rev_override: Option<u64>) -> (String, String) {
+    let root = fx.wc_str();
+    let cfg = read_config(&root).unwrap();
+    let pre = run_preflight(&root, &cfg.whitelist).unwrap();
+    let (tree, _) =
+        record_server_tree_into(&root, &cfg, &pre, &TempIndex::from_head(&root).unwrap()).unwrap();
+    let t = Trailer {
+        url: pre.repos_root,
+        rev: rev_override.unwrap_or(pre.node_rev),
+        uuid: pre.uuid,
+    };
+    let c = create_baseline_commit(&root, &tree, j.baseline_oid_before.as_deref(), &t).unwrap();
+    (tree, c)
+}
+
+fn rebase_conflict(fx: &SvnFixture) {
+    fx.colleague_commits("Code/A.cs", "a-server\n");
+    write(fx, "Code/A.cs", "a-local\n");
+    commit(fx, "local A");
+    write(fx, "Code/B.cs", "b-wip\n");
+    assert!(matches!(sync(fx), SyncInOutcome::RebaseConflict { .. }));
+}
+
+// —— start ——
+
+#[test]
+fn continue_from_start_just_clears_the_record() {
+    let fx = hybrid_with_colleague();
+    s0(&fx, "op-s0");
+    assert_eq!(continue_sync(&fx.wc_str()).unwrap(), SyncInOutcome::Aborted);
+    assert_eq!(phase(&fx), None);
+}
+
+#[test]
+fn abort_from_start_just_clears_the_record() {
+    let fx = hybrid_with_colleague();
+    s0(&fx, "op-s0a");
+    assert_eq!(abort_sync(&fx.wc_str()).unwrap(), SyncInOutcome::Aborted);
+    assert_eq!(phase(&fx), None);
+}
+
+// —— stashing（必测 #16 的 S1 部分、#32）——
+
+#[test]
+fn continue_from_stashing_with_a_landed_push() {
+    // 崩在 `git stash push` 之后、写 stashOid 之前：journal 只说 stashing
+    let fx = hybrid_with_colleague();
+    with_wip(&fx);
+    let mut j = s0(&fx, "op-landed");
+    j.phase = Phase::Stashing;
+    j.stash_ref_before = None;
+    svn_journal::write(&fx.wc_str(), &j).unwrap();
+    git(
+        &fx,
+        &[
+            "stash",
+            "push",
+            "-u",
+            "-m",
+            "mygitclient-sync:op-landed",
+            "--",
+            "Code",
+        ],
+    );
+
+    assert_eq!(
+        continue_sync(&fx.wc_str()).unwrap(),
+        SyncInOutcome::Done { new_rev: 2 }
+    );
+    assert_eq!(
+        read(&fx, "Code/B.cs"),
+        "b-wip\n",
+        "不静默丢掉那条匿名 stash"
+    );
+    assert_eq!(our_stashes(&fx), 0);
+}
+
+#[test]
+fn abort_from_stashing_that_never_landed_changes_nothing() {
+    let fx = hybrid_with_colleague();
+    with_wip(&fx);
+    let mut j = s0(&fx, "op-never");
+    j.phase = Phase::Stashing;
+    svn_journal::write(&fx.wc_str(), &j).unwrap();
+    assert_eq!(abort_sync(&fx.wc_str()).unwrap(), SyncInOutcome::Aborted);
+    assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
+    assert_eq!(phase(&fx), None);
+}
+
+// —— stashed ——
+
+#[test]
+fn continue_from_stashed_on_the_original_branch() {
+    let fx = hybrid_with_colleague();
+    with_wip(&fx);
+    s1(&fx, "op-st1");
+    assert_eq!(
+        continue_sync(&fx.wc_str()).unwrap(),
+        SyncInOutcome::Done { new_rev: 2 }
+    );
+    assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
+}
+
+#[test]
+fn continue_from_stashed_on_the_baseline_branch() {
+    // 崩在 S3 之后
+    let fx = hybrid_with_colleague();
+    with_wip(&fx);
+    s1(&fx, "op-st2");
+    git(&fx, &["checkout", "-q", "svn/base"]);
+    assert_eq!(
+        continue_sync(&fx.wc_str()).unwrap(),
+        SyncInOutcome::Done { new_rev: 2 }
+    );
+    assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
+}
+
+#[test]
+fn continue_from_stashed_refuses_changes_made_after_the_crash() {
+    // A11：锁在崩溃后不存在，用户可能已经在工作区里继续改了
+    let fx = hybrid_with_colleague();
+    with_wip(&fx);
+    s1(&fx, "op-st3");
+    write(&fx, "Code/A.cs", "edited-after-crash\n");
+    assert_eq!(
+        continue_sync(&fx.wc_str()).unwrap_err().code,
+        "sync_in_state_changed"
+    );
+    assert_eq!(phase(&fx), Some(Phase::Stashed), "记录原样保留");
+    assert_eq!(read(&fx, "Code/A.cs"), "edited-after-crash\n");
+}
+
+#[test]
+fn abort_from_stashed_restores_the_wip() {
+    let fx = hybrid_with_colleague();
+    with_wip(&fx);
+    let j = s1(&fx, "op-st4");
+    assert_eq!(abort_sync(&fx.wc_str()).unwrap(), SyncInOutcome::Aborted);
+    assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
+    assert_eq!(git(&fx, &["rev-parse", "HEAD"]), j.orig_head.unwrap());
+    assert_eq!(phase(&fx), None);
+    assert_eq!(our_stashes(&fx), 0);
+}
+
+// —— capturing-baseline ——
+
+#[test]
+fn continue_from_capturing_baseline() {
+    let fx = hybrid_with_colleague();
+    with_wip(&fx);
+    s5(&fx, "op-cap");
+    assert_eq!(
+        continue_sync(&fx.wc_str()).unwrap(),
+        SyncInOutcome::Done { new_rev: 2 }
+    );
+    assert_eq!(baseline_rev(&fx), 2);
+    assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
+}
+
+#[test]
+fn abort_after_the_update_returns_to_the_original_branch() {
+    // A5：S5 已经做完，SVN 退不回去；回到原分支、放回 WIP，基线不动 → 失同步
+    let fx = hybrid_with_colleague();
+    with_wip(&fx);
+    let j = s5(&fx, "op-cap-a");
+    assert_eq!(abort_sync(&fx.wc_str()).unwrap(), SyncInOutcome::Aborted);
+    assert_eq!(git(&fx, &["symbolic-ref", "--short", "HEAD"]), "work");
+    assert_eq!(git(&fx, &["rev-parse", "HEAD"]), j.orig_head.unwrap());
+    assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
+    assert_eq!(read(&fx, "Code/A.cs"), "a1\n", "工作区回到原分支的内容");
+    assert_eq!(baseline_rev(&fx), 1, "基线没发布");
+    assert!(
+        matches!(
+            check_sync(&fx.wc_str()).unwrap().verdict,
+            SyncVerdict::Diverged { .. }
+        ),
+        "工作副本已在 r2、基线还是 r1——如实报失同步，引导重建基线"
+    );
+}
+
+#[test]
+fn abort_after_the_update_refuses_to_overwrite_unknown_changes() {
+    // A5 的护栏：W-file 在 svn 看来不干净，说明磁盘上不全是服务器内容，不能 -f
+    let fx = hybrid_with_colleague();
+    with_wip(&fx);
+    s5(&fx, "op-cap-g");
+    write(&fx, "Code/A.cs", "someone-edited\n");
+    assert_eq!(
+        abort_sync(&fx.wc_str()).unwrap_err().code,
+        "sync_in_unsafe_to_return"
+    );
+    assert_eq!(
+        read(&fx, "Code/A.cs"),
+        "someone-edited\n",
+        "一个字节都没覆盖"
+    );
+    assert_eq!(phase(&fx), Some(Phase::CapturingBaseline));
+}
+
+// —— publishing-baseline（必测 #73 的 S7 部分）——
+
+#[test]
+fn continue_from_publishing_with_the_commit_built_but_not_published() {
+    let fx = hybrid_with_colleague();
+    with_wip(&fx);
+    let mut j = s5(&fx, "op-pub1");
+    let (tree, c) = built_commit(&fx, &j, None);
+    j.phase = Phase::PublishingBaseline;
+    j.capture_tree = Some(tree);
+    j.new_baseline_oid = Some(c.clone());
+    svn_journal::write(&fx.wc_str(), &j).unwrap();
+
+    assert_eq!(
+        continue_sync(&fx.wc_str()).unwrap(),
+        SyncInOutcome::Done { new_rev: 2 }
+    );
+    assert_eq!(
+        git(&fx, &["rev-parse", "svn/base"]),
+        c,
+        "发布的就是记下来的那个 commit，没有重录"
+    );
+}
+
+#[test]
+fn continue_from_publishing_after_the_ref_already_moved() {
+    let fx = hybrid_with_colleague();
+    with_wip(&fx);
+    let mut j = s5(&fx, "op-pub2");
+    let (tree, c) = built_commit(&fx, &j, None);
+    let old = j.baseline_oid_before.clone().unwrap();
+    j.phase = Phase::PublishingBaseline;
+    j.capture_tree = Some(tree);
+    j.new_baseline_oid = Some(c.clone());
+    svn_journal::write(&fx.wc_str(), &j).unwrap();
+    git(&fx, &["update-ref", "refs/heads/svn/base", &c, &old]); // 崩在移动 ref 之后
+
+    assert_eq!(
+        continue_sync(&fx.wc_str()).unwrap(),
+        SyncInOutcome::Done { new_rev: 2 }
+    );
+    assert_eq!(git(&fx, &["rev-parse", "svn/base"]), c);
+}
+
+#[test]
+fn continue_from_publishing_refuses_a_baseline_moved_by_someone_else() {
+    let fx = hybrid_with_colleague();
+    with_wip(&fx);
+    let mut j = s5(&fx, "op-pub3");
+    let (tree, c) = built_commit(&fx, &j, None);
+    let (_, other) = built_commit(&fx, &j, Some(99));
+    let old = j.baseline_oid_before.clone().unwrap();
+    j.phase = Phase::PublishingBaseline;
+    j.capture_tree = Some(tree);
+    j.new_baseline_oid = Some(c);
+    svn_journal::write(&fx.wc_str(), &j).unwrap();
+    git(&fx, &["update-ref", "refs/heads/svn/base", &other, &old]);
+
+    assert_eq!(
+        continue_sync(&fx.wc_str()).unwrap_err().code,
+        "svn_baseline_moved"
+    );
+    assert_eq!(
+        git(&fx, &["rev-parse", "svn/base"]),
+        other,
+        "别人的不被覆盖"
+    );
+    assert_eq!(phase(&fx), Some(Phase::PublishingBaseline));
+}
+
+// —— rebase（必测 #69 的 S9 部分）——
+
+#[test]
+fn continue_after_resolving_a_rebase_conflict() {
+    let fx = hybrid_with_colleague();
+    rebase_conflict(&fx);
+    write(&fx, "Code/A.cs", "a-resolved\n");
+    git(&fx, &["add", "Code/A.cs"]);
+    assert_eq!(
+        continue_sync(&fx.wc_str()).unwrap(),
+        SyncInOutcome::Done { new_rev: 2 }
+    );
+    assert_eq!(read(&fx, "Code/A.cs"), "a-resolved\n");
+    assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
+    assert_eq!(phase(&fx), None);
+}
+
+#[test]
+fn continue_with_unresolved_files_is_refused() {
+    let fx = hybrid_with_colleague();
+    rebase_conflict(&fx);
+    let err = continue_sync(&fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "sync_in_unresolved");
+    assert!(err.message.contains("Code/A.cs"));
+    assert_eq!(phase(&fx), Some(Phase::Rebase));
+}
+
+#[test]
+fn abort_a_rebase_conflict_goes_back_to_before() {
+    let fx = hybrid_with_colleague();
+    let before_head = {
+        fx.colleague_commits("Code/A.cs", "a-server\n");
+        write(&fx, "Code/A.cs", "a-local\n");
+        commit(&fx, "local A");
+        write(&fx, "Code/B.cs", "b-wip\n");
+        git(&fx, &["rev-parse", "HEAD"])
+    };
+    assert!(matches!(sync(&fx), SyncInOutcome::RebaseConflict { .. }));
+    assert_eq!(abort_sync(&fx.wc_str()).unwrap(), SyncInOutcome::Aborted);
+    assert_eq!(git(&fx, &["rev-parse", "HEAD"]), before_head);
+    assert_eq!(read(&fx, "Code/A.cs"), "a-local\n");
+    assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
+    assert_eq!(
+        baseline_rev(&fx),
+        2,
+        "基线保持新的；分支落后于它，是 Phase 1 就有的合法状态"
+    );
+    assert!(!fx.wc().join(".git/rebase-merge").exists());
+}
+
+#[test]
+fn continue_refuses_when_the_branch_moved_during_a_conflict() {
+    // Review Focus 4 / A14：冲突期间锁是放开的
+    let fx = hybrid_with_colleague();
+    rebase_conflict(&fx);
+    git(&fx, &["rebase", "--abort"]);
+    git(&fx, &["checkout", "-q", "-b", "elsewhere"]);
+    assert_eq!(
+        continue_sync(&fx.wc_str()).unwrap_err().code,
+        "sync_in_state_changed"
+    );
+    assert_eq!(phase(&fx), Some(Phase::Rebase));
+    assert_eq!(our_stashes(&fx), 1, "WIP 还在");
+}
+
+#[test]
+fn continue_refuses_when_the_rebase_was_aborted_outside() {
+    // A14 的另一半：用户在外面 `git rebase --abort`，人还在原分支上。分支名对得上，
+    // 只有「原分支是否已落在新基线上」这道复核能拦住——否则 S10 会把 WIP 放到
+    // 没有重放过的旧分支上，然后 drop 掉 stash、宣布完成
+    let fx = hybrid_with_colleague();
+    rebase_conflict(&fx);
+    git(&fx, &["rebase", "--abort"]);
+    assert_eq!(git(&fx, &["symbolic-ref", "--short", "HEAD"]), "work");
+    assert_eq!(
+        continue_sync(&fx.wc_str()).unwrap_err().code,
+        "sync_in_state_changed"
+    );
+    assert_eq!(phase(&fx), Some(Phase::Rebase));
+    assert_eq!(our_stashes(&fx), 1, "WIP 还在");
+}
+
+// —— applying-stash ——
+
+#[test]
+fn continue_after_resolving_a_stash_conflict_drops_the_stash() {
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/A.cs", "a-server\n");
+    write(&fx, "Code/A.cs", "a-wip\n");
+    assert!(matches!(sync(&fx), SyncInOutcome::StashConflict { .. }));
+    write(&fx, "Code/A.cs", "a-merged\n");
+    git(&fx, &["add", "Code/A.cs"]);
+    assert_eq!(
+        continue_sync(&fx.wc_str()).unwrap(),
+        SyncInOutcome::Done { new_rev: 2 }
+    );
+    assert_eq!(our_stashes(&fx), 0);
+    assert_eq!(read(&fx, "Code/A.cs"), "a-merged\n");
+    assert_eq!(phase(&fx), None);
+}
+
+#[test]
+fn continue_after_moving_a_colliding_file_applies_the_stash() {
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/N.cs", "server\n");
+    write(&fx, "Code/B.cs", "b-wip\n");
+    write(&fx, "Code/N.cs", "mine\n");
+    assert!(matches!(sync(&fx), SyncInOutcome::StashBlocked { .. }));
+    std::fs::rename(fx.wc().join("Code/N.cs"), fx.wc().join("Code/N.server.cs")).unwrap();
+    assert_eq!(
+        continue_sync(&fx.wc_str()).unwrap(),
+        SyncInOutcome::Done { new_rev: 2 }
+    );
+    assert_eq!(read(&fx, "Code/N.cs"), "mine\n");
+    assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
+    assert_eq!(phase(&fx), None);
+}
+
+#[test]
+fn abort_while_applying_the_stash_keeps_the_stash_for_the_user() {
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/N.cs", "server\n");
+    write(&fx, "Code/B.cs", "b-wip\n");
+    write(&fx, "Code/N.cs", "mine\n");
+    assert!(matches!(sync(&fx), SyncInOutcome::StashBlocked { .. }));
+    assert_eq!(abort_sync(&fx.wc_str()).unwrap(), SyncInOutcome::Aborted);
+    assert_eq!(our_stashes(&fx), 1, "备份留在 stash 列表里给用户");
+    assert_eq!(
+        git(&fx, &["for-each-ref", "refs/mygitclient/"]),
+        "",
+        "钉住的 ref 已删"
+    );
+    assert_eq!(phase(&fx), None);
+}
+
+// —— 边界 ——
+
+#[test]
+fn a_sync_out_journal_is_not_touched() {
+    // A13
+    let fx = hybrid_with_colleague();
+    let j = Journal {
+        opid: "out".into(),
+        flow: Flow::SyncOut,
+        phase: Phase::Prepare,
+        started_at: 1,
+        ..Default::default()
+    };
+    svn_journal::write(&fx.wc_str(), &j).unwrap();
+    assert_eq!(
+        continue_sync(&fx.wc_str()).unwrap_err().code,
+        "sync_out_not_supported"
+    );
+    assert_eq!(
+        abort_sync(&fx.wc_str()).unwrap_err().code,
+        "sync_out_not_supported"
+    );
+    assert_eq!(phase(&fx), Some(Phase::Prepare));
+}
+
+#[test]
+fn continue_without_a_record_says_so() {
+    let fx = hybrid_with_colleague();
+    assert_eq!(
+        continue_sync(&fx.wc_str()).unwrap_err().code,
+        "sync_no_unfinished"
     );
 }

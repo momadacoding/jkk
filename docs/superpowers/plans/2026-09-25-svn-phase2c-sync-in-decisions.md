@@ -13,7 +13,7 @@
 | 3 | WIP 压栈与取回 | ✅ 完成 | `svn_journal`（`ApplyingStash`、`stash_applied`）、新模块 `svn_sync_stash.rs` + 14 条测试、spec §7.3 S10 注记 / §7.6 phase 表 | RED 已见（两个测试文件编译失败）；8 条变异各自红对应测试；fmt / clippy 0 告警 / `cargo test` 639 passed 0 failed |
 | 4 | 基线录制零件拆分 | ✅ 完成 | `svn_baseline::{create_baseline_commit, move_baseline_ref}`、`read_baseline` 改 `pub(crate)`；`svn_init::record_server_tree_into` + 5 条测试 | RED 已见（两个测试文件编译失败）；fmt / clippy 0 告警 / `cargo test` 644 passed 0 failed |
 | 5 | 编排主路径 S0–S11 + 冲突出口 | ✅ 完成 | 新模块 `svn_sync_in.rs`、fixture `hybrid_whitelist_in_external` + 11 条测试 | RED 已见（模块不存在，编译失败）；5 条变异中 3 条红对应测试、2 条「覆盖不到」（见下）；fmt / clippy 0 告警 / `cargo test` 655 passed 0 failed |
-| 6 | 继续 / 放弃（含回原分支） | ⬜ | | |
+| 6 | 继续 / 放弃（含回原分支） | ✅ 完成 | `svn_sync_in::{continue_sync, abort_sync, back_to_orig, Disk}` 等 + 24 条测试（计划 23 + 补 1） | RED 已见（编译失败）；5 条变异各自红对应测试（第 3 条靠补的用例）；fmt / clippy 0 告警 / `cargo test` 679 passed 0 failed |
 | 7 | S3 / S4 / S5 失败回退 | ⬜ | | |
 | 7A | 外部整体 update 之后由「更新」接管（A16） | ⬜ | | |
 | 8 | Tauri 命令 | ⬜ | | |
@@ -272,3 +272,41 @@
 - S7 的 ref 移动走 `finish_publish` 的三态判断：已是新值（崩溃恢复）/ 仍是旧值（CAS 移动）/ 都不是（停下不覆盖）。
 - `align_index` 用 `swap_index_to_tree` 的 CAS：索引不是旧基线树就停下，不覆盖别的 git 操作留下的索引。
 - 每次 checkout 之后按 A15 核对「在目标分支上且白名单内无被跟踪改动」，不看退出码。
+
+---
+
+## Task 6：继续 / 放弃（含「回到原分支」）
+
+### 验证记录
+
+| 步骤 | 实际结果 |
+|---|---|
+| RED | `continue_sync` / `abort_sync` 不存在，编译失败，与计划期望一致 |
+| GREEN | `svn_sync_in` 34 passed（Task 5 的 11 + 本 Task 23），首轮全过 |
+| 变异 1：`back_to_orig` 去掉 `dirty_w_files` 断言 | 只红 `abort_after_the_update_refuses_to_overwrite_unknown_changes` |
+| 变异 2：`resume_stashed` 去掉 `whitelist_clean` | 只红 `continue_from_stashed_refuses_changes_made_after_the_crash` |
+| 变异 3：`continue_rebase` 去掉 `is_ancestor` 复核 | 计划用例**不红**（被前面的 `current_branch` 复核先挡住，计划已预判）；按计划补 `continue_refuses_when_the_rebase_was_aborted_outside` 后只红它 |
+| 变异 4：`finish_publish` 的 `cur == new` 再 `move_baseline_ref` | 只红 `continue_from_publishing_after_the_ref_already_moved` |
+| 变异 5：`abort_sync` 的 `ApplyingStash` 改成 `drop_wip` | 只红 `abort_while_applying_the_stash_keeps_the_stash_for_the_user` |
+| 全量 | `cargo fmt --check` 0；`cargo clippy --all-targets` 0 告警；`cargo test` 679 passed / 0 failed（49 个测试二进制，= Task 5 的 655 + 本 Task 24） |
+
+### 偏离计划
+
+- **`Disk::GitOnly` 推迟到 Task 7 再定义**。计划本 Task 就定义两个变体，但 `GitOnly` 只有 Task 7 的 S3 / S4 失败回退会构造，本 Task 编译出 `variant GitOnly is never constructed` 告警。照计划 Task 5 对 `dead_code` 的规矩（不加 `#[allow]`，推迟到有调用方的 Task 再写），先只留 `MaybeUpdated`，文档里写明 A12 那一种由 Task 7 引入。
+- 新增用例 `continue_refuses_when_the_rebase_was_aborted_outside`（计划 Step 5 第 3 行明写的补救）：外面 `rebase --abort` 后人还在 `work` 上，分支名对得上，只有 `is_ancestor` 能拦住——否则 S10 会把 WIP 放到没重放过的旧分支上、drop 掉 stash、宣布完成。
+
+### 计划的错误
+
+- 无。
+
+### 计划没写的坑
+
+- 无新坑。`rebase --continue` 走 `run_git_env` 带 `GIT_EDITOR=true`，与计划实测一致。
+
+### 为什么这么改是安全的
+
+- 继续 / 放弃都**先拿锁、在锁内重读 journal**（`take_over`），`flow = sync_out` 的一律不碰（A13，测试钉住 journal 原样）。
+- 从 `stashed` 继续前复核 HEAD / 分支 / 白名单干净 / 基线位置（A11）；不过就停下，journal 与 stash 原样。
+- 放弃时 HEAD 在 `svn/base` 上：先断言白名单内 W-file 在 svn 看来全部干净（= 磁盘上是可从服务器取回的内容），才 `checkout -f` 回原分支（A5）；不干净返回 `sync_in_unsafe_to_return`，一个字节不覆盖（测试钉住）。
+- `applying-stash` 放弃只删钉住的 ref 与 journal，stash 条目留给用户（message 带 opid 认得出来）。
+- `rebase` 继续前复核进行中的 rebase 的 `head-name` 是 `refs/heads/<origBranch>`，且结束后原分支必须以新基线为祖先。
