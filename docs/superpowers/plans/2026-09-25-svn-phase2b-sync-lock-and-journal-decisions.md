@@ -21,6 +21,7 @@
 | 6 | 「上次同步未完成」的检测与展示 | 🟡 代码完成，待真实窗口验证 | `commands/svn.rs`、`lib.rs`、`svnJournal.ts`、`svnJournal.test.ts`、`repoStore.ts`、`BaselineBanner.tsx`、`RepoTab.tsx`、`tests/svn_backend.rs`、spec §5.1.2 + §18 | `cargo test` **590 passed**；`pnpm test` **378 passed**（新增 9）；`pnpm build` OK。**`pnpm tauri dev` 未跑** |
 | 7 | 修入独立 review 的 3 条阻断 + 7 条非阻断 | 完成 | svn_lock.rs、svn_journal.rs、commands/ops.rs、commands/svn.rs、svn_write_guard.rs、svn_lock.rs 测试、svnJournal.ts、repoStore.ts、RepoTab.tsx、E2E | cargo test 595 passed；pnpm test 379 passed；变异验证 x3 |
 | 8 | 修入第二轮独立 review 的 4 条（2026-09-25） | ✅ 完成 | `svnJournal.ts`、`svnJournal.test.ts`（+2）、`repoStore.ts`、`BaselineBanner.tsx`、E2E 清单、spec §5.1.2 + §18、本文件 | `pnpm build` OK；`pnpm test` **381 passed**（+2，先红后绿）；Rust 未改，未跑 cargo |
+| 9 | 锁的出现 / 释放界面自己跟上（用户指出 E2E 要求「重开标签页」不合理） | ✅ 完成 | `commands/watch.rs`（+3 单元测试）、`svn_lock.rs`（`LOCK_FILE` 改 `pub`）、`svnJournal.ts`、`svnJournal.test.ts`（+2）、`repoStore.ts`、E2E 清单 | `cargo fmt --check` OK；clippy 0 告警；`cargo test` **598 passed**（+3）；`pnpm build` OK；`pnpm test` **383 passed**（+2）；变异 ×1；E2E 代码块 PS 5.1 / 7 实跑通过 |
 | 收尾 | E2E 清单 + 独立 review | 完成 | E2E 清单已写；review 已跑两轮并修入 | 真实窗口仍待用户实跑 |
 
 ## 全量验证
@@ -29,9 +30,9 @@
 |---|---|
 | `cargo fmt --check` | ✅ OK |
 | `cargo clippy --all-targets` | ✅ **0 告警** |
-| `cargo test` | ✅ **595 passed / 0 failed**（基线 567，新增 28） |
+| `cargo test` | ✅ **598 passed / 0 failed**（基线 567，新增 31；Task 9 +3） |
 | `pnpm build` | ✅ OK（含 `tsc`） |
-| `pnpm test` | ✅ **381 passed**（基线 369，新增 12；Task 8 +2） |
+| `pnpm test` | ✅ **383 passed**（基线 369，新增 14；Task 8 +2，Task 9 +2） |
 | `pnpm tauri dev` 真实窗口 | ⬜ **未跑** —— 新增命令 `svn_sync_state` 的 invoke 路径尚未验证（`AGENTS.md` §7.3 硬性要求），待用户实跑 |
 
 > 本仓库没有 PR 门禁 CI（`AGENTS.md` §4.1）。以上全部要本地实跑，如实填。
@@ -597,6 +598,17 @@ BOM 部分用 Windows PowerShell 5.1 实测过：`Set-Content -Encoding utf8` �
 
 - **Ctrl+C 不等于进程退出。** 在交互式 PowerShell 里，Ctrl+C 只中断当前管道，会话
   变量里的 `FileStream` 仍然开着。手工造锁的步骤必须显式 `Close()` 或关掉会话。
+- **E2E 清单里的 `<WC>` 是占位符，没法复制粘贴**（用户指出）。PowerShell 会把 `<`
+  当成重定向直接报错；此前交接文档却声称清单「复制粘贴可跑」。另有三处同类问题：
+  场景 1 第 4 / 5 步只有描述没有命令；第 0 节写「任选一个混合仓库」，而场景 3
+  要点「暂存」，违反 `AGENTS.md` 最高优先级那条；状态表的测试数字过期。
+  改法：第 0 节自动定位 `$env:TEMP` 下最新的 `phase1c_*` fixture 设 `$WC`，并校验
+  `.git` 已存在；所有命令改用 `Join-Path $WC ...`；持锁窗口的代码块自带定位逻辑，
+  不依赖另一个会话的变量；补齐缺的命令与收尾删除。
+  **验证方式**：把清单里的 14 个 `powershell` 代码块按原文抽出来，在一次性假 fixture
+  上依次执行，每步后断言文件状态（无 BOM、锁被持有 / 已释放、残锁文件仍在、收尾
+  删干净），Windows PowerShell 5.1 与 PowerShell 7.6 **均全部通过**。第 0.1 / 0.2 两块
+  （起应用、跑 fixture 脚本）没有在这个流程里执行。
 - 后端 `svn_journal_corrupt` 的报错原文已经是完整句子（带路径和「请勿删除」），
   前端再套一层括号会出现「。）。」。红条正文改为原文直接接在一句前缀后面。
 
@@ -622,3 +634,90 @@ BOM 部分用 Windows PowerShell 5.1 实测过：`Set-Content -Encoding utf8` �
 **已知覆盖盲区**：store 里「catch 写 `{ readError }` 而不是 `null`」这一行只有 `tsc`
 和 E2E 第 5 步盖着。`null` 也是合法类型，把它改回 `null` 时 `tsc` 不会报错；
 vitest 只覆盖纯逻辑层。本仓库目前没有 store 层的测试基建，这一行靠 E2E 兜。
+
+---
+
+## Task 9：锁的出现 / 释放，界面要自己跟上（2026-09-25）
+
+用户在看 E2E 场景 3 时指出：「释放锁之后要在 app 里关掉 tab 再重新打开」这个要求
+不合理——别的持锁者不可能通知你去重开。复核成立，而且**不是清单写法的问题，是
+代码缺陷**：清单里的「重开」恰好把它绕了过去。用户选了方案 C（下面 A + B）。
+
+### 根因
+
+横幅只在「打开仓库」与 `repo-changed` 时刷新，而锁的状态变化几乎都不产生这个事件：
+
+| 情形 | 修之前触发 `repo-changed` 吗 | 原因 |
+|---|---|---|
+| 另一个进程拿锁（建锁文件） | ❌ | `watch.rs::is_relevant` 把 `.git/` 下所有 `*.lock` 当 git 噪声过滤，`mygitclient-sync.lock` 一起被吞 |
+| 正常释放（`Drop` 删锁文件） | ❌ | 同上 |
+| 崩溃 / 只关句柄 | ❌ | 文件根本没变，文件系统不产生任何事件 |
+
+后果：黄条一直挂着、一直压着其余横幅，直到工作区碰巧有别的变动。守卫是每次调用
+实时判定的，所以**写操作**释放后立刻能用，只是界面说它会被拒。2c 里更糟：若
+`sync_in` 收尾时先删 journal、后放锁，删 journal 那次刷新读到的仍是「锁被持有」，
+此后再没有事件，横幅永久卡在「正在同步」。
+
+### 修法
+
+- **B（后端）**：`is_relevant` 对文件名等于 `svn_lock::LOCK_FILE` 的路径直接判相关，
+  git 自己的 `*.lock` 仍过滤。`LOCK_FILE` 因此从私有改 `pub`。
+- **A（前端）**：`needsLockPolling(state)`（纯函数，只在 `SyncState.locked` 为真时为真）
+  + `useRepoEffects` 里一个 effect：条件为真时每 `SYNC_LOCK_POLL_MS`（2000）调一次
+  `refreshSvnSyncState`；读到解锁后条件变假，effect 清理定时器，轮询自停。没有锁
+  时不装任何定时器。
+
+### 偏离计划
+
+- 计划与 spec 都没有「锁被持有期间轮询」这一条，是本 Task 新增。spec §5.1 只要求
+  「读不阻塞」与「显示持锁者」，没说界面怎么得知状态变化——这是计划的遗漏，不是
+  与 spec 冲突，所以没改 spec。
+- `readError`（journal 读不出来）**不**轮询：坏的是 journal，轮询不会让它变好；修好
+  文件本身会发 `repo-changed`。
+
+### 计划没写的坑
+
+- **放开过滤可能形成刷新回路。** 界面探测锁要打开锁文件（`probe` 独占打开、`holder`
+  宽松读）。若打开本身产生事件，放开过滤后就是「刷新 → 探测 → 事件 → 刷新」，每
+  300ms 一轮。用真 notify watcher 实测：**两条探测路径（无人持有 / 有人持有）各 5 次，
+  1 秒内零相关事件**。测试 `probing_the_sync_lock_does_not_trigger_a_refresh` 固定了
+  这一点，并带**正对照**（真往锁文件追加一个字节，必须收到相关事件）——没有正对照
+  的话，「没收到事件」可能只是 watcher 没挂上。
+- **E2E 造锁要先拿句柄再写内容。** 原写法「`WriteAllText` 建文件 → 再 `Open`」中间有
+  一瞬间文件在、没人持有；放开过滤后，建文件事件去抖 300ms 后触发刷新，通常那时
+  句柄早已拿到，但顺序反了就不是真实形态。改为 `Open(..., 'Create', 'ReadWrite', 'Read')`
+  后用 `UTF8.GetBytes` 写进句柄，与 `svn_lock::acquire` 同序，也不带 BOM。
+
+### 变异验证
+
+| 变异 | 结果 |
+|---|---|
+| 修 B 之前（原过滤）跑新测试 | `the_sync_lock_file_is_relevant` 红；`probing_…` 的**正对照**红（锁文件的写被过滤）——证明正对照不是摆设 |
+| 修 B 之后让 `probe` 在独占打开成功时往锁文件写一个字节（模拟探测产生事件） | 只有 `probing_the_sync_lock_does_not_trigger_a_refresh` 红，报出 5 条锁文件事件；已还原 |
+| 修 A 之前跑新 vitest | `needsLockPolling is not a function`，2 条红 |
+
+### 为什么这么改是安全的
+
+- **B 只多放行一个文件名**，git 自己的 `index.lock` / `HEAD.lock` / `refs/**.lock` 仍被
+  过滤（`git_own_lock_files_are_still_noise`）。唯一新增的刷新来源是同步锁的建 / 删 /
+  写，一次同步只有寥寥几次。
+- **不会自激**：探测不产生事件已实测固定（见上）。
+- **A 的开销有界**：只在锁被持有时运行，每 2 秒一次独占打开 + 读一个几十字节的文件；
+  解锁即停。与 R5（UI 打开锁文件时持锁方 `Drop` 删不掉）同一个窗口，轮询让它的
+  概率略升，但后果仍只是一条假的「上次没有正常收尾」日志，已记在 R5。
+- **定时器闭包里的 `refreshSvnSyncState` 是旧闭包也没关系**：它只用 `setState` 的函数式
+  更新 + `samePath` 守卫，不读闭包里的 state。
+
+### 已知覆盖盲区
+
+- effect 的起停接线（`lockPolling` 变化时装 / 拆定时器）没有单测，本仓库没有 hooks
+  测试基建；靠 E2E 场景 1 第 5 步、场景 3 第 4 步。
+- `probing_…` 是 `#[cfg(windows)]`：非 Windows 上锁本来就不做互斥（R3），不在那里留
+  一条语义不同的测试。
+
+### E2E 清单
+
+全程去掉「关掉 / 重开标签页」，只保留场景 1 第 1–3 步（它验的正是「下次打开仓库时
+发现上次崩溃留下的记录」）。新增 0.5 节说明每种变化界面靠什么发现、多久内应当
+反映出来，并为「要重开才更新」的每种现象写明对应的是 A 还是 B 失效。14 个代码块
+原样在 PS 5.1 与 PS 7.6 上重跑通过（方法同 Task 8）。

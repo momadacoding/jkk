@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
   describeUnfinishedSync,
+  needsLockPolling,
   otherBannersAreSuppressed,
+  SYNC_LOCK_POLL_MS,
   type SyncPhase,
   type SyncState,
   type SyncStateUnreadable,
@@ -149,6 +151,39 @@ describe('describeUnfinishedSync', () => {
     expect(b.detail).toContain('缺字段 phase')
     expect(b.actions).toEqual([])
     expect(otherBannersAreSuppressed(unreadable)).toBe(true)
+  })
+
+  it('只在锁被持有时轮询：释放不产生任何文件事件，只能靠问', () => {
+    // 持锁进程崩溃或关掉句柄时锁文件原样留着，watcher 收不到任何东西。
+    // 不轮询的话黄条会一直挂着、一直压着其余横幅，直到工作区碰巧有别的变动。
+    expect(needsLockPolling({ locked: true, holder: null, unfinished: null })).toBe(true)
+    expect(
+      needsLockPolling({
+        locked: true,
+        holder: { pid: 1, startedAt: 1, opid: 'x' },
+        unfinished: { flow: 'sync_in', phase: 'rebase', opid: 'x', startedAt: 1 },
+      }),
+    ).toBe(true)
+    // 没锁就不轮询：绝大多数时间都是这个状态，不该有任何定时开销。
+    // 「开始同步」由 watcher 负责（锁文件与 journal 的出现都会发 repo-changed）。
+    expect(needsLockPolling(null)).toBe(false)
+    expect(needsLockPolling(clean)).toBe(false)
+    expect(
+      needsLockPolling({
+        locked: false,
+        holder: null,
+        unfinished: { flow: 'sync_in', phase: 'stashed', opid: 'x', startedAt: 1 },
+      }),
+    ).toBe(false)
+    // 读不出来时锁状态未知，但坏的是 journal——轮询不会让它自己变好，
+    // 修好文件本身会发 repo-changed。
+    expect(needsLockPolling({ readError: 'x' })).toBe(false)
+  })
+
+  it('轮询间隔足够快到「释放后很快消失」，又不至于高频', () => {
+    // 每一轮是一次独占打开 + 读一个小文件；E2E 清单承诺「最多 2 秒」。
+    expect(SYNC_LOCK_POLL_MS).toBeGreaterThanOrEqual(1000)
+    expect(SYNC_LOCK_POLL_MS).toBeLessThanOrEqual(2000)
   })
 
   it('横幅按纯文本渲染，文案里不能带 Markdown 记号', () => {

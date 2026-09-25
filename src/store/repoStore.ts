@@ -13,7 +13,12 @@ import {
   type ServerAudit,
   type SyncStatus,
 } from '../engine/svnSync'
-import { type SyncState, type SyncStateUnreadable } from '../engine/svnJournal'
+import {
+  needsLockPolling,
+  SYNC_LOCK_POLL_MS,
+  type SyncState,
+  type SyncStateUnreadable,
+} from '../engine/svnJournal'
 import { baselineMap, remapRefs, spliceHistory, type SvnRevNode } from '../engine/svnGraph'
 
 import { toErrorCode, toErrorMessage } from '../engine/errors'
@@ -776,6 +781,28 @@ export function useRepoEffects(
     }).then((fn) => { unlisten = fn })
     return () => { unlisten?.() }
   }, [state.path, diffScope])
+
+  /**
+   * 锁被持有期间轮询同步状态，直到它松开（spec §5.1）。
+   *
+   * 锁的释放不一定产生文件事件：持锁进程崩溃、或只是关掉句柄时，锁文件原样
+   * 留着，watcher 什么都收不到。不轮询的话黄条会一直挂着，还一直压着其余横幅，
+   * 直到工作区碰巧有别的变动——用户不该被要求「关掉标签页再打开」。
+   *
+   * 读到 `locked: false` 后 `lockPolling` 变假，effect 清理掉定时器，轮询自行停止。
+   * 没有锁的时候（绝大多数时间）不装任何定时器。
+   */
+  const lockPolling =
+    state.capabilities.vcs === 'svn' && needsLockPolling(state.svnSyncState)
+  useEffect(() => {
+    if (!state.path || !lockPolling) return
+    const path = state.path
+    const timer = window.setInterval(() => {
+      void refreshSvnSyncState(path).catch(() => undefined)
+    }, SYNC_LOCK_POLL_MS)
+    return () => window.clearInterval(timer)
+    // 依赖里不放 `refreshSvnSyncState`，理由同下面审计定时器那段注释。
+  }, [state.path, lockPolling])
 
   /**
    * 服务器侧漏收核对的**自动**触发（2026-09-19）。

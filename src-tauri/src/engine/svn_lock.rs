@@ -28,7 +28,10 @@ use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 /// 锁文件名。与 journal（`mygitclient-sync.json`）同目录、同前缀，便于人工排查。
-const LOCK_FILE: &str = "mygitclient-sync.lock";
+///
+/// `pub` 是给 `commands/watch.rs` 的：它要把这一个文件从 `.git/*.lock` 的噪声过滤里
+/// 豁免出来。
+pub const LOCK_FILE: &str = "mygitclient-sync.lock";
 
 /// 持锁者信息。**只用于显示**（§13），不参与存活判定。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

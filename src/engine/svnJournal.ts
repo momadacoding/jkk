@@ -141,6 +141,28 @@ export function describeUnfinishedSync(
 }
 
 /**
+ * 锁被持有期间的轮询间隔。每一轮是一次独占打开 + 读一个小文件。
+ *
+ * 为什么要轮询：锁的**释放**不一定产生任何文件事件——持锁进程崩溃、或只是关掉
+ * 句柄时，锁文件原样留在磁盘上，watcher 什么都收不到（spec §5.1.2：「文件在」
+ * 不等于「有人持有」）。
+ */
+export const SYNC_LOCK_POLL_MS = 2000
+
+/**
+ * 要不要轮询同步状态：**只在锁被持有时**。
+ *
+ * 「开始同步」不需要轮询：锁文件的出现与 journal 的写入都会让 watcher 发
+ * `repo-changed`。需要靠问的只有「结束」这一侧。
+ *
+ * 读不出来（`readError`）时不轮询：坏的是 journal，轮询不会让它自己变好；
+ * 修好文件本身就会发 `repo-changed`。
+ */
+export function needsLockPolling(s: SyncState | SyncStateUnreadable | null): boolean {
+  return s !== null && !('readError' in s) && s.locked
+}
+
+/**
  * 未收尾 / 同步进行中时，其余横幅一律让位。
  *
  * 那两种状态下仓库停在中间态：失同步横幅会拿一个半推进的基线去比 revision，
