@@ -16,7 +16,7 @@
 | 6 | 继续 / 放弃（含回原分支） | ✅ 完成 | `svn_sync_in::{continue_sync, abort_sync, back_to_orig, Disk}` 等 + 24 条测试（计划 23 + 补 1） | RED 已见（编译失败）；5 条变异各自红对应测试（第 3 条靠补的用例）；fmt / clippy 0 告警 / `cargo test` 679 passed 0 failed |
 | 7 | S3 / S4 / S5 失败回退 | ✅ 完成 | 四个 `on_*` 改为 `rolled_back` 回原分支；`Disk::GitOnly` 加回 + 5 条测试（计划 4 + 补 1 条树冲突） | RED 已见（4 条错误码对但未回退）；3 条变异各自红对应测试（第 3 条靠补的树冲突用例）；fmt / clippy 0 告警 / `cargo test` 684 passed 0 failed |
 | 7A | 外部整体 update 之后由「更新」接管（A16） | ✅ 完成 | `SyncInPreview.catch_up_rev`、`check_sync_in` 放行整体前进、`svn_sync_in::catch_up` + 9 条测试（替换 Task 2 的 1 条） | RED 已见（`catch_up_rev` 不存在）；5 条变异各自红对应测试；fmt / clippy 0 告警 / `cargo test` 692 passed 0 failed |
-| 8 | Tauri 命令 | ⬜ | | |
+| 8 | Tauri 命令 | ✅ 完成 | 新文件 `commands/svn_sync.rs`（4 个命令）+ 注册 + 2 条测试 | RED 已见（guard 测试因文件不存在失败）；2 条变异各自红对应测试；fmt / clippy 0 告警 / `cargo test` 695 passed 0 failed；`pnpm tauri dev` 实跑留到 Task 10 |
 | 9 | 前端纯逻辑 | ⬜ | | |
 | 10 | 前端接线 | ⬜ | | |
 | 11 | E2E + spec 修订 + 收尾 | ⬜ | | |
@@ -390,3 +390,36 @@
 - **锁内复核在接管之前**：确认之后分支被动过时一个字节都不动，基线不被接管（变异 3 钉住）；接管之后再复核一次，S0 记下的 `baselineOidBefore` 是新基线，且白名单外会碰到的文件照常与用户确认过的比。
 - `rebuild_baseline` 失败时 `?` 直接返回：此时没有 journal、没有 stash、基线指针没动，与预览拒绝等价，不另写回退（计划 Step 5 的要求）。
 - **只接管「整体前进」**：`nodeRevs` 单值且大于基线。mixed-revision 归 §9.4（2d），退回基线之前多半是误操作——两者照旧 `sync_in_out_of_sync` 拒绝（`a_mixed_revision_…`、`a_working_copy_rolled_back_…` 钉住，变异 1 证明守卫起作用）。pinned 形态在更早的第 3 条之后就被 A1 拒绝，走不到这里。
+
+---
+
+## Task 8：Tauri 命令
+
+### 验证记录
+
+| 步骤 | 实际结果 |
+|---|---|
+| 接口核对 | 既有 `repo-changed` 事件的 payload 是仓库路径字符串（`commands/watch.rs`），前端 `RepoTab.tsx` 用 `samePath(e.payload, path)` 过滤——本 Task 补发的事件形状一致；`WatchSuspension::new(&str)` 与 Task 1 一致 |
+| RED | `sync_in_types_cross_ipc_in_camel_case` 直接通过（类型在 Task 5 / 7A 已有，计划已说明无妨）；`sync_commands_suspend_the_watcher_…` 因 `commands/svn_sync.rs` 不存在失败 |
+| GREEN | `svn_backend` 28、`svn_write_guard` 6、`commands_are_async` 1 全过 |
+| 变异 1：`svn_sync_abort` 不挂起 watcher | 只红 `sync_commands_suspend_the_watcher_and_their_engine_entries_take_the_lock` |
+| 变异 2：`svn_sync_continue` 去掉 `(async)` | 只红 `every_command_is_declared_async` |
+| 全量 | `cargo fmt --check` 0；`cargo clippy --all-targets` 0 告警；`cargo test` 695 passed / 0 failed（= 693 + 本 Task 2） |
+
+### 偏离计划
+
+- 无。
+
+### 计划的错误
+
+- Step 2 的 `cargo test --test svn_backend sync_in_types --test svn_write_guard sync_commands` 同 Task 7：多个位置过滤参数 cargo 不接受，实际用 `-- sync_in_types sync_commands`。
+
+### 计划没写的坑
+
+- 无。
+
+### 为什么这么改是安全的
+
+- 三个写命令都经 `with_watch_suspended`：`WatchSuspension` 是 RAII，`f()` 返回或 panic 展开时都会恢复 watcher；结束后无论成败补发一次 `repo-changed`，回退动过的分支 / 工作区也能被界面看到。
+- 预览命令不挂起 watcher、不拿锁，只调纯读的 `preview_sync_in`。
+- 命令层不含任何业务判断，拿锁、复核、回退全部在 engine 里，已由 `svn_sync_in.rs` 的用例覆盖；接线由 `svn_write_guard.rs` 的源码断言守着。

@@ -621,3 +621,86 @@ fn every_sync_verdict_variant_serializes_its_fields_in_camel_case() {
     assert_eq!(pinned["baselineRev"], 9, "实际 {pinned}");
     assert_eq!(pinned["external"], "Vendor/Lib", "实际 {pinned}");
 }
+
+#[test]
+fn sync_in_types_cross_ipc_in_camel_case() {
+    // AGENTS.md §7.3：snake_case ↔ camelCase 没有编译期检查。字段名写错只会在
+    // 运行时拿到 undefined——svn_sync.rs 的 SyncVerdict 上真出过一次。
+    use app_lib::engine::svn_sync_check::SyncInPreview;
+    use app_lib::engine::svn_sync_in::{SyncInExpect, SyncInOutcome};
+
+    let p = serde_json::to_value(SyncInPreview {
+        orig_branch: "work".into(),
+        orig_head: "h".into(),
+        baseline_oid: "b".into(),
+        baseline_rev: 1,
+        target_rev: 2,
+        catch_up_rev: Some(2),
+        outside_changes: vec!["Art/x.psd".into()],
+    })
+    .unwrap();
+    for k in [
+        "origBranch",
+        "origHead",
+        "baselineOid",
+        "baselineRev",
+        "targetRev",
+        "catchUpRev",
+        "outsideChanges",
+    ] {
+        assert!(p.get(k).is_some(), "SyncInPreview 缺 `{k}`：{p}");
+    }
+    // `None` 必须发成 `null` 而不是整个键消失：前端按 `catchUpRev === null` 判断（Task 9）
+    let none = serde_json::to_value(SyncInPreview {
+        orig_branch: "work".into(),
+        orig_head: "h".into(),
+        baseline_oid: "b".into(),
+        baseline_rev: 1,
+        target_rev: 1,
+        catch_up_rev: None,
+        outside_changes: vec![],
+    })
+    .unwrap();
+    assert_eq!(
+        none.get("catchUpRev"),
+        Some(&serde_json::Value::Null),
+        "{none}"
+    );
+
+    let cases = [
+        (
+            SyncInOutcome::Done { new_rev: 2 },
+            r#"{"kind":"done","newRev":2}"#,
+        ),
+        (SyncInOutcome::Aborted, r#"{"kind":"aborted"}"#),
+        (
+            SyncInOutcome::RebaseConflict {
+                files: vec!["A".into()],
+            },
+            r#"{"kind":"rebaseConflict","files":["A"]}"#,
+        ),
+        (
+            SyncInOutcome::StashConflict {
+                files: vec!["A".into()],
+                stash_oid: "o".into(),
+            },
+            r#"{"kind":"stashConflict","files":["A"],"stashOid":"o"}"#,
+        ),
+        (
+            SyncInOutcome::StashBlocked {
+                collisions: vec!["N".into()],
+                stash_oid: "o".into(),
+            },
+            r#"{"kind":"stashBlocked","collisions":["N"],"stashOid":"o"}"#,
+        ),
+    ];
+    for (v, want) in cases {
+        assert_eq!(serde_json::to_string(&v).unwrap(), want);
+    }
+
+    let e: SyncInExpect = serde_json::from_str(
+        r#"{"origHead":"h","baselineOid":"b","confirmedOutside":["Art/x.psd"]}"#,
+    )
+    .unwrap();
+    assert_eq!(e.confirmed_outside, vec!["Art/x.psd".to_string()]);
+}

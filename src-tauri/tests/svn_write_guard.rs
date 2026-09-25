@@ -205,3 +205,47 @@ fn write_commands_outside_the_vcs_trait_are_guarded_too() {
         );
     }
 }
+
+/// 三个会写仓库的同步命令：必须挂起 watcher（spec §5.2），且它们调用的 engine 入口
+/// 必须拿锁（spec §5.1）。行为上的「拿不到锁就拒绝」由 `svn_sync_in.rs` 的
+/// `a_second_sync_while_one_is_running_is_refused` 守着；这里守的是接线。
+#[test]
+fn sync_commands_suspend_the_watcher_and_their_engine_entries_take_the_lock() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let cmd = fs::read_to_string(root.join("commands/svn_sync.rs")).unwrap();
+    for (func, engine_fn) in [
+        ("svn_sync_in", "run_sync_in"),
+        ("svn_sync_continue", "continue_sync"),
+        ("svn_sync_abort", "abort_sync"),
+    ] {
+        let body = fn_body(&cmd, func);
+        assert!(
+            body.contains("with_watch_suspended("),
+            "`{func}` 没有挂起 watcher"
+        );
+        assert!(body.contains(engine_fn), "`{func}` 没有调 `{engine_fn}`");
+    }
+    let eng = fs::read_to_string(root.join("engine/svn_sync_in.rs")).unwrap();
+    assert!(fn_body(&eng, "run_sync_in").contains("svn_lock::acquire"));
+    assert!(fn_body(&eng, "continue_sync").contains("take_over("));
+    assert!(fn_body(&eng, "abort_sync").contains("take_over("));
+    assert!(fn_body(&eng, "take_over").contains("svn_lock::acquire"));
+}
+
+/// `fn <name>(` 到下一个顶层 `fn` / `pub fn` 之间的源码。依赖 rustfmt 的格式。
+fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+    let start = src
+        .find(&format!("fn {name}("))
+        .unwrap_or_else(|| panic!("找不到 `fn {name}(`——改名了？"));
+    let rest = &src[start + 1..];
+    let end = [
+        rest.find("\npub fn "),
+        rest.find("\nfn "),
+        rest.find("\npub(crate) fn "),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .unwrap_or(rest.len());
+    &rest[..end]
+}
