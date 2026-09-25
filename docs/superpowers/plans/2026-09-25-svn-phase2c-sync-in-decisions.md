@@ -8,7 +8,7 @@
 | Task | 内容 | 状态 | 产出 | 验证 |
 |---|---|---|---|---|
 | 0 | 决策日志 + 自检 | ✅ 完成 | 本文件 | 自检见下「Task 0」；`pnpm install` 成功 |
-| 1 | 2b 遗留：watcher RAII、锁释放重试、journal tmp 清理、持锁时长 | ⬜ | | |
+| 1 | 2b 遗留：watcher RAII、锁释放重试、journal tmp 清理、持锁时长 | ✅ 完成 | `commands/watch.rs`、`svn_lock.rs`、`svn_journal.rs` + 5 条测试 | RED 已见（2 编译失败 + 1 断言失败）；3 条变异各自只红对应测试；fmt / clippy 0 告警 / `cargo test` 608 passed 0 failed |
 | 2 | 前置检查 | ⬜ | | |
 | 3 | WIP 压栈与取回 | ⬜ | | |
 | 4 | 基线录制零件拆分 | ⬜ | | |
@@ -90,3 +90,38 @@
 ### 为什么这么改是安全的
 
 - 本 Task 只新增文档，不碰代码与仓库状态。
+
+---
+
+## Task 1：2b 遗留——watcher RAII、锁释放重试、journal tmp 清理、持锁时长
+
+### 验证记录
+
+| 步骤 | 实际结果 |
+|---|---|
+| RED | `svn_journal` 新用例断言失败「残留 tmp 必须被清掉」；`svn_watch_suspend` / `svn_lock` 编译失败（`WatchSuspension`、`describe_age` 不存在），与计划期望一致 |
+| GREEN | `cargo test --test svn_watch_suspend --test svn_lock --test svn_journal`：6 / 10 / 11 passed |
+| 变异 1：`WatchSuspension::drop` 不调 `resume_watch` | 只红两条 guard 测试 |
+| 变异 2：锁 `Drop` 重试 `0..1` | 只红 `release_retries_when_a_reader_briefly_holds_the_file` |
+| 变异 3：不调 `sweep_stale_tmp` | 只红 `a_stale_tmp_left_by_a_crash_is_swept_on_the_next_write` |
+| 全量 | `cargo fmt --check` 0；`cargo clippy --all-targets` 0 告警；`cargo test` 608 passed / 0 failed（46 个测试二进制） |
+
+### 偏离计划
+
+- 无代码偏离。计划给的两段测试代码不满足 rustfmt（长行），`cargo fmt` 自动折行，语义不变。
+
+### 计划的错误
+
+- 计划写的 `cargo test` 基线是 598 passed；本 Task 加 5 条后实测 608。差出的 5 条没有逐一核对来源（基线数字抄自 2b 决策日志，统计口径可能不同，例如是否计入 doc-test）。**不影响结论**：0 failed。以后以本表的 608 为新基线。
+
+### 计划没写的坑
+
+- `cargo fmt` 会把 CRLF 的测试文件整体写回成 LF。`git diff --stat` 只显示真实增删（autocrlf 在提交时归一），所以没有造成整文件改动；但用脚本处理这些文件前要重新数行尾。
+- `release_retries_when_a_reader_briefly_holds_the_file` 在实现前处于编译失败状态，没法先看到它的「断言失败」。用变异 2 补上：重试降到 1 次时它确实红，证明测的是重试本身。
+
+### 为什么这么改是安全的
+
+- `WatchSuspension` 只把既有的 `suspend_watch` / `resume_watch` 包进 RAII，挂起集合的语义不变；Drop 在 panic 展开时也会跑（测试钉住）。
+- 锁 `Drop` 的重试最多等 10 × 20ms = 200ms，且只在删除失败、文件仍在时才等；`NotFound` 立刻返回。Drop 里依旧不 panic。
+- `sweep_stale_tmp` 只删「`mygitclient-sync.json.` 开头且 `.tmp` 结尾」的文件，同目录的 `.bak` 等不相干文件由测试证明不被误删；只有持锁者写 journal，写入时的其它 tmp 必然是残骸。
+- journal 写入失败时现在会删掉自己的 tmp（原来只有 rename 失败那条路径会删），目标文件本身从未被触碰，原子性不变。

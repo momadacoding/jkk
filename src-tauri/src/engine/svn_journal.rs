@@ -139,6 +139,7 @@ pub fn write(repo_root: &str, j: &Journal) -> Result<()> {
     let target = journal_path(repo_root);
     let dir = target.parent().expect("journal 路径一定有父目录");
     std::fs::create_dir_all(dir)?;
+    sweep_stale_tmp(dir);
 
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -150,12 +151,19 @@ pub fn write(repo_root: &str, j: &Journal) -> Result<()> {
     // （与 `svn_config::write_config` 同一写法）。
     let body = serde_json::to_vec_pretty(j)
         .map_err(|e| GitError::new("svn_journal_encode", format!("journal 序列化失败: {e}")))?;
-    {
+    // 从创建 tmp 起到 rename 为止，任何一步失败都要把 tmp 删掉（2b 第二轮
+    // review R7：原来只有 rename 失败那条路径会清）。收进一个闭包，是为了让
+    // 「所有 `?` 都在清理范围里」由结构保证，而不是靠每个调用点记得。
+    let written = (|| -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(&body)?;
         // rename 是原子的，但「新内容已经落盘」不是它保证的。
         // 少了这一步，断电后可能 rename 生效了而内容还是空的。
-        f.sync_all()?;
+        f.sync_all()
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
     }
     std::fs::rename(&tmp, &target).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
@@ -195,5 +203,22 @@ pub fn remove(repo_root: &str) -> Result<()> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// 删掉前人留下的 `mygitclient-sync.json.*.tmp`（2b 第二轮 review R7）。
+///
+/// 只有持锁者写 journal（模块头「所有权由锁界定」），所以写入这一刻目录里的
+/// 其它 tmp 必然是崩溃留下的残骸。删不掉就算了：它只占几百字节，不影响正确性。
+fn sweep_stale_tmp(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!("{JOURNAL_FILE}.");
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with(&prefix) && name.ends_with(".tmp") {
+            let _ = std::fs::remove_file(e.path());
+        }
     }
 }

@@ -297,11 +297,29 @@ pub fn assert_not_syncing(repo_root: &str) -> Result<()> {
     Ok(())
 }
 
+/// 「已经持续多久」，给人看的（spec §13：显示持锁进程的 pid 与开始时间）。
+///
+/// 不打印 epoch 秒（2b 第二轮 review R6：原来是「开始于 1757000000」）。
+/// 也不打印本地时刻：后端不知道用户的时区习惯，而「持续了多久」恰好是判断
+/// 「这是不是一次卡死的同步」唯一需要的信息。
+pub fn describe_age(started_at: u64, now: u64) -> String {
+    let secs = now.saturating_sub(started_at);
+    if secs < 60 {
+        "刚刚开始".to_string()
+    } else if secs < 3600 {
+        format!("已持续 {} 分钟", secs / 60)
+    } else {
+        format!("已持续 {} 小时", secs / 3600)
+    }
+}
+
 fn busy_error(repo_root: &str) -> GitError {
     let who = match holder(repo_root) {
         Some(h) => format!(
-            "持有者：进程 {}，开始于 {}（opid {}）。",
-            h.pid, h.started_at, h.opid
+            "持有者：进程 {}，{}（opid {}）。",
+            h.pid,
+            describe_age(h.started_at, now_secs()),
+            h.opid
         ),
         None => "读不到持有者信息（它可能刚刚开始）。".to_string(),
     };
@@ -324,8 +342,18 @@ impl Drop for SyncLock {
         // 正常同步结束后都会留下一个残锁，导致下一次 `acquire` 打出
         // 「上次同步没有正常收尾」的警告——一条永远为假的告警，比没有告警更糟。
         drop(self.file.take());
-        // 到这里句柄已经关了，删得掉。仍然不 unwrap：Drop 里 panic 会在展开
-        // 途中直接 abort，而删不掉的后果只是留个残锁，下次照常接管。
-        let _ = std::fs::remove_file(&self.path);
+        // 到这里句柄已经关了。仍可能删不掉：UI 正以宽松共享模式读它（`holder()`
+        // 没带 FILE_SHARE_DELETE），或 `probe` 正独占打开它。两者都只持有几毫秒，
+        // 而 2c 的界面在锁被持有期间每 2 秒轮询一次，撞上是真实会发生的事
+        // （2b 第二轮 review R5）。删不掉的后果是下一次 acquire 打出一条假的
+        // 「上次同步没有正常收尾」，所以值得等一小会儿；但 Drop 里不能无限等。
+        for _ in 0..10 {
+            match std::fs::remove_file(&self.path) {
+                Ok(()) => return,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        // 仍然不 unwrap：Drop 里 panic 会在展开途中直接 abort。
     }
 }

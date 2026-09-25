@@ -64,6 +64,34 @@ pub fn is_watch_suspended(path: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 挂起监听的 RAII 守卫（spec §5.2，2b 独立 review N3）。
+///
+/// 构造即挂起，Drop 即恢复。**不要**在同步流程里手写成对的
+/// `suspend_watch` / `resume_watch`：中间任何一个 `?` 早退或 panic 都会让
+/// watcher 永远停着——之后外部的每一次改动界面都看不见，而且没有任何报错。
+///
+/// 恢复之后「主动发一次 `repo-changed`」不在这里做：那要 `AppHandle`，而
+/// engine 层与测试都拿不到它。由命令层在守卫 drop 之后补发，见
+/// `commands/svn_sync.rs`。
+pub struct WatchSuspension {
+    path: String,
+}
+
+impl WatchSuspension {
+    pub fn new(path: &str) -> Self {
+        suspend_watch(path);
+        Self {
+            path: path.to_string(),
+        }
+    }
+}
+
+impl Drop for WatchSuspension {
+    fn drop(&mut self) {
+        resume_watch(&self.path);
+    }
+}
+
 /// 变更静默这么久之后才发一次 `repo-changed`（尾沿去抖）。
 const DEBOUNCE: Duration = Duration::from_millis(300);
 /// 轮询 channel 的间隔，需要明显小于 DEBOUNCE 才能及时判定静默。

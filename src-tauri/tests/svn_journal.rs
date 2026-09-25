@@ -194,3 +194,26 @@ fn a_stash_oid_survives_the_round_trip() {
     assert_eq!(back.stash_ref_before.as_deref(), Some("9c1e4b2"));
     assert_eq!(back.phase, Phase::Stashed);
 }
+
+#[test]
+fn a_stale_tmp_left_by_a_crash_is_swept_on_the_next_write() {
+    // 2b 第二轮 review R7：崩溃在 write 中途会在 `.git/` 里留下
+    // `mygitclient-sync.json.<pid>.<nanos>.tmp`，没有任何机制清理它。
+    // 只有持锁者写 journal（模块头「所有权由锁界定」），所以写入时看到的别的
+    // tmp 必然是前人留下的残骸。
+    let fx = git_dir_fixture();
+    let root = fx.path().to_str().unwrap();
+    let stale = fx
+        .path()
+        .join(".git")
+        .join("mygitclient-sync.json.999.123.tmp");
+    std::fs::write(&stale, b"half").unwrap();
+    // 不相干的文件不能被误删
+    let bystander = fx.path().join(".git").join("mygitclient-sync.json.bak");
+    std::fs::write(&bystander, b"keep").unwrap();
+
+    write(root, &minimal("sweep")).unwrap();
+
+    assert!(!stale.exists(), "残留 tmp 必须被清掉");
+    assert!(bystander.exists(), "只清 `.tmp` 结尾的同前缀文件");
+}
