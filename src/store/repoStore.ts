@@ -13,6 +13,12 @@ import {
   type ServerAudit,
   type SyncStatus,
 } from '../engine/svnSync'
+import {
+  needsLockPolling,
+  SYNC_LOCK_POLL_MS,
+  type SyncState,
+  type SyncStateUnreadable,
+} from '../engine/svnJournal'
 import { baselineMap, remapRefs, spliceHistory, type SvnRevNode } from '../engine/svnGraph'
 
 import { toErrorCode, toErrorMessage } from '../engine/errors'
@@ -124,6 +130,14 @@ export interface RepoState {
    * ——读失败时也是 `null`，那时不挂横幅，但同样不能当成「已经迁移过」。
    */
   svnEol: EolStatus | null
+  /**
+   * 同步锁与上次未收尾的 journal（spec §5.1、§7.6）。`null` = 还没读到。
+   *
+   * 读失败**不写 `null`**（与 `svnEol` 不同）：写成 `{ readError }`，横幅照样
+   * 挂出来并让其余横幅让位。`null` 不挂横幅，那等于把「journal 坏了」显示成
+   * 「上次干净收尾了」。
+   */
+  svnSyncState: SyncState | SyncStateUnreadable | null
   /** SVN 历史（缓存 + 已拉取的），按 revision 降序。 */
   svnRevs: SvnRevNode[]
   /**
@@ -166,6 +180,7 @@ const initialState: RepoState = {
   svnSync: null,
   svnAudit: null,
   svnEol: null,
+  svnSyncState: null,
   svnRevs: [],
   gitCommits: [],
   svnLogComplete: false,
@@ -242,6 +257,14 @@ export function svnPinnedExternals(path: string): Promise<PinnedExternal[]> {
 /** 行尾规则装了没有（spec §7.3.0）。**纯读**，不走网络。 */
 export function svnEolStatus(path: string): Promise<EolStatus> {
   return invoke<EolStatus>('svn_eol_status', { path })
+}
+
+/**
+ * 同步锁与上次未收尾的 journal（spec §5.1、§7.6）。**纯读**，不走网络，也不拿锁
+ * ——它恰恰是用来观察锁的。
+ */
+export function svnSyncState(path: string): Promise<SyncState> {
+  return invoke<SyncState>('svn_sync_state', { path })
 }
 
 /**
@@ -359,6 +382,10 @@ export function useRepoStore() {
         // 和常驻体检入口都让位，所以必须在第一帧之前读到，否则界面会先挂出
         // 一条随后又被替换掉的横幅（spec §7.3.0）。
         await refreshSvnEol(path)
+        // 同理，且优先级更高：未收尾 / 同步进行中时**其余横幅全部让位**
+        // （中间态下它们的结论可能是错的，出口还是危险的）。必须在第一帧之前
+        // 读到，否则会先闪一条随后被撤掉的横幅。
+        await refreshSvnSyncState(path)
         // 先用**缓存**把图画出来，再后台拉新的（spec §10.2）。
         await refreshSvnLog(path).catch(() => undefined)
         // 这两条走网络，照 `refreshPullRequests` 的既有模式：不 await、失败静默。
@@ -372,6 +399,7 @@ export function useRepoStore() {
           svnSync: null,
           svnAudit: null,
           svnEol: null,
+          svnSyncState: null,
           svnRevs: [],
           svnLogComplete: false,
           // gitCommits 不用清：refreshGraph 每次都整份覆盖它
@@ -466,6 +494,27 @@ export function useRepoStore() {
     } catch (err) {
       console.warn('读行尾规则状态失败：', err)
       setState((s) => (samePath(s.path ?? '', path) ? { ...s, svnEol: null } : s))
+    }
+  }
+
+  /**
+   * 同步锁与上次未收尾的 journal（spec §5.1、§7.6）。
+   *
+   * `samePath` 守卫同上。失败**不写 `null`**：后端的 journal 坏了会以
+   * `svn_journal_corrupt` 抛上来，写 `null` 就不挂横幅、也不报错——等于把它
+   * 吞成「一切正常」。也不走顶部通用错误横幅：`repo-changed` 每次保存文件都会
+   * 重读一次，那条错误关掉又会立刻弹回来。
+   */
+  const refreshSvnSyncState = async (path: string) => {
+    try {
+      const st = await svnSyncState(path)
+      setState((s) => (samePath(s.path ?? '', path) ? { ...s, svnSyncState: st } : s))
+    } catch (err) {
+      console.warn('读同步状态失败：', err)
+      const unreadable: SyncStateUnreadable = { readError: toErrorMessage(err) }
+      setState((s) =>
+        samePath(s.path ?? '', path) ? { ...s, svnSyncState: unreadable } : s,
+      )
     }
   }
 
@@ -646,6 +695,7 @@ export function useRepoStore() {
     refreshPullRequests,
     refreshSvnSync,
     refreshSvnEol,
+    refreshSvnSyncState,
     checkSvnSyncIfChanged,
     refreshSvnLog,
     fetchSvnLog,
@@ -669,6 +719,7 @@ export interface RepoRefreshers {
   /** §6.6.3 第二档。只在第一档报告「有人动过」之后才调。 */
   /** §6.6.3 的第一档 + 条件触发第二档。挂在高频的 repo-changed 上。 */
   checkSvnSyncIfChanged: (path: string) => Promise<boolean>
+  refreshSvnSyncState: (path: string) => Promise<void>
   /** 服务器侧核对的**后台**入口，自带频率闸。挂定时器与窗口焦点。 */
   auditSvnIfDue: (path: string) => Promise<void>
 }
@@ -678,7 +729,7 @@ export function useRepoEffects(
   refreshers: RepoRefreshers,
   viewMode: string,
 ) {
-  const { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, auditSvnIfDue } = refreshers
+  const { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, refreshSvnSyncState, auditSvnIfDue } = refreshers
   const diffScope = viewMode === 'changes'
     ? 'workdir'
     : state.selectedId
@@ -719,10 +770,39 @@ export function useRepoEffects(
       // 第二档还是每次都跑——分层白做。
       if (state.capabilities.vcs === 'svn') {
         void checkSvnSyncIfChanged(path).catch(ignore)
+        // 同步状态也要跟着刷（2026-09-25 独立 review）。只在打开仓库时读一次的话：
+        // 另一个进程开始或结束的同步永远不会出现 / 永远不会消失；更糟的是，
+        // 打开那一刻若恰好读到 `locked: true`，`otherBannersAreSuppressed` 会把
+        // 失同步 / 行尾 / 漏收横幅**压住整个标签页的生命周期**，除非关掉重开。
+        //
+        // 它是纯本地读（一次 stat + 一个小文件），挂在高频通道上不需要分层。
+        void refreshSvnSyncState(path).catch(ignore)
       }
     }).then((fn) => { unlisten = fn })
     return () => { unlisten?.() }
   }, [state.path, diffScope])
+
+  /**
+   * 锁被持有期间轮询同步状态，直到它松开（spec §5.1）。
+   *
+   * 锁的释放不一定产生文件事件：持锁进程崩溃、或只是关掉句柄时，锁文件原样
+   * 留着，watcher 什么都收不到。不轮询的话黄条会一直挂着，还一直压着其余横幅，
+   * 直到工作区碰巧有别的变动——用户不该被要求「关掉标签页再打开」。
+   *
+   * 读到 `locked: false` 后 `lockPolling` 变假，effect 清理掉定时器，轮询自行停止。
+   * 没有锁的时候（绝大多数时间）不装任何定时器。
+   */
+  const lockPolling =
+    state.capabilities.vcs === 'svn' && needsLockPolling(state.svnSyncState)
+  useEffect(() => {
+    if (!state.path || !lockPolling) return
+    const path = state.path
+    const timer = window.setInterval(() => {
+      void refreshSvnSyncState(path).catch(() => undefined)
+    }, SYNC_LOCK_POLL_MS)
+    return () => window.clearInterval(timer)
+    // 依赖里不放 `refreshSvnSyncState`，理由同下面审计定时器那段注释。
+  }, [state.path, lockPolling])
 
   /**
    * 服务器侧漏收核对的**自动**触发（2026-09-19）。

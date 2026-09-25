@@ -23,6 +23,8 @@ pub mod svn_externals;
 pub mod svn_health;
 pub mod svn_include_check;
 pub mod svn_init;
+pub mod svn_journal;
+pub mod svn_lock;
 pub mod svn_log;
 pub mod svn_log_cache;
 pub mod svn_preflight;

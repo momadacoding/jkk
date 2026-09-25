@@ -16,6 +16,7 @@ use crate::engine::graph::GraphData;
 use crate::engine::repo::RepoInfo;
 use crate::engine::stash::StashEntry;
 use crate::engine::svn_config::SvnConfig;
+use crate::engine::svn_lock::assert_not_syncing;
 use crate::error::Result;
 
 pub struct SvnGitBackend {
@@ -31,6 +32,10 @@ pub struct SvnGitBackend {
     /// `AGENTS.md` §7.3 要求的「必须说明理由」由上面这段注释满足。
     #[allow(dead_code)]
     config: SvnConfig,
+    /// 工作目录根。`GitBackend` 自己也存了一份，但那个字段是私有的、没有访问器，
+    /// 而同步锁守卫（spec §5.1）每个写方法都要用它，所以这里自己留一份。
+    /// 原样保存调用方给的写法，不做规范化——与 `GitBackend::root` 同一条理由。
+    root: String,
 }
 
 impl SvnGitBackend {
@@ -46,6 +51,7 @@ impl SvnGitBackend {
         Ok(Self {
             git: GitBackend::new(path),
             config,
+            root: path.to_string(),
         })
     }
 }
@@ -82,42 +88,54 @@ impl Vcs for SvnGitBackend {
         self.git.diff(scope)
     }
     fn stage(&self, paths: &[String]) -> Result<()> {
+        assert_not_syncing(&self.root)?;
         self.git.stage(paths)
     }
     fn unstage(&self, paths: &[String]) -> Result<()> {
+        assert_not_syncing(&self.root)?;
         self.git.unstage(paths)
     }
     fn discard(&self, paths: &[String], staged: bool) -> Result<()> {
+        assert_not_syncing(&self.root)?;
         self.git.discard(paths, staged)
     }
     fn commit(&self, message: &str, amend: bool) -> Result<()> {
+        assert_not_syncing(&self.root)?;
         self.git.commit(message, amend)
     }
     fn create_branch(&self, name: &str, start_point: Option<&str>) -> Result<()> {
+        assert_not_syncing(&self.root)?;
         self.git.create_branch(name, start_point)
     }
     fn delete_branch(&self, name: &str) -> Result<()> {
+        assert_not_syncing(&self.root)?;
         self.git.delete_branch(name)
     }
     fn rename_branch(&self, old: &str, new: &str) -> Result<()> {
+        assert_not_syncing(&self.root)?;
         self.git.rename_branch(old, new)
     }
     fn checkout(&self, rev: &str) -> Result<()> {
+        assert_not_syncing(&self.root)?;
         self.git.checkout(rev)
     }
     fn list_stashes(&self) -> Result<Vec<StashEntry>> {
         self.git.list_stashes()
     }
     fn stash_push(&self, message: Option<&str>, include_untracked: bool) -> Result<()> {
+        assert_not_syncing(&self.root)?;
         self.git.stash_push(message, include_untracked)
     }
     fn stash_apply(&self, index: usize) -> Result<()> {
+        assert_not_syncing(&self.root)?;
         self.git.stash_apply(index)
     }
     fn stash_pop(&self, index: usize) -> Result<()> {
+        assert_not_syncing(&self.root)?;
         self.git.stash_pop(index)
     }
     fn stash_drop(&self, index: usize) -> Result<()> {
+        assert_not_syncing(&self.root)?;
         self.git.stash_drop(index)
     }
 }
