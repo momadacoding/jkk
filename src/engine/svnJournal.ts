@@ -44,6 +44,16 @@ export interface SyncState {
 }
 
 /**
+ * `svn_sync_state` 读失败（典型是 journal 坏了，`svn_journal_corrupt`）。
+ *
+ * 必须与 `null`（还没读到）分开：后端把「坏了」与「没有」严格分开（B3），
+ * 前端若把失败写回 `null`，两者会在界面上重新合成「一切正常」。
+ */
+export interface SyncStateUnreadable {
+  readError: string
+}
+
+/**
  * 每个 phase 回答同一个问题：**我的东西现在在哪。**
  *
  * 通用文案等于没说。用户在这一刻看到的是一个工作区可能空了的仓库，
@@ -53,7 +63,7 @@ const PHASE_DETAIL: Record<SyncPhase, string> = {
   start: '流程刚开始，还没有动过工作目录里的任何东西——可以直接当作没发生过。',
   stashing:
     '正要把未提交的改动压进 stash，但压没压成还不确定。' +
-    '**不要**自己去 apply 任何 stash 条目：挑错条目会把别人的 WIP 覆盖到你的工作区上。',
+    '不要自己去 apply 任何 stash 条目：挑错条目会把别人的 WIP 覆盖到你的工作区上。',
   stashed:
     '未提交的改动已经压进 stash，它的 OID 已经记下来了，东西没丢。' +
     '工作目录看起来是空的，那是正常的。',
@@ -74,8 +84,24 @@ const NOTE_NEXT_PHASE =
  *
  * 打开仓库那一瞬间状态是 `null`，那时挂任何东西都等于每次打开都闪一下。
  */
-export function describeUnfinishedSync(s: SyncState | null): BannerModel | null {
+export function describeUnfinishedSync(
+  s: SyncState | SyncStateUnreadable | null,
+): BannerModel | null {
   if (!s) return null
+
+  // 判不出来与守卫同一方向：保守地当成有问题。仓库可能正停在中间态，
+  // 此刻说「一切正常」并放出重建基线之类的出口，比多挂一条红条危险得多。
+  if ('readError' in s) {
+    return {
+      tone: 'danger',
+      title: '读不出上次同步的记录',
+      // 后端的报错原文已经是完整句子（`svn_journal_corrupt` 带着路径和
+      // 「请勿删除」），原样接在后面，不再套一层括号。
+      detail: `判断不了上次同步有没有正常结束。${s.readError}`,
+      actions: [],
+      note: '在弄清楚之前，请不要手工去动 stash 或分支指针，也不要删掉那份记录——里面可能记着 stash 的 OID。',
+    }
+  }
 
   // 「正在进行」与「未完成」的出口完全相反：前者要等，后者要用户决定。
   // 说反了会引导用户去「放弃」一次正在正常跑的同步。
@@ -122,6 +148,8 @@ export function describeUnfinishedSync(s: SyncState | null): BannerModel | null 
  * 的出口（重建基线）在这种状态下是**危险**的——重建会移动基线指针，而此刻
  * 正有另一套流程（或它的残骸）依赖着那个指针。
  */
-export function otherBannersAreSuppressed(s: SyncState | null): boolean {
+export function otherBannersAreSuppressed(
+  s: SyncState | SyncStateUnreadable | null,
+): boolean {
   return describeUnfinishedSync(s) !== null
 }

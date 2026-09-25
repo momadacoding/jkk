@@ -20,7 +20,8 @@
 | 5 | 同步期间挂起文件监听 | ✅ 完成 | `commands/watch.rs`、`tests/svn_watch_suspend.rs` | `cargo test` **589 passed**（新增 4）；fmt / clippy 零告警；变异验证 ×2 |
 | 6 | 「上次同步未完成」的检测与展示 | 🟡 代码完成，待真实窗口验证 | `commands/svn.rs`、`lib.rs`、`svnJournal.ts`、`svnJournal.test.ts`、`repoStore.ts`、`BaselineBanner.tsx`、`RepoTab.tsx`、`tests/svn_backend.rs`、spec §5.1.2 + §18 | `cargo test` **590 passed**；`pnpm test` **378 passed**（新增 9）；`pnpm build` OK。**`pnpm tauri dev` 未跑** |
 | 7 | 修入独立 review 的 3 条阻断 + 7 条非阻断 | 完成 | svn_lock.rs、svn_journal.rs、commands/ops.rs、commands/svn.rs、svn_write_guard.rs、svn_lock.rs 测试、svnJournal.ts、repoStore.ts、RepoTab.tsx、E2E | cargo test 595 passed；pnpm test 379 passed；变异验证 x3 |
-| 收尾 | E2E 清单 + 独立 review | 完成 | E2E 清单已写；review 已跑并修入 | 真实窗口仍待用户实跑 |
+| 8 | 修入第二轮独立 review 的 4 条（2026-09-25） | ✅ 完成 | `svnJournal.ts`、`svnJournal.test.ts`（+2）、`repoStore.ts`、`BaselineBanner.tsx`、E2E 清单、spec §5.1.2 + §18、本文件 | `pnpm build` OK；`pnpm test` **381 passed**（+2，先红后绿）；Rust 未改，未跑 cargo |
+| 收尾 | E2E 清单 + 独立 review | 完成 | E2E 清单已写；review 已跑两轮并修入 | 真实窗口仍待用户实跑 |
 
 ## 全量验证
 
@@ -30,7 +31,7 @@
 | `cargo clippy --all-targets` | ✅ **0 告警** |
 | `cargo test` | ✅ **595 passed / 0 failed**（基线 567，新增 28） |
 | `pnpm build` | ✅ OK（含 `tsc`） |
-| `pnpm test` | ✅ **379 passed**（基线 369，新增 10） |
+| `pnpm test` | ✅ **381 passed**（基线 369，新增 12；Task 8 +2） |
 | `pnpm tauri dev` 真实窗口 | ⬜ **未跑** —— 新增命令 `svn_sync_state` 的 invoke 路径尚未验证（`AGENTS.md` §7.3 硬性要求），待用户实跑 |
 
 > 本仓库没有 PR 门禁 CI（`AGENTS.md` §4.1）。以上全部要本地实跑，如实填。
@@ -432,9 +433,11 @@ stash 去 apply 极可能挑到别人的 WIP（§7.6.1 实测过 `stash@{0}` 会
 
 - **纯新增 + 纯读。** `svn_sync_state` 一个字节都不写，也不拿锁（它恰恰是用来
   观察锁的）。既有 567 条 Rust 测试与 369 条前端测试一条没动。
-- **坏 journal 不被吞。** 命令里 `svn_journal::read(&path)?` 直接往上抛；
+- ~~**坏 journal 不被吞。** 命令里 `svn_journal::read(&path)?` 直接往上抛；
   前端 `refreshSvnSyncState` 的 catch 只影响横幅显示，错误本身照常由通用错误
-  提示呈现。吞成「一切正常」正是 Task 4 那条测试守着的反面。
+  提示呈现。~~ **这条论证是错的**（第二轮独立 review 指出，已复核）：那个 catch
+  只调了 `console.warn` 并写回 `null`，没有任何报错路径——坏 journal 在界面上
+  恰恰被吞成了「一切正常」。修法见 Task 8。
 - **让位规则收敛在一处。** `otherBannersAreSuppressed` 与既有的
   `syncBannerIsSuppressed` 同形，由 vitest 钉住，不是散在组件里的 `&&`。
 - **前端读失败写 `null` 而不是编造状态**，与既有 `refreshSvnEol` 完全同形。
@@ -538,3 +541,84 @@ delete 登记）的流程说这句话，是整个界面能说出的最有害的�
   接管不动手），不存在「为了让一边安全而把另一边放开」。
 - **`tsc` 在 N5 的接线上抓到了一处漏传**（`RepoTab.tsx` 的 refreshers 对象缺字段），
   说明那条类型约束是有效的，不是摆设。
+
+---
+
+## Task 8：修入第二轮独立 review（2026-09-25）
+
+第二轮 review 报了 8 条（中 3、低 5），**逐条对照代码复核，全部成立**。其中第 1 条的
+BOM 部分用 Windows PowerShell 5.1 实测过：`Set-Content -Encoding utf8` 写出的文件
+开头是 `EF BB BF`。本轮修 4 条，其余 4 条记为 2c 待办。
+
+### 修了的
+
+| # | 发现 | 处理 |
+|---|---|---|
+| R1a | E2E 场景 3 仍用 `Set-Content -Encoding utf8` 写锁文件——N12 只修了场景 1。5.1 写出的 BOM 让 `holder()` 返回 `None`，横幅看不到 9999 | 改成 `[IO.File]::WriteAllText`，并在场景 3 重复那条警告 |
+| R1b | 场景 3 第 4 步用 Ctrl+C「模拟持锁进程退出」。Ctrl+C 只打断 `Start-Sleep`，`$f` 仍留在会话里开着，**锁根本没释放**——按清单对照表会被误判成「存活判据退化」 | 删掉 `Start-Sleep`（锁就是 `$f` 本身，不需要撑着）；第 4 步改为 `$f.Close()` 或关窗口，并写明为什么不能用 Ctrl+C |
+| R2 | Task 6「为什么安全」里「错误照常由通用错误提示呈现」**与代码不符**；`repoStore.ts` 的 JSDoc 有同一句。实际行为：坏 journal → catch 写 `null` → 不挂横幅、不报错 | **代码与文档一起修**，见下 |
+| R3 | spec §5.1.2 与 §18 写非 Windows「降级为无法判定存活」，代码返回的是 `Free` | **改 spec，不改代码**，见下 |
+| R4 | `stashing` 的文案写着 `**不要**`，横幅按纯文本渲染，用户会看到两对星号 | 去掉星号；新增一条 vitest 扫所有横幅分支的 title / detail / note，不许出现 `**` |
+
+### 没修的（记为 2c 待办）
+
+| # | 发现 | 为什么留到 2c |
+|---|---|---|
+| R5 | UI 打开锁文件（`probe` 的 `share_mode(0)`、`permissive_open` 的 `READ\|WRITE`）时都没给 `FILE_SHARE_DELETE`。持锁方 `Drop` 里的 `remove_file` 恰好撞上会失败，被 `let _ =` 吞掉，留下残锁，下次 `acquire` 打一条假的「上次没有正常收尾」。同理，接管路径的 `remove_file(&path)?` 撞上时会抛裸 io 错误 | 复核成立，概率低（要撞上微秒级窗口）。**本期没有任何代码调 `acquire`**，暴露面为零；2c 接入 `sync_in` 时一并处理（读方加 `FILE_SHARE_DELETE`，或 `Drop` 删除失败时短重试） |
+| R6 | spec §13 要求显示持锁进程的 pid **与开始时间**。横幅只显示 pid；`busy_error` 把 epoch 秒原样打印 | 要定时间格式和时区（前端本地化 vs 后端格式化），属展示层设计，和 2c 的冲突 UI 一起做 |
+| R7 | `svn_journal::write` 在 `create` / `write_all` / `sync_all` 失败时留下 `.tmp`；崩溃留下的 `.tmp` 也没有清理 | 本期没有任何代码调 `write`；与 `svn_attributes::write_attributes` 同一写法，2c 接线时两处一起收 |
+| R8 | vitest 没有「`sync_out` + 共用 phase」的组合，前端文案不看 `flow` 这件事没有测试挡 | 共用录制阶段在 `sync_out` 下该说什么，要等 `sync_out` 的语义定下来（与 N8 同理）。2c/Phase 3 接 `sync_out` 时补 |
+
+### 偏离计划
+
+- **R2 没有走「通用错误提示」**，虽然那是 Task 6 文档原本声称的做法。原因：N5 之后
+  `refreshSvnSyncState` 挂在 `repo-changed` 上，每次保存文件都重读一次；走顶部错误
+  横幅的话，用户关掉它、下一次保存又弹回来。改为在同步横幅的位置挂一条**红条**
+  「读不出上次同步的记录」，正文接后端报错原文，且**其余横幅同样让位**。
+- 为此新增类型 `SyncStateUnreadable = { readError }`。store 字段从
+  `SyncState | null` 放宽为 `SyncState | SyncStateUnreadable | null`，只有
+  `BaselineBanner` 一个消费方，`describeUnfinishedSync` / `otherBannersAreSuppressed`
+  的参数随之放宽。`svnEol` 仍是读失败写 `null`，这里**有意不同**：行尾读不到的
+  后果是少一条提示，journal 读不到的后果是把「中间态」显示成「干净」。
+
+### 计划的错误
+
+- **spec §5.1.2 / §18：「非 Windows 明确降级为无法判定存活」**。按 Task 7 的三态模型，
+  这对应 `Unknown`：守卫关门、接管不动手，于是非 Windows 上**任何一次崩溃留下的锁
+  文件都会永久挡住所有写操作，且没有入口能解开**。代码实际是 `Free`（不做互斥），
+  这才是对的取舍：没有互斥 = 与本期之前相同，永久卡死 = 新引入的退化。已按实现
+  改写 spec 两处，并写明为什么不能选 `Unknown`。
+- 同一段还写着「std 没有等价的跨进程劝告锁」。这话只在本 crate 的 MSRV（1.77.2）
+  下成立；std 的 `File::try_lock` 自 1.89 起稳定，本机工具链是 1.95。spec 已改成
+  如实表述。`svn_lock.rs` 第 84 行的同一句注释**本轮没改**（只动了 TS 与文档，不为
+  一句注释重跑 Rust 全套）；若将来要在非 Windows 上做真互斥，是否提 MSRV 需要单独决定。
+
+### 计划没写的坑
+
+- **Ctrl+C 不等于进程退出。** 在交互式 PowerShell 里，Ctrl+C 只中断当前管道，会话
+  变量里的 `FileStream` 仍然开着。手工造锁的步骤必须显式 `Close()` 或关掉会话。
+- 后端 `svn_journal_corrupt` 的报错原文已经是完整句子（带路径和「请勿删除」），
+  前端再套一层括号会出现「。）。」。红条正文改为原文直接接在一句前缀后面。
+
+### 为什么这么改是安全的
+
+- **R2 只把「不挂横幅」变成「挂红条」**，方向与守卫一致：拿不准时保守。红条上
+  **没有任何按钮**，不会引导用户做出任何写操作；唯一的副作用是其余横幅让位，
+  也就是在读不出记录时不给出「重建基线」这类会移动基线指针的出口。
+- **读成功路径逐字不变**：`try` 分支没动，既有 12 条 vitest 全绿。
+- **R3 只改 spec 不改代码**，行为零变化。
+- **R4 只删了两对星号**，`stashing 阶段必须明确叫用户不要自己去 apply` 仍绿。
+
+### 验证
+
+| 命令 | 结果 |
+|---|---|
+| `pnpm vitest run tests/vitest/svnJournal.test.ts`（改代码前） | 新增 2 条**按预期失败**：`expected null not to be null`；`expected '…**不要**…' not to contain '**'` |
+| `pnpm build`（含 `tsc`） | ✅ OK |
+| `pnpm test` | ✅ **381 passed**（379 + 2） |
+| cargo 全套 | 未跑：本轮没有改 `src-tauri/**` |
+| `pnpm tauri dev` | ⬜ **仍未跑**。E2E 场景 1 新增第 5 步专验 R2 |
+
+**已知覆盖盲区**：store 里「catch 写 `{ readError }` 而不是 `null`」这一行只有 `tsc`
+和 E2E 第 5 步盖着。`null` 也是合法类型，把它改回 `null` 时 `tsc` 不会报错；
+vitest 只覆盖纯逻辑层。本仓库目前没有 store 层的测试基建，这一行靠 E2E 兜。

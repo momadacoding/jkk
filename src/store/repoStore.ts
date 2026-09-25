@@ -13,7 +13,7 @@ import {
   type ServerAudit,
   type SyncStatus,
 } from '../engine/svnSync'
-import { type SyncState } from '../engine/svnJournal'
+import { type SyncState, type SyncStateUnreadable } from '../engine/svnJournal'
 import { baselineMap, remapRefs, spliceHistory, type SvnRevNode } from '../engine/svnGraph'
 
 import { toErrorCode, toErrorMessage } from '../engine/errors'
@@ -128,10 +128,11 @@ export interface RepoState {
   /**
    * 同步锁与上次未收尾的 journal（spec §5.1、§7.6）。`null` = 还没读到。
    *
-   * 与 `svnEol` 同样的道理：读失败也是 `null`，那时不挂横幅，但不能当成
+   * 读失败**不写 `null`**（与 `svnEol` 不同）：写成 `{ readError }`，横幅照样
+   * 挂出来并让其余横幅让位。`null` 不挂横幅，那等于把「journal 坏了」显示成
    * 「上次干净收尾了」。
    */
-  svnSyncState: SyncState | null
+  svnSyncState: SyncState | SyncStateUnreadable | null
   /** SVN 历史（缓存 + 已拉取的），按 revision 降序。 */
   svnRevs: SvnRevNode[]
   /**
@@ -494,9 +495,10 @@ export function useRepoStore() {
   /**
    * 同步锁与上次未收尾的 journal（spec §5.1、§7.6）。
    *
-   * `samePath` 守卫同上。失败写 `null`：读不到就不挂横幅——**但这不等于**
-   * 「上次干净收尾了」。后端的 journal 坏了会以 `svn_journal_corrupt` 抛上来，
-   * 那条错误由通用错误提示负责显示，不在这里吞成「一切正常」。
+   * `samePath` 守卫同上。失败**不写 `null`**：后端的 journal 坏了会以
+   * `svn_journal_corrupt` 抛上来，写 `null` 就不挂横幅、也不报错——等于把它
+   * 吞成「一切正常」。也不走顶部通用错误横幅：`repo-changed` 每次保存文件都会
+   * 重读一次，那条错误关掉又会立刻弹回来。
    */
   const refreshSvnSyncState = async (path: string) => {
     try {
@@ -504,7 +506,10 @@ export function useRepoStore() {
       setState((s) => (samePath(s.path ?? '', path) ? { ...s, svnSyncState: st } : s))
     } catch (err) {
       console.warn('读同步状态失败：', err)
-      setState((s) => (samePath(s.path ?? '', path) ? { ...s, svnSyncState: null } : s))
+      const unreadable: SyncStateUnreadable = { readError: toErrorMessage(err) }
+      setState((s) =>
+        samePath(s.path ?? '', path) ? { ...s, svnSyncState: unreadable } : s,
+      )
     }
   }
 

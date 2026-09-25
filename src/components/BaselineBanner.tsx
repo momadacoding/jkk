@@ -13,6 +13,7 @@ import {
   describeUnfinishedSync,
   otherBannersAreSuppressed,
   type SyncState,
+  type SyncStateUnreadable,
 } from '../engine/svnJournal'
 
 interface BaselineBannerProps {
@@ -23,11 +24,12 @@ interface BaselineBannerProps {
   /** 行尾规则装了没有（spec §7.3.0）。`null` = 还没读到。 */
   eol: EolStatus | null
   /**
-   * 同步锁与上次未收尾的 journal（spec §5.1、§7.6）。`null` = 还没读到。
+   * 同步锁与上次未收尾的 journal（spec §5.1、§7.6）。`null` = 还没读到；
+   * `{ readError }` = 读失败，照样挂红条。
    *
    * 它挂出来的横幅**排在最前，且其余横幅全部让位**——理由见组件里的注释。
    */
-  syncState: SyncState | null
+  syncState: SyncState | SyncStateUnreadable | null
   /** 重建基线。调用方负责先弹确认。 */
   onRebuild: () => void
   /** 手动体检当前基线。 */

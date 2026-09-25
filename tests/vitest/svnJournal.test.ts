@@ -4,6 +4,7 @@ import {
   otherBannersAreSuppressed,
   type SyncPhase,
   type SyncState,
+  type SyncStateUnreadable,
 } from '@/engine/svnJournal'
 
 const clean: SyncState = { locked: false, holder: null, unfinished: null }
@@ -133,5 +134,54 @@ describe('describeUnfinishedSync', () => {
       unfinished: { flow: 'sync_in', phase: 'stashing', opid: 'x', startedAt: 1 },
     })!
     expect(b.detail).toContain('不要')
+  })
+
+  it('读不出同步状态 ≠ 干净：必须挂红条，且其余横幅让位', () => {
+    // 后端把「journal 坏了」与「没有 journal」严格分开（B3），前端若在 catch 里
+    // 写回 null，这两者又在界面上合成了「一切正常」——不挂横幅、也不报错。
+    // 判不出来时仓库可能正停在中间态，与守卫同一方向：保守地当成有问题。
+    const unreadable: SyncStateUnreadable = {
+      readError: '同步记录 .git/mygitclient-sync.json 读不出来：缺字段 phase',
+    }
+    const b = describeUnfinishedSync(unreadable)!
+    expect(b).not.toBeNull()
+    expect(b.tone).toBe('danger')
+    expect(b.detail).toContain('缺字段 phase')
+    expect(b.actions).toEqual([])
+    expect(otherBannersAreSuppressed(unreadable)).toBe(true)
+  })
+
+  it('横幅按纯文本渲染，文案里不能带 Markdown 记号', () => {
+    // BaselineBanner 用 `<p>{detail}</p>` 渲染，`**不要**` 会原样显示两对星号。
+    const phases: SyncPhase[] = [
+      'start',
+      'stashing',
+      'stashed',
+      'rebase',
+      'capturing-baseline',
+      'publishing-baseline',
+      'baseline-ready',
+    ]
+    const states: (SyncState | SyncStateUnreadable)[] = [
+      ...phases.map((phase) => ({
+        locked: false,
+        holder: null,
+        unfinished: { flow: 'sync_in' as const, phase, opid: 'x', startedAt: 1 },
+      })),
+      {
+        locked: false,
+        holder: null,
+        unfinished: { flow: 'sync_out', phase: 'svn-staged' as SyncPhase, opid: 'x', startedAt: 1 },
+      },
+      { locked: true, holder: { pid: 1, startedAt: 1, opid: 'x' }, unfinished: null },
+      { locked: true, holder: null, unfinished: null },
+      { readError: 'x' },
+    ]
+    for (const s of states) {
+      const b = describeUnfinishedSync(s)!
+      for (const text of [b.title, b.detail, b.note ?? '']) {
+        expect(text, JSON.stringify(s)).not.toContain('**')
+      }
+    }
   })
 })

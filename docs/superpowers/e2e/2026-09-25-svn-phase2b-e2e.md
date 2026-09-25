@@ -23,7 +23,7 @@ watcher 挂起，以及「上次同步未完成」的检测与展示。
 
 ⚠️ **没跑的别勾。** 空着是如实，勾上是谎报。
 
-- [ ] 场景 1：手写 journal → 出现「上次同步没有正常结束」横幅，且其余横幅让位
+- [ ] 场景 1：手写 journal → 出现「上次同步没有正常结束」横幅，且其余横幅让位；坏 journal → 「读不出上次同步的记录」红条
 - [ ] 场景 2：删掉 journal → 横幅消失，其余横幅回来
 - [ ] 场景 3：手工造一把活锁 → 写操作被拒，读操作照常
 
@@ -58,7 +58,8 @@ $j = '{"opid":"manual-test","flow":"sync_in","phase":"stashed","startedAt":17570
 
 > ⚠️ **别用 `Set-Content -Encoding utf8`。** Windows 自带的 PowerShell 5.1 会给
 > 它写上 **BOM**（PowerShell 7 不会），而 serde_json 见到 BOM 直接报
-> `expected value`——你会掉进下面那张表的「坏 JSON」那一行，而不是看到横幅。
+> `expected value`——你会看到下面那张表「读不出上次同步的记录」那一行，而不是
+> 本场景要验的横幅。
 > `[IO.File]::WriteAllText` 两个版本都不写 BOM。
 
 3. 重新 `pnpm tauri dev`，打开 `<WC>`。
@@ -79,12 +80,23 @@ $j = '{"opid":"manual-test","flow":"sync_in","phase":"stashed","startedAt":17570
 | 没有横幅 | `svn_sync_state` 没被调用，或参数名转换写错了（这正是本场景要抓的） |
 | 横幅在，但「体检基线」灰条也还在 | `otherBannersAreSuppressed` 的让位判据没接上 |
 | 横幅上有按钮 | 不该有。本期只检测与展示，能收尾的「继续 / 放弃」在 2c |
-| 弹出报错、提示 journal 读不出来 | JSON 写错了（比如编码不是 UTF-8）。这条错误本身是**对的行为**——坏 journal 必须报错而不是当成没有 |
+| 红色横幅，标题「读不出上次同步的记录」 | JSON 写错了（比如带了 BOM）。这条横幅本身是**对的行为**——坏 journal 必须挂出来而不是当成没有（见第 5 步） |
 
 4. 顺带验一下「正在进行中」那条分支与它不同。把 phase 改成 `rebase` 并**同时**
    造一把活锁（见场景 3 第 2 步），重开应用：标题应当变成
    **「这个工作副本正在进行一次同步」**，是**黄色**而不是红色，且说明里带着
    持锁进程的 pid。
+
+5. 验「坏 journal 不被吞」。先按场景 3 第 4 步释放掉第 4 步造的锁，再把记录写成
+   一个缺字段的 JSON，重开应用：
+
+```powershell
+[IO.File]::WriteAllText('<WC>\.git\mygitclient-sync.json', '{}')
+```
+
+   **应该看到**红色横幅，标题 **「读不出上次同步的记录」**，说明里带着后端的
+   报错原文（含 `missing field`），且其余横幅同样全部让位。**没有横幅**就说明前端把
+   读失败又吞成了「一切正常」。验完回到第 2 步把正常的记录写回去，或者直接进场景 2。
 
 ---
 
@@ -116,11 +128,16 @@ Remove-Item <WC>\.git\mygitclient-sync.json
 
 ```powershell
 $lock = '<WC>\.git\mygitclient-sync.lock'
-'{"pid":9999,"startedAt":1757000000,"opid":"manual"}' | Set-Content -Encoding utf8 $lock
+[IO.File]::WriteAllText($lock, '{"pid":9999,"startedAt":1757000000,"opid":"manual"}')
 $f = [System.IO.File]::Open($lock,'Open','ReadWrite','Read')
-'锁已持有，这个窗口别关。验完按 Ctrl+C。'
-Start-Sleep 600
+'锁已持有。这个窗口别关，也别跑别的命令，第 4 步再回来。'
 ```
+
+> ⚠️ 同场景 1：**别用 `Set-Content -Encoding utf8`**，PowerShell 5.1 写出的 BOM
+> 会让 `holder()` 解析失败，横幅只会说「还读不到持有它的进程信息」，看不到 9999。
+>
+> 锁就是 `$f` 这个句柄本身：只要这个 PowerShell 会话还活着、`$f` 没关，锁就一直
+> 被持有，不需要 `Start-Sleep` 撑着。
 
 3. 另起 `pnpm tauri dev`，打开 `<WC>`。
 
@@ -133,8 +150,16 @@ Start-Sleep 600
   「这个工作副本上已经有一次同步正在进行」，并报出持有者 pid。
   切换分支、提交同理。
 
-4. 回到第 2 步那个窗口按 **Ctrl+C** 结束它（模拟持锁进程退出），
-   然后在应用里**重新打开**这个仓库。
+4. 回到第 2 步那个窗口释放锁（模拟持锁进程退出），二选一：
+
+   ```powershell
+   $f.Close()
+   ```
+
+   或者直接**关掉那个 PowerShell 窗口**。然后在应用里**重新打开**这个仓库。
+
+   > ⚠️ **不要用 Ctrl+C 代替。** Ctrl+C 只中断正在跑的命令，`$f` 仍留在会话里
+   > 开着，锁并没有释放——你会看到横幅还在，并被下表误判成「存活判据退化」。
 
 **应该看到：**
 
