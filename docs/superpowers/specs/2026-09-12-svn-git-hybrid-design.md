@@ -1579,6 +1579,10 @@ S9   复核 §7.3.2 的待重放区间，再 git rebase --empty=drop svn/base
                                                          ← 普通内容冲突在这里处理，无 merge-tree 前置
 S10  git stash apply <OID>（若 S1 有 stash），成功后
      git stash drop 对应条目 + 删掉 refs/mygitclient/sync/<opid>
+     ⚠️ apply 之前先查 stash 里的未跟踪文件在磁盘上有没有同名的，有就一个字节
+        都不 apply（2026-09-25 实测：撞名时 git 会先写已跟踪部分再失败，半套 apply）。
+        例外：磁盘、stash、HEAD 三处是同一个 blob 的，是同一个文件，先从磁盘拿掉
+        再 apply（外部 update 带来的服务器新增文件就是这个形状）
 S11  删除 journal；恢复 watcher + 主动发 repo-changed
 ```
 
@@ -1891,12 +1895,13 @@ rebase 预检使用的目标 OID 与 `origHead` 同样落盘，禁止用可能�
 | `publishing-baseline` | TREE 已核对；新基线 commit 可能已创建或已发布，工作分支尚未恢复 | 比对 journal 的新旧 OID 判定发布状态，按 §8.2.2 继续；不重新提交 SVN、不覆盖外部推进的基线 |
 | `restoring-branch` | 基线已发布且索引已对齐；D8d 可能已切回原分支、正在 rebase 或已完成 | 按 HEAD、原分支 OID 与 Git 的 rebase 状态继续 D8d 或进入 D10；不得回到 D6 / D8c 覆盖冲突 |
 
-`sync_in` 另有两个 phase 与 stash 相关，见 §7.3.1：
+`sync_in` 另有三个 phase 与 stash 相关，见 §7.3.1：
 
 | phase | 已经发生了什么 | 放弃时怎么收尾 |
 |---|---|---|
 | `stashing` | `stashRefBefore` 已落盘，`git stash push` 可能落地也可能没有 | 比对当前 `refs/stash` 与 `stashRefBefore` 判定，**不静默 apply** |
 | `stashed` | stash 已落地且 OID 已钉住 | 按 `stashOid` 恢复 |
+| `applying-stash` | S9 已完成，正在或已经执行 S10 的 `git stash apply <OID>`；`stashApplied` 为真表示 apply 已执行（成功或留下冲突） | `stashApplied` 为假：可再次 apply（先查未跟踪文件撞名）；为真：只 drop，**不再 apply**。放弃时只删 journal 与钉住的 ref，stash 条目原样保留给用户 |
 
 S7 与恢复⑥另共用以下录制阶段，以 `flow` 及 `captureReturnStep` 区分后续入口：
 

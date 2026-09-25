@@ -140,6 +140,7 @@ fn every_phase_uses_the_exact_string_from_the_spec() {
         (Phase::PublishingBaseline, "publishing-baseline"),
         (Phase::BaselineReady, "baseline-ready"),
         (Phase::Rebase, "rebase"),
+        (Phase::ApplyingStash, "applying-stash"),
         (Phase::Prepare, "prepare"),
         (Phase::BuildingDeliver, "building-deliver"),
         (Phase::DeliverBuilt, "deliver-built"),
@@ -216,4 +217,20 @@ fn a_stale_tmp_left_by_a_crash_is_swept_on_the_next_write() {
 
     assert!(!stale.exists(), "残留 tmp 必须被清掉");
     assert!(bystander.exists(), "只清 `.tmp` 结尾的同前缀文件");
+}
+
+#[test]
+fn stash_applied_round_trips_and_is_omitted_when_false() {
+    let fx = git_dir_fixture();
+    let root = fx.path().to_str().unwrap();
+    let mut j = minimal("sa");
+    write(root, &j).unwrap();
+    let raw = std::fs::read_to_string(journal_path(root)).unwrap();
+    assert!(
+        !raw.contains("stashApplied"),
+        "false 时不写出，sync_in 早期的 journal 保持干净"
+    );
+    j.stash_applied = true;
+    write(root, &j).unwrap();
+    assert!(read(root).unwrap().unwrap().stash_applied);
 }

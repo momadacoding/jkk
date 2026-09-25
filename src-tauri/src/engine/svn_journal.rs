@@ -44,6 +44,11 @@ pub enum Phase {
     Stashing,
     Stashed,
     Rebase,
+    /// S10：正在 / 已经把 stash 取回来（计划 A2，spec §7.6 本期补上）。
+    ///
+    /// 没有它的话，S9 成功之后只剩 `rebase`，崩溃重开时分不清 stash 有没有
+    /// apply 过——再 apply 一次会撞上自己留下的改动。配合 [`Journal::stash_applied`]。
+    ApplyingStash,
     // —— 两个流程共用的录制阶段 ——
     CapturingBaseline,
     PublishingBaseline,
@@ -98,6 +103,13 @@ pub struct Journal {
     /// 任何一次新的 stash 都会把 `stash@{0}` 挤走，按位置恢复会应用到别人的 WIP）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stash_oid: Option<String>,
+    /// S10 的 `git stash apply` 已经执行过（成功或留下冲突）。
+    ///
+    /// 为真时「继续」只做 drop，**不再 apply**。在 apply 返回之后、drop 之前落盘；
+    /// 崩在这两步之间时它仍是 false，继续会再 apply 一次——2026-09-25 实测 git
+    /// 此时拒绝（「would be overwritten」）且不动任何文件，所以最坏是一条报错。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stash_applied: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_rev_before: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

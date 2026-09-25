@@ -10,7 +10,7 @@
 | 0 | 决策日志 + 自检 | ✅ 完成 | 本文件 | 自检见下「Task 0」；`pnpm install` 成功 |
 | 1 | 2b 遗留：watcher RAII、锁释放重试、journal tmp 清理、持锁时长 | ✅ 完成 | `commands/watch.rs`、`svn_lock.rs`、`svn_journal.rs` + 5 条测试 | RED 已见（2 编译失败 + 1 断言失败）；3 条变异各自只红对应测试；fmt / clippy 0 告警 / `cargo test` 608 passed 0 failed |
 | 2 | 前置检查 | ✅ 完成 | `svn_xml::parse_update_status`、新模块 `svn_sync_check.rs`、fixture `hybrid_with_colleague` + 17 条测试 | RED 已见（两个测试文件编译失败）；4 条变异各自只红对应测试；fmt / clippy 0 告警 / `cargo test` 625 passed 0 failed |
-| 3 | WIP 压栈与取回 | ⬜ | | |
+| 3 | WIP 压栈与取回 | ✅ 完成 | `svn_journal`（`ApplyingStash`、`stash_applied`）、新模块 `svn_sync_stash.rs` + 14 条测试、spec §7.3 S10 注记 / §7.6 phase 表 | RED 已见（两个测试文件编译失败）；8 条变异各自红对应测试；fmt / clippy 0 告警 / `cargo test` 639 passed 0 failed |
 | 4 | 基线录制零件拆分 | ⬜ | | |
 | 5 | 编排主路径 S0–S11 + 冲突出口 | ⬜ | | |
 | 6 | 继续 / 放弃（含回原分支） | ⬜ | | |
@@ -160,3 +160,46 @@
 - 整个模块是**纯读**：git 只跑 `symbolic-ref` / `rev-parse` / `rev-list` / `diff --name-only`，svn 只跑 `status -u --xml`；纳入集合预检用 `TempIndex`（临时索引文件，Drop 时删），不碰真实索引、HEAD 与磁盘。
 - `assert_linear` 在拼 `target..tip` 之前校验两端都是 40 位十六进制 OID：空 OID 会让区间退化成 `..tip`（= `HEAD..tip`），查的不是我们以为的那段；`rev-list` 非零退出一律报错，不当成「没有 merge」（变异 2 钉住）。
 - svn 冲突判定同时看 `item == "conflicted"` 与 `tree-conflicted="true"`：树冲突节点的 `item` 是 `added`（变异 1 钉住）。
+
+---
+
+## Task 3：WIP 压栈与取回（S1 / S10）
+
+### 验证记录
+
+| 步骤 | 实际结果 |
+|---|---|
+| RED | `svn_journal` 缺 `ApplyingStash` / `stash_applied`，`svn_sync_stash` 模块不存在，两个测试文件编译失败，与计划期望一致 |
+| GREEN（首轮） | 12 / 13：`a_failed_push_that_changed_nothing_leaves_no_journal` 红在 `r.is_err()`——见「计划的错误」 |
+| GREEN | `svn_journal` 12 passed；`svn_sync_stash` 13 passed |
+| 变异 1：去掉撞名预检整段 | 红 `restore_refuses_when_an_untracked_file_would_collide`，另红三条 A17 用例（同名同 blob 的放行逻辑也在这段里，属预期） |
+| 变异 2：`find_by_opid` 取 reflog 第一行 | 红 `settle_finds_our_stash_even_when_another_was_pushed_on_top`，另红 `settle_stops_when_the_stash_vanished`（第一行就是「不是我们的」那条，被当成我们的，属预期） |
+| 变异 3：`settle_stashing` 的 `None` 分支不比对 `refs/stash` | 只红 `settle_stops_when_the_stash_vanished` |
+| 变异 4：`drop_wip` 固定 drop `stash@{0}` | 计划原测试**没抓住**（见「偏离计划」）；加强后只红 `restore_applies_and_drop_removes_only_ours` |
+| 变异 5：`is_same_file_everywhere` 恒 `false` | 红 `restore_passes_over_…` 与 `a_real_collision_blocks_…`（后者撞名列表多出 `S.cs`，属预期） |
+| 变异 6：不比磁盘 blob | 只红 `a_same_name_file_edited_on_disk_is_a_real_collision` |
+| 变异 7：真撞名时先删字节相同的文件 | 红 `a_real_collision_blocks_…`（目标）；`restore_passes_over_…` 也红，是变异写法把删除做了两遍的副作用 |
+| 变异 8（补充）：push 失败时不删 journal | 只红 `a_failed_push_that_changed_nothing_leaves_no_journal`——证明换了失败手段之后这条测试真的走到了删除分支 |
+| 全量 | `cargo fmt --check` 0；`cargo clippy --all-targets` 0 告警；`cargo test` 639 passed / 0 failed（48 个测试二进制，= Task 2 的 625 + 本 Task 14） |
+
+### 偏离计划
+
+- `restore_applies_and_drop_removes_only_ours`：在我们的 stash 之后**再压一条别人的**，并断言它还在。计划原样的测试里「别人的」那条压在我们之前，我们那条恰好在栈顶，`drop stash@{0}` 与按 OID 定位结果一样，变异 4 抓不到。
+- `a_failed_push_that_changed_nothing_leaves_no_journal`：制造 push 失败的手段从「白名单指向不存在的路径」换成「预先放一个 `.git/index.lock`」，白名单用正常的 `Code/`。
+
+### 计划的错误
+
+- 计划假设 `git stash push -u -m … -- Nope/`（pathspec 不匹配任何文件）会报错。**2026-09-26 实测（git 2.51.2.windows.1）**：带 `-u` 时输出 `No local changes to save`、**退出 0**；不带 `-u` 才报 `pathspec … did not match` 退出 1。所以那条测试在实现正确时也必然红。
+
+### 计划没写的坑
+
+- `.git/index.lock` 存在时 `git stash push -u` 报 `Unable to create … index.lock` / `could not write index`，**退出 1，工作区、未跟踪文件、stash 栈都不动**（同日实测）。这是「push 失败且没落地」的真实形态，也是用户侧最可能遇到的一种（另一个 git 进程崩溃后留下的锁）。
+- 同一现象的推论：白名单里某个根目录在磁盘上不存在时，`stash_wip` 不报错，按 A7 走到 `stashed` 且无 `stashOid`。这与「那里本来就没有可压的改动」语义一致，不需要特殊处理。
+- `svn_journal.rs`、`engine/mod.rs` 是 CRLF；本 Task 用脚本改它们时先判断行尾再替换。
+
+### 为什么这么改是安全的
+
+- `stash_wip` 空白名单直接拒绝（`sync_stash_empty_whitelist`），不会退化成整仓 stash（§12.2，测试钉住）。
+- push 失败后只有在「按 opid 找不到、且 `refs/stash` 与写 journal 前一致」时才删 journal；任何一条不满足都保留 journal，交给 `settle_stashing` 的判定树。
+- `restore_wip` 在 apply 前完成撞名判定；真撞名时返回 `Blocked`，此时**没有删任何文件、没有 apply**（变异 7 钉住）。A17 放行只删「磁盘 == stash == HEAD 同一 blob」的文件，删掉的字节在 HEAD 里原样存在；apply 中途失败时从 HEAD 取回。
+- `drop_wip` 按 OID 在 reflog 里定位；drop 输出里的 OID 与预期不符时把误删的那条 `stash store` 放回并报错（`sync_stash_drop_raced`），不吞别人的 WIP。
