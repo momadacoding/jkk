@@ -464,6 +464,17 @@ body {
   font-weight: 400;
 }
 
+/* 上游已删除（git branch -vv 的 gone）。和云图标同一档：次要信息，
+   压暗但不另起底色——pill 底色是车道色，再叠一块色会很乱 */
+.ref-pill-gone {
+  flex-shrink: 0;
+  margin-left: 5px;
+  opacity: 0.75;
+  font-size: 10px;
+  font-weight: 400;
+  font-style: italic;
+}
+
 /* 本地分支：左侧色条与底色都取车道色（由内联 style 覆盖），
    标签因此能和图上那条线对应起来 */
 .ref-pill.branch {
@@ -1238,6 +1249,20 @@ body {
 .sb-pr.merged-ahead {
   background: rgba(137, 87, 224, 0.20);
   color: #c8a8f5;
+}
+
+/* 上游已删除。配色沿用 .sb-pr.draft 那套灰（已按 hover/selected 叠层实测过对比度）：
+   这不是警报，只是「这条分支的远端没了」的事实。
+   和 PR 徽章一样不在 hover 时隐藏，否则悬停提示永远看不到 */
+.sb-gone {
+  flex-shrink: 0;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: rgba(139, 148, 158, 0.18);
+  color: #b0b8c2;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 15px;
 }
 
 .sb-current-dot {

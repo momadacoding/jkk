@@ -3,6 +3,7 @@ use git2::{BranchType, Repository};
 use serde::Serialize;
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RefPointer {
     pub name: String,
     pub hash: String,
@@ -13,6 +14,13 @@ pub struct RefPointer {
     /// 也是噪音——前端靠这个区别决定显不显示。
     pub ahead: Option<usize>,
     pub behind: Option<usize>,
+    /// 配置了上游、但上游 ref 已不存在时，给出那个上游的完整 ref 名
+    /// （如 `refs/remotes/origin/feature`）；其余情况为 None。
+    ///
+    /// 就是 `git branch -vv` 里的 `[origin/feature: gone]`：远端分支被删、本地又
+    /// prune 过。此时远程跟踪 ref 没了，graph 上画不出远程标签，↑↓ 也没有可比的
+    /// 对象——界面看起来和「从没推过」一模一样，只能靠这个字段区分。
+    pub gone_upstream: Option<String>,
 }
 
 /// 一个本地分支相对其上游的领先/落后数。
@@ -25,6 +33,23 @@ fn upstream_counts(repo: &Repository, full_name: &str) -> Option<(usize, usize)>
     let local_oid = branch.get().target()?;
     let upstream_oid = upstream.get().target()?;
     repo.graph_ahead_behind(local_oid, upstream_oid).ok()
+}
+
+/// 上游已被删除时返回它的完整 ref 名，见 [`RefPointer::gone_upstream`]。
+///
+/// 不能靠 `branch.upstream()` 的错误码区分：「没配上游」和「上游 ref 不存在」
+/// 在 libgit2 里都是 NotFound。`branch_upstream_name` 只按配置算出名字、不查 ref
+/// 是否存在，于是「算得出名字、却找不到 ref」就是 gone。
+///
+/// 算不出名字（没配上游，或 `branch.<name>.remote` 指向的 remote 已从配置里删掉）
+/// 一律当作没有上游，不报 gone——那不是「远端分支被删」，报了反而误导。
+fn gone_upstream(repo: &Repository, full_name: &str) -> Option<String> {
+    let buf = repo.branch_upstream_name(full_name).ok()?;
+    let upstream = buf.as_str()?;
+    match repo.find_reference(upstream) {
+        Err(e) if e.code() == git2::ErrorCode::NotFound => Some(upstream.to_string()),
+        _ => None,
+    }
 }
 
 pub fn collect(repo: &Repository) -> Result<Vec<RefPointer>> {
@@ -72,12 +97,18 @@ pub fn collect(repo: &Repository) -> Result<Vec<RefPointer>> {
             } else {
                 None
             };
+            let gone = if kind == "branch" {
+                gone_upstream(repo, &name)
+            } else {
+                None
+            };
             refs.push(RefPointer {
                 name: name.clone(),
                 hash: oid.to_string(),
                 kind: kind.to_string(),
                 ahead: counts.map(|(a, _)| a),
                 behind: counts.map(|(_, b)| b),
+                gone_upstream: gone,
             });
         }
     }
@@ -92,6 +123,7 @@ pub fn collect(repo: &Repository) -> Result<Vec<RefPointer>> {
                 kind: "head".to_string(),
                 ahead: None,
                 behind: None,
+                gone_upstream: None,
             });
         }
     }

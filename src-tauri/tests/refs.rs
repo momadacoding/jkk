@@ -191,3 +191,112 @@ fn counts_are_per_branch_not_per_head() {
     assert_eq!(find(&all, "refs/heads/master").ahead, Some(0));
     assert_eq!(find(&all, "refs/heads/feature").ahead, Some(1));
 }
+
+/// `git branch -vv` 那一行里有没有 `[<upstream>: gone]`。拿 git 自己的判断做基准。
+fn git_says_gone(dir: &std::path::Path, branch: &str) -> bool {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(["branch", "-vv", "--no-color"])
+        .output()
+        .expect("git not found");
+    assert!(out.status.success(), "git branch -vv failed");
+    String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+        line.trim_start_matches(['*', '+', ' '])
+            .split_whitespace()
+            .next()
+            == Some(branch)
+            && line.contains(": gone]")
+    })
+}
+
+#[test]
+fn upstream_deleted_on_remote_and_pruned_is_reported_gone() {
+    // 真实形态：分支推过并设了上游，远端（GitHub 合并 PR 后自动删分支）把它删了，
+    // 本地再 `fetch --prune`。此时 `git branch -vv` 显示 `[origin/feature: gone]`，
+    // 远程跟踪 ref 已经不存在，graph 上无从画远程标签——必须另有字段说清楚。
+    let (local, remote) = repo_with_remote();
+    run_git(local.path(), &["checkout", "-b", "feature"]);
+    commit(local.path(), "f1");
+    run_git(local.path(), &["push", "-u", "origin", "feature"]);
+    // 直接在 bare 远程上删，模拟别处删掉分支；本地这边只做 fetch --prune
+    run_git(remote.path(), &["branch", "-D", "feature"]);
+    run_git(local.path(), &["fetch", "--prune", "origin"]);
+    assert!(
+        git_says_gone(local.path(), "feature"),
+        "fixture 没造出 gone 状态"
+    );
+
+    let repo = Repository::open(local.path()).unwrap();
+    let all = refs::collect(&repo).unwrap();
+    let feature = find(&all, "refs/heads/feature");
+    assert_eq!(
+        feature.gone_upstream.as_deref(),
+        Some("refs/remotes/origin/feature")
+    );
+    // 上游不在了就没有可比的对象，计数仍是 None，不能画成 0
+    assert_eq!(feature.ahead, None);
+    assert_eq!(feature.behind, None);
+    assert!(all.iter().all(|r| r.name != "refs/remotes/origin/feature"));
+}
+
+#[test]
+fn upstream_deleted_on_remote_but_not_yet_pruned_is_not_gone() {
+    // 本地还没 prune 时远程跟踪 ref 仍在，git 也不认为 gone——
+    // 界面照旧画 origin/feature 标签和 ↑↓，不能抢先报「已删除」
+    let (local, remote) = repo_with_remote();
+    run_git(local.path(), &["checkout", "-b", "feature"]);
+    commit(local.path(), "f1");
+    run_git(local.path(), &["push", "-u", "origin", "feature"]);
+    run_git(remote.path(), &["branch", "-D", "feature"]);
+    assert!(!git_says_gone(local.path(), "feature"));
+
+    let repo = Repository::open(local.path()).unwrap();
+    let all = refs::collect(&repo).unwrap();
+    let feature = find(&all, "refs/heads/feature");
+    assert_eq!(feature.gone_upstream, None);
+    assert_eq!(feature.ahead, Some(0));
+}
+
+#[test]
+fn branch_without_upstream_config_is_not_gone() {
+    // 从没推过（EnterWorktree 建的分支就是这样）和「推过但被删」必须区分开
+    let (local, _remote) = repo_with_remote();
+    run_git(local.path(), &["branch", "solo"]);
+
+    let repo = Repository::open(local.path()).unwrap();
+    let all = refs::collect(&repo).unwrap();
+    assert_eq!(find(&all, "refs/heads/solo").gone_upstream, None);
+    assert_eq!(find(&all, "refs/heads/master").gone_upstream, None);
+}
+
+#[test]
+fn upstream_pointing_at_deleted_local_branch_is_gone() {
+    // 上游也可以是本地分支（branch.<name>.remote = "."）。它被删掉后
+    // git 同样报 `[base: gone]`，这条路径不经过任何 remote 的 refspec 映射。
+    let (local, _remote) = repo_with_remote();
+    run_git(local.path(), &["branch", "base"]);
+    run_git(local.path(), &["branch", "--track", "child", "base"]);
+    run_git(local.path(), &["branch", "-D", "base"]);
+    assert!(
+        git_says_gone(local.path(), "child"),
+        "fixture 没造出 gone 状态"
+    );
+
+    let repo = Repository::open(local.path()).unwrap();
+    let all = refs::collect(&repo).unwrap();
+    assert_eq!(
+        find(&all, "refs/heads/child").gone_upstream.as_deref(),
+        Some("refs/heads/base")
+    );
+}
+
+#[test]
+fn only_local_branches_carry_gone_upstream() {
+    let (local, _remote) = repo_with_remote();
+    run_git(local.path(), &["tag", "v1"]);
+    let repo = Repository::open(local.path()).unwrap();
+    let all = refs::collect(&repo).unwrap();
+    for r in all.iter().filter(|r| r.kind != "branch") {
+        assert_eq!(r.gone_upstream, None, "{} 不该有 gone_upstream", r.name);
+    }
+}

@@ -25,6 +25,14 @@ export interface RefPointer {
    */
   ahead: number | null
   behind: number | null
+  /**
+   * 配置了上游、但上游 ref 已不存在时，上游的完整 ref 名（如
+   * `refs/remotes/origin/feature`）；其余情况为 null。
+   *
+   * 即 `git branch -vv` 的 `[origin/feature: gone]`。此时 graph 上没有远程标签、
+   * 也没有 ↑↓，不看这个字段就和「从没推过」分不开。
+   */
+  goneUpstream: string | null
 }
 
 export interface CommitNode {
