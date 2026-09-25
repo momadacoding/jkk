@@ -26,7 +26,7 @@ use crate::engine::svn_cli::{run_svn, run_svn_code};
 use crate::engine::svn_config::{read_config, SvnConfig, BASELINE_BRANCH};
 use crate::engine::svn_dirty::read_dirty;
 use crate::engine::svn_include_check::{is_w_file, normalize_roots};
-use crate::engine::svn_init::record_server_tree_into;
+use crate::engine::svn_init::{rebuild_baseline, record_server_tree_into};
 use crate::engine::svn_journal::{self, Flow, Journal, Phase};
 use crate::engine::svn_lock;
 use crate::engine::svn_preflight::{check_targets, read_node_rev, run_preflight};
@@ -86,9 +86,13 @@ pub fn run_sync_in(repo: &str, expect: &SyncInExpect) -> Result<SyncInOutcome> {
     if svn_journal::read(repo)?.is_some() {
         return Err(unfinished_error());
     }
-    // §7.2 第 7 条：锁内复核。预览与确认之间可能过了几分钟，什么都可能变
-    let p = check_sync_in(repo)?;
+    // §7.2 第 7 条：锁内复核。预览与确认之间可能过了几分钟，什么都可能变。
+    // **必须在接管之前**：接管会移动基线指针，复核不过就一个字节都不能动
+    let mut p = check_sync_in(repo)?;
     verify_expect(&p, expect)?;
+    if p.catch_up_rev.is_some() {
+        p = catch_up(repo, &p, expect)?;
+    }
     let cfg = read_config(repo)?;
 
     // S0：任何修改之前落盘；origBranch / origHead 此刻就写（§7.3.1）
@@ -135,6 +139,50 @@ fn verify_expect(p: &SyncInPreview, e: &SyncInExpect) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// 计划 A16：工作副本被外部整体 update 到了比基线新的 rN。
+///
+/// 先用 Phase 1 的「重建基线」把 `svn/base` 录成服务器 rN 的原版（`svn cat -r BASE`，
+/// 不碰磁盘），再走正常的 S0–S11：S9 把分支重放上去、S10 放回 WIP 时，服务器那部分
+/// 改动两边一致，三方合并自动抵消，git 这一侧重新分得清「服务器的」和「我的」
+/// （2026-09-25 实测，见计划 Task 7A）。
+///
+/// # 为什么放在 S0 之前、不写 journal
+///
+/// `rebuild_baseline` 不碰 HEAD、真实索引和磁盘，只以旧 OID 为条件移动一个 ref（R4）。
+/// 它要么没发生、要么完整发生，两种状态都自洽：崩在它之后，重开时基线已经跟上、
+/// 没有 journal，下次预览看到的就是普通的 `InSync`。没有需要恢复的中间态，
+/// 为它加 phase 只会多一种要处理的崩溃现场。
+///
+/// # 为什么接管之后还要再复核
+///
+/// 后面 S0 记的 `baselineOidBefore` 必须是**新**基线；同时确认重建期间分支没被动过。
+/// 预览时给用户看过的「会碰到的白名单外文件」照常再比一次。
+fn catch_up(repo: &str, before: &SyncInPreview, expect: &SyncInExpect) -> Result<SyncInPreview> {
+    let report = rebuild_baseline(repo)?;
+    let p = check_sync_in(repo)?;
+    if report.old_baseline != before.baseline_oid
+        || p.catch_up_rev.is_some()
+        || p.orig_branch != before.orig_branch
+    {
+        return Err(GitError::new(
+            "sync_in_state_changed",
+            format!(
+                "基线已经按服务器 r{} 的原版重录好了，但复核时发现仓库在这期间被别的操作改动过。\
+                 你的文件和分支都还没有被收起或改动，请重新点一次「更新」。",
+                report.node_rev
+            ),
+        ));
+    }
+    verify_expect(
+        &p,
+        &SyncInExpect {
+            baseline_oid: p.baseline_oid.clone(),
+            ..expect.clone()
+        },
+    )?;
+    Ok(p)
 }
 
 /// S3 起。`fresh` 为真表示本进程一路从 S0 走到这里（Task 7 的回退据此选前提）。

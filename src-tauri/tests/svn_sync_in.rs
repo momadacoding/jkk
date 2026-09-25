@@ -870,3 +870,223 @@ fn a_tree_conflict_rolls_back() {
     assert_eq!(baseline_rev(&fx), 1, "基线不推进");
     assert_eq!(phase(&fx), None);
 }
+
+/// 10 行的文件内容，`edits` 里的行（从 1 数）换成给定文本。
+///
+/// 外部 update 的三方合并要有「不同的行」可合：单行文件上服务器与本地一改就是 svn 冲突，
+/// 测不到本 Task 要测的「静默合并」。
+fn ten_lines(tag: &str, edits: &[(usize, &str)]) -> String {
+    (1..=10)
+        .map(|i| match edits.iter().find(|(n, _)| *n == i) {
+            Some((_, s)) => format!("{s}\n"),
+            None => format!("{tag}{i}\n"),
+        })
+        .collect()
+}
+
+/// 先让同事把 A / B 换成 10 行的文件（r2、r3），再走一次正常更新，基线停在 r3。
+fn with_ten_line_files(fx: &SvnFixture) {
+    fx.colleague_commits("Code/A.cs", &ten_lines("a", &[]));
+    fx.colleague_commits("Code/B.cs", &ten_lines("b", &[]));
+    assert_eq!(sync(fx), SyncInOutcome::Done { new_rev: 3 });
+}
+
+/// diff 里真正的增删行（去掉 `+++` / `---` 文件头与 `@@` hunk 头）。
+fn changed_lines(diff: &str) -> String {
+    diff.lines()
+        .filter(|l| {
+            (l.starts_with('+') && !l.starts_with("+++"))
+                || (l.starts_with('-') && !l.starts_with("---"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// TortoiseSVN 在项目根点 update 的等价物。
+fn external_root_update(fx: &SvnFixture) {
+    svn_fixtures::svn_cmd(
+        &fx.wc(),
+        &["update", "--accept", "postpone", "--non-interactive"],
+    );
+}
+
+#[test]
+fn an_external_root_update_is_taken_over_and_separated_again() {
+    // 用户 2026-09-25 提的日常场景（计划 A16）：本地 2 个 commit + 未提交改动，
+    // 早上在 TortoiseSVN 里对项目根点了 update
+    let fx = hybrid_with_colleague();
+    with_ten_line_files(&fx);
+    write(&fx, "Code/A.cs", &ten_lines("a", &[(1, "a1-commit")]));
+    commit(&fx, "c1");
+    write(&fx, "Code/B.cs", &ten_lines("b", &[(1, "b1-commit")]));
+    commit(&fx, "c2");
+    write(
+        &fx,
+        "Code/A.cs",
+        &ten_lines("a", &[(1, "a1-commit"), (9, "a9-wip")]),
+    );
+    write(
+        &fx,
+        "Code/B.cs",
+        &ten_lines("b", &[(1, "b1-commit"), (9, "b9-wip")]),
+    );
+    write(&fx, "Code/New.cs", "new-wip\n");
+    fx.colleague_commits("Code/A.cs", &ten_lines("a", &[(5, "a5-server")])); // r4
+    external_root_update(&fx);
+
+    // 前提：git 这一侧确实混在一起了——测的是真实形状，不是想象的形状
+    let mixed = git(&fx, &["diff", "HEAD", "--", "Code/A.cs"]);
+    assert!(
+        mixed.contains("+a5-server") && mixed.contains("+a9-wip"),
+        "{mixed}"
+    );
+
+    let p = preview_sync_in(&fx.wc_str()).unwrap();
+    assert_eq!(
+        (p.catch_up_rev, p.baseline_rev, p.target_rev),
+        (Some(4), 3, 4)
+    );
+    assert_eq!(sync(&fx), SyncInOutcome::Done { new_rev: 4 });
+
+    assert_eq!(baseline_rev(&fx), 4);
+    assert_eq!(
+        git(&fx, &["rev-list", "--count", "svn/base..work"]),
+        "2",
+        "两个 commit 都在"
+    );
+    // 分开了：相对 HEAD 只剩自己没提交的；相对基线只剩自己提交的
+    // 只看改动行：git 会把 hunk 前一行当「函数名」印进 `@@ … @@ a5-server` 头里，
+    // 那是上下文，不是改动（2026-09-26 实测）
+    let wip = changed_lines(&git(&fx, &["diff", "HEAD"]));
+    assert!(wip.contains("+a9-wip") && wip.contains("+b9-wip"), "{wip}");
+    assert!(
+        !wip.contains("a5-server"),
+        "服务器的改动不该再显示成本地修改：\n{wip}"
+    );
+    let committed = changed_lines(&git(&fx, &["diff", "svn/base", "HEAD"]));
+    assert!(
+        committed.contains("+a1-commit") && committed.contains("+b1-commit"),
+        "{committed}"
+    );
+    assert!(
+        !committed.contains("a5-server") && !committed.contains("wip"),
+        "{committed}"
+    );
+    // 磁盘上三样都在
+    assert_eq!(
+        read(&fx, "Code/A.cs"),
+        ten_lines("a", &[(1, "a1-commit"), (5, "a5-server"), (9, "a9-wip")])
+    );
+    assert_eq!(read(&fx, "Code/New.cs"), "new-wip\n");
+    assert_eq!(
+        check_sync(&fx.wc_str()).unwrap().verdict,
+        SyncVerdict::InSync
+    );
+    assert_eq!(phase(&fx), None);
+    assert_eq!(our_stashes(&fx), 0);
+}
+
+#[test]
+fn a_file_the_server_added_does_not_block_the_catch_up() {
+    // 计划 A17：外部 update 带来的新文件 git 视为未跟踪，S1 的 -u 把它收进 stash；
+    // 基线跟上之后它又作为已跟踪文件回到磁盘。三处同一个 blob，不能停在 StashBlocked
+    let fx = hybrid_with_colleague();
+    write(&fx, "Code/B.cs", "b-wip\n");
+    fx.colleague_commits("Code/S.cs", "server-new\n"); // r2
+    external_root_update(&fx);
+    assert_eq!(
+        git(&fx, &["status", "--porcelain", "--", "Code/S.cs"]),
+        "?? Code/S.cs",
+        "前提"
+    );
+
+    assert_eq!(sync(&fx), SyncInOutcome::Done { new_rev: 2 });
+    assert_eq!(read(&fx, "Code/S.cs"), "server-new\n");
+    assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
+    assert_eq!(
+        git(&fx, &["status", "--porcelain"]),
+        "M Code/B.cs",
+        "S.cs 已被基线跟踪、与 HEAD 一致"
+    );
+    assert_eq!(our_stashes(&fx), 0);
+}
+
+#[test]
+fn a_catch_up_then_continues_to_a_newer_server_revision() {
+    // 外部 update 到 r4 之后同事又提交了 r5：先跟上 r4，再照常更新到 r5
+    let fx = hybrid_with_colleague();
+    with_ten_line_files(&fx);
+    write(&fx, "Code/B.cs", &ten_lines("b", &[(9, "b9-wip")]));
+    fx.colleague_commits("Code/A.cs", &ten_lines("a", &[(5, "a5-server")])); // r4
+    external_root_update(&fx);
+    fx.colleague_commits(
+        "Code/A.cs",
+        &ten_lines("a", &[(5, "a5-server"), (7, "a7-server")]),
+    ); // r5
+
+    let p = preview_sync_in(&fx.wc_str()).unwrap();
+    assert_eq!((p.catch_up_rev, p.target_rev), (Some(4), 5));
+    assert_eq!(sync(&fx), SyncInOutcome::Done { new_rev: 5 });
+    assert_eq!(
+        read(&fx, "Code/A.cs"),
+        ten_lines("a", &[(5, "a5-server"), (7, "a7-server")])
+    );
+    assert_eq!(git(&fx, &["diff", "HEAD", "--name-only"]), "Code/B.cs");
+    // 基线链上 r4 与 r5 各有一个 commit：接管录的 r4 是 S7 的父提交
+    let revs: Vec<u64> = git(&fx, &["log", "--format=%H", "-3", "svn/base"])
+        .lines()
+        .map(|oid| {
+            parse_trailer(&git(&fx, &["log", "-1", "--format=%B", oid]))
+                .unwrap()
+                .rev
+        })
+        .collect();
+    assert_eq!(revs, vec![5, 4, 3]);
+}
+
+#[test]
+fn an_external_update_next_to_my_own_edit_stops_as_a_stash_conflict_without_losing_anything() {
+    // 2026-09-25 实测：服务器改第 5 行、我没提交的改动在第 6 行时，svn 的三方合并静默
+    // 成功，而 git stash apply 把相邻行当成冲突。结局是 StashConflict：内容都在、备份保留
+    let fx = hybrid_with_colleague();
+    with_ten_line_files(&fx);
+    write(&fx, "Code/A.cs", &ten_lines("a", &[(6, "a6-wip")]));
+    fx.colleague_commits("Code/A.cs", &ten_lines("a", &[(5, "a5-server")])); // r4
+    external_root_update(&fx);
+    assert_eq!(
+        read(&fx, "Code/A.cs"),
+        ten_lines("a", &[(5, "a5-server"), (6, "a6-wip")]),
+        "前提：svn 静默合并成功"
+    );
+
+    match sync(&fx) {
+        SyncInOutcome::StashConflict { files, .. } => {
+            assert_eq!(files, vec!["Code/A.cs".to_string()])
+        }
+        o => panic!("相邻行应当是 stash 冲突：{o:?}"),
+    }
+    assert_eq!(baseline_rev(&fx), 4, "基线已经跟上，冲突发生在它之后");
+    let a = read(&fx, "Code/A.cs");
+    assert!(
+        a.contains("a5-server") && a.contains("a6-wip"),
+        "两边都在：\n{a}"
+    );
+    assert_eq!(our_stashes(&fx), 1, "原始备份还在");
+    assert_eq!(phase(&fx), Some(Phase::ApplyingStash));
+}
+
+#[test]
+fn a_catch_up_is_refused_when_the_branch_moved_since_the_preview() {
+    // 接管会移动基线指针，所以锁内复核必须在它**之前**：确认之后分支被动过就一个字节都不动
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/A.cs", "a2\n");
+    svn_fixtures::svn_cmd(&fx.wc(), &["update", "--non-interactive"]);
+    let e = expect(&fx);
+    let base = git(&fx, &["rev-parse", "svn/base"]);
+    write(&fx, "Code/B.cs", "b-late\n");
+    commit(&fx, "committed after preview");
+    let err = run_sync_in(&fx.wc_str(), &e).unwrap_err();
+    assert_eq!(err.code, "sync_in_state_changed");
+    assert_eq!(git(&fx, &["rev-parse", "svn/base"]), base, "基线没被接管");
+    assert_eq!(phase(&fx), None);
+}

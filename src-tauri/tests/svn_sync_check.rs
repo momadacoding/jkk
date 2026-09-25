@@ -128,12 +128,53 @@ fn an_svn_conflict_anywhere_is_refused() {
 }
 
 #[test]
-fn an_out_of_sync_baseline_is_refused() {
-    // §7.2 第 2 条：外部 TortoiseSVN update 过，基线已经失同步。
-    // ⚠️ 只活到 Task 7A：A16 之后「整体前进」改由执行时接管，7A 会删掉这条、换成四条更细的
+fn an_externally_advanced_working_copy_previews_a_catch_up() {
+    // 计划 A16：外部在项目根 update 过——nodeRevs 单值且比基线新。
+    // 预览不拒绝，而是报出要先跟上的 revision；预览本身仍然什么都不改
     let fx = hybrid_with_colleague();
     fx.colleague_commits("Code/A.cs", "a2\n");
     svn_cmd(&fx.wc(), &["update", "--non-interactive"]);
+    let base = git(&fx, &["rev-parse", "svn/base"]);
+    let p = preview_sync_in(&fx.wc_str()).unwrap();
+    assert_eq!(p.catch_up_rev, Some(2));
+    assert_eq!(p.baseline_rev, 1, "baseline_rev 仍是跟上之前的");
+    assert_eq!(p.target_rev, 2);
+    assert_eq!(git(&fx, &["rev-parse", "svn/base"]), base, "预览不动基线");
+}
+
+#[test]
+fn an_in_sync_working_copy_previews_no_catch_up() {
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/A.cs", "a2\n");
+    assert_eq!(preview_sync_in(&fx.wc_str()).unwrap().catch_up_rev, None);
+}
+
+#[test]
+fn a_mixed_revision_working_copy_is_still_refused() {
+    // A16 只接管「整体前进」。在 wc1 自己身上外部只提交一个文件造出 mixed-revision
+    // （spec 必测 #13 的造法），它归 §9.4（2d）
+    let fx = hybrid_with_colleague();
+    std::fs::write(fx.wc().join("Code/A.cs"), "a-external\n").unwrap();
+    svn_cmd(
+        &fx.wc(),
+        &["commit", "-m", "external", "--non-interactive", "Code/A.cs"],
+    );
+    let base = git(&fx, &["rev-parse", "svn/base"]);
+    assert_eq!(
+        code_of(preview_sync_in(&fx.wc_str())),
+        "sync_in_out_of_sync"
+    );
+    assert_eq!(git(&fx, &["rev-parse", "svn/base"]), base);
+}
+
+#[test]
+fn a_working_copy_rolled_back_below_the_baseline_is_still_refused() {
+    // 反方向的 Diverged：先用 Phase 1 的重建把基线推到 r2，再在外部把工作副本退回 r1
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/A.cs", "a2\n");
+    svn_cmd(&fx.wc(), &["update", "--non-interactive"]);
+    app_lib::engine::svn_init::rebuild_baseline(&fx.wc_str()).unwrap();
+    svn_cmd(&fx.wc(), &["update", "-r", "1", "--non-interactive"]);
     assert_eq!(
         code_of(preview_sync_in(&fx.wc_str())),
         "sync_in_out_of_sync"

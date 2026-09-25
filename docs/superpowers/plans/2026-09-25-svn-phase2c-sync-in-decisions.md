@@ -15,7 +15,7 @@
 | 5 | 编排主路径 S0–S11 + 冲突出口 | ✅ 完成 | 新模块 `svn_sync_in.rs`、fixture `hybrid_whitelist_in_external` + 11 条测试 | RED 已见（模块不存在，编译失败）；5 条变异中 3 条红对应测试、2 条「覆盖不到」（见下）；fmt / clippy 0 告警 / `cargo test` 655 passed 0 failed |
 | 6 | 继续 / 放弃（含回原分支） | ✅ 完成 | `svn_sync_in::{continue_sync, abort_sync, back_to_orig, Disk}` 等 + 24 条测试（计划 23 + 补 1） | RED 已见（编译失败）；5 条变异各自红对应测试（第 3 条靠补的用例）；fmt / clippy 0 告警 / `cargo test` 679 passed 0 failed |
 | 7 | S3 / S4 / S5 失败回退 | ✅ 完成 | 四个 `on_*` 改为 `rolled_back` 回原分支；`Disk::GitOnly` 加回 + 5 条测试（计划 4 + 补 1 条树冲突） | RED 已见（4 条错误码对但未回退）；3 条变异各自红对应测试（第 3 条靠补的树冲突用例）；fmt / clippy 0 告警 / `cargo test` 684 passed 0 failed |
-| 7A | 外部整体 update 之后由「更新」接管（A16） | ⬜ | | |
+| 7A | 外部整体 update 之后由「更新」接管（A16） | ✅ 完成 | `SyncInPreview.catch_up_rev`、`check_sync_in` 放行整体前进、`svn_sync_in::catch_up` + 9 条测试（替换 Task 2 的 1 条） | RED 已见（`catch_up_rev` 不存在）；5 条变异各自红对应测试；fmt / clippy 0 告警 / `cargo test` 692 passed 0 failed |
 | 8 | Tauri 命令 | ⬜ | | |
 | 9 | 前端纯逻辑 | ⬜ | | |
 | 10 | 前端接线 | ⬜ | | |
@@ -344,3 +344,42 @@
 - 回退只走 Task 6 的 `back_to_orig`：S3 失败（HEAD 还在原分支，git 整体拒绝、一个字节没写——A15）与「本进程一路走到 S4」时按 `GitOnly` 直接 `-f`；S5 之后、以及从崩溃里恢复时一律 `MaybeUpdated`，先断言 W-file 在 svn 看来干净再 `-f`（A5 / A12）。
 - 回退失败不吞原因：原因永远在 message 前面，回退结果接在后面；回退没成功时 journal 保留，横幅上还能「放弃」。
 - 失败只回滚本流程自己的修改（§12.4）：`a_lying_baseline_is_caught_at_s4_and_rolled_back` 断言基线分支仍指向那个「说谎」的 commit，不去修它；S5 冲突现场（`C Art/x.psd`）原样留给 TortoiseSVN。
+
+---
+
+## Task 7A：外部整体 update 之后由「更新」接管（A16）
+
+### 验证记录
+
+| 步骤 | 实际结果 |
+|---|---|
+| 接口核对 | `svn_init::rebuild_baseline(&str) -> Result<RebuildReport>`，`RebuildReport.{node_rev, old_baseline, new_baseline, health}`；`SyncVerdict::Diverged { node_rev, baseline_rev }`；`SyncInExpect` 已 derive `Clone`——均与计划一致 |
+| RED | `catch_up_rev` 字段不存在，两个测试文件编译失败，与计划期望一致 |
+| GREEN（首轮） | `svn_sync_check` 18 passed；`svn_sync_in` 44 / 45：`an_external_root_update_is_taken_over_and_separated_again` 红在「服务器改动不该显示成本地修改」——见「计划的错误」 |
+| GREEN | `svn_sync_check` 18 passed；`svn_sync_in` 45 passed |
+| 变异 1：去掉 `node_rev > baseline_rev` 守卫 | 只红 `a_working_copy_rolled_back_below_the_baseline_is_still_refused` |
+| 变异 2：`run_sync_in` 不调 `catch_up` | 红主场景 `an_external_root_update_is_taken_over…`，另红其余三条接管用例（它们都依赖接管，属预期） |
+| 变异 3：接管挪到锁内复核之前（有 catch-up 时跳过第一道 `verify_expect`） | 只红 `a_catch_up_is_refused_when_the_branch_moved_since_the_preview` |
+| 变异 4：`catch_up` 不重新 `check_sync_in`、沿用旧预览 | 红主场景，另红其余三条接管用例（S0 记下旧的 `baselineOidBefore`，发布时 CAS 不过，属预期） |
+| 变异 5：`is_same_file_everywhere` 恒 `false` | 只红 `a_file_the_server_added_does_not_block_the_catch_up` |
+| 全量 | `cargo fmt --check` 0；`cargo clippy --all-targets` 0 告警；`cargo test` 692 passed / 0 failed（= Task 7 的 684 − 1 条被替换 + 4 条预览 + 5 条执行） |
+
+### 偏离计划
+
+- 主场景用例里「相对 HEAD / 相对基线只剩自己的改动」两组断言，改成只看 diff 的**改动行**（新增测试辅助函数 `changed_lines`：去掉 `+++` / `---` 文件头与 `@@` hunk 头）。断言的语义不变，只是不再被 hunk 头误伤。
+
+### 计划的错误
+
+- 计划的断言 `!git diff HEAD .contains("a5-server")` 在实现正确时也会红。**2026-09-26 实测**：接管之后 `git diff HEAD -- Code/A.cs` 的改动行只有 `-a9` / `+a9-wip`，但 hunk 头是 `@@ -6,5 +6,5 @@ a5-server`——git 默认把 hunk 之前最近一个「看起来像函数名」的行（这里就是第 5 行）印在 `@@` 之后作为上下文。服务器改动已经完全从改动行里分离出去，断言只是没有区分 hunk 头与改动行。
+
+### 计划没写的坑
+
+- **相邻行冲突照计划实测复现**：服务器改第 5 行、我没提交的改动在第 6 行时，外部 `svn update` 静默三方合并成功（磁盘上两处都在）；接管后 S10 的 `git stash apply` 把相邻行当成冲突，结局 `StashConflict { files: ["Code/A.cs"] }`，基线已跟上到 r4、冲突文件里两边内容都在、原始 stash 保留。git 的合并对相邻行比 svn 严，本期不绕开，由用户手工解一次（`an_external_update_next_to_my_own_edit_stops_as_a_stash_conflict_without_losing_anything` 钉住）。
+- Bash 工具会把 heredoc 里的 `\\` 折成一个 `\`（即使 heredoc 带引号），所以用 Python heredoc 改 Rust 源码时，含反斜杠（字符串续行、`\n`）的替换片段会匹配失败或被改坏；这类替换改用 Edit 工具。
+
+### 为什么这么改是安全的
+
+- **接管不写 journal**：`rebuild_baseline` 不碰 HEAD、真实索引和磁盘，只以旧 OID 为条件移动 `svn/base` 一个 ref（R4）。它要么没发生、要么完整发生，两种状态都自洽：崩在它之后，重开时基线已跟上、没有 journal，下次预览看到的是普通 `InSync`。没有需要恢复的中间态。
+- **锁内复核在接管之前**：确认之后分支被动过时一个字节都不动，基线不被接管（变异 3 钉住）；接管之后再复核一次，S0 记下的 `baselineOidBefore` 是新基线，且白名单外会碰到的文件照常与用户确认过的比。
+- `rebuild_baseline` 失败时 `?` 直接返回：此时没有 journal、没有 stash、基线指针没动，与预览拒绝等价，不另写回退（计划 Step 5 的要求）。
+- **只接管「整体前进」**：`nodeRevs` 单值且大于基线。mixed-revision 归 §9.4（2d），退回基线之前多半是误操作——两者照旧 `sync_in_out_of_sync` 拒绝（`a_mixed_revision_…`、`a_working_copy_rolled_back_…` 钉住，变异 1 证明守卫起作用）。pinned 形态在更早的第 3 条之后就被 A1 拒绝，走不到这里。

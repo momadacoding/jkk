@@ -31,6 +31,9 @@ pub struct SyncInPreview {
     pub baseline_rev: u64,
     /// 这次会更新到的 revision（`svn status -u` 的 `<against>`）。
     pub target_rev: u64,
+    /// 计划 A16：工作副本已被外部**整体** update 到的 revision（比基线新）。
+    /// `Some` 时执行会先把基线跟上它，再走 S0–S11；确认框必须说出这件事。
+    pub catch_up_rev: Option<u64>,
     /// §7.2 第 5 条：git 不管、本地改过、这次 update 又会碰到的文件。
     /// **非空时必须由用户确认**，确认只授权 update，不授权任何 revert。
     pub outside_changes: Vec<String>,
@@ -80,18 +83,28 @@ pub(crate) fn check_sync_in(repo_root: &str) -> Result<SyncInPreview> {
         ));
     }
 
-    let status = check_sync(repo_root)?; // 第 2 条（完整 nodeRevs）
-    if status.verdict != SyncVerdict::InSync {
-        return Err(GitError::new(
-            "sync_in_out_of_sync",
-            format!(
-                "基线已经失同步（白名单 revision {:?}，基线记的是 r{}）。\
-                 在失同步的基线上更新，会把外部的改动当成服务器的新内容录进去。\
-                 请先处理顶部的失同步横幅。",
-                status.node_revs, status.baseline_rev
-            ),
-        ));
-    }
+    // 第 2 条（完整 nodeRevs）。「整体前进」不拒绝，交给执行时接管（计划 A16）：
+    // 在 TortoiseSVN 里对项目根点 update 是每天早上的日常，不是异常
+    let status = check_sync(repo_root)?;
+    let catch_up_rev = match status.verdict {
+        SyncVerdict::InSync => None,
+        SyncVerdict::Diverged {
+            node_rev,
+            baseline_rev,
+        } if node_rev > baseline_rev => Some(node_rev),
+        _ => {
+            return Err(GitError::new(
+                "sync_in_out_of_sync",
+                format!(
+                    "基线已经失同步（白名单 revision {:?}，基线记的是 r{}）。\
+                     工作副本处于多个 revision，或被退回到了基线之前——这两种状态\
+                     「更新」不能自动接管，否则会把外部的改动当成服务器的内容录进基线。\
+                     请先处理顶部的失同步横幅。",
+                    status.node_revs, status.baseline_rev
+                ),
+            ))
+        }
+    };
 
     // 第 6 条后半：当前磁盘的纳入集合预检（§6.3.1）。放在 update 之前，是为了
     // 让「工作树里一个 `.gitignore` 挡住了 W-file」这种问题在动手前暴露——
@@ -147,6 +160,7 @@ pub(crate) fn check_sync_in(repo_root: &str) -> Result<SyncInPreview> {
         baseline_oid,
         baseline_rev: status.baseline_rev,
         target_rev,
+        catch_up_rev,
         outside_changes: outside,
     })
 }
