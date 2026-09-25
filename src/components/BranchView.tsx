@@ -7,6 +7,7 @@ import { usePrompt } from './PromptDialog'
 import { DeleteBranchDialog, type DeleteTargets } from './DeleteBranchDialog'
 import { useConfirm } from './ConfirmDialog'
 import { isBaselineBranch, type Capabilities } from '../engine/capabilities'
+import { goneUpstreamName, goneUpstreamTooltip } from '../engine/refPills'
 
 interface BranchViewProps {
   refs: RefPointer[]
@@ -73,6 +74,16 @@ function SyncBadge({ ahead, behind }: { ahead: number | null; behind: number | n
       {ahead ? <span className="sb-sync-ahead">{ahead}</span> : null}
     </span>
   )
+}
+
+/**
+ * 上游已删除徽章（`git branch -vv` 的 gone）。上游还在或没配上游时什么都不画。
+ *
+ * 这时 ↑↓ 必然是空的——没有上游可比——所以它和 SyncBadge 不会同时出现。
+ */
+function GoneBadge({ upstream }: { upstream: string | null }) {
+  if (!upstream) return null
+  return <span className="sb-gone" title={goneUpstreamTooltip(upstream)}>gone</span>
 }
 
 /**
@@ -243,6 +254,7 @@ export function BranchView({
                 <PrBadge pr={pullRequestForRef(prByBranch, ref)} branchHash={ref.hash} />
               )}
               <SyncBadge ahead={ref.ahead} behind={ref.behind} />
+              <GoneBadge upstream={goneUpstreamName(ref)} />
               {name === head && <span className="sb-current-dot" title="当前分支" />}
             </div>
           )

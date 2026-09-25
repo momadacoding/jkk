@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { buildRefPills, shortRefName } from '../../src/engine/refPills'
+import {
+  buildRefPills,
+  goneUpstreamName,
+  goneUpstreamTooltip,
+  shortRefName,
+} from '../../src/engine/refPills'
 import type { RefPointer } from '../../src/engine/types'
 
 const HASH = 'a'.repeat(40)
@@ -9,6 +14,7 @@ const ref = (name: string, kind: RefPointer['kind']): RefPointer => ({
   kind,
   ahead: null,
   behind: null,
+  goneUpstream: null,
 })
 const local = (name: string) => ref(`refs/heads/${name}`, 'branch')
 const remote = (name: string) => ref(`refs/remotes/${name}`, 'remote')
@@ -98,5 +104,61 @@ describe('buildRefPills', () => {
     const keys = pills.map((p) => p.key)
     expect(new Set(keys).size).toBe(keys.length)
     expect(keys).toEqual(['refs/heads/a', 'refs/heads/b', 'refs/tags/b'])
+  })
+})
+
+describe('goneUpstreamName', () => {
+  // 形态取自后端对 `git branch -vv` 显示 `[origin/x: gone]` 的分支给出的字段
+  const goneLocal = (name: string, upstream: string): RefPointer => ({
+    ...local(name),
+    goneUpstream: upstream,
+  })
+
+  it('上游已删除的本地分支给出上游短名', () => {
+    expect(goneUpstreamName(goneLocal('worktree-ios-kickoff', 'refs/remotes/origin/worktree-ios-kickoff')))
+      .toBe('origin/worktree-ios-kickoff')
+  })
+
+  it('上游是本地分支时去掉 refs/heads/', () => {
+    expect(goneUpstreamName(goneLocal('child', 'refs/heads/base'))).toBe('base')
+  })
+
+  it('没有 gone 的分支给 null', () => {
+    expect(goneUpstreamName(local('main'))).toBeNull()
+  })
+
+  it('非本地分支即使带了字段也不认', () => {
+    expect(goneUpstreamName({ ...remote('origin/x'), goneUpstream: 'refs/remotes/origin/y' })).toBeNull()
+  })
+
+  it('旧后端没发这个字段（undefined）时当作没有', () => {
+    const legacy = { ...local('main') } as Partial<RefPointer>
+    delete legacy.goneUpstream
+    expect(goneUpstreamName(legacy as RefPointer)).toBeNull()
+  })
+
+  it('空字符串不算上游名', () => {
+    expect(goneUpstreamName(goneLocal('main', ''))).toBeNull()
+  })
+})
+
+describe('goneUpstreamTooltip', () => {
+  it('提示里带完整上游名，并说明和 git branch -vv 的 gone 是一回事', () => {
+    const text = goneUpstreamTooltip('origin/feature')
+    expect(text).toContain('origin/feature')
+    expect(text).toContain('gone')
+  })
+})
+
+describe('buildRefPills 与 gone 上游', () => {
+  it('本地分支标签带上已删除上游的短名', () => {
+    const pills = buildRefPills([{ ...local('feature'), goneUpstream: 'refs/remotes/origin/feature' }])
+    expect(pills[0].goneUpstream).toBe('origin/feature')
+    expect(pills[0].remotes).toEqual([])
+  })
+
+  it('其它标签的 goneUpstream 为 null', () => {
+    const pills = buildRefPills([local('main'), remote('origin/other'), tag('v1')])
+    expect(pills.map((p) => p.goneUpstream)).toEqual([null, null, null])
   })
 })

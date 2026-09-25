@@ -4,7 +4,7 @@ import { prBadge, pullRequestForRef } from '../engine/prs'
 import { laneTint } from '../engine/paths'
 import { WORKDIR_ID } from '../engine/workdir'
 import { shortHash } from '../engine/commitActions'
-import { buildRefPills } from '../engine/refPills'
+import { buildRefPills, goneUpstreamTooltip } from '../engine/refPills'
 
 interface CommitRowProps {
   node: LayoutNode
@@ -87,6 +87,7 @@ export function CommitRow({
           const tooltip = [
             ref.name,
             pill.remotes.length > 0 ? `远程同一提交：${pill.remotes.join('、')}` : undefined,
+            pill.goneUpstream ? goneUpstreamTooltip(pill.goneUpstream) : undefined,
             badge?.tooltip,
           ].filter(Boolean).join('\n')
           return (
@@ -106,6 +107,11 @@ export function CommitRow({
                   \uFE0E 要求按文本字形绘制，避免某些平台画成彩色 emoji */}
               {pill.remotes.length > 0 && (
                 <span className="ref-pill-remote" aria-label="远程同一提交">{'\u2601\uFE0E'}</span>
+              )}
+              {/* 上游已删除：远程标签画不出来了，不标一下就和「从没推过」一样。
+                  用 git branch -vv 自己的词，见过它的人一眼就认得 */}
+              {pill.goneUpstream && (
+                <span className="ref-pill-gone" aria-label="上游已删除">gone</span>
               )}
               {/* 编号内嵌在同一个 pill 里：另起一个 pill 要多一份边距和间隙，
                   而这一行还挤着提交信息、作者、hash 和日期 */}

@@ -22,6 +22,26 @@ export interface RefPill {
   ref: RefPointer
   /** 并进这个本地分支标签的远程分支短名（如 `origin/main`）；没有则为空数组。 */
   remotes: string[]
+  /** 本地分支的上游已被删除时，上游短名（如 `origin/main`）；否则 null。 */
+  goneUpstream: string | null
+}
+
+/**
+ * 本地分支的上游已被删除（`git branch -vv` 里的 `gone`）时给出上游短名，否则 null。
+ *
+ * 只认本地分支：后端只给本地分支算这个字段，别的 kind 带着值也是脏数据。
+ * `undefined` 同样当作没有——字段缺失说明后端还没这个能力，不是「上游还在」的证据，
+ * 但更不能凭空报 gone。
+ */
+export function goneUpstreamName(ref: RefPointer): string | null {
+  if (ref.kind !== 'branch' || !ref.goneUpstream) return null
+  return shortRefName(ref.goneUpstream)
+}
+
+/** gone 标记的悬停提示。用户多半是在 `git branch -vv` 里见过这个词才来找的。 */
+export function goneUpstreamTooltip(upstream: string): string {
+  return `上游 ${upstream} 已不存在（git branch -vv 显示为 gone）\n` +
+    '通常是远端分支已被删除（例如 PR 合并后自动删分支），本地 fetch 时又 prune 掉了。'
 }
 
 /**
@@ -74,6 +94,7 @@ export function buildRefPills(refs: RefPointer[]): RefPill[] {
         label,
         ref: r,
         remotes: r.kind === 'branch' ? merged.get(label) ?? [] : [],
+        goneUpstream: goneUpstreamName(r),
       }
     })
 }
