@@ -384,9 +384,16 @@ body {
   font-family: system-ui, -apple-system, sans-serif;
 }
 
+/* 标签不再设固定上限：空间够就完整显示，不够时与消息一起按各自宽度成比例收缩。
+   只让一方收缩都会出问题——标签不缩，一个超长分支名能把消息挤没；
+   消息不缩，标签又回到被截成 `...` 的老样子，而右边明明还空着一大截。
+   已知取舍：标签很多、窗口又很窄时，排在最后的标签会被 overflow 整个藏掉。
+   改之前同样场景是标签不缩、整行溢出，把右侧作者 / hash / 日期挤出视野。 */
 .ref-pills {
   display: flex;
-  flex-shrink: 0;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
   gap: 4px;
 }
 
@@ -431,9 +438,30 @@ body {
   font-family: system-ui, -apple-system, sans-serif;
   font-weight: 500;
   white-space: nowrap;
-  max-width: 260px;
+  /* 标签之间也按宽度收缩，但每个至少留一截，不至于缩成一条色条 */
+  display: inline-flex;
+  flex: 0 1 auto;
+  min-width: 3em;
+  overflow: hidden;
+}
+
+/* 省略号只打在名字上，后面的远程标记和 PR 编号优先完整显示。
+   名字至少留 2em：它本身能缩到 0，而后面两样不缩，不设下限的话挤到极限时
+   标签里只剩 `☁#3`，看不出是哪个分支。极限情况下被 pill 自身 overflow 截掉的
+   是排在后面的 PR 编号，名字开头始终在。 */
+.ref-pill-name {
+  flex: 0 1 auto;
+  min-width: 2em;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* 本地与远程在同一提交：原来要画两个标签，现在只在本地分支后面挂个云图标 */
+.ref-pill-remote {
+  flex-shrink: 0;
+  margin-left: 5px;
+  opacity: 0.75;
+  font-weight: 400;
 }
 
 /* 本地分支：左侧色条与底色都取车道色（由内联 style 覆盖），
@@ -454,6 +482,7 @@ body {
    信息的 3.0 都不到。现在这三个值最差 4.53 / 4.57 / 4.60，都过 WCAG AA 的 4.5，
    同时仍明显弱于分支名本身（最差 5.96）。改色前请重算，不要凭眼睛在单一车道上判断。 */
 .ref-pill-pr {
+  flex-shrink: 0;
   margin-left: 5px;
   color: #9ae8a4;
   font-weight: 600;
