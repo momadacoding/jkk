@@ -3,6 +3,7 @@ import {
   describeUnfinishedSync,
   needsLockPolling,
   otherBannersAreSuppressed,
+  sinceText,
   SYNC_LOCK_POLL_MS,
   type SyncPhase,
   type SyncState,
@@ -56,16 +57,27 @@ describe('describeUnfinishedSync', () => {
     expect(b.detail).toContain('stash')
   })
 
-  it('本期还没有继续/放弃按钮，但必须说清这一点', () => {
-    // 半个功能比没有功能更糟的地方在于让用户干等。这一期只能检测和展示，
-    // 那就明说，别挂两颗点不动的按钮。
+  it('sync_in 未收尾时给出继续 / 放弃按钮', () => {
     const b = describeUnfinishedSync({
       locked: false,
       holder: null,
-      unfinished: { flow: 'sync_in', phase: 'start', opid: 'abc', startedAt: 1757000000 },
+      unfinished: { flow: 'sync_in', phase: 'stashed', opid: 'abc', startedAt: 1757000000 },
     })!
-    expect(b.actions).toEqual([])
-    expect(b.note).toBeTruthy()
+    expect(b.actions.map((a) => a.id)).toEqual(['syncContinue', 'syncAbort'])
+  })
+
+  it('sync_out 留下的记录本版本收不了尾：不给按钮，并说明原因', () => {
+    // `publishing-baseline` 是两条流程共用的阶段名（spec §7.6）：只看 phase 的话，
+    // sync_out 的记录也会挂上 sync_in 的继续 / 放弃按钮
+    for (const phase of ['svn-staged' as SyncPhase, 'publishing-baseline' as const]) {
+      const b = describeUnfinishedSync({
+        locked: false,
+        holder: null,
+        unfinished: { flow: 'sync_out', phase, opid: 'x', startedAt: 1 },
+      })!
+      expect(b.actions, phase).toEqual([])
+      expect(b.note, phase).toContain('后续版本')
+    }
   })
 
   it('未收尾或进行中时，其余横幅一律让位', () => {
@@ -95,6 +107,7 @@ describe('describeUnfinishedSync', () => {
       'capturing-baseline',
       'publishing-baseline',
       'baseline-ready',
+      'applying-stash',
     ] as const
     const seen = new Set<string>()
     for (const phase of phases) {
@@ -196,6 +209,7 @@ describe('describeUnfinishedSync', () => {
       'capturing-baseline',
       'publishing-baseline',
       'baseline-ready',
+      'applying-stash',
     ]
     const states: (SyncState | SyncStateUnreadable)[] = [
       ...phases.map((phase) => ({
@@ -218,5 +232,23 @@ describe('describeUnfinishedSync', () => {
         expect(text, JSON.stringify(s)).not.toContain('**')
       }
     }
+  })
+})
+
+describe('sinceText', () => {
+  it('与后端 describe_age 同一套说法', () => {
+    expect(sinceText(1000, 1030)).toBe('刚刚开始')
+    expect(sinceText(1000, 1000 + 5 * 60)).toBe('已持续 5 分钟')
+    expect(sinceText(1000, 1000 + 2 * 3600 + 60)).toBe('已持续 2 小时')
+    expect(sinceText(2000, 1000)).toBe('刚刚开始')
+  })
+
+  it('正在同步的横幅带上持续时长（spec §13：pid 与开始时间）', () => {
+    const b = describeUnfinishedSync(
+      { locked: true, holder: { pid: 4242, startedAt: 1000, opid: 'x' }, unfinished: null },
+      1000 + 7 * 60,
+    )!
+    expect(b.detail).toContain('4242')
+    expect(b.detail).toContain('已持续 7 分钟')
   })
 })

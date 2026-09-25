@@ -17,7 +17,7 @@
 | 7 | S3 / S4 / S5 失败回退 | ✅ 完成 | 四个 `on_*` 改为 `rolled_back` 回原分支；`Disk::GitOnly` 加回 + 5 条测试（计划 4 + 补 1 条树冲突） | RED 已见（4 条错误码对但未回退）；3 条变异各自红对应测试（第 3 条靠补的树冲突用例）；fmt / clippy 0 告警 / `cargo test` 684 passed 0 failed |
 | 7A | 外部整体 update 之后由「更新」接管（A16） | ✅ 完成 | `SyncInPreview.catch_up_rev`、`check_sync_in` 放行整体前进、`svn_sync_in::catch_up` + 9 条测试（替换 Task 2 的 1 条） | RED 已见（`catch_up_rev` 不存在）；5 条变异各自红对应测试；fmt / clippy 0 告警 / `cargo test` 692 passed 0 failed |
 | 8 | Tauri 命令 | ✅ 完成 | 新文件 `commands/svn_sync.rs`（4 个命令）+ 注册 + 2 条测试 | RED 已见（guard 测试因文件不存在失败）；2 条变异各自红对应测试；fmt / clippy 0 告警 / `cargo test` 695 passed 0 failed；`pnpm tauri dev` 实跑留到 Task 10 |
-| 9 | 前端纯逻辑 | ⬜ | | |
+| 9 | 前端纯逻辑 | ✅ 完成 | 新模块 `src/engine/svnSyncIn.ts`；`svnJournal.ts`（`applying-stash`、横幅动作、`sinceText`）、`svnSync.ts`（整体前进降黄、`svnUpdate`）、`toolbarActions.ts`（`showsSvnUpdate`）+ 测试 | RED 已见（6 条失败 + 1 个模块缺失）；5 条变异各自红对应测试（第 3 条靠加强的用例）；`pnpm build` 通过 / `pnpm test` 430 passed |
 | 10 | 前端接线 | ⬜ | | |
 | 11 | E2E + spec 修订 + 收尾 | ⬜ | | |
 
@@ -423,3 +423,38 @@
 - 三个写命令都经 `with_watch_suspended`：`WatchSuspension` 是 RAII，`f()` 返回或 panic 展开时都会恢复 watcher；结束后无论成败补发一次 `repo-changed`，回退动过的分支 / 工作区也能被界面看到。
 - 预览命令不挂起 watcher、不拿锁，只调纯读的 `preview_sync_in`。
 - 命令层不含任何业务判断，拿锁、复核、回退全部在 engine 里，已由 `svn_sync_in.rs` 的用例覆盖；接线由 `svn_write_guard.rs` 的源码断言守着。
+
+---
+
+## Task 9：前端纯逻辑
+
+### 验证记录
+
+| 步骤 | 实际结果 |
+|---|---|
+| RED | `svnSyncIn.test.ts` 模块不存在；`svnJournal` 4 条、`svnSync` 1 条、`toolbarActions` 1 条失败，与计划期望一致。`svnSync` 的「被回退、多 revision 时不给『更新』」实现前就通过——它是护栏，旧实现本来就不给 |
+| GREEN | 四个测试文件 92 passed |
+| 变异 1：`expectFromPreview` 不拷贝 | 只红 `把预览里的事实原样带回去做锁内复核` |
+| 变异 2：`start` 给继续 + 放弃 | 只红 `start 只有「清除记录」` |
+| 变异 3：`sync_out` 也给 `syncActions` | 计划用例**不红**（见「偏离计划」）；加强后只红 `sync_out 留下的记录本版本收不了尾` |
+| 变异 4：回退分支也带 `svnUpdate` | 只红 `被回退、多 revision 时不给「更新」` |
+| 变异 5：`describeSyncInPreview` 忽略 `catchUpRev` | 红 `工作副本被外部整体更新过…` 与 `接管之后服务器没有更新的内容…`（两条都依赖 `from`，属预期） |
+| 全量 | `pnpm build`（tsc + vite）通过；`pnpm test` 27 个文件 430 passed / 0 failed |
+
+### 偏离计划
+
+- `sync_out 留下的记录本版本收不了尾` 加了一个 phase：除 `svn-staged` 外再测 `publishing-baseline`。计划原样只用 `svn-staged`，而 `syncActions('svn-staged')` 本来就返回 `[]`，「`sync_out` 也给按钮」的变异抓不到。`publishing-baseline` 是 spec §7.6 明写的两条流程共用阶段名，正是只看 phase 会出错的那种输入。
+
+### 计划的错误
+
+- 计划写 `svnJournal.ts` 是 LF；实际本分支上它与本 Task 碰到的其余前端文件都是 CRLF。用 Edit 工具改，行尾不受影响。
+
+### 计划没写的坑
+
+- 无。
+
+### 为什么这么改是安全的
+
+- 全部是纯函数，无 React / Tauri 依赖；`svnJournal.ts` → `svnSyncIn.ts` → `svnSync.ts`（仅 type import），没有运行时循环依赖。
+- 「整体前进」横幅降为黄色，但重建基线与体检两个出口仍在（`所有 danger 文案都写明重建基线…` 与新用例一起钉住），离线时用户仍可先把基线跟上。回退与 mixed-revision 照旧红色、不给「更新」。
+- 新的横幅 action id（`svnUpdate`、`syncContinue`、`syncAbort`）在 Task 10 接线之前会被 `BaselineBanner` 渲染成按钮但没有处理——Task 10 紧接着接上，本 Task 不单独发布。

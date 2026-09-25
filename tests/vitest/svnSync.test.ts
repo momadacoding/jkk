@@ -84,6 +84,36 @@ describe('describeSync', () => {
     expect(backward.detail).toContain('回退')
   })
 
+  it('整体前进（外部在项目根 update 过）：黄色，第一个按钮是「更新」（计划 A16）', () => {
+    const m = describeSync({
+      baselineRev: 4,
+      nodeRevs: [9],
+      verdict: { kind: 'diverged', nodeRev: 9, baselineRev: 4 },
+    })!
+    expect(m.tone).toBe('warn')
+    expect(m.actions[0].id).toBe('svnUpdate')
+    expect(m.detail).toContain('TortoiseSVN')
+    // 重建与体检仍然在：「更新」要联网，离线时用户还能先把基线跟上
+    expect(m.actions.map((a) => a.id)).toEqual(['svnUpdate', 'rebuild', 'check'])
+  })
+
+  it('被回退、多 revision 时不给「更新」：那两种「更新」会拒绝', () => {
+    const backward = describeSync({
+      baselineRev: 9,
+      nodeRevs: [4],
+      verdict: { kind: 'diverged', nodeRev: 4, baselineRev: 9 },
+    })!
+    const mixed = describeSync({
+      baselineRev: 4,
+      nodeRevs: [4, 7],
+      verdict: { kind: 'mixedRevision', revs: [4, 7] },
+    })!
+    for (const m of [backward, mixed]) {
+      expect(m.tone).toBe('danger')
+      expect(m.actions.map((a) => a.id)).not.toContain('svnUpdate')
+    }
+  })
+
   it('所有 danger 文案都写明重建基线不碰工作目录、也不推进工作分支', () => {
     // spec §16：「代价是工作分支不会自动跟进新基线」。不写明的话，用户会以为
     // 点完就万事大吉，下次提交时才发现分支还挂在旧基线上。

@@ -33,7 +33,14 @@ export type ServerAudit =
 export type BannerTone = 'warn' | 'danger'
 
 export interface BannerAction {
-  id: 'rebuild' | 'check' | 'updateWhitelistDir' | 'migrateEol'
+  id:
+    | 'rebuild'
+    | 'check'
+    | 'updateWhitelistDir'
+    | 'migrateEol'
+    | 'syncContinue'
+    | 'syncAbort'
+    | 'svnUpdate'
   label: string
 }
 
@@ -111,15 +118,27 @@ export function describeSync(status: SyncStatus | null): BannerModel | null {
       }
 
     case 'diverged': {
-      const forward = v.nodeRev > v.baselineRev
+      // 计划 A16：前进是每天早上在 TortoiseSVN 里对项目根 update 的日常结果，
+      // 给出口、降成黄色；回退照旧是红色，「更新」对它会拒绝
+      if (v.nodeRev > v.baselineRev) {
+        return {
+          tone: 'warn',
+          title: '工作副本已在外部更新',
+          detail:
+            `工作副本已经前进到 r${v.nodeRev}，基线还记着 r${v.baselineRev}——` +
+            '在 TortoiseSVN 里对项目根点过 update 就会这样。' +
+            '此刻「本地改动」里服务器的改动和你自己的改动混在一起；' +
+            '点「更新」会先把基线跟上，再把两者重新分开。',
+          actions: [{ id: 'svnUpdate', label: '更新…' }, REBUILD, CHECK],
+          note: REBUILD_NOTE,
+        }
+      }
       return {
         tone: 'danger',
-        title: forward ? '基线落后于工作副本' : '工作副本被回退到了基线之前',
-        detail: forward
-          ? `工作副本已经前进到 r${v.nodeRev}，而基线还记着 r${v.baselineRev}。` +
-            '「相对上次更新改了什么」现在算出来的是错的。'
-          : `工作副本被回退到了 r${v.nodeRev}，而基线记着 r${v.baselineRev}。` +
-            '基线比磁盘还新，任何基于它的比较都不成立。',
+        title: '工作副本被回退到了基线之前',
+        detail:
+          `工作副本被回退到了 r${v.nodeRev}，而基线记着 r${v.baselineRev}。` +
+          '基线比磁盘还新，任何基于它的比较都不成立。',
         actions: [REBUILD, CHECK],
         note: REBUILD_NOTE,
       }
