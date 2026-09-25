@@ -169,44 +169,87 @@ pub(crate) fn from_stashed(
     from_baseline_ready(repo, cfg, j)
 }
 
-// —— S3 / S4 / S5 的失败出口。本 Task 只如实报错、journal 原样保留；
-//    Task 7 把它们换成「回到原分支并取回 WIP」。——
+// —— S3 / S4 / S5 的失败出口：回到原分支并取回 WIP（spec §13 前五行）——
 
 fn on_checkout_failed(
-    _repo: &str,
-    _cfg: &SvnConfig,
-    _j: &mut Journal,
+    repo: &str,
+    cfg: &SvnConfig,
+    j: &mut Journal,
     e: GitError,
 ) -> Result<SyncInOutcome> {
-    Err(e)
+    // S3 之前 S5 必然没跑：磁盘上被跟踪的内容全是 git 自己写的（A12）
+    rolled_back(repo, cfg, j, Disk::GitOnly, e)
 }
 
 fn on_stale_baseline(
-    _repo: &str,
-    _cfg: &SvnConfig,
-    _j: &mut Journal,
-    _fresh: bool,
+    repo: &str,
+    cfg: &SvnConfig,
+    j: &mut Journal,
+    fresh: bool,
     dirty: &[String],
 ) -> Result<SyncInOutcome> {
-    Err(stale_error(dirty))
+    // 本进程一路走到这里才敢按 GitOnly；从崩溃里恢复时不知道 S5 跑没跑（A12）
+    let disk = if fresh {
+        Disk::GitOnly
+    } else {
+        Disk::MaybeUpdated
+    };
+    rolled_back(repo, cfg, j, disk, stale_error(dirty))
 }
 
 fn on_update_failed(
-    _repo: &str,
-    _cfg: &SvnConfig,
-    _j: &mut Journal,
+    repo: &str,
+    cfg: &SvnConfig,
+    j: &mut Journal,
     stderr: &str,
 ) -> Result<SyncInOutcome> {
-    Err(update_failed_error(stderr))
+    rolled_back(
+        repo,
+        cfg,
+        j,
+        Disk::MaybeUpdated,
+        update_failed_error(stderr),
+    )
 }
 
 fn on_update_conflict(
-    _repo: &str,
-    _cfg: &SvnConfig,
-    _j: &mut Journal,
+    repo: &str,
+    cfg: &SvnConfig,
+    j: &mut Journal,
     conflicts: &[String],
 ) -> Result<SyncInOutcome> {
-    Err(update_conflict_error(conflicts))
+    rolled_back(
+        repo,
+        cfg,
+        j,
+        Disk::MaybeUpdated,
+        update_conflict_error(conflicts),
+    )
+}
+
+/// 回退并把结果接在原因后面。**原因永远在前**：用户先要知道为什么没更新成。
+fn rolled_back(
+    repo: &str,
+    cfg: &SvnConfig,
+    j: &mut Journal,
+    disk: Disk,
+    cause: GitError,
+) -> Result<SyncInOutcome> {
+    let orig = j.orig_branch.clone().unwrap_or_default();
+    let tail = match back_to_orig(repo, cfg, j, disk) {
+        Ok(RestoreStep::Finished) => {
+            format!("已回到分支 `{orig}`，未提交的改动已放回；基线没有变。")
+        }
+        Ok(_) => "已回到原分支，但放回未提交的改动时遇到问题——详见顶部横幅。".to_string(),
+        Err(re) => format!(
+            "另外：回到原分支也没成功（{}）。记录已保留，处理好之后在顶部横幅上点「放弃」。",
+            re.message
+        ),
+    };
+    Err(GitError::new(
+        &cause.code,
+        format!("{}\n\n{tail}", cause.message),
+    ))
 }
 
 fn stale_error(dirty: &[String]) -> GitError {
@@ -577,12 +620,12 @@ fn now_secs() -> u64 {
 
 // —— 继续 / 放弃（spec §7.6：「提供继续 / 放弃两个入口」）——
 
-/// 往回走的前提（计划 A5 / A12）。
-///
-/// A12 的「S5 还没跑、磁盘上全是 git 写的字节」那一种由 S3 / S4 失败回退引入
-/// （Task 7），在那之前没有构造它的路径，先不定义。
+/// 往回走的两种前提（计划 A5 / A12）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Disk {
+    /// S5 还没跑、且是本进程一路走到这里：磁盘上被跟踪的内容全是 git 自己写的，
+    /// `checkout -f` 只会还原 git 写下的字节。
+    GitOnly,
     /// S5 可能跑过，或从崩溃里恢复、不知道跑没跑：磁盘上可能是服务器内容，
     /// `-f` 之前必须先确认那确实是服务器内容（能从服务器取回）。
     MaybeUpdated,

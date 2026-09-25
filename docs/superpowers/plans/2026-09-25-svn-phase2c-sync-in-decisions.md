@@ -14,7 +14,7 @@
 | 4 | 基线录制零件拆分 | ✅ 完成 | `svn_baseline::{create_baseline_commit, move_baseline_ref}`、`read_baseline` 改 `pub(crate)`；`svn_init::record_server_tree_into` + 5 条测试 | RED 已见（两个测试文件编译失败）；fmt / clippy 0 告警 / `cargo test` 644 passed 0 failed |
 | 5 | 编排主路径 S0–S11 + 冲突出口 | ✅ 完成 | 新模块 `svn_sync_in.rs`、fixture `hybrid_whitelist_in_external` + 11 条测试 | RED 已见（模块不存在，编译失败）；5 条变异中 3 条红对应测试、2 条「覆盖不到」（见下）；fmt / clippy 0 告警 / `cargo test` 655 passed 0 failed |
 | 6 | 继续 / 放弃（含回原分支） | ✅ 完成 | `svn_sync_in::{continue_sync, abort_sync, back_to_orig, Disk}` 等 + 24 条测试（计划 23 + 补 1） | RED 已见（编译失败）；5 条变异各自红对应测试（第 3 条靠补的用例）；fmt / clippy 0 告警 / `cargo test` 679 passed 0 failed |
-| 7 | S3 / S4 / S5 失败回退 | ⬜ | | |
+| 7 | S3 / S4 / S5 失败回退 | ✅ 完成 | 四个 `on_*` 改为 `rolled_back` 回原分支；`Disk::GitOnly` 加回 + 5 条测试（计划 4 + 补 1 条树冲突） | RED 已见（4 条错误码对但未回退）；3 条变异各自红对应测试（第 3 条靠补的树冲突用例）；fmt / clippy 0 告警 / `cargo test` 684 passed 0 failed |
 | 7A | 外部整体 update 之后由「更新」接管（A16） | ⬜ | | |
 | 8 | Tauri 命令 | ⬜ | | |
 | 9 | 前端纯逻辑 | ⬜ | | |
@@ -310,3 +310,37 @@
 - 放弃时 HEAD 在 `svn/base` 上：先断言白名单内 W-file 在 svn 看来全部干净（= 磁盘上是可从服务器取回的内容），才 `checkout -f` 回原分支（A5）；不干净返回 `sync_in_unsafe_to_return`，一个字节不覆盖（测试钉住）。
 - `applying-stash` 放弃只删钉住的 ref 与 journal，stash 条目留给用户（message 带 opid 认得出来）。
 - `rebase` 继续前复核进行中的 rebase 的 `head-name` 是 `refs/heads/<origBranch>`，且结束后原分支必须以新基线为祖先。
+
+---
+
+## Task 7：S3 / S4 / S5 失败回退
+
+### 验证记录
+
+| 步骤 | 实际结果 |
+|---|---|
+| RED | 四条都红：错误码对，但仍停在 `svn/base`、message 里没有「已回到分支」，与计划期望一致 |
+| GREEN | `svn_sync_in` 39 passed（含 Windows 专属的 share=Read 占用用例） |
+| 变异 1：`on_update_failed` 不回退 | 只红 `update_failure_returns_to_the_original_branch` |
+| 变异 2：`checkout_verified` 只看 `on_target` | 只红 `a_file_held_open_during_checkout_is_named_and_rolled_back` |
+| 变异 3：`svn_conflicts` 只看 `item == "conflicted"` | 计划用例不红（计划已预判为覆盖缺口）；补 `a_tree_conflict_rolls_back`（必测 #9）后只红它 |
+| 全量 | `cargo fmt --check` 0；`cargo clippy --all-targets` 0 告警；`cargo test` 684 passed / 0 failed（= Task 6 的 679 + 本 Task 5） |
+
+### 偏离计划
+
+- `Disk::GitOnly` 在本 Task 加回（Task 6 推迟的那个变体），文档与计划原文一致。
+- 新增 `a_tree_conflict_rolls_back`：计划 Step 5 允许「30 分钟内造得出就补」。形状是「wc2 `svn delete Art` 并提交 + wc1 本地改了 `Art/x.psd`」，预览把 `Art/x.psd` 列进白名单外会被碰到的文件、用户确认后，S5 产生树冲突（`item` 不是 `conflicted`），回退到 `work`、基线不动。
+
+### 计划的错误
+
+- Step 2 的命令 `cargo test --test svn_sync_in a_lying_baseline update_failure …` 跑不起来：cargo 的 `TESTNAME` 只接受**一个**位置参数，多个过滤要写在 `--` 之后（`cargo test --test svn_sync_in -- a b c d`）。
+
+### 计划没写的坑
+
+- 无。
+
+### 为什么这么改是安全的
+
+- 回退只走 Task 6 的 `back_to_orig`：S3 失败（HEAD 还在原分支，git 整体拒绝、一个字节没写——A15）与「本进程一路走到 S4」时按 `GitOnly` 直接 `-f`；S5 之后、以及从崩溃里恢复时一律 `MaybeUpdated`，先断言 W-file 在 svn 看来干净再 `-f`（A5 / A12）。
+- 回退失败不吞原因：原因永远在 message 前面，回退结果接在后面；回退没成功时 journal 保留，横幅上还能「放弃」。
+- 失败只回滚本流程自己的修改（§12.4）：`a_lying_baseline_is_caught_at_s4_and_rolled_back` 断言基线分支仍指向那个「说谎」的 commit，不去修它；S5 冲突现场（`C Art/x.psd`）原样留给 TortoiseSVN。

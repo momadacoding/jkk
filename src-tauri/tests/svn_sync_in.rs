@@ -738,3 +738,135 @@ fn continue_without_a_record_says_so() {
         "sync_no_unfinished"
     );
 }
+
+// —— S3 / S4 / S5 失败回退（spec §13 前五行）——
+
+#[test]
+fn a_lying_baseline_is_caught_at_s4_and_rolled_back() {
+    // S4 是双保险（§7.4）：revision 对得上，内容却对不上
+    let fx = hybrid_with_colleague();
+    let root = fx.wc_str();
+    let old = git(&fx, &["rev-parse", "svn/base"]);
+    let idx = TempIndex::from_head(&root).unwrap();
+    idx.replace_blob(&root, "Code/A.cs", b"lie\n").unwrap();
+    let tree = idx.write_tree(&root).unwrap();
+    let t = parse_trailer(&git(&fx, &["log", "-1", "--format=%B", "svn/base"])).unwrap();
+    let lie = create_baseline_commit(&root, &tree, Some(&old), &t).unwrap();
+    git(&fx, &["update-ref", "refs/heads/svn/base", &lie, &old]);
+    write(&fx, "Code/B.cs", "b-wip\n");
+    let head = git(&fx, &["rev-parse", "HEAD"]);
+
+    let err = run_sync_in(&root, &expect(&fx)).unwrap_err();
+    assert_eq!(err.code, "sync_in_baseline_stale");
+    assert!(err.message.contains("Code/A.cs"), "{}", err.message);
+    assert!(err.message.contains("已回到分支 `work`"), "{}", err.message);
+    assert_eq!(git(&fx, &["rev-parse", "HEAD"]), head);
+    assert_eq!(read(&fx, "Code/A.cs"), "a1\n");
+    assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
+    assert_eq!(phase(&fx), None);
+    assert_eq!(our_stashes(&fx), 0);
+    assert_eq!(
+        git(&fx, &["rev-parse", "svn/base"]),
+        lie,
+        "失败只回滚自己（§12.4），不去修基线"
+    );
+}
+
+#[test]
+fn update_failure_returns_to_the_original_branch() {
+    // Review Focus 3：从「S3 之后崩溃」继续，此时服务器不可达
+    let fx = hybrid_with_colleague();
+    with_wip(&fx);
+    let j = s1(&fx, "op-net");
+    git(&fx, &["checkout", "-q", "svn/base"]);
+    let repo = fx.repo();
+    let gone = fx.path().join("repo-gone");
+    std::fs::rename(&repo, &gone).unwrap();
+    let r = continue_sync(&fx.wc_str());
+    std::fs::rename(&gone, &repo).unwrap();
+
+    let err = r.unwrap_err();
+    assert_eq!(err.code, "sync_in_update_failed");
+    assert_eq!(git(&fx, &["symbolic-ref", "--short", "HEAD"]), "work");
+    assert_eq!(git(&fx, &["rev-parse", "HEAD"]), j.orig_head.unwrap());
+    assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
+    assert_eq!(baseline_rev(&fx), 1);
+    assert_eq!(phase(&fx), None);
+    assert!(!svn_lock::is_held(&fx.wc_str()));
+}
+
+#[test]
+fn an_update_conflict_outside_git_rolls_back_and_points_to_tortoisesvn() {
+    // §13 第 5 行 / §7.2.1：用户确认过的美术文件在 update 时冲突
+    let fx = hybrid_with_colleague();
+    write(&fx, "Art/x.psd", "psd-local\n");
+    fx.colleague_commits("Art/x.psd", "psd-server\n");
+    fx.colleague_commits("Code/A.cs", "a2\n");
+    write(&fx, "Code/B.cs", "b-wip\n");
+    let e = expect(&fx);
+    assert_eq!(e.confirmed_outside, vec!["Art/x.psd".to_string()]);
+
+    let err = run_sync_in(&fx.wc_str(), &e).unwrap_err();
+    assert_eq!(err.code, "sync_in_update_conflict");
+    assert!(err.message.contains("Art/x.psd") && err.message.contains("TortoiseSVN"));
+    assert_eq!(git(&fx, &["symbolic-ref", "--short", "HEAD"]), "work");
+    assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
+    assert_eq!(baseline_rev(&fx), 1, "基线不推进");
+    assert_eq!(phase(&fx), None);
+    let st = app_lib::engine::svn_cli::run_svn(&fx.wc_str(), &["status", "Art/x.psd"]).unwrap();
+    assert!(st.starts_with('C'), "冲突现场原样留给 TortoiseSVN：{st}");
+}
+
+#[cfg(windows)]
+#[test]
+fn a_file_held_open_during_checkout_is_named_and_rolled_back() {
+    // Review Focus 2 / A15：Unity 式的 share=Read 占用下，git checkout 退出 0
+    // 却没把文件写进去。必须指名文件、回到原分支
+    use std::os::windows::fs::OpenOptionsExt;
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/A.cs", "a2\n");
+    write(&fx, "Code/B.cs", "b-local\n");
+    commit(&fx, "local B"); // 切到 svn/base 必须改写 B.cs
+    write(&fx, "Code/New.cs", "wip\n");
+    let head = git(&fx, &["rev-parse", "HEAD"]);
+    let e = expect(&fx);
+
+    const FILE_SHARE_READ: u32 = 0x1;
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(fx.wc().join("Code/B.cs"))
+        .unwrap();
+    let r = run_sync_in(&fx.wc_str(), &e);
+    drop(held);
+
+    let err = r.unwrap_err();
+    assert_eq!(err.code, "sync_in_checkout_failed");
+    assert!(err.message.contains("Code/B.cs"), "{}", err.message);
+    assert!(err.message.contains("已回到分支 `work`"), "{}", err.message);
+    assert_eq!(git(&fx, &["rev-parse", "HEAD"]), head);
+    assert_eq!(read(&fx, "Code/B.cs"), "b-local\n");
+    assert_eq!(read(&fx, "Code/New.cs"), "wip\n");
+    assert_eq!(phase(&fx), None);
+}
+
+#[test]
+fn a_tree_conflict_rolls_back() {
+    // 必测 #9 / 计划 A4：树冲突节点的 `item` 不是 `conflicted`，只看 item 会漏掉，
+    // 把一个带树冲突的工作副本当成更新成功继续录基线
+    let fx = hybrid_with_colleague();
+    write(&fx, "Art/x.psd", "psd-local\n");
+    svn_fixtures::svn_cmd(&fx.wc2(), &["update", "--non-interactive"]);
+    svn_fixtures::svn_cmd(&fx.wc2(), &["delete", "Art", "--non-interactive"]);
+    svn_fixtures::svn_cmd(&fx.wc2(), &["commit", "-m", "del Art", "--non-interactive"]);
+    write(&fx, "Code/B.cs", "b-wip\n");
+    let e = expect(&fx);
+
+    let err = run_sync_in(&fx.wc_str(), &e).unwrap_err();
+    assert_eq!(err.code, "sync_in_update_conflict", "{}", err.message);
+    assert!(err.message.contains("Art"), "{}", err.message);
+    assert_eq!(git(&fx, &["symbolic-ref", "--short", "HEAD"]), "work");
+    assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
+    assert_eq!(baseline_rev(&fx), 1, "基线不推进");
+    assert_eq!(phase(&fx), None);
+}
