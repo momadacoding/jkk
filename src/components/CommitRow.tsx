@@ -4,6 +4,7 @@ import { prBadge, pullRequestForRef } from '../engine/prs'
 import { laneTint } from '../engine/paths'
 import { WORKDIR_ID } from '../engine/workdir'
 import { shortHash } from '../engine/commitActions'
+import { buildRefPills } from '../engine/refPills'
 
 interface CommitRowProps {
   node: LayoutNode
@@ -23,11 +24,6 @@ interface CommitRowProps {
   changeCount: number
   /** 该提交是否是 HEAD，是则整行加粗。 */
   isHead: boolean
-}
-
-/** 去掉 refs/heads/ 与 refs/remotes/ 前缀，标签上只留下人看的部分。 */
-function shortName(name: string): string {
-  return name.replace('refs/heads/', '').replace('refs/remotes/', '').replace('refs/tags/', '')
 }
 
 export function CommitRow({
@@ -51,7 +47,8 @@ export function CommitRow({
   const date = new Date(node.commit.time * 1000).toLocaleString()
   // HEAD 那条伪 ref 不做成标签——整行加粗已经表达了「当前在这里」，
   // 只有游离 HEAD 时才需要一个显式标记
-  const visible = refs.filter((r) => r.kind !== 'head')
+  // 本地分支与同一提交上的同名远程分支合成一个标签，见 buildRefPills
+  const pills = buildRefPills(refs.filter((r) => r.kind !== 'head'))
   const detached = refs.some((r) => r.kind === 'head') && !refs.some((r) => r.kind === 'branch')
 
   // svn 节点换一套配色：它们不是本地提交，点开也没有 diff 可看（Phase 4 才做），
@@ -80,23 +77,36 @@ export function CommitRow({
       </span>
       <span className="ref-pills">
         {detached && <span className="ref-pill head">HEAD</span>}
-        {visible.map((ref) => {
+        {pills.map((pill) => {
+          const { ref } = pill
           // 只有本地分支拿得到编号，判定在 engine 里，见 pullRequestForRef
           const pr = pullRequestForRef(prByBranch, ref)
           // ref.hash 就是这一行的提交，也就是该分支的 tip——正好是判断
           // 「PR 合并之后分支有没有再往前走」需要的那个值
           const badge = pr ? prBadge(pr, ref.hash) : undefined
+          const tooltip = [
+            ref.name,
+            pill.remotes.length > 0 ? `远程同一提交：${pill.remotes.join('、')}` : undefined,
+            badge?.tooltip,
+          ].filter(Boolean).join('\n')
           return (
             <span
-              key={ref.name}
-              className={`ref-pill ${ref.kind}`}
+              key={pill.key}
+              className={`ref-pill ${pill.kind}`}
               // 本地分支的色条与底色都取车道色，标签才能和图上那条线对应起来
-              style={ref.kind === 'branch'
+              style={pill.kind === 'branch'
                 ? { borderLeftColor: laneColor, background: laneTint(laneColor, 0.22) }
                 : undefined}
-              title={badge ? `${ref.name}\n${badge.tooltip}` : ref.name}
+              title={tooltip}
             >
-              {shortName(ref.name)}
+              {/* 名字单独一个 span 负责省略号：空间不够时先截名字，
+                  后面的远程标记和 PR 编号始终完整可见 */}
+              <span className="ref-pill-name">{pill.label}</span>
+              {/* 远程标记只是个图标，完整远程名在悬停提示里。
+                  \uFE0E 要求按文本字形绘制，避免某些平台画成彩色 emoji */}
+              {pill.remotes.length > 0 && (
+                <span className="ref-pill-remote" aria-label="远程同一提交">{'\u2601\uFE0E'}</span>
+              )}
               {/* 编号内嵌在同一个 pill 里：另起一个 pill 要多一份边距和间隙，
                   而这一行还挤着提交信息、作者、hash 和日期 */}
               {badge && (
