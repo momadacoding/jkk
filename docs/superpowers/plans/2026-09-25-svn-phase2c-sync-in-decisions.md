@@ -9,7 +9,7 @@
 |---|---|---|---|---|
 | 0 | 决策日志 + 自检 | ✅ 完成 | 本文件 | 自检见下「Task 0」；`pnpm install` 成功 |
 | 1 | 2b 遗留：watcher RAII、锁释放重试、journal tmp 清理、持锁时长 | ✅ 完成 | `commands/watch.rs`、`svn_lock.rs`、`svn_journal.rs` + 5 条测试 | RED 已见（2 编译失败 + 1 断言失败）；3 条变异各自只红对应测试；fmt / clippy 0 告警 / `cargo test` 608 passed 0 failed |
-| 2 | 前置检查 | ⬜ | | |
+| 2 | 前置检查 | ✅ 完成 | `svn_xml::parse_update_status`、新模块 `svn_sync_check.rs`、fixture `hybrid_with_colleague` + 17 条测试 | RED 已见（两个测试文件编译失败）；4 条变异各自只红对应测试；fmt / clippy 0 告警 / `cargo test` 625 passed 0 failed |
 | 3 | WIP 压栈与取回 | ⬜ | | |
 | 4 | 基线录制零件拆分 | ⬜ | | |
 | 5 | 编排主路径 S0–S11 + 冲突出口 | ⬜ | | |
@@ -125,3 +125,38 @@
 - 锁 `Drop` 的重试最多等 10 × 20ms = 200ms，且只在删除失败、文件仍在时才等；`NotFound` 立刻返回。Drop 里依旧不 panic。
 - `sweep_stale_tmp` 只删「`mygitclient-sync.json.` 开头且 `.tmp` 结尾」的文件，同目录的 `.bak` 等不相干文件由测试证明不被误删；只有持锁者写 journal，写入时的其它 tmp 必然是残骸。
 - journal 写入失败时现在会删掉自己的 tmp（原来只有 rename 失败那条路径会删），目标文件本身从未被触碰，原子性不变。
+
+---
+
+## Task 2：前置检查（spec §7.2 第 1–6 条）
+
+### 验证记录
+
+| 步骤 | 实际结果 |
+|---|---|
+| 接口核对 | 计划 Consumes 的 `check_sync`、`detect_pinned`、`verify_include_set`、`git_dir`、`TempIndex::{empty, add_all}`、`assert_not_syncing`、`svn_journal::read` 签名均与实际一致；`is_w_file` / `normalize_roots` 是 `pub(crate)`，新模块在同一 crate 内，可用 |
+| RED | `svn_xml` 缺 `parse_update_status`、`svn_sync_check` 模块不存在，两个测试文件编译失败，与计划期望一致 |
+| GREEN | `svn_xml update_status` 2 passed；`svn_sync_check` 15 passed（含计划标了风险的 `a_pinned_whitelist_external_is_refused`：`init_hybrid` 在该 fixture 上成功，无需换 fixture） |
+| 变异 1：`tree_conflicted` 恒 `false` | 只红 `update_status_sees_tree_conflicts_whose_item_is_not_conflicted` |
+| 变异 2：`rev-list` 非零退出当成通过 | 只红 `a_failing_merge_query_is_not_treated_as_empty` |
+| 变异 3：去掉 `&& incoming` | 只红 `outside_changes_the_update_will_not_touch_are_not_listed` |
+| 变异 4：不跑纳入集合预检 | 只红 `a_gitignore_that_hides_w_files_is_refused_before_anything` |
+| 全量 | `cargo fmt --check` 0；`cargo clippy --all-targets` 0 告警；`cargo test` 625 passed / 0 failed（47 个测试二进制，= Task 1 的 608 + 本 Task 17） |
+
+### 偏离计划
+
+- 无代码偏离。计划给的代码与 rustfmt 结果有几处折行不同，`cargo fmt` 自动处理，语义不变。
+
+### 计划的错误
+
+- 无。
+
+### 计划没写的坑
+
+- `an_out_of_sync_baseline_is_refused` 断言的「整体前进即拒绝」只是本 Task 的中间状态：A16 之后这种状态由执行时接管，Task 7A 会删掉这条测试、换成四条更细的（测试里已写明）。在 7A 之前，`sync_in_out_of_sync` 的文案仍让用户「先处理失同步横幅」。
+
+### 为什么这么改是安全的
+
+- 整个模块是**纯读**：git 只跑 `symbolic-ref` / `rev-parse` / `rev-list` / `diff --name-only`，svn 只跑 `status -u --xml`；纳入集合预检用 `TempIndex`（临时索引文件，Drop 时删），不碰真实索引、HEAD 与磁盘。
+- `assert_linear` 在拼 `target..tip` 之前校验两端都是 40 位十六进制 OID：空 OID 会让区间退化成 `..tip`（= `HEAD..tip`），查的不是我们以为的那段；`rev-list` 非零退出一律报错，不当成「没有 merge」（变异 2 钉住）。
+- svn 冲突判定同时看 `item == "conflicted"` 与 `tree-conflicted="true"`：树冲突节点的 `item` 是 `added`（变异 1 钉住）。

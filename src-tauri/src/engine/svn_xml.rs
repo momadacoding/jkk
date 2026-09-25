@@ -350,6 +350,77 @@ pub fn parse_status_entries(xml: &str) -> Result<Vec<StatusEntry>> {
     Ok(out)
 }
 
+/// `svn status [-u] --xml` 里 `sync_in` 关心的字段（spec §7.2 第 4、5 条，§7.3 S5）。
+///
+/// 与 [`StatusEntry`] 分开：那个结构被初始化、重建、体检、失同步判定共用，
+/// 给它加字段会牵动所有构造点；这里要的三样东西（`repos-status`、树冲突、
+/// `against`）只有更新流程用。
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateStatusEntry {
+    /// 相对 target 的路径，正斜杠。
+    pub path: String,
+    pub item: String,
+    pub props: String,
+    /// `<wc-status tree-conflicted="true">`。
+    ///
+    /// **不能只看 `item == "conflicted"`**：2026-09-25 实测，树冲突节点是
+    /// `item="added" tree-conflicted="true"`，只看 item 会把它当成一个普通的
+    /// 本地新增放过去。
+    pub tree_conflicted: bool,
+    /// `<repos-status item>`：带 `-u` 时才有。`modified` / `added` / `deleted`
+    /// 表示这次 update 会碰到它，`none` 表示不会。
+    pub repos_item: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateStatus {
+    pub entries: Vec<UpdateStatusEntry>,
+    /// `<against revision>`：服务器此刻的 HEAD，也就是这次会更新到的 revision。
+    /// 带 `-u` 时才有；实测**没有任何可更新内容时也会给出**。
+    pub against: Option<u64>,
+}
+
+pub fn parse_update_status(xml: &str) -> Result<UpdateStatus> {
+    let doc = parse_doc(xml)?;
+    let mut entries = Vec::new();
+    for entry in doc.descendants().filter(|n| n.has_tag_name("entry")) {
+        let path = norm_sep(&attr(&entry, "path")?);
+        // 与 parse_status_entries 同一条理由：缺 <wc-status> 一律报错，不跳过
+        let st = entry
+            .children()
+            .find(|n| n.has_tag_name("wc-status"))
+            .ok_or_else(|| {
+                GitError::new(
+                    "svn_xml",
+                    format!("svn status 的 entry `{path}` 底下没有 <wc-status>"),
+                )
+            })?;
+        let repos_item = match entry.children().find(|n| n.has_tag_name("repos-status")) {
+            Some(r) => Some(attr(&r, "item")?),
+            None => None,
+        };
+        entries.push(UpdateStatusEntry {
+            path,
+            item: attr(&st, "item")?,
+            props: attr(&st, "props")?,
+            tree_conflicted: st.attribute("tree-conflicted") == Some("true"),
+            repos_item,
+        });
+    }
+    // 项目根的 <target> 在最前；external 各有自己的 <target>/<against>，
+    // 它们与根同属一个仓库时数值相同（P4 保证白名单不跨仓库），取第一个即可。
+    let against = match doc.descendants().find(|n| n.has_tag_name("against")) {
+        Some(a) => {
+            let raw = attr(&a, "revision")?;
+            Some(raw.parse::<u64>().map_err(|_| {
+                GitError::new("svn_xml", format!("<against revision> 不是数字：{raw}"))
+            })?)
+        }
+        None => None,
+    };
+    Ok(UpdateStatus { entries, against })
+}
+
 /// `svn propget svn:externals -R --xml` 里的一处属性。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExternalsProp {

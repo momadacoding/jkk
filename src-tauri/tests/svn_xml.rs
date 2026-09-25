@@ -765,3 +765,77 @@ fn list_rejects_truncated_output() {
 <lists>\r\n<list\r\n   path=\"file:///C:/tmp/repo\">\r\n";
     assert!(parse_list(xml).is_err());
 }
+
+#[test]
+fn update_status_reads_repos_status_and_against() {
+    use app_lib::engine::svn_xml::parse_update_status;
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<status>
+<target
+   path=".">
+<entry
+   path="Art\x.psd">
+<wc-status
+   item="modified"
+   revision="1"
+   props="none">
+</wc-status>
+<repos-status
+   item="modified"
+   props="none">
+</repos-status>
+</entry>
+<entry
+   path="Art\y.psd">
+<wc-status
+   item="normal"
+   revision="1"
+   props="none">
+</wc-status>
+<repos-status
+   item="modified"
+   props="none">
+</repos-status>
+</entry>
+<against
+   revision="2"/>
+</target>
+</status>"#;
+    let st = parse_update_status(xml).unwrap();
+    assert_eq!(st.against, Some(2));
+    assert_eq!(st.entries.len(), 2);
+    assert_eq!(st.entries[0].path, "Art/x.psd", "路径归一成正斜杠");
+    assert_eq!(st.entries[0].item, "modified");
+    assert_eq!(st.entries[0].repos_item.as_deref(), Some("modified"));
+    assert!(!st.entries[0].tree_conflicted);
+}
+
+#[test]
+fn update_status_sees_tree_conflicts_whose_item_is_not_conflicted() {
+    // 2026-09-25 实测：树冲突节点是 `item="added" tree-conflicted="true"`。
+    // 只看 item == "conflicted" 会把它当成一个普通的本地新增放过去。
+    use app_lib::engine::svn_xml::parse_update_status;
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<status>
+<target
+   path=".">
+<entry
+   path="Code\Gone">
+<wc-status
+   item="added"
+   props="none"
+   copied="true"
+   tree-conflicted="true">
+</wc-status>
+</entry>
+</target>
+</status>"#;
+    let st = parse_update_status(xml).unwrap();
+    assert!(st.entries[0].tree_conflicted);
+    assert_eq!(st.entries[0].item, "added");
+    assert_eq!(
+        st.entries[0].repos_item, None,
+        "不带 -u 时没有 repos-status"
+    );
+    assert_eq!(st.against, None);
+}
