@@ -34,6 +34,8 @@ export type SyncInOutcome =
   | { kind: 'rebaseConflict'; files: string[] }
   | { kind: 'stashConflict'; files: string[]; stashOid: string }
   | { kind: 'stashBlocked'; collisions: string[]; stashOid: string }
+  /** 在放回改动那一步放弃：更新已完成，改动没有（完整）放回，备份留在 stash 里。 */
+  | { kind: 'released'; stashOid: string }
 
 /** 与 `ConfirmRequest` 同名的那几个字段，组件直接展开。 */
 export interface SyncConfirmModel {
@@ -138,6 +140,15 @@ export function describeSyncOutcome(o: SyncInOutcome): OutcomeNotice | null {
         detail:
           `服务器这次新增了与你的未跟踪文件同名的文件，直接放回会覆盖其中一边：\n${listFiles(o.collisions)}\n\n` +
           `把这些文件挪到别处（或改名）之后点顶部横幅上的「继续」。一个字节都还没放回，备份在 stash ${shortOid(o.stashOid)}。`,
+      }
+    case 'released':
+      // 不能复用 aborted 那句「已放回」：这里恰恰没放回（2c 独立 review I1）
+      return {
+        title: '更新已结束，改动没有自动放回',
+        detail:
+          '分支已经在新基线上。未提交的改动没有（完整）放回来——如果刚才有冲突，' +
+          '文件里可能还留着冲突标记，请自己处理。' +
+          `原始备份一直在 stash 列表里（mygitclient-sync:…，${shortOid(o.stashOid)}），需要时自己取回，不要当成垃圾清掉。`,
       }
   }
 }

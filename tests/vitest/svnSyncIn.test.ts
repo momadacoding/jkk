@@ -96,6 +96,17 @@ describe('describeSyncOutcome', () => {
     expect(n.detail).toContain('f2208125aa')
   })
 
+  it('在放回改动那一步放弃：不能说「已放回」，要说备份在 stash 里、分支已在新基线上（2c review I1）', () => {
+    const n = describeSyncOutcome({
+      kind: 'released',
+      stashOid: 'f2208125aad7d35d63ee9495ad0a6cc3c1ce21be',
+    })!
+    expect(n.detail).not.toContain('已放回')
+    expect(n.detail).toContain('f2208125aa')
+    expect(n.detail).toContain('stash')
+    expect(n.detail).toContain('新基线')
+  })
+
   it('stash 冲突给出备份 OID', () => {
     const n = describeSyncOutcome({
       kind: 'stashConflict',
@@ -163,6 +174,7 @@ describe('文案按纯文本渲染', () => {
       { kind: 'rebaseConflict' as const, files: ['A'] },
       { kind: 'stashConflict' as const, files: ['A'], stashOid: 'x'.repeat(40) },
       { kind: 'stashBlocked' as const, collisions: ['N'], stashOid: 'x'.repeat(40) },
+      { kind: 'released' as const, stashOid: 'x'.repeat(40) },
     ]) {
       const n = describeSyncOutcome(o)!
       texts.push(n.title, n.detail)

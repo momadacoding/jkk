@@ -693,6 +693,12 @@ fn sync_in_types_cross_ipc_in_camel_case() {
             },
             r#"{"kind":"stashBlocked","collisions":["N"],"stashOid":"o"}"#,
         ),
+        (
+            SyncInOutcome::Released {
+                stash_oid: "o".into(),
+            },
+            r#"{"kind":"released","stashOid":"o"}"#,
+        ),
     ];
     for (v, want) in cases {
         assert_eq!(serde_json::to_string(&v).unwrap(), want);

@@ -27,9 +27,9 @@
 |---|---|
 | `cargo fmt --check` | ✅ 0（2026-09-26，Task 11 Step 3） |
 | `cargo clippy --all-targets` | ✅ 0 告警 |
-| `cargo test` | ✅ 695 passed / 0 failed / 0 ignored，49 个测试二进制（基线：master `1db8210` 上 598 passed） |
+| `cargo test` | ✅ 699 passed / 0 failed，49 个测试二进制（review 修复之后；修复前 695。基线：master `1db8210` 上 598 passed） |
 | `pnpm build` | ✅ tsc + vite 通过 |
-| `pnpm test` | ✅ 27 个文件 430 passed / 0 failed（基线 383 passed） |
+| `pnpm test` | ✅ 27 个文件 431 passed / 0 failed（review 修复之后；修复前 430。基线 383 passed） |
 | `pnpm tauri dev` | ⬜ **未跑**：E2E 清单 8 个场景都要人在真实窗口里点，本会话没有跑。四个新命令的 invoke 参数名因此**尚未在运行时确认**（序列化形状由 `svn_backend.rs` 钉住，但 JS 侧参数名没有编译期检查） |
 | E2E 清单机械检查 | ✅ 29 个 `powershell` 代码块在 PS 5.1.26100 与 PS 7.6.1 下 `Parser::ParseInput` 均 0 语法错误；`Colleague` 在新造的 fixture 上连提两次（新增文件 r2、修改已有文件 r3）均落地，fixture 已删 |
 
@@ -489,3 +489,51 @@
 
 - 组件只做接线，分支逻辑全部在 Task 9 的纯函数里；invoke 参数名 `path` / `expect` 与 Rust 签名一致，`expect` 内部字段由 `tests/svn_backend.rs` 的序列化断言钉住——但这层转换没有编译期检查，最终仍要靠真实窗口里点一次确认（未跑，见上）。
 - 执行与继续 / 放弃都走 `confirm` 的 `action`：出错时对话框留在原地显示后端错误（错误文案里已写明回退结果），不会静默关掉。
+
+---
+
+## Task 11：独立 review 与修复
+
+### review
+
+- 由全新上下文的 opus agent 按 `AGENTS.md` §13 rubric 做整分支 review（`1db8210..56d27ee`），先读了本文件全部「偏离计划 / 计划的错误」与执行 ledger 的 9 条 ruling。结论 **With fixes**，**未发现未记录的偏离**。
+- reviewer 实跑：`svn_sync_in` / `svn_sync_stash` / `svn_sync_check` / `svn_backend` / `svn_write_guard` 共 110 passed；`pnpm test` 430 passed；在 `%TEMP%` 自建临时仓库做了两次 git 探针，用完删除。
+
+### 分级与处置
+
+| # | 发现 | 定级 | 处置 |
+|---|---|---|---|
+| C1 | S8 或「回原分支」那次 checkout 被 share=Read 占用、退出 0 却留下基线字节。之后点「继续」：rebase 在 `rebase.autoStash=true`（本机全局配置就是这样，reviewer 实测）时把残留收起、重放、再放回，报 Done，磁盘上是撤掉了你那笔提交的内容；点「放弃」直接放回 WIP，残留原样留着 | Critical | 已修 |
+| I1 | `applying-stash` 阶段放弃返回 `Aborted`，界面说「已回到更新前的分支，未提交的改动已放回」——两句都是假的，用户可能把 stash 里的备份当垃圾清掉 | Important | 已修 |
+| I2 | watcher 挂起用集合不计数：同仓库两个标签页，B 的命令因拿不到锁很快返回，它的恢复把 A 的挂起一起撤掉 | Important | 已修 |
+| M1–M6 | `drop_wip` 竞态分支吞掉 `stash store` 失败且依赖未固定 locale 的输出；A17 删除非原子；空白名单时 A5 断言空转；`catch_up` 之后的报错说「没有做任何修改」；S8 失败文案没说下一步；Review Focus 3 的测试不是「S5 途中」断网 | Minor | 记为 deferred，不在本轮修 |
+
+### 修复与验证
+
+| 发现 | 修法 | 测试（先红后绿） |
+|---|---|---|
+| C1 | ① rebase 显式 `-c rebase.autoStash=false -c rebase.updateRefs=false`；② 新增 `settle_checkout_residue`：HEAD 已在原分支上时（`from_baseline_ready` 写 Rebase 之前、`back_to_orig` 放回 WIP 之前），白名单内与 HEAD 不一致的被跟踪文件逐个比对，全是新旧基线里的 blob（或文件已不在）才按 HEAD 写回，否则 `sync_in_unsafe_to_return` 指名停下、记录保留；写回后仍不干净按占用报 `sync_in_checkout_failed` | `continue_after_s8_left_baseline_bytes_does_not_revert_my_commit`（测试里显式开 `rebase.autoStash`）、`abort_after_s8_left_baseline_bytes_does_not_revert_my_commit`、`bytes_that_are_neither_the_branch_nor_the_baseline_are_not_overwritten`：三条 RED 与 reviewer 描述一致（继续报 Done 而 `B.cs` 是基线字节；放弃后残留原样；来路不明的字节也被当成功） |
+| I1 | 后端新结局 `SyncInOutcome::Released { stashOid }`；前端 `describeSyncOutcome` 的 `released` 文案说清分支已在新基线上、改动没有（完整）放回、备份在 stash 里（带短 OID） | Rust：`abort_while_applying_the_stash_keeps_the_stash_for_the_user` 改为断言 `Released` 且 `B.cs` 确实没放回；`sync_in_types_cross_ipc_in_camel_case` 加 `{"kind":"released","stashOid":"o"}`（两者先编译失败）。vitest：新增 `在放回改动那一步放弃…` 并把 `released` 加进纯文本检查（先红） |
+| I2 | `SUSPENDED` 改为按归一化路径计数，计数归零才算恢复；没挂起过的恢复仍是空操作 | `a_second_guard_on_the_same_repo_does_not_resume_the_first`（先红：B 结束后 A 已不在挂起） |
+
+变异复核：去掉 `from_baseline_ready` 的残留处理 → 继续用例红；去掉 `back_to_orig` 的残留处理 → 放弃用例红；把任何字节都当基线 → 「来路不明」用例红；去掉下面那条 S1 前提守卫 → `abort_from_stashing_that_never_landed_changes_nothing` 红。**`rebase.autoStash` 钉死这一条不可观察**：残留处理已保证 rebase 前白名单内干净，钉配置是纵深防御（autoStash 只收已跟踪改动），记为 ruling。
+
+### 偏离计划
+
+- 新增 `SyncInOutcome::Released`（计划没有这个结局）与 `sync_in_unsafe_to_return` 的第二个触发点（原来只在 A5 断言）。
+- 计划文案 `aborted →「已放回」` 被用于 `applying-stash` 放弃，是计划本身的错误（I1）。
+
+### 计划没写的坑
+
+- **首轮修复带出一条回归**：`abort_from_stashing_that_never_landed_changes_nothing` 红了。push 从未落地时 WIP 还在磁盘上，残留检查把它当成「来路不明」。「WIP 全在 stash 里」只在 S1 确实完成过时成立，所以 `stashOid` 缺省且 phase 仍是 `start` / `stashing` / `stashed` 时跳过残留处理——那时 HEAD 从没离开过原分支，没有 checkout 残留可言。
+- 本机全局 git 配置开着 `rebase.autoStash=true`，fixture 仓库会继承它——测试结果会随开发机配置变化，C1 的继续用例因此显式设置它。
+
+### 为什么这么改是安全的
+
+- 残留写回只覆盖「字节在新旧基线 commit 里原样存着」或「磁盘上已经没有」的文件，被覆盖的字节随时能从基线取回；任何一个文件不满足就整体不动。写回的 pathspec 来自 `git diff --name-only`，非空才走到这里（§12.2）。
+- `Released` 只改变结局的报法，后端动作（删钉住的 ref 与 journal、stash 条目留给用户）不变。
+- watcher 计数只影响「何时恢复」，挂起与去抖线程的判断方式不变；恢复没挂起过的路径仍是空操作。
+
+### 仍未做
+
+- 真实窗口 E2E（`pnpm tauri dev`）没有跑，需要人工。

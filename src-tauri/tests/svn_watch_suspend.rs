@@ -83,3 +83,19 @@ fn a_suspension_guard_resumes_on_normal_return() {
     }
     assert!(!is_watch_suspended(path));
 }
+
+#[test]
+fn a_second_guard_on_the_same_repo_does_not_resume_the_first() {
+    // 2c 独立 review I2：同一仓库开两个标签页，A 的更新正在跑，B 点了「继续」。
+    // B 的命令先挂起、再因拿不到锁（sync_in_progress）很快返回，它的 Drop 不能把
+    // A 的挂起一起撤掉——否则 A 跑到 S3–S9 时界面开始读中间态（spec §5.2）
+    use app_lib::commands::watch::WatchSuspension;
+    let path = r"C:\fake\two-tabs";
+    let a = WatchSuspension::new(path);
+    {
+        let _b = WatchSuspension::new(path);
+    }
+    assert!(is_watch_suspended(path), "B 结束了，A 还在跑");
+    drop(a);
+    assert!(!is_watch_suspended(path), "两个都结束才恢复");
+}

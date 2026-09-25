@@ -500,6 +500,9 @@ Remove-Item -Recurse -Force $fix.FullName
 | 外部整体 update 的接管、新增文件、相邻行冲突、继续到更新的 revision | `svn_sync_in.rs` 的 7A 一组 |
 | stash 按 opid 找、按 OID drop、撞名预检与 A17 放宽 | `src-tauri/tests/svn_sync_stash.rs` |
 | 前置检查（merge、detached、pinned、svn 冲突、断网、`.gitignore`） | `src-tauri/tests/svn_sync_check.rs` |
+| S8 / 回原分支的 checkout 留下基线字节时，继续与放弃都先写回、不撤掉你的提交；来路不明的字节不覆盖 | `continue_after_s8_left_baseline_bytes_does_not_revert_my_commit`、`abort_after_s8_left_baseline_bytes_does_not_revert_my_commit`、`bytes_that_are_neither_the_branch_nor_the_baseline_are_not_overwritten` |
+| 在放回改动那一步放弃，结局是 `released`，界面不说「已放回」 | `abort_while_applying_the_stash_keeps_the_stash_for_the_user`、`tests/vitest/svnSyncIn.test.ts` |
+| 同仓库两个标签页，一个的命令结束不会撤掉另一个的 watcher 挂起 | `tests/svn_watch_suspend.rs::a_second_guard_on_the_same_repo_does_not_resume_the_first` |
 | IPC 字段名（含 `catchUpRev` 为 `null` 时仍发出） | `src-tauri/tests/svn_backend.rs::sync_in_types_cross_ipc_in_camel_case` |
 | 三个写命令挂起 watcher、engine 入口拿锁 | `src-tauri/tests/svn_write_guard.rs::sync_commands_suspend_the_watcher_and_their_engine_entries_take_the_lock` |
 | 确认框 / 结局 / 横幅文案 | `tests/vitest/svnSyncIn.test.ts`、`svnJournal.test.ts`、`svnSync.test.ts` |

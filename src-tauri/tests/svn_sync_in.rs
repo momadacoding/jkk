@@ -694,8 +694,17 @@ fn abort_while_applying_the_stash_keeps_the_stash_for_the_user() {
     fx.colleague_commits("Code/N.cs", "server\n");
     write(&fx, "Code/B.cs", "b-wip\n");
     write(&fx, "Code/N.cs", "mine\n");
-    assert!(matches!(sync(&fx), SyncInOutcome::StashBlocked { .. }));
-    assert_eq!(abort_sync(&fx.wc_str()).unwrap(), SyncInOutcome::Aborted);
+    let oid = match sync(&fx) {
+        SyncInOutcome::StashBlocked { stash_oid, .. } => stash_oid,
+        o => panic!("应当被撞名挡住：{o:?}"),
+    };
+    // 2c 独立 review I1：这里一个字节都没放回，结局不能是 `Aborted`——
+    // 界面对 `Aborted` 说的是「已回到更新前的分支，未提交的改动已放回」，两句都是假的
+    assert_eq!(
+        abort_sync(&fx.wc_str()).unwrap(),
+        SyncInOutcome::Released { stash_oid: oid }
+    );
+    assert_eq!(read(&fx, "Code/B.cs"), "b1\n", "确实没放回");
     assert_eq!(our_stashes(&fx), 1, "备份留在 stash 列表里给用户");
     assert_eq!(
         git(&fx, &["for-each-ref", "refs/mygitclient/"]),
@@ -1089,4 +1098,90 @@ fn a_catch_up_is_refused_when_the_branch_moved_since_the_preview() {
     assert_eq!(err.code, "sync_in_state_changed");
     assert_eq!(git(&fx, &["rev-parse", "svn/base"]), base, "基线没被接管");
     assert_eq!(phase(&fx), None);
+}
+
+// —— S8 切回原分支没切干净（2c 独立 review C1）——
+
+/// 停在 `baseline-ready`、HEAD 已在 `work` 上，但 `Code/B.cs` 还是基线的字节。
+///
+/// 这就是 A15 实测的 L1 形状发生在 S8：文件被 Unity 以 share=Read 占着时
+/// `git checkout work` 退出 0、HEAD 已切走，那个文件却没写进去。这里不真的去占
+/// 文件（那只在 Windows 上造得出），直接造出 checkout 之后的磁盘状态。
+///
+/// 你在 `work` 上提交过 `B.cs = b-local`；未提交的改动是一个新文件 `New.cs`。
+fn s8_left_baseline_bytes(fx: &SvnFixture, opid: &str, residue: &str) -> Journal {
+    fx.colleague_commits("Code/A.cs", "a2\n");
+    write(fx, "Code/B.cs", "b-local\n");
+    commit(fx, "local B");
+    write(fx, "Code/New.cs", "wip-new\n");
+    let mut j = s5(fx, opid);
+    let (tree, c) = built_commit(fx, &j, None);
+    let old = j.baseline_oid_before.clone().unwrap();
+    git(fx, &["update-ref", "refs/heads/svn/base", &c, &old]); // S7 发布
+    git(fx, &["read-tree", "svn/base"]); // S7 索引对齐
+    git(fx, &["checkout", "-q", "work"]); // S8
+    write(fx, "Code/B.cs", residue); // checkout 没写进去的那个文件
+    j.phase = Phase::BaselineReady;
+    j.capture_tree = Some(tree);
+    j.new_baseline_oid = Some(c);
+    svn_journal::write(&fx.wc_str(), &j).unwrap();
+    j
+}
+
+#[test]
+fn continue_after_s8_left_baseline_bytes_does_not_revert_my_commit() {
+    // review 实测：`rebase.autoStash=true` 时 rebase 把残留收起、重放、再放回，退出 0，
+    // 结局报 Done——磁盘上却是不含你那笔提交的内容。显式打开它，让测试不随开发机配置变化
+    let fx = hybrid_with_colleague();
+    s8_left_baseline_bytes(&fx, "op-s8c", "b1\n");
+    git(&fx, &["config", "rebase.autoStash", "true"]);
+
+    assert_eq!(
+        continue_sync(&fx.wc_str()).unwrap(),
+        SyncInOutcome::Done { new_rev: 2 }
+    );
+    assert_eq!(
+        read(&fx, "Code/B.cs"),
+        "b-local\n",
+        "你提交过的内容在磁盘上"
+    );
+    assert_eq!(read(&fx, "Code/A.cs"), "a2\n");
+    assert_eq!(read(&fx, "Code/New.cs"), "wip-new\n");
+    assert_eq!(
+        git(&fx, &["status", "--porcelain", "--", "Code/B.cs"]),
+        "",
+        "B.cs 与 HEAD 一致，不显示成「撤销提交」的本地修改"
+    );
+}
+
+#[test]
+fn abort_after_s8_left_baseline_bytes_does_not_revert_my_commit() {
+    let fx = hybrid_with_colleague();
+    let j = s8_left_baseline_bytes(&fx, "op-s8a", "b1\n");
+
+    assert_eq!(abort_sync(&fx.wc_str()).unwrap(), SyncInOutcome::Aborted);
+    assert_eq!(git(&fx, &["rev-parse", "HEAD"]), j.orig_head.unwrap());
+    assert_eq!(read(&fx, "Code/B.cs"), "b-local\n");
+    assert_eq!(read(&fx, "Code/New.cs"), "wip-new\n");
+    assert_eq!(git(&fx, &["status", "--porcelain", "--", "Code/B.cs"]), "");
+}
+
+#[test]
+fn bytes_that_are_neither_the_branch_nor_the_baseline_are_not_overwritten() {
+    // 残留不是基线的字节 ⇒ 不知道是谁改的，继续与放弃都不能覆盖
+    let fx = hybrid_with_colleague();
+    s8_left_baseline_bytes(&fx, "op-s8x", "edited-after-crash\n");
+
+    let err = continue_sync(&fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "sync_in_unsafe_to_return", "{}", err.message);
+    assert!(err.message.contains("Code/B.cs"), "{}", err.message);
+    let err = abort_sync(&fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "sync_in_unsafe_to_return", "{}", err.message);
+    assert_eq!(
+        read(&fx, "Code/B.cs"),
+        "edited-after-crash\n",
+        "一个字节都没覆盖"
+    );
+    assert_eq!(phase(&fx), Some(Phase::BaselineReady), "记录原样保留");
+    assert_eq!(our_stashes(&fx), 1, "WIP 还在");
 }

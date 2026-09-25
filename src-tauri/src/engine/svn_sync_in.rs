@@ -77,6 +77,15 @@ pub enum SyncInOutcome {
         collisions: Vec<String>,
         stash_oid: String,
     },
+    /// 在 `applying-stash` 阶段放弃：更新本身已经完成（分支在新基线上），但未提交的
+    /// 改动**没有**（完整）放回——撞名时一个字节都没放，冲突时文件里留着冲突标记。
+    /// 备份原样留在 stash 列表里。
+    ///
+    /// 不能报成 `Aborted`：界面对它说的是「已回到更新前的分支，未提交的改动已放回」，
+    /// 用户信了就可能把 stash 列表里那条备份当垃圾清掉（2c 独立 review I1）。
+    Released {
+        stash_oid: String,
+    },
 }
 
 /// 一次完整的更新。
@@ -429,12 +438,30 @@ pub(crate) fn from_baseline_ready(
     if rev_parse(repo, "HEAD")? != orig_head {
         return Err(state_changed(&format!("分支 `{orig}` 的位置变了")));
     }
+    // 上一次 S8 可能「退出 0 却没切干净」，继续时 HEAD 已经在原分支上（A15 / C1）
+    settle_checkout_residue(repo, cfg, j, &orig)?;
     // S9：对新基线再复核一次（§7.3.2）
     let new_base = rev_parse(repo, &format!("refs/heads/{BASELINE_BRANCH}"))?;
     assert_linear(repo, &new_base, &orig_head)?;
     j.phase = Phase::Rebase;
     svn_journal::write(repo, j)?;
-    match run_git(repo, &["rebase", "--empty=drop", BASELINE_BRANCH]) {
+    // 用户配置不能改变 rebase 的语义（2c 独立 review C1，实测）：
+    // - `rebase.autoStash=true` 会把工作区里的任何残留收起、重放、再放回，退出 0——
+    //   残留若是基线的字节，就悄悄撤掉了用户提交过的内容，而结局报 Done；
+    // - `rebase.updateRefs=true` 会顺手移动指向被重放区间的其它分支。
+    // 与 `--empty=drop` 同一个原则：不依赖默认值，也不依赖用户配置
+    match run_git(
+        repo,
+        &[
+            "-c",
+            "rebase.autoStash=false",
+            "-c",
+            "rebase.updateRefs=false",
+            "rebase",
+            "--empty=drop",
+            BASELINE_BRANCH,
+        ],
+    ) {
         Ok(_) => finish_forward(repo, j),
         Err(e) => conflict_or_error(repo, e),
     }
@@ -746,9 +773,10 @@ pub fn abort_sync(repo: &str) -> Result<SyncInOutcome> {
         Phase::ApplyingStash => {
             // 放弃接管：stash 条目原样留在列表里（message 带 opid，认得出来），
             // 只删钉住的 ref 与 journal
+            let stash_oid = need(&j.stash_oid, "stashOid")?;
             wip::unpin(repo, &j.opid)?;
             svn_journal::remove(repo)?;
-            return Ok(SyncInOutcome::Aborted);
+            return Ok(SyncInOutcome::Released { stash_oid });
         }
         _ => return Err(sync_out_unsupported()),
     };
@@ -803,7 +831,94 @@ pub(crate) fn back_to_orig(
     if rev_parse(repo, "HEAD")? != orig_head {
         return Err(state_changed(&format!("分支 `{orig}` 的位置变了")));
     }
+    // 上一次切回原分支可能「退出 0 却没切干净」（A15 / C1）；刚才那次 checkout 已经核对过
+    settle_checkout_residue(repo, cfg, j, &orig)?;
     restore_step(repo, j)
+}
+
+/// HEAD 已在原分支上，但白名单内被跟踪文件与 HEAD 不一致时怎么办（2c 独立 review C1）。
+///
+/// 此刻 WIP 全在 stash 里，这类差异只有两个来源：
+///
+/// 1. **checkout 的残留**：S8 / 回原分支那次 `git checkout` 遇上 share=Read 占用，
+///    退出 0、HEAD 已切走，文件却还是基线的字节（A15 实测 L1）。这些字节在基线
+///    commit 里原样存着，按 HEAD 写回去不丢任何东西——不写回的话，rebase 与放回
+///    WIP 之后磁盘上是「撤掉了你那笔提交」的内容，而结局报成功。
+/// 2. **中断期间有人改过**：字节既不是分支的也不是基线的，不知道是谁的，不能覆盖。
+///
+/// 所以逐个比对：全是新旧基线里的 blob（或文件已不在）才写回，否则指名停下，
+/// 记录原样保留。
+fn settle_checkout_residue(repo: &str, cfg: &SvnConfig, j: &Journal, orig: &str) -> Result<()> {
+    // 「WIP 全在 stash 里」的前提只在 S1 确实完成过时成立。没有 stashOid、又停在 S3
+    // 之前的 phase，可能是 push 从未落地（崩在写 journal 与 push 之间）：此时 WIP
+    // 还原样在磁盘上，HEAD 也从没离开过原分支，没有任何 checkout 残留可言
+    if j.stash_oid.is_none() && matches!(j.phase, Phase::Start | Phase::Stashing | Phase::Stashed) {
+        return Ok(());
+    }
+    let stale = tracked_changes(repo, cfg)?;
+    if stale.is_empty() {
+        return Ok(());
+    }
+    let mut bases = vec![rev_parse(repo, &format!("refs/heads/{BASELINE_BRANCH}"))?];
+    if let Some(old) = &j.baseline_oid_before {
+        bases.push(old.clone());
+    }
+    let mut foreign = Vec::new();
+    for p in &stale {
+        if !is_baseline_bytes(repo, &bases, p)? {
+            foreign.push(p.clone());
+        }
+    }
+    if !foreign.is_empty() {
+        return Err(GitError::new(
+            "sync_in_unsafe_to_return",
+            format!(
+                "分支 `{orig}` 上下面这些文件的内容既不是分支里的、也不是基线里的——\
+                 不知道是谁改的，不能覆盖：\n{}\n记录已保留。请先确认这些改动\
+                 （需要的话自己备份），再点「继续」或「放弃」。",
+                list_paths(&foreign)
+            ),
+        ));
+    }
+    // `stale` 非空（上面已返回），不会是空 pathspec（§12.2）
+    let mut args: Vec<&str> = vec!["checkout", "HEAD", "--"];
+    args.extend(stale.iter().map(String::as_str));
+    run_git(repo, &args)?;
+    let left = tracked_changes(repo, cfg)?;
+    if !left.is_empty() {
+        let root = Path::new(repo);
+        return Err(GitError::new(
+            "sync_in_checkout_failed",
+            format!(
+                "分支 `{orig}` 上下面这些文件还没写回分支里的内容，多半仍有程序占着它们：\n{}\n{}\n\
+                 记录已保留，关掉占用的程序之后再点「继续」或「放弃」。",
+                list_paths(&left),
+                describe(root, &find_blockers(root, 5))
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// 磁盘上的 `p` 是不是某个基线 commit 里原样存着的字节（或者文件已经不在）。
+fn is_baseline_bytes(repo: &str, bases: &[String], p: &str) -> Result<bool> {
+    let path = Path::new(repo).join(p);
+    let Ok(meta) = path.symlink_metadata() else {
+        return Ok(true); // 磁盘上没有：按 HEAD 写回不会覆盖任何字节
+    };
+    if !meta.is_file() {
+        return Ok(false);
+    }
+    // `--path` 让磁盘内容走与 `git add` 相同的过滤器（svn_baseline.rs 记过这个坑）
+    let disk = run_git(repo, &["hash-object", &format!("--path={p}"), "--", p])?;
+    for b in bases {
+        let (code, blob) =
+            run_git_code(repo, &["rev-parse", "-q", "--verify", &format!("{b}:{p}")])?;
+        if code == 0 && blob.trim() == disk.trim() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// 拿锁并在锁内重读 journal。
