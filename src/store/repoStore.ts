@@ -30,6 +30,7 @@ import type {
   RebuildReport,
 } from '../engine/svnInit'
 import { samePath } from '../engine/path'
+import type { SyncInExpect, SyncInOutcome, SyncInPreview } from '../engine/svnSyncIn'
 import { nextSelection } from '../engine/selection'
 
 /** 后端 `svn_sync::RootRev`。 */
@@ -265,6 +266,23 @@ export function svnEolStatus(path: string): Promise<EolStatus> {
  */
 export function svnSyncState(path: string): Promise<SyncState> {
   return invoke<SyncState>('svn_sync_state', { path })
+}
+
+export function svnSyncInPreview(path: string): Promise<SyncInPreview> {
+  return invoke<SyncInPreview>('svn_sync_in_preview', { path })
+}
+
+/** `expect` 的字段名是 camelCase，与后端 `SyncInExpect` 的 serde 约定对齐（AGENTS.md §7.3）。 */
+export function svnSyncIn(path: string, expect: SyncInExpect): Promise<SyncInOutcome> {
+  return invoke<SyncInOutcome>('svn_sync_in', { path, expect })
+}
+
+export function svnSyncContinue(path: string): Promise<SyncInOutcome> {
+  return invoke<SyncInOutcome>('svn_sync_continue', { path })
+}
+
+export function svnSyncAbort(path: string): Promise<SyncInOutcome> {
+  return invoke<SyncInOutcome>('svn_sync_abort', { path })
 }
 
 /**

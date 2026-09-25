@@ -18,7 +18,7 @@
 | 7A | 外部整体 update 之后由「更新」接管（A16） | ✅ 完成 | `SyncInPreview.catch_up_rev`、`check_sync_in` 放行整体前进、`svn_sync_in::catch_up` + 9 条测试（替换 Task 2 的 1 条） | RED 已见（`catch_up_rev` 不存在）；5 条变异各自红对应测试；fmt / clippy 0 告警 / `cargo test` 692 passed 0 failed |
 | 8 | Tauri 命令 | ✅ 完成 | 新文件 `commands/svn_sync.rs`（4 个命令）+ 注册 + 2 条测试 | RED 已见（guard 测试因文件不存在失败）；2 条变异各自红对应测试；fmt / clippy 0 告警 / `cargo test` 695 passed 0 failed；`pnpm tauri dev` 实跑留到 Task 10 |
 | 9 | 前端纯逻辑 | ✅ 完成 | 新模块 `src/engine/svnSyncIn.ts`；`svnJournal.ts`（`applying-stash`、横幅动作、`sinceText`）、`svnSync.ts`（整体前进降黄、`svnUpdate`）、`toolbarActions.ts`（`showsSvnUpdate`）+ 测试 | RED 已见（6 条失败 + 1 个模块缺失）；5 条变异各自红对应测试（第 3 条靠加强的用例）；`pnpm build` 通过 / `pnpm test` 430 passed |
-| 10 | 前端接线 | ⬜ | | |
+| 10 | 前端接线 | 🟡 代码完成，真实窗口冒烟未跑 | `repoStore.ts` 四个 invoke、`Toolbar.tsx`「更新」、`BaselineBanner.tsx` 继续 / 放弃与「更新…」、`RepoTab.tsx` 编排、`styles.css` 的 `.dialog-message` 换行 | `pnpm build` 通过 / `pnpm test` 430 passed；`pnpm tauri dev` 场景 1 / 2 **未跑**（需人工操作真实窗口） |
 | 11 | E2E + spec 修订 + 收尾 | ⬜ | | |
 
 ## 全量验证
@@ -458,3 +458,33 @@
 - 全部是纯函数，无 React / Tauri 依赖；`svnJournal.ts` → `svnSyncIn.ts` → `svnSync.ts`（仅 type import），没有运行时循环依赖。
 - 「整体前进」横幅降为黄色，但重建基线与体检两个出口仍在（`所有 danger 文案都写明重建基线…` 与新用例一起钉住），离线时用户仍可先把基线跟上。回退与 mixed-revision 照旧红色、不给「更新」。
 - 新的横幅 action id（`svnUpdate`、`syncContinue`、`syncAbort`）在 Task 10 接线之前会被 `BaselineBanner` 渲染成按钮但没有处理——Task 10 紧接着接上，本 Task 不单独发布。
+
+---
+
+## Task 10：前端接线 + 真实窗口冒烟
+
+### 验证记录
+
+| 步骤 | 实际结果 |
+|---|---|
+| 接口核对 | `ConfirmRequest` 已有 `title / message / warning / confirmLabel / danger / action / busyLabel`，`SyncConfirmModel` 展开进去 `tsc` 不报多余字段；`refreshSvnSyncState / refreshSvnSync / fetchSvnLog` 都收 `path: string` |
+| 构建 | `pnpm build`（tsc + vite）通过 |
+| 测试 | `pnpm test` 27 个文件 430 passed / 0 failed（本 Task 没有新增纯逻辑，组件在本仓库跑不了 vitest——没有 jsdom） |
+| 真实窗口 | **未跑。** 场景 1（普通更新）与场景 2（冲突 → 继续）要在 `pnpm tauri dev` 的窗口里点按钮、在另一个 PowerShell 里造现场，需要人工。清单见 `docs/superpowers/e2e/2026-09-25-svn-phase2c-e2e.md` |
+
+### 偏离计划
+
+- **`.dialog-message` 加 `white-space: pre-wrap`**（`src/styles.css`）。计划没写：`describeSyncOutcome` 与接管说明都用换行符分行列文件清单，而 `ConfirmDialog` 的 message 原来按 HTML 默认折叠空白，清单会挤成一行。其它调用方的 message 都是单行，加上后渲染不变（`.dlg-warning` 本来就是 `pre-wrap`）。
+
+### 计划的错误
+
+- 无。
+
+### 计划没写的坑
+
+- 同上：对话框 message 不保留换行。
+
+### 为什么这么改是安全的
+
+- 组件只做接线，分支逻辑全部在 Task 9 的纯函数里；invoke 参数名 `path` / `expect` 与 Rust 签名一致，`expect` 内部字段由 `tests/svn_backend.rs` 的序列化断言钉住——但这层转换没有编译期检查，最终仍要靠真实窗口里点一次确认（未跑，见上）。
+- 执行与继续 / 放弃都走 `confirm` 的 `action`：出错时对话框留在原地显示后端错误（错误文案里已写明回退结果），不会静默关掉。

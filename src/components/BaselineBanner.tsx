@@ -15,6 +15,7 @@ import {
   type SyncState,
   type SyncStateUnreadable,
 } from '../engine/svnJournal'
+import type { SyncActionId } from '../engine/svnSyncIn'
 
 interface BaselineBannerProps {
   /** 是不是 SVN 混合仓库。普通 git 仓库下整个组件什么都不渲染。 */
@@ -36,6 +37,10 @@ interface BaselineBannerProps {
   onCheck: () => void
   /** 走一次行尾迁移。调用方负责先弹确认。 */
   onMigrateEol: () => void
+  /** 未收尾同步横幅上的「继续 / 放弃」。 */
+  onSyncAction: (id: SyncActionId) => void
+  /** 「工作副本已在外部更新」横幅上的「更新…」，与工具栏的「更新」是同一个入口。 */
+  onSvnUpdate: () => void
 }
 
 /**
@@ -78,6 +83,8 @@ export function BaselineBanner({
   onRebuild,
   onCheck,
   onMigrateEol,
+  onSyncAction,
+  onSvnUpdate,
 }: BaselineBannerProps) {
   // 未收尾 / 同步进行中排在最前，其余一律让位：那两种状态下仓库停在中间态，
   // 别的横幅拿半推进的基线算出来的结论可能是错的，而它们的出口（重建基线）
@@ -102,6 +109,17 @@ export function BaselineBanner({
           <p className="banner-baseline-detail">{unfinished.detail}</p>
           {unfinished.note && (
             <p className="banner-baseline-note">{unfinished.note}</p>
+          )}
+          {unfinished.actions.length > 0 && (
+            <div className="banner-baseline-actions">
+              {unfinished.actions.map((a) => (
+                // `syncActions` 只产出这两个值（Task 9 的测试钉着）；
+                // `BannerAction.id` 是所有横幅共用的联合类型，这里收窄一次
+                <button key={a.id} onClick={() => onSyncAction(a.id as SyncActionId)}>
+                  {a.label}
+                </button>
+              ))}
+            </div>
           )}
         </div>
       )}
@@ -138,6 +156,7 @@ export function BaselineBanner({
                 onClick={() => {
                   if (a.id === 'rebuild') onRebuild()
                   else if (a.id === 'check') onCheck()
+                  else if (a.id === 'svnUpdate') onSvnUpdate()
                   else if (a.id === 'updateWhitelistDir' && model.command) {
                     void navigator.clipboard.writeText(model.command)
                     setCopied(true)
