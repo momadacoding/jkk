@@ -1531,6 +1531,9 @@ SVN 树冲突，以及未受 git 保护文件的 update 冲突，仍按 §13 单
 
 1. 不在 rebase / merge 中途
 2. 基线未失同步（走 §6.6.3 的**完整 `nodeRevs` 校验**，不是 O(1) 那档）
+
+   > 2026-09-25（Phase 2c，用户决定）：`nodeRevs` 单值且**大于** `baselineRev`（外部在项目根整体 update 过）不再拒绝，由执行时先重建基线再更新，见 §18「十四」。其余失同步照旧拒绝。
+
 3. 当前不在 `svn/base` 上，且 **HEAD 必须附着在分支上**（detached HEAD 拒绝，见 §8.1.1）
 4. `svn status` 里 W-file 外没有冲突态文件（`C`），包含 W-path 内被扩展名排除的文件
 5. **本次 update 会触及的 W-file 外文件若有本地修改（`M` / `!`），列出来并要求用户确认**——见下
@@ -1566,15 +1569,21 @@ S1   工作区不干净时：
      ⑤ OID 写进 journal，phase=stashed                     ← 不记 stash@{0}，见 §7.6.1
 S2   （origBranch 已在 S0 落盘，此处只推进 phase）
 S3   git checkout svn/base
+     ⚠️ checkout 之后核对切干净了：文件被以 share=Read 打开（Unity）时 checkout 会
+        退出 0 却没把它写进去（2026-09-25 实测）
 S4   svn status --xml 扫描后只校验 W-file 应为 0 修改        ← 不把已确认保留的差集修改当作失同步
 S5   svn update --accept postpone                        ← 在项目根递归跑，
                                                               连带更新所有 external
      **仅当**检测到白名单所属 external 被 `-r` 钉住时，改走 §6.5.3 的两步形式。
      默认不走两步，理由见 §6.5.4
+     ⚠️ 成败不看退出码：有文本冲突或树冲突时 svn update 仍然退出 0（2026-09-25
+        实测），必须事后 svn status --xml 查 item="conflicted" 或 tree-conflicted="true"
 S6   svn info --xml + svn status -v --xml 读新 revision
 S7   临时索引纳入集合核对 → 用通过核对的 TREE 录制新基线   ← §6.3.1；失败保留旧基线和 journal
      按 §7.6 写入录制 / 发布阶段；完成索引对齐后才进入 S8
 S8   git checkout ORIG_BRANCH
+     ⚠️ checkout 之后核对切干净了：文件被以 share=Read 打开（Unity）时 checkout 会
+        退出 0 却没把它写进去（2026-09-25 实测）
 S9   复核 §7.3.2 的待重放区间，再 git rebase --empty=drop svn/base
                                                          ← 普通内容冲突在这里处理，无 merge-tree 前置
 S10  git stash apply <OID>（若 S1 有 stash），成功后
@@ -3697,6 +3706,23 @@ fixture，白名单 `Code/`，四种脏各一例）：
 误导性的错误上。
 
 ## 18. 修订记录
+
+### 2026-09-25（十四）· Phase 2c 施工：`sync_in` 的实测补足
+
+计划 `docs/superpowers/plans/2026-09-25-svn-phase2c-sync-in.md` 的「对 spec 的补足与偏离」
+A1–A17 全部实测或经用户决定，要点：
+
+- **pinned 模式下 `sync_in` 本期拒绝**（用户决定），§6.5.3 两步 update 推迟；
+- **新增 phase `applying-stash` 与字段 `stashApplied`**，补上 S9 与 S10 之间的崩溃窗口（§7.6 表已更新）；
+- **S10 apply 前先查未跟踪文件撞名**：撞名时 git 会半套 apply；
+- **S5 成败不看退出码**：冲突时 svn update 退出 0；
+- **S5 之后的「放弃」**：先断言 W-file 在 svn 看来干净，再 `checkout -f` 回原分支（用户决定）；
+- **每次 checkout 之后核对**：Unity 式占用下 checkout 退出 0 却没写进文件；
+- **外部整体 update 由「更新」接管**（用户决定，偏离 §7.2 第 2 条）：`nodeRevs` 单值且大于基线时，
+  锁内先跑 §16 的重建基线、再走 S0–S11，服务器改动与本地改动重新分开；mixed-revision 与
+  「退回基线之前」仍拒绝。失同步横幅对这种状态降为黄色并给「更新…」入口；
+- **撞名预检放宽**：磁盘、stash、HEAD 三处同一个 blob 的不算撞名（外部 update 带来的服务器
+  新增文件就是这个形状）。
 
 ### 2026-09-25（十三）· 同步锁的存活判据从 pid 探测改为句柄探测
 

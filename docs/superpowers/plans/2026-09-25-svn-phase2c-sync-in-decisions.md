@@ -19,18 +19,19 @@
 | 8 | Tauri 命令 | ✅ 完成 | 新文件 `commands/svn_sync.rs`（4 个命令）+ 注册 + 2 条测试 | RED 已见（guard 测试因文件不存在失败）；2 条变异各自红对应测试；fmt / clippy 0 告警 / `cargo test` 695 passed 0 failed；`pnpm tauri dev` 实跑留到 Task 10 |
 | 9 | 前端纯逻辑 | ✅ 完成 | 新模块 `src/engine/svnSyncIn.ts`；`svnJournal.ts`（`applying-stash`、横幅动作、`sinceText`）、`svnSync.ts`（整体前进降黄、`svnUpdate`）、`toolbarActions.ts`（`showsSvnUpdate`）+ 测试 | RED 已见（6 条失败 + 1 个模块缺失）；5 条变异各自红对应测试（第 3 条靠加强的用例）；`pnpm build` 通过 / `pnpm test` 430 passed |
 | 10 | 前端接线 | 🟡 代码完成，真实窗口冒烟未跑 | `repoStore.ts` 四个 invoke、`Toolbar.tsx`「更新」、`BaselineBanner.tsx` 继续 / 放弃与「更新…」、`RepoTab.tsx` 编排、`styles.css` 的 `.dialog-message` 换行 | `pnpm build` 通过 / `pnpm test` 430 passed；`pnpm tauri dev` 场景 1 / 2 **未跑**（需人工操作真实窗口） |
-| 11 | E2E + spec 修订 + 收尾 | ⬜ | | |
+| 11 | E2E + spec 修订 + 收尾 | 🟡 清单与 spec 完成，真实窗口场景未跑 | `docs/superpowers/e2e/2026-09-25-svn-phase2c-e2e.md`（8 个场景）、spec §7.2 注记 / §7.3 S3·S5·S8 注记 / §18「十四」 | 全量验证见下表；E2E 机械检查两条通过；独立 review 见「Task 11」 |
 
 ## 全量验证
 
 | 命令 | 结果 |
 |---|---|
-| `cargo fmt --check` | ⬜ |
-| `cargo clippy --all-targets` | ⬜ |
-| `cargo test` | ⬜（基线：master `1db8210` 上 598 passed） |
-| `pnpm build` | ⬜ |
-| `pnpm test` | ⬜（基线 383 passed） |
-| `pnpm tauri dev` | ⬜ |
+| `cargo fmt --check` | ✅ 0（2026-09-26，Task 11 Step 3） |
+| `cargo clippy --all-targets` | ✅ 0 告警 |
+| `cargo test` | ✅ 695 passed / 0 failed / 0 ignored，49 个测试二进制（基线：master `1db8210` 上 598 passed） |
+| `pnpm build` | ✅ tsc + vite 通过 |
+| `pnpm test` | ✅ 27 个文件 430 passed / 0 failed（基线 383 passed） |
+| `pnpm tauri dev` | ⬜ **未跑**：E2E 清单 8 个场景都要人在真实窗口里点，本会话没有跑。四个新命令的 invoke 参数名因此**尚未在运行时确认**（序列化形状由 `svn_backend.rs` 钉住，但 JS 侧参数名没有编译期检查） |
+| E2E 清单机械检查 | ✅ 29 个 `powershell` 代码块在 PS 5.1.26100 与 PS 7.6.1 下 `Parser::ParseInput` 均 0 语法错误；`Colleague` 在新造的 fixture 上连提两次（新增文件 r2、修改已有文件 r3）均落地，fixture 已删 |
 
 ---
 
