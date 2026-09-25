@@ -445,14 +445,7 @@ pub fn create_baseline_commit(
     // `Command::output()`，子进程 stdin 是 null，管道那条路会立刻读到 EOF 并产出
     // 一个 message 为空的 commit——而 trailer 就写在 message 里，等于基线丢掉
     // 记账且不报任何错。
-    let msg = format!(
-        "svn: r{}
-
-{}
-",
-        t.rev,
-        format_trailer(t)
-    );
+    let msg = format!("svn: r{}\n\n{}\n", t.rev, format_trailer(t));
     let mut args: Vec<&str> = vec!["commit-tree", tree];
     if let Some(p) = parent {
         args.push("-p");
@@ -490,7 +483,8 @@ pub fn move_baseline_ref(repo_root: &str, oid: &str, expected_old: Option<&str>)
         GitError::new(
             "svn_baseline_moved",
             format!(
-                "更新基线分支失败——发布前的一瞬间它被别人改了。                 已经建好的 commit 是 {oid}（对象还在，没有丢）。git 原话：{}",
+                "更新基线分支失败——发布前的一瞬间它被别人改了。\
+                 已经建好的 commit 是 {oid}（对象还在，没有丢）。git 原话：{}",
                 e.message
             ),
         )

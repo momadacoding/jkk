@@ -526,4 +526,32 @@ mod split_publish {
         let msg = run_git(r, &["log", "-1", "--format=%B", "svn/base"]).unwrap();
         assert!(msg.contains("git-svn-id: file:///C:/repo@2 "), "{msg}");
     }
+
+    #[test]
+    fn a_failed_update_ref_reads_as_one_sentence() {
+        // 预检通过、`update-ref` 本身失败的那条窄竞态路径。用残留的 ref 锁文件
+        // 触发（读 ref 不受影响，写 ref 报 `cannot lock ref`）。报错是给用户看的
+        // 中文句子，中间不能夹着源码缩进出来的一串空格
+        let d = repo();
+        let r = d.path().to_str().unwrap();
+        let old = run_git(r, &["rev-parse", "svn/base"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let tree = run_git(r, &["rev-parse", "svn/base^{tree}"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let c = create_baseline_commit(r, &tree, Some(&old), &t(2)).unwrap();
+        std::fs::write(d.path().join(".git/refs/heads/svn/base.lock"), "").unwrap();
+        let err = move_baseline_ref(r, &c, Some(&old)).unwrap_err();
+        assert_eq!(err.code, "svn_baseline_moved");
+        assert!(
+            err.message.contains("改了。已经建好的 commit 是"),
+            "{}",
+            err.message
+        );
+        let ours = err.message.split("git 原话").next().unwrap();
+        assert!(!ours.contains("  "), "{}", err.message);
+    }
 }

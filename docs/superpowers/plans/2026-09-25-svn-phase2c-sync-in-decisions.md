@@ -230,6 +230,13 @@
 - `svn_init.rs` 里「`let idx = TempIndex::empty(repo_root)?;` + `idx.add_all(...)`」这两行出现两次（另一处在体检相关函数里）；只删 `record_server_tree` 函数体里那一处，按上下文定位。
 - Git Bash 的 `sed -i` 会把 CRLF 文件写回 LF（本仓库 index 是 LF、提交时归一，`git diff --stat` 不受影响）。
 
+### 事后修正（Task 7A 之后发现，单独提交）
+
+- 本 Task 的拆分是用 Bash 工具里的 Python heredoc 写进去的，而 Bash 工具会把 heredoc 里的 `\\` 折成一个 `\`。结果 `d9aac2d` 里有两处字符串被改坏：
+  1. `create_baseline_commit` 的 `format!("svn: r{}\n\n{}\n", …)` 变成了跨行的字面换行。rustc 把源码换行归一为 LF，生成的 message 与原来逐字相同（trailer 解析的既有用例一直是绿的），但写法偏离了拆分前的原文。
+  2. `move_baseline_ref` 里 `svn_baseline_moved` 报错的续行 `\` 丢了，**用户可见的中文句子中间夹进 17 个空格**。这条只在「预检通过、`update-ref` 自己失败」的窄竞态路径上出现，原有测试走不到。
+- 修法：先补 `split_publish::a_failed_update_ref_reads_as_one_sentence`（用残留的 `refs/heads/svn/base.lock` 让 `update-ref` 失败，读 ref 不受影响），RED 已见（报错里带着那串空格）；再用 Edit 工具把两处字符串逐字恢复成拆分前的原文。`git diff 9e2703d -- svn_baseline.rs` 复核：除计划要的结构拆分外没有别的差异。全仓 Rust 文件扫描「中文后跟 8 个以上空格」无其它命中。修正后 `cargo test` 693 passed / 0 failed。
+
 ### 为什么这么改是安全的
 
 - `publish_baseline` 仍然先比对旧值、比对不过**不建 commit**，然后才调 `create_baseline_commit` + `move_baseline_ref`；`move_baseline_ref` 自己再比对一次、`update-ref` 带旧值兜住窄竞态——比拆分前多一次读取，语义不变（`publish_is_still_create_then_move` 与既有 `svn_baseline` / `svn_init` 用例钉住）。
