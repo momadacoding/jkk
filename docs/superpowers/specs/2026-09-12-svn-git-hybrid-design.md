@@ -1910,7 +1910,11 @@ rebase 预检使用的目标 OID 与 `origHead` 同样落盘，禁止用可能�
 |---|---|---|
 | `stashing` | `stashRefBefore` 已落盘，`git stash push` 可能落地也可能没有 | 比对当前 `refs/stash` 与 `stashRefBefore` 判定，**不静默 apply** |
 | `stashed` | stash 已落地且 OID 已钉住 | 按 `stashOid` 恢复 |
-| `applying-stash` | S9 已完成，正在或已经执行 S10 的 `git stash apply <OID>`；`stashApplied` 为真表示 apply 已执行（成功或留下冲突） | `stashApplied` 为假：可再次 apply（先查未跟踪文件撞名）；为真：只 drop，**不再 apply**。放弃时只删 journal 与钉住的 ref，stash 条目原样保留给用户 |
+| `applying-stash` | S9 已完成（或回退 / 放弃已回到原分支），正在或已经执行 S10 的 `git stash apply <OID>`；`stashApplied` 为真表示 apply 已执行（成功或留下冲突）；`rollingBack` 为真表示这是往回走途中停下的 | `stashApplied` 为假：可再次 apply（先查未跟踪文件撞名）；为真：只 drop，**不再 apply**。放弃时只删 journal 与钉住的 ref，stash 条目原样保留给用户。`rollingBack` 为真时「继续」的结局是「已放弃」而不是「已更新」，横幅与放弃文案都说分支在更新前的位置 |
+
+`sync_in` 的 journal 另有字段 `leftOrig`：S3 的 checkout **之前**置真，表示 HEAD 可能离开过原分支。
+没有可压的改动时 phase 一路停在 `stashed` 走过 S3–S5，只有它能区分「回退留下了 checkout 残留」与
+「push 从未落地、WIP 还在磁盘上」。
 
 S7 与恢复⑥另共用以下录制阶段，以 `flow` 及 `captureReturnStep` 区分后续入口：
 
@@ -3723,6 +3727,9 @@ A1–A17 全部实测或经用户决定，要点：
   「退回基线之前」仍拒绝。失同步横幅对这种状态降为黄色并给「更新…」入口；
 - **撞名预检放宽**：磁盘、stash、HEAD 三处同一个 blob 的不算撞名（外部 update 带来的服务器
   新增文件就是这个形状）。
+- **PR #49 review 之后**（2026-09-26）：journal 增加 `leftOrig` 与 `rollingBack`（§7.6）；
+  checkout 之后的核对也覆盖「该删却没删掉」的文件（同名未跟踪文件即使内容相同也会挡住之后的
+  checkout，实测）；rebase 没有发生过时「继续」重新走 S9，放弃前确认进行中的 rebase 是本次发起的。
 
 ### 2026-09-25（十三）· 同步锁的存活判据从 pid 探测改为句柄探测
 

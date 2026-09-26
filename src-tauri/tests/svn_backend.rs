@@ -379,6 +379,7 @@ fn sync_state_serializes_to_camel_case() {
             phase: Phase::Stashed,
             opid: "abc".into(),
             started_at: 1_757_000_000,
+            rolling_back: true,
         }),
     })
     .unwrap();
@@ -387,11 +388,13 @@ fn sync_state_serializes_to_camel_case() {
     assert_eq!(keys_of(&st["holder"]), vec!["opid", "pid", "startedAt"]);
     assert_eq!(
         keys_of(&st["unfinished"]),
-        vec!["flow", "opid", "phase", "startedAt"]
+        vec!["flow", "opid", "phase", "rollingBack", "startedAt"]
     );
     // 值本身也钉住：前端按这两个字符串分流（spec §7.6 的 phase 表）。
     assert_eq!(st["unfinished"]["flow"], "sync_in");
     assert_eq!(st["unfinished"]["phase"], "stashed");
+    // `applying-stash` 的横幅按它分方向（PR #49 review #3）
+    assert_eq!(st["unfinished"]["rollingBack"], true);
 }
 
 #[test]
@@ -696,8 +699,9 @@ fn sync_in_types_cross_ipc_in_camel_case() {
         (
             SyncInOutcome::Released {
                 stash_oid: "o".into(),
+                rolled_back: true,
             },
-            r#"{"kind":"released","stashOid":"o"}"#,
+            r#"{"kind":"released","stashOid":"o","rolledBack":true}"#,
         ),
     ];
     for (v, want) in cases {

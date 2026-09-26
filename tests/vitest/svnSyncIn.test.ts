@@ -100,11 +100,24 @@ describe('describeSyncOutcome', () => {
     const n = describeSyncOutcome({
       kind: 'released',
       stashOid: 'f2208125aad7d35d63ee9495ad0a6cc3c1ce21be',
+      rolledBack: false,
     })!
     expect(n.detail).not.toContain('已放回')
     expect(n.detail).toContain('f2208125aa')
     expect(n.detail).toContain('stash')
     expect(n.detail).toContain('新基线')
+  })
+
+  it('回退途中放弃放回：分支在更新前的位置，不能说在新基线上（PR #49 review #3）', () => {
+    const n = describeSyncOutcome({
+      kind: 'released',
+      stashOid: 'f2208125aad7d35d63ee9495ad0a6cc3c1ce21be',
+      rolledBack: true,
+    })!
+    expect(n.detail).not.toContain('新基线')
+    expect(n.detail).toContain('更新前')
+    expect(n.detail).not.toContain('已放回')
+    expect(n.detail).toContain('f2208125aa')
   })
 
   it('stash 冲突给出备份 OID', () => {
@@ -174,7 +187,8 @@ describe('文案按纯文本渲染', () => {
       { kind: 'rebaseConflict' as const, files: ['A'] },
       { kind: 'stashConflict' as const, files: ['A'], stashOid: 'x'.repeat(40) },
       { kind: 'stashBlocked' as const, collisions: ['N'], stashOid: 'x'.repeat(40) },
-      { kind: 'released' as const, stashOid: 'x'.repeat(40) },
+      { kind: 'released' as const, stashOid: 'x'.repeat(40), rolledBack: false },
+      { kind: 'released' as const, stashOid: 'x'.repeat(40), rolledBack: true },
     ]) {
       const n = describeSyncOutcome(o)!
       texts.push(n.title, n.detail)

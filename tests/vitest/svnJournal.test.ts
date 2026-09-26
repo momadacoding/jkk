@@ -122,6 +122,19 @@ describe('describeUnfinishedSync', () => {
     expect(seen.size, '有 phase 共用了同一句说明').toBe(phases.length)
   })
 
+  it('回退途中停在放回改动那一步：不能说「基线已经更新」（PR #49 review #3）', () => {
+    const at = (rollingBack: boolean) =>
+      describeUnfinishedSync({
+        locked: false,
+        holder: null,
+        unfinished: { flow: 'sync_in', phase: 'applying-stash', opid: 'x', startedAt: 1, rollingBack },
+      })!.detail
+    expect(at(true)).not.toContain('基线已经更新')
+    expect(at(true)).toContain('更新前')
+    expect(at(true)).toContain('stash')
+    expect(at(false)).toContain('基线已经更新')
+  })
+
   it('认不出的 phase 也要有话说，不能渲染一条没有正文的红条', () => {
     // 后端的 Phase 枚举比前端这个联合类型宽（含 sync_out 的全部阶段），
     // 手写的 journal 或 Phase 3 的流程都能让它们出现。

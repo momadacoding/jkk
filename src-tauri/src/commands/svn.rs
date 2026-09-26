@@ -176,6 +176,9 @@ pub struct UnfinishedSync {
     pub phase: Phase,
     pub opid: String,
     pub started_at: u64,
+    /// `applying-stash` 是回退 / 放弃途中停下的（分支在更新前的位置），不是更新途中。
+    /// 横幅据此换文案（PR #49 review #3）。
+    pub rolling_back: bool,
 }
 
 /// 同步状态。**`locked` 与 `unfinished` 是两件事，不能合并。**
@@ -209,6 +212,7 @@ pub fn svn_sync_state(path: String) -> Result<SyncState, GitError> {
             phase: j.phase,
             opid: j.opid,
             started_at: j.started_at,
+            rolling_back: j.rolling_back,
         }),
     })
 }

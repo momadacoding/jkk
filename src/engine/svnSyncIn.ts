@@ -34,8 +34,11 @@ export type SyncInOutcome =
   | { kind: 'rebaseConflict'; files: string[] }
   | { kind: 'stashConflict'; files: string[]; stashOid: string }
   | { kind: 'stashBlocked'; collisions: string[]; stashOid: string }
-  /** 在放回改动那一步放弃：更新已完成，改动没有（完整）放回，备份留在 stash 里。 */
-  | { kind: 'released'; stashOid: string }
+  /**
+   * 在放回改动那一步放弃：改动没有（完整）放回，备份留在 stash 里。
+   * `rolledBack` 为真时停下的是一次回退，分支在更新前的位置；否则分支已在新基线上。
+   */
+  | { kind: 'released'; stashOid: string; rolledBack: boolean }
 
 /** 与 `ConfirmRequest` 同名的那几个字段，组件直接展开。 */
 export interface SyncConfirmModel {
@@ -143,10 +146,12 @@ export function describeSyncOutcome(o: SyncInOutcome): OutcomeNotice | null {
       }
     case 'released':
       // 不能复用 aborted 那句「已放回」：这里恰恰没放回（2c 独立 review I1）
+      // 回退途中停下的放回不能说「在新基线上」：基线没推进，分支回到了原处（PR #49 review #3）
       return {
-        title: '更新已结束，改动没有自动放回',
+        title: o.rolledBack ? '已放弃这次更新，改动没有自动放回' : '更新已结束，改动没有自动放回',
         detail:
-          '分支已经在新基线上。未提交的改动没有（完整）放回来——如果刚才有冲突，' +
+          (o.rolledBack ? '分支已回到更新前的位置。' : '分支已经在新基线上。') +
+          '未提交的改动没有（完整）放回来——如果刚才有冲突，' +
           '文件里可能还留着冲突标记，请自己处理。' +
           `原始备份一直在 stash 列表里（mygitclient-sync:…，${shortOid(o.stashOid)}），需要时自己取回，不要当成垃圾清掉。`,
       }

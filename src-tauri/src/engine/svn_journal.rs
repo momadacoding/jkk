@@ -110,6 +110,21 @@ pub struct Journal {
     /// 此时拒绝（「would be overwritten」）且不动任何文件，所以最坏是一条报错。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stash_applied: bool,
+    /// S3 的 checkout 即将执行（或已执行）：HEAD 可能已经离开过原分支。
+    ///
+    /// 没有可压的改动时 phase 一路停在 `stashed` 走过 S3–S5，单看 phase 分不出
+    /// 「HEAD 从没离开」与「去过基线又回来了」，而只有后者会留下 checkout 残留
+    /// （PR #49 review #2）。在 checkout **之前**落盘：崩在两步之间时它为真而 HEAD 没动，
+    /// 最坏是多做一次残留比对。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub left_orig: bool,
+    /// 往回走（回退 / 放弃）时进入的 `applying-stash`：分支已回到更新前的位置。
+    ///
+    /// `applying-stash` 两个方向共用，继续 / 放弃的结局与横幅文案却完全不同——往回走时
+    /// 基线（至少对这条分支）没有推进，报 `Done` 或「分支已在新基线上」都是假话
+    /// （PR #49 review #3）。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rolling_back: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_rev_before: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

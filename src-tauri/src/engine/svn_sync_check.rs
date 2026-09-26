@@ -262,13 +262,15 @@ fn attached_branch(repo_root: &str) -> Result<String> {
 }
 
 /// 当前分支名；detached 时 `None`。
+///
+/// 不用 `--short`（PR #49 review #1，实测）：有同名 tag 时它为了消歧义给出
+/// `heads/work`，拿这个名字去 `git checkout` 会退出 0 却让 HEAD detached，
+/// 拼成 `refs/heads/heads/work` 也对不上 rebase 的 head-name。取完整 ref 自己剥前缀。
 pub(crate) fn current_branch(repo_root: &str) -> Result<Option<String>> {
-    let (code, out) = run_git_code(repo_root, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
-    let name = out.trim().to_string();
-    Ok(if code == 0 && !name.is_empty() {
-        Some(name)
-    } else {
-        None
+    let (code, out) = run_git_code(repo_root, &["symbolic-ref", "--quiet", "HEAD"])?;
+    Ok(match out.trim().strip_prefix("refs/heads/") {
+        Some(name) if code == 0 && !name.is_empty() => Some(name.to_string()),
+        _ => None,
     })
 }
 

@@ -37,6 +37,11 @@ export interface UnfinishedSync {
   phase: SyncPhase
   opid: string
   startedAt: number
+  /**
+   * `applying-stash` 是回退 / 放弃途中停下的（分支在更新前的位置）。后端总会发；
+   * 缺省按「往前走」处理。
+   */
+  rollingBack?: boolean
 }
 
 export interface SyncState {
@@ -78,6 +83,14 @@ const PHASE_DETAIL: Record<SyncPhase, string> = {
   'applying-stash':
     '基线已经更新，正在把未提交的改动放回来。如果提示冲突或有同名文件，处理好之后点继续；改动的备份一直在 stash 里。',
 }
+
+/**
+ * 回退 / 放弃途中停在 `applying-stash`：基线（对这条分支）没有推进，
+ * 不能沿用上面那句「基线已经更新」（PR #49 review #3）。
+ */
+const APPLYING_STASH_BACK =
+  '这次更新已经退回，分支回到了更新前的位置，正在把未提交的改动放回来。' +
+  '如果提示冲突或有同名文件，处理好之后点继续；改动的备份一直在 stash 里。'
 
 const NOTE_SYNC_IN =
   '点「继续」从中断的地方接着走；点「放弃」回到更新前。两者都不会丢掉你的提交和未提交的改动。'
@@ -139,8 +152,9 @@ export function describeUnfinishedSync(
   // 认不出的 phase 必须有话说。后端的 `Phase` 枚举比这里的联合类型宽
   // （含 `sync_out` 的全部阶段），而 `PHASE_DETAIL[未知]` 是 `undefined`
   // ——那会渲染出一条只有标题、没有正文的红条，比说「我不认识」更糟。
+  const back = s.unfinished.phase === 'applying-stash' && s.unfinished.rollingBack === true
   const detail =
-    PHASE_DETAIL[s.unfinished.phase] ??
+    (back ? APPLYING_STASH_BACK : PHASE_DETAIL[s.unfinished.phase]) ??
     `流程停在「${s.unfinished.phase}」这一步，这个版本的界面还不认识它` +
       '（多半是更新之后留下的记录）。请不要手工去动 stash 或分支指针，' +
       '记录都还在。'

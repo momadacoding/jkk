@@ -20,6 +20,7 @@
 | 9 | 前端纯逻辑 | ✅ 完成 | 新模块 `src/engine/svnSyncIn.ts`；`svnJournal.ts`（`applying-stash`、横幅动作、`sinceText`）、`svnSync.ts`（整体前进降黄、`svnUpdate`）、`toolbarActions.ts`（`showsSvnUpdate`）+ 测试 | RED 已见（6 条失败 + 1 个模块缺失）；5 条变异各自红对应测试（第 3 条靠加强的用例）；`pnpm build` 通过 / `pnpm test` 430 passed |
 | 10 | 前端接线 | 🟡 代码完成，真实窗口冒烟未跑 | `repoStore.ts` 四个 invoke、`Toolbar.tsx`「更新」、`BaselineBanner.tsx` 继续 / 放弃与「更新…」、`RepoTab.tsx` 编排、`styles.css` 的 `.dialog-message` 换行 | `pnpm build` 通过 / `pnpm test` 430 passed；`pnpm tauri dev` 场景 1 / 2 **未跑**（需人工操作真实窗口） |
 | 11 | E2E + spec 修订 + 收尾 | 🟡 清单与 spec 完成，真实窗口场景未跑 | `docs/superpowers/e2e/2026-09-25-svn-phase2c-e2e.md`（8 个场景）、spec §7.2 注记 / §7.3 S3·S5·S8 注记 / §18「十四」 | 全量验证见下表；E2E 机械检查两条通过；独立 review 见「Task 11」 |
+| 12 | PR #49 review（第二轮）修复 | ✅ 完成 | `svn_sync_check::current_branch`、`svn_sync_in`（`untracked_leftovers`、`require_our_rebase`、`back_outcome`、`continue_rebase` 重走 S9）、journal `leftOrig` / `rollingBack`、`Released.rolledBack`、前端文案 + 12 条 Rust / 2 条 vitest | 见下「PR #49 review（第二轮）」；fmt / clippy 0 告警 / `cargo test` 711 passed 0 failed；`pnpm build` 通过 / `pnpm test` 433 passed |
 
 ## 全量验证
 
@@ -27,9 +28,9 @@
 |---|---|
 | `cargo fmt --check` | ✅ 0（2026-09-26，Task 11 Step 3） |
 | `cargo clippy --all-targets` | ✅ 0 告警 |
-| `cargo test` | ✅ 699 passed / 0 failed，49 个测试二进制（review 修复之后；修复前 695。基线：master `1db8210` 上 598 passed） |
+| `cargo test` | ✅ 711 passed / 0 failed（PR #49 第二轮 review 修复之后；第一轮修复后 699，修复前 695。基线：master `1db8210` 上 598 passed） |
 | `pnpm build` | ✅ tsc + vite 通过 |
-| `pnpm test` | ✅ 27 个文件 431 passed / 0 failed（review 修复之后；修复前 430。基线 383 passed） |
+| `pnpm test` | ✅ 27 个文件 433 passed / 0 failed（第二轮 review 修复之后；第一轮后 431，修复前 430。基线 383 passed） |
 | `pnpm tauri dev` | ⬜ **未跑**：E2E 清单 8 个场景都要人在真实窗口里点，本会话没有跑。四个新命令的 invoke 参数名因此**尚未在运行时确认**（序列化形状由 `svn_backend.rs` 钉住，但 JS 侧参数名没有编译期检查） |
 | E2E 清单机械检查 | ✅ 29 个 `powershell` 代码块在 PS 5.1.26100 与 PS 7.6.1 下 `Parser::ParseInput` 均 0 语法错误；`Colleague` 在新造的 fixture 上连提两次（新增文件 r2、修改已有文件 r3）均落地，fixture 已删 |
 
@@ -537,3 +538,56 @@
 ### 仍未做
 
 - 真实窗口 E2E（`pnpm tauri dev`）没有跑，需要人工。
+
+## PR #49 review（第二轮）
+
+### review 与核实
+
+外部对 PR #49 的 review 提了 10 条（#1 实测，其余读代码）。逐条核实：#1 在临时 fixture 上复现；#6 / #7 依赖的 git 行为在临时 fixture 上实测；其余读代码确认。核实后的分级与处置：
+
+| # | 发现 | 核实 | 定级 | 处置 |
+|---|---|---|---|---|
+| 1 | 分支与 tag 同名时 `symbolic-ref --short` 给 `heads/<b>`，`git checkout heads/<b>` 退出 0 却 detached；S8 报错后继续 / 放弃都认不出分支 | 成立（实测） | High | 已修 |
+| 2 | 没有 WIP 时 phase 一路是 `stashed`，C1 的残留守卫把「回退留下的残留」整个跳过，放弃报「已放回」 | 成立 | High | 已修 |
+| 3 | `applying-stash` 两个方向共用；回退途中被撞名挡住后，继续报 `Done`、放弃说「分支已在新基线上」、横幅说「基线已经更新」 | 成立，且比 review 说的更容易触发（S5 冲突 + 服务器新增同名文件） | High | 已修 |
+| 4 | 放弃在 `rebase` 阶段不查 head-name 就 `rebase --abort` | 成立；但 git 不允许同时开两个 rebase，须先在外面结束本次的，降为 Medium | Medium | 已修 |
+| 5 | 用户在外面走完 rebase 后放弃总是失败 | 基本不成立：此时「继续」能正常收尾，放弃要回去只能 `reset --hard`，拒绝是对的；只是文案没指向「继续」 | Low | deferred |
+| 6 | rebase 启动失败后继续永远不重试 | 成立（实测：退出 1、不留 rebase 目录、HEAD 不动；清掉挡路的东西后同一条 rebase 成功） | Medium | 已修 |
+| 7 | checkout 核对只看被跟踪文件，该删却没删掉的文件成了未跟踪残留 | 成立（实测：同名未跟踪文件**内容相同**也会挡住 checkout），与 #6 连成死路 | Medium | 已修 |
+| 8 | 失败时前端不刷新 SVN 侧 | 部分成立：后端照发 `repo-changed`，图与同步状态会刷；只有 A16 接管后又回退时整体前进横幅与 SVN 日志是旧的 | Low | deferred |
+| 9 | 接管路径重复走网络 | 部分成立：锁内 2 次 `svn status -u`（预览那次不在锁内） | Low | deferred |
+| 10 | `now_secs` 重复；分支名查询三处重复 | 部分成立：`--short` 只有两处，另一处是 master 上的 `svn_init::check_can_align`，同名 tag 时 `update-ref` 带旧值守卫安全失败，不在本 PR 范围 | Low | deferred |
+
+### 修复与验证
+
+| # | 修法 | 测试（先红后绿） |
+|---|---|---|
+| 1 | `current_branch` 改用 `symbolic-ref --quiet HEAD` 并剥 `refs/heads/`（被多处调用，一处改全） | `a_tag_named_like_the_branch_does_not_detach_head`、`continue_after_a_rebase_conflict_with_a_tag_named_like_the_branch`（RED：`sync_in_checkout_failed`，「切到分支 `heads/work`」） |
+| 2 | journal 新字段 `leftOrig`：S3 在 checkout **之前**置真并落盘；残留守卫改为「无 stashOid 且未离开过原分支且 phase 在 S3 之前」才跳过 | `abort_without_wip_does_not_skip_what_a_rollback_left_behind`（守卫先随 #7 一起落地，故用变异确认：去掉 `!j.left_orig` 条件 → 红，`B.cs` 为 `b1`）、`the_record_says_head_may_have_left_the_branch_once_s3_starts`（RED：字段为假） |
+| 3 | journal 新字段 `rollingBack`：`back_to_orig` 在放回之前置真；`applying-stash` 继续时按它走 `back_outcome`（结局 `Aborted`）；`Released` 带 `rolledBack`；`UnfinishedSync` 带 `rollingBack`；前端 `released` 与横幅按方向换文案 | `continue_after_a_blocked_rollback_is_not_reported_as_an_update`（RED：`Done { new_rev: 1 }`）、`abort_after_a_blocked_rollback_says_the_branch_went_back`（先编译失败）、`sync_in_types_cross_ipc_in_camel_case` / `sync_state_serializes_to_camel_case` 钉住新字段名；vitest 两条（先红） |
+| 4 | 抽出 `require_our_rebase`（A14），继续与放弃共用 | `abort_does_not_abort_a_rebase_that_is_not_ours`（RED：别人的 rebase 目录被删） |
+| 6 | `continue_rebase`：没有进行中的 rebase、HEAD 在原分支且仍是 `origHead` 时交回 `from_baseline_ready` 重走 S8 后半与 S9；`sync_in_rebase_failed` 文案指向「继续」 | `continue_retries_a_rebase_that_never_started`（预置 `.git/index.lock` 让 rebase 确定地启动失败；RED：第二次继续 `sync_in_state_changed`） |
+| 7 | 新增 `untracked_leftovers`（`diff --diff-filter=A HEAD <from>` 且磁盘上还在、不在索引里）；`checkout_verified` 以切换前的 HEAD 为 `from` 一起核对；`settle_checkout_residue` 以新旧基线为 `from`，字节是基线 blob 才删，否则指名停下 | `continue_after_s8_left_a_server_added_file_behind`（RED：`sync_in_rebase_failed`「untracked … would be overwritten」）、`abort_after_s8_left_a_server_added_file_behind`、`a_leftover_whose_bytes_are_not_the_baseline_is_not_deleted`、Windows 专属 `a_file_that_checkout_could_not_delete_is_named_and_rolled_back`（真的以 share=Read 占住文件；RED：停在 S8 而不是回退） |
+
+### 偏离计划
+
+- **A14 语义变化**：原测试 `continue_refuses_when_the_rebase_was_aborted_outside` 要求「在外面 `rebase --abort` 之后继续」拒绝。现在改为重新走 S9（测试改名 `continue_replays_again_when_the_rebase_was_aborted_outside`，断言再次得到 `RebaseConflict`）。原测试防的是「直接进 S10、把 WIP 放到没重放过的旧分支上」，新行为同样不会发生；而「rebase 启动就失败」与「在外面被中止」的现场完全相同，分不出来，拒绝会让 #6 永远走不通。
+- journal 新增两个字段、`Released` 新增一个字段（spec §7.6 已同步）。
+
+### 计划没写的坑
+
+- 同名未跟踪文件即使内容与要写进来的 blob 完全相同，git checkout / rebase 也拒绝（「would be overwritten」），2026-09-26 在 git 2.51.2.windows.1 实测。
+- rebase 在最初 checkout onto 时失败：退出 1、打印 `Aborting` / `could not detach HEAD`，**不**留 `rebase-merge`，HEAD 与分支都不动。
+- 有同名 tag 时 `git checkout <b>` 仍然切到分支（附着，stderr 打 `refname is ambiguous`），只有 `heads/<b>` 这种消歧义写法会 detached。
+
+### 为什么这么改是安全的
+
+- 删除未跟踪残留只发生在「路径在某个基线 commit 里、不在 HEAD、不在索引、磁盘字节就是那个 blob」时，删掉的字节随时能从基线取回；任何一个文件不满足就整体不动，记录保留。候选路径来自 `git diff --name-only`，pathspec 为空时直接返回（§12.2）；`ls-files` 只在候选非空时调用。
+- `leftOrig` 先落盘再 checkout：崩在两步之间时它为真而 HEAD 没动。此时 WIP 已在 stash 里（S3 只在 S1 成功之后执行），比对通常是空的；若中断后用户又改了白名单内的文件，只有字节恰好等于某个基线 blob 的才会被写回 HEAD（那份字节能从基线取回），其余指名停下、不覆盖。
+- 「继续」重走 S9 前的所有复核（分支、`origHead`、残留、线性）都在 `from_baseline_ready` 里，与首次执行相同。
+- `require_our_rebase` 只让放弃多一道拒绝，不增加任何写操作。
+
+### 仍未做
+
+- #5 / #8 / #9 / #10 记为 deferred（见上表）。
+- 真实窗口 E2E 仍未跑。

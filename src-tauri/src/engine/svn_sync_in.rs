@@ -77,14 +77,16 @@ pub enum SyncInOutcome {
         collisions: Vec<String>,
         stash_oid: String,
     },
-    /// 在 `applying-stash` 阶段放弃：更新本身已经完成（分支在新基线上），但未提交的
-    /// 改动**没有**（完整）放回——撞名时一个字节都没放，冲突时文件里留着冲突标记。
-    /// 备份原样留在 stash 列表里。
+    /// 在 `applying-stash` 阶段放弃：未提交的改动**没有**（完整）放回——撞名时一个字节
+    /// 都没放，冲突时文件里留着冲突标记。备份原样留在 stash 列表里。
     ///
     /// 不能报成 `Aborted`：界面对它说的是「已回到更新前的分支，未提交的改动已放回」，
     /// 用户信了就可能把 stash 列表里那条备份当垃圾清掉（2c 独立 review I1）。
     Released {
         stash_oid: String,
+        /// 停下的那次放回属于回退 / 放弃：分支在更新前的位置。为假时分支已在新基线上
+        /// （PR #49 review #3）。
+        rolled_back: bool,
     },
 }
 
@@ -201,7 +203,11 @@ pub(crate) fn from_stashed(
     j: &mut Journal,
     fresh: bool,
 ) -> Result<SyncInOutcome> {
-    // S3
+    // S3。`leftOrig` 先落盘，再 checkout（见字段文档；PR #49 review #2）
+    if !j.left_orig {
+        j.left_orig = true;
+        svn_journal::write(repo, j)?;
+    }
     if current_branch(repo)?.as_deref() != Some(BASELINE_BRANCH) {
         if let Err(e) = checkout_verified(repo, cfg, BASELINE_BRANCH, false) {
             return on_checkout_failed(repo, cfg, j, e);
@@ -476,7 +482,8 @@ pub(crate) fn conflict_or_error(repo: &str, e: GitError) -> Result<SyncInOutcome
     Err(GitError::new(
         "sync_in_rebase_failed",
         format!(
-            "把分支重放到新基线上失败了，而且不是冲突。基线已经推进，记录保留。git 原话：{}",
+            "把分支重放到新基线上失败了，而且不是冲突。基线已经推进，记录保留：按 git 说的\
+             处理好之后点「继续」会重新重放，也可以点「放弃」回到更新前。git 原话：{}",
             e.message.trim()
         ),
     ))
@@ -556,6 +563,7 @@ pub(crate) fn checkout_verified(
     branch: &str,
     force: bool,
 ) -> Result<()> {
+    let from = rev_parse(repo, "HEAD")?;
     let mut args: Vec<&str> = vec!["checkout"];
     if force {
         args.push("-f");
@@ -563,14 +571,16 @@ pub(crate) fn checkout_verified(
     args.push(branch);
     let ran = run_git(repo, &args);
     let on_target = current_branch(repo)?.as_deref() == Some(branch);
-    let stale = tracked_changes(repo, cfg)?;
+    let mut stale = tracked_changes(repo, cfg)?;
+    // 该删却没删掉的文件退出 0 地留下，成了未跟踪文件（PR #49 review #7）
+    stale.extend(untracked_leftovers(repo, cfg, &[from])?);
     if on_target && stale.is_empty() {
         return Ok(());
     }
     let files = if stale.is_empty() {
         String::new()
     } else {
-        format!("\n下面这些文件没能写进去：\n{}", list_paths(&stale))
+        format!("\n下面这些文件没能写进去或删掉：\n{}", list_paths(&stale))
     };
     let git_said = match ran {
         Err(e) => format!("\ngit 原话：{}", e.message.trim()),
@@ -599,6 +609,48 @@ fn tracked_changes(repo: &str, cfg: &SvnConfig) -> Result<Vec<String>> {
         .filter(|p| !p.is_empty())
         .map(str::to_string)
         .collect())
+}
+
+/// `from` 里某个 commit 有、当前 HEAD 没有、却还在磁盘上且不在索引里的白名单内文件。
+///
+/// 这是 checkout 该删却没删掉的形状（PR #49 review #7）：文件被占着时 unlink 失败，
+/// checkout 照样退出 0，文件成了新分支上的未跟踪文件。[`tracked_changes`] 看不见它们，
+/// 而同名未跟踪文件**即使内容相同**也会挡住之后的 checkout / rebase（2026-09-26 实测）。
+///
+/// 已进索引的不算：那是被跟踪的改动，归 [`tracked_changes`] 管。
+fn untracked_leftovers(repo: &str, cfg: &SvnConfig, from: &[String]) -> Result<Vec<String>> {
+    let roots = normalize_roots(&cfg.whitelist);
+    if roots.is_empty() {
+        return Ok(Vec::new()); // 空 pathspec 会变成「全部」（§12.2）
+    }
+    let mut out: Vec<String> = Vec::new();
+    for f in from {
+        let mut args: Vec<&str> = vec![
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            "--diff-filter=A",
+            "HEAD",
+            f,
+            "--",
+        ];
+        args.extend(roots.iter().map(String::as_str));
+        for p in run_git(repo, &args)?.split('\0').filter(|p| !p.is_empty()) {
+            if !out.iter().any(|q| q == p) && Path::new(repo).join(p).symlink_metadata().is_ok() {
+                out.push(p.to_string());
+            }
+        }
+    }
+    if out.is_empty() {
+        return Ok(out); // 下面的 ls-files 不能带空 pathspec
+    }
+    let mut args: Vec<&str> = vec!["ls-files", "-z", "--"];
+    args.extend(out.iter().map(String::as_str));
+    let indexed = run_git(repo, &args)?;
+    let indexed: Vec<&str> = indexed.split('\0').filter(|p| !p.is_empty()).collect();
+    out.retain(|p| !indexed.contains(&p.as_str()));
+    Ok(out)
 }
 
 /// S4：白名单内的 W-file 在 SVN 看来有没有修改。`?` / ignored 不算——它们不是
@@ -740,7 +792,9 @@ pub fn continue_sync(repo: &str) -> Result<SyncInOutcome> {
             from_baseline_ready(repo, &cfg, j)
         }
         Phase::BaselineReady => from_baseline_ready(repo, &cfg, j),
-        Phase::Rebase => continue_rebase(repo, j),
+        Phase::Rebase => continue_rebase(repo, &cfg, j),
+        // 往回走时停下的 `applying-stash`：收尾的是一次回退，不是更新（PR #49 review #3）
+        Phase::ApplyingStash if j.rolling_back => Ok(back_outcome(restore_step(repo, j)?)),
         Phase::ApplyingStash => finish_forward(repo, j),
         _ => Err(sync_out_unsupported()),
     }
@@ -766,6 +820,9 @@ pub fn abort_sync(repo: &str) -> Result<SyncInOutcome> {
         | Phase::BaselineReady => back_to_orig(repo, &cfg, j, Disk::MaybeUpdated)?,
         Phase::Rebase => {
             if rebase_in_progress(repo)? {
+                // A14 同样适用于放弃（PR #49 review #4）：`--abort` 会丢掉那次 rebase
+                // 里已经解决的冲突，不是本次同步发起的就不能碰
+                require_our_rebase(repo, j)?;
                 run_git(repo, &["rebase", "--abort"])?;
             }
             back_to_orig(repo, &cfg, j, Disk::MaybeUpdated)?
@@ -776,11 +833,19 @@ pub fn abort_sync(repo: &str) -> Result<SyncInOutcome> {
             let stash_oid = need(&j.stash_oid, "stashOid")?;
             wip::unpin(repo, &j.opid)?;
             svn_journal::remove(repo)?;
-            return Ok(SyncInOutcome::Released { stash_oid });
+            return Ok(SyncInOutcome::Released {
+                stash_oid,
+                rolled_back: j.rolling_back,
+            });
         }
         _ => return Err(sync_out_unsupported()),
     };
-    Ok(match step {
+    Ok(back_outcome(step))
+}
+
+/// 往回走（放弃 / 回退）那一次 S10–S11 的结局。
+fn back_outcome(step: RestoreStep) -> SyncInOutcome {
+    match step {
         RestoreStep::Finished => SyncInOutcome::Aborted,
         RestoreStep::Conflict { files, oid } => SyncInOutcome::StashConflict {
             files,
@@ -790,7 +855,7 @@ pub fn abort_sync(repo: &str) -> Result<SyncInOutcome> {
             collisions,
             stash_oid: oid,
         },
-    })
+    }
 }
 
 /// 回到原分支并取回 WIP（spec §13「回滚到」一列；计划 A5 / A12 / A15）。
@@ -833,6 +898,8 @@ pub(crate) fn back_to_orig(
     }
     // 上一次切回原分支可能「退出 0 却没切干净」（A15 / C1）；刚才那次 checkout 已经核对过
     settle_checkout_residue(repo, cfg, j, &orig)?;
+    // 随 restore_step 进入 applying-stash 时一起落盘（PR #49 review #3）
+    j.rolling_back = true;
     restore_step(repo, j)
 }
 
@@ -848,23 +915,35 @@ pub(crate) fn back_to_orig(
 ///
 /// 所以逐个比对：全是新旧基线里的 blob（或文件已不在）才写回，否则指名停下，
 /// 记录原样保留。
+///
+/// 残留有两种形状，处理方式相同：被跟踪文件的内容不对（按 HEAD 写回），以及基线里有、
+/// 原分支上没有的文件没删掉、成了未跟踪文件（删掉——PR #49 review #7，不删的话 S9
+/// 的 rebase 启动就失败）。
 fn settle_checkout_residue(repo: &str, cfg: &SvnConfig, j: &Journal, orig: &str) -> Result<()> {
     // 「WIP 全在 stash 里」的前提只在 S1 确实完成过时成立。没有 stashOid、又停在 S3
-    // 之前的 phase，可能是 push 从未落地（崩在写 journal 与 push 之间）：此时 WIP
-    // 还原样在磁盘上，HEAD 也从没离开过原分支，没有任何 checkout 残留可言
-    if j.stash_oid.is_none() && matches!(j.phase, Phase::Start | Phase::Stashing | Phase::Stashed) {
-        return Ok(());
-    }
-    let stale = tracked_changes(repo, cfg)?;
-    if stale.is_empty() {
+    // 之前的 phase、且 HEAD 从没离开过原分支，可能是 push 从未落地（崩在写 journal 与
+    // push 之间）：此时 WIP 还原样在磁盘上，没有任何 checkout 残留可言。
+    //
+    // `leftOrig` 不能省（PR #49 review #2）：没有可压的改动时 phase 一路停在 `stashed`
+    // 走过 S3–S5，回退那次 checkout 留下的残留若在这里被跳过，「放弃」会报「已放回」，
+    // 磁盘上却是撤掉了你那几笔提交的内容
+    if j.stash_oid.is_none()
+        && !j.left_orig
+        && matches!(j.phase, Phase::Start | Phase::Stashing | Phase::Stashed)
+    {
         return Ok(());
     }
     let mut bases = vec![rev_parse(repo, &format!("refs/heads/{BASELINE_BRANCH}"))?];
     if let Some(old) = &j.baseline_oid_before {
         bases.push(old.clone());
     }
+    let stale = tracked_changes(repo, cfg)?;
+    let left = untracked_leftovers(repo, cfg, &bases)?;
+    if stale.is_empty() && left.is_empty() {
+        return Ok(());
+    }
     let mut foreign = Vec::new();
-    for p in &stale {
+    for p in stale.iter().chain(&left) {
         if !is_baseline_bytes(repo, &bases, p)? {
             foreign.push(p.clone());
         }
@@ -880,19 +959,27 @@ fn settle_checkout_residue(repo: &str, cfg: &SvnConfig, j: &Journal, orig: &str)
             ),
         ));
     }
-    // `stale` 非空（上面已返回），不会是空 pathspec（§12.2）
-    let mut args: Vec<&str> = vec!["checkout", "HEAD", "--"];
-    args.extend(stale.iter().map(String::as_str));
-    run_git(repo, &args)?;
-    let left = tracked_changes(repo, cfg)?;
-    if !left.is_empty() {
+    if !stale.is_empty() {
+        // 非空才调：空 pathspec 会变成「全部」（§12.2）
+        let mut args: Vec<&str> = vec!["checkout", "HEAD", "--"];
+        args.extend(stale.iter().map(String::as_str));
+        run_git(repo, &args)?;
+    }
+    for p in &left {
+        // 删不掉（仍被占着）不在这里报：下面的复核会指名它
+        let _ = std::fs::remove_file(Path::new(repo).join(p));
+    }
+    let mut remaining = tracked_changes(repo, cfg)?;
+    remaining.extend(untracked_leftovers(repo, cfg, &bases)?);
+    if !remaining.is_empty() {
         let root = Path::new(repo);
         return Err(GitError::new(
             "sync_in_checkout_failed",
             format!(
-                "分支 `{orig}` 上下面这些文件还没写回分支里的内容，多半仍有程序占着它们：\n{}\n{}\n\
+                "分支 `{orig}` 上下面这些文件还没恢复成分支里的样子（没写回或没删掉），\
+                 多半仍有程序占着它们：\n{}\n{}\n\
                  记录已保留，关掉占用的程序之后再点「继续」或「放弃」。",
-                list_paths(&left),
+                list_paths(&remaining),
                 describe(root, &find_blockers(root, 5))
             ),
         ));
@@ -963,14 +1050,20 @@ fn resume_stashed(repo: &str, cfg: &SvnConfig, j: &mut Journal) -> Result<SyncIn
     from_stashed(repo, cfg, j, false)
 }
 
-fn continue_rebase(repo: &str, j: &mut Journal) -> Result<SyncInOutcome> {
+fn continue_rebase(repo: &str, cfg: &SvnConfig, j: &mut Journal) -> Result<SyncInOutcome> {
     let orig = need(&j.orig_branch, "origBranch")?;
+    let orig_head = need(&j.orig_head, "origHead")?;
+    if !rebase_in_progress(repo)?
+        && current_branch(repo)?.as_deref() == Some(orig.as_str())
+        && rev_parse(repo, "HEAD")? == orig_head
+    {
+        // S9 没有发生过：rebase 启动就失败（退出 1、不留 rebase 目录、HEAD 不动——
+        // PR #49 review #6 实测），或者用户在外面 `rebase --abort` 了。两者现场相同，
+        // 都从 S8 之后重来；那条路径自带分支 / 位置 / 残留 / 线性复核
+        return from_baseline_ready(repo, cfg, j);
+    }
     if rebase_in_progress(repo)? {
-        // A14：冲突期间锁是放开的，先确认进行中的正是本次同步发起的 rebase
-        let want = format!("refs/heads/{orig}");
-        if rebase_head_name(repo)?.as_deref() != Some(want.as_str()) {
-            return Err(state_changed("进行中的 rebase 不是本次同步发起的那一个"));
-        }
+        require_our_rebase(repo, j)?;
         let files = unmerged_paths(repo)?;
         if !files.is_empty() {
             return Err(unresolved(&files));
@@ -993,6 +1086,15 @@ fn continue_rebase(repo: &str, j: &mut Journal) -> Result<SyncInOutcome> {
         ));
     }
     finish_forward(repo, j)
+}
+
+/// A14：冲突期间锁是放开的，先确认进行中的正是本次同步发起的 rebase。
+fn require_our_rebase(repo: &str, j: &Journal) -> Result<()> {
+    let want = format!("refs/heads/{}", need(&j.orig_branch, "origBranch")?);
+    if rebase_head_name(repo)?.as_deref() != Some(want.as_str()) {
+        return Err(state_changed("进行中的 rebase 不是本次同步发起的那一个"));
+    }
+    Ok(())
 }
 
 /// `.git/rebase-merge/head-name`（或 `rebase-apply/`）：rebase 的目标分支。
