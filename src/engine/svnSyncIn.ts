@@ -41,6 +41,11 @@ export type SyncInOutcome =
    * `rolledBack` 为真时停下的是一次回退，分支在更新前的位置；否则分支已在新基线上。
    */
   | { kind: 'released'; stashOid: string; rolledBack: boolean }
+  /**
+   * 放回时停下过（冲突等），用户处理完点了「继续」：流程收尾，但原始备份**留在 stash 里**
+   * ——磁盘上的改动经过了人手，证明不了还完整（PR #49 review 第四轮 P1-2）。
+   */
+  | { kind: 'settled'; stashOid: string; rolledBack: boolean }
 
 /** 与 `ConfirmRequest` 同名的那几个字段，组件直接展开。 */
 export interface SyncConfirmModel {
@@ -158,6 +163,16 @@ export function describeSyncOutcome(o: SyncInOutcome): OutcomeNotice | null {
           '文件里可能还留着冲突标记，请自己处理。' +
           `原始备份一直在 stash 列表里（mygitclient-sync:…，${shortOid(o.stashOid)}），需要时自己取回，不要当成垃圾清掉。`,
       }
+    case 'settled':
+      return {
+        title: o.rolledBack ? '已放弃这次更新' : '更新完成',
+        detail:
+          (o.rolledBack
+            ? '分支已回到更新前的位置，未提交的改动按你处理后的样子留在工作区里。'
+            : '未提交的改动按你处理后的样子留在工作区里。') +
+          `为防万一，改动的原始备份没有删，还在 stash 列表里（mygitclient-sync:…，${shortOid(o.stashOid)}）。` +
+          '确认工作区里的内容没问题之后，可以自己把它删掉。',
+      }
   }
 }
 
@@ -194,7 +209,7 @@ export function describeSyncAction(id: SyncActionId, phase: string): SyncConfirm
       phase === 'rebase'
         ? '确认冲突文件都已改好并暂存。会接着把剩下的提交重放完，再放回未提交的改动。'
         : phase === 'applying-stash'
-          ? '确认冲突已解决（或同名文件已挪走）。会结束这次更新并清理 stash 里的备份。'
+          ? '确认冲突已解决（或同名文件已挪走）。会结束这次更新；如果刚才放回时有冲突，原始备份会留在 stash 列表里，由你确认后自己删。'
           : '从中断的地方接着走完这次更新。'
     return { title: '继续更新', message, confirmLabel: '继续', busyLabel: '正在继续…' }
   }

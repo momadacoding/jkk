@@ -91,6 +91,17 @@ pub enum SyncInOutcome {
         /// （PR #49 review #3）。
         rolled_back: bool,
     },
+    /// 放回改动时停下过（冲突，或崩在 apply 之后），用户处理完点了「继续」：流程收尾，
+    /// 但**原始备份留在 stash 列表里、不 drop**。
+    ///
+    /// 此刻磁盘上的 WIP 经过了用户之手（或外部工具），我们证明不了它还完整——实测
+    /// 冲突之后外部 `reset --hard` 会让冲突与 WIP 一起消失，而所有复核照样通过。
+    /// stash 里那份可能是唯一的备份，删不删交给用户（PR #49 review 第四轮 P1-2）。
+    Settled {
+        stash_oid: String,
+        /// 为真时收尾的是一次回退 / 放弃：分支在更新前的位置。
+        rolled_back: bool,
+    },
 }
 
 /// 一次完整的更新。
@@ -453,7 +464,7 @@ pub(crate) fn from_baseline_ready(
     // 上一次 S8 可能「退出 0 却没切干净」，继续时 HEAD 已经在原分支上（A15 / C1）
     settle_checkout_residue(repo, cfg, j, &orig)?;
     // S9：对新基线再复核一次（§7.3.2）
-    let new_base = rev_parse(repo, &format!("refs/heads/{BASELINE_BRANCH}"))?;
+    let new_base = published_baseline(repo, j)?;
     assert_linear(repo, &new_base, &orig_head)?;
     j.phase = Phase::Rebase;
     svn_journal::write(repo, j)?;
@@ -471,7 +482,7 @@ pub(crate) fn from_baseline_ready(
             "rebase.updateRefs=false",
             "rebase",
             "--empty=drop",
-            BASELINE_BRANCH,
+            &new_base,
         ],
     ) {
         Ok(_) => finish_forward(repo, j),
@@ -501,6 +512,10 @@ pub(crate) fn finish_forward(repo: &str, j: &mut Journal) -> Result<SyncInOutcom
         RestoreStep::Finished => SyncInOutcome::Done {
             new_rev: baseline_rev(repo)?,
         },
+        RestoreStep::Kept { oid } => SyncInOutcome::Settled {
+            stash_oid: oid,
+            rolled_back: false,
+        },
         RestoreStep::Conflict { files, oid } => SyncInOutcome::StashConflict {
             files,
             stash_oid: oid,
@@ -514,6 +529,10 @@ pub(crate) fn finish_forward(repo: &str, j: &mut Journal) -> Result<SyncInOutcom
 
 pub(crate) enum RestoreStep {
     Finished,
+    /// 收尾了，但备份留在 stash 里（见 [`SyncInOutcome::Settled`]）。
+    Kept {
+        oid: String,
+    },
     Conflict {
         files: Vec<String>,
         oid: String,
@@ -552,6 +571,12 @@ pub(crate) fn restore_step(repo: &str, j: &mut Journal) -> Result<RestoreStep> {
         if !files.is_empty() {
             return Err(unresolved(&files));
         }
+        // 已经 apply 过、又停下过：磁盘上的 WIP 经过了用户之手，证明不了它还完整，
+        // stash 里那份可能是唯一的备份——不 drop，只拆掉我们自己的钉子与记录
+        // （PR #49 review 第四轮 P1-2，方案 A）。只有同一进程里刚刚干净 apply 完的才 drop
+        wip::unpin(repo, &j.opid)?;
+        svn_journal::remove(repo)?;
+        return Ok(RestoreStep::Kept { oid });
     }
     wip::drop_wip(repo, &j.opid, &oid)?;
     svn_journal::remove(repo)?; // S11；锁由调用方的守卫释放，watcher 由命令层恢复
@@ -859,6 +884,10 @@ pub fn abort_sync(repo: &str) -> Result<SyncInOutcome> {
 fn back_outcome(step: RestoreStep) -> SyncInOutcome {
     match step {
         RestoreStep::Finished => SyncInOutcome::Aborted,
+        RestoreStep::Kept { oid } => SyncInOutcome::Settled {
+            stash_oid: oid,
+            rolled_back: true,
+        },
         RestoreStep::Conflict { files, oid } => SyncInOutcome::StashConflict {
             files,
             stash_oid: oid,
@@ -1090,7 +1119,7 @@ fn continue_rebase(repo: &str, cfg: &SvnConfig, j: &mut Journal) -> Result<SyncI
     if current_branch(repo)?.as_deref() != Some(orig.as_str()) {
         return Err(state_changed(&format!("HEAD 不在原分支 `{orig}` 上")));
     }
-    let base = rev_parse(repo, &format!("refs/heads/{BASELINE_BRANCH}"))?;
+    let base = published_baseline(repo, j)?;
     if !is_ancestor(repo, &base, "HEAD")? {
         return Err(state_changed(
             "原分支还没有落到新基线上（rebase 可能在外面被中止了）；\
@@ -1114,13 +1143,29 @@ fn require_restore_target(repo: &str, j: &Journal) -> Result<()> {
     let ok = if j.rolling_back {
         rev_parse(repo, "HEAD")? == need(&j.orig_head, "origHead")?
     } else {
-        let base = rev_parse(repo, &format!("refs/heads/{BASELINE_BRANCH}"))?;
+        let base = published_baseline(repo, j)?;
         is_ancestor(repo, &base, "HEAD")?
     };
     if !ok {
         return Err(state_changed(&format!("分支 `{orig}` 的位置变了")));
     }
     Ok(())
+}
+
+/// 本次 S7 发布的基线 OID，并确认 `svn/base` 仍指着它（PR #49 review 第四轮 P1-1）。
+///
+/// S8 之后的每一步（重放目标、认 rebase、放回前复核）都要以它为准，而不是「此刻的
+/// `svn/base`」：冲突期间锁是放开的，基线被外部挪走后，拿当前引用比什么都能对上。
+/// 挪过就停下，不猜。
+fn published_baseline(repo: &str, j: &Journal) -> Result<String> {
+    let want = need(&j.new_baseline_oid, "newBaselineOid")?;
+    let now = rev_parse(repo, &format!("refs/heads/{BASELINE_BRANCH}"))?;
+    if now != want {
+        return Err(state_changed(&format!(
+            "基线分支 `{BASELINE_BRANCH}` 被移动过（本次发布的是 {want}，现在是 {now}）"
+        )));
+    }
+    Ok(want)
 }
 
 /// A14：冲突期间锁是放开的，先确认进行中的正是本次同步发起的 rebase。
@@ -1132,7 +1177,7 @@ fn require_restore_target(repo: &str, j: &Journal) -> Result<()> {
 fn require_our_rebase(repo: &str, j: &Journal) -> Result<()> {
     let want_head = format!("refs/heads/{}", need(&j.orig_branch, "origBranch")?);
     let want_orig = need(&j.orig_head, "origHead")?;
-    let want_onto = rev_parse(repo, &format!("refs/heads/{BASELINE_BRANCH}"))?;
+    let want_onto = published_baseline(repo, j)?;
     if rebase_state(repo, "head-name")?.as_deref() != Some(want_head.as_str())
         || rebase_state(repo, "orig-head")?.as_deref() != Some(want_orig.as_str())
         || rebase_state(repo, "onto")?.as_deref() != Some(want_onto.as_str())

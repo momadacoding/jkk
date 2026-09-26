@@ -56,7 +56,24 @@ pub fn svn_rebuild_baseline(path: String) -> Result<RebuildReport, GitError> {
     // 它移动 `svn/base` 指针——正是一次同步全程依赖的那个指针（spec §5.1）。
     // 不走 `trait Vcs`，所以 `vcs/svn.rs` 上的守卫拦不到，必须自己挡一道。
     svn_lock::assert_not_syncing(&path)?;
+    refuse_while_unfinished(&path)?;
     rebuild_baseline(&path)
+}
+
+/// 有未收尾的同步记录时拒绝移动基线（PR #49 review 第四轮 P1-1 的纵深防御）。
+///
+/// `assert_not_syncing` 只看锁，而冲突出口会**放开锁**、留着 journal——那段时间里
+/// 本次同步的继续 / 放弃都以本次发布的基线为准，挪动它只会让继续与放弃都走不通。
+/// 界面在未收尾时已经藏起了重建 / 迁移入口，这里不靠界面。
+fn refuse_while_unfinished(path: &str) -> Result<(), GitError> {
+    if svn_journal::read(path)?.is_some() {
+        return Err(GitError::new(
+            "sync_in_unfinished",
+            "上一次同步还没有收尾，基线正被它依赖着。请先在顶部横幅上选择「继续」或\
+             「放弃」，再重建基线。",
+        ));
+    }
+    Ok(())
 }
 
 /// 体检当前基线。rev 取自基线自己的 trailer，所以这里**能**报出 `Lying`。
@@ -87,6 +104,7 @@ pub fn svn_migrate_eol(path: String) -> Result<RebuildReport, GitError> {
     // 同 `svn_rebuild_baseline`：它也移动基线指针。`migrate_eol` 自带的
     // `MigrationLock` 只防本命令自己的并发，防不了「同步正在跑」。
     svn_lock::assert_not_syncing(&path)?;
+    refuse_while_unfinished(&path)?;
     migrate_eol(&path)
 }
 

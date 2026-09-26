@@ -110,6 +110,30 @@ describe('describeSyncOutcome', () => {
     expect(n.detail).toContain('新基线')
   })
 
+  it('冲突之后继续收尾：要说备份还在 stash 里，不能暗示已清理（PR #49 review 第四轮 P1-2）', () => {
+    const fwd = describeSyncOutcome({
+      kind: 'settled',
+      stashOid: 'f2208125aad7d35d63ee9495ad0a6cc3c1ce21be',
+      rolledBack: false,
+    })!
+    expect(fwd.detail).toContain('f2208125aa')
+    expect(fwd.detail).toContain('stash')
+    expect(fwd.title).toContain('更新')
+    const back = describeSyncOutcome({
+      kind: 'settled',
+      stashOid: 'f2208125aad7d35d63ee9495ad0a6cc3c1ce21be',
+      rolledBack: true,
+    })!
+    expect(back.detail).toContain('更新前')
+    expect(back.detail).not.toContain('新基线')
+  })
+
+  it('放回改动那一步的「继续」确认框不能说会清理备份', () => {
+    const m = describeSyncAction('syncContinue', 'applying-stash').message
+    expect(m).not.toContain('清理')
+    expect(m).toContain('stash')
+  })
+
   it('回退途中放弃放回：分支在更新前的位置，不能说在新基线上（PR #49 review #3）', () => {
     const n = describeSyncOutcome({
       kind: 'released',
@@ -191,6 +215,8 @@ describe('文案按纯文本渲染', () => {
       { kind: 'stashBlocked' as const, collisions: ['N'], stashOid: 'x'.repeat(40) },
       { kind: 'released' as const, stashOid: 'x'.repeat(40), rolledBack: false },
       { kind: 'released' as const, stashOid: 'x'.repeat(40), rolledBack: true },
+      { kind: 'settled' as const, stashOid: 'x'.repeat(40), rolledBack: false },
+      { kind: 'settled' as const, stashOid: 'x'.repeat(40), rolledBack: true },
     ]) {
       const n = describeSyncOutcome(o)!
       texts.push(n.title, n.detail)

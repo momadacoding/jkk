@@ -238,11 +238,7 @@ fn a_branch_switched_since_the_preview_is_refused() {
     // PR #49 review 第三轮 #6：预览时在 work 上，确认之前外部切到指向同一提交的 other。
     // origHead 与基线都没变，只比 OID 会放行，重放的就是用户没确认过的 other
     let fx = hybrid_with_colleague();
-    fx.colleague_commits(
-        "Code/A.cs",
-        "a2
-",
-    );
+    fx.colleague_commits("Code/A.cs", "a2\n");
     let e = expect(&fx);
     git(&fx, &["checkout", "-q", "-b", "other"]);
     let err = run_sync_in(&fx.wc_str(), &e).unwrap_err();
@@ -791,23 +787,152 @@ fn a_new_rebase_of_the_same_branch_is_not_taken_for_ours() {
     assert_eq!(our_stashes(&fx), 1);
 }
 
-// —— applying-stash ——
+/// 外部把 `svn/base` 挪到一个新 commit 上（同一棵树），返回新 OID。
+fn move_baseline_outside(fx: &SvnFixture) -> String {
+    let moved = git(
+        fx,
+        &[
+            "commit-tree",
+            "svn/base^{tree}",
+            "-p",
+            "svn/base",
+            "-m",
+            "moved",
+        ],
+    );
+    git(fx, &["update-ref", "refs/heads/svn/base", &moved]);
+    moved
+}
 
 #[test]
-fn continue_after_resolving_a_stash_conflict_drops_the_stash() {
+fn abort_does_not_abort_a_new_rebase_onto_a_moved_baseline() {
+    // PR #49 review 第四轮 P1-1（实测）：本次 rebase 被外部中止、基线随后被挪走、用户在同一
+    // 原分支上 rebase 到新基线。head-name / orig-head / onto（对**当前** svn/base）全对得上，
+    // 原先会把用户的 rebase 当成本次的中止掉。onto 要比 journal 里本次发布的那一个
     let fx = hybrid_with_colleague();
+    rebase_conflict(&fx);
+    git(&fx, &["rebase", "--abort"]);
+    let moved = move_baseline_outside(&fx);
+    assert!(
+        run_git(&fx.wc_str(), &["rebase", "svn/base"]).is_err(),
+        "停在冲突上"
+    );
+
+    let err = abort_sync(&fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "sync_in_state_changed", "{}", err.message);
+    assert_eq!(
+        std::fs::read_to_string(fx.wc().join(".git/rebase-merge/onto"))
+            .unwrap()
+            .trim(),
+        moved,
+        "用户的 rebase 原样还在"
+    );
+    assert_eq!(phase(&fx), Some(Phase::Rebase));
+}
+
+#[test]
+fn a_baseline_moved_before_the_replay_is_refused() {
+    // 同一根因：S9 的目标不能是「此刻的 svn/base」，得是本次发布的那一个
+    let fx = hybrid_with_colleague();
+    let j = s8_left_baseline_bytes(&fx, "op-drift", "b-local\n");
+    let work = git(&fx, &["rev-parse", "work"]);
+    move_baseline_outside(&fx);
+
+    let err = continue_sync(&fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "sync_in_state_changed", "{}", err.message);
+    assert_eq!(git(&fx, &["rev-parse", "work"]), work, "没有重放");
+    assert_eq!(j.orig_head.unwrap(), work);
+    assert_eq!(phase(&fx), Some(Phase::BaselineReady));
+}
+
+#[test]
+fn continue_restoring_refuses_a_baseline_moved_back() {
+    // 同一根因的第三处：往前走时的放回复核。把基线挪回更新前的位置——它仍是 HEAD 的
+    // 祖先，只比「当前 svn/base 是不是祖先」会放行
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/N.cs", "server\n");
+    write(&fx, "Code/B.cs", "b-wip\n");
+    write(&fx, "Code/N.cs", "mine\n");
+    let before = git(&fx, &["rev-parse", "svn/base"]);
+    assert!(matches!(sync(&fx), SyncInOutcome::StashBlocked { .. }));
+    std::fs::rename(fx.wc().join("Code/N.cs"), fx.wc().join("Code/N.server.cs")).unwrap();
+    git(&fx, &["update-ref", "refs/heads/svn/base", &before]);
+
+    let err = continue_sync(&fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "sync_in_state_changed", "{}", err.message);
+    assert_eq!(our_stashes(&fx), 1);
+    assert_eq!(phase(&fx), Some(Phase::ApplyingStash));
+}
+
+#[test]
+fn rebuilding_the_baseline_is_refused_while_a_sync_is_unfinished() {
+    // 纵深防御：冲突期间锁是放开的，`assert_not_syncing` 只看锁。界面在未收尾时藏起了
+    // 重建 / 迁移入口，但后端不能靠界面挡——它们会移动本次同步依赖的基线
+    let fx = hybrid_with_colleague();
+    rebase_conflict(&fx);
+    let base = git(&fx, &["rev-parse", "svn/base"]);
+    let err = app_lib::commands::svn::svn_rebuild_baseline(fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "sync_in_unfinished", "{}", err.message);
+    let err = app_lib::commands::svn::svn_migrate_eol(fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "sync_in_unfinished", "{}", err.message);
+    assert_eq!(git(&fx, &["rev-parse", "svn/base"]), base);
+}
+
+// —— applying-stash ——
+
+/// 同事改了 A.cs，你手上有一份未提交的 A.cs：S10 放回时冲突。返回 stash OID。
+fn a_stash_conflict(fx: &SvnFixture) -> String {
     fx.colleague_commits("Code/A.cs", "a-server\n");
-    write(&fx, "Code/A.cs", "a-wip\n");
-    assert!(matches!(sync(&fx), SyncInOutcome::StashConflict { .. }));
+    write(fx, "Code/A.cs", "a-wip\n");
+    match sync(fx) {
+        SyncInOutcome::StashConflict { stash_oid, .. } => stash_oid,
+        o => panic!("应当是 stash 冲突：{o:?}"),
+    }
+}
+
+#[test]
+fn continue_after_resolving_a_stash_conflict_keeps_the_backup() {
+    // PR #49 review 第四轮 P1-2（方案 A）：冲突之后磁盘上的 WIP 是用户手工处理过的，
+    // 我们证明不了它还完整——stash 里那份可能是唯一的备份，一律留给用户，不 drop
+    let fx = hybrid_with_colleague();
+    let oid = a_stash_conflict(&fx);
     write(&fx, "Code/A.cs", "a-merged\n");
     git(&fx, &["add", "Code/A.cs"]);
     assert_eq!(
         continue_sync(&fx.wc_str()).unwrap(),
-        SyncInOutcome::Done { new_rev: 2 }
+        SyncInOutcome::Settled {
+            stash_oid: oid,
+            rolled_back: false
+        }
     );
-    assert_eq!(our_stashes(&fx), 0);
+    assert_eq!(our_stashes(&fx), 1, "备份留在 stash 列表里");
+    assert_eq!(
+        git(&fx, &["for-each-ref", "refs/mygitclient/"]),
+        "",
+        "钉住的 ref 已删"
+    );
     assert_eq!(read(&fx, "Code/A.cs"), "a-merged\n");
     assert_eq!(phase(&fx), None);
+}
+
+#[test]
+fn continue_after_the_wip_was_reset_away_does_not_delete_the_only_backup() {
+    // PR #49 review 第四轮 P1-2（实测）：冲突之后外部 `reset --hard svn/base`，冲突与磁盘上
+    // 的 WIP 都没了，而 HEAD 仍以基线为祖先、没有未解决的文件——原先会 drop 掉唯一的备份、报 Done
+    let fx = hybrid_with_colleague();
+    let oid = a_stash_conflict(&fx);
+    git(&fx, &["reset", "-q", "--hard", "svn/base"]);
+
+    assert_eq!(
+        continue_sync(&fx.wc_str()).unwrap(),
+        SyncInOutcome::Settled {
+            stash_oid: oid.clone(),
+            rolled_back: false
+        }
+    );
+    assert_eq!(our_stashes(&fx), 1, "唯一的备份还在");
+    let p = git(&fx, &["show", &format!("{oid}:Code/A.cs")]);
+    assert_eq!(p, "a-wip", "从备份里取得回 WIP");
 }
 
 #[test]

@@ -703,6 +703,13 @@ fn sync_in_types_cross_ipc_in_camel_case() {
             },
             r#"{"kind":"released","stashOid":"o","rolledBack":true}"#,
         ),
+        (
+            SyncInOutcome::Settled {
+                stash_oid: "o".into(),
+                rolled_back: false,
+            },
+            r#"{"kind":"settled","stashOid":"o","rolledBack":false}"#,
+        ),
     ];
     for (v, want) in cases {
         assert_eq!(serde_json::to_string(&v).unwrap(), want);

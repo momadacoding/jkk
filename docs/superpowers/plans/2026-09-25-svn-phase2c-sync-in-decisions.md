@@ -22,6 +22,7 @@
 | 11 | E2E + spec 修订 + 收尾 | 🟡 清单与 spec 完成，真实窗口场景未跑 | `docs/superpowers/e2e/2026-09-25-svn-phase2c-e2e.md`（8 个场景）、spec §7.2 注记 / §7.3 S3·S5·S8 注记 / §18「十四」 | 全量验证见下表；E2E 机械检查两条通过；独立 review 见「Task 11」 |
 | 12 | PR #49 review（第二轮）修复 | ✅ 完成 | `svn_sync_check::current_branch`、`svn_sync_in`（`untracked_leftovers`、`require_our_rebase`、`back_outcome`、`continue_rebase` 重走 S9）、journal `leftOrig` / `rollingBack`、`Released.rolledBack`、前端文案 + 12 条 Rust / 2 条 vitest | 见下「PR #49 review（第二轮）」；fmt / clippy 0 告警 / `cargo test` 711 passed 0 failed；`pnpm build` 通过 / `pnpm test` 433 passed |
 | 13 | PR #49 review（第三轮）修复 | ✅ 完成 | `require_restore_target`、`require_our_rebase` 加 `onto` / `orig-head`、`svn_sync_stash::blocking_ancestor`、`UpdateStatusEntry.repos_props` + `is_conflicted` / `is_incoming`、`SyncInExpect.orig_branch`（前后端）+ 10 条 Rust / 1 条 vitest 改写 | 见下「PR #49 review（第三轮）」；fmt / clippy 0 告警 / `cargo test` 721 passed 0 failed；`pnpm build` 通过 / `pnpm test` 433 passed |
+| 14 | PR #49 review（第四轮）修复 | ✅ 完成 | `published_baseline`（重放目标 / 认 rebase / 放回复核都以 `newBaselineOid` 为准）、`commands/svn.rs::refuse_while_unfinished`、`RestoreStep::Kept` + `SyncInOutcome::Settled`（冲突后继续不 drop）、前端 `settled` 文案与「继续」确认框 + 5 条 Rust 新增 / 1 条改写、2 条 vitest；修正第三轮 heredoc 写坏的一处测试字面量 | 见下「PR #49 review（第四轮）」；fmt / clippy 0 告警 / `cargo test` 726 passed 0 failed；`pnpm build` 通过 / `pnpm test` 435 passed |
 
 ## 全量验证
 
@@ -29,9 +30,9 @@
 |---|---|
 | `cargo fmt --check` | ✅ 0（2026-09-26，Task 11 Step 3） |
 | `cargo clippy --all-targets` | ✅ 0 告警 |
-| `cargo test` | ✅ 721 passed / 0 failed（PR #49 第三轮 review 修复之后；第二轮后 711；第一轮修复后 699，修复前 695。基线：master `1db8210` 上 598 passed） |
+| `cargo test` | ✅ 726 passed / 0 failed（PR #49 第四轮 review 修复之后；第三轮后 721；第二轮后 711；第一轮修复后 699，修复前 695。基线：master `1db8210` 上 598 passed） |
 | `pnpm build` | ✅ tsc + vite 通过 |
-| `pnpm test` | ✅ 27 个文件 433 passed / 0 failed（第三轮 review 修复之后，条数不变、改写 1 条；第一轮后 431，修复前 430。基线 383 passed） |
+| `pnpm test` | ✅ 27 个文件 435 passed / 0 failed（第四轮 review 修复之后；第三轮后 433；第一轮后 431，修复前 430。基线 383 passed） |
 | `pnpm tauri dev` | ⬜ **未跑**：E2E 清单 8 个场景都要人在真实窗口里点，本会话没有跑。四个新命令的 invoke 参数名因此**尚未在运行时确认**（序列化形状由 `svn_backend.rs` 钉住，但 JS 侧参数名没有编译期检查） |
 | E2E 清单机械检查 | ✅ 29 个 `powershell` 代码块在 PS 5.1.26100 与 PS 7.6.1 下 `Parser::ParseInput` 均 0 语法错误；`Colleague` 在新造的 fixture 上连提两次（新增文件 r2、修改已有文件 r3）均落地，fixture 已删 |
 
@@ -635,4 +636,46 @@
 - #1、#2、#6 都只是多一道拒绝，不增加任何写操作；拒绝时记录与 stash 原样保留。
 - #3 只让更多情形走进已有的 `Blocked` 出口（一个字节都不动）。
 - #4 让属性冲突走已有的「S5 冲突 → 回退」出口，与内容冲突一致；#5 只让确认清单多列文件。`repos-status` 的 `props` 属性按 svn 的 schema 是必有的，缺了按 XML 解析错误处理（与现有 `item` 一致），不静默放行。
+
+## PR #49 review（第四轮）
+
+### review 与核实
+
+复查确认第三轮六条的原始复现场景都已覆盖，另提两条 P1。核实（读代码；review 已在临时仓库实测）：
+
+| # | 发现 | 核实 | 定级（review → 核实后） | 处置 |
+|---|---|---|---|---|
+| P1-1 | `require_our_rebase` 的 `onto` 与**当前** `svn/base` 比：本次 rebase 被外部中止、基线被挪走、用户在同一原分支 rebase 到新基线时三项全对上，放弃会中止用户的 rebase | 成立。同一根因另有两处 review 没提：S9 的重放目标、往前走的放回复核（`require_restore_target`）都用当前 `svn/base`。另发现后端的重建基线 / 行尾迁移只看锁、不看 journal——冲突期间锁是放开的，只有界面藏起入口挡着 | P1 → Medium（界面内挪不动基线，要外部工具） | 已修 |
+| P1-2 | stash 冲突后外部 `reset --hard`（或 `reset --hard svn/base`），WIP 与冲突都没了，复核全过，继续会 drop 唯一的备份、报 Done | 成立 | P1 → High | 已修（用户选方案 A） |
+
+### 方案选择（P1-2）
+
+| 方案 | 做法 | 取舍 |
+|---|---|---|
+| **A（采用）** | 放回时停下过的（`stashApplied` 为真），继续收尾时不 drop：只删 journal 与钉住的 ref，stash 条目留给用户，结局 `settled` 说明备份还在 | 从根上消除「删掉唯一备份」；代价是每次 stash 冲突在 stash 列表里留一条，与 spec §13 S10「解决后 drop」不一致（spec 已改） |
+| B | 进入 applying-stash 时记 HEAD；继续时要求 HEAD 未变、stash 涉及的每个路径仍与 HEAD 不同 | 「WIP 还在」只能推断；解决冲突时全取 HEAD 版本会被误拒 |
+
+用户决定按推荐走 A。
+
+### 修复与验证
+
+| # | 修法 | 测试（先红后绿） |
+|---|---|---|
+| P1-1 | 新增 `published_baseline`：取 journal 的 `newBaselineOid`，`svn/base` 不等于它就 `sync_in_state_changed`。S9 直接以该 OID 为 upstream；`require_our_rebase` 的 `onto`、`continue_rebase` 的「已落在新基线上」、`require_restore_target` 往前走的祖先判断都改用它。命令层 `refuse_while_unfinished`：有 journal 时 `svn_rebuild_baseline` / `svn_migrate_eol` 拒绝（`sync_in_unfinished`） | `abort_does_not_abort_a_new_rebase_onto_a_moved_baseline`（review 的场景；RED：用户的 rebase 被中止）、`a_baseline_moved_before_the_replay_is_refused`（RED：已经重放到被挪走的基线上）、`continue_restoring_refuses_a_baseline_moved_back`（RED：继续直接成功）、`rebuilding_the_baseline_is_refused_while_a_sync_is_unfinished`（RED：重建执行了） |
+| P1-2 | `restore_step` 在 `stashApplied` 为真时只查未解决文件，然后 `unpin` + 删 journal，返回 `RestoreStep::Kept`；往前走映射为 `Settled { rolledBack: false }`，往回走为 `true`。同一进程里刚刚干净 apply 完的照旧 drop。前端 `settled` 文案、「继续」确认框不再说「清理备份」 | `continue_after_the_wip_was_reset_away_does_not_delete_the_only_backup`（review 的场景）、`continue_after_resolving_a_stash_conflict_keeps_the_backup`（原 `…drops_the_stash` 改写）：先只加 `Settled` 变体不改行为，两条都 RED 于 `Done { new_rev: 2 }`；`sync_in_types_cross_ipc_in_camel_case` 钉住 `settled`；vitest 两条（RED） |
+
+### 偏离计划
+
+- **偏离 spec §13 S10 / §7.6「解决后 drop」**：见上方案 A，spec 已改。E2E 清单不受影响——场景 4（撞名 → 继续）走的是同一进程里干净 apply，仍然 drop。
+- 新结局 `SyncInOutcome::Settled`，前端联合类型随之新增 `settled`。
+
+### 计划没写的坑
+
+- **Bash 工具的 heredoc 反斜杠折叠又犯了两次**（记忆里早有这一条）：第三轮 `a_branch_switched_since_the_preview_is_refused` 里的 `"a2\n"` 被写成真换行（LF 工作区下行为恰好相同，所以测试是绿的），本轮 `refuse_while_unfinished` 的续行变成一串空格。两处都已改正；扫描「以 `"` 开头的行」确认没有别的。
+
+### 为什么这么改是安全的
+
+- `published_baseline` 只增加拒绝，不增加写操作；拒绝时记录、stash、rebase 状态原样保留。
+- `Kept` 比原来**少做**一件事（不 drop），stash 条目与对象都还在；钉住的 ref 删掉后，stash reflog 仍让对象可达。
+- `refuse_while_unfinished` 只读 journal；journal 坏了按现有语义往上抛 `svn_journal_corrupt`，不吞成「没有记录」。
 

@@ -1910,7 +1910,7 @@ rebase 预检使用的目标 OID 与 `origHead` 同样落盘，禁止用可能�
 |---|---|---|
 | `stashing` | `stashRefBefore` 已落盘，`git stash push` 可能落地也可能没有 | 比对当前 `refs/stash` 与 `stashRefBefore` 判定，**不静默 apply** |
 | `stashed` | stash 已落地且 OID 已钉住 | 按 `stashOid` 恢复 |
-| `applying-stash` | S9 已完成（或回退 / 放弃已回到原分支），正在或已经执行 S10 的 `git stash apply <OID>`；`stashApplied` 为真表示 apply 已执行（成功或留下冲突）；`rollingBack` 为真表示这是往回走途中停下的 | `stashApplied` 为假：可再次 apply（先查未跟踪文件撞名）；为真：只 drop，**不再 apply**。放弃时只删 journal 与钉住的 ref，stash 条目原样保留给用户。`rollingBack` 为真时「继续」的结局是「已放弃」而不是「已更新」，横幅与放弃文案都说分支在更新前的位置 |
+| `applying-stash` | S9 已完成（或回退 / 放弃已回到原分支），正在或已经执行 S10 的 `git stash apply <OID>`；`stashApplied` 为真表示 apply 已执行（成功或留下冲突）；`rollingBack` 为真表示这是往回走途中停下的 | `stashApplied` 为假：可再次 apply（先查未跟踪文件撞名），干净 apply 完才 drop；为真：**不再 apply，也不 drop**——磁盘上的 WIP 经过了人手，证明不了还完整，只删 journal 与钉住的 ref，stash 条目留给用户（结局 `settled`）。继续前复核 HEAD 在原分支上、且（往前走时）落在本次发布的基线上。放弃时只删 journal 与钉住的 ref，stash 条目原样保留给用户。`rollingBack` 为真时「继续」的结局是「已放弃」而不是「已更新」，横幅与放弃文案都说分支在更新前的位置 |
 
 `sync_in` 的 journal 另有字段 `leftOrig`：S3 的 checkout **之前**置真，表示 HEAD 可能离开过原分支。
 没有可压的改动时 phase 一路停在 `stashed` 走过 S3–S5，只有它能区分「回退留下了 checkout 残留」与
@@ -3735,6 +3735,10 @@ A1–A17 全部实测或经用户决定，要点：
   **只改属性**（`repos-status props="modified" item="none"`，实测）；锁内复核另比分支名；
   `applying-stash` 继续前复核当前分支与位置；认 rebase 另比 `onto` 与 `orig-head`；S10 撞名预检
   把「祖先路径被非目录占着」算作撞名。
+- **PR #49 第四轮 review 之后**（2026-09-27）：S8 之后以 journal 里本次发布的 `newBaselineOid` 为准
+  （重放目标、认 rebase 的 `onto`、放回前复核），`svn/base` 被挪过就停下；未收尾时后端拒绝重建基线 /
+  行尾迁移（原先只看锁）；**偏离 §13 S10「解决后 drop」**：放回时停下过的，继续收尾时 stash 备份
+  留给用户、不 drop——实测冲突后外部 `reset --hard` 会让 WIP 消失而所有复核照样通过。
 
 ### 2026-09-25（十三）· 同步锁的存活判据从 pid 探测改为句柄探测
 
