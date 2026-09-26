@@ -368,8 +368,27 @@ pub struct UpdateStatusEntry {
     /// 本地新增放过去。
     pub tree_conflicted: bool,
     /// `<repos-status item>`：带 `-u` 时才有。`modified` / `added` / `deleted`
-    /// 表示这次 update 会碰到它，`none` 表示不会。
+    /// 表示这次 update 会碰到它的内容，`none` 表示不会。
     pub repos_item: Option<String>,
+    /// `<repos-status props>`：带 `-u` 时才有。只改属性的远端改动是
+    /// `item="none" props="modified"`（2026-09-26 实测），单看 `repos_item` 会漏掉。
+    pub repos_props: Option<String>,
+}
+
+impl UpdateStatusEntry {
+    /// 冲突态：内容冲突、树冲突、属性冲突任一种。
+    ///
+    /// 三种都要看（PR #49 review 第三轮 #4，实测）：树冲突节点的 item 可以是 `added`，
+    /// 属性冲突节点是 `item="normal" props="conflicted"`。
+    pub fn is_conflicted(&self) -> bool {
+        self.item == "conflicted" || self.tree_conflicted || self.props == "conflicted"
+    }
+
+    /// 这次 update 会碰到它（内容或属性）。只对带 `-u` 的结果有意义。
+    pub fn is_incoming(&self) -> bool {
+        self.repos_item.as_deref().is_some_and(|r| r != "none")
+            || self.repos_props.as_deref().is_some_and(|r| r != "none")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -395,16 +414,18 @@ pub fn parse_update_status(xml: &str) -> Result<UpdateStatus> {
                     format!("svn status 的 entry `{path}` 底下没有 <wc-status>"),
                 )
             })?;
-        let repos_item = match entry.children().find(|n| n.has_tag_name("repos-status")) {
-            Some(r) => Some(attr(&r, "item")?),
-            None => None,
-        };
+        let (repos_item, repos_props) =
+            match entry.children().find(|n| n.has_tag_name("repos-status")) {
+                Some(r) => (Some(attr(&r, "item")?), Some(attr(&r, "props")?)),
+                None => (None, None),
+            };
         entries.push(UpdateStatusEntry {
             path,
             item: attr(&st, "item")?,
             props: attr(&st, "props")?,
             tree_conflicted: st.attribute("tree-conflicted") == Some("true"),
             repos_item,
+            repos_props,
         });
     }
     // 项目根的 <target> 在最前；external 各有自己的 <target>/<against>，

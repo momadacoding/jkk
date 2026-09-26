@@ -21,6 +21,7 @@
 | 10 | 前端接线 | 🟡 代码完成，真实窗口冒烟未跑 | `repoStore.ts` 四个 invoke、`Toolbar.tsx`「更新」、`BaselineBanner.tsx` 继续 / 放弃与「更新…」、`RepoTab.tsx` 编排、`styles.css` 的 `.dialog-message` 换行 | `pnpm build` 通过 / `pnpm test` 430 passed；`pnpm tauri dev` 场景 1 / 2 **未跑**（需人工操作真实窗口） |
 | 11 | E2E + spec 修订 + 收尾 | 🟡 清单与 spec 完成，真实窗口场景未跑 | `docs/superpowers/e2e/2026-09-25-svn-phase2c-e2e.md`（8 个场景）、spec §7.2 注记 / §7.3 S3·S5·S8 注记 / §18「十四」 | 全量验证见下表；E2E 机械检查两条通过；独立 review 见「Task 11」 |
 | 12 | PR #49 review（第二轮）修复 | ✅ 完成 | `svn_sync_check::current_branch`、`svn_sync_in`（`untracked_leftovers`、`require_our_rebase`、`back_outcome`、`continue_rebase` 重走 S9）、journal `leftOrig` / `rollingBack`、`Released.rolledBack`、前端文案 + 12 条 Rust / 2 条 vitest | 见下「PR #49 review（第二轮）」；fmt / clippy 0 告警 / `cargo test` 711 passed 0 failed；`pnpm build` 通过 / `pnpm test` 433 passed |
+| 13 | PR #49 review（第三轮）修复 | ✅ 完成 | `require_restore_target`、`require_our_rebase` 加 `onto` / `orig-head`、`svn_sync_stash::blocking_ancestor`、`UpdateStatusEntry.repos_props` + `is_conflicted` / `is_incoming`、`SyncInExpect.orig_branch`（前后端）+ 10 条 Rust / 1 条 vitest 改写 | 见下「PR #49 review（第三轮）」；fmt / clippy 0 告警 / `cargo test` 721 passed 0 failed；`pnpm build` 通过 / `pnpm test` 433 passed |
 
 ## 全量验证
 
@@ -28,9 +29,9 @@
 |---|---|
 | `cargo fmt --check` | ✅ 0（2026-09-26，Task 11 Step 3） |
 | `cargo clippy --all-targets` | ✅ 0 告警 |
-| `cargo test` | ✅ 711 passed / 0 failed（PR #49 第二轮 review 修复之后；第一轮修复后 699，修复前 695。基线：master `1db8210` 上 598 passed） |
+| `cargo test` | ✅ 721 passed / 0 failed（PR #49 第三轮 review 修复之后；第二轮后 711；第一轮修复后 699，修复前 695。基线：master `1db8210` 上 598 passed） |
 | `pnpm build` | ✅ tsc + vite 通过 |
-| `pnpm test` | ✅ 27 个文件 433 passed / 0 failed（第二轮 review 修复之后；第一轮后 431，修复前 430。基线 383 passed） |
+| `pnpm test` | ✅ 27 个文件 433 passed / 0 failed（第三轮 review 修复之后，条数不变、改写 1 条；第一轮后 431，修复前 430。基线 383 passed） |
 | `pnpm tauri dev` | ⬜ **未跑**：E2E 清单 8 个场景都要人在真实窗口里点，本会话没有跑。四个新命令的 invoke 参数名因此**尚未在运行时确认**（序列化形状由 `svn_backend.rs` 钉住，但 JS 侧参数名没有编译期检查） |
 | E2E 清单机械检查 | ✅ 29 个 `powershell` 代码块在 PS 5.1.26100 与 PS 7.6.1 下 `Parser::ParseInput` 均 0 语法错误；`Colleague` 在新造的 fixture 上连提两次（新增文件 r2、修改已有文件 r3）均落地，fixture 已删 |
 
@@ -591,3 +592,47 @@
 
 - #5 / #8 / #9 / #10 记为 deferred（见上表）。
 - 真实窗口 E2E 仍未跑。
+
+## PR #49 review（第三轮）
+
+### review 与核实
+
+外部 review 又提了 6 条（3 × P1、3 × P2）。逐条核实全部成立：#3 用临时 git 仓库、#4 / #5 用临时 svn 仓库实测复现，#2 实测 `rebase-merge/` 里记的身份，#1 / #6 读代码确认。
+
+| # | 发现 | 核实 | 定级（review → 核实后） | 处置 |
+|---|---|---|---|---|
+| 1 | `applying-stash` 继续时不复核当前分支：撞名挡住后切到别的分支再继续，WIP 被合进那条分支、备份被 drop、报 Done | 成立。冲突留下 `UU` 时 git 拒绝切分支，主要是撞名这条路 | P1 → High | 已修 |
+| 2 | `require_our_rebase` 只比 head-name：同一条分支上的另一次 rebase 会被认成本次的，放弃时被中止 | 成立；触发要先在外面结束本次 rebase | P1 → Medium | 已修 |
+| 3 | stash 撞名预检不看祖先：`Code/Sub` 成了普通文件时 `Code/Sub/u.cs` 取元数据报错，被当成不存在 | 成立（实测：`stash apply` 退出 1、`cannot create directory`，已跟踪部分已写入）。不丢数据，stash 仍在 | P1 → Medium | 已修 |
+| 4 | S5 之后与预览都不认属性冲突 | 成立（实测：update 退出 0，`item="normal" props="conflicted"`，汇总 `Property conflicts: 1`） | P2 → Medium | 已修 |
+| 5 | 只改属性的远端改动不进白名单外确认 | 成立（实测：`repos-status item="none" props="modified"`；解析器原先不读远端 props） | P2 → Medium | 已修 |
+| 6 | 执行时不核对预览的分支名 | 成立。不丢数据，但重放的是用户没确认过的分支 | P2 → Low–Medium | 已修 |
+
+### 修复与验证
+
+| # | 修法 | 测试（先红后绿） |
+|---|---|---|
+| 1 | 新增 `require_restore_target`，`continue_sync` 的 `applying-stash` 两个方向都先过它：必须在原分支上；往前走要求 `svn/base` 是 HEAD 的祖先（中间多了用户自己的提交不要紧），往回走要求 HEAD == `origHead` | `continue_does_not_put_the_wip_on_a_branch_switched_to_meanwhile`、`continue_after_a_blocked_rollback_refuses_a_moved_branch`（RED：两条的「继续」都直接成功） |
+| 2 | `require_our_rebase` 另比 `rebase-merge/orig-head == origHead` 与 `onto == svn/base`（`rebase_head_name` 泛化为 `rebase_state`） | `a_new_rebase_of_the_same_branch_is_not_taken_for_ours`（RED：放弃把用户的 rebase 中止了）。本次 rebase 自己的继续 / 放弃用例全绿，证明真实的 `onto` / `orig-head` 形状对得上 |
+| 3 | `blocking_ancestor`：逐级看祖先，存在却不是目录（含符号链接）即按撞名报**那一级**（用户要挪走的是它），一个字节都不 apply | `restore_refuses_when_a_parent_of_an_untracked_file_is_now_a_file`（RED：`sync_stash_apply_failed` / `cannot create directory`） |
+| 4 + 5 | `UpdateStatusEntry` 新增 `repos_props`，并收拢两个判据：`is_conflicted()`（内容 / 树 / 属性冲突）、`is_incoming()`（远端 item 或 props 非 `none`）；预览与 S5 之后的冲突检查都改用它们 | 解析：`update_status_counts_a_props_only_incoming_change`、`update_status_sees_property_conflicts`（XML 照实测抄；先编译失败）。集成：`a_props_only_change_on_both_sides_is_listed`、`an_existing_property_conflict_is_refused`、`a_property_conflict_during_update_rolls_back`（RED：清单为空 / 预览放行） |
+| 6 | `SyncInExpect` 新增 `orig_branch`，`verify_expect` 一并比较；前端 `expectFromPreview` 带上 `origBranch` | `a_branch_switched_since_the_preview_is_refused`（先只加字段不加比较：RED，同步在 other 上跑完了）；`sync_in_types_cross_ipc_in_camel_case` 钉住 `origBranch`；vitest `expectFromPreview` 用例（RED） |
+
+### 偏离计划
+
+- `SyncInExpect` 多了一个必填字段，`svn_sync_in` 命令的 JS 参数形状随之改变（`commands/svn_sync.rs` 模块注释已更新）。**必须在 `pnpm tauri dev` 里实跑一次「更新」**才算验证过（`AGENTS.md` §7.3）。
+- 撞名结果里可以出现「祖先那一级」的路径（`Code/Sub`），不只是 stash 里的文件本身。前端 `stashBlocked` 文案（「服务器新增了与你的未跟踪文件同名的文件」）对这种形状仍然成立。
+
+### 计划没写的坑
+
+- svn 属性冲突：`svn update --accept postpone` 退出 0，汇总行 `Property conflicts: 1`，节点 `item="normal" props="conflicted"`，旁边多一个 `.prej` 未版本化文件（2026-09-26，svn 1.14 实测）。
+- 只改属性的远端改动：`<repos-status props="modified" item="none">`。
+- `.git/rebase-merge/` 里 `onto`、`orig-head` 都是完整 OID；本机 `rebase.autoStash=true` 时还会多一个 `autostash` 文件（与本修复无关）。
+- 祖先被普通文件占着时，Rust 对子路径的 `symlink_metadata` 报错，看起来和「不存在」一样。
+
+### 为什么这么改是安全的
+
+- #1、#2、#6 都只是多一道拒绝，不增加任何写操作；拒绝时记录与 stash 原样保留。
+- #3 只让更多情形走进已有的 `Blocked` 出口（一个字节都不动）。
+- #4 让属性冲突走已有的「S5 冲突 → 回退」出口，与内容冲突一致；#5 只让确认清单多列文件。`repos-status` 的 `props` 属性按 svn 的 schema 是必有的，缺了按 XML 解析错误处理（与现有 `item` 一致），不静默放行。
+

@@ -39,6 +39,7 @@ fn baseline_rev(fx: &SvnFixture) -> u64 {
 fn expect(fx: &SvnFixture) -> SyncInExpect {
     let p = preview_sync_in(&fx.wc_str()).unwrap();
     SyncInExpect {
+        orig_branch: p.orig_branch,
         orig_head: p.orig_head,
         baseline_oid: p.baseline_oid,
         confirmed_outside: p.outside_changes,
@@ -230,6 +231,25 @@ fn a_branch_moved_since_the_preview_is_refused() {
     let err = run_sync_in(&fx.wc_str(), &e).unwrap_err();
     assert_eq!(err.code, "sync_in_state_changed");
     assert_eq!(phase(&fx), None);
+}
+
+#[test]
+fn a_branch_switched_since_the_preview_is_refused() {
+    // PR #49 review 第三轮 #6：预览时在 work 上，确认之前外部切到指向同一提交的 other。
+    // origHead 与基线都没变，只比 OID 会放行，重放的就是用户没确认过的 other
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits(
+        "Code/A.cs",
+        "a2
+",
+    );
+    let e = expect(&fx);
+    git(&fx, &["checkout", "-q", "-b", "other"]);
+    let err = run_sync_in(&fx.wc_str(), &e).unwrap_err();
+    assert_eq!(err.code, "sync_in_state_changed", "{}", err.message);
+    assert_eq!(phase(&fx), None, "一个字节都没动");
+    assert_eq!(baseline_rev(&fx), 1);
+    assert_eq!(git(&fx, &["symbolic-ref", "--short", "HEAD"]), "other");
 }
 
 #[test]
@@ -738,6 +758,39 @@ fn abort_does_not_abort_a_rebase_that_is_not_ours() {
     assert_eq!(our_stashes(&fx), 1, "WIP 还在");
 }
 
+#[test]
+fn a_new_rebase_of_the_same_branch_is_not_taken_for_ours() {
+    // PR #49 review 第三轮 #2：用户在外面中止本次 rebase，又在**同一条**原分支上 rebase
+    // 到别的目标并停在冲突上。head-name 仍是 refs/heads/work，只比分支名会把它认成
+    // 本次的，放弃时 `rebase --abort` 丢掉用户在那次 rebase 里的进度
+    let fx = hybrid_with_colleague();
+    rebase_conflict(&fx);
+    git(&fx, &["rebase", "--abort"]);
+    git(&fx, &["checkout", "-q", "-b", "other", "svn/base"]);
+    write(&fx, "Code/A.cs", "a-other\n");
+    commit(&fx, "other A");
+    git(&fx, &["checkout", "-q", "work"]);
+    let other = git(&fx, &["rev-parse", "other"]);
+    assert!(
+        run_git(&fx.wc_str(), &["rebase", "other"]).is_err(),
+        "work 停在冲突上"
+    );
+
+    let err = abort_sync(&fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "sync_in_state_changed", "{}", err.message);
+    let err = continue_sync(&fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "sync_in_state_changed", "{}", err.message);
+    assert_eq!(
+        std::fs::read_to_string(fx.wc().join(".git/rebase-merge/onto"))
+            .unwrap()
+            .trim(),
+        other,
+        "用户的 rebase 原样还在"
+    );
+    assert_eq!(phase(&fx), Some(Phase::Rebase));
+    assert_eq!(our_stashes(&fx), 1);
+}
+
 // —— applying-stash ——
 
 #[test]
@@ -772,6 +825,44 @@ fn continue_after_moving_a_colliding_file_applies_the_stash() {
     assert_eq!(read(&fx, "Code/N.cs"), "mine\n");
     assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
     assert_eq!(phase(&fx), None);
+}
+
+#[test]
+fn continue_does_not_put_the_wip_on_a_branch_switched_to_meanwhile() {
+    // PR #49 review 第三轮 #1：撞名挡住时一个字节都没放回、锁已放开，工作区是干净的，
+    // 用户可以随手切走。此时「继续」不能把原分支的 WIP 放到别的分支上再删掉备份
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/N.cs", "server\n");
+    write(&fx, "Code/B.cs", "b-wip\n");
+    write(&fx, "Code/N.cs", "mine\n");
+    assert!(matches!(sync(&fx), SyncInOutcome::StashBlocked { .. }));
+    std::fs::rename(fx.wc().join("Code/N.cs"), fx.wc().join("Code/N.server.cs")).unwrap();
+    git(&fx, &["checkout", "-q", "-b", "elsewhere"]);
+
+    let err = continue_sync(&fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "sync_in_state_changed", "{}", err.message);
+    assert_eq!(
+        read(&fx, "Code/B.cs"),
+        "b1\n",
+        "一个字节都没放到 elsewhere 上"
+    );
+    assert_eq!(our_stashes(&fx), 1, "备份还在");
+    assert_eq!(phase(&fx), Some(Phase::ApplyingStash), "记录原样保留");
+}
+
+#[test]
+fn continue_after_a_blocked_rollback_refuses_a_moved_branch() {
+    // 同上，往回走的方向：分支必须仍在更新前的位置
+    let fx = hybrid_with_colleague();
+    a_rollback_blocked_by_a_server_added_file(&fx);
+    std::fs::rename(fx.wc().join("Code/N.cs"), fx.wc().join("Code/N.server.cs")).unwrap();
+    write(&fx, "Code/A.cs", "moved\n");
+    commit(&fx, "moved meanwhile");
+
+    let err = continue_sync(&fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "sync_in_state_changed", "{}", err.message);
+    assert_eq!(our_stashes(&fx), 1, "备份还在");
+    assert_eq!(phase(&fx), Some(Phase::ApplyingStash));
 }
 
 #[test]
@@ -968,6 +1059,29 @@ fn an_update_conflict_outside_git_rolls_back_and_points_to_tortoisesvn() {
     assert_eq!(phase(&fx), None);
     let st = app_lib::engine::svn_cli::run_svn(&fx.wc_str(), &["status", "Art/x.psd"]).unwrap();
     assert!(st.starts_with('C'), "冲突现场原样留给 TortoiseSVN：{st}");
+}
+
+#[test]
+fn a_property_conflict_during_update_rolls_back() {
+    // PR #49 review 第三轮 #4（实测）：属性冲突时 update 退出 0，节点是
+    // `props="conflicted"`。只查内容 / 树冲突会接着录基线、报 Done，把未解决的
+    // 属性冲突留在工作副本里
+    let fx = hybrid_with_colleague();
+    svn_fixtures::svn_cmd(&fx.wc(), &["propset", "p", "v-local", "Art/x.psd"]);
+    svn_fixtures::svn_cmd(&fx.wc2(), &["update", "--non-interactive"]);
+    svn_fixtures::svn_cmd(&fx.wc2(), &["propset", "p", "v-server", "Art/x.psd"]);
+    svn_fixtures::svn_cmd(&fx.wc2(), &["commit", "-m", "prop", "--non-interactive"]);
+    write(&fx, "Code/B.cs", "b-wip\n");
+    let e = expect(&fx);
+    assert_eq!(e.confirmed_outside, vec!["Art/x.psd".to_string()]);
+
+    let err = run_sync_in(&fx.wc_str(), &e).unwrap_err();
+    assert_eq!(err.code, "sync_in_update_conflict", "{}", err.message);
+    assert!(err.message.contains("Art/x.psd"), "{}", err.message);
+    assert_eq!(git(&fx, &["symbolic-ref", "--short", "HEAD"]), "work");
+    assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
+    assert_eq!(baseline_rev(&fx), 1, "基线不推进");
+    assert_eq!(phase(&fx), None);
 }
 
 #[cfg(windows)]

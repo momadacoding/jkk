@@ -126,7 +126,7 @@ pub(crate) fn check_sync_in(repo_root: &str) -> Result<SyncInPreview> {
     let mut conflicted = Vec::new();
     let mut outside = Vec::new();
     for e in &st.entries {
-        if e.item == "conflicted" || e.tree_conflicted {
+        if e.is_conflicted() {
             conflicted.push(e.path.clone());
             continue;
         }
@@ -135,8 +135,7 @@ pub(crate) fn check_sync_in(repo_root: &str) -> Result<SyncInPreview> {
         }
         let local =
             matches!(e.item.as_str(), "modified" | "missing" | "replaced") || e.props == "modified";
-        let incoming = e.repos_item.as_deref().is_some_and(|r| r != "none");
-        if local && incoming {
+        if local && e.is_incoming() {
             outside.push(e.path.clone());
         }
     }

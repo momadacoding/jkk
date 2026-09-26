@@ -23,6 +23,8 @@ describe('expectFromPreview', () => {
     const p = { ...preview, outsideChanges: ['Art/x.psd'] }
     const e = expectFromPreview(p)
     expect(e).toEqual({
+      // 分支名也要带：切到指向同一提交的另一条分支时 OID 不变（PR #49 review 第三轮 #6）
+      origBranch: 'work',
       origHead: p.origHead,
       baselineOid: p.baselineOid,
       confirmedOutside: ['Art/x.psd'],

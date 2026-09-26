@@ -111,6 +111,40 @@ fn outside_changes_the_update_will_not_touch_are_not_listed() {
     assert!(p.outside_changes.is_empty(), "{:?}", p.outside_changes);
 }
 
+/// 本地给 `Art/x.psd` 设了属性，同事在服务器上也改了同一个属性——都不碰内容。
+fn both_sides_set_a_property(fx: &svn_fixtures::SvnFixture) {
+    svn_cmd(&fx.wc(), &["propset", "p", "v-local", "Art/x.psd"]);
+    svn_cmd(&fx.wc2(), &["update", "--non-interactive"]);
+    svn_cmd(&fx.wc2(), &["propset", "p", "v-server", "Art/x.psd"]);
+    svn_cmd(&fx.wc2(), &["commit", "-m", "prop", "--non-interactive"]);
+}
+
+#[test]
+fn a_props_only_change_on_both_sides_is_listed() {
+    // PR #49 review 第三轮 #5（实测）：远端 `item="none" props="modified"`。§7.2 第 5 条
+    // 要用户确认的正是这种「git 管不到、update 会碰到」的文件——它会变成属性冲突
+    let fx = hybrid_with_colleague();
+    both_sides_set_a_property(&fx);
+    let p = preview_sync_in(&fx.wc_str()).unwrap();
+    assert_eq!(p.outside_changes, vec!["Art/x.psd".to_string()]);
+}
+
+#[test]
+fn an_existing_property_conflict_is_refused() {
+    // PR #49 review 第三轮 #4（实测）：属性冲突是 `item="normal" props="conflicted"`，
+    // 只看 item 与树冲突会把它放过去。同 A6：只更新 Art，避开 nodeRevs 那一条
+    let fx = hybrid_with_colleague();
+    both_sides_set_a_property(&fx);
+    svn_cmd(
+        &fx.wc(),
+        &["update", "--accept", "postpone", "--non-interactive", "Art"],
+    );
+    assert_eq!(
+        code_of(preview_sync_in(&fx.wc_str())),
+        "sync_in_svn_conflicted"
+    );
+}
+
 #[test]
 fn an_svn_conflict_anywhere_is_refused() {
     // A6。只更新 Art，让 Code 仍停在 r1——否则 nodeRevs 先报失同步，测不到这一条

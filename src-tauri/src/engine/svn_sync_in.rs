@@ -44,6 +44,9 @@ use std::path::Path;
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncInExpect {
+    /// 用户在确认框里看到的分支。只比 `orig_head` 不够：外部切到指向同一提交的
+    /// 另一条分支时 OID 不变，重放的却是另一条（PR #49 review 第三轮 #6）。
+    pub orig_branch: String,
     pub orig_head: String,
     pub baseline_oid: String,
     /// 用户在确认框里看过并同意的「白名单外会被碰到的文件」。
@@ -126,7 +129,10 @@ pub fn run_sync_in(repo: &str, expect: &SyncInExpect) -> Result<SyncInOutcome> {
 }
 
 fn verify_expect(p: &SyncInPreview, e: &SyncInExpect) -> Result<()> {
-    if p.orig_head != e.orig_head || p.baseline_oid != e.baseline_oid {
+    if p.orig_branch != e.orig_branch
+        || p.orig_head != e.orig_head
+        || p.baseline_oid != e.baseline_oid
+    {
         return Err(GitError::new(
             "sync_in_state_changed",
             "从你确认到现在，分支或基线被改动过（可能是别的 git 工具）。\
@@ -678,7 +684,7 @@ fn svn_conflicts(repo: &str) -> Result<Vec<String>> {
     Ok(parse_update_status(&xml)?
         .entries
         .into_iter()
-        .filter(|e| e.item == "conflicted" || e.tree_conflicted)
+        .filter(|e| e.is_conflicted())
         .map(|e| e.path)
         .collect())
 }
@@ -793,9 +799,15 @@ pub fn continue_sync(repo: &str) -> Result<SyncInOutcome> {
         }
         Phase::BaselineReady => from_baseline_ready(repo, &cfg, j),
         Phase::Rebase => continue_rebase(repo, &cfg, j),
-        // 往回走时停下的 `applying-stash`：收尾的是一次回退，不是更新（PR #49 review #3）
-        Phase::ApplyingStash if j.rolling_back => Ok(back_outcome(restore_step(repo, j)?)),
-        Phase::ApplyingStash => finish_forward(repo, j),
+        Phase::ApplyingStash => {
+            require_restore_target(repo, j)?;
+            if j.rolling_back {
+                // 往回走时停下的：收尾的是一次回退，不是更新（PR #49 review #3）
+                Ok(back_outcome(restore_step(repo, j)?))
+            } else {
+                finish_forward(repo, j)
+            }
+        }
         _ => Err(sync_out_unsupported()),
     }
 }
@@ -1088,20 +1100,53 @@ fn continue_rebase(repo: &str, cfg: &SvnConfig, j: &mut Journal) -> Result<SyncI
     finish_forward(repo, j)
 }
 
+/// `applying-stash` 停下之后锁是放开的：放回之前确认 HEAD 还是当初要放回的那个位置
+/// （PR #49 review 第三轮 #1）。
+///
+/// 撞名挡住时一个字节都没放回、工作区干净，用户可以随手切走；不查的话 WIP 会被合进
+/// 别的分支，接着 drop 掉备份、报成功。往前走要求原分支已落在新基线上（中间多了用户
+/// 自己的提交不要紧）；往回走要求原分支仍在更新前的位置。
+fn require_restore_target(repo: &str, j: &Journal) -> Result<()> {
+    let orig = need(&j.orig_branch, "origBranch")?;
+    if current_branch(repo)?.as_deref() != Some(orig.as_str()) {
+        return Err(state_changed(&format!("HEAD 不在原分支 `{orig}` 上")));
+    }
+    let ok = if j.rolling_back {
+        rev_parse(repo, "HEAD")? == need(&j.orig_head, "origHead")?
+    } else {
+        let base = rev_parse(repo, &format!("refs/heads/{BASELINE_BRANCH}"))?;
+        is_ancestor(repo, &base, "HEAD")?
+    };
+    if !ok {
+        return Err(state_changed(&format!("分支 `{orig}` 的位置变了")));
+    }
+    Ok(())
+}
+
 /// A14：冲突期间锁是放开的，先确认进行中的正是本次同步发起的 rebase。
+///
+/// 只比分支名不够（PR #49 review 第三轮 #2）：用户中止本次 rebase 后又在同一条分支上
+/// rebase 到别处，head-name 一模一样。本次的 rebase 由三样东西确定：重放的分支、
+/// 起点（S9 时 HEAD 就是 `origHead`）、目标（`svn/base`）。2026-09-26 实测
+/// `rebase-merge/` 下的 `orig-head` 与 `onto` 就是这两个完整 OID。
 fn require_our_rebase(repo: &str, j: &Journal) -> Result<()> {
-    let want = format!("refs/heads/{}", need(&j.orig_branch, "origBranch")?);
-    if rebase_head_name(repo)?.as_deref() != Some(want.as_str()) {
+    let want_head = format!("refs/heads/{}", need(&j.orig_branch, "origBranch")?);
+    let want_orig = need(&j.orig_head, "origHead")?;
+    let want_onto = rev_parse(repo, &format!("refs/heads/{BASELINE_BRANCH}"))?;
+    if rebase_state(repo, "head-name")?.as_deref() != Some(want_head.as_str())
+        || rebase_state(repo, "orig-head")?.as_deref() != Some(want_orig.as_str())
+        || rebase_state(repo, "onto")?.as_deref() != Some(want_onto.as_str())
+    {
         return Err(state_changed("进行中的 rebase 不是本次同步发起的那一个"));
     }
     Ok(())
 }
 
-/// `.git/rebase-merge/head-name`（或 `rebase-apply/`）：rebase 的目标分支。
-fn rebase_head_name(repo: &str) -> Result<Option<String>> {
+/// `.git/rebase-merge/<name>`（或 `rebase-apply/`）的内容。
+fn rebase_state(repo: &str, name: &str) -> Result<Option<String>> {
     let d = git_dir(repo)?;
     for sub in ["rebase-merge", "rebase-apply"] {
-        let p = d.join(sub).join("head-name");
+        let p = d.join(sub).join(name);
         if p.exists() {
             return Ok(Some(std::fs::read_to_string(p)?.trim().to_string()));
         }

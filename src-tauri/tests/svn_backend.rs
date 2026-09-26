@@ -709,8 +709,9 @@ fn sync_in_types_cross_ipc_in_camel_case() {
     }
 
     let e: SyncInExpect = serde_json::from_str(
-        r#"{"origHead":"h","baselineOid":"b","confirmedOutside":["Art/x.psd"]}"#,
+        r#"{"origBranch":"work","origHead":"h","baselineOid":"b","confirmedOutside":["Art/x.psd"]}"#,
     )
     .unwrap();
     assert_eq!(e.confirmed_outside, vec!["Art/x.psd".to_string()]);
+    assert_eq!(e.orig_branch, "work");
 }

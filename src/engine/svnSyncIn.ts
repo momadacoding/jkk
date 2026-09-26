@@ -22,6 +22,8 @@ export interface SyncInPreview {
 
 /** 后端 `svn_sync_in::SyncInExpect`。 */
 export interface SyncInExpect {
+  /** 确认框里看到的分支；锁内复核要比它（PR #49 review 第三轮 #6）。 */
+  origBranch: string
   origHead: string
   baselineOid: string
   confirmedOutside: string[]
@@ -60,6 +62,7 @@ export type SyncActionId = 'syncContinue' | 'syncAbort'
 /** 预览里的事实原样带回去做锁内复核（spec §7.2 第 7 条）。 */
 export function expectFromPreview(p: SyncInPreview): SyncInExpect {
   return {
+    origBranch: p.origBranch,
     origHead: p.origHead,
     baselineOid: p.baselineOid,
     confirmedOutside: [...p.outsideChanges],

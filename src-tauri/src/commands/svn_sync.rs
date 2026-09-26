@@ -3,7 +3,7 @@
 //! # 参数名的 snake_case ↔ camelCase 转换没有编译期检查
 //!
 //! JS 侧是 `invoke('svn_sync_in', { path, expect })`，`expect` 里是
-//! `{ origHead, baselineOid, confirmedOutside }`。`tests/svn_backend.rs` 钉着
+//! `{ origBranch, origHead, baselineOid, confirmedOutside }`。`tests/svn_backend.rs` 钉着
 //! 序列化形状；签名改动必须实跑一次 `pnpm tauri dev`（`AGENTS.md` §7.3）。
 
 use crate::commands::watch::WatchSuspension;

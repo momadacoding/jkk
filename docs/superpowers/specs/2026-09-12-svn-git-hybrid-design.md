@@ -3730,6 +3730,11 @@ A1–A17 全部实测或经用户决定，要点：
 - **PR #49 review 之后**（2026-09-26）：journal 增加 `leftOrig` 与 `rollingBack`（§7.6）；
   checkout 之后的核对也覆盖「该删却没删掉」的文件（同名未跟踪文件即使内容相同也会挡住之后的
   checkout，实测）；rebase 没有发生过时「继续」重新走 S9，放弃前确认进行中的 rebase 是本次发起的。
+- **PR #49 第三轮 review 之后**（2026-09-26）：§7.2 第 4 条的「SVN 冲突」与 S5 之后的冲突检查都包括
+  **属性冲突**（`props="conflicted"`，update 照样退出 0，实测）；§7.2 第 5 条的「服务器也会改」包括
+  **只改属性**（`repos-status props="modified" item="none"`，实测）；锁内复核另比分支名；
+  `applying-stash` 继续前复核当前分支与位置；认 rebase 另比 `onto` 与 `orig-head`；S10 撞名预检
+  把「祖先路径被非目录占着」算作撞名。
 
 ### 2026-09-25（十三）· 同步锁的存活判据从 pid 探测改为句柄探测
 

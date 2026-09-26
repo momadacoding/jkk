@@ -131,6 +131,14 @@ pub fn restore_wip(repo: &str, oid: &str) -> Result<RestoreOutcome> {
         let out = run_git(repo, &["ls-tree", "-r", "--name-only", "-z", untracked])?;
         let mut collisions = Vec::new();
         for p in out.split('\0').filter(|p| !p.is_empty()) {
+            // 祖先路径被非目录占着时，对 `p` 取元数据会报错，看起来像「不存在」——
+            // 但 git 建不出那一级目录，照样半套 apply（PR #49 review 第三轮 #3，实测）
+            if let Some(block) = blocking_ancestor(repo, p) {
+                if !collisions.contains(&block) {
+                    collisions.push(block);
+                }
+                continue;
+            }
             if Path::new(repo).join(p).symlink_metadata().is_err() {
                 continue;
             }
@@ -186,6 +194,22 @@ pub fn restore_wip(repo: &str, oid: &str) -> Result<RestoreOutcome> {
 /// 文件，每次接管都会停在 `StashBlocked`。
 ///
 /// 任何一处不同、HEAD 里没有它、或它不是普通文件，都按真撞名处理。
+/// `p`（正斜杠、相对仓库根）的某一级祖先在磁盘上存在却不是目录时，返回那一级。
+///
+/// 符号链接也算挡路：git 不会穿过它写文件。
+fn blocking_ancestor(repo: &str, p: &str) -> Option<String> {
+    let parts: Vec<&str> = p.split('/').collect();
+    for n in 1..parts.len() {
+        let prefix = parts[..n].join("/");
+        match Path::new(repo).join(&prefix).symlink_metadata() {
+            Ok(m) if m.is_dir() => continue,
+            Ok(_) => return Some(prefix),
+            Err(_) => return None, // 这一级不存在，更深的也不会有东西挡着
+        }
+    }
+    None
+}
+
 fn is_same_file_everywhere(repo: &str, untracked: &str, p: &str) -> Result<bool> {
     if !Path::new(repo).join(p).is_file() {
         return Ok(false);

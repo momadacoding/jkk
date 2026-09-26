@@ -209,6 +209,42 @@ fn restore_applies_and_drop_removes_only_ours() {
 }
 
 #[test]
+fn restore_refuses_when_a_parent_of_an_untracked_file_is_now_a_file() {
+    // PR #49 review 第三轮 #3（2026-09-26 实测）：stash 里有未跟踪的 `Code/Sub/u.cs`，
+    // 磁盘上 `Code/Sub` 却成了普通文件。对 `Code/Sub/u.cs` 取元数据会报错，原先被当成
+    // 「不存在」放行；随后 `stash apply` 先写已跟踪部分、再在 `cannot create directory`
+    // 上退出 1——正是 A3 要防的半套 apply
+    let fx = hybrid_with_colleague();
+    let root = fx.wc_str();
+    std::fs::write(fx.wc().join("Code/A.cs"), "a-wip\n").unwrap();
+    std::fs::create_dir(fx.wc().join("Code/Sub")).unwrap();
+    std::fs::write(fx.wc().join("Code/Sub/u.cs"), "mine\n").unwrap();
+    let mut j = journal("op-anc");
+    stash_wip(&root, &mut j, &wl()).unwrap();
+    let oid = j.stash_oid.clone().unwrap();
+    assert!(!fx.wc().join("Code/Sub").exists());
+    std::fs::write(fx.wc().join("Code/Sub"), "server\n").unwrap(); // 服务器新增了同名文件
+
+    let out = restore_wip(&root, &oid).unwrap();
+    assert_eq!(
+        out,
+        RestoreOutcome::Blocked {
+            collisions: vec!["Code/Sub".into()]
+        },
+        "指名挡路的那个文件：用户要挪走的是它"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.wc().join("Code/A.cs")).unwrap(),
+        "a1\n",
+        "一个字节都不能 apply"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.wc().join("Code/Sub")).unwrap(),
+        "server\n"
+    );
+}
+
+#[test]
 fn restore_refuses_when_an_untracked_file_would_collide() {
     // Review Focus 1 / A3：撞名时 git 会半套 apply，所以必须在 apply 之前拒绝
     let fx = hybrid_with_colleague();
