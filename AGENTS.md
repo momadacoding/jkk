@@ -353,6 +353,7 @@ libgit2 (读) / git CLI (写)
 - MUST：**所有涉及 git 写操作的测试必须自建临时 fixture 仓库**，参照 `src-tauri/tests/fixtures.rs`；禁止依赖本仓库自身、用户的仓库或任何仓库外的固定路径。测试结束必须清理临时目录。
 - MUST：测试命名必须与实际覆盖的场景一致。名为「覆盖 X」的测试若测的不是 X 的真实形态，属**虚假信心**，review 视为阻断问题。
 - SHOULD：纯函数逻辑优先在 `tests/vitest/` 里覆盖（快、稳定）；只有真正需要 git 行为的才放 Rust 集成测试。
+- SHOULD：组件的**状态与交互**缺陷（弹框状态串味、按钮禁用、键盘处理）用 React Testing Library 写组件测试：文件名 `<组件名>.test.tsx`，文件头写 `// @vitest-environment jsdom`，全局环境仍是 node。jsdom 不渲染布局，**不能**替代 §6.1 要求的视觉验证。范例见 `tests/vitest/ConfirmDialog.test.tsx`。
 - SHOULD：跨平台路径行为（Windows 反斜杠、盘符、大小写不敏感）是本项目的高发缺陷区，涉及 `src/engine/path*.ts` 与 Rust 路径处理的改动应显式覆盖 Windows 形态的输入。
 
 ## 9. 文档规则

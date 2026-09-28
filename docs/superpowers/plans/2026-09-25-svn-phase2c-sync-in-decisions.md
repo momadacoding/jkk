@@ -686,6 +686,9 @@
 - **现象**（用户截图）：rebase 冲突后弹出的「更新遇到冲突」框里有转圈的「处理中…」，确认按钮是禁用的 `…`，没有清单写的「知道了」；Esc、点遮罩都关不掉。
 - **根因**：`useConfirm` 渲染 `<Dialog>` 不带 key。「更新」确认框的 `action` 跑完调 `finish(true)`（`setPending(null)`），`handleSvnUpdate` 紧接着 `showOutcome` 弹结局框（`setPending(下一个)`）；两次更新被 React 18 合并成一次渲染，`<Dialog>` 从未卸载，上一个框的 `busy=true` 被带进新框（`finish` 不复位 `busy`，它原本假设关框即卸载）。同一形状出现在所有「带 action 的框之后紧跟另一个 `confirm`」的地方：继续 / 放弃之后的结局框也中招。
 - **修法**：`Pending` 带自增 `id`，`<Dialog key={pending.id}>`，每个请求都是全新组件。
-- **测试**：仓库没有组件测试设施（vitest `environment: 'node'`，无 jsdom / testing-library），新增依赖须用户确认，故本条**没有自动化回归测试**，以真实窗口复测为准。`pnpm build` 通过 / `pnpm test` 435 passed。
+- **测试**：修复时仓库没有组件测试设施，先以真实窗口复测为准；随后经用户同意新增 devDependencies `@testing-library/react` 16.3.3、`@testing-library/dom` 10.4.2（前者的 peer）、`jsdom` 30.1.1，补了 `tests/vitest/ConfirmDialog.test.tsx` 4 条。只有这个文件用 `// @vitest-environment jsdom`，全局环境仍是 node，既有测试不受影响。
+  - 回归两条（照 `RepoTab` 的真实形状：带 action 的框跑完后立刻 `await confirm` 弹结局框）：新框的「知道了」可点、没有「处理中」；新框能用 Esc 关掉。**变异确认**：去掉 `key` 后这两条都红（`findByRole('知道了')` 超时——按钮文字是 `…`），恢复后全绿。
+  - 另两条钉住既有行为：action 进行中进度与禁用；action 抛错时留在原地、按钮恢复。
+  - `pnpm build` 通过 / `pnpm test` 28 个文件 439 passed。`AGENTS.md` §8、`CLAUDE.md` 补了组件测试的写法与界限（jsdom 不渲染布局，不替代 §6.1 的视觉验证）。
 - **E2E 清单不用改**：清单写的「点『知道了』」是对的行为，错的是实现。
 
