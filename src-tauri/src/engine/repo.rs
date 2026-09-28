@@ -30,3 +30,25 @@ pub fn open(path: &str) -> Result<RepoInfo> {
         head_hash,
     })
 }
+
+/// 仓库是否停在某个需要用户收尾的操作中间（前端据此显示顶部横幅）。
+///
+/// 交给 libgit2 判断而不是自己拼 `<path>/.git/MERGE_HEAD`：linked worktree 里
+/// `.git` 是个文件，状态文件在 `<主仓库>/.git/worktrees/<name>/` 下，
+/// 手工拼路径在 worktree 里永远判成 normal。
+pub fn state(path: &str) -> Result<&'static str> {
+    use git2::RepositoryState as S;
+    let repo = Repository::open(path)?;
+    Ok(match repo.state() {
+        S::Merge => "merge",
+        S::Rebase
+        | S::RebaseInteractive
+        | S::RebaseMerge
+        | S::ApplyMailbox
+        | S::ApplyMailboxOrRebase => "rebase",
+        S::CherryPick | S::CherryPickSequence => "cherry-pick",
+        S::Revert | S::RevertSequence => "revert",
+        // bisect 不会留下冲突文件，也不挡提交，不值得占一条横幅
+        S::Clean | S::Bisect => "normal",
+    })
+}

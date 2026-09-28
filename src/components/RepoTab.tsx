@@ -27,6 +27,7 @@ import { MIGRATE_EOL_WARNING } from '../engine/svnSync'
 import { samePath } from '../engine/path'
 import { isBaselineBranch, visibleSections } from '../engine/capabilities'
 import { askConfirm } from '../engine/confirm'
+import { countConflicts, repoStateBanner } from '../engine/conflicts'
 import { usePrompt } from './PromptDialog'
 import { useConfirm } from './ConfirmDialog'
 import { save } from '@tauri-apps/plugin-dialog'
@@ -622,10 +623,11 @@ export function RepoTab({
   // 别的工具在项目根跑递归 update 会把这些目录退回被钉住的 revision，
   // 而工作副本看起来是干净的。只在向导里显示一次不算常驻。
   const pinnedNotice = describePinned(state.pinned)
+  const stateBanner = repoStateBanner(repoState, countConflicts(state.status.unstaged))
 
   return (
     <div className="repo-tab">
-      {repoState !== 'normal' && <div className="banner-state">{repoState} in progress</div>}
+      {stateBanner && <div className="banner-state">{stateBanner}</div>}
       {pinnedNotice && (
         <div className="banner-pinned">
           <strong>{pinnedNotice.title}</strong>
