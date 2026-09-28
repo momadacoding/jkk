@@ -27,6 +27,7 @@ import { MIGRATE_EOL_WARNING } from '../engine/svnSync'
 import { samePath } from '../engine/path'
 import { isBaselineBranch, visibleSections } from '../engine/capabilities'
 import { askConfirm } from '../engine/confirm'
+import { countConflicts, repoStateBanner } from '../engine/conflicts'
 import { usePrompt } from './PromptDialog'
 import { useConfirm } from './ConfirmDialog'
 import { save } from '@tauri-apps/plugin-dialog'
@@ -160,8 +161,11 @@ export function RepoTab({
   useEffect(() => {
     const path = state.path
     if (!path) return
+    // 换仓库时先清掉上一个仓库的状态；之后单次读取失败则保留上一次读到的值
+    // ——文件事件密集时 Repository::open 偶发失败，不能让进行中的 merge 横幅凭空消失
+    setRepoState('normal')
     const read = () => {
-      void invoke<string>('repo_state', { path }).then(setRepoState).catch(() => setRepoState('normal'))
+      void invoke<string>('repo_state', { path }).then(setRepoState).catch(() => {})
     }
     read()
     let unlisten: (() => void) | undefined
@@ -622,10 +626,11 @@ export function RepoTab({
   // 别的工具在项目根跑递归 update 会把这些目录退回被钉住的 revision，
   // 而工作副本看起来是干净的。只在向导里显示一次不算常驻。
   const pinnedNotice = describePinned(state.pinned)
+  const stateBanner = repoStateBanner(repoState, countConflicts(state.status.unstaged))
 
   return (
     <div className="repo-tab">
-      {repoState !== 'normal' && <div className="banner-state">{repoState} in progress</div>}
+      {stateBanner && <div className="banner-state">{stateBanner}</div>}
       {pinnedNotice && (
         <div className="banner-pinned">
           <strong>{pinnedNotice.title}</strong>

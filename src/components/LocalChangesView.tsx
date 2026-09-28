@@ -11,6 +11,7 @@ import {
 } from '../engine/fileSelection'
 import { commitKeyAction, type CommitField } from '../engine/commitKeys'
 import { buildCommitMessage } from '../engine/commitActions'
+import { conflictsFirst } from '../engine/conflicts'
 
 interface FileSectionProps {
   title: string
@@ -65,6 +66,10 @@ function FileSectionList({
             >
               {actionLabel}
             </button>
+            {/* 只给冲突行加角标：普通改动看所在分区就够了，冲突却和它们混在 Unstaged 里 */}
+            {f.status === 'conflicted' && (
+              <span className="ft-badge conflicted" title="有冲突，处理完再 Stage">!</span>
+            )}
             <span className="changes-file-path">{f.path}</span>
             <span className="changes-file-stats">+{f.additions}/-{f.deletions}</span>
           </div>
@@ -107,7 +112,8 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
   const descriptionRef = useRef<HTMLTextAreaElement>(null)
   const { menu, open, close } = useContextMenu()
 
-  const allFiles = useMemo(() => [...status.unstaged, ...status.staged], [status])
+  const unstaged = useMemo(() => conflictsFirst(status.unstaged), [status.unstaged])
+  const allFiles = useMemo(() => [...unstaged, ...status.staged], [unstaged, status.staged])
   // diff 面板显示最后点到的那一个；多选时看的是其中一个，不是拼在一起
   const activeFile = selection.paths[selection.paths.length - 1] ?? allFiles[0]?.path ?? null
   const activeDiff: DiffData = useMemo(() => ({
@@ -191,7 +197,7 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
                 <FileSectionList
                   title="Unstaged"
                   section="unstaged"
-                  files={status.unstaged}
+                  files={unstaged}
                   actionLabel="Stage"
                   selection={selection}
                   activePath={activeFile}
