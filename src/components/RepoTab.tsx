@@ -161,8 +161,11 @@ export function RepoTab({
   useEffect(() => {
     const path = state.path
     if (!path) return
+    // 换仓库时先清掉上一个仓库的状态；之后单次读取失败则保留上一次读到的值
+    // ——文件事件密集时 Repository::open 偶发失败，不能让进行中的 merge 横幅凭空消失
+    setRepoState('normal')
     const read = () => {
-      void invoke<string>('repo_state', { path }).then(setRepoState).catch(() => setRepoState('normal'))
+      void invoke<string>('repo_state', { path }).then(setRepoState).catch(() => {})
     }
     read()
     let unlisten: (() => void) | undefined
