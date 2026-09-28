@@ -679,3 +679,13 @@
 - `Kept` 比原来**少做**一件事（不 drop），stash 条目与对象都还在；钉住的 ref 删掉后，stash reflog 仍让对象可达。
 - `refuse_while_unfinished` 只读 journal；journal 坏了按现有语义往上抛 `svn_journal_corrupt`，不吞成「没有记录」。
 
+## 真实窗口 E2E 发现（2026-09-28）
+
+### 场景 2：结局框卡在「处理中…」
+
+- **现象**（用户截图）：rebase 冲突后弹出的「更新遇到冲突」框里有转圈的「处理中…」，确认按钮是禁用的 `…`，没有清单写的「知道了」；Esc、点遮罩都关不掉。
+- **根因**：`useConfirm` 渲染 `<Dialog>` 不带 key。「更新」确认框的 `action` 跑完调 `finish(true)`（`setPending(null)`），`handleSvnUpdate` 紧接着 `showOutcome` 弹结局框（`setPending(下一个)`）；两次更新被 React 18 合并成一次渲染，`<Dialog>` 从未卸载，上一个框的 `busy=true` 被带进新框（`finish` 不复位 `busy`，它原本假设关框即卸载）。同一形状出现在所有「带 action 的框之后紧跟另一个 `confirm`」的地方：继续 / 放弃之后的结局框也中招。
+- **修法**：`Pending` 带自增 `id`，`<Dialog key={pending.id}>`，每个请求都是全新组件。
+- **测试**：仓库没有组件测试设施（vitest `environment: 'node'`，无 jsdom / testing-library），新增依赖须用户确认，故本条**没有自动化回归测试**，以真实窗口复测为准。`pnpm build` 通过 / `pnpm test` 435 passed。
+- **E2E 清单不用改**：清单写的「点『知道了』」是对的行为，错的是实现。
+
