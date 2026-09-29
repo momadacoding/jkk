@@ -5,6 +5,7 @@
  * 纯逻辑，无 React 依赖（`AGENTS.md` §7.2）。
  */
 import type { BannerModel } from './svnSync'
+import { syncActions } from './svnSyncIn'
 
 /** 后端 `svn_lock::LockHolder`。**只用于显示**，不是存活判据。 */
 export interface LockHolder {
@@ -29,12 +30,18 @@ export type SyncPhase =
   | 'capturing-baseline'
   | 'publishing-baseline'
   | 'baseline-ready'
+  | 'applying-stash'
 
 export interface UnfinishedSync {
   flow: 'sync_in' | 'sync_out'
   phase: SyncPhase
   opid: string
   startedAt: number
+  /**
+   * `applying-stash` 是回退 / 放弃途中停下的（分支在更新前的位置）。后端总会发；
+   * 缺省按「往前走」处理。
+   */
+  rollingBack?: boolean
 }
 
 export interface SyncState {
@@ -73,11 +80,30 @@ const PHASE_DETAIL: Record<SyncPhase, string> = {
   rebase:
     '停在 git 自己的 rebase 冲突态上。冲突文件可以在「本地改动」里看到，' +
     '这部分状态由 git 自己记着，没有丢失风险。',
+  'applying-stash':
+    '基线已经更新，正在把未提交的改动放回来。如果提示冲突或有同名文件，处理好之后点继续；改动的备份一直在 stash 里。',
 }
 
-const NOTE_NEXT_PHASE =
-  '本期只能告诉你停在哪里；「继续」与「放弃」两个入口随更新流程一起到来。' +
-  '在那之前请不要手工去动 stash 或分支指针——记录还在，等入口到了就能接着走。'
+/**
+ * 回退 / 放弃途中停在 `applying-stash`：基线（对这条分支）没有推进，
+ * 不能沿用上面那句「基线已经更新」（PR #49 review #3）。
+ */
+const APPLYING_STASH_BACK =
+  '这次更新已经退回，分支回到了更新前的位置，正在把未提交的改动放回来。' +
+  '如果提示冲突或有同名文件，处理好之后点继续；改动的备份一直在 stash 里。'
+
+const NOTE_SYNC_IN =
+  '点「继续」从中断的地方接着走；点「放弃」回到更新前。两者都不会丢掉你的提交和未提交的改动。'
+const NOTE_SYNC_OUT =
+  '这条记录是交付流程留下的，恢复入口在后续版本提供。在那之前请不要手工去动 stash 或分支指针。'
+
+/** 「已经持续多久」。与后端 `svn_lock::describe_age` 同一套说法。 */
+export function sinceText(startedAt: number, nowSecs: number): string {
+  const secs = Math.max(0, nowSecs - startedAt)
+  if (secs < 60) return '刚刚开始'
+  if (secs < 3600) return `已持续 ${Math.floor(secs / 60)} 分钟`
+  return `已持续 ${Math.floor(secs / 3600)} 小时`
+}
 
 /**
  * `null`（还没读到）与「干净」都不挂横幅。
@@ -86,6 +112,7 @@ const NOTE_NEXT_PHASE =
  */
 export function describeUnfinishedSync(
   s: SyncState | SyncStateUnreadable | null,
+  nowSecs: number = Math.floor(Date.now() / 1000),
 ): BannerModel | null {
   if (!s) return null
 
@@ -107,7 +134,7 @@ export function describeUnfinishedSync(
   // 说反了会引导用户去「放弃」一次正在正常跑的同步。
   if (s.locked) {
     const who = s.holder
-      ? `持有者是进程 ${s.holder.pid}。`
+      ? `持有者是进程 ${s.holder.pid}，${sinceText(s.holder.startedAt, nowSecs)}。`
       : '还读不到持有它的进程信息（它可能刚刚开始）。'
     return {
       tone: 'warn',
@@ -125,18 +152,20 @@ export function describeUnfinishedSync(
   // 认不出的 phase 必须有话说。后端的 `Phase` 枚举比这里的联合类型宽
   // （含 `sync_out` 的全部阶段），而 `PHASE_DETAIL[未知]` 是 `undefined`
   // ——那会渲染出一条只有标题、没有正文的红条，比说「我不认识」更糟。
+  const back = s.unfinished.phase === 'applying-stash' && s.unfinished.rollingBack === true
   const detail =
-    PHASE_DETAIL[s.unfinished.phase] ??
+    (back ? APPLYING_STASH_BACK : PHASE_DETAIL[s.unfinished.phase]) ??
     `流程停在「${s.unfinished.phase}」这一步，这个版本的界面还不认识它` +
       '（多半是更新之后留下的记录）。请不要手工去动 stash 或分支指针，' +
       '记录都还在。'
 
+  const isSyncIn = s.unfinished.flow === 'sync_in'
   return {
     tone: 'danger',
     title: '上次同步没有正常结束',
     detail,
-    actions: [],
-    note: NOTE_NEXT_PHASE,
+    actions: isSyncIn ? syncActions(s.unfinished.phase) : [],
+    note: isSyncIn ? NOTE_SYNC_IN : NOTE_SYNC_OUT,
   }
 }
 

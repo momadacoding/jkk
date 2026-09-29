@@ -1531,6 +1531,9 @@ SVN 树冲突，以及未受 git 保护文件的 update 冲突，仍按 §13 单
 
 1. 不在 rebase / merge 中途
 2. 基线未失同步（走 §6.6.3 的**完整 `nodeRevs` 校验**，不是 O(1) 那档）
+
+   > 2026-09-25（Phase 2c，用户决定）：`nodeRevs` 单值且**大于** `baselineRev`（外部在项目根整体 update 过）不再拒绝，由执行时先重建基线再更新，见 §18「十四」。其余失同步照旧拒绝。
+
 3. 当前不在 `svn/base` 上，且 **HEAD 必须附着在分支上**（detached HEAD 拒绝，见 §8.1.1）
 4. `svn status` 里 W-file 外没有冲突态文件（`C`），包含 W-path 内被扩展名排除的文件
 5. **本次 update 会触及的 W-file 外文件若有本地修改（`M` / `!`），列出来并要求用户确认**——见下
@@ -1566,19 +1569,29 @@ S1   工作区不干净时：
      ⑤ OID 写进 journal，phase=stashed                     ← 不记 stash@{0}，见 §7.6.1
 S2   （origBranch 已在 S0 落盘，此处只推进 phase）
 S3   git checkout svn/base
+     ⚠️ checkout 之后核对切干净了：文件被以 share=Read 打开（Unity）时 checkout 会
+        退出 0 却没把它写进去（2026-09-25 实测）
 S4   svn status --xml 扫描后只校验 W-file 应为 0 修改        ← 不把已确认保留的差集修改当作失同步
 S5   svn update --accept postpone                        ← 在项目根递归跑，
                                                               连带更新所有 external
      **仅当**检测到白名单所属 external 被 `-r` 钉住时，改走 §6.5.3 的两步形式。
      默认不走两步，理由见 §6.5.4
+     ⚠️ 成败不看退出码：有文本冲突或树冲突时 svn update 仍然退出 0（2026-09-25
+        实测），必须事后 svn status --xml 查 item="conflicted" 或 tree-conflicted="true"
 S6   svn info --xml + svn status -v --xml 读新 revision
 S7   临时索引纳入集合核对 → 用通过核对的 TREE 录制新基线   ← §6.3.1；失败保留旧基线和 journal
      按 §7.6 写入录制 / 发布阶段；完成索引对齐后才进入 S8
 S8   git checkout ORIG_BRANCH
+     ⚠️ checkout 之后核对切干净了：文件被以 share=Read 打开（Unity）时 checkout 会
+        退出 0 却没把它写进去（2026-09-25 实测）
 S9   复核 §7.3.2 的待重放区间，再 git rebase --empty=drop svn/base
                                                          ← 普通内容冲突在这里处理，无 merge-tree 前置
 S10  git stash apply <OID>（若 S1 有 stash），成功后
      git stash drop 对应条目 + 删掉 refs/mygitclient/sync/<opid>
+     ⚠️ apply 之前先查 stash 里的未跟踪文件在磁盘上有没有同名的，有就一个字节
+        都不 apply（2026-09-25 实测：撞名时 git 会先写已跟踪部分再失败，半套 apply）。
+        例外：磁盘、stash、HEAD 三处是同一个 blob 的，是同一个文件，先从磁盘拿掉
+        再 apply（外部 update 带来的服务器新增文件就是这个形状）
 S11  删除 journal；恢复 watcher + 主动发 repo-changed
 ```
 
@@ -1891,12 +1904,17 @@ rebase 预检使用的目标 OID 与 `origHead` 同样落盘，禁止用可能�
 | `publishing-baseline` | TREE 已核对；新基线 commit 可能已创建或已发布，工作分支尚未恢复 | 比对 journal 的新旧 OID 判定发布状态，按 §8.2.2 继续；不重新提交 SVN、不覆盖外部推进的基线 |
 | `restoring-branch` | 基线已发布且索引已对齐；D8d 可能已切回原分支、正在 rebase 或已完成 | 按 HEAD、原分支 OID 与 Git 的 rebase 状态继续 D8d 或进入 D10；不得回到 D6 / D8c 覆盖冲突 |
 
-`sync_in` 另有两个 phase 与 stash 相关，见 §7.3.1：
+`sync_in` 另有三个 phase 与 stash 相关，见 §7.3.1：
 
 | phase | 已经发生了什么 | 放弃时怎么收尾 |
 |---|---|---|
 | `stashing` | `stashRefBefore` 已落盘，`git stash push` 可能落地也可能没有 | 比对当前 `refs/stash` 与 `stashRefBefore` 判定，**不静默 apply** |
 | `stashed` | stash 已落地且 OID 已钉住 | 按 `stashOid` 恢复 |
+| `applying-stash` | S9 已完成（或回退 / 放弃已回到原分支），正在或已经执行 S10 的 `git stash apply <OID>`；`stashApplied` 为真表示 apply 已执行（成功或留下冲突）；`rollingBack` 为真表示这是往回走途中停下的 | `stashApplied` 为假：可再次 apply（先查未跟踪文件撞名），干净 apply 完才 drop；为真：**不再 apply，也不 drop**——磁盘上的 WIP 经过了人手，证明不了还完整，只删 journal 与钉住的 ref，stash 条目留给用户（结局 `settled`）。继续前复核 HEAD 在原分支上、且（往前走时）落在本次发布的基线上。放弃时只删 journal 与钉住的 ref，stash 条目原样保留给用户。`rollingBack` 为真时「继续」的结局是「已放弃」而不是「已更新」，横幅与放弃文案都说分支在更新前的位置 |
+
+`sync_in` 的 journal 另有字段 `leftOrig`：S3 的 checkout **之前**置真，表示 HEAD 可能离开过原分支。
+没有可压的改动时 phase 一路停在 `stashed` 走过 S3–S5，只有它能区分「回退留下了 checkout 残留」与
+「push 从未落地、WIP 还在磁盘上」。
 
 S7 与恢复⑥另共用以下录制阶段，以 `flow` 及 `captureReturnStep` 区分后续入口：
 
@@ -3692,6 +3710,35 @@ fixture，白名单 `Code/`，四种脏各一例）：
 误导性的错误上。
 
 ## 18. 修订记录
+
+### 2026-09-25（十四）· Phase 2c 施工：`sync_in` 的实测补足
+
+计划 `docs/superpowers/plans/2026-09-25-svn-phase2c-sync-in.md` 的「对 spec 的补足与偏离」
+A1–A17 全部实测或经用户决定，要点：
+
+- **pinned 模式下 `sync_in` 本期拒绝**（用户决定），§6.5.3 两步 update 推迟；
+- **新增 phase `applying-stash` 与字段 `stashApplied`**，补上 S9 与 S10 之间的崩溃窗口（§7.6 表已更新）；
+- **S10 apply 前先查未跟踪文件撞名**：撞名时 git 会半套 apply；
+- **S5 成败不看退出码**：冲突时 svn update 退出 0；
+- **S5 之后的「放弃」**：先断言 W-file 在 svn 看来干净，再 `checkout -f` 回原分支（用户决定）；
+- **每次 checkout 之后核对**：Unity 式占用下 checkout 退出 0 却没写进文件；
+- **外部整体 update 由「更新」接管**（用户决定，偏离 §7.2 第 2 条）：`nodeRevs` 单值且大于基线时，
+  锁内先跑 §16 的重建基线、再走 S0–S11，服务器改动与本地改动重新分开；mixed-revision 与
+  「退回基线之前」仍拒绝。失同步横幅对这种状态降为黄色并给「更新…」入口；
+- **撞名预检放宽**：磁盘、stash、HEAD 三处同一个 blob 的不算撞名（外部 update 带来的服务器
+  新增文件就是这个形状）。
+- **PR #49 review 之后**（2026-09-26）：journal 增加 `leftOrig` 与 `rollingBack`（§7.6）；
+  checkout 之后的核对也覆盖「该删却没删掉」的文件（同名未跟踪文件即使内容相同也会挡住之后的
+  checkout，实测）；rebase 没有发生过时「继续」重新走 S9，放弃前确认进行中的 rebase 是本次发起的。
+- **PR #49 第三轮 review 之后**（2026-09-26）：§7.2 第 4 条的「SVN 冲突」与 S5 之后的冲突检查都包括
+  **属性冲突**（`props="conflicted"`，update 照样退出 0，实测）；§7.2 第 5 条的「服务器也会改」包括
+  **只改属性**（`repos-status props="modified" item="none"`，实测）；锁内复核另比分支名；
+  `applying-stash` 继续前复核当前分支与位置；认 rebase 另比 `onto` 与 `orig-head`；S10 撞名预检
+  把「祖先路径被非目录占着」算作撞名。
+- **PR #49 第四轮 review 之后**（2026-09-27）：S8 之后以 journal 里本次发布的 `newBaselineOid` 为准
+  （重放目标、认 rebase 的 `onto`、放回前复核），`svn/base` 被挪过就停下；未收尾时后端拒绝重建基线 /
+  行尾迁移（原先只看锁）；**偏离 §13 S10「解决后 drop」**：放回时停下过的，继续收尾时 stash 备份
+  留给用户、不 drop——实测冲突后外部 `reset --hard` 会让 WIP 消失而所有复核照样通过。
 
 ### 2026-09-25（十三）· 同步锁的存活判据从 pid 探测改为句柄探测
 

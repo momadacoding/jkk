@@ -2,7 +2,7 @@ use crate::engine::path::normalize;
 use crate::engine::svn_lock;
 use crate::error::{GitError, Result};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
@@ -33,10 +33,16 @@ fn lock_err() -> GitError {
 ///
 /// 用「挂起」而不是「停掉再重建」：停掉会丢掉引用计数（多个标签页共用一条线程），
 /// 重建还要重新遍历目录树。
-static SUSPENDED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+///
+/// # 必须计数，不能是集合
+///
+/// 同一仓库可以开在两个标签页里。A 的更新正在跑时 B 点了「继续」，B 的命令也会
+/// 挂起、然后因拿不到锁很快返回——集合的话 B 的恢复会把 A 的挂起一起撤掉
+/// （2c 独立 review I2）。计数到 0 才算恢复。
+static SUSPENDED: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
 
-fn suspended() -> &'static Mutex<HashSet<String>> {
-    SUSPENDED.get_or_init(|| Mutex::new(HashSet::new()))
+fn suspended() -> &'static Mutex<HashMap<String, usize>> {
+    SUSPENDED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// 挂起某个仓库的刷新事件。**同步流程开始时调**（spec §5.2）。
@@ -45,7 +51,7 @@ fn suspended() -> &'static Mutex<HashSet<String>> {
 /// 会把整个同步流程带走。
 pub fn suspend_watch(path: &str) {
     if let Ok(mut s) = suspended().lock() {
-        s.insert(normalize(path));
+        *s.entry(normalize(path)).or_insert(0) += 1;
     }
 }
 
@@ -53,15 +59,50 @@ pub fn suspend_watch(path: &str) {
 /// 否则挂起期间攒下的那一大批改动没有任何事件去告诉前端。
 pub fn resume_watch(path: &str) {
     if let Ok(mut s) = suspended().lock() {
-        s.remove(&normalize(path));
+        let key = normalize(path);
+        // 没挂起过的恢复是无害的空操作：失败路径可能在挂起之前就走到这里
+        if let Some(n) = s.get_mut(&key) {
+            *n -= 1;
+            if *n == 0 {
+                s.remove(&key);
+            }
+        }
     }
 }
 
 pub fn is_watch_suspended(path: &str) -> bool {
     suspended()
         .lock()
-        .map(|s| s.contains(&normalize(path)))
+        .map(|s| s.contains_key(&normalize(path)))
         .unwrap_or(false)
+}
+
+/// 挂起监听的 RAII 守卫（spec §5.2，2b 独立 review N3）。
+///
+/// 构造即挂起，Drop 即恢复。**不要**在同步流程里手写成对的
+/// `suspend_watch` / `resume_watch`：中间任何一个 `?` 早退或 panic 都会让
+/// watcher 永远停着——之后外部的每一次改动界面都看不见，而且没有任何报错。
+///
+/// 恢复之后「主动发一次 `repo-changed`」不在这里做：那要 `AppHandle`，而
+/// engine 层与测试都拿不到它。由命令层在守卫 drop 之后补发，见
+/// `commands/svn_sync.rs`。
+pub struct WatchSuspension {
+    path: String,
+}
+
+impl WatchSuspension {
+    pub fn new(path: &str) -> Self {
+        suspend_watch(path);
+        Self {
+            path: path.to_string(),
+        }
+    }
+}
+
+impl Drop for WatchSuspension {
+    fn drop(&mut self) {
+        resume_watch(&self.path);
+    }
 }
 
 /// 变更静默这么久之后才发一次 `repo-changed`（尾沿去抖）。

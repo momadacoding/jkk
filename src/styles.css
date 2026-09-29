@@ -665,6 +665,8 @@ body {
 
 .dialog-message {
   color: #bbb;
+  /* 更新流程的说明与结局提示按行列文件清单（svnSyncIn.ts 的 listFiles） */
+  white-space: pre-wrap;
 }
 
 .dialog input {

@@ -1151,3 +1151,149 @@ pub fn make_junction(link: &Path, target: &Path) -> bool {
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
+
+/// Phase 2c 用：已初始化的混合仓库 wc1（白名单 `Code/`、扩展名 `.cs`，停在
+/// `work` 分支）+ 扮演同事的 wc2。
+///
+/// 仓库 r1：`Code/A.cs`、`Code/B.cs`，以及白名单外的美术文件 `Art/x.psd`
+/// （§7.2 第 5 条要它：git 不管、update 会碰到的文件）。
+pub fn hybrid_with_colleague() -> SvnFixture {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    run(&root, "svnadmin", &["create", "repo"]);
+    let url = file_url(&root.join("repo"));
+    run(
+        &root,
+        "svn",
+        &["checkout", &url, "wc1", "--non-interactive"],
+    );
+    let wc = root.join("wc1");
+    std::fs::create_dir_all(wc.join("Code")).unwrap();
+    std::fs::create_dir_all(wc.join("Art")).unwrap();
+    std::fs::write(wc.join("Code/A.cs"), "a1\n").unwrap();
+    std::fs::write(wc.join("Code/B.cs"), "b1\n").unwrap();
+    std::fs::write(wc.join("Art/x.psd"), "psd1\n").unwrap();
+    run(&wc, "svn", &["add", "Code", "Art", "--non-interactive"]);
+    run(&wc, "svn", &["commit", "-m", "r1", "--non-interactive"]);
+    run(&wc, "svn", &["update", "--non-interactive"]);
+    run(
+        &root,
+        "svn",
+        &["checkout", &url, "wc2", "--non-interactive"],
+    );
+    app_lib::engine::svn_init::init_hybrid(&app_lib::engine::svn_init::InitRequest {
+        repo_root: wc.to_string_lossy().to_string(),
+        whitelist: vec!["Code/".to_string()],
+        extensions: vec![".cs".to_string()],
+    })
+    .expect("fixture：初始化混合仓库失败");
+    SvnFixture { dir }
+}
+
+impl SvnFixture {
+    /// 同事的工作副本。只有 [`hybrid_with_colleague`] 建它。
+    pub fn wc2(&self) -> PathBuf {
+        self.dir.path().join("wc2")
+    }
+
+    /// 同事在 wc2 里改（或新建）一个文件并提交——「服务器上有新提交」。
+    pub fn colleague_commits(&self, rel: &str, content: &str) {
+        let wc2 = self.wc2();
+        run(&wc2, "svn", &["update", "--non-interactive"]);
+        let p = wc2.join(rel);
+        let is_new = !p.exists();
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&p, content).unwrap();
+        if is_new {
+            run(&wc2, "svn", &["add", "--parents", rel, "--non-interactive"]);
+        }
+        run(
+            &wc2,
+            "svn",
+            &[
+                "commit",
+                "-m",
+                &format!("colleague {rel}"),
+                "--non-interactive",
+            ],
+        );
+    }
+}
+
+/// 必测 #49 / spec §16.0 的真实形态：白名单落在**同仓库**的 external 里。
+///
+/// 仓库布局：`code-trunk/A.cs`、`proj/Art/x.psd`；`proj` 上挂 `^/code-trunk code`
+/// （**不钉 revision**）。wc1 是 `proj` 的检出，`wc1/code` 是 external；wc2 是
+/// `code-trunk` 的检出，扮演直接在代码目录里提交的同事。
+pub fn hybrid_whitelist_in_external() -> SvnFixture {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    run(&root, "svnadmin", &["create", "repo"]);
+    let url = file_url(&root.join("repo"));
+    run(
+        &root,
+        "svn",
+        &["checkout", &url, "seed", "--non-interactive"],
+    );
+    let seed = root.join("seed");
+    std::fs::create_dir_all(seed.join("code-trunk")).unwrap();
+    std::fs::create_dir_all(seed.join("proj/Art")).unwrap();
+    std::fs::write(seed.join("code-trunk/A.cs"), "a1\n").unwrap();
+    std::fs::write(seed.join("proj/Art/x.psd"), "psd1\n").unwrap();
+    run(
+        &seed,
+        "svn",
+        &["add", "code-trunk", "proj", "--non-interactive"],
+    );
+    run(&seed, "svn", &["commit", "-m", "r1", "--non-interactive"]);
+    // 属性值走 -F 文件：命令行传值遇到混合行尾会让 propset 报 E135000 而属性
+    // 静默没设上（见 svn_repo_pinned_external_updated_to_head 的注释）
+    let ext = root.join("externals.txt");
+    std::fs::write(&ext, "^/code-trunk code\n").unwrap();
+    run(
+        &seed,
+        "svn",
+        &[
+            "propset",
+            "svn:externals",
+            "-F",
+            ext.to_str().unwrap(),
+            "proj",
+            "--non-interactive",
+        ],
+    );
+    run(
+        &seed,
+        "svn",
+        &["commit", "-m", "r2 external", "--non-interactive"],
+    );
+    run(
+        &root,
+        "svn",
+        &[
+            "checkout",
+            &format!("{url}/proj"),
+            "wc1",
+            "--non-interactive",
+        ],
+    );
+    run(
+        &root,
+        "svn",
+        &[
+            "checkout",
+            &format!("{url}/code-trunk"),
+            "wc2",
+            "--non-interactive",
+        ],
+    );
+    app_lib::engine::svn_init::init_hybrid(&app_lib::engine::svn_init::InitRequest {
+        repo_root: root.join("wc1").to_string_lossy().to_string(),
+        whitelist: vec!["code/".to_string()],
+        extensions: vec![".cs".to_string()],
+    })
+    .expect("fixture：在 external 形态上初始化混合仓库失败");
+    SvnFixture { dir }
+}

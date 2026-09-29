@@ -72,3 +72,13 @@ export function planToolbarAction(
       }
   }
 }
+
+/**
+ * 「更新」（sync_in）按钮只在 SVN 混合仓库上出现。
+ *
+ * 它不进 `ToolbarAction`：那一组是「一个 invoke 走完」的 git 远程操作，
+ * 而更新要先预览、再确认、结局可能是冲突，由 RepoTab 编排。
+ */
+export function showsSvnUpdate(caps: Capabilities): boolean {
+  return caps.vcs === 'svn'
+}

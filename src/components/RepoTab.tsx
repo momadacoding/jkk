@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { Panel, Group, Separator } from 'react-resizable-panels'
@@ -19,6 +19,7 @@ import {
   svnCheckBaseline,
   svnMigrateEol,
 } from '../store/repoStore'
+import { createSvnSyncFlow } from './svnSyncFlow'
 import SvnInitWizard from './SvnInitWizard'
 import BaselineBanner from './BaselineBanner'
 import { baselineMap } from '../engine/svnGraph'
@@ -130,6 +131,8 @@ export function RepoTab({
   const [selectedWorktree, setSelectedWorktree] = useState<string | null>(null)
   const { prompt, dialog: promptDialog } = usePrompt()
   const { confirm, dialog: confirmDialog } = useConfirm()
+  // 「更新」流程是否在走（svnSyncFlow）。hook 必须排在下面 loading 的提前 return 之前
+  const syncFlowRunning = useRef(false)
 
   useRepoEffects(
     state,
@@ -550,6 +553,19 @@ export function RepoTab({
     })
   }
 
+  // 「更新」与横幅上的继续 / 放弃。流程在 `svnSyncFlow.ts`，这里只注入依赖
+  const { handleSvnUpdate, handleSyncAction } = createSvnSyncFlow({
+    running: syncFlowRunning,
+    repoPath,
+    syncState: () => state.svnSyncState,
+    confirm,
+    clearError,
+    reportError,
+    refreshSvnSyncState,
+    refreshSvnSync,
+    fetchSvnLog,
+  })
+
   /**
    * 走一次行尾迁移：装规则 + 重录基线（spec §7.3.0）。
    *
@@ -646,6 +662,8 @@ export function RepoTab({
         onRebuild={() => void handleRebuildBaseline()}
         onCheck={() => void handleCheckBaseline()}
         onMigrateEol={() => void handleMigrateEol()}
+        onSyncAction={(id) => void handleSyncAction(id)}
+        onSvnUpdate={() => void handleSvnUpdate()}
       />
       {state.error && (
         <div className="banner-error">
@@ -659,6 +677,7 @@ export function RepoTab({
         onRun={runToolbar}
         commandContext={{ worktree: state.path, branch: state.head, headHash: state.headHash }}
         capabilities={state.capabilities}
+        onSvnUpdate={handleSvnUpdate}
       />
       <div className="repo-path-bar" title={state.path ?? ''}>{state.path} @ {state.head}</div>
       <div style={{ flex: 1, overflow: 'hidden' }}>

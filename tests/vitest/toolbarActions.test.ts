@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { planToolbarAction } from '../../src/engine/toolbarActions'
+import { planToolbarAction, showsSvnUpdate } from '../../src/engine/toolbarActions'
+import type { Capabilities } from '../../src/engine/capabilities'
 
 describe('planToolbarAction', () => {
   it('默认 fetch 只 prune，不碰其他远程', () => {
@@ -53,5 +54,16 @@ describe('planToolbarAction', () => {
 
   it('命令名与后端注册的 Tauri 命令一致', () => {
     expect(planToolbarAction('stash', false, 'master').command).toBe('stash_push')
+  })
+})
+
+describe('showsSvnUpdate', () => {
+  const base: Capabilities = {
+    vcs: 'git', worktrees: true, tags: true, remotes: true,
+    pullRequests: true, cherryPick: true, patches: true,
+  }
+  it('只在 SVN 混合仓库上出现', () => {
+    expect(showsSvnUpdate(base)).toBe(false)
+    expect(showsSvnUpdate({ ...base, vcs: 'svn', remotes: false })).toBe(true)
   })
 })

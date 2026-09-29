@@ -26,6 +26,8 @@ export interface ConfirmRequest {
 
 interface Pending extends ConfirmRequest {
   resolve: (ok: boolean) => void
+  /** 每个请求一个，做 `<Dialog>` 的 key，见 `useConfirm`。 */
+  id: number
 }
 
 function WarnGlyph() {
@@ -136,15 +138,28 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
  */
 export function useConfirm() {
   const [pending, setPending] = useState<Pending | null>(null)
+  const seq = useRef(0)
 
   const confirm = useCallback(
     (request: ConfirmRequest) =>
-      new Promise<boolean>((resolve) => setPending({ ...request, resolve })),
+      new Promise<boolean>((resolve) => setPending({ ...request, resolve, id: ++seq.current })),
     [],
   )
 
+  // key 不能省：一个框带着 `action` 跑完、紧接着 `await confirm(...)` 弹下一个（更新结束后
+  // 弹结局）时，`setPending(null)` 与 `setPending(下一个)` 被 React 18 合并成一次渲染，
+  // `<Dialog>` 从没卸载——上一个框的 `busy` 原样带进新框，新框一出来就是「处理中…」、
+  // 按钮禁用、Esc 与点遮罩也关不掉（2026-09-28 Phase 2c E2E 场景 2 实测）。
+  // 每个请求一个 key，新框就是全新的组件，busy / error / 初始焦点都从头来。
+  //
+  // 关框只关自己：旧框执行中被新请求顶替时，它的 action 跑完仍会调 onDone，
+  // 无条件清空会把新框一起关掉、新框的 Promise 永远不结束（PR #49 Codex review #5）
   const dialog = pending ? (
-    <Dialog request={pending} onDone={() => setPending(null)} />
+    <Dialog
+      key={pending.id}
+      request={pending}
+      onDone={() => setPending((p) => (p?.id === pending.id ? null : p))}
+    />
   ) : null
 
   return { confirm, dialog }

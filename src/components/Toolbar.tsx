@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { askConfirm } from '../engine/confirm'
 import type { CommandContext } from '../engine/customCommands'
 import type { UpstreamInfo } from '../engine/types'
-import { planToolbarAction, visibleToolbarActions, type ToolbarAction } from '../engine/toolbarActions'
+import { planToolbarAction, showsSvnUpdate, visibleToolbarActions, type ToolbarAction } from '../engine/toolbarActions'
 import type { Capabilities } from '../engine/capabilities'
 import { CustomCommandBar } from './CustomCommandBar'
 
@@ -40,11 +40,14 @@ interface ToolbarProps {
   commandContext: CommandContext
   /** 后端能力。不支持远程的后端不渲染 fetch/pull/push。 */
   capabilities: Capabilities
+  /** SVN 混合仓库的「更新」（sync_in）。预览、确认、执行都由 RepoTab 编排。 */
+  onSvnUpdate?: () => Promise<void>
 }
 
-export function Toolbar({ branch, upstream, onRun, commandContext, capabilities }: ToolbarProps) {
+export function Toolbar({ branch, upstream, onRun, commandContext, capabilities, onSvnUpdate }: ToolbarProps) {
   const ctrl = useCtrlHeld()
   const [busy, setBusy] = useState<ToolbarAction | null>(null)
+  const [updating, setUpdating] = useState(false)
 
   const run = useCallback(async (action: ToolbarAction) => {
     const plan = planToolbarAction(action, ctrl, branch)
@@ -71,6 +74,19 @@ export function Toolbar({ branch, upstream, onRun, commandContext, capabilities 
         ⎇ {branch}
       </span>
       <span className="toolbar-sep" />
+      {showsSvnUpdate(capabilities) && onSvnUpdate && (
+        <button
+          className="toolbar-button"
+          disabled={busy !== null || updating}
+          onClick={() => {
+            setUpdating(true)
+            void onSvnUpdate().finally(() => setUpdating(false))
+          }}
+          data-action="svn-update"
+        >
+          {updating ? '…' : '更新'}
+        </button>
+      )}
       {visibleToolbarActions(capabilities).map((action) => {
         const plan = planToolbarAction(action, ctrl, branch)
         const count = badge(action)

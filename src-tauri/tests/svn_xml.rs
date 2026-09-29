@@ -765,3 +765,150 @@ fn list_rejects_truncated_output() {
 <lists>\r\n<list\r\n   path=\"file:///C:/tmp/repo\">\r\n";
     assert!(parse_list(xml).is_err());
 }
+
+#[test]
+fn update_status_reads_repos_status_and_against() {
+    use app_lib::engine::svn_xml::parse_update_status;
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<status>
+<target
+   path=".">
+<entry
+   path="Art\x.psd">
+<wc-status
+   item="modified"
+   revision="1"
+   props="none">
+</wc-status>
+<repos-status
+   item="modified"
+   props="none">
+</repos-status>
+</entry>
+<entry
+   path="Art\y.psd">
+<wc-status
+   item="normal"
+   revision="1"
+   props="none">
+</wc-status>
+<repos-status
+   item="modified"
+   props="none">
+</repos-status>
+</entry>
+<against
+   revision="2"/>
+</target>
+</status>"#;
+    let st = parse_update_status(xml).unwrap();
+    assert_eq!(st.against, Some(2));
+    assert_eq!(st.entries.len(), 2);
+    assert_eq!(st.entries[0].path, "Art/x.psd", "路径归一成正斜杠");
+    assert_eq!(st.entries[0].item, "modified");
+    assert_eq!(st.entries[0].repos_item.as_deref(), Some("modified"));
+    assert!(!st.entries[0].tree_conflicted);
+}
+
+#[test]
+fn update_status_counts_a_props_only_incoming_change() {
+    // PR #49 review 第三轮 #5，2026-09-26 实测（svn 1.14）：本地与服务器都只改了属性时，
+    // 远端是 `item="none" props="modified"`。只看远端 item 会以为 update 不碰它
+    use app_lib::engine::svn_xml::parse_update_status;
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<status>
+<target
+   path="wc1">
+<entry
+   path="wc1\x.psd">
+<wc-status
+   item="normal"
+   revision="1"
+   props="modified">
+</wc-status>
+<repos-status
+   props="modified"
+   item="none">
+</repos-status>
+</entry>
+<entry
+   path="wc1\y.psd">
+<wc-status
+   item="normal"
+   revision="1"
+   props="none">
+</wc-status>
+<repos-status
+   props="none"
+   item="none">
+</repos-status>
+</entry>
+<against
+   revision="2"/>
+</target>
+</status>"#;
+    let st = parse_update_status(xml).unwrap();
+    assert_eq!(st.entries[0].repos_props.as_deref(), Some("modified"));
+    assert!(
+        st.entries[0].is_incoming(),
+        "只改属性也是这次 update 会碰到的"
+    );
+    assert!(!st.entries[1].is_incoming());
+}
+
+#[test]
+fn update_status_sees_property_conflicts() {
+    // PR #49 review 第三轮 #4，2026-09-26 实测：属性冲突时 `svn update --accept postpone`
+    // 退出 0，节点是 `item="normal" props="conflicted"`
+    use app_lib::engine::svn_xml::parse_update_status;
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<status>
+<target
+   path="wc1">
+<entry
+   path="wc1\x.psd">
+<wc-status
+   item="normal"
+   revision="2"
+   props="conflicted">
+</wc-status>
+</entry>
+</target>
+</status>"#;
+    let st = parse_update_status(xml).unwrap();
+    assert!(st.entries[0].is_conflicted());
+    assert_eq!(
+        st.entries[0].repos_props, None,
+        "不带 -u 时没有 repos-status"
+    );
+}
+
+#[test]
+fn update_status_sees_tree_conflicts_whose_item_is_not_conflicted() {
+    // 2026-09-25 实测：树冲突节点是 `item="added" tree-conflicted="true"`。
+    // 只看 item == "conflicted" 会把它当成一个普通的本地新增放过去。
+    use app_lib::engine::svn_xml::parse_update_status;
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<status>
+<target
+   path=".">
+<entry
+   path="Code\Gone">
+<wc-status
+   item="added"
+   props="none"
+   copied="true"
+   tree-conflicted="true">
+</wc-status>
+</entry>
+</target>
+</status>"#;
+    let st = parse_update_status(xml).unwrap();
+    assert!(st.entries[0].tree_conflicted);
+    assert_eq!(st.entries[0].item, "added");
+    assert_eq!(
+        st.entries[0].repos_item, None,
+        "不带 -u 时没有 repos-status"
+    );
+    assert_eq!(st.against, None);
+}

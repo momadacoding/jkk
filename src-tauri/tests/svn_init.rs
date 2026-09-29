@@ -1870,3 +1870,58 @@ fn migration_refuses_on_a_directory_that_is_not_a_hybrid_repo() {
     let err = migrate_eol(&fx.wc_str()).expect_err("没建过库就没有基线可迁移");
     assert_eq!(err.code, "svn_not_hybrid", "实际：{}", err.message);
 }
+
+#[test]
+fn recording_from_head_agrees_with_recording_from_empty_after_an_update() {
+    // §6.3.1：S7 从 HEAD 树起步，初始化 / R2 从空索引起步。两者在「磁盘就是
+    // 服务器内容」时必须录出同一棵树——差别只可能出在 HEAD 里有、磁盘上没有的
+    // 文件，而 `git add -A` 会把它们摘掉。
+    use app_lib::engine::svn_baseline::TempIndex;
+    use app_lib::engine::svn_config::read_config;
+    use app_lib::engine::svn_init::record_server_tree_into;
+    use app_lib::engine::svn_preflight::run_preflight;
+
+    let fx = svn_fixtures::hybrid_with_colleague();
+    let root = fx.wc_str();
+    fx.colleague_commits("Code/A.cs", "a2\n");
+    svn_fixtures::svn_cmd(&fx.wc2(), &["delete", "Code/B.cs", "--non-interactive"]);
+    svn_fixtures::svn_cmd(&fx.wc2(), &["commit", "-m", "del B", "--non-interactive"]);
+    run_git(&root, &["checkout", "-q", "svn/base"]).unwrap(); // S3
+    svn_fixtures::svn_cmd(&fx.wc(), &["update", "--non-interactive"]); // S5
+
+    let cfg = read_config(&root).unwrap();
+    let pre = run_preflight(&root, &cfg.whitelist).unwrap();
+    let (from_head, _) =
+        record_server_tree_into(&root, &cfg, &pre, &TempIndex::from_head(&root).unwrap()).unwrap();
+    let (from_empty, _) =
+        record_server_tree_into(&root, &cfg, &pre, &TempIndex::empty(&root).unwrap()).unwrap();
+    assert_eq!(from_head, from_empty);
+    let ls = run_git(&root, &["ls-tree", "-r", "--name-only", &from_head]).unwrap();
+    assert!(
+        !ls.contains("Code/B.cs"),
+        "服务器删掉的文件不能被 HEAD 树带回来：{ls}"
+    );
+}
+
+#[test]
+fn recording_from_head_still_catches_a_new_gitignore() {
+    // 必测 #70 的 S7 半边：服务器带来一个挡住 .cs 的 .gitignore，候选树必须被判漏收
+    use app_lib::engine::svn_baseline::TempIndex;
+    use app_lib::engine::svn_config::read_config;
+    use app_lib::engine::svn_init::record_server_tree_into;
+    use app_lib::engine::svn_preflight::run_preflight;
+
+    let fx = svn_fixtures::hybrid_with_colleague();
+    let root = fx.wc_str();
+    fx.colleague_commits("Code/.gitignore", "*.cs\n");
+    fx.colleague_commits("Code/New.cs", "new\n");
+    run_git(&root, &["checkout", "-q", "svn/base"]).unwrap();
+    svn_fixtures::svn_cmd(&fx.wc(), &["update", "--non-interactive"]);
+
+    let cfg = read_config(&root).unwrap();
+    let pre = run_preflight(&root, &cfg.whitelist).unwrap();
+    let err = record_server_tree_into(&root, &cfg, &pre, &TempIndex::from_head(&root).unwrap())
+        .unwrap_err();
+    assert_eq!(err.code, "include_set_mismatch");
+    assert!(err.message.contains("Code/New.cs"), "{}", err.message);
+}

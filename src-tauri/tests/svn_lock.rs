@@ -242,3 +242,48 @@ fn staging_is_refused_while_a_sync_holds_the_lock() {
         .status()
         .expect("持锁期间读操作不得被阻塞（spec §5.1）");
 }
+
+#[cfg(windows)]
+#[test]
+fn release_retries_when_a_reader_briefly_holds_the_file() {
+    // 2b 第二轮 review R5：UI 读锁文件（`holder()` 的宽松共享打开，没有
+    // FILE_SHARE_DELETE）恰好撞上持锁方 Drop 里的 remove_file，删除失败被吞，
+    // 下一次 acquire 打出一条假的「上次同步没有正常收尾」。2c 的锁被持有期间
+    // 界面每 2 秒轮询一次，撞上的概率从「理论上」变成「真的会有」。
+    use std::os::windows::fs::OpenOptionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+    let root = dir.path().to_str().unwrap().to_string();
+    let lock = acquire(&root, "opid-R5").unwrap();
+    let path = lock_path(&root);
+
+    // 模拟 UI：用与 `holder()` 相同的共享模式开着文件 30ms 再关
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_WRITE: u32 = 0x2;
+    let reader = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(&path)
+        .unwrap();
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        drop(reader);
+    });
+    drop(lock);
+    t.join().unwrap();
+    assert!(
+        !path.exists(),
+        "读者 30ms 后就松手了，释放必须等到它再删掉文件"
+    );
+}
+
+#[test]
+fn busy_error_says_how_long_not_a_raw_epoch() {
+    // 2b 第二轮 review R6：原来打印「开始于 1757000000」。
+    use app_lib::engine::svn_lock::describe_age;
+    assert_eq!(describe_age(1000, 1030), "刚刚开始");
+    assert_eq!(describe_age(1000, 1000 + 5 * 60), "已持续 5 分钟");
+    assert_eq!(describe_age(1000, 1000 + 2 * 3600 + 60), "已持续 2 小时");
+    // 时钟回拨（started_at 在未来）不能 panic，也不能报负数
+    assert_eq!(describe_age(2000, 1000), "刚刚开始");
+}

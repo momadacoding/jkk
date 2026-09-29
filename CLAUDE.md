@@ -26,7 +26,7 @@ pnpm build          # tsc + vite build
 
 ### Testing
 ```bash
-pnpm test                      # vitest run（前端纯逻辑）
+pnpm test                      # vitest run（前端纯逻辑；组件测试在文件头切 jsdom，见 AGENTS.md §8）
 
 cd src-tauri
 cargo test                     # Rust 集成测试（fixture 仓库）
