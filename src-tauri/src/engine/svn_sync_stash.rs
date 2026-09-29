@@ -250,32 +250,38 @@ fn stash_parents(repo: &str, oid: &str) -> Result<Vec<String>> {
     Ok(parents)
 }
 
+/// `oid` 在 stash 栈里的位置（`stash@{n}` 的 n）；不在栈里返回 `None`。
+pub fn stash_position(repo: &str, oid: &str) -> Result<Option<usize>> {
+    if read_stash_ref(repo)?.is_none() {
+        return Ok(None);
+    }
+    let out = run_git(repo, &["log", "-g", "--format=%H", "refs/stash"])?;
+    Ok(out.lines().position(|l| l.trim() == oid))
+}
+
 /// 按 OID drop 我们那一条，再删钉住的 ref。
 pub fn drop_wip(repo: &str, opid: &str, oid: &str) -> Result<()> {
-    if read_stash_ref(repo)?.is_some() {
-        let out = run_git(repo, &["log", "-g", "--format=%H", "refs/stash"])?;
-        if let Some(n) = out.lines().position(|l| l.trim() == oid) {
-            let dropped = run_git(repo, &["stash", "drop", &format!("stash@{{{n}}}")])?;
-            // 输出形如 `Dropped stash@{1} (<oid>)`（2026-09-25 实测）。
-            // 定位与 drop 之间若有外部工具又压了一条，位置会错开——核对一下，
-            // 丢错了就把它塞回去，宁可报错也不吃掉别人的 WIP。
-            if !dropped.contains(oid) {
-                if let Some(other) = dropped
-                    .rsplit_once('(')
-                    .and_then(|(_, r)| r.split_once(')'))
-                    .map(|(o, _)| o.trim().to_string())
-                {
-                    let _ = run_git(
-                        repo,
-                        &["stash", "store", "-m", "mygitclient 误删后放回", &other],
-                    );
-                }
-                return Err(GitError::new(
-                    "sync_stash_drop_raced",
-                    "删除 stash 的瞬间栈被外部改动了。已把误删的那条放回，本次同步的 stash \
-                     仍在，请稍后在横幅上点「继续」重试。",
-                ));
+    if let Some(n) = stash_position(repo, oid)? {
+        let dropped = run_git(repo, &["stash", "drop", &format!("stash@{{{n}}}")])?;
+        // 输出形如 `Dropped stash@{1} (<oid>)`（2026-09-25 实测）。
+        // 定位与 drop 之间若有外部工具又压了一条，位置会错开——核对一下，
+        // 丢错了就把它塞回去，宁可报错也不吃掉别人的 WIP。
+        if !dropped.contains(oid) {
+            if let Some(other) = dropped
+                .rsplit_once('(')
+                .and_then(|(_, r)| r.split_once(')'))
+                .map(|(o, _)| o.trim().to_string())
+            {
+                let _ = run_git(
+                    repo,
+                    &["stash", "store", "-m", "mygitclient 误删后放回", &other],
+                );
             }
+            return Err(GitError::new(
+                "sync_stash_drop_raced",
+                "删除 stash 的瞬间栈被外部改动了。已把误删的那条放回，本次同步的 stash \
+                     仍在，请稍后在横幅上点「继续」重试。",
+            ));
         }
     }
     unpin(repo, opid)

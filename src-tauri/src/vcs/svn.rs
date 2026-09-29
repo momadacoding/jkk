@@ -16,8 +16,10 @@ use crate::engine::graph::GraphData;
 use crate::engine::repo::RepoInfo;
 use crate::engine::stash::StashEntry;
 use crate::engine::svn_config::SvnConfig;
+use crate::engine::svn_journal;
 use crate::engine::svn_lock::assert_not_syncing;
-use crate::error::Result;
+use crate::engine::svn_sync_stash::stash_position;
+use crate::error::{GitError, Result};
 
 pub struct SvnGitBackend {
     git: GitBackend,
@@ -132,10 +134,29 @@ impl Vcs for SvnGitBackend {
     }
     fn stash_pop(&self, index: usize) -> Result<()> {
         assert_not_syncing(&self.root)?;
+        assert_not_sync_backup(&self.root, index)?;
         self.git.stash_pop(index)
     }
     fn stash_drop(&self, index: usize) -> Result<()> {
         assert_not_syncing(&self.root)?;
+        assert_not_sync_backup(&self.root, index)?;
         self.git.stash_drop(index)
     }
+}
+
+/// 未收尾的同步把 WIP 的原始备份放在 stash 里。冲突出口放开了锁，`assert_not_syncing`
+/// 拦不到；应用内把那一条删掉（drop / pop）之后再「继续」，最后一个钉住它的 ref 也会被拆掉，
+/// 备份就再也找不回来了（PR #49 Codex review #2）。只挡那一条，别的 stash 照常。
+fn assert_not_sync_backup(root: &str, index: usize) -> Result<()> {
+    let Some(oid) = svn_journal::read(root)?.and_then(|j| j.stash_oid) else {
+        return Ok(());
+    };
+    if stash_position(root, &oid)? == Some(index) {
+        return Err(GitError::new(
+            "sync_in_unfinished",
+            "这条 stash 是上一次「更新」给未提交改动留的备份，那次同步还没有收尾。\
+             请先在顶部横幅上选择「继续」或「放弃」，再处理它。",
+        ));
+    }
+    Ok(())
 }

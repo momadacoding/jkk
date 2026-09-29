@@ -16,7 +16,7 @@ use app_lib::engine::svn_sync::{check_sync, SyncVerdict};
 use app_lib::engine::svn_sync_check::preview_sync_in;
 use app_lib::engine::svn_sync_in::{abort_sync, continue_sync};
 use app_lib::engine::svn_sync_in::{run_sync_in, SyncInExpect, SyncInOutcome};
-use app_lib::engine::svn_sync_stash::stash_wip;
+use app_lib::engine::svn_sync_stash::{drop_wip, stash_wip};
 use svn_fixtures::{hybrid_with_colleague, SvnFixture};
 
 fn git(fx: &SvnFixture, args: &[&str]) -> String {
@@ -846,6 +846,35 @@ fn a_baseline_moved_before_the_replay_is_refused() {
 }
 
 #[test]
+fn a_baseline_moved_while_still_on_it_is_refused_before_switching_back() {
+    // PR #49 Codex review #4：崩在 baseline-ready、HEAD 还在基线分支上，随后基线被外部挪走。
+    // 核对本次发布的基线原先排在 S8 切分支、清残留之后——拒绝之前工作区已经变了
+    let fx = hybrid_with_colleague();
+    with_wip(&fx);
+    let mut j = s5(&fx, "op-drift-s8");
+    let (tree, c) = built_commit(&fx, &j, None);
+    let old = j.baseline_oid_before.clone().unwrap();
+    git(&fx, &["update-ref", "refs/heads/svn/base", &c, &old]);
+    git(&fx, &["read-tree", "svn/base"]); // 与 S7 的 align_index 同一结果
+    j.phase = Phase::BaselineReady;
+    j.capture_tree = Some(tree);
+    j.new_baseline_oid = Some(c);
+    svn_journal::write(&fx.wc_str(), &j).unwrap();
+    move_baseline_outside(&fx);
+    let b = read(&fx, "Code/B.cs");
+
+    let err = continue_sync(&fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "sync_in_state_changed", "{}", err.message);
+    assert_eq!(
+        git(&fx, &["symbolic-ref", "--short", "HEAD"]),
+        "svn/base",
+        "没有切走"
+    );
+    assert_eq!(read(&fx, "Code/B.cs"), b, "磁盘没动");
+    assert_eq!(phase(&fx), Some(Phase::BaselineReady));
+}
+
+#[test]
 fn continue_restoring_refuses_a_baseline_moved_back() {
     // 同一根因的第三处：往前走时的放回复核。把基线挪回更新前的位置——它仍是 HEAD 的
     // 祖先，只比「当前 svn/base 是不是祖先」会放行
@@ -933,6 +962,61 @@ fn continue_after_the_wip_was_reset_away_does_not_delete_the_only_backup() {
     assert_eq!(our_stashes(&fx), 1, "唯一的备份还在");
     let p = git(&fx, &["show", &format!("{oid}:Code/A.cs")]);
     assert_eq!(p, "a-wip", "从备份里取得回 WIP");
+}
+
+#[test]
+fn continue_after_a_crash_between_drop_and_clearing_the_record_claims_no_backup() {
+    // PR #49 Codex review #1：干净放回后先落 `stashApplied=true`、再 drop、最后删 journal。
+    // 崩在 drop 之后、删 journal 之前，重开点「继续」原先走 Kept，报「备份还在 stash 里」——
+    // 而它已经删了。现场用「冲突解决后按我们自己的方式 drop」构造：journal、stash 栈、
+    // 钉住的 ref 与那一刻相同
+    let fx = hybrid_with_colleague();
+    let oid = a_stash_conflict(&fx);
+    write(&fx, "Code/A.cs", "a-merged\n");
+    git(&fx, &["add", "Code/A.cs"]);
+    let j = svn_journal::read(&fx.wc_str()).unwrap().unwrap();
+    drop_wip(&fx.wc_str(), &j.opid, &oid).unwrap();
+
+    assert!(matches!(
+        continue_sync(&fx.wc_str()).unwrap(),
+        SyncInOutcome::Done { .. }
+    ));
+    assert_eq!(our_stashes(&fx), 0);
+    assert_eq!(phase(&fx), None);
+}
+
+/// `oid` 在 stash 栈里的位置（`stash@{n}` 的 n）。
+fn stash_index(fx: &SvnFixture, oid: &str) -> usize {
+    git(fx, &["log", "-g", "--format=%H", "refs/stash"])
+        .lines()
+        .position(|l| l.trim() == oid)
+        .expect("在 stash 栈里")
+}
+
+#[test]
+fn the_app_does_not_drop_the_sync_backup_while_the_sync_is_unfinished() {
+    // PR #49 Codex review #2：冲突出口放开了锁，应用内的删除 / pop stash 只看锁。
+    // 删掉本次那条之后再「继续」，Kept 会拆掉最后一个钉子——原始备份就再也找不回了
+    let fx = hybrid_with_colleague();
+    write(&fx, "Code/B.cs", "b-other\n");
+    git(
+        &fx,
+        &["stash", "push", "-q", "-m", "other", "--", "Code/B.cs"],
+    );
+    let other = git(&fx, &["rev-parse", "refs/stash"]);
+    let oid = a_stash_conflict(&fx);
+    let root = fx.wc_str();
+
+    let i = stash_index(&fx, &oid);
+    let err = app_lib::commands::stash::stash_drop(root.clone(), i).unwrap_err();
+    assert_eq!(err.code, "sync_in_unfinished", "{}", err.message);
+    let err = app_lib::commands::stash::stash_pop(root.clone(), i).unwrap_err();
+    assert_eq!(err.code, "sync_in_unfinished", "{}", err.message);
+    assert_eq!(our_stashes(&fx), 1, "本次的备份还在");
+
+    // 别的 stash 照常能删
+    app_lib::commands::stash::stash_drop(root, stash_index(&fx, &other)).unwrap();
+    assert_eq!(git(&fx, &["stash", "list"]).lines().count(), 1);
 }
 
 #[test]

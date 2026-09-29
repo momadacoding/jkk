@@ -18,6 +18,11 @@ import type { ConfirmRequest } from './ConfirmDialog'
 
 export interface SvnSyncFlowDeps {
   repoPath: string
+  /**
+   * 是否已有一次流程在走。调用方用 `useRef` 持有：`RepoTab` 每次渲染都重新 create，
+   * 放在闭包里的标记会跟着重置。
+   */
+  running: { current: boolean }
   /** 取**当前**的同步状态（横幅上的继续 / 放弃按它的 phase 选文案）。 */
   syncState: () => SyncState | SyncStateUnreadable | null
   confirm: (request: ConfirmRequest) => Promise<boolean>
@@ -48,13 +53,28 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
   }
 
   /**
+   * 同一时间只走一个流程。预览要跑 `svn status -u`（网络），那几秒里界面上没有框挡着，
+   * 工具栏的「更新」和横幅上的按钮都点得到；两个流程的确认框会互相顶替
+   * （PR #49 Codex review #5）。后端的锁拦得住第二次执行，拦不住界面的错乱。
+   */
+  const exclusive = async (run: () => Promise<void>) => {
+    if (d.running.current) return
+    d.running.current = true
+    try {
+      await run()
+    } finally {
+      d.running.current = false
+    }
+  }
+
+  /**
    * 「更新」（spec §7）：预览 → 确认 → 执行。
    *
    * 预览失败（前置检查不过）直接报错，一个字节都没动。执行走 `action`：
    * 它要跑完整的 svn update（网络），确认完就关框的话界面上几秒毫无动静。
    * 执行出错时对话框留在原地显示错误——后端的错误文案里已经写了回退的结果。
    */
-  const handleSvnUpdate = async () => {
+  const svnUpdate = async () => {
     // 顶部错误条是常驻的（点 × 才关）。上一次「更新」被前置检查拒绝留下的那条说的是
     // 当时的仓库，用户改好之后再点更新时它已经过时，还会和新横幅叠在一起（2026-09-30
     // E2E 场景 6 → 7）。重试就是新的一次：先清旧的，这次再失败自然会报新的
@@ -80,8 +100,8 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
   }
 
   /** 横幅上的继续 / 放弃（spec §7.6）。 */
-  const handleSyncAction = async (id: SyncActionId) => {
-    d.clearError() // 同 handleSvnUpdate
+  const syncAction = async (id: SyncActionId) => {
+    d.clearError() // 同 svnUpdate
     const s = d.syncState()
     const phase = s && !('readError' in s) && s.unfinished ? s.unfinished.phase : 'start'
     const box: { outcome: SyncInOutcome | null } = { outcome: null }
@@ -96,5 +116,8 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
     await showOutcome(box.outcome)
   }
 
-  return { handleSvnUpdate, handleSyncAction }
+  return {
+    handleSvnUpdate: () => exclusive(svnUpdate),
+    handleSyncAction: (id: SyncActionId) => exclusive(() => syncAction(id)),
+  }
 }

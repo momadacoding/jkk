@@ -27,6 +27,7 @@ const preview: SyncInPreview = {
 function deps(log: string[], confirm?: (r: ConfirmRequest) => Promise<boolean>): SvnSyncFlowDeps {
   return {
     repoPath: 'C:/wc1',
+    running: { current: false },
     syncState: () => null,
     confirm:
       confirm ??
@@ -103,6 +104,42 @@ describe('handleSvnUpdate', () => {
     })
     expect(log).toContain('refreshSvnSyncState')
     expect(titles).toEqual(['更新', '知道了'])
+  })
+})
+
+describe('同一时间只走一个流程（PR #49 Codex review #5）', () => {
+  it('预览还在路上时再点「更新」或横幅按钮：不再发第二次', async () => {
+    // 预览要跑 `svn status -u`（网络），几秒里界面上没有框挡着，工具栏和横幅都点得到
+    let release!: (p: SyncInPreview) => void
+    vi.mocked(store.svnSyncInPreview).mockReturnValue(
+      new Promise((r) => {
+        release = r
+      }),
+    )
+    vi.mocked(store.svnSyncIn).mockResolvedValue({ kind: 'done', newRev: 2 })
+    // RepoTab 每次渲染都重新 create 一次：标记必须活在注入的 `running` 里，不能在闭包里
+    const d = deps([])
+
+    const first = createSvnSyncFlow(d).handleSvnUpdate()
+    await createSvnSyncFlow(d).handleSvnUpdate()
+    await createSvnSyncFlow(d).handleSyncAction('syncAbort')
+    release(preview)
+    await first
+
+    expect(store.svnSyncInPreview).toHaveBeenCalledTimes(1)
+    expect(store.svnSyncAbort).not.toHaveBeenCalled()
+    expect(store.svnSyncIn).toHaveBeenCalledTimes(1)
+  })
+
+  it('上一次走完（包括失败）之后可以再点', async () => {
+    vi.mocked(store.svnSyncInPreview).mockRejectedValueOnce({ code: 'x', message: 'm' })
+    const flow = createSvnSyncFlow(deps([]))
+    await flow.handleSvnUpdate()
+    vi.mocked(store.svnSyncInPreview).mockResolvedValue(preview)
+    vi.mocked(store.svnSyncIn).mockResolvedValue({ kind: 'done', newRev: 2 })
+    await flow.handleSvnUpdate()
+    expect(store.svnSyncInPreview).toHaveBeenCalledTimes(2)
+    expect(store.svnSyncIn).toHaveBeenCalledTimes(1)
   })
 })
 

@@ -115,6 +115,32 @@ describe('useConfirm', () => {
     expect(screen.queryByText('推送')).toBeNull()
   })
 
+  it('旧框的 action 跑完不能把后来顶替它的新框一起关掉（PR #49 Codex review #5）', async () => {
+    // 两个请求重叠：第一个框执行中，第二个 confirm 顶替了它。第一个的 action 跑完调
+    // onDone 时原先无条件清空 pending，把第二个框也关了，第二个 Promise 永远不结束
+    const { confirm } = mount()
+    let release!: () => void
+    const gate = new Promise<void>((r) => {
+      release = r
+    })
+    act(() => {
+      void confirm()({ title: '第一个', message: 'm', confirmLabel: '执行', action: () => gate })
+    })
+    fireEvent.click(button('执行'))
+    let second!: Promise<boolean>
+    act(() => {
+      second = confirm()({ title: '第二个', message: 'm', confirmLabel: '知道了' })
+    })
+    await act(async () => {
+      release()
+      await gate
+    })
+
+    expect(screen.queryByText('第二个')).not.toBeNull()
+    fireEvent.click(button('知道了'))
+    await expect(second).resolves.toBe(true)
+  })
+
   it('action 抛错：留在原地显示错误，按钮恢复可点', async () => {
     const { confirm } = mount()
     act(() => {

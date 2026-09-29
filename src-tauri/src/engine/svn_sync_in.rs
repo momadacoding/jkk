@@ -448,6 +448,9 @@ pub(crate) fn from_baseline_ready(
 ) -> Result<SyncInOutcome> {
     let orig = need(&j.orig_branch, "origBranch")?;
     let orig_head = need(&j.orig_head, "origHead")?;
+    // 先核对本次发布的基线，再动工作区：基线被外部挪过就在切分支、清残留之前停下，
+    // 而不是把现场改了一半才拒绝（PR #49 Codex review #4）
+    let new_base = published_baseline(repo, j)?;
     // S8
     match current_branch(repo)?.as_deref() {
         Some(b) if b == BASELINE_BRANCH => checkout_verified(repo, cfg, &orig, false)?,
@@ -464,7 +467,6 @@ pub(crate) fn from_baseline_ready(
     // 上一次 S8 可能「退出 0 却没切干净」，继续时 HEAD 已经在原分支上（A15 / C1）
     settle_checkout_residue(repo, cfg, j, &orig)?;
     // S9：对新基线再复核一次（§7.3.2）
-    let new_base = published_baseline(repo, j)?;
     assert_linear(repo, &new_base, &orig_head)?;
     j.phase = Phase::Rebase;
     svn_journal::write(repo, j)?;
@@ -574,9 +576,17 @@ pub(crate) fn restore_step(repo: &str, j: &mut Journal) -> Result<RestoreStep> {
         // 已经 apply 过、又停下过：磁盘上的 WIP 经过了用户之手，证明不了它还完整，
         // stash 里那份可能是唯一的备份——不 drop，只拆掉我们自己的钉子与记录
         // （PR #49 review 第四轮 P1-2，方案 A）。只有同一进程里刚刚干净 apply 完的才 drop
+        //
+        // `stashApplied` 也可能是干净 apply 之后、drop 之前落的盘：崩在 drop 之后、删 journal
+        // 之前时栈里已经没有它了。「备份还在」必须是查出来的，不是推出来的（PR #49 Codex review #1）
+        let kept = wip::stash_position(repo, &oid)?.is_some();
         wip::unpin(repo, &j.opid)?;
         svn_journal::remove(repo)?;
-        return Ok(RestoreStep::Kept { oid });
+        return Ok(if kept {
+            RestoreStep::Kept { oid }
+        } else {
+            RestoreStep::Finished
+        });
     }
     wip::drop_wip(repo, &j.opid, &oid)?;
     svn_journal::remove(repo)?; // S11；锁由调用方的守卫释放，watcher 由命令层恢复

@@ -23,6 +23,7 @@
 | 12 | PR #49 review（第二轮）修复 | ✅ 完成 | `svn_sync_check::current_branch`、`svn_sync_in`（`untracked_leftovers`、`require_our_rebase`、`back_outcome`、`continue_rebase` 重走 S9）、journal `leftOrig` / `rollingBack`、`Released.rolledBack`、前端文案 + 12 条 Rust / 2 条 vitest | 见下「PR #49 review（第二轮）」；fmt / clippy 0 告警 / `cargo test` 711 passed 0 failed；`pnpm build` 通过 / `pnpm test` 433 passed |
 | 13 | PR #49 review（第三轮）修复 | ✅ 完成 | `require_restore_target`、`require_our_rebase` 加 `onto` / `orig-head`、`svn_sync_stash::blocking_ancestor`、`UpdateStatusEntry.repos_props` + `is_conflicted` / `is_incoming`、`SyncInExpect.orig_branch`（前后端）+ 10 条 Rust / 1 条 vitest 改写 | 见下「PR #49 review（第三轮）」；fmt / clippy 0 告警 / `cargo test` 721 passed 0 failed；`pnpm build` 通过 / `pnpm test` 433 passed |
 | 14 | PR #49 review（第四轮）修复 | ✅ 完成 | `published_baseline`（重放目标 / 认 rebase / 放回复核都以 `newBaselineOid` 为准）、`commands/svn.rs::refuse_while_unfinished`、`RestoreStep::Kept` + `SyncInOutcome::Settled`（冲突后继续不 drop）、前端 `settled` 文案与「继续」确认框 + 5 条 Rust 新增 / 1 条改写、2 条 vitest；修正第三轮 heredoc 写坏的一处测试字面量 | 见下「PR #49 review（第四轮）」；fmt / clippy 0 告警 / `cargo test` 726 passed 0 failed；`pnpm build` 通过 / `pnpm test` 435 passed |
+| 15 | PR #49 Codex 独立 review（`29a3fab..44ef36e`）修复 | ✅ 完成 | `restore_step` 的 Kept 先查 stash 栈、`svn_sync_stash::stash_position`、`vcs/svn.rs::assert_not_sync_backup`、`from_baseline_ready` 先核对基线再 S8、`useConfirm` 关框只关自己、`svnSyncFlow` 同一时间只走一个流程 + 3 条 Rust / 3 条 vitest | 见下「PR #49 Codex 独立 review」；fmt / clippy 0 告警 / `cargo test` 729 passed 0 failed；`pnpm build` 通过 / `pnpm test` 446 passed |
 
 ## 全量验证
 
@@ -30,10 +31,10 @@
 |---|---|
 | `cargo fmt --check` | ✅ 0（2026-09-26，Task 11 Step 3） |
 | `cargo clippy --all-targets` | ✅ 0 告警 |
-| `cargo test` | ✅ 726 passed / 0 failed（PR #49 第四轮 review 修复之后；第三轮后 721；第二轮后 711；第一轮修复后 699，修复前 695。基线：master `1db8210` 上 598 passed） |
+| `cargo test` | ✅ 729 passed / 0 failed（PR #49 Codex review 修复之后；第四轮后 726；第三轮后 721；第二轮后 711；第一轮修复后 699，修复前 695。基线：master `1db8210` 上 598 passed） |
 | `pnpm build` | ✅ tsc + vite 通过 |
-| `pnpm test` | ✅ 27 个文件 435 passed / 0 failed（第四轮 review 修复之后；第三轮后 433；第一轮后 431，修复前 430。基线 383 passed） |
-| `pnpm tauri dev` | ⬜ **未跑**：E2E 清单 8 个场景都要人在真实窗口里点，本会话没有跑。四个新命令的 invoke 参数名因此**尚未在运行时确认**（序列化形状由 `svn_backend.rs` 钉住，但 JS 侧参数名没有编译期检查） |
+| `pnpm test` | ✅ 29 个文件 446 passed / 0 failed（PR #49 Codex review 修复之后；E2E 发现修复后 443；第四轮后 27 个文件 435；第三轮后 433；第一轮后 431，修复前 430。基线 383 passed） |
+| `pnpm tauri dev` | ✅ 2026-09-30 用户在真实窗口跑完 E2E 清单 8 个场景，四个新命令的 invoke 都走通（见「真实窗口 E2E 发现」）。之后的 Codex review 修复（`a990c28` 之后）没有改 Tauri 命令签名，未重跑真实窗口 |
 | E2E 清单机械检查 | ✅ 29 个 `powershell` 代码块在 PS 5.1.26100 与 PS 7.6.1 下 `Parser::ParseInput` 均 0 语法错误；`Colleague` 在新造的 fixture 上连提两次（新增文件 r2、修改已有文件 r3）均落地，fixture 已删 |
 
 ---
@@ -708,4 +709,30 @@
 ### 结果
 
 - 2026-09-30 用户在 `pnpm tauri dev` 真实窗口跑完清单 8 个场景，全部符合预期。途中发现的两个缺陷（场景 2 结局框卡「处理中」、场景 6 → 7 旧红条）已修复并复测通过。
+
+## PR #49 Codex 独立 review（2026-09-30）
+
+范围 `29a3fab..44ef36e`（第四轮修复、确认框 key、测试设施、`svnSyncFlow`、两个文档提交）。Codex 只读审查，`cargo test` 在它的环境里没能起进程，Rust 测试由实现者本地跑。6 条逐条对照代码核实，用户决定「全修」（第 2 条的 `svn/base` 部分与第 3 条按下述理由记录、不在本 PR 修）。
+
+| # | 定级（Codex → 核实） | 结论 | 处理 |
+|---|---|---|---|
+| 1 | P1 → P1 | 成立：干净 apply 后先落 `stashApplied=true`、再 drop、再删 journal。崩在 drop 与删 journal 之间，重开「继续」走 Kept，报「备份还在 stash 里」——实际已删 | 修 |
+| 2 | P1 → P1（stash）/ 既有（`svn/base`） | stash 部分成立：冲突出口放开锁，应用内 drop / pop 只看锁，删掉本次那条后「继续」的 Kept 拆掉最后的钉子。删除 / 重命名 `svn/base` 在 Phase 1 起任何状态下都没拦，非本 PR 引入 | stash 修；`svn/base` 记录，另开 |
+| 3 | P2 → 既有 | 成立但源自 Phase 2b（#46）：重建 / 迁移「先查锁再做、做时不持锁」。第四轮只在旁边加了 journal 检查。同步进行时有模态框挡着，界面上难以并发触发 | 记录，另开（修法：两命令持同一把同步锁） |
+| 4 | P2 → P2 | 成立：`from_baseline_ready` 先 S8 切分支、清残留，才调 `published_baseline` | 修 |
+| 5 | P2 → P3 | 理论成立：`useConfirm` 被新请求顶替时，旧框的 `onDone` 无条件清空，把新框也关掉、新 Promise 永不结束。机制早于 key 修复；实际要连点、且第二次预览恰在第一次确认执行中返回 | 修（用户要求一起修） |
+| 6 | P3 → P3 | 成立：验证表 `pnpm tauri dev` 一行仍写「未跑」，测试数停在第四轮 | 修 |
+
+### 修法与测试
+
+- **#1**：`restore_step` 的 Kept 分支先用新的 `svn_sync_stash::stash_position` 查 OID 是否还在栈里；在 → `Kept`（`Settled`），不在 → `Finished`（往前 `Done`、往回 `Aborted`）。`drop_wip` 改用同一个 helper 定位。测试 `continue_after_a_crash_between_drop_and_clearing_the_record_claims_no_backup`：没有注入崩溃的手段，用「stash 冲突 → 解决 → 按我们自己的 `drop_wip` 删掉」构造与那一刻相同的 journal / stash 栈 / 钉子状态。RED：返回 `Settled`。
+- **#2**：`vcs/svn.rs::assert_not_sync_backup`，`stash_drop` / `stash_pop` 在 journal 的 `stashOid` 恰是 `stash@{index}` 时报 `sync_in_unfinished`；别的 stash 照常，`stash_apply` 不删东西、不挡。测试 `the_app_does_not_drop_the_sync_backup_while_the_sync_is_unfinished` 走 `commands::stash` 的真实入口（`backend_for` → `SvnGitBackend`），并断言另一条 stash 仍可删。RED：drop 成功。已知窄窗：查位置与按 index drop 之间外部又压一条会错位——与 `GitBackend` 按 index 操作的既有语义相同，不在本条范围。
+- **#4**：`published_baseline` 挪到 `from_baseline_ready` 开头。它在所有能走到这里的路径上本来就要求成立（S8 不动 `svn/base`），前移只改变失败时机。测试 `a_baseline_moved_while_still_on_it_is_refused_before_switching_back`：baseline-ready、HEAD 仍在 `svn/base`、基线被外部挪走 → 报 `sync_in_state_changed`，HEAD 仍在 `svn/base`、磁盘上 `Code/B.cs` 未变。RED：HEAD 已被切到 `work`。
+- **#5**：两处都改。
+  - `useConfirm` 的 `onDone` 只在 `pending.id` 仍是自己时清空。测试见 `ConfirmDialog.test.tsx` 新增一条（RED：第二个框被关掉）。
+  - `svnSyncFlow` 加 `running` 标记，同一时间只走一个流程。**计划没写的坑**：`RepoTab` 每次渲染都重新 `createSvnSyncFlow`，标记放闭包里会随渲染重置，所以由调用方 `useRef` 注入；测试按这个形状每次调用都重新 create、共享同一个 `running`（RED：第二次调用等在同一个预览上超时）。`useRef` 必须排在 `RepoTab` 里 `loading` 的提前 `return` 之前，否则 hooks 数量随渲染变化。
+  - 遗留：顶替时旧请求的 Promise 仍不结束（机制未变），`running` 挡住了同步流程之间的重叠；其他调用方的确认框都是用户点击触发，模态框挡着。
+- **#6**：验证表按实际更新。
+
+验证：`cargo fmt --check` 干净 / `cargo clippy --all-targets` 0 告警 / `cargo test --no-fail-fast` 729 passed 0 failed；`pnpm build` 通过 / `pnpm test` 29 个文件 446 passed。**没有改 Tauri 命令签名**，未重跑真实窗口。
 
