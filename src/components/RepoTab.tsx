@@ -18,19 +18,8 @@ import {
   svnRebuildBaseline,
   svnCheckBaseline,
   svnMigrateEol,
-  svnSyncAbort,
-  svnSyncContinue,
-  svnSyncIn,
-  svnSyncInPreview,
 } from '../store/repoStore'
-import {
-  describeSyncAction,
-  describeSyncInPreview,
-  describeSyncOutcome,
-  expectFromPreview,
-  type SyncActionId,
-  type SyncInOutcome,
-} from '../engine/svnSyncIn'
+import { createSvnSyncFlow } from './svnSyncFlow'
 import SvnInitWizard from './SvnInitWizard'
 import BaselineBanner from './BaselineBanner'
 import { baselineMap } from '../engine/svnGraph'
@@ -558,67 +547,17 @@ export function RepoTab({
     })
   }
 
-  /** 同步收尾之后的刷新。`repo-changed` 由后端补发，这里只补它不管的 SVN 侧状态。 */
-  const afterSync = async () => {
-    await refreshSvnSyncState(repoPath)
-    await refreshSvnSync(repoPath)
-    void fetchSvnLog(repoPath)
-  }
-
-  /**
-   * 冲突、撞名、放弃这几种结局要让用户看见；成功不打扰。
-   *
-   * 走 `confirm` 只是借它的对话框外观——取消与确认在这里等价。
-   */
-  const showOutcome = async (o: SyncInOutcome | null) => {
-    const n = o && describeSyncOutcome(o)
-    if (!n) return
-    await confirm({ title: n.title, message: n.detail, confirmLabel: '知道了' })
-  }
-
-  /**
-   * 「更新」（spec §7）：预览 → 确认 → 执行。
-   *
-   * 预览失败（前置检查不过）直接报错，一个字节都没动。执行走 `action`：
-   * 它要跑完整的 svn update（网络），确认完就关框的话界面上几秒毫无动静。
-   * 执行出错时对话框留在原地显示错误——后端的错误文案里已经写了回退的结果。
-   */
-  const handleSvnUpdate = async () => {
-    let preview
-    try {
-      preview = await svnSyncInPreview(repoPath)
-    } catch (err) {
-      reportError(err)
-      return
-    }
-    // 用盒子而不是 `let outcome`：闭包里的赋值 TS 的控制流分析看不见，
-    // `if (outcome)` 会被收窄成 never
-    const box: { outcome: SyncInOutcome | null } = { outcome: null }
-    await confirm({
-      ...describeSyncInPreview(preview),
-      action: async () => {
-        box.outcome = await svnSyncIn(repoPath, expectFromPreview(preview))
-        await afterSync()
-      },
-    })
-    await showOutcome(box.outcome)
-  }
-
-  /** 横幅上的继续 / 放弃（spec §7.6）。 */
-  const handleSyncAction = async (id: SyncActionId) => {
-    const s = state.svnSyncState
-    const phase = s && !('readError' in s) && s.unfinished ? s.unfinished.phase : 'start'
-    const box: { outcome: SyncInOutcome | null } = { outcome: null }
-    await confirm({
-      ...describeSyncAction(id, phase),
-      action: async () => {
-        box.outcome =
-          id === 'syncContinue' ? await svnSyncContinue(repoPath) : await svnSyncAbort(repoPath)
-        await afterSync()
-      },
-    })
-    await showOutcome(box.outcome)
-  }
+  // 「更新」与横幅上的继续 / 放弃。流程在 `svnSyncFlow.ts`，这里只注入依赖
+  const { handleSvnUpdate, handleSyncAction } = createSvnSyncFlow({
+    repoPath,
+    syncState: () => state.svnSyncState,
+    confirm,
+    clearError,
+    reportError,
+    refreshSvnSyncState,
+    refreshSvnSync,
+    fetchSvnLog,
+  })
 
   /**
    * 走一次行尾迁移：装规则 + 重录基线（spec §7.3.0）。

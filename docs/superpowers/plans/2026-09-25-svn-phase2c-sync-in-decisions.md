@@ -692,3 +692,11 @@
   - `pnpm build` 通过 / `pnpm test` 28 个文件 439 passed。`AGENTS.md` §8、`CLAUDE.md` 补了组件测试的写法与界限（jsdom 不渲染布局，不替代 §6.1 的视觉验证）。
 - **E2E 清单不用改**：清单写的「点『知道了』」是对的行为，错的是实现。
 
+### 场景 6 → 7：旧的红色错误条与新横幅叠在一起
+
+- **现象**（用户截图）：场景 6 预览被拒留下的 `sync_in_merge_in_range` 红条，在场景 7 撤掉 merge、外部 update 之后仍挂着，顶部同时有黄色「工作副本已在外部更新」横幅与这条过时的红条。
+- **原因**：顶部错误条（`reportError`）全应用常驻、点 × 才关；各操作开始时都不清它（仅「双击 tag 检出」例外）。不是本 PR 新引入的机制，但在「更新」这里表现为过时的前置检查结论。
+- **方案**（用户选 A + C）：A 重试即清——「更新」与横幅上的继续 / 放弃开始时先 `clearError()`，这次再失败照常报新的；C 清单场景 6 末尾加「点 × 关掉」，场景 7 的「看到别的」表加一行。**否决 B**（`repo-changed` 时清 `sync_in_*` 错误）：每个同步命令结束时后端都补发一次 `repo-changed`，错误会一闪即逝。
+- **重构**：为了能测，把 `afterSync` / `showOutcome` / `handleSvnUpdate` / `handleSyncAction` 从 `RepoTab.tsx` 原样移到新文件 `src/components/svnSyncFlow.ts`（`createSvnSyncFlow(deps)`，不依赖 React），`RepoTab` 只注入依赖。
+- **测试**：`tests/vitest/svnSyncFlow.test.ts` 4 条（node 环境，`vi.mock` 掉四个 invoke 包装）。先做纯搬移：全流程那条绿（证明搬移没改行为），三条清错的 RED；加上 `clearError()` 后全绿。其中一条钉住「这次预览又被拒时，新错误在清除之后报出、不会被清掉」。`pnpm build` 通过 / `pnpm test` 29 个文件 443 passed。
+
