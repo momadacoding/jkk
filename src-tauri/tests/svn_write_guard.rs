@@ -181,11 +181,48 @@ fn read_methods_are_not_guarded() {
 ///
 /// `svn_init_hybrid` **不在**此列：它只在 `SvnUninitialized` 上跑，那种目录里
 /// 还没有 `.git`，也就不可能有锁。
-const GUARDED_COMMANDS: &[(&str, &str)] = &[
-    ("commands/ops.rs", "revert"),
-    ("commands/svn.rs", "svn_rebuild_baseline"),
-    ("commands/svn.rs", "svn_migrate_eol"),
-];
+///
+/// 后两条后来从「看一眼锁」升级成「全程持锁」（拿锁本身就包含了「有人持有就拒绝」），
+/// 挪到下面 `commands_moving_the_baseline_hold_the_lock_throughout` 去守。
+const GUARDED_COMMANDS: &[(&str, &str)] = &[("commands/ops.rs", "revert")];
+
+/// 移动 `svn/base` 的两条命令：**全程**持同步锁，而不只是开头看一眼（PR #49 Codex review #3）。
+///
+/// 只看一眼的话，检查之后、移动基线之前开始的一次同步会收起 WIP、写 journal，
+/// 然后被移走的基线挡在半路。行为上「持锁期间同步被拒」由
+/// `svn_baseline_guard.rs::a_sync_cannot_start_while_the_baseline_is_being_moved` 守着；
+/// 这里守的是两条命令真的走了那个持锁的入口，而且在干活之前。
+#[test]
+fn commands_moving_the_baseline_hold_the_lock_throughout() {
+    let src = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/svn.rs"))
+        .unwrap();
+    for (func, engine_fn) in [
+        ("svn_rebuild_baseline", "rebuild_baseline("),
+        ("svn_migrate_eol", "migrate_eol("),
+    ] {
+        let body = fn_body(&src, func);
+        let hold = body
+            .find("hold_for_baseline_move(")
+            .unwrap_or_else(|| panic!("`{func}` 没有全程持锁"));
+        let work = body
+            .rfind(engine_fn)
+            .unwrap_or_else(|| panic!("`{func}` 没有调 `{engine_fn}`"));
+        assert!(hold < work, "`{func}` 拿锁写在干活之后");
+        assert!(
+            !body.contains("let _ = hold_for_baseline_move("),
+            "`{func}`：`let _ =` 会当场放掉锁，要绑到一个活到函数结束的名字上"
+        );
+    }
+    let helper = fn_body(&src, "hold_for_baseline_move");
+    let acquire = helper.find("svn_lock::acquire").expect("没有拿锁");
+    let recheck = helper
+        .rfind("refuse_while_unfinished(")
+        .expect("没有查未收尾的同步");
+    assert!(
+        acquire < recheck,
+        "拿到锁之后要再查一次 journal：查与拿之间可能刚有一次同步停在了冲突上"
+    );
+}
 
 #[test]
 fn write_commands_outside_the_vcs_trait_are_guarded_too() {

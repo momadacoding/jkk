@@ -770,7 +770,7 @@ pub(crate) fn unresolved(files: &[String]) -> GitError {
     )
 }
 
-fn new_opid() -> String {
+pub(crate) fn new_opid() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())

@@ -147,6 +147,8 @@ export function BranchView({
         })
         if (next && next !== name) onRename(name, next)
       })(),
+      // 同下面的「删除」：改了名，基线就等于不在了（后端同样拒绝）
+      disabled: isBaselineBranch(name),
     },
     {
       label: 'New branch from here…',

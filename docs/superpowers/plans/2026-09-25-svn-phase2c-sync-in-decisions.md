@@ -736,3 +736,22 @@
 
 验证：`cargo fmt --check` 干净 / `cargo clippy --all-targets` 0 告警 / `cargo test --no-fail-fast` 729 passed 0 failed；`pnpm build` 通过 / `pnpm test` 29 个文件 446 passed。**没有改 Tauri 命令签名**，未重跑真实窗口。
 
+### 后续：#2 的 `svn/base` 部分与 #3（PR #49 合并后另开的小 PR，分支 `worktree-svn-guard-followups`）
+
+- **#2 `svn/base` 删除 / 改名**：`vcs/svn.rs::refuse_baseline_branch`。`delete_branch` 与 `rename_branch` 的两端（`old`、`new`）都查，精确匹配 `svn/base`（容忍 `refs/heads/` 前缀），报 `svn_baseline_branch_protected`。`svn/base-backup` 之类照常。**计划没写的坑**：比较不区分大小写。2026-09-30 在临时仓库实测（Windows / NTFS，ref 为散装文件），`git branch -D SVN/BASE` 删掉的就是 `svn/base`，`git branch -m SVN/BASE x` 把它改了名；测试 `a_differently_cased_name_does_not_get_around_it`（RED：删掉了）。界面 `BranchView` 的「Rename…」对基线置灰，与既有的「Delete…」一致。与锁无关：任何状态下都拒绝。
+- **#3 重建 / 迁移全程持锁**：`commands/svn.rs::hold_for_baseline_move`。它先查 journal，再 `svn_lock::acquire`，拿到锁后再查一次 journal；两条命令把锁绑在 `_lock` 上，持到命令结束。
+  - 先查一次，是为了不给注定被拒的操作去接管崩溃留下的残锁。
+  - 锁内复核，是因为查与拿之间可能刚有一次同步停在冲突上：冲突出口放锁、留 journal。
+  - opid 带 `baseline-` 前缀，「正忙」时看得出持有者不是一次更新。
+  - 持锁期间界面会显示通用的「这个工作副本正在进行一次同步」横幅，文案没有区分重建。可以接受：此时重建的确认框正显示进度。
+- **测试**（新文件 `tests/svn_baseline_guard.rs`，fixture 仓库）：
+  - 基线删不掉。RED：删掉了。
+  - 基线改名两个方向都被拒。RED：改名成功。
+  - 别的分支照常能删、能改名。
+  - 持锁期间 `run_sync_in` 报 `sync_in_progress`、不写 journal、HEAD 不动，放锁后 `is_held` 为假。
+  - 被占锁 / 有 journal 时拒绝，且被拒时不留锁。
+  - `svn_write_guard.rs` 新增接线测试：两条命令在干活之前调用持锁入口，且不是 `let _ =`；入口在拿锁之后复核 journal。RED：找不到持锁入口。
+  - 原 `GUARDED_COMMANDS` 表里的这两条挪到新测试去守，因为拿锁本身就包含了「有人持有就拒绝」。
+  - **竞态本身**（检查与移动之间插进一次同步）没有确定性的复现手段。持锁入口从结构上消除了这个窗口；行为测试守「持锁期间同步被拒」，接线测试守「命令确实全程持锁」。
+- 验证：`cargo fmt --check` 干净 / `cargo clippy --all-targets` 0 告警 / `cargo test --no-fail-fast` 742 passed 0 failed；`pnpm build` 通过 / `pnpm test` 30 个文件 456 passed。没有改 Tauri 命令签名。
+
