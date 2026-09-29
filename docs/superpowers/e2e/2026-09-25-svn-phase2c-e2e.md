@@ -432,6 +432,11 @@ G stash list
 `status` **只剩** ` M Code/W7.cs`；`class S7 {}`；`art7`；`svn/base` 两条都是 `svn: r…`
 且 revision 相同（接管录一条、S7 再录一条）；`stash list` 里没有 `mygitclient-sync`。
 
+**在图里找不到这两个 hash 是对的：** 基线 commit 不单独成行，会被换成对应的 SVN 节点。
+这一行的 hash 列显示 `r…`，标题用 SVN log 里的提交说明，`svn/base` 标签也画在这一行上（spec §10.3 / §10.4）。
+两条基线 revision 相同，所以都落在**同一行** `r…` 上，图里不会出现两行。要看它们的 OID，只能在操作窗口里用
+`G log`。
+
 **看到别的说明：**
 
 | 现象 | 含义 |
