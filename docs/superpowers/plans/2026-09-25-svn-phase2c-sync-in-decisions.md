@@ -18,8 +18,8 @@
 | 7A | 外部整体 update 之后由「更新」接管（A16） | ✅ 完成 | `SyncInPreview.catch_up_rev`、`check_sync_in` 放行整体前进、`svn_sync_in::catch_up` + 9 条测试（替换 Task 2 的 1 条） | RED 已见（`catch_up_rev` 不存在）；5 条变异各自红对应测试；fmt / clippy 0 告警 / `cargo test` 692 passed 0 failed |
 | 8 | Tauri 命令 | ✅ 完成 | 新文件 `commands/svn_sync.rs`（4 个命令）+ 注册 + 2 条测试 | RED 已见（guard 测试因文件不存在失败）；2 条变异各自红对应测试；fmt / clippy 0 告警 / `cargo test` 695 passed 0 failed；`pnpm tauri dev` 实跑留到 Task 10 |
 | 9 | 前端纯逻辑 | ✅ 完成 | 新模块 `src/engine/svnSyncIn.ts`；`svnJournal.ts`（`applying-stash`、横幅动作、`sinceText`）、`svnSync.ts`（整体前进降黄、`svnUpdate`）、`toolbarActions.ts`（`showsSvnUpdate`）+ 测试 | RED 已见（6 条失败 + 1 个模块缺失）；5 条变异各自红对应测试（第 3 条靠加强的用例）；`pnpm build` 通过 / `pnpm test` 430 passed |
-| 10 | 前端接线 | 🟡 代码完成，真实窗口冒烟未跑 | `repoStore.ts` 四个 invoke、`Toolbar.tsx`「更新」、`BaselineBanner.tsx` 继续 / 放弃与「更新…」、`RepoTab.tsx` 编排、`styles.css` 的 `.dialog-message` 换行 | `pnpm build` 通过 / `pnpm test` 430 passed；`pnpm tauri dev` 场景 1 / 2 **未跑**（需人工操作真实窗口） |
-| 11 | E2E + spec 修订 + 收尾 | 🟡 清单与 spec 完成，真实窗口场景未跑 | `docs/superpowers/e2e/2026-09-25-svn-phase2c-e2e.md`（8 个场景）、spec §7.2 注记 / §7.3 S3·S5·S8 注记 / §18「十四」 | 全量验证见下表；E2E 机械检查两条通过；独立 review 见「Task 11」 |
+| 10 | 前端接线 | ✅ 完成（真实窗口冒烟随 E2E 8 个场景于 2026-09-30 通过） | `repoStore.ts` 四个 invoke、`Toolbar.tsx`「更新」、`BaselineBanner.tsx` 继续 / 放弃与「更新…」、`RepoTab.tsx` 编排、`styles.css` 的 `.dialog-message` 换行 | `pnpm build` 通过 / `pnpm test` 430 passed；`pnpm tauri dev` 场景 1 / 2 **未跑**（需人工操作真实窗口） |
+| 11 | E2E + spec 修订 + 收尾 | 🟡 清单、spec、真实窗口 E2E（8 个场景，2026-09-30 用户跑完）完成；最新几轮修复的独立 review 未做 | `docs/superpowers/e2e/2026-09-25-svn-phase2c-e2e.md`（8 个场景）、spec §7.2 注记 / §7.3 S3·S5·S8 注记 / §18「十四」 | 全量验证见下表；E2E 机械检查两条通过；独立 review 见「Task 11」 |
 | 12 | PR #49 review（第二轮）修复 | ✅ 完成 | `svn_sync_check::current_branch`、`svn_sync_in`（`untracked_leftovers`、`require_our_rebase`、`back_outcome`、`continue_rebase` 重走 S9）、journal `leftOrig` / `rollingBack`、`Released.rolledBack`、前端文案 + 12 条 Rust / 2 条 vitest | 见下「PR #49 review（第二轮）」；fmt / clippy 0 告警 / `cargo test` 711 passed 0 failed；`pnpm build` 通过 / `pnpm test` 433 passed |
 | 13 | PR #49 review（第三轮）修复 | ✅ 完成 | `require_restore_target`、`require_our_rebase` 加 `onto` / `orig-head`、`svn_sync_stash::blocking_ancestor`、`UpdateStatusEntry.repos_props` + `is_conflicted` / `is_incoming`、`SyncInExpect.orig_branch`（前后端）+ 10 条 Rust / 1 条 vitest 改写 | 见下「PR #49 review（第三轮）」；fmt / clippy 0 告警 / `cargo test` 721 passed 0 failed；`pnpm build` 通过 / `pnpm test` 433 passed |
 | 14 | PR #49 review（第四轮）修复 | ✅ 完成 | `published_baseline`（重放目标 / 认 rebase / 放回复核都以 `newBaselineOid` 为准）、`commands/svn.rs::refuse_while_unfinished`、`RestoreStep::Kept` + `SyncInOutcome::Settled`（冲突后继续不 drop）、前端 `settled` 文案与「继续」确认框 + 5 条 Rust 新增 / 1 条改写、2 条 vitest；修正第三轮 heredoc 写坏的一处测试字面量 | 见下「PR #49 review（第四轮）」；fmt / clippy 0 告警 / `cargo test` 726 passed 0 failed；`pnpm build` 通过 / `pnpm test` 435 passed |
@@ -699,4 +699,13 @@
 - **方案**（用户选 A + C）：A 重试即清——「更新」与横幅上的继续 / 放弃开始时先 `clearError()`，这次再失败照常报新的；C 清单场景 6 末尾加「点 × 关掉」，场景 7 的「看到别的」表加一行。**否决 B**（`repo-changed` 时清 `sync_in_*` 错误）：每个同步命令结束时后端都补发一次 `repo-changed`，错误会一闪即逝。
 - **重构**：为了能测，把 `afterSync` / `showOutcome` / `handleSvnUpdate` / `handleSyncAction` 从 `RepoTab.tsx` 原样移到新文件 `src/components/svnSyncFlow.ts`（`createSvnSyncFlow(deps)`，不依赖 React），`RepoTab` 只注入依赖。
 - **测试**：`tests/vitest/svnSyncFlow.test.ts` 4 条（node 环境，`vi.mock` 掉四个 invoke 包装）。先做纯搬移：全流程那条绿（证明搬移没改行为），三条清错的 RED；加上 `clearError()` 后全绿。其中一条钉住「这次预览又被拒时，新错误在清除之后报出、不会被清掉」。`pnpm build` 通过 / `pnpm test` 29 个文件 443 passed。
+
+### 场景 7：`svn/base` 的两个 OID 在图里找不到——设计行为，清单补说明
+
+- **现象**：`G log --oneline -2 svn/base` 给出两条 `svn: r8`（与清单一致），但图里搜不到这两个 hash。
+- **结论**：不是缺陷。`spliceHistory`（spec §10.3 / §10.4）把基线 commit 换成 `svn:N` 节点，hash 列显示 `rN`、标题取 SVN log 的提交说明、`svn/base` 标签重映射到该行；同 revision 的两条基线落在同一行 `r8`。清单场景 7 补了一段说明（`a990c28`）。
+
+### 结果
+
+- 2026-09-30 用户在 `pnpm tauri dev` 真实窗口跑完清单 8 个场景，全部符合预期。途中发现的两个缺陷（场景 2 结局框卡「处理中」、场景 6 → 7 旧红条）已修复并复测通过。
 
