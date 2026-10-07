@@ -18,9 +18,21 @@ pub fn delete_branch(path: String, name: String) -> Result<()> {
 }
 
 /// 删除分支前的确认框要显示的信息：对应的远程分支、还有多少提交没合并进来。
+///
+/// `merged_heads`（JS 侧 `mergedHeads`）是这个分支已合并 PR 的合并点，只作 squash
+/// 识别的候选，见 [`crate::engine::branch::delete_info_with_merged_heads`]。
+/// 可选：没有 PR 信息（gh 不可用、非 GitHub 仓库）时前端不传。
 #[tauri::command(async)]
-pub fn branch_delete_info(path: String, name: String) -> Result<crate::engine::branch::DeleteInfo> {
-    crate::engine::branch::delete_info(&path, &name)
+pub fn branch_delete_info(
+    path: String,
+    name: String,
+    merged_heads: Option<Vec<String>>,
+) -> Result<crate::engine::branch::DeleteInfo> {
+    crate::engine::branch::delete_info_with_merged_heads(
+        &path,
+        &name,
+        merged_heads.as_deref().unwrap_or_default(),
+    )
 }
 
 #[tauri::command(async)]

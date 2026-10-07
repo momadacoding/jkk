@@ -3,6 +3,8 @@ import { invoke } from '@tauri-apps/api/core'
 import { toErrorMessage } from '../engine/errors'
 import type { Capabilities } from '../engine/capabilities'
 import { deleteBranchTargets } from '../engine/deleteBranchTargets'
+import { unmergedNote } from '../engine/deleteBranchNote'
+import type { PullRequest } from '../engine/types'
 
 /** 检出了待删分支的 worktree（主工作区除外）。 */
 export interface WorktreeTarget {
@@ -40,6 +42,10 @@ export interface DeleteInfo {
    * 表现。为真时那几个提交丢不了东西，警告降级成中性提示。
    */
   contentMerged: boolean
+  /** `contentMerged` 靠哪个已合并 PR 的合并点证明的；分支自己认得出来时为 null。 */
+  mergedVia: string | null
+  /** `contentMerged` 为真时内容实际在哪个 ref 上找到的；不一定是 `comparedTo`。 */
+  mergedInto: string | null
   /** 检出了这个分支的 worktree；没有就不显示那个勾选框。 */
   worktree: WorktreeTarget | null
 }
@@ -105,6 +111,11 @@ interface DeleteBranchDialogProps {
    * 上层裁不到、却能触达 `delete_worktree` 的入口（2026-09-13 独立 review 抓到）。
    */
   capabilities: Capabilities
+  /**
+   * 这个分支上已合并的 PR（见 `mergedPullRequestsFor`）。合并点交给后端当 squash
+   * 识别的候选；没有 PR 信息时传空数组，判定退回只看分支自己。
+   */
+  mergedPullRequests: PullRequest[]
 }
 
 /**
@@ -117,7 +128,7 @@ interface DeleteBranchDialogProps {
  * 勾选框的话这类分支在界面上根本删不掉。
  */
 export function DeleteBranchDialog({
-  repoPath, name, onCancel, onConfirm, capabilities,
+  repoPath, name, onCancel, onConfirm, capabilities, mergedPullRequests,
 }: DeleteBranchDialogProps) {
   const [info, setInfo] = useState<DeleteInfo | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -132,25 +143,39 @@ export function DeleteBranchDialog({
   /** 删除正在进行中。勾了远程时这一步要走网络，实测能到四五秒。 */
   const [busy, setBusy] = useState(false)
   const confirmRef = useRef<HTMLButtonElement>(null)
+  /** 勾选框的默认值是否已经按第一次拿到的信息设过。 */
+  const defaultsApplied = useRef(false)
+
+  // 拼成字符串当 effect 的依赖：数组每次渲染都是新的引用，直接放进依赖会反复重查。
+  // PR 列表是异步到的，弹框开着时它到了，这个 key 一变就会带着合并点重查一次
+  const mergedHeadsKey = mergedPullRequests.map((pr) => pr.headRefOid).join(',')
 
   useEffect(() => {
     if (!repoPath) return
     let cancelled = false
-    invoke<DeleteInfo>('branch_delete_info', { path: repoPath, name })
+    const mergedHeads = mergedHeadsKey ? mergedHeadsKey.split(',') : []
+    invoke<DeleteInfo>('branch_delete_info', { path: repoPath, name, mergedHeads })
       .then((data) => {
         if (cancelled) return
         setInfo(data)
+        // PR 列表晚到会重查一次，上一次的失败不该留在成功的结果旁边
+        setError(null)
+        // 默认值只在第一次拿到信息时设：PR 列表晚到会触发重查，那时用户可能已经
+        // 改过勾选框了，再设一遍会把他的选择悄悄改回去
+        if (defaultsApplied.current) return
+        defaultsApplied.current = true
         // 后端不支持 worktree 时**不能默认勾上**——那个勾选框根本不会渲染出来，
         // 用户没有机会取消它，而 confirm() 会照着这个 state 发出 delete_worktree
         setAlsoWorktree(capabilities.worktrees && data.worktree !== null)
       })
       .catch((err) => { if (!cancelled) setError(toErrorMessage(err)) })
     return () => { cancelled = true }
-  }, [repoPath, name, capabilities.worktrees])
+  }, [repoPath, name, capabilities.worktrees, mergedHeadsKey])
 
   // 远程信息还没回来就先不给删：这时候勾选框还没出现，
   // 用户根本没机会决定要不要连远程一起删
   const ready = info !== null
+  const unmerged = info === null ? null : unmergedNote(info, mergedPullRequests)
 
   /**
    * 跑删除，跑完之前弹框留在原地。
@@ -267,20 +292,14 @@ export function DeleteBranchDialog({
           </>
         )}
 
-        {/* 同一个数字，两种读法。squash merge 之后提交对象全换了新 SHA，这个数
+        {/* 同一个数字，几种读法。squash merge 之后提交对象全换了新 SHA，这个数
             必然大于 0，但内容早就进当前分支了——那种情况下喊「只能靠 reflog 找回」
-            纯属误报，而且每合并一个分支就误报一次，喊到最后真出事也没人看了 */}
-        {info !== null && info.unmerged > 0 && (
-          info.contentMerged ? (
-            <div className="dlg-note">
-              该分支有 {info.unmerged} 个提交不在 {info.comparedTo} 上，但改动已经进去了
-              （squash 或 rebase 合并后的正常现象），删掉不会丢东西。
-            </div>
-          ) : (
-            <div className="dlg-warning">
-              该分支有 {info.unmerged} 个提交不在 {info.comparedTo} 上，删除后只能靠 reflog 找回。
-            </div>
-          )
+            纯属误报，而且每合并一个分支就误报一次，喊到最后真出事也没人看了。
+            措辞的判定在 unmergedNote */}
+        {unmerged && (
+          <div className={unmerged.tone === 'warning' ? 'dlg-warning' : 'dlg-note'}>
+            {unmerged.text}
+          </div>
         )}
 
         {error && <div className="dlg-warning">{error}</div>}

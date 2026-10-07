@@ -54,6 +54,19 @@ pub struct DeleteInfo {
     ///
     /// 判据见 [`content_is_already_in_head`]。
     pub content_merged: bool,
+    /// `content_merged` 是靠哪个已合并 PR 的合并点（`headRefOid`）证明的；
+    /// 分支自己就认得出来、或根本没认出来时为 None。
+    ///
+    /// 本地分支落后于合并点时（别处又推了提交再合并），squash 提交对应的是合并点的
+    /// 净改动，分支自己的 patch-id 对不上，只有换成合并点去比才认得出。界面据此说清
+    /// 「这些提交在哪个 PR 里」，否则一句「改动已经进去了」和分支的实际内容对不上号。
+    pub merged_via: Option<String>,
+    /// `content_merged` 为真时，内容实际是在哪个目标上找到的，如 `main`、`feat/a`。
+    ///
+    /// 不一定等于 [`compared_to`](Self::compared_to)：那是报数用的、落下最少的目标，
+    /// 而内容可能是在别的候选（比如当前 HEAD）上找到的。叠 PR 时尤其如此——合进
+    /// `feat/a` 的 PR 不等于进了 main，界面若照 `compared_to` 说「进了 main」就是在说谎。
+    pub merged_into: Option<String>,
     /// 检出了这个分支的 worktree（主工作区除外），没有就是 None。
     ///
     /// 这不是锦上添花的信息：分支被 worktree 占着时 `git branch -D` 会直接拒绝
@@ -424,8 +437,30 @@ pub fn local_target_for(path: &str, remote_ref: &str) -> Result<(String, bool)> 
     Ok((local, exists))
 }
 
-/// 删除分支前要在确认框里显示的信息。
+/// 删除分支前要在确认框里显示的信息。不借助任何 PR 信息。
 pub fn delete_info(path: &str, name: &str) -> Result<DeleteInfo> {
+    delete_info_with_merged_heads(path, name, &[])
+}
+
+/// 一次最多试几个合并点。每个都可能跑一遍 patch-id 扫描，而弹框在等它。
+const MAX_MERGED_HEADS: usize = 10;
+
+/// 同 [`delete_info`]，另外拿这个分支已合并 PR 的合并点（`headRefOid`）兜底认 squash。
+///
+/// 合并点只是**候选**，不信任 GitHub 说的「已合并」：PR 可能合进的是别的 base。
+/// 放行要本地 git 同时证明两件事——
+/// 1. 本地分支是合并点的祖先（分支上的提交全在合并点的历史里）；
+/// 2. 合并点的内容已经在主干上（同 [`content_is_already_in`] 的判据）。
+///
+/// 非法 oid、本地没有的对象、与分支无祖先关系的合并点一律忽略，退回原来的判定。
+///
+/// 已知的放宽：合并点上若有提交**撤销**了分支的某些改动，那部分改动不会在主干上，
+/// 这里仍判为已合并。那是 PR 自己做出的取舍，不是删分支造成的丢失。
+pub fn delete_info_with_merged_heads(
+    path: &str,
+    name: &str,
+    merged_heads: &[String],
+) -> Result<DeleteInfo> {
     let repo = Repository::open(path)?;
     let (upstream, remote, remote_branch) = match find_remote_branch(&repo, name) {
         Some((u, r, b)) => (Some(u), Some(r), Some(b)),
@@ -442,7 +477,7 @@ pub fn delete_info(path: &str, name: &str) -> Result<DeleteInfo> {
 
     // 算不出来就当作「零个未合并、目标是 HEAD」：这两项只用于多显示一行提示，
     // 不该因为它们失败而让整个确认框打不开
-    let (unmerged, compared_to, content_merged) = (|| {
+    let (unmerged, compared_to, content_merged, merged_via, merged_into) = (|| {
         let branch_oid = repo
             .find_branch(name, BranchType::Local)
             .ok()?
@@ -472,19 +507,43 @@ pub fn delete_info(path: &str, name: &str) -> Result<DeleteInfo> {
         }
         let (label, best_oid, ahead) = best?;
         if ahead == 0 || ahead == usize::MAX {
-            return Some((0, label, false));
+            return Some((0, label, false, None, None));
         }
 
         // 提交对象没进去，内容可能已经进去了（squash / rebase 合并）。落下最少的
-        // 那个目标最可能已经含着这些活，深挖它；其余的只跑便宜的第一步兜一下
-        let merged = content_is_already_in(&repo, branch_oid, best_oid, true)
-            || targets
+        // 那个目标最可能已经含着这些活，深挖它；其余的只跑便宜的第一步兜一下。
+        // 返回内容实际在哪个目标上找到——它不一定是上面报数用的那个
+        let in_targets = |oid: git2::Oid| -> Option<String> {
+            if content_is_already_in(&repo, oid, best_oid, true) {
+                return Some(label.clone());
+            }
+            targets
                 .iter()
-                .filter(|(_, oid)| *oid != best_oid)
-                .any(|(_, oid)| content_is_already_in(&repo, branch_oid, *oid, false));
-        Some((ahead, label, merged))
+                .filter(|(_, t)| *t != best_oid)
+                .find(|(_, t)| content_is_already_in(&repo, oid, *t, false))
+                .map(|(l, _)| l.clone())
+        };
+        if let Some(into) = in_targets(branch_oid) {
+            return Some((ahead, label.clone(), true, None, Some(into)));
+        }
+
+        // 分支自己认不出来时，换成它的已合并 PR 合并点去认，条件见函数注释
+        let via = merged_heads.iter().take(MAX_MERGED_HEADS).find_map(|head| {
+            let head = git2::Oid::from_str(head).ok()?;
+            // 和分支头相同的话上面已经试过了
+            if head == branch_oid {
+                return None;
+            }
+            repo.find_commit(head).ok()?;
+            if !repo.graph_descendant_of(head, branch_oid).ok()? {
+                return None;
+            }
+            in_targets(head).map(|into| (head.to_string(), into))
+        });
+        let (via, into) = via.unzip();
+        Some((ahead, label.clone(), via.is_some(), via, into))
     })()
-    .unwrap_or((0, "HEAD".to_string(), false));
+    .unwrap_or((0, "HEAD".to_string(), false, None, None));
 
     Ok(DeleteInfo {
         upstream,
@@ -494,6 +553,8 @@ pub fn delete_info(path: &str, name: &str) -> Result<DeleteInfo> {
         unmerged,
         compared_to,
         content_merged,
+        merged_via,
+        merged_into,
         worktree: find_worktree(path, name),
     })
 }

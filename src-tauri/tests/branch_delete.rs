@@ -514,3 +514,218 @@ fn a_merged_branch_reports_nothing_unmerged() {
     let info = branch::delete_info(&p(&work), "feat/merged").unwrap();
     assert_eq!(info.unmerged, 0);
 }
+
+// ---- 本地分支落后于 PR 合并点时的 squash 识别 ----
+
+fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .expect("git not found");
+    assert!(out.status.success(), "git {args:?} failed");
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// 真实形态：本地分支停在 PR 合并点的**父提交**上。
+///
+/// 另一个工作副本在分支上又推了一个提交 H，PR 按 H squash 进 main，之后远端分支被删、
+/// 本地 `fetch --prune`。H 的对象在本地、却没有任何 ref 指着它；main 合并后继续往前走。
+/// squash 提交的 patch-id 对应的是 H 的净改动，本地分支只是它的一部分，于是旧判定
+/// 对不上，弹框喊「删除后只能靠 reflog 找回」——实际一点东西都丢不了。
+///
+/// 返回（远端、本地、另一个工作副本、H）。分支名 `feat/behind`，主干 `main`。
+fn branch_behind_a_squash_merged_pr_head() -> (TempDir, TempDir, TempDir, String) {
+    let (remote, work) = repo_with_remote();
+    let url = remote.path().to_str().unwrap().to_string();
+    run_git(work.path(), &["branch", "-m", "main"]);
+    run_git(work.path(), &["push", "-q", "-u", "origin", "main"]);
+    // 远端默认分支设成 main，和 GitHub 一致。不设的话 bare 仓库的 HEAD 指着
+    // repo_with_remote 推上去的 master，而新版 git 的 fetch 会照它建 origin/HEAD，
+    // 比较目标就成了那条只有 c1 的 origin/master
+    run_git(remote.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    run_git(work.path(), &["push", "-q", "origin", "--delete", "master"]);
+    run_git(work.path(), &["checkout", "-q", "-b", "feat/behind"]);
+    commit(work.path(), "c2");
+    commit(work.path(), "c3");
+    run_git(work.path(), &["push", "-q", "-u", "origin", "feat/behind"]);
+
+    let other = TempDir::new().unwrap();
+    run_git(other.path(), &["clone", "-q", &url, "."]);
+    run_git(other.path(), &["config", "user.email", "test@test.com"]);
+    run_git(other.path(), &["config", "user.name", "Test"]);
+    run_git(other.path(), &["checkout", "-q", "feat/behind"]);
+    // 合并点那个额外提交改的是分支碰过的文件——真实案例里正是这样
+    fs::write(other.path().join("c3.txt"), "c3 reviewed").unwrap();
+    run_git(other.path(), &["commit", "-qam", "address review"]);
+    run_git(other.path(), &["push", "-q", "origin", "feat/behind"]);
+    let head = git_out(other.path(), &["rev-parse", "HEAD"]);
+
+    // 本地 fetch 拿到 H 的对象，但本地分支没 pull，停在 c3
+    run_git(work.path(), &["fetch", "-q", "origin"]);
+    // GitHub 的 squash 合并：按 H 压成一个提交进 main，main 随后继续往前走
+    run_git(work.path(), &["checkout", "-q", "main"]);
+    run_git(work.path(), &["merge", "--squash", &head]);
+    run_git(work.path(), &["commit", "-qm", "squashed feat/behind (#1)"]);
+    commit(work.path(), "later");
+    // 远端删分支，本地 prune
+    run_git(
+        other.path(),
+        &["push", "-q", "origin", "--delete", "feat/behind"],
+    );
+    run_git(work.path(), &["fetch", "-q", "--prune", "origin"]);
+
+    // fixture 自检：形态必须和真实案例一致
+    run_git(work.path(), &["cat-file", "-e", &head]);
+    assert_eq!(
+        git_out(work.path(), &["for-each-ref", "--contains", &head]),
+        ""
+    );
+    assert_eq!(
+        git_out(work.path(), &["rev-parse", "feat/behind"]),
+        git_out(work.path(), &["rev-parse", &format!("{head}~1")]),
+        "本地分支应当正好落后 H 一个提交"
+    );
+    (remote, work, other, head)
+}
+
+#[test]
+fn without_the_pr_head_a_branch_behind_the_squashed_head_is_not_recognised() {
+    // 记录现状：只靠本地分支自己的 patch-id 认不出来。这正是要靠合并点补上的缺口
+    let (_remote, work, _other, _head) = branch_behind_a_squash_merged_pr_head();
+    let info = branch::delete_info(&p(&work), "feat/behind").unwrap();
+    assert_eq!(info.unmerged, 2);
+    assert!(!info.content_merged);
+    assert_eq!(info.merged_via, None);
+}
+
+#[test]
+fn a_branch_behind_a_squash_merged_pr_head_is_recognised_via_that_head() {
+    let (_remote, work, _other, head) = branch_behind_a_squash_merged_pr_head();
+    let info = branch::delete_info_with_merged_heads(
+        &p(&work),
+        "feat/behind",
+        std::slice::from_ref(&head),
+    )
+    .unwrap();
+    // 数字照实报——那两个提交对象确实不是 main 的祖先
+    assert_eq!(info.unmerged, 2);
+    assert_eq!(info.compared_to, "main");
+    assert!(
+        info.content_merged,
+        "H 的内容已经 squash 进 main，本地分支是 H 的祖先"
+    );
+    assert_eq!(info.merged_via.as_deref(), Some(head.as_str()));
+    assert_eq!(info.merged_into.as_deref(), Some("main"));
+}
+
+#[test]
+fn reports_where_the_content_was_actually_found_when_it_is_not_the_trunk() {
+    // 叠 PR：feat/b 的 PR 按合并点 H squash 进的是 feat/a（当前检出），不是 main。
+    // 报数用的目标是 main，但内容只在 feat/a 上——界面不能照 compared_to 说「进了 main」
+    let (_remote, work) = repo_with_remote();
+    run_git(work.path(), &["branch", "-m", "main"]);
+    run_git(work.path(), &["checkout", "-q", "-b", "feat/b"]);
+    commit(work.path(), "b1");
+    let tip = git_out(work.path(), &["rev-parse", "HEAD"]);
+    let tree = git_out(work.path(), &["rev-parse", "HEAD^{tree}"]);
+    // H：在 b1 上又改了 b1.txt，没有任何 ref 指着
+    fs::write(work.path().join("b1.txt"), "b1 reviewed").unwrap();
+    run_git(work.path(), &["add", "."]);
+    let h_tree = git_out(work.path(), &["write-tree"]);
+    run_git(work.path(), &["reset", "-q", "--hard", &tip]);
+    assert_ne!(h_tree, tree);
+    let head = git_out(
+        work.path(),
+        &["commit-tree", &h_tree, "-p", &tip, "-m", "address review"],
+    );
+
+    run_git(work.path(), &["checkout", "-q", "main"]);
+    run_git(work.path(), &["checkout", "-q", "-b", "feat/a"]);
+    commit(work.path(), "a1");
+    run_git(work.path(), &["merge", "--squash", &head]);
+    run_git(work.path(), &["commit", "-qm", "squash feat/b into feat/a"]);
+
+    let info =
+        branch::delete_info_with_merged_heads(&p(&work), "feat/b", std::slice::from_ref(&head))
+            .unwrap();
+    assert_eq!(info.compared_to, "main");
+    assert!(info.content_merged);
+    assert_eq!(info.merged_via.as_deref(), Some(head.as_str()));
+    assert_eq!(info.merged_into.as_deref(), Some("feat/a"));
+}
+
+#[test]
+fn a_merged_head_the_branch_is_not_an_ancestor_of_does_not_excuse_it() {
+    // 本地在 H 的父提交上又自己提交了一个——那个提交不在 H 里，更不在 main 里
+    let (_remote, work, _other, head) = branch_behind_a_squash_merged_pr_head();
+    run_git(work.path(), &["checkout", "-q", "feat/behind"]);
+    commit(work.path(), "local-only");
+    run_git(work.path(), &["checkout", "-q", "main"]);
+
+    let info = branch::delete_info_with_merged_heads(&p(&work), "feat/behind", &[head]).unwrap();
+    assert_eq!(info.unmerged, 3);
+    assert!(!info.content_merged, "local-only 不在任何地方，不能降级");
+    assert_eq!(info.merged_via, None);
+}
+
+#[test]
+fn a_merged_head_whose_content_is_not_on_the_trunk_does_not_excuse_it() {
+    // GitHub 说「已合并」不等于进了 main：PR 可能合进的是别的 base。
+    // 结论只能由本地 git 证明，H 的内容在 main 上找不到就不放行
+    let (_remote, work) = repo_with_remote();
+    run_git(work.path(), &["branch", "-m", "main"]);
+    run_git(work.path(), &["checkout", "-q", "-b", "feat/elsewhere"]);
+    commit(work.path(), "c2");
+    commit(work.path(), "c3");
+    let head = git_out(work.path(), &["rev-parse", "HEAD"]);
+    // 本地分支退到 H 的父提交上。分支被检出时 branch -f 动不了它，先切走
+    run_git(work.path(), &["checkout", "-q", "main"]);
+    run_git(
+        work.path(),
+        &["branch", "-f", "feat/elsewhere", &format!("{head}~1")],
+    );
+
+    let info = branch::delete_info_with_merged_heads(&p(&work), "feat/elsewhere", &[head]).unwrap();
+    assert_eq!(info.unmerged, 1);
+    assert!(!info.content_merged);
+    assert_eq!(info.merged_via, None);
+}
+
+#[test]
+fn bogus_merged_heads_are_ignored() {
+    // 空串、非法 oid、本地没有的对象：一律忽略，既不报错也不放行
+    let (_remote, work, _other, _head) = branch_behind_a_squash_merged_pr_head();
+    let heads = vec![String::new(), "not-an-oid".to_string(), "1".repeat(40)];
+    let info = branch::delete_info_with_merged_heads(&p(&work), "feat/behind", &heads).unwrap();
+    assert_eq!(info.unmerged, 2);
+    assert!(!info.content_merged);
+    assert_eq!(info.merged_via, None);
+}
+
+#[test]
+fn the_right_head_is_found_among_several() {
+    // 一个分支可能对应多条已合并 PR，逐个试，报出真正证明了合并的那一个
+    let (_remote, work, _other, head) = branch_behind_a_squash_merged_pr_head();
+    let heads = vec!["1".repeat(40), head.clone()];
+    let info = branch::delete_info_with_merged_heads(&p(&work), "feat/behind", &heads).unwrap();
+    assert!(info.content_merged);
+    assert_eq!(info.merged_via.as_deref(), Some(head.as_str()));
+}
+
+#[test]
+fn a_branch_recognised_on_its_own_does_not_claim_a_merged_head() {
+    // 分支自己就认得出 squash 时，merged_via 不该挂上一个不相干的 PR
+    let (_remote, work) = repo_with_remote();
+    run_git(work.path(), &["checkout", "-q", "-b", "feat/plain-squash"]);
+    commit(work.path(), "c2");
+    let tip = git_out(work.path(), &["rev-parse", "HEAD"]);
+    run_git(work.path(), &["checkout", "-q", "-"]);
+    run_git(work.path(), &["merge", "--squash", "feat/plain-squash"]);
+    run_git(work.path(), &["commit", "-qm", "squashed (#1)"]);
+
+    let info =
+        branch::delete_info_with_merged_heads(&p(&work), "feat/plain-squash", &[tip]).unwrap();
+    assert!(info.content_merged);
+    assert_eq!(info.merged_via, None);
+}
