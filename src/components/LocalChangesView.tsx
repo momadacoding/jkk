@@ -10,6 +10,7 @@ import {
   type FileSelection,
 } from '../engine/fileSelection'
 import { commitKeyAction, type CommitField } from '../engine/commitKeys'
+import { discardShortcut } from '../engine/fileListKeys'
 import { buildCommitMessage } from '../engine/commitActions'
 import { conflictsFirst } from '../engine/conflicts'
 
@@ -26,11 +27,12 @@ interface FileSectionProps {
   onRowContextMenu: (section: FileSection, files: string[], path: string, e: React.MouseEvent) => void
   onToggleOne: (path: string) => void
   onToggleAll: () => void
+  onKeyDown: (section: FileSection, e: React.KeyboardEvent) => void
 }
 
 function FileSectionList({
   title, section, files, actionLabel, selection, activePath,
-  onRowClick, onRowContextMenu, onToggleOne, onToggleAll,
+  onRowClick, onRowContextMenu, onToggleOne, onToggleAll, onKeyDown,
 }: FileSectionProps) {
   const paths = files.map((f) => f.path)
   const selectedHere = selection.section === section ? selection.paths : []
@@ -46,7 +48,9 @@ function FileSectionList({
           <button className="changes-action" onClick={onToggleAll}>{actionLabel} All</button>
         )}
       </div>
-      <div className="changes-section-files">
+      {/* 可聚焦，点一下行焦点就落在这里：快捷键只在文件列表有焦点时生效，
+          挂在 window 上的话 commit 输入框里按 Delete 删字也会被当成丢弃 */}
+      <div className="changes-section-files" tabIndex={0} onKeyDown={(e) => onKeyDown(section, e)}>
         {files.map((f) => (
           <div
             key={f.path}
@@ -56,7 +60,7 @@ function FileSectionList({
               f.path === activePath && selection.section === section ? 'active' : '',
               f.status === 'conflicted' ? 'conflicted' : '',
             ].filter(Boolean).join(' ')}
-            title={`${f.path}\nCtrl+单击多选 · Shift+单击选一段 · 右键更多操作`}
+            title={`${f.path}\nCtrl+单击多选 · Shift+单击选一段 · Delete 丢弃 · 右键更多操作`}
             onClick={(e) => onRowClick(section, paths, f.path, e)}
             onContextMenu={(e) => onRowContextMenu(section, paths, f.path, e)}
           >
@@ -146,6 +150,7 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
         label: `Discard changes${suffix}…`,
         onSelect: () => onDiscard(targets, staged),
         danger: true,
+        shortcut: 'Del',
       },
       {
         label: n > 1 ? `Copy paths${suffix}` : 'Copy path',
@@ -153,6 +158,25 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
       },
     ]
     open(e, items)
+  }
+
+  const fileListKeyDown = (section: FileSection, e: React.KeyboardEvent) => {
+    // isComposing 只在 nativeEvent 上，原因同 commitKeyDown
+    const req = discardShortcut({
+      key: e.key,
+      ctrlKey: e.ctrlKey,
+      metaKey: e.metaKey,
+      shiftKey: e.shiftKey,
+      altKey: e.altKey,
+      repeat: e.repeat,
+      isComposing: e.nativeEvent.isComposing,
+    }, section, selection, {
+      unstaged: unstaged.map((f) => f.path),
+      staged: status.staged.map((f) => f.path),
+    })
+    if (!req) return
+    e.preventDefault()
+    onDiscard(req.paths, req.staged)
   }
 
   // 基线分支上一律不能提交（spec §6.4），连 Ctrl+Enter 也走这个判据
@@ -205,6 +229,7 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
                   onRowContextMenu={contextMenu}
                   onToggleOne={(path) => onStage([path])}
                   onToggleAll={() => onStage(status.unstaged.map((f) => f.path))}
+                  onKeyDown={fileListKeyDown}
                 />
               </Panel>
               <Separator className="separator-h" />
@@ -220,6 +245,7 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
                   onRowContextMenu={contextMenu}
                   onToggleOne={(path) => onUnstage([path])}
                   onToggleAll={() => onUnstage(status.staged.map((f) => f.path))}
+                  onKeyDown={fileListKeyDown}
                 />
               </Panel>
             </Group>

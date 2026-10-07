@@ -7,6 +7,8 @@ export interface MenuItem {
   disabled?: boolean
   /** 危险操作（删除类），显示为红色。 */
   danger?: boolean
+  /** 右侧灰字提示的快捷键，只是展示；按键本身由调用方自己处理。 */
+  shortcut?: string
 }
 
 export interface MenuState {
@@ -77,6 +79,7 @@ export function ContextMenu({ menu, onClose }: { menu: MenuState | null; onClose
           onClick={() => { onClose(); setTimeout(() => item.onSelect(), 0) }}
         >
           {item.label}
+          {item.shortcut && <span className="context-menu-shortcut">{item.shortcut}</span>}
         </button>
       ))}
     </div>
