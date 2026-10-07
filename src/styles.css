@@ -332,6 +332,16 @@ body {
   color: #e57373;
 }
 
+.context-menu-shortcut {
+  float: right;
+  margin-left: 24px;
+  color: #888;
+}
+
+.context-menu-item:hover:not(:disabled) .context-menu-shortcut {
+  color: #ddd;
+}
+
 .worktree-badge {
   margin-left: auto;
   padding: 0 5px;
@@ -1418,6 +1428,16 @@ body {
 .changes-section-files {
   flex: 1;
   overflow: auto;
+}
+
+/* 点行就会聚焦这个容器，鼠标操作时不要画默认焦点框；键盘 Tab 进来时才标出来 */
+.changes-section-files:focus {
+  outline: none;
+}
+
+.changes-section-files:focus-visible {
+  outline: 1px solid #3a6ea5;
+  outline-offset: -1px;
 }
 
 .changes-empty {
