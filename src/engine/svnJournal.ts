@@ -7,6 +7,12 @@
 import type { BannerModel } from './svnSync'
 import { syncActions } from './svnSyncIn'
 
+/**
+ * 重建基线 / 行尾迁移拿同步锁时 opid 的前缀。与 `commands/svn.rs::hold_for_baseline_move`
+ * 逐字对齐——那边改了这里就认不出，横幅退回成「正在进行一次同步」。
+ */
+export const BASELINE_MOVE_OPID_PREFIX = 'baseline-'
+
 /** 后端 `svn_lock::LockHolder`。**只用于显示**，不是存活判据。 */
 export interface LockHolder {
   pid: number
@@ -136,6 +142,20 @@ export function describeUnfinishedSync(
     const who = s.holder
       ? `持有者是进程 ${s.holder.pid}，${sinceText(s.holder.startedAt, nowSecs)}。`
       : '还读不到持有它的进程信息（它可能刚刚开始）。'
+    // 重建基线 / 行尾迁移也全程拿着这把锁。用户知道自己没点过「更新」，再看到
+    // 「重开应用即可」，就会把正在跑的重建拦腰杀掉
+    if (s.holder?.opid.startsWith(BASELINE_MOVE_OPID_PREFIX)) {
+      return {
+        tone: 'warn',
+        title: '正在重建基线',
+        detail:
+          `${who}完成之前暂存、提交、切换分支、更新等写操作会被拒绝，` +
+          '查看状态和 diff 不受影响。',
+        actions: [],
+        // 行尾迁移同样会重录基线，用同一句话
+        note: '可能要等一会儿。请不要在这期间关掉应用。',
+      }
+    }
     return {
       tone: 'warn',
       title: '这个工作副本正在进行一次同步',

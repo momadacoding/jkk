@@ -7,6 +7,7 @@
 #[path = "common/svn_fixtures.rs"]
 mod svn_fixtures;
 
+use app_lib::commands::svn::{svn_migrate_eol, svn_rebuild_baseline};
 use app_lib::engine::git_cli::run_git;
 use app_lib::engine::svn_attributes::has_eol_rule;
 use app_lib::engine::svn_baseline::parse_trailer;
@@ -15,6 +16,7 @@ use app_lib::engine::svn_health::Health;
 use app_lib::engine::svn_init::{
     check_current_baseline, eol_status, init_hybrid, migrate_eol, rebuild_baseline, InitRequest,
 };
+use app_lib::engine::svn_lock;
 use app_lib::engine::svn_xml::parse_info;
 use std::process::Command;
 use svn_fixtures::{
@@ -873,6 +875,28 @@ fn rebuild_refuses_on_a_directory_that_was_never_initialized() {
 }
 
 #[test]
+fn the_baseline_commands_do_not_create_a_git_dir_where_there_is_none() {
+    // 命令层先拿同步锁，而锁文件落在 `.git` 里——顺序不对就会替用户建出一个空 `.git`。
+    // 之后 §6.1 把目录识别成 `SvnSuspicious`，建库被拒，用户得自己去找、去删
+    let fx = svn_repo();
+    let err = svn_rebuild_baseline(fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "svn_not_hybrid", "{}", err.message);
+    let err = svn_migrate_eol(fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "svn_not_hybrid", "{}", err.message);
+    assert!(!fx.wc().join(".git").exists(), "不许留下 .git");
+}
+
+#[test]
+fn the_rebuild_command_runs_to_the_end_under_its_own_lock() {
+    // 命令全程持同步锁，而 `assert_not_syncing` 连持有者自己也挡。重建里只要有一步
+    // 走到带守卫的入口，这条命令就会每次都报「正在同步」——只测「被拒」那一侧看不出来
+    let fx = hybrid_repo_updated_externally();
+    let report = svn_rebuild_baseline(fx.wc_str()).unwrap();
+    assert_eq!(report.node_rev, 3);
+    assert!(!svn_lock::is_held(&fx.wc_str()), "命令结束就放锁");
+}
+
+#[test]
 fn rebuild_emits_no_svn_write_command() {
     // 与初始化同样的约束：整个重建只读 SVN。
     let fx = hybrid_repo_updated_externally();
@@ -1348,7 +1372,9 @@ fn migration_installs_the_rule_and_rerecords_the_baseline() {
     let disk = std::fs::read(fx.wc().join("Code/Nat.cs")).unwrap();
     assert_ne!(stale, disk, "前提不成立：旧形状的基线本该与磁盘不同");
 
-    migrate_eol(&fx.wc_str()).unwrap();
+    // 走命令层：同时证明它在自己持着的同步锁下能跑到底（见重建那条）
+    svn_migrate_eol(fx.wc_str()).unwrap();
+    assert!(!svn_lock::is_held(&fx.wc_str()), "命令结束就放锁");
 
     assert!(has_eol_rule(&fx.wc_str()), "迁移后规则必须装上");
     assert_eq!(

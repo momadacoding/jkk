@@ -6,7 +6,7 @@ import { SidebarSection, SidebarGroup } from './SidebarSection'
 import { usePrompt } from './PromptDialog'
 import { DeleteBranchDialog, type DeleteTargets } from './DeleteBranchDialog'
 import { useConfirm } from './ConfirmDialog'
-import { isBaselineBranch, type Capabilities } from '../engine/capabilities'
+import { isProtectedBaseline, type Capabilities } from '../engine/capabilities'
 import { goneUpstreamName, goneUpstreamTooltip } from '../engine/refPills'
 
 interface BranchViewProps {
@@ -148,7 +148,7 @@ export function BranchView({
         if (next && next !== name) onRename(name, next)
       })(),
       // 同下面的「删除」：改了名，基线就等于不在了（后端同样拒绝）
-      disabled: isBaselineBranch(name),
+      disabled: isProtectedBaseline(name, capabilities),
     },
     {
       label: 'New branch from here…',
@@ -167,7 +167,7 @@ export function BranchView({
       // 基线分支不给删。spec §6.4 说真删了能从 reflog 恢复、最坏重建一个基线，
       // 但让它一键可删没有任何好处——删掉之后失同步检测、体检、重建全部失去
       // 参照，而用户通常不知道自己删的是什么。
-      disabled: name === head || isBaselineBranch(name),
+      disabled: name === head || isProtectedBaseline(name, capabilities),
       danger: true,
     },
   ]
@@ -230,7 +230,7 @@ export function BranchView({
       <SidebarGroup label="Local" count={local.length}>
         {local.map((ref) => {
           const name = shortName(ref)
-          const isBaseline = isBaselineBranch(name)
+          const isBaseline = isProtectedBaseline(name, capabilities)
           const classes = ['sb-row']
           if (name === head) classes.push('current')
           if (name === selectedBranch) classes.push('selected')

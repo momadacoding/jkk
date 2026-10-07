@@ -75,6 +75,16 @@ export function isBaselineBranch(name: string): boolean {
   return name.replace(/^refs\/heads\//, '') === BASELINE_BRANCH
 }
 
+/**
+ * 界面要不要把这个分支当基线护着（不给改名、删除、在其上提交）。
+ *
+ * 只在 SVN 混合仓库里成立：普通 git 仓库里叫 `svn/base` 的分支是用户自己的，
+ * 后端 `GitBackend` 不拦，界面也不该凭空锁死它。
+ */
+export function isProtectedBaseline(name: string, capabilities: Capabilities): boolean {
+  return capabilities.vcs === 'svn' && isBaselineBranch(name)
+}
+
 /** 侧边栏分区。取值与 `RepoTab` 里的渲染顺序一致。 */
 export type SidebarSection = 'branches' | 'tags' | 'worktrees' | 'stashes'
 

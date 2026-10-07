@@ -264,4 +264,28 @@ describe('sinceText', () => {
     expect(b.detail).toContain('4242')
     expect(b.detail).toContain('已持续 7 分钟')
   })
+
+  it('重建基线 / 行尾迁移拿着锁时不说「同步」，也不劝人重开应用', () => {
+    // 那两条命令全程持同步锁，opid 带 `baseline-` 前缀（`commands/svn.rs::hold_for_baseline_move`）。
+    // 用户知道自己没点过「更新」，照着「重开应用即可」去做，就把正在跑的重建拦腰杀掉
+    const b = describeUnfinishedSync(
+      {
+        locked: true,
+        holder: { pid: 4242, startedAt: 1000, opid: 'baseline-op-1-2' },
+        unfinished: null,
+      },
+      1000 + 60,
+    )!
+    expect(b.title).toContain('基线')
+    expect(b.title).not.toContain('同步')
+    expect(b.detail).toContain('4242')
+    expect(b.note ?? '').not.toContain('重开应用')
+
+    // 普通的同步照旧
+    const s = describeUnfinishedSync(
+      { locked: true, holder: { pid: 1, startedAt: 1000, opid: 'op-1-2' }, unfinished: null },
+      1000,
+    )!
+    expect(s.title).toBe('这个工作副本正在进行一次同步')
+  })
 })

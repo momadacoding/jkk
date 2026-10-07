@@ -60,6 +60,37 @@ fn a_differently_cased_name_does_not_get_around_it() {
 }
 
 #[test]
+fn an_at_brace_shorthand_does_not_get_around_it() {
+    // 2026-10-07 实测（git 2.51.2）：`git branch -D` / `-m` 会展开 `@{-N}`、`@{u}`、
+    // `<分支>@{upstream}`。一次更新会先切到 `svn/base` 再切回来，之后 `@{-1}` 就是基线，
+    // `git branch -D @{-1}` 输出「Deleted branch svn/base」
+    let fx = hybrid_with_colleague();
+    let base = git(&fx, &["rev-parse", "svn/base"]);
+    git(&fx, &["checkout", "-q", "svn/base"]);
+    git(&fx, &["checkout", "-q", "work"]);
+    git(&fx, &["branch", "--set-upstream-to=svn/base", "work"]);
+
+    for name in ["@{-1}", "@{u}", "work@{upstream}"] {
+        let err = delete_branch(fx.wc_str(), name.into()).unwrap_err();
+        assert_eq!(
+            err.code, "svn_baseline_branch_protected",
+            "{name}：{}",
+            err.message
+        );
+        let err = rename_branch(fx.wc_str(), name.into(), "moved".into()).unwrap_err();
+        assert_eq!(
+            err.code, "svn_baseline_branch_protected",
+            "{name}：{}",
+            err.message
+        );
+    }
+    // 新名字一侧同样会被展开
+    let err = rename_branch(fx.wc_str(), "work".into(), "@{-1}".into()).unwrap_err();
+    assert_eq!(err.code, "svn_baseline_branch_protected", "{}", err.message);
+    assert_eq!(git(&fx, &["rev-parse", "svn/base"]), base);
+}
+
+#[test]
 fn other_branches_are_still_renamed_and_deleted() {
     let fx = hybrid_with_colleague();
     git(&fx, &["branch", "tmp", "work"]);

@@ -208,9 +208,21 @@ fn commands_moving_the_baseline_hold_the_lock_throughout() {
             .rfind(engine_fn)
             .unwrap_or_else(|| panic!("`{func}` 没有调 `{engine_fn}`"));
         assert!(hold < work, "`{func}` 拿锁写在干活之后");
+        // 锁必须绑到一个活到函数结束的名字上。`let _ = …` 与裸语句 `hold_for_baseline_move(..)?;`
+        // 都会当场放掉它——后者编译器另有 `#[must_use]` 告警，这里不靠告警
+        let line = body
+            .lines()
+            .find(|l| l.contains("hold_for_baseline_move("))
+            .unwrap();
+        let binding = line
+            .trim()
+            .strip_prefix("let ")
+            .and_then(|rest| rest.split_once(" = "))
+            .map(|(name, _)| name.trim());
         assert!(
-            !body.contains("let _ = hold_for_baseline_move("),
-            "`{func}`：`let _ =` 会当场放掉锁，要绑到一个活到函数结束的名字上"
+            matches!(binding, Some(name) if name != "_"),
+            "`{func}`：锁没有绑到名字上，当场就放掉了：`{}`",
+            line.trim()
         );
     }
     let helper = fn_body(&src, "hold_for_baseline_move");

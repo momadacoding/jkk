@@ -174,11 +174,17 @@ fn assert_not_sync_backup(root: &str, index: usize) -> Result<()> {
 ///
 /// 但**不区分大小写**：2026-09-30 实测（Windows / NTFS，ref 为散装文件），
 /// `git branch -D SVN/BASE` 删掉的就是 `svn/base`，`-m` 同理。
+///
+/// 名字里带 `@{` 的一律拒绝：2026-10-07 实测（git 2.51.2），`git branch -D` / `-m`
+/// 会把 `@{-1}`、`@{u}`、`work@{upstream}` 展开成别的分支——一次更新先切到基线再切回来，
+/// 之后 `@{-1}` 就是 `svn/base`。不去解析它指向谁：`check-ref-format` 本来就不许分支名含
+/// `@{`，拒掉它挡不住任何一个真实的分支，而解析与删除之间又会多出一道缝。
 fn refuse_baseline_branch(name: &str) -> Result<()> {
-    if name
-        .strip_prefix("refs/heads/")
-        .unwrap_or(name)
-        .eq_ignore_ascii_case(BASELINE_BRANCH)
+    if name.contains("@{")
+        || name
+            .strip_prefix("refs/heads/")
+            .unwrap_or(name)
+            .eq_ignore_ascii_case(BASELINE_BRANCH)
     {
         return Err(GitError::new(
             "svn_baseline_branch_protected",

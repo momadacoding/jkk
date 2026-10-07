@@ -28,6 +28,7 @@ use crate::engine::svn_sync::{check_sync, read_root_revs, RootRev, SyncStatus};
 use crate::engine::svn_sync_in::new_opid;
 use crate::engine::{svn_journal, svn_lock};
 use crate::error::GitError;
+use crate::vcs::{detect_repo_kind, RepoKind};
 
 /// 只跑前置校验 P1–P4，**什么都不创建**。
 ///
@@ -71,10 +72,21 @@ pub fn svn_rebuild_baseline(path: String) -> Result<RebuildReport, GitError> {
 ///   不为一次注定被拒的操作去接管那把残锁。
 /// - 拿锁**之后**：查与拿之间可能刚有一次同步停在冲突上——冲突出口会放开锁、留着 journal。
 ///
+/// 仓库类型最先查：锁文件落在 `.git` 里，`acquire` 会替不存在的 `.git` 建目录。
+/// 对着一个没建过库的 SVN 工作副本，那会留下一个空 `.git`，§6.1 随后把它认成
+/// `SvnSuspicious`，建库被拒（与 `migrate_eol` 开头那条同一理由）。
+///
 /// `pub` 是给集成测试的：在持锁期间发起一次同步，确认它被拒。
 pub fn hold_for_baseline_move(path: &str) -> Result<svn_lock::SyncLock, GitError> {
+    if detect_repo_kind(path) != RepoKind::SvnHybrid {
+        return Err(GitError::new(
+            "svn_not_hybrid",
+            "这个目录不是已初始化的混合仓库，没有基线可动。",
+        ));
+    }
     refuse_while_unfinished(path)?;
-    // opid 只用于「正忙」时给人看持有者是谁；带上前缀，一眼能看出不是一次更新
+    // opid 只用于「正忙」时给人看持有者是谁；带上前缀，一眼能看出不是一次更新。
+    // 横幅靠这个前缀换文案，与 `svnJournal.ts::BASELINE_MOVE_OPID_PREFIX` 逐字对齐
     let lock = svn_lock::acquire(path, &format!("baseline-{}", new_opid()))?;
     refuse_while_unfinished(path)?;
     Ok(lock)
