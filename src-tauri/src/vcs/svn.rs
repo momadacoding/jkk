@@ -15,7 +15,7 @@ use crate::engine::diff::{DiffData, StatusData};
 use crate::engine::graph::GraphData;
 use crate::engine::repo::RepoInfo;
 use crate::engine::stash::StashEntry;
-use crate::engine::svn_config::SvnConfig;
+use crate::engine::svn_config::{SvnConfig, BASELINE_BRANCH};
 use crate::engine::svn_journal;
 use crate::engine::svn_lock::assert_not_syncing;
 use crate::engine::svn_sync_stash::stash_position;
@@ -111,10 +111,13 @@ impl Vcs for SvnGitBackend {
     }
     fn delete_branch(&self, name: &str) -> Result<()> {
         assert_not_syncing(&self.root)?;
+        refuse_baseline_branch(name)?;
         self.git.delete_branch(name)
     }
     fn rename_branch(&self, old: &str, new: &str) -> Result<()> {
         assert_not_syncing(&self.root)?;
+        refuse_baseline_branch(old)?;
+        refuse_baseline_branch(new)?;
         self.git.rename_branch(old, new)
     }
     fn checkout(&self, rev: &str) -> Result<()> {
@@ -156,6 +159,39 @@ fn assert_not_sync_backup(root: &str, index: usize) -> Result<()> {
             "sync_in_unfinished",
             "这条 stash 是上一次「更新」给未提交改动留的备份，那次同步还没有收尾。\
              请先在顶部横幅上选择「继续」或「放弃」，再处理它。",
+        ));
+    }
+    Ok(())
+}
+
+/// 基线分支不能被删、不能被改名走，别的分支也不能改名成它（PR #49 Codex review #2）。
+///
+/// 失同步检测、体检、重建、更新全都以 `svn/base` 为参照；未收尾的同步还按 OID
+/// 依赖着它。界面的「删除」已置灰，但后端不能只靠界面。
+///
+/// 整名匹配，与 `capabilities.ts::isBaselineBranch` 一致：`svn/base-backup` 这类
+/// 名字是用户自己的分支。容忍 `refs/heads/` 前缀。
+///
+/// 但**不区分大小写**：2026-09-30 实测（Windows / NTFS，ref 为散装文件），
+/// `git branch -D SVN/BASE` 删掉的就是 `svn/base`，`-m` 同理。
+///
+/// 名字里带 `@{` 的一律拒绝：2026-10-07 实测（git 2.51.2），`git branch -D` / `-m`
+/// 会把 `@{-1}`、`@{u}`、`work@{upstream}` 展开成别的分支——一次更新先切到基线再切回来，
+/// 之后 `@{-1}` 就是 `svn/base`。不去解析它指向谁：`check-ref-format` 本来就不许分支名含
+/// `@{`，拒掉它挡不住任何一个真实的分支，而解析与删除之间又会多出一道缝。
+fn refuse_baseline_branch(name: &str) -> Result<()> {
+    if name.contains("@{")
+        || name
+            .strip_prefix("refs/heads/")
+            .unwrap_or(name)
+            .eq_ignore_ascii_case(BASELINE_BRANCH)
+    {
+        return Err(GitError::new(
+            "svn_baseline_branch_protected",
+            format!(
+                "`{BASELINE_BRANCH}` 是 SVN 基线分支，记着「上次与服务器对齐时的内容」，\
+                 不能删除或改名，别的分支也不能改名成它。基线不对时请用「重建基线」。"
+            ),
         ));
     }
     Ok(())

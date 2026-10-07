@@ -26,7 +26,7 @@ import { baselineMap } from '../engine/svnGraph'
 import { describeHealth, describePinned, healthNeedsRebuild } from '../engine/svnInit'
 import { MIGRATE_EOL_WARNING } from '../engine/svnSync'
 import { samePath } from '../engine/path'
-import { isBaselineBranch, visibleSections } from '../engine/capabilities'
+import { isProtectedBaseline, visibleSections } from '../engine/capabilities'
 import { askConfirm } from '../engine/confirm'
 import { countConflicts, repoStateBanner } from '../engine/conflicts'
 import { usePrompt } from './PromptDialog'
@@ -798,7 +798,7 @@ export function RepoTab({
                 onDiscard={(paths, staged) => void handleDiscard(paths, staged)}
                 onCommit={handleCommit}
                 svnMode={state.capabilities.vcs === 'svn'}
-                onBaselineBranch={isBaselineBranch(state.head)}
+                onBaselineBranch={isProtectedBaseline(state.head, state.capabilities)}
               />
             )}
           </Panel>

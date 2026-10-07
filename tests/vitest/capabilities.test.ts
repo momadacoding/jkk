@@ -3,6 +3,7 @@ import {
   ALL_CAPABILITIES,
   NO_GIT_ONLY_CAPABILITIES,
   isBaselineBranch,
+  isProtectedBaseline,
   visibleSections,
 } from '@/engine/capabilities'
 import { visibleToolbarActions } from '@/engine/toolbarActions'
@@ -63,6 +64,15 @@ describe('visibleSections', () => {
     expect(isBaselineBranch('svn/basement')).toBe(false)
     expect(isBaselineBranch('master')).toBe(false)
     expect(isBaselineBranch('')).toBe(false)
+  })
+
+  it('只在 SVN 混合仓库里把 svn/base 当基线护着', () => {
+    // 普通 git 仓库里叫 `svn/base` 的分支只是用户自己的分支：后端 `GitBackend` 不拦，
+    // 界面却把改名、删除、提交全置灰且不解释，等于凭空锁死了它
+    expect(isProtectedBaseline('svn/base', NO_GIT_ONLY_CAPABILITIES)).toBe(true)
+    expect(isProtectedBaseline('refs/heads/svn/base', NO_GIT_ONLY_CAPABILITIES)).toBe(true)
+    expect(isProtectedBaseline('svn/base', ALL_CAPABILITIES)).toBe(false)
+    expect(isProtectedBaseline('svn/base-backup', NO_GIT_ONLY_CAPABILITIES)).toBe(false)
   })
 
   it('vcs 说清楚背后是哪种版本控制，不靠别的字段反推', () => {

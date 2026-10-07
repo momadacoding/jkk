@@ -31,7 +31,8 @@ fn a_live_lock_blocks_a_second_acquisition() {
 
     drop(guard);
     assert!(!is_held(&root), "Drop 之后必须释放");
-    acquire(&root, "opid-C").expect("释放之后必须能重新获取");
+    // 只验证拿得到，拿到即放
+    drop(acquire(&root, "opid-C").expect("释放之后必须能重新获取"));
 }
 
 #[test]
@@ -128,7 +129,7 @@ fn a_lock_file_left_behind_by_a_crash_is_not_held() {
         !is_held(&root),
         "没有任何进程持有句柄时，残留文件不算被持有"
     );
-    acquire(&root, "opid-new").expect("残锁必须可以接管");
+    drop(acquire(&root, "opid-new").expect("残锁必须可以接管"));
 }
 
 /// 用一个**真的外部进程**持锁，然后杀掉它。
@@ -191,7 +192,7 @@ fn a_lock_whose_holder_was_killed_is_not_held() {
         path.exists(),
         "锁文件本身应当还在（残留），只是被判成无人持有"
     );
-    acquire(&root, "mine").expect("崩溃留下的残锁必须可以接管");
+    drop(acquire(&root, "mine").expect("崩溃留下的残锁必须可以接管"));
 }
 
 #[test]
@@ -207,7 +208,7 @@ fn a_stale_lock_naming_a_live_unrelated_pid_is_still_takeable() {
     std::fs::write(lock_path(&root), meta).unwrap();
 
     assert!(!is_held(&root), "pid 活着不等于这把锁有人拿着");
-    acquire(&root, "mine").expect("必须可以接管");
+    drop(acquire(&root, "mine").expect("必须可以接管"));
 }
 
 #[test]

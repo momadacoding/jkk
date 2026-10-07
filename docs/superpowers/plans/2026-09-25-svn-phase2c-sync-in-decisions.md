@@ -736,3 +736,42 @@
 
 验证：`cargo fmt --check` 干净 / `cargo clippy --all-targets` 0 告警 / `cargo test --no-fail-fast` 729 passed 0 failed；`pnpm build` 通过 / `pnpm test` 29 个文件 446 passed。**没有改 Tauri 命令签名**，未重跑真实窗口。
 
+### 后续：#2 的 `svn/base` 部分与 #3（PR #49 合并后另开的小 PR，分支 `worktree-svn-guard-followups`）
+
+- **#2 `svn/base` 删除 / 改名**：`vcs/svn.rs::refuse_baseline_branch`。`delete_branch` 与 `rename_branch` 的两端（`old`、`new`）都查，精确匹配 `svn/base`（容忍 `refs/heads/` 前缀），报 `svn_baseline_branch_protected`。`svn/base-backup` 之类照常。**计划没写的坑**：比较不区分大小写。2026-09-30 在临时仓库实测（Windows / NTFS，ref 为散装文件），`git branch -D SVN/BASE` 删掉的就是 `svn/base`，`git branch -m SVN/BASE x` 把它改了名；测试 `a_differently_cased_name_does_not_get_around_it`（RED：删掉了）。界面 `BranchView` 的「Rename…」对基线置灰，与既有的「Delete…」一致。与锁无关：任何状态下都拒绝。
+- **#3 重建 / 迁移全程持锁**：`commands/svn.rs::hold_for_baseline_move`。它先查 journal，再 `svn_lock::acquire`，拿到锁后再查一次 journal；两条命令把锁绑在 `_lock` 上，持到命令结束。
+  - 先查一次，是为了不给注定被拒的操作去接管崩溃留下的残锁。
+  - 锁内复核，是因为查与拿之间可能刚有一次同步停在冲突上：冲突出口放锁、留 journal。
+  - opid 带 `baseline-` 前缀，「正忙」时看得出持有者不是一次更新。
+  - 持锁期间界面会显示通用的「这个工作副本正在进行一次同步」横幅，文案没有区分重建。可以接受：此时重建的确认框正显示进度。
+- **测试**（新文件 `tests/svn_baseline_guard.rs`，fixture 仓库）：
+  - 基线删不掉。RED：删掉了。
+  - 基线改名两个方向都被拒。RED：改名成功。
+  - 别的分支照常能删、能改名。
+  - 持锁期间 `run_sync_in` 报 `sync_in_progress`、不写 journal、HEAD 不动，放锁后 `is_held` 为假。
+  - 被占锁 / 有 journal 时拒绝，且被拒时不留锁。
+  - `svn_write_guard.rs` 新增接线测试：两条命令在干活之前调用持锁入口，且不是 `let _ =`；入口在拿锁之后复核 journal。RED：找不到持锁入口。
+  - 原 `GUARDED_COMMANDS` 表里的这两条挪到新测试去守，因为拿锁本身就包含了「有人持有就拒绝」。
+  - **竞态本身**（检查与移动之间插进一次同步）没有确定性的复现手段。持锁入口从结构上消除了这个窗口；行为测试守「持锁期间同步被拒」，接线测试守「命令确实全程持锁」。
+- 验证：`cargo fmt --check` 干净 / `cargo clippy --all-targets` 0 告警 / `cargo test --no-fail-fast` 742 passed 0 failed；`pnpm build` 通过 / `pnpm test` 30 个文件 456 passed。没有改 Tauri 命令签名。
+
+#### 独立 review（2026-10-07，`/code-review high`）修入的 6 条
+
+| # | 问题 | 处理 | RED |
+|---|---|---|---|
+| 1 | `@{-1}` / `@{u}` / `work@{upstream}` 绕过基线守卫 | `refuse_baseline_branch` 对含 `@{` 的名字一律拒绝 | 删掉了 `svn/base` |
+| 2 | 命令层先拿锁，`acquire` 的 `create_dir_all` 在没建过库的工作副本里建出空 `.git` | `hold_for_baseline_move` 最先查 `detect_repo_kind` | 留下了 `.git` |
+| 4 | 接线测试只拒 `let _ =`，裸语句 `hold_for_baseline_move(..)?;` 同样当场放锁却通过 | 测试改成要求 `let <非 _ 名字> = …`；`SyncLock` 加 `#[must_use]` | 变异：两道都报 |
+| 5 | 重建 / 迁移持锁时横幅说「正在同步」，还劝「重开应用」——照做会拦腰杀掉重建 | opid 前缀 `baseline-` 换一套文案（`svnJournal.ts::BASELINE_MOVE_OPID_PREFIX`） | 标题仍是「同步」 |
+| 6 | 普通 git 仓库里叫 `svn/base` 的分支也被置灰改名 / 删除 / 提交 | 新增 `capabilities.ts::isProtectedBaseline`，只在 `vcs === 'svn'` 时护着；`BranchView` 三处与 `RepoTab` 的提交判据一并换用 | `ALL_CAPABILITIES` 下仍为真 |
+| 8 | 没有测试在命令自己持锁的情况下跑完重建 / 迁移 | 新增 `the_rebuild_command_runs_to_the_end_under_its_own_lock`；迁移成功那条改走命令层 | 无：当前调用链确实不经过带守卫的入口，这两条是守着它的回归测试 |
+
+- **计划没写的坑（#1）**：2026-10-07 在临时仓库实测（git 2.51.2）。`git branch -D @{-1}`、`-D @{u}`、`-D work@{upstream}` 都输出「Deleted branch svn/base」，`-m @{-1} x` 把它改了名；`-D -`、`-D @` 是「not found」，`-D @{push}` 报错不删。不去解析简写指向谁：`check-ref-format` 本来就不许分支名含 `@{`，拒掉它挡不住任何真实分支，解析与删除之间也不多出一道缝。
+- **为什么是安全的（#2）**：`hold_for_baseline_move` 的类型判断与 `migrate_eol` 开头那条同一套（纯文件系统读）。错误码沿用 `svn_not_hybrid`，前端没有按码分支。
+- **计划没写的坑（#4）**：`#[must_use]` 一加，`tests/svn_lock.rs` 里 4 处「拿到即放、只验证拿得到」的 `acquire(..).expect(..);` 就报出 clippy 告警。这 4 处是有意为之，改成显式的 `drop(acquire(..).expect(..))`，没有用 `#[allow]` 压告警。
+- **偏离（#6）**：review 只点了改名，删除与提交判据是同一个缺陷，一并换掉；`isBaselineBranch` 保留，`isProtectedBaseline` 建在它上面。
+- **没修、留作后续**：
+  - **#3**：`create_branch` / `checkout_remote_branch` 建出名为 `svn/base` 的分支、停在基线上 commit / revert 也会移动基线。这些都是本 PR 之前就有的缺口，范围比本 PR 大。
+  - **#7**：基线丢失后，把备份分支改名回 `svn/base` 会被拒，重建也因 `read_baseline_oid` 失败而走不通。与 #3 的「别的分支不许冒充基线」直接冲突，属于设计取舍，等用户定。
+  - **#9**：`svn_migrate_eol` 内的 `MigrationLock` 已被同步锁覆盖。它崩溃后会留下残锁，要手工删除，这是之前就有的行为，属于重构。
+

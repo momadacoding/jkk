@@ -58,6 +58,7 @@ pub fn lock_path(repo_root: &str) -> PathBuf {
 ///
 /// `Debug` 是测试要的：`acquire(...).expect_err(...)` 要求 `Ok` 那一侧可打印。
 #[derive(Debug)]
+#[must_use = "锁靠 Drop 释放：不绑到一个活到流程结束的名字上，拿到就当场放掉了"]
 pub struct SyncLock {
     /// 这个句柄本身就是锁：它一直开着，别人就独占打不开；进程没了，
     /// 操作系统替我们关掉。**不要提前 drop 它**。
