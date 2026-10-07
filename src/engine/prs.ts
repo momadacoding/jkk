@@ -6,10 +6,24 @@ const LOCAL_BRANCH_PREFIX = 'refs/heads/'
 /**
  * 徽章的形态。CLOSED（关闭未合并）不在其中，它根本不显示。
  *
- * `merged-ahead` 是 `merged` 的危险变体：PR 合并之后分支上又长了提交。
- * 两者必须分开——把它画成普通的 ✓ 等于告诉用户「可以删了」，而那会丢东西。
+ * 已合并的 PR 按本地分支相对合并点的位置再分五种：
+ * - `merged`：分支头就在合并点上，内容全在主干。
+ * - `merged-ahead`：合并后分支上又长了提交。**危险**——画成普通的 ✓ 等于告诉用户
+ *   「可以删了」，而那会丢东西。
+ * - `merged-behind`：合并点比本地新（别处推了提交、本地没拉）。本地没有 PR 之外的
+ *   提交，和 `merged` 一样安全，但分支头对不上，要说清楚为什么。
+ * - `merged-diverged`：两边各有对方没有的提交。危险，同 ahead。
+ * - `merged-unknown`：分支头对不上，但判断不了方向（合并点对象本地没有，或分支在
+ *   上次读取 PR 之后又动过）。可能是 ahead，所以按危险处理。
  */
-export type PrBadgeVariant = 'open' | 'draft' | 'merged' | 'merged-ahead'
+export type PrBadgeVariant =
+  | 'open'
+  | 'draft'
+  | 'merged'
+  | 'merged-ahead'
+  | 'merged-behind'
+  | 'merged-diverged'
+  | 'merged-unknown'
 
 /** 徽章渲染需要的全部东西。组件只调 [`prBadge`] 一次，不各自拼字符串。 */
 export interface PrBadgeView {
@@ -26,6 +40,9 @@ const shortOid = (oid: string) => oid.slice(0, 7)
 function variantOf(pr: PullRequest, branchHash?: string): PrBadgeVariant {
   // MERGED 压过 isDraft：gh 不该给出「已合并的草稿」，但真给了也不能显示成
   // 灰色草稿——那会让一条已经进主干的分支看起来还没开始 review
+  //
+  // 下面的分支头比对只对 MERGED 做。open PR 的分支头对不上意味着有没推上去的提交，
+  // 那件事分支行上的 ahead/behind 徽章已经在说了，不重复报警。
   if (pr.state !== 'MERGED') return pr.isDraft ? 'draft' : 'open'
 
   // 分支头还停在合并点上吗？`headRefOid` 是 PR **合并时**的分支头，
@@ -34,41 +51,81 @@ function variantOf(pr: PullRequest, branchHash?: string): PrBadgeVariant {
   // 两个都拿得到才敢下判断：老版本 gh 可能没有这个字段，远程分支标签也没有
   // 对应的本地 tip。宁可少一个提示，也不能凭空报警。
   if (!branchHash || !pr.headRefOid) return 'merged'
-  return branchHash.toLowerCase() === pr.headRefOid.toLowerCase() ? 'merged' : 'merged-ahead'
+  const tip = branchHash.toLowerCase()
+  if (tip === pr.headRefOid.toLowerCase()) return 'merged'
 
-  // 只对 MERGED 做这个判断。open PR 的分支头对不上意味着有没推上去的提交，
-  // 那件事分支行上的 ahead/behind 徽章已经在说了，不重复报警。
+  // 对不上时方向由后端的祖先计算给出——光比 SHA 的话，「本地落后」会被说成
+  // 「本地领先」。这份结论是在读 PR 列表那一刻对着当时的分支头算的，PR 列表
+  // 只在 fetch/pull/push 后刷新，分支却随时会动：头已经变了就不能再用。
+  const rel = pr.localRelation
+  if (!rel || rel.tip.toLowerCase() !== tip) return 'merged-unknown'
+  if (rel.ahead > 0 && rel.behind > 0) return 'merged-diverged'
+  if (rel.ahead > 0) return 'merged-ahead'
+  if (rel.behind > 0) return 'merged-behind'
+  // 0/0 却 SHA 不同只可能是后端数据自相矛盾，不当成「已全部合并」
+  return 'merged-unknown'
 }
 
 /**
  * 算出一条 PR 在分支上该画成什么样。
  *
- * `branchHash` 是**本地分支的 tip**（`RefPointer.hash`）。它只用来区分
- * merged 与 merged-ahead，其余形态不需要。
+ * `branchHash` 是**本地分支的 tip**（`RefPointer.hash`）。它只用来细分已合并的
+ * 几种形态，其余形态不需要。
  *
- * 标签里的 `✓` 和 `↑` **不是装饰**：graph 里徽章的底色是车道色，12 条车道各不
+ * 标签里的 `✓` 和 `↑` `↓` `?` **不是装饰**：graph 里徽章的底色是车道色，12 条车道各不
  * 相同；能过对比度的紫已经淡到与 draft 灰分不开（实测最高 4.41）。颜色在这里
- * 当不了唯一的区分手段，符号才能，而且这一路对色盲同样成立。`↑` 沿用侧边栏
- * ahead 徽章的箭头，在这个界面里已经是「本地还领先」的意思。
+ * 当不了唯一的区分手段，符号才能，而且这一路对色盲同样成立。`↑` `↓` 沿用侧边栏
+ * ahead/behind 徽章的箭头，在这个界面里已经是「本地领先/落后」的意思。
  */
 export function prBadge(pr: PullRequest, branchHash?: string): PrBadgeView {
   const variant = variantOf(pr, branchHash)
+  // 合并点与分支头不一致的几种形态，两个 SHA 都要说出来，否则用户没法自己核对
+  const title = `已合并的 PR #${pr.number}: ${pr.title}\n`
+  const mergedAt = shortOid(pr.headRefOid)
+  const local = shortOid(branchHash ?? '')
+  const ahead = pr.localRelation?.ahead ?? 0
+  const behind = pr.localRelation?.behind ?? 0
   switch (variant) {
     case 'merged':
       return {
         variant,
         label: `✓#${pr.number}`,
-        tooltip: `已合并的 PR #${pr.number}: ${pr.title}\n分支内容已全部进入主干。`,
+        tooltip: `${title}分支内容已全部进入主干。`,
       }
     case 'merged-ahead':
       return {
         variant,
         label: `✓#${pr.number}↑`,
-        // 两个 SHA 都要说出来，否则用户没法自己核对「到底多了什么」
         tooltip:
-          `已合并的 PR #${pr.number}: ${pr.title}\n` +
-          `合并的是 ${shortOid(pr.headRefOid)}，本地分支已经走到 ${shortOid(branchHash ?? '')}——` +
-          `还有提交不在这个 PR 里，删分支前先确认。`,
+          `${title}合并的是 ${mergedAt}，本地分支已经走到 ${local}，` +
+          `多出 ${ahead} 个提交不在这个 PR 里——删分支前先确认。`,
+      }
+    case 'merged-behind':
+      return {
+        variant,
+        label: `✓#${pr.number}↓`,
+        // 这种情况最常见的来历是「在另一台机器上补了提交再合并」，远端分支随后被删，
+        // 图上就再也找不到那几个提交。说清楚它们去了哪，用户才不会以为丢了东西。
+        tooltip:
+          `${title}合并的是 ${mergedAt}，比本地分支 ${local} 新 ${behind} 个提交` +
+          `（在别处推上去、本地没拉）。\n本地分支没有 PR 之外的提交，内容已全部进入主干。`,
+      }
+    case 'merged-diverged':
+      return {
+        variant,
+        label: `✓#${pr.number}↑↓`,
+        tooltip:
+          `${title}合并的是 ${mergedAt}，本地分支 ${local} 与它分叉：` +
+          `本地多出 ${ahead} 个提交不在这个 PR 里，PR 里另有 ${behind} 个提交本地没有——删分支前先确认。`,
+      }
+    case 'merged-unknown':
+      return {
+        variant,
+        label: `✓#${pr.number}?`,
+        tooltip:
+          `${title}合并的是 ${mergedAt}，本地分支在 ${local}，判断不了两者的先后` +
+          `（合并点的提交本地没有，或分支在上次读取 PR 之后又动过；fetch 后会重新判断）。\n` +
+          `本地可能有不在这个 PR 里的提交——删分支前先确认。`,
       }
     case 'draft':
       return { variant, label: `#${pr.number}`, tooltip: `Draft PR #${pr.number}: ${pr.title}` }

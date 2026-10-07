@@ -127,18 +127,75 @@ describe('prBadge', () => {
     expect(badge.label).toBe('✓#33')
   })
 
+  /** 后端对着 `tip` 算出的本地分支与合并点的位置。 */
+  const relatedAt = (tip: string, ahead: number, behind: number): Partial<PullRequest> =>
+    ({ localRelation: { tip, ahead, behind } })
+  const mergedWith = (number: number, rel: Partial<PullRequest>): PullRequest =>
+    pr(number, 'a', { state: 'MERGED', headRefOid: MERGED_AT, ...rel })
+
   it('PR 合并后分支又长了提交：必须区别对待，否则照着 ✓ 删分支会丢东西', () => {
     // 真实案例：PR #20 合并于 ac6e785，之后分支上又加了 6e6f014，
     // 而那个提交不在 master 里。画成 ✓ 等于告诉用户「可以删了」。
-    const badge = prBadge(merged(20, 'a', MERGED_AT), MOVED_ON)
+    const badge = prBadge(mergedWith(20, relatedAt(MOVED_ON, 1, 0)), MOVED_ON)
     expect(badge.variant).toBe('merged-ahead')
     expect(badge.label).toBe('✓#20↑')
   })
 
-  it('merged-ahead 的提示要把两个 SHA 都说出来', () => {
-    const tip = prBadge(merged(20, 'a', MERGED_AT), MOVED_ON).tooltip
+  it('merged-ahead 的提示要把两个 SHA 和多出的提交数都说出来', () => {
+    const tip = prBadge(mergedWith(20, relatedAt(MOVED_ON, 3, 0)), MOVED_ON).tooltip
     expect(tip).toContain('ac6e785')
     expect(tip).toContain('6e6f014')
+    expect(tip).toContain('3 个提交')
+  })
+
+  it('本地落后于合并点：不能画成 ↑，内容其实全在 PR 里', () => {
+    // 真实案例：本地 worktree-ios-kickoff 停在 736890d，PR #321 合并的 93e3d22 是它的子提交
+    // （在别处推上去、本地没拉）。旧徽章显示 ✓#321↑「本地已经走到 736890d」，正好反了。
+    const local = '736890db9c9e750180a974f2a90a82f02e6cc483'
+    const badge = prBadge(
+      pr(321, 'a', { state: 'MERGED', headRefOid: '93e3d222de3626f1f95b6e5de682b6cc22c48278', ...relatedAt(local, 0, 1) }),
+      local,
+    )
+    expect(badge.variant).toBe('merged-behind')
+    expect(badge.label).toBe('✓#321↓')
+    expect(badge.tooltip).toContain('93e3d22')
+    expect(badge.tooltip).toContain('736890d')
+    expect(badge.tooltip).not.toContain('删分支前先确认')
+  })
+
+  it('两边分叉：本地有 PR 外的提交，PR 里也有本地没有的', () => {
+    const badge = prBadge(mergedWith(20, relatedAt(MOVED_ON, 2, 1)), MOVED_ON)
+    expect(badge.variant).toBe('merged-diverged')
+    expect(badge.label).toBe('✓#20↑↓')
+    expect(badge.tooltip).toContain('删分支前先确认')
+  })
+
+  it('后端没给结论（合并点对象本地没有）：无法判断，仍然提醒确认', () => {
+    // 不能退回普通 ✓——SHA 对不上时，「合并后又提交了」是可能的，那会丢东西
+    const badge = prBadge(mergedWith(20, { localRelation: null }), MOVED_ON)
+    expect(badge.variant).toBe('merged-unknown')
+    expect(badge.label).toBe('✓#20?')
+    expect(badge.tooltip).toContain('删分支前先确认')
+  })
+
+  it('字段整个缺失（老后端）同样是无法判断', () => {
+    expect(prBadge(merged(20, 'a', MERGED_AT), MOVED_ON).variant).toBe('merged-unknown')
+  })
+
+  it('结论是对着旧的分支头算的：分支已经动过，不再采信', () => {
+    // PR 列表只在 fetch/pull/push 后刷新，本地分支却随时会动。
+    // 后端算的时候本地落后，之后本地又提交了——这时再显示 ↓ 就是在说谎。
+    const badge = prBadge(mergedWith(20, relatedAt(MERGED_AT.replace('a', 'b'), 0, 1)), MOVED_ON)
+    expect(badge.variant).toBe('merged-unknown')
+  })
+
+  it('比对分支头时不分大小写', () => {
+    expect(prBadge(mergedWith(20, relatedAt(MOVED_ON.toUpperCase(), 0, 1)), MOVED_ON).variant)
+      .toBe('merged-behind')
+  })
+
+  it('SHA 已相等时不看 localRelation，直接是 merged', () => {
+    expect(prBadge(mergedWith(33, { localRelation: null }), MERGED_AT).variant).toBe('merged')
   })
 
   it('拿不到分支头时退回普通 merged，不瞎猜', () => {
