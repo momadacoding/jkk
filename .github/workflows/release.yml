@@ -136,6 +136,33 @@ jobs:
         with:
           workspaces: src-tauri
 
+      # SVN fixture 测试需要 svn 与 svnadmin 在 PATH 上（spec §17），而 runner 不带 SVN。
+      # 测试故意不做「没装就 skip」，所以这里必须装上，否则 cargo test 必挂。
+      # 用 SlikSvn 是为了和本地开发环境同一发行版；钉死版本，升级要手工改。
+      # choco 改的是机器 PATH，后续 step 看不到，得显式写进 GITHUB_PATH。
+      - name: Install SVN
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install sliksvn --version 1.14.5 -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'choco install sliksvn 失败' }
+          $bin = 'C:\Program Files\SlikSvn\bin'
+          foreach ($exe in 'svn.exe', 'svnadmin.exe') {
+            if (-not (Test-Path (Join-Path $bin $exe))) { throw "没找到 $bin\$exe" }
+          }
+          & (Join-Path $bin 'svnadmin.exe') --version --quiet
+          if ($LASTEXITCODE -ne 0) { throw 'svnadmin 起不来' }
+          $bin >> $env:GITHUB_PATH
+
+      # SVN 测试经 init_hybrid 自己 git init 再 commit-tree 录基线，fixture 插不进
+      # 「给仓库设本地身份」那一步，只能吃全局身份；runner 没有，就报 Author identity unknown。
+      # 必须写**全局配置**而不是设 GIT_AUTHOR_* 环境变量：环境变量会压过 fixture
+      # 自己设的仓库级身份，让断言作者名的测试反过来挂掉（本地实测过）。
+      - name: Configure git identity for tests
+        run: |
+          git config --global user.name CI
+          git config --global user.email ci@localhost
+
       - run: pnpm install --frozen-lockfile
 
       # 发版前把本地那套门槛在干净环境里再走一遍。
