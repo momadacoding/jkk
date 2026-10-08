@@ -8,6 +8,7 @@ import { DeleteBranchDialog, type DeleteTargets } from './DeleteBranchDialog'
 import { useConfirm } from './ConfirmDialog'
 import { isProtectedBaseline, type Capabilities } from '../engine/capabilities'
 import { goneUpstreamName, goneUpstreamTooltip } from '../engine/refPills'
+import { mergedPullRequestsFor } from '../engine/deleteBranchNote'
 
 interface BranchViewProps {
   refs: RefPointer[]
@@ -117,6 +118,11 @@ export function BranchView({
   const remote = refs.filter((r) => r.kind === 'remote')
   // 分支多的仓库里每行都遍历一遍 PR 列表是白费力气，建一次索引就够
   const prByBranch = useMemo(() => indexPullRequestsByBranch(pullRequests), [pullRequests])
+  // 不能用上面的索引：它一个分支只留一条（open 优先），而删除框要的是全部已合并的合并点
+  const deletingMergedPrs = useMemo(
+    () => (deleting ? mergedPullRequestsFor(pullRequests, deleting) : []),
+    [pullRequests, deleting],
+  )
 
   // 展开输入框却不聚焦的话，用户得多点一次才能打字
   useEffect(() => { if (creating) inputRef.current?.focus() }, [creating])
@@ -290,6 +296,7 @@ export function BranchView({
           repoPath={repoPath}
           name={deleting}
           capabilities={capabilities}
+          mergedPullRequests={deletingMergedPrs}
           onCancel={() => setDeleting(null)}
           // 成功才关；失败时 onDelete 抛出，确认框自己接住并留在原地
           onConfirm={async (targets) => { await onDelete(deleting, targets); setDeleting(null) }}
