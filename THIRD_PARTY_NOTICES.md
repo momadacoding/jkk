@@ -13,7 +13,7 @@ dev-dependencies 与 build-dependencies），npm 侧为 production 依赖
 
 ## 组件清单
 
-共 257 个组件。
+共 258 个组件。
 
 | 来源 | 组件 | 版本 | 许可 |
 |---|---|---|---|
@@ -150,6 +150,7 @@ dev-dependencies 与 build-dependencies），npm 侧为 production 依赖
 | cargo | regex-automata | 0.4.16 | MIT OR Apache-2.0 |
 | cargo | regex-syntax | 0.8.11 | MIT OR Apache-2.0 |
 | cargo | rfd | 0.16.0 | MIT |
+| cargo | roxmltree | 0.21.1 | MIT OR Apache-2.0 |
 | cargo | rustc-hash | 2.1.3 | Apache-2.0 OR MIT |
 | cargo | same-file | 1.0.6 | Unlicense/MIT |
 | cargo | schemars | 0.8.22 | MIT |
@@ -962,7 +963,7 @@ END OF TERMS AND CONDITIONS
 </details>
 
 <details>
-<summary>59 个组件共用此许可正文：base64 0.22.1 (cargo) 等</summary>
+<summary>60 个组件共用此许可正文：base64 0.22.1 (cargo) 等</summary>
 
 适用于：
 - base64 0.22.1 (cargo)
@@ -1008,6 +1009,7 @@ END OF TERMS AND CONDITIONS
 - regex 1.13.1 (cargo)
 - regex-automata 0.4.16 (cargo)
 - regex-syntax 0.8.11 (cargo)
+- roxmltree 0.21.1 (cargo)
 - scopeguard 1.2.0 (cargo)
 - serde_with 3.21.0 (cargo)
 - serde_with_macros 3.21.0 (cargo)
@@ -10018,6 +10020,38 @@ SOFTWARE.
 MIT License
 
 Copyright (c) 2022 Bartłomiej Maryńczak
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+</details>
+
+<details>
+<summary>1 个组件共用此许可正文：roxmltree 0.21.1 (cargo)</summary>
+
+适用于：
+- roxmltree 0.21.1 (cargo)
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2018 Yevhenii Reizner
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
