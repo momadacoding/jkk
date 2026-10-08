@@ -174,4 +174,21 @@ export interface PullRequest {
    */
   headRefOid: string
   url: string
+  /**
+   * 本地同名分支相对合并点的位置，gh 不给，由后端在本地补算。
+   *
+   * 只有已合并、有同名本地分支、且合并点对象在本地的 PR 才有值；其余为 null。
+   * 可选是为了兼容没有这个字段的老后端，缺失与 null 同义。
+   */
+  localRelation?: LocalRelation | null
+}
+
+/** 本地分支相对 PR 合并点的领先/落后数，即 `git rev-list --left-right --count <tip>...<合并点>`。 */
+export interface LocalRelation {
+  /** 计算时本地分支的 tip。分支之后动过的话，这份结论就作废了。 */
+  tip: string
+  /** 本地分支有、合并点没有的提交数。 */
+  ahead: number
+  /** 合并点有、本地分支没有的提交数。 */
+  behind: number
 }

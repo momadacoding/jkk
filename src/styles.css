@@ -519,10 +519,14 @@ body {
    分不开（再深一档只有 4.41）。真正承担区分的是 prBadge 加的 `✓` 前缀，
    这一路对色盲也成立。这里的浅紫只是辅助。
 
-   merged-ahead（PR 合了但分支又长了提交）沿用同一个紫：它和 merged 的区别由
-   标签末尾的 `↑` 表达，再引入第四种颜色只会让 24 种车道组合的对比度更难保证。 */
+   merged-ahead / behind / diverged / unknown（分支头与合并点对不上的几种）沿用同一个紫：
+   它们和 merged 的区别由标签末尾的 `↑` `↓` `↑↓` `?` 表达，再引入更多颜色只会让
+   24 种车道组合的对比度更难保证。 */
 .ref-pill-pr.merged,
-.ref-pill-pr.merged-ahead {
+.ref-pill-pr.merged-ahead,
+.ref-pill-pr.merged-behind,
+.ref-pill-pr.merged-diverged,
+.ref-pill-pr.merged-unknown {
   color: #e2d0fc;
 }
 
@@ -1258,7 +1262,10 @@ body {
    这里的底色由我们自己定，不像 graph 那样受车道色摆布，所以紫可以更饱和一档
    （实测最差 5.08）。`✓` 前缀仍然照打，两处形态保持一致。 */
 .sb-pr.merged,
-.sb-pr.merged-ahead {
+.sb-pr.merged-ahead,
+.sb-pr.merged-behind,
+.sb-pr.merged-diverged,
+.sb-pr.merged-unknown {
   background: rgba(137, 87, 224, 0.20);
   color: #c8a8f5;
 }

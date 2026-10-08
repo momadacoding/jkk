@@ -89,7 +89,7 @@ function GoneBadge({ upstream }: { upstream: string | null }) {
 /**
  * PR 编号微徽章。分支上没有可显示的 PR（undefined）时什么都不画。
  *
- * `branchHash` 是本地分支的 tip，用来区分「已全部合并」和「合并后又长了提交」。
+ * `branchHash` 是本地分支的 tip，用来区分「已全部合并」「合并后又长了提交」「本地落后于合并点」等形态。
  */
 function PrBadge({ pr, branchHash }: { pr: PullRequest | undefined; branchHash: string }) {
   if (!pr) return null

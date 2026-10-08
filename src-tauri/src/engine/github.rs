@@ -6,6 +6,7 @@
 
 use crate::engine::proc::hidden_command;
 use crate::error::{GitError, Result};
+use git2::{BranchType, Oid, Repository};
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 
@@ -26,7 +27,24 @@ const PR_LIMIT: &str = "100";
 /// 分开查，每种状态各有自己的 100 条额度。
 const PR_STATES: [&str; 2] = ["open", "merged"];
 
-/// 一条 PR。字段名对齐 `gh pr list --json` 的输出，也正好是前端要的形状。
+/// 本地同名分支相对 PR 合并点（`headRefOid`）的位置，即 `git rev-list --left-right
+/// --count <本地 tip>...<合并点>` 的两个数。
+///
+/// 只比 SHA 是否相等分不出方向：本地落后于合并点（别处又推了提交、本地没拉）和
+/// 本地领先（合并后又提交）都是「不相等」，而前者内容全在 PR 里、后者删分支会丢东西。
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct LocalRelation {
+    /// 计算时本地分支的 tip。PR 列表只在打开仓库和 fetch/pull/push 后刷新，
+    /// 本地分支却随时会动——前端只在它仍等于分支当前 tip 时才采信这个结果。
+    pub tip: String,
+    /// 本地分支有、合并点没有的提交数。
+    pub ahead: usize,
+    /// 合并点有、本地分支没有的提交数。
+    pub behind: usize,
+}
+
+/// 一条 PR。除 `local_relation` 外，字段名对齐 `gh pr list --json` 的输出，
+/// 也正好是前端要的形状。
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PullRequest {
@@ -35,8 +53,9 @@ pub struct PullRequest {
     pub head_ref_name: String,
     /// head 分支在**合并时**的提交 oid。
     ///
-    /// 前端拿它和本地分支的 tip 比，判断 PR 合并之后分支有没有继续往前走——
+    /// 拿它和本地分支的 tip 比，判断 PR 合并之后分支有没有继续往前走——
     /// 走过的话不能画成「已全部合并」，那会诱导用户删掉还没合的提交。
+    /// 方向（领先/落后/分叉）由 [`Self::local_relation`] 给出。
     ///
     /// `#[serde(default)]`：老版本 gh 可能不给这个字段，缺了就退回普通 merged，
     /// 不该让整条通道解析失败。
@@ -50,6 +69,12 @@ pub struct PullRequest {
     /// 成枚举会在 gh 加新状态时直接解析失败，整条通道跟着哑掉。判定放前端。
     pub state: String,
     pub url: String,
+    /// gh 不给这个字段，由 [`annotate_local_relations`] 在本地补算。
+    ///
+    /// 只对已合并、能找到同名本地分支、且合并点对象在本地的 PR 才有值；
+    /// 其余一律 None，前端据此显示「无法判断」，不瞎猜方向。
+    #[serde(default)]
+    pub local_relation: Option<LocalRelation>,
 }
 
 /// 构造一个指向 `path` 的 gh 命令，并关掉所有交互与后台网络行为。
@@ -138,5 +163,46 @@ pub fn list_branch_prs(path: &str) -> Result<Vec<PullRequest>> {
     // 成功也记一笔。这条通道的所有失败都是静默的（见上），没有这行日志的话，
     // 「徽章为什么没出来」在装机版上完全无从下手——分不清是没读到、还是读到了 0 条。
     log::info!("gh pr list 读到 {} 条 PR（open + merged）", all.len());
+    annotate_local_relations(path, &mut all);
     Ok(all)
+}
+
+/// 给已合并的 PR 补上本地同名分支相对合并点的位置，见 [`LocalRelation`]。
+///
+/// 和 gh 那段一样**只降级不报错**：仓库打不开、分支不存在、合并点对象本地没有
+/// （从没 fetch 过）、祖先计算失败（比如浅克隆走到了边界）都只是让这条 PR 拿不到
+/// 结论，前端显示「无法判断」。为这种锦上添花的信息让 PR 通道整条失败不值得。
+pub fn annotate_local_relations(path: &str, prs: &mut [PullRequest]) {
+    if !prs.iter().any(|pr| pr.state == "MERGED") {
+        return;
+    }
+    let repo = match Repository::open(path) {
+        Ok(repo) => repo,
+        Err(err) => {
+            log::info!("打不开仓库，已合并 PR 不判断本地分支的领先落后：{err}");
+            return;
+        }
+    };
+    for pr in prs.iter_mut().filter(|pr| pr.state == "MERGED") {
+        pr.local_relation = local_relation(&repo, &pr.head_ref_name, &pr.head_ref_oid);
+    }
+}
+
+fn local_relation(repo: &Repository, branch: &str, head_ref_oid: &str) -> Option<LocalRelation> {
+    // 空串（老版本 gh 不给 headRefOid）也在这里被挡掉：Oid::from_str 不接受空输入
+    let merged_at = Oid::from_str(head_ref_oid).ok()?;
+    let tip = repo
+        .find_branch(branch, BranchType::Local)
+        .ok()?
+        .get()
+        .target()?;
+    // 先确认合并点对象在本地。缺对象时 graph_ahead_behind 也会报错，但显式查一次
+    // 才能把「本地没有这个提交」和别的失败在语义上分开，不依赖它的错误码。
+    repo.find_commit(merged_at).ok()?;
+    let (ahead, behind) = repo.graph_ahead_behind(tip, merged_at).ok()?;
+    Some(LocalRelation {
+        tip: tip.to_string(),
+        ahead,
+        behind,
+    })
 }
