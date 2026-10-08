@@ -131,7 +131,13 @@ export function DeleteBranchDialog({
   repoPath, name, onCancel, onConfirm, capabilities, mergedPullRequests,
 }: DeleteBranchDialogProps) {
   const [info, setInfo] = useState<DeleteInfo | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  /**
+   * 两种错误分开存：PR 列表晚到会触发重查，重查成功要清掉上一次的查询失败，
+   * 但不能顺手清掉删除失败——删除按 worktree → 远程 → 本地执行，失败时可能已经
+   * 做了一半，那条错误是用户知道停在哪一步的唯一线索（PR 56 Codex review）。
+   */
+  const [infoError, setInfoError] = useState<string | null>(null)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
   const [alsoRemote, setAlsoRemote] = useState(false)
   /**
    * 是否连 worktree 一起删。有 worktree 时**默认勾上**。
@@ -159,7 +165,7 @@ export function DeleteBranchDialog({
         if (cancelled) return
         setInfo(data)
         // PR 列表晚到会重查一次，上一次的失败不该留在成功的结果旁边
-        setError(null)
+        setInfoError(null)
         // 默认值只在第一次拿到信息时设：PR 列表晚到会触发重查，那时用户可能已经
         // 改过勾选框了，再设一遍会把他的选择悄悄改回去
         if (defaultsApplied.current) return
@@ -168,7 +174,7 @@ export function DeleteBranchDialog({
         // 用户没有机会取消它，而 confirm() 会照着这个 state 发出 delete_worktree
         setAlsoWorktree(capabilities.worktrees && data.worktree !== null)
       })
-      .catch((err) => { if (!cancelled) setError(toErrorMessage(err)) })
+      .catch((err) => { if (!cancelled) setInfoError(toErrorMessage(err)) })
     return () => { cancelled = true }
   }, [repoPath, name, capabilities.worktrees, mergedHeadsKey])
 
@@ -195,11 +201,11 @@ export function DeleteBranchDialog({
       alsoWorktree,
     })
     setBusy(true)
-    setError(null)
+    setDeleteError(null)
     try {
       await onConfirm({ remote, worktreePath })
     } catch (err) {
-      setError(toErrorMessage(err))
+      setDeleteError(toErrorMessage(err))
       setBusy(false)
     }
   }
@@ -302,7 +308,8 @@ export function DeleteBranchDialog({
           </div>
         )}
 
-        {error && <div className="dlg-warning">{error}</div>}
+        {infoError && <div className="dlg-warning">{infoError}</div>}
+        {deleteError && <div className="dlg-warning">{deleteError}</div>}
 
         {/* 删 worktree 只是把目录搬进回收站，毫秒级；真正要等网络的只有远程
             那一步，单独报它，免得用户以为界面卡了 */}
