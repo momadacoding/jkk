@@ -394,3 +394,220 @@ fn commit_failures_are_rolled_back_only_when_the_server_surely_did_nothing() {
         "stdout 说提交了就绝不回滚"
     );
 }
+
+// —— Task 6：Local-Only 全流程 ——
+
+fn thirty_lines(fx: &SvnFixture) {
+    let body: String = (1..=30).map(|n| format!("{n}\n")).collect();
+    std::fs::write(fx.wc().join("Code/A.cs"), body).unwrap();
+    git(fx, &["commit", "-qam", "thirty lines"]);
+}
+
+fn edit_line(fx: &SvnFixture, line: usize, to: &str, message: &str) {
+    let p = fx.wc().join("Code/A.cs");
+    let text = std::fs::read_to_string(&p).unwrap();
+    let out: String = text
+        .lines()
+        .enumerate()
+        .map(|(i, l)| {
+            if i + 1 == line {
+                format!("{to}\n")
+            } else {
+                format!("{l}\n")
+            }
+        })
+        .collect();
+    std::fs::write(&p, out).unwrap();
+    git(fx, &["commit", "-qam", message]);
+}
+
+fn line(text: &str, n: usize) -> &str {
+    text.lines().nth(n - 1).unwrap()
+}
+
+#[test]
+fn a_local_only_patch_in_the_middle_is_never_delivered_and_survives() {
+    // 必测 #19（T1 + T3）+ #36 的 rebase 一半：同一文件里既有补丁又有待交付改动
+    let fx = hybrid_with_colleague();
+    thirty_lines(&fx);
+    edit_line(&fx, 1, "one", "C1");
+    edit_line(&fx, 10, "ten-LOCAL", "mute log\n\nLocal-Only: true");
+    edit_line(&fx, 20, "twenty", "C2");
+    let orig_head = git(&fx, &["rev-parse", "HEAD"]);
+
+    let out = deliver(&fx, "jump fix").unwrap();
+    assert_eq!(
+        out,
+        SyncOutOutcome::Delivered {
+            rev: 2,
+            branch: "work".into(),
+            local_only_left: 1
+        }
+    );
+
+    let server = server_cat(&fx, "Code/A.cs");
+    assert_eq!(
+        (line(&server, 1), line(&server, 10), line(&server, 20)),
+        ("one", "10", "twenty")
+    );
+    let base = git(&fx, &["show", "svn/base:Code/A.cs"]);
+    assert_eq!(line(&base, 10), "10", "基线里是干净原文");
+    let disk = std::fs::read_to_string(fx.wc().join("Code/A.cs")).unwrap();
+    assert_eq!(line(&disk, 10), "ten-LOCAL", "磁盘上补丁还在");
+    assert_eq!(line(&disk, 20), "twenty");
+
+    let left = git(&fx, &["log", "--format=%s", "svn/base..work"]);
+    assert_eq!(left, "mute log", "svn/base..work 只剩那个补丁");
+    assert_ne!(
+        git(&fx, &["rev-parse", "work"]),
+        orig_head,
+        "origHead 变了（spec §8.2.4 末）"
+    );
+    assert_settled(&fx);
+}
+
+#[test]
+fn a_local_only_suffix_takes_the_fast_path_and_is_rebased_back_on_top() {
+    let fx = hybrid_with_colleague();
+    thirty_lines(&fx);
+    edit_line(&fx, 1, "one", "C1");
+    edit_line(&fx, 10, "ten-LOCAL", "mute log\n\nLocal-Only: true");
+    let out = deliver(&fx, "c1").unwrap();
+    assert!(
+        matches!(
+            out,
+            SyncOutOutcome::Delivered {
+                local_only_left: 1,
+                ..
+            }
+        ),
+        "{out:?}"
+    );
+    assert_eq!(line(&server_cat(&fx, "Code/A.cs"), 10), "10");
+    assert_eq!(
+        git(&fx, &["rev-parse", "work~1"]),
+        git(&fx, &["rev-parse", "svn/base"])
+    );
+    assert_settled(&fx);
+}
+
+#[test]
+fn an_overlapping_local_only_aborts_before_anything_is_touched() {
+    // 必测 #20（T2）：SVN 侧一个字节没动、没有交付 ref、主工作副本磁盘全程未变
+    let fx = hybrid_with_colleague();
+    thirty_lines(&fx);
+    edit_line(&fx, 10, "ten-LOCAL", "mute log\n\nLocal-Only: true");
+    edit_line(&fx, 11, "eleven", "fix jump");
+    let disk = std::fs::read(fx.wc().join("Code/A.cs")).unwrap();
+    let head = git(&fx, &["rev-parse", "HEAD"]);
+
+    assert_eq!(
+        preview_sync_out(&fx.wc_str()).unwrap_err().code,
+        "sync_out_local_only_conflict"
+    );
+    // 执行入口自己也拦得住（锁内复核重算 D0.5），用一份手写的 expect 直接调
+    let forged = SyncOutExpect {
+        orig_branch: "work".into(),
+        orig_head: head.clone(),
+        baseline_oid: git(&fx, &["rev-parse", "svn/base"]),
+        deliver_tree: "0".repeat(40),
+        changes: vec![DeliverChange {
+            status: "M".into(),
+            path: "Code/A.cs".into(),
+        }],
+        confirmed_outside: vec![],
+        message: "x".into(),
+    };
+    assert_eq!(
+        run_sync_out(&fx.wc_str(), &forged).unwrap_err().code,
+        "sync_out_local_only_conflict"
+    );
+    assert_eq!(std::fs::read(fx.wc().join("Code/A.cs")).unwrap(), disk);
+    assert_eq!(git(&fx, &["rev-parse", "HEAD"]), head);
+    assert_eq!(git(&fx, &["for-each-ref", "refs/mygitclient/"]), "");
+    assert!(svn_journal::read(&fx.wc_str()).unwrap().is_none());
+    assert!(svn_in(fx.path(), &["log", "-q", &repo_url(&fx)]).contains("r1 "));
+    assert!(!svn_in(fx.path(), &["log", "-q", &repo_url(&fx)]).contains("r2 "));
+}
+
+#[test]
+fn a_merge_inside_the_delivery_is_kept_and_the_local_patch_is_replayed_on_top() {
+    // 必测 #72②：merge 已在交付树内，其后只有连续单父的 Local-Only，独有文件保留
+    let fx = hybrid_with_colleague();
+    thirty_lines(&fx);
+    git(&fx, &["checkout", "-q", "-b", "side"]);
+    write(&fx, "Code/Side.cs", "side\n");
+    git(&fx, &["add", "Code/Side.cs"]);
+    git(&fx, &["commit", "-qm", "side"]);
+    git(&fx, &["checkout", "-q", "work"]);
+    git(&fx, &["merge", "-q", "--no-ff", "-m", "merge side", "side"]);
+    edit_line(&fx, 10, "ten-LOCAL", "mute log\n\nLocal-Only: true");
+
+    let out = deliver(&fx, "with merge").unwrap();
+    assert!(
+        matches!(
+            out,
+            SyncOutOutcome::Delivered {
+                local_only_left: 1,
+                ..
+            }
+        ),
+        "{out:?}"
+    );
+    assert_eq!(server_cat(&fx, "Code/Side.cs"), "side\n");
+    assert_eq!(git(&fx, &["show", "svn/base:Code/Side.cs"]), "side");
+    assert!(fx.wc().join("Code/Side.cs").exists());
+    assert_eq!(
+        line(
+            &std::fs::read_to_string(fx.wc().join("Code/A.cs")).unwrap(),
+            10
+        ),
+        "ten-LOCAL"
+    );
+}
+
+#[test]
+fn a_local_patch_that_clashes_with_a_colleague_stops_in_a_resolvable_rebase() {
+    // 必测 #69 的 D8d 一半（停下的状态）；继续的一半在 Task 8
+    let fx = hybrid_with_colleague();
+    thirty_lines(&fx);
+    edit_line(&fx, 1, "one", "C1");
+    edit_line(&fx, 10, "ten-LOCAL", "mute log\n\nLocal-Only: true");
+    let out = deliver_probed(&fx, "c1", &|s, _| {
+        if s == Step::Committed {
+            // 同事在我们 D5 之后改了第 10 行：D6 拉下来，D8d 重放补丁时冲突
+            let theirs: String = (1..=30)
+                .map(|n| match n {
+                    1 => "one\n".to_string(),
+                    10 => "ten-colleague\n".to_string(),
+                    _ => format!("{n}\n"),
+                })
+                .collect();
+            fx.colleague_commits("Code/A.cs", &theirs);
+        }
+    })
+    .unwrap();
+    assert_eq!(
+        out,
+        SyncOutOutcome::RebaseConflict {
+            rev: 3,
+            files: vec!["Code/A.cs".into()]
+        }
+    );
+    let j = svn_journal::read(&fx.wc_str())
+        .unwrap()
+        .expect("journal 保留");
+    assert_eq!(
+        j.phase,
+        app_lib::engine::svn_journal::Phase::RestoringBranch
+    );
+    assert!(
+        !svn_lock::is_held(&fx.wc_str()),
+        "冲突出口放锁，用户要编辑、暂存文件"
+    );
+    assert!(
+        git(&fx, &["log", "-1", "--format=%B", "svn/base"]).contains("@3 "),
+        "基线已推进"
+    );
+    assert!(server_cat(&fx, "Code/A.cs").contains("ten-colleague"));
+}

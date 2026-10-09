@@ -12,7 +12,7 @@
 | 3 前置检查与清单 | ✅ | `svn_sync_out_check.rs`、`svn_sync_check.rs`、`svn_preflight.rs`、`tests/svn_sync_out_check.rs` | `cargo test --test svn_sync_out_check` 11/11；`svn_sync_check` 20/20、`svn_sync_in` 73/73（重构后）；全量绿 |
 | 4 D4 登记与撤销 | ✅ | `svn_stage.rs`、`tests/svn_stage.rs` | `cargo test --test svn_stage` 7/7；全量绿 |
 | 5 编排主路径（无 Local-Only） | ✅ | `svn_sync_out.rs`、`svn_sync_in.rs`（`checkout_failed` 抽取）、`svn_sync_out_check.rs`、`tests/svn_sync_out.rs` | `cargo test --test svn_sync_out` 14/14；`svn_sync_in` 73/73；全量绿 |
-| 6 Local-Only 全流程 | ⏳ | | |
+| 6 Local-Only 全流程 | ✅ | `tests/svn_sync_out.rs`（+5） | `cargo test --test svn_sync_out` 19/19；全量绿 |
 | 7 早退与 D5 失败 | ⏳ | | |
 | 8 继续 / 放弃 | ⏳ | | |
 | 9 D6 / D7a 失败 | ⏳ | | |
@@ -91,6 +91,9 @@
 ### Task 6
 
 - **偏离计划（抄自计划）**：B10 / B11（见 Task 5）。
+- **实施结果**：5 个端到端用例首跑即全部通过——代码在 Task 2 / 5 已写好，本 Task 只补测试，未改任何生产代码。慢路径重放出的交付 commit 在 D8d 被 `rebase --empty=drop` 吸收，没有出现计划担心的 patch-id 冲突。
+- **计划的错误 / 没写的坑**：无。
+- **为什么这么改是安全的**：只加测试。T2 冲突用例同时验了「预览拒绝」与「伪造 expect 直接调执行入口也被锁内复核拒绝」，并断言磁盘、HEAD、`refs/mygitclient/`、journal、服务器 revision 全未变。
 
 ### Task 7
 
