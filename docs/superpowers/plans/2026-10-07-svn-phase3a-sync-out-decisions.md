@@ -10,7 +10,7 @@
 | 1 journal 字段 + Local-Only 解析 | ✅ | `svn_journal.rs`、`graph.rs`、`tests/svn_journal.rs` | `cargo test --test svn_journal` 14/14；fmt / clippy / 全量 cargo test 绿 |
 | 2 交付树 D0.5 | ✅ | `svn_deliver.rs`、`tests/svn_deliver.rs` | `cargo test --test svn_deliver` 10/10；fmt / clippy / 全量 cargo test 绿 |
 | 3 前置检查与清单 | ✅ | `svn_sync_out_check.rs`、`svn_sync_check.rs`、`svn_preflight.rs`、`tests/svn_sync_out_check.rs` | `cargo test --test svn_sync_out_check` 11/11；`svn_sync_check` 20/20、`svn_sync_in` 73/73（重构后）；全量绿 |
-| 4 D4 登记与撤销 | ⏳ | | |
+| 4 D4 登记与撤销 | ✅ | `svn_stage.rs`、`tests/svn_stage.rs` | `cargo test --test svn_stage` 7/7；全量绿 |
 | 5 编排主路径（无 Local-Only） | ⏳ | | |
 | 6 Local-Only 全流程 | ⏳ | | |
 | 7 早退与 D5 失败 | ⏳ | | |
@@ -67,6 +67,12 @@
 - **偏离计划（抄自计划）**：
   - B5：`newParentDirs` = D4 之后 `added` 且磁盘上是目录的条目（`svn status --xml` 不给 `kind`）。
   - B6：撤销 D4 以「当前状态 − `svnStatusBefore`」重算，只取 `added` / `deleted`；`svnDelta` 照常落盘。
+  - **对 spec §8.2.6 的补足**：`newParentDirs` = A 文件各级祖先里、D4 之后状态为 `added` 的目录，**含用户事先自己 `svn add` 过的**（不只是差量里的）。只按差量算，用户预先 add 过的新目录不进 target，D5 会被 `E200009` 拒。撤销仍然只撤差量，用户自己的登记不碰（§12.4）。钉在 `a_parent_dir_the_user_had_already_added_still_goes_into_the_commit_but_is_not_undone`。
+- **实施结果**：照计划代码落地。M2-E1 / E2 复核：`rm` 后 `svn status --xml` 的 `item` 是 `missing`，`svn delete` 后是 `deleted`；`add --parents` 后父目录是 `added`、XML 无 `kind`（`dir` 靠查磁盘）——`staging_registers_adds_and_deletes_and_names_the_new_parent_dirs` 断言了这些值。含 `@` 的路径靠 `peg_safe` 尾 `@` 正常 add / revert。
+- **计划的错误**：无。
+- **计划没写的坑**：无新增。
+- **已知限制（本期不处理）**：git 不跟踪目录，「删掉一整个目录」在 D1 里是一串文件删除；D4 只 `svn delete` 这些文件，服务器上会留下空目录。
+- **为什么这么改是安全的**：`stage` / `svn_revert` / `snapshot` 空目标一律 `sync_out_empty_targets`（必测第 1、2 条）；`svn revert` 不递归、逐条、从深到浅；`deleted` 撤销后只对 `is_file()` 做显式 `remove_file`，不用 `git clean`；撤完与快照逐条比对，不一致报 `sync_out_rollback_incomplete` 且不删 journal。
 
 ### Task 5
 

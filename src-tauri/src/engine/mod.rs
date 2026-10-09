@@ -31,6 +31,7 @@ pub mod svn_log_cache;
 pub mod svn_preflight;
 pub mod svn_pristine;
 pub mod svn_server_set;
+pub mod svn_stage;
 pub mod svn_sync;
 pub mod svn_sync_check;
 pub mod svn_sync_in;
