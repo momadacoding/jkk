@@ -8,7 +8,7 @@
 |---|---|---|---|
 | 0 决策日志 + 自检 | ✅ | 本文件 | 基点 `86e82c7`（worktree `.claude/worktrees/svn-phase3a-sync-out`，分支 `worktree-svn-phase3a-sync-out`） |
 | 1 journal 字段 + Local-Only 解析 | ✅ | `svn_journal.rs`、`graph.rs`、`tests/svn_journal.rs` | `cargo test --test svn_journal` 14/14；fmt / clippy / 全量 cargo test 绿 |
-| 2 交付树 D0.5 | ⏳ | | |
+| 2 交付树 D0.5 | ✅ | `svn_deliver.rs`、`tests/svn_deliver.rs` | `cargo test --test svn_deliver` 10/10；fmt / clippy / 全量 cargo test 绿 |
 | 3 前置检查与清单 | ⏳ | | |
 | 4 D4 登记与撤销 | ⏳ | | |
 | 5 编排主路径（无 Local-Only） | ⏳ | | |
@@ -44,6 +44,10 @@
 - **偏离计划（抄自计划）**：
   - B2：D0.5 慢路径不用临时 worktree + cherry-pick，改用 `git merge-tree --write-tree --merge-base=<C^> <cur> <C>` 在对象层重放，再 `commit-tree`。journal 的 `tempWorktree` 本期不写，收尾仍兼容处理。git < 2.40 在慢路径报 `sync_out_git_too_old`。
   - B15：交付 commit 的作者沿用原 commit（`GIT_AUTHOR_*`），提交者是当前用户。
+- **实施结果**：照计划代码落地，无改动。M1 复核（本机 git 2.51.2.windows.1）：`merge-tree` 冲突时退出 1，stdout 首行 tree、随后 `<mode> <oid> <stage>\t<path>` 三行，`replay_conflict` 按此解析出 `Code/A.cs` 并点名本地补丁（`an_overlapping_local_only_aborts_and_names_both_commits` 钉着）；作者 / message 保留（`replayed_commits_keep_their_author_and_message`）。
+- **计划的错误**：无。
+- **计划没写的坑**：无新增。`sync_out_git_too_old`（退出 129）本机无法复现，只靠代码审读；git < 2.40 的用户走快路径不受影响。
+- **为什么这么改是安全的**：`plan_deliver` 只写对象（`commit-tree`）不写 ref、不碰磁盘 / 索引 / HEAD（`a_local_only_in_the_middle_is_replayed_out_without_touching_the_disk` 断言 `for-each-ref` 前后相同、`status --porcelain` 为空）；`unpin` 只删 `refs/mygitclient/deliver/<无斜杠名>`，越界报 `sync_out_bad_deliver_ref`；`pin` 以空旧值 CAS，撞上残留报错不覆盖。
 
 ### Task 3
 

@@ -17,6 +17,7 @@ pub mod svn_attributes;
 pub mod svn_baseline;
 pub mod svn_cli;
 pub mod svn_config;
+pub mod svn_deliver;
 pub mod svn_dirty;
 pub mod svn_exclude;
 pub mod svn_externals;
