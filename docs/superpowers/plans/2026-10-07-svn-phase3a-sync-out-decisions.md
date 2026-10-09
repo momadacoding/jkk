@@ -7,7 +7,7 @@
 | Task | 状态 | 产出文件 | 验证 |
 |---|---|---|---|
 | 0 决策日志 + 自检 | ✅ | 本文件 | 基点 `86e82c7`（worktree `.claude/worktrees/svn-phase3a-sync-out`，分支 `worktree-svn-phase3a-sync-out`） |
-| 1 journal 字段 + Local-Only 解析 | ⏳ | | |
+| 1 journal 字段 + Local-Only 解析 | ✅ | `svn_journal.rs`、`graph.rs`、`tests/svn_journal.rs` | `cargo test --test svn_journal` 14/14；fmt / clippy / 全量 cargo test 绿 |
 | 2 交付树 D0.5 | ⏳ | | |
 | 3 前置检查与清单 | ⏳ | | |
 | 4 D4 登记与撤销 | ⏳ | | |
@@ -34,7 +34,10 @@
 
 ### Task 1
 
-- **偏离计划**：无（计划本身的偏离从这里起逐 Task 记）。
+- **偏离计划**：无。
+- **计划的错误**：无。
+- **计划没写的坑**：`cargo fmt` 会把测试里单行的 `SvnNode { … }` 字面量拆成多行（超过行宽），计划里的代码块是未格式化的形态，照抄后要跑一次 `cargo fmt`。
+- **为什么这么改是安全的**：新字段全部 `default + skip_serializing_if`，2c 写出的旧 journal 照常读（`a_journal_written_before_phase_3a_still_reads` 钉着）；脊梁四件没动。
 
 ### Task 2
 

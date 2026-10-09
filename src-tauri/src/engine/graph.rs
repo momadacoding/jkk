@@ -41,7 +41,8 @@ fn is_false(b: &bool) -> bool {
 
 /// `Local-Only: true`（spec §6.7）。键按 git 的惯例大小写不敏感，
 /// 且**逐行完整匹配**——正文里顺口提到这个词的提交不算。
-fn parse_local_only(message: &str) -> bool {
+/// `svn_deliver` 用同一份判定摘掉本地补丁——两处规则不能漂移。
+pub(crate) fn parse_local_only(message: &str) -> bool {
     message.lines().any(|line| {
         let line = line.trim();
         let Some((key, value)) = line.split_once(':') else {
