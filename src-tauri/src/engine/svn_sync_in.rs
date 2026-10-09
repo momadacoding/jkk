@@ -1053,7 +1053,7 @@ fn settle_checkout_residue(repo: &str, cfg: &SvnConfig, j: &Journal, orig: &str)
 }
 
 /// 磁盘上的 `p` 是不是某个基线 commit 里原样存着的字节（或者文件已经不在）。
-fn is_baseline_bytes(repo: &str, bases: &[String], p: &str) -> Result<bool> {
+pub(crate) fn is_baseline_bytes(repo: &str, bases: &[String], p: &str) -> Result<bool> {
     let path = Path::new(repo).join(p);
     let Ok(meta) = path.symlink_metadata() else {
         return Ok(true); // 磁盘上没有：按 HEAD 写回不会覆盖任何字节

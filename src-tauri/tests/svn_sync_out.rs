@@ -611,3 +611,201 @@ fn a_local_patch_that_clashes_with_a_colleague_stops_in_a_resolvable_rebase() {
     );
     assert!(server_cat(&fx, "Code/A.cs").contains("ten-colleague"));
 }
+
+// —— Task 7：早退与 D5 失败 ——
+
+/// 白名单当前的 svn 状态文本，用来断言「SVN 侧回到了交付前」。
+fn svn_status(fx: &SvnFixture) -> String {
+    svn_in(&fx.wc(), &["status", "Code"])
+}
+
+fn server_head(fx: &SvnFixture) -> String {
+    svn_in(
+        fx.path(),
+        &["info", "--show-item", "revision", &repo_url(fx)],
+    )
+    .trim()
+    .to_string()
+}
+
+/// 早退之后的通用断言：回到原分支原位置、没有交付 ref、没有 journal、锁已放、SVN 原样。
+fn assert_untouched(fx: &SvnFixture, head: &str, status: &str, server: &str) {
+    assert_eq!(git(fx, &["symbolic-ref", "--short", "HEAD"]), "work");
+    assert_eq!(git(fx, &["rev-parse", "HEAD"]), head);
+    assert_eq!(git(fx, &["for-each-ref", "refs/mygitclient/deliver/"]), "");
+    assert!(svn_journal::read(&fx.wc_str()).unwrap().is_none());
+    assert!(!svn_lock::is_held(&fx.wc_str()));
+    assert_eq!(svn_status(fx), status, "svn 登记没回到交付前");
+    assert_eq!(server_head(fx), server, "服务器上多了 revision");
+    assert_eq!(git(fx, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn a_commit_made_while_the_dialog_was_open_is_caught_before_anything_moves() {
+    // Review Focus 2
+    let fx = hybrid_with_colleague();
+    typical_work(&fx);
+    let p = preview_sync_out(&fx.wc_str()).unwrap();
+    write(&fx, "Code/A.cs", "a3\n");
+    git(&fx, &["commit", "-qam", "one more"]);
+    let (head, status, server) = (
+        git(&fx, &["rev-parse", "HEAD"]),
+        svn_status(&fx),
+        server_head(&fx),
+    );
+    let err = run_sync_out(&fx.wc_str(), &expect_from(&p, "x")).unwrap_err();
+    assert_eq!(err.code, "sync_out_state_changed", "{}", err.message);
+    assert_untouched(&fx, &head, &status, &server);
+}
+
+#[test]
+fn a_file_git_does_not_manage_changed_after_the_preview_needs_reconfirmation() {
+    // 计划 B1：用户确认时没看到的白名单外修改，不能被执行时悄悄带进 D6
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/x.psd", "psd1\n");
+    let p = app_lib::engine::svn_sync_check::preview_sync_in(&fx.wc_str()).unwrap();
+    app_lib::engine::svn_sync_in::run_sync_in(
+        &fx.wc_str(),
+        &app_lib::engine::svn_sync_in::SyncInExpect {
+            orig_branch: p.orig_branch,
+            orig_head: p.orig_head,
+            baseline_oid: p.baseline_oid,
+            confirmed_outside: p.outside_changes,
+        },
+    )
+    .unwrap();
+    typical_work(&fx);
+    let p = preview_sync_out(&fx.wc_str()).unwrap();
+    assert!(p.outside_changes.is_empty());
+    std::fs::write(fx.wc().join("Code/x.psd"), "psd LOCAL\n").unwrap();
+    let (head, status, server) = (
+        git(&fx, &["rev-parse", "HEAD"]),
+        svn_status(&fx),
+        server_head(&fx),
+    );
+    let err = run_sync_out(&fx.wc_str(), &expect_from(&p, "x")).unwrap_err();
+    assert_eq!(err.code, "sync_out_needs_reconfirm", "{}", err.message);
+    assert_untouched(&fx, &head, &status, &server);
+}
+
+#[test]
+fn the_server_moving_after_the_preview_is_caught_at_d35() {
+    // spec §8.4 / §13「D3.5 复查失败」：保留提交信息由前端负责（Task 11）
+    let fx = hybrid_with_colleague();
+    typical_work(&fx);
+    let p = preview_sync_out(&fx.wc_str()).unwrap();
+    fx.colleague_commits("Art/x.psd", "psd2\n");
+    let (head, status, server) = (
+        git(&fx, &["rev-parse", "HEAD"]),
+        svn_status(&fx),
+        server_head(&fx),
+    );
+    let err = run_sync_out(&fx.wc_str(), &expect_from(&p, "x")).unwrap_err();
+    assert_eq!(err.code, "sync_out_server_ahead", "{}", err.message);
+    assert_untouched(&fx, &head, &status, &server);
+}
+
+#[test]
+fn switching_back_in_another_tool_after_confirming_is_caught_at_d49() {
+    // 必测 #30（spec §8.2.5）
+    let fx = hybrid_with_colleague();
+    typical_work(&fx);
+    let (head, status, server) = (
+        git(&fx, &["rev-parse", "HEAD"]),
+        svn_status(&fx),
+        server_head(&fx),
+    );
+    let err = deliver_probed(&fx, "x", &|s, repo| {
+        if s == Step::Staged {
+            run_git(repo, &["checkout", "-q", "work"]).unwrap(); // 用户在 Rider 里切了回去
+        }
+    })
+    .unwrap_err();
+    assert_eq!(err.code, "sync_out_disk_changed", "{}", err.message);
+    assert_untouched(&fx, &head, &status, &server);
+}
+
+#[test]
+fn an_out_of_date_commit_is_rolled_back_precisely() {
+    // 必测 #3 + #29 的全流程版：交付含新增（两层新目录）+ 删除 + 修改，同事抢先改了 A.cs
+    let fx = hybrid_with_colleague();
+    typical_work(&fx);
+    let (head, status) = (git(&fx, &["rev-parse", "HEAD"]), svn_status(&fx));
+    let err = deliver_probed(&fx, "mine", &|s, _| {
+        if s == Step::BeforeCommit {
+            fx.colleague_commits("Code/A.cs", "colleague\n");
+        }
+    })
+    .unwrap_err();
+    assert_eq!(err.code, "sync_out_commit_rejected", "{}", err.message);
+    assert!(
+        err.message.contains("E155011"),
+        "原样展示 svn stderr：{}",
+        err.message
+    );
+    assert_untouched(&fx, &head, &status, "2"); // r2 是同事的
+    assert_eq!(server_msg(&fx, 2), "colleague Code/A.cs");
+}
+
+#[test]
+fn a_hook_rejection_is_rolled_back_and_not_retried() {
+    // spec §8.6 表「服务端钩子拒绝」/ §8.7 绝不自动重试
+    let fx = hybrid_with_colleague();
+    typical_work(&fx);
+    install_rejecting_pre_commit_hook(&fx);
+    let (head, status, server) = (
+        git(&fx, &["rev-parse", "HEAD"]),
+        svn_status(&fx),
+        server_head(&fx),
+    );
+    let err = deliver(&fx, "mine").unwrap_err();
+    assert_eq!(err.code, "sync_out_commit_rejected", "{}", err.message);
+    assert!(err.message.contains("rejected by hook"), "{}", err.message);
+    assert_untouched(&fx, &head, &status, &server);
+}
+
+fn install_rejecting_pre_commit_hook(fx: &SvnFixture) {
+    let hooks = fx.repo().join("hooks");
+    if cfg!(windows) {
+        std::fs::write(
+            hooks.join("pre-commit.bat"),
+            "@echo off\r\necho rejected by hook 1>&2\r\nexit 1\r\n",
+        )
+        .unwrap();
+    } else {
+        let p = hooks.join("pre-commit");
+        std::fs::write(&p, "#!/bin/sh\necho rejected by hook >&2\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+}
+
+#[test]
+fn an_unknown_commit_result_leaves_everything_where_it_is() {
+    // 计划 B3 / B4：仓库在 D5 时不可达（E170013 + E180001），既不回滚也不推进
+    let fx = hybrid_with_colleague();
+    typical_work(&fx);
+    let away = fx.path().join("repo-away");
+    let err = deliver_probed(&fx, "mine", &|s, _| {
+        if s == Step::BeforeCommit {
+            std::fs::rename(fx.repo(), &away).unwrap();
+        }
+    })
+    .unwrap_err();
+    std::fs::rename(&away, fx.repo()).unwrap();
+    assert_eq!(err.code, "sync_out_commit_unknown", "{}", err.message);
+    assert!(err.message.contains("mygitclient:opid="), "{}", err.message);
+    let j = svn_journal::read(&fx.wc_str())
+        .unwrap()
+        .expect("journal 保留");
+    assert_eq!(j.phase, app_lib::engine::svn_journal::Phase::Committing);
+    assert!(!svn_lock::is_held(&fx.wc_str()));
+    assert!(
+        svn_status(&fx).contains("A       Code\\Deep")
+            || svn_status(&fx).contains("A       Code/Deep")
+    );
+    assert_eq!(server_head(&fx), "1");
+}

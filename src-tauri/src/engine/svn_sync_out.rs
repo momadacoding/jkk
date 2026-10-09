@@ -21,6 +21,7 @@ use crate::engine::svn_baseline::{
 use crate::engine::svn_cli::{run_svn, run_svn_code};
 use crate::engine::svn_config::{read_config, SvnConfig, BASELINE_BRANCH};
 use crate::engine::svn_deliver::{deliver_ref, pin, unpin};
+use crate::engine::svn_include_check::normalize_roots;
 use crate::engine::svn_init::record_server_tree_into;
 use crate::engine::svn_journal::{self, Flow, Journal, Phase};
 use crate::engine::svn_lock;
@@ -30,8 +31,8 @@ use crate::engine::svn_sync_check::{
     assert_linear, current_branch, list_paths, rev_parse, unfinished_error, unmerged_paths,
 };
 use crate::engine::svn_sync_in::{
-    checkout_failed, checkout_verified, need, new_opid, rebase_in_progress, tracked_changes,
-    untracked_leftovers,
+    checkout_failed, checkout_verified, is_baseline_bytes, need, new_opid, rebase_in_progress,
+    tracked_changes, untracked_leftovers,
 };
 use crate::engine::svn_sync_out_check::{check_sync_out, git_dirty, DeliverChange, SyncOutPreview};
 use crate::engine::svn_wc::peg_safe;
@@ -735,7 +736,7 @@ pub(crate) fn cleanup_before_svn(repo: &str, cfg: &SvnConfig, j: &Journal) -> Re
     match current_branch(repo)? {
         Some(b) if b == orig => {}
         None if Some(rev_parse(repo, "HEAD")?) == j.deliver_oid => {
-            checkout_verified(repo, cfg, &orig, false)?;
+            back_from_deliver(repo, cfg, j, &orig, &orig_head)?;
         }
         other => {
             return Err(state_changed(&format!(
@@ -753,6 +754,46 @@ pub(crate) fn cleanup_before_svn(repo: &str, cfg: &SvnConfig, j: &Journal) -> Re
     }
     // ⑤
     svn_journal::remove(repo)
+}
+
+/// 从交付树切回原分支。普通切换被挡住时（多半是 D3.8 没切干净：Unity 占着文件，
+/// 磁盘上新旧两种字节混着，计划 A15），只要每个不一致的文件都是交付树或原分支里
+/// 原样存着的字节（或已不在），`-f` 就不会丢任何东西；否则原样报错、不覆盖。
+fn back_from_deliver(
+    repo: &str,
+    cfg: &SvnConfig,
+    j: &Journal,
+    orig: &str,
+    orig_head: &str,
+) -> Result<()> {
+    let Err(first) = checkout_verified(repo, cfg, orig, false) else {
+        return Ok(());
+    };
+    let deliver = need(&j.deliver_oid, "deliverOid")?;
+    let bases = [deliver.clone(), orig_head.to_string()];
+    let mut paths = tracked_changes(repo, cfg)?;
+    paths.extend(changed_between(repo, cfg, &deliver, orig_head)?);
+    for p in &paths {
+        if !is_baseline_bytes(repo, &bases, p)? {
+            return Err(first);
+        }
+    }
+    checkout_verified(repo, cfg, orig, true)
+}
+
+/// `a` 与 `b` 之间白名单内有差异的路径。
+fn changed_between(repo: &str, cfg: &SvnConfig, a: &str, b: &str) -> Result<Vec<String>> {
+    let roots = normalize_roots(&cfg.whitelist);
+    if roots.is_empty() {
+        return Ok(Vec::new()); // 空 pathspec 会变成「全部」（§12.2）
+    }
+    let mut args: Vec<&str> = vec!["diff", "--name-only", "-z", a, b, "--"];
+    args.extend(roots.iter().map(String::as_str));
+    Ok(run_git(repo, &args)?
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 /// D4 之前的出口：收尾，并把结果接在原因后面（原因永远在前）。

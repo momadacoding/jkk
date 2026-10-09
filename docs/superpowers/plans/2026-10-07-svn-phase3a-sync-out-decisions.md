@@ -13,7 +13,7 @@
 | 4 D4 登记与撤销 | ✅ | `svn_stage.rs`、`tests/svn_stage.rs` | `cargo test --test svn_stage` 7/7；全量绿 |
 | 5 编排主路径（无 Local-Only） | ✅ | `svn_sync_out.rs`、`svn_sync_in.rs`（`checkout_failed` 抽取）、`svn_sync_out_check.rs`、`tests/svn_sync_out.rs` | `cargo test --test svn_sync_out` 14/14；`svn_sync_in` 73/73；全量绿 |
 | 6 Local-Only 全流程 | ✅ | `tests/svn_sync_out.rs`（+5） | `cargo test --test svn_sync_out` 19/19；全量绿 |
-| 7 早退与 D5 失败 | ⏳ | | |
+| 7 早退与 D5 失败 | ✅ | `svn_sync_out.rs`（`back_from_deliver`）、`svn_sync_in.rs`、`tests/svn_sync_out.rs`（+7） | `cargo test --test svn_sync_out` 26/26；全量绿 |
 | 8 继续 / 放弃 | ⏳ | | |
 | 9 D6 / D7a 失败 | ⏳ | | |
 | 10 Tauri 命令 | ⏳ | | |
@@ -98,6 +98,11 @@
 ### Task 7
 
 - **偏离计划（抄自计划）**：B3 / B4 / B14（见 Task 5）。
+- **偏离计划（本 Task）**：`an_out_of_date_commit_is_rolled_back_precisely` 末尾计划用文本 `svn log` + `contains("colleague Code/A.cs")`，改成 `server_msg(&fx, 2) == "colleague Code/A.cs"`（Task 5 引入的 XML 读法；ASCII 消息两种写法等价，统一用不受代码页影响的那个）。
+- **实施结果**：7 个用例首跑全部通过——Task 5 的代码已覆盖这些出口，`switching_back…` 与 `an_out_of_date…` 收尾时普通 checkout 没有被挡。Step 3 的 `-f` 退路（`back_from_deliver` + `changed_between`）照计划仍然加上，它的失败测试在 Task 8 的 `a_file_held_open_at_checkout_is_named_and_nothing_is_committed`（计划 Review Focus 第 3 条写「钉在 Task 7」，实际用例在 Task 8 的正文里——计划内部的位置笔误）。
+- **B3 全流程复核**：out-of-date 的实际 stderr 含 `E155011`（`commit_rejected` 原样带出）；钩子拒绝含 `rejected by hook`；仓库目录改名时 `sync_out_commit_unknown`，journal 停在 `committing`、`A Code/Deep` 登记保留、服务器仍是 r1。
+- **计划的错误**：Review Focus 第 3 条的用例位置写成 Task 7，实际在 Task 8。
+- **为什么这么改是安全的（`-f` 退路）**：只有普通 checkout 失败后才考虑 `-f`；`-f` 之前逐个核对「白名单内被跟踪的改动 ∪ 交付树与原分支之间有差异的路径」，每个文件的磁盘字节都必须是交付树或原分支里原样存着的（或已不在），有一个不是就原样返回第一次的错误、不覆盖。`changed_between` 空白名单直接返回空，不发空 pathspec。
 
 ### Task 8
 
