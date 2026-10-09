@@ -9,7 +9,7 @@
 | 0 决策日志 + 自检 | ✅ | 本文件 | 基点 `86e82c7`（worktree `.claude/worktrees/svn-phase3a-sync-out`，分支 `worktree-svn-phase3a-sync-out`） |
 | 1 journal 字段 + Local-Only 解析 | ✅ | `svn_journal.rs`、`graph.rs`、`tests/svn_journal.rs` | `cargo test --test svn_journal` 14/14；fmt / clippy / 全量 cargo test 绿 |
 | 2 交付树 D0.5 | ✅ | `svn_deliver.rs`、`tests/svn_deliver.rs` | `cargo test --test svn_deliver` 10/10；fmt / clippy / 全量 cargo test 绿 |
-| 3 前置检查与清单 | ⏳ | | |
+| 3 前置检查与清单 | ✅ | `svn_sync_out_check.rs`、`svn_sync_check.rs`、`svn_preflight.rs`、`tests/svn_sync_out_check.rs` | `cargo test --test svn_sync_out_check` 11/11；`svn_sync_check` 20/20、`svn_sync_in` 73/73（重构后）；全量绿 |
 | 4 D4 登记与撤销 | ⏳ | | |
 | 5 编排主路径（无 Local-Only） | ⏳ | | |
 | 6 Local-Only 全流程 | ⏳ | | |
@@ -56,6 +56,11 @@
   - B9：D2 发现白名单外变更时拒绝（`sync_out_outside_whitelist`），不静默过滤。
   - B12：pinned 模式在动手前拒绝（`sync_out_pinned_unsupported`），必测第 53 / 55 条推迟。
   - B13：D3.5 合并进执行时锁内复核的那次 `remoteRev` 查询，值写进 `expectedStartRev`。
+- **实施结果**：照计划代码落地。`check_git_idle` 加 `code` / `verb` 参数后，`sync_in` 的报错码与文案逐字不变（`svn_sync_check`、`svn_sync_in` 全部测试照旧通过）。B9 由 `a_change_outside_the_whitelist_is_refused_not_filtered` 钉住；B13 的 `remote_head_rev` 在本 Task 只用于预览，执行时复用在 Task 5。
+- **计划的错误**：无。
+- **计划没写的坑**：无。
+- **已知覆盖缺口**：B12 的 pinned 拒绝没有专门测试——与 `sync_in` 共用 `detect_pinned`，判定本身 2c 已覆盖；这里只是多一个出口码。
+- **为什么这么改是安全的**：整个模块只读；`the_preview_changes_nothing_and_takes_no_lock` 断言预览前后 ref、git status、svn status、journal、锁全不变。`git_dirty` / `svn_targets` 空白名单直接报错，不会退化成整个工作副本。
 
 ### Task 4
 

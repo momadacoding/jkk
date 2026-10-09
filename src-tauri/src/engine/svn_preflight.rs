@@ -117,6 +117,22 @@ pub fn read_node_rev(repo_root: &str, whitelist: &[String]) -> Result<u64> {
     check_single_node_rev(repo_root, &targets, &wcs)
 }
 
+/// 本流程对 svn 发命令时用的 target：白名单根，加上其中的嵌套工作副本根。
+///
+/// 与 [`read_node_rev`] 同一套（external 里的代码要显式指到，spec §6.5.3 / §6.6.5）。
+/// 空白名单直接报错——空 target 会变成「整个工作副本」（spec §12.2）。
+pub(crate) fn svn_targets(repo_root: &str, whitelist: &[String]) -> Result<Vec<String>> {
+    let roots = whitelist_roots(whitelist);
+    if roots.is_empty() {
+        return Err(GitError::new(
+            "svn_empty_whitelist",
+            "白名单是空的，拒绝对整个工作副本发命令。",
+        ));
+    }
+    let wcs = enumerate_wcs(repo_root, whitelist)?;
+    Ok(check_targets(&roots, &wcs))
+}
+
 /// P1 / P2 的检查目标：白名单根，**外加白名单底下每一条嵌套 external 的根**。
 ///
 /// # 为什么不能只查白名单根
