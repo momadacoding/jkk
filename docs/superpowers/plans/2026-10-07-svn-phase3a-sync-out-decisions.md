@@ -14,7 +14,7 @@
 | 5 编排主路径（无 Local-Only） | ✅ | `svn_sync_out.rs`、`svn_sync_in.rs`（`checkout_failed` 抽取）、`svn_sync_out_check.rs`、`tests/svn_sync_out.rs` | `cargo test --test svn_sync_out` 14/14；`svn_sync_in` 73/73；全量绿 |
 | 6 Local-Only 全流程 | ✅ | `tests/svn_sync_out.rs`（+5） | `cargo test --test svn_sync_out` 19/19；全量绿 |
 | 7 早退与 D5 失败 | ✅ | `svn_sync_out.rs`（`back_from_deliver`）、`svn_sync_in.rs`、`tests/svn_sync_out.rs`（+7） | `cargo test --test svn_sync_out` 26/26；全量绿 |
-| 8 继续 / 放弃 | ⏳ | | |
+| 8 继续 / 放弃 | ✅ | `svn_sync_out.rs`（`continue_sync_out` / `abort_sync_out`）、`svn_sync_in.rs`、`tests/svn_sync_out.rs`（+10） | `cargo test --test svn_sync_out` 36/36（含 Windows 占用文件用例）；全量绿 |
 | 9 D6 / D7a 失败 | ⏳ | | |
 | 10 Tauri 命令 | ⏳ | | |
 | 11 前端纯逻辑与流程 | ⏳ | | |
@@ -128,3 +128,10 @@
 - **偏离计划（抄自计划）**：
   - B7：D5 之后的「放弃」= 停止自动收尾：rebase 在进行就 `--abort`；HEAD 不在原分支时，先确认白名单内 W-file 在 svn 看来全部干净再 `checkout -f` 回原分支；删交付 ref 与 journal；已发布的基线留在新位置。
   - B8：D5 之前所有 phase 的「继续」与「放弃」走同一条清理路径；`svn-staged` 先按 B6 撤销登记。
+- **偏离计划（本 Task）**：
+  - `continue_restoring` 的 `rev` 改用 `delivered_rev()`（优先 `committed_rev`），与 `restore_branch` 共用——里程碑 review 第 5 条的延续。`a_d8d_conflict_is_continued_after_the_user_resolves_it` 的期望由计划的 `rev: 3` 改为 `rev: 2`（我的提交 r2，同事 r3）。
+  - 新增 `a_temp_worktree_named_in_a_foreign_journal_is_left_alone`：里程碑 review 第 9 条（删掉 `worktree remove --force`）的回归测试，`abort_sync_out` 是第一个能从 journal 走到收尾的公开入口。**这条测试写在修复之后，没有看到 RED**——当时没有公开入口能构造该场景；它守的是「以后别把这一步加回来」。
+- **实施结果**：照计划代码落地。B4：`committing` 时继续 / 放弃都报 `sync_out_commit_unknown`，journal 原样。B7：`post-commit` 放弃先跑 D6 拉齐（实测 M2-E6：只提交不更新是 mixed-revision，「更新」与「重建基线」都不接），之后 `check_sync` 判为 `Diverged { node_rev: 2, baseline_rev: 1 }`，「更新」的 A16 接管后分支回到新基线——`abandoning_after_the_commit…` 全程钉住。Windows 占用文件用例（share=Read）在本机按计划预期报 `sync_in_checkout_failed` 并指名 `Code/A.cs`，放开后收尾干净。
+- **计划的错误**：无（`rev` 期望值随里程碑 review 修正，见上）。
+- **计划没写的坑 / 覆盖缺口**：`publishing-baseline` 但还没有 `newBaselineOid`（崩在写 `captureTree` 之后、建 commit 之前）走「从 D7 重录」分支，没有对应 Step，未覆盖。
+- **为什么这么改是安全的**：两个入口都先拿锁再在锁内重读 journal，opid 或 flow 变了就停；只接 `flow = sync_out`，否则 `sync_out_wrong_flow`；`sync_in` 的继续 / 放弃照旧拒绝交付 journal（码不变，文案改为指向交付横幅）。D5 之后不重复提交（`every_crash_after_the_commit…` 断言服务器始终只有 r2）；放弃只在 W-file 全部 svn 干净时才 `checkout -f` 回原分支，否则 `sync_out_unsafe_to_return` 保留现场；rebase 只 abort / continue 本次发起的那一个（`require_our_rebase` 核对 head-name / orig-head / onto）。

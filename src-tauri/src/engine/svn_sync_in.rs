@@ -1198,7 +1198,7 @@ fn published_baseline(repo: &str, j: &Journal) -> Result<String> {
 /// rebase 到别处，head-name 一模一样。本次的 rebase 由三样东西确定：重放的分支、
 /// 起点（S9 时 HEAD 就是 `origHead`）、目标（`svn/base`）。2026-09-26 实测
 /// `rebase-merge/` 下的 `orig-head` 与 `onto` 就是这两个完整 OID。
-fn require_our_rebase(repo: &str, j: &Journal) -> Result<()> {
+pub(crate) fn require_our_rebase(repo: &str, j: &Journal) -> Result<()> {
     let want_head = format!("refs/heads/{}", need(&j.orig_branch, "origBranch")?);
     let want_orig = need(&j.orig_head, "origHead")?;
     let want_onto = published_baseline(repo, j)?;
@@ -1223,7 +1223,7 @@ fn rebase_state(repo: &str, name: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
-fn is_ancestor(repo: &str, a: &str, b: &str) -> Result<bool> {
+pub(crate) fn is_ancestor(repo: &str, a: &str, b: &str) -> Result<bool> {
     let (code, _) = run_git_code(repo, &["merge-base", "--is-ancestor", a, b])?;
     match code {
         0 => Ok(true),
@@ -1261,7 +1261,7 @@ fn require_on_old_baseline(repo: &str, j: &Journal) -> Result<()> {
     Ok(())
 }
 
-fn no_unfinished() -> GitError {
+pub(crate) fn no_unfinished() -> GitError {
     GitError::new(
         "sync_no_unfinished",
         "没有未收尾的同步记录，不需要继续或放弃。",
@@ -1271,7 +1271,6 @@ fn no_unfinished() -> GitError {
 fn sync_out_unsupported() -> GitError {
     GitError::new(
         "sync_out_not_supported",
-        "这条记录是「交付」流程留下的，本版本还不能替你收尾（Phase 3 提供）。\
-         在那之前请不要手工去动 stash 或分支指针。",
+        "这条记录是「交付」流程留下的。请用顶部横幅上交付那一组按钮处理，不要手工去动分支指针。",
     )
 }

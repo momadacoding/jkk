@@ -12,7 +12,7 @@
 //! 用户对着预览确认（D3）。执行时锁内把前置检查、D0.5、D1 / D2 全部重算，与
 //! [`SyncOutExpect`] 比对，不一致就停下让用户重新确认。
 
-use crate::engine::git_cli::{run_git, run_git_code};
+use crate::engine::git_cli::{run_git, run_git_code, run_git_env};
 use crate::engine::graph::parse_local_only;
 use crate::engine::svn_baseline::{
     create_baseline_commit, move_baseline_ref, parse_trailer, read_baseline, swap_index_to_tree,
@@ -31,8 +31,9 @@ use crate::engine::svn_sync_check::{
     assert_linear, current_branch, list_paths, rev_parse, unfinished_error, unmerged_paths,
 };
 use crate::engine::svn_sync_in::{
-    checkout_failed, checkout_verified, is_baseline_bytes, need, new_opid, rebase_in_progress,
-    tracked_changes, untracked_leftovers,
+    checkout_failed, checkout_verified, dirty_w_files, is_ancestor, is_baseline_bytes, need,
+    new_opid, no_unfinished, rebase_in_progress, require_our_rebase, tracked_changes, unresolved,
+    untracked_leftovers,
 };
 use crate::engine::svn_sync_out_check::{check_sync_out, git_dirty, DeliverChange, SyncOutPreview};
 use crate::engine::svn_wc::peg_safe;
@@ -589,13 +590,7 @@ pub(crate) fn restore_branch(
     let orig = need(&j.orig_branch, "origBranch")?;
     let orig_head = need(&j.orig_head, "origHead")?;
     let new = published(repo, j)?;
-    // 报给用户的是**他自己的**提交（D5 的 `Committed revision`），不是 D6 更新到的
-    // revision——两者之间同事可能又提交过，拿后者去服务器 log 里找会找到别人的提交。
-    // D5 的输出没读出来（极少）时退回新基线的 revision
-    let rev = match j.committed_rev {
-        Some(r) => r,
-        None => trailer_rev(repo, &new)?,
-    };
+    let rev = delivered_rev(repo, j, &new)?;
     let orig_ref = format!("refs/heads/{orig}");
 
     if j.local_only_commits.is_empty() {
@@ -849,6 +844,16 @@ fn published(repo: &str, j: &Journal) -> Result<String> {
     Ok(new)
 }
 
+/// 报给用户的是**他自己的**提交（D5 的 `Committed revision`），不是 D6 更新到的
+/// revision——两者之间同事可能又提交过，拿后者去服务器 log 里找会找到别人的提交
+/// （里程碑 review）。D5 的输出没读出来（极少）时退回新基线的 revision。
+fn delivered_rev(repo: &str, j: &Journal, new_baseline: &str) -> Result<u64> {
+    match j.committed_rev {
+        Some(r) => Ok(r),
+        None => trailer_rev(repo, new_baseline),
+    }
+}
+
 fn trailer_rev(repo: &str, commit: &str) -> Result<u64> {
     let msg = run_git(repo, &["log", "-1", "--format=%B", commit])?;
     parse_trailer(&msg)
@@ -878,4 +883,162 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+// —— 继续 / 放弃（spec §7.6「提供继续 / 放弃两个入口」；计划 B4 / B7 / B8）——
+
+/// 从中断处接着走。
+pub fn continue_sync_out(repo: &str) -> Result<SyncOutOutcome> {
+    let (_lock, mut j) = take_over(repo)?;
+    let cfg = read_config(repo)?;
+    let j = &mut j;
+    match j.phase {
+        // B8：往 D5 走需要用户重新看过清单；崩溃之后什么都可能变了
+        Phase::Prepare
+        | Phase::BuildingDeliver
+        | Phase::DeliverBuilt
+        | Phase::CheckedOut
+        | Phase::SvnStaged => abandon_before_commit(repo, &cfg, j),
+        Phase::Committing => Err(commit_unknown(j, "（上一次在提交途中中断）")),
+        Phase::PostCommit => after_commit(repo, &cfg, j, &|_: Step, _: &str| {}),
+        Phase::PublishingBaseline => {
+            if j.new_baseline_oid.is_none() {
+                // 没有新 OID = commit 还没建：从 D7 重录（§7.6）
+                capture_delivered(repo, &cfg, j)?;
+            }
+            publish_delivered(repo, &cfg, j)?;
+            restore_branch(repo, &cfg, j)
+        }
+        Phase::RestoringBranch => continue_restoring(repo, &cfg, j),
+        _ => Err(wrong_flow()),
+    }
+}
+
+/// 放弃这次交付。
+pub fn abort_sync_out(repo: &str) -> Result<SyncOutOutcome> {
+    let (_lock, mut j) = take_over(repo)?;
+    let cfg = read_config(repo)?;
+    let j = &mut j;
+    match j.phase {
+        Phase::Prepare
+        | Phase::BuildingDeliver
+        | Phase::DeliverBuilt
+        | Phase::CheckedOut
+        | Phase::SvnStaged => abandon_before_commit(repo, &cfg, j),
+        Phase::Committing => Err(commit_unknown(j, "（上一次在提交途中中断）")),
+        Phase::PostCommit | Phase::PublishingBaseline | Phase::RestoringBranch => {
+            stop_after_commit(repo, &cfg, j)
+        }
+        _ => Err(wrong_flow()),
+    }
+}
+
+/// 拿锁并在锁内重读 journal（两次读之间可能被另一个进程推进过）。
+fn take_over(repo: &str) -> Result<(svn_lock::SyncLock, Journal)> {
+    let first = svn_journal::read(repo)?.ok_or_else(no_unfinished)?;
+    if first.flow != Flow::SyncOut {
+        return Err(wrong_flow());
+    }
+    let lock = svn_lock::acquire(repo, &first.opid)?;
+    let j = svn_journal::read(repo)?.ok_or_else(no_unfinished)?;
+    if j.opid != first.opid || j.flow != Flow::SyncOut {
+        return Err(state_changed("记录在拿锁的那一瞬间被换掉了"));
+    }
+    Ok((lock, j))
+}
+
+/// D5 之前的 phase：撤销登记（若有）并走 §8.2.4 收尾。
+fn abandon_before_commit(repo: &str, cfg: &SvnConfig, j: &Journal) -> Result<SyncOutOutcome> {
+    if j.phase == Phase::SvnStaged {
+        let targets = svn_targets(repo, &cfg.whitelist)?;
+        unstage(repo, &targets, &j.svn_status_before)?;
+    }
+    cleanup_before_svn(repo, cfg, j)?;
+    Ok(SyncOutOutcome::Abandoned { committed: false })
+}
+
+/// 计划 B7：提交已在服务器上，放弃 = 不再替用户做后面的事。
+fn stop_after_commit(repo: &str, cfg: &SvnConfig, j: &Journal) -> Result<SyncOutOutcome> {
+    let orig = need(&j.orig_branch, "origBranch")?;
+    if j.phase == Phase::PostCommit {
+        // 只提交、没更新的工作副本是 mixed-revision（实测 M2-E6），「更新」与「重建基线」都不接。
+        // 先把白名单拉齐，留下一个「整体前进」的状态，让「更新」能接管（2c 的 A16）
+        update_whitelist(repo, cfg, j)?;
+    }
+    if rebase_in_progress(repo)? {
+        // A14：冲突期间锁是放开的，不是我们发起的 rebase 不碰
+        require_our_rebase(repo, j)?;
+        run_git(repo, &["rebase", "--abort"])?;
+    }
+    if current_branch(repo)?.as_deref() != Some(orig.as_str()) {
+        // 能 -f 的前提：W-file 在 svn 看来全部干净 = 磁盘就是服务器内容，能取回（2c 的 A5）
+        let dirty = dirty_w_files(repo, cfg)?;
+        if !dirty.is_empty() {
+            return Err(GitError::new(
+                "sync_out_unsafe_to_return",
+                format!(
+                    "要回到分支 `{orig}` 就得覆盖工作区里的文件，而下面这些文件的内容既不是 git 写的、\
+                     也不是服务器上的，不知道是谁改的，不能覆盖：\n{}\n记录已保留。请先确认这些改动\
+                     （需要的话自己备份），再点「放弃」。",
+                    list_paths(&dirty)
+                ),
+            ));
+        }
+        checkout_verified(repo, cfg, &orig, true)?;
+    }
+    if let Some(r) = &j.deliver_ref {
+        unpin(repo, r)?;
+    }
+    svn_journal::remove(repo)?;
+    Ok(SyncOutOutcome::Abandoned { committed: true })
+}
+
+/// `restoring-branch` 的继续：按 HEAD、原分支 OID 与 git 的 rebase 状态续 D8d 或进 D10。
+/// 不回到 D6 / D8c——那会覆盖用户正在解决的冲突（§7.6）。
+fn continue_restoring(repo: &str, cfg: &SvnConfig, j: &mut Journal) -> Result<SyncOutOutcome> {
+    let orig = need(&j.orig_branch, "origBranch")?;
+    let orig_head = need(&j.orig_head, "origHead")?;
+    let new = published(repo, j)?;
+    let rev = delivered_rev(repo, j, &new)?;
+    if rebase_in_progress(repo)? {
+        require_our_rebase(repo, j)?;
+        let files = unmerged_paths(repo)?;
+        if !files.is_empty() {
+            return Err(unresolved(&files));
+        }
+        // GIT_EDITOR=true：非交互地接受 git 给的提交信息（2c 实测）
+        if let Err(e) = run_git_env(
+            repo,
+            &[
+                "-c",
+                "rebase.autoStash=false",
+                "-c",
+                "rebase.updateRefs=false",
+                "rebase",
+                "--continue",
+            ],
+            &[("GIT_EDITOR", "true")],
+        ) {
+            return rebase_conflict_or_error(repo, rev, e);
+        }
+        return finish(repo, j, rev);
+    }
+    let on_orig = current_branch(repo)?.as_deref() == Some(orig.as_str());
+    if on_orig && rev_parse(repo, "HEAD")? != orig_head {
+        // D8d 已经做完（快进或 rebase 走完了），只差 D10
+        if !is_ancestor(repo, &new, "HEAD")? {
+            return Err(state_changed(
+                "原分支还没有落到新基线上（rebase 可能在外面被中止了）；要停在这里，请点「放弃」",
+            ));
+        }
+        return finish(repo, j, rev);
+    }
+    restore_branch(repo, cfg, j)
+}
+
+fn wrong_flow() -> GitError {
+    GitError::new(
+        "sync_out_wrong_flow",
+        "这条记录是「更新」流程留下的，请用横幅上更新那一组按钮处理。",
+    )
 }

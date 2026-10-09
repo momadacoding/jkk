@@ -5,11 +5,12 @@ mod svn_fixtures;
 
 use app_lib::engine::git_cli::run_git;
 use app_lib::engine::svn_journal;
+use app_lib::engine::svn_journal::Phase;
 use app_lib::engine::svn_lock;
 use app_lib::engine::svn_sync::{check_sync, SyncVerdict};
 use app_lib::engine::svn_sync_out::{
-    classify_commit_failure, commit_targets, run_sync_out, run_sync_out_probed, CommitFailure,
-    Step, SyncOutExpect, SyncOutOutcome,
+    abort_sync_out, classify_commit_failure, commit_targets, continue_sync_out, run_sync_out,
+    run_sync_out_probed, CommitFailure, Step, SyncOutExpect, SyncOutOutcome,
 };
 use app_lib::engine::svn_sync_out_check::{preview_sync_out, DeliverChange, SyncOutPreview};
 use std::process::Command;
@@ -815,4 +816,356 @@ fn an_unknown_commit_result_leaves_everything_where_it_is() {
             || svn_status(&fx).contains("A       Code/Deep")
     );
     assert_eq!(server_head(&fx), "1");
+}
+
+// —— Task 8：继续 / 放弃 ——
+
+/// 在 `step` 处模拟崩溃：panic 展开时锁的 Drop 照常释放（等同于进程死后操作系统放锁），
+/// journal 停在那一步写下的 phase。
+fn crash_at(fx: &SvnFixture, step: Step) {
+    let p = preview_sync_out(&fx.wc_str()).unwrap();
+    let e = expect_from(&p, "crash");
+    let wc = fx.wc_str();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_sync_out_probed(&wc, &e, &move |s: Step, _: &str| {
+            if s == step {
+                panic!("模拟崩溃于 {s:?}");
+            }
+        })
+    }));
+    assert!(r.is_err(), "应在 {step:?} 崩溃");
+    assert!(!svn_lock::is_held(&fx.wc_str()));
+}
+
+fn phase(fx: &SvnFixture) -> Phase {
+    svn_journal::read(&fx.wc_str())
+        .unwrap()
+        .expect("journal 应保留")
+        .phase
+}
+
+#[test]
+fn every_crash_before_the_commit_is_cleaned_up_by_either_button() {
+    // 必测 #16 的 D5 之前部分 + 计划 B8：继续与放弃都走同一条清理路径
+    for (step, want, use_continue) in [
+        (Step::Built, Phase::DeliverBuilt, false),
+        (Step::CheckedOut, Phase::CheckedOut, true),
+        (Step::Staged, Phase::SvnStaged, false),
+        (Step::BeforeCommit, Phase::SvnStaged, true),
+    ] {
+        let fx = hybrid_with_colleague();
+        typical_work(&fx);
+        let (head, status, server) = (
+            git(&fx, &["rev-parse", "HEAD"]),
+            svn_status(&fx),
+            server_head(&fx),
+        );
+        crash_at(&fx, step);
+        assert_eq!(phase(&fx), want, "{step:?}");
+        let out = if use_continue {
+            continue_sync_out(&fx.wc_str())
+        } else {
+            abort_sync_out(&fx.wc_str())
+        }
+        .unwrap_or_else(|e| panic!("{step:?}：{}", e.message));
+        assert_eq!(
+            out,
+            SyncOutOutcome::Abandoned { committed: false },
+            "{step:?}"
+        );
+        assert_untouched(&fx, &head, &status, &server);
+    }
+}
+
+#[test]
+fn a_temp_worktree_named_in_a_foreign_journal_is_left_alone() {
+    // 里程碑 review 第 9 条的回归：本期从不写 tempWorktree；字段若出现（手改 / 外来的
+    // journal），收尾不得对那里 `worktree remove --force`——那会连未提交的改动一起删掉
+    let fx = hybrid_with_colleague();
+    typical_work(&fx);
+    crash_at(&fx, Step::Built);
+    let wt = fx.path().join("someone-elses-worktree");
+    let wt_str = wt.to_string_lossy().to_string();
+    git(&fx, &["worktree", "add", "-q", "-b", "elsewhere", &wt_str]);
+    std::fs::write(wt.join("unsaved.txt"), "work in progress\n").unwrap();
+    let mut j = svn_journal::read(&fx.wc_str()).unwrap().unwrap();
+    j.temp_worktree = Some(wt_str.clone());
+    svn_journal::write(&fx.wc_str(), &j).unwrap();
+
+    assert_eq!(
+        abort_sync_out(&fx.wc_str()).unwrap(),
+        SyncOutOutcome::Abandoned { committed: false }
+    );
+    assert!(
+        wt.join("unsaved.txt").exists(),
+        "别人的 worktree 连同未提交改动必须还在"
+    );
+    assert!(git(&fx, &["worktree", "list"]).contains("someone-elses-worktree"));
+}
+
+#[test]
+fn a_commit_in_an_unknown_state_cannot_be_continued_or_abandoned_yet() {
+    // 计划 B4：查证在 3b
+    let fx = hybrid_with_colleague();
+    typical_work(&fx);
+    let away = fx.path().join("repo-away");
+    let _ = deliver_probed(&fx, "mine", &|s, _| {
+        if s == Step::BeforeCommit {
+            std::fs::rename(fx.repo(), &away).unwrap();
+        }
+    });
+    std::fs::rename(&away, fx.repo()).unwrap();
+    let before = svn_journal::read(&fx.wc_str()).unwrap();
+    assert_eq!(
+        continue_sync_out(&fx.wc_str()).unwrap_err().code,
+        "sync_out_commit_unknown"
+    );
+    assert_eq!(
+        abort_sync_out(&fx.wc_str()).unwrap_err().code,
+        "sync_out_commit_unknown"
+    );
+    assert_eq!(
+        svn_journal::read(&fx.wc_str()).unwrap(),
+        before,
+        "journal 原样"
+    );
+}
+
+#[test]
+fn every_crash_after_the_commit_is_finished_by_continue_without_committing_again() {
+    // 必测 #16 的 D5 之后部分 + #73 的「只续对应阶段、不重做 SVN commit」
+    for (step, want) in [
+        (Step::Committed, Phase::PostCommit),
+        (Step::Updated, Phase::PostCommit),
+        (Step::Captured, Phase::PublishingBaseline),
+        (Step::Published, Phase::RestoringBranch),
+    ] {
+        let fx = hybrid_with_colleague();
+        typical_work(&fx);
+        crash_at(&fx, step);
+        assert_eq!(phase(&fx), want, "{step:?}");
+        let out =
+            continue_sync_out(&fx.wc_str()).unwrap_or_else(|e| panic!("{step:?}：{}", e.message));
+        assert_eq!(
+            out,
+            SyncOutOutcome::Delivered {
+                rev: 2,
+                branch: "work".into(),
+                local_only_left: 0
+            },
+            "{step:?}"
+        );
+        assert_eq!(server_head(&fx), "2", "{step:?}：服务器上只能有一次提交");
+        assert_settled(&fx);
+    }
+}
+
+#[test]
+fn abandoning_after_the_commit_leaves_a_state_that_update_takes_over() {
+    // 计划 B7：放弃 = 不再替用户做后面的事；先 D6 拉齐，避免留下 mixed-revision
+    let fx = hybrid_with_colleague();
+    typical_work(&fx);
+    let head = git(&fx, &["rev-parse", "HEAD"]);
+    let old_base = git(&fx, &["rev-parse", "svn/base"]);
+    crash_at(&fx, Step::Committed);
+    assert_eq!(
+        abort_sync_out(&fx.wc_str()).unwrap(),
+        SyncOutOutcome::Abandoned { committed: true }
+    );
+    assert_eq!(git(&fx, &["rev-parse", "HEAD"]), head);
+    assert_eq!(git(&fx, &["symbolic-ref", "--short", "HEAD"]), "work");
+    assert_eq!(
+        git(&fx, &["rev-parse", "svn/base"]),
+        old_base,
+        "基线没发布就不发布"
+    );
+    assert!(svn_journal::read(&fx.wc_str()).unwrap().is_none());
+    assert_eq!(git(&fx, &["for-each-ref", "refs/mygitclient/deliver/"]), "");
+    match check_sync(&fx.wc_str()).unwrap().verdict {
+        SyncVerdict::Diverged {
+            node_rev,
+            baseline_rev,
+        } => assert_eq!((node_rev, baseline_rev), (2, 1)),
+        v => panic!("应是整体前进，实际 {v:?}"),
+    }
+    // 「更新」接管（2c 的 A16）：已交付的 commit 在 rebase 时变空、被丢掉
+    let p = app_lib::engine::svn_sync_check::preview_sync_in(&fx.wc_str()).unwrap();
+    assert_eq!(p.catch_up_rev, Some(2));
+    app_lib::engine::svn_sync_in::run_sync_in(
+        &fx.wc_str(),
+        &app_lib::engine::svn_sync_in::SyncInExpect {
+            orig_branch: p.orig_branch,
+            orig_head: p.orig_head,
+            baseline_oid: p.baseline_oid,
+            confirmed_outside: p.outside_changes,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        git(&fx, &["rev-parse", "work"]),
+        git(&fx, &["rev-parse", "svn/base"])
+    );
+}
+
+#[test]
+fn a_baseline_moved_by_someone_else_is_not_overwritten_on_continue() {
+    // 必测 #73：注入旧基线 OID 改变，CAS 拒绝覆盖
+    let fx = hybrid_with_colleague();
+    typical_work(&fx);
+    crash_at(&fx, Step::Captured);
+    git(&fx, &["update-ref", "refs/heads/svn/base", "work"]); // 外部工具挪了基线
+    let err = continue_sync_out(&fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "svn_baseline_moved", "{}", err.message);
+    assert_eq!(phase(&fx), Phase::PublishingBaseline);
+    assert_eq!(server_head(&fx), "2");
+}
+
+#[test]
+fn a_d8d_conflict_is_continued_after_the_user_resolves_it() {
+    // 必测 #69 的继续一半
+    let fx = hybrid_with_colleague();
+    make_d8d_clash(&fx);
+    assert_eq!(
+        continue_sync_out(&fx.wc_str()).unwrap_err().code,
+        "sync_in_unresolved",
+        "没解决不能继续"
+    );
+    let resolved: String = (1..=30)
+        .map(|n| match n {
+            1 => "one\n".to_string(),
+            10 => "ten-LOCAL\n".to_string(),
+            _ => format!("{n}\n"),
+        })
+        .collect();
+    std::fs::write(fx.wc().join("Code/A.cs"), resolved).unwrap();
+    git(&fx, &["add", "Code/A.cs"]);
+    let out = continue_sync_out(&fx.wc_str()).unwrap();
+    assert_eq!(
+        out,
+        // 我的提交是 r2，同事的是 r3（里程碑 review 第 5 条：报自己的 revision）
+        SyncOutOutcome::Delivered {
+            rev: 2,
+            branch: "work".into(),
+            local_only_left: 1
+        }
+    );
+    assert_settled(&fx);
+}
+
+#[test]
+fn a_d8d_conflict_can_be_abandoned() {
+    let fx = hybrid_with_colleague();
+    let head = make_d8d_clash(&fx);
+    assert_eq!(
+        abort_sync_out(&fx.wc_str()).unwrap(),
+        SyncOutOutcome::Abandoned { committed: true }
+    );
+    assert_eq!(
+        git(&fx, &["rev-parse", "HEAD"]),
+        head,
+        "rebase 已中止，分支回到交付前的位置"
+    );
+    assert_eq!(git(&fx, &["symbolic-ref", "--short", "HEAD"]), "work");
+    assert!(
+        git(&fx, &["log", "-1", "--format=%B", "svn/base"]).contains("@3 "),
+        "基线留在新位置"
+    );
+    assert!(svn_journal::read(&fx.wc_str()).unwrap().is_none());
+}
+
+/// 造出 D8d 的 rebase 冲突（与 Task 6 的同一场景），返回交付前的 HEAD。
+fn make_d8d_clash(fx: &SvnFixture) -> String {
+    thirty_lines(fx);
+    edit_line(fx, 1, "one", "C1");
+    edit_line(fx, 10, "ten-LOCAL", "mute log\n\nLocal-Only: true");
+    let head = git(fx, &["rev-parse", "HEAD"]);
+    let out = deliver_probed(fx, "c1", &|s, _| {
+        if s == Step::Committed {
+            let theirs: String = (1..=30)
+                .map(|n| match n {
+                    1 => "one\n".to_string(),
+                    10 => "ten-colleague\n".to_string(),
+                    _ => format!("{n}\n"),
+                })
+                .collect();
+            fx.colleague_commits("Code/A.cs", &theirs);
+        }
+    })
+    .unwrap();
+    assert!(
+        matches!(out, SyncOutOutcome::RebaseConflict { .. }),
+        "{out:?}"
+    );
+    head
+}
+
+#[test]
+fn the_delivery_buttons_do_not_touch_an_update_journal_and_vice_versa() {
+    let fx = hybrid_with_colleague();
+    svn_journal::write(
+        &fx.wc_str(),
+        &app_lib::engine::svn_journal::Journal {
+            opid: "in".into(),
+            flow: app_lib::engine::svn_journal::Flow::SyncIn,
+            phase: Phase::Rebase,
+            started_at: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        continue_sync_out(&fx.wc_str()).unwrap_err().code,
+        "sync_out_wrong_flow"
+    );
+    assert_eq!(
+        abort_sync_out(&fx.wc_str()).unwrap_err().code,
+        "sync_out_wrong_flow"
+    );
+
+    let fx2 = hybrid_with_colleague();
+    typical_work(&fx2);
+    crash_at(&fx2, Step::Built);
+    let err = app_lib::engine::svn_sync_in::continue_sync(&fx2.wc_str()).unwrap_err();
+    assert_eq!(err.code, "sync_out_not_supported", "{}", err.message);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_file_held_open_at_checkout_is_named_and_nothing_is_committed() {
+    // Review Focus 3：Unity 以 share=Read 打开文件时，D3.8 的 checkout 退出 0 却没写进去（2c 的 A15）
+    use std::os::windows::fs::OpenOptionsExt;
+    let fx = hybrid_with_colleague();
+    write(&fx, "Code/A.cs", "a2\n");
+    git(&fx, &["commit", "-qam", "deliverable"]);
+    write(&fx, "Code/A.cs", "a2 LOCAL\n");
+    git(&fx, &["commit", "-qam", "patch\n\nLocal-Only: true"]); // 交付树里的 A.cs 与磁盘不同
+    let (head, status, server) = (
+        git(&fx, &["rev-parse", "HEAD"]),
+        svn_status(&fx),
+        server_head(&fx),
+    );
+
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x1) // FILE_SHARE_READ
+        .open(fx.wc().join("Code/A.cs"))
+        .unwrap();
+    let err = deliver(&fx, "x").unwrap_err();
+    assert_eq!(err.code, "sync_in_checkout_failed", "{}", err.message);
+    assert!(
+        err.message.contains("Code/A.cs"),
+        "要指名被占用的文件：{}",
+        err.message
+    );
+    drop(held);
+
+    // 收尾在占用期间若没走完，journal 会保留；放开文件之后点「放弃」必须能收干净
+    if svn_journal::read(&fx.wc_str()).unwrap().is_some() {
+        abort_sync_out(&fx.wc_str()).unwrap();
+    }
+    assert_untouched(&fx, &head, &status, &server);
+    assert_eq!(
+        std::fs::read_to_string(fx.wc().join("Code/A.cs")).unwrap(),
+        "a2 LOCAL\n"
+    );
 }
