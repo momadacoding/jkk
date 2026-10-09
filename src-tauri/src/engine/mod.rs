@@ -35,6 +35,7 @@ pub mod svn_stage;
 pub mod svn_sync;
 pub mod svn_sync_check;
 pub mod svn_sync_in;
+pub mod svn_sync_out;
 pub mod svn_sync_out_check;
 pub mod svn_sync_stash;
 pub mod svn_wc;

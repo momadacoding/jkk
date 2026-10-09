@@ -11,7 +11,7 @@
 | 2 交付树 D0.5 | ✅ | `svn_deliver.rs`、`tests/svn_deliver.rs` | `cargo test --test svn_deliver` 10/10；fmt / clippy / 全量 cargo test 绿 |
 | 3 前置检查与清单 | ✅ | `svn_sync_out_check.rs`、`svn_sync_check.rs`、`svn_preflight.rs`、`tests/svn_sync_out_check.rs` | `cargo test --test svn_sync_out_check` 11/11；`svn_sync_check` 20/20、`svn_sync_in` 73/73（重构后）；全量绿 |
 | 4 D4 登记与撤销 | ✅ | `svn_stage.rs`、`tests/svn_stage.rs` | `cargo test --test svn_stage` 7/7；全量绿 |
-| 5 编排主路径（无 Local-Only） | ⏳ | | |
+| 5 编排主路径（无 Local-Only） | ✅ | `svn_sync_out.rs`、`svn_sync_in.rs`（`checkout_failed` 抽取）、`svn_sync_out_check.rs`、`tests/svn_sync_out.rs` | `cargo test --test svn_sync_out` 14/14；`svn_sync_in` 73/73；全量绿 |
 | 6 Local-Only 全流程 | ⏳ | | |
 | 7 早退与 D5 失败 | ⏳ | | |
 | 8 继续 / 放弃 | ⏳ | | |
@@ -77,6 +77,16 @@
 ### Task 5
 
 - **偏离计划（抄自计划）**：B1 / B13（执行时锁内复核）；B3（D5 失败只在全部错误码属「服务器确定没变」集合时回滚）；B4（`committing` 阶段继续 / 放弃都拒绝）；B10（D8d 无 Local-Only 时 `update-ref` CAS + 一次切分支）；B11（rebase 前的 merge 门槛对 `merge-base(NEWBASE, origHead)..origHead` 做）；B14（`svn commit --force-log`）。
+
+- **偏离计划（本 Task 新增）——D5 的提交信息改走 `-F` 文件**：计划 B14 用 `-m <message> --force-log`。实测（本机 ACP 1252 / OEMCP 437，SlikSvn 1.14.2）svn.exe 的 C 运行库按系统 ANSI 代码页解码命令行：`-m 修复跳跃` 在服务器上**存成了 `Art`**（参数整体错位），`-m "-m 第一行\n第二行"` 存成 `-m ???\n???`。改为把 message 写进 `.git/mygitclient-commit-msg.txt`（相对仓库根，UTF-8），`svn commit -F .git/mygitclient-commit-msg.txt --encoding UTF-8`，提交后删文件；`--force-log` 保留（用户 `svn add --force .` 会把 `.git` 登记成受控，那时 svn 拒绝受控文件当 `-F`，实测 `add --force .` 确实会 `Adding .git`）。ACP 936 的中文系统上 `-m` 本可工作，但 `-F` 与代码页无关。
+  - Ruling：`-F` + `--encoding UTF-8` 替代 `-m` —— 提交信息必须原样（Review Focus 1），而 `-m` 在非中文代码页的机器上会静默存错 —— 代价：多一次文件写 / 删；写失败走 `rollback_exit`（D5 之前，服务器未动）。
+  - 测试改动：`a_plain_delivery…` 与 `a_message_that_looks_like…` 原用文本 `svn log` + `contains` 断言，文本输出同样按代码页转码（中文变 `?`、日期 `(??, 10 ?? 2026)`），区分不了「存坏了」与「显示坏了」。新增 `server_msg()` 读 `svn log --xml`（恒 UTF-8）并逐字 `assert_eq!`。改测试后先看到 RED（`left: "Art"` / `left: "-m ???\n???"`），再改实现转 GREEN。`assert_settled` 加一条「提交信息文件已删」。
+- **计划的错误**：B14 的 `-m` 方案在 ACP ≠ 936 的 Windows 上会存错提交信息（见上）。
+- **计划没写的坑**：
+  - 「要留意」三处：① `svn log -v` 文本日期乱码确认存在（不断言日期，且 message 改走 XML）；② `art_outside_the_whitelist…` 通过，`record_server_tree_into` 对白名单外的 `Art/x.psd` 本地修改不报错；③ `delivery_works_when_the_whitelist_is_an_external` 通过，D6 把 external 拉齐。
+  - **中文文件名在 ACP 1252 机器上不能交付**（同一个命令行转码问题，作用在 svn 的 path 参数上）。实测：`svn add -- 中文.cs@` 退出 1（`W155010 '…\??.cs' not found`）→ D4 `sync_out_stage_failed` → 撤销登记、收尾；已受控的中文文件被修改时 `svn commit -- 中文.cs@` 报 `E200009` → 在 B3 的「确定没变」集合里 → 撤销、收尾。**失败安全、无数据丢失**，但这类机器上带中文文件名的改动交付不了。`--targets FILE` 同样按本地代码页解码，不是解法。本期不处理，记为遗留风险（ACP 936 的中文系统不受影响）。
+- **实施结果**：其余照计划代码落地。`checkout_failed` 抽取后 `sync_in` 文案「切到分支 `x`」变为「切到 `x`」，没有测试断言旧文案，`svn_sync_in` 73/73 照旧通过。B1 / B13：`run_sync_out_probed` 在锁内重跑 `check_sync_out`（含 `remote_head_rev`，即 D3.5）并 `verify_expect`，`expected_start_rev` 取锁内查询值。B3：`commit_failures_are_rolled_back_only_when_the_server_surely_did_nothing` 以 M2 原文钉住。B10：无 Local-Only 时 `update-ref` CAS + 从基线切回（`a_plain_delivery…` 断言 `work == svn/base`）。
+- **为什么这么改是安全的**：D5 target 经 `commit_targets` 断言非空、且至少有一个文件（必测第 1 条）；`--depth=empty` 只提交 target 自身（`a_stray_add…` 钉住）；D5 状态未知时不回滚不推进；`-F` 的文件在 `.git/` 下，不会进白名单 target。
 
 ### Task 6
 

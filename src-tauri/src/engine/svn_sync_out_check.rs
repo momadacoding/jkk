@@ -188,7 +188,7 @@ fn require_on_latest_baseline(repo: &str, base: &str, head: &str, branch: &str) 
 }
 
 /// 白名单内 git 的未提交改动，含未跟踪文件。
-fn git_dirty(repo: &str, cfg: &SvnConfig) -> Result<Vec<String>> {
+pub(crate) fn git_dirty(repo: &str, cfg: &SvnConfig) -> Result<Vec<String>> {
     let roots = normalize_roots(&cfg.whitelist);
     if roots.is_empty() {
         return Err(GitError::new("svn_empty_whitelist", "白名单是空的。")); // §12.2

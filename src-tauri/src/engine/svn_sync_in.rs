@@ -618,27 +618,37 @@ pub(crate) fn checkout_verified(
     if on_target && stale.is_empty() {
         return Ok(());
     }
+    Err(checkout_failed(repo, branch, &stale, ran))
+}
+
+/// checkout 没切干净时的报错（计划 A15）。`sync_out` 的 detached checkout 也用它。
+pub(crate) fn checkout_failed(
+    repo: &str,
+    target: &str,
+    stale: &[String],
+    ran: Result<String>,
+) -> GitError {
     let files = if stale.is_empty() {
         String::new()
     } else {
-        format!("\n下面这些文件没能写进去或删掉：\n{}", list_paths(&stale))
+        format!("\n下面这些文件没能写进去或删掉：\n{}", list_paths(stale))
     };
     let git_said = match ran {
         Err(e) => format!("\ngit 原话：{}", e.message.trim()),
         Ok(_) => String::new(),
     };
     let root = Path::new(repo);
-    Err(GitError::new(
+    GitError::new(
         "sync_in_checkout_failed",
         format!(
-            "切到分支 `{branch}` 没有成功，多半是有程序占着文件（Unity / IDE）。{files}\n{}{git_said}",
+            "切到 `{target}` 没有成功，多半是有程序占着文件（Unity / IDE）。{files}\n{}{git_said}",
             describe(root, &find_blockers(root, 5))
         ),
-    ))
+    )
 }
 
 /// 白名单内被跟踪文件相对 HEAD 的改动（不含未跟踪）。
-fn tracked_changes(repo: &str, cfg: &SvnConfig) -> Result<Vec<String>> {
+pub(crate) fn tracked_changes(repo: &str, cfg: &SvnConfig) -> Result<Vec<String>> {
     let roots = normalize_roots(&cfg.whitelist);
     if roots.is_empty() {
         return Ok(Vec::new()); // 空 pathspec 会变成「全部」（§12.2）
@@ -659,7 +669,11 @@ fn tracked_changes(repo: &str, cfg: &SvnConfig) -> Result<Vec<String>> {
 /// 而同名未跟踪文件**即使内容相同**也会挡住之后的 checkout / rebase（2026-09-26 实测）。
 ///
 /// 已进索引的不算：那是被跟踪的改动，归 [`tracked_changes`] 管。
-fn untracked_leftovers(repo: &str, cfg: &SvnConfig, from: &[String]) -> Result<Vec<String>> {
+pub(crate) fn untracked_leftovers(
+    repo: &str,
+    cfg: &SvnConfig,
+    from: &[String],
+) -> Result<Vec<String>> {
     let roots = normalize_roots(&cfg.whitelist);
     if roots.is_empty() {
         return Ok(Vec::new()); // 空 pathspec 会变成「全部」（§12.2）
