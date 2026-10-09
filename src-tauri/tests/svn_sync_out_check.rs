@@ -239,3 +239,19 @@ fn an_unfinished_sync_or_a_held_lock_blocks_the_preview() {
         "sync_in_unfinished"
     );
 }
+
+#[test]
+fn a_rename_that_only_changes_case_is_refused() {
+    // 里程碑 review：Windows 大小写不敏感，`D Code/B.cs` + `A Code/b.cs` 在磁盘上是同一个文件。
+    // D4 先 add 新名、再 delete 旧名，删掉的就是要交付的那个文件
+    let fx = hybrid_with_colleague();
+    git(&fx, &["mv", "Code/B.cs", "Code/b.cs"]);
+    git(&fx, &["commit", "-qm", "case rename"]);
+    let err = preview_sync_out(&fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "sync_out_unsupported_change", "{}", err.message);
+    assert!(
+        err.message.contains("Code/B.cs") && err.message.contains("Code/b.cs"),
+        "{}",
+        err.message
+    );
+}

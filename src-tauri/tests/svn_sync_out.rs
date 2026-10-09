@@ -235,9 +235,15 @@ fn a_colleague_commit_between_d5_and_d6_ends_up_in_the_new_baseline() {
         }
     })
     .unwrap();
+    // rev 是**我的**提交（r2），不是 D6 更新到的 r3——用户拿它去服务器 log 里找自己的提交
+    // （里程碑 review）。新基线照样是 r3，下面那几行断言它
     assert!(
-        matches!(out, SyncOutOutcome::Delivered { rev: 3, .. }),
+        matches!(out, SyncOutOutcome::Delivered { rev: 2, .. }),
         "{out:?}"
+    );
+    assert!(
+        git(&fx, &["log", "-1", "--format=%B", "svn/base"]).contains("@3 "),
+        "新基线记的是 D6 之后的 r3"
     );
     assert_eq!(git(&fx, &["show", "svn/base:Code/C.cs"]), "c");
     assert_eq!(
@@ -590,7 +596,8 @@ fn a_local_patch_that_clashes_with_a_colleague_stops_in_a_resolvable_rebase() {
     assert_eq!(
         out,
         SyncOutOutcome::RebaseConflict {
-            rev: 3,
+            rev: 2, // 我的提交；同事的是 r3
+
             files: vec!["Code/A.cs".into()]
         }
     );

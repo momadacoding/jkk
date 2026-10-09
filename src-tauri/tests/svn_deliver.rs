@@ -281,3 +281,27 @@ fn pin_refuses_to_overwrite_and_unpin_is_idempotent_and_fenced() {
         "别的 ref 一律不碰"
     );
 }
+
+#[test]
+fn a_conflict_on_a_chinese_file_name_still_names_the_patch_and_the_file() {
+    // 里程碑 review：merge-tree 默认按 core.quotePath 把非 ASCII 路径转义成八进制，
+    // 与 diff-tree -z 的原样路径对不上——点不出是哪个补丁，文件名也成了乱码
+    let fx = hybrid_with_colleague();
+    // 钉成 git 的默认值：开发机的全局配置常把它关掉，会把这个缺陷藏起来
+    git(&fx, &["config", "core.quotePath", "true"]);
+    let p = fx.wc().join("Code/角色.cs");
+    let body: String = (1..=30).map(|n| format!("{n}\n")).collect();
+    std::fs::write(&p, &body).unwrap();
+    git(&fx, &["add", "Code/角色.cs"]);
+    git(&fx, &["commit", "-qm", "add"]);
+    let local = body.replace("10\n", "ten-LOCAL\n");
+    std::fs::write(&p, &local).unwrap();
+    git(&fx, &["commit", "-qam", "mute log\n\nLocal-Only: true"]);
+    std::fs::write(&p, local.replace("11\n", "eleven\n")).unwrap();
+    git(&fx, &["commit", "-qam", "fix jump"]);
+
+    let err = plan_deliver(&fx.wc_str(), &base(&fx), &head(&fx)).unwrap_err();
+    assert_eq!(err.code, "sync_out_local_only_conflict", "{}", err.message);
+    assert!(err.message.contains("Code/角色.cs"), "{}", err.message);
+    assert!(err.message.contains("mute log"), "{}", err.message);
+}

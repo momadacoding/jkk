@@ -589,7 +589,13 @@ pub(crate) fn restore_branch(
     let orig = need(&j.orig_branch, "origBranch")?;
     let orig_head = need(&j.orig_head, "origHead")?;
     let new = published(repo, j)?;
-    let rev = trailer_rev(repo, &new)?;
+    // 报给用户的是**他自己的**提交（D5 的 `Committed revision`），不是 D6 更新到的
+    // revision——两者之间同事可能又提交过，拿后者去服务器 log 里找会找到别人的提交。
+    // D5 的输出没读出来（极少）时退回新基线的 revision
+    let rev = match j.committed_rev {
+        Some(r) => r,
+        None => trailer_rev(repo, &new)?,
+    };
     let orig_ref = format!("refs/heads/{orig}");
 
     if j.local_only_commits.is_empty() {
@@ -726,12 +732,10 @@ pub(crate) fn finish(repo: &str, j: &Journal, rev: u64) -> Result<SyncOutOutcome
 pub(crate) fn cleanup_before_svn(repo: &str, cfg: &SvnConfig, j: &Journal) -> Result<()> {
     let orig = need(&j.orig_branch, "origBranch")?;
     let orig_head = need(&j.orig_head, "origHead")?;
-    // ①：本期不建临时 worktree（计划 B2）；字段在就只清它记着的这一个路径
-    if let Some(t) = &j.temp_worktree {
-        if std::path::Path::new(t).exists() {
-            run_git(repo, &["worktree", "remove", "--force", t])?;
-        }
-    }
+    // ①：本期不建临时 worktree（计划 B2），所以这一步什么都不做。`tempWorktree` 字段
+    // 若出现，只可能来自手改或别的版本写的 journal——对着那里的路径
+    // `worktree remove --force` 会连同未提交的改动一起删掉别人的 worktree（里程碑 review），
+    // 不替用户做这件事
     // ②：只有 D3.8 之后才会真的切
     match current_branch(repo)? {
         Some(b) if b == orig => {}

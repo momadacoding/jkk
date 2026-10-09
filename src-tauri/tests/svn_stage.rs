@@ -191,3 +191,35 @@ fn a_path_with_an_at_sign_is_staged_and_unstaged() {
     unstage(&fx.wc_str(), &targets(), &before).unwrap();
     assert_eq!(snapshot(&fx.wc_str(), &targets()).unwrap(), before);
 }
+
+#[test]
+fn a_file_the_user_already_added_in_tortoise_is_not_added_twice() {
+    // 里程碑 review：用户先在 TortoiseSVN 里 add 了 New.cs，再在 git 里提交它。
+    // 再 `svn add` 一次 svn 退出 1（W150002 + E200009），每次交付都会被挡
+    let fx = hybrid_with_colleague();
+    std::fs::create_dir_all(fx.wc().join("Code/Fresh")).unwrap();
+    std::fs::write(fx.wc().join("Code/Fresh/New.cs"), "new\n").unwrap();
+    svn(&fx, &["add", "--parents", "Code/Fresh/New.cs"]);
+    let before = snapshot(&fx.wc_str(), &targets()).unwrap();
+
+    let rec = stage(
+        &fx.wc_str(),
+        &targets(),
+        &[change("A", "Code/Fresh/New.cs")],
+        &before,
+    )
+    .unwrap();
+    assert_eq!(
+        rec.new_parent_dirs,
+        vec!["Code/Fresh".to_string()],
+        "父目录照样进 D5"
+    );
+    assert!(rec.delta.is_empty(), "没有新增任何登记：{:?}", rec.delta);
+
+    unstage(&fx.wc_str(), &targets(), &before).unwrap();
+    assert_eq!(
+        snapshot(&fx.wc_str(), &targets()).unwrap(),
+        before,
+        "用户自己的登记不碰"
+    );
+}

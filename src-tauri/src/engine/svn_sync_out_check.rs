@@ -244,6 +244,30 @@ pub(crate) fn changed_files(
             ),
         ));
     }
+    // 只改大小写的改名在 D1 里是一对 D + A，而在 Windows（大小写不敏感）的磁盘上是
+    // 同一个文件：D4 先 add 新名、再 `svn delete` 旧名，删掉的正是要交付的那个文件
+    let case_renames: Vec<String> = changes
+        .iter()
+        .filter(|d| d.status == "D")
+        .filter_map(|d| {
+            let lower = d.path.to_lowercase();
+            changes
+                .iter()
+                .find(|a| a.status == "A" && a.path != d.path && a.path.to_lowercase() == lower)
+                .map(|a| format!("{} → {}", d.path, a.path))
+        })
+        .collect();
+    if !case_renames.is_empty() {
+        return Err(GitError::new(
+            "sync_out_unsupported_change",
+            format!(
+                "下面这些改名只改了大小写：\n{}\nWindows 上新旧两个名字是同一个文件，本应用没法安全地\
+                 把它登记成「删旧加新」。请用 TortoiseSVN 的 Rename 单独提交这次改名（先把 git 里的\
+                 这次改名撤掉），再交付其余改动。什么都没有改动。",
+                list_paths(&case_renames)
+            ),
+        ));
+    }
     let roots = normalize_roots(&cfg.whitelist);
     let outside: Vec<String> = changes
         .iter()

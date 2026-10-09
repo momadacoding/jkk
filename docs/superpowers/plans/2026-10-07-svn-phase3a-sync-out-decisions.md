@@ -104,6 +104,25 @@
 - **计划的错误**：Review Focus 第 3 条的用例位置写成 Task 7，实际在 Task 8。
 - **为什么这么改是安全的（`-f` 退路）**：只有普通 checkout 失败后才考虑 `-f`；`-f` 之前逐个核对「白名单内被跟踪的改动 ∪ 交付树与原分支之间有差异的路径」，每个文件的磁盘字节都必须是交付树或原分支里原样存着的（或已不在），有一个不是就原样返回第一次的错误、不覆盖。`changed_between` 空白名单直接返回空，不发空 pathspec。
 
+### 里程碑 review（Task 1–7，`/code-review high`）
+
+10 条发现，按「用户实际会遇到什么」重新定级：
+
+| # | 发现 | 定级 | 处理 |
+|---|---|---|---|
+| 1 | A 文件用户事先在 TortoiseSVN 里 `svn add` 过 → D4 再 add 退出 1（W150002 + E200009），交付永远过不去 | 重要 | **已修**：`stage` 跳过快照里已是 `added` 的 A 文件（仍进 D5 target、仍参与父目录计算）。`a_file_the_user_already_added_in_tortoise_is_not_added_twice` RED（实测 W150002 原文）→ GREEN |
+| 3 | Windows 上只改大小写的改名 = D 旧 + A 新同一物理文件，D4 的 `svn delete` 会删掉要交付的文件 | 重要 | **已修**：`changed_files` 发现大小写不同的 D/A 对时拒绝（`sync_out_unsupported_change`，指引用 TortoiseSVN Rename）。`a_rename_that_only_changes_case_is_refused` RED → GREEN。Ruling：所有平台都拒（Linux 上本可工作）——服务器仓库也要被 Windows 同事检出，代价是 Linux 用户改大小写也得走 TortoiseSVN |
+| 4 | `merge-tree` 不带 `-z` 时按 `core.quotePath` 转义非 ASCII 路径，冲突信息认不出本地补丁、文件名成乱码 | 重要（中文团队常态） | **已修**：`merge-tree --write-tree -z`，按 NUL 解析。**计划没写的坑**：开发机全局 `core.quotepath=false` 会把缺陷藏起来——测试第一次跑竟然通过；测试里显式 `git config core.quotePath true` 后才 RED → GREEN |
+| 5 | `Delivered.rev` / `RebaseConflict.rev` 报的是新基线（D6 后）的 revision，同事在 D5–D6 间提交时会指向别人的提交 | 重要 | **已修**：优先用 `j.committed_rev`，读不出时退回 trailer。两条原断言 `rev: 3` 的用例改为 `rev: 2`（并补断言新基线仍是 `@3`），RED → GREEN |
+| 9 | `cleanup_before_svn` ① 对 journal 里的 `tempWorktree` 路径 `worktree remove --force`，而本期从不写该字段 | 重要（危险死代码） | **已修**：删掉这一步，字段出现也不碰（只可能来自手改 / 外来 journal）。偏离计划 B2「收尾仍兼容处理」。回归测试放 Task 8（`abort_sync_out` 是第一个能从 journal 走到这里的公开入口） |
+| 2 | 本地化的 svn 输出没有英文 `Committed revision`，若「提交落地但退出非零且只有拒绝类错误码」会被误判 Rejected | 次要，推迟 | Ruling：svn 1.14 的 post-commit 钩子失败仍退出 0；退出非零且只带 E165001 的只有 start-commit / pre-commit（提交之前）。场景只在理论上成立；3b 的 opid revprop 查证是正解。代价：若真发生，journal 会停在 `svn-staged` 且撤销报 `sync_out_rollback_incomplete`，不会静默推进 |
+| 6 | D6 多个 target 各自解析 HEAD，更新途中有人提交会得到 mixed revision，D7 停下 | 次要，推迟 | 停在 `post-commit`，「继续」重跑 D6 即自愈 |
+| 7 | `capture_delivered` / `publish_delivered` 与 `sync_in` 的录制 / 发布近乎逐行重复 | 次要，推迟 | 重构，后续统一 |
+| 8 | `checkout_detached` 与 `checkout_verified` 重复；`finish` 与 `commits_between` 各解析一遍 log；`short()` 未复用 | 次要，推迟 | 同上 |
+| 10 | `unstage` 每个节点起一个 svn 进程；慢路径预览每次都写松散对象 | 次要，推迟 | 性能 / 垃圾对象，gc 会清 |
+
+验证：`rust-suite.sh` → fmt ok、clippy clean、cargo test 822 passed / 0 failed。
+
 ### Task 8
 
 - **偏离计划（抄自计划）**：

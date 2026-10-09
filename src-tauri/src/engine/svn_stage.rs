@@ -82,11 +82,19 @@ pub fn stage(
         .filter(|c| c.status == "D")
         .map(|c| c.path.as_str())
         .collect();
-    if !adds.is_empty() {
+    // 用户事先在 TortoiseSVN 里 add 过的文件已是 added：再 add 一次 svn 退出 1
+    // （W150002 + E200009），整次交付被挡。跳过它们——它们照样进 D5 的 target，
+    // 下面的父目录也照样按全部 A 文件算
+    let to_add: Vec<&str> = adds
+        .iter()
+        .copied()
+        .filter(|a| !before.iter().any(|n| n.path == *a && n.status == "added"))
+        .collect();
+    if !to_add.is_empty() {
         svn_batch(
             repo,
             &["add", "--parents", "--non-interactive", "--"],
-            &adds,
+            &to_add,
         )?;
     }
     if !dels.is_empty() {

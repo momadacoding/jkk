@@ -159,7 +159,12 @@ fn replay(repo: &str, onto: &str, picks: &[&Commit], locals: &[&Commit]) -> Resu
             GitError::new("sync_out_replay_failed", format!("{} 没有父提交", c.oid))
         })?;
         let mb = format!("--merge-base={parent}");
-        let (code, out) = run_git_code(repo, &["merge-tree", "--write-tree", &mb, &cur, &c.oid])?;
+        // `-z`：不带它 git 按 core.quotePath（默认 true）把非 ASCII 路径转义成八进制，
+        // 冲突文件名就对不上 diff-tree -z 的原样路径（里程碑 review）
+        let (code, out) = run_git_code(
+            repo,
+            &["merge-tree", "--write-tree", "-z", &mb, &cur, &c.oid],
+        )?;
         match code {
             0 => {}
             1 => return Err(replay_conflict(repo, c, locals, &out)?),
@@ -183,7 +188,7 @@ fn replay(repo: &str, onto: &str, picks: &[&Commit], locals: &[&Commit]) -> Resu
                 ))
             }
         }
-        let tree = out.lines().next().unwrap_or("").trim().to_string();
+        let tree = out.split('\0').next().unwrap_or("").trim().to_string();
         cur = commit_like(repo, &tree, &cur, &c.oid)?;
     }
     Ok(cur)
@@ -191,11 +196,11 @@ fn replay(repo: &str, onto: &str, picks: &[&Commit], locals: &[&Commit]) -> Resu
 
 /// 冲突：指出是哪个待交付 commit、哪些文件、可能是哪几个本地补丁（spec §13「D0.5 cherry-pick 冲突」）。
 fn replay_conflict(repo: &str, c: &Commit, locals: &[&Commit], out: &str) -> Result<GitError> {
-    // 实测 M1：首行是 tree，随后每行 `<mode> <oid> <stage>\t<path>`，空行之后是说明文字
+    // `-z` 形态：`<tree>\0`，随后每条 `<mode> <oid> <stage>\t<path>\0`，一个空字段之后是说明文字
     let mut files: Vec<String> = out
-        .lines()
+        .split('\0')
         .skip(1)
-        .take_while(|l| !l.trim().is_empty())
+        .take_while(|l| !l.is_empty())
         .filter_map(|l| l.split_once('\t').map(|(_, p)| p.to_string()))
         .collect();
     files.sort();
