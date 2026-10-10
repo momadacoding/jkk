@@ -1169,3 +1169,135 @@ fn a_file_held_open_at_checkout_is_named_and_nothing_is_committed() {
         "a2 LOCAL\n"
     );
 }
+
+// —— Task 9：D6 / D7a 失败（提交已在服务器上）——
+
+/// 用「更新」把同事提交的文件拉到 wc1（基线随之推进）。
+fn update_from_server(fx: &SvnFixture) {
+    let p = app_lib::engine::svn_sync_check::preview_sync_in(&fx.wc_str()).unwrap();
+    app_lib::engine::svn_sync_in::run_sync_in(
+        &fx.wc_str(),
+        &app_lib::engine::svn_sync_in::SyncInExpect {
+            orig_branch: p.orig_branch,
+            orig_head: p.orig_head,
+            baseline_oid: p.baseline_oid,
+            confirmed_outside: p.outside_changes,
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_failed_d6_is_retried_without_committing_again() {
+    let fx = hybrid_with_colleague();
+    typical_work(&fx);
+    let away = fx.path().join("repo-away");
+    let err = deliver_probed(&fx, "mine", &|s, _| {
+        if s == Step::Committed {
+            std::fs::rename(fx.repo(), &away).unwrap();
+        }
+    })
+    .unwrap_err();
+    std::fs::rename(&away, fx.repo()).unwrap();
+    assert_eq!(err.code, "sync_out_update_failed", "{}", err.message);
+    assert!(
+        err.message.contains("提交已经成功（r2）"),
+        "{}",
+        err.message
+    );
+    assert_eq!(phase(&fx), Phase::PostCommit);
+
+    let out = continue_sync_out(&fx.wc_str()).unwrap();
+    assert!(
+        matches!(out, SyncOutOutcome::Delivered { rev: 2, .. }),
+        "{out:?}"
+    );
+    assert_eq!(server_head(&fx), "2", "不重复提交");
+    assert_settled(&fx);
+}
+
+#[test]
+fn a_d6_conflict_on_a_file_git_does_not_manage_is_handed_to_tortoisesvn() {
+    // 必测 #65 后半（spec §8.2.1 末、§15 第 25 条）
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/x.psd", "psd1\n");
+    update_from_server(&fx);
+    std::fs::write(fx.wc().join("Code/x.psd"), "psd LOCAL\n").unwrap();
+    typical_work(&fx);
+    let p = preview_sync_out(&fx.wc_str()).unwrap();
+    assert_eq!(
+        p.outside_changes,
+        vec!["Code/x.psd".to_string()],
+        "确认框要列出它"
+    );
+
+    let err = run_sync_out_probed(
+        &fx.wc_str(),
+        &expect_from(&p, "mine"),
+        &|s: Step, _: &str| {
+            if s == Step::Committed {
+                fx.colleague_commits("Code/x.psd", "psd colleague\n");
+            }
+        },
+    )
+    .unwrap_err();
+    assert_eq!(err.code, "sync_out_update_conflict", "{}", err.message);
+    assert!(
+        err.message.contains("Code/x.psd") && err.message.contains("TortoiseSVN"),
+        "{}",
+        err.message
+    );
+    assert_eq!(phase(&fx), Phase::PostCommit);
+
+    // 用户在 TortoiseSVN 里解决（这里用命令行模拟），再点继续。`mine-full` 是「保留我的」；
+    // 计划原写 `working`——文本文件上 svn 已把冲突标记写进工作文件，`working` 会原样保留标记
+    svn_in(
+        &fx.wc(),
+        &["resolve", "--accept", "mine-full", "Code/x.psd"],
+    );
+    let out = continue_sync_out(&fx.wc_str()).unwrap();
+    assert!(matches!(out, SyncOutOutcome::Delivered { .. }), "{out:?}");
+    assert_eq!(
+        std::fs::read_to_string(fx.wc().join("Code/x.psd")).unwrap(),
+        "psd LOCAL\n"
+    );
+}
+
+#[test]
+fn a_new_gitignore_from_the_server_stops_d7a_and_continue_picks_up_after_the_fix() {
+    // 必测 #70 的 D7a 一半：保持已提交状态、不重复 D5；修正规则后从原录制阶段重新核对
+    let fx = hybrid_with_colleague();
+    typical_work(&fx);
+    let err = deliver_probed(&fx, "mine", &|s, _| {
+        if s == Step::Committed {
+            fx.colleague_commits("Code/.gitignore", "*.cs\n");
+            fx.colleague_commits("Code/New2.cs", "n2\n");
+        }
+    })
+    .unwrap_err();
+    assert_eq!(err.code, "include_set_mismatch", "{}", err.message);
+    assert!(err.message.contains("Code/New2.cs"), "{}", err.message);
+    assert_eq!(phase(&fx), Phase::PostCommit);
+    let base_before = git(&fx, &["rev-parse", "svn/base"]);
+    assert!(
+        git(&fx, &["log", "-1", "--format=%B", "svn/base"]).contains("@1 "),
+        "基线没动"
+    );
+
+    // 修正规则：本地把 .gitignore 改空（它在 W-path 内、不是 W-file，svn 视为本地修改）
+    std::fs::write(fx.wc().join("Code/.gitignore"), "").unwrap();
+    let out = continue_sync_out(&fx.wc_str()).unwrap();
+    // rev 是我的提交 r2（里程碑 review 第 5 条）；新基线记的是 D6 之后的 r4
+    assert!(
+        matches!(out, SyncOutOutcome::Delivered { rev: 2, .. }),
+        "{out:?}"
+    );
+    assert!(git(&fx, &["log", "-1", "--format=%B", "svn/base"]).contains("@4 "));
+    assert_ne!(git(&fx, &["rev-parse", "svn/base"]), base_before);
+    assert_eq!(git(&fx, &["show", "svn/base:Code/New2.cs"]), "n2");
+    assert_eq!(
+        server_head(&fx),
+        "4",
+        "r2 是我们的，r3 / r4 是同事的，没有第二次交付"
+    );
+}

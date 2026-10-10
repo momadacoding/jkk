@@ -15,7 +15,7 @@
 | 6 Local-Only 全流程 | ✅ | `tests/svn_sync_out.rs`（+5） | `cargo test --test svn_sync_out` 19/19；全量绿 |
 | 7 早退与 D5 失败 | ✅ | `svn_sync_out.rs`（`back_from_deliver`）、`svn_sync_in.rs`、`tests/svn_sync_out.rs`（+7） | `cargo test --test svn_sync_out` 26/26；全量绿 |
 | 8 继续 / 放弃 | ✅ | `svn_sync_out.rs`（`continue_sync_out` / `abort_sync_out`）、`svn_sync_in.rs`、`tests/svn_sync_out.rs`（+10） | `cargo test --test svn_sync_out` 36/36（含 Windows 占用文件用例）；全量绿 |
-| 9 D6 / D7a 失败 | ⏳ | | |
+| 9 D6 / D7a 失败 | ✅ | `tests/svn_sync_out.rs`（+3） | `cargo test --test svn_sync_out` 39/39；全量绿 |
 | 10 Tauri 命令 | ⏳ | | |
 | 11 前端纯逻辑与流程 | ⏳ | | |
 | 12 前端接线 + 真实窗口冒烟 | ⏳ | | |
@@ -122,6 +122,13 @@
 | 10 | `unstage` 每个节点起一个 svn 进程；慢路径预览每次都写松散对象 | 次要，推迟 | 性能 / 垃圾对象，gc 会清 |
 
 验证：`rust-suite.sh` → fmt ok、clippy clean、cargo test 822 passed / 0 failed。
+
+### Task 9
+
+- **偏离计划**：`a_new_gitignore…` 的结局断言由计划的 `Delivered { rev: 4 }` 改为 `rev: 2`（我的提交；里程碑 review 第 5 条），另加断言新基线 trailer 是 `@4`、服务器 HEAD 仍是 r4（没有第二次交付）。
+- **计划的错误**：`a_d6_conflict_on_a_file_git_does_not_manage_is_handed_to_tortoisesvn` 用 `svn resolve --accept working` 模拟「用户解决冲突」。实测文本文件冲突时 svn 已把 `<<<<<<< .mine … >>>>>>> .r4` 写进工作文件，`working` 原样保留标记，断言 `psd LOCAL` 失败。改成 `--accept mine-full`（「保留我的版本」）。被测的生产代码没有问题：冲突报 `sync_out_update_conflict`、phase 停在 `post-commit`、解决后「继续」走完。
+- **实施结果**：其余两条首跑通过。`a_failed_d6…`：仓库不可达时 `sync_out_update_failed` 且文案带「提交已经成功（r2）」，恢复后继续不重复提交。`a_new_gitignore…`：服务器新增 `Code/.gitignore`（`*.cs`）让 D7a 报 `include_set_mismatch` 并点名 `Code/New2.cs`，基线未动；本地把规则改空后继续，从 D7 重录成功——git 按磁盘上的 `.gitignore` 判定，计划担心的「修正后仍不过」没有出现。
+- **为什么这么改是安全的**：只改测试。
 
 ### Task 8
 
