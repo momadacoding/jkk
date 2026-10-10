@@ -228,6 +228,12 @@ pub struct UnfinishedSync {
     /// `applying-stash` 是回退 / 放弃途中停下的（分支在更新前的位置），不是更新途中。
     /// 横幅据此换文案（PR #49 review #3）。
     pub rolling_back: bool,
+    /// 交付停在 `committing` 时，横幅要告诉用户去 TortoiseSVN 的 log 里从哪个 revision
+    /// 之后找、找哪条提交信息（Phase 3a 计划 B4）。其余 phase 也照发，前端按需用。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_start_rev: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_message: Option<String>,
 }
 
 /// 同步状态。**`locked` 与 `unfinished` 是两件事，不能合并。**
@@ -262,6 +268,8 @@ pub fn svn_sync_state(path: String) -> Result<SyncState, GitError> {
             opid: j.opid,
             started_at: j.started_at,
             rolling_back: j.rolling_back,
+            expected_start_rev: j.expected_start_rev,
+            commit_message: j.commit_message,
         }),
     })
 }

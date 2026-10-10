@@ -16,7 +16,7 @@
 | 7 早退与 D5 失败 | ✅ | `svn_sync_out.rs`（`back_from_deliver`）、`svn_sync_in.rs`、`tests/svn_sync_out.rs`（+7） | `cargo test --test svn_sync_out` 26/26；全量绿 |
 | 8 继续 / 放弃 | ✅ | `svn_sync_out.rs`（`continue_sync_out` / `abort_sync_out`）、`svn_sync_in.rs`、`tests/svn_sync_out.rs`（+10） | `cargo test --test svn_sync_out` 36/36（含 Windows 占用文件用例）；全量绿 |
 | 9 D6 / D7a 失败 | ✅ | `tests/svn_sync_out.rs`（+3） | `cargo test --test svn_sync_out` 39/39；全量绿 |
-| 10 Tauri 命令 | ⏳ | | |
+| 10 Tauri 命令 | ✅ | `commands/svn_sync.rs`、`commands/svn.rs`、`lib.rs`、`tests/svn_backend.rs`、`tests/svn_write_guard.rs` | `svn_backend` 29/29、`svn_write_guard` 8/8、`commands_are_async` 1/1；全量绿。`pnpm tauri dev` 实跑在 Task 12 |
 | 11 前端纯逻辑与流程 | ⏳ | | |
 | 12 前端接线 + 真实窗口冒烟 | ⏳ | | |
 | 13 E2E 清单、spec 修订、收尾 | ⏳ | | |
@@ -122,6 +122,15 @@
 | 10 | `unstage` 每个节点起一个 svn 进程；慢路径预览每次都写松散对象 | 次要，推迟 | 性能 / 垃圾对象，gc 会清 |
 
 验证：`rust-suite.sh` → fmt ok、clippy clean、cargo test 822 passed / 0 failed。
+
+### Task 10
+
+- **偏离计划**：
+  - `svn_write_guard` 的新用例除了「挂起 watcher」，照 2c 那条（`sync_commands_suspend_the_watcher…`）同时断言命令调到对应引擎入口、引擎入口在锁内（`run_sync_out_probed` 含 `svn_lock::acquire`，继续 / 放弃走 `take_over(`）。
+  - 先看到 RED：`svn_backend` 编译失败（`UnfinishedSync` 缺字段），`svn_write_guard` 找不到 `svn_sync_out` 的函数体。
+- **计划的错误**：计划没提到 `UnfinishedSync` 加字段会让 `tests/svn_backend.rs::sync_state_serializes_to_camel_case` 的结构体字面量编译失败。已补字段（`None`，键集合不变），并在同一用例里加一段 `sync_out` / `committing` 带值的断言，钉住 `expectedStartRev`、`commitMessage` 两个键名。
+- **计划没写的坑**：无。
+- **为什么这么改是安全的**：四个命令都是 `#[tauri::command(async)]`（`commands_are_async` 守着）；三个写命令都包在 `with_watch_suspended` 里，结束后无论成败补发 `repo-changed`；新字段 `skip_serializing_if`，旧前端读不到也不受影响。
 
 ### Task 9
 

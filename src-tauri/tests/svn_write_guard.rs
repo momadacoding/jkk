@@ -281,6 +281,31 @@ fn sync_commands_suspend_the_watcher_and_their_engine_entries_take_the_lock() {
     assert!(fn_body(&eng, "take_over").contains("svn_lock::acquire"));
 }
 
+/// 三个会写的交付命令都挂起 watcher 并在结束后补发 repo-changed（spec §5.2），
+/// 引擎入口都在锁内（Phase 3a）。
+#[test]
+fn delivery_commands_run_with_the_watcher_suspended() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let cmd = fs::read_to_string(root.join("commands/svn_sync.rs")).unwrap();
+    for (func, engine_fn) in [
+        ("svn_sync_out", "run_sync_out"),
+        ("svn_sync_out_continue", "continue_sync_out"),
+        ("svn_sync_out_abort", "abort_sync_out"),
+    ] {
+        let body = fn_body(&cmd, func);
+        assert!(
+            body.contains("with_watch_suspended("),
+            "`{func}` 没有挂起 watcher"
+        );
+        assert!(body.contains(engine_fn), "`{func}` 没有调 `{engine_fn}`");
+    }
+    let eng = fs::read_to_string(root.join("engine/svn_sync_out.rs")).unwrap();
+    assert!(fn_body(&eng, "run_sync_out_probed").contains("svn_lock::acquire"));
+    assert!(fn_body(&eng, "continue_sync_out").contains("take_over("));
+    assert!(fn_body(&eng, "abort_sync_out").contains("take_over("));
+    assert!(fn_body(&eng, "take_over").contains("svn_lock::acquire"));
+}
+
 /// `fn <name>(` 到下一个顶层 `fn` / `pub fn` 之间的源码。依赖 rustfmt 的格式。
 fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
     let start = src
