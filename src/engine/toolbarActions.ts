@@ -82,3 +82,8 @@ export function planToolbarAction(
 export function showsSvnUpdate(caps: Capabilities): boolean {
   return caps.vcs === 'svn'
 }
+
+/** 「交付」（sync_out）按钮，与「更新」同一条件（由 RepoTab 编排，不进 `ToolbarAction`）。 */
+export function showsSvnDeliver(caps: Capabilities): boolean {
+  return caps.vcs === 'svn'
+}

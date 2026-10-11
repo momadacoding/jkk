@@ -66,18 +66,48 @@ describe('describeUnfinishedSync', () => {
     expect(b.actions.map((a) => a.id)).toEqual(['syncContinue', 'syncAbort'])
   })
 
-  it('sync_out 留下的记录本版本收不了尾：不给按钮，并说明原因', () => {
+  it('sync_out 留下的记录挂交付那一组按钮，绝不挂 sync_in 的继续 / 放弃', () => {
     // `publishing-baseline` 是两条流程共用的阶段名（spec §7.6）：只看 phase 的话，
-    // sync_out 的记录也会挂上 sync_in 的继续 / 放弃按钮
-    for (const phase of ['svn-staged' as SyncPhase, 'publishing-baseline' as const]) {
-      const b = describeUnfinishedSync({
+    // sync_out 的记录会挂上 sync_in 的继续 / 放弃按钮——那两个命令会拒绝交付记录。
+    // Phase 3a 之前这里断言「不给按钮」，交付的恢复入口落地后改为按 flow 分流
+    const at = (phase: string) =>
+      describeUnfinishedSync({
         locked: false,
         holder: null,
-        unfinished: { flow: 'sync_out', phase, opid: 'x', startedAt: 1 },
+        unfinished: { flow: 'sync_out', phase: phase as SyncPhase, opid: 'x', startedAt: 1 },
       })!
-      expect(b.actions, phase).toEqual([])
-      expect(b.note, phase).toContain('后续版本')
-    }
+    expect(at('publishing-baseline').actions.map((a) => a.id)).toEqual(['syncOutContinue', 'syncOutAbort'])
+    expect(at('svn-staged').actions.map((a) => a.id)).toEqual(['syncOutCleanup'])
+    expect(at('svn-staged').note).toContain('绝不重复提交')
+  })
+
+  it('交付留下的记录：标题、正文、按钮都按 sync_out 的 phase 给', () => {
+    const b = describeUnfinishedSync({
+      locked: false,
+      holder: null,
+      unfinished: { flow: 'sync_out', phase: 'svn-staged', opid: 'op', startedAt: 1 },
+    })!
+    expect(b.title).toBe('上次交付没有正常结束')
+    expect(b.detail).toContain('撤销')
+    expect(b.actions.map((a) => a.id)).toEqual(['syncOutCleanup'])
+  })
+
+  it('提交状态未知：换标题，不给按钮', () => {
+    const b = describeUnfinishedSync({
+      locked: false,
+      holder: null,
+      unfinished: {
+        flow: 'sync_out',
+        phase: 'committing',
+        opid: 'op',
+        startedAt: 1,
+        expectedStartRev: 7,
+        commitMessage: 'm',
+      },
+    })!
+    expect(b.title).toBe('交付状态未知')
+    expect(b.actions).toEqual([])
+    expect(b.detail).toContain('r8')
   })
 
   it('未收尾或进行中时，其余横幅一律让位', () => {
@@ -136,21 +166,23 @@ describe('describeUnfinishedSync', () => {
   })
 
   it('认不出的 phase 也要有话说，不能渲染一条没有正文的红条', () => {
-    // 后端的 Phase 枚举比前端这个联合类型宽（含 sync_out 的全部阶段），
-    // 手写的 journal 或 Phase 3 的流程都能让它们出现。
+    // 后端的 Phase 枚举比任一流程会写的都宽：手写的 journal、别的版本写的记录，
+    // 都能让一条流程的记录里出现另一条流程的阶段名。
     // `PHASE_DETAIL[未知]` 是 undefined，会渲染出只有标题的红条。
-    const b = describeUnfinishedSync({
-      locked: false,
-      holder: null,
-      unfinished: {
-        flow: 'sync_out',
-        phase: 'svn-staged' as SyncPhase,
-        opid: 'x',
-        startedAt: 1,
-      },
-    })!
-    expect(b.detail).toBeTruthy()
-    expect(b.detail).toContain('svn-staged')
+    // （Phase 3a 之前这里用 sync_out 的 `svn-staged` 当「认不出」，现在它认得了。）
+    for (const [flow, phase] of [
+      ['sync_in', 'svn-staged'],
+      ['sync_out', 'stashed'],
+    ] as const) {
+      const b = describeUnfinishedSync({
+        locked: false,
+        holder: null,
+        unfinished: { flow, phase: phase as SyncPhase, opid: 'x', startedAt: 1 },
+      })!
+      expect(b.detail, flow).toBeTruthy()
+      expect(b.detail, flow).toContain(phase)
+      expect(b.actions, flow).toEqual([])
+    }
   })
 
   it('stashing 阶段必须明确叫用户不要自己去 apply', () => {
@@ -230,11 +262,21 @@ describe('describeUnfinishedSync', () => {
         holder: null,
         unfinished: { flow: 'sync_in' as const, phase, opid: 'x', startedAt: 1 },
       })),
-      {
+      ...[
+        'prepare',
+        'building-deliver',
+        'deliver-built',
+        'checked-out',
+        'svn-staged',
+        'committing',
+        'post-commit',
+        'publishing-baseline',
+        'restoring-branch',
+      ].map((phase) => ({
         locked: false,
         holder: null,
-        unfinished: { flow: 'sync_out', phase: 'svn-staged' as SyncPhase, opid: 'x', startedAt: 1 },
-      },
+        unfinished: { flow: 'sync_out' as const, phase: phase as SyncPhase, opid: 'x', startedAt: 1 },
+      })),
       { locked: true, holder: { pid: 1, startedAt: 1, opid: 'x' }, unfinished: null },
       { locked: true, holder: null, unfinished: null },
       { readError: 'x' },

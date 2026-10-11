@@ -17,7 +17,7 @@
 | 8 继续 / 放弃 | ✅ | `svn_sync_out.rs`（`continue_sync_out` / `abort_sync_out`）、`svn_sync_in.rs`、`tests/svn_sync_out.rs`（+10） | `cargo test --test svn_sync_out` 36/36（含 Windows 占用文件用例）；全量绿 |
 | 9 D6 / D7a 失败 | ✅ | `tests/svn_sync_out.rs`（+3） | `cargo test --test svn_sync_out` 39/39；全量绿 |
 | 10 Tauri 命令 | ✅ | `commands/svn_sync.rs`、`commands/svn.rs`、`lib.rs`、`tests/svn_backend.rs`、`tests/svn_write_guard.rs` | `svn_backend` 29/29、`svn_write_guard` 8/8、`commands_are_async` 1/1；全量绿。`pnpm tauri dev` 实跑在 Task 12 |
-| 11 前端纯逻辑与流程 | ⏳ | | |
+| 11 前端纯逻辑与流程 | ✅ | `svnSyncOut.ts`、`svnSyncOutFlow.ts`、`svnJournal.ts`、`svnSync.ts`、`svnSyncIn.ts`（注释）、`toolbarActions.ts`、`repoStore.ts`；测试 `svnSyncOut` / `svnSyncOutFlow`（新）、`svnJournal` / `toolbarActions`（改） | `pnpm build` 过（tsc）；`pnpm test` 36 files / 516 tests 全绿 |
 | 12 前端接线 + 真实窗口冒烟 | ⏳ | | |
 | 13 E2E 清单、spec 修订、收尾 | ⏳ | | |
 
@@ -174,3 +174,14 @@
 
 验证：`cargo fmt --check` ok、`cargo clippy --all-targets` 无告警、`cargo test` 全绿（`svn_sync_out` 47/47，含新增 8 条）。
 - **为什么这么改是安全的**：两个入口都先拿锁再在锁内重读 journal，opid 或 flow 变了就停；只接 `flow = sync_out`，否则 `sync_out_wrong_flow`；`sync_in` 的继续 / 放弃照旧拒绝交付 journal（码不变，文案改为指向交付横幅）。D5 之后不重复提交（`every_crash_after_the_commit…` 断言服务器始终只有 r2）；放弃只在 W-file 全部 svn 干净时才 `checkout -f` 回原分支，否则 `sync_out_unsafe_to_return` 保留现场；rebase 只 abort / continue 本次发起的那一个（`require_our_rebase` 核对 head-name / orig-head / onto）。
+
+### Task 11
+
+- **偏离计划**：
+  - `svnSyncOutFlow` 的横幅按钮（继续 / 停止 / 清理）执行**失败时也刷新同步状态**（抽成 `refreshing()`，交付对话框的失败路径共用）。计划只在交付对话框的失败路径刷新；横幅按钮失败时 journal 同样可能已推进（继续从 `post-commit` 走到 D7a 停下），不刷新的话横幅停在旧 phase、按钮与文案都错。新增用例「继续失败（比如 D6 又断网）：横幅状态也要刷新」先 RED 后 GREEN。
+  - 「停止收尾」在 `post-commit` 的确认文案多一句「要先把白名单更新到最新……所以需要网络」，对应里程碑 review 第 4 条后端语义（放弃也要先 D6）。新增断言钉住，且 `restoring-branch` 不出现这句。
+  - `rebaseConflict` 结局的文案把「点『停止』」改成「点『停止收尾』」，与横幅按钮名一致；新增用例钉住三个按钮名与后端报错里引用的一致。
+  - 新增「文案里不能有 `**`」的用例覆盖交付对话框模型；`svnJournal` 的同名用例扩到交付全部 9 个 phase。
+- **计划的错误**：计划说 `svnJournal.test.ts` 只需改 `NOTE_SYNC_OUT` 那一条旧断言。实际还有一条——「认不出的 phase 也要有话说」拿 `sync_out` / `svn-staged` 当「认不出」，现在它认得了。改为两个方向各测一个真正认不出的组合（`sync_in` 记录里的 `svn-staged`、`sync_out` 记录里的 `stashed`），并断言不给按钮。原「本版本收不了尾」那条改写为「挂交付那一组按钮，绝不挂 sync_in 的」。
+- **计划没写的坑**：新 worktree 没有 `node_modules`，`pnpm test` 报 `vitest is not recognized`；`pnpm install --frozen-lockfile`（PowerShell，Bash 工具无网络）后正常，无新增依赖。
+- **为什么这么改是安全的**：纯前端展示与编排，不发任何新的写命令；四个 invoke 包装的参数名与 Task 10 的命令签名逐字对齐（`{ path }`、`{ path, expect }`，`expect` 字段由 `svn_backend` 的序列化用例钉住）。`describeUnfinishedSync` 先按 `flow` 分流，交付记录永远拿不到 `sync_in` 的按钮（后端也会以 `sync_out_not_supported` 拒绝）。真实窗口里 invoke 是否打通在 Task 12 验证。

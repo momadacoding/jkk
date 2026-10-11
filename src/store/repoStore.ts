@@ -31,6 +31,7 @@ import type {
 } from '../engine/svnInit'
 import { samePath } from '../engine/path'
 import type { SyncInExpect, SyncInOutcome, SyncInPreview } from '../engine/svnSyncIn'
+import type { SyncOutExpect, SyncOutOutcome, SyncOutPreview } from '../engine/svnSyncOut'
 import { nextSelection } from '../engine/selection'
 
 /** 后端 `svn_sync::RootRev`。 */
@@ -283,6 +284,23 @@ export function svnSyncContinue(path: string): Promise<SyncInOutcome> {
 
 export function svnSyncAbort(path: string): Promise<SyncInOutcome> {
   return invoke<SyncInOutcome>('svn_sync_abort', { path })
+}
+
+export function svnSyncOutPreview(path: string): Promise<SyncOutPreview> {
+  return invoke<SyncOutPreview>('svn_sync_out_preview', { path })
+}
+
+/** `expect` 的字段名是 camelCase，与后端 `SyncOutExpect` 的 serde 约定对齐（AGENTS.md §7.3）。 */
+export function svnSyncOut(path: string, expect: SyncOutExpect): Promise<SyncOutOutcome> {
+  return invoke<SyncOutOutcome>('svn_sync_out', { path, expect })
+}
+
+export function svnSyncOutContinue(path: string): Promise<SyncOutOutcome> {
+  return invoke<SyncOutOutcome>('svn_sync_out_continue', { path })
+}
+
+export function svnSyncOutAbort(path: string): Promise<SyncOutOutcome> {
+  return invoke<SyncOutOutcome>('svn_sync_out_abort', { path })
 }
 
 /**

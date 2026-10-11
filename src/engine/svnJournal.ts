@@ -6,6 +6,7 @@
  */
 import type { BannerModel } from './svnSync'
 import { syncActions } from './svnSyncIn'
+import { describeSyncOutPhase, syncOutActions, type SyncOutPhase } from './svnSyncOut'
 
 /**
  * 重建基线 / 行尾迁移拿同步锁时 opid 的前缀。与 `commands/svn.rs::hold_for_baseline_move`
@@ -23,9 +24,9 @@ export interface LockHolder {
 /**
  * 后端 `svn_journal::Phase` 的线序名，逐字对应 spec §7.6 的两张表。
  *
- * 这里只列 `sync_in` 会停在的那些。**但后端的 `Phase` 枚举已经包含 `sync_out`
- * 的全部阶段**（`svn-staged`、`committing`…），一份手工写的 journal 或 Phase 3
- * 的流程都能让它们出现在这里——所以类型收窄不等于运行时收窄，
+ * 这里只列 `sync_in` 会停在的那些（交付的在 `svnSyncOut.ts` 的 `SyncOutPhase`）。
+ * 后端的 `Phase` 枚举是两条流程的并集，手工写的 journal 或别的版本写的记录都能让
+ * 一条流程的记录里出现另一条流程的阶段名——所以类型收窄不等于运行时收窄，
  * `describeUnfinishedSync` 必须对认不出的 phase 有兜底（2026-09-25 独立 review）。
  */
 export type SyncPhase =
@@ -40,7 +41,7 @@ export type SyncPhase =
 
 export interface UnfinishedSync {
   flow: 'sync_in' | 'sync_out'
-  phase: SyncPhase
+  phase: SyncPhase | SyncOutPhase
   opid: string
   startedAt: number
   /**
@@ -48,6 +49,10 @@ export interface UnfinishedSync {
    * 缺省按「往前走」处理。
    */
   rollingBack?: boolean
+  /** 交付停在 `committing` 时，横幅告诉用户去 log 里从哪之后找（计划 B4）。 */
+  expectedStartRev?: number
+  /** 同上：要找的那条提交信息。 */
+  commitMessage?: string
 }
 
 export interface SyncState {
@@ -101,7 +106,7 @@ const APPLYING_STASH_BACK =
 const NOTE_SYNC_IN =
   '点「继续」从中断的地方接着走；点「放弃」回到更新前。两者都不会丢掉你的提交和未提交的改动。'
 const NOTE_SYNC_OUT =
-  '这条记录是交付流程留下的，恢复入口在后续版本提供。在那之前请不要手工去动 stash 或分支指针。'
+  '提交之前停下的，「清理」会把一切撤回原样；提交之后停下的，「继续」只会接着做完，绝不重复提交。'
 
 /** 「已经持续多久」。与后端 `svn_lock::describe_age` 同一套说法。 */
 export function sinceText(startedAt: number, nowSecs: number): string {
@@ -169,23 +174,39 @@ export function describeUnfinishedSync(
 
   if (!s.unfinished) return null
 
-  // 认不出的 phase 必须有话说。后端的 `Phase` 枚举比这里的联合类型宽
-  // （含 `sync_out` 的全部阶段），而 `PHASE_DETAIL[未知]` 是 `undefined`
-  // ——那会渲染出一条只有标题、没有正文的红条，比说「我不认识」更糟。
+  // 先按 flow 分流：`publishing-baseline` 是两条流程共用的阶段名（spec §7.6），
+  // 只看 phase 会给交付记录挂上「更新」的继续 / 放弃——那两个命令会拒绝它
+  if (s.unfinished.flow === 'sync_out') {
+    const u = s.unfinished
+    return {
+      tone: 'danger',
+      title: u.phase === 'committing' ? '交付状态未知' : '上次交付没有正常结束',
+      detail:
+        describeSyncOutPhase(u) ??
+        `交付停在「${u.phase}」这一步，这个版本的界面还不认识它。请不要手工去动分支指针，记录都还在。`,
+      actions: syncOutActions(u.phase),
+      note: NOTE_SYNC_OUT,
+    }
+  }
+
+  // 认不出的 phase 必须有话说。`sync_out` 已在上面分流，这里只剩 `sync_in` 的记录，
+  // 但它的 phase 仍可能是交付流程的名字（手写 / 别的版本写的），而 `PHASE_DETAIL[未知]`
+  // 是 `undefined`——那会渲染出一条只有标题、没有正文的红条，比说「我不认识」更糟。
   const back = s.unfinished.phase === 'applying-stash' && s.unfinished.rollingBack === true
   const detail =
-    (back ? APPLYING_STASH_BACK : PHASE_DETAIL[s.unfinished.phase]) ??
+    (back
+      ? APPLYING_STASH_BACK
+      : (PHASE_DETAIL as Record<string, string | undefined>)[s.unfinished.phase]) ??
     `流程停在「${s.unfinished.phase}」这一步，这个版本的界面还不认识它` +
       '（多半是更新之后留下的记录）。请不要手工去动 stash 或分支指针，' +
       '记录都还在。'
 
-  const isSyncIn = s.unfinished.flow === 'sync_in'
   return {
     tone: 'danger',
     title: '上次同步没有正常结束',
     detail,
-    actions: isSyncIn ? syncActions(s.unfinished.phase) : [],
-    note: isSyncIn ? NOTE_SYNC_IN : NOTE_SYNC_OUT,
+    actions: syncActions(s.unfinished.phase),
+    note: NOTE_SYNC_IN,
   }
 }
 
