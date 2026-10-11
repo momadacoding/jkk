@@ -5,7 +5,7 @@ export const WORKDIR_ID = '__workdir__'
 
 /** 一条「分支线」：一个 tip 加上它沿第一父链独占的提交。 */
 export interface OwnerInfo {
-  /** 认领顺序。0 号是主干（master/main），固定占 lane 0。 */
+  /** 认领顺序。0 号是主干（SVN 链，否则 master/main），固定占 lane 0。 */
   index: number
   /** 该 owner 拥有的提交所占的行区间，闭区间。 */
   minRow: number
@@ -62,7 +62,16 @@ export function collectTips(commits: CommitNode[], refs: RefPointer[]): string[]
   // 骑在它头上。否则 master 会被那条分支的线吞掉，失去自己的车道——而 master 的位置
   // 固定在最左列是这张图的锚点，不该随便哪条分支的存在与否而漂移。
   // 本地主干优先，没有才回退远程主干；两者都没有时本级为空，lane 0 归下一级第一个 tip。
-  const trunk = byRow(mainLocal.length > 0 ? mainLocal : mainRemote)
+  //
+  // SVN 混合图里主干是 SVN 链本身，压过 master/main：它的顶端（行序最靠前的 `svn:N`）
+  // 起线，沿第一父链一路认领到最老的 revision。SVN 仓库没有 master，这一级为空时
+  // lane 0 会归行序最靠前的随便哪条分支，它沿第一父链把下面几个 revision 认领走，
+  // 剩下的 revision 又被另一条分支带走——SVN 主线断成两列两色。
+  // 不认 `svn/base`：比基线新、还没更新的同事 revision 在它上面，会被甩出主线；
+  // 而且普通 git 仓库里叫 svn/base 的分支是用户自己的。`svn:` 节点只有 `spliceHistory`
+  // 接合过的图才有，所以这条只在 SVN 模式下生效。
+  const svnTop = commits.find((c) => c.id.startsWith('svn:'))?.id
+  const trunk = svnTop ? [svnTop] : byRow(mainLocal.length > 0 ? mainLocal : mainRemote)
 
   const tiers: string[][] = [
     trunk,

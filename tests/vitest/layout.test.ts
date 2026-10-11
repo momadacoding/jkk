@@ -294,4 +294,61 @@ describe('computeLayout 按分支归属分车道', () => {
     const rows = computeLayout([node('c1', ['truncated'])])
     expect(rows[0].parents[0].lane).toBe(0)
   })
+
+  it('SVN 混合图里 SVN 主线整条占 lane 0，不被最上面的分支借走', () => {
+    // 交付两次后再拉分支的真实形状（spliceHistory 之后）：grow 长在已交付的 mf 上，
+    // feature / work 都以 r3 为第一父，keep-a 指着已交付的 a。
+    // 主干只认 master/main 时，lane 0 归行序最靠前的 grow，它沿第一父链把 r2、r1
+    // 认领走；r3 头上骑着 feature/work 被滤掉起点资格，又被 feature 带走——
+    // SVN 主线断成两色两列。
+    const commits = [
+      node('g', ['mf']),
+      node('f', ['svn:3']),
+      node('d', ['svn:3']),
+      node('mf', ['svn:2']),
+      node('a', ['svn:1']),
+      node('svn:3', ['svn:2']),
+      node('svn:2', ['svn:1']),
+      node('svn:1', []),
+    ]
+    const refs = [
+      ref('refs/heads/grow', 'g', 'branch'),
+      ref('refs/heads/feature', 'f', 'branch'),
+      ref('refs/heads/work', 'd', 'branch'),
+      ref('refs/heads/keep-a', 'a', 'branch'),
+      ref('refs/heads/svn/base', 'svn:3', 'branch'),
+    ]
+    const lanes = laneById(computeLayout(commits, refs))
+    expect([lanes['svn:3'], lanes['svn:2'], lanes['svn:1']]).toEqual([0, 0, 0])
+    // 其余分支都不该挤进 lane 0
+    for (const id of ['g', 'f', 'd', 'mf', 'a']) expect(lanes[id]).not.toBe(0)
+  })
+
+  it('比基线新的 SVN revision 也在 lane 0，主干从 SVN 链顶端算起而不是 svn/base', () => {
+    // 同事提交了 r4、本地还没更新：svn/base 仍在 r3，r4 在它上面
+    const commits = [
+      node('svn:4', ['svn:3']),
+      node('d', ['svn:3']),
+      node('svn:3', ['svn:2']),
+      node('svn:2', []),
+    ]
+    const refs = [
+      ref('refs/heads/work', 'd', 'branch'),
+      ref('refs/heads/svn/base', 'svn:3', 'branch'),
+    ]
+    const lanes = laneById(computeLayout(commits, refs))
+    expect([lanes['svn:4'], lanes['svn:3'], lanes['svn:2']]).toEqual([0, 0, 0])
+    expect(lanes.d).not.toBe(0)
+  })
+
+  it('普通 git 仓库里叫 svn/base 的分支不会抢 master 的 lane 0', () => {
+    const commits = [node('b1', ['m1']), node('m1', ['m0']), node('m0', [])]
+    const refs = [
+      ref('refs/heads/svn/base', 'b1', 'branch'),
+      ref('refs/heads/master', 'm1', 'branch'),
+    ]
+    const lanes = laneById(computeLayout(commits, refs))
+    expect(lanes.m1).toBe(0)
+    expect(lanes.b1).not.toBe(0)
+  })
 })

@@ -226,3 +226,16 @@
 - **真实窗口**：重启后图为 `D, only local [work] → 批量新增 [svn/base] r3 → 修复跳跃 r2 → r1`，交付提交不再悬挂；点 r2：显示「已交付：79c661c class A」「相对 r1 的变化」、文件树只有 `Code/A.cs`、diff `class A {}` → `class A { int x; }`。
 - **为什么这么改是安全的**：前端只改「画不画」与「读哪段 diff」，不改任何 git 数据；隐藏判据保守（被 ref / HEAD 指着、或有非基线子节点的一律显示），最坏情况是该隐藏的没隐藏，不会藏掉用户的分支。后端只加一个只读分支，畸形输入报错而不是退回工作区 diff。
 - **验证**：`pnpm build` 过；`pnpm test` 38 files / 540 tests；`cargo fmt --check` 过、`cargo clippy --all-targets` 无告警、`cargo test` 55 套 / 847 passed / 0 failed。
+
+### Task 12 补充：有分支时 SVN 主线被拆成两列（用户反馈，计划外）
+
+- **起因**：用户要求造一个带分支的 fixture 看隐藏规则（之前的冒烟都只有 `work` 一条分支）。复制 `phase1c_696a6c45` 为 `phase1c_branches_25282`（`svn relocate` 到副本 repo），加三种场景：`keep-a` 指着已交付的 `class A`；`grow` 从已交付的 `many files` 长出一个提交；`feature` 从 `svn/base` 拉出一个提交。隐藏规则本身表现正确（`class A`、`many files` 因被 ref 指着 / 有非基线子节点而照常显示），但用户指出图很乱：r1、r2 在蓝色 lane 0，r3 在绿色 lane 1，三个 revision 不在一条直线上。
+- **根因**：`collectTips` 的主干级只认 `master` / `main`。SVN 仓库没有它们，lane 0 归行序最靠前的 tip `grow`，它沿第一父链 `grow → many files → r2 → r1` 认领走；`svn/base`（r3）头上骑着以它为第一父的 `feature` / `work`，按「有第一父子节点的不独立成线」被滤掉，r3 随 `feature` 进了 lane 1。只有一条分支时恰好都在 lane 0，所以之前没暴露。
+- **改法**：图里有 `svn:` 节点时，主干级改为 SVN 链顶端（行序第一个 `svn:N`），压过 master/main；它沿第一父链认领整条 SVN 序列。
+  - 不认 `svn/base`：比基线新、还没更新的同事 revision 在它上面，会被甩出主线（测试钉住）。
+  - `svn:` 节点只有 `spliceHistory` 接合过的图才有，普通 git 仓库里叫 `svn/base` 的分支不受影响（测试钉住）。
+- **偏离计划 / spec**：`svnGraph.ts` 头注释与 spec §10.4 说 layout「一行都不用改、只认 parents」。现在 `owners.ts` 认 `svn:` 前缀，是唯一的例外，头注释已同步改写。
+- **测试**：`layout.test.ts` +3（fixture 的真实拓扑、SVN 链顶端在基线之上、普通仓库的 `svn/base` 不抢 lane 0），前两条先 RED（`[1,0,0]` 等），第三条是护栏。
+- **真实窗口**：`phase1c_branches_25282` 重新截图，r3 → r2 → r1 同在 lane 0、同色；`grow` 从 r2 分出（`many files` 在它的线上），`feature`、`work` 从 r3 分出，`keep-a` 从 r1 分出。
+- **为什么这么改是安全的**：只改车道归属的起点顺序，不改节点、边与任何 git 数据；对非 SVN 图零影响（无 `svn:` 节点时走原逻辑，原有 owners / layout 测试全绿）。
+- **验证**：`pnpm build` 过；`pnpm test` 38 files / 543 tests。

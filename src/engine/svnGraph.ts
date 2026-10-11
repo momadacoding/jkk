@@ -2,8 +2,9 @@
  * 混合图：把 SVN 历史与本地 git 历史接成一张图（spec §10.3）。
  *
  * 这一层是**纯函数**：无 React、无 Tauri 依赖，可直接单测（`AGENTS.md` §7.2）。
- * `engine/layout.ts` 与 `engine/svgRenderer.tsx` **一行都不用改**——它们只认
- * `parents`（spec §10.4）。
+ * `engine/layout.ts` 与 `engine/svgRenderer.tsx` 只认 `parents`（spec §10.4），
+ * 唯一的例外在 `engine/owners.ts`：主干要认 SVN 链的顶端（`svn:` 节点），
+ * 否则 SVN 仓库没有 master，lane 0 会被随便哪条分支借走，SVN 主线断成两列。
  *
  * # trailer 的解析不在这里，在 Rust 侧
  *
