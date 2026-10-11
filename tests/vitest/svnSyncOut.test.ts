@@ -152,7 +152,9 @@ describe('横幅', () => {
       expectedStartRev: 7,
       commitMessage: '修复跳跃',
     })!
-    expect(d).toContain('r8')
+    // 提交若落地，第一个可能的位置就是 r8。「r8 之后」按字面会跳过它（最终 review 第 5 条）
+    expect(d).toContain('从 r8 起')
+    expect(d).not.toContain('r8 之后')
     expect(d).toContain('修复跳跃')
     expect(d).toContain('mygitclient:opid=op-1')
   })

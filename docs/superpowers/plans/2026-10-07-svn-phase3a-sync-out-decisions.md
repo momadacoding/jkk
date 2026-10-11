@@ -277,3 +277,35 @@
   - `-m 'subject' -m 'Local-Only: true'` 写出的提交被 `parse_local_only` 认出（逐行匹配），与勾选框写出的形状等价。
 - **spec 修订**（`2026-09-12-svn-git-hybrid-design.md`）：§7.6 sync_out phase 表后加施工注记（新字段、`tempWorktree` 不再写、清理 / 停止收尾语义、继续前认 HEAD、`committing` 拒绝）；§8.2 步骤后加注记（B1 / B13、B9、`-F` 提交、`--depth=empty` 与父目录）；§8.2.2 加 B10 / B11 注记；§8.2.3 慢路径后加 B2 / B15 注记（M1）；§8.6 表后加失败分类（B3 / B4，M2）；§10.3 末加「交付之后的图」；§10.4 修正「layout / renderer 一行不改」；§11 `CommitDetailView` 行补本地基线 diff；§18 新增修订记录（十五）。
 - **为什么这么改是安全的**：E2E 的 git / svn 写操作与 hook 只装在 `$env:TEMP` 下的 fixture 里，清单开头与 0.5 都写明；hook 由 flag 触发一次即删 flag，不影响其余场景。spec 只加注记与修正，不改任何代码。
+
+### 最终 review（全分支，`/code-review high`，范围 `86e82c7..8ed14a3`）
+
+review 先读了「偏离计划」条目，未发现未记录的偏离；E2E 清单除场景 4 外与代码一致。10 条全部复核：
+
+| 条 | 发现 | 判定 | 处理 |
+|---|---|---|---|
+| 1 | `diffScope` 只认图上节点，选 stash（不在 `load_graph` 里）不再读 diff——**普通 git 仓库也中招**，是本分支引入的回归 | 成立，高 | 新增 `selectionDiffScope`：图上节点走 `commitDiffScope`，不在图上的按 `commit:<oid>` 读，不在图上的 `svn:N` 不请求。`svnGraph.test.ts` +4（先 RED） |
+| 2 | `restoring-branch`、无 Local-Only 时「继续」不认 HEAD：中断期间 detached 做的提交 / 切去的别的分支会被直接切走 | 成立，高 | `restore_branch` 无 Local-Only 分支只接受「在新基线上」或「在原分支上」，别处报 `sync_out_state_changed`、不动。`continuing_never_switches_away_from_commits_made_during_the_interruption`（先 RED：原来返回 `Delivered`） |
+| 3 | `refreshing` 里的 `afterSync` 抛错会顶掉后端原文；成功后刷新失败让对话框以为交付失败 | 成立，中 | `afterSync` 自己不抛，刷新失败进错误条。`svnSyncOutFlow.test.ts` +3（先 RED）。`svnSyncFlow`（更新）成功路径同形，**不在本分支修**，列为后续 |
+| 4 | 后端报错点名的按钮在交付横幅上不存在（「放弃」「继续」） | 成立，中 | 按 phase 改成横幅真名：`post-commit` →「继续交付」，`restoring-branch` →「我已解决，继续」，停止 →「停止收尾」。`settle_residue` 加 `buttons` 参数，更新流程仍传「继续」或「放弃」。4 个既有测试加按钮名断言（先 RED） |
+| 5 | `committing` 说明「看 r{N+1} 之后」按字面会跳过提交最可能落在的 r{N+1} | 成立，中 | 前后端都改成「从 r{N+1} 起」。`svnSyncOut.test.ts` 改断言（先 RED）；Rust 侧断言与修复同时改（旧文案不含新断言字样） |
+| 6 | 基线对应的 revision 还没拉进 `svnRevs` 时，交付的提交被收进一个不画的节点，整个看不见 | 成立，中 | `deliveredCommits` 只把「svn 节点已加载」的基线当作可收起的子节点。`svnGraph.test.ts` +1（先 RED） |
+| 7 | 「停止收尾」时原分支已接在新基线上（快进 update-ref 已做完），提示仍说「回到交付前的位置、请更新」 | 成立，低 | `stop_after_commit` 末尾若 `svn/base == newBaselineOid` 且它是 HEAD 的祖先，走 `finish` 报「已交付」。`stopping_after_the_branch_already_reached_the_new_baseline_reports_it_delivered`（先 RED：原来 `Abandoned`） |
+| 8 | E2E 场景 4 写「黄色提示」「取消」，实际是红色 `.dlg-warning`、按钮 `Cancel` | 成立，低 | 改清单 |
+| 9 | `deliveredCommits` 的 `children` / `bySvn` 每次追加都展开复制，O(k²)；`dateOrder` 线性扫就绪集合 | 前半成立，低 | 前半改为 push。`dateOrder` 保留：就绪集合大小 = 图在某一行的并行线数，注释已写明 |
+| 10 | 新代码跨模块导入用相对路径，`AGENTS.md` §7.2 要求 `@/` | 规则与代码库冲突 | **不改**：`src/` 里 0 个文件用 `@/`、26 个用相对路径，只改新文件会让同一目录两种写法并存。按 `AGENTS.md` §0 指出冲突，由用户决定统一迁移还是改规则 |
+
+- **为什么这么改是安全的**：第 2、7 条只收紧 / 改写结局，不新增任何写操作；第 2 条的新拒绝出口不动 HEAD、分支与 journal（测试断言三者）。第 1 条恢复的是改动前对 stash 的行为。第 4、5 条只改文案。
+- **验证**：`pnpm build` 过；`pnpm test` 39 files / 557 tests；`cargo fmt --check` 过；`cargo clippy --all-targets` 无告警；`cargo test --no-fail-fast` 55 套 / 849 passed / 0 failed。
+
+## 全量验证（Task 13 Step 3，最终 review 修复之后）
+
+| 命令 | 结果 |
+|---|---|
+| `cargo fmt --check` | 通过 |
+| `cargo clippy --all-targets` | 0 告警 |
+| `cargo test --no-fail-fast` | 55 套 / 849 passed / 0 failed |
+| `pnpm build` | 通过 |
+| `pnpm test` | 39 files / 557 passed |
+| `pnpm tauri dev` 冒烟（Task 12 Step 5） | ✅ 见 Task 12 |
+| E2E 9 个场景（Task 13） | 未跑——等用户在真实窗口里跑 |

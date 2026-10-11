@@ -1002,7 +1002,14 @@ fn settle_checkout_residue(repo: &str, cfg: &SvnConfig, j: &Journal, orig: &str)
     if let Some(old) = &j.baseline_oid_before {
         bases.push(old.clone());
     }
-    settle_residue(repo, cfg, &bases, orig, "sync_in_unsafe_to_return")
+    settle_residue(
+        repo,
+        cfg,
+        &bases,
+        orig,
+        "sync_in_unsafe_to_return",
+        "「继续」或「放弃」",
+    )
 }
 
 /// [`settle_checkout_residue`] 的核心，`sync_out` 的「停止收尾」也用（Task 8–10 里程碑
@@ -1013,6 +1020,8 @@ pub(crate) fn settle_residue(
     bases: &[String],
     orig: &str,
     unsafe_code: &str,
+    // 报错里让用户点的按钮：两个流程的横幅按钮名不同（交付没有「放弃」）
+    buttons: &str,
 ) -> Result<()> {
     let stale = tracked_changes(repo, cfg)?;
     let left = untracked_leftovers(repo, cfg, bases)?;
@@ -1031,7 +1040,7 @@ pub(crate) fn settle_residue(
             format!(
                 "分支 `{orig}` 上下面这些文件的内容既不是分支里的、也不是基线里的——\
                  不知道是谁改的，不能覆盖：\n{}\n记录已保留。请先确认这些改动\
-                 （需要的话自己备份），再点「继续」或「放弃」。",
+                 （需要的话自己备份），再点{buttons}。",
                 list_paths(&foreign)
             ),
         ));

@@ -3,6 +3,7 @@ import {
   baselineMap,
   commitDiffScope,
   remapRefs,
+  selectionDiffScope,
   spliceHistory,
   type SvnRevNode,
 } from '@/engine/svnGraph'
@@ -247,6 +248,14 @@ describe('spliceHistory：已交付的本地提交（Phase 3a）', () => {
     expect(out.find((c) => c.id === 'side')!.parents).toEqual(['c1'])
   })
 
+  it('基线对应的 revision 还没拉进来时不收起：收进一个不画的节点等于整个看不见', () => {
+    // 最终 review 第 6 条：首次打开 svn log 缓存为空、或只翻了一页时 r2 不在 svnRevs 里
+    const out = spliceHistory([svn(3), svn(1)], delivered(), ['local'])
+    expect(out.some((c) => c.id === 'classA')).toBe(true)
+    expect(out.some((c) => c.id === 'many')).toBe(false) // r3 在，照常收起
+    expect(out.find((c) => c.id === 'svn:3')!.deliveredFrom).toEqual([{ id: 'many', message: 'many files' }])
+  })
+
   it('「更新」录的基线以旧基线为父，什么都不隐藏', () => {
     const out = spliceHistory(
       [svn(2), svn(1)],
@@ -372,5 +381,31 @@ describe('commitDiffScope', () => {
 
   it('没选中任何节点时不请求', () => {
     expect(commitDiffScope(undefined)).toBeNull()
+  })
+})
+
+describe('selectionDiffScope', () => {
+  const commits = [
+    git('abc', ['svn:2']),
+    { ...git('svn:2', []), vcs: 'svn' as const, baselineOid: 'B2', diffBase: 'B1' },
+  ]
+
+  it('图上的节点按 commitDiffScope 读', () => {
+    expect(selectionDiffScope(commits, 'abc')).toBe('commit:abc')
+    expect(selectionDiffScope(commits, 'svn:2')).toBe('range:B1..B2')
+  })
+
+  it('不在图上的选中（stash、5000 条之外的提交）照旧按 oid 读——普通仓库也走这里', () => {
+    // 最终 review 第 1 条：只认图上节点的话，点 stash 不再读 diff，详情停在上一条提交上
+    expect(selectionDiffScope(commits, 'stash0')).toBe('commit:stash0')
+    expect(selectionDiffScope([], 'stash0')).toBe('commit:stash0')
+  })
+
+  it('不在图上的 svn 节点 id 不是 oid，不请求', () => {
+    expect(selectionDiffScope(commits, 'svn:9')).toBeNull()
+  })
+
+  it('没有选中时不请求', () => {
+    expect(selectionDiffScope(commits, null)).toBeNull()
   })
 })

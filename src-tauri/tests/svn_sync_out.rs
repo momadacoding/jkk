@@ -806,6 +806,8 @@ fn an_unknown_commit_result_leaves_everything_where_it_is() {
     std::fs::rename(&away, fx.repo()).unwrap();
     assert_eq!(err.code, "sync_out_commit_unknown", "{}", err.message);
     assert!(err.message.contains("mygitclient:opid="), "{}", err.message);
+    // 基线 r1：提交若落地，第一个可能的位置是 r2，不能说成「r2 之后」（最终 review 第 5 条）
+    assert!(err.message.contains("从 r2 起"), "{}", err.message);
     let j = svn_journal::read(&fx.wc_str())
         .unwrap()
         .expect("journal 保留");
@@ -1025,10 +1027,17 @@ fn a_d8d_conflict_is_continued_after_the_user_resolves_it() {
     // 必测 #69 的继续一半
     let fx = hybrid_with_colleague();
     make_d8d_clash(&fx);
+    let err = continue_sync_out(&fx.wc_str()).unwrap_err();
     assert_eq!(
-        continue_sync_out(&fx.wc_str()).unwrap_err().code,
+        err.code,
         "sync_out_unresolved", // review 第 6 条：不借用「更新」流程的码
         "没解决不能继续"
+    );
+    // 最终 review 第 4 条：报错里点名的按钮必须是这个 phase 横幅上真有的
+    assert!(
+        err.message.contains("「我已解决，继续」"),
+        "{}",
+        err.message
     );
     let resolved: String = (1..=30)
         .map(|n| match n {
@@ -1200,6 +1209,7 @@ fn a_failed_d6_is_retried_without_committing_again() {
     .unwrap_err();
     std::fs::rename(&away, fx.repo()).unwrap();
     assert_eq!(err.code, "sync_out_update_failed", "{}", err.message);
+    assert!(err.message.contains("「继续交付」"), "{}", err.message);
     assert!(
         err.message.contains("提交已经成功（r2）"),
         "{}",
@@ -1242,6 +1252,7 @@ fn a_d6_conflict_on_a_file_git_does_not_manage_is_handed_to_tortoisesvn() {
     )
     .unwrap_err();
     assert_eq!(err.code, "sync_out_update_conflict", "{}", err.message);
+    assert!(err.message.contains("「继续交付」"), "{}", err.message);
     assert!(
         err.message.contains("Code/x.psd") && err.message.contains("TortoiseSVN"),
         "{}",
@@ -1417,6 +1428,9 @@ fn abandoning_on_the_original_branch_settles_checkout_residue() {
     let err = abort_sync_out(&fx.wc_str()).unwrap_err();
     assert_eq!(err.code, "sync_out_unsafe_to_return", "{}", err.message);
     assert!(err.message.contains("Code/A.cs"), "{}", err.message);
+    // 交付横幅上没有「放弃」，只有「停止收尾」（最终 review 第 4 条）
+    assert!(err.message.contains("「停止收尾」"), "{}", err.message);
+    assert!(!err.message.contains("「放弃」"), "{}", err.message);
     assert_eq!(
         std::fs::read_to_string(fx.wc().join("Code/A.cs")).unwrap(),
         "foreign\n"
@@ -1436,6 +1450,35 @@ fn abandoning_on_the_original_branch_settles_checkout_residue() {
     assert!(!fx.wc().join("Code/Col.cs").exists());
     assert_eq!(git(&fx, &["status", "--porcelain"]), "");
     assert!(svn_journal::read(&fx.wc_str()).unwrap().is_none());
+}
+
+#[test]
+fn stopping_after_the_branch_already_reached_the_new_baseline_reports_it_delivered() {
+    // 最终 review 第 7 条：快进的 update-ref 已经做完、只差切回原分支时崩溃，再点「停止收尾」。
+    // 原分支已经在新基线上，「分支回到了交付前的位置、点更新」两句都是假话
+    let fx = hybrid_with_colleague();
+    typical_work(&fx);
+    crash_after_colleague(&fx, Step::Published);
+    assert_eq!(phase(&fx), Phase::RestoringBranch);
+    let new = git(&fx, &["rev-parse", "svn/base"]);
+    let before = git(&fx, &["rev-parse", "work"]);
+    git(&fx, &["update-ref", "refs/heads/work", &new, &before]); // D8d 的 CAS 已经落地
+
+    let out = abort_sync_out(&fx.wc_str()).unwrap();
+    assert!(
+        matches!(
+            out,
+            SyncOutOutcome::Delivered {
+                rev: 2,
+                local_only_left: 0,
+                ..
+            }
+        ),
+        "{out:?}"
+    );
+    assert_eq!(git(&fx, &["rev-parse", "work"]), new);
+    assert_eq!(git(&fx, &["branch", "--show-current"]), "work");
+    assert_settled(&fx);
 }
 
 #[test]
@@ -1461,6 +1504,36 @@ fn continuing_after_the_user_switched_back_by_hand_does_not_move_the_branch_unde
     assert_eq!(
         git(&fx, &["rev-parse", "work"]),
         git(&fx, &["rev-parse", "svn/base"])
+    );
+}
+
+#[test]
+fn continuing_never_switches_away_from_commits_made_during_the_interruption() {
+    // 最终 review 第 2 条：没有本地补丁时 restore_branch 只认「HEAD 已在原分支上」，
+    // HEAD 在别处（detached 做了提交、或切到了别的分支）时照样 checkout 原分支——
+    // 那些提交只剩 reflog 能找回。停止收尾那一侧（里程碑 review 第 7 条）早就拦了
+    let fx = hybrid_with_colleague();
+    typical_work(&fx);
+    crash_after_colleague(&fx, Step::Published);
+    assert_eq!(phase(&fx), Phase::RestoringBranch);
+    git(&fx, &["checkout", "-q", "--detach"]);
+    write(&fx, "Code/A.cs", "made while the app was down\n");
+    git(&fx, &["commit", "-qam", "during"]);
+    let made = git(&fx, &["rev-parse", "HEAD"]);
+    let work_before = git(&fx, &["rev-parse", "work"]);
+
+    let err = continue_sync_out(&fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "sync_out_state_changed", "{}", err.message);
+    assert_eq!(git(&fx, &["rev-parse", "HEAD"]), made, "HEAD 不能被切走");
+    assert_eq!(
+        git(&fx, &["rev-parse", "work"]),
+        work_before,
+        "原分支也不能动"
+    );
+    assert_eq!(
+        phase(&fx),
+        Phase::RestoringBranch,
+        "记录留着，回到原位后还能继续"
     );
 }
 

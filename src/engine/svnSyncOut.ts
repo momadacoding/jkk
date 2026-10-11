@@ -197,7 +197,8 @@ export function describeSyncOutPhase(u: SyncOutUnfinished): string | undefined {
     case 'svn-staged':
       return '交付在提交之前停下了。SVN 里登记了一些新增 / 删除，还没提交。清理会逐条撤销这些登记，再切回你的分支。'
     case 'committing': {
-      const from = u.expectedStartRev === undefined ? '' : `r${u.expectedStartRev + 1} 之后`
+      // 提交若落地，第一个可能的位置就是 start+1，所以说「从它起」而不是「它之后」
+      const from = u.expectedStartRev === undefined ? '' : `从 r${u.expectedStartRev + 1} 起`
       return (
         '提交已经发出，但没有拿到服务器的答复，可能成功也可能没有。本版本还不能自动查证，所以什么都没再动。' +
         `请在 TortoiseSVN 的 Show log 里看${from}有没有提交信息为「${u.commitMessage ?? ''}」的 revision` +

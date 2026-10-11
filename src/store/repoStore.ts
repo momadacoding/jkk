@@ -21,8 +21,8 @@ import {
 } from '../engine/svnJournal'
 import {
   baselineMap,
-  commitDiffScope,
   remapRefs,
+  selectionDiffScope,
   spliceHistory,
   type SvnRevNode,
 } from '../engine/svnGraph'
@@ -779,10 +779,10 @@ export function useRepoEffects(
   viewMode: string,
 ) {
   const { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, refreshSvnSyncState, auditSvnIfDue } = refreshers
-  // svn 节点有两版本地基线时读两版之差（`range:`），否则不请求——它的 id 不是 oid
+  // svn 节点有两版本地基线时读两版之差（`range:`）；不在图上的选中（stash）照旧按 oid 读
   const diffScope = viewMode === 'changes'
     ? 'workdir'
-    : commitDiffScope(state.commits.find((c) => c.id === state.selectedId))
+    : selectionDiffScope(state.commits, state.selectedId)
 
   useEffect(() => {
     if (!state.path || !diffScope) return

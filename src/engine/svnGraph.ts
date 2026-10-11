@@ -111,7 +111,8 @@ export function spliceHistory(
       revToBaseline.set(c.baselineRev, c.id)
     }
   }
-  const delivered = deliveredCommits(gitCommits, baselineToSvn, tips)
+  const loaded = new Set(svnRevs.map((r) => svnId(r.rev)))
+  const delivered = deliveredCommits(gitCommits, baselineToSvn, loaded, tips)
 
   // ① SVN 序列 → 链
   const svnNodes: CommitNode[] = svnRevs.map((r, i) => {
@@ -208,12 +209,25 @@ function dateOrder(nodes: CommitNode[]): CommitNode[] {
 function deliveredCommits(
   gitCommits: CommitNode[],
   baselineToSvn: Map<string, string>,
+  loaded: Set<string>,
   tips: Iterable<string>,
 ): { hidden: Set<string>; bySvn: Map<string, { id: string; message: string }[]> } {
   const pinned = new Set(tips)
+  // 追加用 push 而不是展开复制：一次交付一长串提交时，展开是每个键 O(k²)（最终 review 第 9 条）
+  const append = <T>(m: Map<string, T[]>, k: string, v: T) => {
+    const list = m.get(k)
+    if (list) list.push(v)
+    else m.set(k, [v])
+  }
   const children = new Map<string, string[]>()
   for (const c of gitCommits) {
-    for (const p of c.parents) children.set(p, [...(children.get(p) ?? []), c.id])
+    for (const p of c.parents) append(children, p, c.id)
+  }
+  // 基线对应的 revision 还没拉进来（首次打开、只翻了一页）时不算数：收进一个不画的节点，
+  // 交付的提交就整个看不见了（最终 review 第 6 条）。拉到之后下一次接合自然收起
+  const settled = (k: string) => {
+    const svn = baselineToSvn.get(k)
+    return svn !== undefined && loaded.has(svn)
   }
   const hidden = new Set<string>()
   // 隐藏的提交记到哪个 svn 节点：沿子节点往上找到的第一条基线
@@ -222,7 +236,7 @@ function deliveredCommits(
     if (baselineToSvn.has(c.id) || pinned.has(c.id)) continue
     const kids = children.get(c.id) ?? []
     if (kids.length === 0) continue
-    if (!kids.every((k) => baselineToSvn.has(k) || hidden.has(k))) continue
+    if (!kids.every((k) => settled(k) || hidden.has(k))) continue
     hidden.add(c.id)
     const k = kids[0]
     const svn = baselineToSvn.get(k) ?? owner.get(k)
@@ -232,9 +246,24 @@ function deliveredCommits(
   for (const c of gitCommits) {
     const svn = owner.get(c.id)
     if (svn === undefined) continue
-    bySvn.set(svn, [...(bySvn.get(svn) ?? []), { id: c.id, message: c.message }])
+    append(bySvn, svn, { id: c.id, message: c.message })
   }
   return { hidden, bySvn }
+}
+
+/**
+ * 当前选中该读哪段 diff。
+ *
+ * 图上的节点交给 [`commitDiffScope`]；**不在图上的选中照旧按 oid 读**——stash 提交不被任何
+ * 分支引用、不在 `load_graph` 里，5000 条上限之外的提交也一样，`RepoTab` 的 `detailCommit`
+ * 专门为它们拼了节点。只认图上节点的话，点 stash 不再读 diff，详情停在上一条提交上，
+ * 而且普通 git 仓库也中招（最终 review 第 1 条）。不在图上的 `svn:N` 不是 oid，不请求。
+ */
+export function selectionDiffScope(commits: CommitNode[], selectedId: string | null): string | null {
+  if (!selectedId) return null
+  const node = commits.find((c) => c.id === selectedId)
+  if (node) return commitDiffScope(node)
+  return selectedId.startsWith('svn:') ? null : `commit:${selectedId}`
 }
 
 /**

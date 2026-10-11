@@ -117,6 +117,49 @@ describe('handleSvnDeliver', () => {
     expect(log2).toContain('deliver:initial=修复跳跃')
   })
 
+  it('交付成功后刷新失败：结局照常弹出，刷新的错误进错误条，不能让对话框以为交付失败了', async () => {
+    // 最终 review 第 3 条：提交已在服务器上，对话框却留在原地报错、「交付」还能点
+    const log: string[] = []
+    const d = deps(log)
+    d.refreshSvnSync = async () => {
+      throw { code: 'svn_check_failed' }
+    }
+    vi.mocked(store.svnSyncOutPreview).mockResolvedValue(preview)
+    vi.mocked(store.svnSyncOut).mockResolvedValue({ kind: 'delivered', rev: 2, branch: 'work', localOnlyLeft: 0 })
+    await createSvnSyncOutFlow(d).handleSvnDeliver()
+    expect(log.some((l) => l.startsWith('dialogError'))).toBe(false)
+    expect(log).toContain('reportError:svn_check_failed')
+    expect(log).toContain('confirm:已交付 r2')
+    expect(d.draft.current).toBe('')
+  })
+
+  it('执行失败后刷新也失败：对话框里显示的仍是后端原本的错误', async () => {
+    // D6 失败的原文是用户唯一知道「提交已经成功、点继续」的地方，不能被刷新错误顶掉
+    const log: string[] = []
+    const d = deps(log)
+    d.refreshSvnSync = async () => {
+      throw { code: 'svn_check_failed' }
+    }
+    vi.mocked(store.svnSyncOutPreview).mockResolvedValue(preview)
+    vi.mocked(store.svnSyncOut).mockRejectedValue({ code: 'sync_out_update_failed' })
+    await createSvnSyncOutFlow(d).handleSvnDeliver()
+    expect(log).toContain('dialogError:sync_out_update_failed')
+    expect(log).not.toContain('dialogError:svn_check_failed')
+  })
+
+  it('横幅按钮：继续成功后刷新失败，结局照常弹出', async () => {
+    const log: string[] = []
+    const d = deps(log)
+    d.refreshSvnSyncState = async () => {
+      throw { code: 'journal_unreadable' }
+    }
+    vi.mocked(store.svnSyncOutContinue).mockResolvedValue({ kind: 'delivered', rev: 2, branch: 'work', localOnlyLeft: 0 })
+    await createSvnSyncOutFlow(d).handleSyncOutAction('syncOutContinue')
+    expect(log.some((l) => l.startsWith('dialogError'))).toBe(false)
+    expect(log).toContain('reportError:journal_unreadable')
+    expect(log).toContain('confirm:已交付 r2')
+  })
+
   it('同一时间只走一个流程', async () => {
     const log: string[] = []
     const d = deps(log)

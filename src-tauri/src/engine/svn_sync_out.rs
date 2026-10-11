@@ -450,7 +450,7 @@ fn commit_unknown(j: &Journal, stderr: &str) -> GitError {
         format!(
             "提交已经发出，但没有拿到服务器的明确答复：\n{}\n\
              它可能已经成功，也可能没有。本版本还不能自动查证，所以什么都不再动：\
-             不撤销登记，也不推进基线。请在 TortoiseSVN 的 Show log 里看 r{} 之后有没有\
+             不撤销登记，也不推进基线。请在 TortoiseSVN 的 Show log 里看从 r{} 起有没有\
              提交信息为「{}」的 revision（它带着属性 mygitclient:opid={}）。记录已保留。",
             stderr.trim(),
             start + 1,
@@ -482,7 +482,7 @@ fn update_whitelist(repo: &str, cfg: &SvnConfig, j: &Journal, then: Then) -> Res
     let up = run_svn_code(repo, &args)?;
     if up.code != 0 {
         let retry = match then {
-            Then::Continue => "网络恢复后在顶部横幅上点「继续」，不会重复提交。".to_string(),
+            Then::Continue => "网络恢复后在顶部横幅上点「继续交付」，不会重复提交。".to_string(),
             Then::Stop => format!(
                 "{STOP_NEEDS_UPDATE}网络恢复后再点「继续交付」或「停止收尾」都可以，不会重复提交。"
             ),
@@ -510,7 +510,7 @@ fn update_whitelist(repo: &str, cfg: &SvnConfig, j: &Journal, then: Then) -> Res
     }
     if !conflicts.is_empty() {
         let button = match then {
-            Then::Continue => "继续",
+            Then::Continue => "继续交付",
             Then::Stop => "停止收尾",
         };
         return Err(GitError::new(
@@ -549,7 +549,7 @@ fn capture_delivered(repo: &str, cfg: &SvnConfig, j: &mut Journal) -> Result<()>
             "sync_out_revision_moved",
             format!(
                 "{}，但录新基线的过程中工作副本被外部改动了（r{} → r{now}）。基线没有推进，\
-                 记录已保留；外部操作结束后在顶部横幅上点「继续」。",
+                 记录已保留；外部操作结束后在顶部横幅上点「继续交付」。",
                 committed_text(j),
                 pre.node_rev
             ),
@@ -616,6 +616,21 @@ pub(crate) fn restore_branch(
     let orig_ref = format!("refs/heads/{orig}");
 
     if j.local_only_commits.is_empty() {
+        // 只有两个合法起点：刚发布完停在新基线上，或用户已手工切回原分支（下面处理）。
+        // 别处一律不动——中断期间在那里做过的提交，切走之后只剩 reflog 找得回
+        // （最终 review 第 2 条；停止收尾那一侧由 require_left_in_place 拦）
+        let cur = current_branch(repo)?;
+        let on_new_base =
+            cur.as_deref() == Some(BASELINE_BRANCH) && rev_parse(repo, "HEAD")? == new;
+        if !on_new_base && cur.as_deref() != Some(orig.as_str()) {
+            let head = rev_parse(repo, "HEAD")?;
+            return Err(state_changed(&format!(
+                "提交已在服务器上（r{rev}），基线已推进，但 HEAD 现在在 {}，既不在新基线上也不在原分支 \
+                 `{orig}` 上。中断期间若在那里做过提交，切走就会丢掉它们，所以不动。先处理好它们，再 \
+                 `git checkout {BASELINE_BRANCH}` 回到新基线后点「我已解决，继续」",
+                cur.unwrap_or_else(|| head[..head.len().min(10)].to_string()),
+            )));
+        }
         // 计划 B10：快进 = 直接把分支指针移到新基线（CAS），再从基线切过去——两者是同一个
         // commit，git 不写任何文件。spec 字面的 checkout + merge --ff-only 会多两次全量重编译
         let tip = rev_parse(repo, &orig_ref)?;
@@ -626,7 +641,7 @@ pub(crate) fn restore_branch(
             if !tracked_changes(repo, cfg)?.is_empty() {
                 return Err(state_changed(&format!(
                     "提交已在服务器上（r{rev}），基线已推进，但分支 `{orig}` 已被切回、而且有未提交的\
-                     改动。先提交或撤掉它们再点「继续」"
+                     改动。先提交或撤掉它们再点「我已解决，继续」"
                 )));
             }
             checkout_verified(repo, cfg, BASELINE_BRANCH, false)?;
@@ -700,7 +715,7 @@ pub(crate) fn rebase_conflict_or_error(
         "sync_out_rebase_failed",
         format!(
             "提交已在服务器上（r{rev}），基线已推进，但把本地补丁接到新基线上失败了，而且不是冲突。\
-             记录已保留：按 git 说的处理好之后点「继续」。git 原话：{}",
+             记录已保留：按 git 说的处理好之后点「我已解决，继续」。git 原话：{}",
             e.message.trim()
         ),
     ))
@@ -1019,7 +1034,14 @@ fn stop_after_commit(repo: &str, cfg: &SvnConfig, j: &Journal) -> Result<SyncOut
         // 撤掉了本地补丁的内容
         let mut bases: Vec<String> = j.new_baseline_oid.iter().cloned().collect();
         bases.push(need(&j.deliver_oid, "deliverOid")?);
-        settle_residue(repo, cfg, &bases, &orig, "sync_out_unsafe_to_return")?;
+        settle_residue(
+            repo,
+            cfg,
+            &bases,
+            &orig,
+            "sync_out_unsafe_to_return",
+            "「停止收尾」",
+        )?;
     } else {
         // `-f` 会把 HEAD 从这里切走：中断期间在 detached HEAD 上做的提交、切去的别的分支，
         // 都不在下面 W-file 的检查范围里（里程碑 review 第 7 条）
@@ -1032,12 +1054,20 @@ fn stop_after_commit(repo: &str, cfg: &SvnConfig, j: &Journal) -> Result<SyncOut
                 format!(
                     "要回到分支 `{orig}` 就得覆盖工作区里的文件，而下面这些文件的内容既不是 git 写的、\
                      也不是服务器上的，不知道是谁改的，不能覆盖：\n{}\n记录已保留。请先确认这些改动\
-                     （需要的话自己备份），再点「放弃」。",
+                     （需要的话自己备份），再点「停止收尾」。",
                     list_paths(&dirty)
                 ),
             ));
         }
         checkout_verified(repo, cfg, &orig, true)?;
+    }
+    // 原分支已经接在本次发布的基线上（D8d 的快进 update-ref 做完、或 rebase 走完只差 D10）：
+    // 交付其实已经完成，报「已停止、分支回到交付前、请更新」是假话（最终 review 第 7 条）
+    if let Some(new) = &j.new_baseline_oid {
+        let base_ref = format!("refs/heads/{BASELINE_BRANCH}");
+        if rev_parse(repo, &base_ref)? == *new && is_ancestor(repo, new)? {
+            return finish(repo, j, delivered_rev(repo, j, new)?);
+        }
     }
     if let Some(r) = &j.deliver_ref {
         unpin(repo, r)?;
@@ -1080,7 +1110,7 @@ fn continue_restoring(repo: &str, cfg: &SvnConfig, j: &mut Journal) -> Result<Sy
         // D8d 已经做完（快进或 rebase 走完了），只差 D10
         if !is_ancestor(repo, &new)? {
             return Err(state_changed(
-                "原分支还没有落到新基线上（rebase 可能在外面被中止了）；要停在这里，请点「放弃」",
+                "原分支还没有落到新基线上（rebase 可能在外面被中止了）；要停在这里，请点「停止收尾」",
             ));
         }
         return finish(repo, j, rev);
@@ -1162,7 +1192,7 @@ fn unresolved(files: &[String]) -> GitError {
     GitError::new(
         "sync_out_unresolved",
         format!(
-            "还有冲突没解决：\n{}\n改好之后把它们暂存（git add），再点「继续」。",
+            "还有冲突没解决：\n{}\n改好之后把它们暂存（git add），再点「我已解决，继续」。",
             list_paths(files)
         ),
     )

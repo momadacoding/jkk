@@ -49,10 +49,20 @@ export interface SvnSyncOutFlowDeps {
 }
 
 export function createSvnSyncOutFlow(d: SvnSyncOutFlowDeps) {
-  /** 收尾之后的刷新。`repo-changed` 由后端补发，这里只补它不管的 SVN 侧状态。 */
+  /**
+   * 收尾之后的刷新。`repo-changed` 由后端补发，这里只补它不管的 SVN 侧状态。
+   *
+   * **自己不抛**：刷新失败进错误条，不能改写交付本身的结局（最终 review 第 3 条）——
+   * 成功后抛的话对话框留在原地报错、「交付」还能点，用户以为没提交上去；失败后抛的话
+   * 后端原文（D6 失败时那是用户唯一知道「提交已经成功、点继续」的地方）被顶掉。
+   */
   const afterSync = async () => {
-    await d.refreshSvnSyncState(d.repoPath)
-    await d.refreshSvnSync(d.repoPath)
+    try {
+      await d.refreshSvnSyncState(d.repoPath)
+      await d.refreshSvnSync(d.repoPath)
+    } catch (err) {
+      d.reportError(err)
+    }
     void d.fetchSvnLog(d.repoPath)
   }
 
