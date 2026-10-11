@@ -1904,6 +1904,24 @@ rebase 预检使用的目标 OID 与 `origHead` 同样落盘，禁止用可能�
 | `publishing-baseline` | TREE 已核对；新基线 commit 可能已创建或已发布，工作分支尚未恢复 | 比对 journal 的新旧 OID 判定发布状态，按 §8.2.2 继续；不重新提交 SVN、不覆盖外部推进的基线 |
 | `restoring-branch` | 基线已发布且索引已对齐；D8d 可能已切回原分支、正在 rebase 或已完成 | 按 HEAD、原分支 OID 与 Git 的 rebase 状态继续 D8d 或进入 D10；不得回到 D6 / D8c 覆盖冲突 |
 
+> **Phase 3a 施工注记（2026-10-11）**
+>
+> - 交付另记 `svnStatusBefore`（D4 第一条 svn 命令**之前**落盘）、`svnDelta`、`svnModified`、
+>   `deliverOid`、`committedRev`。撤销 D4 不只信 `svnDelta`，而是以「当前状态 − `svnStatusBefore`」
+>   重算、只取 added / deleted——崩在 `svn add` 之后、写 `svnDelta` 之前时只有前者（计划 B6）。
+> - `tempWorktree` 字段保留但**不再写入**：慢路径改在对象层重放（§8.2.3 注记），没有临时 worktree。
+>   收尾代码仍认这个字段，兼容旧记录。
+> - D5 之前的所有 phase，「继续」与「放弃」走同一条清理路径，横幅只给「清理」（计划 B8）：
+>   继续往 D5 走需要用户重新看过清单，崩溃之后什么都可能变了。
+> - D5 之后的「放弃」= **停止收尾**：提交不撤回，只是不再替用户做后面的事——我们发起的 rebase
+>   先 `--abort`，HEAD 不在原分支上时确认白名单 W-file 在 svn 看来干净再 `checkout -f` 回去，删交付
+>   ref 与 journal（计划 B7）。**`post-commit` 停止前仍要先跑 D6**：只提交不更新的工作副本是
+>   mixed-revision，「更新」与「重建基线」都不接（实测），所以停止收尾也需要网络。
+> - 继续 / 停止前先认 HEAD：`post-commit` 必须 detached 在交付树上，`publishing-baseline` 允许已在
+>   `svn/base` 的新基线上；用户中途切走、或进行中的 rebase 不是本次发起的，都报 `sync_out_state_changed`
+>   并说明怎么回到原位，不在别人的状态上继续。
+> - `committing` 在 3a 里继续 / 放弃都拒绝（`sync_out_commit_unknown`），只给查证说明；查证属 3b。
+
 `sync_in` 另有三个 phase 与 stash 相关，见 §7.3.1：
 
 | phase | 已经发生了什么 | 放弃时怎么收尾 |
@@ -2124,6 +2142,22 @@ D10  收尾：先跑成功路径自己的断言，再复用 §8.2.4 的 ③ 和 
           推进过 origBranch。见 §8.2.4 末尾
 ```
 
+> **Phase 3a 施工注记（2026-10-11）**
+>
+> - **D3 / D3.5 移到流程之外**（计划 B1 / B13）：预览（纯读，不拿锁、不写 journal、不建 ref）算出
+>   D0.5 / D1 / D2 给用户确认；执行时在锁内**重跑整套前置检查**，那次 `remoteRev` 查询就是 D3.5，
+>   值写进 `expectedStartRev`。交付树的 tree OID、文件清单或白名单外改动与确认时不同，报
+>   `sync_out_needs_reconfirm`；分支或基线变了，报 `sync_out_state_changed`。Tauri 命令不能在中途
+>   停下等用户点确认，照字面做要么跨两次 invoke 持锁，要么在预览里留下无记录的临时对象。
+>   「D3 用户取消」于是不再是需要清理的出口：执行命令根本没被调用。
+> - **D2 不过滤，拒绝**（计划 B9，更严）：清单里出现白名单外的路径就报 `sync_out_outside_whitelist`。
+>   D8d 之后分支会快进到新基线，被过滤掉的改动会从分支上静默消失。
+> - **D5 的提交信息走 `-F` 文件**：`svn commit -F .git/mygitclient-commit-msg.txt --encoding UTF-8
+>   --force-log`。实测 svn.exe 按系统 ANSI 代码页解码命令行，ACP 1252 上 `-m 修复跳跃` 存成了别的
+>   字节；`--force-log` 防用户把 `.git` 登记成受控之后 svn 拒绝受控文件当 `-F`。
+> - D5 的 target 带 `--depth=empty`，D4 新增的父目录按「磁盘上是目录」判定（`svn status --xml` 不给
+>   `kind`，实测）。
+
 **D0.5 到 D3.5 之间的任何退出都走 §8.2.4 的统一收尾**，包括 D1/D2 空清单、D3 用户
 取消、D3.5 失败和进程崩溃。这些出口都在 D5 之前，代价为零，但**不清理就会留下临时
 ref 和临时 worktree**。
@@ -2221,6 +2255,15 @@ Local-Only commit 时，先由 §7.3.2 检查待重放区间；rebase 完成后�
 journal）。不与另一种合并算法的结果做整树等值断言。rebase 冲突按 §7.3.2 分流，进入
 现有的用户解决 / 继续 / 放弃流程。
 
+> **Phase 3a 施工注记（2026-10-11，计划 B10 / B11）**：无 Local-Only 时**不切两次分支**——先
+> `git update-ref refs/heads/<orig> NEWBASE <origHead>`（CAS），再从 `svn/base` 切到 `<orig>`；两者是同一个
+> commit，git 不写任何文件。上面字面的 `checkout <orig>` + `merge --ff-only` 会先把磁盘切回不含 D6
+> 服务器改动的旧内容再快进回来，多两次全量重编译。快进断言改为显式的
+> `merge-base --is-ancestor <origHead> NEWBASE`，不成立报 `sync_out_not_fast_forward`。中断期间用户手工切回了
+> 原分支时先回到 `svn/base` 再移指针，否则 update-ref 挪走的是**当前**分支、磁盘却留在旧内容上。
+> 有 Local-Only 时 rebase 前的 merge 门槛对 `merge-base(NEWBASE, origHead)..origHead` 做——慢路径的
+> 交付 commit 是重放出来的新对象，不是 `origHead` 的祖先。
+
 ⚠️ 走到 D8d 时 D5 已经成功、基线已经推进，所以这里报错**不回滚**，语义与 §13 那行
 「D8d rebase 冲突」一致：提交是好的，只是补丁没落回工作分支。保留 journal 中的
 `origHead` 与 Git 的 rebase 状态，由用户选择后续操作，不自动 reset 或重试。
@@ -2299,6 +2342,14 @@ git worktree remove <tmp>
 提示用户去拆分或重排，然后 `git -C <tmp> cherry-pick --abort`，再走 §8.2.4 收尾。
 **绝不自动解冲突**——此时还没碰 SVN、也没碰主工作副本，中止是零代价的，而猜错的后果
 是把本地补丁送上服务器。
+
+> **Phase 3a 施工注记（2026-10-11，计划 B2 / B15）**：慢路径**不用临时 worktree + cherry-pick**，改为
+> 在对象层逐个重放：`git merge-tree --write-tree --merge-base=<C^> <cur> <C>`，再 `commit-tree` 保留原
+> 作者、原 message（提交者是当前用户）。磁盘、索引、HEAD、worktree 注册全不碰，上面两条硬约束（D0.5
+> 不动主工作副本、早退必须清干净）天然成立——没有东西要清。实测 M1：不重叠时与 cherry-pick 得到的
+> tree 完全相同；紧挨着时 `merge-tree` 退出 1 并列出三个 stage，报 `sync_out_local_only_conflict`，
+> 点名两个提交与冲突文件。代价是需要 git ≥ 2.40（`--merge-base`），旧 git 在慢路径上报
+> `sync_out_git_too_old`，快路径不受影响。
 
 **慢路径要求待交付历史是线性的**，这条在 §8.1 #6 前置拦截，理由见下。
 
@@ -2561,6 +2612,14 @@ svn add --parents Assets/Scripts/Deep/Nested/New.cs
 | 服务端钩子拒绝 | E165001 | 无变化 | 同上，原样展示 stderr |
 | 路径权限不足（SVN authz 按路径配） | E170001 | 无变化 | 同上。原子性保证：一个路径没权限则整个提交被拒 |
 | **传输中途断网** | 连接重置 / 超时 | **未知** | 见下 |
+
+**失败分类（Phase 3a 施工，2026-10-11，计划 B3 / B4）**：只在 stderr 里**每一个** `E\d{6}` 错误码都属于
+「服务器确定没变」的集合时才回滚——`E155011`、`E160028`、`E160013`、`E160024`、`E165001`、`E170001`、
+`E200009`、`E200007`。其余一律判「状态未知」：包括 `E170013` / `E180001`、没有错误码、退出非零但 stdout
+里有 `Committed revision`。未知时 phase 停在 `committing`，不回滚、不推进；3a 里继续 / 放弃都拒绝，查证在
+3b。实测 M2（SlikSvn 1.14.2）：out-of-date 是 `E155011 + E160028`；同事删了我要改的文件是
+`E155011 + E160013`；钩子拒绝是 `E165001`；仓库不可达是 `E170013 + E180001`。断网时的错误码随协议不同，
+保守地全归「未知」。上表「认证失败」与「路径权限不足」同为 `E170001`，均在回滚集合内。
 
 传输中断最棘手：数据传完之后、回执送达之前断线，客户端不知道服务器到底提交成功
 没有。盲目回滚是错的——如果实际成功了，撤销 D4 会导致下次交付把同样内容再提交
@@ -3039,6 +3098,22 @@ journal / stash，停止录制基线，指出受影响的 WC / 文件，交由 T
 `svn:N` 节点就没有主干可挂。处理办法是**强制补拉**——baseline commit 的 revision
 列表已知且有限（几十个），拉取时显式包含。
 
+**交付之后的图（Phase 3a 施工，2026-10-11，用户在真实窗口里反馈后补）**：
+
+- **已交付的提交收进 svn 节点**。交付录的新基线以交付树为父（§8.2.2），交付过的提交夹在两条基线
+  之间；③ 换掉基线之后它们没了子节点，被画成从旧 revision 分出、悬在那里的分支。判据：有子节点、
+  子节点全是基线或已收起的提交、且**没有 ref / HEAD 直接指着**的提交不进图，记到沿子节点往上找到的
+  第一个 svn 节点的 `deliveredFrom`。还被分支指着、或另一条分支从它上面长出来的照常显示。
+- **两条序列按时间交错**，规则同 `git log --date-order`：子一定在父之上，此前提下越新越靠上。不能
+  `[...git, ...svn]` 直接拼：有分支指着的旧交付提交会排到所有 revision 上面。
+- **SVN 主线固定在 lane 0**：车道分配的主干认 SVN 链顶端（行序第一个 `svn:N`），压过 master/main。
+  否则 SVN 仓库没有 master，lane 0 归行序最靠前的分支，它沿第一父链认领走几个 revision，剩下的
+  被另一条分支带走——主线断成两列两色。不认 `svn/base`：比基线新、还没更新的 revision 在它上面。
+- **svn 节点画成菱形**（车道色填充、白边），本地提交仍是圆点。不用颜色区分——颜色归车道。
+- 已知不精确：基线 trailer 记的是 D6 更新到的 revision，D5 与 D6 之间同事又提交过时，`deliveredFrom`
+  会挂在同事那个 revision 上；界面因此写「录这条基线之前已交付」。精确对应要把 `committedRev` 写进
+  基线 commit，留作后续。
+
 ### 10.4 数据模型改动
 
 ```ts
@@ -3056,6 +3131,11 @@ export interface CommitNode {
 
 `engine/layout.ts`、`engine/svgRenderer.tsx` **一行不改**——它们只认 `parents`。
 
+> **Phase 3a 修正（2026-10-11）**：上面这句不再成立。车道分配（`engine/owners.ts`）认 `svn:` 前缀找
+> SVN 链顶端，渲染（`svgRenderer`）认 `vcs === 'svn'` 画菱形，理由见 §10.3 末。两处都只在接合过
+> SVN 历史的图里生效，纯 git 仓库零影响。`CommitNode` 另加 `deliveredFrom`、`baselineOid`、
+> `diffBase`（svn 节点专用，见 §10.3 末与 §11 `CommitDetailView`）。
+
 ## 11. 前端改动
 
 | 组件 | 变化 |
@@ -3068,7 +3148,7 @@ export interface CommitNode {
 | `Toolbar` | 按 `capabilities`：Fetch / Pull / Push → Update / Deliver；隐藏 Worktree / Tag / PR |
 | `CommitRow` | `vcs === 'svn'` 时显示 `r12346` 而非短 hash，换配色；`localOnly` 加「仅本地」角标（§6.7） |
 | `LocalChangesView` 的提交框 | 新增「仅本地，不交付」勾选框，勾上即在 message 追加 `Local-Only: true` trailer |
-| `CommitDetailView` | svn 节点的 diff 走 `svn diff -c N`（**需要网络**）。第一期只对白名单内路径显示内容，美术资产只列文件名和状态 |
+| `CommitDetailView` | svn 节点的 diff 走 `svn diff -c N`（**需要网络**）。第一期只对白名单内路径显示内容，美术资产只列文件名和状态。**Phase 3a 补（2026-10-11）**：前后两个节点都有本地基线时（交付或更新录下的），不走网络，直接比两版基线（`read_diff` 的 `range:<a>..<b>` scope，只读；格式不对报 `bad_diff_scope`，不能退回工作区 diff）；前一个节点没有本地基线（同事的 revision）时如实说明要等 Phase 4，不拿更早的基线冒充。另列「录这条基线之前已交付的本地提交」 |
 | 新增 `SvnExternalView` | 白名单外的 svn 改动，只读列表 + revert 入口 |
 | 新增 `SyncDialog` | 更新 / 交付流程 UI，含冲突解决引导与交付确认关口 |
 | 新增 `BaselineBanner` | 失同步 / 同步未完成 / 交付状态未知 |
@@ -3710,6 +3790,30 @@ fixture，白名单 `Code/`，四种脏各一例）：
 误导性的错误上。
 
 ## 18. 修订记录
+
+### 2026-10-07（十五）· Phase 3a 施工：`sync_out` 的实测补足
+
+计划 `docs/superpowers/plans/2026-10-07-svn-phase3a-sync-out.md` 的「对 spec 的补足与偏离」B1–B15
+与施工中新增的偏离，要点（细节见各节的「Phase 3a 施工注记」与决策日志）：
+
+- **D3 / D3.5 移到流程之外**：预览纯读 → 用户确认 → 执行时锁内重跑前置检查（B1 / B13，§8.2 注记）；
+- **D0.5 慢路径改在对象层 `merge-tree` 重放**，不建临时 worktree，`tempWorktree` 不再写入（B2，实测 M1，§8.2.3 注记）；
+- **D5 失败分类**：只有全部错误码都属「服务器确定没变」的集合才回滚，其余判未知、停在 `committing`；
+  3a 里 `committing` 的继续 / 放弃都拒绝（B3 / B4，实测 M2，§8.6）；
+- **D5 提交信息走 `-F` 文件 + `--encoding UTF-8`**（偏离计划 B14 的 `-m`：实测非中文代码页上 `-m`
+  静默存错，§8.2 注记）；
+- **撤销 D4 以「当前 − `svnStatusBefore`」重算**（B6）；**D5 之前继续 / 放弃同为「清理」**（B8）；
+  **D5 之后的放弃 = 停止收尾**，`post-commit` 停止前仍先跑 D6（B7，§7.6 注记）；
+- **D2 遇白名单外变更拒绝而非过滤**（B9）；**D8d 无 Local-Only 时 CAS 移指针 + 一次切换**，快进断言改显式
+  `--is-ancestor`（B10 / B11，§8.2.2 注记）；**pinned 模式拒绝交付**（B12）；
+- **里程碑 review 之后**：继续 / 停止前认 HEAD 与 rebase 是不是本次发起的，不在用户手工改过的状态上继续；
+  `publishing-baseline` 无新基线 OID 时重新录制；认不出的 phase 报 `sync_out_unknown_phase`。
+- **交付之后的图**（用户在真实窗口里反馈）：已交付的提交收进 svn 节点、两条序列按时间交错、SVN 主线
+  固定在 lane 0、svn 节点画成菱形、svn 节点按本地两版基线显示文件变化（§10.3 末、§10.4 修正、§11）。
+
+**实测支撑**：M1（`merge-tree` 与 cherry-pick 结果等价、冲突形状）与 M2（SlikSvn 1.14.2 下各类提交失败的
+错误码）见计划；`-m` 的代码页问题与 `-F` 的行为见决策日志 Task 5；真实窗口冒烟与 E2E 清单见
+`docs/superpowers/e2e/2026-10-07-svn-phase3a-e2e.md`。
 
 ### 2026-09-25（十四）· Phase 2c 施工：`sync_in` 的实测补足
 

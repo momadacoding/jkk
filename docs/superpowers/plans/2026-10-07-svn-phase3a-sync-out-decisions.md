@@ -258,3 +258,22 @@
 - **为什么这么改是安全的**：只改节点形状，不改布局、行序、边与数据；纯 git 仓库没有 `vcs === 'svn'` 的节点，零影响。
 - **测试**：新增 `svgRenderer.test.tsx`（jsdom）4 条：svn 菱形 / git 圆、菱形以车道中心对称、HEAD 放大加粗、选中加粗，先全部 RED。形状好不好认靠真实窗口截图（`phase1c_branches_25282`：r3 / r2 / r1 为蓝色菱形，本地提交仍是圆点，lane 0 的菱形左顶点没被裁）。
 - **验证**：`pnpm build` 过；`pnpm test` 39 files / 549 tests。
+
+### Task 13
+
+- **E2E 清单**：`docs/superpowers/e2e/2026-10-07-svn-phase3a-e2e.md`，结构照 phase2c。状态表全部未勾（真实窗口场景由用户跑）。
+- **偏离计划**：
+  - 场景 7 拆成 **7a（提交之前被杀 →「清理」）** 与 **7b（提交之后被杀 →「继续交付」）**：计划只写「交付进行中结束进程、记录停在哪个 phase」，那样多半落在流程末尾或 `committing`（3a 的死胡同），验不到两种可收尾的按钮。
+  - **新增场景 8（多分支）**：用户 2026-10-11 要求。落后于基线的分支先被 §8.1 第 0 条拒、更新后才能交付；只指着已交付提交的分支更新后快进到基线、交付报「没有可交付的改动」；同时验交付后提交图的四处改动。
+  - 场景 6 不用计划给的「循环脚本盯 svn 日志」，改用 **SVN post-commit hook**；场景 7 改用 **git post-checkout hook** 卡 30 秒。两者都由 flag 文件触发一次，0.5 一次性安装。
+- **计划的错误**：
+  - 场景 6 的备选做法（操作窗口里轮询 svn log，看到你的提交就让 wc2 提交）卡不住：D6 在 D5 返回后毫秒级就开始，轮询必然晚。
+  - 场景 7「在任务管理器里结束进程」的时机不可控，交付全程一两秒。
+- **计划没写的坑（均已命令行实测，探测目录已删）**：
+  - `file://` 下 SVN 的 post-commit hook **同步**执行：客户端等 hook 跑完才返回（实测：hook 里替同事提交一笔，我的 `svn commit` 334ms 后返回时同事的 r3 已在服务器上）。hook 的环境变量是空的，`svn.exe` 必须写绝对路径；`.bat` 里用 `goto` 而不是 `( … )` 块，防路径里的括号（如 `Program Files (x86)`）打断解析。
+  - `run_git` 没有禁用 git hook：用户自己的 post-checkout 等 hook 会在交付途中执行（这正是场景 7 能卡住的原因）。不算缺陷，但用户的慢 hook 会拉长交付。
+  - D7 → D8 之间换索引用的是 `read-tree`，不触发 post-checkout；提交之后第一次触发它的是 D8b 切 `svn/base`（phase 仍是 `publishing-baseline`）——7b 停在哪个 phase 由此推出。
+  - 补丁改第 1 行、待交付改动改第 2 行：`merge-tree --merge-base` 退出 1（冲突）；改第 8 行退出 0（实测），场景 2 / 3 的造法据此。
+  - `-m 'subject' -m 'Local-Only: true'` 写出的提交被 `parse_local_only` 认出（逐行匹配），与勾选框写出的形状等价。
+- **spec 修订**（`2026-09-12-svn-git-hybrid-design.md`）：§7.6 sync_out phase 表后加施工注记（新字段、`tempWorktree` 不再写、清理 / 停止收尾语义、继续前认 HEAD、`committing` 拒绝）；§8.2 步骤后加注记（B1 / B13、B9、`-F` 提交、`--depth=empty` 与父目录）；§8.2.2 加 B10 / B11 注记；§8.2.3 慢路径后加 B2 / B15 注记（M1）；§8.6 表后加失败分类（B3 / B4，M2）；§10.3 末加「交付之后的图」；§10.4 修正「layout / renderer 一行不改」；§11 `CommitDetailView` 行补本地基线 diff；§18 新增修订记录（十五）。
+- **为什么这么改是安全的**：E2E 的 git / svn 写操作与 hook 只装在 `$env:TEMP` 下的 fixture 里，清单开头与 0.5 都写明；hook 由 flag 触发一次即删 flag，不影响其余场景。spec 只加注记与修正，不改任何代码。
