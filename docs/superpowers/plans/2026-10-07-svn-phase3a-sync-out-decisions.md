@@ -209,3 +209,20 @@
   - 观察（非缺陷）：提交图上交付的那笔提交（`class A`）从 r1 分出、并回 r2——新基线的父提交是交付树（spec §8.2.2），图上能看出 r2 交付的是哪一笔。
   - 四个新 invoke 里预览、执行两个已在真实窗口里打通；继续 / 放弃在 Task 13 的 E2E 场景里验证。
 - **为什么这么改是安全的**：组件只做渲染与事件绑定，不直接 `invoke`；交付执行期间 Esc / 遮罩 / Cancel 都关不掉对话框（组件测试钉着），避免用户以为取消了而 svn commit 已经发出；按钮分流有组件测试，交付记录永远到不了「更新」的命令。
+
+### Task 12 补充：交付之后的提交图（用户反馈，计划外）
+
+- **起因**：真实窗口两次交付后，用户反馈图「看不懂」：交付过的 `class A`、`many files` 从 r1 分出、悬在旁边，还排在 r3 上面，像没交付；r2 / r3 点开看不到任何文件变化。
+- **根因（对照 fixture 的 `git log --graph`）**：git 链是一条直线 `local → B3 → many → B2 → classA → B1`——交付录的新基线以交付树为父（spec §8.2.2）。`spliceHistory` ③ 把基线换成 svn 节点、svn 节点只连上一个 revision，基线 → 交付提交的那条边丢了，交付提交成了没有子节点的「分支」；`[...rewritten, ...svnNodes]` 又让所有 git 行排在 svn 行之前。r2 / r3 没有文件：svn 节点详情本来就不拉 diff（Phase 4），而 `commit:<基线>` 比的是基线和交付树，恰好漏掉交付的内容。
+- **用户选定的方案**：A（隐去交付提交）+ 本地两版基线算文件变化。备选 B（画成 merge 边，每次交付多一个分叉）、C（后端改基线父提交，推翻 §8.2.2）未采用。
+- **实现**：
+  - `spliceHistory(svnRevs, gitCommits, tips)`：**有子节点、子节点全是基线或已隐藏的提交、且没有 ref / HEAD 直接指着**的提交不进图，记到对应 svn 节点的 `deliveredFrom`。还有分支指着、或别的分支从它上面长出来的照常显示。`tips` 由 store 的 `merge` 传入（ref hash + `headHash`）。
+  - svn 节点带 `baselineOid`（同 revision 多条基线取最新）与 `diffBase`（**只认图上紧挨着的下一个节点**的基线；它没有基线——同事的 revision——就不给，避免把几个 revision 的改动算到一个头上）。
+  - `commitDiffScope`：git 节点 `commit:<oid>`；svn 节点两者都在时 `range:<diffBase>..<baselineOid>`，否则 `null`（原先发 `commit:svn:N`，后端解析失败、错误被吞）。
+  - 后端 `read_diff` 新增 `range:<a>..<b>` scope（libgit2 `diff_tree_to_tree` + 改名检测，**只读**，Tauri 命令签名不变）。格式不对报 `bad_diff_scope`——**不能**落到默认的 workdir 分支，那会把工作区改动当成节点的变化（RED 时实测正是如此）。
+  - 详情面板：svn 节点显示「录这条基线之前已交付的本地提交」清单；有 `diffBase` 时复用文件树 + diff 布局，注明「相对 rP，按本地两版基线算，只含 git 管的文件」；否则说明前一版没有本地基线、要等 Phase 4。
+- **偏离 / 措辞上的取舍**：基线 trailer 记的是 D6 更新到的 revision，不是 D5 的提交 revision；D5–D6 间同事又提交过时，「交付自」会挂在同事那个 revision 上。所以文案写「录这条基线之前已交付的本地提交」，不写「这个 revision 就是这些提交」。要精确对应需要把 `committed_rev` 写进基线 commit，留作后续。
+- **测试**：`svnGraph.test.ts` +13（隐藏规则 6、基线字段 3、`commitDiffScope` 4），先 RED 11 条；`fixtures.rs` +2（`range` 跨多个提交、5 种畸形 scope 报错），先 RED。
+- **真实窗口**：重启后图为 `D, only local [work] → 批量新增 [svn/base] r3 → 修复跳跃 r2 → r1`，交付提交不再悬挂；点 r2：显示「已交付：79c661c class A」「相对 r1 的变化」、文件树只有 `Code/A.cs`、diff `class A {}` → `class A { int x; }`。
+- **为什么这么改是安全的**：前端只改「画不画」与「读哪段 diff」，不改任何 git 数据；隐藏判据保守（被 ref / HEAD 指着、或有非基线子节点的一律显示），最坏情况是该隐藏的没隐藏，不会藏掉用户的分支。后端只加一个只读分支，畸形输入报错而不是退回工作区 diff。
+- **验证**：`pnpm build` 过；`pnpm test` 38 files / 540 tests；`cargo fmt --check` 过、`cargo clippy --all-targets` 无告警、`cargo test` 55 套 / 847 passed / 0 failed。

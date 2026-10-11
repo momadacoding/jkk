@@ -157,6 +157,68 @@ fn read_status_lists_conflicted_files() {
     assert_eq!(conflicted.status, "conflicted");
 }
 
+fn rev(dir: &std::path::Path, spec: &str) -> String {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(["rev-parse", spec])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// `range:<a>..<b>`：两个任意 commit 之间的差异。SVN 节点用它比前后两版本地基线——
+/// 交付录的基线以交付树为父（spec §8.2.2），`commit:<基线>` 比的是它和交付树，
+/// 恰好把「这一版交付了什么」漏掉（2026-10-11 真实窗口：r2 / r3 看不到任何文件变化）。
+#[test]
+fn read_diff_for_a_range_spans_every_commit_in_between() {
+    let dir = linear_repo();
+    let c1 = rev(dir.path(), "HEAD~1");
+    fs::write(dir.path().join("b.txt"), "b\n").unwrap();
+    run_git(dir.path(), &["add", "b.txt"]);
+    run_git(dir.path(), &["commit", "-m", "c3"]);
+    let c3 = rev(dir.path(), "HEAD");
+    let path = dir.path().to_str().unwrap();
+
+    let diff = engine::diff::read_diff(path, format!("range:{c1}..{c3}")).unwrap();
+    let mut files: Vec<(String, String)> = diff
+        .files
+        .iter()
+        .map(|f| (f.path.clone(), f.status.clone()))
+        .collect();
+    files.sort();
+    assert_eq!(
+        files,
+        [
+            ("a.txt".to_string(), "modified".to_string()),
+            ("b.txt".to_string(), "added".to_string())
+        ]
+    );
+    // 对照：commit:c3 只有它自己那一步
+    let own = engine::diff::read_diff(path, format!("commit:{c3}")).unwrap();
+    assert_eq!(own.files.len(), 1);
+}
+
+#[test]
+fn a_malformed_range_is_an_error_not_a_workdir_diff() {
+    // 解析不了时不能落到下面的「workdir」默认分支——那会把工作区改动当成这个节点的变化
+    let dir = linear_repo();
+    fs::write(dir.path().join("a.txt"), "dirty").unwrap();
+    let path = dir.path().to_str().unwrap();
+    let head = rev(dir.path(), "HEAD");
+    for scope in [
+        "range:".to_string(),
+        format!("range:{head}"),
+        format!("range:..{head}"),
+        format!("range:{head}.."),
+        "range:nothex..alsonot".to_string(),
+    ] {
+        assert!(
+            engine::diff::read_diff(path, scope.clone()).is_err(),
+            "{scope} 应报错"
+        );
+    }
+}
+
 #[test]
 fn read_diff_includes_untracked_content() {
     let dir = linear_repo();

@@ -96,25 +96,48 @@ export function remapRefs<T extends HasHash>(refs: T[], map: Map<string, string>
   })
 }
 
-export function spliceHistory(svnRevs: SvnRevNode[], gitCommits: CommitNode[]): CommitNode[] {
-  // ① SVN 序列 → 链
-  const svnNodes: CommitNode[] = svnRevs.map((r, i) => ({
-    id: svnId(r.rev),
-    // 降序，所以「下一个更小的 revision」就是数组里的下一个
-    parents: i + 1 < svnRevs.length ? [svnId(svnRevs[i + 1].rev)] : [],
-    author: r.author,
-    time: toEpochSeconds(r.date),
-    message: r.message,
-    vcs: 'svn',
-    svnRev: r.rev,
-  }))
-
-  // ② baseline commit → svn 节点 的映射
+export function spliceHistory(
+  svnRevs: SvnRevNode[],
+  gitCommits: CommitNode[],
+  tips: Iterable<string> = [],
+): CommitNode[] {
+  // ② baseline commit → svn 节点 的映射（① 要用它给 svn 节点挂本地基线，提前算）
   const baselineToSvn = baselineMap(gitCommits)
+  // 同一个 revision 可能有多条基线（重建过）：gitCommits 是新的在前，取第一条
+  const revToBaseline = new Map<number, string>()
+  for (const c of gitCommits) {
+    if (c.baselineRev !== undefined && !revToBaseline.has(c.baselineRev)) {
+      revToBaseline.set(c.baselineRev, c.id)
+    }
+  }
+  const delivered = deliveredCommits(gitCommits, baselineToSvn, tips)
 
-  // ③ 重写 parents，并把 baseline commit 自身从输出里去掉
+  // ① SVN 序列 → 链
+  const svnNodes: CommitNode[] = svnRevs.map((r, i) => {
+    const node: CommitNode = {
+      id: svnId(r.rev),
+      // 降序，所以「下一个更小的 revision」就是数组里的下一个
+      parents: i + 1 < svnRevs.length ? [svnId(svnRevs[i + 1].rev)] : [],
+      author: r.author,
+      time: toEpochSeconds(r.date),
+      message: r.message,
+      vcs: 'svn',
+      svnRev: r.rev,
+    }
+    const own = revToBaseline.get(r.rev)
+    if (own !== undefined) node.baselineOid = own
+    // 只认图上紧挨着的下一个节点的基线：它没有基线（同事的 revision）时，拿更早的基线
+    // 去比会把中间几个 revision 的改动都算到这一个头上
+    const prev = i + 1 < svnRevs.length ? revToBaseline.get(svnRevs[i + 1].rev) : undefined
+    if (own !== undefined && prev !== undefined) node.diffBase = prev
+    const from = delivered.bySvn.get(node.id)
+    if (from) node.deliveredFrom = from
+    return node
+  })
+
+  // ③ 重写 parents，并把 baseline commit 与已交付的提交从输出里去掉
   const rewritten: CommitNode[] = gitCommits
-    .filter((c) => !baselineToSvn.has(c.id))
+    .filter((c) => !baselineToSvn.has(c.id) && !delivered.hidden.has(c.id))
     .map((c) => ({
       ...c,
       parents: c.parents.map((p) => baselineToSvn.get(p) ?? p),
@@ -127,6 +150,66 @@ export function spliceHistory(svnRevs: SvnRevNode[], gitCommits: CommitNode[]): 
   // ④ 剔除悬空 parent
   const known = new Set(all.map((c) => c.id))
   return all.map((c) => ({ ...c, parents: c.parents.filter((p) => known.has(p)) }))
+}
+
+/**
+ * 已交付的本地提交：**只能经由基线 commit 才能到达**的 git 提交（Phase 3a）。
+ *
+ * 交付录的新基线以交付树为父（spec §8.2.2），交付过的提交于是夹在两条基线之间。
+ * 接合把基线换成 svn 节点、svn 节点只连上一个 revision，这些提交就没了子节点：
+ * 被画成从旧 revision 分出、悬在那里的分支，还排在所有 svn 行上面，看上去像
+ * 「还没交付」（2026-10-11 真实窗口截图）。它们的内容已经是 SVN 历史的一部分，
+ * 所以不进图，记到对应 svn 节点的 `deliveredFrom` 上。
+ *
+ * 判据：有子节点、子节点全是基线或已隐藏的提交、且没有任何 ref / HEAD 直接指着。
+ * 「还有分支指着」或「另一条分支从它上面长出来」的照常显示——不能把用户的分支藏掉。
+ * `load_graph` 的提交全部从 ref / HEAD 走出来，所以没有子节点的提交一定被指着。
+ *
+ * `gitCommits` 是拓扑序（子在父之前），一遍扫完即可：轮到某个提交时它的子节点都已判过。
+ */
+function deliveredCommits(
+  gitCommits: CommitNode[],
+  baselineToSvn: Map<string, string>,
+  tips: Iterable<string>,
+): { hidden: Set<string>; bySvn: Map<string, { id: string; message: string }[]> } {
+  const pinned = new Set(tips)
+  const children = new Map<string, string[]>()
+  for (const c of gitCommits) {
+    for (const p of c.parents) children.set(p, [...(children.get(p) ?? []), c.id])
+  }
+  const hidden = new Set<string>()
+  // 隐藏的提交记到哪个 svn 节点：沿子节点往上找到的第一条基线
+  const owner = new Map<string, string>()
+  for (const c of gitCommits) {
+    if (baselineToSvn.has(c.id) || pinned.has(c.id)) continue
+    const kids = children.get(c.id) ?? []
+    if (kids.length === 0) continue
+    if (!kids.every((k) => baselineToSvn.has(k) || hidden.has(k))) continue
+    hidden.add(c.id)
+    const k = kids[0]
+    const svn = baselineToSvn.get(k) ?? owner.get(k)
+    if (svn !== undefined) owner.set(c.id, svn)
+  }
+  const bySvn = new Map<string, { id: string; message: string }[]>()
+  for (const c of gitCommits) {
+    const svn = owner.get(c.id)
+    if (svn === undefined) continue
+    bySvn.set(svn, [...(bySvn.get(svn) ?? []), { id: c.id, message: c.message }])
+  }
+  return { hidden, bySvn }
+}
+
+/**
+ * 选中的节点该读哪段 diff（`read_diff` 的 scope）。
+ *
+ * svn 节点的 id 是 `svn:N`，不是 oid，原样发 `commit:svn:N` 只会在后端解析失败。
+ * 它前后两版都有本地基线时，两版基线之差就是这一步在白名单里改了什么，本地就能算，
+ * 不必等 Phase 4 的 `svn diff -c`。
+ */
+export function commitDiffScope(c: CommitNode | undefined): string | null {
+  if (!c) return null
+  if (c.vcs !== 'svn') return `commit:${c.id}`
+  return c.baselineOid && c.diffBase ? `range:${c.diffBase}..${c.baselineOid}` : null
 }
 
 /**

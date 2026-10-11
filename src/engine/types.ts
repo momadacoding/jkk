@@ -68,6 +68,18 @@ export interface CommitNode {
   baselineRev?: number
   /** 后端解析出的 `Local-Only: true`（spec §6.7），不会被交付。 */
   localOnly?: boolean
+  /**
+   * 仅 svn 节点：录这条基线之前已经交付、因此不再单独画在图上的本地提交
+   * （`spliceHistory` 的「已交付」规则）。没有时缺省。
+   *
+   * 不是「这个 revision 就是这些提交」：基线记的是交付之后更新到的 revision，
+   * 中间同事若又提交过，它就是同事的那个 revision。
+   */
+  deliveredFrom?: { id: string; message: string }[]
+  /** 仅 svn 节点：记录这个 revision 的本地基线 commit（有多条时取最新）。 */
+  baselineOid?: string
+  /** 仅 svn 节点：图上下一个（更早的）svn 节点的本地基线。两者都在才能本地算文件变化。 */
+  diffBase?: string
 }
 
 export interface GraphData {

@@ -89,13 +89,14 @@ export function CommitDetailView({ commit, diff, repoPath }: CommitDetailViewPro
     return <div className="commit-detail commit-detail-empty">Select a commit</div>
   }
 
-  // svn 节点：只显示元信息，**不拉 diff**。
+  // svn 节点。
   //
   // spec §11 的前端改动表写着「svn 节点的 diff 走 `svn diff -c N`」，但 §16 的
-  // 分期表把「svn 节点 diff」明确列在 **Phase 4**。两处冲突时按分期表走
-  // （它更晚、更具体）。这里如实说明，而不是给一个空白的文件列表——
-  // 空白会让人以为这个 revision 什么都没改。
+  // 分期表把它列在 **Phase 4**。不过前后两版都有本地基线时（交付或更新录下的），
+  // 两版基线之差本地就能算（`commitDiffScope` 的 `range:`），这里直接显示；
+  // 否则如实说明，而不是给一个空白的文件列表——空白会让人以为这个 revision 什么都没改。
   if (commit.vcs === 'svn') {
+    const prevRev = commit.parents[0]?.replace(/^svn:/, '')
     return (
       <div className="commit-detail">
         <div className="commit-head">
@@ -107,10 +108,42 @@ export function CommitDetailView({ commit, diff, repoPath }: CommitDetailViewPro
           </span>
         </div>
         <pre className="commit-detail-message">{commit.message}</pre>
-        <p className="commit-detail-note">
-          SVN 节点的文件差异要走一次网络请求（<code>svn diff -c {commit.svnRev}</code>），
-          属于 Phase 4，本期还没做。
-        </p>
+        {commit.deliveredFrom && (
+          <div className="commit-detail-note">
+            录这条基线之前已交付的本地提交（它们的内容已在 SVN 历史里，图上不再单独画出）：
+            <ul className="commit-delivered">
+              {commit.deliveredFrom.map((d) => (
+                <li key={d.id}>
+                  <code>{d.id.slice(0, 7)}</code> {d.message}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {commit.diffBase ? (
+          <>
+            <p className="commit-detail-note">
+              相对 r{prevRev} 的变化，按本地两版基线算出，只含 git 管的文件（白名单里的
+              {' '}W-file）。
+            </p>
+            <div className="commit-split">
+              <Group orientation="horizontal">
+                <Panel defaultSize="30%" minSize="15%" maxSize="60%">
+                  <FileTree nodes={changesTree} selectedPath={activePath} onSelect={setPicked} />
+                </Panel>
+                <Separator className="separator-v" />
+                <Panel minSize="30%">
+                  <DiffView diff={activeDiff} showPath={false} />
+                </Panel>
+              </Group>
+            </div>
+          </>
+        ) : (
+          <p className="commit-detail-note">
+            这个 revision 的前一版没有本地基线（多半是同事的提交），文件差异要走一次网络请求
+            （<code>svn diff -c {commit.svnRev}</code>），属于 Phase 4，本期还没做。
+          </p>
+        )}
       </div>
     )
   }
