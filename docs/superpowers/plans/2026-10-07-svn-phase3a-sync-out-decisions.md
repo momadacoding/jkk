@@ -239,3 +239,13 @@
 - **真实窗口**：`phase1c_branches_25282` 重新截图，r3 → r2 → r1 同在 lane 0、同色；`grow` 从 r2 分出（`many files` 在它的线上），`feature`、`work` 从 r3 分出，`keep-a` 从 r1 分出。
 - **为什么这么改是安全的**：只改车道归属的起点顺序，不改节点、边与任何 git 数据；对非 SVN 图零影响（无 `svn:` 节点时走原逻辑，原有 owners / layout 测试全绿）。
 - **验证**：`pnpm build` 过；`pnpm test` 38 files / 543 tests。
+
+### Task 12 补充：git 与 svn 两条序列没按时间交错（用户反馈，计划外）
+
+- **起因**：同一个带分支的 fixture 上，`keep-a` 指着的 `class A`（06:26:30）排在 r3（06:35:30）、r2（06:30:47）上面。
+- **根因**：`spliceHistory` 输出是 `[...git, ...svn]`——所有 git 行在前、svn 行在后，从不交错。之前交付过的提交都被隐藏，图上只剩比基线新的本地提交，所以没暴露；有分支指着已交付提交时它就显示出来、排错位置。
+- **改法**：④ 之后用 `dateOrder` 合并，规则同 `git log --date-order`：子一定在父之上，在此前提下越新越靠上，时间相同保持输入顺序（git 在前）。不单纯按时间排：本地或服务器时钟一偏，子会落到父下面。
+- **为什么这么改是安全的**：只改行序，不改节点与边。纯 git 仓库不经过 `spliceHistory`（`merge` 首行直接返回），零影响；SVN 模式下 git 提交之间的相对顺序不变——`CommitNode.time` 是 libgit2 的 `commit.time()`（committer 时间），与后端 revwalk 的排序键一致。
+- **测试**：`svnGraph.test.ts` +2：fixture 的真实拓扑与时间（先 RED）；子的时钟比父还早时子仍在上（护栏，改前改后都应绿）。
+- **真实窗口**：行序 `grow / feature (23:10) → work (06:35:32) → r3 → many files → r2 → class A → r1`，时间单调递减，SVN 主线仍在 lane 0。
+- **验证**：`pnpm build` 过；`pnpm test` 38 files / 545 tests。

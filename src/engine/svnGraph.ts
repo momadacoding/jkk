@@ -150,7 +150,44 @@ export function spliceHistory(
 
   // ④ 剔除悬空 parent
   const known = new Set(all.map((c) => c.id))
-  return all.map((c) => ({ ...c, parents: c.parents.filter((p) => known.has(p)) }))
+  return dateOrder(all.map((c) => ({ ...c, parents: c.parents.filter((p) => known.has(p)) })))
+}
+
+/**
+ * 把 git、svn 两条各自有序的序列合成一条，规则同 `git log --date-order`：
+ * 子一定在父之上；在此前提下越新越靠上，时间相同按输入顺序。
+ *
+ * 不能直接 `[...git, ...svn]`：分支指着的已交付提交比后面几个 revision 都旧，
+ * 却会排到所有 svn 行上面，看起来像是最近才提交的（2026-10-11 真实窗口）。
+ * 也不能单纯按时间排：本地或服务器时钟一偏，子就落到父下面，线往上画。
+ *
+ * 就绪集合的大小是图在某一行的「宽度」（并行的线数），线性扫最大值足够。
+ */
+function dateOrder(nodes: CommitNode[]): CommitNode[] {
+  const index = new Map<string, number>()
+  nodes.forEach((c, i) => index.set(c.id, i))
+  /** 还没输出的子节点数；归零才轮得到这个节点。 */
+  const pending = new Array<number>(nodes.length).fill(0)
+  for (const c of nodes) for (const p of c.parents) pending[index.get(p)!]++
+
+  const ready: number[] = []
+  nodes.forEach((_, i) => { if (pending[i] === 0) ready.push(i) })
+  const newer = (a: number, b: number) =>
+    nodes[a].time !== nodes[b].time ? nodes[a].time > nodes[b].time : a < b
+
+  const out: CommitNode[] = []
+  while (ready.length > 0) {
+    let best = 0
+    for (let k = 1; k < ready.length; k++) if (newer(ready[k], ready[best])) best = k
+    const i = ready[best]
+    ready.splice(best, 1)
+    out.push(nodes[i])
+    for (const p of nodes[i].parents) {
+      const j = index.get(p)!
+      if (--pending[j] === 0) ready.push(j)
+    }
+  }
+  return out
 }
 
 /**

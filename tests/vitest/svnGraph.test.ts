@@ -123,6 +123,46 @@ describe('spliceHistory', () => {
     expect(out.map((c) => c.id)).toEqual(['aaa', 'svn:2', 'svn:1'])
   })
 
+  it('git 与 svn 两条序列按时间交错，子仍在父之上', () => {
+    // 2026-10-11 带分支的 fixture 实测：keep-a 指着已交付的 class A（06:26:30），它比 r2、r3
+    // 都旧，却被 `[...git, ...svn]` 排在所有 svn 行上面，看起来像是在 r3 之后才提交的。
+    const at = (hms: string) => Date.parse(`2026-10-11T${hms}Z`) / 1000
+    const svnAt = (rev: number, hms: string): SvnRevNode => ({
+      ...svn(rev),
+      date: `2026-10-11T${hms}Z`,
+    })
+    const out = spliceHistory(
+      [svnAt(3, '06:35:30'), svnAt(2, '06:30:47'), svnAt(1, '06:21:18')],
+      // 后端 --date-order 的真实顺序
+      [
+        git('grow', ['many'], { time: at('23:10:51') }),
+        git('feature', ['B3'], { time: at('23:10:51') }),
+        git('local', ['B3'], { time: at('06:35:32') }),
+        { ...baseline('B3', ['many'], 3), time: at('06:35:31') },
+        git('many', ['B2'], { time: at('06:35:29') }),
+        { ...baseline('B2', ['classA'], 2), time: at('06:30:48') },
+        git('classA', ['B1'], { time: at('06:26:30') }),
+        { ...baseline('B1', [], 1), time: at('06:21:19') },
+      ],
+      ['grow', 'feature', 'local', 'classA', 'B3'],
+    )
+    expect(out.map((c) => c.id)).toEqual([
+      'grow', 'feature', 'local', 'svn:3', 'many', 'svn:2', 'classA', 'svn:1',
+    ])
+  })
+
+  it('时间与拓扑冲突时拓扑优先：子提交的时钟比父还早也排在父上面', () => {
+    // 本地时钟偏慢、或 SVN 服务器时钟偏快都会出现；子在父下面线就得往上画
+    const out = spliceHistory(
+      [{ ...svn(2), date: '2026-10-11T08:00:00Z' }],
+      [
+        git('w', ['B2'], { time: Date.parse('2026-10-11T07:00:00Z') / 1000 }),
+        baseline('B2', [], 2),
+      ],
+    )
+    expect(out.map((c) => c.id)).toEqual(['w', 'svn:2'])
+  })
+
   it('两个 baseline 指向同一个 revision 时都被替换', () => {
     // 重建基线会在 svn/base 上落新 commit，旧的仍在历史里。
     const out = spliceHistory(
