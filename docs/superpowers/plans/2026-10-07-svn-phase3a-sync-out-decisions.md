@@ -18,7 +18,7 @@
 | 9 D6 / D7a 失败 | ✅ | `tests/svn_sync_out.rs`（+3） | `cargo test --test svn_sync_out` 39/39；全量绿 |
 | 10 Tauri 命令 | ✅ | `commands/svn_sync.rs`、`commands/svn.rs`、`lib.rs`、`tests/svn_backend.rs`、`tests/svn_write_guard.rs` | `svn_backend` 29/29、`svn_write_guard` 8/8、`commands_are_async` 1/1；全量绿。`pnpm tauri dev` 实跑在 Task 12 |
 | 11 前端纯逻辑与流程 | ✅ | `svnSyncOut.ts`、`svnSyncOutFlow.ts`、`svnJournal.ts`、`svnSync.ts`、`svnSyncIn.ts`（注释）、`toolbarActions.ts`、`repoStore.ts`；测试 `svnSyncOut` / `svnSyncOutFlow`（新）、`svnJournal` / `toolbarActions`（改） | `pnpm build` 过（tsc）；`pnpm test` 36 files / 516 tests 全绿 |
-| 12 前端接线 + 真实窗口冒烟 | ⏳ | | |
+| 12 前端接线 + 真实窗口冒烟 | ✅ | `DeliverDialog.tsx`（新）、`ConfirmDialog.tsx`（导出 `WarnGlyph`）、`Toolbar.tsx`、`BaselineBanner.tsx`、`RepoTab.tsx`、`styles.css`；测试 `DeliverDialog.test.tsx`、`BaselineBanner.test.tsx`（新） | `pnpm build` 过；`pnpm test` 38 files / 527 tests 全绿；`pnpm tauri dev` 真实窗口两次交付（快路径 r2、慢路径 r3）全部核对通过 |
 | 13 E2E 清单、spec 修订、收尾 | ⏳ | | |
 
 ## 决策条目
@@ -185,3 +185,27 @@
 - **计划的错误**：计划说 `svnJournal.test.ts` 只需改 `NOTE_SYNC_OUT` 那一条旧断言。实际还有一条——「认不出的 phase 也要有话说」拿 `sync_out` / `svn-staged` 当「认不出」，现在它认得了。改为两个方向各测一个真正认不出的组合（`sync_in` 记录里的 `svn-staged`、`sync_out` 记录里的 `stashed`），并断言不给按钮。原「本版本收不了尾」那条改写为「挂交付那一组按钮，绝不挂 sync_in 的」。
 - **计划没写的坑**：新 worktree 没有 `node_modules`，`pnpm test` 报 `vitest is not recognized`；`pnpm install --frozen-lockfile`（PowerShell，Bash 工具无网络）后正常，无新增依赖。
 - **为什么这么改是安全的**：纯前端展示与编排，不发任何新的写命令；四个 invoke 包装的参数名与 Task 10 的命令签名逐字对齐（`{ path }`、`{ path, expect }`，`expect` 字段由 `svn_backend` 的序列化用例钉住）。`describeUnfinishedSync` 先按 `flow` 分流，交付记录永远拿不到 `sync_in` 的按钮（后端也会以 `sync_out_not_supported` 拒绝）。真实窗口里 invoke 是否打通在 Task 12 验证。
+
+### Task 12
+
+- **偏离计划**：
+  - **横幅分发的位置（计划的错误，见下）**：交付按钮在**未收尾横幅**里分发，不在失同步横幅那串 `a.id === 'svnUpdate'` 里。`BaselineBanner` 加类型守卫 `isSyncOutAction`，未收尾横幅按 id 分流到 `onSyncOutAction` / `onSyncAction`。新增组件测试 `BaselineBanner.test.tsx`（3 条），前两条 RED（交付按钮被交给了 `onSyncAction`）→ GREEN。
+  - 对话框外观沿用 `ConfirmDialog` 的图标头部（红色警告图标，与删除类确认一致：提交不能撤回），正文与 `.dlg-warning` / `.dlg-progress` 一样缩进 54px；为此 `ConfirmDialog` 导出 `WarnGlyph`。计划的对话框没有头部图标，`.dlg-warning` 自带的 54px 缩进会与其余正文错位。
+  - 本地补丁说明用现成的 `.dlg-note`，勾选框用现成的 `.dlg-check`（`accent-color`），不新写 `.deliver-note`；输入框样式照 `.dialog input`；本地补丁列表也限高（120px）；整框 `max-height: 90vh` 可滚，矮窗口里按钮也够得到。
+  - `.deliver-dialog` 加 `color-scheme: dark`：真实窗口截图里清单的滚动条是系统默认的白色，在深色框里刺眼（与 `.dlg-check input` 注释里的同一类问题）。加上后经热更新复截，滚动条变深色。**全应用的滚动条都是浅色默认样式**（没有任何 `scrollbar` / `color-scheme` 规则），不在本期范围，列为后续项。
+  - 工具栏「更新」与「交付」互相禁用（`svnBusy`）；流程层共用同一个 `running` ref 已经拦住并发，这里让按钮状态看得出来。
+  - 组件测试比计划多一条：交付跑起来之后 Esc 与点遮罩都关不掉。
+  - `RepoTab` 里 `{deliverDialog}` 渲染在 `{confirmDialog}` 之前，交付结局的提示框（走 `confirm`）盖在上面。
+- **计划的错误**：计划 Step 4 让 `BaselineBanner` 在第 159 行附近（失同步横幅的 `svnUpdate` 分发串）加交付按钮的分发。但交付那一组按钮由 `describeUnfinishedSync` 产出，挂在**未收尾横幅**上；那里原本把所有按钮一律 `as SyncActionId` 交给 `onSyncAction`。照计划接线，「清理 / 继续交付 / 停止收尾」会走「更新」的继续 / 放弃，后端以 `sync_out_not_supported` 拒绝——按钮永远点不通。
+- **计划没写的坑**：
+  - 截图：`Graphics.CopyFromScreen` 截到的是盖在应用上的别的窗口（几乎全白）；改用 `PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT=2)`，WebView2 内容被遮挡也能完整画出。截图脚本只放会话 scratchpad，不进仓库。
+  - `pnpm tauri dev` 的进程名是 `app`，窗口会恢复上次打开的标签页（含真实仓库）。冒烟只在 fixture 的 wc1 标签页里操作。
+- **真实窗口冒烟（`scripts/e2e-svn-fixture.ps1` 造的 `phase1c_696a6c45`）**：
+  1. 初始化（白名单 `Code/`、扩展名 `.cs`）；改 `Code/A.cs` 提交；改 `Code/Deep/D.cs` 勾「仅本地，不交付」提交。
+  2. 「交付」：框列出「修改 1 · Code/A.cs」和 1 个本地补丁，「交付」按钮置灰；工具栏「更新」与「交付」都禁用。截图：默认窗口尺寸（2904×1572 物理像素）。头部 / 缩进 / 置灰都正常。
+  3. 写「修复跳跃」、Ctrl+Enter → 「已交付 r2」，正文说还有 1 个本地补丁、请保留分支，没有「可以删除」，也没有横幅。
+  4. 核对：`svn log --xml -v -r 2` 只有 `M /Code/A.cs`，`<msg>修复跳跃</msg>` 原样；服务器 `D.cs` 仍是 `class D {}`；磁盘 `D.cs` 仍带补丁；`work` = 本地补丁接在 `svn/base`（r2）上；`git status` 干净；没有 journal、交付 ref、提交信息临时文件。
+  5. 视觉证据：窗口缩到 800 宽，用 git 在 wc1 造一笔 25 个新文件（长文件名）的提交、叠在本地补丁之上。框内清单限高滚动，长路径没有撑出横向滚动，输入框和按钮都在视野内；滚动条问题见上，修后复截。写「批量新增」交付 → 「已交付 r3」：服务器 26 条路径（`A dir /Code/Many` + 25 个文件，新父目录进了 target），`D.cs` 未交付；`many files` 被重放成新 OID（`bc09ca5` → `b64ead0`，慢路径），本地补丁接回 r3 之上，工作区干净。
+  - 观察（非缺陷）：提交图上交付的那笔提交（`class A`）从 r1 分出、并回 r2——新基线的父提交是交付树（spec §8.2.2），图上能看出 r2 交付的是哪一笔。
+  - 四个新 invoke 里预览、执行两个已在真实窗口里打通；继续 / 放弃在 Task 13 的 E2E 场景里验证。
+- **为什么这么改是安全的**：组件只做渲染与事件绑定，不直接 `invoke`；交付执行期间 Esc / 遮罩 / Cancel 都关不掉对话框（组件测试钉着），避免用户以为取消了而 svn commit 已经发出；按钮分流有组件测试，交付记录永远到不了「更新」的命令。

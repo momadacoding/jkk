@@ -30,7 +30,8 @@ interface Pending extends ConfirmRequest {
   id: number
 }
 
-function WarnGlyph() {
+/** 弹框头部的警告图标。交付确认框（`DeliverDialog`）也用，两个框长得一样。 */
+export function WarnGlyph() {
   return (
     <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" strokeWidth="1.6">
       <path d="M12 4 2.5 20h19z" />

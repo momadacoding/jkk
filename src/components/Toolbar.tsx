@@ -2,7 +2,13 @@ import { useCallback, useEffect, useState } from 'react'
 import { askConfirm } from '../engine/confirm'
 import type { CommandContext } from '../engine/customCommands'
 import type { UpstreamInfo } from '../engine/types'
-import { planToolbarAction, showsSvnUpdate, visibleToolbarActions, type ToolbarAction } from '../engine/toolbarActions'
+import {
+  planToolbarAction,
+  showsSvnDeliver,
+  showsSvnUpdate,
+  visibleToolbarActions,
+  type ToolbarAction,
+} from '../engine/toolbarActions'
 import type { Capabilities } from '../engine/capabilities'
 import { CustomCommandBar } from './CustomCommandBar'
 
@@ -42,12 +48,25 @@ interface ToolbarProps {
   capabilities: Capabilities
   /** SVN 混合仓库的「更新」（sync_in）。预览、确认、执行都由 RepoTab 编排。 */
   onSvnUpdate?: () => Promise<void>
+  /** SVN 混合仓库的「交付」（sync_out）。同上，由 RepoTab 编排。 */
+  onSvnDeliver?: () => Promise<void>
 }
 
-export function Toolbar({ branch, upstream, onRun, commandContext, capabilities, onSvnUpdate }: ToolbarProps) {
+export function Toolbar({
+  branch,
+  upstream,
+  onRun,
+  commandContext,
+  capabilities,
+  onSvnUpdate,
+  onSvnDeliver,
+}: ToolbarProps) {
   const ctrl = useCtrlHeld()
   const [busy, setBusy] = useState<ToolbarAction | null>(null)
   const [updating, setUpdating] = useState(false)
+  const [delivering, setDelivering] = useState(false)
+  // 更新与交付同一时间只走一个（流程层的 running 也拦着，这里让按钮看得出来）
+  const svnBusy = updating || delivering
 
   const run = useCallback(async (action: ToolbarAction) => {
     const plan = planToolbarAction(action, ctrl, branch)
@@ -77,7 +96,7 @@ export function Toolbar({ branch, upstream, onRun, commandContext, capabilities,
       {showsSvnUpdate(capabilities) && onSvnUpdate && (
         <button
           className="toolbar-button"
-          disabled={busy !== null || updating}
+          disabled={busy !== null || svnBusy}
           onClick={() => {
             setUpdating(true)
             void onSvnUpdate().finally(() => setUpdating(false))
@@ -85,6 +104,19 @@ export function Toolbar({ branch, upstream, onRun, commandContext, capabilities,
           data-action="svn-update"
         >
           {updating ? '…' : '更新'}
+        </button>
+      )}
+      {showsSvnDeliver(capabilities) && onSvnDeliver && (
+        <button
+          className="toolbar-button"
+          disabled={busy !== null || svnBusy}
+          onClick={() => {
+            setDelivering(true)
+            void onSvnDeliver().finally(() => setDelivering(false))
+          }}
+          data-action="svn-deliver"
+        >
+          {delivering ? '…' : '交付'}
         </button>
       )}
       {visibleToolbarActions(capabilities).map((action) => {

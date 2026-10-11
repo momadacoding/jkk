@@ -20,6 +20,8 @@ import {
   svnMigrateEol,
 } from '../store/repoStore'
 import { createSvnSyncFlow } from './svnSyncFlow'
+import { createSvnSyncOutFlow } from './svnSyncOutFlow'
+import { useDeliverDialog } from './DeliverDialog'
 import SvnInitWizard from './SvnInitWizard'
 import BaselineBanner from './BaselineBanner'
 import { baselineMap } from '../engine/svnGraph'
@@ -131,8 +133,12 @@ export function RepoTab({
   const [selectedWorktree, setSelectedWorktree] = useState<string | null>(null)
   const { prompt, dialog: promptDialog } = usePrompt()
   const { confirm, dialog: confirmDialog } = useConfirm()
-  // 「更新」流程是否在走（svnSyncFlow）。hook 必须排在下面 loading 的提前 return 之前
+  const { deliver, dialog: deliverDialog } = useDeliverDialog()
+  // 「更新」或「交付」流程是否在走（svnSyncFlow / svnSyncOutFlow 共用一个：两个确认框会
+  // 互相顶替，PR #49 Codex review #5）。hook 必须排在下面 loading 的提前 return 之前
   const syncFlowRunning = useRef(false)
+  // 交付对话框的提交信息草稿：没交付成功时关掉框，下次打开还在（spec §13）
+  const deliverDraft = useRef('')
 
   useRepoEffects(
     state,
@@ -566,6 +572,21 @@ export function RepoTab({
     fetchSvnLog,
   })
 
+  // 「交付」与横幅上交付那一组按钮。`running` 与更新共用
+  const { handleSvnDeliver, handleSyncOutAction } = createSvnSyncOutFlow({
+    running: syncFlowRunning,
+    draft: deliverDraft,
+    repoPath,
+    syncState: () => state.svnSyncState,
+    deliver,
+    confirm,
+    clearError,
+    reportError,
+    refreshSvnSyncState,
+    refreshSvnSync,
+    fetchSvnLog,
+  })
+
   /**
    * 走一次行尾迁移：装规则 + 重录基线（spec §7.3.0）。
    *
@@ -663,6 +684,7 @@ export function RepoTab({
         onCheck={() => void handleCheckBaseline()}
         onMigrateEol={() => void handleMigrateEol()}
         onSyncAction={(id) => void handleSyncAction(id)}
+        onSyncOutAction={(id) => void handleSyncOutAction(id)}
         onSvnUpdate={() => void handleSvnUpdate()}
       />
       {state.error && (
@@ -678,6 +700,7 @@ export function RepoTab({
         commandContext={{ worktree: state.path, branch: state.head, headHash: state.headHash }}
         capabilities={state.capabilities}
         onSvnUpdate={handleSvnUpdate}
+        onSvnDeliver={handleSvnDeliver}
       />
       <div className="repo-path-bar" title={state.path ?? ''}>{state.path} @ {state.head}</div>
       <div style={{ flex: 1, overflow: 'hidden' }}>
@@ -805,6 +828,8 @@ export function RepoTab({
         </Group>
       </div>
       {promptDialog}
+      {deliverDialog}
+      {/* 排在交付框之后：交付结局的提示框（走 confirm）要盖在上面 */}
       {confirmDialog}
     </div>
   )
