@@ -249,3 +249,12 @@
 - **测试**：`svnGraph.test.ts` +2：fixture 的真实拓扑与时间（先 RED）；子的时钟比父还早时子仍在上（护栏，改前改后都应绿）。
 - **真实窗口**：行序 `grow / feature (23:10) → work (06:35:32) → r3 → many files → r2 → class A → r1`，时间单调递减，SVN 主线仍在 lane 0。
 - **验证**：`pnpm build` 过；`pnpm test` 38 files / 545 tests。
+
+### Task 12 补充：svn 节点画成菱形（用户提议，计划外）
+
+- **起因**：用户反馈 svn 节点与 git 提交都是实心圆，不好区分。选定方案 A（菱形）；备选圆角方块（小尺寸下与圆差别不明显）、空心圆（与合并提交的环冲突）、行内「SVN」角标（hash 列已显示 `rN`，冗余）未采用。
+- **改法**：`svgRenderer.renderNode` 对 `vcs === 'svn'` 画 `<polygon>` 菱形，车道色填充 + 白边，`<g>` 加 `svn` class；半对角线取圆半径的 1.3 倍（面积与圆点相当），HEAD 放大、HEAD / 选中描边加粗与圆点规则一致。不用颜色区分：颜色归车道。
+- **偏离 spec**：spec 没规定 svn 节点的样式，§10.4 只说渲染层认 `parents`；现在渲染层认 `vcs`，修订 spec 时补上。
+- **为什么这么改是安全的**：只改节点形状，不改布局、行序、边与数据；纯 git 仓库没有 `vcs === 'svn'` 的节点，零影响。
+- **测试**：新增 `svgRenderer.test.tsx`（jsdom）4 条：svn 菱形 / git 圆、菱形以车道中心对称、HEAD 放大加粗、选中加粗，先全部 RED。形状好不好认靠真实窗口截图（`phase1c_branches_25282`：r3 / r2 / r1 为蓝色菱形，本地提交仍是圆点，lane 0 的菱形左顶点没被裁）。
+- **验证**：`pnpm build` 过；`pnpm test` 39 files / 549 tests。

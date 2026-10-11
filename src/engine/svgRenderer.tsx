@@ -82,6 +82,19 @@ function renderNode(node: LayoutNode, layout: GraphLayout, refs: RefPointer[], s
   const r = isHead ? 6.5 : 5
   const strokeWidth = isHead || selected ? 2.5 : 1.5
 
+  // svn 节点画成菱形：服务器上的 revision 与本地提交能做的事不同（没有 checkout /
+  // cherry-pick，同事的 revision 还看不了文件变化），点之前就该分得出。不用颜色区分——
+  // 颜色归车道，表示「哪条线」。半对角线取圆半径的 1.3 倍，面积与圆点大致相当。
+  if (node.commit.vcs === 'svn') {
+    const d = r * 1.3
+    const points = `${cx},${cy - d} ${cx + d},${cy} ${cx},${cy + d} ${cx - d},${cy}`
+    return (
+      <g key={node.commit.id} className={`${className} svn`} data-id={node.commit.id}>
+        <polygon points={points} fill={color} stroke="#fff" strokeWidth={strokeWidth} strokeLinejoin="round" />
+      </g>
+    )
+  }
+
   return (
     <g key={node.commit.id} className={className} data-id={node.commit.id}>
       <circle cx={cx} cy={cy} r={r} fill={color} stroke="#fff" strokeWidth={strokeWidth} />
