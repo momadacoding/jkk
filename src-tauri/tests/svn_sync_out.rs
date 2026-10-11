@@ -1027,7 +1027,7 @@ fn a_d8d_conflict_is_continued_after_the_user_resolves_it() {
     make_d8d_clash(&fx);
     assert_eq!(
         continue_sync_out(&fx.wc_str()).unwrap_err().code,
-        "sync_in_unresolved",
+        "sync_out_unresolved", // review 第 6 条：不借用「更新」流程的码
         "没解决不能继续"
     );
     let resolved: String = (1..=30)
@@ -1300,4 +1300,271 @@ fn a_new_gitignore_from_the_server_stops_d7a_and_continue_picks_up_after_the_fix
         "4",
         "r2 是我们的，r3 / r4 是同事的，没有第二次交付"
     );
+}
+
+// —— Task 8–10 里程碑 review 的回归 ——
+
+/// 在 `step` 处模拟崩溃，崩溃前先在 D5 之后插一笔同事的提交（`Code/Col.cs`），
+/// 让 D6 有东西可拉、新基线与原分支不同。
+fn crash_after_colleague(fx: &SvnFixture, step: Step) {
+    let p = preview_sync_out(&fx.wc_str()).unwrap();
+    let e = expect_from(&p, "mine");
+    let wc = fx.wc_str();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_sync_out_probed(&wc, &e, &|s: Step, _: &str| {
+            if s == Step::Committed {
+                fx.colleague_commits("Code/Col.cs", "col\n");
+            }
+            if s == step {
+                panic!("模拟崩溃于 {s:?}");
+            }
+        })
+    }));
+    assert!(r.is_err(), "应在 {step:?} 崩溃");
+}
+
+fn deliver_ref_name(fx: &SvnFixture) -> String {
+    git(
+        fx,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/mygitclient/deliver/",
+        ],
+    )
+}
+
+#[test]
+fn resuming_after_the_user_left_the_deliver_tree_never_runs_svn_update() {
+    // review 第 1 条：D6 之前必须先确认 HEAD 还在交付树上，否则 svn update 会把同事的改动
+    // 合进一条本流程从没打算碰的分支
+    let fx = hybrid_with_colleague();
+    typical_work(&fx);
+    crash_after_colleague(&fx, Step::Committed);
+    assert_eq!(phase(&fx), Phase::PostCommit);
+    git(&fx, &["checkout", "-q", "work"]); // 用户在 IDE 里切回了分支
+
+    for (name, r) in [
+        ("继续", continue_sync_out(&fx.wc_str())),
+        ("放弃", abort_sync_out(&fx.wc_str())),
+    ] {
+        let err = r.unwrap_err();
+        assert_eq!(
+            err.code, "sync_out_state_changed",
+            "{name}：{}",
+            err.message
+        );
+        assert!(
+            !fx.wc().join("Code/Col.cs").exists(),
+            "{name}：不能先跑 svn update"
+        );
+        assert_eq!(phase(&fx), Phase::PostCommit, "{name}");
+    }
+
+    // 照报错说的切回交付树，就能接着走
+    git(&fx, &["checkout", "-q", "--detach", &deliver_ref_name(&fx)]);
+    let out = continue_sync_out(&fx.wc_str()).unwrap();
+    assert!(
+        matches!(out, SyncOutOutcome::Delivered { rev: 2, .. }),
+        "{out:?}"
+    );
+    assert!(fx.wc().join("Code/Col.cs").exists());
+    assert_eq!(
+        server_head(&fx),
+        "3",
+        "r2 是我的，r3 是同事的，没有第二次交付"
+    );
+    assert_settled(&fx);
+}
+
+#[test]
+fn a_commit_made_on_the_detached_deliver_tree_is_not_thrown_away_by_abort() {
+    // review 第 7 条：`checkout -f` 之前只看 W-file 的 svn 状态，看不见 detached 上的新提交
+    let fx = hybrid_with_colleague();
+    typical_work(&fx);
+    crash_at(&fx, Step::Committed);
+    write(&fx, "Code/A.cs", "a3\n");
+    git(&fx, &["commit", "-qam", "made while paused"]);
+    let mine = git(&fx, &["rev-parse", "HEAD"]);
+
+    let err = abort_sync_out(&fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "sync_out_state_changed", "{}", err.message);
+    assert_eq!(git(&fx, &["rev-parse", "HEAD"]), mine, "提交不能被切走");
+    assert_eq!(
+        std::fs::read_to_string(fx.wc().join("Code/A.cs")).unwrap(),
+        "a3\n"
+    );
+    assert_eq!(phase(&fx), Phase::PostCommit);
+}
+
+#[test]
+fn abandoning_on_the_original_branch_settles_checkout_residue() {
+    // review 第 2 条：D8d 切回原分支时 Unity 占着文件（退出 0、HEAD 已切、字节还是新基线的），
+    // 「放弃」不能把这种磁盘当作干净的报「已停止收尾」
+    let fx = hybrid_with_colleague();
+    typical_work(&fx);
+    write(&fx, "Code/A.cs", "a2 LOCAL\n");
+    git(&fx, &["commit", "-qam", "patch\n\nLocal-Only: true"]);
+    let head = git(&fx, &["rev-parse", "HEAD"]);
+    crash_after_colleague(&fx, Step::Published);
+    assert_eq!(phase(&fx), Phase::RestoringBranch);
+    // 模拟 A15 的残留：HEAD 已切到原分支，磁盘还是新基线的字节，该删的文件没删掉
+    git(&fx, &["checkout", "-q", "work"]);
+    write(&fx, "Code/Col.cs", "col\n");
+
+    // 不是任何基线里的字节：不知道是谁的，不覆盖
+    write(&fx, "Code/A.cs", "foreign\n");
+    let err = abort_sync_out(&fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "sync_out_unsafe_to_return", "{}", err.message);
+    assert!(err.message.contains("Code/A.cs"), "{}", err.message);
+    assert_eq!(
+        std::fs::read_to_string(fx.wc().join("Code/A.cs")).unwrap(),
+        "foreign\n"
+    );
+
+    write(&fx, "Code/A.cs", "a2\n");
+    assert_eq!(
+        abort_sync_out(&fx.wc_str()).unwrap(),
+        SyncOutOutcome::Abandoned { committed: true }
+    );
+    assert_eq!(git(&fx, &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        std::fs::read_to_string(fx.wc().join("Code/A.cs")).unwrap(),
+        "a2 LOCAL\n",
+        "本地补丁要回到磁盘上"
+    );
+    assert!(!fx.wc().join("Code/Col.cs").exists());
+    assert_eq!(git(&fx, &["status", "--porcelain"]), "");
+    assert!(svn_journal::read(&fx.wc_str()).unwrap().is_none());
+}
+
+#[test]
+fn continuing_after_the_user_switched_back_by_hand_does_not_move_the_branch_under_head() {
+    // review 第 3 条：HEAD 已在原分支上时，`update-ref` 会把当前分支挪到新基线、索引和磁盘
+    // 却留在旧内容上——git 看来就是「你撤掉了同事的改动」
+    let fx = hybrid_with_colleague();
+    typical_work(&fx);
+    crash_after_colleague(&fx, Step::Published);
+    assert_eq!(phase(&fx), Phase::RestoringBranch);
+    git(&fx, &["checkout", "-q", "work"]); // 磁盘回到交付前，Col.cs 被删掉
+
+    let out = continue_sync_out(&fx.wc_str()).unwrap();
+    assert!(
+        matches!(out, SyncOutOutcome::Delivered { rev: 2, .. }),
+        "{out:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.wc().join("Code/Col.cs")).unwrap(),
+        "col\n"
+    );
+    assert_settled(&fx);
+    assert_eq!(
+        git(&fx, &["rev-parse", "work"]),
+        git(&fx, &["rev-parse", "svn/base"])
+    );
+}
+
+#[test]
+fn someone_elses_rebase_after_the_commit_is_named_not_reported_as_corruption() {
+    // review 第 5 条：post-commit 还没有 newBaselineOid，拿它去认 rebase 会报成 journal 损坏
+    let fx = hybrid_with_colleague();
+    typical_work(&fx);
+    crash_at(&fx, Step::Committed);
+    git(&fx, &["checkout", "-q", "-b", "side", "svn/base"]);
+    write(&fx, "Code/A.cs", "side\n");
+    git(&fx, &["commit", "-qam", "side"]);
+    git(&fx, &["checkout", "-q", "work"]);
+    assert!(
+        run_git(&fx.wc_str(), &["rebase", "side"]).is_err(),
+        "要造出一个停在冲突上的 rebase"
+    );
+
+    for (name, r) in [
+        ("继续", continue_sync_out(&fx.wc_str())),
+        ("放弃", abort_sync_out(&fx.wc_str())),
+    ] {
+        let err = r.unwrap_err();
+        assert_eq!(
+            err.code, "sync_out_state_changed",
+            "{name}：{}",
+            err.message
+        );
+        assert!(err.message.contains("rebase"), "{name}：{}", err.message);
+    }
+    assert!(
+        fx.wc().join(".git/rebase-merge").exists(),
+        "别人的 rebase 不碰"
+    );
+    assert_eq!(phase(&fx), Phase::PostCommit);
+}
+
+#[test]
+fn abandoning_offline_says_it_needs_the_network_too() {
+    // review 第 4 条：放弃也要先 D6（否则留下 mixed-revision，之后的「更新」会把同事的改动
+    // 当成你的 WIP）。离线时它会失败，报错不能只叫人去点「继续」
+    let fx = hybrid_with_colleague();
+    typical_work(&fx);
+    crash_at(&fx, Step::Committed);
+    let away = fx.path().join("repo-away");
+    std::fs::rename(fx.repo(), &away).unwrap();
+    let err = abort_sync_out(&fx.wc_str()).unwrap_err();
+    std::fs::rename(&away, fx.repo()).unwrap();
+    assert_eq!(err.code, "sync_out_update_failed", "{}", err.message);
+    assert!(err.message.contains("停止收尾"), "{}", err.message);
+    assert!(err.message.contains("mixed-revision"), "{}", err.message);
+    assert_eq!(phase(&fx), Phase::PostCommit);
+
+    assert_eq!(
+        abort_sync_out(&fx.wc_str()).unwrap(),
+        SyncOutOutcome::Abandoned { committed: true }
+    );
+}
+
+#[test]
+fn a_crash_before_the_new_baseline_commit_is_recaptured_on_continue() {
+    // review 第 10 条：`publishing-baseline` 但还没有 newBaselineOid = commit 没建，从 D7 重录
+    let fx = hybrid_with_colleague();
+    typical_work(&fx);
+    crash_at(&fx, Step::Captured);
+    let mut j = svn_journal::read(&fx.wc_str()).unwrap().unwrap();
+    assert_eq!(j.phase, Phase::PublishingBaseline);
+    j.new_baseline_oid = None;
+    svn_journal::write(&fx.wc_str(), &j).unwrap();
+    let old_base = git(&fx, &["rev-parse", "svn/base"]);
+
+    let out = continue_sync_out(&fx.wc_str()).unwrap();
+    assert!(
+        matches!(out, SyncOutOutcome::Delivered { rev: 2, .. }),
+        "{out:?}"
+    );
+    assert_ne!(git(&fx, &["rev-parse", "svn/base"]), old_base);
+    assert!(git(&fx, &["log", "-1", "--format=%B", "svn/base"]).contains("@2 "));
+    assert_eq!(server_head(&fx), "2");
+    assert_settled(&fx);
+}
+
+#[test]
+fn an_unknown_phase_in_a_delivery_journal_is_not_blamed_on_update() {
+    // review 第 10 条：交付记录里的 phase 认不出，不能说成「更新」流程留下的
+    let fx = hybrid_with_colleague();
+    svn_journal::write(
+        &fx.wc_str(),
+        &app_lib::engine::svn_journal::Journal {
+            opid: "out".into(),
+            flow: app_lib::engine::svn_journal::Flow::SyncOut,
+            phase: Phase::Rebase,
+            started_at: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for r in [
+        continue_sync_out(&fx.wc_str()),
+        abort_sync_out(&fx.wc_str()),
+    ] {
+        let err = r.unwrap_err();
+        assert_eq!(err.code, "sync_out_unknown_phase", "{}", err.message);
+        assert!(err.message.contains("rebase"), "{}", err.message);
+        assert!(!err.message.contains("「更新」流程"), "{}", err.message);
+    }
 }

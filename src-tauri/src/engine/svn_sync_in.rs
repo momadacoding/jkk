@@ -1002,20 +1002,32 @@ fn settle_checkout_residue(repo: &str, cfg: &SvnConfig, j: &Journal, orig: &str)
     if let Some(old) = &j.baseline_oid_before {
         bases.push(old.clone());
     }
+    settle_residue(repo, cfg, &bases, orig, "sync_in_unsafe_to_return")
+}
+
+/// [`settle_checkout_residue`] 的核心，`sync_out` 的「停止收尾」也用（Task 8–10 里程碑
+/// review 第 2 条）：差异全是 `bases` 里原样存着的字节才写回，否则指名停下。
+pub(crate) fn settle_residue(
+    repo: &str,
+    cfg: &SvnConfig,
+    bases: &[String],
+    orig: &str,
+    unsafe_code: &str,
+) -> Result<()> {
     let stale = tracked_changes(repo, cfg)?;
-    let left = untracked_leftovers(repo, cfg, &bases)?;
+    let left = untracked_leftovers(repo, cfg, bases)?;
     if stale.is_empty() && left.is_empty() {
         return Ok(());
     }
     let mut foreign = Vec::new();
     for p in stale.iter().chain(&left) {
-        if !is_baseline_bytes(repo, &bases, p)? {
+        if !is_baseline_bytes(repo, bases, p)? {
             foreign.push(p.clone());
         }
     }
     if !foreign.is_empty() {
         return Err(GitError::new(
-            "sync_in_unsafe_to_return",
+            unsafe_code,
             format!(
                 "分支 `{orig}` 上下面这些文件的内容既不是分支里的、也不是基线里的——\
                  不知道是谁改的，不能覆盖：\n{}\n记录已保留。请先确认这些改动\
@@ -1035,7 +1047,7 @@ fn settle_checkout_residue(repo: &str, cfg: &SvnConfig, j: &Journal, orig: &str)
         let _ = std::fs::remove_file(Path::new(repo).join(p));
     }
     let mut remaining = tracked_changes(repo, cfg)?;
-    remaining.extend(untracked_leftovers(repo, cfg, &bases)?);
+    remaining.extend(untracked_leftovers(repo, cfg, bases)?);
     if !remaining.is_empty() {
         let root = Path::new(repo);
         return Err(GitError::new(
@@ -1199,16 +1211,23 @@ fn published_baseline(repo: &str, j: &Journal) -> Result<String> {
 /// 起点（S9 时 HEAD 就是 `origHead`）、目标（`svn/base`）。2026-09-26 实测
 /// `rebase-merge/` 下的 `orig-head` 与 `onto` 就是这两个完整 OID。
 pub(crate) fn require_our_rebase(repo: &str, j: &Journal) -> Result<()> {
-    let want_head = format!("refs/heads/{}", need(&j.orig_branch, "origBranch")?);
-    let want_orig = need(&j.orig_head, "origHead")?;
-    let want_onto = published_baseline(repo, j)?;
-    if rebase_state(repo, "head-name")?.as_deref() != Some(want_head.as_str())
-        || rebase_state(repo, "orig-head")?.as_deref() != Some(want_orig.as_str())
-        || rebase_state(repo, "onto")?.as_deref() != Some(want_onto.as_str())
-    {
+    let onto = published_baseline(repo, j)?;
+    if !is_our_rebase(repo, j, &onto)? {
         return Err(state_changed("进行中的 rebase 不是本次同步发起的那一个"));
     }
     Ok(())
+}
+
+/// [`require_our_rebase`] 的判定部分。`sync_out` 用自己的基线核对与报错码调它
+/// （Task 8–10 里程碑 review 第 5 / 6 条）。
+pub(crate) fn is_our_rebase(repo: &str, j: &Journal, onto: &str) -> Result<bool> {
+    let want_head = format!("refs/heads/{}", need(&j.orig_branch, "origBranch")?);
+    let want_orig = need(&j.orig_head, "origHead")?;
+    Ok(
+        rebase_state(repo, "head-name")?.as_deref() == Some(want_head.as_str())
+            && rebase_state(repo, "orig-head")?.as_deref() == Some(want_orig.as_str())
+            && rebase_state(repo, "onto")?.as_deref() == Some(onto),
+    )
 }
 
 /// `.git/rebase-merge/<name>`（或 `rebase-apply/`）的内容。

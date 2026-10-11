@@ -149,5 +149,28 @@
   - 新增 `a_temp_worktree_named_in_a_foreign_journal_is_left_alone`：里程碑 review 第 9 条（删掉 `worktree remove --force`）的回归测试，`abort_sync_out` 是第一个能从 journal 走到收尾的公开入口。**这条测试写在修复之后，没有看到 RED**——当时没有公开入口能构造该场景；它守的是「以后别把这一步加回来」。
 - **实施结果**：照计划代码落地。B4：`committing` 时继续 / 放弃都报 `sync_out_commit_unknown`，journal 原样。B7：`post-commit` 放弃先跑 D6 拉齐（实测 M2-E6：只提交不更新是 mixed-revision，「更新」与「重建基线」都不接），之后 `check_sync` 判为 `Diverged { node_rev: 2, baseline_rev: 1 }`，「更新」的 A16 接管后分支回到新基线——`abandoning_after_the_commit…` 全程钉住。Windows 占用文件用例（share=Read）在本机按计划预期报 `sync_in_checkout_failed` 并指名 `Code/A.cs`，放开后收尾干净。
 - **计划的错误**：无（`rev` 期望值随里程碑 review 修正，见上）。
-- **计划没写的坑 / 覆盖缺口**：`publishing-baseline` 但还没有 `newBaselineOid`（崩在写 `captureTree` 之后、建 commit 之前）走「从 D7 重录」分支，没有对应 Step，未覆盖。
+- **计划没写的坑 / 覆盖缺口**：`publishing-baseline` 但还没有 `newBaselineOid`（崩在写 `captureTree` 之后、建 commit 之前）走「从 D7 重录」分支，没有对应 Step，未覆盖。（里程碑 review 第 10 条补上，见下。）
+
+### 里程碑 review（Task 8–10，`/code-review high`，范围 `2bc16f9..958c527`）
+
+10 条发现，逐条对着代码核实过：
+
+| # | 发现 | 定级 | 处理 |
+|---|---|---|---|
+| 1 | 继续 / 放弃 `post-commit` 时 D6（svn update）先于「HEAD 还在交付树上」的检查——用户中断期间切回了分支，svn update 会把同事的改动合进那条分支，之后才在 `capture_delivered` 报错 | 高 | **已修**：`require_left_in_place` 在 D6 之前断言 HEAD 在交付树（detached）上，`publishing-baseline` 还接受「在新基线分支、HEAD = newBaselineOid」。报错指引 `git checkout --detach <deliverRef>`。`resuming_after_the_user_left_the_deliver_tree_never_runs_svn_update` RED → GREEN（并验证照指引切回后能续完） |
+| 7 | 放弃时 `checkout -f <orig>` 之前只看 W-file 的 svn 状态，中断期间在 detached HEAD 上做的提交会被切丢 | 高 | **已修**：`-f` 之前同样走 `require_left_in_place`。`a_commit_made_on_the_detached_deliver_tree_is_not_thrown_away_by_abort` RED（原先报 `sync_out_unsafe_to_return` 是碰巧，因为 A.cs 在 svn 看来改了）→ GREEN。**范围说明**：用户用 `git add -f` 强行跟踪的白名单内非 W-file、被暂存后又在磁盘还原的改动，仍不在检查范围内——git 在本模型里只跟踪 W-file，这两种都需要用户刻意绕开排除规则 |
+| 3 | `restoring-branch` 无本地补丁、HEAD 已被用户切回原分支（仍是 `origHead`）时，`restore_branch` 对**当前**分支 `update-ref`，索引和磁盘留在旧内容，结局报成功——git 看来是「撤掉了同事的改动」 | 高 | **已修**：这种情况先要求原分支上没有被跟踪的改动，再 `checkout_verified` 回基线分支（磁盘写成新基线），然后走原来的 update-ref + 切回。`continuing_after_the_user_switched_back_by_hand_does_not_move_the_branch_under_head` RED（`Code/Col.cs` 不在磁盘上）→ GREEN |
+| 2 | 放弃时 HEAD 已在原分支上（D8d 那次 checkout 退出 0 却没写干净，或刚 `rebase --abort`）就跳过残留核对，报「已停止收尾」，磁盘上是撤掉了本地补丁的内容 | 重要 | **已修**：把 `sync_in` 的 `settle_checkout_residue` 核心抽成 `settle_residue(repo, cfg, bases, orig, unsafe_code)`，两边共用（`sync_in` 行为、码、文案不变）。交付侧 bases = 新基线（若有）+ 交付树；不是任何 base 里的字节就 `sync_out_unsafe_to_return`、不覆盖。`abandoning_on_the_original_branch_settles_checkout_residue` RED → GREEN（同时钉住 foreign 字节不被覆盖） |
+| 5 | `post-commit` 时有别人的 rebase 进行中，`require_our_rebase` 拿还没有的 `newBaselineOid` 去认，报成 `svn_journal_corrupt` | 重要 | **已修**：`check_rebase`——D8d 只发生在 `restoring-branch`，更早的 phase 里出现的 rebase 一律「不是本次交付发起的」（`sync_out_state_changed`），且判定先于 D6。`sync_in` 抽出 `is_our_rebase(repo, j, onto)` 供交付侧用自己的基线核对调用。`someone_elses_rebase_after_the_commit_is_named_not_reported_as_corruption` RED → GREEN |
+| 6 | 交付的继续路径借用了 `sync_in` 的报错码与文案（`sync_in_unresolved`、`sync_in_state_changed`「记录与 stash 原样保留」） | 重要（Task 11 会按码分流） | **已修**：交付侧自带 `unresolved`（`sync_out_unresolved`）、`is_ancestor`（`sync_out_state_changed`），rebase 认领见第 5 条。`a_d8d_conflict_is_continued…` 的断言由 `sync_in_unresolved` 改为 `sync_out_unresolved`。**未改**：`checkout_failed` 仍是 `sync_in_checkout_failed`（Task 8 起就由 `a_file_held_open_at_checkout…` 钉着，文案不提 stash，与流程无关），Task 11 前端把它当通用码处理 |
+| 4 | 离线时「放弃」也失败（要先 D6），报错还叫人去点「继续」 | 次要（文案） | **语义不改，文案已改**。理由：不拉齐白名单就切回分支，工作副本停在 mixed-revision；之后无论用户在 TortoiseSVN 手工 update 还是走「更新」接管，同事的改动都会被当成用户的 WIP——比「离线时只能等」更糟。`update_whitelist` 加 `Then::{Continue, Stop}`，放弃时报错说明为什么也要联网、网络恢复后点「继续交付」或「停止收尾」都行。`abandoning_offline_says_it_needs_the_network_too` RED → GREEN |
+| 10 | 交付记录里出现认不出的 phase 时报「这条记录是『更新』流程留下的」；`publishing-baseline` 无 `newBaselineOid` 的重录分支无测试 | 次要 | **已修**：新码 `sync_out_unknown_phase`，文案带 phase 线序名。`an_unknown_phase_in_a_delivery_journal_is_not_blamed_on_update` RED → GREEN。补 `a_crash_before_the_new_baseline_commit_is_recaptured_on_continue`（**直接 GREEN**：覆盖缺口，不是缺陷）。报错里提到的「清理」按钮由 Task 11 的横幅提供，不改 |
+| 8 | `take_over`、A5 回原分支、rebase 的 `-c` 参数在两个流程里重复 | 次要，推迟 | 本轮只抽了与修复直接相关的两处（`settle_residue`、`is_our_rebase`）。注意 `sync_in::take_over` 没有交付侧那次 opid 复核——是 2c 的既有行为，不在本 PR 范围 |
+| 9 | Task 10 注册了命令却没跑 `pnpm tauri dev` | 已知推迟 | 计划本来就把实跑放在 Task 12（那时前端才有入口），Task 12 必做 |
+
+**给 Task 11 的输入**（前端按这些码与按钮名写）：`sync_out_unresolved`、`sync_out_unknown_phase` 是新码；后端文案引用的按钮名是「继续」「清理」「继续交付」「停止收尾」，前端标签要与之一致。
+
+**为什么这么改是安全的**：所有新检查都只会让原来「继续走下去」的路径**提前停下**、journal 原样保留（每条回归测试都断言 phase 不变）；唯一新增的写操作是第 3 条的 `checkout_verified(svn/base)`，它不带 `-f`，前置条件是原分支上没有被跟踪的改动，事后核对切干净，否则报 `checkout_failed`、记录保留。`settle_residue` 只写回 `bases` 里原样存着的字节（逐文件 `hash-object --path` 比对），空列表不发 pathspec。
+
+验证：`cargo fmt --check` ok、`cargo clippy --all-targets` 无告警、`cargo test` 全绿（`svn_sync_out` 47/47，含新增 8 条）。
 - **为什么这么改是安全的**：两个入口都先拿锁再在锁内重读 journal，opid 或 flow 变了就停；只接 `flow = sync_out`，否则 `sync_out_wrong_flow`；`sync_in` 的继续 / 放弃照旧拒绝交付 journal（码不变，文案改为指向交付横幅）。D5 之后不重复提交（`every_crash_after_the_commit…` 断言服务器始终只有 r2）；放弃只在 W-file 全部 svn 干净时才 `checkout -f` 回原分支，否则 `sync_out_unsafe_to_return` 保留现场；rebase 只 abort / continue 本次发起的那一个（`require_our_rebase` 核对 head-name / orig-head / onto）。

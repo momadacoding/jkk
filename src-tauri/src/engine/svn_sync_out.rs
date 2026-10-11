@@ -31,8 +31,8 @@ use crate::engine::svn_sync_check::{
     assert_linear, current_branch, list_paths, rev_parse, unfinished_error, unmerged_paths,
 };
 use crate::engine::svn_sync_in::{
-    checkout_failed, checkout_verified, dirty_w_files, is_ancestor, is_baseline_bytes, need,
-    new_opid, no_unfinished, rebase_in_progress, require_our_rebase, tracked_changes, unresolved,
+    checkout_failed, checkout_verified, dirty_w_files, is_baseline_bytes, is_our_rebase, need,
+    new_opid, no_unfinished, rebase_in_progress, settle_residue, tracked_changes,
     untracked_leftovers,
 };
 use crate::engine::svn_sync_out_check::{check_sync_out, git_dirty, DeliverChange, SyncOutPreview};
@@ -273,14 +273,14 @@ pub fn run_sync_out_probed(
     after_commit(repo, &cfg, &mut j, probe)
 }
 
-/// D6–D10。继续 `post-commit` 时也从这里进（Task 8）。
+/// D6–D10。继续 `post-commit` 时也从这里进（Task 8）——那时调用方先确认过 HEAD 还在交付树上。
 pub(crate) fn after_commit(
     repo: &str,
     cfg: &SvnConfig,
     j: &mut Journal,
     probe: &dyn Probe,
 ) -> Result<SyncOutOutcome> {
-    update_whitelist(repo, cfg, j)?; // D6
+    update_whitelist(repo, cfg, j, Then::Continue)?; // D6
     probe.at(Step::Updated, repo);
     capture_delivered(repo, cfg, j)?; // D7、D7a、D8a
     probe.at(Step::Captured, repo);
@@ -460,8 +460,20 @@ fn commit_unknown(j: &Journal, stderr: &str) -> GitError {
     )
 }
 
+/// D6 是替谁跑的：报错里告诉用户之后点哪个按钮。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Then {
+    Continue,
+    Stop,
+}
+
+/// 「停止收尾」为什么也要先 D6（Task 8–10 里程碑 review 第 4 条）。
+const STOP_NEEDS_UPDATE: &str =
+    "「停止收尾」也要先把白名单更新到最新：不更新就切回分支，工作副本会停在 \
+     mixed-revision，之后的「更新」会把同事的改动当成你的未提交改动。";
+
 /// D6（spec §8.2.1）：只更新白名单路径。冲突只看白名单 target 之内。
-fn update_whitelist(repo: &str, cfg: &SvnConfig, j: &Journal) -> Result<()> {
+fn update_whitelist(repo: &str, cfg: &SvnConfig, j: &Journal, then: Then) -> Result<()> {
     let targets = svn_targets(repo, &cfg.whitelist)?;
     let pegged: Vec<String> = targets.iter().map(|t| peg_safe(t)).collect();
     let mut args: Vec<&str> = vec!["update", "--accept", "postpone", "--non-interactive", "--"];
@@ -469,11 +481,17 @@ fn update_whitelist(repo: &str, cfg: &SvnConfig, j: &Journal) -> Result<()> {
     let committed = committed_text(j);
     let up = run_svn_code(repo, &args)?;
     if up.code != 0 {
+        let retry = match then {
+            Then::Continue => "网络恢复后在顶部横幅上点「继续」，不会重复提交。".to_string(),
+            Then::Stop => format!(
+                "{STOP_NEEDS_UPDATE}网络恢复后再点「继续交付」或「停止收尾」都可以，不会重复提交。"
+            ),
+        };
         return Err(GitError::new(
             "sync_out_update_failed",
             format!(
                 "{committed}，但把白名单更新到最新时失败了（常见原因：VPN 断了）。基线还没推进，\
-                 记录已保留；网络恢复后在顶部横幅上点「继续」，不会重复提交。svn 原话：{}",
+                 记录已保留。{retry}svn 原话：{}",
                 up.stderr.trim()
             ),
         ));
@@ -491,12 +509,16 @@ fn update_whitelist(repo: &str, cfg: &SvnConfig, j: &Journal) -> Result<()> {
         );
     }
     if !conflicts.is_empty() {
+        let button = match then {
+            Then::Continue => "继续",
+            Then::Stop => "停止收尾",
+        };
         return Err(GitError::new(
             "sync_out_update_conflict",
             format!(
                 "{committed}，但更新白名单时有冲突：\n{}\n这些是 git 管不到的文件（被扩展名排除的，\
                  或目录级的树冲突），本应用没法替你解决。请用 TortoiseSVN 处理（Resolve），\
-                 然后在顶部横幅上点「继续」。基线还没推进，不会重复提交。",
+                 然后在顶部横幅上点「{button}」。基线还没推进，不会重复提交。",
                 list_paths(&conflicts)
             ),
         ));
@@ -597,6 +619,18 @@ pub(crate) fn restore_branch(
         // 计划 B10：快进 = 直接把分支指针移到新基线（CAS），再从基线切过去——两者是同一个
         // commit，git 不写任何文件。spec 字面的 checkout + merge --ff-only 会多两次全量重编译
         let tip = rev_parse(repo, &orig_ref)?;
+        if tip == orig_head && current_branch(repo)?.as_deref() == Some(orig.as_str()) {
+            // 中断期间用户手工切回了原分支（Task 8–10 里程碑 review 第 3 条）。下面的
+            // update-ref 会把**当前**分支挪走、索引和磁盘却留在旧内容上——git 看来就是撤掉了
+            // 同事的改动。先回到基线分支（verified），磁盘随之写成新基线，再走原路
+            if !tracked_changes(repo, cfg)?.is_empty() {
+                return Err(state_changed(&format!(
+                    "提交已在服务器上（r{rev}），基线已推进，但分支 `{orig}` 已被切回、而且有未提交的\
+                     改动。先提交或撤掉它们再点「继续」"
+                )));
+            }
+            checkout_verified(repo, cfg, BASELINE_BRANCH, false)?;
+        }
         if tip == orig_head {
             let (code, _) = run_git_code(repo, &["merge-base", "--is-ancestor", &orig_head, &new])?;
             if code != 0 {
@@ -900,8 +934,15 @@ pub fn continue_sync_out(repo: &str) -> Result<SyncOutOutcome> {
         | Phase::CheckedOut
         | Phase::SvnStaged => abandon_before_commit(repo, &cfg, j),
         Phase::Committing => Err(commit_unknown(j, "（上一次在提交途中中断）")),
-        Phase::PostCommit => after_commit(repo, &cfg, j, &|_: Step, _: &str| {}),
+        Phase::PostCommit => {
+            // D6 之前：HEAD 必须还在交付树上（里程碑 review 第 1 条）
+            check_rebase(repo, j)?;
+            require_left_in_place(repo, j)?;
+            after_commit(repo, &cfg, j, &|_: Step, _: &str| {})
+        }
         Phase::PublishingBaseline => {
+            check_rebase(repo, j)?;
+            require_left_in_place(repo, j)?;
             if j.new_baseline_oid.is_none() {
                 // 没有新 OID = commit 还没建：从 D7 重录（§7.6）
                 capture_delivered(repo, &cfg, j)?;
@@ -910,7 +951,7 @@ pub fn continue_sync_out(repo: &str) -> Result<SyncOutOutcome> {
             restore_branch(repo, &cfg, j)
         }
         Phase::RestoringBranch => continue_restoring(repo, &cfg, j),
-        _ => Err(wrong_flow()),
+        p => Err(unknown_phase(p)),
     }
 }
 
@@ -929,7 +970,7 @@ pub fn abort_sync_out(repo: &str) -> Result<SyncOutOutcome> {
         Phase::PostCommit | Phase::PublishingBaseline | Phase::RestoringBranch => {
             stop_after_commit(repo, &cfg, j)
         }
-        _ => Err(wrong_flow()),
+        p => Err(unknown_phase(p)),
     }
 }
 
@@ -960,17 +1001,29 @@ fn abandon_before_commit(repo: &str, cfg: &SvnConfig, j: &Journal) -> Result<Syn
 /// 计划 B7：提交已在服务器上，放弃 = 不再替用户做后面的事。
 fn stop_after_commit(repo: &str, cfg: &SvnConfig, j: &Journal) -> Result<SyncOutOutcome> {
     let orig = need(&j.orig_branch, "origBranch")?;
-    if j.phase == Phase::PostCommit {
-        // 只提交、没更新的工作副本是 mixed-revision（实测 M2-E6），「更新」与「重建基线」都不接。
-        // 先把白名单拉齐，留下一个「整体前进」的状态，让「更新」能接管（2c 的 A16）
-        update_whitelist(repo, cfg, j)?;
-    }
-    if rebase_in_progress(repo)? {
-        // A14：冲突期间锁是放开的，不是我们发起的 rebase 不碰
-        require_our_rebase(repo, j)?;
+    // A14：冲突期间锁是放开的，不是我们发起的 rebase 不碰。先于 D6 判：别人的 rebase
+    // 进行中时 HEAD 也不在交付树上，svn update 不能跑
+    if check_rebase(repo, j)? {
         run_git(repo, &["rebase", "--abort"])?;
     }
-    if current_branch(repo)?.as_deref() != Some(orig.as_str()) {
+    if j.phase == Phase::PostCommit {
+        // 只提交、没更新的工作副本是 mixed-revision（实测 M2-E6），「更新」与「重建基线」都不接。
+        // 先把白名单拉齐，留下一个「整体前进」的状态，让「更新」能接管（2c 的 A16）。
+        // D6 之前 HEAD 必须还在交付树上（里程碑 review 第 1 条）
+        require_left_in_place(repo, j)?;
+        update_whitelist(repo, cfg, j, Then::Stop)?;
+    }
+    if current_branch(repo)?.as_deref() == Some(orig.as_str()) {
+        // D8d 切回原分支那次 checkout、或刚才的 rebase --abort 可能退出 0 却没写干净
+        // （2c 的 A15；里程碑 review 第 2 条）。不核对就报「已停止收尾」，磁盘上会是
+        // 撤掉了本地补丁的内容
+        let mut bases: Vec<String> = j.new_baseline_oid.iter().cloned().collect();
+        bases.push(need(&j.deliver_oid, "deliverOid")?);
+        settle_residue(repo, cfg, &bases, &orig, "sync_out_unsafe_to_return")?;
+    } else {
+        // `-f` 会把 HEAD 从这里切走：中断期间在 detached HEAD 上做的提交、切去的别的分支，
+        // 都不在下面 W-file 的检查范围里（里程碑 review 第 7 条）
+        require_left_in_place(repo, j)?;
         // 能 -f 的前提：W-file 在 svn 看来全部干净 = 磁盘就是服务器内容，能取回（2c 的 A5）
         let dirty = dirty_w_files(repo, cfg)?;
         if !dirty.is_empty() {
@@ -1000,8 +1053,7 @@ fn continue_restoring(repo: &str, cfg: &SvnConfig, j: &mut Journal) -> Result<Sy
     let orig_head = need(&j.orig_head, "origHead")?;
     let new = published(repo, j)?;
     let rev = delivered_rev(repo, j, &new)?;
-    if rebase_in_progress(repo)? {
-        require_our_rebase(repo, j)?;
+    if check_rebase(repo, j)? {
         let files = unmerged_paths(repo)?;
         if !files.is_empty() {
             return Err(unresolved(&files));
@@ -1026,7 +1078,7 @@ fn continue_restoring(repo: &str, cfg: &SvnConfig, j: &mut Journal) -> Result<Sy
     let on_orig = current_branch(repo)?.as_deref() == Some(orig.as_str());
     if on_orig && rev_parse(repo, "HEAD")? != orig_head {
         // D8d 已经做完（快进或 rebase 走完了），只差 D10
-        if !is_ancestor(repo, &new, "HEAD")? {
+        if !is_ancestor(repo, &new)? {
             return Err(state_changed(
                 "原分支还没有落到新基线上（rebase 可能在外面被中止了）；要停在这里，请点「放弃」",
             ));
@@ -1041,4 +1093,88 @@ fn wrong_flow() -> GitError {
         "sync_out_wrong_flow",
         "这条记录是「更新」流程留下的，请用横幅上更新那一组按钮处理。",
     )
+}
+
+/// 交付记录里出现了交付流程不会写的 phase（手改、或别的版本写的记录）。
+fn unknown_phase(p: Phase) -> GitError {
+    let name = serde_json::to_value(p)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{p:?}"));
+    GitError::new(
+        "sync_out_unknown_phase",
+        format!(
+            "交付记录停在「{name}」这一步，这个版本认不出它（多半是别的版本写的记录）。\
+             这里什么都不动，记录已保留；请不要手工去动分支指针。"
+        ),
+    )
+}
+
+/// 有没有进行中的 rebase；有的话它必须是本次 D8d 发起的那一个（A14），返回 `true`。
+///
+/// D8d 只发生在 `restoring-branch`、且那时新基线已经发布——更早的 phase 里出现的 rebase
+/// 一定不是我们的，不能拿还没有的 `newBaselineOid` 去认（那会被报成 journal 损坏，
+/// 里程碑 review 第 5 条）。
+fn check_rebase(repo: &str, j: &Journal) -> Result<bool> {
+    if !rebase_in_progress(repo)? {
+        return Ok(false);
+    }
+    if j.phase == Phase::RestoringBranch {
+        let onto = published(repo, j)?;
+        if is_our_rebase(repo, j, &onto)? {
+            return Ok(true);
+        }
+    }
+    Err(state_changed(
+        "有一个进行中的 rebase 不是本次交付发起的。它的冲突和进度归它自己，这里不碰；\
+         先在 git 里把它做完或中止",
+    ))
+}
+
+/// 提交之后、回到原分支之前，HEAD 必须还在本流程放它的位置：交付树（detached），或
+/// D8c 之后的新基线分支。否则 D6 的 svn update 会合进一条从没打算碰的分支，`checkout -f`
+/// 会把中断期间在 detached HEAD 上做的提交切丢（里程碑 review 第 1 / 7 条）。
+fn require_left_in_place(repo: &str, j: &Journal) -> Result<()> {
+    let deliver = need(&j.deliver_oid, "deliverOid")?;
+    let head = rev_parse(repo, "HEAD")?;
+    let branch = current_branch(repo)?;
+    let on_deliver = branch.is_none() && head == deliver;
+    let on_new_base = j.phase != Phase::PostCommit
+        && branch.as_deref() == Some(BASELINE_BRANCH)
+        && j.new_baseline_oid.as_deref() == Some(head.as_str());
+    if on_deliver || on_new_base {
+        return Ok(());
+    }
+    let target = j
+        .deliver_ref
+        .clone()
+        .unwrap_or_else(|| deliver[..deliver.len().min(10)].to_string());
+    Err(state_changed(&format!(
+        "HEAD 已经不在本次交付放它的位置上了（应在交付树 {} 上，现在在 {}）。中断期间若在这里做过\
+         提交，切走就会丢掉它们，所以不动。只是切了分支的话，先 `git checkout --detach {target}` \
+         回到交付树",
+        &deliver[..deliver.len().min(10)],
+        branch.unwrap_or_else(|| head[..head.len().min(10)].to_string()),
+    )))
+}
+
+fn unresolved(files: &[String]) -> GitError {
+    GitError::new(
+        "sync_out_unresolved",
+        format!(
+            "还有冲突没解决：\n{}\n改好之后把它们暂存（git add），再点「继续」。",
+            list_paths(files)
+        ),
+    )
+}
+
+/// `a` 在不在 HEAD 的历史里。
+fn is_ancestor(repo: &str, a: &str) -> Result<bool> {
+    match run_git_code(repo, &["merge-base", "--is-ancestor", a, "HEAD"])?.0 {
+        0 => Ok(true),
+        1 => Ok(false),
+        code => Err(state_changed(&format!(
+            "判断 {a} 是否在 HEAD 的历史里失败了（merge-base 退出 {code}）"
+        ))),
+    }
 }
