@@ -19,7 +19,7 @@
 | 10 Tauri 命令 | ✅ | `commands/svn_sync.rs`、`commands/svn.rs`、`lib.rs`、`tests/svn_backend.rs`、`tests/svn_write_guard.rs` | `svn_backend` 29/29、`svn_write_guard` 8/8、`commands_are_async` 1/1；全量绿。`pnpm tauri dev` 实跑在 Task 12 |
 | 11 前端纯逻辑与流程 | ✅ | `svnSyncOut.ts`、`svnSyncOutFlow.ts`、`svnJournal.ts`、`svnSync.ts`、`svnSyncIn.ts`（注释）、`toolbarActions.ts`、`repoStore.ts`；测试 `svnSyncOut` / `svnSyncOutFlow`（新）、`svnJournal` / `toolbarActions`（改） | `pnpm build` 过（tsc）；`pnpm test` 36 files / 516 tests 全绿 |
 | 12 前端接线 + 真实窗口冒烟 | ✅ | `DeliverDialog.tsx`（新）、`ConfirmDialog.tsx`（导出 `WarnGlyph`）、`Toolbar.tsx`、`BaselineBanner.tsx`、`RepoTab.tsx`、`styles.css`；测试 `DeliverDialog.test.tsx`、`BaselineBanner.test.tsx`（新） | `pnpm build` 过；`pnpm test` 38 files / 527 tests 全绿；`pnpm tauri dev` 真实窗口两次交付（快路径 r2、慢路径 r3）全部核对通过 |
-| 13 E2E 清单、spec 修订、收尾 | ⏳ | | |
+| 13 E2E 清单、spec 修订、收尾 | 🟡 Draft PR 已开，E2E 未跑 | `docs/superpowers/e2e/2026-10-07-svn-phase3a-e2e.md`（新）、spec 修订、本文件；最终 review 修复见「最终 review」节 | 全量验证见文末表；E2E 9 个场景待真实窗口执行 |
 
 ## 决策条目
 
