@@ -382,6 +382,8 @@ fn sync_state_serializes_to_camel_case() {
             rolling_back: true,
             expected_start_rev: None,
             commit_message: None,
+            committed_rev: None,
+            orig_branch: None,
         }),
     })
     .unwrap();
@@ -407,6 +409,8 @@ fn sync_state_serializes_to_camel_case() {
         rolling_back: false,
         expected_start_rev: Some(12),
         commit_message: Some("修复跳跃".into()),
+        committed_rev: None,
+        orig_branch: None,
     })
     .unwrap();
     assert_eq!(
@@ -423,6 +427,23 @@ fn sync_state_serializes_to_camel_case() {
     );
     assert_eq!(out["flow"], "sync_out");
     assert_eq!(out["phase"], "committing");
+
+    // 提交之后停下的，横幅标题要写「交付已提交（rN）」（2026-10-14 E2E 用户反馈）
+    let out = serde_json::to_value(UnfinishedSync {
+        flow: Flow::SyncOut,
+        phase: Phase::PublishingBaseline,
+        opid: "o".into(),
+        started_at: 1,
+        rolling_back: false,
+        expected_start_rev: Some(10),
+        commit_message: None,
+        committed_rev: Some(11),
+        // 横幅要点名是哪个分支：中途 HEAD 停在 svn/base 上，工具栏显示的不是它（2026-10-14 E2E）
+        orig_branch: Some("e2e8".into()),
+    })
+    .unwrap();
+    assert_eq!(out["committedRev"], 11);
+    assert_eq!(out["origBranch"], "e2e8");
 }
 
 #[test]

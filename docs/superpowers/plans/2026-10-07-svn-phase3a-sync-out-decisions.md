@@ -298,14 +298,43 @@ review 先读了「偏离计划」条目，未发现未记录的偏离；E2E 清
 - **为什么这么改是安全的**：第 2、7 条只收紧 / 改写结局，不新增任何写操作；第 2 条的新拒绝出口不动 HEAD、分支与 journal（测试断言三者）。第 1 条恢复的是改动前对 stash 的行为。第 4、5 条只改文案。
 - **验证**：`pnpm build` 过；`pnpm test` 39 files / 557 tests；`cargo fmt --check` 过；`cargo clippy --all-targets` 无告警；`cargo test --no-fail-fast` 55 套 / 849 passed / 0 failed。
 
-## 全量验证（Task 13 Step 3，最终 review 修复之后）
+## 全量验证（Task 13 Step 3；最终 review 与真实窗口 E2E 的修复之后，2026-10-15）
 
 | 命令 | 结果 |
 |---|---|
 | `cargo fmt --check` | 通过 |
 | `cargo clippy --all-targets` | 0 告警 |
-| `cargo test --no-fail-fast` | 55 套 / 849 passed / 0 failed |
+| `cargo test --no-fail-fast` | 55 套 / 851 passed / 0 failed |
 | `pnpm build` | 通过 |
-| `pnpm test` | 39 files / 557 passed |
+| `pnpm test` | 39 files / 564 passed |
 | `pnpm tauri dev` 冒烟（Task 12 Step 5） | ✅ 见 Task 12 |
-| E2E 9 个场景（Task 13） | 未跑——等用户在真实窗口里跑 |
+| E2E 9 个场景（Task 13） | ✅ 全部通过，见「真实窗口 E2E」 |
+
+> `cargo test` 不要与 `pnpm tauri dev` 同时跑：两者共用 `src-tauri/target`、feature 组合不同（`tauri dev` 带
+> `--no-default-features`），同时编译会报 `crate ... required to be available in rlib format`（2026-10-13 实测）；
+> 后台大量写文件时 Vite 的文件监听还崩过一次（`UNKNOWN: unknown error, watch`），把 `tauri dev` 一起带退。
+
+### 真实窗口 E2E（2026-10-13～15，fixture `phase1c_fd03e752`）
+
+用户在 `pnpm tauri dev` 里按 `docs/superpowers/e2e/2026-10-07-svn-phase3a-e2e.md` 跑完 9 个场景，全部通过。场景 7a / 7b 改用「先挂监视、journal 进入指定 phase 再结束进程」（手动 30 秒内结束进程卡不准，实测超时一次，交付照常走完——顺带证明慢的 git hook 只让交付变慢、不会弄坏它）。场景 4、7a 各多交付过一次，revision 号比清单晚。
+
+| 场景 | 结果 | 实测要点 |
+|---|---|---|
+| 1 普通交付 | ✅（发现缺陷 E1） | r2 正好 5 条路径；提交信息 UTF-8 原样（控制台乱码只是代码页）；图上交付提交收进 r2，r2 详情 3 个文件 |
+| 2 补丁夹在中间 | ✅ | 服务器无补丁、磁盘有补丁；`svn/base..work` 只剩重放过的补丁；「请保留这个分支」 |
+| 3 紧挨着补丁 | ✅（清单写错 E3） | 错误条点名两个提交与 `Code/P.cs`；HEAD / 分支 / SVN 均未动 |
+| 4 框开着时同事提交 | ✅ | 框不关、红色 `sync_out_server_ahead`；更新后提交信息仍在；r6 只有 `A.cs` |
+| 5 `.psd` 本地改过 | ✅ | 只列 `Code/Art.psd`，不勾不能交付；磁盘 / 服务器各自不变 |
+| 6 补丁落回冲突 | ✅（发现缺陷 E2） | hook 让同事 r9 落在我的 r8 之后；暂存成功（锁已放开）；继续后无重复提交 |
+| 7a 提交前被杀 | ✅ | 停在 `checked-out`，detached 在交付树；「清理」后 HEAD 原样、补丁回到磁盘 |
+| 7b 提交后被杀 | ✅（用户反馈 E4） | 停在 `publishing-baseline`、HEAD 在 `svn/base`；「继续交付」后无重复提交 |
+| 8 多分支 | ✅（用户反馈 E5） | SVN 主线一列菱形；`X8` 有分支指着时照常显示、排在 r11 与 r12 之间；`grow8` 先被 `sync_out_behind_baseline` 拒，更新后 `svn/base..grow8` 只剩 `G8`；`keep8` 更新后快进、交付报「没有可交付的改动」；分支都移走后 `X8` / `G8` 收进 r12 / r13 的「已交付」 |
+
+- **E1（缺陷，已修）**：`git rm` 删掉目录里最后一个文件时 git 顺手删掉空目录，svn 把目录本身报成 `missing`，被当成「白名单里 git 管不到、你本地改过的文件」，交付框弹红色警告。`outside_changes` 改为跳过是其他条目祖先的路径（目录里真正改动的非 W-file 仍逐个报）。`svn_sync_out_check.rs` +2 测试（先 RED，原样复现 `["Code/Solo"]`、`["Code/Art","Code/Art/x.psd"]`）。
+- **E2（缺陷，已修）**：「交付成功，本地补丁落回时有冲突」叫用户点「继续」，横幅按钮叫「我已解决，继续」。原测试只断言含「继续」二字（虚假信心），改为完整按钮名。
+- **E3（清单错误，已改）**：场景 3、7a 的 `svn status -q` 写成「无输出」，实际有本地补丁 / 未交付提交的 `M`；要核对的是没有 `A` / `D` 登记残留。7b 沿用 7a 的提交导致提交信息与内容错位、让用户误以为 r11 交付错了内容，改为单独造 `e2e7b 改 A`。
+- **E4（用户反馈「好难理解」，已改）**：横幅原文是实现层说法（「新基线可能已经发布」「分支还没接上去」），另配一条所有 phase 共用的说明（提交之后停下也讲「提交之前停下的…」，按钮叫「继续」）。改为 `describeSyncOutBanner`：标题回答「交上去没有」（`交付已提交（r12），还差收尾`），正文回答「安全吗、还差什么」，note 写每个按钮的后果；后端 `UnfinishedSync` 加 `committedRev`（journal 已有，只是没发）。
+- **E5（用户反馈，已改）**：场景 8 停在 `publishing-baseline` 时工具栏显示 `svn/base`，用户问「工作分支是 svn/base 吗？之前是 keep8 吗？」，看了「把分支 e2e8 接到最新版本上」又问「e2e8 不是已经提交到 SVN 了么？接上去是干啥？」。横幅点名发起交付的分支（后端加 `origBranch`），说明「现在暂时停在交付途中的中间位置……不要在这里改代码」，还差的事说成「切回 e2e8，并把它更新到最新版本」，「停止收尾」写明不更新的后果（下次交付会被拒）。确认框与两个结局提示框同一套说法，测试禁止出现「基线」「接上 / 接到」「mixed-revision」。
+- **偏离计划**：`UnfinishedSync` 新增 `committedRev`、`origBranch` 两个可选输出字段——只加不改，Tauri 命令签名不变（`svn_backend` 序列化测试钉住字段名）。
+- **为什么这么改是安全的**：E1 只少报目录条目，不影响 W-file 与非 W-file 文件条目（护栏测试）；E2 / E4 / E5 只改文案与只读输出字段。
+- **观察（未改，记为后续）**：成功提示框复用确认框外观，带警告三角与多余的「Cancel」；顶部错误条把多行消息压成一行；未收尾横幅在时工具栏「更新」「交付」仍可点（后端会拒，不会出事）。

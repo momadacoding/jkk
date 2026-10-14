@@ -291,7 +291,9 @@ pub(crate) fn changed_files(
 /// 白名单目录里 git 管不到、有本地修改的文件（W-path 减 W-file，§6.3.2）。有 svn 冲突态就拒绝。
 fn outside_changes(repo: &str, cfg: &SvnConfig) -> Result<Vec<String>> {
     let roots = normalize_roots(&cfg.whitelist);
-    let mut out = Vec::new();
+    let mut local = Vec::new();
+    // 所有条目的祖先路径。是别的条目祖先的那些就是目录
+    let mut parents = std::collections::HashSet::new();
     let mut conflicted = Vec::new();
     for t in svn_targets(repo, &cfg.whitelist)? {
         let xml = run_svn(
@@ -306,6 +308,11 @@ fn outside_changes(repo: &str, cfg: &SvnConfig) -> Result<Vec<String>> {
             ],
         )?;
         for e in parse_update_status(&xml)?.entries {
+            let mut p = e.path.as_str();
+            while let Some((up, _)) = p.rsplit_once('/') {
+                parents.insert(up.to_string());
+                p = up;
+            }
             if e.is_conflicted() {
                 conflicted.push(e.path.clone());
                 continue;
@@ -313,13 +320,17 @@ fn outside_changes(repo: &str, cfg: &SvnConfig) -> Result<Vec<String>> {
             if is_w_file(&e.path, &roots, &cfg.extensions) {
                 continue; // git 管着，上面的 git_dirty 已经要求它干净
             }
-            let local = matches!(e.item.as_str(), "modified" | "missing" | "replaced")
+            let changed = matches!(e.item.as_str(), "modified" | "missing" | "replaced")
                 || e.props == "modified";
-            if local {
-                out.push(e.path.clone());
+            if changed {
+                local.push(e.path.clone());
             }
         }
     }
+    // 目录不是「你改过的文件」：`git rm` 删掉目录里最后一个文件时 git 顺手删掉空目录，svn 把
+    // 目录本身报成 missing，没有扩展名就被当成了被排除的文件（2026-10-13 E2E 场景 1 实测）。
+    // 目录里真正被改动的非 W-file 会作为它自己的条目报出来，不会漏
+    let mut out: Vec<String> = local.into_iter().filter(|p| !parents.contains(p)).collect();
     if !conflicted.is_empty() {
         return Err(GitError::new(
             "sync_out_svn_conflicted",

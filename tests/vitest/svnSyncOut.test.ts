@@ -4,7 +4,7 @@ import {
   describeDeliverPreview,
   describeSyncOutAction,
   describeSyncOutOutcome,
-  describeSyncOutPhase,
+  describeSyncOutBanner,
   expectFromDeliverPreview,
   syncOutActions,
   type SyncOutPreview,
@@ -117,7 +117,12 @@ describe('describeSyncOutOutcome', () => {
     const n = describeSyncOutOutcome({ kind: 'rebaseConflict', rev: 8, files: ['Code/A.cs'] })!
     expect(n.detail).toContain('r8')
     expect(n.detail).toContain('Code/A.cs')
-    expect(n.detail).toContain('继续')
+    // 点名的按钮必须是 restoring-branch 横幅上真有的（2026-10-13 E2E 场景 6 实测原来写的是「继续」）
+    expect(n.detail).toContain('「我已解决，继续」')
+    expect(n.detail).toContain('「停止收尾」')
+    expect(n.detail).not.toContain('「继续」')
+    const labels = syncOutActions('restoring-branch').map((a) => a.label)
+    expect(labels).toEqual(['我已解决，继续', '停止收尾'])
   })
 
   it('放弃的两种结局说法不同', () => {
@@ -146,12 +151,12 @@ describe('横幅', () => {
   })
 
   it('committing 的正文告诉用户去 log 里从哪个 revision 之后找什么（计划 B4）', () => {
-    const d = describeSyncOutPhase({
+    const d = describeSyncOutBanner({
       phase: 'committing',
       opid: 'op-1',
       expectedStartRev: 7,
       commitMessage: '修复跳跃',
-    })!
+    })!.detail
     // 提交若落地，第一个可能的位置就是 r8。「r8 之后」按字面会跳过它（最终 review 第 5 条）
     expect(d).toContain('从 r8 起')
     expect(d).not.toContain('r8 之后')
@@ -163,6 +168,26 @@ describe('横幅', () => {
     expect(describeSyncOutAction('syncOutContinue', 'post-commit').message).toContain('不会重复提交')
     expect(describeSyncOutAction('syncOutAbort', 'post-commit').message).toContain('不会撤回')
     expect(describeSyncOutAction('syncOutCleanup', 'svn-staged').message).toContain('撤销')
+  })
+
+  it('确认框与横幅说同一套人话：不提基线、接上去、mixed-revision（2026-10-14 E2E 用户反馈）', () => {
+    for (const phase of ['post-commit', 'publishing-baseline', 'restoring-branch']) {
+      for (const id of ['syncOutContinue', 'syncOutAbort'] as const) {
+        const m = describeSyncOutAction(id, phase).message
+        expect(m, `${id} ${phase}`).not.toMatch(/基线|接上|接到|mixed-revision/)
+        expect(m, `${id} ${phase}`).toContain('更新到最新版本')
+      }
+    }
+    // 结局提示框也一样
+    for (const o of [
+      { kind: 'rebaseConflict', rev: 8, files: ['Code/P.cs'] },
+      { kind: 'abandoned', committed: true },
+    ] as const) {
+      expect(describeSyncOutOutcome(o)!.detail, o.kind).not.toMatch(/基线|接上|接到|mixed-revision/)
+    }
+    // 「停止收尾」之后为什么要点「更新」
+    expect(describeSyncOutAction('syncOutAbort', 'publishing-baseline').message).toContain('下次交付会被拒')
+    expect(describeSyncOutAction('syncOutContinue', 'restoring-branch').message).toContain('本地补丁')
   })
 
   it('post-commit 的「停止」说明它也要联网（后端会先把白名单更新到最新）', () => {

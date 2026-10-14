@@ -234,6 +234,14 @@ pub struct UnfinishedSync {
     pub expected_start_rev: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit_message: Option<String>,
+    /// 交付已经落地的 revision（D5 成功后才有）。提交之后停下的，横幅标题直接写
+    /// 「交付已提交（rN）」——用户最先想知道的就是交上去没有（2026-10-14 E2E 反馈）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub committed_rev: Option<u64>,
+    /// 发起这次同步的分支。中途 HEAD 会临时停在交付树或 `svn/base` 上，工具栏显示的不是它；
+    /// 横幅要点名「把分支 X 接上去」（2026-10-14 E2E：用户以为工作分支变成了 svn/base）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orig_branch: Option<String>,
 }
 
 /// 同步状态。**`locked` 与 `unfinished` 是两件事，不能合并。**
@@ -270,6 +278,8 @@ pub fn svn_sync_state(path: String) -> Result<SyncState, GitError> {
             rolling_back: j.rolling_back,
             expected_start_rev: j.expected_start_rev,
             commit_message: j.commit_message,
+            committed_rev: j.committed_rev,
+            orig_branch: j.orig_branch,
         }),
     })
 }

@@ -188,6 +188,41 @@ fn files_git_does_not_manage_inside_the_whitelist_are_listed_for_confirmation() 
 }
 
 #[test]
+fn deleting_the_last_file_of_a_directory_is_not_an_outside_change() {
+    // 2026-10-13 E2E 场景 1 实测：`git rm` 删掉目录里最后一个文件时 git 顺手删掉空目录，
+    // svn 把目录本身报成 `missing`。目录没有扩展名，被当成「白名单里 git 管不到、你本地改过的
+    // 文件」，交付框弹出红色警告——误报，交付之后的 update 会把空目录拉回来
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/Solo/S.cs", "solo\n");
+    update(&fx);
+    git(&fx, &["rm", "-q", "Code/Solo/S.cs"]);
+    git(&fx, &["commit", "-qm", "drop solo"]);
+    assert!(
+        !fx.wc().join("Code/Solo").exists(),
+        "前提：git 删掉了空目录"
+    );
+
+    let p = preview_sync_out(&fx.wc_str()).unwrap();
+    assert!(p.outside_changes.is_empty(), "{:?}", p.outside_changes);
+    assert_eq!(p.changes.len(), 1);
+}
+
+#[test]
+fn a_directory_removed_by_hand_still_lists_the_files_git_does_not_manage() {
+    // 护栏：跳过目录条目之后，目录里被删掉的非 W-file 仍逐个报出来——它们才是真正的本地改动
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/Art/x.psd", "psd\n");
+    fx.colleague_commits("Code/Art/y.cs", "y\n");
+    update(&fx);
+    std::fs::remove_dir_all(fx.wc().join("Code/Art")).unwrap();
+    git(&fx, &["add", "-A", "Code"]);
+    git(&fx, &["commit", "-qm", "drop art"]);
+
+    let p = preview_sync_out(&fx.wc_str()).unwrap();
+    assert_eq!(p.outside_changes, vec!["Code/Art/x.psd".to_string()]);
+}
+
+#[test]
 fn nothing_to_deliver_says_how_many_local_patches_were_set_aside() {
     // §8.3 + spec §13「D1 / D2 空清单」：提示是否全部改动都被标成了 Local-Only
     let fx = hybrid_with_colleague();

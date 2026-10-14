@@ -8,6 +8,7 @@ import {
   type SyncPhase,
   type SyncState,
   type SyncStateUnreadable,
+  type UnfinishedSync,
 } from '@/engine/svnJournal'
 
 const clean: SyncState = { locked: false, holder: null, unfinished: null }
@@ -78,7 +79,9 @@ describe('describeUnfinishedSync', () => {
       })!
     expect(at('publishing-baseline').actions.map((a) => a.id)).toEqual(['syncOutContinue', 'syncOutAbort'])
     expect(at('svn-staged').actions.map((a) => a.id)).toEqual(['syncOutCleanup'])
-    expect(at('svn-staged').note).toContain('绝不重复提交')
+    // 「不会重复提交」只对已经提交的 phase 有意义；提交之前讲它是跑题（2026-10-14 用户反馈）
+    expect(at('publishing-baseline').detail).toContain('不会重复提交')
+    expect(at('svn-staged').note).not.toContain('重复提交')
   })
 
   it('交付留下的记录：标题、正文、按钮都按 sync_out 的 phase 给', () => {
@@ -87,9 +90,95 @@ describe('describeUnfinishedSync', () => {
       holder: null,
       unfinished: { flow: 'sync_out', phase: 'svn-staged', opid: 'op', startedAt: 1 },
     })!
-    expect(b.title).toBe('上次交付没有正常结束')
-    expect(b.detail).toContain('撤销')
+    expect(b.title).toBe('交付被打断了，还没提交')
+    expect(b.detail).toContain('登记')
     expect(b.actions.map((a) => a.id)).toEqual(['syncOutCleanup'])
+  })
+
+  // 2026-10-14 E2E 场景 7b 用户反馈「这个提示好难理解」：原文是实现层的说法（「新基线可能已经
+  // 发布」「分支还没接上去」），第二行是所有 phase 共用的说明（提交之后停下时也讲「提交之前
+  // 停下的…」，还把按钮叫成「继续」），两个按钮点了会怎样没说。
+  // 改成：标题回答「交上去没有」，正文回答「安全吗、还差什么」，note 写每个按钮的后果。
+  describe('交付横幅说人话', () => {
+    const banner = (phase: string, extra: Partial<UnfinishedSync> = {}) =>
+      describeUnfinishedSync({
+        locked: false,
+        holder: null,
+        unfinished: { flow: 'sync_out', phase: phase as SyncPhase, opid: 'op', startedAt: 1, ...extra },
+      })!
+    const all = (b: ReturnType<typeof banner>) => `${b.title}\n${b.detail}\n${b.note ?? ''}`
+
+    it('提交之前：标题说还没提交，note 只讲「清理」', () => {
+      for (const phase of ['prepare', 'building-deliver', 'deliver-built', 'checked-out', 'svn-staged']) {
+        const b = banner(phase)
+        expect(b.title, phase).toBe('交付被打断了，还没提交')
+        expect(b.detail, phase).toContain('SVN 上')
+        expect(b.note, phase).toContain('「清理」')
+        expect(all(b), phase).not.toContain('「继续')
+        expect(all(b), phase).not.toContain('提交之后')
+      }
+      expect(banner('checked-out').detail).toContain('本地补丁暂时不在磁盘上')
+    })
+
+    it('提交之后：标题带 revision，正文说不会丢、不会重复提交，note 讲两个按钮各自的后果', () => {
+      for (const phase of ['post-commit', 'publishing-baseline', 'restoring-branch']) {
+        const b = banner(phase, { committedRev: 11 })
+        expect(b.title, phase).toContain('交付已提交（r11）')
+        expect(b.detail, phase).toContain('不会丢')
+        expect(b.detail, phase).toContain('不会重复提交')
+        expect(b.note, phase).toContain('「停止收尾」')
+        expect(b.note, phase).toContain('「更新」')
+        // 不再出现与本 phase 无关的「提交之前停下的…」，也不说实现层的「基线」「发布」
+        expect(all(b), phase).not.toContain('提交之前')
+        expect(all(b), phase).not.toContain('基线')
+        expect(all(b), phase).not.toContain('发布')
+      }
+      expect(banner('publishing-baseline', { committedRev: 11 }).note).toContain('「继续交付」')
+      expect(banner('post-commit', { committedRev: 11 }).note).toContain('需要网络')
+      expect(banner('restoring-branch', { committedRev: 11 }).note).toContain('「我已解决，继续」')
+    })
+
+    it('note 里点名的按钮正是横幅上那几个', () => {
+      for (const phase of ['svn-staged', 'post-commit', 'publishing-baseline', 'restoring-branch']) {
+        const b = banner(phase, { committedRev: 11 })
+        for (const a of b.actions) expect(b.note, `${phase} ${a.label}`).toContain(`「${a.label}」`)
+      }
+    })
+
+    it('点名原分支，说清还差的是「切回它、把它更新到最新」，中间位置别在上面改代码', () => {
+      // 2026-10-14 E2E 场景 8：从 e2e8 交付、停在 publishing-baseline，工具栏显示 svn/base。
+      // 用户先问「现在的工作分支是 svn/base 吗？」，看了「把分支 e2e8 接到最新版本上」又问
+      // 「e2e8 不是已经提交到 SVN 了么？接上去是干啥？」——「接上去」是实现层的说法
+      for (const phase of ['post-commit', 'publishing-baseline', 'restoring-branch']) {
+        const b = banner(phase, { committedRev: 12, origBranch: 'e2e8' })
+        expect(b.detail, phase).toContain('e2e8 的改动已经在 SVN 上了')
+        expect(b.detail, phase).toContain('不要在这里改代码')
+        expect(b.note, phase).toContain('切回 e2e8')
+        expect(all(b), phase).toContain('更新到最新版本')
+        expect(all(b), phase).not.toMatch(/接到|接上|接回/)
+      }
+      for (const phase of ['checked-out', 'svn-staged']) {
+        const b = banner(phase, { origBranch: 'e2e8' })
+        expect(b.note, phase).toContain('切回 e2e8')
+        expect(b.detail, phase).toContain('不要在这里改代码')
+      }
+      // 「停止收尾」之后为什么要点「更新」：不更新，下次交付会被拒
+      expect(banner('publishing-baseline', { committedRev: 12, origBranch: 'e2e8' }).note).toContain(
+        '下次交付会被拒',
+      )
+    })
+
+    it('拿不到分支名（旧记录）时退回「你的」，不出现 undefined', () => {
+      const b = banner('publishing-baseline', { committedRev: 12 })
+      expect(b.detail).toContain('你的改动已经在 SVN 上了')
+      expect(`${b.title}${b.detail}${b.note}`).not.toContain('undefined')
+    })
+
+    it('拿不到 revision 号（旧记录）时标题照样成立，不出现「rundefined」', () => {
+      const b = banner('publishing-baseline')
+      expect(b.title).toBe('交付已提交，还差收尾')
+      expect(all(b)).not.toContain('undefined')
+    })
   })
 
   it('提交状态未知：换标题，不给按钮', () => {

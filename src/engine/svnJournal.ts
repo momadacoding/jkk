@@ -6,7 +6,7 @@
  */
 import type { BannerModel } from './svnSync'
 import { syncActions } from './svnSyncIn'
-import { describeSyncOutPhase, syncOutActions, type SyncOutPhase } from './svnSyncOut'
+import { describeSyncOutBanner, syncOutActions, type SyncOutPhase } from './svnSyncOut'
 
 /**
  * 重建基线 / 行尾迁移拿同步锁时 opid 的前缀。与 `commands/svn.rs::hold_for_baseline_move`
@@ -53,6 +53,10 @@ export interface UnfinishedSync {
   expectedStartRev?: number
   /** 同上：要找的那条提交信息。 */
   commitMessage?: string
+  /** 交付已经落地的 revision（D5 成功后才有），横幅标题写「交付已提交（rN）」。 */
+  committedRev?: number
+  /** 发起这次同步的分支。中途 HEAD 临时停在别处，横幅要点名它。 */
+  origBranch?: string
 }
 
 export interface SyncState {
@@ -105,8 +109,6 @@ const APPLYING_STASH_BACK =
 
 const NOTE_SYNC_IN =
   '点「继续」从中断的地方接着走；点「放弃」回到更新前。两者都不会丢掉你的提交和未提交的改动。'
-const NOTE_SYNC_OUT =
-  '提交之前停下的，「清理」会把一切撤回原样；提交之后停下的，「继续」只会接着做完，绝不重复提交。'
 
 /** 「已经持续多久」。与后端 `svn_lock::describe_age` 同一套说法。 */
 export function sinceText(startedAt: number, nowSecs: number): string {
@@ -178,14 +180,16 @@ export function describeUnfinishedSync(
   // 只看 phase 会给交付记录挂上「更新」的继续 / 放弃——那两个命令会拒绝它
   if (s.unfinished.flow === 'sync_out') {
     const u = s.unfinished
+    // 每个 phase 自带标题、正文与按钮说明（2026-10-14 E2E 用户反馈原文难懂）
+    const b = describeSyncOutBanner(u)
     return {
       tone: 'danger',
-      title: u.phase === 'committing' ? '交付状态未知' : '上次交付没有正常结束',
+      title: b?.title ?? '上次交付没有正常结束',
       detail:
-        describeSyncOutPhase(u) ??
+        b?.detail ??
         `交付停在「${u.phase}」这一步，这个版本的界面还不认识它。请不要手工去动分支指针，记录都还在。`,
       actions: syncOutActions(u.phase),
-      note: NOTE_SYNC_OUT,
+      note: b?.note,
     }
   }
 
