@@ -1953,10 +1953,14 @@ body {
   opacity: 0.85;
 }
 
-/* svn 节点详情里「已交付的本地提交」清单 */
+/* svn 节点详情里收起来的本地提交：附注性质，一行轻量文字，不用提示框 */
 .commit-delivered {
-  margin: 4px 0 0;
-  padding-left: 18px;
+  margin: 0 12px 8px;
+  font-size: 12px;
+  opacity: 0.6;
+}
+.commit-delivered-item + .commit-delivered-item::before {
+  content: '、';
 }
 
 /* 失同步横幅与服务器侧漏收提示。tone 与 engine/svnSync 的 BannerTone 对应。

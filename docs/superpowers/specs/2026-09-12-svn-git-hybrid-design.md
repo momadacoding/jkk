@@ -3111,7 +3111,7 @@ journal / stash，停止录制基线，指出受影响的 WC / 文件，交由 T
   被另一条分支带走——主线断成两列两色。不认 `svn/base`：比基线新、还没更新的 revision 在它上面。
 - **svn 节点画成菱形**（车道色填充、白边），本地提交仍是圆点。不用颜色区分——颜色归车道。
 - 已知不精确：基线 trailer 记的是 D6 更新到的 revision，D5 与 D6 之间同事又提交过时，`deliveredFrom`
-  会挂在同事那个 revision 上；界面因此写「录这条基线之前已交付」。精确对应要把 `committedRev` 写进
+  会挂在同事那个 revision 上。界面只写「本地提交：…」，这种少见情况下会挂错 revision。精确对应要把 `committedRev` 写进
   基线 commit，留作后续。
 
 ### 10.4 数据模型改动
@@ -3148,7 +3148,7 @@ export interface CommitNode {
 | `Toolbar` | 按 `capabilities`：Fetch / Pull / Push → Update / Deliver；隐藏 Worktree / Tag / PR |
 | `CommitRow` | `vcs === 'svn'` 时显示 `r12346` 而非短 hash，换配色；`localOnly` 加「仅本地」角标（§6.7） |
 | `LocalChangesView` 的提交框 | 新增「仅本地，不交付」勾选框，勾上即在 message 追加 `Local-Only: true` trailer |
-| `CommitDetailView` | svn 节点的 diff 走 `svn diff -c N`（**需要网络**）。第一期只对白名单内路径显示内容，美术资产只列文件名和状态。**Phase 3a 补（2026-10-11）**：前后两个节点都有本地基线时（交付或更新录下的），不走网络，直接比两版基线（`read_diff` 的 `range:<a>..<b>` scope，只读；格式不对报 `bad_diff_scope`，不能退回工作区 diff）；前一个节点没有本地基线（同事的 revision）时如实说明要等 Phase 4，不拿更早的基线冒充。另列「录这条基线之前已交付的本地提交」 |
+| `CommitDetailView` | svn 节点的 diff 走 `svn diff -c N`（**需要网络**）。第一期只对白名单内路径显示内容，美术资产只列文件名和状态。**Phase 3a 补（2026-10-11）**：前后两个节点都有本地基线时（交付或更新录下的），不走网络，直接比两版基线（`read_diff` 的 `range:<a>..<b>` scope，只读；格式不对报 `bad_diff_scope`，不能退回工作区 diff）；前一个节点没有本地基线（同事的 revision）时如实说明要等 Phase 4，不拿更早的基线冒充。另列收起来的本地提交（一行「本地提交：hash 标题」；只有一个且标题与 SVN 信息第一行相同时不列，2026-10-15） |
 | 新增 `SvnExternalView` | 白名单外的 svn 改动，只读列表 + revert 入口 |
 | 新增 `SyncDialog` | 更新 / 交付流程 UI，含冲突解决引导与交付确认关口 |
 | 新增 `BaselineBanner` | 失同步 / 同步未完成 / 交付状态未知 |

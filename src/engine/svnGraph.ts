@@ -267,6 +267,21 @@ export function selectionDiffScope(commits: CommitNode[], selectedId: string | n
 }
 
 /**
+ * svn 节点详情里要不要列出它收起来的本地提交，列哪些。
+ *
+ * 只有一个提交、标题又和 SVN 信息一样时，这一栏只是把上面那行再说一遍（2026-10-15
+ * 用户反馈），不显示。一次交付了多个提交、或交付时改写了信息时，这里是唯一还能看到
+ * 原提交标题和 hash 的地方，照常列出。git 侧的 `message` 只有标题，所以 SVN 信息只比第一行。
+ */
+export function deliveredNote(c: CommitNode): { id: string; message: string }[] | null {
+  const from = c.deliveredFrom
+  if (c.vcs !== 'svn' || !from || from.length === 0) return null
+  const svnSubject = c.message.trim().split(/\r?\n/)[0].trim()
+  if (from.length === 1 && from[0].message.trim() === svnSubject) return null
+  return from
+}
+
+/**
  * 选中的节点该读哪段 diff（`read_diff` 的 scope）。
  *
  * svn 节点的 id 是 `svn:N`，不是 oid，原样发 `commit:svn:N` 只会在后端解析失败。

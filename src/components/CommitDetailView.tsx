@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { Panel, Group, Separator } from 'react-resizable-panels'
 import type { CommitNode, DiffData } from '../engine/types'
 import { buildFileTree } from '../engine/fileTree'
+import { deliveredNote } from '../engine/svnGraph'
 import { DiffView } from './DiffView'
 import { FileTree } from './FileTree'
 import { FileContentView } from './FileContentView'
@@ -97,6 +98,7 @@ export function CommitDetailView({ commit, diff, repoPath }: CommitDetailViewPro
   // 否则如实说明，而不是给一个空白的文件列表——空白会让人以为这个 revision 什么都没改。
   if (commit.vcs === 'svn') {
     const prevRev = commit.parents[0]?.replace(/^svn:/, '')
+    const delivered = deliveredNote(commit)
     return (
       <div className="commit-detail">
         <div className="commit-head">
@@ -108,24 +110,19 @@ export function CommitDetailView({ commit, diff, repoPath }: CommitDetailViewPro
           </span>
         </div>
         <pre className="commit-detail-message">{commit.message}</pre>
-        {commit.deliveredFrom && (
-          <div className="commit-detail-note">
-            录这条基线之前已交付的本地提交（它们的内容已在 SVN 历史里，图上不再单独画出）：
-            <ul className="commit-delivered">
-              {commit.deliveredFrom.map((d) => (
-                <li key={d.id}>
-                  <code>{d.id.slice(0, 7)}</code> {d.message}
-                </li>
-              ))}
-            </ul>
+        {delivered && (
+          <div className="commit-delivered">
+            本地提交：
+            {delivered.map((d) => (
+              <span key={d.id} className="commit-delivered-item">
+                <code>{d.id.slice(0, 7)}</code> {d.message}
+              </span>
+            ))}
           </div>
         )}
         {commit.diffBase ? (
           <>
-            <p className="commit-detail-note">
-              相对 r{prevRev} 的变化，按本地两版基线算出，只含 git 管的文件（白名单里的
-              {' '}W-file）。
-            </p>
+            <p className="commit-detail-note">相对 r{prevRev} 的变化（只含 git 管理的文件）。</p>
             <div className="commit-split">
               <Group orientation="horizontal">
                 <Panel defaultSize="30%" minSize="15%" maxSize="60%">
@@ -140,7 +137,7 @@ export function CommitDetailView({ commit, diff, repoPath }: CommitDetailViewPro
           </>
         ) : (
           <p className="commit-detail-note">
-            这个 revision 的前一版没有本地基线（多半是同事的提交），文件差异要走一次网络请求
+            前一个 revision 不是在本机交付或更新时记下的（多半是同事的提交），看文件差异要联网
             （<code>svn diff -c {commit.svnRev}</code>），属于 Phase 4，本期还没做。
           </p>
         )}

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   baselineMap,
   commitDiffScope,
+  deliveredNote,
   remapRefs,
   selectionDiffScope,
   spliceHistory,
@@ -407,5 +408,39 @@ describe('selectionDiffScope', () => {
 
   it('没有选中时不请求', () => {
     expect(selectionDiffScope(commits, null)).toBeNull()
+  })
+})
+
+describe('deliveredNote', () => {
+  const node = (message: string, deliveredFrom?: { id: string; message: string }[]): CommitNode => ({
+    ...git('svn:12', []),
+    vcs: 'svn',
+    message,
+    deliveredFrom,
+  })
+
+  it('只有一个本地提交、标题与 SVN 信息相同：不显示，否则只是重复（2026-10-15 用户反馈）', () => {
+    expect(deliveredNote(node('e2e8 X8', [{ id: 'e36fec9', message: 'e2e8 X8' }]))).toBeNull()
+    // 首尾空白、CRLF；SVN 多行信息只比第一行（git 侧只有标题）
+    expect(deliveredNote(node(' e2e8 X8\r\n\r\n细节\r\n', [{ id: 'e36fec9', message: 'e2e8 X8' }]))).toBeNull()
+  })
+
+  it('交付时改写了信息：显示', () => {
+    const from = [{ id: 'e36fec9', message: 'e2e8 X8' }]
+    expect(deliveredNote(node('e2e8 交付 X8', from))).toEqual(from)
+  })
+
+  it('一次交付了多个提交：全部显示，哪怕某一个和 SVN 信息相同', () => {
+    const from = [
+      { id: 'c2', message: '修音效' },
+      { id: 'c1', message: '修跳跃' },
+    ]
+    expect(deliveredNote(node('修跳跃', from))).toEqual(from)
+  })
+
+  it('没有已交付的提交、git 节点：不显示', () => {
+    expect(deliveredNote(node('r12'))).toBeNull()
+    expect(deliveredNote(node('r12', []))).toBeNull()
+    expect(deliveredNote(git('abc', []))).toBeNull()
   })
 })
