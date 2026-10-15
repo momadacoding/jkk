@@ -260,6 +260,39 @@ describe('spliceHistory：已交付的本地提交（Phase 3a）', () => {
     expect(out.find((c) => c.id === 'svn:3')!.deliveredFrom!.map((d) => d.id)).toEqual(['many'])
   })
 
+  it('交付后同事紧跟着提交：收起的提交挂在真正交付的 revision 上，不挂同事的', () => {
+    // 2026-10-16 review 第 1 条（E2E 场景 6 的 r8 / r9）：基线记的是 D6 更新到的 r3（同事的），
+    // 交付录的基线另记 deliveredRev = 2
+    const out = spliceHistory(
+      [svn(3), svn(2), svn(1)],
+      [
+        git('top', ['B3']),
+        { ...baseline('B3', ['mine'], 3), deliveredRev: 2 },
+        git('mine', ['B1'], { message: 'mine' }),
+        baseline('B1', [], 1),
+      ],
+      ['top'],
+    )
+    expect(out.map((c) => c.id)).toEqual(['top', 'svn:3', 'svn:2', 'svn:1'])
+    expect(out.find((c) => c.id === 'svn:2')!.deliveredFrom!.map((d) => d.id)).toEqual(['mine'])
+    expect(out.find((c) => c.id === 'svn:3')!.deliveredFrom).toBeUndefined()
+  })
+
+  it('真正交付的 revision 还没拉进来：不收起（同「基线 revision 没拉进来」）', () => {
+    const out = spliceHistory(
+      [svn(3), svn(1)],
+      [
+        git('top', ['B3']),
+        { ...baseline('B3', ['mine'], 3), deliveredRev: 2 },
+        git('mine', ['B1']),
+        baseline('B1', [], 1),
+      ],
+      ['top'],
+    )
+    expect(out.some((c) => c.id === 'mine')).toBe(true)
+    expect(out.every((c) => c.deliveredFrom === undefined)).toBe(true)
+  })
+
   it('「更新」录的基线以旧基线为父，什么都不隐藏', () => {
     const out = spliceHistory(
       [svn(2), svn(1)],
@@ -443,11 +476,31 @@ describe('deliveredNote', () => {
     deliveredFrom,
   })
   const dc = (id: string, message: string) => git(id, ['B'], { message })
+  /** 前后两版都在本机记过、下面能直接看到文件变化的 svn 节点。 */
+  const withDiff = (message: string, deliveredFrom?: CommitNode[]): CommitNode => ({
+    ...node(message, deliveredFrom),
+    baselineOid: 'B12',
+    diffBase: 'B11',
+  })
 
-  it('只有一个本地提交、标题与 SVN 信息相同：不显示，否则只是重复（2026-10-15 用户反馈）', () => {
-    expect(deliveredNote(node('e2e8 X8', [dc('e36fec9', 'e2e8 X8')]))).toBeNull()
-    // 首尾空白、CRLF；SVN 多行信息只比第一行（git 侧只有标题）
-    expect(deliveredNote(node(' e2e8 X8\r\n\r\n细节\r\n', [dc('e36fec9', 'e2e8 X8')]))).toBeNull()
+  it('只有一个本地提交、标题与 SVN 信息相同、下面能看到改动：不显示，否则只是重复（2026-10-15 用户反馈）', () => {
+    expect(deliveredNote(withDiff('e2e8 X8', [dc('e36fec9', 'e2e8 X8')]))).toBeNull()
+    // 首尾空白、CRLF；SVN 只比第一段（git 侧的 summary() 就是第一段）
+    expect(deliveredNote(withDiff(' e2e8 X8\r\n\r\n细节\r\n', [dc('e36fec9', 'e2e8 X8')]))).toBeNull()
+  })
+
+  it('标题跨了两行没空行：git 的 summary() 把第一段并成一行，SVN 这边也按第一段并起来比', () => {
+    // 2026-10-16 review 第 5 条：只比第一行时永远对不上
+    const from = [dc('a1', 'Fix crash in loader when file empty')]
+    expect(deliveredNote(withDiff('Fix crash in loader\nwhen file empty\n\n细节', from))).toBeNull()
+    expect(deliveredNote(withDiff('Fix crash in loader\r\n  when file empty', from))).toBeNull()
+  })
+
+  it('信息相同、但这里看不到改动（前一版没在本机记过）：照常列出——这是看它改了什么的唯一入口', () => {
+    // 2026-10-16 review 第 2 条
+    const from = [dc('e36fec9', 'e2e8 X8')]
+    expect(deliveredNote(node('e2e8 X8', from))).toEqual(from)
+    expect(deliveredNote({ ...node('e2e8 X8', from), baselineOid: 'B12' })).toEqual(from)
   })
 
   it('交付时改写了信息：显示', () => {

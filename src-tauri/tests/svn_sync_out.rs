@@ -259,6 +259,43 @@ fn a_colleague_commit_between_d5_and_d6_ends_up_in_the_new_baseline() {
 }
 
 #[test]
+fn the_new_baseline_remembers_which_revision_was_actually_delivered() {
+    // 2026-10-16 review 第 1 条：基线记的是 D6 更新到的 r3（同事的），只看它的话图上会把我交付
+    // 的提交挂到同事的 r3 名下，我自己的 r2 反而说「多半是同事的提交」。E2E 场景 6 的 r8 / r9 就是这样
+    let fx = hybrid_with_colleague();
+    typical_work(&fx);
+    deliver_probed(&fx, "mine", &|s, _| {
+        if s == Step::Committed {
+            fx.colleague_commits("Code/C.cs", "c\n");
+        }
+    })
+    .unwrap();
+    let base = git(&fx, &["rev-parse", "svn/base"]);
+    let data = app_lib::engine::graph::load(&fx.wc_str()).unwrap();
+    let node = data.commits.iter().find(|c| c.id == base).unwrap();
+    assert_eq!(node.baseline_rev, Some(3), "记账照旧是 D6 之后的 r3");
+    assert_eq!(node.delivered_rev, Some(2), "真正交付的是 r2");
+    let json = serde_json::to_value(node).unwrap();
+    assert_eq!(
+        json.get("deliveredRev"),
+        Some(&serde_json::json!(2)),
+        "{json}"
+    );
+
+    // 不是交付录的基线（初始化、更新）没有这一项，前端退回按 baselineRev 归属
+    let first = data
+        .commits
+        .iter()
+        .find(|c| c.baseline_rev == Some(1))
+        .unwrap();
+    assert_eq!(first.delivered_rev, None);
+    assert!(serde_json::to_value(first)
+        .unwrap()
+        .get("deliveredRev")
+        .is_none());
+}
+
+#[test]
 fn the_baseline_is_published_from_the_very_tree_that_was_checked() {
     // 必测 #73 的快进一半：D7a 核对过的 TREE 就是新基线的 tree，索引对齐不改磁盘
     let fx = hybrid_with_colleague();

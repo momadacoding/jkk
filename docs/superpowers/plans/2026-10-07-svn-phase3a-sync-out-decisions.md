@@ -337,6 +337,20 @@ review 先读了「偏离计划」条目，未发现未记录的偏离；E2E 清
 - **E5（用户反馈，已改）**：场景 8 停在 `publishing-baseline` 时工具栏显示 `svn/base`，用户问「工作分支是 svn/base 吗？之前是 keep8 吗？」，看了「把分支 e2e8 接到最新版本上」又问「e2e8 不是已经提交到 SVN 了么？接上去是干啥？」。横幅点名发起交付的分支（后端加 `origBranch`），说明「现在暂时停在交付途中的中间位置……不要在这里改代码」，还差的事说成「切回 e2e8，并把它更新到最新版本」，「停止收尾」写明不更新的后果（下次交付会被拒）。确认框与两个结局提示框同一套说法，测试禁止出现「基线」「接上 / 接到」「mixed-revision」。
 - **E6（用户反馈「感觉很多余」，已改，2026-10-15）**：r12 详情里「录这条基线之前已交付的本地提交（……图上不再单独画出）：e36fec9 e2e8 X8」与上面的 SVN 信息几乎重复，开头又是「基线」术语。新增纯函数 `deliveredNote`：只有一个提交且标题与 SVN 信息第一行相同（去首尾空白）时不显示；多个提交或交付时改写过信息时，缩成一行灰字「本地提交：hash 标题、hash 标题」，不再用提示框。只比第一行是因为 git 侧 `message` 只有标题（`commit.summary()`）。「相对 rN 的变化」与「前一个 revision 没有本地基线」两行同时去掉「基线」。`svnGraph.test.ts` +4（先 RED）。用引擎在 fixture 上造 r14–r18 五种情景给用户看时又发现：同事的 r18 紧跟我交付的 r17，说明却写「前一版没有本地基线」——缺的是它自己。新增 `svnDiffGap` 区分「这个 / 前一个」，+4（先 RED）。
 - **E7（用户反馈，已改，2026-10-16）**：看 r16（一次交付 3 个提交）时用户觉得那行灰字「不够明显」，并问怎么分别看这三个提交的改动——原来界面里看不了，只能 `git show`。改为：标题写明「这次交付包含 3 个本地提交：」/「这次交付来自本地提交：」，每个提交一行、hash 用 revision 号的橙色，**每行可点**；点开后详情就是那个 git 提交本身（Commit / Changes / File Tree），标签栏前有「← 返回 r16」。`deliveredFrom` 由 `{id, message}` 改存整条 `CommitNode`（详情头要作者、时间、父提交）；新增 `findDelivered` 给 `RepoTab` 的 `detailCommit` 兜底。diff 不另接——不在图上的选中本来就按 `commit:<oid>` 读（stash 同一条路），只读。未采用「图上加开关把收起的提交画回去」：会把图重新弄乱。测试：`svnGraph.test.ts` 改 2 + 新 3，新 `CommitDetailView.test.tsx` 5 条，先 RED 6 条。
+- **E2E 之后的独立 review（`/code-review high 58cb309..HEAD`，2026-10-16）**：8 条候选，逐条核对代码后分诊：
+
+  | 条目 | 结论 | 处理 |
+  |---|---|---|
+  | 1 收起的提交挂错 revision（D5–D6 间同事提交，E2E 场景 6 的 r8 / r9 正是如此） | 成立 | 交付录的基线另记 `Delivered-Rev: N`（`create_baseline_commit_with`），`load_graph` 解析成 `deliveredRev`，前端按它归属，旧基线退回 `baselineRev`。Rust +1（`svn_sync_out.rs`），vitest +2。**安全性**：基线 message 多一行；所有读基线 message 的地方（`svn_sync`、`svn_sync_in`、`svn_init`、`svn_log` 的锚点、`svn_sync_out(_check)`）都只经 `parse_trailer` 逐行找 `git-svn-id:`，`git-svn-id` 仍是最后一行，`git log --grep=^git-svn-id` 照常可用 |
+  | 2 一个提交、信息相同、但算不出文件变化时整块隐藏，失去唯一入口 | 成立 | 只有下面能看到改动（`baselineOid` + `diffBase`）时才隐藏。vitest +1，先 RED |
+  | 3 E1 的目录过滤把目录属性改动 / replaced 也吞了 | 成立 | 只跳过「仅因 missing」且是别的条目祖先的目录。Rust +1（`svn_sync_out_check.rs`），先 RED（实测 `[]` vs `["Code/Art"]`） |
+  | 4 「更新」预览有同样的目录误报 | 不在本 PR 修 | 「更新」侧要求 `local && incoming`，目录被删又恰好有同事改动才触发；那时 svn update 会怎么对待 missing 目录要先在 fixture 里实测（`AGENTS.md` §6.2），且误报只多要一次确认、不丢数据。记为后续 |
+  | 5 git 的 `summary()` 是第一段并成一行，SVN 只比第一行 | 成立 | `summaryOf` 同样取第一段、空白压成一个。vitest +1，先 RED |
+  | 6 `findDelivered` 每次线性扫 | 不改 | 只在选中或图数据变化时算一次（`useMemo`），5000 节点量级可忽略；为它在 `spliceHistory` 多维护一张表不值 |
+  | 7 `onSelectCommit` 可选，按钮可能点了没反应 | 成立 | 改为必传 |
+  | 8 「多半是同事的提交」在第 1 条的情形下指错 | 成立 | 不再猜是谁的：「本机没有记下 rN 的内容」/「本机没有记下前一个 revision（rP）的内容」；有收起的提交时提示可以点开它们。组件测试 +2，先 RED |
+
+  第 1 条的前端归属测试写在实现之后才跑，没有单独看到 RED（Rust 侧那条先因字段不存在编译失败）。
 - **偏离计划**：`UnfinishedSync` 新增 `committedRev`、`origBranch` 两个可选输出字段——只加不改，Tauri 命令签名不变（`svn_backend` 序列化测试钉住字段名）。
 - **为什么这么改是安全的**：E1 只少报目录条目，不影响 W-file 与非 W-file 文件条目（护栏测试）；E2 / E4 / E5 只改文案与只读输出字段。
 - **观察（未改，记为后续）**：成功提示框复用确认框外观，带警告三角与多余的「Cancel」；顶部错误条把多行消息压成一行；未收尾横幅在时工具栏「更新」「交付」仍可点（后端会拒，不会出事）。

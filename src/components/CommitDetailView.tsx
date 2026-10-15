@@ -16,8 +16,11 @@ interface CommitDetailViewProps {
   diff: DiffData
   /** 仓库路径，File Tree 标签要用它去读这个提交的整棵树。 */
   repoPath: string | null
-  /** 选中另一个提交：svn 节点详情里点开收着的本地提交、或「返回 rN」时用。 */
-  onSelectCommit?: (id: string) => void
+  /**
+   * 选中另一个提交：svn 节点详情里点开收着的本地提交、或「返回 rN」时用。
+   * 必传——那几行是看收起的提交的唯一入口，不能渲染成点了没反应的按钮（2026-10-16 review）。
+   */
+  onSelectCommit: (id: string) => void
   /** `commit` 是收进这个 svn 节点、不在图上的本地提交时传入，顶上给「返回 rN」。 */
   backTo?: CommitNode | null
 }
@@ -128,7 +131,7 @@ export function CommitDetailView({ commit, diff, repoPath, onSelectCommit, backT
                 type="button"
                 className="commit-delivered-item"
                 title="查看这个提交自己的改动"
-                onClick={() => onSelectCommit?.(d.id)}
+                onClick={() => onSelectCommit(d.id)}
               >
                 <span className="commit-delivered-sha">{d.id.slice(0, 7)}</span> {d.message}
               </button>
@@ -151,10 +154,13 @@ export function CommitDetailView({ commit, diff, repoPath, onSelectCommit, backT
             </div>
           </>
         ) : (
+          // 不猜是谁的提交：交付之后同事紧跟着提交时，自己交付的 revision 也没在本机记过（2026-10-16 review）
           <p className="commit-detail-note">
-            {svnDiffGap(commit) === 'prev' ? '前一个' : '这个'} revision 不是在本机交付或更新时记下的
-            （多半是同事的提交），看文件差异要联网
-            （<code>svn diff -c {commit.svnRev}</code>），属于 Phase 4，本期还没做。
+            {svnDiffGap(commit) === 'prev'
+              ? `本机没有记下前一个 revision（r${prevRev}）的内容，算不出这一版改了什么。`
+              : `本机没有记下 r${commit.svnRev} 的内容，算不出它改了什么。`}
+            看文件差异要联网（<code>svn diff -c {commit.svnRev}</code>），属于 Phase 4，本期还没做。
+            {delivered && '上面的本地提交可以点开，看各自的改动。'}
           </p>
         )}
       </div>
@@ -168,7 +174,7 @@ export function CommitDetailView({ commit, diff, repoPath, onSelectCommit, backT
           <button
             type="button"
             className="commit-detail-back"
-            onClick={() => onSelectCommit?.(backTo.id)}
+            onClick={() => onSelectCommit(backTo.id)}
           >
             ← 返回 r{backTo.svnRev}
           </button>

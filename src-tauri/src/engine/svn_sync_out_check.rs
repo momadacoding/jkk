@@ -292,7 +292,9 @@ pub(crate) fn changed_files(
 fn outside_changes(repo: &str, cfg: &SvnConfig) -> Result<Vec<String>> {
     let roots = normalize_roots(&cfg.whitelist);
     let mut local = Vec::new();
-    // 所有条目的祖先路径。是别的条目祖先的那些就是目录
+    // 只因为「不见了」才算改动的条目；其中是别的条目祖先的就是被删掉的目录
+    let mut only_missing = std::collections::HashSet::new();
+    // 所有条目的祖先路径
     let mut parents = std::collections::HashSet::new();
     let mut conflicted = Vec::new();
     for t in svn_targets(repo, &cfg.whitelist)? {
@@ -323,14 +325,21 @@ fn outside_changes(repo: &str, cfg: &SvnConfig) -> Result<Vec<String>> {
             let changed = matches!(e.item.as_str(), "modified" | "missing" | "replaced")
                 || e.props == "modified";
             if changed {
+                if e.item == "missing" && e.props != "modified" {
+                    only_missing.insert(e.path.clone());
+                }
                 local.push(e.path.clone());
             }
         }
     }
-    // 目录不是「你改过的文件」：`git rm` 删掉目录里最后一个文件时 git 顺手删掉空目录，svn 把
-    // 目录本身报成 missing，没有扩展名就被当成了被排除的文件（2026-10-13 E2E 场景 1 实测）。
-    // 目录里真正被改动的非 W-file 会作为它自己的条目报出来，不会漏
-    let mut out: Vec<String> = local.into_iter().filter(|p| !parents.contains(p)).collect();
+    // 被删掉的目录不是「你改过的文件」：`git rm` 删掉目录里最后一个文件时 git 顺手删掉空目录，
+    // svn 把目录本身报成 missing，没有扩展名就被当成了被排除的文件（2026-10-13 E2E 场景 1 实测）。
+    // 目录里真正被改动的非 W-file 会作为它自己的条目报出来，不会漏。
+    // 只跳过这一种：目录的属性改动、replaced 是目录自己的本地改动，照样要确认（2026-10-16 review）
+    let mut out: Vec<String> = local
+        .into_iter()
+        .filter(|p| !(only_missing.contains(p) && parents.contains(p)))
+        .collect();
     if !conflicted.is_empty() {
         return Err(GitError::new(
             "sync_out_svn_conflicted",

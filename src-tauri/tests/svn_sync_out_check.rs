@@ -223,6 +223,21 @@ fn a_directory_removed_by_hand_still_lists_the_files_git_does_not_manage() {
 }
 
 #[test]
+fn a_directory_property_change_is_listed_even_when_a_file_inside_also_changed() {
+    // 2026-10-16 review 第 3 条：上面那条只该跳过「目录整个不见了」，不能跳过所有带子条目的目录。
+    // 在 TortoiseSVN 里改了目录的 svn:ignore，同时目录里一个 W-file 也改了：属性改动照样要确认
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/Art/y.cs", "y\n");
+    update(&fx);
+    svn(&fx.wc(), &["propset", "svn:ignore", "*.tmp", "Code/Art"]);
+    write(&fx, "Code/Art/y.cs", "y2\n");
+    git(&fx, &["commit", "-qam", "touch y"]);
+
+    let p = preview_sync_out(&fx.wc_str()).unwrap();
+    assert_eq!(p.outside_changes, vec!["Code/Art".to_string()]);
+}
+
+#[test]
 fn nothing_to_deliver_says_how_many_local_patches_were_set_aside() {
     // §8.3 + spec §13「D1 / D2 空清单」：提示是否全部改动都被标成了 Local-Only
     let fx = hybrid_with_colleague();

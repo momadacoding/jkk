@@ -15,8 +15,8 @@
 use crate::engine::git_cli::{run_git, run_git_code, run_git_env};
 use crate::engine::graph::parse_local_only;
 use crate::engine::svn_baseline::{
-    create_baseline_commit, move_baseline_ref, parse_trailer, read_baseline, swap_index_to_tree,
-    TempIndex, Trailer,
+    create_baseline_commit_with, move_baseline_ref, parse_trailer, read_baseline,
+    swap_index_to_tree, TempIndex, Trailer,
 };
 use crate::engine::svn_cli::{run_svn, run_svn_code};
 use crate::engine::svn_config::{read_config, SvnConfig, BASELINE_BRANCH};
@@ -566,7 +566,9 @@ fn capture_delivered(repo: &str, cfg: &SvnConfig, j: &mut Journal) -> Result<()>
         uuid: pre.uuid,
     };
     // 父提交是交付树，不是旧基线（spec §8.2.2；§7.6 末「不能套用 S7 的旧基线父」）
-    let commit = create_baseline_commit(repo, &tree, Some(&deliver), &trailer)?;
+    // 另记真正提交出去的 revision：D5 与 D6 之间同事又提交时，trailer 记的是同事那个
+    let commit =
+        create_baseline_commit_with(repo, &tree, Some(&deliver), &trailer, j.committed_rev)?;
     // 移动 ref 前记录 newBaselineOid（§7.6）
     j.new_baseline_oid = Some(commit);
     svn_journal::write(repo, j)

@@ -3110,9 +3110,9 @@ journal / stash，停止录制基线，指出受影响的 WC / 文件，交由 T
   否则 SVN 仓库没有 master，lane 0 归行序最靠前的分支，它沿第一父链认领走几个 revision，剩下的
   被另一条分支带走——主线断成两列两色。不认 `svn/base`：比基线新、还没更新的 revision 在它上面。
 - **svn 节点画成菱形**（车道色填充、白边），本地提交仍是圆点。不用颜色区分——颜色归车道。
-- 已知不精确：基线 trailer 记的是 D6 更新到的 revision，D5 与 D6 之间同事又提交过时，`deliveredFrom`
-  会挂在同事那个 revision 上。界面只写「本地提交：…」，这种少见情况下会挂错 revision。精确对应要把 `committedRev` 写进
-  基线 commit，留作后续。
+- 基线 trailer 记的是 D6 更新到的 revision，D5 与 D6 之间同事又提交过时它是同事的。交付录的基线因此
+  另记一行 `Delivered-Rev: N`（D5 的 `committedRev`），`deliveredFrom` 按它归属（2026-10-16）。
+  早于此录的基线没有这一行，退回按 trailer 归属，那几次交付在这种情况下仍挂在同事的 revision 上。
 
 ### 10.4 数据模型改动
 

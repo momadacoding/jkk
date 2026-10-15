@@ -112,7 +112,15 @@ export function spliceHistory(
     }
   }
   const loaded = new Set(svnRevs.map((r) => svnId(r.rev)))
-  const delivered = deliveredCommits(gitCommits, baselineToSvn, loaded, tips)
+  // 收起的提交归到哪个 svn 节点：交付录的基线记了真正提交出去的 revision 就认它，
+  // 否则（旧基线）退回基线自己的 revision
+  const deliveredTo = new Map(baselineToSvn)
+  for (const c of gitCommits) {
+    if (c.deliveredRev !== undefined && baselineToSvn.has(c.id)) {
+      deliveredTo.set(c.id, svnId(c.deliveredRev))
+    }
+  }
+  const delivered = deliveredCommits(gitCommits, deliveredTo, loaded, tips)
 
   // ① SVN 序列 → 链
   const svnNodes: CommitNode[] = svnRevs.map((r, i) => {
@@ -208,7 +216,8 @@ function dateOrder(nodes: CommitNode[]): CommitNode[] {
  */
 function deliveredCommits(
   gitCommits: CommitNode[],
-  baselineToSvn: Map<string, string>,
+  /** 基线 commit → 收在它下面的提交归哪个 svn 节点（键集就是全部基线）。 */
+  deliveredTo: Map<string, string>,
   loaded: Set<string>,
   tips: Iterable<string>,
 ): { hidden: Set<string>; bySvn: Map<string, CommitNode[]> } {
@@ -226,20 +235,20 @@ function deliveredCommits(
   // 基线对应的 revision 还没拉进来（首次打开、只翻了一页）时不算数：收进一个不画的节点，
   // 交付的提交就整个看不见了（最终 review 第 6 条）。拉到之后下一次接合自然收起
   const settled = (k: string) => {
-    const svn = baselineToSvn.get(k)
+    const svn = deliveredTo.get(k)
     return svn !== undefined && loaded.has(svn)
   }
   const hidden = new Set<string>()
   // 隐藏的提交记到哪个 svn 节点：沿子节点往上找到的第一条基线
   const owner = new Map<string, string>()
   for (const c of gitCommits) {
-    if (baselineToSvn.has(c.id) || pinned.has(c.id)) continue
+    if (deliveredTo.has(c.id) || pinned.has(c.id)) continue
     const kids = children.get(c.id) ?? []
     if (kids.length === 0) continue
     if (!kids.every((k) => settled(k) || hidden.has(k))) continue
     hidden.add(c.id)
     const k = kids[0]
-    const svn = baselineToSvn.get(k) ?? owner.get(k)
+    const svn = deliveredTo.get(k) ?? owner.get(k)
     if (svn !== undefined) owner.set(c.id, svn)
   }
   const bySvn = new Map<string, CommitNode[]>()
@@ -281,16 +290,28 @@ export function svnDiffGap(c: CommitNode): 'self' | 'prev' | null {
 /**
  * svn 节点详情里要不要列出它收起来的本地提交，列哪些。
  *
- * 只有一个提交、标题又和 SVN 信息一样时，这一栏只是把上面那行再说一遍（2026-10-15
- * 用户反馈），不显示。一次交付了多个提交、或交付时改写了信息时，这里是唯一还能看到
- * 原提交标题和 hash 的地方，照常列出。git 侧的 `message` 只有标题，所以 SVN 信息只比第一行。
+ * 只有一个提交、标题又和 SVN 信息一样、下面也能看到它的改动时，这一栏只是把上面再说一遍
+ * （2026-10-15 用户反馈），不显示。其余情况照常列出：多个提交、交付时改写了信息，或者这里
+ * 算不出文件变化——这一栏是点开它们看改动的唯一入口（2026-10-16 review）。
  */
 export function deliveredNote(c: CommitNode): CommitNode[] | null {
   const from = c.deliveredFrom
   if (c.vcs !== 'svn' || !from || from.length === 0) return null
-  const svnSubject = c.message.trim().split(/\r?\n/)[0].trim()
-  if (from.length === 1 && from[0].message.trim() === svnSubject) return null
-  return from
+  const redundant =
+    from.length === 1 &&
+    c.baselineOid !== undefined &&
+    c.diffBase !== undefined &&
+    from[0].message.trim() === summaryOf(c.message)
+  return redundant ? null : from
+}
+
+/**
+ * 与 git 的 `summary()` 同样取法：第一段（到第一个空行为止），段内换行并成空格、空白压成一个。
+ * git 侧的 `message` 就是这样来的，SVN 信息只取第一行的话，跨行的标题永远对不上（2026-10-16 review）。
+ */
+function summaryOf(message: string): string {
+  const firstParagraph = message.trim().split(/\r?\n\s*\r?\n/)[0]
+  return firstParagraph.replace(/\s+/g, ' ').trim()
 }
 
 /**
