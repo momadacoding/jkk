@@ -6,6 +6,7 @@ import {
   remapRefs,
   selectionDiffScope,
   spliceHistory,
+  svnDiffGap,
   type SvnRevNode,
 } from '@/engine/svnGraph'
 import type { CommitNode } from '@/engine/types'
@@ -408,6 +409,27 @@ describe('selectionDiffScope', () => {
 
   it('没有选中时不请求', () => {
     expect(selectionDiffScope(commits, null)).toBeNull()
+  })
+})
+
+describe('svnDiffGap', () => {
+  const svnNode = (extra: Partial<CommitNode>): CommitNode => ({ ...git('svn:18', ['svn:17']), vcs: 'svn', ...extra })
+
+  it('两版都在本机记过：能算，没有缺口', () => {
+    expect(svnDiffGap(svnNode({ baselineOid: 'B18', diffBase: 'B17' }))).toBeNull()
+  })
+
+  it('自己没在本机记过（同事刚提交、还没更新）：说「这个」，不能说「前一个」', () => {
+    // 2026-10-15 演示：r18 是同事的，r17 是我交付的，原文案说「前一版没有本地基线」
+    expect(svnDiffGap(svnNode({}))).toBe('self')
+  })
+
+  it('自己有、前一个没有（同事的 revision 之后我交付）：说「前一个」', () => {
+    expect(svnDiffGap(svnNode({ baselineOid: 'B18' }))).toBe('prev')
+  })
+
+  it('git 节点没有这回事', () => {
+    expect(svnDiffGap(git('abc', []))).toBeNull()
   })
 })
 

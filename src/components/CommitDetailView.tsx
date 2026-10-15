@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { Panel, Group, Separator } from 'react-resizable-panels'
 import type { CommitNode, DiffData } from '../engine/types'
 import { buildFileTree } from '../engine/fileTree'
-import { deliveredNote } from '../engine/svnGraph'
+import { deliveredNote, svnDiffGap } from '../engine/svnGraph'
 import { DiffView } from './DiffView'
 import { FileTree } from './FileTree'
 import { FileContentView } from './FileContentView'
@@ -137,7 +137,8 @@ export function CommitDetailView({ commit, diff, repoPath }: CommitDetailViewPro
           </>
         ) : (
           <p className="commit-detail-note">
-            前一个 revision 不是在本机交付或更新时记下的（多半是同事的提交），看文件差异要联网
+            {svnDiffGap(commit) === 'prev' ? '前一个' : '这个'} revision 不是在本机交付或更新时记下的
+            （多半是同事的提交），看文件差异要联网
             （<code>svn diff -c {commit.svnRev}</code>），属于 Phase 4，本期还没做。
           </p>
         )}

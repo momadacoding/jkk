@@ -267,6 +267,18 @@ export function selectionDiffScope(commits: CommitNode[], selectedId: string | n
 }
 
 /**
+ * svn 节点为什么本地算不出文件变化：`'self'` 自己没在本机记过（同事刚提交、还没更新），
+ * `'prev'` 自己有、图上前一个没有（同事的 revision 之后交付或更新的）。能算或不是 svn 节点时 `null`。
+ *
+ * 两种说法不能混：同事的 r18 紧跟在我交付的 r17 之后时，说「前一个 revision 没在本机记过」
+ * 是错的（2026-10-15 演示）。
+ */
+export function svnDiffGap(c: CommitNode): 'self' | 'prev' | null {
+  if (c.vcs !== 'svn' || (c.baselineOid && c.diffBase)) return null
+  return c.baselineOid ? 'prev' : 'self'
+}
+
+/**
  * svn 节点详情里要不要列出它收起来的本地提交，列哪些。
  *
  * 只有一个提交、标题又和 SVN 信息一样时，这一栏只是把上面那行再说一遍（2026-10-15
