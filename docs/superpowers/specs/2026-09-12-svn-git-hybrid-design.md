@@ -3148,7 +3148,7 @@ export interface CommitNode {
 | `Toolbar` | 按 `capabilities`：Fetch / Pull / Push → Update / Deliver；隐藏 Worktree / Tag / PR |
 | `CommitRow` | `vcs === 'svn'` 时显示 `r12346` 而非短 hash，换配色；`localOnly` 加「仅本地」角标（§6.7） |
 | `LocalChangesView` 的提交框 | 新增「仅本地，不交付」勾选框，勾上即在 message 追加 `Local-Only: true` trailer |
-| `CommitDetailView` | svn 节点的 diff 走 `svn diff -c N`（**需要网络**）。第一期只对白名单内路径显示内容，美术资产只列文件名和状态。**Phase 3a 补（2026-10-11）**：前后两个节点都有本地基线时（交付或更新录下的），不走网络，直接比两版基线（`read_diff` 的 `range:<a>..<b>` scope，只读；格式不对报 `bad_diff_scope`，不能退回工作区 diff）；前一个节点没有本地基线（同事的 revision）时如实说明要等 Phase 4，不拿更早的基线冒充。另列收起来的本地提交（一行「本地提交：hash 标题」；只有一个且标题与 SVN 信息第一行相同时不列，2026-10-15） |
+| `CommitDetailView` | svn 节点的 diff 走 `svn diff -c N`（**需要网络**）。第一期只对白名单内路径显示内容，美术资产只列文件名和状态。**Phase 3a 补（2026-10-11）**：前后两个节点都有本地基线时（交付或更新录下的），不走网络，直接比两版基线（`read_diff` 的 `range:<a>..<b>` scope，只读；格式不对报 `bad_diff_scope`，不能退回工作区 diff）；前一个节点没有本地基线（同事的 revision）时如实说明要等 Phase 4，不拿更早的基线冒充。另列收起来的本地提交（每个一行、可点开看它自己的改动，点开后可「返回 rN」；只有一个且标题与 SVN 信息第一行相同时不列，2026-10-15/16） |
 | 新增 `SvnExternalView` | 白名单外的 svn 改动，只读列表 + revert 入口 |
 | 新增 `SyncDialog` | 更新 / 交付流程 UI，含冲突解决引导与交付确认关口 |
 | 新增 `BaselineBanner` | 失同步 / 同步未完成 / 交付状态未知 |

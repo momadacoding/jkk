@@ -3,6 +3,7 @@ import {
   baselineMap,
   commitDiffScope,
   deliveredNote,
+  findDelivered,
   remapRefs,
   selectionDiffScope,
   spliceHistory,
@@ -203,11 +204,12 @@ describe('spliceHistory：已交付的本地提交（Phase 3a）', () => {
     expect(out.map((c) => c.id)).toEqual(['local', 'svn:3', 'svn:2', 'svn:1'])
   })
 
-  it('svn 节点记下录这条基线之前交付的本地提交', () => {
+  it('svn 节点记下录这条基线之前交付的本地提交——整条提交原样留着，详情里点开要用', () => {
+    // 2026-10-16 用户要求能分别看这几个提交的改动：只记 id + 标题时详情头缺作者、时间、父提交
     const out = spliceHistory([svn(3), svn(2), svn(1)], delivered(), ['local'])
     const at = (id: string) => out.find((c) => c.id === id)!
-    expect(at('svn:3').deliveredFrom).toEqual([{ id: 'many', message: 'many files' }])
-    expect(at('svn:2').deliveredFrom).toEqual([{ id: 'classA', message: 'class A' }])
+    expect(at('svn:3').deliveredFrom).toEqual([git('many', ['B2'], { message: 'many files' })])
+    expect(at('svn:2').deliveredFrom).toEqual([git('classA', ['B1'], { message: 'class A' })])
     expect(at('svn:1').deliveredFrom).toBeUndefined()
   })
 
@@ -255,7 +257,7 @@ describe('spliceHistory：已交付的本地提交（Phase 3a）', () => {
     const out = spliceHistory([svn(3), svn(1)], delivered(), ['local'])
     expect(out.some((c) => c.id === 'classA')).toBe(true)
     expect(out.some((c) => c.id === 'many')).toBe(false) // r3 在，照常收起
-    expect(out.find((c) => c.id === 'svn:3')!.deliveredFrom).toEqual([{ id: 'many', message: 'many files' }])
+    expect(out.find((c) => c.id === 'svn:3')!.deliveredFrom!.map((d) => d.id)).toEqual(['many'])
   })
 
   it('「更新」录的基线以旧基线为父，什么都不隐藏', () => {
@@ -434,29 +436,27 @@ describe('svnDiffGap', () => {
 })
 
 describe('deliveredNote', () => {
-  const node = (message: string, deliveredFrom?: { id: string; message: string }[]): CommitNode => ({
+  const node = (message: string, deliveredFrom?: CommitNode[]): CommitNode => ({
     ...git('svn:12', []),
     vcs: 'svn',
     message,
     deliveredFrom,
   })
+  const dc = (id: string, message: string) => git(id, ['B'], { message })
 
   it('只有一个本地提交、标题与 SVN 信息相同：不显示，否则只是重复（2026-10-15 用户反馈）', () => {
-    expect(deliveredNote(node('e2e8 X8', [{ id: 'e36fec9', message: 'e2e8 X8' }]))).toBeNull()
+    expect(deliveredNote(node('e2e8 X8', [dc('e36fec9', 'e2e8 X8')]))).toBeNull()
     // 首尾空白、CRLF；SVN 多行信息只比第一行（git 侧只有标题）
-    expect(deliveredNote(node(' e2e8 X8\r\n\r\n细节\r\n', [{ id: 'e36fec9', message: 'e2e8 X8' }]))).toBeNull()
+    expect(deliveredNote(node(' e2e8 X8\r\n\r\n细节\r\n', [dc('e36fec9', 'e2e8 X8')]))).toBeNull()
   })
 
   it('交付时改写了信息：显示', () => {
-    const from = [{ id: 'e36fec9', message: 'e2e8 X8' }]
+    const from = [dc('e36fec9', 'e2e8 X8')]
     expect(deliveredNote(node('e2e8 交付 X8', from))).toEqual(from)
   })
 
   it('一次交付了多个提交：全部显示，哪怕某一个和 SVN 信息相同', () => {
-    const from = [
-      { id: 'c2', message: '修音效' },
-      { id: 'c1', message: '修跳跃' },
-    ]
+    const from = [dc('c2', '修音效'), dc('c1', '修跳跃')]
     expect(deliveredNote(node('修跳跃', from))).toEqual(from)
   })
 
@@ -464,5 +464,28 @@ describe('deliveredNote', () => {
     expect(deliveredNote(node('r12'))).toBeNull()
     expect(deliveredNote(node('r12', []))).toBeNull()
     expect(deliveredNote(git('abc', []))).toBeNull()
+  })
+})
+
+describe('findDelivered', () => {
+  const c1 = git('c1', ['B1'], { message: '修跳跃' })
+  const c2 = git('c2', ['c1'], { message: '修音效' })
+  const r16: CommitNode = { ...git('svn:16', ['svn:15']), vcs: 'svn', svnRev: 16, deliveredFrom: [c2, c1] }
+  const commits = [git('top', ['svn:16']), r16, { ...git('svn:15', []), vcs: 'svn' as const, svnRev: 15 }]
+
+  it('收进 svn 节点的提交找得到，连同收着它的那个 svn 节点（详情要显示「返回 r16」）', () => {
+    expect(findDelivered(commits, 'c1')).toEqual({ commit: c1, owner: r16 })
+    expect(findDelivered(commits, 'c2')!.owner.svnRev).toBe(16)
+  })
+
+  it('图上的提交、不存在的 id、空选中：找不到', () => {
+    expect(findDelivered(commits, 'top')).toBeNull()
+    expect(findDelivered(commits, 'nope')).toBeNull()
+    expect(findDelivered(commits, null)).toBeNull()
+    expect(findDelivered([], 'c1')).toBeNull()
+  })
+
+  it('选中它时按 oid 读 diff（只读，与 stash 同一条路）', () => {
+    expect(selectionDiffScope(commits, 'c1')).toBe('commit:c1')
   })
 })

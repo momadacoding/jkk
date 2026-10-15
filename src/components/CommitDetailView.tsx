@@ -16,6 +16,10 @@ interface CommitDetailViewProps {
   diff: DiffData
   /** 仓库路径，File Tree 标签要用它去读这个提交的整棵树。 */
   repoPath: string | null
+  /** 选中另一个提交：svn 节点详情里点开收着的本地提交、或「返回 rN」时用。 */
+  onSelectCommit?: (id: string) => void
+  /** `commit` 是收进这个 svn 节点、不在图上的本地提交时传入，顶上给「返回 rN」。 */
+  backTo?: CommitNode | null
 }
 
 interface TreeListing {
@@ -37,7 +41,7 @@ function CommitHeader({ commit }: { commit: CommitNode }) {
   )
 }
 
-export function CommitDetailView({ commit, diff, repoPath }: CommitDetailViewProps) {
+export function CommitDetailView({ commit, diff, repoPath, onSelectCommit, backTo }: CommitDetailViewProps) {
   const [tab, setTab] = useState<Tab>('commit')
   const [picked, setPicked] = useState<string | null>(null)
   const [listing, setListing] = useState<TreeListing | null>(null)
@@ -112,11 +116,22 @@ export function CommitDetailView({ commit, diff, repoPath }: CommitDetailViewPro
         <pre className="commit-detail-message">{commit.message}</pre>
         {delivered && (
           <div className="commit-delivered">
-            本地提交：
+            <div className="commit-delivered-title">
+              {delivered.length > 1
+                ? `这次交付包含 ${delivered.length} 个本地提交：`
+                : '这次交付来自本地提交：'}
+            </div>
+            {/* 这些提交不在图上，这里是唯一的入口：点开看它自己的改动（2026-10-16 用户要求） */}
             {delivered.map((d) => (
-              <span key={d.id} className="commit-delivered-item">
-                <code>{d.id.slice(0, 7)}</code> {d.message}
-              </span>
+              <button
+                key={d.id}
+                type="button"
+                className="commit-delivered-item"
+                title="查看这个提交自己的改动"
+                onClick={() => onSelectCommit?.(d.id)}
+              >
+                <span className="commit-delivered-sha">{d.id.slice(0, 7)}</span> {d.message}
+              </button>
             ))}
           </div>
         )}
@@ -149,6 +164,15 @@ export function CommitDetailView({ commit, diff, repoPath }: CommitDetailViewPro
   return (
     <div className="commit-detail">
       <div className="commit-detail-tabs">
+        {backTo && (
+          <button
+            type="button"
+            className="commit-detail-back"
+            onClick={() => onSelectCommit?.(backTo.id)}
+          >
+            ← 返回 r{backTo.svnRev}
+          </button>
+        )}
         <button className={tab === 'commit' ? 'active' : ''} onClick={() => setTab('commit')}>Commit</button>
         <button className={tab === 'changes' ? 'active' : ''} onClick={() => setTab('changes')}>
           Changes{diff.files.length > 0 ? ` (${diff.files.length})` : ''}

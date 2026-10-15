@@ -24,7 +24,7 @@ import { createSvnSyncOutFlow } from './svnSyncOutFlow'
 import { useDeliverDialog } from './DeliverDialog'
 import SvnInitWizard from './SvnInitWizard'
 import BaselineBanner from './BaselineBanner'
-import { baselineMap } from '../engine/svnGraph'
+import { baselineMap, findDelivered } from '../engine/svnGraph'
 import { describeHealth, describePinned, healthNeedsRebuild } from '../engine/svnInit'
 import { MIGRATE_EOL_WARNING } from '../engine/svnSync'
 import { samePath } from '../engine/path'
@@ -493,9 +493,15 @@ export function RepoTab({
   // stash 提交不被任何分支引用，所以不在 load_graph 的输出里。选中一条 stash 时
   // 从它自己的元数据现搭一个 CommitNode，否则详情面板只会显示 "Select a commit"——
   // diff 明明已经取回来了，却因为查不到提交而整片空白。
+  // 收进 svn 节点的本地提交也不在图上：详情里点开它时显示它自己，并能返回那个 svn 节点
+  const delivered = useMemo(
+    () => findDelivered(state.commits, state.selectedId),
+    [state.commits, state.selectedId],
+  )
   const detailCommit = useMemo(() => {
     const fromGraph = state.commits.find((c) => c.id === state.selectedId)
     if (fromGraph) return fromGraph
+    if (delivered) return delivered.commit
     const stash = state.stashes.find((s) => s.hash === state.selectedId)
     if (!stash) return null
     return {
@@ -505,7 +511,7 @@ export function RepoTab({
       time: stash.time,
       message: stash.message,
     }
-  }, [state.commits, state.stashes, state.selectedId])
+  }, [state.commits, state.stashes, state.selectedId, delivered])
 
   if (state.loading && state.commits.length === 0) return <div style={{ padding: 16 }}>Loading...</div>
 
@@ -809,6 +815,8 @@ export function RepoTab({
                     commit={detailCommit}
                     diff={state.diff}
                     repoPath={state.path}
+                    onSelectCommit={selectCommit}
+                    backTo={delivered?.owner ?? null}
                   />
                 </Panel>
               </Group>

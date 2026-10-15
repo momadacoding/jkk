@@ -74,8 +74,10 @@ export interface CommitNode {
    *
    * 不是「这个 revision 就是这些提交」：基线记的是交付之后更新到的 revision，
    * 中间同事若又提交过，它就是同事的那个 revision。
+   *
+   * 存整条提交（`load_graph` 给的原样，parents 未改写）：详情里点开单个提交要显示作者、时间、父提交。
    */
-  deliveredFrom?: { id: string; message: string }[]
+  deliveredFrom?: CommitNode[]
   /** 仅 svn 节点：记录这个 revision 的本地基线 commit（有多条时取最新）。 */
   baselineOid?: string
   /** 仅 svn 节点：图上下一个（更早的）svn 节点的本地基线。两者都在才能本地算文件变化。 */

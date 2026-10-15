@@ -211,7 +211,7 @@ function deliveredCommits(
   baselineToSvn: Map<string, string>,
   loaded: Set<string>,
   tips: Iterable<string>,
-): { hidden: Set<string>; bySvn: Map<string, { id: string; message: string }[]> } {
+): { hidden: Set<string>; bySvn: Map<string, CommitNode[]> } {
   const pinned = new Set(tips)
   // 追加用 push 而不是展开复制：一次交付一长串提交时，展开是每个键 O(k²)（最终 review 第 9 条）
   const append = <T>(m: Map<string, T[]>, k: string, v: T) => {
@@ -242,11 +242,11 @@ function deliveredCommits(
     const svn = baselineToSvn.get(k) ?? owner.get(k)
     if (svn !== undefined) owner.set(c.id, svn)
   }
-  const bySvn = new Map<string, { id: string; message: string }[]>()
+  const bySvn = new Map<string, CommitNode[]>()
   for (const c of gitCommits) {
     const svn = owner.get(c.id)
     if (svn === undefined) continue
-    append(bySvn, svn, { id: c.id, message: c.message })
+    append(bySvn, svn, c)
   }
   return { hidden, bySvn }
 }
@@ -285,12 +285,30 @@ export function svnDiffGap(c: CommitNode): 'self' | 'prev' | null {
  * 用户反馈），不显示。一次交付了多个提交、或交付时改写了信息时，这里是唯一还能看到
  * 原提交标题和 hash 的地方，照常列出。git 侧的 `message` 只有标题，所以 SVN 信息只比第一行。
  */
-export function deliveredNote(c: CommitNode): { id: string; message: string }[] | null {
+export function deliveredNote(c: CommitNode): CommitNode[] | null {
   const from = c.deliveredFrom
   if (c.vcs !== 'svn' || !from || from.length === 0) return null
   const svnSubject = c.message.trim().split(/\r?\n/)[0].trim()
   if (from.length === 1 && from[0].message.trim() === svnSubject) return null
   return from
+}
+
+/**
+ * 选中的是不是收进 svn 节点、不在图上的本地提交；是的话连同收着它的 svn 节点一起返回。
+ *
+ * 详情据此显示这个提交本身、并给「返回 rN」。它的 diff 不用另接：不在图上的选中本来就按
+ * oid 读（[`selectionDiffScope`]）。
+ */
+export function findDelivered(
+  commits: CommitNode[],
+  id: string | null,
+): { commit: CommitNode; owner: CommitNode } | null {
+  if (!id) return null
+  for (const owner of commits) {
+    const commit = owner.deliveredFrom?.find((d) => d.id === id)
+    if (commit) return { commit, owner }
+  }
+  return null
 }
 
 /**
