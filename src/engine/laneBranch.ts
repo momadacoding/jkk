@@ -32,18 +32,19 @@ export function computeLaneBranches(commits: CommitNode[], refs: RefPointer[]): 
   // owner 的起点就是它行序最靠前的自有提交：认领沿第一父链只往下走。
   // 不能用 OwnerInfo.minRow——第二父边会把它顶到合并那一行。
   const tipOf: string[] = new Array(owners.length)
-  // 已删分支要顺着「谁把我的 tip 当第二父合并了」往上找。按行序倒着收，
-  // 离 tip 最近（最早）的那次合并排前面。
+  // 已删分支要顺着「谁把我的 tip 当第二父合并了」往上找。按行序收完再整体反转，
+  // 离 tip 最近（最早）的那次合并排前面；不逐个 unshift，同一 tip 被合并很多次时会退化成平方级。
   const mergersOf = new Map<string, string[]>()
   for (const c of real) {
     const owner = ownerOf.get(c.id)
     if (owner !== undefined && tipOf[owner] === undefined) tipOf[owner] = c.id
     for (const p of c.parents.slice(1)) {
       const list = mergersOf.get(p) ?? []
-      list.unshift(c.id)
+      list.push(c.id)
       mergersOf.set(p, list)
     }
   }
+  for (const list of mergersOf.values()) list.reverse()
 
   const refsAt = new Map<string, RefPointer[]>()
   for (const r of refs) {
@@ -68,7 +69,8 @@ export function computeLaneBranches(commits: CommitNode[], refs: RefPointer[]): 
       } else {
         // 图是 DAG，按理不会成环；visiting 只是防御，不让脏数据把递归跑飞
         visiting.add(owner)
-        const into: string[] = []
+        // Set 保持插入顺序；用数组 includes 去重时，名字一多、嵌套一深就是平方级（2026-10-17 Codex review）
+        const into = new Set<string>()
         for (const merger of mergersOf.get(tip) ?? []) {
           const next = ownerOf.get(merger)
           if (next === undefined || visiting.has(next)) continue
@@ -78,10 +80,10 @@ export function computeLaneBranches(commits: CommitNode[], refs: RefPointer[]): 
               : up.kind === 'merged' ? up.into
                 : up.kind === 'svn' ? [formatLaneBranch(up)]
                   : []
-          for (const name of found) if (!into.includes(name)) into.push(name)
+          for (const name of found) into.add(name)
         }
         visiting.delete(owner)
-        result = into.length > 0 ? { kind: 'merged', into } : { kind: 'none' }
+        result = into.size > 0 ? { kind: 'merged', into: [...into] } : { kind: 'none' }
       }
     }
     memo.set(owner, result)
