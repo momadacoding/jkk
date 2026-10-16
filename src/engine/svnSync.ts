@@ -41,6 +41,9 @@ export interface BannerAction {
     | 'syncContinue'
     | 'syncAbort'
     | 'svnUpdate'
+    | 'syncOutCleanup'
+    | 'syncOutContinue'
+    | 'syncOutAbort'
   label: string
 }
 

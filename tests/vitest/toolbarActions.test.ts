@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { planToolbarAction, showsSvnUpdate } from '../../src/engine/toolbarActions'
-import type { Capabilities } from '../../src/engine/capabilities'
+import { planToolbarAction, showsSvnDeliver, showsSvnUpdate } from '../../src/engine/toolbarActions'
+import {
+  ALL_CAPABILITIES,
+  NO_GIT_ONLY_CAPABILITIES,
+  type Capabilities,
+} from '../../src/engine/capabilities'
 
 describe('planToolbarAction', () => {
   it('默认 fetch 只 prune，不碰其他远程', () => {
@@ -65,5 +69,12 @@ describe('showsSvnUpdate', () => {
   it('只在 SVN 混合仓库上出现', () => {
     expect(showsSvnUpdate(base)).toBe(false)
     expect(showsSvnUpdate({ ...base, vcs: 'svn', remotes: false })).toBe(true)
+  })
+})
+
+describe('showsSvnDeliver', () => {
+  it('「交付」与「更新」一样只在 SVN 混合仓库上出现', () => {
+    expect(showsSvnDeliver(NO_GIT_ONLY_CAPABILITIES)).toBe(true)
+    expect(showsSvnDeliver(ALL_CAPABILITIES)).toBe(false)
   })
 })

@@ -5,7 +5,9 @@
 //! 状态写盘之前崩溃，用户的 WIP 就只剩一个匿名 stash 条目，客户端重开后对它
 //! 一无所知（§7.3.1）。
 
-use app_lib::engine::svn_journal::{journal_path, read, remove, write, Flow, Journal, Phase};
+use app_lib::engine::svn_journal::{
+    journal_path, read, remove, write, Flow, Journal, Phase, SvnNode,
+};
 
 fn git_dir_fixture() -> tempfile::TempDir {
     let d = tempfile::tempdir().unwrap();
@@ -233,4 +235,78 @@ fn stash_applied_round_trips_and_is_omitted_when_false() {
     j.stash_applied = true;
     write(root, &j).unwrap();
     assert!(read(root).unwrap().unwrap().stash_applied);
+}
+
+#[test]
+fn a_sync_out_journal_round_trips_with_its_svn_snapshot() {
+    // D4 的撤销靠 svnStatusBefore（计划 B6），3b 的查证靠 svnAdded / svnDeleted / svnModified
+    // 与 expectedStartRev（spec §8.6.2）。少落一个字段，崩溃重开后就拼不回来
+    let fx = git_dir_fixture();
+    let root = fx.path().to_string_lossy().to_string();
+    let j = Journal {
+        opid: "op-out".into(),
+        flow: Flow::SyncOut,
+        phase: Phase::SvnStaged,
+        started_at: 1_757_000_000,
+        orig_branch: Some("work".into()),
+        orig_head: Some("e5d3f77".into()),
+        svn_added: vec!["Code/Deep/Nested/New.cs".into()],
+        svn_deleted: vec!["Code/Old.cs".into()],
+        svn_modified: vec!["Code/A.cs".into()],
+        svn_status_before: vec![
+            SvnNode {
+                path: "Code/Deep".into(),
+                status: "unversioned".into(),
+                dir: true,
+            },
+            SvnNode {
+                path: "Code/Old.cs".into(),
+                status: "missing".into(),
+                dir: false,
+            },
+        ],
+        svn_delta: vec![SvnNode {
+            path: "Code/Deep".into(),
+            status: "added".into(),
+            dir: true,
+        }],
+        new_parent_dirs: vec!["Code/Deep".into(), "Code/Deep/Nested".into()],
+        deliver_ref: Some("refs/mygitclient/deliver/op-out".into()),
+        deliver_oid: Some("d".repeat(40)),
+        commit_message: Some("修复跳跃".into()),
+        expected_start_rev: Some(12),
+        committed_rev: Some(13),
+        ..Default::default()
+    };
+    write(&root, &j).unwrap();
+    assert_eq!(read(&root).unwrap().as_ref(), Some(&j));
+
+    // 线序格式：字段名逐字是 camelCase，`dir` 为假时不写
+    let raw = std::fs::read_to_string(journal_path(&root)).unwrap();
+    for key in [
+        "svnStatusBefore",
+        "svnDelta",
+        "svnModified",
+        "deliverOid",
+        "committedRev",
+    ] {
+        assert!(raw.contains(&format!("\"{key}\"")), "缺字段 {key}：{raw}");
+    }
+    assert!(!raw.contains("\"dir\":false"), "{raw}");
+}
+
+#[test]
+fn a_journal_written_before_phase_3a_still_reads() {
+    // 2c 写出的 sync_in journal 没有任何新字段，读回来必须照常（新字段取空值）
+    let fx = git_dir_fixture();
+    let root = fx.path().to_string_lossy().to_string();
+    std::fs::write(
+        journal_path(&root),
+        r#"{"opid":"x","flow":"sync_in","phase":"stashed","startedAt":7,"origBranch":"work"}"#,
+    )
+    .unwrap();
+    let j = read(&root).unwrap().unwrap();
+    assert!(j.svn_status_before.is_empty() && j.svn_delta.is_empty());
+    assert_eq!(j.deliver_oid, None);
+    assert_eq!(j.committed_rev, None);
 }

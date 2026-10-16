@@ -618,27 +618,37 @@ pub(crate) fn checkout_verified(
     if on_target && stale.is_empty() {
         return Ok(());
     }
+    Err(checkout_failed(repo, branch, &stale, ran))
+}
+
+/// checkout 没切干净时的报错（计划 A15）。`sync_out` 的 detached checkout 也用它。
+pub(crate) fn checkout_failed(
+    repo: &str,
+    target: &str,
+    stale: &[String],
+    ran: Result<String>,
+) -> GitError {
     let files = if stale.is_empty() {
         String::new()
     } else {
-        format!("\n下面这些文件没能写进去或删掉：\n{}", list_paths(&stale))
+        format!("\n下面这些文件没能写进去或删掉：\n{}", list_paths(stale))
     };
     let git_said = match ran {
         Err(e) => format!("\ngit 原话：{}", e.message.trim()),
         Ok(_) => String::new(),
     };
     let root = Path::new(repo);
-    Err(GitError::new(
+    GitError::new(
         "sync_in_checkout_failed",
         format!(
-            "切到分支 `{branch}` 没有成功，多半是有程序占着文件（Unity / IDE）。{files}\n{}{git_said}",
+            "切到 `{target}` 没有成功，多半是有程序占着文件（Unity / IDE）。{files}\n{}{git_said}",
             describe(root, &find_blockers(root, 5))
         ),
-    ))
+    )
 }
 
 /// 白名单内被跟踪文件相对 HEAD 的改动（不含未跟踪）。
-fn tracked_changes(repo: &str, cfg: &SvnConfig) -> Result<Vec<String>> {
+pub(crate) fn tracked_changes(repo: &str, cfg: &SvnConfig) -> Result<Vec<String>> {
     let roots = normalize_roots(&cfg.whitelist);
     if roots.is_empty() {
         return Ok(Vec::new()); // 空 pathspec 会变成「全部」（§12.2）
@@ -659,7 +669,11 @@ fn tracked_changes(repo: &str, cfg: &SvnConfig) -> Result<Vec<String>> {
 /// 而同名未跟踪文件**即使内容相同**也会挡住之后的 checkout / rebase（2026-09-26 实测）。
 ///
 /// 已进索引的不算：那是被跟踪的改动，归 [`tracked_changes`] 管。
-fn untracked_leftovers(repo: &str, cfg: &SvnConfig, from: &[String]) -> Result<Vec<String>> {
+pub(crate) fn untracked_leftovers(
+    repo: &str,
+    cfg: &SvnConfig,
+    from: &[String],
+) -> Result<Vec<String>> {
     let roots = normalize_roots(&cfg.whitelist);
     if roots.is_empty() {
         return Ok(Vec::new()); // 空 pathspec 会变成「全部」（§12.2）
@@ -988,24 +1002,45 @@ fn settle_checkout_residue(repo: &str, cfg: &SvnConfig, j: &Journal, orig: &str)
     if let Some(old) = &j.baseline_oid_before {
         bases.push(old.clone());
     }
+    settle_residue(
+        repo,
+        cfg,
+        &bases,
+        orig,
+        "sync_in_unsafe_to_return",
+        "「继续」或「放弃」",
+    )
+}
+
+/// [`settle_checkout_residue`] 的核心，`sync_out` 的「停止收尾」也用（Task 8–10 里程碑
+/// review 第 2 条）：差异全是 `bases` 里原样存着的字节才写回，否则指名停下。
+pub(crate) fn settle_residue(
+    repo: &str,
+    cfg: &SvnConfig,
+    bases: &[String],
+    orig: &str,
+    unsafe_code: &str,
+    // 报错里让用户点的按钮：两个流程的横幅按钮名不同（交付没有「放弃」）
+    buttons: &str,
+) -> Result<()> {
     let stale = tracked_changes(repo, cfg)?;
-    let left = untracked_leftovers(repo, cfg, &bases)?;
+    let left = untracked_leftovers(repo, cfg, bases)?;
     if stale.is_empty() && left.is_empty() {
         return Ok(());
     }
     let mut foreign = Vec::new();
     for p in stale.iter().chain(&left) {
-        if !is_baseline_bytes(repo, &bases, p)? {
+        if !is_baseline_bytes(repo, bases, p)? {
             foreign.push(p.clone());
         }
     }
     if !foreign.is_empty() {
         return Err(GitError::new(
-            "sync_in_unsafe_to_return",
+            unsafe_code,
             format!(
                 "分支 `{orig}` 上下面这些文件的内容既不是分支里的、也不是基线里的——\
                  不知道是谁改的，不能覆盖：\n{}\n记录已保留。请先确认这些改动\
-                 （需要的话自己备份），再点「继续」或「放弃」。",
+                 （需要的话自己备份），再点{buttons}。",
                 list_paths(&foreign)
             ),
         ));
@@ -1021,7 +1056,7 @@ fn settle_checkout_residue(repo: &str, cfg: &SvnConfig, j: &Journal, orig: &str)
         let _ = std::fs::remove_file(Path::new(repo).join(p));
     }
     let mut remaining = tracked_changes(repo, cfg)?;
-    remaining.extend(untracked_leftovers(repo, cfg, &bases)?);
+    remaining.extend(untracked_leftovers(repo, cfg, bases)?);
     if !remaining.is_empty() {
         let root = Path::new(repo);
         return Err(GitError::new(
@@ -1039,7 +1074,7 @@ fn settle_checkout_residue(repo: &str, cfg: &SvnConfig, j: &Journal, orig: &str)
 }
 
 /// 磁盘上的 `p` 是不是某个基线 commit 里原样存着的字节（或者文件已经不在）。
-fn is_baseline_bytes(repo: &str, bases: &[String], p: &str) -> Result<bool> {
+pub(crate) fn is_baseline_bytes(repo: &str, bases: &[String], p: &str) -> Result<bool> {
     let path = Path::new(repo).join(p);
     let Ok(meta) = path.symlink_metadata() else {
         return Ok(true); // 磁盘上没有：按 HEAD 写回不会覆盖任何字节
@@ -1184,17 +1219,24 @@ fn published_baseline(repo: &str, j: &Journal) -> Result<String> {
 /// rebase 到别处，head-name 一模一样。本次的 rebase 由三样东西确定：重放的分支、
 /// 起点（S9 时 HEAD 就是 `origHead`）、目标（`svn/base`）。2026-09-26 实测
 /// `rebase-merge/` 下的 `orig-head` 与 `onto` 就是这两个完整 OID。
-fn require_our_rebase(repo: &str, j: &Journal) -> Result<()> {
-    let want_head = format!("refs/heads/{}", need(&j.orig_branch, "origBranch")?);
-    let want_orig = need(&j.orig_head, "origHead")?;
-    let want_onto = published_baseline(repo, j)?;
-    if rebase_state(repo, "head-name")?.as_deref() != Some(want_head.as_str())
-        || rebase_state(repo, "orig-head")?.as_deref() != Some(want_orig.as_str())
-        || rebase_state(repo, "onto")?.as_deref() != Some(want_onto.as_str())
-    {
+pub(crate) fn require_our_rebase(repo: &str, j: &Journal) -> Result<()> {
+    let onto = published_baseline(repo, j)?;
+    if !is_our_rebase(repo, j, &onto)? {
         return Err(state_changed("进行中的 rebase 不是本次同步发起的那一个"));
     }
     Ok(())
+}
+
+/// [`require_our_rebase`] 的判定部分。`sync_out` 用自己的基线核对与报错码调它
+/// （Task 8–10 里程碑 review 第 5 / 6 条）。
+pub(crate) fn is_our_rebase(repo: &str, j: &Journal, onto: &str) -> Result<bool> {
+    let want_head = format!("refs/heads/{}", need(&j.orig_branch, "origBranch")?);
+    let want_orig = need(&j.orig_head, "origHead")?;
+    Ok(
+        rebase_state(repo, "head-name")?.as_deref() == Some(want_head.as_str())
+            && rebase_state(repo, "orig-head")?.as_deref() == Some(want_orig.as_str())
+            && rebase_state(repo, "onto")?.as_deref() == Some(onto),
+    )
 }
 
 /// `.git/rebase-merge/<name>`（或 `rebase-apply/`）的内容。
@@ -1209,7 +1251,7 @@ fn rebase_state(repo: &str, name: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
-fn is_ancestor(repo: &str, a: &str, b: &str) -> Result<bool> {
+pub(crate) fn is_ancestor(repo: &str, a: &str, b: &str) -> Result<bool> {
     let (code, _) = run_git_code(repo, &["merge-base", "--is-ancestor", a, b])?;
     match code {
         0 => Ok(true),
@@ -1247,7 +1289,7 @@ fn require_on_old_baseline(repo: &str, j: &Journal) -> Result<()> {
     Ok(())
 }
 
-fn no_unfinished() -> GitError {
+pub(crate) fn no_unfinished() -> GitError {
     GitError::new(
         "sync_no_unfinished",
         "没有未收尾的同步记录，不需要继续或放弃。",
@@ -1257,7 +1299,6 @@ fn no_unfinished() -> GitError {
 fn sync_out_unsupported() -> GitError {
     GitError::new(
         "sync_out_not_supported",
-        "这条记录是「交付」流程留下的，本版本还不能替你收尾（Phase 3 提供）。\
-         在那之前请不要手工去动 stash 或分支指针。",
+        "这条记录是「交付」流程留下的。请用顶部横幅上交付那一组按钮处理，不要手工去动分支指针。",
     )
 }

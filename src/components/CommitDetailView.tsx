@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { Panel, Group, Separator } from 'react-resizable-panels'
 import type { CommitNode, DiffData } from '../engine/types'
 import { buildFileTree } from '../engine/fileTree'
+import { deliveredNote, svnDiffGap } from '../engine/svnGraph'
 import { DiffView } from './DiffView'
 import { FileTree } from './FileTree'
 import { FileContentView } from './FileContentView'
@@ -15,6 +16,13 @@ interface CommitDetailViewProps {
   diff: DiffData
   /** 仓库路径，File Tree 标签要用它去读这个提交的整棵树。 */
   repoPath: string | null
+  /**
+   * 选中另一个提交：svn 节点详情里点开收着的本地提交、或「返回 rN」时用。
+   * 必传——那几行是看收起的提交的唯一入口，不能渲染成点了没反应的按钮（2026-10-16 review）。
+   */
+  onSelectCommit: (id: string) => void
+  /** `commit` 是收进这个 svn 节点、不在图上的本地提交时传入，顶上给「返回 rN」。 */
+  backTo?: CommitNode | null
 }
 
 interface TreeListing {
@@ -36,7 +44,7 @@ function CommitHeader({ commit }: { commit: CommitNode }) {
   )
 }
 
-export function CommitDetailView({ commit, diff, repoPath }: CommitDetailViewProps) {
+export function CommitDetailView({ commit, diff, repoPath, onSelectCommit, backTo }: CommitDetailViewProps) {
   const [tab, setTab] = useState<Tab>('commit')
   const [picked, setPicked] = useState<string | null>(null)
   const [listing, setListing] = useState<TreeListing | null>(null)
@@ -89,13 +97,15 @@ export function CommitDetailView({ commit, diff, repoPath }: CommitDetailViewPro
     return <div className="commit-detail commit-detail-empty">Select a commit</div>
   }
 
-  // svn 节点：只显示元信息，**不拉 diff**。
+  // svn 节点。
   //
   // spec §11 的前端改动表写着「svn 节点的 diff 走 `svn diff -c N`」，但 §16 的
-  // 分期表把「svn 节点 diff」明确列在 **Phase 4**。两处冲突时按分期表走
-  // （它更晚、更具体）。这里如实说明，而不是给一个空白的文件列表——
-  // 空白会让人以为这个 revision 什么都没改。
+  // 分期表把它列在 **Phase 4**。不过前后两版都有本地基线时（交付或更新录下的），
+  // 两版基线之差本地就能算（`commitDiffScope` 的 `range:`），这里直接显示；
+  // 否则如实说明，而不是给一个空白的文件列表——空白会让人以为这个 revision 什么都没改。
   if (commit.vcs === 'svn') {
+    const prevRev = commit.parents[0]?.replace(/^svn:/, '')
+    const delivered = deliveredNote(commit)
     return (
       <div className="commit-detail">
         <div className="commit-head">
@@ -107,10 +117,52 @@ export function CommitDetailView({ commit, diff, repoPath }: CommitDetailViewPro
           </span>
         </div>
         <pre className="commit-detail-message">{commit.message}</pre>
-        <p className="commit-detail-note">
-          SVN 节点的文件差异要走一次网络请求（<code>svn diff -c {commit.svnRev}</code>），
-          属于 Phase 4，本期还没做。
-        </p>
+        {delivered && (
+          <div className="commit-delivered">
+            <div className="commit-delivered-title">
+              {delivered.length > 1
+                ? `这次交付包含 ${delivered.length} 个本地提交：`
+                : '这次交付来自本地提交：'}
+            </div>
+            {/* 这些提交不在图上，这里是唯一的入口：点开看它自己的改动（2026-10-16 用户要求） */}
+            {delivered.map((d) => (
+              <button
+                key={d.id}
+                type="button"
+                className="commit-delivered-item"
+                title="查看这个提交自己的改动"
+                onClick={() => onSelectCommit(d.id)}
+              >
+                <span className="commit-delivered-sha">{d.id.slice(0, 7)}</span> {d.message}
+              </button>
+            ))}
+          </div>
+        )}
+        {commit.diffBase ? (
+          <>
+            <p className="commit-detail-note">相对 r{prevRev} 的变化（只含 git 管理的文件）。</p>
+            <div className="commit-split">
+              <Group orientation="horizontal">
+                <Panel defaultSize="30%" minSize="15%" maxSize="60%">
+                  <FileTree nodes={changesTree} selectedPath={activePath} onSelect={setPicked} />
+                </Panel>
+                <Separator className="separator-v" />
+                <Panel minSize="30%">
+                  <DiffView diff={activeDiff} showPath={false} />
+                </Panel>
+              </Group>
+            </div>
+          </>
+        ) : (
+          // 不猜是谁的提交：交付之后同事紧跟着提交时，自己交付的 revision 也没在本机记过（2026-10-16 review）
+          <p className="commit-detail-note">
+            {svnDiffGap(commit) === 'prev'
+              ? `本机没有记下前一个 revision（r${prevRev}）的内容，算不出这一版改了什么。`
+              : `本机没有记下 r${commit.svnRev} 的内容，算不出它改了什么。`}
+            看文件差异要联网（<code>svn diff -c {commit.svnRev}</code>），属于 Phase 4，本期还没做。
+            {delivered && '上面的本地提交可以点开，看各自的改动。'}
+          </p>
+        )}
       </div>
     )
   }
@@ -118,6 +170,15 @@ export function CommitDetailView({ commit, diff, repoPath }: CommitDetailViewPro
   return (
     <div className="commit-detail">
       <div className="commit-detail-tabs">
+        {backTo && (
+          <button
+            type="button"
+            className="commit-detail-back"
+            onClick={() => onSelectCommit(backTo.id)}
+          >
+            ← 返回 r{backTo.svnRev}
+          </button>
+        )}
         <button className={tab === 'commit' ? 'active' : ''} onClick={() => setTab('commit')}>Commit</button>
         <button className={tab === 'changes' ? 'active' : ''} onClick={() => setTab('changes')}>
           Changes{diff.files.length > 0 ? ` (${diff.files.length})` : ''}

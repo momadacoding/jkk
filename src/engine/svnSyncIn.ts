@@ -179,7 +179,7 @@ export function describeSyncOutcome(o: SyncInOutcome): OutcomeNotice | null {
 const CONTINUE: BannerAction = { id: 'syncContinue', label: '继续' }
 const ABORT: BannerAction = { id: 'syncAbort', label: '放弃，回到更新前' }
 
-/** 横幅上的按钮。认不出的 phase（`sync_out` 的，Phase 3 才有）不给按钮。 */
+/** 横幅上的按钮。认不出的 phase（比如出现在更新记录里的交付阶段名）不给按钮。 */
 export function syncActions(phase: string): BannerAction[] {
   switch (phase) {
     case 'start':

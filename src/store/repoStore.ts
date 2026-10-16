@@ -19,7 +19,13 @@ import {
   type SyncState,
   type SyncStateUnreadable,
 } from '../engine/svnJournal'
-import { baselineMap, remapRefs, spliceHistory, type SvnRevNode } from '../engine/svnGraph'
+import {
+  baselineMap,
+  remapRefs,
+  selectionDiffScope,
+  spliceHistory,
+  type SvnRevNode,
+} from '../engine/svnGraph'
 
 import { toErrorCode, toErrorMessage } from '../engine/errors'
 import type {
@@ -31,6 +37,7 @@ import type {
 } from '../engine/svnInit'
 import { samePath } from '../engine/path'
 import type { SyncInExpect, SyncInOutcome, SyncInPreview } from '../engine/svnSyncIn'
+import type { SyncOutExpect, SyncOutOutcome, SyncOutPreview } from '../engine/svnSyncOut'
 import { nextSelection } from '../engine/selection'
 
 /** 后端 `svn_sync::RootRev`。 */
@@ -69,9 +76,16 @@ function serializeRootRevs(revs: RootRev[]): string {
  *
  * 所以判据必须是「这个仓库是不是 SVN 混合仓库」，而不是「svnRevs 空不空」。
  */
-function merge(s: RepoState, gitCommits: CommitNode[], svnRevs: SvnRevNode[]): CommitNode[] {
+function merge(
+  s: RepoState,
+  gitCommits: CommitNode[],
+  svnRevs: SvnRevNode[],
+  refs: RefPointer[] = s.refs,
+): CommitNode[] {
   if (s.capabilities.vcs !== 'svn') return gitCommits
-  return spliceHistory(svnRevs, gitCommits)
+  // ref 与 HEAD 是「已交付的提交」判据里的起点：还被它们指着的提交照常显示。
+  // `s.refs` 里指向基线的已经重映射成 `svn:N`，不影响——判据只看非基线提交
+  return spliceHistory(svnRevs, gitCommits, [...refs.map((r) => r.hash), s.headHash])
 }
 
 export interface RepoState {
@@ -285,6 +299,23 @@ export function svnSyncAbort(path: string): Promise<SyncInOutcome> {
   return invoke<SyncInOutcome>('svn_sync_abort', { path })
 }
 
+export function svnSyncOutPreview(path: string): Promise<SyncOutPreview> {
+  return invoke<SyncOutPreview>('svn_sync_out_preview', { path })
+}
+
+/** `expect` 的字段名是 camelCase，与后端 `SyncOutExpect` 的 serde 约定对齐（AGENTS.md §7.3）。 */
+export function svnSyncOut(path: string, expect: SyncOutExpect): Promise<SyncOutOutcome> {
+  return invoke<SyncOutOutcome>('svn_sync_out', { path, expect })
+}
+
+export function svnSyncOutContinue(path: string): Promise<SyncOutOutcome> {
+  return invoke<SyncOutOutcome>('svn_sync_out_continue', { path })
+}
+
+export function svnSyncOutAbort(path: string): Promise<SyncOutOutcome> {
+  return invoke<SyncOutOutcome>('svn_sync_out_abort', { path })
+}
+
 /**
  * 走一次行尾迁移：装规则 + 重录基线。
  *
@@ -458,7 +489,7 @@ export function useRepoStore() {
   const refreshGraph = async (path: string, preferredId?: string, force = false) => {
     const data = await invoke<GraphData>('load_graph', { path })
     setState((s) => {
-      const commits = merge(s, data.commits, s.svnRevs)
+      const commits = merge(s, data.commits, s.svnRevs, data.refs)
       // refs 必须跟着一起重映射：baseline commit 被从节点列表里删掉了，而
       // GraphView 按 `refByHash[node.commit.id]` 渲染标签——不映射的话
       // `svn/base` 匹配不到任何一行，**整个看不见**。
@@ -748,11 +779,10 @@ export function useRepoEffects(
   viewMode: string,
 ) {
   const { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, refreshSvnSyncState, auditSvnIfDue } = refreshers
+  // svn 节点有两版本地基线时读两版之差（`range:`）；不在图上的选中（stash）照旧按 oid 读
   const diffScope = viewMode === 'changes'
     ? 'workdir'
-    : state.selectedId
-      ? `commit:${state.selectedId}`
-      : null
+    : selectionDiffScope(state.commits, state.selectedId)
 
   useEffect(() => {
     if (!state.path || !diffScope) return

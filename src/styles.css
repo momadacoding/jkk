@@ -890,6 +890,92 @@ body {
   overflow-wrap: anywhere;
 }
 
+/* ---------- 交付确认框（DeliverDialog） ---------- */
+
+/* 内容多（清单 + 本地补丁 + 警告 + 输入框）：窄窗口或矮窗口里整框可滚，
+   按钮至少能滚到；清单与补丁列表各自限高，长清单不把输入框挤出视野 */
+.deliver-dialog {
+  max-height: 90vh;
+  overflow-y: auto;
+  /* 清单与补丁列表会出滚动条：不声明的话 WebView2 画的是系统默认的白色滚动条，
+     在深色框里白得刺眼（2026-10-11 真实窗口截图）。全应用的滚动条另行处理 */
+  color-scheme: dark;
+}
+
+/* 正文与 .dlg-warning / .dlg-progress 一样缩进到标题下面 */
+.deliver-files,
+.deliver-local-only,
+.deliver-label,
+.deliver-message {
+  margin-left: 54px;
+}
+
+.deliver-files {
+  max-height: 220px;
+  overflow-y: auto;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+  color: #ddd;
+}
+
+.deliver-files ul,
+.deliver-local-only {
+  margin-top: 2px;
+  margin-bottom: 6px;
+  padding-left: 18px;
+}
+
+.deliver-files li,
+.deliver-local-only li {
+  /* 路径可能很长：任意位置断行，不撑出横向滚动条 */
+  overflow-wrap: anywhere;
+}
+
+.deliver-group {
+  margin-top: 4px;
+  font-weight: 600;
+  color: #bbb;
+}
+
+.deliver-local-only {
+  max-height: 120px;
+  overflow-y: auto;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+  color: #ddd;
+}
+
+.deliver-ack {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  color: var(--fg);
+}
+
+.deliver-label {
+  color: #bbb;
+}
+
+/* 与 .dialog input 同一套外观 */
+.deliver-message {
+  width: calc(100% - 54px);
+  box-sizing: border-box;
+  padding: 5px 7px;
+  background: #1e1e1e;
+  border: 1px solid #555;
+  border-radius: 3px;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  resize: vertical;
+}
+
+.deliver-message:focus {
+  outline: none;
+  border-color: #4fc3f7;
+}
+
 /* ---------- 文件内容（File Tree 右侧，只读） ---------- */
 
 .file-content {
@@ -1865,6 +1951,43 @@ body {
   border-left: 3px solid #6b5a20;
   font-size: 12px;
   opacity: 0.85;
+}
+
+/* svn 节点详情里收起来的本地提交：图上看不到它们，这里是唯一入口，每行可点开。
+   hash 用图上 revision 号的橙色，和灰色的 git hash 区分开 */
+.commit-delivered {
+  margin: 0 12px 8px;
+  font-size: 12px;
+}
+.commit-delivered-title {
+  color: #9a9a9a;
+  margin-bottom: 2px;
+}
+.commit-delivered-item {
+  display: block;
+  width: 100%;
+  padding: 2px 6px;
+  background: transparent;
+  border: none;
+  border-radius: 3px;
+  color: var(--fg);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.commit-delivered-item:hover {
+  background: #2f2f2f;
+}
+.commit-delivered-sha {
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  color: #d8a657;
+}
+
+/* 点开收着的提交后，回到收着它的 svn 节点 */
+.commit-detail-tabs .commit-detail-back {
+  margin-right: 8px;
+  border-right: 1px solid #333;
+  color: #d8a657;
 }
 
 /* 失同步横幅与服务器侧漏收提示。tone 与 engine/svnSync 的 BannerTone 对应。

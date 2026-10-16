@@ -1,5 +1,15 @@
 import { describe, expect, it } from 'vitest'
-import { baselineMap, remapRefs, spliceHistory, type SvnRevNode } from '@/engine/svnGraph'
+import {
+  baselineMap,
+  commitDiffScope,
+  deliveredNote,
+  findDelivered,
+  remapRefs,
+  selectionDiffScope,
+  spliceHistory,
+  svnDiffGap,
+  type SvnRevNode,
+} from '@/engine/svnGraph'
 import type { CommitNode } from '@/engine/types'
 
 const svn = (rev: number): SvnRevNode => ({
@@ -117,6 +127,46 @@ describe('spliceHistory', () => {
     expect(out.map((c) => c.id)).toEqual(['aaa', 'svn:2', 'svn:1'])
   })
 
+  it('git 与 svn 两条序列按时间交错，子仍在父之上', () => {
+    // 2026-10-11 带分支的 fixture 实测：keep-a 指着已交付的 class A（06:26:30），它比 r2、r3
+    // 都旧，却被 `[...git, ...svn]` 排在所有 svn 行上面，看起来像是在 r3 之后才提交的。
+    const at = (hms: string) => Date.parse(`2026-10-11T${hms}Z`) / 1000
+    const svnAt = (rev: number, hms: string): SvnRevNode => ({
+      ...svn(rev),
+      date: `2026-10-11T${hms}Z`,
+    })
+    const out = spliceHistory(
+      [svnAt(3, '06:35:30'), svnAt(2, '06:30:47'), svnAt(1, '06:21:18')],
+      // 后端 --date-order 的真实顺序
+      [
+        git('grow', ['many'], { time: at('23:10:51') }),
+        git('feature', ['B3'], { time: at('23:10:51') }),
+        git('local', ['B3'], { time: at('06:35:32') }),
+        { ...baseline('B3', ['many'], 3), time: at('06:35:31') },
+        git('many', ['B2'], { time: at('06:35:29') }),
+        { ...baseline('B2', ['classA'], 2), time: at('06:30:48') },
+        git('classA', ['B1'], { time: at('06:26:30') }),
+        { ...baseline('B1', [], 1), time: at('06:21:19') },
+      ],
+      ['grow', 'feature', 'local', 'classA', 'B3'],
+    )
+    expect(out.map((c) => c.id)).toEqual([
+      'grow', 'feature', 'local', 'svn:3', 'many', 'svn:2', 'classA', 'svn:1',
+    ])
+  })
+
+  it('时间与拓扑冲突时拓扑优先：子提交的时钟比父还早也排在父上面', () => {
+    // 本地时钟偏慢、或 SVN 服务器时钟偏快都会出现；子在父下面线就得往上画
+    const out = spliceHistory(
+      [{ ...svn(2), date: '2026-10-11T08:00:00Z' }],
+      [
+        git('w', ['B2'], { time: Date.parse('2026-10-11T07:00:00Z') / 1000 }),
+        baseline('B2', [], 2),
+      ],
+    )
+    expect(out.map((c) => c.id)).toEqual(['w', 'svn:2'])
+  })
+
   it('两个 baseline 指向同一个 revision 时都被替换', () => {
     // 重建基线会在 svn/base 上落新 commit，旧的仍在历史里。
     const out = spliceHistory(
@@ -130,6 +180,164 @@ describe('spliceHistory', () => {
 
   it('空输入返回空数组', () => {
     expect(spliceHistory([], [])).toEqual([])
+  })
+})
+
+describe('spliceHistory：已交付的本地提交（Phase 3a）', () => {
+  // 真实形状（2026-10-11 fixture 实测 `git log --graph`）：交付录的新基线以交付树为父
+  // （spec §8.2.2），所以交付过的提交夹在两条基线之间：
+  //
+  //   local(仅本地) → B3(svn: r3) → many → B2(svn: r2) → classA → B1(svn: r1)
+  const delivered = () => [
+    git('local', ['B3'], { localOnly: true }),
+    baseline('B3', ['many'], 3),
+    git('many', ['B2'], { message: 'many files' }),
+    baseline('B2', ['classA'], 2),
+    git('classA', ['B1'], { message: 'class A' }),
+    baseline('B1', [], 1),
+  ]
+
+  it('只能经由基线才能到达的提交不进图——它们已经是 SVN 历史的一部分', () => {
+    // 不隐藏的话，基线换成 svn 节点后它们没有子节点，被画成从旧 revision 分出、悬在
+    // 那里的分支，还排在所有 svn 行的上面，看上去像「还没交付」（2026-10-11 真实窗口）
+    const out = spliceHistory([svn(3), svn(2), svn(1)], delivered(), ['local'])
+    expect(out.map((c) => c.id)).toEqual(['local', 'svn:3', 'svn:2', 'svn:1'])
+  })
+
+  it('svn 节点记下录这条基线之前交付的本地提交——整条提交原样留着，详情里点开要用', () => {
+    // 2026-10-16 用户要求能分别看这几个提交的改动：只记 id + 标题时详情头缺作者、时间、父提交
+    const out = spliceHistory([svn(3), svn(2), svn(1)], delivered(), ['local'])
+    const at = (id: string) => out.find((c) => c.id === id)!
+    expect(at('svn:3').deliveredFrom).toEqual([git('many', ['B2'], { message: 'many files' })])
+    expect(at('svn:2').deliveredFrom).toEqual([git('classA', ['B1'], { message: 'class A' })])
+    expect(at('svn:1').deliveredFrom).toBeUndefined()
+  })
+
+  it('一次交付了一串提交：整串都隐藏、都记在同一个 svn 节点上', () => {
+    const out = spliceHistory(
+      [svn(2), svn(1)],
+      [
+        git('top', ['B2']),
+        baseline('B2', ['c2'], 2),
+        git('c2', ['c1'], { message: 'second' }),
+        git('c1', ['B1'], { message: 'first' }),
+        baseline('B1', [], 1),
+      ],
+      ['top'],
+    )
+    expect(out.map((c) => c.id)).toEqual(['top', 'svn:2', 'svn:1'])
+    expect(out.find((c) => c.id === 'svn:2')!.deliveredFrom!.map((d) => d.id)).toEqual(['c2', 'c1'])
+  })
+
+  it('还有分支（或 HEAD）指着的交付提交照常显示——不能把用户的分支藏掉', () => {
+    const out = spliceHistory([svn(3), svn(2), svn(1)], delivered(), ['local', 'classA'])
+    expect(out.some((c) => c.id === 'classA')).toBe(true)
+    expect(out.some((c) => c.id === 'many')).toBe(false)
+    expect(out.find((c) => c.id === 'svn:2')!.deliveredFrom).toBeUndefined()
+  })
+
+  it('另一条分支从交付提交上长出来：它和它的祖先都照常显示', () => {
+    const out = spliceHistory(
+      [svn(2), svn(1)],
+      [
+        git('top', ['B2']),
+        git('side', ['c1']),
+        baseline('B2', ['c1'], 2),
+        git('c1', ['B1']),
+        baseline('B1', [], 1),
+      ],
+      ['top', 'side'],
+    )
+    expect(out.some((c) => c.id === 'c1')).toBe(true)
+    expect(out.find((c) => c.id === 'side')!.parents).toEqual(['c1'])
+  })
+
+  it('基线对应的 revision 还没拉进来时不收起：收进一个不画的节点等于整个看不见', () => {
+    // 最终 review 第 6 条：首次打开 svn log 缓存为空、或只翻了一页时 r2 不在 svnRevs 里
+    const out = spliceHistory([svn(3), svn(1)], delivered(), ['local'])
+    expect(out.some((c) => c.id === 'classA')).toBe(true)
+    expect(out.some((c) => c.id === 'many')).toBe(false) // r3 在，照常收起
+    expect(out.find((c) => c.id === 'svn:3')!.deliveredFrom!.map((d) => d.id)).toEqual(['many'])
+  })
+
+  it('交付后同事紧跟着提交：收起的提交挂在真正交付的 revision 上，不挂同事的', () => {
+    // 2026-10-16 review 第 1 条（E2E 场景 6 的 r8 / r9）：基线记的是 D6 更新到的 r3（同事的），
+    // 交付录的基线另记 deliveredRev = 2
+    const out = spliceHistory(
+      [svn(3), svn(2), svn(1)],
+      [
+        git('top', ['B3']),
+        { ...baseline('B3', ['mine'], 3), deliveredRev: 2 },
+        git('mine', ['B1'], { message: 'mine' }),
+        baseline('B1', [], 1),
+      ],
+      ['top'],
+    )
+    expect(out.map((c) => c.id)).toEqual(['top', 'svn:3', 'svn:2', 'svn:1'])
+    expect(out.find((c) => c.id === 'svn:2')!.deliveredFrom!.map((d) => d.id)).toEqual(['mine'])
+    expect(out.find((c) => c.id === 'svn:3')!.deliveredFrom).toBeUndefined()
+  })
+
+  it('真正交付的 revision 还没拉进来：不收起（同「基线 revision 没拉进来」）', () => {
+    const out = spliceHistory(
+      [svn(3), svn(1)],
+      [
+        git('top', ['B3']),
+        { ...baseline('B3', ['mine'], 3), deliveredRev: 2 },
+        git('mine', ['B1']),
+        baseline('B1', [], 1),
+      ],
+      ['top'],
+    )
+    expect(out.some((c) => c.id === 'mine')).toBe(true)
+    expect(out.every((c) => c.deliveredFrom === undefined)).toBe(true)
+  })
+
+  it('「更新」录的基线以旧基线为父，什么都不隐藏', () => {
+    const out = spliceHistory(
+      [svn(2), svn(1)],
+      [git('top', ['B2']), baseline('B2', ['B1'], 2), baseline('B1', [], 1)],
+      ['top'],
+    )
+    expect(out.map((c) => c.id)).toEqual(['top', 'svn:2', 'svn:1'])
+    expect(out.every((c) => c.deliveredFrom === undefined)).toBe(true)
+  })
+})
+
+describe('spliceHistory：svn 节点的本地基线（用来本地算文件变化）', () => {
+  it('带上自己的基线 oid，以及图上下一个节点的基线 oid', () => {
+    const out = spliceHistory(
+      [svn(3), svn(2), svn(1)],
+      [git('top', ['B3']), baseline('B3', ['B2'], 3), baseline('B2', ['B1'], 2), baseline('B1', [], 1)],
+      ['top'],
+    )
+    const at = (id: string) => out.find((c) => c.id === id)!
+    expect([at('svn:3').baselineOid, at('svn:3').diffBase]).toEqual(['B3', 'B2'])
+    expect([at('svn:2').baselineOid, at('svn:2').diffBase]).toEqual(['B2', 'B1'])
+    // 最早的节点没有可比的上一版
+    expect([at('svn:1').baselineOid, at('svn:1').diffBase]).toEqual(['B1', undefined])
+  })
+
+  it('上一个节点没有本地基线（同事的 revision）：不给 diffBase，不能拿更早的基线冒充', () => {
+    // r1 → r3 之间夹着同事的 r2：B1..B3 的差异是 r2 + r3 两次的，不是 r3 一次的
+    const out = spliceHistory(
+      [svn(3), svn(2), svn(1)],
+      [git('top', ['B3']), baseline('B3', ['B1'], 3), baseline('B1', [], 1)],
+      ['top'],
+    )
+    const at = (id: string) => out.find((c) => c.id === id)!
+    expect(at('svn:3').baselineOid).toBe('B3')
+    expect(at('svn:3').diffBase).toBeUndefined()
+    expect(at('svn:2').baselineOid).toBeUndefined()
+  })
+
+  it('同一个 revision 有两条基线（重建过）时取最新那条', () => {
+    const out = spliceHistory(
+      [svn(4)],
+      [git('aaa', ['b1']), baseline('b1', ['b0'], 4), baseline('b0', [], 4)],
+      ['aaa'],
+    )
+    expect(out.find((c) => c.id === 'svn:4')!.baselineOid).toBe('b1')
   })
 })
 
@@ -190,5 +398,147 @@ describe('baselineMap / remapRefs', () => {
     // headHash 在 commits 里找不到对应行 —— HEAD 标记不画、定位滚不过去。
     const map = baselineMap([baseline('bbb', [], 4)])
     expect(map.get('bbb') ?? 'bbb').toBe('svn:4')
+  })
+})
+
+describe('commitDiffScope', () => {
+  it('git 节点照旧读这个 commit 的 diff', () => {
+    expect(commitDiffScope(git('abc', ['p']))).toBe('commit:abc')
+  })
+
+  it('有前后两版本地基线的 svn 节点：比两版基线', () => {
+    const node = { ...git('svn:2', ['svn:1']), vcs: 'svn' as const, baselineOid: 'B2', diffBase: 'B1' }
+    expect(commitDiffScope(node)).toBe('range:B1..B2')
+  })
+
+  it('没有可比基线的 svn 节点不请求 diff（id 不是 oid，发出去只会报错）', () => {
+    expect(commitDiffScope({ ...git('svn:2', []), vcs: 'svn' as const })).toBeNull()
+    expect(commitDiffScope({ ...git('svn:2', []), vcs: 'svn' as const, baselineOid: 'B2' })).toBeNull()
+  })
+
+  it('没选中任何节点时不请求', () => {
+    expect(commitDiffScope(undefined)).toBeNull()
+  })
+})
+
+describe('selectionDiffScope', () => {
+  const commits = [
+    git('abc', ['svn:2']),
+    { ...git('svn:2', []), vcs: 'svn' as const, baselineOid: 'B2', diffBase: 'B1' },
+  ]
+
+  it('图上的节点按 commitDiffScope 读', () => {
+    expect(selectionDiffScope(commits, 'abc')).toBe('commit:abc')
+    expect(selectionDiffScope(commits, 'svn:2')).toBe('range:B1..B2')
+  })
+
+  it('不在图上的选中（stash、5000 条之外的提交）照旧按 oid 读——普通仓库也走这里', () => {
+    // 最终 review 第 1 条：只认图上节点的话，点 stash 不再读 diff，详情停在上一条提交上
+    expect(selectionDiffScope(commits, 'stash0')).toBe('commit:stash0')
+    expect(selectionDiffScope([], 'stash0')).toBe('commit:stash0')
+  })
+
+  it('不在图上的 svn 节点 id 不是 oid，不请求', () => {
+    expect(selectionDiffScope(commits, 'svn:9')).toBeNull()
+  })
+
+  it('没有选中时不请求', () => {
+    expect(selectionDiffScope(commits, null)).toBeNull()
+  })
+})
+
+describe('svnDiffGap', () => {
+  const svnNode = (extra: Partial<CommitNode>): CommitNode => ({ ...git('svn:18', ['svn:17']), vcs: 'svn', ...extra })
+
+  it('两版都在本机记过：能算，没有缺口', () => {
+    expect(svnDiffGap(svnNode({ baselineOid: 'B18', diffBase: 'B17' }))).toBeNull()
+  })
+
+  it('自己没在本机记过（同事刚提交、还没更新）：说「这个」，不能说「前一个」', () => {
+    // 2026-10-15 演示：r18 是同事的，r17 是我交付的，原文案说「前一版没有本地基线」
+    expect(svnDiffGap(svnNode({}))).toBe('self')
+  })
+
+  it('自己有、前一个没有（同事的 revision 之后我交付）：说「前一个」', () => {
+    expect(svnDiffGap(svnNode({ baselineOid: 'B18' }))).toBe('prev')
+  })
+
+  it('git 节点没有这回事', () => {
+    expect(svnDiffGap(git('abc', []))).toBeNull()
+  })
+})
+
+describe('deliveredNote', () => {
+  const node = (message: string, deliveredFrom?: CommitNode[]): CommitNode => ({
+    ...git('svn:12', []),
+    vcs: 'svn',
+    message,
+    deliveredFrom,
+  })
+  const dc = (id: string, message: string) => git(id, ['B'], { message })
+  /** 前后两版都在本机记过、下面能直接看到文件变化的 svn 节点。 */
+  const withDiff = (message: string, deliveredFrom?: CommitNode[]): CommitNode => ({
+    ...node(message, deliveredFrom),
+    baselineOid: 'B12',
+    diffBase: 'B11',
+  })
+
+  it('只有一个本地提交、标题与 SVN 信息相同、下面能看到改动：不显示，否则只是重复（2026-10-15 用户反馈）', () => {
+    expect(deliveredNote(withDiff('e2e8 X8', [dc('e36fec9', 'e2e8 X8')]))).toBeNull()
+    // 首尾空白、CRLF；SVN 只比第一段（git 侧的 summary() 就是第一段）
+    expect(deliveredNote(withDiff(' e2e8 X8\r\n\r\n细节\r\n', [dc('e36fec9', 'e2e8 X8')]))).toBeNull()
+  })
+
+  it('标题跨了两行没空行：git 的 summary() 把第一段并成一行，SVN 这边也按第一段并起来比', () => {
+    // 2026-10-16 review 第 5 条：只比第一行时永远对不上
+    const from = [dc('a1', 'Fix crash in loader when file empty')]
+    expect(deliveredNote(withDiff('Fix crash in loader\nwhen file empty\n\n细节', from))).toBeNull()
+    expect(deliveredNote(withDiff('Fix crash in loader\r\n  when file empty', from))).toBeNull()
+  })
+
+  it('信息相同、但这里看不到改动（前一版没在本机记过）：照常列出——这是看它改了什么的唯一入口', () => {
+    // 2026-10-16 review 第 2 条
+    const from = [dc('e36fec9', 'e2e8 X8')]
+    expect(deliveredNote(node('e2e8 X8', from))).toEqual(from)
+    expect(deliveredNote({ ...node('e2e8 X8', from), baselineOid: 'B12' })).toEqual(from)
+  })
+
+  it('交付时改写了信息：显示', () => {
+    const from = [dc('e36fec9', 'e2e8 X8')]
+    expect(deliveredNote(node('e2e8 交付 X8', from))).toEqual(from)
+  })
+
+  it('一次交付了多个提交：全部显示，哪怕某一个和 SVN 信息相同', () => {
+    const from = [dc('c2', '修音效'), dc('c1', '修跳跃')]
+    expect(deliveredNote(node('修跳跃', from))).toEqual(from)
+  })
+
+  it('没有已交付的提交、git 节点：不显示', () => {
+    expect(deliveredNote(node('r12'))).toBeNull()
+    expect(deliveredNote(node('r12', []))).toBeNull()
+    expect(deliveredNote(git('abc', []))).toBeNull()
+  })
+})
+
+describe('findDelivered', () => {
+  const c1 = git('c1', ['B1'], { message: '修跳跃' })
+  const c2 = git('c2', ['c1'], { message: '修音效' })
+  const r16: CommitNode = { ...git('svn:16', ['svn:15']), vcs: 'svn', svnRev: 16, deliveredFrom: [c2, c1] }
+  const commits = [git('top', ['svn:16']), r16, { ...git('svn:15', []), vcs: 'svn' as const, svnRev: 15 }]
+
+  it('收进 svn 节点的提交找得到，连同收着它的那个 svn 节点（详情要显示「返回 r16」）', () => {
+    expect(findDelivered(commits, 'c1')).toEqual({ commit: c1, owner: r16 })
+    expect(findDelivered(commits, 'c2')!.owner.svnRev).toBe(16)
+  })
+
+  it('图上的提交、不存在的 id、空选中：找不到', () => {
+    expect(findDelivered(commits, 'top')).toBeNull()
+    expect(findDelivered(commits, 'nope')).toBeNull()
+    expect(findDelivered(commits, null)).toBeNull()
+    expect(findDelivered([], 'c1')).toBeNull()
+  })
+
+  it('选中它时按 oid 读 diff（只读，与 stash 同一条路）', () => {
+    expect(selectionDiffScope(commits, 'c1')).toBe('commit:c1')
   })
 })

@@ -16,6 +16,13 @@ import {
   type SyncStateUnreadable,
 } from '../engine/svnJournal'
 import type { SyncActionId } from '../engine/svnSyncIn'
+import type { SyncOutActionId } from '../engine/svnSyncOut'
+import type { BannerAction } from '../engine/svnSync'
+
+/** 交付那一组按钮的 id。`BannerAction.id` 是所有横幅共用的联合类型，在这里收窄。 */
+function isSyncOutAction(id: BannerAction['id']): id is SyncOutActionId {
+  return id === 'syncOutCleanup' || id === 'syncOutContinue' || id === 'syncOutAbort'
+}
 
 interface BaselineBannerProps {
   /** 是不是 SVN 混合仓库。普通 git 仓库下整个组件什么都不渲染。 */
@@ -37,8 +44,10 @@ interface BaselineBannerProps {
   onCheck: () => void
   /** 走一次行尾迁移。调用方负责先弹确认。 */
   onMigrateEol: () => void
-  /** 未收尾同步横幅上的「继续 / 放弃」。 */
+  /** 未收尾同步横幅上「更新」那一组的「继续 / 放弃」。 */
   onSyncAction: (id: SyncActionId) => void
+  /** 未收尾同步横幅上「交付」那一组的「清理 / 继续 / 停止」。 */
+  onSyncOutAction: (id: SyncOutActionId) => void
   /** 「工作副本已在外部更新」横幅上的「更新…」，与工具栏的「更新」是同一个入口。 */
   onSvnUpdate: () => void
 }
@@ -84,6 +93,7 @@ export function BaselineBanner({
   onCheck,
   onMigrateEol,
   onSyncAction,
+  onSyncOutAction,
   onSvnUpdate,
 }: BaselineBannerProps) {
   // 未收尾 / 同步进行中排在最前，其余一律让位：那两种状态下仓库停在中间态，
@@ -113,9 +123,15 @@ export function BaselineBanner({
           {unfinished.actions.length > 0 && (
             <div className="banner-baseline-actions">
               {unfinished.actions.map((a) => (
-                // `syncActions` 只产出这两个值（Task 9 的测试钉着）；
-                // `BannerAction.id` 是所有横幅共用的联合类型，这里收窄一次
-                <button key={a.id} onClick={() => onSyncAction(a.id as SyncActionId)}>
+                // 按 id 分流：交付记录的按钮交给「更新」的继续 / 放弃，后端会以
+                // sync_out_not_supported 拒绝。其余只可能是 `syncActions` 的那两个值
+                // （Task 9 的测试钉着）
+                <button
+                  key={a.id}
+                  onClick={() =>
+                    isSyncOutAction(a.id) ? onSyncOutAction(a.id) : onSyncAction(a.id as SyncActionId)
+                  }
+                >
                   {a.label}
                 </button>
               ))}

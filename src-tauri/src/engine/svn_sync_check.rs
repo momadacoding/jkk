@@ -67,7 +67,7 @@ pub(crate) fn check_sync_in(repo_root: &str) -> Result<SyncInPreview> {
     }
     let cfg = read_config(repo_root)?;
 
-    check_git_idle(repo_root)?; // 第 1 条
+    check_git_idle(repo_root, "sync_in_git_busy", "更新")?; // 第 1 条
     let orig_branch = attached_branch(repo_root)?; // 第 3 条
     let orig_head = rev_parse(repo_root, "HEAD")?;
     let baseline_oid = rev_parse(repo_root, &format!("refs/heads/{BASELINE_BRANCH}"))?;
@@ -209,8 +209,10 @@ pub fn assert_linear(repo_root: &str, target: &str, tip: &str) -> Result<()> {
     Ok(())
 }
 
-/// 第 1 条：git 不在任何未完成的操作里，索引也没有未合并条目。
-fn check_git_idle(repo_root: &str) -> Result<()> {
+/// git 不在任何未完成的操作里，索引也没有未合并条目。
+///
+/// `code` / `verb` 由调用方给：同一个判断，「更新」与「交付」各报各的码与文案。
+pub(crate) fn check_git_idle(repo_root: &str, code: &str, verb: &str) -> Result<()> {
     let dir = git_dir(repo_root)?;
     let busy = [
         ("rebase-merge", "rebase"),
@@ -222,15 +224,15 @@ fn check_git_idle(repo_root: &str) -> Result<()> {
     for (marker, what) in busy {
         if dir.join(marker).exists() {
             return Err(GitError::new(
-                "sync_in_git_busy",
-                format!("git 正处在一次没做完的 {what} 里。请先完成或中止它，再更新。"),
+                code,
+                format!("git 正处在一次没做完的 {what} 里。请先完成或中止它，再{verb}。"),
             ));
         }
     }
     if !unmerged_paths(repo_root)?.is_empty() {
         return Err(GitError::new(
-            "sync_in_git_busy",
-            "暂存区里有未解决的冲突。请先解决（或 `git restore --staged`）再更新。",
+            code,
+            format!("暂存区里有未解决的冲突。请先解决（或 `git restore --staged`）再{verb}。"),
         ));
     }
     Ok(())
@@ -291,7 +293,7 @@ pub(crate) fn unmerged_paths(repo_root: &str) -> Result<Vec<String>> {
 }
 
 /// 当前磁盘上的纳入集合预检：期望集合（遍历磁盘）与 `git add -A` 实际收进来的相等。
-fn precheck_include_set(
+pub(crate) fn precheck_include_set(
     repo_root: &str,
     whitelist: &[String],
     extensions: &[String],

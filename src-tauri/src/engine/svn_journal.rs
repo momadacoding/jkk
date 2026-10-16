@@ -64,6 +64,21 @@ pub enum Phase {
     RestoringBranch,
 }
 
+/// D4 前后一个 svn 节点的登记状态（spec §8.5；计划 B5 / B6）。
+///
+/// `status` 是 `<wc-status item>` 原样（`unversioned` / `added` / `deleted` /
+/// `missing` / `modified` …）。`dir` 是**记录当下**磁盘上它是不是目录：
+/// `svn status --xml` 不给 `kind`（计划开工前实测 M2-E1），而撤销时文件可能已经
+/// 不在了，到那时再查磁盘就晚了。
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SvnNode {
+    pub path: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dir: bool,
+}
+
 /// journal 的全部字段（spec §7.6 的 JSON 样例）。
 ///
 /// `sync_out` 的大部分字段现在就定义：本模块拥有这个文件格式，等 Phase 3 再加
@@ -151,6 +166,23 @@ pub struct Journal {
     pub commit_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_start_rev: Option<u64>,
+    /// D1 清单里的 M（spec §8.6.2：查证要「本次提交的完整路径集合」）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub svn_modified: Vec<String>,
+    /// D4 第一条 svn 命令**之前**的白名单 svn 状态（spec §8.5）。撤销的不变量是
+    /// 「回到这份快照」，计划 B6：撤销时以「当前 − 它」重算差量，不只信 `svn_delta`。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub svn_status_before: Vec<SvnNode>,
+    /// D4 之后相对 `svn_status_before` 新增的登记（spec §8.5 的 `svnDelta`）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub svn_delta: Vec<SvnNode>,
+    /// `deliver_ref` 指向的 OID。D8a 的父提交（spec §8.2.2），D4.9 的断言对象。
+    /// 单独记一份：ref 被删之后（崩在 D10 收尾中途）仍要知道它是谁。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deliver_oid: Option<String>,
+    /// D5 的 `Committed revision N`。读不出来时为空，D7 会从 `nodeRevs` 重新得到。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_rev: Option<u64>,
 }
 
 /// `<repo_root>/.git/mygitclient-sync.json`。与 `svn_lock::lock_path` 同一约定。

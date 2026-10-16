@@ -228,6 +228,20 @@ pub struct UnfinishedSync {
     /// `applying-stash` 是回退 / 放弃途中停下的（分支在更新前的位置），不是更新途中。
     /// 横幅据此换文案（PR #49 review #3）。
     pub rolling_back: bool,
+    /// 交付停在 `committing` 时，横幅要告诉用户去 TortoiseSVN 的 log 里从哪个 revision
+    /// 之后找、找哪条提交信息（Phase 3a 计划 B4）。其余 phase 也照发，前端按需用。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_start_rev: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_message: Option<String>,
+    /// 交付已经落地的 revision（D5 成功后才有）。提交之后停下的，横幅标题直接写
+    /// 「交付已提交（rN）」——用户最先想知道的就是交上去没有（2026-10-14 E2E 反馈）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub committed_rev: Option<u64>,
+    /// 发起这次同步的分支。中途 HEAD 会临时停在交付树或 `svn/base` 上，工具栏显示的不是它；
+    /// 横幅要点名「把分支 X 接上去」（2026-10-14 E2E：用户以为工作分支变成了 svn/base）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orig_branch: Option<String>,
 }
 
 /// 同步状态。**`locked` 与 `unfinished` 是两件事，不能合并。**
@@ -262,6 +276,10 @@ pub fn svn_sync_state(path: String) -> Result<SyncState, GitError> {
             opid: j.opid,
             started_at: j.started_at,
             rolling_back: j.rolling_back,
+            expected_start_rev: j.expected_start_rev,
+            commit_message: j.commit_message,
+            committed_rev: j.committed_rev,
+            orig_branch: j.orig_branch,
         }),
     })
 }

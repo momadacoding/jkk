@@ -441,11 +441,40 @@ pub fn create_baseline_commit(
     parent: Option<&str>,
     t: &Trailer,
 ) -> Result<String> {
+    create_baseline_commit_with(repo_root, tree, parent, t, None)
+}
+
+/// 交付录的基线额外记的那一行：真正提交出去的 revision。
+const DELIVERED_REV_KEY: &str = "Delivered-Rev:";
+
+/// 读回 `Delivered-Rev: N`；不是交付录的基线就是 `None`。逐行完整匹配，与 `parse_trailer` 同样先去行尾 `\r`。
+pub fn parse_delivered_rev(message: &str) -> Option<u64> {
+    message.lines().find_map(|raw| {
+        raw.trim_end()
+            .strip_prefix(DELIVERED_REV_KEY)
+            .and_then(|r| r.trim().parse::<u64>().ok())
+    })
+}
+
+/// [`create_baseline_commit`]，交付时多记一行 `Delivered-Rev: N`。
+///
+/// trailer 记的是 D6 更新到的 revision；交付之后同事紧跟着提交时它是同事的，只靠它
+/// 就分不清哪个 revision 才是这次交付（2026-10-16 review）。`git-svn-id` 仍放最后一行。
+pub fn create_baseline_commit_with(
+    repo_root: &str,
+    tree: &str,
+    parent: Option<&str>,
+    t: &Trailer,
+    delivered_rev: Option<u64>,
+) -> Result<String> {
     // `commit-tree` 的 message **必须走 `-m`，不能走 stdin**：`run_git*` 用的是
     // `Command::output()`，子进程 stdin 是 null，管道那条路会立刻读到 EOF 并产出
     // 一个 message 为空的 commit——而 trailer 就写在 message 里，等于基线丢掉
     // 记账且不报任何错。
-    let msg = format!("svn: r{}\n\n{}\n", t.rev, format_trailer(t));
+    let delivered = delivered_rev
+        .map(|r| format!("{DELIVERED_REV_KEY} {r}\n"))
+        .unwrap_or_default();
+    let msg = format!("svn: r{}\n\n{delivered}{}\n", t.rev, format_trailer(t));
     let mut args: Vec<&str> = vec!["commit-tree", tree];
     if let Some(p) = parent {
         args.push("-p");

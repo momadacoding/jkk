@@ -380,6 +380,10 @@ fn sync_state_serializes_to_camel_case() {
             opid: "abc".into(),
             started_at: 1_757_000_000,
             rolling_back: true,
+            expected_start_rev: None,
+            commit_message: None,
+            committed_rev: None,
+            orig_branch: None,
         }),
     })
     .unwrap();
@@ -395,6 +399,127 @@ fn sync_state_serializes_to_camel_case() {
     assert_eq!(st["unfinished"]["phase"], "stashed");
     // `applying-stash` 的横幅按它分方向（PR #49 review #3）
     assert_eq!(st["unfinished"]["rollingBack"], true);
+
+    // 交付停在 `committing` 时横幅要显示这两项（Phase 3a 计划 B4）；为空时不发
+    let out = serde_json::to_value(UnfinishedSync {
+        flow: Flow::SyncOut,
+        phase: Phase::Committing,
+        opid: "o".into(),
+        started_at: 1,
+        rolling_back: false,
+        expected_start_rev: Some(12),
+        commit_message: Some("修复跳跃".into()),
+        committed_rev: None,
+        orig_branch: None,
+    })
+    .unwrap();
+    assert_eq!(
+        keys_of(&out),
+        vec![
+            "commitMessage",
+            "expectedStartRev",
+            "flow",
+            "opid",
+            "phase",
+            "rollingBack",
+            "startedAt"
+        ]
+    );
+    assert_eq!(out["flow"], "sync_out");
+    assert_eq!(out["phase"], "committing");
+
+    // 提交之后停下的，横幅标题要写「交付已提交（rN）」（2026-10-14 E2E 用户反馈）
+    let out = serde_json::to_value(UnfinishedSync {
+        flow: Flow::SyncOut,
+        phase: Phase::PublishingBaseline,
+        opid: "o".into(),
+        started_at: 1,
+        rolling_back: false,
+        expected_start_rev: Some(10),
+        commit_message: None,
+        committed_rev: Some(11),
+        // 横幅要点名是哪个分支：中途 HEAD 停在 svn/base 上，工具栏显示的不是它（2026-10-14 E2E）
+        orig_branch: Some("e2e8".into()),
+    })
+    .unwrap();
+    assert_eq!(out["committedRev"], 11);
+    assert_eq!(out["origBranch"], "e2e8");
+}
+
+#[test]
+fn sync_out_shapes_serialize_to_the_exact_names_the_frontend_reads() {
+    use app_lib::engine::svn_deliver::LocalOnlyCommit;
+    use app_lib::engine::svn_sync_out::{SyncOutExpect, SyncOutOutcome};
+    use app_lib::engine::svn_sync_out_check::{DeliverChange, SyncOutPreview};
+
+    let p = SyncOutPreview {
+        orig_branch: "work".into(),
+        orig_head: "h".into(),
+        baseline_oid: "b".into(),
+        baseline_rev: 1,
+        remote_rev: 1,
+        deliver_oid: "d".into(),
+        deliver_tree: "t".into(),
+        changes: vec![DeliverChange {
+            status: "A".into(),
+            path: "Code/N.cs".into(),
+        }],
+        local_only: vec![LocalOnlyCommit {
+            oid: "l".into(),
+            subject: "mute".into(),
+        }],
+        outside_changes: vec![],
+    };
+    let v = serde_json::to_value(&p).unwrap();
+    assert_eq!(
+        keys_of(&v),
+        vec![
+            "baselineOid",
+            "baselineRev",
+            "changes",
+            "deliverOid",
+            "deliverTree",
+            "localOnly",
+            "origBranch",
+            "origHead",
+            "outsideChanges",
+            "remoteRev",
+        ]
+    );
+    assert_eq!(v["localOnly"][0]["subject"], "mute");
+
+    let o = serde_json::to_value(SyncOutOutcome::Delivered {
+        rev: 2,
+        branch: "work".into(),
+        local_only_left: 1,
+    })
+    .unwrap();
+    assert_eq!(
+        o,
+        serde_json::json!({ "kind": "delivered", "rev": 2, "branch": "work", "localOnlyLeft": 1 })
+    );
+    let o = serde_json::to_value(SyncOutOutcome::RebaseConflict {
+        rev: 3,
+        files: vec!["a".into()],
+    })
+    .unwrap();
+    assert_eq!(
+        o,
+        serde_json::json!({ "kind": "rebaseConflict", "rev": 3, "files": ["a"] })
+    );
+    let o = serde_json::to_value(SyncOutOutcome::Abandoned { committed: true }).unwrap();
+    assert_eq!(
+        o,
+        serde_json::json!({ "kind": "abandoned", "committed": true })
+    );
+
+    let e: SyncOutExpect = serde_json::from_value(serde_json::json!({
+        "origBranch": "work", "origHead": "h", "baselineOid": "b", "deliverTree": "t",
+        "changes": [{ "status": "M", "path": "Code/A.cs" }],
+        "confirmedOutside": [], "message": "m"
+    }))
+    .unwrap();
+    assert_eq!(e.changes[0].path, "Code/A.cs");
 }
 
 #[test]

@@ -27,6 +27,12 @@ pub struct CommitNode {
     /// 不存在两侧规则漂移的问题。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub baseline_rev: Option<u64>,
+    /// 交付录的基线额外记下的「真正提交出去的 revision」（`Delivered-Rev:`）。
+    ///
+    /// `baseline_rev` 是交付之后更新到的 revision：中间同事紧跟着提交时它是同事的，图上收起的
+    /// 本地提交按它归属就会挂到同事名下（2026-10-16 review）。初始化、更新录的基线没有这一项。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered_rev: Option<u64>,
     /// `Local-Only: true`（spec §6.7）：用户勾了「仅本地，不交付」。
     /// 同样只能从正文里看出来。
     #[serde(skip_serializing_if = "is_false")]
@@ -41,7 +47,8 @@ fn is_false(b: &bool) -> bool {
 
 /// `Local-Only: true`（spec §6.7）。键按 git 的惯例大小写不敏感，
 /// 且**逐行完整匹配**——正文里顺口提到这个词的提交不算。
-fn parse_local_only(message: &str) -> bool {
+/// `svn_deliver` 用同一份判定摘掉本地补丁——两处规则不能漂移。
+pub(crate) fn parse_local_only(message: &str) -> bool {
     message.lines().any(|line| {
         let line = line.trim();
         let Some((key, value)) = line.split_once(':') else {
@@ -105,6 +112,7 @@ pub fn load(path: &str) -> Result<GraphData> {
             time: commit.time().seconds(),
             message: commit.summary().unwrap_or("").to_string(),
             baseline_rev: crate::engine::svn_baseline::parse_trailer(full).map(|t| t.rev),
+            delivered_rev: crate::engine::svn_baseline::parse_delivered_rev(full),
             local_only: parse_local_only(full),
         });
         if commits.len() >= limit {

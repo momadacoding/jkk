@@ -66,8 +66,27 @@ export interface CommitNode {
    * 这个说「我是记录那条 revision 的基线 commit」。基线在接合时会被从图上删掉。
    */
   baselineRev?: number
+  /**
+   * 交付录的基线额外记的「真正提交出去的 revision」（`Delivered-Rev:`）。`baselineRev` 是交付之后
+   * 更新到的 revision，同事紧跟着提交时它是同事的；收起的本地提交按这个归属。其余基线缺省。
+   */
+  deliveredRev?: number
   /** 后端解析出的 `Local-Only: true`（spec §6.7），不会被交付。 */
   localOnly?: boolean
+  /**
+   * 仅 svn 节点：这个 revision 交付出去、因此不再单独画在图上的本地提交
+   * （`spliceHistory` 的「已交付」规则）。没有时缺省。
+   *
+   * 按基线的 `deliveredRev` 归属；早于 2026-10-16 录的基线没有它，退回按 `baselineRev`——
+   * 那时交付之后同事若紧跟着提交过，会挂在同事的 revision 上。
+   *
+   * 存整条提交（`load_graph` 给的原样，parents 未改写）：详情里点开单个提交要显示作者、时间、父提交。
+   */
+  deliveredFrom?: CommitNode[]
+  /** 仅 svn 节点：记录这个 revision 的本地基线 commit（有多条时取最新）。 */
+  baselineOid?: string
+  /** 仅 svn 节点：图上下一个（更早的）svn 节点的本地基线。两者都在才能本地算文件变化。 */
+  diffBase?: string
 }
 
 export interface GraphData {

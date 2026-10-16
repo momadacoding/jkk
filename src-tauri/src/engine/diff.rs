@@ -281,6 +281,25 @@ pub fn read_diff(path: &str, scope: String) -> Result<DiffData> {
         diff.find_similar(None)?;
         return diff_to_data(diff);
     }
+    // `range:<a>..<b>`：两个任意 commit 之间。SVN 节点用它比前后两版本地基线——交付录的
+    // 基线以交付树为父（spec §8.2.2），`commit:<基线>` 比的是它和交付树，恰好漏掉
+    // 「这一版交付了什么」。解析不了必须报错：落到下面的默认分支会把工作区改动当成节点的变化
+    if let Some(range) = scope.strip_prefix("range:") {
+        let (from, to) = range
+            .split_once("..")
+            .filter(|(a, b)| !a.is_empty() && !b.is_empty())
+            .ok_or_else(|| {
+                crate::error::GitError::new(
+                    "bad_diff_scope",
+                    format!("无法解析的 diff 范围：{scope}"),
+                )
+            })?;
+        let old = repo.find_commit(git2::Oid::from_str(from)?)?.tree()?;
+        let new = repo.find_commit(git2::Oid::from_str(to)?)?.tree()?;
+        let mut diff = repo.diff_tree_to_tree(Some(&old), Some(&new), None)?;
+        diff.find_similar(None)?;
+        return diff_to_data(diff);
+    }
     // default: workdir vs HEAD（空仓库没有 HEAD，此时与空树比较）
     let tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
     let diff =
