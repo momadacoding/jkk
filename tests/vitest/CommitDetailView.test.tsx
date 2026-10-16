@@ -110,3 +110,25 @@ describe('CommitDetailView：点开收着的提交之后', () => {
     expect(screen.queryByRole('button', { name: /返回/ })).toBeNull()
   })
 })
+
+describe('CommitDetailView：所在分支', () => {
+  // 2026-10-17 用户要求：车道一多，点了提交认不出它在哪条分支上
+  it('信息条上显示分支，切到 Changes / File Tree 也还在', () => {
+    render(<CommitDetailView commit={three[1]} diff={empty} repoPath={null} onSelectCommit={vi.fn()} branch="已合并进 master" />)
+    expect(screen.getByText('⑂ 已合并进 master')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /Changes/ }))
+    expect(screen.getByText('⑂ 已合并进 master')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'File Tree' }))
+    expect(screen.getByText('⑂ 已合并进 master')).toBeTruthy()
+  })
+
+  it('svn 节点也显示', () => {
+    render(<CommitDetailView commit={r16([])} diff={empty} repoPath="C:/r" onSelectCommit={vi.fn()} branch="SVN 主线" />)
+    expect(screen.getByText('⑂ SVN 主线')).toBeTruthy()
+  })
+
+  it('图外提交不传分支时整栏不出现', () => {
+    render(<CommitDetailView commit={three[1]} diff={empty} repoPath="C:/r" onSelectCommit={vi.fn()} branch={null} />)
+    expect(screen.queryByText(/⑂/)).toBeNull()
+  })
+})
