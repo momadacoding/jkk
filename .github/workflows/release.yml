@@ -41,6 +41,11 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: read
+    env:
+      # build.rs 取不到 git describe 时直接让构建失败，而不是静默编出标题为
+      # 「未知提交」的安装包（见 src-tauri/build.rs）。设在 job 级别：
+      # cargo test / clippy 同样会跑 build.rs，也该在同样的条件下失败
+      JKK_REQUIRE_GIT_DESCRIBE: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -97,7 +102,16 @@ jobs:
           if ($cmp -notin @('identical', 'behind')) {
             throw "tag 指向的提交不在 master 上（与 master 比对结果：$cmp）。请先把改动合进 master 再打 tag。"
           }
-          Write-Output "校验通过：$ref @ $env:SHA（相对 master：$cmp）"
+          # 窗口标题靠 build.rs 的 git describe 判断「是不是正式版」（src-tauri/build_support）。
+          # checkout 是浅克隆，万一没把 tag 取下来，安装包标题会带着 hash 或「未知提交」
+          # 发出去，而构建本身照样成功——所以在这里用同一条命令先确认一遍。
+          $describe = git describe --tags --always --match 'v[0-9]*'
+          if ($LASTEXITCODE -ne 0) { throw 'git describe 失败' }
+          # -cne：PowerShell 的 -ne 不区分大小写
+          if ($describe -cne $ref) {
+            throw "git describe 得到 '$describe'，不是 '$ref'：构建出来的窗口标题不会显示为正式版"
+          }
+          Write-Output "校验通过：$ref @ $env:SHA（相对 master：$cmp，describe：$describe）"
 
       # secrets 不能用在 if 里，先把「在不在」映射成 output。
       # 只判存在性，值本身绝不写日志。

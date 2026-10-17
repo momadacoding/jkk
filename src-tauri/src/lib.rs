@@ -1,7 +1,10 @@
+pub mod build_info;
 pub mod commands;
 pub mod engine;
 pub mod error;
 pub mod vcs;
+
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -14,6 +17,13 @@ pub fn run() {
                         .level(log::LevelFilter::Info)
                         .build(),
                 )?;
+            }
+            // tauri.conf.json 里的 "jkk" 只是兜底，带版本的标题只能在运行期设。
+            // 标题只是外观，设失败不能让应用起不来，所以不用 `?`
+            if let Some(window) = app.get_webview_window("main") {
+                if let Err(e) = window.set_title(&build_info::window_title()) {
+                    log::warn!("设置窗口标题失败: {e}");
+                }
             }
             Ok(())
         })

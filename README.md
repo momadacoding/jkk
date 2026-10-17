@@ -99,6 +99,7 @@ workflow 会在构建前自行校验三件事，任何一项不过都在几秒�
 | tag 指向的提交已在 master 上 | 在功能分支上误打 tag，发出未经 review 的代码 |
 | 第三方许可清单与锁文件一致 | 依赖变动后忘了重新生成 `THIRD_PARTY_NOTICES.md` |
 | 目标 Release 不是「已发布」状态 | 重跑 workflow 覆盖掉已经公开的安装包 |
+| `git describe` 恰好等于 tag | 浅克隆没取到 tag，正式版窗口标题带着 hash 发出去 |
 
 同名 Release 若还是 draft（上次传到一半），重跑会复用它并覆盖资产；
 **若已经发布则直接失败** —— 同一版本号对应两份不同的二进制会让审计和回滚失去依据。
@@ -111,6 +112,27 @@ workflow 会在构建前自行校验三件事，任何一项不过都在几秒�
 
 > 这个 workflow **不是 PR 门禁**——`push` 和 `pull_request` 都不会触发它。
 > 日常改动的验证仍然全靠本地手工执行，见 `AGENTS.md` §5。
+
+### 从窗口标题认出是哪个构建
+
+窗口标题由 `src-tauri/build.rs` 在编译期执行
+`git describe --tags --always --match 'v[0-9]*'` 得出，同时开着几个 jkk 时靠它区分：
+
+| 标题 | 含义 |
+|---|---|
+| `jkk 0.5.0` | release 构建，且正好在 `v0.5.0` 这个 tag 上（正式版） |
+| `jkk 0.5.0 (v0.5.0-3-g610fdb0)` | release 构建，在 `v0.5.0` 之后第 3 个提交 `610fdb0` |
+| `jkk 0.5.0 (610fdb0)` | 仓库里没有任何 `v*` tag（如 `workflow_dispatch` 的浅克隆） |
+| `jkk 0.5.0 (v0.5.0-3-g610fdb0) [dev · <目录名>]` | `pnpm tauri dev` 等 debug 构建，带上所在 checkout / worktree 的目录名 |
+| `jkk 0.5.0 (未知提交)` | 编译时取不到 git 信息（没装 git / 不在仓库里） |
+
+几点限制：
+
+- 标题**不带** `-dirty`：build.rs 只在 HEAD、当前分支、tag 变化时重跑，盯不住工作区改动，
+  标出来反而会过时。所以在 tag 上带着未提交改动本地 `pnpm tauri build`，标题同样是
+  `jkk 0.5.0`——正式版只认 Release 页面上的安装包。
+- 同一个 Release 的安装版和绿色版是同一个二进制，标题相同。
+- release.yml 设了 `JKK_REQUIRE_GIT_DESCRIBE=1`，CI 上取不到 describe 会直接构建失败。
 
 ### 绿色版（免安装）
 
