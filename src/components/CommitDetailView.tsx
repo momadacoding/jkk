@@ -23,6 +23,21 @@ interface CommitDetailViewProps {
   onSelectCommit: (id: string) => void
   /** `commit` 是收进这个 svn 节点、不在图上的本地提交时传入，顶上给「返回 rN」。 */
   backTo?: CommitNode | null
+  /**
+   * 这个提交在图上所在车道的分支（`formatLaneBranch` 的结果）。车道一多，光看图认不出
+   * 选中的提交在哪条线上（2026-10-17 用户要求）。图外提交（stash、收进 svn 节点的）没有，传 null。
+   */
+  branch?: string | null
+}
+
+/** 信息条上的分支一栏；三个标签页和 svn 节点共用，换标签页时不该消失。 */
+function BranchTag({ branch }: { branch: string | null | undefined }) {
+  if (!branch) return null
+  return (
+    <span className="commit-head-branch" title={`所在分支：${branch}`}>
+      ⑂ {branch}
+    </span>
+  )
 }
 
 interface TreeListing {
@@ -31,7 +46,7 @@ interface TreeListing {
 }
 
 /** 提交信息条：头像、作者、短 hash、时间、标题。Fork 里三个标签共用这一条。 */
-function CommitHeader({ commit }: { commit: CommitNode }) {
+function CommitHeader({ commit, branch }: { commit: CommitNode; branch?: string | null }) {
   const subject = commit.message.split('\n')[0]
   return (
     <div className="commit-head">
@@ -39,12 +54,13 @@ function CommitHeader({ commit }: { commit: CommitNode }) {
       <span className="commit-head-author">{commit.author}</span>
       <span className="commit-head-sha">{commit.id.slice(0, 7)}</span>
       <span className="commit-head-date">{new Date(commit.time * 1000).toLocaleString()}</span>
+      <BranchTag branch={branch} />
       <span className="commit-head-subject" title={commit.message}>{subject}</span>
     </div>
   )
 }
 
-export function CommitDetailView({ commit, diff, repoPath, onSelectCommit, backTo }: CommitDetailViewProps) {
+export function CommitDetailView({ commit, diff, repoPath, onSelectCommit, backTo, branch }: CommitDetailViewProps) {
   const [tab, setTab] = useState<Tab>('commit')
   const [picked, setPicked] = useState<string | null>(null)
   const [listing, setListing] = useState<TreeListing | null>(null)
@@ -115,6 +131,7 @@ export function CommitDetailView({ commit, diff, repoPath, onSelectCommit, backT
           <span className="commit-head-date">
             {new Date(commit.time * 1000).toLocaleString()}
           </span>
+          <BranchTag branch={branch} />
         </div>
         <pre className="commit-detail-message">{commit.message}</pre>
         {delivered && (
@@ -186,7 +203,7 @@ export function CommitDetailView({ commit, diff, repoPath, onSelectCommit, backT
         <button className={tab === 'tree' ? 'active' : ''} onClick={() => setTab('tree')}>File Tree</button>
       </div>
 
-      <CommitHeader commit={commit} />
+      <CommitHeader commit={commit} branch={branch} />
 
       {tab === 'commit' && (
         <div className="commit-info">

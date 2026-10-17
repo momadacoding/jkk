@@ -1702,6 +1702,17 @@ body {
 .commit-head-sha { font-family: monospace; color: #888; }
 .commit-head-date { color: #888; }
 
+/* 和标题抢宽度时让分支名先截断：标题悬停能看全文，分支名的 title 也带全名 */
+.commit-head-branch {
+  flex-shrink: 1;
+  min-width: 0;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #8ab4d8;
+}
+
 .commit-head-subject {
   flex: 1;
   min-width: 0;

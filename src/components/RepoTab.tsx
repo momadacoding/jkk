@@ -25,6 +25,7 @@ import { useDeliverDialog } from './DeliverDialog'
 import SvnInitWizard from './SvnInitWizard'
 import BaselineBanner from './BaselineBanner'
 import { baselineMap, findDelivered } from '../engine/svnGraph'
+import { computeLaneBranches, formatLaneBranch } from '../engine/laneBranch'
 import { describeHealth, describePinned, healthNeedsRebuild } from '../engine/svnInit'
 import { MIGRATE_EOL_WARNING } from '../engine/svnSync'
 import { samePath } from '../engine/path'
@@ -513,6 +514,14 @@ export function RepoTab({
     }
   }, [state.commits, state.stashes, state.selectedId, delivered])
 
+  // 车道归属对全量历史算一次，点提交时只查表；输入与 GraphView 的布局相同，报的就是图上那条线
+  const laneBranches = useMemo(
+    () => computeLaneBranches(state.commits, state.refs),
+    [state.commits, state.refs],
+  )
+  const detailLane = detailCommit ? laneBranches.get(detailCommit.id) : undefined
+  const detailBranch = detailLane ? formatLaneBranch(detailLane) : null
+
   if (state.loading && state.commits.length === 0) return <div style={{ padding: 16 }}>Loading...</div>
 
   // 「有 `.svn` 无 `.git`」不是错误，是一个还没走的流程（spec §6.1）。
@@ -817,6 +826,7 @@ export function RepoTab({
                     repoPath={state.path}
                     onSelectCommit={selectCommit}
                     backTo={delivered?.owner ?? null}
+                    branch={detailBranch}
                   />
                 </Panel>
               </Group>
