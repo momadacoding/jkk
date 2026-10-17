@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { toErrorMessage } from '../engine/errors'
 
+/**
+ * 结局提示的分量：`attention` 是还要用户动手，`ok` 只是告知。
+ * 不从哪个功能模块引类型：这是通用对话框，SVN 的 `OutcomeNotice.tone` 恰好与它同形。
+ */
+export type NoticeTone = 'ok' | 'attention'
+
 export interface ConfirmRequest {
   title: string
   /** 标题下面那行说明。 */
@@ -22,6 +28,11 @@ export interface ConfirmRequest {
   action?: () => Promise<void>
   /** 进度文案，配合 `action`。 */
   busyLabel?: string
+  /**
+   * 设了就是结局提示，不是确认：只有一个按钮（没有可取消的东西），图标按分量选。
+   * 不设时照旧是确认框。
+   */
+  notice?: NoticeTone
 }
 
 interface Pending extends ConfirmRequest {
@@ -38,6 +49,20 @@ export function WarnGlyph() {
       <path d="M12 10v5M12 17.5v.5" />
     </svg>
   )
+}
+
+/** 结局提示 `ok` 的图标：只是告知，不该长得像警告。 */
+function CheckGlyph() {
+  return (
+    <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <path d="M5 12.5 10 17.5 19 7.5" />
+    </svg>
+  )
+}
+
+function iconClass(r: ConfirmRequest): string {
+  if (r.notice) return `dlg-icon ${r.notice}`
+  return r.danger ? 'dlg-icon danger' : 'dlg-icon'
 }
 
 function RemoteGlyph() {
@@ -90,7 +115,9 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
     <div className="dialog-overlay" onMouseDown={() => { if (!busy) finish(false) }}>
       <div className="dialog dialog-wide" onMouseDown={(e) => e.stopPropagation()}>
         <div className="dlg-head">
-          <span className={request.danger ? 'dlg-icon danger' : 'dlg-icon'}><WarnGlyph /></span>
+          <span className={iconClass(request)}>
+            {request.notice === 'ok' ? <CheckGlyph /> : <WarnGlyph />}
+          </span>
           <div>
             <div className="dialog-title">{request.title}</div>
             <div className="dialog-message">{request.message}</div>
@@ -116,7 +143,7 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
         )}
 
         <div className="dialog-actions">
-          <button disabled={busy} onClick={() => finish(false)}>Cancel</button>
+          {!request.notice && <button disabled={busy} onClick={() => finish(false)}>Cancel</button>}
           <button
             ref={confirmRef}
             className={request.danger ? 'primary danger' : 'primary'}

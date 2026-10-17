@@ -150,6 +150,7 @@ export function describeSyncOutOutcome(o: SyncOutOutcome): OutcomeNotice | null 
     case 'delivered':
       // D9（spec §8.2.3）：分支上还有本地补丁时，它们是唯一副本，绝不能提示删除
       return {
+        tone: 'ok',
         title: `已交付 r${o.rev}`,
         detail:
           o.localOnlyLeft > 0
@@ -158,6 +159,7 @@ export function describeSyncOutOutcome(o: SyncOutOutcome): OutcomeNotice | null 
       }
     case 'rebaseConflict':
       return {
+        tone: 'attention',
         title: '交付成功，本地补丁落回时有冲突',
         detail:
           `改动已经在 SVN 上了（r${o.rev}），不会丢。只剩你的本地补丁放回到最新版本之上时有冲突：\n${listFiles(o.files)}\n\n` +
@@ -166,11 +168,14 @@ export function describeSyncOutOutcome(o: SyncOutOutcome): OutcomeNotice | null 
     case 'abandoned':
       return o.committed
         ? {
+            // 还欠一次「更新」，否则下次交付会被拒
+            tone: 'attention',
             title: '已停止收尾',
             detail:
               '改动已经在 SVN 上了，没有撤回。分支回到了交付前的状态；点「更新」把它更新到最新版本，否则下次交付会被拒。',
           }
         : {
+            tone: 'ok',
             title: '已清理',
             detail: '这次交付在提交之前就停下了。已回到原分支，SVN 侧没有任何改动。',
           }

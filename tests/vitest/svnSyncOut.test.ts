@@ -100,6 +100,15 @@ describe('expectFromDeliverPreview', () => {
 })
 
 describe('describeSyncOutOutcome', () => {
+  it('tone：交付成功与提交前清理是 ok；落回冲突、停止收尾（还欠一次更新）是 attention', () => {
+    const tone = (o: Parameters<typeof describeSyncOutOutcome>[0]) => describeSyncOutOutcome(o)!.tone
+    expect(tone({ kind: 'delivered', rev: 2, branch: 'w', localOnlyLeft: 0 })).toBe('ok')
+    expect(tone({ kind: 'delivered', rev: 2, branch: 'w', localOnlyLeft: 1 })).toBe('ok')
+    expect(tone({ kind: 'abandoned', committed: false })).toBe('ok')
+    expect(tone({ kind: 'abandoned', committed: true })).toBe('attention')
+    expect(tone({ kind: 'rebaseConflict', rev: 2, files: ['a'] })).toBe('attention')
+  })
+
   it('D9：还有本地补丁时绝不说「可以删除分支」', () => {
     const n = describeSyncOutOutcome({ kind: 'delivered', rev: 8, branch: 'work', localOnlyLeft: 2 })!
     expect(n.title).toContain('r8')

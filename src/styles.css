@@ -1,4 +1,7 @@
 :root {
+  /* 整个应用只有深色主题。不声明的话 WebView2 按系统默认画浅色的滚动条与原生控件，
+     在深色面板里白得刺眼（Phase 3a 交付框先在局部修过，2026-10-16 推到全局） */
+  color-scheme: dark;
   --bg: #1e1e1e;
   --fg: #d4d4d4;
   --selected-bg: rgba(255, 255, 255, 0.1);
@@ -293,6 +296,19 @@ body {
   color: #000;
   display: flex;
   justify-content: space-between;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+/* 后端错误常是多行（svn 的 stderr、「已回退到…」的说明），默认的 white-space 会把它们
+   压成一行。限高是为了几十行的 stderr 不把整个标签页顶下去 */
+.banner-error > span {
+  flex: 1;
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 30vh;
+  overflow-y: auto;
 }
 
 .context-menu {
@@ -782,6 +798,17 @@ body {
   color: #e57373;
 }
 
+/* 结局提示（ConfirmRequest.notice）：告知用绿，还要用户动手用琥珀，都不用删除类的红 */
+.dlg-icon.ok {
+  background: #243327;
+  color: #81c784;
+}
+
+.dlg-icon.attention {
+  background: #3a3322;
+  color: #ffb74d;
+}
+
 .dlg-field {
   display: flex;
   align-items: center;
@@ -897,9 +924,6 @@ body {
 .deliver-dialog {
   max-height: 90vh;
   overflow-y: auto;
-  /* 清单与补丁列表会出滚动条：不声明的话 WebView2 画的是系统默认的白色滚动条，
-     在深色框里白得刺眼（2026-10-11 真实窗口截图）。全应用的滚动条另行处理 */
-  color-scheme: dark;
 }
 
 /* 正文与 .dlg-warning / .dlg-progress 一样缩进到标题下面 */

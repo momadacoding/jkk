@@ -147,6 +147,19 @@ describe('handleSvnDeliver', () => {
     expect(log).not.toContain('dialogError:svn_check_failed')
   })
 
+  it('结局提示以 notice 弹出：交付成功是 ok，只有一个按钮', async () => {
+    const d = deps([])
+    const notices: (string | undefined)[] = []
+    d.confirm = async (r: ConfirmRequest) => {
+      notices.push(r.notice)
+      return true
+    }
+    vi.mocked(store.svnSyncOutPreview).mockResolvedValue(preview)
+    vi.mocked(store.svnSyncOut).mockResolvedValue({ kind: 'delivered', rev: 2, branch: 'work', localOnlyLeft: 0 })
+    await createSvnSyncOutFlow(d).handleSvnDeliver()
+    expect(notices).toEqual(['ok'])
+  })
+
   it('横幅按钮：继续成功后刷新失败，结局照常弹出', async () => {
     const log: string[] = []
     const d = deps(log)

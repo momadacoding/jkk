@@ -81,6 +81,19 @@ describe('describeSyncOutcome', () => {
     expect(describeSyncOutcome({ kind: 'done', newRev: 3 })).toBeNull()
   })
 
+  it('tone：还要用户动手的是 attention，只是告知的是 ok（提示框按它选图标）', () => {
+    const stash = 's'.repeat(40)
+    const tone = (o: Parameters<typeof describeSyncOutcome>[0]) => describeSyncOutcome(o)!.tone
+    expect(tone({ kind: 'aborted' })).toBe('ok')
+    expect(tone({ kind: 'settled', stashOid: stash, rolledBack: false })).toBe('ok')
+    expect(tone({ kind: 'settled', stashOid: stash, rolledBack: true })).toBe('ok')
+    expect(tone({ kind: 'rebaseConflict', files: ['a'] })).toBe('attention')
+    expect(tone({ kind: 'stashConflict', files: ['a'], stashOid: stash })).toBe('attention')
+    expect(tone({ kind: 'stashBlocked', collisions: ['a'], stashOid: stash })).toBe('attention')
+    // 「没有自动放回」：文件里可能留着冲突标记，要用户自己处理
+    expect(tone({ kind: 'released', stashOid: stash, rolledBack: false })).toBe('attention')
+  })
+
   it('rebase 冲突：列出文件，并指向横幅上的继续 / 放弃', () => {
     const n = describeSyncOutcome({ kind: 'rebaseConflict', files: ['Code/A.cs'] })!
     expect(n.detail).toContain('Code/A.cs')

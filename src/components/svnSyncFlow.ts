@@ -34,22 +34,28 @@ export interface SvnSyncFlowDeps {
 }
 
 export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
-  /** 同步收尾之后的刷新。`repo-changed` 由后端补发，这里只补它不管的 SVN 侧状态。 */
+  /**
+   * 同步收尾之后的刷新。`repo-changed` 由后端补发，这里只补它不管的 SVN 侧状态。
+   *
+   * **自己不抛**，理由同 `svnSyncOutFlow` 的 `afterSync`：它跑在对话框的 `action` 里，
+   * 更新已经落地之后再抛，对话框会留在原地报错、「更新」还能点，用户以为没更新上。
+   * 刷新失败只进错误条。
+   */
   const afterSync = async () => {
-    await d.refreshSvnSyncState(d.repoPath)
-    await d.refreshSvnSync(d.repoPath)
+    try {
+      await d.refreshSvnSyncState(d.repoPath)
+      await d.refreshSvnSync(d.repoPath)
+    } catch (err) {
+      d.reportError(err)
+    }
     void d.fetchSvnLog(d.repoPath)
   }
 
-  /**
-   * 冲突、撞名、放弃这几种结局要让用户看见；成功不打扰。
-   *
-   * 走 `confirm` 只是借它的对话框外观——取消与确认在这里等价。
-   */
+  /** 冲突、撞名、放弃这几种结局要让用户看见；成功不打扰。`notice` 让它只有一个按钮。 */
   const showOutcome = async (o: SyncInOutcome | null) => {
     const n = o && describeSyncOutcome(o)
     if (!n) return
-    await d.confirm({ title: n.title, message: n.detail, confirmLabel: '知道了' })
+    await d.confirm({ title: n.title, message: n.detail, confirmLabel: '知道了', notice: n.tone })
   }
 
   /**

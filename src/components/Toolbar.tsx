@@ -50,6 +50,8 @@ interface ToolbarProps {
   onSvnUpdate?: () => Promise<void>
   /** SVN 混合仓库的「交付」（sync_out）。同上，由 RepoTab 编排。 */
   onSvnDeliver?: () => Promise<void>
+  /** 非空时「更新」「交付」都禁用，值作悬停说明（`svnSyncBlockedReason`）。 */
+  svnBlockedReason?: string | null
 }
 
 export function Toolbar({
@@ -60,6 +62,7 @@ export function Toolbar({
   capabilities,
   onSvnUpdate,
   onSvnDeliver,
+  svnBlockedReason = null,
 }: ToolbarProps) {
   const ctrl = useCtrlHeld()
   const [busy, setBusy] = useState<ToolbarAction | null>(null)
@@ -96,7 +99,8 @@ export function Toolbar({
       {showsSvnUpdate(capabilities) && onSvnUpdate && (
         <button
           className="toolbar-button"
-          disabled={busy !== null || svnBusy}
+          disabled={busy !== null || svnBusy || svnBlockedReason !== null}
+          title={svnBlockedReason ?? undefined}
           onClick={() => {
             setUpdating(true)
             void onSvnUpdate().finally(() => setUpdating(false))
@@ -109,7 +113,8 @@ export function Toolbar({
       {showsSvnDeliver(capabilities) && onSvnDeliver && (
         <button
           className="toolbar-button"
-          disabled={busy !== null || svnBusy}
+          disabled={busy !== null || svnBusy || svnBlockedReason !== null}
+          title={svnBlockedReason ?? undefined}
           onClick={() => {
             setDelivering(true)
             void onSvnDeliver().finally(() => setDelivering(false))

@@ -105,6 +105,21 @@ describe('handleSvnUpdate', () => {
     expect(log).toContain('refreshSvnSyncState')
     expect(titles).toEqual(['更新', '知道了'])
   })
+
+  it('结局提示以 notice 弹出（只有一个按钮），确认框本身不是 notice', async () => {
+    vi.mocked(store.svnSyncInPreview).mockResolvedValue(preview)
+    vi.mocked(store.svnSyncIn).mockResolvedValue({ kind: 'rebaseConflict', files: ['Code/A.cs'] })
+    const notices: (string | undefined)[] = []
+    const confirm = async (r: ConfirmRequest) => {
+      notices.push(r.notice)
+      await r.action?.()
+      return true
+    }
+
+    await createSvnSyncFlow(deps([], confirm)).handleSvnUpdate()
+
+    expect(notices).toEqual([undefined, 'attention'])
+  })
 })
 
 describe('同一时间只走一个流程（PR #49 Codex review #5）', () => {
@@ -140,6 +155,65 @@ describe('同一时间只走一个流程（PR #49 Codex review #5）', () => {
     await flow.handleSvnUpdate()
     expect(store.svnSyncInPreview).toHaveBeenCalledTimes(2)
     expect(store.svnSyncIn).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('收尾之后的刷新失败（3a 最终 review 第 3 条在「更新」侧的同形问题）', () => {
+  /** 与真对话框一样：`action` 抛错时留在原地显示错误。 */
+  const dialog =
+    (log: string[]) =>
+    async (r: ConfirmRequest): Promise<boolean> => {
+      log.push(`confirm:${r.title}`)
+      try {
+        await r.action?.()
+      } catch (e) {
+        log.push(`dialogError:${(e as { code?: string }).code}`)
+        return false
+      }
+      return true
+    }
+
+  it('更新成功后刷新失败：对话框不报错，刷新的错误进错误条', async () => {
+    // 更新已经落地，对话框却留在原地报错、「更新」还能点，用户会以为没更新上
+    const log: string[] = []
+    const d = deps(log, dialog(log))
+    d.refreshSvnSync = async () => {
+      throw { code: 'svn_check_failed' }
+    }
+    vi.mocked(store.svnSyncInPreview).mockResolvedValue(preview)
+    vi.mocked(store.svnSyncIn).mockResolvedValue({ kind: 'rebaseConflict', files: ['Code/A.cs'] })
+
+    await createSvnSyncFlow(d).handleSvnUpdate()
+
+    expect(log.some((l) => l.startsWith('dialogError'))).toBe(false)
+    expect(log).toContain('reportError:svn_check_failed')
+    // 结局照常弹出
+    expect(log.filter((l) => l.startsWith('confirm:'))).toHaveLength(2)
+    expect(log).toContain('fetchSvnLog')
+  })
+
+  it('横幅上的继续成功后刷新失败：同样不报到对话框里', async () => {
+    const log: string[] = []
+    const d = deps(log, dialog(log))
+    d.refreshSvnSyncState = async () => {
+      throw { code: 'journal_unreadable' }
+    }
+    vi.mocked(store.svnSyncContinue).mockResolvedValue({ kind: 'done', newRev: 2 })
+
+    await createSvnSyncFlow(d).handleSyncAction('syncContinue')
+
+    expect(log.some((l) => l.startsWith('dialogError'))).toBe(false)
+    expect(log).toContain('reportError:journal_unreadable')
+  })
+
+  it('执行本身失败：对话框里显示的仍是后端原本的错误', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncInPreview).mockResolvedValue(preview)
+    vi.mocked(store.svnSyncIn).mockRejectedValue({ code: 'sync_in_update_failed' })
+
+    await createSvnSyncFlow(deps(log, dialog(log))).handleSvnUpdate()
+
+    expect(log).toContain('dialogError:sync_in_update_failed')
   })
 })
 
