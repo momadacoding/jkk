@@ -28,6 +28,7 @@ import { baselineMap, findDelivered } from '../engine/svnGraph'
 import { computeLaneBranches, formatLaneBranch } from '../engine/laneBranch'
 import { describeHealth, describePinned, healthNeedsRebuild } from '../engine/svnInit'
 import { MIGRATE_EOL_WARNING } from '../engine/svnSync'
+import { svnSyncBlockedReason } from '@/engine/svnJournal'
 import { samePath } from '../engine/path'
 import { isProtectedBaseline, visibleSections } from '../engine/capabilities'
 import { askConfirm } from '../engine/confirm'
@@ -716,6 +717,7 @@ export function RepoTab({
         capabilities={state.capabilities}
         onSvnUpdate={handleSvnUpdate}
         onSvnDeliver={handleSvnDeliver}
+        svnBlockedReason={svnSyncBlockedReason(state.svnSyncState)}
       />
       <div className="repo-path-bar" title={state.path ?? ''}>{state.path} @ {state.head}</div>
       <div style={{ flex: 1, overflow: 'hidden' }}>

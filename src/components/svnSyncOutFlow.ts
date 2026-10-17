@@ -80,11 +80,11 @@ export function createSvnSyncOutFlow(d: SvnSyncOutFlowDeps) {
     }
   }
 
-  /** 走 `confirm` 只是借它的对话框外观——取消与确认在这里等价。 */
+  /** 结局提示，`notice` 让它只有一个按钮（理由同 `svnSyncFlow`）。 */
   const showOutcome = async (o: SyncOutOutcome | null) => {
     const n = o && describeSyncOutOutcome(o)
     if (!n) return
-    await d.confirm({ title: n.title, message: n.detail, confirmLabel: '知道了' })
+    await d.confirm({ title: n.title, message: n.detail, confirmLabel: '知道了', notice: n.tone })
   }
 
   /** 同一时间只走一个流程（理由同 `svnSyncFlow` 的 `exclusive`）。 */

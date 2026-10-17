@@ -237,6 +237,32 @@ export function needsLockPolling(s: SyncState | SyncStateUnreadable | null): boo
 }
 
 /**
+ * 工具栏「更新」「交付」该不该禁用；返回值是悬停说明，`null` 表示可点。
+ *
+ * 持锁、留有未收尾记录时两个预览命令一进门就拒绝（在走网络之前）。不出事，但按钮可点、
+ * 点了才弹一条错误条，等于让用户试错才知道现在不该点。横幅本身的按钮不受影响：收尾走的
+ * 就是它们。
+ *
+ * 不拦的两种：还没读到（`null`）——打开仓库时先读同步状态再画第一帧，这时拦住只会让按钮
+ * 闪一下灰；读不出来（`readError`）——可能只是一次偶发失败，而它不轮询、横幅也没有按钮，
+ * 拦住的话按钮会一直灰到下一次碰巧的文件事件。真坏了，预览会以 journal 的错误拒绝。
+ */
+export function svnSyncBlockedReason(s: SyncState | SyncStateUnreadable | null): string | null {
+  if (s === null || 'readError' in s) return null
+  if (s.locked) {
+    // 与横幅同一判据：重建基线时说成「同步」，用户会以为锁是残留的而重开应用
+    return s.holder?.opid.startsWith(BASELINE_MOVE_OPID_PREFIX)
+      ? '正在重建基线，等它完成'
+      : '有一次同步正在进行，等它结束'
+  }
+  if (s.unfinished) {
+    const what = s.unfinished.flow === 'sync_out' ? '交付' : '更新'
+    return `上次${what}没有收尾，先用上方横幅里的按钮处理`
+  }
+  return null
+}
+
+/**
  * 未收尾 / 同步进行中时，其余横幅一律让位。
  *
  * 那两种状态下仓库停在中间态：失同步横幅会拿一个半推进的基线去比 revision，

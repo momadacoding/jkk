@@ -141,6 +141,37 @@ describe('useConfirm', () => {
     await expect(second).resolves.toBe(true)
   })
 
+  it('结局提示（notice）：只有一个按钮，没有 Cancel；ok 不挂警告图标', async () => {
+    // 3a E2E 之后的观察：「已交付 r2」借确认框外观，带警告三角与多余的 Cancel
+    const { confirm } = mount()
+    let shown!: Promise<boolean>
+    act(() => {
+      shown = confirm()({ title: '已交付 r2', message: 'm', confirmLabel: '知道了', notice: 'ok' })
+    })
+    expect(screen.getAllByRole('button').map((b) => b.textContent)).toEqual(['知道了'])
+    expect(document.querySelector('.dlg-icon.ok')).not.toBeNull()
+    expect(document.querySelector('.dlg-icon.attention')).toBeNull()
+    fireEvent.click(button('知道了'))
+    await expect(shown).resolves.toBe(true)
+  })
+
+  it('结局提示（attention）：同样只有一个按钮，图标是提醒色', () => {
+    const { confirm } = mount()
+    act(() => {
+      void confirm()({ title: '更新遇到冲突', message: 'm', confirmLabel: '知道了', notice: 'attention' })
+    })
+    expect(screen.queryByRole('button', { name: 'Cancel' })).toBeNull()
+    expect(document.querySelector('.dlg-icon.attention')).not.toBeNull()
+  })
+
+  it('普通确认框照旧有 Cancel', () => {
+    const { confirm } = mount()
+    act(() => {
+      void confirm()({ title: '删除', message: 'm', confirmLabel: '删除' })
+    })
+    expect(screen.queryByRole('button', { name: 'Cancel' })).not.toBeNull()
+  })
+
   it('action 抛错：留在原地显示错误，按钮恢复可点', async () => {
     const { confirm } = mount()
     act(() => {

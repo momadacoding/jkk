@@ -123,6 +123,33 @@ pub(crate) fn check_sync_in(repo_root: &str) -> Result<SyncInPreview> {
     })?;
     let st = parse_update_status(&xml)?;
     let roots = normalize_roots(&cfg.whitelist);
+    // 被 git 删掉的目录不是「你改过、更新会覆盖的文件」：`git rm` 删掉目录里最后一个文件时 git
+    // 顺手删掉空目录，svn 把目录报成 missing；同事往里加文件时目录本身带 incoming，没有扩展名就被
+    // 当成被排除的文件列进确认框（2026-10-16 fixture 实测）。跳过的条件比交付侧
+    // `svn_sync_out_check::outside_changes` 多一条：目录底下**没有丢掉任何非 W-file**。交付侧会把
+    // 丢掉的非 W-file 逐个列出来；这里只列带 incoming 的，服务器上没动的 `x.psd` 不会单独出现，
+    // 用户在资源管理器里删掉整个目录时，目录条目是唯一的提醒（review 第 1 条，fixture 场景 D）。
+    // 目录自己的属性改动照样要确认
+    let mut parents = std::collections::HashSet::new();
+    let mut lost_non_w = std::collections::HashSet::new();
+    for e in &st.entries {
+        let mut p = e.path.as_str();
+        while let Some((up, _)) = p.rsplit_once('/') {
+            parents.insert(up);
+            p = up;
+        }
+    }
+    for e in &st.entries {
+        // 只从叶子往上标：被删的子目录自己也是「丢掉的非 W 条目」，从它标会把嵌套目录全拦下
+        let leaf = !parents.contains(e.path.as_str());
+        if leaf && e.item == "missing" && !is_w_file(&e.path, &roots, &cfg.extensions) {
+            let mut p = e.path.as_str();
+            while let Some((up, _)) = p.rsplit_once('/') {
+                lost_non_w.insert(up);
+                p = up;
+            }
+        }
+    }
     let mut conflicted = Vec::new();
     let mut outside = Vec::new();
     for e in &st.entries {
@@ -133,9 +160,14 @@ pub(crate) fn check_sync_in(repo_root: &str) -> Result<SyncInPreview> {
         if is_w_file(&e.path, &roots, &cfg.extensions) {
             continue; // git 管着，S1 会压进 stash
         }
+        let path = e.path.as_str();
+        let removed_dir = e.item == "missing"
+            && e.props != "modified"
+            && parents.contains(path)
+            && !lost_non_w.contains(path);
         let local =
             matches!(e.item.as_str(), "modified" | "missing" | "replaced") || e.props == "modified";
-        if local && e.is_incoming() {
+        if local && !removed_dir && e.is_incoming() {
             outside.push(e.path.clone());
         }
     }

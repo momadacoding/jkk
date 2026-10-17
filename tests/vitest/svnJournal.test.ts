@@ -4,6 +4,7 @@ import {
   needsLockPolling,
   otherBannersAreSuppressed,
   sinceText,
+  svnSyncBlockedReason,
   SYNC_LOCK_POLL_MS,
   type SyncPhase,
   type SyncState,
@@ -376,6 +377,47 @@ describe('describeUnfinishedSync', () => {
         expect(text, JSON.stringify(s)).not.toContain('**')
       }
     }
+  })
+})
+
+describe('svnSyncBlockedReason', () => {
+  // 3a E2E 之后的观察：未收尾横幅挂着时工具栏「更新」「交付」仍可点，
+  // 点了要先跑一遍预览（网络）才被后端以「上次没收尾」拒绝
+  it('有未收尾的记录：两条流程都要说清去横幅上处理', () => {
+    for (const flow of ['sync_in', 'sync_out'] as const) {
+      const r = svnSyncBlockedReason({
+        locked: false,
+        holder: null,
+        unfinished: { flow, phase: 'publishing-baseline', opid: 'x', startedAt: 1 },
+      })
+      expect(r, flow).toMatch(/横幅/)
+    }
+  })
+
+  it('另一次同步正持锁：拦住', () => {
+    expect(svnSyncBlockedReason({ locked: true, holder: null, unfinished: null })).toMatch(/正在进行/)
+  })
+
+  it('重建基线持锁：说法与横幅一致，不能说成「同步」（review 第 3 条）', () => {
+    // 用户知道自己没点过更新，看到「同步正在进行」会以为锁是残留的、重开应用，把重建拦腰杀掉
+    const r = svnSyncBlockedReason({
+      locked: true,
+      holder: { pid: 1, startedAt: 1, opid: 'baseline-123' },
+      unfinished: null,
+    })
+    expect(r).toMatch(/重建基线/)
+    expect(r).not.toMatch(/同步/)
+  })
+
+  it('记录读不出来：不拦（review 第 2 条）', () => {
+    // 读失败可能只是一次偶发的 IO / invoke 失败，而 readError 不轮询、横幅也没有按钮；
+    // 拦住的话按钮会一直灰到下一次碰巧的文件事件。真坏了，预览会以 journal 错误拒绝
+    expect(svnSyncBlockedReason({ readError: 'svn_journal_corrupt' })).toBeNull()
+  })
+
+  it('干净、或还没读到：不拦（还没读到时拦住会让刚打开的仓库按钮闪一下灰）', () => {
+    expect(svnSyncBlockedReason(clean)).toBeNull()
+    expect(svnSyncBlockedReason(null)).toBeNull()
   })
 })
 

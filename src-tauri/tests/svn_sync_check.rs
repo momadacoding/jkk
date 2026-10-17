@@ -5,6 +5,7 @@ mod svn_fixtures;
 
 use app_lib::engine::git_cli::run_git;
 use app_lib::engine::svn_sync_check::{assert_linear, preview_sync_in};
+use app_lib::engine::svn_sync_in::{run_sync_in, SyncInExpect};
 use svn_fixtures::{hybrid_with_colleague, svn_cmd};
 
 fn git(fx: &svn_fixtures::SvnFixture, args: &[&str]) -> String {
@@ -109,6 +110,78 @@ fn outside_changes_the_update_will_not_touch_are_not_listed() {
     fx.colleague_commits("Code/A.cs", "a2\n");
     let p = preview_sync_in(&fx.wc_str()).unwrap();
     assert!(p.outside_changes.is_empty(), "{:?}", p.outside_changes);
+}
+
+#[test]
+fn a_directory_git_removed_is_not_an_outside_change_when_the_colleague_adds_to_it() {
+    // 与交付侧 E1 同一个误报（3a E2E 之后的 review 第 4 条）：`git rm` 删掉目录里最后一个文件时
+    // git 顺手删掉空目录，svn 把目录报成 `missing`；同事往这个目录里加文件时目录本身带 incoming，
+    // 于是目录被当成「本地改过、更新会覆盖」的文件列进确认框。实测 svn status -u：
+    // `Code/Solo` item=missing、repos-status item=modified；`Code/Solo/S.cs` missing；
+    // `Code/Solo/T.cs` repos added。update 只会把目录拉回来，不丢任何东西
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/Solo/S.cs", "solo\n");
+    update_to_head(&fx);
+    git(&fx, &["rm", "-q", "Code/Solo/S.cs"]);
+    git(&fx, &["commit", "-qm", "drop solo"]);
+    assert!(
+        !fx.wc().join("Code/Solo").exists(),
+        "前提：git 删掉了空目录"
+    );
+    fx.colleague_commits("Code/Solo/T.cs", "t\n");
+
+    let p = preview_sync_in(&fx.wc_str()).unwrap();
+    assert!(p.outside_changes.is_empty(), "{:?}", p.outside_changes);
+
+    // 不报是对的：真跑一次更新，同事的新文件到位，本地的删除照样重放在上面
+    update_to_head(&fx);
+    assert!(fx.wc().join("Code/Solo/T.cs").exists());
+    assert!(!fx.wc().join("Code/Solo/S.cs").exists());
+    assert_eq!(git(&fx, &["log", "-1", "--format=%s"]), "drop solo");
+}
+
+#[test]
+fn a_removed_directory_still_lists_the_changed_file_inside_it() {
+    // 护栏：跳过目录条目之后，目录里真正会被 update 覆盖的非 W-file 仍要报出来
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/Art/x.psd", "psd1\n");
+    update_to_head(&fx);
+    std::fs::remove_dir_all(fx.wc().join("Code/Art")).unwrap();
+    fx.colleague_commits("Code/Art/x.psd", "psd2\n");
+
+    let p = preview_sync_in(&fx.wc_str()).unwrap();
+    assert_eq!(p.outside_changes, vec!["Code/Art/x.psd".to_string()]);
+}
+
+#[test]
+fn a_directory_deleted_with_files_git_does_not_manage_is_still_listed() {
+    // review 第 1 条（2026-10-16 fixture 场景 D）：目录里有 git 管不到的 `x.psd`，用户在资源管理器里
+    // 删了整个目录，同事往里加了 `T.cs`。`x.psd` 服务器上没动、不带 incoming，不会单独列出；
+    // 这时目录条目是唯一的提醒——update 会把用户删掉的 `x.psd` 一起拉回来
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/Solo/S.cs", "solo\n");
+    fx.colleague_commits("Code/Solo/x.psd", "psd\n");
+    update_to_head(&fx);
+    std::fs::remove_dir_all(fx.wc().join("Code/Solo")).unwrap();
+    fx.colleague_commits("Code/Solo/T.cs", "t\n");
+
+    let p = preview_sync_in(&fx.wc_str()).unwrap();
+    assert_eq!(p.outside_changes, vec!["Code/Solo".to_string()]);
+}
+
+/// 用「更新」本身把 wc1 和基线一起带到服务器最新（直接 `svn update` 会让基线失同步）。
+fn update_to_head(fx: &svn_fixtures::SvnFixture) {
+    let p = preview_sync_in(&fx.wc_str()).unwrap();
+    run_sync_in(
+        &fx.wc_str(),
+        &SyncInExpect {
+            orig_branch: p.orig_branch,
+            orig_head: p.orig_head,
+            baseline_oid: p.baseline_oid,
+            confirmed_outside: p.outside_changes,
+        },
+    )
+    .unwrap();
 }
 
 /// 本地给 `Art/x.psd` 设了属性，同事在服务器上也改了同一个属性——都不碰内容。

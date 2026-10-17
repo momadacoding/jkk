@@ -57,9 +57,13 @@ export interface SyncConfirmModel {
   danger?: boolean
 }
 
+/** 提示框的分量：`attention` 是还要用户动手（解决冲突、自己取回改动、补一次更新），`ok` 只是告知。 */
+export type NoticeTone = 'ok' | 'attention'
+
 export interface OutcomeNotice {
   title: string
   detail: string
+  tone: NoticeTone
 }
 
 export type SyncActionId = 'syncContinue' | 'syncAbort'
@@ -130,9 +134,10 @@ export function describeSyncOutcome(o: SyncInOutcome): OutcomeNotice | null {
     case 'done':
       return null // 成功不打扰：界面刷新本身就是结果
     case 'aborted':
-      return { title: '已放弃这次更新', detail: '已回到更新前的分支，未提交的改动已放回。' }
+      return { title: '已放弃这次更新', detail: '已回到更新前的分支，未提交的改动已放回。', tone: 'ok' }
     case 'rebaseConflict':
       return {
+        tone: 'attention',
         title: '更新遇到冲突',
         detail:
           `基线已经更新好了，把你的提交重放上去时有冲突：\n${listFiles(o.files)}\n\n` +
@@ -140,6 +145,7 @@ export function describeSyncOutcome(o: SyncInOutcome): OutcomeNotice | null {
       }
     case 'stashConflict':
       return {
+        tone: 'attention',
         title: '放回未提交的改动时有冲突',
         detail:
           `更新已经完成，但你未提交的改动与新代码冲突了：\n${listFiles(o.files)}\n\n` +
@@ -147,6 +153,7 @@ export function describeSyncOutcome(o: SyncInOutcome): OutcomeNotice | null {
       }
     case 'stashBlocked':
       return {
+        tone: 'attention',
         title: '未提交的改动还没放回来',
         detail:
           `服务器这次新增了与你的未跟踪文件同名的文件，直接放回会覆盖其中一边：\n${listFiles(o.collisions)}\n\n` +
@@ -156,6 +163,7 @@ export function describeSyncOutcome(o: SyncInOutcome): OutcomeNotice | null {
       // 不能复用 aborted 那句「已放回」：这里恰恰没放回（2c 独立 review I1）
       // 回退途中停下的放回不能说「在新基线上」：基线没推进，分支回到了原处（PR #49 review #3）
       return {
+        tone: 'attention',
         title: o.rolledBack ? '已放弃这次更新，改动没有自动放回' : '更新已结束，改动没有自动放回',
         detail:
           (o.rolledBack ? '分支已回到更新前的位置。' : '分支已经在新基线上。') +
@@ -164,7 +172,9 @@ export function describeSyncOutcome(o: SyncInOutcome): OutcomeNotice | null {
           `原始备份一直在 stash 列表里（mygitclient-sync:…，${shortOid(o.stashOid)}），需要时自己取回，不要当成垃圾清掉。`,
       }
     case 'settled':
+      // stash 里的备份留着只是为防万一，删不删随用户，不算待办
       return {
+        tone: 'ok',
         title: o.rolledBack ? '已放弃这次更新' : '更新完成',
         detail:
           (o.rolledBack
