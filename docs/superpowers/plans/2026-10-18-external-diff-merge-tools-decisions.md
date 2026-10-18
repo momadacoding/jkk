@@ -13,7 +13,7 @@
 | 1 外部工具配置与规则匹配 | ✅ 完成 | `engine/external_tools_config.rs`、`commands/external.rs`、`src/engine/externalTools.ts`、`src/store/externalToolsStore.ts`；测试 `tests/external_tools_config.rs`（7）、`tests/vitest/externalTools.test.ts`（17） | fmt / clippy / cargo test 全绿；pnpm build 通过，pnpm test 43 文件 637 例全过；`pnpm tauri dev` 实测推迟到 Task 4（见决策） |
 | 2 外部进程启动、锁与临时目录 | ✅ 完成 | `engine/external_launch.rs`；测试 `tests/external_launch.rs`（12） | fmt / clippy 无告警；cargo test 58 个测试二进制 898 例全过 |
 | 3 按字节导出与外部 diff 命令 | ✅ 完成 | `engine/blob_export.rs`、`engine/external_diff.rs`、`commands/external.rs` 加 `open_external_diff`；`external_launch.rs` 加 `ExternalToolExited`、`TempWorkspace` 的 Drop 兜底；测试 `tests/external_diff.rs`（21） | fmt / clippy 无告警；`cargo test -j 4` 59 个二进制 919 例全过；`%TEMP%\jkk-external` 无残留 |
-| 4 前端外部 diff 入口与刷新代次 | 未开始 | | |
+| 4 前端外部 diff 入口与刷新代次 | 🟡 代码完成，Step 5 真实窗口实测待用户执行 | `src/engine/latestGate.ts`、`src/components/externalToolItems.ts`；改 `externalTools.ts`、`externalToolsStore.ts`、`repoStore.ts`、`ContextMenu.tsx`、`FileTree.tsx`、`LocalChangesView.tsx`、`CommitDetailView.tsx`、`RepoTab.tsx`、`styles.css`；测试 `latestGate.test.ts`（4）、`externalTools.test.ts`（+13）、`LocalChangesView.test.tsx`（+7）、`CommitDetailView.test.tsx`（+3） | pnpm build 通过；pnpm test 44 文件 661 例全过；`pnpm tauri dev` 实测未做 |
 | 5 冲突信息读取与五种情况分类 | 未开始 | | |
 | 6 冲突文件的 HEAD 对比工作区 diff | 未开始 | | |
 | 7 外部 merge 命令与各侧标题 | 未开始 | | |
@@ -121,3 +121,39 @@
 - 工作区一侧先用 `symlink_metadata` 检查，符号链接和目录都拒绝；测试断言链接指向的文件内容不变。
 - 导出走 `run_git_bytes` 按字节写盘，git 失败时不写文件（`export_failure_does_not_write_file`）。
 - 本 Task 没有 git 写操作。所有 git 调用都只在 `TempDir` fixture 里跑。
+
+### Task 4
+
+#### 偏离计划
+
+- Ruling：做了真正的子菜单「用其他工具打开 ▸」，没有按计划的退路平铺成「用 X 打开」—— spec §4.5 写明子菜单是用户确认过的设计；`ContextMenu` 的 `MenuItem` 加了可选的 `children`，只支持一层，鼠标移上去或点一下展开，子菜单渲染在主菜单的 DOM 里（「点菜单外面就关」的判断才会放行它）—— 代价：贴着窗口右边缘弹出时子菜单可能出界，要在真实窗口里看一眼。
+- Ruling：菜单拼装分两层 —— `src/engine/externalTools.ts` 的 `diffMenuEntries` 给出文案和工具 id（纯逻辑，可单测），`src/components/externalToolItems.ts` 的 `externalDiffItems` 把它们变成 `MenuItem`（`MenuItem` 类型在 components 层，engine 不能依赖它）。两个视图共用同一个 `ExternalToolsMenu` prop —— 代价：无。
+- Ruling：计划之外新增的 engine 函数和常量：`DiffTarget` 类型、`diffTargetFromScope`（解析 `commit:` / `range:`，与 Rust 侧 `read_diff` 一致）、`describeToolExit`（退出后的报错文案）、`EDIT_CONFIG_LABEL`、`OTHER_TOOLS_LABEL` —— 代价：无。
+- Ruling：`CommitDetailView` 的 `diffScope` 写成可选 `diffScope?: string | null`，不是计划的必填 —— 现有测试和调用方不传它；不传等于 null，没有对比项 —— 代价：无。
+- Ruling：配置在窗口重新获得焦点时重读 —— 计划没写何时重读；只在挂载时读的话，用户点「编辑外部工具配置…」改完，要重启应用菜单才更新 —— 代价：每次切回窗口多一次读小 JSON 的 invoke。
+- Ruling：冲突文件的右键菜单里也保留「编辑外部工具配置…」（没有对比项）—— spec §4.5 规定每个外部工具菜单的最后一项都是它；Task 8 会在它前面加 merge 项 —— 代价：无。
+- Ruling：外部工具只打开右键点中的那一个文件，不跟随多选 —— 一次开一堆 BC 窗口不是用户要的 —— 代价：无。
+- Ruling：提交详情只在 Changes 标签页的文件树、以及 svn 节点有两版基线时的文件树上挂右键菜单；Commit 标签页的文件列表和 File Tree 标签页不挂 —— 计划只要求 FileTree 的 `onContextMenu`；File Tree 标签页看的是整棵树，不是改动 —— 代价：在 Commit 标签页的文件列表上右键没有反应，要切到 Changes。
+- Ruling：退出事件报错时消息前面加上文件路径（`<file>：<工具> 退出码 N，可能没有正常完成`）—— 同时开着几个文件时要知道是哪一个 —— 代价：无。
+- 计划之外多加的测试：Staged 右键得到 staged 目标、只有一个工具时没有子菜单、点「编辑外部工具配置…」调用 `onEditConfig`、`describeToolExit` 四例、`diffMenuEntries` 三例、`diffTargetFromScope` 的各种畸形输入、`latestGate` 实例之间互不影响。
+
+#### 计划的错误
+
+- 无。
+
+#### 计划没写的坑
+
+- 代次闸的取舍：较新的请求如果失败（`invoke` 抛错），较早那次的成功结果也已经被判为过期、丢掉了，界面会停在更早的状态，直到下一次刷新。文件监听很快会再触发，所以接受。
+- PowerShell 的 `Set-Content -Path` 把 `f[1] x.txt` 里的 `[1]` 当通配符，报一个看起来毫不相干的「找不到参数 NoNewline」；fixture 脚本必须用 `-LiteralPath`。Task 12 的 fixture 脚本照此写。
+- BComp.exe 会不会等比较窗口关掉才退出（spec §4.4 要求实测），以及 BC 做 diff 时正常关闭的退出码是不是 0，都要靠 Step 5 的真实窗口实测确认。如果 BComp 立刻返回，临时目录会在 BC 还开着时被删掉，Step 5 能直接看出来。
+
+#### 为什么这么改是安全的
+
+- 前端没有任何 git 写操作；外部 diff 只经 `open_external_diff` 走 Task 3 的后端流程。
+- 刷新只认 `worktree` 与当前标签相同的退出事件（`samePath`），别的标签不受影响；代次闸保证晚到的旧结果不会盖掉新状态。
+- 退出码非零、等待失败都通过 `reportError` 报出来，不吞掉；退出码不参与任何「是否已解决」的判断。
+
+#### Step 5 真实窗口实测（待用户执行）
+
+- fixture：`scratchpad\make-diff-fixture.ps1` 在会话 scratchpad 里建一次性仓库 `diff-fixture`（Staged + Unstaged 的 `a.txt`、只在工作区改的 `目录 a/f[1] x.txt`、改名提交 c2）。
+- 结果：待填。

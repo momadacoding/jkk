@@ -24,7 +24,10 @@ import { createSvnSyncOutFlow } from './svnSyncOutFlow'
 import { useDeliverDialog } from './DeliverDialog'
 import SvnInitWizard from './SvnInitWizard'
 import BaselineBanner from './BaselineBanner'
-import { baselineMap, findDelivered } from '../engine/svnGraph'
+import { baselineMap, findDelivered, selectionDiffScope } from '../engine/svnGraph'
+import { describeToolExit } from '@/engine/externalTools'
+import { openExternalDiff, useExternalToolExit, useExternalTools } from '@/store/externalToolsStore'
+import type { ExternalToolsMenu } from './externalToolItems'
 import { computeLaneBranches, formatLaneBranch } from '../engine/laneBranch'
 import { describeHealth, describePinned, healthNeedsRebuild } from '../engine/svnInit'
 import { MIGRATE_EOL_WARNING } from '../engine/svnSync'
@@ -523,6 +526,31 @@ export function RepoTab({
   const detailLane = detailCommit ? laneBranches.get(detailCommit.id) : undefined
   const detailBranch = detailLane ? formatLaneBranch(detailLane) : null
 
+  // 提交详情的 diff 按哪个 scope 读的，与 `useRepoEffects` 的算法相同；外部 diff 据此定两侧
+  const commitScope = selectionDiffScope(state.commits, state.selectedId)
+  const externalTools = useExternalTools()
+  useEffect(() => {
+    if (externalTools.error) reportError(externalTools.error)
+  }, [externalTools.error, reportError])
+  const externalToolsMenu: ExternalToolsMenu = {
+    config: externalTools.config,
+    onDiff: (toolId, target) => {
+      if (!state.path) return
+      openExternalDiff(state.path, toolId, target).catch(reportError)
+    },
+    onEditConfig: () => { externalTools.openConfig().catch(reportError) },
+  }
+  // 工具里可能改了工作区文件（Unstaged 那一侧是真文件），退出后刷新这个仓库的状态和 diff
+  useExternalToolExit(state.path, (exit) => {
+    const path = state.path
+    if (!path) return
+    void refreshStatus(path).catch(reportError)
+    const scope = viewMode === 'changes' ? 'workdir' : commitScope
+    if (scope) void refreshDiff(path, scope).catch(reportError)
+    const problem = describeToolExit(exit.toolLabel, exit.code, exit.error)
+    if (problem) reportError(`${exit.file}：${problem}`)
+  })
+
   if (state.loading && state.commits.length === 0) return <div style={{ padding: 16 }}>Loading...</div>
 
   // 「有 `.svn` 无 `.git`」不是错误，是一个还没走的流程（spec §6.1）。
@@ -829,6 +857,8 @@ export function RepoTab({
                     onSelectCommit={selectCommit}
                     backTo={delivered?.owner ?? null}
                     branch={detailBranch}
+                    diffScope={commitScope}
+                    externalTools={externalToolsMenu}
                   />
                 </Panel>
               </Group>
@@ -842,6 +872,7 @@ export function RepoTab({
                 onCommit={handleCommit}
                 svnMode={state.capabilities.vcs === 'svn'}
                 onBaselineBranch={isProtectedBaseline(state.head, state.capabilities)}
+                externalTools={externalToolsMenu}
               />
             )}
           </Panel>

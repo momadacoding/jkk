@@ -8,6 +8,9 @@ import { DiffView } from './DiffView'
 import { FileTree } from './FileTree'
 import { FileContentView } from './FileContentView'
 import { toErrorMessage } from '../engine/errors'
+import { diffTargetFromScope } from '@/engine/externalTools'
+import { ContextMenu, useContextMenu } from './ContextMenu'
+import { externalDiffItems, type ExternalToolsMenu } from './externalToolItems'
 
 type Tab = 'commit' | 'changes' | 'tree'
 
@@ -28,6 +31,13 @@ interface CommitDetailViewProps {
    * 选中的提交在哪条线上（2026-10-17 用户要求）。图外提交（stash、收进 svn 节点的）没有，传 null。
    */
   branch?: string | null
+  /**
+   * 这份 diff 是按哪个 scope 读出来的（`selectionDiffScope` 的结果），外部 diff 据此决定两侧。
+   * 只认 `commit:` / `range:`；null 或别的值时右键菜单里没有对比项。
+   */
+  diffScope?: string | null
+  /** 外部 diff 工具的菜单项；不传时文件树没有右键菜单。 */
+  externalTools?: ExternalToolsMenu
 }
 
 /** 信息条上的分支一栏；三个标签页和 svn 节点共用，换标签页时不该消失。 */
@@ -60,11 +70,22 @@ function CommitHeader({ commit, branch }: { commit: CommitNode; branch?: string 
   )
 }
 
-export function CommitDetailView({ commit, diff, repoPath, onSelectCommit, backTo, branch }: CommitDetailViewProps) {
+export function CommitDetailView({
+  commit, diff, repoPath, onSelectCommit, backTo, branch, diffScope = null, externalTools,
+}: CommitDetailViewProps) {
   const [tab, setTab] = useState<Tab>('commit')
   const [picked, setPicked] = useState<string | null>(null)
   const [listing, setListing] = useState<TreeListing | null>(null)
   const [listError, setListError] = useState<string | null>(null)
+  const { menu, open, close } = useContextMenu()
+
+  // 改动列表里的文件右键：两侧由 diff scope 决定，改名时左边用旧路径
+  const fileContextMenu = (path: string, e: React.MouseEvent) => {
+    const oldPath = diff.files.find((f) => f.path === path)?.oldPath ?? null
+    const target = diffTargetFromScope(diffScope, path, oldPath)
+    if (!externalTools || !target) return
+    open(e, externalDiffItems(externalTools, target))
+  }
 
   const fileStats = useMemo(
     () =>
@@ -161,7 +182,12 @@ export function CommitDetailView({ commit, diff, repoPath, onSelectCommit, backT
             <div className="commit-split">
               <Group orientation="horizontal">
                 <Panel defaultSize="30%" minSize="15%" maxSize="60%">
-                  <FileTree nodes={changesTree} selectedPath={activePath} onSelect={setPicked} />
+                  <FileTree
+                    nodes={changesTree}
+                    selectedPath={activePath}
+                    onSelect={setPicked}
+                    onContextMenu={fileContextMenu}
+                  />
                 </Panel>
                 <Separator className="separator-v" />
                 <Panel minSize="30%">
@@ -169,6 +195,7 @@ export function CommitDetailView({ commit, diff, repoPath, onSelectCommit, backT
                 </Panel>
               </Group>
             </div>
+            <ContextMenu menu={menu} onClose={close} />
           </>
         ) : (
           // 不猜是谁的提交：交付之后同事紧跟着提交时，自己交付的 revision 也没在本机记过（2026-10-16 review）
@@ -234,13 +261,19 @@ export function CommitDetailView({ commit, diff, repoPath, onSelectCommit, backT
         <div className="commit-split">
           <Group orientation="horizontal">
             <Panel defaultSize="30%" minSize="15%" maxSize="60%">
-              <FileTree nodes={changesTree} selectedPath={activePath} onSelect={setPicked} />
+              <FileTree
+                nodes={changesTree}
+                selectedPath={activePath}
+                onSelect={setPicked}
+                onContextMenu={fileContextMenu}
+              />
             </Panel>
             <Separator className="separator-v" />
             <Panel minSize="30%">
               <DiffView diff={activeDiff} showPath={false} />
             </Panel>
           </Group>
+          <ContextMenu menu={menu} onClose={close} />
         </div>
       )}
 

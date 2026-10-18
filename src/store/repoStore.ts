@@ -28,6 +28,7 @@ import {
 } from '../engine/svnGraph'
 
 import { toErrorCode, toErrorMessage } from '../engine/errors'
+import { createLatestGate } from '@/engine/latestGate'
 import type {
   Health,
   InitReport,
@@ -393,6 +394,9 @@ export function useRepoStore() {
   const lastAuditAt = useRef(0)
   const auditInFlight = useRef(false)
 
+  /** `refreshStatus` / `refreshDiff` 的请求代次，见 `createLatestGate`。放 ref：要跨渲染保持计数。 */
+  const refreshGate = useRef(createLatestGate()).current
+
   const openRepo = useCallback(async (path: string) => {
     setState((s) => ({ ...s, loading: true, error: null, errorCode: null }))
     try {
@@ -508,7 +512,10 @@ export function useRepoStore() {
   }
 
   const refreshStatus = async (path: string) => {
+    const token = refreshGate.begin('status')
     const status = await invoke<StatusData>('read_status', { path })
+    // 文件监听、外部工具退出、用户操作会同时各发一次；晚到的旧结果不能盖掉新的
+    if (!refreshGate.isLatest(token, 'status')) return
     setState((s) => ({ ...s, status }))
   }
 
@@ -711,7 +718,10 @@ export function useRepoStore() {
   }
 
   const refreshDiff = async (path: string, scope: string) => {
+    const token = refreshGate.begin('diff')
     const diff = await invoke<DiffData>('read_diff', { path, scope })
+    // 同上；另外切换选中时上一个提交的 diff 可能后到，按代次丢掉就不会显示错提交的改动
+    if (!refreshGate.isLatest(token, 'diff')) return
     setState((s) => ({ ...s, diff }))
   }
 

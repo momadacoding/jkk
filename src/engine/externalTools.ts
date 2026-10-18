@@ -92,6 +92,78 @@ export function toolFor(
   return tool && argsFor(tool, kind) ? tool : null
 }
 
+/** 外部 diff 的两侧，与 Rust 侧 `DiffTarget` 一一对应（`kind` 做标签）。 */
+export type DiffTarget =
+  | { kind: 'unstaged'; file: string }
+  | { kind: 'staged'; file: string }
+  | { kind: 'commit'; oid: string; file: string; oldFile: string | null }
+  | { kind: 'range'; from: string; to: string; file: string; oldFile: string | null }
+
+/** 每个外部工具菜单的最后一项（spec §4.5）。 */
+export const EDIT_CONFIG_LABEL = '编辑外部工具配置…'
+/** 配了不止一个可用工具时的子菜单标题。 */
+export const OTHER_TOOLS_LABEL = '用其他工具打开 ▸'
+
+export interface ToolEntry {
+  label: string
+  toolId: string
+}
+
+/**
+ * 外部 diff 菜单里的工具项：第一项「在 X 中对比」，其余进子菜单只写工具名。
+ * 配置读不出来时一项都没有，调用方只留「编辑外部工具配置…」。
+ */
+export function diffMenuEntries(
+  cfg: ExternalToolsConfig | null,
+  filePath: string,
+): { primary: ToolEntry | null; others: ToolEntry[] } {
+  if (!cfg) return { primary: null, others: [] }
+  const { primary, others } = toolMenu(cfg, filePath, 'diff')
+  return {
+    primary: primary ? { label: `在 ${primary.label} 中对比`, toolId: primary.id } : null,
+    others: others.map((t) => ({ label: t.label, toolId: t.id })),
+  }
+}
+
+/**
+ * 提交详情的 diff scope 转成外部 diff 的目标。
+ *
+ * 只认 `commit:<oid>` 和 `range:<a>..<b>`（与 Rust 侧 `read_diff` 的解析一致），
+ * 其余（`workdir`、解析不了的）返回 null，菜单里就不给对比项。
+ */
+export function diffTargetFromScope(
+  scope: string | null,
+  file: string,
+  oldFile: string | null,
+): DiffTarget | null {
+  if (!scope) return null
+  if (scope.startsWith('commit:')) {
+    const oid = scope.slice('commit:'.length)
+    return oid ? { kind: 'commit', oid, file, oldFile } : null
+  }
+  if (scope.startsWith('range:')) {
+    const range = scope.slice('range:'.length)
+    const at = range.indexOf('..')
+    if (at < 0) return null
+    const from = range.slice(0, at)
+    const to = range.slice(at + 2)
+    return from && to ? { kind: 'range', from, to, file, oldFile } : null
+  }
+  return null
+}
+
+/**
+ * 外部工具退出后要不要报给用户：正常退出返回 null，否则返回一句带工具名和退出码的说明。
+ *
+ * 退出码只用来报告工具故障（例如 BC 的 102 / 103），**永远不用来判断冲突是否已解决**。
+ */
+export function describeToolExit(toolLabel: string, code: number | null, error: string | null): string | null {
+  if (error) return `${toolLabel}：${error}`
+  if (code === 0) return null
+  if (code === null) return `${toolLabel} 被异常终止`
+  return `${toolLabel} 退出码 ${code}，可能没有正常完成`
+}
+
 /** 右键菜单：第一项是匹配到的工具，「用其他工具打开 ▸」里是其余能做这件事的工具。 */
 export function toolMenu(
   cfg: ExternalToolsConfig,

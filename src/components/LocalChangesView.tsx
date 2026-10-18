@@ -13,6 +13,7 @@ import { commitKeyAction, type CommitField } from '../engine/commitKeys'
 import { discardShortcut } from '../engine/fileListKeys'
 import { buildCommitMessage } from '../engine/commitActions'
 import { conflictsFirst } from '../engine/conflicts'
+import { externalDiffItems, type ExternalToolsMenu } from './externalToolItems'
 
 interface FileSectionProps {
   title: string
@@ -105,9 +106,11 @@ interface LocalChangesViewProps {
    * 「基线 == 服务器在 rN 的状态」这条前提就不成立了，而体检只比磁盘、发现不了。
    */
   onBaselineBranch: boolean
+  /** 外部 diff 工具的菜单项；不传时右键菜单里没有这些项。 */
+  externalTools?: ExternalToolsMenu
 }
 
-export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, onCommit, svnMode, onBaselineBranch }: LocalChangesViewProps) {
+export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, onCommit, svnMode, onBaselineBranch, externalTools }: LocalChangesViewProps) {
   const [selection, setSelection] = useState<FileSelection>(emptyFileSelection)
   const [subject, setSubject] = useState('')
   const [description, setDescription] = useState('')
@@ -118,6 +121,10 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
 
   const unstaged = useMemo(() => conflictsFirst(status.unstaged), [status.unstaged])
   const allFiles = useMemo(() => [...unstaged, ...status.staged], [unstaged, status.staged])
+  const conflicted = useMemo(
+    () => new Set(status.unstaged.filter((f) => f.status === 'conflicted').map((f) => f.path)),
+    [status.unstaged],
+  )
   // diff 面板显示最后点到的那一个；多选时看的是其中一个，不是拼在一起
   const activeFile = selection.paths[selection.paths.length - 1] ?? allFiles[0]?.path ?? null
   const activeDiff: DiffData = useMemo(() => ({
@@ -156,6 +163,10 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
         label: n > 1 ? `Copy paths${suffix}` : 'Copy path',
         onSelect: () => { void navigator.clipboard.writeText(targets.join('\n')) },
       },
+      // 外部工具一次只开右键点中的那一个文件，不跟随多选；冲突文件只做 merge，不给对比
+      ...externalDiffItems(externalTools, conflicted.has(path)
+        ? null
+        : { kind: staged ? 'staged' : 'unstaged', file: path }),
     ]
     open(e, items)
   }

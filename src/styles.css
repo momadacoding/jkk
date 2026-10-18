@@ -358,6 +358,17 @@ body {
   color: #ddd;
 }
 
+/* 子菜单紧贴入口项的右侧展开；入口项要做定位参照 */
+.context-menu-sub {
+  position: relative;
+}
+
+.context-menu-submenu {
+  position: absolute;
+  left: 100%;
+  top: -5px;
+}
+
 .worktree-badge {
   margin-left: auto;
   padding: 0 5px;

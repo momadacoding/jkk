@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
+  describeToolExit,
+  diffMenuEntries,
+  diffTargetFromScope,
   matchesPattern,
   toolFor,
   toolMenu,
@@ -134,5 +137,73 @@ describe('toolMenu', () => {
     const menu = toolMenu(config({ defaultDiff: null }), 'a.txt', 'diff')
     expect(menu.primary).toBeNull()
     expect(menu.others.map((t) => t.id)).toEqual(['bc', 'vscode'])
+  })
+})
+
+describe('diffMenuEntries', () => {
+  it('第一项写成「在 X 中对比」，其余工具只写名字', () => {
+    expect(diffMenuEntries(config(), 'a.txt')).toEqual({
+      primary: { label: '在 Beyond Compare 中对比', toolId: 'bc' },
+      others: [{ label: 'VS Code', toolId: 'vscode' }],
+    })
+  })
+
+  it('配置读取失败时没有任何工具项', () => {
+    expect(diffMenuEntries(null, 'a.txt')).toEqual({ primary: null, others: [] })
+  })
+
+  it('改名的文件按新文件名匹配规则', () => {
+    const cfg = config({ rules: [{ patterns: ['*.unity'], diff: 'vscode' }] })
+    expect(diffMenuEntries(cfg, 'Assets/New.unity').primary?.toolId).toBe('vscode')
+  })
+})
+
+describe('describeToolExit', () => {
+  it('退出码 0 不打扰用户', () => {
+    expect(describeToolExit('Beyond Compare', 0, null)).toBeNull()
+  })
+
+  it('非零退出码带上工具名和退出码', () => {
+    const msg = describeToolExit('Beyond Compare', 103, null)
+    expect(msg).toContain('Beyond Compare')
+    expect(msg).toContain('103')
+  })
+
+  it('等待失败时报原因，不吞掉', () => {
+    expect(describeToolExit('VS Code', null, '等待外部工具退出失败：x')).toBe('VS Code：等待外部工具退出失败：x')
+  })
+
+  it('没有退出码也没有原因时说明被异常终止', () => {
+    expect(describeToolExit('VS Code', null, null)).toContain('VS Code')
+  })
+})
+
+describe('diffTargetFromScope', () => {
+  it('commit:<oid>', () => {
+    expect(diffTargetFromScope('commit:abc', 'n.txt', 'o.txt')).toEqual({
+      kind: 'commit',
+      oid: 'abc',
+      file: 'n.txt',
+      oldFile: 'o.txt',
+    })
+  })
+
+  it('range:<a>..<b>', () => {
+    expect(diffTargetFromScope('range:a1..b2', 'n.txt', null)).toEqual({
+      kind: 'range',
+      from: 'a1',
+      to: 'b2',
+      file: 'n.txt',
+      oldFile: null,
+    })
+  })
+
+  it('解析不了或不是提交的 scope 不给入口', () => {
+    expect(diffTargetFromScope(null, 'a', null)).toBeNull()
+    expect(diffTargetFromScope('workdir', 'a', null)).toBeNull()
+    expect(diffTargetFromScope('commit:', 'a', null)).toBeNull()
+    expect(diffTargetFromScope('range:a..', 'a', null)).toBeNull()
+    expect(diffTargetFromScope('range:..b', 'a', null)).toBeNull()
+    expect(diffTargetFromScope('range:ab', 'a', null)).toBeNull()
   })
 })
