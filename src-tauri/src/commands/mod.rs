@@ -1,5 +1,6 @@
 pub mod custom;
 pub mod diff;
+pub mod external;
 pub mod graph;
 pub mod ops;
 pub mod pr;
