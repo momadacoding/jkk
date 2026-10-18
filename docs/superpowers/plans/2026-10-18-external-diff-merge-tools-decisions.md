@@ -11,7 +11,7 @@
 |---|---|---|---|
 | 0 建 worktree 与决策日志 | ✅ 完成 | 本文件 | 纯文档，无代码验证；`git status` 只有本文件 |
 | 1 外部工具配置与规则匹配 | ✅ 完成 | `engine/external_tools_config.rs`、`commands/external.rs`、`src/engine/externalTools.ts`、`src/store/externalToolsStore.ts`；测试 `tests/external_tools_config.rs`（7）、`tests/vitest/externalTools.test.ts`（17） | fmt / clippy / cargo test 全绿；pnpm build 通过，pnpm test 43 文件 637 例全过；`pnpm tauri dev` 实测推迟到 Task 4（见决策） |
-| 2 外部进程启动、锁与临时目录 | 未开始 | | |
+| 2 外部进程启动、锁与临时目录 | ✅ 完成 | `engine/external_launch.rs`；测试 `tests/external_launch.rs`（12） | fmt / clippy 无告警；cargo test 58 个测试二进制 898 例全过 |
 | 3 按字节导出与外部 diff 命令 | 未开始 | | |
 | 4 前端外部 diff 入口与刷新代次 | 未开始 | | |
 | 5 冲突信息读取与五种情况分类 | 未开始 | | |
@@ -66,3 +66,28 @@
 
 - 本 Task 没有任何 git 操作。唯一的写盘是配置文件缺失时写默认预设；解析或校验失败时一律不写（`broken_json_errors_and_leaves_file_untouched` 断言文件字节不变）。
 - 规则或默认值引用不存在的工具时报错，不回退到默认工具，避免场景文件被悄悄交给 BC 做文本合并。
+
+### Task 2
+
+#### 偏离计划
+
+- Ruling：`try_lock` 多一个参数 `tool_label`，签名变成 `try_lock(worktree, file, tool_label)` —— spec §4.2 要求重复点击时提示「已在 <工具> 中打开」，计划给的两参数签名拿不到占着锁的是哪个工具；锁表改成 key → 工具名 —— 代价：Task 3、7 调用时多传一个 label，无其他影响。
+- Ruling：`TempWorkspace` 多一个 `create_in(root)`，`create()` 等于 `create_in(&temp_root())` —— `workspace_remove_refuses_outside_root` 需要造一个建在根目录之外的 workspace；`remove` 仍只认 `temp_root()` 的**直接子目录**，所以 `create_in` 建在别处的目录永远删不掉 —— 代价：无。
+- Ruling：`expand_template` 的 `vars` 名字不带 `$`，并且名字后面紧跟字母、数字或下划线时不算匹配（`$LOCALX` 原样保留）—— 和 `src/engine/customCommands.ts` 用 `\b` 的做法一致；最长名字优先照计划做 —— 代价：无。
+- Ruling：argv 测试不用 `echo %*`，改为测试时用 `rustc` 现场编一个把 argv 写进文件的小程序，分两条路径测：直接启动这个 exe（BComp.exe 的形态），以及经一个转发 `%*` 的 `.cmd` 再启动它（`code.cmd` 的形态）—— `echo %*` 打出来的是 cmd 转义后的原始命令行，断言不了「每个参数是单个 argv」；也不在 Cargo.toml 里加 `[[bin]]`，那会影响 Tauri 打包时选主程序 —— 代价：测试依赖 PATH 上有 `rustc`（跑得了 cargo test 的机器都有），编不出来时测试失败，不跳过。
+- 计划之外多测了 `%PATH%`、`^caret` 两种参数，以及 `longest_name_wins_regardless_of_order`、`lock_key_is_normalized_on_windows`、`workspace_files_live_in_a_fresh_dir_under_root`。
+
+#### 计划的错误
+
+- 无。
+
+#### 计划没写的坑
+
+- 实测：参数 `a b`、`中文`、`x&y`、`50%`、`!bang!`、`"q"`、`%PATH%`、`^caret` 无论直接启动 exe，还是经 `.cmd` 转发 `%*`，都作为单个 argv 原样送到。所以 Step 4「某种字符送不到就停下来问」的情况没有出现。
+- `launcher::resolve_program` 找不到程序时，错误消息写的是「请检查 customCommands.json」。`spawn_watched` 改为自己生成不提配置文件的消息「找不到可执行文件 `<program>`」，由 Task 3 的命令层补上 `externalTools.json` 的路径。
+
+#### 为什么这么改是安全的
+
+- 递归删除只发生在 `TempWorkspace::remove`。删之前用 `symlink_metadata` 确认目标是目录、不是符号链接，并且 canonicalize 之后的父目录**恰好**是 canonicalize 之后的 `temp_root()`；任何一条不满足都拒绝删除，返回 `external_tool_cleanup`。`workspace_remove_refuses_outside_root` 断言越界的文件还在。
+- 子目录用 `create_dir` 而不是 `create_dir_all` 创建：撞名时直接报错，不会和别的调用共用一个目录、把对方的文件删掉。
+- 外部进程不经过 shell，参数作为数组交给 std；`.cmd` 的转义由 std 负责，argv 测试覆盖了 cmd 的元字符。

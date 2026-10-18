@@ -1,6 +1,7 @@
 pub mod branch;
 pub mod custom_config;
 pub mod diff;
+pub mod external_launch;
 pub mod external_tools_config;
 pub mod file_lock;
 pub mod git_cli;
