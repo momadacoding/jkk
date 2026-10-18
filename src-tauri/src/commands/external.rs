@@ -1,7 +1,9 @@
+use crate::engine::external_diff::{self, DiffTarget};
+use crate::engine::external_launch::ExternalToolExited;
 use crate::engine::{external_tools_config, launcher};
 use crate::error::{GitError, Result};
 use std::path::PathBuf;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 const CODE: &str = "external_tools_config";
 
@@ -36,4 +38,42 @@ pub fn open_external_tools_config(app: AppHandle) -> Result<()> {
         .to_str()
         .ok_or_else(|| GitError::new(CODE, "配置路径不是合法的 UTF-8"))?;
     launcher::open_in_default_app(text)
+}
+
+/// 用外部工具对比一个文件。立即返回；工具退出后发 `external-tool-exited`。
+///
+/// 每次都重新读配置：用户改完 externalTools.json 不用重启应用。
+#[tauri::command(async)]
+pub fn open_external_diff(
+    app: AppHandle,
+    path: String,
+    tool_id: String,
+    target: DiffTarget,
+) -> Result<()> {
+    let config_path = config_path(&app)?;
+    let cfg = external_tools_config::load_from(&config_path)?;
+    let tool_label = external_tools_config::find_tool(&cfg, &tool_id)?
+        .label
+        .clone();
+    let file = target.file().to_string();
+    let worktree = path.clone();
+    external_diff::open_external_diff(
+        &path,
+        &cfg,
+        &config_path,
+        &tool_id,
+        &target,
+        move |report| {
+            let _ = app.emit(
+                "external-tool-exited",
+                ExternalToolExited {
+                    worktree,
+                    file,
+                    tool_label,
+                    code: report.code,
+                    error: report.error,
+                },
+            );
+        },
+    )
 }

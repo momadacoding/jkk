@@ -4,6 +4,7 @@ use crate::engine::launcher::resolve_program;
 use crate::engine::path::normalize;
 use crate::engine::proc::hidden_command;
 use crate::error::{GitError, Result};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -67,9 +68,21 @@ fn unique_name() -> String {
 }
 
 /// 一次外部工具调用专属的临时子目录。
+///
+/// 正常路径显式调用 `remove`；没调用就被丢掉时（导出失败、启动失败，回调闭包随之被丢弃）
+/// 由 Drop 兜底删除，校验规则与 `remove` 相同。
 #[derive(Debug)]
 pub struct TempWorkspace {
     dir: PathBuf,
+    removed: bool,
+}
+
+impl Drop for TempWorkspace {
+    fn drop(&mut self) {
+        if !self.removed {
+            let _ = self.remove_checked();
+        }
+    }
 }
 
 impl TempWorkspace {
@@ -84,7 +97,10 @@ impl TempWorkspace {
         let dir = root.join(unique_name());
         // 用 create_dir 而不是 create_dir_all：目录已存在说明撞名，宁可报错也不和别人共用
         std::fs::create_dir(&dir)?;
-        Ok(Self { dir })
+        Ok(Self {
+            dir,
+            removed: false,
+        })
     }
 
     pub fn file(&self, name: &str) -> PathBuf {
@@ -95,7 +111,13 @@ impl TempWorkspace {
     ///
     /// 删之前确认它是 `temp_root()` 的**直接子目录**、且不是符号链接，
     /// 否则拒绝：这里删的是递归目录，路径算错一次就可能删到用户文件。
-    pub fn remove(self) -> Result<()> {
+    pub fn remove(mut self) -> Result<()> {
+        // 不管成败都不再让 Drop 重试：拒绝删除的目录重试一次也还是拒绝
+        self.removed = true;
+        self.remove_checked()
+    }
+
+    fn remove_checked(&self) -> Result<()> {
         let meta = match std::fs::symlink_metadata(&self.dir) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -165,6 +187,19 @@ pub struct ExitReport {
     /// 被信号杀掉（Unix）时没有退出码。
     pub code: Option<i32>,
     /// 等待进程本身失败时的原因。
+    pub error: Option<String>,
+}
+
+/// 外部工具退出后发给前端的事件 `external-tool-exited` 的内容。
+///
+/// 带上 worktree，前端只刷新对应的仓库；多开标签时别的仓库不受影响。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalToolExited {
+    pub worktree: String,
+    pub file: String,
+    pub tool_label: String,
+    pub code: Option<i32>,
     pub error: Option<String>,
 }
 

@@ -12,7 +12,7 @@
 | 0 建 worktree 与决策日志 | ✅ 完成 | 本文件 | 纯文档，无代码验证；`git status` 只有本文件 |
 | 1 外部工具配置与规则匹配 | ✅ 完成 | `engine/external_tools_config.rs`、`commands/external.rs`、`src/engine/externalTools.ts`、`src/store/externalToolsStore.ts`；测试 `tests/external_tools_config.rs`（7）、`tests/vitest/externalTools.test.ts`（17） | fmt / clippy / cargo test 全绿；pnpm build 通过，pnpm test 43 文件 637 例全过；`pnpm tauri dev` 实测推迟到 Task 4（见决策） |
 | 2 外部进程启动、锁与临时目录 | ✅ 完成 | `engine/external_launch.rs`；测试 `tests/external_launch.rs`（12） | fmt / clippy 无告警；cargo test 58 个测试二进制 898 例全过 |
-| 3 按字节导出与外部 diff 命令 | 未开始 | | |
+| 3 按字节导出与外部 diff 命令 | ✅ 完成 | `engine/blob_export.rs`、`engine/external_diff.rs`、`commands/external.rs` 加 `open_external_diff`；`external_launch.rs` 加 `ExternalToolExited`、`TempWorkspace` 的 Drop 兜底；测试 `tests/external_diff.rs`（21） | fmt / clippy 无告警；`cargo test -j 4` 59 个二进制 919 例全过；`%TEMP%\jkk-external` 无残留 |
 | 4 前端外部 diff 入口与刷新代次 | 未开始 | | |
 | 5 冲突信息读取与五种情况分类 | 未开始 | | |
 | 6 冲突文件的 HEAD 对比工作区 diff | 未开始 | | |
@@ -91,3 +91,33 @@
 - 递归删除只发生在 `TempWorkspace::remove`。删之前用 `symlink_metadata` 确认目标是目录、不是符号链接，并且 canonicalize 之后的父目录**恰好**是 canonicalize 之后的 `temp_root()`；任何一条不满足都拒绝删除，返回 `external_tool_cleanup`。`workspace_remove_refuses_outside_root` 断言越界的文件还在。
 - 子目录用 `create_dir` 而不是 `create_dir_all` 创建：撞名时直接报错，不会和别的调用共用一个目录、把对方的文件删掉。
 - 外部进程不经过 shell，参数作为数组交给 std；`.cmd` 的转义由 std 负责，argv 测试覆盖了 cmd 的元字符。
+
+### Task 3
+
+#### 偏离计划
+
+- Ruling：打开流程（锁 → 临时目录 → 导出 → 展开参数 → 启动 → 退出后清理）放进 engine 函数 `external_diff::open_external_diff(repo, cfg, config_path, tool_id, target, on_exit)`，Tauri 命令只负责读配置、发事件 —— 计划把流程写在命令里，那样 cleanup、锁释放、错误改写都没法在没有 Tauri 的测试里验证 —— 代价：多一层函数，Task 7 的 merge 照这个结构写。
+- Ruling：`TempWorkspace` 加 Drop 兜底删除（校验规则与 `remove` 相同，`remove` 调用过就不再重试）—— 回调闭包持有 workspace，`spawn_watched` 启动失败时闭包被丢弃，没有 Drop 的话临时目录会残留；导出中途失败也是同理 —— 代价：无。
+- Ruling：`ExternalToolExited` 定义在 `external_launch.rs`（diff 和 merge 共用），不在 `external_diff.rs` —— 代价：无。
+- Ruling：`DiffTarget` 用 serde 的 `rename_all_fields = "camelCase"`（serde 1.0.229 支持）—— 计划只写了 `rename_all = "camelCase"`，那只改变体名（`commit`），**不改**变体里的字段，`old_file` 会要求前端传 `old_file`；嵌套参数也不经过 Tauri 的顶层 camelCase 转换。`diff_target_deserializes_camel_case` 锁住这一点 —— 代价：无。
+- Ruling：各侧标题的文案 —— Unstaged「`<file>`（暂存区）/（工作区）」；Staged「（HEAD）/（暂存区）」；Commit 左「`<旧路径>`（父提交短 hash）」，根提交写「（无父提交）」，右「`<file>`（短 hash 标题）」；Range「（from 短 hash）/（to 短 hash）」。spec 把具体文案留给实现者 —— 代价：只是文案。
+- Ruling：临时文件不设只读 —— spec 留给实现者；Windows 上 `remove_dir_all` 遇到只读文件会失败、导致残留，而只读带来的好处（BC 里误改临时侧时提醒）不大 —— 代价：用户在 BC 里改了临时那一侧，改动随临时目录一起被删。
+- Ruling：`Staged` 不做改名检测，左右都用同一个路径 —— 「本地改动」的 Staged 列表本身没有旧路径（`FileChange` 只有 `path`），重命名后 HEAD 里没有新路径，左边是空文件 —— 代价：暂存区里的改名看起来是「新增」。
+- 计划之外多加的测试：`deleted_workdir_file_right_is_empty_temp_file`、`range_uses_from_and_to`、`export_rejects_empty_path`、`side_file_name_keeps_extension`、`directory_is_not_a_regular_file`、`diff_target_deserializes_camel_case`、`tool_without_diff_args_is_unsupported`、`missing_program_error_points_to_config_and_releases_lock`、`second_open_of_same_file_is_busy`、`exit_cleans_workspace_and_releases_lock`。
+
+#### 计划的错误
+
+- `rename_all = "camelCase"` 不足以让前端的 `oldFile` 反序列化成功，见上面的 Ruling。
+
+#### 计划没写的坑
+
+- 全量 `cargo test` 在本机一次失败于 `os error 1455`（The paging file is too small）：59 个测试二进制并行链接，把内存和页面文件耗尽了。这是环境问题，不是代码问题；用 `cargo test -j 4` 重跑全部通过。以后的 Task 都用 `-j 4`。
+- `symlink_workdir_side_is_refused` 在本机实际运行了，没有跳过（`--nocapture` 下没有出现「跳过」）。
+- `repo.workdir()` 在 Windows 上返回正斜杠路径；工作区那一侧经 `components().collect()` 重新拼成反斜杠再交给外部工具。
+
+#### 为什么这么改是安全的
+
+- 工作区文件只读不写：Unstaged 的右侧直接交给外部工具（用户在工具里存盘是期望的行为），工作区里不存在的一侧写到临时目录，绝不在工作区里造文件（`deleted_workdir_file_right_is_empty_temp_file` 断言）。
+- 工作区一侧先用 `symlink_metadata` 检查，符号链接和目录都拒绝；测试断言链接指向的文件内容不变。
+- 导出走 `run_git_bytes` 按字节写盘，git 失败时不写文件（`export_failure_does_not_write_file`）。
+- 本 Task 没有 git 写操作。所有 git 调用都只在 `TempDir` fixture 里跑。
