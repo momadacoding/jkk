@@ -13,7 +13,7 @@
 | 1 外部工具配置与规则匹配 | ✅ 完成 | `engine/external_tools_config.rs`、`commands/external.rs`、`src/engine/externalTools.ts`、`src/store/externalToolsStore.ts`；测试 `tests/external_tools_config.rs`（7）、`tests/vitest/externalTools.test.ts`（17） | fmt / clippy / cargo test 全绿；pnpm build 通过，pnpm test 43 文件 637 例全过；`pnpm tauri dev` 实测推迟到 Task 4（见决策） |
 | 2 外部进程启动、锁与临时目录 | ✅ 完成 | `engine/external_launch.rs`；测试 `tests/external_launch.rs`（12） | fmt / clippy 无告警；cargo test 58 个测试二进制 898 例全过 |
 | 3 按字节导出与外部 diff 命令 | ✅ 完成 | `engine/blob_export.rs`、`engine/external_diff.rs`、`commands/external.rs` 加 `open_external_diff`；`external_launch.rs` 加 `ExternalToolExited`、`TempWorkspace` 的 Drop 兜底；测试 `tests/external_diff.rs`（21） | fmt / clippy 无告警；`cargo test -j 4` 59 个二进制 919 例全过；`%TEMP%\jkk-external` 无残留 |
-| 4 前端外部 diff 入口与刷新代次 | 🟡 代码完成，Step 5 真实窗口实测待用户执行 | `src/engine/latestGate.ts`、`src/components/externalToolItems.ts`；改 `externalTools.ts`、`externalToolsStore.ts`、`repoStore.ts`、`ContextMenu.tsx`、`FileTree.tsx`、`LocalChangesView.tsx`、`CommitDetailView.tsx`、`RepoTab.tsx`、`styles.css`；测试 `latestGate.test.ts`（4）、`externalTools.test.ts`（+13）、`LocalChangesView.test.tsx`（+7）、`CommitDetailView.test.tsx`（+3） | pnpm build 通过；pnpm test 44 文件 661 例全过；`pnpm tauri dev` 实测未做 |
+| 4 前端外部 diff 入口与刷新代次 | ✅ 完成（真实窗口实测发现 BC 退出码误报，已修复并复测通过，见 Task 4 决策） | `src/engine/latestGate.ts`、`src/components/externalToolItems.ts`；改 `externalTools.ts`、`externalToolsStore.ts`、`repoStore.ts`、`ContextMenu.tsx`、`FileTree.tsx`、`LocalChangesView.tsx`、`CommitDetailView.tsx`、`RepoTab.tsx`、`styles.css`；测试 `latestGate.test.ts`（4）、`externalTools.test.ts`（+13）、`LocalChangesView.test.tsx`（+7）、`CommitDetailView.test.tsx`（+3） | pnpm build 通过；pnpm test 44 文件 662 例全过；cargo test 923 例全过；`pnpm tauri dev` 实测通过 |
 | 5 冲突信息读取与五种情况分类 | 未开始 | | |
 | 6 冲突文件的 HEAD 对比工作区 diff | 未开始 | | |
 | 7 外部 merge 命令与各侧标题 | 未开始 | | |
@@ -173,4 +173,4 @@
 - 没选的方案：B 按程序名认出 BC 套用规则（把 BC 的知识写死在代码里，换个名字就失效）；C 所有工具都只在退出码 ≥ 100 时报错（对 VS Code 不成立，会漏报）。
 - 用户本机的 `%APPDATA%\com.momadacoding.jkk\externalTools.json` 删除前核对过内容，和旧默认预设一字不差（用户确认没改过），经用户同意已删除，下次读取时按新预设重新生成。
 - 测试：Rust `bc_preset_treats_comparison_results_as_success`、`tool_without_success_codes_only_accepts_zero`、`exit_codes_and_messages_load_from_json`、`exit_event_judges_code_by_tool_config`；vitest `describeToolExit` 五例（含「后端判为正常时即使退出码是 13 也不报」）。pnpm build 通过；pnpm test 662 例全过；fmt / clippy 无告警；`cargo test -j 4` 59 个二进制 923 例全过。
-- 待用户复测：重新打开有差异的文件、关掉 BC 后不再报错。
+- 用户复测（2026-10-19，配置已按新预设重新生成）：对比有差异的文件、关掉 BC 后不再报错。Task 4 Step 5 全部通过。
