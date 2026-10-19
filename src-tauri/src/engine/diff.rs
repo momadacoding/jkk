@@ -94,8 +94,12 @@ fn readable_only(repo: &Repository, diff: &git2::Diff) -> Option<Vec<String>> {
             continue;
         };
         let as_str = path.to_string_lossy().to_string();
-        // 已删除的文件本来就不在工作区，不算坏路径
-        if delta.status() == git2::Delta::Deleted {
+        // 已删除的文件本来就不在工作区，不算坏路径。冲突条目 libgit2 不读内容，
+        // 工作区里被删掉也照样要留在列表里（行内容由 `fill_conflicted` 另外补）
+        if matches!(
+            delta.status(),
+            git2::Delta::Deleted | git2::Delta::Conflicted
+        ) {
             good.push(as_str);
             continue;
         }
@@ -304,16 +308,58 @@ pub fn read_diff(path: &str, scope: String) -> Result<DiffData> {
     let tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
     let diff =
         repo.diff_tree_to_workdir_with_index(tree.as_ref(), Some(&mut workdir_diff_opts(None)))?;
-    match readable_only(&repo, &diff) {
-        None => diff_to_data(diff),
+    let mut data = match readable_only(&repo, &diff) {
+        None => diff_to_data(diff)?,
         // 一个能读的都没有：返回空 diff 而不是让整个视图报错。
         // 注意此时不能拿空的 pathspec 去重建——那等于不加限制，又会撞上坏路径。
-        Some(good) if good.is_empty() => Ok(DiffData { files: Vec::new() }),
+        Some(good) if good.is_empty() => DiffData { files: Vec::new() },
         Some(good) => diff_to_data(repo.diff_tree_to_workdir_with_index(
             tree.as_ref(),
             Some(&mut workdir_diff_opts(Some(&good))),
-        )?),
+        )?)?,
+    };
+    // 补不出来只是冲突文件没有行内容，不能让整个变更视图跟着报错
+    if let Err(e) = fill_conflicted(&repo, tree.as_ref(), &mut data) {
+        log::warn!("冲突文件的 diff 读取失败：{}", e.message);
     }
+    Ok(data)
+}
+
+/// 给冲突文件补上 HEAD 对比工作区的 hunk（spec §4.1 ②），`status` 仍是 `conflicted`。
+///
+/// 带上 index 时 libgit2 对冲突条目只给一个 `Conflicted`、不带 hunk（第 63 条的根因）。
+/// 对这些路径单独做一次 tree 对比工作区（不经过 index），libgit2 就按普通改动比较，
+/// 并且套用 autocrlf 等过滤器——直接拿 blob 和工作区字节比（`Patch::from_blob_and_buffer`）
+/// 在 autocrlf 下会把每一行都当成改动。行的收集复用 `diff_to_data`。
+fn fill_conflicted(
+    repo: &Repository,
+    tree: Option<&git2::Tree>,
+    data: &mut DiffData,
+) -> Result<()> {
+    let paths: Vec<String> = data
+        .files
+        .iter()
+        .filter(|f| f.status == "conflicted")
+        .map(|f| f.path.clone())
+        .collect();
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut opts = workdir_diff_opts(Some(&paths));
+    // 路径按字面量匹配：`f[1].txt` 不能被当成模式去匹配 `f1.txt`
+    opts.disable_pathspec_match(true);
+    let extra = diff_to_data(repo.diff_tree_to_workdir(tree, Some(&mut opts))?)?;
+    for found in extra.files {
+        if let Some(file) = data
+            .files
+            .iter_mut()
+            .find(|f| f.status == "conflicted" && f.path == found.path)
+        {
+            file.hunks = found.hunks;
+            file.binary = found.binary;
+        }
+    }
+    Ok(())
 }
 
 /// delta 在界面上用哪个路径标识。重命名时用新路径，删除时退回旧路径。

@@ -15,7 +15,7 @@
 | 3 按字节导出与外部 diff 命令 | ✅ 完成 | `engine/blob_export.rs`、`engine/external_diff.rs`、`commands/external.rs` 加 `open_external_diff`；`external_launch.rs` 加 `ExternalToolExited`、`TempWorkspace` 的 Drop 兜底；测试 `tests/external_diff.rs`（21） | fmt / clippy 无告警；`cargo test -j 4` 59 个二进制 919 例全过；`%TEMP%\jkk-external` 无残留 |
 | 4 前端外部 diff 入口与刷新代次 | ✅ 完成（真实窗口实测发现 BC 退出码误报，已修复并复测通过，见 Task 4 决策） | `src/engine/latestGate.ts`、`src/components/externalToolItems.ts`；改 `externalTools.ts`、`externalToolsStore.ts`、`repoStore.ts`、`ContextMenu.tsx`、`FileTree.tsx`、`LocalChangesView.tsx`、`CommitDetailView.tsx`、`RepoTab.tsx`、`styles.css`；测试 `latestGate.test.ts`（4）、`externalTools.test.ts`（+13）、`LocalChangesView.test.tsx`（+7）、`CommitDetailView.test.tsx`（+3） | pnpm build 通过；pnpm test 44 文件 662 例全过；cargo test 923 例全过；`pnpm tauri dev` 实测通过 |
 | 5 冲突信息读取与五种情况分类 | ✅ 完成 | `engine/conflicts.rs`、`commands/conflict.rs`；测试 `tests/conflicts.rs`（35） | fmt / clippy 无告警；`cargo test -j 4 --no-fail-fast` 60 个二进制 962 例全过 |
-| 6 冲突文件的 HEAD 对比工作区 diff | 未开始 | | |
+| 6 冲突文件的 HEAD 对比工作区 diff | ✅ 完成 | 改 `engine/diff.rs`（`fill_conflicted`、`readable_only` 放行冲突条目）；测试 `tests/fixtures.rs`（+3） | fmt / clippy 无告警；`cargo test -j 4 --no-fail-fast` 60 个二进制 965 例全过 |
 | 7 外部 merge 命令与各侧标题 | 未开始 | | |
 | 8 前端冲突提示与 merge 入口 | 未开始 | | |
 | 9 DU / UD 二选一 | 未开始 | | |
@@ -231,3 +231,25 @@
 
 - 本 Task 只读：git2 读 index、blob、HEAD tree 和工作区文件；CLI 只有 `check-attr`（stdin 喂路径）和 `config --get-regexp`，都不写仓库。
 - 判不准的一律往保守方向走：属性认不出的名字按 git 的规则退回文本合并后，再看工作区有没有标记；LFS、二进制、自定义 driver 都不会显示「可以暂存」。
+
+### Task 6
+
+#### 偏离计划
+
+- Ruling：冲突文件的 hunk 用 `diff_tree_to_workdir`（不经过 index）加精确 pathspec 求出，再交给现有的 `diff_to_data` 收集行；没有用计划写的 `git2::Patch::from_blob_and_buffer` —— 后者直接拿 blob 和工作区字节比，autocrlf 下工作区是 CRLF，每一行都会被当成改动；前者套用过滤器（`conflicted_file_diff_applies_autocrlf` 断言只有真正改过的一行出现）—— 代价：多一次只覆盖冲突路径的 diff。
+- Ruling：工作区里的冲突文件被删掉时，显示成整份删除，不是计划写的「hunks 为空」—— 和 Task 5「工作区删掉判为 NoMarkers」配套：界面会提示「检查后可以暂存」，用户必须能看出要暂存的是一次删除（`conflicted_file_missing_in_workdir_shows_deletion`）—— 代价：无。
+- Ruling：`fill_conflicted` 失败只记 warning、不让 `read_diff` 失败 —— 与本文件里坏路径不拖垮整个变更视图的既有做法一致 —— 代价：冲突文件没有行内容时界面上看不到原因，要看日志。
+- 计划之外多加的测试：`conflicted_file_diff_applies_autocrlf`、`conflicted_file_missing_in_workdir_shows_deletion`。
+
+#### 计划的错误
+
+- `Patch::from_blob_and_buffer` 不套用过滤器，见上。
+
+#### 计划没写的坑
+
+- 工作区里删掉的冲突文件原来会**整个从 diff 里消失**：`readable_only` 把 `Conflicted` 条目当成「工作区读不到的坏路径」排除掉了。冲突条目 libgit2 不读内容，现在和 `Deleted` 一样放行。这一改同时作用于 `read_status` 的行数统计，冲突行本来就是 0/0，不受影响。
+
+#### 为什么这么改是安全的
+
+- 只读：多出来的一次 diff 只覆盖冲突路径，pathspec 按字面量匹配（`disable_pathspec_match`），`f[1].txt` 不会匹配到 `f1.txt`。
+- `status` 仍是 `conflicted`，前端按冲突处理，不会把冲突文件当普通改动暂存。
