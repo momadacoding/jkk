@@ -159,22 +159,37 @@ describe('diffMenuEntries', () => {
 })
 
 describe('describeToolExit', () => {
-  it('退出码 0 不打扰用户', () => {
-    expect(describeToolExit('Beyond Compare', 0, null)).toBeNull()
+  const exit = (over: Partial<Parameters<typeof describeToolExit>[0]>) => ({
+    toolLabel: 'Beyond Compare',
+    code: 0,
+    error: null,
+    success: true,
+    codeMessage: null,
+    ...over,
   })
 
-  it('非零退出码带上工具名和退出码', () => {
-    const msg = describeToolExit('Beyond Compare', 103, null)
-    expect(msg).toContain('Beyond Compare')
-    expect(msg).toContain('103')
+  it('后端判为正常结束时不打扰用户，即使退出码非 0（BC 的 13 是「有差异」）', () => {
+    expect(describeToolExit(exit({ code: 13 }))).toBeNull()
+  })
+
+  it('故障码有说明时带上说明', () => {
+    const msg = describeToolExit(exit({ code: 103, success: false, codeMessage: 'BComp.exe 找不到 BCompare.exe' }))
+    expect(msg).toBe('Beyond Compare 退出码 103：BComp.exe 找不到 BCompare.exe')
+  })
+
+  it('没有说明的非正常退出码带上工具名和退出码', () => {
+    const msg = describeToolExit(exit({ toolLabel: 'VS Code', code: 1, success: false }))
+    expect(msg).toContain('VS Code')
+    expect(msg).toContain('1')
   })
 
   it('等待失败时报原因，不吞掉', () => {
-    expect(describeToolExit('VS Code', null, '等待外部工具退出失败：x')).toBe('VS Code：等待外部工具退出失败：x')
+    expect(describeToolExit(exit({ toolLabel: 'VS Code', code: null, error: '等待外部工具退出失败：x', success: false })))
+      .toBe('VS Code：等待外部工具退出失败：x')
   })
 
   it('没有退出码也没有原因时说明被异常终止', () => {
-    expect(describeToolExit('VS Code', null, null)).toContain('VS Code')
+    expect(describeToolExit(exit({ toolLabel: 'VS Code', code: null, success: false }))).toContain('VS Code')
   })
 })
 

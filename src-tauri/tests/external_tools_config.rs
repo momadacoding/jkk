@@ -122,6 +122,53 @@ fn optional_fields_fall_back_to_none() {
     assert_eq!(cfg.tools[1].diff_args, None);
 }
 
+/// BComp.exe 的退出码 1/2/11–14 是比较结果（相同、有差异、有冲突），不是故障（BC5 命令行文档）。
+#[test]
+fn bc_preset_treats_comparison_results_as_success() {
+    let cfg = external_tools_config::default_config();
+    let bc = external_tools_config::find_tool(&cfg, "bc").unwrap();
+    for code in [0, 1, 2, 11, 12, 13, 14] {
+        assert!(external_tools_config::is_success_exit(bc, code), "{code}");
+    }
+    for code in [3, 100, 101, 102, 103, 107] {
+        assert!(!external_tools_config::is_success_exit(bc, code), "{code}");
+    }
+    assert!(external_tools_config::exit_code_message(bc, 103)
+        .unwrap()
+        .contains("找不到 BCompare.exe"));
+    assert_eq!(external_tools_config::exit_code_message(bc, 13), None);
+}
+
+/// 没写 successExitCodes 的工具（VS Code、用户自己加的）只认 0。
+#[test]
+fn tool_without_success_codes_only_accepts_zero() {
+    let cfg = external_tools_config::default_config();
+    let code = external_tools_config::find_tool(&cfg, "vscode").unwrap();
+    assert!(code.success_exit_codes.is_none());
+    assert!(external_tools_config::is_success_exit(code, 0));
+    assert!(!external_tools_config::is_success_exit(code, 1));
+    assert_eq!(external_tools_config::exit_code_message(code, 1), None);
+}
+
+/// 用户在配置里写的退出码说明能读出来；JSON 的键只能是字符串。
+#[test]
+fn exit_codes_and_messages_load_from_json() {
+    let dir = TempDir::new().unwrap();
+    let path = write(
+        &dir,
+        r#"{"version":1,"tools":[{"id":"t","label":"T","program":"t.exe",
+            "successExitCodes":[0,5],"exitCodeMessages":{"9":"磁盘满了"}}]}"#,
+    );
+    let cfg = external_tools_config::load_from(&path).unwrap();
+    let t = &cfg.tools[0];
+    assert!(external_tools_config::is_success_exit(t, 5));
+    assert!(!external_tools_config::is_success_exit(t, 9));
+    assert_eq!(
+        external_tools_config::exit_code_message(t, 9).as_deref(),
+        Some("磁盘满了")
+    );
+}
+
 #[test]
 fn find_tool_reports_unknown_id() {
     let cfg = external_tools_config::default_config();

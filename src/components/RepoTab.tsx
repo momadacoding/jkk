@@ -547,7 +547,7 @@ export function RepoTab({
     void refreshStatus(path).catch(reportError)
     const scope = viewMode === 'changes' ? 'workdir' : commitScope
     if (scope) void refreshDiff(path, scope).catch(reportError)
-    const problem = describeToolExit(exit.toolLabel, exit.code, exit.error)
+    const problem = describeToolExit(exit)
     if (problem) reportError(`${exit.file}：${problem}`)
   })
 

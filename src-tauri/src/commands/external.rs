@@ -1,5 +1,5 @@
 use crate::engine::external_diff::{self, DiffTarget};
-use crate::engine::external_launch::ExternalToolExited;
+use crate::engine::external_launch::exit_event;
 use crate::engine::{external_tools_config, launcher};
 use crate::error::{GitError, Result};
 use std::path::PathBuf;
@@ -52,9 +52,7 @@ pub fn open_external_diff(
 ) -> Result<()> {
     let config_path = config_path(&app)?;
     let cfg = external_tools_config::load_from(&config_path)?;
-    let tool_label = external_tools_config::find_tool(&cfg, &tool_id)?
-        .label
-        .clone();
+    let tool = external_tools_config::find_tool(&cfg, &tool_id)?.clone();
     let file = target.file().to_string();
     let worktree = path.clone();
     external_diff::open_external_diff(
@@ -66,13 +64,7 @@ pub fn open_external_diff(
         move |report| {
             let _ = app.emit(
                 "external-tool-exited",
-                ExternalToolExited {
-                    worktree,
-                    file,
-                    tool_label,
-                    code: report.code,
-                    error: report.error,
-                },
+                exit_event(&worktree, &file, &tool, report),
             );
         },
     )

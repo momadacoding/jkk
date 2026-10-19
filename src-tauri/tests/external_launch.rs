@@ -108,6 +108,31 @@ fn lock_key_is_normalized_on_windows() {
     assert_eq!(err.code, "external_tool_busy");
 }
 
+/// 退出事件里的 success / codeMessage 由工具自己的配置决定：BC 的 13 是「有差异」，不是故障。
+#[test]
+fn exit_event_judges_code_by_tool_config() {
+    let cfg = app_lib::engine::external_tools_config::default_config();
+    let bc = &cfg.tools[0];
+    let report = |code| ExitReport { code, error: None };
+
+    let ev = external_launch::exit_event("C:/r", "a.txt", bc, report(Some(13)));
+    assert!(ev.success);
+    assert_eq!(ev.code_message, None);
+    assert_eq!(ev.tool_label, "Beyond Compare");
+
+    let ev = external_launch::exit_event("C:/r", "a.txt", bc, report(Some(102)));
+    assert!(!ev.success);
+    assert!(ev.code_message.unwrap().contains("BCompare.exe"));
+
+    // 没有退出码（被信号杀掉）或等待失败，一律不算成功
+    assert!(!external_launch::exit_event("C:/r", "a.txt", bc, report(None)).success);
+    let failed = ExitReport {
+        code: Some(0),
+        error: Some("x".into()),
+    };
+    assert!(!external_launch::exit_event("C:/r", "a.txt", bc, failed).success);
+}
+
 fn wait_exit(rx: &mpsc::Receiver<ExitReport>) -> ExitReport {
     rx.recv_timeout(Duration::from_secs(60))
         .expect("外部进程退出后应当回调 on_exit")

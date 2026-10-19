@@ -14,6 +14,10 @@ export interface ExternalToolExited {
   code: number | null
   /** 等待进程本身失败时的原因。 */
   error: string | null
+  /** 按这个工具的 `successExitCodes` 判断是否正常结束。 */
+  success: boolean
+  /** 配置里给这个退出码写的说明。 */
+  codeMessage: string | null
 }
 
 /**

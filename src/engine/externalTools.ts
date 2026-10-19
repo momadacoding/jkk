@@ -7,6 +7,10 @@ export interface ExternalTool {
   diffArgs?: string[]
   /** 缺省表示这个工具不能做 merge，不出现在 merge 菜单里。 */
   mergeArgs?: string[]
+  /** 哪些退出码算正常结束；缺省只认 0。判断在后端做，前端只读事件里的结果。 */
+  successExitCodes?: number[]
+  /** 已知故障码的说明，键是十进制退出码。 */
+  exitCodeMessages?: Record<string, string>
 }
 
 /** 按文件名选工具的一条规则；没写的那一项回落到顶层默认值。 */
@@ -152,15 +156,29 @@ export function diffTargetFromScope(
   return null
 }
 
+/** 判断一次外部工具退出要不要报错所需的信息，取自 `external-tool-exited` 事件。 */
+export interface ToolExitInfo {
+  toolLabel: string
+  code: number | null
+  error: string | null
+  /** 后端按这个工具的 `successExitCodes` 判断的结果。 */
+  success: boolean
+  /** 配置里给这个退出码写的说明。 */
+  codeMessage: string | null
+}
+
 /**
- * 外部工具退出后要不要报给用户：正常退出返回 null，否则返回一句带工具名和退出码的说明。
+ * 外部工具退出后要不要报给用户：正常结束返回 null，否则返回一句带工具名和退出码的说明。
  *
- * 退出码只用来报告工具故障（例如 BC 的 102 / 103），**永远不用来判断冲突是否已解决**。
+ * 「正常」由后端按工具配置判断，这里不再自己看退出码是不是 0：BC 用 13 表示「有差异」。
+ * 退出码只用来报告工具故障，**永远不用来判断冲突是否已解决**。
  */
-export function describeToolExit(toolLabel: string, code: number | null, error: string | null): string | null {
+export function describeToolExit(exit: ToolExitInfo): string | null {
+  const { toolLabel, code, error } = exit
   if (error) return `${toolLabel}：${error}`
-  if (code === 0) return null
+  if (exit.success) return null
   if (code === null) return `${toolLabel} 被异常终止`
+  if (exit.codeMessage) return `${toolLabel} 退出码 ${code}：${exit.codeMessage}`
   return `${toolLabel} 退出码 ${code}，可能没有正常完成`
 }
 

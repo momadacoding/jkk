@@ -162,4 +162,15 @@
   - 用户发现应用内的 diff 和 BC 不一致：应用内「本地改动」右侧是 HEAD 对比工作区（第 2、3 行都变了），BC 的 Unstaged 是 index 对比工作区（只有第 3 行变了）。两边都是正确的，这是 spec §4.3 里写明的有意差异；已向用户解释。
   - Staged 的 `a.txt`：左边 `line 2`、右边 `line 2 staged`，正确（HEAD 对比暂存区）。
   - `目录 a/f[1] x.txt`（中文、空格、方括号）：BC 正常打开，路径没有被截断或当成通配符。
-  - 提交详情里的改名文件、子菜单靠窗口右边缘时的位置、关闭 BC 后是否弹出退出码报错：待用户继续实测。
+  - 提交详情里 c2 的改名文件 `new-name.txt`：左边是改名前 `old-name.txt` 的内容，正确。
+  - 子菜单「用其他工具打开 ▸」靠窗口右边缘时没有超出屏幕。
+  - **发现缺陷**：关掉 BC 后顶部报「new-name.txt：Beyond Compare 退出码 13，可能没有正常完成」。见下面的修复。
+
+#### Step 5 实测发现的缺陷与修复：BC 的退出码
+
+- 计划的错误：Task 4 把「退出码非 0」一律当成工具故障报给用户。BC5 官方命令行文档（`command_line_reference.html`）写明 BComp.exe 用退出码报**比较结果**：0 成功、1 逐字节相同、2 按规则相同、11 逐字节有差异、12 相似、13 按规则有差异、14 检测到冲突；100 起才是故障（100 未知错误、101 有冲突且合并结果没写出、102 BComp 无法等待 BCompare、103 找不到 BCompare、104 试用期已过、105–107 脚本错误）。所以每次对比有差异的文件关掉 BC 都会误报 13。
+- Ruling（用户在 A/B/C 三个方案里选了 A）：工具配置加两个可选字段 —— `successExitCodes`（缺省只认 0）和 `exitCodeMessages`（已知故障码的说明，键是十进制字符串）。BC 预设写 `[0, 1, 2, 11, 12, 13, 14]` 和 100–107 的中文说明；101 不算成功，merge 时它表示合并结果没保存，应当提示。判断放在后端：`external_launch::exit_event` 用**启动时**那份配置里的工具算出 `success` 和 `codeMessage` 放进 `external-tool-exited` 事件；前端 `describeToolExit` 只看 `success`，不再自己判断退出码。没有退出码或等待失败一律不算成功 —— 代价：用户旧的 `externalTools.json` 里没有这两个字段，BC 仍按「只认 0」误报，要删掉配置让它重新生成，或手动加上。
+- 没选的方案：B 按程序名认出 BC 套用规则（把 BC 的知识写死在代码里，换个名字就失效）；C 所有工具都只在退出码 ≥ 100 时报错（对 VS Code 不成立，会漏报）。
+- 用户本机的 `%APPDATA%\com.momadacoding.jkk\externalTools.json` 删除前核对过内容，和旧默认预设一字不差（用户确认没改过），经用户同意已删除，下次读取时按新预设重新生成。
+- 测试：Rust `bc_preset_treats_comparison_results_as_success`、`tool_without_success_codes_only_accepts_zero`、`exit_codes_and_messages_load_from_json`、`exit_event_judges_code_by_tool_config`；vitest `describeToolExit` 五例（含「后端判为正常时即使退出码是 13 也不报」）。pnpm build 通过；pnpm test 662 例全过；fmt / clippy 无告警；`cargo test -j 4` 59 个二进制 923 例全过。
+- 待用户复测：重新打开有差异的文件、关掉 BC 后不再报错。

@@ -447,6 +447,8 @@ fn tool(program: &str, diff_args: Option<&[&str]>) -> ExternalToolsConfig {
             program: program.into(),
             diff_args: diff_args.map(|a| a.iter().map(|s| s.to_string()).collect()),
             merge_args: None,
+            success_exit_codes: None,
+            exit_code_messages: None,
         }],
     }
 }

@@ -1,5 +1,6 @@
 //! 启动外部 diff / merge 工具：占位符展开、临时目录、同一文件的互斥锁、等进程退出。
 
+use crate::engine::external_tools_config::{exit_code_message, is_success_exit, ExternalTool};
 use crate::engine::launcher::resolve_program;
 use crate::engine::path::normalize;
 use crate::engine::proc::hidden_command;
@@ -201,6 +202,32 @@ pub struct ExternalToolExited {
     pub tool_label: String,
     pub code: Option<i32>,
     pub error: Option<String>,
+    /// 按这个工具的 `successExitCodes` 判断是否正常结束；前端据此决定报不报错。
+    pub success: bool,
+    /// 配置里给这个退出码写的说明（例如 BC 的 103「找不到 BCompare.exe」）。
+    pub code_message: Option<String>,
+}
+
+/// 组装退出事件。判断用的是**启动时**那份配置里的工具，用户中途改配置不影响这一次。
+///
+/// 没有退出码（被信号杀掉）或等待本身失败时一律不算成功。
+pub fn exit_event(
+    worktree: &str,
+    file: &str,
+    tool: &ExternalTool,
+    report: ExitReport,
+) -> ExternalToolExited {
+    let success = report.error.is_none() && report.code.is_some_and(|c| is_success_exit(tool, c));
+    let code_message = report.code.and_then(|c| exit_code_message(tool, c));
+    ExternalToolExited {
+        worktree: worktree.to_string(),
+        file: file.to_string(),
+        tool_label: tool.label.clone(),
+        code: report.code,
+        error: report.error,
+        success,
+        code_message,
+    }
 }
 
 /// 启动外部工具，进程结束后在后台线程里回调 `on_exit`。

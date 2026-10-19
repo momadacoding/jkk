@@ -1,6 +1,6 @@
 use crate::error::{GitError, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 const CODE: &str = "external_tools_config";
@@ -19,6 +19,31 @@ pub struct ExternalTool {
     pub diff_args: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_args: Option<Vec<String>>,
+    /// 哪些退出码算正常结束；缺省只认 0。
+    ///
+    /// BComp.exe 用退出码报比较结果（1 相同、13 有差异、14 有冲突……），
+    /// 一律按「非 0 即故障」处理会在每次关掉 BC 时误报。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success_exit_codes: Option<Vec<i32>>,
+    /// 已知故障码的说明，键是十进制退出码（JSON 的键只能是字符串）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code_messages: Option<BTreeMap<String, String>>,
+}
+
+/// 这个退出码对这个工具来说算不算正常结束。
+pub fn is_success_exit(tool: &ExternalTool, code: i32) -> bool {
+    match &tool.success_exit_codes {
+        Some(codes) => codes.contains(&code),
+        None => code == 0,
+    }
+}
+
+/// 配置里给这个退出码写的说明。
+pub fn exit_code_message(tool: &ExternalTool, code: i32) -> Option<String> {
+    tool.exit_code_messages
+        .as_ref()?
+        .get(&code.to_string())
+        .cloned()
 }
 
 /// 按文件名选工具的一条规则；没写的那一项回落到顶层默认值。
@@ -97,6 +122,24 @@ pub fn default_config() -> ExternalToolsConfig {
                     "/centertitle=$BASE_TITLE",
                     "/outputtitle=$MERGED_TITLE",
                 ])),
+                // BC5 命令行文档：0 成功，1/2 相同，11/12/13 有差异，14 有冲突，都是正常的比较结果；
+                // 100 起是故障。101（有冲突、合并结果没写出）对 merge 有意义，所以不算成功
+                success_exit_codes: Some(vec![0, 1, 2, 11, 12, 13, 14]),
+                exit_code_messages: Some(
+                    [
+                        (100, "未知错误"),
+                        (101, "有冲突，合并结果没有写出"),
+                        (102, "BComp.exe 无法等待 BCompare.exe 结束"),
+                        (103, "BComp.exe 找不到 BCompare.exe"),
+                        (104, "试用期已过"),
+                        (105, "加载脚本文件出错"),
+                        (106, "脚本语法错误"),
+                        (107, "脚本无法加载文件或文件夹"),
+                    ]
+                    .into_iter()
+                    .map(|(code, msg)| (code.to_string(), msg.to_string()))
+                    .collect(),
+                ),
             },
             ExternalTool {
                 id: "vscode".to_string(),
@@ -107,6 +150,8 @@ pub fn default_config() -> ExternalToolsConfig {
                 merge_args: Some(strings(&[
                     "--wait", "--merge", "$REMOTE", "$LOCAL", "$BASE", "$MERGED",
                 ])),
+                success_exit_codes: None,
+                exit_code_messages: None,
             },
         ],
     }
