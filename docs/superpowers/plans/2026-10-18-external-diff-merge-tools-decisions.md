@@ -156,4 +156,8 @@
 #### Step 5 真实窗口实测（待用户执行）
 
 - fixture：`scratchpad\make-diff-fixture.ps1` 在会话 scratchpad 里建一次性仓库 `diff-fixture`（Staged + Unstaged 的 `a.txt`、只在工作区改的 `目录 a/f[1] x.txt`、改名提交 c2）。
-- 结果：待填。
+- 结果（2026-10-19，用户在 `pnpm tauri dev` 里实测）：
+  - Unstaged 的 `a.txt` 用 BC 打开成功，两侧标题为「a.txt（暂存区）」「a.txt（工作区）」，只有第 3 行不同，符合 index 对比工作区。这也说明 `open_external_diff` 和 `read_external_tools` 在真实窗口里调通了。
+  - BC 开着时 `%TEMP%\jkk-external` 下有子目录，关掉 BC 后子目录消失：**BComp.exe 会等比较窗口关闭才退出**，spec §4.4 要求实测的这一点成立，不需要改用 `BComp.com`。
+  - 用户发现应用内的 diff 和 BC 不一致：应用内「本地改动」右侧是 HEAD 对比工作区（第 2、3 行都变了），BC 的 Unstaged 是 index 对比工作区（只有第 3 行变了）。两边都是正确的，这是 spec §4.3 里写明的有意差异；已向用户解释。
+  - Staged、中文路径、提交详情里的改名文件、子菜单靠窗口右边缘时的位置、关闭 BC 后是否弹出退出码报错：待用户继续实测。
