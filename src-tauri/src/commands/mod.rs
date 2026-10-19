@@ -1,3 +1,4 @@
+pub mod conflict;
 pub mod custom;
 pub mod diff;
 pub mod external;

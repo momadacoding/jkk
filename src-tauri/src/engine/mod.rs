@@ -1,5 +1,6 @@
 pub mod blob_export;
 pub mod branch;
+pub mod conflicts;
 pub mod custom_config;
 pub mod diff;
 pub mod external_diff;

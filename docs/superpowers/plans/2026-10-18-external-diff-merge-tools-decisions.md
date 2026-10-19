@@ -14,7 +14,7 @@
 | 2 外部进程启动、锁与临时目录 | ✅ 完成 | `engine/external_launch.rs`；测试 `tests/external_launch.rs`（12） | fmt / clippy 无告警；cargo test 58 个测试二进制 898 例全过 |
 | 3 按字节导出与外部 diff 命令 | ✅ 完成 | `engine/blob_export.rs`、`engine/external_diff.rs`、`commands/external.rs` 加 `open_external_diff`；`external_launch.rs` 加 `ExternalToolExited`、`TempWorkspace` 的 Drop 兜底；测试 `tests/external_diff.rs`（21） | fmt / clippy 无告警；`cargo test -j 4` 59 个二进制 919 例全过；`%TEMP%\jkk-external` 无残留 |
 | 4 前端外部 diff 入口与刷新代次 | ✅ 完成（真实窗口实测发现 BC 退出码误报，已修复并复测通过，见 Task 4 决策） | `src/engine/latestGate.ts`、`src/components/externalToolItems.ts`；改 `externalTools.ts`、`externalToolsStore.ts`、`repoStore.ts`、`ContextMenu.tsx`、`FileTree.tsx`、`LocalChangesView.tsx`、`CommitDetailView.tsx`、`RepoTab.tsx`、`styles.css`；测试 `latestGate.test.ts`（4）、`externalTools.test.ts`（+13）、`LocalChangesView.test.tsx`（+7）、`CommitDetailView.test.tsx`（+3） | pnpm build 通过；pnpm test 44 文件 662 例全过；cargo test 923 例全过；`pnpm tauri dev` 实测通过 |
-| 5 冲突信息读取与五种情况分类 | 未开始 | | |
+| 5 冲突信息读取与五种情况分类 | ✅ 完成 | `engine/conflicts.rs`、`commands/conflict.rs`；测试 `tests/conflicts.rs`（35） | fmt / clippy 无告警；`cargo test -j 4 --no-fail-fast` 60 个二进制 962 例全过 |
 | 6 冲突文件的 HEAD 对比工作区 diff | 未开始 | | |
 | 7 外部 merge 命令与各侧标题 | 未开始 | | |
 | 8 前端冲突提示与 merge 入口 | 未开始 | | |
@@ -200,3 +200,34 @@
 
 - pnpm build 通过；pnpm test 45 文件 666 例全过。
 - cargo fmt --check、cargo clippy --all-targets 无告警；`cargo test -j 4 --no-fail-fast` 59 个二进制 927 例全过。
+
+### Task 5
+
+#### 偏离计划
+
+- Ruling：`path_attrs` 用 `git check-attr --stdin -z merge filter conflict-marker-size`（`run_git_stdin`），不是计划写的 `-- <paths>` —— 冲突文件可能有几百个，Windows 命令行有长度上限；`-z` 的输入输出都不受路径字符影响 —— 代价：无。
+- Ruling：多导出一个 `merge_config_raw(repo) -> Result<String>`，`merge_config` 在它之上解析 —— Task 10 的缓存 fingerprint 要用原始输出 —— 代价：无。
+- Ruling：生效 driver 的判定照搬 git `ll-merge.c` 的 `find_ll_merge_driver`：`merge`（set）→ 文本；`-merge`（unset）→ binary；没写 → 看 `merge.default`；写了名字 → 先找配置里有 `merge.<名字>.*` 任意键的自定义 driver，再找内置的 `text` / `binary` / `union`，都没有就退回文本合并。所以「本机完全没配」的名字（表 1 第 3 行）走 ① / ②，不算 ④ —— 代价：无，这正是 git 的真实行为。
+- Ruling：`merge.default` 指向自定义 driver 时 reason 是 `MergeDefault`、`driver` 填名字；指向 `binary` 时 `driver` 为 None —— spec 把 `merge.default` 归在 ④a —— 代价：界面上按 ④a 文案显示，不说「配置了自动合并工具」。
+- Ruling：④ 里二进制内容排在最前，先于属性判定 —— ④c 不给外部 merge 入口，`merge=binary` 加二进制内容时不能被 ④a 盖掉（`binary_content_wins_over_binary_attr`）—— 代价：无。
+- Ruling：UU / AA 的工作区路径被换成目录或符号链接时判为 Structural；工作区文件被删掉时判为 NoMarkers —— 前者已经不是内容合并的问题，外部 merge 也会被 `ensure_regular_file` 拒绝；后者是用户的合法选择，② 的 diff 如实显示成删除 —— 代价：删掉的文件会显示「检查后可以暂存」。
+- Ruling：`same_as_head` 只对 UU / AA 计算，用 libgit2 的 `diff_tree_to_workdir`（不经过 index）加精确 pathspec —— 它套用 autocrlf 等过滤器，工作区是 CRLF、blob 是 LF 时不会误判成不同（`same_as_head_survives_autocrlf`）；HEAD 里没有的路径永远是 false —— 代价：无。
+- Ruling：`symlink_conflict_is_structural` 不建真的链接，用 `update-index --cacheinfo 120000,...` 直接写 mode 120000 的条目，所以不需要「没权限就跳过」—— 判定只看 index 的 mode —— 代价：无。
+- Ruling：测试进程里设 `GIT_CONFIG_GLOBAL=<空文件>`、`GIT_CONFIG_NOSYSTEM=1`（`Once` 只设一次）—— 本机全局配置里有 git-lfs 装的 `merge.lfs-text.driver`，会混进 `merge_config` 的结果，测试结论不能依赖开发机的配置 —— 代价：只影响 `tests/conflicts.rs` 这个测试二进制。
+- 计划之外多加的测试：`path_attrs` 两例、`merge_config` 两例（零匹配、分组和取最后一个值、名字带点）、`merge_default_binary_is_not_text_merged`、`explicit_text_attr_overrides_merge_default`、`binary_content_wins_over_binary_attr`、`lfs_filter_is_not_text_merged`、`marker_size_attr_is_respected`、`same_as_head_survives_autocrlf`、`no_conflicts_is_empty`、`chinese_space_bracket_dash_path`。
+
+#### 计划的错误
+
+- 无。
+
+#### 计划没写的坑
+
+- 结构冲突的真实形状（git 2.51.2.windows.1）：rename/rename（一边 a→b、一边 a→c）留下 `a.txt` 只有 stage 1（`git status` 显示 DD）、`b.txt` 只有 stage 2（AU）、`c.txt` 只有 stage 3（UA）。同一次 merge 里的 modify/delete 留下 stage {1,2}，`git status` 显示 UD（deleted by them），与计划的映射一致。
+- LFS 实测（本机 git-lfs 3.7.1，`git lfs track` 的标准写法 `filter=lfs diff=lfs merge=lfs -text`）：本机没有 `merge.lfs` 这个 driver（git-lfs 只装了 `merge.lfs-text`），git 退回逐行文本合并，**冲突标记写进了 pointer 文件里**（`oid` / `size` 两行被标记包住），工作区不是真实内容。所以 LFS 必须算 ④，不能按 ① 让用户去 BC 里解 pointer 文本。这条判定只看 `filter=lfs` 属性，不依赖本机有没有装 lfs。
+- libgit2 `diff_tree_to_workdir_with_index` 对冲突路径只给 `Conflicted`，`diff_tree_to_workdir`（不经过 index）给 `Modified` 并带 hunk，过滤器照常生效。Task 6 用后者。
+- 新仓库 HEAD 未出生时 `git rev-parse --abbrev-ref HEAD` 失败，测试取当前分支要用 `git symbolic-ref --short HEAD`。
+
+#### 为什么这么改是安全的
+
+- 本 Task 只读：git2 读 index、blob、HEAD tree 和工作区文件；CLI 只有 `check-attr`（stdin 喂路径）和 `config --get-regexp`，都不写仓库。
+- 判不准的一律往保守方向走：属性认不出的名字按 git 的规则退回文本合并后，再看工作区有没有标记；LFS、二进制、自定义 driver 都不会显示「可以暂存」。
