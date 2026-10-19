@@ -126,7 +126,7 @@ export function RepoTab({
     state, openRepo, refreshHead, refreshGraph, refreshStatus, refreshWorktrees,
     refreshDiff, refreshUpstream, refreshStashes, refreshPullRequests,
     refreshSvnSync, refreshSvnEol, refreshSvnSyncState, checkSvnSyncIfChanged, fetchSvnLog, refreshSvnAudit, auditSvnIfDue,
-    selectCommit, clearError, reportError,
+    selectCommit, clearError, reportError, wantedDiffScope,
   } = useRepoStore()
   const [repoState, setRepoState] = useState<string>('normal')
   // 侧边栏分区按后端能力裁剪。SVN 混合仓库下 tag / worktree 整块不渲染
@@ -147,7 +147,7 @@ export function RepoTab({
 
   useRepoEffects(
     state,
-    { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, refreshSvnSyncState, auditSvnIfDue },
+    { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, refreshSvnSyncState, auditSvnIfDue, wantedDiffScope },
     viewMode,
   )
 

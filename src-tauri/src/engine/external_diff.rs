@@ -81,21 +81,66 @@ fn index_side(repo: &Repository, rel: &str) -> Result<Side> {
     })
 }
 
+/// 仓库内的相对路径必须每一段都是普通名字：不能为空、不能是绝对路径或盘符、不能有 `..`。
+///
+/// 在任何 git2 查找之前调用：`Index::get_path` 拿到绝对路径时会直接 panic，不是返回错误。
+fn check_rel_path(rel: &str) -> Result<()> {
+    let bad = || {
+        GitError::new(
+            "external_tool_bad_path",
+            format!("不是仓库内的相对路径：{rel}"),
+        )
+    };
+    let path = Path::new(rel);
+    if rel.is_empty() || path.has_root() {
+        return Err(bad());
+    }
+    if path
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
+    {
+        Ok(())
+    } else {
+        Err(bad())
+    }
+}
+
 /// 工作区那一侧：文件不存在时用空临时文件；存在就必须是普通文件。
+///
+/// 从 worktree 根往下逐段用 `symlink_metadata` 检查，**每一级目录**都不能是链接（junction 也算）：
+/// 只查末级的话，父目录被换成指向仓库外的链接时，工具会打开、保存仓库外的同名文件。
+/// 最后再核对规范化后的位置仍在 worktree 内，作为第二道防线。
 fn workdir_side(repo: &Repository, rel: &str) -> Result<Side> {
     let workdir = repo
         .workdir()
         .ok_or_else(|| GitError::new("external_tool_export", "裸仓库没有工作区"))?;
-    // 经 components 重新拼一遍，Windows 上分隔符统一成反斜杠，交给外部工具更稳妥
-    let abs: PathBuf = workdir.join(rel).components().collect();
-    match std::fs::symlink_metadata(&abs) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Side::Missing),
-        Err(e) => Err(e.into()),
-        Ok(_) => {
-            ensure_regular_file(&abs)?;
-            Ok(Side::Workdir(abs))
+    let mut abs: PathBuf = workdir.components().collect();
+    let parts: Vec<_> = Path::new(rel).components().collect();
+    for (i, part) in parts.iter().enumerate() {
+        abs.push(part);
+        let meta = match std::fs::symlink_metadata(&abs) {
+            Ok(m) => m,
+            // 文件或它所在的目录不存在：这一侧是空的
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Side::Missing),
+            Err(e) => return Err(e.into()),
+        };
+        let last = i + 1 == parts.len();
+        if !last && meta.file_type().is_symlink() {
+            return Err(GitError::new(
+                "external_tool_not_regular",
+                format!("{} 是链接，不能把它下面的文件交给外部工具", abs.display()),
+            ));
         }
     }
+    ensure_regular_file(&abs)?;
+    let root = std::fs::canonicalize(workdir)?;
+    if !std::fs::canonicalize(&abs)?.starts_with(&root) {
+        return Err(GitError::new(
+            "external_tool_bad_path",
+            format!("{} 不在当前 worktree 内", abs.display()),
+        ));
+    }
+    Ok(Side::Workdir(abs))
 }
 
 fn materialize(
@@ -136,6 +181,18 @@ pub fn prepare_diff(
     target: &DiffTarget,
     ws: &TempWorkspace,
 ) -> Result<(PathBuf, PathBuf, String, String)> {
+    check_rel_path(target.file())?;
+    if let DiffTarget::Commit {
+        old_file: Some(old),
+        ..
+    }
+    | DiffTarget::Range {
+        old_file: Some(old),
+        ..
+    } = target
+    {
+        check_rel_path(old)?;
+    }
     let repo = Repository::open(repo_path)?;
     let (left, left_name, right, right_name, lt, rt) = match target {
         DiffTarget::Unstaged { file } => (

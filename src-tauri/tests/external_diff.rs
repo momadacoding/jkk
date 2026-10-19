@@ -276,6 +276,47 @@ fn export_failure_does_not_write_file() {
     assert!(!dest.exists());
 }
 
+/// 没配 required 的 smudge 过滤器失败时，`git cat-file --filters` 仍退出 0、输出跳过过滤器的内容。
+/// spec §4.2 要求过滤器失败就中止，不能把这份内容当成工作区形态交给工具（Codex review 第 3 条）。
+#[test]
+fn export_fails_when_non_required_smudge_filter_fails() {
+    let dir = repo();
+    fs::write(dir.path().join(".gitattributes"), "a.txt filter=broken\n").unwrap();
+    git(dir.path(), &["add", ".gitattributes"]);
+    commit_file(dir.path(), "a.txt", b"raw\n", "c1");
+    git(dir.path(), &["config", "filter.broken.smudge", "exit 1"]);
+    let blob = git(dir.path(), &["rev-parse", "HEAD:a.txt"]);
+
+    let out = TempDir::new().unwrap();
+    let dest = out.path().join("a.LOCAL.txt");
+    let err = blob_export::export_filtered(p(dir.path()), "a.txt", &blob, &dest).unwrap_err();
+    assert_eq!(err.code, "external_tool_export");
+    assert!(!dest.exists(), "过滤失败时不能写出文件");
+    // 只对这一次命令临时加 required，不能改仓库配置
+    let required = Command::new("git")
+        .current_dir(dir.path())
+        .args(["config", "--get", "filter.broken.required"])
+        .output()
+        .unwrap();
+    assert!(!required.status.success(), "不能把 required 写进仓库配置");
+}
+
+/// 正常工作的 smudge 过滤器照常生效。
+#[test]
+fn export_applies_smudge_filter() {
+    let dir = repo();
+    fs::write(dir.path().join(".gitattributes"), "*.txt filter=up\n").unwrap();
+    git(dir.path(), &["add", ".gitattributes"]);
+    commit_file(dir.path(), "a b[1].txt", b"hello\n", "c1");
+    git(dir.path(), &["config", "filter.up.smudge", "tr a-z A-Z"]);
+    let blob = git(dir.path(), &["rev-parse", "HEAD:a b[1].txt"]);
+
+    let out = TempDir::new().unwrap();
+    let dest = out.path().join("x.txt");
+    blob_export::export_filtered(p(dir.path()), "a b[1].txt", &blob, &dest).unwrap();
+    assert_eq!(fs::read(&dest).unwrap(), b"HELLO\n");
+}
+
 #[test]
 fn export_rejects_empty_path() {
     let dir = repo();
@@ -362,6 +403,76 @@ fn symlink_workdir_side_is_refused() {
     .unwrap_err();
     assert_eq!(err.code, "external_tool_not_regular");
     assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+    ws.remove().unwrap();
+}
+
+/// 父目录被换成指向仓库外的链接时也要拒绝：只查末级的话，工具会打开仓库外的同名文件，
+/// 用户在工具里存盘就改到了仓库外（Codex review 第 1 条）。
+#[test]
+fn linked_parent_dir_of_workdir_side_is_refused() {
+    let dir = repo();
+    commit_file(dir.path(), "sub/a.txt", b"inside\n", "c1");
+    let outside = TempDir::new().unwrap();
+    fs::write(outside.path().join("a.txt"), "victim\n").unwrap();
+    fs::remove_dir_all(dir.path().join("sub")).unwrap();
+
+    let link = dir.path().join("sub");
+    #[cfg(windows)]
+    let made = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(outside.path())
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    #[cfg(not(windows))]
+    let made = std::os::unix::fs::symlink(outside.path(), &link).is_ok();
+    if !made {
+        eprintln!("跳过：本机建不了目录联接");
+        return;
+    }
+
+    let ws = TempWorkspace::create().unwrap();
+    let err = external_diff::prepare_diff(
+        p(dir.path()),
+        &DiffTarget::Unstaged {
+            file: "sub/a.txt".into(),
+        },
+        &ws,
+    )
+    .unwrap_err();
+    assert_eq!(err.code, "external_tool_not_regular", "{}", err.message);
+    assert_eq!(
+        fs::read_to_string(outside.path().join("a.txt")).unwrap(),
+        "victim\n"
+    );
+    ws.remove().unwrap();
+}
+
+/// 前端传来的路径带 `..` 或是绝对路径时直接拒绝，不能拼出 worktree 之外的位置。
+#[test]
+fn path_escaping_worktree_is_refused() {
+    let dir = repo();
+    commit_file(dir.path(), "a.txt", b"v1\n", "c1");
+    let ws = TempWorkspace::create().unwrap();
+    for file in [
+        "../a.txt",
+        "sub/../../a.txt",
+        "C:/Windows/win.ini",
+        "/etc/passwd",
+    ] {
+        let err = external_diff::prepare_diff(
+            p(dir.path()),
+            &DiffTarget::Unstaged { file: file.into() },
+            &ws,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.code, "external_tool_bad_path",
+            "{file}: {}",
+            err.message
+        );
+    }
     ws.remove().unwrap();
 }
 

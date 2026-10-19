@@ -174,3 +174,29 @@
 - 用户本机的 `%APPDATA%\com.momadacoding.jkk\externalTools.json` 删除前核对过内容，和旧默认预设一字不差（用户确认没改过），经用户同意已删除，下次读取时按新预设重新生成。
 - 测试：Rust `bc_preset_treats_comparison_results_as_success`、`tool_without_success_codes_only_accepts_zero`、`exit_codes_and_messages_load_from_json`、`exit_event_judges_code_by_tool_config`；vitest `describeToolExit` 五例（含「后端判为正常时即使退出码是 13 也不报」）。pnpm build 通过；pnpm test 662 例全过；fmt / clippy 无告警；`cargo test -j 4` 59 个二进制 923 例全过。
 - 用户复测（2026-10-19，配置已按新预设重新生成）：对比有差异的文件、关掉 BC 后不再报错。Task 4 Step 5 全部通过。
+
+### 阶段 1 review（Codex，2026-10-20）
+
+独立 review 用 Codex `adversarial-review --base master --scope branch`，按 AGENTS.md §13 的 rubric，先读本文件的 Ruling 再看 diff。结论 needs-attention，三条发现逐条核实后都成立，全部修复，每条先写失败测试。
+
+#### 计划的错误
+
+- **[high] 父目录链接可以绕过工作区一侧的检查**（`external_diff.rs` `workdir_side`）：原来只用 `symlink_metadata` 查末级文件。已跟踪的 `sub/a.txt` 所在目录被换成指向仓库外的 junction 时，工具会打开仓库外的同名文件，用户在工具里存盘就改到了仓库外。
+  - 修复：从 worktree 根往下逐段 `symlink_metadata`，中间任何一级是链接（junction 也算）都拒绝，返回 `external_tool_not_regular`；最后核对规范化后的位置仍在 worktree 内。另外在任何 git2 查找之前校验相对路径（`check_rel_path`）：空、绝对路径、盘符、`..` 一律返回 `external_tool_bad_path`。
+  - 测试：`linked_parent_dir_of_workdir_side_is_refused`（本机真的建了 junction，`--nocapture` 下没有出现「跳过」）、`path_escaping_worktree_is_refused`。
+  - 修复前写测试时发现：**git2 的 `Index::get_path` 拿到绝对路径时会直接 panic**（`index.rs:397`），不是返回错误；所以路径校验必须放在所有 git2 查找之前，四种 target 都要校验 `file` 和 `old_file`。
+- **[medium] 后发出的旧 scope 刷新让当前提交的 diff 作废**（`repoStore.ts` `refreshDiff`）：Stage / Unstage / Discard / Commit 的回调固定刷新 `workdir`。用户操作后切到提交 B，B 的请求先发出、旧操作的 `workdir` 请求后发出；Task 4 加的代次闸不分 scope，B 的结果被判为过期，界面一直显示工作区的改动。这个竞态原来就有（谁后回谁赢），代次闸让它变成必然。
+  - 修复：代次按 scope 分开计（key 为 `diff:<scope>`）；写回前再核对 scope 是不是当前视图要的那一份。当前视图的 scope 由 `useRepoEffects` 每次渲染写入 `useRepoStore` 新增的 `wantedDiffScope` ref（在渲染里写，保证按选中刷新的 effect 发请求前已是新值），`undefined` 表示还不知道（刚打开仓库），此时照常写回。`RepoRefreshers` 接口多了 `wantedDiffScope` 字段。
+  - 测试：`tests/vitest/repoStoreDiffRefresh.test.ts` 用 jsdom 和 `renderHook` 驱动真实的 `useRepoStore`，`invoke` 换成可控的 promise，覆盖 workdir 先回 / 后回、同 scope 两次以旧的晚到、还不知道视图时照常写回四种情况。
+- **[medium] 没配 required 的 smudge 过滤器失败被当成导出成功**（`blob_export.rs` `export_filtered`）：Codex 实测，过滤器退出 1 且没有 `required=true` 时，`git cat-file --filters` 仍退出 0，只在 stderr 警告，stdout 是跳过过滤器的内容；`run_git_bytes` 只看退出码，于是照常写临时文件、启动工具，违反 spec §4.2「过滤器失败就中止」。
+  - 修复：导出前用 `git check-attr -z filter -- <path>` 查出这个路径的过滤器名，只对这一次命令加 `-c filter.<name>.required=true`，失败就变成非 0；不改仓库配置。名字里带 `=` 时没法安全拼进 `-c`，按出错处理。
+  - 测试：`export_fails_when_non_required_smudge_filter_fails`（同时断言仓库配置里没有被写进 required）、`export_applies_smudge_filter`（正常过滤器照常生效，路径带空格和方括号）。
+
+#### 计划没写的坑
+
+- 全量 `cargo test -j 4` 一次失败在 `vcs_backend::backend_diff_matches_engine` 的 fixture 准备步骤（`git commit -m c1` 失败），这个测试和本分支的改动无关；单独重跑 3 次都通过，判断是高并行负载下的偶发失败。另外 cargo 默认在第一个失败的测试二进制处停止，只跑了 56 个；以后全量验证用 `cargo test -j 4 --no-fail-fast`，确保 59 个都跑到。
+
+#### 验证
+
+- pnpm build 通过；pnpm test 45 文件 666 例全过。
+- cargo fmt --check、cargo clippy --all-targets 无告警；`cargo test -j 4 --no-fail-fast` 59 个二进制 927 例全过。

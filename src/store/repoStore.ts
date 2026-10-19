@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type MutableRefObject } from 'react'
 import type { CommitNode, DiffData, GraphData, PullRequest, RefPointer, RepoInfo, StashEntry, StatusData, UpstreamInfo, Worktree } from '../engine/types'
 import { ALL_CAPABILITIES, type Capabilities } from '../engine/capabilities'
 import {
@@ -396,6 +396,14 @@ export function useRepoStore() {
 
   /** `refreshStatus` / `refreshDiff` 的请求代次，见 `createLatestGate`。放 ref：要跨渲染保持计数。 */
   const refreshGate = useRef(createLatestGate()).current
+  /**
+   * 当前视图要显示哪一份 diff，由 `useRepoEffects` 每次渲染写入。
+   *
+   * `undefined` 表示还不知道（刚打开仓库），此时照常写回。用户操作（stage、discard、commit）的
+   * 回调会固定刷新 `workdir`，它可能在用户切到某个提交之后才发出；不核对 scope 的话，
+   * 它要么让那个提交的结果作废，要么晚到后把工作区的改动盖在提交详情上（Codex review 第 2 条）。
+   */
+  const wantedDiffScope = useRef<string | null | undefined>(undefined)
 
   const openRepo = useCallback(async (path: string) => {
     setState((s) => ({ ...s, loading: true, error: null, errorCode: null }))
@@ -718,10 +726,14 @@ export function useRepoStore() {
   }
 
   const refreshDiff = async (path: string, scope: string) => {
-    const token = refreshGate.begin('diff')
+    // 代次按 scope 分开计：别的 scope 的请求不能让这一份作废
+    const key = `diff:${scope}`
+    const token = refreshGate.begin(key)
     const diff = await invoke<DiffData>('read_diff', { path, scope })
-    // 同上；另外切换选中时上一个提交的 diff 可能后到，按代次丢掉就不会显示错提交的改动
-    if (!refreshGate.isLatest(token, 'diff')) return
+    if (!refreshGate.isLatest(token, key)) return
+    // 写回前再核对：只认当前视图要的那一份，切走之后才回来的旧 scope 结果丢掉
+    const wanted = wantedDiffScope.current
+    if (wanted !== undefined && wanted !== scope) return
     setState((s) => ({ ...s, diff }))
   }
 
@@ -763,6 +775,7 @@ export function useRepoStore() {
     selectCommit,
     clearError,
     reportError,
+    wantedDiffScope,
   }
 }
 
@@ -781,6 +794,8 @@ export interface RepoRefreshers {
   refreshSvnSyncState: (path: string) => Promise<void>
   /** 服务器侧核对的**后台**入口，自带频率闸。挂定时器与窗口焦点。 */
   auditSvnIfDue: (path: string) => Promise<void>
+  /** `useRepoStore` 的 `wantedDiffScope`：这里每次渲染写入当前视图的 scope。 */
+  wantedDiffScope: MutableRefObject<string | null | undefined>
 }
 
 export function useRepoEffects(
@@ -793,6 +808,8 @@ export function useRepoEffects(
   const diffScope = viewMode === 'changes'
     ? 'workdir'
     : selectionDiffScope(state.commits, state.selectedId)
+  // 在渲染里写而不是在 effect 里写：下面那个按选中刷新 diff 的 effect 发请求之前，它必须已经是新值
+  refreshers.wantedDiffScope.current = diffScope
 
   useEffect(() => {
     if (!state.path || !diffScope) return

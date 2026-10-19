@@ -1,6 +1,6 @@
 //! 把 git 里的某个版本导出成临时文件，交给外部 diff / merge 工具。
 
-use crate::engine::git_cli::run_git_bytes;
+use crate::engine::git_cli::{run_git, run_git_bytes};
 use crate::error::{GitError, Result};
 use std::path::Path;
 
@@ -14,15 +14,44 @@ pub fn export_filtered(repo: &str, rel_path: &str, oid: &str, dest: &Path) -> Re
     if rel_path.is_empty() {
         return Err(GitError::new("external_tool_export", "导出路径为空"));
     }
-    let path_arg = format!("--path={rel_path}");
-    let bytes = run_git_bytes(repo, &["cat-file", "--filters", &path_arg, oid]).map_err(|e| {
+    let export_error = |e: GitError| {
         GitError::new(
             "external_tool_export",
             format!("导出 {rel_path} 失败：{}", e.message.trim()),
         )
-    })?;
+    };
+    let path_arg = format!("--path={rel_path}");
+    // 没配 `required` 的过滤器失败时，git 只在 stderr 警告一句、退出码仍是 0，
+    // 输出的是跳过过滤器的内容。只对这一次命令把它设成 required，失败才会变成非 0；
+    // 用 `-c` 而不是改仓库配置，用户的 checkout 行为不受影响
+    let required = filter_driver(repo, rel_path)
+        .map_err(export_error)?
+        .map(|name| format!("filter.{name}.required=true"));
+    let mut args: Vec<&str> = Vec::new();
+    if let Some(kv) = &required {
+        args.extend(["-c", kv.as_str()]);
+    }
+    args.extend(["cat-file", "--filters", &path_arg, oid]);
+    let bytes = run_git_bytes(repo, &args).map_err(export_error)?;
     std::fs::write(dest, bytes)?;
     Ok(())
+}
+
+/// 这个路径生效的 `filter` 属性指向哪个过滤器驱动；没有设置时返回 None。
+///
+/// `-z` 输出是 `<path>\0filter\0<value>\0`，路径里有什么字符都不影响解析。
+/// 名字里带 `=` 时没法安全地拼进 `-c`，按出错处理，不悄悄跳过。
+fn filter_driver(repo: &str, rel_path: &str) -> Result<Option<String>> {
+    let out = run_git(repo, &["check-attr", "-z", "filter", "--", rel_path])?;
+    let value = out.split('\0').nth(2).unwrap_or("");
+    match value {
+        "" | "unspecified" | "unset" | "set" => Ok(None),
+        name if name.contains('=') => Err(GitError::new(
+            "external_tool_export",
+            format!("过滤器名字里有 `=`，无法导出：{name}"),
+        )),
+        name => Ok(Some(name.to_string())),
+    }
 }
 
 /// 临时文件名：保留原扩展名，外部工具才能按类型选语法高亮和比较规则。
