@@ -1,6 +1,6 @@
 use crate::engine::external_diff::{self, DiffTarget};
 use crate::engine::external_launch::exit_event;
-use crate::engine::{external_tools_config, launcher};
+use crate::engine::{external_merge, external_tools_config, launcher};
 use crate::error::{GitError, Result};
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, Manager};
@@ -68,4 +68,27 @@ pub fn open_external_diff(
             );
         },
     )
+}
+
+/// 用外部工具解决一个冲突文件。立即返回；工具退出后发 `external-tool-exited`。
+///
+/// 工具退出后不暂存：冲突文件由用户回到应用里检查后手动 Stage（spec §2 反目标）。
+#[tauri::command(async)]
+pub fn open_external_merge(
+    app: AppHandle,
+    path: String,
+    tool_id: String,
+    file: String,
+) -> Result<()> {
+    let config_path = config_path(&app)?;
+    let cfg = external_tools_config::load_from(&config_path)?;
+    let tool = external_tools_config::find_tool(&cfg, &tool_id)?.clone();
+    let worktree = path.clone();
+    let exited_file = file.clone();
+    external_merge::open_external_merge(&path, &cfg, &config_path, &tool_id, &file, move |report| {
+        let _ = app.emit(
+            "external-tool-exited",
+            exit_event(&worktree, &exited_file, &tool, report),
+        );
+    })
 }

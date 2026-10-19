@@ -16,7 +16,7 @@
 | 4 前端外部 diff 入口与刷新代次 | ✅ 完成（真实窗口实测发现 BC 退出码误报，已修复并复测通过，见 Task 4 决策） | `src/engine/latestGate.ts`、`src/components/externalToolItems.ts`；改 `externalTools.ts`、`externalToolsStore.ts`、`repoStore.ts`、`ContextMenu.tsx`、`FileTree.tsx`、`LocalChangesView.tsx`、`CommitDetailView.tsx`、`RepoTab.tsx`、`styles.css`；测试 `latestGate.test.ts`（4）、`externalTools.test.ts`（+13）、`LocalChangesView.test.tsx`（+7）、`CommitDetailView.test.tsx`（+3） | pnpm build 通过；pnpm test 44 文件 662 例全过；cargo test 923 例全过；`pnpm tauri dev` 实测通过 |
 | 5 冲突信息读取与五种情况分类 | ✅ 完成 | `engine/conflicts.rs`、`commands/conflict.rs`；测试 `tests/conflicts.rs`（35） | fmt / clippy 无告警；`cargo test -j 4 --no-fail-fast` 60 个二进制 962 例全过 |
 | 6 冲突文件的 HEAD 对比工作区 diff | ✅ 完成 | 改 `engine/diff.rs`（`fill_conflicted`、`readable_only` 放行冲突条目）；测试 `tests/fixtures.rs`（+3） | fmt / clippy 无告警；`cargo test -j 4 --no-fail-fast` 60 个二进制 965 例全过 |
-| 7 外部 merge 命令与各侧标题 | 未开始 | | |
+| 7 外部 merge 命令与各侧标题 | ✅ 完成 | `engine/external_merge.rs`、`commands/external.rs` 加 `open_external_merge`；`external_diff.rs` 抽出 `workdir_file` 等共用函数；测试 `tests/external_merge.rs`（20） | fmt / clippy 无告警；`cargo test -j 4 --no-fail-fast` 61 个二进制 985 例全过；`pnpm tauri dev` 实测并到 Task 8 |
 | 8 前端冲突提示与 merge 入口 | 未开始 | | |
 | 9 DU / UD 二选一 | 未开始 | | |
 | 10 merge driver 检查（后端） | 未开始 | | |
@@ -253,3 +253,29 @@
 
 - 只读：多出来的一次 diff 只覆盖冲突路径，pathspec 按字面量匹配（`disable_pathspec_match`），`f[1].txt` 不会匹配到 `f1.txt`。
 - `status` 仍是 `conflicted`，前端按冲突处理，不会把冲突文件当普通改动暂存。
+
+### Task 7
+
+#### 偏离计划
+
+- Ruling：`merge_titles`、`prepare_merge`、`open_external_merge` 放在新模块 `engine/external_merge.rs`，不放进计划写的 `conflicts.rs` —— `conflicts.rs` 只负责只读的冲突信息，外部 merge 的结构和 `external_diff.rs` 一一对应（锁 → 临时目录 → 导出 → 展开 → 启动），放一起好对照 —— 代价：无。
+- Ruling：`external_diff.rs` 的 `check_rel_path`、`path_arg`、`short` 改成 `pub(crate)`；`workdir_side` 拆出 `pub(crate) fn workdir_file(repo, rel) -> Result<Option<PathBuf>>`，`$MERGED` 复用同一套逐段检查（父目录是链接、不在 worktree 内都拒绝）—— 不复制一份安全检查 —— 代价：无，diff 侧行为不变（`external_diff` 21 例照常通过）。
+- Ruling：`prepare_merge` 每次都重新调用 `read_conflicts` 并按路径找到这一条；文件已经不是冲突时报 `conflict_state_changed`（与 Task 9 同一个 code），`$MERGED` 不存在时报 `external_tool_not_regular` —— 不信任前端可能已经过期的状态 —— 代价：每次打开多读一次冲突信息（一次 `check-attr` 加一次 `config`）。
+- Ruling：标题文案 —— merge：local `<分支>（HEAD）`（detached 时短 hash），remote 是指着 `MERGE_HEAD` 的分支名（先本地后远程，同类按名字排序取第一个），没有就用短 hash；rebase：local `当前重放结果（HEAD，基于 <onto 分支或短 hash>）`，onto 读 gitdir 下 `rebase-merge/onto` 或 `rebase-apply/onto`，remote `REBASE_HEAD <短 hash> <标题>`；cherry-pick / revert：`CHERRY_PICK_HEAD` / `REVERT_HEAD` 同样形状；其他状态（stash apply / pop 的冲突不留状态文件）remote 写 `对方` —— 计划没覆盖 stash —— 代价：只是文案。
+- 计划之外多加的测试：`merge_titles_use_branch_names`、`merge_title_falls_back_to_short_hash`、`cherry_pick_titles_use_cherry_pick_head`、`not_text_merged_exports_original_versions`、`resolved_file_is_rejected`、`bad_paths_are_rejected_before_any_lookup`、`missing_merged_file_is_refused`、`chinese_space_bracket_dash_path`、`linked_worktree_merged_is_in_that_worktree`、`tool_without_merge_args_is_unsupported`、`missing_program_points_to_config_and_releases_lock`、`second_open_of_same_file_is_busy`。
+- `merged_symlink_is_refused` 写成 `merged_under_linked_dir_is_refused`：Windows 上建文件符号链接要特权，改为把 `$MERGED` 的父目录换成指向仓库外的 junction（不需要特权，本机实际运行，没有跳过）；断言被拒绝、仓库外的文件内容不变。末级是链接的情况 Task 5 已经判成 Structural，同样被拒绝。
+
+#### 计划的错误
+
+- 无。
+
+#### 计划没写的坑
+
+- `Repository::mergehead_foreach` 要 `&mut Repository`。
+- rebase 停在冲突上时 HEAD 是 detached，`repo.head()` 没有分支名，所以 rebase 的 local 标题必须靠 onto 文件取基线名，不能用 `head_label`。
+
+#### 为什么这么改是安全的
+
+- 不写仓库：导出只走 `cat-file --filters`，写的是应用临时目录下本次新建的子目录。
+- `$MERGED` 是工作区里已有的普通文件，打开前逐段检查父目录不是链接、规范化后仍在 worktree 内；清理只调用 `TempWorkspace::remove`，它只删 `temp_root()` 的直接子目录，`merged_path_survives_cleanup` 断言 `$MERGED` 内容不变。
+- 工具退出后不 `git add`；退出码只用来报故障，不参与冲突是否已解决的判断。

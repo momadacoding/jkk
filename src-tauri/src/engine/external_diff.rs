@@ -84,7 +84,7 @@ fn index_side(repo: &Repository, rel: &str) -> Result<Side> {
 /// 仓库内的相对路径必须每一段都是普通名字：不能为空、不能是绝对路径或盘符、不能有 `..`。
 ///
 /// 在任何 git2 查找之前调用：`Index::get_path` 拿到绝对路径时会直接 panic，不是返回错误。
-fn check_rel_path(rel: &str) -> Result<()> {
+pub(crate) fn check_rel_path(rel: &str) -> Result<()> {
     let bad = || {
         GitError::new(
             "external_tool_bad_path",
@@ -106,11 +106,19 @@ fn check_rel_path(rel: &str) -> Result<()> {
 }
 
 /// 工作区那一侧：文件不存在时用空临时文件；存在就必须是普通文件。
+fn workdir_side(repo: &Repository, rel: &str) -> Result<Side> {
+    Ok(match workdir_file(repo, rel)? {
+        Some(abs) => Side::Workdir(abs),
+        None => Side::Missing,
+    })
+}
+
+/// 工作区里的真实文件，交给外部工具直接读写；文件或它所在的目录不存在时返回 None。
 ///
 /// 从 worktree 根往下逐段用 `symlink_metadata` 检查，**每一级目录**都不能是链接（junction 也算）：
 /// 只查末级的话，父目录被换成指向仓库外的链接时，工具会打开、保存仓库外的同名文件。
 /// 最后再核对规范化后的位置仍在 worktree 内，作为第二道防线。
-fn workdir_side(repo: &Repository, rel: &str) -> Result<Side> {
+pub(crate) fn workdir_file(repo: &Repository, rel: &str) -> Result<Option<PathBuf>> {
     let workdir = repo
         .workdir()
         .ok_or_else(|| GitError::new("external_tool_export", "裸仓库没有工作区"))?;
@@ -121,7 +129,7 @@ fn workdir_side(repo: &Repository, rel: &str) -> Result<Side> {
         let meta = match std::fs::symlink_metadata(&abs) {
             Ok(m) => m,
             // 文件或它所在的目录不存在：这一侧是空的
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Side::Missing),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
         };
         let last = i + 1 == parts.len();
@@ -140,7 +148,7 @@ fn workdir_side(repo: &Repository, rel: &str) -> Result<Side> {
             format!("{} 不在当前 worktree 内", abs.display()),
         ));
     }
-    Ok(Side::Workdir(abs))
+    Ok(Some(abs))
 }
 
 fn materialize(
@@ -169,7 +177,7 @@ fn find_commit<'r>(repo: &'r Repository, spec: &str) -> Result<Commit<'r>> {
     Ok(repo.revparse_single(spec)?.peel_to_commit()?)
 }
 
-fn short(commit: &Commit) -> String {
+pub(crate) fn short(commit: &Commit) -> String {
     commit.id().to_string()[..7].to_string()
 }
 
@@ -265,7 +273,7 @@ pub fn prepare_diff(
     Ok((left, right, lt, rt))
 }
 
-fn path_arg(path: &Path) -> Result<String> {
+pub(crate) fn path_arg(path: &Path) -> Result<String> {
     path.to_str().map(str::to_string).ok_or_else(|| {
         GitError::new(
             "external_tool_export",

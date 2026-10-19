@@ -34,6 +34,7 @@ pub fn run() {
             commands::custom::read_custom_commands,
             commands::custom::run_custom_command,
             commands::external::open_external_diff,
+            commands::external::open_external_merge,
             commands::external::open_external_tools_config,
             commands::external::read_external_tools,
             commands::diff::read_status,
