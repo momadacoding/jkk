@@ -333,3 +333,80 @@ describe('LocalChangesView 的冲突文件', () => {
     expect(screen.queryByText(/中解决/)).toBeNull()
   })
 })
+
+describe('LocalChangesView 的一边删一边改', () => {
+  function mountDeleteModify() {
+    const onResolveDeleteModify = vi.fn()
+    const file = '目录/-d [1].txt'
+    render(
+      <LocalChangesView
+        status={{ unstaged: [conflicted(file)], staged: [] }}
+        diff={{ files: [] }}
+        onStage={vi.fn()}
+        onUnstage={vi.fn()}
+        onDiscard={vi.fn()}
+        onCommit={vi.fn()}
+        svnMode={false}
+        onBaselineBranch={false}
+        conflicts={[conflictInfo(file, { case: 'deleteModify', code: 'DU', ours: null })]}
+        onResolveDeleteModify={onResolveDeleteModify}
+      />,
+    )
+    return { onResolveDeleteModify, file }
+  }
+
+  it('点「保留修改后的文件」直接调用 keep = true，不弹框', async () => {
+    const { onResolveDeleteModify, file } = mountDeleteModify()
+    fireEvent.click(screen.getByRole('button', { name: '保留修改后的文件' }))
+    await waitFor(() => expect(onResolveDeleteModify).toHaveBeenCalledWith(file, true))
+    expect(document.querySelector('.dialog-actions')).toBeNull()
+  })
+
+  it('点「删除文件」先弹危险确认框，标题和内容都带文件名；取消就不执行', async () => {
+    const { onResolveDeleteModify, file } = mountDeleteModify()
+    fireEvent.click(screen.getByRole('button', { name: '删除文件' }))
+    const dialog = await waitFor(() => {
+      const el = document.querySelector('.dialog-actions')?.closest('.dialog') ?? document.querySelector('.dialog-actions')?.parentElement
+      if (!el) throw new Error('没有弹框')
+      return el as HTMLElement
+    })
+    expect(dialog.textContent).toContain(`删除 ${file}？`)
+    // 标题和正文里各出现一次
+    expect((dialog.textContent ?? '').split(file).length - 1).toBeGreaterThanOrEqual(2)
+    expect(within(dialog).getByRole('button', { name: '删除文件' }).className).toContain('danger')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(document.querySelector('.dialog-actions')).toBeNull())
+    expect(onResolveDeleteModify).not.toHaveBeenCalled()
+  })
+
+  it('确认之后才调用 keep = false', async () => {
+    const { onResolveDeleteModify, file } = mountDeleteModify()
+    fireEvent.click(screen.getByRole('button', { name: '删除文件' }))
+    const actions = await waitFor(() => {
+      const el = document.querySelector('.dialog-actions')
+      if (!el) throw new Error('没有弹框')
+      return el as HTMLElement
+    })
+    fireEvent.click(within(actions).getByRole('button', { name: '删除文件' }))
+    await waitFor(() => expect(onResolveDeleteModify).toHaveBeenCalledWith(file, false))
+  })
+
+  it('没接回调时不显示这两个按钮', () => {
+    const file = 'd.txt'
+    render(
+      <LocalChangesView
+        status={{ unstaged: [conflicted(file)], staged: [] }}
+        diff={{ files: [] }}
+        onStage={vi.fn()}
+        onUnstage={vi.fn()}
+        onDiscard={vi.fn()}
+        onCommit={vi.fn()}
+        svnMode={false}
+        onBaselineBranch={false}
+        conflicts={[conflictInfo(file, { case: 'deleteModify', code: 'UD', theirs: null })]}
+      />,
+    )
+    expect(screen.queryByRole('button', { name: '删除文件' })).toBeNull()
+    expect(screen.queryByRole('button', { name: '保留修改后的文件' })).toBeNull()
+  })
+})

@@ -17,6 +17,7 @@ import { externalDiffItems, externalMergeItems, type ExternalToolsMenu } from '.
 import { canExternalMerge, conflictView, PENDING_CONFLICT_VIEW } from '@/engine/conflictView'
 import { toolFor } from '@/engine/externalTools'
 import { ConflictNotice } from './ConflictNotice'
+import { useConfirm } from './ConfirmDialog'
 
 interface FileSectionProps {
   title: string
@@ -119,9 +120,11 @@ interface LocalChangesViewProps {
    * 「这个文件有冲突」，不给任何操作，也不显示 diff。
    */
   conflicts?: ConflictInfo[] | null
+  /** ③ 一边删一边改的二选一，立即暂存；不传时不显示这两个按钮。 */
+  onResolveDeleteModify?: (file: string, keep: boolean) => void
 }
 
-export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, onCommit, svnMode, onBaselineBranch, externalTools, conflicts }: LocalChangesViewProps) {
+export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, onCommit, svnMode, onBaselineBranch, externalTools, conflicts, onResolveDeleteModify }: LocalChangesViewProps) {
   const [selection, setSelection] = useState<FileSelection>(emptyFileSelection)
   const [subject, setSubject] = useState('')
   const [description, setDescription] = useState('')
@@ -129,6 +132,7 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
   const [localOnly, setLocalOnly] = useState(false)
   const descriptionRef = useRef<HTMLTextAreaElement>(null)
   const { menu, open, close } = useContextMenu()
+  const { confirm, dialog: confirmDialog } = useConfirm()
 
   const unstaged = useMemo(() => conflictsFirst(status.unstaged), [status.unstaged])
   const allFiles = useMemo(() => [...unstaged, ...status.staged], [unstaged, status.staged])
@@ -158,6 +162,18 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
   const activeConflictView = activeConflictInfo
     ? conflictView(activeConflictInfo, mergeTool)
     : PENDING_CONFLICT_VIEW
+
+  /** 「删除文件」会丢掉修改过的那一版，先确认；「保留」不弹框（spec §4.1 ③）。 */
+  const deleteConflictFile = async (file: string) => {
+    if (!onResolveDeleteModify) return
+    const ok = await confirm({
+      title: `删除 ${file}？`,
+      message: `${file} 会从工作区删除，并立即暂存这次删除；修改过的那一版不会保留。`,
+      confirmLabel: '删除文件',
+      danger: true,
+    })
+    if (ok) onResolveDeleteModify(file, false)
+  }
 
   const click = (section: FileSection, files: string[], path: string, e: React.MouseEvent) => {
     setSelection((cur) => nextFileSelection(cur, section, files, path, {
@@ -298,6 +314,8 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
                   mergeToolLabel={mergeTool?.label ?? null}
                   onOpenMerge={() => { if (mergeTool) externalTools?.onMerge(mergeTool.id, activeConflict) }}
                   onStage={() => onStage([activeConflict])}
+                  onKeep={onResolveDeleteModify && (() => onResolveDeleteModify(activeConflict, true))}
+                  onDelete={onResolveDeleteModify && (() => { void deleteConflictFile(activeConflict) })}
                 />
                 {activeConflictView.sameAsHeadNote
                   ? <div className="conflict-same-as-head">{activeConflictView.sameAsHeadNote}</div>
@@ -369,6 +387,7 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
         )}
       </div>
       <ContextMenu menu={menu} onClose={close} />
+      {confirmDialog}
     </div>
   )
 }

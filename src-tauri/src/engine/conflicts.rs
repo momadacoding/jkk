@@ -4,7 +4,9 @@
 //! 生效的属性和 `merge.*` 配置走 git CLI（`check-attr` / `config`），因为真正执行合并的是
 //! git CLI，判定要和它的解析结果一致（spec §5）。
 
-use crate::engine::git_cli::{run_git_code, run_git_stdin};
+use crate::engine::external_diff::{check_rel_path, workdir_file};
+use crate::engine::git_cli::{run_git, run_git_code, run_git_stdin};
+use crate::engine::svn_lock;
 use crate::error::{GitError, Result};
 use git2::{DiffOptions, IndexEntry, Repository};
 use serde::Serialize;
@@ -455,4 +457,42 @@ fn not_text_reason(
         return Ok(Some((NotTextReason::Lfs, None)));
     }
     Ok(None)
+}
+
+/// ③ 一边删一边改的二选一：保留修改后的文件（`add`），或删除它（`rm`），**立即暂存**（spec §4.1 ③）。
+///
+/// - 路径为空直接拒绝：git 把空 pathspec 当成「全部」，`ops.rs` 出过这种事故。
+/// - 必须加 `--literal-pathspecs`：只写 `--` 时 `f[1].txt` 仍按模式匹配，会连 `f1.txt` 一起处理。
+/// - 执行前重新读 index：仍是 DU / UD 才继续；保留时工作区文件必须存在且是普通文件。
+///   前端手里的状态可能已经过期（别处解决掉了、文件被删了），不满足就报「状态已变化」。
+/// - SVN 混合仓库同步进行中时拒绝，和其他写操作一样（spec §5.1）。
+pub fn resolve_delete_modify(repo: &str, file: &str, keep: bool) -> Result<()> {
+    if file.is_empty() {
+        return Err(GitError::new("empty_path", "路径为空，不执行"));
+    }
+    check_rel_path(file)?;
+    svn_lock::assert_not_syncing(repo)?;
+    let changed = || {
+        GitError::new(
+            "conflict_state_changed",
+            format!("{file} 的状态已变化，请刷新"),
+        )
+    };
+    let info = read_conflicts(repo)?
+        .into_iter()
+        .find(|c| c.path == file)
+        .ok_or_else(changed)?;
+    if info.case != ConflictCase::DeleteModify {
+        return Err(changed());
+    }
+    if keep {
+        // 符号链接、父目录是链接、不在 worktree 内都会在这里报错
+        let repo_g = Repository::open(repo)?;
+        if workdir_file(&repo_g, file)?.is_none() {
+            return Err(changed());
+        }
+    }
+    let verb = if keep { "add" } else { "rm" };
+    run_git(repo, &["--literal-pathspecs", verb, "--", file])?;
+    Ok(())
 }

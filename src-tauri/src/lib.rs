@@ -30,6 +30,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::diff::read_diff,
             commands::conflict::read_conflicts,
+            commands::conflict::resolve_delete_modify,
             commands::custom::open_custom_commands_config,
             commands::custom::read_custom_commands,
             commands::custom::run_custom_command,

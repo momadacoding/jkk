@@ -878,6 +878,7 @@ export function RepoTab({
                 onBaselineBranch={isProtectedBaseline(state.head, state.capabilities)}
                 externalTools={externalToolsMenu}
                 conflicts={state.conflicts}
+                onResolveDeleteModify={(file, keep) => runAndRefresh('resolve_delete_modify', { file, keep }, async () => { await refreshStatus(state.path!); await refreshDiff(state.path!, 'workdir') })}
               />
             )}
           </Panel>

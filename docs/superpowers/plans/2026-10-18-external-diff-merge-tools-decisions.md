@@ -18,7 +18,7 @@
 | 6 冲突文件的 HEAD 对比工作区 diff | ✅ 完成 | 改 `engine/diff.rs`（`fill_conflicted`、`readable_only` 放行冲突条目）；测试 `tests/fixtures.rs`（+3） | fmt / clippy 无告警；`cargo test -j 4 --no-fail-fast` 60 个二进制 965 例全过 |
 | 7 外部 merge 命令与各侧标题 | ✅ 完成 | `engine/external_merge.rs`、`commands/external.rs` 加 `open_external_merge`；`external_diff.rs` 抽出 `workdir_file` 等共用函数；测试 `tests/external_merge.rs`（20） | fmt / clippy 无告警；`cargo test -j 4 --no-fail-fast` 61 个二进制 985 例全过；`pnpm tauri dev` 实测并到 Task 8 |
 | 8 前端冲突提示与 merge 入口 | ✅ 代码完成（真实窗口实测并入 Task 12） | `src/engine/conflictView.ts`、`src/components/ConflictNotice.tsx`；改 `types.ts`、`externalTools.ts`（`mergeMenuEntries`）、`externalToolItems.ts`（`externalMergeItems`、`onMerge`）、`externalToolsStore.ts`（`openExternalMerge`）、`repoStore.ts`（`conflicts`、`refreshConflicts`）、`LocalChangesView.tsx`、`RepoTab.tsx`、`styles.css`；测试 `conflictView.test.ts`（13）、`repoStoreConflicts.test.ts`（4）、`LocalChangesView.test.tsx`（+8） | pnpm build 通过；pnpm test 47 文件 691 例全过 |
-| 9 DU / UD 二选一 | 未开始 | | |
+| 9 DU / UD 二选一 | ✅ 代码完成（真实窗口实测并入 Task 12） | `conflicts.rs` 加 `resolve_delete_modify`、命令 `resolve_delete_modify`；`LocalChangesView`（确认框）、`ConflictNotice`、`RepoTab`；测试 `tests/conflicts.rs`（+11）、`LocalChangesView.test.tsx`（+4） | fmt / clippy 无告警；`cargo test -j 4 --no-fail-fast` 61 个二进制 996 例全过；pnpm build 通过，pnpm test 47 文件 695 例全过 |
 | 10 merge driver 检查（后端） | 未开始 | | |
 | 11 横幅与合并入口前的确认 | 未开始 | | |
 | 12 用户文档、E2E 清单与最终验证 | 未开始 | | |
@@ -306,3 +306,29 @@
 
 - 前端没有新的 git 写操作；Stage 按钮走现有的 `stage` 命令，必须用户点。外部 merge 只经 `open_external_merge` 走 Task 7 的后端流程，后端打开前还会重新读一遍冲突状态。
 - 冲突信息的写回有代次闸（key `conflicts`），冲突在外面解决之后晚到的旧结果不会把冲突写回来（`repoStoreConflicts.test.ts` 第 3 例）。
+
+### Task 9
+
+#### 偏离计划
+
+- Ruling：`svn_write_guard.rs` 不改 —— 它扫描的是 `src/vcs/svn.rs` 里 `impl Vcs for SvnGitBackend` 的方法，新命令不经过 `Vcs` trait，直接调 engine，不在扫描范围内；守卫由 `resolve_delete_modify` 自己调用 `svn_lock::assert_not_syncing` 承担，`refused_while_sync_lock_held` 断言被拒绝（code `sync_in_progress`）且 index 和工作区都没动 —— 代价：以后有人把这个函数挪进 `Vcs` trait 时要记得归类。
+- Ruling：除了空路径（`empty_path`），还用 `check_rel_path` 拒绝绝对路径、盘符和 `..`（`external_tool_bad_path`）—— 防止路径逃出仓库 —— 代价：无。
+- Ruling：「状态已变化」统一用 code `conflict_state_changed`：路径已经不是冲突、冲突不是 DU / UD（例如 UU）、保留时工作区文件不存在。保留时文件是链接或父目录是链接，沿用 `workdir_file` 的 `external_tool_not_regular` —— 代价：无。
+- Ruling：删除确认框放在 `LocalChangesView` 里（`useConfirm`），不放 `RepoTab` —— 组件测试能直接覆盖「取消就不调用」；标题 `删除 <文件>？`，正文 `<文件> 会从工作区删除，并立即暂存这次删除；修改过的那一版不会保留。`，确认按钮 `删除文件`、`danger` —— 代价：只是文案。
+- Ruling：RepoTab 沿用现有的 `runAndRefresh` 调 `resolve_delete_modify`（与 stage / unstage 同一条路径，在组件里 invoke），没有另加 store 函数 —— 与周围代码一致，不在本任务里重构 —— 代价：无。
+- 计划之外多加的测试：`keep_resolves_ud_and_delete_resolves_du`、`dash_and_chinese_path_resolves`、`escaping_path_rejected`、`not_delete_modify_rejected`；`literal_pathspec_spares_lookalike` 同时覆盖 keep；组件测试「没接回调时不显示这两个按钮」、「确认之后才调用 keep = false」。
+
+#### 计划的错误
+
+- 无。
+
+#### 计划没写的坑
+
+- 实测（git 2.51.2）：`git --literal-pathspecs rm -- <path>` 对 UD 条目不需要 `-f`，退出 0，index 里变成 `D`。
+- 写 fixture 时亲手踩到了 spec 要防的坑：`git rm -q 'f[1].txt'` 不加 literal 时把旁边的 `f1.txt` 一起删了。测试 fixture 里的删除也一律用 `--literal-pathspecs`。
+
+#### 为什么这么改是安全的
+
+- 写操作只有 `git --literal-pathspecs add|rm -- <file>`，走 `run_git`；空路径在任何 git 调用之前拒绝，`--literal-pathspecs` 保证 `f[1].txt` 不会匹配 `f1.txt`（`literal_pathspec_spares_lookalike` 断言 `f1.txt` 的内容和状态都不变）。
+- 执行前重新读 index 复核，状态不符就不执行；删除必须先在确认框里确认，「保留」不弹框（spec 原文）。
+- 所有测试都在 `TempDir` fixture 里跑。

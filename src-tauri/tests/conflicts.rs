@@ -650,3 +650,182 @@ fn chinese_space_bracket_dash_path() {
     assert_eq!(c.reason, Some(NotTextReason::BinaryAttr));
     assert!(c.same_as_head);
 }
+
+// ---------- ③ 保留 / 删除 ----------
+
+/// 一边删一边改。`we_delete` 为真时 main 删、feat 改（DU），否则 main 改、feat 删（UD）。
+/// 删除一律用 literal pathspec：`git rm 'f[1].txt'` 会把 `f1.txt` 一起删掉。
+fn delete_modify(dir: &Path, file: &str, we_delete: bool) {
+    write(dir, file, b"keep\n");
+    commit_all(dir, "base");
+    git(dir, &["checkout", "-q", "-b", "feat"]);
+    let delete = |dir: &Path| {
+        git(dir, &["--literal-pathspecs", "rm", "-q", "--", file]);
+        git(dir, &["commit", "-q", "-m", "del"]);
+    };
+    let modify = |dir: &Path| {
+        write(dir, file, b"changed\n");
+        commit_all(dir, "mod");
+    };
+    // feat 做的是 main 的另一半
+    if we_delete {
+        modify(dir)
+    } else {
+        delete(dir)
+    }
+    git(dir, &["checkout", "-q", "main"]);
+    if we_delete {
+        delete(dir)
+    } else {
+        modify(dir)
+    }
+    assert!(!git_out(dir, &["merge", "feat"]).status.success());
+}
+
+fn unmerged(dir: &Path) -> String {
+    git(dir, &["ls-files", "-u"])
+}
+
+#[test]
+fn keep_resolves_du() {
+    let dir = repo();
+    delete_modify(dir.path(), "d.txt", true);
+    assert_eq!(only(dir.path()).code, "DU");
+    conflicts::resolve_delete_modify(p(dir.path()), "d.txt", true).unwrap();
+    assert_eq!(unmerged(dir.path()), "");
+    assert_eq!(git(dir.path(), &["show", ":d.txt"]), "changed");
+    assert_eq!(git(dir.path(), &["status", "--short"]), "A  d.txt");
+}
+
+#[test]
+fn delete_resolves_ud() {
+    let dir = repo();
+    delete_modify(dir.path(), "d.txt", false);
+    assert_eq!(only(dir.path()).code, "UD");
+    conflicts::resolve_delete_modify(p(dir.path()), "d.txt", false).unwrap();
+    assert_eq!(unmerged(dir.path()), "");
+    assert!(!dir.path().join("d.txt").exists());
+    assert_eq!(git(dir.path(), &["status", "--short"]), "D  d.txt");
+}
+
+#[test]
+fn keep_resolves_ud_and_delete_resolves_du() {
+    let dir = repo();
+    delete_modify(dir.path(), "d.txt", false);
+    conflicts::resolve_delete_modify(p(dir.path()), "d.txt", true).unwrap();
+    assert_eq!(unmerged(dir.path()), "");
+    assert_eq!(git(dir.path(), &["show", ":d.txt"]), "changed");
+
+    let dir = repo();
+    delete_modify(dir.path(), "d.txt", true);
+    conflicts::resolve_delete_modify(p(dir.path()), "d.txt", false).unwrap();
+    assert_eq!(unmerged(dir.path()), "");
+    assert!(!dir.path().join("d.txt").exists());
+}
+
+/// `f[1].txt` 按 pathspec 模式会匹配到 `f1.txt`；必须按字面量处理，旁边的文件不受影响。
+#[test]
+fn literal_pathspec_spares_lookalike() {
+    let dir = repo();
+    write(dir.path(), "f1.txt", b"one\n");
+    commit_all(dir.path(), "seed");
+    delete_modify(dir.path(), "f[1].txt", false);
+    write(dir.path(), "f1.txt", b"one modified\n");
+    let before = git(dir.path(), &["status", "--short", "--", ":(literal)f1.txt"]);
+    assert_eq!(before, "M f1.txt");
+
+    conflicts::resolve_delete_modify(p(dir.path()), "f[1].txt", false).unwrap();
+    assert_eq!(
+        fs::read(dir.path().join("f1.txt")).unwrap(),
+        b"one modified\n"
+    );
+    assert_eq!(
+        git(dir.path(), &["status", "--short", "--", ":(literal)f1.txt"]),
+        before
+    );
+    assert_eq!(unmerged(dir.path()), "");
+
+    // keep 同理：不能把 f1.txt 的改动一起暂存
+    let dir = repo();
+    write(dir.path(), "f1.txt", b"one\n");
+    commit_all(dir.path(), "seed");
+    delete_modify(dir.path(), "f[1].txt", true);
+    write(dir.path(), "f1.txt", b"one modified\n");
+    conflicts::resolve_delete_modify(p(dir.path()), "f[1].txt", true).unwrap();
+    assert_eq!(
+        git(dir.path(), &["status", "--short", "--", ":(literal)f1.txt"]),
+        "M f1.txt"
+    );
+}
+
+#[test]
+fn dash_and_chinese_path_resolves() {
+    let dir = repo();
+    let file = "目录 a/-x [1].txt";
+    delete_modify(dir.path(), file, true);
+    conflicts::resolve_delete_modify(p(dir.path()), file, true).unwrap();
+    assert_eq!(unmerged(dir.path()), "");
+}
+
+#[test]
+fn empty_path_rejected() {
+    let dir = repo();
+    delete_modify(dir.path(), "d.txt", false);
+    for keep in [true, false] {
+        let err = conflicts::resolve_delete_modify(p(dir.path()), "", keep).unwrap_err();
+        assert_eq!(err.code, "empty_path");
+    }
+    assert_ne!(unmerged(dir.path()), "", "什么都不能动");
+}
+
+#[test]
+fn escaping_path_rejected() {
+    let dir = repo();
+    delete_modify(dir.path(), "d.txt", false);
+    for bad in ["../d.txt", "C:/d.txt", "/d.txt"] {
+        assert!(conflicts::resolve_delete_modify(p(dir.path()), bad, false).is_err());
+    }
+    assert_ne!(unmerged(dir.path()), "");
+}
+
+/// 执行前状态已经变了（在外面解决掉了）：拒绝，不再执行。
+#[test]
+fn state_changed_rejected() {
+    let dir = repo();
+    delete_modify(dir.path(), "d.txt", false);
+    git(dir.path(), &["add", "d.txt"]);
+    let err = conflicts::resolve_delete_modify(p(dir.path()), "d.txt", false).unwrap_err();
+    assert_eq!(err.code, "conflict_state_changed");
+    assert!(dir.path().join("d.txt").exists(), "不能删掉已经解决的文件");
+}
+
+/// 不是一边删一边改的冲突（UU）也不能走这条路。
+#[test]
+fn not_delete_modify_rejected() {
+    let dir = repo();
+    assert_eq!(text_conflict(dir.path(), None, &[]), 1);
+    let err = conflicts::resolve_delete_modify(p(dir.path()), "a.txt", true).unwrap_err();
+    assert_eq!(err.code, "conflict_state_changed");
+    assert_ne!(unmerged(dir.path()), "");
+}
+
+#[test]
+fn keep_missing_file_rejected() {
+    let dir = repo();
+    delete_modify(dir.path(), "d.txt", true);
+    fs::remove_file(dir.path().join("d.txt")).unwrap();
+    let err = conflicts::resolve_delete_modify(p(dir.path()), "d.txt", true).unwrap_err();
+    assert_eq!(err.code, "conflict_state_changed");
+    assert_ne!(unmerged(dir.path()), "");
+}
+
+#[test]
+fn refused_while_sync_lock_held() {
+    let dir = repo();
+    delete_modify(dir.path(), "d.txt", false);
+    let _lock = app_lib::engine::svn_lock::acquire(p(dir.path()), "test-op").unwrap();
+    let err = conflicts::resolve_delete_modify(p(dir.path()), "d.txt", false).unwrap_err();
+    assert_eq!(err.code, "sync_in_progress");
+    assert_ne!(unmerged(dir.path()), "");
+    assert!(dir.path().join("d.txt").exists());
+}
