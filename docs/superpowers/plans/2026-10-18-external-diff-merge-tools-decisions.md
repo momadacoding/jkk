@@ -19,7 +19,7 @@
 | 7 外部 merge 命令与各侧标题 | ✅ 完成 | `engine/external_merge.rs`、`commands/external.rs` 加 `open_external_merge`；`external_diff.rs` 抽出 `workdir_file` 等共用函数；测试 `tests/external_merge.rs`（20） | fmt / clippy 无告警；`cargo test -j 4 --no-fail-fast` 61 个二进制 985 例全过；`pnpm tauri dev` 实测并到 Task 8 |
 | 8 前端冲突提示与 merge 入口 | ✅ 代码完成（真实窗口实测并入 Task 12） | `src/engine/conflictView.ts`、`src/components/ConflictNotice.tsx`；改 `types.ts`、`externalTools.ts`（`mergeMenuEntries`）、`externalToolItems.ts`（`externalMergeItems`、`onMerge`）、`externalToolsStore.ts`（`openExternalMerge`）、`repoStore.ts`（`conflicts`、`refreshConflicts`）、`LocalChangesView.tsx`、`RepoTab.tsx`、`styles.css`；测试 `conflictView.test.ts`（13）、`repoStoreConflicts.test.ts`（4）、`LocalChangesView.test.tsx`（+8） | pnpm build 通过；pnpm test 47 文件 691 例全过 |
 | 9 DU / UD 二选一 | ✅ 代码完成（真实窗口实测并入 Task 12） | `conflicts.rs` 加 `resolve_delete_modify`、命令 `resolve_delete_modify`；`LocalChangesView`（确认框）、`ConflictNotice`、`RepoTab`；测试 `tests/conflicts.rs`（+11）、`LocalChangesView.test.tsx`（+4） | fmt / clippy 无告警；`cargo test -j 4 --no-fail-fast` 61 个二进制 996 例全过；pnpm build 通过，pnpm test 47 文件 695 例全过 |
-| 10 merge driver 检查（后端） | 未开始 | | |
+| 10 merge driver 检查（后端） | ✅ 完成 | `engine/merge_drivers.rs`、命令 `check_merge_drivers`；`conflicts.rs` 的 `parse_merge_config` 改为 `pub(crate)`；测试 `tests/merge_drivers.rs`（22） | fmt / clippy 无告警；`cargo test -j 4 --no-fail-fast` 62 个二进制 1018 例全过 |
 | 11 横幅与合并入口前的确认 | 未开始 | | |
 | 12 用户文档、E2E 清单与最终验证 | 未开始 | | |
 
@@ -332,3 +332,30 @@
 - 写操作只有 `git --literal-pathspecs add|rm -- <file>`，走 `run_git`；空路径在任何 git 调用之前拒绝，`--literal-pathspecs` 保证 `f[1].txt` 不会匹配 `f1.txt`（`literal_pathspec_spares_lookalike` 断言 `f1.txt` 的内容和状态都不变）。
 - 执行前重新读 index 复核，状态不符就不执行；删除必须先在确认框里确认，「保留」不弹框（spec 原文）。
 - 所有测试都在 `TempDir` fixture 里跑。
+
+### Task 10
+
+#### 偏离计划
+
+- Ruling：`DriverState` 序列化成带 `kind` 标签的对象（`{ kind: 'ok' }`、`{ kind: 'programMissing', program }`），不用 serde 默认的外部标签 —— 单元变体和结构变体混在一起时，默认形状一会儿是字符串一会儿是对象，前端不好判 —— 代价：无。
+- Ruling：`check_count` 按仓库分开计，签名是 `check_count(repo: &str) -> usize`，不是计划写的无参全局计数 —— 同一个测试二进制里的测试并行跑，全局计数会被别的测试加上去 —— 代价：无。
+- Ruling：fingerprint 在计划的五项之外多加两项：index 里**所有路径**（不含 oid），以及根目录 `.gitattributes` 的 mtime（不管是否被跟踪）—— 前者：仓库里原来没有场景文件、后来新增一个时，规则没变也必须重新算，否则缺 driver 永远报不出来（`cache_invalidated_by_new_tracked_file`）；后者：刚新建、还没 `git add` 的根 `.gitattributes` 已经生效 —— 代价：每次检查要遍历一遍 index（libgit2 内存操作，5 万文件量级在毫秒级，Task 12 实测）；暂存一个**新**文件会让缓存失效一次。子目录里**未跟踪**的 `.gitattributes` 仍然不在指纹里，要等别的变化才会重新算。
+- Ruling：`core.attributesFile` 没设时，按 git 的默认位置 `$XDG_CONFIG_HOME/git/attributes`（没有 XDG 时 `~/.config/git/attributes`）取 mtime —— 计划只写了 `core.attributesFile` —— 代价：无。
+- Ruling：`merge=lfs` 不算需要检查的自定义名字 —— `git lfs track` 往每个 LFS 仓库都写 `merge=lfs`，git-lfs 从来不定义 `merge.lfs` driver，git 一直是退回文本合并 pointer 文件（Task 5 实测）；不排除的话，每个 LFS 仓库都会挂一条「Unity 场景会被写坏」的红色横幅、每次合并都要确认。LFS 冲突由冲突显示的 ④（`filter=lfs`）兜住（`lfs_standard_attr_not_reported`，先删掉排除项确认它失败，再恢复）—— 代价：如果有人真的给 LFS 配了一个叫 `lfs` 的 merge driver 又配坏了，这里不会提示。
+- Ruling：程序检查只认 Rust 意义上的绝对路径（Windows 上要带盘符）；`/c/Program Files/...` 这种 MSYS 路径按「不是绝对路径」跳过，算 Ok —— spec §4.6 第 3 点「不是绝对路径就跳过」 —— 代价：用 MSYS 路径写的失效 driver 报不出来。
+- 计划之外多加的测试：`sample_paths_are_capped_at_three`、`quoted_program_path_with_spaces`、`relative_program_is_not_checked`、`core_attributes_file_counts`、`merge_default_custom_is_checked`、`merge_default_builtin_is_not_reported`、`check_failure_is_reported_as_incomplete`、`cache_invalidated_by_config_change`、`cache_invalidated_by_new_tracked_file`、`lfs_standard_attr_not_reported`。
+- 过程说明：本 Task 的 21 个测试写好后没有单独跑一次看失败（模块不存在，只会是编译错误），实现后一次通过；之后补的 `lfs_standard_attr_not_reported` 按 RED → GREEN 验证过。
+
+#### 计划的错误
+
+- 无。
+
+#### 计划没写的坑
+
+- **实测结论（`merge_tree_and_stash_apply_invoke_driver`）**：`git merge-tree --write-tree -z --merge-base=<base> <ours> <theirs>`（与 `svn_deliver.rs` 的 replay 参数相同）和 `git stash apply` **都会调用**自定义 merge driver。所以交付慢路径和 stash apply / pop 都属于「会触发合并的入口」，Task 11 都要拦。
+- 测试进程除了 `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_NOSYSTEM`，还要把 `XDG_CONFIG_HOME` 指到空目录，否则本机的全局属性文件会混进 `check-attr` 的结果。
+
+#### 为什么这么改是安全的
+
+- 只读：`config --get-regexp`、`rev-parse --git-path`、`ls-files -z`、`check-attr --stdin -z` 各一次，不改用户的 git 配置（spec「不自动修改用户的 git 配置」）。
+- 检查失败一律写进 `incomplete`，不会显示成配置正常；只缓存成功的结果。

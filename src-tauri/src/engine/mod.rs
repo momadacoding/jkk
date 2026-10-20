@@ -12,6 +12,7 @@ pub mod git_cli;
 pub mod github;
 pub mod graph;
 pub mod launcher;
+pub mod merge_drivers;
 pub mod ops;
 pub mod path;
 pub mod proc;

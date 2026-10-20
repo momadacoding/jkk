@@ -186,7 +186,7 @@ pub fn merge_config(repo: &str) -> Result<MergeConfig> {
 
 /// 每条记录是 `key\nvalue\0`，没有值的键是 `key\0`。同一个键出现多次时后面的覆盖前面的，
 /// 和 git 读配置的语义一致。
-fn parse_merge_config(raw: &str) -> MergeConfig {
+pub(crate) fn parse_merge_config(raw: &str) -> MergeConfig {
     let mut cfg = MergeConfig::default();
     for rec in raw.split('\0').filter(|r| !r.is_empty()) {
         let (key, value) = match rec.split_once('\n') {

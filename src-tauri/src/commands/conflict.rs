@@ -12,3 +12,9 @@ pub fn read_conflicts(path: String) -> Result<Vec<ConflictInfo>> {
 pub fn resolve_delete_modify(path: String, file: String, keep: bool) -> Result<()> {
     conflicts::resolve_delete_modify(&path, &file, keep)
 }
+
+/// 本机 merge driver 配置检查（spec §4.6）。不报错：检查失败写在 `incomplete` 里。
+#[tauri::command(async)]
+pub fn check_merge_drivers(path: String) -> crate::engine::merge_drivers::DriverReport {
+    crate::engine::merge_drivers::check_merge_drivers(&path)
+}
