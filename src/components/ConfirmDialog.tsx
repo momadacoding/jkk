@@ -19,6 +19,11 @@ export interface ConfirmRequest {
   /** 危险操作，确认按钮变红。 */
   danger?: boolean
   /**
+   * 打开时焦点落在「取消」上，回车不会误确认。用于默认按钮必须是取消的场合
+   * （spec §4.6：缺 merge driver 时合并前的确认）。
+   */
+  focusCancel?: boolean
+  /**
    * 点确认后要跑的活。传了的话弹框会等它跑完再关，期间显示进度。
    *
    * 涉及网络的操作必须走这条路：`git push --delete` 到 GitHub 实测四五秒，
@@ -75,6 +80,7 @@ function RemoteGlyph() {
 
 function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
   const confirmRef = useRef<HTMLButtonElement>(null)
+  const cancelRef = useRef<HTMLButtonElement>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -101,7 +107,10 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
   }
 
   // 焦点必须落进弹框里，回车和 Esc 才有着落
-  useEffect(() => { confirmRef.current?.focus() }, [])
+  useEffect(() => {
+    if (request.focusCancel && cancelRef.current) cancelRef.current.focus()
+    else confirmRef.current?.focus()
+  }, [])
 
   useEffect(() => {
     // 活跑起来之后 Esc 不再关闭，关掉只会让用户以为取消了
@@ -143,7 +152,7 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
         )}
 
         <div className="dialog-actions">
-          {!request.notice && <button disabled={busy} onClick={() => finish(false)}>Cancel</button>}
+          {!request.notice && <button ref={cancelRef} disabled={busy} onClick={() => finish(false)}>Cancel</button>}
           <button
             ref={confirmRef}
             className={request.danger ? 'primary danger' : 'primary'}

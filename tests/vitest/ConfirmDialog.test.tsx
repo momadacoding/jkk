@@ -191,3 +191,22 @@ describe('useConfirm', () => {
     expect(screen.queryByText('处理中…')).toBeNull()
   })
 })
+
+describe('focusCancel', () => {
+  it('危险操作要求默认按钮是取消：焦点落在 Cancel 上，回车不会误确认', async () => {
+    const { confirm } = mount()
+    let result!: Promise<boolean>
+    act(() => {
+      result = confirm()({ title: '合并前确认', message: 'm', danger: true, confirmLabel: '仍然继续', focusCancel: true })
+    })
+    await waitFor(() => expect(document.activeElement).toBe(button('Cancel')))
+    fireEvent.click(button('Cancel'))
+    await expect(result).resolves.toBe(false)
+  })
+
+  it('不设时焦点照旧在确认按钮上', async () => {
+    const { confirm } = mount()
+    act(() => { void confirm()({ title: 't', message: 'm', confirmLabel: 'Go' }) })
+    await waitFor(() => expect(document.activeElement).toBe(button('Go')))
+  })
+})

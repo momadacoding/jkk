@@ -2120,3 +2120,23 @@ body {
 .conflict-notice-actions { display: flex; gap: 8px; margin-top: 8px; }
 .conflict-notice-actions button.danger { color: #f3cdcd; border-color: #7a3030; }
 .conflict-same-as-head { padding: 10px 12px; color: #aaa; font-size: 12px; }
+
+/* ---------- merge driver 配置问题（仓库顶部） ---------- */
+
+.banner-driver {
+  padding: 6px 12px;
+  font-size: 12px;
+  border-bottom: 1px solid transparent;
+}
+.banner-driver.danger { background: #4a1f1f; color: #f3cdcd; border-bottom-color: #7a3030; }
+.banner-driver.warning { background: #4a3d16; color: #f0e2b8; border-bottom-color: #6b5a20; }
+.banner-driver.info { background: #2a2d33; color: #c8ccd4; border-bottom-color: #3a3f47; }
+.banner-driver-example {
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  background: rgba(0, 0, 0, 0.25);
+  font-family: Consolas, 'Courier New', monospace;
+  font-size: 11px;
+  white-space: pre-wrap;
+  user-select: text;
+}

@@ -37,6 +37,8 @@ import { isProtectedBaseline, visibleSections } from '../engine/capabilities'
 import { askConfirm } from '../engine/confirm'
 import { countConflicts, repoStateBanner } from '../engine/conflicts'
 import { usePrompt } from './PromptDialog'
+import { MergeDriverBanner } from './MergeDriverBanner'
+import { mergeRiskConfirm, triggersMerge } from '@/engine/mergeDrivers'
 import { useConfirm } from './ConfirmDialog'
 import { save } from '@tauri-apps/plugin-dialog'
 import type { CommitNode } from '../engine/types'
@@ -123,7 +125,7 @@ export function RepoTab({
   repoPath, openPaths, onOpenInNewTab, onRepoRemoved,
 }: RepoTabProps) {
   const {
-    state, openRepo, refreshHead, refreshGraph, refreshStatus, refreshWorktrees,
+    state, openRepo, refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers,
     refreshDiff, refreshUpstream, refreshStashes, refreshPullRequests,
     refreshSvnSync, refreshSvnEol, refreshSvnSyncState, checkSvnSyncIfChanged, fetchSvnLog, refreshSvnAudit, auditSvnIfDue,
     selectCommit, clearError, reportError, wantedDiffScope,
@@ -145,9 +147,28 @@ export function RepoTab({
   // 交付对话框的提交信息草稿：没交付成功时关掉框，下次打开还在（spec §13）
   const deliverDraft = useRef('')
 
+  /**
+   * 应用发起会触发合并的操作之前，重新检查 merge driver（spec §4.6）。
+   *
+   * 只在「完全没配」时弹危险确认框，默认按钮是取消；返回 false 时调用方不再继续。
+   * 用刚查到的结果，不用 state 里的旧值：用户可能刚改完 git 配置。
+   * 检查本身失败（invoke 抛错）时放行并报错——检查未完成不等于有风险，拦住会让合并做不了。
+   */
+  const guardMerge = useCallback(async (): Promise<boolean> => {
+    const path = state.path
+    if (!path) return false
+    try {
+      const request = mergeRiskConfirm(await refreshMergeDrivers(path))
+      return request ? await confirm(request) : true
+    } catch (err) {
+      reportError(err)
+      return true
+    }
+  }, [state.path, refreshMergeDrivers, confirm, reportError])
+
   useRepoEffects(
     state,
-    { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, refreshSvnSyncState, auditSvnIfDue, wantedDiffScope },
+    { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, refreshSvnSyncState, auditSvnIfDue, wantedDiffScope },
     viewMode,
   )
 
@@ -202,19 +223,22 @@ export function RepoTab({
 
   const runAndRefresh = useCallback(async (cmd: string, args: Record<string, unknown>, refresh: () => Promise<void>) => {
     if (!state.path) return
+    // stash apply / pop 也会调用 merge driver（Task 10 实测）
+    if (triggersMerge(cmd) && !(await guardMerge())) return
     try {
       await invoke(cmd, { path: state.path, ...args })
       await refresh()
     } catch (err) {
       reportError(err)
     }
-  }, [state.path, reportError])
+  }, [state.path, reportError, guardMerge])
 
   /** 工具栏动作：跑完把所有受影响的状态刷一遍。 */
   const runToolbar = useCallback(async (command: string, args: Record<string, unknown>) => {
     const path = state.path
     if (!path) return
     const before = state.headHash
+    if (triggersMerge(command) && !(await guardMerge())) return
     try {
       await invoke(command, { path, ...args })
       // fetch/pull/push/stash 会同时影响图、状态、上游计数和 stash 列表
@@ -235,7 +259,7 @@ export function RepoTab({
     } catch (err) {
       reportError(err)
     }
-  }, [state.path, state.headHash, refreshHead, refreshGraph, refreshStatus, refreshUpstream, refreshStashes, refreshPullRequests, reportError])
+  }, [state.path, state.headHash, refreshHead, refreshGraph, refreshStatus, refreshUpstream, refreshStashes, refreshPullRequests, reportError, guardMerge])
 
   /**
    * graph 行右键菜单的调度。
@@ -613,6 +637,7 @@ export function RepoTab({
     repoPath,
     syncState: () => state.svnSyncState,
     confirm,
+    guardMerge,
     clearError,
     reportError,
     refreshSvnSyncState,
@@ -628,6 +653,7 @@ export function RepoTab({
     syncState: () => state.svnSyncState,
     deliver,
     confirm,
+    guardMerge,
     clearError,
     reportError,
     refreshSvnSyncState,
@@ -735,6 +761,7 @@ export function RepoTab({
         onSyncOutAction={(id) => void handleSyncOutAction(id)}
         onSvnUpdate={() => void handleSvnUpdate()}
       />
+      <MergeDriverBanner report={state.mergeDrivers} />
       {state.error && (
         <div className="banner-error">
           <span>{state.error}</span>

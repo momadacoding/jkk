@@ -29,6 +29,7 @@ import {
 
 import { toErrorCode, toErrorMessage } from '../engine/errors'
 import { createLatestGate } from '@/engine/latestGate'
+import type { DriverReport } from '@/engine/mergeDrivers'
 import type {
   Health,
   InitReport,
@@ -120,6 +121,11 @@ export interface RepoState {
    * 不能把失败当成空数组——那样界面会以为这些文件不是冲突。
    */
   conflicts: ConflictInfo[] | null
+  /**
+   * 本机 merge driver 配置检查（spec §4.6）。`null` = 还没读到，不挂横幅。
+   * 打开仓库和每次 `repo-changed` 都刷新；后端有缓存，`.gitattributes` 没变时很便宜。
+   */
+  mergeDrivers: DriverReport | null
   diff: DiffData
   selectedId: string | null
   loading: boolean
@@ -195,6 +201,7 @@ const initialState: RepoState = {
   capabilities: ALL_CAPABILITIES,
   status: { staged: [], unstaged: [] },
   conflicts: null,
+  mergeDrivers: null,
   diff: { files: [] },
   selectedId: null,
   loading: false,
@@ -437,6 +444,8 @@ export function useRepoStore() {
       setState((s) => ({ ...s, worktrees: wts }))
       await refreshUpstream(path)
       await refreshStashes(path)
+      // 不 await：大仓库第一次要扫全部文件的属性，横幅晚一点出现无所谓
+      void refreshMergeDrivers(path).catch((err) => console.warn('merge driver 检查失败：', err))
       // 不 await：这一步要走网络（gh 实测一两秒），让它拖住打开仓库的收尾没有意义。
       // 不支持 PR 的后端连这次 gh 调用都省掉——界面上没有任何地方会用到结果。
       if (caps.pullRequests) void refreshPullRequests(path)
@@ -559,6 +568,16 @@ export function useRepoStore() {
       if (refreshGate.isLatest(token, 'conflicts')) setState((s) => ({ ...s, conflicts: null }))
       throw err
     }
+  }
+
+  /**
+   * 重新检查 merge driver 并写回横幅。返回这次的结果：合并前的确认要用**刚查到的**，
+   * 不能用 state 里可能是几秒前的那份。`samePath` 守卫同 `refreshSvnEol`。
+   */
+  const refreshMergeDrivers = async (path: string): Promise<DriverReport> => {
+    const report = await invoke<DriverReport>('check_merge_drivers', { path })
+    setState((s) => (samePath(s.path ?? '', path) ? { ...s, mergeDrivers: report } : s))
+    return report
   }
 
   const refreshWorktrees = async (path: string) => {
@@ -794,6 +813,7 @@ export function useRepoStore() {
     refreshGraph,
     refreshStatus,
     refreshWorktrees,
+    refreshMergeDrivers,
     refreshDiff,
     refreshUpstream,
     refreshStashes,
@@ -819,6 +839,8 @@ export interface RepoRefreshers {
   refreshGraph: (path: string) => Promise<void>
   refreshStatus: (path: string) => Promise<void>
   refreshWorktrees: (path: string) => Promise<void>
+  /** `.gitattributes` 或 git 配置变了要重查；后端按指纹缓存，没变时不重扫。 */
+  refreshMergeDrivers: (path: string) => Promise<DriverReport>
   refreshDiff: (path: string, scope: string) => Promise<void>
   refreshUpstream: (path: string) => Promise<void>
   refreshStashes: (path: string) => Promise<void>
@@ -837,7 +859,7 @@ export function useRepoEffects(
   refreshers: RepoRefreshers,
   viewMode: string,
 ) {
-  const { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, refreshSvnSyncState, auditSvnIfDue } = refreshers
+  const { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, refreshSvnSyncState, auditSvnIfDue } = refreshers
   // svn 节点有两版本地基线时读两版之差（`range:`）；不在图上的选中（stash）照旧按 oid 读
   const diffScope = viewMode === 'changes'
     ? 'workdir'
@@ -867,6 +889,7 @@ export function useRepoEffects(
       // 外部 push/fetch 会改变领先落后数，命令行 stash 也要反映到面板上
       void refreshUpstream(path).catch(ignore)
       void refreshStashes(path).catch(ignore)
+      void refreshMergeDrivers(path).catch(ignore)
       if (diffScope) void refreshDiff(path, diffScope).catch(ignore)
       // §6.6.3 的**分层**：高频通道上只跑 O(1) 的第一档，变了才跑第二档。
       //

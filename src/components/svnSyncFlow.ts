@@ -26,6 +26,11 @@ export interface SvnSyncFlowDeps {
   /** 取**当前**的同步状态（横幅上的继续 / 放弃按它的 phase 选文案）。 */
   syncState: () => SyncState | SyncStateUnreadable | null
   confirm: (request: ConfirmRequest) => Promise<boolean>
+  /**
+   * 合并前的 merge driver 确认（spec §4.6）：更新 / 交付里的 rebase、补丁落回、merge-tree
+   * 都会调用 driver。返回 false 时什么都不做。必填：漏接一个入口就是缺陷。
+   */
+  guardMerge: () => Promise<boolean>
   clearError: () => void
   reportError: (err: unknown) => void
   refreshSvnSyncState: (path: string) => Promise<void>
@@ -85,6 +90,8 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
     // 当时的仓库，用户改好之后再点更新时它已经过时，还会和新横幅叠在一起（2026-09-30
     // E2E 场景 6 → 7）。重试就是新的一次：先清旧的，这次再失败自然会报新的
     d.clearError()
+    // 先于预览：预览要走网络，用户在这里取消的话那几秒白等
+    if (!(await d.guardMerge())) return
     let preview
     try {
       preview = await svnSyncInPreview(d.repoPath)
@@ -108,6 +115,8 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
   /** 横幅上的继续 / 放弃（spec §7.6）。 */
   const syncAction = async (id: SyncActionId) => {
     d.clearError() // 同 svnUpdate
+    // 「继续」会接着跑 rebase；「放弃」只是回退，不合并
+    if (id === 'syncContinue' && !(await d.guardMerge())) return
     const s = d.syncState()
     const phase = s && !('readError' in s) && s.unfinished ? s.unfinished.phase : 'start'
     const box: { outcome: SyncInOutcome | null } = { outcome: null }

@@ -20,7 +20,7 @@
 | 8 前端冲突提示与 merge 入口 | ✅ 代码完成（真实窗口实测并入 Task 12） | `src/engine/conflictView.ts`、`src/components/ConflictNotice.tsx`；改 `types.ts`、`externalTools.ts`（`mergeMenuEntries`）、`externalToolItems.ts`（`externalMergeItems`、`onMerge`）、`externalToolsStore.ts`（`openExternalMerge`）、`repoStore.ts`（`conflicts`、`refreshConflicts`）、`LocalChangesView.tsx`、`RepoTab.tsx`、`styles.css`；测试 `conflictView.test.ts`（13）、`repoStoreConflicts.test.ts`（4）、`LocalChangesView.test.tsx`（+8） | pnpm build 通过；pnpm test 47 文件 691 例全过 |
 | 9 DU / UD 二选一 | ✅ 代码完成（真实窗口实测并入 Task 12） | `conflicts.rs` 加 `resolve_delete_modify`、命令 `resolve_delete_modify`；`LocalChangesView`（确认框）、`ConflictNotice`、`RepoTab`；测试 `tests/conflicts.rs`（+11）、`LocalChangesView.test.tsx`（+4） | fmt / clippy 无告警；`cargo test -j 4 --no-fail-fast` 61 个二进制 996 例全过；pnpm build 通过，pnpm test 47 文件 695 例全过 |
 | 10 merge driver 检查（后端） | ✅ 完成 | `engine/merge_drivers.rs`、命令 `check_merge_drivers`；`conflicts.rs` 的 `parse_merge_config` 改为 `pub(crate)`；测试 `tests/merge_drivers.rs`（22） | fmt / clippy 无告警；`cargo test -j 4 --no-fail-fast` 62 个二进制 1018 例全过 |
-| 11 横幅与合并入口前的确认 | 未开始 | | |
+| 11 横幅与合并入口前的确认 | ✅ 代码完成（真实窗口实测并入 Task 12） | `src/engine/mergeDrivers.ts`、`src/components/MergeDriverBanner.tsx`；改 `repoStore.ts`（`mergeDrivers`、`refreshMergeDrivers`）、`RepoTab.tsx`（`guardMerge`）、`svnSyncFlow.ts`、`svnSyncOutFlow.ts`、`ConfirmDialog.tsx`（`focusCancel`）、`styles.css`；测试 `mergeDrivers.test.ts`（12）、`svnSyncFlow.test.ts`（+4）、`svnSyncOutFlow.test.ts`（+4）、`ConfirmDialog.test.tsx`（+2） | pnpm build 通过；pnpm test 48 文件 717 例全过 |
 | 12 用户文档、E2E 清单与最终验证 | 未开始 | | |
 
 ## 决策条目
@@ -359,3 +359,47 @@
 
 - 只读：`config --get-regexp`、`rev-parse --git-path`、`ls-files -z`、`check-attr --stdin -z` 各一次，不改用户的 git 配置（spec「不自动修改用户的 git 配置」）。
 - 检查失败一律写进 `incomplete`，不会显示成配置正常；只缓存成功的结果。
+
+### Task 11
+
+#### 偏离计划
+
+- Ruling：`driverBanners` 的返回值多一个可选字段 `example`（配置示例），没有把示例拼进 `text` —— 计划要求 `text` 逐字等于给定文案、「后面附上配置示例」；分开放，横幅里能用 `<pre>` 显示、方便复制 —— 代价：无。示例以 UnityYAMLMerge 为例，driver 名字换成实际缺的那个，程序路径写成占位 `<UnityYAMLMerge.exe 的完整路径>`（不同机器的 Unity 版本目录不同）。
+- Ruling：没有示例路径时（只来自 `merge.default`）文案写「一些文件」，不编造路径 —— 代价：无。
+- Ruling：`mergeRiskConfirm` 返回 engine 自己的 `MergeRiskConfirm`（与 `ConfirmRequest` 同名字段），不 import components 的类型 —— AGENTS.md §7.5 engine 不依赖组件层，`svnSyncIn.ts` 也是这个做法。文案：标题 `合并前确认`，正文 `本机 git 配置里没有定义 merge driver <名字…>，.gitattributes 却要求用它合并。`，警告条 `git 会退回逐行文本合并，往这些文件里写冲突标记，Unity 场景会被写坏。建议先按顶部横幅的示例配好 driver 再合并。` —— 代价：只是文案。
+- Ruling：`ConfirmDialog` 加可选的 `focusCancel` —— spec §4.6「默认按钮是『取消』」，原来的弹框总是把焦点放在确认按钮上，回车就确认了；不设时行为不变（`ConfirmDialog.test.tsx` 两例）—— 代价：无。
+- Ruling：用纯函数 `triggersMerge(command)` 判断，在 `runToolbar` 和 `runAndRefresh` 这两个统一出口里拦，不在每个调用点各写一遍 —— 新加一个会合并的入口只要走这两个出口就自动被拦 —— 代价：直接 `invoke` 而不走这两个出口的新代码会漏拦（下面的 grep 清单是核对手段）。
+- Ruling：SVN 两个流程的 `guardMerge` 是**必填**依赖；放在预览**之前**调用（预览要走网络，用户在这里取消就不用白等）；「继续」要过，「放弃 / 清理 / 停止」不合并、不过 —— 代价：无。
+- Ruling：`guardMerge` 里 `check_merge_drivers` 的 invoke 本身抛错时**放行**并报错 —— 后端的检查本身从不报错（失败写在 `incomplete` 里，也不拦，spec 只拦「完全没配」）；invoke 抛错是 IPC 层面的问题，拦住会让所有合并都做不了 —— 代价：极少数情况下缺 driver 没被拦住，但顶部会有错误条。
+- Ruling：`mergeDrivers` 在打开仓库时不 await 地刷新，`repo-changed` 时也刷新（后端有缓存）—— 代价：大仓库第一次打开时横幅晚一点出现。
+- 已有测试的调整：`svnSyncFlow` / `svnSyncOutFlow` 各有一例断言完整的步骤日志，现在 `clearError` 和预览之间多了 `guardMerge`，期望值随之更新（这是有意的新顺序，不是放宽断言）。
+
+#### 合并入口清单（grep 核对，2026-10-21）
+
+| 入口 | 命令 | 经过的出口 | 是否拦 |
+|---|---|---|---|
+| 工具栏 Pull / Pull (rebase) | `pull` | `Toolbar.onRun` → `runToolbar` | ✅ |
+| 提交右键 Cherry-pick | `cherry_pick` | `handleCommitAction` → `runToolbar` | ✅ |
+| 提交右键 Revert | `revert` | `handleCommitAction` → `runToolbar` | ✅ |
+| Stash 面板 Apply | `stash_apply` | `StashView.onApply` → `runAndRefresh` | ✅ |
+| Stash 面板 Pop | `stash_pop` | `StashView.onPop` → `runAndRefresh` | ✅ |
+| SVN「更新」 | `svn_sync_in` | `svnSyncFlow.svnUpdate` | ✅ |
+| SVN 横幅「继续」（更新） | `svn_sync_continue` | `svnSyncFlow.syncAction` | ✅ |
+| SVN「交付」 | `svn_sync_out` | `svnSyncOutFlow.svnDeliver` | ✅ |
+| SVN 横幅「继续」（交付） | `svn_sync_out_continue` | `svnSyncOutFlow.syncOutAction` | ✅ |
+
+- 核对方法：在 `src/` 里 grep 这些命令名和 `svnSyncIn(` 等包装函数的调用点，再对照后端 `commands/` 里会合并的 `#[tauri::command]`（`pull`、`cherry_pick`、`revert`、`stash_apply`、`stash_pop`，以及 svn_sync 四个）。应用里没有单独的 merge / rebase 命令；`svnJournal.ts` / `svnSyncIn.ts` 里的 `'rebase'` 是同步阶段名，不是命令。
+- 不拦的：`fetch`、`push`、`stash_push`、`stash_drop`、`checkout`（不带 `-m`，有本地改动时 git 直接拒绝，不合并）、`svn_sync_abort`、`svn_sync_out_abort`。
+
+#### 计划的错误
+
+- 无。
+
+#### 计划没写的坑
+
+- 原来的确认框不支持「默认按钮是取消」，见上面 `focusCancel`。
+
+#### 为什么这么改是安全的
+
+- 不改用户的 git 配置，只提示并给出可复制的配置示例。
+- 拦截只是在合并之前多一个确认，用户点取消时什么都不执行（流程测试断言预览和执行都没被调用）。

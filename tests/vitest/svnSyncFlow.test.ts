@@ -29,6 +29,10 @@ function deps(log: string[], confirm?: (r: ConfirmRequest) => Promise<boolean>):
     repoPath: 'C:/wc1',
     running: { current: false },
     syncState: () => null,
+    guardMerge: async () => {
+      log.push('guardMerge')
+      return true
+    },
     confirm:
       confirm ??
       (async (r) => {
@@ -79,7 +83,7 @@ describe('handleSvnUpdate', () => {
 
     await createSvnSyncFlow(deps(log)).handleSvnUpdate()
 
-    expect(log).toEqual(['clearError', 'reportError:sync_in_merge_in_range'])
+    expect(log).toEqual(['clearError', 'guardMerge', 'reportError:sync_in_merge_in_range'])
     expect(store.svnSyncIn).not.toHaveBeenCalled()
   })
 
@@ -236,5 +240,39 @@ describe('handleSyncAction', () => {
       expect(log.indexOf('clearError'), id).toBeGreaterThanOrEqual(0)
       expect(log.indexOf('clearError'), id).toBeLessThan(log.indexOf(act))
     }
+  })
+})
+
+describe('合并前的 merge driver 确认', () => {
+  it('guardMerge 返回 false 时「更新」不预览、不执行', async () => {
+    const log: string[] = []
+    await createSvnSyncFlow({ ...deps(log), guardMerge: async () => false }).handleSvnUpdate()
+    expect(store.svnSyncInPreview).not.toHaveBeenCalled()
+    expect(store.svnSyncIn).not.toHaveBeenCalled()
+  })
+
+  it('「更新」先过 guardMerge 再预览', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncInPreview).mockImplementation(async () => {
+      log.push('preview')
+      return preview
+    })
+    vi.mocked(store.svnSyncIn).mockResolvedValue({ kind: 'done', newRev: 2 })
+    await createSvnSyncFlow(deps(log)).handleSvnUpdate()
+    expect(log.indexOf('guardMerge')).toBeGreaterThanOrEqual(0)
+    expect(log.indexOf('guardMerge')).toBeLessThan(log.indexOf('preview'))
+  })
+
+  it('横幅上的「继续」要过 guardMerge，返回 false 时不调后端', async () => {
+    const log: string[] = []
+    await createSvnSyncFlow({ ...deps(log), guardMerge: async () => false }).handleSyncAction('syncContinue')
+    expect(store.svnSyncContinue).not.toHaveBeenCalled()
+  })
+
+  it('「放弃」不合并，不过 guardMerge', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncAbort).mockResolvedValue({ kind: 'aborted' } as never)
+    await createSvnSyncFlow({ ...deps(log), guardMerge: async () => false }).handleSyncAction('syncAbort')
+    expect(store.svnSyncAbort).toHaveBeenCalled()
   })
 })
