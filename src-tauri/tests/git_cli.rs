@@ -94,3 +94,33 @@ fn run_git_env_still_maps_failure_to_giterror() {
     .expect_err("不存在的对象必须报错");
     assert_eq!(err.code, "git_cli");
 }
+
+/// stdin 很大、且 git 边读边写 stdout 时不能死锁（`check-attr --stdin` 就是这样）。
+///
+/// 先把 stdin 全部写完再读 stdout 的话：输出把管道缓冲区写满，git 阻塞在写 stdout 上、
+/// 不再读 stdin，我们阻塞在写 stdin 上——两边互等。5 万文件的仓库做 merge driver 检查时
+/// 实测卡死（2026-10-21）。用超时把「挂住」变成失败，而不是让整个测试进程卡住。
+#[test]
+fn run_git_stdin_does_not_deadlock_on_large_output() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = repo_with_commit();
+    let path = dir.path().to_str().unwrap().to_string();
+    let mut input = Vec::new();
+    for i in 0..20_000 {
+        input.extend_from_slice(format!("Assets/D{:03}/File{i:05}.cs", i / 100).as_bytes());
+        input.push(0);
+    }
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let out = git_cli::run_git_stdin(&path, &["check-attr", "--stdin", "-z", "merge"], &input);
+        let _ = tx.send(out);
+    });
+    let out = rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("run_git_stdin 60 秒没有返回：stdin / stdout 管道死锁")
+        .unwrap();
+    // 每个路径三段：路径、属性名、值
+    assert_eq!(out.split('\0').filter(|s| !s.is_empty()).count(), 60_000);
+}

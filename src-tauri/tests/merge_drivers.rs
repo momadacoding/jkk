@@ -454,3 +454,32 @@ fn lfs_standard_attr_not_reported() {
     assert!(r.findings.iter().all(|f| f.name != "lfs"), "{r:?}");
     assert_eq!(finding(&r, "unityyamlmerge").state, DriverState::Missing);
 }
+
+/// 大仓库耗时（spec §4.6「大仓库的耗时要实测」）。默认不跑：
+/// `cargo test --release --test merge_drivers -- --ignored --nocapture perf_50k_files`
+#[test]
+#[ignore]
+fn perf_50k_files() {
+    use std::time::Instant;
+    let dir = repo();
+    write(dir.path(), ".gitattributes", b"*.unity merge=uym\n");
+    for d in 0..500 {
+        let sub = dir.path().join(format!("Assets/D{d:03}"));
+        fs::create_dir_all(&sub).unwrap();
+        for f in 0..100 {
+            let ext = if f == 0 { "unity" } else { "cs" };
+            fs::write(sub.join(format!("F{f:03}.{ext}")), b"x\n").unwrap();
+        }
+    }
+    commit_all(dir.path(), "50k");
+    let t = Instant::now();
+    let first = check(dir.path());
+    let cold = t.elapsed();
+    let t = Instant::now();
+    let second = check(dir.path());
+    let warm = t.elapsed();
+    assert_eq!(first, second);
+    assert_eq!(merge_drivers::check_count(p(dir.path())), 1);
+    assert_eq!(finding(&first, "uym").state, DriverState::Missing);
+    eprintln!("50k 文件：首次 {cold:?}，命中缓存 {warm:?}");
+}
