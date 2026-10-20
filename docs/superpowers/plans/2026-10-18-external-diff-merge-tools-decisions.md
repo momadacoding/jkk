@@ -21,7 +21,7 @@
 | 9 DU / UD 二选一 | ✅ 代码完成（真实窗口实测并入 Task 12） | `conflicts.rs` 加 `resolve_delete_modify`、命令 `resolve_delete_modify`；`LocalChangesView`（确认框）、`ConflictNotice`、`RepoTab`；测试 `tests/conflicts.rs`（+11）、`LocalChangesView.test.tsx`（+4） | fmt / clippy 无告警；`cargo test -j 4 --no-fail-fast` 61 个二进制 996 例全过；pnpm build 通过，pnpm test 47 文件 695 例全过 |
 | 10 merge driver 检查（后端） | ✅ 完成 | `engine/merge_drivers.rs`、命令 `check_merge_drivers`；`conflicts.rs` 的 `parse_merge_config` 改为 `pub(crate)`；测试 `tests/merge_drivers.rs`（22） | fmt / clippy 无告警；`cargo test -j 4 --no-fail-fast` 62 个二进制 1018 例全过 |
 | 11 横幅与合并入口前的确认 | ✅ 代码完成（真实窗口实测并入 Task 12） | `src/engine/mergeDrivers.ts`、`src/components/MergeDriverBanner.tsx`；改 `repoStore.ts`（`mergeDrivers`、`refreshMergeDrivers`）、`RepoTab.tsx`（`guardMerge`）、`svnSyncFlow.ts`、`svnSyncOutFlow.ts`、`ConfirmDialog.tsx`（`focusCancel`）、`styles.css`；测试 `mergeDrivers.test.ts`（12）、`svnSyncFlow.test.ts`（+4）、`svnSyncOutFlow.test.ts`（+4）、`ConfirmDialog.test.tsx`（+2） | pnpm build 通过；pnpm test 48 文件 717 例全过 |
-| 12 用户文档、E2E 清单与最终验证 | 未开始 | | |
+| 12 用户文档、E2E 清单与最终验证 | 🟡 进行中：文档、fixture 脚本、两侧全量验证已完成；真实窗口 E2E 与独立最终 review 待用户 | `README.md`「外部 diff / merge 工具」一节、`docs/superpowers/e2e/2026-10-18-external-tools-e2e.md`、`scripts/e2e-external-tools-fixture.ps1`；修 `git_cli::run_git_stdin` 死锁（`tests/git_cli.rs` +1）；`tests/merge_drivers.rs` 加 `perf_50k_files`（ignored） | fmt / clippy 无告警；`cargo test -j 4 --no-fail-fast` 62 个二进制 1019 例全过、1 例 ignored；pnpm build 通过，pnpm test 48 文件 717 例全过；fixture 脚本实际跑过一次，五个仓库状态符合预期后删除 |
 
 ## 决策条目
 
@@ -418,3 +418,17 @@
 
 - `cargo test --release --test merge_drivers -- --ignored --nocapture perf_50k_files`：5 万个被跟踪文件、500 个目录，首次 **272 ms**，命中缓存 **102 ms**（修复死锁之后）。
 - 命中缓存时仍有约 100 ms：每次要起 `git config --get-regexp` 和 `git rev-parse --git-path` 两个进程，再遍历一遍 index 算指纹。`repo-changed` 每次触发都会付这个代价，界面上不阻塞（不 await）。如果真实窗口里感到卡，下一步可以把 `rev-parse` 的结果按仓库缓存。
+
+#### 偏离计划
+
+- Ruling：Step 3 / 4（真实窗口实测、用户走 E2E 清单）和 Task 8 / 9 / 11 推迟过来的实测合并成 E2E 清单的 12 条，由用户一次走完 —— 代价：见 Task 8 的 Ruling。
+- Ruling：E2E 场景 7 原文是「在应用里点 merge → 弹出确认框」，应用里没有 merge 命令，改为在提交图上 Cherry-pick 分支 `pick` 的提交触发 —— 拦截走的是同一个 `runToolbar` 出口 —— 代价：无。
+- Ruling：fixture 的 drivers 仓库用三个专门的名字（`e2e-missing` / `e2e-half` / `e2e-badexe`），不需要用户去注释掉自己的全局 driver 配置 —— 代价：无。
+- Ruling：大仓库耗时除了真实窗口那条，另加一个 `#[ignore]` 的引擎层计时测试 `perf_50k_files`，数字可重复测 —— 代价：无。
+- Ruling：最终独立 review 交给用户触发 Codex（`/codex:adversarial-review` 是只允许用户调用的命令），和阶段 1 的 review 同一种方式 —— 代价：review 结果回来之前不能宣称完成。
+
+#### 计划没写的坑
+
+- 本机 `C:\Program Files\Unity\Hub\Editor\` 下有 `2022.3.62f3`、`6000.0.32f1`，但都没有 `Editor\Data\Tools\UnityYAMLMerge.exe`；spec 里写的 `6000.6.6f1` 路径不存在。fixture 脚本找不到时 scene 仓库改用假 driver，E2E 第 6 条的「自动弹出 BC」要在装了 Unity 的机器上验证。
+- fixture 脚本写文件一律用 .NET API，不用 `Set-Content -Path`（`[1]` 会被当通配符，见 Task 4）。
+- Python heredoc 处理含反斜杠的文本两次出错（README 里 JSON 的 `\\` 被折叠、`\U` 被当成转义），含反斜杠的片段改用 Edit 工具写。
