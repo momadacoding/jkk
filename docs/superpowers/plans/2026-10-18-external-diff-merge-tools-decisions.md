@@ -403,3 +403,18 @@
 
 - 不改用户的 git 配置，只提示并给出可复制的配置示例。
 - 拦截只是在合并之前多一个确认，用户点取消时什么都不执行（流程测试断言预览和执行都没被调用）。
+
+### Task 12
+
+#### 实测发现的缺陷与修复：`run_git_stdin` 管道死锁
+
+- 现象：5 万文件仓库的 `perf_50k_files` 跑了十几分钟不返回，进程列表里 `git check-attr --stdin -z merge` 一直挂着。
+- 根因：`git_cli::run_git_stdin` 先把 stdin 全部写完、再读 stdout。`check-attr --stdin` 是边读边写的命令：输出写满管道缓冲区后 git 阻塞在写 stdout 上、不再读 stdin，我们阻塞在写 stdin 上，两边互等。几十个路径时输出小于缓冲区，所以 Task 5 / Task 10 的测试都没暴露。这正是计划 Review Focus 第 5 条（大仓库的 driver 检查）要防的场景；冲突文件很多时 `path_attrs` 也会撞上。
+- 修复：stdin 改在 `std::thread::scope` 的单独线程里写（写完即 drop、关闭管道），主线程同时 `wait_with_output` 把 stdout / stderr 读空；git 先失败退出时先报 stderr，再报写入错误。原来的调用方（`svn_baseline` 的 `hash-object --stdin`）行为不变。
+- 测试：`tests/git_cli.rs` 的 `run_git_stdin_does_not_deadlock_on_large_output`，2 万个路径喂给 `check-attr --stdin`，60 秒超时判失败。修复前 60 秒超时失败（RED），修复后 0.43 秒通过（GREEN）。
+- 清理：卡死的测试进程与它的 `git check-attr` 子进程是本会话起的，已结束；它留在 `%TEMP%\.tmptNsY6H` 的 5 万文件 fixture 已删除。
+
+#### 大仓库的 driver 检查耗时（引擎层实测）
+
+- `cargo test --release --test merge_drivers -- --ignored --nocapture perf_50k_files`：5 万个被跟踪文件、500 个目录，首次 **272 ms**，命中缓存 **102 ms**（修复死锁之后）。
+- 命中缓存时仍有约 100 ms：每次要起 `git config --get-regexp` 和 `git rev-parse --git-path` 两个进程，再遍历一遍 index 算指纹。`repo-changed` 每次触发都会付这个代价，界面上不阻塞（不 await）。如果真实窗口里感到卡，下一步可以把 `rev-parse` 的结果按仓库缓存。
