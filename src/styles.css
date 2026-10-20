@@ -2094,3 +2094,29 @@ body {
 .svn-step.done { opacity: 0.75; }
 .svn-step-title { display: block; }
 .svn-step-hint { display: block; opacity: 0.7; }
+/* ---------- 冲突文件的提示（diff 面板顶部） ---------- */
+
+.conflict-pane {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+.conflict-pane > .diff-view {
+  flex: 1;
+  min-height: 0;
+}
+.conflict-notice {
+  flex: none;
+  padding: 10px 12px;
+  background: #3a2f16;
+  color: #f0e2b8;
+  border-bottom: 1px solid #6b5a20;
+  font-size: 12px;
+}
+.conflict-notice-heading { font-weight: 600; }
+.conflict-notice-body { margin: 6px 0 0; opacity: 0.9; }
+.conflict-notice code { font-family: Consolas, 'Courier New', monospace; }
+.conflict-notice-actions { display: flex; gap: 8px; margin-top: 8px; }
+.conflict-notice-actions button.danger { color: #f3cdcd; border-color: #7a3030; }
+.conflict-same-as-head { padding: 10px 12px; color: #aaa; font-size: 12px; }

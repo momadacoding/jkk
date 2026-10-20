@@ -1,6 +1,6 @@
 import { useMemo, useRef, useState } from 'react'
 import { Panel, Group, Separator } from 'react-resizable-panels'
-import type { DiffData, FileChange, StatusData } from '../engine/types'
+import type { ConflictInfo, DiffData, FileChange, StatusData } from '../engine/types'
 import { DiffView } from './DiffView'
 import { ContextMenu, useContextMenu, type MenuItem } from './ContextMenu'
 import {
@@ -13,7 +13,10 @@ import { commitKeyAction, type CommitField } from '../engine/commitKeys'
 import { discardShortcut } from '../engine/fileListKeys'
 import { buildCommitMessage } from '../engine/commitActions'
 import { conflictsFirst } from '../engine/conflicts'
-import { externalDiffItems, type ExternalToolsMenu } from './externalToolItems'
+import { externalDiffItems, externalMergeItems, type ExternalToolsMenu } from './externalToolItems'
+import { canExternalMerge, conflictView, PENDING_CONFLICT_VIEW } from '@/engine/conflictView'
+import { toolFor } from '@/engine/externalTools'
+import { ConflictNotice } from './ConflictNotice'
 
 interface FileSectionProps {
   title: string
@@ -76,7 +79,10 @@ function FileSectionList({
               <span className="ft-badge conflicted" title="有冲突，处理完再 Stage">!</span>
             )}
             <span className="changes-file-path">{f.path}</span>
-            <span className="changes-file-stats">+{f.additions}/-{f.deletions}</span>
+            {/* 冲突行的行数没有意义（libgit2 给冲突条目的永远是 0/0），只留角标 */}
+            {f.status !== 'conflicted' && (
+              <span className="changes-file-stats">+{f.additions}/-{f.deletions}</span>
+            )}
           </div>
         ))}
         {files.length === 0 && <div className="changes-empty">No files</div>}
@@ -108,9 +114,14 @@ interface LocalChangesViewProps {
   onBaselineBranch: boolean
   /** 外部 diff 工具的菜单项；不传时右键菜单里没有这些项。 */
   externalTools?: ExternalToolsMenu
+  /**
+   * 冲突文件的分类（`read_conflicts`）。null / 不传表示还没读到：冲突文件只显示
+   * 「这个文件有冲突」，不给任何操作，也不显示 diff。
+   */
+  conflicts?: ConflictInfo[] | null
 }
 
-export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, onCommit, svnMode, onBaselineBranch, externalTools }: LocalChangesViewProps) {
+export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, onCommit, svnMode, onBaselineBranch, externalTools, conflicts }: LocalChangesViewProps) {
   const [selection, setSelection] = useState<FileSelection>(emptyFileSelection)
   const [subject, setSubject] = useState('')
   const [description, setDescription] = useState('')
@@ -130,6 +141,23 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
   const activeDiff: DiffData = useMemo(() => ({
     files: diff.files.filter((f) => f.path === activeFile),
   }), [diff, activeFile])
+  const conflictByPath = useMemo(
+    () => new Map((conflicts ?? []).map((c) => [c.path, c])),
+    [conflicts],
+  )
+  /** 这个冲突文件能交给外部 merge 时返回路径，否则 null（③、④c、⑤、还没读到）。 */
+  const mergeablePath = (path: string): string | null => {
+    const info = conflictByPath.get(path)
+    return info && canExternalMerge(info) ? path : null
+  }
+  const activeConflict = activeFile && conflicted.has(activeFile) ? activeFile : null
+  const mergeTool = activeConflict && externalTools?.config
+    ? toolFor(externalTools.config, activeConflict, 'merge')
+    : null
+  const activeConflictInfo = activeConflict ? conflictByPath.get(activeConflict) : undefined
+  const activeConflictView = activeConflictInfo
+    ? conflictView(activeConflictInfo, mergeTool)
+    : PENDING_CONFLICT_VIEW
 
   const click = (section: FileSection, files: string[], path: string, e: React.MouseEvent) => {
     setSelection((cur) => nextFileSelection(cur, section, files, path, {
@@ -164,9 +192,9 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
         onSelect: () => { void navigator.clipboard.writeText(targets.join('\n')) },
       },
       // 外部工具一次只开右键点中的那一个文件，不跟随多选；冲突文件只做 merge，不给对比
-      ...externalDiffItems(externalTools, conflicted.has(path)
-        ? null
-        : { kind: staged ? 'staged' : 'unstaged', file: path }),
+      ...(conflicted.has(path)
+        ? externalMergeItems(externalTools, mergeablePath(path))
+        : externalDiffItems(externalTools, { kind: staged ? 'staged' : 'unstaged', file: path })),
     ]
     open(e, items)
   }
@@ -263,7 +291,21 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
           </Panel>
           <Separator className="separator-v" />
           <Panel minSize="30%">
-            <DiffView diff={activeDiff} />
+            {activeConflict ? (
+              <div className="conflict-pane">
+                <ConflictNotice
+                  view={activeConflictView}
+                  mergeToolLabel={mergeTool?.label ?? null}
+                  onOpenMerge={() => { if (mergeTool) externalTools?.onMerge(mergeTool.id, activeConflict) }}
+                  onStage={() => onStage([activeConflict])}
+                />
+                {activeConflictView.sameAsHeadNote
+                  ? <div className="conflict-same-as-head">{activeConflictView.sameAsHeadNote}</div>
+                  : activeConflictView.showDiff && <DiffView diff={activeDiff} />}
+              </div>
+            ) : (
+              <DiffView diff={activeDiff} />
+            )}
           </Panel>
         </Group>
       </div>

@@ -130,6 +130,22 @@ export function diffMenuEntries(
 }
 
 /**
+ * 冲突文件的外部 merge 菜单项：第一项「在 X 中解决」，其余能做 merge 的工具进子菜单。
+ * 配置读不出来时一项都没有。
+ */
+export function mergeMenuEntries(
+  cfg: ExternalToolsConfig | null,
+  filePath: string,
+): { primary: ToolEntry | null; others: ToolEntry[] } {
+  if (!cfg) return { primary: null, others: [] }
+  const { primary, others } = toolMenu(cfg, filePath, 'merge')
+  return {
+    primary: primary ? { label: `在 ${primary.label} 中解决`, toolId: primary.id } : null,
+    others: others.map((t) => ({ label: t.label, toolId: t.id })),
+  }
+}
+
+/**
  * 提交详情的 diff scope 转成外部 diff 的目标。
  *
  * 只认 `commit:<oid>` 和 `range:<a>..<b>`（与 Rust 侧 `read_diff` 的解析一致），

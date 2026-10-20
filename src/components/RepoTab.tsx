@@ -26,7 +26,7 @@ import SvnInitWizard from './SvnInitWizard'
 import BaselineBanner from './BaselineBanner'
 import { baselineMap, findDelivered, selectionDiffScope } from '../engine/svnGraph'
 import { describeToolExit } from '@/engine/externalTools'
-import { openExternalDiff, useExternalToolExit, useExternalTools } from '@/store/externalToolsStore'
+import { openExternalDiff, openExternalMerge, useExternalToolExit, useExternalTools } from '@/store/externalToolsStore'
 import type { ExternalToolsMenu } from './externalToolItems'
 import { computeLaneBranches, formatLaneBranch } from '../engine/laneBranch'
 import { describeHealth, describePinned, healthNeedsRebuild } from '../engine/svnInit'
@@ -538,6 +538,10 @@ export function RepoTab({
       if (!state.path) return
       openExternalDiff(state.path, toolId, target).catch(reportError)
     },
+    onMerge: (toolId, file) => {
+      if (!state.path) return
+      openExternalMerge(state.path, toolId, file).catch(reportError)
+    },
     onEditConfig: () => { externalTools.openConfig().catch(reportError) },
   }
   // 工具里可能改了工作区文件（Unstaged 那一侧是真文件），退出后刷新这个仓库的状态和 diff
@@ -873,6 +877,7 @@ export function RepoTab({
                 svnMode={state.capabilities.vcs === 'svn'}
                 onBaselineBranch={isProtectedBaseline(state.head, state.capabilities)}
                 externalTools={externalToolsMenu}
+                conflicts={state.conflicts}
               />
             )}
           </Panel>

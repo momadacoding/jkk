@@ -62,6 +62,14 @@ export function openExternalDiff(path: string, toolId: string, target: DiffTarge
 }
 
 /**
+ * 用外部工具解决一个冲突文件。立即返回；工具退出后后端发 `external-tool-exited`。
+ * 退出后不暂存，冲突是否解决由用户看过结果后自己 Stage。
+ */
+export function openExternalMerge(path: string, toolId: string, file: string): Promise<void> {
+  return invoke('open_external_merge', { path, toolId, file })
+}
+
+/**
  * 订阅外部工具退出事件，只认 `path` 这个仓库的（多开标签时别的仓库不受影响）。
  *
  * `onExit` 放进 ref：调用方每次渲染都传新闭包，直接放进依赖会让监听反复注销重注册，

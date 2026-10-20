@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { useCallback, useEffect, useRef, useState, type MutableRefObject } from 'react'
-import type { CommitNode, DiffData, GraphData, PullRequest, RefPointer, RepoInfo, StashEntry, StatusData, UpstreamInfo, Worktree } from '../engine/types'
+import type { CommitNode, ConflictInfo, DiffData, GraphData, PullRequest, RefPointer, RepoInfo, StashEntry, StatusData, UpstreamInfo, Worktree } from '../engine/types'
 import { ALL_CAPABILITIES, type Capabilities } from '../engine/capabilities'
 import {
   auditIsDue,
@@ -113,6 +113,13 @@ export interface RepoState {
    */
   capabilities: Capabilities
   status: StatusData
+  /**
+   * 冲突文件的分类（`read_conflicts`），跟着 `status` 刷新。
+   *
+   * `null` 表示还没读到或读取失败：冲突文件只显示「这个文件有冲突」，不给操作。
+   * 不能把失败当成空数组——那样界面会以为这些文件不是冲突。
+   */
+  conflicts: ConflictInfo[] | null
   diff: DiffData
   selectedId: string | null
   loading: boolean
@@ -187,6 +194,7 @@ const initialState: RepoState = {
   pullRequests: [],
   capabilities: ALL_CAPABILITIES,
   status: { staged: [], unstaged: [] },
+  conflicts: null,
   diff: { files: [] },
   selectedId: null,
   loading: false,
@@ -525,6 +533,32 @@ export function useRepoStore() {
     // 文件监听、外部工具退出、用户操作会同时各发一次；晚到的旧结果不能盖掉新的
     if (!refreshGate.isLatest(token, 'status')) return
     setState((s) => ({ ...s, status }))
+    // 冲突的分类跟着 status 走：文件监听、外部工具退出、用户操作都经过这里，
+    // BC 存盘后 ① 变 ② 不需要另挂一条刷新路径
+    await refreshConflicts(path, status)
+  }
+
+  /**
+   * 只在 status 里有冲突时才调后端，否则直接置空。
+   *
+   * 置空前也要先领一个代次：上一份 `read_conflicts` 可能还在路上，冲突在外面解决了之后
+   * 它晚到的话会把已经不存在的冲突写回来。
+   */
+  const refreshConflicts = async (path: string, status: StatusData) => {
+    const token = refreshGate.begin('conflicts')
+    if (!status.unstaged.some((f) => f.status === 'conflicted')) {
+      setState((s) => ({ ...s, conflicts: [] }))
+      return
+    }
+    try {
+      const conflicts = await invoke<ConflictInfo[]>('read_conflicts', { path })
+      if (!refreshGate.isLatest(token, 'conflicts')) return
+      setState((s) => ({ ...s, conflicts }))
+    } catch (err) {
+      // 读不到就退回「还没读到」，界面不给任何操作；错误照常交给调用方报出来
+      if (refreshGate.isLatest(token, 'conflicts')) setState((s) => ({ ...s, conflicts: null }))
+      throw err
+    }
   }
 
   const refreshWorktrees = async (path: string) => {

@@ -17,7 +17,7 @@
 | 5 冲突信息读取与五种情况分类 | ✅ 完成 | `engine/conflicts.rs`、`commands/conflict.rs`；测试 `tests/conflicts.rs`（35） | fmt / clippy 无告警；`cargo test -j 4 --no-fail-fast` 60 个二进制 962 例全过 |
 | 6 冲突文件的 HEAD 对比工作区 diff | ✅ 完成 | 改 `engine/diff.rs`（`fill_conflicted`、`readable_only` 放行冲突条目）；测试 `tests/fixtures.rs`（+3） | fmt / clippy 无告警；`cargo test -j 4 --no-fail-fast` 60 个二进制 965 例全过 |
 | 7 外部 merge 命令与各侧标题 | ✅ 完成 | `engine/external_merge.rs`、`commands/external.rs` 加 `open_external_merge`；`external_diff.rs` 抽出 `workdir_file` 等共用函数；测试 `tests/external_merge.rs`（20） | fmt / clippy 无告警；`cargo test -j 4 --no-fail-fast` 61 个二进制 985 例全过；`pnpm tauri dev` 实测并到 Task 8 |
-| 8 前端冲突提示与 merge 入口 | 未开始 | | |
+| 8 前端冲突提示与 merge 入口 | ✅ 代码完成（真实窗口实测并入 Task 12） | `src/engine/conflictView.ts`、`src/components/ConflictNotice.tsx`；改 `types.ts`、`externalTools.ts`（`mergeMenuEntries`）、`externalToolItems.ts`（`externalMergeItems`、`onMerge`）、`externalToolsStore.ts`（`openExternalMerge`）、`repoStore.ts`（`conflicts`、`refreshConflicts`）、`LocalChangesView.tsx`、`RepoTab.tsx`、`styles.css`；测试 `conflictView.test.ts`（13）、`repoStoreConflicts.test.ts`（4）、`LocalChangesView.test.tsx`（+8） | pnpm build 通过；pnpm test 47 文件 691 例全过 |
 | 9 DU / UD 二选一 | 未开始 | | |
 | 10 merge driver 检查（后端） | 未开始 | | |
 | 11 横幅与合并入口前的确认 | 未开始 | | |
@@ -279,3 +279,30 @@
 - 不写仓库：导出只走 `cat-file --filters`，写的是应用临时目录下本次新建的子目录。
 - `$MERGED` 是工作区里已有的普通文件，打开前逐段检查父目录不是链接、规范化后仍在 worktree 内；清理只调用 `TempWorkspace::remove`，它只删 `temp_root()` 的直接子目录，`merged_path_survives_cleanup` 断言 `$MERGED` 内容不变。
 - 工具退出后不 `git add`；退出码只用来报故障，不参与冲突是否已解决的判断。
+
+### Task 8
+
+#### 偏离计划
+
+- Ruling：`refreshConflicts` 不单独挂在 `repo-changed` 和外部工具退出事件上，而是由 `refreshStatus` 拿到新 status 之后调用 —— 这两条路径（以及 stage / discard / commit 的回调）本来就都会刷新 status，冲突分类跟着 status 走就不会漏掉哪条路径；status 里没有冲突时不调后端、直接置空 —— 代价：`refreshStatus` 的 promise 要等冲突信息也读完才 resolve。
+- Ruling：`RepoState.conflicts` 是 `ConflictInfo[] | null`，`null` 表示还没读到或读取失败 —— 失败时如果写成空数组，界面会把冲突文件当成「没有冲突信息」而给出普通 diff；`null` 时冲突文件只显示 `这个文件有冲突`（`PENDING_CONFLICT_VIEW`），没有任何按钮、没有 diff、右键菜单里也没有 merge 入口 —— 代价：读取失败时用户只能看到顶部错误横幅和这句话。
+- Ruling：右键菜单的 merge 入口也按 spec §4.2 限制在 ① / ② / ④a / ④b（`canExternalMerge`），不是所有冲突文件都给 —— spec 写明「③、④c、⑤ 没有入口」，计划只写了按钮 —— 代价：无。
+- Ruling：几处计划没给的文案由我定：③ `HEAD 这边删除了这个文件，另一边修改了它` / `HEAD 这边修改了这个文件，另一边删除了它`，正文 `选择保留修改后的文件，或删除它。选择后立即暂存。`；⑤ 按 code 写 `结构冲突（DD）：两边都删除或改名了这个文件`、`结构冲突（AU）：只有 HEAD 这边有这个路径（通常是改名冲突）`、`结构冲突（UA）：只有另一边有这个路径（通常是改名冲突）`，mode 不是普通文件时写 `结构冲突（<code>）：这个路径涉及符号链接、子模块或文件与目录互换`，正文 `应用内暂不处理这种冲突，请在命令行里解决。`；④b 的 heading / body 按 spec 原文在「说明它没能完全合并」处断开 —— 用「HEAD 这边 / 另一边」而不是 ours / theirs，因为 rebase 时两者含义对调 —— 代价：只是文案。
+- Ruling：④b 的 heading 里 driver 名用反引号包住（计划的测试断言就是这个字面量），`ConflictNotice` 把反引号段渲染成 `<code>` —— 既满足断言，界面上又不出现裸反引号 —— 代价：无。
+- Ruling：`sameAsHeadNote` 非空时用这句话代替 diff，不再显示空 diff —— spec 写的是「改为提示」 —— 代价：无。
+- Ruling：`ExternalToolsMenu` 加必填的 `onMerge`；diff 和 merge 两种菜单共用一个 `toolItems` 拼装函数 —— 代价：无。
+- Ruling：Step 6 的真实窗口实测（BC 解决 → 保存 → ① 变 ② → Stage）推迟到 Task 12，和 E2E 清单里同一条一起由用户走一遍；Task 9–11 的界面也一并在那时验证 —— 实测需要用户操作 BC，分几次打断用户不划算 —— 代价：如果 invoke 参数名有错，要到 Task 12 才暴露（`open_external_merge` 的参数 `path` / `toolId` / `file` 与 `open_external_diff` 同一种形状）。
+- 计划之外多加的测试：`canExternalMerge`、`PENDING_CONFLICT_VIEW`、④a 的 merge.default / LFS、⑤ 的 heading；组件测试里 ① 不显示 diff、② 显示 diff 并能 Stage、其他 merge 工具只列有 `mergeArgs` 的、二进制冲突没有 merge 入口、冲突信息未读到时没有任何入口；store 测试四例。
+
+#### 计划的错误
+
+- 无。
+
+#### 计划没写的坑
+
+- 选中的冲突文件顶部和右键菜单里会同时出现「在 Beyond Compare 中解决」，组件测试要用 `within(.context-menu)` 限定范围。
+
+#### 为什么这么改是安全的
+
+- 前端没有新的 git 写操作；Stage 按钮走现有的 `stage` 命令，必须用户点。外部 merge 只经 `open_external_merge` 走 Task 7 的后端流程，后端打开前还会重新读一遍冲突状态。
+- 冲突信息的写回有代次闸（key `conflicts`），冲突在外面解决之后晚到的旧结果不会把冲突写回来（`repoStoreConflicts.test.ts` 第 3 例）。
