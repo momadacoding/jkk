@@ -41,6 +41,11 @@ export interface SvnSyncOutFlowDeps {
   syncState: () => SyncState | SyncStateUnreadable | null
   deliver: (request: DeliverRequest) => Promise<boolean>
   confirm: (request: ConfirmRequest) => Promise<boolean>
+  /**
+   * 合并前的 merge driver 确认（spec §4.6）：更新 / 交付里的 rebase、补丁落回、merge-tree
+   * 都会调用 driver。返回 false 时什么都不做。必填：漏接一个入口就是缺陷。
+   */
+  guardMerge: () => Promise<boolean>
   clearError: () => void
   reportError: (err: unknown) => void
   refreshSvnSyncState: (path: string) => Promise<void>
@@ -102,6 +107,8 @@ export function createSvnSyncOutFlow(d: SvnSyncOutFlowDeps) {
   const svnDeliver = async () => {
     // 同 svnSyncFlow：上一次被前置检查拒绝留下的错误条说的是当时的仓库
     d.clearError()
+    // 交付里的 rebase、补丁落回、慢路径的 merge-tree 都会调用 driver；先于预览，理由同 svnSyncFlow
+    if (!(await d.guardMerge())) return
     let preview
     try {
       preview = await svnSyncOutPreview(d.repoPath)
@@ -132,6 +139,8 @@ export function createSvnSyncOutFlow(d: SvnSyncOutFlowDeps) {
   /** 横幅上交付那一组按钮。「清理」与「停止」都走放弃命令（计划 B8）。 */
   const syncOutAction = async (id: SyncOutActionId) => {
     d.clearError()
+    // 只有「继续」会接着合并；「清理」与「停止」都走放弃命令
+    if (id === 'syncOutContinue' && !(await d.guardMerge())) return
     const s = d.syncState()
     const phase = s && !('readError' in s) && s.unfinished ? s.unfinished.phase : 'prepare'
     const box: { outcome: SyncOutOutcome | null } = { outcome: null }

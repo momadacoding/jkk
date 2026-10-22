@@ -358,6 +358,17 @@ body {
   color: #ddd;
 }
 
+/* 子菜单紧贴入口项的右侧展开；入口项要做定位参照 */
+.context-menu-sub {
+  position: relative;
+}
+
+.context-menu-submenu {
+  position: absolute;
+  left: 100%;
+  top: -5px;
+}
+
 .worktree-badge {
   margin-left: auto;
   padding: 0 5px;
@@ -770,6 +781,16 @@ body {
   background: #55302e;
   border-color: #6d3b39;
   color: #9a8280;
+}
+
+/*
+ * 回车会按哪个按钮必须看得出来。用 :focus 而不是 :focus-visible：框多半是鼠标点出来的，
+ * 焦点是代码挪过去的，浏览器不算 focus-visible、不画框。默认按钮是 Cancel 的框（合并前确认）
+ * 尤其要看清——否则红色主按钮看着像默认按钮，与「回车等于取消」正好相反。
+ */
+.dialog-actions button:focus {
+  outline: 2px solid #4fc3f7;
+  outline-offset: 2px;
 }
 
 /* 删除分支那个框要放得下 origin/feat/... 这种长名字 */
@@ -2083,3 +2104,49 @@ body {
 .svn-step.done { opacity: 0.75; }
 .svn-step-title { display: block; }
 .svn-step-hint { display: block; opacity: 0.7; }
+/* ---------- 冲突文件的提示（diff 面板顶部） ---------- */
+
+.conflict-pane {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+.conflict-pane > .diff-view {
+  flex: 1;
+  min-height: 0;
+}
+.conflict-notice {
+  flex: none;
+  padding: 10px 12px;
+  background: #3a2f16;
+  color: #f0e2b8;
+  border-bottom: 1px solid #6b5a20;
+  font-size: 12px;
+}
+.conflict-notice-heading { font-weight: 600; }
+.conflict-notice-body { margin: 6px 0 0; opacity: 0.9; }
+.conflict-notice code { font-family: Consolas, 'Courier New', monospace; }
+.conflict-notice-actions { display: flex; gap: 8px; margin-top: 8px; }
+.conflict-notice-actions button.danger { color: #f3cdcd; border-color: #7a3030; }
+.conflict-same-as-head { padding: 10px 12px; color: #aaa; font-size: 12px; }
+
+/* ---------- merge driver 配置问题（仓库顶部） ---------- */
+
+.banner-driver {
+  padding: 6px 12px;
+  font-size: 12px;
+  border-bottom: 1px solid transparent;
+}
+.banner-driver.danger { background: #4a1f1f; color: #f3cdcd; border-bottom-color: #7a3030; }
+.banner-driver.warning { background: #4a3d16; color: #f0e2b8; border-bottom-color: #6b5a20; }
+.banner-driver.info { background: #2a2d33; color: #c8ccd4; border-bottom-color: #3a3f47; }
+.banner-driver-example {
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  background: rgba(0, 0, 0, 0.25);
+  font-family: Consolas, 'Courier New', monospace;
+  font-size: 11px;
+  white-space: pre-wrap;
+  user-select: text;
+}

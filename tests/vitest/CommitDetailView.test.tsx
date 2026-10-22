@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
 //
 // svn 节点详情里「这次交付包含的本地提交」：能点开单个提交，点开后能回到 svn 节点（2026-10-16 用户要求）。
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import { CommitDetailView } from '@/components/CommitDetailView'
-import type { CommitNode } from '@/engine/types'
+import type { ExternalToolsConfig } from '@/engine/externalTools'
+import type { CommitNode, DiffData } from '@/engine/types'
 
 // 文件树 + diff 的分栏（react-resizable-panels）要 ResizeObserver，jsdom 没有。这里只看文字，不量尺寸
 globalThis.ResizeObserver ??= class {
@@ -130,5 +131,77 @@ describe('CommitDetailView：所在分支', () => {
   it('图外提交不传分支时整栏不出现', () => {
     render(<CommitDetailView commit={three[1]} diff={empty} repoPath="C:/r" onSelectCommit={vi.fn()} branch={null} />)
     expect(screen.queryByText(/⑂/)).toBeNull()
+  })
+})
+
+// diff 为 null = 这个提交的 diff 还没读回来（`currentDiff`）。2026-10-22 E2E：大提交要几十秒，
+// 这期间不能显示上一份 diff 的文件，也不能在 Changes 上标上一份的个数
+describe('CommitDetailView：diff 还没读回来', () => {
+  it('Commit 标签页说正在读取，不列文件，Changes 不带个数', () => {
+    render(<CommitDetailView commit={three[1]} diff={null} repoPath="C:/r" onSelectCommit={vi.fn()} />)
+    expect(screen.getByText('正在读取这个提交的改动…')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Changes' })).toBeTruthy()
+    expect(document.querySelector('.commit-file-row')).toBeNull()
+  })
+
+  it('Changes 标签页同样说正在读取', () => {
+    render(<CommitDetailView commit={three[1]} diff={null} repoPath="C:/r" onSelectCommit={vi.fn()} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Changes' }))
+    expect(screen.getByText('正在读取这个提交的改动…')).toBeTruthy()
+  })
+})
+
+describe('CommitDetailView：外部 diff 菜单', () => {
+  const renamed: DiffData = {
+    files: [{ path: 'n.txt', status: 'renamed', oldPath: 'o.txt', binary: false, hunks: [] }],
+  }
+  const config: ExternalToolsConfig = {
+    version: 1,
+    defaultDiff: 'bc',
+    defaultMerge: 'bc',
+    rules: [],
+    tools: [{ id: 'bc', label: 'Beyond Compare', program: 'BComp.exe', diffArgs: ['$LOCAL', '$REMOTE'] }],
+  }
+
+  function mount(commit: CommitNode, diffScope: string | null) {
+    const onDiff = vi.fn()
+    render(
+      <CommitDetailView
+        commit={commit}
+        diff={renamed}
+        repoPath="C:/r"
+        onSelectCommit={vi.fn()}
+        diffScope={diffScope}
+        externalTools={{ config, onDiff, onEditConfig: vi.fn() }}
+      />,
+    )
+    return onDiff
+  }
+
+  it('commit:abc：右键文件拿到 commit 目标，改名带上旧路径', async () => {
+    const onDiff = mount(three[1], 'commit:abc')
+    fireEvent.click(screen.getByRole('button', { name: /Changes/ }))
+    fireEvent.contextMenu(screen.getByText('n.txt'))
+    fireEvent.click(screen.getByText('在 Beyond Compare 中对比'))
+    await waitFor(() =>
+      expect(onDiff).toHaveBeenCalledWith('bc', { kind: 'commit', oid: 'abc', file: 'n.txt', oldFile: 'o.txt' }),
+    )
+  })
+
+  it('range:a..b（svn 节点两版基线之差）拿到 range 目标', async () => {
+    const commit = { ...r16([]), baselineOid: 'B16', diffBase: 'B15' }
+    const onDiff = mount(commit, 'range:a..b')
+    fireEvent.contextMenu(screen.getByText('n.txt'))
+    fireEvent.click(screen.getByText('在 Beyond Compare 中对比'))
+    await waitFor(() =>
+      expect(onDiff).toHaveBeenCalledWith('bc', { kind: 'range', from: 'a', to: 'b', file: 'n.txt', oldFile: 'o.txt' }),
+    )
+  })
+
+  it('diffScope 为 null 时没有对比项', () => {
+    mount(three[1], null)
+    fireEvent.click(screen.getByRole('button', { name: /Changes/ }))
+    fireEvent.contextMenu(screen.getByText('n.txt'))
+    expect(screen.queryByText(/中对比/)).toBeNull()
   })
 })

@@ -38,6 +38,10 @@ function deps(log: string[], typed = '修复跳跃'): SvnSyncOutFlowDeps & { dra
     running: { current: false },
     draft,
     syncState: () => null,
+    guardMerge: async () => {
+      log.push('guardMerge')
+      return true
+    },
     deliver: async (r: DeliverRequest) => {
       log.push(`deliver:initial=${r.initialMessage}`)
       r.onMessageChange(typed)
@@ -84,7 +88,7 @@ describe('handleSvnDeliver', () => {
     const log: string[] = []
     vi.mocked(store.svnSyncOutPreview).mockRejectedValue({ code: 'sync_out_behind_baseline' })
     await createSvnSyncOutFlow(deps(log)).handleSvnDeliver()
-    expect(log).toEqual(['clearError', 'reportError:sync_out_behind_baseline'])
+    expect(log).toEqual(['clearError', 'guardMerge', 'reportError:sync_out_behind_baseline'])
   })
 
   it('成功：带着用户写的信息执行、刷新、清空草稿、弹 D9 提示', async () => {
@@ -203,5 +207,41 @@ describe('handleSyncOutAction', () => {
     expect(log).toContain('dialogError:sync_out_update_failed')
     expect(log).toContain('refreshSvnSyncState')
     expect(log.filter((l) => l.startsWith('confirm:'))).toHaveLength(1) // 没有结局提示
+  })
+})
+
+describe('交付前的 merge driver 确认', () => {
+  it('guardMerge 返回 false 时「交付」不预览、不执行', async () => {
+    const log: string[] = []
+    await createSvnSyncOutFlow({ ...deps(log), guardMerge: async () => false }).handleSvnDeliver()
+    expect(store.svnSyncOutPreview).not.toHaveBeenCalled()
+    expect(store.svnSyncOut).not.toHaveBeenCalled()
+  })
+
+  it('「交付」先过 guardMerge 再预览', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncOutPreview).mockImplementation(async () => {
+      log.push('preview')
+      return preview
+    })
+    vi.mocked(store.svnSyncOut).mockResolvedValue({ kind: 'delivered', rev: 2, branch: 'work', localOnlyLeft: 0 })
+    await createSvnSyncOutFlow(deps(log)).handleSvnDeliver()
+    expect(log.indexOf('guardMerge')).toBeGreaterThanOrEqual(0)
+    expect(log.indexOf('guardMerge')).toBeLessThan(log.indexOf('preview'))
+  })
+
+  it('横幅上的「继续」要过 guardMerge，返回 false 时不调后端', async () => {
+    const log: string[] = []
+    await createSvnSyncOutFlow({ ...deps(log), guardMerge: async () => false }).handleSyncOutAction('syncOutContinue')
+    expect(store.svnSyncOutContinue).not.toHaveBeenCalled()
+  })
+
+  it('「放弃 / 清理」不合并，不过 guardMerge', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncOutAbort).mockResolvedValue({ kind: 'aborted' } as never)
+    const flow = createSvnSyncOutFlow({ ...deps(log), guardMerge: async () => false })
+    await flow.handleSyncOutAction('syncOutAbort')
+    await flow.handleSyncOutAction('syncOutCleanup')
+    expect(store.svnSyncOutAbort).toHaveBeenCalledTimes(2)
   })
 })

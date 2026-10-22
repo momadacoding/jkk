@@ -281,6 +281,138 @@ the name of a script file.
   在终端里手动跑一遍，看真实报错。
 - **JSON 写错时程序不会覆盖你的文件**，只会在 `⚙` 上显示 `⚠` 并把解析错误显示出来。
 
+## 外部 diff / merge 工具
+
+右键文件可以交给外部工具对比或解决冲突，默认 Beyond Compare。设计见
+`docs/superpowers/specs/2026-10-17-external-diff-merge-tools-design.md`。
+
+- **对比**：「本地改动」的 Unstaged / Staged 文件、提交详情（Changes 标签页，含 stash 与 SVN 节点）
+  的文件，右键「在 X 中对比」。Unstaged 是暂存区对比工作区，Staged 是 HEAD 对比暂存区
+  （同 `git difftool` / `git difftool --cached`）；应用内右侧显示的是 HEAD 对比工作区，两者有意不同。
+- **解决冲突**：冲突文件右键「在 X 中解决」，或选中后点右侧提示里的按钮。工具拿到的是三个原始版本
+  （`$LOCAL` / `$REMOTE` / `$BASE` 为临时文件），结果写进工作区的真实文件（`$MERGED`）。
+  **应用不会在工具关闭后自动暂存**，回到应用里看过结果再手动 Stage。例外是 VS Code：它的合并编辑器点
+  「Complete Merge」时会自己 `git add` 结果文件并关闭编辑器（VS Code 的行为，不经过应用），回到应用时文件已在 Staged。
+- **一边删一边改（DU / UD）**：在右侧选「保留修改后的文件」或「删除文件」，立即暂存；删除前会确认。
+- 临时文件放在 `%TEMP%\jkk-external\` 下每次一个子目录，工具退出后删除。同一个文件已经在工具里
+  打开时，再点会提示「已在 X 中打开」。
+
+配置文件位置（首次使用时写出默认预设，右键菜单最后一项「编辑外部工具配置…」打开它，
+切回窗口时自动重读）：
+
+| 平台 | 路径 |
+|---|---|
+| Windows | `%APPDATA%\com.momadacoding.jkk\externalTools.json` |
+| macOS | `~/Library/Application Support/com.momadacoding.jkk/externalTools.json` |
+| Linux | `~/.config/com.momadacoding.jkk/externalTools.json` |
+
+默认预设（Beyond Compare 5 与 VS Code）：
+
+```json
+{
+  "version": 1,
+  "defaultDiff": "bc",
+  "defaultMerge": "bc",
+  "rules": [],
+  "tools": [
+    {
+      "id": "bc",
+      "label": "Beyond Compare",
+      "program": "C:\\Program Files\\Beyond Compare 5\\BComp.exe",
+      "diffArgs": ["$LOCAL", "$REMOTE", "/lefttitle=$LOCAL_TITLE", "/righttitle=$REMOTE_TITLE"],
+      "mergeArgs": ["$LOCAL", "$REMOTE", "$BASE", "$MERGED",
+                    "/lefttitle=$LOCAL_TITLE", "/righttitle=$REMOTE_TITLE",
+                    "/centertitle=$BASE_TITLE", "/outputtitle=$MERGED_TITLE"],
+      "successExitCodes": [0, 1, 2, 11, 12, 13, 14]
+    },
+    {
+      "id": "vscode",
+      "label": "VS Code",
+      "program": "code",
+      "diffArgs": ["--wait", "--diff", "$LOCAL", "$REMOTE"],
+      "mergeArgs": ["--wait", "--merge", "$REMOTE", "$LOCAL", "$BASE", "$MERGED"]
+    }
+  ]
+}
+```
+
+（实际预设里 BC 还带 `exitCodeMessages`：BComp.exe 用退出码报比较结果，1–14 都是正常结束，
+100 起才是故障。）
+
+| 字段 | 说明 |
+|---|---|
+| `program` | 可执行文件绝对路径或 PATH 上的名字。BC 不在 PATH 上，预设写死安装路径，不探测 |
+| `diffArgs` / `mergeArgs` | 参数数组，逐项做占位符替换，不经过 shell。没写的那一项，这个工具就不出现在对应菜单里 |
+| `successExitCodes` | 哪些退出码算正常结束，缺省只认 0。其他退出码会在顶部报错，但**从不用来判断冲突是否已解决** |
+| `exitCodeMessages` | 已知故障码的说明，键是十进制退出码 |
+
+占位符：`$LOCAL` `$REMOTE` `$BASE` `$MERGED`，以及对应的 `$LOCAL_TITLE` 等标题
+（merge 时写真实名字：当前分支 / 被合并的分支；rebase 时写「当前重放结果」和 `REBASE_HEAD`）。
+
+### 按文件类型选工具
+
+`rules` 从上往下匹配，第一条命中的生效；模式只看文件名、不区分大小写，只支持 `*` 和 `?`。
+没写的那一项用 `defaultDiff` / `defaultMerge`。规则引用了不存在的工具时报配置错误，不回退。
+
+Unity 场景用 UnityYAMLMerge 解冲突、看 diff 仍用 BC 的写法（路径按本机 Unity 版本改）：
+
+```json
+"rules": [
+  { "patterns": ["*.unity", "*.prefab", "*.asset"], "merge": "unityyamlmerge" }
+],
+"tools": [
+  { "id": "unityyamlmerge", "label": "UnityYAMLMerge",
+    "program": "C:\\Program Files\\Unity\\Hub\\Editor\\6000.6.6f1\\Editor\\Data\\Tools\\UnityYAMLMerge.exe",
+    "mergeArgs": ["merge", "-p", "$BASE", "$REMOTE", "$LOCAL", "$MERGED"] }
+]
+```
+
+手动解决时**不带** `--fallback none`：合不了的部分会按 Unity 自带的 `mergespecfile.txt` 交给后备工具
+（默认列了 Beyond Compare 5）。
+
+### 冲突文件右侧显示什么
+
+| 显示 | 含义 | 操作 |
+|---|---|---|
+| 这个文件有冲突 | 工作区里有冲突标记 | 在 X 中解决 |
+| 未检测到冲突标记，检查后可以暂存 | 下面是 HEAD 对比工作区的 diff | Stage |
+| git 没有逐行合并这个文件… | `merge=binary`、`-merge`、`merge.default`、LFS | 在 X 中解决、Stage |
+| 这个文件配置了自动合并工具 `X`，但仍处于冲突状态… | 自定义 merge driver 没能合完 | 在 X 中解决、Stage |
+| 二进制文件冲突 | 任意一个版本是二进制 | Stage |
+| 一边删一边改 | DU / UD | 保留 / 删除（立即暂存） |
+| 结构冲突 | 改名冲突、符号链接、子模块等 | 无，请在命令行里处理 |
+
+任何情况下都不显示「已解决」：index 里仍是冲突，只有手动 Stage 才算解决。
+
+### merge driver 配置检查
+
+`.gitattributes` 跟着仓库走，`merge=<名字>` 对应的 driver 却要在每台机器自己的 git 配置里定义。
+打开仓库时会检查，有问题就在顶部挂横幅：
+
+| 本机状态 | 横幅 | 合并时会怎样 |
+|---|---|---|
+| 完全没配这个名字 | 红色，附配置示例 | git 退回逐行文本合并，往场景文件里写冲突标记 |
+| 只配了 `name` 等、没有 `driver` | 红色 | 整个合并直接 fatal，什么都不改 |
+| `driver` 指向的程序（绝对路径）不存在 | 琥珀色 | driver 失败，冲突需要手动解决 |
+
+「完全没配」时，在应用里点 Pull、Cherry-pick、Revert、Stash Apply / Pop、SVN 更新 / 交付（含继续）
+之前会弹确认框，默认按钮是取消。在命令行或其他客户端里发起的合并拦不住。应用不会改你的 git 配置。
+`merge=lfs`（`git lfs track` 写的标准属性）不检查。
+
+作为**自动 driver** 的配置示例（必须带 `--fallback none`，否则 git 在后台调用时会弹出后备工具窗口卡住合并）：
+
+```text
+# .gitattributes（提交进仓库）
+*.unity  merge=unityyamlmerge
+*.prefab merge=unityyamlmerge
+*.asset  merge=unityyamlmerge
+
+# 全局 ~/.gitconfig（每台机器各配一次）
+[merge "unityyamlmerge"]
+    name = Unity SmartMerge
+    driver = 'C:/Program Files/Unity/Hub/Editor/6000.6.6f1/Editor/Data/Tools/UnityYAMLMerge.exe' merge -h -p --force --fallback none %O %B %A %A
+```
+
 ## 设计文档
 
 - 设计规格：`docs/superpowers/specs/2026-08-04-mygitclient-design.md`

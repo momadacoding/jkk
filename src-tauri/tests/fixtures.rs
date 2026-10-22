@@ -466,3 +466,92 @@ fn read_diff_survives_a_dangling_link_in_the_workdir() {
         diff.files.iter().map(|f| &f.path).collect::<Vec<_>>()
     );
 }
+
+/// 造一个 UU 冲突：HEAD 第 1 行是 `colleague1`，对方是 `patch-local`，共 6 行。
+fn conflicted_repo(autocrlf: bool) -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let d = dir.path();
+    run_git(d, &["init", "-q", "-b", "main"]);
+    run_git(d, &["config", "user.email", "t@t.com"]);
+    run_git(d, &["config", "user.name", "T"]);
+    run_git(
+        d,
+        &[
+            "config",
+            "core.autocrlf",
+            if autocrlf { "true" } else { "false" },
+        ],
+    );
+    let body = |first: &str| format!("{first}\nline2\nline3\nline4\nline5\nline6\n");
+    fs::write(d.join("c.txt"), body("base1")).unwrap();
+    run_git(d, &["add", "."]);
+    run_git(d, &["commit", "-qm", "base"]);
+    run_git(d, &["checkout", "-q", "-b", "feat"]);
+    fs::write(d.join("c.txt"), body("patch-local")).unwrap();
+    run_git(d, &["commit", "-qam", "theirs"]);
+    run_git(d, &["checkout", "-q", "main"]);
+    fs::write(d.join("c.txt"), body("colleague1")).unwrap();
+    run_git(d, &["commit", "-qam", "ours"]);
+    assert!(!try_git(d, &["merge", "feat"]), "merge 应当冲突");
+    dir
+}
+
+fn conflicted_diff_lines(dir: &std::path::Path) -> Vec<String> {
+    let data = engine::diff::read_diff(dir.to_str().unwrap(), "workdir".into()).unwrap();
+    let file = data
+        .files
+        .iter()
+        .find(|f| f.path == "c.txt")
+        .expect("c.txt in diff");
+    assert_eq!(file.status, "conflicted");
+    file.hunks
+        .iter()
+        .flat_map(|h| h.lines.iter())
+        .map(|l| format!("{}{}", l.origin, l.content))
+        .collect()
+}
+
+/// spec §3 的实测复刻：解完冲突后显示的是 HEAD 对比工作区，不是 base，也不是 ours 对比 theirs。
+#[test]
+fn conflicted_file_diff_is_head_vs_workdir() {
+    let dir = conflicted_repo(false);
+    fs::write(
+        dir.path().join("c.txt"),
+        "colleague1 + patch-local（手工合并）\nline2\nline3\nline4\nline5 手改\nline6\n",
+    )
+    .unwrap();
+    let lines = conflicted_diff_lines(dir.path());
+    for want in [
+        "-colleague1",
+        "+colleague1 + patch-local（手工合并）",
+        "-line5",
+        "+line5 手改",
+    ] {
+        assert!(lines.iter().any(|l| l == want), "缺 {want}：{lines:?}");
+    }
+}
+
+/// autocrlf 下工作区是 CRLF：只有真正改过的行出现在 diff 里，不能整份文件都算改动。
+#[test]
+fn conflicted_file_diff_applies_autocrlf() {
+    let dir = conflicted_repo(true);
+    fs::write(
+        dir.path().join("c.txt"),
+        "colleague1\r\nline2\r\nline3\r\nline4\r\nline5 手改\r\nline6\r\n",
+    )
+    .unwrap();
+    let lines = conflicted_diff_lines(dir.path());
+    let changed: Vec<&String> = lines.iter().filter(|l| !l.starts_with(' ')).collect();
+    assert_eq!(changed, ["-line5", "+line5 手改"], "{lines:?}");
+}
+
+/// 用户在工作区里删掉了冲突文件：如实显示成整份删除，暂存前能看出来要暂存的是一次删除。
+#[test]
+fn conflicted_file_missing_in_workdir_shows_deletion() {
+    let dir = conflicted_repo(false);
+    fs::remove_file(dir.path().join("c.txt")).unwrap();
+    let lines = conflicted_diff_lines(dir.path());
+    assert!(!lines.is_empty());
+    assert!(lines.iter().all(|l| l.starts_with('-')), "{lines:?}");
+    assert!(lines.iter().any(|l| l == "-colleague1"), "{lines:?}");
+}

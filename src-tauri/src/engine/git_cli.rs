@@ -76,9 +76,14 @@ pub fn run_git_bytes(path: &str, args: &[&str]) -> Result<Vec<u8>> {
 /// 内容是 `&[u8]` 不是 `&str`：源码文件很可能不是 UTF-8（国内 Unity 工程里 GBK 的
 /// `.cs` 很常见），任何一次字符串化都会把非法字节换成 U+FFFD（§16.2 末）。
 ///
-/// ⚠️ **必须先写完 stdin 再等进程结束。** 用 `output()` 之前不关掉 stdin 的话，
-/// 双方会各等各的：git 等更多输入，我们等它退出。这里靠 `take()` 让
-/// `ChildStdin` 在写完后立即 drop 来关闭管道。
+/// ⚠️ **写 stdin 和读 stdout 必须同时进行。** 两个坑：
+///
+/// - 不关掉 stdin 就等进程结束，双方各等各的：git 等更多输入，我们等它退出。
+///   写入线程写完即 drop `ChildStdin`，管道随之关闭。
+/// - 先把 stdin 全部写完再读 stdout，遇到边读边写的命令（`check-attr --stdin`）会死锁：
+///   输出写满管道缓冲区后 git 阻塞在写 stdout 上、不再读 stdin，我们阻塞在写 stdin 上。
+///   5 万文件的仓库做 merge driver 检查时实测卡死（2026-10-21）。所以 stdin 放在单独的
+///   线程里写，主线程同时 `wait_with_output` 把 stdout / stderr 读空。
 pub fn run_git_stdin(path: &str, args: &[&str], stdin_bytes: &[u8]) -> Result<String> {
     use std::io::Write;
     use std::process::Stdio;
@@ -89,18 +94,22 @@ pub fn run_git_stdin(path: &str, args: &[&str], stdin_bytes: &[u8]) -> Result<St
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    {
-        let mut sink = child.stdin.take().ok_or_else(|| {
-            GitError::new("git_cli", "拿不到子进程的 stdin，无法喂入内容".to_string())
-        })?;
-        sink.write_all(stdin_bytes)?;
-        // sink 在这里 drop → 管道关闭 → git 才会开始收尾
-    }
-    let output = child.wait_with_output()?;
+    let mut sink = child.stdin.take().ok_or_else(|| {
+        GitError::new("git_cli", "拿不到子进程的 stdin，无法喂入内容".to_string())
+    })?;
+    let (output, written) = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || sink.write_all(stdin_bytes));
+        let output = child.wait_with_output();
+        (output, writer.join())
+    });
+    let output = output?;
+    // git 先失败退出时写入会撞上断开的管道；那时真正的原因在 stderr 里，先报它
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         return Err(GitError::new("git_cli", stderr));
     }
+    written
+        .map_err(|_| GitError::new("git_cli", "写入子进程 stdin 的线程异常退出".to_string()))??;
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 

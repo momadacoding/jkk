@@ -2,7 +2,10 @@ import { useEffect, useRef, useState } from 'react'
 
 export interface MenuItem {
   label: string
+  /** 有 `children` 的项是子菜单的入口，点它只展开子菜单，不调用这里。 */
   onSelect: () => void
+  /** 子菜单：鼠标移上去或点一下展开，只支持一层。 */
+  children?: MenuItem[]
   /** 置灰但仍然显示，用来说明「为什么这里不能做这件事」。 */
   disabled?: boolean
   /** 危险操作（删除类），显示为红色。 */
@@ -68,21 +71,54 @@ export function ContextMenu({ menu, onClose }: { menu: MenuState | null; onClose
       style={{ left: pos.x, top: pos.y }}
       onContextMenu={(e) => e.preventDefault()}
     >
-      {menu.items.map((item, i) => (
-        <button
-          key={i}
-          className={`context-menu-item${item.danger ? ' danger' : ''}`}
-          disabled={item.disabled}
-          // 先让菜单真的从屏幕上消失，再跑动作。同步执行的话，动作里但凡有一步
-          // 卡住主线程（原生 prompt/confirm 就是），React 还没来得及重绘，
-          // 菜单就会一直留在弹框后面——曾经的 "New branch from here…" 就是这样。
-          onClick={() => { onClose(); setTimeout(() => item.onSelect(), 0) }}
-        >
-          {item.label}
-          {item.shortcut && <span className="context-menu-shortcut">{item.shortcut}</span>}
-        </button>
-      ))}
+      <MenuItems items={menu.items} onClose={onClose} />
     </div>
+  )
+}
+
+function MenuItems({ items, onClose }: { items: MenuItem[]; onClose: () => void }) {
+  // 同一时刻只展开一个子菜单
+  const [openSub, setOpenSub] = useState<number | null>(null)
+  return (
+    <>
+      {items.map((item, i) =>
+        item.children ? (
+          // 子菜单渲染在主菜单的 DOM 里面：外面那个「点菜单外面就关」的判断才会放行它
+          <div
+            key={i}
+            className="context-menu-sub"
+            onMouseEnter={() => setOpenSub(i)}
+            onMouseLeave={() => setOpenSub(null)}
+          >
+            <button
+              className="context-menu-item"
+              disabled={item.disabled}
+              onClick={() => setOpenSub(openSub === i ? null : i)}
+            >
+              {item.label}
+            </button>
+            {openSub === i && (
+              <div className="context-menu context-menu-submenu">
+                <MenuItems items={item.children} onClose={onClose} />
+              </div>
+            )}
+          </div>
+        ) : (
+          <button
+            key={i}
+            className={`context-menu-item${item.danger ? ' danger' : ''}`}
+            disabled={item.disabled}
+            // 先让菜单真的从屏幕上消失，再跑动作。同步执行的话，动作里但凡有一步
+            // 卡住主线程（原生 prompt/confirm 就是），React 还没来得及重绘，
+            // 菜单就会一直留在弹框后面——曾经的 "New branch from here…" 就是这样。
+            onClick={() => { onClose(); setTimeout(() => item.onSelect(), 0) }}
+          >
+            {item.label}
+            {item.shortcut && <span className="context-menu-shortcut">{item.shortcut}</span>}
+          </button>
+        ),
+      )}
+    </>
   )
 }
 

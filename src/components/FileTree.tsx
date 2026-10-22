@@ -50,9 +50,10 @@ interface RowsProps {
   isOpen: (path: string) => boolean
   onToggle: (path: string) => void
   onSelect: (path: string) => void
+  onContextMenu?: (path: string, e: React.MouseEvent) => void
 }
 
-function Rows({ nodes, depth, selectedPath, isOpen, onToggle, onSelect }: RowsProps) {
+function Rows({ nodes, depth, selectedPath, isOpen, onToggle, onSelect, onContextMenu }: RowsProps) {
   return (
     <>
       {nodes.map((node) => {
@@ -76,6 +77,7 @@ function Rows({ nodes, depth, selectedPath, isOpen, onToggle, onSelect }: RowsPr
                   isOpen={isOpen}
                   onToggle={onToggle}
                   onSelect={onSelect}
+                  onContextMenu={onContextMenu}
                 />
               )}
             </div>
@@ -90,6 +92,7 @@ function Rows({ nodes, depth, selectedPath, isOpen, onToggle, onSelect }: RowsPr
             style={indent}
             title={node.path}
             onClick={() => onSelect(node.path)}
+            onContextMenu={onContextMenu ? (e) => onContextMenu(node.path, e) : undefined}
           >
             <span className="ft-chevron-spacer" />
             {mark ? (
@@ -117,9 +120,11 @@ interface FileTreeProps {
    * 全展开会把渲染拖垮，所以那边传 false。
    */
   defaultOpen?: boolean
+  /** 文件行（不含目录行）的右键菜单；不传时用浏览器默认行为。 */
+  onContextMenu?: (path: string, e: React.MouseEvent) => void
 }
 
-export function FileTree({ nodes, selectedPath, onSelect, defaultOpen = true }: FileTreeProps) {
+export function FileTree({ nodes, selectedPath, onSelect, defaultOpen = true, onContextMenu }: FileTreeProps) {
   /**
    * 只记「用户改过的那些目录」，没记录的一律走 `defaultOpen`。
    *
@@ -142,6 +147,7 @@ export function FileTree({ nodes, selectedPath, onSelect, defaultOpen = true }: 
         isOpen={isOpen}
         onToggle={toggle}
         onSelect={onSelect}
+        onContextMenu={onContextMenu}
       />
     </div>
   )

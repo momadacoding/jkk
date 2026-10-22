@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { useCallback, useEffect, useRef, useState } from 'react'
-import type { CommitNode, DiffData, GraphData, PullRequest, RefPointer, RepoInfo, StashEntry, StatusData, UpstreamInfo, Worktree } from '../engine/types'
+import { useCallback, useEffect, useRef, useState, type MutableRefObject } from 'react'
+import type { CommitNode, ConflictInfo, DiffData, GraphData, PullRequest, RefPointer, RepoInfo, StashEntry, StatusData, UpstreamInfo, Worktree } from '../engine/types'
 import { ALL_CAPABILITIES, type Capabilities } from '../engine/capabilities'
 import {
   auditIsDue,
@@ -28,6 +28,8 @@ import {
 } from '../engine/svnGraph'
 
 import { toErrorCode, toErrorMessage } from '../engine/errors'
+import { createLatestGate } from '@/engine/latestGate'
+import type { DriverReport } from '@/engine/mergeDrivers'
 import type {
   Health,
   InitReport,
@@ -112,7 +114,21 @@ export interface RepoState {
    */
   capabilities: Capabilities
   status: StatusData
+  /**
+   * 冲突文件的分类（`read_conflicts`），跟着 `status` 刷新。
+   *
+   * `null` 表示还没读到或读取失败：冲突文件只显示「这个文件有冲突」，不给操作。
+   * 不能把失败当成空数组——那样界面会以为这些文件不是冲突。
+   */
+  conflicts: ConflictInfo[] | null
+  /**
+   * 本机 merge driver 配置检查（spec §4.6）。`null` = 还没读到，不挂横幅。
+   * 打开仓库和每次 `repo-changed` 都刷新；后端有缓存，`.gitattributes` 没变时很便宜。
+   */
+  mergeDrivers: DriverReport | null
   diff: DiffData
+  /** `diff` 是按哪个 scope 读出来的；`null` = 还没读过。显示前用 `currentDiff` 与当前视图要的比对。 */
+  diffScope: string | null
   selectedId: string | null
   loading: boolean
   error: string | null
@@ -186,7 +202,10 @@ const initialState: RepoState = {
   pullRequests: [],
   capabilities: ALL_CAPABILITIES,
   status: { staged: [], unstaged: [] },
+  conflicts: null,
+  mergeDrivers: null,
   diff: { files: [] },
+  diffScope: null,
   selectedId: null,
   loading: false,
   error: null,
@@ -393,6 +412,17 @@ export function useRepoStore() {
   const lastAuditAt = useRef(0)
   const auditInFlight = useRef(false)
 
+  /** `refreshStatus` / `refreshDiff` 的请求代次，见 `createLatestGate`。放 ref：要跨渲染保持计数。 */
+  const refreshGate = useRef(createLatestGate()).current
+  /**
+   * 当前视图要显示哪一份 diff，由 `useRepoEffects` 每次渲染写入。
+   *
+   * `undefined` 表示还不知道（刚打开仓库），此时照常写回。用户操作（stage、discard、commit）的
+   * 回调会固定刷新 `workdir`，它可能在用户切到某个提交之后才发出；不核对 scope 的话，
+   * 它要么让那个提交的结果作废，要么晚到后把工作区的改动盖在提交详情上（Codex review 第 2 条）。
+   */
+  const wantedDiffScope = useRef<string | null | undefined>(undefined)
+
   const openRepo = useCallback(async (path: string) => {
     setState((s) => ({ ...s, loading: true, error: null, errorCode: null }))
     try {
@@ -417,6 +447,8 @@ export function useRepoStore() {
       setState((s) => ({ ...s, worktrees: wts }))
       await refreshUpstream(path)
       await refreshStashes(path)
+      // 不 await：大仓库第一次要扫全部文件的属性，横幅晚一点出现无所谓
+      void refreshMergeDrivers(path).catch((err) => console.warn('merge driver 检查失败：', err))
       // 不 await：这一步要走网络（gh 实测一两秒），让它拖住打开仓库的收尾没有意义。
       // 不支持 PR 的后端连这次 gh 调用都省掉——界面上没有任何地方会用到结果。
       if (caps.pullRequests) void refreshPullRequests(path)
@@ -508,8 +540,47 @@ export function useRepoStore() {
   }
 
   const refreshStatus = async (path: string) => {
+    const token = refreshGate.begin('status')
     const status = await invoke<StatusData>('read_status', { path })
+    // 文件监听、外部工具退出、用户操作会同时各发一次；晚到的旧结果不能盖掉新的
+    if (!refreshGate.isLatest(token, 'status')) return
     setState((s) => ({ ...s, status }))
+    // 冲突的分类跟着 status 走：文件监听、外部工具退出、用户操作都经过这里，
+    // BC 存盘后 ① 变 ② 不需要另挂一条刷新路径
+    await refreshConflicts(path, status)
+  }
+
+  /**
+   * 只在 status 里有冲突时才调后端，否则直接置空。
+   *
+   * 置空前也要先领一个代次：上一份 `read_conflicts` 可能还在路上，冲突在外面解决了之后
+   * 它晚到的话会把已经不存在的冲突写回来。
+   */
+  const refreshConflicts = async (path: string, status: StatusData) => {
+    const token = refreshGate.begin('conflicts')
+    if (!status.unstaged.some((f) => f.status === 'conflicted')) {
+      setState((s) => ({ ...s, conflicts: [] }))
+      return
+    }
+    try {
+      const conflicts = await invoke<ConflictInfo[]>('read_conflicts', { path })
+      if (!refreshGate.isLatest(token, 'conflicts')) return
+      setState((s) => ({ ...s, conflicts }))
+    } catch (err) {
+      // 读不到就退回「还没读到」，界面不给任何操作；错误照常交给调用方报出来
+      if (refreshGate.isLatest(token, 'conflicts')) setState((s) => ({ ...s, conflicts: null }))
+      throw err
+    }
+  }
+
+  /**
+   * 重新检查 merge driver 并写回横幅。返回这次的结果：合并前的确认要用**刚查到的**，
+   * 不能用 state 里可能是几秒前的那份。`samePath` 守卫同 `refreshSvnEol`。
+   */
+  const refreshMergeDrivers = async (path: string): Promise<DriverReport> => {
+    const report = await invoke<DriverReport>('check_merge_drivers', { path })
+    setState((s) => (samePath(s.path ?? '', path) ? { ...s, mergeDrivers: report } : s))
+    return report
   }
 
   const refreshWorktrees = async (path: string) => {
@@ -711,8 +782,25 @@ export function useRepoStore() {
   }
 
   const refreshDiff = async (path: string, scope: string) => {
-    const diff = await invoke<DiffData>('read_diff', { path, scope })
-    setState((s) => ({ ...s, diff }))
+    // 代次按 scope 分开计：别的 scope 的请求不能让这一份作废
+    const key = `diff:${scope}`
+    const token = refreshGate.begin(key)
+    // 写回前再核对：只认当前视图要的那一份，切走之后才回来的旧 scope 结果丢掉
+    const stillWanted = () => {
+      if (!refreshGate.isLatest(token, key)) return false
+      const wanted = wantedDiffScope.current
+      return wanted === undefined || wanted === scope
+    }
+    let diff: DiffData
+    try {
+      diff = await invoke<DiffData>('read_diff', { path, scope })
+    } catch (err) {
+      // 读失败也要把这个 scope 记成「读过了」，不然界面会一直说「正在读取」；错误照旧抛给调用方
+      if (stillWanted()) setState((s) => ({ ...s, diff: { files: [] }, diffScope: scope }))
+      throw err
+    }
+    if (!stillWanted()) return
+    setState((s) => ({ ...s, diff, diffScope: scope }))
   }
 
   const selectCommit = (id: string) => {
@@ -738,6 +826,7 @@ export function useRepoStore() {
     refreshGraph,
     refreshStatus,
     refreshWorktrees,
+    refreshMergeDrivers,
     refreshDiff,
     refreshUpstream,
     refreshStashes,
@@ -753,6 +842,7 @@ export function useRepoStore() {
     selectCommit,
     clearError,
     reportError,
+    wantedDiffScope,
   }
 }
 
@@ -762,6 +852,8 @@ export interface RepoRefreshers {
   refreshGraph: (path: string) => Promise<void>
   refreshStatus: (path: string) => Promise<void>
   refreshWorktrees: (path: string) => Promise<void>
+  /** `.gitattributes` 或 git 配置变了要重查；后端按指纹缓存，没变时不重扫。 */
+  refreshMergeDrivers: (path: string) => Promise<DriverReport>
   refreshDiff: (path: string, scope: string) => Promise<void>
   refreshUpstream: (path: string) => Promise<void>
   refreshStashes: (path: string) => Promise<void>
@@ -771,6 +863,8 @@ export interface RepoRefreshers {
   refreshSvnSyncState: (path: string) => Promise<void>
   /** 服务器侧核对的**后台**入口，自带频率闸。挂定时器与窗口焦点。 */
   auditSvnIfDue: (path: string) => Promise<void>
+  /** `useRepoStore` 的 `wantedDiffScope`：这里每次渲染写入当前视图的 scope。 */
+  wantedDiffScope: MutableRefObject<string | null | undefined>
 }
 
 export function useRepoEffects(
@@ -778,11 +872,13 @@ export function useRepoEffects(
   refreshers: RepoRefreshers,
   viewMode: string,
 ) {
-  const { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, refreshSvnSyncState, auditSvnIfDue } = refreshers
+  const { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, refreshSvnSyncState, auditSvnIfDue } = refreshers
   // svn 节点有两版本地基线时读两版之差（`range:`）；不在图上的选中（stash）照旧按 oid 读
   const diffScope = viewMode === 'changes'
     ? 'workdir'
     : selectionDiffScope(state.commits, state.selectedId)
+  // 在渲染里写而不是在 effect 里写：下面那个按选中刷新 diff 的 effect 发请求之前，它必须已经是新值
+  refreshers.wantedDiffScope.current = diffScope
 
   useEffect(() => {
     if (!state.path || !diffScope) return
@@ -806,6 +902,7 @@ export function useRepoEffects(
       // 外部 push/fetch 会改变领先落后数，命令行 stash 也要反映到面板上
       void refreshUpstream(path).catch(ignore)
       void refreshStashes(path).catch(ignore)
+      void refreshMergeDrivers(path).catch(ignore)
       if (diffScope) void refreshDiff(path, diffScope).catch(ignore)
       // §6.6.3 的**分层**：高频通道上只跑 O(1) 的第一档，变了才跑第二档。
       //

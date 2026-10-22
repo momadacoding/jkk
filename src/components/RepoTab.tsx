@@ -24,7 +24,11 @@ import { createSvnSyncOutFlow } from './svnSyncOutFlow'
 import { useDeliverDialog } from './DeliverDialog'
 import SvnInitWizard from './SvnInitWizard'
 import BaselineBanner from './BaselineBanner'
-import { baselineMap, findDelivered } from '../engine/svnGraph'
+import { baselineMap, findDelivered, selectionDiffScope } from '../engine/svnGraph'
+import { describeToolExit } from '@/engine/externalTools'
+import { currentDiff } from '@/engine/currentDiff'
+import { openExternalDiff, openExternalMerge, useExternalToolExit, useExternalTools } from '@/store/externalToolsStore'
+import type { ExternalToolsMenu } from './externalToolItems'
 import { computeLaneBranches, formatLaneBranch } from '../engine/laneBranch'
 import { describeHealth, describePinned, healthNeedsRebuild } from '../engine/svnInit'
 import { MIGRATE_EOL_WARNING } from '../engine/svnSync'
@@ -34,6 +38,8 @@ import { isProtectedBaseline, visibleSections } from '../engine/capabilities'
 import { askConfirm } from '../engine/confirm'
 import { countConflicts, repoStateBanner } from '../engine/conflicts'
 import { usePrompt } from './PromptDialog'
+import { MergeDriverBanner } from './MergeDriverBanner'
+import { mergeRiskConfirm, triggersMerge } from '@/engine/mergeDrivers'
 import { useConfirm } from './ConfirmDialog'
 import { save } from '@tauri-apps/plugin-dialog'
 import type { CommitNode } from '../engine/types'
@@ -120,10 +126,10 @@ export function RepoTab({
   repoPath, openPaths, onOpenInNewTab, onRepoRemoved,
 }: RepoTabProps) {
   const {
-    state, openRepo, refreshHead, refreshGraph, refreshStatus, refreshWorktrees,
+    state, openRepo, refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers,
     refreshDiff, refreshUpstream, refreshStashes, refreshPullRequests,
     refreshSvnSync, refreshSvnEol, refreshSvnSyncState, checkSvnSyncIfChanged, fetchSvnLog, refreshSvnAudit, auditSvnIfDue,
-    selectCommit, clearError, reportError,
+    selectCommit, clearError, reportError, wantedDiffScope,
   } = useRepoStore()
   const [repoState, setRepoState] = useState<string>('normal')
   // 侧边栏分区按后端能力裁剪。SVN 混合仓库下 tag / worktree 整块不渲染
@@ -142,9 +148,28 @@ export function RepoTab({
   // 交付对话框的提交信息草稿：没交付成功时关掉框，下次打开还在（spec §13）
   const deliverDraft = useRef('')
 
+  /**
+   * 应用发起会触发合并的操作之前，重新检查 merge driver（spec §4.6）。
+   *
+   * 只在「完全没配」时弹危险确认框，默认按钮是取消；返回 false 时调用方不再继续。
+   * 用刚查到的结果，不用 state 里的旧值：用户可能刚改完 git 配置。
+   * 检查本身失败（invoke 抛错）时放行并报错——检查未完成不等于有风险，拦住会让合并做不了。
+   */
+  const guardMerge = useCallback(async (): Promise<boolean> => {
+    const path = state.path
+    if (!path) return false
+    try {
+      const request = mergeRiskConfirm(await refreshMergeDrivers(path))
+      return request ? await confirm(request) : true
+    } catch (err) {
+      reportError(err)
+      return true
+    }
+  }, [state.path, refreshMergeDrivers, confirm, reportError])
+
   useRepoEffects(
     state,
-    { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, refreshSvnSyncState, auditSvnIfDue },
+    { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, refreshSvnSyncState, auditSvnIfDue, wantedDiffScope },
     viewMode,
   )
 
@@ -199,19 +224,22 @@ export function RepoTab({
 
   const runAndRefresh = useCallback(async (cmd: string, args: Record<string, unknown>, refresh: () => Promise<void>) => {
     if (!state.path) return
+    // stash apply / pop 也会调用 merge driver（Task 10 实测）
+    if (triggersMerge(cmd) && !(await guardMerge())) return
     try {
       await invoke(cmd, { path: state.path, ...args })
       await refresh()
     } catch (err) {
       reportError(err)
     }
-  }, [state.path, reportError])
+  }, [state.path, reportError, guardMerge])
 
   /** 工具栏动作：跑完把所有受影响的状态刷一遍。 */
   const runToolbar = useCallback(async (command: string, args: Record<string, unknown>) => {
     const path = state.path
     if (!path) return
     const before = state.headHash
+    if (triggersMerge(command) && !(await guardMerge())) return
     try {
       await invoke(command, { path, ...args })
       // fetch/pull/push/stash 会同时影响图、状态、上游计数和 stash 列表
@@ -232,7 +260,7 @@ export function RepoTab({
     } catch (err) {
       reportError(err)
     }
-  }, [state.path, state.headHash, refreshHead, refreshGraph, refreshStatus, refreshUpstream, refreshStashes, refreshPullRequests, reportError])
+  }, [state.path, state.headHash, refreshHead, refreshGraph, refreshStatus, refreshUpstream, refreshStashes, refreshPullRequests, reportError, guardMerge])
 
   /**
    * graph 行右键菜单的调度。
@@ -523,6 +551,35 @@ export function RepoTab({
   const detailLane = detailCommit ? laneBranches.get(detailCommit.id) : undefined
   const detailBranch = detailLane ? formatLaneBranch(detailLane) : null
 
+  // 提交详情的 diff 按哪个 scope 读的，与 `useRepoEffects` 的算法相同；外部 diff 据此定两侧
+  const commitScope = selectionDiffScope(state.commits, state.selectedId)
+  const externalTools = useExternalTools()
+  useEffect(() => {
+    if (externalTools.error) reportError(externalTools.error)
+  }, [externalTools.error, reportError])
+  const externalToolsMenu: ExternalToolsMenu = {
+    config: externalTools.config,
+    onDiff: (toolId, target) => {
+      if (!state.path) return
+      openExternalDiff(state.path, toolId, target).catch(reportError)
+    },
+    onMerge: (toolId, file) => {
+      if (!state.path) return
+      openExternalMerge(state.path, toolId, file).catch(reportError)
+    },
+    onEditConfig: () => { externalTools.openConfig().catch(reportError) },
+  }
+  // 工具里可能改了工作区文件（Unstaged 那一侧是真文件），退出后刷新这个仓库的状态和 diff
+  useExternalToolExit(state.path, (exit) => {
+    const path = state.path
+    if (!path) return
+    void refreshStatus(path).catch(reportError)
+    const scope = viewMode === 'changes' ? 'workdir' : commitScope
+    if (scope) void refreshDiff(path, scope).catch(reportError)
+    const problem = describeToolExit(exit)
+    if (problem) reportError(`${exit.file}：${problem}`)
+  })
+
   if (state.loading && state.commits.length === 0) return <div style={{ padding: 16 }}>Loading...</div>
 
   // 「有 `.svn` 无 `.git`」不是错误，是一个还没走的流程（spec §6.1）。
@@ -581,6 +638,7 @@ export function RepoTab({
     repoPath,
     syncState: () => state.svnSyncState,
     confirm,
+    guardMerge,
     clearError,
     reportError,
     refreshSvnSyncState,
@@ -596,6 +654,7 @@ export function RepoTab({
     syncState: () => state.svnSyncState,
     deliver,
     confirm,
+    guardMerge,
     clearError,
     reportError,
     refreshSvnSyncState,
@@ -703,6 +762,7 @@ export function RepoTab({
         onSyncOutAction={(id) => void handleSyncOutAction(id)}
         onSvnUpdate={() => void handleSvnUpdate()}
       />
+      <MergeDriverBanner report={state.mergeDrivers} />
       {state.error && (
         <div className="banner-error">
           <span>{state.error}</span>
@@ -824,24 +884,29 @@ export function RepoTab({
                 <Panel defaultSize="35%" minSize="15%" maxSize="65%">
                   <CommitDetailView
                     commit={detailCommit}
-                    diff={state.diff}
+                    diff={currentDiff(state.diff, state.diffScope, commitScope)}
                     repoPath={state.path}
                     onSelectCommit={selectCommit}
                     backTo={delivered?.owner ?? null}
                     branch={detailBranch}
+                    diffScope={commitScope}
+                    externalTools={externalToolsMenu}
                   />
                 </Panel>
               </Group>
             ) : (
               <LocalChangesView
                 status={state.status}
-                diff={state.diff}
+                diff={currentDiff(state.diff, state.diffScope, 'workdir')}
                 onStage={(paths) => runAndRefresh('stage', { paths }, async () => { await refreshStatus(state.path!); await refreshDiff(state.path!, 'workdir') })}
                 onUnstage={(paths) => runAndRefresh('unstage', { paths }, async () => { await refreshStatus(state.path!); await refreshDiff(state.path!, 'workdir') })}
                 onDiscard={(paths, staged) => void handleDiscard(paths, staged)}
                 onCommit={handleCommit}
                 svnMode={state.capabilities.vcs === 'svn'}
                 onBaselineBranch={isProtectedBaseline(state.head, state.capabilities)}
+                externalTools={externalToolsMenu}
+                conflicts={state.conflicts}
+                onResolveDeleteModify={(file, keep) => runAndRefresh('resolve_delete_modify', { file, keep }, async () => { await refreshStatus(state.path!); await refreshDiff(state.path!, 'workdir') })}
               />
             )}
           </Panel>

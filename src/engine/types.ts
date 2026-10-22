@@ -211,3 +211,32 @@ export interface LocalRelation {
   /** 合并点有、本地分支没有的提交数。 */
   behind: number
 }
+
+/** 冲突文件某个 stage 的条目，与 Rust 侧 `StageInfo` 一一对应。 */
+export interface StageInfo {
+  oid: string
+  /** git 的文件 mode，例如 0o100644；0o120000 是符号链接。 */
+  mode: number
+}
+
+/** 冲突的五种情况（spec §4.1），判定顺序 ⑤ → ③ → ④ → ① → ②。 */
+export type ConflictCase = 'structural' | 'deleteModify' | 'notTextMerged' | 'markers' | 'noMarkers'
+
+/** ④ git 没做逐行文本合并的原因。 */
+export type NotTextReason = 'binaryAttr' | 'customDriver' | 'mergeDefault' | 'lfs' | 'binaryContent'
+
+/** 一个冲突文件的信息，与 Rust 侧 `ConflictInfo` 一一对应（`read_conflicts`）。 */
+export interface ConflictInfo {
+  path: string
+  /** `UU` / `AA` / `DU` / `UD` / `AU` / `UA` / `DD`。 */
+  code: string
+  base: StageInfo | null
+  ours: StageInfo | null
+  theirs: StageInfo | null
+  case: ConflictCase
+  reason: NotTextReason | null
+  /** 自定义 merge driver 的名字。 */
+  driver: string | null
+  /** 工作区（经过过滤器）与 HEAD 完全相同。 */
+  sameAsHead: boolean
+}

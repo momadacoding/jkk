@@ -8,12 +8,19 @@ import { DiffView } from './DiffView'
 import { FileTree } from './FileTree'
 import { FileContentView } from './FileContentView'
 import { toErrorMessage } from '../engine/errors'
+import { diffTargetFromScope } from '@/engine/externalTools'
+import { ContextMenu, useContextMenu } from './ContextMenu'
+import { externalDiffItems, type ExternalToolsMenu } from './externalToolItems'
 
 type Tab = 'commit' | 'changes' | 'tree'
 
+const NO_FILES: DiffData['files'] = []
+const LOADING_NOTE = '正在读取这个提交的改动…'
+
 interface CommitDetailViewProps {
   commit: CommitNode | null
-  diff: DiffData
+  /** `null` = 这个提交的 diff 还没读回来（`currentDiff`）：说正在读取，不显示上一份。 */
+  diff: DiffData | null
   /** 仓库路径，File Tree 标签要用它去读这个提交的整棵树。 */
   repoPath: string | null
   /**
@@ -28,6 +35,13 @@ interface CommitDetailViewProps {
    * 选中的提交在哪条线上（2026-10-17 用户要求）。图外提交（stash、收进 svn 节点的）没有，传 null。
    */
   branch?: string | null
+  /**
+   * 这份 diff 是按哪个 scope 读出来的（`selectionDiffScope` 的结果），外部 diff 据此决定两侧。
+   * 只认 `commit:` / `range:`；null 或别的值时右键菜单里没有对比项。
+   */
+  diffScope?: string | null
+  /** 外部 diff 工具的菜单项；不传时文件树没有右键菜单。 */
+  externalTools?: ExternalToolsMenu
 }
 
 /** 信息条上的分支一栏；三个标签页和 svn 节点共用，换标签页时不该消失。 */
@@ -60,26 +74,39 @@ function CommitHeader({ commit, branch }: { commit: CommitNode; branch?: string 
   )
 }
 
-export function CommitDetailView({ commit, diff, repoPath, onSelectCommit, backTo, branch }: CommitDetailViewProps) {
+export function CommitDetailView({
+  commit, diff, repoPath, onSelectCommit, backTo, branch, diffScope = null, externalTools,
+}: CommitDetailViewProps) {
   const [tab, setTab] = useState<Tab>('commit')
   const [picked, setPicked] = useState<string | null>(null)
   const [listing, setListing] = useState<TreeListing | null>(null)
   const [listError, setListError] = useState<string | null>(null)
+  const { menu, open, close } = useContextMenu()
+  const loading = diff === null
+  const files = diff?.files ?? NO_FILES
+
+  // 改动列表里的文件右键：两侧由 diff scope 决定，改名时左边用旧路径
+  const fileContextMenu = (path: string, e: React.MouseEvent) => {
+    const oldPath = files.find((f) => f.path === path)?.oldPath ?? null
+    const target = diffTargetFromScope(diffScope, path, oldPath)
+    if (!externalTools || !target) return
+    open(e, externalDiffItems(externalTools, target))
+  }
 
   const fileStats = useMemo(
     () =>
-      diff.files.map((f) => ({
+      files.map((f) => ({
         path: f.path,
         status: f.status,
         additions: f.hunks.reduce((n, h) => n + h.lines.filter((l) => l.origin === '+').length, 0),
         deletions: f.hunks.reduce((n, h) => n + h.lines.filter((l) => l.origin === '-').length, 0),
       })),
-    [diff],
+    [files],
   )
 
   const changesTree = useMemo(
-    () => buildFileTree(diff.files.map((f) => ({ path: f.path, status: f.status }))),
-    [diff],
+    () => buildFileTree(files.map((f) => ({ path: f.path, status: f.status }))),
+    [files],
   )
 
   const fullTree = useMemo(
@@ -89,13 +116,34 @@ export function CommitDetailView({ commit, diff, repoPath, onSelectCommit, backT
 
   // 选中项从当前 diff 推出来而不是存起来：换一个提交时上一个选中的文件多半
   // 不在新 diff 里，存着的话右边会空白，还得再写一个 effect 去清它。
-  const activePath = picked && diff.files.some((f) => f.path === picked)
+  const activePath = picked && files.some((f) => f.path === picked)
     ? picked
-    : diff.files[0]?.path ?? null
+    : files[0]?.path ?? null
 
   const activeDiff: DiffData = useMemo(
-    () => ({ files: diff.files.filter((f) => f.path === activePath) }),
-    [diff, activePath],
+    () => ({ files: files.filter((f) => f.path === activePath) }),
+    [files, activePath],
+  )
+
+  // 改动列表与 diff 的分栏；diff 还没读回来时整块换成一句说明
+  const changesSplit = loading ? <div className="diff-note">{LOADING_NOTE}</div> : (
+    <div className="commit-split">
+      <Group orientation="horizontal">
+        <Panel defaultSize="30%" minSize="15%" maxSize="60%">
+          <FileTree
+            nodes={changesTree}
+            selectedPath={activePath}
+            onSelect={setPicked}
+            onContextMenu={fileContextMenu}
+          />
+        </Panel>
+        <Separator className="separator-v" />
+        <Panel minSize="30%">
+          <DiffView diff={activeDiff} showPath={false} />
+        </Panel>
+      </Group>
+      <ContextMenu menu={menu} onClose={close} />
+    </div>
   )
 
   const commitId = commit?.id ?? null
@@ -158,17 +206,7 @@ export function CommitDetailView({ commit, diff, repoPath, onSelectCommit, backT
         {commit.diffBase ? (
           <>
             <p className="commit-detail-note">相对 r{prevRev} 的变化（只含 git 管理的文件）。</p>
-            <div className="commit-split">
-              <Group orientation="horizontal">
-                <Panel defaultSize="30%" minSize="15%" maxSize="60%">
-                  <FileTree nodes={changesTree} selectedPath={activePath} onSelect={setPicked} />
-                </Panel>
-                <Separator className="separator-v" />
-                <Panel minSize="30%">
-                  <DiffView diff={activeDiff} showPath={false} />
-                </Panel>
-              </Group>
-            </div>
+            {changesSplit}
           </>
         ) : (
           // 不猜是谁的提交：交付之后同事紧跟着提交时，自己交付的 revision 也没在本机记过（2026-10-16 review）
@@ -198,7 +236,7 @@ export function CommitDetailView({ commit, diff, repoPath, onSelectCommit, backT
         )}
         <button className={tab === 'commit' ? 'active' : ''} onClick={() => setTab('commit')}>Commit</button>
         <button className={tab === 'changes' ? 'active' : ''} onClick={() => setTab('changes')}>
-          Changes{diff.files.length > 0 ? ` (${diff.files.length})` : ''}
+          Changes{files.length > 0 ? ` (${files.length})` : ''}
         </button>
         <button className={tab === 'tree' ? 'active' : ''} onClick={() => setTab('tree')}>File Tree</button>
       </div>
@@ -219,6 +257,7 @@ export function CommitDetailView({ commit, diff, repoPath, onSelectCommit, backT
           </div>
           <div className="commit-full-message">{commit.message}</div>
           <div className="commit-files">
+            {loading && <div className="diff-note">{LOADING_NOTE}</div>}
             {fileStats.map((f) => (
               <div key={f.path} className="commit-file-row">
                 <span className={`commit-file-status ${f.status}`}>{f.status.slice(0, 1).toUpperCase()}</span>
@@ -230,19 +269,7 @@ export function CommitDetailView({ commit, diff, repoPath, onSelectCommit, backT
         </div>
       )}
 
-      {tab === 'changes' && (
-        <div className="commit-split">
-          <Group orientation="horizontal">
-            <Panel defaultSize="30%" minSize="15%" maxSize="60%">
-              <FileTree nodes={changesTree} selectedPath={activePath} onSelect={setPicked} />
-            </Panel>
-            <Separator className="separator-v" />
-            <Panel minSize="30%">
-              <DiffView diff={activeDiff} showPath={false} />
-            </Panel>
-          </Group>
-        </div>
-      )}
+      {tab === 'changes' && changesSplit}
 
       {tab === 'tree' && (
         <div className="commit-split">
