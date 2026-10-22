@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { useFocusTrap } from './useFocusTrap'
 import { toErrorMessage } from '../engine/errors'
 import { canDeliver } from '../engine/svnSyncOut'
 import { WarnGlyph } from './ConfirmDialog'
@@ -17,6 +18,8 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const textRef = useRef<HTMLTextAreaElement>(null)
+  const boxRef = useRef<HTMLDivElement>(null)
+  useFocusTrap(boxRef)
   const ready = canDeliver(message, ack, m) && !busy
 
   const finish = (ok: boolean) => {
@@ -56,6 +59,7 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
   return (
     <div className="dialog-overlay" onMouseDown={() => { if (!busy) finish(false) }}>
       <div
+        ref={boxRef}
         className="dialog dialog-wide deliver-dialog"
         role="dialog"
         aria-label={m.title}

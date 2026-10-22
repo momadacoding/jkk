@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { useFocusTrap } from './useFocusTrap'
 import { toErrorMessage } from '../engine/errors'
 
 /**
@@ -81,6 +82,8 @@ function RemoteGlyph() {
 function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
   const confirmRef = useRef<HTMLButtonElement>(null)
   const cancelRef = useRef<HTMLButtonElement>(null)
+  const boxRef = useRef<HTMLDivElement>(null)
+  useFocusTrap(boxRef)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -122,7 +125,7 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
 
   return (
     <div className="dialog-overlay" onMouseDown={() => { if (!busy) finish(false) }}>
-      <div className="dialog dialog-wide" onMouseDown={(e) => e.stopPropagation()}>
+      <div ref={boxRef} className="dialog dialog-wide" onMouseDown={(e) => e.stopPropagation()}>
         <div className="dlg-head">
           <span className={iconClass(request)}>
             {request.notice === 'ok' ? <CheckGlyph /> : <WarnGlyph />}

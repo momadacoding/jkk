@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { useFocusTrap } from './useFocusTrap'
 
 export interface PromptRequest {
   /** 标题栏文字。 */
@@ -18,6 +19,8 @@ interface Pending extends PromptRequest {
 function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
   const [value, setValue] = useState(request.defaultValue ?? '')
   const inputRef = useRef<HTMLInputElement>(null)
+  const boxRef = useRef<HTMLDivElement>(null)
+  useFocusTrap(boxRef)
 
   // 弹出来就聚焦并整段选中，对齐 window.prompt 的手感：直接打字就是覆写
   useEffect(() => {
@@ -35,7 +38,7 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
   return (
     <div className="dialog-overlay" onMouseDown={() => finish(null)}>
       {/* 点遮罩关闭，但点框内不能穿透过去 */}
-      <div className="dialog" onMouseDown={(e) => e.stopPropagation()}>
+      <div ref={boxRef} className="dialog" onMouseDown={(e) => e.stopPropagation()}>
         <div className="dialog-title">{request.title}</div>
         <label className="dialog-message" htmlFor="prompt-input">{request.message}</label>
         <input
