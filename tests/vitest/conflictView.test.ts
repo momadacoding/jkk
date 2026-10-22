@@ -68,9 +68,10 @@ describe('conflictView', () => {
     expect(v.sameAsHeadNote).toBeNull()
   })
 
-  it('④a 工作区与 HEAD 相同时提示还没合并', () => {
+  // 只说事实，不说「还没合并」：用户在工具里有意选了 HEAD 那版时也是这个状态，应用分不清
+  it('④a 工作区与 HEAD 相同时提示另一边的改动没有进来', () => {
     const v = conflictView(info({ case: 'notTextMerged', reason: 'binaryAttr', sameAsHead: true }), bc)
-    expect(v.sameAsHeadNote).toBe('工作区与 HEAD（你这边）完全相同，还没合并')
+    expect(v.sameAsHeadNote).toBe('工作区与 HEAD（你这边）完全相同：另一边的改动都没有进来')
   })
 
   it('④a 的其他来源（merge.default、LFS）用同一句文案', () => {

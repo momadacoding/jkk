@@ -9,13 +9,14 @@ export interface ConflictViewModel {
   body: string
   /** 下面要不要接着显示 HEAD 对比工作区的 diff。 */
   showDiff: boolean
-  /** 非 null 时用这句话代替 diff：两边逐字节相同，还没合并。 */
+  /** 非 null 时用这句话代替 diff：工作区与 HEAD 逐字节相同，另一边的改动都不在里面。 */
   sameAsHeadNote: string | null
   actions: ConflictAction[]
 }
 
 const NOT_TEXT_MERGED = 'git 没有逐行合并这个文件（按 .gitattributes 或 git 配置），需要手动合并'
-const SAME_AS_HEAD = '工作区与 HEAD（你这边）完全相同，还没合并'
+// 只说事实：git 原样留下 HEAD 那版、和用户在工具里有意选了 HEAD 那版，应用分不清，不能说「还没合并」
+const SAME_AS_HEAD = '工作区与 HEAD（你这边）完全相同：另一边的改动都没有进来'
 
 /**
  * 冲突信息还没读到（或读取失败）时的显示：只说有冲突，不给任何操作、不显示 diff。
