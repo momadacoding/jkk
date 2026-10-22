@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { useFocusTrap } from './useFocusTrap'
 import type { Worktree } from '../engine/types'
 import { toErrorCode, toErrorMessage } from '../engine/errors'
 
@@ -53,6 +54,8 @@ export function DeleteWorktreeDialog({ worktree, onCancel, onConfirm }: DeleteWo
   const [needsForce, setNeedsForce] = useState(false)
   const [busy, setBusy] = useState(false)
   const confirmRef = useRef<HTMLButtonElement>(null)
+  const boxRef = useRef<HTMLDivElement>(null)
+  useFocusTrap(boxRef)
 
   useEffect(() => { confirmRef.current?.focus() }, [])
 
@@ -79,7 +82,7 @@ export function DeleteWorktreeDialog({ worktree, onCancel, onConfirm }: DeleteWo
 
   return (
     <div className="dialog-overlay" onMouseDown={() => { if (!busy) onCancel() }}>
-      <div className="dialog dialog-wide" onMouseDown={(e) => e.stopPropagation()}>
+      <div ref={boxRef} className="dialog dialog-wide" onMouseDown={(e) => e.stopPropagation()}>
         <div className="dlg-head">
           <span className="dlg-icon danger"><TrashGlyph /></span>
           <div>

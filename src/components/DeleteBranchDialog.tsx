@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { useFocusTrap } from './useFocusTrap'
 import { invoke } from '@tauri-apps/api/core'
 import { toErrorMessage } from '../engine/errors'
 import type { Capabilities } from '../engine/capabilities'
@@ -149,6 +150,8 @@ export function DeleteBranchDialog({
   /** 删除正在进行中。勾了远程时这一步要走网络，实测能到四五秒。 */
   const [busy, setBusy] = useState(false)
   const confirmRef = useRef<HTMLButtonElement>(null)
+  const boxRef = useRef<HTMLDivElement>(null)
+  useFocusTrap(boxRef)
   /** 勾选框的默认值是否已经按第一次拿到的信息设过。 */
   const defaultsApplied = useRef(false)
 
@@ -223,7 +226,7 @@ export function DeleteBranchDialog({
 
   return (
     <div className="dialog-overlay" onMouseDown={() => { if (!busy) onCancel() }}>
-      <div className="dialog dialog-wide" onMouseDown={(e) => e.stopPropagation()}>
+      <div ref={boxRef} className="dialog dialog-wide" onMouseDown={(e) => e.stopPropagation()}>
         <div className="dlg-head">
           <span className="dlg-icon danger"><TrashGlyph /></span>
           <div>
