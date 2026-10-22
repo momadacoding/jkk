@@ -783,6 +783,16 @@ body {
   color: #9a8280;
 }
 
+/*
+ * 回车会按哪个按钮必须看得出来。用 :focus 而不是 :focus-visible：框多半是鼠标点出来的，
+ * 焦点是代码挪过去的，浏览器不算 focus-visible、不画框。默认按钮是 Cancel 的框（合并前确认）
+ * 尤其要看清——否则红色主按钮看着像默认按钮，与「回车等于取消」正好相反。
+ */
+.dialog-actions button:focus {
+  outline: 2px solid #4fc3f7;
+  outline-offset: 2px;
+}
+
 /* 删除分支那个框要放得下 origin/feat/... 这种长名字 */
 .dialog-wide {
   min-width: 460px;
