@@ -465,6 +465,48 @@ fn merged_path_survives_cleanup() {
     drop(external_launch::try_lock(p(dir.path()), "a.txt", "x").unwrap());
 }
 
+/// merge 工具在仓库根目录下启动（与 git mergetool 一致），不继承应用进程的工作目录。
+#[cfg(windows)]
+#[test]
+fn merge_tool_runs_in_repo_root() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = repo(false);
+    text_conflict(dir.path(), "a.txt");
+    let bin = TempDir::new().unwrap();
+    let script = bin.path().join("fake.cmd");
+    fs::write(&script, "@cd>\"%~dp0cwd.txt\"\r\n@exit /b 0\r\n").unwrap();
+
+    let (tx, rx) = mpsc::channel();
+    external_merge::open_external_merge(
+        p(dir.path()),
+        &merge_tool(
+            script.to_str().unwrap(),
+            Some(&["$LOCAL", "$REMOTE", "$BASE", "$MERGED"]),
+        ),
+        Path::new("externalTools.json"),
+        "t",
+        "a.txt",
+        move |r| tx.send(r).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(60)).unwrap().code,
+        Some(0)
+    );
+
+    let cwd = PathBuf::from(
+        fs::read_to_string(bin.path().join("cwd.txt"))
+            .unwrap()
+            .trim(),
+    );
+    assert_eq!(
+        fs::canonicalize(cwd).unwrap(),
+        fs::canonicalize(dir.path()).unwrap()
+    );
+}
+
 /// 同一个文件已经在外部工具里打开时，第二次打开被锁拦住。
 #[test]
 fn second_open_of_same_file_is_busy() {

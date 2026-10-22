@@ -235,9 +235,13 @@ pub fn exit_event(
 /// 启动失败（找不到程序、没有权限）同步返回 `launcher` 错误，`on_exit` 不会被调用，
 /// 调用方据此当场释放锁和临时目录。参数作为数组交给 std，不经过 shell；
 /// `.cmd` / `.bat` 由 std 交给 cmd.exe 并按 cmd 规则转义（见 `launcher::resolve_program`）。
+///
+/// 工具在 `cwd`（仓库根目录）下启动，与 git difftool / mergetool 一致。不设的话会继承应用进程的
+/// 工作目录（dev 版是 `src-tauri`，装机版是启动应用时的目录），UnityYAMLMerge 报错时就把那个目录拼进消息里。
 pub fn spawn_watched(
     program: &str,
     args: &[String],
+    cwd: &Path,
     on_exit: impl FnOnce(ExitReport) + Send + 'static,
 ) -> Result<()> {
     let not_found = || GitError::new("launcher", format!("找不到可执行文件 `{program}`"));
@@ -245,6 +249,7 @@ pub fn spawn_watched(
     let mut command = hidden_command(&resolved);
     command
         .args(args)
+        .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

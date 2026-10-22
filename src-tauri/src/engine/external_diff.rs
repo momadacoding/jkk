@@ -314,7 +314,7 @@ pub fn open_external_diff(
             ("REMOTE_TITLE", right_title),
         ],
     );
-    spawn_watched(&tool.program, &args, move |report| {
+    spawn_watched(&tool.program, &args, Path::new(repo_path), move |report| {
         // 清理失败（例如工具还占着文件）只留下临时目录，不影响结果上报
         let _ = ws.remove();
         drop(lock);

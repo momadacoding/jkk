@@ -225,7 +225,7 @@ pub fn open_external_merge(
             ("MERGED_TITLE", m.titles.merged),
         ],
     );
-    spawn_watched(&tool.program, &args, move |report| {
+    spawn_watched(&tool.program, &args, Path::new(repo_path), move |report| {
         // 只删本次的临时子目录；`$MERGED` 在工作区里，不在删除范围内
         let _ = ws.remove();
         drop(lock);

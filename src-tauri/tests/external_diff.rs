@@ -632,6 +632,49 @@ fn second_open_of_same_file_is_busy() {
     assert_eq!(err.code, "external_tool_busy");
 }
 
+/// diff 工具在仓库根目录下启动（与 git difftool 一致），不继承应用进程的工作目录。
+#[cfg(windows)]
+#[test]
+fn diff_tool_runs_in_repo_root() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = repo();
+    commit_file(dir.path(), "a.txt", b"v1\n", "c1");
+    fs::write(dir.path().join("a.txt"), "v2\n").unwrap();
+    let bin = TempDir::new().unwrap();
+    let script = bin.path().join("fake.cmd");
+    fs::write(&script, "@cd>\"%~dp0cwd.txt\"\r\n@exit /b 0\r\n").unwrap();
+
+    let cfg = tool(script.to_str().unwrap(), Some(&["$LOCAL", "$REMOTE"]));
+    let (tx, rx) = mpsc::channel();
+    external_diff::open_external_diff(
+        p(dir.path()),
+        &cfg,
+        Path::new("externalTools.json"),
+        "t",
+        &DiffTarget::Unstaged {
+            file: "a.txt".into(),
+        },
+        move |r| tx.send(r).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(60)).unwrap().code,
+        Some(0)
+    );
+
+    let cwd = PathBuf::from(
+        fs::read_to_string(bin.path().join("cwd.txt"))
+            .unwrap()
+            .trim(),
+    );
+    assert_eq!(
+        fs::canonicalize(cwd).unwrap(),
+        fs::canonicalize(dir.path()).unwrap()
+    );
+}
+
 /// 进程退出后：回调拿到退出码、临时目录已删、锁已放开、工作区文件还在。
 #[cfg(windows)]
 #[test]

@@ -141,9 +141,10 @@ fn wait_exit(rx: &mpsc::Receiver<ExitReport>) -> ExitReport {
 #[test]
 fn spawn_missing_program_errors_synchronously() {
     for program in ["jkk-definitely-not-a-program", "C:/jkk-nope/missing.exe"] {
-        let err =
-            external_launch::spawn_watched(program, &[], |_| panic!("启动失败时不应回调 on_exit"))
-                .unwrap_err();
+        let err = external_launch::spawn_watched(program, &[], &std::env::temp_dir(), |_| {
+            panic!("启动失败时不应回调 on_exit")
+        })
+        .unwrap_err();
         assert_eq!(err.code, "launcher", "{program}");
         assert!(err.message.contains(program), "{}", err.message);
     }
@@ -190,9 +191,14 @@ mod windows {
 
     fn run_and_read(program: &Path, out: &Path, args: &[String]) -> Vec<String> {
         let (tx, rx) = mpsc::channel();
-        external_launch::spawn_watched(program.to_str().unwrap(), args, move |r| {
-            tx.send(r).unwrap();
-        })
+        external_launch::spawn_watched(
+            program.to_str().unwrap(),
+            args,
+            out.parent().unwrap(),
+            move |r| {
+                tx.send(r).unwrap();
+            },
+        )
         .unwrap();
         let report = wait_exit(&rx);
         assert_eq!(report.code, Some(0), "{report:?}");
@@ -221,6 +227,46 @@ mod windows {
         assert_eq!(got, tricky_args());
     }
 
+    /// 工具在调用方给的目录里启动，不继承应用进程的工作目录（dev 版是 `src-tauri`）。
+    /// UnityYAMLMerge 报错时会把工作目录拼进消息里，git mergetool 也是在仓库根目录下起工具。
+    /// 目录名带中文和空格：用 rustc 编的程序写出 `current_dir`，避开 cmd 的 OEM 代码页。
+    #[test]
+    fn spawn_watched_runs_in_given_dir() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("cwd.rs");
+        fs::write(
+            &src,
+            r#"fn main() {
+                let out = std::env::current_exe().unwrap().with_extension("out");
+                std::fs::write(out, std::env::current_dir().unwrap().to_str().unwrap()).unwrap();
+            }"#,
+        )
+        .unwrap();
+        let exe = dir.path().join("cwd.exe");
+        let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+        let status = Command::new(rustc)
+            .arg("-o")
+            .arg(&exe)
+            .arg(&src)
+            .status()
+            .expect("找不到 rustc");
+        assert!(status.success(), "编译 cwd 转储程序失败");
+        let work = dir.path().join("仓库 dir");
+        fs::create_dir(&work).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        external_launch::spawn_watched(exe.to_str().unwrap(), &[], &work, move |r| {
+            tx.send(r).unwrap();
+        })
+        .unwrap();
+        assert_eq!(wait_exit(&rx).code, Some(0));
+        let got = PathBuf::from(fs::read_to_string(exe.with_extension("out")).unwrap());
+        assert_eq!(
+            fs::canonicalize(got).unwrap(),
+            fs::canonicalize(&work).unwrap()
+        );
+    }
+
     #[test]
     fn spawn_watched_reports_nonzero_exit() {
         let dir = TempDir::new().unwrap();
@@ -228,7 +274,7 @@ mod windows {
         fs::write(&cmd, "@exit /b 7\r\n").unwrap();
 
         let (tx, rx) = mpsc::channel();
-        external_launch::spawn_watched(cmd.to_str().unwrap(), &[], move |r| {
+        external_launch::spawn_watched(cmd.to_str().unwrap(), &[], dir.path(), move |r| {
             tx.send(r).unwrap();
         })
         .unwrap();
