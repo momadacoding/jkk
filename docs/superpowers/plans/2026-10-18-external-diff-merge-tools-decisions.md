@@ -453,5 +453,15 @@
 - 实测：UnityYAMLMerge 自带的 `mergespecfile.txt` 里 `.unity` / `.prefab` 的专用后备是占位程序 `YouFallbackMergeToolForScenesHere.exe`，不存在，会落到 `*` 行；`*` 行里 PlasticSCM 之后是 `%programs%\Beyond Compare 5\bcomp.exe "%r" "%l" "%b" "%d"`。
 - 用户授权（2026-10-22）：改用户真实的 `%APPDATA%\com.momadacoding.jkk\externalTools.json`，加 `unityyamlmerge` 工具与 `*.unity` / `*.prefab` / `*.asset` 的 merge 规则，**验完保留**。改前原文件备份在本会话 scratchpad（`externalTools.json.bak`），改后 JSON 能解析、程序路径存在。
 - 6b 实测时用户指出文案矛盾：在 BC 里有意把结果选成 HEAD 那版后，右侧显示「工作区与 HEAD（你这边）完全相同，还没合并」——既然已经完全相同，为什么说还没合并。根因是这句话把推断当事实：应用分不清「git / driver 原样留下 HEAD 那版」和「用户有意选了 HEAD 那版」。方案 A/B 交用户选，用户选 A。Ruling：改为只说事实「工作区与 HEAD（你这边）完全相同：另一边的改动都没有进来」，仍不说「可以暂存」（spec §4.1 总原则）；spec §4.1 表格同步修订 —— 代价：无。TDD：先改 `conflictView.test.ts` 断言，红灯实测收到旧文案；改 `conflictView.ts` 常量后 `pnpm build` 通过、`pnpm test` 48 文件 717 例全过。
+- 第 12 条验收后用户发现：选中 5 万文件的根提交 `big`，提交详情显示 `M Assets/D0000/F001.cs +1/-0`，diff 内容是用户刚在工作区加的那一行——把工作区改动当成了这个提交的改动。
+  - 根因（实测）：后端 `read_diff` 对根提交是对的（父树为空，全部是新增）。临时探针（release 构建，测完已删）：这个提交的 `read_diff` 要 **47.4 秒**，JSON **10.6 MB**；dev 窗口是 debug 构建，更慢。这期间 store 里只有一份 `diff`，仍是上一个 scope（`workdir`）的，提交详情直接拿来显示。master 上就是这样（`refreshDiff` 回来之前不清旧 diff），不是本分支引入的；平时几毫秒就换掉了看不出来。
+  - Ruling（用户 2026-10-22 选定，**偏离计划**：本分支修，而不是另开分支）：store 记下 `diffScope`（这份 diff 是按哪个 scope 读的）；新增纯函数 `src/engine/currentDiff.ts`，scope 与当前视图要的不一致时返回 `null`；`RepoTab` 给提交详情传 `currentDiff(diff, diffScope, commitScope)`、给本地改动传 `currentDiff(…, 'workdir')`；两个视图拿到 `null` 时说「正在读取这个提交的改动…」/「正在读取工作区的改动…」，不列文件、Changes 不带个数。读失败时把这个 scope 记成空 diff（否则界面永远说正在读取），错误照旧抛给调用方 —— 代价：两个视图的 `diff` prop 变成 `DiffData | null`。
+  - TDD：先写 `currentDiff.test.ts`（5）、`CommitDetailView.test.tsx`（+2）、`LocalChangesView.test.tsx`（+1），红灯实测模块不存在、视图读 `null.files` 崩溃；`repoStoreDiffRefresh.test.ts`（+2）是改完 store 之后补的，没有单独跑过红灯（断言的 `diffScope` 字段在旧代码里不存在）。`pnpm build` 通过，`pnpm test` 49 文件 727 例全过。
+  - 遗留：`useRepoEffects` 里按选中刷新 diff 的 effect 没有 `.catch`，读失败是未处理的 rejection、顶部不报错（master 上就是这样）；现在失败时视图显示为空列表而不是旧 diff，仍可能被误读成「这个提交没有改动」。
+- 后续（用户 2026-10-22 要求记录方案，不在本分支做）：超大提交的 diff 太慢、太大（5 万文件 47 秒 / 10.6 MB）。`read_diff` 对 `commit:` 一次性 `find_similar` + 打印所有文件的完整 patch，再整份序列化给前端。方案：
+  1. 先定位 47 秒花在哪：`diff_tree_to_tree`、`find_similar`（5 万新增文件的改名检测）、`print(Patch)`、serde 序列化各计时。
+  2. 接口分两步：`read_diff_summary` 只返回文件列表与增删行数（`git2::DiffStats` / 逐文件 `Patch::line_stats`，不拼 hunk 文本）；点到某个文件时再 `read_file_diff(scope, path)` 取那一个文件的 patch。`CommitDetailView` 的文件列表与 Changes 树只依赖前者。
+  3. 文件数超过阈值（例如 1000）时跳过改名检测，并在界面上说明「文件太多，未检测改名」；或按 `diff.renameLimit` 的思路设上限。
+  4. 文件列表本身上万条时，Commit 标签页的平铺列表要虚拟滚动或截断（File Tree 标签页已有「文件太多，只显示前 N 条」的先例）。
 - 发现但不在本分支处理：冲突没解决完时点 Commit，界面只显示 git 的英文原文。可以改成有冲突时禁用 Commit 或给中文提示，提交流程不在本计划范围，记为后续事项。
 - 6b 实测时用户提出、不在本分支处理（用户 2026-10-22 确认记为后续）：合并结果与 HEAD 相同时，Stage 后 Staged 为空，但仍要 Commit 才能结束合并，界面上只有顶部 `merge in progress` 一条线索，用户会以为没事可做。改进方向：合并进行中且冲突已全部解决时，横幅写「冲突已全部解决，提交以完成合并」，Commit 按钮改叫「提交合并」；应用里也没有放弃合并（`merge --abort`）的入口。与上一条同属提交流程，一起做。
