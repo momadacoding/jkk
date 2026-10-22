@@ -5,7 +5,8 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 import { beforeAll, describe, expect, it, vi } from 'vitest'
 import { LocalChangesView } from '@/components/LocalChangesView'
 import type { ExternalTool, ExternalToolsConfig } from '@/engine/externalTools'
-import type { ConflictInfo, FileChange, StatusData } from '@/engine/types'
+import type { ConflictInfo, DiffData, FileChange, StatusData } from '@/engine/types'
+import type { FileSelection } from '@/engine/fileSelection'
 
 // react-resizable-panels 挂载时要 new 一个 ResizeObserver，jsdom 没有。
 // 这里不测布局，给个什么都不做的桩就够了。
@@ -429,5 +430,109 @@ describe('LocalChangesView：diff 还没读回来', () => {
     )
     fireEvent.click(screen.getByText('a.txt'))
     expect(screen.getByText('正在读取工作区的改动…')).toBeTruthy()
+  })
+})
+
+// 第 65 条：右侧 diff 按选中文件所在的区读。选中由 RepoTab 持有（它要据此决定读哪个 scope），
+// 组件拿到的是受控的 selection。
+describe('LocalChangesView 的选中按区', () => {
+  function mountWith(status: StatusData, selection: FileSelection, diff: DiffData | null = { files: [] }) {
+    const onSelectionChange = vi.fn()
+    const onDiscard = vi.fn()
+    render(
+      <LocalChangesView
+        status={status}
+        diff={diff}
+        onStage={vi.fn()}
+        onUnstage={vi.fn()}
+        onDiscard={onDiscard}
+        onCommit={vi.fn()}
+        svnMode={false}
+        onBaselineBranch={false}
+        selection={selection}
+        onSelectionChange={onSelectionChange}
+      />,
+    )
+    return { onSelectionChange, onDiscard }
+  }
+
+  /** 某个区里的某一行。同一个文件两个区都有时，按区取。 */
+  function rowIn(title: 'Unstaged' | 'Staged', path: string): HTMLElement {
+    const header = screen.getByText((_, el) => el?.tagName === 'SPAN' && el.textContent?.startsWith(`${title} (`) === true)
+    const section = header.closest('.changes-section')
+    if (!(section instanceof HTMLElement)) throw new Error(`找不到 ${title} 区`)
+    const row = within(section).getByText(path).closest('.changes-file')
+    if (!(row instanceof HTMLElement)) throw new Error(`找不到 ${title} 区的 ${path}`)
+    return row
+  }
+
+  const none: FileSelection = { section: null, paths: [], anchor: null }
+  const both: StatusData = { unstaged: [change('a.txt')], staged: [change('a.txt')] }
+
+  it('点 Staged 里的行：交给父组件的选中是 Staged 的它', () => {
+    const { onSelectionChange } = mountWith(both, none)
+    fireEvent.click(within(rowIn('Staged', 'a.txt')).getByText('a.txt'))
+    expect(onSelectionChange).toHaveBeenLastCalledWith({ section: 'staged', paths: ['a.txt'], anchor: 'a.txt' })
+  })
+
+  it('同一个文件两边都有：只高亮选中的那一边', () => {
+    mountWith(both, { section: 'staged', paths: ['a.txt'], anchor: 'a.txt' })
+    expect(rowIn('Staged', 'a.txt').classList.contains('active')).toBe(true)
+    expect(rowIn('Unstaged', 'a.txt').classList.contains('active')).toBe(false)
+  })
+
+  it('什么都没选：右侧显示默认的第一个，但不把它高亮成选中', () => {
+    mountWith({ unstaged: [change('a.txt')], staged: [change('s.txt')] }, none)
+    expect(document.querySelectorAll('.changes-file.active')).toHaveLength(0)
+  })
+
+  it('选中的文件刚被整份暂存：选中跟到 Staged，在那里按 Delete 丢的就是它', () => {
+    // 父组件里记的还是「Unstaged 的 a.txt」，但 a.txt 已经只在 Staged 里了
+    const { onDiscard } = mountWith(
+      { unstaged: [change('b.txt')], staged: [change('a.txt')] },
+      { section: 'unstaged', paths: ['a.txt'], anchor: 'a.txt' },
+    )
+    const row = rowIn('Staged', 'a.txt')
+    expect(row.classList.contains('active')).toBe(true)
+    expect(row.classList.contains('selected')).toBe(true)
+    const list = row.closest('.changes-section-files')
+    if (!(list instanceof HTMLElement)) throw new Error('找不到 Staged 列表')
+    fireEvent.keyDown(list, { key: 'Delete' })
+    expect(onDiscard).toHaveBeenCalledWith(['a.txt'], true)
+  })
+
+  it('受控时不自己写回对齐结果：那是持有者（RepoTab）的事，它在本组件没挂载时也要对齐', () => {
+    const { onSelectionChange } = mountWith(
+      { unstaged: [change('b.txt')], staged: [change('a.txt')] },
+      { section: 'unstaged', paths: ['a.txt'], anchor: 'a.txt' },
+    )
+    expect(onSelectionChange).not.toHaveBeenCalled()
+  })
+
+  it('不受控时自己存回对齐结果：a.txt 暂存后又被改动、两边都有，选中仍在 Staged', () => {
+    const props = {
+      diff: { files: [] },
+      onStage: vi.fn(),
+      onUnstage: vi.fn(),
+      onDiscard: vi.fn(),
+      onCommit: vi.fn(),
+      svnMode: false,
+      onBaselineBranch: false,
+    }
+    const { rerender } = render(
+      <LocalChangesView {...props} status={{ unstaged: [change('a.txt'), change('b.txt')], staged: [] }} />,
+    )
+    fireEvent.click(within(rowIn('Unstaged', 'a.txt')).getByText('a.txt'))
+    // 整份暂存
+    rerender(<LocalChangesView {...props} status={{ unstaged: [change('b.txt')], staged: [change('a.txt')] }} />)
+    // 又在工作区改了一下：两边都有
+    rerender(<LocalChangesView {...props} status={{ unstaged: [change('a.txt'), change('b.txt')], staged: [change('a.txt')] }} />)
+    expect(rowIn('Staged', 'a.txt').classList.contains('active')).toBe(true)
+    expect(rowIn('Unstaged', 'a.txt').classList.contains('active')).toBe(false)
+  })
+
+  it('Staged 的 diff 还没读回来：说正在读取暂存区，不说工作区', () => {
+    mountWith({ unstaged: [], staged: [change('s.txt')] }, { section: 'staged', paths: ['s.txt'], anchor: 's.txt' }, null)
+    expect(screen.getByText('正在读取暂存区的改动…')).toBeTruthy()
   })
 })

@@ -1,11 +1,14 @@
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Panel, Group, Separator } from 'react-resizable-panels'
 import type { ConflictInfo, DiffData, FileChange, StatusData } from '../engine/types'
 import { DiffView } from './DiffView'
 import { ContextMenu, useContextMenu, type MenuItem } from './ContextMenu'
 import {
+  activeChange,
+  changesPaths,
   emptyFileSelection,
   nextFileSelection,
+  reconcileSelection,
   type FileSection,
   type FileSelection,
 } from '../engine/fileSelection'
@@ -123,10 +126,18 @@ interface LocalChangesViewProps {
   conflicts?: ConflictInfo[] | null
   /** ③ 一边删一边改的二选一，立即暂存；不传时不显示这两个按钮。 */
   onResolveDeleteModify?: (file: string, keep: boolean) => void
+  /**
+   * 受控的选中（第 65 条）。右侧 diff 按选中文件所在的区读——Unstaged 是暂存区对比工作区，
+   * Staged 是 HEAD 对比暂存区——读哪个 scope 由父组件在渲染时从这份选中算出来，
+   * 所以选中放在父组件里。不传时组件自己持有（单独挂载、测试）。
+   */
+  selection?: FileSelection
+  onSelectionChange?: (selection: FileSelection) => void
 }
 
-export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, onCommit, svnMode, onBaselineBranch, externalTools, conflicts, onResolveDeleteModify }: LocalChangesViewProps) {
-  const [selection, setSelection] = useState<FileSelection>(emptyFileSelection)
+export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, onCommit, svnMode, onBaselineBranch, externalTools, conflicts, onResolveDeleteModify, selection: selectionProp, onSelectionChange }: LocalChangesViewProps) {
+  const [ownSelection, setOwnSelection] = useState<FileSelection>(emptyFileSelection)
+  const setSelection = onSelectionChange ?? setOwnSelection
   const [subject, setSubject] = useState('')
   const [description, setDescription] = useState('')
   const [amend, setAmend] = useState(false)
@@ -136,18 +147,35 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
   const { confirm, dialog: confirmDialog } = useConfirm()
 
   const unstaged = useMemo(() => conflictsFirst(status.unstaged), [status.unstaged])
-  const allFiles = useMemo(() => [...unstaged, ...status.staged], [unstaged, status.staged])
   const conflicted = useMemo(
     () => new Set(status.unstaged.filter((f) => f.status === 'conflicted').map((f) => f.path)),
     [status.unstaged],
   )
-  // diff 面板显示最后点到的那一个；多选时看的是其中一个，不是拼在一起
-  const activeFile = selection.paths[selection.paths.length - 1] ?? allFiles[0]?.path ?? null
+  const paths = useMemo(() => changesPaths(status), [status])
+  // 状态刷新后先让选中与列表对齐（文件被整份暂存时跟到 Staged），高亮、快捷键、右侧显示
+  // 都用对齐后的这一份；父组件算 scope 用的是同一个函数，两边不会分叉
+  const rawSelection = selectionProp ?? ownSelection
+  const selection = useMemo(
+    () => reconcileSelection(rawSelection, paths.unstaged, paths.staged),
+    [rawSelection, paths],
+  )
+  // 渲染已经按对齐后的那份走了，这里只是把它存回去：不存的话，存着的仍是
+  // 「Unstaged 的 a.txt」，a.txt 之后再被改动、两边都有时选中会跳回 Unstaged。
+  // 只管自己持有的那份；受控时由持有者在状态变化时对齐（本组件不挂载时状态也会变）
+  useEffect(() => {
+    if (!selectionProp && selection !== ownSelection) setOwnSelection(selection)
+  }, [selectionProp, selection, ownSelection])
+  // diff 面板显示最后点到的那一个；多选时看的是其中一个，不是拼在一起。
+  // 父组件按它所在的区读 diff，传下来的 `diff` 里同一路径最多一条
+  const active = activeChange(selection, paths.unstaged, paths.staged)
+  const activeFile = active?.path ?? null
   const activeDiff: DiffData = useMemo(() => ({
     files: (diff?.files ?? []).filter((f) => f.path === activeFile),
   }), [diff, activeFile])
   const diffPane = diff === null
-    ? <div className="diff-note">正在读取工作区的改动…</div>
+    ? <div className="diff-note">
+        {active?.section === 'staged' ? '正在读取暂存区的改动…' : '正在读取工作区的改动…'}
+      </div>
     : <DiffView diff={activeDiff} />
   const conflictByPath = useMemo(
     () => new Map((conflicts ?? []).map((c) => [c.path, c])),
@@ -180,7 +208,8 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
   }
 
   const click = (section: FileSection, files: string[], path: string, e: React.MouseEvent) => {
-    setSelection((cur) => nextFileSelection(cur, section, files, path, {
+    // 从对齐后的选中算下一步：父组件里记着的那份可能还停在文件已经离开的那个区
+    setSelection(nextFileSelection(selection, section, files, path, {
       ctrl: e.ctrlKey || e.metaKey,
       shift: e.shiftKey,
     }))
@@ -229,10 +258,7 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
       altKey: e.altKey,
       repeat: e.repeat,
       isComposing: e.nativeEvent.isComposing,
-    }, section, selection, {
-      unstaged: unstaged.map((f) => f.path),
-      staged: status.staged.map((f) => f.path),
-    })
+    }, section, selection, paths)
     if (!req) return
     e.preventDefault()
     onDiscard(req.paths, req.staged)

@@ -71,6 +71,9 @@ fn workdir_diff_opts(only: Option<&[String]>) -> DiffOptions {
         for p in paths {
             opts.pathspec(p);
         }
+        // 按字面量匹配：`f[1].txt` 当模式会连 `f1.txt` 一起匹配上，
+        // 而那恰好可能就是要绕开的坏路径，拉回来之后整个输出又会中止
+        opts.disable_pathspec_match(true);
     }
     opts
 }
@@ -304,22 +307,48 @@ pub fn read_diff(path: &str, scope: String) -> Result<DiffData> {
         diff.find_similar(None)?;
         return diff_to_data(diff);
     }
-    // default: workdir vs HEAD（空仓库没有 HEAD，此时与空树比较）
+    // 空仓库没有 HEAD，此时与空树比较
     let tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
-    let diff =
-        repo.diff_tree_to_workdir_with_index(tree.as_ref(), Some(&mut workdir_diff_opts(None)))?;
-    let mut data = match readable_only(&repo, &diff) {
+    match scope.as_str() {
+        // 「本地改动」按分区比较（第 65 条），与外部 diff 的两侧取法一致：
+        // Staged = HEAD 对比暂存区，即这次提交会提交什么
+        "staged" => {
+            // 不做改名检测：Staged 列表来自 `read_status`，它把 `git mv` 列成一删一增两项。
+            // 这里若合成一条改名，点到旧路径那一项时右侧就找不到它的 diff
+            let diff = repo.diff_tree_to_index(tree.as_ref(), None, None)?;
+            let mut data = diff_to_data(diff)?;
+            // 合并冲突中 index 里的冲突条目也会出现在这里，但 `read_status` 只把冲突文件放进
+            // Unstaged（显示 HEAD 对比工作区）。留着它，Staged 的 diff 就多出列表里没有的项
+            data.files.retain(|f| f.status != "conflicted");
+            Ok(data)
+        }
+        // Unstaged = 暂存区对比工作区，即还没暂存的那部分
+        "unstaged" => workdir_side(&repo, tree.as_ref(), |opts| {
+            repo.diff_index_to_workdir(None, Some(opts))
+        }),
+        // workdir（以及其余认不出的 scope）：HEAD 对比工作区
+        _ => workdir_side(&repo, tree.as_ref(), |opts| {
+            repo.diff_tree_to_workdir_with_index(tree.as_ref(), Some(opts))
+        }),
+    }
+}
+
+/// 拿 `build` 给出的那一侧与工作区比。坏路径与冲突文件的处理两个 scope 共用。
+fn workdir_side<'r>(
+    repo: &'r Repository,
+    head_tree: Option<&git2::Tree>,
+    build: impl Fn(&mut DiffOptions) -> std::result::Result<git2::Diff<'r>, git2::Error>,
+) -> Result<DiffData> {
+    let diff = build(&mut workdir_diff_opts(None))?;
+    let mut data = match readable_only(repo, &diff) {
         None => diff_to_data(diff)?,
         // 一个能读的都没有：返回空 diff 而不是让整个视图报错。
         // 注意此时不能拿空的 pathspec 去重建——那等于不加限制，又会撞上坏路径。
         Some(good) if good.is_empty() => DiffData { files: Vec::new() },
-        Some(good) => diff_to_data(repo.diff_tree_to_workdir_with_index(
-            tree.as_ref(),
-            Some(&mut workdir_diff_opts(Some(&good))),
-        )?)?,
+        Some(good) => diff_to_data(build(&mut workdir_diff_opts(Some(&good)))?)?,
     };
     // 补不出来只是冲突文件没有行内容，不能让整个变更视图跟着报错
-    if let Err(e) = fill_conflicted(&repo, tree.as_ref(), &mut data) {
+    if let Err(e) = fill_conflicted(repo, head_tree, &mut data) {
         log::warn!("冲突文件的 diff 读取失败：{}", e.message);
     }
     Ok(data)

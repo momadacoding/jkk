@@ -29,6 +29,7 @@ import {
 
 import { toErrorCode, toErrorMessage } from '../engine/errors'
 import { createLatestGate } from '@/engine/latestGate'
+import { changesSection, type FileSection, type FileSelection } from '@/engine/fileSelection'
 import type { DriverReport } from '@/engine/mergeDrivers'
 import type {
   Health,
@@ -422,6 +423,9 @@ export function useRepoStore() {
    * 它要么让那个提交的结果作废，要么晚到后把工作区的改动盖在提交详情上（Codex review 第 2 条）。
    */
   const wantedDiffScope = useRef<string | null | undefined>(undefined)
+  /** 最新渲染时的状态。`refreshChanges` 的状态读取被更晚的刷新盖掉时，按它算区。 */
+  const latestStatus = useRef(state.status)
+  latestStatus.current = state.status
 
   const openRepo = useCallback(async (path: string) => {
     setState((s) => ({ ...s, loading: true, error: null, errorCode: null }))
@@ -539,15 +543,20 @@ export function useRepoStore() {
     })
   }
 
-  const refreshStatus = async (path: string) => {
+  /**
+   * 交回读到的状态：Stage / Unstage 之后选中的文件可能换了区，调用方要按新状态算
+   * 接下来读哪个区的 diff（第 65 条）。被更晚的请求盖掉时交回 undefined。
+   */
+  const refreshStatus = async (path: string): Promise<StatusData | undefined> => {
     const token = refreshGate.begin('status')
     const status = await invoke<StatusData>('read_status', { path })
     // 文件监听、外部工具退出、用户操作会同时各发一次；晚到的旧结果不能盖掉新的
-    if (!refreshGate.isLatest(token, 'status')) return
+    if (!refreshGate.isLatest(token, 'status')) return undefined
     setState((s) => ({ ...s, status }))
     // 冲突的分类跟着 status 走：文件监听、外部工具退出、用户操作都经过这里，
     // BC 存盘后 ① 变 ② 不需要另挂一条刷新路径
     await refreshConflicts(path, status)
+    return status
   }
 
   /**
@@ -803,6 +812,19 @@ export function useRepoStore() {
     setState((s) => ({ ...s, diff, diffScope: scope }))
   }
 
+  /**
+   * 写操作（Stage / Unstage / 丢弃 / 提交 / DU-UD 二选一）之后刷新「本地改动」。
+   *
+   * 按**刷新后**的状态算该读哪个区（第 65 条）：选中的文件可能刚换了区，按点击那一刻的区去读，
+   * 读回来的整份 diff 只会被丢掉。`selection` 是取值函数，调用方传最新的选中。
+   */
+  const refreshChanges = async (path: string, selection: () => FileSelection) => {
+    const status = await refreshStatus(path)
+    // 被更晚的状态刷新盖掉时也不能跳过：盖掉它的可能是工具栏、checkout 这些只刷状态、
+    // 不读 diff 的路径，跳过的话右侧就停在旧内容上。按 store 里最新的状态算区
+    await refreshDiff(path, changesSection(selection(), status ?? latestStatus.current))
+  }
+
   const selectCommit = (id: string) => {
     setState((s) => ({ ...s, selectedId: id }))
   }
@@ -843,6 +865,7 @@ export function useRepoStore() {
     clearError,
     reportError,
     wantedDiffScope,
+    refreshChanges,
   }
 }
 
@@ -850,7 +873,7 @@ export function useRepoStore() {
 export interface RepoRefreshers {
   refreshHead: (path: string) => Promise<string>
   refreshGraph: (path: string) => Promise<void>
-  refreshStatus: (path: string) => Promise<void>
+  refreshStatus: (path: string) => Promise<StatusData | undefined>
   refreshWorktrees: (path: string) => Promise<void>
   /** `.gitattributes` 或 git 配置变了要重查；后端按指纹缓存，没变时不重扫。 */
   refreshMergeDrivers: (path: string) => Promise<DriverReport>
@@ -867,15 +890,20 @@ export interface RepoRefreshers {
   wantedDiffScope: MutableRefObject<string | null | undefined>
 }
 
+/**
+ * @param changesScope 「本地改动」视图右侧 diff 的 scope：选中文件在 Unstaged 是 `unstaged`
+ *   （暂存区对比工作区），在 Staged 是 `staged`（HEAD 对比暂存区），见第 65 条
+ */
 export function useRepoEffects(
   state: RepoState,
   refreshers: RepoRefreshers,
   viewMode: string,
+  changesScope: FileSection,
 ) {
   const { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, refreshSvnSyncState, auditSvnIfDue } = refreshers
   // svn 节点有两版本地基线时读两版之差（`range:`）；不在图上的选中（stash）照旧按 oid 读
   const diffScope = viewMode === 'changes'
-    ? 'workdir'
+    ? changesScope
     : selectionDiffScope(state.commits, state.selectedId)
   // 在渲染里写而不是在 effect 里写：下面那个按选中刷新 diff 的 effect 发请求之前，它必须已经是新值
   refreshers.wantedDiffScope.current = diffScope
@@ -888,6 +916,9 @@ export function useRepoEffects(
   useEffect(() => {
     if (!state.path) return
     let unlisten: (() => void) | undefined
+    // 依赖里有 diffScope，换选中、换区都会重新注册。`listen` 是一次 IPC 往返，
+    // 清理时它可能还没回来：回来之后立刻注销，否则每换一次就多挂一个监听器（同 `useExternalToolExit`）
+    let disposed = false
     listen<string>('repo-changed', (event) => {
       const path = state.path!
       // 事件是全局广播的，每个标签只认自己那个仓库的变更
@@ -903,7 +934,10 @@ export function useRepoEffects(
       void refreshUpstream(path).catch(ignore)
       void refreshStashes(path).catch(ignore)
       void refreshMergeDrivers(path).catch(ignore)
-      if (diffScope) void refreshDiff(path, diffScope).catch(ignore)
+      // 按事件到达时当前视图要的那份读，不按注册时的 diffScope：Stage 之后选中的文件
+      // 可能已经换了区，旧区那一份读回来只会被丢掉
+      const scope = refreshers.wantedDiffScope.current
+      if (scope) void refreshDiff(path, scope).catch(ignore)
       // §6.6.3 的**分层**：高频通道上只跑 O(1) 的第一档，变了才跑第二档。
       //
       // 不分层的话，每一次文件保存都会触发一遍白名单子树的 `svn status -v`
@@ -923,8 +957,14 @@ export function useRepoEffects(
         // 它是纯本地读（一次 stat + 一个小文件），挂在高频通道上不需要分层。
         void refreshSvnSyncState(path).catch(ignore)
       }
-    }).then((fn) => { unlisten = fn })
-    return () => { unlisten?.() }
+    }).then((fn) => {
+      if (disposed) fn()
+      else unlisten = fn
+    })
+    return () => {
+      disposed = true
+      unlisten?.()
+    }
   }, [state.path, diffScope])
 
   /**
