@@ -10,13 +10,14 @@ interface Pending {
   cmd: string
   args: Record<string, unknown>
   resolve: (value: unknown) => void
+  reject: (reason: unknown) => void
 }
 
 const pending: Pending[] = []
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: (cmd: string, args: Record<string, unknown>) =>
-    new Promise((resolve) => { pending.push({ cmd, args, resolve }) }),
+    new Promise((resolve, reject) => { pending.push({ cmd, args, resolve, reject }) }),
 }))
 vi.mock('@tauri-apps/api/event', () => ({ listen: () => Promise.resolve(() => {}) }))
 
@@ -82,5 +83,38 @@ describe('refreshDiff 只写回当前视图要的那一份', () => {
     act(() => { void result.current.refreshDiff('C:/r', 'workdir') })
     await answer('workdir', diffOf('a.txt'))
     expect(result.current.state.diff.files.map((f) => f.path)).toEqual(['a.txt'])
+  })
+})
+
+// 界面用 `currentDiff(diff, diffScope, 当前视图要的)` 决定显示 diff 还是「正在读取」
+describe('refreshDiff 记下 diff 是哪个 scope 的', () => {
+  it('写回时一起记下 scope；新请求回来之前 diffScope 仍是上一份的', async () => {
+    const { result } = renderHook(() => useRepoStore())
+    expect(result.current.state.diffScope).toBeNull()
+    result.current.wantedDiffScope.current = 'workdir'
+    act(() => { void result.current.refreshDiff('C:/r', 'workdir') })
+    await answer('workdir', diffOf('dirty.txt'))
+    expect(result.current.state.diffScope).toBe('workdir')
+
+    result.current.wantedDiffScope.current = 'commit:B'
+    act(() => { void result.current.refreshDiff('C:/r', 'commit:B') })
+    // 大提交的 diff 还在读：store 里仍是工作区那份，scope 也如实是 workdir
+    expect(result.current.state.diffScope).toBe('workdir')
+    await answer('commit:B', diffOf('b.txt'))
+    expect(result.current.state.diffScope).toBe('commit:B')
+  })
+
+  it('读失败：记成这个 scope 的空 diff（不让界面一直说正在读取），错误照旧抛给调用方', async () => {
+    const { result } = renderHook(() => useRepoStore())
+    result.current.wantedDiffScope.current = 'commit:B'
+    let run!: Promise<void>
+    act(() => { run = result.current.refreshDiff('C:/r', 'commit:B') })
+    const call = pending.find((p) => p.cmd === 'read_diff')!
+    await act(async () => {
+      call.reject(new Error('boom'))
+      await expect(run).rejects.toThrow('boom')
+    })
+    expect(result.current.state.diffScope).toBe('commit:B')
+    expect(result.current.state.diff.files).toEqual([])
   })
 })

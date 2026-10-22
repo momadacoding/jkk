@@ -410,3 +410,24 @@ describe('LocalChangesView 的一边删一边改', () => {
     expect(screen.queryByRole('button', { name: '保留修改后的文件' })).toBeNull()
   })
 })
+
+// diff 为 null = 工作区 diff 还没读回来（`currentDiff`），比如刚从提交详情切回来。
+// 右侧不能留着上一个视图的 diff
+describe('LocalChangesView：diff 还没读回来', () => {
+  it('右侧说正在读取', () => {
+    render(
+      <LocalChangesView
+        status={{ unstaged: [change('a.txt')], staged: [] }}
+        diff={null}
+        onStage={vi.fn()}
+        onUnstage={vi.fn()}
+        onDiscard={vi.fn()}
+        onCommit={vi.fn()}
+        svnMode={false}
+        onBaselineBranch={false}
+      />,
+    )
+    fireEvent.click(screen.getByText('a.txt'))
+    expect(screen.getByText('正在读取工作区的改动…')).toBeTruthy()
+  })
+})

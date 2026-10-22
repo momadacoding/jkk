@@ -134,6 +134,23 @@ describe('CommitDetailView：所在分支', () => {
   })
 })
 
+// diff 为 null = 这个提交的 diff 还没读回来（`currentDiff`）。2026-10-22 E2E：大提交要几十秒，
+// 这期间不能显示上一份 diff 的文件，也不能在 Changes 上标上一份的个数
+describe('CommitDetailView：diff 还没读回来', () => {
+  it('Commit 标签页说正在读取，不列文件，Changes 不带个数', () => {
+    render(<CommitDetailView commit={three[1]} diff={null} repoPath="C:/r" onSelectCommit={vi.fn()} />)
+    expect(screen.getByText('正在读取这个提交的改动…')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Changes' })).toBeTruthy()
+    expect(document.querySelector('.commit-file-row')).toBeNull()
+  })
+
+  it('Changes 标签页同样说正在读取', () => {
+    render(<CommitDetailView commit={three[1]} diff={null} repoPath="C:/r" onSelectCommit={vi.fn()} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Changes' }))
+    expect(screen.getByText('正在读取这个提交的改动…')).toBeTruthy()
+  })
+})
+
 describe('CommitDetailView：外部 diff 菜单', () => {
   const renamed: DiffData = {
     files: [{ path: 'n.txt', status: 'renamed', oldPath: 'o.txt', binary: false, hunks: [] }],

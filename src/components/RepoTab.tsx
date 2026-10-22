@@ -26,6 +26,7 @@ import SvnInitWizard from './SvnInitWizard'
 import BaselineBanner from './BaselineBanner'
 import { baselineMap, findDelivered, selectionDiffScope } from '../engine/svnGraph'
 import { describeToolExit } from '@/engine/externalTools'
+import { currentDiff } from '@/engine/currentDiff'
 import { openExternalDiff, openExternalMerge, useExternalToolExit, useExternalTools } from '@/store/externalToolsStore'
 import type { ExternalToolsMenu } from './externalToolItems'
 import { computeLaneBranches, formatLaneBranch } from '../engine/laneBranch'
@@ -883,7 +884,7 @@ export function RepoTab({
                 <Panel defaultSize="35%" minSize="15%" maxSize="65%">
                   <CommitDetailView
                     commit={detailCommit}
-                    diff={state.diff}
+                    diff={currentDiff(state.diff, state.diffScope, commitScope)}
                     repoPath={state.path}
                     onSelectCommit={selectCommit}
                     backTo={delivered?.owner ?? null}
@@ -896,7 +897,7 @@ export function RepoTab({
             ) : (
               <LocalChangesView
                 status={state.status}
-                diff={state.diff}
+                diff={currentDiff(state.diff, state.diffScope, 'workdir')}
                 onStage={(paths) => runAndRefresh('stage', { paths }, async () => { await refreshStatus(state.path!); await refreshDiff(state.path!, 'workdir') })}
                 onUnstage={(paths) => runAndRefresh('unstage', { paths }, async () => { await refreshStatus(state.path!); await refreshDiff(state.path!, 'workdir') })}
                 onDiscard={(paths, staged) => void handleDiscard(paths, staged)}

@@ -127,6 +127,8 @@ export interface RepoState {
    */
   mergeDrivers: DriverReport | null
   diff: DiffData
+  /** `diff` 是按哪个 scope 读出来的；`null` = 还没读过。显示前用 `currentDiff` 与当前视图要的比对。 */
+  diffScope: string | null
   selectedId: string | null
   loading: boolean
   error: string | null
@@ -203,6 +205,7 @@ const initialState: RepoState = {
   conflicts: null,
   mergeDrivers: null,
   diff: { files: [] },
+  diffScope: null,
   selectedId: null,
   loading: false,
   error: null,
@@ -782,12 +785,22 @@ export function useRepoStore() {
     // 代次按 scope 分开计：别的 scope 的请求不能让这一份作废
     const key = `diff:${scope}`
     const token = refreshGate.begin(key)
-    const diff = await invoke<DiffData>('read_diff', { path, scope })
-    if (!refreshGate.isLatest(token, key)) return
     // 写回前再核对：只认当前视图要的那一份，切走之后才回来的旧 scope 结果丢掉
-    const wanted = wantedDiffScope.current
-    if (wanted !== undefined && wanted !== scope) return
-    setState((s) => ({ ...s, diff }))
+    const stillWanted = () => {
+      if (!refreshGate.isLatest(token, key)) return false
+      const wanted = wantedDiffScope.current
+      return wanted === undefined || wanted === scope
+    }
+    let diff: DiffData
+    try {
+      diff = await invoke<DiffData>('read_diff', { path, scope })
+    } catch (err) {
+      // 读失败也要把这个 scope 记成「读过了」，不然界面会一直说「正在读取」；错误照旧抛给调用方
+      if (stillWanted()) setState((s) => ({ ...s, diff: { files: [] }, diffScope: scope }))
+      throw err
+    }
+    if (!stillWanted()) return
+    setState((s) => ({ ...s, diff, diffScope: scope }))
   }
 
   const selectCommit = (id: string) => {

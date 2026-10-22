@@ -94,7 +94,8 @@ function FileSectionList({
 
 interface LocalChangesViewProps {
   status: StatusData
-  diff: DiffData
+  /** `null` = 工作区 diff 还没读回来（`currentDiff`），比如刚从提交详情切回来：说正在读取，不显示上一份。 */
+  diff: DiffData | null
   onStage: (paths: string[]) => void
   onUnstage: (paths: string[]) => void
   onDiscard: (paths: string[], staged: boolean) => void
@@ -143,8 +144,11 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
   // diff 面板显示最后点到的那一个；多选时看的是其中一个，不是拼在一起
   const activeFile = selection.paths[selection.paths.length - 1] ?? allFiles[0]?.path ?? null
   const activeDiff: DiffData = useMemo(() => ({
-    files: diff.files.filter((f) => f.path === activeFile),
+    files: (diff?.files ?? []).filter((f) => f.path === activeFile),
   }), [diff, activeFile])
+  const diffPane = diff === null
+    ? <div className="diff-note">正在读取工作区的改动…</div>
+    : <DiffView diff={activeDiff} />
   const conflictByPath = useMemo(
     () => new Map((conflicts ?? []).map((c) => [c.path, c])),
     [conflicts],
@@ -319,11 +323,9 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
                 />
                 {activeConflictView.sameAsHeadNote
                   ? <div className="conflict-same-as-head">{activeConflictView.sameAsHeadNote}</div>
-                  : activeConflictView.showDiff && <DiffView diff={activeDiff} />}
+                  : activeConflictView.showDiff && diffPane}
               </div>
-            ) : (
-              <DiffView diff={activeDiff} />
-            )}
+            ) : diffPane}
           </Panel>
         </Group>
       </div>
