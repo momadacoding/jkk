@@ -496,14 +496,18 @@ fn conflicted_repo(autocrlf: bool) -> TempDir {
     dir
 }
 
-fn conflicted_diff_lines(dir: &std::path::Path) -> Vec<String> {
-    let data = engine::diff::read_diff(dir.to_str().unwrap(), "workdir".into()).unwrap();
+/// 冲突文件在「本地改动」里出现的两个 scope：旧的 `workdir`，以及按分区比较之后
+/// Unstaged 用的 `unstaged`（第 65 条）。两者对冲突文件都必须是 HEAD 对比工作区。
+const CONFLICT_SCOPES: [&str; 2] = ["workdir", "unstaged"];
+
+fn conflicted_diff_lines(dir: &std::path::Path, scope: &str) -> Vec<String> {
+    let data = engine::diff::read_diff(dir.to_str().unwrap(), scope.into()).unwrap();
     let file = data
         .files
         .iter()
         .find(|f| f.path == "c.txt")
-        .expect("c.txt in diff");
-    assert_eq!(file.status, "conflicted");
+        .unwrap_or_else(|| panic!("scope {scope}：c.txt 不在 diff 里"));
+    assert_eq!(file.status, "conflicted", "scope {scope}");
     file.hunks
         .iter()
         .flat_map(|h| h.lines.iter())
@@ -520,14 +524,19 @@ fn conflicted_file_diff_is_head_vs_workdir() {
         "colleague1 + patch-local（手工合并）\nline2\nline3\nline4\nline5 手改\nline6\n",
     )
     .unwrap();
-    let lines = conflicted_diff_lines(dir.path());
-    for want in [
-        "-colleague1",
-        "+colleague1 + patch-local（手工合并）",
-        "-line5",
-        "+line5 手改",
-    ] {
-        assert!(lines.iter().any(|l| l == want), "缺 {want}：{lines:?}");
+    for scope in CONFLICT_SCOPES {
+        let lines = conflicted_diff_lines(dir.path(), scope);
+        for want in [
+            "-colleague1",
+            "+colleague1 + patch-local（手工合并）",
+            "-line5",
+            "+line5 手改",
+        ] {
+            assert!(
+                lines.iter().any(|l| l == want),
+                "scope {scope} 缺 {want}：{lines:?}"
+            );
+        }
     }
 }
 
@@ -540,9 +549,15 @@ fn conflicted_file_diff_applies_autocrlf() {
         "colleague1\r\nline2\r\nline3\r\nline4\r\nline5 手改\r\nline6\r\n",
     )
     .unwrap();
-    let lines = conflicted_diff_lines(dir.path());
-    let changed: Vec<&String> = lines.iter().filter(|l| !l.starts_with(' ')).collect();
-    assert_eq!(changed, ["-line5", "+line5 手改"], "{lines:?}");
+    for scope in CONFLICT_SCOPES {
+        let lines = conflicted_diff_lines(dir.path(), scope);
+        let changed: Vec<&String> = lines.iter().filter(|l| !l.starts_with(' ')).collect();
+        assert_eq!(
+            changed,
+            ["-line5", "+line5 手改"],
+            "scope {scope}：{lines:?}"
+        );
+    }
 }
 
 /// 用户在工作区里删掉了冲突文件：如实显示成整份删除，暂存前能看出来要暂存的是一次删除。
@@ -550,8 +565,255 @@ fn conflicted_file_diff_applies_autocrlf() {
 fn conflicted_file_missing_in_workdir_shows_deletion() {
     let dir = conflicted_repo(false);
     fs::remove_file(dir.path().join("c.txt")).unwrap();
-    let lines = conflicted_diff_lines(dir.path());
-    assert!(!lines.is_empty());
-    assert!(lines.iter().all(|l| l.starts_with('-')), "{lines:?}");
-    assert!(lines.iter().any(|l| l == "-colleague1"), "{lines:?}");
+    for scope in CONFLICT_SCOPES {
+        let lines = conflicted_diff_lines(dir.path(), scope);
+        assert!(!lines.is_empty(), "scope {scope}");
+        assert!(
+            lines.iter().all(|l| l.starts_with('-')),
+            "scope {scope}：{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l == "-colleague1"),
+            "scope {scope}：{lines:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 第 65 条：「本地改动」的 diff 按分区比较。
+// Unstaged = 暂存区 对比 工作区（`unstaged`），Staged = HEAD 对比 暂存区（`staged`）。
+// ---------------------------------------------------------------------------
+
+/// 三行文件 `a.txt` 已提交的仓库。
+fn three_line_repo() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let d = dir.path();
+    run_git(d, &["init", "-q"]);
+    run_git(d, &["config", "user.email", "t@t.com"]);
+    run_git(d, &["config", "user.name", "T"]);
+    run_git(d, &["config", "core.autocrlf", "false"]);
+    fs::write(d.join("a.txt"), "line 1\nline 2\nline 3\n").unwrap();
+    run_git(d, &["add", "."]);
+    run_git(d, &["commit", "-qm", "base"]);
+    dir
+}
+
+/// issue 第 65 条的复现：第 2 行改了并暂存，第 3 行又改了没暂存。
+fn staged_and_unstaged_repo() -> TempDir {
+    let dir = three_line_repo();
+    let d = dir.path();
+    fs::write(d.join("a.txt"), "line 1\nline 2 staged\nline 3\n").unwrap();
+    run_git(d, &["add", "a.txt"]);
+    fs::write(d.join("a.txt"), "line 1\nline 2 staged\nline 3 workdir\n").unwrap();
+    dir
+}
+
+/// 某个 scope 下某个文件的改动行（不含上下文行），找不到文件时返回 None。
+fn changed_lines(dir: &std::path::Path, scope: &str, path: &str) -> Option<Vec<String>> {
+    let data = engine::diff::read_diff(dir.to_str().unwrap(), scope.into()).unwrap();
+    data.files.iter().find(|f| f.path == path).map(|f| {
+        f.hunks
+            .iter()
+            .flat_map(|h| h.lines.iter())
+            .filter(|l| l.origin != ' ')
+            .map(|l| format!("{}{}", l.origin, l.content))
+            .collect()
+    })
+}
+
+fn diff_paths(dir: &std::path::Path, scope: &str) -> Vec<String> {
+    let data = engine::diff::read_diff(dir.to_str().unwrap(), scope.into()).unwrap();
+    let mut paths: Vec<String> = data.files.iter().map(|f| f.path.clone()).collect();
+    paths.sort();
+    paths
+}
+
+#[test]
+fn unstaged_scope_compares_the_index_with_the_workdir() {
+    let dir = staged_and_unstaged_repo();
+    let lines = changed_lines(dir.path(), "unstaged", "a.txt").expect("a.txt");
+    assert_eq!(lines, ["-line 3", "+line 3 workdir"]);
+}
+
+#[test]
+fn staged_scope_compares_head_with_the_index() {
+    let dir = staged_and_unstaged_repo();
+    let lines = changed_lines(dir.path(), "staged", "a.txt").expect("a.txt");
+    assert_eq!(lines, ["-line 2", "+line 2 staged"]);
+}
+
+/// 只暂存、工作区没再改：Staged 里有它，Unstaged 的 diff 里不该有。反过来同理。
+#[test]
+fn a_file_changed_on_one_side_only_appears_in_that_scope_only() {
+    let dir = three_line_repo();
+    let d = dir.path();
+    fs::write(d.join("staged-only.txt"), "s\n").unwrap();
+    run_git(d, &["add", "staged-only.txt"]);
+    fs::write(d.join("a.txt"), "line 1\nline 2\nline 3 workdir\n").unwrap();
+
+    assert_eq!(diff_paths(d, "staged"), ["staged-only.txt"]);
+    assert_eq!(diff_paths(d, "unstaged"), ["a.txt"]);
+}
+
+/// 未跟踪文件只在 Unstaged，整份算新增。
+#[test]
+fn unstaged_scope_shows_untracked_files_as_whole_additions() {
+    let dir = three_line_repo();
+    fs::write(dir.path().join("new.txt"), "n1\nn2\n").unwrap();
+    let data = engine::diff::read_diff(dir.path().to_str().unwrap(), "unstaged".into()).unwrap();
+    let file = data
+        .files
+        .iter()
+        .find(|f| f.path == "new.txt")
+        .expect("new.txt");
+    assert_eq!(file.status, "added");
+    assert_eq!(
+        changed_lines(dir.path(), "unstaged", "new.txt").unwrap(),
+        ["+n1", "+n2"]
+    );
+    assert!(changed_lines(dir.path(), "staged", "new.txt").is_none());
+}
+
+/// 暂存了修改之后又在工作区删掉：Staged 是那次修改，Unstaged 是一次整份删除。
+#[test]
+fn a_staged_change_deleted_in_the_workdir_shows_on_both_sides() {
+    let dir = three_line_repo();
+    let d = dir.path();
+    fs::write(d.join("a.txt"), "line 1\nline 2 staged\nline 3\n").unwrap();
+    run_git(d, &["add", "a.txt"]);
+    fs::remove_file(d.join("a.txt")).unwrap();
+
+    assert_eq!(
+        changed_lines(d, "staged", "a.txt").unwrap(),
+        ["-line 2", "+line 2 staged"]
+    );
+    let data = engine::diff::read_diff(d.to_str().unwrap(), "unstaged".into()).unwrap();
+    let file = data
+        .files
+        .iter()
+        .find(|f| f.path == "a.txt")
+        .expect("a.txt");
+    assert_eq!(file.status, "deleted");
+    assert_eq!(
+        changed_lines(d, "unstaged", "a.txt").unwrap(),
+        ["-line 1", "-line 2 staged", "-line 3"],
+        "删除要对着暂存区那一版，不是 HEAD 那一版"
+    );
+}
+
+/// 还没有任何提交的仓库：HEAD 不存在，Staged 对着空树比。
+#[test]
+fn staged_scope_works_before_the_first_commit() {
+    let dir = TempDir::new().unwrap();
+    let d = dir.path();
+    run_git(d, &["init", "-q"]);
+    fs::write(d.join("first.txt"), "hello\n").unwrap();
+    run_git(d, &["add", "first.txt"]);
+
+    let data = engine::diff::read_diff(d.to_str().unwrap(), "staged".into()).unwrap();
+    let file = data
+        .files
+        .iter()
+        .find(|f| f.path == "first.txt")
+        .expect("first.txt");
+    assert_eq!(file.status, "added");
+    assert_eq!(changed_lines(d, "staged", "first.txt").unwrap(), ["+hello"]);
+    assert!(diff_paths(d, "unstaged").is_empty());
+}
+
+/// Staged 列表里的每一项，在 staged diff 里都必须找得到同名的条目——
+/// 否则点到它时右侧只会显示「No changes」。改名是最容易对不上的形态：
+/// 列表按 `read_status` 出，diff 若单独做改名检测，两边的路径就不一样了。
+#[test]
+fn every_path_in_the_staged_list_has_a_staged_diff_entry() {
+    let dir = three_line_repo();
+    let d = dir.path();
+    run_git(d, &["mv", "a.txt", "b.txt"]);
+    fs::write(d.join("added.txt"), "x\n").unwrap();
+    run_git(d, &["add", "added.txt"]);
+
+    let status = engine::diff::read_status(d.to_str().unwrap()).unwrap();
+    let mut listed: Vec<String> = status.staged.iter().map(|f| f.path.clone()).collect();
+    listed.sort();
+    assert!(!listed.is_empty());
+    assert_eq!(diff_paths(d, "staged"), listed);
+}
+
+/// 同上，Unstaged 那一侧（不含冲突文件，冲突由上面那组用例管）。
+#[test]
+fn every_path_in_the_unstaged_list_has_an_unstaged_diff_entry() {
+    let dir = three_line_repo();
+    let d = dir.path();
+    fs::write(d.join("a.txt"), "changed\n").unwrap();
+    fs::write(d.join("untracked.txt"), "u\n").unwrap();
+    fs::create_dir_all(d.join("dir")).unwrap();
+    fs::write(d.join("dir").join("nested.txt"), "n\n").unwrap();
+
+    let status = engine::diff::read_status(d.to_str().unwrap()).unwrap();
+    let mut listed: Vec<String> = status.unstaged.iter().map(|f| f.path.clone()).collect();
+    listed.sort();
+    assert_eq!(listed.len(), 3, "{listed:?}");
+    assert_eq!(diff_paths(d, "unstaged"), listed);
+}
+
+/// 合并冲突中（AGENTS.md §8）：`read_status` 只把冲突文件放进 Unstaged，
+/// staged diff 不能因为 index 里的冲突条目而失败，也不能多出 Staged 列表里没有的项。
+#[test]
+fn staged_scope_during_a_merge_conflict_matches_the_staged_list() {
+    let dir = conflicted_repo(false);
+    let d = dir.path();
+    // 冲突之外再暂存一个普通改动，确认 Staged 那一侧照常有内容
+    fs::write(d.join("other.txt"), "o\n").unwrap();
+    run_git(d, &["add", "other.txt"]);
+
+    let status = engine::diff::read_status(d.to_str().unwrap()).unwrap();
+    let mut listed: Vec<String> = status.staged.iter().map(|f| f.path.clone()).collect();
+    listed.sort();
+    assert_eq!(listed, ["other.txt"]);
+    assert_eq!(diff_paths(d, "staged"), listed);
+}
+
+/// 有坏链接时要用 pathspec 把能读的路径逐个列出来重建 diff。路径里的 `[` `*` 不能被当成
+/// 通配符：`f[1].txt` 当模式会同时匹配到 `f1.txt`——而 `f1.txt` 恰好就是那个要绕开的坏链接，
+/// 被重新拉回来之后整个 diff 又会中止。
+#[test]
+fn rebuilding_around_a_dangling_link_matches_paths_literally() {
+    let dir = linear_repo();
+    let d = dir.path();
+    fs::write(d.join("f[1].txt"), "new\n").unwrap();
+    if !make_dangling_link(&d.join("f1.txt")) {
+        eprintln!("跳过：本机无法创建目录联接");
+        return;
+    }
+    for scope in ["workdir", "unstaged"] {
+        let data = engine::diff::read_diff(d.to_str().unwrap(), scope.into())
+            .unwrap_or_else(|e| panic!("scope {scope}：{}", e.message));
+        let paths: Vec<&str> = data.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"f[1].txt"), "scope {scope}：{paths:?}");
+        assert_eq!(
+            changed_lines(d, scope, "f[1].txt"),
+            Some(vec!["+new".to_string()]),
+            "scope {scope}：f[1].txt 的内容要读得出来"
+        );
+    }
+}
+
+#[test]
+fn unstaged_scope_survives_a_dangling_link_in_the_workdir() {
+    let dir = linear_repo();
+    fs::write(dir.path().join("real.txt"), "changed\n").unwrap();
+    if !make_dangling_link(&dir.path().join("broken-link")) {
+        eprintln!("跳过：本机无法创建目录联接");
+        return;
+    }
+    let data = engine::diff::read_diff(dir.path().to_str().unwrap(), "unstaged".into())
+        .expect("坏的链接不应该让整个 read_diff 失败");
+    assert!(
+        data.files.iter().any(|f| f.path == "real.txt"),
+        "real.txt 的 diff 不见了：{:?}",
+        data.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+    );
+    // staged 不读工作区，坏链接与它无关，但也不能因此失败
+    engine::diff::read_diff(dir.path().to_str().unwrap(), "staged".into())
+        .expect("staged 不该被工作区里的坏链接影响");
 }

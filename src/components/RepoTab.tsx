@@ -27,6 +27,13 @@ import BaselineBanner from './BaselineBanner'
 import { baselineMap, findDelivered, selectionDiffScope } from '../engine/svnGraph'
 import { describeToolExit } from '@/engine/externalTools'
 import { currentDiff } from '@/engine/currentDiff'
+import {
+  changesPaths,
+  changesSection,
+  emptyFileSelection,
+  reconcileSelection,
+  type FileSelection,
+} from '@/engine/fileSelection'
 import { openExternalDiff, openExternalMerge, useExternalToolExit, useExternalTools } from '@/store/externalToolsStore'
 import type { ExternalToolsMenu } from './externalToolItems'
 import { computeLaneBranches, formatLaneBranch } from '../engine/laneBranch'
@@ -129,13 +136,33 @@ export function RepoTab({
     state, openRepo, refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers,
     refreshDiff, refreshUpstream, refreshStashes, refreshPullRequests,
     refreshSvnSync, refreshSvnEol, refreshSvnSyncState, checkSvnSyncIfChanged, fetchSvnLog, refreshSvnAudit, auditSvnIfDue,
-    selectCommit, clearError, reportError, wantedDiffScope,
+    selectCommit, clearError, reportError, wantedDiffScope, refreshChanges: refreshChangesIn,
   } = useRepoStore()
   const [repoState, setRepoState] = useState<string>('normal')
   // 侧边栏分区按后端能力裁剪。SVN 混合仓库下 tag / worktree 整块不渲染
   // ——`create_tag` 与整个 commands/worktree.rs 都还没进接缝，仍直接跑 git CLI。
   const sections = visibleSections(state.capabilities)
   const [viewMode, setViewMode] = useState<ViewMode>('commits')
+  // 「本地改动」的选中放在这里而不是 `LocalChangesView` 里：右侧 diff 按选中文件所在的区读
+  // （Unstaged 读暂存区对比工作区，Staged 读 HEAD 对比暂存区，第 65 条），读哪个区要在
+  // 渲染时就算出来——等子组件挂载后再报上来的话，第一次渲染会先读错一个区
+  const [changesSelection, setChangesSelection] = useState<FileSelection>(emptyFileSelection)
+  // 每次 store 更新都会重渲染，文件可能上万个：只在选中或状态变了时重算
+  const changesScope = useMemo(
+    () => changesSection(changesSelection, state.status),
+    [changesSelection, state.status],
+  )
+  // 操作之后的刷新回调要拿最新的选中算区，闭包里那份是点击那一刻的
+  const changesSelectionRef = useRef(changesSelection)
+  changesSelectionRef.current = changesSelection
+  // 状态变了就把选中对齐后存回去（文件被整份暂存时跟到 Staged）。渲染时读哪个区已经按对齐后的
+  // 那份算了，这里只是存档：不存的话 a.txt 之后再被改动、两边都有时，选中会跳回 Unstaged。
+  // 放在选中的持有者这里而不是 LocalChangesView：在提交图视图里它没挂载，状态照样会变
+  useEffect(() => {
+    const paths = changesPaths(state.status)
+    // 没变时 reconcileSelection 返回同一个对象，setState 不会触发渲染
+    setChangesSelection((s) => reconcileSelection(s, paths.unstaged, paths.staged))
+  }, [state.status])
   const [selectedBranch, setSelectedBranch] = useState<string | null>(null)
   const [selectedTag, setSelectedTag] = useState<string | null>(null)
   const [selectedWorktree, setSelectedWorktree] = useState<string | null>(null)
@@ -171,6 +198,7 @@ export function RepoTab({
     state,
     { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, refreshSvnSyncState, auditSvnIfDue, wantedDiffScope },
     viewMode,
+    changesScope,
   )
 
   useEffect(() => {
@@ -210,17 +238,22 @@ export function RepoTab({
     return () => { unlisten?.() }
   }, [state.path])
 
+  /** 写操作之后刷新「本地改动」，按刷新后的状态与最新的选中算读哪个区（store 的 `refreshChanges`）。 */
+  const refreshChanges = useCallback(
+    (path: string) => refreshChangesIn(path, () => changesSelectionRef.current),
+    [refreshChangesIn],
+  )
+
   const handleCommit = useCallback(async (msg: string, amend: boolean) => {
     if (!state.path) return
     try {
       await invoke('commit', { path: state.path, message: msg, amend })
       await refreshGraph(state.path)
-      await refreshStatus(state.path)
-      await refreshDiff(state.path, 'workdir')
+      await refreshChanges(state.path)
     } catch (err) {
       reportError(err)
     }
-  }, [state.path, refreshGraph, refreshStatus, refreshDiff, reportError])
+  }, [state.path, refreshGraph, refreshChanges, reportError])
 
   const runAndRefresh = useCallback(async (cmd: string, args: Record<string, unknown>, refresh: () => Promise<void>) => {
     if (!state.path) return
@@ -361,12 +394,11 @@ export function RepoTab({
 
     try {
       await invoke('discard', { path, paths, staged })
-      await refreshStatus(path)
-      await refreshDiff(path, 'workdir')
+      await refreshChanges(path)
     } catch (err) {
       reportError(err)
     }
-  }, [state.path, state.status.unstaged, refreshStatus, refreshDiff, reportError])
+  }, [state.path, state.status.unstaged, refreshChanges, reportError])
 
   /**
    * 删除分支，可选连远程和 worktree 一起删。确认在 `DeleteBranchDialog` 里做过了。
@@ -573,9 +605,12 @@ export function RepoTab({
   useExternalToolExit(state.path, (exit) => {
     const path = state.path
     if (!path) return
-    void refreshStatus(path).catch(reportError)
-    const scope = viewMode === 'changes' ? 'workdir' : commitScope
-    if (scope) void refreshDiff(path, scope).catch(reportError)
+    if (viewMode === 'changes') {
+      void refreshChanges(path).catch(reportError)
+    } else {
+      void refreshStatus(path).catch(reportError)
+      if (commitScope) void refreshDiff(path, commitScope).catch(reportError)
+    }
     const problem = describeToolExit(exit)
     if (problem) reportError(`${exit.file}：${problem}`)
   })
@@ -897,16 +932,18 @@ export function RepoTab({
             ) : (
               <LocalChangesView
                 status={state.status}
-                diff={currentDiff(state.diff, state.diffScope, 'workdir')}
-                onStage={(paths) => runAndRefresh('stage', { paths }, async () => { await refreshStatus(state.path!); await refreshDiff(state.path!, 'workdir') })}
-                onUnstage={(paths) => runAndRefresh('unstage', { paths }, async () => { await refreshStatus(state.path!); await refreshDiff(state.path!, 'workdir') })}
+                diff={currentDiff(state.diff, state.diffScope, changesScope)}
+                selection={changesSelection}
+                onSelectionChange={setChangesSelection}
+                onStage={(paths) => runAndRefresh('stage', { paths }, () => refreshChanges(state.path!))}
+                onUnstage={(paths) => runAndRefresh('unstage', { paths }, () => refreshChanges(state.path!))}
                 onDiscard={(paths, staged) => void handleDiscard(paths, staged)}
                 onCommit={handleCommit}
                 svnMode={state.capabilities.vcs === 'svn'}
                 onBaselineBranch={isProtectedBaseline(state.head, state.capabilities)}
                 externalTools={externalToolsMenu}
                 conflicts={state.conflicts}
-                onResolveDeleteModify={(file, keep) => runAndRefresh('resolve_delete_modify', { file, keep }, async () => { await refreshStatus(state.path!); await refreshDiff(state.path!, 'workdir') })}
+                onResolveDeleteModify={(file, keep) => runAndRefresh('resolve_delete_modify', { file, keep }, () => refreshChanges(state.path!))}
               />
             )}
           </Panel>
