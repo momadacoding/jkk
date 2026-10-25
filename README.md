@@ -84,8 +84,13 @@ pnpm tauri build
 git checkout master
 git pull --ff-only
 
-# 三处版本号必须一致
-#   package.json / src-tauri/tauri.conf.json / src-tauri/Cargo.toml
+# 版本号直接在 master 上改，不走 PR（范围见 AGENTS.md「发版提交例外」）。
+# 四处必须一致：package.json / src-tauri/tauri.conf.json / src-tauri/Cargo.toml，
+# 以及 src-tauri/Cargo.lock 里 app 那一条
+node scripts/gen-notices.mjs --check   # 依赖变过就去掉 --check 重新生成，一起提交
+git commit -am "chore(release): 版本号升到 0.1.0"
+git push origin master
+
 git tag v0.1.0
 git push origin v0.1.0
 ```

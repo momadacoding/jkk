@@ -164,8 +164,12 @@
 - SHOULD：例外仅限一行级别的拼写、注释、文档小修（参见 1.1），这类可在当前位置直接处理，无需单独 worktree。
 - MUST：所有功能分支通过 PR 合并到 `master`，不要直接 push 到 `master`。
 - MUST：创建 PR 默认为 Draft（`gh pr create --draft`）；仅当用户明确要求创建正式（ready）PR 时才省略 `--draft`。
-- MUST：**独立 review 门槛**：走 PR 流程的改动合并前，必须由**独立于本 PR 实现者的人或 agent** 完成一次 review（实现者的自查不满足该门槛，self-merge 不被接受）。可用 `/code-review`、独立 review subagent 或 Codex 二次意见满足。review 按 §13 rubric 执行，发现的高危问题合并前必须修复。下一条纯文档例外不受此门槛约束。
+- MUST：**独立 review 门槛**：走 PR 流程的改动合并前，必须由**独立于本 PR 实现者的人或 agent** 完成一次 review（实现者的自查不满足该门槛，self-merge 不被接受）。可用 `/code-review`、独立 review subagent 或 Codex 二次意见满足。review 按 §13 rubric 执行，发现的高危问题合并前必须修复。下面的纯文档例外与发版提交例外不受此门槛约束。
 - MUST：**纯文档提交例外**：仅新增或修改文档（改动完全落在 `docs/**`、`*.md`），允许直接在 `master` 分支提交并 push，无需 worktree、无需 PR。此例外**只适用于文档，不适用于任何代码改动**；一旦同一提交夹带任何代码变更，例外立即失效，必须回到 worktree + 分支 + PR 流程。
+- MUST：**发版提交例外**：只改版本号的发版提交，允许直接在 `master` 提交并 push，随后打 `v*` tag，无需 worktree、无需 PR。改动范围严格限于：`package.json`、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json` 的 `version` 字段，`src-tauri/Cargo.lock` 中本 crate（`app`）那一条的版本号，以及用 `node scripts/gen-notices.mjs` 重新生成的 `THIRD_PARTY_NOTICES.md`。同一提交夹带任何其他改动，例外立即失效。
+  - 理由：版本号不改变行为，它可能出的错（清单与 tag 不一致、许可清单过期、tag 不在 master、编不过或测试挂）都由 release workflow 在构建前拦住，走 PR 只多一道形式。
+  - 提交前本地至少跑 `node scripts/gen-notices.mjs --check`；§5.2 的两侧门槛由 release workflow 在 CI 上执行，并以那次 run 的实际结论为准。
+  - commit、push、打 tag 仍需用户在当前对话中明确要求（§1.1）。CI 失败时修复走正常的 worktree + PR 流程；删除已推送的 tag 重打属破坏性操作，需单独授权，优先改发下一个补丁版本号。
 - MUST：本仓库**没有 PR 门禁 CI**。唯一的 workflow 是 `.github/workflows/release.yml`，它只在**打 `v*` tag** 或手动触发时运行，`push` 和 `pull_request` 都不会触发它。因此针对 PR 或分支改动，禁止宣称「CI 通过」或等待 CI 结果；所有验证必须本地实际执行并如实报告（见 §5）。只有在真的打了 tag、且实际查看过那次 run 的结论之后，才可以引用 CI 结果。
 
 ### 4.2 开始代码修改前的自检
