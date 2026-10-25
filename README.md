@@ -95,6 +95,14 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
+Release 说明开头的「新功能 / 修复」由 `scripts/release-notes.sh` 自动生成：取上一个正式版
+tag 以来的提交标题，`feat` 进新功能、`fix` 进修复，其余类型不列。所以提交标题就是更新日志，
+要写成用户看得懂的话。打 tag 之前可以先预览（需要 `gh` 已登录，比对的是 origin 上的 master）：
+
+```bash
+bash scripts/release-notes.sh v0.1.0 master
+```
+
 workflow 会在构建前自行校验三件事，任何一项不过都在几秒内失败：
 
 | 校验 | 拦住什么 |

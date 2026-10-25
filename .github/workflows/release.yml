@@ -113,6 +113,23 @@ jobs:
           }
           Write-Output "校验通过：$ref @ $env:SHA（相对 master：$cmp，describe：$describe）"
 
+      # Release 说明里的「新功能 / 修复」，取自上一个正式版以来的 feat / fix 提交。
+      # 放在 build job 而不是 publish job：publish job 持有 contents: write，
+      # 刻意不 checkout、不跑仓库里的代码，生成结果经 artifact 交过去。
+      # 放在构建之前：API 出错几秒内就失败，不用等十几分钟的构建跑完。
+      - name: Generate release notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-notes
+          bash scripts/release-notes.sh "$REF_NAME" > release-notes/changes.md
+          cat release-notes/changes.md
+
       # secrets 不能用在 if 里，先把「在不在」映射成 output。
       # 只判存在性，值本身绝不写日志。
       - name: Detect signing certificate
@@ -327,6 +344,14 @@ jobs:
           name: jkk-windows
           path: artifacts/*
 
+      # 单独一个 artifact：放进 jkk-windows 会被 publish 当成安装包资产一起传上去
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: release-notes
+          path: release-notes/changes.md
+          if-no-files-found: error
+
   # 拆成独立 job 的唯一目的：让 contents: write 只存在于这里。
   # 它不 checkout 代码、不跑构建，只把上一个 job 的产物挂上去。
   # 跑 ubuntu 而不是 windows：私有仓库的 Windows runner 按 2 倍分钟数计费，
@@ -342,6 +367,11 @@ jobs:
         with:
           name: jkk-windows
           path: artifacts
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-notes
+          path: release-notes
 
       # 发成 draft：产物传上去之后由人过目一眼再点发布。
       #
@@ -373,6 +403,13 @@ jobs:
           - `SHA256SUMS.txt` —— 上面文件的校验和
 
           第三方组件的许可声明见安装目录下的 THIRD_PARTY_NOTICES.md。'
+
+          # 改动列表放最前面，固定说明垫在分隔线下。没有更早正式版时列表为空，只留固定说明。
+          # 只在新建 draft 时用得上：复用已有 draft 时不改说明，人可能已经在上面改过字
+          changes=$(cat release-notes/changes.md)
+          if [ -n "$changes" ]; then
+            notes="$changes"$'\n\n---\n\n'"$notes"
+          fi
 
           # 校验和随包发布，便于核对下载到的是不是这次构建的产物
           ( cd artifacts && sha256sum ./* > SHA256SUMS.txt )
