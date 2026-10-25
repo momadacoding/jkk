@@ -7,7 +7,8 @@ pub use crate::engine::worktree::{read_worktrees, Worktree};
 
 /// 回收站里最多留几个条目。超出的按时间从旧到新清掉。
 ///
-/// 这里存的是完整的工作树，装了 node_modules 的能到几个 GB，不能无限攒。
+/// 这里存的是工作树，不能无限攒。被忽略的大目录（node_modules、构建产物）进回收站
+/// 之后会被后台删掉（见 [`ignored_entries`]），剩下的一般不大，但个数上限照样要有。
 const TRASH_KEEP: usize = 5;
 
 /// 新槽位落在这个目录，旧版（0.2.1 及更早）的回收站是隔壁的 [`TRASH_DIR_LEGACY`]。
@@ -210,6 +211,13 @@ struct TrashMeta {
     /// 原管理目录（`.git/worktrees/<name>`）
     admin: String,
     deleted_at: u64,
+    /// 删除时被 git 忽略的条目（相对工作树、正斜杠），见 [`ignored_entries`]。
+    /// 后台清理会把其中超过 [`STRIP_THRESHOLD`] 的从槽位里删掉；手工捞回去的人
+    /// 对照这份清单和槽位里实际剩下的，就知道要重新 `pnpm install` / `cargo build` 什么。
+    ///
+    /// 旧版写的 meta 没有这个字段，按空处理：那些槽位原样保留到被清理选中。
+    #[serde(default)]
+    ignored: Vec<String>,
 }
 
 fn now_secs() -> u64 {
@@ -413,6 +421,295 @@ fn has_entry(dir: &Path, name: &str) -> bool {
     )
 }
 
+/// 被 git 忽略的条目超过这个大小，就不在回收站里保留。
+///
+/// 占空间的几乎全是 `target`、`node_modules`、`.venv`、`dist`、Unity 的 `Library`
+/// 这类大目录，重装/重编就有；而 `.env`、`*.local`、`.vscode/` 这些被忽略的小东西
+/// 往往是唯一副本（密钥、本地配置），删了省不出空间、丢了却找不回来。按大小划线
+/// 正好把两类分开，不用维护一份「哪些名字算构建产物」的清单。
+///
+/// 公开只为让集成测试造出刚好越线的文件；界面文案里的「50MB」是手写的，改这里
+/// 要一起改 `DeleteWorktreeDialog.tsx`。
+pub const STRIP_THRESHOLD: u64 = 50 * 1024 * 1024;
+
+/// 回收站清理的进程内互斥，**每个主仓库一把**，见 [`prune_trash`]。
+///
+/// 不用全局一把：仓库 A 启动时在删一个 15GB 的 target，仓库 B 的清理没有理由
+/// 排在它后面。键是 [`main_repo`] 给的路径，删除和启动清理都从那里来，拼写一致。
+/// 表只增不减，一个应用会话里打开过的仓库数有限。
+static PRUNE_LOCKS: std::sync::Mutex<Vec<(PathBuf, RepoLock)>> = std::sync::Mutex::new(Vec::new());
+
+type RepoLock = std::sync::Arc<std::sync::Mutex<()>>;
+
+fn prune_lock(main_repo_dir: &Path) -> RepoLock {
+    let mut locks = PRUNE_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, lock)) = locks.iter().find(|(dir, _)| dir == main_repo_dir) {
+        return lock.clone();
+    }
+    let lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+    locks.push((main_repo_dir.to_path_buf(), lock.clone()));
+    lock
+}
+
+/// 删除命令最多等列举被忽略条目这么久（从脏检查结束算起）。
+///
+/// 列举只为省空间，不能让删除被它拖住：慢盘、超大的未跟踪目录、git 卡住，
+/// 都只该让这次删除少省点空间。正常仓库里它和脏检查是同一量级（实测几十毫秒），
+/// 并行跑完时早就好了；force 删除不跑脏检查，最多多等这一段。
+const LISTING_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// 槽位里记录瘦身决定的文件，与标记文件并列放在槽位根上。
+///
+/// 每条记录是 `D<相对路径>\0`（决定删）或 `K<相对路径>\0`（决定留）。
+///
+/// - **先记 D 再删**：`remove_dir_all` 删到一半应用退出，剩下的半截可能已经不到
+///   阈值了。重新量会把它判成「留」，残缺的半棵树就会冒充原样留在回收站里。
+///   有了 D，下一轮不再量，照删到底。
+/// - **K 也记**：槽位内容不会再变，量过一次判定为留的，以后每轮清理都不必再遍历
+///   一遍（一个 45MB、上万文件的 `.venv` 每次启动都走一遍是白费）。
+///
+/// 用 `\0` 分隔：git 路径里可以有换行，不能有 NUL。记录写不进去不追究，最坏是
+/// 下一轮重新量。
+const STRIP_STATE: &str = "strip-state";
+
+/// 这个被忽略的条目该不该从回收站里删掉：总字节数超过 `limit`，并且里面**没有
+/// 嵌套的 git 仓库**。
+///
+/// # 嵌套仓库一律保留
+///
+/// 被忽略的目录里可能装着另一个仓库或 worktree（`.worktrees/` 本身就是被忽略的，
+/// 用 `info/exclude` 藏起来的 clone 也一样）。它们自己的未提交改动对外层的
+/// `git status` 不可见，脏检查拦不住；删掉就是丢数据。两种形态都认：
+/// - 名叫 `.git` 的子项（目录；worktree 里是文件）；
+/// - 没有 `.git`、仓库数据直接摆在顶层的 bare 仓库（镜像 clone、`backup.git`），
+///   见 [`looks_like_bare_repo`]。没推到别处的提交可能只在这里。
+///
+/// 这意味着越过阈值之后还得把整棵树走完才能下结论，代价只在要删的大目录上付
+/// 一次（结论会记进 [`STRIP_STATE`]）。
+///
+/// 不跟进链接（含 junction）：链接指向的东西不在槽位里，算进来会把一个小目录
+/// 误判成大目录。读不出来的子项跳过不计——少算的方向是「保留」，安全。
+fn should_strip(path: &Path, limit: u64) -> bool {
+    let Ok(md) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if md.file_type().is_symlink() {
+        return false;
+    }
+    if !md.is_dir() {
+        return md.len() > limit;
+    }
+    let mut total: u64 = 0;
+    let mut dirs = vec![path.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        if looks_like_bare_repo(&dir) {
+            return false;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.file_name() == ".git" {
+                return false;
+            }
+            // DirEntry::metadata 不跟进链接（Windows 上直接取自目录枚举，不多一次系统调用）
+            let Ok(md) = entry.metadata() else {
+                continue;
+            };
+            if md.file_type().is_symlink() {
+                continue;
+            }
+            if md.is_dir() {
+                dirs.push(entry.path());
+            } else {
+                total = total.saturating_add(md.len());
+            }
+        }
+    }
+    total > limit
+}
+
+/// 目录本身是不是一个 bare 仓库：`HEAD` 文件加 `objects/`、`refs/` 目录，与 git
+/// 自己判定 git 目录的最低要求一致。宁可把长得像的普通目录误认成仓库（结果是
+/// 保留），也不能漏认。
+fn looks_like_bare_repo(dir: &Path) -> bool {
+    dir.join("HEAD").is_file() && dir.join("objects").is_dir() && dir.join("refs").is_dir()
+}
+
+/// 把 git 给的相对路径拼到 `root` 下面，并确认**拼出来的路径真的在 `root` 里**。
+///
+/// 只接受普通路径分量（拒绝 `..`、绝对路径、盘符），而且沿途每一级都不能是链接：
+/// 中间夹一个指向仓库外的 junction，拼出来的路径就落到外面去了，字符串上却看不
+/// 出来。中间各级必须是目录，最后一级可以是目录也可以是文件。
+fn resolve_inside(root: &Path, rel: &str) -> Option<PathBuf> {
+    let mut cur = root.to_path_buf();
+    let mut is_dir = true;
+    for comp in Path::new(rel).components() {
+        let std::path::Component::Normal(part) = comp else {
+            return None;
+        };
+        // 上一级不是目录，就不可能还有下一级
+        if !is_dir {
+            return None;
+        }
+        cur.push(part);
+        let md = std::fs::symlink_metadata(&cur).ok()?;
+        if md.file_type().is_symlink() {
+            return None;
+        }
+        is_dir = md.is_dir();
+    }
+    (cur != root).then_some(cur)
+}
+
+/// 从 `ls-files -o -i --directory` 的输出里挑出**最下层**的条目。
+///
+/// 一个目录里的东西全被忽略时，git 既列这个目录，也列里面每个被忽略的子项
+/// （实测：`packages/foo/`、`packages/foo/.env`、`packages/foo/node_modules/` 各一行；
+/// 只装着 target 的 `src-tauri/` 也和 `src-tauri/target/` 各一行）。按父目录整体
+/// 量、整体删，会把 200MB 的 node_modules 旁边那个几字节的 `.env` 一起删掉；
+/// 只取没有子项被列出来的那些行，大的小的才分得开。
+///
+/// 目录项以 `/` 结尾。排序之后一个目录的子孙紧跟在它后面（夹在 `X/` 与 `X/…`
+/// 之间的字符串必然也以 `X/` 开头），所以只需看下一项；带着 `/` 比，
+/// `src-tauri-x/` 才不会被当成 `src-tauri/` 的子项。
+fn leaf_entries(listing: &str) -> Vec<&str> {
+    let mut all: Vec<&str> = listing.split('\0').filter(|e| !e.is_empty()).collect();
+    all.sort_unstable();
+    all.dedup();
+    let mut leaves = Vec::new();
+    for (i, entry) in all.iter().enumerate() {
+        let has_child =
+            entry.ends_with('/') && all.get(i + 1).is_some_and(|next| next.starts_with(entry));
+        if !has_child {
+            leaves.push(*entry);
+        }
+    }
+    leaves
+}
+
+/// 删除前列出工作树里被 git 忽略的条目，后台清理会把其中超过 [`STRIP_THRESHOLD`]
+/// 的从回收站槽位里删掉。
+///
+/// 回收站留的是整棵工作树，一个 Tauri 项目的 debug 构建加 node_modules 动辄十几
+/// GB，留 [`TRASH_KEEP`] 个就能攒到上百 GB。
+///
+/// # 为什么要在搬移之前问 git
+///
+/// 只动**没被 git 跟踪**的东西：被跟踪的文件里的改动可能是唯一副本。搬完之后
+/// 管理目录也进了回收站，git 就问不动了，只能趁现在问。这里只列不量大小，
+/// 量大小要遍历整棵树，放到后台清理时再做。
+///
+/// 列出来的每一项里都只有未跟踪且被忽略的内容；部分文件被跟踪的目录不会整个
+/// 列出来，只列里面被忽略的子项。取哪一层见 [`leaf_entries`]。
+///
+/// Windows 上 git 会**进 junction** 往下列（实测 `linked/node_modules/`，`linked`
+/// 是指向仓库外的 junction）。这里不校验路径：清单只是候选，删之前
+/// [`strip_ignored`] 会在槽位里逐条走 [`resolve_inside`]，在这里再查一遍只会
+/// 拖慢删除命令。
+/// 不用 `status --ignored`：它不列「内容全被忽略」的父目录下的细项，和这里的
+/// 形态对不上。`-z` 免掉非 ASCII 路径的转义。
+///
+/// 问不出来就当没有：这只是省空间，绝不能让删除本身失败。
+fn ignored_entries(worktree_path: &str) -> Vec<String> {
+    let Ok(out) = run_git(
+        worktree_path,
+        &[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ],
+    ) else {
+        return Vec::new();
+    };
+    leaf_entries(&out)
+        .into_iter()
+        .map(|entry| entry.strip_suffix('/').unwrap_or(entry).to_string())
+        .collect()
+}
+
+/// 读槽位里已经做过的瘦身决定（决定删的、决定留的），见 [`STRIP_STATE`]。
+/// 读不出来当作一条都没有。
+fn read_strip_state(
+    slot: &Path,
+) -> (
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+) {
+    let mut strip = std::collections::HashSet::new();
+    let mut keep = std::collections::HashSet::new();
+    let Ok(raw) = std::fs::read(slot.join(STRIP_STATE)) else {
+        return (strip, keep);
+    };
+    for record in String::from_utf8_lossy(&raw).split('\0') {
+        if let Some(rel) = record.strip_prefix('D') {
+            strip.insert(rel.to_string());
+        } else if let Some(rel) = record.strip_prefix('K') {
+            keep.insert(rel.to_string());
+        }
+    }
+    (strip, keep)
+}
+
+/// 往 [`STRIP_STATE`] 追加一条决定。文件在一个槽位的一轮瘦身里只开一次
+/// （`file` 由调用方持有）；一条记录一次 `write_all`，D 记录必须在删之前落下去。
+fn record_strip_decision(file: &mut Option<std::fs::File>, slot: &Path, kind: char, rel: &str) {
+    use std::io::Write;
+    if file.is_none() {
+        *file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(slot.join(STRIP_STATE))
+            .ok();
+    }
+    if let Some(file) = file {
+        let _ = file.write_all(format!("{kind}{rel}\0").as_bytes());
+    }
+}
+
+/// 把槽位里登记过的被忽略条目中，超过 [`STRIP_THRESHOLD`] 且不含嵌套仓库的删掉。
+///
+/// 删之前在**槽位里**重新核一遍路径：meta 是磁盘上的文本，拼出来的路径必须还在
+/// 槽位的工作树里。决定记进 [`STRIP_STATE`]，删到一半被打断的下一轮照删到底，
+/// 判定为留的下一轮不再量。
+///
+/// meta 在这里重读而不是沿用选举时读到的那份：槽位若已被（别的进程的）清理线程
+/// 认领，正式标记已经改名，读不出来就跳过，不去和它的 `remove_dir_all` 抢同一棵树。
+///
+/// `remove_dir_all` 解链接而不跟进，node_modules 里 pnpm 的 junction 不会连累
+/// 链接指向的地方，见 [`prune_trash`] 的说明。
+fn strip_ignored(slot: &Path) {
+    let Ok(meta) = read_meta(slot, MARK_COMMITTED) else {
+        return;
+    };
+    let (decided_strip, decided_keep) = read_strip_state(slot);
+    let mut state_file = None;
+    let root = slot.join("worktree");
+    for rel in &meta.ignored {
+        if decided_keep.contains(rel) {
+            continue;
+        }
+        let Some(path) = resolve_inside(&root, rel) else {
+            continue;
+        };
+        if !decided_strip.contains(rel) {
+            if !should_strip(&path, STRIP_THRESHOLD) {
+                record_strip_decision(&mut state_file, slot, 'K', rel);
+                continue;
+            }
+            record_strip_decision(&mut state_file, slot, 'D', rel);
+        }
+        let _ = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+    }
+}
+
 /// 删除一个 worktree：搬进仓库内的回收站，而不是抹掉。
 ///
 /// 收的是 worktree 的**完整路径**而不是名字：名字得靠 `parent(当前仓库)/名字` 拼，
@@ -499,6 +796,26 @@ pub fn delete_worktree(
         ));
     }
 
+    // 列被忽略条目和脏检查各扫一遍工作树，耗时同一个量级（实测都是 status 级别），
+    // 并行跑，删除不必为多出来的这一遍多等。目录已丢时没有可列的，git 也起不来。
+    //
+    // 用分离线程而不是 scoped：脏检查拦下来时直接返回，不必等一个结果要被扔掉的
+    // 扫描跑完；那个线程自己跑完就结束，只读不写，没有副作用。线程起不来
+    // （资源耗尽）就当没有被忽略条目，不能让删除 panic。
+    let listing = if worktree_exists {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worktree_path = worktree_path.clone();
+        std::thread::Builder::new()
+            .name("trash-list-ignored".into())
+            .spawn(move || {
+                let _ = tx.send(ignored_entries(&worktree_path));
+            })
+            .ok()
+            .map(|_| rx)
+    } else {
+        None
+    };
+
     // 脏就拦下来。跑不动 status 说明 worktree 本身已经坏了，那种情况下拦着反而
     // 让人没法收拾，交给 force 放行。
     //
@@ -508,9 +825,13 @@ pub fn delete_worktree(
             Ok(true) => {
                 return Err(GitError::new(
                     "worktree_dirty",
-                    "这个 worktree 里有未提交的改动或未跟踪的文件。\n\n\
-                     确认要删的话可以继续，目录会被移到仓库内的回收站，不是直接抹掉。"
-                        .to_string(),
+                    format!(
+                        "这个 worktree 里有未提交的改动或未跟踪的文件。\n\n\
+                         确认要删的话可以继续，目录会被移到仓库内的回收站，不是直接抹掉；\
+                         但被 git 忽略、超过 {} MB 的文件和目录（node_modules、构建产物等）\
+                         不保留，在里面手改过的东西会一起丢掉。",
+                        STRIP_THRESHOLD / (1024 * 1024)
+                    ),
                 ))
             }
             Ok(false) => {}
@@ -526,6 +847,10 @@ pub fn delete_worktree(
             }
         }
     }
+    // 超时、列举线程 panic（发送端随之丢掉）都只会少省点空间，不该挡住删除
+    let ignored = listing
+        .and_then(|rx| rx.recv_timeout(LISTING_GRACE).ok())
+        .unwrap_or_default();
 
     let name = Path::new(&worktree_path)
         .file_name()
@@ -543,6 +868,7 @@ pub fn delete_worktree(
         worktree: worktree_path.clone(),
         admin: admin.to_string_lossy().to_string(),
         deleted_at: now_secs(),
+        ignored,
     };
     if let Err(err) = write_meta(&slot, &meta) {
         remove_slot(&slot);
@@ -692,6 +1018,13 @@ fn sort_slots(slots: &mut [(u64, PathBuf)]) {
 /// 不是每个目录各留几个。合并之后旧目录里时间戳更早的条目会先被选中，
 /// 旧回收站随之排空——分开各留 5 个的话它会永远卡在 5 个不动。
 fn prune_trash(main_repo_dir: &Path) {
+    // 进程内整轮串行：启动清理和每次删除都会起一个清理线程，不串行的话一个线程
+    // 正在给某个槽位瘦身时，另一个线程可能把同一个槽位选成 victim 整个删，两边同时
+    // `remove_dir_all` 同一棵十几 GB 的树，互相报错、磁盘白忙。排在后面的线程拿到
+    // 锁时，前面做完的只剩 NotFound 和记过的决定，很快走完。跨进程仍靠认领机制。
+    // 中毒的锁照用：守的只是「别同时删」，没有要保护的数据。
+    let lock = prune_lock(main_repo_dir);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     let worktrees = main_repo_dir.join(".worktrees");
     let mut slots: Vec<(u64, PathBuf)> = Vec::new();
     for root in [worktrees.join(TRASH_DIR), worktrees.join(TRASH_DIR_LEGACY)] {
@@ -725,18 +1058,21 @@ fn prune_trash(main_repo_dir: &Path) {
             }
         }
     }
-    if slots.len() <= TRASH_KEEP {
-        return;
-    }
     // read_dir 顺序未定义；相同秒级时间戳必须再按路径排序，让并发清理者
     // 尝试认领同一组 victim，避免各自成功删除不同条目而跌破保留数量。
     sort_slots(&mut slots);
-    for (_, dir) in slots.iter().take(slots.len() - TRASH_KEEP) {
+    let victims = slots.len().saturating_sub(TRASH_KEEP);
+    for (_, dir) in slots.iter().take(victims) {
         // 认领失败 = 另一个清理线程先拿到了，放弃这个 victim
         let Some(claimed) = claim_for_pruning(dir) else {
             continue;
         };
         let _ = std::fs::remove_dir_all(&claimed);
+    }
+    // 留下的条目瘦身：每轮都对所有留下的条目跑一遍，上次没删完的（应用中途
+    // 退出）这次接着删，判定过的不再重量（见 STRIP_STATE）。
+    for (_, dir) in slots.iter().skip(victims) {
+        strip_ignored(dir);
     }
 }
 
@@ -842,6 +1178,7 @@ mod tests {
                 worktree: format!("/wt/{name}"),
                 admin: format!("/admin/{name}"),
                 deleted_at: 100,
+                ignored: Vec::new(),
             },
         )
         .unwrap();
@@ -910,6 +1247,7 @@ mod tests {
                     worktree: format!("w{i}"),
                     admin: format!("a{i}"),
                     deleted_at: i, // 越旧越该先清
+                    ignored: Vec::new(),
                 },
             )
             .unwrap();
@@ -957,6 +1295,7 @@ mod tests {
                     worktree: format!("w{i}"),
                     admin: format!("a{i}"),
                     deleted_at: 100 + i,
+                    ignored: Vec::new(),
                 },
             )
             .unwrap();
@@ -996,6 +1335,7 @@ mod tests {
                     worktree: format!("w{i}"),
                     admin: format!("a{i}"),
                     deleted_at: 200 + i,
+                    ignored: Vec::new(),
                 },
             )
             .unwrap();
@@ -1011,6 +1351,7 @@ mod tests {
                 worktree: "half".into(),
                 admin: "half-admin".into(),
                 deleted_at: 1,
+                ignored: Vec::new(),
             },
         )
         .unwrap();
@@ -1064,6 +1405,7 @@ mod tests {
                         worktree: format!("w{i}"),
                         admin: format!("a{i}"),
                         deleted_at: base_ts + i as u64,
+                        ignored: Vec::new(),
                     },
                 )
                 .unwrap();
@@ -1324,26 +1666,11 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn different_spellings_of_one_directory_are_the_same_path() {
-        use std::os::windows::process::CommandExt;
-
         let dir = tempfile::TempDir::new().unwrap();
         let real = dir.path().join("real");
         std::fs::create_dir_all(real.join("inner")).unwrap();
         let link = dir.path().join("link");
-        let out = std::process::Command::new("cmd")
-            .arg("/c")
-            .raw_arg(format!(
-                "mklink /J \"{}\" \"{}\"",
-                link.display(),
-                real.display()
-            ))
-            .output()
-            .expect("cmd 起不来");
-        assert!(
-            out.status.success(),
-            "mklink 失败: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        mklink(&link, &real);
 
         // 字符串上毫无共同点，落到的是同一个目录
         assert!(same_path(
@@ -1355,5 +1682,282 @@ mod tests {
             real.join("inner").to_str().unwrap(),
             link.join("elsewhere").to_str().unwrap()
         ));
+    }
+
+    /// 拼路径只接受落在根目录里面的相对路径：`..`、绝对路径、空串、不存在的
+    /// 路径都不给；文件只能是最后一级。
+    #[test]
+    fn resolve_inside_refuses_anything_outside_the_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("a").join("node_modules")).unwrap();
+        std::fs::write(root.join("file.txt"), "1").unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules")).unwrap();
+
+        assert_eq!(
+            super::resolve_inside(&root, "a/node_modules"),
+            Some(root.join("a").join("node_modules"))
+        );
+        assert_eq!(
+            super::resolve_inside(&root, "file.txt"),
+            Some(root.join("file.txt")),
+            "被忽略的单个文件也是候选"
+        );
+        assert_eq!(super::resolve_inside(&root, "file.txt/x"), None);
+        assert_eq!(super::resolve_inside(&root, "../node_modules"), None);
+        assert_eq!(super::resolve_inside(&root, "a/../../node_modules"), None);
+        let abs = dir.path().join("node_modules");
+        assert_eq!(super::resolve_inside(&root, abs.to_str().unwrap()), None);
+        assert_eq!(super::resolve_inside(&root, ""), None, "空串就是根本身");
+        assert_eq!(super::resolve_inside(&root, "missing"), None);
+    }
+
+    /// 造 junction（Windows 上 pnpm 就是用它连 node_modules 的）。
+    #[cfg(windows)]
+    fn mklink(link: &std::path::Path, target: &std::path::Path) {
+        use std::os::windows::process::CommandExt;
+        let out = std::process::Command::new("cmd")
+            .arg("/c")
+            .raw_arg(format!(
+                "mklink /J \"{}\" \"{}\"",
+                link.display(),
+                target.display()
+            ))
+            .output()
+            .expect("cmd 起不来");
+        assert!(
+            out.status.success(),
+            "mklink 失败: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// 路径中间夹着 junction 时拼出来的路径落在根外面，必须拒绝；
+    /// 最后一级本身是 junction 也不给。
+    #[cfg(windows)]
+    #[test]
+    fn resolve_inside_refuses_paths_through_a_junction() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(outside.join("node_modules")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        mklink(&root.join("linked"), &outside);
+        mklink(&root.join("node_modules"), &outside.join("node_modules"));
+
+        assert!(
+            root.join("linked").join("node_modules").is_dir(),
+            "前提：顺着 junction 能看到外面的 node_modules"
+        );
+        assert_eq!(super::resolve_inside(&root, "linked/node_modules"), None);
+        assert_eq!(super::resolve_inside(&root, "node_modules"), None);
+    }
+
+    /// 大小按目录里所有文件累加，文件按自身大小；不存在的算不超过。
+    #[test]
+    fn size_check_sums_nested_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(tree.join("a").join("b")).unwrap();
+        std::fs::write(tree.join("x"), [0u8; 40]).unwrap();
+        std::fs::write(tree.join("a").join("b").join("y"), [0u8; 40]).unwrap();
+
+        assert!(super::should_strip(&tree, 79));
+        assert!(!super::should_strip(&tree, 80), "刚好等于上限不算超过");
+        assert!(super::should_strip(&tree.join("x"), 39));
+        assert!(!super::should_strip(&tree.join("x"), 40));
+        assert!(!super::should_strip(&dir.path().join("missing"), 0));
+    }
+
+    /// 量大小不能跟进 junction：链接指向的大目录不在槽位里，算进来会把一个
+    /// 小目录误判成大目录、把它整个删掉。链接本身也不算超过。
+    #[cfg(windows)]
+    #[test]
+    fn size_check_never_follows_junctions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let big = dir.path().join("big");
+        std::fs::create_dir_all(&big).unwrap();
+        std::fs::write(big.join("blob"), [0u8; 1000]).unwrap();
+        let small = dir.path().join("small");
+        std::fs::create_dir_all(&small).unwrap();
+        std::fs::write(small.join("tiny"), [0u8; 10]).unwrap();
+        mklink(&small.join("link"), &big);
+
+        assert!(!super::should_strip(&small, 100));
+        assert!(!super::should_strip(&small.join("link"), 100));
+    }
+
+    /// 被忽略的目录里装着嵌套仓库（`.git` 目录）或 worktree（`.git` 文件）时，
+    /// 再大也不删：它们自己的未提交改动对外层 `git status` 不可见。
+    #[test]
+    fn nested_repositories_are_never_stripped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let clone = dir.path().join("vendor-repos");
+        std::fs::create_dir_all(clone.join("inner").join(".git")).unwrap();
+        std::fs::write(clone.join("inner").join("work.txt"), [0u8; 1000]).unwrap();
+        let linked = dir.path().join("nested-wt");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(linked.join(".git"), "gitdir: /elsewhere").unwrap();
+        std::fs::write(linked.join("work.txt"), [0u8; 1000]).unwrap();
+
+        assert!(!super::should_strip(&clone, 100), "嵌套仓库不能删");
+        assert!(!super::should_strip(&linked, 100), "嵌套 worktree 不能删");
+    }
+
+    /// bare 仓库（镜像 clone、`backup.git`）没有 `.git` 子项，仓库数据直接摆在
+    /// 顶层；没推到别处的提交可能只在这里。被忽略的目录本身是、或者里面装着
+    /// bare 仓库，都不能删。
+    #[test]
+    fn bare_repositories_are_never_stripped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let make_bare = |at: &std::path::Path| {
+            std::fs::create_dir_all(at.join("objects").join("pack")).unwrap();
+            std::fs::create_dir_all(at.join("refs").join("heads")).unwrap();
+            std::fs::write(at.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+            std::fs::write(at.join("objects").join("pack").join("p.pack"), [0u8; 1000]).unwrap();
+        };
+        let bak = dir.path().join("bak");
+        make_bare(&bak.join("backup.git"));
+        let mirror = dir.path().join("mirror.git");
+        make_bare(&mirror);
+        // 对照：只有 HEAD 文件、缺 objects/refs 的普通目录照常按大小判
+        let lookalike = dir.path().join("lookalike");
+        std::fs::create_dir_all(&lookalike).unwrap();
+        std::fs::write(lookalike.join("HEAD"), [0u8; 1000]).unwrap();
+
+        assert!(
+            !super::should_strip(&bak, 100),
+            "装着 bare 仓库的目录不能删"
+        );
+        assert!(!super::should_strip(&mirror, 100), "bare 仓库本身不能删");
+        assert!(super::should_strip(&lookalike, 100));
+    }
+
+    /// 只取最下层：目录里的东西全被忽略时 git 父子都列，按父目录删会把
+    /// 大目录旁边的小 `.env` 一起删掉。这里的输入照抄实测的 git 输出形态。
+    #[test]
+    fn only_the_deepest_listed_entries_are_candidates() {
+        let listing = "packages/\0packages/foo/\0packages/foo/.env\0\
+                       packages/foo/node_modules/\0src-tauri/\0src-tauri/target/\0\
+                       src-tauri-x/\0vendor-repos/\0.env\0";
+        assert_eq!(
+            super::leaf_entries(listing),
+            vec![
+                ".env",
+                "packages/foo/.env",
+                "packages/foo/node_modules/",
+                "src-tauri-x/",
+                "src-tauri/target/",
+                "vendor-repos/",
+            ]
+        );
+        assert!(super::leaf_entries("").is_empty());
+    }
+
+    /// 瘦身的决定落盘：记了 D 的照删（哪怕剩下的已经不到阈值——那是上次删到
+    /// 一半被打断的半截），记了 K 的不再量。
+    #[test]
+    fn recorded_strip_decisions_are_honoured() {
+        let (_dir, trash) = trash_fixture();
+        let slot = super::new_trash_slot(&trash, "w").unwrap();
+        super::write_meta(
+            &slot,
+            &super::TrashMeta {
+                worktree: "/wt".into(),
+                admin: "/admin".into(),
+                deleted_at: 1,
+                ignored: vec!["half".into(), "kept".into(), "fresh".into()],
+            },
+        )
+        .unwrap();
+        super::commit_slot(&slot).unwrap();
+        let wt = slot.join("worktree");
+        std::fs::create_dir_all(wt.join("half")).unwrap();
+        std::fs::write(wt.join("half").join("rest"), "删到一半剩下的").unwrap();
+        big_file(&wt.join("kept").join("blob"));
+        std::fs::write(wt.join("fresh"), "小").unwrap();
+        std::fs::write(slot.join(super::STRIP_STATE), "Dhalf\0Kkept\0").unwrap();
+
+        super::strip_ignored(&slot);
+
+        assert!(!wt.join("half").exists(), "记了 D 的要删到底");
+        assert!(wt.join("kept/blob").exists(), "记了 K 的不再重新判定");
+        assert!(wt.join("fresh").exists(), "小的留着");
+        let (strip, keep) = super::read_strip_state(&slot);
+        assert_eq!(strip, ["half".to_string()].into());
+        assert_eq!(
+            keep,
+            ["kept".to_string(), "fresh".to_string()].into(),
+            "新判定的也要记下来"
+        );
+    }
+
+    /// 旧版写的 meta 没有 `ignored` 字段，必须照样读得出来——读不出来的
+    /// 正式条目会被当成最旧的优先清掉。
+    #[test]
+    fn meta_written_by_older_versions_still_parses() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(super::MARK_COMMITTED),
+            r#"{"worktree":"/wt","admin":"/admin","deleted_at":42}"#,
+        )
+        .unwrap();
+
+        let meta = super::read_meta(dir.path(), super::MARK_COMMITTED).unwrap();
+        assert_eq!(meta.deleted_at, 42);
+        assert!(meta.ignored.is_empty());
+    }
+
+    /// 造一个逻辑大小超过瘦身阈值的文件。`set_len` 只改文件长度不写数据，
+    /// 不会真往盘上写几十 MB。
+    fn big_file(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        file.set_len(super::STRIP_THRESHOLD + 1).unwrap();
+    }
+
+    /// 瘦身只删 meta 点名、在槽位工作树里、而且超过阈值的条目：小的留着，
+    /// 名单外的大文件留着，`..` 拼出去的留着。
+    #[test]
+    fn stripping_removes_only_listed_entries_over_the_threshold() {
+        let (_dir, trash) = trash_fixture();
+        let slot = super::new_trash_slot(&trash, "w").unwrap();
+        super::write_meta(
+            &slot,
+            &super::TrashMeta {
+                worktree: "/wt".into(),
+                admin: "/admin".into(),
+                deleted_at: 1,
+                ignored: vec![
+                    "target".into(),
+                    "app.log".into(),
+                    ".env".into(),
+                    ".idea".into(),
+                    "../outside".into(),
+                ],
+            },
+        )
+        .unwrap();
+        super::commit_slot(&slot).unwrap();
+        let wt = slot.join("worktree");
+        big_file(&wt.join("target").join("debug").join("app.exe"));
+        big_file(&wt.join("app.log"));
+        std::fs::write(wt.join(".env"), "SECRET=1").unwrap();
+        std::fs::create_dir_all(wt.join(".idea")).unwrap();
+        std::fs::write(wt.join(".idea").join("workspace.xml"), "<x/>").unwrap();
+        big_file(&wt.join("recording.bin")); // 大，但不在名单上（没被忽略）
+        big_file(&slot.join("outside").join("blob")); // 工作树外，`..` 能拼到
+
+        super::strip_ignored(&slot);
+
+        assert!(!wt.join("target").exists(), "被忽略的大目录该删");
+        assert!(!wt.join("app.log").exists(), "被忽略的大文件该删");
+        assert!(wt.join(".env").exists(), "被忽略的小文件留着");
+        assert!(
+            wt.join(".idea/workspace.xml").exists(),
+            "被忽略的小目录留着"
+        );
+        assert!(wt.join("recording.bin").exists(), "名单外的不能删");
+        assert!(slot.join("outside/blob").exists(), "工作树外的路径不能删");
     }
 }
