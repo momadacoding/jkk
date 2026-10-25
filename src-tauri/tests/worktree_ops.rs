@@ -452,6 +452,269 @@ fn deleting_returns_fast_even_when_the_trash_needs_pruning() {
     assert!(kept <= 5, "后台清理该把回收站收敛到 5 个，实际 {kept} 个");
 }
 
+/// 等后台线程把某个条件做成，超时返回 false。
+fn wait_until(cond: impl Fn() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    cond()
+}
+
+/// 造一个逻辑大小刚超过瘦身阈值的文件。`set_len` 只改长度不写数据，
+/// 不会真往盘上写几十 MB。
+fn big_file(path: &std::path::Path) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let file = fs::File::create(path).unwrap();
+    file.set_len(cmd::STRIP_THRESHOLD + 1).unwrap();
+}
+
+/// 瘦身按 git 列出的顺序一条条删，而 `ls-files` 的输出按路径排序。放一个路径
+/// 排在最后的大目录当哨兵：它没了，前面的候选就都已经处理过，这时再断言
+/// 「该留的还在」才有意义——固定睡一会儿在慢机器上什么都证明不了。
+/// 用到它的测试必须忽略 `node_modules/`。
+const SENTINEL: &str = "zzz-sentinel/node_modules";
+
+fn plant_sentinel(wt: &std::path::Path) {
+    big_file(&wt.join(SENTINEL).join("blob"));
+}
+
+fn wait_strip_done(moved: &std::path::Path) -> bool {
+    wait_until(|| !moved.join(SENTINEL).exists())
+}
+
+/// 提交一份 .gitignore，让后面造的东西处于「被忽略、未跟踪」的真实形态。
+fn commit_gitignore(main: &std::path::Path, wt: &std::path::Path, rules: &str) {
+    fs::write(wt.join(".gitignore"), rules).unwrap();
+    run_git(main, &["-C", wt.to_str().unwrap(), "add", ".gitignore"]);
+    run_git(
+        main,
+        &["-C", wt.to_str().unwrap(), "commit", "-m", "gitignore"],
+    );
+}
+
+/// 回收站不收被 git 忽略的大东西：node_modules、cargo 的 target、大日志。
+/// 一个 Tauri 工作树的 debug 构建动辄十几 GB，回收站留 5 个就能攒到上百 GB——
+/// 这正是要修的事故。
+///
+/// 其余一律原样保留：跟踪的文件、未提交的文件（哪怕很大）、被忽略的小东西
+/// （`.env`、`.idea/`、`dist/`、没装几个包的 node_modules）。
+#[test]
+fn the_trash_drops_big_ignored_entries_but_keeps_everything_else() {
+    let (_dir, wt) = repo_with_worktree("heavy");
+    let main = main_of(&wt);
+    // src-tauri 里有跟踪文件，git 才会单独列出它下面的 target
+    fs::create_dir_all(wt.join("src-tauri")).unwrap();
+    fs::write(wt.join("src-tauri").join("Cargo.toml"), "[package]").unwrap();
+    run_git(&main, &["-C", wt.to_str().unwrap(), "add", "src-tauri"]);
+    commit_gitignore(
+        &main,
+        &wt,
+        "node_modules/\ntarget\ndist/\n.env\n*.log\n.idea/\n",
+    );
+
+    stuff(&wt.join("node_modules"), 300);
+    big_file(&wt.join("node_modules").join("pkg-big").join("binary.node"));
+    big_file(&wt.join("src-tauri/target/debug/app.exe"));
+    big_file(&wt.join("app.log"));
+    // 被忽略但小：要么是唯一副本（密钥、本地配置），要么删了也省不出空间
+    stuff(&wt.join("packages").join("p").join("node_modules"), 50);
+    fs::write(wt.join(".env"), "SECRET=1").unwrap();
+    fs::create_dir_all(wt.join(".idea")).unwrap();
+    fs::write(wt.join(".idea").join("workspace.xml"), "<x/>").unwrap();
+    fs::create_dir_all(wt.join("dist")).unwrap();
+    fs::write(wt.join("dist").join("bundle.js"), "1").unwrap();
+    // 很大但没被忽略：是用户的东西，多大都不能删
+    big_file(&wt.join("recording.bin"));
+    plant_sentinel(&wt);
+
+    let deleted = delete(&main, &wt, true);
+    let moved = std::path::Path::new(&deleted.trash_path).join("worktree");
+
+    assert!(wait_strip_done(&moved), "后台瘦身没跑完");
+    assert!(!moved.join("node_modules").exists(), "大 node_modules 该删");
+    assert!(
+        !moved.join("src-tauri/target").exists(),
+        "cargo 的 target 该删"
+    );
+    assert!(!moved.join("app.log").exists(), "被忽略的大文件该删");
+    assert!(moved.join("a.txt").exists(), "跟踪的文件该在");
+    assert!(
+        moved.join("src-tauri/Cargo.toml").exists(),
+        "只删 target，不删它的父目录"
+    );
+    assert!(
+        moved.join("recording.bin").exists(),
+        "没被忽略的大文件不能删"
+    );
+    assert!(moved.join(".env").exists(), "被忽略的小文件该在");
+    assert!(
+        moved.join(".idea/workspace.xml").exists(),
+        "被忽略的小目录该在"
+    );
+    assert!(moved.join("dist/bundle.js").exists(), "小的 dist 该在");
+    assert!(
+        moved.join("packages/p/node_modules").exists(),
+        "没超过阈值的 node_modules 该在"
+    );
+}
+
+/// 一个目录里只剩被忽略的东西时（切分支后跟踪文件消失就是这种形态），大的删、
+/// 小的留：200MB 的 node_modules 旁边那个 `.env` 是密钥的唯一副本，不能因为
+/// 同处一个「整体被忽略」的父目录就陪葬。
+#[test]
+fn a_small_secret_survives_next_to_a_big_dependency_dir() {
+    let (_dir, wt) = repo_with_worktree("orphaned");
+    let main = main_of(&wt);
+    commit_gitignore(&main, &wt, "node_modules/\n.env\n");
+
+    big_file(&wt.join("packages/foo/node_modules/pkg/binary.node"));
+    fs::write(wt.join("packages/foo/.env"), "SECRET=唯一副本").unwrap();
+    plant_sentinel(&wt);
+
+    let deleted = delete(&main, &wt, true);
+    let moved = std::path::Path::new(&deleted.trash_path).join("worktree");
+
+    assert!(wait_strip_done(&moved), "后台瘦身没跑完");
+    assert!(
+        !moved.join("packages/foo/node_modules").exists(),
+        "大的 node_modules 该删"
+    );
+    assert_eq!(
+        fs::read_to_string(moved.join("packages/foo/.env")).unwrap(),
+        "SECRET=唯一副本",
+        "同目录下的小 .env 必须留着"
+    );
+}
+
+/// 被忽略的目录里装着别的仓库时（`info/exclude` 藏起来的 clone、嵌套 worktree），
+/// 再大也不删：它们自己的未提交改动外层 `git status` 看不见，脏检查拦不住。
+#[test]
+fn a_nested_repository_in_an_ignored_dir_is_kept() {
+    let (_dir, wt) = repo_with_worktree("nesting");
+    let main = main_of(&wt);
+    commit_gitignore(&main, &wt, "node_modules/\nvendor-repos/\n");
+
+    let inner = wt.join("vendor-repos").join("inner");
+    fs::create_dir_all(&inner).unwrap();
+    run_git(&inner, &["init"]);
+    big_file(&inner.join("dataset.bin"));
+    plant_sentinel(&wt);
+
+    let deleted = delete(&main, &wt, true);
+    let moved = std::path::Path::new(&deleted.trash_path).join("worktree");
+
+    assert!(wait_strip_done(&moved), "后台瘦身没跑完");
+    assert!(
+        moved.join("vendor-repos/inner/dataset.bin").exists(),
+        "嵌套仓库里的东西不能删"
+    );
+}
+
+/// 被 git 跟踪的东西不在瘦身范围内，哪怕它所在的目录里还躺着被忽略的大文件：
+/// 只删被忽略的那个，跟踪文件里没提交的改动只存在于回收站里，必须留着。
+#[test]
+fn tracked_files_survive_even_next_to_big_ignored_ones() {
+    let (_dir, wt) = repo_with_worktree("vendored");
+    let main = main_of(&wt);
+    commit_gitignore(&main, &wt, "node_modules/\n");
+
+    let vendored = wt.join("vendor").join("node_modules");
+    fs::create_dir_all(&vendored).unwrap();
+    fs::write(vendored.join("patched.js"), "v1").unwrap();
+    run_git(&main, &["-C", wt.to_str().unwrap(), "add", "-f", "vendor"]);
+    run_git(
+        &main,
+        &["-C", wt.to_str().unwrap(), "commit", "-m", "vendor"],
+    );
+    fs::write(vendored.join("patched.js"), "v2 未提交").unwrap();
+    big_file(&vendored.join("cache.bin"));
+    plant_sentinel(&wt);
+
+    let deleted = delete(&main, &wt, true);
+    let moved = std::path::Path::new(&deleted.trash_path).join("worktree");
+
+    assert!(wait_strip_done(&moved), "后台瘦身没跑完");
+    assert!(
+        !moved.join("vendor/node_modules/cache.bin").exists(),
+        "被忽略的大文件该删"
+    );
+    assert_eq!(
+        fs::read_to_string(moved.join("vendor/node_modules/patched.js")).unwrap(),
+        "v2 未提交",
+        "被跟踪的文件必须原样保留"
+    );
+}
+
+/// 删除一个 worktree 时，即使目录在后台被清理着，删除本身也必须毫秒级返回——
+/// 清 node_modules 是分钟级的，不能让用户的点击替它买单。
+#[test]
+fn stripping_does_not_slow_the_delete_down() {
+    let (_dir, wt) = repo_with_worktree("big");
+    let main = main_of(&wt);
+    commit_gitignore(&main, &wt, "node_modules/\n");
+    stuff(&wt.join("node_modules"), 20_000);
+    big_file(&wt.join("node_modules").join("binary.node"));
+
+    let started = std::time::Instant::now();
+    let deleted = delete(&main, &wt, false);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "删除被清理拖慢了：{:?}",
+        started.elapsed()
+    );
+
+    let moved = std::path::Path::new(&deleted.trash_path).join("worktree");
+    assert!(
+        wait_until(|| !moved.join("node_modules").exists()),
+        "后台最终要把 node_modules 清掉"
+    );
+}
+
+/// 瘦身绝不能跟进 junction：pnpm 在 Windows 上就是用 junction 把包连进
+/// node_modules 的，链接可能指向仓库外。
+///
+/// 另一条通道是**路径中间**的 junction：`linked/` 本身就是指向仓库外的链接，
+/// 外面恰好有个大 `node_modules`。Windows 上 git 会进 junction，真的会把
+/// `linked/node_modules/` 列成候选（实测），拼出来的路径落在仓库外，不能删。
+#[cfg(windows)]
+#[test]
+fn stripping_never_follows_junctions() {
+    let (dir, wt) = repo_with_worktree("linked");
+    let main = main_of(&wt);
+    commit_gitignore(&main, &wt, "node_modules/\n");
+
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("important.txt"), "仓库外的数据").unwrap();
+    big_file(&outside.join("node_modules").join("important.bin"));
+
+    big_file(&wt.join("node_modules").join("binary.node"));
+    junction(&wt.join("node_modules").join("external"), &outside);
+    junction(&wt.join("linked"), &outside);
+    plant_sentinel(&wt);
+
+    let deleted = delete(&main, &wt, true);
+    let moved = std::path::Path::new(&deleted.trash_path).join("worktree");
+
+    assert!(wait_strip_done(&moved), "后台瘦身没跑完");
+    assert!(
+        !moved.join("node_modules").exists(),
+        "工作树自己的 node_modules 该被清掉"
+    );
+    assert!(
+        outside.join("important.txt").exists(),
+        "node_modules 里的 junction 被跟进去了"
+    );
+    assert!(
+        outside.join("node_modules").join("important.bin").exists(),
+        "路径中间的 junction 被跟进去了，删到了仓库外的 node_modules"
+    );
+}
+
 /// 删掉 worktree 不会动里面做的提交——提交对象在共享的对象库里，
 /// 分支引用也在共享的 refs 里，worktree 目录只是一份检出。
 #[test]

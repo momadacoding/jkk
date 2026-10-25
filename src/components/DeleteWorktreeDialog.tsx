@@ -107,9 +107,12 @@ export function DeleteWorktreeDialog({ worktree, onCancel, onConfirm }: DeleteWo
 
         {/* 说清楚代价的边界：分支根本不动。不写的话用户会以为删 worktree 会把
             分支上的提交一起带走。回收站路径要写出来：没有撤销入口之后，它是
-            用户自己把东西捞回来的唯一线索 */}
+            用户自己把东西捞回来的唯一线索。被忽略的大东西不进回收站也要说：
+            捞回来发现 node_modules 没了，得知道是有意为之、重装即可。
+            50MB 对应 Rust 侧的 STRIP_THRESHOLD，改那边要同步改这里 */}
         <div className="dlg-note">
-          目录会被移到仓库内的回收站（.worktrees/.trash），不是直接抹掉。分支和它上面的提交不受影响。
+          目录会被移到仓库内的回收站（.worktrees/.trash-v2），不是直接抹掉。分支和它上面的提交不受影响。
+          被 git 忽略、超过 50MB 的文件和目录（node_modules、构建产物等）不保留，捞回来后重新安装 / 构建即可。
         </div>
 
         {error && <div className="dlg-warning">{error}</div>}
