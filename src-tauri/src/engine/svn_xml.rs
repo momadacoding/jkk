@@ -97,9 +97,20 @@ pub fn parse_info(xml: &str) -> Result<Vec<SvnInfoEntry>> {
 /// 用 `descendants()` 按 tag 名直接筛 `wc-status`，天然不会碰到内层的 `<commit>`
 /// ——这正是选 DOM 而不是流式 parser 的理由。
 pub fn parse_node_revs(xml: &str) -> Result<BTreeSet<i64>> {
+    Ok(parse_node_rev_entries(xml)?
+        .into_iter()
+        .map(|(_, rev)| rev)
+        .collect())
+}
+
+/// 与 [`parse_node_revs`] 同一份输入、同一套守卫，但逐节点给出 `(路径, revision)`。
+///
+/// 只在 `nodeRevs` 多值、要告诉用户**哪些文件**掉了队时用。路径是 entry 的 path
+/// 属性，统一成正斜杠，按路径升序。
+pub fn parse_node_rev_entries(xml: &str) -> Result<Vec<(String, i64)>> {
     let doc = parse_doc(xml)?;
     assert_externals_were_ignored(&doc)?;
-    let mut revs = BTreeSet::new();
+    let mut revs: Vec<(String, i64)> = Vec::new();
     let mut skipped_uncommitted = 0usize;
     for st in doc.descendants().filter(|n| n.has_tag_name("wc-status")) {
         // external **根**的 wc-status 没有 revision 属性，跳过而不是记成 0——
@@ -133,8 +144,14 @@ pub fn parse_node_revs(xml: &str) -> Result<BTreeSet<i64>> {
             skipped_uncommitted += 1;
             continue;
         }
-        revs.insert(rev);
+        let path = st
+            .parent_element()
+            .filter(|p| p.has_tag_name("entry"))
+            .ok_or_else(|| GitError::new("svn_xml", "svn status 的 <wc-status> 不在 <entry> 底下"))
+            .and_then(|entry| attr(&entry, "path"))?;
+        revs.push((norm_sep(&path), rev));
     }
+    revs.sort();
     // 全被跳过、一个正 revision 都没剩：不能套用下面那条「漏了 -v」的说法，
     // 那会把用户引向一个完全无关的方向。
     if revs.is_empty() && skipped_uncommitted > 0 {

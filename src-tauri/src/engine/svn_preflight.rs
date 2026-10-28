@@ -9,9 +9,9 @@
 use crate::engine::svn_cli::run_svn;
 use crate::engine::svn_dirty::read_dirty;
 use crate::engine::svn_wc::{check_single_repository, enumerate_wcs, peg_safe, WcIdentity};
-use crate::engine::svn_xml::{parse_node_revs, parse_status_entries, StatusEntry};
+use crate::engine::svn_xml::{parse_node_rev_entries, parse_status_entries, StatusEntry};
 use crate::error::{GitError, Result};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// 录基线需要、而且只有走完校验才敢用的三个事实。
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -80,7 +80,7 @@ pub fn run_preflight(repo_root: &str, whitelist: &[String]) -> Result<Preflight>
     check_no_operation_in_progress(repo_root, &wcs)?; // P3
     let targets = check_targets(&roots, &wcs);
     let dirty = collect_dirty(repo_root, &targets)?; // P1
-    let node_rev = check_single_node_rev(repo_root, &targets, &wcs)?; // P2
+    let node_rev = check_single_node_rev(repo_root, &roots, &targets, &wcs)?; // P2
 
     let first = wcs.first().ok_or_else(|| {
         GitError::new(
@@ -114,7 +114,7 @@ pub fn read_node_rev(repo_root: &str, whitelist: &[String]) -> Result<u64> {
     let roots = whitelist_roots(whitelist);
     let wcs = enumerate_wcs(repo_root, whitelist)?;
     let targets = check_targets(&roots, &wcs);
-    check_single_node_rev(repo_root, &targets, &wcs)
+    check_single_node_rev(repo_root, &roots, &targets, &wcs)
 }
 
 /// 本流程对 svn 发命令时用的 target：白名单根，加上其中的嵌套工作副本根。
@@ -340,37 +340,29 @@ fn collect_dirty(repo_root: &str, targets: &[String]) -> Result<Vec<StatusEntry>
 /// `targets` 来自 [`check_targets`]，对应 spec §6.6.5 的「在**每个 `wc(P)`** 上各跑
 /// 一次……取并集」。被 `-r` 钉住的嵌套 external 正是靠这条并集才现形——它自己那份
 /// revision 不会出现在父目录的 status 里。
-fn check_single_node_rev(repo_root: &str, targets: &[String], wcs: &[WcIdentity]) -> Result<u64> {
-    let mut all: BTreeSet<i64> = BTreeSet::new();
+fn check_single_node_rev(
+    repo_root: &str,
+    roots: &[String],
+    targets: &[String],
+    wcs: &[WcIdentity],
+) -> Result<u64> {
+    let mut entries: Vec<(String, i64)> = Vec::new();
     for root in targets {
         let arg = peg_safe(root);
         let xml = run_svn(
             repo_root,
             &["status", "-v", "--xml", "--ignore-externals", "--", &arg],
         )?;
-        all.extend(parse_node_revs(&xml)?);
+        entries.extend(parse_node_rev_entries(&xml)?);
     }
+    let all: BTreeSet<i64> = entries.iter().map(|(_, r)| *r).collect();
 
     if all.len() > 1 {
-        let list = all
-            .iter()
-            .map(|r| r.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        // spec §6.5 给的引导是「先跑一次完整 svn update」，但 §6.6.4 明确指出
-        // **白名单落在 external 里时这条引导永远无效**——external 的 revision
-        // 来自另一个仓库的序列，本工作副本的 update 动不了它。给错引导比不给更糟：
-        // 用户会反复跑 update，反复失败，而错在别处。
-        let hint = if touches_external(repo_root, wcs) {
-            "白名单落在 external 里，**跑 svn update 解决不了**——\
-             external 的 revision 来自另一个仓库的序列。\
-             需要改 svn:externals 的钉死写法，或把白名单收到单一 revision 的子树内。"
-        } else {
-            "工作副本是 mixed-revision，请先跑一次完整的 svn update 把它对齐到同一个 revision。"
-        };
-        return Err(GitError::new(
-            "svn_preflight_mixed_revision",
-            format!("白名单内出现了多个 revision：{{{list}}}。{hint}"),
+        return Err(mixed_revision_error(
+            &entries,
+            &all,
+            roots,
+            touches_external(repo_root, wcs),
         ));
     }
 
@@ -395,6 +387,112 @@ fn check_single_node_rev(repo_root: &str, targets: &[String], wcs: &[WcIdentity]
             ),
         )
     })
+}
+
+/// P2 不过时的报错：列出**不在多数 revision 上**的节点，按方向说明成因。
+///
+/// # 为什么不能只报 revision 集合
+///
+/// 2026-10-28 用户在初始化时撞上 `{N, N+1}`：之前在 TortoiseSVN 里提交过别的文件、
+/// 没 update。只看见两个数字时，用户认不出这是自己刚才那次提交——列出掉队的文件
+/// 才对得上号。
+///
+/// # 多数派与方向
+///
+/// 「多数」按节点数取，平票取较大的 revision。少数比多数**新**，几乎总是提交过、
+/// 没 update（`svn commit` 只推进提交的那几个节点，连父目录都不动）；少数比多数
+/// **旧**，是 update 时被跳过或被单独退回。两种成因都按实际出现的方向给，不出现的
+/// 那条不说——给一条与现场无关的原因，用户会去查一件没发生过的事。
+fn mixed_revision_error(
+    entries: &[(String, i64)],
+    all: &BTreeSet<i64>,
+    roots: &[String],
+    in_external: bool,
+) -> GitError {
+    const SHOWN: usize = 20;
+
+    let list = all
+        .iter()
+        .map(|r| r.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut counts: BTreeMap<i64, usize> = BTreeMap::new();
+    for (_, r) in entries {
+        *counts.entry(*r).or_default() += 1;
+    }
+    // BTreeMap 升序遍历 + max_by_key 取最后一个最大值 ⇒ 平票时取较大的 revision
+    let majority = counts
+        .iter()
+        .max_by_key(|(_, n)| **n)
+        .map(|(r, _)| *r)
+        .unwrap_or_default();
+
+    let stragglers: Vec<&(String, i64)> = entries.iter().filter(|(_, r)| *r != majority).collect();
+    let mut text = format!(
+        "白名单内出现了多个 revision：{{{list}}}。大多数文件停在 r{majority}，下面这些不在：\n"
+    );
+    for (path, rev) in stragglers.iter().take(SHOWN) {
+        text.push_str(&format!("  - r{rev}  {path}\n"));
+    }
+    if stragglers.len() > SHOWN {
+        text.push_str(&format!("  ……另有 {} 条未列出\n", stragglers.len() - SHOWN));
+    }
+    // spec §6.5 给的引导是「先跑一次完整 svn update」，但 §6.6.4 明确指出
+    // **白名单落在 external 里时这条引导永远无效**——external 的 revision
+    // 来自另一个仓库的序列，本工作副本的 update 动不了它。给错引导比不给更糟：
+    // 用户会反复跑 update，反复失败，而错在别处。
+    //
+    // 按方向给的成因也只在 external 之外给：那里的多值多半来自 `-r` 钉死，
+    // 说成「提交过」「update 被跳过」会和紧跟着的「update 解决不了」自相矛盾
+    if in_external {
+        text.push_str(
+            "白名单落在 external 里，**跑 svn update 解决不了**——\
+             external 的 revision 来自另一个仓库的序列。\
+             需要改 svn:externals 的钉死写法，或把白名单收到单一 revision 的子树内。",
+        );
+    } else {
+        if stragglers.iter().any(|(_, r)| *r > majority) {
+            text.push_str(
+                "停在更新的 revision 上：多半是在 TortoiseSVN 里提交过、之后没有 update——\
+                 svn commit 只把提交的那几个文件推到新 revision，其余文件原地不动。\n",
+            );
+        }
+        if stragglers.iter().any(|(_, r)| *r < majority) {
+            text.push_str(
+                "停在更旧的 revision 上：多半是 update 时被跳过了（比如文件被 Unity 占着），\
+                 或被单独 update 回了旧版本。\n",
+            );
+        }
+        text.push_str(&format!(
+            "在 TortoiseSVN 里对工程根目录（或白名单目录）跑一次 Update，\
+             把工作副本对齐到同一个 revision，再回来重试。命令行：svn update {}",
+            update_command_args(roots)
+        ));
+    }
+    GitError::new("svn_preflight_mixed_revision", text)
+}
+
+/// 给用户复制的 `svn update` 参数：带空格的加引号，带 `@` 的补 peg。
+///
+/// 只服务于展示，不拿去执行——本应用自己调 svn 一律走 `run_svn` + [`peg_safe`]。
+fn update_command_args(roots: &[String]) -> String {
+    roots
+        .iter()
+        .map(|r| {
+            let r = if r.contains('@') {
+                peg_safe(r)
+            } else {
+                r.clone()
+            };
+            if r.contains(char::is_whitespace) {
+                format!("\"{r}\"")
+            } else {
+                r
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// 白名单是否递归覆盖到了仓库根工作副本之外的工作副本（即落进了 external）。

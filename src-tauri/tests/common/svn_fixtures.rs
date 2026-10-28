@@ -655,6 +655,37 @@ pub fn svn_repo_mixed_revision() -> SvnFixture {
     SvnFixture { dir }
 }
 
+/// **提交过、没有 update** 造出的 mixed-revision：整体在 r3，`Code/B.cs` 被提交到 r4。
+///
+/// 这是用户真实撞上的形态（2026-10-28：初始化之前在 TortoiseSVN 里提交过别的文件）。
+/// 与 [`svn_repo_mixed_revision`] 方向相反——那边是少数文件**落后**，这边是少数文件
+/// **超前**。`svn commit` 只把提交的那几个节点推到新 revision，父目录与其余文件原地不动。
+pub fn svn_repo_committed_without_update() -> SvnFixture {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let url = seed_three_revisions(&root);
+    run(
+        &root,
+        "svn",
+        &["checkout", &url, "wc1", "--non-interactive"],
+    );
+    let wc = root.join("wc1");
+    std::fs::write(wc.join("Code/B.cs"), "v4\n").unwrap();
+    run(
+        &wc,
+        "svn",
+        &[
+            "commit",
+            "-m",
+            "r4",
+            "--non-interactive",
+            "--",
+            "Code/B.cs@",
+        ],
+    );
+    SvnFixture { dir }
+}
+
 /// 白名单目录**在 r1 上还不存在**，r2 才建出来。
 ///
 /// # 干什么用的

@@ -272,8 +272,10 @@ export function wizardErrorHint(code: string, message = ''): string {
       '换成了同名目录。这种位置上 svn 自己都说不清是什么，取不到它在服务器上的内容。' +
       '本应用不会替你动这些路径（删目录、revert 都是破坏性操作）。' +
       '除了 `~`，其余本地修改都不再阻断建库或重建基线。',
+    // 开头与后端消息一致：后端列出了掉队文件与成因时这段整条不显示
     svn_preflight_mixed_revision:
-      '工作副本里有多个 revision。先跑一次完整的 svn update 把它对齐。' +
+      '白名单内出现了多个 revision——最常见的原因是在 TortoiseSVN 里提交过文件、' +
+      '之后没有 update。先在 TortoiseSVN 里对工程根目录跑一次 Update 把它对齐。' +
       '如果白名单落在 external 里，update 解决不了——错误详情里会说明。',
     svn_preflight_operation_in_progress:
       '上一次 svn 操作没跑完。先跑 Cleanup 释放写锁；' +

@@ -2092,6 +2092,8 @@ body {
 .svn-notice.ok { border-left: 3px solid #3f7d4f; }
 .svn-notice.warn { border-left: 3px solid #8a7320; }
 .svn-notice.error { border-left: 3px solid #8a3030; }
+/* 后端错误消息里的文件清单靠 \n 分行（obstructed、mixed-revision），不保留就挤成一行 */
+.svn-notice.error > strong { white-space: pre-wrap; }
 .svn-notice-detail {
   margin: 4px 0 0;
   white-space: pre-wrap;
