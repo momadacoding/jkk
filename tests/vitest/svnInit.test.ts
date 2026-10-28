@@ -272,7 +272,7 @@ describe('错误码到引导语的映射', () => {
     // 不能因为其中一个恰好与引导开头重合就被当成重复而吞掉。
     for (const headline of [
       'git 实际跟踪的文件集合与配置声明的不一致。',
-      '建库前预检没通过：按当前的忽略规则，git 将要收进来的文件与配置声明的不一致。',
+      '录制基线前预检没通过：按当前的忽略规则，git 将要收进来的文件与配置声明的不一致。',
     ]) {
       const hint = wizardErrorHint('include_set_mismatch', headline)
       expect(hint).toContain('.gitignore')

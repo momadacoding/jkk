@@ -73,20 +73,37 @@ pub struct PhaseTiming {
 /// 2026-10-27 用户在公司装机版上反馈「确认并建库」要半小时，却没法知道花在哪一步。
 /// 所以成功时进 [`InitReport::timings`]，失败时由 [`PhaseClock::annotate`] 附在
 /// 错误正文末尾；`log::info!` 只是开发时顺带看的。
-#[derive(Default)]
+///
+/// 录制服务器树的那几步是共用的（同步、重建也走），所以计时器带一个 `scope`
+/// 写进日志，免得同步时日志里冒出「建库阶段」误导排查（第二轮 review）。
 struct PhaseClock {
+    scope: &'static str,
     phases: Vec<PhaseTiming>,
-    /// 最后一个失败的阶段在 `phases` 里的下标。
+    /// 失败的阶段在 `phases` 里的下标。
     failed: Option<usize>,
+    /// 上一个阶段结束的时刻。失败落在两个阶段之间时，用它量那段空档。
+    last_end: Option<std::time::Instant>,
 }
 
+/// 失败没有落在任何计时阶段里时补的那一行。
+const UNTIMED_PHASE: &str = "（上一阶段之后、未单独计时的步骤）";
+
 impl PhaseClock {
+    fn new(scope: &'static str) -> Self {
+        Self {
+            scope,
+            phases: Vec::new(),
+            failed: None,
+            last_end: None,
+        }
+    }
+
     /// 计时跑一段。**失败也记**：最该看耗时的恰恰是「跑了很久然后失败」的那一步。
     fn run<T>(&mut self, phase: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
         let started = std::time::Instant::now();
         let out = f();
         let millis = started.elapsed().as_millis() as u64;
-        log::info!("建库阶段「{phase}」耗时 {millis} ms");
+        log::info!("{}阶段「{phase}」耗时 {millis} ms", self.scope);
         if out.is_err() {
             self.failed = Some(self.phases.len());
         }
@@ -94,11 +111,31 @@ impl PhaseClock {
             phase: phase.to_string(),
             millis,
         });
+        self.last_end = Some(std::time::Instant::now());
         out
     }
 
+    /// 已知出错了、但没有哪个计时阶段失败时，补一行「未单独计时的步骤」标成失败。
+    ///
+    /// 不把每个可失败的小步骤都包进 `run`：那样成功页上会多出一堆 0.0 秒的行，
+    /// 而且以后新加的步骤照样可能漏包。这里兜底，保证失败标记**恰好一个**、
+    /// 而且落在它真正发生的位置——所以调用方要在跑回退阶段**之前**调它。
+    /// 一个阶段都没跑过时什么也不做，与 [`Self::annotate`] 同口径。
+    fn settle_failure(&mut self) {
+        if self.failed.is_some() || self.phases.is_empty() {
+            return;
+        }
+        let millis = self.last_end.map_or(0, |t| t.elapsed().as_millis() as u64);
+        self.failed = Some(self.phases.len());
+        self.phases.push(PhaseTiming {
+            phase: UNTIMED_PHASE.to_string(),
+            millis,
+        });
+    }
+
     /// 把耗时附在错误正文末尾。一个阶段都没跑过时原样返回。
-    fn annotate(&self, mut e: GitError) -> GitError {
+    fn annotate(mut self, mut e: GitError) -> GitError {
+        self.settle_failure();
         if self.phases.is_empty() {
             return e;
         }
@@ -140,7 +177,38 @@ fn human_duration(millis: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::human_duration;
+    use super::{human_duration, PhaseClock};
+    use crate::error::{GitError, Result};
+
+    /// 第二轮 review：失败若发生在两个计时阶段之间（比如建临时索引），原来的
+    /// 耗时表一个失败标记都没有，用户只会以为是表里最后那一步出的事。
+    #[test]
+    fn a_failure_outside_any_timed_phase_is_still_marked_where_it_happened() {
+        let mut clock = PhaseClock::new("测试");
+        clock.run("甲", || Ok(())).unwrap();
+        // 未计时的步骤失败了；调用方随后照常跑回退阶段
+        clock.settle_failure();
+        let _ = clock.run("回退", || -> Result<()> { Ok(()) });
+
+        let msg = clock.annotate(GitError::new("x", "出错了")).message;
+        assert_eq!(msg.matches("← 在这一步失败").count(), 1, "实际：{msg}");
+        let marked = msg.lines().find(|l| l.contains("← 在这一步失败")).unwrap();
+        assert!(marked.contains("未单独计时"), "实际：{msg}");
+        assert!(
+            msg.find("未单独计时").unwrap() < msg.find("回退").unwrap(),
+            "失败标在它真正发生的位置，即回退之前：{msg}"
+        );
+    }
+
+    #[test]
+    fn a_failure_inside_a_timed_phase_is_not_marked_twice() {
+        let mut clock = PhaseClock::new("测试");
+        let _ = clock.run("甲", || -> Result<()> { Err(GitError::new("x", "坏")) });
+        clock.settle_failure();
+        let msg = clock.annotate(GitError::new("x", "坏")).message;
+        assert_eq!(msg.matches("← 在这一步失败").count(), 1, "实际：{msg}");
+        assert!(!msg.contains("未单独计时"), "实际：{msg}");
+    }
 
     /// 与 `tests/vitest/svnInit.test.ts` 的「耗时的显示」逐条对应——两侧必须给出同样的字。
     #[test]
@@ -209,7 +277,7 @@ pub fn init_hybrid(req: &InitRequest) -> Result<InitReport> {
         }
     }
 
-    let mut clock = PhaseClock::default();
+    let mut clock = PhaseClock::new("建库");
     match init_phases(req, root, &mut clock) {
         Ok(mut report) => {
             report.timings = clock.phases;
@@ -224,11 +292,12 @@ pub fn init_hybrid(req: &InitRequest) -> Result<InitReport> {
 fn init_phases(req: &InitRequest, root: &str, clock: &mut PhaseClock) -> Result<InitReport> {
     // 工作副本根的 URL 在一次运行里不会变，取一次传下去
     // （配置要写它，体检要拿它当基准）。
-    let (svn_url, cfg) = clock.run("读取工作副本信息（svn info）", || {
-        let svn_url = working_copy_url(root)?;
-        let cfg = build_config(req, &svn_url)?;
-        Ok((svn_url, cfg))
-    })?;
+    //
+    // 这两步**不计时**：都是瞬时的，而 `build_config` 失败的是用户的输入。
+    // 一个阶段都还没计时，`annotate` 就原样返回错误——否则一条「白名单写错了」
+    // 后面会跟一张耗时表，还把失败标在 svn info 上（第二轮 review）。
+    let svn_url = working_copy_url(root)?;
+    let cfg = build_config(req, &svn_url)?;
 
     // ---- 前置校验：全部在创建 .git **之前**，失败时无需回退 ----
     let pre = clock.run("前置校验 P1–P4（svn status）", || {
@@ -252,6 +321,9 @@ fn init_phases(req: &InitRequest, root: &str, clock: &mut PhaseClock) -> Result<
             timings: Vec::new(),
         }),
         Err(e) => {
+            // 失败若不在任何计时阶段里，先把标记落在这里——放到回退之后再补，
+            // 表上看起来就像是回退之后才出的错。
+            clock.settle_failure();
             // 回退要删掉的 .git 里可能已经有 `git add` 写进去的几 GB 对象，
             // 这一步本身就可能很慢，必须算进耗时。它总是「成功」的（rollback
             // 自己吞掉删除失败），不会抢走前面那个失败阶段的标记。
@@ -311,11 +383,12 @@ pub fn record_server_tree_into(
     pre: &Preflight,
     idx: &TempIndex,
 ) -> Result<(String, BTreeSet<String>)> {
-    record_server_tree_timed(repo_root, cfg, pre, idx, &mut PhaseClock::default())
+    // 同步（S7 / D7a）不报耗时，计时器用完即弃；`scope` 只决定开发日志里怎么称呼
+    record_server_tree_timed(repo_root, cfg, pre, idx, &mut PhaseClock::new("同步录制"))
 }
 
-/// [`record_server_tree_into`] 的本体，额外按子步骤计时。只有初始化看这份耗时
-/// ——`git add` 是用户报告里最可疑的大头，必须单独拆出来。
+/// [`record_server_tree_into`] 的本体，额外按子步骤计时。只有初始化把这份耗时
+/// 交给用户——`git add` 是用户报告里最可疑的大头，必须单独拆出来。
 fn record_server_tree_timed(
     repo_root: &str,
     cfg: &SvnConfig,
@@ -432,6 +505,27 @@ fn claim_git_dir(root: &str) -> Result<()> {
     }
 }
 
+/// 只读地问一遍 git「你会收哪些文件」。初始化与重建基线共用，都排在 `git add` 之前。
+///
+/// `git add` 要把白名单里每个文件哈希压缩一遍，大工程上要跑很久，跑完才发现
+/// 被某个 `.gitignore` 挡掉了几百个文件、再整个回退，代价太大（2026-10-27
+/// 用户报告约半小时）。最终核对照留，这一道只负责早点失败。
+///
+/// 脏清单修正必须与录制用同一套算法（`classify` + `explained_paths`），
+/// 见 `dry_run_include_set` 的说明。两者都是纯内存计算，算两遍不费事。
+fn dry_run_before_add(
+    root: &str,
+    cfg: &SvnConfig,
+    pre: &Preflight,
+    clock: &mut PhaseClock,
+) -> Result<()> {
+    clock.run("纳入集合预检（git ls-files）", || {
+        let fixes = classify(&pre.dirty)?;
+        let touched = explained_paths(&fixes, &cfg.whitelist, &cfg.extensions);
+        dry_run_include_set(root, &cfg.whitelist, &cfg.extensions, &fixes, &touched)
+    })
+}
+
 /// `git init` 之后的全部步骤。抽出来是为了让**唯一的**回退点长在一个地方——
 /// 中间任何一步 `?` 早退都走同一条 `Err` 分支，不会漏掉某条路径忘了回退。
 fn build_repo(
@@ -456,18 +550,8 @@ fn build_repo(
         Ok(())
     })?;
 
-    // 规则写好之后、`git add` 之前：只读地问一遍 git「你会收哪些文件」。
-    // `git add` 要把白名单里每个文件哈希压缩一遍，大工程上要跑很久，跑完才发现
-    // 被某个 `.gitignore` 挡掉了几百个文件、再整个回退，代价太大（2026-10-27
-    // 用户报告约半小时）。最终核对照留，这一道只负责早点失败。
-    //
-    // 脏清单修正必须与录制用同一套算法（`classify` + `explained_paths`），
-    // 见 `dry_run_include_set` 的说明。两者都是纯内存计算，算两遍不费事。
-    clock.run("纳入集合预检（git ls-files）", || {
-        let fixes = classify(&pre.dirty)?;
-        let touched = explained_paths(&fixes, &cfg.whitelist, &cfg.extensions);
-        dry_run_include_set(root, &cfg.whitelist, &cfg.extensions, &fixes, &touched)
-    })?;
+    // 规则写好之后、`git add` 之前
+    dry_run_before_add(root, cfg, pre, clock)?;
 
     // R2a–R2c：录出服务器 rN 的树。首个基线从**空**索引起步。
     let (tree, explained) = record_server_tree(root, cfg, pre, clock)?;
@@ -945,6 +1029,7 @@ fn align_branch(repo_root: &str, branch: &str, report: &RebuildReport) -> Result
 ///
 /// ```text
 /// R1  校验：白名单内 svn status 干净、nodeRevs 单值 {N}
+///     纳入集合预检（只读，git add 之前；与初始化同一道）
 /// R2  临时索引录 tree，全程不碰真实 index、不碰 HEAD
 /// R3  git commit-tree TREE -p svn/base …            → NEWBASE
 /// R3b 基线体检（§6.8）                                ← 有差异就中止，指针还没动
@@ -984,9 +1069,15 @@ pub fn rebuild_baseline(repo_root: &str) -> Result<RebuildReport> {
     let pre = run_preflight(repo_root, &cfg.whitelist)?;
     let svn_url = working_copy_url(repo_root)?;
 
-    // R2a–R2c：**从空索引起步**，录出服务器 rN 的树。
     // 重建不报耗时：计时只为初始化向导服务，这里给一个用完即弃的计时器。
-    let (tree, explained) = record_server_tree(repo_root, &cfg, &pre, &mut PhaseClock::default())?;
+    let mut clock = PhaseClock::new("重建基线");
+
+    // 与初始化同一道只读预检：重建同样要跑完整的 `git add`，大工程上被 `.gitignore`
+    // 挡掉的文件要等那之后才报（第二轮 review）。
+    dry_run_before_add(repo_root, &cfg, &pre, &mut clock)?;
+
+    // R2a–R2c：**从空索引起步**，录出服务器 rN 的树。
+    let (tree, explained) = record_server_tree(repo_root, &cfg, &pre, &mut clock)?;
 
     // R3b：**在 R4 之前**。判据是 §6.8.7 的 `D \ S == ∅`——磁盘与服务器的每一处
     // 差异都必须被一条已知的本地修改解释。指针还没动，中止的代价为零。

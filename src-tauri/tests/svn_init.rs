@@ -383,6 +383,13 @@ fn init_refuses_a_whitelist_that_open_would_later_reject() {
     .expect_err("漏尾斜杠的目录条目必须在建库前就被拒");
     assert_eq!(err.code, "svn_config");
     assert!(!fx.wc().join(".git").exists(), "校验没过却建了 .git");
+    // 第二轮 review：输入校验是瞬时的，附一张耗时表只会把噪音挤进详情框，
+    // 还会把失败标在「svn info」上
+    assert!(
+        !err.message.contains("各阶段耗时"),
+        "输入校验错误不该带耗时表：{}",
+        err.message
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -801,6 +808,27 @@ fn a_failure_before_r4_leaves_the_baseline_pointer_untouched() {
         before,
         run_git(&fx.wc_str(), &["rev-parse", "refs/heads/svn/base"]).unwrap(),
         "指针被动了"
+    );
+}
+
+#[test]
+fn rebuild_catches_a_gitignore_in_the_precheck_before_running_git_add() {
+    // 第二轮 review：重建与初始化走同一条 `git add` + 最终核对，大工程上同样要等
+    // 半小时才看到 `include_set_mismatch`。预检必须也接在重建上。
+    let fx = hybrid_repo_updated_externally();
+    std::fs::write(fx.wc().join(".gitignore"), "*.cs\n").unwrap();
+
+    let err = rebuild_baseline(&fx.wc_str()).expect_err("必须拦住");
+    assert_eq!(err.code, "include_set_mismatch");
+    assert!(
+        err.message.contains("预检"),
+        "应当由 git add 之前的预检拦下，实际：{}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("建库"),
+        "重建不是建库，标题不能说错：{}",
+        err.message
     );
 }
 

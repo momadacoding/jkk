@@ -7,7 +7,7 @@
 //! 与 §6.8 的基线体检**互不替代**：体检证明「磁盘 == 服务器」，这条证明
 //! 「git 跟踪的集合 == 配置声明的集合」（spec §15 第 20 条）。
 
-use crate::engine::git_cli::{run_git_code, run_git_stdin_code};
+use crate::engine::git_cli::{run_git_code, run_git_stdin_partial};
 use crate::engine::svn_baseline::TempIndex;
 use crate::engine::svn_dirty::Fix;
 use crate::error::{GitError, Result};
@@ -366,8 +366,8 @@ pub fn dry_run_include_set(
         "include_set_mismatch",
         mismatch_report(
             repo_root,
-            "建库前预检没通过：按当前的忽略规则，git 将要收进来的文件与配置声明的不一致。\
-             还没开始录制基线就停下了。",
+            "录制基线前预检没通过：按当前的忽略规则，git 将要收进来的文件与配置声明的不一致。\
+             还没开始录制就停下了。",
             &missing,
             &unexpected,
         ),
@@ -389,7 +389,7 @@ const MAX_GROUPS: usize = 10;
 /// 要动手改的正是那几条规则，不是那几百个文件。
 ///
 /// 规则查询失败时**不阻止报告**：差异本身已经确定，规则只是帮用户定位的附加
-/// 信息。整组落进「查不到裁决规则」，用户仍然看得到是哪些文件。
+/// 信息。查不到的路径落进「查不到裁决规则」，用户仍然看得到是哪些文件。
 pub(crate) fn mismatch_report(
     repo_root: &str,
     headline: &str,
@@ -401,10 +401,7 @@ pub(crate) fn mismatch_report(
         .chain(unexpected)
         .map(String::as_str)
         .collect();
-    let verdicts = blame_rules(repo_root, &all).unwrap_or_else(|e| {
-        log::warn!("批量查询裁决规则失败，报告里不带规则：{}", e.message);
-        BTreeMap::new()
-    });
+    let verdicts = blame_rules(repo_root, &all);
 
     let mut msg = format!("{headline}\n");
     let mut blamed_gitignore = false;
@@ -558,16 +555,67 @@ impl Verdict {
 /// - `--non-matching`：没被忽略的文件也给出裁决（反选规则或空），两个方向都能指认。
 /// - `-z`：输入输出都按 NUL 分隔、不做引号转义。不带它中文路径会被转义成八进制，
 ///   回填时对不上号。输出是四段一组：`来源\0行号\0模式\0路径\0`（2026-10-27 实测）。
-fn blame_rules(repo_root: &str, files: &[&str]) -> Result<BTreeMap<String, Verdict>> {
-    if files.is_empty() {
-        return Ok(BTreeMap::new());
+///
+/// # 某个路径让 git fatal 时，跳过它接着查
+///
+/// `check-ignore` 逐个路径作答，遇到它拒绝的路径就整个退出。已知的触发是白名单里的
+/// **目录符号链接**：期望集合跟随它，于是 `Code/Link/x.cs` 出现在「实际没有」一侧，
+/// 而 git 对它报 `pathspec … is beyond a symbolic link`（第二轮 review 指出）。
+/// 原实现在这时整批作废，几百个被 `.gitignore` 挡掉的文件也一起变成「查不到」。
+///
+/// 现在拿 fatal 之前的输出（每个路径答完就刷出，实测 fatal 前的记录完整可读），
+/// 第一个没答的就是出事的路径，跳过它续查。与它**同目录及更深**的路径共享同一段
+/// 前导路径，越过符号链接时会一个接一个 fatal，所以一并跳过，免得每个都重起一次
+/// 进程。查不到的路径不进结果，报告里落进「查不到裁决规则」。
+fn blame_rules(repo_root: &str, files: &[&str]) -> BTreeMap<String, Verdict> {
+    let mut out = BTreeMap::new();
+    let mut rest: Vec<&str> = files.to_vec();
+    let mut resumes = 0;
+    while !rest.is_empty() {
+        let (answered, fatal) = match blame_batch(repo_root, &rest, &mut out) {
+            Ok(r) => r,
+            // 连进程都起不来：再试也一样
+            Err(e) => {
+                log::warn!("批量查询裁决规则失败，其余路径不带规则：{}", e.message);
+                break;
+            }
+        };
+        let Some(e) = fatal else { break };
+        let Some(&culprit) = rest.get(answered) else {
+            break;
+        };
+        log::warn!(
+            "git 拒绝查询 {culprit} 的裁决规则，跳过它续查：{}",
+            e.message.trim()
+        );
+        resumes += 1;
+        if resumes > MAX_RESUMES {
+            log::warn!("续查已达 {MAX_RESUMES} 次，其余路径不带规则");
+            break;
+        }
+        // 父目录为空（仓库根下的文件）时只跳它自己——空前缀会匹配所有路径
+        let dir = culprit.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        rest = rest[answered + 1..]
+            .iter()
+            .copied()
+            .filter(|f| dir.is_empty() || !f.starts_with(&format!("{dir}/")))
+            .collect();
     }
+    out
+}
+
+/// 一次 git 调用。返回「从头算起连续答完了几个」和 fatal（若有）。
+fn blame_batch(
+    repo_root: &str,
+    files: &[&str],
+    out: &mut BTreeMap<String, Verdict>,
+) -> Result<(usize, Option<GitError>)> {
     let mut input = Vec::new();
     for f in files {
         input.extend_from_slice(f.as_bytes());
         input.push(0);
     }
-    let (_, out) = run_git_stdin_code(
+    let (stdout, fatal) = run_git_stdin_partial(
         repo_root,
         &[
             "check-ignore",
@@ -579,18 +627,68 @@ fn blame_rules(repo_root: &str, files: &[&str]) -> Result<BTreeMap<String, Verdi
         ],
         &input,
     )?;
-    let parts: Vec<&str> = out.split('\0').collect();
-    Ok(parts
-        .chunks_exact(4)
-        .map(|c| {
-            (
-                c[3].to_string(),
-                Verdict {
-                    source: c[0].to_string(),
-                    line: c[1].to_string(),
-                    pattern: c[2].to_string(),
-                },
-            )
-        })
-        .collect())
+    let parts: Vec<&str> = stdout.split('\0').collect();
+    let mut answered = 0;
+    for c in parts.chunks_exact(4) {
+        // 答案按输入顺序一条对一条；对不上就不再往后数，第一个没对上的当成出事的那个
+        if files.get(answered) == Some(&c[3]) {
+            answered += 1;
+        } else {
+            break;
+        }
+        out.insert(
+            c[3].to_string(),
+            Verdict {
+                source: c[0].to_string(),
+                line: c[1].to_string(),
+                pattern: c[2].to_string(),
+            },
+        );
+    }
+    Ok((answered, fatal))
+}
+
+/// fatal 之后最多续查几次。每次都要重起一个 git 进程；超过这个数多半不是个别
+/// 路径的问题（仓库本身坏了），再查也是白花时间。
+const MAX_RESUMES: usize = 32;
+
+#[cfg(test)]
+mod tests {
+    use super::mismatch_report;
+    use crate::engine::git_cli::run_git;
+
+    /// 第二轮 review（2026-10-28）：裁决规则一次批量查，只要有一个路径让
+    /// `check-ignore` fatal，原实现整批落进「查不到裁决规则」。
+    ///
+    /// 真实的触发是白名单里的**目录符号链接**（`pathspec … is beyond a symbolic
+    /// link`）。本机建符号链接要管理员权限，这里换成 git 同样会 fatal 的
+    /// 「仓库外路径」，只钉「一个 fatal 不连累别的路径」这件事；符号链接本身的
+    /// 形态由 `tests/svn_exclude.rs` 里 unix 专属的用例覆盖。
+    #[test]
+    fn a_path_git_refuses_to_check_does_not_cost_the_others_their_verdicts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_str().unwrap();
+        run_git(root, &["init", "-q"]).unwrap();
+        std::fs::create_dir_all(dir.path().join("Code/Tools")).unwrap();
+        std::fs::write(dir.path().join("Code/.gitignore"), "*.exe\n").unwrap();
+
+        // fatal 的那条夹在中间：它之前、之后的路径都必须拿到裁决
+        let missing = [
+            "Code/Tools/a.exe".to_string(),
+            "../outside.exe".to_string(),
+            "Code/Tools/b.exe".to_string(),
+        ];
+        let unexpected = ["Code/Keep.cs".to_string()];
+        let m = mismatch_report(root, "h", &missing, &unexpected);
+
+        assert!(
+            m.contains("2 个被 Code/.gitignore:1:*.exe 挡掉"),
+            "fatal 前后的路径都要拿到裁决，实际：{m}"
+        );
+        assert!(m.contains("1 个查不到裁决规则"), "实际：{m}");
+        assert!(
+            m.contains("1 个没有匹配任何规则"),
+            "另一侧的裁决也不能被连累，实际：{m}"
+        );
+    }
 }

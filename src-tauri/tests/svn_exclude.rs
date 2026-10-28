@@ -751,9 +751,9 @@ fn the_mismatch_report_points_at_a_nested_git_repository() {
 #[test]
 fn a_junction_inside_the_whitelist_does_not_break_the_batch_rule_lookup() {
     // review 担心（2026-10-28）：裁决规则一次批量查，若 junction 底下的路径让
-    // `check-ignore` fatal（「越过符号链接」），整批都会落进「查不到裁决规则」。
+    // `check-ignore` fatal（「越过符号链接」），那些路径会拿不到裁决。
     // 实测（git 2.51.2.windows.1）：不会 fatal，junction 底下与普通目录同样给出
-    // 裁决。这条把这个实测钉住——哪天 git 改了行为，批量查询需要改成逐个回退。
+    // 裁决。这条把这个实测钉住；真符号链接会 fatal，见下一条。
     let dir = workdir();
     let p = dir.path();
     let outside = TempDir::new().unwrap();
@@ -772,6 +772,33 @@ fn a_junction_inside_the_whitelist_does_not_break_the_batch_rule_lookup() {
         "junction 底下与普通目录的文件都要拿到裁决规则，实际：{m}"
     );
     fs::remove_dir(p.join("Code/Mirror")).unwrap();
+}
+
+/// 第二轮 review（2026-10-28）：真的**目录符号链接**会让 `check-ignore` 对它底下的
+/// 路径报 `beyond a symbolic link` 并退出。原实现整批作废，同一份报告里被
+/// `.gitignore` 挡掉的文件也跟着变成「查不到裁决规则」。
+///
+/// 只在 unix 上跑：Windows 建符号链接要管理员权限或开发者模式，本机两者都没有
+/// （2026-10-28 实测 `New-Item -ItemType SymbolicLink` 被拒）。Windows 上「一个
+/// fatal 不连累别的路径」由 `svn_include_check` 的内联单测用另一种 fatal 钉住。
+#[cfg(unix)]
+#[test]
+fn a_directory_symlink_inside_the_whitelist_does_not_cost_other_files_their_rule() {
+    let dir = workdir();
+    let p = dir.path();
+    let outside = TempDir::new().unwrap();
+    fs::write(outside.path().join("m.cs"), "x").unwrap();
+    std::os::unix::fs::symlink(outside.path(), p.join("Code/Link")).unwrap();
+    fs::create_dir_all(p.join("Code/Tools")).unwrap();
+    // 字母序排在 `Code/Link/m.cs` 之后——原实现里正是它被连累
+    fs::write(p.join("Code/Tools/a.exe"), "x").unwrap();
+    fs::write(p.join("Code/.gitignore"), "*.exe\n").unwrap();
+
+    let m = check_wildcard(p).message;
+    assert!(
+        m.contains("1 个被 Code/.gitignore:1:*.exe 挡掉"),
+        "符号链接之后的文件也要拿到裁决规则，实际：{m}"
+    );
 }
 
 #[test]
@@ -857,8 +884,14 @@ fn the_precheck_catches_a_gitignore_without_writing_any_object() {
 }
 
 #[test]
-fn the_precheck_passes_whenever_the_final_check_passes() {
+fn the_precheck_passes_the_clean_configurations_the_final_check_passes() {
     // 预检挡住一个最终核对会放行的仓库，就是误报阻断。用同一份 fixture 两边都跑。
+    //
+    // 只覆盖**干净的纯 git 目录**下的三种白名单 / 扩展名组合（含中文文件名、
+    // 单文件条目、`*`），不是「两道核对处处等价」的证明。其余形态在别处：
+    // 脏工作副本 → `svn_init` 的 `the_precheck_does_not_block_what_the_final_check_
+    // accepts_on_a_dirty_working_copy`；junction / external / GBK 等 → `svn_init`
+    // 的成功路径用例（它们都要先过预检）；嵌套仓库 → 两道都拦，见下方用例。
     let dir = workdir();
     fs::write(dir.path().join("Code/角色.cs"), "x").unwrap();
     for (w, e) in [

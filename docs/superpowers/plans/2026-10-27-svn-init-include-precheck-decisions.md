@@ -19,10 +19,15 @@
 | 4 | 前端：错误正文保留换行可滚动；成功页显示耗时；引导语改写 | 完成 | `svnInit.ts`、`SvnInitWizard.tsx`、`styles.css` | `svnInit.test.ts` 新增 7 条先红后绿 |
 | 5 | spec §6.5 序列补预检一行 + 说明段 | 完成 | `2026-09-12-svn-git-hybrid-design.md` | — |
 | 6 | 处理 `/code-review high` 的 9 条（见下方「review 处理」） | 完成 | 同上 | 新增 1 条 `svn_init` 回归（先红后绿）、1 条 junction 实测、Rust 内联单测 1 条、vitest 1 条 |
+| 7 | 第二轮 review 第 1 条：批量查规则遇 fatal 时续查，不整批丢失 | 完成 | `svn_include_check.rs`（`blame_rules` / `blame_batch`）、`git_cli.rs`（`run_git_stdin_code` → `run_git_stdin_partial`） | 内联单测 1 条先红后绿；unix 专属符号链接用例 1 条（本机不跑） |
+| 8 | 第二轮第 2 条：预检「等价」测试改名、写清覆盖范围 | 完成 | `tests/svn_exclude.rs` | — |
+| 9 | 第二轮第 3–5 条：耗时表的失败标记、校验错误不带耗时、日志不再冒称「建库」 | 完成 | `svn_init.rs`（`PhaseClock::new` / `settle_failure`） | 内联单测 2 条；`svn_init` 断言 1 条（撤掉实现后实测变红） |
+| 10 | 第二轮第 6 条：重建基线接入预检 | 完成 | `svn_init.rs`（`dry_run_before_add`）、预检标题去掉「建库」、spec 说明段 | `svn_init` 新增 1 条（撤掉实现后实测变红）；vitest 标题样例同步 |
 
-全量验证（2026-10-28，review 修复之后重跑）：`cargo fmt --check` / `cargo clippy --all-targets`
-无告警、`cargo test` 62 个套件全绿；`pnpm build`、`pnpm test`（53 文件 / 789 条）全绿。
-**未做**真实窗口验证（见末尾）。
+全量验证（2026-10-29，第二轮 review 修复之后重跑）：`cargo fmt --check` / `cargo clippy --all-targets`
+无告警、`cargo test` 全部套件全绿；`pnpm build`、`pnpm test`（53 文件 / 789 条）全绿。
+第二轮改动**未做**真实窗口验证：只动了后端报错文本与重建流程，向导界面没变；
+第一轮的窗口验证见末尾。
 
 ## 决策条目
 
@@ -46,6 +51,7 @@
 5. **`check-ignore --stdin` 在「一个都没被忽略」时退出 1**（多收一侧的常态），
    原 `run_git_stdin` 把任何非零当失败。新增 `run_git_stdin_code`：0/1 正常，≥128 仍是错误
    ——把 fatal 当成「没结果」会让整批裁决静默变成「查不到」。
+   （第二轮改成 `run_git_stdin_partial`：fatal 仍明确交回，但连同 fatal 之前的输出，见第二轮第 1 条。）
 6. **junction 底下的路径不会让 `check-ignore` fatal。** 实测与普通目录一样给出裁决
    （`a_junction_inside_the_whitelist_does_not_break_the_batch_rule_lookup` 钉住）。
 7. **Rust `{:.1}` 对恰在中间的值按银行家舍入，JS `toFixed(1)` 四舍五入。** 实测
@@ -60,9 +66,9 @@
 - **预检函数名叫 `dry_run_include_set`，不叫 `precheck_include_set`。** 后者在
   `svn_sync_check.rs` 里已经存在，走的是真 `git add`、不套脏清单修正，给同步前用。同名不同义
   极易引错（review 指出）。
-- **预检只接进初始化，没接进「重建基线」与同步前检查。** 重建走同一条 `git add` + 最终核对；
+- **预检接进初始化与「重建基线」（后者是第二轮补的），没接进同步前检查。**
   `svn_sync_check::precheck_include_set`（更新 / 交付前都会跑）同样在空索引上做一次完整
-  `git add`，大工程上每次同步都要把白名单读一遍。用户这次报的是建库，范围先收住，列为后续项。
+  `git add`，大工程上每次同步都要把白名单读一遍。它是另一条流程，列为后续项。
 - **前端引导语改写为「怎么处理」**，不再复述「不一致」本身：原引导开头 12 个字与最终核对的
   标题重合会被去重吞掉，而与预检标题不重合会显示——两种标题下行为不一致。改写后两种都显示，
   内容只讲处理办法（`.gitignore` 挪走 / 嵌套仓库移出白名单），由测试钉住。
@@ -90,6 +96,49 @@
 | 8 `ls_others` 复制了 `add_all` 的 pathspec 处理 | 成立 | 抽出共用的 `w_pathspecs` |
 | 9 预检的临时索引多余 | 保留，见上 | — |
 
+### 第二轮 review 处理（`/code-review high`，2026-10-28）
+
+| 条 | 结论 | 处理 |
+|---|---|---|
+| 1 批量查规则遇真符号链接 fatal，整批丢失 | 成立（第一轮第 2 条只实测了 junction） | 续查，见下 |
+| 2 同步前检查仍跑真 `git add` | 成立，另一条流程 | 后续项 |
+| 3 重建基线没接预检 | 成立 | 接上，与初始化共用 `dry_run_before_add` |
+| 4 阶段之间的失败没有标记 | 成立 | `settle_failure` 兜底，见下 |
+| 5 同步路径日志写「建库阶段」 | 成立 | `PhaseClock::new(scope)`：建库 / 重建基线 / 同步录制 |
+| 6 输入校验错误也带耗时表 | 成立 | `svn info` 与 `build_config` 移出计时 |
+| 7 失败路径上的 stat 没有缓存 | 接受，后续项 | — |
+| 8 成功路径多遍历一遍目录 | 同第一轮第 6 条，接受 | — |
+| 9 测试名称说过头了 | 成立 | 改名 `the_precheck_passes_the_clean_configurations_the_final_check_passes`，注释写明其余形态在哪覆盖 |
+
+**第 1 条：计划没写的坑与取舍。**
+
+- **本机复现不了真符号链接。** `New-Item -ItemType SymbolicLink` 报「Administrator privilege
+  required」，开发者模式也没开。fatal 的机制按 reviewer 的说法与 git 源码（`check-ignore` 解析 pathspec 时带
+  `PATHSPEC_SYMLINK_LEADING_PATH`）采信，没有实测。符号链接形态的用例写成 `#[cfg(unix)]`，
+  本机不跑；Windows 上用「仓库外路径」（`../outside.exe`，实测同样 fatal）钉住
+  「一个路径 fatal 不连累别的」这件事，测试名说的就是这件事，不冒称符号链接。
+- **实测 fatal 之前的输出是完整的**：`Code/A.cs`、`../outside.cs`、`Code/B.cs` 三条输入，
+  stdout 拿到 `Code/A.cs` 的完整记录后进程以 fatal 退出，`Code/B.cs` 丢失。所以「从头连续答完了
+  几个」就能定位出事的路径，第一个没答的就是它。
+- **没选二分。** 二分不依赖输出语义，但符号链接底下的几百个文件在排序后是连续的一段，
+  二分会对这一段逐个打到叶子，进程数是它们数量的两倍。续查时把**同目录及更深**的路径
+  一并跳过：越过同一个符号链接的路径共享同一段前导路径，必然一起 fatal。父目录为空
+  （仓库根下的文件）时只跳它自己——空前缀会匹配所有路径（AGENTS.md §6.2）。
+- **续查上限 32 次。** 每次续查都重起一个进程；超过这个数多半是仓库本身坏了，其余路径不带规则。
+
+**第 4 条：为什么兜底而不是逐个包进 `run`。** 包的话成功页上会多出一串 0.0 秒的行，
+以后新加的步骤照样可能漏包。`settle_failure` 在出错时若没有任何阶段被标失败，补一行
+「上一阶段之后、未单独计时的步骤」（耗时是距上一阶段结束的空档）。`init_phases` 在跑
+回退阶段**之前**调它，否则标记会落在回退之后；`annotate` 里再调一次兜住其他出口。
+
+**第 6 条：`svn info` 不再计时。** 它和 `build_config` 都是瞬时的，一个阶段都还没计时时
+`annotate` 原样返回错误。代价是成功页少了「读取工作副本信息」一行，前端没有按阶段名取值的地方。
+
+**第 3 条：预检标题去掉「建库」。** 原来是「建库前预检没通过…」，重建时会说错。改成
+「录制基线前预检没通过…还没开始录制就停下了」。前端按错误码取引导语，正文只拿来做去重比对，
+新标题与引导语开头不重合，引导照常显示；
+vitest 里的标题样例同步改了。
+
 ### 为什么这么改是安全的
 
 - **预检是只读的。** `ls-files -o` 只遍历目录，不写对象、不碰真实索引（候选索引从空起步，
@@ -97,7 +146,7 @@
   断言 `.git/objects` 前后都是 0 个文件。
 - **预检在回退区内。** 它排在 `git init` 之后、`build_repo` 里，失败走原有的唯一回退点删掉
   刚建的 `.git`；`a_gitignore_is_caught_by_the_precheck_before_anything_is_recorded` 断言 `.git` 已删。
-- **不会误报阻断正常仓库。** `the_precheck_passes_whenever_the_final_check_passes` 用三种白名单 /
+- **不会误报阻断正常仓库。** `the_precheck_passes_the_clean_configurations_the_final_check_passes` 用三种白名单 /
   扩展名组合（含中文文件名、单文件条目、`*`）两道都跑；脏工作副本由 review 第 1 条的回归用例
   覆盖；原有 `svn_init` 全部成功路径用例（干净、脏、external、junction、中文、GBK）仍全绿。
 - **空白名单不会退化成「全部」。** `ls_others` 空列表直接返回空集（AGENTS.md §6.2），有用例钉住。
@@ -135,4 +184,7 @@ fixture 本身的一个误判，记下免得下次再踩：**SVN 默认 `global-
 
 - **半小时的真正大头还没实测。** 计时是为了下次在公司真实工程上拿到数字；在那之前
   「`git add` 是大头」仍是推测。
-- 「重建基线」与同步前检查（`svn_sync_check::precheck_include_set`）换成只读预检，视用户需要再做。
+- 同步前检查（`svn_sync_check::precheck_include_set`）换成只读预检（第二轮第 2 条），视用户需要再做。
+- 报告里 `nested_repo` 对每个缺失文件的每级祖先都 stat 一次、没有按目录缓存（第二轮第 7 条）。
+  只在失败路径上，十万级缺失时才显著。
+- 真符号链接的续查只有 unix 用例，本机没有跑过（见第二轮第 1 条）。

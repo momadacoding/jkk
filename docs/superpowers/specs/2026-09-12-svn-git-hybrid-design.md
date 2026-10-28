@@ -842,9 +842,12 @@ git checkout -b work                 ← 立刻离开基线分支
 比对（两侧套用与 R2b 录制相同的脏清单修正，否则会挡住最终核对放行的脏工作副本），
 不写任何对象；不一致就以同一个错误码 `include_set_mismatch` 失败、回退。
 它**只负责早点失败，不替代**最终核对——录进基线的只认 `git add` 之后的真索引。
+§16 的重建基线同样从空索引跑一遍完整的 `git add`，2026-10-28 起也在 R2 之前跑这道预检。
+同步前的磁盘检查（`svn_sync_check::precheck_include_set`）仍走真 `git add`，尚未换。
 
 两道核对的报告都按「裁决规则」分组（`git check-ignore --no-index -v -n -z --stdin`
-一次查完），每组给数量和几个样例；嵌套的 git 仓库单独成组。向导在成功页和错误正文
+一次查完；某个路径让 git fatal 时跳过它及同目录的路径续查，不整批作废），
+每组给数量和几个样例；嵌套的 git 仓库单独成组。向导在成功页和错误正文
 末尾都显示各阶段耗时（装机版不落 Rust 日志，耗时只能进界面）。实现日志见
 `docs/superpowers/plans/2026-10-27-svn-init-include-precheck-decisions.md`。
 
