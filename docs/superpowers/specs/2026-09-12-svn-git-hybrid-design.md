@@ -824,6 +824,7 @@ P1–P5 全部走完之后才建库（P1–P4 是硬门槛，P5 命中不阻断�
 git init -b svn/base                 ← 显式指定，不吃 init.defaultBranch 的默认值
 写入 .git/mygitclient.json（用户编辑白名单）
 生成 .git/info/exclude               ← 含末尾的 .svn/ 兜底行，见 §6.3
+纳入集合预检（ls-files -o，只读）     ← 2026-10-27 补：git add 之前先问「将会收什么」，见下方说明
 按 §16 R2a–R2c 录出服务器 rN 的树    ← 脏文件取 BASE 内容、A/? 剔除；含集合核对（§6.3.1）
 用该 TREE 录制首个基线并对齐真实索引 ← git-svn-id 的 rev 取自 P2 读到的 N；无父提交
 基线体检（§6.8.7）                    ← 判据 D \ S == ∅；不通过则整个回退，删掉刚建的 .git
@@ -832,6 +833,20 @@ git checkout -b work                 ← 立刻离开基线分支
 
 ⚠️ 「三条全过」是初版留下的说法，那时只有 P1–P3。现在是五条，**P4 与 P1–P3 一样
 是阻断级门槛**，不要照字面只跑前三条；P5 是分流不是门槛。
+
+**纳入集合预检（2026-10-27 补）。** §6.3.1 的集合核对排在 `git add -A` 之后，而
+`git add` 要把白名单里每个文件哈希压缩一遍。用户在真实 Unity 工程（扩展名 `*`）上
+等了约半小时才看到 `include_set_mismatch`（工作树里残留的 `.gitignore` 挡掉了几百个
+`.exe` / `.pyc`），随后整个回退，重试又是半小时。预检在 `git add` 之前用
+`git ls-files -o --exclude-standard`（空的候选索引）问一遍「将会收什么」，与期望集合
+比对（两侧套用与 R2b 录制相同的脏清单修正，否则会挡住最终核对放行的脏工作副本），
+不写任何对象；不一致就以同一个错误码 `include_set_mismatch` 失败、回退。
+它**只负责早点失败，不替代**最终核对——录进基线的只认 `git add` 之后的真索引。
+
+两道核对的报告都按「裁决规则」分组（`git check-ignore --no-index -v -n -z --stdin`
+一次查完），每组给数量和几个样例；嵌套的 git 仓库单独成组。向导在成功页和错误正文
+末尾都显示各阶段耗时（装机版不落 Rust 日志，耗时只能进界面）。实现日志见
+`docs/superpowers/plans/2026-10-27-svn-init-include-precheck-decisions.md`。
 
 #### 6.5.1 为什么 P1–P3 不能省
 

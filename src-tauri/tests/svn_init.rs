@@ -204,6 +204,103 @@ fn a_failure_after_git_init_rolls_the_whole_thing_back() {
 }
 
 #[test]
+fn a_gitignore_is_caught_by_the_precheck_before_anything_is_recorded() {
+    // 2026-10-27：真实 Unity 工程上这一类不一致要等 `git add` 跑完（约半小时）才报。
+    // 预检在 `git add` 之前就要拦住它；看得出是哪一道拦的，用户才知道没白等。
+    let fx = svn_repo();
+    std::fs::write(fx.wc().join(".gitignore"), "*.cs\n").unwrap();
+
+    let err = init_hybrid(&req(&fx)).expect_err("必须拦住");
+    assert_eq!(err.code, "include_set_mismatch");
+    assert!(err.message.contains("预检"), "实际：{}", err.message);
+    assert!(
+        err.message.contains("被 .gitignore:1:*.cs 挡掉"),
+        "实际：{}",
+        err.message
+    );
+    assert!(!fx.wc().join(".git").exists(), "刚建的 .git 没删干净");
+}
+
+#[test]
+fn the_precheck_does_not_block_what_the_final_check_accepts_on_a_dirty_working_copy() {
+    // review 指出（2026-10-28）：预检若只按磁盘口径比，会挡住最终核对放行的仓库。
+    // 两种形态都是「被 .gitignore 挡住的 svn 脏文件」：
+    //   - `?` 的 New.cs：服务器上没有，最终核对按 Drop 把它从期望集合里剔掉；
+    //   - `M` 的 A.cs：服务器上有，录制时 replace_blob 强行把它放进候选索引。
+    // 两者在最终核对里都对得上，预检必须同样放行。
+    let fx = svn_repo();
+    let wc = fx.wc();
+    std::fs::write(wc.join("Code/New.cs"), "class N {}").unwrap();
+    std::fs::write(wc.join("Code/A.cs"), "a changed\n").unwrap();
+    std::fs::write(wc.join(".gitignore"), "New.cs\nA.cs\n").unwrap();
+
+    let report = init_hybrid(&req(&fx)).unwrap_or_else(|e| panic!("误报阻断：{}", e.message));
+    let tree = run_git(
+        &fx.wc_str(),
+        &["ls-tree", "-r", "--name-only", "refs/heads/svn/base"],
+    )
+    .unwrap();
+    assert!(
+        tree.contains("Code/A.cs"),
+        "服务器上有的必须在基线里：{tree}"
+    );
+    assert!(
+        !tree.contains("Code/New.cs"),
+        "服务器上没有的不该进基线：{tree}"
+    );
+    assert!(!report.timings.is_empty());
+}
+
+#[test]
+fn a_failed_init_reports_how_long_each_phase_took() {
+    // 用户在公司装机版上复现，而 Rust 日志插件只在 debug 构建启用——
+    // 耗时只有放进错误正文，用户才看得到。
+    let fx = svn_repo();
+    std::fs::write(fx.wc().join(".gitignore"), "*.cs\n").unwrap();
+
+    let msg = init_hybrid(&req(&fx)).expect_err("必须拦住").message;
+    let tail = msg
+        .split("各阶段耗时")
+        .nth(1)
+        .unwrap_or_else(|| panic!("错误正文里没有耗时：{msg}"));
+    assert!(tail.contains("前置校验"), "实际：{tail}");
+    assert!(
+        tail.contains("纳入集合预检") && tail.contains("← 在这一步失败"),
+        "要标出停在哪一步：{tail}"
+    );
+    assert!(
+        !tail.contains("git add"),
+        "预检失败时根本不该走到 git add：{tail}"
+    );
+    // 回退要删掉一个可能装着几 GB 对象的 .git，它的耗时也得算进去（review 指出）
+    assert!(tail.contains("回退"), "回退的耗时没列出来：{tail}");
+    assert_eq!(
+        tail.matches("← 在这一步失败").count(),
+        1,
+        "只能有一个阶段被标成失败，回退本身成功不该被标：{tail}"
+    );
+}
+
+#[test]
+fn a_successful_init_reports_how_long_each_phase_took() {
+    let fx = svn_repo();
+    let report = init_hybrid(&req(&fx)).unwrap();
+    let phases: Vec<&str> = report.timings.iter().map(|t| t.phase.as_str()).collect();
+    for want in ["前置校验", "纳入集合预检", "git add", "基线体检"] {
+        assert!(
+            phases.iter().any(|p| p.contains(want)),
+            "缺少「{want}」阶段，实际：{phases:?}"
+        );
+    }
+    let pre = phases
+        .iter()
+        .position(|p| p.contains("纳入集合预检"))
+        .unwrap();
+    let add = phases.iter().position(|p| p.contains("git add")).unwrap();
+    assert!(pre < add, "预检必须排在 git add 之前：{phases:?}");
+}
+
+#[test]
 fn a_preflight_failure_never_creates_a_git_at_all() {
     // P1–P4 全部跑在创建 .git **之前**，所以这一侧根本不需要回退。
     //

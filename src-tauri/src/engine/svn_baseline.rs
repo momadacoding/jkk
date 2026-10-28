@@ -24,6 +24,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// （`cannot lock ref …: reference already exists`）且 ref 不动。
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 
+/// 白名单条目 → 传给 git 的 pathspec。
+///
+/// `add_all` 与 `ls_others` 必须用**同一份**：预检靠 `ls_others` 预言 `add_all`
+/// 会收什么，两边的 pathspec 一旦写分叉（比如一边去了尾斜杠、一边加了 `:(literal)`），
+/// 预检就会给出假通过或假阻断，而且没有任何测试会变红。
+fn w_pathspecs(w_paths: &[String]) -> Vec<String> {
+    w_paths
+        .iter()
+        .map(|w| w.replace('\\', "/"))
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
 /// 同一进程内的序号，保证同一纳秒里建的两个临时索引也不同名。
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -94,11 +107,7 @@ impl TempIndex {
     /// 而那玩意被 git 跟踪之后一次 checkout 就能毁掉一个正在用的工作副本
     /// （spec §6.3）。`AGENTS.md` §6.2 记过本仓库已经因空 pathspec 误伤过一次。
     pub fn add_all(&self, repo_root: &str, w_paths: &[String]) -> Result<()> {
-        let paths: Vec<String> = w_paths
-            .iter()
-            .map(|w| w.replace('\\', "/"))
-            .filter(|w| !w.is_empty())
-            .collect();
+        let paths = w_pathspecs(w_paths);
         if paths.is_empty() {
             return Ok(());
         }
@@ -122,6 +131,31 @@ impl TempIndex {
             .split('\0')
             .filter(|s| !s.is_empty())
             .map(str::to_string)
+            .collect())
+    }
+
+    /// 在候选索引的视角下，`<W-path>` 里「未跟踪且没被忽略」的文件——即此刻
+    /// `add_all` **将会**收进来的东西，但不写任何对象。
+    ///
+    /// 只用于 `git add` 之前的预检（[`crate::engine::svn_include_check::dry_run_include_set`]），
+    /// 不替代最终核对：最终核对读的是 `add_all` 之后的真索引。
+    ///
+    /// 嵌套的 git 仓库在输出里是一条带尾斜杠的目录（`Code/Plugin/`），这里去掉尾斜杠，
+    /// 与 `git add` 之后索引里那条子模块指针（`Code/Plugin`）同形。
+    ///
+    /// 空列表返回空集：`ls-files -o` 不带 pathspec 会列出整个仓库。
+    pub fn ls_others(&self, repo_root: &str, w_paths: &[String]) -> Result<BTreeSet<String>> {
+        let paths = w_pathspecs(w_paths);
+        if paths.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let mut args: Vec<&str> = vec!["ls-files", "-o", "--exclude-standard", "-z", "--"];
+        args.extend(paths.iter().map(String::as_str));
+        let out = self.git(repo_root, &args)?;
+        Ok(out
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.trim_end_matches('/').to_string())
             .collect())
     }
 

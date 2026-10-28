@@ -22,7 +22,7 @@ use crate::engine::svn_dirty::{classify, explained_paths, read_dirty, Fix};
 use crate::engine::svn_exclude::{generate_exclude, write_exclude};
 use crate::engine::svn_externals::{detect_pinned, PinnedExternal};
 use crate::engine::svn_health::{check_baseline, ExplainedOrigin, Health};
-use crate::engine::svn_include_check::{normalize_roots, verify_include_set};
+use crate::engine::svn_include_check::{dry_run_include_set, normalize_roots, verify_include_set};
 use crate::engine::svn_preflight::{check_targets, read_node_rev, run_preflight, Preflight};
 use crate::engine::svn_pristine::{cat_base, BaseContent};
 use crate::engine::svn_xml::parse_info;
@@ -53,6 +53,113 @@ pub struct InitReport {
     /// P5 命中的被钉死 external。非空即进入 pinned 模式（spec §6.5.3），
     /// 同样不阻断。
     pub pinned: Vec<PinnedExternal>,
+    /// 各阶段耗时，按执行顺序。失败时同样的内容附在错误正文末尾。
+    pub timings: Vec<PhaseTiming>,
+}
+
+/// 一个阶段花了多久。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhaseTiming {
+    pub phase: String,
+    pub millis: u64,
+}
+
+/// 建库各阶段的计时器。
+///
+/// # 为什么耗时要进 UI，而不只是写日志
+///
+/// Rust 日志插件只在 debug 构建启用（`lib.rs`），装机版里 `log::info!` 不落地。
+/// 2026-10-27 用户在公司装机版上反馈「确认并建库」要半小时，却没法知道花在哪一步。
+/// 所以成功时进 [`InitReport::timings`]，失败时由 [`PhaseClock::annotate`] 附在
+/// 错误正文末尾；`log::info!` 只是开发时顺带看的。
+#[derive(Default)]
+struct PhaseClock {
+    phases: Vec<PhaseTiming>,
+    /// 最后一个失败的阶段在 `phases` 里的下标。
+    failed: Option<usize>,
+}
+
+impl PhaseClock {
+    /// 计时跑一段。**失败也记**：最该看耗时的恰恰是「跑了很久然后失败」的那一步。
+    fn run<T>(&mut self, phase: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let started = std::time::Instant::now();
+        let out = f();
+        let millis = started.elapsed().as_millis() as u64;
+        log::info!("建库阶段「{phase}」耗时 {millis} ms");
+        if out.is_err() {
+            self.failed = Some(self.phases.len());
+        }
+        self.phases.push(PhaseTiming {
+            phase: phase.to_string(),
+            millis,
+        });
+        out
+    }
+
+    /// 把耗时附在错误正文末尾。一个阶段都没跑过时原样返回。
+    fn annotate(&self, mut e: GitError) -> GitError {
+        if self.phases.is_empty() {
+            return e;
+        }
+        let total: u64 = self.phases.iter().map(|p| p.millis).sum();
+        e.message.push_str(&format!(
+            "\n\n各阶段耗时（共 {}）：\n",
+            human_duration(total)
+        ));
+        for (i, p) in self.phases.iter().enumerate() {
+            let mark = if self.failed == Some(i) {
+                "   ← 在这一步失败"
+            } else {
+                ""
+            };
+            e.message.push_str(&format!(
+                "  {}  {}{mark}\n",
+                p.phase,
+                human_duration(p.millis)
+            ));
+        }
+        e
+    }
+}
+
+/// `1234` → `1.2 秒`，`95000` → `1 分 35 秒`。与前端 `formatDuration` 逐字同一口径。
+///
+/// 只用整数运算、四舍五入：`{:.1}` 对 `1.25` 按银行家舍入给 `1.2`，而前端
+/// `toFixed(1)` 给 `1.3`，两处会对不上。档位按取整之后的值切，否则 59.95 秒会
+/// 显示成「60.0 秒」。
+fn human_duration(millis: u64) -> String {
+    let tenths = (millis + 50) / 100;
+    if tenths < 600 {
+        format!("{}.{} 秒", tenths / 10, tenths % 10)
+    } else {
+        let secs = (millis + 500) / 1000;
+        format!("{} 分 {} 秒", secs / 60, secs % 60)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::human_duration;
+
+    /// 与 `tests/vitest/svnInit.test.ts` 的「耗时的显示」逐条对应——两侧必须给出同样的字。
+    #[test]
+    fn human_duration_matches_the_frontend_word_for_word() {
+        for (ms, want) in [
+            (0, "0.0 秒"),
+            (1234, "1.2 秒"),
+            (1249, "1.2 秒"),
+            (1250, "1.3 秒"),
+            (59_949, "59.9 秒"),
+            (59_950, "1 分 0 秒"),
+            (60_000, "1 分 0 秒"),
+            (89_500, "1 分 30 秒"),
+            (95_000, "1 分 35 秒"),
+            (31 * 60_000 + 12_400, "31 分 12 秒"),
+        ] {
+            assert_eq!(human_duration(ms), want, "millis = {ms}");
+        }
+    }
 }
 
 /// 走完整个初始化向导。任何一步失败都会把本次创建的 `.git` 删干净。
@@ -64,6 +171,7 @@ pub struct InitReport {
 /// git init -b svn/base       ← 显式指定，不吃 init.defaultBranch 的默认值
 /// 写入 .git/mygitclient.json
 /// 生成 .git/info/exclude
+/// 纳入集合预检               ← git add 之前只读地问「将会收什么」，不一致即失败
 /// 纳入集合核对（§6.3.1）      ← 临时索引，期望集合 vs ls-files，得到 TREE
 /// 用该 TREE 录首个基线        ← rev 取自 P2 的 N；无父提交
 /// git read-tree TREE         ← 对齐真实索引，**不带 -u**、不改磁盘
@@ -101,28 +209,56 @@ pub fn init_hybrid(req: &InitRequest) -> Result<InitReport> {
         }
     }
 
+    let mut clock = PhaseClock::default();
+    match init_phases(req, root, &mut clock) {
+        Ok(mut report) => {
+            report.timings = clock.phases;
+            Ok(report)
+        }
+        Err(e) => Err(clock.annotate(e)),
+    }
+}
+
+/// [`init_hybrid`] 判完目录类型之后的全部步骤。抽出来是为了让耗时在**任何**
+/// `?` 早退时都能附到错误上，不必在每个返回点各补一次。
+fn init_phases(req: &InitRequest, root: &str, clock: &mut PhaseClock) -> Result<InitReport> {
     // 工作副本根的 URL 在一次运行里不会变，取一次传下去
     // （配置要写它，体检要拿它当基准）。
-    let svn_url = working_copy_url(root)?;
-    let cfg = build_config(req, &svn_url)?;
+    let (svn_url, cfg) = clock.run("读取工作副本信息（svn info）", || {
+        let svn_url = working_copy_url(root)?;
+        let cfg = build_config(req, &svn_url)?;
+        Ok((svn_url, cfg))
+    })?;
 
     // ---- 前置校验：全部在创建 .git **之前**，失败时无需回退 ----
-    let pre = run_preflight(root, &cfg.whitelist)?; // P1–P4
-    let pinned = detect_pinned(root, &cfg.whitelist)?; // P5，命中不阻断
+    let pre = clock.run("前置校验 P1–P4（svn status）", || {
+        run_preflight(root, &cfg.whitelist)
+    })?;
+    // P5，命中不阻断
+    let pinned = clock.run("检测钉死的 external（svn propget -R）", || {
+        detect_pinned(root, &cfg.whitelist)
+    })?;
 
     // ⚠️ **进入回退区之前，原子地「创建并占有」`.git`。**
-    claim_git_dir(root)?;
+    clock.run("占有 .git", || claim_git_dir(root))?;
 
     // ---- 从这里开始，失败必须删掉本次创建的 .git ----
-    match build_repo(root, &cfg, &pre, &svn_url) {
+    match build_repo(root, &cfg, &pre, &svn_url, clock) {
         Ok((baseline, health)) => Ok(InitReport {
             node_rev: pre.node_rev,
             baseline,
             health,
             pinned,
+            timings: Vec::new(),
         }),
         Err(e) => {
-            rollback(root);
+            // 回退要删掉的 .git 里可能已经有 `git add` 写进去的几 GB 对象，
+            // 这一步本身就可能很慢，必须算进耗时。它总是「成功」的（rollback
+            // 自己吞掉删除失败），不会抢走前面那个失败阶段的标记。
+            let _ = clock.run("回退（删除刚建的 .git）", || {
+                rollback(root);
+                Ok(())
+            });
             Err(e)
         }
     }
@@ -133,9 +269,10 @@ fn record_server_tree(
     repo_root: &str,
     cfg: &SvnConfig,
     pre: &Preflight,
+    clock: &mut PhaseClock,
 ) -> Result<(String, BTreeSet<String>)> {
     let idx = TempIndex::empty(repo_root)?;
-    record_server_tree_into(repo_root, cfg, pre, &idx)
+    record_server_tree_timed(repo_root, cfg, pre, &idx, clock)
 }
 
 /// 录出「**服务器 rN 的树**」（spec §16 R2a–R2c）。返回 `(TREE, S)`。
@@ -174,14 +311,49 @@ pub fn record_server_tree_into(
     pre: &Preflight,
     idx: &TempIndex,
 ) -> Result<(String, BTreeSet<String>)> {
+    record_server_tree_timed(repo_root, cfg, pre, idx, &mut PhaseClock::default())
+}
+
+/// [`record_server_tree_into`] 的本体，额外按子步骤计时。只有初始化看这份耗时
+/// ——`git add` 是用户报告里最可疑的大头，必须单独拆出来。
+fn record_server_tree_timed(
+    repo_root: &str,
+    cfg: &SvnConfig,
+    pre: &Preflight,
+    idx: &TempIndex,
+    clock: &mut PhaseClock,
+) -> Result<(String, BTreeSet<String>)> {
     let fixes = classify(&pre.dirty)?;
     // `S` 先算出来，再拿它驱动改写——**同一个集合**既决定动哪些路径，也交给体检。
     // 分两份算的话，两份迟早会不一致，而「体检那份更大」这个方向会悄悄削弱判据。
     let touched = explained_paths(&fixes, &cfg.whitelist, &cfg.extensions);
 
-    idx.add_all(repo_root, &cfg.whitelist)?;
+    clock.run("录入磁盘内容（git add）", || {
+        idx.add_all(repo_root, &cfg.whitelist)
+    })?;
 
-    for (path, fix) in &fixes {
+    clock.run("把本地改动换回服务器内容（svn cat）", || {
+        rewrite_to_server(repo_root, pre, idx, &fixes, &touched)
+    })?;
+
+    // R2c：核对与录制**共用同一份候选索引**（spec §6.3.1），核对完之后在同一个
+    // `idx` 上 `write_tree`——不得核对一次后又重新 add 另录一棵树。
+    clock.run("纳入集合核对（git ls-files）", || {
+        verify_include_set(repo_root, idx, &cfg.whitelist, &cfg.extensions, &fixes)
+    })?;
+    let tree = clock.run("写树（git write-tree）", || idx.write_tree(repo_root))?;
+    Ok((tree, touched))
+}
+
+/// R2b 的逐条改写：脏条目换成服务器 rN 的内容，或从候选索引里剔除。
+fn rewrite_to_server(
+    repo_root: &str,
+    pre: &Preflight,
+    idx: &TempIndex,
+    fixes: &std::collections::BTreeMap<String, Fix>,
+    touched: &BTreeSet<String>,
+) -> Result<()> {
+    for (path, fix) in fixes {
         if !touched.contains(path) {
             // 不归 git 管，树里本来就没有它。见上面「`S` 必须恰好」。
             continue;
@@ -208,12 +380,7 @@ pub fn record_server_tree_into(
             Fix::Drop => idx.remove_path(repo_root, path)?,
         }
     }
-
-    // R2c：核对与录制**共用同一份候选索引**（spec §6.3.1），核对完之后在同一个
-    // `idx` 上 `write_tree`——不得核对一次后又重新 add 另录一棵树。
-    verify_include_set(repo_root, idx, &cfg.whitelist, &cfg.extensions, &fixes)?;
-    let tree = idx.write_tree(repo_root)?;
-    Ok((tree, touched))
+    Ok(())
 }
 
 /// 原子地创建 `.git` 目录，作为「这次初始化拥有它」的凭据。
@@ -272,21 +439,38 @@ fn build_repo(
     cfg: &SvnConfig,
     pre: &Preflight,
     svn_url: &str,
+    clock: &mut PhaseClock,
 ) -> Result<(String, Health)> {
-    // `-b svn/base` 必须显式给：不给的话吃 `init.defaultBranch`，用户配成什么
-    // 都有可能，而后面每一处都按 `svn/base` 这个名字找基线。
-    run_git(root, &["init", "-b", BASELINE_BRANCH])?;
-    write_config(root, cfg)?;
-    write_exclude(root, &generate_exclude(&cfg.whitelist, &cfg.extensions))?;
-    // **必须在 `record_server_tree` 之前。** 这条规则决定 `git add` 与
-    // `hash-object --path` 读磁盘时跑不跑行尾过滤器，也就决定了第一个基线里
-    // blob 长什么样。放到录制之后等于建库当场就造出一个需要迁移的旧形状基线
-    // ——而那种基线的故障是潜伏的：stat cache 会让 `git status` 一开始假报
-    // 干净，等某个文件的 mtime 被碰一下才单独冒出来（spec §7.3.0）。
-    write_attributes(root)?;
+    clock.run("建仓库、写规则（git init）", || {
+        // `-b svn/base` 必须显式给：不给的话吃 `init.defaultBranch`，用户配成什么
+        // 都有可能，而后面每一处都按 `svn/base` 这个名字找基线。
+        run_git(root, &["init", "-b", BASELINE_BRANCH])?;
+        write_config(root, cfg)?;
+        write_exclude(root, &generate_exclude(&cfg.whitelist, &cfg.extensions))?;
+        // **必须在 `record_server_tree` 之前。** 这条规则决定 `git add` 与
+        // `hash-object --path` 读磁盘时跑不跑行尾过滤器，也就决定了第一个基线里
+        // blob 长什么样。放到录制之后等于建库当场就造出一个需要迁移的旧形状基线
+        // ——而那种基线的故障是潜伏的：stat cache 会让 `git status` 一开始假报
+        // 干净，等某个文件的 mtime 被碰一下才单独冒出来（spec §7.3.0）。
+        write_attributes(root)?;
+        Ok(())
+    })?;
+
+    // 规则写好之后、`git add` 之前：只读地问一遍 git「你会收哪些文件」。
+    // `git add` 要把白名单里每个文件哈希压缩一遍，大工程上要跑很久，跑完才发现
+    // 被某个 `.gitignore` 挡掉了几百个文件、再整个回退，代价太大（2026-10-27
+    // 用户报告约半小时）。最终核对照留，这一道只负责早点失败。
+    //
+    // 脏清单修正必须与录制用同一套算法（`classify` + `explained_paths`），
+    // 见 `dry_run_include_set` 的说明。两者都是纯内存计算，算两遍不费事。
+    clock.run("纳入集合预检（git ls-files）", || {
+        let fixes = classify(&pre.dirty)?;
+        let touched = explained_paths(&fixes, &cfg.whitelist, &cfg.extensions);
+        dry_run_include_set(root, &cfg.whitelist, &cfg.extensions, &fixes, &touched)
+    })?;
 
     // R2a–R2c：录出服务器 rN 的树。首个基线从**空**索引起步。
-    let (tree, explained) = record_server_tree(root, cfg, pre)?;
+    let (tree, explained) = record_server_tree(root, cfg, pre, clock)?;
 
     let trailer = Trailer {
         // Repository Root，不是工作副本 URL（spec §6.4.1）
@@ -296,7 +480,9 @@ fn build_repo(
     };
     // 首个基线**无父提交**；`expected_old = None` 表示「这个 ref 现在不该存在」，
     // 刚 `git init` 出来的仓库正是如此。
-    let baseline = publish_baseline(root, &tree, None, &trailer, None)?;
+    let baseline = clock.run("发布基线（git commit-tree）", || {
+        publish_baseline(root, &tree, None, &trailer, None)
+    })?;
 
     // 对齐真实索引（spec §6.3.1）。**不带 `-u`**：绝不能用基线内容去覆盖磁盘。
     //
@@ -308,40 +494,49 @@ fn build_repo(
     // 内容，两者故意不同。对齐索引之后 `git status` 显示的恰好就是用户原有的那些
     // 本地 SVN 修改（`M` → 已修改、`?` → 未跟踪、`D` → 已删除），第一眼就是对的。
     // 带 `-u` 会把这些改动**抹掉**——那是本期最不能犯的错。
-    run_git(root, &["read-tree", &tree])?;
+    clock.run("对齐索引（git read-tree）", || {
+        run_git(root, &["read-tree", &tree])
+    })?;
 
-    let health = check_baseline(
-        root,
-        svn_url,
-        pre.node_rev,
-        &cfg.whitelist,
-        &cfg.extensions,
-        &explained,
-        // 刚刚由 R2b 从 `svn cat -r BASE` 写进去的，而 P2 保证 `BASE == node_rev`
-        // ——这批路径由构造保证正确，不必报成「未覆盖」。
-        ExplainedOrigin::JustRecorded,
-    )?;
-    if let Health::Lying { files } = &health {
-        // spec §6.8.5：此刻还没建工作分支，整个回退代价最小。
-        return Err(GitError::new(
-            "svn_baseline_lying",
-            format!(
-                "基线体检没通过：磁盘内容与服务器上的 r{} 不一致，共 {} 处。\
-                 继续下去会得到一个从一开始就在撒谎的基线，所以整个回退了。\n{}",
-                pre.node_rev,
-                files.len(),
-                files
-                    .iter()
-                    .take(20)
-                    .map(|f| format!("  - {f}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            ),
-        ));
-    }
+    // Lying 的判定放在阶段**里面**：它是这一阶段的失败，耗时表要把「← 在这一步
+    // 失败」标在体检上。放在外面的话，体检阶段算成功，表里一个失败标记都没有。
+    let health = clock.run("基线体检（svn diff）", || {
+        let health = check_baseline(
+            root,
+            svn_url,
+            pre.node_rev,
+            &cfg.whitelist,
+            &cfg.extensions,
+            &explained,
+            // 刚刚由 R2b 从 `svn cat -r BASE` 写进去的，而 P2 保证 `BASE == node_rev`
+            // ——这批路径由构造保证正确，不必报成「未覆盖」。
+            ExplainedOrigin::JustRecorded,
+        )?;
+        if let Health::Lying { files } = &health {
+            // spec §6.8.5：此刻还没建工作分支，整个回退代价最小。
+            return Err(GitError::new(
+                "svn_baseline_lying",
+                format!(
+                    "基线体检没通过：磁盘内容与服务器上的 r{} 不一致，共 {} 处。\
+                     继续下去会得到一个从一开始就在撒谎的基线，所以整个回退了。\n{}",
+                    pre.node_rev,
+                    files.len(),
+                    files
+                        .iter()
+                        .take(20)
+                        .map(|f| format!("  - {f}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ),
+            ));
+        }
+        Ok(health)
+    })?;
 
     // 立刻离开基线分支（spec §6.5 最后一步）。
-    run_git(root, &["checkout", "-b", WORK_BRANCH])?;
+    clock.run("切到工作分支（git checkout）", || {
+        run_git(root, &["checkout", "-b", WORK_BRANCH])
+    })?;
     Ok((baseline, health))
 }
 
@@ -790,7 +985,8 @@ pub fn rebuild_baseline(repo_root: &str) -> Result<RebuildReport> {
     let svn_url = working_copy_url(repo_root)?;
 
     // R2a–R2c：**从空索引起步**，录出服务器 rN 的树。
-    let (tree, explained) = record_server_tree(repo_root, &cfg, &pre)?;
+    // 重建不报耗时：计时只为初始化向导服务，这里给一个用完即弃的计时器。
+    let (tree, explained) = record_server_tree(repo_root, &cfg, &pre, &mut PhaseClock::default())?;
 
     // R3b：**在 R4 之前**。判据是 §6.8.7 的 `D \ S == ∅`——磁盘与服务器的每一处
     // 差异都必须被一条已知的本地修改解释。指针还没动，中止的代价为零。

@@ -49,12 +49,20 @@ export type Health =
   | { status: 'lying'; files: string[] }
   | { status: 'notChecked'; reason: string }
 
+/** `engine::svn_init::PhaseTiming` */
+export interface PhaseTiming {
+  phase: string
+  millis: number
+}
+
 /** `engine::svn_init::InitReport` */
 export interface InitReport {
   nodeRev: number
   baseline: string
   health: Health
   pinned: PinnedExternal[]
+  /** 各阶段耗时，按执行顺序。失败时后端把同样的内容附在错误正文末尾。 */
+  timings: PhaseTiming[]
 }
 
 /** `engine::svn_init::RebuildReport` */
@@ -249,6 +257,56 @@ export function describePinned(pinned: PinnedExternal[]): Notice | null {
 }
 
 /**
+ * `1234` → `1.2 秒`，`95000` → `1 分 35 秒`。
+ *
+ * 与 Rust 侧 `svn_init::human_duration` 同一口径：失败时耗时由后端拼进错误正文，
+ * 成功时由这里格式化，两处写法不一致的话，用户拿两次结果对比会对不上号。
+ *
+ * 只用整数运算、四舍五入：`toFixed(1)` 与 Rust 的 `{:.1}` 对 `1.25` 这种恰好
+ * 落在中间的值取整方向不同（一个给 1.3、一个给 1.2）。档位按**取整之后**的值切，
+ * 否则 59.95 秒会显示成「60.0 秒」而不是「1 分 0 秒」。
+ */
+export function formatDuration(millis: number): string {
+  const tenths = Math.floor((millis + 50) / 100)
+  if (tenths < 600) return `${Math.floor(tenths / 10)}.${tenths % 10} 秒`
+  const secs = Math.floor((millis + 500) / 1000)
+  return `${Math.floor(secs / 60)} 分 ${secs % 60} 秒`
+}
+
+/**
+ * 建库成功页的耗时说明。没有耗时时返回 `null`。
+ *
+ * 2026-10-27 用户在公司装机版上反馈「确认并建库」要半小时，但没法知道花在哪一步
+ * ——装机版不落 Rust 日志，所以耗时只能放在界面上。
+ */
+export function describeTimings(timings: PhaseTiming[] | undefined): Notice | null {
+  if (!timings || timings.length === 0) return null
+  const total = timings.reduce((sum, t) => sum + t.millis, 0)
+  return {
+    tone: 'ok',
+    title: `各阶段耗时（共 ${formatDuration(total)}）`,
+    detail: timings.map((t) => `${t.phase}  ${formatDuration(t.millis)}`).join('\n'),
+    blocking: false,
+  }
+}
+
+/**
+ * 把错误正文拆成「一行标题 + 详情」。
+ *
+ * 后端的多行错误（纳入集合不一致的分组报告、附在末尾的耗时）原来整段放在
+ * `<strong>` 里，换行全被折叠，几十行挤成一大段，用户看不出每个文件后面跟的
+ * 裁决规则（2026-10-27 用户报告）。详情交给保留换行的 `<pre>` 渲染。
+ */
+export function splitErrorMessage(message: string): { headline: string; detail: string } {
+  const i = message.indexOf('\n')
+  if (i < 0) return { headline: message, detail: '' }
+  return {
+    headline: message.slice(0, i),
+    detail: message.slice(i + 1).replace(/^\n+/, '').replace(/\n+$/, ''),
+  }
+}
+
+/**
  * 错误码 → 给用户的下一步引导。
  *
  * 没有对应条目时返回**空串**而不是 `undefined`：组件会直接渲染它，
@@ -297,8 +355,10 @@ export function wizardErrorHint(code: string, message = ''): string {
       'svn status 说某个文件在服务器上有，取它的内容时 svn 又说它还没提交过。' +
       '两个判断对不上，所以停下来了——多半是录制过程中工作副本被外部改动了，请重试一次。',
     include_set_mismatch:
-      'git 实际跟踪的文件集合与配置声明的不一致。错误详情里指出了是哪条规则做的决定' +
-      '——最常见的原因是工作树里有一个 .gitignore 盖掉了本应用生成的规则。',
+      '上面的清单按「是哪条规则做的决定」分组，每组列几个样例；查不到规则的单独成组。' +
+      '被某个 .gitignore 挡掉的：把那个 .gitignore 挪走或删掉对应的行——' +
+      '最常见的来源是以前在这个目录里用过 git、只删了 .git 没删 .gitignore。' +
+      '位于嵌套 git 仓库里的：把那个目录移出白名单，或者确认后删掉它里面的 .git。',
     svn_baseline_no_trailer: '基线分支上没有本应用写的记账信息，它不是本应用录出来的基线。请重建基线。',
   }
   const hint = table[code]

@@ -7,7 +7,7 @@
 //! 与 §6.8 的基线体检**互不替代**：体检证明「磁盘 == 服务器」，这条证明
 //! 「git 跟踪的集合 == 配置声明的集合」（spec §15 第 20 条）。
 
-use crate::engine::git_cli::run_git_code;
+use crate::engine::git_cli::{run_git_code, run_git_stdin_code};
 use crate::engine::svn_baseline::TempIndex;
 use crate::engine::svn_dirty::Fix;
 use crate::error::{GitError, Result};
@@ -293,70 +293,304 @@ pub fn verify_include_set(
     if expected == actual {
         return Ok(());
     }
-    let missing: Vec<&String> = expected.difference(&actual).collect();
-    let unexpected: Vec<&String> = actual.difference(&expected).collect();
-
-    let mut msg = String::from("git 实际跟踪的文件集合与配置声明的不一致。\n");
-    if !missing.is_empty() {
-        msg.push_str("\n应当被跟踪、实际没有：\n");
-        for f in missing.iter().take(20) {
-            // 指认是哪条规则做的决定。git 会直接给出「文件:行号:模式」，
-            // 比我们自己猜准得多。
-            let who = blame_rule(repo_root, f).unwrap_or_else(|_| "（查不到裁决规则）".into());
-            msg.push_str(&format!("  {f}   ← {who}\n"));
-        }
-        if missing.len() > 20 {
-            msg.push_str(&format!("  …还有 {} 条\n", missing.len() - 20));
-        }
-    }
-    if !unexpected.is_empty() {
-        msg.push_str("\n不该被跟踪、实际跟踪了：\n");
-        for f in unexpected.iter().take(20) {
-            // 这一侧同样要指认规则——用户想知道的正是「凭什么它进来了」。
-            // 这些文件必然已在索引里，所以 `blame_rule` 的 `--no-index` 是前提。
-            let who = blame_rule(repo_root, f).unwrap_or_else(|_| "（查不到裁决规则）".into());
-            msg.push_str(&format!("  {f}   ← {who}\n"));
-        }
-        if unexpected.len() > 20 {
-            msg.push_str(&format!("  …还有 {} 条\n", unexpected.len() - 20));
-        }
-    }
-    Err(GitError::new("include_set_mismatch", msg))
+    let missing: Vec<String> = expected.difference(&actual).cloned().collect();
+    let unexpected: Vec<String> = actual.difference(&expected).cloned().collect();
+    Err(GitError::new(
+        "include_set_mismatch",
+        mismatch_report(
+            repo_root,
+            "git 实际跟踪的文件集合与配置声明的不一致。",
+            &missing,
+            &unexpected,
+        ),
+    ))
 }
 
-/// 问 git「这个文件是被哪条规则决定的」。
+/// `git add` **之前**的只读预检：按当前的忽略规则，git 将要收进来的文件与配置
+/// 声明的是否一致。
 ///
-/// `--non-matching` 让它对**没被忽略**的文件也给出裁决规则（形如
-/// `.git/info/exclude:5:!/Code/**/*`），于是两个方向都能指认。
+/// # 为什么需要它
 ///
-/// # `--no-index` 不能省
+/// [`verify_include_set`] 排在 `git add -A` 之后，而 `git add` 要把白名单里每个
+/// 文件哈希压缩写进 `.git/objects`。2026-10-27 用户在真实 Unity 工程（扩展名 `*`）
+/// 上等了约半小时才看到 `include_set_mismatch`，随后回退删掉整个 `.git`，下次重试
+/// 又是半小时。这里只遍历目录（`ls-files -o`），一个对象都不写。
 ///
-/// 「多收」方向的文件**必然已经在索引里**，而 `git check-ignore` 默认会先看
-/// 索引：已跟踪的文件它一律当成「没有规则管得着」。2026-09-14 实测同一个文件
-/// （`Code/Junk.psd`，被 `/Code/**` 排除，用 `git add -f` 强行入索引）：
+/// # 它不替代最终核对
 ///
-/// | | 输出 | exit |
-/// |---|---|---|
-/// | 无 `--no-index` | `::<TAB>Code/Junk.psd`（空裁决） | 1 |
-/// | 有 `--no-index` | `.git/info/exclude:3:/Code/**<TAB>Code/Junk.psd` | 0 |
+/// 两道比的是同一件事，但这一道读的是「git 将会收什么」，最终那道读的是「git
+/// 实际收了什么」。磁盘可能在两者之间变化，录进基线的只认后者。这一道只负责
+/// **早点失败**。
 ///
-/// 也就是说，最需要指认规则的那一侧，不带这个参数恰好什么也指认不出来。
-/// spec §6.3.1 已写明要带。
-fn blame_rule(repo_root: &str, file: &str) -> Result<String> {
-    let (_, out) = run_git_code(
+/// # 两侧都要套用与录制相同的脏清单修正
+///
+/// 最终核对的期望集合按 svn 脏清单修正过（[`server_expected_set`]），实际集合也被
+/// 录制改写过：`Fix::Drop` 的路径被 `remove_path` 摘掉，`Fix::TakeBase` 的路径被
+/// `replace_blob` **强行**放进索引——不管忽略规则怎么说。这里必须逐项复刻，
+/// 否则一个「被 `.gitignore` 挡住的 `?` / `M` 文件」会被预检挡下，而最终核对
+/// 本来会放行——误报阻断（2026-10-28 review 指出，`svn_init` 有用例钉住）。
+/// `touched` 必须与录制用的是同一个集合（[`crate::engine::svn_dirty::explained_paths`]）。
+///
+/// # 与 `svn_sync_check::precheck_include_set` 不是一回事
+///
+/// 那一个走真的 `git add`、不套修正，给同步前的磁盘检查用。名字刻意错开。
+pub fn dry_run_include_set(
+    repo_root: &str,
+    whitelist: &[String],
+    extensions: &[String],
+    fixes: &BTreeMap<String, Fix>,
+    touched: &BTreeSet<String>,
+) -> Result<()> {
+    let expected = server_expected_set(repo_root, whitelist, extensions, fixes)?;
+    let idx = TempIndex::empty(repo_root)?;
+    let mut actual = idx.ls_others(repo_root, whitelist)?;
+    for (path, fix) in fixes {
+        if !touched.contains(path) {
+            continue;
+        }
+        match fix {
+            Fix::TakeBase => {
+                actual.insert(path.clone());
+            }
+            Fix::Drop => {
+                actual.remove(path);
+            }
+        }
+    }
+    if expected == actual {
+        return Ok(());
+    }
+    let missing: Vec<String> = expected.difference(&actual).cloned().collect();
+    let unexpected: Vec<String> = actual.difference(&expected).cloned().collect();
+    Err(GitError::new(
+        "include_set_mismatch",
+        mismatch_report(
+            repo_root,
+            "建库前预检没通过：按当前的忽略规则，git 将要收进来的文件与配置声明的不一致。\
+             还没开始录制基线就停下了。",
+            &missing,
+            &unexpected,
+        ),
+    ))
+}
+
+/// 每组列出的样例文件数。
+const SAMPLES_PER_GROUP: usize = 3;
+/// 最多展开的组数，其余合成一行。
+const MAX_GROUPS: usize = 10;
+
+/// 把两个方向的差异写成「按裁决规则分组」的报告。
+///
+/// # 为什么按规则分组，而不是逐个文件列
+///
+/// 原来是按字母序列前 20 个文件、每个后面跟一条规则。2026-10-27 用户在真实
+/// Unity 工程上（扩展名 `*`）漏收了几百个 `.exe` / `.pyc`：前 20 条只覆盖了
+/// 字母序最前的一小撮，「是哪几条规则、各挡了多少个」恰恰看不出来——而用户
+/// 要动手改的正是那几条规则，不是那几百个文件。
+///
+/// 规则查询失败时**不阻止报告**：差异本身已经确定，规则只是帮用户定位的附加
+/// 信息。整组落进「查不到裁决规则」，用户仍然看得到是哪些文件。
+pub(crate) fn mismatch_report(
+    repo_root: &str,
+    headline: &str,
+    missing: &[String],
+    unexpected: &[String],
+) -> String {
+    let all: Vec<&str> = missing
+        .iter()
+        .chain(unexpected)
+        .map(String::as_str)
+        .collect();
+    let verdicts = blame_rules(repo_root, &all).unwrap_or_else(|e| {
+        log::warn!("批量查询裁决规则失败，报告里不带规则：{}", e.message);
+        BTreeMap::new()
+    });
+
+    let mut msg = format!("{headline}\n");
+    let mut blamed_gitignore = false;
+    if !missing.is_empty() {
+        msg.push_str(&format!(
+            "\n应当被跟踪、实际没有：共 {} 个\n",
+            missing.len()
+        ));
+        let groups = group_by(missing, |f| {
+            if let Some(repo) = nested_repo(repo_root, f) {
+                return format!(
+                    "位于嵌套的 git 仓库 {repo} 里（git 只给它记一个子模块指针，不收里面的文件）"
+                );
+            }
+            match verdicts.get(f) {
+                Some(v) if v.ignores() => {
+                    if is_worktree_gitignore(&v.source) {
+                        blamed_gitignore = true;
+                    }
+                    format!("被 {} 挡掉", v.rule())
+                }
+                Some(v) if !v.pattern.is_empty() => {
+                    format!("没有被忽略规则挡住（git 的裁决：{}），原因不明", v.rule())
+                }
+                Some(_) => "没有被忽略规则挡住（无匹配规则），原因不明".to_string(),
+                None => "查不到裁决规则".to_string(),
+            }
+        });
+        push_groups(&mut msg, groups);
+    }
+    if !unexpected.is_empty() {
+        msg.push_str(&format!(
+            "\n不该被跟踪、实际跟踪了：共 {} 个\n",
+            unexpected.len()
+        ));
+        let groups = group_by(unexpected, |f| match verdicts.get(f) {
+            // 子模块指针本身。里面的文件已经在「实际没有」那一侧点过名了
+            _ if Path::new(repo_root).join(f).join(".git").exists() => {
+                "是嵌套的 git 仓库（git 只给它记一个子模块指针）".to_string()
+            }
+            Some(v) if !v.pattern.is_empty() => format!("由 {} 纳入", v.rule()),
+            Some(_) => "没有匹配任何规则".to_string(),
+            None => "查不到裁决规则".to_string(),
+        });
+        push_groups(&mut msg, groups);
+    }
+    if blamed_gitignore {
+        msg.push_str(
+            "\n工作树里的 .gitignore 优先级高于本应用生成的 .git/info/exclude。\
+             把上面点名的 .gitignore 挪走、或删掉对应的行之后再重试。\n",
+        );
+    }
+    msg
+}
+
+/// 按 `label` 分组，组按文件数从多到少排；同数按标签排，保证输出稳定。
+fn group_by(
+    files: &[String],
+    mut label: impl FnMut(&str) -> String,
+) -> Vec<(String, Vec<&String>)> {
+    let mut map: BTreeMap<String, Vec<&String>> = BTreeMap::new();
+    for f in files {
+        map.entry(label(f)).or_default().push(f);
+    }
+    let mut groups: Vec<(String, Vec<&String>)> = map.into_iter().collect();
+    groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+    groups
+}
+
+fn push_groups(msg: &mut String, groups: Vec<(String, Vec<&String>)>) {
+    for (label, files) in groups.iter().take(MAX_GROUPS) {
+        msg.push_str(&format!("  · {} 个{label}\n", files.len()));
+        for f in files.iter().take(SAMPLES_PER_GROUP) {
+            msg.push_str(&format!("      {f}\n"));
+        }
+        if files.len() > SAMPLES_PER_GROUP {
+            msg.push_str(&format!(
+                "      …还有 {} 个\n",
+                files.len() - SAMPLES_PER_GROUP
+            ));
+        }
+    }
+    if groups.len() > MAX_GROUPS {
+        let rest = &groups[MAX_GROUPS..];
+        let n: usize = rest.iter().map(|(_, f)| f.len()).sum();
+        msg.push_str(&format!("  …另有 {} 组，共 {n} 个\n", rest.len()));
+    }
+}
+
+/// `source` 是不是工作树里的某个 `.gitignore`（而不是 `.git/info/exclude` 或全局文件）。
+///
+/// git 对工作树里的 `.gitignore` 给的是仓库相对路径（`Code/.gitignore`），
+/// 对全局文件给的是绝对路径，所以「相对路径且以 `.gitignore` 结尾」就够了。
+fn is_worktree_gitignore(source: &str) -> bool {
+    let s = source.replace('\\', "/");
+    let file_name = s.rsplit('/').next().unwrap_or("");
+    file_name == ".gitignore" && !Path::new(&s).is_absolute() && !s.starts_with(".git/")
+}
+
+/// `rel` 的某个祖先目录是不是一个嵌套的 git 仓库，是则返回最外层那个目录。
+///
+/// 只看仓库根**以下**的目录：根自己的 `.git` 是我们的仓库。
+fn nested_repo(repo_root: &str, rel: &str) -> Option<String> {
+    let root = Path::new(repo_root);
+    let mut dir = String::new();
+    let segs: Vec<&str> = rel.split('/').collect();
+    for seg in &segs[..segs.len().saturating_sub(1)] {
+        if !dir.is_empty() {
+            dir.push('/');
+        }
+        dir.push_str(seg);
+        if root.join(&dir).join(".git").exists() {
+            return Some(dir);
+        }
+    }
+    None
+}
+
+/// git 对一个路径的裁决：`check-ignore -v` 的 `来源:行号:模式` 三段。
+///
+/// 没有匹配任何规则时三段都为空。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Verdict {
+    source: String,
+    line: String,
+    pattern: String,
+}
+
+impl Verdict {
+    fn rule(&self) -> String {
+        format!("{}:{}:{}", self.source, self.line, self.pattern)
+    }
+
+    /// 这条裁决是不是「忽略」。以 `!` 开头的是反选，即「不忽略」。
+    fn ignores(&self) -> bool {
+        !self.pattern.is_empty() && !self.pattern.starts_with('!')
+    }
+}
+
+/// 一次性问 git「这批文件各自是被哪条规则决定的」。
+///
+/// 原来是每个文件一次子进程，只能查前 20 个；几百个文件时逐个查又太慢。
+/// `--stdin` 一次查完，才能按规则分组。
+///
+/// # 参数逐个不能省
+///
+/// - `--no-index`：「多收」方向的文件**必然已经在索引里**，而 `check-ignore` 默认
+///   会先看索引、对已跟踪文件一律给空裁决。2026-09-14 实测同一个文件
+///   （`Code/Junk.psd`，被 `/Code/**` 排除，用 `git add -f` 强行入索引）不带它得到
+///   `::<TAB>Code/Junk.psd`，带上得到 `.git/info/exclude:3:/Code/**`。
+/// - `--non-matching`：没被忽略的文件也给出裁决（反选规则或空），两个方向都能指认。
+/// - `-z`：输入输出都按 NUL 分隔、不做引号转义。不带它中文路径会被转义成八进制，
+///   回填时对不上号。输出是四段一组：`来源\0行号\0模式\0路径\0`（2026-10-27 实测）。
+fn blame_rules(repo_root: &str, files: &[&str]) -> Result<BTreeMap<String, Verdict>> {
+    if files.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let mut input = Vec::new();
+    for f in files {
+        input.extend_from_slice(f.as_bytes());
+        input.push(0);
+    }
+    let (_, out) = run_git_stdin_code(
         repo_root,
         &[
             "check-ignore",
             "--no-index",
             "-v",
             "--non-matching",
-            "--",
-            file,
+            "-z",
+            "--stdin",
         ],
+        &input,
     )?;
-    let line = out.lines().next().unwrap_or("").trim().to_string();
-    if line.is_empty() {
-        return Ok("（无匹配规则）".to_string());
-    }
-    Ok(line)
+    let parts: Vec<&str> = out.split('\0').collect();
+    Ok(parts
+        .chunks_exact(4)
+        .map(|c| {
+            (
+                c[3].to_string(),
+                Verdict {
+                    source: c[0].to_string(),
+                    line: c[1].to_string(),
+                    pattern: c[2].to_string(),
+                },
+            )
+        })
+        .collect())
 }

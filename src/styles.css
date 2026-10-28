@@ -2098,6 +2098,12 @@ body {
   font-family: inherit;
   font-size: 12px;
 }
+/* 错误详情可能有几十行（按规则分组的不一致报告 + 各阶段耗时），
+   限高滚动，不能把对话框撑出窗口、顶掉底部的按钮 */
+.svn-notice-scroll {
+  max-height: 40vh;
+  overflow: auto;
+}
 .svn-steps { display: flex; gap: 12px; list-style: none; padding: 0; margin: 8px 0 12px; }
 .svn-step { flex: 1; font-size: 11px; opacity: 0.45; }
 .svn-step.current { opacity: 1; font-weight: 600; }
