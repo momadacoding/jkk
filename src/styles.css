@@ -2092,6 +2092,8 @@ body {
 .svn-notice.ok { border-left: 3px solid #3f7d4f; }
 .svn-notice.warn { border-left: 3px solid #8a7320; }
 .svn-notice.error { border-left: 3px solid #8a3030; }
+/* 完成页会连着出好几块（体检、pinned、耗时），贴在一起会读成同一块 */
+.svn-notice + .svn-notice { margin-top: 10px; }
 .svn-notice-detail {
   margin: 4px 0 0;
   white-space: pre-wrap;

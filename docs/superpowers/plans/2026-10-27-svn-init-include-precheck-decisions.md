@@ -106,10 +106,33 @@
   `record_server_tree_into`（sync_in / sync_out 用）行为不变，只是内部换成带计时器的同一份实现。
   回退阶段的闭包恒返回 `Ok`，`rollback` 自身的行为（吞掉删除失败）没有改变。
 
+## 真实窗口验证（2026-10-28）
+
+驱动方式沿用 `e2e/2026-08-04`：`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222`
+起 `pnpm tauri dev`，CDP 读 DOM、派发事件，截图走 `Page.captureScreenshot`。另设
+`WEBVIEW2_USER_DATA_FOLDER` 指到 scratchpad，与安装版的 EBWebView 隔开。用户先关掉了安装版；
+`session.json` 事先备份挪开、验完原样还原（哈希一致）。目标是 `%TEMP%\svnui` 下的一次性
+SVN fixture，验完即删，没有碰任何真实仓库。向导全程按真实用户的操作走（受控输入用原生 setter
++ `input` 事件，按钮用 `click()`），打开 fixture 走的是空态页的 `onOpenPath`。
+
+| 场景 | 结果 |
+|---|---|
+| 白名单 `Code/`、扩展名 `*`，`Code/.gitignore` 写 `*.exe`，30 个 `.exe` 受 SVN 版本控制 | ✅ 1.5 秒内报 `include_set_mismatch`，标题是预检那句；详情「应当被跟踪、实际没有：共 30 个 / 30 个被 Code/.gitignore:1:*.exe 挡掉 / 3 个样例 / …还有 27 个」+ `.gitignore` 处理建议；`.git` 已删 |
+| 同上，耗时块 | ✅ 7 个阶段，「纳入集合预检」标「← 在这一步失败」，「回退」单独一行，没有 `git add` |
+| 错误详情滚动区 | ✅ 内容 324px、框高 239px（40vh），可滚动；底部引导语与「取消 / 建库」按钮仍在窗口内 |
+| 挪走 `.gitignore` 后在同一向导里点「建库」重试 | ✅ 建好，体检 `verified`，完成页列出 14 个阶段（含「录入磁盘内容（git add）」）|
+| 关闭向导 | ✅ 主界面接上：`⎇ work`，分支 `svn/base`（基线）与 `work` |
+
+窗口里发现并修了一处：完成页的「体检」和「耗时」两块提示上下贴在一起读成一块，
+`styles.css` 加 `.svn-notice + .svn-notice { margin-top: 10px }`，热更新后实测第二块 `margin-top: 10px`。
+
+fixture 本身的一个误判，记下免得下次再踩：**SVN 默认 `global-ignores` 含 `*.pyc`**，
+`svn add` 不会把 `.pyc` 加进去（`svn status --no-ignore` 显示 `I`）。它们服务器上没有，
+两道核对都正确地按 `Drop` 排除，所以报告里没有它们——不是缺陷。用户工程里的 `.pyc`
+能被报「漏收」，说明它们是被显式加进 SVN 的。
+
 ## 未验证 / 后续
 
-- **真实窗口未验证。** 错误详情的滚动区、成功页的耗时块只在 `pnpm build` 与纯逻辑测试层面
-  验证过，没有在 `pnpm tauri dev` 里看过实际渲染（AGENTS.md §6.1）。
 - **半小时的真正大头还没实测。** 计时是为了下次在公司真实工程上拿到数字；在那之前
   「`git add` 是大头」仍是推测。
 - 「重建基线」与同步前检查（`svn_sync_check::precheck_include_set`）换成只读预检，视用户需要再做。
