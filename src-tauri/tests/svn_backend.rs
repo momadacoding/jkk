@@ -334,12 +334,17 @@ fn init_and_rebuild_reports_serialize_to_camel_case() {
             local_path: "Code/pinA".into(),
             pinned_rev: 1,
         }],
+        timings: vec![app_lib::engine::svn_init::PhaseTiming {
+            phase: "预检".into(),
+            millis: 12,
+        }],
     })
     .unwrap();
     assert_eq!(
         keys_of(&init),
-        vec!["baseline", "health", "nodeRev", "pinned"]
+        vec!["baseline", "health", "nodeRev", "pinned", "timings"]
     );
+    assert_eq!(keys_of(&init["timings"][0]), vec!["millis", "phase"]);
     assert_eq!(
         keys_of(&init["pinned"][0]),
         vec!["definedIn", "localPath", "pinnedRev"]

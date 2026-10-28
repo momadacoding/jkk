@@ -3,8 +3,10 @@ import {
   WIZARD_STEPS,
   describeHealth,
   describePinned,
+  describeTimings,
   nextStep,
   parseExtensions,
+  splitErrorMessage,
   stepStatus,
   wizardErrorHint,
 } from '../engine/svnInit'
@@ -85,6 +87,9 @@ export default function SvnInitWizard({
 
   const healthNotice = report ? describeHealth(report.health) : null
   const pinnedNotice = report ? describePinned(report.pinned) : null
+  const timingsNotice = report ? describeTimings(report.timings) : null
+  const errorParts = error ? splitErrorMessage(error.message) : null
+  const errorHint = error ? wizardErrorHint(error.code, error.message) : ''
 
   return (
     <div className="dlg svn-wizard">
@@ -150,19 +155,21 @@ export default function SvnInitWizard({
           </div>
           {healthNotice && <NoticeBox notice={healthNotice} />}
           {pinnedNotice && <NoticeBox notice={pinnedNotice} />}
+          {timingsNotice && <NoticeBox notice={timingsNotice} />}
         </>
       )}
 
-      {error && (
+      {errorParts && (
         <div className="dlg-note svn-notice error">
-          <strong>{error.message}</strong>
+          <strong>{errorParts.headline}</strong>
+          {/* 多行详情（分组报告、耗时）必须保留换行，而且可能有几十行——
+              放进可滚动的 <pre>，不能把对话框撑出屏幕 */}
+          {errorParts.detail && (
+            <pre className="svn-notice-detail svn-notice-scroll">{errorParts.detail}</pre>
+          )}
           {/* 空串时不渲染这一段——`wizardErrorHint` 对未知错误码返回 ''，
               直接渲染会变成一个空的提示块 */}
-          {wizardErrorHint(error.code, error.message) && (
-            <pre className="svn-notice-detail">
-              {wizardErrorHint(error.code, error.message)}
-            </pre>
-          )}
+          {errorHint && <pre className="svn-notice-detail">{errorHint}</pre>}
         </div>
       )}
 

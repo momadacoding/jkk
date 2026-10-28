@@ -6,7 +6,7 @@
 
 use app_lib::engine::svn_baseline::TempIndex;
 use app_lib::engine::svn_exclude::{generate_exclude, write_exclude};
-use app_lib::engine::svn_include_check::{expected_set, verify_include_set};
+use app_lib::engine::svn_include_check::{dry_run_include_set, expected_set, verify_include_set};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -663,4 +663,275 @@ fn the_mismatch_report_names_the_rule_for_files_that_are_tracked_but_should_not_
         "拿到的是不带 --no-index 的空裁决，实际：{}",
         err.message
     );
+}
+
+// ---------------------------------------------------------------------------
+// 不一致报告的可读性（2026-10-27，用户在真实 Unity 工程上的报告）
+//
+// 原来的报告只列按字母序的前 20 个文件、每个文件后面跟一条裁决规则。几百个文件
+// 被同一条规则挡掉时，用户真正要的「是哪条规则、挡了多少个」反而看不出来。
+// ---------------------------------------------------------------------------
+
+/// 一次 `TempIndex` 录制 + 核对，扩展名用 `*`（用户的真实配置）。
+fn check_wildcard(dir: &Path) -> app_lib::error::GitError {
+    let (w, e) = (strs(&["Code/"]), strs(&["*"]));
+    write_rules(dir, &w, &e);
+    check(dir, &w, &e).expect_err("必须报不一致")
+}
+
+#[test]
+fn the_mismatch_report_groups_dropped_files_by_the_rule_that_dropped_them() {
+    let dir = workdir();
+    let p = dir.path();
+    fs::create_dir_all(p.join("Code/Tools")).unwrap();
+    fs::create_dir_all(p.join("Code/Py")).unwrap();
+    for i in 0..30 {
+        fs::write(p.join(format!("Code/Tools/t{i:02}.exe")), "x").unwrap();
+    }
+    for i in 0..3 {
+        fs::write(p.join(format!("Code/Py/m{i}.pyc")), "x").unwrap();
+    }
+    // 一份在白名单内、一份在仓库根——两处都是用户以前本地 git 可能留下的位置
+    fs::write(p.join("Code/.gitignore"), "*.exe\n").unwrap();
+    fs::write(p.join(".gitignore"), "*.pyc\n").unwrap();
+
+    let err = check_wildcard(p);
+    assert_eq!(err.code, "include_set_mismatch");
+    let m = &err.message;
+    assert!(m.contains("共 33 个"), "应当给出漏收总数，实际：{m}");
+    assert!(
+        m.contains("30 个被 Code/.gitignore:1:*.exe 挡掉"),
+        "应当按规则汇总数量，实际：{m}"
+    );
+    assert!(
+        m.contains("3 个被 .gitignore:1:*.pyc 挡掉"),
+        "第二条规则也要单独成组，实际：{m}"
+    );
+    assert!(
+        m.find("*.exe").unwrap() < m.find("*.pyc").unwrap(),
+        "挡得多的规则排在前面，实际：{m}"
+    );
+    let listed = m.lines().filter(|l| l.trim_end().ends_with(".exe")).count();
+    assert!(
+        (1..=5).contains(&listed),
+        "同一组只列几个样例，不能把 30 个全倒出来（实际列了 {listed} 个）：{m}"
+    );
+    assert!(
+        m.contains("…还有 27 个"),
+        "样例之外要说清还有多少，实际：{m}"
+    );
+}
+
+#[test]
+fn the_mismatch_report_points_at_a_nested_git_repository() {
+    // 嵌套仓库里的文件不是被忽略规则挡掉的（`check-ignore` 说它们没被忽略），
+    // `git add -A` 只给它记一个子模块指针。不单独说明的话，用户看到的是
+    // 「没有匹配规则却没被收」，无从下手。
+    let dir = workdir();
+    let p = dir.path();
+    let nested = p.join("Code/Plugin");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("P.cs"), "x").unwrap();
+    run_git(&nested, &["init", "-q"]);
+    run_git(&nested, &["config", "user.email", "t@t"]);
+    run_git(&nested, &["config", "user.name", "T"]);
+    run_git(&nested, &["add", "-A"]);
+    run_git(&nested, &["commit", "-qm", "plugin"]);
+
+    let err = check_wildcard(p);
+    let m = &err.message;
+    assert!(
+        m.contains("嵌套的 git 仓库 Code/Plugin"),
+        "应当点名嵌套仓库，实际：{m}"
+    );
+    assert!(m.contains("Code/Plugin/P.cs"), "实际：{m}");
+}
+
+#[cfg(windows)]
+#[test]
+fn a_junction_inside_the_whitelist_does_not_break_the_batch_rule_lookup() {
+    // review 担心（2026-10-28）：裁决规则一次批量查，若 junction 底下的路径让
+    // `check-ignore` fatal（「越过符号链接」），那些路径会拿不到裁决。
+    // 实测（git 2.51.2.windows.1）：不会 fatal，junction 底下与普通目录同样给出
+    // 裁决。这条把这个实测钉住；真符号链接会 fatal，见下一条。
+    let dir = workdir();
+    let p = dir.path();
+    let outside = TempDir::new().unwrap();
+    fs::write(outside.path().join("m.exe"), "x").unwrap();
+    if !make_junction(&p.join("Code/Mirror"), outside.path()) {
+        panic!("建 junction 失败——本条测试的前提没成立，不能当成通过");
+    }
+    fs::create_dir_all(p.join("Code/Tools")).unwrap();
+    fs::write(p.join("Code/Tools/a.exe"), "x").unwrap();
+    fs::write(p.join("Code/.gitignore"), "*.exe\n").unwrap();
+
+    let m = check_wildcard(p).message;
+    // 2 个 = 普通目录里的 a.exe + junction 底下的 m.exe，两个都拿到了裁决
+    assert!(
+        m.contains("2 个被 Code/.gitignore:1:*.exe 挡掉"),
+        "junction 底下与普通目录的文件都要拿到裁决规则，实际：{m}"
+    );
+    fs::remove_dir(p.join("Code/Mirror")).unwrap();
+}
+
+/// 第二轮 review（2026-10-28）：真的**目录符号链接**会让 `check-ignore` 对它底下的
+/// 路径报 `beyond a symbolic link` 并退出。原实现整批作废，同一份报告里被
+/// `.gitignore` 挡掉的文件也跟着变成「查不到裁决规则」。
+///
+/// 只在 unix 上跑：Windows 建符号链接要管理员权限或开发者模式，本机两者都没有
+/// （2026-10-28 实测 `New-Item -ItemType SymbolicLink` 被拒）。Windows 上「一个
+/// fatal 不连累别的路径」由 `svn_include_check` 的内联单测用另一种 fatal 钉住。
+#[cfg(unix)]
+#[test]
+fn a_directory_symlink_inside_the_whitelist_does_not_cost_other_files_their_rule() {
+    let dir = workdir();
+    let p = dir.path();
+    let outside = TempDir::new().unwrap();
+    fs::write(outside.path().join("m.cs"), "x").unwrap();
+    std::os::unix::fs::symlink(outside.path(), p.join("Code/Link")).unwrap();
+    fs::create_dir_all(p.join("Code/Tools")).unwrap();
+    // 字母序排在 `Code/Link/m.cs` 之后——原实现里正是它被连累
+    fs::write(p.join("Code/Tools/a.exe"), "x").unwrap();
+    fs::write(p.join("Code/.gitignore"), "*.exe\n").unwrap();
+
+    let m = check_wildcard(p).message;
+    assert!(
+        m.contains("1 个被 Code/.gitignore:1:*.exe 挡掉"),
+        "符号链接之后的文件也要拿到裁决规则，实际：{m}"
+    );
+}
+
+#[test]
+fn the_mismatch_report_keeps_non_ascii_paths_readable() {
+    // 批量查裁决规则走的是 `-z`：不带它的话 git 会把中文路径转义成八进制，
+    // 回填时对不上号，整组落进「查不到规则」。
+    let dir = workdir();
+    let p = dir.path();
+    fs::create_dir_all(p.join("Code/工具")).unwrap();
+    fs::write(p.join("Code/工具/甲.exe"), "x").unwrap();
+    fs::write(p.join("Code/.gitignore"), "*.exe\n").unwrap();
+
+    let m = check_wildcard(p).message;
+    assert!(
+        m.contains("1 个被 Code/.gitignore:1:*.exe 挡掉"),
+        "实际：{m}"
+    );
+    assert!(m.contains("Code/工具/甲.exe"), "实际：{m}");
+}
+
+// ---------------------------------------------------------------------------
+// 预检：`git add` 之前的只读核对（2026-10-27）
+//
+// 最终核对排在 `git add -A` 之后。真实 Unity 工程上 `git add` 要把白名单里每个
+// 文件哈希压缩一遍，用户等了约半小时才看到 `include_set_mismatch`，然后回退
+// 把 `.git` 整个删掉——下一次重试又是半小时。预检只遍历目录、不写任何对象。
+// ---------------------------------------------------------------------------
+
+/// 跑预检。这些 fixture 是纯 git 目录，svn 脏清单按定义为空——与 `check` 同口径。
+/// 脏清单修正那一侧由 `svn_init` 里带真实 svn 工作副本的用例覆盖。
+fn dry_run(root: &str, w: &[String], e: &[String]) -> app_lib::error::Result<()> {
+    dry_run_include_set(
+        root,
+        w,
+        e,
+        &std::collections::BTreeMap::new(),
+        &BTreeSet::new(),
+    )
+}
+
+/// `.git/objects` 下的文件数。预检必须一个对象都不写。
+fn object_files(dir: &Path) -> usize {
+    fn walk(p: &Path) -> usize {
+        fs::read_dir(p)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                if e.path().is_dir() {
+                    walk(&e.path())
+                } else {
+                    1
+                }
+            })
+            .sum()
+    }
+    walk(&dir.join(".git/objects"))
+}
+
+#[test]
+fn the_precheck_catches_a_gitignore_without_writing_any_object() {
+    let dir = workdir();
+    let p = dir.path();
+    fs::create_dir_all(p.join("Code/Tools")).unwrap();
+    fs::write(p.join("Code/Tools/t.exe"), "x").unwrap();
+    fs::write(p.join("Code/.gitignore"), "*.exe\n").unwrap();
+    let (w, e) = (strs(&["Code/"]), strs(&["*"]));
+    write_rules(p, &w, &e);
+    assert_eq!(object_files(p), 0, "前置条件：fixture 里还没有任何对象");
+
+    let err = dry_run(p.to_str().unwrap(), &w, &e).expect_err("必须在预检拦住");
+    assert_eq!(err.code, "include_set_mismatch");
+    assert!(
+        err.message.contains("预检"),
+        "要能看出是哪一道拦的：{}",
+        err.message
+    );
+    assert!(
+        err.message.contains("1 个被 Code/.gitignore:1:*.exe 挡掉"),
+        "实际：{}",
+        err.message
+    );
+    assert_eq!(object_files(p), 0, "预检写了对象——它就不再是便宜的那一道了");
+}
+
+#[test]
+fn the_precheck_passes_the_clean_configurations_the_final_check_passes() {
+    // 预检挡住一个最终核对会放行的仓库，就是误报阻断。用同一份 fixture 两边都跑。
+    //
+    // 只覆盖**干净的纯 git 目录**下的三种白名单 / 扩展名组合（含中文文件名、
+    // 单文件条目、`*`），不是「两道核对处处等价」的证明。其余形态在别处：
+    // 脏工作副本 → `svn_init` 的 `the_precheck_does_not_block_what_the_final_check_
+    // accepts_on_a_dirty_working_copy`；junction / external / GBK 等 → `svn_init`
+    // 的成功路径用例（它们都要先过预检）；嵌套仓库 → 两道都拦，见下方用例。
+    let dir = workdir();
+    fs::write(dir.path().join("Code/角色.cs"), "x").unwrap();
+    for (w, e) in [
+        (strs(&["Code/"]), strs(&[".cs"])),
+        (strs(&["Code/"]), strs(&["*"])),
+        (strs(&["Code/", "Code/Junk.psd"]), strs(&[".cs"])),
+    ] {
+        write_rules(dir.path(), &w, &e);
+        dry_run(dir.path().to_str().unwrap(), &w, &e)
+            .unwrap_or_else(|err| panic!("{w:?} {e:?} 预检误报：{}", err.message));
+        check(dir.path(), &w, &e).unwrap();
+    }
+}
+
+#[test]
+fn the_precheck_catches_a_nested_repository_that_git_add_would_choke_on() {
+    // 没有提交的嵌套仓库会让 `git add -A` 直接失败（2026-10-27 实测：
+    // `'Code/Plugin/' does not have a commit checked out`），用户只看到一句
+    // git 的英文报错。预检要在那之前把它点名。
+    let dir = workdir();
+    let p = dir.path();
+    let nested = p.join("Code/Plugin");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("P.cs"), "x").unwrap();
+    run_git(&nested, &["init", "-q"]);
+    let (w, e) = (strs(&["Code/"]), strs(&[".cs"]));
+    write_rules(p, &w, &e);
+
+    let err = dry_run(p.to_str().unwrap(), &w, &e).expect_err("必须拦住");
+    assert!(
+        err.message.contains("嵌套的 git 仓库 Code/Plugin"),
+        "实际：{}",
+        err.message
+    );
+}
+
+#[test]
+fn the_precheck_with_an_empty_whitelist_checks_nothing_rather_than_everything() {
+    // AGENTS.md §6.2：`ls-files -o` 不带 pathspec 会列出整个仓库。
+    let dir = workdir();
+    write_rules(dir.path(), &[], &strs(&[".cs"]));
+    dry_run(dir.path().to_str().unwrap(), &[], &strs(&[".cs"])).unwrap();
 }

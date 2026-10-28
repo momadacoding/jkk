@@ -5,11 +5,69 @@ import {
   healthNeedsRebuild,
   HEALTH_MAX_LISTED,
   describePinned,
+  describeTimings,
+  formatDuration,
   nextStep,
   parseExtensions,
+  splitErrorMessage,
   stepStatus,
   wizardErrorHint,
 } from '@/engine/svnInit'
+
+describe('耗时的显示', () => {
+  it('与 Rust 侧 human_duration 同一口径：一分钟内保留一位小数，之后按分秒', () => {
+    expect(formatDuration(0)).toBe('0.0 秒')
+    expect(formatDuration(1234)).toBe('1.2 秒')
+    expect(formatDuration(60_000)).toBe('1 分 0 秒')
+    expect(formatDuration(95_000)).toBe('1 分 35 秒')
+    expect(formatDuration(31 * 60_000 + 12_400)).toBe('31 分 12 秒')
+  })
+
+  it('取整只用整数运算、四舍五入，与 Rust 侧逐字一致（review 指出 toFixed 与 {:.1} 对 .x5 取整方向不同）', () => {
+    // 1250：Rust `{:.1}` 按银行家舍入给 1.2，`toFixed(1)` 给 1.3——两边都改成整数四舍五入
+    expect(formatDuration(1250)).toBe('1.3 秒')
+    expect(formatDuration(1249)).toBe('1.2 秒')
+    // 59_950 四舍五入到一位小数是 60.0 秒，应当进到分钟那一档
+    expect(formatDuration(59_949)).toBe('59.9 秒')
+    expect(formatDuration(59_950)).toBe('1 分 0 秒')
+    expect(formatDuration(89_500)).toBe('1 分 30 秒')
+  })
+
+  it('成功页按执行顺序列出每个阶段，标题给总耗时', () => {
+    const n = describeTimings([
+      { phase: '前置校验 P1–P4（svn status）', millis: 1200 },
+      { phase: '录入磁盘内容（git add）', millis: 95_000 },
+    ])
+    expect(n).not.toBeNull()
+    expect(n!.title).toContain('1 分 36 秒')
+    const lines = n!.detail.split('\n')
+    expect(lines[0]).toContain('前置校验')
+    expect(lines[0]).toContain('1.2 秒')
+    expect(lines[1]).toContain('git add')
+    expect(lines[1]).toContain('1 分 35 秒')
+  })
+
+  it('没有耗时（旧后端或空数组）时不显示', () => {
+    expect(describeTimings([])).toBeNull()
+    expect(describeTimings(undefined)).toBeNull()
+  })
+})
+
+describe('错误正文的拆分', () => {
+  it('第一行作标题，其余原样作详情——几百行的不一致报告不能被挤成一段', () => {
+    const msg = 'git 实际跟踪的文件集合与配置声明的不一致。\n\n应当被跟踪、实际没有：共 3 个\n  · 3 个被 .gitignore:1:*.pyc 挡掉'
+    const { headline, detail } = splitErrorMessage(msg)
+    expect(headline).toBe('git 实际跟踪的文件集合与配置声明的不一致。')
+    expect(detail).toBe('应当被跟踪、实际没有：共 3 个\n  · 3 个被 .gitignore:1:*.pyc 挡掉')
+  })
+
+  it('单行错误没有详情', () => {
+    expect(splitErrorMessage('svn 不在 PATH 里')).toEqual({
+      headline: 'svn 不在 PATH 里',
+      detail: '',
+    })
+  })
+})
 
 describe('向导步骤状态机', () => {
   it('按固定顺序推进，最后一步没有下一步', () => {
@@ -207,6 +265,19 @@ describe('错误码到引导语的映射', () => {
     // 抑制只针对重复，不能把这张表整个变成摆设
     const terse = '核对失败'
     expect(wizardErrorHint('include_set_mismatch', terse)).toContain('.gitignore')
+  })
+
+  it('纳入集合不一致：预检与最终核对两种标题下都给出「怎么处理」', () => {
+    // 后端报告只说「是哪条规则」，怎么处理由这条引导说——两道核对的标题不同，
+    // 不能因为其中一个恰好与引导开头重合就被当成重复而吞掉。
+    for (const headline of [
+      'git 实际跟踪的文件集合与配置声明的不一致。',
+      '录制基线前预检没通过：按当前的忽略规则，git 将要收进来的文件与配置声明的不一致。',
+    ]) {
+      const hint = wizardErrorHint('include_set_mismatch', headline)
+      expect(hint).toContain('.gitignore')
+      expect(hint).toContain('嵌套')
+    }
   })
 })
 
