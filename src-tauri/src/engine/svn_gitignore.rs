@@ -172,7 +172,18 @@ pub(crate) fn query_verdicts(ctx: &GitCtx, files: &[&str]) -> Result<BTreeMap<St
     let mut resumes = 0;
     while !rest.is_empty() {
         let (answered, fatal) = verdict_batch(ctx, &rest, &mut out)?;
-        let Some(e) = fatal else { break };
+        let Some(e) = fatal else {
+            // 没有 fatal 却没答全：git 回显的路径与输入对不上号，其余路径落进「查不到」。
+            // 至今没见过这种形态，留个痕迹，免得只剩一个解释不了的不一致报告
+            if answered < rest.len() {
+                log::warn!(
+                    "check-ignore 的输出从 {:?} 起对不上输入，其余 {} 个路径不带规则",
+                    rest[answered],
+                    rest.len() - answered
+                );
+            }
+            break;
+        };
         let Some(&culprit) = rest.get(answered) else {
             break;
         };
@@ -337,8 +348,16 @@ fn scan_dir(dir: &Path, root: &Path, chain: &mut Vec<PathBuf>, scan: &mut TreeSc
                 .map_err(|_| GitError::new("include_set", "路径不在仓库内"))?
                 .to_string_lossy()
                 .replace('\\', "/");
-            if name == ".gitignore" {
-                scan.gitignores.insert(rel.clone());
+            // git 打开的是 `目录/.gitignore`：大小写不敏感的卷上 `.GitIgnore` 也会被读到，
+            // 而裁决来源照样报 `目录/.gitignore`（2026-10-30 实测）。按 git 的写法记，
+            // 影子树复制与改名停用都按这个名字打开同一个文件；大小写敏感的卷上
+            // `.GitIgnore` 打不开 `.gitignore`，git 也不读它，不收
+            if name.eq_ignore_ascii_case(".gitignore") && p.with_file_name(".gitignore").is_file() {
+                let as_git = match rel.rsplit_once('/') {
+                    Some((d, _)) => format!("{d}/.gitignore"),
+                    None => ".gitignore".to_string(),
+                };
+                scan.gitignores.insert(as_git);
             }
             scan.files.insert(rel);
         }
@@ -718,6 +737,13 @@ pub fn disable_gitignore(repo_root: &str, rel: &str) -> Result<String> {
 ///
 /// 原位置**又出现了一个文件**时不覆盖它（Review Focus 第 5 条）：那可能是用户或 SVN
 /// 更新刚放进来的。两个文件都留着，点名让用户处理。倒序改回，与改名顺序相反。
+///
+/// # 为什么不是「判存在再 rename」
+///
+/// 与 [`disable_gitignore`] 同一个理由：Windows 上 `fs::rename` 会替换已存在的目标，判完
+/// 之后、改名之前冒出来的文件会被静默盖掉（/code-review 第 3 条）。`hard_link` 在目标已存在
+/// 时原子地失败，所以先链接到原名、再删停用名。卷不支持硬链接（FAT / exFAT）时退回
+/// 「判存在再 rename」——那里没有原子的不覆盖改名可用，窗口只剩这一种卷。
 pub fn restore_gitignores(repo_root: &str, renamed: &[DisabledGitignore]) -> Vec<String> {
     let root = Path::new(repo_root);
     let mut failures = Vec::new();
@@ -728,14 +754,24 @@ pub fn restore_gitignores(repo_root: &str, renamed: &[DisabledGitignore]) -> Vec
             display_path(repo_root, &r.from),
             display_path(repo_root, &r.to),
         );
+        let reappeared = format!("{from_full} 又出现了一个新文件，{to_full} 没有改回去");
         if from.exists() {
-            failures.push(format!(
-                "{from_full} 又出现了一个新文件，{to_full} 没有改回去"
-            ));
+            failures.push(reappeared);
             continue;
         }
-        if let Err(e) = std::fs::rename(&to, &from) {
-            failures.push(format!("{to_full} → {from_full}：{e}"));
+        match std::fs::hard_link(&to, &from) {
+            Ok(()) => {
+                // 原名已经回来了；停用名删不掉只是多留一份副本，照样点名
+                if let Err(e) = std::fs::remove_file(&to) {
+                    failures.push(format!("{from_full} 已改回，但 {to_full} 没删掉：{e}"));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => failures.push(reappeared),
+            Err(_) => {
+                if let Err(e) = std::fs::rename(&to, &from) {
+                    failures.push(format!("{to_full} → {from_full}：{e}"));
+                }
+            }
         }
     }
     failures

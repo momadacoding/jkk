@@ -278,3 +278,55 @@
 - 换基后验证：`cargo fmt --check` / `clippy --all-targets` 无告警，`cargo test` 65 个套件全部通过；
   `pnpm build` 通过，`pnpm test` 54 文件 / 807 条全绿（#91 带来 3 条）。换基只动了后端三个文件的合并与
   两条测试断言，前端与 IPC 未变，真实窗口未重跑。
+
+### `/code-review high` 的核实与修复（2026-10-30）
+
+review 由独立的 review agent 完成，10 条。逐条先核实再处理：
+
+| 条 | 结论 | 处理 |
+|---|---|---|
+| 1 大小写不同的 `.GitIgnore` 第 2 步看不见 | **成立**（实测） | 已修 |
+| 2 `is_versioned` 按小写名问 svn，受控的 `.GitIgnore` 会被改名 | **不成立**（实测） | 不改 |
+| 3 `restore_gitignores` 判存在后 `rename`，有覆盖窗口 | 成立（读代码） | 已修 |
+| 4 只把基线树当已跟踪，`work` 上已提交、基线里没有的文件后来被 `.gitignore` 挡住会被当成白名单外 | 成立，是 spec 没覆盖的缺口 | **待用户决定**（改 W-file 定义，波及所有入口） |
+| 5 向导重新检查后清单为空时「尊重」仍生效；重新检查失败盖掉原错误 | 成立（读代码） | 已修 |
+| 6 `detect_with_renames` 去重丢掉后几轮的计数 | 前半**不成立**；后半（上限静默退出）成立但只在病态结构下出现 | 不改 |
+| 7 `verdict_batch` 对不上号且没有 fatal 时静默丢弃 | 成立，但没见过触发形态 | 只补 `log::warn!` |
+| 8 每轮重复遍历目录树 | 成立 | 延后（本日志「最终 review」已记） |
+| 9 `WScope::for_repo` 一次操作建多次 | 成立 | 延后（Task 3 有意的取舍） |
+| 10 `ignore_case` / 目录遍历两份实现 | 成立 | 延后 |
+
+- 计划没写的坑（实测，git 2.51.2.windows.1，NTFS）：`Code/.GitIgnore` 照样被 git 读到，
+  `check-ignore -v` 的来源报 `Code/.gitignore`。`scan_dir` 只认名字恰好是 `.gitignore` 的文件，
+  影子树里没有它 → 第 2 步查不出 → 建库时真仓库查出来 → `svn_gitignore_unconfirmed` → 重查还是
+  没有，**死循环**。祖先目录那条路走的是 `root.join(".gitignore").is_file()`，本来就大小写不敏感，
+  只有子树漏了。
+  - 修正：名字大小写不敏感地等于 `.gitignore`、**且**按 `.gitignore` 打得开（大小写敏感的卷上打不开，
+    git 也不读）时收下，记成 git 的写法 `目录/.gitignore`——与裁决来源、`acknowledged`、`disabled`
+    同一个键；影子树复制与改名都按这个名字打开同一个文件。
+  - RED：`a_gitignore_spelled_in_another_case_is_still_detected`（第 2 步得到 `[]`）、
+    `a_hidden_gitignore_spelled_in_another_case_is_listed_too`（内层 `.GITIGNORE` 没列出）、
+    `confirming_what_step_two_listed_gets_past_a_gitignore_spelled_in_another_case`（按第 2 步的清单
+    确认，建库仍报 `svn_gitignore_unconfirmed`）。三条都是 `#[cfg(windows)]`：大小写敏感的卷上
+    git 不读 `.GitIgnore`，这个形态不存在。
+  - 已知取舍：改名失败回退时，文件改回的名字是 `.gitignore`，原来的大小写丢了。只发生在不受控的
+    文件上，内容不变。
+- 第 2 条核实（实测，SlikSvn 1.14.2）：受控的 `Code/.GitIgnore`，在 `Code/` 里
+  `svn status --xml -v --depth empty -- .gitignore` 返回 `path=".GitIgnore"`、`item="normal"`——Windows 上
+  svn 会把参数解析成磁盘上的真实大小写。`is_versioned` 判为受控，不会被改名。
+- 第 3 条修正：`hard_link(停用名, 原名)` 在原名已存在时原子地失败（`AlreadyExists` → 照旧点名
+  「又出现了一个新文件」），成功后再删停用名，删不掉也点名。卷不支持硬链接（FAT / exFAT）时退回原来的
+  「判存在再 rename」。竞态没法写成稳定的失败用例；既有的 `restore_never_overwrites_a_gitignore_that_reappeared`
+  与 `disabling_renames_..._restoring_puts_it_back` 覆盖了两条确定性路径，照样通过。
+- 第 5 条修正：新增 `effectiveRespect(conflicts, respect)`（`src/engine/svnInit.ts`），清单为空时
+  请求里的「尊重」恒为 `false`；重新检查包一层 `try`，失败时留着旧清单、显示建库那次的错误。
+  RED：组件用例两条（下一次建库收到 `true`；界面显示的是「重新检查失败」）。
+- 第 4 条为什么不顺手改：spec「参照统一是当前基线树里已有的文件」是写明的决定。改成「基线 ∪ `work` 的
+  HEAD」会改动体检 / 重建 / 同步前检查 / 交付的口径。现在的表现是拒绝交付，提示里说的「多半是 `git add -f`」
+  是误导，但不丢数据。
+- 第 6 条为什么前半不成立：不受控的一经发现就在影子树里停用，后面几轮不会再出现；会再次出现的只有受控的。
+  受控的永远不改名，只有「尊重」时能建库，而「尊重」时外层也不停用——第 0 轮的计数就是「尊重」口径下的
+  真实数字，后几轮的反而不对。
+- 验证：`cargo fmt --check` / `clippy --all-targets` 无告警，`cargo test` 全部套件通过；`pnpm build` 通过，
+  `pnpm test` 54 文件 / 809 条全绿。真实窗口未重跑：第 1 条的改动在后端扫描、没有 IPC 变化，fixture 用例
+  走的是同一条 `init_preflight` / `init_hybrid_with` 路径；第 5 条由组件用例覆盖。

@@ -404,6 +404,16 @@ export function gitignoreBlockReason(conflicts: GitignoreConflict[], respect: bo
   return null
 }
 
+/**
+ * 建库请求里实际带的「尊重」。
+ *
+ * 没有冲突时勾选框不渲染，用户看不到这个选项，它就不能生效：重新检查之后清单变空时，
+ * 之前勾上的 `true` 还留在 state 里（/code-review 第 5 条）。
+ */
+export function effectiveRespect(conflicts: GitignoreConflict[], respect: boolean): boolean {
+  return respect && conflicts.length > 0
+}
+
 /** 完成页：改了哪些名、或按尊重口径没收哪些文件。两样都没有时返回 `null`。 */
 export function describeGitignoreOutcome(o: GitignoreOutcome | undefined): Notice | null {
   if (!o) return null

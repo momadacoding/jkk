@@ -97,6 +97,41 @@ describe('SvnInitWizard：起作用的 .gitignore（2026-10-28 设计 §3）', (
     )
   })
 
+  it('重新检查后清单空了：勾选框跟着消失，下一次建库不再按「尊重」请求', async () => {
+    // /code-review 第 5 条：勾选框藏起来了，state 里的 true 却留着，用户看不见的选项照样生效
+    const onPreflight = vi
+      .fn<OnPreflight>()
+      .mockResolvedValueOnce(preflight([conflict({ versioned: true })]))
+      .mockResolvedValueOnce(preflight([]))
+    const onInit = vi
+      .fn<OnInit>()
+      .mockRejectedValueOnce({ code: 'svn_gitignore_unconfirmed', message: '发现了你在上一步没看到的 .gitignore' })
+      .mockResolvedValue(report)
+    mount(onPreflight, onInit)
+    await toConfirm()
+    fireEvent.click(screen.getByLabelText(CHECKBOX))
+    fireEvent.click(screen.getByRole('button', { name: '建库' }))
+    await waitFor(() => expect(onPreflight).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.queryByLabelText(CHECKBOX)).toBeNull())
+    fireEvent.click(screen.getByRole('button', { name: '建库' }))
+    await waitFor(() => expect(onInit).toHaveBeenLastCalledWith(['Assets/'], ['.cs'], false, []))
+  })
+
+  it('重新检查本身失败时，显示的仍是建库那次的错误', async () => {
+    const onPreflight = vi
+      .fn<OnPreflight>()
+      .mockResolvedValueOnce(preflight([conflict()]))
+      .mockRejectedValueOnce({ code: 'svn_not_wc', message: '重新检查失败' })
+    const onInit = vi
+      .fn<OnInit>()
+      .mockRejectedValueOnce({ code: 'svn_gitignore_unconfirmed', message: '发现了你在上一步没看到的 .gitignore' })
+    mount(onPreflight, onInit)
+    await toConfirm()
+    fireEvent.click(screen.getByRole('button', { name: '建库' }))
+    expect(await screen.findByText(/发现了你在上一步没看到的 \.gitignore/)).toBeTruthy()
+    expect(screen.queryByText(/重新检查失败/)).toBeNull()
+  })
+
   it('建库报「有没看过的 .gitignore」时重新检查，把新清单摆出来', async () => {
     const inner = conflict({ path: 'Assets/Sub/.gitignore', fullPath: 'C:\\w\\Assets\\Sub\\.gitignore' })
     const onPreflight = vi

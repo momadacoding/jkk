@@ -178,6 +178,59 @@ fn a_nested_gitignore_reports_its_own_location() {
         .ends_with(r"\Code\Sub\.gitignore"));
 }
 
+/// 大小写不敏感的卷上，git 打开 `目录/.gitignore` 时读到的是磁盘上的 `.GitIgnore`，
+/// 裁决来源照样报 `Code/.gitignore`（2026-10-30 实测，git 2.51.2.windows.1）。
+/// 第 2 步若只认名字恰好是 `.gitignore` 的文件，影子树里就没有它、查不出冲突；
+/// 建库时真仓库却查得出来 → 送回第 3 步 → 再查还是没有，死循环（/code-review 第 1 条）。
+#[cfg(windows)]
+#[test]
+fn a_gitignore_spelled_in_another_case_is_still_detected() {
+    let fx = svn_repo();
+    commit(&fx, &[("Code/a.exe", "a")]);
+    write(&fx, "Code/.GitIgnore", "*.exe\n");
+
+    let p = init_preflight(&fx.wc_str(), &strs(&["Code/"]), &strs(&["*"])).unwrap();
+    let paths: Vec<&str> = p
+        .gitignore_conflicts
+        .iter()
+        .map(|c| c.path.as_str())
+        .collect();
+    // 与建库时真仓库给的来源同一个写法，`acknowledged` 才对得上账
+    assert_eq!(
+        paths,
+        vec!["Code/.gitignore"],
+        "{:?}",
+        p.gitignore_conflicts
+    );
+    assert_eq!(
+        p.gitignore_conflicts[0].rules,
+        vec![excludes(1, "*.exe", &["Code/a.exe"])]
+    );
+}
+
+/// 同上，藏在外层后面的那个：外层停用之后才起作用、又是另一种大小写。
+#[cfg(windows)]
+#[test]
+fn a_hidden_gitignore_spelled_in_another_case_is_listed_too() {
+    let fx = svn_repo();
+    commit(&fx, &[("Code/Sub/X.cs", "x")]);
+    write(&fx, "Code/.gitignore", "Sub/\n");
+    write(&fx, "Code/Sub/.GITIGNORE", "*.cs\n");
+
+    let p = init_preflight(&fx.wc_str(), &strs(&["Code/"]), &strs(&["*"])).unwrap();
+    let paths: Vec<(&str, bool)> = p
+        .gitignore_conflicts
+        .iter()
+        .map(|c| (c.path.as_str(), c.active_after_rename))
+        .collect();
+    assert_eq!(
+        paths,
+        vec![("Code/.gitignore", false), ("Code/Sub/.gitignore", true)],
+        "{:?}",
+        p.gitignore_conflicts
+    );
+}
+
 #[test]
 fn a_gitignore_hidden_behind_another_is_listed_too() {
     // git 不进入已被忽略的目录：`Code/.gitignore` 写 `Sub/` 时，`Code/Sub/.gitignore` 根本

@@ -533,6 +533,36 @@ fn acknowledging_the_hidden_gitignore_too_disables_both() {
     assert_eq!(json["disabledGitignores"].as_array().unwrap().len(), 2);
 }
 
+/// 第 2 步列出来的清单原样确认，建库就必须成功——大小写不同的 `.GitIgnore` 也一样
+/// （/code-review 第 1 条：原来第 2 步看不到它，建库时被送回第 3 步，永远出不去）。
+#[cfg(windows)]
+#[test]
+fn confirming_what_step_two_listed_gets_past_a_gitignore_spelled_in_another_case() {
+    let fx = svn_repo();
+    let wc = fx.wc();
+    std::fs::create_dir_all(wc.join("Code/Sub")).unwrap();
+    std::fs::write(wc.join("Code/Sub/X.cs"), "x\n").unwrap();
+    svn(&wc, &["add", "Code/Sub", "--non-interactive"]);
+    svn(&wc, &["commit", "-m", "sub", "--non-interactive"]);
+    svn(&wc, &["update", "--non-interactive"]);
+    std::fs::write(wc.join("Code/.GitIgnore"), "Sub/\n").unwrap();
+    std::fs::write(wc.join("Code/Sub/.GITIGNORE"), "*.cs\n").unwrap();
+
+    let r = req(&fx);
+    let pre = app_lib::engine::svn_init::init_preflight(&r.repo_root, &r.whitelist, &r.extensions)
+        .unwrap();
+    let seen: Vec<String> = pre
+        .gitignore_conflicts
+        .iter()
+        .map(|c| c.path.clone())
+        .collect();
+    let seen_refs: Vec<&str> = seen.iter().map(String::as_str).collect();
+    init_hybrid_with(&r, &choice(false, &seen_refs))
+        .unwrap_or_else(|e| panic!("第 2 步列出的是 {seen:?}：{}", e.message));
+    let tree = baseline_tree(&fx);
+    assert!(tree.contains("Code/Sub/X.cs"), "{tree}");
+}
+
 #[test]
 fn the_gitignore_phase_shows_up_in_timings() {
     let fx = svn_repo();

@@ -6,6 +6,7 @@ import {
   describeHealth,
   describePinned,
   describeTimings,
+  effectiveRespect,
   gitignoreBlockReason,
   needsReconfirm,
   nextStep,
@@ -253,7 +254,7 @@ export default function SvnInitWizard({
                     await onInit(
                       whitelist,
                       extensions,
-                      respectGitignore,
+                      effectiveRespect(conflicts, respectGitignore),
                       conflicts.map((c) => c.path),
                     ),
                   )
@@ -262,7 +263,11 @@ export default function SvnInitWizard({
                   // 出现了用户没看过的 .gitignore：重新检查、把新清单摆出来，留在这一步。
                   // 错误照常显示，告诉用户为什么清单变了
                   if (needsReconfirm(toErrorCode(e) ?? '')) {
-                    setPreflight(await onPreflight(whitelist, extensions))
+                    try {
+                      setPreflight(await onPreflight(whitelist, extensions))
+                    } catch {
+                      // 重新检查失败时留着旧清单；要显示的是建库为什么没成，不是这一次
+                    }
                   }
                   throw e
                 }
