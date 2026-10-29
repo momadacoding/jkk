@@ -117,6 +117,10 @@ export function stepStatus(step: StepId, current: StepId): StepState {
 // ---------------------------------------------------------------------------
 
 const EXTENSION_SEPARATORS = /[,，、;；\s]+/
+/** 中文输入法下打出的全角句点，当成 `.` */
+const FULL_WIDTH_DOTS = /[。．]/g
+/** 复制粘贴带进来的零宽字符。`\s` 不含它们，留着会让扩展名静默匹配不到文件 */
+const ZERO_WIDTH = /[​-‍⁠﻿]/g
 
 /**
  * 把用户输入的扩展名串解析成配置需要的数组。
@@ -130,10 +134,15 @@ const EXTENSION_SEPARATORS = /[,，、;；\s]+/
  * 分隔符不只认 ASCII 逗号：中文输入法下顺手打出的 `、` `，` `；` 以及空白都切开。
  * 只认 `,` 时 `.cs、.lua` 会整串成为一个扩展名，生成的反选规则匹配不到任何文件，
  * 白名单整体失效却没有任何报错（2026-10-28 现场）。扩展名本身不会含这些字符。
+ * 同理，全角句点 `。` `．` 换成 `.`，零宽字符直接去掉。
+ *
+ * Rust 侧 `svn_config::validate_new_extensions` 对同一批字符兜底拒绝：这里漏掉的，
+ * 建库时会在 `git init` 之前报错，不会静默建出一个什么都不管的仓库。
  */
 export function parseExtensions(raw: string): string[] {
   const out: string[] = []
-  for (const piece of raw.split(EXTENSION_SEPARATORS)) {
+  const cleaned = raw.replace(ZERO_WIDTH, '').replace(FULL_WIDTH_DOTS, '.')
+  for (const piece of cleaned.split(EXTENSION_SEPARATORS)) {
     const t = piece.trim()
     if (!t) continue
     const norm = t === '*' ? '*' : t.startsWith('.') ? t : `.${t}`

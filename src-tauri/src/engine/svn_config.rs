@@ -90,6 +90,7 @@ pub fn read_config(repo_root: &str) -> Result<SvnConfig> {
 /// 的内容，等于造出一个「识别成混合仓库、但每次读配置都报错」的死局。
 pub fn write_config(repo_root: &str, cfg: &SvnConfig) -> Result<()> {
     validate(cfg)?;
+    validate_new_extensions(&cfg.extensions)?;
     let path = config_path(repo_root);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -100,8 +101,45 @@ pub fn write_config(repo_root: &str, cfg: &SvnConfig) -> Result<()> {
     Ok(())
 }
 
-/// 扩展名里不允许出现的字符（空白另外判）：列表分隔符与 gitignore 字符类括号。
-const EXTENSION_FORBIDDEN: &[char] = &[',', '，', '、', ';', '；', '[', ']'];
+/// 新写入的扩展名里不允许出现的字符（空白另外判）：列表分隔符、全角句点、
+/// gitignore 字符类括号，以及 `char::is_whitespace` 不算空白的零宽字符。
+const EXTENSION_FORBIDDEN: &[char] = &[
+    ',', '，', '、', ';', '；', '。', '．', '[', ']', '\u{200B}', '\u{200C}', '\u{200D}',
+    '\u{2060}', '\u{FEFF}',
+];
+
+/// 挡住「整串列表被写成一条扩展名」这类**能写出来、但匹配不到任何文件**的扩展名。
+///
+/// 2026-10-28 现场：向导只按 ASCII 逗号切分，用户用顿号分隔，配置里落下
+/// `".cs、.lua、.java"`。它以点开头、不含路径分隔符，[`validate`] 放行，生成的
+/// `!/…/**/*.cs、.lua、.java` 什么都匹配不到——白名单整体失效却没有任何报错。
+/// `[` `]` 在 exclude 规则里是字符类，同样会让匹配静默偏离字面意思。
+///
+/// # 为什么只在写新配置时查，不放进 [`validate`]
+///
+/// `validate` 在每次打开仓库、同步、读日志时都会跑（经 [`read_config`]）。旧版本
+/// 已经写下这种扩展名的仓库往往是**半能用**的（`[".cs", ".lua、.java"]` 里 `.cs`
+/// 照常受管，上面可能已经有提交和 stash），读配置时拒绝等于把它整个锁死，应用里
+/// 没有任何出路。而这类扩展名不危险——不会让命令作用到预期之外的范围，只是
+/// 匹配不到文件；exclude 与纳入集合核对都按同一份字符串算，两边仍然一致。
+/// 所以只在源头（向导组装配置、写配置文件）挡住。
+pub fn validate_new_extensions(extensions: &[String]) -> Result<()> {
+    for e in extensions {
+        if e.chars()
+            .any(|c| c.is_whitespace() || EXTENSION_FORBIDDEN.contains(&c))
+        {
+            return Err(GitError::new(
+                "svn_config",
+                format!(
+                    "扩展名 {e:?} 含空白、列表分隔符、全角句点或方括号，\
+                     看起来是把多个扩展名写成了一条，这样的规则匹配不到任何文件。\
+                     请用英文逗号分隔，每条以英文句点开头，例如 .cs, .lua"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// 校验一份**已规范化**的配置。
 pub fn validate(cfg: &SvnConfig) -> Result<()> {
@@ -157,23 +195,6 @@ pub fn validate(cfg: &SvnConfig) -> Result<()> {
         // "*" 是 spec §6.3 明文给出的全纳入写法，单独放行。
         if e == "*" {
             continue;
-        }
-        // 列表分隔符或空白出现在一条扩展名里，几乎一定是把整串列表写成了一条
-        // （2026-10-28 现场：向导只认 ASCII 逗号，用户用了顿号）。放行的话生成的
-        // `!/…/**/*.cs、.lua` 匹配不到任何文件，白名单整体失效却没有任何报错。
-        // `[` `]` 在 exclude 规则里是字符类，同样会让匹配静默偏离字面意思。
-        if e.chars()
-            .any(|c| c.is_whitespace() || EXTENSION_FORBIDDEN.contains(&c))
-        {
-            return Err(GitError::new(
-                "svn_config",
-                format!(
-                    "扩展名 {e:?} 含空白、列表分隔符或方括号，看起来是把多个扩展名写成了一条。\
-                     按这份配置生成的忽略规则匹配不到任何文件。\
-                     如果仓库已经用它建过库，需要重新初始化：确认 git 里没有要保留的\
-                     提交或 stash 后删除 .git 目录（.svn 不受影响），再用向导以英文逗号分隔重建"
-                ),
-            ));
         }
         if !e.starts_with('.') {
             return Err(GitError::new(

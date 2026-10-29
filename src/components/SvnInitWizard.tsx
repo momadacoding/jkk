@@ -125,7 +125,7 @@ export default function SvnInitWizard({
           </div>
           <div className="dlg-field">
             <label className="dlg-field-label" htmlFor="svn-ext">
-              收哪些扩展名（逗号分隔，`*` 表示全收）
+              收哪些扩展名（逗号、顿号、分号或空格分隔，`*` 表示全收）
             </label>
             <input
               id="svn-ext"

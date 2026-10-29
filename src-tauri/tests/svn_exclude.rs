@@ -5,7 +5,7 @@
 //! 而这个模块存在的全部理由就是后者（spec §6.3）。
 
 use app_lib::engine::svn_baseline::TempIndex;
-use app_lib::engine::svn_exclude::{generate_exclude, write_exclude};
+use app_lib::engine::svn_exclude::{generate_exclude, write_exclude, GENERATED_HEADER};
 use app_lib::engine::svn_include_check::{dry_run_include_set, expected_set, verify_include_set};
 use std::collections::BTreeSet;
 use std::fs;
@@ -556,34 +556,19 @@ fn a_users_own_exclude_is_backed_up_before_we_take_over() {
 }
 
 #[test]
-fn an_exclude_from_an_older_version_is_still_recognised_as_ours() {
-    // 文件头的文字改过一次（旧文字声称「下次打开仓库时被覆盖」，与实现不符）。
-    // 「是不是我们写的」只看第一行，旧版写下的 exclude 若因文字不同被当成用户原件，
-    // 就会被备份成 exclude.bak——之后真正的用户原件再也进不了备份（备份存在不再覆盖）。
-    let dir = workdir();
-    let info = dir.path().join(".git").join("info");
-    fs::create_dir_all(&info).unwrap();
-    fs::write(
-        info.join("exclude"),
-        "# 由 mygitclient 自动生成，请勿手工编辑——改动会在下次打开仓库时被覆盖。\n/*\n!/Code/\n.svn/\n",
-    )
-    .unwrap();
-
-    write_rules(dir.path(), &strs(&["Code/"]), &strs(&[".cs"]));
-    assert!(
-        !info.join("exclude.bak").exists(),
-        "旧版本生成的 exclude 不该被当成用户原件备份"
-    );
-}
-
-#[test]
-fn the_generated_header_does_not_promise_regeneration_on_open() {
-    // exclude 只在建库时写一次。改配置文件不会让它重新生成，文件头不能说会——
-    // 否则用户改了 mygitclient.json、以为下次打开就生效，实际白名单纹丝不动。
+fn the_generated_header_says_changes_need_a_reinit() {
+    // exclude 只在建库时写一次，改配置文件、重建基线都不会让它重新生成。旧文件头
+    // 说「改动会在下次打开仓库时被覆盖」，用户据此改 mygitclient.json、以为重开就
+    // 生效，实际白名单纹丝不动。正面断言出路，而不是只排除某几个措辞。
     let text = generate_exclude(&strs(&["Code/"]), &strs(&[".cs"]));
     let header = text.lines().next().unwrap();
-    assert!(header.starts_with('#'), "{header}");
-    assert!(!header.contains("打开仓库"), "{header}");
+    assert_eq!(header, GENERATED_HEADER);
+    assert!(
+        header.starts_with('#'),
+        "必须是注释行，否则会被当成规则：{header}"
+    );
+    assert!(header.contains("重新初始化"), "{header}");
+    assert!(!header.contains("覆盖"), "不能承诺会被自动覆盖：{header}");
 }
 
 #[test]

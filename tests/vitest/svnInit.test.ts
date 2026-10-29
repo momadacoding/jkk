@@ -113,6 +113,13 @@ describe('扩展名输入的解析', () => {
     expect(parseExtensions('.cs .lua\t.java\n.m')).toEqual(['.cs', '.lua', '.java', '.m'])
   })
 
+  it('全角句点当成 `.`，零宽字符去掉', () => {
+    // 中文输入法下 `.cs、.lua` 会打成 `。cs、。lua`；补点逻辑会把它变成 `.。cs`，
+    // 以点开头、不含分隔符，照样静默匹配不到任何文件（独立 review）
+    expect(parseExtensions('。cs、．lua')).toEqual(['.cs', '.lua'])
+    expect(parseExtensions('.cs​,﻿.lua')).toEqual(['.cs', '.lua'])
+  })
+
   it('混合分隔符与连续分隔符不产生空条目', () => {
     expect(parseExtensions('cs、 lua,,；java  ')).toEqual(['.cs', '.lua', '.java'])
   })
