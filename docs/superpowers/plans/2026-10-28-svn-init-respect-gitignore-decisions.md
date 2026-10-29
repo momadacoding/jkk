@@ -341,3 +341,15 @@ review 由独立的 review agent 完成，10 条。逐条先核实再处理：
 - 验证：`cargo fmt --check` / `clippy --all-targets` 无告警，`cargo test` 全部套件通过；`pnpm build` 通过，
   `pnpm test` 54 文件 / 809 条全绿。真实窗口未重跑：第 1 条的改动在后端扫描、没有 IPC 变化，fixture 用例
   走的是同一条 `init_preflight` / `init_hybrid_with` 路径；第 5 条由组件用例覆盖。
+
+### 合并 master（2026-10-30，用户放行合并、提交与推送）
+
+- master 新增 PR #93（扩展名支持中文分隔符，`validate_new_extensions`）。照本分支一贯做法用 `git merge origin/master`，
+  不 rebase：已推送的历史不动，不需要 force push。
+- 冲突 2 个，都是两边各加各的：
+  - `src-tauri/tests/svn_config.rs`：`use` 列表两边各加一个名字，取并集（`validate_new_extensions` + `DisabledGitignore`）。
+  - `tests/vitest/SvnInitWizard.test.tsx`（add/add，两边都新建了这个文件）：保留 master 的文件头注释，import 取并集，
+    两组 `describe` 都留；两边都有叫 `mount` 的辅助函数、签名不同，master 的改名为 `mountForExtPreview`。
+- 自动合并的 9 个文件里核对过一处：master 在 `build_config` 里加的 `validate_new_extensions` 仍在 `git init` 之前
+  （`init_hybrid_with` 先调 `build_config`），第 2 步预检也走它，两处接受范围一致。
+- 验证：`pnpm build` 通过，`pnpm test` 54 文件 / 816 条全绿；Rust 侧见合并提交说明。
