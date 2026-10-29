@@ -556,10 +556,10 @@ fn a_users_own_exclude_is_backed_up_before_we_take_over() {
 }
 
 #[test]
-fn the_generated_header_says_changes_need_a_reinit() {
+fn the_generated_header_says_config_edits_do_not_regenerate_it() {
     // exclude 只在建库时写一次，改配置文件、重建基线都不会让它重新生成。旧文件头
     // 说「改动会在下次打开仓库时被覆盖」，用户据此改 mygitclient.json、以为重开就
-    // 生效，实际白名单纹丝不动。正面断言出路，而不是只排除某几个措辞。
+    // 生效，实际白名单纹丝不动。正面断言它说出了这件事，而不是只排除某几个措辞。
     let text = generate_exclude(&strs(&["Code/"]), &strs(&[".cs"]));
     let header = text.lines().next().unwrap();
     assert_eq!(header, GENERATED_HEADER);
@@ -567,8 +567,15 @@ fn the_generated_header_says_changes_need_a_reinit() {
         header.starts_with('#'),
         "必须是注释行，否则会被当成规则：{header}"
     );
-    assert!(header.contains("重新初始化"), "{header}");
+    assert!(
+        header.contains("mygitclient.json")
+            && header.contains("不会")
+            && header.contains("重新生成"),
+        "必须说明改配置不会让规则重新生成：{header}"
+    );
     assert!(!header.contains("覆盖"), "不能承诺会被自动覆盖：{header}");
+    // 应用里没有重新初始化的入口，不能把人引过去（第二轮独立 review）
+    assert!(!header.contains("重新初始化"), "{header}");
 }
 
 #[test]

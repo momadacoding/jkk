@@ -157,6 +157,12 @@ const LISTED_EXTENSIONS: &[&str] = &[
     ".．cs",
     ".c[s]",
     ".cs]",
+    ".cs\u{FF64}.lua",
+    ".cs\u{FF61}",
+    // 句末打的 `。` 被前端换成 `.` 之后的形态（第二轮独立 review）
+    ".lua.",
+    ".",
+    "..",
 ];
 
 #[test]
