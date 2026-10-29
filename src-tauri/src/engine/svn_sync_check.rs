@@ -13,7 +13,8 @@ use crate::engine::svn_baseline::{git_dir, TempIndex};
 use crate::engine::svn_cli::run_svn;
 use crate::engine::svn_config::{read_config, BASELINE_BRANCH};
 use crate::engine::svn_externals::detect_pinned;
-use crate::engine::svn_include_check::{is_w_file, normalize_roots, verify_include_set};
+use crate::engine::svn_include_check::verify_include_set;
+use crate::engine::svn_scope::WScope;
 use crate::engine::svn_sync::{check_sync, SyncVerdict};
 use crate::engine::svn_xml::parse_update_status;
 use crate::engine::{svn_journal, svn_lock};
@@ -66,6 +67,7 @@ pub(crate) fn check_sync_in(repo_root: &str) -> Result<SyncInPreview> {
         ));
     }
     let cfg = read_config(repo_root)?;
+    let scope = WScope::for_repo(repo_root, &cfg)?;
 
     check_git_idle(repo_root, "sync_in_git_busy", "更新")?; // 第 1 条
     let orig_branch = attached_branch(repo_root)?; // 第 3 条
@@ -109,7 +111,7 @@ pub(crate) fn check_sync_in(repo_root: &str) -> Result<SyncInPreview> {
     // 第 6 条后半：当前磁盘的纳入集合预检（§6.3.1）。放在 update 之前，是为了
     // 让「工作树里一个 `.gitignore` 挡住了 W-file」这种问题在动手前暴露——
     // 否则要到 S7 才炸，那时 svn update 已经做完，用户卡在 svn/base 上。
-    precheck_include_set(repo_root, &cfg.whitelist, &cfg.extensions)?;
+    precheck_include_set(repo_root, &scope)?;
 
     // 第 4、5 条：走网络，放最后
     let xml = run_svn(repo_root, &["status", "-u", "--xml"]).map_err(|e| {
@@ -122,7 +124,8 @@ pub(crate) fn check_sync_in(repo_root: &str) -> Result<SyncInPreview> {
         )
     })?;
     let st = parse_update_status(&xml)?;
-    let roots = normalize_roots(&cfg.whitelist);
+    // 整批判一次：「尊重 .gitignore」时每次判定都是一次 git 子进程
+    let w_files = scope.filter(st.entries.iter().map(|e| e.path.as_str()))?;
     // 被 git 删掉的目录不是「你改过、更新会覆盖的文件」：`git rm` 删掉目录里最后一个文件时 git
     // 顺手删掉空目录，svn 把目录报成 missing；同事往里加文件时目录本身带 incoming，没有扩展名就被
     // 当成被排除的文件列进确认框（2026-10-16 fixture 实测）。跳过的条件比交付侧
@@ -142,7 +145,7 @@ pub(crate) fn check_sync_in(repo_root: &str) -> Result<SyncInPreview> {
     for e in &st.entries {
         // 只从叶子往上标：被删的子目录自己也是「丢掉的非 W 条目」，从它标会把嵌套目录全拦下
         let leaf = !parents.contains(e.path.as_str());
-        if leaf && e.item == "missing" && !is_w_file(&e.path, &roots, &cfg.extensions) {
+        if leaf && e.item == "missing" && !w_files.contains(&e.path) {
             let mut p = e.path.as_str();
             while let Some((up, _)) = p.rsplit_once('/') {
                 lost_non_w.insert(up);
@@ -157,7 +160,7 @@ pub(crate) fn check_sync_in(repo_root: &str) -> Result<SyncInPreview> {
             conflicted.push(e.path.clone());
             continue;
         }
-        if is_w_file(&e.path, &roots, &cfg.extensions) {
+        if w_files.contains(&e.path) {
             continue; // git 管着，S1 会压进 stash
         }
         let path = e.path.as_str();
@@ -325,15 +328,13 @@ pub(crate) fn unmerged_paths(repo_root: &str) -> Result<Vec<String>> {
 }
 
 /// 当前磁盘上的纳入集合预检：期望集合（遍历磁盘）与 `git add -A` 实际收进来的相等。
-pub(crate) fn precheck_include_set(
-    repo_root: &str,
-    whitelist: &[String],
-    extensions: &[String],
-) -> Result<()> {
+pub(crate) fn precheck_include_set(repo_root: &str, scope: &WScope) -> Result<()> {
     let idx = TempIndex::empty(repo_root)?;
-    idx.add_all(repo_root, whitelist)?;
+    idx.add_all(repo_root, scope.whitelist())?;
+    // 与录制同一口径：已在基线里、被后来的 .gitignore 挡住的文件补回来（设计 §4）
+    idx.add_paths(repo_root, &scope.hidden_tracked_on_disk()?)?;
     // 空的 fixes：这里比的就是「磁盘现在的样子」，不是服务器的
-    verify_include_set(repo_root, &idx, whitelist, extensions, &BTreeMap::new())
+    verify_include_set(repo_root, &idx, scope, &BTreeMap::new())
 }
 
 /// 路径清单给人看：最多 20 条，多了说还有几条。`svn_sync_in` 也用它。

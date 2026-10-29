@@ -33,9 +33,9 @@ import { changesSection, type FileSection, type FileSelection } from '@/engine/f
 import type { DriverReport } from '@/engine/mergeDrivers'
 import type {
   Health,
+  InitPreflight,
   InitReport,
   PinnedExternal,
-  Preflight,
   RebuildReport,
 } from '../engine/svnInit'
 import { samePath } from '../engine/path'
@@ -250,18 +250,35 @@ async function readCapabilities(path: string): Promise<Capabilities> {
 // 转换后不变，但别因此以为这层不存在。
 // ---------------------------------------------------------------------------
 
-/** 只跑 P1–P4，什么都不创建。 */
-export function svnPreflightCheck(path: string, whitelist: string[]): Promise<Preflight> {
-  return invoke<Preflight>('svn_preflight_check', { path, whitelist })
+/** 向导第 2 步：P1–P4 加起作用的 `.gitignore`，什么都不创建。 */
+export function svnPreflightCheck(
+  path: string,
+  whitelist: string[],
+  extensions: string[],
+): Promise<InitPreflight> {
+  return invoke<InitPreflight>('svn_preflight_check', { path, whitelist, extensions })
 }
 
-/** 走完初始化向导。**会在工作副本里创建 `.git`**；任何一步失败后端会自己删干净。 */
+/**
+ * 走完初始化向导。**会在工作副本里创建 `.git`**；不尊重时还会把起作用的 `.gitignore`
+ * 改名停用。任何一步失败后端会自己删干净、改回原名。
+ *
+ * ⚠️ Rust 侧参数名是 `respect_gitignore`，这里必须写成 `respectGitignore`（AGENTS.md §7.3）。
+ */
 export function svnInitHybrid(
   path: string,
   whitelist: string[],
   extensions: string[],
+  respectGitignore: boolean,
+  acknowledged: string[],
 ): Promise<InitReport> {
-  return invoke<InitReport>('svn_init_hybrid', { path, whitelist, extensions })
+  return invoke<InitReport>('svn_init_hybrid', {
+    path,
+    whitelist,
+    extensions,
+    respectGitignore,
+    acknowledged,
+  })
 }
 
 /** 重建基线。**会移动基线指针**；不动 HEAD、不动索引、不动磁盘。 */

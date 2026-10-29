@@ -25,8 +25,9 @@
 use crate::engine::svn_cli::run_svn;
 use crate::engine::svn_config::{read_config, SvnConfig};
 use crate::engine::svn_dirty::{classify, read_dirty, Fix};
-use crate::engine::svn_include_check::{is_w_file, normalize_roots, server_expected_set};
+use crate::engine::svn_include_check::{normalize_roots, server_expected_set};
 use crate::engine::svn_preflight::check_targets;
+use crate::engine::svn_scope::WScope;
 use crate::engine::svn_wc::{enumerate_wcs, WcIdentity};
 use crate::engine::svn_xml::parse_list;
 use crate::error::Result;
@@ -92,8 +93,8 @@ pub fn audit_server_set_at_baseline(repo_root: &str) -> Result<ServerAudit> {
 /// 那就是用修 NB-2 的代码重新造一个 NB-2。
 pub fn audit_server_set(repo_root: &str, rev: u64) -> Result<ServerAudit> {
     let cfg = read_config(repo_root)?;
-    let roots = normalize_roots(&cfg.whitelist);
-    if roots.is_empty() {
+    let scope = WScope::for_repo(repo_root, &cfg)?;
+    if scope.roots().is_empty() {
         return Ok(ServerAudit::NotChecked {
             reason: "白名单是空的，没有核对范围。".to_string(),
         });
@@ -154,13 +155,13 @@ pub fn audit_server_set(repo_root: &str, rev: u64) -> Result<ServerAudit> {
             } else {
                 format!("{}/{}", unit.wc_root.trim_end_matches('/'), entry.name)
             };
-            // 与 git 侧**同一套**判据过滤：服务器上的美术资产本来就不该进 git，
-            // 不过滤的话每个真实工程一打开就报几千条。
-            if is_w_file(&rel, &roots, &cfg.extensions) {
-                server.insert(rel);
-            }
+            server.insert(rel);
         }
     }
+    // 与 git 侧**同一套**判据过滤：服务器上的美术资产本来就不该进 git，
+    // 不过滤的话每个真实工程一打开就报几千条。「尊重 .gitignore」时被它排除的
+    // 同样不算——那些文件用户明确选了不交给 git。
+    let server = scope.filter(server.iter().map(String::as_str))?;
 
     // 比的是**服务器该有的那个集合**，不是磁盘上现有的（spec §6.3.1）。
     //
@@ -177,7 +178,7 @@ pub fn audit_server_set(repo_root: &str, rev: u64) -> Result<ServerAudit> {
     // 误报的代价不止是噪音：它会让用户学会忽略这条提示，而这条提示要抓的那类
     // 缺陷（磁盘上压根看不见的漏收）是四道检查全绿时唯一的信号。
     let expected = match dirty_fixes(repo_root, &cfg, &units) {
-        Ok(fixes) => server_expected_set(repo_root, &cfg.whitelist, &cfg.extensions, &fixes)?,
+        Ok(fixes) => server_expected_set(repo_root, &scope, &fixes)?,
         // 读不到脏清单（比如白名单里有 obstructed）时**不猜**。这条检查是锦上添花，
         // 退回 `NotChecked` 比拿一个可能误报的集合去指控用户强。
         Err(e) => {

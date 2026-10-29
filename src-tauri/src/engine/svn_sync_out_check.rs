@@ -7,10 +7,11 @@ use crate::engine::svn_cli::run_svn;
 use crate::engine::svn_config::{read_config, SvnConfig, BASELINE_BRANCH};
 use crate::engine::svn_deliver::{plan_deliver, LocalOnlyCommit};
 use crate::engine::svn_externals::detect_pinned;
-use crate::engine::svn_include_check::{is_w_file, normalize_roots};
+use crate::engine::svn_include_check::normalize_roots;
 use crate::engine::svn_journal;
 use crate::engine::svn_lock;
 use crate::engine::svn_preflight::svn_targets;
+use crate::engine::svn_scope::WScope;
 use crate::engine::svn_sync::{check_sync, SyncVerdict};
 use crate::engine::svn_sync_check::{
     check_git_idle, current_branch, list_paths, precheck_include_set, rev_parse, unfinished_error,
@@ -112,7 +113,7 @@ pub(crate) fn check_sync_out(repo: &str) -> Result<SyncOutPreview> {
         return Err(nothing_to_deliver(plan.local_only.len()));
     }
 
-    precheck_include_set(repo, &cfg.whitelist, &cfg.extensions)?; // 第 8 条
+    precheck_include_set(repo, &WScope::for_repo(repo, &cfg)?)?; // 第 8 条
 
     let outside_changes = outside_changes(repo, &cfg)?; // 第 2 条后半
 
@@ -268,10 +269,10 @@ pub(crate) fn changed_files(
             ),
         ));
     }
-    let roots = normalize_roots(&cfg.whitelist);
+    let w_files = WScope::for_repo(repo, cfg)?.filter(changes.iter().map(|c| c.path.as_str()))?;
     let outside: Vec<String> = changes
         .iter()
-        .filter(|c| !is_w_file(&c.path, &roots, &cfg.extensions))
+        .filter(|c| !w_files.contains(&c.path))
         .map(|c| c.path.clone())
         .collect();
     if !outside.is_empty() {
@@ -290,13 +291,13 @@ pub(crate) fn changed_files(
 
 /// 白名单目录里 git 管不到、有本地修改的文件（W-path 减 W-file，§6.3.2）。有 svn 冲突态就拒绝。
 fn outside_changes(repo: &str, cfg: &SvnConfig) -> Result<Vec<String>> {
-    let roots = normalize_roots(&cfg.whitelist);
     let mut local = Vec::new();
     // 只因为「不见了」才算改动的条目；其中是别的条目祖先的就是被删掉的目录
     let mut only_missing = std::collections::HashSet::new();
     // 所有条目的祖先路径
     let mut parents = std::collections::HashSet::new();
     let mut conflicted = Vec::new();
+    let mut entries = Vec::new();
     for t in svn_targets(repo, &cfg.whitelist)? {
         let xml = run_svn(
             repo,
@@ -309,27 +310,30 @@ fn outside_changes(repo: &str, cfg: &SvnConfig) -> Result<Vec<String>> {
                 &peg_safe(&t),
             ],
         )?;
-        for e in parse_update_status(&xml)?.entries {
-            let mut p = e.path.as_str();
-            while let Some((up, _)) = p.rsplit_once('/') {
-                parents.insert(up.to_string());
-                p = up;
+        entries.extend(parse_update_status(&xml)?.entries);
+    }
+    // 整批判一次：「尊重 .gitignore」时每次判定都是一次 git 子进程
+    let w_files = WScope::for_repo(repo, cfg)?.filter(entries.iter().map(|e| e.path.as_str()))?;
+    for e in entries {
+        let mut p = e.path.as_str();
+        while let Some((up, _)) = p.rsplit_once('/') {
+            parents.insert(up.to_string());
+            p = up;
+        }
+        if e.is_conflicted() {
+            conflicted.push(e.path.clone());
+            continue;
+        }
+        if w_files.contains(&e.path) {
+            continue; // git 管着，上面的 git_dirty 已经要求它干净
+        }
+        let changed =
+            matches!(e.item.as_str(), "modified" | "missing" | "replaced") || e.props == "modified";
+        if changed {
+            if e.item == "missing" && e.props != "modified" {
+                only_missing.insert(e.path.clone());
             }
-            if e.is_conflicted() {
-                conflicted.push(e.path.clone());
-                continue;
-            }
-            if is_w_file(&e.path, &roots, &cfg.extensions) {
-                continue; // git 管着，上面的 git_dirty 已经要求它干净
-            }
-            let changed = matches!(e.item.as_str(), "modified" | "missing" | "replaced")
-                || e.props == "modified";
-            if changed {
-                if e.item == "missing" && e.props != "modified" {
-                    only_missing.insert(e.path.clone());
-                }
-                local.push(e.path.clone());
-            }
+            local.push(e.path.clone());
         }
     }
     // 被删掉的目录不是「你改过的文件」：`git rm` 删掉目录里最后一个文件时 git 顺手删掉空目录，

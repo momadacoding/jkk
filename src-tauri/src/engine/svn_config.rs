@@ -16,7 +16,14 @@ use std::path::{Path, PathBuf};
 pub const BASELINE_BRANCH: &str = "svn/base";
 
 /// 本客户端认识的配置格式版本。
-pub const SUPPORTED_VERSION: u32 = 1;
+pub const SUPPORTED_VERSIONS: [u32; 2] = [1, RESPECT_GITIGNORE_VERSION];
+
+/// 选了「尊重已有的 .gitignore」的仓库写这个版本。
+///
+/// 「尊重」改变了 W-file 的定义。只认版本 1 的旧客户端打开这种仓库时必须**明确拒绝**，
+/// 不能静默按「不尊重」口径工作——那会把正常仓库报成一堆看不懂的漏收
+/// （2026-10-28 spec §4）。没选「尊重」的仓库仍写 1，新旧客户端都能打开。
+pub const RESPECT_GITIGNORE_VERSION: u32 = 2;
 
 /// `mode` 的唯一合法值。§6.1 的仓库识别据它判定这是不是一个混合仓库。
 pub const SVN_GIT_MODE: &str = "svn-git";
@@ -36,6 +43,23 @@ pub struct SvnConfig {
     pub extensions: Vec<String>,
     #[serde(default = "default_baseline_branch")]
     pub baseline_branch: String,
+    /// 建库时用户勾了「尊重已有的 .gitignore 规则」：被工作树里的 `.gitignore`
+    /// 排除的文件不算 W-file（已在基线里的除外）。判定集中在 `engine::svn_scope`。
+    ///
+    /// 缺省 false，且为 false 时不写进文件——已经建好的仓库行为与文件内容都不变。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub respect_gitignore: bool,
+    /// 建库时被改名停用的 `.gitignore`。只做记录，供以后排查；不进任何命令行。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_gitignores: Vec<DisabledGitignore>,
+}
+
+/// 一次改名停用：原路径 → 新路径，都是仓库相对路径、正斜杠。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisabledGitignore {
+    pub from: String,
+    pub to: String,
 }
 
 fn default_version() -> u32 {
@@ -108,12 +132,23 @@ pub fn validate(cfg: &SvnConfig) -> Result<()> {
     // 这里与 `engine::custom_config` 的做法**有意不同**——那边的 `version` 明确
     // 写了「解析时不校验其值」，因为它最坏的后果是一个工具栏按钮不对；而这里
     // 一个版本语义差异会直接改变白名单的含义，进而改变哪些文件受保护。
-    if cfg.version != SUPPORTED_VERSION {
+    if !SUPPORTED_VERSIONS.contains(&cfg.version) {
         return Err(GitError::new(
             "svn_config",
             format!(
-                "不支持的 version：{}（本客户端只认 {SUPPORTED_VERSION}）。\
+                "不支持的 version：{}（本客户端只认 {SUPPORTED_VERSIONS:?}）。\
                  请确认这个配置文件是不是给更新版本的客户端写的",
+                cfg.version
+            ),
+        ));
+    }
+    // 反过来不要求：version 2 而不尊重，语义与 1 相同，放行无害。
+    if cfg.respect_gitignore && cfg.version != RESPECT_GITIGNORE_VERSION {
+        return Err(GitError::new(
+            "svn_config",
+            format!(
+                "respectGitignore 为 true 时 version 必须是 {RESPECT_GITIGNORE_VERSION}，实际是 {}。\
+                 否则只认版本 1 的旧客户端会按「不尊重」的口径打开这个仓库",
                 cfg.version
             ),
         ));

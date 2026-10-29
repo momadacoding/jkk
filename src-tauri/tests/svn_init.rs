@@ -14,7 +14,8 @@ use app_lib::engine::svn_baseline::parse_trailer;
 use app_lib::engine::svn_cli::run_svn;
 use app_lib::engine::svn_health::Health;
 use app_lib::engine::svn_init::{
-    check_current_baseline, eol_status, init_hybrid, migrate_eol, rebuild_baseline, InitRequest,
+    check_current_baseline, eol_status, init_hybrid, init_hybrid_with, migrate_eol,
+    rebuild_baseline, GitignoreChoice, InitRequest,
 };
 use app_lib::engine::svn_lock;
 use app_lib::engine::svn_xml::parse_info;
@@ -196,28 +197,78 @@ fn a_failure_after_git_init_rolls_the_whole_thing_back() {
     let fx = svn_repo();
     std::fs::write(fx.wc().join(".gitignore"), "*.cs\n").unwrap();
 
-    let err = init_hybrid(&req(&fx)).expect_err("纳入集合核对必须拦住");
-    assert_eq!(err.code, "include_set_mismatch");
+    // 2026-10-28 起这一类先被「检查起作用的 .gitignore」阶段拦下（用户没在第 3 步确认过它）。
+    // 那一步同样在 `git init` 之后，走的是同一条回退路径。
+    let err = init_hybrid(&req(&fx)).expect_err("必须拦住");
+    assert_eq!(err.code, "svn_gitignore_unconfirmed");
     assert!(!fx.wc().join(".git").exists(), "刚建的 .git 没删干净");
     assert!(fx.wc().join("Code/A.cs").exists(), "工作目录文件被删了");
     assert!(fx.wc().join(".svn").is_dir(), ".svn 被动了");
 }
 
+fn choice(respect: bool, acknowledged: &[&str]) -> GitignoreChoice {
+    GitignoreChoice {
+        respect,
+        acknowledged: acknowledged.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+fn baseline_tree(fx: &SvnFixture) -> String {
+    run_git(
+        &fx.wc_str(),
+        &["ls-tree", "-r", "--name-only", "refs/heads/svn/base"],
+    )
+    .unwrap()
+}
+
+/// `Code/Plugin` 是一个没有提交的嵌套 git 仓库：`git add -A` 会直接失败，
+/// 预检要在那之前把它点名（PR #90）。
+fn add_uncommitted_nested_repo(fx: &SvnFixture) {
+    let nested = fx.wc().join("Code/Plugin");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("P.cs"), "x").unwrap();
+    let ok = Command::new("git")
+        .current_dir(&nested)
+        .args(["init", "-q"])
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+}
+
 #[test]
-fn a_gitignore_is_caught_by_the_precheck_before_anything_is_recorded() {
-    // 2026-10-27：真实 Unity 工程上这一类不一致要等 `git add` 跑完（约半小时）才报。
-    // 预检在 `git add` 之前就要拦住它；看得出是哪一道拦的，用户才知道没白等。
+fn an_unacknowledged_gitignore_sends_the_user_back_before_anything_is_recorded() {
+    // 2026-10-28 设计 §3：起作用的 .gitignore 必须在第 3 步给用户看过。没看过的
+    // （第 2 步之后才出现的，或者调用方根本没给）一律拦下、回到第 3 步。
     let fx = svn_repo();
     std::fs::write(fx.wc().join(".gitignore"), "*.cs\n").unwrap();
 
     let err = init_hybrid(&req(&fx)).expect_err("必须拦住");
-    assert_eq!(err.code, "include_set_mismatch");
-    assert!(err.message.contains("预检"), "实际：{}", err.message);
+    assert_eq!(err.code, "svn_gitignore_unconfirmed");
+    let full = format!("{}\\.gitignore", fx.wc_str().replace('/', "\\"));
     assert!(
-        err.message.contains("被 .gitignore:1:*.cs 挡掉"),
-        "实际：{}",
+        err.message.contains(&full),
+        "要点名完整路径：{}",
         err.message
     );
+    assert!(!fx.wc().join(".git").exists(), "刚建的 .git 没删干净");
+    assert!(fx.wc().join(".gitignore").is_file(), "没确认过的文件不能动");
+    assert!(
+        !err.message.contains("git add"),
+        "不该走到 git add：{}",
+        err.message
+    );
+}
+
+#[test]
+fn a_nested_repo_is_still_caught_by_the_precheck() {
+    // 预检原来靠「.gitignore 挡住 W-file」覆盖，那一类现在先被上面那道拦下；
+    // 预检本身仍要在 `git add` 之前抓住别的不一致。
+    let fx = svn_repo();
+    add_uncommitted_nested_repo(&fx);
+    let err = init_hybrid(&req(&fx)).expect_err("必须拦住");
+    assert_eq!(err.code, "include_set_mismatch", "{}", err.message);
+    assert!(err.message.contains("预检"), "实际：{}", err.message);
     assert!(!fx.wc().join(".git").exists(), "刚建的 .git 没删干净");
 }
 
@@ -226,23 +277,21 @@ fn the_precheck_does_not_block_what_the_final_check_accepts_on_a_dirty_working_c
     // review 指出（2026-10-28）：预检若只按磁盘口径比，会挡住最终核对放行的仓库。
     // 两种形态都是「被 .gitignore 挡住的 svn 脏文件」：
     //   - `?` 的 New.cs：服务器上没有，最终核对按 Drop 把它从期望集合里剔掉；
-    //   - `M` 的 A.cs：服务器上有，录制时 replace_blob 强行把它放进候选索引。
-    // 两者在最终核对里都对得上，预检必须同样放行。
+    //   - `M` 的 A.cs：服务器上有。
+    // 「尊重」模式下 A.cs 被 .gitignore 排除、不归 git 管，预检与最终核对同样放行。
     let fx = svn_repo();
     let wc = fx.wc();
     std::fs::write(wc.join("Code/New.cs"), "class N {}").unwrap();
     std::fs::write(wc.join("Code/A.cs"), "a changed\n").unwrap();
     std::fs::write(wc.join(".gitignore"), "New.cs\nA.cs\n").unwrap();
 
-    let report = init_hybrid(&req(&fx)).unwrap_or_else(|e| panic!("误报阻断：{}", e.message));
-    let tree = run_git(
-        &fx.wc_str(),
-        &["ls-tree", "-r", "--name-only", "refs/heads/svn/base"],
-    )
-    .unwrap();
+    let report = init_hybrid_with(&req(&fx), &choice(true, &[".gitignore"]))
+        .unwrap_or_else(|e| panic!("误报阻断：{}", e.message));
+    let tree = baseline_tree(&fx);
+    assert!(tree.contains("Code/B.cs"), "{tree}");
     assert!(
-        tree.contains("Code/A.cs"),
-        "服务器上有的必须在基线里：{tree}"
+        !tree.contains("Code/A.cs"),
+        "尊重时被挡住的不进基线：{tree}"
     );
     assert!(
         !tree.contains("Code/New.cs"),
@@ -252,11 +301,260 @@ fn the_precheck_does_not_block_what_the_final_check_accepts_on_a_dirty_working_c
 }
 
 #[test]
+fn respect_init_succeeds_and_leaves_hidden_files_out_of_git() {
+    let fx = svn_repo();
+    let wc = fx.wc();
+    std::fs::write(wc.join("Code/Gen.cs"), "g\n").unwrap();
+    svn(&wc, &["add", "Code/Gen.cs", "--non-interactive"]);
+    svn(&wc, &["commit", "-m", "gen", "--non-interactive"]);
+    svn(&wc, &["update", "--non-interactive"]);
+    std::fs::write(wc.join(".gitignore"), "Gen.cs\n").unwrap();
+
+    let report = init_hybrid_with(&req(&fx), &choice(true, &[".gitignore"])).unwrap();
+    let tree = baseline_tree(&fx);
+    assert!(!tree.contains("Code/Gen.cs"), "{tree}");
+    assert!(tree.contains("Code/A.cs"), "{tree}");
+    let raw = std::fs::read_to_string(wc.join(".git/mygitclient.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(json["version"], 2);
+    assert_eq!(json["respectGitignore"], true);
+    assert!(report.gitignore.respected);
+    assert_eq!(report.gitignore.conflicts.len(), 1);
+    assert_eq!(report.gitignore.conflicts[0].path, ".gitignore");
+    assert!(report.gitignore.disabled.is_empty());
+    assert!(wc.join(".gitignore").is_file(), "尊重时不动任何文件");
+
+    // 之后的体检与重建按同一口径，不误报
+    let h = check_current_baseline(&fx.wc_str()).unwrap();
+    assert!(matches!(h, Health::Verified { .. }), "实际 {h:?}");
+    rebuild_baseline(&fx.wc_str()).unwrap();
+}
+
+#[test]
+fn respect_init_blocks_a_negation_that_admits_unselected_files() {
+    // 「尊重」只做减法：`!` 把用户没选的文件拉进 git 照样拦下（用户 2026-10-28 确认）
+    let fx = svn_repo();
+    std::fs::write(fx.wc().join("Code/n.txt"), "n\n").unwrap();
+    std::fs::write(fx.wc().join("Code/.gitignore"), "!*.txt\n").unwrap();
+
+    let err =
+        init_hybrid_with(&req(&fx), &choice(true, &["Code/.gitignore"])).expect_err("必须拦住");
+    assert_eq!(err.code, "svn_gitignore_includes", "{}", err.message);
+    assert!(err.message.contains("第 1 行 `!*.txt`"), "{}", err.message);
+    assert!(err.message.contains("Code/n.txt"), "{}", err.message);
+    assert!(!fx.wc().join(".git").exists(), "刚建的 .git 没删干净");
+}
+
+fn config_json(fx: &SvnFixture) -> serde_json::Value {
+    let raw = std::fs::read_to_string(fx.wc().join(".git/mygitclient.json")).unwrap();
+    serde_json::from_str(&raw).unwrap()
+}
+
+#[test]
+fn default_init_disables_an_acknowledged_unversioned_gitignore() {
+    // 不勾 = 白名单与扩展名说了算，起作用的 .gitignore 改名停用（用户 2026-10-28 确认）
+    let fx = svn_repo();
+    let wc = fx.wc();
+    std::fs::write(wc.join(".gitignore"), "*.cs\n").unwrap();
+
+    let report = init_hybrid_with(&req(&fx), &choice(false, &[".gitignore"])).unwrap();
+    let tree = baseline_tree(&fx);
+    assert!(tree.contains("Code/A.cs"), "{tree}");
+    assert!(!wc.join(".gitignore").exists(), "应当被改名");
+    assert_eq!(
+        std::fs::read_to_string(wc.join(".gitignore.jkk-disabled")).unwrap(),
+        "*.cs\n"
+    );
+    let json = config_json(&fx);
+    assert_eq!(json["version"], 1, "不尊重的仓库新旧客户端都能打开");
+    assert_eq!(
+        json["disabledGitignores"],
+        serde_json::json!([{ "from": ".gitignore", "to": ".gitignore.jkk-disabled" }])
+    );
+    assert!(!report.gitignore.respected);
+    let wc_win = fx.wc_str().replace('/', "\\");
+    assert_eq!(report.gitignore.disabled.len(), 1);
+    assert_eq!(
+        report.gitignore.disabled[0].from,
+        format!("{wc_win}\\.gitignore")
+    );
+    assert_eq!(
+        report.gitignore.disabled[0].to,
+        format!("{wc_win}\\.gitignore.jkk-disabled")
+    );
+    assert!(report.timings.iter().any(|t| t.phase.contains("改名")));
+}
+
+#[test]
+fn the_renamed_gitignore_never_enters_the_baseline() {
+    // 2026-10-29 真实窗口验证发现：扩展名 `*` 时 `.gitignore.jkk-disabled` 本身是 W-file，
+    // 而 svn 脏清单是改名**之前**读的，里面只有旧名——新名被当成「服务器上有」录进了基线。
+    // 基线里多一个服务器上没有的文件，就是一个撒谎的基线（svn diff 看不见未版本控制文件，
+    // 体检拦不住）。
+    let fx = svn_repo();
+    let wc = fx.wc();
+    std::fs::write(wc.join("Code/a.exe"), "x").unwrap();
+    svn(&wc, &["add", "Code/a.exe", "--non-interactive"]);
+    svn(&wc, &["commit", "-m", "exe", "--non-interactive"]);
+    svn(&wc, &["update", "--non-interactive"]);
+    std::fs::write(wc.join("Code/.gitignore"), "*.exe\n").unwrap();
+
+    let all = InitRequest {
+        repo_root: fx.wc_str(),
+        whitelist: vec!["Code/".to_string()],
+        extensions: vec!["*".to_string()],
+    };
+    init_hybrid_with(&all, &choice(false, &["Code/.gitignore"])).unwrap();
+    let tree = baseline_tree(&fx);
+    assert!(tree.contains("Code/a.exe"), "{tree}");
+    assert!(
+        !tree.contains(".gitignore"),
+        "未版本控制的文件不能进基线：{tree}"
+    );
+    // 改名后的文件仍是一个未跟踪的本地文件，git status 里看得到它
+    let st = run_git(&fx.wc_str(), &["status", "--porcelain"]).unwrap();
+    assert!(st.contains("?? Code/.gitignore.jkk-disabled"), "{st}");
+}
+
+#[test]
+fn default_init_disables_a_gitignore_whose_negation_admits_unselected_files() {
+    // spec §7「`!` 多收在两种模式下」的不尊重那一半：改名之后多收自然消失
+    let fx = svn_repo();
+    std::fs::write(fx.wc().join("Code/n.txt"), "n\n").unwrap();
+    std::fs::write(fx.wc().join("Code/.gitignore"), "!*.txt\n").unwrap();
+
+    init_hybrid_with(&req(&fx), &choice(false, &["Code/.gitignore"])).unwrap();
+    let tree = baseline_tree(&fx);
+    assert!(!tree.contains("Code/n.txt"), "{tree}");
+    assert!(fx.wc().join("Code/.gitignore.jkk-disabled").is_file());
+}
+
+#[test]
+fn default_init_refuses_to_rename_a_versioned_gitignore() {
+    // 受 SVN 版本控制的 .gitignore 是团队的规则：改名会变成一个要交付的 SVN 改动
+    let fx = svn_repo();
+    let wc = fx.wc();
+    std::fs::write(wc.join(".gitignore"), "*.cs\n").unwrap();
+    svn(&wc, &["add", ".gitignore", "--non-interactive"]);
+    svn(&wc, &["commit", "-m", "team rules", "--non-interactive"]);
+    svn(&wc, &["update", "--non-interactive"]);
+
+    let err = init_hybrid_with(&req(&fx), &choice(false, &[".gitignore"])).expect_err("必须拦住");
+    assert_eq!(err.code, "svn_gitignore_versioned", "{}", err.message);
+    assert!(err.message.contains("尊重"), "{}", err.message);
+    assert_eq!(
+        std::fs::read_to_string(wc.join(".gitignore")).unwrap(),
+        "*.cs\n",
+        "什么都不能改"
+    );
+    assert!(!wc.join(".gitignore.jkk-disabled").exists());
+    assert!(!wc.join(".git").exists(), "刚建的 .git 没删干净");
+}
+
+#[test]
+fn a_failed_init_puts_the_renamed_gitignore_back() {
+    // 反目标第 4 条：建库失败回退后，改了名的 .gitignore 必须改回来。
+    // 改名之后再让预检失败（没有提交的嵌套 git 仓库）。
+    let fx = svn_repo();
+    let wc = fx.wc();
+    std::fs::write(wc.join(".gitignore"), "*.cs\n").unwrap();
+    add_uncommitted_nested_repo(&fx);
+
+    let err = init_hybrid_with(&req(&fx), &choice(false, &[".gitignore"])).expect_err("必须失败");
+    assert_eq!(err.code, "include_set_mismatch", "{}", err.message);
+    // 前提：确实改过名、是在改名之后失败的——否则这条测的只是「没改过」
+    assert!(
+        err.message.contains("改名") && err.message.contains("纳入集合预检"),
+        "{}",
+        err.message
+    );
+    assert_eq!(
+        std::fs::read_to_string(wc.join(".gitignore")).unwrap(),
+        "*.cs\n"
+    );
+    assert!(!wc.join(".gitignore.jkk-disabled").exists());
+    assert!(!wc.join(".git").exists(), "刚建的 .git 没删干净");
+}
+
+#[test]
+fn a_gitignore_that_becomes_active_after_renaming_sends_the_user_back() {
+    // git 不进入已被忽略的目录：外层的 `Sub/` 改名之后，内层的 .gitignore 才开始起作用。
+    // 用户在第 3 步没见过它，必须全部改回、送回第 3 步重新确认（设计 §5）。
+    let fx = svn_repo();
+    let wc = fx.wc();
+    std::fs::create_dir_all(wc.join("Code/Sub")).unwrap();
+    std::fs::write(wc.join("Code/Sub/X.cs"), "x\n").unwrap();
+    svn(&wc, &["add", "Code/Sub", "--non-interactive"]);
+    svn(&wc, &["commit", "-m", "sub", "--non-interactive"]);
+    svn(&wc, &["update", "--non-interactive"]);
+    std::fs::write(wc.join("Code/.gitignore"), "Sub/\n").unwrap();
+    std::fs::write(wc.join("Code/Sub/.gitignore"), "*.cs\n").unwrap();
+
+    let err = init_hybrid_with(&req(&fx), &choice(false, &["Code/.gitignore"]))
+        .expect_err("必须送回第 3 步");
+    assert_eq!(err.code, "svn_gitignore_unconfirmed", "{}", err.message);
+    let inner = format!("{}\\Code\\Sub\\.gitignore", fx.wc_str().replace('/', "\\"));
+    assert!(err.message.contains(&inner), "{}", err.message);
+    assert_eq!(
+        std::fs::read_to_string(wc.join("Code/.gitignore")).unwrap(),
+        "Sub/\n",
+        "已改的名必须全部改回"
+    );
+    assert!(!wc.join("Code/.gitignore.jkk-disabled").exists());
+    assert!(!wc.join(".git").exists(), "刚建的 .git 没删干净");
+}
+
+#[test]
+fn acknowledging_the_hidden_gitignore_too_disables_both() {
+    // 第 2 步把藏在外层后面的那个也列出来了（`a_gitignore_hidden_behind_another_is_listed_too`），
+    // 用户两个都确认过：建库按轮改名，外层改完、内层冒出来、它在确认清单里，接着改。
+    let fx = svn_repo();
+    let wc = fx.wc();
+    std::fs::create_dir_all(wc.join("Code/Sub")).unwrap();
+    std::fs::write(wc.join("Code/Sub/X.cs"), "x\n").unwrap();
+    svn(&wc, &["add", "Code/Sub", "--non-interactive"]);
+    svn(&wc, &["commit", "-m", "sub", "--non-interactive"]);
+    svn(&wc, &["update", "--non-interactive"]);
+    std::fs::write(wc.join("Code/.gitignore"), "Sub/\n").unwrap();
+    std::fs::write(wc.join("Code/Sub/.gitignore"), "*.cs\n").unwrap();
+
+    let report = init_hybrid_with(
+        &req(&fx),
+        &choice(false, &["Code/.gitignore", "Code/Sub/.gitignore"]),
+    )
+    .unwrap_or_else(|e| panic!("{}", e.message));
+    let tree = baseline_tree(&fx);
+    assert!(tree.contains("Code/Sub/X.cs"), "{tree}");
+    assert!(wc.join("Code/.gitignore.jkk-disabled").is_file());
+    assert!(wc.join("Code/Sub/.gitignore.jkk-disabled").is_file());
+    assert_eq!(report.gitignore.disabled.len(), 2);
+    assert_eq!(report.gitignore.conflicts.len(), 2);
+    let json = config_json(&fx);
+    assert_eq!(json["disabledGitignores"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn the_gitignore_phase_shows_up_in_timings() {
+    let fx = svn_repo();
+    let report = init_hybrid(&req(&fx)).unwrap();
+    assert!(
+        report
+            .timings
+            .iter()
+            .any(|t| t.phase == "检查起作用的 .gitignore（git check-ignore）"),
+        "{:?}",
+        report.timings
+    );
+    assert!(!report.gitignore.respected);
+    assert!(report.gitignore.conflicts.is_empty());
+}
+
+#[test]
 fn a_failed_init_reports_how_long_each_phase_took() {
     // 用户在公司装机版上复现，而 Rust 日志插件只在 debug 构建启用——
     // 耗时只有放进错误正文，用户才看得到。
     let fx = svn_repo();
-    std::fs::write(fx.wc().join(".gitignore"), "*.cs\n").unwrap();
+    add_uncommitted_nested_repo(&fx);
 
     let msg = init_hybrid(&req(&fx)).expect_err("必须拦住").message;
     let tail = msg

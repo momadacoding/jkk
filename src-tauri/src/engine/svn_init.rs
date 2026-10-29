@@ -16,16 +16,22 @@ use crate::engine::svn_baseline::{
 };
 use crate::engine::svn_cli::run_svn;
 use crate::engine::svn_config::{
-    normalize_whitelist_entry, write_config, SvnConfig, BASELINE_BRANCH, SVN_GIT_MODE,
+    normalize_whitelist_entry, write_config, DisabledGitignore, SvnConfig, BASELINE_BRANCH,
+    RESPECT_GITIGNORE_VERSION, SVN_GIT_MODE,
 };
 use crate::engine::svn_dirty::{classify, explained_paths, read_dirty, Fix};
 use crate::engine::svn_exclude::{generate_exclude, write_exclude};
 use crate::engine::svn_externals::{detect_pinned, PinnedExternal};
+use crate::engine::svn_gitignore::{
+    detect_conflicts, detect_with_renames, disable_gitignore, display_path, restore_gitignores,
+    scan_tree, GitCtx, GitignoreConflict, ProbeGitDir, RuleEffect, MAX_RENAME_ROUNDS,
+};
 use crate::engine::svn_health::{check_baseline, ExplainedOrigin, Health};
-use crate::engine::svn_include_check::{dry_run_include_set, normalize_roots, verify_include_set};
+use crate::engine::svn_include_check::{dry_run_include_set, verify_include_set};
 use crate::engine::svn_preflight::{check_targets, read_node_rev, run_preflight, Preflight};
 use crate::engine::svn_pristine::{cat_base, BaseContent};
-use crate::engine::svn_xml::parse_info;
+use crate::engine::svn_scope::WScope;
+use crate::engine::svn_xml::{parse_info, StatusEntry};
 use crate::error::{GitError, Result};
 use crate::vcs::{detect_repo_kind, RepoKind};
 use std::collections::BTreeSet;
@@ -37,6 +43,38 @@ pub struct InitRequest {
     pub repo_root: String,
     pub whitelist: Vec<String>,
     pub extensions: Vec<String>,
+}
+
+/// 用户在向导第 3 步对起作用的 `.gitignore` 做的选择（2026-10-28 设计 §3）。
+///
+/// 缺省 = 不尊重、一个都没看过：只要查到起作用的 `.gitignore` 就拦下送回第 3 步，
+/// 不会在用户没看过的情况下改任何文件。
+#[derive(Debug, Clone, Default)]
+pub struct GitignoreChoice {
+    /// 勾了「尊重已有的 .gitignore 规则」。
+    pub respect: bool,
+    /// 第 3 步展示过的 `.gitignore`（[`GitignoreConflict::path`]）。
+    pub acknowledged: Vec<String>,
+}
+
+/// 建库对 `.gitignore` 做了什么，完成页据此说明（设计 §3「完成页」）。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitignoreOutcome {
+    /// 按「尊重」口径建的库。
+    pub respected: bool,
+    /// 建库时查到的起作用的 `.gitignore`。
+    pub conflicts: Vec<GitignoreConflict>,
+    /// 被改名停用的（不尊重时）。
+    pub disabled: Vec<RenamedGitignore>,
+}
+
+/// 一次改名停用，**完整的 Windows 形态路径**，给完成页显示。配置里记的是相对路径。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenamedGitignore {
+    pub from: String,
+    pub to: String,
 }
 
 /// 初始化的结果。**`health` 与 `pinned` 都不是失败**，是要在 UI 上如实显示的状态。
@@ -55,6 +93,8 @@ pub struct InitReport {
     pub pinned: Vec<PinnedExternal>,
     /// 各阶段耗时，按执行顺序。失败时同样的内容附在错误正文末尾。
     pub timings: Vec<PhaseTiming>,
+    /// 对起作用的 `.gitignore` 做了什么。
+    pub gitignore: GitignoreOutcome,
 }
 
 /// 一个阶段花了多久。
@@ -237,8 +277,9 @@ mod tests {
 /// ```text
 /// P1–P5                      ← P1–P4 硬门槛，P5 命中只切 pinned 模式
 /// git init -b svn/base       ← 显式指定，不吃 init.defaultBranch 的默认值
-/// 写入 .git/mygitclient.json
 /// 生成 .git/info/exclude
+/// 检查起作用的 .gitignore     ← 没给用户看过的、尊重时 `!` 多收的，拦下（2026-10-28 设计 §3）
+/// 写入 .git/mygitclient.json
 /// 纳入集合预检               ← git add 之前只读地问「将会收什么」，不一致即失败
 /// 纳入集合核对（§6.3.1）      ← 临时索引，期望集合 vs ls-files，得到 TREE
 /// 用该 TREE 录首个基线        ← rev 取自 P2 的 N；无父提交
@@ -247,6 +288,11 @@ mod tests {
 /// git checkout -b work       ← 立刻离开基线分支
 /// ```
 pub fn init_hybrid(req: &InitRequest) -> Result<InitReport> {
+    init_hybrid_with(req, &GitignoreChoice::default())
+}
+
+/// 同 [`init_hybrid`]，带上用户在第 3 步对起作用的 `.gitignore` 做的选择。
+pub fn init_hybrid_with(req: &InitRequest, choice: &GitignoreChoice) -> Result<InitReport> {
     let root = req.repo_root.as_str();
 
     // ⚠️ 这里是全项目唯一一处会 `remove_dir_all` 的代码，所以**自己再判一次**，
@@ -278,7 +324,7 @@ pub fn init_hybrid(req: &InitRequest) -> Result<InitReport> {
     }
 
     let mut clock = PhaseClock::new("建库");
-    match init_phases(req, root, &mut clock) {
+    match init_phases(req, choice, root, &mut clock) {
         Ok(mut report) => {
             report.timings = clock.phases;
             Ok(report)
@@ -289,7 +335,12 @@ pub fn init_hybrid(req: &InitRequest) -> Result<InitReport> {
 
 /// [`init_hybrid`] 判完目录类型之后的全部步骤。抽出来是为了让耗时在**任何**
 /// `?` 早退时都能附到错误上，不必在每个返回点各补一次。
-fn init_phases(req: &InitRequest, root: &str, clock: &mut PhaseClock) -> Result<InitReport> {
+fn init_phases(
+    req: &InitRequest,
+    choice: &GitignoreChoice,
+    root: &str,
+    clock: &mut PhaseClock,
+) -> Result<InitReport> {
     // 工作副本根的 URL 在一次运行里不会变，取一次传下去
     // （配置要写它，体检要拿它当基准）。
     //
@@ -297,10 +348,16 @@ fn init_phases(req: &InitRequest, root: &str, clock: &mut PhaseClock) -> Result<
     // 一个阶段都还没计时，`annotate` 就原样返回错误——否则一条「白名单写错了」
     // 后面会跟一张耗时表，还把失败标在 svn info 上（第二轮 review）。
     let svn_url = working_copy_url(root)?;
-    let cfg = build_config(req, &svn_url)?;
+    let mut cfg = build_config(&req.repo_root, &req.whitelist, &req.extensions, &svn_url)?;
+    if choice.respect {
+        // 选了「尊重」写版本 2：只认版本 1 的旧客户端会明确拒绝，而不是按「不尊重」
+        // 的口径静默工作（设计 §4）
+        cfg.respect_gitignore = true;
+        cfg.version = RESPECT_GITIGNORE_VERSION;
+    }
 
     // ---- 前置校验：全部在创建 .git **之前**，失败时无需回退 ----
-    let pre = clock.run("前置校验 P1–P4（svn status）", || {
+    let mut pre = clock.run("前置校验 P1–P4（svn status）", || {
         run_preflight(root, &cfg.whitelist)
     })?;
     // P5，命中不阻断
@@ -312,25 +369,51 @@ fn init_phases(req: &InitRequest, root: &str, clock: &mut PhaseClock) -> Result<
     clock.run("占有 .git", || claim_git_dir(root))?;
 
     // ---- 从这里开始，失败必须删掉本次创建的 .git ----
-    match build_repo(root, &cfg, &pre, &svn_url, clock) {
-        Ok((baseline, health)) => Ok(InitReport {
+    // 改过名的 `.gitignore` 记在这里而不是 build_repo 里：失败时要靠它逐个改回来
+    // （反目标第 4 条），而 build_repo 的 `Err` 带不出它。
+    let mut renamed: Vec<DisabledGitignore> = Vec::new();
+    match build_repo(
+        root,
+        &mut cfg,
+        choice,
+        &mut pre,
+        &svn_url,
+        clock,
+        &mut renamed,
+    ) {
+        Ok((baseline, health, gitignore)) => Ok(InitReport {
             node_rev: pre.node_rev,
             baseline,
             health,
             pinned,
             timings: Vec::new(),
+            gitignore,
         }),
-        Err(e) => {
+        Err(mut e) => {
             // 失败若不在任何计时阶段里，先把标记落在这里——放到回退之后再补，
             // 表上看起来就像是回退之后才出的错。
             clock.settle_failure();
             // 回退要删掉的 .git 里可能已经有 `git add` 写进去的几 GB 对象，
             // 这一步本身就可能很慢，必须算进耗时。它总是「成功」的（rollback
             // 自己吞掉删除失败），不会抢走前面那个失败阶段的标记。
+            let mut failures = Vec::new();
             let _ = clock.run("回退（删除刚建的 .git）", || {
+                // 两步互不依赖：改回失败照样删 .git，失败的那几个在下面点名
+                failures = restore_gitignores(root, &renamed);
                 rollback(root);
                 Ok(())
             });
+            // 改回失败不能静默（设计 §5）：点名，让用户手工处理
+            if !failures.is_empty() {
+                e.message.push_str(&format!(
+                    "\n\n下面这些 .gitignore 没能改回原名，请手工处理：\n{}",
+                    failures
+                        .iter()
+                        .map(|f| format!("  {f}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ));
+            }
             Err(e)
         }
     }
@@ -396,13 +479,18 @@ fn record_server_tree_timed(
     idx: &TempIndex,
     clock: &mut PhaseClock,
 ) -> Result<(String, BTreeSet<String>)> {
+    let scope = WScope::for_repo(repo_root, cfg)?;
     let fixes = classify(&pre.dirty)?;
     // `S` 先算出来，再拿它驱动改写——**同一个集合**既决定动哪些路径，也交给体检。
     // 分两份算的话，两份迟早会不一致，而「体检那份更大」这个方向会悄悄削弱判据。
-    let touched = explained_paths(&fixes, &cfg.whitelist, &cfg.extensions);
+    let touched = explained_paths(&fixes, &scope)?;
 
     clock.run("录入磁盘内容（git add）", || {
-        idx.add_all(repo_root, &cfg.whitelist)
+        idx.add_all(repo_root, &cfg.whitelist)?;
+        // 「尊重 .gitignore」时，已在基线里、被后来的 .gitignore 挡住的文件 `add -A`
+        // 收不到（从空索引起步时）。git 的语义是已跟踪文件不受 .gitignore 影响，
+        // 不补回来基线会悄悄变小（设计 §4）。从 HEAD 起步时它们本来就在，再加一次无害。
+        idx.add_paths(repo_root, &scope.hidden_tracked_on_disk()?)
     })?;
 
     clock.run("把本地改动换回服务器内容（svn cat）", || {
@@ -412,7 +500,7 @@ fn record_server_tree_timed(
     // R2c：核对与录制**共用同一份候选索引**（spec §6.3.1），核对完之后在同一个
     // `idx` 上 `write_tree`——不得核对一次后又重新 add 另录一棵树。
     clock.run("纳入集合核对（git ls-files）", || {
-        verify_include_set(repo_root, idx, &cfg.whitelist, &cfg.extensions, &fixes)
+        verify_include_set(repo_root, idx, &scope, &fixes)
     })?;
     let tree = clock.run("写树（git write-tree）", || idx.write_tree(repo_root))?;
     Ok((tree, touched))
@@ -520,9 +608,10 @@ fn dry_run_before_add(
     clock: &mut PhaseClock,
 ) -> Result<()> {
     clock.run("纳入集合预检（git ls-files）", || {
+        let scope = WScope::for_repo(root, cfg)?;
         let fixes = classify(&pre.dirty)?;
-        let touched = explained_paths(&fixes, &cfg.whitelist, &cfg.extensions);
-        dry_run_include_set(root, &cfg.whitelist, &cfg.extensions, &fixes, &touched)
+        let touched = explained_paths(&fixes, &scope)?;
+        dry_run_include_set(root, &scope, &fixes, &touched)
     })
 }
 
@@ -530,16 +619,18 @@ fn dry_run_before_add(
 /// 中间任何一步 `?` 早退都走同一条 `Err` 分支，不会漏掉某条路径忘了回退。
 fn build_repo(
     root: &str,
-    cfg: &SvnConfig,
-    pre: &Preflight,
+    cfg: &mut SvnConfig,
+    choice: &GitignoreChoice,
+    pre: &mut Preflight,
     svn_url: &str,
     clock: &mut PhaseClock,
-) -> Result<(String, Health)> {
+    renamed: &mut Vec<DisabledGitignore>,
+) -> Result<(String, Health, GitignoreOutcome)> {
     clock.run("建仓库、写规则（git init）", || {
         // `-b svn/base` 必须显式给：不给的话吃 `init.defaultBranch`，用户配成什么
         // 都有可能，而后面每一处都按 `svn/base` 这个名字找基线。
         run_git(root, &["init", "-b", BASELINE_BRANCH])?;
-        write_config(root, cfg)?;
+        // 配置**不在这里写**：「尊重 / 改名」的结果要等下一阶段才定（设计 §4、§5）。
         write_exclude(root, &generate_exclude(&cfg.whitelist, &cfg.extensions))?;
         // **必须在 `record_server_tree` 之前。** 这条规则决定 `git add` 与
         // `hash-object --path` 读磁盘时跑不跑行尾过滤器，也就决定了第一个基线里
@@ -549,6 +640,90 @@ fn build_repo(
         write_attributes(root)?;
         Ok(())
     })?;
+
+    // 起作用的 `.gitignore`（设计 §3）。在刚建的真仓库里查——exclude 已经写好，裁决与之后
+    // 录制时完全一致。第 2 步用探针查过一次，但那之后磁盘可能变了，这里以此刻为准。
+    let mut conflicts = clock.run(
+        "检查起作用的 .gitignore（git check-ignore）",
+        || {
+            let fixes = classify(&pre.dirty)?;
+            let scan = scan_tree(root, &cfg.whitelist)?;
+            let conflicts = detect_conflicts(
+                &GitCtx::Repo(root),
+                root,
+                &scan,
+                &cfg.whitelist,
+                &cfg.extensions,
+                &fixes,
+            )?;
+            check_gitignore_choice(&conflicts, choice)?;
+            Ok(conflicts)
+        },
+    )?;
+    // 不尊重：把起作用的 `.gitignore` 改名停用（设计 §5）。在回退区里、`git add` 之前；
+    // 失败时由 init_phases 按 `renamed` 逐个改回。
+    //
+    // **按轮进行。** git 不进入已被忽略的目录，外层改名之后内层的 `.gitignore` 才开始
+    // 起作用。每改完一轮立刻按同一口径重查：冒出来的若在用户确认过的清单里（第 2 步
+    // 模拟停用时已经列出来了），接着改；不在的，全部改回、送回第 3 步。
+    if !choice.respect && !conflicts.is_empty() {
+        clock.run("停用起作用的 .gitignore（改名）", || {
+            let mut round = conflicts.clone();
+            for _ in 0..MAX_RENAME_ROUNDS {
+                disable_round(root, &round, pre, renamed)?;
+                let fixes = classify(&pre.dirty)?;
+                let scan = scan_tree(root, &cfg.whitelist)?;
+                let again = detect_conflicts(
+                    &GitCtx::Repo(root),
+                    root,
+                    &scan,
+                    &cfg.whitelist,
+                    &cfg.extensions,
+                    &fixes,
+                )?;
+                if again.is_empty() {
+                    return Ok(());
+                }
+                let unseen: Vec<&GitignoreConflict> = again
+                    .iter()
+                    .filter(|c| !choice.acknowledged.contains(&c.path))
+                    .collect();
+                if !unseen.is_empty() {
+                    return Err(unconfirmed_error(&unseen));
+                }
+                round = again
+                    .into_iter()
+                    .map(|mut c| {
+                        c.active_after_rename = true;
+                        c
+                    })
+                    .collect();
+                conflicts.extend(round.iter().cloned());
+            }
+            Err(GitError::new(
+                "svn_gitignore_rename",
+                format!(
+                    "改名停用了 {MAX_RENAME_ROUNDS} 轮还在冒出新的起作用的 .gitignore，\
+                     目录结构不正常，停下来了。请先手工处理这些 .gitignore。"
+                ),
+            ))
+        })?;
+        // 记进配置，便于以后排查——完成页只显示一次（设计 §5）
+        cfg.disabled_gitignores = renamed.clone();
+    }
+    let outcome = GitignoreOutcome {
+        respected: choice.respect,
+        conflicts,
+        disabled: renamed
+            .iter()
+            .map(|r| RenamedGitignore {
+                from: display_path(root, &r.from),
+                to: display_path(root, &r.to),
+            })
+            .collect(),
+    };
+
+    clock.run("写配置", || write_config(root, cfg))?;
 
     // 规则写好之后、`git add` 之前
     dry_run_before_add(root, cfg, pre, clock)?;
@@ -589,8 +764,7 @@ fn build_repo(
             root,
             svn_url,
             pre.node_rev,
-            &cfg.whitelist,
-            &cfg.extensions,
+            &WScope::for_repo(root, cfg)?,
             &explained,
             // 刚刚由 R2b 从 `svn cat -r BASE` 写进去的，而 P2 保证 `BASE == node_rev`
             // ——这批路径由构造保证正确，不必报成「未覆盖」。
@@ -621,7 +795,108 @@ fn build_repo(
     clock.run("切到工作分支（git checkout）", || {
         run_git(root, &["checkout", "-b", WORK_BRANCH])
     })?;
-    Ok((baseline, health))
+    Ok((baseline, health, outcome))
+}
+
+/// 第 3 步的选择与此刻查到的冲突对得上吗（设计 §3「点建库之后」那张表）。
+///
+/// - 有用户**没看过**的 → 拦下，回到第 3 步重新确认。用户永远不会遇到
+///   「没看过就被改了名」的文件，也不会遇到「没看过就按它少收了文件」（反目标第 1 条）。
+/// - 尊重且有 `!` 多收 → 拦下并点名那一行：「尊重」只做减法。
+fn check_gitignore_choice(conflicts: &[GitignoreConflict], choice: &GitignoreChoice) -> Result<()> {
+    let unseen: Vec<&GitignoreConflict> = conflicts
+        .iter()
+        .filter(|c| !choice.acknowledged.contains(&c.path))
+        .collect();
+    if !unseen.is_empty() {
+        return Err(unconfirmed_error(&unseen));
+    }
+    if choice.respect {
+        let mut lines = Vec::new();
+        for c in conflicts {
+            for r in c.rules.iter().filter(|r| r.effect == RuleEffect::Includes) {
+                lines.push(format!(
+                    "{} 第 {} 行 `{}` 会把你没选的文件拉进 git（{} 个，例如 {}）",
+                    c.full_path,
+                    r.line,
+                    r.pattern,
+                    r.count,
+                    r.samples.join("、")
+                ));
+            }
+        }
+        if !lines.is_empty() {
+            return Err(GitError::new(
+                "svn_gitignore_includes",
+                format!(
+                    "{}\n「尊重」只允许 .gitignore 少收文件、不允许多收。\
+                     请取消勾选，或先修改这一行。",
+                    lines.join("\n")
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 改名停用一轮：受版本控制的一个都不改、直接拦下；其余逐个改名，并把新名字以「未版本
+/// 控制」补进脏清单。
+fn disable_round(
+    root: &str,
+    round: &[GitignoreConflict],
+    pre: &mut Preflight,
+    renamed: &mut Vec<DisabledGitignore>,
+) -> Result<()> {
+    let versioned: Vec<String> = round
+        .iter()
+        .filter(|c| c.versioned)
+        .map(|c| format!("  {}", c.full_path))
+        .collect();
+    if !versioned.is_empty() {
+        return Err(GitError::new(
+            "svn_gitignore_versioned",
+            format!(
+                "下面的 .gitignore 受 SVN 版本控制，是团队提交的规则，本应用不会改它：\n{}\n\
+                 请勾选「尊重已有的 .gitignore 规则」，或先和团队确认。什么都没改。",
+                versioned.join("\n")
+            ),
+        ));
+    }
+    for c in round {
+        let to = disable_gitignore(root, &c.path)?;
+        // 新名字是一个**未版本控制**的文件（受控的上面已经拦下了），而 svn 脏清单
+        // 是改名之前读的、里面没有它。扩展名为 `*` 时它是 W-file，不补进清单就会
+        // 被当成「服务器上有」录进基线——基线里多一个服务器上没有的文件，而
+        // `svn diff` 看不见未版本控制文件，体检拦不住（2026-10-29 真实窗口验证发现）。
+        // 补成 `?`，录制、预检与体检都从这同一份清单算修正。
+        pre.dirty.push(StatusEntry {
+            path: to.clone(),
+            item: "unversioned".to_string(),
+            props: "none".to_string(),
+            wc_locked: false,
+        });
+        renamed.push(DisabledGitignore {
+            from: c.path.clone(),
+            to,
+        });
+    }
+    Ok(())
+}
+
+/// 「有你没看过的 `.gitignore`」——第 2 步之后才出现的，或改名之后才开始起作用的。
+fn unconfirmed_error(unseen: &[&GitignoreConflict]) -> GitError {
+    let list: Vec<String> = unseen
+        .iter()
+        .map(|c| format!("  {}", c.full_path))
+        .collect();
+    GitError::new(
+        "svn_gitignore_unconfirmed",
+        format!(
+            "发现了你在上一步没看到的 .gitignore：\n{}\n\
+             什么都没改，刚建的 .git 已删除。请看一下新的清单，重新确认后再建库。",
+            list.join("\n")
+        ),
+    )
 }
 
 /// 行尾规则的安装状态（spec §7.3.0）。
@@ -1085,8 +1360,7 @@ pub fn rebuild_baseline(repo_root: &str) -> Result<RebuildReport> {
         repo_root,
         &svn_url,
         pre.node_rev,
-        &cfg.whitelist,
-        &cfg.extensions,
+        &WScope::for_repo(repo_root, &cfg)?,
         &explained,
         // 刚刚由 R2b 从 `svn cat -r BASE` 写进去的，而 P2 保证 `BASE == node_rev`
         // ——这批路径由构造保证正确，不必报成「未覆盖」。
@@ -1235,16 +1509,20 @@ pub fn check_current_baseline(repo_root: &str) -> Result<Health> {
     // ⚠️ **代价要说清楚：`S` 里的那些文件，这条检查什么也证明不了。** 它比的是
     // 磁盘与服务器，而那些路径上的磁盘内容本来就是用户改过的。工作副本干净时
     // `S = ∅`，覆盖面才是完整的（spec §6.8.7）。
+    let scope = WScope::for_repo(repo_root, &cfg)?;
     let wcs = crate::engine::svn_wc::enumerate_wcs(repo_root, &cfg.whitelist)?;
-    let targets = check_targets(&normalize_roots(&cfg.whitelist), &wcs);
+    let targets = check_targets(scope.roots(), &wcs);
     let fixes = classify(&read_dirty(repo_root, &targets)?)?;
-    let explained = explained_paths(&fixes, &cfg.whitelist, &cfg.extensions);
+    let explained = explained_paths(&fixes, &scope)?;
 
     // 基线树与磁盘树的差异里，**解释不了**的那些是独立的一份证据：它直接说明
     // 基线树本身就不对（老版本录错了、有人手工在 svn/base 上提交过），而拿磁盘
     // 去比服务器的那条路径看不见这种错误。
     let idx = TempIndex::empty(repo_root)?;
     idx.add_all(repo_root, &cfg.whitelist)?;
+    // 与录制同一口径：已在基线里、被后来的 .gitignore 挡住的文件补回来，
+    // 否则它们会被当成「基线树 ≠ 磁盘树」报成撒谎（设计 §4）
+    idx.add_paths(repo_root, &scope.hidden_tracked_on_disk()?)?;
     let disk_tree = idx.write_tree(repo_root)?;
     let tree_evidence: Vec<String> = run_git(
         repo_root,
@@ -1267,8 +1545,7 @@ pub fn check_current_baseline(repo_root: &str) -> Result<Health> {
         repo_root,
         &cfg.svn_url,
         trailer.rev,
-        &cfg.whitelist,
-        &cfg.extensions,
+        &scope,
         &explained,
         // 手动体检：基线是**什么时候、哪个版本**录的都不知道，这条检查覆盖不到
         // `S` 里那些路径，必须如实报出去（2026-09-21 独立 review）。
@@ -1348,9 +1625,17 @@ fn rollback(root: &str) {
 }
 
 /// 按请求组装并校验配置。规范化必须在校验之前（与 `read_config` 同序）。
-fn build_config(req: &InitRequest, svn_url: &str) -> Result<SvnConfig> {
-    let mut whitelist = Vec::with_capacity(req.whitelist.len());
-    for entry in &req.whitelist {
+///
+/// 第 2 步的 [`init_preflight`] 与建库共用它：两处对白名单 / 扩展名的接受范围必须一致，
+/// 否则第 2 步放行的输入会在点「建库」时才被拒。
+fn build_config(
+    repo_root: &str,
+    req_whitelist: &[String],
+    extensions: &[String],
+    svn_url: &str,
+) -> Result<SvnConfig> {
+    let mut whitelist = Vec::with_capacity(req_whitelist.len());
+    for entry in req_whitelist {
         whitelist.push(normalize_whitelist_entry(entry)?);
     }
     let cfg = SvnConfig {
@@ -1358,8 +1643,10 @@ fn build_config(req: &InitRequest, svn_url: &str) -> Result<SvnConfig> {
         mode: SVN_GIT_MODE.to_string(),
         svn_url: svn_url.to_string(),
         whitelist,
-        extensions: req.extensions.clone(),
+        extensions: extensions.to_vec(),
         baseline_branch: BASELINE_BRANCH.to_string(),
+        respect_gitignore: false,
+        disabled_gitignores: Vec::new(),
     };
     crate::engine::svn_config::validate(&cfg)?;
     // ⚠️ 这一条**不能省**。`SvnGitBackend::open` 每次打开混合仓库都会跑它，
@@ -1373,8 +1660,40 @@ fn build_config(req: &InitRequest, svn_url: &str) -> Result<SvnConfig> {
     //   向导那条分支只认 `svn_not_initialized`，用户在应用内**没有任何出路**。
     //
     // 放在 `git init` 之前，属于「失败无需回退」那一段。
-    crate::engine::svn_config::validate_whitelist_against_disk(&req.repo_root, &cfg.whitelist)?;
+    crate::engine::svn_config::validate_whitelist_against_disk(repo_root, &cfg.whitelist)?;
     Ok(cfg)
+}
+
+/// 建库向导第 2 步「检查工作副本」的结果：P1–P4 加上起作用的 `.gitignore`。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InitPreflight {
+    #[serde(flatten)]
+    pub preflight: Preflight,
+    /// 起作用的 `.gitignore`（2026-10-28 设计 §3）。空表示没有冲突，向导不显示勾选框。
+    pub gitignore_conflicts: Vec<GitignoreConflict>,
+}
+
+/// 第 2 步：P1–P4，再查起作用的 `.gitignore`。**什么都不创建**。
+///
+/// 这一步还没有 `.git`，检测借一个系统临时目录里的探针 git 目录完成（[`ProbeGitDir`]），
+/// 写进去的 exclude 与建库时生成的逐字相同——得到的裁决与建库后一致。
+pub fn init_preflight(
+    repo_root: &str,
+    whitelist: &[String],
+    extensions: &[String],
+) -> Result<InitPreflight> {
+    let svn_url = working_copy_url(repo_root)?;
+    let cfg = build_config(repo_root, whitelist, extensions, &svn_url)?;
+    let preflight = run_preflight(repo_root, &cfg.whitelist)?;
+    let fixes = classify(&preflight.dirty)?;
+    let probe = ProbeGitDir::create(repo_root, &cfg.whitelist, &cfg.extensions)?;
+    let gitignore_conflicts =
+        detect_with_renames(&probe, repo_root, &cfg.whitelist, &cfg.extensions, &fixes)?;
+    Ok(InitPreflight {
+        preflight,
+        gitignore_conflicts,
+    })
 }
 
 /// 工作副本**根**的 URL。

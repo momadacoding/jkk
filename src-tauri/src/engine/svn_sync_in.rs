@@ -25,11 +25,12 @@ use crate::engine::svn_baseline::{
 use crate::engine::svn_cli::{run_svn, run_svn_code};
 use crate::engine::svn_config::{read_config, SvnConfig, BASELINE_BRANCH};
 use crate::engine::svn_dirty::read_dirty;
-use crate::engine::svn_include_check::{is_w_file, normalize_roots};
+use crate::engine::svn_include_check::normalize_roots;
 use crate::engine::svn_init::{rebuild_baseline, record_server_tree_into};
 use crate::engine::svn_journal::{self, Flow, Journal, Phase};
 use crate::engine::svn_lock;
 use crate::engine::svn_preflight::{check_targets, read_node_rev, run_preflight};
+use crate::engine::svn_scope::WScope;
 use crate::engine::svn_sync_check::{
     assert_linear, check_sync_in, current_branch, list_paths, rev_parse, unfinished_error,
     unmerged_paths, SyncInPreview,
@@ -711,12 +712,14 @@ pub(crate) fn untracked_leftovers(
 /// S4：白名单内的 W-file 在 SVN 看来有没有修改。`?` / ignored 不算——它们不是
 /// 「base 文件被改了」，而是 SVN 不认识的文件。
 pub(crate) fn dirty_w_files(repo: &str, cfg: &SvnConfig) -> Result<Vec<String>> {
-    let roots = normalize_roots(&cfg.whitelist);
+    let scope = WScope::for_repo(repo, cfg)?;
     let wcs = enumerate_wcs(repo, &cfg.whitelist)?;
-    let targets = check_targets(&roots, &wcs);
-    Ok(read_dirty(repo, &targets)?
+    let targets = check_targets(scope.roots(), &wcs);
+    let entries = read_dirty(repo, &targets)?;
+    let w_files = scope.filter(entries.iter().map(|e| e.path.as_str()))?;
+    Ok(entries
         .into_iter()
-        .filter(|e| is_w_file(&e.path, &roots, &cfg.extensions))
+        .filter(|e| w_files.contains(&e.path))
         .filter(|e| {
             !matches!(
                 e.item.as_str(),

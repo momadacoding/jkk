@@ -15,6 +15,7 @@ mod svn_fixtures;
 use app_lib::engine::svn_dirty::{classify, explained_paths, read_dirty};
 use app_lib::engine::svn_health::{check_baseline, ExplainedOrigin, Health};
 use app_lib::engine::svn_init::{init_hybrid, InitRequest};
+use app_lib::engine::svn_scope::WScope;
 use std::collections::BTreeSet;
 use svn_fixtures::{file_url, svn_cmd, svn_repo_for_health, SvnFixture};
 
@@ -39,7 +40,7 @@ fn req(fx: &SvnFixture) -> InitRequest {
 fn explained_now(fx: &SvnFixture) -> BTreeSet<String> {
     let dirty = read_dirty(&fx.wc_str(), &wl()).unwrap();
     let fixes = classify(&dirty).unwrap();
-    explained_paths(&fixes, &wl(), &cs())
+    explained_paths(&fixes, &WScope::plain(&wl(), &cs())).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -69,8 +70,7 @@ fn local_modifications_are_explained_and_do_not_accuse_the_baseline() {
         &fx.wc_str(),
         &file_url(&fx.repo()),
         1,
-        &wl(),
-        &cs(),
+        &WScope::plain(&wl(), &cs()),
         &s,
         ExplainedOrigin::Unknown,
     )
@@ -115,8 +115,7 @@ fn a_baseline_claiming_a_revision_the_disk_never_reached_is_caught() {
         &fx.wc_str(),
         &url,
         2,
-        &wl(),
-        &cs(),
+        &WScope::plain(&wl(), &cs()),
         &s,
         ExplainedOrigin::Unknown,
     )
@@ -153,8 +152,7 @@ fn a_file_that_got_dirty_after_s_was_captured_still_blocks() {
         &fx.wc_str(),
         &file_url(&fx.repo()),
         1,
-        &wl(),
-        &cs(),
+        &WScope::plain(&wl(), &cs()),
         &stale_s,
         ExplainedOrigin::Unknown,
     )
@@ -181,8 +179,7 @@ fn the_criterion_degenerates_to_the_original_one_on_a_clean_working_copy() {
         &fx.wc_str(),
         &file_url(&fx.repo()),
         1,
-        &wl(),
-        &cs(),
+        &WScope::plain(&wl(), &cs()),
         &BTreeSet::new(),
         ExplainedOrigin::Unknown,
     )
@@ -208,8 +205,7 @@ fn a_dirty_file_outside_the_whitelist_extensions_never_enters_s() {
         &fx.wc_str(),
         &file_url(&fx.repo()),
         1,
-        &wl(),
-        &cs(),
+        &WScope::plain(&wl(), &cs()),
         &s,
         ExplainedOrigin::Unknown,
     )
@@ -251,8 +247,7 @@ fn a_manual_check_reports_exactly_which_paths_it_could_not_cover() {
         &fx.wc_str(),
         &file_url(&fx.repo()),
         1,
-        &wl(),
-        &cs(),
+        &WScope::plain(&wl(), &cs()),
         &s,
         // 手动体检：基线是谁、什么时候录的都不知道
         ExplainedOrigin::Unknown,
@@ -292,8 +287,7 @@ fn right_after_recording_there_is_nothing_to_disclose() {
         &fx.wc_str(),
         &file_url(&fx.repo()),
         1,
-        &wl(),
-        &cs(),
+        &WScope::plain(&wl(), &cs()),
         &s,
         ExplainedOrigin::JustRecorded,
     )
@@ -321,8 +315,7 @@ fn a_clean_working_copy_has_nothing_to_disclose_either() {
             &fx.wc_str(),
             &file_url(&fx.repo()),
             1,
-            &wl(),
-            &cs(),
+            &WScope::plain(&wl(), &cs()),
             &BTreeSet::new(),
             origin,
         )

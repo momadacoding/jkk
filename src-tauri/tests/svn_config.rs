@@ -4,7 +4,8 @@
 //! 每个字段都会被送进 git 或 svn 的命令行（spec §6.2.1）。
 
 use app_lib::engine::svn_config::{
-    normalize_whitelist_entry, read_config, validate, validate_whitelist_against_disk, SvnConfig,
+    normalize_whitelist_entry, read_config, validate, validate_whitelist_against_disk,
+    write_config, DisabledGitignore, SvnConfig,
 };
 use std::fs;
 use tempfile::TempDir;
@@ -17,12 +18,87 @@ fn ok_config() -> SvnConfig {
         whitelist: vec!["Assets/Scripts/".to_string()],
         extensions: vec![".cs".to_string()],
         baseline_branch: "svn/base".to_string(),
+        respect_gitignore: false,
+        disabled_gitignores: Vec::new(),
     }
 }
 
 #[test]
 fn a_well_formed_config_passes() {
     validate(&ok_config()).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 「尊重 .gitignore」与配置版本 2（2026-10-28 spec §4）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn version_2_is_accepted_only_with_respect() {
+    let mut cfg = ok_config();
+    cfg.version = 2;
+    cfg.respect_gitignore = true;
+    validate(&cfg).unwrap();
+
+    // 选了「尊重」却写着 1：旧版客户端会照单全收、按「不尊重」口径工作——正是版本 2 要防的
+    let mut cfg = ok_config();
+    cfg.respect_gitignore = true;
+    let err = validate(&cfg).expect_err("respect 必须配 version 2");
+    assert_eq!(err.code, "svn_config");
+    assert!(
+        err.message.contains("respectGitignore"),
+        "实际：{}",
+        err.message
+    );
+
+    let mut cfg = ok_config();
+    cfg.version = 3;
+    assert_eq!(validate(&cfg).expect_err("未知版本").code, "svn_config");
+}
+
+#[test]
+fn a_v1_config_round_trips_without_the_new_keys() {
+    // 没选「尊重」的仓库，新旧版本客户端都要能打开：写回去的文件不能多出新键
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_str().unwrap();
+    fs::create_dir_all(dir.path().join(".git")).unwrap();
+    fs::write(
+        dir.path().join(".git/mygitclient.json"),
+        r#"{"version":1,"mode":"svn-git","svnUrl":"https://s/x","whitelist":["Code/"],"extensions":[".cs"]}"#,
+    )
+    .unwrap();
+    let cfg = read_config(root).unwrap();
+    assert!(!cfg.respect_gitignore);
+    write_config(root, &cfg).unwrap();
+    let raw = fs::read_to_string(dir.path().join(".git/mygitclient.json")).unwrap();
+    assert!(!raw.contains("respectGitignore"), "实际：{raw}");
+    assert!(!raw.contains("disabledGitignores"), "实际：{raw}");
+}
+
+#[test]
+fn a_respect_config_is_written_as_version_2_with_its_rename_record() {
+    // 旧版客户端的 validate 是「version != 1 就拒」——文件里落的是 2，旧版就会明确报
+    // 「不支持的配置版本」，而不是静默按错误口径工作（spec §4）
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let mut cfg = ok_config();
+    cfg.version = 2;
+    cfg.respect_gitignore = true;
+    cfg.disabled_gitignores = vec![DisabledGitignore {
+        from: "Assets/.gitignore".to_string(),
+        to: "Assets/.gitignore.jkk-disabled".to_string(),
+    }];
+    write_config(root, &cfg).unwrap();
+    let raw = fs::read_to_string(dir.path().join(".git/mygitclient.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(json["version"], 2);
+    assert_eq!(json["respectGitignore"], true);
+    assert_eq!(json["disabledGitignores"][0]["from"], "Assets/.gitignore");
+    assert_eq!(
+        json["disabledGitignores"][0]["to"],
+        "Assets/.gitignore.jkk-disabled"
+    );
+    // 读回来校验得过（`ok_config` 的白名单在磁盘上不存在，不影响读配置）
+    assert_eq!(read_config(root).unwrap(), cfg);
 }
 
 #[test]
@@ -146,8 +222,9 @@ fn an_unknown_version_is_rejected() {
     // 与 baselineBranch 被钉死同一条理由：留一个不校验的字段，只会让「文件里
     // 写的」与「代码假设的」不一致。这里一个版本语义差异会直接改变白名单的
     // 含义，进而改变哪些文件受保护——比 custom_config 那个 version 严重得多。
+    // 2 已是「尊重 .gitignore」的合法版本（2026-10-28 spec §4），未知版本改用 3
     let mut cfg = ok_config();
-    cfg.version = 2;
+    cfg.version = 3;
     let err = validate(&cfg).expect_err("未知 version 必须被拒");
     assert_eq!(err.code, "svn_config");
     assert!(err.message.contains("version"));

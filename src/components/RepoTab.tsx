@@ -631,8 +631,10 @@ export function RepoTab({
           // 上面那个条件立刻为假、向导被卸载，完成页一帧都画不出来。
           // 等用户在完成页看完体检结果与 pinned 说明、点「关闭」再重开。
           onFinish={() => void openRepo(repoPath)}
-          onPreflight={(whitelist) => svnPreflightCheck(repoPath, whitelist)}
-          onInit={(whitelist, extensions) => svnInitHybrid(repoPath, whitelist, extensions)}
+          onPreflight={(whitelist, extensions) => svnPreflightCheck(repoPath, whitelist, extensions)}
+          onInit={(whitelist, extensions, respectGitignore, acknowledged) =>
+            svnInitHybrid(repoPath, whitelist, extensions, respectGitignore, acknowledged)
+          }
         />
       </div>
     )

@@ -21,7 +21,7 @@
 //! 错误（§6.8.1）。所以这里对没见过的 item **报错而不是跳过**。
 
 use crate::engine::svn_cli::run_svn;
-use crate::engine::svn_include_check::{is_w_file, normalize_roots};
+use crate::engine::svn_scope::WScope;
 use crate::engine::svn_wc::peg_safe;
 use crate::engine::svn_xml::{parse_status_entries, StatusEntry};
 use crate::error::{GitError, Result};
@@ -280,17 +280,10 @@ fn walk_expand(
 /// 抽成一个函数是因为**三个地方都要算它**：录制时（决定改写哪些路径）、录制后
 /// 的体检、以及用户手动点体检。三份各写一遍，迟早有一份会和另外两份不一致，
 /// 而不一致的方向若是「多算了」，判据就被削弱了且没有信号。
-pub fn explained_paths(
-    fixes: &BTreeMap<String, Fix>,
-    whitelist: &[String],
-    extensions: &[String],
-) -> BTreeSet<String> {
-    let roots = normalize_roots(whitelist);
-    fixes
-        .keys()
-        .filter(|p| is_w_file(p, &roots, extensions))
-        .cloned()
-        .collect()
+///
+/// 「尊重 .gitignore」时，被它排除的脏文件同样不在树里，不进 `S`（[`WScope`]）。
+pub fn explained_paths(fixes: &BTreeMap<String, Fix>, scope: &WScope) -> Result<BTreeSet<String>> {
+    scope.filter(fixes.keys().map(String::as_str))
 }
 
 /// 录基线时要对这个路径做什么。

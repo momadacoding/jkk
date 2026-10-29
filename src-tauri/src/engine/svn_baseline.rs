@@ -11,7 +11,9 @@
 //! 3. **trailer 三字段缺一不可**，解析失败即「这不是 baseline」（spec §6.4.1）
 //! 4. **`update-ref` 必须带旧 OID 作比较条件**
 
-use crate::engine::git_cli::{run_git, run_git_code, run_git_env, run_git_stdin};
+use crate::engine::git_cli::{
+    run_git, run_git_code, run_git_env, run_git_stdin, run_git_stdin_env,
+};
 use crate::engine::svn_config::BASELINE_BRANCH;
 use crate::error::{GitError, Result};
 use std::collections::BTreeSet;
@@ -114,6 +116,37 @@ impl TempIndex {
         let mut args: Vec<&str> = vec!["add", "-A", "--"];
         args.extend(paths.iter().map(String::as_str));
         self.git(repo_root, &args)?;
+        Ok(())
+    }
+
+    /// 把这些磁盘上的文件逐个放进候选索引，**不看忽略规则**。
+    ///
+    /// 只给「尊重 .gitignore」时补回「已在基线里、被后来的 `.gitignore` 挡住」的文件用
+    /// （`WScope::hidden_tracked_on_disk`）：`add -A` 收不到它们，而 git 的语义是已跟踪
+    /// 文件不受 `.gitignore` 影响，从空索引起步的入口必须把它们补回来。
+    ///
+    /// 用 `update-index --add -z --stdin`：它本来就不读忽略规则；路径逐条字面处理，
+    /// 没有 pathspec 魔法；走 stdin 不受命令行长度限制。内容按路径套用行尾过滤器，
+    /// 与 `git add` 得到的 blob 相同。
+    ///
+    /// 空列表是 no-op。调用方保证每条路径在磁盘上都是文件——不存在的路径
+    /// `update-index` 会直接报错。
+    pub fn add_paths(&self, repo_root: &str, paths: &[String]) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut input = Vec::new();
+        for p in paths {
+            input.extend_from_slice(normalize_entry_path(p)?.as_bytes());
+            input.push(0);
+        }
+        let idx = self.path.to_string_lossy().to_string();
+        run_git_stdin_env(
+            repo_root,
+            &["update-index", "--add", "-z", "--stdin"],
+            &input,
+            &[("GIT_INDEX_FILE", &idx)],
+        )?;
         Ok(())
     }
 
