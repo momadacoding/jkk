@@ -993,6 +993,49 @@ fn rebuild_refuses_only_when_a_node_is_obstructed() {
 }
 
 #[test]
+fn whenever_the_banner_says_mixed_revision_rebuild_is_refused() {
+    // 前端 `describeSync` 对 mixedRevision 不再给「重建基线」，依据就是这一条：
+    // 失同步判定与重建开头的 P2 查同一组 target，前者判成多值，后者必然拒绝。
+    // 哪天两边的 target 分了家，这条会红——那时按钮要不要回来得重新判断。
+    //
+    // 造法是用户 2026-10-28 真实撞上的形态：在 TortoiseSVN 里提交过、没 update
+    let fx = svn_repo_for_health();
+    init_hybrid(&req(&fx)).unwrap();
+    std::fs::write(fx.wc().join("Code/A.cs"), "v2\n").unwrap();
+    svn(
+        &fx.wc(),
+        &[
+            "commit",
+            "-m",
+            "r2",
+            "--non-interactive",
+            "--",
+            "Code/A.cs@",
+        ],
+    );
+
+    let status = app_lib::engine::svn_sync::check_sync(&fx.wc_str()).unwrap();
+    assert!(
+        matches!(
+            status.verdict,
+            app_lib::engine::svn_sync::SyncVerdict::MixedRevision { .. }
+        ),
+        "前提：横幅这时要判成 mixedRevision，实际 {:?}",
+        status.verdict
+    );
+
+    let base_before = run_git(&fx.wc_str(), &["rev-parse", "svn/base"]).unwrap();
+    let err = rebuild_baseline(&fx.wc_str()).expect_err("mixed-revision 上重建必须被拒");
+    assert_eq!(err.code, "svn_preflight_mixed_revision", "{}", err.message);
+    assert!(err.message.contains("r2  Code/A.cs"), "{}", err.message);
+    assert_eq!(
+        run_git(&fx.wc_str(), &["rev-parse", "svn/base"]).unwrap(),
+        base_before,
+        "被拒之后基线指针不许动"
+    );
+}
+
+#[test]
 fn rebuild_refuses_on_a_directory_that_was_never_initialized() {
     let fx = svn_repo();
     let err = rebuild_baseline(&fx.wc_str()).expect_err("没建过库就没有基线可重建");

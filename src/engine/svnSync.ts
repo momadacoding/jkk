@@ -93,15 +93,21 @@ export function describeSync(status: SyncStatus | null): BannerModel | null {
       return null
 
     case 'mixedRevision':
+      // 不给「重建基线」：失同步判定（svn_sync::node_revs）与重建开头的 P2 查的是
+      // 同一组 target，这里判成多值，重建就**一定**以 svn_preflight_mixed_revision
+      // 拒绝（2026-10-28 发现的死路）。唯一的出口是先在外部 update 对齐，之后判定
+      // 变成整体前进，「更新」接管（计划 A16）
       return {
         tone: 'danger',
         title: '工作副本处于多个 revision',
         detail:
           `白名单内的文件分别停在 r${v.revs.join('、r')} 上。` +
-          '这通常是外部提交或只更新了一部分目录造成的——' +
-          `基线记的是 r${status.baselineRev}，已经不能代表磁盘上的内容。`,
-        actions: [REBUILD, CHECK],
-        note: REBUILD_NOTE,
+          '多半是在 TortoiseSVN 里提交过、之后没有 update，或只更新了一部分目录——' +
+          `基线记的是 r${status.baselineRev}，已经不能代表磁盘上的内容。` +
+          '先在 TortoiseSVN 里对工程根目录跑一次 Update 把它对齐，' +
+          '之后这条横幅会换成下一步该做什么。',
+        actions: [CHECK],
+        note: '这种状态下「重建基线」和「更新」都会被拒：录不出一个标着单一 revision 的基线。',
       }
 
     case 'pinnedReset':

@@ -9,8 +9,8 @@ use app_lib::engine::svn_cli::run_svn;
 use app_lib::engine::svn_preflight::run_preflight;
 use app_lib::engine::svn_xml::parse_info;
 use svn_fixtures::{
-    svn_repo, svn_repo_dirty, svn_repo_mixed_revision, svn_repo_obstructed,
-    svn_repo_root_rev_behind, svn_repo_with_cross_repo_nested_external,
+    svn_repo, svn_repo_committed_without_update, svn_repo_dirty, svn_repo_mixed_revision,
+    svn_repo_obstructed, svn_repo_root_rev_behind, svn_repo_with_cross_repo_nested_external,
     svn_repo_with_same_repo_nested_external, svn_repo_with_svn_ignored_cs,
     svn_repo_with_svn_ignored_non_code_file, DirtyKind, NestedExternal,
 };
@@ -161,6 +161,37 @@ fn p2_rejects_a_real_mixed_revision_working_copy() {
     assert_eq!(err.code, "svn_preflight_mixed_revision");
     // 错误信息里要带上到底是哪几个 revision，否则用户不知道该更新什么
     assert!(err.message.contains('1') && err.message.contains('3'));
+    // 只给 revision 号不够：用户得知道是**哪些文件**掉了队，才能对上自己干过什么
+    assert!(err.message.contains("r1  Code/A.cs"), "{}", err.message);
+    assert!(
+        !err.message.contains("Code/B.cs"),
+        "停在多数 revision 上的不该列：{}",
+        err.message
+    );
+    // 少数落后：原因是 update 时被跳过或被单独退回，不是「提交过」
+    assert!(err.message.contains("更旧"), "{}", err.message);
+    assert!(!err.message.contains("更新的 revision"), "{}", err.message);
+}
+
+#[test]
+fn p2_names_the_files_committed_without_update() {
+    // 2026-10-28 用户实测撞上的形态：初始化前在 TortoiseSVN 里提交过文件、没 update。
+    // 报错只有 `{3, 4}` 时用户认不出这是自己刚才那次提交。
+    let fx = svn_repo_committed_without_update();
+    let err = run_preflight(&fx.wc_str(), &wl(&["Code/"])).expect_err("提交后没 update 必须被拒");
+    assert_eq!(err.code, "svn_preflight_mixed_revision");
+    assert!(err.message.contains("{3, 4}"), "{}", err.message);
+    assert!(err.message.contains("大多数文件停在 r3"), "{}", err.message);
+    assert!(err.message.contains("r4  Code/B.cs"), "{}", err.message);
+    assert!(
+        !err.message.contains("Code/A.cs"),
+        "停在多数 revision 上的不该列：{}",
+        err.message
+    );
+    // 少数超前：点名「提交过、没 update」，并给出能照做的出口
+    assert!(err.message.contains("提交过"), "{}", err.message);
+    assert!(!err.message.contains("更旧"), "{}", err.message);
+    assert!(err.message.contains("svn update Code"), "{}", err.message);
 }
 
 #[test]
@@ -312,6 +343,11 @@ fn p2_catches_a_pinned_nested_external_left_at_another_revision() {
         "实际：{}",
         err.message
     );
+    // 成因是 `-r` 钉死：不能再说「提交过 / update 被跳过」，那和紧跟着的
+    // 「update 解决不了」自相矛盾，也不能给一条照抄了也没用的 svn update 命令
+    assert!(err.message.contains("解决不了"), "{}", err.message);
+    assert!(!err.message.contains("多半是"), "{}", err.message);
+    assert!(!err.message.contains("命令行"), "{}", err.message);
 }
 
 #[test]

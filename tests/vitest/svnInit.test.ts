@@ -231,6 +231,20 @@ describe('错误码到引导语的映射', () => {
     expect(wizardErrorHint('svn_preflight_mixed_revision')).toContain('update')
   })
 
+  it('mixed-revision 点名最常见的成因：提交过、没 update（2026-10-28 用户实测）', () => {
+    // 初始化前在 TortoiseSVN 里提交过别的文件就会撞上。只说「多个 revision」时
+    // 用户认不出那是自己刚才那次提交
+    expect(wizardErrorHint('svn_preflight_mixed_revision')).toContain('提交过')
+  })
+
+  it('mixed-revision 的后端消息已列出文件与成因时，不再重复一遍', () => {
+    // 后端消息的真实开头（svn_preflight::mixed_revision_error）
+    const backend =
+      '白名单内出现了多个 revision：{3, 4}。大多数文件停在 r3，下面这些不在：\n' +
+      '  - r4  Code/B.cs\n'
+    expect(wizardErrorHint('svn_preflight_mixed_revision', backend)).toBe('')
+  })
+
   it('未完成的操作要区分 Cleanup 与完整 update', () => {
     // 2026-09-14 实测：svn cleanup 清掉写锁，但 item="incomplete" 原样留着。
     // 只说「跑一次 Cleanup」的引导会让用户以为做完了，而校验还是过不去。

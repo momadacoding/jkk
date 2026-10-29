@@ -31,7 +31,7 @@ describe('describeSync', () => {
     expect(describeSync(null)).toBeNull()
   })
 
-  it('mixed revision 列出每一个值，出口是重建基线', () => {
+  it('mixed revision 列出每一个值，出口是先在 TortoiseSVN 里 update', () => {
     const m = describeSync({
       baselineRev: 4,
       nodeRevs: [4, 7],
@@ -40,7 +40,25 @@ describe('describeSync', () => {
     expect(m.tone).toBe('danger')
     expect(m.detail).toContain('4')
     expect(m.detail).toContain('7')
-    expect(m.actions.map((a) => a.id)).toContain('rebuild')
+    expect(m.detail).toContain('提交过')
+    expect(m.detail).toContain('Update')
+  })
+
+  it('mixed revision 不给「重建基线」：它开头的 P2 对同一组 target 必然拒绝', () => {
+    // 2026-10-28 发现的死路：横幅推荐重建基线，重建一开头就以
+    // svn_preflight_mixed_revision 拒绝，再让用户去 update。
+    // 失同步判定（svn_sync::node_revs）与 P2 查的是同一组 target，所以这里
+    // 判成 mixedRevision 时重建**一定**失败，按钮只是一个必然报错的入口
+    const m = describeSync({
+      baselineRev: 4,
+      nodeRevs: [4, 7],
+      verdict: { kind: 'mixedRevision', revs: [4, 7] },
+    })!
+    const ids = m.actions.map((a) => a.id)
+    expect(ids).not.toContain('rebuild')
+    expect(ids).toContain('check')
+    // 按钮少了要说为什么，否则用户会去找「重建基线」在哪
+    expect(m.note).toContain('重建基线')
   })
 
   it('pinned reset 给的是 svn update 那条出路，不是重建基线', () => {
@@ -114,12 +132,13 @@ describe('describeSync', () => {
     }
   })
 
-  it('所有 danger 文案都写明重建基线不碰工作目录、也不推进工作分支', () => {
+  it('给了重建基线的文案都写明它不碰工作目录、也不推进工作分支', () => {
     // spec §16：「代价是工作分支不会自动跟进新基线」。不写明的话，用户会以为
     // 点完就万事大吉，下次提交时才发现分支还挂在旧基线上。
+    // mixedRevision 不在这里：它不给重建基线（见上面那条）
     const cases: SyncStatus[] = [
-      { baselineRev: 4, nodeRevs: [4, 7], verdict: { kind: 'mixedRevision', revs: [4, 7] } },
       { baselineRev: 4, nodeRevs: [9], verdict: { kind: 'diverged', nodeRev: 9, baselineRev: 4 } },
+      { baselineRev: 9, nodeRevs: [4], verdict: { kind: 'diverged', nodeRev: 4, baselineRev: 9 } },
     ]
     for (const c of cases) {
       const m = describeSync(c)!
