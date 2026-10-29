@@ -227,6 +227,44 @@ describe('扩展名输入的解析', () => {
     expect(parseExtensions('')).toEqual([])
     expect(parseExtensions('  ,  ')).toEqual([])
   })
+
+  it('中文顿号、中文逗号、分号、空白都当分隔符', () => {
+    // 2026-10-28 现场：用户用 `、` 分隔，整串被当成一个扩展名写进配置，
+    // 生成的反选规则匹配不到任何文件，白名单整体失效而界面毫无提示
+    expect(parseExtensions('.cs、.lua、.java')).toEqual(['.cs', '.lua', '.java'])
+    expect(parseExtensions('.cs，.lua')).toEqual(['.cs', '.lua'])
+    expect(parseExtensions('.cs;.lua；.java')).toEqual(['.cs', '.lua', '.java'])
+    expect(parseExtensions('.cs .lua\t.java\n.m')).toEqual(['.cs', '.lua', '.java', '.m'])
+  })
+
+  it('输入法句点当成 `.`，零宽字符去掉', () => {
+    // 中文输入法下 `.cs、.lua` 会打成 `。cs、。lua`；补点逻辑会把它变成 `.。cs`，
+    // 以点开头、不含分隔符，照样静默匹配不到任何文件（独立 review）。码点写成转义，
+    // 零宽字符直接写进字符串的话，编辑器删掉它这条测试照样通过、却什么也没测
+    expect(parseExtensions('\u{3002}cs\u{3001}\u{FF0E}lua\u{FF64}\u{FF61}java')).toEqual([
+      '.cs',
+      '.lua',
+      '.java',
+    ])
+    expect(parseExtensions('.cs\u{200B},\u{FEFF}.lua')).toEqual(['.cs', '.lua'])
+  })
+
+  it('句末的点被去掉，不产生 `.lua.` 或 `.` 这种匹配不到文件的条目', () => {
+    // 第二轮独立 review：`cs，lua。` 句末的 `。` 换成 `.` 之后成了 `.lua.`，
+    // 后端校验放行，所有 .lua 文件被静默漏掉
+    expect(parseExtensions('cs，lua\u{3002}')).toEqual(['.cs', '.lua'])
+    expect(parseExtensions('. cs')).toEqual(['.cs'])
+    expect(parseExtensions('..')).toEqual([])
+  })
+
+  it('`*.cs` 这种 glob 写法去掉前导 `*`，单独的 `*` 仍是全收', () => {
+    expect(parseExtensions('*.cs, *.lua')).toEqual(['.cs', '.lua'])
+    expect(parseExtensions('*')).toEqual(['*'])
+  })
+
+  it('混合分隔符与连续分隔符不产生空条目', () => {
+    expect(parseExtensions('cs、 lua,,；java  ')).toEqual(['.cs', '.lua', '.java'])
+  })
 })
 
 describe('体检三态的显示分类', () => {

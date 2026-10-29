@@ -146,14 +146,22 @@ export default function SvnInitWizard({
           </div>
           <div className="dlg-field">
             <label className="dlg-field-label" htmlFor="svn-ext">
-              收哪些扩展名（逗号分隔，`*` 表示全收）
+              收哪些扩展名（逗号、顿号、分号或空格分隔，`*` 表示全收）
             </label>
             <input
               id="svn-ext"
               value={extensionsText}
               onChange={(e) => setExtensionsText(e.target.value)}
             />
-            <div className="dlg-note">实际写入配置的是：{extensions.join(' ') || '（空）'}</div>
+            {/* 逐条显示并给出条数：只用空格拼接时，切错的一整串看起来和切对了一模一样 */}
+            <div className="dlg-note" data-testid="svn-ext-preview">
+              {extensions.length === 0
+                ? '实际写入配置的是：（空）'
+                : <>
+                    实际写入配置的是 {extensions.length} 条：
+                    {extensions.map((e) => <code key={e} className="svn-ext-item">{e}</code>)}
+                  </>}
+            </div>
           </div>
         </>
       )}

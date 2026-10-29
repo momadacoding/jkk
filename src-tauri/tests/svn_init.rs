@@ -184,6 +184,19 @@ fn the_health_check_runs_and_its_result_is_reported() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn a_listed_extension_is_refused_before_git_init() {
+    // 2026-10-28 现场：顿号分隔的整串扩展名一路放行，建出一个什么都不管的仓库。
+    // 必须在 `git init` 之前拦下——此刻还没有任何东西要回退。
+    let fx = svn_repo();
+    let mut r = req(&fx);
+    r.extensions = vec![".cs、.lua".to_string()];
+
+    let err = init_hybrid(&r).expect_err("坏扩展名必须被拒");
+    assert_eq!(err.code, "svn_config");
+    assert!(!fx.wc().join(".git").exists(), "被拒时不该建出 .git");
+}
+
+#[test]
 fn a_failure_after_git_init_rolls_the_whole_thing_back() {
     // 用**纳入集合核对不过**来触发：工作副本根放一个 `.gitignore`（`*.cs`），
     // 它的优先级高于我们生成的 `.git/info/exclude`（spec §6.3.1），于是候选索引
