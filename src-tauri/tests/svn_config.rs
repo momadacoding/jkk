@@ -4,7 +4,8 @@
 //! 每个字段都会被送进 git 或 svn 的命令行（spec §6.2.1）。
 
 use app_lib::engine::svn_config::{
-    normalize_whitelist_entry, read_config, validate, validate_whitelist_against_disk, SvnConfig,
+    normalize_whitelist_entry, read_config, validate, validate_new_extensions,
+    validate_whitelist_against_disk, write_config, SvnConfig,
 };
 use std::fs;
 use tempfile::TempDir;
@@ -139,6 +140,72 @@ fn extensions_must_start_with_a_dot_and_carry_no_separators() {
     let mut cfg = ok_config();
     cfg.extensions = vec!["*".to_string()];
     validate(&cfg).unwrap();
+}
+
+/// 2026-10-28 现场那一类：整串列表被写成一条扩展名。以点开头、不含路径分隔符，
+/// 旧校验全部放行，生成的规则匹配不到任何文件。
+const LISTED_EXTENSIONS: &[&str] = &[
+    ".cs、.lua",
+    ".cs，.lua",
+    ".cs,.lua",
+    ".cs;.lua",
+    ".cs；.lua",
+    ".cs .lua",
+    ".cs\t",
+    ".cs\u{200B}",
+    ".。cs",
+    ".．cs",
+    ".c[s]",
+    ".cs]",
+    ".cs\u{FF64}.lua",
+    ".cs\u{FF61}",
+    // 句末打的 `。` 被前端换成 `.` 之后的形态（第二轮独立 review）
+    ".lua.",
+    ".",
+    "..",
+];
+
+#[test]
+fn an_extension_that_is_really_a_whole_list_cannot_be_written() {
+    for bad in LISTED_EXTENSIONS {
+        let exts = vec![".cs".to_string(), bad.to_string()];
+        let err = validate_new_extensions(&exts).expect_err(&format!("{bad:?} 必须被拒"));
+        assert_eq!(err.code, "svn_config", "{bad:?}");
+        assert!(err.message.contains("英文逗号"), "{bad:?}: {}", err.message);
+
+        // 写配置文件这条路同样要挡：它是唯一的落盘入口
+        let dir = TempDir::new().unwrap();
+        let mut cfg = ok_config();
+        cfg.extensions = exts;
+        write_config(dir.path().to_str().unwrap(), &cfg).expect_err(&format!("{bad:?}"));
+        assert!(
+            !dir.path().join(".git/mygitclient.json").exists(),
+            "{bad:?}：被拒时不能留下配置文件"
+        );
+    }
+    validate_new_extensions(&[".cs".to_string(), ".lua".to_string(), "*".to_string()]).unwrap();
+}
+
+#[test]
+fn a_repo_built_by_an_older_version_with_a_listed_extension_still_opens() {
+    // 旧版本写下的 `[".cs", ".lua、.java"]` 是**半能用**的：.cs 照常受管，上面可能
+    // 已有提交和 stash。读配置时拒绝会把仓库整个锁死，应用里没有任何出路（独立 review）。
+    // 这类扩展名不危险，只是匹配不到文件，exclude 与纳入集合核对按同一份字符串算，
+    // 两边仍然一致——所以读盘照旧放行。
+    for bad in LISTED_EXTENSIONS {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let mut raw = serde_json::to_value(ok_config()).unwrap();
+        raw["extensions"] = serde_json::json!([".cs", bad]);
+        fs::write(
+            dir.path().join(".git/mygitclient.json"),
+            serde_json::to_string(&raw).unwrap(),
+        )
+        .unwrap();
+        let cfg = read_config(dir.path().to_str().unwrap())
+            .unwrap_or_else(|e| panic!("{bad:?} 不该锁死旧仓库：{}", e.message));
+        assert_eq!(cfg.extensions, vec![".cs".to_string(), bad.to_string()]);
+    }
 }
 
 #[test]

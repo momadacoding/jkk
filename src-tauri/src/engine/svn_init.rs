@@ -1362,6 +1362,9 @@ fn build_config(req: &InitRequest, svn_url: &str) -> Result<SvnConfig> {
         baseline_branch: BASELINE_BRANCH.to_string(),
     };
     crate::engine::svn_config::validate(&cfg)?;
+    // 放在 `git init` 之前：坏扩展名在这里被拒时什么都还没建。`write_config` 里
+    // 也查一遍，但那时 `git init` 已经跑过，失败要走回退。
+    crate::engine::svn_config::validate_new_extensions(&cfg.extensions)?;
     // ⚠️ 这一条**不能省**。`SvnGitBackend::open` 每次打开混合仓库都会跑它，
     // 而这里是唯一**写入**配置的地方——两边不接上的话，向导能建出一个自己
     // 打不开的仓库：

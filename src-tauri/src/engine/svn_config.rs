@@ -90,6 +90,7 @@ pub fn read_config(repo_root: &str) -> Result<SvnConfig> {
 /// 的内容，等于造出一个「识别成混合仓库、但每次读配置都报错」的死局。
 pub fn write_config(repo_root: &str, cfg: &SvnConfig) -> Result<()> {
     validate(cfg)?;
+    validate_new_extensions(&cfg.extensions)?;
     let path = config_path(repo_root);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -97,6 +98,70 @@ pub fn write_config(repo_root: &str, cfg: &SvnConfig) -> Result<()> {
     let json = serde_json::to_string_pretty(cfg)
         .map_err(|e| GitError::new("svn_config", format!("配置序列化失败: {e}")))?;
     std::fs::write(&path, format!("{json}\n"))?;
+    Ok(())
+}
+
+/// 新写入的扩展名里不允许出现的字符（空白另外判）：列表分隔符、输入法句点、
+/// gitignore 字符类括号，以及 `char::is_whitespace` 不算空白的零宽字符。
+/// 非 ASCII 一律写成转义：零宽字符肉眼看不见，写字面量的话被编辑器删掉也没人发现。
+/// 前端 `parseExtensions` 对同一批字符做切分 / 替换，这里是它漏掉时的兜底。
+// 按类别分行写，rustfmt 会把每类前面的注释挪到上一行行尾，读起来像在注释错的字符
+#[rustfmt::skip]
+const EXTENSION_FORBIDDEN: &[char] = &[
+    // 分隔符：全角逗号、中文顿号、全角分号、半角片假名顿号
+    ',', ';', '\u{FF0C}', '\u{3001}', '\u{FF1B}', '\u{FF64}',
+    // 输入法句点：中文句号、全角句点、半角片假名句点
+    '\u{3002}', '\u{FF0E}', '\u{FF61}',
+    // 字符类括号
+    '[', ']',
+    // 零宽字符
+    '\u{200B}', '\u{200C}', '\u{200D}', '\u{2060}', '\u{FEFF}',
+];
+
+/// 挡住**能写出来、但匹配不到任何文件**的扩展名。
+///
+/// 2026-10-28 现场：向导只按 ASCII 逗号切分，用户用顿号分隔，配置里落下
+/// `".cs、.lua、.java"`。它以点开头、不含路径分隔符，[`validate`] 放行，生成的
+/// `!/…/**/*.cs、.lua、.java` 什么都匹配不到——白名单整体失效却没有任何报错。
+/// 以 `.` 结尾的（`.lua.`、`.`、`..`，多半来自句末打的 `。`）同理：Windows 上文件名
+/// 不能以点结尾，`*.lua.` 永远匹配不到。
+///
+/// `[` `]` 不一样：exclude 规则里它是字符类，`*.c[s]` 会收进 `Foo.cs`，而纳入集合
+/// 核对按字面量比后缀，两边给出不同答案，核对会报不一致。新配置里同样挡掉。
+///
+/// # 为什么只在写新配置时查，不放进 [`validate`]
+///
+/// `validate` 在每次打开仓库、同步、读日志时都会跑（经 [`read_config`]）。旧版本
+/// 已经写下这种扩展名的仓库往往是**半能用**的（`[".cs", ".lua、.java"]` 里 `.cs`
+/// 照常受管，上面可能已经有提交和 stash），读配置时拒绝等于把它整个锁死，应用里
+/// 没有任何出路。这类扩展名不危险，不会让命令作用到预期之外的范围：分隔符、句点、
+/// 零宽字符那几类只是匹配不到文件，exclude 与纳入集合核对两边都为空，仍然一致；
+/// 方括号那一类会让核对报不一致，但那是旧版本就有的形态，不是这里新造出来的。
+/// 所以只在源头（向导组装配置、写配置文件）挡住。
+pub fn validate_new_extensions(extensions: &[String]) -> Result<()> {
+    for e in extensions {
+        if e.chars()
+            .any(|c| c.is_whitespace() || EXTENSION_FORBIDDEN.contains(&c))
+        {
+            return Err(GitError::new(
+                "svn_config",
+                format!(
+                    "扩展名 {e:?} 含空白、列表分隔符、全角句点或方括号，\
+                     看起来是把多个扩展名写成了一条，这样的规则匹配不到任何文件。\
+                     请用英文逗号分隔，每条以英文句点开头，例如 .cs, .lua"
+                ),
+            ));
+        }
+        if e != "*" && e.ends_with('.') {
+            return Err(GitError::new(
+                "svn_config",
+                format!(
+                    "扩展名 {e:?} 以句点结尾，这样的规则匹配不到任何文件。\
+                     请用英文逗号分隔，每条以英文句点开头，例如 .cs, .lua"
+                ),
+            ));
+        }
+    }
     Ok(())
 }
 
