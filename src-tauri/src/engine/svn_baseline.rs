@@ -410,12 +410,83 @@ pub fn swap_index_to_tree(repo_root: &str, expect: &str, target: &str) -> Result
         ));
     }
 
+    let index = git_dir(repo_root)?.join("index");
     let staging = TempIndex::empty(repo_root)?;
-    staging.git(repo_root, &["read-tree", target])?;
+    fill_keeping_stat(repo_root, &index, &staging, target)?;
     // rename 覆盖：锁在手里，没有别的 git 进程会同时读写 .git/index。
     // 这正是 git 自己换索引的做法（写 index.lock 再 rename）。
-    std::fs::rename(staging.path(), git_dir(repo_root)?.join("index"))?;
+    std::fs::rename(staging.path(), &index)?;
     // `staging` 的 Drop 会去删一个已经不存在的路径，`let _ =` 吃掉即可。
+    Ok(())
+}
+
+/// 在 `staging` 里生成 `target` 树的索引，**沿用真实索引里没变的条目的 stat**。
+///
+/// # 为什么不能从空索引 `read-tree`
+///
+/// 从空索引读出来的条目 ctime / mtime / size 全是 0。git 与 libgit2 都只能逐个读
+/// 文件哈希来判断「没改」——2026-10-28 现场一万五千个文件 `git status` 冷缓存 53 秒，
+/// 而 libgit2 只读不回写，客户端每次刷新都要重来一遍，Local Changes 长时间刷不出来。
+/// 每次同步都会走到这里，等于每次同步都把这个慢重新造一遍。
+///
+/// # 为什么是复制 + `read-tree -i -m`
+///
+/// 单树合并：内容与 `target` 相同的条目原样保留（连同 stat），变了的条目换成新
+/// blob、stat 清零——旧 stat 对新内容无效，沿用它就是把新内容当成旧内容。
+/// 2026-10-30 实测（probe-readtree.sh）：
+///
+/// ```text
+/// read-tree -m      → 换掉的条目在工作区有未暂存改动时拒绝：
+///                     Entry 'b.txt' not uptodate. Cannot merge.（退出 128）
+/// read-tree -i -m   → 不对照工作区；a / c 保留 stat，b 清零
+/// ```
+///
+/// 同步把服务器改动合进一个本地也改过的文件，正是 `-m` 拒绝的形态，所以必须带
+/// `-i`。它也不动磁盘（没有 `-u`），与原来的做法一样只写索引。
+///
+/// # 复制必须保留 mtime
+///
+/// git 判「racily clean」靠比较条目 mtime 与**索引文件自己的** mtime。复制出来的
+/// 文件若拿到「现在」的 mtime，原本该被当成可疑、要重新哈希的条目就会被当成干净的。
+/// `std::fs::copy` 在 Windows 上保留 mtime、在 Unix 上不保留，所以显式设回去。
+///
+/// # 退路
+///
+/// `-i -m` 在索引含冲突条目等情况下会失败。stat 只关乎快慢，不关乎对错，所以这时
+/// 退回从空索引生成，只记一条 warning——不能因为一个性能优化让同步失败。
+fn fill_keeping_stat(
+    repo_root: &str,
+    index: &Path,
+    staging: &TempIndex,
+    target: &str,
+) -> Result<()> {
+    if index.is_file() {
+        let kept = copy_with_mtime(index, staging.path())
+            .and_then(|()| staging.git(repo_root, &["read-tree", "-i", "-m", target]));
+        match kept {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                log::warn!(
+                    "沿用 stat 生成索引失败，退回从空索引生成（之后第一次 status 会慢）：{}",
+                    e.message
+                );
+                if staging.path().exists() {
+                    std::fs::remove_file(staging.path())?;
+                }
+            }
+        }
+    }
+    staging.git(repo_root, &["read-tree", target])?;
+    Ok(())
+}
+
+fn copy_with_mtime(from: &Path, to: &Path) -> Result<()> {
+    std::fs::copy(from, to)?;
+    let mtime = std::fs::metadata(from)?.modified()?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(to)?
+        .set_modified(mtime)?;
     Ok(())
 }
 

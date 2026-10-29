@@ -757,6 +757,24 @@ fn build_repo(
         run_git(root, &["read-tree", &tree])
     })?;
 
+    // 刚 read-tree 出来的条目没有 stat（全是 0），不补的话之后每次 status 都要把
+    // 白名单里的文件全部重新哈希一遍，而客户端读状态走的 libgit2 只读不回写，
+    // 这个慢永远不会自愈（2026-10-28 现场：一万五千个文件冷缓存 53 秒）。
+    // 只这一次付全量哈希的代价，之后同步换索引会沿用这里填好的 stat
+    // （`svn_baseline::swap_index_to_tree`）。
+    //
+    // `-q`：有修改 / 删除的文件不算错，照常只给干净的条目填 stat（2026-10-30 实测
+    // 退出码为 0）。stat 只关乎快慢、不关乎对错，所以失败也只记 warning、不让建库失败。
+    clock.run("刷新索引 stat（git update-index --refresh）", || {
+        if let Err(e) = run_git(root, &["update-index", "-q", "--refresh"]) {
+            log::warn!(
+                "建库后刷新索引 stat 失败，之后第一次 status 会慢：{}",
+                e.message
+            );
+        }
+        Ok(())
+    })?;
+
     // Lying 的判定放在阶段**里面**：它是这一阶段的失败，耗时表要把「← 在这一步
     // 失败」标在体检上。放在外面的话，体检阶段算成功，表里一个失败标记都没有。
     let health = clock.run("基线体检（svn diff）", || {
