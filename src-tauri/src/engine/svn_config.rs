@@ -100,6 +100,9 @@ pub fn write_config(repo_root: &str, cfg: &SvnConfig) -> Result<()> {
     Ok(())
 }
 
+/// 扩展名里不允许出现的字符（空白另外判）：列表分隔符与 gitignore 字符类括号。
+const EXTENSION_FORBIDDEN: &[char] = &[',', '，', '、', ';', '；', '[', ']'];
+
 /// 校验一份**已规范化**的配置。
 pub fn validate(cfg: &SvnConfig) -> Result<()> {
     // `version` 与 `mode` 必须校验，理由与 `baselineBranch` 被钉死成 `svn/base`
@@ -154,6 +157,23 @@ pub fn validate(cfg: &SvnConfig) -> Result<()> {
         // "*" 是 spec §6.3 明文给出的全纳入写法，单独放行。
         if e == "*" {
             continue;
+        }
+        // 列表分隔符或空白出现在一条扩展名里，几乎一定是把整串列表写成了一条
+        // （2026-10-28 现场：向导只认 ASCII 逗号，用户用了顿号）。放行的话生成的
+        // `!/…/**/*.cs、.lua` 匹配不到任何文件，白名单整体失效却没有任何报错。
+        // `[` `]` 在 exclude 规则里是字符类，同样会让匹配静默偏离字面意思。
+        if e.chars()
+            .any(|c| c.is_whitespace() || EXTENSION_FORBIDDEN.contains(&c))
+        {
+            return Err(GitError::new(
+                "svn_config",
+                format!(
+                    "扩展名 {e:?} 含空白、列表分隔符或方括号，看起来是把多个扩展名写成了一条。\
+                     按这份配置生成的忽略规则匹配不到任何文件。\
+                     如果仓库已经用它建过库，需要重新初始化：确认 git 里没有要保留的\
+                     提交或 stash 后删除 .git 目录（.svn 不受影响），再用向导以英文逗号分隔重建"
+                ),
+            ));
         }
         if !e.starts_with('.') {
             return Err(GitError::new(

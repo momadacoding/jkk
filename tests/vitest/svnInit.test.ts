@@ -103,6 +103,19 @@ describe('扩展名输入的解析', () => {
     expect(parseExtensions('')).toEqual([])
     expect(parseExtensions('  ,  ')).toEqual([])
   })
+
+  it('中文顿号、中文逗号、分号、空白都当分隔符', () => {
+    // 2026-10-28 现场：用户用 `、` 分隔，整串被当成一个扩展名写进配置，
+    // 生成的反选规则匹配不到任何文件，白名单整体失效而界面毫无提示
+    expect(parseExtensions('.cs、.lua、.java')).toEqual(['.cs', '.lua', '.java'])
+    expect(parseExtensions('.cs，.lua')).toEqual(['.cs', '.lua'])
+    expect(parseExtensions('.cs;.lua；.java')).toEqual(['.cs', '.lua', '.java'])
+    expect(parseExtensions('.cs .lua\t.java\n.m')).toEqual(['.cs', '.lua', '.java', '.m'])
+  })
+
+  it('混合分隔符与连续分隔符不产生空条目', () => {
+    expect(parseExtensions('cs、 lua,,；java  ')).toEqual(['.cs', '.lua', '.java'])
+  })
 })
 
 describe('体检三态的显示分类', () => {

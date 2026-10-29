@@ -116,6 +116,8 @@ export function stepStatus(step: StepId, current: StepId): StepState {
 // 输入解析
 // ---------------------------------------------------------------------------
 
+const EXTENSION_SEPARATORS = /[,，、;；\s]+/
+
 /**
  * 把用户输入的扩展名串解析成配置需要的数组。
  *
@@ -124,10 +126,14 @@ export function stepStatus(step: StepId, current: StepId): StepState {
  * ——能自动修的就修掉，不必为此弹一个他看不懂的校验错误。
  *
  * 给 `*` 补成 `.*` 会让校验失败，所以它必须原样放过。
+ *
+ * 分隔符不只认 ASCII 逗号：中文输入法下顺手打出的 `、` `，` `；` 以及空白都切开。
+ * 只认 `,` 时 `.cs、.lua` 会整串成为一个扩展名，生成的反选规则匹配不到任何文件，
+ * 白名单整体失效却没有任何报错（2026-10-28 现场）。扩展名本身不会含这些字符。
  */
 export function parseExtensions(raw: string): string[] {
   const out: string[] = []
-  for (const piece of raw.split(',')) {
+  for (const piece of raw.split(EXTENSION_SEPARATORS)) {
     const t = piece.trim()
     if (!t) continue
     const norm = t === '*' ? '*' : t.startsWith('.') ? t : `.${t}`

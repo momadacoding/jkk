@@ -556,6 +556,37 @@ fn a_users_own_exclude_is_backed_up_before_we_take_over() {
 }
 
 #[test]
+fn an_exclude_from_an_older_version_is_still_recognised_as_ours() {
+    // 文件头的文字改过一次（旧文字声称「下次打开仓库时被覆盖」，与实现不符）。
+    // 「是不是我们写的」只看第一行，旧版写下的 exclude 若因文字不同被当成用户原件，
+    // 就会被备份成 exclude.bak——之后真正的用户原件再也进不了备份（备份存在不再覆盖）。
+    let dir = workdir();
+    let info = dir.path().join(".git").join("info");
+    fs::create_dir_all(&info).unwrap();
+    fs::write(
+        info.join("exclude"),
+        "# 由 mygitclient 自动生成，请勿手工编辑——改动会在下次打开仓库时被覆盖。\n/*\n!/Code/\n.svn/\n",
+    )
+    .unwrap();
+
+    write_rules(dir.path(), &strs(&["Code/"]), &strs(&[".cs"]));
+    assert!(
+        !info.join("exclude.bak").exists(),
+        "旧版本生成的 exclude 不该被当成用户原件备份"
+    );
+}
+
+#[test]
+fn the_generated_header_does_not_promise_regeneration_on_open() {
+    // exclude 只在建库时写一次。改配置文件不会让它重新生成，文件头不能说会——
+    // 否则用户改了 mygitclient.json、以为下次打开就生效，实际白名单纹丝不动。
+    let text = generate_exclude(&strs(&["Code/"]), &strs(&[".cs"]));
+    let header = text.lines().next().unwrap();
+    assert!(header.starts_with('#'), "{header}");
+    assert!(!header.contains("打开仓库"), "{header}");
+}
+
+#[test]
 fn write_exclude_leaves_no_temp_file_behind() {
     // 原子替换用的临时文件必须收干净——`.git/info/` 里留一个
     // `exclude.mygitclient.tmp` 不会报错，但下次有人来看这个目录会一头雾水。

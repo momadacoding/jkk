@@ -2106,6 +2106,16 @@ body {
   max-height: 40vh;
   overflow: auto;
 }
+/* 扩展名预览逐条加框：一条超长的「.cs、.lua、…」在框里一眼就能看出是切错了 */
+.svn-ext-item {
+  display: inline-block;
+  margin: 2px 4px 0 0;
+  padding: 0 4px;
+  border: 1px solid #3c4043;
+  border-radius: 3px;
+  font-family: Consolas, 'Courier New', monospace;
+  word-break: break-all;
+}
 .svn-steps { display: flex; gap: 12px; list-style: none; padding: 0; margin: 8px 0 12px; }
 .svn-step { flex: 1; font-size: 11px; opacity: 0.45; }
 .svn-step.current { opacity: 1; font-weight: 600; }

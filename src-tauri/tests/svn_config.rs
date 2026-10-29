@@ -142,6 +142,53 @@ fn extensions_must_start_with_a_dot_and_carry_no_separators() {
 }
 
 #[test]
+fn an_extension_that_is_really_a_whole_list_is_rejected() {
+    // 2026-10-28 现场：向导只按 ASCII 逗号切分，用户用顿号分隔，配置里落下的是
+    // `".cs、.lua、.java"` 这样一整串。它以点开头、不含路径分隔符，旧校验放行，
+    // 生成的 `!/Assets/Scripts/**/*.cs、.lua、.java` 匹配不到任何文件——
+    // 白名单整体失效而没有任何报错。必须在校验处挡住，而不是静默失效。
+    for bad in [
+        ".cs、.lua",
+        ".cs，.lua",
+        ".cs,.lua",
+        ".cs;.lua",
+        ".cs；.lua",
+        ".cs .lua",
+        ".cs\t",
+        " .cs",
+        ".c[s]",
+        ".cs]",
+    ] {
+        let mut cfg = ok_config();
+        cfg.extensions = vec![bad.to_string()];
+        let err = validate(&cfg).expect_err(&format!("{bad:?} 必须被拒"));
+        assert_eq!(err.code, "svn_config", "{bad:?}");
+        // 已经用坏配置建过库的人只能重新初始化，报错要把出路说出来
+        assert!(
+            err.message.contains("重新初始化"),
+            "{bad:?}: {}",
+            err.message
+        );
+    }
+}
+
+#[test]
+fn a_config_file_already_holding_a_listed_extension_fails_to_read() {
+    // 旧版本已经写进磁盘的坏配置：打开这类仓库时要报错，不能继续静默失效
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join(".git")).unwrap();
+    let mut cfg = serde_json::to_value(ok_config()).unwrap();
+    cfg["extensions"] = serde_json::json!([".cs、.lua、.java", ".shader、.hlsl"]);
+    fs::write(
+        dir.path().join(".git/mygitclient.json"),
+        serde_json::to_string(&cfg).unwrap(),
+    )
+    .unwrap();
+    let err = read_config(dir.path().to_str().unwrap()).expect_err("坏配置必须读失败");
+    assert_eq!(err.code, "svn_config");
+}
+
+#[test]
 fn an_unknown_version_is_rejected() {
     // 与 baselineBranch 被钉死同一条理由：留一个不校验的字段，只会让「文件里
     // 写的」与「代码假设的」不一致。这里一个版本语义差异会直接改变白名单的

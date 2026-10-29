@@ -132,7 +132,15 @@ export default function SvnInitWizard({
               value={extensionsText}
               onChange={(e) => setExtensionsText(e.target.value)}
             />
-            <div className="dlg-note">实际写入配置的是：{extensions.join(' ') || '（空）'}</div>
+            {/* 逐条显示并给出条数：只用空格拼接时，切错的一整串看起来和切对了一模一样 */}
+            <div className="dlg-note" data-testid="svn-ext-preview">
+              {extensions.length === 0
+                ? '实际写入配置的是：（空）'
+                : <>
+                    实际写入配置的是 {extensions.length} 条：
+                    {extensions.map((e) => <code key={e} className="svn-ext-item">{e}</code>)}
+                  </>}
+            </div>
           </div>
         </>
       )}

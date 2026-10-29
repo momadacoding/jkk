@@ -9,8 +9,17 @@ use std::io::Write;
 
 /// 生成文件的第一行。也是「这个 exclude 是不是我们写的」的唯一判据
 /// ——[`write_exclude`] 靠它决定要不要先备份用户原有的内容。
+///
+/// 只在建库时写一次：改 `mygitclient.json` 不会让它重新生成。打开仓库时重新生成
+/// 也不对——纳入集合与基线绑定，换一套规则而基线不变，新纳入的 SVN 文件会被 git
+/// 当成未跟踪的新文件。改白名单或扩展名要重建基线。
 pub const GENERATED_HEADER: &str =
-    "# 由 mygitclient 自动生成，请勿手工编辑——改动会在下次打开仓库时被覆盖。";
+    "# 由 mygitclient 建库时生成，请勿手工编辑。白名单与扩展名的改动需要重新初始化才会生效。";
+
+/// 0.6.0 及更早版本写下的文件头。文字与实现不符已经改掉，但磁盘上的旧文件仍然是
+/// 我们写的，[`write_exclude`] 不能把它当成用户原件备份。
+const LEGACY_HEADERS: &[&str] =
+    &["# 由 mygitclient 自动生成，请勿手工编辑——改动会在下次打开仓库时被覆盖。"];
 
 /// 生成规则文本。
 ///
@@ -155,7 +164,10 @@ pub fn write_exclude(repo_root: &str, content: &str) -> Result<()> {
     let target = info.join("exclude");
 
     if let Ok(existing) = std::fs::read_to_string(&target) {
-        let ours = existing.lines().next() == Some(GENERATED_HEADER);
+        let ours = existing
+            .lines()
+            .next()
+            .is_some_and(|l| l == GENERATED_HEADER || LEGACY_HEADERS.contains(&l));
         let has_rules = existing
             .lines()
             .any(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'));
