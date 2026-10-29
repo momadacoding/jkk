@@ -2092,13 +2092,19 @@ body {
 .svn-notice.ok { border-left: 3px solid #3f7d4f; }
 .svn-notice.warn { border-left: 3px solid #8a7320; }
 .svn-notice.error { border-left: 3px solid #8a3030; }
-/* 后端错误消息里的文件清单靠 \n 分行（obstructed、mixed-revision），不保留就挤成一行 */
-.svn-notice.error > strong { white-space: pre-wrap; }
+/* 完成页会连着出好几块（体检、pinned、耗时），贴在一起会读成同一块 */
+.svn-notice + .svn-notice { margin-top: 10px; }
 .svn-notice-detail {
   margin: 4px 0 0;
   white-space: pre-wrap;
   font-family: inherit;
   font-size: 12px;
+}
+/* 错误详情可能有几十行（按规则分组的不一致报告 + 各阶段耗时），
+   限高滚动，不能把对话框撑出窗口、顶掉底部的按钮 */
+.svn-notice-scroll {
+  max-height: 40vh;
+  overflow: auto;
 }
 .svn-steps { display: flex; gap: 12px; list-style: none; padding: 0; margin: 8px 0 12px; }
 .svn-step { flex: 1; font-size: 11px; opacity: 0.45; }

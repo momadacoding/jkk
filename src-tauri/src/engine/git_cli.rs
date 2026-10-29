@@ -85,6 +85,51 @@ pub fn run_git_bytes(path: &str, args: &[&str]) -> Result<Vec<u8>> {
 ///   5 万文件的仓库做 merge driver 检查时实测卡死（2026-10-21）。所以 stdin 放在单独的
 ///   线程里写，主线程同时 `wait_with_output` 把 stdout / stderr 读空。
 pub fn run_git_stdin(path: &str, args: &[&str], stdin_bytes: &[u8]) -> Result<String> {
+    let (output, written) = pipe_through(path, args, stdin_bytes)?;
+    // git 先失败退出时写入会撞上断开的管道；那时真正的原因在 stderr 里，先报它
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        return Err(GitError::new("git_cli", stderr));
+    }
+    written?;
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// 同 [`run_git_stdin`]，但退出码 1 不算失败（与 [`run_git_code`] 同理），
+/// 而且 fatal 时**把已经输出的部分一并交回**。返回 `(stdout, fatal)`。
+///
+/// 已知需要它的地方：`check-ignore --stdin`。
+///
+/// - 它在「一个路径都没被忽略」时退出 1，而那正是核对报告里「多收」一侧的常态。
+/// - 它逐个路径输出、遇到某个路径 fatal 就整个退出（比如路径越过了符号链接）。
+///   调用方拿着 fatal 之前的输出，就能跳过出事的那个路径接着查，而不是整批作废。
+///
+/// fatal 仍然以 `Some(GitError)` 明确交回——把它当成「没有结果」会让报告看起来
+/// 正常、其实什么也没查。
+pub fn run_git_stdin_partial(
+    path: &str,
+    args: &[&str],
+    stdin_bytes: &[u8],
+) -> Result<(String, Option<GitError>)> {
+    let (output, written) = pipe_through(path, args, stdin_bytes)?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let code = output.status.code().unwrap_or(-1);
+    if code != 0 && code != 1 {
+        // git 中途退出时写入撞上断开的管道是预期内的，原因在 stderr 里
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        return Ok((stdout, Some(GitError::new("git_cli", stderr))));
+    }
+    written?;
+    Ok((stdout, None))
+}
+
+/// 起进程、一边写 stdin 一边读空 stdout / stderr。写入结果单独交回，由调用方
+/// 决定先看退出码还是先看写入——见 [`run_git_stdin`] 开头的两个坑。
+fn pipe_through(
+    path: &str,
+    args: &[&str],
+    stdin_bytes: &[u8],
+) -> Result<(std::process::Output, Result<()>)> {
     use std::io::Write;
     use std::process::Stdio;
 
@@ -102,15 +147,14 @@ pub fn run_git_stdin(path: &str, args: &[&str], stdin_bytes: &[u8]) -> Result<St
         let output = child.wait_with_output();
         (output, writer.join())
     });
-    let output = output?;
-    // git 先失败退出时写入会撞上断开的管道；那时真正的原因在 stderr 里，先报它
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        return Err(GitError::new("git_cli", stderr));
-    }
-    written
-        .map_err(|_| GitError::new("git_cli", "写入子进程 stdin 的线程异常退出".to_string()))??;
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    let written = match written {
+        Ok(r) => r.map_err(GitError::from),
+        Err(_) => Err(GitError::new(
+            "git_cli",
+            "写入子进程 stdin 的线程异常退出".to_string(),
+        )),
+    };
+    Ok((output?, written))
 }
 
 /// 同 [`run_git`]，但额外注入一组环境变量。
