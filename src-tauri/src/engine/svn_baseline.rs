@@ -288,6 +288,11 @@ impl TempIndex {
         let p = self.path.to_string_lossy().to_string();
         run_git_env(repo_root, args, &[("GIT_INDEX_FILE", &p)])
     }
+
+    fn git_stdin(&self, repo_root: &str, args: &[&str], stdin: &[u8]) -> Result<String> {
+        let p = self.path.to_string_lossy().to_string();
+        run_git_stdin_env(repo_root, args, stdin, &[("GIT_INDEX_FILE", &p)])
+    }
 }
 
 /// 索引条目路径的归一：正斜杠、非空。
@@ -398,28 +403,48 @@ impl Drop for IndexLock {
 /// 磁盘上的文件一个都不碰：新索引是用 `read-tree`（**不带 `-u`**）在一个独立的
 /// 临时索引文件里生成的，再整体 rename 覆盖 `.git/index`。
 pub fn swap_index_to_tree(repo_root: &str, expect: &str, target: &str) -> Result<()> {
-    let _lock = IndexLock::acquire(repo_root)?;
+    {
+        let _lock = IndexLock::acquire(repo_root)?;
 
-    // 纯读，不需要索引锁；而锁在我们手里，所以这个结论一直有效到 rename 为止。
-    let (code, _) = run_git_code(repo_root, &["diff-index", "--cached", "--quiet", expect])?;
-    if code != 0 {
-        return Err(GitError::new(
-            "svn_index_moved",
-            "索引已经不是预期的样子了（有别的 git 操作动过它）。\
-             这次不会覆盖它。",
-        ));
+        // 纯读，不需要索引锁；而锁在我们手里，所以这个结论一直有效到 rename 为止。
+        let (code, _) = run_git_code(repo_root, &["diff-index", "--cached", "--quiet", expect])?;
+        if code != 0 {
+            return Err(GitError::new(
+                "svn_index_moved",
+                "索引已经不是预期的样子了（有别的 git 操作动过它）。\
+                 这次不会覆盖它。",
+            ));
+        }
+
+        let index = git_dir(repo_root)?.join("index");
+        let staging = build_index_keeping_stat(repo_root, &index, target)?;
+        // rename 覆盖：锁在手里，没有别的 git 进程会同时读写 .git/index。
+        // 这正是 git 自己换索引的做法（写 index.lock 再 rename）。
+        std::fs::rename(staging.path(), &index)?;
+        // `staging` 的 Drop 会去删一个已经不存在的路径，`let _ =` 吃掉即可。
     }
-
-    let index = git_dir(repo_root)?.join("index");
-    let staging = build_index_keeping_stat(repo_root, &index, target)?;
-    // rename 覆盖：锁在手里，没有别的 git 进程会同时读写 .git/index。
-    // 这正是 git 自己换索引的做法（写 index.lock 再 rename）。
-    std::fs::rename(staging.path(), &index)?;
-    // `staging` 的 Drop 会去删一个已经不存在的路径，`let _ =` 吃掉即可。
+    refresh_stat(repo_root);
     Ok(())
 }
 
-/// 生成一份 `target` 树的临时索引，**条目尽量带着有效的 stat**。
+/// 给真实索引里 stat 对不上的条目按磁盘回填 stat。
+///
+/// 只沿用不回填的话，变了的条目 stat 永远是 0：行尾迁移改写全部 blob、一次大的
+/// `svn update`，之后又是每次刷新全量哈希（独立 review）。refresh 只哈希 stat 对不上
+/// 的条目，代价与这次变了的文件数成正比；与磁盘不一致（有本地改动）的条目照旧留 0。
+/// `-q` 下有修改 / 删除也返回 0（2026-10-30 实测）。
+///
+/// **放在释放索引锁之后**（第二轮独立 review）：行尾迁移会让它哈希全部文件，在锁里跑
+/// 等于让 IDE、终端的 git 写操作在这几十秒里全部撞上 `index.lock`。它只改 stat、不改
+/// 条目内容，git 自己会拿锁，与别的进程并发是安全的；拿不到锁就只是这次没刷。
+/// stat 只关乎快慢，不关乎对错，所以失败只记 warning。
+fn refresh_stat(repo_root: &str) {
+    if let Err(e) = run_git(repo_root, &["update-index", "-q", "--refresh"]) {
+        log::warn!("刷新索引 stat 失败，之后第一次 status 会慢：{}", e.message);
+    }
+}
+
+/// 生成一份 `target` 树的临时索引，**沿用真实索引里没变的条目的 stat**。
 ///
 /// # 为什么不能只从空索引 `read-tree`
 ///
@@ -428,11 +453,11 @@ pub fn swap_index_to_tree(repo_root: &str, expect: &str, target: &str) -> Result
 /// 而 libgit2 只读不回写，客户端每次刷新都要重来一遍，Local Changes 长时间刷不出来。
 /// 每次同步都会走到这里，等于每次同步都把这个慢重新造一遍。
 ///
-/// # 第一步：复制真实索引 + `read-tree -i -m`
+/// # 复制真实索引 + `read-tree -i -m`
 ///
 /// 单树合并：内容与 `target` 相同的条目原样保留（连同 stat），变了的条目换成新
-/// blob、stat 清零——旧 stat 对新内容无效，沿用它就是把新内容当成旧内容。
-/// 2026-10-30 实测（probe-readtree.sh）：
+/// blob、stat 清零——旧 stat 对新内容无效，沿用它就是把新内容当成旧内容。变了的
+/// 条目由换上之后的 [`refresh_stat`] 回填。2026-10-30 实测（probe-readtree.sh）：
 ///
 /// ```text
 /// read-tree -m      → 换掉的条目在工作区有未暂存改动时拒绝：
@@ -441,17 +466,8 @@ pub fn swap_index_to_tree(repo_root: &str, expect: &str, target: &str) -> Result
 /// ```
 ///
 /// 同步把服务器改动合进一个本地也改过的文件，正是 `-m` 拒绝的形态，所以必须带
-/// `-i`。它也不动磁盘（没有 `-u`），与原来的做法一样只写索引。
-///
-/// 条目上的 skip-worktree / assume-unchanged 标志随之保留，与 `git reset --mixed`
-/// 一致；原来从空索引生成时每次同步都会把用户设的这些标志悄悄抹掉。
-///
-/// # 第二步：`update-index -q --refresh`
-///
-/// 只沿用不回填的话，变了的条目 stat 永远是 0：行尾迁移改写全部 blob、一次大的
-/// `svn update`，之后又是每次刷新全量哈希（独立 review）。refresh 只哈希 stat 对不上
-/// 的条目，代价与这次变了的文件数成正比；与磁盘不一致（有本地改动）的条目照旧留 0。
-/// `-q` 下有修改 / 删除也返回 0（2026-10-30 实测）。
+/// `-i`。它也不动磁盘（没有 `-u`），与原来的做法一样只写索引。真实索引不存在时
+/// git 把 `GIT_INDEX_FILE` 当成空索引，`-i -m` 照常可用（实测），不用另走一条分支。
 ///
 /// # 复制必须保留 mtime
 ///
@@ -461,40 +477,69 @@ pub fn swap_index_to_tree(repo_root: &str, expect: &str, target: &str) -> Result
 ///
 /// # 退路
 ///
-/// stat 只关乎快慢，不关乎对错，任何一步失败都不能让同步失败：第一步失败就换一份
-/// **新的**临时索引从空生成（不去删失败的那份——删不掉的话又是一个失败点，它的
-/// `Drop` 会尽力清理），refresh 失败只记 warning。目前没有已知能让第一步失败而守卫
-/// 放行的输入：冲突条目会先被 `diff-index --cached` 的守卫挡下。所以这条退路是防御性
-/// 的，测试覆盖不到。
+/// stat 只关乎快慢，不关乎对错，这一步失败不能让同步失败：换一份**新的**临时索引
+/// 从空生成（不去删失败的那份——删不掉的话又是一个失败点，它的 `Drop` 会尽力清理）。
+/// 目前没有已知能让它失败而守卫放行的输入：冲突条目会先被 `diff-index --cached` 的
+/// 守卫挡下。所以这条退路是防御性的，测试覆盖不到。
 fn build_index_keeping_stat(repo_root: &str, index: &Path, target: &str) -> Result<TempIndex> {
-    let staging = match merge_onto_copy(repo_root, index, target) {
-        Ok(idx) => idx,
+    match merge_onto_copy(repo_root, index, target) {
+        Ok(idx) => Ok(idx),
         Err(e) => {
             log::warn!("沿用 stat 生成索引失败，退回从空索引生成：{}", e.message);
             let idx = TempIndex::empty(repo_root)?;
             idx.git(repo_root, &["read-tree", target])?;
-            idx
+            Ok(idx)
         }
-    };
-    if let Err(e) = staging.git(repo_root, &["update-index", "-q", "--refresh"]) {
-        log::warn!(
-            "刷新新索引的 stat 失败，之后第一次 status 会慢：{}",
-            e.message
-        );
     }
-    Ok(staging)
 }
 
 fn merge_onto_copy(repo_root: &str, index: &Path, target: &str) -> Result<TempIndex> {
     let idx = TempIndex::empty(repo_root)?;
     if index.is_file() {
         copy_with_mtime(index, idx.path())?;
-        idx.git(repo_root, &["read-tree", "-i", "-m", target])?;
-    } else {
-        // 没有索引文件 = 空索引，没有 stat 可沿用
-        idx.git(repo_root, &["read-tree", target])?;
     }
+    idx.git(repo_root, &["read-tree", "-i", "-m", target])?;
+    clear_entry_flags(repo_root, &idx)?;
     Ok(idx)
+}
+
+/// 清掉条目上的 skip-worktree / assume-unchanged 标志。
+///
+/// 2026-10-30 实测：`read-tree -i -m` 把 skip-worktree 留在**内容已变**的条目上，
+/// assume-unchanged 也原样保留。同步之后紧接着 checkout / rebase 工作分支，带
+/// skip-worktree 的路径不会被写到磁盘，分支内容与磁盘静默分叉（第二轮独立 review）。
+/// 原来从空索引生成时这些标志每次都被清掉，同步流程依赖的正是那个形状，这里还原它。
+///
+/// `ls-files -v` 的标记：`S` / `s` = skip-worktree，小写 = assume-unchanged。两个
+/// `--no-*` 选项**必须分两次**：实测写在同一条命令里只有后一个生效。路径走 stdin，
+/// 数量可能成千上万（sparse checkout），放命令行会撞上 Windows 的长度上限。
+fn clear_entry_flags(repo_root: &str, idx: &TempIndex) -> Result<()> {
+    let listing = idx.git(repo_root, &["ls-files", "-v", "-z"])?;
+    let (mut skipped, mut assumed) = (Vec::new(), Vec::new());
+    for rec in listing.split('\0') {
+        let Some((tag, path)) = rec.split_once(' ') else {
+            continue;
+        };
+        if tag.eq_ignore_ascii_case("s") {
+            skipped.push(path);
+        }
+        if tag.chars().all(|c| c.is_ascii_lowercase()) {
+            assumed.push(path);
+        }
+    }
+    for (flag, paths) in [
+        ("--no-skip-worktree", skipped),
+        ("--no-assume-unchanged", assumed),
+    ] {
+        // 空列表不发命令：不让 git 去解释一个空的路径输入（AGENTS.md §6.2）
+        if paths.is_empty() {
+            continue;
+        }
+        let mut stdin = paths.join("\0").into_bytes();
+        stdin.push(0);
+        idx.git_stdin(repo_root, &["update-index", "-z", flag, "--stdin"], &stdin)?;
+    }
+    Ok(())
 }
 
 fn copy_with_mtime(from: &Path, to: &Path) -> Result<()> {

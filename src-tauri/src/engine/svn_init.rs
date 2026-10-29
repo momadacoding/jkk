@@ -1308,8 +1308,9 @@ fn align_branch(repo_root: &str, branch: &str, report: &RebuildReport) -> Result
                     format!(
                         "{}\n\n另外：把索引退回旧基线也失败了（{}）。\
                      `git status` 现在会显示一批你从没暂存过的改动，\
-                     请手工执行 `git read-tree -i -m {}` 复位\
-                     （`-i -m` 沿用索引里没变的条目的 stat，不带它的话之后每次刷新都要全量重新哈希）。",
+                     请手工执行 `git read-tree {}` 复位，再执行一次 \
+                     `git update-index -q --refresh`（不刷新的话之后每次刷新状态都要\
+                     把所有文件重新哈希一遍）。",
                         e.message, re.message, report.old_baseline
                     ),
                 ),

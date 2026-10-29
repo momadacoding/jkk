@@ -186,6 +186,32 @@ fn swapping_succeeds_when_a_changed_entry_has_unstaged_edits_on_disk() {
 }
 
 #[test]
+fn swapping_clears_skip_worktree_and_assume_unchanged_like_before() {
+    // 2026-10-30 实测：`read-tree -i -m` 把 skip-worktree 留在**内容已变**的条目上，
+    // assume-unchanged 也原样保留。同步之后紧接着 checkout / rebase 工作分支，带
+    // skip-worktree 的路径不会被写到磁盘，分支内容与磁盘静默分叉（独立 review）。
+    // 原来从空索引生成时这些标志每次都被清掉，同步流程依赖的正是那个形状。
+    let t = two_trees();
+    let p = t.dir.path();
+    fs::write(p.join("b.txt"), "B2\n").unwrap();
+    fixture_git(p, &["update-index", "--skip-worktree", "a.txt", "b.txt"]);
+    fixture_git(p, &["update-index", "--assume-unchanged", "c.txt"]);
+
+    swap_index_to_tree(p.to_str().unwrap(), &t.old, &t.new).unwrap();
+
+    // `ls-files -v`：H = 普通条目，S = skip-worktree，小写 = assume-unchanged
+    let tags = fixture_git(p, &["ls-files", "-v"]);
+    assert_eq!(tags, "H a.txt\nH b.txt\nH c.txt", "标志必须全部清掉");
+    assert_eq!(
+        run_git(p.to_str().unwrap(), &["write-tree"])
+            .unwrap()
+            .trim(),
+        t.new,
+        "清标志不能改动条目内容"
+    );
+}
+
+#[test]
 fn swapping_still_refuses_when_something_is_staged() {
     // 换索引会冲掉暂存内容，所以「索引此刻仍等于 expect」的守卫不能因为换了
     // 生成新索引的写法而松掉
