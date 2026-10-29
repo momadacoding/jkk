@@ -12,7 +12,7 @@
 use crate::engine::git_cli::{run_git, run_git_code};
 use crate::engine::svn_attributes::{has_eol_rule, restore_attributes, write_attributes};
 use crate::engine::svn_baseline::{
-    git_dir, publish_baseline, swap_index_to_tree, TempIndex, Trailer,
+    git_dir, publish_baseline, refresh_index_stat, swap_index_to_tree, TempIndex, Trailer,
 };
 use crate::engine::svn_cli::run_svn;
 use crate::engine::svn_config::{
@@ -763,15 +763,9 @@ fn build_repo(
     // 只这一次付全量哈希的代价，之后同步换索引会沿用这里填好的 stat
     // （`svn_baseline::swap_index_to_tree`）。
     //
-    // `-q`：有修改 / 删除的文件不算错，照常只给干净的条目填 stat（2026-10-30 实测
-    // 退出码为 0）。stat 只关乎快慢、不关乎对错，所以失败也只记 warning、不让建库失败。
+    // 失败策略见 `refresh_index_stat`：只记 warning、不让建库失败。
     clock.run("刷新索引 stat（git update-index --refresh）", || {
-        if let Err(e) = run_git(root, &["update-index", "-q", "--refresh"]) {
-            log::warn!(
-                "建库后刷新索引 stat 失败，之后第一次 status 会慢：{}",
-                e.message
-            );
-        }
+        refresh_index_stat(root);
         Ok(())
     })?;
 
@@ -1317,6 +1311,9 @@ fn align_branch(repo_root: &str, branch: &str, report: &RebuildReport) -> Result
             },
         );
     }
+    // 分支与索引都到位之后才回填 stat：行尾迁移改写了全部 blob，这是一次全量哈希，
+    // 夹在换索引与 update-ref 之间会撑开「索引已换、分支未动」的窗口
+    refresh_index_stat(repo_root);
     Ok(())
 }
 

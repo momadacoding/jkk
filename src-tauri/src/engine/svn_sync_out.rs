@@ -16,7 +16,7 @@ use crate::engine::git_cli::{run_git, run_git_code, run_git_env};
 use crate::engine::graph::parse_local_only;
 use crate::engine::svn_baseline::{
     create_baseline_commit_with, move_baseline_ref, parse_trailer, read_baseline,
-    swap_index_to_tree, TempIndex, Trailer,
+    refresh_index_stat, swap_index_to_tree, TempIndex, Trailer,
 };
 use crate::engine::svn_cli::{run_svn, run_svn_code};
 use crate::engine::svn_config::{read_config, SvnConfig, BASELINE_BRANCH};
@@ -594,12 +594,17 @@ pub(crate) fn publish_delivered(repo: &str, cfg: &SvnConfig, j: &mut Journal) ->
     }
     // D8c：索引从交付树换成新基线树（CAS），磁盘不动——磁盘已经是 D6 之后的候选快照
     let (code, _) = run_git_code(repo, &["diff-index", "--cached", "--quiet", &new])?;
-    if code != 0 {
+    let swapped = code != 0;
+    if swapped {
         swap_index_to_tree(repo, &deliver, &new)?;
     }
     // 树 == 索引 == 磁盘，git 不写任何文件
     if current_branch(repo)?.as_deref() != Some(BASELINE_BRANCH) {
         checkout_verified(repo, cfg, BASELINE_BRANCH, false)?;
+    }
+    // 分支与索引都到位之后再回填这次变了的条目的 stat（`refresh_index_stat` 的理由）
+    if swapped {
+        refresh_index_stat(repo);
     }
     j.phase = Phase::RestoringBranch;
     svn_journal::write(repo, j)

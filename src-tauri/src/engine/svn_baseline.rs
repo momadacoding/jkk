@@ -423,22 +423,29 @@ pub fn swap_index_to_tree(repo_root: &str, expect: &str, target: &str) -> Result
         std::fs::rename(staging.path(), &index)?;
         // `staging` 的 Drop 会去删一个已经不存在的路径，`let _ =` 吃掉即可。
     }
-    refresh_stat(repo_root);
     Ok(())
 }
 
 /// 给真实索引里 stat 对不上的条目按磁盘回填 stat。
 ///
-/// 只沿用不回填的话，变了的条目 stat 永远是 0：行尾迁移改写全部 blob、一次大的
-/// `svn update`，之后又是每次刷新全量哈希（独立 review）。refresh 只哈希 stat 对不上
-/// 的条目，代价与这次变了的文件数成正比；与磁盘不一致（有本地改动）的条目照旧留 0。
-/// `-q` 下有修改 / 删除也返回 0（2026-10-30 实测）。
+/// [`swap_index_to_tree`] 只沿用没变的条目的 stat，变了的条目是 0；不回填的话，
+/// 行尾迁移改写全部 blob、一次大的 `svn update` 之后，又是每次刷新全量哈希（独立
+/// review）。refresh 只哈希 stat 对不上的条目，代价与这次变了的文件数成正比；与磁盘
+/// 不一致（有本地改动）的条目照旧留 0。`-q` 下有修改 / 删除也返回 0（2026-10-30 实测）。
 ///
-/// **放在释放索引锁之后**（第二轮独立 review）：行尾迁移会让它哈希全部文件，在锁里跑
-/// 等于让 IDE、终端的 git 写操作在这几十秒里全部撞上 `index.lock`。它只改 stat、不改
-/// 条目内容，git 自己会拿锁，与别的进程并发是安全的；拿不到锁就只是这次没刷。
-/// stat 只关乎快慢，不关乎对错，所以失败只记 warning。
-fn refresh_stat(repo_root: &str) {
+/// # 由调用方在流程走完后调，不放进 swap
+///
+/// 行尾迁移是「先换索引、再 `update-ref`」。refresh 放在 swap 里，这一次全量哈希就夹在
+/// 两步之间，几十秒里索引已是新基线、分支还指着旧的，外部 `git status` 看到满屏已暂存
+/// 的改动，外部挪动分支还会让回滚再付一遍全量哈希（第三轮独立 review）。
+///
+/// # 它自己也拿 `index.lock`
+///
+/// `git update-index --refresh` 从开始到写回全程持有 `index.lock`，这段时间别的 git
+/// 写操作会撞锁——这是填 stat 本身的代价，用户自己跑一次 `git status` 也一样，挪到哪里
+/// 都免不了，只能让它少哈希（这正是沿用 stat 的意义）。拿不到锁时它直接失败，只是
+/// 这次没刷。stat 只关乎快慢，不关乎对错，所以失败只记 warning、不让调用方失败。
+pub fn refresh_index_stat(repo_root: &str) {
     if let Err(e) = run_git(repo_root, &["update-index", "-q", "--refresh"]) {
         log::warn!("刷新索引 stat 失败，之后第一次 status 会慢：{}", e.message);
     }
@@ -457,7 +464,7 @@ fn refresh_stat(repo_root: &str) {
 ///
 /// 单树合并：内容与 `target` 相同的条目原样保留（连同 stat），变了的条目换成新
 /// blob、stat 清零——旧 stat 对新内容无效，沿用它就是把新内容当成旧内容。变了的
-/// 条目由换上之后的 [`refresh_stat`] 回填。2026-10-30 实测（probe-readtree.sh）：
+/// 条目由调用方在流程走完后调 [`refresh_index_stat`] 回填。2026-10-30 实测（probe-readtree.sh）：
 ///
 /// ```text
 /// read-tree -m      → 换掉的条目在工作区有未暂存改动时拒绝：

@@ -11,7 +11,7 @@
 mod svn_fixtures;
 
 use app_lib::engine::git_cli::{run_git, run_git_code};
-use app_lib::engine::svn_baseline::swap_index_to_tree;
+use app_lib::engine::svn_baseline::{refresh_index_stat, swap_index_to_tree};
 use app_lib::engine::svn_init::{init_hybrid, InitRequest};
 use std::fs;
 use std::path::Path;
@@ -145,16 +145,42 @@ fn swapping_the_index_keeps_stat_for_entries_the_new_tree_did_not_change() {
         c_before,
         "c.txt 没变，stat 必须原样保留"
     );
-    // b.txt 换了内容：旧 stat 对新 blob 无效不能沿用，而且要按磁盘重新填上——
+    // b.txt 换了内容：旧 stat 对新 blob 无效，不能沿用。swap 本身**不**回填——回填要
+    // 哈希文件，行尾迁移时是全量，放在 swap 里会撑开「索引已换、分支未动」的窗口
+    // （第三轮独立 review），由调用方在流程走完后调 `refresh_index_stat`
+    assert_eq!(index_stat(p, "b.txt").0, 0, "b.txt 变了，旧 stat 不能沿用");
+    assert_ne!(index_stat(p, "b.txt"), b_old_stat);
+
     // 留成 0 的话，行尾迁移这种改写全部 blob 的操作之后，慢又全部回来了（独立 review）
+    refresh_index_stat(p.to_str().unwrap());
     let b_now = index_stat(p, "b.txt");
-    assert_ne!(b_now, b_old_stat, "b.txt 变了，旧 stat 不能沿用");
     assert!(
         b_now.0 != 0 && b_now.2 == 3,
-        "b.txt 与磁盘一致，stat 应当按磁盘重新填上，实际 {b_now:?}"
+        "b.txt 与磁盘一致，refresh 后 stat 应当按磁盘重新填上，实际 {b_now:?}"
     );
+    assert_eq!(index_stat(p, "a.txt"), a_before, "refresh 不该动没变的条目");
     let (code, _) = run_git_code(p.to_str().unwrap(), &["diff", "--quiet"]).unwrap();
     assert_eq!(code, 0, "磁盘就是新树的内容，工作区相对索引应当干净");
+}
+
+#[test]
+fn swapping_works_when_the_real_index_file_does_not_exist() {
+    // 依赖的 git 行为（2026-10-30 实测）：`GIT_INDEX_FILE` 指向不存在的文件时，
+    // `read-tree -i -m` 当成空索引照常工作，所以没有单独的分支。没有索引文件 = 空索引，
+    // 守卫只在 expect 是空树时放行，这里就构造那个形态（AGENTS.md §6.2：实测行为固化成测试）
+    let t = two_trees();
+    let p = t.dir.path();
+    let empty = fixture_git(p, &["hash-object", "-t", "tree", "-w", "--stdin"]);
+    fs::remove_file(p.join(".git/index")).unwrap();
+
+    swap_index_to_tree(p.to_str().unwrap(), &empty, &t.new).unwrap();
+
+    assert_eq!(
+        run_git(p.to_str().unwrap(), &["write-tree"])
+            .unwrap()
+            .trim(),
+        t.new
+    );
 }
 
 #[test]
