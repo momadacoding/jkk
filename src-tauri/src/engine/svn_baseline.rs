@@ -411,8 +411,7 @@ pub fn swap_index_to_tree(repo_root: &str, expect: &str, target: &str) -> Result
     }
 
     let index = git_dir(repo_root)?.join("index");
-    let staging = TempIndex::empty(repo_root)?;
-    fill_keeping_stat(repo_root, &index, &staging, target)?;
+    let staging = build_index_keeping_stat(repo_root, &index, target)?;
     // rename 覆盖：锁在手里，没有别的 git 进程会同时读写 .git/index。
     // 这正是 git 自己换索引的做法（写 index.lock 再 rename）。
     std::fs::rename(staging.path(), &index)?;
@@ -420,16 +419,16 @@ pub fn swap_index_to_tree(repo_root: &str, expect: &str, target: &str) -> Result
     Ok(())
 }
 
-/// 在 `staging` 里生成 `target` 树的索引，**沿用真实索引里没变的条目的 stat**。
+/// 生成一份 `target` 树的临时索引，**条目尽量带着有效的 stat**。
 ///
-/// # 为什么不能从空索引 `read-tree`
+/// # 为什么不能只从空索引 `read-tree`
 ///
 /// 从空索引读出来的条目 ctime / mtime / size 全是 0。git 与 libgit2 都只能逐个读
 /// 文件哈希来判断「没改」——2026-10-28 现场一万五千个文件 `git status` 冷缓存 53 秒，
 /// 而 libgit2 只读不回写，客户端每次刷新都要重来一遍，Local Changes 长时间刷不出来。
 /// 每次同步都会走到这里，等于每次同步都把这个慢重新造一遍。
 ///
-/// # 为什么是复制 + `read-tree -i -m`
+/// # 第一步：复制真实索引 + `read-tree -i -m`
 ///
 /// 单树合并：内容与 `target` 相同的条目原样保留（连同 stat），变了的条目换成新
 /// blob、stat 清零——旧 stat 对新内容无效，沿用它就是把新内容当成旧内容。
@@ -444,6 +443,16 @@ pub fn swap_index_to_tree(repo_root: &str, expect: &str, target: &str) -> Result
 /// 同步把服务器改动合进一个本地也改过的文件，正是 `-m` 拒绝的形态，所以必须带
 /// `-i`。它也不动磁盘（没有 `-u`），与原来的做法一样只写索引。
 ///
+/// 条目上的 skip-worktree / assume-unchanged 标志随之保留，与 `git reset --mixed`
+/// 一致；原来从空索引生成时每次同步都会把用户设的这些标志悄悄抹掉。
+///
+/// # 第二步：`update-index -q --refresh`
+///
+/// 只沿用不回填的话，变了的条目 stat 永远是 0：行尾迁移改写全部 blob、一次大的
+/// `svn update`，之后又是每次刷新全量哈希（独立 review）。refresh 只哈希 stat 对不上
+/// 的条目，代价与这次变了的文件数成正比；与磁盘不一致（有本地改动）的条目照旧留 0。
+/// `-q` 下有修改 / 删除也返回 0（2026-10-30 实测）。
+///
 /// # 复制必须保留 mtime
 ///
 /// git 判「racily clean」靠比较条目 mtime 与**索引文件自己的** mtime。复制出来的
@@ -452,32 +461,40 @@ pub fn swap_index_to_tree(repo_root: &str, expect: &str, target: &str) -> Result
 ///
 /// # 退路
 ///
-/// `-i -m` 在索引含冲突条目等情况下会失败。stat 只关乎快慢，不关乎对错，所以这时
-/// 退回从空索引生成，只记一条 warning——不能因为一个性能优化让同步失败。
-fn fill_keeping_stat(
-    repo_root: &str,
-    index: &Path,
-    staging: &TempIndex,
-    target: &str,
-) -> Result<()> {
-    if index.is_file() {
-        let kept = copy_with_mtime(index, staging.path())
-            .and_then(|()| staging.git(repo_root, &["read-tree", "-i", "-m", target]));
-        match kept {
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                log::warn!(
-                    "沿用 stat 生成索引失败，退回从空索引生成（之后第一次 status 会慢）：{}",
-                    e.message
-                );
-                if staging.path().exists() {
-                    std::fs::remove_file(staging.path())?;
-                }
-            }
+/// stat 只关乎快慢，不关乎对错，任何一步失败都不能让同步失败：第一步失败就换一份
+/// **新的**临时索引从空生成（不去删失败的那份——删不掉的话又是一个失败点，它的
+/// `Drop` 会尽力清理），refresh 失败只记 warning。目前没有已知能让第一步失败而守卫
+/// 放行的输入：冲突条目会先被 `diff-index --cached` 的守卫挡下。所以这条退路是防御性
+/// 的，测试覆盖不到。
+fn build_index_keeping_stat(repo_root: &str, index: &Path, target: &str) -> Result<TempIndex> {
+    let staging = match merge_onto_copy(repo_root, index, target) {
+        Ok(idx) => idx,
+        Err(e) => {
+            log::warn!("沿用 stat 生成索引失败，退回从空索引生成：{}", e.message);
+            let idx = TempIndex::empty(repo_root)?;
+            idx.git(repo_root, &["read-tree", target])?;
+            idx
         }
+    };
+    if let Err(e) = staging.git(repo_root, &["update-index", "-q", "--refresh"]) {
+        log::warn!(
+            "刷新新索引的 stat 失败，之后第一次 status 会慢：{}",
+            e.message
+        );
     }
-    staging.git(repo_root, &["read-tree", target])?;
-    Ok(())
+    Ok(staging)
+}
+
+fn merge_onto_copy(repo_root: &str, index: &Path, target: &str) -> Result<TempIndex> {
+    let idx = TempIndex::empty(repo_root)?;
+    if index.is_file() {
+        copy_with_mtime(index, idx.path())?;
+        idx.git(repo_root, &["read-tree", "-i", "-m", target])?;
+    } else {
+        // 没有索引文件 = 空索引，没有 stat 可沿用
+        idx.git(repo_root, &["read-tree", target])?;
+    }
+    Ok(idx)
 }
 
 fn copy_with_mtime(from: &Path, to: &Path) -> Result<()> {
@@ -709,4 +726,35 @@ fn moved_error(expected: Option<&str>, actual: Option<&str>) -> GitError {
              请重新读取当前状态后再录一次。"
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::copy_with_mtime;
+    use std::time::{Duration, SystemTime};
+
+    /// 复制出来的临时索引必须带着原索引的 mtime：git 拿索引文件自己的 mtime 判
+    /// racily clean，变成「现在」会让本该重新哈希的条目被当成干净的
+    /// （`std::fs::copy` 在 Unix 上不保留 mtime，Windows 上保留，两边都要成立）。
+    #[test]
+    fn the_copy_keeps_the_source_mtime() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (from, to) = (dir.path().join("index"), dir.path().join("copy"));
+        std::fs::write(&from, b"DIRC").unwrap();
+        let past = SystemTime::now() - Duration::from_secs(3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&from)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+
+        copy_with_mtime(&from, &to).unwrap();
+
+        assert_eq!(std::fs::read(&to).unwrap(), b"DIRC");
+        assert_eq!(
+            std::fs::metadata(&to).unwrap().modified().unwrap(),
+            std::fs::metadata(&from).unwrap().modified().unwrap()
+        );
+    }
 }
