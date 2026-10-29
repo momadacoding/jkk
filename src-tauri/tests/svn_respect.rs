@@ -9,6 +9,7 @@ mod svn_fixtures;
 use app_lib::engine::git_cli::run_git;
 use app_lib::engine::svn_baseline::TempIndex;
 use app_lib::engine::svn_config::{read_config, write_config};
+use app_lib::engine::svn_gitignore::display_path;
 use app_lib::engine::svn_health::Health;
 use app_lib::engine::svn_init::{check_current_baseline, rebuild_baseline};
 use app_lib::engine::svn_server_set::{audit_server_set_at_baseline, ServerAudit};
@@ -125,6 +126,56 @@ fn respect_delivery_treats_gitignored_files_as_outside_git() {
     git(&fx, &["commit", "-qam", "work"]);
     let p = preview_sync_out(&fx.wc_str()).unwrap();
     assert_eq!(p.outside_changes, vec!["Code/Gen1.cs".to_string()]);
+}
+
+/// `work` 上提交了新文件 `Code/Foo.cs`（还没交付，基线里没有），之后才出现挡住它的
+/// `.gitignore`。口径参照的是基线树（设计 §4），它不算 W-file，交付照样拒绝——但不能再说
+/// 「不在白名单里、多半是 `git add -f`」：它就在白名单里。要点名是哪个文件的哪一行
+/// （/code-review 第 4 条，用户 2026-10-30 选方案 B：口径不动，只把提示说对）。
+#[test]
+fn respect_delivery_names_the_gitignore_line_that_hides_a_committed_new_file() {
+    let fx = hybrid_with_colleague();
+    enable_respect(&fx);
+    std::fs::write(fx.wc().join("Code/Foo.cs"), "foo\n").unwrap();
+    git(&fx, &["add", "Code/Foo.cs"]);
+    git(&fx, &["commit", "-qm", "foo"]);
+    std::fs::write(fx.wc().join("Code/.gitignore"), "# 后来加的\nFoo.cs\n").unwrap();
+
+    let err = preview_sync_out(&fx.wc_str()).expect_err("口径不变，必须拒绝");
+    assert_eq!(err.code, "sync_out_hidden_by_gitignore", "{}", err.message);
+    let gitignore = display_path(&fx.wc_str(), "Code/.gitignore");
+    assert!(err.message.contains("Code/Foo.cs"), "{}", err.message);
+    assert!(
+        err.message
+            .contains(&format!("{gitignore} 第 2 行 `Foo.cs`")),
+        "{}",
+        err.message
+    );
+    assert!(!err.message.contains("git add -f"), "{}", err.message);
+}
+
+/// 真正在白名单外的改动与被 `.gitignore` 挡住的同时出现：两类分开点名，前者沿用原来的说法。
+#[test]
+fn respect_delivery_still_calls_out_changes_outside_the_whitelist_separately() {
+    let fx = hybrid_with_colleague();
+    enable_respect(&fx);
+    std::fs::write(fx.wc().join("Code/Foo.cs"), "foo\n").unwrap();
+    std::fs::create_dir_all(fx.wc().join("Art")).unwrap();
+    std::fs::write(fx.wc().join("Art/x.psd"), "psd\n").unwrap();
+    git(&fx, &["add", "Code/Foo.cs"]);
+    git(&fx, &["add", "-f", "Art/x.psd"]);
+    git(&fx, &["commit", "-qm", "foo"]);
+    std::fs::write(fx.wc().join("Code/.gitignore"), "Foo.cs\n").unwrap();
+
+    let err = preview_sync_out(&fx.wc_str()).expect_err("必须拒绝");
+    assert_eq!(err.code, "sync_out_hidden_by_gitignore", "{}", err.message);
+    let (hidden, outside) = err
+        .message
+        .split_once("不在白名单里")
+        .unwrap_or_else(|| panic!("缺「不在白名单里」一段：{}", err.message));
+    assert!(hidden.contains("Code/Foo.cs"), "{}", err.message);
+    assert!(!hidden.contains("Art/x.psd"), "{}", err.message);
+    assert!(outside.contains("Art/x.psd"), "{}", err.message);
 }
 
 #[test]

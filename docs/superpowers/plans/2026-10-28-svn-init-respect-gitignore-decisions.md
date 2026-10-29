@@ -288,7 +288,7 @@ review 由独立的 review agent 完成，10 条。逐条先核实再处理：
 | 1 大小写不同的 `.GitIgnore` 第 2 步看不见 | **成立**（实测） | 已修 |
 | 2 `is_versioned` 按小写名问 svn，受控的 `.GitIgnore` 会被改名 | **不成立**（实测） | 不改 |
 | 3 `restore_gitignores` 判存在后 `rename`，有覆盖窗口 | 成立（读代码） | 已修 |
-| 4 只把基线树当已跟踪，`work` 上已提交、基线里没有的文件后来被 `.gitignore` 挡住会被当成白名单外 | 成立，是 spec 没覆盖的缺口 | **待用户决定**（改 W-file 定义，波及所有入口） |
+| 4 只把基线树当已跟踪，`work` 上已提交、基线里没有的文件后来被 `.gitignore` 挡住会被当成白名单外 | 成立，是 spec 没覆盖的缺口 | 用户选方案 B：口径不动，只把提示说对（见下） |
 | 5 向导重新检查后清单为空时「尊重」仍生效；重新检查失败盖掉原错误 | 成立（读代码） | 已修 |
 | 6 `detect_with_renames` 去重丢掉后几轮的计数 | 前半**不成立**；后半（上限静默退出）成立但只在病态结构下出现 | 不改 |
 | 7 `verdict_batch` 对不上号且没有 fatal 时静默丢弃 | 成立，但没见过触发形态 | 只补 `log::warn!` |
@@ -324,6 +324,17 @@ review 由独立的 review agent 完成，10 条。逐条先核实再处理：
 - 第 4 条为什么不顺手改：spec「参照统一是当前基线树里已有的文件」是写明的决定。改成「基线 ∪ `work` 的
   HEAD」会改动体检 / 重建 / 同步前检查 / 交付的口径。现在的表现是拒绝交付，提示里说的「多半是 `git add -f`」
   是误导，但不丢数据。
+  - Ruling（用户 2026-10-30）：方案 B——口径不动，只改提示；「基线 ∪ HEAD」留作以后单独设计。spec §4 已补「已知限制」。
+  - 做法：`WScope::hidden_reasons` 只对「路径判断是 W、又不在基线里」的路径问裁决，返回挡住它的 `Verdict`；
+    `changed_files` 先按原口径算出不是 W-file 的改动，再拆成「被 `.gitignore` 挡住」与「真正在白名单外」。
+    只有后者时错误码与文案逐字不变（`a_change_outside_the_whitelist_is_refused_not_filtered` 照旧通过）；
+    有前者时报新码 `sync_out_hidden_by_gitignore`，逐个写「路径（完整 .gitignore 路径 第 N 行 `规则`）」，
+    后者附在后面另起一段。前端没有按这两个码分支的地方，只显示正文，不用改。
+  - 顺带：`changed_files` 里的 `WScope` 建一次、过滤与点名共用（第 9 条的一小部分）。
+  - RED：`respect_delivery_names_the_gitignore_line_that_hides_a_committed_new_file`、
+    `respect_delivery_still_calls_out_changes_outside_the_whitelist_separately`，均拿到 `sync_out_outside_whitelist`。
+  - 安全：判定集合与改动前完全相同（`not_w` 的算法没动），只是报错的分组和文案变了；拒绝仍然拒绝，
+    没有任何路径因此变得可交付。`hidden_reasons` 不尊重时直接返回空、不起进程。
 - 第 6 条为什么前半不成立：不受控的一经发现就在影子树里停用，后面几轮不会再出现；会再次出现的只有受控的。
   受控的永远不改名，只有「尊重」时能建库，而「尊重」时外层也不停用——第 0 轮的计数就是「尊重」口径下的
   真实数字，后几轮的反而不对。

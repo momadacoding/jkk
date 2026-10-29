@@ -21,10 +21,10 @@
 
 use crate::engine::git_cli::{run_git, run_git_code};
 use crate::engine::svn_config::{SvnConfig, BASELINE_BRANCH};
-use crate::engine::svn_gitignore::{query_verdicts, GitCtx};
+use crate::engine::svn_gitignore::{query_verdicts, GitCtx, Verdict};
 use crate::engine::svn_include_check::normalize_roots;
 use crate::error::{GitError, Result};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// 一次操作里的 W-file 口径。每个入口在操作开头建一个，整次操作复用。
@@ -133,15 +133,36 @@ impl WScope {
             .into_iter()
             .collect())
     }
+
+    /// 这批路径里**只因为**被工作树 `.gitignore` 挡住才不算 W-file 的那些，连同挡住它的裁决。
+    ///
+    /// 给报错用：路径就在白名单里、扩展名也对，用户要知道的是「哪个文件的哪一行」，而不是
+    /// 一句「不在白名单里」（/code-review 第 4 条）。不尊重时为空，不起进程。
+    pub(crate) fn hidden_reasons<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> Result<BTreeMap<String, Verdict>> {
+        let Some(r) = &self.respect else {
+            return Ok(BTreeMap::new());
+        };
+        let ask: Vec<&str> = paths
+            .into_iter()
+            .filter(|p| path_is_w(p, &self.roots, &self.extensions) && !r.tracked.contains(*p))
+            .collect();
+        verdicts_hiding(&r.repo_root, &ask)
+    }
 }
 
 /// `files` 里被工作树 `.gitignore` 排除的那些。
 fn hidden_by_gitignore(repo_root: &str, files: &[&str]) -> Result<BTreeSet<String>> {
-    Ok(query_verdicts(&GitCtx::Repo(repo_root), files)?
-        .into_iter()
-        .filter(|(_, v)| v.ignores() && v.in_worktree_gitignore())
-        .map(|(p, _)| p)
-        .collect())
+    Ok(verdicts_hiding(repo_root, files)?.into_keys().collect())
+}
+
+/// `files` 里被工作树 `.gitignore` 排除的那些，连同裁决。
+fn verdicts_hiding(repo_root: &str, files: &[&str]) -> Result<BTreeMap<String, Verdict>> {
+    let mut v = query_verdicts(&GitCtx::Repo(repo_root), files)?;
+    v.retain(|_, v| v.ignores() && v.in_worktree_gitignore());
+    Ok(v)
 }
 
 /// 当前基线树里的文件。基线 ref 还不存在（建库途中）时为空。

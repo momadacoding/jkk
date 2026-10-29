@@ -269,24 +269,54 @@ pub(crate) fn changed_files(
             ),
         ));
     }
-    let w_files = WScope::for_repo(repo, cfg)?.filter(changes.iter().map(|c| c.path.as_str()))?;
-    let outside: Vec<String> = changes
+    let scope = WScope::for_repo(repo, cfg)?;
+    let w_files = scope.filter(changes.iter().map(|c| c.path.as_str()))?;
+    let not_w: Vec<String> = changes
         .iter()
         .filter(|c| !w_files.contains(&c.path))
         .map(|c| c.path.clone())
         .collect();
-    if !outside.is_empty() {
+    if not_w.is_empty() {
+        return Ok(changes);
+    }
+    // 「尊重」口径下，白名单里、却被后来出现的 `.gitignore` 挡住的新文件也不是 W-file
+    // （参照的是基线树，设计 §4）。照样拒绝，但要说清是哪一行挡的——它们不是 `git add -f`
+    // 加进来的，「不在白名单里」会把人引到错的方向（/code-review 第 4 条）。
+    let hidden = scope.hidden_reasons(not_w.iter().map(String::as_str))?;
+    let outside: Vec<String> = not_w
+        .into_iter()
+        .filter(|p| !hidden.contains_key(p))
+        .collect();
+    let outside_msg = (!outside.is_empty()).then(|| {
+        format!(
+            "下面这些改动不在白名单里，本应用不替你交付它们：\n{}\n它们多半是用 `git add -f` \
+             加进来的。交付之后分支会接到服务器的新内容上，这些改动会从分支上消失——所以这里\
+             停下，不悄悄跳过。请先把它们移出这个分支的提交，或用 TortoiseSVN 提交。",
+            list_paths(&outside)
+        )
+    });
+    if hidden.is_empty() {
         return Err(GitError::new(
             "sync_out_outside_whitelist",
-            format!(
-                "下面这些改动不在白名单里，本应用不替你交付它们：\n{}\n它们多半是用 `git add -f` \
-                 加进来的。交付之后分支会接到服务器的新内容上，这些改动会从分支上消失——所以这里\
-                 停下，不悄悄跳过。请先把它们移出这个分支的提交，或用 TortoiseSVN 提交。",
-                list_paths(&outside)
-            ),
+            outside_msg.unwrap_or_default(),
         ));
     }
-    Ok(changes)
+    let lines: Vec<String> = hidden
+        .iter()
+        .map(|(p, v)| format!("{p}（{}）", v.describe(repo)))
+        .collect();
+    let mut msg = format!(
+        "下面这些改动在白名单里，但被 .gitignore 挡住了，又还不在基线里。这个仓库建库时选了\
+         「尊重已有的 .gitignore 规则」，按这个口径它们不交给 git 管，本应用不替你交付：\n{}\n\
+         想交付它们，请先删掉或改掉挡住它们的那一行（那个 .gitignore 受 SVN 版本控制的话，这本身\
+         也是一次要交付的改动），或用 TortoiseSVN 提交；不想交付，请把它们移出这个分支的提交。",
+        list_paths(&lines)
+    );
+    if let Some(o) = outside_msg {
+        msg.push_str("\n\n另外，");
+        msg.push_str(&o);
+    }
+    Err(GitError::new("sync_out_hidden_by_gitignore", msg))
 }
 
 /// 白名单目录里 git 管不到、有本地修改的文件（W-path 减 W-file，§6.3.2）。有 svn 冲突态就拒绝。
