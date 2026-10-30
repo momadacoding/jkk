@@ -12,7 +12,7 @@
 use crate::engine::git_cli::{run_git, run_git_code};
 use crate::engine::svn_attributes::{has_eol_rule, restore_attributes, write_attributes};
 use crate::engine::svn_baseline::{
-    git_dir, publish_baseline, swap_index_to_tree, TempIndex, Trailer,
+    git_dir, publish_baseline, refresh_index_stat, swap_index_to_tree, TempIndex, Trailer,
 };
 use crate::engine::svn_cli::run_svn;
 use crate::engine::svn_config::{
@@ -757,6 +757,18 @@ fn build_repo(
         run_git(root, &["read-tree", &tree])
     })?;
 
+    // 刚 read-tree 出来的条目没有 stat（全是 0），不补的话之后每次 status 都要把
+    // 白名单里的文件全部重新哈希一遍，而客户端读状态走的 libgit2 只读不回写，
+    // 这个慢永远不会自愈（2026-10-28 现场：一万五千个文件冷缓存 53 秒）。
+    // 只这一次付全量哈希的代价，之后同步换索引会沿用这里填好的 stat
+    // （`svn_baseline::swap_index_to_tree`）。
+    //
+    // 失败策略见 `refresh_index_stat`：只记 warning、不让建库失败。
+    clock.run("刷新索引 stat（git update-index --refresh）", || {
+        refresh_index_stat(root);
+        Ok(())
+    })?;
+
     // Lying 的判定放在阶段**里面**：它是这一阶段的失败，耗时表要把「← 在这一步
     // 失败」标在体检上。放在外面的话，体检阶段算成功，表里一个失败标记都没有。
     let health = clock.run("基线体检（svn diff）", || {
@@ -1290,13 +1302,18 @@ fn align_branch(repo_root: &str, branch: &str, report: &RebuildReport) -> Result
                     format!(
                         "{}\n\n另外：把索引退回旧基线也失败了（{}）。\
                      `git status` 现在会显示一批你从没暂存过的改动，\
-                     请手工执行 `git read-tree {}` 复位。",
+                     请手工执行 `git read-tree {}` 复位，再执行一次 \
+                     `git update-index -q --refresh`（不刷新的话之后每次刷新状态都要\
+                     把所有文件重新哈希一遍）。",
                         e.message, re.message, report.old_baseline
                     ),
                 ),
             },
         );
     }
+    // 分支与索引都到位之后才回填 stat：行尾迁移改写了全部 blob，这是一次全量哈希，
+    // 夹在换索引与 update-ref 之间会撑开「索引已换、分支未动」的窗口
+    refresh_index_stat(repo_root);
     Ok(())
 }
 

@@ -20,7 +20,7 @@ use crate::engine::file_lock::{describe, find_blockers};
 use crate::engine::git_cli::{run_git, run_git_code, run_git_env};
 use crate::engine::svn_baseline::{
     create_baseline_commit, git_dir, move_baseline_ref, parse_trailer, read_baseline,
-    swap_index_to_tree, TempIndex, Trailer,
+    refresh_index_stat, swap_index_to_tree, TempIndex, Trailer,
 };
 use crate::engine::svn_cli::{run_svn, run_svn_code};
 use crate::engine::svn_config::{read_config, SvnConfig, BASELINE_BRANCH};
@@ -438,7 +438,10 @@ fn align_index(repo: &str, old: &str, new: &str) -> Result<()> {
         return Ok(()); // 已对齐
     }
     // CAS：索引必须仍是旧基线树，否则有别的 git 操作动过它，宁可停下也不覆盖
-    swap_index_to_tree(repo, old, new)
+    swap_index_to_tree(repo, old, new)?;
+    // 此刻 HEAD 已在新基线上，索引与它一致，可以回填这次变了的条目的 stat
+    refresh_index_stat(repo);
+    Ok(())
 }
 
 /// S8 起：切回原分支、复核待重放区间、rebase。
