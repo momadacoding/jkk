@@ -1,16 +1,21 @@
 import { useState } from 'react'
 import {
   WIZARD_STEPS,
+  describeGitignoreConflicts,
+  describeGitignoreOutcome,
   describeHealth,
   describePinned,
   describeTimings,
+  effectiveRespect,
+  gitignoreBlockReason,
+  needsReconfirm,
   nextStep,
   parseExtensions,
   splitErrorMessage,
   stepStatus,
   wizardErrorHint,
 } from '../engine/svnInit'
-import type { InitReport, Notice, Preflight, StepId } from '../engine/svnInit'
+import type { InitPreflight, InitReport, Notice, StepId } from '../engine/svnInit'
 import { toErrorCode, toErrorMessage } from '../engine/errors'
 
 interface SvnInitWizardProps {
@@ -27,10 +32,19 @@ interface SvnInitWizardProps {
    * 一起变成死代码。窗口验证时看到「向导退场、主界面接上」，还把它当成了预期行为。
    */
   onFinish: () => void
-  /** 只跑 P1–P4，什么都不创建。失败时应当抛出。 */
-  onPreflight: (whitelist: string[]) => Promise<Preflight>
-  /** 真正建库。失败时应当抛出——向导据此留在原地并显示错误，好让用户修完重试。 */
-  onInit: (whitelist: string[], extensions: string[]) => Promise<InitReport>
+  /** P1–P4 加起作用的 `.gitignore`，什么都不创建。失败时应当抛出。 */
+  onPreflight: (whitelist: string[], extensions: string[]) => Promise<InitPreflight>
+  /**
+   * 真正建库。失败时应当抛出——向导据此留在原地并显示错误，好让用户修完重试。
+   *
+   * `acknowledged` 是第 3 步展示过的 `.gitignore`（相对路径），后端拿它与此刻查到的对账。
+   */
+  onInit: (
+    whitelist: string[],
+    extensions: string[],
+    respectGitignore: boolean,
+    acknowledged: string[],
+  ) => Promise<InitReport>
 }
 
 /** 一条提示的渲染。tone 决定配色，内容全部由 `engine/svnInit` 算好。 */
@@ -62,8 +76,10 @@ export default function SvnInitWizard({
   const [extensionsText, setExtensionsText] = useState('.cs')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<{ code: string; message: string } | null>(null)
-  const [preflight, setPreflight] = useState<Preflight | null>(null)
+  const [preflight, setPreflight] = useState<InitPreflight | null>(null)
   const [report, setReport] = useState<InitReport | null>(null)
+  /** 「尊重已有的 .gitignore 规则」，默认不勾（用户 2026-10-28 决定）。 */
+  const [respectGitignore, setRespectGitignore] = useState(false)
 
   const whitelist = whitelistText
     .split('\n')
@@ -85,9 +101,14 @@ export default function SvnInitWizard({
     }
   }
 
+  const conflicts = preflight?.gitignoreConflicts ?? []
+  const conflictsNotice = describeGitignoreConflicts(conflicts)
+  const blockReason = gitignoreBlockReason(conflicts, respectGitignore)
+
   const healthNotice = report ? describeHealth(report.health) : null
   const pinnedNotice = report ? describePinned(report.pinned) : null
   const timingsNotice = report ? describeTimings(report.timings) : null
+  const gitignoreNotice = report ? describeGitignoreOutcome(report.gitignore) : null
   const errorParts = error ? splitErrorMessage(error.message) : null
   const errorHint = error ? wizardErrorHint(error.code, error.message) : ''
 
@@ -154,6 +175,29 @@ export default function SvnInitWizard({
         </div>
       )}
 
+      {/* 起作用的 .gitignore 列在「建库」按钮上方；没有冲突时这一块和勾选框都不渲染 */}
+      {step === 'confirm' && conflictsNotice && (
+        <>
+          <NoticeBox notice={conflictsNotice} />
+          {/* `.dlg-field` 是横向 flex：说明文字放进去会被挤到右边一列，所以单独成块 */}
+          <label className="dlg-field dlg-check">
+            <input
+              type="checkbox"
+              checked={respectGitignore}
+              onChange={(e) => setRespectGitignore(e.target.checked)}
+              disabled={busy}
+            />
+            尊重已有的 .gitignore 规则
+          </label>
+          <div className="dlg-note">
+            不勾：上面这些 .gitignore 会改名为 .gitignore.jkk-disabled 停用，文件照样交给 git 管。
+            <br />
+            勾上：被它们挡掉的文件不交给 git 管，以后的更新、交付也按这个口径。
+          </div>
+          {blockReason && <div className="dlg-note svn-notice error">{blockReason}</div>}
+        </>
+      )}
+
       {step === 'done' && report && (
         <>
           <div className="dlg-note">
@@ -161,6 +205,7 @@ export default function SvnInitWizard({
             <div>首个基线：r{report.nodeRev}（{report.baseline.slice(0, 10)}）</div>
             <div>当前分支已切到 work，基线分支是 svn/base。</div>
           </div>
+          {gitignoreNotice && <NoticeBox notice={gitignoreNotice} />}
           {healthNotice && <NoticeBox notice={healthNotice} />}
           {pinnedNotice && <NoticeBox notice={pinnedNotice} />}
           {timingsNotice && <NoticeBox notice={timingsNotice} />}
@@ -193,7 +238,7 @@ export default function SvnInitWizard({
             disabled={busy || whitelist.length === 0 || extensions.length === 0}
             onClick={() =>
               run(async () => {
-                setPreflight(await onPreflight(whitelist))
+                setPreflight(await onPreflight(whitelist, extensions))
                 setStep(nextStep('choose') ?? 'preflight')
               })
             }
@@ -209,11 +254,31 @@ export default function SvnInitWizard({
         {step === 'confirm' && (
           <button
             type="button"
-            disabled={busy}
+            disabled={busy || blockReason !== null}
             onClick={() =>
               run(async () => {
-                setReport(await onInit(whitelist, extensions))
-                setStep('done')
+                try {
+                  setReport(
+                    await onInit(
+                      whitelist,
+                      extensions,
+                      effectiveRespect(conflicts, respectGitignore),
+                      conflicts.map((c) => c.path),
+                    ),
+                  )
+                  setStep('done')
+                } catch (e) {
+                  // 出现了用户没看过的 .gitignore：重新检查、把新清单摆出来，留在这一步。
+                  // 错误照常显示，告诉用户为什么清单变了
+                  if (needsReconfirm(toErrorCode(e) ?? '')) {
+                    try {
+                      setPreflight(await onPreflight(whitelist, extensions))
+                    } catch {
+                      // 重新检查失败时留着旧清单；要显示的是建库为什么没成，不是这一次
+                    }
+                  }
+                  throw e
+                }
               })
             }
           >

@@ -16,13 +16,13 @@
 use crate::engine::svn_externals::PinnedExternal;
 use crate::engine::svn_health::Health;
 use crate::engine::svn_init::{
-    check_current_baseline, eol_status, init_hybrid, migrate_eol, pinned_externals,
-    rebuild_baseline, EolStatus, InitReport, InitRequest, RebuildReport,
+    check_current_baseline, eol_status, init_hybrid_with, init_preflight, migrate_eol,
+    pinned_externals, rebuild_baseline, EolStatus, GitignoreChoice, InitPreflight, InitReport,
+    InitRequest, RebuildReport,
 };
 use crate::engine::svn_journal::{Flow, Phase};
 use crate::engine::svn_lock::LockHolder;
 use crate::engine::svn_log::{fetch_log, read_log, LogPage};
-use crate::engine::svn_preflight::{run_preflight, Preflight};
 use crate::engine::svn_server_set::{audit_server_set_at_baseline, ServerAudit};
 use crate::engine::svn_sync::{check_sync, read_root_revs, RootRev, SyncStatus};
 use crate::engine::svn_sync_in::new_opid;
@@ -30,26 +30,44 @@ use crate::engine::{svn_journal, svn_lock};
 use crate::error::GitError;
 use crate::vcs::{detect_repo_kind, RepoKind};
 
-/// 只跑前置校验 P1–P4，**什么都不创建**。
+/// 向导第 2 步：前置校验 P1–P4，再查起作用的 `.gitignore`。**什么都不创建**。
 ///
 /// 向导在用户确认白名单之后、真正动手之前调它，把「能不能建」这件事先告诉用户。
+/// 查 `.gitignore` 要知道扩展名（「起作用」只算挡住了 W-file 的），所以多收一个
+/// `extensions`——前端 invoke 参数名同为 `extensions`（AGENTS.md §7.3）。
 #[tauri::command(async)]
-pub fn svn_preflight_check(path: String, whitelist: Vec<String>) -> Result<Preflight, GitError> {
-    run_preflight(&path, &whitelist)
+pub fn svn_preflight_check(
+    path: String,
+    whitelist: Vec<String>,
+    extensions: Vec<String>,
+) -> Result<InitPreflight, GitError> {
+    init_preflight(&path, &whitelist, &extensions)
 }
 
-/// 走完整个初始化向导。任何一步失败都会把本次创建的 `.git` 删干净。
+/// 走完整个初始化向导。任何一步失败都会把本次创建的 `.git` 删干净（连同改过名的
+/// `.gitignore` 一起改回）。
+///
+/// `respect_gitignore` 在前端是 `respectGitignore`；`acknowledged` 是第 3 步展示过的
+/// `.gitignore` 相对路径，后端拿它与此刻查到的对账（2026-10-28 设计 §3）。
 #[tauri::command(async)]
 pub fn svn_init_hybrid(
     path: String,
     whitelist: Vec<String>,
     extensions: Vec<String>,
+    respect_gitignore: bool,
+    acknowledged: Vec<String>,
 ) -> Result<InitReport, GitError> {
-    init_hybrid(&InitRequest {
-        repo_root: path,
-        whitelist,
-        extensions,
-    })
+    init_hybrid_with(
+        &InitRequest {
+            repo_root: path,
+            whitelist,
+            extensions,
+        },
+        &GitignoreChoice {
+            respect: respect_gitignore,
+            acknowledged,
+        },
+    )
 }
 
 /// 重建基线 R1–R5。全程不动 HEAD、不动真实索引、不动磁盘。

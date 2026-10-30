@@ -7,9 +7,11 @@
 //! 与 §6.8 的基线体检**互不替代**：体检证明「磁盘 == 服务器」，这条证明
 //! 「git 跟踪的集合 == 配置声明的集合」（spec §15 第 20 条）。
 
-use crate::engine::git_cli::{run_git_code, run_git_stdin_partial};
+use crate::engine::git_cli::run_git_code;
 use crate::engine::svn_baseline::TempIndex;
 use crate::engine::svn_dirty::Fix;
+use crate::engine::svn_gitignore::{query_verdicts, GitCtx};
+use crate::engine::svn_scope::WScope;
 use crate::error::{GitError, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -23,45 +25,6 @@ pub(crate) fn normalize_roots(whitelist: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// 这条仓库相对路径算不算 W-file。
-///
-/// # 全项目只有这一处定义
-///
-/// 三个模块要问同一个问题：本模块（磁盘侧期望集合）、`svn_health`（服务器 diff
-/// 的过滤）、`svn_server_set`（服务器清单的过滤）。两份判据迟早分叉，而分叉的
-/// 表现很难查——要么「每次打开都报几千条漏收」，要么「永远报没问题」。
-///
-/// # 为什么是纯路径判断，不走磁盘
-///
-/// [`expected_set`] 遍历磁盘算 W-file，但那套在这里**不能**用：服务器上存在、
-/// 磁盘上不存在的文件（被删掉的、或被 depth-exclude 掉的）恰恰是要抓的东西，
-/// 走磁盘的判断会把它们整个漏掉。
-///
-/// 扩展名比较大小写不敏感：Windows 上 git 会把 `A.CS` 一起收进来
-/// （`core.ignoreCase` 默认 true），那它就是 W-file。
-pub(crate) fn is_w_file(rel: &str, roots: &[String], extensions: &[String]) -> bool {
-    // **单文件白名单条目不过扩展名过滤**，与 `svn_exclude` 的第 ③ 段和
-    // [`expected_set`] 保持一致（spec §6.3）。
-    //
-    // 两边不一致的后果是假阴性：`whitelist:["Code/notes.txt"]` + `extensions:[".cs"]`
-    // 时，`notes.txt` 会被录进基线（那两处收它），而体检把它按扩展名滤掉
-    // ——服务器上改了它，体检照样报 `Verified`。
-    if roots.iter().any(|r| rel == r) {
-        return true;
-    }
-    let under = roots.iter().any(|r| rel.starts_with(&format!("{r}/")));
-    if !under {
-        return false;
-    }
-    if extensions.iter().any(|e| e == "*") {
-        return true;
-    }
-    let lower = rel.to_lowercase();
-    extensions
-        .iter()
-        .any(|e| lower.ends_with(&e.to_lowercase()))
-}
-
 /// 按配置遍历磁盘算出**期望**被 git 跟踪的文件集合（W-file，spec §6.3.2）。
 ///
 /// 路径统一为仓库内相对路径 + 正斜杠，与 `git ls-files` 的输出形式对齐。
@@ -70,8 +33,21 @@ pub fn expected_set(
     whitelist: &[String],
     extensions: &[String],
 ) -> Result<BTreeSet<String>> {
+    expected_set_folded(repo_root, whitelist, extensions, ignore_case(repo_root))
+}
+
+/// [`expected_set`] 的本体，扩展名是否忽略大小写由调用方给。
+///
+/// 建库向导第 2 步还没有 `.git`，[`ignore_case`] 在工作副本里问不到 git 的判断——
+/// 那时由探针 git 目录给出（`svn_gitignore::detect_conflicts`），必须与建库后的真仓库
+/// 一致，否则第 2 步看到的清单与建库时拦下的不同。
+pub(crate) fn expected_set_folded(
+    repo_root: &str,
+    whitelist: &[String],
+    extensions: &[String],
+    fold: bool,
+) -> Result<BTreeSet<String>> {
     let root = Path::new(repo_root);
-    let fold = ignore_case(repo_root);
     let mut out = BTreeSet::new();
     for raw in whitelist {
         let entry = raw.replace('\\', "/");
@@ -114,14 +90,24 @@ pub fn expected_set(
 ///
 /// 工作副本干净时 `fixes` 为空，退化成初版的「磁盘 W-file」，S7 / 恢复⑥ / D7a
 /// 三个入口行为逐字不变。
+///
+/// # 「尊重 .gitignore」
+///
+/// 磁盘集合先按 [`WScope`] 去掉被工作树 `.gitignore` 排除的文件；`TakeBase` 补进来的
+/// 路径同样过 [`WScope::filter`]。两步缺一步，期望集合就会与 `git add -A` 的实际行为分叉。
 pub fn server_expected_set(
     repo_root: &str,
-    whitelist: &[String],
-    extensions: &[String],
+    scope: &WScope,
     fixes: &BTreeMap<String, Fix>,
 ) -> Result<BTreeSet<String>> {
-    let mut set = expected_set(repo_root, whitelist, extensions)?;
-    let roots = normalize_roots(whitelist);
+    let mut set = expected_set(repo_root, scope.whitelist(), scope.extensions())?;
+    scope.retain_not_ignored(&mut set)?;
+    let take_base = scope.filter(
+        fixes
+            .iter()
+            .filter(|(_, f)| **f == Fix::TakeBase)
+            .map(|(p, _)| p.as_str()),
+    )?;
     for (path, fix) in fixes {
         match fix {
             // 服务器 rN 上没有它。不在集合里时 `remove` 是 no-op——非 W-file
@@ -136,7 +122,7 @@ pub fn server_expected_set(
             // **必须过 W-file 判据**：一个被删掉的 `Code/Notes.txt` 不该因为
             // 「服务器上有」就进基线树，它本来就不归 git 管。
             Fix::TakeBase => {
-                if is_w_file(path, &roots, extensions) {
+                if take_base.contains(path) {
                     set.insert(path.clone());
                 }
             }
@@ -284,11 +270,10 @@ fn walk(
 pub fn verify_include_set(
     repo_root: &str,
     idx: &TempIndex,
-    whitelist: &[String],
-    extensions: &[String],
+    scope: &WScope,
     fixes: &BTreeMap<String, Fix>,
 ) -> Result<()> {
-    let expected = server_expected_set(repo_root, whitelist, extensions, fixes)?;
+    let expected = server_expected_set(repo_root, scope, fixes)?;
     let actual = idx.ls_files(repo_root)?;
     if expected == actual {
         return Ok(());
@@ -336,14 +321,15 @@ pub fn verify_include_set(
 /// 那一个走真的 `git add`、不套修正，给同步前的磁盘检查用。名字刻意错开。
 pub fn dry_run_include_set(
     repo_root: &str,
-    whitelist: &[String],
-    extensions: &[String],
+    scope: &WScope,
     fixes: &BTreeMap<String, Fix>,
     touched: &BTreeSet<String>,
 ) -> Result<()> {
-    let expected = server_expected_set(repo_root, whitelist, extensions, fixes)?;
+    let expected = server_expected_set(repo_root, scope, fixes)?;
     let idx = TempIndex::empty(repo_root)?;
-    let mut actual = idx.ls_others(repo_root, whitelist)?;
+    let mut actual = idx.ls_others(repo_root, scope.whitelist())?;
+    // 录制会把这些补进候选索引（`TempIndex::add_paths`），预言里也要有
+    actual.extend(scope.hidden_tracked_on_disk()?);
     for (path, fix) in fixes {
         if !touched.contains(path) {
             continue;
@@ -401,7 +387,12 @@ pub(crate) fn mismatch_report(
         .chain(unexpected)
         .map(String::as_str)
         .collect();
-    let verdicts = blame_rules(repo_root, &all);
+    // 个别路径让 git fatal 时 `query_verdicts` 自己跳过续查；这里的 `Err` 只剩
+    // 「连进程都起不来」——差异照样报，只是不带规则
+    let verdicts = query_verdicts(&GitCtx::Repo(repo_root), &all).unwrap_or_else(|e| {
+        log::warn!("批量查询裁决规则失败，报告里不带规则：{}", e.message);
+        BTreeMap::new()
+    });
 
     let mut msg = format!("{headline}\n");
     let mut blamed_gitignore = false;
@@ -418,13 +409,16 @@ pub(crate) fn mismatch_report(
             }
             match verdicts.get(f) {
                 Some(v) if v.ignores() => {
-                    if is_worktree_gitignore(&v.source) {
+                    if v.in_worktree_gitignore() {
                         blamed_gitignore = true;
                     }
-                    format!("被 {} 挡掉", v.rule())
+                    format!("被 {} 挡掉", v.describe(repo_root))
                 }
                 Some(v) if !v.pattern.is_empty() => {
-                    format!("没有被忽略规则挡住（git 的裁决：{}），原因不明", v.rule())
+                    format!(
+                        "没有被忽略规则挡住（git 的裁决：{}），原因不明",
+                        v.describe(repo_root)
+                    )
                 }
                 Some(_) => "没有被忽略规则挡住（无匹配规则），原因不明".to_string(),
                 None => "查不到裁决规则".to_string(),
@@ -442,7 +436,7 @@ pub(crate) fn mismatch_report(
             _ if Path::new(repo_root).join(f).join(".git").exists() => {
                 "是嵌套的 git 仓库（git 只给它记一个子模块指针）".to_string()
             }
-            Some(v) if !v.pattern.is_empty() => format!("由 {} 纳入", v.rule()),
+            Some(v) if !v.pattern.is_empty() => format!("由 {} 纳入", v.describe(repo_root)),
             Some(_) => "没有匹配任何规则".to_string(),
             None => "查不到裁决规则".to_string(),
         });
@@ -491,16 +485,6 @@ fn push_groups(msg: &mut String, groups: Vec<(String, Vec<&String>)>) {
     }
 }
 
-/// `source` 是不是工作树里的某个 `.gitignore`（而不是 `.git/info/exclude` 或全局文件）。
-///
-/// git 对工作树里的 `.gitignore` 给的是仓库相对路径（`Code/.gitignore`），
-/// 对全局文件给的是绝对路径，所以「相对路径且以 `.gitignore` 结尾」就够了。
-fn is_worktree_gitignore(source: &str) -> bool {
-    let s = source.replace('\\', "/");
-    let file_name = s.rsplit('/').next().unwrap_or("");
-    file_name == ".gitignore" && !Path::new(&s).is_absolute() && !s.starts_with(".git/")
-}
-
 /// `rel` 的某个祖先目录是不是一个嵌套的 git 仓库，是则返回最外层那个目录。
 ///
 /// 只看仓库根**以下**的目录：根自己的 `.git` 是我们的仓库。
@@ -520,142 +504,11 @@ fn nested_repo(repo_root: &str, rel: &str) -> Option<String> {
     None
 }
 
-/// git 对一个路径的裁决：`check-ignore -v` 的 `来源:行号:模式` 三段。
-///
-/// 没有匹配任何规则时三段都为空。
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Verdict {
-    source: String,
-    line: String,
-    pattern: String,
-}
-
-impl Verdict {
-    fn rule(&self) -> String {
-        format!("{}:{}:{}", self.source, self.line, self.pattern)
-    }
-
-    /// 这条裁决是不是「忽略」。以 `!` 开头的是反选，即「不忽略」。
-    fn ignores(&self) -> bool {
-        !self.pattern.is_empty() && !self.pattern.starts_with('!')
-    }
-}
-
-/// 一次性问 git「这批文件各自是被哪条规则决定的」。
-///
-/// 原来是每个文件一次子进程，只能查前 20 个；几百个文件时逐个查又太慢。
-/// `--stdin` 一次查完，才能按规则分组。
-///
-/// # 参数逐个不能省
-///
-/// - `--no-index`：「多收」方向的文件**必然已经在索引里**，而 `check-ignore` 默认
-///   会先看索引、对已跟踪文件一律给空裁决。2026-09-14 实测同一个文件
-///   （`Code/Junk.psd`，被 `/Code/**` 排除，用 `git add -f` 强行入索引）不带它得到
-///   `::<TAB>Code/Junk.psd`，带上得到 `.git/info/exclude:3:/Code/**`。
-/// - `--non-matching`：没被忽略的文件也给出裁决（反选规则或空），两个方向都能指认。
-/// - `-z`：输入输出都按 NUL 分隔、不做引号转义。不带它中文路径会被转义成八进制，
-///   回填时对不上号。输出是四段一组：`来源\0行号\0模式\0路径\0`（2026-10-27 实测）。
-///
-/// # 某个路径让 git fatal 时，跳过它接着查
-///
-/// `check-ignore` 逐个路径作答，遇到它拒绝的路径就整个退出。已知的触发是白名单里的
-/// **目录符号链接**：期望集合跟随它，于是 `Code/Link/x.cs` 出现在「实际没有」一侧，
-/// 而 git 对它报 `pathspec … is beyond a symbolic link`（第二轮 review 指出）。
-/// 原实现在这时整批作废，几百个被 `.gitignore` 挡掉的文件也一起变成「查不到」。
-///
-/// 现在拿 fatal 之前的输出（每个路径答完就刷出，实测 fatal 前的记录完整可读），
-/// 第一个没答的就是出事的路径，跳过它续查。与它**同目录及更深**的路径共享同一段
-/// 前导路径，越过符号链接时会一个接一个 fatal，所以一并跳过，免得每个都重起一次
-/// 进程。查不到的路径不进结果，报告里落进「查不到裁决规则」。
-fn blame_rules(repo_root: &str, files: &[&str]) -> BTreeMap<String, Verdict> {
-    let mut out = BTreeMap::new();
-    let mut rest: Vec<&str> = files.to_vec();
-    let mut resumes = 0;
-    while !rest.is_empty() {
-        let (answered, fatal) = match blame_batch(repo_root, &rest, &mut out) {
-            Ok(r) => r,
-            // 连进程都起不来：再试也一样
-            Err(e) => {
-                log::warn!("批量查询裁决规则失败，其余路径不带规则：{}", e.message);
-                break;
-            }
-        };
-        let Some(e) = fatal else { break };
-        let Some(&culprit) = rest.get(answered) else {
-            break;
-        };
-        log::warn!(
-            "git 拒绝查询 {culprit} 的裁决规则，跳过它续查：{}",
-            e.message.trim()
-        );
-        resumes += 1;
-        if resumes > MAX_RESUMES {
-            log::warn!("续查已达 {MAX_RESUMES} 次，其余路径不带规则");
-            break;
-        }
-        // 父目录为空（仓库根下的文件）时只跳它自己——空前缀会匹配所有路径
-        let dir = culprit.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-        rest = rest[answered + 1..]
-            .iter()
-            .copied()
-            .filter(|f| dir.is_empty() || !f.starts_with(&format!("{dir}/")))
-            .collect();
-    }
-    out
-}
-
-/// 一次 git 调用。返回「从头算起连续答完了几个」和 fatal（若有）。
-fn blame_batch(
-    repo_root: &str,
-    files: &[&str],
-    out: &mut BTreeMap<String, Verdict>,
-) -> Result<(usize, Option<GitError>)> {
-    let mut input = Vec::new();
-    for f in files {
-        input.extend_from_slice(f.as_bytes());
-        input.push(0);
-    }
-    let (stdout, fatal) = run_git_stdin_partial(
-        repo_root,
-        &[
-            "check-ignore",
-            "--no-index",
-            "-v",
-            "--non-matching",
-            "-z",
-            "--stdin",
-        ],
-        &input,
-    )?;
-    let parts: Vec<&str> = stdout.split('\0').collect();
-    let mut answered = 0;
-    for c in parts.chunks_exact(4) {
-        // 答案按输入顺序一条对一条；对不上就不再往后数，第一个没对上的当成出事的那个
-        if files.get(answered) == Some(&c[3]) {
-            answered += 1;
-        } else {
-            break;
-        }
-        out.insert(
-            c[3].to_string(),
-            Verdict {
-                source: c[0].to_string(),
-                line: c[1].to_string(),
-                pattern: c[2].to_string(),
-            },
-        );
-    }
-    Ok((answered, fatal))
-}
-
-/// fatal 之后最多续查几次。每次都要重起一个 git 进程；超过这个数多半不是个别
-/// 路径的问题（仓库本身坏了），再查也是白花时间。
-const MAX_RESUMES: usize = 32;
-
 #[cfg(test)]
 mod tests {
     use super::mismatch_report;
     use crate::engine::git_cli::run_git;
+    use crate::engine::svn_gitignore::display_path;
 
     /// 第二轮 review（2026-10-28）：裁决规则一次批量查，只要有一个路径让
     /// `check-ignore` fatal，原实现整批落进「查不到裁决规则」。
@@ -681,10 +534,11 @@ mod tests {
         let unexpected = ["Code/Keep.cs".to_string()];
         let m = mismatch_report(root, "h", &missing, &unexpected);
 
-        assert!(
-            m.contains("2 个被 Code/.gitignore:1:*.exe 挡掉"),
-            "fatal 前后的路径都要拿到裁决，实际：{m}"
+        let want = format!(
+            "2 个被 {} 第 1 行 `*.exe` 挡掉",
+            display_path(root, "Code/.gitignore")
         );
+        assert!(m.contains(&want), "fatal 前后的路径都要拿到裁决，实际：{m}");
         assert!(m.contains("1 个查不到裁决规则"), "实际：{m}");
         assert!(
             m.contains("1 个没有匹配任何规则"),

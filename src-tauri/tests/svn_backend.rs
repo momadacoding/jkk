@@ -277,6 +277,26 @@ fn preflight_serializes_to_camel_case_and_keeps_the_dirty_list_off_the_wire() {
 }
 
 #[test]
+fn init_preflight_flattens_the_preflight_and_adds_the_gitignore_conflicts() {
+    // 前端 `InitPreflight extends Preflight`：三个原有键必须在顶层，不能套一层 `preflight`
+    let json = serde_json::to_value(app_lib::engine::svn_init::InitPreflight {
+        preflight: app_lib::engine::svn_preflight::Preflight {
+            node_rev: 7,
+            repos_root: "file:///x".into(),
+            uuid: "u".into(),
+            dirty: vec![],
+        },
+        gitignore_conflicts: vec![],
+    })
+    .unwrap();
+    assert_eq!(
+        keys_of(&json),
+        vec!["gitignoreConflicts", "nodeRev", "reposRoot", "uuid"]
+    );
+    assert_eq!(json["gitignoreConflicts"], serde_json::json!([]));
+}
+
+#[test]
 fn the_three_health_states_serialize_as_a_discriminated_union() {
     // 前端要按结果分三种显示（spec §6.8.6），所以判别字段必须稳定。
     // serde 默认的外部标签会吐成 `{"Verified":{"rev":1}}`——键名带大写、
@@ -338,13 +358,70 @@ fn init_and_rebuild_reports_serialize_to_camel_case() {
             phase: "预检".into(),
             millis: 12,
         }],
+        gitignore: app_lib::engine::svn_init::GitignoreOutcome {
+            respected: false,
+            conflicts: vec![app_lib::engine::svn_gitignore::GitignoreConflict {
+                path: "Code/.gitignore".into(),
+                full_path: r"C:\w\Code\.gitignore".into(),
+                versioned: false,
+                active_after_rename: true,
+                rules: vec![
+                    app_lib::engine::svn_gitignore::GitignoreRule {
+                        line: 1,
+                        pattern: "*.exe".into(),
+                        effect: app_lib::engine::svn_gitignore::RuleEffect::Excludes,
+                        count: 2,
+                        samples: vec!["Code/a.exe".into()],
+                    },
+                    app_lib::engine::svn_gitignore::GitignoreRule {
+                        line: 2,
+                        pattern: "!*.txt".into(),
+                        effect: app_lib::engine::svn_gitignore::RuleEffect::Includes,
+                        count: 1,
+                        samples: vec!["Code/n.txt".into()],
+                    },
+                ],
+            }],
+            disabled: vec![app_lib::engine::svn_init::RenamedGitignore {
+                from: r"C:\w\Code\.gitignore".into(),
+                to: r"C:\w\Code\.gitignore.jkk-disabled".into(),
+            }],
+        },
     })
     .unwrap();
     assert_eq!(
         keys_of(&init),
-        vec!["baseline", "health", "nodeRev", "pinned", "timings"]
+        vec![
+            "baseline",
+            "gitignore",
+            "health",
+            "nodeRev",
+            "pinned",
+            "timings"
+        ]
     );
     assert_eq!(keys_of(&init["timings"][0]), vec!["millis", "phase"]);
+    // 前端 `svnInit.ts` 的 GitignoreOutcome / GitignoreConflict / GitignoreRule 按这些键读
+    let g = &init["gitignore"];
+    assert_eq!(keys_of(g), vec!["conflicts", "disabled", "respected"]);
+    assert_eq!(
+        keys_of(&g["conflicts"][0]),
+        vec![
+            "activeAfterRename",
+            "fullPath",
+            "path",
+            "rules",
+            "versioned"
+        ]
+    );
+    assert_eq!(g["conflicts"][0]["activeAfterRename"], true);
+    assert_eq!(
+        keys_of(&g["conflicts"][0]["rules"][0]),
+        vec!["count", "effect", "line", "pattern", "samples"]
+    );
+    assert_eq!(g["conflicts"][0]["rules"][0]["effect"], "excludes");
+    assert_eq!(g["conflicts"][0]["rules"][1]["effect"], "includes");
+    assert_eq!(keys_of(&g["disabled"][0]), vec!["from", "to"]);
     assert_eq!(
         keys_of(&init["pinned"][0]),
         vec!["definedIn", "localPath", "pinnedRev"]

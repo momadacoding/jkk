@@ -55,6 +55,52 @@ export interface PhaseTiming {
   millis: number
 }
 
+/** `engine::svn_gitignore::GitignoreRule`：一个 `.gitignore` 里起作用的一行。 */
+export interface GitignoreRule {
+  line: number
+  pattern: string
+  /** `excludes` 挡住了 SVN 里有的文件；`includes` 用 `!` 把用户没选的文件拉进了 git。 */
+  effect: 'excludes' | 'includes'
+  count: number
+  /** 最多 3 个，仓库相对路径。 */
+  samples: string[]
+}
+
+/** `engine::svn_gitignore::GitignoreConflict`：一个起作用的 `.gitignore`。 */
+export interface GitignoreConflict {
+  /** 仓库相对路径。建库时原样作为 `acknowledged` 交回后端对账。 */
+  path: string
+  /** 完整的 Windows 路径，给人看的。 */
+  fullPath: string
+  /** 受 SVN 版本控制——团队的规则，不改名。 */
+  versioned: boolean
+  /**
+   * 现在被外层的 `.gitignore` 挡着、git 根本读不到它；外层改名停用之后才开始起作用。
+   * 勾上「尊重」时外层不停用，它也就不起作用。
+   */
+  activeAfterRename: boolean
+  rules: GitignoreRule[]
+}
+
+/** `engine::svn_init::RenamedGitignore`，两端都是完整路径。 */
+export interface RenamedGitignore {
+  from: string
+  to: string
+}
+
+/** `engine::svn_init::GitignoreOutcome`：建库对 `.gitignore` 做了什么。 */
+export interface GitignoreOutcome {
+  respected: boolean
+  conflicts: GitignoreConflict[]
+  disabled: RenamedGitignore[]
+}
+
+/** `engine::svn_init::InitPreflight`：第 2 步的结果。 */
+export interface InitPreflight extends Preflight {
+  /** 空表示没有冲突，第 3 步不显示勾选框。 */
+  gitignoreConflicts: GitignoreConflict[]
+}
+
 /** `engine::svn_init::InitReport` */
 export interface InitReport {
   nodeRev: number
@@ -63,6 +109,7 @@ export interface InitReport {
   pinned: PinnedExternal[]
   /** 各阶段耗时，按执行顺序。失败时后端把同样的内容附在错误正文末尾。 */
   timings: PhaseTiming[]
+  gitignore: GitignoreOutcome
 }
 
 /** `engine::svn_init::RebuildReport` */
@@ -309,6 +356,119 @@ export function describeTimings(timings: PhaseTiming[] | undefined): Notice | nu
   }
 }
 
+// ---------------------------------------------------------------------------
+// 起作用的 .gitignore（2026-10-28 设计 §3）
+// ---------------------------------------------------------------------------
+
+/** 一条规则写成一行：「第 N 行 `rule`：…，例如 a、b」。 */
+function describeRule(r: GitignoreRule, what: 'conflict' | 'outcome'): string {
+  const head = `第 ${r.line} 行 \`${r.pattern}\``
+  const eg = r.samples.length > 0 ? `，例如 ${r.samples.join('、')}` : ''
+  if (what === 'outcome') return `${head}：${r.count} 个${eg}`
+  return r.effect === 'includes'
+    ? `${head}：多收 ${r.count} 个你没选的文件${eg}`
+    : `${head}：挡掉 ${r.count} 个 SVN 里有的文件${eg}`
+}
+
+/**
+ * 第 3 步「确认并建库」按钮上方的冲突清单。没有冲突时返回 `null`——那时连勾选框都不显示。
+ *
+ * 写完整路径：git 报的是 `.gitignore` 的实际位置，可能在任意一层子目录，
+ * 用户要能照着路径去打开它（用户反馈第 1 点）。
+ */
+export function describeGitignoreConflicts(conflicts: GitignoreConflict[]): Notice | null {
+  if (conflicts.length === 0) return null
+  const blocks = conflicts.map((c) =>
+    [
+      c.fullPath +
+        (c.versioned ? '（受 SVN 版本控制）' : '') +
+        (c.activeAfterRename ? '（外层的 .gitignore 停用之后才会起作用）' : ''),
+      ...c.rules.map((r) => `  ${describeRule(r, 'conflict')}`),
+    ].join('\n'),
+  )
+  return {
+    tone: 'warn',
+    title: '这些 .gitignore 会影响交给 git 管的文件',
+    detail: blocks.join('\n\n'),
+    blocking: false,
+  }
+}
+
+/**
+ * 按当前的勾选，「建库」能不能点；不能时返回原因（与后端的拦截同义）。
+ *
+ * 后端仍会再拦一次——这里只是让用户不必点了才知道。
+ */
+export function gitignoreBlockReason(conflicts: GitignoreConflict[], respect: boolean): string | null {
+  if (!respect) {
+    const versioned = conflicts.filter((c) => c.versioned)
+    if (versioned.length > 0) {
+      return (
+        `${versioned.map((c) => c.fullPath).join('、')} 受 SVN 版本控制，是团队提交的规则，本应用不会改它。` +
+        '请勾选「尊重已有的 .gitignore 规则」，或先和团队确认。'
+      )
+    }
+    return null
+  }
+  // 尊重时外层不停用，藏在后面的那些不会被 git 读到，与这次建库无关
+  for (const c of conflicts.filter((x) => !x.activeAfterRename)) {
+    const r = c.rules.find((x) => x.effect === 'includes')
+    if (r) {
+      return (
+        `${c.fullPath} 第 ${r.line} 行 \`${r.pattern}\` 会把你没选的文件拉进 git。` +
+        '「尊重」只允许 .gitignore 少收文件、不允许多收。请取消勾选，或先修改这一行。'
+      )
+    }
+  }
+  return null
+}
+
+/**
+ * 建库请求里实际带的「尊重」。
+ *
+ * 没有冲突时勾选框不渲染，用户看不到这个选项，它就不能生效：重新检查之后清单变空时，
+ * 之前勾上的 `true` 还留在 state 里（/code-review 第 5 条）。
+ */
+export function effectiveRespect(conflicts: GitignoreConflict[], respect: boolean): boolean {
+  return respect && conflicts.length > 0
+}
+
+/** 完成页：改了哪些名、或按尊重口径没收哪些文件。两样都没有时返回 `null`。 */
+export function describeGitignoreOutcome(o: GitignoreOutcome | undefined): Notice | null {
+  if (!o) return null
+  if (o.disabled.length > 0) {
+    return {
+      tone: 'warn',
+      title: `停用了 ${o.disabled.length} 个 .gitignore`,
+      detail: [...o.disabled.map((d) => `${d.from} → ${d.to}`), '', '想恢复就把它改回原名。'].join('\n'),
+      blocking: false,
+    }
+  }
+  if (o.respected && o.conflicts.length > 0) {
+    const blocks = o.conflicts.map((c) =>
+      [
+        c.fullPath,
+        ...c.rules.filter((r) => r.effect === 'excludes').map((r) => `  ${describeRule(r, 'outcome')}`),
+      ].join('\n'),
+    )
+    return {
+      tone: 'ok',
+      title: '按 .gitignore 的规则，这些文件没有交给 git 管',
+      detail: blocks.join('\n\n'),
+      blocking: false,
+    }
+  }
+  return null
+}
+
+/**
+ * 这个错误是不是「出现了你没看过的 .gitignore」：是的话向导要重新跑第 2 步、
+ * 把新清单摆到第 3 步给用户看，而不是只报一个错。
+ */
+export function needsReconfirm(code: string): boolean {
+  return code === 'svn_gitignore_unconfirmed'
+}
+
 /**
  * 把错误正文拆成「一行标题 + 详情」。
  *
@@ -381,6 +541,10 @@ export function wizardErrorHint(code: string, message = ''): string {
       '最常见的来源是以前在这个目录里用过 git、只删了 .git 没删 .gitignore。' +
       '位于嵌套 git 仓库里的：把那个目录移出白名单，或者确认后删掉它里面的 .git。',
     svn_baseline_no_trailer: '基线分支上没有本应用写的记账信息，它不是本应用录出来的基线。请重建基线。',
+    svn_gitignore_unconfirmed: '清单已经刷新，请看过之后重新点「建库」。',
+    svn_gitignore_versioned:
+      '受版本控制的 .gitignore 是团队规则。要按它来就勾选「尊重」；要改它请先和团队商量，用 TortoiseSVN 提交。',
+    svn_gitignore_includes: '「尊重」只接受 .gitignore 少收文件。取消勾选会把这个 .gitignore 改名停用。',
   }
   const hint = table[code]
   if (!hint) return ''

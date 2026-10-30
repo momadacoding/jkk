@@ -16,11 +16,11 @@
 //! 时机全部满足它：HEAD 在 `svn/base` 上且工作区干净，或基线树刚从磁盘录出来。
 
 use crate::engine::svn_cli::run_svn;
-// `is_w_file` / `normalize_roots` 原本是本模块的私有函数，Phase 1c 提到
-// `svn_include_check` 共用——`svn_server_set` 要用**同一套**判据去过滤服务器清单。
+// W-file 判据原本是本模块的私有函数，Phase 1c 提到 `svn_include_check` 共用，
+// 2026-10-28 再收进 `svn_scope`——`svn_server_set` 等要用**同一套**判据。
 // 两份「什么算 W-file」迟早分叉，而分叉的表现是「每次打开都报几千条漏收」或者
 // 「永远报没问题」，两头都很难查。
-use crate::engine::svn_include_check::{is_w_file, normalize_roots};
+use crate::engine::svn_scope::WScope;
 use crate::engine::svn_xml::parse_diff_summary;
 use crate::error::{GitError, Result};
 use std::collections::BTreeSet;
@@ -104,8 +104,8 @@ pub fn check_baseline(
     repo_root: &str,
     svn_url: &str,
     rev: u64,
-    whitelist: &[String],
-    extensions: &[String],
+    // W-file 口径。「尊重 .gitignore」时被它排除、又不在基线里的文件不参与比对。
+    scope: &WScope,
     // `explained` 是 §6.8.7 的 `S`——本次录制**实际动过**的路径。这些路径上的差异
     // 已经被换成了服务器内容，不构成基线撒谎。
     //
@@ -117,7 +117,7 @@ pub fn check_baseline(
     // 报成「未覆盖」，见 [`ExplainedOrigin`]。
     origin: ExplainedOrigin,
 ) -> Result<Health> {
-    let roots = normalize_roots(whitelist);
+    let roots = scope.roots();
     if roots.is_empty() {
         // 不传 target 时 `svn diff` 会拿**整个工作副本**跟服务器比。对一个 Unity
         // 工程那是几个 GB 的美术资产，而且任何一处正常的本地改动都会报成基线撒谎。
@@ -133,7 +133,7 @@ pub fn check_baseline(
     if let Some(reason) = url_mismatch(repo_root, base)? {
         return Ok(Health::NotChecked { reason });
     }
-    if let Some(reason) = whitelist_not_under_base(repo_root, base, &roots)? {
+    if let Some(reason) = whitelist_not_under_base(repo_root, base, roots)? {
         return Ok(Health::NotChecked { reason });
     }
 
@@ -147,7 +147,7 @@ pub fn check_baseline(
     //
     // 现在按记账单位分开发命令：`enumerate_wcs` 返回的每一条都自带 `url`，
     // 嵌套 external 用它**自己的** URL 去比，那块内容第一次真的被服务器验过。
-    let units = crate::engine::svn_wc::enumerate_wcs(repo_root, whitelist)?;
+    let units = crate::engine::svn_wc::enumerate_wcs(repo_root, scope.whitelist())?;
     let mut files: Vec<String> = Vec::new();
     for unit in &units {
         let unit_url = unit.url.trim_end_matches('/');
@@ -207,13 +207,15 @@ pub fn check_baseline(
                     ),
                 });
             };
-            //   剔除扩展名不在白名单里的文件
-            if !is_w_file(&repo_rel, &roots, extensions) {
-                continue;
-            }
             files.push(repo_rel);
         }
     }
+    //   剔除不是 W-file 的（扩展名不在白名单里、或被尊重的 .gitignore 排除）。
+    //   整批问一次：「尊重」时每次判定都是一次 git 子进程。
+    let mut files: Vec<String> = scope
+        .filter(files.iter().map(String::as_str))?
+        .into_iter()
+        .collect();
 
     // §6.8.7：判据是 `D \ S == ∅`，不是 `D == ∅`。
     //

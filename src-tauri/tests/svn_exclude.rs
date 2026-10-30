@@ -7,6 +7,7 @@
 use app_lib::engine::svn_baseline::TempIndex;
 use app_lib::engine::svn_exclude::{generate_exclude, write_exclude, GENERATED_HEADER};
 use app_lib::engine::svn_include_check::{dry_run_include_set, expected_set, verify_include_set};
+use app_lib::engine::svn_scope::WScope;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -24,6 +25,15 @@ fn run_git(dir: &Path, args: &[&str]) {
         "git {args:?} 失败：{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// 报告里 `.gitignore` 的完整 Windows 路径（仓库根 + 相对路径，斜杠换成反斜杠）。
+fn full(root: &Path, rel: &str) -> String {
+    format!(
+        "{}\\{}",
+        root.to_string_lossy().replace('/', "\\"),
+        rel.replace('/', "\\")
+    )
 }
 
 fn tracked(dir: &Path) -> Vec<String> {
@@ -234,7 +244,12 @@ fn check(dir: &Path, w: &[String], e: &[String]) -> app_lib::error::Result<()> {
     // 这些 fixture 是纯 git 目录、没有 SVN 工作副本，脏清单按定义为空。
     // 空 `fixes` 时期望集合退化成「磁盘上的 W-file」，也就是 §16.1 之前的口径——
     // 这批测试覆盖的正是那条不变的行为（spec §6.3.1）。
-    verify_include_set(root, &idx, w, e, &std::collections::BTreeMap::new())
+    verify_include_set(
+        root,
+        &idx,
+        &WScope::plain(w, e),
+        &std::collections::BTreeMap::new(),
+    )
 }
 
 #[test]
@@ -668,7 +683,8 @@ fn the_mismatch_report_names_the_rule_for_files_that_are_tracked_but_should_not_
     let root = dir.path().to_str().unwrap();
     let idx = TempIndex::from_head(root).unwrap();
     idx.add_all(root, &w).unwrap();
-    let err = verify_include_set(root, &idx, &w, &e, &std::collections::BTreeMap::new())
+    let scope = WScope::plain(&w, &e);
+    let err = verify_include_set(root, &idx, &scope, &std::collections::BTreeMap::new())
         .expect_err("多收必须被抓到");
     assert_eq!(err.code, "include_set_mismatch");
     assert!(
@@ -677,8 +693,13 @@ fn the_mismatch_report_names_the_rule_for_files_that_are_tracked_but_should_not_
         err.message
     );
     assert!(
-        err.message.contains("exclude:"),
+        err.message.contains("本应用生成的规则 `/Code/**`"),
         "多收方向必须指认是哪条规则本来该挡住它，实际：{}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("info/exclude"),
+        "本应用生成的规则不暴露 .git/info/exclude 这个路径（spec §6），实际：{}",
         err.message
     );
     assert!(
@@ -722,13 +743,18 @@ fn the_mismatch_report_groups_dropped_files_by_the_rule_that_dropped_them() {
     assert_eq!(err.code, "include_set_mismatch");
     let m = &err.message;
     assert!(m.contains("共 33 个"), "应当给出漏收总数，实际：{m}");
-    assert!(
-        m.contains("30 个被 Code/.gitignore:1:*.exe 挡掉"),
-        "应当按规则汇总数量，实际：{m}"
+    // 完整路径 + 「第 N 行」：git 报的是 `.gitignore` 的实际位置，可能在任意一层，
+    // 显示上必须看得出来（spec §6）
+    let code = format!(
+        "30 个被 {} 第 1 行 `*.exe` 挡掉",
+        full(p, "Code/.gitignore")
     );
+    assert!(m.contains(&code), "应当按规则汇总数量，实际：{m}");
+    let top = format!("3 个被 {} 第 1 行 `*.pyc` 挡掉", full(p, ".gitignore"));
+    assert!(m.contains(&top), "第二条规则也要单独成组，实际：{m}");
     assert!(
-        m.contains("3 个被 .gitignore:1:*.pyc 挡掉"),
-        "第二条规则也要单独成组，实际：{m}"
+        !m.contains(":1:"),
+        "不再用 git 的 文件:行号:规则 格式，实际：{m}"
     );
     assert!(
         m.find("*.exe").unwrap() < m.find("*.pyc").unwrap(),
@@ -790,8 +816,9 @@ fn a_junction_inside_the_whitelist_does_not_break_the_batch_rule_lookup() {
 
     let m = check_wildcard(p).message;
     // 2 个 = 普通目录里的 a.exe + junction 底下的 m.exe，两个都拿到了裁决
+    let want = format!("2 个被 {} 第 1 行 `*.exe` 挡掉", full(p, "Code/.gitignore"));
     assert!(
-        m.contains("2 个被 Code/.gitignore:1:*.exe 挡掉"),
+        m.contains(&want),
         "junction 底下与普通目录的文件都要拿到裁决规则，实际：{m}"
     );
     fs::remove_dir(p.join("Code/Mirror")).unwrap();
@@ -818,8 +845,9 @@ fn a_directory_symlink_inside_the_whitelist_does_not_cost_other_files_their_rule
     fs::write(p.join("Code/.gitignore"), "*.exe\n").unwrap();
 
     let m = check_wildcard(p).message;
+    let want = format!("1 个被 {} 第 1 行 `*.exe` 挡掉", full(p, "Code/.gitignore"));
     assert!(
-        m.contains("1 个被 Code/.gitignore:1:*.exe 挡掉"),
+        m.contains(&want),
         "符号链接之后的文件也要拿到裁决规则，实际：{m}"
     );
 }
@@ -835,10 +863,8 @@ fn the_mismatch_report_keeps_non_ascii_paths_readable() {
     fs::write(p.join("Code/.gitignore"), "*.exe\n").unwrap();
 
     let m = check_wildcard(p).message;
-    assert!(
-        m.contains("1 个被 Code/.gitignore:1:*.exe 挡掉"),
-        "实际：{m}"
-    );
+    let want = format!("1 个被 {} 第 1 行 `*.exe` 挡掉", full(p, "Code/.gitignore"));
+    assert!(m.contains(&want), "实际：{m}");
     assert!(m.contains("Code/工具/甲.exe"), "实际：{m}");
 }
 
@@ -855,8 +881,7 @@ fn the_mismatch_report_keeps_non_ascii_paths_readable() {
 fn dry_run(root: &str, w: &[String], e: &[String]) -> app_lib::error::Result<()> {
     dry_run_include_set(
         root,
-        w,
-        e,
+        &WScope::plain(w, e),
         &std::collections::BTreeMap::new(),
         &BTreeSet::new(),
     )
@@ -898,11 +923,8 @@ fn the_precheck_catches_a_gitignore_without_writing_any_object() {
         "要能看出是哪一道拦的：{}",
         err.message
     );
-    assert!(
-        err.message.contains("1 个被 Code/.gitignore:1:*.exe 挡掉"),
-        "实际：{}",
-        err.message
-    );
+    let want = format!("1 个被 {} 第 1 行 `*.exe` 挡掉", full(p, "Code/.gitignore"));
+    assert!(err.message.contains(&want), "实际：{}", err.message);
     assert_eq!(object_files(p), 0, "预检写了对象——它就不再是便宜的那一道了");
 }
 
@@ -957,4 +979,21 @@ fn the_precheck_with_an_empty_whitelist_checks_nothing_rather_than_everything() 
     let dir = workdir();
     write_rules(dir.path(), &[], &strs(&[".cs"]));
     dry_run(dir.path().to_str().unwrap(), &[], &strs(&[".cs"])).unwrap();
+}
+
+#[test]
+fn display_path_is_windows_shaped_at_any_depth() {
+    use app_lib::engine::svn_gitignore::display_path;
+    assert_eq!(
+        display_path("C:/w/wc1", "Assets/Plugins/.gitignore"),
+        r"C:\w\wc1\Assets\Plugins\.gitignore"
+    );
+    assert_eq!(
+        display_path(r"C:\w\wc1\", ".gitignore"),
+        r"C:\w\wc1\.gitignore"
+    );
+    assert_eq!(
+        display_path("C:/w/wc1/", "Code/.gitignore"),
+        r"C:\w\wc1\Code\.gitignore"
+    );
 }

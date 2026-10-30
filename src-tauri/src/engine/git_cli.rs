@@ -85,7 +85,20 @@ pub fn run_git_bytes(path: &str, args: &[&str]) -> Result<Vec<u8>> {
 ///   5 万文件的仓库做 merge driver 检查时实测卡死（2026-10-21）。所以 stdin 放在单独的
 ///   线程里写，主线程同时 `wait_with_output` 把 stdout / stderr 读空。
 pub fn run_git_stdin(path: &str, args: &[&str], stdin_bytes: &[u8]) -> Result<String> {
-    let (output, written) = pipe_through(path, args, stdin_bytes)?;
+    run_git_stdin_env(path, args, stdin_bytes, &[])
+}
+
+/// 同 [`run_git_stdin`]，额外注入一组环境变量（理由同 [`run_git_env`]）。
+///
+/// 已知需要它的地方：在临时索引（`GIT_INDEX_FILE`）上 `update-index --add --stdin`
+/// ——路径可能有几千条，走命令行会撞上 Windows 的命令行长度上限。
+pub fn run_git_stdin_env(
+    path: &str,
+    args: &[&str],
+    stdin_bytes: &[u8],
+    envs: &[(&str, &str)],
+) -> Result<String> {
+    let (output, written) = pipe_through(path, args, stdin_bytes, envs)?;
     // git 先失败退出时写入会撞上断开的管道；那时真正的原因在 stderr 里，先报它
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -111,7 +124,7 @@ pub fn run_git_stdin_partial(
     args: &[&str],
     stdin_bytes: &[u8],
 ) -> Result<(String, Option<GitError>)> {
-    let (output, written) = pipe_through(path, args, stdin_bytes)?;
+    let (output, written) = pipe_through(path, args, stdin_bytes, &[])?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let code = output.status.code().unwrap_or(-1);
     if code != 0 && code != 1 {
@@ -129,11 +142,16 @@ fn pipe_through(
     path: &str,
     args: &[&str],
     stdin_bytes: &[u8],
+    envs: &[(&str, &str)],
 ) -> Result<(std::process::Output, Result<()>)> {
     use std::io::Write;
     use std::process::Stdio;
 
-    let mut child = git_command(path)
+    let mut cmd = git_command(path);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let mut child = cmd
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

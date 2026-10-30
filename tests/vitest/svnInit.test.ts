@@ -12,7 +12,131 @@ import {
   splitErrorMessage,
   stepStatus,
   wizardErrorHint,
+  describeGitignoreConflicts,
+  describeGitignoreOutcome,
+  gitignoreBlockReason,
+  needsReconfirm,
 } from '@/engine/svnInit'
+import type { GitignoreConflict, GitignoreRule } from '@/engine/svnInit'
+
+function rule(over: Partial<GitignoreRule> = {}): GitignoreRule {
+  return {
+    line: 1,
+    pattern: '*.exe',
+    effect: 'excludes',
+    count: 2,
+    samples: ['Assets/a.exe', 'Assets/b.exe'],
+    ...over,
+  }
+}
+
+function conflict(over: Partial<GitignoreConflict> = {}): GitignoreConflict {
+  return {
+    path: 'Assets/.gitignore',
+    fullPath: 'C:\\w\\Assets\\.gitignore',
+    versioned: false,
+    activeAfterRename: false,
+    rules: [rule()],
+    ...over,
+  }
+}
+
+describe('起作用的 .gitignore（2026-10-28 设计 §3）', () => {
+  it('没有冲突时不显示这一块', () => {
+    expect(describeGitignoreConflicts([])).toBeNull()
+  })
+
+  it('写完整路径与「第 N 行」，带数量和样例', () => {
+    const n = describeGitignoreConflicts([conflict()])!
+    expect(n.tone).toBe('warn')
+    expect(n.title).toBe('这些 .gitignore 会影响交给 git 管的文件')
+    expect(n.detail).toContain('C:\\w\\Assets\\.gitignore')
+    expect(n.detail).toContain('第 1 行 `*.exe`：挡掉 2 个 SVN 里有的文件，例如 Assets/a.exe、Assets/b.exe')
+    expect(n.detail).not.toContain('（受 SVN 版本控制）')
+  })
+
+  it('受版本控制的标出来；多收的另一种说法', () => {
+    const n = describeGitignoreConflicts([
+      conflict({
+        versioned: true,
+        rules: [rule({ line: 5, pattern: '!*.txt', effect: 'includes', count: 1, samples: ['Assets/n.txt'] })],
+      }),
+    ])!
+    expect(n.detail).toContain('C:\\w\\Assets\\.gitignore（受 SVN 版本控制）')
+    expect(n.detail).toContain('第 5 行 `!*.txt`：多收 1 个你没选的文件，例如 Assets/n.txt')
+  })
+
+  it('能不能点「建库」：受控 × 勾选、多收 × 勾选 四种组合', () => {
+    const versioned = [conflict({ versioned: true })]
+    const includes = [conflict({ rules: [rule({ effect: 'includes', pattern: '!*.txt' })] })]
+    const plain = [conflict()]
+    // 不勾 + 受控 → 拦（不改团队的规则）
+    expect(gitignoreBlockReason(versioned, false)).toContain('受 SVN 版本控制')
+    // 勾上 + 受控 → 放行（尊重它，不动它）
+    expect(gitignoreBlockReason(versioned, true)).toBeNull()
+    // 勾上 + 多收 → 拦（尊重只做减法）
+    expect(gitignoreBlockReason(includes, true)).toContain('不允许多收')
+    // 不勾 + 多收（未受控）→ 放行（改名之后多收自然消失）
+    expect(gitignoreBlockReason(includes, false)).toBeNull()
+    expect(gitignoreBlockReason(plain, false)).toBeNull()
+    expect(gitignoreBlockReason(plain, true)).toBeNull()
+    expect(gitignoreBlockReason([], false)).toBeNull()
+  })
+
+  it('藏在外层后面的标出来：外层停用之后才会起作用', () => {
+    const n = describeGitignoreConflicts([
+      conflict(),
+      conflict({ path: 'Assets/Sub/.gitignore', fullPath: 'C:\\w\\Assets\\Sub\\.gitignore', activeAfterRename: true }),
+    ])!
+    expect(n.detail).toContain('C:\\w\\Assets\\Sub\\.gitignore（外层的 .gitignore 停用之后才会起作用）')
+    expect(n.detail).not.toContain('C:\\w\\Assets\\.gitignore（外层')
+  })
+
+  it('勾上「尊重」时外层不停用，藏在后面的那些不起作用，不该拦', () => {
+    const hiddenIncludes = conflict({
+      activeAfterRename: true,
+      rules: [rule({ effect: 'includes', pattern: '!*.txt' })],
+    })
+    expect(gitignoreBlockReason([conflict(), hiddenIncludes], true)).toBeNull()
+    // 不勾时外层会被停用，藏在后面的受控文件会起作用——照样要拦
+    const hiddenVersioned = conflict({ activeAfterRename: true, versioned: true })
+    expect(gitignoreBlockReason([conflict(), hiddenVersioned], false)).toContain('受 SVN 版本控制')
+  })
+
+  it('完成页：既没尊重也没改名时不说', () => {
+    expect(describeGitignoreOutcome({ respected: false, conflicts: [], disabled: [] })).toBeNull()
+  })
+
+  it('完成页：改过名的列出原路径与新路径，并说怎么恢复', () => {
+    const n = describeGitignoreOutcome({
+      respected: false,
+      conflicts: [conflict()],
+      disabled: [{ from: 'C:\\w\\Assets\\.gitignore', to: 'C:\\w\\Assets\\.gitignore.jkk-disabled' }],
+    })!
+    expect(n.title).toBe('停用了 1 个 .gitignore')
+    expect(n.detail).toContain('C:\\w\\Assets\\.gitignore → C:\\w\\Assets\\.gitignore.jkk-disabled')
+    expect(n.detail).toContain('想恢复就把它改回原名。')
+  })
+
+  it('完成页：尊重时列出没交给 git 管的文件', () => {
+    const n = describeGitignoreOutcome({ respected: true, conflicts: [conflict()], disabled: [] })!
+    expect(n.title).toBe('按 .gitignore 的规则，这些文件没有交给 git 管')
+    expect(n.detail).toContain('C:\\w\\Assets\\.gitignore')
+    expect(n.detail).toContain('第 1 行 `*.exe`：2 个，例如 Assets/a.exe、Assets/b.exe')
+  })
+
+  it('只有「出现了没看过的 .gitignore」需要刷新清单重新确认', () => {
+    expect(needsReconfirm('svn_gitignore_unconfirmed')).toBe(true)
+    expect(needsReconfirm('svn_gitignore_versioned')).toBe(false)
+    expect(needsReconfirm('include_set_mismatch')).toBe(false)
+  })
+
+  it('三个新错误码都有引导语', () => {
+    expect(wizardErrorHint('svn_gitignore_unconfirmed')).toContain('重新点「建库」')
+    expect(wizardErrorHint('svn_gitignore_versioned')).toContain('尊重')
+    expect(wizardErrorHint('svn_gitignore_includes')).toContain('改名停用')
+  })
+})
 
 describe('耗时的显示', () => {
   it('与 Rust 侧 human_duration 同一口径：一分钟内保留一位小数，之后按分秒', () => {

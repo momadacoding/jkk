@@ -20,6 +20,7 @@ mod svn_fixtures;
 
 use app_lib::engine::svn_health::{check_baseline, Health};
 use app_lib::engine::svn_init::{init_hybrid, InitRequest};
+use app_lib::engine::svn_scope::WScope;
 use app_lib::engine::svn_server_set::{self, ServerAudit};
 use app_lib::engine::svn_sync::{self, SyncVerdict};
 use svn_fixtures::{
@@ -121,8 +122,7 @@ fn the_existing_checks_really_do_miss_a_depth_excluded_subtree() {
         &fx.wc_str(),
         &file_url(&fx.repo()),
         REV,
-        &["Code/".to_string()],
-        &[".cs".to_string()],
+        &WScope::plain(&["Code/".to_string()], &[".cs".to_string()]),
         // 这个 fixture 的工作副本是干净的，`S = ∅`：判据退化成 §6.8.2 的
         // `D == ∅`，正是这条测试要证明「体检看不见 set-depth=exclude」的前提。
         &std::collections::BTreeSet::new(),

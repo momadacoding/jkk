@@ -10,6 +10,7 @@ mod svn_fixtures;
 
 use app_lib::engine::svn_cli::run_svn;
 use app_lib::engine::svn_health::{check_baseline, ExplainedOrigin, Health};
+use app_lib::engine::svn_scope::WScope;
 use svn_fixtures::{
     file_url, svn_repo_for_health, svn_repo_for_health_at_r2,
     svn_repo_with_cross_repo_nested_external, svn_repo_with_same_repo_nested_external,
@@ -43,8 +44,7 @@ fn check(fx: &SvnFixture, rev: u64) -> Health {
         &fx.wc_str(),
         &repo_url(fx),
         rev,
-        &wl(&["Code/"]),
-        &cs(),
+        &WScope::plain(&wl(&["Code/"]), &cs()),
         &nothing_explained(),
         ExplainedOrigin::Unknown,
     )
@@ -141,8 +141,7 @@ fn t6_multiple_whitelist_roots_are_accepted() {
         &fx.wc_str(),
         &repo_url(&fx),
         1,
-        &wl(&["Code/", "Art/"]),
-        &cs(),
+        &WScope::plain(&wl(&["Code/", "Art/"]), &cs()),
         &nothing_explained(),
         ExplainedOrigin::Unknown,
     )
@@ -205,8 +204,7 @@ fn a_command_failure_is_not_reported_as_a_lying_baseline() {
         &fx.wc_str(),
         "file:///definitely/not/here",
         1,
-        &wl(&["Code/"]),
-        &cs(),
+        &WScope::plain(&wl(&["Code/"]), &cs()),
         &nothing_explained(),
         ExplainedOrigin::Unknown,
     )
@@ -238,8 +236,7 @@ fn a_failing_command_still_emits_partial_xml_and_must_not_be_parsed_as_success()
             &fx.wc_str(),
             "file:///definitely/not/here",
             1,
-            &wl(&["Code/"]),
-            &cs(),
+            &WScope::plain(&wl(&["Code/"]), &cs()),
             &nothing_explained(),
             ExplainedOrigin::Unknown,
         )
@@ -260,8 +257,7 @@ fn an_empty_whitelist_is_an_error_not_a_clean_bill_of_health() {
         &fx.wc_str(),
         &repo_url(&fx),
         1,
-        &[],
-        &cs(),
+        &WScope::plain(&[], &cs()),
         &nothing_explained(),
         ExplainedOrigin::Unknown,
     )
@@ -289,8 +285,7 @@ fn a_switched_whitelist_subtree_is_not_checked_rather_than_lying() {
         &fx.wc_str(),
         wc_url.trim(),
         3,
-        &wl(&["Code/"]),
-        &cs(),
+        &WScope::plain(&wl(&["Code/"]), &cs()),
         &nothing_explained(),
         ExplainedOrigin::Unknown,
     )
@@ -315,8 +310,8 @@ fn a_single_file_whitelist_entry_is_not_filtered_out_by_extension() {
         &fx.wc_str(),
         &repo_url(&fx),
         1,
-        &wl(&["Code/Art.psd"]), // 单文件条目
-        &cs(),                  // 扩展名只有 .cs，psd 不在里面
+        // 单文件条目；扩展名只有 .cs，psd 不在里面
+        &WScope::plain(&wl(&["Code/Art.psd"]), &cs()),
         &nothing_explained(),
         ExplainedOrigin::Unknown,
     )
@@ -340,8 +335,7 @@ fn a_clean_nested_external_is_verified_not_merely_unchecked() {
         &fx.wc_str(),
         &file_url(&fx.repo()),
         2,
-        &wl(&["Code/"]),
-        &cs(),
+        &WScope::plain(&wl(&["Code/"]), &cs()),
         &nothing_explained(),
         ExplainedOrigin::Unknown,
     )
@@ -370,8 +364,7 @@ fn one_unit_failing_does_not_silently_verify_the_others() {
         &fx.wc_str(),
         &file_url(&fx.repo()),
         2,
-        &wl(&["Code/"]),
-        &cs(),
+        &WScope::plain(&wl(&["Code/"]), &cs()),
         &nothing_explained(),
         ExplainedOrigin::Unknown,
     )
@@ -397,8 +390,7 @@ fn a_lying_baseline_inside_a_nested_external_is_caught() {
         &fx.wc_str(),
         &file_url(&fx.repo()),
         2,
-        &wl(&["Code/"]),
-        &cs(),
+        &WScope::plain(&wl(&["Code/"]), &cs()),
         &nothing_explained(),
         ExplainedOrigin::Unknown,
     )
@@ -427,8 +419,7 @@ fn an_svn_url_pointing_at_a_subpath_is_not_checked_rather_than_lying() {
         &fx.wc_str(),
         &bogus,
         1,
-        &wl(&["Code/"]),
-        &cs(),
+        &WScope::plain(&wl(&["Code/"]), &cs()),
         &nothing_explained(),
         ExplainedOrigin::Unknown,
     )
