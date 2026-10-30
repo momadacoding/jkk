@@ -257,6 +257,21 @@ describe('扩展名输入的解析', () => {
     expect(parseExtensions('..')).toEqual([])
   })
 
+  it('连续的点当分隔处理，不产生 `..cs` / `.cs..lua` 这种匹配不到文件的条目', () => {
+    // 第三轮独立 review：`.。lua` 换完句点是 `..lua`，`.cs。.lua` 是 `.cs..lua`，
+    // 都不以点结尾、后端也放行，生成的规则匹配不到任何文件
+    expect(parseExtensions('.\u{3002}lua')).toEqual(['.lua'])
+    expect(parseExtensions('.cs\u{3002}.lua')).toEqual(['.cs', '.lua'])
+    expect(parseExtensions('..cs')).toEqual(['.cs'])
+  })
+
+  it('全角字母、数字、星号折成 ASCII（NFKC）', () => {
+    // 输入法全角模式打出的 `．ｃｓ` 只换句点的话是 `.ｃｓ`，匹配不到 `Foo.cs`
+    expect(parseExtensions('\u{FF0E}\u{FF43}\u{FF53}')).toEqual(['.cs'])
+    expect(parseExtensions('\u{FF0A}.lua')).toEqual(['.lua'])
+    expect(parseExtensions('.mp\u{FF14}')).toEqual(['.mp4'])
+  })
+
   it('`*.cs` 这种 glob 写法去掉前导 `*`，单独的 `*` 仍是全收', () => {
     expect(parseExtensions('*.cs, *.lua')).toEqual(['.cs', '.lua'])
     expect(parseExtensions('*')).toEqual(['*'])

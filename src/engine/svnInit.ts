@@ -163,12 +163,24 @@ export function stepStatus(step: StepId, current: StepId): StepState {
 // 输入解析
 // ---------------------------------------------------------------------------
 
-// 码点一律写成转义：零宽字符肉眼看不见，编辑器或格式化工具删掉它也不会有人发现
-// 分隔符：ASCII 与全角的逗号 / 分号、中文顿号、半角片假名顿号 `､`、空白
-const EXTENSION_SEPARATORS = /[,;\u{FF0C}\u{3001}\u{FF1B}\u{FF64}\s]+/u
-/** 输入法打出的句点（`。` `．` `｡`），当成 `.` */
-const FULL_WIDTH_DOTS = /[\u{3002}\u{FF0E}\u{FF61}]/gu
-/** 复制粘贴带进来的零宽字符。`\s` 不含它们，留着会让扩展名静默匹配不到文件 */
+// 码点一律写成转义：零宽字符肉眼看不见，编辑器或格式化工具删掉它也不会有人发现。
+//
+// 先做 NFKC：全角的逗号、分号、句点、字母、数字、星号都折成 ASCII，半角片假名的
+// `､` `｡` 折成 `、` `。`。之后要单独处理的只剩中文顿号、中文句号和零宽字符——
+// 不用再逐个列全角字符，列不全的那个就是下一次静默失效（第三轮独立 review）。
+
+/**
+ * 分隔符：逗号、分号、中文顿号、空白，以及**两个以上连续的点**——`.cs。.lua` 换完句号
+ * 是 `.cs..lua`，`.。lua` 是 `..lua`，按点切开才是本意。
+ */
+const EXTENSION_SEPARATORS = /(?:[,;\u{3001}\s]|\.{2,})+/u
+/** 中文句号，当成 `.` */
+const IDEOGRAPHIC_FULL_STOP = /\u{3002}/gu
+/**
+ * 复制粘贴带进来的零宽字符，切分之前去掉。U+200B–U+200D、U+2060 不属于 `\s`，
+ * 留着会让扩展名静默匹配不到文件；U+FEFF 属于 `\s`，但它夹在扩展名中间是被粘进来的，
+ * 去掉而不是当成分隔符切开。
+ */
 const ZERO_WIDTH = /[\u{200B}-\u{200D}\u{2060}\u{FEFF}]/gu
 
 /**
@@ -183,14 +195,19 @@ const ZERO_WIDTH = /[\u{200B}-\u{200D}\u{2060}\u{FEFF}]/gu
  * 分隔符不只认 ASCII 逗号：中文输入法下顺手打出的 `、` `，` `；` 以及空白都切开。
  * 只认 `,` 时 `.cs、.lua` 会整串成为一个扩展名，生成的反选规则匹配不到任何文件，
  * 白名单整体失效却没有任何报错（2026-10-28 现场）。扩展名本身不会含这些字符。
- * 同理，输入法句点换成 `.`，零宽字符直接去掉，`*.cs` 去掉前导 `*`，末尾的 `.` 去掉。
+ * 同理，全角字符折成 ASCII，中文句号换成 `.`，零宽字符直接去掉，连续的点当分隔，
+ * `*.cs` 去掉前导 `*`，末尾的 `.` 去掉。
  *
- * Rust 侧 `svn_config::validate_new_extensions` 对同一批字符兜底拒绝：这里漏掉的，
- * 建库时会在 `git init` 之前报错，不会静默建出一个什么都不管的仓库。
+ * Rust 侧 `svn_config::validate_new_extensions` 按白名单兜底（只收 ASCII 字母、数字与
+ * `. _ - + ~`，不许空段）：这里漏掉的，建库时会在 `git init` 之前报错，不会静默建出
+ * 一个什么都不管的仓库。
  */
 export function parseExtensions(raw: string): string[] {
   const out: string[] = []
-  const cleaned = raw.replace(ZERO_WIDTH, '').replace(FULL_WIDTH_DOTS, '.')
+  const cleaned = raw
+    .normalize('NFKC')
+    .replace(ZERO_WIDTH, '')
+    .replace(IDEOGRAPHIC_FULL_STOP, '.')
   for (const piece of cleaned.split(EXTENSION_SEPARATORS)) {
     // `*.cs` 是很顺手的 glob 写法，去掉 `*` 即是本意；末尾的 `.` 来自句末打的 `。`，
     // 留着就是 `.lua.`，匹配不到任何文件（Windows 上文件名不能以点结尾）

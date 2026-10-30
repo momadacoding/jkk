@@ -238,6 +238,12 @@ const LISTED_EXTENSIONS: &[&str] = &[
     ".lua.",
     ".",
     "..",
+    // 空段：`.。cs` / `.cs。.lua` 换完句号的形态（第三轮独立 review）
+    "..cs",
+    ".cs..lua",
+    // 全角字母、星号：黑名单永远列不全，白名单才挡得住
+    ".\u{FF43}\u{FF53}",
+    ".c\u{FF0A}",
 ];
 
 #[test]
@@ -258,15 +264,40 @@ fn an_extension_that_is_really_a_whole_list_cannot_be_written() {
             "{bad:?}：被拒时不能留下配置文件"
         );
     }
-    validate_new_extensions(&[".cs".to_string(), ".lua".to_string(), "*".to_string()]).unwrap();
+    // 白名单不能误伤真实工程里的扩展名：复合扩展名、带 + 的、带下划线和连字符的
+    let ok: Vec<String> = [
+        ".cs",
+        ".lua",
+        "*",
+        ".meta",
+        ".d.ts",
+        ".c++",
+        ".asset_bundle",
+        ".mp4",
+        ".x-y~",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    validate_new_extensions(&ok).unwrap();
+}
+
+#[test]
+fn a_rejected_extension_names_the_offending_character() {
+    // 第三轮独立 review：所有字符类共用一句「把多个扩展名写成了一条」，对方括号、零宽
+    // 字符都不对，零宽字符更是看不见。报错要把那个字符的码点指出来
+    let err = validate_new_extensions(&[".cs\u{200B}".to_string()]).unwrap_err();
+    assert!(err.message.contains("U+200B"), "{}", err.message);
+    let err = validate_new_extensions(&[".c[s]".to_string()]).unwrap_err();
+    assert!(err.message.contains("'['"), "{}", err.message);
 }
 
 #[test]
 fn a_repo_built_by_an_older_version_with_a_listed_extension_still_opens() {
     // 旧版本写下的 `[".cs", ".lua、.java"]` 是**半能用**的：.cs 照常受管，上面可能
     // 已有提交和 stash。读配置时拒绝会把仓库整个锁死，应用里没有任何出路（独立 review）。
-    // 这类扩展名不危险，只是匹配不到文件，exclude 与纳入集合核对按同一份字符串算，
-    // 两边仍然一致——所以读盘照旧放行。
+    // 这类扩展名不会让命令作用到预期之外的范围，所以读盘照旧放行。方括号那一类会让
+    // 纳入集合核对报不一致，但那是旧版本就有的形态，不是这里新造出来的。
     for bad in LISTED_EXTENSIONS {
         let dir = TempDir::new().unwrap();
         fs::create_dir_all(dir.path().join(".git")).unwrap();

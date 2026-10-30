@@ -23,6 +23,10 @@ use crate::error::{GitError, Result};
 use std::io::Write;
 
 /// 生成文件的第一行。也是「这个 attributes 是不是我们写的」的唯一判据。
+///
+/// 「下次打开仓库时被覆盖」与实现不符（它只在建库和行尾迁移时写），`svn_exclude`
+/// 的同名文件头已经改掉，这里**有意没改**：[`has_eol_rule`] 按第一行精确比对来判定
+/// 规则装没装过，改文字会让所有现存仓库都被判成需要迁移。要改得先让判据兼容旧文字。
 pub const GENERATED_HEADER: &str =
     "# 由 mygitclient 自动生成，请勿手工编辑——改动会在下次打开仓库时被覆盖。";
 
