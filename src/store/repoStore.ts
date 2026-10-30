@@ -29,6 +29,7 @@ import {
 
 import { toErrorCode, toErrorMessage } from '../engine/errors'
 import { createLatestGate } from '@/engine/latestGate'
+import { createSingleFlight } from '@/engine/singleFlight'
 import { changesSection, type FileSection, type FileSelection } from '@/engine/fileSelection'
 import type { DriverReport } from '@/engine/mergeDrivers'
 import type {
@@ -430,8 +431,20 @@ export function useRepoStore() {
   const lastAuditAt = useRef(0)
   const auditInFlight = useRef(false)
 
-  /** `refreshStatus` / `refreshDiff` 的请求代次，见 `createLatestGate`。放 ref：要跨渲染保持计数。 */
+  /** `refreshConflicts` 的请求代次，见 `createLatestGate`。放 ref：要跨渲染保持计数。 */
   const refreshGate = useRef(createLatestGate()).current
+  /**
+   * `refreshStatus` / `refreshDiff` 同一种读取同时只跑一轮，见 `createSingleFlight`。
+   * 放 ref：在跑的那一轮要跨渲染记住。
+   */
+  const refreshFlights = useRef(createSingleFlight()).current
+  /**
+   * 最后一次请求状态 / diff 的仓库路径。单飞按路径分开（不同仓库的读取不能互相顶替），
+   * 旧仓库晚到的结果就要靠它挡住，不让它盖掉新仓库的。现在每个标签页的路径是固定的，
+   * 但 store 不该依赖这一点（独立 review）。
+   */
+  const lastStatusPath = useRef<string | null>(null)
+  const lastDiffPath = useRef<string | null>(null)
   /**
    * 当前视图要显示哪一份 diff，由 `useRepoEffects` 每次渲染写入。
    *
@@ -440,9 +453,6 @@ export function useRepoStore() {
    * 它要么让那个提交的结果作废，要么晚到后把工作区的改动盖在提交详情上（Codex review 第 2 条）。
    */
   const wantedDiffScope = useRef<string | null | undefined>(undefined)
-  /** 最新渲染时的状态。`refreshChanges` 的状态读取被更晚的刷新盖掉时，按它算区。 */
-  const latestStatus = useRef(state.status)
-  latestStatus.current = state.status
 
   const openRepo = useCallback(async (path: string) => {
     setState((s) => ({ ...s, loading: true, error: null, errorCode: null }))
@@ -562,16 +572,22 @@ export function useRepoStore() {
 
   /**
    * 交回读到的状态：Stage / Unstage 之后选中的文件可能换了区，调用方要按新状态算
-   * 接下来读哪个区的 diff（第 65 条）。被更晚的请求盖掉时交回 undefined。
+   * 接下来读哪个区的 diff（第 65 条）。
+   *
+   * 文件监听、外部工具退出、用户操作会先后各发一次。同时只读一轮，在读时再来的只补读一次，
+   * 交回的状态一定是调用之后才开读的（`createSingleFlight`）。各轮串行、按开读先后到达，
+   * 写回不必再核对代次，先读完的那轮也不会被作废。
    */
-  const refreshStatus = async (path: string): Promise<StatusData | undefined> => {
-    const token = refreshGate.begin('status')
-    const status = await invoke<StatusData>('read_status', { path })
-    // 文件监听、外部工具退出、用户操作会同时各发一次；晚到的旧结果不能盖掉新的
-    if (!refreshGate.isLatest(token, 'status')) return undefined
-    setState((s) => ({ ...s, status }))
+  const refreshStatus = async (path: string): Promise<StatusData> => {
+    lastStatusPath.current = path
+    const status = await refreshFlights.run(`status:${path}`, async () => {
+      const read = await invoke<StatusData>('read_status', { path })
+      if (lastStatusPath.current === path) setState((s) => ({ ...s, status: read }))
+      return read
+    })
     // 冲突的分类跟着 status 走：文件监听、外部工具退出、用户操作都经过这里，
-    // BC 存盘后 ① 变 ② 不需要另挂一条刷新路径
+    // BC 存盘后 ① 变 ② 不需要另挂一条刷新路径。
+    // 放在单飞外面：它有自己的代次闸，不该让下一轮状态读取排在它后面
     await refreshConflicts(path, status)
     return status
   }
@@ -808,25 +824,26 @@ export function useRepoStore() {
   }
 
   const refreshDiff = async (path: string, scope: string) => {
-    // 代次按 scope 分开计：别的 scope 的请求不能让这一份作废
-    const key = `diff:${scope}`
-    const token = refreshGate.begin(key)
     // 写回前再核对：只认当前视图要的那一份，切走之后才回来的旧 scope 结果丢掉
+    lastDiffPath.current = path
     const stillWanted = () => {
-      if (!refreshGate.isLatest(token, key)) return false
+      if (lastDiffPath.current !== path) return false
       const wanted = wantedDiffScope.current
       return wanted === undefined || wanted === scope
     }
-    let diff: DiffData
-    try {
-      diff = await invoke<DiffData>('read_diff', { path, scope })
-    } catch (err) {
-      // 读失败也要把这个 scope 记成「读过了」，不然界面会一直说「正在读取」；错误照旧抛给调用方
-      if (stillWanted()) setState((s) => ({ ...s, diff: { files: [] }, diffScope: scope }))
-      throw err
-    }
-    if (!stillWanted()) return
-    setState((s) => ({ ...s, diff, diffScope: scope }))
+    // 按仓库和 scope 分开单飞（同 `refreshStatus`）：别的 scope 的读取不用排队。
+    // 同一个 scope 各轮串行、按开读先后到达，写回不必再核对代次
+    await refreshFlights.run(`diff:${path}:${scope}`, async () => {
+      let diff: DiffData
+      try {
+        diff = await invoke<DiffData>('read_diff', { path, scope })
+      } catch (err) {
+        // 读失败也要把这个 scope 记成「读过了」，不然界面会一直说「正在读取」；错误照旧抛给调用方
+        if (stillWanted()) setState((s) => ({ ...s, diff: { files: [] }, diffScope: scope }))
+        throw err
+      }
+      if (stillWanted()) setState((s) => ({ ...s, diff, diffScope: scope }))
+    })
   }
 
   /**
@@ -837,9 +854,7 @@ export function useRepoStore() {
    */
   const refreshChanges = async (path: string, selection: () => FileSelection) => {
     const status = await refreshStatus(path)
-    // 被更晚的状态刷新盖掉时也不能跳过：盖掉它的可能是工具栏、checkout 这些只刷状态、
-    // 不读 diff 的路径，跳过的话右侧就停在旧内容上。按 store 里最新的状态算区
-    await refreshDiff(path, changesSection(selection(), status ?? latestStatus.current))
+    await refreshDiff(path, changesSection(selection(), status))
   }
 
   const selectCommit = (id: string) => {
@@ -890,7 +905,7 @@ export function useRepoStore() {
 export interface RepoRefreshers {
   refreshHead: (path: string) => Promise<string>
   refreshGraph: (path: string) => Promise<void>
-  refreshStatus: (path: string) => Promise<StatusData | undefined>
+  refreshStatus: (path: string) => Promise<StatusData>
   refreshWorktrees: (path: string) => Promise<void>
   /** `.gitattributes` 或 git 配置变了要重查；后端按指纹缓存，没变时不重扫。 */
   refreshMergeDrivers: (path: string) => Promise<DriverReport>
