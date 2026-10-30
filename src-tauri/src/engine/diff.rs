@@ -162,16 +162,19 @@ fn line_stats(diff: &git2::Diff) -> HashMap<String, (usize, usize)> {
     stats
 }
 
-/// index 相对 HEAD 的状态（已暂存那一侧）。
-fn index_status(status: git2::Status) -> &'static str {
-    if status.contains(git2::Status::INDEX_NEW) {
-        "added"
-    } else if status.contains(git2::Status::INDEX_DELETED) {
-        "deleted"
-    } else if status.contains(git2::Status::INDEX_RENAMED) {
-        "renamed"
-    } else {
-        "modified"
+/// 变更列表里一条 delta 的状态；`None` 表示这一类不进列表。
+///
+/// 取值与 `statuses()` 的换算一致（libgit2 `status.c` 的 `*_delta2status`）：
+/// Untracked 与 Added 同为新增。类型变化与读不了的条目原本就不在列表里
+/// （原实现的掩码没有 `*_TYPECHANGE` / `WT_UNREADABLE`），这里保持不变。
+fn listed_status(delta: git2::Delta) -> Option<&'static str> {
+    match delta {
+        git2::Delta::Added | git2::Delta::Copied | git2::Delta::Untracked => Some("added"),
+        git2::Delta::Deleted => Some("deleted"),
+        git2::Delta::Modified => Some("modified"),
+        git2::Delta::Renamed => Some("renamed"),
+        git2::Delta::Conflicted => Some("conflicted"),
+        _ => None,
     }
 }
 
@@ -187,87 +190,77 @@ fn is_readable(repo: &Repository, rel: &str) -> bool {
     }
 }
 
-/// 工作区相对 index 的状态（未暂存那一侧）。
-fn worktree_status(status: git2::Status) -> &'static str {
-    if status.contains(git2::Status::WT_NEW) {
-        "added"
-    } else if status.contains(git2::Status::WT_DELETED) {
-        "deleted"
-    } else if status.contains(git2::Status::WT_RENAMED) {
-        "renamed"
-    } else {
-        "modified"
-    }
-}
-
+/// 「本地改动」两个列表与各自的增删行数。
+///
+/// **只扫一遍工作区。** `statuses()` 内部就是 `diff_tree_to_index` + `diff_index_to_workdir`
+/// 再按路径配对（libgit2 `status.c`），这两个 diff 我们为了算行数本来就要做，再调一次
+/// `statuses()` 等于把整个工作区重新 stat 一遍。大工作副本上一遍约 1 秒（2026-10-30 排查），
+/// 所以列表直接从这两个 diff 取。两个 diff 各自保持路径顺序，配对结果里筛出某一侧的项，
+/// 顺序与这一侧 diff 的顺序相同，列表顺序因此不变。
 pub fn read_status(path: &str) -> Result<StatusData> {
     let repo = Repository::open(path)?;
 
     let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
-    let staged_stats = line_stats(&repo.diff_tree_to_index(head_tree.as_ref(), None, None)?);
+    // index 只读一次，几个 diff 共用。不传的话每个 diff 都会在 index 变了时从磁盘重读
+    // （libgit2 `diff_load_index`）：两次之间若有一次 `git add`，Staged 和 Unstaged 两个列表
+    // 就来自两个版本的 index，刚暂存的文件可能两边都在或两边都没有。`statuses()` 也是只读一次
+    let index = repo.index()?;
+    // `statuses()` 固定带 INCLUDE_TYPECHANGE。不带的话类型变化会拆成一删一增，
+    // 列表里凭空多出两项；带上之后它是一条 Typechange，按原样不列
+    let mut staged_opts = DiffOptions::new();
+    staged_opts.include_typechange(true);
+    let staged_diff =
+        repo.diff_tree_to_index(head_tree.as_ref(), Some(&index), Some(&mut staged_opts))?;
+    let staged_stats = line_stats(&staged_diff);
 
-    let workdir_diff = repo.diff_index_to_workdir(None, Some(&mut workdir_diff_opts(None)))?;
+    let mut wd_opts = workdir_diff_opts(None);
+    wd_opts.include_typechange(true);
+    let workdir_diff = repo.diff_index_to_workdir(Some(&index), Some(&mut wd_opts))?;
     let unstaged_stats = match readable_only(&repo, &workdir_diff) {
         None => line_stats(&workdir_diff),
         // 全都读不了就没什么可统计的，行数一律退化为 0，
-        // 但文件列表来自 statuses()，不受影响
+        // 但文件列表来自上面那个 diff 的 deltas，不受影响
         Some(good) if good.is_empty() => HashMap::new(),
+        // 绕开坏路径重建的这一遍只为行数，列表不从它取
         Some(good) => line_stats(
-            &repo.diff_index_to_workdir(None, Some(&mut workdir_diff_opts(Some(&good))))?,
+            &repo.diff_index_to_workdir(Some(&index), Some(&mut workdir_diff_opts(Some(&good))))?,
         ),
     };
 
-    let mut status_opts = git2::StatusOptions::new();
-    status_opts
-        .include_untracked(true)
-        .recurse_untracked_dirs(true);
-    let statuses = repo.statuses(Some(&mut status_opts))?;
-
-    let mut staged = Vec::new();
-    let mut unstaged = Vec::new();
-
-    let make = |path_str: &str, kind: &str, stats: &HashMap<String, (usize, usize)>| {
-        let (additions, deletions) = stats.get(path_str).copied().unwrap_or((0, 0));
+    let make = |path_str: String, kind: &str, stats: &HashMap<String, (usize, usize)>| {
+        let (additions, deletions) = stats.get(&path_str).copied().unwrap_or((0, 0));
         FileChange {
-            path: path_str.to_string(),
+            path: path_str,
             status: kind.to_string(),
             additions,
             deletions,
         }
     };
 
-    for entry in statuses.iter() {
-        let status = entry.status();
-        let path_str = entry.path().unwrap_or("");
-
-        // 冲突文件既不在 INDEX_* 也不在 WT_* 里，单独处理，
-        // 否则 merge 冲突时界面上根本看不到冲突文件。
-        if status.contains(git2::Status::CONFLICTED) {
-            unstaged.push(make(path_str, "conflicted", &unstaged_stats));
+    let mut staged = Vec::new();
+    for delta in staged_diff.deltas() {
+        // 冲突条目两个 diff 里都有（两边的 iterator 都带 INCLUDE_CONFLICTS），只在 Unstaged
+        // 列一次。Staged 也列的话会多出一项，而 Staged 的 diff 已经把它滤掉了
+        if delta.status() == git2::Delta::Conflicted {
             continue;
         }
+        if let Some(kind) = listed_status(delta.status()) {
+            staged.push(make(delta_path(&delta), kind, &staged_stats));
+        }
+    }
 
-        if status.intersects(
-            git2::Status::INDEX_NEW
-                | git2::Status::INDEX_MODIFIED
-                | git2::Status::INDEX_DELETED
-                | git2::Status::INDEX_RENAMED,
-        ) {
-            staged.push(make(path_str, index_status(status), &staged_stats));
+    let mut unstaged = Vec::new();
+    for delta in workdir_diff.deltas() {
+        let path_str = delta_path(&delta);
+        let Some(kind) = listed_status(delta.status()) else {
+            continue;
+        };
+        // 只对新增项做可读性检查（与原来的 WT_NEW 同一范围）。已跟踪文件被删掉走的是
+        // Deleted，那是真实变更，即使工作区里已经没有这个路径也必须保留。
+        if kind == "added" && !is_readable(&repo, &path_str) {
+            continue;
         }
-        if status.intersects(
-            git2::Status::WT_NEW
-                | git2::Status::WT_MODIFIED
-                | git2::Status::WT_DELETED
-                | git2::Status::WT_RENAMED,
-        ) {
-            // 只对未跟踪项做可读性检查。已跟踪文件被删掉走的是 WT_DELETED，
-            // 那是真实变更，即使工作区里已经没有这个路径也必须保留。
-            let phantom = status.contains(git2::Status::WT_NEW) && !is_readable(&repo, path_str);
-            if !phantom {
-                unstaged.push(make(path_str, worktree_status(status), &unstaged_stats));
-            }
-        }
+        unstaged.push(make(path_str, kind, &unstaged_stats));
     }
 
     Ok(StatusData { staged, unstaged })
@@ -401,7 +394,7 @@ fn delta_path(delta: &git2::DiffDelta) -> String {
         .unwrap_or_default()
 }
 
-/// 与 `index_status` / `worktree_status` 保持同一套取值，前端只认这一套。
+/// 与 `listed_status`（变更列表）保持同一套取值，前端只认这一套。
 fn delta_status(status: git2::Delta) -> &'static str {
     match status {
         git2::Delta::Added | git2::Delta::Untracked => "added",
