@@ -65,17 +65,34 @@ describe('refreshDiff 只写回当前视图要的那一份', () => {
     expect(result.current.state.diff.files.map((f) => f.path)).toEqual(['b.txt'])
   })
 
-  it('同一个 scope 发了两次：先发的晚到时丢掉，只留后发的', async () => {
+  // 2026-10-30 排查：并发的两轮抢同一块磁盘，而且先发的那轮做完被丢掉，界面要等第二轮
+  it('同一个 scope 在读时再来：不并发；先读完的照常写回，再补读一次', async () => {
     const { result } = renderHook(() => useRepoStore())
     result.current.wantedDiffScope.current = 'workdir'
     act(() => {
       void result.current.refreshDiff('C:/r', 'workdir')
       void result.current.refreshDiff('C:/r', 'workdir')
     })
-    const [older, newer] = pending.filter((p) => p.cmd === 'read_diff')
-    await act(async () => { newer.resolve(diffOf('new.txt')) })
-    await act(async () => { older.resolve(diffOf('old.txt')) })
-    expect(result.current.state.diff.files.map((f) => f.path)).toEqual(['new.txt'])
+    expect(pending.filter((p) => p.cmd === 'read_diff')).toHaveLength(1)
+    await answer('workdir', diffOf('first.txt'))
+    expect(result.current.state.diff.files.map((f) => f.path)).toEqual(['first.txt'])
+    expect(pending.filter((p) => p.cmd === 'read_diff')).toHaveLength(1)
+    await answer('workdir', diffOf('trailing.txt'))
+    expect(result.current.state.diff.files.map((f) => f.path)).toEqual(['trailing.txt'])
+  })
+
+  it('换了仓库：旧仓库同一个 scope 晚到的 diff 不盖掉新仓库的', async () => {
+    const { result } = renderHook(() => useRepoStore())
+    result.current.wantedDiffScope.current = 'workdir'
+    act(() => {
+      void result.current.refreshDiff('C:/a', 'workdir')
+      void result.current.refreshDiff('C:/b', 'workdir')
+    })
+    const reads = pending.filter((p) => p.cmd === 'read_diff')
+    expect(reads.map((p) => p.args.path)).toEqual(['C:/a', 'C:/b'])
+    await act(async () => { reads[1].resolve(diffOf('b.txt')) })
+    await act(async () => { reads[0].resolve(diffOf('a.txt')) })
+    expect(result.current.state.diff.files.map((f) => f.path)).toEqual(['b.txt'])
   })
 
   it('还不知道当前视图要哪一份时（刚打开仓库）照常写回', async () => {
@@ -87,11 +104,12 @@ describe('refreshDiff 只写回当前视图要的那一份', () => {
 })
 
 // 第 65 条：Stage / Unstage 之后选中的文件可能换了区，刷新 diff 要按**新的**状态算读哪个区，
-// 所以 refreshStatus 把它读到的状态交回去；被更晚的请求盖掉时交回 undefined，调用方别拿它算
+// 所以 refreshStatus 把它读到的状态交回去
 describe('refreshStatus 交回读到的状态', () => {
   const status = { unstaged: [], staged: [{ path: 'a.txt', status: 'modified', additions: 1, deletions: 0 }] }
+  const later = { unstaged: [], staged: [{ path: 'b.txt', status: 'modified', additions: 1, deletions: 0 }] }
 
-  it('最新的一次：交回读到的状态', async () => {
+  it('交回读到的状态', async () => {
     const { result } = renderHook(() => useRepoStore())
     let run!: Promise<unknown>
     act(() => { run = result.current.refreshStatus('C:/r') })
@@ -100,16 +118,46 @@ describe('refreshStatus 交回读到的状态', () => {
     await expect(run).resolves.toEqual(status)
   })
 
-  it('被后发的请求盖掉：交回 undefined', async () => {
+  // 2026-10-30 排查的主因：Stage 的回调先发一轮，约 300ms 后文件监听（`git add` 改了 index）
+  // 再发一轮。原来按「只认最后一次」，先发的那轮做完被丢掉，界面要等第二轮，约 5 秒
+  it('在读时再来：不并发；先发的那轮照常写回并交回，后来的拿补读那一轮的结果', async () => {
     const { result } = renderHook(() => useRepoStore())
-    let older!: Promise<unknown>
+    let first!: Promise<unknown>
+    let second!: Promise<unknown>
     act(() => {
-      older = result.current.refreshStatus('C:/r')
-      void result.current.refreshStatus('C:/r')
+      first = result.current.refreshStatus('C:/r')
+      second = result.current.refreshStatus('C:/r')
     })
-    const [first] = pending.filter((p) => p.cmd === 'read_status')
-    await act(async () => { first.resolve(status) })
-    await expect(older).resolves.toBeUndefined()
+    expect(pending.filter((p) => p.cmd === 'read_status')).toHaveLength(1)
+    const own = pending.find((p) => p.cmd === 'read_status')!
+    pending.splice(pending.indexOf(own), 1)
+    await act(async () => { own.resolve(status) })
+    await expect(first).resolves.toEqual(status)
+    expect(result.current.state.status).toEqual(status)
+
+    const trailing = pending.filter((p) => p.cmd === 'read_status')
+    expect(trailing).toHaveLength(1)
+    pending.splice(pending.indexOf(trailing[0]), 1)
+    await act(async () => { trailing[0].resolve(later) })
+    await expect(second).resolves.toEqual(later)
+    expect(result.current.state.status).toEqual(later)
+  })
+
+  // 现在每个标签页的路径是固定的，但 store 不该依赖这一点（独立 review）
+  it('换了仓库：新仓库的读取不排在旧仓库后面，旧仓库晚到的结果不盖掉新仓库', async () => {
+    const { result } = renderHook(() => useRepoStore())
+    let b!: Promise<unknown>
+    act(() => {
+      void result.current.refreshStatus('C:/a')
+      b = result.current.refreshStatus('C:/b')
+    })
+    const reads = pending.filter((p) => p.cmd === 'read_status')
+    expect(reads.map((p) => p.args.path)).toEqual(['C:/a', 'C:/b'])
+    for (const p of reads) pending.splice(pending.indexOf(p), 1)
+    await act(async () => { reads[1].resolve(later) })
+    await expect(b).resolves.toEqual(later)
+    await act(async () => { reads[0].resolve(status) })
+    expect(result.current.state.status).toEqual(later)
   })
 })
 
@@ -126,16 +174,33 @@ describe('refreshChanges', () => {
     expect(pending.filter((p) => p.cmd === 'read_diff').map((p) => p.args.scope)).toEqual(['staged'])
   })
 
-  // 盖掉它的那次状态刷新可能来自工具栏、checkout 等，它们不读 diff；这里跳过的话右侧就停在旧的
-  it('状态被更晚的刷新盖掉：照样读 diff，按 store 里最新的状态算区', async () => {
+  // Stage 的回调先读状态，文件监听那一轮在它读的过程中到达：不并发，也不让它作废
+  it('状态读取进行中又来一次刷新：不等补读那一轮，用自己那轮的结果算区读 diff', async () => {
     const { result } = renderHook(() => useRepoStore())
     act(() => {
       void result.current.refreshChanges('C:/r', unstagedA)
       void result.current.refreshStatus('C:/r')
     })
-    const [older, newer] = pending.filter((p) => p.cmd === 'read_status')
-    await act(async () => { newer.resolve({ unstaged: [ch('b.txt')], staged: [ch('a.txt')] }) })
-    await act(async () => { older.resolve({ unstaged: [ch('a.txt')], staged: [] }) })
+    expect(pending.filter((p) => p.cmd === 'read_status')).toHaveLength(1)
+    const own = pending.find((p) => p.cmd === 'read_status')!
+    pending.splice(pending.indexOf(own), 1)
+    await act(async () => { own.resolve({ unstaged: [ch('b.txt')], staged: [ch('a.txt')] }) })
+    expect(pending.filter((p) => p.cmd === 'read_diff').map((p) => p.args.scope)).toEqual(['staged'])
+  })
+
+  // 在读的那一轮可能是写操作之前发起的（比如上一次保存触发的监听），它读到的是旧状态
+  it('写操作之前就已经在读的状态不算数：等补读那一轮的结果再算区', async () => {
+    const { result } = renderHook(() => useRepoStore())
+    act(() => { void result.current.refreshStatus('C:/r') })
+    // 这时用户点了 Stage，回调随后刷新
+    act(() => { void result.current.refreshChanges('C:/r', unstagedA) })
+    const stale = pending.find((p) => p.cmd === 'read_status')!
+    pending.splice(pending.indexOf(stale), 1)
+    await act(async () => { stale.resolve({ unstaged: [ch('a.txt')], staged: [] }) })
+    expect(pending.filter((p) => p.cmd === 'read_diff')).toEqual([])
+    const fresh = pending.find((p) => p.cmd === 'read_status')!
+    pending.splice(pending.indexOf(fresh), 1)
+    await act(async () => { fresh.resolve({ unstaged: [ch('b.txt')], staged: [ch('a.txt')] }) })
     expect(pending.filter((p) => p.cmd === 'read_diff').map((p) => p.args.scope)).toEqual(['staged'])
   })
 })
