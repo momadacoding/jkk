@@ -45,6 +45,7 @@
 - [ ] 场景 10：只提交删除 → 跟进后记成墓碑
 - [ ] 场景 11：SVN 操作进行中切回 jkk → 「SVN 正在更新…」
 - [ ] 场景 12：周一根目录整体更新 → 跟进后基线回到单值旧格式
+- [ ] 场景 14（接在 12 之后）：暂存 / 改了没暂存 / 新增文件，经过跟进、手动跟进、工具栏 Stash 都还在
 - [ ] 场景 13（可选）：用真的 TortoiseSVN 重走场景 2
 
 ---
@@ -367,7 +368,7 @@ G commit -qm 'e2e 4 B2'
 
 ## 场景 5：stash 去修 bug，回来继续
 
-jkk 没有「收起改动」的按钮，这一步在操作窗口里用命令做（只在 fixture 里）。
+这一步在操作窗口里用命令做（只在 fixture 里）。工具栏上的 Stash 按钮在场景 14 里单独验。
 
 **造现场（操作窗口）：**
 
@@ -699,6 +700,145 @@ G status --short
 
 ---
 
+## 场景 14：没暂存的改动和新增文件
+
+接在场景 12 之后做（场景 13 是可选的，放在最后）。前面的场景开始时工作区基本是干净的，这里专门验三种还没进 git 提交的改动：
+
+| 形态 | 下文的文件 |
+|---|---|
+| 已暂存 | `Code/Bag/B1.cs` |
+| 改了、没暂存 | `Code/Mail/M1.cs` |
+| 新增、git 没跟踪（`??`） | `Code/New14.cs`、`Code/New14b.cs` |
+
+### 14A：普通跟进不碰它们，自己 svn add 的新文件被认领
+
+**造现场（操作窗口）：** 三种改动各来一份，再新建一个文件 `svn add` 后直接提交到 SVN。
+
+```powershell
+Wc 'Code/Bag/B1.cs' 'class B1 { int staged14; }'
+G add Code/Bag/B1.cs
+Wc 'Code/Mail/M1.cs' 'class M1 { int unstaged14; }'
+Wc 'Code/New14.cs' 'class New14 { }'
+Wc 'Code/Mine14.cs' 'class Mine14 { }'
+svn add -q --non-interactive (Join-Path $WC 'Code/Mine14.cs')
+SvnCommit 'Code/Mine14.cs'
+G status --short --untracked-files=all
+```
+
+`status` 应当是四行：`M  Code/Bag/B1.cs`、` M Code/Mail/M1.cs`、`?? Code/Mine14.cs`、`?? Code/New14.cs`。
+
+**操作（应用）：** 点回应用 → 横幅只列 `Code/Mine14.cs` → 点「跟进」→「跟进完成」。
+
+**核对（操作窗口）：**
+
+```powershell
+G status --short --untracked-files=all
+G show :Code/Bag/B1.cs
+Get-Content (Join-Path $WC 'Code/Mail/M1.cs')
+G show svn/base:Code/Mine14.cs
+```
+
+- `status` 剩三行：`M  Code/Bag/B1.cs`、` M Code/Mail/M1.cs`、`?? Code/New14.cs`。`Mine14.cs` 不见了，因为它已经进了基线，磁盘上的内容和基线一样；
+- 暂存区里的 B1 还是 `staged14`，磁盘上的 M1 还是 `unstaged14`；
+- 基线里有 `class Mine14 { }`。
+
+**收尾（操作窗口）：** 把这些改动提交到 git，14B 从干净的工作区开始。
+
+```powershell
+G add -A Code
+G commit -qm 'e2e 14a wip'
+```
+
+### 14B：手动跟进先收走、最后原样放回
+
+**造现场（操作窗口）：** 和场景 8 一样，做一条与 SVN 提交冲突的分支。
+
+```powershell
+G switch -q -c side14
+Wc 'Code/A.cs' 'class A { int side14; }'
+G commit -qam 'side14 A'
+G switch -q work
+Wc 'Code/A.cs' 'class A { int fix14; }'
+SvnCommit 'Code/A.cs'
+```
+
+**应用：** 点回应用 → 横幅 → 点「跟进」，`side14` 应标为落后。在分支列表里切到 `side14` → 点 **「仅切换」**。
+先只切换，是为了在手动跟进**之前**往工作区里放改动。
+
+**接着（操作窗口）：** 在 side14 上放三种改动。
+
+```powershell
+Wc 'Code/Bag/B1.cs' 'class B1 { int staged14b; }'
+G add Code/Bag/B1.cs
+Wc 'Code/Mail/M1.cs' 'class M1 { int unstaged14b; }'
+Wc 'Code/New14b.cs' 'class New14b { }'
+G status --short --untracked-files=all
+```
+
+应当是：`M  Code/Bag/B1.cs`、` M Code/Mail/M1.cs`、`?? Code/New14b.cs`。
+
+**操作（应用）：** 点回应用 → 黄色横幅「当前分支落后基线」上点「跟进」→ 转「手动跟进」→ 确认。
+弹出冲突、列出 `Code/A.cs` 时，**操作窗口**：
+
+```powershell
+Wc 'Code/A.cs' 'class A { int fix14; int side14; }'
+```
+
+**应用：** 在「本地改动」里暂存 `Code/A.cs` → 点横幅上的「继续」→ 确认。
+
+**核对（操作窗口）：**
+
+```powershell
+git -C $WC merge-base --is-ancestor svn/base HEAD; $LASTEXITCODE
+G status --short --untracked-files=all
+G show :Code/Bag/B1.cs
+Get-Content (Join-Path $WC 'Code/Mail/M1.cs')
+Get-Content (Join-Path $WC 'Code/New14b.cs')
+```
+
+- 先是 `0`；
+- `status` 是和手动跟进之前完全一样的三行：`M  Code/Bag/B1.cs`（**仍然是已暂存**）、` M Code/Mail/M1.cs`、`?? Code/New14b.cs`；
+- 内容依次是 `staged14b`、`unstaged14b`、`class New14b { }`。
+
+### 14C：工具栏 Stash 与「Stash all」
+
+这是改造前就有的按钮，这一期没动它，记在这里是让你知道它的边界。接着 14B 的现场，仍在 side14 上：
+
+1. **应用：** 直接点工具栏的 **Stash**。**操作窗口：** `G status --short --untracked-files=all`
+
+   应当**只剩** `?? Code/New14b.cs`：普通 Stash 收走已暂存和改了没暂存的，**不收新增文件**。
+
+2. **操作窗口：** 放回来。
+
+   ```powershell
+   G stash pop -q --index
+   G status --short --untracked-files=all
+   ```
+
+   回到 14B 核对时的三行，B1 仍是已暂存（`--index` 才会恢复暂存状态）。
+
+3. **应用：** 按住 **Ctrl** 点工具栏，按钮名变成 **Stash all**，点它。**操作窗口：** `G status --short --untracked-files=all` 应当是空的。
+4. **操作窗口：** `G stash pop -q --index`，然后 `G status --short --untracked-files=all`，还是那三行。
+
+**收尾：** **操作窗口**把改动提交到 side14，然后在**应用**里切回 `work`。
+
+```powershell
+G add -A Code
+G commit -qm 'e2e 14b wip'
+```
+
+**看到别的说明：**
+
+| 现象 | 含义 |
+|---|---|
+| 14A 跟进后 B1 变成没暂存，或 M1 / New14 内容变了 | 普通跟进写了工作区或丢了暂存（`follow_never_writes_working_tree` 该挡住的） |
+| 14A 跟进后 `?? Code/Mine14.cs` 还在 | 自己 `svn add` 提交的新文件没进基线，或进了基线但索引没跟上 |
+| 14B 继续之后 B1 变成 ` M`（没暂存了），且弹了「暂存没保住」 | `stash apply --index` 失败退回了不带 `--index` 的 apply；记下弹框内容反馈回来 |
+| 14B 继续之后 `New14b.cs` 不见了 | 手动跟进的 stash 收了新增文件却没放回——严重，**先别做别的操作**，把 `G stash list` 的输出发回来 |
+| 14C 第 1 步 New14b 也被收走了 | 普通 Stash 的行为和预期不同（预期是只有 Stash all 才收新增文件） |
+
+---
+
 ## 场景 13（可选）：用真的 TortoiseSVN 重走场景 2
 
 前面的 `SvnCommit` 是命令行，效果与 TortoiseSVN 提交相同，但 TortoiseSVN 会弹出自己的对话框，
@@ -740,6 +880,7 @@ Remove-Item -Recurse -Force $fix.FullName
 | 已提交的删除成为墓碑；漏收（depth-exclude）拒绝录制；确认失败拒绝 | `svn_health.rs::committed_deletion_becomes_tombstone_when_just_recorded` 及同文件的 exclude / unconfirmed 测试 |
 | Local-Only 泄漏按 hunk 判定（含相邻行、行号偏移） | `svn_leak.rs::leak_by_hunk_matches_w21_scenarios` 等 |
 | 落后分支磁盘还是旧内容时转手动跟进 | `branch_entry_sends_a_stale_disk_to_manual_follow`、`a_stale_disk_on_a_lagging_branch_also_stops_a_recording_follow` |
+| 手动跟进带着暂存 / 未暂存 / 未跟踪的改动：继续、放弃、崩溃后续上都原样放回 | `manual_follow_restores_staging_with_index_when_possible`、`manual_follow_abort_after_a_crash_restores_everything` 等用 `wip()` 造现场的一组 |
 | 手动跟进暂存没保住时 stash 保留、能取回 | `manual_follow_stage_lost_keeps_a_stage_that_differs_from_disk` |
 | 多条分支共享的 commit 只重放一次；外部 `--no-ff` merge 后内容已全部进 SVN 时直接跟上 | `svn_replay.rs::shared_commit_replayed_once_across_branches`、`all_committed_true_through_no_ff_merge_with_delete_add_mode_rename` |
 | 拼索引：暂存的删除 / mode / i-t-a / skip-worktree / assume-unchanged、冲突索引拒绝、钉住的旧索引 gc 后能还原 | `src-tauri/tests/svn_follow_index.rs` |
