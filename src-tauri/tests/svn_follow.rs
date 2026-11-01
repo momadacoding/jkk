@@ -3436,6 +3436,38 @@ fn follow_records_the_same_tree_an_empty_index_would() {
 }
 
 #[test]
+fn a_recording_from_the_old_base_keeps_its_file_modes() {
+    // 与空索引不等价的一处，有意保留（独立 review 2026-11-01）：filemode=false 时 `git add` 沿用
+    // 已有条目的 mode。旧基线里的 100755（S7 从用户 commit 带进来的）跟进后仍是 100755；
+    // 从空索引录会归一成 100644，基线就随跟进来回翻 mode
+    let fx = hybrid_with_colleague();
+    let wc = fx.wc_str();
+    git(&fx, &["config", "core.filemode", "false"]);
+    let scratch = fx.wc().join(".git").join("mode-test-index");
+    let scratch = scratch.to_string_lossy().into_owned();
+    let env = [("GIT_INDEX_FILE", scratch.as_str())];
+    run_git_env(&wc, &["read-tree", "svn/base^{tree}"], &env).unwrap();
+    run_git_env(&wc, &["update-index", "--chmod=+x", A], &env).unwrap();
+    let old_base = run_git_env(&wc, &["write-tree"], &env)
+        .unwrap()
+        .trim()
+        .to_string();
+    let cfg = read_config(&wc).unwrap();
+
+    let kept = record_mixed(
+        &wc,
+        &cfg,
+        &TempIndex::from_tree_keeping_stat(&wc, &old_base).unwrap(),
+    )
+    .unwrap();
+    let fresh = record_mixed(&wc, &cfg, &TempIndex::empty(&wc).unwrap()).unwrap();
+
+    let mode = |tree: &str| git(&fx, &["ls-tree", tree, A])[..6].to_string();
+    assert_eq!(mode(&kept.tree), "100755");
+    assert_eq!(mode(&fresh.tree), "100644");
+}
+
+#[test]
 fn a_stale_scan_cache_cannot_record_a_lying_baseline() {
     // 准备阶段缓存了 svn 扫描（性能 P2）。缓存之后 TortoiseSVN 又提交了一次：用陈旧的
     // 节点状态录，映射会把新内容标成旧 revision。R3c 重读与体检必须把它拦下

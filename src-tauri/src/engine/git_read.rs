@@ -8,12 +8,15 @@
 //!
 //! # 「不存在」与「坏了」要分开
 //!
-//! [`resolve`] 只把 `NotFound` / `InvalidSpec` / `Ambiguous` 当成「没有」，与 `rev-parse -q --verify`
-//! 退出 1 对应；ref 文件损坏之类返回 `Err`，与 CLI 的 128 对应。把损坏当成不存在会让调用方以为
-//! 基线还没建，进而覆盖掉一段真实历史（`svn_baseline::read_baseline`）。
+//! [`resolve`] 只把 ref / 路径层面的 `NotFound` / `InvalidSpec` / `Ambiguous` 当成「没有」；
+//! ref 文件损坏、ref 指向的对象缺失都返回 `Err`。把损坏当成不存在会让调用方以为基线还没建，
+//! 进而覆盖掉一段真实历史（`svn_baseline::read_baseline`）。
+//!
+//! 这两种损坏上 CLI 并不报错：内容是垃圾的 ref，`rev-parse -q --verify` 警告后退出 1（算「没有」）；
+//! 悬空 ref 退出 0 照样打印 OID。这里有意比 CLI 严（`tests/git_read.rs`，独立 review 2026-11-01）。
 
 use crate::error::Result;
-use git2::{ErrorCode, ObjectType, Repository, TreeWalkMode, TreeWalkResult};
+use git2::{ErrorClass, ErrorCode, ObjectType, Repository, TreeWalkMode, TreeWalkResult};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
@@ -22,10 +25,11 @@ fn open(repo: &str) -> Result<Repository> {
 }
 
 fn absent(e: &git2::Error) -> bool {
+    // ref 在、对象没了（悬空 ref）也报 NotFound，但类别是 Odb：那是对象库坏了，不是「没有」
     matches!(
         e.code(),
         ErrorCode::NotFound | ErrorCode::InvalidSpec | ErrorCode::Ambiguous
-    )
+    ) && e.class() != ErrorClass::Odb
 }
 
 /// `git rev-parse --git-dir`，绝对路径。linked worktree 里是 `.git/worktrees/<名字>`，与 CLI 相同。

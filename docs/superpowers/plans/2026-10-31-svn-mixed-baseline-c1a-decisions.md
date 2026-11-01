@@ -1101,8 +1101,16 @@
   read-tree 0.18 s + add 0.14 s + write-tree 0.06 s。两边 `write-tree` 得到同一个树 OID。
 - **为什么这么改是安全的：**
   - 原来从空索引起步是为了甩掉服务器上已删除的文件。从旧基线起步时这些文件磁盘上已不在，`add -A` 一样摘掉。
-  - 两种起点只在一处不等价：旧基线里有**现在已不算 W** 的文件（白名单或扩展名收窄过）。它是已跟踪文件，`add -A` 会留下，
-    R2c 纳入集合核对报 `include_set_mismatch`。这时 `record_from_old_base` 退回空索引按原口径重录一次，结果与改动前相同。
+  - **文件集合**上两种起点只在一处不等价：旧基线里有**现在已不算 W** 的文件（白名单或扩展名收窄过）。它是已跟踪文件，
+    `add -A` 会留下，R2c 纳入集合核对报 `include_set_mismatch`。这时 `record_from_old_base` 退回空索引按原口径重录一次。
+  - **【独立 review 更正】** 原先这里写「结果与改动前完全相同」，只在集合层面成立。另有两处不等价（review 实测）：
+    - mode：filemode=false 时 `git add` 沿用已有条目的 mode，旧基线里的 100755（S7 从用户 commit 带进来的）跟进后仍是
+      100755，空索引会归一成 100644。**有意保留**：与 S7 同一口径，否则基线每次跟进都来回翻 mode。
+      `svn_follow::a_recording_from_the_old_base_keeps_its_file_modes` 钉住。
+    - 过滤规则（autocrlf、`.gitattributes` 的 eol / filter / ident）改了之后，stat 没变的文件不按新规则重新 clean，blob 是
+      旧规则的结果，体检看不出（它比磁盘与服务器，不比 blob）。与 git 对真实索引的口径相同（要 `add --renormalize`）；
+      已迁移仓库由 `.git/info/attributes` 钉住 text / eol 基本碰不到，碰到时「重建基线」从空索引录可纠正。没有加规则指纹
+      检测，记为遗留。
   - stat 只是缓存，内容仍以磁盘为准：复制时保留了索引文件的 mtime，racily clean 的条目照样重新哈希（同 `swap_index_to_tree`
     的论证）；assume-unchanged / skip-worktree 被清掉，`add -A` 不会因为它们跳过磁盘。真实索引只被读、不被写。
 - **偏离：** 原方案 A 只列了「git 只读查询改 libgit2」与「svn 去重」；P1 是测量后新发现的最大项，一并做。`sync_in` S7 与
@@ -1122,6 +1130,10 @@
 - **为什么这么改是安全的：** 范围内跟进本身不发 SVN 写命令、不写工作区；外部在范围内的改动由 R3c（读最新节点状态）与
   体检（直接问服务器）两道兜住。`a_stale_scan_cache_cannot_record_a_lying_baseline` 先缓存、再在 TortoiseSVN 侧提交、再录，
   断言被拦下、基线不动。
+  - **【独立 review 补充】** R1 前置校验（`collect_dirty`、`read_node_status`、`check_no_operation_in_progress`）也吃缓存，读的是
+    `check_sync` 时的快照，窗口从「R1 到 git add」放大到准备阶段前半段。review 逐条推过：窗口内新出现的本地修改被体检报
+    Lying；窗口内 TortoiseSVN 提交了原本脏的文件被 R3c 报 `revision_moved`；update / 提交被 R3c 与体检拦下。InSync 分支的
+    「补上 R1」因此只是 `check_sync` 结论的重复。
 - **偏离：** 没有改成「把节点状态一路传参」：那要动 `check_sync` / `run_preflight_with` / `record_mixed` / 体检四处的签名，
   它们还被初始化、重建、更新、交付共用；缓存只在跟进范围内生效，别的入口行为不变。
 - **测试：** `svn_cli` 三条（范围内复用、忘掉后重读、出范围不复用），两个变异（`forget` 改成空操作、范围结束不清）各抓到一条。
@@ -1135,15 +1147,25 @@
   `unmerged_paths`、`svn_basemap::read_base_map`、`svn_follow::branch_baseline` / `previous_baseline`、`svn_replay::rev_parse`、
   `svn_scope::baseline_files`、`svn_follow_mark::write_mark`、`svn_include_check::ignore_case`。`check_git_version` 进程内
   只在「够新」时记一次。
-- **「不存在」与「坏了」：** `read_baseline` / `baseline_files` 原先按退出码 1（不存在）/ 128（损坏）区分。`resolve` 只把
-  `NotFound` / `InvalidSpec` / `Ambiguous` 当成没有，ref 文件损坏返回 `Err`，`git_read::a_corrupt_ref_is_an_error_not_absent` 钉住。
+- **「不存在」与「坏了」：** `resolve` 只把 ref / 路径层面的 `NotFound` / `InvalidSpec` / `Ambiguous` 当成没有，其余返回 `Err`。
+  **【独立 review 更正】** 原先这里写「与原来按退出码 1 / 128 区分一致」，不成立（review 用同版本 git2 探针实测）：
+  - 悬空 ref（ref 是合法 OID、对象缺失）：CLI 退出 0 照样给 OID；libgit2 报 `NotFound`、类别 `Odb`，提交 3393378 把它当成了
+    「没有基线」——正是注释警告的方向。顺调用方查过没有丢数据的路径（建首个基线的 `update-ref` 带零旧值会失败），但
+    `svn_sync::baseline_oid` 报「还没有基线」、`svn_scope::baseline_files` 静默返回空集。**已修**：`absent()` 排除 `Odb` 类别，
+    `git_read::a_dangling_ref_is_an_error_not_absent` 先红后绿。
+  - 内容是垃圾的 ref：CLI 警告 `ignoring broken ref` 后退出 **1**（原代码因此算「没有」），libgit2 报错。新代码更严，有意保留；
+    测试改名 `a_garbage_ref_is_an_error_although_the_cli_calls_it_absent`，断言 CLI 退出码是 1，原来只断言 `!= 0` 把分歧遮住了。
 - **计划没写的坑：** `core.ignoreCase` 仓库里不设时两条路都取全局配置（本机 `~/.config/git/config` 里是 true），契约测试
   改成与 CLI 比，而不是断言 false。
 - **没改的（偏离方案 A 的「全部只读查询」）：** `diff-tree`（重命名检测与 `--literal-pathspecs`）、`log` / `rev-list` 的排序
   （`--topo-order --reverse`）、`worktree list`（prunable）、`for-each-ref` 的 `%(upstream)`。两边语义有差，换了要逐条复核；
   它们在 e2e 6 条分支时约占 1 秒，留作后续。
-- **测试：** `tests/git_read.rs` 9 条，每条在同一 fixture 上与原 CLI 输出逐一对照（含游离 HEAD、冲突态、损坏 ref、
-  linked worktree、中文路径）。
+- **测试：** `tests/git_read.rs` 10 条，每条在同一 fixture 上与原 CLI 输出逐一对照（含游离 HEAD、冲突态、linked worktree、
+  中文路径）；两种损坏 ref 上有意与 CLI 不同，测试里写明 CLI 的实际退出码。
+- **【独立 review 其余低危，未改】** `git_read::is_ancestor` 在 `src/` 下没有调用方（留给后续 P3 扩展）；`Repository::open`
+  失败的错误码从 `git_cli` 变成 `git2`，`read_baseline` 起不来时的错误码统一成 `svn_baseline`，前端只按
+  `svn_baseline_no_trailer` 匹配，不受影响。split index / fsmonitor 扩展被复制进临时索引后的行为 review 未实测，
+  `swap_index_to_tree` 早已同样做法，不是本次新引入。
 
 #### 结果
 

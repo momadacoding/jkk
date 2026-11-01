@@ -167,7 +167,7 @@ fn verdicts_hiding(repo_root: &str, files: &[&str]) -> Result<BTreeMap<String, V
 /// 当前基线树里的文件。基线 ref 还不存在（建库途中）时为空。
 fn baseline_files(repo_root: &str) -> Result<BTreeSet<String>> {
     let reference = format!("refs/heads/{BASELINE_BRANCH}");
-    // 不存在 → 空；损坏 → 报错（`git_read::resolve` 分得开，与原来按退出码 1 / 128 分一致）
+    // 不存在 → 空；损坏（含悬空 ref）→ 报错（`git_read::resolve` 分得开，比 CLI 的退出码更严）
     let Some(oid) = crate::engine::git_read::resolve(repo_root, &reference)
         .map_err(|e| GitError::new("git_cli", format!("读基线 ref 失败：{}", e.message.trim())))?
     else {

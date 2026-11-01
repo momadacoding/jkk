@@ -869,9 +869,17 @@ fn prepare(repo: &str) -> Result<Plan> {
 /// 全量哈希一遍（[`TempIndex::from_tree_keeping_stat`]）。
 ///
 /// 原来从空索引起步，为的是甩掉服务器上已删除的文件；从旧基线起步时它们磁盘上已经不在，
-/// `add -A` 照样摘掉。不等价的只有一种：旧基线里有现在已不算 W 的文件（白名单或扩展名收窄过），
-/// 它是已跟踪文件，`add -A` 会留下它，R2c 的纳入集合核对随即报 `include_set_mismatch`。这时退回
-/// 空索引按原来的口径再录一次，结果与改动前完全相同。
+/// `add -A` 照样摘掉。**文件集合**上不等价的只有一种：旧基线里有现在已不算 W 的文件（白名单或
+/// 扩展名收窄过），它是已跟踪文件，`add -A` 会留下它，R2c 的纳入集合核对随即报
+/// `include_set_mismatch`。这时退回空索引按原来的口径再录一次。
+///
+/// 集合之外还有两处与空索引不同（独立 review 2026-11-01 实测），都与 git 自己对真实索引的口径一致：
+/// - mode：filemode=false 时沿用旧基线条目的 mode，不再每次归一成 100644（有意，见测试
+///   `a_recording_from_the_old_base_keeps_its_file_modes`）。
+/// - 过滤规则（autocrlf、`.gitattributes` 的 eol / filter）改了之后，stat 没变的文件不会按新规则
+///   重新 clean，blob 仍是旧规则的结果；体检比的是磁盘与服务器，看不出来。已迁移的仓库由
+///   `.git/info/attributes` 钉住 text / eol（`svn_attributes`），基本碰不到；碰到时「重建基线」
+///   从空索引录，可以纠正。
 fn record_from_old_base(repo: &str, cfg: &SvnConfig, old_base: &str) -> Result<Recorded> {
     let idx = TempIndex::from_tree_keeping_stat(repo, old_base)?;
     match record_mixed(repo, cfg, &idx) {

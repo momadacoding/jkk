@@ -88,14 +88,30 @@ fn resolve_matches_rev_parse_verify() {
 }
 
 #[test]
-fn a_corrupt_ref_is_an_error_not_absent() {
-    // 「ref 损坏」当成「不存在」会让调用方以为基线没建，覆盖掉一段真实历史
+fn a_garbage_ref_is_an_error_although_the_cli_calls_it_absent() {
+    // 「ref 损坏」当成「不存在」会让调用方以为基线没建，覆盖掉一段真实历史。
+    // **这里有意与 CLI 不同**：CLI 警告 `ignoring broken ref` 后退出 1，等于说「没有」；
+    // 我们报错，宁可让操作停下（独立 review 2026-11-01 实测）
     let d = repo();
     let p = d.path();
     fs::write(p.join(".git/refs/heads/broken"), "not an oid\n").unwrap();
     let (code, _) = git(p, &["rev-parse", "-q", "--verify", "refs/heads/broken"]);
-    assert_ne!(code, 0);
+    assert_eq!(code, 1);
     assert!(git_read::resolve(s(p), "refs/heads/broken").is_err());
+}
+
+#[test]
+fn a_dangling_ref_is_an_error_not_absent() {
+    // ref 文件是合法 OID、对象却不在（断电丢对象、对象库被外部工具弄坏）。CLI 照样打印
+    // 这个 OID；libgit2 报 NotFound（类别 Odb），不能因此说成「没有基线」
+    let d = repo();
+    let p = d.path();
+    let missing = "0123456789abcdef0123456789abcdef01234567";
+    fs::write(p.join(".git/refs/heads/dangling"), format!("{missing}\n")).unwrap();
+    let (code, out) = git(p, &["rev-parse", "-q", "--verify", "refs/heads/dangling"]);
+    assert_eq!((code, out.trim()), (0, missing));
+    assert!(git_read::resolve(s(p), "refs/heads/dangling").is_err());
+    assert!(git_read::resolve(s(p), "refs/heads/dangling^{commit}").is_err());
 }
 
 #[test]
