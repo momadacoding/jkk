@@ -46,6 +46,7 @@
 - [ ] 场景 11：SVN 操作进行中切回 jkk → 「SVN 正在更新…」
 - [ ] 场景 12：周一根目录整体更新 → 跟进后基线回到单值旧格式
 - [ ] 场景 14（接在 12 之后）：暂存 / 改了没暂存 / 新增文件，经过跟进、手动跟进、工具栏 Stash 都还在
+- [ ] 场景 15（接在 14 之后）：切分支时的新增文件——跟着走、撞名被拒、同事的新文件在落后分支上被删后由手动跟进放回
 - [ ] 场景 13（可选）：用真的 TortoiseSVN 重走场景 2
 
 ---
@@ -368,7 +369,8 @@ G commit -qm 'e2e 4 B2'
 
 ## 场景 5：stash 去修 bug，回来继续
 
-这一步在操作窗口里用命令做（只在 fixture 里）。工具栏上的 Stash 按钮在场景 14 里单独验。
+这一步在操作窗口里用命令做（只在 fixture 里）。工具栏上的 Stash 按钮在场景 14 里单独验；
+普通 Stash 默认不收新增文件，已记为 momadacoding/jkk 第 99 号 issue，后续优化。
 
 **造现场（操作窗口）：**
 
@@ -836,6 +838,115 @@ G commit -qm 'e2e 14b wip'
 | 14B 继续之后 B1 变成 ` M`（没暂存了），且弹了「暂存没保住」 | `stash apply --index` 失败退回了不带 `--index` 的 apply；记下弹框内容反馈回来 |
 | 14B 继续之后 `New14b.cs` 不见了 | 手动跟进的 stash 收了新增文件却没放回——严重，**先别做别的操作**，把 `G stash list` 的输出发回来 |
 | 14C 第 1 步 New14b 也被收走了 | 普通 Stash 的行为和预期不同（预期是只有 Stash all 才收新增文件） |
+
+---
+
+## 场景 15：切分支时的新增文件
+
+接在场景 14 之后做，从 `work` 开始。jkk 切分支执行的就是 `git checkout <分支>`，对新增文件的处理全按 git 的规矩来。
+2026-11-01 实测 git 2.51：
+
+| 情形 | git 的做法 |
+|---|---|
+| 未跟踪的新文件，目标分支没有这个路径 | 跟着带过去，还是 `??` |
+| 未跟踪的新文件，目标分支跟踪着同名文件 | **拒绝切换**，什么都不动——**内容一模一样也拒绝** |
+| 当前分支跟踪着某文件，目标分支没有 | 切过去时从磁盘上删掉 |
+
+第三条在混合仓库里会出现这种情况：同事新加的文件跟进后进了基线，切到落后的分支时会从磁盘上消失，TortoiseSVN 显示成 `!`（丢失）。
+
+**造现场（操作窗口）：** 一条和 work 一样新、多跟踪一个文件的分支 `up15`。
+
+```powershell
+G switch -q -c up15
+Wc 'Code/Only15.cs' 'class Only15 { int v1; }'
+G add Code/Only15.cs
+G commit -qm 'up15 adds Only15'
+G switch -q work
+```
+
+### 15A：自己的新文件跟着走
+
+1. **操作窗口：** `Wc 'Code/New15.cs' 'class New15 { }'`
+2. **应用：** 在分支列表里切到 `up15`，不应弹确认框。**操作窗口：** `G status --short --untracked-files=all` 里有 `?? Code/New15.cs`。
+3. **应用：** 切回 `work`。`New15.cs` 还在，仍是 `??`。
+
+### 15B：新文件和目标分支撞名
+
+1. **操作窗口：** `Wc 'Code/Only15.cs' 'class Only15 { int mine; }'`（work 上它是未跟踪的）
+2. **应用：** 切到 `up15`。
+
+   **应该看到：** 报错，内容是 git 的原话 `untracked working tree files would be overwritten by checkout` 并列出 `Code/Only15.cs`；
+   仍停在 `work`，`Get-Content (Join-Path $WC 'Code/Only15.cs')` 还是 `mine`。
+3. **操作窗口：** 改成和 up15 里**一模一样**的内容再试一次：`Wc 'Code/Only15.cs' 'class Only15 { int v1; }'` →
+   **应用**切到 `up15` → **还是同样的报错**（git 不比内容）。
+4. **操作窗口：** 清掉这两个文件。
+
+   ```powershell
+   Remove-Item (Join-Path $WC 'Code/Only15.cs'), (Join-Path $WC 'Code/New15.cs')
+   ```
+
+### 15C：同事的新文件 + 切到落后分支
+
+**造现场（操作窗口）：** 先做一条会落后的分支，再让同事加一个新文件、你只更新这一个文件，最后你提交一版和分支冲突的 A。
+
+```powershell
+G switch -q -c lag15
+Wc 'Code/A.cs' 'class A { int lag15; }'
+G commit -qam 'lag15 A'
+G switch -q work
+Colleague 'Code/Col15.cs' 'class Col15 { }'
+svn update -q --non-interactive (Join-Path $WC 'Code/Col15.cs')
+Wc 'Code/A.cs' 'class A { int fix15; }'
+SvnCommit 'Code/A.cs'
+G status --short --untracked-files=all
+```
+
+`status` 里有 `?? Code/Col15.cs`：同事的新文件在 git 看来还是未跟踪的。
+
+**操作（应用）：** 点回应用 → 横幅列出 `Code/A.cs` 和 `Code/Col15.cs` → 点「跟进」→「跟进完成」里 `lag15` 落后。
+
+**核对：** `G status --short --untracked-files=all` 里**没有** `Col15.cs` 了（进了基线，成了已跟踪文件）。
+
+**接着（应用）：** 切到 `lag15` → 点 **「仅切换」**。
+
+```powershell
+svn status (Join-Path $WC 'Code/Col15.cs') (Join-Path $WC 'Code/A.cs')
+```
+
+**应该看到：** `!  ...Code\Col15.cs`（lag15 里没有这个文件，切过去时 git 把它从磁盘删了）和 `M  ...Code\A.cs`。
+顶部是黄色横幅「当前分支落后基线」。
+
+**操作（应用）：** 点横幅上的「跟进」→ 应当转「手动跟进」（lag15 的 A 和你提交的 A 冲突）→ 确认 → 冲突列出 `Code/A.cs` 时：
+
+```powershell
+Wc 'Code/A.cs' 'class A { int fix15; int lag15; }'
+```
+
+**应用：** 暂存 `Code/A.cs` → 点「继续」→ 确认。
+
+**核对（操作窗口）：**
+
+```powershell
+git -C $WC merge-base --is-ancestor svn/base HEAD; $LASTEXITCODE
+svn status (Join-Path $WC 'Code/Col15.cs') (Join-Path $WC 'Code/A.cs')
+Get-Content (Join-Path $WC 'Code/Col15.cs')
+```
+
+应当是 `0`；`svn status` 只剩 `M ...Code\A.cs`（你在 lag15 上的改动），**没有** `!`；`Col15.cs` 回来了，内容 `class Col15 { }`。
+
+**收尾（应用）：** 切回 `work`。
+
+**看到别的说明：**
+
+| 现象 | 含义 |
+|---|---|
+| 15B 报错之后 Only15 的内容变了，或者分支切过去了 | git 的拒绝没生效——不应该发生，把报错原文发回来 |
+| 15B 的报错是一串看不懂的东西，或者什么提示都没有 | 切分支失败的提示没接好（这一期没改这里，记下来另开 issue） |
+| 15C 跟进后 `?? Code/Col15.cs` 还在 | 局部更新拉下来的新文件没进基线 |
+| 15C 手动跟进点了「继续」之后 `svn status` 里 `!` 还在 | rebase 到新基线时没把 Col15 写回磁盘——把 `G status --short` 和 `G ls-files Code/Col15.cs` 的输出发回来 |
+| 15C 点「跟进」时报「白名单内…」之类的拒绝，提到 Col15 | 手动跟进前的检查把 SVN 的 `!`（丢失）当成了不能继续的状态 |
+
+不冲突、只是磁盘上少了文件的那种落后，由自动化测试 `a_file_the_lagging_branch_does_not_have_counts_as_stale_when_it_is_gone_from_disk` 覆盖，这里不手工重复。
 
 ---
 
