@@ -380,6 +380,91 @@ describe('describeUnfinishedSync', () => {
   })
 })
 
+describe('未收尾的跟进', () => {
+  const follow = (phase: string): SyncState => ({
+    locked: false,
+    holder: null,
+    unfinished: { flow: 'follow', phase: phase as SyncPhase, opid: 'x', startedAt: 1 },
+  })
+
+  it('横幅只给「继续」：跟进没有放弃入口，恢复自己会走到一致状态', () => {
+    const b = describeUnfinishedSync(follow('follow-publishing'))!
+    expect(b.tone).toBe('danger')
+    expect(b.title).toContain('跟进')
+    expect(b.actions).toEqual([{ id: 'followContinue', label: '继续' }])
+  })
+
+  it('不能借用「更新」的说法：跟进没有动过工作区，也没有 stash', () => {
+    const b = describeUnfinishedSync(follow('follow-publishing'))!
+    expect(b.detail).not.toContain('stash')
+    expect(b.detail).toContain('磁盘')
+    expect(`${b.detail}${b.note}`).not.toContain('放弃')
+  })
+
+  it('跟进记录里出现认不出的 phase 不给按钮，但要有话说', () => {
+    const b = describeUnfinishedSync(follow('rebase'))!
+    expect(b.detail).toContain('rebase')
+    expect(b.actions).toEqual([])
+  })
+
+  it('其余横幅让位，工具栏按钮说清是跟进没收尾', () => {
+    expect(otherBannersAreSuppressed(follow('follow-publishing'))).toBe(true)
+    expect(svnSyncBlockedReason(follow('follow-publishing'))).toBe(
+      '上次跟进没有收尾，先用上方横幅里的按钮处理',
+    )
+  })
+})
+
+describe('未收尾的手动跟进', () => {
+  const manual = (phase: string, rollingBack = false): SyncState => ({
+    locked: false,
+    holder: null,
+    unfinished: {
+      flow: 'follow_manual',
+      phase: phase as SyncPhase,
+      opid: 'x',
+      startedAt: 1,
+      rollingBack,
+    },
+  })
+
+  it('沿用更新的继续 / 放弃按钮，不走跟进的恢复命令', () => {
+    const b = describeUnfinishedSync(manual('rebase'))!
+    expect(b.tone).toBe('danger')
+    expect(b.title).toContain('手动跟进')
+    expect(b.actions.map((a) => a.id)).toEqual(['syncContinue', 'syncAbort'])
+  })
+
+  it('按钮与说明都不把它叫成「更新」', () => {
+    for (const p of ['stashing', 'stashed', 'rebase']) {
+      const b = describeUnfinishedSync(manual(p))!
+      expect(b.actions.map((a) => a.label).join(), p).not.toContain('更新')
+      expect(b.note, p).not.toContain('更新')
+    }
+  })
+
+  it('放回那一步的按钮与更新相同：放弃不回滚', () => {
+    const b = describeUnfinishedSync(manual('applying-stash'))!
+    expect(b.actions).toEqual([
+      { id: 'syncContinue', label: '我已处理，继续' },
+      { id: 'syncAbort', label: '不再自动放回' },
+    ])
+  })
+
+  it('放弃途中停下：说的是回到手动跟进之前，不说「基线已经更新」', () => {
+    const b = describeUnfinishedSync(manual('applying-stash', true))!
+    expect(b.detail).toContain('手动跟进')
+    expect(b.detail).not.toContain('更新')
+  })
+
+  it('其余横幅让位，工具栏按钮说清是手动跟进没收尾', () => {
+    expect(otherBannersAreSuppressed(manual('rebase'))).toBe(true)
+    expect(svnSyncBlockedReason(manual('rebase'))).toBe(
+      '上次手动跟进没有收尾，先用上方横幅里的按钮处理',
+    )
+  })
+})
+
 describe('svnSyncBlockedReason', () => {
   // 3a E2E 之后的观察：未收尾横幅挂着时工具栏「更新」「交付」仍可点，
   // 点了要先跑一遍预览（网络）才被后端以「上次没收尾」拒绝

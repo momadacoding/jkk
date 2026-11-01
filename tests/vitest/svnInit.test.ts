@@ -388,6 +388,23 @@ describe('错误码到引导语的映射', () => {
     expect(wizardErrorHint('svn_preflight_dirty')).toBe('')
   })
 
+  it('SVN 冲突与漏收各有引导，都指回 TortoiseSVN（计划 Task 5）', () => {
+    // 建库与重建允许混合版本之后，R1 新增拒绝冲突，R3b 新增拒绝漏收（depth=exclude）
+    const c = wizardErrorHint('svn_preflight_conflicted')
+    expect(c).toContain('Resolve')
+    const x = wizardErrorHint('svn_baseline_excluded_paths')
+    expect(x).toContain('Exclude')
+    expect(x).toContain('Fully recursive')
+  })
+
+  it('向服务器确认不成时引导检查连接，不说成基线有问题（Review 1 第 1 条）', () => {
+    // 与漏收是两回事：这里还不知道文件是删了还是被排除了，出路是连上服务器重试
+    const h = wizardErrorHint('svn_baseline_unconfirmed')
+    expect(h).toContain('连上')
+    expect(h).toContain('重试')
+    expect(h).not.toContain('Fully recursive')
+  })
+
   it('重建期间被外部改动时说清指针没动、重试即可', () => {
     // R3c（spec §16 / §16.1 竞态表）。用户最关心的是「我的基线坏了吗」，
     // 所以第一句必须是「没坏」。

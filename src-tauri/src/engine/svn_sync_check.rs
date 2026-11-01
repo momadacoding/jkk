@@ -15,7 +15,7 @@ use crate::engine::svn_config::{read_config, BASELINE_BRANCH};
 use crate::engine::svn_externals::detect_pinned;
 use crate::engine::svn_include_check::verify_include_set;
 use crate::engine::svn_scope::WScope;
-use crate::engine::svn_sync::{check_sync, SyncVerdict};
+use crate::engine::svn_sync::{check_sync_with_nodes, SyncVerdict};
 use crate::engine::svn_xml::parse_update_status;
 use crate::engine::{svn_journal, svn_lock};
 use crate::error::{GitError, Result};
@@ -32,8 +32,10 @@ pub struct SyncInPreview {
     pub baseline_rev: u64,
     /// 这次会更新到的 revision（`svn status -u` 的 `<against>`）。
     pub target_rev: u64,
-    /// 计划 A16：工作副本已被外部**整体** update 到的 revision（比基线新）。
-    /// `Some` 时执行会先把基线跟上它，再走 S0–S11；确认框必须说出这件事。
+    /// 计划 A16：SVN 侧有新内容、要先把基线跟上时，跟上之后的 floor。外部**整体** update
+    /// 时就是那个 revision；计划 Task 5 起只提交不更新、局部 update 也接管，这时它可能
+    /// 等于 `baseline_rev`（floor 没动，有文件在更新的 revision 上）。
+    /// `Some` 时执行会先把基线跟上（`rebuild_baseline`），再走 S0–S11；确认框必须说出这件事。
     pub catch_up_rev: Option<u64>,
     /// §7.2 第 5 条：git 不管、本地改过、这次 update 又会碰到的文件。
     /// **非空时必须由用户确认**，确认只授权 update，不授权任何 revert。
@@ -85,21 +87,27 @@ pub(crate) fn check_sync_in(repo_root: &str) -> Result<SyncInPreview> {
         ));
     }
 
-    // 第 2 条（完整 nodeRevs）。「整体前进」不拒绝，交给执行时接管（计划 A16）：
-    // 在 TortoiseSVN 里对项目根点 update 是每天早上的日常，不是异常
-    let status = check_sync(repo_root)?;
-    let catch_up_rev = match status.verdict {
-        SyncVerdict::InSync => None,
-        SyncVerdict::Diverged {
-            node_rev,
-            baseline_rev,
-        } if node_rev > baseline_rev => Some(node_rev),
+    // 第 2 条（完整 nodeRevs）。SVN 侧有新内容不拒绝，交给执行时接管（计划 A16）：
+    // 在 TortoiseSVN 里对项目根点 update、只提交不更新、只更新某个子目录，都是日常，不是异常。
+    // 计划 Task 5 起 `rebuild_baseline` 能录混合版本，A16 推广到任何 `ExternallyAdvanced`
+    // （分析 §6.2 末条「A16 的整体前进成为 ExternallyAdvanced 的特例」）
+    let (status, nodes) = check_sync_with_nodes(repo_root)?;
+    let uniform = uniform_forward_rev(&status, &nodes);
+    let catch_up_rev = match &status.verdict {
+        // 整体前进、但 W-file 内容都没变（只动了白名单外的文件）：照旧接管，与改造前一致
+        SyncVerdict::InSync => uniform,
+        SyncVerdict::ExternallyAdvanced { removed, added, .. } => Some(match uniform {
+            Some(n) => n,
+            None => {
+                floor_after_catch_up(repo_root, &baseline_oid, &status, &nodes, removed, added)?
+            }
+        }),
         _ => {
             return Err(GitError::new(
                 "sync_in_out_of_sync",
                 format!(
                     "基线已经失同步（白名单 revision {:?}，基线记的是 r{}）。\
-                     工作副本处于多个 revision，或被退回到了基线之前——这两种状态\
+                     工作副本被退回到了基线之前，或 SVN 操作还没做完——这些状态\
                      「更新」不能自动接管，否则会把外部的改动当成服务器的内容录进基线。\
                      请先处理顶部的失同步横幅。",
                     status.node_revs, status.baseline_rev
@@ -197,6 +205,59 @@ pub(crate) fn check_sync_in(repo_root: &str) -> Result<SyncInPreview> {
         catch_up_rev,
         outside_changes: outside,
     })
+}
+
+/// 接管之后基线的 floor：重建录的树 = 基线树 − 消失的 + 外部新增的（本地新增的不进树），
+/// floor 取这些文件与白名单内目录的节点 revision 的最小值（与 `svn_nodes::compute_map`
+/// 同一规则）。
+///
+/// 只给确认框展示，不参与任何判定：真正的 floor 由重建时的映射决定，接管之后的锁内复核
+/// 照常再跑一遍。一个节点都没有时退回旧 floor。
+fn floor_after_catch_up(
+    repo_root: &str,
+    baseline_oid: &str,
+    status: &crate::engine::svn_sync::SyncStatus,
+    nodes: &[crate::engine::svn_nodes::NodeStatus],
+    removed: &[String],
+    added: &[crate::engine::svn_sync::ExternalChange],
+) -> Result<u64> {
+    let mut files = crate::engine::svn_sync::tree_files(repo_root, baseline_oid)?;
+    for r in removed {
+        files.remove(r);
+    }
+    files.extend(added.iter().map(|a| a.path.clone()));
+    Ok(nodes
+        .iter()
+        .filter(|n| files.contains(&n.path))
+        .filter_map(|n| n.node_rev)
+        .chain(
+            crate::engine::svn_nodes::dir_revs(nodes)
+                .into_iter()
+                .map(|(_, n)| n),
+        )
+        .min()
+        .unwrap_or(status.baseline_rev))
+}
+
+/// 计划 A16 的「整体前进」：基线是单值，且白名单里**所有**节点（含目录）都停在同一个
+/// 比它新的 revision 上。返回那个 revision。
+///
+/// 判定上它可能是 `ExternallyAdvanced`（有 W-file 内容变了），也可能是 `InSync`
+/// （只动了白名单外的文件）。后者照旧接管：录出的基线树不变，只是标签跟上了 rN，
+/// 与改造前的行为一致。计划 Task 5 起前者之外的 `ExternallyAdvanced` 也接管，
+/// 这里只负责「接管到哪个 revision」的那个数字。
+fn uniform_forward_rev(
+    status: &crate::engine::svn_sync::SyncStatus,
+    nodes: &[crate::engine::svn_nodes::NodeStatus],
+) -> Option<u64> {
+    if status.base.newer != 0 || status.base.gone != 0 {
+        return None;
+    }
+    let revs: std::collections::BTreeSet<u64> = nodes.iter().filter_map(|n| n.node_rev).collect();
+    match revs.iter().collect::<Vec<_>>().as_slice() {
+        [&n] if n > status.baseline_rev => Some(n),
+        _ => None,
+    }
 }
 
 /// §7.3.2 的 merge 门槛：`target..tip` 必须是线性的。

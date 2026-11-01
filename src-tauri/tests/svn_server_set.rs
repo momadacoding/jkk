@@ -18,6 +18,9 @@
 #[path = "common/svn_fixtures.rs"]
 mod svn_fixtures;
 
+use app_lib::engine::git_cli::run_git;
+use app_lib::engine::svn_baseline::create_baseline_commit_with;
+use app_lib::engine::svn_basemap::read_base_map;
 use app_lib::engine::svn_health::{check_baseline, Health};
 use app_lib::engine::svn_init::{init_hybrid, InitRequest};
 use app_lib::engine::svn_scope::WScope;
@@ -95,9 +98,13 @@ fn a_depth_excluded_subtree_is_reported_as_missing() {
 }
 
 #[test]
-fn the_existing_checks_really_do_miss_a_depth_excluded_subtree() {
+fn local_checks_cannot_tell_a_depth_excluded_subtree_from_a_deletion() {
     // 这条**不测新代码**，它把「为什么需要这块新机制」钉成回归测试。
     // 少了它，将来有人「优化」掉这次网络调用时，不会有任何测试变红。
+    //
+    // 计划 Task 3 起失同步判定按文件比较映射，能看见被排除的文件「消失」了，但在本地
+    // 它与「在 SVN 上提交删除」长得一模一样（E17）。分得清两者的只有服务器：跟进前
+    // 向服务器确认（Task 4 / 5），这里的核对也照样需要。
     let fx = svn_repo_for_health();
     init(&fx);
     svn_cmd(
@@ -114,8 +121,12 @@ fn the_existing_checks_really_do_miss_a_depth_excluded_subtree() {
     let st = svn_sync::check_sync(&fx.wc_str()).unwrap();
     assert_eq!(
         st.verdict,
-        SyncVerdict::InSync,
-        "失同步判据看不见 depth-exclude —— 这正是 NB-2 的成因"
+        SyncVerdict::ExternallyAdvanced {
+            changed: vec![],
+            added: vec![],
+            removed: vec!["Code/Deep/D.cs".to_string()],
+        },
+        "失同步判据只能报「消失」，与提交删除同一个形状——是不是漏收要问服务器"
     );
 
     let health = check_baseline(
@@ -294,4 +305,83 @@ fn a_locally_added_but_uncommitted_file_is_not_reported_either() {
         matches!(got, ServerAudit::Matched),
         "未提交的新增不该影响服务器侧核对，实际 {got:?}"
     );
+}
+
+#[test]
+fn server_audit_ignores_tombstoned_files() {
+    // 计划 Task 4：已提交删除的文件 floor 上还在、本地已没有，正是墓碑记着的那批。
+    // 不剔除就会被报成「服务器上有代码文件不在本地」——方向完全反了。
+    let fx = svn_repo_for_health();
+    init(&fx);
+    svn_cmd(
+        &fx.wc(),
+        &["delete", "--non-interactive", "--", "Code/Deep/D.cs@"],
+    );
+    svn_cmd(&fx.wc(), &["commit", "-m", "r2 rm", "--non-interactive"]);
+
+    // 对照：只按 floor 的清单比，提交删除就是一条「缺失」
+    match svn_server_set::audit_server_set(&fx.wc_str(), REV).unwrap() {
+        ServerAudit::Missing { files, .. } => {
+            assert_eq!(files, vec!["Code/Deep/D.cs".to_string()])
+        }
+        other => panic!("前提：没有墓碑时应当报缺失，实际 {other:?}"),
+    }
+
+    // 直接给映射
+    let repo = fx.wc_str();
+    let mut map = read_base_map(&repo, "svn/base").unwrap();
+    map.gone.insert("Code/Deep/D.cs".to_string(), 2);
+    let got = svn_server_set::audit_server_set_map(&repo, &map).unwrap();
+    assert!(matches!(got, ServerAudit::Matched), "实际 {got:?}");
+
+    // 打开仓库那条路径：从 svn/base 上读记账（这里手工发布一个带墓碑的混合基线）
+    publish_baseline_without(&fx, "Code/Deep/D.cs", 2);
+    let got = svn_server_set::audit_server_set_at_baseline(&repo).unwrap();
+    assert!(matches!(got, ServerAudit::Matched), "实际 {got:?}");
+
+    // 墓碑只剔它自己：真正漏收的文件照样报出来
+    svn_cmd(
+        &fx.wc(),
+        &[
+            "update",
+            "--set-depth=exclude",
+            "--non-interactive",
+            "--",
+            "Code/A.cs@",
+        ],
+    );
+    match svn_server_set::audit_server_set_at_baseline(&repo).unwrap() {
+        ServerAudit::Missing { files, .. } => assert_eq!(files, vec!["Code/A.cs".to_string()]),
+        other => panic!("实际 {other:?}"),
+    }
+}
+
+/// 把 svn/base 换成「去掉 `path`、带墓碑 `path → rev`」的混合基线（Task 5 之前只能手工造；
+/// 与 `tests/svn_sync.rs` 的同名函数同一造法）。
+fn publish_baseline_without(fx: &SvnFixture, path: &str, rev: u64) {
+    let repo = fx.wc_str();
+    let old = run_git(&repo, &["rev-parse", "svn/base"]).unwrap();
+    let old = old.trim();
+    let mut map = read_base_map(&repo, old).unwrap();
+    let idx = fx.path().join("tomb-index");
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(fx.wc())
+            .env("GIT_INDEX_FILE", &idx)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    git(&["read-tree", old]);
+    git(&["update-index", "--force-remove", "--", path]);
+    let tree = git(&["write-tree"]);
+    map.gone.insert(path.to_string(), rev);
+    let oid = create_baseline_commit_with(&repo, &tree, Some(old), &map, &[], None).unwrap();
+    run_git(&repo, &["update-ref", "refs/heads/svn/base", &oid, old]).unwrap();
 }

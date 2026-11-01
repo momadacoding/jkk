@@ -69,6 +69,31 @@ pub fn parse_info(xml: &str) -> Result<Vec<SvnInfoEntry>> {
     Ok(out)
 }
 
+/// 从 `svn info -R --xml` 里挑出 `--set-depth=exclude` 掉的节点，返回 `(path, kind)`：
+/// path 是 entry 的 path 属性（正斜杠），kind 是 `file` / `dir`（缺失时为空串），按出现顺序。
+///
+/// 被排除的节点从 `status -v` 里消失，与提交删除同形（E17）；整单元的 `svn diff --summarize`
+/// 也不报它们（Task 4 实测）。本地能看见它们的只有 `info`：entry 照样在，
+/// `<wc-info><depth>` 是 `exclude`。
+pub fn parse_excluded_nodes(xml: &str) -> Result<Vec<(String, String)>> {
+    let doc = parse_doc(xml)?;
+    let mut out = Vec::new();
+    for entry in doc.descendants().filter(|n| n.has_tag_name("entry")) {
+        let depth = entry
+            .children()
+            .find(|n| n.has_tag_name("wc-info"))
+            .and_then(|w| w.children().find(|n| n.has_tag_name("depth")))
+            .and_then(|n| n.text());
+        if depth == Some("exclude") {
+            out.push((
+                norm_sep(&attr(&entry, "path")?),
+                entry.attribute("kind").unwrap_or("").to_string(),
+            ));
+        }
+    }
+    Ok(out)
+}
+
 /// 从 `svn status -v --xml` 里取每个已版本控制节点的 revision 集合。
 ///
 /// # ⚠️ 输入必须来自带 `-v` **和** `--ignore-externals` 的 status
@@ -188,6 +213,128 @@ pub fn parse_node_rev_entries(xml: &str) -> Result<Vec<(String, i64)>> {
         ));
     }
     Ok(revs)
+}
+
+/// `svn status -v --xml --ignore-externals` 里的一个节点（混合版本基线的判定输入）。
+///
+/// 与 [`StatusEntry`] 分开：那个结构被初始化、重建、体检共用，这里要的
+/// 「最后修改 revision」「作者」「changelist」只有映射计算与失同步判定用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeStatus {
+    /// entry 的 path 属性归一成正斜杠。target 是相对仓库根的路径时，它也就是仓库相对路径。
+    pub path: String,
+    /// `<wc-status item>` 原样。
+    pub item: String,
+    /// `<wc-status revision>`：节点在工作副本里处于哪个 revision。
+    ///
+    /// 没有这个属性（external 标记、树冲突）或是 `-1`（added，还没有服务器 revision）时为 `None`：
+    /// 它们对「停在哪个服务器 revision」无可奉告，记成 0 会凭空造出一个回退。
+    pub node_rev: Option<u64>,
+    /// `<commit revision>`：节点最后一次被修改的 revision。只有带 BASE 的节点才有（E13），
+    /// added / replaced 没有。
+    pub commit_rev: Option<u64>,
+    /// `<commit><author>`。匿名提交没有这个元素。
+    pub author: Option<String>,
+    /// `wc-locked="true"`：只出现在目录上（E15），说明有 svn 操作正在进行或中途被杀。
+    pub wc_locked: bool,
+    pub tree_conflicted: bool,
+    /// `copied="true"`：节点是复制过来的（`svn cp`，含 `svn rm X; svn cp Y X` 的 replaced）。
+    ///
+    /// 这类节点没有 `revision`，`<commit>` 却是**复制源**的最后修改 revision 与作者（Review 1
+    /// 第 4 条实测），不能当成这个路径的 c(f)。
+    pub copied: bool,
+    /// 父元素 `<changelist name>`（E14）。
+    pub changelist: Option<String>,
+}
+
+/// 解析 `svn status -v --xml --ignore-externals`，逐节点给出 [`NodeStatus`]。
+///
+/// - 遍历**整份文档**的 `<entry>`：changelist 成员在 `</target>` 之后与之平级的
+///   `<changelist>` 块里（E14），只遍历 `<target>` 会把它们当成「消失」
+/// - 与 [`parse_node_rev_entries`] 同一套输入守卫：混进 external 内部的节点报
+///   `svn_xml_externals_not_ignored`；一个带服务器 revision 的节点都没有时报错，
+///   那多半是漏了 `-v`，空结果会让基线树里每个文件都被判成「消失」
+///
+/// 结果按 path 升序。
+pub fn parse_node_status(xml: &str) -> Result<Vec<NodeStatus>> {
+    let doc = parse_doc(xml)?;
+    assert_externals_were_ignored(&doc)?;
+    let mut out = Vec::new();
+    for entry in doc.descendants().filter(|n| n.has_tag_name("entry")) {
+        let path = norm_sep(&attr(&entry, "path")?);
+        let st = entry
+            .children()
+            .find(|n| n.has_tag_name("wc-status"))
+            .ok_or_else(|| {
+                GitError::new(
+                    "svn_xml",
+                    format!("svn status 的 entry `{path}` 底下没有 <wc-status>"),
+                )
+            })?;
+        let node_rev = match st.attribute("revision") {
+            None => None,
+            Some(raw) => {
+                let r = raw.parse::<i64>().map_err(|_| {
+                    GitError::new("svn_xml", format!("wc-status revision 不是整数: {raw}"))
+                })?;
+                // -1 只可能是还没提交的节点（见 parse_node_rev_entries 的实测）
+                u64::try_from(r).ok()
+            }
+        };
+        let commit = st.children().find(|n| n.has_tag_name("commit"));
+        let commit_rev = match commit.and_then(|c| c.attribute("revision")) {
+            None => None,
+            Some(raw) => Some(raw.parse::<u64>().map_err(|_| {
+                GitError::new("svn_xml", format!("commit revision 不是非负整数: {raw}"))
+            })?),
+        };
+        let author = commit
+            .and_then(|c| c.children().find(|n| n.has_tag_name("author")))
+            .map(|a| joined_text(&a))
+            .filter(|a| !a.is_empty());
+        let changelist = entry
+            .parent_element()
+            .filter(|p| p.has_tag_name("changelist"))
+            .and_then(|p| p.attribute("name"))
+            .map(str::to_string);
+        out.push(NodeStatus {
+            path,
+            item: attr(&st, "item")?,
+            node_rev,
+            commit_rev,
+            author,
+            wc_locked: st.attribute("wc-locked") == Some("true"),
+            tree_conflicted: st.attribute("tree-conflicted") == Some("true"),
+            copied: st.attribute("copied") == Some("true"),
+            changelist,
+        });
+    }
+    if !out.iter().any(|n| n.node_rev.is_some()) {
+        let uncommitted = out.iter().any(|n| n.item == "added");
+        return Err(if uncommitted {
+            GitError::new(
+                "svn_xml_all_nodes_uncommitted",
+                "这份 svn status 输出里的节点全都还没提交，一个有服务器 revision 的节点都没有。\
+                 白名单指向的内容整个都是本地新增的，还没进过 SVN。",
+            )
+        } else {
+            GitError::new(
+                "svn_xml_empty_node_revs",
+                "这份 svn status 输出里一个带 revision 的节点都没有，最常见的原因是漏了 `-v`。\
+                 空结果会把基线里的每个文件都判成「从工作副本中消失」，所以这里报错。",
+            )
+        });
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+/// 一个元素底下全部文本子节点拼起来（理由同 [`joined_child_text`]）。
+fn joined_text(node: &Node) -> String {
+    node.children()
+        .filter_map(|n| n.text())
+        .collect::<Vec<_>>()
+        .concat()
 }
 
 /// 从 `svn status --xml`（**不带** `--ignore-externals`）里列出 external 根。

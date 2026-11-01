@@ -42,7 +42,7 @@ function mount(viewMode: string, changesScope: 'unstaged' | 'staged') {
     ({ viewMode, changesScope }) => {
       const store = useRepoStore()
       const state = { ...store.state, path: 'C:/r' }
-      useRepoEffects(state, store, viewMode, changesScope)
+      useRepoEffects(state, store, viewMode, changesScope, true)
       return store
     },
     { initialProps: { viewMode, changesScope } },

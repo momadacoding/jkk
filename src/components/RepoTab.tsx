@@ -17,11 +17,14 @@ import {
   svnPreflightCheck,
   svnRebuildBaseline,
   svnCheckBaseline,
+  svnGetUser,
   svnMigrateEol,
+  svnSetUser,
 } from '../store/repoStore'
 import { createSvnSyncFlow } from './svnSyncFlow'
 import { createSvnSyncOutFlow } from './svnSyncOutFlow'
 import { useDeliverDialog } from './DeliverDialog'
+import { useFollowReportDialog } from './FollowReportDialog'
 import SvnInitWizard from './SvnInitWizard'
 import BaselineBanner from './BaselineBanner'
 import { baselineMap, findDelivered, selectionDiffScope } from '../engine/svnGraph'
@@ -110,6 +113,8 @@ function SidebarNav({ mode, changeCount, onChange }: { mode: ViewMode; changeCou
 interface RepoTabProps {
   /** 本标签打开的仓库/worktree 路径。 */
   repoPath: string
+  /** 这个标签是不是当前显示的那个（所有标签都保持挂载）。 */
+  active: boolean
   /** 所有标签已打开的路径，用于标记「已打开」。 */
   openPaths: string[]
   onOpenInNewTab: (path: string) => void
@@ -130,12 +135,12 @@ interface RepoTabProps {
  * 互不影响；`repo-changed` 事件在 store 内按路径过滤。
  */
 export function RepoTab({
-  repoPath, openPaths, onOpenInNewTab, onRepoRemoved,
+  repoPath, active, openPaths, onOpenInNewTab, onRepoRemoved,
 }: RepoTabProps) {
   const {
     state, openRepo, refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers,
     refreshDiff, refreshUpstream, refreshStashes, refreshPullRequests,
-    refreshSvnSync, refreshSvnEol, refreshSvnSyncState, checkSvnSyncIfChanged, fetchSvnLog, refreshSvnAudit, auditSvnIfDue,
+    refreshSvnSync, refreshSvnEol, refreshSvnSyncState, refreshSvnBranchesBehind, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, checkSvnSyncOnFocus, markSvnFollowOnBlur, fetchSvnLog, refreshSvnAudit, auditSvnIfDue,
     selectCommit, clearError, reportError, wantedDiffScope, refreshChanges: refreshChangesIn,
   } = useRepoStore()
   const [repoState, setRepoState] = useState<string>('normal')
@@ -169,6 +174,9 @@ export function RepoTab({
   const { prompt, dialog: promptDialog } = usePrompt()
   const { confirm, dialog: confirmDialog } = useConfirm()
   const { deliver, dialog: deliverDialog } = useDeliverDialog()
+  const { showFollowReport, dialog: followReportDialog } = useFollowReportDialog()
+  // 跟进执行中（svnSyncFlow 写），横幅上的按钮据此禁用
+  const [following, setFollowing] = useState(false)
   // 「更新」或「交付」流程是否在走（svnSyncFlow / svnSyncOutFlow 共用一个：两个确认框会
   // 互相顶替，PR #49 Codex review #5）。hook 必须排在下面 loading 的提前 return 之前
   const syncFlowRunning = useRef(false)
@@ -196,9 +204,10 @@ export function RepoTab({
 
   useRepoEffects(
     state,
-    { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, refreshSvnSyncState, auditSvnIfDue, wantedDiffScope },
+    { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, checkSvnSyncOnFocus, markSvnFollowOnBlur, refreshSvnSyncState, refreshSvnBranchesBehind, auditSvnIfDue, wantedDiffScope },
     viewMode,
     changesScope,
+    active,
   )
 
   useEffect(() => {
@@ -669,8 +678,16 @@ export function RepoTab({
     })
   }
 
-  // 「更新」与横幅上的继续 / 放弃。流程在 `svnSyncFlow.ts`，这里只注入依赖
-  const { handleSvnUpdate, handleSyncAction } = createSvnSyncFlow({
+  /** 切分支之后：选中要跟到新分支的 tip 上，否则图停在旧位置。 */
+  const refreshAfterCheckout = async () => {
+    const before = state.headHash
+    const after = await refreshHead(state.path!)
+    await refreshGraph(state.path!, after, after !== before)
+    await refreshStatus(state.path!)
+  }
+
+  // 「更新」「跟进」与横幅上的继续 / 放弃。流程在 `svnSyncFlow.ts`，这里只注入依赖
+  const { handleSvnUpdate, handleSyncAction, handleFollow, handleCheckoutBehind } = createSvnSyncFlow({
     running: syncFlowRunning,
     repoPath,
     syncState: () => state.svnSyncState,
@@ -681,6 +698,23 @@ export function RepoTab({
     refreshSvnSyncState,
     refreshSvnSync,
     fetchSvnLog,
+    setFollowing,
+    refreshAfterFollow: async () => {
+      await refreshHead(repoPath)
+      await refreshGraph(repoPath)
+      await refreshStatus(repoPath)
+      await refreshSvnBranchesBehind(repoPath)
+    },
+    showFollowReport: (report) =>
+      showFollowReport({
+        report,
+        readUser: () => svnGetUser(repoPath),
+        saveUser: (user) => svnSetUser(repoPath, user),
+      }),
+    checkoutBranch: async (name) => {
+      await invoke('checkout', { path: repoPath, rev: name })
+      await refreshAfterCheckout()
+    },
   })
 
   // 「交付」与横幅上交付那一组按钮。`running` 与更新共用
@@ -798,6 +832,8 @@ export function RepoTab({
         onSyncAction={(id) => void handleSyncAction(id)}
         onSyncOutAction={(id) => void handleSyncOutAction(id)}
         onSvnUpdate={() => void handleSvnUpdate()}
+        onFollow={() => void handleFollow()}
+        followBusy={following}
       />
       <MergeDriverBanner report={state.mergeDrivers} />
       {state.error && (
@@ -833,13 +869,11 @@ export function RepoTab({
                 head={state.head}
                 selectedBranch={selectedBranch}
                 onSelect={handleSelectBranch}
-                onCheckout={(name) => runAndRefresh('checkout', { rev: name }, async () => {
-                  const before = state.headHash
-                  const after = await refreshHead(state.path!)
-                  // 切分支后选中要跟到新分支的 tip 上，否则图停在旧位置
-                  await refreshGraph(state.path!, after, after !== before)
-                  await refreshStatus(state.path!)
-                })}
+                onCheckout={(name) =>
+                  state.svnBranchesBehind.includes(name)
+                    ? void handleCheckoutBehind(name)
+                    : runAndRefresh('checkout', { rev: name }, refreshAfterCheckout)
+                }
                 onCreate={(name, start) => runAndRefresh('create_branch', { name, startPoint: start ?? null }, async () => await refreshGraph(state.path!))}
                 onRename={(oldName, newName) => runAndRefresh('rename_branch', { old: oldName, new: newName }, async () => {
                   await refreshHead(state.path!)
@@ -850,6 +884,7 @@ export function RepoTab({
                 onDeleteRemote={handleDeleteRemote}
                 repoPath={state.path}
                 capabilities={state.capabilities}
+                behindBaseline={state.svnBranchesBehind}
               />
               {sections.includes('tags') && (
               <TagView
@@ -953,6 +988,7 @@ export function RepoTab({
       </div>
       {promptDialog}
       {deliverDialog}
+      {followReportDialog}
       {/* 排在交付框之后：交付结局的提示框（走 confirm）要盖在上面 */}
       {confirmDialog}
     </div>

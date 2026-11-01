@@ -10,9 +10,10 @@
 //! （`AGENTS.md` §7.3）。
 
 use crate::commands::watch::WatchSuspension;
+use crate::engine::svn_follow::{follow, manual_follow, resume_follow, FollowOutcome};
 use crate::engine::svn_sync_check::{preview_sync_in, SyncInPreview};
 use crate::engine::svn_sync_in::{
-    abort_sync, continue_sync, run_sync_in, SyncInExpect, SyncInOutcome,
+    abort_sync, continue_sync, new_opid, run_sync_in, SyncInExpect, SyncInOutcome,
 };
 use crate::engine::svn_sync_out::{
     abort_sync_out, continue_sync_out, run_sync_out, SyncOutExpect, SyncOutOutcome,
@@ -75,6 +76,25 @@ pub fn svn_sync_out_continue(handle: AppHandle, path: String) -> Result<SyncOutO
 #[tauri::command(async)]
 pub fn svn_sync_out_abort(handle: AppHandle, path: String) -> Result<SyncOutOutcome, GitError> {
     with_watch_suspended(&handle, &path, || abort_sync_out(&path))
+}
+
+/// 跟进外部提交（分析 §6.5）：录新基线、对象层重放分支、发布。不写磁盘，不发 SVN 写命令。
+#[tauri::command(async)]
+pub fn svn_follow(handle: AppHandle, path: String) -> Result<FollowOutcome, GitError> {
+    with_watch_suspended(&handle, &path, || follow(&path, &new_opid()))
+}
+
+/// 把崩溃留下的跟进走完，或回滚到一致状态再重新跟进（计划 Task 10）。
+#[tauri::command(async)]
+pub fn svn_follow_continue(handle: AppHandle, path: String) -> Result<FollowOutcome, GitError> {
+    with_watch_suspended(&handle, &path, || resume_follow(&path))
+}
+
+/// 手动跟进（分析 §6.5）：跟进冲突时的兜底。会写磁盘，只由用户在界面上显式发起。
+/// 结局与更新相同，冲突之后的继续 / 放弃走 `svn_sync_continue` / `svn_sync_abort`。
+#[tauri::command(async)]
+pub fn svn_follow_manual(handle: AppHandle, path: String) -> Result<SyncInOutcome, GitError> {
+    with_watch_suspended(&handle, &path, || manual_follow(&path, &new_opid()))
 }
 
 /// 挂起 watcher 跑完一段同步，然后**无论成败**补发一次 `repo-changed`。

@@ -100,6 +100,42 @@ fn the_preview_changes_nothing_and_takes_no_lock() {
 }
 
 #[test]
+fn sync_out_refuses_mixed_baseline_with_own_error() {
+    // 分析 §6.8 第一期：基线是混合版本时显式拒绝交付。不能靠 `remoteRev == baselineRev`
+    // 碰巧拦住——floor 取最小值时它确实会拦，但给出的理由（「服务器上有更新的提交」）是错的
+    let fx = hybrid_with_colleague();
+    write(&fx, "Code/A.cs", "a-ext\n");
+    svn(
+        &fx.wc(),
+        &[
+            "commit",
+            "-m",
+            "external",
+            "--non-interactive",
+            "--",
+            "Code/A.cs@",
+        ],
+    );
+    app_lib::engine::svn_init::rebuild_baseline(&fx.wc_str()).unwrap();
+    // 分支放到混合基线上，再提交一处要交付的改动：其余前置条件全部满足
+    git(&fx, &["reset", "-q", "--hard", "svn/base"]);
+    write(&fx, "Code/B.cs", "b-mine\n");
+    git(&fx, &["commit", "-qam", "work"]);
+    let refs = git(&fx, &["for-each-ref"]);
+
+    let err = preview_sync_out(&fx.wc_str()).unwrap_err();
+
+    assert_eq!(err.code, "sync_out_mixed_baseline", "{}", err.message);
+    assert!(
+        err.message
+            .contains("请先更新，或继续用 TortoiseSVN 提交后点跟进"),
+        "{}",
+        err.message
+    );
+    assert_eq!(git(&fx, &["for-each-ref"]), refs, "预览什么都不改");
+}
+
+#[test]
 fn a_branch_still_on_the_old_baseline_is_refused() {
     // 必测 #57（§8.1 第 0 条、§8.1.2）：分支 B 从旧基线分出来，基线已被别的交付 / 更新推进
     let fx = hybrid_with_colleague();

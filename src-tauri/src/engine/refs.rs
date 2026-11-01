@@ -2,6 +2,8 @@ use crate::error::Result;
 use git2::{BranchType, Repository};
 use serde::Serialize;
 
+const INTERNAL_REF_PREFIX: &str = "refs/mygitclient/";
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RefPointer {
@@ -57,6 +59,12 @@ pub fn collect(repo: &Repository) -> Result<Vec<RefPointer>> {
     for reference in repo.references()? {
         let reference = reference?;
         let name = reference.name().unwrap_or("").to_string();
+        // 本应用自己的内部 ref（交付树、跟进钉住的旧索引，W28）不是给人看的。留在列表里的话，
+        // 指着图上提交的那条会被画成一个写着全名的标签，还会被前端当成「有 ref 指着」，
+        // 已交付的提交因此收不起来。
+        if name.starts_with(INTERNAL_REF_PREFIX) {
+            continue;
+        }
         let kind = if name == "HEAD" {
             "head"
         } else if name.starts_with("refs/heads/") {

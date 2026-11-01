@@ -8,6 +8,8 @@
  * 都必须落在这个文件里**，组件不写 if。
  */
 
+import type { BaseMapSummary } from './svnSync'
+
 // ---------------------------------------------------------------------------
 // 与 Rust 侧一一对应的类型
 //
@@ -17,7 +19,10 @@
 
 /** `engine::svn_preflight::Preflight` */
 export interface Preflight {
-  /** 记账单位 N，取自 nodeRevs（**不是** `svn info .` 的 revision）。 */
+  /**
+   * 记账单位 N，取自节点 revision（**不是** `svn info .` 的 revision）。计划 Task 5 起向导允许
+   * 混合版本，这时它是所有节点里最旧的那个，真正的 floor 以建库结果为准。
+   */
   nodeRev: number
   /** Repository Root。 */
   reposRoot: string
@@ -103,6 +108,7 @@ export interface InitPreflight extends Preflight {
 
 /** `engine::svn_init::InitReport` */
 export interface InitReport {
+  /** 首个基线记账的 floor（混合版本时是最旧的文件 revision）。 */
   nodeRev: number
   baseline: string
   health: Health
@@ -114,10 +120,13 @@ export interface InitReport {
 
 /** `engine::svn_init::RebuildReport` */
 export interface RebuildReport {
+  /** 新记账的 floor。 */
   nodeRev: number
   oldBaseline: string
   newBaseline: string
   health: Health
+  /** 计划 Task 5：重建可能录出混合版本；`newer` / `gone` 都是 0 时就是单值。 */
+  base: BaseMapSummary
 }
 
 // ---------------------------------------------------------------------------
@@ -526,11 +535,24 @@ export function wizardErrorHint(code: string, message = ''): string {
       '换成了同名目录。这种位置上 svn 自己都说不清是什么，取不到它在服务器上的内容。' +
       '本应用不会替你动这些路径（删目录、revert 都是破坏性操作）。' +
       '除了 `~`，其余本地修改都不再阻断建库或重建基线。',
-    // 开头与后端消息一致：后端列出了掉队文件与成因时这段整条不显示
+    // 开头与后端消息一致：后端列出了掉队文件与成因时这段整条不显示。
+    // 计划 Task 5 起建库与重建都允许混合版本，不再报这个码；条目保留，兼容旧版留下的报错
     svn_preflight_mixed_revision:
       '白名单内出现了多个 revision——最常见的原因是在 TortoiseSVN 里提交过文件、' +
       '之后没有 update。先在 TortoiseSVN 里对工程根目录跑一次 Update 把它对齐。' +
       '如果白名单落在 external 里，update 解决不了——错误详情里会说明。',
+    // 开头与后端消息里的那句一致：后端已经说过时这段不重复
+    svn_preflight_conflicted:
+      '冲突的文件磁盘上带着冲突标记，录进基线就等于把冲突当成了服务器内容。' +
+      '白名单内的 SVN 冲突要先在 TortoiseSVN 里解决（Resolve），再回来重试。',
+    svn_baseline_excluded_paths:
+      '这些文件服务器上还在，工作副本里却没有——多半是被「Update to revision → Exclude」排除了。' +
+      '录进基线会让它们悄悄从基线里消失，所以停下了。在 TortoiseSVN 里把所在目录按' +
+      '「Fully recursive」更新回来再试。',
+    svn_baseline_unconfirmed:
+      '有些文件在基线的 revision 上存在、工作副本里却没有，要问过 SVN 服务器才知道是删了' +
+      '还是被排除了，这一步没做成。不确认就录，它们会悄悄从基线里消失。' +
+      '确认能连上 SVN 服务器后重试。',
     svn_preflight_operation_in_progress:
       '上一次 svn 操作没跑完。先跑 Cleanup 释放写锁；' +
       '只跑 Cleanup 往往不够，还要再跑一次完整的 svn update 把没更新完的节点补齐。',
@@ -547,8 +569,8 @@ export function wizardErrorHint(code: string, message = ''): string {
       '报出来的文件是「磁盘与服务器对不上、而 svn 又说它没被改过」，' +
       '最常见的原因是漏跑了一次完整的 svn update。',
     svn_rebuild_revision_moved:
-      '重建过程中工作副本被外部改动了（多半是 TortoiseSVN 那边提交或更新了一次）。' +
-      '基线指针没有改动，重新点一次「重建基线」即可。',
+      '录制过程中工作副本被外部改动了（多半是 TortoiseSVN 那边提交或更新了一次）。' +
+      '基线没有改动，等它做完之后重新点一次即可。',
     svn_baseline_classification_conflict:
       'svn status 说某个文件在服务器上有，取它的内容时 svn 又说它还没提交过。' +
       '两个判断对不上，所以停下来了——多半是录制过程中工作副本被外部改动了，请重试一次。',

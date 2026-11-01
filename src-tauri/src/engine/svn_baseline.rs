@@ -14,6 +14,7 @@
 use crate::engine::git_cli::{
     run_git, run_git_code, run_git_env, run_git_stdin, run_git_stdin_env,
 };
+use crate::engine::svn_basemap::{format_message, parse_message, BaseMap, MAX_MAP_ENTRIES};
 use crate::engine::svn_config::BASELINE_BRANCH;
 use crate::error::{GitError, Result};
 use std::collections::BTreeSet;
@@ -284,6 +285,14 @@ impl TempIndex {
         &self.path
     }
 
+    /// 绝对路径，给调用方自己拼 `GIT_INDEX_FILE` 用（`svn_replay` 构造 C'）。
+    ///
+    /// 必须是绝对路径（W19）：git 在 `repo_root` 下运行，相对路径会被它按 `repo_root`
+    /// 再解析一次，指到别处去。
+    pub fn abs_path(&self) -> Result<String> {
+        abs_utf8(&self.path)
+    }
+
     fn git(&self, repo_root: &str, args: &[&str]) -> Result<String> {
         let p = self.path.to_string_lossy().to_string();
         run_git_env(repo_root, args, &[("GIT_INDEX_FILE", &p)])
@@ -319,18 +328,103 @@ impl Drop for TempIndex {
 }
 
 fn unique_index_path(repo_root: &str) -> Result<PathBuf> {
-    let dir = git_dir(repo_root)?;
+    unique_git_dir_path(repo_root, "index")
+}
+
+/// `.git/` 下一个本进程独占的文件名（pid + 纳秒 + 序号）。
+fn unique_git_dir_path(repo_root: &str, ext: &str) -> Result<PathBuf> {
+    Ok(git_dir(repo_root)?.join(unique_file_name(ext)))
+}
+
+/// 本进程独占的临时文件名（pid + 纳秒 + 序号）。
+fn unique_file_name(ext: &str) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    Ok(dir.join(format!(
-        "mygitclient-{}-{}-{}.index",
-        std::process::id(),
-        nanos,
-        seq
-    )))
+    format!("mygitclient-{}-{}-{}.{ext}", std::process::id(), nanos, seq)
+}
+
+/// 用完即删的临时文件；`?` 早退时也由 [`Drop`] 删掉。
+pub(crate) struct TempFile {
+    path: PathBuf,
+}
+
+/// 绝对、UTF-8 的路径字符串，用来交给 git 的参数或环境变量。
+fn abs_utf8(p: &Path) -> Result<String> {
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(p)
+    };
+    abs.to_str().map(str::to_string).ok_or_else(|| {
+        GitError::new(
+            "svn_baseline",
+            format!("临时文件路径不是合法的 UTF-8：{}", abs.display()),
+        )
+    })
+}
+
+impl TempFile {
+    /// 在 `.git/` 下建一个本进程独占的临时文件并写入 `bytes`（commit message 用，W27）。
+    pub(crate) fn in_git_dir(repo_root: &str, ext: &str, bytes: &[u8]) -> Result<Self> {
+        Self::create(unique_git_dir_path(repo_root, ext)?, bytes)
+    }
+
+    /// 绝对路径（理由同 [`TempIndex::abs_path`]）。
+    pub(crate) fn abs_path(&self) -> Result<String> {
+        abs_utf8(&self.path)
+    }
+
+    /// 给 svn 当参数读的临时文件（`--targets`）：优先放 `.git/`，不是 git 仓库时退回系统临时目录。
+    ///
+    /// svn.exe 按系统代码页取命令行参数（日志 Task 4），`%TEMP%` 里有代码页表示不了的字符
+    /// （用户名是中文、系统代码页是 1252）时路径传进去就坏了，每次必败。`.git/` 下配合
+    /// [`Self::svn_arg`] 的相对路径是纯 ASCII，与用户名、仓库路径都无关。
+    ///
+    /// 退路只为纯 SVN 的工作副本（体检不要求是 git 仓库）；录制时一定有 `.git/`。
+    pub(crate) fn for_svn_arg(repo_root: &str, ext: &str, bytes: &[u8]) -> Result<Self> {
+        let path = match unique_git_dir_path(repo_root, ext) {
+            Ok(p) => p,
+            Err(_) => {
+                let name = unique_file_name(ext);
+                std::env::temp_dir().join(name)
+            }
+        };
+        Self::create(path, bytes)
+    }
+
+    /// 传给 svn 的写法：svn 以 `repo_root` 为 cwd，文件在它底下时用相对路径（纯 ASCII），
+    /// 否则（worktree 的 git dir、系统临时目录）用完整路径。
+    pub(crate) fn svn_arg(&self, repo_root: &str) -> String {
+        self.path
+            .strip_prefix(repo_root)
+            .unwrap_or(&self.path)
+            .to_string_lossy()
+            .to_string()
+    }
+
+    fn create(path: PathBuf, bytes: &[u8]) -> Result<Self> {
+        use std::io::Write;
+        // `create_new`：名字撞上别人的文件时宁可失败，也不覆盖
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        // 先建 guard 再写：写到一半失败时文件也会被删
+        let guard = Self { path };
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        Ok(guard)
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        // 删不掉也不能 panic（见 TempIndex::drop 的同一条理由）
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// 临时索引放进 `.git/`：与真实索引同一个文件系统（`write_tree` 之后的对象要落在
@@ -364,6 +458,9 @@ fn unique_index_path(repo_root: &str) -> Result<PathBuf> {
 /// 自动抢占别人的索引锁比留一个残锁危险得多。
 pub struct IndexLock {
     path: PathBuf,
+    /// 锁文件已经被 rename 成 `.git/index`：这把锁不再属于我们，Drop 不能再去删——
+    /// 那个路径上此刻可能是别的 git 进程刚建的锁。
+    released: bool,
 }
 
 impl IndexLock {
@@ -375,7 +472,10 @@ impl IndexLock {
             .create_new(true)
             .open(&path)
         {
-            Ok(_) => Ok(Self { path }),
+            Ok(_) => Ok(Self {
+                path,
+                released: false,
+            }),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(GitError::new(
                 "svn_index_busy",
                 format!(
@@ -388,10 +488,33 @@ impl IndexLock {
             Err(e) => Err(e.into()),
         }
     }
+
+    /// 锁文件的位置。跟进把它当工作副本写（W23：`GIT_INDEX_FILE=<它>` 时 git 锁的是
+    /// `index.lock.lock`，外部 git 照样被 `index.lock` 挡住），写完 rename 成 `.git/index`。
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// 绝对路径，给 `GIT_INDEX_FILE` 用（W19）。
+    pub(crate) fn abs_path(&self) -> Result<String> {
+        abs_utf8(&self.path)
+    }
+
+    pub(crate) fn is_released(&self) -> bool {
+        self.released
+    }
+
+    /// 锁文件已经换成 `.git/index`，交出所有权。
+    pub(crate) fn release(&mut self) {
+        self.released = true;
+    }
 }
 
 impl Drop for IndexLock {
     fn drop(&mut self) {
+        if self.released {
+            return;
+        }
         // 删不掉也不能 panic（见 TempIndex::drop 的同一条理由）。
         let _ = std::fs::remove_file(&self.path);
     }
@@ -522,18 +645,7 @@ fn merge_onto_copy(repo_root: &str, index: &Path, target: &str) -> Result<TempIn
 /// 数量可能成千上万（sparse checkout），放命令行会撞上 Windows 的长度上限。
 fn clear_entry_flags(repo_root: &str, idx: &TempIndex) -> Result<()> {
     let listing = idx.git(repo_root, &["ls-files", "-v", "-z"])?;
-    let (mut skipped, mut assumed) = (Vec::new(), Vec::new());
-    for rec in listing.split('\0') {
-        let Some((tag, path)) = rec.split_once(' ') else {
-            continue;
-        };
-        if tag.eq_ignore_ascii_case("s") {
-            skipped.push(path);
-        }
-        if tag.chars().all(|c| c.is_ascii_lowercase()) {
-            assumed.push(path);
-        }
-    }
+    let (skipped, assumed) = parse_entry_flags(&listing);
     for (flag, paths) in [
         ("--no-skip-worktree", skipped),
         ("--no-assume-unchanged", assumed),
@@ -549,7 +661,25 @@ fn clear_entry_flags(repo_root: &str, idx: &TempIndex) -> Result<()> {
     Ok(())
 }
 
-fn copy_with_mtime(from: &Path, to: &Path) -> Result<()> {
+/// 解析 `ls-files -v -z`：`(skip-worktree 的路径, assume-unchanged 的路径)`。标记含义见
+/// [`clear_entry_flags`]。
+pub(crate) fn parse_entry_flags(listing: &str) -> (Vec<&str>, Vec<&str>) {
+    let (mut skipped, mut assumed) = (Vec::new(), Vec::new());
+    for rec in listing.split('\0') {
+        let Some((tag, path)) = rec.split_once(' ') else {
+            continue;
+        };
+        if tag.eq_ignore_ascii_case("s") {
+            skipped.push(path);
+        }
+        if tag.chars().all(|c| c.is_ascii_lowercase()) {
+            assumed.push(path);
+        }
+    }
+    (skipped, assumed)
+}
+
+pub(crate) fn copy_with_mtime(from: &Path, to: &Path) -> Result<()> {
     std::fs::copy(from, to)?;
     let mtime = std::fs::metadata(from)?.modified()?;
     std::fs::OpenOptions::new()
@@ -642,17 +772,27 @@ fn baseline_ref() -> String {
 /// journal（spec §7.6 `publishing-baseline`：创建 commit 前记录 captureTree，
 /// 移动 ref 前再记录 newBaselineOid）。崩在两步之间时，重开就知道「commit 已建、
 /// ref 未动」，只补 update-ref，不重建另一个 commit。
+///
+/// 计划 Task 5 起收 [`BaseMap`]：重建、初始化与 S7 都可能录出混合基线。单值时
+/// message 与改造前逐字节相同（`format_message` 的单值分支）。
 pub fn create_baseline_commit(
     repo_root: &str,
     tree: &str,
     parent: Option<&str>,
-    t: &Trailer,
+    map: &BaseMap,
 ) -> Result<String> {
-    create_baseline_commit_with(repo_root, tree, parent, t, None)
+    create_baseline_commit_with(repo_root, tree, parent, map, &[], None)
+}
+
+impl From<&Trailer> for BaseMap {
+    /// 旧格式的单值记账。
+    fn from(t: &Trailer) -> Self {
+        BaseMap::single(t.url.clone(), t.uuid.clone(), t.rev)
+    }
 }
 
 /// 交付录的基线额外记的那一行：真正提交出去的 revision。
-const DELIVERED_REV_KEY: &str = "Delivered-Rev:";
+pub(crate) const DELIVERED_REV_KEY: &str = "Delivered-Rev:";
 
 /// 读回 `Delivered-Rev: N`；不是交付录的基线就是 `None`。逐行完整匹配，与 `parse_trailer` 同样先去行尾 `\r`。
 pub fn parse_delivered_rev(message: &str) -> Option<u64> {
@@ -663,33 +803,67 @@ pub fn parse_delivered_rev(message: &str) -> Option<u64> {
     })
 }
 
-/// [`create_baseline_commit`]，交付时多记一行 `Delivered-Rev: N`。
+/// 用 `TREE` 建一个记账为 `map` 的基线 commit，**不动任何 ref**。
 ///
-/// trailer 记的是 D6 更新到的 revision；交付之后同事紧跟着提交时它是同事的，只靠它
-/// 就分不清哪个 revision 才是这次交付（2026-10-16 review）。`git-svn-id` 仍放最后一行。
+/// - `summary_extra`：混合基线首行之后的说明行（见 [`format_message`]）
+/// - `delivered_rev`：交付时多记一行 `Delivered-Rev: N`。trailer 记的是 D6 更新到的
+///   revision；交付之后同事紧跟着提交时它是同事的，只靠它就分不清哪个 revision
+///   才是这次交付（2026-10-16 review）。单值时 `git-svn-id` 仍放最后一行。
 pub fn create_baseline_commit_with(
     repo_root: &str,
     tree: &str,
     parent: Option<&str>,
-    t: &Trailer,
+    map: &BaseMap,
+    summary_extra: &[String],
     delivered_rev: Option<u64>,
 ) -> Result<String> {
-    // `commit-tree` 的 message **必须走 `-m`，不能走 stdin**：`run_git*` 用的是
-    // `Command::output()`，子进程 stdin 是 null，管道那条路会立刻读到 EOF 并产出
-    // 一个 message 为空的 commit——而 trailer 就写在 message 里，等于基线丢掉
-    // 记账且不报任何错。
-    let delivered = delivered_rev
-        .map(|r| format!("{DELIVERED_REV_KEY} {r}\n"))
-        .unwrap_or_default();
-    let msg = format!("svn: r{}\n\n{delivered}{}\n", t.rev, format_trailer(t));
+    if map.entry_count() > MAX_MAP_ENTRIES {
+        return Err(GitError::new(
+            "svn_map_too_large",
+            format!(
+                "基线映射有 {} 条，超过上限 {MAX_MAP_ENTRIES}，不录这个基线。",
+                map.entry_count()
+            ),
+        ));
+    }
+    let msg = format_message(map, summary_extra, delivered_rev);
+    // 写之前先自己读一遍：记账读不回来的基线看起来完全正常，却会让之后每一次
+    // 失同步判定都判成「不是基线」。在这里失败，好过录出一个读不懂的基线。
+    if parse_message(&msg).as_ref() != Some(map) || parse_delivered_rev(&msg) != delivered_rev {
+        return Err(GitError::new(
+            "svn_map_unreadable",
+            "基线记账格式化之后读不回原值（仓库根 URL 或 UUID 的形状不对？），不录这个基线。",
+        ));
+    }
+
+    // message 走 `-F <文件>`，不走 `-m`：Windows 命令行上限约 32K 字符，映射有几百条
+    // 路径就会超；文件按字节原样读入，UTF-8 往返无损（W27）。也不走 `-F -`（stdin）：
+    // `run_git` 的子进程 stdin 是 null，会立刻读到 EOF、产出 message 为空的 commit，
+    // 基线丢掉记账且不报错。文件放 `.git/` 下，不会出现在工作目录里被 TortoiseSVN 看见。
+    let file = TempFile::create(unique_git_dir_path(repo_root, "msg")?, msg.as_bytes())?;
+    // git 在 repo_root 下运行，相对路径会被它按 repo_root 再解析一次，所以要绝对路径
+    let abs = if file.path.is_absolute() {
+        file.path.clone()
+    } else {
+        std::env::current_dir()?.join(&file.path)
+    };
+    let abs = abs.to_str().ok_or_else(|| {
+        GitError::new(
+            "svn_baseline",
+            format!("临时 message 文件路径不是合法的 UTF-8：{}", abs.display()),
+        )
+    })?;
     let mut args: Vec<&str> = vec!["commit-tree", tree];
     if let Some(p) = parent {
         args.push("-p");
         args.push(p);
     }
-    args.push("-m");
-    args.push(&msg);
-    Ok(run_git(repo_root, &args)?.trim().to_string())
+    args.push("-F");
+    args.push(abs);
+    let oid = run_git(repo_root, &args)?.trim().to_string();
+    // `file` 在这里离开作用域被删；上面任何一步 `?` 早退也一样
+    drop(file);
+    Ok(oid)
 }
 
 /// **以旧 OID 作比较条件**把基线分支移到 `oid`。
@@ -734,14 +908,14 @@ pub fn publish_baseline(
     repo_root: &str,
     tree: &str,
     parent: Option<&str>,
-    t: &Trailer,
+    map: &BaseMap,
     expected_old: Option<&str>,
 ) -> Result<String> {
     let current = read_baseline(repo_root)?;
     if current.as_deref() != expected_old {
         return Err(moved_error(expected_old, current.as_deref()));
     }
-    let oid = create_baseline_commit(repo_root, tree, parent, t)?;
+    let oid = create_baseline_commit(repo_root, tree, parent, map)?;
     move_baseline_ref(repo_root, &oid, expected_old)?;
     Ok(oid)
 }

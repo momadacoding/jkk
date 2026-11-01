@@ -23,10 +23,22 @@ pub struct CommitNode {
     /// 只有第一段。前端拿到的数据里根本没有这一行，在那边解析必然恒为 None
     /// ——2026-09-16 独立 review 发现的就是这个，整个混合图接合静默不生效。
     ///
-    /// 解析用 `svn_baseline::parse_trailer`，与录制基线的是同一份实现，
+    /// 解析用 `svn_basemap::parse_message`，与录制、读回基线的是同一份实现，
     /// 不存在两侧规则漂移的问题。
+    ///
+    /// **只在单值基线上有值。** 混合基线没有「那一个 revision」：有值的话前端会把它从图上删掉、
+    /// 挂到 `svn:<floor>`，顶掉 floor 节点原本的基线（分析 §6.9）。混合基线看下面三个字段。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub baseline_rev: Option<u64>,
+    /// 混合基线的 floor；其余提交是 `None`。有值就是混合基线。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_floor: Option<u64>,
+    /// 混合基线里 revision 比 floor 新的文件数，可以是 0（只有墓碑）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_newer: Option<u32>,
+    /// 混合基线的墓碑数；没有墓碑时缺省。只有墓碑的基线靠它才说得清「混合」在哪。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_gone: Option<u32>,
     /// 交付录的基线额外记下的「真正提交出去的 revision」（`Delivered-Rev:`）。
     ///
     /// `baseline_rev` 是交付之后更新到的 revision：中间同事紧跟着提交时它是同事的，图上收起的
@@ -105,13 +117,21 @@ pub fn load(path: &str) -> Result<GraphData> {
         let commit = repo.find_commit(oid)?;
         // 正文只在这里用一次：解析完就丢，不进 payload。
         let full = commit.message().unwrap_or("");
+        let base = crate::engine::svn_basemap::parse_message(full);
+        let single = base.as_ref().filter(|m| m.is_single());
+        let mixed = base.as_ref().filter(|m| !m.is_single());
         commits.push(CommitNode {
             id: oid.to_string(),
             parents: commit.parent_ids().map(|id| id.to_string()).collect(),
             author: commit.author().name().unwrap_or("").to_string(),
             time: commit.time().seconds(),
             message: commit.summary().unwrap_or("").to_string(),
-            baseline_rev: crate::engine::svn_baseline::parse_trailer(full).map(|t| t.rev),
+            baseline_rev: single.map(|m| m.floor),
+            baseline_floor: mixed.map(|m| m.floor),
+            baseline_newer: mixed.map(|m| m.revs.len() as u32),
+            baseline_gone: mixed
+                .filter(|m| !m.gone.is_empty())
+                .map(|m| m.gone.len() as u32),
             delivered_rev: crate::engine::svn_baseline::parse_delivered_rev(full),
             local_only: parse_local_only(full),
         });

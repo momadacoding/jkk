@@ -6,6 +6,9 @@ vi.mock('@/store/repoStore', () => ({
   svnSyncIn: vi.fn(),
   svnSyncContinue: vi.fn(),
   svnSyncAbort: vi.fn(),
+  svnFollow: vi.fn(),
+  svnFollowContinue: vi.fn(),
+  svnFollowManual: vi.fn(),
 }))
 
 import * as store from '@/store/repoStore'
@@ -51,7 +54,40 @@ function deps(log: string[], confirm?: (r: ConfirmRequest) => Promise<boolean>):
     fetchSvnLog: async () => {
       log.push('fetchSvnLog')
     },
+    setFollowing: (busy) => log.push(`following:${busy}`),
+    refreshAfterFollow: async () => {
+      log.push('refreshAfterFollow')
+    },
+    showFollowReport: async () => {
+      log.push('showFollowReport')
+    },
+    checkoutBranch: async (name) => {
+      log.push(`checkout:${name}`)
+    },
   }
+}
+
+const report = {
+  newFloor: 1,
+  verified: true,
+  changes: [],
+  removed: [],
+  dropped: [],
+  rewritten: [],
+  stage: { decisions: {}, uncertain: [], lost: [], discarded: [] },
+  movedBranches: [],
+  behindBranches: [],
+  leaks: [],
+  pinnedRef: null,
+}
+
+const conflict = {
+  kind: 'needsManual' as const,
+  at: 'c'.repeat(40),
+  files: ['Code/A.cs'],
+  baselinePublished: true,
+  leaks: [],
+  staleDisk: false,
 }
 
 beforeEach(() => {
@@ -59,6 +95,356 @@ beforeEach(() => {
   vi.mocked(store.svnSyncIn).mockReset()
   vi.mocked(store.svnSyncContinue).mockReset()
   vi.mocked(store.svnSyncAbort).mockReset()
+  vi.mocked(store.svnFollow).mockReset()
+  vi.mocked(store.svnFollowContinue).mockReset()
+  vi.mocked(store.svnFollowManual).mockReset()
+})
+
+describe('handleFollow', () => {
+  it('banner follow button invokes svnFollow：执行中按钮禁用，完成后刷新再弹报告', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnFollow).mockImplementation(async () => {
+      log.push('svnFollow')
+      return { kind: 'done', report }
+    })
+
+    await createSvnSyncFlow(deps(log)).handleFollow()
+
+    expect(store.svnFollow).toHaveBeenCalledWith('C:/wc1')
+    expect(log).toEqual([
+      'clearError',
+      'guardMerge',
+      'following:true',
+      'svnFollow',
+      'refreshAfterFollow',
+      'refreshSvnSyncState',
+      'refreshSvnSync',
+      'fetchSvnLog',
+      'following:false',
+      'showFollowReport',
+    ])
+  })
+
+  it('报告拿到的是后端给的那一份', async () => {
+    vi.mocked(store.svnFollow).mockResolvedValue({ kind: 'done', report })
+    const shown: unknown[] = []
+    await createSvnSyncFlow({
+      ...deps([]),
+      showFollowReport: async (r) => {
+        shown.push(r)
+      },
+    }).handleFollow()
+    expect(shown).toEqual([report])
+  })
+
+  it('merge driver 没确认时什么都不发，按钮也不动', async () => {
+    const log: string[] = []
+    await createSvnSyncFlow({ ...deps(log), guardMerge: async () => false }).handleFollow()
+    expect(store.svnFollow).not.toHaveBeenCalled()
+    expect(log).toEqual(['clearError'])
+  })
+
+  it('同一时间只走一个流程，不会发第二次', async () => {
+    let release!: (o: { kind: 'done'; report: typeof report }) => void
+    vi.mocked(store.svnFollow).mockReturnValue(
+      new Promise((r) => {
+        release = r
+      }),
+    )
+    const d = deps([])
+
+    const first = createSvnSyncFlow(d).handleFollow()
+    await vi.waitFor(() => expect(store.svnFollow).toHaveBeenCalled())
+    await createSvnSyncFlow(d).handleFollow()
+    await createSvnSyncFlow(d).handleSvnUpdate()
+    release({ kind: 'done', report })
+    await first
+
+    expect(store.svnFollow).toHaveBeenCalledTimes(1)
+    expect(store.svnSyncInPreview).not.toHaveBeenCalled()
+  })
+
+  it('拒绝：显示错误，不弹报告，按钮复位', async () => {
+    const log: string[] = []
+    const seen: ConfirmRequest[] = []
+    vi.mocked(store.svnFollow).mockResolvedValue({
+      kind: 'refused',
+      code: 'svn_follow_git_busy',
+      message: 'git 正在 rebase',
+    })
+
+    await createSvnSyncFlow(
+      deps(log, async (r) => {
+        seen.push(r)
+        return true
+      }),
+    ).handleFollow()
+
+    expect(seen).toHaveLength(1)
+    expect(seen[0].notice).toBe('attention')
+    expect(seen[0].message).toContain('git 正在 rebase')
+    expect(log).not.toContain('showFollowReport')
+    expect(log).toContain('following:false')
+  })
+
+  it('命令本身抛错：进错误条，按钮复位', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnFollow).mockRejectedValue({ code: 'io', message: 'x' })
+
+    await createSvnSyncFlow(deps(log)).handleFollow()
+
+    expect(log).toContain('reportError:io')
+    expect(log.at(-1)).toBe('following:false')
+    expect(log).not.toContain('showFollowReport')
+  })
+
+  it('刷新失败不盖掉结局：跟进已经落地，报告照弹', async () => {
+    const log: string[] = []
+    const d = deps(log)
+    d.refreshAfterFollow = async () => {
+      throw { code: 'load_graph_failed' }
+    }
+    vi.mocked(store.svnFollow).mockResolvedValue({ kind: 'done', report })
+
+    await createSvnSyncFlow(d).handleFollow()
+
+    expect(log).toContain('reportError:load_graph_failed')
+    expect(log.at(-1)).toBe('showFollowReport')
+  })
+
+  it('冲突：确认之后才走手动跟进，确认框上有冲突的文件，不再过一遍 merge driver', async () => {
+    const log: string[] = []
+    const seen: ConfirmRequest[] = []
+    vi.mocked(store.svnFollow).mockResolvedValue(conflict)
+    vi.mocked(store.svnFollowManual).mockImplementation(async () => {
+      log.push('followManual')
+      return { kind: 'done', newRev: 2 }
+    })
+
+    await createSvnSyncFlow(
+      deps(log, async (r) => {
+        seen.push(r)
+        await r.action?.()
+        return true
+      }),
+    ).handleFollow()
+
+    expect(seen[0].title).toBe('跟进遇到冲突')
+    expect(seen[0].message).toContain('Code/A.cs')
+    expect(seen[0].confirmLabel).toBe('手动跟进')
+    expect(store.svnFollowManual).toHaveBeenCalledWith('C:/wc1')
+    expect(log.filter((l) => l === 'guardMerge')).toHaveLength(1)
+    expect(log).not.toContain('showFollowReport')
+  })
+
+  it('冲突时取消：手动跟进永远不自动发起', async () => {
+    vi.mocked(store.svnFollow).mockResolvedValue(conflict)
+
+    await createSvnSyncFlow(deps([], async () => false)).handleFollow()
+
+    expect(store.svnFollowManual).not.toHaveBeenCalled()
+  })
+
+  it('手动跟进遇到冲突：后续的继续 / 放弃走横幅，这里把结局报出来', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnFollow).mockResolvedValue(conflict)
+    vi.mocked(store.svnFollowManual).mockResolvedValue({ kind: 'rebaseConflict', files: ['A'] })
+
+    await createSvnSyncFlow(deps(log)).handleFollow()
+
+    expect(log.at(-1)).toBe('confirm:手动跟进遇到冲突')
+  })
+})
+
+describe('handleCheckoutBehind', () => {
+  /** 按下确认框上的哪一颗按钮。 */
+  const press =
+    (log: string[], pick: 'confirm' | 'alternative' | 'cancel', seen: ConfirmRequest[] = []) =>
+    async (r: ConfirmRequest): Promise<boolean> => {
+      seen.push(r)
+      log.push(`confirm:${r.title}`)
+      // 第二个框是手动跟进自己的确认
+      if (seen.length > 1 || pick === 'confirm') {
+        await r.action?.()
+        return true
+      }
+      if (pick === 'alternative') r.alternative?.onSelect()
+      return false
+    }
+
+  it('切换并手动跟进（默认）：切分支 → merge driver → 手动跟进自己的确认框', async () => {
+    const log: string[] = []
+    const seen: ConfirmRequest[] = []
+    vi.mocked(store.svnFollowManual).mockImplementation(async () => {
+      log.push('followManual')
+      return { kind: 'done', newRev: 2 }
+    })
+
+    await createSvnSyncFlow(deps(log, press(log, 'confirm', seen))).handleCheckoutBehind('old')
+
+    expect(seen[0].confirmLabel).toBe('切换并手动跟进')
+    expect(seen[0].alternative?.label).toBe('仅切换')
+    expect(log).toEqual([
+      'clearError',
+      'confirm:切换到落后基线的分支',
+      'checkout:old',
+      'clearError',
+      'guardMerge',
+      'confirm:手动跟进',
+      'followManual',
+      'refreshSvnSyncState',
+      'refreshSvnSync',
+      'fetchSvnLog',
+    ])
+  })
+
+  it('仅切换：只切分支，不碰手动跟进', async () => {
+    const log: string[] = []
+    await createSvnSyncFlow(deps(log, press(log, 'alternative'))).handleCheckoutBehind('old')
+    expect(log).toContain('checkout:old')
+    expect(store.svnFollowManual).not.toHaveBeenCalled()
+    expect(log).not.toContain('guardMerge')
+  })
+
+  it('取消：什么都不做', async () => {
+    const log: string[] = []
+    await createSvnSyncFlow(deps(log, press(log, 'cancel'))).handleCheckoutBehind('old')
+    expect(log).not.toContain('checkout:old')
+    expect(store.svnFollowManual).not.toHaveBeenCalled()
+  })
+
+  it('切分支被工作区改动挡住：沿用错误提示，不走手动跟进，也不替用户 stash', async () => {
+    const log: string[] = []
+    const d = deps(log, press(log, 'confirm'))
+    d.checkoutBranch = async () => {
+      throw { code: 'checkout_blocked', message: 'local changes would be overwritten' }
+    }
+
+    await createSvnSyncFlow(d).handleCheckoutBehind('old')
+
+    expect(log).toContain('reportError:checkout_blocked')
+    expect(store.svnFollowManual).not.toHaveBeenCalled()
+    expect(log).not.toContain('confirm:手动跟进')
+  })
+
+  it('同一时间只走一个流程', async () => {
+    const log: string[] = []
+    const d = deps(log)
+    d.running.current = true
+    await createSvnSyncFlow(d).handleCheckoutBehind('old')
+    expect(log).toEqual([])
+  })
+})
+
+describe('切换之后的手动跟进（只经由「切换并手动跟进」发起，Review 3 第 4 条）', () => {
+  /** 切分支的框点确认（它没有 action）；之后的框交给 `rest`。 */
+  const afterSwitch =
+    (log: string[], rest: (r: ConfirmRequest) => Promise<boolean>) =>
+    async (r: ConfirmRequest): Promise<boolean> => {
+      if (r.title === '切换到落后基线的分支') {
+        log.push(`confirm:${r.title}`)
+        return true
+      }
+      return rest(r)
+    }
+  const accept = (log: string[]) => async (r: ConfirmRequest) => {
+    log.push(`confirm:${r.title}`)
+    await r.action?.()
+    return true
+  }
+
+  it('永远不自动执行：手动跟进的框不确认就什么都不发', async () => {
+    const log: string[] = []
+    const decline = async (r: ConfirmRequest) => {
+      log.push(`confirm:${r.title}`)
+      return false
+    }
+    await createSvnSyncFlow(deps(log, afterSwitch(log, decline))).handleCheckoutBehind('old')
+    expect(log).toContain('confirm:手动跟进')
+    expect(store.svnFollowManual).not.toHaveBeenCalled()
+    expect(log).not.toContain('refreshSvnSync')
+  })
+
+  it('merge driver 没确认时连手动跟进的框都不弹', async () => {
+    const log: string[] = []
+    await createSvnSyncFlow({
+      ...deps(log, afterSwitch(log, accept(log))),
+      guardMerge: async () => false,
+    }).handleCheckoutBehind('old')
+    expect(store.svnFollowManual).not.toHaveBeenCalled()
+    expect(log).toEqual([
+      'clearError',
+      'confirm:切换到落后基线的分支',
+      'checkout:old',
+      'clearError',
+    ])
+  })
+
+  it('冲突出口与暂存没保住都要让用户看见', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnFollowManual).mockResolvedValueOnce({ kind: 'rebaseConflict', files: ['A'] })
+    await createSvnSyncFlow(deps(log, afterSwitch(log, accept(log)))).handleCheckoutBehind('old')
+    expect(log.at(-1)).toBe('confirm:手动跟进遇到冲突')
+
+    vi.mocked(store.svnFollowManual).mockResolvedValueOnce({
+      kind: 'stageLost',
+      newRev: 2,
+      stashOid: 's'.repeat(40),
+      files: ['Code/B.cs'],
+    })
+    await createSvnSyncFlow(deps(log, afterSwitch(log, accept(log)))).handleCheckoutBehind('old')
+    expect(log.at(-1)).toBe('confirm:手动跟进完成，暂存状态没保住')
+  })
+})
+
+describe('横幅上手动跟进记录的继续 / 放弃', () => {
+  const unfinished = (phase: 'rebase' | 'applying-stash') => () => ({
+    locked: false,
+    holder: null,
+    unfinished: { flow: 'follow_manual' as const, phase, opid: 'x', startedAt: 1 },
+  })
+
+  it('走更新的继续命令，文案说手动跟进', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncContinue).mockResolvedValue({ kind: 'done', newRev: 2 })
+
+    await createSvnSyncFlow({ ...deps(log), syncState: unfinished('rebase') }).handleSyncAction(
+      'syncContinue',
+    )
+
+    expect(store.svnSyncContinue).toHaveBeenCalledWith('C:/wc1')
+    expect(store.svnFollowContinue).not.toHaveBeenCalled()
+    expect(log).toContain('confirm:继续手动跟进')
+  })
+
+  it('放弃的结局也说手动跟进', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncAbort).mockResolvedValue({ kind: 'aborted' })
+
+    await createSvnSyncFlow({ ...deps(log), syncState: unfinished('rebase') }).handleSyncAction(
+      'syncAbort',
+    )
+
+    expect(log).toContain('confirm:放弃这次手动跟进')
+    expect(log.at(-1)).toBe('confirm:已放弃这次手动跟进')
+  })
+
+  it('继续到最后暂存没保住：手动跟进的记录按手动跟进的话报出来', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncContinue).mockResolvedValue({
+      kind: 'stageLost',
+      newRev: 2,
+      stashOid: 's'.repeat(40),
+      files: [],
+    })
+
+    await createSvnSyncFlow({
+      ...deps(log),
+      syncState: unfinished('applying-stash'),
+    }).handleSyncAction('syncContinue')
+
+    expect(log.at(-1)).toBe('confirm:手动跟进完成，暂存状态没保住')
+  })
 })
 
 describe('handleSvnUpdate', () => {
@@ -240,6 +626,78 @@ describe('handleSyncAction', () => {
       expect(log.indexOf('clearError'), id).toBeGreaterThanOrEqual(0)
       expect(log.indexOf('clearError'), id).toBeLessThan(log.indexOf(act))
     }
+  })
+})
+
+describe('跟进记录的「继续」', () => {
+  it('清错 → merge driver 确认 → 执行 → 刷新 → 弹报告，走的是跟进的命令', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnFollowContinue).mockImplementation(async () => {
+      log.push('followContinue')
+      return { kind: 'done', report }
+    })
+
+    await createSvnSyncFlow(deps(log)).handleSyncAction('followContinue')
+
+    expect(store.svnSyncContinue).not.toHaveBeenCalled()
+    expect(store.svnSyncAbort).not.toHaveBeenCalled()
+    expect(log).toEqual([
+      'clearError',
+      'guardMerge',
+      'confirm:继续跟进',
+      'followContinue',
+      'refreshAfterFollow',
+      'refreshSvnSyncState',
+      'refreshSvnSync',
+      'fetchSvnLog',
+      'showFollowReport',
+    ])
+  })
+
+  it('恢复之后重新跟进遇到冲突：同样落到手动跟进，不留一句没有按钮的话', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnFollowContinue).mockResolvedValue(conflict)
+    vi.mocked(store.svnFollowManual).mockResolvedValue({ kind: 'done', newRev: 2 })
+
+    await createSvnSyncFlow(deps(log)).handleSyncAction('followContinue')
+
+    expect(log).toContain('confirm:跟进遇到冲突')
+    expect(store.svnFollowManual).toHaveBeenCalledTimes(1)
+  })
+
+  it('恢复被拒：把后端的话告诉用户', async () => {
+    const seen: ConfirmRequest[] = []
+    vi.mocked(store.svnFollowContinue).mockResolvedValue({
+      kind: 'refused',
+      code: 'svn_index_busy',
+      message: '索引被占着',
+    })
+
+    await createSvnSyncFlow(
+      deps([], async (r) => {
+        seen.push(r)
+        await r.action?.()
+        return true
+      }),
+    ).handleSyncAction('followContinue')
+
+    expect(seen.at(-1)?.message).toContain('索引被占着')
+    expect(seen.at(-1)?.notice).toBe('attention')
+  })
+
+  it('恢复可能重新重放，guardMerge 返回 false 时什么都不做', async () => {
+    const log: string[] = []
+    await createSvnSyncFlow({ ...deps(log), guardMerge: async () => false }).handleSyncAction(
+      'followContinue',
+    )
+    expect(store.svnFollowContinue).not.toHaveBeenCalled()
+  })
+
+  it('取消确认框时没有结局可报', async () => {
+    const log: string[] = []
+    await createSvnSyncFlow(deps(log, async () => false)).handleSyncAction('followContinue')
+    expect(store.svnFollowContinue).not.toHaveBeenCalled()
+    expect(log).not.toContain('refreshSvnSync')
   })
 })
 

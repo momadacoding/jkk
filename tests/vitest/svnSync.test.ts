@@ -7,22 +7,70 @@ import {
   describeEolMigration,
   describeSync,
   MIGRATE_EOL_WARNING,
+  markOnBlur,
   needsStandaloneCheck,
   recordAfterSuccess,
+  shouldMarkOnBlur,
   syncBannerIsSuppressed,
   syncIfRootRevChanged,
+  syncIfWcDbChanged,
+  wcDbStampsChanged,
   type EolStatus,
   type RootRevMemo,
   type SyncStatus,
+  type SyncVerdict,
+  type WcDbStamp,
+  type WcDbStampMemo,
 } from '@/engine/svnSync'
 
-const inSync: SyncStatus = { baselineRev: 4, nodeRevs: [4], verdict: { kind: 'inSync' } }
+/** 后端 `SyncStatus` 的完整形状；`base` 默认是单值基线。 */
+function st(verdict: SyncVerdict, baselineRev: number, nodeRevs: number[]): SyncStatus {
+  return {
+    baselineRev,
+    nodeRevs,
+    verdict,
+    base: { floor: baselineRev, newer: 0, gone: 0 },
+    headBehindBase: false,
+  }
+}
+
+const inSync = st({ kind: 'inSync' }, 4, [4])
 const eolNeeds: EolStatus = { ruleInstalled: false, needsMigration: true }
 const eolDone: EolStatus = { ruleInstalled: true, needsMigration: false }
+
+const backward = st({ kind: 'diverged', nodeRev: 4, baselineRev: 9 }, 9, [4])
+
+const advanced = st(
+  {
+    kind: 'externallyAdvanced',
+    changed: [
+      { path: 'Code/A.cs', rev: 1245, author: 'zhang' },
+      { path: 'Code/B.cs', rev: 1248, author: null },
+    ],
+    added: [{ path: 'Code/N.cs', rev: 1246, author: 'li' }],
+    removed: ['Code/Old.cs'],
+  },
+  1240,
+  [1240, 1245, 1246, 1248],
+)
 
 describe('describeSync', () => {
   it('同步时不挂横幅', () => {
     expect(describeSync(inSync)).toBeNull()
+  })
+
+  it('基线已经发布、当前分支没跟上：黄色横幅给「跟进」', () => {
+    const b = describeSync({ ...inSync, headBehindBase: true })!
+    expect(b.tone).toBe('warn')
+    expect(b.title).toBe('当前分支落后基线')
+    expect(b.actions).toEqual([{ id: 'follow', label: '跟进' }])
+  })
+
+  it('分支落后不盖过真正的失同步：那些判定有自己的出口', () => {
+    const b = describeSync({ ...advanced, headBehindBase: true })!
+    expect(b.title).not.toBe('当前分支落后基线')
+    const d = describeSync({ ...backward, headBehindBase: true })!
+    expect(d.tone).toBe('danger')
   })
 
   it('还没读到状态时也不挂横幅', () => {
@@ -31,45 +79,44 @@ describe('describeSync', () => {
     expect(describeSync(null)).toBeNull()
   })
 
-  it('mixed revision 列出每一个值，出口是先在 TortoiseSVN 里 update', () => {
-    const m = describeSync({
-      baselineRev: 4,
-      nodeRevs: [4, 7],
-      verdict: { kind: 'mixedRevision', revs: [4, 7] },
-    })!
-    expect(m.tone).toBe('danger')
-    expect(m.detail).toContain('4')
-    expect(m.detail).toContain('7')
-    expect(m.detail).toContain('提交过')
-    expect(m.detail).toContain('Update')
+  it('externallyAdvanced：黄色，标题报文件数，只给「跟进」一个按钮', () => {
+    // 分析 §6.10：不给「体检基线」——此时体检用的还是旧基线，必然把这些文件报成
+    // 「基线与服务器不符」，而跟进本身就包含体检
+    const m = describeSync(advanced)!
+    expect(m.tone).toBe('warn')
+    expect(m.title).toBe('SVN 侧有 4 个文件有新内容')
+    expect(m.actions).toEqual([{ id: 'follow', label: '跟进' }])
   })
 
-  it('mixed revision 不给「重建基线」：它开头的 P2 对同一组 target 必然拒绝', () => {
-    // 2026-10-28 发现的死路：横幅推荐重建基线，重建一开头就以
-    // svn_preflight_mixed_revision 拒绝，再让用户去 update。
-    // 失同步判定（svn_sync::node_revs）与 P2 查的是同一组 target，所以这里
-    // 判成 mixedRevision 时重建**一定**失败，按钮只是一个必然报错的入口
-    const m = describeSync({
-      baselineRev: 4,
-      nodeRevs: [4, 7],
-      verdict: { kind: 'mixedRevision', revs: [4, 7] },
-    })!
-    const ids = m.actions.map((a) => a.id)
-    expect(ids).not.toContain('rebuild')
-    expect(ids).toContain('check')
-    // 按钮少了要说为什么，否则用户会去找「重建基线」在哪
-    expect(m.note).toContain('重建基线')
+  it('externallyAdvanced 列出路径、revision 与作者，让用户分清是不是自己提交的', () => {
+    const m = describeSync(advanced)!
+    const files = m.files ?? []
+    expect(files.some((l) => l.includes('Code/A.cs') && l.includes('r1245') && l.includes('zhang'))).toBe(true)
+    expect(files.some((l) => l.includes('Code/N.cs') && l.includes('li'))).toBe(true)
+    // 消失的文件不说「已删除」：本地分不出提交删除与 depth-exclude 漏收（E17）
+    expect(files.some((l) => l.includes('Code/Old.cs') && l.includes('已没有'))).toBe(true)
+    expect(files.every((l) => !l.includes('删除'))).toBe(true)
+    // 没有作者的不能插值出 null / undefined
+    expect(files.every((l) => !l.includes('null') && !l.includes('undefined'))).toBe(true)
+    // 措辞不能说成「你提交了」：局部 update 拉下的同事改动也是这个判定（分析 §6.2）
+    expect(m.detail).not.toContain('你提交')
+  })
+
+  it('wcLocked：灰色「SVN 正在更新…」，不给任何按钮', () => {
+    const m = describeSync(st({ kind: 'wcLocked', dirs: ['Code'] }, 4, [4]))!
+    expect(m.tone).toBe('quiet')
+    expect(m.title).toBe('SVN 正在更新…')
+    expect(m.actions).toEqual([])
+    expect(m.detail).toContain('Code')
   })
 
   it('pinned reset 给的是 svn update 那条出路，不是重建基线', () => {
     // spec §6.6.2：这两种情况的修复完全相反。
     // 对 pinned 用「重建基线」会把被钉死的**旧内容**录成一个标着新 revision 的
     // 基线 —— 自己造出 §9.2 的基线撒谎。
-    const m = describeSync({
-      baselineRev: 7,
-      nodeRevs: [5],
-      verdict: { kind: 'pinnedReset', nodeRev: 5, baselineRev: 7, external: 'Code' },
-    })!
+    const m = describeSync(
+      st({ kind: 'pinnedReset', nodeRev: 5, baselineRev: 7, external: 'Code' }, 7, [5]),
+    )!
     const ids = m.actions.map((a) => a.id)
     expect(ids).toContain('updateWhitelistDir')
     expect(ids).not.toContain('rebuild')
@@ -78,84 +125,32 @@ describe('describeSync', () => {
 
   it('pinned reset 给出可以照抄的命令文本', () => {
     // 本期一条 SVN 写命令都不发，所以出口是「把命令给用户，让他自己去跑」。
-    const m = describeSync({
-      baselineRev: 7,
-      nodeRevs: [5],
-      verdict: { kind: 'pinnedReset', nodeRev: 5, baselineRev: 7, external: 'Code' },
-    })!
+    const m = describeSync(
+      st({ kind: 'pinnedReset', nodeRev: 5, baselineRev: 7, external: 'Code' }, 7, [5]),
+    )!
     expect(m.command).toBe('svn update Code')
   })
 
-  it('diverged 时分清是被推进还是被回退', () => {
-    const forward = describeSync({
-      baselineRev: 4,
-      nodeRevs: [9],
-      verdict: { kind: 'diverged', nodeRev: 9, baselineRev: 4 },
-    })!
-    const backward = describeSync({
-      baselineRev: 9,
-      nodeRevs: [4],
-      verdict: { kind: 'diverged', nodeRev: 4, baselineRev: 9 },
-    })!
-    expect(forward.detail).not.toEqual(backward.detail)
-    expect(forward.detail).toContain('前进')
-    expect(backward.detail).toContain('回退')
-  })
-
-  it('整体前进（外部在项目根 update 过）：黄色，第一个按钮是「更新」（计划 A16）', () => {
-    const m = describeSync({
-      baselineRev: 4,
-      nodeRevs: [9],
-      verdict: { kind: 'diverged', nodeRev: 9, baselineRev: 4 },
-    })!
-    expect(m.tone).toBe('warn')
-    expect(m.actions[0].id).toBe('svnUpdate')
-    expect(m.detail).toContain('TortoiseSVN')
-    // 重建与体检仍然在：「更新」要联网，离线时用户还能先把基线跟上
-    expect(m.actions.map((a) => a.id)).toEqual(['svnUpdate', 'rebuild', 'check'])
-  })
-
-  it('被回退、多 revision 时不给「更新」：那两种「更新」会拒绝', () => {
-    const backward = describeSync({
-      baselineRev: 9,
-      nodeRevs: [4],
-      verdict: { kind: 'diverged', nodeRev: 4, baselineRev: 9 },
-    })!
-    const mixed = describeSync({
-      baselineRev: 4,
-      nodeRevs: [4, 7],
-      verdict: { kind: 'mixedRevision', revs: [4, 7] },
-    })!
-    for (const m of [backward, mixed]) {
-      expect(m.tone).toBe('danger')
-      expect(m.actions.map((a) => a.id)).not.toContain('svnUpdate')
-    }
+  it('diverged 只表示回退：红色，说「回退」，不给「更新」', () => {
+    // 计划 Task 3 起前进一律是 externallyAdvanced，diverged 只剩任一文件 n(f) < R(f)
+    const m = describeSync(backward)!
+    expect(m.tone).toBe('danger')
+    expect(m.detail).toContain('回退')
+    expect(m.actions.map((a) => a.id)).not.toContain('svnUpdate')
   })
 
   it('给了重建基线的文案都写明它不碰工作目录、也不推进工作分支', () => {
     // spec §16：「代价是工作分支不会自动跟进新基线」。不写明的话，用户会以为
     // 点完就万事大吉，下次提交时才发现分支还挂在旧基线上。
-    // mixedRevision 不在这里：它不给重建基线（见上面那条）
-    const cases: SyncStatus[] = [
-      { baselineRev: 4, nodeRevs: [9], verdict: { kind: 'diverged', nodeRev: 9, baselineRev: 4 } },
-      { baselineRev: 9, nodeRevs: [4], verdict: { kind: 'diverged', nodeRev: 4, baselineRev: 9 } },
-    ]
-    for (const c of cases) {
-      const m = describeSync(c)!
-      expect(m.actions.map((a) => a.id)).toContain('rebuild')
-      expect(m.note).toContain('工作目录')
-      expect(m.note).toContain('工作分支')
-    }
+    const m = describeSync(backward)!
+    expect(m.actions.map((a) => a.id)).toContain('rebuild')
+    expect(m.note).toContain('工作目录')
+    expect(m.note).toContain('工作分支')
   })
 
-  it('每种失同步都提供手动体检入口', () => {
+  it('回退与 pinned reset 都提供手动体检入口', () => {
     // NB-6：`check_current_baseline` 是 Lying 唯一真正可达的入口。
-    const m = describeSync({
-      baselineRev: 4,
-      nodeRevs: [9],
-      verdict: { kind: 'diverged', nodeRev: 9, baselineRev: 4 },
-    })!
-    expect(m.actions.map((a) => a.id)).toContain('check')
+    expect(describeSync(backward)!.actions.map((a) => a.id)).toContain('check')
   })
 })
 
@@ -213,22 +208,14 @@ describe('needsStandaloneCheck', () => {
   })
 
   it('失同步横幅在时不重复渲染——任何时刻恰好一个入口', () => {
-    const diverged: SyncStatus = {
-      baselineRev: 4,
-      nodeRevs: [9],
-      verdict: { kind: 'diverged', nodeRev: 9, baselineRev: 4 },
-    }
+    const diverged = st({ kind: 'diverged', nodeRev: 4, baselineRev: 9 }, 9, [4])
     expect(needsStandaloneCheck(true, diverged, eolDone)).toBe(false)
     // 前提：那条横幅自己带着体检按钮
     expect(describeSync(diverged)!.actions.map((a) => a.id)).toContain('check')
   })
 
   it('pinned reset 的横幅也带体检，所以同样不重复', () => {
-    const pinned: SyncStatus = {
-      baselineRev: 9,
-      nodeRevs: [4],
-      verdict: { kind: 'pinnedReset', nodeRev: 4, baselineRev: 9, external: 'Code/Vendor' },
-    }
+    const pinned = st({ kind: 'pinnedReset', nodeRev: 4, baselineRev: 9, external: 'Code/Vendor' }, 9, [4])
     expect(needsStandaloneCheck(true, pinned, eolDone)).toBe(false)
     expect(describeSync(pinned)!.actions.map((a) => a.id)).toContain('check')
   })
@@ -395,20 +382,12 @@ describe('describeEolMigration', () => {
   it('pinnedReset 时让位——那种状态下重建基线是错的', () => {
     // 迁移的动作就是重建基线，而 pinnedReset 下重建会把被 svn:externals
     // 钉死的旧内容录成一个标着新 revision 的基线，自己造出 §9.2 的基线撒谎。
-    const pinned: SyncStatus = {
-      baselineRev: 9,
-      nodeRevs: [4],
-      verdict: { kind: 'pinnedReset', nodeRev: 4, baselineRev: 9, external: 'Code/Vendor' },
-    }
+    const pinned = st({ kind: 'pinnedReset', nodeRev: 4, baselineRev: 9, external: 'Code/Vendor' }, 9, [4])
     expect(describeEolMigration(eolNeeds, pinned)).toBeNull()
   })
 
   it('其余失同步状态下迁移横幅仍然出现', () => {
-    const diverged: SyncStatus = {
-      baselineRev: 4,
-      nodeRevs: [9],
-      verdict: { kind: 'diverged', nodeRev: 9, baselineRev: 4 },
-    }
+    const diverged = st({ kind: 'diverged', nodeRev: 4, baselineRev: 9 }, 9, [4])
     expect(describeEolMigration(eolNeeds, diverged)).not.toBeNull()
   })
 })
@@ -451,16 +430,8 @@ describe('迁移文案必须与后端真实行为一致', () => {
 })
 
 describe('迁移横幅与失同步横幅互斥', () => {
-  const diverged: SyncStatus = {
-    baselineRev: 4,
-    nodeRevs: [9],
-    verdict: { kind: 'diverged', nodeRev: 9, baselineRev: 4 },
-  }
-  const pinned: SyncStatus = {
-    baselineRev: 9,
-    nodeRevs: [4],
-    verdict: { kind: 'pinnedReset', nodeRev: 4, baselineRev: 9, external: 'Code/Vendor' },
-  }
+  const diverged = st({ kind: 'diverged', nodeRev: 4, baselineRev: 9 }, 9, [4])
+  const pinned = st({ kind: 'pinnedReset', nodeRev: 4, baselineRev: 9, external: 'Code/Vendor' }, 9, [4])
 
   it('需要迁移时失同步横幅让位，避免两条红条', () => {
     expect(syncBannerIsSuppressed(eolNeeds, diverged)).toBe(true)
@@ -478,5 +449,213 @@ describe('迁移横幅与失同步横幅互斥', () => {
   it('迁移未完成时不挂常驻「体检基线」——基线本来就不可信', () => {
     expect(needsStandaloneCheck(true, inSync, eolNeeds)).toBe(false)
     expect(needsStandaloneCheck(true, inSync, eolDone)).toBe(true)
+  })
+})
+
+describe('wcDbStampsChanged', () => {
+  const a: WcDbStamp = { wcRoot: 'C:/wc', mtimeNs: '1793000000123456789', size: 4096 }
+  const b: WcDbStamp = { wcRoot: 'C:/wc/code', mtimeNs: '1793000000000000001', size: 8192 }
+
+  it('没有记录时算变了：第一次焦点要跑一次校验', () => {
+    expect(wcDbStampsChanged(null, [a])).toBe(true)
+    expect(wcDbStampsChanged(null, [])).toBe(true)
+  })
+
+  it('完全一样时没变', () => {
+    expect(wcDbStampsChanged([a, b], [{ ...a }, { ...b }])).toBe(false)
+    expect(wcDbStampsChanged([], [])).toBe(false)
+  })
+
+  it('顺序不算变化', () => {
+    expect(wcDbStampsChanged([a, b], [b, a])).toBe(false)
+  })
+
+  it('mtime 只差 1 纳秒也算变了：按字符串比，不走 number', () => {
+    // 转成 number 之后这两个值相等（超过 2^53），这条就是防有人把它 Number() 掉
+    expect(Number('1793000000123456789')).toBe(Number('1793000000123456790'))
+    expect(wcDbStampsChanged([a], [{ ...a, mtimeNs: '1793000000123456790' }])).toBe(true)
+  })
+
+  it('size 变了算变了', () => {
+    expect(wcDbStampsChanged([a], [{ ...a, size: 4097 }])).toBe(true)
+  })
+
+  it('多一个或少一个工作副本都算变了', () => {
+    expect(wcDbStampsChanged([a], [a, b])).toBe(true)
+    expect(wcDbStampsChanged([a, b], [a])).toBe(true)
+  })
+
+  it('工作副本换了一个，个数相同也算变了', () => {
+    expect(wcDbStampsChanged([a], [{ ...a, wcRoot: 'C:/other' }])).toBe(true)
+  })
+})
+
+describe('syncIfWcDbChanged', () => {
+  const a: WcDbStamp = { wcRoot: 'C:/wc', mtimeNs: '1', size: 1 }
+  const a2: WcDbStamp = { ...a, mtimeNs: '2' }
+
+  it('focus refreshes sync only when wc.db stamp changed', async () => {
+    const memo: WcDbStampMemo = { value: null }
+    let checks = 0
+    const check = async () => {
+      checks += 1
+    }
+
+    // 第一次没有记录，要跑
+    expect(await syncIfWcDbChanged(memo, async () => [a], check)).toBe(true)
+    expect(checks).toBe(1)
+    expect(memo.value).toEqual([a])
+
+    // 来回切窗口，wc.db 没变：一次校验都不发
+    expect(await syncIfWcDbChanged(memo, async () => [a], check)).toBe(false)
+    expect(await syncIfWcDbChanged(memo, async () => [{ ...a }], check)).toBe(false)
+    expect(checks).toBe(1)
+
+    // TortoiseSVN 提交之后切回来
+    expect(await syncIfWcDbChanged(memo, async () => [a2], check)).toBe(true)
+    expect(checks).toBe(2)
+    expect(memo.value).toEqual([a2])
+  })
+
+  it('校验失败不记：下一次焦点重试，不能让横幅长期撒谎', async () => {
+    const memo: WcDbStampMemo = { value: [a] }
+
+    await expect(
+      syncIfWcDbChanged(
+        memo,
+        async () => [a2],
+        async () => {
+          throw new Error('wc locked')
+        },
+      ),
+    ).rejects.toThrow('wc locked')
+
+    expect(memo.value).toEqual([a])
+    let checks = 0
+    await syncIfWcDbChanged(
+      memo,
+      async () => [a2],
+      async () => {
+        checks += 1
+      },
+    )
+    expect(checks).toBe(1)
+  })
+
+  it('读戳失败时不跑校验、记录不动，错误交给调用方', async () => {
+    const memo: WcDbStampMemo = { value: [a] }
+    let checks = 0
+
+    await expect(
+      syncIfWcDbChanged(
+        memo,
+        async () => {
+          throw new Error('stat failed')
+        },
+        async () => {
+          checks += 1
+        },
+      ),
+    ).rejects.toThrow('stat failed')
+
+    expect(checks).toBe(0)
+    expect(memo.value).toEqual([a])
+  })
+
+  it('记的是开跑之前读到的戳：校验期间又变了，下一次还会判不等', async () => {
+    const memo: WcDbStampMemo = { value: null }
+    let disk = a
+    await syncIfWcDbChanged(
+      memo,
+      async () => [disk],
+      async () => {
+        disk = a2
+      },
+    )
+    expect(memo.value).toEqual([a])
+    expect(wcDbStampsChanged(memo.value, [disk])).toBe(true)
+  })
+})
+
+describe('shouldMarkOnBlur', () => {
+  it('最近一次判定是 inSync、没有校验在跑时写', () => {
+    expect(shouldMarkOnBlur('inSync', 0)).toBe(true)
+  })
+
+  it('最近一次判定不是 inSync 时不写：快照会比外部提交新', () => {
+    for (const kind of ['externallyAdvanced', 'wcLocked', 'diverged', 'pinnedReset'] as const) {
+      expect(shouldMarkOnBlur(kind, 0), kind).toBe(false)
+    }
+  })
+
+  it('还没判定过时不写', () => {
+    expect(shouldMarkOnBlur(null, 0)).toBe(false)
+  })
+
+  it('校验进行中不写：判定可能马上就不是 inSync 了（Review 2 遗留）', () => {
+    expect(shouldMarkOnBlur('inSync', 1)).toBe(false)
+    expect(shouldMarkOnBlur('inSync', 3)).toBe(false)
+  })
+})
+
+describe('markOnBlur', () => {
+  const a: WcDbStamp = { wcRoot: 'C:/wc', mtimeNs: '1', size: 1 }
+  const a2: WcDbStamp = { ...a, mtimeNs: '2' }
+
+  function run(over: {
+    verdict?: SyncVerdict['kind'] | null
+    checks?: number
+    memo?: WcDbStamp[] | null
+    disk?: WcDbStamp[]
+  }) {
+    let marks = 0
+    let reads = 0
+    const result = markOnBlur(
+      over.verdict === undefined ? 'inSync' : over.verdict,
+      over.checks ?? 0,
+      { value: over.memo === undefined ? [a] : over.memo },
+      async () => {
+        reads += 1
+        return over.disk ?? [a]
+      },
+      async () => {
+        marks += 1
+      },
+    )
+    return result.then((wrote) => ({ wrote, marks, reads }))
+  }
+
+  it('InSync、wc.db 没变：写', async () => {
+    expect(await run({})).toEqual({ wrote: true, marks: 1, reads: 1 })
+  })
+
+  it('不该写的时候连 stat 都不发', async () => {
+    expect(await run({ verdict: 'externallyAdvanced' })).toEqual({ wrote: false, marks: 0, reads: 0 })
+    expect(await run({ checks: 1 })).toEqual({ wrote: false, marks: 0, reads: 0 })
+  })
+
+  it('jkk 在前台时 TortoiseSVN 提交完了：wc.db 已变，判定还是旧的，不写', async () => {
+    // 点了提交就切回 jkk，进度框在后台走完。这时写下的快照晚于这次提交，却会被当成早于它，
+    // 比这次提交新的暂存就会被当成中间版本丢掉
+    expect(await run({ disk: [a2] })).toEqual({ wrote: false, marks: 0, reads: 1 })
+  })
+
+  it('还没有过焦点检测（打开仓库之后第一次失焦）：没有戳可比，按判定写', async () => {
+    expect(await run({ memo: null, disk: [a2] })).toEqual({ wrote: true, marks: 1, reads: 0 })
+  })
+
+  it('读戳失败或写失败时抛给调用方', async () => {
+    const memo = { value: [a] }
+    await expect(
+      markOnBlur(
+        'inSync',
+        0,
+        memo,
+        async () => {
+          throw new Error('stat failed')
+        },
+        async () => {},
+      ),
+    ).rejects.toThrow('stat failed')
   })
 })

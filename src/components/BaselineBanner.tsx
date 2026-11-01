@@ -15,6 +15,7 @@ import {
   type SyncState,
   type SyncStateUnreadable,
 } from '../engine/svnJournal'
+import type { FollowActionId } from '../engine/svnFollow'
 import type { SyncActionId } from '../engine/svnSyncIn'
 import type { SyncOutActionId } from '../engine/svnSyncOut'
 import type { BannerAction } from '../engine/svnSync'
@@ -44,12 +45,22 @@ interface BaselineBannerProps {
   onCheck: () => void
   /** 走一次行尾迁移。调用方负责先弹确认。 */
   onMigrateEol: () => void
-  /** 未收尾同步横幅上「更新」那一组的「继续 / 放弃」。 */
-  onSyncAction: (id: SyncActionId) => void
+  /** 未收尾同步横幅上「更新」那一组的「继续 / 放弃」，以及跟进记录的「继续」。 */
+  onSyncAction: (id: SyncActionId | FollowActionId) => void
   /** 未收尾同步横幅上「交付」那一组的「清理 / 继续 / 停止」。 */
   onSyncOutAction: (id: SyncOutActionId) => void
-  /** 「工作副本已在外部更新」横幅上的「更新…」，与工具栏的「更新」是同一个入口。 */
+  /**
+   * 横幅上的「更新…」，与工具栏的「更新」是同一个入口。计划 Task 3 起整体前进归入
+   * 「SVN 侧有新内容」，出口改成「跟进」，`describeSync` 暂时不再产出这颗按钮。
+   */
   onSvnUpdate: () => void
+  /**
+   * 「SVN 侧有新内容」与「当前分支落后基线」横幅上的「跟进」。没传时不渲染这颗按钮：
+   * 留一颗点了没反应的按钮比没有更糟。
+   */
+  onFollow?: () => void
+  /** 跟进执行中。要走服务器体检，几秒里按钮要有反应，也不能再点一次。 */
+  followBusy?: boolean
 }
 
 /**
@@ -95,6 +106,8 @@ export function BaselineBanner({
   onSyncAction,
   onSyncOutAction,
   onSvnUpdate,
+  onFollow,
+  followBusy = false,
 }: BaselineBannerProps) {
   // 未收尾 / 同步进行中排在最前，其余一律让位：那两种状态下仓库停在中间态，
   // 别的横幅拿半推进的基线算出来的结论可能是错的，而它们的出口（重建基线）
@@ -106,6 +119,8 @@ export function BaselineBanner({
   const auditModel = hushed ? null : describeAudit(audit)
   const standalone = !hushed && needsStandaloneCheck(isSvn, sync, eol)
   const [copied, setCopied] = useState(false)
+  // 「跟进」只在调用方接了流程时才出现（见 `onFollow` 的说明）
+  const modelActions = (model?.actions ?? []).filter((a) => a.id !== 'follow' || onFollow)
 
   if (!unfinished && !eolModel && !model && !auditModel && !standalone) return null
 
@@ -125,11 +140,13 @@ export function BaselineBanner({
               {unfinished.actions.map((a) => (
                 // 按 id 分流：交付记录的按钮交给「更新」的继续 / 放弃，后端会以
                 // sync_out_not_supported 拒绝。其余只可能是 `syncActions` 的那两个值
-                // （Task 9 的测试钉着）
+                // 或跟进的 `followContinue`（Task 9 的测试钉着）
                 <button
                   key={a.id}
                   onClick={() =>
-                    isSyncOutAction(a.id) ? onSyncOutAction(a.id) : onSyncAction(a.id as SyncActionId)
+                    isSyncOutAction(a.id)
+                      ? onSyncOutAction(a.id)
+                      : onSyncAction(a.id as SyncActionId | FollowActionId)
                   }
                 >
                   {a.label}
@@ -165,12 +182,21 @@ export function BaselineBanner({
             <pre className="banner-baseline-command">{model.command}</pre>
           )}
           {model.note && <p className="banner-baseline-note">{model.note}</p>}
+          {model.files && model.files.length > 0 && (
+            <ul className="banner-baseline-files">
+              {model.files.map((f) => (
+                <li key={f}>{f}</li>
+              ))}
+            </ul>
+          )}
           <div className="banner-baseline-actions">
-            {model.actions.map((a) => (
+            {modelActions.map((a) => (
               <button
                 key={a.id}
+                disabled={a.id === 'follow' && followBusy}
                 onClick={() => {
-                  if (a.id === 'rebuild') onRebuild()
+                  if (a.id === 'follow') onFollow?.()
+                  else if (a.id === 'rebuild') onRebuild()
                   else if (a.id === 'check') onCheck()
                   else if (a.id === 'svnUpdate') onSvnUpdate()
                   else if (a.id === 'updateWhitelistDir' && model.command) {
@@ -182,7 +208,11 @@ export function BaselineBanner({
                   }
                 }}
               >
-                {a.id === 'updateWhitelistDir' && copied ? '已复制' : a.label}
+                {a.id === 'updateWhitelistDir' && copied
+                  ? '已复制'
+                  : a.id === 'follow' && followBusy
+                    ? '正在跟进…'
+                    : a.label}
               </button>
             ))}
           </div>

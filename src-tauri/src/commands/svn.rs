@@ -13,7 +13,12 @@
 //! `#[serde(rename_all = "camelCase")]`，并在 `tests/svn_backend.rs` 里用断言钉住
 //! 序列化后的字段名。
 
+use crate::engine::svn_config::set_svn_user;
 use crate::engine::svn_externals::PinnedExternal;
+use crate::engine::svn_follow::branches_behind;
+use crate::engine::svn_follow_mark::{
+    svn_user_info, wc_db_stamps, write_mark, SvnUserInfo, WcDbStamp,
+};
 use crate::engine::svn_health::Health;
 use crate::engine::svn_init::{
     check_current_baseline, eol_status, init_hybrid_with, init_preflight, migrate_eol,
@@ -197,6 +202,53 @@ pub fn svn_sync_status(path: String) -> Result<SyncStatus, GitError> {
 #[tauri::command(async)]
 pub fn svn_root_revs(path: String) -> Result<Vec<RootRev>, GitError> {
     read_root_revs(&path)
+}
+
+/// 记一份失焦快照（日志 Task 0「计划的错误」）。前端在「最近一次校验为 InSync」之后
+/// 窗口失焦时调用。只看索引与 HEAD，不扫工作区，不发 svn 命令。
+///
+/// 不是混合仓库时什么也不做：焦点事件不分仓库类型。没建过库的 SVN 工作副本更不能写，
+/// `.git` 一出现，§6.1 就把它认成 `SvnSuspicious`。
+#[tauri::command(async)]
+pub fn svn_follow_mark(path: String) -> Result<(), GitError> {
+    if detect_repo_kind(&path) != RepoKind::SvnHybrid {
+        return Ok(());
+    }
+    write_mark(&path)
+}
+
+/// 各工作副本 `wc.db` 的 mtime + size（分析 §6.6）。前端在窗口拿到焦点时调用，
+/// **与上次观测值比**，变了才跑第二档校验；上次观测值由前端持有。
+///
+/// wc.db 没变时只有几次 `stat`，不发 svn 命令。不是混合仓库时返回空列表。
+#[tauri::command(async)]
+pub fn svn_wc_db_stamps(path: String) -> Result<Vec<WcDbStamp>, GitError> {
+    if detect_repo_kind(&path) != RepoKind::SvnHybrid {
+        return Ok(Vec::new());
+    }
+    wc_db_stamps(&path)
+}
+
+/// 落后基线的本地分支（分析 §6.11.3）。不是混合仓库时返回空列表：`repo-changed` 不分仓库类型。
+#[tauri::command(async)]
+pub fn svn_branches_behind(path: String) -> Result<Vec<String>, GitError> {
+    if detect_repo_kind(&path) != RepoKind::SvnHybrid {
+        return Ok(Vec::new());
+    }
+    branches_behind(&path)
+}
+
+/// 「我的 SVN 用户名」：配置里的值与自动探测的结果，分开给（日志 D4）。探测可能跑一次
+/// `svn auth`，只读用户名，不进日志。
+#[tauri::command(async)]
+pub fn svn_get_user(path: String) -> Result<SvnUserInfo, GitError> {
+    svn_user_info(&path)
+}
+
+/// 写配置里的 `svnUser`，空串清除（日志 D4）。下一次跟进生效。
+#[tauri::command(async)]
+pub fn svn_set_user(path: String, user: String) -> Result<(), GitError> {
+    set_svn_user(&path, &user)
 }
 
 /// 读**缓存里**的 SVN 历史，**不走网络**。

@@ -22,6 +22,7 @@
 //! 它走网络、可能慢、可能失败。所以它的结论不进初始化 / 重建 / 交付的任何判定，
 //! 只在界面上多挂一条说明。误报的代价止于噪音，漏报的代价与改动前相同。
 
+use crate::engine::svn_basemap::BaseMap;
 use crate::engine::svn_cli::run_svn;
 use crate::engine::svn_config::{read_config, SvnConfig};
 use crate::engine::svn_dirty::{classify, read_dirty, Fix};
@@ -67,17 +68,30 @@ pub enum ServerAudit {
     NotChecked { reason: String },
 }
 
-/// 用**当前基线的 revision** 跑一次服务器侧核对。
+/// 用**当前基线的记账**跑一次服务器侧核对：floor 的清单，剔除墓碑路径。
 ///
-/// 基线还没建起来（或 trailer 读不出来）时返回 `NotChecked` 而不是 `Err`：
+/// 基线还没建起来（或记账读不出来）时返回 `NotChecked` 而不是 `Err`：
 /// 调用方是「打开仓库」那条热路径，没有基线是一个正常状态。
 pub fn audit_server_set_at_baseline(repo_root: &str) -> Result<ServerAudit> {
-    match crate::engine::svn_sync::read_baseline_rev(repo_root) {
-        Ok(rev) => audit_server_set(repo_root, rev),
+    match crate::engine::svn_sync::read_baseline_map(repo_root) {
+        Ok(map) => audit_server_set_map(repo_root, &map),
         Err(e) => Ok(ServerAudit::NotChecked {
             reason: format!("读不到基线 revision，没法核对服务器内容：{}", e.message),
         }),
     }
+}
+
+/// 按映射核对（计划 Task 4）：列 floor 上的服务器清单，墓碑路径不算缺失。
+///
+/// # 为什么是 floor、为什么要剔墓碑
+///
+/// - 基线树里单列在更新 revision 的文件，floor 上要么也有（之后才改过），要么没有
+///   （之后才加进来）；这条检查只报「服务器有、本地没有」，后者不会误报
+/// - 已提交删除的文件 floor 上还在、本地已没有，正是墓碑记着的那批。不剔掉就会被报成
+///   「服务器上有代码文件不在本地」，指控方向完全反了（分析 §6.4 末条）
+pub fn audit_server_set_map(repo_root: &str, map: &BaseMap) -> Result<ServerAudit> {
+    let gone: BTreeSet<String> = map.gone.keys().cloned().collect();
+    audit_inner(repo_root, map.floor, &gone)
 }
 
 /// 拿服务器在 `rev` 上的文件清单与磁盘上的 W-file 比一次。
@@ -92,6 +106,11 @@ pub fn audit_server_set_at_baseline(repo_root: &str) -> Result<ServerAudit> {
 /// 「服务器有、磁盘没有」的差集在空集上**恒为空** ⇒ 报告「没有漏收」。
 /// 那就是用修 NB-2 的代码重新造一个 NB-2。
 pub fn audit_server_set(repo_root: &str, rev: u64) -> Result<ServerAudit> {
+    audit_inner(repo_root, rev, &BTreeSet::new())
+}
+
+/// `gone`：墓碑路径，从「服务器有、本地没有」里剔除。
+fn audit_inner(repo_root: &str, rev: u64, gone: &BTreeSet<String>) -> Result<ServerAudit> {
     let cfg = read_config(repo_root)?;
     let scope = WScope::for_repo(repo_root, &cfg)?;
     if scope.roots().is_empty() {
@@ -193,7 +212,11 @@ pub fn audit_server_set(repo_root: &str, rev: u64) -> Result<ServerAudit> {
 
     // **只报这一个方向。** 反方向（磁盘有、服务器没有）是「本地新增还没 svn add」，
     // 完全正常；报了就是噪音，而噪音会让用户学会忽略这条提示。
-    let missing: Vec<String> = server.difference(&expected).cloned().collect();
+    let missing: Vec<String> = server
+        .difference(&expected)
+        .filter(|p| !gone.contains(*p))
+        .cloned()
+        .collect();
     if missing.is_empty() {
         return Ok(ServerAudit::Matched);
     }

@@ -14,14 +14,54 @@
  */
 export type SyncVerdict =
   | { kind: 'inSync' }
-  | { kind: 'mixedRevision'; revs: number[] }
+  | { kind: 'wcLocked'; dirs: string[] }
+  | {
+      kind: 'externallyAdvanced'
+      changed: ExternalChange[]
+      added: ExternalChange[]
+      removed: string[]
+    }
+  /** 只表示回退：有文件的节点 revision 比基线记的还旧（计划 Task 3）。 */
   | { kind: 'diverged'; nodeRev: number; baselineRev: number }
   | { kind: 'pinnedReset'; nodeRev: number; baselineRev: number; external: string }
 
+/** 后端 `svn_sync::ExternalChange`：SVN 侧有新内容的一个文件。 */
+export interface ExternalChange {
+  path: string
+  /** 最后修改 revision；后端读不到时给的是节点 revision。 */
+  rev: number
+  /** 匿名提交为 `null`。 */
+  author: string | null
+}
+
+/**
+ * 后端 `svn_follow_mark::WcDbStamp`。
+ *
+ * `mtimeNs` 是十进制**字符串**：纳秒时间戳超过 2^53，当 number 收会被舍入。只拿它比相等。
+ */
+export interface WcDbStamp {
+  wcRoot: string
+  mtimeNs: string
+  size: number
+}
+
+/** 后端 `svn_sync::BaseMapSummary`。 */
+export interface BaseMapSummary {
+  floor: number
+  /** 单列在更新 revision 的文件数。 */
+  newer: number
+  /** 墓碑数。 */
+  gone: number
+}
+
 export interface SyncStatus {
+  /** 基线映射的 floor。 */
   baselineRev: number
   nodeRevs: number[]
   verdict: SyncVerdict
+  base: BaseMapSummary
+  /** 当前分支不包含 `svn/base`，且分叉点是一条基线 commit：基线发布了，分支没跟上。 */
+  headBehindBase: boolean
 }
 
 /** 后端 `svn_server_set::ServerAudit`，判别字段是 `status`。 */
@@ -30,16 +70,19 @@ export type ServerAudit =
   | { status: 'missing'; files: string[]; total: number }
   | { status: 'notChecked'; reason: string }
 
-export type BannerTone = 'warn' | 'danger'
+/** `quiet` 是灰色：只告知、不需要用户动手（与常驻体检入口同一套样式）。 */
+export type BannerTone = 'warn' | 'danger' | 'quiet'
 
 export interface BannerAction {
   id:
+    | 'follow'
     | 'rebuild'
     | 'check'
     | 'updateWhitelistDir'
     | 'migrateEol'
     | 'syncContinue'
     | 'syncAbort'
+    | 'followContinue'
     | 'svnUpdate'
     | 'syncOutCleanup'
     | 'syncOutContinue'
@@ -62,6 +105,8 @@ export interface BannerModel {
   command?: string
   /** 补充说明，比如「重建基线不会碰工作目录」。 */
   note?: string
+  /** 逐行列出的文件（已排好版的展示文本）。 */
+  files?: string[]
 }
 
 export interface AuditModel {
@@ -90,25 +135,60 @@ export function describeSync(status: SyncStatus | null): BannerModel | null {
   const v = status.verdict
   switch (v.kind) {
     case 'inSync':
-      return null
-
-    case 'mixedRevision':
-      // 不给「重建基线」：失同步判定（svn_sync::node_revs）与重建开头的 P2 查的是
-      // 同一组 target，这里判成多值，重建就**一定**以 svn_preflight_mixed_revision
-      // 拒绝（2026-10-28 发现的死路）。唯一的出口是先在外部 update 对齐，之后判定
-      // 变成整体前进，「更新」接管（计划 A16）
+      // 基线与工作副本一致，但当前分支还在更早的基线上：上次跟进遇到冲突，或者切到了一条旧分支
+      // （分析 §6.11.3）。这时「本地改动」是相对旧内容算的，要给「分支跟进」的入口
+      if (!status.headBehindBase) return null
       return {
-        tone: 'danger',
-        title: '工作副本处于多个 revision',
+        tone: 'warn',
+        title: '当前分支落后基线',
         detail:
-          `白名单内的文件分别停在 r${v.revs.join('、r')} 上。` +
-          '多半是在 TortoiseSVN 里提交过、之后没有 update，或只更新了一部分目录——' +
-          `基线记的是 r${status.baselineRev}，已经不能代表磁盘上的内容。` +
-          '先在 TortoiseSVN 里对工程根目录跑一次 Update 把它对齐，' +
-          '之后这条横幅会换成下一步该做什么。',
-        actions: [CHECK],
-        note: '这种状态下「重建基线」和「更新」都会被拒：录不出一个标着单一 revision 的基线。',
+          '基线已经前进，当前分支还停在更早的基线上，「本地改动」里会多出基线带进来的文件。' +
+          '点「跟进」把这条分支的提交重放到新基线上，不会改动工作目录里的任何文件。' +
+          // Review 3 第 2 条：只移分支的话，磁盘上的旧内容会显示成把 SVN 的内容改回去
+          '如果是用「仅切换」或别的工具切过来的，磁盘上还是这条分支的旧内容（TortoiseSVN 显示为已修改），' +
+          '跟进会改为提示「手动跟进」：那一步会把新内容写回磁盘。',
+        actions: [{ id: 'follow', label: '跟进' }],
       }
+
+    case 'wcLocked':
+      // E15：活锁（TortoiseSVN 正在提交 / 更新）与陈旧锁（进程被杀）分不出来。
+      // 不给按钮：活锁等它做完就好，陈旧锁要用户自己在 TortoiseSVN 里 Clean up，
+      // 本应用不替他跑 cleanup
+      return {
+        tone: 'quiet',
+        title: 'SVN 正在更新…',
+        detail:
+          `工作副本被 SVN 锁着（${v.dirs.join('、')}），可能有 TortoiseSVN 操作正在进行。` +
+          '等它做完这条提示会自己消失；如果一直不消失，说明上次操作中途断了，' +
+          '请在 TortoiseSVN 里对该目录执行 Clean up。',
+        actions: [],
+      }
+
+    case 'externallyAdvanced': {
+      // 分析 §6.10：只给「跟进」。不给「体检基线」：此时体检用的还是旧基线，必然把这些文件
+      // 报成「基线与服务器不符」，而跟进本身就包含体检。措辞不说「你提交了」：局部 update
+      // 拉下的同事改动也是这个判定，作者列出来让用户自己分辨
+      const n = v.changed.length + v.added.length + v.removed.length
+      const by = (c: ExternalChange) => (c.author ? `  ${c.author}` : '')
+      const files = [
+        ...v.changed.map((c) => `${c.path}  r${c.rev}${by(c)}`),
+        ...v.added.map((c) => `${c.path}  r${c.rev}${by(c)}（新增）`),
+        // 不写「已在 SVN 上删除」：本地分不出提交删除与 `--set-depth=exclude` 漏收（E17），
+        // 要跟进时向服务器确认才知道
+        ...v.removed.map((p) => `${p}（工作副本里已没有）`),
+      ]
+      return {
+        tone: 'warn',
+        title: `SVN 侧有 ${n} 个文件有新内容`,
+        detail:
+          '这些文件在 SVN 上已经是更新的版本（在 TortoiseSVN 里提交过，或更新了部分目录），' +
+          `基线还停在旧的内容上（r${status.baselineRev}）。` +
+          '此刻「本地改动」里会把它们也算进去；点「跟进」把基线推进到各文件的真实 revision，' +
+          '不会改动工作目录里的任何文件。',
+        actions: [{ id: 'follow', label: '跟进' }],
+        files,
+      }
+    }
 
     case 'pinnedReset':
       // spec §6.6.2 点名的那个「具体且常见」的成因。**不要给重建基线**：
@@ -126,32 +206,18 @@ export function describeSync(status: SyncStatus | null): BannerModel | null {
         command: `svn update ${v.external}`,
       }
 
-    case 'diverged': {
-      // 计划 A16：前进是每天早上在 TortoiseSVN 里对项目根 update 的日常结果，
-      // 给出口、降成黄色；回退照旧是红色，「更新」对它会拒绝
-      if (v.nodeRev > v.baselineRev) {
-        return {
-          tone: 'warn',
-          title: '工作副本已在外部更新',
-          detail:
-            `工作副本已经前进到 r${v.nodeRev}，基线还记着 r${v.baselineRev}——` +
-            '在 TortoiseSVN 里对项目根点过 update 就会这样。' +
-            '此刻「本地改动」里服务器的改动和你自己的改动混在一起；' +
-            '点「更新」会先把基线跟上，再把两者重新分开。',
-          actions: [{ id: 'svnUpdate', label: '更新…' }, REBUILD, CHECK],
-          note: REBUILD_NOTE,
-        }
-      }
+    case 'diverged':
+      // 计划 Task 3 起只表示回退：前进（含原 A16 的整体前进）一律是 externallyAdvanced。
+      // 回退是红色，「更新」对它会拒绝
       return {
         tone: 'danger',
         title: '工作副本被回退到了基线之前',
         detail:
-          `工作副本被回退到了 r${v.nodeRev}，而基线记着 r${v.baselineRev}。` +
+          `工作副本里有文件被回退到了 r${v.nodeRev}，而基线记着它在 r${v.baselineRev}。` +
           '基线比磁盘还新，任何基于它的比较都不成立。',
         actions: [REBUILD, CHECK],
         note: REBUILD_NOTE,
       }
-    }
   }
 }
 
@@ -380,5 +446,75 @@ export async function syncIfRootRevChanged(
   const now = await readRootRevs()
   if (now === memo.value) return false
   await recordAfterSuccess(memo, now, runFullCheck)
+  return true
+}
+
+/** 焦点检测的「上次观测值」。`null` = 还没成功校验过。放 ref 的理由同 {@link RootRevMemo}。 */
+export interface WcDbStampMemo {
+  value: WcDbStamp[] | null
+}
+
+/** 这次读到的戳与上次比。工作副本多了、少了、换了都算变（外部增删 external，日志 Task 9）。 */
+export function wcDbStampsChanged(prev: WcDbStamp[] | null, next: WcDbStamp[]): boolean {
+  if (!prev || prev.length !== next.length) return true
+  const seen = new Map(prev.map((s) => [s.wcRoot, s]))
+  return next.some((s) => {
+    const old = seen.get(s.wcRoot)
+    return !old || old.mtimeNs !== s.mtimeNs || old.size !== s.size
+  })
+}
+
+/**
+ * 窗口拿到焦点时的检测（分析 §6.6）：wc.db 变了才跑第二档校验。
+ *
+ * 来回切窗口很频繁，而第二档要跑 `svn status`，这里只有几次 `stat`。`svn status` 不写 wc.db
+ * （E19），所以校验本身不会让下一次判成变了。
+ *
+ * 记录的规矩同 {@link recordAfterSuccess}：记开跑之前读到的值，校验成功之后才记。
+ */
+export async function syncIfWcDbChanged(
+  memo: WcDbStampMemo,
+  readStamps: () => Promise<WcDbStamp[]>,
+  runFullCheck: () => Promise<void>,
+): Promise<boolean> {
+  const stamps = await readStamps()
+  if (!wcDbStampsChanged(memo.value, stamps)) return false
+  await runFullCheck()
+  memo.value = stamps
+  return true
+}
+
+/**
+ * 窗口失焦时要不要记快照（日志 Task 0，W26）。
+ *
+ * 快照的价值在于「它一定早于接下来的外部提交」。所以只在确认过 InSync 时写，而且校验正在跑时
+ * 不写：焦点刚回来、结论还没出，这时写下的快照可能晚于外部提交，却会被当成早于（Review 2 遗留）。
+ * 不写只是用上一份更旧的快照或者走「拿不准」，方向是保守的。
+ */
+export function shouldMarkOnBlur(
+  verdict: SyncVerdict['kind'] | null,
+  checksRunning: number,
+): boolean {
+  return verdict === 'inSync' && checksRunning === 0
+}
+
+/**
+ * 失焦时记快照。多看一眼 wc.db：TortoiseSVN 的进度框还在走时切回 jkk，提交在 jkk 前台时完成，
+ * 焦点事件已经过去了，判定还是旧的 InSync，这时写下的快照同样晚于外部提交。
+ *
+ * 没有戳可比（打开仓库之后还没有过焦点检测）时按判定写，这是唯一会放过这种情形的窗口。
+ *
+ * @returns 是否写了
+ */
+export async function markOnBlur(
+  verdict: SyncVerdict['kind'] | null,
+  checksRunning: number,
+  memo: WcDbStampMemo,
+  readStamps: () => Promise<WcDbStamp[]>,
+  mark: () => Promise<void>,
+): Promise<boolean> {
+  if (!shouldMarkOnBlur(verdict, checksRunning)) return false
+  if (memo.value && wcDbStampsChanged(memo.value, await readStamps())) return false
+  await mark()
   return true
 }

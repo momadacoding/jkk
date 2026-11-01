@@ -8,6 +8,7 @@
 
 use crate::engine::svn_cli::run_svn;
 use crate::engine::svn_dirty::read_dirty;
+use crate::engine::svn_nodes::{read_node_status, NodeStatus};
 use crate::engine::svn_wc::{check_single_repository, enumerate_wcs, peg_safe, WcIdentity};
 use crate::engine::svn_xml::{parse_node_rev_entries, parse_status_entries, StatusEntry};
 use crate::error::{GitError, Result};
@@ -39,6 +40,12 @@ pub struct Preflight {
     /// 不走这个字段。
     #[serde(skip)]
     pub dirty: Vec<StatusEntry>,
+    /// 允许混合版本时（[`run_preflight_with`] 的 `allow_mixed`）读到的节点状态，录制拿它算映射
+    /// （计划 Task 5）。不允许混合时为 `None`：P2 只读 revision，不读这份。
+    ///
+    /// 不过 IPC，理由同 `dirty`。
+    #[serde(skip)]
+    pub nodes: Option<Vec<NodeStatus>>,
 }
 
 /// 一次跑完 P1–P4；全过则返回录基线需要的三个事实，任一不过返回 `Err`。
@@ -65,6 +72,29 @@ pub struct Preflight {
 ///
 /// [`parse_node_revs`]: crate::engine::svn_xml::parse_node_revs
 pub fn run_preflight(repo_root: &str, whitelist: &[String]) -> Result<Preflight> {
+    run_preflight_with(repo_root, whitelist, false)
+}
+
+/// 同 [`run_preflight`]；`allow_mixed` 为真时不做 P2（单值要求），改读一次节点状态，
+/// 并补上录混合基线所需的 R1 拒绝（分析 §6.3 R1，计划 Task 5）：
+///
+/// | 拒绝 | 为什么 |
+/// |---|---|
+/// | SVN 冲突（文本 / 属性 / 树冲突） | 冲突文件按「取回 BASE」录（`svn_dirty::classify`），带冲突标记的磁盘内容会被当成普通本地改动收下，体检照样通过 |
+/// | 任一目录 `wc-locked` | svn 操作正在进行或中途被杀（E15），录到的可能是半更新的中间态。P3 只看工作副本根，锁在子目录上时看不到 |
+///
+/// `~`、未完成的 update（P3）、跨仓库（P4）与单值时相同。
+///
+/// 初始化（分析 §10 Q4）与重建用 `true`；交付后的 D7 仍用 [`run_preflight`]：D6 刚把白名单
+/// 更新到同一个 revision，那里出现混合版本说明出了别的事。
+///
+/// `node_rev` 此时取所有节点（含目录）revision 的最小值，只给向导展示；真正的 floor 由
+/// `svn_nodes::compute_map` 按基线树的文件算。
+pub fn run_preflight_with(
+    repo_root: &str,
+    whitelist: &[String],
+    allow_mixed: bool,
+) -> Result<Preflight> {
     let roots = whitelist_roots(whitelist);
     if roots.is_empty() {
         return Err(GitError::new(
@@ -80,7 +110,26 @@ pub fn run_preflight(repo_root: &str, whitelist: &[String]) -> Result<Preflight>
     check_no_operation_in_progress(repo_root, &wcs)?; // P3
     let targets = check_targets(&roots, &wcs);
     let dirty = collect_dirty(repo_root, &targets)?; // P1
-    let node_rev = check_single_node_rev(repo_root, &roots, &targets, &wcs)?; // P2
+    let (node_rev, nodes) = if allow_mixed {
+        let nodes = read_node_status(repo_root, whitelist, &wcs)?;
+        check_recordable(&dirty, &nodes)?; // R1
+        let floor = nodes
+            .iter()
+            .filter_map(|n| n.node_rev)
+            .min()
+            .ok_or_else(|| {
+                GitError::new(
+                    "svn_preflight",
+                    "没读到任何 revision——这本该由 parse_node_status 的空集守卫拦下",
+                )
+            })?;
+        (floor, Some(nodes))
+    } else {
+        (
+            check_single_node_rev(repo_root, &roots, &targets, &wcs)?, // P2
+            None,
+        )
+    };
 
     let first = wcs.first().ok_or_else(|| {
         GitError::new(
@@ -93,7 +142,64 @@ pub fn run_preflight(repo_root: &str, whitelist: &[String]) -> Result<Preflight>
         repos_root: first.repos_root.clone(),
         uuid: first.uuid.clone(),
         dirty,
+        nodes,
     })
+}
+
+/// 录混合基线前的 R1 补充拒绝：SVN 冲突与目录上的写锁。见 [`run_preflight_with`]。
+fn check_recordable(dirty: &[StatusEntry], nodes: &[NodeStatus]) -> Result<()> {
+    let mut conflicted: BTreeSet<String> = nodes
+        .iter()
+        .filter(|n| n.item == "conflicted" || n.tree_conflicted)
+        .map(|n| n.path.clone())
+        .collect();
+    // 只有属性冲突时 item 仍是 normal，节点状态里看不出来，要看 `props`
+    conflicted.extend(
+        dirty
+            .iter()
+            .filter(|e| e.item == "conflicted" || e.props == "conflicted")
+            .map(|e| e.path.replace('\\', "/")),
+    );
+    if !conflicted.is_empty() {
+        let list: Vec<&String> = conflicted.iter().collect();
+        return Err(GitError::new(
+            "svn_preflight_conflicted",
+            format!(
+                "白名单内有 {} 处 SVN 冲突还没处理：\n{}\n\
+                 冲突的文件磁盘上带着冲突标记，录进基线就等于把冲突当成了服务器内容。\
+                 请先在 TortoiseSVN 里解决（Resolve）后再试。",
+                list.len(),
+                shown_paths(&list)
+            ),
+        ));
+    }
+    let locked: Vec<&String> = nodes
+        .iter()
+        .filter(|n| n.wc_locked)
+        .map(|n| &n.path)
+        .collect();
+    if !locked.is_empty() {
+        return Err(GitError::new(
+            "svn_preflight_operation_in_progress",
+            format!(
+                "下面这些目录上有一把没释放的写锁（svn status 的 `L`）：\n{}\n\
+                 TortoiseSVN 可能正在提交或更新，也可能上一次操作中途被杀了（两者分不出来）。\
+                 这种状态下录到的可能是一棵半更新的树。等它做完再试；\
+                 确认没有 svn 操作在跑的话，先在 TortoiseSVN 里对这个目录跑一次 Cleanup。",
+                shown_paths(&locked)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// 路径清单给人看：最多 20 条。
+fn shown_paths(paths: &[&String]) -> String {
+    let mut s: Vec<String> = paths.iter().take(20).map(|p| format!("  - {p}")).collect();
+    if paths.len() > 20 {
+        s.push(format!("  ……另有 {} 条未列出", paths.len() - 20));
+    }
+    s.join("\n")
 }
 
 /// 只重读一次 `nodeRevs`，不做别的校验（spec §16 R3c）。

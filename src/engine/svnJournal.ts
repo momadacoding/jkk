@@ -38,9 +38,10 @@ export type SyncPhase =
   | 'publishing-baseline'
   | 'baseline-ready'
   | 'applying-stash'
+  | 'follow-publishing'
 
 export interface UnfinishedSync {
-  flow: 'sync_in' | 'sync_out'
+  flow: 'sync_in' | 'sync_out' | 'follow' | 'follow_manual'
   phase: SyncPhase | SyncOutPhase
   opid: string
   startedAt: number
@@ -97,6 +98,10 @@ const PHASE_DETAIL: Record<SyncPhase, string> = {
     '这部分状态由 git 自己记着，没有丢失风险。',
   'applying-stash':
     '基线已经更新，正在把未提交的改动放回来。如果提示冲突或有同名文件，处理好之后点继续；改动的备份一直在 stash 里。',
+  // 跟进不写磁盘：用户最关心的「我的文件还在不在」答案与更新完全不同
+  'follow-publishing':
+    '跟进发布到一半就中断了。磁盘上的文件一个都没动，暂存区的旧内容也钉着，找得回来。' +
+    '基线和分支可能只移动了一部分，所以暂存区可能暂时不可用，或者看起来不对。',
 }
 
 /**
@@ -107,8 +112,19 @@ const APPLYING_STASH_BACK =
   '这次更新已经退回，分支回到了更新前的位置，正在把未提交的改动放回来。' +
   '如果提示冲突或有同名文件，处理好之后点继续；改动的备份一直在 stash 里。'
 
+const NOTE_FOLLOW =
+  '点「继续」把这次跟进走完；走不下去时会先把分支移回原处，再重新跟进一次。在这之前请不要手工删 index.lock 或移动分支指针。'
+
 const NOTE_SYNC_IN =
   '点「继续」从中断的地方接着走；点「放弃」回到更新前。两者都不会丢掉你的提交和未提交的改动。'
+
+/** 手动跟进放弃途中停下，同 {@link APPLYING_STASH_BACK}。 */
+const APPLYING_STASH_BACK_MANUAL =
+  '这次手动跟进已经退回，分支回到了原来的位置，正在把未提交的改动放回来。' +
+  '如果提示冲突或有同名文件，处理好之后点继续；改动的备份一直在 stash 里。'
+
+const NOTE_FOLLOW_MANUAL =
+  '点「继续」从中断的地方接着走；点「放弃」回到手动跟进之前，基线保持在新的位置。两者都不会丢掉你的提交和未提交的改动。'
 
 /** 「已经持续多久」。与后端 `svn_lock::describe_age` 同一套说法。 */
 export function sinceText(startedAt: number, nowSecs: number): string {
@@ -193,13 +209,32 @@ export function describeUnfinishedSync(
     }
   }
 
+  // 同样先于下面：跟进的恢复命令是 `svn_follow_continue`，「更新」的继续 / 放弃会拒绝这条记录。
+  // 只给「继续」：恢复本身就会走到一致状态，C1a 没有放弃入口
+  if (s.unfinished.flow === 'follow') {
+    const known = s.unfinished.phase === 'follow-publishing'
+    return {
+      tone: 'danger',
+      title: '上次跟进没有正常结束',
+      detail: known
+        ? PHASE_DETAIL['follow-publishing']
+        : `跟进停在「${s.unfinished.phase}」这一步，这个版本的界面还不认识它。请不要手工去动分支指针，记录都还在。`,
+      actions: known ? [{ id: 'followContinue', label: '继续' }] : [],
+      note: known ? NOTE_FOLLOW : undefined,
+    }
+  }
+
   // 认不出的 phase 必须有话说。`sync_out` 已在上面分流，这里只剩 `sync_in` 的记录，
   // 但它的 phase 仍可能是交付流程的名字（手写 / 别的版本写的），而 `PHASE_DETAIL[未知]`
   // 是 `undefined`——那会渲染出一条只有标题、没有正文的红条，比说「我不认识」更糟。
   const back = s.unfinished.phase === 'applying-stash' && s.unfinished.rollingBack === true
+  // 手动跟进沿用这组阶段与按钮（继续 / 放弃走 `svn_sync_continue` / `svn_sync_abort`），只换说法
+  const manual = s.unfinished.flow === 'follow_manual'
   const detail =
     (back
-      ? APPLYING_STASH_BACK
+      ? manual
+        ? APPLYING_STASH_BACK_MANUAL
+        : APPLYING_STASH_BACK
       : (PHASE_DETAIL as Record<string, string | undefined>)[s.unfinished.phase]) ??
     `流程停在「${s.unfinished.phase}」这一步，这个版本的界面还不认识它` +
       '（多半是更新之后留下的记录）。请不要手工去动 stash 或分支指针，' +
@@ -207,10 +242,10 @@ export function describeUnfinishedSync(
 
   return {
     tone: 'danger',
-    title: '上次同步没有正常结束',
+    title: manual ? '上次手动跟进没有正常结束' : '上次同步没有正常结束',
     detail,
-    actions: syncActions(s.unfinished.phase),
-    note: NOTE_SYNC_IN,
+    actions: syncActions(s.unfinished.phase, manual ? '放弃，回到手动跟进前' : undefined),
+    note: manual ? NOTE_FOLLOW_MANUAL : NOTE_SYNC_IN,
   }
 }
 
@@ -256,7 +291,12 @@ export function svnSyncBlockedReason(s: SyncState | SyncStateUnreadable | null):
       : '有一次同步正在进行，等它结束'
   }
   if (s.unfinished) {
-    const what = s.unfinished.flow === 'sync_out' ? '交付' : '更新'
+    const what = {
+      sync_in: '更新',
+      sync_out: '交付',
+      follow: '跟进',
+      follow_manual: '手动跟进',
+    }[s.unfinished.flow]
     return `上次${what}没有收尾，先用上方横幅里的按钮处理`
   }
   return null

@@ -1020,11 +1020,12 @@ fn abandoning_after_the_commit_leaves_a_state_that_update_takes_over() {
     );
     assert!(svn_journal::read(&fx.wc_str()).unwrap().is_none());
     assert_eq!(git(&fx, &["for-each-ref", "refs/mygitclient/deliver/"]), "");
-    match check_sync(&fx.wc_str()).unwrap().verdict {
-        SyncVerdict::Diverged {
-            node_rev,
-            baseline_rev,
-        } => assert_eq!((node_rev, baseline_rev), (2, 1)),
+    // 整体前进（D6 已拉齐）：计划 Task 3 起判成 ExternallyAdvanced，节点 revision 单值 r2
+    let st = check_sync(&fx.wc_str()).unwrap();
+    match st.verdict {
+        SyncVerdict::ExternallyAdvanced { .. } => {
+            assert_eq!((st.node_revs.clone(), st.baseline_rev), (vec![2], 1))
+        }
         v => panic!("应是整体前进，实际 {v:?}"),
     }
     // 「更新」接管（2c 的 A16）：已交付的 commit 在 rebase 时变空、被丢掉

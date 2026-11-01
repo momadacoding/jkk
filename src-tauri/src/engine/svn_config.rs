@@ -9,6 +9,8 @@
 use crate::error::{GitError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// 基线分支名是**固定值**，不是可配项。
 ///
@@ -52,6 +54,13 @@ pub struct SvnConfig {
     /// 建库时被改名停用的 `.gitignore`。只做记录，供以后排查；不进任何命令行。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_gitignores: Vec<DisabledGitignore>,
+    /// 「我的 SVN 用户名」（分析 §6.10）：跟进时判断外部提交是不是自己做的。只与
+    /// `svn status` 的 `<commit author>` 比相等，不进任何命令行，所以不用过 `validate`。
+    ///
+    /// 缺省 `None`，且为 `None` 时不写进文件：已有仓库的配置文件不变。此时
+    /// `svn_follow_mark::my_svn_user` 退回 `svn auth`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub svn_user: Option<String>,
 }
 
 /// 一次改名停用：原路径 → 新路径，都是仓库相对路径、正斜杠。
@@ -123,6 +132,67 @@ pub fn write_config(repo_root: &str, cfg: &SvnConfig) -> Result<()> {
         .map_err(|e| GitError::new("svn_config", format!("配置序列化失败: {e}")))?;
     std::fs::write(&path, format!("{json}\n"))?;
     Ok(())
+}
+
+/// 改「我的 SVN 用户名」（分析 §6.10，日志 D4）。空串或全空白就是清除，键从文件里删掉。
+///
+/// **不走 [`write_config`]：** 用户是在跟进报告里顺手填一个名字，这一步不该有别的后果。
+/// - `write_config` 要过 [`validate_new_extensions`]，旧版本写下的扩展名过不了（它们读得出来、
+///   仓库半能用，只在源头挡），存个用户名不能因此报错
+/// - 经 [`SvnConfig`] 走一遍会把白名单规范化，并丢掉这个版本不认识的字段：这个文件是用户手写的
+///
+/// 所以只动这一个键，其余原样写回（键序不保证，JSON 不在乎）。先 [`read_config`]：文件不存在或
+/// 坏了就报错，不写，`.git/mygitclient.json` 一出现目录就被认成混合仓库。临时文件 + rename：
+/// 这个文件每次刷新都有人读，写一半被读到就是一条「配置坏了」的红条。
+pub fn set_svn_user(repo_root: &str, user: &str) -> Result<()> {
+    read_config(repo_root)?;
+    let path = config_path(repo_root);
+    let bad = |e: serde_json::Error| GitError::new("svn_config", format!("配置文件读写失败: {e}"));
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path)?).map_err(bad)?;
+    let fields = doc
+        .as_object_mut()
+        .ok_or_else(|| GitError::new("svn_config", "配置文件不是 JSON 对象"))?;
+    match user.trim() {
+        "" => {
+            fields.remove("svnUser");
+        }
+        me => {
+            fields.insert("svnUser".to_string(), me.into());
+        }
+    }
+    let json = serde_json::to_string_pretty(&doc).map_err(bad)?;
+    // 临时文件名每次不同（Review 3 第 3 条）：固定的名字下两次写同时进来，一边的 rename 会把另一边
+    // 的临时文件拿走
+    let tmp = path.with_extension(format!(
+        "json.{}-{}.tmp",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&tmp, format!("{json}\n"))?;
+    replace_file(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        GitError::new("io", format!("替换配置文件失败: {e}"))
+    })
+}
+
+/// 本进程内临时文件名的序号。
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// rename 被别的进程（杀毒、索引、另一个读配置的线程）短暂占着目标时的退避，合计约 1.5 秒。
+/// 与 `svn_follow_index` 换入索引同一口径（W24）。
+const RENAME_BACKOFF_MS: [u64; 6] = [50, 100, 150, 250, 400, 550];
+
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    for wait in RENAME_BACKOFF_MS {
+        match std::fs::rename(from, to) {
+            Err(e) if cfg!(windows) && matches!(e.raw_os_error(), Some(5 | 32)) => {
+                std::thread::sleep(Duration::from_millis(wait))
+            }
+            r => return r,
+        }
+    }
+    std::fs::rename(from, to)
 }
 
 /// 新写入的扩展名里允许出现的非字母数字字符。

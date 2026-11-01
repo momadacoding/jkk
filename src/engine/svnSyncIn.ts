@@ -15,7 +15,10 @@ export interface SyncInPreview {
   baselineOid: string
   baselineRev: number
   targetRev: number
-  /** 计划 A16：工作副本已被外部整体 update 到的 revision；`null` 表示没有。 */
+  /**
+   * 计划 A16：要先把基线跟上时，跟上之后的 floor；`null` 表示不需要。整体 update 时就是那个
+   * revision；计划 Task 5 起只提交不更新、局部更新也接管，floor 可能等于 `baselineRev`。
+   */
   catchUpRev: number | null
   outsideChanges: string[]
 }
@@ -46,6 +49,14 @@ export type SyncInOutcome =
    * ——磁盘上的改动经过了人手，证明不了还完整（PR #49 review 第四轮 P1-2）。
    */
   | { kind: 'settled'; stashOid: string; rolledBack: boolean }
+  /**
+   * 收尾了，改动内容都放回来了，但「已暂存」的状态没保住：手动跟进带 `--index` 放不回去，或者
+   * 更新时有暂存版本与磁盘不同（Review 3 第 1 条）。`newRev` 为 null 时收尾的是一次放弃。
+   *
+   * 备份不删：`files` 的暂存版本只在 `stashOid` 那条 stash 里。`stashOid` 为 null 只出现在崩溃恢复、
+   * stash 已被外部删掉时。
+   */
+  | { kind: 'stageLost'; newRev: number | null; stashOid: string | null; files: string[] }
 
 /** 与 `ConfirmRequest` 同名的那几个字段，组件直接展开。 */
 export interface SyncConfirmModel {
@@ -90,8 +101,35 @@ function shortOid(oid: string): string {
   return oid.slice(0, 10)
 }
 
+/**
+ * 「已暂存」没保住时，暂存的那一份在哪、怎么取回（Review 3 第 1 条）。更新与手动跟进共用。
+ *
+ * 命令里给完整 OID：用户要照抄。`git restore --staged` 只写暂存区，不碰磁盘上现在的版本。
+ */
+export function stageLostDetail(o: Extract<SyncInOutcome, { kind: 'stageLost' }>): string {
+  const head = '未提交的改动内容都放回来了，但「已暂存」的状态没保住，现在都显示为未暂存。'
+  const oid = o.stashOid
+  if (!oid) return `${head}需要的话重新暂存一次。`
+  const where = `stash 列表里的 mygitclient-sync:…（${oid}）`
+  if (o.files.length === 0) {
+    return (
+      `${head}暂存的内容磁盘上都有。为防万一，原始备份没有删，还在${where}，` +
+      '确认没问题之后可以自己删掉。'
+    )
+  }
+  return (
+    `${head}下面这些文件暂存的版本与磁盘上的不同：\n${listFiles(o.files)}\n\n` +
+    `暂存的那一份没有丢，原样留在${where}，不要当成垃圾清掉。取回办法：\n` +
+    `· 查看：git show ${oid}^2:<文件>\n` +
+    `· 放回暂存区（不动磁盘）：git restore --source=${oid}^2 --staged -- <文件>\n` +
+    `也可以在侧栏的 STASHES 里找到这一条。另有 refs/mygitclient/sync/ 下的一个引用钉着它，确认不再需要时一并删掉。`
+  )
+}
+
 /** 计划 A8：S10 用不带 `--index` 的 stash apply。 */
-export const STAGING_NOTE = '「已暂存」的状态不会保留：改动内容都会放回来，只是需要重新暂存。'
+export const STAGING_NOTE =
+  '「已暂存」的状态不会保留：改动内容都会放回来，只是需要重新暂存。' +
+  '暂存的版本与磁盘不同的文件，暂存的那一份会留在 stash 里，结束时会告诉你。'
 
 export function describeSyncInPreview(p: SyncInPreview): SyncConfirmModel {
   // 计划 A16：外部整体 update 过时，先跟上的那个 revision 才是这次更新的起点
@@ -99,10 +137,17 @@ export function describeSyncInPreview(p: SyncInPreview): SyncConfirmModel {
   const catchUp =
     p.catchUpRev === null
       ? ''
-      : `工作副本已经在外部（TortoiseSVN）更新到了 r${p.catchUpRev}，基线还停在 r${p.baselineRev}，` +
-        '所以「本地改动」里服务器的改动和你自己的改动现在混在一起。' +
-        `这次会先按服务器 r${p.catchUpRev} 的原版把基线跟上（不碰你的文件），` +
-        '再把你的提交和未提交改动整理到新基线上，两者会重新分开。\n\n'
+      : p.catchUpRev > p.baselineRev
+        ? `工作副本已经在外部（TortoiseSVN）更新到了 r${p.catchUpRev}，基线还停在 r${p.baselineRev}，` +
+          '所以「本地改动」里服务器的改动和你自己的改动现在混在一起。' +
+          `这次会先按服务器 r${p.catchUpRev} 的原版把基线跟上（不碰你的文件），` +
+          '再把你的提交和未提交改动整理到新基线上，两者会重新分开。\n\n'
+        : // 计划 Task 5：只提交不更新、或只更新了部分目录。floor 没动，但有文件已经在更新的
+          // revision 上——说「更新到了 r1」是错的
+          `工作副本里有文件在外部（TortoiseSVN）提交过或单独更新过，基线还停在 r${p.baselineRev}，` +
+          '所以「本地改动」里已经进了 SVN 的内容和你还没提交的改动现在混在一起。' +
+          '这次会先按这些文件在服务器上的原版把基线跟上（不碰你的文件），' +
+          '再把你的提交和未提交改动整理到新基线上，两者会重新分开。\n\n'
   const update =
     p.targetRev <= from
       ? p.catchUpRev === null
@@ -183,19 +228,29 @@ export function describeSyncOutcome(o: SyncInOutcome): OutcomeNotice | null {
           `为防万一，改动的原始备份没有删，还在 stash 列表里（mygitclient-sync:…，${shortOid(o.stashOid)}）。` +
           '确认工作区里的内容没问题之后，可以自己把它删掉。',
       }
+    case 'stageLost':
+      // 更新不带 `--index`：有暂存版本与磁盘不同时备份留在 stash 里（Review 3 第 1 条）
+      return {
+        tone: 'attention',
+        title: o.newRev === null ? '已放弃这次更新，暂存状态没保住' : '更新完成，暂存状态没保住',
+        detail: (o.newRev === null ? '分支已回到更新前的位置。' : '') + stageLostDetail(o),
+      }
   }
 }
 
 const CONTINUE: BannerAction = { id: 'syncContinue', label: '继续' }
-const ABORT: BannerAction = { id: 'syncAbort', label: '放弃，回到更新前' }
 
-/** 横幅上的按钮。认不出的 phase（比如出现在更新记录里的交付阶段名）不给按钮。 */
-export function syncActions(phase: string): BannerAction[] {
+/**
+ * 横幅上的按钮。认不出的 phase（比如出现在更新记录里的交付阶段名）不给按钮。
+ * 手动跟进沿用这组按钮，`abortLabel` 换掉那句「回到更新前」。
+ */
+export function syncActions(phase: string, abortLabel = '放弃，回到更新前'): BannerAction[] {
+  const abort: BannerAction = { id: 'syncAbort', label: abortLabel }
   switch (phase) {
     case 'start':
       return [{ id: 'syncAbort', label: '清除这条记录' }]
     case 'rebase':
-      return [{ id: 'syncContinue', label: '我已解决，继续' }, ABORT]
+      return [{ id: 'syncContinue', label: '我已解决，继续' }, abort]
     case 'applying-stash':
       return [{ id: 'syncContinue', label: '我已处理，继续' }, { id: 'syncAbort', label: '不再自动放回' }]
     case 'stashing':
@@ -203,7 +258,7 @@ export function syncActions(phase: string): BannerAction[] {
     case 'capturing-baseline':
     case 'publishing-baseline':
     case 'baseline-ready':
-      return [CONTINUE, ABORT]
+      return [CONTINUE, abort]
     default:
       return []
   }

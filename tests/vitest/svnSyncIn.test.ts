@@ -4,6 +4,7 @@ import {
   describeSyncInPreview,
   describeSyncOutcome,
   expectFromPreview,
+  STAGING_NOTE,
   syncActions,
   type SyncInPreview,
 } from '@/engine/svnSyncIn'
@@ -67,6 +68,15 @@ describe('describeSyncInPreview', () => {
     expect(m.message).toContain('重新分开')
     expect(m.message).toContain('把 r2 更新到 r3')
     expect(m.danger).toBeFalsy()
+  })
+
+  it('只提交不更新时接管：floor 没动，不说「更新到了 r1」（计划 Task 5）', () => {
+    // 后端 catch_up_rev 是接管之后的 floor：A.cs 提交到 r2、B.cs 还在 r1 时它就是 1
+    const m = describeSyncInPreview({ ...preview, baselineRev: 1, catchUpRev: 1, targetRev: 3 })
+    expect(m.message).not.toContain('更新到了 r1')
+    expect(m.message).toContain('提交过')
+    expect(m.message).toContain('重新分开')
+    expect(m.message).toContain('把 r1 更新到 r3')
   })
 
   it('接管之后服务器没有更新的内容：只整理，不说「仍会走一遍流程」那句空话', () => {
@@ -168,6 +178,32 @@ describe('describeSyncOutcome', () => {
     expect(n.detail).toContain('Code/A.cs')
     expect(n.detail).toContain('f2208125aa')
   })
+
+  it('暂存与磁盘不同（Review 3 第 1 条）：点名文件，说清暂存的那一份在 stash 里、怎么取回', () => {
+    const oid = 'f2208125aad7d35d63ee9495ad0a6cc3c1ce21be'
+    const n = describeSyncOutcome({ kind: 'stageLost', newRev: 2, stashOid: oid, files: ['Code/B.cs'] })!
+    expect(n.tone).toBe('attention')
+    expect(n.title).toContain('更新完成')
+    expect(n.detail).toContain('Code/B.cs')
+    expect(n.detail).toContain('没有丢')
+    expect(n.detail).toContain(`git show ${oid}^2:`)
+    expect(n.detail).toContain(`git restore --source=${oid}^2 --staged`)
+    expect(n.detail).not.toContain('需要的话重新暂存一次')
+
+    const back = describeSyncOutcome({ kind: 'stageLost', newRev: null, stashOid: oid, files: ['Code/B.cs'] })!
+    expect(back.title).toContain('放弃')
+    expect(back.detail).toContain('更新前')
+  })
+
+  it('stash 已经不在了（崩溃恢复）：不提备份，只让用户重新暂存', () => {
+    const n = describeSyncOutcome({ kind: 'stageLost', newRev: 2, stashOid: null, files: [] })!
+    expect(n.detail).toContain('重新暂存')
+    expect(n.detail).not.toContain('stash')
+  })
+
+  it('预览就说清暂存版本与磁盘不同的会留在 stash 里', () => {
+    expect(STAGING_NOTE).toContain('stash')
+  })
 })
 
 describe('syncActions', () => {
@@ -230,6 +266,9 @@ describe('文案按纯文本渲染', () => {
       { kind: 'released' as const, stashOid: 'x'.repeat(40), rolledBack: true },
       { kind: 'settled' as const, stashOid: 'x'.repeat(40), rolledBack: false },
       { kind: 'settled' as const, stashOid: 'x'.repeat(40), rolledBack: true },
+      { kind: 'stageLost' as const, newRev: 2, stashOid: 'x'.repeat(40), files: ['B'] },
+      { kind: 'stageLost' as const, newRev: 2, stashOid: 'x'.repeat(40), files: [] },
+      { kind: 'stageLost' as const, newRev: null, stashOid: null, files: [] },
     ]) {
       const n = describeSyncOutcome(o)!
       texts.push(n.title, n.detail)

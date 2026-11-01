@@ -178,6 +178,7 @@ function App() {
         >
           <RepoTab
             repoPath={tab.path}
+            active={tab.id === activeId}
             openPaths={openPaths}
             onOpenInNewTab={openInNewTab}
             onRepoRemoved={handleRepoRemoved}

@@ -5,13 +5,18 @@ import type { CommitNode, ConflictInfo, DiffData, GraphData, PullRequest, RefPoi
 import { ALL_CAPABILITIES, type Capabilities } from '../engine/capabilities'
 import {
   auditIsDue,
+  markOnBlur,
   recordAfterSuccess,
   syncIfRootRevChanged,
+  syncIfWcDbChanged,
   SVN_AUDIT_POLL_MS,
   type EolStatus,
   type RootRevMemo,
   type ServerAudit,
   type SyncStatus,
+  type SyncVerdict,
+  type WcDbStamp,
+  type WcDbStampMemo,
 } from '../engine/svnSync'
 import {
   needsLockPolling,
@@ -40,6 +45,7 @@ import type {
   RebuildReport,
 } from '../engine/svnInit'
 import { samePath } from '../engine/path'
+import type { FollowOutcome, SvnUserInfo } from '../engine/svnFollow'
 import type { SyncInExpect, SyncInOutcome, SyncInPreview } from '../engine/svnSyncIn'
 import type { SyncOutExpect, SyncOutOutcome, SyncOutPreview } from '../engine/svnSyncOut'
 import { nextSelection } from '../engine/selection'
@@ -171,6 +177,8 @@ export interface RepoState {
    * 「上次干净收尾了」。
    */
   svnSyncState: SyncState | SyncStateUnreadable | null
+  /** 落后基线的本地分支（分析 §6.11.3）。分支列表打标记，切过去时要确认。 */
+  svnBranchesBehind: string[]
   /** SVN 历史（缓存 + 已拉取的），按 revision 降序。 */
   svnRevs: SvnRevNode[]
   /**
@@ -217,6 +225,7 @@ const initialState: RepoState = {
   svnAudit: null,
   svnEol: null,
   svnSyncState: null,
+  svnBranchesBehind: [],
   svnRevs: [],
   gitCommits: [],
   svnLogComplete: false,
@@ -337,6 +346,36 @@ export function svnSyncAbort(path: string): Promise<SyncInOutcome> {
   return invoke<SyncInOutcome>('svn_sync_abort', { path })
 }
 
+/** 跟进外部提交（分析 §6.5）：录新基线、对象层重放分支、发布。不写磁盘，不发 SVN 写命令。 */
+export function svnFollow(path: string): Promise<FollowOutcome> {
+  return invoke<FollowOutcome>('svn_follow', { path })
+}
+
+/** 把崩溃留下的跟进走完，或回到一致状态后重新跟进。 */
+export function svnFollowContinue(path: string): Promise<FollowOutcome> {
+  return invoke<FollowOutcome>('svn_follow_continue', { path })
+}
+
+/** 手动跟进：跟进冲突时的兜底，会写磁盘。冲突之后的继续 / 放弃走 `svnSyncContinue` / `svnSyncAbort`。 */
+export function svnFollowManual(path: string): Promise<SyncInOutcome> {
+  return invoke<SyncInOutcome>('svn_follow_manual', { path })
+}
+
+/** 落后基线的本地分支。纯本地读；非混合仓库或没有基线时返回空列表。 */
+export function svnBranchesBehind(path: string): Promise<string[]> {
+  return invoke<string[]>('svn_branches_behind', { path })
+}
+
+/** 「我的 SVN 用户名」：配置的值与自动探测的结果。 */
+export function svnGetUser(path: string): Promise<SvnUserInfo> {
+  return invoke<SvnUserInfo>('svn_get_user', { path })
+}
+
+/** 写配置里的 `svnUser`，空串清除。 */
+export function svnSetUser(path: string, user: string): Promise<void> {
+  return invoke<void>('svn_set_user', { path, user })
+}
+
 export function svnSyncOutPreview(path: string): Promise<SyncOutPreview> {
   return invoke<SyncOutPreview>('svn_sync_out_preview', { path })
 }
@@ -372,6 +411,19 @@ export function svnSyncStatus(path: string): Promise<SyncStatus> {
 /** 每个工作副本根的 revision（第一档，O(1)）。挂在高频刷新上。 */
 export function svnRootRevs(path: string): Promise<RootRev[]> {
   return invoke<RootRev[]>('svn_root_revs', { path })
+}
+
+/** 记一份失焦快照（只看索引与 HEAD）。非混合仓库什么也不做。 */
+export function svnFollowMark(path: string): Promise<void> {
+  return invoke<void>('svn_follow_mark', { path })
+}
+
+/**
+ * 各工作副本 `wc.db` 的 mtime + size（分析 §6.6）。窗口拿到焦点时调用，与上次观测值比。
+ * wc.db 没变时后端只有几次 `stat`，不发 svn 命令。非混合仓库返回空列表。
+ */
+export function svnWcDbStamps(path: string): Promise<WcDbStamp[]> {
+  return invoke<WcDbStamp[]>('svn_wc_db_stamps', { path })
 }
 
 /** 一页 SVN 历史 + 「还能不能再往下翻」，对应后端 `LogPage`。 */
@@ -421,6 +473,20 @@ export function useRepoStore() {
    * `recordAfterSuccess` 的事：只有第二档真的跑成功了才记。
    */
   const lastRootRevs = useRef<RootRevMemo>({ value: null })
+
+  /** 上一次校验成功时的 HEAD。见 `checkSvnSyncIfHeadMoved`。 */
+  const lastCheckedHead = useRef<RootRevMemo>({ value: null })
+  /** 焦点检测的上次观测值。放 ref 的理由同 `lastRootRevs`。 */
+  const lastWcDbStamps = useRef<WcDbStampMemo>({ value: null })
+  /**
+   * 最近一次第二档校验的结论，失败时是 `null`。失焦快照要它。
+   *
+   * 不读 `state.svnSync`：失焦的处理函数闭包里那份是注册时的，就算走 ref 同步也要等一次渲染，
+   * 校验结果写回与失焦之间没有先后保证。
+   */
+  const latestVerdict = useRef<SyncVerdict['kind'] | null>(null)
+  /** 正在跑的校验（含读戳、读 revision 的那一段）。见 `shouldMarkOnBlur`。 */
+  const svnChecksRunning = useRef(0)
 
   /**
    * 上一次**开始**服务器侧核对的时刻，与 `auditInFlight` 一起构成
@@ -498,6 +564,9 @@ export function useRepoStore() {
         // （中间态下它们的结论可能是错的，出口还是危险的）。必须在第一帧之前
         // 读到，否则会先闪一条随后被撤掉的横幅。
         await refreshSvnSyncState(path)
+        void refreshSvnBranchesBehind(path).catch((err) =>
+          console.warn('读取落后基线的分支失败：', err),
+        )
         // 先用**缓存**把图画出来，再后台拉新的（spec §10.2）。
         await refreshSvnLog(path).catch(() => undefined)
         // 这两条走网络，照 `refreshPullRequests` 的既有模式：不 await、失败静默。
@@ -512,6 +581,7 @@ export function useRepoStore() {
           svnAudit: null,
           svnEol: null,
           svnSyncState: null,
+          svnBranchesBehind: [],
           svnRevs: [],
           svnLogComplete: false,
           // gitCommits 不用清：refreshGraph 每次都整份覆盖它
@@ -682,8 +752,29 @@ export function useRepoStore() {
 
   /** 第二档本身：完整的 `nodeRevs` 校验（spec §6.6.3）。纯本地读，不碰观测值。 */
   const applySvnSync = async (path: string) => {
-    const st = await svnSyncStatus(path)
+    // 只认最后发起的一次：焦点与 repo-changed 都会发起，先发起的那次看到的是更旧的工作副本，
+    // 晚到时不能把 ExternallyAdvanced 盖回 InSync，失焦快照就是拿这个结论当前提的
+    const token = refreshGate.begin('svnSync')
+    let st: SyncStatus
+    try {
+      st = await svnSyncStatus(path)
+    } catch (err) {
+      if (refreshGate.isLatest(token, 'svnSync')) latestVerdict.current = null
+      throw err
+    }
+    if (!refreshGate.isLatest(token, 'svnSync')) return
+    latestVerdict.current = st.verdict.kind
     setState((s) => ({ ...s, svnSync: st }))
+  }
+
+  /** 给一次校验记数，从它读第一档的输入开始，到结论写回为止。 */
+  const trackSvnCheck = async <T>(run: () => Promise<T>): Promise<T> => {
+    svnChecksRunning.current += 1
+    try {
+      return await run()
+    } finally {
+      svnChecksRunning.current -= 1
+    }
   }
 
   const readRootRevs = async (path: string) => serializeRootRevs(await svnRootRevs(path))
@@ -695,10 +786,11 @@ export function useRepoStore() {
    * `lastRootRevs` 还是 `null` 而再跑一次全量。**先读 revision 再跑校验**，
    * 而且只在校验成功后才记，理由见 `recordAfterSuccess`。
    */
-  const refreshSvnSync = async (path: string) => {
-    const observed = await readRootRevs(path)
-    await recordAfterSuccess(lastRootRevs.current, observed, () => applySvnSync(path))
-  }
+  const refreshSvnSync = (path: string) =>
+    trackSvnCheck(async () => {
+      const observed = await readRootRevs(path)
+      await recordAfterSuccess(lastRootRevs.current, observed, () => applySvnSync(path))
+    })
 
   /**
    * 第一档（O(1)）：rootRev 与**上次观测值**比，变了才跑第二档。
@@ -706,11 +798,67 @@ export function useRepoStore() {
    * 返回是否真的跑了第二档，只为让调用方能读懂日志；调用方不依赖它。
    */
   const checkSvnSyncIfChanged = (path: string) =>
-    syncIfRootRevChanged(
-      lastRootRevs.current,
-      () => readRootRevs(path),
-      () => applySvnSync(path),
+    trackSvnCheck(() =>
+      syncIfRootRevChanged(
+        lastRootRevs.current,
+        () => readRootRevs(path),
+        () => applySvnSync(path),
+      ),
     )
+
+  /**
+   * HEAD 动了就跑第二档（分析 §6.11.3）。`headBehindBase` 是第二档的结论，而切分支不改 revision、
+   * 不写 wc.db，上面两档都看不见：不补这一条的话，切到落后的分支（包括外部工具切的）横幅上
+   * 没有「跟进」，切回来又留着一条过时的横幅。只在 HEAD 真的变了时跑，存盘不会走到第二档。
+   */
+  const checkSvnSyncIfHeadMoved = (path: string, head: string) =>
+    trackSvnCheck(() =>
+      syncIfRootRevChanged(
+        lastCheckedHead.current,
+        async () => head,
+        () => applySvnSync(path),
+      ),
+    )
+
+  /**
+   * 窗口拿到焦点、或切到这个标签时的检测（分析 §6.6）：wc.db 变了才跑第二档。
+   *
+   * 不能只靠 `checkSvnSyncIfChanged`：TortoiseSVN 只提交、不更新时根节点的 revision 不动，
+   * 第一档看不见，也没有文件事件（`.svn` 被 watcher 过滤）。
+   */
+  const checkSvnSyncOnFocus = (path: string) =>
+    trackSvnCheck(() =>
+      syncIfWcDbChanged(
+        lastWcDbStamps.current,
+        () => svnWcDbStamps(path),
+        () => refreshSvnSync(path),
+      ),
+    )
+
+  /**
+   * 窗口失焦、或切到别的标签时记一份快照。
+   *
+   * 写不成不打扰用户：快照只是判定线索，没有它时跟进走「拿不准」的保守分支。
+   */
+  const markSvnFollowOnBlur = async (path: string) => {
+    try {
+      await markOnBlur(
+        latestVerdict.current,
+        svnChecksRunning.current,
+        lastWcDbStamps.current,
+        () => svnWcDbStamps(path),
+        () => svnFollowMark(path),
+      )
+    } catch (err) {
+      console.warn('失焦快照没写成：', err)
+    }
+  }
+
+  /** 落后基线的分支。`samePath` 守卫同 `refreshSvnEol`。 */
+  const refreshSvnBranchesBehind = async (path: string) => {
+    const behind = await svnBranchesBehind(path)
+    setState((s) => (samePath(s.path ?? '', path) ? { ...s, svnBranchesBehind: behind } : s))
+  }
 
   /** 读缓存里的 SVN 历史并接进图。不走网络。 */
   const refreshSvnLog = async (path: string) => {
@@ -888,7 +1036,11 @@ export function useRepoStore() {
     refreshSvnSync,
     refreshSvnEol,
     refreshSvnSyncState,
+    refreshSvnBranchesBehind,
     checkSvnSyncIfChanged,
+    checkSvnSyncIfHeadMoved,
+    checkSvnSyncOnFocus,
+    markSvnFollowOnBlur,
     refreshSvnLog,
     fetchSvnLog,
     refreshSvnAudit,
@@ -915,7 +1067,14 @@ export interface RepoRefreshers {
   /** §6.6.3 第二档。只在第一档报告「有人动过」之后才调。 */
   /** §6.6.3 的第一档 + 条件触发第二档。挂在高频的 repo-changed 上。 */
   checkSvnSyncIfChanged: (path: string) => Promise<boolean>
+  /** §6.11.3：HEAD 变了才跑第二档。挂在 repo-changed 读到的新 HEAD 上。 */
+  checkSvnSyncIfHeadMoved: (path: string, head: string) => Promise<boolean>
+  /** §6.6 的焦点检测：wc.db 变了才跑第二档。挂窗口焦点与切标签。 */
+  checkSvnSyncOnFocus: (path: string) => Promise<boolean>
+  /** 失焦快照，自带是否该写的判断，不抛。挂窗口失焦与切标签。 */
+  markSvnFollowOnBlur: (path: string) => Promise<void>
   refreshSvnSyncState: (path: string) => Promise<void>
+  refreshSvnBranchesBehind: (path: string) => Promise<void>
   /** 服务器侧核对的**后台**入口，自带频率闸。挂定时器与窗口焦点。 */
   auditSvnIfDue: (path: string) => Promise<void>
   /** `useRepoStore` 的 `wantedDiffScope`：这里每次渲染写入当前视图的 scope。 */
@@ -925,14 +1084,16 @@ export interface RepoRefreshers {
 /**
  * @param changesScope 「本地改动」视图右侧 diff 的 scope：选中文件在 Unstaged 是 `unstaged`
  *   （暂存区对比工作区），在 Staged 是 `staged`（HEAD 对比暂存区），见第 65 条
+ * @param active 这个标签是不是当前显示的那个。所有标签都挂载着，焦点事件每个标签都收得到
  */
 export function useRepoEffects(
   state: RepoState,
   refreshers: RepoRefreshers,
   viewMode: string,
   changesScope: FileSection,
+  active: boolean,
 ) {
-  const { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, refreshSvnSyncState, auditSvnIfDue } = refreshers
+  const { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, checkSvnSyncOnFocus, markSvnFollowOnBlur, refreshSvnSyncState, refreshSvnBranchesBehind, auditSvnIfDue } = refreshers
   // svn 节点有两版本地基线时读两版之差（`range:`）；不在图上的选中（stash）照旧按 oid 读
   const diffScope = viewMode === 'changes'
     ? changesScope
@@ -958,7 +1119,11 @@ export function useRepoEffects(
       // 刷新期间仓库可能正处于中间态（比如 checkout 写到一半），失败就等下一次事件
       const ignore = () => undefined
       // 外部 checkout 同样会改 HEAD 和 worktree 归属，两者都要跟着刷新
-      void refreshHead(path).catch(ignore)
+      void refreshHead(path)
+        .then((head) => {
+          if (state.capabilities.vcs === 'svn') return checkSvnSyncIfHeadMoved(path, head)
+        })
+        .catch(ignore)
       void refreshGraph(path).catch(ignore)
       void refreshStatus(path).catch(ignore)
       void refreshWorktrees(path).catch(ignore)
@@ -988,6 +1153,8 @@ export function useRepoEffects(
         //
         // 它是纯本地读（一次 stat + 一个小文件），挂在高频通道上不需要分层。
         void refreshSvnSyncState(path).catch(ignore)
+        // 跟进、切分支、外部工具动了分支都走这里。后端走 libgit2，不起进程
+        void refreshSvnBranchesBehind(path).catch(ignore)
       }
     }).then((fn) => {
       if (disposed) fn()
@@ -1060,4 +1227,46 @@ export function useRepoEffects(
     // effect 每渲染一次就重装一次定时器，五分钟的计时永远归零、一次都不会触发。
     // 本文件里其它几个 effect 也是同一个写法。
   }, [state.path, state.capabilities.vcs])
+
+  /**
+   * 外部提交的检测与失焦快照（分析 §6.6，日志 W26）。
+   *
+   * 用户的操作顺序是「切到 TortoiseSVN 提交 → 切回来」：失焦那一刻记下暂存与 HEAD，
+   * 它们一定早于这次提交；拿到焦点时比 wc.db，发现提交。
+   *
+   * 只有当前标签挂监听：别的仓库的暂存不是用户此刻在看的，检测也等切过去再做（下一个 effect）。
+   * 依赖里不放这两个函数，理由同上面的审计定时器。
+   */
+  useEffect(() => {
+    if (!state.path || state.capabilities.vcs !== 'svn' || !active) return
+    const path = state.path
+    const onFocus = () => {
+      void checkSvnSyncOnFocus(path).catch((err) => console.warn('焦点检测失败：', err))
+    }
+    const onBlur = () => {
+      void markSvnFollowOnBlur(path)
+    }
+    window.addEventListener('focus', onFocus)
+    window.addEventListener('blur', onBlur)
+    return () => {
+      window.removeEventListener('focus', onFocus)
+      window.removeEventListener('blur', onBlur)
+    }
+  }, [state.path, state.capabilities.vcs, active])
+
+  /**
+   * 切标签等于这个仓库的失焦 / 拿到焦点：标签藏着时外部提交没人检测，切走之后的窗口失焦又
+   * 轮不到它。只响应 `active` 真的变了，第一次渲染打开仓库自己会校验。
+   */
+  const wasActive = useRef(active)
+  useEffect(() => {
+    if (wasActive.current === active) return
+    wasActive.current = active
+    if (!state.path || state.capabilities.vcs !== 'svn') return
+    if (active) {
+      void checkSvnSyncOnFocus(state.path).catch((err) => console.warn('焦点检测失败：', err))
+    } else {
+      void markSvnFollowOnBlur(state.path)
+    }
+  }, [active])
 }

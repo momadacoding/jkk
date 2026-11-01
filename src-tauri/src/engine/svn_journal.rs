@@ -1,4 +1,4 @@
-//! 写前 operation journal（spec §7.6）。`sync_in` 与 `sync_out` 共用。
+//! 写前 operation journal（spec §7.6）。`sync_in`、`sync_out` 与跟进（计划 Task 10）共用。
 //!
 //! # 「写前」是字面意思
 //!
@@ -16,6 +16,7 @@
 //! （spec §5.1「读操作不阻塞」）。读到的可能是另一个进程正在推进的状态，
 //! 所以它的结论只能用来显示，不能用来决定动作。
 
+use crate::engine::svn_follow::FollowReport;
 use crate::error::{GitError, Result};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -30,6 +31,10 @@ pub enum Flow {
     #[default]
     SyncIn,
     SyncOut,
+    Follow,
+    /// 手动跟进（计划 Task 13）。阶段与 `sync_in` 共用 Start…ApplyingStash，继续 / 放弃也走
+    /// `sync_in` 的入口；单独一个 flow 是因为它不切基线、不跑 `svn update`，恢复时不能套用 S3–S7。
+    FollowManual,
 }
 
 /// 流程停在哪一步。字符串**逐字**取自 spec §7.6 的两张表，不要「优化」拼写：
@@ -62,6 +67,65 @@ pub enum Phase {
     Committing,
     PostCommit,
     RestoringBranch,
+    // —— 跟进（计划 Task 10）——
+    /// 发布阶段，走到哪一步看 [`FollowSteps::step`]。
+    FollowPublishing,
+}
+
+/// 跟进发布走到了哪一步：**这一步即将执行，或者已经执行**（写前日志，见模块头）。
+///
+/// 恢复靠它分清残留的 `.git/index.lock` 是什么：停在 [`Self::PrepareIndex`] 时只可能是半成品，
+/// 只能删；[`Self::MoveBranch`] 及之后才是拼好的索引（日志 Task 8 遗留第 2 条）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FollowStep {
+    /// CAS 移动 `svn/base`。「分支跟进」入口没有这一步。
+    #[default]
+    Baseline,
+    /// 持 IndexLock 拼新索引。
+    PrepareIndex,
+    /// 核对 HEAD，CAS 移动当前分支。
+    MoveBranch,
+    /// 再核对 HEAD，把 index.lock rename 成 index。
+    SwapIndex,
+    /// CAS 移动其他分支，然后收尾。
+    MoveOthers,
+}
+
+/// 一条要移动的分支。CAS 的旧值与新值都在这里，重开时不用重放。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchMove {
+    pub branch: String,
+    pub old: String,
+    pub new: String,
+}
+
+/// 跟进的发布进度。旧 / 新基线记在 `baselineOidBefore` / `newBaselineOid`，当前分支记在
+/// `origBranch` / `origHead`，这里只放跟进才有的东西。
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FollowSteps {
+    pub step: FollowStep,
+    /// 当前分支要移到哪里。`None`：当前分支重放冲突，这次只发布基线。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_tip: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub others: Vec<BranchMove>,
+    /// 拼好的索引的 blob OID。恢复时拿它认 `.git/index.lock` 是不是我们那一份：重开时那个路径上
+    /// 可能已经是别的 git 进程的锁，rename 过去等于把别人的半成品当索引。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_blob: Option<String>,
+    /// 拼好的索引 `ls-files --stage` 的指纹。锁没了之后靠它判断 rename 发生过没有：stat 刷新
+    /// 会改写索引的字节，不改这份内容。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_stages: Option<String>,
+    /// `.git/index.lock` 是我方建的（`prepare_index` 建锁后立刻写）。停在
+    /// [`FollowStep::PrepareIndex`] 时只有这条记录能证明路径上的锁可以删。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lock_created: bool,
+    /// 重开之后要交给用户的报告。泄漏告警只在这次跟进里看得见，不能因为崩溃就丢了。
+    pub report: FollowReport,
 }
 
 /// D4 前后一个 svn 节点的登记状态（spec §8.5；计划 B5 / B6）。
@@ -140,6 +204,10 @@ pub struct Journal {
     /// （PR #49 review #3）。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rolling_back: bool,
+    /// 手动跟进的 S10 没能带 `--index` 放回（W7）：内容都在，「已暂存」的状态没保住。
+    /// 和 [`Self::stash_applied`] 一起落盘：崩在放回之后时，收尾仍要把这件事告诉用户。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stage_lost: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_rev_before: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -183,6 +251,10 @@ pub struct Journal {
     /// D5 的 `Committed revision N`。读不出来时为空，D7 会从 `nodeRevs` 重新得到。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub committed_rev: Option<u64>,
+
+    // —— 以下只有跟进用 ——
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_steps: Option<FollowSteps>,
 }
 
 /// `<repo_root>/.git/mygitclient-sync.json`。与 `svn_lock::lock_path` 同一约定。

@@ -263,6 +263,18 @@ fn preflight_serializes_to_camel_case_and_keeps_the_dirty_list_off_the_wire() {
             props: "none".into(),
             wc_locked: false,
         }],
+        // 计划 Task 5：允许混合版本时带上的节点状态，同样不过 IPC
+        nodes: Some(vec![app_lib::engine::svn_xml::NodeStatus {
+            path: "Code/A.cs".into(),
+            item: "normal".into(),
+            node_rev: Some(7),
+            commit_rev: Some(7),
+            author: None,
+            wc_locked: false,
+            tree_conflicted: false,
+            copied: false,
+            changelist: None,
+        }]),
     })
     .unwrap();
     assert_eq!(keys_of(&json), vec!["nodeRev", "reposRoot", "uuid"]);
@@ -285,6 +297,7 @@ fn init_preflight_flattens_the_preflight_and_adds_the_gitignore_conflicts() {
             repos_root: "file:///x".into(),
             uuid: "u".into(),
             dirty: vec![],
+            nodes: None,
         },
         gitignore_conflicts: vec![],
     })
@@ -432,12 +445,19 @@ fn init_and_rebuild_reports_serialize_to_camel_case() {
         old_baseline: "a".into(),
         new_baseline: "b".into(),
         health: Health::NotChecked { reason: "x".into() },
+        base: app_lib::engine::svn_sync::BaseMapSummary {
+            floor: 2,
+            newer: 1,
+            gone: 0,
+        },
     })
     .unwrap();
     assert_eq!(
         keys_of(&rebuild),
-        vec!["health", "newBaseline", "nodeRev", "oldBaseline"]
+        vec!["base", "health", "newBaseline", "nodeRev", "oldBaseline"]
     );
+    // 计划 Task 5：前端 `RebuildReport.base` 与横幅的 `SyncStatus.base` 同一个形状
+    assert_eq!(keys_of(&rebuild["base"]), vec!["floor", "gone", "newer"]);
 }
 
 #[test]
@@ -725,6 +745,38 @@ fn svn_fetch_log_includes_the_baseline_anchor_even_when_it_missed_the_whitelist(
 }
 
 #[test]
+fn svn_fetch_log_includes_the_floor_of_a_mixed_baseline_as_an_anchor() {
+    // 混合基线的 floor 与单值基线的 revision 一样，往往是个没碰过白名单的 revision。
+    // 补不到的话 spliceHistory 没有 svn 节点可挂，根上的混合基线和工作分支悬在主线之外
+    use app_lib::engine::git_cli::run_git;
+    use app_lib::engine::svn_baseline::{create_baseline_commit_with, move_baseline_ref};
+    let fx = svn_fixtures::svn_repo_baseline_rev_outside_whitelist();
+    init_hybrid_on(&fx);
+    let root = fx.wc_str();
+    let rev_parse = |r: &str| {
+        run_git(&root, &["rev-parse", r])
+            .unwrap()
+            .trim()
+            .to_string()
+    };
+    let old = rev_parse("refs/heads/svn/base");
+    let tree = rev_parse(&format!("{old}^{{tree}}"));
+    let mut map = app_lib::engine::svn_basemap::read_base_map(&root, &old).unwrap();
+    // r3 只动了白名单之外的目录
+    map.floor = 3;
+    map.revs.insert("Code/A.cs".to_string(), 4);
+    let new = create_baseline_commit_with(&root, &tree, Some(&old), &map, &[], None).unwrap();
+    move_baseline_ref(&root, &new, Some(&old)).unwrap();
+
+    let got = app_lib::commands::svn::svn_fetch_log(fx.wc_str(), false, 200).unwrap();
+    assert!(
+        got.revs.iter().any(|e| e.rev == 3),
+        "floor r3 必须在序列里，实际 {:?}",
+        got.revs.iter().map(|e| e.rev).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn svn_sync_status_and_root_revs_are_reachable_through_the_command_layer() {
     let fx = svn_repo();
     init_hybrid_on(&fx);
@@ -772,6 +824,12 @@ fn the_new_commands_serialize_with_the_field_names_the_frontend_reads() {
     assert!(st.get("baselineRev").is_some(), "实际 {st}");
     assert!(st.get("nodeRevs").is_some(), "实际 {st}");
     assert_eq!(st["verdict"]["kind"], "inSync", "实际 {st}");
+    // Review 2 第 8 条：前端靠它给「分支跟进」入口
+    assert_eq!(st["headBehindBase"], false, "实际 {st}");
+    // 计划 Task 3：基线映射的摘要。前端拿它判断「基线本身是不是混合的」
+    assert_eq!(st["base"]["floor"], st["baselineRev"], "实际 {st}");
+    assert_eq!(st["base"]["newer"], 0, "实际 {st}");
+    assert_eq!(st["base"]["gone"], 0, "实际 {st}");
 
     let revs =
         serde_json::to_value(app_lib::commands::svn::svn_root_revs(fx.wc_str()).unwrap()).unwrap();
@@ -784,6 +842,41 @@ fn the_new_commands_serialize_with_the_field_names_the_frontend_reads() {
     assert!(log.get("complete").is_some(), "实际 {log}");
     assert!(log["revs"][0].get("rev").is_some(), "实际 {log}");
     assert!(log["revs"][0].get("message").is_some(), "实际 {log}");
+}
+
+#[test]
+fn wc_db_stamp_serializes_with_the_nanoseconds_as_a_string() {
+    // 计划 Task 9。纳秒时间戳超过 JS 的 2^53，作为 JSON 数字到前端会被舍入，而前端只拿它
+    // 比相等。序列化成字符串是这里要钉住的契约，不止是字段名
+    let v = serde_json::to_value(app_lib::engine::svn_follow_mark::WcDbStamp {
+        wc_root: "C:/wc".to_string(),
+        mtime_ns: 1_793_000_000_123_456_789,
+        size: 42,
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({
+            "wcRoot": "C:/wc",
+            "mtimeNs": "1793000000123456789",
+            "size": 42,
+        })
+    );
+}
+
+#[test]
+fn svn_user_info_serializes_in_camel_case() {
+    // 计划 Task 11。两个字段都是一个词，转换后不变；这里钉的是「没值时是 null」：
+    // 前端靠它判断要不要问用户，缺键和 null 在 TS 里不是同一个类型
+    let v = serde_json::to_value(app_lib::engine::svn_follow_mark::SvnUserInfo {
+        configured: Some("zhang".to_string()),
+        detected: None,
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({ "configured": "zhang", "detected": null })
+    );
 }
 
 #[test]
@@ -803,9 +896,12 @@ fn every_sync_verdict_variant_serializes_its_fields_in_camel_case() {
     // fixture，而这里要钉的是序列化形状，不是判定逻辑（那个 `svn_sync.rs` 里有）。
     use app_lib::engine::svn_sync::SyncVerdict;
 
-    let mixed = serde_json::to_value(SyncVerdict::MixedRevision { revs: vec![3, 5] }).unwrap();
-    assert_eq!(mixed["kind"], "mixedRevision", "实际 {mixed}");
-    assert_eq!(mixed["revs"][1], 5, "实际 {mixed}");
+    let locked = serde_json::to_value(SyncVerdict::WcLocked {
+        dirs: vec!["Code".to_string()],
+    })
+    .unwrap();
+    assert_eq!(locked["kind"], "wcLocked", "实际 {locked}");
+    assert_eq!(locked["dirs"][0], "Code", "实际 {locked}");
 
     let diverged = serde_json::to_value(SyncVerdict::Diverged {
         node_rev: 9,
@@ -830,6 +926,185 @@ fn every_sync_verdict_variant_serializes_its_fields_in_camel_case() {
     assert_eq!(pinned["nodeRev"], 4, "实际 {pinned}");
     assert_eq!(pinned["baselineRev"], 9, "实际 {pinned}");
     assert_eq!(pinned["external"], "Vendor/Lib", "实际 {pinned}");
+}
+
+#[test]
+fn externally_advanced_serializes_camel_case() {
+    // 计划 Task 3：变体带字段，`ExternalChange` 是嵌套结构体——两层都要是 camelCase，
+    // 作者缺失时发 `null` 而不是整个键消失（前端按 `author === null` 判断）
+    use app_lib::engine::svn_sync::{ExternalChange, SyncVerdict};
+
+    let v = serde_json::to_value(SyncVerdict::ExternallyAdvanced {
+        changed: vec![ExternalChange {
+            path: "Code/A.cs".into(),
+            rev: 1245,
+            author: Some("zhang".into()),
+        }],
+        added: vec![ExternalChange {
+            path: "Code/N.cs".into(),
+            rev: 1246,
+            author: None,
+        }],
+        removed: vec!["Code/Old.cs".into()],
+    })
+    .unwrap();
+    assert_eq!(v["kind"], "externallyAdvanced", "实际 {v}");
+    assert_eq!(v["changed"][0]["path"], "Code/A.cs", "实际 {v}");
+    assert_eq!(v["changed"][0]["rev"], 1245, "实际 {v}");
+    assert_eq!(v["changed"][0]["author"], "zhang", "实际 {v}");
+    assert_eq!(
+        v["added"][0].get("author"),
+        Some(&serde_json::Value::Null),
+        "实际 {v}"
+    );
+    assert_eq!(v["removed"][0], "Code/Old.cs", "实际 {v}");
+}
+
+#[test]
+fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
+    // 计划 Task 10。三层嵌套（Outcome → Report → Leak / ComposeReport），每一层都要是 camelCase；
+    // 只测 Refused 的话，变体字段与结构体字段的 serde 属性写错都测不到
+    use app_lib::engine::svn_follow::{FollowOutcome, FollowReport};
+    use app_lib::engine::svn_follow_index::{ComposeReport, StageDecision};
+    use app_lib::engine::svn_leak::{HunkLeak, Leak, LeakVerdict};
+    use app_lib::engine::svn_sync::ExternalChange;
+    use std::collections::BTreeMap;
+
+    let v = serde_json::to_value(FollowOutcome::NeedsManual {
+        at: "c".into(),
+        files: vec!["Code/A.cs".into()],
+        baseline_published: true,
+        leaks: vec![Leak {
+            branch: "work".into(),
+            commit: "l".into(),
+            subject: "s".into(),
+            path: "Code/A.cs".into(),
+            hunks: vec![HunkLeak {
+                old_start: 3,
+                lines: 1,
+                verdict: LeakVerdict::Unknown,
+            }],
+        }],
+        stale_disk: true,
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({
+            "kind": "needsManual",
+            "at": "c",
+            "files": ["Code/A.cs"],
+            "baselinePublished": true,
+            "leaks": [{
+                "branch": "work",
+                "commit": "l",
+                "subject": "s",
+                "path": "Code/A.cs",
+                "hunks": [{ "oldStart": 3, "lines": 1, "verdict": "unknown" }],
+            }],
+            "staleDisk": true,
+        })
+    );
+
+    let v = serde_json::to_value(FollowOutcome::Refused {
+        code: "svn_follow_wc_locked".into(),
+        message: "m".into(),
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({ "kind": "refused", "code": "svn_follow_wc_locked", "message": "m" })
+    );
+
+    let mut decisions = BTreeMap::new();
+    decisions.insert("Code/A.cs".to_string(), StageDecision::TakeNew);
+    decisions.insert("Code/B.cs".to_string(), StageDecision::KeepStaged);
+    decisions.insert(
+        "Code/C.cs".to_string(),
+        StageDecision::Merged("blob".into()),
+    );
+    decisions.insert("Code/D.cs".to_string(), StageDecision::LostToNew);
+    let v = serde_json::to_value(FollowOutcome::Done {
+        report: Box::new(FollowReport {
+            new_floor: 3,
+            verified: true,
+            changes: vec![ExternalChange {
+                path: "Code/A.cs".into(),
+                rev: 4,
+                author: None,
+            }],
+            removed: vec!["Code/Old.cs".into()],
+            dropped: vec!["c1".into()],
+            rewritten: vec![("c2".into(), vec!["Code/A.cs".into()])],
+            stage: ComposeReport {
+                decisions,
+                uncertain: vec!["Code/B.cs".into()],
+                lost: vec!["Code/D.cs".into()],
+                discarded: vec!["Code/A.cs".into()],
+            },
+            moved_branches: vec!["feature".into()],
+            behind_branches: vec![("old".into(), "冲突".into())],
+            pinned_ref: Some("refs/mygitclient/follow/x".into()),
+            leaks: vec![Leak {
+                branch: "work".into(),
+                commit: "l".into(),
+                subject: "s".into(),
+                path: "Code/A.cs".into(),
+                hunks: vec![
+                    HunkLeak {
+                        old_start: 5,
+                        lines: 1,
+                        verdict: LeakVerdict::Present,
+                    },
+                    HunkLeak {
+                        old_start: 0,
+                        lines: 0,
+                        verdict: LeakVerdict::Unknown,
+                    },
+                ],
+            }],
+        }),
+    })
+    .unwrap();
+    assert_eq!(v["kind"], "done");
+    let r = &v["report"];
+    assert_eq!(r["newFloor"], 3, "实际 {v}");
+    assert_eq!(r["verified"], true, "实际 {v}");
+    assert_eq!(r["changes"][0]["author"], serde_json::Value::Null);
+    assert_eq!(r["removed"][0], "Code/Old.cs");
+    assert_eq!(r["dropped"][0], "c1");
+    assert_eq!(r["rewritten"][0], serde_json::json!(["c2", ["Code/A.cs"]]));
+    assert_eq!(r["movedBranches"][0], "feature");
+    assert_eq!(r["behindBranches"][0], serde_json::json!(["old", "冲突"]));
+    assert_eq!(r["pinnedRef"], "refs/mygitclient/follow/x", "实际 {v}");
+
+    let s = &r["stage"];
+    assert_eq!(s["decisions"]["Code/A.cs"], "takeNew", "实际 {v}");
+    assert_eq!(s["decisions"]["Code/B.cs"], "keepStaged", "实际 {v}");
+    assert_eq!(
+        s["decisions"]["Code/C.cs"],
+        serde_json::json!({ "merged": "blob" }),
+        "实际 {v}"
+    );
+    assert_eq!(s["decisions"]["Code/D.cs"], "lostToNew", "实际 {v}");
+    assert_eq!(s["uncertain"][0], "Code/B.cs");
+    assert_eq!(s["lost"][0], "Code/D.cs");
+    assert_eq!(s["discarded"][0], "Code/A.cs");
+
+    let l = &r["leaks"][0];
+    assert_eq!(
+        l,
+        &serde_json::json!({
+            "branch": "work",
+            "commit": "l",
+            "subject": "s",
+            "path": "Code/A.cs",
+            "hunks": [
+                { "oldStart": 5, "lines": 1, "verdict": "present" },
+                { "oldStart": 0, "lines": 0, "verdict": "unknown" },
+            ],
+        })
+    );
 }
 
 #[test]
@@ -883,6 +1158,22 @@ fn sync_in_types_cross_ipc_in_camel_case() {
             r#"{"kind":"done","newRev":2}"#,
         ),
         (SyncInOutcome::Aborted, r#"{"kind":"aborted"}"#),
+        (
+            SyncInOutcome::StageLost {
+                new_rev: Some(2),
+                stash_oid: Some("s".into()),
+                files: vec!["A".into()],
+            },
+            r#"{"kind":"stageLost","newRev":2,"stashOid":"s","files":["A"]}"#,
+        ),
+        (
+            SyncInOutcome::StageLost {
+                new_rev: None,
+                stash_oid: None,
+                files: vec![],
+            },
+            r#"{"kind":"stageLost","newRev":null,"stashOid":null,"files":[]}"#,
+        ),
         (
             SyncInOutcome::RebaseConflict {
                 files: vec!["A".into()],

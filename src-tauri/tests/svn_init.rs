@@ -11,6 +11,7 @@ use app_lib::commands::svn::{svn_migrate_eol, svn_rebuild_baseline};
 use app_lib::engine::git_cli::run_git;
 use app_lib::engine::svn_attributes::has_eol_rule;
 use app_lib::engine::svn_baseline::parse_trailer;
+use app_lib::engine::svn_basemap::read_base_map;
 use app_lib::engine::svn_cli::run_svn;
 use app_lib::engine::svn_health::Health;
 use app_lib::engine::svn_init::{
@@ -18,10 +19,12 @@ use app_lib::engine::svn_init::{
     rebuild_baseline, GitignoreChoice, InitRequest,
 };
 use app_lib::engine::svn_lock;
+use app_lib::engine::svn_tombstone::fault::{self, Point};
 use app_lib::engine::svn_xml::parse_info;
 use std::process::Command;
 use svn_fixtures::{
-    svn_repo, svn_repo_dirty, svn_repo_for_health, svn_repo_obstructed, svn_repo_with_native_eol,
+    hybrid_with_colleague, svn_repo, svn_repo_committed_without_update, svn_repo_dirty,
+    svn_repo_for_health, svn_repo_obstructed, svn_repo_with_native_eol,
     svn_repo_with_same_repo_nested_external, DirtyKind, NestedExternal, SvnFixture,
 };
 
@@ -1334,12 +1337,9 @@ fn rebuild_refuses_only_when_a_node_is_obstructed() {
 }
 
 #[test]
-fn whenever_the_banner_says_mixed_revision_rebuild_is_refused() {
-    // 前端 `describeSync` 对 mixedRevision 不再给「重建基线」，依据就是这一条：
-    // 失同步判定与重建开头的 P2 查同一组 target，前者判成多值，后者必然拒绝。
-    // 哪天两边的 target 分了家，这条会红——那时按钮要不要回来得重新判断。
-    //
-    // 造法是用户 2026-10-28 真实撞上的形态：在 TortoiseSVN 里提交过、没 update
+fn rebuild_accepts_commit_without_update_and_writes_mixed_trailer() {
+    // 用户 2026-10-28 真实撞上的形态：在 TortoiseSVN 里提交过、没 update。
+    // 计划 Task 5 之前 P2 在这里拒绝（svn_preflight_mixed_revision）；现在按文件记账录混合基线
     let fx = svn_repo_for_health();
     init_hybrid(&req(&fx)).unwrap();
     std::fs::write(fx.wc().join("Code/A.cs"), "v2\n").unwrap();
@@ -1354,26 +1354,378 @@ fn whenever_the_banner_says_mixed_revision_rebuild_is_refused() {
             "Code/A.cs@",
         ],
     );
-
-    let status = app_lib::engine::svn_sync::check_sync(&fx.wc_str()).unwrap();
+    let wc = fx.wc_str();
+    let status = app_lib::engine::svn_sync::check_sync(&wc).unwrap();
     assert!(
         matches!(
             status.verdict,
-            app_lib::engine::svn_sync::SyncVerdict::MixedRevision { .. }
+            app_lib::engine::svn_sync::SyncVerdict::ExternallyAdvanced { .. }
         ),
-        "前提：横幅这时要判成 mixedRevision，实际 {:?}",
+        "前提：横幅这时要判成 externallyAdvanced，实际 {:?}",
         status.verdict
     );
+    let base_before = run_git(&wc, &["rev-parse", "svn/base"])
+        .unwrap()
+        .trim()
+        .to_string();
 
-    let base_before = run_git(&fx.wc_str(), &["rev-parse", "svn/base"]).unwrap();
-    let err = rebuild_baseline(&fx.wc_str()).expect_err("mixed-revision 上重建必须被拒");
-    assert_eq!(err.code, "svn_preflight_mixed_revision", "{}", err.message);
-    assert!(err.message.contains("r2  Code/A.cs"), "{}", err.message);
+    let report = rebuild_baseline(&wc).expect("只提交、没更新的工作副本必须能重建");
+
+    assert_eq!(report.node_rev, 1, "node_rev 是 floor");
+    assert_eq!(report.old_baseline, base_before);
+    assert!(
+        matches!(report.health, Health::Verified { .. }),
+        "{:?}",
+        report.health
+    );
+    let map = read_base_map(&wc, "svn/base").unwrap();
+    assert_eq!(map.floor, 1);
     assert_eq!(
-        run_git(&fx.wc_str(), &["rev-parse", "svn/base"]).unwrap(),
+        map.revs,
+        std::collections::BTreeMap::from([("Code/A.cs".to_string(), 2)])
+    );
+    assert!(map.gone.is_empty());
+    let msg = run_git(&wc, &["log", "-1", "--format=%B", "svn/base"]).unwrap();
+    assert!(
+        parse_trailer(&msg).is_none(),
+        "混合时不写 git-svn-id（分析 §6.1）：\n{msg}"
+    );
+    assert_eq!(
+        run_git(&wc, &["cat-file", "blob", "svn/base:Code/A.cs"]).unwrap(),
+        "v2\n",
+        "录的是 A.cs 在 r2 的内容"
+    );
+    assert_eq!(
+        run_git(&wc, &["rev-parse", "svn/base^"]).unwrap().trim(),
+        base_before,
+        "重建的父提交仍是旧基线"
+    );
+    assert_eq!(
+        app_lib::engine::svn_sync::check_sync(&wc).unwrap().verdict,
+        app_lib::engine::svn_sync::SyncVerdict::InSync,
+        "重建之后横幅消失"
+    );
+}
+
+#[test]
+fn rebuild_refuses_conflicted_working_copy() {
+    // 分析 §6.3 R2 那条 ⚠️：冲突的文件按「取回 BASE」录，带冲突标记的磁盘内容会被当成
+    // 普通本地改动收下、体检也照样通过，所以冲突必须在 R1 拦住
+    let fx = svn_repo_for_health();
+    init_hybrid(&req(&fx)).unwrap();
+    let url = svn_fixtures::file_url(&fx.repo());
+    svn(fx.path(), &["checkout", &url, "wc2", "--non-interactive"]);
+    let wc2 = fx.path().join("wc2");
+    std::fs::write(wc2.join("Code/A.cs"), "theirs\n").unwrap();
+    svn(&wc2, &["commit", "-m", "r2", "--non-interactive"]);
+    std::fs::write(fx.wc().join("Code/A.cs"), "mine\n").unwrap();
+    svn(
+        &fx.wc(),
+        &["update", "--accept", "postpone", "--non-interactive"],
+    );
+    let wc = fx.wc_str();
+    let base_before = run_git(&wc, &["rev-parse", "svn/base"]).unwrap();
+
+    let err = rebuild_baseline(&wc).expect_err("有 SVN 冲突时必须拒绝重建");
+
+    assert_eq!(err.code, "svn_preflight_conflicted", "{}", err.message);
+    assert!(err.message.contains("Code/A.cs"), "{}", err.message);
+    assert_eq!(
+        run_git(&wc, &["rev-parse", "svn/base"]).unwrap(),
         base_before,
         "被拒之后基线指针不许动"
     );
+}
+
+// —— Review 1 第 6 条：混合 R1 的其余几种拒绝 ——
+
+/// 已初始化的 svn_repo_for_health，外加一个同仓库的第二工作副本 wc2（扮演同事）。
+fn initialized_with_wc2() -> (SvnFixture, std::path::PathBuf) {
+    let fx = svn_repo_for_health();
+    init_hybrid(&req(&fx)).unwrap();
+    let url = svn_fixtures::file_url(&fx.repo());
+    svn(fx.path(), &["checkout", &url, "wc2", "--non-interactive"]);
+    let wc2 = fx.path().join("wc2");
+    (fx, wc2)
+}
+
+fn assert_rebuild_refused(fx: &SvnFixture, code: &str, needle: &str) {
+    let wc = fx.wc_str();
+    let base_before = run_git(&wc, &["rev-parse", "svn/base"]).unwrap();
+    let err = rebuild_baseline(&wc).expect_err("必须拒绝重建");
+    assert_eq!(err.code, code, "{}", err.message);
+    assert!(err.message.contains(needle), "{}", err.message);
+    assert_eq!(
+        run_git(&wc, &["rev-parse", "svn/base"]).unwrap(),
+        base_before,
+        "被拒之后基线指针不许动"
+    );
+}
+
+#[test]
+fn rebuild_refuses_tree_conflict() {
+    // 同事删了 A，本地改了 A，update → 树冲突（local edit, incoming delete）
+    let (fx, wc2) = initialized_with_wc2();
+    svn(&wc2, &["delete", "--non-interactive", "--", "Code/A.cs@"]);
+    svn(&wc2, &["commit", "-m", "r2", "--non-interactive"]);
+    std::fs::write(fx.wc().join("Code/A.cs"), "mine\n").unwrap();
+    svn(
+        &fx.wc(),
+        &["update", "--accept", "postpone", "--non-interactive"],
+    );
+    let st = run_svn(&fx.wc_str(), &["status", "--xml", "--", "Code@"]).unwrap();
+    assert!(st.contains("tree-conflicted=\"true\""), "前提：{st}");
+
+    assert_rebuild_refused(&fx, "svn_preflight_conflicted", "Code/A.cs");
+}
+
+#[test]
+fn rebuild_refuses_property_only_conflict() {
+    // 只有属性冲突时 item 仍是 normal，节点状态里看不出来，要看 props（check_recordable 的第二段）
+    let (fx, wc2) = initialized_with_wc2();
+    svn(
+        &wc2,
+        &[
+            "propset",
+            "k",
+            "theirs",
+            "--non-interactive",
+            "--",
+            "Code/A.cs@",
+        ],
+    );
+    svn(&wc2, &["commit", "-m", "r2", "--non-interactive"]);
+    svn(
+        &fx.wc(),
+        &[
+            "propset",
+            "k",
+            "mine",
+            "--non-interactive",
+            "--",
+            "Code/A.cs@",
+        ],
+    );
+    svn(
+        &fx.wc(),
+        &["update", "--accept", "postpone", "--non-interactive"],
+    );
+    let st = run_svn(&fx.wc_str(), &["status", "--xml", "--", "Code@"]).unwrap();
+    assert!(st.contains("props=\"conflicted\""), "前提：{st}");
+    assert!(
+        !st.contains("item=\"conflicted\""),
+        "前提：只有属性冲突，{st}"
+    );
+
+    assert_rebuild_refused(&fx, "svn_preflight_conflicted", "Code/A.cs");
+}
+
+#[cfg(windows)]
+#[test]
+fn rebuild_refuses_a_locked_subdirectory() {
+    // 只对子目录跑的 update 半途失败：锁在 Code / Code/Deep 上，工作副本根上没有（实测），
+    // P3 的 `--depth=empty` 查不到，要靠 R1 从节点状态里看出来
+    use std::os::windows::fs::OpenOptionsExt;
+    let (fx, wc2) = initialized_with_wc2();
+    std::fs::write(wc2.join("Code/Deep/D.cs"), "d2\n").unwrap();
+    svn(&wc2, &["commit", "-m", "r2", "--non-interactive"]);
+    {
+        let _hold = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(fx.wc().join("Code/Deep/D.cs"))
+            .unwrap();
+        let ok = Command::new("svn")
+            .current_dir(fx.wc())
+            .args(["update", "--non-interactive", "--", "Code/Deep@"])
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(!ok, "前提：被独占的文件让 update 半途失败");
+    }
+    let root = run_svn(
+        &fx.wc_str(),
+        &["status", "--depth=empty", "--xml", "--", ".@"],
+    )
+    .unwrap();
+    assert!(
+        !root.contains("wc-locked"),
+        "前提：工作副本根上没有锁，{root}"
+    );
+
+    assert_rebuild_refused(&fx, "svn_preflight_operation_in_progress", "Code/Deep");
+}
+
+// —— Review 1 第 1、2 条 ——
+
+#[test]
+fn init_refuses_when_a_committed_deletion_cannot_be_confirmed() {
+    // 第 1 条：floor 组的 D 问不到服务器时不能当成 NotChecked 放行——那会发布一个静默丢了
+    // D.cs、又没有墓碑的基线。初始化整个回退
+    let fx = svn_repo_for_health();
+    svn(
+        &fx.wc(),
+        &["delete", "--non-interactive", "--", "Code/Deep/D.cs@"],
+    );
+    svn(&fx.wc(), &["commit", "-m", "r2", "--non-interactive"]);
+
+    let err = {
+        let _armed = fault::arm(Point::ConfirmAbsent);
+        init_hybrid(&req(&fx)).expect_err("确认不了删除时必须拒绝")
+    };
+    assert_eq!(err.code, "svn_baseline_unconfirmed", "{}", err.message);
+    assert!(err.message.contains("Code/Deep/D.cs"), "{}", err.message);
+    assert!(!fx.wc().join(".git").exists(), "初始化失败要整个回退");
+
+    // 对照：撤掉注入后照常建库、记墓碑（`init_records_committed_deletion_as_tombstone`）
+    init_hybrid(&req(&fx)).unwrap();
+}
+
+#[test]
+fn commit_all_without_update_after_colleague_added_file_keeps_dir_floor() {
+    // 第 2 条：Code@1 有 A、B；同事 r2 新增 Code/X.cs；用户只提交 A、B 到 r3、没 update。
+    // 文件都到了 r3，目录 Code 还在 r1，工作副本里没有 X。floor 只看文件会取 3，而 `Code@3`
+    // 有 X、基线树里没有：在线时被误报漏收（svn_baseline_excluded_paths），离线时发布撒谎的单值
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/X.cs", "x2\n"); // r2
+    std::fs::write(fx.wc().join("Code/A.cs"), "a3\n").unwrap();
+    std::fs::write(fx.wc().join("Code/B.cs"), "b3\n").unwrap();
+    svn(
+        &fx.wc(),
+        &[
+            "commit",
+            "-m",
+            "r3",
+            "--non-interactive",
+            "--",
+            "Code/A.cs@",
+            "Code/B.cs@",
+        ],
+    );
+    let wc = fx.wc_str();
+    assert!(!fx.wc().join("Code/X.cs").exists(), "前提：没 update");
+
+    let report = rebuild_baseline(&wc).expect("不能误报漏收");
+
+    assert!(
+        matches!(report.health, Health::Verified { .. }),
+        "{:?}",
+        report.health
+    );
+    let map = read_base_map(&wc, "svn/base").unwrap();
+    assert_eq!(map.floor, 1, "floor = 目录 Code 的 revision");
+    assert_eq!(
+        map.revs,
+        std::collections::BTreeMap::from([
+            ("Code/A.cs".to_string(), 3),
+            ("Code/B.cs".to_string(), 3)
+        ])
+    );
+    assert!(map.gone.is_empty(), "{:?}", map.gone);
+    assert_eq!(
+        app_lib::engine::svn_sync::check_sync(&wc).unwrap().verdict,
+        app_lib::engine::svn_sync::SyncVerdict::InSync
+    );
+    assert!(
+        matches!(
+            check_current_baseline(&wc).unwrap(),
+            Health::Verified { .. }
+        ),
+        "手动体检也要站得住"
+    );
+}
+
+#[test]
+fn init_accepts_mixed_revision_working_copy() {
+    // 分析 §10 Q4：初始化也允许混合版本。整体 r3，`Code/B.cs` 提交到了 r4、没 update
+    let fx = svn_repo_committed_without_update();
+    let wc = fx.wc_str();
+    let report = init_hybrid(&req(&fx)).expect("混合版本的工作副本必须能建库");
+
+    assert_eq!(report.node_rev, 3, "node_rev 是 floor");
+    assert!(
+        matches!(report.health, Health::Verified { .. }),
+        "{:?}",
+        report.health
+    );
+    let map = read_base_map(&wc, "svn/base").unwrap();
+    assert_eq!(map.floor, 3);
+    assert_eq!(
+        map.revs,
+        std::collections::BTreeMap::from([("Code/B.cs".to_string(), 4)])
+    );
+    assert!(map.gone.is_empty());
+    assert_eq!(
+        run_git(&wc, &["cat-file", "blob", "svn/base:Code/B.cs"]).unwrap(),
+        "v4\n"
+    );
+    assert_eq!(
+        run_git(&wc, &["rev-list", "--parents", "-1", "svn/base"])
+            .unwrap()
+            .split_whitespace()
+            .count(),
+        1,
+        "首个基线无父提交"
+    );
+    assert_eq!(
+        app_lib::engine::svn_sync::check_sync(&wc).unwrap().verdict,
+        app_lib::engine::svn_sync::SyncVerdict::InSync
+    );
+}
+
+#[test]
+fn init_records_committed_deletion_as_tombstone() {
+    // 在 TortoiseSVN 里提交了一次删除、没 update：被删的文件从工作副本里消失，其余节点留在 r1。
+    // 改造前 floor 组那条 D 解释不了，体检报 Lying、整个回退；现在向服务器确认它在 HEAD
+    // 上已不存在，记成墓碑（分析 §6.3 / §10 Q4，日志「墓碑的产生方式」）
+    let fx = svn_repo_for_health();
+    svn(
+        &fx.wc(),
+        &["delete", "--non-interactive", "--", "Code/Deep/D.cs@"],
+    );
+    svn(&fx.wc(), &["commit", "-m", "r2", "--non-interactive"]);
+    let wc = fx.wc_str();
+
+    let report = init_hybrid(&req(&fx)).expect("提交删除之后必须能建库");
+
+    assert_eq!(report.node_rev, 1);
+    assert!(
+        matches!(report.health, Health::Verified { .. }),
+        "{:?}",
+        report.health
+    );
+    let map = read_base_map(&wc, "svn/base").unwrap();
+    assert_eq!(map.floor, 1);
+    assert!(map.revs.is_empty(), "{:?}", map.revs);
+    assert_eq!(
+        map.gone,
+        std::collections::BTreeMap::from([("Code/Deep/D.cs".to_string(), 2)]),
+        "墓碑记确认删除时的服务器 HEAD"
+    );
+    let listed = run_git(&wc, &["ls-tree", "-r", "--name-only", "svn/base"]).unwrap();
+    assert!(!listed.contains("Code/Deep/D.cs"), "{listed}");
+    let msg = run_git(&wc, &["log", "-1", "--format=%B", "svn/base"]).unwrap();
+    assert!(msg.contains("Svn-Base-Gone: 2 Code/Deep/D.cs"), "{msg}");
+    assert_eq!(
+        app_lib::engine::svn_sync::check_sync(&wc).unwrap().verdict,
+        app_lib::engine::svn_sync::SyncVerdict::InSync
+    );
+}
+
+#[test]
+fn check_current_baseline_verifies_mixed_baseline() {
+    // 改造前这里只认 `git-svn-id`，混合基线一律报 svn_baseline_no_trailer
+    let fx = svn_repo_committed_without_update();
+    init_hybrid(&req(&fx)).unwrap();
+    match check_current_baseline(&fx.wc_str()).unwrap() {
+        Health::Verified { rev, unverified } => {
+            assert_eq!(rev, 3, "报的是 floor");
+            assert!(unverified.is_empty(), "{unverified:?}");
+        }
+        other => panic!("混合基线是真的，必须 Verified，实际：{other:?}"),
+    }
 }
 
 #[test]

@@ -4,13 +4,34 @@
  * 从 `RepoTab` 里拆出来，是为了能在 node 环境里直接测先后顺序（清错 → 预览 → 确认 →
  * 执行 → 刷新 → 结局），不必渲染整个标签页。不依赖 React：依赖全部从参数进来。
  */
-import { svnSyncAbort, svnSyncContinue, svnSyncIn, svnSyncInPreview } from '../store/repoStore'
+import {
+  svnFollow,
+  svnFollowContinue,
+  svnFollowManual,
+  svnSyncAbort,
+  svnSyncContinue,
+  svnSyncIn,
+  svnSyncInPreview,
+} from '../store/repoStore'
+import {
+  describeCheckoutBehind,
+  describeFollowConflict,
+  describeFollowContinue,
+  describeFollowOutcome,
+  describeManualFollow,
+  describeManualFollowAction,
+  describeManualFollowOutcome,
+  type FollowActionId,
+  type FollowOutcome,
+  type FollowReport,
+} from '../engine/svnFollow'
 import {
   describeSyncAction,
   describeSyncInPreview,
   describeSyncOutcome,
   expectFromPreview,
   type SyncActionId,
+  type SyncConfirmModel,
   type SyncInOutcome,
 } from '../engine/svnSyncIn'
 import type { SyncState, SyncStateUnreadable } from '../engine/svnJournal'
@@ -36,6 +57,14 @@ export interface SvnSyncFlowDeps {
   refreshSvnSyncState: (path: string) => Promise<void>
   refreshSvnSync: (path: string) => Promise<void>
   fetchSvnLog: (path: string) => Promise<unknown>
+  /** 跟进执行中。横幅上的按钮据此禁用：跟进要走服务器体检，这几秒里没有框挡着。 */
+  setFollowing: (busy: boolean) => void
+  /** 跟进之后刷新 HEAD、提交图、本地改动与落后基线的分支。可以抛，流程接住。 */
+  refreshAfterFollow: () => Promise<void>
+  /** 弹跟进报告，关掉时结束。 */
+  showFollowReport: (report: FollowReport) => Promise<void>
+  /** 切分支并刷新。失败要抛：「切换并手动跟进」据此停下。 */
+  checkoutBranch: (name: string) => Promise<void>
 }
 
 export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
@@ -56,9 +85,22 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
     void d.fetchSvnLog(d.repoPath)
   }
 
+  /**
+   * 跟进之后多刷一份。`repo-changed` 也会补发，这里不靠它：报告弹出来时界面要已经是新的。
+   * 同样不抛，跟进已经落地了。
+   */
+  const afterFollow = async () => {
+    try {
+      await d.refreshAfterFollow()
+    } catch (err) {
+      d.reportError(err)
+    }
+    await afterSync()
+  }
+
   /** 冲突、撞名、放弃这几种结局要让用户看见；成功不打扰。`notice` 让它只有一个按钮。 */
-  const showOutcome = async (o: SyncInOutcome | null) => {
-    const n = o && describeSyncOutcome(o)
+  const showOutcome = async (o: SyncInOutcome | null, manual = false) => {
+    const n = o && (manual ? describeManualFollowOutcome(o) : describeSyncOutcome(o))
     if (!n) return
     await d.confirm({ title: n.title, message: n.detail, confirmLabel: '知道了', notice: n.tone })
   }
@@ -118,21 +160,133 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
     // 「继续」会接着跑 rebase；「放弃」只是回退，不合并
     if (id === 'syncContinue' && !(await d.guardMerge())) return
     const s = d.syncState()
-    const phase = s && !('readError' in s) && s.unfinished ? s.unfinished.phase : 'start'
+    const unfinished = s && !('readError' in s) ? s.unfinished : null
+    const phase = unfinished ? unfinished.phase : 'start'
+    // 手动跟进的记录走同一对命令，只换说法（后端 `take_over` 接手两种 flow）
+    const manual = unfinished?.flow === 'follow_manual'
     const box: { outcome: SyncInOutcome | null } = { outcome: null }
     await d.confirm({
-      ...describeSyncAction(id, phase),
+      ...(manual ? describeManualFollowAction(id, phase) : describeSyncAction(id, phase)),
       action: async () => {
         box.outcome =
           id === 'syncContinue' ? await svnSyncContinue(d.repoPath) : await svnSyncAbort(d.repoPath)
         await afterSync()
       },
     })
-    await showOutcome(box.outcome)
+    await showOutcome(box.outcome, manual)
+  }
+
+  /**
+   * 手动跟进（分析 §6.5）：跟进冲突时的兜底，会写磁盘，所以永远走确认框，绝不自动发起。
+   * 结局与冲突出口沿用更新，后续的继续 / 放弃走 {@link syncAction}。调用方负责先过 merge driver。
+   */
+  const confirmManualFollow = async (model: SyncConfirmModel) => {
+    const box: { outcome: SyncInOutcome | null } = { outcome: null }
+    await d.confirm({
+      ...model,
+      action: async () => {
+        box.outcome = await svnFollowManual(d.repoPath)
+        await afterSync()
+      },
+    })
+    await showOutcome(box.outcome, true)
+  }
+
+  /** 「切换并手动跟进」切过去之后的那一步。调用方已在 `exclusive` 里。 */
+  const manualFollow = async () => {
+    d.clearError()
+    // rebase 与放回都会调用 merge driver
+    if (!(await d.guardMerge())) return
+    await confirmManualFollow(describeManualFollow())
+  }
+
+  /** 按跟进的结局走下一步。`needsManual` 这时 merge driver 已经确认过了。 */
+  const settleFollow = async (o: FollowOutcome) => {
+    if (o.kind === 'done') {
+      await d.showFollowReport(o.report)
+      return
+    }
+    if (o.kind === 'needsManual') {
+      await confirmManualFollow(describeFollowConflict(o))
+      return
+    }
+    const n = describeFollowOutcome(o)
+    await d.confirm({ title: n.title, message: n.detail, confirmLabel: '知道了', notice: n.tone })
+  }
+
+  /**
+   * 横幅上的「跟进」（分析 §6.5）。不写工作区，所以不要确认框；重放走 merge-tree，要过
+   * merge driver 确认。跑的时候没有框挡着，靠 `setFollowing` 让按钮有反应。
+   */
+  const follow = async () => {
+    d.clearError()
+    if (!(await d.guardMerge())) return
+    d.setFollowing(true)
+    let outcome: FollowOutcome
+    try {
+      outcome = await svnFollow(d.repoPath)
+      await afterFollow()
+    } catch (err) {
+      d.reportError(err)
+      return
+    } finally {
+      d.setFollowing(false)
+    }
+    await settleFollow(outcome)
+  }
+
+  /**
+   * 切到落后基线的分支（分析 §6.11.3）。切分支被工作区改动挡住时报错就停，不替用户 stash：
+   * 那是另一次要确认的操作，手动跟进自己的 stash 要等切过去之后才轮得到。
+   */
+  const checkoutBehind = async (branch: string) => {
+    d.clearError()
+    const { alternativeLabel, ...model } = describeCheckoutBehind(branch)
+    const box = { onlySwitch: false }
+    const follow = await d.confirm({
+      ...model,
+      alternative: {
+        label: alternativeLabel,
+        onSelect: () => {
+          box.onlySwitch = true
+        },
+      },
+    })
+    if (!follow && !box.onlySwitch) return
+    try {
+      await d.checkoutBranch(branch)
+    } catch (err) {
+      d.reportError(err)
+      return
+    }
+    if (follow) await manualFollow()
+  }
+
+  /**
+   * 横幅上跟进记录的「继续」（计划 Task 10）。恢复走不下去时会重新跟进，重放要走 merge-tree，
+   * 所以和更新的「继续」一样先过 merge driver 确认。
+   */
+  const followContinue = async () => {
+    d.clearError()
+    if (!(await d.guardMerge())) return
+    const box: { outcome: FollowOutcome | null } = { outcome: null }
+    await d.confirm({
+      ...describeFollowContinue(),
+      action: async () => {
+        box.outcome = await svnFollowContinue(d.repoPath)
+        await afterFollow()
+      },
+    })
+    if (box.outcome) await settleFollow(box.outcome)
   }
 
   return {
     handleSvnUpdate: () => exclusive(svnUpdate),
-    handleSyncAction: (id: SyncActionId) => exclusive(() => syncAction(id)),
+    handleFollow: () => exclusive(follow),
+    // 没有单独的「手动跟进」入口（Review 3 第 4 条）：它只经由跟进冲突的确认框与「切换并手动跟进」
+    // 发起，两处都已在 `exclusive` 里，见 `settleFollow` 与 `checkoutBehind`
+    handleCheckoutBehind: (branch: string) => exclusive(() => checkoutBehind(branch)),
+    handleSyncAction: (id: SyncActionId | FollowActionId) =>
+      exclusive(() => (id === 'followContinue' ? followContinue() : syncAction(id))),
   }
 }

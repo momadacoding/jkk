@@ -257,9 +257,10 @@ fn an_in_sync_working_copy_previews_no_catch_up() {
 }
 
 #[test]
-fn a_mixed_revision_working_copy_is_still_refused() {
-    // A16 只接管「整体前进」。在 wc1 自己身上外部只提交一个文件造出 mixed-revision
-    // （spec 必测 #13 的造法），它归 §9.4（2d）
+fn a_commit_without_update_previews_a_catch_up_at_the_new_floor() {
+    // 计划 Task 5：任何 ExternallyAdvanced 都由 A16 接管（重建已能录混合版本）。
+    // 在 wc1 自己身上外部只提交一个文件造出 mixed-revision（spec 必测 #13 的造法）：
+    // A.cs 在 r2、B.cs 仍在 r1，接管后的 floor 是 1。改造前这里报 sync_in_out_of_sync
     let fx = hybrid_with_colleague();
     std::fs::write(fx.wc().join("Code/A.cs"), "a-external\n").unwrap();
     svn_cmd(
@@ -267,11 +268,11 @@ fn a_mixed_revision_working_copy_is_still_refused() {
         &["commit", "-m", "external", "--non-interactive", "Code/A.cs"],
     );
     let base = git(&fx, &["rev-parse", "svn/base"]);
-    assert_eq!(
-        code_of(preview_sync_in(&fx.wc_str())),
-        "sync_in_out_of_sync"
-    );
-    assert_eq!(git(&fx, &["rev-parse", "svn/base"]), base);
+    let p = preview_sync_in(&fx.wc_str()).unwrap();
+    assert_eq!(p.catch_up_rev, Some(1), "catch_up_rev 是接管之后的 floor");
+    assert_eq!(p.baseline_rev, 1);
+    assert_eq!(p.target_rev, 2);
+    assert_eq!(git(&fx, &["rev-parse", "svn/base"]), base, "预览不动基线");
 }
 
 #[test]

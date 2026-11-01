@@ -4,7 +4,7 @@
 //! 每个字段都会被送进 git 或 svn 的命令行（spec §6.2.1）。
 
 use app_lib::engine::svn_config::{
-    normalize_whitelist_entry, read_config, validate, validate_new_extensions,
+    normalize_whitelist_entry, read_config, set_svn_user, validate, validate_new_extensions,
     validate_whitelist_against_disk, write_config, DisabledGitignore, SvnConfig,
 };
 use std::fs;
@@ -20,6 +20,7 @@ fn ok_config() -> SvnConfig {
         baseline_branch: "svn/base".to_string(),
         respect_gitignore: false,
         disabled_gitignores: Vec::new(),
+        svn_user: None,
     }
 }
 
@@ -99,6 +100,59 @@ fn a_respect_config_is_written_as_version_2_with_its_rename_record() {
     );
     // 读回来校验得过（`ok_config` 的白名单在磁盘上不存在，不影响读配置）
     assert_eq!(read_config(root).unwrap(), cfg);
+}
+
+#[test]
+fn svn_user_round_trips_and_stays_out_of_files_that_never_set_it() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_str().unwrap();
+
+    write_config(root, &ok_config()).unwrap();
+    let raw = fs::read_to_string(dir.path().join(".git/mygitclient.json")).unwrap();
+    assert!(!raw.contains("svnUser"), "没设就不写，实际 {raw}");
+    assert_eq!(read_config(root).unwrap().svn_user, None);
+
+    let mut cfg = ok_config();
+    cfg.svn_user = Some("zhangsan".to_string());
+    write_config(root, &cfg).unwrap();
+    let raw = fs::read_to_string(dir.path().join(".git/mygitclient.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(json["svnUser"], "zhangsan");
+    assert_eq!(read_config(root).unwrap(), cfg);
+}
+
+#[test]
+fn concurrent_set_svn_user_calls_do_not_collide_on_the_temp_file() {
+    // Review 3 第 3 条：临时文件名原先固定为 `mygitclient.json.tmp`，两次写同时进来时一边的 rename
+    // 把另一边的临时文件拿走，另一边 rename 报「找不到文件」，或者写进对方正要 rename 的文件
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_str().unwrap().to_string();
+    write_config(&root, &ok_config()).unwrap();
+
+    let writers: Vec<_> = (0..8)
+        .map(|i| {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                for n in 0..25 {
+                    set_svn_user(&root, &format!("u{i}-{n}"))
+                        .map_err(|e| format!("{}: {}", e.code, e.message))?;
+                }
+                Ok::<(), String>(())
+            })
+        })
+        .collect();
+    for w in writers {
+        w.join().unwrap().unwrap();
+    }
+
+    let user = read_config(&root).unwrap().svn_user.unwrap();
+    assert!(user.starts_with('u'), "{user}");
+    let leftovers: Vec<String> = fs::read_dir(dir.path().join(".git"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|n| n.contains(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "临时文件都该收掉：{leftovers:?}");
 }
 
 #[test]

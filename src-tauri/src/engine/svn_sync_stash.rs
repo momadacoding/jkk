@@ -11,6 +11,7 @@ use crate::engine::svn_include_check::normalize_roots;
 use crate::engine::svn_journal::{self, Journal, Phase};
 use crate::engine::svn_sync_check::unmerged_paths;
 use crate::error::{GitError, Result};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 pub const MSG_PREFIX: &str = "mygitclient-sync:";
@@ -120,6 +121,24 @@ pub enum RestoreOutcome {
 
 /// S10：按 OID 取回。
 pub fn restore_wip(repo: &str, oid: &str) -> Result<RestoreOutcome> {
+    Ok(restore(repo, oid, false)?.0)
+}
+
+/// 手动跟进的 S10（分析 §6.11.1、W7）：先带 `--index`，保住暂存与未暂存的区分。
+///
+/// 第二个返回值：「已暂存」的状态没保住。实测 `--index` 有两种失败（git 2.51）：
+///
+/// - 暂存补丁打不到新 HEAD 上（`conflicts in index`）：什么都没写，退回不带 `--index`；
+/// - 暂存打得上、未暂存的部分冲突（`Index was not unstashed`）：现场与不带 `--index` 冲突时相同，
+///   直接走冲突出口，再 apply 一次只会撞上自己。
+///
+/// 退回之后暂存的那一份只在 stash 里：返回 `true` 时调用方**不能 drop**（Review 3 第 1 条，
+/// 见 [`staged_only_paths`]）。
+pub fn restore_wip_keeping_index(repo: &str, oid: &str) -> Result<(RestoreOutcome, bool)> {
+    restore(repo, oid, true)
+}
+
+fn restore(repo: &str, oid: &str, keep_index: bool) -> Result<(RestoreOutcome, bool)> {
     let parents = stash_parents(repo, oid)?;
     // 带 `-u` 的 stash 有第三个父提交，里面是未跟踪文件。
     //
@@ -150,7 +169,7 @@ pub fn restore_wip(repo: &str, oid: &str) -> Result<RestoreOutcome> {
         }
         // 真撞名时**一个字节都不动**：字节相同的那批也还没删
         if !collisions.is_empty() {
-            return Ok(RestoreOutcome::Blocked { collisions });
+            return Ok((RestoreOutcome::Blocked { collisions }, false));
         }
         // 计划 A17：三处同一个 blob 的，先从磁盘拿掉，让 apply 把同样的字节写回来。
         // 删的是 HEAD 里原样存着的内容，不是用户独有的数据
@@ -158,22 +177,10 @@ pub fn restore_wip(repo: &str, oid: &str) -> Result<RestoreOutcome> {
             std::fs::remove_file(Path::new(repo).join(p))?;
         }
     }
-    let result = match run_git(repo, &["stash", "apply", oid]) {
-        Ok(_) => Ok(RestoreOutcome::Applied),
-        Err(e) => {
-            let files = unmerged_paths(repo)?;
-            if files.is_empty() {
-                Err(GitError::new(
-                    "sync_stash_apply_failed",
-                    format!(
-                        "取回未提交改动失败了，而且不是冲突。stash 原样保留（{oid}）。git 原话：{}",
-                        e.message
-                    ),
-                ))
-            } else {
-                Ok(RestoreOutcome::Conflicted { files })
-            }
-        }
+    let result = if keep_index {
+        apply_keeping_index(repo, oid)
+    } else {
+        apply_plain(repo, oid).map(|o| (o, false))
     };
     // apply 没把它们写回来（中途失败）时从 HEAD 取回：HEAD 里就是同一个 blob。
     // `p` 来自 ls-tree，不会是空 pathspec（§12.2）
@@ -183,6 +190,88 @@ pub fn restore_wip(repo: &str, oid: &str) -> Result<RestoreOutcome> {
         }
     }
     result
+}
+
+fn apply_plain(repo: &str, oid: &str) -> Result<RestoreOutcome> {
+    match run_git(repo, &["stash", "apply", oid]) {
+        Ok(_) => Ok(RestoreOutcome::Applied),
+        Err(e) => {
+            let files = unmerged_paths(repo)?;
+            if files.is_empty() {
+                Err(apply_failed(oid, &e))
+            } else {
+                Ok(RestoreOutcome::Conflicted { files })
+            }
+        }
+    }
+}
+
+fn apply_failed(oid: &str, e: &GitError) -> GitError {
+    GitError::new(
+        "sync_stash_apply_failed",
+        format!(
+            "取回未提交改动失败了，而且不是冲突。stash 原样保留（{oid}）。git 原话：{}",
+            e.message
+        ),
+    )
+}
+
+/// 见 [`restore_wip_keeping_index`]。
+///
+/// 能不能退回要看现场，不看 git 的报错文字（会随语言变）：工作区和索引都和 apply 之前一样，才是
+/// 「什么都没写」。对不上就是没见过的失败形状，再 apply 会叠在半成品上，停下，stash 原样保留。
+fn apply_keeping_index(repo: &str, oid: &str) -> Result<(RestoreOutcome, bool)> {
+    let before = status_all(repo)?;
+    let Err(e) = run_git(repo, &["stash", "apply", "--index", oid]) else {
+        return Ok((RestoreOutcome::Applied, false));
+    };
+    let files = unmerged_paths(repo)?;
+    if !files.is_empty() {
+        return Ok((RestoreOutcome::Conflicted { files }, true));
+    }
+    if status_all(repo)? != before {
+        return Err(apply_failed(oid, &e));
+    }
+    Ok((apply_plain(repo, oid)?, true))
+}
+
+/// stash 里暂存版本与磁盘版本不同的路径：暂存改过它（`^1` → `^2`），而 stash 自己的树（apply
+/// 放回的工作区那一份）又不是暂存的那一份（Review 3 第 1 条）。
+///
+/// 不带 `--index` 的 apply 只放回工作区那一份。这些路径的暂存版本此后**只在 stash 里**，drop 掉
+/// 就只剩悬空对象，gc 之后找不回来。暂存与磁盘相同的路径不在内：内容都在磁盘上，丢的只是
+/// 「已暂存」的标记。
+pub fn staged_only_paths(repo: &str, oid: &str) -> Result<Vec<String>> {
+    let parents = stash_parents(repo, oid)?;
+    let changed = |from: &str, to: &str| -> Result<BTreeSet<String>> {
+        Ok(run_git(
+            repo,
+            &[
+                "diff-tree",
+                "-r",
+                "-z",
+                "--no-renames",
+                "--name-only",
+                from,
+                to,
+            ],
+        )?
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect())
+    };
+    let staged = changed(&parents[0], &parents[1])?;
+    let differs = changed(&parents[1], oid)?;
+    Ok(staged.intersection(&differs).cloned().collect())
+}
+
+/// 工作区与索引的现状。未跟踪文件逐个列出：只写回一部分的半成品也要看得见。
+fn status_all(repo: &str) -> Result<String> {
+    run_git(
+        repo,
+        &["status", "--porcelain", "-z", "--untracked-files=all"],
+    )
 }
 
 /// 计划 A17：stash 里的这个未跟踪文件，与磁盘上撞名的文件、HEAD 里的同名文件是
