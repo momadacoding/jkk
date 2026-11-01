@@ -166,6 +166,14 @@ export function RepoTab({
   const [selectedBranch, setSelectedBranch] = useState<string | null>(null)
   const [selectedTag, setSelectedTag] = useState<string | null>(null)
   const [selectedWorktree, setSelectedWorktree] = useState<string | null>(null)
+  // 侧边栏单击定位的请求计数，见 GraphView 的 `revealSeq`
+  const [revealSeq, setRevealSeq] = useState(0)
+
+  /** 选中并把 graph 滚到这个提交；选中没变（再点同一个分支）时也要重新滚。 */
+  const revealCommit = useCallback((hash: string) => {
+    selectCommit(hash)
+    setRevealSeq((n) => n + 1)
+  }, [selectCommit])
   const { prompt, dialog: promptDialog } = usePrompt()
   const { confirm, dialog: confirmDialog } = useConfirm()
   const { deliver, dialog: deliverDialog } = useDeliverDialog()
@@ -496,8 +504,8 @@ export function RepoTab({
   const handleSelectBranch = useCallback((name: string, hash: string) => {
     setSelectedBranch(name)
     setViewMode('commits') // 否则在 Local Changes 视图下点分支毫无反馈
-    selectCommit(hash)
-  }, [selectCommit])
+    revealCommit(hash)
+  }, [revealCommit])
 
   /**
    * 单击 tag：只选中并把 graph 定位到它指向的提交，不碰工作区。
@@ -513,8 +521,8 @@ export function RepoTab({
       reportError(`tag "${name}" 指向的提交 (${hash.slice(0, 7)}) 不在当前提交图中`)
       return
     }
-    selectCommit(hash)
-  }, [selectCommit, state.commits, reportError])
+    revealCommit(hash)
+  }, [revealCommit, state.commits, reportError])
 
   /**
    * 双击 tag：检出到它指向的提交。这会进入游离 HEAD，是 git 的正常语义。
@@ -549,8 +557,8 @@ export function RepoTab({
       reportError(`worktree "${name}" 的 HEAD (${headHash.slice(0, 7)}) 不在当前提交图中`)
       return
     }
-    selectCommit(headHash)
-  }, [selectCommit, state.commits, reportError])
+    revealCommit(headHash)
+  }, [revealCommit, state.commits, reportError])
 
   // stash 提交不被任何分支引用，所以不在 load_graph 的输出里。选中一条 stash 时
   // 从它自己的元数据现搭一个 CommitNode，否则详情面板只会显示 "Select a commit"——
@@ -903,6 +911,7 @@ export function RepoTab({
                     refs={state.refs}
                     pullRequests={state.pullRequests}
                     selectedId={state.selectedId}
+                    revealSeq={revealSeq}
                     onSelect={selectCommit}
                     headHash={graphHeadHash}
                     changeCount={state.status.unstaged.length + state.status.staged.length}
