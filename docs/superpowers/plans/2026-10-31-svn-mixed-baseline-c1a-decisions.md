@@ -32,11 +32,12 @@
 
 | # | 事项 | 当前采用的保守做法 | 位置 |
 |---|---|---|---|
-| D1 | 实现期间是否按 Task 提交 commit（AGENTS.md §1.1 要求用户放行；用户全局规则允许 worktree 分支例行提交） | 不 commit，进度以本文件为准 | 全程 |
-| D2 | 映射条目上限 | `MAX_MAP_ENTRIES = 5000`，不做目录压缩 | Task 1、2 |
-| D3 | 跟进钉住旧索引的 ref 保留多少 | 最近 20 个（`KEEP_PINS`，已实现） | Task 10 |
-| D4 | 「我的 SVN 用户名」取不到时 | 一律当「不是我」，暂存走三方合并，commit 正常重放（不会误丢数据，只是 U2 / U3 的中间版本不会自动让位）。Task 9 已实现 `my_svn_user`：`svnUser` 配置优先，否则看 `svn auth`；`None` 的情形是 `file://`、没有缓存、同一服务器多个不同用户名、非 ASCII 用户名（管道输出是 GBK，见 Task 9）。入口已加（Task 11）：跟进报告里 `uncertain` 非空或取不到用户时显示一行输入框，`svn_set_user` 写配置，空串清除。**还要定：** 要不要在设置里也放一个常驻入口（分析 §6.10） | Task 9、10、11 |
-| D5 | Q8：C3 与 C2 的先后 | 不影响 C1a | — |
+| D1 | 实现期间是否按 Task 提交 commit（AGENTS.md §1.1 要求用户放行；用户全局规则允许 worktree 分支例行提交） | **已定（2026-11-01）：** 实现期间不 commit；全部完成后用户放行提交并建 Draft PR | 全程 |
+| D2 | 映射条目上限 | **已定（2026-11-01）：** 保持 `MAX_MAP_ENTRIES = 5000`，不做目录压缩。用户确认白名单一周内变化的代码文件不会超过这个数 | Task 1、2 |
+| D3 | 跟进钉住旧索引的 ref 保留多少 | **已定（2026-11-01）：** 保持最近 20 个（`KEEP_PINS`） | Task 10 |
+| D4 | 「我的 SVN 用户名」取不到时 | 一律当「不是我」，暂存走三方合并，commit 正常重放（不会误丢数据，只是 U2 / U3 的中间版本不会自动让位）。Task 9 已实现 `my_svn_user`：`svnUser` 配置优先，否则看 `svn auth`；`None` 的情形是 `file://`、没有缓存、同一服务器多个不同用户名、非 ASCII 用户名（管道输出是 GBK，见 Task 9）。入口已加（Task 11）：跟进报告里 `uncertain` 非空或取不到用户时显示一行输入框，`svn_set_user` 写配置，空串清除。**已定（2026-11-01）：** 不加常驻入口，维持现状；先手测自动探测在用户机器上能否取到用户名，取不到再议 | Task 9、10、11 |
+| D5 | Q8：C3 与 C2 的先后 | **已定（2026-11-01）：** 先做 C3（在 jkk 里不更新整个项目的交付），再做 C2。不影响 C1a | 分析 §9、§10 Q8 |
+| D11 | 离线跟进：第一条 diff 就失败（通常是断网）时怎么办（Review 2 第 6 条） | **已定（2026-11-01）：** 维持现状，照常发布并在报告里标「未验证」（`verified: false`）；D 已知后的任何失败仍一律 `Unconfirmed` 拒绝。离线录制可能漏记已提交删除，见分析 R35，联网后体检会报出 | Review 2 修复第 6 条 |
 | D6 | Task 3～5 之间 sync_in 遇到 `ExternallyAdvanced` 怎么办（指令要求暂时一律拒绝） | ~~只拒绝「非整体前进」的那部分~~ Task 5 已收口：任何 `ExternallyAdvanced` 都走 A16 接管（`rebuild_baseline` 已能录混合版本），不再报 `sync_in_out_of_sync` | Task 3（`svn_sync_check::uniform_forward_rev`），Task 5 收口 |
 | D7 | ~~Task 11 接线之前，整体前进的横幅只剩一颗不渲染的「跟进」~~ | **已处理**（Task 11）：`RepoTab` 接上 `onFollow`，横幅的「跟进」可用，执行中禁用 | Task 3、11 |
 | D8 | 被 depth-exclude 的节点没法用尾随 PATH 点名（单元根本身、路径含非 ASCII 字符）时怎么判 | **已处理**（Review 1 第 3 条）：对它 `svn ls -R --xml <编码后的 url>@<F>`，列表按 W-file 口径筛，筛出来的与点得了名的走同一条 HEAD 确认；没有 W-file 的不阻断 | Task 4（`svn_health::check_grouped`），Review 1 收口 |
