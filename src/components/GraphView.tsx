@@ -5,6 +5,7 @@ import { computeLayout } from '../engine/layout'
 import { computePaths, filterPathsToBand, laneColor } from '../engine/paths'
 import { createSvgRenderer } from '../engine/svgRenderer'
 import { WORKDIR_ID, withWorkdirRow } from '../engine/workdir'
+import { findDelivered } from '../engine/svnGraph'
 import { CommitRow } from './CommitRow'
 import { ContextMenu, useContextMenu } from './ContextMenu'
 import { commitMenu, type CommitAction } from '../engine/commitActions'
@@ -20,6 +21,13 @@ interface GraphViewProps {
   /** 当前仓库的 open PR，用来在分支标签上带出编号。读不到时是空数组。 */
   pullRequests: PullRequest[]
   selectedId: string | null
+  /**
+   * 定位请求计数。侧边栏单击分支 / tag / worktree 时加一，表示「把选中的提交滚进视口」。
+   *
+   * 只靠 `selectedId` 变化触发定位不够：目标若本来就是选中的提交（打开仓库时默认选中 HEAD），
+   * 用户滚走之后再点同一个分支，`selectedId` 不变，图就停在原地。
+   */
+  revealSeq: number
   onSelect: (id: string) => void
   /** 当前 HEAD 的完整 oid（不是分支名），用来挂工作区伪行。 */
   headHash: string
@@ -43,7 +51,7 @@ interface GraphViewProps {
 const renderer = createSvgRenderer()
 
 export function GraphView({
-  commits, refs, pullRequests, selectedId, onSelect, headHash, changeCount, onOpenChanges, onCommitAction,
+  commits, refs, pullRequests, selectedId, revealSeq, onSelect, headHash, changeCount, onOpenChanges, onCommitAction,
   capabilities, onLoadMoreSvn, svnLogComplete,
 }: GraphViewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
@@ -115,6 +123,9 @@ export function GraphView({
 
   // 选中的提交不在可见范围内时把它滚到中间；已经可见就不动，避免点击行时画面乱跳。
   //
+  // `revealSeq` 在依赖里：选中没变、但侧边栏又点了一次同一个目标时也要重新定位。
+  // 选中的是收进 svn 节点、不在图上的本地提交时，定位到收着它的那个节点。
+  //
   // 首次打开仓库时 store 会把 selectedId 预置成该 worktree 的 HEAD，于是这里顺带
   // 完成「打开 worktree 就定位到它所在的提交」。
   //
@@ -125,14 +136,15 @@ export function GraphView({
   useEffect(() => {
     const el = containerRef.current
     if (!el || !selectedId || el.clientHeight === 0) return
-    const idx = commits.findIndex((c) => c.id === selectedId)
+    const targetId = findDelivered(commits, selectedId)?.owner.id ?? selectedId
+    const idx = commits.findIndex((c) => c.id === targetId)
     if (idx < 0) return
     // 插了工作区伪行后真实提交整体下移一行
     const rowOffset = headHash ? 1 : 0
     const rowTop = (idx + rowOffset) * ROW_HEIGHT
     if (rowTop >= el.scrollTop && rowTop + ROW_HEIGHT <= el.scrollTop + el.clientHeight) return
     el.scrollTop = Math.max(0, rowTop - el.clientHeight / 2 + ROW_HEIGHT / 2)
-  }, [selectedId, commits, headHash])
+  }, [selectedId, revealSeq, commits, headHash])
 
   const handleScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {
     scrollTopRef.current = e.currentTarget.scrollTop
