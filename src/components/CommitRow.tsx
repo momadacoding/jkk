@@ -5,6 +5,7 @@ import { laneTint } from '../engine/paths'
 import { WORKDIR_ID } from '../engine/workdir'
 import { shortHash } from '../engine/commitActions'
 import { buildRefPills, goneUpstreamTooltip } from '../engine/refPills'
+import { mixedBaselineLabel } from '../engine/svnGraph'
 
 interface CommitRowProps {
   node: LayoutNode
@@ -54,6 +55,7 @@ export function CommitRow({
   // svn 节点换一套配色：它们不是本地提交，点开也没有 diff 可看（Phase 4 才做），
   // 与 git 提交长得一模一样会让人以为能对它做 checkout / revert 之类的操作。
   const isSvn = node.commit.vcs === 'svn'
+  const mixedLabel = mixedBaselineLabel(node.commit)
 
   return (
     <div
@@ -73,7 +75,10 @@ export function CommitRow({
             仅本地
           </span>
         )}
-        {node.commit.message}
+        {/* 混合基线的标题是录制时拼的同一句话，标注代替它，一行里不说两遍。详情里看得到原文 */}
+        {mixedLabel
+          ? <span className="mixed-baseline-badge" title={node.commit.message}>{mixedLabel}</span>
+          : node.commit.message}
       </span>
       <span className="ref-pills">
         {detached && <span className="ref-pill head">HEAD</span>}

@@ -210,3 +210,53 @@ describe('focusCancel', () => {
     await waitFor(() => expect(document.activeElement).toBe(button('Go')))
   })
 })
+
+describe('第二个选择 alternative（§6.11.3 切到落后基线的分支）', () => {
+  function open(onSelect: () => void) {
+    const { confirm } = mount()
+    let result!: Promise<boolean>
+    act(() => {
+      result = confirm()({
+        title: '切换',
+        message: 'm',
+        confirmLabel: '切换并手动跟进',
+        alternative: { label: '仅切换', onSelect },
+      })
+    })
+    return () => result
+  }
+
+  it('默认按钮仍是确认：回车不会落到第二个选择上', async () => {
+    open(() => {})
+    await waitFor(() => expect(document.activeElement).toBe(button('切换并手动跟进')))
+  })
+
+  it('点它：跑回调、框关掉，结果是 false，调用方靠回调分辨', async () => {
+    let picked = 0
+    const result = open(() => {
+      picked += 1
+    })
+    fireEvent.click(button('仅切换'))
+    expect(await result()).toBe(false)
+    expect(picked).toBe(1)
+    expect(screen.queryByRole('button', { name: '仅切换' })).toBeNull()
+  })
+
+  it('取消不触发它', async () => {
+    let picked = 0
+    const result = open(() => {
+      picked += 1
+    })
+    fireEvent.click(button('Cancel'))
+    expect(await result()).toBe(false)
+    expect(picked).toBe(0)
+  })
+
+  it('没传时不渲染', async () => {
+    const { confirm } = mount()
+    act(() => {
+      void confirm()({ title: 't', message: 'm', confirmLabel: 'OK' })
+    })
+    expect(screen.getAllByRole('button').map((b) => b.textContent)).toEqual(['Cancel', 'OK'])
+  })
+})

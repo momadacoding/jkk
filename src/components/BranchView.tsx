@@ -48,6 +48,8 @@ interface BranchViewProps {
    * `remotes` / `pullRequests` 决定。
    */
   capabilities: Capabilities
+  /** 落后基线的本地分支（分析 §6.11.3）。普通 git 仓库下是空数组。 */
+  behindBaseline: string[]
 }
 
 const shortName = (ref: RefPointer) =>
@@ -104,7 +106,7 @@ function PrBadge({ pr, branchHash }: { pr: PullRequest | undefined; branchHash: 
 
 export function BranchView({
   refs, pullRequests, head, selectedBranch, onSelect, onCheckout, onCreate, onRename, onDelete,
-  onCheckoutRemote, onDeleteRemote, repoPath, capabilities,
+  onCheckoutRemote, onDeleteRemote, repoPath, capabilities, behindBaseline,
 }: BranchViewProps) {
   const [creating, setCreating] = useState(false)
   const [newName, setNewName] = useState('')
@@ -258,6 +260,14 @@ export function BranchView({
               <BranchIcon />
               <span className="sb-label">{name}</span>
               {isBaseline && <span className="sb-baseline-tag">基线</span>}
+              {behindBaseline.includes(name) && (
+                <span
+                  className="sb-gone"
+                  title="这条分支还停在更早的基线上，不含 SVN 的最新内容。切过去时会让你选择要不要手动跟进。"
+                >
+                  落后基线
+                </span>
+              )}
               {capabilities.pullRequests && (
                 <PrBadge pr={pullRequestForRef(prByBranch, ref)} branchHash={ref.hash} />
               )}

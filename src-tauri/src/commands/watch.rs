@@ -124,6 +124,11 @@ fn is_relevant(repo: Option<&git2::Repository>, root: &Path, target: &Path) -> b
         if target.file_name() == Some(std::ffi::OsStr::new(svn_lock::LOCK_FILE)) {
             return true;
         }
+        // 失焦快照（`svn_follow_mark`）是客户端自己写的线索，每次切窗口写一次，放过去
+        // 就是每次切窗口多一轮全量刷新。里面的内容不影响任何面板
+        if s.contains("/.git/mygitclient/") || s.ends_with("/.git/mygitclient") {
+            return false;
+        }
         // git 内部：锁文件和对象库写入是高频噪声，refs / HEAD / index 才有意义
         return !(s.ends_with(".lock") || s.contains("/.git/objects/"));
     }
@@ -272,6 +277,25 @@ mod tests {
             let p = rel.iter().fold(root.clone(), |acc, c| acc.join(c));
             assert!(!is_relevant(None, &root, &p), "{}", p.display());
         }
+    }
+
+    #[test]
+    fn the_follow_mark_written_on_blur_is_noise() {
+        // 失焦时写快照。放它过去，每次切窗口都会多一轮全量刷新。目录本身的事件也要挡：
+        // 第一次写快照时 `.git/mygitclient` 是新建的
+        let (_d, root) = wc();
+        let repo = root.to_str().unwrap();
+        let mark = crate::engine::svn_follow_mark::mark_path(repo);
+        for p in [
+            mark.clone(),
+            mark.with_extension("json.123.0.tmp"),
+            mark.parent().unwrap().to_path_buf(),
+        ] {
+            assert!(!is_relevant(None, &root, &p), "{}", p.display());
+        }
+        // 只挡这个子目录：同名前缀的 journal 仍然相关
+        let journal = root.join(".git").join("mygitclient-sync.json");
+        assert!(is_relevant(None, &root, &journal));
     }
 
     /// 界面探测锁（`probe` 独占打开、`holder` 宽松读）**本身**不能产生相关事件。

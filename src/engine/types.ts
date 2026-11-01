@@ -64,8 +64,16 @@ export interface CommitNode {
    *
    * 与 `svnRev` 不是一回事：`svnRev` 说「我就是这条 revision」，
    * 这个说「我是记录那条 revision 的基线 commit」。基线在接合时会被从图上删掉。
+   *
+   * 只在单值基线上有值。混合基线没有这一项，看下面 `baselineFloor`（分析 §6.9）。
    */
   baselineRev?: number
+  /** 后端解析出的混合基线的 floor。有值就是混合基线：不接合，作为普通 git 节点留在图上。 */
+  baselineFloor?: number
+  /** 混合基线里 revision 比 floor 新的文件数，可以是 0（只有墓碑）。 */
+  baselineNewer?: number
+  /** 混合基线的墓碑数；没有墓碑时缺省。 */
+  baselineGone?: number
   /**
    * 交付录的基线额外记的「真正提交出去的 revision」（`Delivered-Rev:`）。`baselineRev` 是交付之后
    * 更新到的 revision，同事紧跟着提交时它是同事的；收起的本地提交按这个归属。其余基线缺省。

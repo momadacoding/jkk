@@ -15,9 +15,10 @@
 use crate::engine::git_cli::{run_git, run_git_code, run_git_env};
 use crate::engine::graph::parse_local_only;
 use crate::engine::svn_baseline::{
-    create_baseline_commit_with, move_baseline_ref, parse_trailer, read_baseline,
-    refresh_index_stat, swap_index_to_tree, TempIndex, Trailer,
+    create_baseline_commit_with, move_baseline_ref, read_baseline, refresh_index_stat,
+    swap_index_to_tree, TempIndex,
 };
+use crate::engine::svn_basemap::{read_base_map, BaseMap};
 use crate::engine::svn_cli::{run_svn, run_svn_code};
 use crate::engine::svn_config::{read_config, SvnConfig, BASELINE_BRANCH};
 use crate::engine::svn_deliver::{deliver_ref, pin, unpin};
@@ -560,15 +561,11 @@ fn capture_delivered(repo: &str, cfg: &SvnConfig, j: &mut Journal) -> Result<()>
     j.capture_tree = Some(tree.clone());
     j.new_baseline_oid = None;
     svn_journal::write(repo, j)?;
-    let trailer = Trailer {
-        url: pre.repos_root,
-        rev: pre.node_rev,
-        uuid: pre.uuid,
-    };
+    let map = BaseMap::single(pre.repos_root, pre.uuid, pre.node_rev);
     // 父提交是交付树，不是旧基线（spec §8.2.2；§7.6 末「不能套用 S7 的旧基线父」）
     // 另记真正提交出去的 revision：D5 与 D6 之间同事又提交时，trailer 记的是同事那个
     let commit =
-        create_baseline_commit_with(repo, &tree, Some(&deliver), &trailer, j.committed_rev)?;
+        create_baseline_commit_with(repo, &tree, Some(&deliver), &map, &[], j.committed_rev)?;
     // 移动 ref 前记录 newBaselineOid（§7.6）
     j.new_baseline_oid = Some(commit);
     svn_journal::write(repo, j)
@@ -910,11 +907,10 @@ fn delivered_rev(repo: &str, j: &Journal, new_baseline: &str) -> Result<u64> {
     }
 }
 
+/// 新基线记账的 floor。交付录的基线总是单值（D7 要求 nodeRevs 单值），读法与其余入口统一
+/// 走 `read_base_map`（计划 Task 5）。
 fn trailer_rev(repo: &str, commit: &str) -> Result<u64> {
-    let msg = run_git(repo, &["log", "-1", "--format=%B", commit])?;
-    parse_trailer(&msg)
-        .map(|t| t.rev)
-        .ok_or_else(|| GitError::new("svn_baseline_trailer", "新基线上读不到 git-svn-id。"))
+    Ok(read_base_map(repo, commit)?.floor)
 }
 
 pub(crate) fn state_changed(what: &str) -> GitError {
@@ -1000,7 +996,7 @@ pub fn abort_sync_out(repo: &str) -> Result<SyncOutOutcome> {
 fn take_over(repo: &str) -> Result<(svn_lock::SyncLock, Journal)> {
     let first = svn_journal::read(repo)?.ok_or_else(no_unfinished)?;
     if first.flow != Flow::SyncOut {
-        return Err(wrong_flow());
+        return Err(wrong_flow(first.flow));
     }
     let lock = svn_lock::acquire(repo, &first.opid)?;
     let j = svn_journal::read(repo)?.ok_or_else(no_unfinished)?;
@@ -1125,10 +1121,16 @@ fn continue_restoring(repo: &str, cfg: &SvnConfig, j: &mut Journal) -> Result<Sy
     restore_branch(repo, cfg, j)
 }
 
-fn wrong_flow() -> GitError {
+fn wrong_flow(flow: Flow) -> GitError {
     GitError::new(
         "sync_out_wrong_flow",
-        "这条记录是「更新」流程留下的，请用横幅上更新那一组按钮处理。",
+        match flow {
+            Flow::Follow => "这条记录是「跟进」流程留下的，请用横幅上的「继续」把它走完。",
+            Flow::FollowManual => {
+                "这条记录是「手动跟进」流程留下的，请用横幅上的「继续」或「放弃」处理。"
+            }
+            _ => "这条记录是「更新」流程留下的，请用横幅上更新那一组按钮处理。",
+        },
     )
 }
 

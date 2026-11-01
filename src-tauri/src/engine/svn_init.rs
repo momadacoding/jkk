@@ -12,8 +12,9 @@
 use crate::engine::git_cli::{run_git, run_git_code};
 use crate::engine::svn_attributes::{has_eol_rule, restore_attributes, write_attributes};
 use crate::engine::svn_baseline::{
-    git_dir, publish_baseline, refresh_index_stat, swap_index_to_tree, TempIndex, Trailer,
+    git_dir, publish_baseline, refresh_index_stat, swap_index_to_tree, TempIndex,
 };
+use crate::engine::svn_basemap::{read_base_map, BaseMap};
 use crate::engine::svn_cli::run_svn;
 use crate::engine::svn_config::{
     normalize_whitelist_entry, write_config, DisabledGitignore, SvnConfig, BASELINE_BRANCH,
@@ -26,15 +27,20 @@ use crate::engine::svn_gitignore::{
     detect_conflicts, detect_with_renames, disable_gitignore, display_path, restore_gitignores,
     scan_tree, GitCtx, GitignoreConflict, ProbeGitDir, RuleEffect, MAX_RENAME_ROUNDS,
 };
-use crate::engine::svn_health::{check_baseline, ExplainedOrigin, Health};
+use crate::engine::svn_health::{
+    check_baseline_map, check_baseline_map_with_nodes, ExplainedOrigin, Health, HealthMap,
+};
 use crate::engine::svn_include_check::{dry_run_include_set, verify_include_set};
-use crate::engine::svn_preflight::{check_targets, read_node_rev, run_preflight, Preflight};
+use crate::engine::svn_nodes::{compute_map, read_node_status, NodeStatus};
+use crate::engine::svn_preflight::{check_targets, run_preflight_with, Preflight};
 use crate::engine::svn_pristine::{cat_base, BaseContent};
 use crate::engine::svn_scope::WScope;
+use crate::engine::svn_sync::{tree_files, BaseMapSummary};
+use crate::engine::svn_wc::enumerate_wcs;
 use crate::engine::svn_xml::{parse_info, StatusEntry};
 use crate::error::{GitError, Result};
 use crate::vcs::{detect_repo_kind, RepoKind};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// 初始化完成后立刻切上去的工作分支。UI 禁止在基线分支上开发提交（spec §6.4）。
 const WORK_BRANCH: &str = "work";
@@ -81,7 +87,8 @@ pub struct RenamedGitignore {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InitReport {
-    /// 记账单位 N，取自 P2 读到的 `nodeRevs`。
+    /// 首个基线记账的 floor：单值时就是那个 N，混合版本时是最旧的文件 revision
+    /// （计划 Task 5，分析 §6.1）。
     pub node_rev: u64,
     /// 首个基线 commit 的 OID。
     pub baseline: String,
@@ -357,8 +364,9 @@ fn init_phases(
     }
 
     // ---- 前置校验：全部在创建 .git **之前**，失败时无需回退 ----
+    // 允许混合版本（分析 §10 Q4）：不做 P2，改读节点状态，录制时按文件记账
     let mut pre = clock.run("前置校验 P1–P4（svn status）", || {
-        run_preflight(root, &cfg.whitelist)
+        run_preflight_with(root, &cfg.whitelist, true)
     })?;
     // P5，命中不阻断
     let pinned = clock.run("检测钉死的 external（svn propget -R）", || {
@@ -381,13 +389,14 @@ fn init_phases(
         clock,
         &mut renamed,
     ) {
-        Ok((baseline, health, gitignore)) => Ok(InitReport {
-            node_rev: pre.node_rev,
-            baseline,
-            health,
+        Ok(built) => Ok(InitReport {
+            // 映射的 floor：混合版本时就是最旧的那个文件 revision（分析 §6.1）
+            node_rev: built.floor,
+            baseline: built.baseline,
+            health: built.health,
             pinned,
             timings: Vec::new(),
-            gitignore,
+            gitignore: built.gitignore,
         }),
         Err(mut e) => {
             // 失败若不在任何计时阶段里，先把标记落在这里——放到回退之后再补，
@@ -419,15 +428,203 @@ fn init_phases(
     }
 }
 
-/// 从**空索引**起步录服务器 rN 的树。初始化与 Phase 1 R2 用它（spec §6.3.1）。
-fn record_server_tree(
-    repo_root: &str,
+/// 一次录制的结果（计划 Task 5）：树、它的记账、录制时的节点状态、体检结论。
+#[derive(Debug, Clone)]
+pub struct Recorded {
+    pub tree: String,
+    pub map: BaseMap,
+    /// R2 时读到的节点状态（含目录），按路径升序。
+    pub nodes: Vec<NodeStatus>,
+    /// 体检结论：`Verified` 或 `NotChecked`（`Lying` 与漏收都已在录制里拒绝）。
+    pub health: Health,
+}
+
+/// 录一个可能是混合版本的基线：R1–R3c（分析 §6.3）。**不建 commit、不动任何 ref**。
+///
+/// ```text
+/// R1   P1（`~`）、P3、P4，加上 SVN 冲突与目录写锁（`run_preflight_with(.., true)`）
+/// R2   沿用 R2a–R2c：脏条目换成 BASE、剔除未版本化的、核对纳入集合
+///      → compute_map：floor + 单列文件（日志「映射取值」）
+/// R3b  分组体检（JustRecorded）：Lying 拒绝；服务器上还在、工作副本里没有的拒绝（漏收）；
+///      向服务器确认已删除的成为墓碑，并进映射
+/// R3c  重读节点状态，按同一规则再算一次映射，必须与 R2 时相同
+/// ```
+///
+/// `idx` 由调用方给：重建与初始化从空索引起步，S7 从 HEAD 树起步（spec §6.3.1）。
+pub fn record_mixed(repo: &str, cfg: &SvnConfig, idx: &TempIndex) -> Result<Recorded> {
+    let pre = run_preflight_with(repo, &cfg.whitelist, true)?;
+    let svn_url = working_copy_url(repo)?;
+    record_mixed_with(
+        repo,
+        cfg,
+        &pre,
+        idx,
+        &svn_url,
+        &mut PhaseClock::new("同步录制"),
+        "基线没有推进。",
+    )
+}
+
+/// [`record_mixed`] 的本体。初始化与重建已经跑过 R1（`pre`，必须是 `allow_mixed` 的结果），
+/// 不再跑第二遍；`tail` 接在拒绝文案里，说明此刻仓库处在什么状态。
+fn record_mixed_with(
+    repo: &str,
     cfg: &SvnConfig,
     pre: &Preflight,
+    idx: &TempIndex,
+    svn_url: &str,
     clock: &mut PhaseClock,
-) -> Result<(String, BTreeSet<String>)> {
-    let idx = TempIndex::empty(repo_root)?;
-    record_server_tree_timed(repo_root, cfg, pre, &idx, clock)
+    tail: &str,
+) -> Result<Recorded> {
+    let nodes = pre.nodes.as_deref().ok_or_else(|| {
+        GitError::new(
+            "svn_init",
+            "录混合基线要用允许混合版本的前置校验结果（带节点状态），这里拿到的不是。这是实现缺陷。",
+        )
+    })?;
+    // R2a–R2c
+    let (tree, explained) = record_server_tree_timed(repo, cfg, pre, idx, clock)?;
+    // 映射的键取录出来的树（分析 §6.2：不从 status 推）
+    let files = tree_files(repo, &tree)?;
+    let recorded = compute_map(&pre.repos_root, &pre.uuid, &files, nodes, BTreeMap::new())?;
+
+    // R3b。Lying / 漏收的判定放在阶段**里面**：初始化的耗时表要把失败标在体检上
+    let scope = WScope::for_repo(repo, cfg)?;
+    let (health, new_gone) = clock.run("基线体检（svn diff）", || {
+        match check_baseline_map_with_nodes(
+            repo,
+            svn_url,
+            &recorded,
+            &scope,
+            &explained,
+            // 刚由 R2b 从 `svn cat -r BASE` 写进去；映射按节点 revision 记，BASE 就是那个
+            // revision 的内容——这批路径由构造保证正确，不必报成「未覆盖」
+            ExplainedOrigin::JustRecorded,
+            Some(nodes),
+        )? {
+            HealthMap::Excluded { files } => Err(excluded_error(&files, tail)),
+            // Review 1 第 1 条：没确认成的不能降成 NotChecked 放行
+            HealthMap::Unconfirmed { files, reason } => {
+                Err(not_confirmed_error(&files, &reason, tail))
+            }
+            HealthMap::Verified {
+                health: Health::Lying { files },
+                ..
+            } => Err(lying_error(&recorded, &files, tail)),
+            HealthMap::Verified { health, new_gone } => Ok((health, new_gone)),
+        }
+    })?;
+    // 墓碑与 floor 的保留规则只在 compute_map 里写一处，合进去时再算一次
+    let map = if new_gone.is_empty() {
+        recorded.clone()
+    } else {
+        compute_map(&pre.repos_root, &pre.uuid, &files, nodes, new_gone)?
+    };
+
+    // R3c：纯本地。防的是 R2a 到此刻之间有人在 TortoiseSVN 里 commit / update，把某个
+    // 文件的 BASE 推到了新 revision——那时 `svn cat -r BASE` 取回的是新内容，映射记的却是
+    // 旧 revision（spec §16.1 末的竞态表）。体检通常已先一步拦下，这里是第二道。
+    // 比较的是「按同一规则算出的映射」，不是逐节点 revision：局部 update 只推高没改过的
+    // 文件时映射不变，录下的内容也仍然对。
+    // 跟进的准备阶段缓存了 svn 扫描（`with_scan_cache`），这里必须读最新的节点状态
+    crate::engine::svn_cli::forget_node_scans();
+    let wcs = enumerate_wcs(repo, &cfg.whitelist)?;
+    let now = read_node_status(repo, &cfg.whitelist, &wcs)?;
+    match compute_map(&pre.repos_root, &pre.uuid, &files, &now, BTreeMap::new()) {
+        Ok(again) if again == recorded => {}
+        // 算不出来（文件在 status 里消失了）同样是录制期间被改了
+        _ => return Err(moved_error(&recorded, tail)),
+    }
+
+    Ok(Recorded {
+        tree,
+        map,
+        nodes: nodes.to_vec(),
+        health,
+    })
+}
+
+/// 记账给人看：单值时就是 `rN`。
+fn describe_map(map: &BaseMap) -> String {
+    if map.revs.is_empty() {
+        format!("r{}", map.floor)
+    } else {
+        format!(
+            "r{}（另有 {} 个文件按各自的 revision）",
+            map.floor,
+            map.revs.len()
+        )
+    }
+}
+
+fn listed(files: &[String]) -> String {
+    let mut s: Vec<String> = files.iter().take(20).map(|f| format!("  - {f}")).collect();
+    if files.len() > 20 {
+        s.push(format!("  ……另有 {} 条未列出", files.len() - 20));
+    }
+    s.join("\n")
+}
+
+fn lying_error(map: &BaseMap, files: &[String], tail: &str) -> GitError {
+    GitError::new(
+        "svn_baseline_lying",
+        format!(
+            "基线体检没通过：磁盘内容与服务器上的 {} 不一致，共 {} 处。{tail}\n{}",
+            describe_map(map),
+            files.len(),
+            listed(files)
+        ),
+    )
+}
+
+/// 分析 §6.2「removed 必须经服务器确认才能变成墓碑」的另一半：服务器上还在。
+fn excluded_error(files: &[String], tail: &str) -> GitError {
+    GitError::new(
+        "svn_baseline_excluded_paths",
+        format!(
+            "下面这些文件服务器上还在，工作副本里却没有，共 {} 处。{tail}\n{}\n\
+             最常见的成因是它们被 `--set-depth=exclude`（TortoiseSVN 里的「Update to revision → \
+             Exclude」）排除了，也可能是在外部只更新到了它们被删除的那个 revision、之后又被加回来。\
+             录进基线会让它们从基线里消失、又不算删除，所以停下了。\
+             请在 TortoiseSVN 里把它们所在的目录按「Fully recursive」更新回来，再试一次。",
+            files.len(),
+            listed(files)
+        ),
+    )
+}
+
+/// 体检该向服务器确认的没确认成（[`HealthMap::Unconfirmed`]）。
+fn not_confirmed_error(files: &[String], reason: &str, tail: &str) -> GitError {
+    let what = if files.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "下面这些文件在基线的 revision 上存在、工作副本里却没有，共 {} 处：\n{}\n",
+            files.len(),
+            listed(files)
+        )
+    };
+    GitError::new(
+        "svn_baseline_unconfirmed",
+        format!(
+            "录制前要向 SVN 服务器确认一些文件是已经删除、还是被排除在工作副本之外，\
+             这一步没做成：{reason}\n{what}\
+             不确认就录，基线会把它们静默丢掉、也不记成删除，所以停下了。{tail}\
+             请确认能连上 SVN 服务器后再试一次。"
+        ),
+    )
+}
+
+fn moved_error(map: &BaseMap, tail: &str) -> GitError {
+    GitError::new(
+        "svn_rebuild_revision_moved",
+        format!(
+            "录制过程中工作副本被外部改动了：开始时白名单是 {}，现在不是了。\
+             录下来的内容会对应错误的 revision，所以中止了。{tail}\
+             多半是 TortoiseSVN 那边刚提交或更新了一次，等它做完再试一次。",
+            describe_map(map)
+        ),
+    )
 }
 
 /// 录出「**服务器 rN 的树**」（spec §16 R2a–R2c）。返回 `(TREE, S)`。
@@ -625,7 +822,7 @@ fn build_repo(
     svn_url: &str,
     clock: &mut PhaseClock,
     renamed: &mut Vec<DisabledGitignore>,
-) -> Result<(String, Health, GitignoreOutcome)> {
+) -> Result<Built> {
     clock.run("建仓库、写规则（git init）", || {
         // `-b svn/base` 必须显式给：不给的话吃 `init.defaultBranch`，用户配成什么
         // 都有可能，而后面每一处都按 `svn/base` 这个名字找基线。
@@ -728,19 +925,26 @@ fn build_repo(
     // 规则写好之后、`git add` 之前
     dry_run_before_add(root, cfg, pre, clock)?;
 
-    // R2a–R2c：录出服务器 rN 的树。首个基线从**空**索引起步。
-    let (tree, explained) = record_server_tree(root, cfg, pre, clock)?;
+    // R2a–R3c：录出各文件在服务器上的那一版（可能是混合版本，分析 §10 Q4）。首个基线从
+    // **空**索引起步。体检在这里面、发布之前：Lying 或漏收时此刻还没建工作分支，整个回退
+    // 代价最小（spec §6.8.5）。初始化没有旧映射，floor 组里提交删除留下的 D 由体检向服务器
+    // 确认后记成墓碑（分析 §6.3）
+    let idx = TempIndex::empty(root)?;
+    let rec = record_mixed_with(
+        root,
+        cfg,
+        pre,
+        &idx,
+        svn_url,
+        clock,
+        "继续下去会得到一个从一开始就在撒谎的基线，所以整个回退了。",
+    )?;
+    let tree = rec.tree.clone();
 
-    let trailer = Trailer {
-        // Repository Root，不是工作副本 URL（spec §6.4.1）
-        url: pre.repos_root.clone(),
-        rev: pre.node_rev,
-        uuid: pre.uuid.clone(),
-    };
     // 首个基线**无父提交**；`expected_old = None` 表示「这个 ref 现在不该存在」，
-    // 刚 `git init` 出来的仓库正是如此。
+    // 刚 `git init` 出来的仓库正是如此。记账的 Repository Root 不是工作副本 URL（spec §6.4.1）
     let baseline = clock.run("发布基线（git commit-tree）", || {
-        publish_baseline(root, &tree, None, &trailer, None)
+        publish_baseline(root, &tree, None, &rec.map, None)
     })?;
 
     // 对齐真实索引（spec §6.3.1）。**不带 `-u`**：绝不能用基线内容去覆盖磁盘。
@@ -769,45 +973,24 @@ fn build_repo(
         Ok(())
     })?;
 
-    // Lying 的判定放在阶段**里面**：它是这一阶段的失败，耗时表要把「← 在这一步
-    // 失败」标在体检上。放在外面的话，体检阶段算成功，表里一个失败标记都没有。
-    let health = clock.run("基线体检（svn diff）", || {
-        let health = check_baseline(
-            root,
-            svn_url,
-            pre.node_rev,
-            &WScope::for_repo(root, cfg)?,
-            &explained,
-            // 刚刚由 R2b 从 `svn cat -r BASE` 写进去的，而 P2 保证 `BASE == node_rev`
-            // ——这批路径由构造保证正确，不必报成「未覆盖」。
-            ExplainedOrigin::JustRecorded,
-        )?;
-        if let Health::Lying { files } = &health {
-            // spec §6.8.5：此刻还没建工作分支，整个回退代价最小。
-            return Err(GitError::new(
-                "svn_baseline_lying",
-                format!(
-                    "基线体检没通过：磁盘内容与服务器上的 r{} 不一致，共 {} 处。\
-                     继续下去会得到一个从一开始就在撒谎的基线，所以整个回退了。\n{}",
-                    pre.node_rev,
-                    files.len(),
-                    files
-                        .iter()
-                        .take(20)
-                        .map(|f| format!("  - {f}"))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                ),
-            ));
-        }
-        Ok(health)
-    })?;
-
     // 立刻离开基线分支（spec §6.5 最后一步）。
     clock.run("切到工作分支（git checkout）", || {
         run_git(root, &["checkout", "-b", WORK_BRANCH])
     })?;
-    Ok((baseline, health, outcome))
+    Ok(Built {
+        baseline,
+        floor: rec.map.floor,
+        health: rec.health,
+        gitignore: outcome,
+    })
+}
+
+/// [`build_repo`] 成功时交给 [`init_phases`] 的东西。
+struct Built {
+    baseline: String,
+    floor: u64,
+    health: Health,
+    gitignore: GitignoreOutcome,
 }
 
 /// 第 3 步的选择与此刻查到的冲突对得上吗（设计 §3「点建库之后」那张表）。
@@ -948,13 +1131,15 @@ pub fn eol_status(repo_root: &str) -> Result<EolStatus> {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RebuildReport {
-    /// 新的记账单位 N。
+    /// 新记账的 floor：单值时就是那个 N（计划 Task 5 起可能是混合版本，见 `base`）。
     pub node_rev: u64,
     /// 重建前基线指向谁。
     pub old_baseline: String,
     /// 重建后指向谁。同一棵 tree 也会产出新的 commit（spec §6.3.1）。
     pub new_baseline: String,
     pub health: Health,
+    /// 新记账的摘要：`newer` / `gone` 都是 0 时就是单值、旧格式。
+    pub base: BaseMapSummary,
 }
 
 /// 行尾迁移：装上规则 + 按新规则重录基线（spec §7.3.0「迁移」）。
@@ -1320,11 +1505,12 @@ fn align_branch(repo_root: &str, branch: &str, report: &RebuildReport) -> Result
 /// 重建基线 R1–R5（spec §16 Phase 1）。
 ///
 /// ```text
-/// R1  校验：白名单内 svn status 干净、nodeRevs 单值 {N}
+/// R1  校验：没有 `~`、冲突、写锁、未完成的 update（计划 Task 5 起不再要求单值）
 ///     纳入集合预检（只读，git add 之前；与初始化同一道）
-/// R2  临时索引录 tree，全程不碰真实 index、不碰 HEAD
+/// R2  临时索引录 tree，全程不碰真实 index、不碰 HEAD；按文件算映射
+/// R3b 分组体检（§6.8、分析 §6.4）                     ← 有差异 / 漏收就中止，指针还没动
+/// R3c 复查映射没变
 /// R3  git commit-tree TREE -p svn/base …            → NEWBASE
-/// R3b 基线体检（§6.8）                                ← 有差异就中止，指针还没动
 /// R4  git update-ref refs/heads/svn/base NEWBASE     ← 只动指针
 /// R5  删掉临时索引文件                                 ← TempIndex 的 Drop
 /// ```
@@ -1355,10 +1541,10 @@ pub fn rebuild_baseline(repo_root: &str) -> Result<RebuildReport> {
     let cfg = crate::engine::svn_config::read_config(repo_root)?;
     let old_baseline = read_baseline_oid(repo_root)?;
 
-    // R1：与 P1/P2 同一套判据，复用 run_preflight（它顺带把 P3/P4 也跑了，
-    // 那两条在重建时同样必须成立——工作副本半路挂着没跑完的 update，
-    // 录出来就是一棵残缺的树）。
-    let pre = run_preflight(repo_root, &cfg.whitelist)?;
+    // R1：P1/P3/P4 加上冲突与写锁（它们在重建时同样必须成立——工作副本半路挂着没跑完的
+    // update，录出来就是一棵残缺的树）。**不再要求单值**（计划 Task 5）：只提交、不更新是
+    // 用户每天的常态，映射按文件记各自的 revision（分析 §6.3）。
+    let pre = run_preflight_with(repo_root, &cfg.whitelist, true)?;
     let svn_url = working_copy_url(repo_root)?;
 
     // 重建不报耗时：计时只为初始化向导服务，这里给一个用完即弃的计时器。
@@ -1368,77 +1554,36 @@ pub fn rebuild_baseline(repo_root: &str) -> Result<RebuildReport> {
     // 挡掉的文件要等那之后才报（第二轮 review）。
     dry_run_before_add(repo_root, &cfg, &pre, &mut clock)?;
 
-    // R2a–R2c：**从空索引起步**，录出服务器 rN 的树。
-    let (tree, explained) = record_server_tree(repo_root, &cfg, &pre, &mut clock)?;
-
-    // R3b：**在 R4 之前**。判据是 §6.8.7 的 `D \ S == ∅`——磁盘与服务器的每一处
-    // 差异都必须被一条已知的本地修改解释。指针还没动，中止的代价为零。
-    let health = check_baseline(
+    // R2–R3c：**从空索引起步**。R3b 的体检在 R4 之前，判据是各组 `D \ S == ∅`——磁盘与
+    // 服务器的每一处差异都必须被一条已知的本地修改或一条确认过的删除解释。指针还没动，
+    // 中止的代价为零。
+    let idx = TempIndex::empty(repo_root)?;
+    let rec = record_mixed_with(
         repo_root,
+        &cfg,
+        &pre,
+        &idx,
         &svn_url,
-        pre.node_rev,
-        &WScope::for_repo(repo_root, &cfg)?,
-        &explained,
-        // 刚刚由 R2b 从 `svn cat -r BASE` 写进去的，而 P2 保证 `BASE == node_rev`
-        // ——这批路径由构造保证正确，不必报成「未覆盖」。
-        ExplainedOrigin::JustRecorded,
+        &mut clock,
+        "基线指针没有改动。",
     )?;
-    if let Health::Lying { files } = &health {
-        return Err(GitError::new(
-            "svn_baseline_lying",
-            format!(
-                "基线体检没通过：磁盘内容与服务器上的 r{} 不一致，共 {} 处。\
-                 基线指针没有改动。\n{}",
-                pre.node_rev,
-                files.len(),
-                files
-                    .iter()
-                    .take(20)
-                    .map(|f| format!("  - {f}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            ),
-        ));
-    }
 
-    // R3c：复查 `nodeRevs` 仍是 {N}。纯本地，不走网络。
-    //
-    // 防的是 R2a 到此刻之间有人在 TortoiseSVN 里 commit / update，把 BASE 推到了
-    // N+1——那时 `svn cat -r BASE` 取回的是 N+1 的内容，而 trailer 写的是 rN
-    // （spec §16.1 末的竞态表）。体检通常已先一步拦下，这里是第二道。
-    let now = read_node_rev(repo_root, &cfg.whitelist)?;
-    if now != pre.node_rev {
-        return Err(GitError::new(
-            "svn_rebuild_revision_moved",
-            format!(
-                "重建过程中工作副本被外部改动了：开始时白名单停在 r{}，现在是 r{now}。\
-                 录下来的内容会对应错误的 revision，所以中止了——基线指针没有改动。\
-                 请重新点一次「重建基线」。",
-                pre.node_rev
-            ),
-        ));
-    }
-
-    // R3 + R4：建 commit 并以旧 OID 作比较条件更新指针。
-    let trailer = Trailer {
-        url: pre.repos_root.clone(),
-        rev: pre.node_rev,
-        uuid: pre.uuid.clone(),
-    };
+    // R3 + R4：建 commit 并以旧 OID 作比较条件更新指针。父提交仍是旧基线。
     let new_baseline = publish_baseline(
         repo_root,
-        &tree,
+        &rec.tree,
         Some(&old_baseline),
-        &trailer,
+        &rec.map,
         Some(&old_baseline),
     )?;
 
     // R5 由 `idx` 的 Drop 负责。
     Ok(RebuildReport {
-        node_rev: pre.node_rev,
+        node_rev: rec.map.floor,
         old_baseline,
         new_baseline,
-        health,
+        health: rec.health,
+        base: BaseMapSummary::of(&rec.map),
     })
 }
 
@@ -1479,39 +1624,19 @@ pub fn check_current_baseline(repo_root: &str) -> Result<Health> {
         ));
     }
     let cfg = crate::engine::svn_config::read_config(repo_root)?;
-    let msg = run_git(
-        repo_root,
-        &[
-            "log",
-            "-1",
-            "--format=%B",
-            &format!("refs/heads/{BASELINE_BRANCH}"),
-        ],
-    )?;
-    let trailer = crate::engine::svn_baseline::parse_trailer(&msg).ok_or_else(|| {
-        // 「解析失败即视为该 commit 不是 baseline」（spec §6.4.1，不猜、不部分接受）。
-        GitError::new(
-            "svn_baseline_no_trailer",
-            "基线分支最新的 commit 上没有可解析的 git-svn-id trailer，\
-             它不是本应用录出来的基线。体检无从谈起——请重建基线。",
-        )
-    })?;
+    // 记账与树取自同一个 OID：分两次按 ref 名读，中间基线被移动就会拿一棵树配另一份记账。
+    // 读不出记账即「不是 baseline」（spec §6.4.1，不猜、不部分接受），`read_base_map` 报
+    // `svn_baseline_no_trailer`。混合基线（计划 Task 5）也读得出
+    let oid = read_baseline_oid(repo_root)?;
+    let map = read_base_map(repo_root, &oid)?;
 
     // 前提校验：磁盘上的 W-file 录成树，必须与基线树逐字节相同。
     // 用 `%T` 而不是 `<ref>^{tree}`——后者在若干 Windows shell 里要转义，
     // 而 `run_git` 是直接 spawn 进程、不过 shell，两种写法这里都能用，
     // 但 `%T` 不带任何需要转义的字符，少一处将来会被改错的地方。
-    let baseline_tree = run_git(
-        repo_root,
-        &[
-            "log",
-            "-1",
-            "--format=%T",
-            &format!("refs/heads/{BASELINE_BRANCH}"),
-        ],
-    )?
-    .trim()
-    .to_string();
+    let baseline_tree = run_git(repo_root, &["log", "-1", "--format=%T", &oid])?
+        .trim()
+        .to_string();
     // 这里曾经有一道门槛：「磁盘内容必须与基线树逐字节相同，否则不下结论」。
     //
     // **那道门槛和 §16.1 里那条「工作副本必须干净」是同一个病**：程序员的工作区
@@ -1558,16 +1683,23 @@ pub fn check_current_baseline(repo_root: &str) -> Result<Health> {
     .map(str::to_string)
     .collect();
 
-    let health = check_baseline(
+    // 按映射分组体检（分析 §6.4）：单值映射发的命令与改造前逐字相同；已有墓碑逐条向服务器核对
+    let health = match check_baseline_map(
         repo_root,
         &cfg.svn_url,
-        trailer.rev,
+        &map,
         &scope,
         &explained,
         // 手动体检：基线是**什么时候、哪个版本**录的都不知道，这条检查覆盖不到
         // `S` 里那些路径，必须如实报出去（2026-09-21 独立 review）。
         ExplainedOrigin::Unknown,
-    )?;
+    )? {
+        HealthMap::Verified { health, .. } => health,
+        // `Unknown` 不产生墓碑、不判漏收，走不到这里；万一走到，按「撒谎」报，不放行
+        HealthMap::Excluded { files } | HealthMap::Unconfirmed { files, .. } => {
+            Health::Lying { files }
+        }
+    };
 
     // 合并两份证据。`NotChecked` 原样透传——那是「没能验证」，不是「验证不通过」，
     // 把它降级成 Lying 会让离线场景寸步难行（spec §6.8.6）。
@@ -1664,6 +1796,7 @@ fn build_config(
         baseline_branch: BASELINE_BRANCH.to_string(),
         respect_gitignore: false,
         disabled_gitignores: Vec::new(),
+        svn_user: None,
     };
     crate::engine::svn_config::validate(&cfg)?;
     // 放在 `git init` 之前：坏扩展名在这里被拒时什么都还没建。`write_config` 里
@@ -1705,7 +1838,8 @@ pub fn init_preflight(
 ) -> Result<InitPreflight> {
     let svn_url = working_copy_url(repo_root)?;
     let cfg = build_config(repo_root, whitelist, extensions, &svn_url)?;
-    let preflight = run_preflight(repo_root, &cfg.whitelist)?;
+    // 与建库同一套判据：允许混合版本（分析 §10 Q4），冲突与写锁在这一步就拦下
+    let preflight = run_preflight_with(repo_root, &cfg.whitelist, true)?;
     let fixes = classify(&preflight.dirty)?;
     let probe = ProbeGitDir::create(repo_root, &cfg.whitelist, &cfg.extensions)?;
     let gitignore_conflicts =

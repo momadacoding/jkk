@@ -151,6 +151,7 @@ fn every_phase_uses_the_exact_string_from_the_spec() {
         (Phase::Committing, "committing"),
         (Phase::PostCommit, "post-commit"),
         (Phase::RestoringBranch, "restoring-branch"),
+        (Phase::FollowPublishing, "follow-publishing"),
     ];
     for (phase, text) in cases {
         let encoded = serde_json::to_string(&phase).unwrap();
@@ -167,6 +168,100 @@ fn flow_uses_the_exact_strings_from_the_spec() {
         serde_json::to_string(&Flow::SyncOut).unwrap(),
         "\"sync_out\""
     );
+    assert_eq!(serde_json::to_string(&Flow::Follow).unwrap(), "\"follow\"");
+    assert_eq!(
+        serde_json::to_string(&Flow::FollowManual).unwrap(),
+        "\"follow_manual\""
+    );
+}
+
+#[test]
+fn stage_lost_stays_out_of_the_file_until_it_happens_and_survives_a_reread() {
+    // 旧 journal 没有这个字段；崩在放回之后重开时，收尾要靠它告诉用户暂存没保住
+    let fx = git_dir_fixture();
+    let root = fx.path().to_string_lossy().to_string();
+    write(&root, &minimal("op")).unwrap();
+    let on_disk = std::fs::read_to_string(journal_path(&root)).unwrap();
+    assert!(!on_disk.contains("stageLost"), "{on_disk}");
+
+    let j = Journal {
+        flow: Flow::FollowManual,
+        stage_lost: true,
+        ..minimal("op")
+    };
+    write(&root, &j).unwrap();
+    assert_eq!(read(&root).unwrap().unwrap(), j);
+}
+
+#[test]
+fn follow_steps_use_fixed_strings_and_round_trip() {
+    // 恢复靠 step 分清残留的 index.lock 是半成品还是拼好的索引，写错就读不回来
+    use app_lib::engine::svn_follow::FollowReport;
+    use app_lib::engine::svn_journal::{BranchMove, FollowStep, FollowSteps};
+    for (step, text) in [
+        (FollowStep::Baseline, "baseline"),
+        (FollowStep::PrepareIndex, "prepare-index"),
+        (FollowStep::MoveBranch, "move-branch"),
+        (FollowStep::SwapIndex, "swap-index"),
+        (FollowStep::MoveOthers, "move-others"),
+    ] {
+        assert_eq!(serde_json::to_string(&step).unwrap(), format!("\"{text}\""));
+    }
+
+    let fx = git_dir_fixture();
+    let root = fx.path().to_string_lossy().to_string();
+    let j = Journal {
+        flow: Flow::Follow,
+        phase: Phase::FollowPublishing,
+        follow_steps: Some(FollowSteps {
+            step: FollowStep::SwapIndex,
+            new_tip: Some("t".to_string()),
+            others: vec![BranchMove {
+                branch: "feature".to_string(),
+                old: "o".to_string(),
+                new: "n".to_string(),
+            }],
+            index_blob: Some("b".to_string()),
+            index_stages: Some("s".to_string()),
+            lock_created: true,
+            report: FollowReport {
+                new_floor: 7,
+                ..Default::default()
+            },
+        }),
+        ..minimal("op")
+    };
+    write(&root, &j).unwrap();
+    assert_eq!(read(&root).unwrap().unwrap(), j);
+
+    let raw = std::fs::read_to_string(journal_path(&root)).unwrap();
+    for key in [
+        "followSteps",
+        "newTip",
+        "indexBlob",
+        "indexStages",
+        "lockCreated",
+        "newFloor",
+    ] {
+        assert!(raw.contains(&format!("\"{key}\"")), "缺字段 {key}：{raw}");
+    }
+}
+
+#[test]
+fn a_journal_without_follow_steps_still_reads_and_stays_clean() {
+    let fx = git_dir_fixture();
+    let root = fx.path().to_string_lossy().to_string();
+    std::fs::write(
+        journal_path(&root),
+        r#"{"opid":"x","flow":"sync_in","phase":"stashed","startedAt":7}"#,
+    )
+    .unwrap();
+    let j = read(&root).unwrap().unwrap();
+    assert_eq!(j.follow_steps, None);
+
+    write(&root, &j).unwrap();
+    let raw = std::fs::read_to_string(journal_path(&root)).unwrap();
+    assert!(!raw.contains("followSteps"), "空值不落盘：{raw}");
 }
 
 #[test]

@@ -19,14 +19,16 @@
 use crate::engine::file_lock::{describe, find_blockers};
 use crate::engine::git_cli::{run_git, run_git_code, run_git_env};
 use crate::engine::svn_baseline::{
-    create_baseline_commit, git_dir, move_baseline_ref, parse_trailer, read_baseline,
-    refresh_index_stat, swap_index_to_tree, TempIndex, Trailer,
+    create_baseline_commit, git_dir, move_baseline_ref, read_baseline, refresh_index_stat,
+    swap_index_to_tree, TempIndex,
 };
+use crate::engine::svn_basemap::BaseMap;
 use crate::engine::svn_cli::{run_svn, run_svn_code};
 use crate::engine::svn_config::{read_config, SvnConfig, BASELINE_BRANCH};
 use crate::engine::svn_dirty::read_dirty;
+use crate::engine::svn_follow_mark::clear_mark;
 use crate::engine::svn_include_check::normalize_roots;
-use crate::engine::svn_init::{rebuild_baseline, record_server_tree_into};
+use crate::engine::svn_init::{rebuild_baseline, record_mixed, record_server_tree_into};
 use crate::engine::svn_journal::{self, Flow, Journal, Phase};
 use crate::engine::svn_lock;
 use crate::engine::svn_preflight::{check_targets, read_node_rev, run_preflight};
@@ -103,6 +105,21 @@ pub enum SyncInOutcome {
         /// 为真时收尾的是一次回退 / 放弃：分支在更新前的位置。
         rolled_back: bool,
     },
+    /// 收尾了，改动内容都放回来了，但「已暂存」的状态没保住（分析 §6.11.1）：手动跟进带 `--index`
+    /// 放不回去、退回了普通 apply；或者更新（本来就不带 `--index`）时有暂存版本与磁盘不同。
+    /// 不能报成 `Done` / `Aborted`：用户拿暂存区当存档，要知道存档没了。冲突的结局不用这一条：
+    /// `StashConflict` 本身就意味着暂存没保住。
+    ///
+    /// **备份不删、钉子不拆**（Review 3 第 1 条）：`files` 的暂存版本此后只在 stash 里。
+    StageLost {
+        /// `None`：收尾的是一次放弃，分支回到了流程之前的位置。
+        new_rev: Option<u64>,
+        /// 留着的 stash。`None` 只在崩溃恢复时出现：stash 已经不在了（被外部删掉）。
+        stash_oid: Option<String>,
+        /// 暂存版本与磁盘不同的路径（[`wip::staged_only_paths`]）。手动跟进时可以为空：
+        /// 暂存的内容磁盘上都有，丢的只是标记。
+        files: Vec<String>,
+    },
 }
 
 /// 一次完整的更新。
@@ -170,9 +187,10 @@ fn verify_expect(p: &SyncInPreview, e: &SyncInExpect) -> Result<()> {
     Ok(())
 }
 
-/// 计划 A16：工作副本被外部整体 update 到了比基线新的 rN。
+/// 计划 A16：SVN 侧有新内容——外部整体 update 到了比基线新的 rN，或者（计划 Task 5 起）
+/// 只提交不更新、只更新了部分目录留下的混合版本。
 ///
-/// 先用 Phase 1 的「重建基线」把 `svn/base` 录成服务器 rN 的原版（`svn cat -r BASE`，
+/// 先用 Phase 1 的「重建基线」把 `svn/base` 录成各文件在服务器上的原版（`svn cat -r BASE`，
 /// 不碰磁盘），再走正常的 S0–S11：S9 把分支重放上去、S10 放回 WIP 时，服务器那部分
 /// 改动两边一致，三方合并自动抵消，git 这一侧重新分得清「服务器的」和「我的」
 /// （2026-09-25 实测，见计划 Task 7A）。
@@ -321,6 +339,16 @@ fn rolled_back(
         Ok(RestoreStep::Finished) => {
             format!("已回到分支 `{orig}`，未提交的改动已放回；基线没有变。")
         }
+        // 没有横幅可看（记录已删）：暂存的那份在哪要在这里说清楚
+        Ok(RestoreStep::StageKept { oid, files }) => format!(
+            "已回到分支 `{orig}`，未提交的改动已放回；基线没有变。但「已暂存」的状态没保住{}\
+             原始备份留在 stash 列表里（{oid}），需要时用 `git show {oid}^2:<文件>` 查看暂存的版本。",
+            if files.is_empty() {
+                "。".to_string()
+            } else {
+                format!("，下面这些文件暂存的版本与磁盘不同：\n{}\n", list_paths(&files))
+            }
+        ),
         Ok(_) => "已回到原分支，但放回未提交的改动时遇到问题——详见顶部横幅。".to_string(),
         Err(re) => format!(
             "另外：回到原分支也没成功（{}）。记录已保留，处理好之后在顶部横幅上点「放弃」。",
@@ -374,38 +402,65 @@ pub(crate) fn capture_and_publish(repo: &str, cfg: &SvnConfig, j: &mut Journal) 
     j.new_baseline_oid = None;
     svn_journal::write(repo, j)?;
 
-    // S6：P1–P4 与 nodeRevs 单值。S5 若没让 nodeRevs 收敛，在这里停（journal 留在
-    // capturing-baseline，继续时从这里重来）
-    let pre = run_preflight(repo, &cfg.whitelist)?;
     // §6.3.1：S7 从当前 HEAD 树（此刻就是旧基线）起步
     let idx = TempIndex::from_head(repo)?;
-    let (tree, _explained) = record_server_tree_into(repo, cfg, &pre, &idx)?;
-    // 与 R3c 同一道：录制期间有人在 TortoiseSVN 里 commit / update
-    let now = read_node_rev(repo, &cfg.whitelist)?;
-    if now != pre.node_rev {
-        return Err(GitError::new(
-            "sync_in_revision_moved",
-            format!(
-                "录新基线的过程中工作副本被外部改动了（r{} → r{now}）。基线没有推进，\
-                 记录保留；外部操作结束后在顶部横幅上点「继续」。",
-                pre.node_rev
-            ),
-        ));
-    }
+    let (tree, map) = match capture_single(repo, cfg, &idx)? {
+        Some(done) => done,
+        // S5 之后白名单仍是混合版本（例如 external 没跟着更新到同一个 revision）：
+        // 按文件记账录（计划 Task 5），带体检与墓碑。单值时不走这条，行为与改造前相同
+        None => {
+            let rec = record_mixed(repo, cfg, &idx).map_err(|e| {
+                if e.code == "svn_rebuild_revision_moved" {
+                    moved_error(&e.message)
+                } else {
+                    e
+                }
+            })?;
+            (rec.tree, rec.map)
+        }
+    };
     // 创建 commit 前记录 captureTree（§7.6）
     j.phase = Phase::PublishingBaseline;
     j.capture_tree = Some(tree.clone());
     svn_journal::write(repo, j)?;
-    let trailer = Trailer {
-        url: pre.repos_root,
-        rev: pre.node_rev,
-        uuid: pre.uuid,
-    };
-    let commit = create_baseline_commit(repo, &tree, Some(&old), &trailer)?;
+    let commit = create_baseline_commit(repo, &tree, Some(&old), &map)?;
     // 移动 ref 前记录 newBaselineOid（§7.6）
     j.new_baseline_oid = Some(commit);
     svn_journal::write(repo, j)?;
     finish_publish(repo, j)
+}
+
+/// S6–S7 的单值录制：P1–P4 与 nodeRevs 单值，与改造前逐字相同。白名单不是单值时返回
+/// `None`，交给 [`record_mixed`]；其余失败照旧报错（journal 留在 capturing-baseline，
+/// 继续时从这里重来）。
+fn capture_single(
+    repo: &str,
+    cfg: &SvnConfig,
+    idx: &TempIndex,
+) -> Result<Option<(String, BaseMap)>> {
+    let pre = match run_preflight(repo, &cfg.whitelist) {
+        Ok(p) => p,
+        Err(e) if e.code == "svn_preflight_mixed_revision" => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let (tree, _explained) = record_server_tree_into(repo, cfg, &pre, idx)?;
+    // 与 R3c 同一道：录制期间有人在 TortoiseSVN 里 commit / update
+    let now = read_node_rev(repo, &cfg.whitelist)?;
+    if now != pre.node_rev {
+        return Err(moved_error(&format!("r{} → r{now}", pre.node_rev)));
+    }
+    let map = BaseMap::single(pre.repos_root, pre.uuid, pre.node_rev);
+    Ok(Some((tree, map)))
+}
+
+fn moved_error(detail: &str) -> GitError {
+    GitError::new(
+        "sync_in_revision_moved",
+        format!(
+            "录新基线的过程中工作副本被外部改动了（{detail}）。基线没有推进，\
+             记录保留；外部操作结束后在顶部横幅上点「继续」。"
+        ),
+    )
 }
 
 /// 发布 + 索引对齐 + `baseline-ready`。重开时也从这里续（§7.6 publishing-baseline）。
@@ -514,9 +569,23 @@ pub(crate) fn conflict_or_error(repo: &str, e: GitError) -> Result<SyncInOutcome
 
 /// S10–S11，结局记为 `Done`。
 pub(crate) fn finish_forward(repo: &str, j: &mut Journal) -> Result<SyncInOutcome> {
+    if j.flow == Flow::FollowManual {
+        // 分支已经落到基线上，快照里的 HEAD 与暂存都过时了（跟进的 F6 同样清它）
+        clear_mark(repo);
+    }
     Ok(match restore_step(repo, j)? {
+        RestoreStep::Finished if j.stage_lost => SyncInOutcome::StageLost {
+            new_rev: Some(baseline_rev(repo)?),
+            stash_oid: None,
+            files: Vec::new(),
+        },
         RestoreStep::Finished => SyncInOutcome::Done {
             new_rev: baseline_rev(repo)?,
+        },
+        RestoreStep::StageKept { oid, files } => SyncInOutcome::StageLost {
+            new_rev: Some(baseline_rev(repo)?),
+            stash_oid: Some(oid),
+            files,
         },
         RestoreStep::Kept { oid } => SyncInOutcome::Settled {
             stash_oid: oid,
@@ -539,6 +608,11 @@ pub(crate) enum RestoreStep {
     Kept {
         oid: String,
     },
+    /// 干净地放回了，但暂存没保住：stash 与钉子都留着（见 [`SyncInOutcome::StageLost`]）。
+    StageKept {
+        oid: String,
+        files: Vec<String>,
+    },
     Conflict {
         files: Vec<String>,
         oid: String,
@@ -558,7 +632,14 @@ pub(crate) fn restore_step(repo: &str, j: &mut Journal) -> Result<RestoreStep> {
     if !j.stash_applied {
         j.phase = Phase::ApplyingStash;
         svn_journal::write(repo, j)?;
-        match wip::restore_wip(repo, &oid)? {
+        let outcome = if j.flow == Flow::FollowManual {
+            let (outcome, stage_lost) = wip::restore_wip_keeping_index(repo, &oid)?;
+            j.stage_lost = stage_lost;
+            outcome
+        } else {
+            wip::restore_wip(repo, &oid)?
+        };
+        match outcome {
             RestoreOutcome::Applied => {}
             RestoreOutcome::Conflicted { files } => {
                 j.stash_applied = true;
@@ -569,9 +650,30 @@ pub(crate) fn restore_step(repo: &str, j: &mut Journal) -> Result<RestoreStep> {
                 return Ok(RestoreStep::Blocked { collisions, oid })
             }
         }
+        // 暂存没放回去时，与磁盘不同的那份暂存只在 stash 里（Review 3 第 1 条）。手动跟进带
+        // `--index` 放回成功时暂存原样在索引里，不用查
+        let staged_only = if j.flow == Flow::FollowManual && !j.stage_lost {
+            Vec::new()
+        } else {
+            wip::staged_only_paths(repo, &oid)?
+        };
+        if !staged_only.is_empty() {
+            j.stage_lost = true;
+        }
         // apply 成功之后、drop 之前落盘：崩在这里重开时只 drop，不再 apply（计划 A2）
         j.stash_applied = true;
         svn_journal::write(repo, j)?;
+        if j.stage_lost {
+            // 不 drop、不拆钉子：拆了之后用户在 stash 列表里删掉那条，暂存的那份就没有任何引用了。
+            // 手动跟进退回普通 apply 时即使 `staged_only` 为空也留着：内容磁盘上都有，但用户拿暂存区
+            // 当存档，备份交给用户确认后自己删。崩在这里之后的「继续」走下面的 else，按 `Kept`
+            // 收尾，备份照样留在 stash 列表里
+            svn_journal::remove(repo)?;
+            return Ok(RestoreStep::StageKept {
+                oid,
+                files: staged_only,
+            });
+        }
     } else {
         let files = unmerged_paths(repo)?;
         if !files.is_empty() {
@@ -749,19 +851,9 @@ pub(crate) fn rebase_in_progress(repo: &str) -> Result<bool> {
     Ok(d.join("rebase-merge").exists() || d.join("rebase-apply").exists())
 }
 
+/// 新基线的 floor（混合基线也读得出，计划 Task 5）。
 fn baseline_rev(repo: &str) -> Result<u64> {
-    let msg = run_git(
-        repo,
-        &[
-            "log",
-            "-1",
-            "--format=%B",
-            &format!("refs/heads/{BASELINE_BRANCH}"),
-        ],
-    )?;
-    parse_trailer(&msg)
-        .map(|t| t.rev)
-        .ok_or_else(|| GitError::new("svn_baseline", "基线 commit 上读不到 git-svn-id"))
+    crate::engine::svn_sync::read_baseline_rev(repo)
 }
 
 pub(crate) fn need(v: &Option<String>, field: &str) -> Result<String> {
@@ -858,7 +950,8 @@ pub fn continue_sync(repo: &str) -> Result<SyncInOutcome> {
             require_restore_target(repo, j)?;
             if j.rolling_back {
                 // 往回走时停下的：收尾的是一次回退，不是更新（PR #49 review #3）
-                Ok(back_outcome(restore_step(repo, j)?))
+                let step = restore_step(repo, j)?;
+                Ok(back_outcome(step, j.stage_lost))
             } else {
                 finish_forward(repo, j)
             }
@@ -907,13 +1000,23 @@ pub fn abort_sync(repo: &str) -> Result<SyncInOutcome> {
         }
         _ => return Err(sync_out_unsupported()),
     };
-    Ok(back_outcome(step))
+    Ok(back_outcome(step, j.stage_lost))
 }
 
 /// 往回走（放弃 / 回退）那一次 S10–S11 的结局。
-fn back_outcome(step: RestoreStep) -> SyncInOutcome {
+fn back_outcome(step: RestoreStep, stage_lost: bool) -> SyncInOutcome {
     match step {
+        RestoreStep::Finished if stage_lost => SyncInOutcome::StageLost {
+            new_rev: None,
+            stash_oid: None,
+            files: Vec::new(),
+        },
         RestoreStep::Finished => SyncInOutcome::Aborted,
+        RestoreStep::StageKept { oid, files } => SyncInOutcome::StageLost {
+            new_rev: None,
+            stash_oid: Some(oid),
+            files,
+        },
         RestoreStep::Kept { oid } => SyncInOutcome::Settled {
             stash_oid: oid,
             rolled_back: true,
@@ -1103,8 +1206,12 @@ pub(crate) fn is_baseline_bytes(repo: &str, bases: &[String], p: &str) -> Result
 /// 拿锁并在锁内重读 journal。
 fn take_over(repo: &str) -> Result<(svn_lock::SyncLock, Journal)> {
     let first = svn_journal::read(repo)?.ok_or_else(no_unfinished)?;
-    if first.flow != Flow::SyncIn {
-        return Err(sync_out_unsupported());
+    match first.flow {
+        // 手动跟进的冲突出口沿用这里的继续 / 放弃（计划 Task 13）；差别只在恢复时不走 S3–S7，
+        // 见 `resume_stashed`
+        Flow::SyncIn | Flow::FollowManual => {}
+        Flow::SyncOut => return Err(sync_out_unsupported()),
+        Flow::Follow => return Err(follow_unsupported()),
     }
     let lock = svn_lock::acquire(repo, &first.opid)?;
     // 拿锁之前那份只用来取 opid；两次读之间可能被另一个进程推进过
@@ -1113,6 +1220,10 @@ fn take_over(repo: &str) -> Result<(svn_lock::SyncLock, Journal)> {
 }
 
 /// A11：从 `stashed` 接着走之前，确认中断期间没人动过。
+///
+/// 手动跟进（`Flow::FollowManual`）的基线早就发布了，这里直接接到 S8 之后：套用 S3–S7 等于切基线、
+/// 跑 `svn update`，而它恰恰不做这两件事。它的 `baselineOidBefore` 是分支落后的那个旧基线，HEAD
+/// 被外部切到新基线上时下面照样报「基线分支的位置变了」，不用单独分支。
 fn resume_stashed(repo: &str, cfg: &SvnConfig, j: &mut Journal) -> Result<SyncInOutcome> {
     let orig = need(&j.orig_branch, "origBranch")?;
     let orig_head = need(&j.orig_head, "origHead")?;
@@ -1138,6 +1249,9 @@ fn resume_stashed(repo: &str, cfg: &SvnConfig, j: &mut Journal) -> Result<SyncIn
                 "HEAD 在 {other:?} 上，既不是原分支 `{orig}` 也不是基线分支"
             )))
         }
+    }
+    if j.flow == Flow::FollowManual {
+        return from_baseline_ready(repo, cfg, j);
     }
     from_stashed(repo, cfg, j, false)
 }
@@ -1299,6 +1413,13 @@ pub(crate) fn no_unfinished() -> GitError {
     GitError::new(
         "sync_no_unfinished",
         "没有未收尾的同步记录，不需要继续或放弃。",
+    )
+}
+
+fn follow_unsupported() -> GitError {
+    GitError::new(
+        "sync_follow_not_supported",
+        "这条记录是「跟进」流程留下的。请用顶部横幅上的「继续」把它走完，不要手工去动分支指针。",
     )
 }
 

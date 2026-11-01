@@ -7,8 +7,8 @@ mod svn_fixtures;
 use app_lib::engine::git_cli::run_git;
 use app_lib::engine::svn_journal::{read, Flow, Journal, Phase};
 use app_lib::engine::svn_sync_stash::{
-    drop_wip, find_by_opid, pin_ref, read_stash_ref, restore_wip, settle_stashing, stash_wip,
-    RestoreOutcome,
+    drop_wip, find_by_opid, pin_ref, read_stash_ref, restore_wip, restore_wip_keeping_index,
+    settle_stashing, stash_wip, RestoreOutcome,
 };
 use svn_fixtures::hybrid_with_colleague;
 
@@ -374,6 +374,122 @@ fn restore_reports_conflicts_and_keeps_the_stash() {
         other => panic!("应当是冲突：{other:?}"),
     }
     assert!(git(&root, &["stash", "list"]).contains("mygitclient-sync:op-x"));
+}
+
+const NINE: &str = "1\n2\n3\n4\n5\n6\n7\n8\n9\n";
+
+/// 把 `Code/A.cs` 换成 9 行、提交，再按 `staged` / `disk` 留下 WIP 并压栈，HEAD 上再来一个提交。
+fn index_scene(
+    fx: &svn_fixtures::SvnFixture,
+    staged: &str,
+    disk: &str,
+    moved_head: &str,
+) -> (String, String) {
+    let root = fx.wc_str();
+    let a = fx.wc().join("Code/A.cs");
+    std::fs::write(&a, NINE).unwrap();
+    git(&root, &["commit", "-qam", "nine"]);
+    std::fs::write(&a, staged).unwrap();
+    git(&root, &["add", "Code/A.cs"]);
+    std::fs::write(&a, disk).unwrap();
+    let mut j = journal("op-i");
+    stash_wip(&root, &mut j, &wl()).unwrap();
+    std::fs::write(&a, moved_head).unwrap();
+    git(&root, &["commit", "-qam", "moved"]);
+    (root, j.stash_oid.unwrap())
+}
+
+#[test]
+fn restore_keeping_index_keeps_stage_and_disk_apart() {
+    let fx = hybrid_with_colleague();
+    let staged = NINE.replace("2\n", "2-s\n");
+    let disk = staged.replace("8\n", "8-d\n");
+    // 第 6 行在第 2 行补丁的上下文（第 3–5 行）之外，也不贴着未暂存的第 8 行
+    let (root, oid) = index_scene(&fx, &staged, &disk, &NINE.replace("6\n", "6-h\n"));
+
+    let (out, lost) = restore_wip_keeping_index(&root, &oid).unwrap();
+
+    assert_eq!(out, RestoreOutcome::Applied);
+    assert!(!lost);
+    assert!(git(&root, &["show", ":Code/A.cs"]).contains("2-s"));
+    assert!(!git(&root, &["show", ":Code/A.cs"]).contains("8-d"));
+}
+
+#[test]
+fn restore_keeping_index_falls_back_when_the_stage_does_not_apply() {
+    // 探针 P1：`conflicts in index`，什么都没写
+    let fx = hybrid_with_colleague();
+    let staged = NINE.replace("2\n", "2-s\n");
+    let (root, oid) = index_scene(&fx, &staged, &staged, &NINE.replace("4\n", "4-h\n"));
+
+    let (out, lost) = restore_wip_keeping_index(&root, &oid).unwrap();
+
+    assert_eq!(out, RestoreOutcome::Applied);
+    assert!(lost);
+    assert_eq!(git(&root, &["diff", "--cached", "--name-only"]), "");
+    let disk = std::fs::read_to_string(fx.wc().join("Code/A.cs")).unwrap();
+    assert!(disk.contains("2-s") && disk.contains("4-h"), "{disk}");
+}
+
+#[test]
+fn restore_keeping_index_conflict_is_not_applied_twice() {
+    // 探针 P2：暂存打得上、未暂存冲突。现场已是冲突态，再 apply 一次只会撞上自己
+    let fx = hybrid_with_colleague();
+    let staged = NINE.replace("2\n", "2-s\n");
+    let disk = staged.replace("8\n", "8-d\n");
+    let (root, oid) = index_scene(&fx, &staged, &disk, &NINE.replace("8\n", "8-h\n"));
+
+    let (out, lost) = restore_wip_keeping_index(&root, &oid).unwrap();
+
+    assert_eq!(
+        out,
+        RestoreOutcome::Conflicted {
+            files: vec!["Code/A.cs".to_string()],
+        }
+    );
+    assert!(lost);
+    assert!(git(&root, &["stash", "list"]).contains("mygitclient-sync:op-i"));
+}
+
+#[test]
+fn restore_keeping_index_stops_when_the_failure_changed_the_index() {
+    // 放回之前用户暂存了 stash 也碰过的文件（比如停在撞名时动过），内容只在索引里、磁盘等于 HEAD。
+    // `--index` 先把索引复位，再在「本地改动会被覆盖」上失败：没有未合并条目，现场却变了。
+    // 这时不带 `--index` 反而能成功，等于在被改过的现场上接着写，所以必须停下
+    let fx = hybrid_with_colleague();
+    let root = fx.wc_str();
+    let (a, b) = (fx.wc().join("Code/A.cs"), fx.wc().join("Code/B.cs"));
+    std::fs::write(&a, "a-staged\n").unwrap();
+    git(&root, &["add", "Code/A.cs"]);
+    std::fs::write(&b, "b-stash\n").unwrap();
+    let mut j = journal("op-c");
+    stash_wip(&root, &mut j, &wl()).unwrap();
+    let head_bytes = std::fs::read(&b).unwrap();
+    std::fs::write(&b, "b-local\n").unwrap();
+    git(&root, &["add", "Code/B.cs"]);
+    std::fs::write(&b, &head_bytes).unwrap();
+
+    let e = restore_wip_keeping_index(&root, &j.stash_oid.unwrap()).unwrap_err();
+
+    assert_eq!(e.code, "sync_stash_apply_failed");
+    assert_eq!(std::fs::read(&b).unwrap(), head_bytes, "没有接着写");
+    assert!(git(&root, &["stash", "list"]).contains("mygitclient-sync:op-c"));
+}
+
+#[test]
+fn restore_keeping_index_is_blocked_before_writing_a_byte() {
+    // A3 不变：真撞名在动手之前挡住，`--index` 与否都一样
+    let fx = hybrid_with_colleague();
+    let root = fx.wc_str();
+    std::fs::write(fx.wc().join("Code/U.cs"), "stashed\n").unwrap();
+    let mut j = journal("op-u");
+    stash_wip(&root, &mut j, &wl()).unwrap();
+    std::fs::write(fx.wc().join("Code/U.cs"), "别的内容\n").unwrap();
+
+    let (out, lost) = restore_wip_keeping_index(&root, &j.stash_oid.unwrap()).unwrap();
+
+    assert!(matches!(out, RestoreOutcome::Blocked { .. }));
+    assert!(!lost, "还没放回，谈不上丢");
 }
 
 #[test]

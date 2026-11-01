@@ -15,15 +15,22 @@
 //! 调用时必须满足「磁盘上白名单内的内容 == 基线树的内容」。spec §6.8.5 列的四个
 //! 时机全部满足它：HEAD 在 `svn/base` 上且工作区干净，或基线树刚从磁盘录出来。
 
-use crate::engine::svn_cli::run_svn;
+use crate::engine::svn_cli::{run_svn, run_svn_code};
 // W-file 判据原本是本模块的私有函数，Phase 1c 提到 `svn_include_check` 共用，
 // 2026-10-28 再收进 `svn_scope`——`svn_server_set` 等要用**同一套**判据。
 // 两份「什么算 W-file」迟早分叉，而分叉的表现是「每次打开都报几千条漏收」或者
 // 「永远报没问题」，两头都很难查。
+use crate::engine::svn_basemap::BaseMap;
+use crate::engine::svn_nodes::{read_node_status, NodeStatus};
 use crate::engine::svn_scope::WScope;
-use crate::engine::svn_xml::parse_diff_summary;
+use crate::engine::svn_tombstone::fault::{self, Point};
+use crate::engine::svn_tombstone::{
+    confirm_absent, decode_url, encode_url_path, error_codes, server_head_rev,
+};
+use crate::engine::svn_wc::WcIdentity;
+use crate::engine::svn_xml::{parse_diff_summary, parse_excluded_nodes, parse_list};
 use crate::error::{GitError, Result};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// 体检的三种结果。**必须分开**（spec §6.8.6）。
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -117,6 +124,467 @@ pub fn check_baseline(
     // 报成「未覆盖」，见 [`ExplainedOrigin`]。
     origin: ExplainedOrigin,
 ) -> Result<Health> {
+    // 单值包装（计划 Task 4）：映射只有 floor，并且**不产生墓碑**——floor 组里没被解释的
+    // D 照旧算差异。于是发出的命令（每个单元一条整单元 diff，不带 `--ignore-properties`）
+    // 与判据都与改造前逐字相同。`repos_root` / `uuid` 只有产生墓碑时才用，这里留空。
+    let map = BaseMap::single(String::new(), String::new(), rev);
+    let opts = Grouped {
+        tombstoning: false,
+        nodes: None,
+    };
+    match check_grouped(repo_root, svn_url, &map, scope, explained, origin, opts)? {
+        HealthMap::Verified { health, .. } => Ok(health),
+        // 不产生墓碑就不会去问服务器，走不到这里；万一走到，按「撒谎」报，不放行
+        HealthMap::Excluded { files } | HealthMap::Unconfirmed { files, .. } => {
+            Ok(Health::Lying { files })
+        }
+    }
+}
+
+/// 混合基线的体检结论。
+#[derive(Debug, Clone, PartialEq)]
+pub enum HealthMap {
+    /// 没有漏收。`health` 是照常的三种结论之一（`Verified` / `Lying` / `NotChecked`）。
+    Verified {
+        health: Health,
+        /// 只在 [`ExplainedOrigin::JustRecorded`] 时产生：floor 组里没被墓碑解释、也不在 S
+        /// 里的 D，向服务器 HEAD 确认已不存在的，成为新墓碑（值 = 当时的 HEAD）。
+        /// `health` 不是 `Verified` 时恒为空。
+        new_gone: BTreeMap<String, u64>,
+    },
+    /// 这些路径服务器 HEAD 上仍然存在，工作副本里却没有（漏收，E17），调用方应拒绝录制
+    /// （`svn_baseline_excluded_paths`）。
+    Excluded { files: Vec<String> },
+    /// 只在 [`ExplainedOrigin::JustRecorded`] 时产生：有该向服务器确认的东西，却没确认成——
+    /// 读不到服务器 HEAD、`svn info` 核对失败、找不出被排除的节点、列不出被排除节点在 floor
+    /// 上的内容。调用方必须拒绝录制（`svn_baseline_unconfirmed`）。
+    ///
+    /// # 为什么不能是 `NotChecked`（Review 1 第 1 条）
+    ///
+    /// 录制接受 `NotChecked`（离线时照样能录）。可这里 `files` 是**已知**的、floor 上有而
+    /// 工作副本里没有的文件：改造前同一状态是 Lying（拒绝）；降成 NotChecked 放行，发布的
+    /// 基线就静默丢了它们，也没有墓碑——比改造前更差。
+    ///
+    /// `files`：待确认的路径（floor 组没被解释的 D、被排除节点列出来的 W-file；列不出内容的
+    /// 被排除节点报节点本身）；扫描被排除节点那一步就失败时为空。
+    Unconfirmed { files: Vec<String>, reason: String },
+}
+
+/// 按映射分组体检（分析 §6.4，命令形状照日志 E18）。
+///
+/// - floor 组：每个单元一条整单元 `svn diff --old=<unit_url>@<F> --new=<wc_root>`，
+///   结果里剔除映射单列的文件（它们归各自的组）；映射不是单值时加 `--ignore-properties`
+///   去掉根目录那条假的属性差异
+/// - 其余每个 revision 组：`--old=<unit_url>@<r> --new=<wc_root> -- <PATH>...`，PATH 相对单元根，
+///   按命令行长度分批（[`MAX_DIFF_CMDLINE`]）；未版本化 / 丢失的 PATH 发之前剔除
+///   （前者让整条命令 E155010；后者 svn 本来就不报，内容由 S 负责）
+/// - 墓碑：`<unit_url>/<rel>@<d>` 必须不存在，否则 `Lying`
+/// - `JustRecorded` 时，floor 组没被解释的 D 向服务器 HEAD 确认：不存在 → `new_gone`；
+///   仍存在 → [`HealthMap::Excluded`]；确认不成 → [`HealthMap::Unconfirmed`]。
+///   `--set-depth=exclude` 掉的节点整单元 diff 不报，另用 `svn info -R` 找出来、点名再比一次
+///   （点不了名的用 `svn ls -R` 列出 floor 上的内容），让它们也走这条确认
+///
+/// 判据：各组 `D \ S` 的并集为空，且墓碑全部成立。
+pub fn check_baseline_map(
+    repo_root: &str,
+    svn_url: &str,
+    map: &BaseMap,
+    scope: &WScope,
+    explained: &BTreeSet<String>,
+    origin: ExplainedOrigin,
+) -> Result<HealthMap> {
+    check_baseline_map_with_nodes(repo_root, svn_url, map, scope, explained, origin, None)
+}
+
+/// 同 [`check_baseline_map`]，调用方已经读过节点状态时传进来，省掉剔除尾随 PATH 那一次
+/// `svn status -v`（录制 R2 刚读过，计划 Task 5）。`None` 时自己读。
+pub(crate) fn check_baseline_map_with_nodes(
+    repo_root: &str,
+    svn_url: &str,
+    map: &BaseMap,
+    scope: &WScope,
+    explained: &BTreeSet<String>,
+    origin: ExplainedOrigin,
+    nodes: Option<&[NodeStatus]>,
+) -> Result<HealthMap> {
+    let opts = Grouped {
+        tombstoning: origin == ExplainedOrigin::JustRecorded,
+        nodes,
+    };
+    check_grouped(repo_root, svn_url, map, scope, explained, origin, opts)
+}
+
+/// [`check_grouped`] 的两个开关。
+#[derive(Clone, Copy)]
+struct Grouped<'a> {
+    /// 为假时不产生墓碑、不问服务器 HEAD、不扫被排除的节点（单值包装 [`check_baseline`]）。
+    tombstoning: bool,
+    /// 调用方已读过的节点状态；`None` 时需要就自己读。
+    nodes: Option<&'a [NodeStatus]>,
+}
+
+/// 尾随 PATH 那批命令的命令行上限（字符数按 UTF-8 字节估，偏保守）。
+///
+/// Windows 的命令行上限是 32767 个 UTF-16 单元，留出余量给 svn 路径、引号与全局参数。
+/// `svn diff` 没有 `--targets`（分析 §6.4），只能分批。
+pub const MAX_DIFF_CMDLINE: usize = 24000;
+
+/// 一条体检用的 `svn diff` 负责哪些结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffScope {
+    /// floor 组：结果里剔除映射单列（`revs`）的文件，其余都算；D 可能成为墓碑。
+    Floor,
+    /// 只看这些文件（仓库相对路径），其余结果属于别的组。
+    Only(BTreeSet<String>),
+}
+
+/// 将要发出的一条 `svn diff`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffCommand {
+    /// 所属单元的 `wc_root`（仓库相对）。
+    pub wc_root: String,
+    /// 所属单元的 URL（去掉尾部 `/`），结果路径要剥掉它。
+    pub unit_url: String,
+    pub rev: u64,
+    /// 传给 `run_svn` 的参数（不含 `--non-interactive`，那由 `run_svn` 注入）。
+    pub args: Vec<String>,
+    pub scope: DiffScope,
+}
+
+/// [`plan_diffs`] 的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffPlan {
+    pub commands: Vec<DiffCommand>,
+    /// 被排除的节点里没法用尾随 PATH 点名的（就是单元根本身，或路径含非 ASCII 字符，
+    /// 见 [`plan_diffs`]）。调用方改用 `svn ls -R <url>@<F>` 列出内容再按 W-file 筛（D8）。
+    pub unaddressable: Vec<String>,
+}
+
+/// 由映射算出体检要发的全部 `svn diff`。纯函数，不发命令。
+///
+/// - `skip`：要剔除的 PATH（未版本化 / 丢失），仓库相对
+/// - `excluded`：`--set-depth=exclude` 掉的节点，仓库相对；用 floor revision 点名比一次
+///
+/// 映射是单值、`excluded` 为空时，结果就是每个单元一条与改造前完全相同的命令。
+///
+/// # 为什么含非 ASCII 字符的 PATH 不走尾随参数
+///
+/// 2026-10-31 实测（SlikSvn 1.14.2，系统代码页 1252）：`svn diff ... -- "sp ace/中文.cs"`
+/// 报 `E155010: The node '…\sp ace\?? .cs' was not found`——svn.exe 按系统代码页取命令行
+/// 参数，代码页表示不了的字符变成 `?`。这类文件改走整单元 diff、只看它们的结果，
+/// 慢一些，但不依赖代码页。
+pub fn plan_diffs(
+    units: &[WcIdentity],
+    map: &BaseMap,
+    skip: &BTreeSet<String>,
+    excluded: &BTreeSet<String>,
+) -> Result<DiffPlan> {
+    let mixed = !map.is_single();
+    let mut commands = Vec::new();
+    for u in units {
+        let url = u.url.trim_end_matches('/');
+        let mut args = vec![
+            "diff".to_string(),
+            format!("--old={url}@{}", map.floor),
+            format!("--new={}", u.wc_root),
+            "--summarize".to_string(),
+            "--xml".to_string(),
+        ];
+        if mixed {
+            args.push("--ignore-properties".to_string());
+        }
+        commands.push(DiffCommand {
+            wc_root: u.wc_root.clone(),
+            unit_url: url.to_string(),
+            rev: map.floor,
+            args,
+            scope: DiffScope::Floor,
+        });
+    }
+
+    // (单元, revision) → [(仓库相对路径, 相对单元根)]
+    let mut groups: BTreeMap<(usize, u64), Vec<(String, String)>> = BTreeMap::new();
+    for (p, &r) in &map.revs {
+        if skip.contains(p) {
+            continue;
+        }
+        let (i, rel) = unit_of(units, p).ok_or_else(|| outside_units(p))?;
+        groups.entry((i, r)).or_default().push((p.clone(), rel));
+    }
+    for ((i, r), files) in groups {
+        let u = &units[i];
+        let (pathable, whole): (Vec<_>, Vec<_>) = files
+            .into_iter()
+            .partition(|(_, rel)| !rel.is_empty() && rel.is_ascii());
+        let head = group_head(u, r);
+        if !whole.is_empty() {
+            commands.push(DiffCommand {
+                wc_root: u.wc_root.clone(),
+                unit_url: u.url.trim_end_matches('/').to_string(),
+                rev: r,
+                args: head[..head.len() - 1].to_vec(),
+                scope: DiffScope::Only(whole.into_iter().map(|(p, _)| p).collect()),
+            });
+        }
+        push_batches(&mut commands, u, r, head, pathable, false);
+    }
+
+    let mut unaddressable = Vec::new();
+    let mut ex_by_unit: BTreeMap<usize, Vec<(String, String)>> = BTreeMap::new();
+    for p in excluded {
+        match unit_of(units, p) {
+            Some((i, rel)) if !rel.is_empty() && rel.is_ascii() => {
+                ex_by_unit.entry(i).or_default().push((p.clone(), rel));
+            }
+            _ => unaddressable.push(p.clone()),
+        }
+    }
+    for (i, files) in ex_by_unit {
+        let u = &units[i];
+        push_batches(
+            &mut commands,
+            u,
+            map.floor,
+            group_head(u, map.floor),
+            files,
+            true,
+        );
+    }
+    Ok(DiffPlan {
+        commands,
+        unaddressable,
+    })
+}
+
+/// 尾随 PATH 那类命令的固定前缀，最后一个参数是 `--`。
+fn group_head(u: &WcIdentity, rev: u64) -> Vec<String> {
+    vec![
+        "diff".to_string(),
+        format!("--old={}@{rev}", u.url.trim_end_matches('/')),
+        format!("--new={}", u.wc_root),
+        "--summarize".to_string(),
+        "--xml".to_string(),
+        "--ignore-properties".to_string(),
+        "--".to_string(),
+    ]
+}
+
+/// 把 `files` 接在 `head` 后面，按 [`MAX_DIFF_CMDLINE`] 切成若干条命令。
+fn push_batches(
+    out: &mut Vec<DiffCommand>,
+    u: &WcIdentity,
+    rev: u64,
+    head: Vec<String>,
+    files: Vec<(String, String)>,
+    floor: bool,
+) {
+    let base_len = cmdline_len(&head);
+    let mut args = head.clone();
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    let mut len = base_len;
+    let mut flush = |args: &mut Vec<String>, set: &mut BTreeSet<String>| {
+        out.push(DiffCommand {
+            wc_root: u.wc_root.clone(),
+            unit_url: u.url.trim_end_matches('/').to_string(),
+            rev,
+            args: std::mem::replace(args, head.clone()),
+            scope: if floor {
+                DiffScope::Floor
+            } else {
+                DiffScope::Only(std::mem::take(set))
+            },
+        });
+        set.clear();
+    };
+    for (p, rel) in files {
+        let add = rel.len() + 3;
+        if !set.is_empty() && len + add > MAX_DIFF_CMDLINE {
+            flush(&mut args, &mut set);
+            len = base_len;
+        }
+        args.push(rel);
+        set.insert(p);
+        len += add;
+    }
+    if !set.is_empty() {
+        flush(&mut args, &mut set);
+    }
+}
+
+/// 命令行长度的保守估计：每个参数按字节数 + 两个引号 + 一个空格。
+fn cmdline_len(args: &[String]) -> usize {
+    "svn --non-interactive".len() + args.iter().map(|a| a.len() + 3).sum::<usize>()
+}
+
+/// 仓库相对路径归哪个单元：取最长的 `wc_root` 前缀（嵌套 external 比外层更具体）。
+/// 返回单元下标与相对单元根的路径（就是单元根本身时为空串）。
+fn unit_of(units: &[WcIdentity], path: &str) -> Option<(usize, String)> {
+    let mut best: Option<(usize, usize, String)> = None;
+    for (i, u) in units.iter().enumerate() {
+        let root = u.wc_root.trim_end_matches('/');
+        let rel = if path.eq_ignore_ascii_case(root) {
+            Some(String::new())
+        } else {
+            strip_prefix_ci(path, &format!("{root}/"))
+        };
+        if let Some(rel) = rel {
+            let longer = match &best {
+                None => true,
+                Some(b) => root.len() > b.1,
+            };
+            if longer {
+                best = Some((i, root.len(), rel));
+            }
+        }
+    }
+    best.map(|(i, _, rel)| (i, rel))
+}
+
+fn outside_units(p: &str) -> GitError {
+    GitError::new(
+        "svn_health_path_outside_units",
+        format!(
+            "基线记账里的 `{p}` 不在任何一个白名单工作副本底下，没法决定拿哪个 URL 去比。\
+             白名单改过之后要先重建基线。"
+        ),
+    )
+}
+
+/// 墓碑 / 待确认路径在服务器上的 `<url>@<rev>`。
+fn server_url_at(units: &[WcIdentity], p: &str, rev: u64) -> Option<String> {
+    let (i, rel) = unit_of(units, p)?;
+    let url = units[i].url.trim_end_matches('/');
+    Some(if rel.is_empty() {
+        format!("{url}@{rev}")
+    } else {
+        format!("{url}/{}@{rev}", encode_url_path(&rel))
+    })
+}
+
+/// 每个单元 `svn info -R --xml` 一次，找出被 `--set-depth=exclude` 掉的节点
+/// （仓库相对路径 → kind）。纯本地读，不写 wc.db（E19）。
+fn excluded_nodes(repo_root: &str, units: &[WcIdentity]) -> Result<BTreeMap<String, String>> {
+    fault::hit(Point::ExcludedScan)?;
+    let mut out = BTreeMap::new();
+    for u in units {
+        // info 的 target 必须过 peg_safe（与 diff 的尾随 PATH 相反，见 `svn_wc::peg_safe`）
+        let arg = crate::engine::svn_wc::peg_safe(&u.wc_root);
+        let xml = run_svn(repo_root, &["info", "-R", "--xml", "--", &arg])?;
+        for (p, kind) in parse_excluded_nodes(&xml)? {
+            out.insert(p, kind);
+        }
+    }
+    Ok(out)
+}
+
+/// 点不了名的被排除节点 `p` 在 floor 上有哪些文件（仓库相对路径），D8。
+///
+/// 走百分号编码成 ASCII 的 URL，不受系统代码页影响，这正是它点不了名的原因（`plan_diffs`）。
+/// `kind` 是 `svn info` 给的节点类型：文件的清单就是它自己，名字不用拼。
+///
+/// floor 上还没有这个节点（之后才加进来又被排除）时 svn rc=1、W160013：返回空，与点名
+/// diff 在同一形态下的结果（rc=0、无输出）一致——floor 上没有，基线就不欠它什么。
+/// 别的失败一律报错，不能当成空：`parse_list` 的文档写明了失败时 stdout 也是一份合法的空清单。
+fn excluded_files_at_floor(
+    repo_root: &str,
+    units: &[WcIdentity],
+    p: &str,
+    kind: Option<&str>,
+    floor: u64,
+) -> Result<Vec<String>> {
+    fault::hit(Point::ListAtFloor)?;
+    let url = server_url_at(units, p, floor).ok_or_else(|| outside_units(p))?;
+    let out = run_svn_code(repo_root, &["ls", "-R", "--xml", "--", &url])?;
+    if out.code != 0 {
+        let codes = error_codes(&out.stderr);
+        let absent = codes.iter().any(|c| c == "W160013")
+            && codes.iter().all(|c| c == "W160013" || c == "E200009");
+        if absent {
+            return Ok(Vec::new());
+        }
+        return Err(GitError::new(
+            "svn_health_list_failed",
+            format!("svn ls 没跑成。svn 原话：{}", out.stderr.trim()),
+        ));
+    }
+    let is_file = kind == Some("file");
+    let root = p.trim_end_matches('/');
+    Ok(parse_list(&out.stdout)?
+        .entries
+        .into_iter()
+        .filter(|e| e.kind == "file")
+        .map(|e| {
+            if is_file {
+                root.to_string()
+            } else {
+                format!("{root}/{}", e.name)
+            }
+        })
+        .collect())
+}
+
+/// 把 `svn diff --xml` 输出里的路径还原成仓库相对路径。`Err` 是说明为什么还原不了。
+fn repo_rel_of(path: &str, cmd: &DiffCommand, prefix: &str) -> std::result::Result<String, String> {
+    fault::hit(Point::DiffPath).map_err(|e| e.message)?;
+    // 单文件白名单条目：`--new` 就是那个文件本身，svn 打出来的路径恰好
+    // 等于 `unit_url`，没有尾随的子路径可剥。
+    if path
+        .trim_end_matches('/')
+        .eq_ignore_ascii_case(&cmd.unit_url)
+    {
+        return Ok(cmd.wc_root.clone());
+    }
+    let Some(sub) = strip_prefix_ci(path, prefix) else {
+        return Err(format!(
+            "svn diff 输出里的路径 `{path}` 不在本次比对的基准 URL `{}` 之下，\
+             没法还原成仓库相对路径。这是一个本应用没有预料到的输出形状，\
+             为安全起见判为「未经体检」——既不宣称基线健康，也不指控它撒谎。",
+            cmd.unit_url
+        ));
+    };
+    // 输出是 URL：空格是 `%20`、中文是 `%XX` 序列、`%` 是 `%25`。
+    // 不解码的话，这类路径既对不上 S，报给用户的也是编码后的样子
+    match decode_url(&sub) {
+        Some(d) => Ok(format!("{}/{}", cmd.wc_root, d)),
+        None => Err(format!(
+            "svn diff 输出里的路径 `{path}` 不是合法的百分号编码，没法还原成\
+             仓库相对路径。为安全起见判为「未经体检」。"
+        )),
+    }
+}
+
+/// 体检本体。`tombstoning` 为假时不产生墓碑、不问服务器 HEAD、不扫被排除的节点
+/// （单值包装 [`check_baseline`] 走这条，行为与改造前相同）。
+fn check_grouped(
+    repo_root: &str,
+    svn_url: &str,
+    map: &BaseMap,
+    scope: &WScope,
+    explained: &BTreeSet<String>,
+    origin: ExplainedOrigin,
+    opts: Grouped,
+) -> Result<HealthMap> {
+    let tombstoning = opts.tombstoning;
+    let done = |health: Health| {
+        Ok(HealthMap::Verified {
+            health,
+            new_gone: BTreeMap::new(),
+        })
+    };
+    let not_checked = |reason: String| done(Health::NotChecked { reason });
+    // 比对已经开始之后的失败。第一条 diff 有了结果，「没验成」就不再等于「什么都不知道」：
+    // 录制时必须拒绝，降成 NotChecked 放行会静默丢掉已知的删除（理由见 HealthMap::Unconfirmed）
+    let incomplete = |known: Vec<String>, reason: String| {
+        if tombstoning {
+            Ok(HealthMap::Unconfirmed {
+                files: known,
+                reason,
+            })
+        } else {
+            not_checked(reason)
+        }
+    };
+
     let roots = scope.roots();
     if roots.is_empty() {
         // 不传 target 时 `svn diff` 会拿**整个工作副本**跟服务器比。对一个 Unity
@@ -131,10 +599,10 @@ pub fn check_baseline(
 
     let base = svn_url.trim_end_matches('/');
     if let Some(reason) = url_mismatch(repo_root, base)? {
-        return Ok(Health::NotChecked { reason });
+        return not_checked(reason);
     }
     if let Some(reason) = whitelist_not_under_base(repo_root, base, roots)? {
-        return Ok(Health::NotChecked { reason });
+        return not_checked(reason);
     }
 
     // §6.6.5：**每个 `wc(P)` 各体检一次，用它自己的 `url(P)`**。
@@ -148,35 +616,105 @@ pub fn check_baseline(
     // 现在按记账单位分开发命令：`enumerate_wcs` 返回的每一条都自带 `url`，
     // 嵌套 external 用它**自己的** URL 去比，那块内容第一次真的被服务器验过。
     let units = crate::engine::svn_wc::enumerate_wcs(repo_root, scope.whitelist())?;
-    let mut files: Vec<String> = Vec::new();
-    for unit in &units {
-        let unit_url = unit.url.trim_end_matches('/');
-        let old = format!("--old={unit_url}@{rev}");
-        // `--new` 直接指向这个单位，不再用 `--new=.` + 尾随 target。
-        //
-        // ⚠️ 这里**不能**过 `peg_safe`：带 `--old` / `--new` 时路径是纯字面量，
-        // 追加 `@` 会得到 `E155010: The node '…Code@' was not found`（1b 实测）。
-        let new = format!("--new={}", unit.wc_root);
-        let args: Vec<&str> = vec!["diff", &old, &new, "--summarize", "--xml"];
 
+    // 尾随 PATH 里不能有未版本化的（整条 E155010）；丢失的 svn 不报，同样剔除。
+    // 单值映射没有尾随 PATH，不必多跑这次 status。
+    let mut skip: BTreeSet<String> = BTreeSet::new();
+    if !map.revs.is_empty() {
+        let read;
+        let nodes: &[NodeStatus] = match opts.nodes {
+            Some(n) => n,
+            None => match read_node_status(repo_root, scope.whitelist(), &units) {
+                Ok(n) => {
+                    read = n;
+                    &read
+                }
+                Err(e) => return not_checked(format!("读不到工作副本的节点状态：{}", e.message)),
+            },
+        };
+        let by_path: BTreeMap<&str, &NodeStatus> =
+            nodes.iter().map(|n| (n.path.as_str(), n)).collect();
+        for p in map.revs.keys() {
+            let gone = match by_path.get(p.as_str()) {
+                None => true,
+                Some(n) => matches!(
+                    n.item.as_str(),
+                    "unversioned" | "missing" | "ignored" | "external"
+                ),
+            };
+            if gone {
+                skip.insert(p.clone());
+            }
+        }
+    }
+
+    let excluded = if tombstoning {
+        match excluded_nodes(repo_root, &units) {
+            Ok(x) => x,
+            // 不是 NotChecked：不知道有没有漏收，就不能发布（见 HealthMap::Unconfirmed）
+            Err(e) => {
+                return Ok(HealthMap::Unconfirmed {
+                    files: Vec::new(),
+                    reason: format!("找不出被排除（depth=exclude）的节点：{}", e.message),
+                })
+            }
+        }
+    } else {
+        BTreeMap::new()
+    };
+    let excluded_paths: BTreeSet<String> = excluded.keys().cloned().collect();
+    let plan = match plan_diffs(&units, map, &skip, &excluded_paths) {
+        Ok(p) => p,
+        Err(e) => return not_checked(e.message),
+    };
+
+    // (仓库相对路径, item, 是否 floor 组)
+    let mut diffs: Vec<(String, String, bool)> = Vec::new();
+    // 到此刻为止已知的 floor 上有、工作副本里没有的文件
+    let deleted_so_far = |diffs: &[(String, String, bool)]| -> Vec<String> {
+        let known: BTreeSet<String> = diffs
+            .iter()
+            .filter(|(p, item, floor)| {
+                *floor && item == "deleted" && !explained.contains(p) && !map.gone.contains_key(p)
+            })
+            .map(|(p, _, _)| p.clone())
+            .collect();
+        known.into_iter().collect()
+    };
+    for (i, cmd) in plan.commands.iter().enumerate() {
+        let args: Vec<&str> = cmd.args.iter().map(String::as_str).collect();
         // 命令失败一律落到 NotChecked，**不能**当成「没有差异」。
         //
         // 不能用「解析得出来就算成功」：2026-09-14 实测，URL 不可达时 svn 仍然
         // 往 stdout 打出 `<?xml …?>` 和 `<diff><paths>`，错误只在 stderr 和退出码里。
         // 照那种写法，断网时会得到一个空的 paths 列表，于是**报告基线健康**。
         //
-        // 一个单位失败就整体 NotChecked，**不能**「其余都干净所以 Verified」：
+        // 一条失败就整体 NotChecked，**不能**「其余都干净所以 Verified」：
         // `Verified` 是一句主动的保证，不是「没发现问题」。
-        let xml = match run_svn(repo_root, &args) {
+        //
+        // 例外是录制时的第二条起（见 `incomplete`）：第一条就失败时（通常是断网）什么都不知道，
+        // 离线录制照旧放行；后面失败时前面的结果已经摆在这里了。
+        let point = if i == 0 {
+            Point::FirstDiff
+        } else {
+            Point::LaterDiff
+        };
+        let xml = match fault::hit(point).and_then(|()| run_svn(repo_root, &args)) {
             Ok(x) => x,
             Err(e) => {
-                return Ok(Health::NotChecked {
-                    reason: format!("比对 `{}` 时失败：{}", unit.wc_root, e.message),
-                })
+                let reason = format!(
+                    "比对 `{}`（r{}）时失败：{}",
+                    cmd.wc_root, cmd.rev, e.message
+                );
+                return if i == 0 {
+                    not_checked(reason)
+                } else {
+                    incomplete(deleted_so_far(&diffs), reason)
+                };
             }
         };
 
-        let prefix = format!("{unit_url}/");
+        let prefix = format!("{}/", cmd.unit_url);
         for entry in parse_diff_summary(&xml)? {
             // §6.8.4 的三条过滤，靠 --xml 的三个独立属性完成：
             //   剔除目录条目
@@ -187,57 +725,170 @@ pub fn check_baseline(
             if entry.item == "none" {
                 continue;
             }
-            // 单文件白名单条目：`--new` 就是那个文件本身，svn 打出来的路径恰好
-            // 等于 `unit_url`，没有尾随的子路径可剥。
-            let repo_rel = if entry
-                .path
-                .trim_end_matches('/')
-                .eq_ignore_ascii_case(unit_url)
-            {
-                unit.wc_root.clone()
-            } else if let Some(sub) = strip_prefix_ci(&entry.path, &prefix) {
-                format!("{}/{}", unit.wc_root, sub)
-            } else {
-                return Ok(Health::NotChecked {
-                    reason: format!(
-                        "svn diff 输出里的路径 `{}` 不在本次比对的基准 URL `{unit_url}` 之下，\
-                         没法还原成仓库相对路径。这是一个本应用没有预料到的输出形状，\
-                         为安全起见判为「未经体检」——既不宣称基线健康，也不指控它撒谎。",
-                        entry.path
-                    ),
-                });
+            let repo_rel = match repo_rel_of(&entry.path, cmd, &prefix) {
+                Ok(p) => p,
+                Err(reason) => return incomplete(deleted_so_far(&diffs), reason),
             };
-            files.push(repo_rel);
+            let mine = match &cmd.scope {
+                DiffScope::Floor => !map.revs.contains_key(&repo_rel),
+                DiffScope::Only(set) => set.contains(&repo_rel),
+            };
+            if mine {
+                diffs.push((repo_rel, entry.item, matches!(cmd.scope, DiffScope::Floor)));
+            }
         }
     }
     //   剔除不是 W-file 的（扩展名不在白名单里、或被尊重的 .gitignore 排除）。
     //   整批问一次：「尊重」时每次判定都是一次 git 子进程。
-    let mut files: Vec<String> = scope
-        .filter(files.iter().map(String::as_str))?
-        .into_iter()
-        .collect();
+    let w = scope.filter(diffs.iter().map(|d| d.0.as_str()))?;
 
     // §6.8.7：判据是 `D \ S == ∅`，不是 `D == ∅`。
     //
-    // `D` 是刚刚收集的这批「磁盘与服务器 rN 有内容差异的 W-file」；`S`（`explained`）
+    // `D` 是刚刚收集的这批「磁盘与服务器有内容差异的 W-file」；`S`（`explained`）
     // 是本次录制实际动过的路径——它们的差异**已经被换成服务器内容**，不构成
     // 基线撒谎。剩下解释不了的每一条，才是真的证伪。
     //
     // 工作副本干净时 `S = ∅`，这一步退化成原来的 `D == ∅`，与 §6.8.2 逐字等价。
-    files.retain(|f| !explained.contains(f));
-
-    if files.is_empty() {
-        // `S` 里的路径被上面那行**整批豁免**了，所以它们一条都没被验证。
-        // 报不报出去看它们是谁写的——见 [`ExplainedOrigin`]。
-        let unverified = match origin {
-            ExplainedOrigin::JustRecorded => Vec::new(),
-            ExplainedOrigin::Unknown => explained.iter().cloned().collect(),
-        };
-        return Ok(Health::Verified { rev, unverified });
+    let mut lying: BTreeSet<String> = BTreeSet::new();
+    let mut candidates: BTreeSet<String> = BTreeSet::new();
+    for (p, item, floor) in &diffs {
+        if !w.contains(p) || explained.contains(p) {
+            continue;
+        }
+        if item == "deleted" && *floor {
+            // floor 上有、工作副本里没有：墓碑说过它已删除，由下面的墓碑核对负责
+            if map.gone.contains_key(p) {
+                continue;
+            }
+            if tombstoning {
+                candidates.insert(p.clone());
+                continue;
+            }
+        }
+        lying.insert(p.clone());
     }
-    files.sort();
-    files.dedup();
-    Ok(Health::Lying { files })
+    if !lying.is_empty() {
+        return done(Health::Lying {
+            files: lying.into_iter().collect(),
+        });
+    }
+
+    // 已有墓碑：`<url>/<rel>@<d>` 必须不存在（分析 §4.1）
+    if !map.gone.is_empty() {
+        let mut urls = Vec::with_capacity(map.gone.len());
+        for (p, &d) in &map.gone {
+            match server_url_at(&units, p, d) {
+                Some(u) => urls.push((p.clone(), u)),
+                None => {
+                    return incomplete(
+                        candidates.iter().cloned().collect(),
+                        outside_units(p).message,
+                    )
+                }
+            }
+        }
+        let found = match confirm_absent(repo_root, &urls) {
+            Ok(f) => f,
+            Err(e) => {
+                return incomplete(
+                    candidates.iter().cloned().collect(),
+                    format!("核对删除记录失败：{}", e.message),
+                )
+            }
+        };
+        let reappeared: Vec<String> = found
+            .into_iter()
+            .filter(|&(_, exists)| exists)
+            .map(|(p, _)| p)
+            .collect();
+        if !reappeared.is_empty() {
+            return done(Health::Lying { files: reappeared });
+        }
+    }
+
+    let mut new_gone: BTreeMap<String, u64> = BTreeMap::new();
+    if tombstoning {
+        // 走到这里 candidates 是**已知**的 floor 上有、工作副本里没有的文件。从这往下任何一步
+        // 没做成都是 Unconfirmed，不是 NotChecked（理由见 HealthMap::Unconfirmed）
+        let unconfirmed = |files: &BTreeSet<String>, reason: String| {
+            Ok(HealthMap::Unconfirmed {
+                files: files.iter().cloned().collect(),
+                reason,
+            })
+        };
+
+        // D8：点不了名的被排除节点，列出它在 floor 上的内容，按 W-file 口径筛。筛出来的与
+        // 点得了名的走同一条确认；一个 W-file 都没有的不阻断
+        for p in &plan.unaddressable {
+            let kind = excluded.get(p).map(String::as_str);
+            let listed = match excluded_files_at_floor(repo_root, &units, p, kind, map.floor) {
+                Ok(l) => l,
+                Err(e) => {
+                    let mut files = candidates.clone();
+                    files.insert(p.clone());
+                    return unconfirmed(
+                        &files,
+                        format!("列不出被排除的 `{p}` 里有什么：{}", e.message),
+                    );
+                }
+            };
+            let w_files = scope.filter(listed.iter().map(String::as_str))?;
+            candidates.extend(
+                w_files
+                    .into_iter()
+                    .filter(|f| !explained.contains(f) && !map.gone.contains_key(f)),
+            );
+        }
+
+        let mut refused: BTreeSet<String> = BTreeSet::new();
+        if !candidates.is_empty() {
+            // P4 保证所有单元同属一个仓库，HEAD 取哪个单元的 Repository Root 都一样
+            let head = match server_head_rev(repo_root, &units[0].repos_root) {
+                Ok(h) => h,
+                Err(e) => return unconfirmed(&candidates, e.message),
+            };
+            let mut urls = Vec::with_capacity(candidates.len());
+            for p in &candidates {
+                match server_url_at(&units, p, head) {
+                    Some(u) => urls.push((p.clone(), u)),
+                    None => return unconfirmed(&candidates, outside_units(p).message),
+                }
+            }
+            let found = match confirm_absent(repo_root, &urls) {
+                Ok(f) => f,
+                Err(e) => {
+                    return unconfirmed(&candidates, format!("向服务器确认删除失败：{}", e.message))
+                }
+            };
+            for (p, exists) in found {
+                if exists {
+                    refused.insert(p);
+                } else {
+                    new_gone.insert(p, head);
+                }
+            }
+        }
+        if !refused.is_empty() {
+            return Ok(HealthMap::Excluded {
+                files: refused.into_iter().collect(),
+            });
+        }
+    }
+
+    // `S` 里的路径被上面那行**整批豁免**了，所以它们一条都没被验证。
+    // 报不报出去看它们是谁写的——见 [`ExplainedOrigin`]。发命令前剔掉的 PATH 同样没比过。
+    let mut unverified: BTreeSet<String> = match origin {
+        ExplainedOrigin::JustRecorded => BTreeSet::new(),
+        ExplainedOrigin::Unknown => explained.clone(),
+    };
+    unverified.extend(skip.into_iter().filter(|p| !explained.contains(p)));
+    Ok(HealthMap::Verified {
+        health: Health::Verified {
+            rev: map.floor,
+            unverified: unverified.into_iter().collect(),
+        },
+        new_gone,
+    })
 }
 
 /// `svn_url` 必须就是**工作副本根**的 URL；不是的话返回一句说得清的理由。

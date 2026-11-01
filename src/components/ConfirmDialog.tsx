@@ -35,6 +35,11 @@ export interface ConfirmRequest {
   /** 进度文案，配合 `action`。 */
   busyLabel?: string
   /**
+   * 确认之外的第二个选择，排在确认按钮之前，默认焦点仍在确认上。点了之后调 `onSelect`，
+   * 框关掉，`confirm()` 的结果是 false：调用方靠回调与取消区分。
+   */
+  alternative?: { label: string; onSelect: () => void }
+  /**
    * 设了就是结局提示，不是确认：只有一个按钮（没有可取消的东西），图标按分量选。
    * 不设时照旧是确认框。
    */
@@ -58,7 +63,7 @@ export function WarnGlyph() {
 }
 
 /** 结局提示 `ok` 的图标：只是告知，不该长得像警告。 */
-function CheckGlyph() {
+export function CheckGlyph() {
   return (
     <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" strokeWidth="1.8">
       <path d="M5 12.5 10 17.5 19 7.5" />
@@ -156,6 +161,17 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
 
         <div className="dialog-actions">
           {!request.notice && <button ref={cancelRef} disabled={busy} onClick={() => finish(false)}>Cancel</button>}
+          {request.alternative && (
+            <button
+              disabled={busy}
+              onClick={() => {
+                request.alternative?.onSelect()
+                finish(false)
+              }}
+            >
+              {request.alternative.label}
+            </button>
+          )}
           <button
             ref={confirmRef}
             className={request.danger ? 'primary danger' : 'primary'}

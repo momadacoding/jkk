@@ -9,7 +9,8 @@
 //! 4. `update-ref` 必须带旧 OID 作比较条件
 
 use app_lib::engine::git_cli::{run_git, run_git_code};
-use app_lib::engine::svn_baseline::{parse_trailer, publish_baseline, TempIndex, Trailer};
+use app_lib::engine::svn_baseline::{parse_trailer, publish_baseline, TempIndex};
+use app_lib::engine::svn_basemap::BaseMap;
 use app_lib::engine::svn_exclude::{generate_exclude, write_exclude};
 use std::fs;
 use std::path::Path;
@@ -50,12 +51,13 @@ fn wl() -> Vec<String> {
     vec!["Code/".to_string()]
 }
 
-fn trailer(rev: u64) -> Trailer {
-    Trailer {
-        url: "https://svn.example.com/game".into(),
+/// 单值记账（`create_baseline_commit` / `publish_baseline` 计划 Task 5 起收 `BaseMap`）。
+fn trailer(rev: u64) -> BaseMap {
+    BaseMap::single(
+        "https://svn.example.com/game",
+        "8f3a1c7e-4b21-0410-9d2f-1a7b3c5d9e01",
         rev,
-        uuid: "8f3a1c7e-4b21-0410-9d2f-1a7b3c5d9e01".into(),
-    }
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -444,7 +446,7 @@ fn an_empty_path_is_refused_by_both_writers() {
 mod split_publish {
     use app_lib::engine::git_cli::run_git;
     use app_lib::engine::svn_baseline::{
-        create_baseline_commit, move_baseline_ref, publish_baseline, Trailer,
+        create_baseline_commit, move_baseline_ref, publish_baseline,
     };
 
     fn repo() -> tempfile::TempDir {
@@ -457,12 +459,12 @@ mod split_publish {
         d
     }
 
-    fn t(rev: u64) -> Trailer {
-        Trailer {
-            url: "file:///C:/repo".into(),
+    fn t(rev: u64) -> app_lib::engine::svn_basemap::BaseMap {
+        app_lib::engine::svn_basemap::BaseMap::single(
+            "file:///C:/repo",
+            "0f3a0000-0000-0000-0000-000000000000",
             rev,
-            uuid: "0f3a0000-0000-0000-0000-000000000000".into(),
-        }
+        )
     }
 
     #[test]

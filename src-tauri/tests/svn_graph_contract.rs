@@ -33,9 +33,14 @@ mod svn_fixtures;
 
 use app_lib::engine::git_cli::run_git;
 use app_lib::engine::graph;
+use app_lib::engine::svn_baseline::{create_baseline_commit_with, move_baseline_ref};
+use app_lib::engine::svn_basemap::{read_base_map, BaseMap};
+use app_lib::engine::svn_follow::{follow, FollowOutcome};
 use app_lib::engine::svn_init::{init_hybrid, InitRequest};
 use app_lib::engine::svn_sync;
-use svn_fixtures::{svn_repo, SvnFixture};
+use svn_fixtures::{
+    hybrid_with_colleague, svn_cmd, svn_repo, svn_repo_committed_without_update, SvnFixture,
+};
 
 fn init(fx: &SvnFixture) {
     init_hybrid(&InitRequest {
@@ -187,5 +192,218 @@ fn the_graph_serializes_to_the_camel_case_names_the_frontend_reads() {
     assert!(
         json.get("baseline_rev").is_none(),
         "不能同时留着 snake_case 的写法：{json}"
+    );
+}
+
+// —— 混合基线（计划 Task 12，分析 §6.9）——
+
+fn oid(fx: &SvnFixture, rev: &str) -> String {
+    run_git(&fx.wc_str(), &["rev-parse", rev])
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+fn node<'a>(data: &'a graph::GraphData, id: &str) -> &'a graph::CommitNode {
+    data.commits
+        .iter()
+        .find(|c| c.id == id)
+        .unwrap_or_else(|| panic!("{id} 必须在图里"))
+}
+
+/// 真实形状：TortoiseSVN 只提交 A、不 update，点「跟进」。基线 → r1 + A 在 r2。
+fn followed_mixed() -> SvnFixture {
+    let fx = hybrid_with_colleague();
+    std::fs::write(fx.wc().join("Code/A.cs"), "a2\n").unwrap();
+    svn_cmd(
+        &fx.wc(),
+        &[
+            "commit",
+            "-m",
+            "tortoise",
+            "--non-interactive",
+            "--",
+            "Code/A.cs",
+        ],
+    );
+    let out = follow(&fx.wc_str(), "op1").unwrap();
+    assert!(matches!(out, FollowOutcome::Done { .. }), "{out:?}");
+    fx
+}
+
+/// 在现有基线上手工录一条树不变、记账不同的基线。真实流程造起来太绕的记账才用它（墓碑要服务器删文件）。
+fn publish(fx: &SvnFixture, edit: impl FnOnce(&mut BaseMap)) -> String {
+    let root = fx.wc_str();
+    let old = oid(fx, "refs/heads/svn/base");
+    let mut map = read_base_map(&root, &old).unwrap();
+    edit(&mut map);
+    let tree = oid(fx, &format!("{old}^{{tree}}"));
+    let new = create_baseline_commit_with(&root, &tree, Some(&old), &map, &[], None).unwrap();
+    move_baseline_ref(&root, &new, Some(&old)).unwrap();
+    new
+}
+
+#[test]
+fn a_followed_mixed_baseline_reports_floor_and_newer_but_no_single_revision() {
+    // 混合基线没有「那一个 revision」。baseline_rev 有值的话，前端会把它从图上删掉、
+    // 挂到 svn:<floor> 上，顶掉 floor 节点原本的基线（分析 §6.9）
+    let fx = followed_mixed();
+    let data = graph::load(&fx.wc_str()).unwrap();
+    let base = node(&data, &oid(&fx, "refs/heads/svn/base"));
+
+    assert_eq!(base.baseline_rev, None);
+    assert_eq!(base.baseline_floor, Some(1));
+    assert_eq!(base.baseline_newer, Some(1));
+    assert_eq!(base.baseline_gone, None, "没有墓碑时不带这一项");
+}
+
+#[test]
+fn the_mixed_baseline_of_a_mixed_working_copy_init_is_a_root() {
+    // 初始化录的基线没有父：spliceHistory 只能靠 floor 把它接到 SVN 主线上
+    let fx = svn_repo_committed_without_update();
+    init(&fx);
+    let data = graph::load(&fx.wc_str()).unwrap();
+    let base = node(&data, &oid(&fx, "refs/heads/svn/base"));
+
+    assert!(base.parents.is_empty());
+    assert_eq!(base.baseline_rev, None);
+    assert_eq!(base.baseline_floor, Some(3));
+    assert_eq!(base.baseline_newer, Some(1));
+}
+
+#[test]
+fn a_mixed_baseline_with_only_tombstones_is_still_mixed() {
+    // 没有 revision 不同的文件、只有墓碑：is_single 为假，也不能当成 r<floor>
+    let fx = hybrid_with_colleague();
+    let id = publish(&fx, |m| {
+        m.gone.insert("Code/删掉 的.cs".to_string(), 7);
+    });
+    let data = graph::load(&fx.wc_str()).unwrap();
+    let base = node(&data, &id);
+
+    assert_eq!(base.baseline_rev, None);
+    assert_eq!(base.baseline_floor, Some(1));
+    assert_eq!(base.baseline_newer, Some(0));
+    assert_eq!(base.baseline_gone, Some(1));
+}
+
+#[test]
+fn a_single_valued_baseline_and_an_ordinary_commit_have_no_mixed_fields() {
+    let fx = svn_repo();
+    init(&fx);
+    let id = commit(&fx, "normal.cs", "普通提交", None);
+    let data = graph::load(&fx.wc_str()).unwrap();
+
+    let base = oid(&fx, "refs/heads/svn/base");
+    for n in [node(&data, &base), node(&data, &id)] {
+        assert_eq!(n.baseline_floor, None);
+        assert_eq!(n.baseline_newer, None);
+        assert_eq!(n.baseline_gone, None);
+        let json = serde_json::to_value(n).unwrap();
+        for k in ["baselineFloor", "baselineNewer", "baselineGone"] {
+            assert!(json.get(k).is_none(), "不带 {k}：{json}");
+        }
+    }
+}
+
+#[test]
+fn the_mixed_fields_serialize_to_the_camel_case_names_the_frontend_reads() {
+    let fx = followed_mixed();
+    let id = publish(&fx, |m| {
+        m.gone.insert("Code/x.cs".to_string(), 7);
+    });
+    let data = graph::load(&fx.wc_str()).unwrap();
+
+    let json = serde_json::to_value(node(&data, &id)).unwrap();
+    assert_eq!(json["baselineFloor"], 1, "{json}");
+    assert_eq!(json["baselineNewer"], 1, "{json}");
+    assert_eq!(json["baselineGone"], 1, "{json}");
+    assert!(json.get("baselineRev").is_none(), "{json}");
+    assert!(json.get("baseline_floor").is_none(), "{json}");
+}
+
+#[test]
+fn a_commit_that_merely_mentions_svn_base_keys_is_not_a_baseline() {
+    // 正文里讲格式的提交（包括本仓库自己的）：记账只认最后一段
+    let fx = svn_repo();
+    init(&fx);
+    let id = commit(
+        &fx,
+        "doc.cs",
+        "说明新格式",
+        Some("Svn-Base-Floor: 3\nSvn-Base-Rev: 4 Code/A.cs\n\n这两行只是例子。"),
+    );
+    let data = graph::load(&fx.wc_str()).unwrap();
+    let n = node(&data, &id);
+
+    assert_eq!(n.baseline_rev, None);
+    assert_eq!(n.baseline_floor, None);
+}
+
+#[test]
+fn a_damaged_new_trailer_is_not_read_as_the_git_svn_id_next_to_it() {
+    // parse_message 的规则：最后一段有 Svn-Base- 行就按新格式严格解析，失败不退回旧格式。
+    // 图上照旧用 parse_trailer 的话，这条会被当成单值基线从图上删掉
+    let fx = svn_repo();
+    init(&fx);
+    let id = commit(
+        &fx,
+        "broken.cs",
+        "被改坏的记账",
+        Some("Svn-Base-Floor: x\ngit-svn-id: file:///r@5 00000000-0000-0000-0000-000000000000"),
+    );
+    let data = graph::load(&fx.wc_str()).unwrap();
+    let n = node(&data, &id);
+
+    assert_eq!(n.baseline_rev, None);
+    assert_eq!(n.baseline_floor, None);
+}
+
+#[test]
+fn follow_pin_refs_are_not_drawn() {
+    // W28：跟进把旧索引钉在 refs/mygitclient/follow/<opid>，那个 commit 的树里只有一个 index blob。
+    // 进了图或进了 refs，用户就会看到一条与历史无关的提交，或一个写着全名的标签
+    let fx = followed_mixed();
+    let pin = oid(&fx, "refs/mygitclient/follow/op1");
+    let data = graph::load(&fx.wc_str()).unwrap();
+
+    assert!(
+        data.commits.iter().all(|c| c.id != pin),
+        "钉住索引的 commit 不能进图"
+    );
+    assert!(
+        data.refs
+            .iter()
+            .all(|r| !r.name.starts_with("refs/mygitclient/")),
+        "实际 {:?}",
+        data.refs.iter().map(|r| &r.name).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_deliver_ref_on_a_commit_of_the_graph_gets_no_pill() {
+    // 交付途中 deliver ref 可能就指着分支上的提交（快路径），它在图上有行：refs 里带着它，
+    // CommitRow 就画出一个 `refs/mygitclient/deliver/<opid>` 的标签，已交付判据也会把它当 tip
+    let fx = svn_repo();
+    init(&fx);
+    let id = commit(&fx, "work.cs", "要交付的提交", None);
+    run_git(
+        &fx.wc_str(),
+        &["update-ref", "refs/mygitclient/deliver/op-1", &id],
+    )
+    .unwrap();
+    let data = graph::load(&fx.wc_str()).unwrap();
+
+    assert!(
+        data.commits.iter().any(|c| c.id == id),
+        "提交本身照常在图上"
+    );
+    assert!(data
+        .refs
+        .iter()
+        .all(|r| !r.name.starts_with("refs/mygitclient/")));
+    assert!(
+        data.refs.iter().any(|r| r.name == "refs/heads/work"),
+        "别的 ref 不受影响"
     );
 }

@@ -6,6 +6,7 @@ mod svn_fixtures;
 use app_lib::engine::git_cli::run_git;
 use app_lib::engine::svn_baseline::parse_trailer;
 use app_lib::engine::svn_baseline::{create_baseline_commit, TempIndex, Trailer};
+use app_lib::engine::svn_basemap::read_base_map;
 use app_lib::engine::svn_config::read_config;
 use app_lib::engine::svn_init::record_server_tree_into;
 use app_lib::engine::svn_journal::{self, Phase};
@@ -173,6 +174,65 @@ fn a_stash_conflict_keeps_the_stash_and_marks_it_applied() {
     assert_eq!(j.stash_oid.as_deref(), Some(oid.as_str()));
     assert_eq!(our_stashes(&fx), 1);
     assert!(!svn_lock::is_held(&fx.wc_str()));
+}
+
+#[test]
+fn a_stage_that_differs_from_disk_stays_in_the_stash_after_update() {
+    // Review 3 第 1 条：S10 不带 `--index`，暂存区里与磁盘不同的那一份（方案甲）放不回来。
+    // 原先照常 drop 并拆钉子，方案甲只剩悬空对象，gc 后消失
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/A.cs", "a2\n");
+    write(&fx, "Code/B.cs", "b-plan-a\n");
+    git(&fx, &["add", "Code/B.cs"]);
+    write(&fx, "Code/B.cs", "b-plan-b\n");
+
+    let (new_rev, stash, files) = match sync(&fx) {
+        SyncInOutcome::StageLost {
+            new_rev,
+            stash_oid,
+            files,
+        } => (new_rev, stash_oid, files),
+        o => panic!("应当报暂存没保住：{o:?}"),
+    };
+    assert_eq!(new_rev, Some(2));
+    assert_eq!(files, vec!["Code/B.cs".to_string()]);
+    assert_eq!(read(&fx, "Code/A.cs"), "a2\n");
+    assert_eq!(read(&fx, "Code/B.cs"), "b-plan-b\n", "磁盘那一份放回来了");
+    let stash = stash.expect("备份留着");
+    assert_eq!(our_stashes(&fx), 1, "不 drop");
+    assert_eq!(
+        git(
+            &fx,
+            &[
+                "for-each-ref",
+                "--format=%(objectname)",
+                "refs/mygitclient/sync/"
+            ]
+        ),
+        stash,
+        "钉子也留着"
+    );
+    assert_eq!(
+        git(&fx, &["show", &format!("{stash}^2:Code/B.cs")]),
+        "b-plan-a",
+        "方案甲取得回来"
+    );
+    assert_eq!(phase(&fx), None);
+    assert!(!svn_lock::is_held(&fx.wc_str()));
+}
+
+#[test]
+fn a_stage_equal_to_disk_is_dropped_as_before() {
+    // 暂存与磁盘一样：内容都在磁盘上，丢的只是「已暂存」的标记（计划 A8 的既有行为），备份照常删
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/A.cs", "a2\n");
+    write(&fx, "Code/B.cs", "b-staged\n");
+    git(&fx, &["add", "Code/B.cs"]);
+
+    assert_eq!(sync(&fx), SyncInOutcome::Done { new_rev: 2 });
+    assert_eq!(read(&fx, "Code/B.cs"), "b-staged\n");
+    assert_eq!(our_stashes(&fx), 0);
+    assert_eq!(git(&fx, &["for-each-ref", "refs/mygitclient/"]), "");
 }
 
 #[test]
@@ -359,7 +419,8 @@ fn built_commit(fx: &SvnFixture, j: &Journal, rev_override: Option<u64>) -> (Str
         rev: rev_override.unwrap_or(pre.node_rev),
         uuid: pre.uuid,
     };
-    let c = create_baseline_commit(&root, &tree, j.baseline_oid_before.as_deref(), &t).unwrap();
+    let c = create_baseline_commit(&root, &tree, j.baseline_oid_before.as_deref(), &(&t).into())
+        .unwrap();
     (tree, c)
 }
 
@@ -522,9 +583,9 @@ fn abort_after_the_update_returns_to_the_original_branch() {
     assert!(
         matches!(
             check_sync(&fx.wc_str()).unwrap().verdict,
-            SyncVerdict::Diverged { .. }
+            SyncVerdict::ExternallyAdvanced { .. }
         ),
-        "工作副本已在 r2、基线还是 r1——如实报失同步，引导重建基线"
+        "工作副本已在 r2、基线还是 r1——如实报 SVN 侧有新内容（计划 Task 3 起不再是 Diverged）"
     );
 }
 
@@ -1204,7 +1265,7 @@ fn a_lying_baseline_is_caught_at_s4_and_rolled_back() {
     idx.replace_blob(&root, "Code/A.cs", b"lie\n").unwrap();
     let tree = idx.write_tree(&root).unwrap();
     let t = parse_trailer(&git(&fx, &["log", "-1", "--format=%B", "svn/base"])).unwrap();
-    let lie = create_baseline_commit(&root, &tree, Some(&old), &t).unwrap();
+    let lie = create_baseline_commit(&root, &tree, Some(&old), &(&t).into()).unwrap();
     git(&fx, &["update-ref", "refs/heads/svn/base", &lie, &old]);
     write(&fx, "Code/B.cs", "b-wip\n");
     let head = git(&fx, &["rev-parse", "HEAD"]);
@@ -1565,6 +1626,100 @@ fn a_catch_up_is_refused_when_the_branch_moved_since_the_preview() {
     assert_eq!(err.code, "sync_in_state_changed");
     assert_eq!(git(&fx, &["rev-parse", "svn/base"]), base, "基线没被接管");
     assert_eq!(phase(&fx), None);
+}
+
+// —— 从混合版本基线出发（计划 Task 5，分析 §6.7）——
+
+/// 在 wc1 里用 svn 直接提交 `Code/A.cs`、不 update：A.cs 在 r2，其余仍在 r1。
+/// git 这一侧 A.cs 是一处未提交的改动（work 分支还是 r1 的内容）。
+fn commit_a_without_update(fx: &SvnFixture) {
+    write(fx, "Code/A.cs", "a-ext\n");
+    svn_fixtures::svn_cmd(
+        &fx.wc(),
+        &[
+            "commit",
+            "-m",
+            "external",
+            "--non-interactive",
+            "--",
+            "Code/A.cs@",
+        ],
+    );
+}
+
+#[test]
+fn sync_in_from_mixed_baseline_checks_out_zero_w_modifications() {
+    // 分析 §11 第一条：基线是混合版本时，S3 `checkout svn/base` 之后磁盘就是各节点自己的
+    // BASE，S4 的 W-file 修改数按构造为 0。不为 0 时 S4 报 sync_in_baseline_stale、整个回退
+    let fx = hybrid_with_colleague();
+    commit_a_without_update(&fx);
+    let wc = fx.wc_str();
+    app_lib::engine::svn_init::rebuild_baseline(&wc).unwrap();
+    let map = read_base_map(&wc, "svn/base").unwrap();
+    assert_eq!(
+        (map.floor, map.revs.get("Code/A.cs").copied()),
+        (1, Some(2)),
+        "前提：基线是混合版本"
+    );
+    // 前提的另一半：基线树逐文件等于各节点的 BASE（磁盘干净、且与基线树相同），
+    // 于是 checkout 之后 svn 不会看到修改
+    assert_eq!(
+        git(&fx, &["diff", "--name-only", "svn/base", "--", "Code"]),
+        ""
+    );
+    fx.colleague_commits("Code/B.cs", "b-colleague\n"); // r3
+
+    let p = preview_sync_in(&wc).unwrap();
+    assert_eq!(
+        p.catch_up_rev, None,
+        "基线已经是混合版本、判定 InSync，不需要接管"
+    );
+    assert_eq!(sync(&fx), SyncInOutcome::Done { new_rev: 3 });
+
+    assert_eq!(baseline_rev(&fx), 3, "S5 归一之后写回旧格式 git-svn-id");
+    assert!(read_base_map(&wc, "svn/base").unwrap().is_single());
+    assert_eq!(read(&fx, "Code/A.cs"), "a-ext\n");
+    assert_eq!(read(&fx, "Code/B.cs"), "b-colleague\n");
+    assert_eq!(
+        git(&fx, &["status", "--porcelain"]),
+        "",
+        "自己提交到 SVN 的改动已在基线里，不再显示成本地修改"
+    );
+    assert_eq!(check_sync(&wc).unwrap().verdict, SyncVerdict::InSync);
+    assert_eq!(phase(&fx), None);
+    assert_eq!(our_stashes(&fx), 0);
+}
+
+#[test]
+fn sync_in_catches_up_externally_advanced_then_updates() {
+    // 计划 Task 5：A16 接管推广到任何 ExternallyAdvanced。只提交、不更新（非整体前进）
+    // 改造前报 sync_in_out_of_sync；现在先把基线录成混合版本（floor 1、A.cs 在 r2），
+    // 再照常更新到 r3
+    let fx = hybrid_with_colleague();
+    commit_a_without_update(&fx);
+    fx.colleague_commits("Code/B.cs", "b-colleague\n"); // r3
+    let wc = fx.wc_str();
+    let base0 = git(&fx, &["rev-parse", "svn/base"]);
+
+    let p = preview_sync_in(&wc).unwrap();
+    assert_eq!(
+        (p.catch_up_rev, p.baseline_rev, p.target_rev),
+        (Some(1), 1, 3)
+    );
+    assert_eq!(sync(&fx), SyncInOutcome::Done { new_rev: 3 });
+
+    assert_eq!(baseline_rev(&fx), 3);
+    // 基线链：r3 ← 接管录的混合基线 ← 初始 r1
+    let caught = git(&fx, &["rev-parse", "svn/base^"]);
+    let mixed = read_base_map(&wc, &caught).unwrap();
+    assert_eq!((mixed.floor, mixed.revs.len()), (1, 1), "{mixed:?}");
+    assert_eq!(git(&fx, &["rev-parse", "svn/base^^"]), base0);
+    assert_eq!(read(&fx, "Code/A.cs"), "a-ext\n");
+    assert_eq!(read(&fx, "Code/B.cs"), "b-colleague\n");
+    assert_eq!(git(&fx, &["status", "--porcelain"]), "");
+    assert_eq!(check_sync(&wc).unwrap().verdict, SyncVerdict::InSync);
+    assert_eq!(phase(&fx), None);
+    assert_eq!(our_stashes(&fx), 0);
 }
 
 // —— S8 切回原分支没切干净（2c 独立 review C1）——

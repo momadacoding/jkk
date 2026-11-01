@@ -328,10 +328,12 @@ fn fetch_missing_anchors(
     ) else {
         return Ok(());
     };
+    // 混合基线补它的 floor：根上的混合基线（初始化录的）只能靠这个节点接到主线上。
+    // 其余文件的 revision 不用补，它们不对应图上的节点（分析 §6.9）
     let mut wanted: Vec<u64> = log
         .split('\0')
-        .filter_map(crate::engine::svn_baseline::parse_trailer)
-        .map(|t| t.rev)
+        .filter_map(crate::engine::svn_basemap::parse_message)
+        .map(|m| m.floor)
         .filter(|r| !have.contains(r) && !cache.anchors.contains_key(r))
         .collect();
     wanted.sort_unstable_by(|a, b| b.cmp(a)); // 新的在前

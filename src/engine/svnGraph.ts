@@ -14,8 +14,8 @@
  * `svn/base` 的 ref 重映射、「仅本地」角标三样一起静默失效，而前端测试因为直接
  * 手写带 trailer 的完整 message 全部照绿（`AGENTS.md` §13 第 9 条的「虚假信心」）。
  *
- * 现在由 `engine/graph.rs` 用 `svn_baseline::parse_trailer` 解析，送到这里时已经是
- * `baselineRev` / `localOnly` 两个字段。那是录制基线时用的**同一份**实现，
+ * 现在由 `engine/graph.rs` 用 `svn_basemap::parse_message` 解析，送到这里时已经是
+ * `baselineRev` / `baselineFloor` / `localOnly` 等字段。那是录制基线时用的**同一份**实现，
  * 两侧规则不会漂移，而之前这里是它的第二份拷贝。
  * 契约由 `src-tauri/tests/svn_graph_contract.rs` 钉住。
  */
@@ -45,6 +45,15 @@ function svnId(rev: number): string {
  * ③ 重写所有 git commit 的 parents，按映射替换；baseline commit 自身从输出里删掉
  * ④ 剔除任何不在最终节点集合里的 parent id        ← spec 没写，见下
  * ```
+ *
+ * # 混合基线（分析 §6.9）
+ *
+ * 没有 `baselineRev`，所以不进映射表：不顶掉 `svn:<floor>` 原本的基线，`svn/base` 标签
+ * 留在它自己那一行，它作为普通 git 节点把工作分支接到 SVN 主线上。它的父边是上一条基线，
+ * 第 ③ 步照常改写；连不上时（初始化录的没有父、父基线的 revision 没拉到）退回接
+ * `svn:<floor>`，见 [`liveParents`]。
+ *
+ * 被单值基线取代之后的处理见 [`deliveredCommits`]。
  *
  * # 第 ④ 步为什么必须有
  *
@@ -159,7 +168,33 @@ export function spliceHistory(
 
   // ④ 剔除悬空 parent
   const known = new Set(all.map((c) => c.id))
-  return dateOrder(all.map((c) => ({ ...c, parents: c.parents.filter((p) => known.has(p)) })))
+  return dateOrder(all.map((c) => ({ ...c, parents: liveParents(c, known) })))
+}
+
+/**
+ * 还连得上的 parents。混合基线一条都连不上时退回 `svn:<floor>`：它是工作分支通往 SVN 主线的
+ * 唯一一段，断开的话整条分支悬在主线之外。连得上时不改接：历史上它就接在那条基线后面，
+ * 上一条基线的 revision 可能比 floor 早（分析 §6.9「svn:<floor> 或更早」）。
+ */
+function liveParents(c: CommitNode, known: Set<string>): string[] {
+  const live = c.parents.filter((p) => known.has(p))
+  if (live.length > 0 || c.baselineFloor === undefined) return live
+  const floor = svnId(c.baselineFloor)
+  return known.has(floor) ? [floor] : live
+}
+
+/**
+ * 混合基线那一行的标注；不是混合基线时 `null`。
+ *
+ * 只在接合过的图上标（`vcs` 是 `spliceHistory` 写的）：普通 git 仓库不接合，
+ * 那里带这种 trailer 的提交不是这个仓库的基线。
+ */
+export function mixedBaselineLabel(c: CommitNode): string | null {
+  if (c.vcs !== 'git' || c.baselineFloor === undefined) return null
+  const parts: string[] = []
+  if (c.baselineNewer) parts.push(`${c.baselineNewer} 个文件在更新的 revision`)
+  if (c.baselineGone) parts.push(`${c.baselineGone} 个文件已删除`)
+  return `svn/base：r${c.baselineFloor} + ${parts.join('，')}`
 }
 
 /**
@@ -212,6 +247,10 @@ function dateOrder(nodes: CommitNode[]): CommitNode[] {
  * 「还有分支指着」或「另一条分支从它上面长出来」的照常显示——不能把用户的分支藏掉。
  * `load_graph` 的提交全部从 ref / HEAD 走出来，所以没有子节点的提交一定被指着。
  *
+ * 被单值基线取代的混合基线（根目录更新之后）也符合这个判据：它同样不再画，否则悬成一条死分支。
+ * 但它不是谁交付的提交，不进 `bySvn`，`deliveredFrom` 里不列。没被取代的混合基线不算判据里的
+ * 「基线」：有 svn/base 指着，夹在它下面的提交也还没有对应的 svn 节点可归。
+ *
  * `gitCommits` 是拓扑序（子在父之前），一遍扫完即可：轮到某个提交时它的子节点都已判过。
  */
 function deliveredCommits(
@@ -254,7 +293,7 @@ function deliveredCommits(
   const bySvn = new Map<string, CommitNode[]>()
   for (const c of gitCommits) {
     const svn = owner.get(c.id)
-    if (svn === undefined) continue
+    if (svn === undefined || c.baselineFloor !== undefined) continue
     append(bySvn, svn, c)
   }
   return { hidden, bySvn }

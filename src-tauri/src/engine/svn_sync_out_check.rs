@@ -2,7 +2,7 @@
 //! 不写 journal、不建 ref、不碰磁盘。确认框里的全部事实都来自这里（计划 B1）。
 
 use crate::engine::git_cli::{run_git, run_git_code};
-use crate::engine::svn_baseline::parse_trailer;
+use crate::engine::svn_basemap::{read_base_map, BaseMap};
 use crate::engine::svn_cli::run_svn;
 use crate::engine::svn_config::{read_config, SvnConfig, BASELINE_BRANCH};
 use crate::engine::svn_deliver::{plan_deliver, LocalOnlyCommit};
@@ -16,8 +16,9 @@ use crate::engine::svn_sync::{check_sync, SyncVerdict};
 use crate::engine::svn_sync_check::{
     check_git_idle, current_branch, list_paths, precheck_include_set, rev_parse, unfinished_error,
 };
+use crate::engine::svn_tombstone::server_head_rev_with;
 use crate::engine::svn_wc::peg_safe;
-use crate::engine::svn_xml::{parse_info, parse_update_status};
+use crate::engine::svn_xml::parse_update_status;
 use crate::error::{GitError, Result};
 use crate::vcs::{detect_repo_kind, RepoKind};
 
@@ -72,6 +73,8 @@ pub(crate) fn check_sync_out(repo: &str) -> Result<SyncOutPreview> {
     let orig_branch = attached_branch(repo)?; // 第 4 条
     let orig_head = rev_parse(repo, "HEAD")?;
     let baseline_oid = rev_parse(repo, &format!("refs/heads/{BASELINE_BRANCH}"))?;
+    let base = read_base_map(repo, &baseline_oid)?;
+    refuse_mixed_baseline(&base)?;
     require_on_latest_baseline(repo, &baseline_oid, &orig_head, &orig_branch)?; // 第 0 条
 
     if !detect_pinned(repo, &cfg.whitelist)?.is_empty() {
@@ -117,9 +120,8 @@ pub(crate) fn check_sync_out(repo: &str) -> Result<SyncOutPreview> {
 
     let outside_changes = outside_changes(repo, &cfg)?; // 第 2 条后半
 
-    // 第 5 条：走网络，放最后
-    let root = repos_root(repo, &baseline_oid)?;
-    let remote_rev = remote_head_rev(repo, &root)?;
+    // 第 5 条：走网络，放最后。Repository Root 就是记账里的那个（spec §6.4.1）
+    let remote_rev = remote_head_rev(repo, &base.repos_root)?;
     if remote_rev != status.baseline_rev {
         return Err(GitError::new(
             "sync_out_server_ahead",
@@ -388,34 +390,41 @@ fn outside_changes(repo: &str, cfg: &SvnConfig) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// 基线 trailer 里的 Repository Root（spec §6.4.1：trailer 的 `<url>` 就是它）。
-fn repos_root(repo: &str, baseline: &str) -> Result<String> {
-    let msg = run_git(repo, &["log", "-1", "--format=%B", baseline])?;
-    parse_trailer(&msg)
-        .map(|t| t.url)
-        .ok_or_else(|| GitError::new("svn_baseline_trailer", "基线 commit 上读不到 git-svn-id。"))
+/// 基线是混合版本时拒绝交付（分析 §6.8 第一期）。
+///
+/// 放在最前面、只读本地：不能靠后面的 `remoteRev == baselineRev` 碰巧拦住——floor 取最小值时
+/// 混合 ⇒ floor < 服务器 HEAD，它确实会拦，但说的是「服务器上有更新的提交、请先更新」，
+/// 而用户多半刚用 TortoiseSVN 提交过，那句话会让他以为是同事的改动。交付在混合基线上算出的
+/// 清单本身也不可信：没有单一的 revision 可以拿来做 D6 之后的记账。
+fn refuse_mixed_baseline(base: &BaseMap) -> Result<()> {
+    if base.is_single() {
+        return Ok(());
+    }
+    let mut parts = Vec::new();
+    if !base.revs.is_empty() {
+        parts.push(format!("{} 个文件在更新的 revision", base.revs.len()));
+    }
+    if !base.gone.is_empty() {
+        parts.push(format!("{} 个文件已在 SVN 上删除", base.gone.len()));
+    }
+    Err(GitError::new(
+        "sync_out_mixed_baseline",
+        format!(
+            "基线是混合版本：停在 r{}，另有 {}（在 TortoiseSVN 里提交过、或只更新过部分目录）。\
+             本版本只能在单一 revision 的基线上交付。\
+             请先更新，或继续用 TortoiseSVN 提交后点跟进。什么都没有改动。",
+            base.floor,
+            parts.join("，")
+        ),
+    ))
 }
 
-/// 服务器 HEAD revision。`<root>@HEAD` 的 peg 写法顺带避开 URL 里含 `@` 的歧义。
+/// 服务器 HEAD revision。与墓碑核对共用 [`server_head_rev_with`]，只是错误码与文案是交付侧的。
 pub(crate) fn remote_head_rev(repo: &str, repos_root: &str) -> Result<u64> {
-    let target = format!("{repos_root}@HEAD");
-    let xml = run_svn(repo, &["info", "--xml", "--non-interactive", &target]).map_err(|e| {
+    server_head_rev_with(repo, repos_root, |raw| {
         GitError::new(
             "sync_out_server_unreachable",
-            format!(
-                "问服务器当前 revision 失败了，什么都没有改动。svn 原话：{}",
-                e.message.trim()
-            ),
-        )
-    })?;
-    let e = parse_info(&xml)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| GitError::new("svn_xml", "svn info 没有返回任何 entry"))?;
-    u64::try_from(e.revision).map_err(|_| {
-        GitError::new(
-            "svn_xml",
-            format!("svn info 给了一个负的 revision：{}", e.revision),
+            format!("问服务器当前 revision 失败了，什么都没有改动。svn 原话：{raw}"),
         )
     })
 }

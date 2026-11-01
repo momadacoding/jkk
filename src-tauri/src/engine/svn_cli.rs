@@ -2,6 +2,8 @@
 
 use crate::engine::proc::hidden_command;
 use crate::error::{GitError, Result};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::process::Command;
 
 /// 构造一条指向 `path` 的 svn 命令。
@@ -30,12 +32,97 @@ pub fn svn_command(path: &str) -> Command {
 /// 这三处全部失败，仓库根本打不开。哪些调用该带由调用点决定，见 spec §4.4 的
 /// 子命令表。
 pub fn run_svn(path: &str, args: &[&str]) -> Result<String> {
+    let key = scan_key(path, args);
+    if let Some(hit) = key.as_deref().and_then(cached_scan) {
+        return Ok(hit);
+    }
     let output = svn_command(path).args(with_global(args)).output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         return Err(GitError::new("svn_cli", stderr));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    let out = String::from_utf8_lossy(&output.stdout).to_string();
+    if let Some(k) = key {
+        remember_scan(k, &out);
+    }
+    Ok(out)
+}
+
+thread_local! {
+    /// [`with_scan_cache`] 范围内的 `svn info` / `svn status` 输出。`None` = 不在范围内。
+    static SCANS: RefCell<Option<HashMap<String, String>>> = const { RefCell::new(None) };
+}
+
+/// 在 `f` 执行期间，同一条 `svn info` / `svn status`（同一工作目录、同样的参数）只跑一次。
+///
+/// # 为什么
+///
+/// 跟进的准备阶段里，失同步判定、R1 前置校验、R3b 体检各自调 `enumerate_wcs` 与
+/// `read_node_status`，同一片白名单被 `svn status` 全量扫了约 10 遍。2026-11-01 实测一万五千个
+/// 文件每遍约 0.2 秒（开发机）；公司机器上 git 同类操作约慢 7～10 倍（stage-refresh-perf 日志）。
+///
+/// # 为什么是安全的
+///
+/// - 只缓存只读的 `info` / `status`，范围由调用方划定（跟进只包住准备阶段），出了范围就丢。
+/// - 范围内不发生 SVN 写操作：跟进全程不写工作区、不发 SVN 写命令。外部（TortoiseSVN）在范围内
+///   的改动由两道防线兜住：R3c 重读节点状态前先 [`forget_node_scans`]，体检直接问服务器；发布前
+///   的复核不在范围内，照常读最新的。
+/// - 只按线程缓存：Tauri 命令在线程池里跑，一次跟进从头到尾在同一个线程上。
+///
+/// 嵌套调用沿用外层的缓存，不重置。
+pub fn with_scan_cache<T>(f: impl FnOnce() -> T) -> T {
+    /// 范围结束（含 panic 展开）时把缓存拿掉。
+    struct Scope;
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            SCANS.with(|s| s.borrow_mut().take());
+        }
+    }
+    if SCANS.with(|s| s.borrow().is_some()) {
+        return f();
+    }
+    SCANS.with(|s| *s.borrow_mut() = Some(HashMap::new()));
+    let _scope = Scope;
+    f()
+}
+
+/// 忘掉缓存里的节点状态扫描（`status -v`），下一次照常去读。R3c 用：它存在的意义就是发现录制
+/// 期间工作副本被外部改了，读缓存等于没查。`info` 与找 external 的 `status` 留着——那是工作副本
+/// 的布局，不是 revision。不在范围内时什么都不做。
+pub fn forget_node_scans() {
+    SCANS.with(|s| {
+        if let Some(m) = s.borrow_mut().as_mut() {
+            m.retain(|k, _| !k.split('\0').any(|a| a == "-v"));
+        }
+    });
+}
+
+/// 可以缓存的扫描的键；其余命令返回 `None`。
+fn scan_key(path: &str, args: &[&str]) -> Option<String> {
+    if !matches!(args.first(), Some(&"info") | Some(&"status")) {
+        return None;
+    }
+    if SCANS.with(|s| s.borrow().is_none()) {
+        return None;
+    }
+    let mut k = path.to_string();
+    for a in args {
+        k.push('\0');
+        k.push_str(a);
+    }
+    Some(k)
+}
+
+fn cached_scan(key: &str) -> Option<String> {
+    SCANS.with(|s| s.borrow().as_ref().and_then(|m| m.get(key).cloned()))
+}
+
+fn remember_scan(key: String, out: &str) {
+    SCANS.with(|s| {
+        if let Some(m) = s.borrow_mut().as_mut() {
+            m.insert(key, out.to_string());
+        }
+    });
 }
 
 /// 同 [`run_svn`]，但把 stdout 按**原始字节**返回，且把退出码和 stderr 一起给出去。

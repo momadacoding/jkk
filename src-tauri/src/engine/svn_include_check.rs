@@ -7,7 +7,6 @@
 //! 与 §6.8 的基线体检**互不替代**：体检证明「磁盘 == 服务器」，这条证明
 //! 「git 跟踪的集合 == 配置声明的集合」（spec §15 第 20 条）。
 
-use crate::engine::git_cli::run_git_code;
 use crate::engine::svn_baseline::TempIndex;
 use crate::engine::svn_dirty::Fix;
 use crate::engine::svn_gitignore::{query_verdicts, GitCtx};
@@ -156,11 +155,7 @@ pub fn server_expected_set(
 /// 非法值落到 `false`：stdout 为空，与「键不存在」同一条路径。git 自己也会
 /// 在别处对这个值报错，这里不必再造一种失败形态。
 fn ignore_case(repo_root: &str) -> bool {
-    // 键不存在时 `git config` 退出 1，走 run_git_code 免得被当成失败
-    match run_git_code(repo_root, &["config", "--bool", "--get", "core.ignoreCase"]) {
-        Ok((_, out)) => out.trim().eq_ignore_ascii_case("true"),
-        Err(_) => false,
-    }
+    crate::engine::git_read::ignore_case(repo_root)
 }
 
 fn matches_ext(path: &str, extensions: &[String], fold: bool) -> bool {

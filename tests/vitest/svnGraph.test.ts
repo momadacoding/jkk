@@ -4,6 +4,7 @@ import {
   commitDiffScope,
   deliveredNote,
   findDelivered,
+  mixedBaselineLabel,
   remapRefs,
   selectionDiffScope,
   spliceHistory,
@@ -42,6 +43,18 @@ const git = (id: string, parents: string[], extra: Partial<CommitNode> = {}): Co
  */
 const baseline = (id: string, parents: string[], rev: number): CommitNode =>
   git(id, parents, { message: `svn: r${rev}`, baselineRev: rev })
+
+/**
+ * 一条混合基线，形状与后端真实产物一致：没有 `baselineRev`，标题是 `format_message` 写的那句，
+ * floor 与文件数已由 Rust 侧解析好（`svn_graph_contract.rs`）。
+ */
+const mixed = (id: string, parents: string[], floor: number, newer = 1, gone?: number): CommitNode =>
+  git(id, parents, {
+    message: `svn: r${floor}（另有 ${newer} 个文件在更新的 revision）`,
+    baselineFloor: floor,
+    baselineNewer: newer,
+    ...(gone === undefined ? {} : { baselineGone: gone }),
+  })
 
 describe('spliceHistory', () => {
   it('SVN 序列连成一条链，parent 指向下一个更小的 revision', () => {
@@ -304,6 +317,214 @@ describe('spliceHistory：已交付的本地提交（Phase 3a）', () => {
   })
 })
 
+describe('spliceHistory：混合基线（分析 §6.9）', () => {
+  const at = (out: CommitNode[], id: string) => out.find((c) => c.id === id)!
+  /** 图上每条父边都连得到节点。 */
+  const noDangling = (out: CommitNode[]) =>
+    expect(out.every((c) => c.parents.every((p) => out.some((n) => n.id === p)))).toBe(true)
+  const gitIds = (out: CommitNode[]) => out.map((c) => c.id).filter((id) => !id.startsWith('svn:'))
+
+  it('mixed baseline stays as git node attached to its floor svn node', () => {
+    // 跟进录的基线以旧基线为父；旧基线（单值）换成 svn 节点，这条父边要跟着改写
+    const out = spliceHistory(
+      [svn(12), svn(11), svn(10)],
+      [git('w', ['M']), mixed('M', ['B10'], 10), baseline('B10', [], 10)],
+      ['w', 'M'],
+    )
+    expect(at(out, 'M').vcs).toBe('git')
+    expect(at(out, 'M').parents).toEqual(['svn:10'])
+    expect(at(out, 'w').parents).toEqual(['M'])
+    expect(out.some((c) => c.id === 'B10')).toBe(false)
+    noDangling(out)
+  })
+
+  it('连续多条混合基线：一条接一条，最老的那条接到单值基线的 svn 节点', () => {
+    // 两次跟进之间没有根目录更新：M2 → M1 → B10
+    const out = spliceHistory(
+      [svn(13), svn(12), svn(11), svn(10)],
+      [
+        git('w', ['M2']),
+        mixed('M2', ['M1'], 10, 2),
+        mixed('M1', ['B10'], 10),
+        baseline('B10', [], 10),
+      ],
+      ['w', 'M2'],
+    )
+    expect(at(out, 'M2').parents).toEqual(['M1'])
+    expect(at(out, 'M1').parents).toEqual(['svn:10'])
+    expect(gitIds(out)).toEqual(['w', 'M2', 'M1'])
+    noDangling(out)
+  })
+
+  it('svn node diff scope excludes commits after a mixed baseline', () => {
+    // 混合基线顶掉 r10 的基线的话，r10 读成 `range:B9..M`，用户后来提交的文件全算进 r10
+    const out = spliceHistory(
+      [svn(11), svn(10), svn(9)],
+      [
+        git('w', ['M']),
+        mixed('M', ['B10'], 10),
+        baseline('B10', ['B9'], 10),
+        baseline('B9', [], 9),
+      ],
+      ['w', 'M'],
+    )
+    expect(commitDiffScope(at(out, 'svn:10'))).toBe('range:B9..B10')
+    // r11 是 TortoiseSVN 提交的，本机没有单独记过它，混合基线不能冒充它的基线
+    expect(at(out, 'svn:11').baselineOid).toBeUndefined()
+    expect(commitDiffScope(at(out, 'svn:11'))).toBeNull()
+    expect(svnDiffGap(at(out, 'svn:11'))).toBe('self')
+  })
+
+  it('混合基线之后的工作提交不算进任何 svn 节点的 deliveredFrom', () => {
+    const out = spliceHistory(
+      [svn(11), svn(10)],
+      [git('top', ['w']), git('w', ['M']), mixed('M', ['B10'], 10), baseline('B10', [], 10)],
+      ['top', 'M'],
+    )
+    expect(gitIds(out)).toEqual(['top', 'w', 'M'])
+    expect(out.every((c) => c.deliveredFrom === undefined)).toBe(true)
+  })
+
+  it('被单值基线取代的混合基线不是「已交付的本地提交」：收起，但不进 deliveredFrom', () => {
+    // 根目录更新之后：B20 → M2 → M1 → B10。混合基线夹在两条基线之间，形状和交付的提交一样，
+    // 不区分的话 r20 的详情会写「这次交付包含 2 个本地提交」；留在图上又会悬成一条死分支
+    const out = spliceHistory(
+      [svn(20), svn(10)],
+      [
+        git('w', ['B20']),
+        baseline('B20', ['M2'], 20),
+        mixed('M2', ['M1'], 10, 2),
+        mixed('M1', ['B10'], 10),
+        baseline('B10', [], 10),
+      ],
+      ['w'],
+    )
+    expect(out.map((c) => c.id)).toEqual(['w', 'svn:20', 'svn:10'])
+    expect(at(out, 'svn:20').deliveredFrom).toBeUndefined()
+    // 两版单值基线之差就是 r20 这一步，中间隔着混合基线不影响
+    expect(commitDiffScope(at(out, 'svn:20'))).toBe('range:B10..B20')
+    noDangling(out)
+  })
+
+  it('混合基线夹在交付的提交中间：提交照常归到 svn 节点，混合基线本身不列', () => {
+    const out = spliceHistory(
+      [svn(20), svn(10)],
+      [
+        baseline('B20', ['c'], 20),
+        git('c', ['M'], { message: 'mine' }),
+        mixed('M', ['x'], 10),
+        git('x', ['B10']),
+        baseline('B10', [], 10),
+      ],
+    )
+    expect(gitIds(out)).toEqual([])
+    expect(at(out, 'svn:20').deliveredFrom!.map((d) => d.id)).toEqual(['c', 'x'])
+  })
+
+  it('被取代但还有分支骑着的混合基线照常显示，父边照常接', () => {
+    // 跟进时冲突、标了「落后基线」的 feature 还停在混合基线上
+    const out = spliceHistory(
+      [svn(20), svn(10)],
+      [
+        git('feat', ['M']),
+        git('w', ['B20']),
+        baseline('B20', ['M'], 20),
+        mixed('M', ['B10'], 10),
+        baseline('B10', [], 10),
+      ],
+      ['feat', 'w'],
+    )
+    expect(at(out, 'feat').parents).toEqual(['M'])
+    expect(at(out, 'M').parents).toEqual(['svn:10'])
+    expect(at(out, 'svn:20').deliveredFrom).toBeUndefined()
+    noDangling(out)
+  })
+
+  it('取代它的单值基线还没拉进来：不收起', () => {
+    // 同「已交付的提交」：收进一个不画的节点等于整个看不见，拉到之后下一次接合自然收起
+    const out = spliceHistory(
+      [svn(10)],
+      [git('w', ['B20']), baseline('B20', ['M'], 20), mixed('M', ['B10'], 10), baseline('B10', [], 10)],
+      ['w'],
+    )
+    expect(at(out, 'M').parents).toEqual(['svn:10'])
+    noDangling(out)
+  })
+
+  it('初始化录的混合基线没有父：接到 floor 的 svn 节点上', () => {
+    // 不接的话工作分支整条悬在 SVN 主线之外
+    const out = spliceHistory(
+      [svn(4), svn(3), svn(2)],
+      [git('w', ['M']), mixed('M', [], 3)],
+      ['w', 'M'],
+    )
+    expect(at(out, 'M').parents).toEqual(['svn:3'])
+    noDangling(out)
+  })
+
+  it('父基线的 revision 没拉到：退回接 floor', () => {
+    const out = spliceHistory(
+      [svn(12), svn(11)],
+      [mixed('M', ['B10'], 11), baseline('B10', [], 10)],
+      ['M'],
+    )
+    expect(at(out, 'M').parents).toEqual(['svn:11'])
+  })
+
+  it('floor 也没拉到（断网）：没有父，不留悬空边', () => {
+    const out = spliceHistory([svn(12)], [mixed('M', [], 3)], ['M'])
+    expect(at(out, 'M').parents).toEqual([])
+  })
+
+  it('父边连得上时不改接 floor：历史上它就接在那条基线后面', () => {
+    const out = spliceHistory(
+      [svn(12), svn(11), svn(10)],
+      [mixed('M', ['B10'], 12), baseline('B10', [], 10)],
+      ['M'],
+    )
+    expect(at(out, 'M').parents).toEqual(['svn:10'])
+  })
+})
+
+describe('mixedBaselineLabel', () => {
+  // 接合过的节点才带 vcs；普通 git 仓库不接合
+  const onGraph = (c: CommitNode): CommitNode => ({ ...c, vcs: 'git' })
+
+  it('r<floor> + N 个文件在更新的 revision', () => {
+    expect(mixedBaselineLabel(onGraph(mixed('M', [], 10, 3)))).toBe(
+      'svn/base：r10 + 3 个文件在更新的 revision',
+    )
+  })
+
+  it('有墓碑时带上', () => {
+    expect(mixedBaselineLabel(onGraph(mixed('M', [], 10, 3, 2)))).toBe(
+      'svn/base：r10 + 3 个文件在更新的 revision，2 个文件已删除',
+    )
+  })
+
+  it('只有墓碑时不写「0 个文件」', () => {
+    expect(mixedBaselineLabel(onGraph(mixed('M', [], 10, 0, 2)))).toBe(
+      'svn/base：r10 + 2 个文件已删除',
+    )
+  })
+
+  it('floor 为 0 也算混合基线，不能被真值判断吃掉', () => {
+    expect(mixedBaselineLabel(onGraph(mixed('M', [], 0, 1)))).toBe(
+      'svn/base：r0 + 1 个文件在更新的 revision',
+    )
+  })
+
+  it('普通提交、单值基线、svn 节点：不标', () => {
+    expect(mixedBaselineLabel(onGraph(git('a', [])))).toBeNull()
+    expect(mixedBaselineLabel(onGraph(baseline('b', [], 3)))).toBeNull()
+    expect(mixedBaselineLabel({ ...git('svn:3', []), vcs: 'svn', svnRev: 3 })).toBeNull()
+  })
+
+  it('普通 git 仓库不接合、节点没有 vcs：不标——那样的提交不是这个仓库的基线', () => {
+    expect(mixedBaselineLabel(mixed('M', [], 10))).toBeNull()
+  })
+})
+
 describe('spliceHistory：svn 节点的本地基线（用来本地算文件变化）', () => {
   it('带上自己的基线 oid，以及图上下一个节点的基线 oid', () => {
     const out = spliceHistory(
@@ -383,6 +604,16 @@ describe('baselineMap / remapRefs', () => {
     const map = baselineMap([git('aaa', []), baseline('bbb', [], 7)])
     expect(map.get('aaa')).toBeUndefined()
     expect(map.get('bbb')).toBe('svn:7')
+  })
+
+  it('混合基线不进映射表：svn/base 的标签留在它自己那一行', () => {
+    // 映射到 svn:<floor> 的话，标签跑到 r<floor> 上，那一行却没有混合基线的任何东西
+    const commits = [mixed('M', ['B'], 4), baseline('B', [], 4)]
+    const map = baselineMap(commits)
+    expect(map.has('M')).toBe(false)
+    const out = remapRefs(refs([{ name: 'refs/heads/svn/base', hash: 'M' }]), map)
+    expect(out[0].hash).toBe('M')
+    expect(spliceHistory([svn(4)], commits, ['M']).some((c) => c.id === out[0].hash)).toBe(true)
   })
 
   it('baselineRev 为 0 也算 baseline，不能被真值判断吃掉', () => {

@@ -12,11 +12,17 @@
 //! 所以它不能留下任何需要事后清理的东西。
 //!
 //! 代价：`--merge-base` 要 git ≥ 2.40。只在慢路径上用到，旧 git 报 `sync_out_git_too_old`。
+//!
+//! 重放本身在 [`crate::engine::svn_replay`]（与跟进共用）；交付不丢空 commit、不换路径，
+//! 错误码与文案由本文件的 `DELIVER_CODES` 给出。
 
-use crate::engine::git_cli::{run_git, run_git_code, run_git_env};
-use crate::engine::graph::parse_local_only;
+use crate::engine::git_cli::{run_git, run_git_code};
+use crate::engine::svn_replay::{
+    commits_between, no_superseded, replay_onto, ReplayCodes, ReplayCommit, ReplayOpts,
+    ReplayOutcome,
+};
 use crate::error::{GitError, Result};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// 交付树 ref 的前缀。不在 `refs/heads/` 下，与用户分支不可能撞名（spec §8.2.3、必测 #25）。
 pub const DELIVER_REF_PREFIX: &str = "refs/mygitclient/deliver/";
@@ -40,12 +46,15 @@ pub struct DeliverPlan {
     pub fast: bool,
 }
 
-struct Commit {
-    oid: String,
-    parents: Vec<String>,
-    subject: String,
-    local_only: bool,
-}
+/// 交付的三类错误码与 git 太旧时的文案（对象层重放在 `svn_replay`）。
+const DELIVER_CODES: ReplayCodes = ReplayCodes {
+    conflict: "sync_out_local_only_conflict",
+    too_old: "sync_out_git_too_old",
+    too_old_message: "本地补丁夹在待交付的提交中间，摘掉它们需要 git 2.40 或更新的版本\
+                      （`git merge-tree --merge-base`）。请升级 git，或把本地补丁移到分支顶端\
+                      （那样不需要重放）。",
+    failed: "sync_out_replay_failed",
+};
 
 pub fn deliver_ref(opid: &str) -> String {
     format!("{DELIVER_REF_PREFIX}{opid}")
@@ -64,8 +73,8 @@ pub fn plan_deliver(repo: &str, base: &str, head: &str) -> Result<DeliverPlan> {
             ));
         }
     }
-    let list = commits_between(repo, base, head)?;
-    let by_oid: HashMap<&str, &Commit> = list.iter().map(|c| (c.oid.as_str(), c)).collect();
+    let list = commits_between(repo, base, head, &DELIVER_CODES)?;
+    let by_oid: HashMap<&str, &ReplayCommit> = list.iter().map(|c| (c.oid.as_str(), c)).collect();
     let local_only: Vec<LocalOnlyCommit> = list
         .iter()
         .filter(|c| c.local_only)
@@ -99,8 +108,8 @@ pub fn plan_deliver(repo: &str, base: &str, head: &str) -> Result<DeliverPlan> {
         if let Some(m) = list.iter().find(|c| c.parents.len() > 1) {
             return Err(merge_in_slow_path(m));
         }
-        let picks: Vec<&Commit> = list.iter().filter(|c| !c.local_only).collect();
-        let locals: Vec<&Commit> = list.iter().filter(|c| c.local_only).collect();
+        let picks: Vec<ReplayCommit> = list.iter().filter(|c| !c.local_only).cloned().collect();
+        let locals: Vec<&ReplayCommit> = list.iter().filter(|c| c.local_only).collect();
         replay(repo, base, &picks, &locals)?
     };
     let deliver_tree = run_git(repo, &["rev-parse", &format!("{deliver_oid}^{{tree}}")])?
@@ -114,97 +123,39 @@ pub fn plan_deliver(repo: &str, base: &str, head: &str) -> Result<DeliverPlan> {
     })
 }
 
-/// `base..head`，从旧到新。`%B` 是完整 message，Local-Only 判定与图上的角标同一份实现。
-fn commits_between(repo: &str, base: &str, head: &str) -> Result<Vec<Commit>> {
-    let out = run_git(
-        repo,
-        &[
-            "log",
-            "--reverse",
-            "--topo-order",
-            "--format=%H%x00%P%x00%s%x00%B%x1e",
-            &format!("{base}..{head}"),
-        ],
-    )?;
-    let mut list = Vec::new();
-    for rec in out.split('\u{1e}') {
-        let rec = rec.trim_start_matches('\n');
-        if rec.is_empty() {
-            continue;
+/// 慢路径：在对象层逐个重放待交付 commit（计划 B2）。交付不丢空 commit、不换路径。
+fn replay(
+    repo: &str,
+    onto: &str,
+    picks: &[ReplayCommit],
+    locals: &[&ReplayCommit],
+) -> Result<String> {
+    let opts = ReplayOpts {
+        drop_empty: false,
+        superseded: &no_superseded,
+        codes: DELIVER_CODES,
+    };
+    match replay_onto(repo, onto, picks, &opts, &mut BTreeMap::new())? {
+        ReplayOutcome::Done { tip, .. } => Ok(tip),
+        ReplayOutcome::Conflict { at, files } => {
+            let c = picks.iter().find(|c| c.oid == at).ok_or_else(|| {
+                GitError::new(
+                    DELIVER_CODES.failed,
+                    format!("重放报告的冲突 commit {at} 不在待交付的提交里"),
+                )
+            })?;
+            Err(replay_conflict(repo, c, locals, &files)?)
         }
-        let mut f = rec.splitn(4, '\0');
-        let (Some(oid), Some(parents), Some(subject), Some(body)) =
-            (f.next(), f.next(), f.next(), f.next())
-        else {
-            return Err(GitError::new(
-                "sync_out_replay_failed",
-                format!("读不懂 git log 的输出：{rec:?}"),
-            ));
-        };
-        list.push(Commit {
-            oid: oid.to_string(),
-            parents: parents.split_whitespace().map(str::to_string).collect(),
-            subject: subject.to_string(),
-            local_only: parse_local_only(body),
-        });
     }
-    Ok(list)
-}
-
-/// 慢路径：在对象层逐个重放待交付 commit（计划 B2）。
-fn replay(repo: &str, onto: &str, picks: &[&Commit], locals: &[&Commit]) -> Result<String> {
-    let mut cur = onto.to_string();
-    for c in picks {
-        let parent = c.parents.first().ok_or_else(|| {
-            GitError::new("sync_out_replay_failed", format!("{} 没有父提交", c.oid))
-        })?;
-        let mb = format!("--merge-base={parent}");
-        // `-z`：不带它 git 按 core.quotePath（默认 true）把非 ASCII 路径转义成八进制，
-        // 冲突文件名就对不上 diff-tree -z 的原样路径（里程碑 review）
-        let (code, out) = run_git_code(
-            repo,
-            &["merge-tree", "--write-tree", "-z", &mb, &cur, &c.oid],
-        )?;
-        match code {
-            0 => {}
-            1 => return Err(replay_conflict(repo, c, locals, &out)?),
-            // 129 = 用法错误：多半是 git 太旧，不认识 --merge-base
-            129 => {
-                return Err(GitError::new(
-                    "sync_out_git_too_old",
-                    "本地补丁夹在待交付的提交中间，摘掉它们需要 git 2.40 或更新的版本\
-                     （`git merge-tree --merge-base`）。请升级 git，或把本地补丁移到分支顶端\
-                     （那样不需要重放）。",
-                ))
-            }
-            _ => {
-                return Err(GitError::new(
-                    "sync_out_replay_failed",
-                    format!(
-                        "重放 {} 时 git merge-tree 退出 {code}：{}",
-                        short(&c.oid),
-                        out.trim()
-                    ),
-                ))
-            }
-        }
-        let tree = out.split('\0').next().unwrap_or("").trim().to_string();
-        cur = commit_like(repo, &tree, &cur, &c.oid)?;
-    }
-    Ok(cur)
 }
 
 /// 冲突：指出是哪个待交付 commit、哪些文件、可能是哪几个本地补丁（spec §13「D0.5 cherry-pick 冲突」）。
-fn replay_conflict(repo: &str, c: &Commit, locals: &[&Commit], out: &str) -> Result<GitError> {
-    // `-z` 形态：`<tree>\0`，随后每条 `<mode> <oid> <stage>\t<path>\0`，一个空字段之后是说明文字
-    let mut files: Vec<String> = out
-        .split('\0')
-        .skip(1)
-        .take_while(|l| !l.is_empty())
-        .filter_map(|l| l.split_once('\t').map(|(_, p)| p.to_string()))
-        .collect();
-    files.sort();
-    files.dedup();
+fn replay_conflict(
+    repo: &str,
+    c: &ReplayCommit,
+    locals: &[&ReplayCommit],
+    files: &[String],
+) -> Result<GitError> {
     let mut blamed = Vec::new();
     for l in locals {
         let touched = run_git(
@@ -223,7 +174,7 @@ fn replay_conflict(repo: &str, c: &Commit, locals: &[&Commit], out: &str) -> Res
         }
     }
     Ok(GitError::new(
-        "sync_out_local_only_conflict",
+        DELIVER_CODES.conflict,
         format!(
             "摘掉本地补丁之后，待交付的提交 {} {} 放不上去——它和下面的本地补丁改到了同一处：\n{}\n\
              冲突的文件：\n{}\n\
@@ -242,40 +193,6 @@ fn replay_conflict(repo: &str, c: &Commit, locals: &[&Commit], out: &str) -> Res
                 .join("\n"),
         ),
     ))
-}
-
-/// 用 `like` 的作者与 message 在 `parent` 上创建 `tree` 的 commit（计划 B15）。
-fn commit_like(repo: &str, tree: &str, parent: &str, like: &str) -> Result<String> {
-    let meta = run_git(
-        repo,
-        &[
-            "log",
-            "-1",
-            "--date=raw",
-            "--format=%an%x00%ae%x00%ad%x00%B",
-            like,
-        ],
-    )?;
-    let mut f = meta.splitn(4, '\0');
-    let (name, email, date, msg) = (
-        f.next().unwrap_or(""),
-        f.next().unwrap_or(""),
-        f.next().unwrap_or(""),
-        f.next().unwrap_or("").trim_end_matches('\n'),
-    );
-    // message 走 -m：run_git* 的子进程 stdin 是 null，走 stdin 会产出空 message
-    // （svn_baseline::create_baseline_commit 记过这个坑）
-    Ok(run_git_env(
-        repo,
-        &["commit-tree", tree, "-p", parent, "-m", msg],
-        &[
-            ("GIT_AUTHOR_NAME", name),
-            ("GIT_AUTHOR_EMAIL", email),
-            ("GIT_AUTHOR_DATE", date),
-        ],
-    )?
-    .trim()
-    .to_string())
 }
 
 /// 给交付树起名字。**旧值写空串**：ref 必须还不存在，撞上残留就报错而不是覆盖。
@@ -304,7 +221,7 @@ pub fn unpin(repo: &str, r: &str) -> Result<()> {
     Ok(())
 }
 
-fn local_only_merge(c: &Commit) -> GitError {
+fn local_only_merge(c: &ReplayCommit) -> GitError {
     GitError::new(
         "sync_out_local_only_merge",
         format!(
@@ -317,7 +234,7 @@ fn local_only_merge(c: &Commit) -> GitError {
     )
 }
 
-fn merge_in_slow_path(m: &Commit) -> GitError {
+fn merge_in_slow_path(m: &ReplayCommit) -> GitError {
     GitError::new(
         "sync_out_merge_in_slow_path",
         format!(

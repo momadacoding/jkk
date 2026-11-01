@@ -1021,6 +1021,28 @@ body {
   border-color: #4fc3f7;
 }
 
+/* 跟进报告：节多，放在一个滚动区里。说明已在 .deliver-files 的缩进里，不再缩一次 */
+.follow-report {
+  max-height: 50vh;
+}
+
+.follow-report .dlg-note,
+.follow-report .dlg-warning {
+  margin-left: 0;
+  font-family: system-ui, -apple-system, sans-serif;
+}
+
+/* 「我的 SVN 用户名」一行：输入框占满，按钮跟在后面 */
+.follow-user {
+  display: flex;
+  gap: 8px;
+  margin: 4px 0 0 54px;
+}
+
+.follow-user input {
+  flex: 1;
+}
+
 /* ---------- 文件内容（File Tree 右侧，只读） ---------- */
 
 .file-content {
@@ -1975,8 +1997,9 @@ body {
 .commit-row.svn .commit-hash { color: #d8a657; }
 .commit-row.svn .commit-message { opacity: 0.88; }
 
-/* 「仅本地，不交付」角标（spec §6.7）。 */
-.local-only-badge {
+/* 「仅本地，不交付」角标（spec §6.7）与混合基线的标注（分析 §6.9）。 */
+.local-only-badge,
+.mixed-baseline-badge {
   display: inline-block;
   margin-right: 6px;
   padding: 0 5px;
