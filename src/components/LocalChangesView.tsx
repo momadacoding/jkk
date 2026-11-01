@@ -8,12 +8,14 @@ import {
   changesPaths,
   emptyFileSelection,
   nextFileSelection,
+  rangeSelection,
   reconcileSelection,
+  selectAllFiles,
   type FileSection,
   type FileSelection,
 } from '../engine/fileSelection'
 import { commitKeyAction, type CommitField } from '../engine/commitKeys'
-import { discardShortcut } from '../engine/fileListKeys'
+import { discardShortcut, isSelectAllShortcut } from '../engine/fileListKeys'
 import { buildCommitMessage } from '../engine/commitActions'
 import { conflictsFirst } from '../engine/conflicts'
 import { externalDiffItems, externalMergeItems, type ExternalToolsMenu } from './externalToolItems'
@@ -33,6 +35,9 @@ interface FileSectionProps {
   activePath: string | null
   onRowClick: (section: FileSection, files: string[], path: string, e: React.MouseEvent) => void
   onRowContextMenu: (section: FileSection, files: string[], path: string, e: React.MouseEvent) => void
+  /** 按住拖动多选：在行上按下开始，划进别的行时扩到那一行。 */
+  onRowMouseDown: (section: FileSection, path: string, e: React.MouseEvent) => void
+  onRowMouseEnter: (section: FileSection, files: string[], path: string, e: React.MouseEvent) => void
   onToggleOne: (path: string) => void
   onToggleAll: () => void
   onKeyDown: (section: FileSection, e: React.KeyboardEvent) => void
@@ -40,7 +45,7 @@ interface FileSectionProps {
 
 function FileSectionList({
   title, section, files, actionLabel, selection, activePath,
-  onRowClick, onRowContextMenu, onToggleOne, onToggleAll, onKeyDown,
+  onRowClick, onRowContextMenu, onRowMouseDown, onRowMouseEnter, onToggleOne, onToggleAll, onKeyDown,
 }: FileSectionProps) {
   const paths = files.map((f) => f.path)
   const selectedHere = selection.section === section ? selection.paths : []
@@ -68,9 +73,11 @@ function FileSectionList({
               f.path === activePath && selection.section === section ? 'active' : '',
               f.status === 'conflicted' ? 'conflicted' : '',
             ].filter(Boolean).join(' ')}
-            title={`${f.path}\nCtrl+单击多选 · Shift+单击选一段 · Delete 丢弃 · 右键更多操作`}
+            title={`${f.path}\nCtrl+单击多选 · Shift+单击或按住拖动选一段 · Ctrl+A 全选 · Delete 丢弃 · 右键更多操作`}
             onClick={(e) => onRowClick(section, paths, f.path, e)}
             onContextMenu={(e) => onRowContextMenu(section, paths, f.path, e)}
+            onMouseDown={(e) => onRowMouseDown(section, f.path, e)}
+            onMouseEnter={(e) => onRowMouseEnter(section, paths, f.path, e)}
           >
             <button
               className="changes-toggle"
@@ -248,17 +255,65 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
     open(e, items)
   }
 
+  /**
+   * 按住拖动的起点；null = 没在拖。只在 mousedown 到 mouseup 之间有值，
+   * 不进 state：它不影响渲染，放 state 里每划过一行都多渲染一次。
+   */
+  const dragRef = useRef<{ section: FileSection, anchor: string } | null>(null)
+  useEffect(() => {
+    // 挂在 window 上：在列表外、甚至两个区的分隔条上松开也得结束拖动
+    const end = () => { dragRef.current = null }
+    window.addEventListener('mouseup', end)
+    return () => window.removeEventListener('mouseup', end)
+  }, [])
+
+  const rowMouseDown = (section: FileSection, path: string, e: React.MouseEvent) => {
+    // 只认不带修饰键的左键：Ctrl / Shift 按下去是单击多选，交给 onClick；
+    // 行内的 Stage 按钮是按钮，从它上面按下去不是要选东西
+    if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return
+    if (e.target instanceof Element && e.target.closest('.changes-toggle')) return
+    // 不改选中、不 preventDefault：没拖动就松开时由 onClick 照常处理；
+    // 挡掉默认行为的话列表拿不到焦点，Ctrl+A 和 Delete 就失效了
+    dragRef.current = { section, anchor: path }
+  }
+
+  const rowMouseEnter = (section: FileSection, files: string[], path: string, e: React.MouseEvent) => {
+    const drag = dragRef.current
+    if (!drag) return
+    // 在窗口外松开时收不到 mouseup，回来时左键已经不在按着了
+    if ((e.buttons & 1) === 0) {
+      dragRef.current = null
+      return
+    }
+    // 不跨区，理由同 nextFileSelection
+    if (drag.section !== section) return
+    // 拖到别的行再松开时，click 落在两行的公共祖先（列表容器）上，不会再触发行的 onClick
+    const next = rangeSelection(section, files, drag.anchor, path)
+    // 锚点在拖动中途被刷新掉时 rangeSelection 换了新锚点，记回来，
+    // 否则之后划过的每一行都只会选中它自己
+    drag.anchor = next.anchor ?? path
+    setSelection(next)
+  }
+
   const fileListKeyDown = (section: FileSection, e: React.KeyboardEvent) => {
     // isComposing 只在 nativeEvent 上，原因同 commitKeyDown
-    const req = discardShortcut({
+    const key = {
       key: e.key,
+      code: e.code,
       ctrlKey: e.ctrlKey,
       metaKey: e.metaKey,
       shiftKey: e.shiftKey,
       altKey: e.altKey,
       repeat: e.repeat,
       isComposing: e.nativeEvent.isComposing,
-    }, section, selection, paths)
+    }
+    if (isSelectAllShortcut(key)) {
+      // 不挡的话 WebView 会把整页文字全选上
+      e.preventDefault()
+      setSelection(selectAllFiles(selection, section, paths[section]))
+      return
+    }
+    const req = discardShortcut(key, section, selection, paths)
     if (!req) return
     e.preventDefault()
     onDiscard(req.paths, req.staged)
@@ -312,6 +367,8 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
                   activePath={activeFile}
                   onRowClick={click}
                   onRowContextMenu={contextMenu}
+                  onRowMouseDown={rowMouseDown}
+                  onRowMouseEnter={rowMouseEnter}
                   onToggleOne={(path) => onStage([path])}
                   onToggleAll={() => onStage(status.unstaged.map((f) => f.path))}
                   onKeyDown={fileListKeyDown}
@@ -328,6 +385,8 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
                   activePath={activeFile}
                   onRowClick={click}
                   onRowContextMenu={contextMenu}
+                  onRowMouseDown={rowMouseDown}
+                  onRowMouseEnter={rowMouseEnter}
                   onToggleOne={(path) => onUnstage([path])}
                   onToggleAll={() => onUnstage(status.staged.map((f) => f.path))}
                   onKeyDown={fileListKeyDown}

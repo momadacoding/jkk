@@ -58,17 +58,50 @@ export function nextFileSelection(
     return { section, paths: sortByList(paths, files), anchor: path }
   }
 
-  if (mods.shift && anchor) {
-    const from = files.indexOf(anchor)
-    const to = files.indexOf(path)
-    if (from >= 0 && to >= 0) {
-      const [lo, hi] = from <= to ? [from, to] : [to, from]
-      // 锚点不动，这样可以反复 Shift 调整同一段范围
-      return { section, paths: files.slice(lo, hi + 1), anchor }
-    }
-  }
+  if (mods.shift && anchor) return rangeSelection(section, files, anchor, path)
 
   return { section, paths: [path], anchor: path }
+}
+
+/**
+ * 从锚点到 `path` 的一段。Shift+单击和按住拖动共用。
+ *
+ * 锚点不动，这样可以反复 Shift 调整、或拖回来缩小同一段范围。锚点不在列表里
+ * （拖到一半状态刷新、它被暂存走了）时退回到只选 `path`，并以它为新锚点。
+ *
+ * @param files 该区的完整路径列表，顺序即显示顺序
+ */
+export function rangeSelection(
+  section: FileSection,
+  files: string[],
+  anchor: string,
+  path: string,
+): FileSelection {
+  const from = files.indexOf(anchor)
+  const to = files.indexOf(path)
+  if (from < 0 || to < 0) return { section, paths: [path], anchor: path }
+  const [lo, hi] = from <= to ? [from, to] : [to, from]
+  return { section, paths: files.slice(lo, hi + 1), anchor }
+}
+
+/**
+ * Ctrl+A：选中该区全部文件。
+ *
+ * 同区的锚点还在就保留，之后 Shift+单击仍从用户原来点的那一行算；否则取第一个。
+ * 本区为空时原样返回——在空列表里按 Ctrl+A 不该把另一个区的选中清掉。
+ *
+ * @param files 该区的完整路径列表，顺序即显示顺序
+ */
+export function selectAllFiles(
+  current: FileSelection,
+  section: FileSection,
+  files: string[],
+): FileSelection {
+  if (files.length === 0) return current
+  const anchor = current.section === section && current.anchor !== null && files.includes(current.anchor)
+    ? current.anchor
+    : files[0]
+  return { section, paths: [...files], anchor }
 }
 
 /** 右侧 diff 正在显示的那一项：哪个文件、在哪个区。 */

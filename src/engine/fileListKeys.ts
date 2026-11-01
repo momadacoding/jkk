@@ -3,6 +3,8 @@ import type { FileSection, FileSelection } from './fileSelection'
 /** 只取判断所需的字段，这层逻辑不依赖 DOM，可以直接单测。 */
 export interface FileListKeyEvent {
   key: string
+  /** 物理键位（`KeyA`），不随键盘布局变。只有全选在 key 不是拉丁字母时才看它。 */
+  code?: string
   ctrlKey: boolean
   metaKey: boolean
   shiftKey: boolean
@@ -11,6 +13,20 @@ export interface FileListKeyEvent {
   repeat?: boolean
   /** 输入法正在组词。 */
   isComposing?: boolean
+}
+
+/**
+ * 文件列表里这一下是不是「全选」（Ctrl+A，macOS 上 Cmd+A）。
+ *
+ * 只在文件列表有焦点时才会问到这里，commit 输入框里的 Ctrl+A 照旧全选文字。
+ * 自动重复不排除：全选是幂等的。Shift / Alt 组合留着，以后可能另有含义。
+ */
+export function isSelectAllShortcut(e: FileListKeyEvent): boolean {
+  if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey || e.isComposing) return false
+  if (e.key.toLowerCase() === 'a') return true
+  // 俄文、希腊文等布局下按 Ctrl+A 拿到的 key 是本地字母（如「ф」），这时才退回看物理键位。
+  // 不能一律看 code：AZERTY 上 KeyA 那个键是 Q，Ctrl+Q 不该被当成全选
+  return e.code === 'KeyA' && !/^[\x20-\x7e]$/.test(e.key)
 }
 
 /** 与右键菜单 `Discard changes…` 完全相同的入参。 */

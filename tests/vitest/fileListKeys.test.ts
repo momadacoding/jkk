@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { discardShortcut, type FileListKeyEvent } from '@/engine/fileListKeys'
+import { discardShortcut, isSelectAllShortcut, type FileListKeyEvent } from '@/engine/fileListKeys'
 import type { FileSelection } from '@/engine/fileSelection'
 
 const del: FileListKeyEvent = {
@@ -61,5 +61,35 @@ describe('discardShortcut', () => {
     const s = sel('unstaged', ['a.txt'])
     expect(discardShortcut({ ...del, repeat: true }, 'unstaged', s, files)).toBeNull()
     expect(discardShortcut({ ...del, isComposing: true }, 'unstaged', s, files)).toBeNull()
+  })
+})
+
+describe('isSelectAllShortcut', () => {
+  const a: FileListKeyEvent = { key: 'a', ctrlKey: true, metaKey: false, shiftKey: false, altKey: false }
+
+  it('Ctrl+A 和 macOS 的 Cmd+A 都算；开着大写锁定时 key 是 A 也算', () => {
+    expect(isSelectAllShortcut(a)).toBe(true)
+    expect(isSelectAllShortcut({ ...a, ctrlKey: false, metaKey: true })).toBe(true)
+    expect(isSelectAllShortcut({ ...a, key: 'A' })).toBe(true)
+  })
+
+  it('俄文布局下 key 是「ф」：按物理键位 KeyA 认出来', () => {
+    expect(isSelectAllShortcut({ ...a, key: 'ф', code: 'KeyA' })).toBe(true)
+  })
+
+  it('AZERTY 上 KeyA 那个键是 Q：Ctrl+Q 不算全选', () => {
+    expect(isSelectAllShortcut({ ...a, key: 'q', code: 'KeyA' })).toBe(false)
+  })
+
+  it('按住不放的自动重复也算：全选是幂等的，重复无害', () => {
+    expect(isSelectAllShortcut({ ...a, repeat: true })).toBe(true)
+  })
+
+  it('不带 Ctrl/Cmd、带了 Shift 或 Alt、输入法组词中都不算', () => {
+    expect(isSelectAllShortcut({ ...a, ctrlKey: false })).toBe(false)
+    expect(isSelectAllShortcut({ ...a, shiftKey: true })).toBe(false)
+    expect(isSelectAllShortcut({ ...a, altKey: true })).toBe(false)
+    expect(isSelectAllShortcut({ ...a, isComposing: true })).toBe(false)
+    expect(isSelectAllShortcut({ ...a, key: 'b' })).toBe(false)
   })
 })

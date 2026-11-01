@@ -536,3 +536,134 @@ describe('LocalChangesView 的选中按区', () => {
     expect(screen.getByText('正在读取暂存区的改动…')).toBeTruthy()
   })
 })
+
+describe('LocalChangesView 的拖动多选与 Ctrl+A', () => {
+  function mountThree() {
+    const onDiscard = vi.fn()
+    const status: StatusData = {
+      unstaged: [change('a.txt'), change('b.txt'), change('c.txt')],
+      staged: [change('s.txt')],
+    }
+    render(
+      <LocalChangesView
+        status={status}
+        diff={{ files: [] }}
+        onStage={vi.fn()}
+        onUnstage={vi.fn()}
+        onDiscard={onDiscard}
+        onCommit={vi.fn()}
+        svnMode={false}
+        onBaselineBranch={false}
+      />,
+    )
+    return { onDiscard }
+  }
+
+  function row(path: string): HTMLElement {
+    const el = screen.getByText(path).closest('.changes-file')
+    if (!(el instanceof HTMLElement)) throw new Error(`找不到 ${path} 的行`)
+    return el
+  }
+
+  const selected = () => Array.from(document.querySelectorAll('.changes-file.selected'))
+    .map((el) => el.querySelector('.changes-file-path')?.textContent)
+
+  it('在一行按下左键、拖到另一行：选中从按下的行到当前行的一段', () => {
+    mountThree()
+    fireEvent.mouseDown(row('a.txt'), { button: 0, buttons: 1 })
+    fireEvent.mouseEnter(row('c.txt'), { buttons: 1 })
+    expect(selected()).toEqual(['a.txt', 'b.txt', 'c.txt'])
+    // 拖回来范围跟着缩，锚点仍是按下的那行
+    fireEvent.mouseEnter(row('b.txt'), { buttons: 1 })
+    expect(selected()).toEqual(['a.txt', 'b.txt'])
+  })
+
+  it('松开鼠标后再划过别的行不再改选中', () => {
+    mountThree()
+    fireEvent.mouseDown(row('a.txt'), { button: 0, buttons: 1 })
+    fireEvent.mouseEnter(row('b.txt'), { buttons: 1 })
+    fireEvent.mouseUp(window)
+    fireEvent.mouseEnter(row('c.txt'), { buttons: 1 })
+    expect(selected()).toEqual(['a.txt', 'b.txt'])
+  })
+
+  it('在窗口外松开（没收到 mouseup）：回来时左键已不在按着，不当成还在拖', () => {
+    mountThree()
+    fireEvent.mouseDown(row('a.txt'), { button: 0, buttons: 1 })
+    fireEvent.mouseEnter(row('c.txt'), { buttons: 0 })
+    fireEvent.mouseEnter(row('b.txt'), { buttons: 1 })
+    expect(selected()).toEqual([])
+  })
+
+  it('拖到一半状态刷新、锚点那行没了：从下一行起照样能拖出一段', () => {
+    const view = (unstaged: string[]) => (
+      <LocalChangesView
+        status={{ unstaged: unstaged.map(change), staged: [] }}
+        diff={{ files: [] }}
+        onStage={vi.fn()}
+        onUnstage={vi.fn()}
+        onDiscard={vi.fn()}
+        onCommit={vi.fn()}
+        svnMode={false}
+        onBaselineBranch={false}
+      />
+    )
+    const { rerender } = render(view(['a.txt', 'b.txt', 'c.txt', 'd.txt']))
+    fireEvent.mouseDown(row('a.txt'), { button: 0, buttons: 1 })
+    // a.txt 在外部被暂存走了
+    rerender(view(['b.txt', 'c.txt', 'd.txt']))
+    fireEvent.mouseEnter(row('b.txt'), { buttons: 1 })
+    fireEvent.mouseEnter(row('d.txt'), { buttons: 1 })
+    expect(selected()).toEqual(['b.txt', 'c.txt', 'd.txt'])
+  })
+
+  it('从行内的 Stage 按钮上按下不开始拖动', () => {
+    mountThree()
+    fireEvent.mouseDown(within(row('a.txt')).getByText('Stage'), { button: 0, buttons: 1 })
+    fireEvent.mouseEnter(row('c.txt'), { buttons: 1 })
+    expect(selected()).toEqual([])
+  })
+
+  it('右键按下不开始拖动', () => {
+    mountThree()
+    fireEvent.mouseDown(row('a.txt'), { button: 2, buttons: 2 })
+    fireEvent.mouseEnter(row('c.txt'), { buttons: 2 })
+    expect(selected()).toEqual([])
+  })
+
+  it('拖到另一个区的行上不跨区', () => {
+    mountThree()
+    fireEvent.mouseDown(row('a.txt'), { button: 0, buttons: 1 })
+    fireEvent.mouseEnter(row('b.txt'), { buttons: 1 })
+    fireEvent.mouseEnter(row('s.txt'), { buttons: 1 })
+    expect(selected()).toEqual(['a.txt', 'b.txt'])
+  })
+
+  it('文件列表有焦点时 Ctrl+A 选中本区全部，并挡掉 WebView 的整页全选', () => {
+    mountThree()
+    const notPrevented = fireEvent.keyDown(listOf('a.txt'), { key: 'a', ctrlKey: true })
+    expect(notPrevented).toBe(false)
+    expect(selected()).toEqual(['a.txt', 'b.txt', 'c.txt'])
+    expect(screen.getByText('已选 3')).toBeTruthy()
+  })
+
+  it('Ctrl+A 只选有焦点的那个区：在 Staged 列表里按，只选 Staged', () => {
+    mountThree()
+    fireEvent.keyDown(listOf('s.txt'), { key: 'a', ctrlKey: true })
+    expect(selected()).toEqual(['s.txt'])
+  })
+
+  it('Ctrl+A 之后按 Delete，丢弃请求带上全部文件（确认框仍由 onDiscard 弹）', () => {
+    const { onDiscard } = mountThree()
+    fireEvent.keyDown(listOf('a.txt'), { key: 'a', ctrlKey: true })
+    fireEvent.keyDown(listOf('a.txt'), { key: 'Delete' })
+    expect(onDiscard).toHaveBeenCalledWith(['a.txt', 'b.txt', 'c.txt'], false)
+  })
+
+  it('commit 输入框里的 Ctrl+A 照旧全选文字，不碰文件选中', () => {
+    mountThree()
+    const notPrevented = fireEvent.keyDown(screen.getByPlaceholderText('Commit subject'), { key: 'a', ctrlKey: true })
+    expect(notPrevented).toBe(true)
+    expect(selected()).toEqual([])
+  })
+})
