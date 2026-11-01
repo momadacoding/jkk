@@ -29,24 +29,24 @@
 | 项 | 状态 |
 |---|---|
 | 自动化验证（`cargo test` 1474 过、`pnpm test` 998 过、`pnpm build`、`fmt`、`clippy`） | ✅ 2026-11-01，见决策日志 |
-| 下面的真实窗口场景 | 未跑 |
+| 下面的真实窗口场景 | ✅ 2026-11-01 场景 1–12、14、15 全部通过；场景 13 未跑（需要真的 TortoiseSVN 弹框）。由 Claude 在 `pnpm tauri dev` 真实窗口里驱动：WebView2 远程调试端口点按钮、读界面，「离开 / 点回应用」用系统调用真实切换前台窗口 |
 
 ⚠️ **没跑的别勾。** 空着是如实，勾上是谎报。
 
-- [ ] 场景 1：只提交、不更新 → 横幅 → 跟进 → 「本地改动」只剩没提交的；填「我的 SVN 用户名」
-- [ ] 场景 2：暂存了中间版本，提交的是最终版 → 中间版本的暂存被丢弃
-- [ ] 场景 3：commit 了好几个中间版本，提交的是最终版 → 中间 commit 被收掉
-- [ ] 场景 4：子目录局部更新 → 同事的改动进基线、与你的暂存合并；没改内容的文件不报
-- [ ] 场景 5：stash → 修 bug 提交 → 跟进 → stash 照常放回
-- [ ] 场景 6：feature 分支 → 在 work 上修 bug 提交 → 跟进后 feature 一起跟上
-- [ ] 场景 7：feature 与提交冲突 → 标「落后基线」→「切换并手动跟进」→ 解冲突 → 继续
-- [ ] 场景 8：「仅切换」到落后分支 → 横幅「当前分支落后基线」→ 跟进 → 转手动跟进
-- [ ] 场景 9：Local-Only 补丁 + 「提交后恢复」只提交功能改动 → 不告警、补丁还在；整文件提交 → 告警
-- [ ] 场景 10：只提交删除 → 跟进后记成墓碑
-- [ ] 场景 11：SVN 操作进行中切回 jkk → 「SVN 正在更新…」
-- [ ] 场景 12：周一根目录整体更新 → 跟进后基线回到单值旧格式
-- [ ] 场景 14（接在 12 之后）：暂存 / 改了没暂存 / 新增文件，经过跟进、手动跟进、工具栏 Stash 都还在
-- [ ] 场景 15（接在 14 之后）：切分支时的新增文件——跟着走、撞名被拒、同事的新文件在落后分支上被删后由手动跟进放回
+- [x] 场景 1：只提交、不更新 → 横幅 → 跟进 → 「本地改动」只剩没提交的；填「我的 SVN 用户名」
+- [x] 场景 2：暂存了中间版本，提交的是最终版 → 中间版本的暂存被丢弃
+- [x] 场景 3：commit 了好几个中间版本，提交的是最终版 → 中间 commit 被收掉
+- [x] 场景 4：子目录局部更新 → 同事的改动进基线、与你的暂存合并；没改内容的文件不报
+- [x] 场景 5：stash → 修 bug 提交 → 跟进 → stash 照常放回
+- [x] 场景 6：feature 分支 → 在 work 上修 bug 提交 → 跟进后 feature 一起跟上
+- [x] 场景 7：feature 与提交冲突 → 标「落后基线」→「切换并手动跟进」→ 解冲突 → 继续
+- [x] 场景 8：「仅切换」到落后分支 → 横幅「当前分支落后基线」→ 跟进 → 转手动跟进
+- [x] 场景 9：Local-Only 补丁 + 「提交后恢复」只提交功能改动 → 不告警、补丁还在；整文件提交 → 告警
+- [x] 场景 10：只提交删除 → 跟进后记成墓碑
+- [x] 场景 11：SVN 操作进行中切回 jkk → 「SVN 正在更新…」
+- [x] 场景 12：周一根目录整体更新 → 跟进后基线回到单值旧格式
+- [x] 场景 14（接在 12 之后）：暂存 / 改了没暂存 / 新增文件，经过跟进、手动跟进、工具栏 Stash 都还在
+- [x] 场景 15（接在 14 之后）：切分支时的新增文件——跟着走、撞名被拒、同事的新文件在落后分支上被删后由手动跟进放回
 - [ ] 场景 13（可选）：用真的 TortoiseSVN 重走场景 2
 
 ---
@@ -107,13 +107,15 @@ function Colleague([string]$rel, [string]$content) {
     New-Item -ItemType Directory -Force (Split-Path $p) | Out-Null
     [IO.File]::WriteAllText($p, $content)
     if ($isNew) { svn add -q --parents --non-interactive $p }
-    svn commit -q --non-interactive --username colleague -m "colleague $rel" $WC2
+    # --no-auth-cache：file:// 也会缓存用户名，不加的话之后 SvnCommit 的作者全变成 colleague
+    svn commit -q --non-interactive --no-auth-cache --username colleague -m "colleague $rel" $WC2
     if ($LASTEXITCODE -ne 0) { throw 'svn commit 失败' }
 }
 function SvnCommit([string[]]$rels) {
     # @(...)：只有一个文件时管道结果是字符串，@paths 会把它拆成一个个字符传给 svn
     $paths = @($rels | ForEach-Object { Join-Path $WC $_ })
-    svn commit -q --non-interactive -m "me: $($rels -join ', ')" @paths
+    # 显式带用户名：万一缓存里已经是 colleague（旧版辅助函数留下的），也不会记错作者
+    svn commit -q --non-interactive --username $env:USERNAME -m "me: $($rels -join ', ')" @paths
     if ($LASTEXITCODE -ne 0) { throw 'svn commit 失败' }
 }
 function G { git -C $WC @args; if ($LASTEXITCODE -ne 0) { throw "git $args 失败" } }
