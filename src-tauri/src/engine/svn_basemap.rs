@@ -9,7 +9,6 @@
 //! 新 trailer 只放在 message 的最后一段，自己解析，不经 `interpret-trailers`：
 //! 后者会改写前导空格、续行和 `#` 行（W27）。
 
-use crate::engine::git_cli::run_git_bytes;
 use crate::engine::svn_baseline::{format_trailer, parse_trailer, Trailer, DELIVERED_REV_KEY};
 use crate::error::{GitError, Result};
 use std::collections::BTreeMap;
@@ -336,15 +335,10 @@ pub fn decode_path(s: &str) -> Option<String> {
 /// 用 `cat-file commit` 取原始字节而不是 `log --format=%B`：后者会多一个结尾 `\n`（W27），
 /// 且这里要的是写进去的原样。读不出记账沿用 `svn_baseline_no_trailer`。
 pub fn read_base_map(repo: &str, rev: &str) -> Result<BaseMap> {
-    let raw = run_git_bytes(repo, &["cat-file", "commit", rev])?;
-    // 头部到第一个空行为止（`gpgsig` 之类的续行以空格开头，不会是空行）
-    let body = raw
-        .windows(2)
-        .position(|w| w == b"\n\n")
-        .map(|at| &raw[at + 2..])
-        .unwrap_or(&[]);
+    // 原始字节，等于 `cat-file commit` 里空行之后的部分（libgit2，`tests/git_read.rs` 对照过）
+    let body = crate::engine::git_read::commit_message(repo, rev)?;
     // 我们始终写 UTF-8；不是 UTF-8 就不是我们写的，不用 lossy 去猜（替换字符会混进路径）
-    let parsed = std::str::from_utf8(body).ok().and_then(parse_message);
+    let parsed = std::str::from_utf8(&body).ok().and_then(parse_message);
     parsed.ok_or_else(|| {
         GitError::new(
             "svn_baseline_no_trailer",

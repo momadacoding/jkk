@@ -102,6 +102,18 @@ impl TempIndex {
         Ok(idx)
     }
 
+    /// 从 `tree` 起步，**沿用真实索引里没变的条目的 stat**（做法与退路见
+    /// [`build_index_keeping_stat`]）。
+    ///
+    /// 跟进的录制用它代替 [`TempIndex::empty`]：从空索引起步的条目没有 stat，`git add -A`
+    /// 只能把白名单里的文件逐个读出来哈希。2026-11-01 实测一万五千个文件：add + write-tree
+    /// 从 9.2 秒降到 0.38 秒，录出的树 OID 相同。stat 只是缓存，内容仍以磁盘为准：
+    /// 复制时保留了索引文件的 mtime，racily clean 的条目照样会被重新哈希。
+    pub fn from_tree_keeping_stat(repo_root: &str, tree: &str) -> Result<Self> {
+        let index = git_dir(repo_root)?.join("index");
+        build_index_keeping_stat(repo_root, &index, tree)
+    }
+
     /// 在候选索引上 `git add -A -- <W-path>`。
     ///
     /// # 空列表是 no-op，绝不能退化成「全部」
@@ -690,13 +702,7 @@ pub(crate) fn copy_with_mtime(from: &Path, to: &Path) -> Result<()> {
 }
 
 pub fn git_dir(repo_root: &str) -> Result<PathBuf> {
-    let out = run_git(repo_root, &["rev-parse", "--git-dir"])?;
-    let p = PathBuf::from(out.trim());
-    Ok(if p.is_absolute() {
-        p
-    } else {
-        Path::new(repo_root).join(p)
-    })
+    crate::engine::git_read::git_dir(repo_root)
 }
 
 /// 基线 commit 里那一行权威记账（spec §6.4.1）。
@@ -922,23 +928,21 @@ pub fn publish_baseline(
 
 /// 基线分支现在指着谁；不存在返回 `None`。
 pub(crate) fn read_baseline(repo_root: &str) -> Result<Option<String>> {
-    let (code, out) = run_git_code(repo_root, &["rev-parse", "-q", "--verify", &baseline_ref()])?;
-    match code {
-        0 => Ok(Some(out.trim().to_string())),
-        // 1 = 「ref 不存在」。**不能把 128 也算进来**：那是「ref 损坏」，
-        // 当成「不存在」会让我们以为这是首个基线，然后覆盖掉一段真实历史。
-        // 同一个坑 1a 在 `engine::ops::head_is_unborn` 上踩过一次。
-        1 => Ok(None),
-        _ => Err(GitError::new(
+    // 「ref 不存在」才是 None。**ref 损坏不能算进来**：当成「不存在」会让我们以为这是首个
+    // 基线，然后覆盖掉一段真实历史。同一个坑 1a 在 `engine::ops::head_is_unborn` 上踩过一次。
+    // `git_read::resolve` 只把 NotFound 一类当成没有，损坏照样报错（`tests/git_read.rs`）
+    crate::engine::git_read::resolve(repo_root, &baseline_ref()).map_err(|e| {
+        GitError::new(
             "svn_baseline",
             format!(
-                "读取基线分支 {} 失败（rev-parse 退出 {code}）。\
+                "读取基线分支 {} 失败（{}）。\
                  这不是「基线不存在」，更可能是 ref 损坏；\
                  当成不存在会覆盖掉一段真实历史，所以这里直接报错。",
-                baseline_ref()
+                baseline_ref(),
+                e.message.trim()
             ),
-        )),
-    }
+        )
+    })
 }
 
 fn moved_error(expected: Option<&str>, actual: Option<&str>) -> GitError {

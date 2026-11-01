@@ -8,7 +8,8 @@
 mod svn_fixtures;
 
 use app_lib::engine::svn_cli::{
-    path_dirs_from_reg_output, probe_svn, run_svn, run_svn_code, with_global, SvnAvailability,
+    forget_node_scans, path_dirs_from_reg_output, probe_svn, run_svn, run_svn_code, with_global,
+    with_scan_cache, SvnAvailability,
 };
 use svn_fixtures::svn_repo;
 
@@ -159,6 +160,47 @@ fn reg_output_parsing_keeps_the_first_path_entry() {
         ],
         "第一个条目不能被吞掉"
     );
+}
+
+// —— 跟进准备阶段的只读扫描缓存（性能 P2）——
+
+fn node_scan(wc: &str) -> String {
+    run_svn(wc, &["status", "-v", "--xml", "--", "Code@"]).unwrap()
+}
+
+#[test]
+fn a_scan_cache_serves_the_same_status_until_node_scans_are_forgotten() {
+    let fx = svn_repo();
+    let wc = fx.wc_str();
+    with_scan_cache(|| {
+        let first = node_scan(&wc);
+        std::fs::write(fx.wc().join("Code/A.cs"), "edited\n").unwrap();
+        assert_eq!(node_scan(&wc), first, "缓存范围内同一条扫描只跑一次");
+        forget_node_scans();
+        assert_ne!(
+            node_scan(&wc),
+            first,
+            "忘掉之后必须重新读：R3c 靠它发现录制期间的变化"
+        );
+    });
+}
+
+#[test]
+fn outside_a_scan_cache_every_status_is_fresh() {
+    let fx = svn_repo();
+    let wc = fx.wc_str();
+    let first = node_scan(&wc);
+    std::fs::write(fx.wc().join("Code/A.cs"), "edited\n").unwrap();
+    assert_ne!(node_scan(&wc), first);
+}
+
+#[test]
+fn a_scan_cache_does_not_outlive_its_scope() {
+    let fx = svn_repo();
+    let wc = fx.wc_str();
+    let inside = with_scan_cache(|| node_scan(&wc));
+    std::fs::write(fx.wc().join("Code/A.cs"), "edited\n").unwrap();
+    assert_ne!(node_scan(&wc), inside, "范围结束后不能再拿旧结果");
 }
 
 #[test]

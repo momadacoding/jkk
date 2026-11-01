@@ -540,9 +540,12 @@ fn not_a_file(c: &ReplayCommit, path: &str, codes: &ReplayCodes) -> GitError {
 }
 
 fn rev_parse(repo: &str, rev: &str) -> Result<String> {
-    Ok(run_git(repo, &["rev-parse", "--verify", "-q", rev])?
-        .trim()
-        .to_string())
+    crate::engine::git_read::resolve(repo, rev)?.ok_or_else(|| {
+        GitError::new(
+            "git_cli",
+            format!("fatal: Needed a single revision（{rev}）"),
+        )
+    })
 }
 
 /// 空 OID 会让区间退化成 `..head`（= `HEAD..head`），查的就不是那一段了。

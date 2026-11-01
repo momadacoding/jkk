@@ -11,7 +11,7 @@
 mod svn_fixtures;
 
 use app_lib::engine::git_cli::{run_git, run_git_code};
-use app_lib::engine::svn_baseline::{refresh_index_stat, swap_index_to_tree};
+use app_lib::engine::svn_baseline::{refresh_index_stat, swap_index_to_tree, TempIndex};
 use app_lib::engine::svn_init::{init_hybrid, InitRequest};
 use std::fs;
 use std::path::Path;
@@ -290,5 +290,50 @@ fn init_leaves_clean_files_with_stat_in_the_index() {
     assert!(
         !status.lines().any(|l| l.ends_with("Code/A.cs")),
         "A.cs 没改过，不该出现在 status 里，实际：{status:?}"
+    );
+}
+
+/// 临时索引文件里这个条目的 (mtime 秒, mtime 纳秒, size)。
+fn temp_index_stat(index: &Path, path: &str) -> (i32, u32, u32) {
+    let idx = git2::Index::open(index).unwrap();
+    let e = idx
+        .get_path(Path::new(path), 0)
+        .unwrap_or_else(|| panic!("临时索引里没有 {path}"));
+    (e.mtime.seconds(), e.mtime.nanoseconds(), e.file_size)
+}
+
+#[test]
+fn a_temp_index_from_a_tree_keeps_stat_for_entries_the_tree_did_not_change() {
+    // 跟进的录制从空索引起步时，`git add -A` 要把白名单里的文件逐个读出来哈希：
+    // 2026-11-01 实测一万五千个文件 add + write-tree 9.2 秒；沿用 stat 之后 0.38 秒，
+    // 录出的树 OID 相同
+    let t = two_trees();
+    let p = t.dir.path();
+    let (a_real, c_real) = (index_stat(p, "a.txt"), index_stat(p, "c.txt"));
+
+    let idx = TempIndex::from_tree_keeping_stat(p.to_str().unwrap(), &t.new).unwrap();
+
+    assert_eq!(
+        temp_index_stat(idx.path(), "a.txt"),
+        a_real,
+        "a.txt 没变，stat 必须沿用"
+    );
+    assert_eq!(
+        temp_index_stat(idx.path(), "c.txt"),
+        c_real,
+        "c.txt 没变，stat 必须沿用"
+    );
+    assert_eq!(
+        temp_index_stat(idx.path(), "b.txt").0,
+        0,
+        "b.txt 换了内容，旧 stat 对新 blob 无效，不能沿用"
+    );
+    assert_eq!(idx.write_tree(p.to_str().unwrap()).unwrap(), t.new);
+    assert_eq!(
+        run_git(p.to_str().unwrap(), &["write-tree"])
+            .unwrap()
+            .trim(),
+        t.old,
+        "真实索引一个字节都不能动"
     );
 }

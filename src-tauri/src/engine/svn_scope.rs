@@ -19,7 +19,6 @@
 //! - **已在基线里的不会被移出去。** git 本身的语义就是已跟踪文件不受 `.gitignore` 影响，
 //!   参照统一取 `refs/heads/svn/base` 的树。建库途中这个 ref 还不存在，参照为空。
 
-use crate::engine::git_cli::{run_git, run_git_code};
 use crate::engine::svn_config::{SvnConfig, BASELINE_BRANCH};
 use crate::engine::svn_gitignore::{query_verdicts, GitCtx, Verdict};
 use crate::engine::svn_include_check::normalize_roots;
@@ -168,25 +167,13 @@ fn verdicts_hiding(repo_root: &str, files: &[&str]) -> Result<BTreeMap<String, V
 /// 当前基线树里的文件。基线 ref 还不存在（建库途中）时为空。
 fn baseline_files(repo_root: &str) -> Result<BTreeSet<String>> {
     let reference = format!("refs/heads/{BASELINE_BRANCH}");
-    let (code, _) = run_git_code(repo_root, &["rev-parse", "--verify", "-q", &reference])?;
-    match code {
-        0 => {}
-        1 => return Ok(BTreeSet::new()),
-        other => {
-            return Err(GitError::new(
-                "git_cli",
-                format!("读基线 ref 失败（git rev-parse 退出 {other}）"),
-            ))
-        }
-    }
-    Ok(run_git(
-        repo_root,
-        &["ls-tree", "-r", "-z", "--name-only", &reference],
-    )?
-    .split('\0')
-    .filter(|s| !s.is_empty())
-    .map(str::to_string)
-    .collect())
+    // 不存在 → 空；损坏 → 报错（`git_read::resolve` 分得开，与原来按退出码 1 / 128 分一致）
+    let Some(oid) = crate::engine::git_read::resolve(repo_root, &reference)
+        .map_err(|e| GitError::new("git_cli", format!("读基线 ref 失败：{}", e.message.trim())))?
+    else {
+        return Ok(BTreeSet::new());
+    };
+    crate::engine::git_read::tree_paths(repo_root, &oid)
 }
 
 /// 纯路径判断：在白名单内 ∧ 扩展名匹配。

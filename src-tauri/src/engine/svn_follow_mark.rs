@@ -13,7 +13,8 @@
 //!
 //! [`wc_db_stamps`] 是另一件事：窗口拿到焦点时用来发现外部提交，开销要小到每次焦点都能跑。
 
-use crate::engine::git_cli::{run_git_bytes, run_git_code};
+use crate::engine::git_cli::run_git_bytes;
+use crate::engine::git_read;
 use crate::engine::svn_basemap::read_base_map;
 use crate::engine::svn_cli::{svn_command, with_global};
 use crate::engine::svn_config::{read_config, BASELINE_BRANCH};
@@ -74,24 +75,15 @@ pub fn write_mark(repo: &str) -> Result<()> {
     if !Path::new(repo).join(".git").is_dir() {
         return Ok(());
     }
-    let (code, head) = run_git_code(repo, &["rev-parse", "--verify", "-q", "HEAD^{commit}"])?;
-    if code != 0 {
+    let Some(head_oid) = git_read::resolve(repo, "HEAD^{commit}")? else {
         return Ok(());
-    }
-    let head_oid = head.trim().to_string();
-    // 在 HEAD 之后读：两次读之间基线前进时，这里偏新，只会把「快照之后」算小，走向拿不准
-    let spec = format!("refs/heads/{BASELINE_BRANCH}^{{commit}}");
-    let (code, base) = run_git_code(repo, &["rev-parse", "--verify", "-q", &spec])?;
-    let base_oid = (code == 0).then(|| base.trim().to_string());
-    let (code, symref) = run_git_code(repo, &["symbolic-ref", "-q", "HEAD"])?;
-    let branch = if code == 0 {
-        symref
-            .trim()
-            .strip_prefix("refs/heads/")
-            .map(str::to_string)
-    } else {
-        None
     };
+    // 在 HEAD 之后读：两次读之间基线前进时，这里偏新，只会把「快照之后」算小，走向拿不准
+    let base_oid = git_read::resolve(repo, &format!("refs/heads/{BASELINE_BRANCH}^{{commit}}"))?;
+    let branch = git_read::symbolic_head(repo)?
+        .as_deref()
+        .and_then(|r| r.strip_prefix("refs/heads/"))
+        .map(str::to_string);
     // 比的是上面读到的 oid 而不是 `HEAD`：快照里的 HEAD 与暂存必须来自同一个基准。
     // `--ita-invisible-in-index`：否则 i-t-a 被报成 A + 空 blob，与真的暂存了一个空文件同形
     let raw = run_git_bytes(

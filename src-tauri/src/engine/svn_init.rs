@@ -525,7 +525,9 @@ fn record_mixed_with(
     // 文件的 BASE 推到了新 revision——那时 `svn cat -r BASE` 取回的是新内容，映射记的却是
     // 旧 revision（spec §16.1 末的竞态表）。体检通常已先一步拦下，这里是第二道。
     // 比较的是「按同一规则算出的映射」，不是逐节点 revision：局部 update 只推高没改过的
-    // 文件时映射不变，录下的内容也仍然对
+    // 文件时映射不变，录下的内容也仍然对。
+    // 跟进的准备阶段缓存了 svn 扫描（`with_scan_cache`），这里必须读最新的节点状态
+    crate::engine::svn_cli::forget_node_scans();
     let wcs = enumerate_wcs(repo, &cfg.whitelist)?;
     let now = read_node_status(repo, &cfg.whitelist, &wcs)?;
     match compute_map(&pre.repos_root, &pre.uuid, &files, &now, BTreeMap::new()) {

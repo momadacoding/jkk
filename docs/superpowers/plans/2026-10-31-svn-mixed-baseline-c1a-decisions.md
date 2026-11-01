@@ -27,6 +27,9 @@
 | R1 | Review 1 修复（Task 1–5） | 完成（未 commit） | 改 `svn_health.rs`、`svn_tombstone.rs`（`fault`）、`svn_nodes.rs`（`dir_revs`）、`svn_sync.rs`、`svn_sync_check.rs`、`svn_xml.rs`（`copied`）、`svn_init.rs`、`svn_baseline.rs`（`TempFile::for_svn_arg`）、`src/engine/svnInit.ts`；测试 `tests/svn_health.rs`、`svn_init.rs`、`svn_nodes.rs`、`svn_sync.rs`、`svn_backend.rs`、`tests/vitest/svnInit.test.ts`。详见「Review 1 修复」小节 | `cargo fmt --check` 通过、`cargo clippy --all-targets` 无告警；`cargo test --no-fail-fast` 71 个测试二进制 1227 过 / 0 失败 / 1 ignored（merge_drivers 原有，含 Task 7 的 `svn_leak`）；`pnpm build` 通过；`pnpm test` 55 文件 836 过 |
 | R2 | Review 2 修复（Task 6–10） | 完成（未 commit） | 改 `engine/svn_follow.rs`、`svn_follow_index.rs`（`prepare_index_with`、`pin_raw_index` 挂 `blobs/<oid>`）、`svn_follow_mark.rs`（`base_oid`）、`svn_leak.rs`、`svn_health.rs`（`repo_rel_of`、`incomplete`）、`svn_tombstone.rs`（`FirstDiff` / `LaterDiff` / `DiffPath`）、`svn_journal.rs`（`indexStages`、`lockCreated`）、`svn_sync.rs`（`head_behind_base`）、`src/engine/svnSync.ts`、`svnFollow.ts`；测试 `tests/svn_follow.rs`、`svn_follow_index.rs`、`svn_follow_mark.rs`、`svn_leak.rs`、`svn_health.rs`、`svn_journal.rs`、`svn_backend.rs`、`tests/vitest/svnSync.test.ts`、`svnFollow.test.ts`。详见「Review 2 修复」小节 | `cargo fmt --check` 通过、`cargo clippy --all-targets` 无告警；回归测试先红后绿，14 次变异全部抓到；`cargo test --no-fail-fast` 74 个测试二进制 1417 过 / 0 失败 / 1 ignored（merge_drivers 原有）；`pnpm build` 通过；`pnpm test` 57 文件 874 过。**`pnpm tauri dev` 未验证**：`SyncStatus`、`FollowReport` 加字段，没有改命令签名，靠契约测试 |
 | R3 | Review 3 修复（最终 review） | 完成（未 commit） | 改 `engine/svn_sync_stash.rs`（`staged_only_paths`）、`svn_sync_in.rs`（`RestoreStep::StageKept`、`SyncInOutcome::StageLost` 加 `stash_oid` / `files`、`rolled_back` 尾句）、`svn_follow.rs`（`stale_disk_paths`、`NeedsManual.stale_disk`）、`svn_config.rs`（`set_svn_user` 临时文件名与 rename 重试）、`src/engine/svnSyncIn.ts`（`stageLostDetail`、`STAGING_NOTE`）、`svnFollow.ts`、`svnSync.ts`、`src/components/svnSyncFlow.ts`（删 `handleManualFollow`）；测试 `tests/svn_follow.rs` +4（改名 1、改 3）、`svn_sync_in.rs` +2、`svn_config.rs` +1、`svn_backend.rs`，vitest `svnSyncIn.test.ts` +3、`svnFollow.test.ts` +3、`svnSyncFlow.test.ts`（`handleManualFollow` 的 5 条改成 3 条经 `handleCheckoutBehind`）。详见「Review 3 修复」小节 | `cargo fmt --check` 通过、`cargo clippy --all-targets` 无告警；第 2、3 条的回归测试修前跑红，第 1 条修前编译不过（证据见小节）；5 个变异第一轮 1 个存活，补 `a_file_the_lagging_branch_…` 后抓到；`cargo test --no-fail-fast` 74 个测试二进制 1473 过 / 0 失败 / 1 ignored（merge_drivers 原有），之后补的那 1 条单独跑过；`pnpm build` 通过；`pnpm test` 60 文件 998 过。**`pnpm tauri dev` 未验证**：没有改命令签名，两个结局加字段，靠契约测试 |
+| P1 | 性能：录制的候选索引沿用 stat | 完成 | 改 `svn_baseline.rs`（`TempIndex::from_tree_keeping_stat`）、`svn_follow.rs`（`record_from_old_base`）；测试 `tests/svn_index_stat.rs` +1、`tests/svn_follow.rs` +2 | 退路测试先红（`include_set_mismatch`）后绿；stat 测试先编译不过后绿；同树测试改动前后都绿（守行为不变）。全量验证见 P3 |
+| P2 | 性能：准备阶段的 svn 扫描去重 | 完成 | 改 `svn_cli.rs`（`with_scan_cache`、`forget_node_scans`）、`svn_follow.rs`（包住 `prepare`）、`svn_init.rs`（R3c 前 `forget_node_scans`）；测试 `tests/svn_cli.rs` +3、`tests/svn_follow.rs` +1 | 2 个变异各被一条测试抓到；全量验证见 P3 |
+| P3 | 性能：git 只读查询改走 libgit2 | 完成 | 新增 `engine/git_read.rs`、`tests/git_read.rs`（9 条）；改 `svn_baseline.rs`、`svn_sync.rs`、`svn_sync_check.rs`、`svn_basemap.rs`、`svn_follow.rs`、`svn_replay.rs`、`svn_scope.rs`、`svn_follow_mark.rs`、`svn_include_check.rs`、`engine/mod.rs` | `cargo fmt --check` 通过、`cargo clippy --all-targets` 无告警；`cargo test --no-fail-fast` 75 个测试二进制 1490 过 / 0 失败 / 1 ignored（merge_drivers 原有）；真实窗口回归见「性能」小节；前端未改，未跑 `pnpm` |
 
 ## 【待决】汇总
 
@@ -1071,3 +1074,91 @@
 - **崩在 StageKept 落盘之后、删 journal 之前**：「继续」报 `Settled`，不点名暂存与磁盘不同的路径，钉子被拆，备份只靠 stash 列表。这期间用户又在外部删掉了那条 stash 的话，「继续」照旧拆钉子、报 `StageLost { stashOid: null }`，暂存那一份就没有引用了（用户自己删的 stash，没有再加保护）
 - **磁盘内容恰好等于旧 HEAD 的路径是用户有意改回去的**：第 2 条会让它走手动跟进，rebase 把它写成新内容；旧内容在历史里（旧 HEAD），但不会出现在 stash 里
 - **路径以 `"` 开头时 `hash-object --stdin-paths` 会按 C 风格引号解析**，算出的值对不上，按「不是旧内容」处理，回到修前行为
+
+### 性能（E2E 之后，用户选方案 A）
+
+#### 背景与测量
+
+- 起因：用户在 e2e fixture 里感到「跟进要 4 秒左右」，担心 500GB 工程上要几分钟。没有公司机器的数据；以前的参考只有
+  `2026-10-30-stage-refresh-perf-decisions.md`（git，15,000 文件：开发机约 140 ms / 公司机器约 1 秒一遍，冷缓存 53 秒）。
+- 测法：在 `git_cli` / `svn_cli` 的子进程入口临时加计时（环境变量 `JKK_PROC_TRACE`，**不提交**），`pnpm tauri dev` 里点跟进，
+  按跟进前后的标记截取。开发机，debug 构建。
+- e2e fixture（7 个文件、6 条分支）：7.7 秒，170 个子进程（git 143、svn 27），子进程合计 7.5 秒；单个约 45 ms，几乎全是起进程的固定开销。
+- 15,000 文件 fixture（`50 × 20 × 15` 个 `.cs`，与 git 基准同形；1 条分支）：**18.3 秒**，85 个子进程。最大的一块是
+  `git add -A -- Code/` 7.1 秒 + `write-tree` 0.9 秒；svn 合计 4.6 秒（`status` 每遍约 0.2 秒、扫了约 10 遍，`info -R` 1.1 秒，
+  体检 `diff --summarize` 1.4 秒）。
+- 单次扫描（同一 fixture，取 3 次最小值）：`status --xml` 159 ms、`status -v --xml` 226 ms、`info -R --xml` 994 ms、
+  `diff --summarize`（`file://`）1181 ms、空 `git --version` 40 ms。
+- 计划外的发现：同一 fixture 初始化 2 分 32 秒，其中 `git add` 2 分 13 秒。初始化一次性，不在本轮范围，记一笔。
+
+#### P1：录制的候选索引沿用 stat
+
+- **计划没写的坑：** 跟进录新基线用 `TempIndex::empty`，条目没有 stat，`git add -A` 只能把白名单全量读出来哈希——和
+  10-28 现场「索引没 stat 冷缓存 53 秒」是同一个病，只是这次发生在每次跟进的临时索引上。
+- **做法：** `TempIndex::from_tree_keeping_stat(旧基线)`：复制真实索引（保留 mtime）再 `read-tree -i -m <旧基线>`，复用
+  `swap_index_to_tree` 已有的 `build_index_keeping_stat`（含清 skip-worktree / assume-unchanged、失败退回空索引）。
+- **实测（15k fixture，磁盘上另有 1 处本地修改、1 个新文件）：** 空索引 add 7.9 s + write-tree 1.3 s；沿用 stat 时
+  read-tree 0.18 s + add 0.14 s + write-tree 0.06 s。两边 `write-tree` 得到同一个树 OID。
+- **为什么这么改是安全的：**
+  - 原来从空索引起步是为了甩掉服务器上已删除的文件。从旧基线起步时这些文件磁盘上已不在，`add -A` 一样摘掉。
+  - 两种起点只在一处不等价：旧基线里有**现在已不算 W** 的文件（白名单或扩展名收窄过）。它是已跟踪文件，`add -A` 会留下，
+    R2c 纳入集合核对报 `include_set_mismatch`。这时 `record_from_old_base` 退回空索引按原口径重录一次，结果与改动前相同。
+  - stat 只是缓存，内容仍以磁盘为准：复制时保留了索引文件的 mtime，racily clean 的条目照样重新哈希（同 `swap_index_to_tree`
+    的论证）；assume-unchanged / skip-worktree 被清掉，`add -A` 不会因为它们跳过磁盘。真实索引只被读、不被写。
+- **偏离：** 原方案 A 只列了「git 只读查询改 libgit2」与「svn 去重」；P1 是测量后新发现的最大项，一并做。`sync_in` S7 与
+  交付用的 `TempIndex::from_head` 有同样的问题，**没改**（不在本轮范围，待用户决定）。
+- **测试：** `svn_index_stat::a_temp_index_from_a_tree_keeps_stat_for_entries_the_tree_did_not_change`（先编译不过后绿）；
+  `svn_follow::follow_records_the_same_tree_an_empty_index_would`（改动前后都绿，守行为不变）；
+  `follow_falls_back_to_an_empty_index_when_the_old_base_has_files_outside_the_whitelist`（只换起点、不带退路时红：
+  `include_set_mismatch`，补退路后绿）。
+
+#### P2：准备阶段的 svn 扫描去重
+
+- **计划没写的坑：** 准备阶段里失同步判定、R1 前置校验、R3b 体检、R3c 各调一次 `enumerate_wcs`（`info` + 全量 `status`）
+  与 `read_node_status`（全量 `status -v`），同一片白名单扫了约 10 遍。
+- **做法：** `svn_cli::with_scan_cache`：范围内同一条 `svn info` / `svn status`（同目录、同参数）只跑一次，线程局部；
+  跟进只把 `prepare` 包进去，每次重试是新的范围。R3c 重读之前 `forget_node_scans` 丢掉 `status -v` 的结果；
+  `info` 与找 external 的 `status` 留着（工作副本布局，不是 revision）。发布前的复核不在范围内。
+- **为什么这么改是安全的：** 范围内跟进本身不发 SVN 写命令、不写工作区；外部在范围内的改动由 R3c（读最新节点状态）与
+  体检（直接问服务器）两道兜住。`a_stale_scan_cache_cannot_record_a_lying_baseline` 先缓存、再在 TortoiseSVN 侧提交、再录，
+  断言被拦下、基线不动。
+- **偏离：** 没有改成「把节点状态一路传参」：那要动 `check_sync` / `run_preflight_with` / `record_mixed` / 体检四处的签名，
+  它们还被初始化、重建、更新、交付共用；缓存只在跟进范围内生效，别的入口行为不变。
+- **测试：** `svn_cli` 三条（范围内复用、忘掉后重读、出范围不复用），两个变异（`forget` 改成空操作、范围结束不清）各抓到一条。
+
+#### P3：git 只读查询改走 libgit2
+
+- 新模块 `engine/git_read.rs`：`git_dir`、`resolve`（`rev-parse -q --verify`）、`symbolic_head`、`commit_message`
+  （`cat-file commit` 空行之后的原始字节）、`merge_base`、`is_ancestor`、`tree_paths`（`ls-tree -r --name-only`）、
+  `unmerged_paths`（`diff --diff-filter=U`）、`ignore_case`。替换了 `svn_baseline::git_dir` / `read_baseline`、
+  `svn_sync::baseline_oid` / `tree_files` / `head_behind_base`、`svn_sync_check::current_branch` / `rev_parse` /
+  `unmerged_paths`、`svn_basemap::read_base_map`、`svn_follow::branch_baseline` / `previous_baseline`、`svn_replay::rev_parse`、
+  `svn_scope::baseline_files`、`svn_follow_mark::write_mark`、`svn_include_check::ignore_case`。`check_git_version` 进程内
+  只在「够新」时记一次。
+- **「不存在」与「坏了」：** `read_baseline` / `baseline_files` 原先按退出码 1（不存在）/ 128（损坏）区分。`resolve` 只把
+  `NotFound` / `InvalidSpec` / `Ambiguous` 当成没有，ref 文件损坏返回 `Err`，`git_read::a_corrupt_ref_is_an_error_not_absent` 钉住。
+- **计划没写的坑：** `core.ignoreCase` 仓库里不设时两条路都取全局配置（本机 `~/.config/git/config` 里是 true），契约测试
+  改成与 CLI 比，而不是断言 false。
+- **没改的（偏离方案 A 的「全部只读查询」）：** `diff-tree`（重命名检测与 `--literal-pathspecs`）、`log` / `rev-list` 的排序
+  （`--topo-order --reverse`）、`worktree list`（prunable）、`for-each-ref` 的 `%(upstream)`。两边语义有差，换了要逐条复核；
+  它们在 e2e 6 条分支时约占 1 秒，留作后续。
+- **测试：** `tests/git_read.rs` 9 条，每条在同一 fixture 上与原 CLI 输出逐一对照（含游离 HEAD、冲突态、损坏 ref、
+  linked worktree、中文路径）。
+
+#### 结果
+
+| fixture | 改动前 | P1 + P2 | P1 + P2 + P3 |
+|---|---|---|---|
+| 15,000 文件，1 条分支（跟进耗时 / 子进程数） | 18.3 s / 85 | 10.1 s / 85 | 8.0～8.2 s / 54 |
+| e2e fixture，分支逐渐增多（场景 1～14A 各次跟进） | 4.6～8.8 s | — | 2.6～4.8 s |
+
+- 都是开发机上的 debug 构建。15k 时还有约 2.4 秒花在子进程之外（debug 构建下解析 4MB 的 svn XML、libgit2 未优化），
+  release 构建会更少，没有单独测。
+- 剩下的大头：体检 `svn diff --summarize` 约 1 秒（要问服务器，真实网络下更慢）、`svn info -R` 约 0.9 秒（找被 depth-exclude 的
+  节点），都是正确性检查，没动。
+- **真实窗口回归（2026-11-01）：** 新 fixture 上用脚本驱动 `pnpm tauri dev`，按测试指引跑场景 1、2、3、4、6、7、10、12、14A，
+  27 项核对全过。焦点改用页面内派发的 `window` blur / focus（与真实切窗口走同一组监听）：用户正在用电脑时系统不让抢前台。
+  第一轮脚本自己的错误（报告弹框被提前关掉，用户名没存上）导致场景 2 起连锁失败，修脚本后在新 fixture 上重跑全过。
+- 临时计时代码（`JKK_PROC_TRACE`）已删，不进提交。
+- **遗留：** 「更新」（`sync_in` S7）与交付用的 `TempIndex::from_head` 同样从没有 stat 的索引起步，15k 规模下也要多花约 8 秒；
+  初始化在 15k fixture 上 2 分 32 秒（`git add` 2 分 13 秒）。都不在本轮范围，待用户决定。

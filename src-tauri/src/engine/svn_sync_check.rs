@@ -8,7 +8,7 @@
 //! 本地的、便宜的检查在前，走网络的 `svn status -u` 放在最后：断网时用户先看到
 //! 的应当是「你在 detached HEAD 上」这种能自己修的问题，而不是一条网络错误。
 
-use crate::engine::git_cli::{run_git, run_git_code};
+use crate::engine::git_cli::run_git_code;
 use crate::engine::svn_baseline::{git_dir, TempIndex};
 use crate::engine::svn_cli::run_svn;
 use crate::engine::svn_config::{read_config, BASELINE_BRANCH};
@@ -364,28 +364,28 @@ fn attached_branch(repo_root: &str) -> Result<String> {
 /// `heads/work`，拿这个名字去 `git checkout` 会退出 0 却让 HEAD detached，
 /// 拼成 `refs/heads/heads/work` 也对不上 rebase 的 head-name。取完整 ref 自己剥前缀。
 pub(crate) fn current_branch(repo_root: &str) -> Result<Option<String>> {
-    let (code, out) = run_git_code(repo_root, &["symbolic-ref", "--quiet", "HEAD"])?;
-    Ok(match out.trim().strip_prefix("refs/heads/") {
-        Some(name) if code == 0 && !name.is_empty() => Some(name.to_string()),
-        _ => None,
-    })
+    let head = crate::engine::git_read::symbolic_head(repo_root)?;
+    Ok(
+        match head.as_deref().and_then(|h| h.strip_prefix("refs/heads/")) {
+            Some(name) if !name.is_empty() => Some(name.to_string()),
+            _ => None,
+        },
+    )
 }
 
 /// `git rev-parse --verify <rev>` 的完整 OID。
 pub(crate) fn rev_parse(repo_root: &str, rev: &str) -> Result<String> {
-    Ok(run_git(repo_root, &["rev-parse", "--verify", rev])?
-        .trim()
-        .to_string())
+    crate::engine::git_read::resolve(repo_root, rev)?.ok_or_else(|| {
+        GitError::new(
+            "git_cli",
+            format!("fatal: Needed a single revision（{rev}）"),
+        )
+    })
 }
 
 /// 索引里未合并的路径（冲突态）。
 pub(crate) fn unmerged_paths(repo_root: &str) -> Result<Vec<String>> {
-    let out = run_git(repo_root, &["diff", "--name-only", "--diff-filter=U", "-z"])?;
-    Ok(out
-        .split('\0')
-        .filter(|p| !p.is_empty())
-        .map(str::to_string)
-        .collect())
+    crate::engine::git_read::unmerged_paths(repo_root)
 }
 
 /// 当前磁盘上的纳入集合预检：期望集合（遍历磁盘）与 `git add -A` 实际收进来的相等。

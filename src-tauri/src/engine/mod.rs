@@ -9,6 +9,7 @@ pub mod external_merge;
 pub mod external_tools_config;
 pub mod file_lock;
 pub mod git_cli;
+pub mod git_read;
 pub mod github;
 pub mod graph;
 pub mod launcher;

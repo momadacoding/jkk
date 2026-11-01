@@ -40,7 +40,6 @@
 //! `nodeRevs == baselineRev` 照样成立。那类外部操作只能由 git 侧看见（工作区
 //! 出现修改或改动凭空消失），由现有的 watcher + `git status` 负责，**不归本模块**。
 
-use crate::engine::git_cli::{run_git, run_git_code};
 use crate::engine::svn_basemap::{read_base_map, BaseMap};
 use crate::engine::svn_cli::run_svn;
 use crate::engine::svn_config::read_config;
@@ -236,11 +235,10 @@ fn head_behind_base(repo_root: &str, base: &str) -> bool {
     if !matches!(current_branch(repo_root), Ok(Some(b)) if b != BASELINE_BRANCH) {
         return false;
     }
-    let Ok((0, out)) = run_git_code(repo_root, &["merge-base", "HEAD", base]) else {
+    let Ok(Some(fork)) = crate::engine::git_read::merge_base(repo_root, "HEAD", base) else {
         return false;
     };
-    let fork = out.trim();
-    !fork.is_empty() && fork != base && read_base_map(repo_root, fork).is_ok()
+    fork != base && read_base_map(repo_root, &fork).is_ok()
 }
 
 /// [`judge`] 的中间结果。
@@ -354,28 +352,23 @@ fn judge(
 /// `svn/base` 顶端的 OID。分支不存在时报 `svn_no_baseline`（理由见 [`read_baseline_rev`]）。
 fn baseline_oid(repo_root: &str) -> Result<String> {
     let reference = format!("refs/heads/{BASELINE_BRANCH}");
-    let out = run_git(repo_root, &["rev-parse", "--verify", "-q", &reference]).map_err(|e| {
+    let no_baseline = |detail: &str| {
         GitError::new(
             "svn_no_baseline",
             format!(
                 "读不到基线分支 `{BASELINE_BRANCH}`，这个仓库还没有基线，\
-                 失同步无从判定。原始错误：{}",
-                e.message.trim()
+                 失同步无从判定。原始错误：{detail}"
             ),
         )
-    })?;
-    Ok(out.trim().to_string())
+    };
+    crate::engine::git_read::resolve(repo_root, &reference)
+        .map_err(|e| no_baseline(e.message.trim()))?
+        .ok_or_else(|| no_baseline("ref 不存在"))
 }
 
 /// 基线树里的文件：映射的键集合（分析 §6.2：不从 status 推）。
 pub(crate) fn tree_files(repo_root: &str, oid: &str) -> Result<BTreeSet<String>> {
-    Ok(
-        run_git(repo_root, &["ls-tree", "-r", "-z", "--name-only", oid])?
-            .split('\0')
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect(),
-    )
+    crate::engine::git_read::tree_paths(repo_root, oid)
 }
 
 /// 每个工作副本根的 revision（spec §6.6.3 的**第一档**，O(1)）。

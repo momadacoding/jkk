@@ -58,7 +58,8 @@ use crate::engine::svn_baseline::{
     create_baseline_commit_with, git_dir, move_baseline_ref, TempIndex,
 };
 use crate::engine::svn_basemap::{read_base_map, BaseMap};
-use crate::engine::svn_config::{read_config, BASELINE_BRANCH};
+use crate::engine::svn_cli::with_scan_cache;
+use crate::engine::svn_config::{read_config, SvnConfig, BASELINE_BRANCH};
 use crate::engine::svn_follow_index::{
     prepare_index, prepare_index_with, rename_lock_into_index, ComposeReport, PathFacts,
     PreparedIndex,
@@ -66,7 +67,7 @@ use crate::engine::svn_follow_index::{
 use crate::engine::svn_follow_mark::{clear_mark, my_svn_user, read_mark, FollowMark};
 use crate::engine::svn_health::Health;
 use crate::engine::svn_include_check::normalize_roots;
-use crate::engine::svn_init::record_mixed;
+use crate::engine::svn_init::{record_mixed, Recorded};
 use crate::engine::svn_journal::{self, BranchMove, Flow, FollowStep, FollowSteps, Journal, Phase};
 use crate::engine::svn_leak::{local_only_leaks, Leak};
 use crate::engine::svn_lock;
@@ -192,7 +193,8 @@ pub fn git_version_ok(text: &str) -> bool {
 /// 跟进一次：判定为 ExternallyAdvanced 时走 F1–F6，InSync 而分支落后时走「分支跟进」入口。
 pub fn follow(repo: &str, opid: &str) -> Result<FollowOutcome> {
     for _ in 0..MAX_ATTEMPTS {
-        let plan = match prepare(repo) {
+        // 准备阶段里同一条 svn 扫描只跑一次（性能 P2）；发布前的复核在范围外，照常读最新的
+        let plan = match with_scan_cache(|| prepare(repo)) {
             Ok(p) => p,
             Err(e) => return Ok(refused(e)),
         };
@@ -595,11 +597,18 @@ fn commits_before_mark(repo: &str, who: &Who, new: &str) -> BTreeSet<String> {
 }
 
 fn check_git_version(repo: &str) -> Result<()> {
+    /// 进程内只问一次「够新」：PATH 上的 git 不会在应用运行中变旧。不够新的结果不记，用户
+    /// 升级 git 之后不用重启应用（性能 P3：每次跟进省一个子进程）。
+    static NEW_ENOUGH: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     let text = match fault::pretended_git_version() {
         Some(v) => v,
+        None if NEW_ENOUGH.get().is_some() => return Ok(()),
         None => run_git(repo, &["--version"])?,
     };
     if git_version_ok(&text) {
+        if fault::pretended_git_version().is_none() {
+            let _ = NEW_ENOUGH.set(());
+        }
         return Ok(());
     }
     Err(GitError::new(
@@ -658,13 +667,11 @@ fn branch_baseline(repo: &str, head: &str, base: &str) -> Result<String> {
              请把历史整理成从基线分出来的样子，再跟进。",
         )
     };
-    let (code, out) = run_git_code(repo, &["merge-base", head, base])?;
-    let scope = out.trim();
-    if code != 0 || scope.is_empty() {
+    let Some(scope) = crate::engine::git_read::merge_base(repo, head, base)? else {
         return Err(unrelated());
-    }
-    read_base_map(repo, scope).map_err(|_| unrelated())?;
-    Ok(scope.to_string())
+    };
+    read_base_map(repo, &scope).map_err(|_| unrelated())?;
+    Ok(scope)
 }
 
 /// 预检与 F1–F3。**一个 ref 都不动**：基线 commit 与重放结果只是对象。
@@ -714,9 +721,7 @@ fn prepare(repo: &str) -> Result<Plan> {
             added,
             removed,
         } => {
-            // 从空索引起步，与重建同一口径（分析 §6.3）：甩掉服务器上已删除的文件
-            let idx = TempIndex::empty(repo)?;
-            let rec = record_mixed(repo, &cfg, &idx)?;
+            let rec = record_from_old_base(repo, &cfg, &old_base)?;
             let who = Who::gather(repo, &rec.map.repos_root, &rec.nodes)?;
             let mut changes: Vec<ExternalChange> = changed.into_iter().chain(added).collect();
             changes.sort_by(|a, b| (a.rev, &a.path).cmp(&(b.rev, &b.path)));
@@ -858,6 +863,27 @@ fn prepare(repo: &str) -> Result<Plan> {
         recorded,
         who,
     })
+}
+
+/// 录新基线（分析 §6.3）。候选索引从旧基线树起步、沿用真实索引的 stat，免得每次跟进都把白名单
+/// 全量哈希一遍（[`TempIndex::from_tree_keeping_stat`]）。
+///
+/// 原来从空索引起步，为的是甩掉服务器上已删除的文件；从旧基线起步时它们磁盘上已经不在，
+/// `add -A` 照样摘掉。不等价的只有一种：旧基线里有现在已不算 W 的文件（白名单或扩展名收窄过），
+/// 它是已跟踪文件，`add -A` 会留下它，R2c 的纳入集合核对随即报 `include_set_mismatch`。这时退回
+/// 空索引按原来的口径再录一次，结果与改动前完全相同。
+fn record_from_old_base(repo: &str, cfg: &SvnConfig, old_base: &str) -> Result<Recorded> {
+    let idx = TempIndex::from_tree_keeping_stat(repo, old_base)?;
+    match record_mixed(repo, cfg, &idx) {
+        Err(e) if e.code == "include_set_mismatch" => {
+            log::info!(
+                "从旧基线起步的候选索引多收了文件，退回空索引重录：{}",
+                e.message
+            );
+            record_mixed(repo, cfg, &TempIndex::empty(repo)?)
+        }
+        r => r,
+    }
 }
 
 /// 分支落后时，磁盘上仍是旧 HEAD 内容、而 HEAD 一移到 `tip` 就会显示成反向修改的路径
@@ -1092,9 +1118,7 @@ fn previous_baseline(repo: &str, old_base: &str, new_base: &str) -> Result<Optio
     if old_base != new_base {
         return Ok(Some(old_base.to_string()));
     }
-    let spec = format!("{new_base}^1^{{commit}}");
-    let (code, out) = run_git_code(repo, &["rev-parse", "-q", "--verify", &spec])?;
-    Ok((code == 0).then(|| out.trim().to_string()))
+    crate::engine::git_read::resolve(repo, &format!("{new_base}^1^{{commit}}"))
 }
 
 struct OthersCtx<'a> {

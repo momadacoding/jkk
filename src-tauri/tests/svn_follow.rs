@@ -11,14 +11,16 @@ mod svn_fixtures;
 
 use app_lib::commands::svn::svn_branches_behind;
 use app_lib::engine::git_cli::{run_git, run_git_env};
+use app_lib::engine::svn_baseline::TempIndex;
 use app_lib::engine::svn_basemap::read_base_map;
+use app_lib::engine::svn_cli::with_scan_cache;
 use app_lib::engine::svn_config::{read_config, write_config};
 use app_lib::engine::svn_follow::fault::{self, Crashed, Point};
 use app_lib::engine::svn_follow::{
     follow, git_version_ok, manual_follow, resume_follow, FollowOutcome, FollowReport,
 };
 use app_lib::engine::svn_follow_mark::{mark_path, read_mark, write_mark};
-use app_lib::engine::svn_init::rebuild_baseline;
+use app_lib::engine::svn_init::{rebuild_baseline, record_mixed};
 use app_lib::engine::svn_journal::{self, Flow, FollowStep, Journal, Phase};
 use app_lib::engine::svn_leak::LeakVerdict;
 use app_lib::engine::svn_lock;
@@ -3405,4 +3407,117 @@ fn branches_behind_is_empty_when_the_baseline_ref_is_gone() {
     git(&fx, &["update-ref", "-d", "refs/heads/svn/base"]);
 
     assert_eq!(behind(&fx), Vec::<String>::new());
+}
+
+// —— 录制的候选索引沿用 stat（性能，日志「性能 P1」）——
+
+#[test]
+fn follow_records_the_same_tree_an_empty_index_would() {
+    // 候选索引改成从旧基线树起步、沿用真实索引的 stat 之后，录出来的必须仍是
+    // 「从空索引 add 磁盘、再换回服务器内容」那棵树：磁盘上什么形态都放一份
+    let fx = hybrid_with_colleague();
+    set_me(&fx, &committer(&fx));
+    write(&fx, "Code/W.cs", "w\n");
+    commit_all(&fx, "work 上的 commit");
+    write(&fx, B, "b-staged\n");
+    git(&fx, &["add", B]);
+    write(&fx, B, "b-disk\n");
+    write(&fx, "Code/Untracked.cs", "u\n");
+    write(&fx, A, "a2\n");
+    tortoise_commit(&fx, A);
+    fx.colleague_commits("Code/C.cs", "c\n");
+    svn_update(&fx, "Code/C.cs");
+
+    done(run(&fx));
+
+    let cfg = read_config(&fx.wc_str()).unwrap();
+    let fresh = record_mixed(&fx.wc_str(), &cfg, &TempIndex::empty(&fx.wc_str()).unwrap()).unwrap();
+    assert_eq!(oid(&fx, "svn/base^{tree}"), fresh.tree);
+}
+
+#[test]
+fn a_stale_scan_cache_cannot_record_a_lying_baseline() {
+    // 准备阶段缓存了 svn 扫描（性能 P2）。缓存之后 TortoiseSVN 又提交了一次：用陈旧的
+    // 节点状态录，映射会把新内容标成旧 revision。R3c 重读与体检必须把它拦下
+    let fx = hybrid_with_colleague();
+    let base = oid(&fx, "svn/base");
+    let cfg = read_config(&fx.wc_str()).unwrap();
+    let err = with_scan_cache(|| {
+        check_sync(&fx.wc_str()).unwrap();
+        write(&fx, A, "a2\n");
+        tortoise_commit(&fx, A);
+        record_mixed(&fx.wc_str(), &cfg, &TempIndex::empty(&fx.wc_str()).unwrap())
+    })
+    .expect_err("陈旧的扫描结果不能录出基线");
+    assert!(
+        ["svn_rebuild_revision_moved", "svn_baseline_lying"].contains(&err.code.as_str()),
+        "应当被 R3c 或体检拦下，实际 {}: {}",
+        err.code,
+        err.message
+    );
+    assert_eq!(oid(&fx, "svn/base"), base);
+}
+
+#[test]
+fn follow_falls_back_to_an_empty_index_when_the_old_base_has_files_outside_the_whitelist() {
+    // 旧基线里有现在已不算 W 的文件（比如扩展名清单收窄过）：从旧基线起步时 `add -A`
+    // 会把这个已跟踪的文件留下，纳入集合核对不过。这时要退回空索引照旧录一次，
+    // 而不是让跟进失败
+    let fx = hybrid_with_colleague();
+    write(&fx, "Code/readme.txt", "r\n");
+    svn_cmd(
+        &fx.wc(),
+        &["add", "--non-interactive", "--", "Code/readme.txt"],
+    );
+    tortoise_commit(&fx, "Code/readme.txt");
+    svn_update(&fx, ".");
+    // 把 readme.txt 塞进基线树，work 跟着指过去
+    let base = oid(&fx, "svn/base");
+    let blob = git(&fx, &["hash-object", "-w", "Code/readme.txt"]);
+    let tmp = fx.wc().join(".git").join("probe-index");
+    let env = [("GIT_INDEX_FILE", tmp.to_str().unwrap())];
+    let wc = fx.wc_str();
+    run_git_env(&wc, &["read-tree", &base], &env).unwrap();
+    run_git_env(
+        &wc,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{blob},Code/readme.txt"),
+        ],
+        &env,
+    )
+    .unwrap();
+    let tree = run_git_env(&wc, &["write-tree"], &env).unwrap();
+    std::fs::remove_file(&tmp).unwrap();
+    let msg = git(&fx, &["log", "-1", "--format=%B", "svn/base"]);
+    let msg_file = fx.wc().join(".git").join("probe-msg");
+    std::fs::write(&msg_file, &msg).unwrap();
+    let wide = git(
+        &fx,
+        &[
+            "commit-tree",
+            tree.trim(),
+            "-p",
+            &base,
+            "-F",
+            msg_file.to_str().unwrap(),
+        ],
+    );
+    std::fs::remove_file(&msg_file).unwrap();
+    git(&fx, &["update-ref", "refs/heads/svn/base", &wide]);
+    git(&fx, &["update-ref", "refs/heads/work", &wide]);
+    git(&fx, &["read-tree", &wide]);
+    write(&fx, A, "a2\n");
+    tortoise_commit(&fx, A);
+
+    done(run(&fx));
+
+    assert_eq!(show(&fx, "svn/base:Code/A.cs"), "a2");
+    let files = git(&fx, &["ls-tree", "-r", "--name-only", "svn/base"]);
+    assert!(
+        !files.lines().any(|l| l == "Code/readme.txt"),
+        "退回空索引重录，不是 W 的文件不进新基线：{files}"
+    );
 }
