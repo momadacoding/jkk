@@ -431,7 +431,8 @@ git -C $WC merge-base --is-ancestor svn/base feature; $LASTEXITCODE
 svn status (Join-Path $WC 'Code')
 ```
 
-只列 `M ... Code\Mail\M1.cs`。A 没有显示成「已修改」：切分支没有把旧的 A 写回磁盘。
+列出 `M ... Code\Bag\B2.cs`、`M ... Code\Deep\D.cs`、`M ... Code\Mail\M1.cs` 三行——它们在场景 4、5 收尾时提交进了 git，但没提交到 SVN，对 SVN 来说本来就是已修改。
+**关键是没有 `Code\A.cs`**：A 没有显示成「已修改」，切分支没有把旧的 A 写回磁盘。
 
 **收尾（应用）：** 切回 `work`。
 
