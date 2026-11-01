@@ -4,7 +4,9 @@ import {
   changesPaths,
   changesSection,
   nextFileSelection,
+  rangeSelection,
   reconcileSelection,
+  selectAllFiles,
   type FileSelection,
 } from '../../src/engine/fileSelection'
 import type { FileChange } from '../../src/engine/types'
@@ -189,5 +191,47 @@ describe('changesPaths', () => {
     const ch = (path: string, status = 'modified'): FileChange => ({ path, status, additions: 0, deletions: 0 })
     expect(changesPaths({ unstaged: [ch('plain'), ch('c', 'conflicted')], staged: [ch('s')] }))
       .toEqual({ unstaged: ['c', 'plain'], staged: ['s'] })
+  })
+})
+
+describe('rangeSelection（按住拖动选一段）', () => {
+  it('从锚点往下拖：选中锚点到当前行，按显示顺序', () => {
+    expect(rangeSelection('unstaged', files, 'b.ts', 'd.ts'))
+      .toEqual({ section: 'unstaged', paths: ['b.ts', 'c.ts', 'd.ts'], anchor: 'b.ts' })
+  })
+
+  it('往上拖：顺序仍按列表，锚点不变，拖回来能缩小范围', () => {
+    expect(rangeSelection('unstaged', files, 'd.ts', 'b.ts'))
+      .toEqual({ section: 'unstaged', paths: ['b.ts', 'c.ts', 'd.ts'], anchor: 'd.ts' })
+    expect(rangeSelection('unstaged', files, 'd.ts', 'd.ts'))
+      .toEqual({ section: 'unstaged', paths: ['d.ts'], anchor: 'd.ts' })
+  })
+
+  it('锚点在拖动中途被刷新掉了：只选当前行，并以它为新锚点', () => {
+    expect(rangeSelection('staged', files, 'gone.ts', 'c.ts'))
+      .toEqual({ section: 'staged', paths: ['c.ts'], anchor: 'c.ts' })
+  })
+})
+
+describe('selectAllFiles（Ctrl+A）', () => {
+  it('选中该区全部文件，按显示顺序；锚点取第一个', () => {
+    expect(selectAllFiles(empty, 'unstaged', files))
+      .toEqual({ section: 'unstaged', paths: files, anchor: 'a.ts' })
+  })
+
+  it('同区已有锚点且还在列表里：保留它，之后 Shift+单击还从那里算', () => {
+    const cur: FileSelection = { section: 'unstaged', paths: ['c.ts'], anchor: 'c.ts' }
+    expect(selectAllFiles(cur, 'unstaged', files).anchor).toBe('c.ts')
+  })
+
+  it('选中原本在另一个区：整片换到本区，不沿用那边的锚点', () => {
+    const cur: FileSelection = { section: 'staged', paths: ['c.ts'], anchor: 'c.ts' }
+    expect(selectAllFiles(cur, 'unstaged', files))
+      .toEqual({ section: 'unstaged', paths: files, anchor: 'a.ts' })
+  })
+
+  it('本区没有文件：原样返回，不能把另一个区的选中清掉', () => {
+    const cur: FileSelection = { section: 'staged', paths: ['s.ts'], anchor: 's.ts' }
+    expect(selectAllFiles(cur, 'unstaged', [])).toBe(cur)
   })
 })
