@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useFocusTrap } from './useFocusTrap'
+import { Reveal } from './Reveal'
 import { toErrorMessage } from '../engine/errors'
 import { canDeliver } from '../engine/svnSyncOut'
 import { WarnGlyph } from './ConfirmDialog'
@@ -132,12 +133,12 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
           }}
         />
 
-        {error && <div className="dlg-warning">{error}</div>}
+        {error && <Reveal className="dlg-warning">{error}</Reveal>}
         {busy && (
-          <div className="dlg-progress">
+          <Reveal className="dlg-progress">
             <span className="dlg-spinner" />
             {m.busyLabel}
-          </div>
+          </Reveal>
         )}
 
         <div className="dialog-actions">

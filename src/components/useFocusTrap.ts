@@ -1,4 +1,4 @@
-import { useEffect, type RefObject } from 'react'
+import { useEffect, useRef, type RefObject } from 'react'
 import { nextFocusIndex } from '../engine/focusTrap'
 
 const FOCUSABLE = [
@@ -24,6 +24,10 @@ const open: RefObject<HTMLElement | null>[] = []
  * 焦点在框外时也收得到。
  */
 export function useFocusTrap(ref: RefObject<HTMLElement | null>) {
+  // 打开前的焦点在**首次渲染时**记下：effect 里再读就晚了，`autoFocus` 在提交阶段已经把它挪进框里
+  const before = useRef<Element | null | undefined>(undefined)
+  if (before.current === undefined) before.current = document.activeElement
+
   useEffect(() => {
     open.push(ref)
     const onKey = (e: KeyboardEvent) => {
@@ -40,6 +44,11 @@ export function useFocusTrap(ref: RefObject<HTMLElement | null>) {
     return () => {
       window.removeEventListener('keydown', onKey, true)
       open.splice(open.indexOf(ref), 1)
+      // 关框后把焦点还回去：不还的话落到 body，文件列表的 Del / Ctrl+A 就收不到了。
+      // 焦点已被别处接走（比如紧接着弹出的下一个框）时不抢
+      const prev = before.current
+      const lost = !document.activeElement || document.activeElement === document.body
+      if (lost && prev instanceof HTMLElement && prev.isConnected) prev.focus()
     }
   }, [ref])
 }

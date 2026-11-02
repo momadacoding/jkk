@@ -8,7 +8,8 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:layout": "tsc -p tsconfig.layout.json && playwright test"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
@@ -19,6 +20,7 @@
     "react-resizable-panels": "^4.12.2"
   },
   "devDependencies": {
+    "@playwright/test": "^1.64.1",
     "@tauri-apps/cli": "^2.0.0",
     "@testing-library/dom": "^10.4.2",
     "@testing-library/react": "^16.3.3",

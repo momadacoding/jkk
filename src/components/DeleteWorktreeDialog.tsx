@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useFocusTrap } from './useFocusTrap'
+import { Reveal } from './Reveal'
 import type { Worktree } from '../engine/types'
 import { toErrorCode, toErrorMessage } from '../engine/errors'
 
@@ -115,13 +116,13 @@ export function DeleteWorktreeDialog({ worktree, onCancel, onConfirm }: DeleteWo
           被 git 忽略、超过 50MB 的文件和目录（node_modules、构建产物等）不保留，捞回来后重新安装 / 构建即可。
         </div>
 
-        {error && <div className="dlg-warning">{error}</div>}
+        {error && <Reveal className="dlg-warning">{error}</Reveal>}
 
         {busy && (
-          <div className="dlg-progress">
+          <Reveal className="dlg-progress">
             <span className="dlg-spinner" />
             正在删除…
-          </div>
+          </Reveal>
         )}
 
         <div className="dialog-actions">

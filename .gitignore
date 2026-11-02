@@ -1,6 +1,7 @@
 .worktrees/
 .claude/worktrees/
 .playwright-mcp/
+test-results/
 node_modules/
 dist/
 src-tauri/target/

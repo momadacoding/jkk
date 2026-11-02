@@ -229,12 +229,15 @@ Commit message 格式：
 | Rust 测试（`src-tauri/tests/**`） | `cargo test` |
 | Tauri 命令签名 / `tauri.conf.json` / `capabilities/**` | 前后端两侧全跑，并实际启动 `pnpm tauri dev` 确认相关 invoke 真的通 |
 | UI / 样式 | 在真实窗口或 Vite dev server 现场验证，见 §6.1 |
+| 弹框及其样式（`.dialog*`、新增或改动 `src/components/*Dialog.tsx`、`SvnInitWizard`） | 额外跑 `pnpm test:layout`（有头 Edge，量按钮是否够得着）；测试代码 `tests/layout/**` 同样跑它 |
 | 文档 / AI 规范 | markdown 格式和链接合理性；无需跑完整代码测试，除非改动影响代码 |
 
 已知的覆盖盲区，必须如实说明、不得当作已验证：
 
 - MUST：本仓库**没有配置任何 lint 工具**（无 eslint / oxlint / prettier / biome）。禁止声称「lint 通过」。前端唯一的静态检查是 `pnpm build` 里的 `tsc`。
 - MUST：`tsconfig.json` 的 `include` 只有 `src`，**`tests/vitest/**` 不在 `tsc` 覆盖范围内**。测试文件的类型错误只会在 `pnpm test` 运行时暴露，不要用 `pnpm build` 通过来推断测试类型正确。
+- MUST：**新增弹框要在 `tests/layout/scenarios.ts` 与 `harness.tsx` 里加一个超长场景**，两处缺一处 `pnpm test` 的 `dialogGuards.test.ts` 都会失败。动态清单不进原生确认框（`askConfirm`）：它的布局不归我们管，布局测试也量不到。
+- MUST：`pnpm test:layout` 不在 `pnpm test` 里，也没有 CI，只在本地按上表手动跑；它量的是 Edge，不是 Tauri 真实窗口。`tests/layout/**` 的类型检查（`tsconfig.layout.json`）也只在这条命令里跑，`pnpm build` 不查它。
 
 交付时必须报告实际执行命令及结果。如果某项未配置或无法执行，必须说明原因。
 

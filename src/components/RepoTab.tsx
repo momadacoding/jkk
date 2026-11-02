@@ -53,7 +53,7 @@ import { MIGRATE_EOL_WARNING } from '../engine/svnSync'
 import { svnSyncBlockedReason } from '@/engine/svnJournal'
 import { samePath } from '../engine/path'
 import { isProtectedBaseline, visibleSections } from '../engine/capabilities'
-import { askConfirm } from '../engine/confirm'
+import { describeDiscard } from '../engine/discardConfirm'
 import { countConflicts, repoStateBanner } from '../engine/conflicts'
 import { usePrompt } from './PromptDialog'
 import { MergeDriverBanner } from './MergeDriverBanner'
@@ -408,19 +408,12 @@ export function RepoTab({
     const path = state.path
     if (!path || paths.length === 0) return
     // Unstaged 区里 status 为 added 的就是未跟踪文件
+    const picked = new Set(paths)
     const gone = staged
       ? []
-      : state.status.unstaged.filter((f) => paths.includes(f.path) && f.status === 'added').map((f) => f.path)
-    const recoverable = paths.filter((p) => !gone.includes(p))
-
-    const lines = ['丢弃以下改动？']
-    if (recoverable.length > 0) {
-      lines.push('', `恢复到${staged ? ' HEAD' : '暂存区的内容'}（${recoverable.length}）：`, ...recoverable.map((p) => `  ${p}`))
-    }
-    if (gone.length > 0) {
-      lines.push('', `永久删除，无法恢复（${gone.length}）：`, ...gone.map((p) => `  ${p}`))
-    }
-    if (!(await askConfirm(lines.join('\n'), 'Discard changes'))) return
+      : state.status.unstaged.filter((f) => picked.has(f.path) && f.status === 'added').map((f) => f.path)
+    // 走应用内确认框：原生框的布局不归我们管，几百个文件时布局测试也量不到它
+    if (!(await confirm(describeDiscard(paths, gone, staged)))) return
 
     try {
       await invoke('discard', { path, paths, staged })
@@ -428,7 +421,7 @@ export function RepoTab({
     } catch (err) {
       reportError(err)
     }
-  }, [state.path, state.status.unstaged, refreshChanges, reportError])
+  }, [state.path, state.status.unstaged, confirm, refreshChanges, reportError])
 
   /**
    * 删除分支，可选连远程和 worktree 一起删。确认在 `DeleteBranchDialog` 里做过了。
