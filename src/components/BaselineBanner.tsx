@@ -19,6 +19,7 @@ import type { FollowActionId } from '../engine/svnFollow'
 import type { SyncActionId } from '../engine/svnSyncIn'
 import type { SyncOutActionId } from '../engine/svnSyncOut'
 import type { BannerAction } from '../engine/svnSync'
+import { describeStaleHooks, type HookHealth } from '../engine/tsvnHooks'
 
 /** 交付那一组按钮的 id。`BannerAction.id` 是所有横幅共用的联合类型，在这里收窄。 */
 function isSyncOutAction(id: BannerAction['id']): id is SyncOutActionId {
@@ -61,6 +62,12 @@ interface BaselineBannerProps {
   onFollow?: () => void
   /** 跟进执行中。要走服务器体检，几秒里按钮要有反应，也不能再点一次。 */
   followBusy?: boolean
+  /** TortoiseSVN 钩子的健康状态（C1h）。`null` = 还没读到或不适用。 */
+  hooks?: HookHealth | null
+  /** 打开钩子注册框。没传时不渲染入口。 */
+  onOpenHooks?: () => void
+  /** 失效横幅上的「撤销注册」。调用方负责先弹确认。 */
+  onUnregisterHooks?: () => void
 }
 
 /**
@@ -108,6 +115,9 @@ export function BaselineBanner({
   onSvnUpdate,
   onFollow,
   followBusy = false,
+  hooks = null,
+  onOpenHooks,
+  onUnregisterHooks,
 }: BaselineBannerProps) {
   // 未收尾 / 同步进行中排在最前，其余一律让位：那两种状态下仓库停在中间态，
   // 别的横幅拿半推进的基线算出来的结论可能是错的，而它们的出口（重建基线）
@@ -118,11 +128,13 @@ export function BaselineBanner({
   const model = hushed || syncBannerIsSuppressed(eol, sync) ? null : describeSync(sync)
   const auditModel = hushed ? null : describeAudit(audit)
   const standalone = !hushed && needsStandaloneCheck(isSvn, sync, eol)
+  // 钩子失效不受 hushed 影响：它说的是 TortoiseSVN 那边会报错，与基线的中间态无关
+  const staleHooks = isSvn ? describeStaleHooks(hooks) : null
   const [copied, setCopied] = useState(false)
   // 「跟进」只在调用方接了流程时才出现（见 `onFollow` 的说明）
   const modelActions = (model?.actions ?? []).filter((a) => a.id !== 'follow' || onFollow)
 
-  if (!unfinished && !eolModel && !model && !auditModel && !standalone) return null
+  if (!unfinished && !eolModel && !model && !auditModel && !standalone && !staleHooks) return null
 
   return (
     <>
@@ -238,6 +250,19 @@ export function BaselineBanner({
           </p>
           <div className="banner-baseline-actions">
             <button onClick={onCheck}>体检基线</button>
+            {onOpenHooks && <button onClick={onOpenHooks}>TortoiseSVN 钩子…</button>}
+          </div>
+        </div>
+      )}
+      {staleHooks && (
+        <div className="banner-baseline warn">
+          <div className="banner-baseline-head">
+            <strong>{staleHooks.title}</strong>
+          </div>
+          <p className="banner-baseline-detail">{staleHooks.detail}</p>
+          <div className="banner-baseline-actions">
+            {onOpenHooks && <button onClick={onOpenHooks}>重新注册</button>}
+            {onUnregisterHooks && <button onClick={onUnregisterHooks}>撤销注册</button>}
           </div>
         </div>
       )}

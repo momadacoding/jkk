@@ -964,7 +964,7 @@ fn externally_advanced_serializes_camel_case() {
 fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     // 计划 Task 10。三层嵌套（Outcome → Report → Leak / ComposeReport），每一层都要是 camelCase；
     // 只测 Refused 的话，变体字段与结构体字段的 serde 属性写错都测不到
-    use app_lib::engine::svn_follow::{FollowOutcome, FollowReport};
+    use app_lib::engine::svn_follow::{Evidence, FollowOutcome, FollowReport};
     use app_lib::engine::svn_follow_index::{ComposeReport, StageDecision};
     use app_lib::engine::svn_leak::{HunkLeak, Leak, LeakVerdict};
     use app_lib::engine::svn_sync::ExternalChange;
@@ -1045,6 +1045,8 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
             moved_branches: vec!["feature".into()],
             behind_branches: vec![("old".into(), "冲突".into())],
             pinned_ref: Some("refs/mygitclient/follow/x".into()),
+            evidence: Evidence::Hooks,
+            evidence_cutoff_ms: Some(42),
             leaks: vec![Leak {
                 branch: "work".into(),
                 commit: "l".into(),
@@ -1077,6 +1079,17 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     assert_eq!(r["movedBranches"][0], "feature");
     assert_eq!(r["behindBranches"][0], serde_json::json!(["old", "冲突"]));
     assert_eq!(r["pinnedRef"], "refs/mygitclient/follow/x", "实际 {v}");
+    assert_eq!(r["evidence"], "hooks", "实际 {v}");
+    assert_eq!(r["evidenceCutoffMs"], 42, "实际 {v}");
+    // journal 里的旧报告没有这两个字段：读回来按作者 + 快照判定
+    let mut old = r.clone();
+    old.as_object_mut().unwrap().remove("evidence");
+    old.as_object_mut().unwrap().remove("evidenceCutoffMs");
+    let back: FollowReport = serde_json::from_value(old).unwrap();
+    assert_eq!(
+        (back.evidence, back.evidence_cutoff_ms),
+        (Evidence::Heuristic, None)
+    );
 
     let s = &r["stage"];
     assert_eq!(s["decisions"]["Code/A.cs"], "takeNew", "实际 {v}");

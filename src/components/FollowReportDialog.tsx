@@ -136,6 +136,7 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
         </div>
 
         {m.warning && <div className="dlg-warning">{m.warning}</div>}
+        <div className="dlg-note">{m.basis}</div>
 
         {m.sections.length > 0 && (
           <div className="deliver-files follow-report">

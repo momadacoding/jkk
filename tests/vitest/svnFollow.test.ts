@@ -27,7 +27,18 @@ const report: FollowReport = {
   behindBranches: [],
   leaks: [],
   pinnedRef: null,
+  evidence: 'heuristic',
+  evidenceCutoffMs: null,
 }
+
+describe('describeFollowReport 的判定依据（C1h）', () => {
+  it('写明按什么判定的暂存与 commit', () => {
+    expect(describeFollowReport(report).basis).toBe('判定依据：作者 + 失焦快照')
+    expect(describeFollowReport({ ...report, evidence: 'hooks', evidenceCutoffMs: 1 }).basis).toBe(
+      '判定依据：TortoiseSVN 钩子事件',
+    )
+  })
+})
 
 const leak: Leak = {
   branch: 'work',

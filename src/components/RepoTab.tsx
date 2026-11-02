@@ -20,7 +20,13 @@ import {
   svnGetUser,
   svnMigrateEol,
   svnSetUser,
+  tsvnHooksRegister,
+  tsvnHooksStatus,
+  tsvnHooksUnregister,
 } from '../store/repoStore'
+import TsvnHooksDialog from './TsvnHooksDialog'
+import { toErrorMessage } from '../engine/errors'
+import type { HookHealth, TsvnHooksStatus } from '../engine/tsvnHooks'
 import { createSvnSyncFlow } from './svnSyncFlow'
 import { createSvnSyncOutFlow } from './svnSyncOutFlow'
 import { useDeliverDialog } from './DeliverDialog'
@@ -185,6 +191,11 @@ export function RepoTab({
   const { showFollowReport, dialog: followReportDialog } = useFollowReportDialog()
   // 跟进执行中（svnSyncFlow 写），横幅上的按钮据此禁用
   const [following, setFollowing] = useState(false)
+  // TortoiseSVN 钩子（C1h）：健康状态给横幅；注册框开着时是读到的状态
+  const [hooksHealth, setHooksHealth] = useState<HookHealth | null>(null)
+  const [hooksDialog, setHooksDialog] = useState<TsvnHooksStatus | null>(null)
+  const [hooksBusy, setHooksBusy] = useState(false)
+  const [hooksError, setHooksError] = useState<string | null>(null)
   // 「更新」或「交付」流程是否在走（svnSyncFlow / svnSyncOutFlow 共用一个：两个确认框会
   // 互相顶替，PR #49 Codex review #5）。hook 必须排在下面 loading 的提前 return 之前
   const syncFlowRunning = useRef(false)
@@ -632,6 +643,71 @@ export function RepoTab({
     if (problem) reportError(`${exit.file}：${problem}`)
   })
 
+  // TortoiseSVN 钩子（C1h）：打开 SVN 仓库时读一次健康状态，失效时横幅提示；每次跟进之后再读
+  // 一次（后端跟进前查过，界面要跟上）。不放在焦点事件里：这个命令要跑 `svn info`。
+  // 读失败只写 console：这只是附加的精确模式，不该占住顶部的错误横幅
+  const isSvnRepo = state.capabilities.vcs === 'svn'
+  const refreshHooksHealth = () =>
+    tsvnHooksStatus(repoPath)
+      .then((s) => setHooksHealth(s.supported ? s.health : null))
+      .catch((err) => console.warn('读不出 TortoiseSVN 钩子状态：', err))
+  useEffect(() => {
+    if (!isSvnRepo || !state.path) return
+    const path = state.path
+    let live = true
+    tsvnHooksStatus(path)
+      .then((s) => {
+        if (live) setHooksHealth(s.supported ? s.health : null)
+      })
+      .catch((err) => console.warn('读不出 TortoiseSVN 钩子状态：', err))
+    return () => {
+      live = false
+    }
+  }, [isSvnRepo, state.path])
+
+  const openHooks = async () => {
+    try {
+      setHooksError(null)
+      setHooksDialog(await tsvnHooksStatus(repoPath))
+    } catch (err) {
+      reportError(err)
+    }
+  }
+  const registerHooks = async (blockLeaks: boolean) => {
+    setHooksBusy(true)
+    setHooksError(null)
+    try {
+      setHooksHealth(await tsvnHooksRegister(repoPath, blockLeaks))
+      setHooksDialog(null)
+    } catch (err) {
+      // 框开着：顶部红条被遮罩盖住，错误要显示在框内
+      setHooksError(toErrorMessage(err))
+    } finally {
+      setHooksBusy(false)
+    }
+  }
+  const unregisterHooks = async () => {
+    const ok = await confirm({
+      title: '撤销 TortoiseSVN 钩子',
+      message: '从 TortoiseSVN 的设置里删掉 jkk 为这个仓库挂的钩子。你自己或公司的钩子不受影响。',
+      confirmLabel: '撤销',
+    })
+    if (!ok) return
+    setHooksBusy(true)
+    setHooksError(null)
+    try {
+      await tsvnHooksUnregister(repoPath)
+      setHooksHealth({ state: 'notRegistered' })
+      setHooksDialog(null)
+    } catch (err) {
+      // 从失效横幅发起时框没开，错误走顶部红条
+      if (hooksDialog) setHooksError(toErrorMessage(err))
+      else reportError(err)
+    } finally {
+      setHooksBusy(false)
+    }
+  }
+
   if (state.loading && state.commits.length === 0) return <div style={{ padding: 16 }}>Loading...</div>
 
   // 「有 `.svn` 无 `.git`」不是错误，是一个还没走的流程（spec §6.1）。
@@ -712,6 +788,7 @@ export function RepoTab({
       await refreshGraph(repoPath)
       await refreshStatus(repoPath)
       await refreshSvnBranchesBehind(repoPath)
+      void refreshHooksHealth()
     },
     showFollowReport: (report) =>
       showFollowReport({
@@ -842,7 +919,20 @@ export function RepoTab({
         onSvnUpdate={() => void handleSvnUpdate()}
         onFollow={() => void handleFollow()}
         followBusy={following}
+        hooks={hooksHealth}
+        onOpenHooks={() => void openHooks()}
+        onUnregisterHooks={() => void unregisterHooks()}
       />
+      {hooksDialog && (
+        <TsvnHooksDialog
+          status={hooksDialog}
+          busy={hooksBusy}
+          error={hooksError}
+          onRegister={(blockLeaks) => void registerHooks(blockLeaks)}
+          onUnregister={() => void unregisterHooks()}
+          onClose={() => setHooksDialog(null)}
+        />
+      )}
       <MergeDriverBanner report={state.mergeDrivers} />
       {state.error && (
         <div className="banner-error">

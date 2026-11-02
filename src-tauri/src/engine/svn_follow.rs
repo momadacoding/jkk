@@ -88,12 +88,15 @@ use crate::engine::svn_sync_in::{
 };
 use crate::engine::svn_sync_stash::stash_wip;
 use crate::engine::svn_wc::enumerate_wcs;
+use crate::engine::tsvn_hooks::{quick_health, HookHealth};
+use crate::engine::tsvn_inbox::{prune_inbox, read_evidence, CommitEvidence, HookEvidence};
 use crate::error::{GitError, Result};
 use crate::vcs::{detect_repo_kind, RepoKind};
 use git2::{BranchType, Repository};
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 重放给跟进的错误码。`too_old` 是兜底：预检已经挡在 F1 之前。
 const FOLLOW_CODES: ReplayCodes = ReplayCodes {
@@ -176,6 +179,24 @@ pub struct FollowReport {
     /// 钉着换入之前的原始索引与暂存 blob 的 ref。没拼过索引时（只发布了基线）是 `None`。
     #[serde(default)]
     pub pinned_ref: Option<String>,
+    /// 判定依据（C1h）：钩子健康时按本机事件，否则按作者 + 失焦快照。
+    #[serde(default)]
+    pub evidence: Evidence,
+    /// 读收件箱的时刻（unix 毫秒）。跟进完成后，早于它的事件都已反映在新基线里，可以清掉。
+    /// 不按钩子判定时为 `None`，收件箱不动。
+    #[serde(default)]
+    pub evidence_cutoff_ms: Option<i64>,
+}
+
+/// 跟进判定「暂存是不是中间版本」的依据（C1h；分析 §6.13.3）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Evidence {
+    /// TortoiseSVN 钩子写的本机事件。
+    Hooks,
+    /// 作者 + 失焦快照（C1a）。钩子没注册或失效时用它。
+    #[default]
+    Heuristic,
 }
 
 /// 外部 git 的版本够不够。解析不了按不够：宁可让用户看一眼版本，也不要发布到一半才失败。
@@ -422,10 +443,27 @@ struct Who {
     authors: BTreeMap<String, Option<String>>,
     /// 快照之后才进基线的路径（见 [`paths_after_mark`]）。`None`：分不清快照与外部提交的先后。
     after_mark: Option<BTreeSet<String>>,
+    /// TortoiseSVN 钩子的本机事件（C1h；分析 §6.13.3）。只有钩子健康时才是 `Some`，这时按
+    /// 事件判定，不再按作者猜。
+    events: Option<HookEvidence>,
+    /// 读收件箱的时刻，见 [`FollowReport::evidence_cutoff_ms`]。
+    events_read_at_ms: Option<i64>,
 }
 
 impl Who {
     fn gather(repo: &str, repos_root: &str, nodes: &[NodeStatus]) -> Result<Self> {
+        let health = fault::pretended_hook_health().unwrap_or_else(|| quick_health(repo));
+        // 先记时刻再读。钩子的 `at_ms` 取在写文件之前，所以一条事件可能时刻早于截点却没被这次
+        // 读到，随后被当成已处理清掉：只是少了一条证据，落到「拿不准」（Review 2 Minor 第 1 条）
+        let (events, events_read_at_ms) = match health {
+            HookHealth::Healthy { .. } => {
+                let at = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as i64);
+                (Some(read_evidence(repo)), Some(at))
+            }
+            _ => (None, None),
+        };
         Ok(Self {
             me: my_svn_user(repo, repos_root),
             mark: read_mark(repo)?,
@@ -434,7 +472,75 @@ impl Who {
                 .map(|n| (n.path.clone(), n.author.clone()))
                 .collect(),
             after_mark: None,
+            events,
+            events_read_at_ms,
         })
+    }
+
+    /// 本机提交事件里、提交开始时刻晚于失焦快照的路径（分析 §6.13.3 表第 1、3 行的前提）。
+    /// 快照或 t_commit 有一个不知道，都不算：拿不准。
+    fn committed_after_mark(&self, c: &CommitEvidence) -> bool {
+        let mark_ms = self.mark.as_ref().and_then(|m| m.at_ms);
+        matches!((mark_ms, c.t_commit_ms), (Some(m), Some(t)) if m < t)
+    }
+
+    /// 按钩子事件翻成 [`PathFacts`]（计划 Task 5 的表）。同一路径既有提交又有更新时取
+    /// revision 高的那条，相同时按提交：同一个 revision 里有我的提交，这个文件就是我交的。
+    fn facts_from_events(
+        &self,
+        ev: &HookEvidence,
+        path: &str,
+        staged: Option<&BTreeMap<String, String>>,
+    ) -> PathFacts {
+        let commit = ev
+            .commits
+            .iter()
+            .filter(|c| c.paths.contains(path))
+            .max_by_key(|c| c.revision);
+        let update = ev
+            .updates
+            .iter()
+            .filter(|u| u.paths.contains(path))
+            .max_by_key(|u| u.revision);
+        let uncertain = PathFacts {
+            author_is_me: Some(true),
+            staged_before_mark: Some(false),
+        };
+        match (commit, update) {
+            (Some(c), u) if u.map_or(true, |u| u.revision <= c.revision) => {
+                if !self.committed_after_mark(c) {
+                    return uncertain;
+                }
+                PathFacts {
+                    author_is_me: Some(true),
+                    staged_before_mark: self.staged_in_mark(path, staged),
+                }
+            }
+            (_, Some(_)) => PathFacts {
+                author_is_me: Some(false),
+                staged_before_mark: None,
+            },
+            // 钩子健康却没有事件：另一台机器、命令行 svn、IDE 插件。作者是我也不按作者丢弃（R22）
+            _ => match self.is_me(path) {
+                Some(true) => uncertain,
+                other => PathFacts {
+                    author_is_me: other,
+                    staged_before_mark: None,
+                },
+            },
+        }
+    }
+
+    /// 当前暂存是否与快照里的一样。快照把暂存的删除记成全 0；索引里没有这条路径就是暂存了删除。
+    fn staged_in_mark(
+        &self,
+        path: &str,
+        staged: Option<&BTreeMap<String, String>>,
+    ) -> Option<bool> {
+        let m = self.mark.as_ref()?;
+        let zero = "0".repeat(m.head_oid.len());
+        let now = staged?.get(path).unwrap_or(&zero);
+        Some(m.staged.get(path) == Some(now))
     }
 
     /// 匿名提交不可能是我：`Some(false)`。用户名取不到、节点不在：`None`（D4）。
@@ -446,16 +552,18 @@ impl Who {
 
     /// 拼索引要的事实。`staged` 是当前索引的暂存 blob，只在持索引锁时读一次（见 [`staged_blobs`]）。
     fn facts(&self, path: &str, staged: Option<&BTreeMap<String, String>>) -> PathFacts {
+        if let Some(ev) = &self.events {
+            return self.facts_from_events(ev, path, staged);
+        }
         let after_mark = self.after_mark.as_ref().is_some_and(|s| s.contains(path));
         PathFacts {
             author_is_me: self.is_me(path),
             // 这条路径的 SVN 提交早于快照时，快照里的暂存可能是提交之后的新内容，推不出先后
-            staged_before_mark: self.mark.as_ref().filter(|_| after_mark).and_then(|m| {
-                // 快照把暂存的删除记成全 0；索引里没有这条路径就是暂存了删除
-                let zero = "0".repeat(m.head_oid.len());
-                let now = staged?.get(path).unwrap_or(&zero);
-                Some(m.staged.get(path) == Some(now))
-            }),
+            staged_before_mark: if after_mark {
+                self.staged_in_mark(path, staged)
+            } else {
+                None
+            },
         }
     }
 }
@@ -761,8 +869,18 @@ fn prepare(repo: &str) -> Result<Plan> {
     who.after_mark = paths_after_mark(repo, who.mark.as_ref(), &new_base);
     let before_mark = commits_before_mark(repo, &who, &new_base);
     // F2 ①：早于失焦快照的 commit 里，被我在快照之后用 TortoiseSVN 提交过的路径取 SVN 版本
+    // 有钩子事件时，「我在快照之后提交的」直接取本机提交事件，不按作者猜（分析 §6.13.3 表第 3 行）
+    let mine: BTreeSet<String> = match &who.events {
+        Some(ev) => ev
+            .commits
+            .iter()
+            .filter(|c| who.committed_after_mark(c))
+            .flat_map(|c| c.paths.iter().cloned())
+            .collect(),
+        None => ext.mine(&who),
+    };
     let replaceable: BTreeSet<String> = match &who.after_mark {
-        Some(after) => ext.mine(&who).intersection(after).cloned().collect(),
+        Some(after) => mine.intersection(after).cloned().collect(),
         None => BTreeSet::new(),
     };
     let superseded = |c: &ReplayCommit| -> BTreeSet<String> {
@@ -781,6 +899,12 @@ fn prepare(repo: &str) -> Result<Plan> {
         verified,
         changes,
         removed,
+        evidence: if who.events.is_some() {
+            Evidence::Hooks
+        } else {
+            Evidence::Heuristic
+        },
+        evidence_cutoff_ms: who.events_read_at_ms,
         ..Default::default()
     };
 
@@ -1708,6 +1832,13 @@ fn finish(repo: &str, j: &mut Journal) -> Result<FollowOutcome> {
         fault::reach(fault::Point::OtherMoved, None);
     }
     clear_mark(repo);
+    // 跟进完成：读收件箱之前到的事件都已反映在新基线里（C1h）。之后才到的留给下一次
+    if let Some(cutoff) = report.evidence_cutoff_ms {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as i64);
+        prune_inbox(repo, &|e| e.at_ms <= cutoff, now);
+    }
     trim_pins(repo, &j.opid);
     fault::reach(fault::Point::BeforeFinish, None);
     svn_journal::remove(repo)?;
@@ -1927,6 +2058,7 @@ fn settle_branch_and_index(repo: &str, j: &mut Journal) -> Result<Resumed> {
 #[doc(hidden)]
 pub mod fault {
     use crate::engine::svn_follow_index::PreparedIndex;
+    use crate::engine::tsvn_hooks::HookHealth;
     use std::cell::{Cell, RefCell};
 
     /// 发布途中可注入的位置，按执行顺序。
@@ -1970,6 +2102,17 @@ pub mod fault {
         static CRASH: Cell<Option<Point>> = const { Cell::new(None) };
         static CALL: RefCell<Option<Hook>> = const { RefCell::new(None) };
         static GIT_VERSION: RefCell<Option<String>> = const { RefCell::new(None) };
+        static HOOK_HEALTH: RefCell<Option<HookHealth>> = const { RefCell::new(None) };
+    }
+
+    /// 本线程上跟进读到的钩子健康状态换成 `h`：测试不读写注册表。
+    pub fn pretend_hook_health(h: HookHealth) -> Armed {
+        HOOK_HEALTH.with(|g| *g.borrow_mut() = Some(h));
+        Armed(())
+    }
+
+    pub(crate) fn pretended_hook_health() -> Option<HookHealth> {
+        HOOK_HEALTH.with(|g| g.borrow().clone())
     }
 
     /// 守卫一 drop，本线程上全部注入都撤销。
@@ -1999,6 +2142,7 @@ pub mod fault {
             CRASH.with(|c| c.set(None));
             CALL.with(|c| *c.borrow_mut() = None);
             GIT_VERSION.with(|g| *g.borrow_mut() = None);
+            HOOK_HEALTH.with(|g| *g.borrow_mut() = None);
         }
     }
 
