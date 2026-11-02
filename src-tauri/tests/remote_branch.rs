@@ -380,3 +380,331 @@ fn an_ordinary_branch_is_deletable_after_a_prefetch() {
 
     assert!(git_out(work.path(), &["ls-remote", "--heads", "origin", "feat/x"]).is_empty());
 }
+
+/// 再建一个 bare 仓库，默认分支是 `default`，分支 `default` 和 `feat/x` 都指向 work 的 HEAD。
+fn bare_repo_with_default(work: &TempDir, default: &str) -> TempDir {
+    let bare = TempDir::new().unwrap();
+    run_git(bare.path(), &["init", "--bare"]);
+    run_git(
+        work.path(),
+        &[
+            "push",
+            "-q",
+            bare.path().to_str().unwrap(),
+            &format!("HEAD:refs/heads/{default}"),
+            "HEAD:refs/heads/feat/x",
+        ],
+    );
+    run_git(
+        bare.path(),
+        &["symbolic-ref", "HEAD", &format!("refs/heads/{default}")],
+    );
+    bare
+}
+
+fn add_push_url(work: &TempDir, url: &str) {
+    run_git(
+        work.path(),
+        &["remote", "set-url", "--add", "--push", "origin", url],
+    );
+}
+
+fn has_branch(bare: &TempDir, name: &str) -> bool {
+    !git_out(bare.path(), &["branch", "--list", name]).is_empty()
+}
+
+fn delete_on_origin(work: &TempDir, branch: &str) -> app_lib::error::Result<()> {
+    ops::delete_remote_branch(p(work), "origin".into(), branch.into())
+}
+
+/// push 走 pushurl 时，护栏要看 **push 到达的那个仓库**。
+///
+/// fetch 侧的默认分支不叫 trunk，只问 fetch URL 的话护栏放行，push 目标的默认分支就没了。
+#[test]
+fn refuses_to_delete_the_default_branch_of_the_push_target() {
+    let (_fetch_side, work) = repo_with_added_remote();
+    let push_side = bare_repo_with_default(&work, "trunk");
+    add_push_url(&work, &p(&push_side));
+
+    let err = delete_on_origin(&work, "trunk").unwrap_err();
+
+    assert_eq!(err.code, "protected_branch", "{}", err.message);
+    assert!(has_branch(&push_side, "trunk"), "push 目标的默认分支被删了");
+}
+
+/// 反过来：fetch 侧的默认分支在 push 目标上只是普通分支，删的又是 push 目标，不该拦。
+#[test]
+fn the_fetch_sides_default_is_deletable_on_a_push_target_that_does_not_use_it() {
+    let (fetch_side, work) = repo_with_added_remote();
+    let fetch_default = default_branch_of(&fetch_side);
+    let push_side = bare_repo_with_default(&work, "trunk");
+    run_git(
+        work.path(),
+        &[
+            "push",
+            "-q",
+            &p(&push_side),
+            &format!("HEAD:refs/heads/{fetch_default}"),
+        ],
+    );
+    add_push_url(&work, &p(&push_side));
+
+    delete_on_origin(&work, &fetch_default).unwrap();
+
+    assert!(!has_branch(&push_side, &fetch_default));
+    assert!(has_branch(&fetch_side, &fetch_default), "删到 fetch 侧去了");
+}
+
+/// 配了多个 pushurl 时 `git push` 会推到**每一个**，所以任何一个的默认分支都不能删。
+#[test]
+fn refuses_when_any_push_url_has_the_branch_as_default() {
+    let (_fetch_side, work) = repo_with_added_remote();
+    let first = bare_repo_with_default(&work, "develop");
+    let second = bare_repo_with_default(&work, "trunk");
+    run_git(
+        work.path(),
+        &["push", "-q", &p(&first), "HEAD:refs/heads/trunk"],
+    );
+    add_push_url(&work, &p(&first));
+    add_push_url(&work, &p(&second));
+
+    let err = delete_on_origin(&work, "trunk").unwrap_err();
+
+    assert_eq!(err.code, "protected_branch", "{}", err.message);
+    assert!(has_branch(&first, "trunk"), "第一个 pushurl 上的分支被删了");
+    assert!(
+        has_branch(&second, "trunk"),
+        "第二个 pushurl 的默认分支被删了"
+    );
+}
+
+/// `url.<base>.pushInsteadOf` 只改写 push 地址，配置里看不到 pushurl，护栏同样要跟过去。
+#[test]
+fn push_instead_of_is_followed_to_the_real_push_target() {
+    let (fetch_side, work) = repo_with_added_remote();
+    let push_side = bare_repo_with_default(&work, "trunk");
+    run_git(
+        work.path(),
+        &[
+            "config",
+            &format!("url.{}.pushInsteadOf", p(&push_side)),
+            &p(&fetch_side),
+        ],
+    );
+
+    let err = delete_on_origin(&work, "trunk").unwrap_err();
+
+    assert_eq!(err.code, "protected_branch", "{}", err.message);
+    assert!(has_branch(&push_side, "trunk"));
+}
+
+/// 没配 pushurl 的远程要**按名字**问：`remote.<name>.proxy` 这类配置只认名字，push 按
+/// 名字走得通，问 URL 却可能失败，护栏就无依据放行了。
+///
+/// 用 `uploadpack` 配一个不存在的命令来区分两种问法：它只影响按名字的查询。按 URL 问会
+/// 成功并报 `protected_branch`；按名字问才会失败，放行后由 bare 仓库拒绝，报 `git_cli`。
+#[test]
+fn a_remote_without_a_pushurl_is_still_asked_by_name() {
+    let (remote, work) = repo_with_added_remote();
+    let default_branch = default_branch_of(&remote);
+    run_git(
+        work.path(),
+        &["config", "remote.origin.uploadpack", "no-such-upload-pack"],
+    );
+
+    let err = delete_on_origin(&work, &default_branch).unwrap_err();
+
+    assert_eq!(err.code, "git_cli", "{}", err.message);
+}
+
+/// 同一个 URL 配成 pushurl，和没配 pushurl 时的 push 目标相同，同样按名字问。
+#[test]
+fn a_push_url_equal_to_the_fetch_url_is_still_asked_by_name() {
+    let (remote, work) = repo_with_added_remote();
+    let default_branch = default_branch_of(&remote);
+    add_push_url(&work, &p(&remote));
+    run_git(
+        work.path(),
+        &["config", "remote.origin.uploadpack", "no-such-upload-pack"],
+    );
+
+    let err = delete_on_origin(&work, &default_branch).unwrap_err();
+
+    assert_eq!(err.code, "git_cli", "{}", err.message);
+}
+
+/// 配了多个 fetch URL、没配 pushurl 时 push 同样到达每一个，而按名字只问得到第一个。
+#[test]
+fn every_url_is_asked_when_a_remote_has_several() {
+    let (_first, work) = repo_with_added_remote();
+    let second = bare_repo_with_default(&work, "trunk");
+    run_git(
+        work.path(),
+        &["remote", "set-url", "--add", "origin", &p(&second)],
+    );
+
+    let err = delete_on_origin(&work, "trunk").unwrap_err();
+
+    assert_eq!(err.code, "protected_branch", "{}", err.message);
+    assert!(has_branch(&second, "trunk"));
+}
+
+/// 预取问的也必须是 push 目标：问成 fetch 侧的话，这次握手白做，护栏还要再连一次。
+///
+/// 手法同 `the_guard_uses_the_prefetch_instead_of_asking_the_remote_again`。
+#[test]
+fn the_prefetch_covers_the_push_target() {
+    let (_fetch_side, work) = repo_with_added_remote();
+    let push_side = bare_repo_with_default(&work, "trunk");
+    add_push_url(&work, &p(&push_side));
+
+    branch::prefetch_remote_default(&p(&work), "origin");
+
+    let result = with_remote_moved_away(&push_side, || delete_on_origin(&work, "trunk"));
+    let err = result.unwrap_err();
+    assert_eq!(err.code, "protected_branch", "{}", err.message);
+}
+
+/// 多个 push 目标都要预取到：只预取第一个的话，后面的还得当场握手。
+#[test]
+fn the_prefetch_covers_every_push_target() {
+    let (_fetch_side, work) = repo_with_added_remote();
+    let first = bare_repo_with_default(&work, "develop");
+    let second = bare_repo_with_default(&work, "trunk");
+    run_git(
+        work.path(),
+        &["push", "-q", &p(&first), "HEAD:refs/heads/trunk"],
+    );
+    add_push_url(&work, &p(&first));
+    add_push_url(&work, &p(&second));
+
+    branch::prefetch_remote_default(&p(&work), "origin");
+
+    let result = with_remote_moved_away(&second, || delete_on_origin(&work, "trunk"));
+    let err = result.unwrap_err();
+    assert_eq!(err.code, "protected_branch", "{}", err.message);
+}
+
+/// 空的、不存在的、长得像选项的远程名：预检问不到就放行，不崩，也不删东西。
+#[test]
+fn the_preflight_survives_empty_unknown_and_option_like_remote_names() {
+    let (remote, work) = repo_with_added_remote();
+    let default_branch = default_branch_of(&remote);
+
+    for name in ["", "no-such-remote", "--upload-pack=no-such-upload-pack"] {
+        ops::check_remote_deletable(p(&work), name.into(), default_branch.clone()).unwrap();
+    }
+
+    assert!(has_branch(&remote, &default_branch));
+}
+
+/// 预取之后改了 pushurl，旧结果不能拿来给新的 push 目标把关。
+///
+/// 旧目标的默认分支是 develop，trunk 在它上面只是普通分支；新目标的默认分支才是 trunk。
+#[test]
+fn changing_the_push_url_does_not_reuse_a_stale_prefetch() {
+    let (_fetch_side, work) = repo_with_added_remote();
+    let old_target = bare_repo_with_default(&work, "develop");
+    let new_target = bare_repo_with_default(&work, "trunk");
+    add_push_url(&work, &p(&old_target));
+
+    branch::prefetch_remote_default(&p(&work), "origin");
+    run_git(
+        work.path(),
+        &["remote", "set-url", "--push", "origin", &p(&new_target)],
+    );
+
+    let err = delete_on_origin(&work, "trunk").unwrap_err();
+
+    assert_eq!(err.code, "protected_branch", "{}", err.message);
+    assert!(has_branch(&new_target, "trunk"));
+}
+
+/// 删 worktree 之前的预检：默认分支要在这里就被拒，而且什么都没动。
+///
+/// 用 `git remote add` 接上的远程：弹框的 `remoteProtected` 只看本地 ref，这种远程上恒为
+/// false，勾选框不会灰掉，所以这道预检是防止「worktree 删了、远程却被护栏拒绝」的唯一一关。
+#[test]
+fn the_preflight_refuses_the_default_branch_of_a_remote_added_by_hand() {
+    let (remote, work) = repo_with_added_remote();
+    let default_branch = default_branch_of(&remote);
+
+    let err =
+        ops::check_remote_deletable(p(&work), "origin".into(), default_branch.clone()).unwrap_err();
+
+    assert_eq!(err.code, "protected_branch", "{}", err.message);
+    assert!(has_branch(&remote, &default_branch));
+}
+
+/// 预检只读：普通分支放行，且不能真的删掉它。
+#[test]
+fn the_preflight_passes_an_ordinary_branch_without_deleting_it() {
+    let (_remote, work) = cloned_repo();
+
+    ops::check_remote_deletable(p(&work), "origin".into(), "feat/x".into()).unwrap();
+
+    assert!(!git_out(work.path(), &["ls-remote", "--heads", "origin", "feat/x"]).is_empty());
+}
+
+/// 预检不能吃掉预取：吃掉的话紧接着的删除要再握一次手，提速就白做了。
+#[test]
+fn the_preflight_leaves_the_prefetch_for_the_delete() {
+    let (remote, work) = repo_with_added_remote();
+    let default_branch = default_branch_of(&remote);
+
+    branch::prefetch_remote_default(&p(&work), "origin");
+    let first = ops::check_remote_deletable(p(&work), "origin".into(), default_branch.clone());
+    assert_eq!(first.unwrap_err().code, "protected_branch");
+
+    let result = with_remote_moved_away(&remote, || delete_on_origin(&work, &default_branch));
+    let err = result.unwrap_err();
+    assert_eq!(err.code, "protected_branch", "{}", err.message);
+}
+
+/// 预检自己查到的答案也要留给删除：没赶上预取时不该为此多连一次网。
+#[test]
+fn the_delete_reuses_the_answer_the_preflight_queried_itself() {
+    let (remote, work) = repo_with_added_remote();
+    let default_branch = default_branch_of(&remote);
+
+    let first = ops::check_remote_deletable(p(&work), "origin".into(), default_branch.clone());
+    assert_eq!(first.unwrap_err().code, "protected_branch");
+
+    let result = with_remote_moved_away(&remote, || delete_on_origin(&work, &default_branch));
+    let err = result.unwrap_err();
+    assert_eq!(err.code, "protected_branch", "{}", err.message);
+}
+
+/// 预检留下的答案仍然只服务一次删除：真正的删除取走之后，下一次必须重新问。
+///
+/// 第二次把远程挪走，本地又没有 `origin/HEAD`：还留着答案的话会报 `protected_branch`，
+/// 答案确实没了才会走到 push，由 push 报连不上。
+#[test]
+fn the_preflight_does_not_turn_the_answer_into_a_lasting_cache() {
+    let (remote, work) = repo_with_added_remote();
+    let default_branch = default_branch_of(&remote);
+
+    branch::prefetch_remote_default(&p(&work), "origin");
+    let _ = ops::check_remote_deletable(p(&work), "origin".into(), default_branch.clone());
+    let consumed = delete_on_origin(&work, &default_branch);
+    assert_eq!(consumed.unwrap_err().code, "protected_branch");
+
+    let result = with_remote_moved_away(&remote, || delete_on_origin(&work, &default_branch));
+    let err = result.unwrap_err();
+    assert_eq!(err.code, "git_cli", "{}", err.message);
+}
+
+/// 预检问不到远程时放行（与护栏的口径一致），失败也不能留下来。
+#[test]
+fn an_unreachable_preflight_does_not_block_or_disarm_the_guard() {
+    let (remote, work) = repo_with_added_remote();
+    let default_branch = default_branch_of(&remote);
+
+    let offline = with_remote_moved_away(&remote, || {
+        ops::check_remote_deletable(p(&work), "origin".into(), default_branch.clone())
+    });
+    offline.unwrap();
+
+    let err = delete_on_origin(&work, &default_branch).unwrap_err();
+    assert_eq!(err.code, "protected_branch", "{}", err.message);
+}

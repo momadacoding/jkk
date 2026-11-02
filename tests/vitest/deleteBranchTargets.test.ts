@@ -1,6 +1,144 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { ALL_CAPABILITIES, NO_GIT_ONLY_CAPABILITIES } from '@/engine/capabilities'
-import { deleteBranchTargets, type DeleteBranchInfo } from '@/engine/deleteBranchTargets'
+import {
+  deleteBranchTargets,
+  runBranchDeletion,
+  withoutCompletedSteps,
+  type DeleteBranchInfo,
+} from '@/engine/deleteBranchTargets'
+
+const remoteTarget = { remote: 'origin', branch: 'feat/x' }
+
+/** 记下实际发生的步骤；`fail` 里的步骤抛错，模拟那一步被拒。 */
+function recordSteps(fail?: string) {
+  const calls: string[] = []
+  const step = (label: string) => vi.fn(async () => {
+    calls.push(label)
+    if (label === fail) throw new Error(`${label} 被拒`)
+  })
+  return {
+    calls,
+    steps: {
+      checkRemote: step('checkRemote'),
+      deleteWorktree: step('deleteWorktree'),
+      deleteRemote: step('deleteRemote'),
+      deleteLocal: step('deleteLocal'),
+    },
+  }
+}
+
+describe('runBranchDeletion', () => {
+  it('worktree 和远程都要删时，先预检远程，再按 worktree → 远程 → 本地走', async () => {
+    const { calls, steps } = recordSteps()
+    await runBranchDeletion({ remote: remoteTarget, worktreePath: 'C:/wt/x' }, vi.fn(), steps)
+    expect(calls).toEqual(['checkRemote', 'deleteWorktree', 'deleteRemote', 'deleteLocal'])
+    expect(steps.checkRemote).toHaveBeenCalledWith(remoteTarget)
+    expect(steps.deleteWorktree).toHaveBeenCalledWith('C:/wt/x')
+    expect(steps.deleteRemote).toHaveBeenCalledWith(remoteTarget)
+  })
+
+  it('预检被拒时什么都不删：worktree 删了就回不来', async () => {
+    // 这就是要修的缺陷：`git remote add` 接上的远程没有本地 origin/HEAD，勾选框不会灰掉，
+    // 以前 worktree 删完才被护栏拒绝，用户得到一次部分删除
+    const { calls, steps } = recordSteps('checkRemote')
+    await expect(
+      runBranchDeletion({ remote: remoteTarget, worktreePath: 'C:/wt/x' }, vi.fn(), steps),
+    ).rejects.toThrow('checkRemote 被拒')
+    expect(calls).toEqual(['checkRemote'])
+  })
+
+  it('没有 worktree 时不预检：删远程本身就是第一步，护栏会先拦，预检只会白跑', async () => {
+    const { calls, steps } = recordSteps()
+    await runBranchDeletion({ remote: remoteTarget, worktreePath: null }, vi.fn(), steps)
+    expect(calls).toEqual(['deleteRemote', 'deleteLocal'])
+  })
+
+  it('不删远程时不预检，不走网络', async () => {
+    const { calls, steps } = recordSteps()
+    await runBranchDeletion({ remote: null, worktreePath: 'C:/wt/x' }, vi.fn(), steps)
+    expect(calls).toEqual(['deleteWorktree', 'deleteLocal'])
+  })
+
+  it('两个都不删时只删本地分支', async () => {
+    const { calls, steps } = recordSteps()
+    await runBranchDeletion({ remote: null, worktreePath: null }, vi.fn(), steps)
+    expect(calls).toEqual(['deleteLocal'])
+  })
+
+  it('某一步失败后不再往下走', async () => {
+    const worktree = recordSteps('deleteWorktree')
+    await expect(
+      runBranchDeletion({ remote: remoteTarget, worktreePath: 'C:/wt/x' }, vi.fn(), worktree.steps),
+    ).rejects.toThrow()
+    expect(worktree.calls).toEqual(['checkRemote', 'deleteWorktree'])
+
+    const remote = recordSteps('deleteRemote')
+    await expect(
+      runBranchDeletion({ remote: remoteTarget, worktreePath: null }, vi.fn(), remote.steps),
+    ).rejects.toThrow()
+    expect(remote.calls).toEqual(['deleteRemote'])
+  })
+
+  it('每做完一步上报一次，失败的那步和没走到的不算', async () => {
+    const all = vi.fn()
+    await runBranchDeletion(
+      { remote: remoteTarget, worktreePath: 'C:/wt/x' },
+      all,
+      recordSteps().steps,
+    )
+    expect(all.mock.calls.map(([step]) => step)).toEqual(['worktree', 'remote'])
+
+    const partial = vi.fn()
+    await expect(
+      runBranchDeletion(
+        { remote: remoteTarget, worktreePath: 'C:/wt/x' },
+        partial,
+        recordSteps('deleteRemote').steps,
+      ),
+    ).rejects.toThrow()
+    expect(partial.mock.calls.map(([step]) => step)).toEqual(['worktree'])
+  })
+})
+
+describe('withoutCompletedSteps', () => {
+  const full: DeleteBranchInfo = {
+    upstream: 'origin/feat/x',
+    remote: 'origin',
+    remoteBranch: 'feat/x',
+    remoteProtected: false,
+    worktree: { path: 'C:/wt/feat-x' },
+  }
+  const choice = { alsoRemote: true, alsoWorktree: true }
+
+  it('什么都没做完时原样返回', () => {
+    expect(withoutCompletedSteps(full, [])).toEqual(full)
+  })
+
+  it('worktree 做完了：重试只剩远程', () => {
+    const left = withoutCompletedSteps(full, ['worktree'])
+    expect(deleteBranchTargets(ALL_CAPABILITIES, left, choice)).toEqual({
+      remote: { remote: 'origin', branch: 'feat/x' },
+      worktreePath: null,
+    })
+  })
+
+  it('远程做完了：重试只剩 worktree，勾选框的依据也一起清掉', () => {
+    const left = withoutCompletedSteps(full, ['remote'])
+    expect(deleteBranchTargets(ALL_CAPABILITIES, left, choice)).toEqual({
+      remote: null,
+      worktreePath: 'C:/wt/feat-x',
+    })
+    expect(left.upstream).toBeNull()
+  })
+
+  it('都做完了：重试只删本地分支', () => {
+    const left = withoutCompletedSteps(full, ['worktree', 'remote'])
+    expect(deleteBranchTargets(ALL_CAPABILITIES, left, choice)).toEqual({
+      remote: null,
+      worktreePath: null,
+    })
+  })
+})
 
 /** 有上游、也有 worktree 的分支——两个勾选框都会出现的形态。 */
 const info: DeleteBranchInfo = {

@@ -3,7 +3,11 @@ import { useFocusTrap } from './useFocusTrap'
 import { invoke } from '@tauri-apps/api/core'
 import { toErrorMessage } from '../engine/errors'
 import type { Capabilities } from '../engine/capabilities'
-import { deleteBranchTargets } from '../engine/deleteBranchTargets'
+import {
+  deleteBranchTargets,
+  withoutCompletedSteps,
+  type BranchDeletionStep,
+} from '../engine/deleteBranchTargets'
 import { unmergedNote } from '../engine/deleteBranchNote'
 import type { PullRequest } from '../engine/types'
 import { prefetchRemoteDefault } from '@/store/repoStore'
@@ -106,8 +110,11 @@ interface DeleteBranchDialogProps {
   /** 要删除的本地分支名。 */
   name: string
   onCancel: () => void
-  /** 失败时应当抛出——弹框据此留在原地并把错误显示出来，好让用户重试。 */
-  onConfirm: (targets: DeleteTargets) => Promise<void>
+  /**
+   * 失败时应当抛出——弹框据此留在原地并把错误显示出来，好让用户重试。
+   * 每做完一步调一次 `onStepDone`，重试时才不会把做完的再做一遍。
+   */
+  onConfirm: (targets: DeleteTargets, onStepDone: (step: BranchDeletionStep) => void) => Promise<void>
   /**
    * 后端能力。`BRANCHES` 分区在任何模式下都渲染，所以这个弹框是**唯一**一处
    * 上层裁不到、却能触达 `delete_worktree` 的入口（2026-09-13 独立 review 抓到）。
@@ -132,7 +139,17 @@ interface DeleteBranchDialogProps {
 export function DeleteBranchDialog({
   repoPath, name, onCancel, onConfirm, capabilities, mergedPullRequests,
 }: DeleteBranchDialogProps) {
-  const [info, setInfo] = useState<DeleteInfo | null>(null)
+  const [loadedInfo, setInfo] = useState<DeleteInfo | null>(null)
+  /**
+   * 这个弹框里已经做完的步骤。删除失败时弹框留着让用户重试，做完的步骤不能再做一遍：
+   * worktree 已经没了，后端报「没什么可删的」；远程那条已经没了，push 报 ref 不存在。
+   * 两种都会让序列停在那一步，永远走不到本地分支。
+   *
+   * **不靠重查后端来判断。** 远程那条删掉之后 `find_remote_branch` 会扫到别的远程上的
+   * 同名分支，勾选框还勾着，照重查结果重试就是删一条用户从没选过的分支。
+   */
+  const [completed, setCompleted] = useState<BranchDeletionStep[]>([])
+  const info = loadedInfo && withoutCompletedSteps(loadedInfo, completed)
   /**
    * 两种错误分开存：PR 列表晚到会触发重查，重查成功要清掉上一次的查询失败，
    * 但不能顺手清掉删除失败——删除按 worktree → 远程 → 本地执行，失败时可能已经
@@ -221,7 +238,9 @@ export function DeleteBranchDialog({
     setBusy(true)
     setDeleteError(null)
     try {
-      await onConfirm({ remote, worktreePath })
+      await onConfirm({ remote, worktreePath }, (step) => {
+        setCompleted((steps) => [...steps, step])
+      })
     } catch (err) {
       setDeleteError(toErrorMessage(err))
       setBusy(false)
@@ -329,12 +348,20 @@ export function DeleteBranchDialog({
         {infoError && <div className="dlg-warning">{infoError}</div>}
         {deleteError && <div className="dlg-warning">{deleteError}</div>}
 
+        {/* 做完的步骤对应的勾选框消失了，不说一声的话用户点 Cancel 会以为什么都没发生 */}
+        {!busy && completed.length > 0 && (
+          <div className="dlg-note">
+            已经删除：{completed.map((step) => (step === 'worktree' ? 'worktree' : '远程分支')).join('、')}。
+            重试只做剩下的步骤。
+          </div>
+        )}
+
         {/* 删 worktree 只是把目录搬进回收站，毫秒级；真正要等网络的只有远程
             那一步，单独报它，免得用户以为界面卡了 */}
         {busy && (
           <div className="dlg-progress">
             <span className="dlg-spinner" />
-            {alsoRemote ? '正在联系远程…' : '正在删除…'}
+            {prefetchTarget ? '正在联系远程…' : '正在删除…'}
           </div>
         )}
 

@@ -53,6 +53,7 @@ pub fn run() {
             commands::ops::delete_remote_ref,
             commands::ops::prefetch_remote_default,
             commands::ops::prefetch_remote_default_for_ref,
+            commands::ops::check_remote_deletable,
             commands::ops::discard,
             commands::ops::rename_branch,
             commands::ops::revert,

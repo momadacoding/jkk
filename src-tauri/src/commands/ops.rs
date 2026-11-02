@@ -43,6 +43,17 @@ pub fn delete_remote_branch(path: String, remote: String, branch: String) -> Res
     Ok(())
 }
 
+/// 只跑护栏、不删任何东西：删除序列的第一步不可撤销时，先用它确认后面不会被**护栏**拒绝。
+/// push 自身的失败（断网、分支已经不在）它防不了。
+///
+/// 删除顺序是 worktree → 远程 → 本地分支。`git remote add` 接上的远程没有本地的
+/// `origin/HEAD`，弹框勾选框不会灰掉，到远程那一步才被护栏拒绝的话 worktree 已经没了。
+/// 答案留给紧接着的 [`delete_remote_branch`]，不多连一次网。
+#[tauri::command(async)]
+pub fn check_remote_deletable(path: String, remote: String, branch: String) -> Result<()> {
+    crate::engine::branch::check_deletable_on_remote(&path, &remote, &branch)
+}
+
 /// 用户表明要删远程时调：后台先问好远程默认分支，点确认时护栏直接复用。
 ///
 /// 这趟查询是一次完整的 SSH 握手，放在用户读弹框的那几秒里做，删除时就只剩

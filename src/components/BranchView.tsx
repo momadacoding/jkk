@@ -7,6 +7,7 @@ import { usePrompt } from './PromptDialog'
 import { DeleteBranchDialog, type DeleteTargets } from './DeleteBranchDialog'
 import { useConfirm } from './ConfirmDialog'
 import { isProtectedBaseline, type Capabilities } from '../engine/capabilities'
+import type { BranchDeletionStep } from '../engine/deleteBranchTargets'
 import { goneUpstreamName, goneUpstreamTooltip } from '../engine/refPills'
 import { mergedPullRequestsFor } from '../engine/deleteBranchNote'
 import { prefetchRemoteDefaultForRef } from '@/store/repoStore'
@@ -32,7 +33,11 @@ interface BranchViewProps {
    * 返回的 Promise 要等删完才 resolve，确认框靠它显示进度；失败要抛出，
    * 确认框据此留在原地显示错误。
    */
-  onDelete: (name: string, targets: DeleteTargets) => Promise<void>
+  onDelete: (
+    name: string,
+    targets: DeleteTargets,
+    onStepDone: (step: BranchDeletionStep) => void,
+  ) => Promise<void>
   /** 检出远程分支：建一条跟踪它的本地分支并切过去。 */
   onCheckoutRemote: (remoteBranch: string) => void
   /**
@@ -315,7 +320,10 @@ export function BranchView({
           mergedPullRequests={deletingMergedPrs}
           onCancel={() => setDeleting(null)}
           // 成功才关；失败时 onDelete 抛出，确认框自己接住并留在原地
-          onConfirm={async (targets) => { await onDelete(deleting, targets); setDeleting(null) }}
+          onConfirm={async (targets, onStepDone) => {
+            await onDelete(deleting, targets, onStepDone)
+            setDeleting(null)
+          }}
         />
       )}
     </SidebarSection>

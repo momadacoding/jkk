@@ -336,6 +336,14 @@ export function prefetchRemoteDefaultForRef(path: string, remoteBranch: string):
   })
 }
 
+/**
+ * 只跑远程护栏，不删任何东西：要删的分支是默认分支时 reject。
+ * 删除序列的第一步不可撤销时先调它，理由见 `runBranchDeletion`。
+ */
+export function checkRemoteDeletable(path: string, remote: string, branch: string): Promise<void> {
+  return invoke<void>('check_remote_deletable', { path, remote, branch })
+}
+
 /** 行尾规则装了没有（spec §7.3.0）。**纯读**，不走网络。 */
 export function svnEolStatus(path: string): Promise<EolStatus> {
   return invoke<EolStatus>('svn_eol_status', { path })

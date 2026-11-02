@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { invoke } from '@tauri-apps/api/core'
 import { DeleteBranchDialog, type DeleteInfo } from '@/components/DeleteBranchDialog'
 import { ALL_CAPABILITIES } from '@/engine/capabilities'
+import type { BranchDeletionStep } from '@/engine/deleteBranchTargets'
 import type { PullRequest } from '@/engine/types'
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }))
@@ -100,6 +101,124 @@ describe('DeleteBranchDialog', () => {
     rerender(dialog({ prs: [MERGED_PR] }))
     await waitFor(() => expect(deleteButton().disabled).toBe(false))
     expect(screen.queryByText(/branch info failed/)).toBeNull()
+  })
+
+  const BOTH_TARGETS: DeleteInfo = {
+    ...INFO,
+    upstream: 'origin/feat/x',
+    remote: 'origin',
+    remoteBranch: 'feat/x',
+    worktree: { name: 'wt', path: 'C:/wt' },
+  }
+
+  type Targets = { remote: unknown; worktreePath: string | null }
+  type OnStepDone = (step: BranchDeletionStep) => void
+
+  function retryDialog(onConfirm: (targets: Targets, onStepDone: OnStepDone) => Promise<void>) {
+    return (
+      <DeleteBranchDialog
+        repoPath="C:\\repo"
+        name="feat/x"
+        capabilities={ALL_CAPABILITIES}
+        mergedPullRequests={[]}
+        onCancel={() => {}}
+        onConfirm={onConfirm}
+      />
+    )
+  }
+
+  it('worktree 删完、push 失败：重试不再删 worktree，远程照旧，勾选框也消失', async () => {
+    // 不记进度的话重试还会带上旧的 worktreePath，后端报 worktree_not_registered，
+    // 序列永远走不到远程和本地
+    invokeMock.mockResolvedValue(BOTH_TARGETS)
+    const onConfirm = vi
+      .fn<(targets: Targets, onStepDone: OnStepDone) => Promise<void>>()
+      .mockImplementationOnce(async (_targets, onStepDone) => {
+        onStepDone('worktree')
+        throw new Error('network down')
+      })
+      .mockResolvedValue(undefined)
+
+    render(retryDialog(onConfirm))
+    await waitFor(() => expect(deleteButton().disabled).toBe(false))
+    fireEvent.click(screen.getByRole('checkbox', { name: /Also delete remote branch/ }))
+
+    fireEvent.click(deleteButton())
+    expect(await screen.findByText(/network down/)).toBeTruthy()
+    expect(onConfirm.mock.calls[0][0].worktreePath).toBe('C:/wt')
+    expect(screen.queryByText('Also delete worktree')).toBeNull()
+    expect(screen.getByText(/已经删除：worktree/)).toBeTruthy()
+
+    fireEvent.click(deleteButton())
+    await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(2))
+    expect(onConfirm.mock.calls[1][0]).toEqual({
+      remote: { remote: 'origin', branch: 'feat/x' },
+      worktreePath: null,
+    })
+  })
+
+  it('远程删完、本地失败：重试不再 push --delete，否则 ref 不存在会一直卡在这一步', async () => {
+    invokeMock.mockResolvedValue({ ...BOTH_TARGETS, worktree: null })
+    const onConfirm = vi
+      .fn<(targets: Targets, onStepDone: OnStepDone) => Promise<void>>()
+      .mockImplementationOnce(async (_targets, onStepDone) => {
+        onStepDone('remote')
+        throw new Error('local delete failed')
+      })
+      .mockResolvedValue(undefined)
+
+    render(retryDialog(onConfirm))
+    await waitFor(() => expect(deleteButton().disabled).toBe(false))
+    fireEvent.click(screen.getByRole('checkbox', { name: /Also delete remote branch/ }))
+
+    fireEvent.click(deleteButton())
+    expect(await screen.findByText(/local delete failed/)).toBeTruthy()
+    expect(screen.queryByRole('checkbox', { name: /Also delete remote branch/ })).toBeNull()
+
+    fireEvent.click(deleteButton())
+    await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(2))
+    expect(onConfirm.mock.calls[1][0].remote).toBeNull()
+  })
+
+  it('远程删完后 PR 列表晚到的重查扫到别的远程：绝不能改删那条用户没选过的分支', async () => {
+    // 真实时序：feat/x 在 origin 和 upstream 上都有。origin 那条删掉之后再查，
+    // find_remote_branch 会扫到 upstream/feat/x，勾选状态还在，而护栏只拦默认分支
+    const onOrigin: DeleteInfo = { ...BOTH_TARGETS, worktree: null }
+    invokeMock.mockResolvedValueOnce(onOrigin).mockResolvedValue({
+      ...onOrigin,
+      upstream: 'upstream/feat/x',
+      remote: 'upstream',
+    })
+    const onConfirm = vi
+      .fn<(targets: Targets, onStepDone: OnStepDone) => Promise<void>>()
+      .mockImplementationOnce(async (_targets, onStepDone) => {
+        onStepDone('remote')
+        throw new Error('local delete failed')
+      })
+      .mockResolvedValue(undefined)
+    const withPrs = (prs: PullRequest[]) => (
+      <DeleteBranchDialog
+        repoPath="C:\\repo"
+        name="feat/x"
+        capabilities={ALL_CAPABILITIES}
+        mergedPullRequests={prs}
+        onCancel={() => {}}
+        onConfirm={onConfirm}
+      />
+    )
+
+    const { rerender } = render(withPrs([]))
+    await waitFor(() => expect(deleteButton().disabled).toBe(false))
+    fireEvent.click(screen.getByRole('checkbox', { name: /Also delete remote branch/ }))
+    fireEvent.click(deleteButton())
+    expect(await screen.findByText(/local delete failed/)).toBeTruthy()
+
+    rerender(withPrs([MERGED_PR]))
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledTimes(3))
+
+    fireEvent.click(deleteButton())
+    await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(2))
+    expect(onConfirm.mock.calls[1][0].remote).toBeNull()
   })
 })
 

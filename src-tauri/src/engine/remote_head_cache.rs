@@ -19,7 +19,11 @@
 //! - **等待有上限**（[`MAX_WAIT`]），且查询期间不持锁。`run_git` 没有超时，半开的 TCP
 //!   连接或没人理的凭据窗口能让一次查询永远不返回，卡住的预取不能把之后的删除一起拖死。
 //!   等不到就自己问：结论和没有预取时一样，只是多等了一会儿。
-//! - key 含远程的 fetch URL：`git remote set-url` 之后旧结果不会拿去给新远程把关。
+//! - key 含 push 目标的地址：改了 URL 或 pushurl 之后，旧结果不会拿去给新目标把关。
+//!
+//! 删除序列的第一步不可撤销时，会先用 [`PrefetchCache::peek_or_query`] 预检一次。它只是
+//! 把取走的时机推迟到真正的删除，上面几条不变：答案仍然只被一次删除取走，TTL 仍按查询
+//! 发出时刻算，所以预检和删除之间隔得太久（worktree 很大）时护栏会当场重问。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
@@ -47,6 +51,13 @@ struct Prefetched {
     value: String,
 }
 
+impl Prefetched {
+    /// 护栏不能松的那条规则，所有读结果的路径都走这里。
+    fn is_within(&self, ttl: Duration) -> bool {
+        self.started.elapsed() < ttl
+    }
+}
+
 #[derive(Debug, Default)]
 struct State {
     /// 正在路上的预取的发出时刻。预取绝不替换它，所以同一个 key 永远最多一个。
@@ -55,6 +66,16 @@ struct State {
     /// 正阻塞在 `changed` 上的线程数。只给测试用来确定「护栏真的在等了」。
     #[cfg(test)]
     waiters: usize,
+}
+
+impl State {
+    /// 记下一次成功的查询。预取和预检可能同时在路上，后回来的不一定是后发出的，
+    /// 按发出时刻取新，不能拿旧答案盖掉新答案。
+    fn remember(&mut self, started: Instant, value: String) {
+        if self.last.as_ref().map_or(true, |p| p.started < started) {
+            self.last = Some(Prefetched { started, value });
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -68,6 +89,35 @@ impl Slot {
     /// 继续用即可，不能让一次 panic 把之后所有删远程分支都卡死。
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 等路上的预取结束，最多等到它发出后 `max_wait`。
+    fn wait_for_prefetch(&self, max_wait: Duration) -> MutexGuard<'_, State> {
+        let mut state = self.lock();
+        if let Some(started) = state.in_flight {
+            // 截止时刻只算一次：等待期间又来一次新预取时，不能重新开始计时
+            let deadline = started + max_wait;
+            while state.in_flight.is_some() {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                #[cfg(test)]
+                {
+                    state.waiters += 1;
+                }
+                let (next, _) = self
+                    .changed
+                    .wait_timeout(state, left)
+                    .unwrap_or_else(|e| e.into_inner());
+                state = next;
+                #[cfg(test)]
+                {
+                    state.waiters -= 1;
+                }
+            }
+        }
+        state
     }
 }
 
@@ -95,36 +145,35 @@ impl PrefetchCache {
         query: impl FnOnce() -> Option<String>,
     ) -> Option<String> {
         let slot = self.slot(key);
-        let mut state = slot.lock();
-        if let Some(started) = state.in_flight {
-            // 截止时刻只算一次：等待期间又来一次新预取时，不能重新开始计时
-            let deadline = started + max_wait;
-            while state.in_flight.is_some() {
-                let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    break;
-                }
-                #[cfg(test)]
-                {
-                    state.waiters += 1;
-                }
-                let (next, _) = slot
-                    .changed
-                    .wait_timeout(state, left)
-                    .unwrap_or_else(|e| e.into_inner());
-                state = next;
-                #[cfg(test)]
-                {
-                    state.waiters -= 1;
-                }
-            }
-        }
-        let taken = state.last.take().filter(|p| p.started.elapsed() < ttl);
+        let mut state = slot.wait_for_prefetch(max_wait);
+        let taken = state.last.take().filter(|p| p.is_within(ttl));
         drop(state);
         match taken {
             Some(p) => Some(p.value),
             None => query(),
         }
+    }
+
+    /// 预检用：等待和判断同 [`take_or_query`](Self::take_or_query)，但答案留下来给紧接着的
+    /// 删除，自己查到的成功结果也存（按发出时刻计 TTL）。查询期间不持锁。
+    pub fn peek_or_query(
+        &self,
+        key: &str,
+        ttl: Duration,
+        max_wait: Duration,
+        query: impl FnOnce() -> Option<String>,
+    ) -> Option<String> {
+        let slot = self.slot(key);
+        let state = slot.wait_for_prefetch(max_wait);
+        if let Some(p) = state.last.as_ref().filter(|p| p.is_within(ttl)) {
+            return Some(p.value.clone());
+        }
+        drop(state);
+
+        let started = Instant::now();
+        let value = query()?;
+        slot.lock().remember(started, value.clone());
+        Some(value)
     }
 
     /// 预取用：有查询在路上、或结果还很新时直接返回，否则查一次，成功才记下。
@@ -138,10 +187,7 @@ impl PrefetchCache {
     pub fn prefetch(&self, key: &str, ttl: Duration, query: impl FnOnce() -> Option<String>) {
         let slot = self.slot(key);
         let mut state = slot.lock();
-        let fresh = state
-            .last
-            .as_ref()
-            .is_some_and(|p| p.started.elapsed() < ttl / 2);
+        let fresh = state.last.as_ref().is_some_and(|p| p.is_within(ttl / 2));
         if fresh || state.in_flight.is_some() {
             return;
         }
@@ -155,7 +201,7 @@ impl PrefetchCache {
         let mut state = slot.lock();
         state.in_flight = None;
         if let Some(value) = value {
-            state.last = Some(Prefetched { started, value });
+            state.remember(started, value);
         }
         drop(state);
         slot.changed.notify_all();
@@ -368,5 +414,131 @@ mod tests {
         let cache = PrefetchCache::default();
         cache.prefetch("k", LONG, || Some("main".into()));
         cache.prefetch("k", LONG, || panic!("结果还新鲜，不该再发一次"));
+    }
+
+    /// 预检看过的预取结果还在，紧接着的删除能取走，而且只有这一次删除能取走。
+    #[test]
+    fn a_peek_leaves_the_result_for_exactly_one_delete() {
+        let cache = PrefetchCache::default();
+        cache.prefetch("k", LONG, || Some("master".into()));
+
+        let peeked = cache.peek_or_query("k", LONG, LONG, || panic!("预取过了，不该再问"));
+        assert_eq!(peeked.as_deref(), Some("master"));
+
+        let taken = cache.take_or_query("k", LONG, LONG, || panic!("预检不该吃掉结果"));
+        assert_eq!(taken.as_deref(), Some("master"));
+
+        let next = cache.take_or_query("k", LONG, LONG, || Some("main".into()));
+        assert_eq!(next.as_deref(), Some("main"));
+    }
+
+    /// 没赶上预取时，预检查到的答案也留给删除，不多连一次网。
+    #[test]
+    fn a_peek_keeps_the_answer_it_queried_itself() {
+        let cache = PrefetchCache::default();
+
+        let peeked = cache.peek_or_query("k", LONG, LONG, || Some("main".into()));
+        assert_eq!(peeked.as_deref(), Some("main"));
+
+        let taken = cache.take_or_query("k", LONG, LONG, || panic!("预检问过了，不该再问"));
+        assert_eq!(taken.as_deref(), Some("main"));
+    }
+
+    /// 预检失败同样不留痕：之后护栏要自己问，不能沿用。
+    #[test]
+    fn a_failed_peek_leaves_nothing_behind() {
+        let cache = PrefetchCache::default();
+
+        assert_eq!(cache.peek_or_query("k", LONG, LONG, || None), None);
+
+        let taken = cache.take_or_query("k", LONG, LONG, || Some("main".into()));
+        assert_eq!(taken.as_deref(), Some("main"));
+    }
+
+    /// 过期结果不能因为预检而续命：TTL 没有例外。
+    #[test]
+    fn a_peek_does_not_use_or_extend_an_expired_result() {
+        let cache = PrefetchCache::default();
+        with_aged_result(&cache, 40);
+
+        let peeked = cache.peek_or_query("k", TTL, LONG, || Some("new".into()));
+        assert_eq!(peeked.as_deref(), Some("new"));
+
+        let taken = cache.take_or_query("k", TTL, LONG, || panic!("预检刚查过"));
+        assert_eq!(taken.as_deref(), Some("new"));
+    }
+
+    /// 预检看过之后结果的年龄不变：删除时已过期就要当场重问，worktree 删得再久也一样。
+    #[test]
+    fn a_peek_does_not_reset_the_age_of_a_result() {
+        let cache = PrefetchCache::default();
+        with_aged_result(&cache, 20);
+
+        let peeked = cache.peek_or_query("k", TTL, LONG, || panic!("结果还没过期"));
+        assert_eq!(peeked.as_deref(), Some("old"));
+
+        let started = cache.slot("k").lock().last.as_ref().unwrap().started;
+        assert!(started.elapsed() >= Duration::from_secs(20), "年龄被重置了");
+    }
+
+    /// 预检也要等路上的预取，不能另发一次。
+    #[test]
+    fn a_peek_waits_for_the_prefetch_in_flight() {
+        let cache = Arc::new(PrefetchCache::default());
+        let (prefetch, release) = start_prefetch(&cache, Some("main"));
+
+        let c = cache.clone();
+        let peek = thread::spawn(move || {
+            c.peek_or_query("k", LONG, LONG, || panic!("等待者不该再问一次"))
+        });
+        wait_for_waiter(&cache);
+        release.send(()).unwrap();
+
+        prefetch.join().unwrap();
+        assert_eq!(peek.join().unwrap().as_deref(), Some("main"));
+    }
+
+    /// 卡死的预取同样不能把预检拖死，等够上限就自己问。
+    #[test]
+    fn a_stuck_prefetch_cannot_block_the_peek() {
+        let cache = Arc::new(PrefetchCache::default());
+        let (prefetch, release) = start_prefetch(&cache, None);
+
+        let got = cache.peek_or_query("k", LONG, Duration::from_millis(50), || Some("main".into()));
+        assert_eq!(got.as_deref(), Some("main"));
+
+        release.send(()).unwrap();
+        prefetch.join().unwrap();
+    }
+
+    /// 反方向：卡住的预取晚回来时，不能盖掉预检等不及自己查到的更新答案。
+    #[test]
+    fn a_slow_prefetch_does_not_overwrite_a_newer_result() {
+        let cache = Arc::new(PrefetchCache::default());
+        let (prefetch, release) = start_prefetch(&cache, Some("older"));
+
+        let peeked = cache.peek_or_query("k", LONG, Duration::ZERO, || Some("newer".into()));
+        assert_eq!(peeked.as_deref(), Some("newer"));
+
+        release.send(()).unwrap();
+        prefetch.join().unwrap();
+
+        let taken = cache.take_or_query("k", LONG, LONG, || panic!("结果还在"));
+        assert_eq!(taken.as_deref(), Some("newer"));
+    }
+
+    /// 预检查询期间写入的更新答案不能被盖掉。
+    #[test]
+    fn a_slow_peek_does_not_overwrite_a_newer_result() {
+        let cache = PrefetchCache::default();
+
+        let got = cache.peek_or_query("k", LONG, LONG, || {
+            cache.prefetch("k", LONG, || Some("newer".into()));
+            Some("older".into())
+        });
+        assert_eq!(got.as_deref(), Some("older"));
+
+        let taken = cache.take_or_query("k", LONG, LONG, || panic!("结果还在"));
+        assert_eq!(taken.as_deref(), Some("newer"));
     }
 }

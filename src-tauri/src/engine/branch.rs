@@ -31,7 +31,8 @@ pub struct DeleteInfo {
     /// 先看到 worktree 目录被搬走、标签被关掉，然后才收到一句「不能删」。
     ///
     /// 判据只查本地的 `refs/remotes/<remote>/HEAD`（弹框那条路径上不能走网络），
-    /// 所以是**尽力而为**：查不到就是 false，勾选框照常出现，届时由护栏兜底。
+    /// 所以是**尽力而为**：查不到就是 false，勾选框照常出现，届时由预检和护栏兜底
+    /// （要连 worktree 一起删时前端先调 [`check_deletable_on_remote`]）。
     pub remote_protected: bool,
     /// 有多少提交只在这个分支上、不在 [`compared_to`](Self::compared_to) 上。
     ///
@@ -380,14 +381,14 @@ fn remote_default_branch(repo: &Repository, remote: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// 直接问远程：你的 HEAD 指着哪条分支。
+/// 直接问：你的 HEAD 指着哪条分支。`ask` 是 [`PushTarget::ask`]。
 ///
 /// 输出形如 `ref: refs/heads/main\tHEAD`，后面还跟一行 oid，只取符号引用那行。
 /// 问不到（断网、没权限、远程 URL 是坏的）就是 None——那种情况下紧接着的
 /// `push` 本来也发不出去。
-fn remote_default_branch_from_network(path: &str, remote: &str) -> Option<String> {
-    let out =
-        crate::engine::git_cli::run_git(path, &["ls-remote", "--symref", remote, "HEAD"]).ok()?;
+fn remote_default_branch_from_network(path: &str, ask: &str) -> Option<String> {
+    let out = crate::engine::git_cli::run_git(path, &["ls-remote", "--symref", "--", ask, "HEAD"])
+        .ok()?;
     out.lines()
         .find_map(|line| line.strip_prefix("ref: "))
         .and_then(|rest| rest.split('\t').next())
@@ -395,41 +396,84 @@ fn remote_default_branch_from_network(path: &str, remote: &str) -> Option<String
         .map(|s| s.to_string())
 }
 
-/// 缓存 key：仓库路径 + 远程名 + 它的 fetch URL（`ls-remote` 问的就是这个地址）。
-///
-/// 带上 URL 是为了 `git remote set-url` 之后不拿旧远程的默认分支给新远程把关。
-/// 打不开仓库或找不到这个远程时返回 None，调用方就不走缓存、当场查。
-fn remote_head_cache_key(path: &str, remote: &str) -> Option<String> {
-    let repo = Repository::open(path).ok()?;
-    let r = repo.find_remote(remote).ok()?;
-    let url = String::from_utf8_lossy(r.url_bytes()).into_owned();
-    Some(format!("{path}\0{remote}\0{url}"))
+/// `git push <remote>` 会到达的一个仓库。
+struct PushTarget {
+    /// 它的地址，进缓存 key：改了 URL 之后不拿旧目标的默认分支给新目标把关。
+    url: String,
+    /// 交给 `ls-remote` 的参数。
+    ///
+    /// 能用远程名就用远程名：`remote.<name>.proxy`、`uploadpack` 这些配置只认名字，push
+    /// 是按名字走的，问 URL 的话 push 通得过而这次查询可能失败，护栏就无依据放行了。
+    /// 只有 push 目标和 fetch 地址不一样时才只能问 URL，那时名字问到的是 fetch 侧。
+    ask: String,
 }
 
-/// 同 [`remote_default_branch_from_network`]，但先看预取的结果。
+/// `git push <remote>` 实际会到达的所有仓库。
 ///
-/// 预取还在路上就限时等它；取不到成功结果（没预取、过期、预取失败、等超时）就当场查。
-/// 预取结果取走即消失，安全边界见 [`crate::engine::remote_head_cache`]。
-fn remote_default_branch_cached(path: &str, remote: &str) -> Option<String> {
-    use crate::engine::remote_head_cache::{global, MAX_WAIT, TTL};
-    let query = || remote_default_branch_from_network(path, remote);
-    match remote_head_cache_key(path, remote) {
-        Some(key) => global().take_or_query(&key, TTL, MAX_WAIT, query),
-        None => query(),
+/// 护栏保护的是**被删的那个仓库**，所以要问 push 目标，不是 fetch URL：配了 pushurl
+/// 时两者可以是不同的服务器。走 CLI 不走 libgit2：删除用的是 CLI 的 push，这条命令已经
+/// 把 pushurl、多值、`insteadOf` / `pushInsteadOf` 都算进去了，和 push 同一个口径。
+///
+/// 读不出来时退回远程名本身，由 ls-remote 按名字解析，和没有这一步时一样。
+fn push_targets(path: &str, remote: &str) -> Vec<PushTarget> {
+    let urls = |args: &[&str]| -> Vec<String> {
+        crate::engine::git_cli::run_git(path, args)
+            .map(|out| out.lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    };
+    let by_name = |url: &str| PushTarget {
+        url: url.to_string(),
+        ask: remote.to_string(),
+    };
+    let push = urls(&["remote", "get-url", "--push", "--all", "--", remote]);
+    match push.as_slice() {
+        [] => vec![by_name(remote)],
+        // 多个地址时按名字只会问到第一个，必须逐个问 URL，所以这里只认单值
+        [only] if urls(&["remote", "get-url", "--all", "--", remote]) == push => {
+            vec![by_name(only)]
+        }
+        _ => push
+            .iter()
+            .map(|url| PushTarget {
+                url: url.clone(),
+                ask: url.clone(),
+            })
+            .collect(),
     }
 }
 
-/// 用户表明要删远程时调用：提前问好远程的默认分支，点确认时护栏不必再握一次手。
+/// 缓存 key：仓库路径 + 远程名 + push 目标的地址。
+fn remote_head_cache_key(path: &str, remote: &str, target: &PushTarget) -> String {
+    format!("{path}\0{remote}\0{}", target.url)
+}
+
+/// 这次查到的答案要不要留给后面那次删除，见 [`refuse_default_branch`]。
+#[derive(Clone, Copy)]
+enum Answer {
+    /// 真正删除前的护栏：答案用完即弃。
+    Consume,
+    /// 删除序列开头的预检：答案留给紧接着的护栏，不多连一次网。
+    Keep,
+}
+
+/// 用户表明要删远程时调用：提前问好默认分支，点确认时护栏不必再握一次手。
 ///
 /// 只读、无副作用，失败也不报——失败不留痕，护栏到时会自己问。已有查询在路上时直接
-/// 返回，不排队占线程。
+/// 返回，不排队占线程。多个 push 目标同时问：一个一个问的话每个都是一次握手的时间，
+/// 用户点确认时后面的还没轮到，前一个卡住时更是永远轮不到。
 pub fn prefetch_remote_default(path: &str, remote: &str) {
     use crate::engine::remote_head_cache::{global, TTL};
-    if let Some(key) = remote_head_cache_key(path, remote) {
-        global().prefetch(&key, TTL, || {
-            remote_default_branch_from_network(path, remote)
-        });
-    }
+    let targets = push_targets(path, remote);
+    std::thread::scope(|scope| {
+        for target in &targets {
+            scope.spawn(move || {
+                let key = remote_head_cache_key(path, remote, target);
+                global().prefetch(&key, TTL, || {
+                    remote_default_branch_from_network(path, &target.ask)
+                });
+            });
+        }
+    });
 }
 
 /// 同 [`prefetch_remote_default`]，按侧边栏给的 `origin/feat/x` 形式定位远程。
@@ -457,23 +501,47 @@ pub fn prefetch_remote_default_for_ref(path: &str, remote_ref: &str) {
 /// `upstream`，也就是别人的主仓库）根本没有那条 ref，护栏直接放行；本地 ref
 /// 过期时护栏还会去保护一个已经不存在的旧名字，把现役的默认分支放过去。
 ///
+/// **问的是 push 目标，每一个都问**，见 [`push_targets`]：`git push` 会推到所有
+/// pushurl，所以任何一个的默认分支都不能删。fetch 侧的默认分支不看，那个仓库不会被动到。
+///
 /// 那次 ls-remote 是一整趟 SSH 握手（实测到 GitHub 3 秒多，和 push 一样贵），
 /// 所以用户表明要删远程时会用 [`prefetch_remote_default`] 提前发出去，这里优先
-/// 复用那个结果，见 [`remote_default_branch_cached`]。
+/// 复用那个结果，安全边界见 [`crate::engine::remote_head_cache`]。
 ///
 /// 两条路都问不出来时**放行**：这时候要么是断网（push 一样会失败），要么这个
-/// 远程真的没有默认分支，没有依据就不该拦着用户干活。
+/// 远程真的没有默认分支，没有依据就不该拦着用户干活。本地 ref 记的是 fetch 侧，
+/// 但问不到 push 目标时它仍是手里唯一的依据，宁可多拦。
 pub fn ensure_deletable_on_remote(path: &str, remote: &str, branch: &str) -> Result<()> {
-    let default = remote_default_branch_cached(path, remote).or_else(|| {
-        Repository::open(path)
-            .ok()
-            .and_then(|repo| remote_default_branch(&repo, remote))
-    });
-    if default.as_deref() == Some(branch) {
-        return Err(crate::error::GitError::new(
-            "protected_branch",
-            format!("{branch} 是 {remote} 的默认分支，不能删除。确实要删请在命令行操作。"),
-        ));
+    refuse_default_branch(path, remote, branch, Answer::Consume)
+}
+
+/// 同 [`ensure_deletable_on_remote`]，但不删任何东西，答案留给紧接着的那次删除。
+///
+/// 删除序列的第一步不可撤销时用它：先确认走到远程那一步不会被拦。
+pub fn check_deletable_on_remote(path: &str, remote: &str, branch: &str) -> Result<()> {
+    refuse_default_branch(path, remote, branch, Answer::Keep)
+}
+
+fn refuse_default_branch(path: &str, remote: &str, branch: &str, answer: Answer) -> Result<()> {
+    use crate::engine::remote_head_cache::{global, MAX_WAIT, TTL};
+    for target in push_targets(path, remote) {
+        let key = remote_head_cache_key(path, remote, &target);
+        let query = || remote_default_branch_from_network(path, &target.ask);
+        let default = match answer {
+            Answer::Consume => global().take_or_query(&key, TTL, MAX_WAIT, query),
+            Answer::Keep => global().peek_or_query(&key, TTL, MAX_WAIT, query),
+        }
+        .or_else(|| {
+            Repository::open(path)
+                .ok()
+                .and_then(|repo| remote_default_branch(&repo, remote))
+        });
+        if default.as_deref() == Some(branch) {
+            return Err(crate::error::GitError::new(
+                "protected_branch",
+                format!("{branch} 是 {remote} 的默认分支，不能删除。确实要删请在命令行操作。"),
+            ));
+        }
     }
     Ok(())
 }
