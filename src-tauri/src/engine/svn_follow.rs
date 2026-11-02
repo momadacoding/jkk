@@ -1218,8 +1218,7 @@ pub fn branches_behind(repo: &str) -> Result<Vec<String>> {
     };
     let base = base.id();
     let mut behind = Vec::new();
-    for entry in git.branches(Some(BranchType::Local))? {
-        let (branch, _) = entry?;
+    for branch in crate::engine::refs::branches(&git, Some(BranchType::Local))? {
         // 名字不是 UTF-8 的分支传不到前端，也就标不上
         let Some(name) = branch.name()?.map(str::to_string) else {
             continue;

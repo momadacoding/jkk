@@ -1,6 +1,10 @@
+#[path = "common/long_ref.rs"]
+mod long_ref;
+
 use app_lib::engine::external_launch::{self, TempWorkspace};
 use app_lib::engine::external_merge::{self, PreparedMerge};
 use app_lib::engine::external_tools_config::{ExternalTool, ExternalToolsConfig};
+use long_ref::plant_long_loose_ref;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -128,6 +132,18 @@ fn merge_titles_use_branch_names() {
     assert_eq!(m.titles.remote, "feat");
     assert_eq!(m.titles.base, "共同祖先");
     assert_eq!(m.titles.merged, "结果（工作区）");
+    ws.remove().unwrap();
+}
+
+/// feat 只有 loose ref，排在它前面的超长 ref 不能让标题退化成短 hash。
+#[test]
+fn merge_title_finds_a_loose_branch_behind_a_long_ref() {
+    let dir = repo(false);
+    text_conflict(dir.path(), "a.txt");
+    let head = git(dir.path(), &["rev-parse", "HEAD"]);
+    plant_long_loose_ref(dir.path(), &head);
+    let (m, ws) = prepare(dir.path(), "a.txt");
+    assert_eq!(m.titles.remote, "feat");
     ws.remove().unwrap();
 }
 

@@ -1,3 +1,6 @@
+#[path = "common/long_ref.rs"]
+mod long_ref;
+
 use app_lib::engine;
 use std::fs;
 use std::process::Command;
@@ -816,4 +819,53 @@ fn unstaged_scope_survives_a_dangling_link_in_the_workdir() {
     // staged 不读工作区，坏链接与它无关，但也不能因此失败
     engine::diff::read_diff(dir.path().to_str().unwrap(), "staged".into())
         .expect("staged 不该被工作区里的坏链接影响");
+}
+
+#[test]
+fn graph_walks_loose_tips_instead_of_stale_packed_ones_behind_a_long_ref() {
+    // 现场的形状：分支 rebase 过，packed-refs 里还是 rebase 前的 tip。读到旧值时图上会多出
+    // 一条已经没人指着的分叉，而新 tip 和只有 loose 的分支一起从图上消失。
+    let dir = linear_repo();
+    let home = rev(dir.path(), "HEAD");
+    run_git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+    run_git(
+        dir.path(),
+        &["commit", "-q", "--allow-empty", "-m", "rebase 前"],
+    );
+    let stale_tip = rev(dir.path(), "HEAD");
+    run_git(dir.path(), &["pack-refs", "--all"]);
+
+    run_git(
+        dir.path(),
+        &[
+            "commit",
+            "-q",
+            "--amend",
+            "--allow-empty",
+            "-m",
+            "rebase 后",
+        ],
+    );
+    let new_tip = rev(dir.path(), "HEAD");
+    run_git(dir.path(), &["checkout", "-q", "-b", "loose-only"]);
+    run_git(
+        dir.path(),
+        &["commit", "-q", "--allow-empty", "-m", "只有 loose"],
+    );
+    let loose_tip = rev(dir.path(), "HEAD");
+    run_git(dir.path(), &["checkout", "-q", "--detach", &home]);
+    long_ref::plant_long_loose_ref(dir.path(), &home);
+
+    let data = engine::graph::load(dir.path().to_str().unwrap()).unwrap();
+    let ids: Vec<&str> = data.commits.iter().map(|c| c.id.as_str()).collect();
+
+    assert!(ids.contains(&new_tip.as_str()), "新 tip 不在图里");
+    assert!(
+        ids.contains(&loose_tip.as_str()),
+        "只有 loose 的分支不在图里"
+    );
+    assert!(
+        !ids.contains(&stale_tip.as_str()),
+        "rebase 掉的旧 tip 不该在图里"
+    );
 }

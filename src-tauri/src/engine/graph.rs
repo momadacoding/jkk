@@ -91,8 +91,7 @@ pub fn load(path: &str) -> Result<GraphData> {
     // 于是那条线从它的圆点上穿过去，看上去它不是分支 tip 而是合并线的中转点。
     walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
     walk.push_head()?;
-    for branch in repo.branches(None)? {
-        let (branch, _) = branch?;
+    for branch in crate::engine::refs::branches(&repo, None)? {
         if let Some(oid) = branch.get().target() {
             walk.push(oid)?;
         }
