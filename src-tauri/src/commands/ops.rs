@@ -43,6 +43,29 @@ pub fn delete_remote_branch(path: String, remote: String, branch: String) -> Res
     Ok(())
 }
 
+/// 用户表明要删远程时调：后台先问好远程默认分支，点确认时护栏直接复用。
+///
+/// 这趟查询是一次完整的 SSH 握手，放在用户读弹框的那几秒里做，删除时就只剩
+/// push 一次连接。只读，失败不报——失败不留痕，护栏到时会自己问，见
+/// [`crate::engine::remote_head_cache`]。
+///
+/// 放到独立线程、命令立刻返回：调用方不等结果，而 `run_git` 没有超时，半开连接下这次
+/// 查询可能永远不返回，不能让它占住 tokio 工作线程，那会拖慢所有其他命令。
+#[tauri::command(async)]
+pub fn prefetch_remote_default(path: String, remote: String) {
+    std::thread::spawn(move || {
+        crate::engine::branch::prefetch_remote_default(&path, &remote);
+    });
+}
+
+/// 同 [`prefetch_remote_default`]，按侧边栏给的 `origin/feat/x` 形式定位远程。
+#[tauri::command(async)]
+pub fn prefetch_remote_default_for_ref(path: String, remote_branch: String) {
+    std::thread::spawn(move || {
+        crate::engine::branch::prefetch_remote_default_for_ref(&path, &remote_branch);
+    });
+}
+
 /// 按 `origin/feat/x` 这种完整简称删除远程分支。
 ///
 /// 侧边栏的远程分支那一栏拿到的就是这个形式，拆分放在后端做——远程名可以带

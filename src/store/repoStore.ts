@@ -316,6 +316,26 @@ export function svnPinnedExternals(path: string): Promise<PinnedExternal[]> {
   return invoke<PinnedExternal[]>('svn_pinned_externals', { path })
 }
 
+/**
+ * 用户表明要删远程时调：后台先问好远程默认分支（删除护栏要用）。
+ *
+ * 这次 `ls-remote` 是一整趟 SSH 握手，实测到 GitHub 3 秒多。放在用户读弹框的
+ * 时间里做，点确认时就只剩 push 一次连接。**只是提速**：护栏只认成功的结果，
+ * 预取失败或没回来，它会限时等待后自己再问，所以这里吞掉一切错误，调用方不必 await。
+ */
+export function prefetchRemoteDefault(path: string, remote: string): void {
+  invoke('prefetch_remote_default', { path, remote }).catch((err) => {
+    console.warn('预取远程默认分支失败：', err)
+  })
+}
+
+/** 同 {@link prefetchRemoteDefault}，按侧边栏的 `origin/feat/x` 形式给出（拆远程名在后端做）。 */
+export function prefetchRemoteDefaultForRef(path: string, remoteBranch: string): void {
+  invoke('prefetch_remote_default_for_ref', { path, remoteBranch }).catch((err) => {
+    console.warn('预取远程默认分支失败：', err)
+  })
+}
+
 /** 行尾规则装了没有（spec §7.3.0）。**纯读**，不走网络。 */
 export function svnEolStatus(path: string): Promise<EolStatus> {
   return invoke<EolStatus>('svn_eol_status', { path })

@@ -6,6 +6,7 @@ import type { Capabilities } from '../engine/capabilities'
 import { deleteBranchTargets } from '../engine/deleteBranchTargets'
 import { unmergedNote } from '../engine/deleteBranchNote'
 import type { PullRequest } from '../engine/types'
+import { prefetchRemoteDefault } from '@/store/repoStore'
 
 /** 检出了待删分支的 worktree（主工作区除外）。 */
 export interface WorktreeTarget {
@@ -180,6 +181,20 @@ export function DeleteBranchDialog({
       .catch((err) => { if (!cancelled) setInfoError(toErrorMessage(err)) })
     return () => { cancelled = true }
   }, [repoPath, name, capabilities.worktrees, mergedHeadsKey])
+
+  // 勾上「同时删除远程」的那一刻，趁用户移向 Delete 按钮先把护栏要的默认分支问好：
+  // 那是一整趟 SSH 握手（实测 3 秒多），不预取的话点确认后要连两次网。
+  // **不在弹框打开时就发**：只删本地分支的人不该因此走网络（SSH agent 审批、
+  // GCM 凭据框都可能弹出来）。条件直接用 deleteBranchTargets——真正发出删除的
+  // 也是它，删不了的就不白跑网络。依赖远程名而不是 info：PR 列表晚到的重查不该再发一趟；
+  // 只有取消再勾选才会再发一次，重复由后端去重。删除失败后直接重试不会触发预取，
+  // 这时护栏当场问：只是慢，结论不变
+  const prefetchTarget = info
+    ? deleteBranchTargets(capabilities, info, { alsoRemote, alsoWorktree: false }).remote?.remote
+    : undefined
+  useEffect(() => {
+    if (repoPath && prefetchTarget) prefetchRemoteDefault(repoPath, prefetchTarget)
+  }, [repoPath, prefetchTarget])
 
   // 远程信息还没回来就先不给删：这时候勾选框还没出现，
   // 用户根本没机会决定要不要连远程一起删

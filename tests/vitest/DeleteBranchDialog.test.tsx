@@ -102,3 +102,116 @@ describe('DeleteBranchDialog', () => {
     expect(screen.queryByText(/branch info failed/)).toBeNull()
   })
 })
+
+describe('DeleteBranchDialog 预取远程默认分支', () => {
+  const WITH_REMOTE: DeleteInfo = {
+    ...INFO,
+    upstream: 'origin/feat/x',
+    remote: 'origin',
+    remoteBranch: 'feat/x',
+  }
+
+  /** 按命令名分派：`branch_delete_info` 回 `info`，其余（预取）回 undefined。 */
+  function respondWith(info: DeleteInfo) {
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === 'branch_delete_info' ? info : undefined)
+  }
+
+  function prefetchCalls() {
+    return invokeMock.mock.calls.filter(([cmd]) => cmd === 'prefetch_remote_default')
+  }
+
+  function remoteCheckbox(): HTMLInputElement {
+    return screen.getByRole('checkbox', { name: /Also delete remote branch/ }) as HTMLInputElement
+  }
+
+  it('只删本地（远程那项没勾）：不走网络——SSH agent 审批、凭据框都不该为此弹出来', async () => {
+    respondWith(WITH_REMOTE)
+    render(dialog({ prs: [] }))
+    await waitFor(() => expect(deleteButton().disabled).toBe(false))
+    expect(remoteCheckbox().checked).toBe(false)
+    expect(prefetchCalls()).toHaveLength(0)
+  })
+
+  it('勾上远程那项就预取，护栏在点确认时不必再握一次手', async () => {
+    respondWith(WITH_REMOTE)
+    render(dialog({ prs: [] }))
+    await waitFor(() => expect(deleteButton().disabled).toBe(false))
+    fireEvent.click(remoteCheckbox())
+    await waitFor(() => expect(prefetchCalls()).toEqual([
+      // JSX 属性字符串不处理转义：dialog() 里的 repoPath="C:\\repo" 实际是两个反斜杠
+      ['prefetch_remote_default', { path: String.raw`C:\\repo`, remote: 'origin' }],
+    ]))
+  })
+
+  it('PR 列表晚到触发重查：远程没变，不再发一趟', async () => {
+    respondWith(WITH_REMOTE)
+    const { rerender } = render(dialog({ prs: [] }))
+    await waitFor(() => expect(deleteButton().disabled).toBe(false))
+    fireEvent.click(remoteCheckbox())
+    await waitFor(() => expect(prefetchCalls()).toHaveLength(1))
+    rerender(dialog({ prs: [MERGED_PR] }))
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.filter(([c]) => c === 'branch_delete_info')).toHaveLength(2))
+    expect(prefetchCalls()).toHaveLength(1)
+  })
+
+  it('勾着的时候重查发现远程分支受保护：换了远程也不预取（门控看的是能不能删，不只是勾没勾）', async () => {
+    let current = WITH_REMOTE
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === 'branch_delete_info' ? current : undefined)
+    const { rerender } = render(dialog({ prs: [] }))
+    await waitFor(() => expect(deleteButton().disabled).toBe(false))
+    fireEvent.click(remoteCheckbox())
+    await waitFor(() => expect(prefetchCalls()).toHaveLength(1))
+
+    current = { ...WITH_REMOTE, remote: 'upstream', remoteProtected: true }
+    rerender(dialog({ prs: [MERGED_PR] }))
+    await waitFor(() => expect(remoteCheckbox().disabled).toBe(true))
+    expect(prefetchCalls()).toHaveLength(1)
+  })
+
+  it('取消再重新勾选会再发一次：上次过期或失败时靠这个刷新，去重在后端', async () => {
+    respondWith(WITH_REMOTE)
+    render(dialog({ prs: [] }))
+    await waitFor(() => expect(deleteButton().disabled).toBe(false))
+    fireEvent.click(remoteCheckbox())
+    fireEvent.click(remoteCheckbox())
+    fireEvent.click(remoteCheckbox())
+    await waitFor(() => expect(prefetchCalls()).toHaveLength(2))
+  })
+
+  it('默认分支的勾选框是禁用的，点不上，也就不会预取', async () => {
+    respondWith({ ...WITH_REMOTE, remoteProtected: true })
+    render(dialog({ prs: [] }))
+    await waitFor(() => expect(deleteButton().disabled).toBe(false))
+    expect(remoteCheckbox().disabled).toBe(true)
+    fireEvent.click(remoteCheckbox())
+    expect(remoteCheckbox().checked).toBe(false)
+    expect(prefetchCalls()).toHaveLength(0)
+  })
+
+  it('不管理远程的模式（SVN 混合仓库）没有勾选框，也就不会预取', async () => {
+    respondWith(WITH_REMOTE)
+    render(
+      <DeleteBranchDialog
+        repoPath="C:\\repo"
+        name="feat/x"
+        capabilities={{ ...ALL_CAPABILITIES, remotes: false }}
+        mergedPullRequests={[]}
+        onCancel={() => {}}
+        onConfirm={async () => {}}
+      />,
+    )
+    await waitFor(() => expect(deleteButton().disabled).toBe(false))
+    expect(screen.queryByRole('checkbox', { name: /Also delete remote branch/ })).toBeNull()
+    expect(prefetchCalls()).toHaveLength(0)
+  })
+
+  it('没有远程分支：不预取', async () => {
+    respondWith(INFO)
+    render(dialog({ prs: [] }))
+    await waitFor(() => expect(deleteButton().disabled).toBe(false))
+    expect(prefetchCalls()).toHaveLength(0)
+  })
+})

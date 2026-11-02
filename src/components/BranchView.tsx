@@ -9,6 +9,7 @@ import { useConfirm } from './ConfirmDialog'
 import { isProtectedBaseline, type Capabilities } from '../engine/capabilities'
 import { goneUpstreamName, goneUpstreamTooltip } from '../engine/refPills'
 import { mergedPullRequestsFor } from '../engine/deleteBranchNote'
+import { prefetchRemoteDefaultForRef } from '@/store/repoStore'
 
 interface BranchViewProps {
   refs: RefPointer[]
@@ -198,17 +199,22 @@ export function BranchView({
     },
     {
       label: 'Delete remote branch…',
-      onSelect: () => void confirm({
-        title: 'Delete Remote Branch',
-        message: 'Delete this branch from the remote repository',
-        detail: { label: 'Branch:', value: full },
-        warning: '远程分支是共享的，删掉之后其他人下次 fetch --prune 也会跟着少这一条。',
-        confirmLabel: 'Delete',
-        danger: true,
-        // 交给弹框去跑：这一步要走网络，得让等待可见
-        action: () => onDeleteRemote(full),
-        busyLabel: '正在联系远程…',
-      }),
+      onSelect: () => {
+        // 护栏要先问远程默认分支，那是一整趟 SSH 握手（实测 3 秒多）。趁用户读
+        // 确认框先发出去，点 Delete 时就只剩 push 一次连接
+        if (repoPath) prefetchRemoteDefaultForRef(repoPath, full)
+        void confirm({
+          title: 'Delete Remote Branch',
+          message: 'Delete this branch from the remote repository',
+          detail: { label: 'Branch:', value: full },
+          warning: '远程分支是共享的，删掉之后其他人下次 fetch --prune 也会跟着少这一条。',
+          confirmLabel: 'Delete',
+          danger: true,
+          // 交给弹框去跑：这一步要走网络，得让等待可见
+          action: () => onDeleteRemote(full),
+          busyLabel: '正在联系远程…',
+        })
+      },
       danger: true,
     },
   ]

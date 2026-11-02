@@ -395,6 +395,52 @@ fn remote_default_branch_from_network(path: &str, remote: &str) -> Option<String
         .map(|s| s.to_string())
 }
 
+/// 缓存 key：仓库路径 + 远程名 + 它的 fetch URL（`ls-remote` 问的就是这个地址）。
+///
+/// 带上 URL 是为了 `git remote set-url` 之后不拿旧远程的默认分支给新远程把关。
+/// 打不开仓库或找不到这个远程时返回 None，调用方就不走缓存、当场查。
+fn remote_head_cache_key(path: &str, remote: &str) -> Option<String> {
+    let repo = Repository::open(path).ok()?;
+    let r = repo.find_remote(remote).ok()?;
+    let url = String::from_utf8_lossy(r.url_bytes()).into_owned();
+    Some(format!("{path}\0{remote}\0{url}"))
+}
+
+/// 同 [`remote_default_branch_from_network`]，但先看预取的结果。
+///
+/// 预取还在路上就限时等它；取不到成功结果（没预取、过期、预取失败、等超时）就当场查。
+/// 预取结果取走即消失，安全边界见 [`crate::engine::remote_head_cache`]。
+fn remote_default_branch_cached(path: &str, remote: &str) -> Option<String> {
+    use crate::engine::remote_head_cache::{global, MAX_WAIT, TTL};
+    let query = || remote_default_branch_from_network(path, remote);
+    match remote_head_cache_key(path, remote) {
+        Some(key) => global().take_or_query(&key, TTL, MAX_WAIT, query),
+        None => query(),
+    }
+}
+
+/// 用户表明要删远程时调用：提前问好远程的默认分支，点确认时护栏不必再握一次手。
+///
+/// 只读、无副作用，失败也不报——失败不留痕，护栏到时会自己问。已有查询在路上时直接
+/// 返回，不排队占线程。
+pub fn prefetch_remote_default(path: &str, remote: &str) {
+    use crate::engine::remote_head_cache::{global, TTL};
+    if let Some(key) = remote_head_cache_key(path, remote) {
+        global().prefetch(&key, TTL, || {
+            remote_default_branch_from_network(path, remote)
+        });
+    }
+}
+
+/// 同 [`prefetch_remote_default`]，按侧边栏给的 `origin/feat/x` 形式定位远程。
+///
+/// 拆分放后端的理由同 [`split_remote_ref`]：远程名可以带斜杠。
+pub fn prefetch_remote_default_for_ref(path: &str, remote_ref: &str) {
+    if let Ok((remote, _)) = split_remote_ref(path, remote_ref) {
+        prefetch_remote_default(path, &remote);
+    }
+}
+
 /// 删远程分支之前拦一道：远程的默认分支一律不给删。
 ///
 /// 不能把这个判断外包给服务端。GitHub 确实会用 `refusing to delete the current
@@ -409,13 +455,16 @@ fn remote_default_branch_from_network(path: &str, remote: &str) -> Option<String
 /// **先问远程，本地 ref 只当兜底。** 反过来的话 [`remote_default_branch`] 的
 /// 两个毛病会正好落在最坏的地方：`git remote add` 加的远程（fork 工作流里的
 /// `upstream`，也就是别人的主仓库）根本没有那条 ref，护栏直接放行；本地 ref
-/// 过期时护栏还会去保护一个已经不存在的旧名字，把现役的默认分支放过去。这里
-/// 多花的一次 ls-remote 往返，相对紧接着那次 push 可以忽略。
+/// 过期时护栏还会去保护一个已经不存在的旧名字，把现役的默认分支放过去。
+///
+/// 那次 ls-remote 是一整趟 SSH 握手（实测到 GitHub 3 秒多，和 push 一样贵），
+/// 所以用户表明要删远程时会用 [`prefetch_remote_default`] 提前发出去，这里优先
+/// 复用那个结果，见 [`remote_default_branch_cached`]。
 ///
 /// 两条路都问不出来时**放行**：这时候要么是断网（push 一样会失败），要么这个
 /// 远程真的没有默认分支，没有依据就不该拦着用户干活。
 pub fn ensure_deletable_on_remote(path: &str, remote: &str, branch: &str) -> Result<()> {
-    let default = remote_default_branch_from_network(path, remote).or_else(|| {
+    let default = remote_default_branch_cached(path, remote).or_else(|| {
         Repository::open(path)
             .ok()
             .and_then(|repo| remote_default_branch(&repo, remote))

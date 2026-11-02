@@ -18,6 +18,7 @@ pub mod ops;
 pub mod path;
 pub mod proc;
 pub mod refs;
+pub mod remote_head_cache;
 pub mod repo;
 pub mod session;
 pub mod stash;

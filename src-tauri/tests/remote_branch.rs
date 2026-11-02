@@ -78,6 +78,36 @@ fn p(dir: &TempDir) -> String {
     dir.path().to_str().unwrap().to_string()
 }
 
+/// 拿 bare 远程自己的 HEAD 当事实来源，不去猜 init.defaultBranch 是什么。
+fn default_branch_of(remote: &TempDir) -> String {
+    let head = git_out(remote.path(), &["symbolic-ref", "HEAD"]);
+    head.strip_prefix("refs/heads/").expect(&head).to_string()
+}
+
+/// 离开作用域时把目录挪回原处。放在 Drop 里：`f` panic 时也要挪回去，
+/// TempDir 只认原路径，否则目录会留在磁盘上。
+struct MoveBack<'a> {
+    moved: std::path::PathBuf,
+    original: &'a std::path::Path,
+}
+
+impl Drop for MoveBack<'_> {
+    fn drop(&mut self) {
+        let _ = fs::rename(&self.moved, self.original);
+    }
+}
+
+/// 在远程目录被挪走（模拟连不上）期间跑 `f`，跑完挪回去。
+fn with_remote_moved_away<T>(remote: &TempDir, f: impl FnOnce() -> T) -> T {
+    let moved = remote.path().with_extension("moved");
+    fs::rename(remote.path(), &moved).unwrap();
+    let _back = MoveBack {
+        moved,
+        original: remote.path(),
+    };
+    f()
+}
+
 #[test]
 fn splits_the_remote_name_off_the_ref() {
     let (_remote, work) = cloned_repo();
@@ -181,12 +211,7 @@ fn refuses_to_delete_the_remotes_default_branch() {
 #[test]
 fn refuses_to_delete_the_default_branch_of_a_remote_added_by_hand() {
     let (remote, work) = repo_with_added_remote();
-    // 拿远程自己的 HEAD 当事实来源，不去猜 init.defaultBranch 是什么
-    let default_ref = git_out(remote.path(), &["symbolic-ref", "HEAD"]);
-    let default_branch = default_ref
-        .strip_prefix("refs/heads/")
-        .expect(&default_ref)
-        .to_string();
+    let default_branch = default_branch_of(&remote);
 
     // 前提确认：本地确实没有这条 ref，纯靠它判断必然放行
     assert!(
@@ -237,4 +262,121 @@ fn an_ordinary_branch_is_still_deletable_on_a_remote_without_a_head_ref() {
         &["ls-remote", "--heads", "origin", "feat/ordinary"]
     )
     .is_empty());
+}
+
+/// 预取过之后护栏照样挡住默认分支（预取不能削弱护栏）。
+///
+/// 用 `git remote add` 接上的远程：本地没有 `origin/HEAD`，挡不挡只取决于预取或
+/// 当场查询的结果。「护栏确实用了预取」由下一条测试证明。
+#[test]
+fn a_prefetched_default_branch_is_still_refused() {
+    let (remote, work) = repo_with_added_remote();
+    let default_branch = default_branch_of(&remote);
+
+    branch::prefetch_remote_default(&p(&work), "origin");
+
+    let err = ops::delete_remote_ref(p(&work), format!("origin/{default_branch}")).unwrap_err();
+    assert_eq!(err.code, "protected_branch", "{}", err.message);
+    assert!(
+        !git_out(
+            work.path(),
+            &["ls-remote", "--heads", "origin", &default_branch]
+        )
+        .is_empty(),
+        "默认分支被删掉了"
+    );
+}
+
+/// 护栏**真的用了**预取结果，而不是又问了一次远程。
+///
+/// 预取之后把远程目录挪走：护栏再去 ls-remote 必然失败，本地又没有 `origin/HEAD`
+/// 可兜底——没用上预取的话护栏无依据放行，错误码会是 push 失败的 `git_cli`。
+/// 只有复用了预取结果才会报 `protected_branch`。
+#[test]
+fn the_guard_uses_the_prefetch_instead_of_asking_the_remote_again() {
+    let (remote, work) = repo_with_added_remote();
+    let default_branch = default_branch_of(&remote);
+
+    branch::prefetch_remote_default(&p(&work), "origin");
+
+    let result = with_remote_moved_away(&remote, || {
+        ops::delete_remote_ref(p(&work), format!("origin/{default_branch}"))
+    });
+    let err = result.unwrap_err();
+    assert_eq!(err.code, "protected_branch", "{}", err.message);
+}
+
+/// 侧边栏入口按 `origin/x` 这种形式预取，护栏同样要用上这个结果。
+///
+/// 手法同上一条：预取后挪走远程、本地没有 `origin/HEAD`，只有预取真的按拆出来的
+/// 远程名存进了缓存，才可能报 `protected_branch`。
+#[test]
+fn prefetching_by_remote_ref_fills_the_cache_the_guard_reads() {
+    let (remote, work) = repo_with_added_remote();
+    let remote_ref = format!("origin/{}", default_branch_of(&remote));
+
+    branch::prefetch_remote_default_for_ref(&p(&work), &remote_ref);
+
+    let result = with_remote_moved_away(&remote, || ops::delete_remote_ref(p(&work), remote_ref));
+    let err = result.unwrap_err();
+    assert_eq!(err.code, "protected_branch", "{}", err.message);
+}
+
+/// 预取失败（当时断网）之后网络恢复：护栏不能沿用那次失败，要自己再问一次。
+///
+/// 本地没有 `origin/HEAD` 可兜底，沿用失败就会放行，而此刻 push 已经能到达远程。
+#[test]
+fn a_failed_prefetch_does_not_disarm_the_guard() {
+    let (remote, work) = repo_with_added_remote();
+    let default_branch = default_branch_of(&remote);
+
+    with_remote_moved_away(&remote, || {
+        branch::prefetch_remote_default(&p(&work), "origin");
+    });
+
+    let err = ops::delete_remote_ref(p(&work), format!("origin/{default_branch}")).unwrap_err();
+    assert_eq!(err.code, "protected_branch", "{}", err.message);
+}
+
+/// 预取之后改了远程 URL，旧结果不能拿来给新远程把关。
+///
+/// 两个远程的默认分支不同：A 是建仓时的默认分支，B 是 `trunk`。预取的是 A，
+/// 随后 origin 改指 B。缓存要是只按远程**名字**记，护栏会拿 A 的默认分支去比，
+/// 于是放行删除 B 的默认分支 `trunk`。
+#[test]
+fn changing_the_remote_url_does_not_reuse_a_stale_prefetch() {
+    let (_remote_a, work) = repo_with_added_remote();
+    let url_b_dir = TempDir::new().unwrap();
+    let url_b = url_b_dir.path().to_str().unwrap().to_string();
+    run_git(url_b_dir.path(), &["init", "--bare"]);
+    run_git(
+        work.path(),
+        &["push", "-q", &url_b, "HEAD:refs/heads/trunk"],
+    );
+    run_git(
+        url_b_dir.path(),
+        &["symbolic-ref", "HEAD", "refs/heads/trunk"],
+    );
+
+    branch::prefetch_remote_default(&p(&work), "origin");
+    run_git(work.path(), &["remote", "set-url", "origin", &url_b]);
+    run_git(work.path(), &["fetch", "-q", "origin"]);
+
+    let err = ops::delete_remote_ref(p(&work), "origin/trunk".into()).unwrap_err();
+    assert_eq!(err.code, "protected_branch", "{}", err.message);
+    assert!(
+        !git_out(url_b_dir.path(), &["branch", "--list", "trunk"]).is_empty(),
+        "B 的默认分支被删掉了"
+    );
+}
+
+/// 预取之后删普通分支照常能删——缓存不能把护栏变成「全拦」。
+#[test]
+fn an_ordinary_branch_is_deletable_after_a_prefetch() {
+    let (_remote, work) = cloned_repo();
+    branch::prefetch_remote_default_for_ref(&p(&work), "origin/feat/x");
+
+    ops::delete_remote_ref(p(&work), "origin/feat/x".into()).unwrap();
+
+    assert!(git_out(work.path(), &["ls-remote", "--heads", "origin", "feat/x"]).is_empty());
 }
