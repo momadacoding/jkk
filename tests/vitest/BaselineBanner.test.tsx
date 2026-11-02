@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { BaselineBanner } from '@/components/BaselineBanner'
 import type { SyncState } from '@/engine/svnJournal'
 import type { SyncStatus } from '@/engine/svnSync'
+import type { HookHealth } from '@/engine/tsvnHooks'
 
 function renderWith(syncState: SyncState) {
   const onSyncAction = vi.fn()
@@ -144,5 +145,62 @@ describe('BaselineBanner 失同步横幅的「跟进」按钮', () => {
     renderSync({ ...advanced, verdict: { kind: 'wcLocked', dirs: ['Code'] } })
     expect(screen.getByText('SVN 正在更新…')).toBeTruthy()
     expect(screen.queryAllByRole('button')).toHaveLength(0)
+  })
+})
+
+describe('BaselineBanner 的 TortoiseSVN 钩子入口（C1h）', () => {
+  const inSync: SyncStatus = {
+    baselineRev: 3,
+    nodeRevs: [3],
+    base: { floor: 3, newer: 0, gone: 0 },
+    verdict: { kind: 'inSync' },
+  }
+
+  function renderHooks(hooks: HookHealth | null) {
+    const onOpenHooks = vi.fn()
+    const onUnregisterHooks = vi.fn()
+    render(
+      <BaselineBanner
+        isSvn
+        sync={inSync}
+        audit={null}
+        eol={null}
+        syncState={{ locked: false, holder: null, unfinished: null }}
+        onRebuild={() => {}}
+        onCheck={() => {}}
+        onMigrateEol={() => {}}
+        onSyncAction={() => {}}
+        onSyncOutAction={() => {}}
+        onSvnUpdate={() => {}}
+        hooks={hooks}
+        onOpenHooks={onOpenHooks}
+        onUnregisterHooks={onUnregisterHooks}
+      />,
+    )
+    return { onOpenHooks, onUnregisterHooks }
+  }
+
+  it('体检基线旁有「TortoiseSVN 钩子…」', () => {
+    const { onOpenHooks } = renderHooks({ state: 'notRegistered' })
+    fireEvent.click(screen.getByRole('button', { name: 'TortoiseSVN 钩子…' }))
+    expect(onOpenHooks).toHaveBeenCalledTimes(1)
+  })
+
+  it('失效时挂横幅，可以重新注册，也可以撤销注册', () => {
+    const { onOpenHooks, onUnregisterHooks } = renderHooks({
+      state: 'stale',
+      reasons: ['post_commit 钩子指向 D:\\old\\app.exe'],
+    })
+    expect(screen.getByText('TortoiseSVN 钩子已失效')).toBeTruthy()
+    expect(screen.getByText(/D:\\old\\app\.exe/)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '重新注册' }))
+    fireEvent.click(screen.getByRole('button', { name: '撤销注册' }))
+    expect(onOpenHooks).toHaveBeenCalledTimes(1)
+    expect(onUnregisterHooks).toHaveBeenCalledTimes(1)
+  })
+
+  it('健康时不挂失效横幅', () => {
+    renderHooks({ state: 'healthy', blockLeaks: true })
+    expect(screen.queryByText('TortoiseSVN 钩子已失效')).toBeNull()
   })
 })

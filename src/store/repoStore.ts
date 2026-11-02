@@ -46,6 +46,7 @@ import type {
 } from '../engine/svnInit'
 import { samePath } from '../engine/path'
 import type { FollowOutcome, SvnUserInfo } from '../engine/svnFollow'
+import type { HookHealth, TsvnHooksStatus } from '../engine/tsvnHooks'
 import type { SyncInExpect, SyncInOutcome, SyncInPreview } from '../engine/svnSyncIn'
 import type { SyncOutExpect, SyncOutOutcome, SyncOutPreview } from '../engine/svnSyncOut'
 import { nextSelection } from '../engine/selection'
@@ -374,6 +375,21 @@ export function svnGetUser(path: string): Promise<SvnUserInfo> {
 /** 写配置里的 `svnUser`，空串清除。 */
 export function svnSetUser(path: string, user: string): Promise<void> {
   return invoke<void>('svn_set_user', { path, user })
+}
+
+/** TortoiseSVN 钩子的状态与注册计划（C1h）。只读注册表，会跑 `svn info` 找工作副本根。 */
+export function tsvnHooksStatus(path: string): Promise<TsvnHooksStatus> {
+  return invoke<TsvnHooksStatus>('tsvn_hooks_status', { path })
+}
+
+/** 写 TortoiseSVN 的钩子设置。调用方先让用户在注册框里确认。 */
+export function tsvnHooksRegister(path: string, blockLeaks: boolean): Promise<HookHealth> {
+  return invoke<HookHealth>('tsvn_hooks_register', { path, blockLeaks })
+}
+
+/** 删掉本仓库的 jkk 钩子，别人的钩子原样保留。 */
+export function tsvnHooksUnregister(path: string): Promise<void> {
+  return invoke<void>('tsvn_hooks_unregister', { path })
 }
 
 export function svnSyncOutPreview(path: string): Promise<SyncOutPreview> {

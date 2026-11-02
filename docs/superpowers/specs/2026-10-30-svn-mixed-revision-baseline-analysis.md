@@ -1,7 +1,7 @@
 # SVN 混合版本基线与「跟进外部提交」——设计分析
 
-- 日期：2026-10-30（2026-10-31 第三至六轮修订，2026-11-01 第七轮修订）
-- 状态：C1a 已实现（未合并），实际范围见 §9。本文已按实现回写（第七轮，§12）；C1h、C1b、C2、C3 仍是计划。2026-10-30 用户已回答全部问题（§10）：选定 C-α，自动跟进，交付不强制更新整个项目，允许混合版本初始化。实现过程的全部细节见 `docs/superpowers/plans/2026-10-31-svn-mixed-baseline-c1a-decisions.md`（下称「实现日志」）
+- 日期：2026-10-30（2026-10-31 第三至六轮修订，2026-11-01 第七轮修订，2026-11-02 第八轮修订）
+- 状态：C1a 已合并；C1h 已实现（未合并）；实际范围见 §9。本文已按实现回写（第七、八轮，§12）；C1b、C2、C3 仍是计划。C1h 的实现细节见 `docs/superpowers/plans/2026-11-01-svn-c1h-tsvn-hooks-decisions.md`（下称「C1h 日志」）。2026-10-30 用户已回答全部问题（§10）：选定 C-α，自动跟进，交付不强制更新整个项目，允许混合版本初始化。实现过程的全部细节见 `docs/superpowers/plans/2026-10-31-svn-mixed-baseline-c1a-decisions.md`（下称「实现日志」）
 - 关联：主规格 `2026-09-12-svn-git-hybrid-design.md` 的 §6.3.1、§6.4、§6.6、§6.8、§7.3、§8.1、§8.2.1、§9.4、§10.3、§15、§16.1、§16.2
 - 已过两轮独立 review（2026-10-30），并按 2026-10-31 与用户的讨论做了第三至五轮修订（第四轮新增 §6.13 TortoiseSVN 钩子；第五轮按用户的日常工作流逐项核对，新增 §1.5、§6.14；第六轮补充子目录局部更新的场景 U7，失同步判定改看最后修改 revision）；第七轮把实现中的修正回写到各章节，见 §12
 
@@ -491,7 +491,7 @@ journal 记下每一步之前的 OID，重开时从断点补做。不变量：**
 - **触发：** jkk 主窗口拿到焦点时，读每个 wc(P) 的 `.svn/wc.db` 的戳（mtime + size），与上次比较；变了才跑一次第二档完整校验。mtime 走 IPC 时是十进制字符串（纳秒超过 2^53）。wc(P) 清单在进程内缓存，戳变了或白名单变了才重新枚举，每次焦点只 `stat`；external 的增删一定写父 wc 的 wc.db。用户的操作顺序是「在 TortoiseSVN 里提交 → 切回 jkk」，焦点事件正好落在需要检测的时刻。另外 `repo-changed` 读到 HEAD 变了也跑第二档：切分支不写 wc.db，而「当前分支落后基线」是第二档的结论
 - **为什么不在第一期用 notify：** 省掉了 Windows notify 下 wc.db 的事件形状、TSVNCache 后台进程会不会高频改写 wc.db、仓库外的工作副本根（`svn_wc.rs:23`，例如白名单落在指向外部目录的 external 里）要单独挂监听这三个未知数。E19 已证明 jkk 发的只读 svn 命令都不写 wc.db，第二档校验不会自激；`changelist`、`cleanup` 会写，只多一次无害的校验
 - **失焦快照（第七轮，取代 T0）：** 最近判定是 InSync、没有校验在跑、wc.db 戳没变时，jkk 失焦就写一份快照 `FollowMark { at, head_oid, branch, staged, base_oid }` 到 `.git/mygitclient/follow-mark.json`（`git diff-index --cached -z --ita-invisible-in-index HEAD`，不扫工作区；先写临时文件再 rename；watcher 过滤这个目录），供 §6.11.1 判断暂存与 commit 是否早于外部提交。快照能挺过重启；跟进完成后清掉。四道闸都只会让它少写，少写的后果是走「拿不准」。校验结果用代次闸，晚到的旧结果不能把 ExternallyAdvanced 盖回 InSync
-- **更新进行中（第五轮，U1）：** 每周根目录更新要半小时，期间用户切回 jkk，焦点检测会看到 wc.db 在变。工作副本被 svn 锁住时 `svn status` 仍 rc=0，只有目录 entry 带 `wc-locked="true"`（E15），不是报错，所以看这个属性，判 `WcLocked`：横幅显示 SVN 操作进行中，不跟进、不录制。分不出活锁与陈旧锁，不自动 cleanup。白名单外的目录被锁时看不到，那也不影响白名单。有钩子时由 Start-update 直接暂停 jkk 的刷新与跟进、Post-update 统一恢复（§6.13.1）
+- **更新进行中（第五轮，U1）：** 每周根目录更新要半小时，期间用户切回 jkk，焦点检测会看到 wc.db 在变。工作副本被 svn 锁住时 `svn status` 仍 rc=0，只有目录 entry 带 `wc-locked="true"`（E15），不是报错，所以看这个属性，判 `WcLocked`：横幅显示 SVN 操作进行中，不跟进、不录制。分不出活锁与陈旧锁，不自动 cleanup。白名单外的目录被锁时看不到，那也不影响白名单。设想过有钩子时由 Start-update 暂停 jkk 的刷新与跟进，C1h 没有做（§6.13.1），更新期间仍靠 `wc-locked`
 - **TortoiseSVN 钩子（§6.13）：** 注册后，Post-commit / Post-update 事件是即时且精确的信号；焦点 + wc.db 戳仍保留，兜住命令行 svn、IDE 插件与钩子失效的情形
 - **以后：** 没有钩子、又真需要在 jkk 后台时也能发现（例如为了 C2 的通知），再补 notify 监听：在 `is_relevant`（`commands/watch.rs:117`）里对这个具体文件放行，其余 `.svn` 内容仍过滤；`wc.db-journal` 等 SQLite 旁路文件不放行；仓库外的工作副本根单独挂监听目标
 - **交互：** 自动跟进（用户 2026-10-30 选定，Q1），执行条件、通知与开关见 §6.12。条件不满足时挂黄色横幅，给「跟进」按钮并写明没有自动执行的原因
@@ -617,7 +617,7 @@ journal 记下每一步之前的 OID，重开时从断点补做。不变量：**
   - Local-Only commit 是按 hunk 的事实来源：注释 log 之类的 hunk 做成 Local-Only commit，它们不出现在「本地改动」里，跟进时照常重放保留，交付时被摘掉（`svn_deliver.rs` 已实现）
   - `ignore-on-commit` 是 TortoiseSVN 侧按文件的粗粒度保护，继续保留
   - 要把这类文件里的功能 hunk 提交上去：用 TortoiseSVN 时，走它自带的「提交后恢复」（提交框里右键文件 → Restore after commit，手工删掉不要的改动后提交，提交完自动恢复原文件；TortoiseSVN 手册 `tsvn-dug-commit.html`，经 Context7 查得）。用 jkk 交付时自动摘掉 Local-Only，不用手工删，但要等 C3（§6.8）
-  - 两条路都由 F3（§6.5）与 Pre-commit 钩子（§6.13.4）按 hunk 检查本地补丁有没有被带上去
+  - 两条路都由 F3（§6.5）与 Check-commit 钩子（§6.13.4）按 hunk 检查本地补丁有没有被带上去
 
 #### 6.11.3 分支
 
@@ -678,6 +678,8 @@ journal 记下每一步之前的 OID，重开时从断点补做。不变量：**
 
 第四轮修订（2026-10-31，用户提出）。前面各节把 TortoiseSVN 当成黑盒，只能事后从 wc.db 与 `svn status` 推断它做了什么。用户提出给 TortoiseSVN 加一个与外部软件通讯的机制；查证后发现不需要改它的源码：TortoiseSVN 自带**客户端钩子脚本**（设置 → 钩子脚本，按工作副本路径注册）。
 
+> **第八轮：** C1h 已实现，本节按 TortoiseSVN 1.14.9 上的实测（C1h 日志 H1–H5、E2E）回写。
+
 文档已确认（TortoiseSVN 手册 `tsvn-dug-settings.html`「Client Side Hook Scripts」，经 Context7 查得）：
 
 - 钩子类型：Start-commit、Manual Pre-commit、Check-commit、Pre-commit、Post-commit、Start-update、Pre-update、Post-update、Pre-connect、Pre-lock、Post-lock
@@ -692,18 +694,20 @@ journal 记下每一步之前的 OID，重开时从断点补做。不变量：**
 
 | 钩子 | jkk 拿来做什么 | 替掉或补上什么 |
 |---|---|---|
-| Pre-commit | 记下提交开始的本机时刻 t_commit；对照 Local-Only 路径清单拦截（§6.13.4） | 给 §6.13.3 一个准确的先后基准；R4 从提交后告警变为提交前拦截 |
-| Post-commit | 补全这条提交事件：路径、`REVISION` | §6.11.1、§6.5 F2 ① 的作者 + 快照推断改为按事件判定（§6.13.3）；同时是即时的检测信号 |
-| Post-update | 记一条更新事件：`RESULTPATH` 里的路径、`REVISION` | 跟进时确知这些路径的变化来自更新（同事的改动），直接走三方合并 |
-| Start-update（可选） | 更新前把索引与分支位置钉住 | 更新出问题时有一个确定的回退点 |
+| Check-commit（可选，默认开） | 按 hunk 拦截 Local-Only 泄漏（§6.13.4），不写事件 | R4 从提交后告警变为提交前拦截 |
+| Pre-commit | 记下提交开始的本机时刻 t_commit | 给 §6.13.3 一个准确的先后基准 |
+| Post-commit | 补全这条提交事件：路径、`REVISION`。**提交失败时不被调用**（E155011 过期实测），收件箱会留下孤儿 Pre，配对要带时间窗，孤儿 24 小时后清掉 | §6.11.1、§6.5 F2 ① 的作者 + 快照推断改为按事件判定（§6.13.3） |
+| Post-update | 记一条更新事件：`RESULTPATH` 里的路径、`REVISION`。`RESULTPATH` 列根目录本身和每个实际被动过的文件，含已删除的，有冲突时照常调用 | 跟进时确知这些路径的变化来自更新（同事的改动），直接走三方合并 |
+
+没有注册 Start-update：原设想的「更新前钉住索引」用不上，跟进不在更新时动索引。Start-commit 只拿得到右键选中的根目录，也没有用处。
 
 #### 6.13.2 通讯方式：收件箱文件
 
-- 钩子只做一件事：把参数与 `PATH` / `RESULTPATH` 文件的内容写成一条事件，放进 `.git/mygitclient/tsvn-inbox/<时间戳>-<序号>.json`，立即返回 0（Pre-commit 的拦截除外，见 §6.13.4）。不连接 jkk 进程，不读 git 仓库
-- jkk 运行时立即处理（收件箱目录在文件监听里单独放行，或在下一次焦点检查时读取）；没在运行时，下次启动再处理。jkk 没开也绝不卡住提交
-- 事件只是线索，真相仍是 §6.2 的映射比较：事件里的 revision 不大于基线映射里对应路径 revision 的，视为已处理并删除；收件箱的条目数与保留时长设上限
-- 钩子本体的形态留给 spec：jkk 可执行文件带一个 CLI 子命令（要确认 Tauri 打包出的 GUI 子系统程序被 TortoiseSVN 调起时的行为、与单实例逻辑的交互），或随 jkk 分发一个极小的 exe。不用 PowerShell 脚本：启动慢，公司机器的 ExecutionPolicy 也可能禁止
-- 多个 wc(P) 时每个工作副本根各注册一次；钩子按 `CWD` / `PATH` 找到对应的 jkk 仓库
+- 钩子只做一件事：把参数与 `PATH` / `RESULTPATH` 文件的内容写成一条事件，放进 `.git/mygitclient/tsvn-inbox/<时间戳>-<序号>.json`，立即返回 0（Check-commit 不写事件，只做 §6.13.4 的拦截）。不连接 jkk 进程
+- 收件箱只在跟进时读。按事件即时触发属于 C2（§6.13.6），C1h 发现外部提交仍靠焦点 + wc.db 戳（§6.6）。jkk 没开也绝不卡住提交
+- 跟进完成（Done）之后清理：读收件箱之前记下时刻 `evidence_cutoff_ms`，早于它的事件都已反映在新基线里，可以删。原设想的「事件 revision 不大于映射 revision」不可比：更新事件的 revision 是「更新到哪个版本」，映射记的是文件最后修改的 revision。收件箱的条目数与保留时长设上限
+- 钩子本体是 jkk 的 exe 自带 `--tsvn-hook <kind> --repo "<仓库>"` 子命令（用户决定 D1），在 Tauri builder 之前分流。实测 GUI 子系统的 exe 当钩子没有控制台闪现，stderr 与退出码都能被 TortoiseSVN 拿到。不用 PowerShell 脚本：启动慢（冷启动约 0.35s），公司机器的 ExecutionPolicy 也可能禁止
+- 多个 wc(P) 时每个工作副本根各注册一次。**`CWD` 不能用来定位仓库：** 它是勾选文件的公共父目录，不是工作副本根，所以仓库路径写在注册的命令行里。TortoiseSVN 按路径前缀匹配钩子
 
 #### 6.13.3 有事件时的暂存与 commit 判定
 
@@ -724,18 +728,22 @@ Pre-commit 与 Post-commit 合起来给出「本机在 t_commit 开始提交、�
 
 #### 6.13.4 提交前拦截 Local-Only 泄漏
 
-- jkk 在 HEAD 变化时，把当前分支上 Local-Only commit 改过的路径，以及按 hunk 拆开的补丁，写进 `.git/mygitclient/local-only/`。钩子先拿 `PATH` 列表与路径清单求交集，没有交集直接放行，不读 git
-- 有交集的文件再按 hunk 检查（第五轮修订，U6）：磁盘上这一刻的内容就是要提交的内容（用了「提交后恢复」时，也是用户删过本地改动之后的版本），逐个 hunk 判断 Local-Only 的改动是否还在里面（例如对单个 hunk 做 `git apply -R --check`，精度与上下文行的处理待实测，§11）。只剩功能 hunk 时放行。只按路径判断的话，U6 里每次正常提交功能 hunk 都会被拦
-- 命中 → 钩子返回错误，TortoiseSVN 中止提交并显示错误内容：列出命中的文件、commit 与 hunk，提示取消勾选这些文件，或用「提交后恢复」删掉这些 hunk 再提交。jkk 设置里可以关掉拦截
-- 钩子自身出错（清单读不到、超时）→ 放行（fail-open），由跟进时的 F3 事后兜底。拦截是附加的一道防线，不能因为它坏了就让用户提交不了
-- Check-commit 在文档里与 Pre-commit 并列；它若拿得到勾选清单、返回错误时保留提交框，就比 Pre-commit 更合适（用户可以直接取消勾选再点提交）。两者的实际行为待实测（§11）；若 `PATH` 只给选择的根目录、拿不到勾选清单，拦截降级为 Post-commit 之后的告警
+- **拦截放在 Check-commit，不在 Pre-commit。** 实测 Check-commit 的 `PATH` 就是勾选的文件；返回错误时弹「Hook script failed」，**Abort** 回到提交框、消息保留，用户可以取消勾选再提交，也可以 **Proceed anyway** 越过。Pre-commit 返回错误时提交框会关掉，要走「Retry without hooks」
+- 不预先写 Local-Only 清单，钩子现场用 git2 读 `svn/base..HEAD` 上的 Local-Only commit。这样没有清单过期的问题，分支上没有 Local-Only commit 时只多一次 revwalk
+- 按 hunk 检查（第五轮修订，U6）与 F3 共用判定（`judge_sides`）：N 取磁盘上这一刻的字节。实测用了「提交后恢复」时，提交前看到的也是用户删过本地改动之后的版本。不用 `git apply -R --check`（W21 表明 `--unidiff-zero` 有假阳性）。只剩功能 hunk 时放行；拿不准的 hunk 也拦，提示里标「（可能）」。只按路径判断的话，U6 里每次正常提交功能 hunk 都会被拦
+- 命中 → 钩子返回错误，TortoiseSVN 显示 stderr：列出命中的文件、行号与 commit，提示取消勾选这些文件，或用「提交后恢复」删掉这些改动再提交。注册框里可以关掉拦截
+- **stderr 按线程 ANSI 代码页解读，要用 `CP_THREAD_ACP` 编码。** 不能用 `CP_ACP`：系统 locale 英文、用户 locale 中文的机器上，`CP_ACP` 是 1252，中文全变 `?`。线程代码页是单字节的非中文用户 locale 下，提示同样会变 `?`，这一点没有处理（C1h 日志 Task 7）
+- 钩子自身出错（读不到仓库、文件读不了）→ 放行（fail-open），由跟进时的 F3 事后兜底。拦截是附加的一道防线，不能因为它坏了就让用户提交不了
 
 #### 6.13.5 注册与健康检查
 
-- 由用户在 jkk 设置里明确开启。jkk 先列出将要写入的钩子（类型、工作副本路径、命令行），确认后写入 TortoiseSVN 的设置。存储位置（注册表或配置文件）与能否由程序写入待实测；不宜程序写入时，退回为给出步骤让用户在 TortoiseSVN 设置里手工添加
-- 不覆盖用户已有的同类钩子：同一路径上已有同类型钩子时停下，提示用户
-- 启动时与每次跟进前做健康检查：钩子仍在；命令路径仍指向当前的 jkk（便携版换了目录就会失效）；wc.db 显示有过提交、收件箱却没有对应事件时，判定钩子失效，降级到 §6.11.1 并提示
-- 关闭开关时撤销注册
+- 由用户在 jkk 里明确开启（入口是「体检基线」横幅上的「TortoiseSVN 钩子…」，没有设置页）。jkk 先列出将要写入的钩子（类型、工作副本路径、命令行），确认后写入 `HKCU\Software\TortoiseSVN` 的 `hooks` 值（REG_SZ，每条 6 行，追加后不用重启 TortoiseSVN）
+- 写入带 CAS，写完读回核对；认不出的格式（不能逐字节往返的值）拒绝写入，不重写
+- TortoiseSVN 设置窗口开着时点确定，可能把 jkk 写入的钩子整值盖掉（未实测）。写入时的两道核对发现不了几分钟后的覆盖，而条目全部消失时判的是「未注册」，没有失效横幅，所以注册框提醒先关掉设置窗口
+- 不覆盖用户已有的同类钩子：同一路径、祖先或子孙路径上已有同类型钩子时停下，提示用户
+- 打开仓库时与每次跟进之后读健康状态，跟进时再用只读注册表的 `quick_health`：三个必选钩子都在；命令路径是当前的 jkk（便携版换了目录就会失效）；`--repo` 是本仓库。不是实时的，失效横幅要等下一次读取才出现。原设想的「wc.db 显示有过提交、收件箱却没有事件就判失效」没有做：钩子健康时，这些路径本来就落到「拿不准」，方向安全
+- 失效横幅和注册框里都能撤销注册
+- **exe 不存在时 TortoiseSVN 会挡提交**（实测）：Check-commit 报「The system cannot find the file specified」，点 Proceed anyway 之后 Pre-commit 再让提交失败，要点 Retry without hooks。钩子进程起不来，fail-open 管不到。所以卸载或移动 jkk 之前要先撤销注册；注册框目前只对开发构建给这条提示
 - 钩子是精确模式，不是前提：未注册或失效时，一切退回 §6.6 与 §6.11.1
 
 #### 6.13.6 与自动跟进的关系
@@ -753,7 +761,7 @@ Post-commit / Post-update 事件是即时信号，jkk 在后台、不在焦点�
 | U3 | 每轮一个 commit | 用 TortoiseSVN 提交：F2 ① 把这些 commit 里已提交的路径换成 SVN 版本，变空的 commit 丢弃，不留归档 ref（§10 Q7）。用 jkk 提交：交付把整段 commit 作为一次 SVN 提交 | 同 U2 |
 | U4 | stash 修 bug 再回来 | 跟进不碰 stash；之后 apply 到新基线，只有修 bug 改了同一个文件时才出现真实冲突；changelist 不受影响（E11） | C1a |
 | U5 | feature 分支 + main 上修 bug + 最后整体提交或 merge 回 main | main 上的 bugfix 提交后，feature 在对象层重放跟上（§6.11.3，已挪回 C1a）；冲突才标「落后基线」，切换时手动跟进。jkk 的合并默认快进 / rebase 未做（仓库里还没有合并入口）；外部工具产生的 merge commit 在内容全部提交后由「已全部提交」捷径收掉（§6.5 F2） | C1a；用 jkk 提交要 C3 |
-| U6 | ignore changelist 里按 hunk 区分 | 本地补丁 hunk 做成 Local-Only commit；功能 hunk 用 TortoiseSVN「提交后恢复」或 jkk 交付提交；F3 与 Pre-commit 钩子按 hunk 检查泄漏（§6.5、§6.13.4、§6.11.2） | 检查：C1a / C1h；jkk 自动摘掉补丁：C3 |
+| U6 | ignore changelist 里按 hunk 区分 | 本地补丁 hunk 做成 Local-Only commit；功能 hunk 用 TortoiseSVN「提交后恢复」或 jkk 交付提交；F3 与 Check-commit 钩子按 hunk 检查泄漏（§6.5、§6.13.4、§6.11.2） | 检查：C1a / C1h；jkk 自动摘掉补丁：C3 |
 | U7 | 子目录每天局部更新，要分清哪些是自己的改动 | 局部更新与自己的 TortoiseSVN 提交走同一个 ExternallyAdvanced → 跟进：同事的改动进基线，「本地改动」只剩自己的。按最后修改 revision 判定，只是被局部更新推高节点 revision 的文件不算变化，映射不膨胀（§6.2、E12）。暂存过的文件走三方合并（§6.11.1、W13）。局部更新产生 SVN 冲突时，先在 TortoiseSVN 里解决（条件 4）。通知与基线 commit 说明按 revision 和作者列出带进来的改动（§6.10）。分支上 commit 改过的文件被同事改了时，条件 11 会挡住自动跟进 | C1a；钩子事件让来源更确定：C1h |
 
 结论：U1、U4、U7 在 C1a 完整满足（U7 依赖第六轮的「按最后修改 revision 判定」）；U2、U3 用 TortoiseSVN 提交时 C1a 满足，C1h 让判定更准；U5、U6 依赖第五轮的三处修订（按 hunk 检查泄漏、「已全部提交」捷径、其他分支重放挪回 C1a）。四个场景里「用 jkk 提交到 SVN」都要等 C3，因此 C3 排在 C2 之前（§9；用户 2026-11-01 确认，§10 Q8）。
@@ -785,11 +793,11 @@ Post-commit / Post-update 事件是即时信号，jkk 在后台、不在焦点�
 | R21 | 撤销之后立刻被再次自动跟进 | §6.12 条件 13 |
 | R22 | 作者规则误丢暂存或 commit 里的改动：另一台机器上的提交（作者也是我），或「我」配置错 | 失焦快照（含 `base_oid` 路径范围）挡住「提交之后才暂存 / 提交」，Local-Only commit 不进 F2 ①；另一台机器的情形在没有钩子时接受（§6.11.1），钩子健康时关掉（§6.13.3）；旧索引与暂存 blob 钉住、原 commit 在 reflog，能找回；通知里列出所有被丢弃 / 换掉的路径；「我」取不到时一律当成「不是我」，退回三方合并 |
 | R23 | 失焦快照失真：没写上、损坏、写于提交之后 | 没有快照或损坏 ⇒ 拿不准；前端四道闸（判定 InSync、无校验在跑、wc.db 戳没变、读戳成功）只会少写；`base_oid` 限定路径范围，不是 NEW 的祖先时拿不准。打开仓库后第一次失焦没有戳可比，提交在 jkk 前台完成的形状放得过去，下一次焦点之后就有了。代价只是少一次自动丢弃 |
-| R24 | 钩子失效（jkk 换了目录、被用户在 TortoiseSVN 里删掉、事件丢失），jkk 却仍按「钩子健康」判定 | 启动时与每次跟进前做健康检查；wc.db 显示有提交而收件箱没有事件即判失效、降级并提示（§6.13.5）。失效方向是「本该有事件的路径被当成不在事件里」，按 §6.13.3 落进「拿不准」，不会误丢 |
-| R25 | 钩子挡住了正常的提交，或拖慢 TortoiseSVN | 只有 Pre-commit 的 Local-Only 命中会返回错误，其余钩子一律立即返回 0；钩子自身出错时放行（fail-open）；钩子不读 git 仓库，只写收件箱文件、读一份预先算好的路径清单；设置里可以单独关掉拦截 |
+| R24 | 钩子失效（jkk 换了目录、被用户在 TortoiseSVN 里删掉、事件丢失），jkk 却仍按「钩子健康」判定 | 打开仓库时与每次跟进前后做健康检查，只核对注册表条目（§6.13.5），事件丢失判不出来。失效方向是「本该有事件的路径被当成不在事件里」，按 §6.13.3 落进「拿不准」，不会误丢 |
+| R25 | 钩子挡住了正常的提交，或拖慢 TortoiseSVN | 只有 Check-commit 的 Local-Only 命中会返回错误，其余钩子一律立即返回 0；钩子自身出错时放行（fail-open），panic 也兜住；用户可以 Proceed anyway；注册框里可以关掉拦截。**例外：exe 不存在时每次提交要多点两道（§6.13.5）**，实测已确认，靠失效横幅和撤销注册缓解。release exe 一次钩子约 100ms（含进程启动），大工程未测 |
 | R26 | 钩子改了用户的 TortoiseSVN 配置，影响 jkk 之外的使用 | 用户明确开启才注册，写入前列出内容；不覆盖已有同类钩子；关闭时撤销；不用会提交进仓库的 `tsvn:*hook` 属性（§6.13） |
 | R27 | Local-Only 检查按路径判断，U6 里正常提交功能 hunk 被误报，或被钩子拦下 | 改为按 hunk（§6.5 F3、§6.13.4） |
-| R28 | 按 hunk 检查漏判：Local-Only hunk 附近有已提交的功能改动，上下文对不上 | F3 用零上下文 diff 做行号映射，重叠 hunk 里按 `+` 行逐条查（方向是多报）；B→L 与 B→NEW 独立 diff，内容重复时 hunk 滑动仍可能判成不重叠；钩子侧的精度待实测（§11）。钩子只是附加防线，F3 兜底 |
+| R28 | 按 hunk 检查漏判：Local-Only hunk 附近有已提交的功能改动，上下文对不上 | F3 用零上下文 diff 做行号映射，重叠 hunk 里按 `+` 行逐条查（方向是多报）；B→L 与 B→NEW 独立 diff，内容重复时 hunk 滑动仍可能判成不重叠；钩子与 F3 共用判定，精度相同（§6.13.4）。钩子只是附加防线，F3 兜底 |
 | R29 | merge 回 main 后，跟进、更新、交付全部因不线性被拒 | jkk 的合并默认快进 / rebase（C1a 未做，仓库还没有合并入口）；F2 的「已全部提交」捷径收掉内容已全部进 SVN 的分支（§6.5、§6.11.3） |
 | R30 | 「已全部提交」捷径误判，把还有未提交内容的分支移到 NEW | 判据逐路径比较 blob 与 mode（含删除），区间里有 Local-Only 就不走捷径；旧分支位置在 reflog |
 | R31 | 更新进行中触发检测与跟进，读到更新到一半的工作副本 | 工作副本被锁时跳过（§6.6、条件 2）；R1 本来就拒绝 update 中途 |
@@ -830,7 +838,8 @@ Post-commit / Post-update 事件是即时信号，jkk 在后台、不在焦点�
 | | `src/store/repoStore.ts`、`RepoTab.tsx`、`App.tsx`、`svnSyncFlow.ts`、`BaselineBanner.tsx`、`ConfirmDialog.tsx`、`BranchView.tsx` | 焦点 / 失焦、跟进入口、「落后基线」与「切换并手动跟进」 |
 | | `src/engine/svnGraph.ts`、`CommitRow.tsx`、`styles.css` | 混合基线的接合、标注与收起（§6.9） |
 | 测试 | `src-tauri/tests/svn_*.rs`、`tests/vitest/` | 见实现日志进度总账 |
-| 未改（后续期） | 新增 `svn_tsvn_hook.rs`、钩子 CLI 入口、合并入口、设置页、「本地改动」按 changelist 分组 | C1h、C1b、C2 |
+| C1h | 新增 `engine/tsvn_hooks.rs`、`tsvn_hook_cli.rs`、`tsvn_inbox.rs`、`src/engine/tsvnHooks.ts`、`TsvnHooksDialog.tsx`；改 `svn_follow.rs`、`svn_follow_mark.rs`、`svn_leak.rs`、`commands/svn.rs`、`main.rs` | 见 C1h 日志进度总账 |
+| 未改（后续期） | 合并入口、设置页、「本地改动」按 changelist 分组 | C1b、C2 |
 
 按 AGENTS.md 属于架构级改动：走 spec → plan，在独立 worktree 里施工，附 decisions 日志，合并前做独立 review。
 
@@ -848,8 +857,8 @@ Post-commit / Post-update 事件是即时信号，jkk 在后台、不在焦点�
 
 | 期 | 内容 | 对用户的价值 |
 |---|---|---|
-| C1a（已实现，未合并） | 混合版本基线（§6.1–§6.4，按最后修改 revision 判定前进，上限 5000 条）；跟进（§6.5，含对象层重放、「自己提交的路径取 SVN 版本」、「已全部提交」捷径、按规则拼索引含作者 + 失焦快照规则、按 hunk 的 Local-Only 泄漏检查、崩溃恢复）与「跟进」按钮；其他分支一并跟进（§6.11.3），冲突的标「落后基线」并提供「切换并手动跟进」；手动跟进；焦点 + wc.db 戳检测，`wc-locked` 时不跟进（§6.6）；§6.7、§6.9、§6.10 的横幅与报告；允许混合版本初始化（Q4）；交付遇到混合版本基线显式拒绝。**不含：** 合并默认快进、目录压缩 | TortoiseSVN 提交后切回 jkk，横幅立刻出现，点「跟进」即干净；暂存存档保住，中间版本的暂存自动让位给已提交的版本；feature 分支跟着 main 上的 bugfix 走，切回去不动磁盘；本地补丁 hunk 不会误报；每周更新照旧 |
-| C1h | TortoiseSVN 钩子（§6.13）：Pre-commit / Post-commit / Post-update 收件箱事件；按事件判定暂存与 commit（§6.13.3）；提交前按 hunk 拦截 Local-Only（§6.13.4）；注册、撤销与健康检查 | 「暂存的是不是中间版本」不再靠猜，另一台机器的提交不会误丢暂存；本地补丁在 TortoiseSVN 提交框里就被拦下 |
+| C1a（已合并） | 混合版本基线（§6.1–§6.4，按最后修改 revision 判定前进，上限 5000 条）；跟进（§6.5，含对象层重放、「自己提交的路径取 SVN 版本」、「已全部提交」捷径、按规则拼索引含作者 + 失焦快照规则、按 hunk 的 Local-Only 泄漏检查、崩溃恢复）与「跟进」按钮；其他分支一并跟进（§6.11.3），冲突的标「落后基线」并提供「切换并手动跟进」；手动跟进；焦点 + wc.db 戳检测，`wc-locked` 时不跟进（§6.6）；§6.7、§6.9、§6.10 的横幅与报告；允许混合版本初始化（Q4）；交付遇到混合版本基线显式拒绝。**不含：** 合并默认快进、目录压缩 | TortoiseSVN 提交后切回 jkk，横幅立刻出现，点「跟进」即干净；暂存存档保住，中间版本的暂存自动让位给已提交的版本；feature 分支跟着 main 上的 bugfix 走，切回去不动磁盘；本地补丁 hunk 不会误报；每周更新照旧 |
+| C1h（已实现，未合并） | TortoiseSVN 钩子（§6.13）：Pre-commit / Post-commit / Post-update 收件箱事件；按事件判定暂存与 commit（§6.13.3）；Check-commit 按 hunk 拦截 Local-Only（§6.13.4）；注册、撤销与健康检查。**不含：** Start-update、收件箱即时处理（归 C2）、按收件箱缺事件判失效 | 「暂存的是不是中间版本」不再靠猜，另一台机器的提交不会误丢暂存；本地补丁在 TortoiseSVN 提交框里就被拦下 |
 | C1b | changelist 分组（§6.11.2） | `ignore-on-commit` 单独成组 |
 | C2 | 自动跟进（§6.12）；增量录制；有钩子时由钩子事件即时触发（§6.13.6），没有钩子的环境才考虑补 notify 监听（§6.6） | 提交后切回 jkk 已经是干净的，不用点按钮 |
 | C3 | 不强制更新整个项目的交付（§6.8），单独出 spec | 可以改在 jkk 里交付：只提交自己的文件，跳过 `ignore-on-commit`，不拉同事的改动 |
@@ -895,14 +904,17 @@ Post-commit / Post-update 事件是即时信号，jkk 在后台、不在焦点�
 - ✅ `stash apply --index` 失败的真实形状：实现日志 Task 13 的 P1–P7
 - ✅ changelist：update、合并、冲突、resolve、revert 不改成员；命令行 `svn ci` 移出成员（E21）
 - ✅「切换并手动跟进」：切换失败就停，不替用户 stash；切换之后走手动跟进。真实窗口未验证
-- TortoiseSVN 钩子（§6.13）：
-  - Pre-commit / Check-commit / Post-commit 的 `PATH` 里，是提交框里勾选的文件，还是选择的根目录；Post-update 的 `RESULTPATH` 是否列出每个实际改动的文件
-  - Check-commit 返回错误时是否保留提交框；Pre-commit 返回错误时 TortoiseSVN 怎么展示错误内容
-  - 钩子设置的存储位置（注册表或配置文件）、能否由程序写入；同一路径同一类型能否挂多个钩子，与公司已有钩子（含 `tsvn:*hook` 属性）怎么共存
-  - Tauri 打包出的 GUI 子系统程序作为钩子命令被调起时的行为（有无控制台闪现、退出码能否被 TortoiseSVN 拿到、与单实例逻辑的交互）
-  - 钩子进程的耗时：在 Unity 大工程上提交时，钩子不能让提交明显变慢
-  - 提交失败（E155011 过期、网络中断）时 Post-commit 是否仍被调用、`ERROR` 参数的形状；Pre-commit 有记录而 Post-commit 缺失时收件箱的清理
-- 部分：F3 已测，相邻 / 重叠 hunk 的 12 个判定全对（W21），Review 2 补了同 hunk 三种漏报。未测：钩子侧单 hunk `git apply -R --check` 的上下文处理（W21 表明 `--unidiff-zero` 有假阳性，C1h 要换做法）、「提交后恢复」时 Pre-commit 看到的磁盘内容
+- TortoiseSVN 钩子（§6.13，编号见 C1h 日志 Task 0，TortoiseSVN 1.14.9）：
+  - ✅ Check / Pre / Post-commit 的 `PATH` 是勾选的文件；Post-update 的 `RESULTPATH` 列出根目录和每个实际被动过的文件（H2、H4）
+  - ✅ Check-commit 返回错误时保留提交框；Pre-commit 返回错误时关掉提交框，走「Retry without hooks」；都只显示 stderr（H3）
+  - ✅ 钩子存在 `HKCU\Software\TortoiseSVN\hooks`，程序写入可行（H1）。部分：jkk 把同类型重叠当冲突，不探索同一路径挂多个钩子；与 `tsvn:*hook` 属性的共存未测
+  - ✅ GUI 子系统 exe 当钩子：无控制台闪现，退出码与 stderr 都拿得到；本仓库没有单实例逻辑（H5）
+  - 部分：release exe 一次约 100ms（含进程启动）。未测：Unity 大工程上的耗时
+  - ✅ 提交因 E155011 失败时 Post-commit 不被调用，孤儿 Pre 留在收件箱、不误配对（H4、E2E 场景 6）。未测：网络中断
+  - ✅ 工作副本路径含空格与中文时，注册的命令行和 `CWD` 正常（E2E）。未测：工作副本在盘符根目录时 `CWD` 的引号形状
+  - ✅ exe 不存在时的表现（E2E 场景 7b，§6.13.5）
+  - 未测：TortoiseSVN 设置窗口开着时 jkk 去注册，窗口关闭后是否整值写回
+- 部分：F3 已测，相邻 / 重叠 hunk 的 12 个判定全对（W21），Review 2 补了同 hunk 三种漏报。钩子不走 `git apply -R --check`，与 F3 共用判定（§6.13.4）。✅「提交后恢复」时提交前看到的是删过之后的磁盘内容（H5、E2E 场景 5）
 - ✅「已全部提交」捷径：含 merge、删除、新增、mode、重命名（W20）；区间有 Local-Only 不走捷径
 - 部分：status 不报错，只有目录带 `wc-locked`（E15）。未测：真实 TortoiseSVN 半小时更新期间的表现
 - ✅ `<commit revision>` 在 `A`、`R`、copied 上的形状：E13、Review 1 第 4 条。未测：`svn update -r` 回退到 c(f) ≤ X < R(f) 按回退处理是否过严。目录压缩未实现，不适用
@@ -910,6 +922,21 @@ Post-commit / Post-update 事件是即时信号，jkk 在后台、不在焦点�
 - （C2 补 notify 时）Windows notify 下 `.svn/wc.db` 的真实事件形状；TSVNCache 后台进程会不会频繁改写 wc.db；TortoiseSVN 一次提交里 wc.db 会被写几次、间隔多长，定出去抖的静默时长
 
 ## 12. 修订记录
+
+### 2026-11-02 · 第八轮修订（C1h 实现回写）
+
+C1h 实现完成（未合并），C1a 已合并。把 C1h 日志的实测与偏离回写到原章节，以实测和代码为准。
+
+| 严重度 | 问题 | 修订 |
+|---|---|---|
+| 高 | 拦截写在 Pre-commit 上，实测失败时提交框会关掉 | 改在 Check-commit（§6.13.1、§6.13.4、R25） |
+| 高 | 「不会挡住提交」只在 exe 能启动时成立 | exe 不存在时实测两道拦截，写明（§6.13.5、R25） |
+| 高 | `CWD` 不是工作副本根 | 仓库路径写进注册的命令行（§6.13.2） |
+| 中 | stderr 编码：Task 0 未实测就写「系统代码页 936」，代码按 `CP_ACP` 写，本机 ACP 是 1252，中文全变 `?`；E2E 才发现 | 改 `CP_THREAD_ACP`（§6.13.4） |
+| 中 | 提交失败时没有 Post-commit | 配对带时间窗、孤儿 Pre 清理（§6.13.1） |
+| 中 | 收件箱清理的 revision 判据不可比 | 改时间截点（§6.13.2） |
+| — | 没做的设想：Start-update、Local-Only 预写清单、按收件箱缺事件判失效、收件箱即时处理 | §6.6、§6.13.1、§6.13.2、§6.13.4、§6.13.5、R24 |
+| — | 其余 | §8、§9 按实现改；§11 钩子条目标注结论；U6 与 §6.11 里的 Pre-commit 改 Check-commit。历史修订记录保留原文 |
 
 ### 2026-11-01 · 第七轮修订（实现回写）
 

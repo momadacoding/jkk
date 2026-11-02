@@ -61,6 +61,10 @@ export interface FollowReport {
   leaks: Leak[]
   /** 钉着换入之前的原始索引与暂存 blob 的 ref。 */
   pinnedRef: string | null
+  /** 判定依据（C1h）：钩子健康时按本机事件，否则按作者 + 失焦快照。 */
+  evidence: 'hooks' | 'heuristic'
+  /** 读收件箱的时刻。前端不用，随 journal 走。 */
+  evidenceCutoffMs: number | null
 }
 
 /** 后端 `svn_follow::FollowOutcome`。 */
@@ -119,6 +123,8 @@ export interface FollowReportModel {
   summary: string
   /** 整份报告的前提有问题（这次没向服务器验证过）。 */
   warning?: string
+  /** 暂存与 commit 是按什么判定的（C1h）。 */
+  basis: string
   sections: FollowReportSection[]
 }
 
@@ -272,6 +278,8 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
     warning: r.verified
       ? undefined
       : '这次没能向服务器体检新基线（可能是断网），基线照样发布了。连上之后建议手动体检一次。',
+    basis:
+      r.evidence === 'hooks' ? '判定依据：TortoiseSVN 钩子事件' : '判定依据：作者 + 失焦快照',
     sections,
   }
 }

@@ -31,6 +31,11 @@ use crate::engine::svn_log::{fetch_log, read_log, LogPage};
 use crate::engine::svn_server_set::{audit_server_set_at_baseline, ServerAudit};
 use crate::engine::svn_sync::{check_sync, read_root_revs, RootRev, SyncStatus};
 use crate::engine::svn_sync_in::new_opid;
+use crate::engine::tsvn_hooks::{
+    desired_entries, judge_health, parse_hooks, plan_registration, read_hooks_value,
+    registered_value, registration_roots, try_unregistered_value, write_hooks_value, HookEntry,
+    HookHealth,
+};
 use crate::engine::{svn_journal, svn_lock};
 use crate::error::GitError;
 use crate::vcs::{detect_repo_kind, RepoKind};
@@ -243,6 +248,112 @@ pub fn svn_branches_behind(path: String) -> Result<Vec<String>, GitError> {
 #[tauri::command(async)]
 pub fn svn_get_user(path: String) -> Result<SvnUserInfo, GitError> {
     svn_user_info(&path)
+}
+
+/// TortoiseSVN 钩子的状态与注册计划（C1h 计划 Task 6）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TsvnHooksStatus {
+    pub supported: bool,
+    pub health: HookHealth,
+    /// 勾选「提交前拦截本地补丁」时将写入的全部条目（含 check_commit），前端按勾选过滤。
+    pub planned: Vec<HookEntry>,
+    pub conflicts: Vec<HookEntry>,
+    /// 当前程序的路径：命令行里写的就是它。前端据此提示开发构建。
+    pub exe: String,
+}
+
+/// 钩子要挂在混合仓库上，而且 `.git` 必须是目录：钩子往 `.git/mygitclient/` 写事件，
+/// linked worktree（`.git` 是文件）永远写不进去（review 1 Declined 第 7 条）。
+fn hooks_target(path: &str) -> Result<(String, std::path::PathBuf), GitError> {
+    if detect_repo_kind(path) != RepoKind::SvnHybrid {
+        return Err(GitError::new(
+            "svn_not_hybrid",
+            "这个目录不是已初始化的混合仓库，不能挂 TortoiseSVN 钩子。",
+        ));
+    }
+    // 纵深防御：今天 `detect_repo_kind` 对 `.git` 是文件的目录已经不认混合仓库（测试
+    // `hook_commands_refuse_a_linked_worktree_layout`），这里不依赖那条规则不变
+    if !std::path::Path::new(path).join(".git").is_dir() {
+        return Err(GitError::new(
+            "tsvn_hooks_no_git_dir",
+            "这个仓库的 .git 不是目录（linked worktree），钩子写不进事件。请在主工作区里注册。",
+        ));
+    }
+    let exe = std::env::current_exe()
+        .map_err(|e| GitError::new("tsvn_hooks_failed", format!("找不到当前程序的路径：{e}")))?;
+    // 注册表里统一写反斜杠：TortoiseSVN 界面写进去的就是这个样子（日志 H1）
+    Ok((path.replace('/', "\\"), exe))
+}
+
+#[tauri::command(async)]
+pub fn tsvn_hooks_status(path: String) -> Result<TsvnHooksStatus, GitError> {
+    let (repo, exe) = hooks_target(&path)?;
+    let exe_text = exe.display().to_string();
+    if !cfg!(windows) {
+        return Ok(TsvnHooksStatus {
+            supported: false,
+            health: HookHealth::NotRegistered,
+            planned: Vec::new(),
+            conflicts: Vec::new(),
+            exe: exe_text,
+        });
+    }
+    let roots = registration_roots(&repo)?;
+    let entries = parse_hooks(&read_hooks_value()?.unwrap_or_default());
+    // 一个工作副本根都没有时，「有本仓库的条目」也不算健康（review 1 Minor 最后一条）
+    let health = if roots.is_empty() {
+        HookHealth::NotRegistered
+    } else {
+        judge_health(&entries, &roots, &exe, &repo)
+    };
+    let plan = plan_registration(&entries, &roots, &exe, &repo, true);
+    Ok(TsvnHooksStatus {
+        supported: true,
+        health,
+        planned: desired_entries(&roots, &exe, &repo, true),
+        conflicts: plan.conflicts,
+        exe: exe_text,
+    })
+}
+
+/// 写 TortoiseSVN 的钩子设置。只追加 / 替换本仓库的 jkk 条目；有冲突、值认不出来、写的时候
+/// 被别的程序改过，都不写。
+#[tauri::command(async)]
+pub fn tsvn_hooks_register(path: String, block_leaks: bool) -> Result<HookHealth, GitError> {
+    let (repo, exe) = hooks_target(&path)?;
+    let roots = registration_roots(&repo)?;
+    if roots.is_empty() {
+        return Err(GitError::new(
+            "tsvn_hooks_no_wc",
+            "没有找到要挂钩子的工作副本：请先检查白名单。",
+        ));
+    }
+    let current = read_hooks_value()?;
+    let new = registered_value(
+        current.as_deref().unwrap_or(""),
+        &roots,
+        &exe,
+        &repo,
+        block_leaks,
+    )?;
+    write_hooks_value(current.as_deref(), Some(&new))?;
+    Ok(judge_health(&parse_hooks(&new), &roots, &exe, &repo))
+}
+
+/// 删掉本仓库的 jkk 钩子。失效（exe 不在了）时也必须能删：不删的话 TortoiseSVN 每次提交
+/// 都报钩子错误（review 1 第 5 条）。
+#[tauri::command(async)]
+pub fn tsvn_hooks_unregister(path: String) -> Result<(), GitError> {
+    let (repo, _) = hooks_target(&path)?;
+    let Some(current) = read_hooks_value()? else {
+        return Ok(());
+    };
+    let new = try_unregistered_value(&current, &repo)?;
+    if new.as_deref() == Some(current.as_str()) {
+        return Ok(());
+    }
+    write_hooks_value(Some(&current), new.as_deref())
 }
 
 /// 写配置里的 `svnUser`，空串清除（日志 D4）。下一次跟进生效。

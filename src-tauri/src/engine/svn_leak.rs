@@ -125,6 +125,124 @@ pub fn local_only_leaks(
     Ok(out)
 }
 
+/// Check-commit 钩子用（C1h 计划 Task 4；分析 §6.13.4）：当前分支 `svn/base..HEAD` 里的
+/// Local-Only commit，它们改过、又在这次提交里的文件，拿**磁盘上这一刻的内容**当 N 判定。
+///
+/// - `abs_paths` 是 TortoiseSVN 的 PATH（勾选的文件，正斜杠绝对路径，日志 H2）。仓库外的忽略。
+///   路径比较大小写不敏感：TortoiseSVN 给的盘符、目录大小写不一定与 git 记录的一致。
+/// - 用了「提交后恢复」时，磁盘上就是用户删过本地改动之后的版本（日志 H5），正好是要提交的内容。
+/// - 只读：git2 读对象，`std::fs` 读磁盘，不起 git 进程、不写任何东西。分支上没有 Local-Only
+///   commit 时只多一次 revwalk，不读文件。
+/// - `svn/base` 不存在、HEAD 读不出来：报错，由钩子放行（fail-open）。
+pub fn local_only_leaks_on_disk(repo: &str, abs_paths: &[String]) -> Result<Vec<Leak>> {
+    use crate::engine::graph::parse_local_only;
+    use crate::engine::svn_config::BASELINE_BRANCH;
+    use crate::engine::tsvn_hook_cli::to_repo_relative;
+    use std::collections::BTreeMap;
+
+    let wanted: BTreeSet<String> = abs_paths
+        .iter()
+        .filter_map(|p| to_repo_relative(repo, p))
+        .map(|p| p.to_lowercase())
+        .collect();
+    let mut out = Vec::new();
+    if wanted.is_empty() {
+        return Ok(out);
+    }
+    let git = Repository::open(repo)?;
+    let head = git.head()?;
+    let branch = head.shorthand().unwrap_or("HEAD").to_string();
+    let head_oid = head.peel_to_commit()?.id();
+    let base = git
+        .revparse_single(&format!("refs/heads/{BASELINE_BRANCH}"))?
+        .peel_to_commit()?
+        .id();
+    let mut walk = git.revwalk()?;
+    walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)?;
+    walk.push(head_oid)?;
+    walk.hide(base)?;
+    // 同一路径的磁盘内容只读一次
+    let mut disk: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
+    for oid in walk {
+        let commit = git.find_commit(oid?)?;
+        if !parse_local_only(&String::from_utf8_lossy(commit.message_bytes())) {
+            continue;
+        }
+        let l_tree = commit.tree()?;
+        let b_tree = match commit.parent_ids().next() {
+            Some(p) => Some(git.find_commit(p)?.tree()?),
+            None => None,
+        };
+        for path in touched_paths(&git, b_tree.as_ref(), &l_tree)? {
+            if !wanted.contains(&path.to_lowercase()) {
+                continue;
+            }
+            if !disk.contains_key(&path) {
+                let bytes = match std::fs::read(std::path::Path::new(repo).join(&path)) {
+                    Ok(b) => Some(b),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(e.into()),
+                };
+                disk.insert(path.clone(), bytes);
+            }
+            let n_bytes = disk[&path].as_deref();
+            let b_entry = entry(b_tree.as_ref(), &path);
+            // 磁盘与 B 完全相同：什么都没带上去。对应 `judge_path` 的 `n == b`，比的是 oid，
+            // 所以二进制文件也成立（混合仓库不做行尾转换，磁盘字节就是 blob 内容）
+            let same_as_b = match (b_entry, n_bytes) {
+                (None, None) => true,
+                (Some((oid, _)), Some(bytes)) => Oid::hash_object(ObjectType::Blob, bytes)? == oid,
+                _ => false,
+            };
+            if same_as_b {
+                continue;
+            }
+            let n = side_of_bytes(n_bytes);
+            let b = side_of_entry(&git, b_entry)?;
+            let l = side_of_entry(&git, entry(Some(&l_tree), &path))?;
+            let hunks = judge_sides(b, l, n)?;
+            if !hunks.is_empty() {
+                out.push(Leak {
+                    branch: branch.clone(),
+                    commit: oid_string(&commit),
+                    subject: commit.summary().unwrap_or_default().to_string(),
+                    path,
+                    hunks,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn oid_string(c: &git2::Commit) -> String {
+    c.id().to_string()
+}
+
+/// 给 TortoiseSVN 提交框显示的拦截说明（日志 H3：只显示 stderr，`\n` 换行）。
+pub fn leak_message(leaks: &[Leak]) -> String {
+    let mut s = String::from("jkk：这些文件里有 Local-Only 补丁，提交会把它带上服务器：\n");
+    for leak in leaks {
+        for h in &leak.hunks {
+            let at = if h.old_start == 0 && h.lines == 0 {
+                "整个文件".to_string()
+            } else {
+                format!("第 {} 行起", h.old_start)
+            };
+            let maybe = match h.verdict {
+                LeakVerdict::Present => "",
+                LeakVerdict::Unknown => "（可能）",
+            };
+            s.push_str(&format!(
+                "  {}：{at}{maybe}，来自「{}」\n",
+                leak.path, leak.subject
+            ));
+        }
+    }
+    s.push_str("取消勾选这些文件，或用「提交后恢复」删掉这些改动再提交。");
+    s
+}
+
 /// 树里某个路径的条目：(OID, 对象类型)。`filemode` 不参与判定：只改 mode 的泄漏
 /// 不在 F3 的范围内（见日志 Task 7「遗留风险」）。
 type Entry = Option<(Oid, Option<ObjectType>)>;
@@ -161,35 +279,67 @@ fn whole_file(verdict: LeakVerdict) -> Vec<HunkLeak> {
     }]
 }
 
+/// 一侧文件的样子。`Binary` 也包括 gitlink 等非 blob：按行比不了。
+enum Side {
+    Absent,
+    Binary,
+    Text(Vec<u8>),
+}
+
+fn side_of_entry(repo: &Repository, e: Entry) -> Result<Side> {
+    let Some((oid, kind)) = e else {
+        return Ok(Side::Absent);
+    };
+    if kind != Some(ObjectType::Blob) {
+        return Ok(Side::Binary);
+    }
+    let blob = repo.find_blob(oid)?;
+    Ok(if blob.is_binary() {
+        Side::Binary
+    } else {
+        Side::Text(blob.content().to_vec())
+    })
+}
+
+/// 磁盘上的 N：前 8000 字节里有 NUL 就当二进制。B、L 用 libgit2 的 `is_binary`，判据比这里
+/// 宽（1.9.6 的 `git_str_is_binary` 还看 UTF-16/32 BOM 与不可打印字符的比例），同一份内容两侧
+/// 可能分类不同；任一侧是二进制都判 `Unknown`，所以分歧的代价只是多拦一次，用户点
+/// Proceed anyway 即可。
+fn side_of_bytes(b: Option<&[u8]>) -> Side {
+    match b {
+        None => Side::Absent,
+        Some(b) if b.iter().take(8000).any(|c| *c == 0) => Side::Binary,
+        Some(b) => Side::Text(b.to_vec()),
+    }
+}
+
 fn judge_path(repo: &Repository, b: Entry, l: Entry, n: Entry) -> Result<Vec<HunkLeak>> {
     // NEW 里这个路径与 B 完全相同：NEW 没碰它，什么都没带上去
     if n == b {
         return Ok(Vec::new());
     }
-    let (Some(l), Some(n)) = (l, n) else {
+    judge_sides(
+        side_of_entry(repo, b)?,
+        side_of_entry(repo, l)?,
+        side_of_entry(repo, n)?,
+    )
+}
+
+fn judge_sides(b: Side, l: Side, n: Side) -> Result<Vec<HunkLeak>> {
+    let (l, n) = match (l, n) {
         // L 删了文件：NEW 也删了才是「删除」泄漏；NEW 只是改了内容，删除没上去。
         // NEW 删了文件而 L 是改 / 增：L 的内容不可能在 NEW 里
-        return Ok(if l.is_none() && n.is_none() {
-            whole_file(LeakVerdict::Present)
-        } else {
-            Vec::new()
-        });
+        (Side::Absent, Side::Absent) => return Ok(whole_file(LeakVerdict::Present)),
+        (Side::Absent, _) | (_, Side::Absent) => return Ok(Vec::new()),
+        (l, n) => (l, n),
     };
-    // 两侧都有、NEW 也改过。非 blob（gitlink 等）或二进制：按行比不了
-    let blob_bytes = |e: (Oid, Option<ObjectType>)| -> Result<Option<Vec<u8>>> {
-        if e.1 != Some(ObjectType::Blob) {
-            return Ok(None);
-        }
-        let blob = repo.find_blob(e.0)?;
-        Ok((!blob.is_binary()).then(|| blob.content().to_vec()))
-    };
-    let b_bytes = match b {
+    // 两侧都有、NEW 也改过。二进制：按行比不了
+    let b = match b {
         // L 新增的文件：B 当空文件
-        None => Some(Vec::new()),
-        Some(e) => blob_bytes(e)?,
+        Side::Absent => Side::Text(Vec::new()),
+        b => b,
     };
-    let (Some(b_bytes), Some(l_bytes), Some(n_bytes)) = (b_bytes, blob_bytes(l)?, blob_bytes(n)?)
-    else {
+    let (Side::Text(b_bytes), Side::Text(l_bytes), Side::Text(n_bytes)) = (b, l, n) else {
         return Ok(whole_file(LeakVerdict::Unknown));
     };
     let l_hunks = spans(&b_bytes, &l_bytes)?;

@@ -60,6 +60,13 @@ fn mark_records_staged_blobs_and_head() {
     assert_eq!(mark.head_oid, git(&fx, &["rev-parse", "HEAD"]));
     assert_eq!(mark.branch.as_deref(), Some("work"));
     assert!(mark.at > 1_600_000_000, "at 是 unix 秒，实际 {}", mark.at);
+    // C1h：毫秒时刻，要与钩子事件的 t_commit 比先后（同一秒内分不出来）
+    let ms = mark.at_ms.expect("新快照一律写 atMs");
+    assert!(
+        ms / 1000 - mark.at <= 1,
+        "atMs 与 at 是同一时刻：{ms} / {}",
+        mark.at
+    );
     assert_eq!(mark.staged.len(), 3, "实际 {:?}", mark.staged);
     assert_eq!(
         mark.staged["Code/A.cs"],
@@ -282,6 +289,7 @@ fn a_damaged_mark_reads_as_none_instead_of_blocking_the_follow() {
         .unwrap()
         .expect("旧格式没有 baseOid，照样读得出来");
     assert_eq!(old_format.base_oid, None);
+    assert_eq!(old_format.at_ms, None, "旧格式没有 atMs，照样读得出来");
 }
 
 #[test]

@@ -5,7 +5,9 @@
 //! `commit-tree`，参照 `svn_replay.rs`），不经过工作区。跑完随 `TempDir` 删除。
 
 use app_lib::engine::git_cli::{run_git, run_git_env, run_git_stdin_env};
-use app_lib::engine::svn_leak::{local_only_leaks, Leak, LeakVerdict};
+use app_lib::engine::svn_leak::{
+    leak_message, local_only_leaks, local_only_leaks_on_disk, Leak, LeakVerdict,
+};
 use app_lib::engine::svn_replay::{commits_between, ReplayCodes, ReplayCommit};
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -530,10 +532,206 @@ fn judge(b: &str, l: &str, n: &str) -> Hunks {
     let new = commit_on(&r, Some(&base), &[Ch::Put(F, n.as_bytes())], "NEW");
     let commits = commits_between(&r.s(), &base, &lc, &CODES).unwrap();
     let leaks = local_only_leaks(&r.s(), "main", &commits, &set(&[F]), &new).unwrap();
+    let hunks = match shape(&leaks).into_iter().next() {
+        Some((_, hunks)) => hunks,
+        None => Vec::new(),
+    };
+    // C1h Task 4：Check-commit 走的真实路径（N 是磁盘文件）与按对象判定必须同一结论。
+    // 走 `local_only_leaks_on_disk` 而不是某个只有测试在调的函数（Review 2 第 1 条）
+    let (dr, _) = disk_repo(b, l, Some(n));
+    let on_disk = local_only_leaks_on_disk(&dr.s(), &[abs(&dr, F)]).unwrap();
+    let on_disk = match shape(&on_disk).into_iter().next() {
+        Some((_, hunks)) => hunks,
+        None => Vec::new(),
+    };
+    assert_eq!(on_disk, hunks, "磁盘路径与 local_only_leaks 结论不一致");
+    hunks
+}
+
+#[test]
+fn disk_path_matches_local_only_leaks_on_w21_cases() {
+    let b = y4(&[], false);
+    let l = y4(&[(5, LOG_OFF), (30, LOG_OFF)], false);
+    let w2 = (6, "work(2)");
+    let c5 = (5, LOG_OFF);
+    let c30 = (30, LOG_OFF);
+    use LeakVerdict::Present;
+    // `judge` 内部断言了磁盘路径与 local_only_leaks 结论一致；这里再钉住结论本身
+    let cases: Vec<(&str, String, Hunks)> = vec![
+        ("只提交了功能改动", y4(&[w2], false), vec![]),
+        ("泄漏 line5", y4(&[w2, c5], false), vec![(5, 1, Present)]),
+        (
+            "全部泄漏",
+            y4(&[w2, c5, c30], false),
+            vec![(5, 1, Present), (30, 1, Present)],
+        ),
+        (
+            "前面插入 3 行后泄漏 line30",
+            y4(&[w2, c30], true),
+            vec![(30, 1, Present)],
+        ),
+    ];
+    for (name, n, want) in cases {
+        assert_eq!(judge(&b, &l, &n), want, "{name}");
+    }
+}
+
+/// 磁盘路径的边界形状。每一条都与按对象判定（`local_only_leaks`）对照过语义。
+fn disk_shape(b: Option<&[u8]>, l: Option<&[u8]>, n: Option<&[u8]>) -> Hunks {
+    let (r, _) = disk_repo_bytes(b, l, n);
+    let leaks = local_only_leaks_on_disk(&r.s(), &[abs(&r, F)]).unwrap();
     match shape(&leaks).into_iter().next() {
         Some((_, hunks)) => hunks,
         None => Vec::new(),
     }
+}
+
+#[test]
+fn disk_equal_to_base_is_not_a_leak() {
+    // 文本
+    assert!(disk_shape(Some(b"a\n"), Some(b"x\n"), Some(b"a\n")).is_empty());
+    // 二进制：按行比不了，但 N 与 B 完全相同就是没碰（`judge_path` 的 `n == b`）。
+    // 少了这一步，Local-Only 改过、这次又原样提交的二进制文件会被判 Unknown 挡下（Review 2 第 1 条）
+    assert!(disk_shape(Some(b"a\0"), Some(b"b\0"), Some(b"a\0")).is_empty());
+    // L 新增、磁盘上也没有
+    assert!(disk_shape(None, Some(b"log\n"), None).is_empty());
+}
+
+#[test]
+fn disk_edge_shapes() {
+    use LeakVerdict::{Present, Unknown};
+    // L 删了文件、磁盘上也没有：删除泄漏
+    assert_eq!(disk_shape(Some(b"a\n"), None, None), vec![(0, 0, Present)]);
+    // L 删了、磁盘上只是改了：删除没上去
+    assert!(disk_shape(Some(b"a\n"), None, Some(b"b\n")).is_empty());
+    // 二进制（含 NUL）且都不同：比不了
+    assert_eq!(
+        disk_shape(Some(b"a\0"), Some(b"b\0"), Some(b"c\0")),
+        vec![(0, 0, Unknown)]
+    );
+    // L 新增的文件：B 当空文件
+    assert_eq!(
+        disk_shape(None, Some(b"log\n"), Some(b"log\n")),
+        vec![(0, 0, Present)]
+    );
+}
+
+// —— C1h Task 4：Check-commit 拿磁盘上这一刻的内容当 N ——
+
+/// B（`svn/base`）← L（Local-Only）← HEAD 在 main 上，工作区按 `disk` 写。返回 (仓库, L)。
+fn disk_repo(b: &str, l: &str, disk: Option<&str>) -> (Repo, String) {
+    disk_repo_bytes(
+        Some(b.as_bytes()),
+        Some(l.as_bytes()),
+        disk.map(str::as_bytes),
+    )
+}
+
+/// `None` 表示这一侧没有这个文件。
+fn disk_repo_bytes(b: Option<&[u8]>, l: Option<&[u8]>, disk: Option<&[u8]>) -> (Repo, String) {
+    let r = Repo::new();
+    let mut base_changes = vec![Ch::Put(OTHER, b"o\n")];
+    if let Some(b) = b {
+        base_changes.push(Ch::Put(F, b));
+    }
+    let base = commit_on(&r, None, &base_changes, "B");
+    let change = match l {
+        Some(l) => Ch::Put(F, l),
+        None => Ch::Del(F),
+    };
+    let lc = commit_on(&r, Some(&base), &[change], LOCAL_ONLY_MSG);
+    r.git(&["update-ref", "refs/heads/svn/base", &base]);
+    r.git(&["update-ref", "refs/heads/main", &lc]);
+    r.git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+    let f = r.dir.path().join(F);
+    std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+    std::fs::write(r.dir.path().join(OTHER), "o changed\n").unwrap();
+    if let Some(d) = disk {
+        std::fs::write(&f, d).unwrap();
+    }
+    (r, lc)
+}
+
+/// TortoiseSVN 给的绝对路径：正斜杠（H2）。
+fn abs(r: &Repo, rel: &str) -> String {
+    format!("{}/{rel}", r.s().replace('\\', "/"))
+}
+
+#[test]
+fn restore_after_commit_with_patch_removed_is_not_a_leak() {
+    // H5 的形状：20 行；L 改第 2 行；提交前用户删掉了第 2 行的补丁，只留第 18 行的功能改动
+    let b: String = (1..=20).map(|i| format!("line {i:02}\r\n")).collect();
+    let l = b.replace("line 02\r\n", "line 02 DEBUG_LOCAL_PATCH\r\n");
+    let disk = b.replace("line 18\r\n", "line 18 FEATURE\r\n");
+    let (r, _) = disk_repo(&b, &l, Some(&disk));
+    let leaks = local_only_leaks_on_disk(&r.s(), &[abs(&r, F)]).unwrap();
+    assert!(leaks.is_empty(), "{leaks:?}");
+}
+
+#[test]
+fn whole_file_commit_with_patch_is_present() {
+    let b: String = (1..=20).map(|i| format!("line {i:02}\r\n")).collect();
+    let l = b.replace("line 02\r\n", "line 02 DEBUG_LOCAL_PATCH\r\n");
+    let disk = l.replace("line 18\r\n", "line 18 FEATURE\r\n");
+    let (r, lc) = disk_repo(&b, &l, Some(&disk));
+    let leaks = local_only_leaks_on_disk(&r.s(), &[abs(&r, F)]).unwrap();
+    assert_eq!(
+        shape(&leaks),
+        vec![(F.to_string(), vec![(2, 1, LeakVerdict::Present)])]
+    );
+    assert_eq!(
+        (leaks[0].commit.as_str(), leaks[0].branch.as_str()),
+        (lc.as_str(), "main")
+    );
+    assert_eq!(leaks[0].subject, "L: 注释掉 log");
+}
+
+#[test]
+fn disk_check_ignores_paths_not_in_the_commit_or_not_touched_by_local_only() {
+    let b = ten();
+    let l = b.replace("l4\n", "log\n");
+    let (r, _) = disk_repo(&b, &l, Some(&l));
+    // F 带着补丁，但这次没勾 F，只勾了 OTHER（L 没碰它）
+    assert!(local_only_leaks_on_disk(&r.s(), &[abs(&r, OTHER)])
+        .unwrap()
+        .is_empty());
+    // 仓库外的路径
+    assert!(
+        local_only_leaks_on_disk(&r.s(), &["Z:/elsewhere/x.cs".to_string()])
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn disk_check_matches_paths_case_insensitively() {
+    let b = ten();
+    let l = b.replace("l4\n", "log\n");
+    let (r, _) = disk_repo(&b, &l, Some(&l));
+    let upper = abs(&r, F).to_uppercase().replace("日志 F.CS", "日志 f.cs");
+    assert_eq!(local_only_leaks_on_disk(&r.s(), &[upper]).unwrap().len(), 1);
+}
+
+#[test]
+fn disk_check_without_svn_base_is_an_error() {
+    let (r, _) = disk_repo(&ten(), &ten().replace("l4\n", "log\n"), None);
+    r.git(&["update-ref", "-d", "refs/heads/svn/base"]);
+    assert!(local_only_leaks_on_disk(&r.s(), &[abs(&r, F)]).is_err());
+}
+
+#[test]
+fn leak_message_names_paths_subjects_and_the_way_out() {
+    let b: String = (1..=20).map(|i| format!("line {i:02}\r\n")).collect();
+    let l = b.replace("line 02\r\n", "line 02 DEBUG_LOCAL_PATCH\r\n");
+    let (r, _) = disk_repo(&b, &l, Some(&l));
+    let msg = leak_message(&local_only_leaks_on_disk(&r.s(), &[abs(&r, F)]).unwrap());
+    assert!(msg.contains(F), "{msg}");
+    assert!(msg.contains("L: 注释掉 log"), "{msg}");
+    assert!(msg.contains("第 2 行"), "{msg}");
+    assert_eq!(
+        msg.lines().last(),
+        Some("取消勾选这些文件，或用「提交后恢复」删掉这些改动再提交。")
+    );
 }
 
 #[test]

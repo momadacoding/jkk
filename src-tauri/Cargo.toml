@@ -44,6 +44,10 @@ roxmltree = "0.21"
 windows = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_System_RestartManager",
+  # TortoiseSVN 钩子：读写 HKCU\Software\TortoiseSVN\hooks（C1h 计划 Task 1）
+  "Win32_System_Registry",
+  # 钩子的 stderr 按线程 ANSI 代码页写，TortoiseSVN 按它解读（C1h 日志 H4）
+  "Win32_Globalization",
 ] }
 
 [dev-dependencies]

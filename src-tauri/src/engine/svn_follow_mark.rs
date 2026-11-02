@@ -34,8 +34,12 @@ const MARK_FILE: &str = "follow-mark.json";
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FollowMark {
-    /// unix 秒，只供排查。判定不依赖任何时钟。
+    /// unix 秒，只供排查。
     pub at: i64,
+    /// unix 毫秒。C1h 起有钩子事件时要与 t_commit 比先后（分析 §6.13.3），秒分不出同一秒内
+    /// 的先后。旧格式没有（`None`），按拿不准处理。
+    #[serde(default)]
+    pub at_ms: Option<i64>,
     pub head_oid: String,
     /// 快照时的 `svn/base`。跟进只把这之后才进基线的路径算成「快照之后的 SVN 提交」：判定 InSync
     /// 时写的快照可以比 SVN 提交新（基线已发布、分支落后）。旧格式没有这个字段（`None`），按
@@ -97,10 +101,10 @@ pub fn write_mark(repo: &str) -> Result<()> {
             &head_oid,
         ],
     )?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok();
     let mark = FollowMark {
-        at: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64),
+        at: now.map_or(0, |d| d.as_secs() as i64),
+        at_ms: now.map(|d| d.as_millis() as i64),
         head_oid,
         base_oid,
         branch,
