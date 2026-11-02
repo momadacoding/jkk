@@ -13,6 +13,7 @@ import { StashView } from './StashView'
 import {
   useRepoStore,
   useRepoEffects,
+  checkRemoteDeletable,
   svnInitHybrid,
   svnPreflightCheck,
   svnRebuildBaseline,
@@ -36,6 +37,7 @@ import BaselineBanner from './BaselineBanner'
 import { baselineMap, findDelivered, selectionDiffScope } from '../engine/svnGraph'
 import { describeToolExit } from '@/engine/externalTools'
 import { currentDiff } from '@/engine/currentDiff'
+import { runBranchDeletion, type BranchDeletionStep } from '@/engine/deleteBranchTargets'
 import {
   changesPaths,
   changesSection,
@@ -430,16 +432,7 @@ export function RepoTab({
 
   /**
    * 删除分支，可选连远程和 worktree 一起删。确认在 `DeleteBranchDialog` 里做过了。
-   *
-   * **顺序是 worktree → 远程 → 本地分支**，按「最容易失败的放最前」排：
-   *
-   * - worktree 那一步最常被拒——只要里面有改动或未跟踪文件，`git worktree
-   *   remove` 就不干（这也意味着它不会偷偷毁掉未提交的东西）。它排第一，
-   *   失败时远程和本地都还没动过，原地重试就行。
-   * - 远程那一步会因为外部原因失败（断网、没权限、分支被保护），排在删本地
-   *   引用之前；反过来的话本地引用已经没了，还得先去 reflog 里捞回来才能重试。
-   * - 本地分支最后。它也**必须**在 worktree 之后：分支被 worktree 检出时
-   *   `git branch -D` 会直接拒绝。
+   * 顺序和预检的理由见 `runBranchDeletion`。
    *
    * **失败不在这里吞掉，抛给确认框。** 那个框会留在原地把错误显示出来，用户
    * 就地就能重试；丢进顶部横幅的话框已经关了，还得重新右键走一遍。
@@ -447,27 +440,29 @@ export function RepoTab({
   const handleDeleteBranch = useCallback(async (
     name: string,
     targets: { remote: { remote: string; branch: string } | null; worktreePath: string | null },
+    onStepDone: (step: BranchDeletionStep) => void,
   ) => {
     const path = state.path
     if (!path) return
-    const { remote, worktreePath } = targets
-    if (worktreePath) {
-      // 不带 force：worktree 里有未提交的东西时要拦下来，这层保护和从侧边栏
-      // 删是一致的。错误会抛给确认框显示
-      await invoke('delete_worktree', { path, worktreePath, force: false })
-      // 就在这一步之后关，而不是等整套删完：后面的远程/本地分支还可能失败，
-      // 那时候目录已经没了，标签不关照样是个死标签
-      onRepoRemoved(worktreePath)
-    }
-    if (remote) {
-      await invoke('delete_remote_branch', { path, remote: remote.remote, branch: remote.branch })
-    }
-    await invoke('delete_branch', { path, name })
-    await refreshGraph(path)
-    await refreshUpstream(path)
-    // 删掉的 worktree 还挂在侧边栏上，得把那一栏也刷掉
-    if (worktreePath) await refreshWorktrees(path)
-  }, [state.path, refreshGraph, refreshUpstream, refreshWorktrees, onRepoRemoved])
+    await runBranchDeletion(targets, onStepDone, {
+      checkRemote: ({ remote, branch }) => checkRemoteDeletable(path, remote, branch),
+      deleteWorktree: async (worktreePath) => {
+        // 不带 force：worktree 里有未提交的东西时要拦下来，这层保护和从侧边栏
+        // 删是一致的。错误会抛给确认框显示
+        await invoke('delete_worktree', { path, worktreePath, force: false })
+        // 就在这一步之后关，而不是等整套删完：后面的远程/本地分支还可能失败，
+        // 那时候目录已经没了，标签不关照样是个死标签，侧边栏那一栏同理。
+        // 不等这次刷新：它既不该拦住后面的步骤，也不该拖住这一步的进度上报
+        onRepoRemoved(worktreePath)
+        void refreshWorktrees(path).catch(reportError)
+      },
+      deleteRemote: ({ remote, branch }) => invoke<void>('delete_remote_branch', { path, remote, branch }),
+      deleteLocal: () => invoke<void>('delete_branch', { path, name }),
+    })
+    // 到这里已经全删完了：刷新失败不能再抛给确认框，它会显示成删除失败，让用户去重试
+    await refreshGraph(path).catch(reportError)
+    await refreshUpstream(path).catch(reportError)
+  }, [state.path, refreshGraph, refreshUpstream, refreshWorktrees, onRepoRemoved, reportError])
 
   /**
    * 删除一个 worktree。确认在 `DeleteWorktreeDialog` 里做过了。
