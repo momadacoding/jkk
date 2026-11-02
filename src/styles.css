@@ -692,11 +692,29 @@ body {
   gap: 8px;
   min-width: 360px;
   max-width: 90vw;
+  /* 遮罩不滚动：框比窗口高时上下都出界，按钮再也够不着 */
+  max-height: 90vh;
+  overflow-y: auto;
   padding: 14px 16px;
   background: #2b2b2b;
   border: 1px solid #444;
   border-radius: 5px;
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55);
+}
+
+/* 确认框里滚动的部分：放不下时只有它缩，按钮留在原地 */
+.dialog-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-y: auto;
+}
+
+/* 与按钮一起留在滚动区外。滚动容器能缩到 0，flex: none 防止被正文压扁 */
+.dialog-error {
+  flex: none;
+  max-height: 30vh;
+  overflow-y: auto;
 }
 
 .dialog-title {
@@ -708,6 +726,8 @@ body {
   color: #bbb;
   /* 更新流程的说明与结局提示按行列文件清单（svnSyncIn.ts 的 listFiles） */
   white-space: pre-wrap;
+  /* 长路径得能断开，否则 .dialog-body 会多出一条横向滚动条 */
+  overflow-wrap: anywhere;
 }
 
 .dialog input {
@@ -940,12 +960,8 @@ body {
 
 /* ---------- 交付确认框（DeliverDialog） ---------- */
 
-/* 内容多（清单 + 本地补丁 + 警告 + 输入框）：窄窗口或矮窗口里整框可滚，
-   按钮至少能滚到；清单与补丁列表各自限高，长清单不把输入框挤出视野 */
-.deliver-dialog {
-  max-height: 90vh;
-  overflow-y: auto;
-}
+/* 内容多（清单 + 本地补丁 + 警告 + 输入框）：清单与补丁列表各自限高，
+   长清单不把输入框挤出视野；再放不下时整框滚动，那条规则在 .dialog 上 */
 
 /* 正文与 .dlg-warning / .dlg-progress 一样缩进到标题下面 */
 .deliver-files,

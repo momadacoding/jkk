@@ -61,7 +61,7 @@ export function TsvnHooksDialog({
     <div className="dialog-overlay" onMouseDown={onClose}>
       <div
         ref={boxRef}
-        className="dialog dialog-wide deliver-dialog"
+        className="dialog dialog-wide"
         role="dialog"
         aria-label="TortoiseSVN 钩子"
         onMouseDown={(e) => e.stopPropagation()}

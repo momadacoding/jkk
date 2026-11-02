@@ -60,7 +60,7 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
     <div className="dialog-overlay" onMouseDown={() => { if (!busy) finish(false) }}>
       <div
         ref={boxRef}
-        className="dialog dialog-wide deliver-dialog"
+        className="dialog dialog-wide"
         role="dialog"
         aria-label={m.title}
         onMouseDown={(e) => e.stopPropagation()}

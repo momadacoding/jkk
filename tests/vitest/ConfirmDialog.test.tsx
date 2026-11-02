@@ -192,6 +192,97 @@ describe('useConfirm', () => {
   })
 })
 
+describe('正文过长时按钮不能被挤走', () => {
+  // jsdom 不做布局，这里只钉结构：滚动的是 .dialog-body，按钮和错误条必须在它外面。
+  // 高度上限与滚动是 CSS 的事，要在真实窗口里验
+  const body = () => document.querySelector('.dialog-body') as HTMLElement
+
+  it('标题、正文、警告条都在滚动区里', () => {
+    const { confirm } = mount()
+    act(() => {
+      void confirm()({ title: '标题', message: '正文', warning: '警告', confirmLabel: 'OK' })
+    })
+    for (const text of ['标题', '正文', '警告']) {
+      expect(body().contains(screen.getByText(text))).toBe(true)
+    }
+  })
+
+  it('按钮在滚动区外，滚到哪都看得见', () => {
+    const { confirm } = mount()
+    act(() => {
+      void confirm()({ title: 't', message: 'm', confirmLabel: 'OK' })
+    })
+    expect(body().contains(button('OK'))).toBe(false)
+    expect(body().contains(button('Cancel'))).toBe(false)
+  })
+
+  it('action 的错误也在滚动区外：滚动条停在顶部时点确认，失败不能发生在视口之外', async () => {
+    const { confirm } = mount()
+    act(() => {
+      void confirm()({
+        title: 't',
+        message: 'm',
+        confirmLabel: '更新',
+        action: async () => {
+          throw new Error('remote rejected')
+        },
+      })
+    })
+    fireEvent.click(button('更新'))
+    const error = await screen.findByText(/remote rejected/)
+    expect(body().contains(error)).toBe(false)
+  })
+
+  it('滚动区能用 Tab 走到：焦点困在按钮上时键盘滚不动正文', () => {
+    // useFocusTrap 只认可聚焦元素，不带 tabindex 的话 Tab 只在按钮之间循环
+    const { confirm } = mount()
+    act(() => {
+      void confirm()({ title: 't', message: 'm', confirmLabel: 'OK' })
+    })
+    expect(body().tabIndex).toBe(0)
+  })
+
+  it('错误区同样能用 Tab 走到', async () => {
+    const { confirm } = mount()
+    act(() => {
+      void confirm()({
+        title: 't',
+        message: 'm',
+        confirmLabel: '更新',
+        action: async () => {
+          throw new Error('remote rejected')
+        },
+      })
+    })
+    fireEvent.click(button('更新'))
+    expect((await screen.findByText(/remote rejected/)).tabIndex).toBe(0)
+  })
+
+  it('进度也在滚动区外', async () => {
+    const { confirm } = mount()
+    let release!: () => void
+    const gate = new Promise<void>((r) => {
+      release = r
+    })
+    act(() => {
+      void confirm()({
+        title: 't',
+        message: 'm',
+        confirmLabel: '更新',
+        busyLabel: '正在更新…',
+        action: () => gate,
+      })
+    })
+    fireEvent.click(button('更新'))
+    const progress = await screen.findByText('正在更新…')
+    expect(body().contains(progress)).toBe(false)
+    await act(async () => {
+      release()
+      await gate
+    })
+  })
+})
+
 describe('focusCancel', () => {
   it('危险操作要求默认按钮是取消：焦点落在 Cancel 上，回车不会误确认', async () => {
     const { confirm } = mount()

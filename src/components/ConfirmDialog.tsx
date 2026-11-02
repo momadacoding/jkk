@@ -131,26 +131,30 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
   return (
     <div className="dialog-overlay" onMouseDown={() => { if (!busy) finish(false) }}>
       <div ref={boxRef} className="dialog dialog-wide" onMouseDown={(e) => e.stopPropagation()}>
-        <div className="dlg-head">
-          <span className={iconClass(request)}>
-            {request.notice === 'ok' ? <CheckGlyph /> : <WarnGlyph />}
-          </span>
-          <div>
-            <div className="dialog-title">{request.title}</div>
-            <div className="dialog-message">{request.message}</div>
+        {/* 正文长短由调用方决定，只有这一块滚；按钮、错误、进度在外面，滚到哪都看得见。
+            tabIndex：焦点默认在按钮上，不给的话键盘滚不动这里 */}
+        <div className="dialog-body" tabIndex={0}>
+          <div className="dlg-head">
+            <span className={iconClass(request)}>
+              {request.notice === 'ok' ? <CheckGlyph /> : <WarnGlyph />}
+            </span>
+            <div>
+              <div className="dialog-title">{request.title}</div>
+              <div className="dialog-message">{request.message}</div>
+            </div>
           </div>
+
+          {request.detail && (
+            <div className="dlg-field">
+              <span className="dlg-field-label">{request.detail.label}</span>
+              <span className="dlg-value"><RemoteGlyph />{request.detail.value}</span>
+            </div>
+          )}
+
+          {request.warning && <div className="dlg-warning">{request.warning}</div>}
         </div>
 
-        {request.detail && (
-          <div className="dlg-field">
-            <span className="dlg-field-label">{request.detail.label}</span>
-            <span className="dlg-value"><RemoteGlyph />{request.detail.value}</span>
-          </div>
-        )}
-
-        {request.warning && <div className="dlg-warning">{request.warning}</div>}
-
-        {error && <div className="dlg-warning">{error}</div>}
+        {error && <div className="dlg-warning dialog-error" tabIndex={0}>{error}</div>}
 
         {busy && (
           <div className="dlg-progress">
