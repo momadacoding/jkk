@@ -7,6 +7,7 @@ import {
   type TsvnHooksStatus,
 } from '../engine/tsvnHooks'
 import { useFocusTrap } from './useFocusTrap'
+import { Reveal } from './Reveal'
 
 interface TsvnHooksDialogProps {
   status: TsvnHooksStatus
@@ -61,7 +62,7 @@ export function TsvnHooksDialog({
     <div className="dialog-overlay" onMouseDown={onClose}>
       <div
         ref={boxRef}
-        className="dialog dialog-wide deliver-dialog"
+        className="dialog dialog-wide"
         role="dialog"
         aria-label="TortoiseSVN 钩子"
         onMouseDown={(e) => e.stopPropagation()}
@@ -111,9 +112,9 @@ export function TsvnHooksDialog({
           </>
         )}
         {error && (
-          <div className="dlg-warning" role="alert">
+          <Reveal className="dlg-warning" role="alert">
             {error}
-          </div>
+          </Reveal>
         )}
         <div className="dialog-actions">
           {status.supported && registered && (

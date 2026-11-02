@@ -40,7 +40,9 @@
 │   │   ├── engine/   # git 读取引擎
 │   │   └── main.rs
 │   └── tests/        # Rust fixtures 测试
-└── tests/vitest/     # 前端单元测试
+└── tests/
+    ├── vitest/       # 前端单元测试
+    └── layout/       # 弹框布局测试（Playwright）
 ```
 
 ## 安装依赖
@@ -186,6 +188,12 @@ pnpm tauri icon src-tauri/icons/source.png   # 派生全套平台图标
 
 ```bash
 pnpm test
+```
+
+弹框布局测试（需要本机装有 Microsoft Edge，会弹出浏览器窗口）：
+
+```bash
+pnpm test:layout
 ```
 
 Rust 测试：

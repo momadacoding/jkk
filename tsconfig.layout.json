@@ -1,0 +1,9 @@
+{
+  // 布局测试的类型检查。复现页手搭了 FollowReport、HookEntry 这些对象，src 里的类型一改，
+  // 不查的话它们会悄悄跟真实形状脱节；Playwright 只剥类型、不报错。`pnpm test:layout` 先跑它
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": []
+  },
+  "include": ["src", "tests/layout"]
+}

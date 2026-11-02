@@ -309,7 +309,9 @@ export function describeHealth(h: Health): Notice {
         title: `基线与服务器不符，共 ${h.files.length} 处`,
         detail:
           h.files.length > 0
-            ? h.files.join('\n')
+            ? // 不走 capPaths：这份清单是决定要不要重建基线的依据，界面上没有别处能看到它。
+              // 再长也放得下，确认框的正文会滚动
+              h.files.join('\n')
             : '（没有列出具体文件，这本身不该发生，请重建基线）',
         blocking: true,
       }

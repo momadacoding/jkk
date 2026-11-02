@@ -17,7 +17,8 @@ vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }))
 const invokeMock = vi.mocked(invoke)
 afterEach(() => invokeMock.mockReset())
 
-const FOCUSABLE = 'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), a[href]'
+// 与 useFocusTrap 同一份口径：确认框的滚动区靠 tabindex 进入 Tab 顺序
+const FOCUSABLE = 'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])'
 
 function focusables(): HTMLElement[] {
   const box = document.querySelector('.dialog')

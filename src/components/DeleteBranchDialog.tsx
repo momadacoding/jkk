@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useFocusTrap } from './useFocusTrap'
+import { Reveal } from './Reveal'
 import { invoke } from '@tauri-apps/api/core'
 import { toErrorMessage } from '../engine/errors'
 import type { Capabilities } from '../engine/capabilities'
@@ -345,8 +346,8 @@ export function DeleteBranchDialog({
           </div>
         )}
 
-        {infoError && <div className="dlg-warning">{infoError}</div>}
-        {deleteError && <div className="dlg-warning">{deleteError}</div>}
+        {infoError && <Reveal className="dlg-warning">{infoError}</Reveal>}
+        {deleteError && <Reveal className="dlg-warning">{deleteError}</Reveal>}
 
         {/* 做完的步骤对应的勾选框消失了，不说一声的话用户点 Cancel 会以为什么都没发生 */}
         {!busy && completed.length > 0 && (
@@ -359,10 +360,10 @@ export function DeleteBranchDialog({
         {/* 删 worktree 只是把目录搬进回收站，毫秒级；真正要等网络的只有远程
             那一步，单独报它，免得用户以为界面卡了 */}
         {busy && (
-          <div className="dlg-progress">
+          <Reveal className="dlg-progress">
             <span className="dlg-spinner" />
             {prefetchTarget ? '正在联系远程…' : '正在删除…'}
-          </div>
+          </Reveal>
         )}
 
         <div className="dialog-actions">

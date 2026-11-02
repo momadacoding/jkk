@@ -297,6 +297,15 @@ describe('体检三态的显示分类', () => {
     expect(d.detail).toContain('Code/A.cs')
   })
 
+  it('lying 的清单不截断：它是决定要不要重建基线的依据，没有别处能看到', () => {
+    // 长度由确认框的滚动区兜底（ConfirmDialog.test.tsx）。这里截断的话，用户要在
+    // 看不到受影响文件的情况下决定重建
+    const many = Array.from({ length: HEALTH_MAX_LISTED + 290 }, (_, i) => `Code/F${i}.cs`)
+    const d = describeHealth({ status: 'lying', files: many })
+    expect(d.title).toContain(String(many.length))
+    expect(d.detail.split('\n')).toEqual(many)
+  })
+
   it('notChecked 既不是成功也不是阻断——这是 spec §6.8.6 的第三行', () => {
     // 把「没能验证」当成「验证不通过」会让离线场景寸步难行，
     // 当成「验证通过」则等于这条检查不存在。所以它必须是独立的第三种。

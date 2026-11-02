@@ -27,6 +27,7 @@ pnpm build          # tsc + vite build
 ### Testing
 ```bash
 pnpm test                      # vitest run（前端纯逻辑；组件测试在文件头切 jsdom，见 AGENTS.md §8）
+pnpm test:layout               # Playwright + 有头 Edge：量弹框的按钮够不够得着（见 AGENTS.md §5.1）
 
 cd src-tauri
 cargo test                     # Rust 集成测试（fixture 仓库）
