@@ -1,0 +1,15 @@
+# 本地与 release CI 共用的 Rust 版本：release.yml 从这里读 channel 去装，本地 rustup 也认它。
+#
+# 钉死而不是跟 stable：CI 跟着 stable 漂时，新版 clippy 多出来的 lint 会在 `-D warnings`
+# 下让发版构建突然失败，而本地旧版一直是绿的（v0.7.0 就是这么挂的）。
+# 升级 Rust 就是改这一行、在本地把 fmt / clippy / test 跑过，再走 PR。
+#
+# 放在仓库根而不是 src-tauri/：rustup 按**当前目录**往上找这个文件，release.yml 是在根目录
+# 用 --manifest-path 调 cargo 的，放 src-tauri/ 里 CI 会看不到。
+#
+# 这与 src-tauri/Cargo.toml 的 rust-version（MSRV）是两回事：那是声明的最低版本，这里是
+# 实际用来构建、检查的版本。
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
