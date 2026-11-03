@@ -14,6 +14,8 @@
 ## 环境要求
 
 - [Rust](https://rustup.rs/)：通过 rustup 安装即可，具体版本由仓库根的 `rust-toolchain.toml` 钉死，首次 `cargo` 时自动安装
+  （rustup 恰好是 1.28.0 时不会自动装，先 `rustup update` 或在仓库里跑一次 `rustup toolchain install`）
+- [PowerShell](https://github.com/PowerShell/PowerShell) 7.4+：仅发版脚本需要
 - [Node.js](https://nodejs.org/) + [pnpm](https://pnpm.io/)
 - Windows / macOS / Linux 均可（当前主要在 Windows 11 开发）
 - 本地已安装 `git`
@@ -83,20 +85,34 @@ pnpm tauri build
 发版走脚本，在 master 的主工作区里执行（需要 `gh` 已登录）：
 
 ```powershell
-pwsh scripts/release.ps1 -Version 0.7.3            # 停在 draft，人去页面过目后点发布
-pwsh scripts/release.ps1 -Version 0.7.3 -Publish   # 构建成功后直接转正式发布
-pwsh scripts/release.ps1 -Version 0.7.3 -DryRun    # 只做检查、打印要改的版本号
+pwsh -NoProfile -File scripts/release.ps1 -Version 0.7.3            # 停在 draft，人去页面过目后点发布
+pwsh -NoProfile -File scripts/release.ps1 -Version 0.7.3 -Publish   # 构建成功后直接转正式发布
+pwsh -NoProfile -File scripts/release.ps1 -Version 0.7.3 -DryRun    # 只检查、打印要做的事，不改任何东西
 ```
 
 脚本依次：检查在 master、工作区干净、与 origin 同步、tag 不存在 → 改四处版本号
 （三个清单 + `Cargo.lock` 里 app 那一条）并重新生成许可清单 → 本地 `cargo fmt --check` /
-`clippy` → 提交并推 master（范围见 AGENTS.md「发版提交例外」）→ **对这个提交手动触发一次
-release workflow 预检** → 预检绿了才打 tag → 等正式构建。全程约 80 分钟。
+`clippy` → 提交并推 master → **对这个提交手动触发一次 release workflow 预检** → 预检绿了
+才把 tag 打在**这个提交**上 → 等正式构建。全程约 80 分钟。
+
+发版提交按 numstat 校验：四个版本文件必须恰好各改一行，许可清单可以随依赖变化，
+其它任何改动都会让脚本停下（范围见 AGENTS.md「发版提交例外」）。
 
 先预检再打 tag，是因为 runner 与本机的差异（8.3 短路径的 `%TEMP%`、全新的 git 配置、
 SlikSvn 版本等）本地复现不了，以前只能打了 tag 才发现，挂一次就废一个版本号。
-中途失败修好后（修复照常走 PR）用同一个版本号重跑即可：已提交的版本号不会重复 bump，
-同一提交已经成功的预检直接复用。
+
+中途失败后用同一个版本号重跑，脚本按远端实际状态续上：
+
+| 上次停在 | 重跑时 |
+|---|---|
+| 版本号提交了但没推上去 | 推送后继续 |
+| 预检进行中 / 已成功 | 接着等 / 直接复用 |
+| 预检失败 | 修复照常走 PR；合进 master 后重跑，对新 master 重新预检 |
+| 本地 tag 打好了但没推上去 | 推送后继续 |
+| tag 已推送（构建没等完、断线、转正式发布失败） | 只等那次 tag 构建，按需转正式发布 |
+| 版本号提交没推上去，而 origin/master 已前进 | 停下说明，需要先手工把本地 master 对齐 origin |
+
+脚本从不删 tag、不 reset。tag 构建真的失败时，按 AGENTS.md「发版提交例外」的规则改发下一个补丁版本。
 
 Rust 版本由仓库根的 `rust-toolchain.toml` 钉死，本地 rustup 与 CI 用的是同一个，
 新版 clippy 的 lint 不会再在发版那天才冒出来。升级 Rust 就是改那一行，走 PR。
