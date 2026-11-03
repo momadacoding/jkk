@@ -52,6 +52,9 @@ fn merged_pr(branch: &str, head_ref_oid: &str) -> PullRequest {
         is_draft: false,
         state: "MERGED".to_string(),
         url: "u".to_string(),
+        base_ref_name: "master".to_string(),
+        merged_at: None,
+        is_cross_repository: false,
         local_relation: None,
     }
 }
@@ -63,7 +66,7 @@ fn path_str(dir: &TempDir) -> String {
 #[test]
 fn parses_real_gh_output() {
     let json = r#"[
-      {"headRefName":"fix/watch","headRefOid":"ac6e785eb547aadf74ff83993fe44b231aaf9b8a","isDraft":false,"number":36,"state":"OPEN","title":"linked worktree 下外部 commit 不触发刷新","url":"https://github.com/o/r/pull/36"},
+      {"baseRefName":"master","headRefName":"fix/watch","headRefOid":"ac6e785eb547aadf74ff83993fe44b231aaf9b8a","isCrossRepository":false,"isDraft":false,"mergedAt":null,"number":36,"state":"OPEN","title":"linked worktree 下外部 commit 不触发刷新","url":"https://github.com/o/r/pull/36"},
       {"headRefName":"feat/tab","headRefOid":"6e6f014513cd3cc520cfa3838228517af47ad3ef","isDraft":true,"number":35,"state":"OPEN","title":"中键点击标签即关闭","url":"https://github.com/o/r/pull/35"}
     ]"#;
 
@@ -79,11 +82,46 @@ fn parses_real_gh_output() {
             is_draft: false,
             state: "OPEN".to_string(),
             url: "https://github.com/o/r/pull/36".to_string(),
+            base_ref_name: "master".to_string(),
+            // open 的 PR，gh 给的是 null
+            merged_at: None,
+            is_cross_repository: false,
             // gh 不给这个字段，它由 list_branch_prs 在本地补算
             local_relation: None,
         }
     );
     assert!(prs[1].is_draft, "isDraft 必须映射到 is_draft");
+}
+
+#[test]
+fn parses_base_and_merge_time_of_a_stacked_pr() {
+    // 真实形状：叠在别的 PR 分支上、合进那条分支的 PR
+    let json = r#"[{"baseRefName":"worktree-fix-mobile-api-failure-kind","headRefName":"worktree-fix-refresh-truncated-body","headRefOid":"bb9bb65ad2b3b43bd7a24e343641f2f24a8bc752","isCrossRepository":false,"isDraft":false,"mergedAt":"2026-11-02T17:20:38Z","number":397,"state":"MERGED","title":"t","url":"u"}]"#;
+    let prs = github::parse_pr_list(json).unwrap();
+    assert_eq!(prs[0].base_ref_name, "worktree-fix-mobile-api-failure-kind");
+    assert_eq!(prs[0].merged_at.as_deref(), Some("2026-11-02T17:20:38Z"));
+    assert!(!prs[0].is_cross_repository);
+}
+
+#[test]
+fn absent_base_fields_deserialize_to_defaults() {
+    // 只覆盖 JSON 里缺这几个字段的形状。老版本 gh 不是这种形状——它会直接拒绝不认识的
+    // --json 字段、整条命令失败，那条退化路径不在这里测（见 PullRequest::base_ref_name）
+    let json = r#"[{"headRefName":"a","isDraft":false,"number":1,"state":"MERGED","title":"t","url":"u"}]"#;
+    let prs = github::parse_pr_list(json).unwrap();
+    assert_eq!(prs[0].base_ref_name, "");
+    assert_eq!(prs[0].merged_at, None);
+    assert!(!prs[0].is_cross_repository);
+}
+
+#[test]
+fn requested_fields_include_what_the_stacked_check_needs() {
+    for field in ["baseRefName", "mergedAt", "isCrossRepository"] {
+        assert!(
+            github::PR_FIELDS.split(',').any(|f| f == field),
+            "PR_FIELDS 缺少 {field}"
+        );
+    }
 }
 
 #[test]

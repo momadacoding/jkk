@@ -40,6 +40,7 @@ function row(commit: CommitNode, refs: RefPointer[]) {
       node={{ commit } as LayoutNode}
       refs={refs}
       prByBranch={new Map()}
+      prsByHead={new Map()}
       selected={false}
       layoutWidth={0}
       laneColor="#fff"

@@ -17,6 +17,8 @@ interface CommitRowProps {
    * 每行再遍历一遍 PR 列表是白费力气。索引由 `GraphView` 建一次。
    */
   prByBranch: Map<string, PullRequest>
+  /** 同理，按 head 分组的本仓库 PR，用来认出合进已合并父分支的叠 PR（`groupPullRequestsByHead`）。 */
+  prsByHead: Map<string, PullRequest[]>
   selected: boolean
   layoutWidth: number
   /** 该提交所在车道的颜色，用作本地分支标签的左侧色条。 */
@@ -28,7 +30,7 @@ interface CommitRowProps {
 }
 
 export function CommitRow({
-  node, refs, prByBranch, selected, layoutWidth, laneColor, changeCount, isHead,
+  node, refs, prByBranch, prsByHead, selected, layoutWidth, laneColor, changeCount, isHead,
 }: CommitRowProps) {
   if (node.commit.id === WORKDIR_ID) {
     return (
@@ -88,7 +90,7 @@ export function CommitRow({
           const pr = pullRequestForRef(prByBranch, ref)
           // ref.hash 就是这一行的提交，也就是该分支的 tip——正好是判断
           // 「PR 合并之后分支有没有再往前走」需要的那个值
-          const badge = pr ? prBadge(pr, ref.hash) : undefined
+          const badge = pr ? prBadge(pr, ref.hash, prsByHead) : undefined
           const tooltip = [
             ref.name,
             pill.remotes.length > 0 ? `远程同一提交：${pill.remotes.join('、')}` : undefined,

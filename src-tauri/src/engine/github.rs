@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::process::Command;
 
 /// 向 gh 索要的字段，和 [`PullRequest`] 一一对应。
-const PR_FIELDS: &str = "number,headRefName,headRefOid,title,isDraft,state,url";
+pub const PR_FIELDS: &str =
+    "number,headRefName,headRefOid,title,isDraft,state,url,baseRefName,mergedAt,isCrossRepository";
 
 /// 每种状态各取多少条。
 ///
@@ -69,6 +70,22 @@ pub struct PullRequest {
     /// 成枚举会在 gh 加新状态时直接解析失败，整条通道跟着哑掉。判定放前端。
     pub state: String,
     pub url: String,
+    /// PR 要合进的分支名，不带 `refs/heads/` 前缀。
+    ///
+    /// 叠 PR 的 base 是另一个 PR 的 head 分支：父 PR 先合进主干、子 PR 后合的话，子 PR 合进的是
+    /// 一条已经没用的分支，改动根本没进主干，但 gh 照样报 MERGED。前端靠这个字段认出这种情况。
+    ///
+    /// 下面三个字段的 `#[serde(default)]` 只管 JSON 里缺字段的情况，**兜不住老版本 gh**：
+    /// gh 遇到不认识的 `--json` 字段会整条命令失败，[`list_prs_in_state`] 随之降级成「没有 PR」，
+    /// 所有 PR 徽章一起消失。实测本机 gh 支持这三个字段；更老的 gh 上会出现上述退化。
+    #[serde(default)]
+    pub base_ref_name: String,
+    /// 合并时间（RFC 3339）；没合并的 PR gh 给 `null`。用来判断父子 PR 谁先合并。
+    #[serde(default)]
+    pub merged_at: Option<String>,
+    /// 来自 fork 的 PR。它们的 head 分支名常常就叫 `main`，不能当作本仓库里的父 PR。
+    #[serde(default)]
+    pub is_cross_repository: bool,
     /// gh 不给这个字段，由 [`annotate_local_relations`] 在本地补算。
     ///
     /// 只对已合并、能找到同名本地分支、且合并点对象在本地的 PR 才有值；

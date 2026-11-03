@@ -15,6 +15,8 @@ const LOCAL_BRANCH_PREFIX = 'refs/heads/'
  * - `merged-diverged`：两边各有对方没有的提交。危险，同 ahead。
  * - `merged-unknown`：分支头对不上，但判断不了方向（合并点对象本地没有，或分支在
  *   上次读取 PR 之后又动过）。可能是 ahead，所以按危险处理。
+ * - `merged-stranded`：叠 PR 合进了父 PR 的分支，而父 PR 比它先合并。改动困在那条已经没用
+ *   的分支上，没进主干，gh 却照样报 MERGED。**危险**，且压过上面四种：最要紧的是改动不在主干。
  */
 export type PrBadgeVariant =
   | 'open'
@@ -24,6 +26,7 @@ export type PrBadgeVariant =
   | 'merged-behind'
   | 'merged-diverged'
   | 'merged-unknown'
+  | 'merged-stranded'
 
 /** 徽章渲染需要的全部东西。组件只调 [`prBadge`] 一次，不各自拼字符串。 */
 export interface PrBadgeView {
@@ -66,21 +69,126 @@ function variantOf(pr: PullRequest, branchHash?: string): PrBadgeVariant {
   return 'merged-unknown'
 }
 
+/** 解析不了就是 null。gh 给的是 `2026-11-02T17:20:38Z`，但不靠字符串比较排先后。 */
+function mergedTime(pr: PullRequest): number | null {
+  if (!pr.mergedAt) return null
+  const t = Date.parse(pr.mergedAt)
+  return Number.isNaN(t) ? null : t
+}
+
+/**
+ * 按 head 分支名把**本仓库**的 open / merged PR 分组，供叠 PR 判断用（见 [`strandedOn`]）。
+ *
+ * 不能拿 [`indexPullRequestsByBranch`] 代替：那个索引每个分支只留一条显示用的 PR，而父分支上
+ * 可能有好几个 PR（一个合进 release、一个合进 main），只看其中一个会误判。
+ * fork 的 PR 不收：它们的 head 常常就叫 `main`，会被当成每个合进 main 的 PR 的父 PR。
+ */
+export function groupPullRequestsByHead(prs: PullRequest[]): Map<string, PullRequest[]> {
+  const groups = new Map<string, PullRequest[]>()
+  for (const pr of prs) {
+    if (pr.isCrossRepository || statePriority(pr) === 0) continue
+    const head = pr.headRefName?.trim()
+    if (!head) continue
+    const list = groups.get(head)
+    if (list) list.push(pr)
+    else groups.set(head, [pr])
+  }
+  return groups
+}
+
+/** 困住一个 PR 的链：`via` 是它合进的分支对应的 PR，`root` 是更早合并、没把它带走的那个。 */
+interface Stranding {
+  via: PullRequest
+  root: PullRequest
+}
+
+/**
+ * 这个已合并的 PR 的改动是不是被困在了父 PR 的分支上。
+ *
+ * 父 PR 是 head 等于它 base 的那些 PR。改动能继续往上走，只要其中**任一个**还开着、或在它之后
+ * 合并且自己没被困住——走得通一条就算进去了。所有父 PR 都比它先合并，就是困住了。
+ * base 上没有任何 PR 时当作合进了普通目标分支（主干、release 等），不判断。
+ *
+ * 只看 gh 给的数据，不去比本地的默认分支：`origin/HEAD` 可能过期或根本没有，拿它判断会对每个
+ * 已合并 PR 误报。缺合并时间、同一秒合并分不出先后、base 互相指向的坏数据，一律不判断：宁可
+ * 少一个提示，也不凭空报警。
+ */
+function strandedOn(
+  pr: PullRequest,
+  byHead: Map<string, PullRequest[]>,
+  seen: Set<number> = new Set(),
+): Stranding | undefined {
+  if (pr.state !== 'MERGED' || !pr.baseRefName) return undefined
+  const mine = mergedTime(pr)
+  if (mine === null) return undefined
+  const parents = (byHead.get(pr.baseRefName) ?? [])
+    .filter((p) => p.number !== pr.number)
+    .sort((a, b) => b.number - a.number)
+  if (parents.length === 0) return undefined
+  seen.add(pr.number)
+  let stranding: Stranding | undefined
+  for (const parent of parents) {
+    if (parent.state !== 'MERGED') return undefined
+    const theirs = mergedTime(parent)
+    if (theirs === null || theirs === mine || seen.has(parent.number)) return undefined
+    if (theirs < mine) {
+      stranding ??= { via: parent, root: parent }
+      continue
+    }
+    // 改动随父 PR 走了，再看父 PR 自己有没有被困住
+    const upstream = strandedOn(parent, byHead, seen)
+    if (!upstream) return undefined
+    stranding ??= { via: parent, root: upstream.root }
+  }
+  return stranding
+}
+
 /**
  * 算出一条 PR 在分支上该画成什么样。
  *
  * `branchHash` 是**本地分支的 tip**（`RefPointer.hash`）。它只用来细分已合并的
  * 几种形态，其余形态不需要。
  *
+ * `byHead` 是 [`groupPullRequestsByHead`] 的结果，用来找叠 PR 的父 PR（见 [`strandedOn`]）。
+ * 不传就不做这项判断。
+ *
  * 标签里的 `✓` 和 `↑` `↓` `?` **不是装饰**：graph 里徽章的底色是车道色，12 条车道各不
  * 相同；能过对比度的紫已经淡到与 draft 灰分不开（实测最高 4.41）。颜色在这里
  * 当不了唯一的区分手段，符号才能，而且这一路对色盲同样成立。`↑` `↓` 沿用侧边栏
  * ahead/behind 徽章的箭头，在这个界面里已经是「本地领先/落后」的意思。
  */
-export function prBadge(pr: PullRequest, branchHash?: string): PrBadgeView {
+export function prBadge(
+  pr: PullRequest,
+  branchHash?: string,
+  byHead?: Map<string, PullRequest[]>,
+): PrBadgeView {
+  const badge = relationBadge(pr, branchHash)
+  const stranding = byHead ? strandedOn(pr, byHead) : undefined
+  if (!stranding) return badge
+  const { via, root } = stranding
+  const route =
+    via === root
+      ? `而 #${root.number} 在它之前就已经合并了。`
+      : `#${via.number} 后来合并了，但它也困在已经先合并的 PR #${root.number} 的分支上。`
+  // 本地分支相对合并点的警告（↑ ↓ ? 那几种）照样要说：另开 PR 时漏掉那几个提交一样会丢东西
+  const extra = badge.variant === 'merged' ? '' : `\n另外：${badge.tooltip.split('\n').slice(1).join('\n')}`
+  // `!` 而不是只换颜色：理由同上面关于 ✓ 的说明
+  return {
+    variant: 'merged-stranded',
+    label: `✓#${pr.number}!`,
+    tooltip:
+      `已合并的 PR #${pr.number}: ${pr.title}\n` +
+      `合进的是 ${pr.baseRefName}（PR #${via.number} 的分支），${route}\n` +
+      `按 PR 记录，这个 PR 的改动没有随 #${root.number} 进入 ${root.baseRefName}，` +
+      `只留在那条分支上——删分支前先确认，需要的话另开 PR。${extra}`,
+  }
+}
+
+/** 不考虑叠 PR 时的徽章：open / draft，或已合并时本地分支相对合并点的几种形态。 */
+function relationBadge(pr: PullRequest, branchHash?: string): PrBadgeView {
+  const title = `已合并的 PR #${pr.number}: ${pr.title}\n`
   const variant = variantOf(pr, branchHash)
   // 合并点与分支头不一致的几种形态，两个 SHA 都要说出来，否则用户没法自己核对
-  const title = `已合并的 PR #${pr.number}: ${pr.title}\n`
   const mergedAt = shortOid(pr.headRefOid)
   const local = shortOid(branchHash ?? '')
   const ahead = pr.localRelation?.ahead ?? 0
