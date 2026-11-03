@@ -13,7 +13,7 @@
 
 ## 环境要求
 
-- [Rust](https://rustup.rs/) >= 1.77.2
+- [Rust](https://rustup.rs/)：通过 rustup 安装即可，具体版本由仓库根的 `rust-toolchain.toml` 钉死，首次 `cargo` 时自动安装
 - [Node.js](https://nodejs.org/) + [pnpm](https://pnpm.io/)
 - Windows / macOS / Linux 均可（当前主要在 Windows 11 开发）
 - 本地已安装 `git`
@@ -28,7 +28,7 @@
 │   ├── specs/    # 设计规格文档
 │   ├── plans/    # 实现计划
 │   └── e2e/      # E2E 验证清单
-├── scripts/          # 一次性/维护脚本（图标生成、CI 签名等）
+├── scripts/          # 维护脚本（发版、图标生成、CI 签名等）
 ├── src/              # React 前端
 │   ├── components/   # UI 组件
 │   ├── engine/       # 提交图布局/路径/SVG 渲染
@@ -80,22 +80,26 @@ pnpm tauri build
 测试与 lint 门槛、`pnpm tauri build`，然后把安装包传上去建一个 **draft** Release，
 由人过目后再点发布。
 
-```bash
-# tag 必须打在 master 上。在功能分支或 worktree 里打 tag 同样能构建成功，
-# 发出去的却是没经过 review 的代码，而且从安装包上完全看不出来。
-git checkout master
-git pull --ff-only
+发版走脚本，在 master 的主工作区里执行（需要 `gh` 已登录）：
 
-# 版本号直接在 master 上改，不走 PR（范围见 AGENTS.md「发版提交例外」）。
-# 四处必须一致：package.json / src-tauri/tauri.conf.json / src-tauri/Cargo.toml，
-# 以及 src-tauri/Cargo.lock 里 app 那一条
-node scripts/gen-notices.mjs --check   # 依赖变过就去掉 --check 重新生成，一起提交
-git commit -am "chore(release): 版本号升到 0.1.0"
-git push origin master
-
-git tag v0.1.0
-git push origin v0.1.0
+```powershell
+pwsh scripts/release.ps1 -Version 0.7.3            # 停在 draft，人去页面过目后点发布
+pwsh scripts/release.ps1 -Version 0.7.3 -Publish   # 构建成功后直接转正式发布
+pwsh scripts/release.ps1 -Version 0.7.3 -DryRun    # 只做检查、打印要改的版本号
 ```
+
+脚本依次：检查在 master、工作区干净、与 origin 同步、tag 不存在 → 改四处版本号
+（三个清单 + `Cargo.lock` 里 app 那一条）并重新生成许可清单 → 本地 `cargo fmt --check` /
+`clippy` → 提交并推 master（范围见 AGENTS.md「发版提交例外」）→ **对这个提交手动触发一次
+release workflow 预检** → 预检绿了才打 tag → 等正式构建。全程约 80 分钟。
+
+先预检再打 tag，是因为 runner 与本机的差异（8.3 短路径的 `%TEMP%`、全新的 git 配置、
+SlikSvn 版本等）本地复现不了，以前只能打了 tag 才发现，挂一次就废一个版本号。
+中途失败修好后（修复照常走 PR）用同一个版本号重跑即可：已提交的版本号不会重复 bump，
+同一提交已经成功的预检直接复用。
+
+Rust 版本由仓库根的 `rust-toolchain.toml` 钉死，本地 rustup 与 CI 用的是同一个，
+新版 clippy 的 lint 不会再在发版那天才冒出来。升级 Rust 就是改那一行，走 PR。
 
 Release 说明开头的「新功能 / 修复」由 `scripts/release-notes.sh` 自动生成：取上一个正式版
 tag 以来的提交标题，`feat` 进新功能、`fix` 进修复，其余类型不列。所以提交标题就是更新日志，
@@ -124,8 +128,8 @@ workflow 会在构建前自行校验三件事，任何一项不过都在几秒�
 
 产物含 `SHA256SUMS.txt`，可用来核对下载到的是不是这次构建的东西。
 
-真打 tag 之前可以先在 Actions 页面手动触发一次（`workflow_dispatch`）：
-只构建、不发 Release，用来确认 CI 环境编得出来。
+手动触发（`workflow_dispatch`）只构建、不发 Release，`scripts/release.ps1` 的预检就是它；
+也可以在 Actions 页面对任意分支手动跑，提前确认改动在 CI 环境里编得出来、测得过。
 
 > 这个 workflow **不是 PR 门禁**——`push` 和 `pull_request` 都不会触发它。
 > 日常改动的验证仍然全靠本地手工执行，见 `AGENTS.md` §5。
