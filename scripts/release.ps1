@@ -65,11 +65,19 @@ function Show-RunFailure([string]$runId) {
 function Wait-Run([string]$runId, [string]$label) {
     Write-Host "$label：https://github.com/$script:repo/actions/runs/$runId"
     gh run watch $runId --interval 30
+    $errors = 0
     while ($true) {
         $json = gh run view $runId --json status,conclusion
         if ($LASTEXITCODE -eq 0) {
+            $errors = 0
             $s = $json | ConvertFrom-Json
             if ($s.status -eq 'completed') { break }
+        } else {
+            # 查不动（登录过期、长时间断网）时别无声地卡住；连续 30 分钟都查不动就放弃，
+            # run 本身不受影响，重跑脚本会接着等它
+            $errors++
+            Write-Host "查询 run $runId 失败（连续第 $errors 次），30 秒后重试" -ForegroundColor Yellow
+            if ($errors -ge 60) { throw "连续 30 分钟查不到 run $runId 的状态。修好 gh 登录 / 网络后重跑本脚本即可续上" }
         }
         Start-Sleep 30
     }
@@ -117,6 +125,17 @@ function Set-VersionIn([string]$path, [string]$pattern, [string]$from, [string]$
     Write-Host ("  {0,-28} {1} -> {2}" -f $path, $from, $to)
 }
 
+# 发版提交例外只许改版本号：四个版本文件必须恰好各一行增一行删，许可清单随依赖变化可以多改；
+# 除此之外任何改动都不该搭车（cargo 改写了 Cargo.lock、手工提交借用了发版标题都算）
+function Assert-ReleaseOnly([string[]]$numstat) {
+    foreach ($line in $numstat) {
+        $added, $deleted, $path = $line -split "`t", 3
+        if ($path -eq $script:notices) { continue }
+        if ($path -notin $script:versionFiles) { throw "发版提交里有例外之外的文件：$path" }
+        if ($added -ne '1' -or $deleted -ne '1') { throw "$path 的改动不只是一行版本号（+$added -$deleted）" }
+    }
+}
+
 # 远端 tag 指向的提交（附注 tag 取 ^{} 解引用后的那一行）；不存在时返回空
 function Get-RemoteTagCommit([string]$tag) {
     $lines = Invoke-Checked '查询远端 tag' { git ls-remote origin "refs/tags/$tag" "refs/tags/$tag^{}" }
@@ -154,6 +173,15 @@ function Complete-Release([string]$tag, [string]$sha) {
 if ($Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { throw "版本号要形如 0.7.3：$Version" }
 $tag = "v$Version"
 $releaseSubject = "chore(release): 版本号升到 $Version"
+$files = @(
+    @{ Path = 'package.json'; Pattern = '^(\s*"version":\s*"){V}(")' }
+    @{ Path = 'src-tauri/tauri.conf.json'; Pattern = '^(\s*"version":\s*"){V}(")' }
+    # 只认 [package] 段里的那一行，依赖表里的 version = 不碰
+    @{ Path = 'src-tauri/Cargo.toml'; Pattern = '(?s)(\[package\][^\[]*?^version = "){V}(")' }
+    @{ Path = 'src-tauri/Cargo.lock'; Pattern = '(^name = "app"\r?\nversion = "){V}(")' }
+)
+$script:versionFiles = $files | ForEach-Object { $_.Path }
+$script:notices = 'THIRD_PARTY_NOTICES.md'
 
 # 不用 `git rev-parse --show-toplevel`：它的输出按控制台代码页解码，中文路径会乱码
 $script:root = Split-Path $PSScriptRoot -Parent
@@ -164,14 +192,13 @@ Set-Location $script:root
 Step '检查前置条件'
 Invoke-Checked 'gh 登录检查（先 gh auth login）' { gh auth status *> $null }
 $originUrl = Invoke-Checked '读取 origin 地址' { git remote get-url origin }
-if ($env:GH_REPO) {
-    # 其余 gh 子命令都认 GH_REPO；它若指向别的仓库，就会推一个仓库、在另一个仓库上预检
-    if (($originUrl -replace '\\', '/') -notmatch "[/:]$([regex]::Escape($env:GH_REPO))(\.git)?/?$") {
-        throw "GH_REPO=$env:GH_REPO 与 origin（$originUrl）不是同一个仓库"
-    }
-    $script:repo = $env:GH_REPO
-} else {
-    $script:repo = Invoke-Checked '读取仓库名' { gh repo view --json nameWithOwner --jq .nameWithOwner }
+# gh 子命令操作的仓库来自 GH_REPO 或 `gh repo set-default`，都可能不是 origin；
+# 不一致就会推一个仓库、在另一个仓库上预检和发版
+$script:repo = if ($env:GH_REPO) { $env:GH_REPO } else {
+    Invoke-Checked '读取仓库名' { gh repo view --json nameWithOwner --jq .nameWithOwner }
+}
+if (($originUrl -replace '\\', '/') -notmatch "[/:]$([regex]::Escape($script:repo))(\.git)?/?$") {
+    throw "gh 操作的仓库 $script:repo 与 origin（$originUrl）不是同一个"
 }
 
 $branch = Invoke-Checked '读取当前分支' { git symbolic-ref --short -q HEAD }
@@ -201,6 +228,8 @@ if ($ahead -gt 0) {
             throw "上次的版本号提交没推上去，而 origin/master 已经前进了 $behind 个提交。" +
                 '确认那个发版提交里没有别的东西后，把本地 master 对齐 origin/master（会丢弃那个本地提交）再重跑'
         }
+        # 标题对得上不够：手工提交也可能借用这个标题。内容同样按发版提交例外核一遍
+        Assert-ReleaseOnly (Invoke-Checked '核对未推送的发版提交' { git diff --numstat HEAD~1 HEAD })
         Write-Host '上次的版本号提交还没推上去，这次接着推'
         $pendingPush = $true
     } else {
@@ -225,15 +254,14 @@ if ($localTagSha -and -not $pendingPush) {
 # --- 版本号 ---
 Step "版本号 -> $Version"
 $current = (Get-Content package.json -Raw | ConvertFrom-Json).version
-$files = @(
-    @{ Path = 'package.json'; Pattern = '^(\s*"version":\s*"){V}(")' }
-    @{ Path = 'src-tauri/tauri.conf.json'; Pattern = '^(\s*"version":\s*"){V}(")' }
-    # 只认 [package] 段里的那一行，依赖表里的 version = 不碰
-    @{ Path = 'src-tauri/Cargo.toml'; Pattern = '(?s)(\[package\][^\[]*?^version = "){V}(")' }
-    @{ Path = 'src-tauri/Cargo.lock'; Pattern = '(^name = "app"\r?\nversion = "){V}(")' }
-)
-$versionFiles = $files | ForEach-Object { $_.Path }
-$notices = 'THIRD_PARTY_NOTICES.md'
+if ($DryRun -and $behind -gt 0) {
+    Write-Host "[DryRun] 本地落后 origin，下面按本地的 $current 推算；实际运行时以快进后的版本为准" -ForegroundColor Yellow
+}
+# 本地 tag 打在 HEAD 上、版本号却还要 bump：bump 会产生新提交，tag 必然对不上。
+# 在这里就停，别等 40 分钟预检跑完才发现
+if ($localTagSha -and $current -ne $Version) {
+    throw "本地已有 $tag（指向 HEAD），但版本号还是 $current。确认后删掉本地 tag 再重跑"
+}
 
 if ($current -eq $Version) {
     # 重跑：版本号已经是目标值（已提交，可能还没推）。核对四处一致
@@ -264,21 +292,13 @@ if ($current -eq $Version) {
         } finally { Pop-Location }
 
         Step '提交版本号'
-        Invoke-Checked 'git add' { git add -- @versionFiles $notices }
-        # 发版提交例外只许改版本号：四个版本文件必须恰好各一行增一行删，
-        # 许可清单随依赖变化可以多改；除此之外任何改动都不该搭车（cargo 改写了 Cargo.lock 也算）
-        $numstat = Invoke-Checked 'git diff --cached --numstat' { git diff --cached --numstat }
-        foreach ($line in $numstat) {
-            $added, $deleted, $path = $line -split "`t", 3
-            if ($path -eq $notices) { continue }
-            if ($path -notin $versionFiles) { throw "暂存区里有发版提交例外之外的文件：$path" }
-            if ($added -ne '1' -or $deleted -ne '1') { throw "$path 的改动不只是一行版本号（+$added -$deleted）" }
-        }
+        Invoke-Checked 'git add' { git add -- $script:versionFiles $script:notices }
+        Assert-ReleaseOnly (Invoke-Checked 'git diff --cached --numstat' { git diff --cached --numstat })
         Invoke-Checked 'git commit' { git commit -q -m $releaseSubject }
     } catch {
         # 不替用户撤销：只提示。开跑前已确认工作区干净，这些文件里只有本脚本的改动
         Write-Host "`n版本号改动还留在工作区或暂存区。修好问题后先撤掉再重跑：" -ForegroundColor Yellow
-        Write-Host "  git restore --staged --worktree $($versionFiles -join ' ') $notices"
+        Write-Host "  git restore --staged --worktree $($script:versionFiles -join ' ') $script:notices"
         throw
     }
     $pendingPush = $true
@@ -296,7 +316,7 @@ $sha = Invoke-Checked '读取 HEAD' { git rev-parse HEAD }
 
 # --- 预检 ---
 Step "CI 预检（workflow_dispatch @ $($sha.Substring(0, 8))）"
-# 同一提交上已经成功的预检（任何分支，同一棵树、同一份 workflow）直接复用；进行中的接着等
+# 同一提交上已经在 master 跑过的预检：成功的直接复用，进行中的接着等
 $dispatchRuns = @(Get-Runs 'workflow_dispatch' $sha 'master')
 $reuse = $dispatchRuns | Where-Object conclusion -EQ 'success' | Select-Object -Last 1
 if (-not $reuse) { $reuse = $dispatchRuns | Where-Object status -NE 'completed' | Select-Object -Last 1 }
