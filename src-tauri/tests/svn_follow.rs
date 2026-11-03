@@ -6,6 +6,8 @@
 //! 崩溃与竞态用 `svn_follow::fault` 注入：`crash_at` 模拟进程死掉（同步锁随 unwind 释放，
 //! 对应操作系统回收句柄；`.git/index.lock` 留在磁盘上），`call_at` 在固定位置插进一段外部操作。
 
+#[path = "common/long_ref.rs"]
+mod long_ref;
 #[path = "common/svn_fixtures.rs"]
 mod svn_fixtures;
 
@@ -3324,6 +3326,23 @@ fn branch_with_no_commits_of_its_own_on_an_old_baseline_is_behind() {
     tortoise_commit(&fx, A);
     done(run(&fx));
     assert_eq!(oid(&fx, "stay"), old_base, "前提：有 upstream，跟进不动它");
+
+    assert_eq!(behind(&fx), vec!["stay".to_string()]);
+}
+
+#[test]
+fn loose_branch_behind_a_long_ref_is_still_listed() {
+    // 超长 ref 让 libgit2 的全量遍历提前结束时，只有 loose 的分支不能从「落后基线」里消失
+    let fx = hybrid_with_colleague();
+    let old_base = oid(&fx, "svn/base");
+    git(&fx, &["branch", "stay", &old_base]);
+    git(&fx, &["config", "branch.stay.remote", "."]);
+    git(&fx, &["config", "branch.stay.merge", "refs/heads/work"]);
+    i_commit(&fx);
+    write(&fx, A, "a2\n");
+    tortoise_commit(&fx, A);
+    done(run(&fx));
+    long_ref::plant_long_loose_ref(&fx.wc(), &old_base);
 
     assert_eq!(behind(&fx), vec!["stay".to_string()]);
 }

@@ -35,12 +35,11 @@ pub struct PreparedMerge {
 /// 指着这个提交的分支名：先找本地分支，再找远程跟踪分支，同类里按名字取第一个。
 fn branch_at(repo: &Repository, oid: Oid) -> Option<String> {
     for kind in [BranchType::Local, BranchType::Remote] {
-        let mut names: Vec<String> = repo
-            .branches(Some(kind))
+        let mut names: Vec<String> = crate::engine::refs::branches(repo, Some(kind))
             .ok()?
-            .flatten()
-            .filter(|(b, _)| b.get().target() == Some(oid))
-            .filter_map(|(b, _)| b.name().ok().flatten().map(str::to_string))
+            .iter()
+            .filter(|b| b.get().target() == Some(oid))
+            .filter_map(|b| b.name().ok().flatten().map(str::to_string))
             .collect();
         names.sort();
         if let Some(first) = names.into_iter().next() {

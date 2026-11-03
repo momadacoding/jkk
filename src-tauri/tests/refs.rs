@@ -1,5 +1,9 @@
+#[path = "common/long_ref.rs"]
+mod long_ref;
+
 use app_lib::engine::refs;
 use git2::Repository;
+use long_ref::plant_long_loose_ref;
 use std::fs;
 use std::process::Command;
 use tempfile::TempDir;
@@ -299,4 +303,167 @@ fn only_local_branches_carry_gone_upstream() {
     for r in all.iter().filter(|r| r.kind != "branch") {
         assert_eq!(r.gone_upstream, None, "{} 不该有 gone_upstream", r.name);
     }
+}
+
+/// 现场的形状：`packed-refs` 里是旧值，loose 里是新值，超长 ref 排在 `refs/heads` 之前。
+/// 返回的仓库里 master 和 origin/master 都比 packed 里的值新一条，另有两个只有 loose 的 ref。
+fn repo_with_packed_stale_refs() -> (TempDir, TempDir) {
+    let (local, remote) = repo_with_remote();
+    run_git(local.path(), &["update-ref", "refs/packed-ns/x", "HEAD"]);
+    run_git(local.path(), &["pack-refs", "--all"]);
+    commit(local.path(), "c2");
+    run_git(local.path(), &["push", "origin", "HEAD"]);
+    run_git(local.path(), &["branch", "loose-only"]);
+    run_git(local.path(), &["tag", "loose-tag"]);
+    plant_long_loose_ref(local.path(), &rev_parse(local.path(), "HEAD"));
+    (local, remote)
+}
+
+#[test]
+fn collect_prefers_loose_values_over_stale_packed_ones_behind_a_long_ref() {
+    let (local, _remote) = repo_with_packed_stale_refs();
+    let head = rev_parse(local.path(), "HEAD");
+
+    let repo = Repository::open(local.path()).unwrap();
+    let all = refs::collect(&repo).unwrap();
+
+    assert_eq!(find(&all, "refs/heads/master").hash, head);
+    assert_eq!(find(&all, "refs/remotes/origin/master").hash, head);
+}
+
+#[test]
+fn collect_lists_loose_only_refs_behind_a_long_ref() {
+    let (local, _remote) = repo_with_packed_stale_refs();
+    let head = rev_parse(local.path(), "HEAD");
+
+    let repo = Repository::open(local.path()).unwrap();
+    let all = refs::collect(&repo).unwrap();
+
+    assert_eq!(find(&all, "refs/heads/loose-only").hash, head);
+    assert_eq!(find(&all, "refs/tags/loose-tag").hash, head);
+}
+
+#[test]
+fn collect_reads_shared_loose_refs_from_a_linked_worktree() {
+    // 用户可能直接打开 linked worktree：分支 ref 在主仓库的 commondir 下，不在它自己的 gitdir 里
+    let (local, _remote) = repo_with_packed_stale_refs();
+    let head = rev_parse(local.path(), "HEAD");
+    let holder = TempDir::new().unwrap();
+    let linked = holder.path().join("wt");
+    run_git(
+        local.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            linked.to_str().unwrap(),
+            "-b",
+            "wt",
+        ],
+    );
+
+    let repo = Repository::open(&linked).unwrap();
+    let all = refs::collect(&repo).unwrap();
+
+    assert_eq!(find(&all, "refs/heads/master").hash, head);
+    assert_eq!(find(&all, "refs/heads/wt").hash, head);
+}
+
+fn assert_each_name_listed_once(all: &[refs::RefPointer]) {
+    let mut names: Vec<&str> = all.iter().map(|r| r.name.as_str()).collect();
+    let total = names.len();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), total, "有 ref 被列了两次：{names:?}");
+}
+
+#[test]
+fn collect_keeps_other_namespaces_without_listing_any_ref_twice() {
+    let (local, _remote) = repo_with_remote();
+    run_git(local.path(), &["update-ref", "refs/custom/x", "HEAD"]);
+    run_git(local.path(), &["tag", "v1"]);
+
+    let repo = Repository::open(local.path()).unwrap();
+    let all = refs::collect(&repo).unwrap();
+
+    assert_eq!(find(&all, "refs/custom/x").kind, "other");
+    assert_each_name_listed_once(&all);
+}
+
+#[test]
+fn collect_lists_every_other_namespace_behind_a_long_ref() {
+    let (local, _remote) = repo_with_packed_stale_refs();
+    let head = rev_parse(local.path(), "HEAD");
+    let packed = rev_parse(local.path(), "HEAD~1");
+    run_git(local.path(), &["update-ref", "refs/custom/x", "HEAD"]);
+    // refs/stash 是 refs/ 下的顶层文件，不是目录
+    run_git(local.path(), &["update-ref", "refs/stash", "HEAD"]);
+
+    let repo = Repository::open(local.path()).unwrap();
+    let all = refs::collect(&repo).unwrap();
+
+    assert_eq!(find(&all, "refs/custom/x").hash, head);
+    assert_eq!(find(&all, "refs/stash").hash, head);
+    assert_eq!(
+        find(&all, "refs/packed-ns/x").hash,
+        packed,
+        "磁盘上没有目录、只在 packed-refs 里的命名空间也要列出来"
+    );
+    assert_each_name_listed_once(&all);
+}
+
+/// 阳性对照：证明上面这些 `..._behind_a_long_ref` 用例测的是真实缺陷，而不是摆设。
+/// 这条失败说明 libgit2 的行为变了：可能是修好了，也可能是 fixture 不再能触发截断，
+/// 要重新确认 `refs.rs` 里绕开全量遍历的做法还有没有必要。
+#[cfg(windows)]
+#[test]
+fn long_ref_fixture_really_truncates_the_full_walk() {
+    let (local, _remote) = repo_with_packed_stale_refs();
+    let repo = Repository::open(local.path()).unwrap();
+
+    let names: Vec<String> = repo
+        .references()
+        .unwrap()
+        .flatten()
+        .filter_map(|r| r.name().map(str::to_string))
+        .collect();
+
+    assert!(
+        !names.iter().any(|n| n == "refs/heads/loose-only"),
+        "全量遍历没有被截断：{names:?}"
+    );
+}
+
+#[test]
+fn branches_filters_by_kind_and_sees_loose_refs_behind_a_long_ref() {
+    let (local, _remote) = repo_with_packed_stale_refs();
+    let repo = Repository::open(local.path()).unwrap();
+
+    let names = |kind| -> Vec<String> {
+        refs::branches(&repo, kind)
+            .unwrap()
+            .iter()
+            .map(|b| b.get().name().unwrap().to_string())
+            .collect()
+    };
+
+    let local_names = names(Some(git2::BranchType::Local));
+    assert!(
+        local_names.contains(&"refs/heads/loose-only".to_string()),
+        "{local_names:?}"
+    );
+    assert!(local_names.iter().all(|n| n.starts_with("refs/heads/")));
+
+    let remote_names = names(Some(git2::BranchType::Remote));
+    assert!(
+        remote_names.contains(&"refs/remotes/origin/master".to_string()),
+        "{remote_names:?}"
+    );
+    assert!(remote_names.iter().all(|n| n.starts_with("refs/remotes/")));
+
+    assert_eq!(
+        names(None).len(),
+        local_names.len() + remote_names.len(),
+        "None 应是两类之和"
+    );
 }

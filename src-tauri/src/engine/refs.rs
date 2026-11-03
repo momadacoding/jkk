@@ -1,6 +1,7 @@
 use crate::error::Result;
-use git2::{BranchType, Repository};
+use git2::{Branch, BranchType, Reference, Repository};
 use serde::Serialize;
+use std::collections::HashSet;
 
 const INTERNAL_REF_PREFIX: &str = "refs/mygitclient/";
 
@@ -54,10 +55,81 @@ fn gone_upstream(repo: &Repository, full_name: &str) -> Option<String> {
     }
 }
 
-pub fn collect(repo: &Repository) -> Result<Vec<RefPointer>> {
-    let mut refs = Vec::new();
+/// 取某个命名空间下的全部 ref。`namespace` 以 `/` 结尾。
+///
+/// # 为什么不用 `repo.references()` / `repo.branches()`
+///
+/// 这两个都从 `refs/` 根开始遍历 loose ref。libgit2 在 Windows 上碰到路径过长的 ref 时遍历
+/// 提前结束，而且**不报错**（`refdb_fs.c` 的 `iter_load_paths` 遇错只是退出循环）：字母序排在
+/// 它后面的 loose ref 全部漏掉，只剩 `packed-refs` 里的旧值，只有 loose 的 ref 直接消失。
+/// 2026-11-03 的现场是 Codex 写的 `refs/codex/turn-diffs/...`（绝对路径 274 字符）：图上 main
+/// 停在几周前，rebase 掉的提交还挂着分支名。
+///
+/// 带前缀的 glob 从 `refs/heads/` 这样的子目录开始遍历，够不到别的命名空间里的 ref。
+///
+/// **没有解决的情况：** 超长 ref 就在同一命名空间内时，排在它后面的 ref 仍会被截断。判定看的是
+/// 绝对路径，所以仓库放得深、远程分支名又长（dependabot 这类）时确实可能发生。
+fn references_in<'repo>(repo: &'repo Repository, namespace: &str) -> Result<Vec<Reference<'repo>>> {
+    let mut list = Vec::new();
+    for reference in repo.references_glob(&format!("{namespace}*"))? {
+        list.push(reference?);
+    }
+    Ok(list)
+}
+
+/// 全部 ref：`refs/` 下每个第一层条目各读各的，互不截断，见 [`references_in`]。
+///
+/// 命名空间不写死：`refs/pull`、`refs/notes` 这些也画标签，只列已知的几个会让它们继续丢。
+/// 最后的全量遍历兜住磁盘上没有目录、只在 `packed-refs` 里的命名空间；它读到的 packed 项
+/// 不受截断影响，已经收过的名字跳过，既不重复也不会用旧值。
+fn all_references(repo: &Repository) -> Result<Vec<Reference<'_>>> {
+    let mut all = Vec::new();
+    // 用 commondir：linked worktree 自己的 gitdir 下没有分支 ref
+    let top_level = std::fs::read_dir(repo.commondir().join("refs"));
+    for entry in top_level.into_iter().flatten().flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if entry.path().is_dir() {
+            all.extend(references_in(repo, &format!("refs/{name}/"))?);
+        } else if let Ok(reference) = repo.find_reference(&format!("refs/{name}")) {
+            // refs/stash 这样的顶层文件。`*.lock` 之类查不到，跳过
+            all.push(reference);
+        }
+    }
+    let listed: HashSet<Vec<u8>> = all.iter().map(|r| r.name_bytes().to_vec()).collect();
     for reference in repo.references()? {
         let reference = reference?;
+        if !listed.contains(reference.name_bytes()) {
+            all.push(reference);
+        }
+    }
+    Ok(all)
+}
+
+/// 替代 `repo.branches()`，原因见 [`references_in`]。任一条读取失败时整体返回错误，
+/// 不像 `.flatten()` 那样跳过那一条。
+pub fn branches(repo: &Repository, kind: Option<BranchType>) -> Result<Vec<Branch<'_>>> {
+    let namespaces: &[&str] = match kind {
+        Some(BranchType::Local) => &["refs/heads/"],
+        Some(BranchType::Remote) => &["refs/remotes/"],
+        None => &["refs/heads/", "refs/remotes/"],
+    };
+    let mut list = Vec::new();
+    for namespace in namespaces {
+        list.extend(
+            references_in(repo, namespace)?
+                .into_iter()
+                .map(Branch::wrap),
+        );
+    }
+    Ok(list)
+}
+
+pub fn collect(repo: &Repository) -> Result<Vec<RefPointer>> {
+    let mut refs = Vec::new();
+    for reference in all_references(repo)? {
         let name = reference.name().unwrap_or("").to_string();
         // 本应用自己的内部 ref（交付树、跟进钉住的旧索引，W28）不是给人看的。留在列表里的话，
         // 指着图上提交的那条会被画成一个写着全名的标签，还会被前端当成「有 ref 指着」，
