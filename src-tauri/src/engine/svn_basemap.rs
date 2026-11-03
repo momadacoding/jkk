@@ -239,15 +239,13 @@ fn parse_new_trailer(lines: &[&str]) -> Option<BaseMap> {
             if gone.insert(p, r).is_some() {
                 return None;
             }
-        } else if let Some(v) = l
-            .strip_prefix(DELIVERED_REV_KEY)
-            .and_then(|v| v.strip_prefix(' '))
-        {
+        } else {
+            // 剩下只认 Delivered-Rev；最后一段里其它不认识的行不是我们写的，不猜（`?` 直接返回 None）
+            let v = l
+                .strip_prefix(DELIVERED_REV_KEY)
+                .and_then(|v| v.strip_prefix(' '))?;
             // 由 `parse_delivered_rev` 读，这里只校验形状
             parse_rev(v)?;
-        } else {
-            // 最后一段里出现不认识的行：不是我们写的，不猜
-            return None;
         }
     }
     let (repos_root, uuid) = repo?;
