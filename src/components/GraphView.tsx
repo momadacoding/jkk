@@ -1,6 +1,6 @@
 import { useMemo, useRef, useState, useCallback, useEffect } from 'react'
 import type { CommitNode, PullRequest, RefPointer } from '../engine/types'
-import { indexPullRequestsByBranch } from '../engine/prs'
+import { groupPullRequestsByHead, indexPullRequestsByBranch } from '../engine/prs'
 import { computeLayout } from '../engine/layout'
 import { computePaths, filterPathsToBand, laneColor } from '../engine/paths'
 import { createSvgRenderer } from '../engine/svgRenderer'
@@ -62,6 +62,7 @@ export function GraphView({
   // 索引建一次，供视口内每一行的每个标签查。虚拟滚动下几十行同时在场，
   // 每行都遍历一遍 PR 列表是白费力气
   const prByBranch = useMemo(() => indexPullRequestsByBranch(pullRequests), [pullRequests])
+  const prsByHead = useMemo(() => groupPullRequestsByHead(pullRequests), [pullRequests])
 
   // 布局与路径对全量历史只算一次：父 commit 可能在视口外，线段必须完整生成，
   // 渲染阶段才按条带过滤（见下方 svg memo）。颜色按 lane 分配，与视口无关。
@@ -220,6 +221,7 @@ export function GraphView({
               node={node}
               refs={refByHash[node.commit.id] ?? []}
               prByBranch={prByBranch}
+              prsByHead={prsByHead}
               selected={selectedId === node.commit.id}
               layoutWidth={layoutWidth}
               laneColor={laneColor(node.lane)}

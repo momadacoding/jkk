@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { indexPullRequestsByBranch, prBadge, pullRequestForRef } from '../../src/engine/prs'
+import {
+  groupPullRequestsByHead,
+  indexPullRequestsByBranch,
+  prBadge,
+  pullRequestForRef,
+} from '../../src/engine/prs'
 import type { PullRequest, RefPointer } from '../../src/engine/types'
 
 const pr = (number: number, headRefName: string, extra: Partial<PullRequest> = {}): PullRequest => ({
@@ -214,6 +219,152 @@ describe('prBadge', () => {
   it('open PR 的分支头对不上也还是 open', () => {
     // 那种情况已经由分支行上的 ahead/behind 徽章表达了，不重复报警
     expect(prBadge(pr(37, 'a', { headRefOid: MERGED_AT }), MOVED_ON).variant).toBe('open')
+  })
+})
+
+describe('prBadge：叠 PR 合进了已经合并的父分支', () => {
+  // 真实案例（readwise-alternative）：#397 叠在 #396 上，base 是 #396 的分支。
+  // #396 在 17:08 合进 main，#397 在 17:20 才合——合进的是那条已经没用的分支，改动没有进 main，
+  // 可徽章照样是 ✓。
+  const PARENT_HEAD = 'worktree-fix-mobile-api-failure-kind'
+  const CHILD_HEAD = 'worktree-fix-refresh-truncated-body'
+  const CHILD_OID = 'bb9bb65ad2b3b43bd7a24e343641f2f24a8bc752'
+  const parent = (extra: Partial<PullRequest> = {}): PullRequest =>
+    pr(396, PARENT_HEAD, {
+      state: 'MERGED',
+      baseRefName: 'main',
+      mergedAt: '2026-11-02T17:08:07Z',
+      ...extra,
+    })
+  const child = (extra: Partial<PullRequest> = {}): PullRequest =>
+    pr(397, CHILD_HEAD, {
+      state: 'MERGED',
+      headRefOid: CHILD_OID,
+      baseRefName: PARENT_HEAD,
+      mergedAt: '2026-11-02T17:20:38Z',
+      ...extra,
+    })
+  const badgeOf = (c: PullRequest, p: PullRequest, tip = CHILD_OID) =>
+    prBadge(c, tip, groupPullRequestsByHead([p, c]))
+  const at = (hhmm: string) => `2026-11-02T${hhmm}:00Z`
+
+  it('父 PR 比它先合并：改动困在父分支上，不能再画成普通 ✓', () => {
+    const badge = badgeOf(child(), parent())
+    expect(badge.variant).toBe('merged-stranded')
+    expect(badge.label).toBe('✓#397!')
+  })
+
+  it('提示要说出合进了哪条分支、是哪个 PR 的、没进的是哪条分支，并提醒删分支前确认', () => {
+    const tip = badgeOf(child(), parent()).tooltip
+    expect(tip).toContain(PARENT_HEAD)
+    // 父 PR 合进的不一定是默认分支，要说出它实际的 base，而不是笼统的「主干」
+    expect(tip).toContain('没有随 #396 进入 main')
+    expect(tip).toContain('删分支前先确认')
+  })
+
+  it('父 PR 自己的徽章不受影响', () => {
+    const p = parent({ headRefOid: CHILD_OID })
+    expect(prBadge(p, CHILD_OID, groupPullRequestsByHead([p, child()])).variant).toBe('merged')
+  })
+
+  it('父分支上有多个 PR 时，只要有一个在它之后合并就算进去了——不能只看显示用的那一个', () => {
+    // 显示索引会挑编号最大的 #150（合进 release、比子 PR 早），据此会误报
+    const toMain = pr(100, 'x', { state: 'MERGED', baseRefName: 'main', mergedAt: at('18:00') })
+    const toRelease = pr(150, 'x', { state: 'MERGED', baseRefName: 'release', mergedAt: at('10:00') })
+    const c = child({ baseRefName: 'x', mergedAt: at('12:00') })
+    expect(prBadge(c, CHILD_OID, groupPullRequestsByHead([toMain, toRelease, c])).variant)
+      .toBe('merged')
+  })
+
+  it('父分支上还有开着的 PR：改动会随它合进去，即使那条分支更早合过一次', () => {
+    const earlier = pr(100, 'x', { state: 'MERGED', baseRefName: 'main', mergedAt: at('09:00') })
+    const reopened = pr(200, 'x', { state: 'OPEN', baseRefName: 'main', mergedAt: null })
+    const c = child({ baseRefName: 'x', mergedAt: at('12:00') })
+    expect(prBadge(c, CHILD_OID, groupPullRequestsByHead([earlier, reopened, c])).variant)
+      .toBe('merged')
+  })
+
+  it('多层叠 PR：父 PR 晚于它合并，但父 PR 自己也困住了，它跟着一起困住', () => {
+    // A→main 10:00 合并；C→B 11:00 合并；B→A 12:00 合并（A 已经合过了，B 被困住）
+    const a = pr(1, 'a', { state: 'MERGED', baseRefName: 'main', mergedAt: at('10:00') })
+    const b = pr(2, 'b', { state: 'MERGED', baseRefName: 'a', mergedAt: at('12:00') })
+    const c = pr(3, 'c', { state: 'MERGED', baseRefName: 'b', mergedAt: at('11:00'), headRefOid: CHILD_OID })
+    const badge = prBadge(c, CHILD_OID, groupPullRequestsByHead([a, b, c]))
+    expect(badge.variant).toBe('merged-stranded')
+    expect(badge.tooltip).toContain('#2')
+    expect(badge.tooltip).toContain('没有随 #1 进入 main')
+  })
+
+  it('多层叠 PR 一路按顺序合并：全都进去了', () => {
+    const a = pr(1, 'a', { state: 'MERGED', baseRefName: 'main', mergedAt: at('12:00') })
+    const b = pr(2, 'b', { state: 'MERGED', baseRefName: 'a', mergedAt: at('11:00') })
+    const c = pr(3, 'c', { state: 'MERGED', baseRefName: 'b', mergedAt: at('10:00'), headRefOid: CHILD_OID })
+    expect(prBadge(c, CHILD_OID, groupPullRequestsByHead([a, b, c])).variant).toBe('merged')
+  })
+
+  it('base 互相指向的坏数据不会死循环', () => {
+    const a = pr(1, 'a', { state: 'MERGED', baseRefName: 'b', mergedAt: at('12:00') })
+    const b = pr(2, 'b', { state: 'MERGED', baseRefName: 'a', mergedAt: at('11:00'), headRefOid: CHILD_OID })
+    expect(prBadge(b, CHILD_OID, groupPullRequestsByHead([a, b])).variant).toBe('merged')
+  })
+
+  it('同一秒合并分不出先后，不报警', () => {
+    expect(badgeOf(child(), parent({ mergedAt: '2026-11-02T17:20:38Z' })).variant).toBe('merged')
+  })
+
+  it('困住的同时本地分支又有 PR 外的提交：两件事都要说', () => {
+    const moved = '6e6f014513cd3cc520cfa3838228517af47ad3ef'
+    const c = child({ localRelation: { tip: moved, ahead: 3, behind: 0 } })
+    const tip = badgeOf(c, parent(), moved).tooltip
+    expect(tip).toContain('没有随 #396 进入 main')
+    expect(tip).toContain('3 个提交不在这个 PR 里')
+  })
+
+  it('关闭未合并的 PR 不当父 PR', () => {
+    expect(badgeOf(child(), parent({ state: 'CLOSED' })).variant).toBe('merged')
+  })
+
+  it('正常的叠 PR 流程：子 PR 先合进父分支、父 PR 后合进主干，内容都进去了', () => {
+    const badge = badgeOf(child(), parent({ mergedAt: '2026-11-02T18:00:00Z' }))
+    expect(badge.variant).toBe('merged')
+  })
+
+  it('父 PR 还开着：改动会随它一起合进去，不报警', () => {
+    expect(badgeOf(child(), parent({ state: 'OPEN', mergedAt: null })).variant).toBe('merged')
+  })
+
+  it('fork 的 PR 不算父 PR——它的 head 常常也叫 main', () => {
+    const forkMain = pr(500, 'main', {
+      state: 'MERGED',
+      isCrossRepository: true,
+      mergedAt: '2026-01-01T00:00:00Z',
+    })
+    const normal = child({ baseRefName: 'main' })
+    expect(badgeOf(normal, forkMain).variant).toBe('merged')
+  })
+
+  it('任一边缺 mergedAt（老版本 gh）时不判断，不凭空报警', () => {
+    expect(badgeOf(child({ mergedAt: undefined }), parent()).variant).toBe('merged')
+    expect(badgeOf(child(), parent({ mergedAt: null })).variant).toBe('merged')
+  })
+
+  it('mergedAt 解析不了时同样不判断', () => {
+    expect(badgeOf(child({ mergedAt: 'not a date' }), parent()).variant).toBe('merged')
+  })
+
+  it('base 是自己的 head 分支（坏数据）时不把自己当父 PR', () => {
+    const self = child({ baseRefName: CHILD_HEAD, mergedAt: '2026-11-02T17:20:38Z' })
+    expect(prBadge(self, CHILD_OID, groupPullRequestsByHead([self])).variant).toBe('merged')
+  })
+
+  it('困在父分支上压过 ↑ 等形态：最要紧的是改动不在主干', () => {
+    const moved = '6e6f014513cd3cc520cfa3838228517af47ad3ef'
+    const c = child({ localRelation: { tip: moved, ahead: 1, behind: 0 } })
+    expect(badgeOf(c, parent(), moved).variant).toBe('merged-stranded')
+  })
+
+  it('不传索引时保持原来的判定', () => {
+    expect(prBadge(child(), CHILD_OID).variant).toBe('merged')
   })
 })
 

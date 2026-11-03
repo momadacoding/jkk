@@ -1,6 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { PullRequest, RefPointer } from '../engine/types'
-import { indexPullRequestsByBranch, prBadge, pullRequestForRef } from '../engine/prs'
+import {
+  groupPullRequestsByHead,
+  indexPullRequestsByBranch,
+  prBadge,
+  pullRequestForRef,
+} from '../engine/prs'
 import { ContextMenu, useContextMenu } from './ContextMenu'
 import { SidebarSection, SidebarGroup } from './SidebarSection'
 import { usePrompt } from './PromptDialog'
@@ -100,9 +105,13 @@ function GoneBadge({ upstream }: { upstream: string | null }) {
  *
  * `branchHash` 是本地分支的 tip，用来区分「已全部合并」「合并后又长了提交」「本地落后于合并点」等形态。
  */
-function PrBadge({ pr, branchHash }: { pr: PullRequest | undefined; branchHash: string }) {
+function PrBadge({ pr, branchHash, byHead }: {
+  pr: PullRequest | undefined
+  branchHash: string
+  byHead: Map<string, PullRequest[]>
+}) {
   if (!pr) return null
-  const badge = prBadge(pr, branchHash)
+  const badge = prBadge(pr, branchHash, byHead)
   return (
     <span className={`sb-pr ${badge.variant}`} title={badge.tooltip}>
       {badge.label}
@@ -126,6 +135,7 @@ export function BranchView({
   const remote = refs.filter((r) => r.kind === 'remote')
   // 分支多的仓库里每行都遍历一遍 PR 列表是白费力气，建一次索引就够
   const prByBranch = useMemo(() => indexPullRequestsByBranch(pullRequests), [pullRequests])
+  const prsByHead = useMemo(() => groupPullRequestsByHead(pullRequests), [pullRequests])
   // 不能用上面的索引：它一个分支只留一条（open 优先），而删除框要的是全部已合并的合并点
   const deletingMergedPrs = useMemo(
     () => (deleting ? mergedPullRequestsFor(pullRequests, deleting) : []),
@@ -280,7 +290,7 @@ export function BranchView({
                 </span>
               )}
               {capabilities.pullRequests && (
-                <PrBadge pr={pullRequestForRef(prByBranch, ref)} branchHash={ref.hash} />
+                <PrBadge pr={pullRequestForRef(prByBranch, ref)} branchHash={ref.hash} byHead={prsByHead} />
               )}
               <SyncBadge ahead={ref.ahead} behind={ref.behind} />
               <GoneBadge upstream={goneUpstreamName(ref)} />

@@ -202,6 +202,15 @@ export interface PullRequest {
   headRefOid: string
   url: string
   /**
+   * PR 合进的分支名，不带 `refs/heads/` 前缀。叠 PR 的 base 是另一个 PR 的 head 分支。
+   * 可选：老版本 gh 不给，缺失时不做叠 PR 判断。
+   */
+  baseRefName?: string
+  /** 合并时间（ISO 8601），没合并时为 null。可选，理由同上。 */
+  mergedAt?: string | null
+  /** 来自 fork 的 PR。它的 head 常常就叫 `main`，不能当本仓库里的父 PR。 */
+  isCrossRepository?: boolean
+  /**
    * 本地同名分支相对合并点的位置，gh 不给，由后端在本地补算。
    *
    * 只有已合并、有同名本地分支、且合并点对象在本地的 PR 才有值；其余为 null。
