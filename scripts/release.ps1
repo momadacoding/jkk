@@ -83,13 +83,16 @@ function Find-Run([string]$event, [string]$sha, [string]$branch) {
 
 # 把文件里恰好一处 $pattern 的版本号换掉；匹配数不是 1 就失败，宁可停也不猜
 function Set-VersionIn([string]$path, [string]$pattern, [string]$from, [string]$to) {
-    $text = [IO.File]::ReadAllText($path)
+    # [IO.File] 认的是 .NET 进程的当前目录，Set-Location 改不到它：相对路径会读写到
+    # 启动脚本时所在的目录（实测踩过）。一律拼成仓库根下的绝对路径
+    $full = Join-Path $script:root $path
+    $text = [IO.File]::ReadAllText($full)
     $re = [regex]::new($pattern.Replace('{V}', [regex]::Escape($from)), 'Multiline')
     $n = $re.Matches($text).Count
     if ($n -ne 1) { throw "$path 里匹配到 $n 处版本号（期望恰好 1 处），不改" }
     if (-not $script:DryRun -and $from -ne $to) {
         $new = $re.Replace($text, { param($m) $m.Groups[1].Value + $to + $m.Groups[2].Value }, 1)
-        [IO.File]::WriteAllText($path, $new, [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($full, $new, [Text.UTF8Encoding]::new($false))
     }
     Write-Host ("  {0,-28} {1} -> {2}" -f $path, $from, $to)
 }
@@ -99,12 +102,17 @@ function Set-VersionIn([string]$path, [string]$pattern, [string]$from, [string]$
 if ($Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { throw "版本号要形如 0.7.3：$Version" }
 $tag = "v$Version"
 
-$root = Invoke-Checked '定位仓库根' { git rev-parse --show-toplevel }
-Set-Location $root
+$script:root = Invoke-Checked '定位仓库根' { git rev-parse --show-toplevel }
+Set-Location $script:root
+# 下面的 .NET 文件 API 与 node 子进程都按进程当前目录解析相对路径，和 PowerShell 的位置对齐
+[Environment]::CurrentDirectory = $script:root
 
 Step '检查前置条件'
 Invoke-Checked 'gh 登录检查（先 gh auth login）' { gh auth status *> $null }
-$script:repo = Invoke-Checked '读取仓库名' { gh repo view --json nameWithOwner --jq .nameWithOwner }
+# 设了 GH_REPO 就用它（其余 gh 子命令本来就认它），否则按 origin 推断
+$script:repo = if ($env:GH_REPO) { $env:GH_REPO } else {
+    Invoke-Checked '读取仓库名' { gh repo view --json nameWithOwner --jq .nameWithOwner }
+}
 
 $branch = Invoke-Checked '读取当前分支' { git symbolic-ref --short -q HEAD }
 if ($branch -ne 'master') { throw "要在 master 上发版，当前是 $branch" }
