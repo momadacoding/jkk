@@ -350,6 +350,26 @@ mod tests {
         assert!(!on_disk.exists(), "用完即删");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn targets_file_arg_stays_relative_when_repo_root_is_spelled_differently() {
+        // 同一个目录的另一种写法：CI runner 的 %TEMP% 是 8.3 短名（RUNNER~1），libgit2 给的
+        // git dir 却是长名；用户手里的路径也可能和它大小写不同。按字符串比前缀会对不上，
+        // 退回中文绝对路径，`.git/` 下相对路径这层保护就没了。NTFS 不分大小写，用全大写复现
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("仓库");
+        std::fs::create_dir(&repo).unwrap();
+        let repo = repo.to_string_lossy().to_string();
+        crate::engine::git_cli::run_git(&repo, &["init", "-q"]).unwrap();
+
+        let spelled = repo.to_uppercase();
+        assert_ne!(spelled, repo);
+        let file = TempFile::for_svn_arg(&spelled, "targets", b"x\n").unwrap();
+        let arg = file.svn_arg(&spelled);
+        assert!(arg.is_ascii() && arg.starts_with(".git"), "{arg}");
+        assert!(std::path::Path::new(&spelled).join(&arg).is_file(), "{arg}");
+    }
+
     #[test]
     fn targets_file_falls_back_to_temp_dir_outside_a_git_repo() {
         // 体检不要求是 git 仓库（纯 SVN 工作副本）

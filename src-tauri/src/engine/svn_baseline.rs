@@ -409,9 +409,17 @@ impl TempFile {
 
     /// 传给 svn 的写法：svn 以 `repo_root` 为 cwd，文件在它底下时用相对路径（纯 ASCII），
     /// 否则（worktree 的 git dir、系统临时目录）用完整路径。
+    ///
+    /// 两边先 canonicalize 再比：libgit2 给的 git dir 与 `repo_root` 可能是同一目录的
+    /// 不同写法（8.3 短名 / 长名、大小写），按字符串比前缀会对不上，退回中文绝对路径。
     pub(crate) fn svn_arg(&self, repo_root: &str) -> String {
-        self.path
-            .strip_prefix(repo_root)
+        let canon = std::fs::canonicalize(&self.path)
+            .and_then(|f| Ok((f, std::fs::canonicalize(repo_root)?)));
+        let rel = match &canon {
+            Ok((f, root)) => f.strip_prefix(root).ok(),
+            Err(_) => None,
+        };
+        rel.or_else(|| self.path.strip_prefix(repo_root).ok())
             .unwrap_or(&self.path)
             .to_string_lossy()
             .to_string()
