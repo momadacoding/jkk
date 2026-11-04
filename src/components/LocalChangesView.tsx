@@ -17,7 +17,7 @@ import {
 import { commitKeyAction, type CommitField } from '../engine/commitKeys'
 import { discardShortcut, isSelectAllShortcut } from '../engine/fileListKeys'
 import { buildCommitMessage } from '../engine/commitActions'
-import { conflictsFirst } from '../engine/conflicts'
+import { conflictsFirst, describeStageConflicts } from '../engine/conflicts'
 import { externalDiffItems, externalMergeItems, type ExternalToolsMenu } from './externalToolItems'
 import { canExternalMerge, conflictView, PENDING_CONFLICT_VIEW } from '@/engine/conflictView'
 import { toolFor } from '@/engine/externalTools'
@@ -214,6 +214,17 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
     if (ok) onResolveDeleteModify(file, false)
   }
 
+  /**
+   * 所有 Stage 入口（行按钮、Stage All、右键、冲突说明里的按钮）的唯一出口。
+   * 还留着冲突标记、或冲突信息没读到的文件，先确认；取消就整批不暂存（第 85 条）。
+   * 没传 `conflicts` 与 null 同义：还没读到。
+   */
+  const stage = async (paths: string[]) => {
+    const request = describeStageConflicts(paths, status.unstaged, conflicts ?? null)
+    if (request && !(await confirm(request))) return
+    onStage(paths)
+  }
+
   const click = (section: FileSection, files: string[], path: string, e: React.MouseEvent) => {
     // 从对齐后的选中算下一步：父组件里记着的那份可能还停在文件已经离开的那个区
     setSelection(nextFileSelection(selection, section, files, path, {
@@ -236,7 +247,7 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
     const items: MenuItem[] = [
       staged
         ? { label: `Unstage${suffix}`, onSelect: () => onUnstage(targets) }
-        : { label: `Stage${suffix}`, onSelect: () => onStage(targets) },
+        : { label: `Stage${suffix}`, onSelect: () => { void stage(targets) } },
       {
         label: `Discard changes${suffix}…`,
         onSelect: () => onDiscard(targets, staged),
@@ -369,8 +380,8 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
                   onRowContextMenu={contextMenu}
                   onRowMouseDown={rowMouseDown}
                   onRowMouseEnter={rowMouseEnter}
-                  onToggleOne={(path) => onStage([path])}
-                  onToggleAll={() => onStage(status.unstaged.map((f) => f.path))}
+                  onToggleOne={(path) => { void stage([path]) }}
+                  onToggleAll={() => { void stage(status.unstaged.map((f) => f.path)) }}
                   onKeyDown={fileListKeyDown}
                 />
               </Panel>
@@ -402,7 +413,7 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
                   view={activeConflictView}
                   mergeToolLabel={mergeTool?.label ?? null}
                   onOpenMerge={() => { if (mergeTool) externalTools?.onMerge(mergeTool.id, activeConflict) }}
-                  onStage={() => onStage([activeConflict])}
+                  onStage={() => { void stage([activeConflict]) }}
                   onKeep={onResolveDeleteModify && (() => onResolveDeleteModify(activeConflict, true))}
                   onDelete={onResolveDeleteModify && (() => { void deleteConflictFile(activeConflict) })}
                 />

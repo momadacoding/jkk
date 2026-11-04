@@ -57,7 +57,10 @@ impl Vcs for GitBackend {
         }
         // `--` 不能省：没有它，`-dash.txt` 这种文件名会被 git 当成选项解析，
         // 报 `error: unknown switch 'd'`（实测 2026-09-12）。
-        let mut args: Vec<&str> = vec!["add", "--"];
+        // `--literal-pathspecs` 也不能省：`--` 之后的路径仍按 glob 匹配，暂存 `f[1].txt`
+        // 会连带暂存 `f1.txt`。`f1.txt` 若是还留着冲突标记的冲突文件，就绕过了前端的
+        // 确认、被标记为已解决（第 85 条，实测 2026-11-04）。
+        let mut args: Vec<&str> = vec!["--literal-pathspecs", "add", "--"];
         args.extend(paths.iter().map(String::as_str));
         engine::git_cli::run_git(&self.root, &args)?;
         Ok(())
@@ -70,7 +73,8 @@ impl Vcs for GitBackend {
         if paths.is_empty() {
             return Ok(());
         }
-        let mut args: Vec<&str> = vec!["reset", "HEAD", "--"];
+        // `--literal-pathspecs`：同 stage，撤 `f[1].txt` 不能把 `f1.txt` 一起撤出暂存区
+        let mut args: Vec<&str> = vec!["--literal-pathspecs", "reset", "HEAD", "--"];
         args.extend(paths.iter().map(String::as_str));
         engine::git_cli::run_git(&self.root, &args)?;
         Ok(())
