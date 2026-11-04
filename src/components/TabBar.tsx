@@ -10,9 +10,11 @@ interface TabBarProps {
   onCloseAll: () => void
   onCloseOthers: (id: string) => void
   onOpenRepo: () => void
+  /** 不传则不显示设置入口（布局测试的复现页只要标签栏的外形）。 */
+  onOpenSettings?: () => void
 }
 
-export function TabBar({ tabs, activeId, onActivate, onClose, onCloseAll, onCloseOthers, onOpenRepo }: TabBarProps) {
+export function TabBar({ tabs, activeId, onActivate, onClose, onCloseAll, onCloseOthers, onOpenRepo, onOpenSettings }: TabBarProps) {
   const { menu, open, close } = useContextMenu()
   return (
     <div className="tab-bar">
@@ -50,6 +52,11 @@ export function TabBar({ tabs, activeId, onActivate, onClose, onCloseAll, onClos
         <span className="tab-open-icon">+</span>
         <span>Open Repo</span>
       </button>
+      {onOpenSettings && (
+        <button className="tab-settings" onClick={onOpenSettings} title="Settings" aria-label="Settings">
+          ⚙
+        </button>
+      )}
       <ContextMenu menu={menu} onClose={close} />
     </div>
   )

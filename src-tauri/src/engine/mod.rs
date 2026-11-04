@@ -1,3 +1,4 @@
+pub mod app_settings;
 pub mod blob_export;
 pub mod branch;
 pub mod conflicts;

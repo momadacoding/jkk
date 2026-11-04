@@ -11,6 +11,7 @@ import { DeleteWorktreeDialog } from '@/components/DeleteWorktreeDialog'
 import { useDeliverDialog } from '@/components/DeliverDialog'
 import { useFollowReportDialog } from '@/components/FollowReportDialog'
 import { usePrompt } from '@/components/PromptDialog'
+import { SettingsDialog } from '@/components/SettingsDialog'
 import SvnInitWizard from '@/components/SvnInitWizard'
 import { TabBar } from '@/components/TabBar'
 import { TsvnHooksDialog } from '@/components/TsvnHooksDialog'
@@ -240,6 +241,24 @@ const SCENES: Record<string, () => ReactNode> = {
       onUnregister={noop}
       onClose={noop}
     />
+  ),
+  'settings-long-error': () => (
+    <SettingsDialog
+      initial={{
+        closeToTray: true,
+        trayAvailable: true,
+        showShortcut: 'Ctrl+Alt+Shift+Super+F12',
+        shortcutError: LONG_ERROR,
+        defaultShortcut: 'Ctrl+Alt+J',
+      }}
+      onSave={async () => {
+        throw new Error(LONG_ERROR)
+      }}
+      onClose={noop}
+    />
+  ),
+  'settings-load-failed': () => (
+    <SettingsDialog initial={null} loadError={LONG_ERROR} onSave={async () => {}} onClose={noop} />
   ),
 }
 

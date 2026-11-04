@@ -117,11 +117,17 @@ fn tmp_path(path: &Path) -> PathBuf {
 ///
 /// 任何一步失败都要把临时文件收掉，否则配置目录会慢慢攒出一堆 `.tmp`。
 pub fn save_to(path: &Path, session: &Session) -> Result<()> {
+    let text = serde_json::to_string_pretty(session)
+        .map_err(|e| GitError::new("session", e.to_string()))?;
+    write_atomic(path, &text)
+}
+
+/// `save_to` 的落盘部分，程序自己写的其他配置（`settings.json`）也走这里，
+/// 免得同一套「临时文件唯一 + 同目录 rename + 失败收尾」的约束维护两份。
+pub(crate) fn write_atomic(path: &Path, text: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let text = serde_json::to_string_pretty(session)
-        .map_err(|e| GitError::new("session", e.to_string()))?;
     let tmp = tmp_path(path);
     if let Err(e) = std::fs::write(&tmp, text) {
         let _ = std::fs::remove_file(&tmp);

@@ -25,4 +25,7 @@ export const SCENARIOS: LayoutScenario[] = [
   { id: 'deliver-short-error', component: 'DeliverDialog', clickPrimary: true },
   { id: 'follow-report-long', component: 'FollowReportDialog' },
   { id: 'tsvn-hooks-long', component: 'TsvnHooksDialog' },
+  // 已保存的快捷键注册失败的说明 + 保存失败的错误同时在框里
+  { id: 'settings-long-error', component: 'SettingsDialog', clickPrimary: true },
+  { id: 'settings-load-failed', component: 'SettingsDialog' },
 ]

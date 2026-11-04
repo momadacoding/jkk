@@ -1,3 +1,4 @@
+pub mod app_settings;
 pub mod conflict;
 pub mod custom;
 pub mod diff;

@@ -3,7 +3,10 @@ import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 import { EmptyState } from './components/EmptyState'
 import { RepoTab } from './components/RepoTab'
+import { SettingsDialog } from './components/SettingsDialog'
 import { TabBar } from './components/TabBar'
+import type { AppSettingsView } from './engine/appSettings'
+import { toErrorMessage } from './engine/errors'
 import { samePath } from './engine/path'
 import {
   closeAllTabs,
@@ -15,7 +18,14 @@ import {
   type RepoTabInfo,
   type SessionView,
 } from './engine/session'
+import { readAppSettings, saveAppSettings } from './store/appSettingsStore'
 import './styles.css'
+
+/** 设置框：每次打开都重读，快捷键注册状态可能在框外变过（启动时被占、别的程序释放了）。 */
+type SettingsState =
+  | { kind: 'closed' }
+  | { kind: 'open'; view: AppSettingsView }
+  | { kind: 'failed'; message: string }
 
 function App() {
   const nextId = useRef(0)
@@ -36,6 +46,7 @@ function App() {
    * 那些暂时打不开的标签永久抹掉。等用户真的动了标签再存。
    */
   const skipNextSave = useRef(false)
+  const [settings, setSettings] = useState<SettingsState>({ kind: 'closed' })
 
   // 供下面的回调读取最新状态，避免把 tabs / activeId 放进依赖导致回调每次渲染都换新
   const tabsRef = useRef(tabs)
@@ -147,6 +158,13 @@ function App() {
     if (typeof selected === 'string') openInNewTab(selected)
   }, [openInNewTab])
 
+  const openSettings = useCallback(() => {
+    readAppSettings()
+      .then((view) => setSettings({ kind: 'open', view }))
+      .catch((err) => setSettings({ kind: 'failed', message: toErrorMessage(err) }))
+  }, [])
+  const closeSettings = useCallback(() => setSettings({ kind: 'closed' }), [])
+
   const openPaths = tabs.map((t) => t.path)
 
   return (
@@ -159,7 +177,16 @@ function App() {
         onCloseAll={closeAll}
         onCloseOthers={closeOthers}
         onOpenRepo={handleOpenRepo}
+        onOpenSettings={openSettings}
       />
+      {settings.kind !== 'closed' && (
+        <SettingsDialog
+          initial={settings.kind === 'open' ? settings.view : null}
+          loadError={settings.kind === 'failed' ? settings.message : null}
+          onSave={saveAppSettings}
+          onClose={closeSettings}
+        />
+      )}
       {/* 还原完成前什么都不渲染：先闪一下空态页再跳出标签很难看 */}
       {restored && tabs.length === 0 && (
         <EmptyState
