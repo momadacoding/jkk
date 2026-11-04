@@ -21,11 +21,15 @@ tauri-build = { version = "2.6.3", features = [] }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
-tauri = { version = "2.11.3", features = [] }
+tauri = { version = "2.11.3", features = ["tray-icon"] }
 tauri-plugin-log = "2"
 git2 = "0.20"
 notify = "7"
 tauri-plugin-dialog = "2.7.2"
+
+# 系统级快捷键呼出主界面。只在 Rust 侧注册，不引入对应的 npm 包、不开 JS 权限
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-global-shortcut = "2.3.2"
 
 # svn 的 --xml 输出必须用真 parser 解析：`<wc-status` 与 `revision="…"` 不在同一行
 # 且是 CRLF，行内正则**不报错、只返回空集**，于是「nodeRevs 单值」这条不变量会以

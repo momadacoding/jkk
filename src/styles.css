@@ -155,6 +155,27 @@ body {
   line-height: 1;
 }
 
+/* 设置入口靠在标签栏最右边，和标签、打开仓库按钮分开 */
+.tab-settings {
+  flex-shrink: 0;
+  height: 23px;
+  margin: 0 0 4px auto;
+  padding: 0 8px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: #9a9a9a;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.tab-settings:hover {
+  background: #2f2f2f;
+  border-color: #3d3d3d;
+  color: #fff;
+}
+
 .tab-panel {
   flex: 1;
   min-height: 0;
@@ -964,6 +985,74 @@ body {
      压成一行会把结构全糊掉，长路径也得能断开 */
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+/* ---------- 设置框（SettingsDialog） ---------- */
+
+/* 没有 .dlg-icon 那一列，警告不缩进 */
+.settings-dialog .dlg-warning {
+  margin-left: 0;
+}
+
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px 0;
+}
+
+.settings-heading {
+  color: #ddd;
+  font-size: 12px;
+  font-weight: bold;
+}
+
+.settings-note {
+  margin-left: 20px;
+  color: #9aa0a6;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.settings-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-left: 20px;
+}
+
+.shortcut-recorder {
+  min-width: 160px;
+  padding: 5px 10px;
+  background: #1e1e1e;
+  border: 1px solid #555;
+  border-radius: 3px;
+  color: var(--fg);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.shortcut-recorder.recording {
+  border-color: #4fc3f7;
+  color: #4fc3f7;
+}
+
+.shortcut-recorder:disabled,
+.settings-link:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.settings-link {
+  padding: 0;
+  background: transparent;
+  border: none;
+  color: #4fc3f7;
+  font-size: 12px;
+  cursor: pointer;
 }
 
 /* ---------- 交付确认框（DeliverDialog） ---------- */

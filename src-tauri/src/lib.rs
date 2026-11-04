@@ -1,5 +1,6 @@
 pub mod build_info;
 pub mod commands;
+pub mod desktop;
 pub mod engine;
 pub mod error;
 pub mod vcs;
@@ -25,9 +26,17 @@ pub fn run() {
                     log::warn!("设置窗口标题失败: {e}");
                 }
             }
+            // 托盘和快捷键是附加能力，装不上也不能让应用起不来；
+            // 这时设置框读不到状态会报错，关窗退回默认的直接退出
+            if let Err(e) = desktop::setup(app) {
+                log::warn!("初始化托盘 / 全局快捷键失败: {e}");
+            }
             Ok(())
         })
+        .on_window_event(desktop::on_window_event)
         .invoke_handler(tauri::generate_handler![
+            commands::app_settings::read_app_settings,
+            commands::app_settings::save_app_settings,
             commands::diff::read_diff,
             commands::conflict::check_merge_drivers,
             commands::conflict::read_conflicts,
