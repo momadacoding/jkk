@@ -1069,6 +1069,9 @@ fn disable_round(
             item: "unversioned".to_string(),
             props: "none".to_string(),
             wc_locked: false,
+            revision: None,
+            copied: false,
+            schedule: None,
         });
         renamed.push(DisabledGitignore {
             from: c.path.clone(),

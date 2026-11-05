@@ -426,6 +426,70 @@ fn status_entries_carry_props_so_a_property_only_change_is_visible() {
     assert_eq!(got[0].props, "modified", "脏在属性上");
 }
 
+/// 2026-11-06 用 svn 1.14.2 在一次性 fixture 上实测的形状（`svn status -v --xml`）：
+/// `svn cp Code/A Code/B` 后改 `B/x.cs`，`svn add` 一个新目录 `N` 后从磁盘删掉 `N/n.cs`。
+const STATUS_COPIED_XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
+<status>\r\n\
+<target\r\n   path=\"Code\">\r\n\
+<entry\r\n   path=\"Code\\A\\x.cs\">\r\n\
+<wc-status\r\n   item=\"normal\"\r\n   revision=\"1\"\r\n   props=\"none\">\r\n\
+<commit\r\n   revision=\"1\">\r\n<author>u</author>\r\n<date>2026-11-06T00:00:00.000000Z</date>\r\n</commit>\r\n\
+</wc-status>\r\n\
+</entry>\r\n\
+<entry\r\n   path=\"Code\\B\">\r\n\
+<wc-status\r\n   item=\"added\"\r\n   props=\"none\"\r\n   copied=\"true\">\r\n\
+</wc-status>\r\n\
+</entry>\r\n\
+<entry\r\n   path=\"Code\\B\\x.cs\">\r\n\
+<wc-status\r\n   item=\"modified\"\r\n   props=\"none\"\r\n   copied=\"true\">\r\n\
+</wc-status>\r\n\
+</entry>\r\n\
+<entry\r\n   path=\"Code\\N\\n.cs\">\r\n\
+<wc-status\r\n   props=\"none\"\r\n   item=\"missing\"\r\n   revision=\"-1\">\r\n\
+</wc-status>\r\n\
+</entry>\r\n\
+</target>\r\n\
+</status>\r\n";
+
+#[test]
+fn status_entries_carry_revision_and_copied_so_local_only_nodes_are_visible() {
+    // 「服务器 rN 上有没有这个路径」只能从这两个属性看出来，`item` 说不清：
+    // - `svn add` 后又从磁盘删掉的文件是 `missing`，与「已提交后丢失」同一个 item，
+    //   差别只在 `revision="-1"`
+    // - 复制出来的节点**根本没有 `revision` 属性**，只有 `copied="true"`。把
+    //   revision 当必填属性解析，遇到 `svn cp` 过的工作副本就整个读不动
+    let got = parse_status_entries(STATUS_COPIED_XML).unwrap();
+    let shape: Vec<(&str, Option<i64>, bool)> = got
+        .iter()
+        .map(|e| (e.path.as_str(), e.revision, e.copied))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("Code/A/x.cs", Some(1), false),
+            ("Code/B", None, true),
+            ("Code/B/x.cs", None, true),
+            ("Code/N/n.cs", Some(-1), false),
+        ]
+    );
+}
+
+#[test]
+fn a_non_integer_status_revision_is_a_loud_error() {
+    // 悄悄当成「没有 revision」会把一个已提交节点读成本地新加的，进而被摘出基线。
+    let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
+<status>\r\n\
+<target\r\n   path=\"Code\">\r\n\
+<entry\r\n   path=\"Code\\A.cs\">\r\n\
+<wc-status\r\n   item=\"missing\"\r\n   revision=\"x\"\r\n   props=\"none\">\r\n\
+</wc-status>\r\n\
+</entry>\r\n\
+</target>\r\n\
+</status>\r\n";
+    let err = parse_status_entries(xml).expect_err("revision 不是整数必须报错");
+    assert_eq!(err.code, "svn_xml");
+}
+
 #[test]
 fn a_clean_status_yields_no_entries() {
     // 干净工作副本上不带 -v 的 status 只有 <target>，没有 <entry>。

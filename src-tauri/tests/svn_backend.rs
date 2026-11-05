@@ -262,6 +262,9 @@ fn preflight_serializes_to_camel_case_and_keeps_the_dirty_list_off_the_wire() {
             item: "modified".into(),
             props: "none".into(),
             wc_locked: false,
+            revision: Some(7),
+            copied: false,
+            schedule: None,
         }],
         // 计划 Task 5：允许混合版本时带上的节点状态，同样不过 IPC
         nodes: Some(vec![app_lib::engine::svn_xml::NodeStatus {

@@ -464,6 +464,28 @@ pub struct StatusEntry {
     /// `incomplete`。只查锁的话，用户跑完 cleanup 就能带着一棵没更新完的树
     /// 通过校验。
     pub wc_locked: bool,
+    /// `<wc-status revision>` 原样，**可能没有**。
+    ///
+    /// 2026-11-06 实测（svn 1.14.2，`status -v --xml`）：
+    ///
+    /// | 节点 | revision |
+    /// |---|---|
+    /// | 已提交的（含磁盘上删掉的 `missing`） | `N` |
+    /// | `svn add` 还没提交的（含又从磁盘删掉的 `missing`） | `-1` |
+    /// | 复制来的（`copied="true"`） | **没有这个属性** |
+    ///
+    /// 两种 `missing` 只靠它区分：一个服务器上有，一个从来没上过服务器。
+    pub revision: Option<i64>,
+    /// `<wc-status copied="true">`：节点是复制来的（`svn cp` / `svn mv` 的目标，
+    /// 以及复制出来的目录底下的每一个子节点）。复制来的节点在磁盘上被删掉后
+    /// 这个标记会消失，只剩 `revision="-1"`（实测）。
+    pub copied: bool,
+    /// `svn info` 的 `<wc-info><schedule>`（`add` / `replace` / `normal` …）。
+    ///
+    /// **`svn status` 里没有这一项**，[`parse_status_entries`] 一律给 `None`；只有
+    /// `item="missing"` + `revision="-1"` 的条目由 `svn_dirty::read_dirty` 另跑
+    /// `svn info` 补上——「add 后删」与「替换后删」在 status 里一模一样，只有它分得开。
+    pub schedule: Option<String>,
 }
 
 /// 解析 `svn status --xml`，列出每一条 entry。
@@ -501,6 +523,17 @@ pub fn parse_status_entries(xml: &str) -> Result<Vec<StatusEntry>> {
                     format!("svn status 的 entry `{path}` 底下没有 <wc-status>"),
                 )
             })?;
+        // 不能像 item / props 那样必填：复制来的节点根本没有它。
+        // 但有就必须是整数——当成「没有」会把已提交的节点读成本地新加的。
+        let revision = match st.attribute("revision") {
+            None => None,
+            Some(raw) => Some(raw.parse::<i64>().map_err(|_| {
+                GitError::new(
+                    "svn_xml",
+                    format!("svn status 的 entry `{path}` 的 revision 不是整数：{raw}"),
+                )
+            })?),
+        };
         out.push(StatusEntry {
             path,
             item: attr(&st, "item")?,
@@ -508,9 +541,35 @@ pub fn parse_status_entries(xml: &str) -> Result<Vec<StatusEntry>> {
             // 没锁时这个属性根本不出现，所以这里只能用「有且等于 true」判定，
             // 不能像 item / props 那样要求它必须存在。
             wc_locked: st.attribute("wc-locked") == Some("true"),
+            revision,
+            copied: st.attribute("copied") == Some("true"),
+            schedule: None,
         });
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+/// 从 `svn info --xml` 里取每个 entry 的 `<wc-info><schedule>`，返回 `(path, schedule)`，
+/// path 归一成正斜杠（与 [`parse_status_entries`] 同一套，方便对回去）。
+///
+/// 不复用 [`parse_info`]：那边把 url / uuid 等仓库身份字段当必填，这里只要 schedule，
+/// 一个缺 `<repository>` 的 entry 不该让「新加后删掉」的判断跟着失败。
+///
+/// 没有 `<wc-info>` 或 `<schedule>` 的 entry 给 `None`，由调用方当成「说不清」。
+pub fn parse_info_schedules(xml: &str) -> Result<Vec<(String, Option<String>)>> {
+    let doc = parse_doc(xml)?;
+    let mut out = Vec::new();
+    for entry in doc.descendants().filter(|n| n.has_tag_name("entry")) {
+        let path = norm_sep(&attr(&entry, "path")?);
+        let schedule = entry
+            .children()
+            .find(|n| n.has_tag_name("wc-info"))
+            .and_then(|w| w.children().find(|n| n.has_tag_name("schedule")))
+            .and_then(|n| n.text())
+            .map(|s| s.trim().to_string());
+        out.push((path, schedule));
+    }
     Ok(out)
 }
 
