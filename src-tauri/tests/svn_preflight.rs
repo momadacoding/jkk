@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 初始化向导的前置校验 P1 / P2 / P3（spec §6.5）。
 //!
 //! P4 在 1a 的 `svn_wc::check_single_repository`，这里只验证它确实被串进了流程。

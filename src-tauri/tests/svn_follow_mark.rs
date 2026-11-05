@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 失焦快照、「我是谁」与 wc.db 戳（计划 Task 9；分析 §6.6、§6.10；日志 E19、W26）。
 //!
 //! git 写操作全部在 fixture 里做。`svn auth` 只碰本文件在临时目录里造的假缓存

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! `load_graph` 与前端混合图之间的**数据契约**。
 //!
 //! # 这个文件为一次「四道检查全绿、功能整个不生效」的事故而建

@@ -367,6 +367,7 @@ pub fn registration_roots(repo: &str) -> Result<Vec<String>> {
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)] // HKCU 注册表读写只有 Win32 C API，没有安全封装
 mod registry {
     use crate::error::{GitError, Result};
     use windows::core::{w, PCWSTR};

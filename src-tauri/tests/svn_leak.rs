@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! Local-Only 泄漏按 hunk 判定（计划 Task 7；分析 §6.5 F3、§6.11.2；日志 W21）。
 //!
 //! 被测对象只读对象（B = Local-Only commit 的父提交、L、NEW），与 SVN 无关，所以 fixture

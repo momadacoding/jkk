@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 基线记账格式 `BaseMap`（分析 §6.1，计划 Task 1）。
 //!
 //! 两条硬要求：

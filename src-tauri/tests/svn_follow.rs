@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 跟进编排 F1–F6 与崩溃恢复（计划 Task 10；分析 §6.5、§6.11.1、§6.11.3）。
 //!
 //! 全部在临时 fixture 上跑：wc1 是「你」，wc2 是同事；「TortoiseSVN 提交」就是在 wc1 里直接

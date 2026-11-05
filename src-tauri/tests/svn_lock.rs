@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 跨进程仓库锁（spec §5.1.1）。
 //!
 //! 这把锁的全部价值在**崩溃之后**：清理代码跑不到的时候，锁还能不能被正确

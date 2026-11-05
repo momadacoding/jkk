@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! `WScope`：全项目唯一的 W-file 口径（2026-10-28 spec §4）。
 //!
 //! 「尊重 .gitignore」时 W-file = 白名单 ∧ 扩展名 ∧ 没被工作树里的 `.gitignore` 排除，

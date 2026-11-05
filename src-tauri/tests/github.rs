@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! `gh pr list --json` 输出的解析，以及 gh 不可用时的降级行为。
 //!
 //! 这里**不真跑网络**：断言的是解析层和失败路径，样例 JSON 取自

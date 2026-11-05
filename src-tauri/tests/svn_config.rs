@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 配置校验的测试。
 //!
 //! 这个文件**用户手写**，所以它和输入框里敲的字符串是同一个可信级别，

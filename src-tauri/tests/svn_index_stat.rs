@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 换索引 / 建库之后，索引条目要带着 stat 信息。
 //!
 //! 2026-10-28 现场：建库与每次同步都用 `read-tree` 在**空**索引里生成新索引，条目的

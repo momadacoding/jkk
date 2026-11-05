@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! §16 R2b 的取数入口：`svn cat -r BASE` 拿单个文件在服务器 rN 上的字节。
 //!
 //! 这些测试钉的是 spec §16.2 的四条硬约束，每一条都能独立把基线录坏：

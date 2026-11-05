@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! `sync_in` 前置检查（spec §7.2）。全部是**纯读**：每条拒绝都要断言仓库没被动过。
 
 #[path = "common/svn_fixtures.rs"]

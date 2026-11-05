@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! `sync_out` 的前置检查（spec §8.1）与 D1 / D2 清单。全部在临时 fixture 上跑。
 
 #[path = "common/svn_fixtures.rs"]

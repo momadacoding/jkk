@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 use app_lib::commands::repo::repo_state;
 use std::fs;
 use std::path::Path;

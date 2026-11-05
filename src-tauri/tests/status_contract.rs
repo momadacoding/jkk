@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! `read_status` 的完整输出快照。
 //!
 //! 这组测试先在**原实现**（`diff_index_to_workdir` + `statuses()` 两遍扫描）上跑通，

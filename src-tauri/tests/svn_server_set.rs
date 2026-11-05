@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! §6.3.1 的服务器侧证伪：`svn ls -R` 的清单 vs 磁盘上的 W-file。
 //!
 //! # 这块机制是为一个**四道检查全绿的盲区**造的

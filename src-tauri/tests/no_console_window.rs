@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 守住「不许有第二个 spawn 入口」这条约束。
 //!
 //! release 构建带 `windows_subsystem = "windows"`（`src/main.rs`），GUI 进程本身

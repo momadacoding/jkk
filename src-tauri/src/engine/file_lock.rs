@@ -120,6 +120,7 @@ fn is_occupied(_path: &Path) -> bool {
 ///
 /// 只对**文件句柄**有效。目录被当成工作目录占用时 RM 什么也给不出来，返回空。
 #[cfg(windows)]
+#[allow(unsafe_code)] // Restart Manager 只有 Win32 C API，没有安全封装
 fn blocking_processes(path: &Path) -> Vec<BlockingProcess> {
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::System::RestartManager::{

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 守住「命令不得跑在 UI 线程上」这条约束。
 //!
 //! Tauri 2 里没有 `async` 标记的命令**在主线程上执行**（官方文档 calling-rust：

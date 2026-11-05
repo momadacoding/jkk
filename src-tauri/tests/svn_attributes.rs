@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! `.git/info/attributes` 的生成与写入测试。
 //!
 //! **断言对象是 git 的实际裁决（`git check-attr`），不是生成出来的文本**

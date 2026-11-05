@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! §6.8.7 的判据 `D \ S == ∅`：工作副本不干净时的基线体检。
 //!
 //! # 这个文件必须成对存在，缺一半就是虚假信心

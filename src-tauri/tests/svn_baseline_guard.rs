@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 基线分支 `svn/base` 与移动它的命令的护栏（PR #49 Codex review #2 / #3 留下的两条）。
 //!
 //! 全部在临时 fixture 上跑：wc1 是「你」，wc2 是同事。

@@ -56,3 +56,19 @@ windows = { version = "0.61", features = [
 
 [dev-dependencies]
 tempfile = "3.14"
+
+# 机械护栏：防止以后的改动悄悄引入会让后端 panic 的写法。
+# clippy 类只在 `cargo clippy` 时检查；测试代码的豁免见 clippy.toml 与各测试文件顶部。
+[lints.rust]
+# 不用 forbid（它不能被局部放开）：Restart Manager / 注册表 / 代码页转换三处
+# Windows FFI 必须 unsafe，在那几个函数 / 模块上显式 #[allow] 并写明理由
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"

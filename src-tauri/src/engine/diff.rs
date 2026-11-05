@@ -476,7 +476,11 @@ fn diff_to_data(diff: git2::Diff) -> Result<DiffData> {
                 lines: Vec::new(),
             });
         }
-        file.hunks.last_mut().unwrap().lines.push(DiffLine {
+        // 上面刚保证过至少有一个 hunk，else 分支走不到；不 unwrap 是为了 panic 不进回调
+        let Some(current) = file.hunks.last_mut() else {
+            return true;
+        };
+        current.lines.push(DiffLine {
             origin: line.origin(),
             content: std::str::from_utf8(line.content())
                 .unwrap_or("")

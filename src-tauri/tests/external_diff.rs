@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 use app_lib::engine::blob_export;
 use app_lib::engine::external_diff::{self, DiffTarget};
 use app_lib::engine::external_launch::{self, TempWorkspace};

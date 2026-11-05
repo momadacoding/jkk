@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! svn CLI 封装的测试。
 //!
 //! 这些测试需要 `svn` 在 PATH 上（spec §17）。本仓库没有 CI，所有验证都在开发机

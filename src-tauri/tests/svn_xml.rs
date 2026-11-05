@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! svn `--xml` 解析的测试。
 //!
 //! 这里的输入**不是手写的理想 XML**，而是从真实 svn 输出复制来的形态：属性

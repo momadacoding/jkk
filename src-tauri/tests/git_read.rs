@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! `engine::git_read`（libgit2）与它替换掉的 git CLI 查询逐条对照。
 //!
 //! 这些查询原先走 CLI，改走 libgit2 是为了省掉起进程的开销（C1a 决策日志「性能 P3」）。
