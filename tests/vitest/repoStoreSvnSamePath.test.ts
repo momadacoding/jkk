@@ -42,13 +42,13 @@ async function openAt(result: { current: ReturnType<typeof useRepoStore> }, path
 
 const logPage = { revs: [{ rev: 7, author: 'a', date: '2026-01-01T00:00:00Z', message: 'r7' }], complete: true }
 
-const syncStatus = {
+const syncStatus: SyncStatus = {
   baselineRev: 7,
   nodeRevs: [7],
-  verdict: { kind: 'InSync' },
-  base: { floor: 7, ceiling: 7, mixed: false },
+  verdict: { kind: 'inSync' },
+  base: { floor: 7, newer: 0, gone: 0 },
   headBehindBase: false,
-} as unknown as SyncStatus
+}
 
 describe('SVN 刷新：请求在飞时切到了别的仓库', () => {
   it('fetchSvnLog：旧仓库晚到的 SVN 历史不接进新仓库的图', async () => {
@@ -78,6 +78,31 @@ describe('SVN 刷新：请求在飞时切到了别的仓库', () => {
     await openAt(result, 'C:/b')
     await answer('svn_sync_status', 'C:/a', syncStatus)
     expect(result.current.state.svnSync).toBeNull()
+  })
+
+  // 失焦快照拿最近一次结论当前提：旧仓库的 inSync 记到新仓库头上，新仓库从没校验过也会被写快照
+  it('refreshSvnSync：旧仓库的结论也不算新仓库的「最近一次判定」，失焦不据此写快照', async () => {
+    const { result } = renderHook(() => useRepoStore())
+    await openAt(result, 'C:/a')
+    act(() => { void result.current.refreshSvnSync('C:/a') })
+    await answer('svn_root_revs', 'C:/a', [{ wcRoot: 'C:/a', rev: 7 }])
+    await openAt(result, 'C:/b')
+    await answer('svn_sync_status', 'C:/a', syncStatus)
+    // 不 await：会写快照的话 svn_follow_mark 挂在 pending 里永远不回
+    act(() => { void result.current.markSvnFollowOnBlur('C:/b') })
+    await act(async () => {})
+    expect(pending.some((p) => p.cmd === 'svn_follow_mark')).toBe(false)
+  })
+
+  it('同一个仓库：结论写回后失焦照常写快照', async () => {
+    const { result } = renderHook(() => useRepoStore())
+    await openAt(result, 'C:/a')
+    act(() => { void result.current.refreshSvnSync('C:/a') })
+    await answer('svn_root_revs', 'C:/a', [{ wcRoot: 'C:/a', rev: 7 }])
+    await answer('svn_sync_status', 'C:/a', syncStatus)
+    act(() => { void result.current.markSvnFollowOnBlur('C:/a') })
+    await act(async () => {})
+    expect(pending.some((p) => p.cmd === 'svn_follow_mark' && p.args.path === 'C:/a')).toBe(true)
   })
 
   it('同一个仓库照常写回', async () => {

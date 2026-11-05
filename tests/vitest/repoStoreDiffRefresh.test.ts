@@ -251,6 +251,20 @@ describe('refreshDiff 记下 diff 是哪个 scope 的', () => {
     expect(result.current.state.diff.error).toContain('bad object B')
   })
 
+  it('用户已经离开的那份读失败：不抛、不写，顶部错误条不会报一个看不见的提交', async () => {
+    const { result } = renderHook(() => useRepoStore())
+    result.current.wantedDiffScope.current = 'commit:B'
+    let run!: Promise<void>
+    act(() => { run = result.current.refreshDiff('C:/r', 'commit:A') })
+    const call = pending.find((p) => p.cmd === 'read_diff')!
+    await act(async () => {
+      call.reject(new Error('bad object A'))
+      await expect(run).resolves.toBeUndefined()
+    })
+    expect(result.current.state.diff.error).toBeUndefined()
+    expect(result.current.state.diffScope).toBeNull()
+  })
+
   it('读失败之后再读成功：错误清掉', async () => {
     const { result } = renderHook(() => useRepoStore())
     result.current.wantedDiffScope.current = 'workdir'

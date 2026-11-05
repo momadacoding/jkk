@@ -1,8 +1,8 @@
 /**
  * 第 68 条：删除 worktree 的确认框写着回收站目录，那是撤销入口删掉之后用户手工捞回 worktree
- * 的唯一线索。0.2.x 之后新槽位挪到了 `.trash-v2`，文案没跟着改，指错了目录。
+ * 的唯一线索。新槽位挪到 `.trash-v2` 时文案漏改过一次（后来已改对）。
  *
- * 这里读源码把两边钉在一起：下次再改 `TRASH_DIR`，文案没跟上就会红。
+ * 这条只是防线：读源码把两边钉在一起，下次再改 `TRASH_DIR`，文案没跟上就会红。
  */
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
