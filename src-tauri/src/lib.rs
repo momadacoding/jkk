@@ -49,6 +49,7 @@ pub fn run() {
             commands::external::open_external_tools_config,
             commands::external::read_external_tools,
             commands::diff::read_status,
+            commands::diff::read_status_paths,
             commands::graph::load_graph,
             commands::ops::branch_delete_info,
             commands::ops::checkout,

@@ -40,7 +40,7 @@ import { currentDiff } from '@/engine/currentDiff'
 import { runBranchDeletion, type BranchDeletionStep } from '@/engine/deleteBranchTargets'
 import {
   changesPaths,
-  changesSection,
+  changesDiffScope,
   emptyFileSelection,
   reconcileSelection,
   type FileSelection,
@@ -149,7 +149,7 @@ export function RepoTab({
     state, openRepo, refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers,
     refreshDiff, refreshUpstream, refreshStashes, refreshPullRequests,
     refreshSvnSync, refreshSvnEol, refreshSvnSyncState, refreshSvnBranchesBehind, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, checkSvnSyncOnFocus, markSvnFollowOnBlur, fetchSvnLog, refreshSvnAudit, auditSvnIfDue,
-    selectCommit, clearError, reportError, wantedDiffScope, refreshChanges: refreshChangesIn,
+    selectCommit, clearError, reportError, wantedDiffScope, refreshChanges: refreshChangesIn, afterIndexWrite,
   } = useRepoStore()
   const [repoState, setRepoState] = useState<string>('normal')
   // 侧边栏分区按后端能力裁剪。SVN 混合仓库下 tag / worktree 整块不渲染
@@ -162,7 +162,7 @@ export function RepoTab({
   const [changesSelection, setChangesSelection] = useState<FileSelection>(emptyFileSelection)
   // 每次 store 更新都会重渲染，文件可能上万个：只在选中或状态变了时重算
   const changesScope = useMemo(
-    () => changesSection(changesSelection, state.status),
+    () => changesDiffScope(changesSelection, state.status),
     [changesSelection, state.status],
   )
   // 操作之后的刷新回调要拿最新的选中算区，闭包里那份是点击那一刻的
@@ -268,9 +268,12 @@ export function RepoTab({
     return () => { unlisten?.() }
   }, [state.path])
 
-  /** 写操作之后刷新「本地改动」，按刷新后的状态与最新的选中算读哪个区（store 的 `refreshChanges`）。 */
+  /**
+   * 写操作之后刷新「本地改动」，按刷新后的状态与最新的选中算读哪个区（store 的 `refreshChanges`）。
+   * `touched`：只改了 index 的 Stage / Unstage 传刚操作的路径，状态只重读这几个路径。
+   */
   const refreshChanges = useCallback(
-    (path: string) => refreshChangesIn(path, () => changesSelectionRef.current),
+    (path: string, touched?: string[]) => refreshChangesIn(path, () => changesSelectionRef.current, touched),
     [refreshChangesIn],
   )
 
@@ -296,6 +299,29 @@ export function RepoTab({
       reportError(err)
     }
   }, [state.path, reportError, guardMerge])
+
+  /**
+   * Stage / Unstage。不走 `runAndRefresh`：它在命令失败时不刷新，原来有文件监听兜底，而本应用自己写的
+   * index 现在不再触发监听（6.13 方案 B）。`git add` 可能写进去一部分再以非 0 退出（比如有一个路径
+   * 刚被忽略），所以失败也要刷新，而且按全量读：不知道哪些路径真的变了（独立 review 第 3 条）。
+   */
+  const writeIndex = useCallback(async (cmd: 'stage' | 'unstage', paths: string[]) => {
+    const path = state.path
+    if (!path) return
+    let ok = true
+    try {
+      await invoke(cmd, { path, paths })
+    } catch (err) {
+      ok = false
+      reportError(err)
+    }
+    try {
+      await refreshChanges(path, ok ? paths : undefined)
+    } catch (err) {
+      reportError(err)
+    }
+    afterIndexWrite(path)
+  }, [state.path, reportError, refreshChanges, afterIndexWrite])
 
   /** 工具栏动作：跑完把所有受影响的状态刷一遍。 */
   const runToolbar = useCallback(async (command: string, args: Record<string, unknown>) => {
@@ -1060,8 +1086,8 @@ export function RepoTab({
                 diff={currentDiff(state.diff, state.diffScope, changesScope)}
                 selection={changesSelection}
                 onSelectionChange={setChangesSelection}
-                onStage={(paths) => runAndRefresh('stage', { paths }, () => refreshChanges(state.path!))}
-                onUnstage={(paths) => runAndRefresh('unstage', { paths }, () => refreshChanges(state.path!))}
+                onStage={(paths) => void writeIndex('stage', paths)}
+                onUnstage={(paths) => void writeIndex('unstage', paths)}
                 onDiscard={(paths, staged) => void handleDiscard(paths, staged)}
                 onCommit={handleCommit}
                 svnMode={state.capabilities.vcs === 'svn'}

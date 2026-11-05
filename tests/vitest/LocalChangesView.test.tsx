@@ -568,6 +568,24 @@ describe('LocalChangesView：diff 还没读回来', () => {
     fireEvent.click(screen.getByText('a.txt'))
     expect(screen.getByText('正在读取工作区的改动…')).toBeTruthy()
   })
+
+  // 6.13 方案 C：右侧只读显示的那一个文件，没有文件可显示时什么都不读，diff 一直是 null。
+  // 这时说「正在读取」就永远读不完了
+  it('两边都没有文件：不说正在读取', () => {
+    render(
+      <LocalChangesView
+        status={{ unstaged: [], staged: [] }}
+        diff={null}
+        onStage={vi.fn()}
+        onUnstage={vi.fn()}
+        onDiscard={vi.fn()}
+        onCommit={vi.fn()}
+        svnMode={false}
+        onBaselineBranch={false}
+      />,
+    )
+    expect(screen.queryByText(/正在读取/)).toBeNull()
+  })
 })
 
 // 第 65 条：右侧 diff 按选中文件所在的区读。选中由 RepoTab 持有（它要据此决定读哪个 scope），

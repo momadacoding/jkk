@@ -179,12 +179,15 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
   const activeDiff: DiffData = useMemo(() => ({
     files: (diff?.files ?? []).filter((f) => f.path === activeFile),
   }), [diff, activeFile])
-  const diffPane = diff === null
-    ? <div className="diff-note">
-        {active?.section === 'staged' ? '正在读取暂存区的改动…' : '正在读取工作区的改动…'}
+  // 没有文件可显示时父组件什么都不读（`changesDiffScope` 为 null），diff 一直是 null：
+  // 这时不能说正在读取，按空 diff 显示
+  // 只读选中的那一个文件之后，换选中也要等一次读取（通常几十毫秒）：提示延迟出现，读得快就不闪
+  const diffPane = diff === null && active
+    ? <div className="diff-note diff-note-pending">
+        {active.section === 'staged' ? '正在读取暂存区的改动…' : '正在读取工作区的改动…'}
       </div>
     // 读失败时 files 是空的：不说明的话就成了「没有改动」（第 72 条）
-    : diff.error
+    : diff?.error
       ? <div className="diff-note">读取改动失败：{diff.error}</div>
       : <DiffView diff={activeDiff} />
   const conflictByPath = useMemo(

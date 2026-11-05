@@ -11,7 +11,7 @@
 pub mod git;
 pub mod svn;
 
-use crate::engine::diff::{DiffData, StatusData};
+use crate::engine::diff::{DiffData, StatusData, StatusPatch};
 use crate::engine::graph::GraphData;
 use crate::engine::repo::RepoInfo;
 use crate::engine::stash::StashEntry;
@@ -115,6 +115,10 @@ pub trait Vcs: Send + Sync {
 
     /// 读取工作区状态（已暂存 / 未暂存）。
     fn status(&self) -> Result<StatusData>;
+
+    /// 只重读这几个路径的工作区状态，外加整份已暂存（Stage / Unstage 之后用）。
+    /// 空 paths 不读工作区，见 [`crate::engine::diff::read_status_paths`]。
+    fn status_paths(&self, paths: &[String]) -> Result<StatusPatch>;
 
     /// 读取指定 scope 的 diff。scope 的取值形式由各后端自行解释。
     fn diff(&self, scope: &str) -> Result<DiffData>;

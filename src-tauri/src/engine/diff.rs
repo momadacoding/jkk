@@ -199,43 +199,87 @@ fn is_readable(repo: &Repository, rel: &str) -> bool {
 /// 顺序与这一侧 diff 的顺序相同，列表顺序因此不变。
 pub fn read_status(path: &str) -> Result<StatusData> {
     let repo = Repository::open(path)?;
-
-    let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
     // index 只读一次，几个 diff 共用。不传的话每个 diff 都会在 index 变了时从磁盘重读
     // （libgit2 `diff_load_index`）：两次之间若有一次 `git add`，Staged 和 Unstaged 两个列表
     // 就来自两个版本的 index，刚暂存的文件可能两边都在或两边都没有。`statuses()` 也是只读一次
     let index = repo.index()?;
+    Ok(StatusData {
+        staged: staged_list(&repo, &index)?,
+        unstaged: unstaged_list(&repo, &index, None)?,
+    })
+}
+
+/// Stage / Unstage 之后只重读刚操作的那几个路径（2026-11-05 排查报告 6.13 方案 A）。
+#[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusPatch {
+    /// 整份 Staged，与 `read_status` 的相同。它只比 HEAD 和 index，不碰工作区，所以便宜。
+    pub staged: Vec<FileChange>,
+    /// 只有点名的这几个路径在 Unstaged 里的项，内容和顺序与 `read_status` 里的那几项相同。
+    pub unstaged: Vec<FileChange>,
+    /// index 是否不区分大小写（`core.ignorecase`）。前端按 git 的顺序把新项插回列表要用它：
+    /// libgit2 的 diff 在不区分大小写的 index 上按不区分大小写的顺序排。
+    pub ignore_case: bool,
+}
+
+/// 「本地改动」的一次局部重读：整份 Staged，加上这几个路径的 Unstaged。
+///
+/// 为什么只重读这几个路径就够：Stage / Unstage 只改 index 里这几个路径的项，工作区一个字节
+/// 都不动；Unstaged 比的是 index 和工作区，别的路径两边都没变。例外是 `git add` 的连带改动
+/// （比如加 `t/x` 会把 index 里的文件 `t` 换掉），它一定反映在 Staged 上，前端比对 Staged 发现
+/// 别的路径变了就退回全量重读（`statusPatch.ts`）。
+///
+/// 全量读一次要把整个工作区 stat 一遍（大工作副本上 1.35–2.33 秒）；带上字面量 pathspec，
+/// libgit2 的工作区迭代器只进这几个路径所在的目录。
+///
+/// **空列表不读 Unstaged。** 空 pathspec 在 libgit2 里是「全部」，不拦的话前端拿到整份
+/// Unstaged，再追加到原列表上，每一项都会出现两次。
+pub fn read_status_paths(path: &str, paths: &[String]) -> Result<StatusPatch> {
+    let repo = Repository::open(path)?;
+    let index = repo.index()?;
+    let unstaged = if paths.is_empty() {
+        Vec::new()
+    } else {
+        // 字面量 pathspec 在 libgit2 里仍按目录前缀匹配：点名 `t` 会把 `t/x` 也带出来。
+        // 只留点名路径自己的项，否则前端会把带出来的那项和列表里原有的那项各留一份
+        // （`a_named_path_does_not_bring_in_entries_under_it`）
+        let named: std::collections::HashSet<&str> = paths.iter().map(String::as_str).collect();
+        let mut list = unstaged_list(&repo, &index, Some(paths))?;
+        list.retain(|f| named.contains(f.path.as_str()));
+        list
+    };
+    // libgit2 打开 index 时按同一个配置项决定是否不区分大小写（`GIT_INDEX_CAPABILITY_FROM_OWNER`）
+    let ignore_case = repo
+        .config()
+        .and_then(|c| c.get_bool("core.ignorecase"))
+        .unwrap_or(false);
+    Ok(StatusPatch {
+        staged: staged_list(&repo, &index)?,
+        unstaged,
+        ignore_case,
+    })
+}
+
+fn change(path: String, kind: &str, stats: &HashMap<String, (usize, usize)>) -> FileChange {
+    let (additions, deletions) = stats.get(&path).copied().unwrap_or((0, 0));
+    FileChange {
+        path,
+        status: kind.to_string(),
+        additions,
+        deletions,
+    }
+}
+
+/// HEAD 对比 index。只读对象库，不碰工作区。
+fn staged_list(repo: &Repository, index: &git2::Index) -> Result<Vec<FileChange>> {
+    let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
     // `statuses()` 固定带 INCLUDE_TYPECHANGE。不带的话类型变化会拆成一删一增，
     // 列表里凭空多出两项；带上之后它是一条 Typechange，按原样不列
     let mut staged_opts = DiffOptions::new();
     staged_opts.include_typechange(true);
     let staged_diff =
-        repo.diff_tree_to_index(head_tree.as_ref(), Some(&index), Some(&mut staged_opts))?;
+        repo.diff_tree_to_index(head_tree.as_ref(), Some(index), Some(&mut staged_opts))?;
     let staged_stats = line_stats(&staged_diff);
-
-    let mut wd_opts = workdir_diff_opts(None);
-    wd_opts.include_typechange(true);
-    let workdir_diff = repo.diff_index_to_workdir(Some(&index), Some(&mut wd_opts))?;
-    let unstaged_stats = match readable_only(&repo, &workdir_diff) {
-        None => line_stats(&workdir_diff),
-        // 全都读不了就没什么可统计的，行数一律退化为 0，
-        // 但文件列表来自上面那个 diff 的 deltas，不受影响
-        Some(good) if good.is_empty() => HashMap::new(),
-        // 绕开坏路径重建的这一遍只为行数，列表不从它取
-        Some(good) => line_stats(
-            &repo.diff_index_to_workdir(Some(&index), Some(&mut workdir_diff_opts(Some(&good))))?,
-        ),
-    };
-
-    let make = |path_str: String, kind: &str, stats: &HashMap<String, (usize, usize)>| {
-        let (additions, deletions) = stats.get(&path_str).copied().unwrap_or((0, 0));
-        FileChange {
-            path: path_str,
-            status: kind.to_string(),
-            additions,
-            deletions,
-        }
-    };
 
     let mut staged = Vec::new();
     for delta in staged_diff.deltas() {
@@ -245,9 +289,32 @@ pub fn read_status(path: &str) -> Result<StatusData> {
             continue;
         }
         if let Some(kind) = listed_status(delta.status()) {
-            staged.push(make(delta_path(&delta), kind, &staged_stats));
+            staged.push(change(delta_path(&delta), kind, &staged_stats));
         }
     }
+    Ok(staged)
+}
+
+/// index 对比工作区。`only` 非空时只看这几个路径（字面量匹配），见 `read_status_paths`。
+fn unstaged_list(
+    repo: &Repository,
+    index: &git2::Index,
+    only: Option<&[String]>,
+) -> Result<Vec<FileChange>> {
+    let mut wd_opts = workdir_diff_opts(only);
+    wd_opts.include_typechange(true);
+    let workdir_diff = repo.diff_index_to_workdir(Some(index), Some(&mut wd_opts))?;
+    let unstaged_stats = match readable_only(repo, &workdir_diff) {
+        None => line_stats(&workdir_diff),
+        // 全都读不了就没什么可统计的，行数一律退化为 0，
+        // 但文件列表来自上面那个 diff 的 deltas，不受影响
+        Some(good) if good.is_empty() => HashMap::new(),
+        // 绕开坏路径重建的这一遍只为行数，列表不从它取。`good` 取自上面的 diff，
+        // 不会比 `only` 的范围大
+        Some(good) => line_stats(
+            &repo.diff_index_to_workdir(Some(index), Some(&mut workdir_diff_opts(Some(&good))))?,
+        ),
+    };
 
     let mut unstaged = Vec::new();
     for delta in workdir_diff.deltas() {
@@ -257,13 +324,12 @@ pub fn read_status(path: &str) -> Result<StatusData> {
         };
         // 只对新增项做可读性检查（与原来的 WT_NEW 同一范围）。已跟踪文件被删掉走的是
         // Deleted，那是真实变更，即使工作区里已经没有这个路径也必须保留。
-        if kind == "added" && !is_readable(&repo, &path_str) {
+        if kind == "added" && !is_readable(repo, &path_str) {
             continue;
         }
-        unstaged.push(make(path_str, kind, &unstaged_stats));
+        unstaged.push(change(path_str, kind, &unstaged_stats));
     }
-
-    Ok(StatusData { staged, unstaged })
+    Ok(unstaged)
 }
 
 pub fn read_diff(path: &str, scope: String) -> Result<DiffData> {
@@ -302,37 +368,77 @@ pub fn read_diff(path: &str, scope: String) -> Result<DiffData> {
     }
     // 空仓库没有 HEAD，此时与空树比较
     let tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+    // `staged:<路径>` / `unstaged:<路径>`：「本地改动」右侧只显示选中的那一个文件，只读它
+    // （2026-11-05 排查报告 6.13 方案 C）。整区读要把整个工作区 stat 一遍、再读出每个改动文件的
+    // 内容，而界面只用其中一项。结果与整区读里这个路径的那一项相同（`tests/diff_file_scope.rs`）
+    if let Some((section, file)) = scope
+        .split_once(':')
+        .filter(|(s, _)| matches!(*s, "staged" | "unstaged"))
+    {
+        // 空路径必须报错：空 pathspec 在 libgit2 里是「全部」，这条快路径会悄悄变回整区读
+        if file.is_empty() {
+            return Err(crate::error::GitError::new(
+                "bad_diff_scope",
+                format!("无法解析的 diff 范围：{scope}"),
+            ));
+        }
+        let only = [file.to_string()];
+        return if section == "staged" {
+            staged_side(&repo, tree.as_ref(), Some(&only))
+        } else {
+            workdir_side(&repo, tree.as_ref(), Some(&only), |opts| {
+                repo.diff_index_to_workdir(None, Some(opts))
+            })
+        };
+    }
     match scope.as_str() {
         // 「本地改动」按分区比较（第 65 条），与外部 diff 的两侧取法一致：
         // Staged = HEAD 对比暂存区，即这次提交会提交什么
-        "staged" => {
-            // 不做改名检测：Staged 列表来自 `read_status`，它把 `git mv` 列成一删一增两项。
-            // 这里若合成一条改名，点到旧路径那一项时右侧就找不到它的 diff
-            let diff = repo.diff_tree_to_index(tree.as_ref(), None, None)?;
-            let mut data = diff_to_data(diff)?;
-            // 合并冲突中 index 里的冲突条目也会出现在这里，但 `read_status` 只把冲突文件放进
-            // Unstaged（显示 HEAD 对比工作区）。留着它，Staged 的 diff 就多出列表里没有的项
-            data.files.retain(|f| f.status != "conflicted");
-            Ok(data)
-        }
+        "staged" => staged_side(&repo, tree.as_ref(), None),
         // Unstaged = 暂存区对比工作区，即还没暂存的那部分
-        "unstaged" => workdir_side(&repo, tree.as_ref(), |opts| {
+        "unstaged" => workdir_side(&repo, tree.as_ref(), None, |opts| {
             repo.diff_index_to_workdir(None, Some(opts))
         }),
         // workdir（以及其余认不出的 scope）：HEAD 对比工作区
-        _ => workdir_side(&repo, tree.as_ref(), |opts| {
+        _ => workdir_side(&repo, tree.as_ref(), None, |opts| {
             repo.diff_tree_to_workdir_with_index(tree.as_ref(), Some(opts))
         }),
     }
 }
 
+/// HEAD 对比暂存区，即这次提交会提交什么。`only` 非空时只比这几个路径（字面量匹配）。
+fn staged_side(
+    repo: &Repository,
+    tree: Option<&git2::Tree>,
+    only: Option<&[String]>,
+) -> Result<DiffData> {
+    let mut opts = DiffOptions::new();
+    if let Some(paths) = only {
+        for p in paths {
+            opts.pathspec(p);
+        }
+        // 字面量匹配，理由同 `workdir_diff_opts`
+        opts.disable_pathspec_match(true);
+    }
+    // 不做改名检测：Staged 列表来自 `read_status`，它把 `git mv` 列成一删一增两项。
+    // 这里若合成一条改名，点到旧路径那一项时右侧就找不到它的 diff
+    let diff = repo.diff_tree_to_index(tree, None, Some(&mut opts))?;
+    let mut data = diff_to_data(diff)?;
+    // 合并冲突中 index 里的冲突条目也会出现在这里，但 `read_status` 只把冲突文件放进
+    // Unstaged（显示 HEAD 对比工作区）。留着它，Staged 的 diff 就多出列表里没有的项
+    data.files.retain(|f| f.status != "conflicted");
+    Ok(data)
+}
+
 /// 拿 `build` 给出的那一侧与工作区比。坏路径与冲突文件的处理两个 scope 共用。
+/// `only` 非空时只比这几个路径（字面量匹配），见 `workdir_diff_opts`。
 fn workdir_side<'r>(
     repo: &'r Repository,
     head_tree: Option<&git2::Tree>,
+    only: Option<&[String]>,
     build: impl Fn(&mut DiffOptions) -> std::result::Result<git2::Diff<'r>, git2::Error>,
 ) -> Result<DiffData> {
-    let diff = build(&mut workdir_diff_opts(None))?;
+    let diff = build(&mut workdir_diff_opts(only))?;
     let mut data = match readable_only(repo, &diff) {
         None => diff_to_data(diff)?,
         // 一个能读的都没有：返回空 diff 而不是让整个视图报错。
