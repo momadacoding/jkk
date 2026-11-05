@@ -261,18 +261,53 @@ const NOT_GIT_ONLY: &[(&str, &str, &str)] = &[
         "read_worktrees_cmd",
         "只读：打开仓库时无条件读一次",
     ),
+    ("conflict.rs", "read_conflicts", "只读"),
+    (
+        "conflict.rs",
+        "resolve_delete_modify",
+        "SVN 模式下合并冲突照样会有，二选一是 index 操作",
+    ),
+    ("conflict.rs", "check_merge_drivers", "只读"),
+    // 整个文件放行：这些命令不碰 git 写操作
+    ("app_settings.rs", "*", "应用设置，不碰仓库"),
+    ("session.rs", "*", "会话文件，不碰仓库"),
+    ("custom.rs", "*", "用户自己配的外部命令，按用户的意思跑"),
+    ("external.rs", "*", "拉起外部 diff / merge 工具，只导出文件"),
+    ("diff.rs", "*", "只读"),
+    ("graph.rs", "*", "只读"),
+    ("tree.rs", "*", "只读"),
+    ("repo.rs", "*", "只读：打开仓库、读能力"),
+    ("watch.rs", "*", "文件监听，不写仓库"),
+    (
+        "pr.rs",
+        "*",
+        "只读；SVN 后端不声明 pullRequests，前端也不发",
+    ),
 ];
+
+/// SVN 自己的命令，不在这道检查里：它们只对混合仓库有意义，各自查仓库类型与同步锁。
+const SVN_COMMAND_FILES: &[&str] = &["svn.rs", "svn_sync.rs", "mod.rs"];
 
 /// 第 69 条：git 专属写命令原来只靠前端藏入口，漏过两次。分类必须穷尽，理由同文件头。
 #[test]
 fn every_command_outside_the_vcs_trait_is_classified() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands");
     let mut unclassified = Vec::new();
-    for file in ["ops.rs", "remote.rs", "worktree.rs"] {
+    // 扫整个 commands/ 目录：只扫几个文件的话，别处新加的 git 专属写命令抓不到（PR 115 review）
+    let mut files: Vec<String> = fs::read_dir(&root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|f| f.ends_with(".rs") && !SVN_COMMAND_FILES.contains(&f.as_str()))
+        .collect();
+    files.sort();
+    assert!(files.iter().any(|f| f == "ops.rs"), "commands/ 目录没读对");
+    for file in &files {
+        let file = file.as_str();
         let src = fs::read_to_string(root.join(file)).unwrap();
         for (i, _) in src.match_indices("#[tauri::command") {
             let after = &src[i..];
-            let sig = after.find("pub fn ").expect("命令属性后面没有函数") + "pub fn ".len();
+            // 认 `fn `，不认 `pub fn `：`pub async fn` 会被跳过，下一个命令被重复检查
+            let sig = after.find("fn ").expect("命令属性后面没有函数") + "fn ".len();
             let name: String = after[sig..]
                 .chars()
                 .take_while(|c| c.is_alphanumeric() || *c == '_')
@@ -282,7 +317,7 @@ fn every_command_outside_the_vcs_trait_is_classified() {
             let guarded = body.contains("require_capability(");
             let allowed = NOT_GIT_ONLY
                 .iter()
-                .any(|(f, n, _)| *f == file && *n == name);
+                .any(|(f, n, _)| *f == file && (*n == name || *n == "*"));
             assert!(
                 !(allowed && guarded),
                 "`{file}::{name}` 加了守卫却还在放行表里，从表里删掉"

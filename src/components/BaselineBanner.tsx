@@ -128,11 +128,13 @@ export function BaselineBanner({
   // 此刻是危险的——会移动正被依赖的基线指针。
   const unfinished = describeUnfinishedSync(syncState)
   const hushed = otherBannersAreSuppressed(syncState)
-  const eolModel = hushed ? null : describeEolMigration(eol, sync)
-  // 基线丢了时没有同步结论，失同步横幅的位置换成恢复横幅，按钮走同一套分发
-  const model = hushed || syncBannerIsSuppressed(eol, sync)
+  // 基线丢了（第 70 条）排在行尾迁移前面：迁移同样要读基线，留着那颗按钮点了只会报错
+  // （PR 115 review）。恢复横幅占失同步横幅的位置，按钮走同一套分发
+  const missing = !hushed && isSvn ? describeMissingBaseline(baselineMissing, sync) : null
+  const eolModel = hushed || missing ? null : describeEolMigration(eol, sync)
+  const model = hushed
     ? null
-    : describeSync(sync) ?? (isSvn ? describeMissingBaseline(baselineMissing, sync) : null)
+    : missing ?? (syncBannerIsSuppressed(eol, sync) ? null : describeSync(sync))
   const auditModel = hushed ? null : describeAudit(audit)
   const standalone = !hushed && needsStandaloneCheck(isSvn, sync, eol, baselineMissing)
   // 钩子失效不受 hushed 影响：它说的是 TortoiseSVN 那边会报错，与基线的中间态无关

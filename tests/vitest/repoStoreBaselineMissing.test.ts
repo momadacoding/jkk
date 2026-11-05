@@ -58,6 +58,17 @@ describe('失同步判定报 svn_no_baseline', () => {
     expect(result.current.state.svnSync).toBeNull()
   })
 
+  it('基线确实丢了之后来一次别的失败（锁、网络）：标记不清，恢复横幅不闪掉', async () => {
+    const { result } = await opened()
+    answers.set('svn_sync_status', () => Promise.reject({ code: 'svn_no_baseline', message: '读不到基线分支' }))
+    await act(async () => { await result.current.refreshSvnSync('C:/r').catch(() => undefined) })
+    answers.set('svn_root_revs', () => [{ wcRoot: 'C:/r', rev: 2 }])
+    answers.set('svn_sync_status', () => Promise.reject({ code: 'svn_wc_locked', message: 'E155004' }))
+    await act(async () => { await result.current.refreshSvnSync('C:/r').catch(() => undefined) })
+    expect(result.current.state.svnBaselineMissing).toBe(true)
+    expect(result.current.state.svnSync).toBeNull()
+  })
+
   it('别的失败不算基线缺失，上一次的结论保留', async () => {
     const { result } = await opened()
     answers.set('svn_sync_status', () => inSync)

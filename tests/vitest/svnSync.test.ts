@@ -682,4 +682,8 @@ describe('describeMissingBaseline', () => {
     expect(needsStandaloneCheck(true, null, null, true)).toBe(false)
     expect(needsStandaloneCheck(true, null, null, false)).toBe(true)
   })
+
+  it('重建之后有了结论：标记没清，常驻体检入口也要回来', () => {
+    expect(needsStandaloneCheck(true, st({ kind: 'inSync' }, 1, [1]), null, true)).toBe(true)
+  })
 })

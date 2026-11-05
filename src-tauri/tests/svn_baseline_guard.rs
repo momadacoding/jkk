@@ -191,6 +191,31 @@ fn rebuilding_after_the_baseline_was_deleted_records_a_new_one() {
 }
 
 #[test]
+fn rebuilding_a_lost_baseline_from_a_branch_with_no_baseline_history_is_refused() {
+    // 录成根 commit 的话，工作分支与基线永远没有共同祖先，跟进再也做不了（PR 115 review）。
+    // 历史里只有别的 SVN 仓库导入的 git-svn commit 也不能当父提交
+    let fx = hybrid_with_colleague();
+    git(&fx, &["branch", "-D", "svn/base"]);
+    git(&fx, &["checkout", "-q", "--orphan", "lonely"]);
+    git(
+        &fx,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "imported\n\ngit-svn-id: file:///elsewhere/trunk@3 00000000-0000-0000-0000-000000000000",
+        ],
+    );
+
+    let err = svn_rebuild_baseline(fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "svn_baseline_recover", "{}", err.message);
+    assert!(
+        run_git(&fx.wc_str(), &["rev-parse", "--verify", "svn/base"]).is_err(),
+        "拒绝了却建出了 svn/base"
+    );
+}
+
+#[test]
 fn rebuilding_with_the_baseline_present_still_moves_it_from_the_old_one() {
     let fx = hybrid_with_colleague();
     let old = git(&fx, &["rev-parse", "svn/base"]);

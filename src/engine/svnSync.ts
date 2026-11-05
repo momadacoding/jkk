@@ -242,7 +242,9 @@ export function needsStandaloneCheck(
   /** 基线分支不存在（第 70 条）：体检同样要读基线，入口点了只会报错，出口在恢复横幅上。 */
   baselineMissing = false,
 ): boolean {
-  if (baselineMissing) return false
+  // 只看「丢了且还没有结论」：标记在判定成功时不清，重建之后有了结论，入口就该回来
+  // （PR 115 review）
+  if (baselineMissing && !sync) return false
   // 迁移没做完时基线本来就不可信，挂一个「体检基线」只会给出误导性的结论
   // ——体检比的是磁盘与服务器，而此刻的问题出在基线自己的形状上。
   //

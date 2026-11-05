@@ -165,7 +165,8 @@ export interface RepoState {
   svnSync: SyncStatus | null
   /**
    * 最近一次失同步判定报了 `svn_no_baseline`：基线分支 `svn/base` 不存在（第 70 条）。
-   * 只在判定失败时写；成功时不清，由 `describeMissingBaseline` 看到有结论就不挂横幅。
+   * 只在判定报这个错时置位，别的失败与成功都不动它。读它的两处（`describeMissingBaseline`、
+   * `needsStandaloneCheck`）都同时看 `svnSync`：有结论就说明基线读得到，标记作废。
    */
   svnBaselineMissing: boolean
   /** 服务器侧清单核对（§6.3.1 / NB-2）。走网络，失败静默。 */
@@ -813,11 +814,13 @@ export function useRepoStore() {
       if (refreshGate.isLatest(token, 'svnSync')) {
         latestVerdict.current = null
         // 基线分支丢了（第 70 条）：旧结论作废，横幅换成恢复入口。别的失败（网络、锁）
-        // 照旧保留上一次的结论，那时基线还在
-        const missing = toErrorCode(err) === 'svn_no_baseline'
-        setState((s) => (samePath(s.path ?? '', path)
-          ? { ...s, svnBaselineMissing: missing, ...(missing ? { svnSync: null } : {}) }
-          : s))
+        // 什么都不动：既保留上一次的结论，也不清这个标记——基线确实丢了的时候，
+        // 一次锁错误不该让恢复横幅闪掉（PR 115 review）
+        if (toErrorCode(err) === 'svn_no_baseline') {
+          setState((s) => (samePath(s.path ?? '', path)
+            ? { ...s, svnBaselineMissing: true, svnSync: null }
+            : s))
+        }
       }
       throw err
     }
