@@ -37,6 +37,8 @@ pub fn branch_delete_info(
 
 #[tauri::command(async)]
 pub fn delete_remote_branch(path: String, remote: String, branch: String) -> Result<()> {
+    // 不走 trait Vcs：SVN 混合仓库由这一行拦（第 69 条），不能只靠界面藏入口
+    crate::vcs::require_capability(&path, "远程分支", |c| c.remotes)?;
     // 护栏放在 push 之前：默认分支删掉就没了，不能等服务端心情好才挡
     crate::engine::branch::ensure_deletable_on_remote(&path, &remote, &branch)?;
     run_git(&path, &["push", &remote, "--delete", &branch])?;
@@ -83,6 +85,8 @@ pub fn prefetch_remote_default_for_ref(path: String, remote_branch: String) {
 /// 斜杠，前端按第一个 `/` 去切会切错。
 #[tauri::command(async)]
 pub fn delete_remote_ref(path: String, remote_branch: String) -> Result<()> {
+    // 下面的 delete_remote_branch 也会拦，这里先拦是为了连 split 那次读都不做
+    crate::vcs::require_capability(&path, "远程分支", |c| c.remotes)?;
     let (remote, branch) = crate::engine::branch::split_remote_ref(&path, &remote_branch)?;
     delete_remote_branch(path, remote, branch)
 }
@@ -96,6 +100,7 @@ pub fn delete_remote_ref(path: String, remote_branch: String) -> Result<()> {
 /// 留下的分支，静默把它重置到远程会丢掉本地提交。
 #[tauri::command(async)]
 pub fn checkout_remote_branch(path: String, remote_branch: String) -> Result<String> {
+    crate::vcs::require_capability(&path, "远程分支", |c| c.remotes)?;
     let (local, exists) = crate::engine::branch::local_target_for(&path, &remote_branch)?;
     if exists {
         run_git(&path, &["checkout", &local])?;
@@ -121,6 +126,7 @@ pub fn checkout(path: String, rev: String) -> Result<()> {
 /// 在某条提交上打一个轻量 tag。
 #[tauri::command(async)]
 pub fn create_tag(path: String, name: String, rev: String) -> Result<()> {
+    crate::vcs::require_capability(&path, "tag", |c| c.tags)?;
     // 不带 -f：同名 tag 已存在时让 git 报错，静默改写一个 tag 的指向
     // 是能把别人已经拉走的引用悄悄挪位置的操作
     run_git(&path, &["tag", &name, &rev])?;
@@ -130,6 +136,7 @@ pub fn create_tag(path: String, name: String, rev: String) -> Result<()> {
 /// 把一条提交摘到当前分支上。
 #[tauri::command(async)]
 pub fn cherry_pick(path: String, rev: String) -> Result<()> {
+    crate::vcs::require_capability(&path, "cherry-pick", |c| c.cherry_pick)?;
     run_git(&path, &["cherry-pick", &rev])?;
     Ok(())
 }
@@ -154,6 +161,7 @@ pub fn revert(path: String, rev: String) -> Result<()> {
 /// git 会按提交说明自动编号命名，用户在存盘框里选的文件名就白选了。
 #[tauri::command(async)]
 pub fn save_patch(path: String, rev: String, out: String) -> Result<()> {
+    crate::vcs::require_capability(&path, "导出 patch", |c| c.patches)?;
     // -1 限定只导出这一条，不带上它的祖先
     let patch =
         crate::engine::git_cli::run_git_bytes(&path, &["format-patch", "-1", "--stdout", &rev])?;

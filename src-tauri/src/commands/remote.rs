@@ -15,6 +15,8 @@ fn has_upstream(path: &str) -> bool {
 
 #[tauri::command(async)]
 pub fn fetch(path: String, all: bool) -> Result<()> {
+    // 本文件的命令都不走 trait Vcs：SVN 混合仓库由这一行拦（第 69 条）
+    crate::vcs::require_capability(&path, "git 远程", |c| c.remotes)?;
     // all 对应界面上按住 Ctrl 的变体
     if all {
         run_git(&path, &["fetch", "--all", "--prune", "--tags"])?;
@@ -26,6 +28,7 @@ pub fn fetch(path: String, all: bool) -> Result<()> {
 
 #[tauri::command(async)]
 pub fn pull(path: String, rebase: bool) -> Result<()> {
+    crate::vcs::require_capability(&path, "git 远程", |c| c.remotes)?;
     // 默认不带参数，尊重用户自己的 pull.rebase 配置——
     // 这是 git 客户端最不意外的行为
     if rebase {
@@ -38,6 +41,7 @@ pub fn pull(path: String, rebase: bool) -> Result<()> {
 
 #[tauri::command(async)]
 pub fn push(path: String, force: bool) -> Result<()> {
+    crate::vcs::require_capability(&path, "git 远程", |c| c.remotes)?;
     let branch = current_branch(&path)?;
     // 新分支没有上游，裸 push 会直接失败，自动补 -u 省掉一次无谓的报错
     let set_upstream = !has_upstream(&path);
@@ -94,6 +98,7 @@ fn tag_remote(path: &str) -> Result<String> {
 /// 把一条本地 tag 推到远端。
 #[tauri::command(async)]
 pub fn push_tag(path: String, name: String) -> Result<()> {
+    crate::vcs::require_capability(&path, "tag", |c| c.tags)?;
     // 空名必须在这里就挡掉。拼进 refspec 会变成 `refs/tags/:refs/tags/`——
     // 冒号左边为空正是 git 删除远端引用的写法，一个空串就能把远端引用删掉。
     let name = name.trim();

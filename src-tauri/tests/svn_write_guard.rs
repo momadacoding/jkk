@@ -236,6 +236,70 @@ fn commands_moving_the_baseline_hold_the_lock_throughout() {
     );
 }
 
+/// 不走 `trait Vcs`、也不调 `require_capability`、但**可以**在 SVN 混合仓库上跑的命令。
+/// 每一条写明理由；新加的命令不在这里又没守卫，下面的测试就红（第 69 条）。
+const NOT_GIT_ONLY: &[(&str, &str, &str)] = &[
+    ("ops.rs", "branch_delete_info", "只读：删除对话框要先问"),
+    (
+        "ops.rs",
+        "check_remote_deletable",
+        "只读护栏，删远程之前的预检",
+    ),
+    ("ops.rs", "prefetch_remote_default", "只读，失败不报"),
+    (
+        "ops.rs",
+        "prefetch_remote_default_for_ref",
+        "只读，失败不报",
+    ),
+    (
+        "ops.rs",
+        "revert",
+        "SVN 模式下可用（见 GUARDED_COMMANDS），自己查同步锁",
+    ),
+    (
+        "worktree.rs",
+        "read_worktrees_cmd",
+        "只读：打开仓库时无条件读一次",
+    ),
+];
+
+/// 第 69 条：git 专属写命令原来只靠前端藏入口，漏过两次。分类必须穷尽，理由同文件头。
+#[test]
+fn every_command_outside_the_vcs_trait_is_classified() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands");
+    let mut unclassified = Vec::new();
+    for file in ["ops.rs", "remote.rs", "worktree.rs"] {
+        let src = fs::read_to_string(root.join(file)).unwrap();
+        for (i, _) in src.match_indices("#[tauri::command") {
+            let after = &src[i..];
+            let sig = after.find("pub fn ").expect("命令属性后面没有函数") + "pub fn ".len();
+            let name: String = after[sig..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            let body = fn_body(&src, &name);
+            let through_trait = body.contains("backend_for(");
+            let guarded = body.contains("require_capability(");
+            let allowed = NOT_GIT_ONLY
+                .iter()
+                .any(|(f, n, _)| *f == file && *n == name);
+            assert!(
+                !(allowed && guarded),
+                "`{file}::{name}` 加了守卫却还在放行表里，从表里删掉"
+            );
+            if !(through_trait || guarded || allowed) {
+                unclassified.push(format!("{file}::{name}"));
+            }
+        }
+    }
+    assert!(
+        unclassified.is_empty(),
+        "这些命令不走 trait Vcs，也没有 `require_capability`：{unclassified:?}。\
+         git 专属的写命令在第一行调 `crate::vcs::require_capability`；\
+         确实能在 SVN 混合仓库上跑的，加进 NOT_GIT_ONLY 并写明理由。"
+    );
+}
+
 #[test]
 fn write_commands_outside_the_vcs_trait_are_guarded_too() {
     for (file, func) in GUARDED_COMMANDS {

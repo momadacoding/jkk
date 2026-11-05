@@ -221,3 +221,30 @@ pub fn backend_for(path: &str) -> Result<Box<dyn Vcs>> {
         )),
     }
 }
+
+/// git 专属命令的后端守卫：这个仓库的后端不声明 `feature` 时拒绝（第 69 条）。
+///
+/// `checkout_remote_branch`、`create_tag`、`cherry_pick`、`fetch`、`create_worktree` 这些命令
+/// 不走 `trait Vcs`，直连 `run_git`。原来只靠前端按 `capabilities` 把入口藏起来，
+/// 已经漏过两次（删除分支对话框在 SVN 模式下调到了 `delete_worktree` /
+/// `delete_remote_branch`）。所以每个这样的命令入口第一行调它，判据就是前端用的那份
+/// `capabilities()`，两边不会各说各话。
+///
+/// 普通 git 仓库的后端声明全部能力，行为不变；还没初始化 / 来历不明的 SVN 目录由
+/// `backend_for` 照常报各自的错误码，与走 trait 的命令一致。
+///
+/// `what` 是给用户看的功能名，如「worktree」「tag」。
+pub fn require_capability(
+    path: &str,
+    what: &str,
+    feature: fn(&Capabilities) -> bool,
+) -> Result<()> {
+    let caps = backend_for(path)?.capabilities();
+    if feature(&caps) {
+        return Ok(());
+    }
+    Err(crate::error::GitError::new(
+        "svn_not_supported",
+        format!("SVN 混合仓库不支持 {what}。这个功能只在普通 git 仓库里可用。"),
+    ))
+}
