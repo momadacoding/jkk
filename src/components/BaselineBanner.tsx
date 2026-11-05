@@ -2,6 +2,7 @@ import { useState } from 'react'
 import {
   describeAudit,
   describeEolMigration,
+  describeMissingBaseline,
   describeSync,
   needsStandaloneCheck,
   syncBannerIsSuppressed,
@@ -40,6 +41,8 @@ interface BaselineBannerProps {
    * 它挂出来的横幅**排在最前，且其余横幅全部让位**——理由见组件里的注释。
    */
   syncState: SyncState | SyncStateUnreadable | null
+  /** 基线分支 `svn/base` 不存在（第 70 条）：挂恢复横幅，出口是重建基线。 */
+  baselineMissing?: boolean
   /** 重建基线。调用方负责先弹确认。 */
   onRebuild: () => void
   /** 手动体检当前基线。 */
@@ -107,6 +110,7 @@ export function BaselineBanner({
   audit,
   eol,
   syncState,
+  baselineMissing = false,
   onRebuild,
   onCheck,
   onMigrateEol,
@@ -124,10 +128,15 @@ export function BaselineBanner({
   // 此刻是危险的——会移动正被依赖的基线指针。
   const unfinished = describeUnfinishedSync(syncState)
   const hushed = otherBannersAreSuppressed(syncState)
-  const eolModel = hushed ? null : describeEolMigration(eol, sync)
-  const model = hushed || syncBannerIsSuppressed(eol, sync) ? null : describeSync(sync)
+  // 基线丢了（第 70 条）排在行尾迁移前面：迁移同样要读基线，留着那颗按钮点了只会报错
+  // （PR 115 review）。恢复横幅占失同步横幅的位置，按钮走同一套分发
+  const missing = !hushed && isSvn ? describeMissingBaseline(baselineMissing, sync) : null
+  const eolModel = hushed || missing ? null : describeEolMigration(eol, sync)
+  const model = hushed
+    ? null
+    : missing ?? (syncBannerIsSuppressed(eol, sync) ? null : describeSync(sync))
   const auditModel = hushed ? null : describeAudit(audit)
-  const standalone = !hushed && needsStandaloneCheck(isSvn, sync, eol)
+  const standalone = !hushed && needsStandaloneCheck(isSvn, sync, eol, baselineMissing)
   // 钩子失效不受 hushed 影响：它说的是 TortoiseSVN 那边会报错，与基线的中间态无关
   const staleHooks = isSvn ? describeStaleHooks(hooks) : null
   const [copied, setCopied] = useState(false)

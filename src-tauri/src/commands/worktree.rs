@@ -174,6 +174,8 @@ pub fn read_worktrees_cmd(path: String) -> Result<Vec<Worktree>> {
 
 #[tauri::command(async)]
 pub fn create_worktree(path: String, name: String, branch: Option<String>) -> Result<()> {
+    // 不走 trait Vcs：SVN 混合仓库由这一行拦（第 69 条）。读列表的命令不拦，打开仓库要用
+    crate::vcs::require_capability(&path, "worktree", |c| c.worktrees)?;
     let worktree_path = main_repo(&path)?.join(".worktrees").join(&name);
     let target = worktree_path.to_string_lossy().to_string();
 
@@ -741,6 +743,8 @@ pub fn delete_worktree(
     worktree_path: String,
     force: bool,
 ) -> Result<DeletedWorktree> {
+    // 排在一切检查之前（第 69 条）：删除对话框在 SVN 模式下调到过这里
+    crate::vcs::require_capability(&path, "worktree", |c| c.worktrees)?;
     // 目录在不在必须用严格探测：`Path::exists` 把 I/O 错误（网络盘断连、未挂载、
     // 无权限）折叠成 false，那种情况下走「目录已丢」分支会跳过脏检查、只搬登记，
     // 仍真实存在的工作树和里面的未提交内容就成了无主数据。

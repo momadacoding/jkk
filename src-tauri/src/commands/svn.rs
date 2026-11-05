@@ -22,8 +22,8 @@ use crate::engine::svn_follow_mark::{
 use crate::engine::svn_health::Health;
 use crate::engine::svn_init::{
     check_current_baseline, eol_status, init_hybrid_with, init_preflight, migrate_eol,
-    pinned_externals, rebuild_baseline, EolStatus, GitignoreChoice, InitPreflight, InitReport,
-    InitRequest, RebuildReport,
+    pinned_externals, rebuild_or_recover_baseline, EolStatus, GitignoreChoice, InitPreflight,
+    InitReport, InitRequest, RebuildReport,
 };
 use crate::engine::svn_journal::{Flow, Phase};
 use crate::engine::svn_lock::LockHolder;
@@ -86,7 +86,8 @@ pub fn svn_rebuild_baseline(path: String) -> Result<RebuildReport, GitError> {
     // 它移动 `svn/base` 指针——正是一次同步全程依赖的那个指针（spec §5.1）。
     // 不走 `trait Vcs`，所以 `vcs/svn.rs` 上的守卫拦不到，必须自己挡一道
     let _lock = hold_for_baseline_move(&path)?;
-    rebuild_baseline(&path)
+    // 基线丢失时从零录一条，这是丢失之后唯一的出路（第 70 条）
+    rebuild_or_recover_baseline(&path)
 }
 
 /// 移动基线之前拿同步锁，**持到命令结束**（PR #49 Codex review #3）。

@@ -204,3 +204,50 @@ describe('BaselineBanner 的 TortoiseSVN 钩子入口（C1h）', () => {
     expect(screen.queryByText('TortoiseSVN 钩子已失效')).toBeNull()
   })
 })
+
+describe('BaselineBanner：基线分支丢了（第 70 条）', () => {
+  it('挂出恢复横幅，「重建基线」交给 onRebuild，不挂常驻体检入口', () => {
+    const onRebuild = vi.fn()
+    render(
+      <BaselineBanner
+        isSvn
+        sync={null}
+        audit={null}
+        eol={null}
+        syncState={null}
+        baselineMissing
+        onRebuild={onRebuild}
+        onCheck={() => {}}
+        onMigrateEol={() => {}}
+        onSyncAction={() => {}}
+        onSyncOutAction={() => {}}
+        onSvnUpdate={() => {}}
+      />,
+    )
+    expect(screen.getByText(/基线分支 svn\/base 不见了/)).toBeTruthy()
+    expect(screen.queryByRole('button', { name: '体检基线' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: '重建基线' }))
+    expect(onRebuild).toHaveBeenCalledTimes(1)
+  })
+
+  it('行尾规则也没装：恢复横幅优先，不挂那颗必然报错的迁移按钮', () => {
+    render(
+      <BaselineBanner
+        isSvn
+        sync={null}
+        audit={null}
+        eol={{ ruleInstalled: false, needsMigration: true }}
+        syncState={null}
+        baselineMissing
+        onRebuild={() => {}}
+        onCheck={() => {}}
+        onMigrateEol={() => {}}
+        onSyncAction={() => {}}
+        onSyncOutAction={() => {}}
+        onSvnUpdate={() => {}}
+      />,
+    )
+    expect(screen.getByText(/基线分支 svn\/base 不见了/)).toBeTruthy()
+    expect(document.querySelectorAll('.banner-baseline')).toHaveLength(1)
+  })
+})

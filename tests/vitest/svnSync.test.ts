@@ -5,6 +5,7 @@ import {
   SVN_AUDIT_POLL_MS,
   describeAudit,
   describeEolMigration,
+  describeMissingBaseline,
   describeSync,
   MIGRATE_EOL_WARNING,
   markOnBlur,
@@ -657,5 +658,32 @@ describe('markOnBlur', () => {
         async () => {},
       ),
     ).rejects.toThrow('stat failed')
+  })
+})
+
+// 第 70 条：基线分支丢了之后，界面上原来没有任何出路
+describe('describeMissingBaseline', () => {
+  it('基线丢了且没有同步结论：危险横幅，出口是重建基线', () => {
+    const m = describeMissingBaseline(true, null)
+    expect(m?.tone).toBe('danger')
+    expect(m?.title).toContain('svn/base')
+    expect(m?.actions.map((a) => a.id)).toEqual(['rebuild'])
+  })
+
+  it('没丢不挂', () => {
+    expect(describeMissingBaseline(false, null)).toBeNull()
+  })
+
+  it('已经有新的同步结论（重建成功之后）：不挂，哪怕标记还没清', () => {
+    expect(describeMissingBaseline(true, st({ kind: 'inSync' }, 1, [1]))).toBeNull()
+  })
+
+  it('基线丢了时不挂常驻体检入口：体检同样要读基线，点了只会报错', () => {
+    expect(needsStandaloneCheck(true, null, null, true)).toBe(false)
+    expect(needsStandaloneCheck(true, null, null, false)).toBe(true)
+  })
+
+  it('重建之后有了结论：标记没清，常驻体检入口也要回来', () => {
+    expect(needsStandaloneCheck(true, st({ kind: 'inSync' }, 1, [1]), null, true)).toBe(true)
   })
 })

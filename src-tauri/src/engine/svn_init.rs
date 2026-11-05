@@ -1133,7 +1133,8 @@ pub fn eol_status(repo_root: &str) -> Result<EolStatus> {
 pub struct RebuildReport {
     /// 新记账的 floor：单值时就是那个 N（计划 Task 5 起可能是混合版本，见 `base`）。
     pub node_rev: u64,
-    /// 重建前基线指向谁。
+    /// 重建前基线指向谁。**空串**表示基线丢失后从零录的，没有旧基线
+    /// （[`rebuild_or_recover_baseline`]，第 70 条）。
     pub old_baseline: String,
     /// 重建后指向谁。同一棵 tree 也会产出新的 commit（spec §6.3.1）。
     pub new_baseline: String,
@@ -1538,8 +1539,98 @@ pub fn rebuild_baseline(repo_root: &str) -> Result<RebuildReport> {
             "这个目录不是已初始化的混合仓库，没有基线可重建。",
         ));
     }
-    let cfg = crate::engine::svn_config::read_config(repo_root)?;
     let old_baseline = read_baseline_oid(repo_root)?;
+    rebuild_from(repo_root, Some(old_baseline))
+}
+
+/// 界面上「重建基线」的入口：基线在时同 [`rebuild_baseline`]；**`svn/base` 不存在**时从零录一条
+/// （第 70 条）。
+///
+/// # 为什么要有这条路
+///
+/// 基线被删掉之后，原来在应用里没有出路：重建要先读旧基线，读不到就报错；把备份分支改名回
+/// `svn/base` 又被护栏拒绝（别的分支不许冒充基线）。从零录走的是与重建完全相同的预检和体检，
+/// 只是没有旧指针可比，所以它是唯一一条经过服务器核对的恢复路径。
+///
+/// # 为什么是安全的
+///
+/// - 只认「ref 不存在」：`read_baseline` 把 ref 损坏报成错误，不会把一段真实历史当成没有而覆盖
+/// - 发布以「ref 现在不该存在」为比较条件（`publish_baseline(.., None)` 即 `update-ref` 带零 OID），
+///   检查之后有人建了 `svn/base` 的话发布失败，不会覆盖
+/// - 父提交取 HEAD 历史里最近的一条、同一个 SVN 仓库的基线 commit：工作分支与新基线仍有共同
+///   祖先，后面的「更新」变基才有落脚点。找不到就拒绝，**不录根 commit**（见 [`last_baseline_in_head`]）
+///
+/// 只给命令层用。`migrate_eol` 与 `sync_in` 照旧调 [`rebuild_baseline`]：它们依赖旧基线。
+pub fn rebuild_or_recover_baseline(repo_root: &str) -> Result<RebuildReport> {
+    if detect_repo_kind(repo_root) != RepoKind::SvnHybrid {
+        return Err(GitError::new(
+            "svn_not_hybrid",
+            "这个目录不是已初始化的混合仓库，没有基线可重建。",
+        ));
+    }
+    match crate::engine::svn_baseline::read_baseline(repo_root)? {
+        Some(old) => rebuild_from(repo_root, Some(old)),
+        None => rebuild_from(repo_root, None),
+    }
+}
+
+/// HEAD 历史里最近的一条、**来自同一个 SVN 仓库**的基线 commit，作为从零重建时的父提交。
+///
+/// 找不到就**拒绝**，不退回成没有父提交的根 commit（PR 115 review）：根基线发布之后，以后每次
+/// 重建都以它为父，工作分支与基线永远没有共同祖先，跟进报 `svn_follow_branch_unrelated`，
+/// 而删除、改名基线又被护栏拒绝，用户在应用里就再也没有出路了。
+///
+/// - `--topo-order`：按提交时间排的话，落后分支上更早的基线可能排在前面
+/// - 核对 `repos_root` 与 `uuid`：工作分支历史里可能混着别的 SVN 库导入的 git-svn commit
+/// - `rev-list` 本身失败照样报错，不降级成「没有」（AGENTS.md：探测失败不得当成空集）
+fn last_baseline_in_head(repo_root: &str, recorded: &BaseMap) -> Result<String> {
+    // 两个 --grep 是「或」。只看最近 200 条候选：恢复是罕见操作，但不该在大历史上扫到底
+    let out = run_git(
+        repo_root,
+        &[
+            "rev-list",
+            "--topo-order",
+            "--max-count=200",
+            "--grep=Svn-Base-",
+            "--grep=git-svn-id",
+            "HEAD",
+        ],
+    )
+    .map_err(|e| {
+        GitError::new(
+            "svn_baseline_recover",
+            format!(
+                "基线分支不存在，想从当前分支的历史里找回上一条基线，但读不出历史：{}。\
+                 请先切到工作分支再重建。",
+                e.message.trim()
+            ),
+        )
+    })?;
+    // 提交说明里碰巧提到这几个字的普通 commit 解析不出记账，跳过
+    out.lines()
+        .map(str::trim)
+        .filter(|oid| !oid.is_empty())
+        .find(|oid| {
+            read_base_map(repo_root, oid)
+                .is_ok_and(|m| m.repos_root == recorded.repos_root && m.uuid == recorded.uuid)
+        })
+        .map(str::to_string)
+        .ok_or_else(|| {
+            GitError::new(
+                "svn_baseline_recover",
+                format!(
+                    "基线分支 `{BASELINE_BRANCH}` 不存在，而当前分支最近 200 条历史里也没有来自这个 \
+                     SVN 仓库的基线 commit，没法把新基线接回去。凭空录一条的话，你的分支和基线\
+                     就再也没有共同祖先，之后的跟进、更新都做不了。\
+                     请先切到基于原来基线的工作分支，再重建基线。"
+                ),
+            )
+        })
+}
+
+/// 重建的主体。`old_baseline` 为 `None` 表示基线丢失、从零录（见 [`rebuild_or_recover_baseline`]）。
+fn rebuild_from(repo_root: &str, old_baseline: Option<String>) -> Result<RebuildReport> {
+    let cfg = crate::engine::svn_config::read_config(repo_root)?;
 
     // R1：P1/P3/P4 加上冲突与写锁（它们在重建时同样必须成立——工作副本半路挂着没跑完的
     // update，录出来就是一棵残缺的树）。**不再要求单值**（计划 Task 5）：只提交、不更新是
@@ -1568,19 +1659,25 @@ pub fn rebuild_baseline(repo_root: &str) -> Result<RebuildReport> {
         "基线指针没有改动。",
     )?;
 
-    // R3 + R4：建 commit 并以旧 OID 作比较条件更新指针。父提交仍是旧基线。
+    // R3 + R4：建 commit 并以旧 OID 作比较条件更新指针。父提交仍是旧基线；
+    // 基线丢失时父提交是 HEAD 历史里最近的基线，比较条件是「ref 不存在」
+    let parent = match &old_baseline {
+        Some(old) => old.clone(),
+        None => last_baseline_in_head(repo_root, &rec.map)?,
+    };
     let new_baseline = publish_baseline(
         repo_root,
         &rec.tree,
-        Some(&old_baseline),
+        Some(&parent),
         &rec.map,
-        Some(&old_baseline),
+        old_baseline.as_deref(),
     )?;
 
     // R5 由 `idx` 的 Drop 负责。
     Ok(RebuildReport {
         node_rev: rec.map.floor,
-        old_baseline,
+        // 空串 = 基线丢失后从零录的，没有旧基线（第 70 条）
+        old_baseline: old_baseline.unwrap_or_default(),
         new_baseline,
         health: rec.health,
         base: BaseMapSummary::of(&rec.map),
