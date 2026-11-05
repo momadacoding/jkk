@@ -23,7 +23,7 @@
 use crate::engine::svn_cli::run_svn;
 use crate::engine::svn_scope::WScope;
 use crate::engine::svn_wc::peg_safe;
-use crate::engine::svn_xml::{parse_status_entries, StatusEntry};
+use crate::engine::svn_xml::{parse_info_schedules, parse_status_entries, StatusEntry};
 use crate::error::{GitError, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -121,7 +121,11 @@ pub fn read_dirty(repo_root: &str, targets: &[String]) -> Result<Vec<StatusEntry
             // `normal` + `props == "none"` 才是真干净。只改了属性的节点是
             // `item="normal" props="modified"`（2026-09-14 实测），它**要**进清单：
             // 本函数的定义是「非 pristine」。[`classify`] 再把它判成「不用动」。
-            if e.item == "normal" && e.props == "none" {
+            //
+            // 复制来的干净文件也是 `normal` + `none`，但它**不**等于服务器内容：服务器
+            // rN 上根本没有这个路径（2026-11-06 实测）。丢掉它就等于宣称它干净，
+            // 于是按磁盘内容录进基线。
+            if e.item == "normal" && e.props == "none" && !e.copied {
                 continue;
             }
             // 未版本控制 / ignored 的**目录**：svn 连 `-v` 都不下沉进去，
@@ -143,7 +147,92 @@ pub fn read_dirty(repo_root: &str, targets: &[String]) -> Result<Vec<StatusEntry
     // 下沉进 external），但去重的代价近乎为零，而重复会让 `S` 多出条目。
     dirty.sort_by(|a, b| a.path.cmp(&b.path));
     dirty.dedup_by(|a, b| a.path == b.path);
+    fill_schedules(repo_root, &mut dirty)?;
     Ok(dirty)
+}
+
+/// 一次 `svn info` 最多带多少个路径。Windows 命令行上限约 32K 字符，路径按 200 字符
+/// 估也留足了余量。
+const INFO_BATCH: usize = 50;
+
+/// 给 `missing` + `revision="-1"` 的条目补上 `svn info` 的 schedule（见 [`classify`]）。
+///
+/// 只读、不联网（`svn info` 对工作副本路径读的是 wc.db）。这类条目通常没有，没有时
+/// 不起进程——空参数列表的 `svn info` 会去查当前目录，不能交给它。
+///
+/// # 非 ASCII 路径不能当参数传
+///
+/// svn.exe 按系统 ANSI 代码页取命令行参数，ACP 1252 上中文变成 `?`、目标找不到（见
+/// `svn_health` 的实测记录；本函数的 fixture 测试也在开发机上撞到了）。这类路径改问它
+/// **最深的纯 ASCII 祖先目录**，带 `-R`：输出的 XML 是 UTF-8，与代码页无关，再按路径
+/// 挑出要的那几条。祖先至少是 `read_dirty` 的 target 本身——target 是参数，若含
+/// 非 ASCII 字符，前面的 `svn status` 已经失败了。
+fn fill_schedules(repo_root: &str, dirty: &mut [StatusEntry]) -> Result<()> {
+    let want: Vec<usize> = dirty
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.item == "missing" && e.revision == Some(-1))
+        .map(|(i, _)| i)
+        .collect();
+    let (ascii, wide): (Vec<usize>, Vec<usize>) =
+        want.iter().partition(|&&i| dirty[i].path.is_ascii());
+
+    let mut found: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for chunk in ascii.chunks(INFO_BATCH) {
+        let targets: Vec<String> = chunk.iter().map(|&i| peg_safe(&dirty[i].path)).collect();
+        let mut args: Vec<&str> = vec!["info", "--xml", "--"];
+        args.extend(targets.iter().map(String::as_str));
+        found.extend(info_schedules(repo_root, &args, chunk.len())?);
+    }
+    let ancestors: BTreeSet<String> = wide
+        .iter()
+        .map(|&i| ascii_ancestor(&dirty[i].path))
+        .collect();
+    for anc in &ancestors {
+        let target = peg_safe(anc);
+        let args = ["info", "-R", "--xml", "--", target.as_str()];
+        found.extend(info_schedules(repo_root, &args, wide.len())?);
+    }
+
+    for i in want {
+        // 没对上的留 `None`：classify 把它当成「说不清」并停下，而不是猜
+        dirty[i].schedule = found.get(&dirty[i].path).cloned().flatten();
+    }
+    Ok(())
+}
+
+/// 跑一次 `svn info --xml` 并取出 schedule。失败时说清是哪一步：这个错误会一路冒到
+/// 初始化 / 跟进 / 体检的界面上，svn 的原话单独看不出它和录基线有什么关系。
+fn info_schedules(
+    repo_root: &str,
+    args: &[&str],
+    count: usize,
+) -> Result<Vec<(String, Option<String>)>> {
+    let wrap = |e: GitError| {
+        GitError::new(
+            "svn_dirty_info_failed",
+            format!(
+                "有 {count} 个文件从磁盘上丢了、svn 记录它们还没提交过。为了分清它们是新加的\
+                 还是顶替了服务器上的文件，要用 svn info 查一下，这一步失败了：{}",
+                e.message
+            ),
+        )
+    };
+    let xml = run_svn(repo_root, args).map_err(wrap)?;
+    parse_info_schedules(&xml).map_err(wrap)
+}
+
+/// 路径里从头开始、每一段都是纯 ASCII 的最长前缀（不含最后一段——那是要问的文件自己）。
+/// 一段都没有时退到 `.`。
+fn ascii_ancestor(path: &str) -> String {
+    let segs: Vec<&str> = path.split('/').collect();
+    let parents = &segs[..segs.len().saturating_sub(1)];
+    let n = parents.iter().take_while(|s| s.is_ascii()).count();
+    if n == 0 {
+        ".".to_string()
+    } else {
+        parents[..n].join("/")
+    }
 }
 
 /// 这个相对路径在磁盘上**是不是一个目录**——junction / 符号链接**跟随**。
@@ -264,6 +353,10 @@ fn walk_expand(
                 item: item.to_string(),
                 props: "none".to_string(),
                 wc_locked: false,
+                // 未纳入版本控制的路径 svn 不给 revision，也不可能是复制来的
+                revision: None,
+                copied: false,
+                schedule: None,
             });
         }
     }
@@ -300,8 +393,45 @@ pub enum Fix {
 /// 返回值同时就是体检判据里的 `S`（§6.8.7），所以它必须**恰好**是会被改写的那批
 /// 路径：多一条，`D \ S` 就小一分，判据被悄悄削弱，而不会有任何测试变红。
 /// `BTreeMap` 保证有序且去重。
+///
+/// # 「服务器上有没有」不能只看 item
+///
+/// 2026-11-06 在 fixture 上实测，下面几种 item 看着像「服务器上有」，其实没有，
+/// 而 `svn cat -r BASE` 要么报 E200009（录制中止），要么**成功返回复制源的内容**
+/// （静默录出假基线）：
+///
+/// | 工作副本里做了什么 | item | revision | copied |
+/// |---|---|---|---|
+/// | `svn add` 后又从磁盘删掉 | `missing` | `-1` | — |
+/// | `svn cp` / `svn mv` 出来的目录里的干净文件 | `normal` | 没有 | `true` |
+/// | 同上，改过的文件 | `modified` | 没有 | `true` |
+/// | 同上，从磁盘删掉的文件 / 整个子目录 | `missing` | `-1` | — （标记消失） |
+/// | `svn rm X; svn cp Y X` | `replaced` | 没有 | `true` |
+///
+/// 所以先按「所在的复制子树」判（见 [`copy_root`]），再落到按 item 的映射。
+/// 最后一行是另一回事：服务器上**有** `X` 的旧内容，但离线取到的是 `Y`，只能停下。
+///
+/// # `missing` + `revision="-1"` 要看 `schedule`
+///
+/// 不在复制子树里的这种条目有三种来源，`svn status` 分不开（独立 review 实测），
+/// 只有 `svn info` 的 `<schedule>` 分得开，由 [`read_dirty`] 补进 [`StatusEntry::schedule`]：
+///
+/// | 工作副本里做了什么 | schedule | 服务器 rN 上 | 怎么办 |
+/// |---|---|---|---|
+/// | `svn add` 后又从磁盘删掉 | `add` | 没有 | Drop |
+/// | `svn rm X` 后同名 `svn add`（或 `svn cp`），再从磁盘删掉 | `replace` | **有**旧内容 | 停下 |
+/// | 其他（没查到 / 没见过的值） | — | 说不清 | 停下 |
+///
+/// 只有正面证据（`add`）才摘：误摘的代价是基线静默少一个服务器上的文件，比报错贵。
+/// 也绝不落回 TakeBase——`revision="-1"` 的节点 `svn cat -r BASE` 要么报 E200009，
+/// 要么在复制子树里返回复制源的内容。
 pub fn classify(entries: &[StatusEntry]) -> Result<BTreeMap<String, Fix>> {
     let mut out: BTreeMap<String, Fix> = BTreeMap::new();
+    // 路径（已归一）→ 条目。用来顺着祖先链找每个节点所在复制子树的根
+    let by_path: BTreeMap<String, &StatusEntry> = entries
+        .iter()
+        .map(|e| (e.path.replace('\\', "/"), e))
+        .collect();
 
     for e in entries {
         let path = e.path.replace('\\', "/");
@@ -311,6 +441,35 @@ pub fn classify(entries: &[StatusEntry]) -> Result<BTreeMap<String, Fix>> {
                 "脏清单里出现了空路径。它会变成一条空 pathspec 的 git 调用，\
                  而本仓库已经因为空 pathspec 误伤过一次（AGENTS.md §6.2）。",
             ));
+        }
+
+        // 只对受版本控制的节点问「服务器上有没有」。未版本控制 / ignored 本来就是 Drop，
+        // external 标记与 obstructed 交给下面原有的分支。
+        if matches!(
+            e.item.as_str(),
+            "modified" | "replaced" | "conflicted" | "deleted" | "missing" | "normal" | "added"
+        ) {
+            if let Some((root, root_item)) = copy_root(&path, &by_path) {
+                match root_item {
+                    // 复制根是新加的：整棵子树服务器 rN 上都没有
+                    "added" => {
+                        out.insert(path, Fix::Drop);
+                        continue;
+                    }
+                    "replaced" => return Err(copied_over_server_content(&path, &root)),
+                    _ => return Err(copy_origin_unknown(&path, &root, root_item)),
+                }
+            }
+            if e.item == "missing" && e.revision == Some(-1) {
+                match e.schedule.as_deref() {
+                    Some("add") => {
+                        out.insert(path, Fix::Drop);
+                        continue;
+                    }
+                    Some("replace") => return Err(replaced_then_missing(&path)),
+                    other => return Err(missing_uncommitted_unknown(&path, other)),
+                }
+            }
         }
 
         let fix = match e.item.as_str() {
@@ -364,4 +523,123 @@ pub fn classify(entries: &[StatusEntry]) -> Result<BTreeMap<String, Fix>> {
     }
 
     Ok(out)
+}
+
+/// `path` 所在复制子树的根（路径与 item）：从 `path` 自己往上走，带 `copied` 的记为
+/// 候选，取链上**最上层**那个。
+///
+/// # 链怎么走
+///
+/// - 带 `copied` 的节点：记为候选，继续往上。取最上层而不是最近的：复制出来的目录里
+///   再 `svn cp` 一份，决定性的是最外层那次复制
+/// - `missing` + `revision="-1"`：**穿过去**。复制子树里从磁盘删掉的文件、整个子目录
+///   都会丢掉 copied 标记、只剩这个形状（实测），它们不能把链截断——否则
+///   `C/sub/x.cs` 找不到 `C`，而 `svn cat -r BASE` 会返回复制源的内容
+/// - 其他节点，或者清单里没有（干净的、未复制的节点被 [`read_dirty`] 滤掉了）：**停**。
+///   这是 external 的边界：带 external 的目录被复制后，external 里的节点没有 copied
+///   标记、服务器上（external 的源）也确实有，不能被外面那次复制吞进去（独立 review 实测）
+///
+/// 被穿过的**祖先**若带着 schedule，它本身就可能是复制根：整个复制目录从磁盘删掉后
+/// （`svn mv E M; rm -rf M` 很常见），根是 `missing -1` + `add`、子节点是 `missing -1` +
+/// `normal`（独立 review 实测）。`add` 记成 added 的根，`replace` 记成 replaced 的根。
+/// 只看祖先、不看自己：自己是 `missing -1` 的情况由 [`classify`] 按 schedule 单独判，
+/// 报错文案更准。
+///
+/// 按路径段走，不按字符串前缀：`Code/B` 是复制来的，不代表 `Code/Bar.cs` 也是。
+fn copy_root<'a>(
+    path: &str,
+    by_path: &BTreeMap<String, &'a StatusEntry>,
+) -> Option<(String, &'a str)> {
+    let mut root: Option<(String, &'a str)> = None;
+    let mut cur = path;
+    loop {
+        match by_path.get(cur) {
+            Some(e) if e.copied => root = Some((cur.to_string(), e.item.as_str())),
+            Some(e) if e.item == "missing" && e.revision == Some(-1) => {
+                if cur != path {
+                    match e.schedule.as_deref() {
+                        Some("add") => root = Some((cur.to_string(), "added")),
+                        Some("replace") => root = Some((cur.to_string(), "replaced")),
+                        _ => {}
+                    }
+                }
+            }
+            _ => return root,
+        }
+        cur = &cur[..cur.rfind('/')?];
+    }
+}
+
+fn under(path: &str, root: &str) -> String {
+    if root == path {
+        format!("`{path}`")
+    } else {
+        format!("`{path}`（它在 `{root}` 底下）")
+    }
+}
+
+/// 复制根**顶替了服务器上已有的路径**（`svn rm X; svn cp Y X`）。
+///
+/// 服务器 rN 上这个位置有旧内容，但 `svn cat -r BASE` 给的是复制源 `Y` 的内容（实测），
+/// 离线拿不到旧内容；子树里哪些路径服务器上也有，同样判断不了。按「服务器上没有」
+/// 摘掉会让基线少文件，按 BASE 取会录进复制源的内容——两条都是假基线，所以停下。
+fn copied_over_server_content(path: &str, root: &str) -> GitError {
+    GitError::new(
+        "svn_dirty_replaced_with_history",
+        format!(
+            "{}是复制过来、顶替了服务器上原有内容的（svn status 里 `{root}` 是带复制历史的 \
+             replaced，典型操作是先 `svn rm` 再 `svn cp` / `svn mv` 到同一个位置）。\
+             服务器上这个位置的旧内容在本地取不到，svn 只给得出复制源的内容，\
+             录进基线就会把复制源当成服务器内容。\n\
+             请先在 TortoiseSVN 里把这次替换提交，或者对 `{root}` 做「还原」，然后再试。\
+             本应用什么都没改。",
+            under(path, root)
+        ),
+    )
+}
+
+/// 链上最上层的复制节点既不是 added 也不是 replaced：真正的复制起点不在本次检查的
+/// 范围里（典型是白名单根本身就在一个复制出来的目录里，独立 review 实测），判断不了
+/// 服务器上有没有这些路径。
+fn copy_origin_unknown(path: &str, root: &str, root_item: &str) -> GitError {
+    GitError::new(
+        "svn_dirty_copy_origin_unknown",
+        format!(
+            "{}是复制过来的，但往上找到的 `{root}`（svn status 里是 `{root_item}`）也是复制来的，\
+             真正的复制起点在白名单之外，看不到。服务器上这些路径有没有、是什么，在本地判断不了。\n\
+             请先在 TortoiseSVN 里把这次复制提交，然后再试。本应用什么都没改。",
+            under(path, root)
+        ),
+    )
+}
+
+/// `svn rm X` 后在同一位置新加（或复制）了文件，之后又从磁盘删掉：服务器 rN 上 `X`
+/// 有旧内容，本地却只剩一个「待替换、文件丢失」的记录，拿不到旧内容。
+fn replaced_then_missing(path: &str) -> GitError {
+    GitError::new(
+        "svn_dirty_replaced_missing",
+        format!(
+            "`{path}` 在 svn 里先删掉、又在同一位置新加了文件（替换），之后又从磁盘上删掉了。\
+             服务器上这个位置有旧内容，但本地取不到它。\n\
+             对 `{path}` 做「还原」可以恢复服务器上的那一版；如果新加的文件是有意删掉的，\
+             还原之后再在 TortoiseSVN 里删除它即可。本应用什么都没改。"
+        ),
+    )
+}
+
+/// `missing` + `revision="-1"`，但 `svn info` 没说清它是新加的还是替换的。
+fn missing_uncommitted_unknown(path: &str, schedule: Option<&str>) -> GitError {
+    let said = match schedule {
+        Some(s) => format!("svn info 说它的 schedule 是 `{s}`"),
+        None => "没查到它的 schedule".to_string(),
+    };
+    GitError::new(
+        "svn_dirty_missing_unresolved",
+        format!(
+            "`{path}` 从磁盘上丢了，svn 记录它还没提交过，但{said}，判断不了服务器上有没有它。\
+             摘掉可能让基线少一个服务器上的文件，取回又取不到，所以停下。\n\
+             请在 TortoiseSVN 里对它做「还原」，或者确认是新加的文件后撤销添加，然后再试。\
+             本应用什么都没改。"
+        ),
+    )
 }

@@ -11,21 +11,37 @@ mod svn_fixtures;
 use app_lib::engine::svn_dirty::{classify, Fix};
 use app_lib::engine::svn_xml::StatusEntry;
 
+/// 一个**已提交过**的节点（`revision="1"`、不是复制来的）。
 fn entry(path: &str, item: &str) -> StatusEntry {
+    node(path, item, Some(1), false)
+}
+
+fn entry_with_props(path: &str, item: &str, props: &str) -> StatusEntry {
+    StatusEntry {
+        props: props.into(),
+        ..entry(path, item)
+    }
+}
+
+/// `revision` / `copied` 照 `svn status -v --xml` 的原样给：复制来的节点没有
+/// `revision` 属性（`None`），`svn add` 还没提交的是 `Some(-1)`。
+fn node(path: &str, item: &str, revision: Option<i64>, copied: bool) -> StatusEntry {
     StatusEntry {
         path: path.into(),
         item: item.into(),
         props: "none".into(),
         wc_locked: false,
+        revision,
+        copied,
+        schedule: None,
     }
 }
 
-fn entry_with_props(path: &str, item: &str, props: &str) -> StatusEntry {
+/// `missing` + `revision="-1"`，带上 `read_dirty` 从 `svn info` 补来的 schedule。
+fn missing_uncommitted(path: &str, schedule: Option<&str>) -> StatusEntry {
     StatusEntry {
-        path: path.into(),
-        item: item.into(),
-        props: props.into(),
-        wc_locked: false,
+        schedule: schedule.map(str::to_string),
+        ..node(path, "missing", Some(-1), false)
     }
 }
 
@@ -133,6 +149,355 @@ fn backslashes_are_normalized_so_the_keys_match_git_paths() {
 // ---------------------------------------------------------------------------
 // `read_dirty` 的磁盘遍历：跟随 junction，但必须停得下来
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// 「服务器 rN 上有没有这个路径」：只看 item 说不清的那几种（2026-11-06 实测形状）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_file_added_then_deleted_from_disk_is_dropped_not_fetched() {
+    // 2026-11-05 真实工作副本上的形态：整个目录 `svn add`、没提交，里面的文件又从
+    // 磁盘上删掉了。它与「已提交后丢失」同是 `missing`，只有 `revision="-1"` 不同。
+    // 当成 TakeBase 的话 `svn cat -r BASE` 报 E200009，录制整个中止，重试也没用。
+    // `svn info` 说它们是 `add`（实测），这是摘掉它们的唯一依据。
+    let got = classify(&[
+        node("Code/New", "added", Some(-1), false),
+        missing_uncommitted("Code/New/main.cs", Some("add")),
+        missing_uncommitted("Code/New/tests", Some("add")),
+        missing_uncommitted("Code/New/tests/t.cs", Some("add")),
+    ])
+    .unwrap();
+    for p in ["Code/New/main.cs", "Code/New/tests/t.cs"] {
+        assert_eq!(got.get(p), Some(&Fix::Drop), "{p}：实际整份结果 {got:?}");
+    }
+}
+
+#[test]
+fn a_replaced_file_deleted_from_disk_is_refused_not_dropped() {
+    // 独立 review 实测：`svn rm A.cs` 后同名 `svn add`（或 `svn cp`），再从磁盘删掉，
+    // status 也是 `missing revision="-1"`，与上一条一模一样；只有 `svn info` 的
+    // schedule 是 `replace`。服务器上**有** A.cs，摘掉就是基线静默少一个文件。
+    let err = classify(&[missing_uncommitted("Code/A.cs", Some("replace"))]).unwrap_err();
+    assert_eq!(
+        err.code, "svn_dirty_replaced_missing",
+        "实际：{}",
+        err.message
+    );
+    assert!(err.message.contains("Code/A.cs"), "实际：{}", err.message);
+}
+
+#[test]
+fn an_uncommitted_missing_file_without_a_known_schedule_is_refused() {
+    // 没查到 schedule、或是没见过的值：说不清服务器上有没有。只有正面证据才摘，
+    // 也不落回 TakeBase（`revision="-1"` 的节点取不到服务器内容）。
+    for schedule in [None, Some("normal"), Some("delete")] {
+        let err = classify(&[missing_uncommitted("Code/A.cs", schedule)]).unwrap_err();
+        assert_eq!(
+            err.code, "svn_dirty_missing_unresolved",
+            "schedule={schedule:?}：{}",
+            err.message
+        );
+    }
+}
+
+#[test]
+fn a_committed_file_deleted_from_disk_is_still_fetched_from_the_server() {
+    // 反面：上一条的修法不能把真正「服务器上有、本地删了」的文件也摘掉，
+    // 那会让基线悄悄少一个文件。
+    let got = classify(&[node("Code/A.cs", "missing", Some(1), false)]).unwrap();
+    assert_eq!(got.get("Code/A.cs"), Some(&Fix::TakeBase), "实际：{got:?}");
+}
+
+#[test]
+fn every_node_under_a_copied_directory_is_dropped() {
+    // `svn cp Code/A Code/B`（`svn mv` 的目标一样）：服务器 rN 上根本没有 `Code/B`。
+    //
+    // 修之前两条路都录出假基线、且没有任何报错：
+    // - 干净的子文件是 `normal`，被当成「和服务器一样」按磁盘录进去
+    // - 改过的子文件 `svn cat -r BASE` **成功**，拿到的是复制源 `Code/A` 的内容
+    // 删掉的子文件 copied 标记跟着消失，只剩 `revision="-1"`（实测）。
+    let got = classify(&[
+        node("Code/B", "added", None, true),
+        node("Code/B/clean.cs", "normal", None, true),
+        node("Code/B/edited.cs", "modified", None, true),
+        node("Code/B/gone.cs", "missing", Some(-1), false),
+        node("Code/B/removed.cs", "deleted", None, true),
+        // 中间目录 `svn status -v` 一定会列出来（`normal copied`），read_dirty 也保留它
+        node("Code/B/Sub", "normal", None, true),
+        node("Code/B/Sub/deep.cs", "normal", None, true),
+    ])
+    .unwrap();
+    for p in [
+        "Code/B/clean.cs",
+        "Code/B/edited.cs",
+        "Code/B/gone.cs",
+        "Code/B/removed.cs",
+        "Code/B/Sub/deep.cs",
+    ] {
+        assert_eq!(got.get(p), Some(&Fix::Drop), "{p}：实际整份结果 {got:?}");
+    }
+}
+
+#[test]
+fn a_copied_file_on_its_own_is_dropped() {
+    // `svn cp Code/A.cs Code/C.cs`：复制根自己就是文件。
+    let got = classify(&[node("Code/C.cs", "added", None, true)]).unwrap();
+    assert_eq!(got.get("Code/C.cs"), Some(&Fix::Drop), "实际：{got:?}");
+}
+
+#[test]
+fn a_replaced_node_inside_a_copied_directory_is_dropped_too() {
+    // 实测：复制源里有一个 replaced 的文件，复制出来的那份也是 `replaced copied`。
+    // 它的父目录服务器上就没有，谈不上「服务器上的旧内容」。
+    let got = classify(&[
+        node("Code/B", "added", None, true),
+        node("Code/B/x.cs", "replaced", None, true),
+    ])
+    .unwrap();
+    assert_eq!(got.get("Code/B/x.cs"), Some(&Fix::Drop), "实际：{got:?}");
+}
+
+#[test]
+fn a_file_replaced_by_a_copy_is_refused() {
+    // `svn rm Code/A.cs; svn cp Code/B.cs Code/A.cs`：服务器 rN 上 `Code/A.cs` 是**旧**
+    // 内容，而 `svn cat -r BASE` 返回的是复制源 `Code/B.cs`（实测）。离线拿不到旧内容，
+    // 录下去就是假基线，只能停下来让用户先提交或还原。
+    let err = classify(&[node("Code/A.cs", "replaced", None, true)]).unwrap_err();
+    assert_eq!(
+        err.code, "svn_dirty_replaced_with_history",
+        "实际：{}",
+        err.message
+    );
+    assert!(
+        err.message.contains("Code/A.cs"),
+        "要点名是哪个路径：{}",
+        err.message
+    );
+}
+
+#[test]
+fn everything_under_a_directory_replaced_by_a_copy_is_refused() {
+    // 复制根是 replaced 的目录：服务器上这个目录有旧内容，里面哪些路径服务器上也有，
+    // 离线判断不了。
+    let err = classify(&[
+        node("Code/D", "replaced", None, true),
+        node("Code/D/x.cs", "normal", None, true),
+    ])
+    .unwrap_err();
+    assert_eq!(
+        err.code, "svn_dirty_replaced_with_history",
+        "实际：{}",
+        err.message
+    );
+}
+
+#[test]
+fn a_replaced_node_without_history_keeps_its_current_classification() {
+    // `svn rm` 后同名 `svn add`（不带历史）：`revision="1"`、没有 copied。这一种的
+    // 取数来源另有待决策（分析文档 6.2），这次不改它的行为。
+    let got = classify(&[node("Code/A.cs", "replaced", Some(1), false)]).unwrap();
+    assert_eq!(got.get("Code/A.cs"), Some(&Fix::TakeBase), "实际：{got:?}");
+}
+
+#[test]
+fn a_copied_directory_deleted_from_disk_as_a_whole_is_dropped() {
+    // 独立 review 实测：`svn cp E C1; rm -rf C1`（或 `svn mv E M1` 后在资源管理器里删掉
+    // 目标）。整棵子树都是 `missing revision="-1"`、都没有 copied 标记；根的 schedule 是
+    // `add`，子节点是 `normal`。根要被认成 added 的复制根，子节点才不会因 schedule 说不清
+    // 而误停。
+    let got = classify(&[
+        missing_uncommitted("Code/C1", Some("add")),
+        missing_uncommitted("Code/C1/x.cs", Some("normal")),
+        missing_uncommitted("Code/C1/sub", Some("normal")),
+        missing_uncommitted("Code/C1/sub/y.cs", Some("normal")),
+    ])
+    .unwrap();
+    for p in ["Code/C1/x.cs", "Code/C1/sub/y.cs"] {
+        assert_eq!(got.get(p), Some(&Fix::Drop), "{p}：实际 {got:?}");
+    }
+}
+
+#[test]
+fn a_directory_replaced_by_a_copy_and_deleted_from_disk_is_refused() {
+    // 同形，但根是 `svn rm D; svn cp E D` 后删掉的：schedule 是 `replace`，服务器上 D 有旧内容。
+    // `D` 自己报「替换后丢失」，子节点报「复制顶替」，先撞上哪条取决于顺序——两条都是拒绝。
+    let err = classify(&[
+        missing_uncommitted("Code/D", Some("replace")),
+        missing_uncommitted("Code/D/x.cs", Some("normal")),
+    ])
+    .unwrap_err();
+    assert!(
+        matches!(
+            err.code.as_str(),
+            "svn_dirty_replaced_missing" | "svn_dirty_replaced_with_history"
+        ),
+        "实际：{} {}",
+        err.code,
+        err.message
+    );
+}
+
+#[test]
+fn a_whole_subdirectory_deleted_inside_a_copied_directory_is_dropped() {
+    // 实测：`svn cp A C; rm -rf C/sub` 后，`C/sub` 与 `C/sub/x.cs` 都是
+    // `missing revision="-1"`、都丢了 copied 标记，`svn info` 的 schedule 是 `normal`，
+    // 而 `svn cat -r BASE C/sub/x.cs` **成功**返回复制源的内容。祖先链必须穿过这两层
+    // 找到 `C`，否则要么静默录进复制源内容，要么因 schedule 说不清而误停。
+    let got = classify(&[
+        node("Code/C", "added", None, true),
+        missing_uncommitted("Code/C/sub", Some("normal")),
+        missing_uncommitted("Code/C/sub/x.cs", Some("normal")),
+    ])
+    .unwrap();
+    assert_eq!(
+        got.get("Code/C/sub/x.cs"),
+        Some(&Fix::Drop),
+        "实际：{got:?}"
+    );
+}
+
+#[test]
+fn an_external_inside_a_copied_directory_is_not_swallowed_by_the_copy() {
+    // 独立 review 实测：带 `svn:externals` 的目录被 `svn cp` 后再 `svn up`，external
+    // 拉进复制目录。external 里改过的文件是 `modified revision="2"`、没有 copied 标记，
+    // 服务器上（external 的源）确实有它。external 根自己是干净的、不在清单里，
+    // 它就是边界——越过它找到外面的复制根，会把这个文件误摘出基线。
+    let got = classify(&[
+        node("Proj2", "added", None, true),
+        node("Proj2/Code/ext/l.cs", "modified", Some(2), false),
+    ])
+    .unwrap();
+    assert_eq!(
+        got.get("Proj2/Code/ext/l.cs"),
+        Some(&Fix::TakeBase),
+        "实际：{got:?}"
+    );
+}
+
+#[test]
+fn a_copy_whose_origin_lies_above_the_whitelist_is_refused_with_its_own_reason() {
+    // 白名单根 `Proj2/Code` 自己是 `normal copied`，真正的复制起点 `Proj2` 不在本次
+    // 检查的清单里。既不能当新加的摘掉，也不该被说成「先 svn rm 再 svn cp」。
+    let err = classify(&[
+        node("Proj2/Code", "normal", None, true),
+        node("Proj2/Code/x.cs", "modified", None, true),
+    ])
+    .unwrap_err();
+    assert_eq!(
+        err.code, "svn_dirty_copy_origin_unknown",
+        "实际：{}",
+        err.message
+    );
+}
+
+#[test]
+fn a_sibling_whose_name_extends_a_copied_directory_is_not_mistaken_for_its_child() {
+    // 祖先判断按路径段，不按字符串前缀：`Code/B` 被复制，不代表 `Code/Bar.cs` 也是。
+    let got = classify(&[
+        node("Code/B", "added", None, true),
+        node("Code/Bar.cs", "missing", Some(1), false),
+    ])
+    .unwrap();
+    assert_eq!(
+        got.get("Code/Bar.cs"),
+        Some(&Fix::TakeBase),
+        "实际：{got:?}"
+    );
+}
+
+#[test]
+fn read_dirty_keeps_clean_files_under_a_copied_directory() {
+    // `normal` + `props=none` 本来会被当成干净条目丢掉，但复制来的干净文件服务器上
+    // 没有，丢掉就等于宣称它「和服务器一样」。
+    let fx = svn_fixtures::svn_repo();
+    let wc = fx.wc();
+    svn_fixtures::svn_cmd(&wc, &["mkdir", "Code/Lib"]);
+    std::fs::write(wc.join("Code/Lib/L.cs"), "l\n").unwrap();
+    svn_fixtures::svn_cmd(&wc, &["add", "Code/Lib/L.cs"]);
+    svn_fixtures::svn_cmd(&wc, &["commit", "-m", "lib", "--non-interactive"]);
+    svn_fixtures::svn_cmd(&wc, &["update", "--non-interactive"]);
+    svn_fixtures::svn_cmd(&wc, &["copy", "Code/Lib", "Code/Lib2"]);
+
+    let dirty =
+        app_lib::engine::svn_dirty::read_dirty(&fx.wc_str(), &["Code/".to_string()]).unwrap();
+    let copied = dirty
+        .iter()
+        .find(|e| e.path == "Code/Lib2/L.cs")
+        .unwrap_or_else(|| panic!("复制来的干净文件被当成干净条目丢掉了：{dirty:?}"));
+    assert_eq!(copied.item, "normal");
+    assert!(copied.copied, "实际：{copied:?}");
+    assert!(
+        !dirty.iter().any(|e| e.path == "Code/Lib/L.cs"),
+        "复制源本身是真干净的，不该进清单：{dirty:?}"
+    );
+}
+
+#[test]
+fn read_dirty_matches_the_schedule_back_to_a_non_ascii_path() {
+    // `svn info` 输出的 path 要与 status 的 path 对得上，否则 schedule 留空、录制被拦。
+    // 中文路径是本项目的高发缺陷区（开发机线程代码页 936），必须走真 svn 实测。
+    let fx = svn_fixtures::svn_repo();
+    let wc = fx.wc();
+    std::fs::create_dir_all(wc.join("Code/新建 目录")).unwrap();
+    std::fs::write(wc.join("Code/新建 目录/类@名.cs"), "n\n").unwrap();
+    // 参数只给 ASCII：svn.exe 按系统代码页取参数，中文路径传不进去（ACP 1252 上实测
+    // 变成 `?`）。`--force` 让它自己递归加上 `Code` 底下未版本控制的项
+    svn_fixtures::svn_cmd(&wc, &["add", "--force", "Code"]);
+    std::fs::remove_file(wc.join("Code/新建 目录/类@名.cs")).unwrap();
+
+    let dirty =
+        app_lib::engine::svn_dirty::read_dirty(&fx.wc_str(), &["Code/".to_string()]).unwrap();
+    let e = dirty
+        .iter()
+        .find(|e| e.path == "Code/新建 目录/类@名.cs")
+        .unwrap_or_else(|| panic!("清单里没有中文路径的条目：{dirty:?}"));
+    assert_eq!(
+        (e.item.as_str(), e.revision, e.schedule.as_deref()),
+        ("missing", Some(-1), Some("add"))
+    );
+}
+
+#[test]
+fn read_dirty_tells_an_added_missing_file_from_a_replaced_one() {
+    // 两条在 svn status 里一模一样（`missing revision="-1"`），schedule 必须由
+    // read_dirty 从真 `svn info` 里补出来，否则 classify 只能一律停下。
+    let fx = svn_fixtures::svn_repo();
+    let wc = fx.wc();
+    std::fs::create_dir_all(wc.join("Code/New")).unwrap();
+    std::fs::write(wc.join("Code/New/n.cs"), "n\n").unwrap();
+    svn_fixtures::svn_cmd(&wc, &["add", "Code/New"]);
+    std::fs::remove_file(wc.join("Code/New/n.cs")).unwrap();
+    svn_fixtures::svn_cmd(&wc, &["rm", "Code/A.cs"]);
+    std::fs::write(wc.join("Code/A.cs"), "new\n").unwrap();
+    svn_fixtures::svn_cmd(&wc, &["add", "Code/A.cs"]);
+    std::fs::remove_file(wc.join("Code/A.cs")).unwrap();
+
+    let dirty =
+        app_lib::engine::svn_dirty::read_dirty(&fx.wc_str(), &["Code/".to_string()]).unwrap();
+    let shape = |p: &str| {
+        let e = dirty
+            .iter()
+            .find(|e| e.path == p)
+            .unwrap_or_else(|| panic!("清单里没有 {p}：{dirty:?}"));
+        (e.item.clone(), e.revision, e.schedule.clone())
+    };
+    assert_eq!(
+        shape("Code/New/n.cs"),
+        ("missing".to_string(), Some(-1), Some("add".to_string()))
+    );
+    assert_eq!(
+        shape("Code/A.cs"),
+        ("missing".to_string(), Some(-1), Some("replace".to_string()))
+    );
+    // 其余条目不额外起 svn info
+    assert!(
+        dirty
+            .iter()
+            .filter(|e| !(e.item == "missing" && e.revision == Some(-1)))
+            .all(|e| e.schedule.is_none()),
+        "实际：{dirty:?}"
+    );
+}
 
 #[cfg(windows)]
 #[test]

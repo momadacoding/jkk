@@ -1870,6 +1870,249 @@ fn a_directory_deleted_with_svn_delete_is_taken_back_from_the_server() {
     );
 }
 
+/// 在 `Code/Lib` 下提交 `L.cs` / `M.cs` / `N.cs` 三个文件，工作副本更新到 r2。
+fn svn_repo_with_lib() -> SvnFixture {
+    let fx = svn_repo();
+    let wc = fx.wc();
+    svn(&wc, &["mkdir", "Code/Lib"]);
+    for (name, body) in [("L.cs", "l\n"), ("M.cs", "m\n"), ("N.cs", "n\n")] {
+        std::fs::write(wc.join("Code/Lib").join(name), body).unwrap();
+        svn(&wc, &["add", &format!("Code/Lib/{name}")]);
+    }
+    svn(&wc, &["commit", "-m", "lib", "--non-interactive"]);
+    svn(&wc, &["update", "--non-interactive"]);
+    fx
+}
+
+fn baseline_files(fx: &SvnFixture) -> String {
+    run_git(
+        &fx.wc_str(),
+        &["ls-tree", "-r", "--name-only", "refs/heads/svn/base"],
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_file_added_then_deleted_from_disk_does_not_abort_init() {
+    // 2026-11-05 用户报告的形态（跟进被拒、重试无效）：整个目录 `svn add`、没提交，
+    // 里面的文件又从磁盘上删掉了。svn status 是 `missing`，服务器上从来没有它。
+    let fx = svn_repo();
+    let wc = fx.wc();
+    std::fs::create_dir_all(wc.join("Code/New/tests")).unwrap();
+    std::fs::write(wc.join("Code/New/main.cs"), "m\n").unwrap();
+    std::fs::write(wc.join("Code/New/tests/t.cs"), "t\n").unwrap();
+    std::fs::write(wc.join("Code/New/Keep.cs"), "k\n").unwrap();
+    svn(&wc, &["add", "Code/New"]);
+    std::fs::remove_file(wc.join("Code/New/main.cs")).unwrap();
+    std::fs::remove_dir_all(wc.join("Code/New/tests")).unwrap();
+
+    let report = init_hybrid(&req(&fx)).expect("新加后又删掉的文件不该让录制中止");
+
+    let listed = baseline_files(&fx);
+    assert!(
+        !listed.contains("Code/New/"),
+        "服务器上没有的进了基线：\n{listed}"
+    );
+    assert!(
+        listed.contains("Code/A.cs"),
+        "服务器上有的必须还在：\n{listed}"
+    );
+    assert!(
+        matches!(report.health, Health::Verified { .. }),
+        "实际：{:?}",
+        report.health
+    );
+}
+
+#[test]
+fn rebuild_also_gets_past_a_file_added_then_deleted_from_disk() {
+    // 跟进与重建走的是「从 HEAD 树起步」那条录制路径，与初始化的空索引起步不同，
+    // 两条都要钉住。
+    let fx = svn_repo();
+    init_hybrid(&req(&fx)).unwrap();
+    let wc = fx.wc();
+    std::fs::create_dir_all(wc.join("Code/New")).unwrap();
+    std::fs::write(wc.join("Code/New/main.cs"), "m\n").unwrap();
+    svn(&wc, &["add", "Code/New"]);
+    std::fs::remove_file(wc.join("Code/New/main.cs")).unwrap();
+
+    rebuild_baseline(&fx.wc_str()).expect("新加后又删掉的文件不该让重建中止");
+    let listed = baseline_files(&fx);
+    assert!(!listed.contains("Code/New/"), "实际：\n{listed}");
+}
+
+#[test]
+fn a_copied_directory_never_enters_the_baseline() {
+    // `svn cp Code/Lib Code/Lib2`：服务器 r2 上没有 `Code/Lib2`。修之前这棵子树
+    // 全部录进基线、体检和纳入集合核对全绿——干净的子文件按磁盘录，改过的子文件
+    // 录的是**复制源**的内容，删掉的子文件 `svn cat -r BASE` 同样成功。
+    let fx = svn_repo_with_lib();
+    let wc = fx.wc();
+    svn(&wc, &["copy", "Code/Lib", "Code/Lib2"]);
+    std::fs::write(wc.join("Code/Lib2/L.cs"), "edited\n").unwrap();
+    std::fs::remove_file(wc.join("Code/Lib2/N.cs")).unwrap();
+
+    let report = init_hybrid(&req(&fx)).unwrap();
+
+    let listed = baseline_files(&fx);
+    assert!(
+        !listed.contains("Code/Lib2/"),
+        "复制出来的目录进了基线，服务器上根本没有它：\n{listed}"
+    );
+    for p in ["Code/Lib/L.cs", "Code/Lib/M.cs", "Code/Lib/N.cs"] {
+        assert!(listed.contains(p), "复制源 {p} 必须还在：\n{listed}");
+    }
+    assert!(
+        matches!(report.health, Health::Verified { .. }),
+        "实际：{:?}",
+        report.health
+    );
+    // 磁盘只读
+    assert_eq!(
+        std::fs::read_to_string(wc.join("Code/Lib2/L.cs")).unwrap(),
+        "edited\n"
+    );
+}
+
+#[test]
+fn the_single_revision_recording_leaves_a_copied_directory_out_of_the_tree() {
+    // 同步 S7 的单值路径（`capture_single`）和交付后的 D7a 只走 R2a–R2c，**没有**
+    // 混合录制那道 `compute_map`（复制来的节点没有 revision，它会报
+    // `svn_map_unknown_node`）。修之前这两条路把复制出来的目录原样录进基线，且不报错。
+    use app_lib::engine::svn_baseline::TempIndex;
+    use app_lib::engine::svn_config::read_config;
+    use app_lib::engine::svn_init::record_server_tree_into;
+    use app_lib::engine::svn_preflight::run_preflight;
+
+    let fx = svn_repo_with_lib();
+    init_hybrid(&req(&fx)).unwrap();
+    let wc = fx.wc();
+    svn(&wc, &["copy", "Code/Lib", "Code/Lib2"]);
+    std::fs::write(wc.join("Code/Lib2/L.cs"), "edited\n").unwrap();
+    std::fs::remove_file(wc.join("Code/Lib2/N.cs")).unwrap();
+
+    let repo = fx.wc_str();
+    let cfg = read_config(&repo).unwrap();
+    let pre = run_preflight(&repo, &cfg.whitelist).expect("单值工作副本，前置校验该放行");
+    let idx = TempIndex::from_head(&repo).unwrap();
+    let (tree, _) = record_server_tree_into(&repo, &cfg, &pre, &idx).unwrap();
+
+    let listed = run_git(&repo, &["ls-tree", "-r", "--name-only", &tree]).unwrap();
+    assert!(
+        !listed.contains("Code/Lib2/"),
+        "复制出来的目录进了录出来的树：\n{listed}"
+    );
+    assert!(listed.contains("Code/Lib/L.cs"), "实际：\n{listed}");
+}
+
+#[test]
+fn a_moved_directory_is_recorded_at_its_old_place_only() {
+    // `svn mv` 的目标与 `svn cp` 同形（`added copied`），源头是 `deleted`、服务器上还在。
+    let fx = svn_repo_with_lib();
+    svn(&fx.wc(), &["move", "Code/Lib", "Code/Moved"]);
+
+    init_hybrid(&req(&fx)).unwrap();
+
+    let listed = baseline_files(&fx);
+    assert!(!listed.contains("Code/Moved/"), "实际：\n{listed}");
+    let blob = run_git(
+        &fx.wc_str(),
+        &["cat-file", "blob", "refs/heads/svn/base:Code/Lib/M.cs"],
+    )
+    .unwrap();
+    assert_eq!(blob, "m\n", "旧位置要从服务器取回");
+}
+
+#[test]
+fn a_file_replaced_by_a_copy_is_refused_instead_of_recorded_with_the_copy_source() {
+    // `svn rm Code/A.cs; svn cp Code/B.cs Code/A.cs`：`svn cat -r BASE Code/A.cs`
+    // 返回 `b`（复制源），服务器 r1 上却是 `a`。修之前基线里的 `Code/A.cs` 是 `b`，
+    // 而且体检通过（它在 `S` 里）。
+    let fx = svn_repo();
+    let wc = fx.wc();
+    svn(&wc, &["rm", "Code/A.cs"]);
+    svn(&wc, &["copy", "Code/B.cs", "Code/A.cs"]);
+
+    let err = init_hybrid(&req(&fx)).expect_err("离线取不到服务器上的旧内容，必须停下");
+    assert_eq!(
+        err.code, "svn_dirty_replaced_with_history",
+        "实际：{}",
+        err.message
+    );
+    assert!(!wc.join(".git").exists(), "失败要整个回退");
+}
+
+#[test]
+fn a_replaced_file_deleted_from_disk_is_refused_not_silently_dropped() {
+    // 独立 review 发现：它在 svn status 里与「add 后删」同形（`missing revision="-1"`），
+    // 只按 revision 判会把服务器上确实有的 `Code/A.cs` 摘出基线，且体检全绿。
+    let fx = svn_repo();
+    let wc = fx.wc();
+    svn(&wc, &["rm", "Code/A.cs"]);
+    std::fs::write(wc.join("Code/A.cs"), "new\n").unwrap();
+    svn(&wc, &["add", "Code/A.cs"]);
+    std::fs::remove_file(wc.join("Code/A.cs")).unwrap();
+
+    let err = init_hybrid(&req(&fx)).expect_err("服务器上有旧内容、本地取不到，必须停下");
+    assert_eq!(
+        err.code, "svn_dirty_replaced_missing",
+        "实际：{}",
+        err.message
+    );
+    assert!(!wc.join(".git").exists(), "失败要整个回退");
+}
+
+#[test]
+fn a_moved_directory_whose_target_was_deleted_from_disk_does_not_block_init() {
+    // `svn mv Code/Lib Code/Moved` 后在资源管理器里删掉 `Code/Moved`：整棵目标子树
+    // `missing revision="-1"`、没有 copied 标记，根的 schedule 是 `add`（独立 review 实测）。
+    let fx = svn_repo_with_lib();
+    let wc = fx.wc();
+    svn(&wc, &["move", "Code/Lib", "Code/Moved"]);
+    std::fs::remove_dir_all(wc.join("Code/Moved")).unwrap();
+
+    let report = init_hybrid(&req(&fx)).expect("删掉移动目标不该让录制停下");
+
+    let listed = baseline_files(&fx);
+    assert!(!listed.contains("Code/Moved/"), "实际：\n{listed}");
+    assert!(
+        listed.contains("Code/Lib/M.cs"),
+        "旧位置要从服务器取回：\n{listed}"
+    );
+    assert!(
+        matches!(report.health, Health::Verified { .. }),
+        "实际：{:?}",
+        report.health
+    );
+}
+
+#[test]
+fn a_subdirectory_deleted_inside_a_copied_directory_stays_out_of_the_baseline() {
+    // `svn cp` 出来的目录里整个子目录被删掉：子目录和里面的文件都丢了 copied 标记，
+    // `svn cat -r BASE` 却照样返回复制源的内容（实测）。
+    let fx = svn_repo();
+    let wc = fx.wc();
+    svn(&wc, &["mkdir", "Code/Lib", "Code/Lib/Sub"]);
+    std::fs::write(wc.join("Code/Lib/Sub/S.cs"), "s\n").unwrap();
+    std::fs::write(wc.join("Code/Lib/L.cs"), "l\n").unwrap();
+    svn(&wc, &["add", "Code/Lib/Sub/S.cs", "Code/Lib/L.cs"]);
+    svn(&wc, &["commit", "-m", "lib", "--non-interactive"]);
+    svn(&wc, &["update", "--non-interactive"]);
+    svn(&wc, &["copy", "Code/Lib", "Code/Lib2"]);
+    std::fs::remove_dir_all(wc.join("Code/Lib2/Sub")).unwrap();
+
+    let report = init_hybrid(&req(&fx)).unwrap();
+
+    let listed = baseline_files(&fx);
+    assert!(!listed.contains("Code/Lib2/"), "实际：\n{listed}");
+    assert!(listed.contains("Code/Lib/Sub/S.cs"), "实际：\n{listed}");
+    assert!(
+        matches!(report.health, Health::Verified { .. }),
+        "实际：{:?}",
+        report.health
+    );
+}
+
 #[test]
 fn all_three_directory_shapes_at_once_still_record_correctly() {
     // E2E 场景 13 的**完整形态**：三种目录级的脏同时存在。
