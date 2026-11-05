@@ -225,7 +225,7 @@ export function RepoTab({
 
   useRepoEffects(
     state,
-    { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, checkSvnSyncOnFocus, markSvnFollowOnBlur, refreshSvnSyncState, refreshSvnBranchesBehind, auditSvnIfDue, wantedDiffScope },
+    { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, checkSvnSyncOnFocus, markSvnFollowOnBlur, refreshSvnSyncState, refreshSvnBranchesBehind, auditSvnIfDue, wantedDiffScope, reportError },
     viewMode,
     changesScope,
     active,

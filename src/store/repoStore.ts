@@ -536,6 +536,14 @@ export function useRepoStore() {
    * 校验结果写回与失焦之间没有先后保证。
    */
   const latestVerdict = useRef<SyncVerdict['kind'] | null>(null)
+  /**
+   * `openRepo` 写进 state 的那个路径，同步镜像一份。
+   *
+   * `latestVerdict` 写回前要核对「还是不是这个仓库」（第 71 条），但不能放进 `setState` 的
+   * updater 里核对：updater 可能要等下一次渲染才执行，而 `trackSvnCheck` 在那之前就把
+   * 在跑的计数归零了，失焦快照会拿上一次的结论去写（PR 113 review）。
+   */
+  const openedPath = useRef<string | null>(null)
   /** 正在跑的校验（含读戳、读 revision 的那一段）。见 `shouldMarkOnBlur`。 */
   const svnChecksRunning = useRef(0)
 
@@ -578,6 +586,7 @@ export function useRepoStore() {
       // 每次打开都重新读，且**必然写回**：上一个仓库是 SVN 时留下的能力集合
       // 会把下一个普通 git 仓库的入口一起关掉。
       const caps = await readCapabilities(path)
+      openedPath.current = path
       setState((s) => ({
         ...s,
         path,
@@ -825,8 +834,12 @@ export function useRepoStore() {
       throw err
     }
     if (!refreshGate.isLatest(token, 'svnSync')) return
+    // `samePath` 守卫（第 71 条）：读的过程中用户可能已经切到别的仓库，旧仓库的结论
+    // 写过去就是一条错的失同步横幅。`latestVerdict` 必须**同步**写（见 `openedPath`），
+    // 所以按 ref 核对；state 照 `refreshSvnSyncState` 的写法在 updater 里再核对一次
+    if (!samePath(openedPath.current ?? '', path)) return
     latestVerdict.current = st.verdict.kind
-    setState((s) => ({ ...s, svnSync: st }))
+    setState((s) => (samePath(s.path ?? '', path) ? { ...s, svnSync: st } : s))
   }
 
   /** 给一次校验记数，从它读第一档的输入开始，到结论写回为止。 */
@@ -925,14 +938,27 @@ export function useRepoStore() {
   /** 读缓存里的 SVN 历史并接进图。不走网络。 */
   const refreshSvnLog = async (path: string) => {
     const page = await svnReadLog(path)
-    // svnRevs 一变就要重接一次：后台拉取是异步的，先画出来的图里
-    // svn 节点还没到位，工作分支那时还挂在 baseline commit 上。
-    setState((s) => ({
-      ...s,
-      svnRevs: page.revs,
-      commits: merge(s, s.gitCommits, page.revs),
-      svnLogComplete: page.complete,
-    }))
+    applySvnLog(path, page)
+  }
+
+  /**
+   * 把一页 SVN 历史写回并重接提交图。
+   *
+   * svnRevs 一变就要重接一次：后台拉取是异步的，先画出来的图里
+   * svn 节点还没到位，工作分支那时还挂在 baseline commit 上。
+   *
+   * `samePath` 守卫（第 71 条）：拉取走网络、可能好几秒，期间切到别的仓库的话，
+   * 旧仓库的 SVN 节点会被接进新仓库的图。
+   */
+  const applySvnLog = (path: string, page: SvnLogPage) => {
+    setState((s) => (samePath(s.path ?? '', path)
+      ? {
+          ...s,
+          svnRevs: page.revs,
+          commits: merge(s, s.gitCommits, page.revs),
+          svnLogComplete: page.complete,
+        }
+      : s))
   }
 
   /**
@@ -942,15 +968,7 @@ export function useRepoStore() {
    */
   const fetchSvnLog = async (path: string, older = false) => {
     try {
-      const page = await svnFetchLog(path, older, SVN_LOG_PAGE)
-      // svnRevs 一变就要重接一次：后台拉取是异步的，先画出来的图里
-      // svn 节点还没到位，工作分支那时还挂在 baseline commit 上。
-      setState((s) => ({
-        ...s,
-        svnRevs: page.revs,
-        commits: merge(s, s.gitCommits, page.revs),
-        svnLogComplete: page.complete,
-      }))
+      applySvnLog(path, await svnFetchLog(path, older, SVN_LOG_PAGE))
     } catch (err) {
       console.warn('拉取 SVN 历史失败，图上只显示缓存里已有的部分：', err)
     }
@@ -1007,10 +1025,11 @@ export function useRepoStore() {
   const refreshPinned = async (path: string) => {
     try {
       const pinned = await svnPinnedExternals(path)
-      setState((s) => ({ ...s, pinned }))
+      // `samePath` 守卫：`svn propget -R` 是秒级、打开仓库时不 await，期间可能已切走（第 71 条）
+      setState((s) => (samePath(s.path ?? '', path) ? { ...s, pinned } : s))
     } catch (err) {
       console.warn('读取 pinned external 失败，不显示 pinned 模式说明：', err)
-      setState((s) => ({ ...s, pinned: [] }))
+      setState((s) => (samePath(s.path ?? '', path) ? { ...s, pinned: [] } : s))
     }
   }
 
@@ -1027,7 +1046,8 @@ export function useRepoStore() {
   const refreshPullRequests = async (path: string) => {
     try {
       const prs = await invoke<PullRequest[]>('list_pull_requests', { path })
-      setState((s) => ({ ...s, pullRequests: prs }))
+      // `samePath` 守卫：gh 走网络一两秒，期间可能已切走（第 71 条）
+      setState((s) => (samePath(s.path ?? '', path) ? { ...s, pullRequests: prs } : s))
     } catch (err) {
       console.warn('读取 PR 列表失败，分支旁不显示编号徽章：', err)
     }
@@ -1048,8 +1068,12 @@ export function useRepoStore() {
       try {
         diff = await invoke<DiffData>('read_diff', { path, scope })
       } catch (err) {
-        // 读失败也要把这个 scope 记成「读过了」，不然界面会一直说「正在读取」；错误照旧抛给调用方
-        if (stillWanted()) setState((s) => ({ ...s, diff: { files: [] }, diffScope: scope }))
+        // 读失败也要把这个 scope 记成「读过了」，不然界面会一直说「正在读取」；错误照旧抛给调用方。
+        // 带上原因：光一个空列表，界面上就成了「这个提交没有改动」（第 72 条）
+        // 用户已经离开的那份读失败了就安静地丢掉：照常抛的话，界面显示的是 B 的 diff，
+        // 顶部错误条却报 A 的「bad object」（PR 113 review）
+        if (!stillWanted()) return
+        setState((s) => ({ ...s, diff: { files: [], error: toErrorMessage(err) }, diffScope: scope }))
         throw err
       }
       if (stillWanted()) setState((s) => ({ ...s, diff, diffScope: scope }))
@@ -1141,6 +1165,8 @@ export interface RepoRefreshers {
   auditSvnIfDue: (path: string) => Promise<void>
   /** `useRepoStore` 的 `wantedDiffScope`：这里每次渲染写入当前视图的 scope。 */
   wantedDiffScope: MutableRefObject<string | null | undefined>
+  /** 用户操作引起的读取失败交给顶部错误条。 */
+  reportError: (err: unknown) => void
 }
 
 /**
@@ -1155,7 +1181,7 @@ export function useRepoEffects(
   changesScope: FileSection,
   active: boolean,
 ) {
-  const { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, checkSvnSyncOnFocus, markSvnFollowOnBlur, refreshSvnSyncState, refreshSvnBranchesBehind, auditSvnIfDue } = refreshers
+  const { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, checkSvnSyncOnFocus, markSvnFollowOnBlur, refreshSvnSyncState, refreshSvnBranchesBehind, auditSvnIfDue, reportError } = refreshers
   // svn 节点有两版本地基线时读两版之差（`range:`）；不在图上的选中（stash）照旧按 oid 读
   const diffScope = viewMode === 'changes'
     ? changesScope
@@ -1165,7 +1191,9 @@ export function useRepoEffects(
 
   useEffect(() => {
     if (!state.path || !diffScope) return
-    refreshDiff(state.path, diffScope)
+    // 不 catch 的话失败是一个未处理的 rejection，顶部错误条什么都不显示（第 72 条）。
+    // 与文件监听那条不同，这里是用户点了才读的，失败要让他看见
+    refreshDiff(state.path, diffScope).catch(reportError)
   }, [state.selectedId, state.path, diffScope])
 
   useEffect(() => {

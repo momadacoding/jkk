@@ -4,6 +4,7 @@
 // 这里测 store 与 effect 把它们接对了：什么时候发哪条命令，校验在跑时不写快照，只处理当前标签。
 // 真实窗口里焦点事件的时序测不到，见日志 Task 11 的手测清单。
 import { act, renderHook } from '@testing-library/react'
+import { useEffect } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ALL_CAPABILITIES } from '@/engine/capabilities'
 import type { SyncVerdict } from '@/engine/svnSync'
@@ -58,6 +59,10 @@ function mount(active = true) {
   return renderHook(
     ({ active }) => {
       const store = useRepoStore()
+      // store 自己也得认为打开的是 C:/r：写回前的 `samePath` 守卫核对的是 store 里的路径
+      // （第 71 条），只把 path 塞给 effect 的话写回全被当成「已切到别的仓库」丢掉。
+      // 打开走到 refreshGraph 就挂住（没写回答），不会再发任何 svn 命令
+      useEffect(() => { void store.openRepo('C:/r') }, [])
       const state = { ...store.state, path: 'C:/r', capabilities: SVN }
       useRepoEffects(state, store, 'graph', 'unstaged', active)
       return store
@@ -87,6 +92,8 @@ beforeEach(() => {
   calls.length = 0
   repoChanged.length = 0
   answers.clear()
+  answers.set('open_repo', () => ({ path: 'C:/r', head: 'work', headHash: 'h' }))
+  answers.set('read_capabilities', () => SVN)
   answers.set('svn_root_revs', () => [])
   answers.set('svn_wc_db_stamps', stamps('1'))
   answers.set('svn_follow_mark', () => undefined)

@@ -84,6 +84,8 @@ export function CommitDetailView({
   const { menu, open, close } = useContextMenu()
   const loading = diff === null
   const files = diff?.files ?? NO_FILES
+  // 读失败时 files 是空的：不说明的话就成了「这个提交没有改动」（第 72 条）
+  const failedNote = diff?.error ? `读取改动失败：${diff.error}` : null
 
   // 改动列表里的文件右键：两侧由 diff scope 决定，改名时左边用旧路径
   const fileContextMenu = (path: string, e: React.MouseEvent) => {
@@ -126,7 +128,7 @@ export function CommitDetailView({
   )
 
   // 改动列表与 diff 的分栏；diff 还没读回来时整块换成一句说明
-  const changesSplit = loading ? <div className="diff-note">{LOADING_NOTE}</div> : (
+  const changesSplit = loading || failedNote ? <div className="diff-note">{failedNote ?? LOADING_NOTE}</div> : (
     <div className="commit-split">
       <Group orientation="horizontal">
         <Panel defaultSize="30%" minSize="15%" maxSize="60%">
@@ -258,6 +260,7 @@ export function CommitDetailView({
           <div className="commit-full-message">{commit.message}</div>
           <div className="commit-files">
             {loading && <div className="diff-note">{LOADING_NOTE}</div>}
+            {failedNote && <div className="diff-note">{failedNote}</div>}
             {fileStats.map((f) => (
               <div key={f.path} className="commit-file-row">
                 <span className={`commit-file-status ${f.status}`}>{f.status.slice(0, 1).toUpperCase()}</span>

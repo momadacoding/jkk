@@ -236,4 +236,49 @@ describe('refreshDiff 记下 diff 是哪个 scope 的', () => {
     expect(result.current.state.diffScope).toBe('commit:B')
     expect(result.current.state.diff.files).toEqual([])
   })
+
+  // 第 72 条：空列表和「确实没有改动」长得一样，用户会误以为这个提交什么都没改
+  it('读失败：那份空 diff 带着错误，界面能和「确实没有改动」区分开', async () => {
+    const { result } = renderHook(() => useRepoStore())
+    result.current.wantedDiffScope.current = 'commit:B'
+    let run!: Promise<void>
+    act(() => { run = result.current.refreshDiff('C:/r', 'commit:B') })
+    const call = pending.find((p) => p.cmd === 'read_diff')!
+    await act(async () => {
+      call.reject({ code: 'git_cli', message: 'fatal: bad object B' })
+      await expect(run).rejects.toBeTruthy()
+    })
+    expect(result.current.state.diff.error).toContain('bad object B')
+  })
+
+  it('用户已经离开的那份读失败：不抛、不写，顶部错误条不会报一个看不见的提交', async () => {
+    const { result } = renderHook(() => useRepoStore())
+    result.current.wantedDiffScope.current = 'commit:B'
+    let run!: Promise<void>
+    act(() => { run = result.current.refreshDiff('C:/r', 'commit:A') })
+    const call = pending.find((p) => p.cmd === 'read_diff')!
+    await act(async () => {
+      call.reject(new Error('bad object A'))
+      await expect(run).resolves.toBeUndefined()
+    })
+    expect(result.current.state.diff.error).toBeUndefined()
+    expect(result.current.state.diffScope).toBeNull()
+  })
+
+  it('读失败之后再读成功：错误清掉', async () => {
+    const { result } = renderHook(() => useRepoStore())
+    result.current.wantedDiffScope.current = 'workdir'
+    let run!: Promise<void>
+    act(() => { run = result.current.refreshDiff('C:/r', 'workdir') })
+    const call = pending.find((p) => p.cmd === 'read_diff')!
+    pending.splice(pending.indexOf(call), 1)
+    await act(async () => {
+      call.reject(new Error('boom'))
+      await expect(run).rejects.toThrow('boom')
+    })
+    act(() => { void result.current.refreshDiff('C:/r', 'workdir') })
+    await answer('workdir', diffOf('a.txt'))
+    expect(result.current.state.diff.error).toBeUndefined()
+    expect(result.current.state.diff.files.map((f) => f.path)).toEqual(['a.txt'])
+  })
 })

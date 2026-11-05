@@ -149,6 +149,11 @@ export interface FileDiff {
 
 export interface DiffData {
   files: FileDiff[]
+  /**
+   * 只在前端出现，Rust 侧不返回：`read_diff` 失败时 store 记下的原因。
+   * 有它时 `files` 是空的，但意思是「没读出来」，不是「没有改动」（第 72 条）。
+   */
+  error?: string
 }
 
 export interface UpstreamInfo {
