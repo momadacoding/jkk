@@ -178,6 +178,78 @@ fn backend_stage_and_unstage_handle_dash_prefixed_paths() {
     );
 }
 
+/// 有两个文件 `f1.txt` 与 `f[1].txt` 的仓库。`f[1].txt` 当 glob 时恰好匹配 `f1.txt`。
+fn glob_pair_repo() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    run_git(dir.path(), &["init", "-b", "main"]);
+    run_git(dir.path(), &["config", "user.email", "test@test.com"]);
+    run_git(dir.path(), &["config", "user.name", "Test"]);
+    run_git(dir.path(), &["config", "core.autocrlf", "false"]);
+    fs::write(dir.path().join("f1.txt"), "one\n").unwrap();
+    fs::write(dir.path().join("f[1].txt"), "bracket\n").unwrap();
+    run_git(dir.path(), &["add", "-A"]);
+    run_git(dir.path(), &["commit", "-m", "init"]);
+    dir
+}
+
+fn short_status(dir: &TempDir) -> String {
+    let out = Command::new("git")
+        .current_dir(dir.path())
+        .args(["status", "--short"])
+        .output()
+        .expect("git not found");
+    String::from_utf8(out.stdout).unwrap()
+}
+
+#[test]
+fn stage_of_a_bracket_name_does_not_resolve_the_conflict_it_globs_to() {
+    // 第 85 条的旁路：`git add -- 'f[1].txt'` 仍按 glob 匹配，会把还留着冲突标记的
+    // `f1.txt` 一起暂存（= 标记为已解决）。前端的确认只看到 `f[1].txt`，拦不住。
+    // 实测 2026-11-04：status 从 `UU f1.txt` 变成 `M  f1.txt`，内容仍以 `<<<<<<<` 开头。
+    let dir = glob_pair_repo();
+    run_git(dir.path(), &["checkout", "-qb", "other"]);
+    fs::write(dir.path().join("f1.txt"), "theirs\n").unwrap();
+    run_git(dir.path(), &["commit", "-qam", "theirs"]);
+    run_git(dir.path(), &["checkout", "-q", "main"]);
+    fs::write(dir.path().join("f1.txt"), "ours\n").unwrap();
+    run_git(dir.path(), &["commit", "-qam", "ours"]);
+    let merged = Command::new("git")
+        .current_dir(dir.path())
+        .args(["merge", "other"])
+        .output()
+        .expect("git not found");
+    assert!(!merged.status.success(), "fixture 应当停在冲突上");
+    assert!(fs::read_to_string(dir.path().join("f1.txt"))
+        .unwrap()
+        .starts_with("<<<<<<<"));
+    fs::write(dir.path().join("f[1].txt"), "edited\n").unwrap();
+
+    let backend = backend_for(&p(&dir)).unwrap();
+    backend.stage(&["f[1].txt".to_string()]).unwrap();
+
+    let st = short_status(&dir);
+    assert!(st.contains("UU f1.txt"), "f1.txt 必须仍是冲突：\n{st}");
+    assert!(st.contains("M  f[1].txt"), "f[1].txt 应当已暂存：\n{st}");
+}
+
+#[test]
+fn unstage_of_a_bracket_name_leaves_the_file_it_globs_to_staged() {
+    let dir = glob_pair_repo();
+    fs::write(dir.path().join("f1.txt"), "a\n").unwrap();
+    fs::write(dir.path().join("f[1].txt"), "b\n").unwrap();
+    run_git(dir.path(), &["add", "-A"]);
+
+    let backend = backend_for(&p(&dir)).unwrap();
+    backend.unstage(&["f[1].txt".to_string()]).unwrap();
+
+    let st = short_status(&dir);
+    assert!(st.contains("M  f1.txt"), "f1.txt 必须仍在暂存区：\n{st}");
+    assert!(
+        st.contains(" M f[1].txt"),
+        "f[1].txt 应当已撤出暂存区：\n{st}"
+    );
+}
+
 #[test]
 fn backend_stage_then_commit_advances_head() {
     let dir = repo();

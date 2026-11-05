@@ -412,6 +412,143 @@ describe('LocalChangesView 的一边删一边改', () => {
   })
 })
 
+// 第 85 条：git add 不检查冲突标记，Stage 一下标记就能被提交进历史。
+// 四个入口（行按钮、Stage All、右键、多选后右键）都必须先过同一道确认。
+// 冲突说明里的 Stage 按钮也走同一个出口，但它只在 noMarkers / 二进制时出现，
+// 这两种本来就放行，所以只是兜底，这里不单独测。
+// 后端那一半（暂存 `f[1].txt` 不能按 glob 连带 `f1.txt`）在 src-tauri/tests/vcs_backend.rs。
+describe('LocalChangesView：有冲突标记的文件暂存前要确认', () => {
+  function mountGuard(conflicts: ConflictInfo[] | null) {
+    const onStage = vi.fn()
+    render(
+      <LocalChangesView
+        status={{
+          unstaged: [conflicted('c.txt'), conflicted('clean.txt'), change('a.txt'), change('b.txt')],
+          staged: [],
+        }}
+        diff={{ files: [] }}
+        onStage={onStage}
+        onUnstage={vi.fn()}
+        onDiscard={vi.fn()}
+        onCommit={vi.fn()}
+        svnMode={false}
+        onBaselineBranch={false}
+        conflicts={conflicts}
+      />,
+    )
+    return { onStage }
+  }
+  const infos = [conflictInfo('c.txt'), conflictInfo('clean.txt', { case: 'noMarkers' })]
+
+  function rowToggle(path: string): HTMLElement {
+    const btn = screen.getByText(path).closest('.changes-file')?.querySelector('.changes-toggle')
+    if (!(btn instanceof HTMLElement)) throw new Error(`找不到 ${path} 的 Stage 按钮`)
+    return btn
+  }
+
+  async function guardDialog(): Promise<HTMLElement> {
+    return await waitFor(() => {
+      const el = document.querySelector('.dialog-actions')?.closest('.dialog')
+      if (!(el instanceof HTMLElement)) throw new Error('没有弹框')
+      return el
+    })
+  }
+
+  function contextMenu(): HTMLElement {
+    const menu = document.querySelector('.context-menu')
+    if (!(menu instanceof HTMLElement)) throw new Error('右键菜单没打开')
+    return menu
+  }
+
+  async function cancel(dialog: HTMLElement) {
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(document.querySelector('.dialog-actions')).toBeNull())
+  }
+
+  it('行上的 Stage 按钮：弹确认，取消后不暂存', async () => {
+    const { onStage } = mountGuard(infos)
+    fireEvent.click(rowToggle('c.txt'))
+    const dialog = await guardDialog()
+    expect(dialog.textContent).toContain('c.txt')
+    expect(dialog.textContent).toContain('冲突标记')
+    await cancel(dialog)
+    expect(onStage).not.toHaveBeenCalled()
+  })
+
+  // 只断言焦点：Dialog 没有全局回车处理，回车触发的是有焦点的那个按钮
+  it('打开时焦点落在取消上', async () => {
+    mountGuard(infos)
+    fireEvent.click(rowToggle('c.txt'))
+    const dialog = await guardDialog()
+    await waitFor(() => expect(document.activeElement).toBe(within(dialog).getByRole('button', { name: 'Cancel' })))
+  })
+
+  it('确认之后才暂存', async () => {
+    const { onStage } = mountGuard(infos)
+    fireEvent.click(rowToggle('c.txt'))
+    const dialog = await guardDialog()
+    fireEvent.click(within(dialog).getByRole('button', { name: '仍然暂存' }))
+    await waitFor(() => expect(onStage).toHaveBeenCalledWith(['c.txt']))
+  })
+
+  it('Stage All：弹确认，取消后整批都不暂存', async () => {
+    const { onStage } = mountGuard(infos)
+    fireEvent.click(screen.getByRole('button', { name: 'Stage All' }))
+    await cancel(await guardDialog())
+    expect(onStage).not.toHaveBeenCalled()
+  })
+
+  it('Stage All 确认后整批一起暂存，不漏普通文件', async () => {
+    const { onStage } = mountGuard(infos)
+    fireEvent.click(screen.getByRole('button', { name: 'Stage All' }))
+    const dialog = await guardDialog()
+    fireEvent.click(within(dialog).getByRole('button', { name: '仍然暂存' }))
+    await waitFor(() => expect(onStage).toHaveBeenCalledTimes(1))
+    expect([...onStage.mock.calls[0][0]].sort()).toEqual(['a.txt', 'b.txt', 'c.txt', 'clean.txt'])
+  })
+
+  it('右键菜单的 Stage：弹确认，取消后不暂存', async () => {
+    const { onStage } = mountGuard(infos)
+    fireEvent.contextMenu(screen.getByText('c.txt'))
+    fireEvent.click(within(contextMenu()).getByText('Stage'))
+    await cancel(await guardDialog())
+    expect(onStage).not.toHaveBeenCalled()
+  })
+
+  it('多选（混着普通文件）后右键 Stage：取消后整批都不暂存，不会只暂存普通文件', async () => {
+    const { onStage } = mountGuard(infos)
+    fireEvent.click(screen.getByText('a.txt'))
+    fireEvent.click(screen.getByText('c.txt'), { ctrlKey: true })
+    fireEvent.contextMenu(screen.getByText('c.txt'))
+    fireEvent.click(within(contextMenu()).getByText('Stage (2)'))
+    await cancel(await guardDialog())
+    expect(onStage).not.toHaveBeenCalled()
+  })
+
+  it('冲突信息还没读到（null）：没有标记的那个冲突文件也要拦', async () => {
+    const { onStage } = mountGuard(null)
+    fireEvent.click(rowToggle('clean.txt'))
+    const dialog = await guardDialog()
+    expect(dialog.textContent).toContain('clean.txt')
+    await cancel(dialog)
+    expect(onStage).not.toHaveBeenCalled()
+  })
+
+  it('确认没有冲突标记的冲突文件直接暂存，不弹框', async () => {
+    const { onStage } = mountGuard(infos)
+    fireEvent.click(rowToggle('clean.txt'))
+    await waitFor(() => expect(onStage).toHaveBeenCalledWith(['clean.txt']))
+    expect(document.querySelector('.dialog-actions')).toBeNull()
+  })
+
+  it('普通文件照旧直接暂存，不弹框', async () => {
+    const { onStage } = mountGuard(infos)
+    fireEvent.click(rowToggle('a.txt'))
+    await waitFor(() => expect(onStage).toHaveBeenCalledWith(['a.txt']))
+    expect(document.querySelector('.dialog-actions')).toBeNull()
+  })
+})
+
 // diff 为 null = 工作区 diff 还没读回来（`currentDiff`），比如刚从提交详情切回来。
 // 右侧不能留着上一个视图的 diff
 describe('LocalChangesView：diff 还没读回来', () => {
