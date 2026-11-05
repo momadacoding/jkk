@@ -135,14 +135,32 @@ pub fn discard(path: &str, paths: &[String], staged: bool) -> Result<()> {
 
     // 失败原样抛出：`ls-files --others` 在空仓库里也是退出 0（实测），它没有
     // 「失败即空集」的合法情形。真失败了还往下走，等于拿一个空集去做分类。
-    let mut probe: Vec<&str> = vec!["ls-files", "--others", "--exclude-standard", "-z", "--"];
+    // 下面每条带路径的命令都加 `--literal-pathspecs`：`--` 之后的路径 git 仍按 glob 匹配，
+    // 丢弃 `f[1].txt` 会连带 checkout / rm 掉用户没选中的 `f1.txt`，而这一步不可逆
+    // （实测 2026-11-04：f1.txt 未暂存的改动被抹掉，`rm -f` 路径下整个文件被删）。
+    let mut probe: Vec<&str> = vec![
+        "--literal-pathspecs",
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        "--",
+    ];
     probe.extend(paths.iter().map(String::as_str));
     let untracked = path_set(path, &probe)?;
 
     // `staged == false` 时下面的判断被 `staged &&` 短路，in_head 根本用不到。
     // 那就别跑这条命令——少一次进程，也少一个能出错的面。
     let in_head = if staged {
-        let mut head_probe: Vec<&str> = vec!["ls-tree", "-r", "HEAD", "--name-only", "-z", "--"];
+        let mut head_probe: Vec<&str> = vec![
+            "--literal-pathspecs",
+            "ls-tree",
+            "-r",
+            "HEAD",
+            "--name-only",
+            "-z",
+            "--",
+        ];
         head_probe.extend(paths.iter().map(String::as_str));
         match path_set(path, &head_probe) {
             Ok(set) => set,
@@ -185,7 +203,7 @@ pub fn discard(path: &str, paths: &[String], staged: bool) -> Result<()> {
     let mut done: Vec<&str> = Vec::new();
 
     if !restore.is_empty() {
-        let mut args: Vec<&str> = vec!["checkout"];
+        let mut args: Vec<&str> = vec!["--literal-pathspecs", "checkout"];
         if staged {
             args.push("HEAD");
         }
@@ -206,7 +224,7 @@ pub fn discard(path: &str, paths: &[String], staged: bool) -> Result<()> {
     }
 
     if !remove.is_empty() {
-        let mut args: Vec<&str> = vec!["rm", "-f", "--"];
+        let mut args: Vec<&str> = vec!["--literal-pathspecs", "rm", "-f", "--"];
         args.extend(remove.iter().copied());
         if let Err(err) = run_git(path, &args) {
             return Err(partial_failure(

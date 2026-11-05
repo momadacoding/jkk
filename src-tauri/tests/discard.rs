@@ -102,6 +102,86 @@ fn discarding_staged_goes_all_the_way_back_to_head() {
     );
 }
 
+// `--` 之后的路径 git 仍按 glob 匹配：`f[1].txt` 匹配得到 `f1.txt`。discard 不可逆，
+// 抹掉或删掉一个用户没选中的文件就是数据丢失（实测 2026-11-04，见 vcs_backend.rs 的同类测试）。
+
+/// 只提交了 `f1.txt` 的仓库；`f[1].txt` 由各测试自己决定是否跟踪。
+fn glob_repo(track_bracket: bool) -> TempDir {
+    let dir = repo();
+    fs::write(dir.path().join("f1.txt"), "one\n").unwrap();
+    if track_bracket {
+        fs::write(dir.path().join("f[1].txt"), "bracket\n").unwrap();
+    }
+    run_git(dir.path(), &["add", "-A"]);
+    run_git(dir.path(), &["commit", "-m", "glob pair"]);
+    dir
+}
+
+#[test]
+fn discarding_a_bracket_name_keeps_unstaged_edits_of_the_file_it_globs_to() {
+    let dir = glob_repo(true);
+    fs::write(dir.path().join("f1.txt"), "precious\n").unwrap();
+    fs::write(dir.path().join("f[1].txt"), "throw away\n").unwrap();
+
+    ops::discard(p(&dir), vec!["f[1].txt".into()], false).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(dir.path().join("f[1].txt")).unwrap(),
+        "bracket\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("f1.txt")).unwrap(),
+        "precious\n",
+        "没选中的 f1.txt 不能被一起抹掉"
+    );
+}
+
+#[test]
+fn discarding_a_staged_bracket_name_keeps_staged_edits_of_the_file_it_globs_to() {
+    let dir = glob_repo(true);
+    fs::write(dir.path().join("f1.txt"), "precious\n").unwrap();
+    fs::write(dir.path().join("f[1].txt"), "throw away\n").unwrap();
+    run_git(dir.path(), &["add", "-A"]);
+
+    ops::discard(p(&dir), vec!["f[1].txt".into()], true).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(dir.path().join("f1.txt")).unwrap(),
+        "precious\n",
+        "没选中的 f1.txt 不能被一起退回 HEAD"
+    );
+    assert_eq!(
+        git_out(dir.path(), &["diff", "--cached", "--name-only"]),
+        "f1.txt",
+        "f1.txt 的暂存必须还在，f[1].txt 的必须没了"
+    );
+}
+
+#[test]
+fn discarding_a_staged_new_bracket_name_does_not_delete_the_file_it_globs_to() {
+    // 走 `git rm -f` 那条路径：f[1].txt 不在 HEAD 里
+    let dir = glob_repo(false);
+    fs::write(dir.path().join("f1.txt"), "precious\n").unwrap();
+    fs::write(dir.path().join("f[1].txt"), "new\n").unwrap();
+    run_git(
+        dir.path(),
+        &["--literal-pathspecs", "add", "--", "f1.txt", "f[1].txt"],
+    );
+
+    ops::discard(p(&dir), vec!["f[1].txt".into()], true).unwrap();
+
+    assert!(!dir.path().join("f[1].txt").exists());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("f1.txt")).unwrap(),
+        "precious\n",
+        "没选中的 f1.txt 不能被 git rm -f 一起删掉"
+    );
+    assert_eq!(
+        git_out(dir.path(), &["diff", "--cached", "--name-only"]),
+        "f1.txt"
+    );
+}
+
 #[test]
 fn deletes_an_untracked_file() {
     // git 里没有它的任何副本，除了删掉别无选择
