@@ -183,7 +183,10 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
     ? <div className="diff-note">
         {active?.section === 'staged' ? '正在读取暂存区的改动…' : '正在读取工作区的改动…'}
       </div>
-    : <DiffView diff={activeDiff} />
+    // 读失败时 files 是空的：不说明的话就成了「没有改动」（第 72 条）
+    : diff.error
+      ? <div className="diff-note">读取改动失败：{diff.error}</div>
+      : <DiffView diff={activeDiff} />
   const conflictByPath = useMemo(
     () => new Map((conflicts ?? []).map((c) => [c.path, c])),
     [conflicts],

@@ -205,3 +205,27 @@ describe('CommitDetailView：外部 diff 菜单', () => {
     expect(screen.queryByText(/中对比/)).toBeNull()
   })
 })
+
+// 第 72 条：读失败不能显示成「这个提交没有改动」
+describe('CommitDetailView：diff 读失败', () => {
+  const failed: DiffData = { files: [], error: 'fatal: bad object B' }
+
+  it('Commit 标签的文件列表处写明读取失败', () => {
+    render(<CommitDetailView commit={three[1]} diff={failed} repoPath="C:/r" onSelectCommit={vi.fn()} />)
+    expect(screen.getByText(/读取改动失败/)).toBeTruthy()
+    expect(screen.getByText(/bad object B/)).toBeTruthy()
+  })
+
+  it('Changes 标签整块换成失败说明，不显示 No changes', () => {
+    render(<CommitDetailView commit={three[1]} diff={failed} repoPath="C:/r" onSelectCommit={vi.fn()} />)
+    fireEvent.click(screen.getByRole('button', { name: /Changes/ }))
+    expect(screen.getByText(/读取改动失败/)).toBeTruthy()
+    expect(screen.queryByText('No changes')).toBeNull()
+  })
+
+  it('确实没有改动时照旧显示 No changes', () => {
+    render(<CommitDetailView commit={three[1]} diff={empty} repoPath="C:/r" onSelectCommit={vi.fn()} />)
+    fireEvent.click(screen.getByRole('button', { name: /Changes/ }))
+    expect(screen.queryByText(/读取改动失败/)).toBeNull()
+  })
+})
