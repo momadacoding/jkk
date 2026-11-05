@@ -412,27 +412,6 @@ describe('LocalChangesView 的一边删一边改', () => {
   })
 })
 
-// 第 72 条：读失败不能显示成「没有改动」
-describe('LocalChangesView：diff 读失败', () => {
-  it('右侧写明读取失败和原因，不说 No changes', () => {
-    render(
-      <LocalChangesView
-        status={{ unstaged: [change('a.txt')], staged: [] }}
-        diff={{ files: [], error: 'fatal: index file corrupt' }}
-        onStage={vi.fn()}
-        onUnstage={vi.fn()}
-        onDiscard={vi.fn()}
-        onCommit={vi.fn()}
-        svnMode={false}
-        onBaselineBranch={false}
-      />,
-    )
-    expect(screen.getByText(/读取改动失败/)).toBeTruthy()
-    expect(screen.getByText(/index file corrupt/)).toBeTruthy()
-    expect(screen.queryByText('No changes')).toBeNull()
-  })
-})
-
 // diff 为 null = 工作区 diff 还没读回来（`currentDiff`），比如刚从提交详情切回来。
 // 右侧不能留着上一个视图的 diff
 describe('LocalChangesView：diff 还没读回来', () => {
@@ -686,5 +665,26 @@ describe('LocalChangesView 的拖动多选与 Ctrl+A', () => {
     const notPrevented = fireEvent.keyDown(screen.getByPlaceholderText('Commit subject'), { key: 'a', ctrlKey: true })
     expect(notPrevented).toBe(true)
     expect(selected()).toEqual([])
+  })
+})
+
+// 第 72 条：读失败不能显示成「没有改动」
+describe('LocalChangesView：diff 读失败', () => {
+  it('右侧写明读取失败和原因，不说 No changes', () => {
+    render(
+      <LocalChangesView
+        status={{ unstaged: [change('a.txt')], staged: [] }}
+        diff={{ files: [], error: 'fatal: index file corrupt' }}
+        onStage={vi.fn()}
+        onUnstage={vi.fn()}
+        onDiscard={vi.fn()}
+        onCommit={vi.fn()}
+        svnMode={false}
+        onBaselineBranch={false}
+      />,
+    )
+    expect(screen.getByText(/读取改动失败/)).toBeTruthy()
+    expect(screen.getByText(/index file corrupt/)).toBeTruthy()
+    expect(screen.queryByText('No changes')).toBeNull()
   })
 })
