@@ -158,6 +158,30 @@ fn an_unreadable_path_reads_as_empty() {
     assert_contract_everywhere(d, "no-such-clean.txt");
 }
 
+/// 字面量 pathspec 在 libgit2 里仍按目录前缀匹配：已跟踪的文件 `assets` 换成了未跟踪的同名目录，
+/// 选中 `assets` 那一项时，不能把目录下每个文件的内容都读出来（第二轮独立 review 第 6 条）。
+/// 结果只能有 `assets` 自己。
+#[test]
+fn a_file_replaced_by_a_directory_reads_only_that_file() {
+    let dir = init_repo();
+    let d = dir.path();
+    write(d, "assets", "file\n");
+    write(d, "clean.txt", "c\n");
+    run_git(d, &["add", "."]);
+    run_git(d, &["commit", "-qm", "base"]);
+    fs::remove_file(d.join("assets")).unwrap();
+    for i in 0..20 {
+        write(d, &format!("assets/f{i}.txt"), "x\n");
+    }
+
+    let paths: Vec<_> = file_scope(d, "unstaged", "assets")
+        .iter()
+        .map(|f| f["path"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(paths, ["assets"]);
+    assert_contract_everywhere(d, "clean.txt");
+}
+
 /// 空路径绝不能退化成「整个区」（libgit2 把空 pathspec 当全部，AGENTS.md §6.2）：要报错。
 /// 退化成整区的话，这条快路径就悄悄变回了它要替换掉的那次全量读。
 #[test]

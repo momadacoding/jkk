@@ -62,11 +62,12 @@ Unstaged（index 对比工作区，字面量 pathspec）+ `ignoreCase`。`read_s
 
 **做法（第二版：核对 index 指纹）**
 
-- `OwnIndexWrite` 守卫：`stage` / `unstage` 命令开头登记「本应用在写 index」，Drop 时记下 index 的指纹
-  （大小 + 修改时间）。计数而不是布尔：两次 Stage 重叠时，先结束的那次不能让还在写的那次被当成写完了。
+- `OwnIndexWrite` 守卫：`stage` / `unstage` 命令开头登记「本应用在写 index」并记下这一轮开始的时刻，Drop 时记下
+  index 的指纹（大小 + 修改时间 + 末尾 32 字节校验和）。计数而不是布尔：两次 Stage 重叠时，先结束的那次不能让
+  还在写的那次被当成写完了。
 - watcher 把相关事件分两类：gitdir 下的 `index`、gitdir 本身、commondir 下的 `objects` 这三条是「自己写 index
   也会碰到的」，其余一律要刷新。攒着的变化只有前一类时，去抖到点才核对：还在写 → 下一个 tick 再看；
-  index 还是最后记下的那份 → 不发；没登记过、读不到或者指纹变了 → 照常发。
+  最早那条事件早于这一轮写开始 → 照常发；index 还是最后记下的那份 → 不发；没登记过、读不到或者指纹变了 → 照常发。
 - 三条路径比较前把事件路径的父目录 `canonicalize`（8.3 短名、大小写、分隔符，同 `watch_targets` 的坑），
   先按文件名预筛，绝大多数事件不付这个代价。linked worktree 的 index 在 per-worktree gitdir 里、对象库在
   commondir 里，所以分开取。
@@ -80,9 +81,10 @@ Unstaged（index 对比工作区，字面量 pathspec）+ `ignoreCase`。`read_s
 **为什么这么改是安全的**
 
 - 只影响「要不要发 `repo-changed`」，不碰任何 git 操作。
-- 外部写 index 一定改变修改时间（git 先写 `index.lock` 再改名，NTFS 精度 100ns），所以会照常刷新，
-  实测见 `stage_and_unstage_only_touch_the_index` 末尾的外部 `git add`。剩下的缝只有「本应用的 git 退出」到
-  「Drop 里记下指纹」之间那几微秒里恰好有外部写入，这时会把外部那份当成自己的。
+- 之后的外部写入一定改变指纹（内容变了末尾校验和就变），所以会照常刷新，实测见
+  `stage_and_unstage_only_touch_the_index` 末尾的外部 `git add`。之前（去抖期内）的外部写入靠「事件早于这一轮写开始」
+  认出来（第二轮 review 第 4 条）。剩下的缝：「这一轮写开始」到「git 拿到 `index.lock`」之间（起一个 git 进程的工夫），
+  以及「git 退出」到「Drop 里记下指纹」之间，恰好有外部写入时会把外部那份当成自己的，要等下一个事件才显示。
 - `.git` 目录本身和 `objects` 目录的事件只是目录项变化。外部真有改动时总有自己那条事件（index、refs、HEAD……），
   所以这一类只看 index 指纹就够了。
 - 前端自己的刷新（A2）照常跑，冲突分类也跟着它走（`refreshStatus` 里的 `refreshConflicts`）。原来那一轮刷新顺带做的
@@ -158,8 +160,10 @@ Unstaged（index 对比工作区，字面量 pathspec）+ `ignoreCase`。`read_s
 - B1 改为核对 index 指纹之后在真实窗口复验：界面上 Unstage、Stage a.txt 各一次，2 秒内 `repo-changed` 0 次，
   列表与全量读一致；随后外部终端 `git add -- b.txt`，收到 1 次事件，列表刷新。「自己写完后紧接着外部写入」这个
   紧贴的时序在窗口里卡不准，由 `the_verdict_follows_the_index_fingerprint` 覆盖。
-- 最终：`cargo fmt --check`、`cargo clippy --all-targets` 无告警；`cargo test` 83 个目标 1678 条全过；
-  `pnpm build` 通过；`pnpm test` 74 个文件 1215 条全过。
+- 首个提交时：`cargo test` 1678 条、`pnpm test` 1215 条全过。
+- 第二轮 review 修完后：`cargo fmt --check`、`cargo clippy --all-targets` 无告警；`cargo test` 83 个目标 1679 条全过；
+  `pnpm build` 通过；`pnpm test` 74 个文件 1220 条全过。第二轮的改动没有再进真实窗口复验：B1 的判定逻辑由
+  `commands::watch` 的单测与真实 watcher 实测覆盖，前端的改动不涉及 Tauri 命令签名。
 
 **计划没写的坑**
 
@@ -181,3 +185,16 @@ Unstaged（index 对比工作区，字面量 pathspec）+ `ignoreCase`。`read_s
 | 8 `gitPathCompare` 每次比较分配两个数组 | 成立 | 改为按下标逐码位比 |
 | 9 每个事件都 normalize + 加锁，登记表不清理 | 成立 | 复用线程里的 key；只在攒着的变化全是那三条路径、到点时才查一次登记表。登记表每个 Stage 过的仓库一项，第二版没有过期的概念，不清理 |
 | 10 实测测试硬编码豁免为真，没走真守卫 | 成立 | 测试改为走 `OwnIndexWrite` 和 `own_write_verdict`，并加外部 `git add` 的反例 |
+
+### 第二轮独立 review（`/code-review high`，2026-11-06，对首个提交）
+
+| 条目 | 结论 | 处理 |
+|---|---|---|
+| 1 全量读失败后「上一次的状态」落后于磁盘，下一次 Stage 还在它上面合并 | 成立 | 全量读失败就清掉这个仓库的 `knownStatus`，下一轮必走全量（测试先红后绿） |
+| 2 另一个标签收到「写了 index」通知时没重查 merge driver | 成立 | `onIndexWrite` 里补调 `refreshMergeDrivers` |
+| 3 Stage / Unstage `.gitattributes` 会改变别的文件的 Unstaged（eol / text 规则），Staged 里看不出来 | 成立 | 点名路径里有任何一层的 `.gitattributes` 就走全量读。`.gitignore` 不在此列：libgit2 判断忽略读的是工作区里的文件，不看 index |
+| 4 攒着的 index 事件若是 Stage **之前**别人写的（去抖 300ms 内），它的改动已经包含在我们记下的指纹里，会被判成自己写的 | 成立。第一版日志里「剩下的缝只有几微秒」写错了，实际是整个去抖期 | 登记这一轮写开始的时刻；攒着的事件里最早那条早于它就判「不是自己写的」。剩下的缝缩到「写开始」到「git 拿到 `index.lock`」之间（起一个 git 进程的工夫） |
+| 5 指纹只有大小 + 修改时间，FAT/exFAT/网络共享上同一个时间刻度里的同尺寸改写认不出 | 成立 | 指纹加上 index 末尾 32 字节（git 写 index 时附的内容校验和），测试覆盖「大小、修改时间都一样，只有内容不同」 |
+| 6 单文件 diff 选中的路径现在是目录（文件换成了同名未跟踪目录）时，会读出目录下每个文件的内容 | 成立，fixture 复现（20 个文件全被带出来） | `diff_to_data_only`：列表只建精确匹配的那一项，补丁只对它生成（`Patch::from_diff`），其余 delta 不读内容 |
+| 7 Stage 让选中文件换区时，写之后的刷新和选中跟着变的 effect 把同一个文件连读两次 | 成立 | `refreshDiff` 的 `joinSince`：同一个 scope 正在读、且那一轮在这次写操作的刷新开始之后才开读，就直接复用；写之前就在读的那轮不复用。文件监听不复用 |
+| 8 index 路径靠 `own_paths[0]` 的位置约定 | 成立 | 改为 `OwnWritePaths { index, gitdir, objects }` |

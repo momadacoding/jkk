@@ -141,6 +141,27 @@ describe('Stage / Unstage 之后的局部重读', () => {
     expect(statusReads().map((p) => [p.cmd, p.args.paths])).toEqual([['read_status_paths', ['b.txt', 'c.txt']]])
   })
 
+  // 第二轮独立 review 第 1 条：文件监听那轮全量读偶发失败（事件密集时 Repository::open 会失败），
+  // 「上一次的状态」就停在那次改动之前。接着 Stage 若在它上面合并，那次改动一直显示不出来
+  it('上一次全量读失败：下一次 Stage 不在旧状态上合并，改为全量读', async () => {
+    const { result } = await loaded()
+    act(() => { void result.current.refreshStatus('C:/r').catch(() => undefined) })
+    await fail('read_status')
+    act(() => { void result.current.refreshChanges('C:/r', unstagedA, ['a.txt']).catch(() => undefined) })
+    expect(statusReads().map((p) => p.cmd)).toEqual(['read_status'])
+  })
+
+  // 第二轮独立 review 第 3 条：暂存区里的 .gitattributes 决定别的文件按什么 eol / text 规则比较，
+  // Stage / Unstage 它会让别的文件在 Unstaged 里出现或消失，而 Staged 里看不出来
+  it('点名的路径里有 .gitattributes（任何一层目录）：全量读', async () => {
+    for (const p of ['.gitattributes', 'sub/dir/.gitattributes']) {
+      pending.length = 0
+      const { result } = await loaded()
+      act(() => { void result.current.refreshChanges('C:/r', unstagedA, ['a.txt', p]) })
+      expect(statusReads().map((c) => c.cmd), p).toEqual(['read_status'])
+    }
+  })
+
   it('换了仓库：局部重读不拿别的仓库的状态当「上一次」', async () => {
     const { result } = await loaded()
     act(() => { void result.current.refreshChanges('C:/other', unstagedA, ['a.txt']) })
@@ -167,6 +188,8 @@ describe('afterIndexWrite：Stage / Unstage 之后补上原来靠监听那一轮
     act(() => { a.result.current.afterIndexWrite('c:\\r') })
     // 只有 b 读状态（全量）：a 自己刚就地刷新过，别的仓库的标签不管
     expect(statusReads().map((p) => [p.cmd, p.args.path])).toEqual([['read_status', 'C:/r']])
+    // b 的 merge driver 横幅也要跟着重查（第二轮独立 review 第 2 条）：a 一次、b 一次
+    expect(pending.filter((p) => p.cmd === 'check_merge_drivers')).toHaveLength(2)
     b.unmount()
     pending.length = 0
     act(() => { a.result.current.afterIndexWrite('C:/r') })

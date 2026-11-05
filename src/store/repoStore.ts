@@ -589,6 +589,10 @@ export function useRepoStore() {
    * 只在单飞里写：同一个仓库的读取串行，它就总是最后开读的那一轮的结果。
    */
   const knownStatus = useRef(new Map<string, StatusData>())
+  /** 写操作之后的刷新（`refreshChanges`）开始的次数，`refreshDiff` 据此判断在跑的那轮能不能复用。 */
+  const writeSeq = useRef(0)
+  /** 每个 diff 单飞队列里正在跑的那一轮：读的是哪个 scope、开读时的 `writeSeq`、读完的信号。 */
+  const diffRunning = useRef(new Map<string, { scope: string, seq: number, done: Promise<void> }>())
   /**
    * 当前视图要显示哪一份 diff，由 `useRepoEffects` 每次渲染写入。
    *
@@ -741,7 +745,15 @@ export function useRepoStore() {
     else want.full = true
     statusWanted.current.set(path, want)
     const status = await refreshFlights.run(`status:${path}`, async () => {
-      const read = await readStatus(path)
+      let read: StatusData
+      try {
+        read = await readStatus(path)
+      } catch (err) {
+        // 这一轮没读到，「上一次的状态」就落后于磁盘：它本该反映的改动（比如文件监听那轮要读的保存）
+        // 不在里面。下一次局部重读不能在它上面合并，清掉让下一轮走全量（第二轮独立 review 第 1 条）
+        knownStatus.current.delete(path)
+        throw err
+      }
       knownStatus.current.set(path, read)
       if (lastStatusPath.current === path) setState((s) => ({ ...s, status: read }))
       return read
@@ -763,7 +775,12 @@ export function useRepoStore() {
     const want = statusWanted.current.get(path)
     statusWanted.current.delete(path)
     const prev = knownStatus.current.get(path)
-    if (want && !want.full && want.paths.size > 0 && prev) {
+    // 暂存区里的 .gitattributes 决定别的文件按什么 eol / text 规则比较：Stage / Unstage 它会让别的文件
+    // 在 Unstaged 里出现或消失，而 Staged 里看不出来，合并检测不到（第二轮独立 review 第 3 条）
+    const touchesAttributes = [...(want?.paths ?? [])].some(
+      (p) => p === '.gitattributes' || p.endsWith('/.gitattributes'),
+    )
+    if (want && !want.full && want.paths.size > 0 && prev && !touchesAttributes) {
       const touched = [...want.paths]
       try {
         const patch = await invoke<StatusPatch>('read_status_paths', { path, paths: touched })
@@ -1106,7 +1123,14 @@ export function useRepoStore() {
     }
   }
 
-  const refreshDiff = async (path: string, scope: string) => {
+  /**
+   * @param joinSince 给了就允许复用正在跑的那一轮：同一个 scope、且那一轮在第 `joinSince` 次写操作刷新
+   *   开始之后才开读（`writeSeq`）。按选中读的 effect 传 0（任何一轮都行，它只要数据）；写操作之后的刷新
+   *   传自己开始时的序号（写之前就在读的那轮读到的是旧数据，不能复用）。不给就照旧排补跑
+   *   （文件监听：在跑的那轮可能早于这次改动）。没有它的话，Stage 让选中的文件换到 Staged 时，
+   *   写之后的刷新和选中跟着变的 effect 会把同一个文件连读两次（第二轮独立 review 第 7 条）
+   */
+  const refreshDiff = async (path: string, scope: string, joinSince?: number) => {
     // 写回前再核对：只认当前视图要的那一份，切走之后才回来的旧 scope 结果丢掉
     lastDiffPath.current = path
     const stillWanted = () => {
@@ -1119,20 +1143,33 @@ export function useRepoStore() {
     // 「本地改动」的单文件 scope 例外，全部排在同一队里：方向键一路按下去，每个文件都会来一次，
     // 补跑只做最后一个，中间跳过的不读（6.13 方案 C）。各轮仍串行，写回照旧只认当前要的那一份
     const flight = isChangesFileScope(scope) ? `diff:${path}:changes-file` : `diff:${path}:${scope}`
+    const running = diffRunning.current.get(flight)
+    if (joinSince !== undefined && running?.scope === scope && running.seq >= joinSince) {
+      // 复用的调用方只等它读完，成败由发起那一轮的调用方报
+      return running.done
+    }
     await refreshFlights.run(flight, async () => {
-      let diff: DiffData
+      let finish!: () => void
+      const entry = { scope, seq: writeSeq.current, done: new Promise<void>((r) => { finish = r }) }
+      diffRunning.current.set(flight, entry)
       try {
-        diff = await invoke<DiffData>('read_diff', { path, scope })
-      } catch (err) {
-        // 读失败也要把这个 scope 记成「读过了」，不然界面会一直说「正在读取」；错误照旧抛给调用方。
-        // 带上原因：光一个空列表，界面上就成了「这个提交没有改动」（第 72 条）
-        // 用户已经离开的那份读失败了就安静地丢掉：照常抛的话，界面显示的是 B 的 diff，
-        // 顶部错误条却报 A 的「bad object」（PR 113 review）
-        if (!stillWanted()) return
-        setState((s) => ({ ...s, diff: { files: [], error: toErrorMessage(err) }, diffScope: scope }))
-        throw err
+        let diff: DiffData
+        try {
+          diff = await invoke<DiffData>('read_diff', { path, scope })
+        } catch (err) {
+          // 读失败也要把这个 scope 记成「读过了」，不然界面会一直说「正在读取」；错误照旧抛给调用方。
+          // 带上原因：光一个空列表，界面上就成了「这个提交没有改动」（第 72 条）
+          // 用户已经离开的那份读失败了就安静地丢掉：照常抛的话，界面显示的是 B 的 diff，
+          // 顶部错误条却报 A 的「bad object」（PR 113 review）
+          if (!stillWanted()) return
+          setState((s) => ({ ...s, diff: { files: [], error: toErrorMessage(err) }, diffScope: scope }))
+          throw err
+        }
+        if (stillWanted()) setState((s) => ({ ...s, diff, diffScope: scope }))
+      } finally {
+        if (diffRunning.current.get(flight) === entry) diffRunning.current.delete(flight)
+        finish()
       }
-      if (stillWanted()) setState((s) => ({ ...s, diff, diffScope: scope }))
     })
   }
 
@@ -1146,9 +1183,11 @@ export function useRepoStore() {
    *   会动工作区的操作（丢弃、提交、DU/UD 二选一）不传，照常全量读
    */
   const refreshChanges = async (path: string, selection: () => FileSelection, touched?: string[]) => {
+    // 这次写操作之后才开读的 diff 可以复用，之前的不行（`refreshDiff` 的 `joinSince`）
+    const since = ++writeSeq.current
     const status = await refreshStatus(path, touched)
     const scope = changesDiffScope(selection(), status)
-    if (scope) await refreshDiff(path, scope)
+    if (scope) await refreshDiff(path, scope, since)
   }
 
   /**
@@ -1171,6 +1210,8 @@ export function useRepoStore() {
       const mine = lastStatusPath.current
       if (!mine || !samePath(mine, path)) return
       void refreshStatus(mine).catch(() => undefined)
+      // merge driver 的检查也看 index（暂存的 .gitattributes），同样要重查（第二轮独立 review 第 2 条）
+      void refreshMergeDrivers(mine).catch(() => undefined)
       const scope = wantedDiffScope.current
       if (scope) void refreshDiff(mine, scope).catch(() => undefined)
     }
@@ -1235,7 +1276,7 @@ export interface RepoRefreshers {
   refreshWorktrees: (path: string) => Promise<void>
   /** `.gitattributes` 或 git 配置变了要重查；后端按指纹缓存，没变时不重扫。 */
   refreshMergeDrivers: (path: string) => Promise<DriverReport>
-  refreshDiff: (path: string, scope: string) => Promise<void>
+  refreshDiff: (path: string, scope: string, joinSince?: number) => Promise<void>
   refreshUpstream: (path: string) => Promise<void>
   refreshStashes: (path: string) => Promise<void>
   /** §6.6.3 第二档。只在第一档报告「有人动过」之后才调。 */
@@ -1282,7 +1323,8 @@ export function useRepoEffects(
     if (!state.path || !diffScope) return
     // 不 catch 的话失败是一个未处理的 rejection，顶部错误条什么都不显示（第 72 条）。
     // 与文件监听那条不同，这里是用户点了才读的，失败要让他看见
-    refreshDiff(state.path, diffScope).catch(reportError)
+    // 只要这一份数据：已经在读同一个 scope 就复用那一轮（Stage 之后写操作的刷新多半刚发出它）
+    refreshDiff(state.path, diffScope, 0).catch(reportError)
   }, [state.selectedId, state.path, diffScope])
 
   useEffect(() => {

@@ -124,6 +124,53 @@ describe('refreshDiff 只写回当前视图要的那一份', () => {
     expect(result.current.state.diffScope).toBe('staged:s.txt')
   })
 
+  // 第二轮独立 review 第 7 条：Stage 选中的文件后它换到了 Staged，写操作之后的刷新读一次
+  // `staged:a.txt`，选中跟着变又让 effect 再要一次。后一次不需要更新的数据，直接用在跑的那一轮
+  it('按选中读（可复用）：同一个 scope 已经在读，就用那一轮，不再补读', async () => {
+    const { result } = renderHook(() => useRepoStore())
+    result.current.wantedDiffScope.current = 'staged:a.txt'
+    act(() => {
+      void result.current.refreshChanges('C:/r', () => ({ section: 'staged', paths: ['a.txt'], anchor: 'a.txt' }), ['a.txt'])
+    })
+    const status = pending.find((p) => p.cmd === 'read_status')!
+    pending.splice(pending.indexOf(status), 1)
+    await act(async () => { status.resolve({ unstaged: [], staged: [{ path: 'a.txt', status: 'modified', additions: 1, deletions: 0 }] }) })
+    expect(pending.filter((p) => p.cmd === 'read_diff').map((p) => p.args.scope)).toEqual(['staged:a.txt'])
+    let joined!: Promise<void>
+    act(() => { joined = result.current.refreshDiff('C:/r', 'staged:a.txt', 0) })
+    await answer('staged:a.txt', diffOf('a.txt'))
+    await act(async () => { await joined })
+    expect(pending.filter((p) => p.cmd === 'read_diff')).toEqual([])
+  })
+
+  it('反过来：选中先读、写操作之后的刷新随后要同一个 scope，同样复用（那一轮是在写之后开读的）', async () => {
+    const { result } = renderHook(() => useRepoStore())
+    result.current.wantedDiffScope.current = 'staged:a.txt'
+    act(() => {
+      void result.current.refreshChanges('C:/r', () => ({ section: 'staged', paths: ['a.txt'], anchor: 'a.txt' }), ['a.txt'])
+    })
+    // 状态还没回来，选中就先触发了读取
+    act(() => { void result.current.refreshDiff('C:/r', 'staged:a.txt', 0) })
+    const status = pending.find((p) => p.cmd === 'read_status')!
+    pending.splice(pending.indexOf(status), 1)
+    await act(async () => { status.resolve({ unstaged: [], staged: [{ path: 'a.txt', status: 'modified', additions: 1, deletions: 0 }] }) })
+    expect(pending.filter((p) => p.cmd === 'read_diff').map((p) => p.args.scope)).toEqual(['staged:a.txt'])
+  })
+
+  it('写操作之前就在读的同一个 scope：写操作之后的刷新不复用它，照常补读', async () => {
+    const { result } = renderHook(() => useRepoStore())
+    result.current.wantedDiffScope.current = 'staged:a.txt'
+    act(() => { void result.current.refreshDiff('C:/r', 'staged:a.txt', 0) })
+    act(() => {
+      void result.current.refreshChanges('C:/r', () => ({ section: 'staged', paths: ['a.txt'], anchor: 'a.txt' }), ['a.txt'])
+    })
+    const status = pending.find((p) => p.cmd === 'read_status')!
+    pending.splice(pending.indexOf(status), 1)
+    await act(async () => { status.resolve({ unstaged: [], staged: [{ path: 'a.txt', status: 'modified', additions: 1, deletions: 0 }] }) })
+    await answer('staged:a.txt', diffOf('a.txt'))
+    expect(pending.filter((p) => p.cmd === 'read_diff').map((p) => p.args.scope)).toEqual(['staged:a.txt'])
+  })
+
   it('单个文件的读取不和提交详情的排在一起', () => {
     const { result } = renderHook(() => useRepoStore())
     act(() => {

@@ -382,11 +382,10 @@ pub fn read_diff(path: &str, scope: String) -> Result<DiffData> {
                 format!("无法解析的 diff 范围：{scope}"),
             ));
         }
-        let only = [file.to_string()];
         return if section == "staged" {
-            staged_side(&repo, tree.as_ref(), Some(&only))
+            staged_side(&repo, tree.as_ref(), Some(file))
         } else {
-            workdir_side(&repo, tree.as_ref(), Some(&only), |opts| {
+            workdir_side(&repo, tree.as_ref(), Some(file), |opts| {
                 repo.diff_index_to_workdir(None, Some(opts))
             })
         };
@@ -406,24 +405,22 @@ pub fn read_diff(path: &str, scope: String) -> Result<DiffData> {
     }
 }
 
-/// HEAD 对比暂存区，即这次提交会提交什么。`only` 非空时只比这几个路径（字面量匹配）。
+/// HEAD 对比暂存区，即这次提交会提交什么。`file` 非空时只要这一个文件，见 `diff_to_data_only`。
 fn staged_side(
     repo: &Repository,
     tree: Option<&git2::Tree>,
-    only: Option<&[String]>,
+    file: Option<&str>,
 ) -> Result<DiffData> {
     let mut opts = DiffOptions::new();
-    if let Some(paths) = only {
-        for p in paths {
-            opts.pathspec(p);
-        }
+    if let Some(f) = file {
+        opts.pathspec(f);
         // 字面量匹配，理由同 `workdir_diff_opts`
         opts.disable_pathspec_match(true);
     }
     // 不做改名检测：Staged 列表来自 `read_status`，它把 `git mv` 列成一删一增两项。
     // 这里若合成一条改名，点到旧路径那一项时右侧就找不到它的 diff
     let diff = repo.diff_tree_to_index(tree, None, Some(&mut opts))?;
-    let mut data = diff_to_data(diff)?;
+    let mut data = diff_to_data_only(diff, file)?;
     // 合并冲突中 index 里的冲突条目也会出现在这里，但 `read_status` 只把冲突文件放进
     // Unstaged（显示 HEAD 对比工作区）。留着它，Staged 的 diff 就多出列表里没有的项
     data.files.retain(|f| f.status != "conflicted");
@@ -431,20 +428,21 @@ fn staged_side(
 }
 
 /// 拿 `build` 给出的那一侧与工作区比。坏路径与冲突文件的处理两个 scope 共用。
-/// `only` 非空时只比这几个路径（字面量匹配），见 `workdir_diff_opts`。
+/// `file` 非空时只要这一个文件（字面量 pathspec + 精确匹配），见 `diff_to_data_only`。
 fn workdir_side<'r>(
     repo: &'r Repository,
     head_tree: Option<&git2::Tree>,
-    only: Option<&[String]>,
+    file: Option<&str>,
     build: impl Fn(&mut DiffOptions) -> std::result::Result<git2::Diff<'r>, git2::Error>,
 ) -> Result<DiffData> {
-    let diff = build(&mut workdir_diff_opts(only))?;
+    let only = file.map(|f| vec![f.to_string()]);
+    let diff = build(&mut workdir_diff_opts(only.as_deref()))?;
     let mut data = match readable_only(repo, &diff) {
-        None => diff_to_data(diff)?,
+        None => diff_to_data_only(diff, file)?,
         // 一个能读的都没有：返回空 diff 而不是让整个视图报错。
         // 注意此时不能拿空的 pathspec 去重建——那等于不加限制，又会撞上坏路径。
         Some(good) if good.is_empty() => DiffData { files: Vec::new() },
-        Some(good) => diff_to_data(build(&mut workdir_diff_opts(Some(&good)))?)?,
+        Some(good) => diff_to_data_only(build(&mut workdir_diff_opts(Some(&good)))?, file)?,
     };
     // 补不出来只是冲突文件没有行内容，不能让整个变更视图跟着报错
     if let Err(e) = fill_conflicted(repo, head_tree, &mut data) {
@@ -520,12 +518,23 @@ fn delta_status(status: git2::Delta) -> &'static str {
 /// 只是部分文件没有行内容。二进制文件同理——它压根不产出 '+'/'-' 行，
 /// 只有列表能证明它变过。
 fn diff_to_data(diff: git2::Diff) -> Result<DiffData> {
+    diff_to_data_only(diff, None)
+}
+
+/// 同 `diff_to_data`，`exact` 非空时只要路径恰好是它的那一项。
+///
+/// 单文件 scope 用的字面量 pathspec 在 libgit2 里仍按目录前缀匹配：已跟踪的文件 `assets` 换成了
+/// 未跟踪的同名目录时，点名 `assets` 会带出目录下每一个文件。`diff.print` 会把它们的内容全读一遍，
+/// 「只读一个文件」反而比整区读还慢（第二轮独立 review 第 6 条）。所以列表只建精确匹配的那一项，
+/// 补丁也只对它生成（`Patch::from_diff`），其余 delta 不碰内容。
+fn diff_to_data_only(diff: git2::Diff, exact: Option<&str>) -> Result<DiffData> {
     let mut files: Vec<FileDiff> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
+    let wanted = |path: &str| exact.map_or(true, |e| e == path);
 
     for delta in diff.deltas() {
         let path = delta_path(&delta);
-        if index.contains_key(&path) {
+        if index.contains_key(&path) || !wanted(&path) {
             continue;
         }
         let old_path = delta
@@ -543,56 +552,72 @@ fn diff_to_data(diff: git2::Diff) -> Result<DiffData> {
         });
     }
 
-    let outcome = diff.print(git2::DiffFormat::Patch, |delta, hunk, line| {
-        let Some(&i) = index.get(&delta_path(&delta)) else {
-            return true;
-        };
-        let file = &mut files[i];
+    let mut on_line =
+        |delta: git2::DiffDelta, hunk: Option<git2::DiffHunk>, line: git2::DiffLine| {
+            let Some(&i) = index.get(&delta_path(&delta)) else {
+                return true;
+            };
+            let file = &mut files[i];
 
-        // 二进制标记只在真正读了内容之后才立得起来，所以这里补一次：
-        // 建列表时 delta 的 BINARY 标志往往还没置上。
-        if line.origin() == 'B' || delta.flags().contains(git2::DiffFlags::BINARY) {
-            file.binary = true;
-        }
-        // libgit2 会把文件头（'F'）、hunk 头（'H'）、二进制标记（'B'）
-        // 也作为行回调抛出来，直接渲染就会出现 "F diff --git ..." 这种脏行。
-        if !matches!(line.origin(), '+' | '-' | ' ') {
-            return true;
-        }
+            // 二进制标记只在真正读了内容之后才立得起来，所以这里补一次：
+            // 建列表时 delta 的 BINARY 标志往往还没置上。
+            if line.origin() == 'B' || delta.flags().contains(git2::DiffFlags::BINARY) {
+                file.binary = true;
+            }
+            // libgit2 会把文件头（'F'）、hunk 头（'H'）、二进制标记（'B'）
+            // 也作为行回调抛出来，直接渲染就会出现 "F diff --git ..." 这种脏行。
+            if !matches!(line.origin(), '+' | '-' | ' ') {
+                return true;
+            }
 
-        let (old_start, new_start, header) = match hunk {
-            Some(h) => (
-                h.old_start(),
-                h.new_start(),
-                String::from_utf8_lossy(h.header())
+            let (old_start, new_start, header) = match hunk {
+                Some(h) => (
+                    h.old_start(),
+                    h.new_start(),
+                    String::from_utf8_lossy(h.header())
+                        .trim_end_matches('\n')
+                        .to_string(),
+                ),
+                None => (0, 0, String::new()),
+            };
+            let same_hunk = file
+                .hunks
+                .last()
+                .is_some_and(|h| h.old_start == old_start && h.new_start == new_start);
+            if !same_hunk {
+                file.hunks.push(DiffHunk {
+                    old_start,
+                    new_start,
+                    header,
+                    lines: Vec::new(),
+                });
+            }
+            file.hunks.last_mut().unwrap().lines.push(DiffLine {
+                origin: line.origin(),
+                content: std::str::from_utf8(line.content())
+                    .unwrap_or("")
                     .trim_end_matches('\n')
                     .to_string(),
-            ),
-            None => (0, 0, String::new()),
-        };
-        let same_hunk = file
-            .hunks
-            .last()
-            .is_some_and(|h| h.old_start == old_start && h.new_start == new_start);
-        if !same_hunk {
-            file.hunks.push(DiffHunk {
-                old_start,
-                new_start,
-                header,
-                lines: Vec::new(),
+                old_lineno: line.old_lineno(),
+                new_lineno: line.new_lineno(),
             });
-        }
-        file.hunks.last_mut().unwrap().lines.push(DiffLine {
-            origin: line.origin(),
-            content: std::str::from_utf8(line.content())
-                .unwrap_or("")
-                .trim_end_matches('\n')
-                .to_string(),
-            old_lineno: line.old_lineno(),
-            new_lineno: line.new_lineno(),
-        });
-        true
-    });
+            true
+        };
+    let outcome = match exact {
+        None => diff.print(git2::DiffFormat::Patch, |d, h, l| on_line(d, h, l)),
+        Some(_) => (|| {
+            for i in 0..diff.deltas().len() {
+                let keep = diff.get_delta(i).is_some_and(|d| wanted(&delta_path(&d)));
+                if !keep {
+                    continue;
+                }
+                if let Some(mut patch) = git2::Patch::from_diff(&diff, i)? {
+                    patch.print(&mut |d, h, l| on_line(d, h, l))?;
+                }
+            }
+            Ok(())
+        })(),
+    };
     if let Err(e) = outcome {
         log::warn!(
             "diff 输出中断，已保留 {} 个文件的结果：{}",
