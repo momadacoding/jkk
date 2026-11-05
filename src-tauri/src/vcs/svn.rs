@@ -103,10 +103,13 @@ impl Vcs for SvnGitBackend {
     }
     fn commit(&self, message: &str, amend: bool) -> Result<()> {
         assert_not_syncing(&self.root)?;
+        refuse_while_on_baseline(&self.root)?;
         self.git.commit(message, amend)
     }
     fn create_branch(&self, name: &str, start_point: Option<&str>) -> Result<()> {
         assert_not_syncing(&self.root)?;
+        // 基线丢了的时候新建一个同名分支，就成了一条没经过体检的「基线」（第 70 条）
+        refuse_baseline_branch(name)?;
         self.git.create_branch(name, start_point)
     }
     fn delete_branch(&self, name: &str) -> Result<()> {
@@ -190,7 +193,31 @@ fn refuse_baseline_branch(name: &str) -> Result<()> {
             "svn_baseline_branch_protected",
             format!(
                 "`{BASELINE_BRANCH}` 是 SVN 基线分支，记着「上次与服务器对齐时的内容」，\
-                 不能删除或改名，别的分支也不能改名成它。基线不对时请用「重建基线」。"
+                 不能删除或改名，也不能新建或改名出一个同名分支。\
+                 基线不对或丢了时请用「重建基线」。"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// HEAD 停在基线分支上时，commit（含 amend）/ revert 会直接移动 `svn/base`（第 70 条）。
+///
+/// 界面按 `isProtectedBaseline` 禁了提交，但后端不能只靠界面。checkout 到基线不拦：
+/// 查看基线内容是正当的，同步流程自己也会切过去。判据与 `refuse_baseline_branch` 一样不区分
+/// 大小写。`pub(crate)` 是给不走 trait 的 `commands::ops::revert` 用的。
+pub(crate) fn refuse_while_on_baseline(root: &str) -> Result<()> {
+    let head = crate::engine::git_read::symbolic_head(root)?;
+    let on_base = head
+        .as_deref()
+        .and_then(|h| h.strip_prefix("refs/heads/"))
+        .is_some_and(|b| b.eq_ignore_ascii_case(BASELINE_BRANCH));
+    if on_base {
+        return Err(GitError::new(
+            "svn_on_baseline_branch",
+            format!(
+                "当前停在 SVN 基线分支 `{BASELINE_BRANCH}` 上，在这里提交或撤销会直接移动基线。\
+                 请先切回工作分支。"
             ),
         ));
     }

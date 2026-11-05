@@ -5,8 +5,8 @@
 #[path = "common/svn_fixtures.rs"]
 mod svn_fixtures;
 
-use app_lib::commands::ops::{delete_branch, rename_branch};
-use app_lib::commands::svn::hold_for_baseline_move;
+use app_lib::commands::ops::{commit, create_branch, delete_branch, rename_branch, revert};
+use app_lib::commands::svn::{hold_for_baseline_move, svn_rebuild_baseline, svn_sync_status};
 use app_lib::engine::git_cli::run_git;
 use app_lib::engine::svn_journal::{self, Flow, Journal, Phase};
 use app_lib::engine::svn_lock;
@@ -99,6 +99,104 @@ fn other_branches_are_still_renamed_and_deleted() {
     // 名字里带 `svn/base` 的普通分支不受影响（精确匹配，同 `capabilities.ts::isBaselineBranch`）
     git(&fx, &["branch", "svn/base-backup", "work"]);
     delete_branch(fx.wc_str(), "svn/base-backup".into()).unwrap();
+}
+
+// —— 第 70 条：别的分支不能冒充基线，HEAD 在基线上时不能提交 ——
+
+#[test]
+fn a_branch_named_like_the_baseline_cannot_be_created() {
+    // 基线丢了的时候新建一个叫 svn/base 的分支，就成了一条没经过体检的「基线」
+    let fx = hybrid_with_colleague();
+    git(&fx, &["branch", "-D", "svn/base"]);
+    for name in ["svn/base", "SVN/Base", "refs/heads/svn/base"] {
+        let err = create_branch(fx.wc_str(), name.into(), Some("work".into())).unwrap_err();
+        assert_eq!(
+            err.code, "svn_baseline_branch_protected",
+            "{name}：{}",
+            err.message
+        );
+    }
+    assert!(run_git(&fx.wc_str(), &["rev-parse", "--verify", "svn/base"]).is_err());
+}
+
+#[test]
+fn committing_or_reverting_while_head_is_on_the_baseline_is_refused() {
+    let fx = hybrid_with_colleague();
+    let base = git(&fx, &["rev-parse", "svn/base"]);
+    git(&fx, &["checkout", "-q", "svn/base"]);
+    std::fs::write(fx.wc().join("Code/Extra.cs"), "class Extra {}\n").unwrap();
+    git(&fx, &["add", "Code/Extra.cs"]);
+
+    for amend in [false, true] {
+        let err = commit(fx.wc_str(), "on base".into(), amend).unwrap_err();
+        assert_eq!(
+            err.code, "svn_on_baseline_branch",
+            "amend={amend}：{}",
+            err.message
+        );
+    }
+    let err = revert(fx.wc_str(), "HEAD".into()).unwrap_err();
+    assert_eq!(err.code, "svn_on_baseline_branch", "{}", err.message);
+    assert_eq!(git(&fx, &["rev-parse", "svn/base"]), base, "基线被移动了");
+}
+
+#[test]
+fn committing_on_a_work_branch_is_unaffected() {
+    let fx = hybrid_with_colleague();
+    std::fs::write(fx.wc().join("Code/Extra.cs"), "class Extra {}\n").unwrap();
+    git(&fx, &["add", "Code/Extra.cs"]);
+    commit(fx.wc_str(), "on work".into(), false).unwrap();
+}
+
+#[test]
+fn in_a_plain_git_repo_a_branch_called_svn_base_is_just_a_branch() {
+    // 与 `isProtectedBaseline` 只在 vcs === 'svn' 时生效一致
+    let dir = tempfile::TempDir::new().unwrap();
+    let p = dir.path().to_string_lossy().to_string();
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["config", "user.email", "t@t"],
+        vec!["config", "user.name", "T"],
+        vec!["commit", "--allow-empty", "-m", "c1"],
+    ] {
+        run_git(&p, &args).unwrap();
+    }
+    create_branch(p.clone(), "svn/base".into(), None).unwrap();
+    run_git(&p, &["checkout", "-q", "svn/base"]).unwrap();
+    std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+    run_git(&p, &["add", "a.txt"]).unwrap();
+    commit(p.clone(), "c2".into(), false).unwrap_or_else(|e| panic!("{}", e.message));
+    std::fs::write(dir.path().join("a.txt"), "b\n").unwrap();
+    run_git(&p, &["add", "a.txt"]).unwrap();
+    commit(p, "c3".into(), true).unwrap_or_else(|e| panic!("{}", e.message));
+}
+
+// —— 第 70 条：基线丢了之后「重建基线」从零录一条 ——
+
+#[test]
+fn rebuilding_after_the_baseline_was_deleted_records_a_new_one() {
+    let fx = hybrid_with_colleague();
+    let old = git(&fx, &["rev-parse", "svn/base"]);
+    git(&fx, &["branch", "-D", "svn/base"]);
+
+    let report = svn_rebuild_baseline(fx.wc_str()).unwrap_or_else(|e| panic!("{}", e.message));
+
+    assert_eq!(report.old_baseline, "", "没有旧基线时报空串");
+    assert_eq!(git(&fx, &["rev-parse", "svn/base"]), report.new_baseline);
+    // 父提交接回 HEAD 历史里最近的那条基线，工作分支与新基线仍有共同祖先
+    assert_eq!(git(&fx, &["rev-parse", "svn/base^"]), old);
+    assert_eq!(git(&fx, &["merge-base", "work", "svn/base"]), old);
+    // 失同步判定重新有了参照
+    svn_sync_status(fx.wc_str()).unwrap_or_else(|e| panic!("{}", e.message));
+}
+
+#[test]
+fn rebuilding_with_the_baseline_present_still_moves_it_from_the_old_one() {
+    let fx = hybrid_with_colleague();
+    let old = git(&fx, &["rev-parse", "svn/base"]);
+    let report = svn_rebuild_baseline(fx.wc_str()).unwrap_or_else(|e| panic!("{}", e.message));
+    assert_eq!(report.old_baseline, old);
+    assert_eq!(git(&fx, &["rev-parse", "svn/base^"]), old);
 }
 
 // —— 移动基线的命令全程持同步锁 ——

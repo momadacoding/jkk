@@ -150,6 +150,11 @@ pub fn revert(path: String, rev: String) -> Result<()> {
     // `new-tag` / `cherry-pick` / `save-patch`，revert 走 `?? true`，
     // 在 SVN 混合仓库上是**完全可用**的。
     crate::engine::svn_lock::assert_not_syncing(&path)?;
+    // HEAD 停在基线上时 revert 会移动 `svn/base`（第 70 条）。只在混合仓库里查：
+    // 普通 git 仓库里叫这个名字的分支就是一条普通分支
+    if crate::vcs::detect_repo_kind(&path) == crate::vcs::RepoKind::SvnHybrid {
+        crate::vcs::svn::refuse_while_on_baseline(&path)?;
+    }
     // --no-edit：GUI 里没有终端，不加这个 git 会拉起编辑器等一个永远不会来的输入
     run_git(&path, &["revert", "--no-edit", &rev])?;
     Ok(())

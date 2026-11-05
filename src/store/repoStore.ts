@@ -163,6 +163,11 @@ export interface RepoState {
    * 都等于每次打开都闪一下。`describeSync(null)` 因此返回 `null`。
    */
   svnSync: SyncStatus | null
+  /**
+   * 最近一次失同步判定报了 `svn_no_baseline`：基线分支 `svn/base` 不存在（第 70 条）。
+   * 只在判定失败时写；成功时不清，由 `describeMissingBaseline` 看到有结论就不挂横幅。
+   */
+  svnBaselineMissing: boolean
   /** 服务器侧清单核对（§6.3.1 / NB-2）。走网络，失败静默。 */
   svnAudit: ServerAudit | null
   /**
@@ -223,6 +228,7 @@ const initialState: RepoState = {
   errorCode: null,
   pinned: [],
   svnSync: null,
+  svnBaselineMissing: false,
   svnAudit: null,
   svnEol: null,
   svnSyncState: null,
@@ -622,6 +628,7 @@ export function useRepoStore() {
         setState((s) => ({
           ...s,
           svnSync: null,
+          svnBaselineMissing: false,
           svnAudit: null,
           svnEol: null,
           svnSyncState: null,
@@ -803,7 +810,15 @@ export function useRepoStore() {
     try {
       st = await svnSyncStatus(path)
     } catch (err) {
-      if (refreshGate.isLatest(token, 'svnSync')) latestVerdict.current = null
+      if (refreshGate.isLatest(token, 'svnSync')) {
+        latestVerdict.current = null
+        // 基线分支丢了（第 70 条）：旧结论作废，横幅换成恢复入口。别的失败（网络、锁）
+        // 照旧保留上一次的结论，那时基线还在
+        const missing = toErrorCode(err) === 'svn_no_baseline'
+        setState((s) => (samePath(s.path ?? '', path)
+          ? { ...s, svnBaselineMissing: missing, ...(missing ? { svnSync: null } : {}) }
+          : s))
+      }
       throw err
     }
     if (!refreshGate.isLatest(token, 'svnSync')) return

@@ -899,6 +899,7 @@ export function RepoTab({
         audit={state.svnAudit}
         eol={state.svnEol}
         syncState={state.svnSyncState}
+        baselineMissing={state.svnBaselineMissing}
         onRebuild={() => void handleRebuildBaseline()}
         onCheck={() => void handleCheckBaseline()}
         onMigrateEol={() => void handleMigrateEol()}

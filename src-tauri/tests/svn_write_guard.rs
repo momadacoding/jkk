@@ -197,7 +197,7 @@ fn commands_moving_the_baseline_hold_the_lock_throughout() {
     let src = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/svn.rs"))
         .unwrap();
     for (func, engine_fn) in [
-        ("svn_rebuild_baseline", "rebuild_baseline("),
+        ("svn_rebuild_baseline", "rebuild_or_recover_baseline("),
         ("svn_migrate_eol", "migrate_eol("),
     ] {
         let body = fn_body(&src, func);

@@ -239,7 +239,10 @@ export function needsStandaloneCheck(
   isSvn: boolean,
   sync: SyncStatus | null,
   eol: EolStatus | null,
+  /** 基线分支不存在（第 70 条）：体检同样要读基线，入口点了只会报错，出口在恢复横幅上。 */
+  baselineMissing = false,
 ): boolean {
+  if (baselineMissing) return false
   // 迁移没做完时基线本来就不可信，挂一个「体检基线」只会给出误导性的结论
   // ——体检比的是磁盘与服务器，而此刻的问题出在基线自己的形状上。
   //
@@ -321,6 +324,32 @@ export function describeEolMigration(
  * ——那时 `describeEolMigration` 自己返回 `null`，失同步横幅照常渲染，因为
  * 它指的是另一件**必须先做**的事。
  */
+/**
+ * 基线分支 `svn/base` 不存在时的恢复横幅（第 70 条）。不用挂时返回 `null`。
+ *
+ * 读基线失败（`svn_no_baseline`）时失同步判定无从做起，原来界面上什么都不显示，
+ * 用户在应用里没有出路：别的分支又不许改名成基线。后端的「重建基线」在基线不存在时
+ * 从零录一条，走的是与平时重建相同的预检和体检。
+ *
+ * 已经有同步结论（重建成功、或者用户在别处把基线弄回来了）就不挂：标记可能还没来得及清，
+ * 但结论本身说明基线是读得到的。
+ */
+export function describeMissingBaseline(
+  missing: boolean,
+  sync: SyncStatus | null,
+): BannerModel | null {
+  if (!missing || sync) return null
+  return {
+    tone: 'danger',
+    title: '基线分支 svn/base 不见了',
+    detail:
+      '失同步判定、体检、更新和交付都以它为参照，现在都做不了。' +
+      '重建基线会按服务器上当前的版本重新录一条，并接在你当前分支历史里最近的那条基线之后。',
+    note: '不会修改工作目录里的任何文件，也不会推进你的工作分支。',
+    actions: [{ id: 'rebuild', label: '重建基线' }],
+  }
+}
+
 export function syncBannerIsSuppressed(
   eol: EolStatus | null,
   sync: SyncStatus | null,
