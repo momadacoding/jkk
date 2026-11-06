@@ -149,7 +149,7 @@ export function RepoTab({
   const {
     state, openRepo, refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers,
     refreshDiff, refreshUpstream, refreshStashes, refreshPullRequests,
-    refreshSvnSync, refreshSvnEol, refreshSvnSyncState, refreshSvnBranchesBehind, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, checkSvnSyncOnFocus, markSvnFollowOnBlur, fetchSvnLog, refreshSvnAudit, auditSvnIfDue,
+    refreshSvnSync, refreshSvnEol, refreshSvnSyncState, refreshSvnBranchesBehind, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, checkSvnSyncOnFocus, freshSvnSync, markSvnFollowOnBlur, fetchSvnLog, refreshSvnAudit, auditSvnIfDue,
     selectCommit, clearError, reportError, wantedDiffScope, refreshChanges: refreshChangesIn, afterIndexWrite,
   } = useRepoStore()
   const [repoState, setRepoState] = useState<string>('normal')
@@ -279,22 +279,29 @@ export function RepoTab({
   )
 
   const handleCommit = useCallback(async (msg: string, amend: boolean): Promise<boolean> => {
-    if (!state.path) return false
-    // 事故分析 6.6：SVN 带进来的内容还没跟进就提交，会被记成「你的提交」（11-05 的快照提交）
+    const path = state.path
+    if (!path) return false
+    // 事故分析 6.6：SVN 带进来的内容还没跟进就提交，会被记成「你的提交」（11-05 的快照提交）。
+    // 结论先刷一次：TortoiseSVN 刚更新完时 state 里的可能还是旧的（review 第 4 条）
     if (state.capabilities.vcs === 'svn') {
       const staged = (state.status?.staged ?? []).map((f) => f.path)
-      const warning = commitBeforeFollowWarning(staged, state.svnSync)
-      if (warning && !(await confirm({ ...warning, focusCancel: true }))) return false
+      if (staged.length > 0) {
+        const warning = commitBeforeFollowWarning(staged, await freshSvnSync(path))
+        if (warning && !(await confirm({ ...warning, focusCancel: true }))) return false
+      }
     }
     try {
-      await invoke('commit', { path: state.path, message: msg, amend })
-      await refreshGraph(state.path)
-      await refreshChanges(state.path)
+      await invoke('commit', { path, message: msg, amend })
     } catch (err) {
       reportError(err)
+      // 没提交上（hook 拒绝、同步进行中……）：写好的说明留着（review 第 6 条）
+      return false
     }
+    // 提交已经成功：刷新失败不影响「说明可以清空」
+    await refreshGraph(path).catch(reportError)
+    await refreshChanges(path).catch(reportError)
     return true
-  }, [state.path, state.capabilities.vcs, state.status, state.svnSync, confirm, refreshGraph, refreshChanges, reportError])
+  }, [state.path, state.capabilities.vcs, state.status, freshSvnSync, confirm, refreshGraph, refreshChanges, reportError])
 
   const runAndRefresh = useCallback(async (cmd: string, args: Record<string, unknown>, refresh: () => Promise<void>) => {
     if (!state.path) return

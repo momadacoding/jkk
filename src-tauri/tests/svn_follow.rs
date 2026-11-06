@@ -1514,6 +1514,8 @@ fn branch_entry_sends_a_stale_disk_to_manual_follow() {
     let status = check_sync(&fx.wc_str()).unwrap();
     assert!(matches!(status.verdict, SyncVerdict::InSync));
     assert!(status.head_behind_base);
+    // 事故分析 6.6：提交前的提醒拿它与暂存求交集
+    assert_eq!(status.behind_paths, vec![A.to_string()]);
     let head = oid(&fx, "HEAD");
     let index = std::fs::read(fx.wc().join(".git/index")).unwrap();
 

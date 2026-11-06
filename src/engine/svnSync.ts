@@ -62,6 +62,8 @@ export interface SyncStatus {
   base: BaseMapSummary
   /** 当前分支不包含 `svn/base`，且分叉点是一条基线 commit：基线发布了，分支没跟上。 */
   headBehindBase: boolean
+  /** `headBehindBase` 时分支基线到 `svn/base` 改过的文件（事故分析 6.6 的提交前提醒用）。旧后端没有。 */
+  behindPaths?: string[]
 }
 
 /** 后端 `svn_server_set::ServerAudit`，判别字段是 `status`。 */

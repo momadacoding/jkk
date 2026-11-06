@@ -40,11 +40,26 @@ describe('commitBeforeFollowWarning（事故分析 6.6）', () => {
     expect(commitBeforeFollowWarning([], advanced)).toBeNull()
   })
 
-  it('分支落后基线时「本地改动」里混着基线带进来的文件：有暂存就提醒', () => {
-    const behind: SyncStatus = { ...inSync, headBehindBase: true }
-    const w = commitBeforeFollowWarning(['Code/Mine.cs'], behind)!
-    expect(w.message).toContain('落后基线')
-    expect(commitBeforeFollowWarning([], behind)).toBeNull()
+  it('分支落后基线：暂存落在基线带进来的文件里才提醒，不是有暂存就弹', () => {
+    // review 第 3 条：用应用切到一条老分支时磁盘是它自己的内容，「有暂存就弹」会每次提交都打扰
+    const behind: SyncStatus = { ...inSync, headBehindBase: true, behindPaths: ['Code/A.cs'] }
+    const w = commitBeforeFollowWarning(['Code/A.cs', 'Code/Mine.cs'], behind)!
+    expect(w.message).toContain('Code/A.cs')
+    expect(w.message).not.toContain('Code/Mine.cs')
+    expect(commitBeforeFollowWarning(['Code/Mine.cs'], behind)).toBeNull()
+    // 旧后端没有 behindPaths：不打扰
+    expect(commitBeforeFollowWarning(['Code/A.cs'], { ...inSync, headBehindBase: true })).toBeNull()
+  })
+
+  it('又 update 了一次、分支同时落后基线：两份清单都看', () => {
+    // review 第 2 条：externallyAdvanced 但暂存与 SVN 新改动不相交时，不能跳过落后基线那份
+    const both: SyncStatus = { ...advanced, headBehindBase: true, behindPaths: ['Code/Old.cs'] }
+    const w = commitBeforeFollowWarning(['Code/Old.cs'], both)!
+    expect(w.message).toContain('Code/Old.cs')
+  })
+
+  it('路径大小写不同也认得（Windows）', () => {
+    expect(commitBeforeFollowWarning(['code/a.CS'], advanced)).not.toBeNull()
   })
 
   it('不是 SVN 仓库、还没读到状态、已经同步：不打扰', () => {
