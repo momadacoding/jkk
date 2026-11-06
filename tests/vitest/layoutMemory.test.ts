@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  layoutToRestore,
   parseSectionMemory,
   sanitizePanelLayout,
   sectionOpen,
@@ -36,6 +37,24 @@ describe('sectionOpen / withSectionOpen', () => {
     const after = withSectionOpen(before, 'worktrees', true)
     expect(after).toEqual({ branches: false, worktrees: true })
     expect(before).toEqual({ branches: false })
+  })
+})
+
+describe('layoutToRestore', () => {
+  it('隐藏时挂载、按默认值算出的布局与存档不同：补上存档', () => {
+    const saved = { sidebar: 36.8, main: 63.2 }
+    expect(layoutToRestore(saved, { sidebar: 22, main: 78 })).toEqual(saved)
+  })
+
+  it('没有存档、已经一样（含四舍五入误差）时不动', () => {
+    expect(layoutToRestore(undefined, { sidebar: 22, main: 78 })).toBeNull()
+    expect(layoutToRestore({ sidebar: 36.824, main: 63.176 }, { sidebar: 36.8, main: 63.2 })).toBeNull()
+  })
+
+  it('面板集合对不上（另一套面板留下的存档）时不动', () => {
+    expect(layoutToRestore({ sidebar: 30, main: 70 }, { graph: 65, detail: 35 })).toBeNull()
+    expect(layoutToRestore({ sidebar: 30 }, { sidebar: 22, main: 78 })).toBeNull()
+    expect(layoutToRestore({}, {})).toBeNull()
   })
 })
 

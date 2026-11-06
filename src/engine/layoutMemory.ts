@@ -77,6 +77,26 @@ export function withSectionOpen(memory: SectionMemory, key: SidebarSectionKey, o
   return { ...memory, [key]: open }
 }
 
+/** 面板 id → 百分比。与 `react-resizable-panels` 的 `Layout` 同形，这里不引 UI 库的类型。 */
+export type PanelLayout = Record<string, number>
+
+/**
+ * 面板组在隐藏状态下挂载、第一次有尺寸之后，要不要把记住的布局补上去。
+ *
+ * 返回要设置的布局；不需要（没存档、面板对不上、已经一样）时返回 `null`。
+ * 面板集合对不上说明存档是另一套面板留下的，硬套上去会把比例分给不存在的面板。
+ * 容差 0.1 个百分点：库会把比例四舍五入，完全相等的比较会造成多余的 setLayout。
+ */
+export function layoutToRestore(saved: PanelLayout | undefined, current: PanelLayout): PanelLayout | null {
+  if (!saved) return null
+  const savedKeys = Object.keys(saved)
+  const currentKeys = Object.keys(current)
+  if (savedKeys.length === 0 || savedKeys.length !== currentKeys.length) return null
+  if (!currentKeys.every((k) => k in saved)) return null
+  const same = currentKeys.every((k) => Math.abs(saved[k] - current[k]) < 0.1)
+  return same ? null : saved
+}
+
 /**
  * 校验面板布局存档，合法时原样返回，否则返回 `null`（等同于没有存档）。
  *

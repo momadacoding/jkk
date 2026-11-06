@@ -162,12 +162,6 @@ export function RepoTab({
   // 面板分割比例记在所有仓库标签共用的存档里：拖宽侧边栏是对「这个应用」的偏好，不是对某个仓库的
   const mainLayout = usePanelLayout(PANEL_GROUP_IDS.repoMain)
   const commitsLayout = usePanelLayout(PANEL_GROUP_IDS.repoCommits)
-  // 标签第一次成为活动标签之前不挂面板区。App 把后台标签挂着、用 display:none 藏起来，
-  // 这时 Group 量到的宽度是 0，库会把 defaultLayout 搁置，等第一次真正有尺寸时改用各 Panel
-  // 的 defaultSize 重算——记住的分割比例就被跳过了，重启后只有当时的活动标签能还原。
-  // 后台标签本来也看不见、点不到，晚挂面板区不丢东西；数据加载走 store，不受影响
-  const [everActive, setEverActive] = useState(active)
-  if (active && !everActive) setEverActive(true)
   // 「本地改动」的选中放在这里而不是 `LocalChangesView` 里：右侧 diff 按选中文件所在的区读
   // （Unstaged 读暂存区对比工作区，Staged 读 HEAD 对比暂存区，第 65 条），读哪个区要在
   // 渲染时就算出来——等子组件挂载后再报上来的话，第一次渲染会先读错一个区
@@ -993,7 +987,6 @@ export function RepoTab({
       />
       <div className="repo-path-bar" title={state.path ?? ''}>{state.path} @ {state.head}</div>
       <div style={{ flex: 1, overflow: 'hidden' }}>
-        {everActive && (<>
         {/* 不给 Group 传 id：库按 id 在全局注册表里找 Group，多个仓库标签同时挂载时
             同一个 id 会串到别的标签上。存档键由 useDefaultLayout 的 id 决定，与此无关 */}
         <Group orientation="horizontal" {...mainLayout}>
@@ -1128,7 +1121,6 @@ export function RepoTab({
             )}
           </Panel>
         </Group>
-        </>)}
       </div>
       {promptDialog}
       {deliverDialog}
