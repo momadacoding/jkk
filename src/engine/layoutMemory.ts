@@ -6,12 +6,16 @@
  * 回到默认布局，不能把解析错误顶到渲染路径上（侧边栏渲染不出来比忘了布局糟得多）。
  */
 
-/** 侧边栏里会被记住展开状态的分区。新增分区要在这里登记，避免键名手写拼错。 */
+/**
+ * 侧边栏里会被记住展开状态的分区。新增分区要在这里登记，避免键名手写拼错。
+ *
+ * TAGS 故意不在里面：它要求每次启动都收起（tag 只是偶尔查一下），记住「展开」
+ * 会让点开过一次之后所有仓库、每次启动都展开，正好违背这个要求。
+ */
 export type SidebarSectionKey =
   | 'branches'
   | 'branches.local'
   | 'branches.remote'
-  | 'tags'
   | 'worktrees'
   | 'stashes'
 
@@ -30,7 +34,17 @@ export const PANEL_GROUP_IDS = {
   repoMain: 'mygitclient.layout.repo-main.v1',
   /** Commits 视图里的 提交图 / 提交详情 */
   repoCommits: 'mygitclient.layout.repo-commits.v1',
+  /** Changes 视图里的 文件列表 | diff */
+  changesMain: 'mygitclient.layout.changes-main.v1',
+  /** Changes 视图里的 Unstaged / Staged */
+  changesLists: 'mygitclient.layout.changes-lists.v1',
+  /** 提交详情 Changes 页的 文件树 | diff */
+  commitChanges: 'mygitclient.layout.commit-changes.v1',
+  /** 提交详情 File Tree 页的 文件树 | 文件内容 */
+  commitTree: 'mygitclient.layout.commit-tree.v1',
 } as const
+
+export type PanelGroupId = (typeof PANEL_GROUP_IDS)[keyof typeof PANEL_GROUP_IDS]
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)

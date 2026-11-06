@@ -1,6 +1,7 @@
-import type { LayoutStorage } from 'react-resizable-panels'
+import { useDefaultLayout, type LayoutStorage } from 'react-resizable-panels'
 import {
   SECTION_MEMORY_KEY,
+  type PanelGroupId,
   parseSectionMemory,
   sanitizePanelLayout,
   sectionOpen,
@@ -55,7 +56,23 @@ export function saveSectionOpen(key: SidebarSectionKey, open: boolean): void {
 }
 
 /** 给 `useDefaultLayout` 用的存储：读出来的存档先校验，坏的当作没有。 */
-export const panelLayoutStorage: LayoutStorage = {
+const panelLayoutStorage: LayoutStorage = {
   getItem: (key) => sanitizePanelLayout(readRaw(key)),
   setItem: (key, value) => writeRaw(key, value),
+}
+
+/**
+ * 记住一个 `<Group>` 的分割比例，返回值直接展开到 Group 上：`<Group {...usePanelLayout(id)}>`。
+ *
+ * 只存用户亲手拖出来的布局——窗口缩放、挂载时库自己算出来的布局不该覆盖记忆。
+ * Group 里的每个 `<Panel>` 都要给固定的 `id`，存档按面板 id 对应；
+ * 不要把 `id` 也传给 `<Group>`，原因见 `PANEL_GROUP_IDS`。
+ */
+export function usePanelLayout(id: PanelGroupId) {
+  const { defaultLayout, onLayoutChanged } = useDefaultLayout({
+    id,
+    storage: panelLayoutStorage,
+    onlySaveAfterUserInteractions: true,
+  })
+  return { defaultLayout, onLayoutChanged }
 }

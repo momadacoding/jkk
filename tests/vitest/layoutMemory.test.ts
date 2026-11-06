@@ -26,15 +26,15 @@ describe('parseSectionMemory', () => {
 
 describe('sectionOpen / withSectionOpen', () => {
   it('没记过用默认值，记过用记忆——包括记的是 false', () => {
-    expect(sectionOpen({}, 'tags', false)).toBe(false)
-    expect(sectionOpen({ tags: true }, 'tags', false)).toBe(true)
+    expect(sectionOpen({}, 'worktrees', false)).toBe(false)
+    expect(sectionOpen({ worktrees: true }, 'worktrees', false)).toBe(true)
     expect(sectionOpen({ branches: false }, 'branches', true)).toBe(false)
   })
 
   it('写入一个分区不影响其他分区，也不改入参', () => {
     const before = { branches: false }
-    const after = withSectionOpen(before, 'tags', true)
-    expect(after).toEqual({ branches: false, tags: true })
+    const after = withSectionOpen(before, 'worktrees', true)
+    expect(after).toEqual({ branches: false, worktrees: true })
     expect(before).toEqual({ branches: false })
   })
 })

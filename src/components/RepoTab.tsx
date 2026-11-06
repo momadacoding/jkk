@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { Panel, Group, Separator, useDefaultLayout } from 'react-resizable-panels'
+import { Panel, Group, Separator } from 'react-resizable-panels'
 import { PANEL_GROUP_IDS } from '@/engine/layoutMemory'
-import { panelLayoutStorage } from '@/store/layoutStore'
+import { usePanelLayout } from '@/store/layoutStore'
 import { GraphView } from './GraphView'
 import { BranchView } from './BranchView'
 import { TagView } from './TagView'
@@ -159,18 +159,9 @@ export function RepoTab({
   // ——`create_tag` 与整个 commands/worktree.rs 都还没进接缝，仍直接跑 git CLI。
   const sections = visibleSections(state.capabilities)
   const [viewMode, setViewMode] = useState<ViewMode>('commits')
-  // 面板分割比例记在所有仓库标签共用的存档里：拖宽侧边栏是对「这个应用」的偏好，不是对某个仓库的。
-  // 只存用户亲手拖出来的布局——窗口缩放、隐藏标签挂载时库自己算出来的布局不该覆盖记忆
-  const mainLayout = useDefaultLayout({
-    id: PANEL_GROUP_IDS.repoMain,
-    storage: panelLayoutStorage,
-    onlySaveAfterUserInteractions: true,
-  })
-  const commitsLayout = useDefaultLayout({
-    id: PANEL_GROUP_IDS.repoCommits,
-    storage: panelLayoutStorage,
-    onlySaveAfterUserInteractions: true,
-  })
+  // 面板分割比例记在所有仓库标签共用的存档里：拖宽侧边栏是对「这个应用」的偏好，不是对某个仓库的
+  const mainLayout = usePanelLayout(PANEL_GROUP_IDS.repoMain)
+  const commitsLayout = usePanelLayout(PANEL_GROUP_IDS.repoCommits)
   // 标签第一次成为活动标签之前不挂面板区。App 把后台标签挂着、用 display:none 藏起来，
   // 这时 Group 量到的宽度是 0，库会把 defaultLayout 搁置，等第一次真正有尺寸时改用各 Panel
   // 的 defaultSize 重算——记住的分割比例就被跳过了，重启后只有当时的活动标签能还原。
@@ -1005,11 +996,7 @@ export function RepoTab({
         {everActive && (<>
         {/* 不给 Group 传 id：库按 id 在全局注册表里找 Group，多个仓库标签同时挂载时
             同一个 id 会串到别的标签上。存档键由 useDefaultLayout 的 id 决定，与此无关 */}
-        <Group
-          orientation="horizontal"
-          defaultLayout={mainLayout.defaultLayout}
-          onLayoutChanged={mainLayout.onLayoutChanged}
-        >
+        <Group orientation="horizontal" {...mainLayout}>
           {/* 22%：分支名普遍带 feat/ 前缀，20% 时连 worktree 名字都存不下 */}
           <Panel id="sidebar" defaultSize="22%" minSize="15%" maxSize="40%" style={{ display: 'flex', flexDirection: 'column' }}>
             <div style={{ flex: 1, overflow: 'auto' }}>
@@ -1086,11 +1073,7 @@ export function RepoTab({
           <Separator style={{ width: 4, background: '#333' }} />
           <Panel id="main" minSize="30%">
             {viewMode === 'commits' ? (
-              <Group
-                orientation="vertical"
-                defaultLayout={commitsLayout.defaultLayout}
-                onLayoutChanged={commitsLayout.onLayoutChanged}
-              >
+              <Group orientation="vertical" {...commitsLayout}>
                 <Panel id="graph" minSize="30%">
                   <GraphView
                     commits={state.commits}

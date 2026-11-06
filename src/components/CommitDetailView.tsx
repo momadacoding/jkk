@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { Panel, Group, Separator } from 'react-resizable-panels'
+import { PANEL_GROUP_IDS } from '@/engine/layoutMemory'
+import { usePanelLayout } from '@/store/layoutStore'
 import type { CommitNode, DiffData } from '../engine/types'
 import { buildFileTree } from '../engine/fileTree'
 import { deliveredNote, svnDiffGap } from '../engine/svnGraph'
@@ -81,6 +83,9 @@ export function CommitDetailView({
   const [picked, setPicked] = useState<string | null>(null)
   const [listing, setListing] = useState<TreeListing | null>(null)
   const [listError, setListError] = useState<string | null>(null)
+  // Changes 页与 File Tree 页各记各的分割：一个看 diff、一个看整文件，合适的宽度不一样
+  const changesLayout = usePanelLayout(PANEL_GROUP_IDS.commitChanges)
+  const treeLayout = usePanelLayout(PANEL_GROUP_IDS.commitTree)
   const { menu, open, close } = useContextMenu()
   const loading = diff === null
   const files = diff?.files ?? NO_FILES
@@ -130,8 +135,8 @@ export function CommitDetailView({
   // 改动列表与 diff 的分栏；diff 还没读回来时整块换成一句说明
   const changesSplit = loading || failedNote ? <div className="diff-note">{failedNote ?? LOADING_NOTE}</div> : (
     <div className="commit-split">
-      <Group orientation="horizontal">
-        <Panel defaultSize="30%" minSize="15%" maxSize="60%">
+      <Group orientation="horizontal" {...changesLayout}>
+        <Panel id="files" defaultSize="30%" minSize="15%" maxSize="60%">
           <FileTree
             nodes={changesTree}
             selectedPath={activePath}
@@ -140,7 +145,7 @@ export function CommitDetailView({
           />
         </Panel>
         <Separator className="separator-v" />
-        <Panel minSize="30%">
+        <Panel id="diff" minSize="30%">
           <DiffView diff={activeDiff} showPath={false} />
         </Panel>
       </Group>
@@ -276,8 +281,8 @@ export function CommitDetailView({
 
       {tab === 'tree' && (
         <div className="commit-split">
-          <Group orientation="horizontal">
-            <Panel defaultSize="30%" minSize="15%" maxSize="60%">
+          <Group orientation="horizontal" {...treeLayout}>
+            <Panel id="tree" defaultSize="30%" minSize="15%" maxSize="60%">
               {listError ? (
                 <div className="diff-note">{listError}</div>
               ) : (
@@ -296,7 +301,7 @@ export function CommitDetailView({
               )}
             </Panel>
             <Separator className="separator-v" />
-            <Panel minSize="30%">
+            <Panel id="content" minSize="30%">
               {/* 这里看的是文件在这个提交下的样子，不是它改了什么——那是 Changes 的事 */}
               <FileContentView repoPath={repoPath} rev={commit.id} path={picked} />
             </Panel>

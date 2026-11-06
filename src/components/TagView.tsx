@@ -28,12 +28,12 @@ export function TagView({ tags, commits, selectedTag, onSelect, onCheckout, onPu
   const { menu, open, close } = useContextMenu()
   const sorted = sortTags(tags, commits)
 
-  // 默认收起：tag 多的仓库一展开就把 WORKTREES / STASHES 挤到屏幕外，
-  // 而 tag 的日常用法是偶尔查一下。用户展开过就记住（memoryKey）。
+  // 每次挂载都收起，也不记展开状态：tag 多的仓库一展开就把 WORKTREES / STASHES
+  // 挤到屏幕外，而 tag 的日常用法是偶尔查一下，当次展开够用。
   // defaultOpen 必须是常量：SidebarSection 只在挂载时读一次，而本组件挂载时
   // refs 还没加载完，按 `sorted.length` 算出来的值恒为 false。
   return (
-    <SidebarSection title="TAGS" count={sorted.length} defaultOpen={false} memoryKey="tags">
+    <SidebarSection title="TAGS" count={sorted.length} defaultOpen={false}>
       {sorted.length === 0 && <div className="sb-empty">No tags</div>}
       {sorted.map((ref) => {
         const name = tagShortName(ref.name)
