@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 //
 // 组件测试只在这个文件里切到 jsdom，其余纯逻辑测试仍跑在 node 环境（vitest.config.ts）。
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { beforeAll, describe, expect, it, vi } from 'vitest'
 import { LocalChangesView } from '@/components/LocalChangesView'
 import type { ExternalTool, ExternalToolsConfig } from '@/engine/externalTools'
@@ -841,5 +841,63 @@ describe('LocalChangesView：diff 读失败', () => {
     expect(screen.getByText(/读取改动失败/)).toBeTruthy()
     expect(screen.getByText(/index file corrupt/)).toBeTruthy()
     expect(screen.queryByText('No changes')).toBeNull()
+  })
+})
+
+describe('LocalChangesView 的提交说明（事故分析 6.6）', () => {
+  function mountWith(onCommit: (msg: string, amend: boolean) => void | Promise<boolean>) {
+    const status: StatusData = { unstaged: [], staged: [change('s.txt')] }
+    render(
+      <LocalChangesView
+        status={status}
+        diff={{ files: [] }}
+        onStage={vi.fn()}
+        onUnstage={vi.fn()}
+        onDiscard={vi.fn()}
+        onCommit={onCommit}
+        svnMode={true}
+        onBaselineBranch={false}
+      />,
+    )
+    const subject = screen.getByPlaceholderText('Commit subject') as HTMLInputElement
+    fireEvent.change(subject, { target: { value: '修登录' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Commit' }))
+    return subject
+  }
+
+  /** 把 onCommit 之后的微任务与 React 的渲染都冲刷掉（review 第 7 条：只等一个微任务时清空也还没发生）。 */
+  async function settle() {
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0))
+    })
+  }
+
+  it('提交了：说明清空（对照组，同一时机能观察到清空）', async () => {
+    const subject = mountWith(vi.fn(async () => true))
+    await settle()
+    expect(subject.value).toBe('')
+  })
+
+  it('在「先跟进」的提醒里取消了、或没提交上：写好的说明留着', async () => {
+    const onCommit = vi.fn(async () => false)
+    const subject = mountWith(onCommit)
+    await settle()
+    expect(onCommit).toHaveBeenCalledTimes(1)
+    expect(subject.value).toBe('修登录')
+  })
+
+  it('提交在途时再点、再按 Ctrl+Enter 都不会提交第二次', async () => {
+    // review 第 1 条：要等 onCommit 跑完才清说明，在途期间按钮一直可点就会提交两次
+    let finish!: (v: boolean) => void
+    const onCommit = vi.fn(() => new Promise<boolean>((r) => { finish = r }))
+    const subject = mountWith(onCommit)
+    fireEvent.click(screen.getByRole('button', { name: 'Commit' }))
+    fireEvent.keyDown(subject, { key: 'Enter', ctrlKey: true })
+    await settle()
+    expect(onCommit).toHaveBeenCalledTimes(1)
+    expect((screen.getByRole('button', { name: 'Commit' }) as HTMLButtonElement).disabled).toBe(true)
+    await act(async () => finish(true))
+    await settle()
+    expect(subject.value).toBe('')
   })
 })

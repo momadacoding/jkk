@@ -40,6 +40,7 @@
 //! `nodeRevs == baselineRev` 照样成立。那类外部操作只能由 git 侧看见（工作区
 //! 出现修改或改动凭空消失），由现有的 watcher + `git status` 负责，**不归本模块**。
 
+use crate::engine::git_cli::run_git;
 use crate::engine::svn_basemap::{read_base_map, BaseMap};
 use crate::engine::svn_cli::run_svn;
 use crate::engine::svn_config::read_config;
@@ -154,7 +155,14 @@ pub struct SyncStatus {
     pub base: BaseMapSummary,
     /// 当前分支不包含 `svn/base`，且分叉点是一条基线 commit（「分支跟进」入口，分析 §6.11.3）。
     pub head_behind_base: bool,
+    /// `head_behind_base` 时，分支自己的基线到 `svn/base` 之间改过的文件（仓库相对、正斜杠）。
+    /// 提交前「先跟进」的提醒拿它与暂存求交集（事故分析 6.6）：不落后时为空。最多
+    /// [`MAX_BEHIND_PATHS`] 个，读不出来时为空（提醒退回不打扰）。
+    pub behind_paths: Vec<String>,
 }
+
+/// [`SyncStatus::behind_paths`] 的上限：只拿来求交集，太多时截断也只是少提醒几个。
+pub const MAX_BEHIND_PATHS: usize = 20_000;
 
 /// 一个工作副本根的 revision，`rootRev` 提示档用。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -217,28 +225,52 @@ pub(crate) fn check_sync_with_nodes(repo_root: &str) -> Result<(SyncStatus, Vec<
             removed: j.removed,
         }
     };
+    let fork = behind_fork(repo_root, &oid);
     let status = SyncStatus {
         baseline_rev: map.floor,
         node_revs: j.node_revs.into_iter().collect(),
         verdict,
         base: BaseMapSummary::of(&map),
-        head_behind_base: head_behind_base(repo_root, &oid),
+        head_behind_base: fork.is_some(),
+        behind_paths: fork
+            .map(|f| paths_between(repo_root, &f, &oid))
+            .unwrap_or_default(),
     };
     Ok((status, nodes))
 }
 
-/// 基线发布了、当前分支没跟上：上次跟进冲突，或者切到了一条旧分支（分析 §6.11.3）。
+/// 基线发布了、当前分支没跟上：上次跟进冲突，或者切到了一条旧分支（分析 §6.11.3）。返回分支自己的
+/// 基线（分叉点）。
 ///
 /// 口径与跟进的 `branch_baseline` 相同：分叉点必须是一条基线 commit，否则跟进只会拒绝。detached
 /// 与基线分支本身不算，跟进同样不接。只是给入口的提示，读不出来都按不落后，不挡校验。
-fn head_behind_base(repo_root: &str, base: &str) -> bool {
+fn behind_fork(repo_root: &str, base: &str) -> Option<String> {
     if !matches!(current_branch(repo_root), Ok(Some(b)) if b != BASELINE_BRANCH) {
-        return false;
+        return None;
     }
     let Ok(Some(fork)) = crate::engine::git_read::merge_base(repo_root, "HEAD", base) else {
-        return false;
+        return None;
     };
-    fork != base && read_base_map(repo_root, &fork).is_ok()
+    (fork != base && read_base_map(repo_root, &fork).is_ok()).then_some(fork)
+}
+
+/// `a..b` 改过的文件。只读 git 对象；读不出来时为空，只是少一次提醒。
+fn paths_between(repo_root: &str, a: &str, b: &str) -> Vec<String> {
+    match run_git(
+        repo_root,
+        &["diff-tree", "-r", "-z", "--no-renames", "--name-only", a, b],
+    ) {
+        Ok(out) => out
+            .split('\0')
+            .filter(|p| !p.is_empty())
+            .take(MAX_BEHIND_PATHS)
+            .map(str::to_string)
+            .collect(),
+        Err(e) => {
+            log::warn!("读不出落后基线的文件清单，提交前不按它提醒：{}", e.message);
+            Vec::new()
+        }
+    }
 }
 
 /// [`judge`] 的中间结果。

@@ -547,6 +547,8 @@ export function useRepoStore() {
    * 校验结果写回与失焦之间没有先后保证。
    */
   const latestVerdict = useRef<SyncVerdict['kind'] | null>(null)
+  /** 最近一次写回的完整结论，同步写。提交前的「先跟进」提醒要它（事故分析 6.6），理由同上。 */
+  const latestSync = useRef<SyncStatus | null>(null)
   /**
    * `openRepo` 写进 state 的那个路径，同步镜像一份。
    *
@@ -903,6 +905,8 @@ export function useRepoStore() {
         // 什么都不动：既保留上一次的结论，也不清这个标记——基线确实丢了的时候，
         // 一次锁错误不该让恢复横幅闪掉（PR 115 review）
         if (toErrorCode(err) === 'svn_no_baseline') {
+          // 提交前的提醒不能再按丢失之前的旧清单弹（6.6 第 2 轮 review 低危第 2 条）
+          latestSync.current = null
           setState((s) => (samePath(s.path ?? '', path)
             ? { ...s, svnBaselineMissing: true, svnSync: null }
             : s))
@@ -916,6 +920,7 @@ export function useRepoStore() {
     // 所以按 ref 核对；state 照 `refreshSvnSyncState` 的写法在 updater 里再核对一次
     if (!samePath(openedPath.current ?? '', path)) return false
     latestVerdict.current = st.verdict.kind
+    latestSync.current = st
     setState((s) => (samePath(s.path ?? '', path) ? { ...s, svnSync: st } : s))
     return true
   }
@@ -1005,6 +1010,16 @@ export function useRepoStore() {
         () => refreshSvnSyncReporting(path),
       ),
     )
+
+  /**
+   * 提交前要用的结论（事故分析 6.6，独立 review 第 4 条）：TortoiseSVN 刚更新完、焦点检测还没写回时，
+   * `state.svnSync` 还是旧的 InSync，提醒就漏了。先跑一次焦点检测：wc.db 没变只是几次 stat，变了才跑
+   * 第二档并等它写回。再从同步写的 ref 读，不读闭包里的 state。检测失败时用已有的结论，不挡提交。
+   */
+  const freshSvnSync = async (path: string): Promise<SyncStatus | null> => {
+    await checkSvnSyncOnFocus(path).catch(() => undefined)
+    return samePath(openedPath.current ?? '', path) ? latestSync.current : null
+  }
 
   /**
    * 窗口失焦、或切到别的标签时记一份快照。
@@ -1280,6 +1295,7 @@ export function useRepoStore() {
     checkSvnSyncIfChanged,
     checkSvnSyncIfHeadMoved,
     checkSvnSyncOnFocus,
+    freshSvnSync,
     markSvnFollowOnBlur,
     refreshSvnLog,
     fetchSvnLog,

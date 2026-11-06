@@ -109,7 +109,9 @@ interface LocalChangesViewProps {
   onStage: (paths: string[]) => void
   onUnstage: (paths: string[]) => void
   onDiscard: (paths: string[], staged: boolean) => void
-  onCommit: (msg: string, amend: boolean) => void
+  /** 返回 `false` = 这次没提交（用户在「先跟进」的提醒里取消了），提交说明要留着。 */
+  onCommit: (msg: string, amend: boolean) => void | Promise<boolean>
+
   /**
    * SVN 混合仓库才显示「仅本地，不交付」勾选框（spec §6.7）。
    *
@@ -338,14 +340,29 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
 
   // 基线分支上一律不能提交（spec §6.4），连 Ctrl+Enter 也走这个判据
   // ——只把按钮置灰而快捷键还通，等于没拦。
-  const canCommit = subject.trim().length > 0 && !onBaselineBranch
+  // 提交在途（6.6 review 第 1 条）：要等 onCommit 整个跑完才知道清不清说明，这段时间里按钮和
+  // Ctrl+Enter 必须失效，否则双击、按住不放都会把同一条说明提交两次（amend 就是 amend 两次）。
+  // state 管按钮置灰，ref 挡同一帧里的第二次调用（state 要等下一次渲染才生效）
+  const [committing, setCommitting] = useState(false)
+  const committingRef = useRef(false)
+  const canCommit = subject.trim().length > 0 && !onBaselineBranch && !committing
 
-  const handleCommit = () => {
-    onCommit(buildCommitMessage(subject, description, svnMode && localOnly), amend)
-    setSubject('')
-    setDescription('')
-    // 勾选框**不**重置：连着提交几个本地补丁是常见做法，每次都要重勾很烦。
-    // amend 同理（既有行为就是不重置）。
+  const handleCommit = async () => {
+    if (committingRef.current || !canCommit) return
+    committingRef.current = true
+    setCommitting(true)
+    try {
+      const committed = await onCommit(buildCommitMessage(subject, description, svnMode && localOnly), amend)
+      // 6.6：在「先跟进」的提醒里取消、或者没提交上时，写好的说明不能丢
+      if (committed === false) return
+      setSubject('')
+      setDescription('')
+      // 勾选框**不**重置：连着提交几个本地补丁是常见做法，每次都要重勾很烦。
+      // amend 同理（既有行为就是不重置）。
+    } finally {
+      committingRef.current = false
+      setCommitting(false)
+    }
   }
 
   const commitKeyDown = (field: CommitField) => (e: React.KeyboardEvent) => {
@@ -364,7 +381,7 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
     // 走到这里都是我们接管的组合：Ctrl+Enter 在 textarea 里默认会插一个换行，
     // subject 的 Enter 也可能被外层当成表单提交，一律挡掉默认行为。
     e.preventDefault()
-    if (action === 'commit') handleCommit()
+    if (action === 'commit') void handleCommit()
     else descriptionRef.current?.focus()
   }
 
