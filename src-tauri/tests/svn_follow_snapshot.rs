@@ -334,14 +334,17 @@ fn rule_skips_a_commit_whose_parent_holds_my_own_content() {
 #[test]
 fn snapshot_equal_to_the_new_baseline_is_not_reported() {
     // review 第 7 条：快照里的内容就是 NEW 的，换不换都一样，报出来只是噪音
+    // 快照里还有我自己的 A、同事改的是另一个文件：「已全部提交」捷径不成立，真的走一遍重放与分节
+    // （第 2 轮 review：只有 B 时捷径直接收掉，根本走不到要测的过滤）
     let fx = hybrid_with_colleague();
-    lagging_snapshot(&fx, B, Some("b2\n"), &[]);
-    colleague(&fx, A, "a2\n");
+    lagging_snapshot(&fx, B, Some("b2\n"), &[(A, "a-mine\n")]);
+    colleague(&fx, "Code/E.cs", "e1\n");
     svn_update(&fx);
 
     let rep = done(run(&fx));
 
     assert_eq!(show(&fx, "HEAD:Code/B.cs"), "b2");
+    assert_eq!(show(&fx, "HEAD:Code/A.cs"), "a-mine", "确实重放了");
     assert!(rep.snapshot.is_empty(), "{:?}", rep.snapshot);
     assert!(rep.rewritten.is_empty(), "{:?}", rep.rewritten);
 }
@@ -351,8 +354,18 @@ fn manual_follow_of_a_pure_snapshot_leaves_no_empty_commit() {
     // review 第 3 条：快照里全是 SVN 内容。rebase 会留下「一开始就为空」的 commit，所以根本不 pick
     let fx = hybrid_with_colleague();
     let (_, snap) = lagging_snapshot(&fx, B, Some("b2\n"), &[]);
-    // 磁盘就是基线 1：判定 InSync，分支落后基线，可以直接手动跟进
-    let o = manual_follow(&fx.wc_str(), "mf1").unwrap();
+    // 磁盘就是基线 1：判定 InSync，分支落后基线，可以直接手动跟进。先停在 rebase 之前，确认走的是
+    // noop（规则判定出错时原样 rebase 也会把快照丢掉，只看结局分不出来，第 2 轮 review）
+    let wc = fx.wc_str();
+    let armed = fault::crash_at(Point::ManualStashed);
+    let r = catch_unwind(AssertUnwindSafe(|| manual_follow(&wc, "mf1")));
+    drop(armed);
+    assert!(r.is_err(), "应当停在崩溃点");
+    assert_eq!(
+        svn_journal::read(&wc).unwrap().unwrap().rebase_todo,
+        vec!["noop".to_string()]
+    );
+    let o = continue_sync(&wc).unwrap();
     assert!(matches!(o, SyncInOutcome::Done { .. }), "{o:?}");
 
     assert_eq!(oid(&fx, "HEAD"), oid(&fx, "svn/base"), "没有留下空 commit");

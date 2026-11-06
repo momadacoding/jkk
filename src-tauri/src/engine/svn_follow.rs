@@ -406,11 +406,17 @@ pub fn manual_follow(repo: &str, opid: &str) -> Result<SyncInOutcome> {
 /// rebase 会保留「一开始就为空」的 commit，`--empty=drop` 只丢重放后才变空的，分支上就会留下一个空的
 /// 「svn up 之后整包提交」，与对象层把它记成 `dropped` 不一致。一个都不剩时列表是 [`NOOP`]。
 ///
-/// 列表放在环境变量里交给 rebase（见 `svn_sync_in::rebase_with_todo`）。超过 Windows 单个环境变量
-/// 约 32K 字符的上限时退回原样 rebase，并记日志（独立 review 第 9 条）。
+/// 列表放在环境变量里交给 rebase（见 `svn_sync_in::rebase_with_todo`）。放不下时（[`too_many_for_todo`]）
+/// 退回原样 rebase，并记日志（独立 review 第 9 条）。
 fn snapshot_todo(repo: &str, scope: &str, head: &str, new: &str) -> Result<Vec<String>> {
-    const MAX_TODO_CHARS: usize = 30_000;
     let commits = commits_between(repo, scope, head, &FOLLOW_CODES)?;
+    if too_many_for_todo(commits.len()) {
+        log::warn!(
+            "待重放的 commit 有 {} 个，环境变量放不下，手动跟进按原样 rebase（快照内容不按基线走）",
+            commits.len()
+        );
+        return Ok(Vec::new());
+    }
     let rule = SnapshotRule::new(repo, new);
     let mut any = false;
     let mut todo = Vec::with_capacity(commits.len());
@@ -442,22 +448,25 @@ fn snapshot_todo(repo: &str, scope: &str, head: &str, new: &str) -> Result<Vec<S
     if todo.is_empty() {
         return Ok(vec![NOOP.to_string()]);
     }
-    if todo.len() * 46 > MAX_TODO_CHARS {
-        log::warn!(
-            "待重放的 commit 有 {} 个，环境变量放不下，手动跟进按原样 rebase（快照内容不按基线走）",
-            todo.len()
-        );
-        return Ok(Vec::new());
-    }
     Ok(todo)
 }
 
 /// 待重放列表里「什么都不 pick」的那一行：分支上的 commit 全是快照内容。
 pub(crate) const NOOP: &str = "noop";
 
+/// 待重放列表放不进一个环境变量（Windows 约 32K 字符，每行 `pick <40 位 OID>\n` 46 个字符）。
+/// 按分支上的 commit 数判，[`snapshot_todo`] 与 [`manual_snapshot`] 用同一个判据：冲突框说「会直接
+/// 采用新基线」，手动跟进就一定是那样做的（第 2 轮 review 低危第 2 条）。
+fn too_many_for_todo(commits: usize) -> bool {
+    commits * 46 > 30_000
+}
+
 /// 冲突出口告诉用户的：手动跟进时哪些 commit 里的哪些路径会直接采用新基线（方案 §3）。
 /// 与 [`snapshot_todo`] 用同一条规则；内容本来就等于 NEW 的不列（见 [`SnapshotRule::reported_paths`]）。
 fn manual_snapshot(commits: &[ReplayCommit], rule: &SnapshotRule, scope: &str) -> PathsByCommit {
+    if too_many_for_todo(commits.len()) {
+        return Vec::new();
+    }
     commits
         .iter()
         .filter_map(|c| {

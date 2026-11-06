@@ -47,8 +47,8 @@
 细节：
 
 - 整个 commit 都是快照内容（C' 与 C^ 同树）时不放进 todo：rebase 会保留「一开始就为空」的 commit，`--empty=drop` 只丢重放后才变空的。一个都不剩时 todo 是 `noop`，分支直接落到新基线上，与对象层把它记成 dropped 一致。
-- todo 超过 Windows 单个环境变量的上限（约 30K 字符，约 650 个 commit）时退回原样 rebase，记日志。
-- C' 没有 ref 指着。rebase 开始之前用 `cat-file --batch-check` 核对它们还在：记录搁置太久碰上 gc 时，报错并提示「放弃」后重新跟进，这时分支还没动。
+- todo 超过 Windows 单个环境变量的上限（约 30K 字符，约 650 个 commit）时退回原样 rebase，记日志；冲突框按同一个判据不列快照清单。
+- C' 没有 ref 指着。rebase 开始之前用 `cat-file --batch-check` 核对它们还在：记录搁置太久碰上 gc 时报 `svn_follow_manual_todo_lost`，提示「放弃」后重新跟进，这时分支还没动。
 
 ## 4. 顺带修：对象层跟进合错也报「完成」（PR 119 遗留）
 

@@ -576,9 +576,14 @@ pub(crate) fn from_baseline_ready(
     };
     match ran {
         Ok(_) => finish_forward(repo, j),
+        // rebase 根本没开始：不是冲突，也不是 git 的报错，「继续」只会拿同一份列表再失败一次
+        Err(e) if e.code == REBASE_TODO_LOST => Err(e),
         Err(e) => conflict_or_error(repo, e),
     }
 }
+
+/// 手动跟进事先准备的 C' 已被 gc 清掉（见 [`rebase_with_todo`]）。
+const REBASE_TODO_LOST: &str = "svn_follow_manual_todo_lost";
 
 /// 手动跟进的 S9：按事先算好的列表逐个 pick（事故分析 6.10，`svn_follow::snapshot_todo`）。
 ///
@@ -616,7 +621,7 @@ fn rebase_with_todo(repo: &str, new_base: &str, todo: &[String]) -> Result<Strin
     let check = run_git_stdin(repo, &["cat-file", "--batch-check"], oids.as_bytes())?;
     if check.lines().any(|l| l.ends_with(" missing")) {
         return Err(GitError::new(
-            "sync_in_rebase_failed",
+            REBASE_TODO_LOST,
             "手动跟进事先准备好的提交已经被 git 清理掉了（记录搁置太久）。分支没动，未提交的改动收在备份里：\
              点「放弃」会把它们放回来，然后再点一次「跟进」重新开始。",
         ));
