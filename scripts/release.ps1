@@ -9,7 +9,8 @@
 
   可重入——中途失败后用同一个版本号重跑，按远端的实际状态续上：
     - 版本号已提交但没推上去（本地只领先一个本脚本的发版提交）：推送后继续
-    - 同一提交已有成功或进行中的预检：直接复用 / 接着等
+    - 同一提交已有成功或进行中的预检：直接复用 / 接着等。master 之后又进了别的提交也一样：
+      以发版提交为准，不对新 HEAD 重跑预检，tag 打在发版提交上
     - 预检失败：照常走 worktree + PR 修复，合进 master 后重跑，会对新 master 重新预检
     - 本地 tag 已打在该提交上但没推上去：推送后继续
     - tag 已推送（构建没等完、watch 断线、转正式发布失败）：跳过前面所有步骤，
@@ -246,8 +247,10 @@ $localTagSha = git rev-parse -q --verify "refs/tags/$tag^{commit}"
 if ($LASTEXITCODE -ne 0) { $localTagSha = '' }
 if ($localTagSha -and -not $pendingPush) {
     $head = Invoke-Checked '读取 HEAD' { git rev-parse HEAD }
-    if ($localTagSha -ne $head) {
-        throw "本地已有 $tag，但指向 $localTagSha 而不是 HEAD。它从没推上去过，确认后删掉本地 tag 再重跑"
+    # 打在 HEAD 上，或者打在本脚本的发版提交上（tag 打好后 master 又进了别的提交）都合法
+    $tagSubject = Invoke-Checked '读取本地 tag 指向的提交' { git log -1 --format=%s $localTagSha }
+    if ($localTagSha -ne $head -and $tagSubject -ne $releaseSubject) {
+        throw "本地已有 $tag，但指向 $localTagSha，既不是 HEAD 也不是发版提交。它从没推上去过，确认后删掉本地 tag 再重跑"
     }
 }
 
@@ -260,17 +263,21 @@ if ($DryRun -and $behind -gt 0) {
 # 本地 tag 打在 HEAD 上、版本号却还要 bump：bump 会产生新提交，tag 必然对不上。
 # 在这里就停，别等 40 分钟预检跑完才发现
 if ($localTagSha -and $current -ne $Version) {
-    throw "本地已有 $tag（指向 HEAD），但版本号还是 $current。确认后删掉本地 tag 再重跑"
+    throw "本地已有 $tag（指向 $localTagSha），但版本号还是 $current。确认后删掉本地 tag 再重跑"
 }
 
+# 版本号早已在 origin/master 上时，引入它的那个发版提交；预检复用和打 tag 以它为准，见下方「预检」
+$releaseSha = ''
 if ($current -eq $Version) {
     # 重跑：版本号已经是目标值（已提交，可能还没推）。核对四处一致
     foreach ($f in $files) { Set-VersionIn $f.Path $f.Pattern $Version $Version }
     Write-Host "版本号已经是 $Version，跳过 bump"
     if (-not $pendingPush -and $ahead -eq 0) {
         # 版本号已在 origin/master 上：要么上次推完就停了，要么有人手工改过。确认那是发版提交
-        $last = Invoke-Checked '查找发版提交' { git log -1 --format=%s -S "`"version`": `"$Version`"" -- package.json }
-        if ($last -ne $releaseSubject) { Write-Host "注意：引入 $Version 的提交标题是「$last」，不是本脚本的发版提交" -ForegroundColor Yellow }
+        $intro = Invoke-Checked '查找发版提交' { git log -1 --format=%H%x09%s -S "`"version`": `"$Version`"" -- package.json }
+        $introSha, $last = "$intro" -split "`t", 2
+        if ($last -eq $releaseSubject) { $releaseSha = $introSha }
+        else { Write-Host "注意：引入 $Version 的提交标题是「$last」，不是本脚本的发版提交" -ForegroundColor Yellow }
     }
 } else {
     if ($pendingPush) { throw "本地未推送的发版提交与 -Version $Version 对不上（package.json 是 $current）" }
@@ -313,6 +320,27 @@ if ($pendingPush) {
 
 # 预检、打 tag 都钉在这个提交上，之后 HEAD 怎么动都不影响
 $sha = Invoke-Checked '读取 HEAD' { git rev-parse HEAD }
+
+# 重跑时 master 可能已经越过发版提交（上次预检途中脚本被停、期间又合了别的 PR）。
+# 发版提交上已有成功或进行中的预检，就沿用它、tag 也打在它上面：拿 HEAD 会对同一个版本白跑
+# 一轮约 40 分钟的预检，还会把发版之后的无关改动带进这个版本。只有它的预检失败过（之后合了修复）
+# 或从没跑过时，才对当前 master 重新预检
+if ($releaseSha -and $releaseSha -ne $sha) {
+    $prior = @(Get-Runs 'workflow_dispatch' $releaseSha 'master') |
+        Where-Object { $_.conclusion -eq 'success' -or $_.status -ne 'completed' }
+    if ($prior) {
+        Write-Host "master 在发版提交 $($releaseSha.Substring(0, 8)) 之后又进了提交；沿用发版提交上的预检，tag 也打在它上面"
+        # 上面核对的版本号是 HEAD 的工作区；tag 要打在发版提交上，它自己也得是纯版本号提交
+        Assert-ReleaseOnly (Invoke-Checked '核对发版提交' { git diff --numstat "$releaseSha~1" $releaseSha })
+        $sha = $releaseSha
+    } else {
+        Write-Host "发版提交 $($releaseSha.Substring(0, 8)) 上没有成功或进行中的预检，对当前 master 重新预检" -ForegroundColor Yellow
+    }
+}
+# 本地 tag 只能打在最终要发的提交上；在这里就停，别等 40 分钟预检跑完才在打 tag 时发现
+if ($localTagSha -and $localTagSha -ne $sha) {
+    throw "本地 $tag 指向 $localTagSha，而这次要预检和打 tag 的是 $sha。确认后删掉本地 tag 再重跑"
+}
 
 # --- 预检 ---
 Step "CI 预检（workflow_dispatch @ $($sha.Substring(0, 8))）"
