@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 写前 operation journal（spec §7.6）。
 //!
 //! 它不是「冲突时才写的状态文件」，而是**写前日志**：任何一步修改落地之前，

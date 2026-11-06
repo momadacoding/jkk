@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! SVN 历史缓存的读写与合并。
 //!
 //! 全是纯本地逻辑 + 文件 IO，**不需要 svn**——所以这些测试在没装 svn 的机器上

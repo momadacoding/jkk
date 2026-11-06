@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! D0.5：从 HEAD 摘掉 Local-Only commit 构造交付树（spec §8.2.3；计划 B2）。
 //! 全部在临时 fixture 上跑。
 

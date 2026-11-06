@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 收件箱读取、配对与清理（计划 Task 3；日志 H3、H4）。
 
 use app_lib::engine::tsvn_inbox::{

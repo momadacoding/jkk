@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! P5：白名单覆盖到的 external 有没有被 `-r` 钉死（spec §6.5.2 手段一）。
 //!
 //! 命中**不阻断**——它只是把流程切到 pinned 模式（§6.5.3），所以这里的断言全是

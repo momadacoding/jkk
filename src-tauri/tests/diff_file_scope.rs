@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! `read_diff` 的单文件 scope：`staged:<路径>` / `unstaged:<路径>`（2026-11-05 排查报告 6.13 方案 C）。
 //!
 //! 「本地改动」右侧只显示选中的那一个文件，原来却按整个区读（`unstaged` 要把整个工作区 stat 一遍、

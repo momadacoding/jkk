@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 跟进时拼索引（计划 Task 8；分析 §6.11.1；日志 W22–W26、W28）。
 //!
 //! 被测对象只碰 `.git/`（索引、对象、一条 ref），与 SVN 无关，所以 fixture 是 `TempDir` 里

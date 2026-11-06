@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 第 69 条：不走 `trait Vcs` 的 git 专属写命令，在 SVN 混合仓库上必须被后端拒绝。
 //!
 //! 原来只靠前端按 `capabilities` 把入口藏起来，已经漏过两次。这里逐条直接调命令

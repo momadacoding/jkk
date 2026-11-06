@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 白名单覆盖到的工作副本枚举与 P4（spec §6.5 / §6.5.5）。
 
 #[path = "common/svn_fixtures.rs"]

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! `read_status_paths`（Stage / Unstage 之后只重读这几个路径）的契约。
 //!
 //! 契约只有一条：**Staged 与全量读的完全相同，Unstaged 恰好是全量读里这几个路径的那几项**

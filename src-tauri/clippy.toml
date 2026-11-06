@@ -1,0 +1,7 @@
+# src 里的 #[cfg(test)] 模块与 #[test] 函数豁免 Cargo.toml [lints.clippy] 的 panic 类护栏：
+# 测试里 unwrap / panic 就是断言失败的正常写法。
+# tests/*.rs 的辅助函数不在这个豁免范围内，由各文件顶部的 #![allow] 兜底。
+allow-unwrap-in-tests = true
+allow-panic-in-tests = true
+allow-dbg-in-tests = true
+allow-print-in-tests = true

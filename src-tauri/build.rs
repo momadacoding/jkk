@@ -3,6 +3,8 @@ mod git_describe;
 
 use std::path::Path;
 
+// 发版构建拿不到 git describe 时故意 panic 让构建失败，见下方注释
+#[allow(clippy::panic)]
 fn main() {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("cargo 必然设置");
     let dir = Path::new(&manifest_dir);

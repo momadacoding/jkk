@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 仓库识别与能力声明。
 
 #[path = "common/svn_fixtures.rs"]

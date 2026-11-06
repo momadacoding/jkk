@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 基线录制：临时索引、`git-svn-id` trailer、`commit-tree` + `update-ref`
 //! （spec §6.3.1 / §6.4.1）。
 //!

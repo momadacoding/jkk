@@ -185,6 +185,7 @@ fn check_commit(a: &HookArgs) -> HookOutcome {
 /// （日志 H4）。不能用 `CP_ACP`：系统 locale 是英文、用户 locale 是中文的机器上它是 1252，
 /// 中文全变成 `?`，而 TortoiseSVN 显示 GBK 字节是正常的。代码页里没有的字符由系统换成
 /// 默认字符（通常是 `?`）。
+#[allow(unsafe_code)] // CP_THREAD_ACP 转码只有 WideCharToMultiByte，没有安全封装
 pub fn encode_thread_acp(s: &str) -> Vec<u8> {
     #[cfg(windows)]
     {

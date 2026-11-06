@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 对象层重放引擎（计划 Task 6；分析 §6.5 F2、§6.11.3；日志 W17–W20）。
 //!
 //! 全部在临时 fixture 上跑。被重放的 commit 与「新基线」都直接在对象层造（临时索引 +

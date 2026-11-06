@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! `svn log` 拉取编排的测试。
 //!
 //! 这里的每一条都对应 2026-09-15 在临时 fixture 上实测出来的一个 svn 行为，

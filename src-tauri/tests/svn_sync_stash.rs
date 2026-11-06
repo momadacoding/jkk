@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! S1 / S10：WIP 按 opid 压栈、按 OID 取回（spec §7.3.1、§7.6.1）。
 //! 都在临时 fixture 上跑，git 行为以 2026-09-25 实测为准（计划 A3 / A7）。
 

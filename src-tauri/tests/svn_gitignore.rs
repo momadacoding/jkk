@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 建库向导第 2 步：查出「起作用的」`.gitignore`（2026-10-28 设计 §3）。
 //!
 //! 「起作用」= 挡住了 SVN 里有的 W-file（少收），或用 `!` 把用户没选的文件纳入（多收）。

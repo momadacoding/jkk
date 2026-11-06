@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 「尊重 .gitignore」口径下，建库之后的每个入口都按同一口径判断（2026-10-28 设计 §4）。
 //!
 //! 反目标第 3 条：选了「尊重」之后，体检 / 更新 / 交付 / 重建里有任何一处还按「不尊重」

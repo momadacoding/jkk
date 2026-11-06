@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 守住「同步进行中，所有写操作必须拒绝」这条约束（spec §5.1）。
 //!
 //! 扫源码而不是靠 review 盯着——理由与 `commands_are_async.rs` 完全一样：

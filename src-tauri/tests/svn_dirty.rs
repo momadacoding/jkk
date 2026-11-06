@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! §16 R2a：把 `svn status` 的条目分成「取回 BASE」「从树里剔除」「不用动」。
 //!
 //! 这是一层纯逻辑，但它决定基线里每个文件的内容来源，判错一条就是一个假基线。

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 窗口标题里的版本信息：编译期 `git describe` 的真实形状 + 标题拼装规则。
 //!
 //! `build_support/git_describe.rs` 只给 build.rs 用，不进 lib，这里按路径直接引入。

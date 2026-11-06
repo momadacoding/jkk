@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 初始化向导的编排与失败回退（spec §6.5）。
 //!
 //! **回退是这里的重点。** 初始化会在用户的 SVN 工作副本里创建 `.git`，任何一步

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! §6.8 基线体检：让基线可被服务器证伪。
 //!
 //! 场景编号沿用 spec §6.8.2 的 T1–T7，2026-09-14 在临时 fixture 上逐条复现过。

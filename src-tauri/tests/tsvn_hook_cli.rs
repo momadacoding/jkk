@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 钩子子命令与收件箱写入（计划 Task 2；日志 H2、H4）。
 //!
 //! 临时文件的内容按实测的真实形状造：UTF-8 无 BOM、正斜杠绝对路径、每行 CRLF。
@@ -540,6 +541,7 @@ fn encode_thread_acp_round_trips_ascii() {
 /// 不依赖跑测试的机器；但在 ACP 本身就是 936 的机器上，这条抓不到退回 `CP_ACP` 的改动。
 #[cfg(windows)]
 #[test]
+#[allow(unsafe_code)] // 改本线程 locale 只有 Win32 C API
 fn stderr_text_follows_the_thread_code_page_not_the_system_one() {
     use app_lib::engine::tsvn_hook_cli::encode_thread_acp;
     use windows::Win32::Globalization::{GetThreadLocale, SetThreadLocale};

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 跟进按 TortoiseSVN 钩子事件判定（C1h 计划 Task 5；分析 §6.13.3）。
 //!
 //! fixture 与 `svn_follow.rs` 相同：wc1 是「你」，wc2 是同事，「TortoiseSVN 提交」就是在 wc1

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 节点状态解析与映射计算（计划 Task 2；分析 §6.1、§6.2；日志「映射取值」）。
 //!
 //! 映射取值：F = 基线树里各文件节点 revision 的最小值；最后修改 revision c(f) ≤ F 的文件

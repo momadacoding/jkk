@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 后端与 engine 的**等价性**测试。
 //!
 //! Phase 0 是纯重构，验收标准是「经 trait 调用与直接调 engine 结果一致」。

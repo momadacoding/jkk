@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! exclude 规则生成的测试。
 //!
 //! **断言对象是 git 的实际行为（`git ls-files`），不是生成出来的规则文本**

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 同步期间挂起 watcher（spec §5.2）。
 //!
 //! 挂起状态本身是纯逻辑，单独测得了；「去抖线程真的查了它」由最后那条源码断言

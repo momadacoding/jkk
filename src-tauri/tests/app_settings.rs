@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 use app_lib::engine::app_settings::{self, AppSettings, DEFAULT_SHOW_SHORTCUT};
 use std::fs;
 use tempfile::TempDir;

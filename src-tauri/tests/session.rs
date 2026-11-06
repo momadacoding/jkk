@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 use app_lib::engine::session::{self, Session};
 use std::fs;
 use std::process::Command;

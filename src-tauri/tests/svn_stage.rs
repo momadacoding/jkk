@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! D4 登记与 §8.5 精确撤销。在 wc1 上直接摆出「D3.8 之后」的磁盘：
 //! A.cs 改了、B.cs 被 git 删掉、新文件落在两层新目录里。
 

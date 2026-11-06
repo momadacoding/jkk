@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! TortoiseSVN 钩子注册表条目的解析、注册计划与健康判定（计划 Task 1；日志 H1、H3）。
 //!
 //! 全是纯字符串，不读写注册表。

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! §6.6 失同步判定。
 //!
 //! 每条测试都先在一个**干净**仓库上跑完初始化（P1/P2/P3 都得过），再由测试自己
