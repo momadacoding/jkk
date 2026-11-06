@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(gh pr ready *)",
+      "PowerShell(gh pr merge *)",
+      "Bash(gh pr ready *)",
+      "Bash(gh pr merge *)"
+    ],
+    "deny": [
+      "PowerShell(gh pr merge *--admin*)",
+      "PowerShell(gh pr merge *-R *)",
+      "PowerShell(gh pr merge *--repo*)",
+      "PowerShell(gh pr ready *-R *)",
+      "PowerShell(gh pr ready *--repo*)",
+      "Bash(gh pr merge *--admin*)",
+      "Bash(gh pr merge *-R *)",
+      "Bash(gh pr merge *--repo*)",
+      "Bash(gh pr ready *-R *)",
+      "Bash(gh pr ready *--repo*)"
+    ]
+  }
+}
