@@ -647,6 +647,11 @@ pub fn replaced_without_history_paths(entries: &[StatusEntry]) -> BTreeSet<Strin
 /// 目录也停（PR 116 遗留）：`svn rm D; mkdir D; svn add D` 之后，D 底下重新加的同名文件 schedule 是
 /// `add`，单看它会被摘出基线，可服务器上旧的 D 里有它。
 ///
+/// **边界（未修）**：只有 D 落在 `svn status` 的 target 视野里才看得见。白名单根本身在被替换的父目录
+/// 里时（白名单 `Code/Sub/Inner`，替换的是 `Code/Sub`），status 只给出 `added -1` 的子节点、看不到
+/// replaced 的 D，子文件照旧按 Drop 静默少录。要修得对白名单根的父目录查 `svn info` 的 schedule，
+/// 留作后续（6.2 第 2 轮 review M2）。
+///
 /// 不说「本应用什么都没改」：同步的 S7、交付的 D7a 走到这里时 SVN 那边已经动过了。
 pub fn replaced_without_history(path: &str, root: &str) -> GitError {
     GitError::new(

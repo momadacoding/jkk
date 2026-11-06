@@ -2086,6 +2086,20 @@ fn a_directory_replaced_without_history_is_refused_not_recorded_without_its_file
     );
     assert!(err.message.contains("Code/Sub"), "{}", err.message);
     assert!(!wc.join(".git").exists(), "失败要整个回退");
+    assert_stopped_before_git_add(&err.message);
+}
+
+/// 6.2 第 2 轮 review M-a：替换在 `git add` 之前的纳入集合预检里就停下（大工程上 add 要跑很久）。
+fn assert_stopped_before_git_add(msg: &str) {
+    let tail = msg
+        .split("各阶段耗时")
+        .nth(1)
+        .unwrap_or_else(|| panic!("错误正文里没有耗时：{msg}"));
+    assert!(
+        tail.contains("纳入集合预检") && tail.contains("← 在这一步失败"),
+        "要停在预检：{tail}"
+    );
+    assert!(!tail.contains("git add"), "不该走到 git add：{tail}");
 }
 
 #[test]
@@ -2122,6 +2136,7 @@ fn a_replaced_file_without_history_names_the_replacement_instead_of_asking_to_re
         err.message
     );
     assert!(!wc.join(".git").exists(), "失败要整个回退");
+    assert_stopped_before_git_add(&err.message);
 }
 
 #[test]

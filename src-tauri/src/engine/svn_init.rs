@@ -725,16 +725,14 @@ fn rewrite_to_server(
     fixes: &std::collections::BTreeMap<String, Fix>,
     touched: &BTreeSet<String>,
 ) -> Result<()> {
-    let replaced = replaced_without_history_paths(&pre.dirty);
+    // 事故分析 6.2：自己或某个祖先是不带历史的替换，服务器上的旧内容取不到。文件走 TakeBase 会撞
+    // E200009；目录底下重新加的子文件走 Drop 会静默少录（PR 116 遗留）。初始化与重建在 `git add`
+    // 之前已经查过一次（`dry_run_before_add`）；同步 S7、交付 D7a、跟进没有那一步，这里是兜底
+    refuse_replaced(pre, fixes, touched)?;
     for (path, fix) in fixes {
         if !touched.contains(path) {
             // 不归 git 管，树里本来就没有它。见上面「`S` 必须恰好」。
             continue;
-        }
-        // 事故分析 6.2：它自己或某个祖先是不带历史的替换，服务器上的旧内容取不到。文件走 TakeBase
-        // 会撞 E200009；目录底下重新加的子文件走 Drop 会静默少录（PR 116 遗留）。两种都在这里停下
-        if let Some(root) = replaced_at_or_above(path, &replaced) {
-            return Err(replaced_without_history(path, root));
         }
         match fix {
             Fix::TakeBase => match cat_base(repo_root, path)? {
@@ -835,8 +833,30 @@ fn dry_run_before_add(
         let scope = WScope::for_repo(root, cfg)?;
         let fixes = classify(&pre.dirty)?;
         let touched = explained_paths(&fixes, &scope)?;
+        // 6.2 第 2 轮 review M-a：在 `git add` 之前就停，大工程上 add 要跑很久
+        refuse_replaced(pre, &fixes, &touched)?;
         dry_run_include_set(root, &scope, &fixes, &touched)
     })
+}
+
+/// 归 git 管的脏路径里，自己或某个祖先是不带历史的替换时停下（事故分析 6.2）。
+///
+/// 一次预扫，不边取内容边判：逐条改写时排在前面的路径可能先撞上别的错误（第 2 轮 review L-a）。
+fn refuse_replaced(
+    pre: &Preflight,
+    fixes: &std::collections::BTreeMap<String, Fix>,
+    touched: &BTreeSet<String>,
+) -> Result<()> {
+    let replaced = replaced_without_history_paths(&pre.dirty);
+    if replaced.is_empty() {
+        return Ok(());
+    }
+    for path in fixes.keys().filter(|p| touched.contains(*p)) {
+        if let Some(root) = replaced_at_or_above(path, &replaced) {
+            return Err(replaced_without_history(path, root));
+        }
+    }
+    Ok(())
 }
 
 /// `git init` 之后的全部步骤。抽出来是为了让**唯一的**回退点长在一个地方——
