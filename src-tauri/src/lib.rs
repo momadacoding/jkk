@@ -37,6 +37,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::app_settings::read_app_settings,
             commands::app_settings::save_app_settings,
+            commands::app_settings::set_shortcut_recording,
             commands::diff::read_diff,
             commands::conflict::check_merge_drivers,
             commands::conflict::read_conflicts,
