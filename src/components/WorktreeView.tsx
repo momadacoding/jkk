@@ -46,6 +46,7 @@ export function WorktreeView({
     <SidebarSection
       title="WORKTREES"
       count={worktrees.length}
+      memoryKey="worktrees"
       action={{ title: 'New worktree', onClick: () => onCreate(`wt-${Date.now()}`) }}
     >
       {worktrees.map((wt) => {

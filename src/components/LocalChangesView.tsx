@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Panel, Group, Separator } from 'react-resizable-panels'
+import { PANEL_GROUP_IDS } from '@/engine/layoutMemory'
+import { usePanelLayout } from '@/store/layoutStore'
 import type { ConflictInfo, DiffData, FileChange, StatusData } from '../engine/types'
 import { DiffView } from './DiffView'
 import { ContextMenu, useContextMenu, type MenuItem } from './ContextMenu'
@@ -147,6 +149,9 @@ interface LocalChangesViewProps {
 export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, onCommit, svnMode, onBaselineBranch, externalTools, conflicts, onResolveDeleteModify, selection: selectionProp, onSelectionChange }: LocalChangesViewProps) {
   const [ownSelection, setOwnSelection] = useState<FileSelection>(emptyFileSelection)
   const setSelection = onSelectionChange ?? setOwnSelection
+  // 文件列表 | diff、Unstaged / Staged 两处分割都记住，所有仓库标签共用
+  const mainLayout = usePanelLayout(PANEL_GROUP_IDS.changesMain)
+  const listsLayout = usePanelLayout(PANEL_GROUP_IDS.changesLists)
   const [subject, setSubject] = useState('')
   const [description, setDescription] = useState('')
   const [amend, setAmend] = useState(false)
@@ -388,10 +393,10 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
   return (
     <div className="local-changes-view">
       <div className="changes-body">
-        <Group orientation="horizontal">
-          <Panel defaultSize="25%" minSize="15%" maxSize="50%">
-            <Group orientation="vertical">
-              <Panel minSize="15%">
+        <Group orientation="horizontal" {...mainLayout}>
+          <Panel id="files" defaultSize="25%" minSize="15%" maxSize="50%">
+            <Group orientation="vertical" {...listsLayout}>
+              <Panel id="unstaged" minSize="15%">
                 <FileSectionList
                   title="Unstaged"
                   section="unstaged"
@@ -409,7 +414,7 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
                 />
               </Panel>
               <Separator className="separator-h" />
-              <Panel minSize="15%">
+              <Panel id="staged" minSize="15%">
                 <FileSectionList
                   title="Staged"
                   section="staged"
@@ -429,7 +434,7 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
             </Group>
           </Panel>
           <Separator className="separator-v" />
-          <Panel minSize="30%">
+          <Panel id="diff" minSize="30%">
             {activeConflict ? (
               <div className="conflict-pane">
                 <ConflictNotice

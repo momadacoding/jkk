@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { Panel, Group, Separator } from 'react-resizable-panels'
+import { PANEL_GROUP_IDS } from '@/engine/layoutMemory'
+import { usePanelLayout } from '@/store/layoutStore'
 import { GraphView } from './GraphView'
 import { BranchView } from './BranchView'
 import { TagView } from './TagView'
@@ -157,6 +159,9 @@ export function RepoTab({
   // ——`create_tag` 与整个 commands/worktree.rs 都还没进接缝，仍直接跑 git CLI。
   const sections = visibleSections(state.capabilities)
   const [viewMode, setViewMode] = useState<ViewMode>('commits')
+  // 面板分割比例记在所有仓库标签共用的存档里：拖宽侧边栏是对「这个应用」的偏好，不是对某个仓库的
+  const mainLayout = usePanelLayout(PANEL_GROUP_IDS.repoMain)
+  const commitsLayout = usePanelLayout(PANEL_GROUP_IDS.repoCommits)
   // 「本地改动」的选中放在这里而不是 `LocalChangesView` 里：右侧 diff 按选中文件所在的区读
   // （Unstaged 读暂存区对比工作区，Staged 读 HEAD 对比暂存区，第 65 条），读哪个区要在
   // 渲染时就算出来——等子组件挂载后再报上来的话，第一次渲染会先读错一个区
@@ -982,9 +987,11 @@ export function RepoTab({
       />
       <div className="repo-path-bar" title={state.path ?? ''}>{state.path} @ {state.head}</div>
       <div style={{ flex: 1, overflow: 'hidden' }}>
-        <Group orientation="horizontal">
+        {/* 不给 Group 传 id：库按 id 在全局注册表里找 Group，多个仓库标签同时挂载时
+            同一个 id 会串到别的标签上。存档键由 useDefaultLayout 的 id 决定，与此无关 */}
+        <Group orientation="horizontal" {...mainLayout}>
           {/* 22%：分支名普遍带 feat/ 前缀，20% 时连 worktree 名字都存不下 */}
-          <Panel defaultSize="22%" minSize="15%" maxSize="40%" style={{ display: 'flex', flexDirection: 'column' }}>
+          <Panel id="sidebar" defaultSize="22%" minSize="15%" maxSize="40%" style={{ display: 'flex', flexDirection: 'column' }}>
             <div style={{ flex: 1, overflow: 'auto' }}>
               <SidebarNav
                 mode={viewMode}
@@ -1057,10 +1064,10 @@ export function RepoTab({
             </div>
           </Panel>
           <Separator style={{ width: 4, background: '#333' }} />
-          <Panel minSize="30%">
+          <Panel id="main" minSize="30%">
             {viewMode === 'commits' ? (
-              <Group orientation="vertical">
-                <Panel minSize="30%">
+              <Group orientation="vertical" {...commitsLayout}>
+                <Panel id="graph" minSize="30%">
                   <GraphView
                     commits={state.commits}
                     refs={state.refs}
@@ -1082,7 +1089,7 @@ export function RepoTab({
                   />
                 </Panel>
                 <Separator style={{ height: 4, background: '#333' }} />
-                <Panel defaultSize="35%" minSize="15%" maxSize="65%">
+                <Panel id="detail" defaultSize="35%" minSize="15%" maxSize="65%">
                   <CommitDetailView
                     commit={detailCommit}
                     diff={currentDiff(state.diff, state.diffScope, commitScope)}
