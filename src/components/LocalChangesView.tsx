@@ -109,7 +109,9 @@ interface LocalChangesViewProps {
   onStage: (paths: string[]) => void
   onUnstage: (paths: string[]) => void
   onDiscard: (paths: string[], staged: boolean) => void
-  onCommit: (msg: string, amend: boolean) => void
+  /** 返回 `false` = 这次没提交（用户在「先跟进」的提醒里取消了），提交说明要留着。 */
+  onCommit: (msg: string, amend: boolean) => void | Promise<boolean>
+
   /**
    * SVN 混合仓库才显示「仅本地，不交付」勾选框（spec §6.7）。
    *
@@ -340,8 +342,10 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
   // ——只把按钮置灰而快捷键还通，等于没拦。
   const canCommit = subject.trim().length > 0 && !onBaselineBranch
 
-  const handleCommit = () => {
-    onCommit(buildCommitMessage(subject, description, svnMode && localOnly), amend)
+  const handleCommit = async () => {
+    const committed = await onCommit(buildCommitMessage(subject, description, svnMode && localOnly), amend)
+    // 6.6：在「先跟进」的提醒里取消时，写好的说明不能丢
+    if (committed === false) return
     setSubject('')
     setDescription('')
     // 勾选框**不**重置：连着提交几个本地补丁是常见做法，每次都要重勾很烦。
@@ -364,7 +368,7 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
     // 走到这里都是我们接管的组合：Ctrl+Enter 在 textarea 里默认会插一个换行，
     // subject 的 Enter 也可能被外层当成表单提交，一律挡掉默认行为。
     e.preventDefault()
-    if (action === 'commit') handleCommit()
+    if (action === 'commit') void handleCommit()
     else descriptionRef.current?.focus()
   }
 

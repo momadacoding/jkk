@@ -61,6 +61,7 @@ import { mergeRiskConfirm, triggersMerge } from '@/engine/mergeDrivers'
 import { useConfirm } from './ConfirmDialog'
 import { save } from '@tauri-apps/plugin-dialog'
 import type { CommitNode } from '../engine/types'
+import { commitBeforeFollowWarning } from '@/engine/svnCommitGuard'
 import {
   commitMenu,
   formatCommitInfo,
@@ -277,8 +278,14 @@ export function RepoTab({
     [refreshChangesIn],
   )
 
-  const handleCommit = useCallback(async (msg: string, amend: boolean) => {
-    if (!state.path) return
+  const handleCommit = useCallback(async (msg: string, amend: boolean): Promise<boolean> => {
+    if (!state.path) return false
+    // 事故分析 6.6：SVN 带进来的内容还没跟进就提交，会被记成「你的提交」（11-05 的快照提交）
+    if (state.capabilities.vcs === 'svn') {
+      const staged = (state.status?.staged ?? []).map((f) => f.path)
+      const warning = commitBeforeFollowWarning(staged, state.svnSync)
+      if (warning && !(await confirm({ ...warning, focusCancel: true }))) return false
+    }
     try {
       await invoke('commit', { path: state.path, message: msg, amend })
       await refreshGraph(state.path)
@@ -286,7 +293,8 @@ export function RepoTab({
     } catch (err) {
       reportError(err)
     }
-  }, [state.path, refreshGraph, refreshChanges, reportError])
+    return true
+  }, [state.path, state.capabilities.vcs, state.status, state.svnSync, confirm, refreshGraph, refreshChanges, reportError])
 
   const runAndRefresh = useCallback(async (cmd: string, args: Record<string, unknown>, refresh: () => Promise<void>) => {
     if (!state.path) return

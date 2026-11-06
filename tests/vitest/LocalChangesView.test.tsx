@@ -843,3 +843,38 @@ describe('LocalChangesView：diff 读失败', () => {
     expect(screen.queryByText('No changes')).toBeNull()
   })
 })
+
+describe('LocalChangesView 的提交说明（事故分析 6.6）', () => {
+  function mountWith(onCommit: (msg: string, amend: boolean) => void | Promise<boolean>) {
+    const status: StatusData = { unstaged: [], staged: [change('s.txt')] }
+    render(
+      <LocalChangesView
+        status={status}
+        diff={{ files: [] }}
+        onStage={vi.fn()}
+        onUnstage={vi.fn()}
+        onDiscard={vi.fn()}
+        onCommit={onCommit}
+        svnMode={true}
+        onBaselineBranch={false}
+      />,
+    )
+    const subject = screen.getByPlaceholderText('Commit subject') as HTMLInputElement
+    fireEvent.change(subject, { target: { value: '修登录' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Commit' }))
+    return subject
+  }
+
+  it('在「先跟进」的提醒里取消了：写好的说明留着', async () => {
+    const onCommit = vi.fn(async () => false)
+    const subject = mountWith(onCommit)
+    await waitFor(() => expect(onCommit).toHaveBeenCalledTimes(1))
+    await Promise.resolve()
+    expect(subject.value).toBe('修登录')
+  })
+
+  it('提交了：说明照旧清空', async () => {
+    const subject = mountWith(vi.fn(async () => true))
+    await waitFor(() => expect(subject.value).toBe(''))
+  })
+})
