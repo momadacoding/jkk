@@ -516,6 +516,46 @@ export async function syncIfWcDbChanged(
 }
 
 /**
+ * 尾随复查的间隔：最后一个文件事件之后再比一次（事故分析 6.11）。
+ *
+ * `.svn` 被 watcher 过滤，wc.db 自己的写入不产生事件。TortoiseSVN 装完最后一个文件到 wc.db
+ * 最后一次提交事务之间没有新事件，那一刻读到的是半途的戳；不补这一下，横幅又要等下一次焦点。
+ * 要比 watcher 的去抖（300ms）长，否则复查和最后一个事件挤在同一刻，什么都没多看到。
+ */
+export const SVN_TRAILING_RECHECK_MS = 2000
+
+/**
+ * 文件变动时的检测（事故分析 6.11）：根 revision **或** wc.db 戳变了就跑第二档。
+ *
+ * 只看根 revision 不够：TortoiseSVN 只更新一个子目录时根的 revision 不动，「本地改动」立刻出现
+ * 一大片，「跟进」却要等下一次窗口焦点才挂出来。wc.db 戳只是几次 `stat`，挂在高频通道上没有负担。
+ *
+ * 读戳失败（工作副本被删了一半之类）时退回只看根 revision，不让新加的这一档拖垮原有的那一档；
+ * 戳的记录这时不动。记录的规矩同 {@link recordAfterSuccess}：两份观测值都在开跑前读，成功才记。
+ */
+export async function syncIfRootRevOrWcDbChanged(
+  rootMemo: RootRevMemo,
+  wcDbMemo: WcDbStampMemo,
+  readRootRevs: () => Promise<string>,
+  readStamps: () => Promise<WcDbStamp[]>,
+  runFullCheck: () => Promise<void>,
+): Promise<boolean> {
+  const rootRevs = await readRootRevs()
+  let stamps: WcDbStamp[] | null
+  try {
+    stamps = await readStamps()
+  } catch {
+    stamps = null
+  }
+  const changed = rootRevs !== rootMemo.value || (stamps !== null && wcDbStampsChanged(wcDbMemo.value, stamps))
+  if (!changed) return false
+  await runFullCheck()
+  rootMemo.value = rootRevs
+  if (stamps !== null) wcDbMemo.value = stamps
+  return true
+}
+
+/**
  * 窗口失焦时要不要记快照（日志 Task 0，W26）。
  *
  * 快照的价值在于「它一定早于接下来的外部提交」。所以只在确认过 InSync 时写，而且校验正在跑时

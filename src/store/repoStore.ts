@@ -8,8 +8,10 @@ import {
   markOnBlur,
   recordAfterSuccess,
   syncIfRootRevChanged,
+  syncIfRootRevOrWcDbChanged,
   syncIfWcDbChanged,
   SVN_AUDIT_POLL_MS,
+  SVN_TRAILING_RECHECK_MS,
   type EolStatus,
   type RootRevMemo,
   type ServerAudit,
@@ -938,15 +940,20 @@ export function useRepoStore() {
     })
 
   /**
-   * 第一档（O(1)）：rootRev 与**上次观测值**比，变了才跑第二档。
+   * 第一档（O(1)）：rootRev 或 wc.db 戳与**上次观测值**比，变了才跑第二档。
+   *
+   * wc.db 那一半是事故分析 6.11：只更新子目录时根 revision 不动，原来要等下一次焦点才挂出「跟进」。
+   * 与焦点检测共用 `lastWcDbStamps`：两边记的都是「最近一次成功校验之前的戳」，失焦快照按它判断。
    *
    * 返回是否真的跑了第二档，只为让调用方能读懂日志；调用方不依赖它。
    */
   const checkSvnSyncIfChanged = (path: string) =>
     trackSvnCheck(() =>
-      syncIfRootRevChanged(
+      syncIfRootRevOrWcDbChanged(
         lastRootRevs.current,
+        lastWcDbStamps.current,
         () => readRootRevs(path),
+        () => svnWcDbStamps(path),
         () => applySvnSync(path),
       ),
     )
@@ -1336,6 +1343,8 @@ export function useRepoEffects(
     // 换仓库时仍会重新注册。`listen` 是一次 IPC 往返，清理时它可能还没回来：回来之后立刻注销，
     // 否则每换一次就多挂一个监听器（同 `useExternalToolExit`）
     let disposed = false
+    // 尾随复查（事故分析 6.11）：wc.db 的最后一笔写入没有文件事件，见 `SVN_TRAILING_RECHECK_MS`
+    let trailing: number | undefined
     listen<string>('repo-changed', (event) => {
       const path = state.path!
       // 事件是全局广播的，每个标签只认自己那个仓库的变更
@@ -1370,6 +1379,10 @@ export function useRepoEffects(
       // 第二档还是每次都跑——分层白做。
       if (state.capabilities.vcs === 'svn') {
         void checkSvnSyncIfChanged(path).catch(ignore)
+        window.clearTimeout(trailing)
+        trailing = window.setTimeout(() => {
+          if (!disposed) void checkSvnSyncIfChanged(path).catch(ignore)
+        }, SVN_TRAILING_RECHECK_MS)
         // 同步状态也要跟着刷（2026-09-25 独立 review）。只在打开仓库时读一次的话：
         // 另一个进程开始或结束的同步永远不会出现 / 永远不会消失；更糟的是，
         // 打开那一刻若恰好读到 `locked: true`，`otherBannersAreSuppressed` 会把
@@ -1386,6 +1399,7 @@ export function useRepoEffects(
     })
     return () => {
       disposed = true
+      window.clearTimeout(trailing)
       unlisten?.()
     }
   }, [state.path, state.capabilities.vcs])
