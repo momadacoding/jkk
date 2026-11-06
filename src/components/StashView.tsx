@@ -27,7 +27,7 @@ export function StashView({ stashes, onSelect, onApply, onPop, onDrop, selectedI
   const { menu, open, close } = useContextMenu()
 
   return (
-    <SidebarSection title="STASHES" count={stashes.length} defaultOpen={stashes.length > 0}>
+    <SidebarSection title="STASHES" count={stashes.length} defaultOpen={stashes.length > 0} memoryKey="stashes">
       {stashes.length === 0 && <div className="sb-empty">No stashes</div>}
       {stashes.map((entry) => {
         const items = [

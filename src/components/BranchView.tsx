@@ -237,6 +237,7 @@ export function BranchView({
   return (
     <SidebarSection
       title="BRANCHES"
+      memoryKey="branches"
       action={{ title: 'New branch', onClick: () => setCreating(true) }}
     >
       {creating && (
@@ -256,7 +257,7 @@ export function BranchView({
         </div>
       )}
 
-      <SidebarGroup label="Local" count={local.length}>
+      <SidebarGroup label="Local" count={local.length} memoryKey="branches.local">
         {local.map((ref) => {
           const name = shortName(ref)
           const isBaseline = isProtectedBaseline(name, capabilities)
@@ -303,7 +304,7 @@ export function BranchView({
       {/* 远程分支在 SVN 混合仓库里没有对应物，而 checkout_remote_branch /
           delete_remote_branch 都还没进接缝，仍直接跑 git CLI。整组不渲染 */}
       {capabilities.remotes && (
-      <SidebarGroup label="Remote" count={remote.length} defaultOpen={false}>
+      <SidebarGroup label="Remote" count={remote.length} defaultOpen={false} memoryKey="branches.remote">
         {remote.map((ref) => (
           <div
             key={ref.name}
