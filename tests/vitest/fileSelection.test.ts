@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
   activeChange,
+  changesDiffScope,
   changesPaths,
-  changesSection,
+  isChangesFileScope,
   nextFileSelection,
   rangeSelection,
   reconcileSelection,
@@ -169,21 +170,46 @@ describe('activeChange', () => {
   })
 })
 
-describe('changesSection', () => {
+// 右侧只显示选中的那一个文件，只读它（2026-11-05 排查报告 6.13 方案 C）
+describe('changesDiffScope', () => {
   const ch = (path: string, status = 'modified'): FileChange => ({ path, status, additions: 0, deletions: 0 })
 
-  it('选中 Staged 里的：staged', () => {
-    expect(changesSection(sel('staged', 's'), { unstaged: [ch('u')], staged: [ch('s')] })).toBe('staged')
+  it('选中 Staged 里的：读它在 Staged 的 diff', () => {
+    expect(changesDiffScope(sel('staged', 's'), { unstaged: [ch('u')], staged: [ch('s')] })).toBe('staged:s')
   })
 
-  it('没选、只有 Staged 有文件：staged', () => {
-    expect(changesSection(empty, { unstaged: [], staged: [ch('s')] })).toBe('staged')
+  it('选中 Unstaged 里的：读它在 Unstaged 的 diff', () => {
+    expect(changesDiffScope(sel('unstaged', 'u'), { unstaged: [ch('u')], staged: [ch('s')] })).toBe('unstaged:u')
   })
 
-  it('两边都空：unstaged（没东西可读，取哪个都一样，固定一个免得来回切）', () => {
-    expect(changesSection(empty, { unstaged: [], staged: [] })).toBe('unstaged')
+  it('没选、只有 Staged 有文件：读 Staged 的第一个（界面上默认显示的就是它）', () => {
+    expect(changesDiffScope(empty, { unstaged: [], staged: [ch('s'), ch('t')] })).toBe('staged:s')
   })
 
+  it('没选：读 Unstaged 第一个显示的，冲突文件排在最前', () => {
+    expect(changesDiffScope(empty, { unstaged: [ch('plain'), ch('c', 'conflicted')], staged: [] })).toBe('unstaged:c')
+  })
+
+  it('选中的文件刚被整份暂存：跟到 Staged', () => {
+    expect(changesDiffScope(sel('unstaged', 'a'), { unstaged: [ch('b')], staged: [ch('a')] })).toBe('staged:a')
+  })
+
+  // 原来固定读整个 Unstaged：没有改动时也要把整个工作区扫一遍
+  it('两边都空：什么都不读', () => {
+    expect(changesDiffScope(empty, { unstaged: [], staged: [] })).toBeNull()
+  })
+
+  it('认得出自己给的 scope，不把提交详情的当成它', () => {
+    expect(isChangesFileScope('staged:a.txt')).toBe(true)
+    expect(isChangesFileScope('unstaged:a.txt')).toBe(true)
+    for (const s of ['staged', 'unstaged', 'workdir', 'unstaged:', 'commit:abc', 'range:a..b']) {
+      expect(isChangesFileScope(s)).toBe(false)
+    }
+  })
+
+  it('路径里带冒号也原样拼上（后端只按第一个冒号拆）', () => {
+    expect(changesDiffScope(sel('unstaged', 'a:b'), { unstaged: [ch('a:b')], staged: [] })).toBe('unstaged:a:b')
+  })
 })
 
 describe('changesPaths', () => {

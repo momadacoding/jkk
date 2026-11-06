@@ -3,7 +3,7 @@ use crate::engine::svn_lock;
 use crate::error::{GitError, Result};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Mutex, OnceLock};
@@ -105,6 +105,217 @@ impl Drop for WatchSuspension {
     }
 }
 
+/// 本应用自己写 index（Stage / Unstage）的登记：归一化路径 → 在写的次数、这一轮写开始的时刻、
+/// 最后一次写完时 index 的指纹。
+///
+/// 2026-11-05 排查报告 6.13 方案 B：Stage 之后前端自己会就地刷新「本地改动」；监听再看到
+/// `.git/index` 被改，300ms 后又发一次 `repo-changed`，前端随之跑一整轮（状态全量扫描、提交图、
+/// stash、merge driver、svn info……），和前端自己那轮抢磁盘和 CPU。这一轮什么新信息都没有：
+/// Stage / Unstage 只改 index（`stage_and_unstage_only_touch_the_index` 实测）。
+///
+/// # 为什么核对指纹而不是开一个时间窗口
+///
+/// 第一版是「写的过程中加之后 1 秒内的 index 事件都算自己的」。窗口内外部进程也写了 index
+/// （终端里 `git add`、mergetool 标记已解决）会被一起吞掉。现在写完记下 index 的指纹，去抖到点要发
+/// 事件时再看一次：还是那份就是自己写的；不是就说明之后又有人写过，照常刷新。
+///
+/// 还要核对时刻：攒着的事件若早于这一轮写开始，就是写之前别人留下的，它的改动已经包含在我们记下的
+/// 指纹里，比指纹认不出来（第二轮独立 review 第 4 条）。剩下的缝只有「这一轮写开始」到「git 拿到
+/// `index.lock`」之间（起一个 git 进程的工夫）里恰好有外部写入。
+static OWN_INDEX_WRITES: OnceLock<Mutex<HashMap<String, OwnWrites>>> = OnceLock::new();
+
+struct OwnWrites {
+    running: usize,
+    /// 这一轮写开始的时刻：在写次数从 0 变 1 时记下，重叠的几次算同一轮
+    started: Option<Instant>,
+    /// 最后一次写完时 index 的指纹。读不到（index 不存在、仓库打不开）时为 None：不豁免任何东西
+    stamp: Option<IndexStamp>,
+}
+
+/// index 的指纹：大小、修改时间、文件末尾的校验和。
+///
+/// git 写 index 是先写 `index.lock` 再改名，修改时间每次都变——但 FAT/exFAT（2 秒）、部分网络共享的
+/// 时间戳很粗，同一个刻度里两次只改了已有条目的写，大小和修改时间都可能一样（第二轮独立 review 第 5 条）。
+/// index 末尾是整份内容的校验和（SHA-1 20 字节、SHA-256 32 字节），内容一变它就变，所以再读末尾 32 字节。
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct IndexStamp {
+    len: u64,
+    modified: std::time::SystemTime,
+    tail: Vec<u8>,
+}
+
+fn index_stamp(index: &Path) -> Option<IndexStamp> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(index).ok()?;
+    let meta = file.metadata().ok()?;
+    let len = meta.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(32))).ok()?;
+    let mut tail = Vec::with_capacity(32);
+    file.read_to_end(&mut tail).ok()?;
+    Some(IndexStamp {
+        len,
+        modified: meta.modified().ok()?,
+        tail,
+    })
+}
+
+fn own_index_writes() -> &'static Mutex<HashMap<String, OwnWrites>> {
+    OWN_INDEX_WRITES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 本应用自己写 index 的 RAII 登记：构造即开始，Drop 即结束并记下 index 的指纹。
+///
+/// 用守卫而不是成对调用，理由同 `WatchSuspension`：中间任何一个 `?` 早退都会让登记永远停在
+/// 「在写」，之后这个仓库的 index 事件一直等下去。锁中毒时静默放弃：后果只是多刷新一轮。
+/// 命令失败也照样记：git 可能写了一部分，前端在失败时自己全量刷新（`RepoTab` 的 `writeIndex`）。
+pub struct OwnIndexWrite {
+    key: String,
+    path: String,
+}
+
+impl OwnIndexWrite {
+    pub fn begin(path: &str) -> Self {
+        let key = normalize(path);
+        if let Ok(mut m) = own_index_writes().lock() {
+            let w = m.entry(key.clone()).or_insert(OwnWrites {
+                running: 0,
+                started: None,
+                stamp: None,
+            });
+            if w.running == 0 {
+                w.started = Some(Instant::now());
+            }
+            w.running += 1;
+        }
+        Self {
+            key,
+            path: path.to_string(),
+        }
+    }
+}
+
+impl Drop for OwnIndexWrite {
+    fn drop(&mut self) {
+        // 先取指纹再减计数：反过来的话，watcher 可能在「不在写了、指纹还是上一次的」那一刻来核对
+        let stamp = git2::Repository::open(&self.path)
+            .ok()
+            .and_then(|r| index_stamp(&r.path().join("index")));
+        if let Ok(mut m) = own_index_writes().lock() {
+            if let Some(w) = m.get_mut(&self.key) {
+                w.running = w.running.saturating_sub(1);
+                w.stamp = stamp;
+            }
+        }
+    }
+}
+
+/// 只看到「自己写 index 会碰到的路径」时，到点核对的结论。
+#[derive(Debug, PartialEq, Eq)]
+enum OwnVerdict {
+    /// index 还是我们最后写完的那份，事件也都在这一轮写开始之后：不发事件
+    Own,
+    /// 没登记过、读不到指纹、指纹变了（之后有人又写过）、或者事件早于这一轮写：照常发
+    NotOwn,
+    /// 本应用的写还没结束：先不判，下一个 tick 再看
+    Pending,
+}
+
+/// `key` 是 `normalize` 过的路径（watcher 线程里已经算好）；`index` 是这个仓库 gitdir 下的 index；
+/// `since` 是攒着的这批事件里最早那条到达的时刻。
+fn own_write_verdict(key: &str, index: &Path, since: Instant) -> OwnVerdict {
+    let recorded = {
+        let Ok(m) = own_index_writes().lock() else {
+            return OwnVerdict::NotOwn;
+        };
+        match m.get(key) {
+            None => return OwnVerdict::NotOwn,
+            Some(w) if w.running > 0 => return OwnVerdict::Pending,
+            Some(w) if w.started.map_or(true, |s| since < s) => return OwnVerdict::NotOwn,
+            Some(w) => w.stamp.clone(),
+        }
+    };
+    // 读文件放在锁外：Stage 命令的 Drop 也要拿这把锁
+    match recorded {
+        Some(stamp) if index_stamp(index).as_ref() == Some(&stamp) => OwnVerdict::Own,
+        _ => OwnVerdict::NotOwn,
+    }
+}
+
+/// Stage / Unstage 在 watcher 眼里会碰到的路径（已规范化）：gitdir 下的 `index`，以及两个只是
+/// 「目录项变了」的目录事件——gitdir 本身（`index.lock` 建了又改名）和 commondir 下的 `objects`
+/// （新对象落进新的两位前缀子目录）。后两个是 `stage_and_unstage_only_touch_the_index` 实测出来的；
+/// 它们本身不带信息，外部真有改动时总有自己那条子路径的事件（index、refs……）。linked worktree 的
+/// index 在 per-worktree gitdir 里，对象库在 commondir 里，所以两个目录分开取。
+struct OwnWritePaths {
+    index: PathBuf,
+    gitdir: PathBuf,
+    objects: PathBuf,
+}
+
+impl OwnWritePaths {
+    fn of(repo: &git2::Repository) -> Self {
+        let gitdir = crate::engine::watch::canonical(repo.path());
+        Self {
+            index: gitdir.join("index"),
+            objects: crate::engine::watch::canonical(repo.commondir()).join("objects"),
+            gitdir,
+        }
+    }
+
+    /// 事件路径规范化之后是不是这三条之一。
+    ///
+    /// 事件路径是按监听目标的原始写法给的，而这三条来自 libgit2，两边写法（8.3 短名、大小写、分隔符）
+    /// 不同就会失配，见 `engine::watch::watch_targets`。只规范化父目录：`index` 改名的瞬间文件本身
+    /// 可能还不在。
+    fn contains(&self, target: &Path) -> bool {
+        let (Some(parent), Some(name)) = (target.parent(), target.file_name()) else {
+            return false;
+        };
+        let all = [&self.index, &self.gitdir, &self.objects];
+        // 先比文件名，绝大多数事件到这里就结束，不付 `canonicalize` 的代价。Windows 上不区分大小写
+        let same_name = |p: &&PathBuf| {
+            p.file_name().is_some_and(|n| {
+                if cfg!(windows) {
+                    n.eq_ignore_ascii_case(name)
+                } else {
+                    n == name
+                }
+            })
+        };
+        if !all.iter().any(same_name) {
+            return false;
+        }
+        let normalized = crate::engine::watch::canonical(parent).join(name);
+        all.iter().any(|p| **p == normalized)
+    }
+}
+
+/// 一条事件路径对刷新意味着什么。
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Wake {
+    /// 不相关（被忽略的文件、对象库里的文件、锁文件……）
+    No,
+    /// 自己写 index 也会碰到的路径：到点核对再决定（`own_write_verdict`）
+    IfNotOwn,
+    /// 一定要刷新
+    Yes,
+}
+
+fn classify(
+    repo: Option<&git2::Repository>,
+    root: &Path,
+    own_paths: Option<&OwnWritePaths>,
+    target: &Path,
+) -> Wake {
+    if !is_relevant(repo, root, target) {
+        Wake::No
+    } else if own_paths.is_some_and(|o| o.contains(target)) {
+        Wake::IfNotOwn
+    } else {
+        Wake::Yes
+    }
+}
+
 /// 变更静默这么久之后才发一次 `repo-changed`（尾沿去抖）。
 const DEBOUNCE: Duration = Duration::from_millis(300);
 /// 轮询 channel 的间隔，需要明显小于 DEBOUNCE 才能及时判定静默。
@@ -187,7 +398,12 @@ pub fn watch_repo(handle: AppHandle, path: String) -> Result<()> {
             }
         }
 
+        // 认「自己写的 index」用，见 `own_write_paths`。打不开仓库时为空：什么都不豁免
+        let own_paths = repo.as_ref().map(OwnWritePaths::of);
+        // 攒着的变化里有一定要刷新的
         let mut pending = false;
+        // 攒着的「自己写 index 也会碰到的路径」里最早那条到达的时刻：到点核对再决定
+        let mut own_only_since: Option<Instant> = None;
         let mut last_change = Instant::now();
         loop {
             let still_mine = watchers()
@@ -199,12 +415,14 @@ pub fn watch_repo(handle: AppHandle, path: String) -> Result<()> {
             }
             match rx.recv_timeout(TICK) {
                 Ok(Ok(event)) => {
-                    if event
-                        .paths
-                        .iter()
-                        .any(|p| is_relevant(repo.as_ref(), &root, p))
-                    {
-                        pending = true;
+                    for p in &event.paths {
+                        match classify(repo.as_ref(), &root, own_paths.as_ref(), p) {
+                            Wake::No => continue,
+                            Wake::IfNotOwn => {
+                                own_only_since.get_or_insert_with(Instant::now);
+                            }
+                            Wake::Yes => pending = true,
+                        }
                         last_change = Instant::now();
                     }
                 }
@@ -214,8 +432,21 @@ pub fn watch_repo(handle: AppHandle, path: String) -> Result<()> {
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
-            if pending && last_change.elapsed() >= DEBOUNCE {
+            if (pending || own_only_since.is_some()) && last_change.elapsed() >= DEBOUNCE {
+                // 只有 index 一类的变化时到这时才核对：去抖之后 Stage 命令多半已经结束、指纹已经记下。
+                // 还没结束就留着，下一个 tick 再看
+                if let (false, Some(since), Some(own)) = (pending, own_only_since, &own_paths) {
+                    match own_write_verdict(&key, &own.index, since) {
+                        OwnVerdict::Pending => continue,
+                        OwnVerdict::Own => {
+                            own_only_since = None;
+                            continue;
+                        }
+                        OwnVerdict::NotOwn => {}
+                    }
+                }
                 pending = false;
+                own_only_since = None;
                 // 挂起期间**丢弃**事件而不是攒着：同步结束时调用方会主动发一次，
                 // 攒着只会在恢复的瞬间连发几百条。
                 if !is_watch_suspended(&path) {
@@ -244,7 +475,9 @@ pub fn unwatch_repo(path: String) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_relevant;
+    use super::{
+        classify, is_relevant, normalize, own_write_verdict, OwnIndexWrite, OwnVerdict, Wake,
+    };
     use crate::engine::svn_lock;
     use std::path::PathBuf;
 
@@ -254,6 +487,278 @@ mod tests {
         let root = dir.path().to_path_buf();
         std::fs::create_dir_all(root.join(".git")).unwrap();
         (dir, root)
+    }
+
+    /// 一个真的仓库（带一个空 index）：`own_write_paths` 要从 libgit2 拿 gitdir / commondir，
+    /// 指纹要从真的 index 文件取。
+    fn real_repo() -> (tempfile::TempDir, PathBuf, git2::Repository) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        let repo = git2::Repository::init(&root).unwrap();
+        repo.index().unwrap().write().unwrap();
+        (dir, root, repo)
+    }
+
+    #[test]
+    fn what_our_own_index_write_touches_is_checked_not_refreshed_outright() {
+        // 2026-11-05 排查报告 6.13 方案 B：Stage 之后前端自己会就地刷新；监听再看到 `.git/index`
+        // 被改，300ms 后又触发一整轮刷新（状态全量扫描、提交图、stash、svn info……），和前端那轮
+        // 抢磁盘和 CPU。这三条路径要先核对是不是自己写的
+        let (_d, root, repo) = real_repo();
+        let own = super::OwnWritePaths::of(&repo);
+        let git = root.join(".git");
+        for p in [git.join("index"), git.clone(), git.join("objects")] {
+            assert_eq!(
+                classify(Some(&repo), &root, Some(&own), &p),
+                Wake::IfNotOwn,
+                "{}",
+                p.display()
+            );
+        }
+    }
+
+    #[test]
+    fn everything_else_still_wakes_a_refresh() {
+        // 同一时刻工作区里的保存、别的 git 元数据变化都不能被一起吞掉
+        let (_d, root, repo) = real_repo();
+        let own = super::OwnWritePaths::of(&repo);
+        let git = root.join(".git");
+        for p in [
+            root.join("a.txt"),
+            // 工作区里恰好叫 index / objects 的文件
+            root.join("index"),
+            root.join("sub").join("index"),
+            root.join("objects"),
+            git.join("HEAD"),
+            git.join("refs").join("heads").join("main"),
+            git.join("MERGE_HEAD"),
+        ] {
+            assert_eq!(
+                classify(Some(&repo), &root, Some(&own), &p),
+                Wake::Yes,
+                "{}",
+                p.display()
+            );
+        }
+        // 打不开仓库（没有清单）时不核对任何东西
+        assert_eq!(classify(None, &root, None, &git.join("index")), Wake::Yes);
+    }
+
+    #[test]
+    fn the_check_survives_a_different_spelling_of_the_repo_path() {
+        // 事件路径按监听目标的原始写法给，清单来自 libgit2（正斜杠、可能是长名）。
+        // 写法不同也要认得出来，否则永远走不到指纹核对
+        let (_d, root, repo) = real_repo();
+        let own = super::OwnWritePaths::of(&repo);
+        let spelled = PathBuf::from(root.to_string_lossy().replace('\\', "/")).join(".git/index");
+        assert_eq!(
+            classify(Some(&repo), &root, Some(&own), &spelled),
+            Wake::IfNotOwn
+        );
+        #[cfg(windows)]
+        {
+            let upper = PathBuf::from(root.to_string_lossy().to_uppercase()).join(".git\\index");
+            assert_eq!(
+                classify(Some(&repo), &root, Some(&own), &upper),
+                Wake::IfNotOwn
+            );
+        }
+    }
+
+    #[test]
+    fn the_verdict_follows_the_index_fingerprint() {
+        use std::time::{Duration, Instant, SystemTime};
+        let (_d, root, _repo) = real_repo();
+        let raw = root.to_str().unwrap();
+        let key = &normalize(raw);
+        let index = root.join(".git").join("index");
+        let verdict = |since: Instant| own_write_verdict(key, &index, since);
+        // 没登记过：不是自己写的
+        assert_eq!(verdict(Instant::now()), OwnVerdict::NotOwn);
+
+        // Stage 命令收到的路径写法（分隔符、结尾斜杠、大小写）和 watcher 的不同，也是同一个仓库
+        let first = OwnIndexWrite::begin(&format!("{}/", raw.replace('\\', "/")));
+        let during = Instant::now();
+        assert_eq!(verdict(during), OwnVerdict::Pending);
+        // 两次 Stage 重叠：先结束的那次不能让另一次还在写的被当成写完了
+        let second = OwnIndexWrite::begin(raw);
+        drop(first);
+        assert_eq!(verdict(during), OwnVerdict::Pending);
+        drop(second);
+        // 写完了、index 还是那份：自己写的。事件晚到多久都一样，不靠时间窗口
+        assert_eq!(verdict(during), OwnVerdict::Own);
+        assert_eq!(
+            verdict(Instant::now() + Duration::from_secs(60)),
+            OwnVerdict::Own
+        );
+        let other = &normalize(root.join("elsewhere").to_str().unwrap());
+        assert_eq!(own_write_verdict(other, &index, during), OwnVerdict::NotOwn);
+
+        // 攒着的事件比这次写开始得还早：是写之前别人留下的（终端里 `git add -N`、`update-index`），
+        // 它的改动已经包含在我们记下的指纹里，比指纹认不出来（第二轮独立 review 第 4 条）
+        let before = Instant::now();
+        drop(OwnIndexWrite::begin(raw));
+        assert_eq!(verdict(before), OwnVerdict::NotOwn);
+        assert_eq!(verdict(Instant::now()), OwnVerdict::Own);
+
+        // 之后有人又写了 index（大小变了）：不是自己写的，照常刷新
+        let original = std::fs::read(&index).unwrap();
+        std::fs::write(&index, [original.as_slice(), b"x"].concat()).unwrap();
+        assert_eq!(verdict(Instant::now()), OwnVerdict::NotOwn);
+        // 大小一样、只有修改时间变了：同样认出来
+        std::fs::write(&index, &original).unwrap();
+        let own_write = OwnIndexWrite::begin(raw);
+        let since = Instant::now();
+        drop(own_write);
+        assert_eq!(verdict(since), OwnVerdict::Own);
+        let set_mtime = |t: SystemTime| {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&index)
+                .unwrap();
+            f.set_modified(t).unwrap();
+        };
+        let recorded = std::fs::metadata(&index).unwrap().modified().unwrap();
+        set_mtime(recorded + Duration::from_secs(5));
+        assert_eq!(verdict(since), OwnVerdict::NotOwn);
+        // 大小、修改时间都一样，只有内容不同（时间戳粗的文件系统上同一个刻度里的两次写）：
+        // 靠 index 末尾的校验和认出来（第二轮独立 review 第 5 条）
+        let mut changed = original.clone();
+        *changed.last_mut().unwrap() ^= 0xff;
+        std::fs::write(&index, &changed).unwrap();
+        set_mtime(recorded);
+        assert_eq!(
+            std::fs::metadata(&index).unwrap().len(),
+            original.len() as u64
+        );
+        assert_eq!(verdict(since), OwnVerdict::NotOwn);
+    }
+
+    /// 实测：本应用的 Stage / Unstage（`GitBackend` 原样的参数、`OwnIndexWrite` 原样的守卫）在 watcher
+    /// 眼里只碰了那三条路径，而且到点核对时认得出是自己写的；之后外部终端里的 `git add` 认得出不是。
+    ///
+    /// 方案 B 的前提就是这一条。若 git 某天在 `add` / `reset` 时还写了别的相关文件，这里先红，
+    /// 而不是界面上悄悄多出一轮刷新。
+    #[cfg(windows)]
+    #[test]
+    fn stage_and_unstage_only_touch_the_index() {
+        use crate::vcs::Vcs;
+        use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        let git = |args: &[&str]| {
+            assert!(Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "T"]);
+        std::fs::write(root.join("a.txt"), "1\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "base"]);
+        std::fs::write(root.join("a.txt"), "1\n2\n").unwrap();
+        std::fs::write(root.join("new.txt"), "n\n").unwrap();
+
+        let repo = git2::Repository::open(&root).unwrap();
+        let own = super::OwnWritePaths::of(&repo);
+        let key = normalize(root.to_str().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut w = RecommendedWatcher::new(
+            move |res: notify::Result<notify::Event>| {
+                let _ = tx.send(res);
+            },
+            Config::default(),
+        )
+        .unwrap();
+        w.watch(&root, RecursiveMode::Recursive).unwrap();
+        // 这批里最早一条「自己写 index 也会碰到的路径」的到达时刻，与 watcher 线程的 `own_only_since` 同义
+        let first_candidate = |seen: &[(PathBuf, Wake, Instant)]| {
+            seen.iter()
+                .find(|(_, w, _)| *w == Wake::IfNotOwn)
+                .map(|(_, _, t)| *t)
+                .expect("没收到 index 一类的事件")
+        };
+        // 每条相关路径的分类和到达时刻
+        let collect = |d: Duration| -> Vec<(PathBuf, Wake, Instant)> {
+            let end = Instant::now() + d;
+            let mut seen = Vec::new();
+            while let Some(left) = end.checked_duration_since(Instant::now()) {
+                match rx.recv_timeout(left) {
+                    Ok(Ok(ev)) => {
+                        for p in ev.paths {
+                            let wake = classify(Some(&repo), &root, Some(&own), &p);
+                            if wake != Wake::No {
+                                seen.push((p, wake, Instant::now()));
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => panic!("watcher 报错：{e}"),
+                    Err(_) => break,
+                }
+            }
+            seen
+        };
+        let _ = collect(Duration::from_millis(500));
+
+        let backend = crate::vcs::git::GitBackend::new(root.to_str().unwrap());
+        let paths = vec!["a.txt".to_string(), "new.txt".to_string()];
+        for (what, run) in [
+            (
+                "stage",
+                &(|| backend.stage(&paths)) as &dyn Fn() -> crate::error::Result<()>,
+            ),
+            ("unstage", &|| backend.unstage(&paths)),
+        ] {
+            // 与 `commands::ops::stage` 相同：命令跑完守卫就 drop，记下指纹
+            {
+                let _own = OwnIndexWrite::begin(root.to_str().unwrap());
+                run().unwrap();
+            }
+            let seen = collect(Duration::from_millis(1000));
+            // 先证明确实看到了 index 的变化，下面的结论才有意义
+            assert!(
+                seen.iter().any(|(p, _, _)| p.ends_with(".git/index")),
+                "{what}：没收到 index 的事件，watcher 没工作？{seen:?}"
+            );
+            let outside: Vec<_> = seen.iter().filter(|(_, w, _)| *w == Wake::Yes).collect();
+            assert!(
+                outside.is_empty(),
+                "{what} 碰到了清单以外的相关路径：{outside:?}"
+            );
+            assert_eq!(
+                own_write_verdict(&key, &own.index, first_candidate(&seen)),
+                OwnVerdict::Own,
+                "{what}：到点核对没认出是自己写的"
+            );
+        }
+
+        // 外部终端里的 `git add`：也只碰这三条路径，但核对时认得出不是自己写的，照常刷新
+        git(&["add", "--", "a.txt"]);
+        let seen = collect(Duration::from_millis(1000));
+        assert!(
+            seen.iter().any(|(p, _, _)| p.ends_with(".git/index")),
+            "{seen:?}"
+        );
+        assert_eq!(
+            own_write_verdict(&key, &own.index, first_candidate(&seen)),
+            OwnVerdict::NotOwn
+        );
+
+        // 正对照：工作区的保存一定唤醒
+        std::fs::write(root.join("a.txt"), "1\n2\n3\n").unwrap();
+        let seen = collect(Duration::from_millis(1000));
+        assert!(
+            seen.iter()
+                .any(|(p, w, _)| p.ends_with("a.txt") && *w == Wake::Yes),
+            "正对照失败：工作区的保存没有唤醒刷新：{seen:?}"
+        );
     }
 
     #[test]

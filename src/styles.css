@@ -696,6 +696,16 @@ body {
   color: #666;
 }
 
+/* 「正在读取」延迟 200ms 才出现：单个文件的 diff 通常几十毫秒就回来，不让它一闪而过 */
+.diff-note-pending {
+  animation: diff-note-reveal 0s linear 200ms both;
+}
+
+@keyframes diff-note-reveal {
+  from { visibility: hidden; }
+  to { visibility: visible; }
+}
+
 /* ---------- 应用内弹框（替代 window.prompt） ---------- */
 
 .dialog-overlay {

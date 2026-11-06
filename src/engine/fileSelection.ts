@@ -176,12 +176,21 @@ export function changesPaths(status: StatusData): { unstaged: string[], staged: 
 }
 
 /**
- * 「本地改动」右侧该读哪个区的 diff：Unstaged 读暂存区对比工作区（scope `unstaged`），
- * Staged 读 HEAD 对比暂存区（scope `staged`）。两边都空时固定为 Unstaged。
+ * 「本地改动」右侧要读的 diff scope：只读显示的那一个文件，`<区>:<路径>`。
+ *
+ * 按选中文件所在的区读（第 65 条）：Unstaged 读暂存区对比工作区，Staged 读 HEAD 对比暂存区。
+ * 只读一个文件（2026-11-05 排查报告 6.13 方案 C）：右侧本来就只显示这一个，整区读要把整个工作区
+ * stat 一遍、再读出每个改动文件的内容。两边都空时为 `null`，什么都不读。
  */
-export function changesSection(selection: FileSelection, status: StatusData): FileSection {
+export function changesDiffScope(selection: FileSelection, status: StatusData): string | null {
   const { unstaged, staged } = changesPaths(status)
-  return activeChange(selection, unstaged, staged)?.section ?? 'unstaged'
+  const active = activeChange(selection, unstaged, staged)
+  return active ? `${active.section}:${active.path}` : null
+}
+
+/** 是不是 `changesDiffScope` 给出的单文件 scope。提交详情的 `commit:` / `range:` 不算。 */
+export function isChangesFileScope(scope: string): boolean {
+  return /^(staged|unstaged):./.test(scope)
 }
 
 /** 按列表显示顺序排列，保证选中顺序和眼睛看到的一致。 */

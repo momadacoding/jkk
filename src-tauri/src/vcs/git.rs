@@ -6,7 +6,7 @@
 
 use super::{Capabilities, Vcs};
 use crate::engine;
-use crate::engine::diff::{DiffData, StatusData};
+use crate::engine::diff::{DiffData, StatusData, StatusPatch};
 use crate::engine::graph::GraphData;
 use crate::engine::repo::RepoInfo;
 use crate::engine::stash::StashEntry;
@@ -41,6 +41,10 @@ impl Vcs for GitBackend {
 
     fn status(&self) -> Result<StatusData> {
         engine::diff::read_status(&self.root)
+    }
+
+    fn status_paths(&self, paths: &[String]) -> Result<StatusPatch> {
+        engine::diff::read_status_paths(&self.root, paths)
     }
 
     fn diff(&self, scope: &str) -> Result<DiffData> {
