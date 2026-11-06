@@ -55,7 +55,12 @@ export interface FollowReport {
   changes: ExternalChange[]
   removed: string[]
   dropped: string[]
+  /** (原 commit, 换成 SVN 版本的路径)：我自己提交到 SVN 的（F2 ①）。 */
   rewritten: [string, string[]][]
+  /** (原 commit, 换成 SVN 版本的路径)：内容与更新的某个基线逐字节相同，是快照进来的 SVN 内容（6.10）。 */
+  snapshot: [string, string[]][]
+  /** 重放后与磁盘对不上的文件：多半是重放干净却合错了（PR 119 遗留）。 */
+  drift: string[]
   stage: ComposeReport
   movedBranches: string[]
   behindBranches: [string, string][]
@@ -108,6 +113,8 @@ export interface FollowReportSection {
     | 'changes'
     | 'dropped'
     | 'rewritten'
+    | 'snapshot'
+    | 'drift'
     | 'moved'
     | 'behind'
   title: string
@@ -194,7 +201,19 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
     .filter(([, d]) => typeof d === 'object')
     .map(([path]) => path)
   const pinned = pinnedNote(r.pinnedRef)
+  // 旧后端没有这两个字段
+  const snapshot = r.snapshot ?? []
+  const drift = r.drift ?? []
   const candidates: FollowReportSection[] = [
+    {
+      id: 'drift',
+      title: '重放后与磁盘对不上',
+      warn: true,
+      note:
+        '这些文件在磁盘上是 SVN 的版本，分支里却成了别的内容（或者把 SVN 已删的文件带了回来），' +
+        '多半是重放时合错了。「本地改动」里会出现它们的反向修改：磁盘上的版本是对的话，暂存后 amend 进分支的最后一个 commit。',
+      groups: [{ label: '', items: drift }],
+    },
     {
       id: 'leaks',
       title: '泄漏告警',
@@ -246,6 +265,15 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
       groups: r.rewritten.map(([c, paths]) => ({ label: c.slice(0, 10), items: paths })),
     },
     {
+      id: 'snapshot',
+      title: '按基线对齐的快照内容',
+      warn: false,
+      note:
+        '这些文件在 commit 里的内容与 SVN 上某个较新的版本逐字节相同（多半是 svn update 之后整包提交进 git 的），' +
+        '重放时直接采用了新基线的版本。如果你是有意停在那个版本，请从原 commit 里取回。',
+      groups: snapshot.map(([c, paths]) => ({ label: c.slice(0, 10), items: paths })),
+    },
+    {
       id: 'moved',
       title: '移动的分支',
       warn: false,
@@ -268,8 +296,8 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
         .map((g) => ({ ...g, items: capped(g.items) })),
     }))
     .filter((s) => s.groups.length > 0)
-  const warned = !r.verified || r.leaks.length > 0 || r.stage.lost.length > 0
-  const pending = r.stage.uncertain.length > 0 || r.behindBranches.length > 0
+  const warned = !r.verified || r.leaks.length > 0 || r.stage.lost.length > 0 || drift.length > 0
+  const pending = r.stage.uncertain.length > 0 || r.behindBranches.length > 0 || snapshot.length > 0
   const count = r.changes.length + r.removed.length
   const what = count > 0 ? `跟进了 ${count} 个文件` : '分支已跟上基线'
   return {

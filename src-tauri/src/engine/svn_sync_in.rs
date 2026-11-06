@@ -558,21 +558,75 @@ pub(crate) fn from_baseline_ready(
     //   残留若是基线的字节，就悄悄撤掉了用户提交过的内容，而结局报 Done；
     // - `rebase.updateRefs=true` 会顺手移动指向被重放区间的其它分支。
     // 与 `--empty=drop` 同一个原则：不依赖默认值，也不依赖用户配置
-    match run_git(
+    let ran = if j.rebase_todo.is_empty() {
+        run_git(
+            repo,
+            &[
+                "-c",
+                "rebase.autoStash=false",
+                "-c",
+                "rebase.updateRefs=false",
+                "rebase",
+                "--empty=drop",
+                &new_base,
+            ],
+        )
+    } else {
+        rebase_with_todo(repo, &new_base, &j.rebase_todo)
+    };
+    match ran {
+        Ok(_) => finish_forward(repo, j),
+        Err(e) => conflict_or_error(repo, e),
+    }
+}
+
+/// 手动跟进的 S9：按事先算好的列表逐个 pick（事故分析 6.10，`svn_follow::snapshot_todo`）。
+///
+/// 用 `rebase -i` 换掉 todo，而不是自己 cherry-pick：继续、放弃、冲突出口都还是 `git rebase` 的
+/// 那套状态机，下游一行不用改。todo 经 `GIT_SEQUENCE_EDITOR` 写入，内容放环境变量：git 把编辑器命令
+/// 交给 sh，todo 文件路径由 git 自己作为参数传给它，我们不拼任何路径进命令行（仓库路径可能含空格、
+/// 中文，Windows 上还有代码页问题）。环境变量的优先级高于 `sequence.editor` 配置。
+///
+/// 钉住的配置：`missingCommitsCheck=ignore`，原 commit 不在 todo 里是故意的，用户配成 `error` 时
+/// rebase 会拒绝；`autoSquash=false`，免得 `fixup!` commit 在我们写 todo 之前被挪动；另外两项同上。
+fn rebase_with_todo(repo: &str, new_base: &str, todo: &[String]) -> Result<String> {
+    let mut list = String::new();
+    for oid in todo {
+        // 只放 OID：todo 里的说明文字随用户配置变，pick 只认 OID
+        if oid.len() != 40 || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(GitError::new(
+                "sync_in_rebase_failed",
+                format!("内部错误：待重放列表里不是一个完整 OID：`{oid}`。基线已经推进，记录保留，可以点「放弃」。"),
+            ));
+        }
+        list.push_str("pick ");
+        list.push_str(oid);
+        list.push('\n');
+    }
+    run_git_env(
         repo,
         &[
             "-c",
             "rebase.autoStash=false",
             "-c",
             "rebase.updateRefs=false",
+            "-c",
+            "rebase.missingCommitsCheck=ignore",
+            "-c",
+            "rebase.autoSquash=false",
             "rebase",
+            "-i",
             "--empty=drop",
-            &new_base,
+            new_base,
         ],
-    ) {
-        Ok(_) => finish_forward(repo, j),
-        Err(e) => conflict_or_error(repo, e),
-    }
+        &[
+            (
+                "GIT_SEQUENCE_EDITOR",
+                "printf '%s' \"$MYGITCLIENT_REBASE_TODO\" >",
+            ),
+            ("MYGITCLIENT_REBASE_TODO", &list),
+        ],
+    )
 }
 
 /// rebase 非零退出：真冲突就停在冲突态（正常出口），否则按命令错误处理（§7.3.2 末）。

@@ -51,6 +51,7 @@ pub mod svn_pristine;
 pub mod svn_replay;
 pub mod svn_scope;
 pub mod svn_server_set;
+pub mod svn_snapshot;
 pub mod svn_stage;
 pub mod svn_sync;
 pub mod svn_sync_check;

@@ -22,6 +22,8 @@ const report: FollowReport = {
   removed: [],
   dropped: [],
   rewritten: [],
+  snapshot: [],
+  drift: [],
   stage: { decisions: {}, uncertain: [], lost: [], discarded: [] },
   movedBranches: [],
   behindBranches: [],
@@ -199,6 +201,42 @@ describe('describeFollowReport', () => {
     expect(rewritten.items).toEqual(['Code/A.cs', 'Code/B.cs'])
     // 这两节只是告知
     expect(describeFollowReport(r).tone).toBe('ok')
+  })
+
+  it('6.10：快照进来的 SVN 内容单独成节，要用户看一眼', () => {
+    const r: FollowReport = { ...report, snapshot: [['f'.repeat(40), ['Code/B.cs']]] }
+    const s = section(r, 'snapshot')!
+    expect(s.warn).toBe(false)
+    expect(s.groups[0].label).toContain('f'.repeat(10))
+    expect(s.groups[0].items).toEqual(['Code/B.cs'])
+    expect(s.note).toContain('逐字节相同')
+    expect(s.note).toContain('有意')
+    // 可能把用户故意停住的旧版本换掉了：不能只是「完成」
+    expect(describeFollowReport(r).tone).toBe('attention')
+  })
+
+  it('PR 119 遗留：重放后与磁盘对不上的文件是警告，排在文件清单前面', () => {
+    const r: FollowReport = {
+      ...report,
+      drift: ['Code/A.cs'],
+      changes: [{ path: 'Code/B.cs', rev: 4, author: 'x' }],
+    }
+    const m = describeFollowReport(r)
+    const s = section(r, 'drift')!
+    expect(s.warn).toBe(true)
+    expect(s.groups[0].items).toEqual(['Code/A.cs'])
+    expect(s.note).toContain('磁盘')
+    expect(m.tone).toBe('attention')
+    expect(m.sections.findIndex((x) => x.id === 'drift')).toBeLessThan(
+      m.sections.findIndex((x) => x.id === 'changes'),
+    )
+  })
+
+  it('旧后端没有这两个字段时照常描述', () => {
+    const old = { ...report } as Partial<FollowReport>
+    delete old.snapshot
+    delete old.drift
+    expect(() => describeFollowReport(old as FollowReport)).not.toThrow()
   })
 
   it('移动的分支只是告知，落后的分支要说原因', () => {

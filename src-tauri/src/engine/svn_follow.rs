@@ -74,9 +74,10 @@ use crate::engine::svn_lock;
 use crate::engine::svn_nodes::{compute_map, read_node_status, NodeStatus};
 use crate::engine::svn_preflight::run_preflight_with;
 use crate::engine::svn_replay::{
-    all_committed, commits_between, replay_onto, ReplayCodes, ReplayCommit, ReplayOpts,
-    ReplayOutcome,
+    all_committed, commit_without, commits_between, replay_onto, ReplayCodes, ReplayCommit,
+    ReplayOpts, ReplayOutcome,
 };
+use crate::engine::svn_snapshot::SnapshotRule;
 use crate::engine::svn_sync::{
     check_sync_with_nodes, read_baseline_map, tree_files, ExternalChange, SyncVerdict,
 };
@@ -168,8 +169,16 @@ pub struct FollowReport {
     pub removed: Vec<String>,
     /// 变空丢弃的原 commit（「已全部提交」捷径收掉的也在内）。
     pub dropped: Vec<String>,
-    /// (原 commit, 换成 SVN 版本的路径)。
+    /// (原 commit, 换成 SVN 版本的路径)：F2 ①，我自己提交到 SVN 的。
     pub rewritten: Vec<(String, Vec<String>)>,
+    /// (原 commit, 换成 SVN 版本的路径)：内容与比分支基线更新的某个基线逐字节相同，是快照进来的
+    /// SVN 内容（事故分析 6.10，[`SnapshotRule`]）。与 `rewritten` 不重复。
+    #[serde(default)]
+    pub snapshot: Vec<(String, Vec<String>)>,
+    /// 重放后与磁盘对不上的文件：磁盘是 SVN 的版本（= 新基线），分支 tip 却是别的内容，或者把 SVN
+    /// 已删的文件带了回来。多半是重放干净却合错了（W14；PR 119 遗留）。只告警，不拦。
+    #[serde(default)]
+    pub drift: Vec<String>,
     pub stage: ComposeReport,
     /// 移动过的其他分支。当前分支不在内。
     pub moved_branches: Vec<String>,
@@ -355,6 +364,7 @@ pub fn manual_follow(repo: &str, opid: &str) -> Result<SyncInOutcome> {
     require_changes_in_whitelist(repo, &cfg.whitelist)?;
 
     let floor = read_base_map(repo, &scope)?.floor;
+    let rebase_todo = snapshot_todo(repo, &scope, &head, &base)?;
     let mut j = Journal {
         opid: opid.to_string(),
         flow: Flow::FollowManual,
@@ -365,6 +375,7 @@ pub fn manual_follow(repo: &str, opid: &str) -> Result<SyncInOutcome> {
         baseline_rev_before: Some(floor),
         baseline_oid_before: Some(scope),
         new_baseline_oid: Some(base),
+        rebase_todo,
         ..Default::default()
     };
     svn_journal::write(repo, &j)?;
@@ -372,6 +383,25 @@ pub fn manual_follow(repo: &str, opid: &str) -> Result<SyncInOutcome> {
     fault::reach(fault::Point::ManualStashed, None);
     // S8 在这里不切分支（HEAD 一直在原分支上），只做复核；S9 重放到 `newBaselineOid`
     from_baseline_ready(repo, &cfg, &mut j)
+}
+
+/// 手动跟进的 rebase 要逐个 pick 的 commit（事故分析 6.10，方案 §3）。
+///
+/// rebase 原样 pick 分支上的 commit，快照进来的 SVN 内容会和新基线撞上：对象层重放已经把它们换成了
+/// SVN 版本，手动跟进不跟着换的话，11-05 那 35 个冲突在磁盘上又回来了。这里为命中的 commit 造 C'
+/// （[`commit_without`]），其余照用原 commit。一个都没命中时返回空，S9 照原样 `rebase <新基线>`。
+fn snapshot_todo(repo: &str, scope: &str, head: &str, new: &str) -> Result<Vec<String>> {
+    let commits = commits_between(repo, scope, head, &FOLLOW_CODES)?;
+    let rule = SnapshotRule::new(repo, new);
+    let mut any = false;
+    let mut todo = Vec::with_capacity(commits.len());
+    for c in &commits {
+        let hits = rule.paths(scope, c);
+        let oid = commit_without(repo, c, &hits, &FOLLOW_CODES)?;
+        any |= oid != c.oid;
+        todo.push(oid);
+    }
+    Ok(if any { todo } else { Vec::new() })
 }
 
 /// S1 的 stash 只收白名单，rebase 却要求整个工作区干净，白名单外的已跟踪改动放过去就是 stash 完才
@@ -892,6 +922,13 @@ fn prepare(repo: &str) -> Result<Plan> {
             BTreeSet::new()
         }
     };
+    // 6.10：快照进来的 SVN 内容按基线走。规则按分支自己的基线算，其他分支在 `plan_other` 里另拼
+    let snapshot = SnapshotRule::new(repo, &new_base);
+    let current = |c: &ReplayCommit| -> BTreeSet<String> {
+        let mut p = superseded(c);
+        p.extend(snapshot.paths(&scope, c));
+        p
+    };
 
     let map_floor = read_base_map(repo, &new_base)?.floor;
     let mut report = FollowReport {
@@ -912,13 +949,7 @@ fn prepare(repo: &str) -> Result<Plan> {
     let mut memo = BTreeMap::new();
     let commits = commits_between(repo, &scope, &old_head, &FOLLOW_CODES)?;
     let replayed = replay_branch(
-        repo,
-        &scope,
-        &old_head,
-        &new_base,
-        &commits,
-        &superseded,
-        &mut memo,
+        repo, &scope, &old_head, &new_base, &commits, &current, &mut memo,
     )?;
     let stale = match &replayed {
         Replayed::Moved { tip, .. } => stale_disk_paths(repo, &scope, &old_base, &old_head, tip)?,
@@ -957,7 +988,10 @@ fn prepare(repo: &str) -> Result<Plan> {
             rewritten,
         } => {
             report.dropped = dropped;
-            report.rewritten = rewritten;
+            let (snap, own) = split_snapshot(rewritten, &commits, &superseded, &snapshot, &scope);
+            report.rewritten = own;
+            report.snapshot = snap;
+            report.drift = drift_paths(repo, &new_base, &tip, &paths)?;
             // F3：按原始 commit 算，不受 F2 ① 换路径影响。手动跟进不拦，只告警（§6.12 条件 8 管自动）
             report.leaks = local_only_leaks(repo, &branch, &commits, &paths, &new_base)?;
             let others = plan_others(
@@ -968,6 +1002,7 @@ fn prepare(repo: &str) -> Result<Plan> {
                     new_base: &new_base,
                     paths: &paths,
                     superseded: &superseded,
+                    snapshot: &snapshot,
                 },
                 &mut memo,
                 &mut report,
@@ -1101,6 +1136,100 @@ fn stale_disk_paths(
     }
     stale.sort();
     Ok(stale)
+}
+
+/// (原 commit, 路径) 的列表，报告里 `rewritten` / `snapshot` 的形状。
+type PathsByCommit = Vec<(String, Vec<String>)>;
+
+/// 把重放换过的路径按来源分开：(6.10 快照内容, F2 ① 我自己提交到 SVN 的)。两条规则都命中的
+/// 算 F2 ①：那是我自己的提交，「你已经提交到了 SVN」比「多半是快照」更准。
+fn split_snapshot(
+    rewritten: PathsByCommit,
+    commits: &[ReplayCommit],
+    f2: &dyn Fn(&ReplayCommit) -> BTreeSet<String>,
+    rule: &SnapshotRule,
+    scope: &str,
+) -> (PathsByCommit, PathsByCommit) {
+    let mut snap = Vec::new();
+    let mut own = Vec::new();
+    for (oid, paths) in rewritten {
+        let (hits, mine) = match commits.iter().find(|c| c.oid == oid) {
+            Some(c) => (rule.paths(scope, c), f2(c)),
+            None => (BTreeSet::new(), BTreeSet::new()),
+        };
+        let (s, o): (Vec<String>, Vec<String>) = paths
+            .into_iter()
+            .partition(|p| hits.contains(p) && !mine.contains(p));
+        if !s.is_empty() {
+            snap.push((oid.clone(), s));
+        }
+        if !o.is_empty() {
+            own.push((oid, o));
+        }
+    }
+    (snap, own)
+}
+
+/// 对象层跟进重放后，分支 tip 与磁盘对不上的文件（方案 §4；PR 119 遗留）。
+///
+/// 只看本次外部变更改过的路径（`external`，`scope..NEW`）里 tip 与 NEW 不同的。磁盘等于 NEW 的
+/// 版本，说明 SVN 对这个文件没有本地修改（磁盘 = BASE = NEW），我的 commit 里对它的改动要么已经在
+/// SVN 上、要么不在磁盘上了，正确的 tip 应当等于 NEW；tip 却是别的内容，就是合错了。tip 有、NEW 与
+/// 磁盘都没有的，是被带回来的 SVN 已删文件。磁盘是别的内容（我还没交给 SVN 的改动）时判断不了，
+/// 不报。符号链接、子模块不判。磁盘内容按 `git add` 的过滤规则算（同 [`stale_disk_paths`]）。
+fn drift_paths(
+    repo: &str,
+    new: &str,
+    tip: &str,
+    external: &BTreeSet<String>,
+) -> Result<Vec<String>> {
+    if new == tip || external.is_empty() {
+        return Ok(Vec::new());
+    }
+    // raw 格式：`:<旧 mode> <新 mode> <旧 oid> <新 oid> <状态>` NUL `<路径>` NUL；旧 = NEW，新 = tip
+    let raw = run_git(repo, &["diff-tree", "-r", "-z", "--no-renames", new, tip])?;
+    let mut drift = Vec::new();
+    let mut to_hash: Vec<(String, String)> = Vec::new();
+    let mut fields = raw.split('\0').filter(|f| !f.is_empty());
+    while let (Some(meta), Some(path)) = (fields.next(), fields.next()) {
+        if !external.contains(path) {
+            continue;
+        }
+        let meta: Vec<&str> = meta.trim_start_matches(':').split(' ').collect();
+        let (Some(mode), Some(new_oid), Some(status)) = (meta.first(), meta.get(2), meta.get(4))
+        else {
+            continue;
+        };
+        let on_disk = Path::new(repo).join(path).symlink_metadata();
+        if status.starts_with('A') {
+            // NEW 里没有、tip 里有：磁盘上也没有就是被带回来的
+            if on_disk.is_err() {
+                drift.push(path.to_string());
+            }
+        } else if (*mode == "100644" || *mode == "100755")
+            && on_disk.map(|m| m.is_file()).unwrap_or(false)
+        {
+            to_hash.push((path.to_string(), new_oid.to_string()));
+        }
+    }
+    if !to_hash.is_empty() {
+        let input: String = to_hash.iter().map(|(p, _)| format!("{p}\n")).collect();
+        let out = run_git_stdin(repo, &["hash-object", "--stdin-paths"], input.as_bytes())?;
+        let disk: Vec<&str> = out.lines().map(str::trim).collect();
+        if disk.len() != to_hash.len() {
+            return Err(GitError::new(
+                "svn_follow_hash_failed",
+                "核对磁盘内容时 git hash-object 的输出行数对不上。这次什么都没动，请再点一次「跟进」。",
+            ));
+        }
+        for ((p, new_oid), d) in to_hash.iter().zip(disk) {
+            if d == new_oid {
+                drift.push(p.clone());
+            }
+        }
+    }
+    drift.sort();
+    Ok(drift)
 }
 
 enum Replayed {
@@ -1258,7 +1387,9 @@ struct OthersCtx<'a> {
     prev_base: Option<&'a str>,
     new_base: &'a str,
     paths: &'a BTreeSet<String>,
+    /// F2 ①。6.10 的快照规则按各分支自己的基线算，见 `snapshot`。
     superseded: &'a dyn Fn(&ReplayCommit) -> BTreeSet<String>,
+    snapshot: &'a SnapshotRule<'a>,
 }
 
 /// 其他分支（分析 §6.11.3）。范围是包含旧基线的本地分支；跳过当前分支、任何 worktree 里是
@@ -1318,15 +1449,12 @@ fn plan_other(
             "分支上的 Local-Only 补丁可能被一起提交到了 SVN，不自动移动".to_string(),
         ));
     }
-    let replayed = replay_branch(
-        repo,
-        &own,
-        &b.oid,
-        ctx.new_base,
-        &commits,
-        ctx.superseded,
-        memo,
-    );
+    let sup = |c: &ReplayCommit| -> BTreeSet<String> {
+        let mut p = (ctx.superseded)(c);
+        p.extend(ctx.snapshot.paths(&own, c));
+        p
+    };
+    let replayed = replay_branch(repo, &own, &b.oid, ctx.new_base, &commits, &sup, memo);
     match replayed {
         Ok(Replayed::Moved {
             tip,
@@ -1338,9 +1466,16 @@ fn plan_other(
                     report.dropped.push(d);
                 }
             }
-            for r in rewritten {
+            let (snap, own_rewritten) =
+                split_snapshot(rewritten, &commits, ctx.superseded, ctx.snapshot, &own);
+            for r in own_rewritten {
                 if !report.rewritten.contains(&r) {
                     report.rewritten.push(r);
+                }
+            }
+            for r in snap {
+                if !report.snapshot.contains(&r) {
+                    report.snapshot.push(r);
                 }
             }
             Ok(Ok(tip))

@@ -216,6 +216,12 @@ pub struct Journal {
     pub capture_tree: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_baseline_oid: Option<String>,
+    /// 手动跟进的 S9 要逐个 pick 的 commit（事故分析 6.10）。空 = 照原样 `rebase <新基线>`。
+    ///
+    /// 非空时是分支上每个 commit 对应的 C'：快照进来的 SVN 内容已换回父提交的版本。在写 journal
+    /// 之前算好、一起落盘：崩在 rebase 开始之前时，继续要用同一份列表。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rebase_todo: Vec<String>,
 
     // —— 以下只有 sync_out 用（§7.6 末尾三段）——
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
