@@ -213,11 +213,30 @@ fn only_the_real_conflict_is_left_and_manual_follow_sees_only_it() {
 
     match run(&fx) {
         FollowOutcome::NeedsManual {
-            files, snapshot, ..
+            files,
+            snapshot,
+            details,
+            ..
         } => {
             assert_eq!(files, vec![A.to_string()]);
             // review 第 2 条：动手之前告诉用户，手动跟进会直接采用基线的是哪些
             assert_eq!(snapshot, vec![(snap, vec![B.to_string()])]);
+            // 事故分析 6.5：冲突框直接给出 SVN 上是谁、哪个 revision 改的，以及冲突那几行
+            assert_eq!(details.len(), 1);
+            let d = &details[0];
+            assert_eq!(d.path, A);
+            assert_eq!(d.svn_author.as_deref(), Some("colleague"));
+            assert!(d.svn_rev.is_some_and(|r| r > 1), "{d:?}");
+            assert!(!d.svn_removed);
+            let preview = d.preview.as_deref().expect("文本冲突要有预览");
+            assert!(preview.starts_with("<<<<<<< 新基线（SVN）"), "{preview}");
+            assert!(preview.contains("a-colleague"), "{preview}");
+            assert!(preview.contains("a-mine"), "{preview}");
+            assert!(preview.ends_with(">>>>>>> 你的提交"), "{preview}");
+            assert!(
+                !preview.contains(&oid(&fx, "svn/base")),
+                "OID 标签要换成人话：{preview}"
+            );
         }
         other => panic!("应当交给手动跟进：{other:?}"),
     }

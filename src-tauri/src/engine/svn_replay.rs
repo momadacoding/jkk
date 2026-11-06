@@ -68,7 +68,13 @@ pub enum ReplayOutcome {
         rewritten: Vec<(String, Vec<String>)>,
     },
     /// 在原 commit `at` 处冲突。什么都没有发布——重放只建了对象。
-    Conflict { at: String, files: Vec<String> },
+    Conflict {
+        at: String,
+        files: Vec<String>,
+        /// merge-tree 写出的冲突树：冲突文件里带着冲突标记。只是对象，没有 ref 指着；
+        /// 给冲突框取预览用（事故分析 6.5）。
+        tree: String,
+    },
 }
 
 /// 交付用：不换任何路径。
@@ -190,10 +196,11 @@ pub fn replay_onto(
         };
         let tree = match merge(repo, &cur, parent, &theirs, c, codes)? {
             Merged::Clean(t) => t,
-            Merged::Conflict(files) => {
+            Merged::Conflict { files, tree } => {
                 return Ok(ReplayOutcome::Conflict {
                     at: c.oid.clone(),
                     files,
+                    tree,
                 })
             }
         };
@@ -438,7 +445,7 @@ fn c_prime_tree(
 
 enum Merged {
     Clean(String),
-    Conflict(Vec<String>),
+    Conflict { files: Vec<String>, tree: String },
 }
 
 fn merge(
@@ -460,7 +467,11 @@ fn merge(
         0 => Ok(Merged::Clean(
             out.split('\0').next().unwrap_or("").trim().to_string(),
         )),
-        1 => Ok(Merged::Conflict(conflict_files(&out))),
+        // 冲突时第一个字段同样是树：冲突文件以带冲突标记的内容写在里面
+        1 => Ok(Merged::Conflict {
+            files: conflict_files(&out),
+            tree: out.split('\0').next().unwrap_or("").trim().to_string(),
+        }),
         // 129 = 用法错误：多半是 git 太旧，不认识 --merge-base
         129 => Err(GitError::new(codes.too_old, codes.too_old_message)),
         _ => Err(GitError::new(
