@@ -404,6 +404,76 @@ describe('手动跟进', () => {
     expect(describeManualFollowOutcome({ kind: 'done', newRev: 3 })).toBeNull()
   })
 
+  describe('收尾核对有发现（事故分析 6.9）', () => {
+    const drift = (o: Partial<Extract<SyncInOutcome, { kind: 'followDrift' }>>) =>
+      describeManualFollowOutcome({
+        kind: 'followDrift',
+        newRev: 3,
+        changed: [],
+        resurrected: [],
+        before: stash,
+        stashOid: stash,
+        stageLost: null,
+        auditError: null,
+        ...o,
+      })!
+
+    it('不能报成功：要打扰，点名被合错的文件，给出取回跟进前版本的完整命令', () => {
+      const n = drift({ changed: ['Code/Dbs.cpp'] })
+      expect(n.tone).toBe('attention')
+      expect(n.title).toContain('和跟进前不一样')
+      expect(n.detail).toContain('Code/Dbs.cpp')
+      expect(n.detail).toContain(`git show "${stash}:<文件>"`)
+      expect(n.detail).toContain('有意改的，可以忽略')
+    })
+
+    it('取回命令只写磁盘、不动暂存区，并说清跟进前未跟踪的文件怎么取（独立 review）', () => {
+      const n = drift({ changed: ['Code/Dbs.cpp'] })
+      expect(n.detail).toContain(`git restore --source="${stash}" --worktree -- <文件>`)
+      expect(n.detail).not.toContain('git checkout')
+      // cmd.exe 里 `^` 是转义符：必须在引号里
+      expect(n.detail).toContain(`--source="${stash}^3"`)
+      expect(n.detail).toContain('没有旧版本可取')
+    })
+
+    it('核对没跑成时照实说，不能装作核对过了', () => {
+      const n = drift({ auditError: 'hash-object 读不了 Code/Locked.cs' })
+      expect(n.tone).toBe('attention')
+      expect(n.title).toContain('核对没跑成')
+      expect(n.detail).toContain('没法确认')
+      expect(n.detail).toContain('hash-object 读不了 Code/Locked.cs')
+      expect(n.detail).toContain(`mygitclient-sync:…，${stash}`)
+    })
+
+    it('备份留着要说清：它可能是正确内容唯一的副本', () => {
+      const n = drift({ changed: ['Code/Dbs.cpp'] })
+      expect(n.detail).toContain(`mygitclient-sync:…，${stash}`)
+      expect(n.detail).toContain('唯一的副本')
+    })
+
+    it('没有未提交的改动时不提备份，取回命令指向原分支 HEAD，也不提 ^3', () => {
+      const head = 'h'.repeat(40)
+      const n = drift({ changed: ['Code/Dbs.cpp'], before: head, stashOid: null })
+      expect(n.detail).not.toContain('mygitclient-sync')
+      expect(n.detail).toContain(`git restore --source="${head}" --worktree -- <文件>`)
+      expect(n.detail).not.toContain('^3')
+    })
+
+    it('被带回的 SVN 已删文件单独成段；磁盘上还在的只从 git 里删，不动 SVN 工作副本里那份', () => {
+      const n = drift({ resurrected: ['Tools/sim_lowmem.lua'] })
+      expect(n.detail).toContain('Tools/sim_lowmem.lua')
+      expect(n.detail).toContain('显示为删除')
+      expect(n.detail).toContain('git rm --cached -- <文件>')
+      expect(n.detail).not.toContain('git restore')
+    })
+
+    it('暂存也没保住时一并说出来', () => {
+      const n = drift({ changed: ['Code/Dbs.cpp'], stageLost: ['Code/B.cs'] })
+      expect(n.detail).toContain('「已暂存」的状态没保住')
+      expect(n.detail).toContain('Code/B.cs')
+    })
+  })
+
   it('暂存没保住要说出来，并分清是完成还是放弃', () => {
     const forward = describeManualFollowOutcome({
       kind: 'stageLost',

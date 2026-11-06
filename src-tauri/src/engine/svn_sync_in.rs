@@ -26,6 +26,7 @@ use crate::engine::svn_basemap::BaseMap;
 use crate::engine::svn_cli::{run_svn, run_svn_code};
 use crate::engine::svn_config::{read_config, SvnConfig, BASELINE_BRANCH};
 use crate::engine::svn_dirty::read_dirty;
+use crate::engine::svn_follow_audit;
 use crate::engine::svn_follow_mark::clear_mark;
 use crate::engine::svn_include_check::normalize_roots;
 use crate::engine::svn_init::{rebuild_baseline, record_mixed, record_server_tree_into};
@@ -119,6 +120,29 @@ pub enum SyncInOutcome {
         /// 暂存版本与磁盘不同的路径（[`wip::staged_only_paths`]）。手动跟进时可以为空：
         /// 暂存的内容磁盘上都有，丢的只是标记。
         files: Vec<String>,
+    },
+    /// 手动跟进收尾了，但收尾核对（[`svn_follow_audit`]，事故分析 6.9）发现重放结果与跟进前
+    /// 不一致，或者核对没跑成。**不能报成 `Done`**：2026-11-05 磁盘上的文件被静默合错，界面却报「完成」，
+    /// 正确内容唯一的副本（stash 备份）也随之被删。
+    ///
+    /// 分支已经在新基线上，什么都不回滚；备份不删（拆掉钉子，同 `Settled`），交给用户核对。
+    FollowDrift {
+        new_rev: u64,
+        /// 跟进前后磁盘内容不同的文件。
+        changed: Vec<String>,
+        /// 重放后的分支里有、新基线和磁盘上都没有的文件。
+        resurrected: Vec<String>,
+        /// 代表「跟进前的磁盘」的提交：有未提交改动时是 stash，否则是原分支 HEAD。
+        /// 给用户取回原内容用（`git restore --source=<before> --worktree -- <文件>`，不动暂存区）。
+        before: String,
+        /// 留在 stash 列表里的备份。`None`：这次没有未提交的改动。
+        stash_oid: Option<String>,
+        /// 暂存状态也没保住时，暂存版本与磁盘不同的路径（同 `StageLost.files`，可以为空）。
+        /// `None`：暂存保住了。
+        stage_lost: Option<Vec<String>>,
+        /// 核对没跑成时的原因（这时 `changed` / `resurrected` 为空、备份照样留着）。流程不因此
+        /// 停住：没有备份要保护时停住就再也走不完（独立 review）。
+        audit_error: Option<String>,
     },
 }
 
@@ -569,11 +593,42 @@ pub(crate) fn conflict_or_error(repo: &str, e: GitError) -> Result<SyncInOutcome
 
 /// S10–S11，结局记为 `Done`。
 pub(crate) fn finish_forward(repo: &str, j: &mut Journal) -> Result<SyncInOutcome> {
-    if j.flow == Flow::FollowManual {
+    let manual = j.flow == Flow::FollowManual;
+    if manual {
         // 分支已经落到基线上，快照里的 HEAD 与暂存都过时了（跟进的 F6 同样清它）
         clear_mark(repo);
     }
-    Ok(match restore_step(repo, j)? {
+    // 收尾核对只给手动跟进：更新（sync_in）自己跑了 svn update，磁盘本来就该变
+    let mut audit = manual.then(Audit::default);
+    // 在动手之前读：收尾之后再读失败的话，核对的发现就跟着错误一起丢了（独立 review）
+    let new_rev = if manual {
+        Some(baseline_rev(repo)?)
+    } else {
+        None
+    };
+    let step = restore_step_with(repo, j, audit.as_mut())?;
+    if let (Some(a), Some(new_rev)) = (audit.filter(Audit::worth_reporting), new_rev) {
+        let kept = match &step {
+            RestoreStep::Finished => Some((None, None)),
+            RestoreStep::Kept { oid } => Some((Some(oid.clone()), None)),
+            RestoreStep::StageKept { oid, files } => Some((Some(oid.clone()), Some(files.clone()))),
+            // 冲突 / 撞名时改动还没放回，核对不会跑；万一有，照原来的结局走
+            RestoreStep::Conflict { .. } | RestoreStep::Blocked { .. } => None,
+        };
+        if let Some((stash_oid, stage_lost)) = kept {
+            let drift = a.drift.unwrap_or_default();
+            return Ok(SyncInOutcome::FollowDrift {
+                new_rev,
+                changed: drift.changed,
+                resurrected: drift.resurrected,
+                before: a.before.unwrap_or_default(),
+                stash_oid,
+                stage_lost,
+                audit_error: a.error,
+            });
+        }
+    }
+    Ok(match step {
         RestoreStep::Finished if j.stage_lost => SyncInOutcome::StageLost {
             new_rev: Some(baseline_rev(repo)?),
             stash_oid: None,
@@ -623,10 +678,81 @@ pub(crate) enum RestoreStep {
     },
 }
 
+/// 手动跟进收尾核对的输入与结果（[`restore_step_with`]）。
+#[derive(Default)]
+pub(crate) struct Audit {
+    /// 核对跑完了才有。`Some(空)` 是「核对过，干净」。
+    drift: Option<svn_follow_audit::Drift>,
+    /// 拿来比的「跟进前的磁盘」：stash 或原分支 HEAD。
+    before: Option<String>,
+    /// 核对没跑成（git 出错）时的原因。这时流程照常收尾、备份留着，但要告诉用户没核对。
+    error: Option<String>,
+}
+
+impl Audit {
+    /// 要不要报 `FollowDrift`：有发现，或者核对没跑成。
+    fn worth_reporting(&self) -> bool {
+        self.error.is_some() || self.drift.as_ref().is_some_and(|d| !d.is_empty())
+    }
+}
+
 /// S10 + S11：取回 WIP、drop、删 journal。往前走与往回走（放弃）共用。
 pub(crate) fn restore_step(repo: &str, j: &mut Journal) -> Result<RestoreStep> {
+    restore_step_with(repo, j, None)
+}
+
+/// 跟进前的磁盘与此刻的磁盘比一遍，结果写进 `audit`。返回「是否要留下备份」。
+///
+/// **不返回错误**：核对是收尾之后的附加检查，它出错（某个文件读不了、过滤器缺失）不能让流程停住
+/// ——没有 stash 时 journal 还停在 rebase，「继续」会再核对一次、再出同一个错，永远走不完（独立
+/// review）。出错就记下原因、留下备份，交给用户。
+fn run_audit(
+    j: &Journal,
+    repo: &str,
+    before: &str,
+    untracked: Option<&str>,
+    audit: &mut Audit,
+) -> bool {
+    audit.before = Some(before.to_string());
+    let result = (|| {
+        let new_base = need(&j.new_baseline_oid, "newBaselineOid")?;
+        let orig_head = need(&j.orig_head, "origHead")?;
+        let old_base = need(&j.baseline_oid_before, "baselineOidBefore")?;
+        svn_follow_audit::audit(repo, before, untracked, &orig_head, &old_base, &new_base)
+    })();
+    match result {
+        Ok(drift) => {
+            let keep = !drift.is_empty();
+            audit.drift = Some(drift);
+            keep
+        }
+        Err(e) => {
+            log::warn!("手动跟进的收尾核对没跑成：{} {}", e.code, e.message);
+            audit.error = Some(e.message);
+            true
+        }
+    }
+}
+
+/// [`restore_step`] 加上收尾核对：`audit` 为 `Some` 时，改动干净放回之后、drop 之前核对磁盘，
+/// 有发现（或核对没跑成）就**不 drop**，按 `Kept` 收尾。
+pub(crate) fn restore_step_with(
+    repo: &str,
+    j: &mut Journal,
+    mut audit: Option<&mut Audit>,
+) -> Result<RestoreStep> {
     let Some(oid) = j.stash_oid.clone() else {
-        svn_journal::remove(repo)?; // 没有 WIP（计划 A7）
+        // 没有 WIP（计划 A7）：跟进前的磁盘就是原分支 HEAD，白名单里也没有未跟踪文件。
+        // 先收尾再核对：这里没有备份要保护，核对怎样都不该让流程停在半路
+        svn_journal::remove(repo)?;
+        if let Some(a) = audit.as_deref_mut() {
+            match need(&j.orig_head, "origHead") {
+                Ok(orig_head) => {
+                    run_audit(j, repo, &orig_head, None, a);
+                }
+                Err(e) => a.error = Some(e.message),
+            }
+        }
         return Ok(RestoreStep::Finished);
     };
     if !j.stash_applied {
@@ -663,6 +789,17 @@ pub(crate) fn restore_step(repo: &str, j: &mut Journal) -> Result<RestoreStep> {
         // apply 成功之后、drop 之前落盘：崩在这里重开时只 drop，不再 apply（计划 A2）
         j.stash_applied = true;
         svn_journal::write(repo, j)?;
+        let keep = match audit {
+            Some(a) => match svn_follow_audit::stash_untracked(repo, &oid) {
+                Ok(untracked) => run_audit(j, repo, &oid, untracked.as_deref(), a),
+                Err(e) => {
+                    a.before = Some(oid.clone());
+                    a.error = Some(e.message);
+                    true
+                }
+            },
+            None => false,
+        };
         if j.stage_lost {
             // 不 drop、不拆钉子：拆了之后用户在 stash 列表里删掉那条，暂存的那份就没有任何引用了。
             // 手动跟进退回普通 apply 时即使 `staged_only` 为空也留着：内容磁盘上都有，但用户拿暂存区
@@ -673,6 +810,13 @@ pub(crate) fn restore_step(repo: &str, j: &mut Journal) -> Result<RestoreStep> {
                 oid,
                 files: staged_only,
             });
+        }
+        if keep {
+            // 核对有发现：stash 里那份可能是正确内容唯一的副本（11-05 就是），不 drop。
+            // 只拆钉子、留在 stash 列表里，与 `Kept` 同一个处理（PR #49 review 第四轮 P1-2）
+            wip::unpin(repo, &j.opid)?;
+            svn_journal::remove(repo)?;
+            return Ok(RestoreStep::Kept { oid });
         }
     } else {
         let files = unmerged_paths(repo)?;

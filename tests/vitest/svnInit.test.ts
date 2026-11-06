@@ -422,6 +422,15 @@ describe('错误码到引导语的映射', () => {
     expect(h).toContain('重新点')
   })
 
+  it('分类对不上时说出替换这个常见原因，不叫人重试（事故分析 6.3）', () => {
+    // 原文案「多半是录制过程中被外部改动了，请重试一次」：工作副本不变时重试永远停在同一处，
+    // 2026-11-05 用户就照着反复重试过
+    const h = wizardErrorHint('svn_baseline_classification_conflict')
+    expect(h).toContain('替换')
+    expect(h).toContain('还原')
+    expect(h).not.toContain('请重试一次')
+  })
+
   it('体检不通过时先撇清「不是你的本地修改」', () => {
     // §6.8.7 之后本地修改已经被 S 排除在外。不说这一句的话，一个手上有改动的
     // 用户会立刻把两件事联系起来，然后去做一件完全没用的事（清理工作区）。

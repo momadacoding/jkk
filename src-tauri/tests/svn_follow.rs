@@ -2696,6 +2696,121 @@ fn manual_follow_abort_returns_to_original_branch() {
     assert!(matches!(run(&fx), FollowOutcome::NeedsManual { .. }));
 }
 
+// —— 手动跟进的收尾核对（事故分析 6.9）——
+
+/// 「svn update 之后把整个工作区提交进 git」的快照提交：先让同事改，再 update，再 commit。
+fn snapshot_commit(fx: &SvnFixture, rel: &str, content: &str) -> String {
+    colleague(fx, rel, content);
+    svn_update(fx, "Code");
+    commit_all(fx, "svn up 之后整包提交")
+}
+
+/// 同事提交，并把作者改成别人：`file://` 下作者都是系统用户，不改的话跟进会把它当成「我自己
+/// 提交的」，按 F2 ① 直接取 SVN 版本，走不到手动跟进。要在 update 之前改（见 `committer`）。
+fn colleague(fx: &SvnFixture, rel: &str, content: &str) {
+    fx.colleague_commits(rel, content);
+    set_author(fx, youngest(fx), "colleague");
+}
+
+fn drift(o: SyncInOutcome) -> (Vec<String>, Vec<String>, String, Option<String>) {
+    match o {
+        SyncInOutcome::FollowDrift {
+            changed,
+            resurrected,
+            before,
+            stash_oid,
+            ..
+        } => (changed, resurrected, before, stash_oid),
+        other => panic!("应当报 FollowDrift：{other:?}"),
+    }
+}
+
+#[test]
+fn manual_follow_reports_a_merge_that_silently_changed_the_disk_and_keeps_the_backup() {
+    // 2026-11-05 的 MetaLeagueDbsApp.cpp：快照提交里有某段代码的早期版本，SVN 之后把它挪了
+    // 位置。重放时 git 没报冲突，合出了两份同名函数并写到磁盘，界面照样报「完成」，
+    // 而 stash 里那份备份（= 跟进前的正确内容）被删掉了。
+    //
+    // 真实现场是 diff3 在相似代码块上对齐错了，fixture 里复现不了那种对齐，这里用一个
+    // 「把两边拼起来、退出 0」的 merge driver 代替：效果同样是**没有冲突、结果是错的**。
+    // 它在对象层跟进报完冲突之后才装上，只让手动跟进的 rebase 与放回改动中招。
+    let fx = hybrid_with_colleague();
+    snapshot_commit(&fx, A, "a-snapshot\n");
+    colleague(&fx, A, "a2\n");
+    // 同一段时间里同事还加了一个新文件：跟进前它是未跟踪文件，跟进后变成已跟踪，内容没变，
+    // 不能被报成「磁盘变了」
+    colleague(&fx, "Code/X.cs", "x\n");
+    svn_update(&fx, "Code");
+    assert_eq!(read(&fx, A), "a2\n", "前提：跟进前磁盘上是 SVN 的最新内容");
+    let o = run(&fx);
+    assert!(matches!(o, FollowOutcome::NeedsManual { .. }), "{o:?}");
+    // 追加，不覆盖：初始化在这个文件里钉了换行规则，冲掉的话测试就跑在与生产不同的规则下
+    let attrs = fx.wc().join(".git/info/attributes");
+    let mut rules = std::fs::read_to_string(&attrs).unwrap_or_default();
+    rules.push_str("\nCode/A.cs merge=concat\n");
+    std::fs::write(&attrs, rules).unwrap();
+    git(&fx, &["config", "merge.concat.driver", "cat %B >> %A"]);
+
+    let (changed, resurrected, before, stash_oid) = drift(manual(&fx));
+
+    assert_eq!(changed, vec![A.to_string()], "只报被合错的那一个");
+    assert!(resurrected.is_empty(), "{resurrected:?}");
+    let stash_oid = stash_oid.expect("有未提交改动，备份必须留着");
+    assert_eq!(before, stash_oid, "跟进前的磁盘就是那份 stash");
+    assert_eq!(
+        show(&fx, &format!("{stash_oid}:{A}")),
+        "a2",
+        "备份里是跟进前的正确内容"
+    );
+    assert!(
+        stash_list(&fx).contains("mygitclient-sync"),
+        "备份要留在 stash 列表里：{}",
+        stash_list(&fx)
+    );
+    assert!(
+        svn_journal::read(&fx.wc_str()).unwrap().is_none(),
+        "流程已收尾"
+    );
+}
+
+#[test]
+fn manual_follow_reports_a_file_svn_deleted_that_the_snapshot_brought_back() {
+    // 2026-11-05 的 sim_lowmem.lua：SVN 把它改了名，快照提交里还是旧名字，重放后被加回分支。
+    // 磁盘上没有它（这是对的），git 侧却显示成一条已暂存的删除，过程中没有任何提示。
+    let fx = hybrid_with_colleague();
+    snapshot_commit(&fx, "Code/Old.cs", "o\n");
+    let wc2 = fx.wc2();
+    svn_cmd(&wc2, &["update", "--non-interactive"]);
+    svn_cmd(&wc2, &["rm", "Code/Old.cs"]);
+    svn_cmd(&wc2, &["commit", "-m", "rename", "--non-interactive"]);
+    set_author(&fx, youngest(&fx), "colleague");
+    // 同一段时间里同事的其他改动：只有 Old.cs 一加一删时 r1 到 r3 的净变化是零，没有可跟进的
+    colleague(&fx, B, "b2\n");
+    svn_update(&fx, "Code");
+    assert!(
+        !fx.wc().join("Code/Old.cs").exists(),
+        "前提：SVN 已经把它从磁盘上删掉"
+    );
+    // 再加一处真冲突，对象层才会交给手动跟进（只有 Old.cs 时它直接移 HEAD，见决策日志）。
+    // 只提交 A.cs：`conflict_scene` 的 `add -A` 会把 Old.cs 的删除一并提交，场景就没了
+    write(&fx, A, "a-git\n");
+    git(&fx, &["add", "--", A]);
+    git(&fx, &["commit", "-qm", "git 里的版本"]);
+    write(&fx, A, "a-svn\n");
+    tortoise_commit(&fx, A);
+    let o = run(&fx);
+    assert!(matches!(o, FollowOutcome::NeedsManual { .. }), "{o:?}");
+    expect_rebase_conflict(&fx);
+    resolve_a(&fx, "a-svn\n");
+
+    let (changed, resurrected, _, stash_oid) = drift(resume(&fx));
+
+    assert_eq!(resurrected, vec!["Code/Old.cs".to_string()]);
+    assert!(changed.is_empty(), "磁盘与跟进前一致：{changed:?}");
+    assert!(stash_oid.is_some(), "那条删除就是未提交改动，备份要留着");
+    assert!(git(&fx, &["ls-tree", "--name-only", "HEAD", "Code/"]).contains("Code/Old.cs"));
+}
+
 #[test]
 fn manual_follow_refuses_when_head_contains_base() {
     let fx = hybrid_with_colleague();
