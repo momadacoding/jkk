@@ -436,6 +436,15 @@ export interface RootRevMemo {
 }
 
 /**
+ * 第二档校验。返回 `false` = 结论被更晚发起的一次顶替、没有写回界面：这时**不能**记观测值。
+ *
+ * 不区分的话（事故分析 6.11 独立 review 第 1 条）：先开跑的 X 被晚开跑的 T 顶替、静默返回，
+ * memo 记成 X 的观测值；T 再失败，界面停在旧结论，之后的事件和焦点检测比的都是 X 记下的值，
+ * 判没变，横幅一直不出现。返回 `void` 按写回了处理。
+ */
+export type FullCheck = () => Promise<boolean | void>
+
+/**
  * 跑一次第二档，**成功之后**才把这次观测值记进 memo。
  *
  * # 顺序就是这条函数存在的全部理由
@@ -452,14 +461,17 @@ export interface RootRevMemo {
  *
  * `observed` 必须是**开跑之前**读到的值：校验期间工作副本要是又前进了，
  * 记下这个偏旧的值会让下一次事件判不等、再校验一遍。多跑一次远好过漏一次。
+ *
+ * 校验被顶替（返回 `false`，见 {@link FullCheck}）同样不记。返回是否记了。
  */
 export async function recordAfterSuccess(
   memo: RootRevMemo,
   observed: string,
-  runFullCheck: () => Promise<void>,
-): Promise<void> {
-  await runFullCheck()
+  runFullCheck: FullCheck,
+): Promise<boolean> {
+  if ((await runFullCheck()) === false) return false
   memo.value = observed
+  return true
 }
 
 /**
@@ -472,7 +484,7 @@ export async function recordAfterSuccess(
 export async function syncIfRootRevChanged(
   memo: RootRevMemo,
   readRootRevs: () => Promise<string>,
-  runFullCheck: () => Promise<void>,
+  runFullCheck: FullCheck,
 ): Promise<boolean> {
   const now = await readRootRevs()
   if (now === memo.value) return false
@@ -501,17 +513,16 @@ export function wcDbStampsChanged(prev: WcDbStamp[] | null, next: WcDbStamp[]): 
  * 来回切窗口很频繁，而第二档要跑 `svn status`，这里只有几次 `stat`。`svn status` 不写 wc.db
  * （E19），所以校验本身不会让下一次判成变了。
  *
- * 记录的规矩同 {@link recordAfterSuccess}：记开跑之前读到的值，校验成功之后才记。
+ * 记录的规矩同 {@link recordAfterSuccess}：记开跑之前读到的值，校验成功且写回了才记。
  */
 export async function syncIfWcDbChanged(
   memo: WcDbStampMemo,
   readStamps: () => Promise<WcDbStamp[]>,
-  runFullCheck: () => Promise<void>,
+  runFullCheck: FullCheck,
 ): Promise<boolean> {
   const stamps = await readStamps()
   if (!wcDbStampsChanged(memo.value, stamps)) return false
-  await runFullCheck()
-  memo.value = stamps
+  if ((await runFullCheck()) !== false) memo.value = stamps
   return true
 }
 
@@ -521,6 +532,9 @@ export async function syncIfWcDbChanged(
  * `.svn` 被 watcher 过滤，wc.db 自己的写入不产生事件。TortoiseSVN 装完最后一个文件到 wc.db
  * 最后一次提交事务之间没有新事件，那一刻读到的是半途的戳；不补这一下，横幅又要等下一次焦点。
  * 要比 watcher 的去抖（300ms）长，否则复查和最后一个事件挤在同一刻，什么都没多看到。
+ *
+ * 2 秒是估计值，没有实测 TortoiseSVN 装完最后一个文件到最后一次写 wc.db 的间隔。间隔更长时
+ * 横幅退回到等下一次焦点，与改动前相同，不会更差。
  */
 export const SVN_TRAILING_RECHECK_MS = 2000
 
@@ -528,29 +542,31 @@ export const SVN_TRAILING_RECHECK_MS = 2000
  * 文件变动时的检测（事故分析 6.11）：根 revision **或** wc.db 戳变了就跑第二档。
  *
  * 只看根 revision 不够：TortoiseSVN 只更新一个子目录时根的 revision 不动，「本地改动」立刻出现
- * 一大片，「跟进」却要等下一次窗口焦点才挂出来。wc.db 戳只是几次 `stat`，挂在高频通道上没有负担。
+ * 一大片，「跟进」却要等下一次窗口焦点才挂出来。
  *
- * 读戳失败（工作副本被删了一半之类）时退回只看根 revision，不让新加的这一档拖垮原有的那一档；
- * 戳的记录这时不动。记录的规矩同 {@link recordAfterSuccess}：两份观测值都在开跑前读，成功才记。
+ * 成本：戳没变时后端只有几次 `stat`；戳一变，后端要重新枚举工作副本（`svn info` + `svn status`），
+ * 随后第二档还要跑一遍 `svn status`。外部更新进行中 wc.db 一直在变，所以调用方必须单飞，
+ * 不能每个事件都并发起一轮。
+ *
+ * 两样观测值任一读失败，就只按另一样判断，读失败的那份记录不动；都读不到才抛错。
+ * 记录的规矩同 {@link recordAfterSuccess}：都在开跑前读，校验成功且写回了才记。
  */
 export async function syncIfRootRevOrWcDbChanged(
   rootMemo: RootRevMemo,
   wcDbMemo: WcDbStampMemo,
   readRootRevs: () => Promise<string>,
   readStamps: () => Promise<WcDbStamp[]>,
-  runFullCheck: () => Promise<void>,
+  runFullCheck: FullCheck,
 ): Promise<boolean> {
-  const rootRevs = await readRootRevs()
-  let stamps: WcDbStamp[] | null
-  try {
-    stamps = await readStamps()
-  } catch {
-    stamps = null
-  }
-  const changed = rootRevs !== rootMemo.value || (stamps !== null && wcDbStampsChanged(wcDbMemo.value, stamps))
+  const [rootRead, stampsRead] = await Promise.allSettled([readRootRevs(), readStamps()])
+  if (rootRead.status === 'rejected' && stampsRead.status === 'rejected') throw rootRead.reason
+  const rootRevs = rootRead.status === 'fulfilled' ? rootRead.value : null
+  const stamps = stampsRead.status === 'fulfilled' ? stampsRead.value : null
+  const changed = (rootRevs !== null && rootRevs !== rootMemo.value)
+    || (stamps !== null && wcDbStampsChanged(wcDbMemo.value, stamps))
   if (!changed) return false
-  await runFullCheck()
-  rootMemo.value = rootRevs
+  if ((await runFullCheck()) === false) return true
+  if (rootRevs !== null) rootMemo.value = rootRevs
   if (stamps !== null) wcDbMemo.value = stamps
   return true
 }
@@ -573,7 +589,8 @@ export function shouldMarkOnBlur(
  * 失焦时记快照。多看一眼 wc.db：TortoiseSVN 的进度框还在走时切回 jkk，提交在 jkk 前台时完成，
  * 焦点事件已经过去了，判定还是旧的 InSync，这时写下的快照同样晚于外部提交。
  *
- * 没有戳可比（打开仓库之后还没有过焦点检测）时按判定写，这是唯一会放过这种情形的窗口。
+ * 没有戳可比（打开仓库之后焦点检测、文件变动检测都还没有记下过戳）时按判定写，
+ * 这是唯一会放过这种情形的窗口。
  *
  * @returns 是否写了
  */
