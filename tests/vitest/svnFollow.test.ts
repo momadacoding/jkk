@@ -114,7 +114,7 @@ describe('describeFollowReport', () => {
     const sure: Leak = { ...leak, path: 'Code/S.cs', hunks: [{ oldStart: 1, lines: 1, verdict: 'present' }] }
     const m = describeFollowReport({ ...report, leaks: [sure, leak] })
     const s = m.sections.find((x) => x.id === 'leaks')!
-    expect(s.groups.map((g) => g.label)).toEqual(['已确认在 SVN 上', '拿不准'])
+    expect(s.groups.map((g) => g.label)).toEqual(['这些改动已确认在 SVN 上', '拿不准'])
     expect(s.groups[0].items[0]).toContain('Code/S.cs')
     expect(s.groups[1].items[0]).toContain('Code/L.cs')
     expect(s.note).toContain('不影响这次跟进')
@@ -427,17 +427,20 @@ describe('describeFollowOutcome', () => {
     expect(old.detail).not.toContain('SVN 上 r')
   })
 
-  it('6.7：冲突框说清点了取消之后从哪里回来', () => {
-    const n = describeFollowOutcome({
-      kind: 'needsManual',
-      at: 'c'.repeat(40),
-      files: ['Code/A.cs'],
-      baselinePublished: true,
-      leaks: [],
-      staleDisk: false,
-    })
-    expect(n.detail).toContain('取消')
-    expect(n.detail).toContain('横幅上的「跟进」')
+  it('6.7：冲突框说清点了取消之后从哪里回来，按钮名照实写', () => {
+    for (const staleDisk of [false, true]) {
+      const n = describeFollowOutcome({
+        kind: 'needsManual',
+        at: 'c'.repeat(40),
+        files: ['Code/A.cs'],
+        baselinePublished: true,
+        leaks: [],
+        staleDisk,
+      })
+      // 确认框的取消按钮写的是 Cancel（ConfirmDialog），文案要对得上
+      expect(n.detail).toContain('「Cancel」')
+      expect(n.detail).toContain('横幅上的「跟进」')
+    }
   })
 
   it('6.10：手动跟进会直接采用基线的快照内容，动手之前列出来', () => {

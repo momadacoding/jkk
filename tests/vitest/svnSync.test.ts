@@ -70,7 +70,7 @@ describe('describeSync', () => {
   it('6.7：冲突框点了取消之后，横幅写明再点「跟进」就回到手动跟进', () => {
     // 2026-11-05 用户取消冲突框之后没找到入口：手动跟进没有单独的按钮，只能经由跟进重新弹出
     const b = describeSync({ ...inSync, headBehindBase: true })!
-    expect(b.detail).toContain('取消')
+    expect(b.detail).toContain('Cancel')
     expect(b.detail).toContain('手动跟进')
   })
 

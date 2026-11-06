@@ -228,14 +228,10 @@ fn only_the_real_conflict_is_left_and_manual_follow_sees_only_it() {
             assert_eq!(d.svn_author.as_deref(), Some("colleague"));
             assert!(d.svn_rev.is_some_and(|r| r > 1), "{d:?}");
             assert!(!d.svn_removed);
-            let preview = d.preview.as_deref().expect("文本冲突要有预览");
-            assert!(preview.starts_with("<<<<<<< 新基线（SVN）"), "{preview}");
-            assert!(preview.contains("a-colleague"), "{preview}");
-            assert!(preview.contains("a-mine"), "{preview}");
-            assert!(preview.ends_with(">>>>>>> 你的提交"), "{preview}");
-            assert!(
-                !preview.contains(&oid(&fx, "svn/base")),
-                "OID 标签要换成人话：{preview}"
+            // 整段相等：方向是这条的重点（11-05 用户弄反过），只查包含的话内容对调了也照样通过
+            assert_eq!(
+                d.preview.as_deref(),
+                Some("<<<<<<< 新基线（SVN）\na-colleague\n=======\na-mine\n>>>>>>> 你的提交"),
             );
         }
         other => panic!("应当交给手动跟进：{other:?}"),

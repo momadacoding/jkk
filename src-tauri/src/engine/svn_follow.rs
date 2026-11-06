@@ -327,7 +327,7 @@ pub struct ConflictDetail {
     pub svn_author: Option<String>,
     /// SVN 上把它删了。
     pub svn_removed: bool,
-    /// 第一处冲突块，标签换成人话，最多 [`PREVIEW_LINES`] 行。二进制、太大、没有冲突标记（如修改与删除
+    /// 第一处冲突块，标签换成人话，每一侧最多 [`PREVIEW_SIDE_LINES`] 行（见 [`preview_of`]）。二进制、太大、没有冲突标记（如修改与删除
     /// 撞上）时为 `None`。
     pub preview: Option<String>,
 }
@@ -1268,12 +1268,17 @@ fn split_snapshot(
     (snap, own)
 }
 
-/// 冲突预览最多几行（含冲突标记）。冲突框是给人扫一眼的，完整内容在手动跟进时由合并工具给。
-pub const PREVIEW_LINES: usize = 14;
-/// 预览只取前几个冲突文件：11-05 那次有 37 个，全取既慢又没人看。
+/// 冲突预览里每一侧（新基线 / 共同的旧版本 / 你的提交）最多几行。按侧限，不按总行数限（6.5 review M1：
+/// SVN 那一侧一长，「你的提交」就整段看不到了）。冲突框是给人扫一眼的，完整内容在手动跟进时由合并工具给。
+pub const PREVIEW_SIDE_LINES: usize = 6;
+/// 单行最多几个字符：minified 的 JSON / JS 一行就能有几百 KB。
+pub const PREVIEW_LINE_CHARS: usize = 200;
+/// 预览最多给几个冲突文件：11-05 那次有 37 个，全取既慢又没人看。按取成功的计（review L1）。
 const PREVIEW_FILES: usize = 5;
+/// 最多尝试几个文件：前面的都是二进制或修改与删除撞上时，后面的文本冲突也要有机会。
+const PREVIEW_TRIES: usize = 10;
 /// 超过这个大小的冲突文件不读预览。
-const PREVIEW_MAX_BYTES: usize = 512 * 1024;
+const PREVIEW_MAX_BYTES: u64 = 512 * 1024;
 
 /// 每个冲突文件的上下文（事故分析 6.5）。SVN 侧的作者与 revision 来自这次录基线时的外部变更清单，
 /// 不额外跑 svn；预览来自 merge-tree 的冲突树，只读 git 对象。预览读失败只是没有预览。
@@ -1283,60 +1288,109 @@ fn conflict_details(
     tree: &str,
     ext: &External,
 ) -> Vec<ConflictDetail> {
+    let mut shown = 0;
     files
         .iter()
         .enumerate()
         .map(|(i, path)| {
             let change = ext.changes.iter().find(|c| &c.path == path);
+            let preview = if shown < PREVIEW_FILES && i < PREVIEW_TRIES {
+                conflict_preview(repo, tree, path)
+            } else {
+                None
+            };
+            if preview.is_some() {
+                shown += 1;
+            }
             ConflictDetail {
                 path: path.clone(),
                 svn_rev: change.map(|c| c.rev).filter(|r| *r > 0),
                 svn_author: change.and_then(|c| c.author.clone()),
                 svn_removed: ext.removed.contains(path),
-                preview: if i < PREVIEW_FILES {
-                    conflict_preview(repo, tree, path)
-                } else {
-                    None
-                },
+                preview,
             }
         })
         .collect()
 }
 
-/// 冲突树里 `path` 的第一处冲突块。merge-tree 的标签是 OID，换成人话：重放时「我们这边」是新基线，
-/// 「他们那边」是被重放的 commit（与 rebase 的方向相同，11-05 用户用外部合并工具时就弄反过）。
+/// 冲突树里 `path` 的第一处冲突块（见 [`preview_of`]）。先问大小再读（review L2：二进制冲突时树里
+/// 留的是整份原文件，Unity 资源能有几百 MB）。不是 UTF-8 的（国内 Unity 工程里 GBK 的 `.cs` 常见）
+/// 照样给，开头说一句可能是乱码（review L3）。
 fn conflict_preview(repo: &str, tree: &str, path: &str) -> Option<String> {
-    let bytes = run_git_bytes(repo, &["cat-file", "blob", &format!("{tree}:{path}")]).ok()?;
-    if bytes.len() > PREVIEW_MAX_BYTES || bytes.contains(&0) {
+    let spec = format!("{tree}:{path}");
+    let size: u64 = run_git(repo, &["cat-file", "-s", &spec])
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    if size > PREVIEW_MAX_BYTES {
         return None;
     }
-    let text = String::from_utf8_lossy(&bytes);
-    let mut out = Vec::new();
-    let mut inside = false;
-    for line in text.lines() {
-        let line = line.trim_end_matches('\r');
-        if !inside {
-            if !line.starts_with("<<<<<<<") {
-                continue;
-            }
-            inside = true;
-            out.push("<<<<<<< 新基线（SVN）".to_string());
-            continue;
-        }
-        if out.len() >= PREVIEW_LINES {
-            out.push("…".to_string());
-            break;
-        }
-        if line.starts_with("|||||||") {
-            out.push("||||||| 共同的旧版本".to_string());
-        } else if line.starts_with(">>>>>>>") {
-            out.push(">>>>>>> 你的提交".to_string());
-            break;
-        } else {
-            out.push(line.to_string());
+    let bytes = run_git_bytes(repo, &["cat-file", "blob", &spec]).ok()?;
+    if bytes.contains(&0) {
+        return None;
+    }
+    match std::str::from_utf8(&bytes) {
+        Ok(text) => preview_of(text),
+        Err(_) => preview_of(&String::from_utf8_lossy(&bytes))
+            .map(|p| format!("（不是 UTF-8 编码，中文可能显示为乱码）\n{p}")),
+    }
+}
+
+/// 文本里第一处冲突块，标签换成人话。merge-tree 的标签是 OID；重放时「我们这边」是新基线（第 2 个及
+/// 以后的 commit 冲突时还含着你之前已重放的提交），「他们那边」是被重放的 commit，与 rebase 的方向相同
+/// （11-05 用户用外部合并工具时就弄反过）。
+///
+/// 每一侧最多 [`PREVIEW_SIDE_LINES`] 行，多出的写「…（还有 N 行）」；分隔线与 `>>>>>>> 你的提交` 总是在。
+/// 单行截到 [`PREVIEW_LINE_CHARS`] 个字符。没有冲突标记时为 `None`。
+pub fn preview_of(text: &str) -> Option<String> {
+    fn flush(out: &mut Vec<String>, side: &mut Vec<String>) {
+        let n = side.len();
+        out.extend(side.drain(..).take(PREVIEW_SIDE_LINES));
+        if n > PREVIEW_SIDE_LINES {
+            out.push(format!("…（还有 {} 行）", n - PREVIEW_SIDE_LINES));
         }
     }
-    (!out.is_empty()).then(|| out.join("\n"))
+    fn clip(line: &str) -> String {
+        if line.chars().count() <= PREVIEW_LINE_CHARS {
+            return line.to_string();
+        }
+        let mut s: String = line.chars().take(PREVIEW_LINE_CHARS).collect();
+        s.push('…');
+        s
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut side: Vec<String> = Vec::new();
+    let mut inside = false;
+    for raw in text.lines() {
+        let line = raw.trim_end_matches('\r');
+        if !inside {
+            if line.starts_with("<<<<<<<") {
+                inside = true;
+                out.push("<<<<<<< 新基线（SVN）".to_string());
+            }
+            continue;
+        }
+        if line.starts_with("|||||||") {
+            flush(&mut out, &mut side);
+            out.push("||||||| 共同的旧版本".to_string());
+        } else if line == "=======" {
+            flush(&mut out, &mut side);
+            out.push("=======".to_string());
+        } else if line.starts_with(">>>>>>>") {
+            flush(&mut out, &mut side);
+            out.push(">>>>>>> 你的提交".to_string());
+            return Some(out.join("\n"));
+        } else {
+            side.push(clip(line));
+        }
+    }
+    if !inside {
+        return None;
+    }
+    // 没有收尾标记（文件被截断之类）：有多少给多少
+    flush(&mut out, &mut side);
+    Some(out.join("\n"))
 }
 
 /// 对象层跟进重放后，分支 tip 与磁盘对不上的文件（方案 §4；PR 119 遗留）。
@@ -1622,7 +1676,7 @@ fn plan_other(
     if !leaks.is_empty() {
         report.leaks.extend(leaks);
         return Ok(Err(
-            "分支上的 Local-Only 补丁可能被一起提交到了 SVN，不自动移动".to_string(),
+            "分支上的 Local-Only 补丁里有改动已经或可能出现在 SVN 上，不自动移动".to_string(),
         ));
     }
     let sup = |c: &ReplayCommit| -> BTreeSet<String> {
