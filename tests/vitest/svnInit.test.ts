@@ -422,11 +422,11 @@ describe('错误码到引导语的映射', () => {
     expect(h).toContain('重新点')
   })
 
-  it('分类对不上时说出替换这个常见原因，不叫人重试（事故分析 6.3）', () => {
+  it('分类对不上时说清重试没用之后怎么办（事故分析 6.3）', () => {
     // 原文案「多半是录制过程中被外部改动了，请重试一次」：工作副本不变时重试永远停在同一处，
-    // 2026-11-05 用户就照着反复重试过
+    // 2026-11-05 用户就照着反复重试过。替换这个最常见的原因 6.2 起在分类时就停下了
     const h = wizardErrorHint('svn_baseline_classification_conflict')
-    expect(h).toContain('替换')
+    expect(h).toContain('重试仍停在同一处')
     expect(h).toContain('还原')
     expect(h).not.toContain('请重试一次')
   })

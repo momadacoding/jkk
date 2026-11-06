@@ -52,7 +52,8 @@ fn every_svn_status_item_maps_to_exactly_one_outcome() {
     for (item, want) in [
         // 磁盘上的不是服务器内容（或磁盘上根本没有）→ 取服务器那一版
         ("modified", Some(Fix::TakeBase)),
-        ("replaced", Some(Fix::TakeBase)),
+        // `replaced` 不在这张表里：不带历史的离线取不到旧内容，一律停下（事故分析 6.2），
+        // 带历史的按复制子树判，见下面几条
         ("conflicted", Some(Fix::TakeBase)),
         ("deleted", Some(Fix::TakeBase)),
         ("missing", Some(Fix::TakeBase)),
@@ -293,11 +294,46 @@ fn everything_under_a_directory_replaced_by_a_copy_is_refused() {
 }
 
 #[test]
-fn a_replaced_node_without_history_keeps_its_current_classification() {
-    // `svn rm` 后同名 `svn add`（不带历史）：`revision="1"`、没有 copied。这一种的
-    // 取数来源另有待决策（分析文档 6.2），这次不改它的行为。
-    let got = classify(&[node("Code/A.cs", "replaced", Some(1), false)]).unwrap();
-    assert_eq!(got.get("Code/A.cs"), Some(&Fix::TakeBase), "实际：{got:?}");
+fn a_replaced_node_without_history_is_refused() {
+    // 事故分析 6.2：`svn rm` 后同名 `svn add`（不带历史）：`revision="1"`、没有 copied。
+    // 服务器 rN 上有旧内容，但 `svn cat -r BASE` 报 E200009，离线取不到。原来走 TakeBase，
+    // 停在 `svn_baseline_classification_conflict`；选定的做法是在分类时就明确拒绝，说清怎么办，
+    // 不为它破例联网
+    for e in [
+        node("Code/A.cs", "replaced", Some(1), false),
+        entry("Code/A.cs", "replaced"),
+    ] {
+        let err = classify(&[e]).unwrap_err();
+        assert_eq!(
+            err.code, "svn_dirty_replaced_without_history",
+            "实际：{}",
+            err.message
+        );
+        assert!(err.message.contains("Code/A.cs"), "{}", err.message);
+        assert!(err.message.contains("提交"), "{}", err.message);
+        assert!(err.message.contains("还原"), "{}", err.message);
+    }
+}
+
+#[test]
+fn files_under_a_directory_replaced_without_history_are_refused_not_dropped() {
+    // PR 116 遗留：`svn rm D; mkdir D; svn add D`。D 底下的同名文件是 `added`、schedule `add`，
+    // 单看它会被摘掉，可服务器上旧的 D 里有它。D 自己是不带历史的 replaced，整个停下
+    let err = classify(&[
+        node("Code/D", "replaced", Some(1), false),
+        node("Code/D/x.cs", "added", Some(-1), false),
+    ])
+    .unwrap_err();
+    assert_eq!(err.code, "svn_dirty_replaced_without_history");
+    assert!(err.message.contains("Code/D"), "{}", err.message);
+
+    // 子节点排在前面也一样：结果是整个出错，不会只摘掉子节点
+    let err = classify(&[
+        node("Code/D/x.cs", "added", Some(-1), false),
+        node("Code/D", "replaced", Some(1), false),
+    ])
+    .unwrap_err();
+    assert_eq!(err.code, "svn_dirty_replaced_without_history");
 }
 
 #[test]

@@ -2044,10 +2044,36 @@ fn a_file_replaced_by_a_copy_is_refused_instead_of_recorded_with_the_copy_source
 }
 
 #[test]
+fn a_directory_replaced_without_history_is_refused_not_recorded_without_its_files() {
+    // PR 116 遗留：`svn rm D; mkdir D; svn add D`。D 底下重新加的同名文件 schedule 是 `add`，
+    // 单看它会被摘出基线，可服务器上旧的 D 里有它：静默少录一个服务器上的文件
+    let fx = svn_repo();
+    let wc = fx.wc();
+    std::fs::create_dir_all(wc.join("Code/Sub")).unwrap();
+    std::fs::write(wc.join("Code/Sub/x.cs"), "x1\n").unwrap();
+    svn(&wc, &["add", "Code/Sub"]);
+    svn(&wc, &["commit", "-m", "sub", "--non-interactive"]);
+    svn(&wc, &["update", "--non-interactive"]);
+    svn(&wc, &["rm", "Code/Sub"]);
+    std::fs::create_dir_all(wc.join("Code/Sub")).unwrap();
+    std::fs::write(wc.join("Code/Sub/x.cs"), "x2\n").unwrap();
+    svn(&wc, &["add", "Code/Sub"]);
+
+    let err = init_hybrid(&req(&fx)).expect_err("服务器上旧的 Sub 取不到，必须停下");
+    assert_eq!(
+        err.code, "svn_dirty_replaced_without_history",
+        "实际：{}",
+        err.message
+    );
+    assert!(err.message.contains("Code/Sub"), "{}", err.message);
+    assert!(!wc.join(".git").exists(), "失败要整个回退");
+}
+
+#[test]
 fn a_replaced_file_without_history_names_the_replacement_instead_of_asking_to_retry() {
     // 事故分析 6.3：`svn rm X` 后同名 `svn add`（不带历史、文件还在磁盘上），`svn cat -r BASE`
-    // 报 E200009，录制停在 `svn_baseline_classification_conflict`。原文案说「多半是录制过程中
-    // 被外部改动了，请重试一次」——工作副本不变，重试多少次都一样，用户 11-05 就反复重试过。
+    // 报 E200009。原文案说「多半是录制过程中被外部改动了，请重试一次」——工作副本不变，重试
+    // 多少次都一样，用户 11-05 就反复重试过。6.2 之后在分类时就停下，不再走到取数那一步
     let fx = svn_repo();
     let wc = fx.wc();
     svn(&wc, &["rm", "Code/A.cs"]);
@@ -2056,7 +2082,7 @@ fn a_replaced_file_without_history_names_the_replacement_instead_of_asking_to_re
 
     let err = init_hybrid(&req(&fx)).expect_err("取不到服务器上的旧内容，必须停下");
     assert_eq!(
-        err.code, "svn_baseline_classification_conflict",
+        err.code, "svn_dirty_replaced_without_history",
         "实际：{}",
         err.message
     );

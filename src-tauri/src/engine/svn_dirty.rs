@@ -470,13 +470,18 @@ pub fn classify(entries: &[StatusEntry]) -> Result<BTreeMap<String, Fix>> {
                     other => return Err(missing_uncommitted_unknown(&path, other)),
                 }
             }
+            // 不带历史的替换（事故分析 6.2）：带历史的已经在上面按复制子树处理了
+            if e.item == "replaced" {
+                return Err(replaced_without_history(&path));
+            }
         }
 
         let fix = match e.item.as_str() {
             // 磁盘上的不是服务器内容。`deleted` / `missing` 是磁盘上干脆没有——
             // 它们仍然要取回来，因为基线记的是**服务器**上的样子，本地的删除是
             // 一处待交付的改动，不是基线的一部分。
-            "modified" | "replaced" | "conflicted" | "deleted" | "missing" => Fix::TakeBase,
+            // `replaced` 走不到这里：带历史的按复制子树判，不带历史的上面已经停下
+            "modified" | "conflicted" | "deleted" | "missing" => Fix::TakeBase,
 
             // 服务器 rN 上根本没有它们。`ignored` 与 `unversioned` 都算：
             // 被 `svn:ignore` 挡住不代表 git 不收它（正是 `--no-ignore` 存在的
@@ -615,6 +620,25 @@ fn copy_origin_unknown(path: &str, root: &str, root_item: &str) -> GitError {
 
 /// `svn rm X` 后在同一位置新加（或复制）了文件，之后又从磁盘删掉：服务器 rN 上 `X`
 /// 有旧内容，本地却只剩一个「待替换、文件丢失」的记录，拿不到旧内容。
+/// 不带历史的 replaced（`svn rm X` 后在同一位置 `svn add`；目录同理）。事故分析 6.2 选定的做法：
+/// 离线取不到服务器上的旧内容（`svn cat -r BASE` 报 E200009，2026-11-05 实测），也不为它破例联网，
+/// 明确停下并说清怎么办。
+///
+/// 目录也停（PR 116 遗留）：`svn rm D; mkdir D; svn add D` 之后，D 底下重新加的同名文件 schedule 是
+/// `add`，单看它会被摘出基线，可服务器上旧的 D 里有它。停在 D 上，子节点怎么分类就不重要了。
+fn replaced_without_history(path: &str) -> GitError {
+    GitError::new(
+        "svn_dirty_replaced_without_history",
+        format!(
+            "`{path}` 在 svn 里被替换过：先删掉，又在同一位置重新添加（TortoiseSVN 里显示为 R）。\
+             服务器上这个位置有旧内容，但本地取不到它（svn 只记着「替换」这件事，旧内容要联网才拿得到），\
+             录进基线就会少录或者录错。\n\
+             请先在 TortoiseSVN 里把这次替换提交，或者对 `{path}` 做「还原」，然后再试。\
+             工作副本不变的话，重试还会停在这里。本应用什么都没改。"
+        ),
+    )
+}
+
 fn replaced_then_missing(path: &str) -> GitError {
     GitError::new(
         "svn_dirty_replaced_missing",

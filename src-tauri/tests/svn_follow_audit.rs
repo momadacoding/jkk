@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
 //! 手动跟进收尾核对（`svn_follow_audit`）的判据，直接在纯 git 的临时仓库上测。
 //!
 //! 端到端的形状（真 SVN fixture、走完整个手动跟进）在 `tests/svn_follow.rs`；这里钉的是那边
