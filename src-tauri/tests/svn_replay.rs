@@ -322,9 +322,16 @@ fn superseded_path_resolves_w10_r2_conflict() {
     )
     .unwrap()
     {
-        ReplayOutcome::Conflict { at, files } => {
+        ReplayOutcome::Conflict { at, files, tree } => {
             assert_eq!(at, c1);
             assert_eq!(files, vec![A.to_string()]);
+            // 事故分析 6.5：冲突树里的文件带着冲突标记，冲突框从这里取预览
+            let conflicted = git(&fx, &["cat-file", "blob", &format!("{tree}:{A}")]);
+            assert!(
+                conflicted.contains("<<<<<<<") && conflicted.contains(">>>>>>>"),
+                "{conflicted}"
+            );
+            assert!(conflicted.contains("two-FINAL") && conflicted.contains("two-C1"));
         }
         other => panic!("期望冲突，实际 {other:?}"),
     }
@@ -642,7 +649,7 @@ fn replay_cjk_path_conflict_is_reported_verbatim() {
     )
     .unwrap()
     {
-        ReplayOutcome::Conflict { at, files } => {
+        ReplayOutcome::Conflict { at, files, .. } => {
             assert_eq!(at, c);
             assert_eq!(files, vec![p.to_string()]);
         }

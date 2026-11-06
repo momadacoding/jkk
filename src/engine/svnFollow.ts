@@ -73,6 +73,17 @@ export interface FollowReport {
   evidenceCutoffMs: number | null
 }
 
+/** 后端 `svn_follow::ConflictDetail`：冲突框里一个冲突文件的上下文（事故分析 6.5）。 */
+export interface ConflictDetail {
+  path: string
+  /** SVN 上最后一次改它的 revision 与作者。本次外部变更里没有它时为 null。 */
+  svnRev: number | null
+  svnAuthor: string | null
+  svnRemoved: boolean
+  /** 第一处冲突块，标签已换成「新基线（SVN）/ 你的提交」。二进制、太大、没有冲突标记时为 null。 */
+  preview: string | null
+}
+
 /** 后端 `svn_follow::FollowOutcome`。 */
 export type FollowOutcome =
   | { kind: 'done'; report: FollowReport }
@@ -90,6 +101,8 @@ export type FollowOutcome =
       staleDisk: boolean
       /** 手动跟进时会直接采用新基线版本的快照内容（6.10）：动手之前告诉用户。旧后端没有。 */
       snapshot?: [string, string[]][]
+      /** 每个冲突文件的上下文（6.5），与 `files` 同序。旧后端没有。 */
+      details?: ConflictDetail[]
     }
   /** 什么都没动：前置条件不满足，或者准备阶段失败。 */
   | { kind: 'refused'; code: string; message: string }
@@ -156,7 +169,11 @@ function capped(items: string[]): string[] {
   ]
 }
 
-const LEAK_NOTE = '这些本地补丁（Local-Only）可能被提交到了 SVN，请检查'
+/**
+ * 泄漏提醒（事故分析 6.8）：原来一句「可能被提交到了 SVN，请检查」，用户分不清哪些已确认、哪些只是拿不准，
+ * 也不知道它影不影响这次操作。按 hunk 判定分两档列，并写明影响。
+ */
+const LEAK_NOTE = '这些本地补丁（Local-Only）里有改动已经或可能出现在了 SVN 上'
 
 /** 6.10 的快照内容：报告与冲突框共用的开头。 */
 const SNAPSHOT_NOTE =
@@ -167,8 +184,20 @@ function leakLine(l: Leak): string {
   return `${l.path}（分支 ${l.branch}：${l.subject}）`
 }
 
+/** 所有 hunk 都原样出现在新基线里的算「已确认」；有任何一处对不上的算「拿不准」。 */
+function leakTiers(leaks: Leak[]): { sure: Leak[]; unsure: Leak[] } {
+  const isSure = (l: Leak) => l.hunks.length > 0 && l.hunks.every((h) => h.verdict === 'present')
+  return { sure: leaks.filter(isSure), unsure: leaks.filter((l) => !isSure(l)) }
+}
+
 function leakSection(leaks: Leak[]): string {
-  return `${LEAK_NOTE}：\n${listed(leaks.map(leakLine))}`
+  const { sure, unsure } = leakTiers(leaks)
+  const parts = [`${LEAK_NOTE}。只是提醒，不拦手动跟进，也不改任何文件。`]
+  if (sure.length > 0) parts.push(`这些改动已确认在 SVN 上：\n${listed(sure.map(leakLine))}`)
+  if (unsure.length > 0) {
+    parts.push(`拿不准（SVN 动过同一处，但对不上）：\n${listed(unsure.map(leakLine))}`)
+  }
+  return parts.join('\n')
 }
 
 /** 怎么找回被换掉的暂存。索引没有 reflog，这个 ref 是唯一的出路（分析 §6.11.1）。 */
@@ -226,8 +255,13 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
       id: 'leaks',
       title: '泄漏告警',
       warn: true,
-      note: `${LEAK_NOTE}。`,
-      groups: [{ label: '', items: r.leaks.map(leakLine) }],
+      note:
+        `${LEAK_NOTE}。只是提醒，不影响这次跟进；` +
+        '带着这些补丁的其他分支不会自动移动，切过去时会提示手动跟进。确认是你有意提交的，就可以不管它。',
+      groups: [
+        { label: '这些改动已确认在 SVN 上', items: leakTiers(r.leaks).sure.map(leakLine) },
+        { label: '拿不准', items: leakTiers(r.leaks).unsure.map(leakLine) },
+      ],
     },
     {
       id: 'lost',
@@ -338,6 +372,37 @@ export function describeFollowContinue(): SyncConfirmModel {
   }
 }
 
+/**
+ * 冲突文件一行一个，带上 SVN 侧是谁、哪个 revision 改的（事故分析 6.5：11-05 要手工跑 svn log 才看清）。
+ * 旧后端没有 `details` 时照原样列文件名。
+ */
+function conflictLines(o: Extract<FollowOutcome, { kind: 'needsManual' }>): string[] {
+  const byPath = new Map((o.details ?? []).map((d) => [d.path, d]))
+  return o.files.map((f) => {
+    const d = byPath.get(f)
+    if (!d) return f
+    if (d.svnRemoved) return `${f}（SVN 上已删除）`
+    if (d.svnRev === null) return f
+    return `${f}（SVN 上 r${d.svnRev}${d.svnAuthor ? ` ${d.svnAuthor}` : ''} 改过）`
+  })
+}
+
+/** 冲突那几行的预览：后端只给前几个文件，每个一段。 */
+function previewSection(details: ConflictDetail[]): string[] {
+  const shown = details.filter((d) => d.preview)
+  if (shown.length === 0) return []
+  return [
+    '冲突的地方（只列前几个文件的第一处）：\n\n' +
+      shown.map((d) => `${d.path}\n${d.preview}`).join('\n\n'),
+  ]
+}
+
+/**
+ * 事故分析 6.7：手动跟进没有单独的按钮，取消之后用户找不到回来的路。按钮上写的是 Cancel，文案照着写。
+ */
+const COME_BACK_NOTE =
+  '现在不想处理也可以点「Cancel」，什么都不会动。之后随时点顶部横幅上的「跟进」，会回到这一步。'
+
 /** 跟进没走完时说什么。走完了说什么在 {@link describeFollowReport}。 */
 export function describeFollowOutcome(o: Exclude<FollowOutcome, { kind: 'done' }>): OutcomeNotice {
   switch (o.kind) {
@@ -355,11 +420,14 @@ export function describeFollowOutcome(o: Exclude<FollowOutcome, { kind: 'done' }
             '只移动分支的话，这些文件会在「本地改动」里显示成把 SVN 上的内容改回去，提交就等于回退。' +
               '分支和暂存区都没动。点「手动跟进」：未提交的改动先收起来，分支重放到新基线上时会把新内容' +
               '写回磁盘，最后再把改动放回来。这一步会写工作区里的文件。',
+            COME_BACK_NOTE,
           ]
         : [
-            `基线已经发布，但把提交 ${o.at.slice(0, 10)} 重放上去时有冲突：\n${listed(o.files)}`,
+            `基线已经发布，但把提交 ${o.at.slice(0, 10)} 重放上去时有冲突：\n${listed(conflictLines(o))}`,
+            ...previewSection(o.details ?? []),
             '分支和暂存区都没动。这需要人来判断：点「手动跟进」，未提交的改动会先收起来，分支重放到' +
               '新基线上，冲突由你解决，最后再把改动放回来。这一步会写工作区里的文件。',
+            COME_BACK_NOTE,
           ]
       const snapshot = (o.snapshot ?? []).flatMap(([c, paths]) =>
         paths.map((p) => `${p}（${c.slice(0, 10)}）`),

@@ -968,7 +968,7 @@ fn externally_advanced_serializes_camel_case() {
 fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     // 计划 Task 10。三层嵌套（Outcome → Report → Leak / ComposeReport），每一层都要是 camelCase；
     // 只测 Refused 的话，变体字段与结构体字段的 serde 属性写错都测不到
-    use app_lib::engine::svn_follow::{Evidence, FollowOutcome, FollowReport};
+    use app_lib::engine::svn_follow::{ConflictDetail, Evidence, FollowOutcome, FollowReport};
     use app_lib::engine::svn_follow_index::{ComposeReport, StageDecision};
     use app_lib::engine::svn_leak::{HunkLeak, Leak, LeakVerdict};
     use app_lib::engine::svn_sync::ExternalChange;
@@ -991,6 +991,13 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
         }],
         stale_disk: true,
         snapshot: vec![("s1".into(), vec!["Code/B.cs".into()])],
+        details: vec![ConflictDetail {
+            path: "Code/A.cs".into(),
+            svn_rev: Some(7),
+            svn_author: Some("li".into()),
+            svn_removed: false,
+            preview: Some("<<<<<<< 新基线（SVN）".into()),
+        }],
     })
     .unwrap();
     assert_eq!(
@@ -1009,6 +1016,13 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
             }],
             "staleDisk": true,
             "snapshot": [["s1", ["Code/B.cs"]]],
+            "details": [{
+                "path": "Code/A.cs",
+                "svnRev": 7,
+                "svnAuthor": "li",
+                "svnRemoved": false,
+                "preview": "<<<<<<< 新基线（SVN）",
+            }],
         })
     );
 

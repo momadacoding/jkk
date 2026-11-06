@@ -110,6 +110,33 @@ describe('describeFollowReport', () => {
     expect(m.tone).toBe('attention')
   })
 
+  it('6.8：泄漏按判定分两档，并写明不影响这次跟进', () => {
+    const sure: Leak = { ...leak, path: 'Code/S.cs', hunks: [{ oldStart: 1, lines: 1, verdict: 'present' }] }
+    const m = describeFollowReport({ ...report, leaks: [sure, leak] })
+    const s = m.sections.find((x) => x.id === 'leaks')!
+    expect(s.groups.map((g) => g.label)).toEqual(['这些改动已确认在 SVN 上', '拿不准'])
+    expect(s.groups[0].items[0]).toContain('Code/S.cs')
+    expect(s.groups[1].items[0]).toContain('Code/L.cs')
+    expect(s.note).toContain('不影响这次跟进')
+    expect(s.note).toContain('其他分支')
+    expect(s.note).not.toContain('请检查')
+  })
+
+  it('6.8：冲突框里的泄漏同样分两档，说清不拦手动跟进', () => {
+    const sure: Leak = { ...leak, path: 'Code/S.cs', hunks: [{ oldStart: 1, lines: 1, verdict: 'present' }] }
+    const n = describeFollowOutcome({
+      kind: 'needsManual',
+      at: 'c'.repeat(40),
+      files: ['Code/A.cs'],
+      baselinePublished: true,
+      leaks: [sure, leak],
+      staleDisk: false,
+    })
+    expect(n.detail).toContain('已确认在 SVN 上')
+    expect(n.detail).toContain('拿不准')
+    expect(n.detail).toContain('不拦手动跟进')
+  })
+
   it('要用户留意的节排在最前：列表很长时不能被文件清单压到看不见', () => {
     const m = describeFollowReport({
       ...report,
@@ -361,6 +388,59 @@ describe('describeFollowOutcome', () => {
     expect(n.detail).toContain('Local-Only')
     expect(n.detail).toContain('Code/L.cs')
     expect(n.detail).toContain('加日志')
+  })
+
+  it('6.5：冲突框给出每个文件在 SVN 上是谁、哪个 revision 改的，以及冲突那几行', () => {
+    const n = describeFollowOutcome({
+      kind: 'needsManual',
+      at: 'c'.repeat(40),
+      files: ['Code/A.cs', 'Code/G.cs', 'Code/X.cs'],
+      baselinePublished: true,
+      leaks: [],
+      staleDisk: false,
+      details: [
+        {
+          path: 'Code/A.cs',
+          svnRev: 66464,
+          svnAuthor: 'liuhao',
+          svnRemoved: false,
+          preview: '<<<<<<< 新基线（SVN）\nnew\n=======\nmine\n>>>>>>> 你的提交',
+        },
+        { path: 'Code/G.cs', svnRev: null, svnAuthor: null, svnRemoved: true, preview: null },
+        { path: 'Code/X.cs', svnRev: null, svnAuthor: null, svnRemoved: false, preview: null },
+      ],
+    })
+    expect(n.detail).toContain('Code/A.cs（SVN 上 r66464 liuhao 改过）')
+    expect(n.detail).toContain('Code/G.cs（SVN 上已删除）')
+    expect(n.detail).toMatch(/· Code\/X\.cs\n/)
+    expect(n.detail).toContain('<<<<<<< 新基线（SVN）\nnew\n=======\nmine\n>>>>>>> 你的提交')
+    // 旧后端没有 details：照原样列文件名
+    const old = describeFollowOutcome({
+      kind: 'needsManual',
+      at: 'c'.repeat(40),
+      files: ['Code/A.cs'],
+      baselinePublished: true,
+      leaks: [],
+      staleDisk: false,
+    })
+    expect(old.detail).toContain('Code/A.cs')
+    expect(old.detail).not.toContain('SVN 上 r')
+  })
+
+  it('6.7：冲突框说清点了取消之后从哪里回来，按钮名照实写', () => {
+    for (const staleDisk of [false, true]) {
+      const n = describeFollowOutcome({
+        kind: 'needsManual',
+        at: 'c'.repeat(40),
+        files: ['Code/A.cs'],
+        baselinePublished: true,
+        leaks: [],
+        staleDisk,
+      })
+      // 确认框的取消按钮写的是 Cancel（ConfirmDialog），文案要对得上
+      expect(n.detail).toContain('「Cancel」')
+      expect(n.detail).toContain('横幅上的「跟进」')
+    }
   })
 
   it('6.10：手动跟进会直接采用基线的快照内容，动手之前列出来', () => {
