@@ -3,6 +3,7 @@ import {
   auditIsDue,
   SVN_AUDIT_MIN_GAP_MS,
   SVN_AUDIT_POLL_MS,
+  SVN_TRAILING_RECHECK_MS,
   describeAudit,
   describeEolMigration,
   describeMissingBaseline,
@@ -14,6 +15,7 @@ import {
   shouldMarkOnBlur,
   syncBannerIsSuppressed,
   syncIfRootRevChanged,
+  syncIfRootRevOrWcDbChanged,
   syncIfWcDbChanged,
   wcDbStampsChanged,
   type EolStatus,
@@ -575,6 +577,199 @@ describe('syncIfWcDbChanged', () => {
     )
     expect(memo.value).toEqual([a])
     expect(wcDbStampsChanged(memo.value, [disk])).toBe(true)
+  })
+})
+
+describe('syncIfRootRevOrWcDbChanged（6.11：文件变动时也比 wc.db）', () => {
+  const a: WcDbStamp = { wcRoot: 'C:/wc', mtimeNs: '1', size: 1 }
+  const a2: WcDbStamp = { ...a, mtimeNs: '2' }
+  const counter = () => {
+    let n = 0
+    return {
+      run: async () => {
+        n += 1
+      },
+      get count() {
+        return n
+      },
+    }
+  }
+
+  it('只更新子目录：根 revision 不变、wc.db 变了，也要跑第二档', async () => {
+    const root: RootRevMemo = { value: 'wc=7' }
+    const wc: WcDbStampMemo = { value: [a] }
+    const full = counter()
+
+    const ran = await syncIfRootRevOrWcDbChanged(root, wc, async () => 'wc=7', async () => [a2], full.run)
+
+    expect(ran).toBe(true)
+    expect(full.count).toBe(1)
+    expect(wc.value).toEqual([a2])
+    expect(root.value).toBe('wc=7')
+  })
+
+  it('两样都没变：一次校验都不发（存盘是高频事件）', async () => {
+    const root: RootRevMemo = { value: 'wc=7' }
+    const wc: WcDbStampMemo = { value: [a] }
+    const full = counter()
+
+    expect(await syncIfRootRevOrWcDbChanged(root, wc, async () => 'wc=7', async () => [{ ...a }], full.run)).toBe(false)
+    expect(full.count).toBe(0)
+  })
+
+  it('根 revision 变了照旧跑，两份观测值都记下', async () => {
+    const root: RootRevMemo = { value: 'wc=7' }
+    const wc: WcDbStampMemo = { value: [a] }
+    const full = counter()
+
+    expect(await syncIfRootRevOrWcDbChanged(root, wc, async () => 'wc=8', async () => [a2], full.run)).toBe(true)
+    expect(root.value).toBe('wc=8')
+    expect(wc.value).toEqual([a2])
+  })
+
+  it('校验失败两份都不记：下一次事件重试', async () => {
+    const root: RootRevMemo = { value: 'wc=7' }
+    const wc: WcDbStampMemo = { value: [a] }
+
+    await expect(
+      syncIfRootRevOrWcDbChanged(root, wc, async () => 'wc=8', async () => [a2], async () => {
+        throw new Error('wc locked')
+      }),
+    ).rejects.toThrow('wc locked')
+
+    expect(root.value).toBe('wc=7')
+    expect(wc.value).toEqual([a])
+  })
+
+  it('读 wc.db 戳失败：退回只看根 revision，戳的记录不动', async () => {
+    const root: RootRevMemo = { value: 'wc=7' }
+    const wc: WcDbStampMemo = { value: [a] }
+    const boom = async (): Promise<WcDbStamp[]> => {
+      throw new Error('stat failed')
+    }
+    const full = counter()
+
+    expect(await syncIfRootRevOrWcDbChanged(root, wc, async () => 'wc=7', boom, full.run)).toBe(false)
+    expect(full.count).toBe(0)
+
+    expect(await syncIfRootRevOrWcDbChanged(root, wc, async () => 'wc=8', boom, full.run)).toBe(true)
+    expect(full.count).toBe(1)
+    expect(root.value).toBe('wc=8')
+    expect(wc.value).toEqual([a])
+  })
+
+  it('记的是开跑之前读到的戳：校验期间 wc.db 又写了一笔，尾随复查还会判不等', async () => {
+    const root: RootRevMemo = { value: 'wc=7' }
+    const wc: WcDbStampMemo = { value: [a] }
+    let disk = a2
+    const a3: WcDbStamp = { ...a, mtimeNs: '3' }
+
+    await syncIfRootRevOrWcDbChanged(root, wc, async () => 'wc=7', async () => [disk], async () => {
+      disk = a3
+    })
+    expect(wc.value).toEqual([a2])
+
+    const full = counter()
+    expect(await syncIfRootRevOrWcDbChanged(root, wc, async () => 'wc=7', async () => [disk], full.run)).toBe(true)
+    expect(full.count).toBe(1)
+  })
+
+  it('读根 revision 失败：只按戳判断，根的记录不动', async () => {
+    const root: RootRevMemo = { value: 'wc=7' }
+    const wc: WcDbStampMemo = { value: [a] }
+    const boom = async (): Promise<string> => {
+      throw new Error('svn info failed')
+    }
+    const full = counter()
+
+    expect(await syncIfRootRevOrWcDbChanged(root, wc, boom, async () => [a], full.run)).toBe(false)
+    expect(await syncIfRootRevOrWcDbChanged(root, wc, boom, async () => [a2], full.run)).toBe(true)
+    expect(full.count).toBe(1)
+    expect(root.value).toBe('wc=7')
+    expect(wc.value).toEqual([a2])
+  })
+
+  it('两样都读不到：抛错，什么都不记', async () => {
+    const root: RootRevMemo = { value: 'wc=7' }
+    const wc: WcDbStampMemo = { value: [a] }
+    await expect(
+      syncIfRootRevOrWcDbChanged(
+        root,
+        wc,
+        async () => {
+          throw new Error('svn info failed')
+        },
+        async () => {
+          throw new Error('stat failed')
+        },
+        async () => undefined,
+      ),
+    ).rejects.toThrow('svn info failed')
+    expect(root.value).toBe('wc=7')
+    expect(wc.value).toEqual([a])
+  })
+
+  it('review 第 1 条：先开跑的被顶替、后开跑的失败，两份记录都不能推进', async () => {
+    const root: RootRevMemo = { value: 'wc=7' }
+    const wc: WcDbStampMemo = { value: [a] }
+
+    // X 读到最终戳 a2，开跑；T（尾随复查）在 X 回来之前也开跑，成为最新的一次
+    // 两边都等「第二档已开跑」再往下走，不靠数微任务
+    let finishX!: (wrote: boolean) => void
+    let xStarted!: () => void
+    const xRunning = new Promise<void>((res) => {
+      xStarted = res
+    })
+    const x = syncIfRootRevOrWcDbChanged(root, wc, async () => 'wc=7', async () => [a2], () =>
+      new Promise<boolean>((res) => {
+        finishX = res
+        xStarted()
+      }),
+    )
+    let failT!: (err: Error) => void
+    let tStarted!: () => void
+    const tRunning = new Promise<void>((res) => {
+      tStarted = res
+    })
+    const t = syncIfRootRevOrWcDbChanged(root, wc, async () => 'wc=7', async () => [a2], () =>
+      new Promise<boolean>((_, rej) => {
+        failT = rej
+        tStarted()
+      }),
+    )
+    await Promise.all([xRunning, tRunning])
+
+    finishX(false) // 被 T 顶替，结论没写回
+    expect(await x).toBe(true)
+    failT(new Error('sqlite busy'))
+    await expect(t).rejects.toThrow('sqlite busy')
+
+    expect(root.value).toBe('wc=7')
+    expect(wc.value).toEqual([a])
+    // 之后不管哪个通道再来，都还会跑第二档：焦点检测
+    const focus = counter()
+    expect(await syncIfWcDbChanged({ value: wc.value }, async () => [a2], focus.run)).toBe(true)
+    expect(focus.count).toBe(1)
+    // 文件变动 / 尾随复查
+    const full = counter()
+    expect(await syncIfRootRevOrWcDbChanged(root, wc, async () => 'wc=7', async () => [a2], full.run)).toBe(true)
+    expect(full.count).toBe(1)
+  })
+
+  it('被顶替时焦点检测与 recordAfterSuccess 也不记', async () => {
+    const wc: WcDbStampMemo = { value: [a] }
+    expect(await syncIfWcDbChanged(wc, async () => [a2], async () => false)).toBe(true)
+    expect(wc.value).toEqual([a])
+
+    const root: RootRevMemo = { value: 'wc=7' }
+    expect(await recordAfterSuccess(root, 'wc=8', async () => false)).toBe(false)
+    expect(root.value).toBe('wc=7')
+    expect(await syncIfRootRevChanged(root, async () => 'wc=8', async () => false)).toBe(true)
+    expect(root.value).toBe('wc=7')
+  })
+
+  it('尾随复查的间隔比 watcher 的去抖长', () => {
+    expect(SVN_TRAILING_RECHECK_MS).toBeGreaterThan(300)
   })
 })
 

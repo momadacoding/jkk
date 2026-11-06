@@ -8,8 +8,10 @@ import {
   markOnBlur,
   recordAfterSuccess,
   syncIfRootRevChanged,
+  syncIfRootRevOrWcDbChanged,
   syncIfWcDbChanged,
   SVN_AUDIT_POLL_MS,
+  SVN_TRAILING_RECHECK_MS,
   type EolStatus,
   type RootRevMemo,
   type ServerAudit,
@@ -881,8 +883,13 @@ export function useRepoStore() {
     }
   }
 
-  /** 第二档本身：完整的 `nodeRevs` 校验（spec §6.6.3）。纯本地读，不碰观测值。 */
-  const applySvnSync = async (path: string) => {
+  /**
+   * 第二档本身：完整的 `nodeRevs` 校验（spec §6.6.3）。纯本地读，不碰观测值。
+   *
+   * 返回结论有没有写回：被更晚发起的一次顶替、或仓库已切走时是 `false`，调用方据此不记观测值
+   * （见 `FullCheck`）。
+   */
+  const applySvnSync = async (path: string): Promise<boolean> => {
     // 只认最后发起的一次：焦点与 repo-changed 都会发起，先发起的那次看到的是更旧的工作副本，
     // 晚到时不能把 ExternallyAdvanced 盖回 InSync，失焦快照就是拿这个结论当前提的
     const token = refreshGate.begin('svnSync')
@@ -903,13 +910,14 @@ export function useRepoStore() {
       }
       throw err
     }
-    if (!refreshGate.isLatest(token, 'svnSync')) return
+    if (!refreshGate.isLatest(token, 'svnSync')) return false
     // `samePath` 守卫（第 71 条）：读的过程中用户可能已经切到别的仓库，旧仓库的结论
     // 写过去就是一条错的失同步横幅。`latestVerdict` 必须**同步**写（见 `openedPath`），
     // 所以按 ref 核对；state 照 `refreshSvnSyncState` 的写法在 updater 里再核对一次
-    if (!samePath(openedPath.current ?? '', path)) return
+    if (!samePath(openedPath.current ?? '', path)) return false
     latestVerdict.current = st.verdict.kind
     setState((s) => (samePath(s.path ?? '', path) ? { ...s, svnSync: st } : s))
+    return true
   }
 
   /** 给一次校验记数，从它读第一档的输入开始，到结论写回为止。 */
@@ -930,24 +938,42 @@ export function useRepoStore() {
    * 顺带把观测到的 rootRevs 记下来当基准——不记的话下一次刷新会因为
    * `lastRootRevs` 还是 `null` 而再跑一次全量。**先读 revision 再跑校验**，
    * 而且只在校验成功后才记，理由见 `recordAfterSuccess`。
+   *
+   * 不记 wc.db 戳：打开仓库后第一次存盘，文件变动检测看到戳的记录是空的，会多跑一次第二档。
+   * 只多一次，已知代价（6.11 review 第 4 条，见实现日志）。返回结论有没有写回。
    */
-  const refreshSvnSync = (path: string) =>
+  const refreshSvnSyncReporting = (path: string) =>
     trackSvnCheck(async () => {
       const observed = await readRootRevs(path)
-      await recordAfterSuccess(lastRootRevs.current, observed, () => applySvnSync(path))
+      return recordAfterSuccess(lastRootRevs.current, observed, () => applySvnSync(path))
     })
+  /** 对外的入口不关心写没写回，签名保持 `Promise<void>`。 */
+  const refreshSvnSync = async (path: string): Promise<void> => {
+    await refreshSvnSyncReporting(path)
+  }
 
   /**
-   * 第一档（O(1)）：rootRev 与**上次观测值**比，变了才跑第二档。
+   * 第一档：rootRev 或 wc.db 戳与**上次观测值**比，变了才跑第二档。
+   *
+   * wc.db 那一半是事故分析 6.11：只更新子目录时根 revision 不动，原来要等下一次焦点才挂出「跟进」。
+   * 与焦点检测共用 `lastWcDbStamps`：两边记的都是「最近一次写回了结论的校验开跑之前的戳」，
+   * 失焦快照按它判断。
+   *
+   * 单飞（6.11 review 第 2 条）：外部更新进行中 wc.db 一直在变，每个事件都并发起一轮的话会叠起
+   * 多个秒级的 `svn status`，还和 TortoiseSVN 抢 wc.db 的锁。在跑时再来的只补跑一次。
    *
    * 返回是否真的跑了第二档，只为让调用方能读懂日志；调用方不依赖它。
    */
   const checkSvnSyncIfChanged = (path: string) =>
-    trackSvnCheck(() =>
-      syncIfRootRevChanged(
-        lastRootRevs.current,
-        () => readRootRevs(path),
-        () => applySvnSync(path),
+    refreshFlights.run(`svnCheck:${path}`, () =>
+      trackSvnCheck(() =>
+        syncIfRootRevOrWcDbChanged(
+          lastRootRevs.current,
+          lastWcDbStamps.current,
+          () => readRootRevs(path),
+          () => svnWcDbStamps(path),
+          () => applySvnSync(path),
+        ),
       ),
     )
 
@@ -976,7 +1002,7 @@ export function useRepoStore() {
       syncIfWcDbChanged(
         lastWcDbStamps.current,
         () => svnWcDbStamps(path),
-        () => refreshSvnSync(path),
+        () => refreshSvnSyncReporting(path),
       ),
     )
 
@@ -1336,6 +1362,8 @@ export function useRepoEffects(
     // 换仓库时仍会重新注册。`listen` 是一次 IPC 往返，清理时它可能还没回来：回来之后立刻注销，
     // 否则每换一次就多挂一个监听器（同 `useExternalToolExit`）
     let disposed = false
+    // 尾随复查（事故分析 6.11）：wc.db 的最后一笔写入没有文件事件，见 `SVN_TRAILING_RECHECK_MS`
+    let trailing: number | undefined
     listen<string>('repo-changed', (event) => {
       const path = state.path!
       // 事件是全局广播的，每个标签只认自己那个仓库的变更
@@ -1370,6 +1398,10 @@ export function useRepoEffects(
       // 第二档还是每次都跑——分层白做。
       if (state.capabilities.vcs === 'svn') {
         void checkSvnSyncIfChanged(path).catch(ignore)
+        window.clearTimeout(trailing)
+        trailing = window.setTimeout(() => {
+          if (!disposed) void checkSvnSyncIfChanged(path).catch(ignore)
+        }, SVN_TRAILING_RECHECK_MS)
         // 同步状态也要跟着刷（2026-09-25 独立 review）。只在打开仓库时读一次的话：
         // 另一个进程开始或结束的同步永远不会出现 / 永远不会消失；更糟的是，
         // 打开那一刻若恰好读到 `locked: true`，`otherBannersAreSuppressed` 会把
@@ -1386,6 +1418,7 @@ export function useRepoEffects(
     })
     return () => {
       disposed = true
+      window.clearTimeout(trailing)
       unlisten?.()
     }
   }, [state.path, state.capabilities.vcs])
