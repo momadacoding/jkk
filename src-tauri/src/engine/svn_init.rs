@@ -20,7 +20,10 @@ use crate::engine::svn_config::{
     normalize_whitelist_entry, write_config, DisabledGitignore, SvnConfig, BASELINE_BRANCH,
     RESPECT_GITIGNORE_VERSION, SVN_GIT_MODE,
 };
-use crate::engine::svn_dirty::{classify, explained_paths, read_dirty, Fix};
+use crate::engine::svn_dirty::{
+    classify, explained_paths, read_dirty, replaced_without_history,
+    replaced_without_history_paths, Fix,
+};
 use crate::engine::svn_exclude::{generate_exclude, write_exclude};
 use crate::engine::svn_externals::{detect_pinned, PinnedExternal};
 use crate::engine::svn_gitignore::{
@@ -703,6 +706,17 @@ fn record_server_tree_timed(
     Ok((tree, touched))
 }
 
+/// `path` 自己或最近的一个祖先在 `replaced` 里时返回它。
+fn replaced_at_or_above<'a>(path: &str, replaced: &'a BTreeSet<String>) -> Option<&'a str> {
+    let mut cur = path;
+    loop {
+        if let Some(r) = replaced.get(cur) {
+            return Some(r.as_str());
+        }
+        cur = &cur[..cur.rfind('/')?];
+    }
+}
+
 /// R2b 的逐条改写：脏条目换成服务器 rN 的内容，或从候选索引里剔除。
 fn rewrite_to_server(
     repo_root: &str,
@@ -711,10 +725,16 @@ fn rewrite_to_server(
     fixes: &std::collections::BTreeMap<String, Fix>,
     touched: &BTreeSet<String>,
 ) -> Result<()> {
+    let replaced = replaced_without_history_paths(&pre.dirty);
     for (path, fix) in fixes {
         if !touched.contains(path) {
             // 不归 git 管，树里本来就没有它。见上面「`S` 必须恰好」。
             continue;
+        }
+        // 事故分析 6.2：它自己或某个祖先是不带历史的替换，服务器上的旧内容取不到。文件走 TakeBase
+        // 会撞 E200009；目录底下重新加的子文件走 Drop 会静默少录（PR 116 遗留）。两种都在这里停下
+        if let Some(root) = replaced_at_or_above(path, &replaced) {
+            return Err(replaced_without_history(path, root));
         }
         match fix {
             Fix::TakeBase => match cat_base(repo_root, path)? {

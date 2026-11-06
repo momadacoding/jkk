@@ -2044,6 +2044,25 @@ fn a_file_replaced_by_a_copy_is_refused_instead_of_recorded_with_the_copy_source
 }
 
 #[test]
+fn a_replaced_file_git_does_not_track_neither_blocks_init_nor_the_baseline_check() {
+    // 6.2 独立 review H1：白名单目录里替换过的 `.png` 不归 git 管（扩展名只有 `.cs`），原来录制时
+    // 直接跳过。在分类里一刀切地拒绝的话，初始化、同步 S7、交付 D7a 都会被它挡住，后两者此时
+    // SVN 已经写过了；只读的体检也一样
+    let fx = svn_repo();
+    let wc = fx.wc();
+    std::fs::write(wc.join("Code/icon.png"), "png1\n").unwrap();
+    svn(&wc, &["add", "Code/icon.png"]);
+    svn(&wc, &["commit", "-m", "icon", "--non-interactive"]);
+    svn(&wc, &["update", "--non-interactive"]);
+    svn(&wc, &["rm", "Code/icon.png"]);
+    std::fs::write(wc.join("Code/icon.png"), "png2\n").unwrap();
+    svn(&wc, &["add", "Code/icon.png"]);
+
+    init_hybrid(&req(&fx)).unwrap_or_else(|e| panic!("{}: {}", e.code, e.message));
+    check_current_baseline(&fx.wc_str()).unwrap_or_else(|e| panic!("{}: {}", e.code, e.message));
+}
+
+#[test]
 fn a_directory_replaced_without_history_is_refused_not_recorded_without_its_files() {
     // PR 116 遗留：`svn rm D; mkdir D; svn add D`。D 底下重新加的同名文件 schedule 是 `add`，
     // 单看它会被摘出基线，可服务器上旧的 D 里有它：静默少录一个服务器上的文件

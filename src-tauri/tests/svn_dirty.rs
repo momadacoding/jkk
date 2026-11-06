@@ -9,7 +9,7 @@
 #[path = "common/svn_fixtures.rs"]
 mod svn_fixtures;
 
-use app_lib::engine::svn_dirty::{classify, Fix};
+use app_lib::engine::svn_dirty::{classify, replaced_without_history_paths, Fix};
 use app_lib::engine::svn_xml::StatusEntry;
 
 /// 一个**已提交过**的节点（`revision="1"`、不是复制来的）。
@@ -52,8 +52,9 @@ fn every_svn_status_item_maps_to_exactly_one_outcome() {
     for (item, want) in [
         // 磁盘上的不是服务器内容（或磁盘上根本没有）→ 取服务器那一版
         ("modified", Some(Fix::TakeBase)),
-        // `replaced` 不在这张表里：不带历史的离线取不到旧内容，一律停下（事故分析 6.2），
-        // 带历史的按复制子树判，见下面几条
+        // 不带历史的 `replaced` 照旧是 TakeBase：要不要停下由录制器按「归不归 git 管」判
+        // （事故分析 6.2，`replaced_without_history_paths`）；带历史的按复制子树判，见下面几条
+        ("replaced", Some(Fix::TakeBase)),
         ("conflicted", Some(Fix::TakeBase)),
         ("deleted", Some(Fix::TakeBase)),
         ("missing", Some(Fix::TakeBase)),
@@ -294,46 +295,42 @@ fn everything_under_a_directory_replaced_by_a_copy_is_refused() {
 }
 
 #[test]
-fn a_replaced_node_without_history_is_refused() {
-    // 事故分析 6.2：`svn rm` 后同名 `svn add`（不带历史）：`revision="1"`、没有 copied。
-    // 服务器 rN 上有旧内容，但 `svn cat -r BASE` 报 E200009，离线取不到。原来走 TakeBase，
-    // 停在 `svn_baseline_classification_conflict`；选定的做法是在分类时就明确拒绝，说清怎么办，
-    // 不为它破例联网
-    for e in [
+fn replaced_nodes_without_history_are_listed_for_the_recorder() {
+    // 事故分析 6.2：`svn rm` 后同名 `svn add`（不带历史）：`revision="1"`、没有 copied。服务器 rN
+    // 上有旧内容，但 `svn cat -r BASE` 报 E200009。分类不拒绝（独立 review H1：它不知道归不归
+    // git 管），只把它们列出来，由录制器对归 git 管的路径停下
+    let entries = [
         node("Code/A.cs", "replaced", Some(1), false),
-        entry("Code/A.cs", "replaced"),
-    ] {
-        let err = classify(&[e]).unwrap_err();
-        assert_eq!(
-            err.code, "svn_dirty_replaced_without_history",
-            "实际：{}",
-            err.message
-        );
-        assert!(err.message.contains("Code/A.cs"), "{}", err.message);
-        assert!(err.message.contains("提交"), "{}", err.message);
-        assert!(err.message.contains("还原"), "{}", err.message);
-    }
+        node("Code/D", "replaced", Some(1), false),
+        node("Code/D/x.cs", "added", Some(-1), false),
+        node("Code/M.cs", "modified", Some(1), false),
+    ];
+    let got: Vec<String> = replaced_without_history_paths(&entries)
+        .into_iter()
+        .collect();
+    assert_eq!(got, vec!["Code/A.cs".to_string(), "Code/D".to_string()]);
+    assert!(classify(&entries).is_ok(), "分类本身照常");
 }
 
 #[test]
-fn files_under_a_directory_replaced_without_history_are_refused_not_dropped() {
-    // PR 116 遗留：`svn rm D; mkdir D; svn add D`。D 底下的同名文件是 `added`、schedule `add`，
-    // 单看它会被摘掉，可服务器上旧的 D 里有它。D 自己是不带历史的 replaced，整个停下
-    let err = classify(&[
-        node("Code/D", "replaced", Some(1), false),
-        node("Code/D/x.cs", "added", Some(-1), false),
-    ])
-    .unwrap_err();
-    assert_eq!(err.code, "svn_dirty_replaced_without_history");
-    assert!(err.message.contains("Code/D"), "{}", err.message);
+fn a_replaced_node_with_history_is_not_listed() {
+    // 带历史的由 classify 按复制根处理（报 svn_dirty_replaced_with_history），不重复列
+    let entries = [node("Code/A.cs", "replaced", None, true)];
+    assert!(replaced_without_history_paths(&entries).is_empty());
+}
 
-    // 子节点排在前面也一样：结果是整个出错，不会只摘掉子节点
-    let err = classify(&[
-        node("Code/D/x.cs", "added", Some(-1), false),
-        node("Code/D", "replaced", Some(1), false),
-    ])
-    .unwrap_err();
-    assert_eq!(err.code, "svn_dirty_replaced_without_history");
+#[test]
+fn an_svn_rm_then_add_inside_a_copied_directory_is_dropped_with_the_copy() {
+    // 6.2 独立 review 实测：`svn cp Code/Y Code/C; svn rm --force Code/C/y.cs; …; svn add Code/C/y.cs`。
+    // C 是 `added copied`，y.cs 是 `replaced revision="-1"`、没有 copied 标记。服务器上根本没有 C，
+    // 应当随复制根一起摘掉，不能报「服务器上这个位置有旧内容」
+    let entries = [
+        node("Code/C", "added", None, true),
+        node("Code/C/y.cs", "replaced", Some(-1), false),
+    ];
+    let got = classify(&entries).unwrap();
+    assert_eq!(got.get("Code/C/y.cs"), Some(&Fix::Drop), "实际：{got:?}");
+    assert!(replaced_without_history_paths(&entries).is_empty());
 }
 
 #[test]
