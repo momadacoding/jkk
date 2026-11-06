@@ -22,6 +22,8 @@ const report: FollowReport = {
   removed: [],
   dropped: [],
   rewritten: [],
+  snapshot: [],
+  drift: [],
   stage: { decisions: {}, uncertain: [], lost: [], discarded: [] },
   movedBranches: [],
   behindBranches: [],
@@ -106,6 +108,33 @@ describe('describeFollowReport', () => {
     expect(s.groups[0].items[0]).toContain('work')
     expect(s.groups[0].items[0]).toContain('加日志')
     expect(m.tone).toBe('attention')
+  })
+
+  it('6.8：泄漏按判定分两档，并写明不影响这次跟进', () => {
+    const sure: Leak = { ...leak, path: 'Code/S.cs', hunks: [{ oldStart: 1, lines: 1, verdict: 'present' }] }
+    const m = describeFollowReport({ ...report, leaks: [sure, leak] })
+    const s = m.sections.find((x) => x.id === 'leaks')!
+    expect(s.groups.map((g) => g.label)).toEqual(['这些改动已确认在 SVN 上', '拿不准'])
+    expect(s.groups[0].items[0]).toContain('Code/S.cs')
+    expect(s.groups[1].items[0]).toContain('Code/L.cs')
+    expect(s.note).toContain('不影响这次跟进')
+    expect(s.note).toContain('其他分支')
+    expect(s.note).not.toContain('请检查')
+  })
+
+  it('6.8：冲突框里的泄漏同样分两档，说清不拦手动跟进', () => {
+    const sure: Leak = { ...leak, path: 'Code/S.cs', hunks: [{ oldStart: 1, lines: 1, verdict: 'present' }] }
+    const n = describeFollowOutcome({
+      kind: 'needsManual',
+      at: 'c'.repeat(40),
+      files: ['Code/A.cs'],
+      baselinePublished: true,
+      leaks: [sure, leak],
+      staleDisk: false,
+    })
+    expect(n.detail).toContain('已确认在 SVN 上')
+    expect(n.detail).toContain('拿不准')
+    expect(n.detail).toContain('不拦手动跟进')
   })
 
   it('要用户留意的节排在最前：列表很长时不能被文件清单压到看不见', () => {
@@ -199,6 +228,42 @@ describe('describeFollowReport', () => {
     expect(rewritten.items).toEqual(['Code/A.cs', 'Code/B.cs'])
     // 这两节只是告知
     expect(describeFollowReport(r).tone).toBe('ok')
+  })
+
+  it('6.10：快照进来的 SVN 内容单独成节，要用户看一眼', () => {
+    const r: FollowReport = { ...report, snapshot: [['f'.repeat(40), ['Code/B.cs']]] }
+    const s = section(r, 'snapshot')!
+    expect(s.warn).toBe(false)
+    expect(s.groups[0].label).toContain('f'.repeat(10))
+    expect(s.groups[0].items).toEqual(['Code/B.cs'])
+    expect(s.note).toContain('逐字节相同')
+    expect(s.note).toContain('有意')
+    // 可能把用户故意停住的旧版本换掉了：不能只是「完成」
+    expect(describeFollowReport(r).tone).toBe('attention')
+  })
+
+  it('PR 119 遗留：重放后与磁盘对不上的文件是警告，排在文件清单前面', () => {
+    const r: FollowReport = {
+      ...report,
+      drift: ['Code/A.cs'],
+      changes: [{ path: 'Code/B.cs', rev: 4, author: 'x' }],
+    }
+    const m = describeFollowReport(r)
+    const s = section(r, 'drift')!
+    expect(s.warn).toBe(true)
+    expect(s.groups[0].items).toEqual(['Code/A.cs'])
+    expect(s.note).toContain('磁盘')
+    expect(m.tone).toBe('attention')
+    expect(m.sections.findIndex((x) => x.id === 'drift')).toBeLessThan(
+      m.sections.findIndex((x) => x.id === 'changes'),
+    )
+  })
+
+  it('旧后端没有这两个字段时照常描述', () => {
+    const old = { ...report } as Partial<FollowReport>
+    delete old.snapshot
+    delete old.drift
+    expect(() => describeFollowReport(old as FollowReport)).not.toThrow()
   })
 
   it('移动的分支只是告知，落后的分支要说原因', () => {
@@ -323,6 +388,77 @@ describe('describeFollowOutcome', () => {
     expect(n.detail).toContain('Local-Only')
     expect(n.detail).toContain('Code/L.cs')
     expect(n.detail).toContain('加日志')
+  })
+
+  it('6.5：冲突框给出每个文件在 SVN 上是谁、哪个 revision 改的，以及冲突那几行', () => {
+    const n = describeFollowOutcome({
+      kind: 'needsManual',
+      at: 'c'.repeat(40),
+      files: ['Code/A.cs', 'Code/G.cs', 'Code/X.cs'],
+      baselinePublished: true,
+      leaks: [],
+      staleDisk: false,
+      details: [
+        {
+          path: 'Code/A.cs',
+          svnRev: 66464,
+          svnAuthor: 'liuhao',
+          svnRemoved: false,
+          preview: '<<<<<<< 新基线（SVN）\nnew\n=======\nmine\n>>>>>>> 你的提交',
+        },
+        { path: 'Code/G.cs', svnRev: null, svnAuthor: null, svnRemoved: true, preview: null },
+        { path: 'Code/X.cs', svnRev: null, svnAuthor: null, svnRemoved: false, preview: null },
+      ],
+    })
+    expect(n.detail).toContain('Code/A.cs（SVN 上 r66464 liuhao 改过）')
+    expect(n.detail).toContain('Code/G.cs（SVN 上已删除）')
+    expect(n.detail).toMatch(/· Code\/X\.cs\n/)
+    expect(n.detail).toContain('<<<<<<< 新基线（SVN）\nnew\n=======\nmine\n>>>>>>> 你的提交')
+    // 旧后端没有 details：照原样列文件名
+    const old = describeFollowOutcome({
+      kind: 'needsManual',
+      at: 'c'.repeat(40),
+      files: ['Code/A.cs'],
+      baselinePublished: true,
+      leaks: [],
+      staleDisk: false,
+    })
+    expect(old.detail).toContain('Code/A.cs')
+    expect(old.detail).not.toContain('SVN 上 r')
+  })
+
+  it('6.7：冲突框说清点了取消之后从哪里回来，按钮名照实写', () => {
+    for (const staleDisk of [false, true]) {
+      const n = describeFollowOutcome({
+        kind: 'needsManual',
+        at: 'c'.repeat(40),
+        files: ['Code/A.cs'],
+        baselinePublished: true,
+        leaks: [],
+        staleDisk,
+      })
+      // 确认框的取消按钮写的是 Cancel（ConfirmDialog），文案要对得上
+      expect(n.detail).toContain('「Cancel」')
+      expect(n.detail).toContain('横幅上的「跟进」')
+    }
+  })
+
+  it('6.10：手动跟进会直接采用基线的快照内容，动手之前列出来', () => {
+    const base = {
+      kind: 'needsManual' as const,
+      at: 'c'.repeat(40),
+      files: ['Code/A.cs'],
+      baselinePublished: true,
+      leaks: [],
+      staleDisk: false,
+    }
+    const n = describeFollowOutcome({ ...base, snapshot: [['f'.repeat(40), ['Code/B.cs']]] })
+    expect(n.detail).toContain('Code/B.cs（ffffffffff）')
+    expect(n.detail).toContain('直接采用新基线的版本')
+    expect(n.detail).toContain('有意')
+    // 旧后端没有这个字段、或者没有命中：不出这一段
+    expect(describeFollowOutcome(base).detail).not.toContain('逐字节相同')
+    expect(describeFollowOutcome({ ...base, snapshot: [] }).detail).not.toContain('逐字节相同')
   })
 
   it('磁盘上还是旧分支内容（Review 3 第 2 条）：不说冲突，说清只移分支会造出回退', () => {

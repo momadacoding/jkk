@@ -68,7 +68,13 @@ pub enum ReplayOutcome {
         rewritten: Vec<(String, Vec<String>)>,
     },
     /// 在原 commit `at` 处冲突。什么都没有发布——重放只建了对象。
-    Conflict { at: String, files: Vec<String> },
+    Conflict {
+        at: String,
+        files: Vec<String>,
+        /// merge-tree 写出的冲突树：冲突文件里带着冲突标记。只是对象，没有 ref 指着；
+        /// 给冲突框取预览用（事故分析 6.5）。
+        tree: String,
+    },
 }
 
 /// 交付用：不换任何路径。
@@ -190,10 +196,11 @@ pub fn replay_onto(
         };
         let tree = match merge(repo, &cur, parent, &theirs, c, codes)? {
             Merged::Clean(t) => t,
-            Merged::Conflict(files) => {
+            Merged::Conflict { files, tree } => {
                 return Ok(ReplayOutcome::Conflict {
                     at: c.oid.clone(),
                     files,
+                    tree,
                 })
             }
         };
@@ -358,12 +365,58 @@ fn ls_entries(
     Ok(found)
 }
 
+/// 给手动跟进的 rebase 用的 C'（事故分析 6.10）：C 里 `paths` 的条目换回 C^ 的，挂在原来的 C^ 上，
+/// 作者与 message 取自 C。rebase pick 它时以 C^ 为合并基础，得到的就是「C 的改动减去这些路径」，
+/// 与对象层重放里 merge-tree 看到的 theirs 完全一样。`paths` 里 C 没改过的不算；一条都没换时原样
+/// 返回 C。
+pub fn commit_without(
+    repo: &str,
+    c: &ReplayCommit,
+    paths: &BTreeSet<String>,
+    codes: &ReplayCodes,
+) -> Result<String> {
+    let parent = single_parent(c, codes)?;
+    if paths.is_empty() {
+        return Ok(c.oid.clone());
+    }
+    let swaps = swaps_for(repo, c, parent, paths, codes)?;
+    if swaps.is_empty() {
+        return Ok(c.oid.clone());
+    }
+    let tree = c_prime_tree(repo, c, &swaps, codes)?;
+    commit_like(repo, &tree, parent, &c.oid)
+}
+
 /// 构造 C'：临时索引读入 C，把 swaps 写成 C^ 的条目，`write-tree` 后挂在 C^ 上（W19）。
 /// C' 只给 merge-tree 当 theirs，元数据无所谓；最终 commit 的元数据仍取自原 C。
 fn c_prime(
     repo: &str,
     c: &ReplayCommit,
     parent: &str,
+    swaps: &[Swap],
+    codes: &ReplayCodes,
+) -> Result<String> {
+    let tree = c_prime_tree(repo, c, swaps, codes)?;
+    let oid = run_git(
+        repo,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            parent,
+            "-m",
+            "mygitclient: replay C'",
+        ],
+    )?
+    .trim()
+    .to_string();
+    Ok(oid)
+}
+
+/// C 的树把 swaps 写成 C^ 的条目之后的树。
+fn c_prime_tree(
+    repo: &str,
+    c: &ReplayCommit,
     swaps: &[Swap],
     codes: &ReplayCodes,
 ) -> Result<String> {
@@ -385,27 +438,14 @@ fn c_prime(
     }
     run_git_stdin_env(repo, &["update-index", "-z", "--index-info"], &input, &env)?;
     let tree = run_git_env(repo, &["write-tree"], &env)?.trim().to_string();
-    let oid = run_git(
-        repo,
-        &[
-            "commit-tree",
-            &tree,
-            "-p",
-            parent,
-            "-m",
-            "mygitclient: replay C'",
-        ],
-    )?
-    .trim()
-    .to_string();
     // `idx` 在这里离开作用域被删；上面任何一步 `?` 早退也一样
     drop(idx);
-    Ok(oid)
+    Ok(tree)
 }
 
 enum Merged {
     Clean(String),
-    Conflict(Vec<String>),
+    Conflict { files: Vec<String>, tree: String },
 }
 
 fn merge(
@@ -427,7 +467,11 @@ fn merge(
         0 => Ok(Merged::Clean(
             out.split('\0').next().unwrap_or("").trim().to_string(),
         )),
-        1 => Ok(Merged::Conflict(conflict_files(&out))),
+        // 冲突时第一个字段同样是树：冲突文件以带冲突标记的内容写在里面
+        1 => Ok(Merged::Conflict {
+            files: conflict_files(&out),
+            tree: out.split('\0').next().unwrap_or("").trim().to_string(),
+        }),
         // 129 = 用法错误：多半是 git 太旧，不认识 --merge-base
         129 => Err(GitError::new(codes.too_old, codes.too_old_message)),
         _ => Err(GitError::new(

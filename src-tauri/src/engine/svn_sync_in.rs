@@ -17,7 +17,7 @@
 //! 结束后再补发一次 `repo-changed`（`commands/svn_sync.rs`）。
 
 use crate::engine::file_lock::{describe, find_blockers};
-use crate::engine::git_cli::{run_git, run_git_code, run_git_env};
+use crate::engine::git_cli::{run_git, run_git_code, run_git_env, run_git_stdin};
 use crate::engine::svn_baseline::{
     create_baseline_commit, git_dir, move_baseline_ref, read_baseline, refresh_index_stat,
     swap_index_to_tree, TempIndex,
@@ -558,21 +558,98 @@ pub(crate) fn from_baseline_ready(
     //   残留若是基线的字节，就悄悄撤掉了用户提交过的内容，而结局报 Done；
     // - `rebase.updateRefs=true` 会顺手移动指向被重放区间的其它分支。
     // 与 `--empty=drop` 同一个原则：不依赖默认值，也不依赖用户配置
-    match run_git(
+    let ran = if j.rebase_todo.is_empty() {
+        run_git(
+            repo,
+            &[
+                "-c",
+                "rebase.autoStash=false",
+                "-c",
+                "rebase.updateRefs=false",
+                "rebase",
+                "--empty=drop",
+                &new_base,
+            ],
+        )
+    } else {
+        rebase_with_todo(repo, &new_base, &j.rebase_todo)
+    };
+    match ran {
+        Ok(_) => finish_forward(repo, j),
+        // rebase 根本没开始：不是冲突，也不是 git 的报错，「继续」只会拿同一份列表再失败一次
+        Err(e) if e.code == REBASE_TODO_LOST => Err(e),
+        Err(e) => conflict_or_error(repo, e),
+    }
+}
+
+/// 手动跟进事先准备的 C' 已被 gc 清掉（见 [`rebase_with_todo`]）。
+const REBASE_TODO_LOST: &str = "svn_follow_manual_todo_lost";
+
+/// 手动跟进的 S9：按事先算好的列表逐个 pick（事故分析 6.10，`svn_follow::snapshot_todo`）。
+///
+/// 用 `rebase -i` 换掉 todo，而不是自己 cherry-pick：继续、放弃、冲突出口都还是 `git rebase` 的
+/// 那套状态机，下游一行不用改。todo 经 `GIT_SEQUENCE_EDITOR` 写入，内容放环境变量：git 把编辑器命令
+/// 交给 sh，todo 文件路径由 git 自己作为参数传给它，我们不拼任何路径进命令行（仓库路径可能含空格、
+/// 中文，Windows 上还有代码页问题）。环境变量的优先级高于 `sequence.editor` 配置。
+///
+/// 钉住的配置：`missingCommitsCheck=ignore`，原 commit 不在 todo 里是故意的，用户配成 `error` 时
+/// rebase 会拒绝；`autoSquash=false`，免得 `fixup!` commit 在我们写 todo 之前被挪动；另外两项同上。
+fn rebase_with_todo(repo: &str, new_base: &str, todo: &[String]) -> Result<String> {
+    let mut list = String::new();
+    let mut oids = String::new();
+    for oid in todo {
+        // 分支上全是快照内容：什么都不 pick，分支落到新基线上
+        if oid == crate::engine::svn_follow::NOOP {
+            list.push_str("noop\n");
+            continue;
+        }
+        // 只放 OID：todo 里的说明文字随用户配置变，pick 只认 OID
+        if oid.len() != 40 || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(GitError::new(
+                "sync_in_rebase_failed",
+                format!("内部错误：待重放列表里不是一个完整 OID：`{oid}`。基线已经推进，记录保留，可以点「放弃」。"),
+            ));
+        }
+        list.push_str("pick ");
+        list.push_str(oid);
+        list.push('\n');
+        oids.push_str(oid);
+        oids.push('\n');
+    }
+    // C' 没有 ref 指着：记录搁置太久又碰上 gc 时会被清掉。在 rebase 开始之前查，免得它停在半路
+    // （独立 review 第 9 条）。这时什么都还没动，HEAD 仍在原分支上
+    let check = run_git_stdin(repo, &["cat-file", "--batch-check"], oids.as_bytes())?;
+    if check.lines().any(|l| l.ends_with(" missing")) {
+        return Err(GitError::new(
+            REBASE_TODO_LOST,
+            "手动跟进事先准备好的提交已经被 git 清理掉了（记录搁置太久）。分支没动，未提交的改动收在备份里：\
+             点「放弃」会把它们放回来，然后再点一次「跟进」重新开始。",
+        ));
+    }
+    run_git_env(
         repo,
         &[
             "-c",
             "rebase.autoStash=false",
             "-c",
             "rebase.updateRefs=false",
+            "-c",
+            "rebase.missingCommitsCheck=ignore",
+            "-c",
+            "rebase.autoSquash=false",
             "rebase",
+            "-i",
             "--empty=drop",
-            &new_base,
+            new_base,
         ],
-    ) {
-        Ok(_) => finish_forward(repo, j),
-        Err(e) => conflict_or_error(repo, e),
-    }
+        &[
+            (
+                "GIT_SEQUENCE_EDITOR",
+                "printf '%s' \"$MYGITCLIENT_REBASE_TODO\" >",
+            ),
+            ("MYGITCLIENT_REBASE_TODO", &list),
+        ],
+    )
 }
 
 /// rebase 非零退出：真冲突就停在冲突态（正常出口），否则按命令错误处理（§7.3.2 末）。

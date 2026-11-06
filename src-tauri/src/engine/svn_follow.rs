@@ -74,9 +74,10 @@ use crate::engine::svn_lock;
 use crate::engine::svn_nodes::{compute_map, read_node_status, NodeStatus};
 use crate::engine::svn_preflight::run_preflight_with;
 use crate::engine::svn_replay::{
-    all_committed, commits_between, replay_onto, ReplayCodes, ReplayCommit, ReplayOpts,
-    ReplayOutcome,
+    all_committed, commit_without, commits_between, replay_onto, ReplayCodes, ReplayCommit,
+    ReplayOpts, ReplayOutcome,
 };
+use crate::engine::svn_snapshot::SnapshotRule;
 use crate::engine::svn_sync::{
     check_sync_with_nodes, read_baseline_map, tree_files, ExternalChange, SyncVerdict,
 };
@@ -148,6 +149,12 @@ pub enum FollowOutcome {
         /// 重放没冲突，但分支落后、磁盘上还是旧 HEAD 的内容（见 [`stale_disk_paths`]）：对象层跟进
         /// 只移 HEAD，「本地改动」会变成把 SVN 的内容改回去（Review 3 第 2 条）。
         stale_disk: bool,
+        /// 手动跟进时会直接采用新基线版本的快照内容（事故分析 6.10，独立 review 第 2 条）：在用户点
+        /// 「手动跟进」之前告诉他，有意停住的旧版本会被换掉。
+        snapshot: PathsByCommit,
+        /// 每个冲突文件的上下文（事故分析 6.5）：SVN 上是谁、在哪个 revision 改的，冲突那几行的预览。
+        /// 与 `files` 同序；`stale_disk` 时为空。
+        details: Vec<ConflictDetail>,
     },
     /// 什么都没动：前置条件不满足，或者准备阶段失败。
     Refused {
@@ -168,8 +175,16 @@ pub struct FollowReport {
     pub removed: Vec<String>,
     /// 变空丢弃的原 commit（「已全部提交」捷径收掉的也在内）。
     pub dropped: Vec<String>,
-    /// (原 commit, 换成 SVN 版本的路径)。
+    /// (原 commit, 换成 SVN 版本的路径)：F2 ①，我自己提交到 SVN 的。
     pub rewritten: Vec<(String, Vec<String>)>,
+    /// (原 commit, 换成 SVN 版本的路径)：内容与比分支基线更新的某个基线逐字节相同，是快照进来的
+    /// SVN 内容（事故分析 6.10，[`SnapshotRule`]）。与 `rewritten` 不重复。
+    #[serde(default)]
+    pub snapshot: Vec<(String, Vec<String>)>,
+    /// 重放后与磁盘对不上的文件：磁盘是 SVN 的版本（= 新基线），分支 tip 却是别的内容，或者把 SVN
+    /// 已删的文件带了回来。多半是重放干净却合错了（W14；PR 119 遗留）。只告警，不拦。
+    #[serde(default)]
+    pub drift: Vec<String>,
     pub stage: ComposeReport,
     /// 移动过的其他分支。当前分支不在内。
     pub moved_branches: Vec<String>,
@@ -221,17 +236,8 @@ pub fn follow(repo: &str, opid: &str) -> Result<FollowOutcome> {
         };
         fault::reach(fault::Point::Prepared, None);
         // 分支跟进入口上重放冲突：基线本来就在那里，没有要发布的东西
-        if let (
-            true,
-            Target::Conflict {
-                at,
-                files,
-                leaks,
-                stale_disk,
-            },
-        ) = (plan.old_base == plan.new_base, &plan.target)
-        {
-            return Ok(needs_manual(at, files, leaks, *stale_disk));
+        if let (true, Target::Conflict(m)) = (plan.old_base == plan.new_base, &plan.target) {
+            return Ok(needs_manual(m));
         }
         // 同步锁活到 publish 返回：冲突出口这种提前返回也在 Drop 里放掉
         let _lock = match svn_lock::acquire(repo, opid) {
@@ -298,14 +304,32 @@ fn refused(e: GitError) -> FollowOutcome {
     }
 }
 
-fn needs_manual(at: &str, files: &[String], leaks: &[Leak], stale_disk: bool) -> FollowOutcome {
+fn needs_manual(m: &ManualNeeded) -> FollowOutcome {
     FollowOutcome::NeedsManual {
-        at: at.to_string(),
-        files: files.to_vec(),
+        at: m.at.clone(),
+        files: m.files.clone(),
         baseline_published: true,
-        leaks: leaks.to_vec(),
-        stale_disk,
+        leaks: m.leaks.clone(),
+        stale_disk: m.stale_disk,
+        snapshot: m.snapshot.clone(),
+        details: m.details.clone(),
     }
+}
+
+/// 冲突框里一个冲突文件的上下文（事故分析 6.5）。11-05 那次要手工跑 git log / svn log / svn cat
+/// 才看清冲突是什么。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictDetail {
+    pub path: String,
+    /// SVN 上最后一次改它的 revision 与作者（跟进录基线时读到的）。本次外部变更里没有它时为 `None`。
+    pub svn_rev: Option<u64>,
+    pub svn_author: Option<String>,
+    /// SVN 上把它删了。
+    pub svn_removed: bool,
+    /// 第一处冲突块，标签换成人话，每一侧最多 [`PREVIEW_SIDE_LINES`] 行（见 [`preview_of`]）。二进制、太大、没有冲突标记（如修改与删除
+    /// 撞上）时为 `None`。
+    pub preview: Option<String>,
 }
 
 /// 手动跟进（分析 §6.5；计划 Task 13）：对象层重放冲突时的兜底，需要人来判断，所以**只由用户显式
@@ -355,6 +379,7 @@ pub fn manual_follow(repo: &str, opid: &str) -> Result<SyncInOutcome> {
     require_changes_in_whitelist(repo, &cfg.whitelist)?;
 
     let floor = read_base_map(repo, &scope)?.floor;
+    let rebase_todo = snapshot_todo(repo, &scope, &head, &base)?;
     let mut j = Journal {
         opid: opid.to_string(),
         flow: Flow::FollowManual,
@@ -365,6 +390,7 @@ pub fn manual_follow(repo: &str, opid: &str) -> Result<SyncInOutcome> {
         baseline_rev_before: Some(floor),
         baseline_oid_before: Some(scope),
         new_baseline_oid: Some(base),
+        rebase_todo,
         ..Default::default()
     };
     svn_journal::write(repo, &j)?;
@@ -372,6 +398,86 @@ pub fn manual_follow(repo: &str, opid: &str) -> Result<SyncInOutcome> {
     fault::reach(fault::Point::ManualStashed, None);
     // S8 在这里不切分支（HEAD 一直在原分支上），只做复核；S9 重放到 `newBaselineOid`
     from_baseline_ready(repo, &cfg, &mut j)
+}
+
+/// 手动跟进的 rebase 要逐个 pick 的 commit（事故分析 6.10，方案 §3）。
+///
+/// rebase 原样 pick 分支上的 commit，快照进来的 SVN 内容会和新基线撞上：对象层重放已经把它们换成了
+/// SVN 版本，手动跟进不跟着换的话，11-05 那 35 个冲突在磁盘上又回来了。这里为命中的 commit 造 C'
+/// （[`commit_without`]），其余照用原 commit。一个都没命中时返回空，S9 照原样 `rebase <新基线>`。
+///
+/// 整个 commit 都是快照内容时（C' 的树等于 C^ 的树、原 C 本来不空），不放进列表（独立 review 第 3 条）：
+/// rebase 会保留「一开始就为空」的 commit，`--empty=drop` 只丢重放后才变空的，分支上就会留下一个空的
+/// 「svn up 之后整包提交」，与对象层把它记成 `dropped` 不一致。一个都不剩时列表是 [`NOOP`]。
+///
+/// 列表放在环境变量里交给 rebase（见 `svn_sync_in::rebase_with_todo`）。放不下时（[`too_many_for_todo`]）
+/// 退回原样 rebase，并记日志（独立 review 第 9 条）。
+fn snapshot_todo(repo: &str, scope: &str, head: &str, new: &str) -> Result<Vec<String>> {
+    let commits = commits_between(repo, scope, head, &FOLLOW_CODES)?;
+    if too_many_for_todo(commits.len()) {
+        log::warn!(
+            "待重放的 commit 有 {} 个，环境变量放不下，手动跟进按原样 rebase（快照内容不按基线走）",
+            commits.len()
+        );
+        return Ok(Vec::new());
+    }
+    let rule = SnapshotRule::new(repo, new);
+    let mut any = false;
+    let mut todo = Vec::with_capacity(commits.len());
+    for c in &commits {
+        let hits = rule.paths(scope, c);
+        let oid = commit_without(repo, c, &hits, &FOLLOW_CODES)?;
+        if oid == c.oid {
+            todo.push(oid);
+            continue;
+        }
+        any = true;
+        let trees = run_git(
+            repo,
+            &[
+                "rev-parse",
+                &format!("{oid}^{{tree}}"),
+                &format!("{oid}^^{{tree}}"),
+            ],
+        )?;
+        let mut t = trees.lines();
+        // C' 换过路径所以原 C 一定改过东西；C' 再与父提交同树就是整个变空了
+        if t.next() != t.next() {
+            todo.push(oid);
+        }
+    }
+    if !any {
+        return Ok(Vec::new());
+    }
+    if todo.is_empty() {
+        return Ok(vec![NOOP.to_string()]);
+    }
+    Ok(todo)
+}
+
+/// 待重放列表里「什么都不 pick」的那一行：分支上的 commit 全是快照内容。
+pub(crate) const NOOP: &str = "noop";
+
+/// 待重放列表放不进一个环境变量（Windows 约 32K 字符，每行 `pick <40 位 OID>\n` 46 个字符）。
+/// 按分支上的 commit 数判，[`snapshot_todo`] 与 [`manual_snapshot`] 用同一个判据：冲突框说「会直接
+/// 采用新基线」，手动跟进就一定是那样做的（第 2 轮 review 低危第 2 条）。
+fn too_many_for_todo(commits: usize) -> bool {
+    commits * 46 > 30_000
+}
+
+/// 冲突出口告诉用户的：手动跟进时哪些 commit 里的哪些路径会直接采用新基线（方案 §3）。
+/// 与 [`snapshot_todo`] 用同一条规则；内容本来就等于 NEW 的不列（见 [`SnapshotRule::reported_paths`]）。
+fn manual_snapshot(commits: &[ReplayCommit], rule: &SnapshotRule, scope: &str) -> PathsByCommit {
+    if too_many_for_todo(commits.len()) {
+        return Vec::new();
+    }
+    commits
+        .iter()
+        .filter_map(|c| {
+            let p = rule.reported_paths(scope, c);
+            (!p.is_empty()).then(|| (c.oid.clone(), p.into_iter().collect()))
+        })
+        .collect()
 }
 
 /// S1 的 stash 只收白名单，rebase 却要求整个工作区干净，白名单外的已跟踪改动放过去就是 stash 完才
@@ -413,12 +519,18 @@ enum Target {
     /// 当前分支要移到的 NEW_TIP。
     Tip(String),
     /// 当前分支重放冲突（或磁盘上还是旧内容，`stale_disk`），只发布基线。
-    Conflict {
-        at: String,
-        files: Vec<String>,
-        leaks: Vec<Leak>,
-        stale_disk: bool,
-    },
+    Conflict(ManualNeeded),
+}
+
+/// 交给手动跟进的现场，字段见 [`FollowOutcome::NeedsManual`]。
+struct ManualNeeded {
+    at: String,
+    files: Vec<String>,
+    leaks: Vec<Leak>,
+    stale_disk: bool,
+    /// 手动跟进会按 6.10 直接采用新基线版本的路径，见 [`manual_snapshot`]。
+    snapshot: PathsByCommit,
+    details: Vec<ConflictDetail>,
 }
 
 struct Plan {
@@ -892,6 +1004,13 @@ fn prepare(repo: &str) -> Result<Plan> {
             BTreeSet::new()
         }
     };
+    // 6.10：快照进来的 SVN 内容按基线走。规则按分支自己的基线算，其他分支在 `plan_other` 里另拼
+    let snapshot = SnapshotRule::new(repo, &new_base);
+    let current = |c: &ReplayCommit| -> BTreeSet<String> {
+        let mut p = superseded(c);
+        p.extend(snapshot.paths(&scope, c));
+        p
+    };
 
     let map_floor = read_base_map(repo, &new_base)?.floor;
     let mut report = FollowReport {
@@ -912,29 +1031,26 @@ fn prepare(repo: &str) -> Result<Plan> {
     let mut memo = BTreeMap::new();
     let commits = commits_between(repo, &scope, &old_head, &FOLLOW_CODES)?;
     let replayed = replay_branch(
-        repo,
-        &scope,
-        &old_head,
-        &new_base,
-        &commits,
-        &superseded,
-        &mut memo,
+        repo, &scope, &old_head, &new_base, &commits, &current, &mut memo,
     )?;
     let stale = match &replayed {
         Replayed::Moved { tip, .. } => stale_disk_paths(repo, &scope, &old_base, &old_head, tip)?,
         Replayed::Conflict { .. } => Vec::new(),
     };
     let (target, others) = match replayed {
-        Replayed::Conflict { at, files } => {
+        Replayed::Conflict { at, files, tree } => {
             // F3 也要算：分支没重放，但补丁可能已经上了服务器，用户要在手动跟进之前知道
             let leaks = local_only_leaks(repo, &branch, &commits, &paths, &new_base)?;
+            let details = conflict_details(repo, &files, &tree, &ext);
             (
-                Target::Conflict {
+                Target::Conflict(ManualNeeded {
                     at,
                     files,
                     leaks,
                     stale_disk: false,
-                },
+                    snapshot: manual_snapshot(&commits, &snapshot, &scope),
+                    details,
+                }),
                 Vec::new(),
             )
         }
@@ -942,12 +1058,14 @@ fn prepare(repo: &str) -> Result<Plan> {
         Replayed::Moved { .. } if !stale.is_empty() => {
             let leaks = local_only_leaks(repo, &branch, &commits, &paths, &new_base)?;
             (
-                Target::Conflict {
+                Target::Conflict(ManualNeeded {
                     at: old_head.clone(),
                     files: stale,
                     leaks,
                     stale_disk: true,
-                },
+                    snapshot: manual_snapshot(&commits, &snapshot, &scope),
+                    details: Vec::new(),
+                }),
                 Vec::new(),
             )
         }
@@ -957,7 +1075,14 @@ fn prepare(repo: &str) -> Result<Plan> {
             rewritten,
         } => {
             report.dropped = dropped;
-            report.rewritten = rewritten;
+            let (snap, own) = split_snapshot(rewritten, &commits, &superseded, &snapshot, &scope);
+            report.rewritten = own;
+            report.snapshot = snap;
+            // 只是告警：核对本身出错（文件被独占锁住之类）不能让跟进失败（review 第 6 条）
+            report.drift = drift_paths(repo, &new_base, &tip, &paths).unwrap_or_else(|e| {
+                log::warn!("核对重放结果与磁盘时出错，跳过：{}", e.message);
+                Vec::new()
+            });
             // F3：按原始 commit 算，不受 F2 ① 换路径影响。手动跟进不拦，只告警（§6.12 条件 8 管自动）
             report.leaks = local_only_leaks(repo, &branch, &commits, &paths, &new_base)?;
             let others = plan_others(
@@ -968,6 +1093,7 @@ fn prepare(repo: &str) -> Result<Plan> {
                     new_base: &new_base,
                     paths: &paths,
                     superseded: &superseded,
+                    snapshot: &snapshot,
                 },
                 &mut memo,
                 &mut report,
@@ -1103,6 +1229,237 @@ fn stale_disk_paths(
     Ok(stale)
 }
 
+/// (原 commit, 路径) 的列表，报告里 `rewritten` / `snapshot` 的形状。
+type PathsByCommit = Vec<(String, Vec<String>)>;
+
+/// 把重放换过的路径按来源分开：(6.10 快照内容, F2 ① 我自己提交到 SVN 的)。两条规则都命中的
+/// 算 F2 ①：那是我自己的提交，「你已经提交到了 SVN」比「多半是快照」更准。
+fn split_snapshot(
+    rewritten: PathsByCommit,
+    commits: &[ReplayCommit],
+    f2: &dyn Fn(&ReplayCommit) -> BTreeSet<String>,
+    rule: &SnapshotRule,
+    scope: &str,
+) -> (PathsByCommit, PathsByCommit) {
+    let mut snap = Vec::new();
+    let mut own = Vec::new();
+    for (oid, paths) in rewritten {
+        let (hits, reported, mine) = match commits.iter().find(|c| c.oid == oid) {
+            Some(c) => (rule.paths(scope, c), rule.reported_paths(scope, c), f2(c)),
+            None => (BTreeSet::new(), BTreeSet::new(), BTreeSet::new()),
+        };
+        let mut s = Vec::new();
+        let mut o = Vec::new();
+        for p in paths {
+            if mine.contains(&p) || !hits.contains(&p) {
+                o.push(p);
+            } else if reported.contains(&p) {
+                s.push(p);
+            }
+            // 其余：快照命中、且 commit 里的内容本来就与 NEW 相同，换不换都一样，不报（review 第 7 条）
+        }
+        if !s.is_empty() {
+            snap.push((oid.clone(), s));
+        }
+        if !o.is_empty() {
+            own.push((oid, o));
+        }
+    }
+    (snap, own)
+}
+
+/// 冲突预览里每一侧（新基线 / 共同的旧版本 / 你的提交）最多几行。按侧限，不按总行数限（6.5 review M1：
+/// SVN 那一侧一长，「你的提交」就整段看不到了）。冲突框是给人扫一眼的，完整内容在手动跟进时由合并工具给。
+pub const PREVIEW_SIDE_LINES: usize = 6;
+/// 单行最多几个字符：minified 的 JSON / JS 一行就能有几百 KB。
+pub const PREVIEW_LINE_CHARS: usize = 200;
+/// 预览最多给几个冲突文件：11-05 那次有 37 个，全取既慢又没人看。按取成功的计（review L1）。
+const PREVIEW_FILES: usize = 5;
+/// 最多尝试几个文件：前面的都是二进制或修改与删除撞上时，后面的文本冲突也要有机会。
+const PREVIEW_TRIES: usize = 10;
+/// 超过这个大小的冲突文件不读预览。
+const PREVIEW_MAX_BYTES: u64 = 512 * 1024;
+
+/// 每个冲突文件的上下文（事故分析 6.5）。SVN 侧的作者与 revision 来自这次录基线时的外部变更清单，
+/// 不额外跑 svn；预览来自 merge-tree 的冲突树，只读 git 对象。预览读失败只是没有预览。
+fn conflict_details(
+    repo: &str,
+    files: &[String],
+    tree: &str,
+    ext: &External,
+) -> Vec<ConflictDetail> {
+    let mut shown = 0;
+    files
+        .iter()
+        .enumerate()
+        .map(|(i, path)| {
+            let change = ext.changes.iter().find(|c| &c.path == path);
+            let preview = if shown < PREVIEW_FILES && i < PREVIEW_TRIES {
+                conflict_preview(repo, tree, path)
+            } else {
+                None
+            };
+            if preview.is_some() {
+                shown += 1;
+            }
+            ConflictDetail {
+                path: path.clone(),
+                svn_rev: change.map(|c| c.rev).filter(|r| *r > 0),
+                svn_author: change.and_then(|c| c.author.clone()),
+                svn_removed: ext.removed.contains(path),
+                preview,
+            }
+        })
+        .collect()
+}
+
+/// 冲突树里 `path` 的第一处冲突块（见 [`preview_of`]）。先问大小再读（review L2：二进制冲突时树里
+/// 留的是整份原文件，Unity 资源能有几百 MB）。不是 UTF-8 的（国内 Unity 工程里 GBK 的 `.cs` 常见）
+/// 照样给，开头说一句可能是乱码（review L3）。
+fn conflict_preview(repo: &str, tree: &str, path: &str) -> Option<String> {
+    let spec = format!("{tree}:{path}");
+    let size: u64 = run_git(repo, &["cat-file", "-s", &spec])
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    if size > PREVIEW_MAX_BYTES {
+        return None;
+    }
+    let bytes = run_git_bytes(repo, &["cat-file", "blob", &spec]).ok()?;
+    if bytes.contains(&0) {
+        return None;
+    }
+    match std::str::from_utf8(&bytes) {
+        Ok(text) => preview_of(text),
+        Err(_) => preview_of(&String::from_utf8_lossy(&bytes))
+            .map(|p| format!("（不是 UTF-8 编码，中文可能显示为乱码）\n{p}")),
+    }
+}
+
+/// 文本里第一处冲突块，标签换成人话。merge-tree 的标签是 OID；重放时「我们这边」是新基线（第 2 个及
+/// 以后的 commit 冲突时还含着你之前已重放的提交），「他们那边」是被重放的 commit，与 rebase 的方向相同
+/// （11-05 用户用外部合并工具时就弄反过）。
+///
+/// 每一侧最多 [`PREVIEW_SIDE_LINES`] 行，多出的写「…（还有 N 行）」；分隔线与 `>>>>>>> 你的提交` 总是在。
+/// 单行截到 [`PREVIEW_LINE_CHARS`] 个字符。没有冲突标记时为 `None`。
+pub fn preview_of(text: &str) -> Option<String> {
+    fn flush(out: &mut Vec<String>, side: &mut Vec<String>) {
+        let n = side.len();
+        out.extend(side.drain(..).take(PREVIEW_SIDE_LINES));
+        if n > PREVIEW_SIDE_LINES {
+            out.push(format!("…（还有 {} 行）", n - PREVIEW_SIDE_LINES));
+        }
+    }
+    fn clip(line: &str) -> String {
+        if line.chars().count() <= PREVIEW_LINE_CHARS {
+            return line.to_string();
+        }
+        let mut s: String = line.chars().take(PREVIEW_LINE_CHARS).collect();
+        s.push('…');
+        s
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut side: Vec<String> = Vec::new();
+    let mut inside = false;
+    for raw in text.lines() {
+        let line = raw.trim_end_matches('\r');
+        if !inside {
+            if line.starts_with("<<<<<<<") {
+                inside = true;
+                out.push("<<<<<<< 新基线（SVN）".to_string());
+            }
+            continue;
+        }
+        if line.starts_with("|||||||") {
+            flush(&mut out, &mut side);
+            out.push("||||||| 共同的旧版本".to_string());
+        } else if line == "=======" {
+            flush(&mut out, &mut side);
+            out.push("=======".to_string());
+        } else if line.starts_with(">>>>>>>") {
+            flush(&mut out, &mut side);
+            out.push(">>>>>>> 你的提交".to_string());
+            return Some(out.join("\n"));
+        } else {
+            side.push(clip(line));
+        }
+    }
+    if !inside {
+        return None;
+    }
+    // 没有收尾标记（文件被截断之类）：有多少给多少
+    flush(&mut out, &mut side);
+    Some(out.join("\n"))
+}
+
+/// 对象层跟进重放后，分支 tip 与磁盘对不上的文件（方案 §4；PR 119 遗留）。
+///
+/// 只看本次外部变更改过的路径（`external`，`scope..NEW`）里 tip 与 NEW 不同的。磁盘等于 NEW 的
+/// 版本，说明 SVN 对这个文件没有本地修改（磁盘 = BASE = NEW），我的 commit 里对它的改动要么已经在
+/// SVN 上、要么不在磁盘上了，正确的 tip 应当等于 NEW；tip 却是别的内容，就是合错了。tip 有、NEW 与
+/// 磁盘都没有的，是被带回来的 SVN 已删文件。磁盘是别的内容（我还没交给 SVN 的改动）时判断不了，
+/// 不报。符号链接、子模块不判。磁盘内容按 `git add` 的过滤规则算（同 [`stale_disk_paths`]）。
+fn drift_paths(
+    repo: &str,
+    new: &str,
+    tip: &str,
+    external: &BTreeSet<String>,
+) -> Result<Vec<String>> {
+    if new == tip || external.is_empty() {
+        return Ok(Vec::new());
+    }
+    // raw 格式：`:<旧 mode> <新 mode> <旧 oid> <新 oid> <状态>` NUL `<路径>` NUL；旧 = NEW，新 = tip
+    let raw = run_git(repo, &["diff-tree", "-r", "-z", "--no-renames", new, tip])?;
+    let mut drift = Vec::new();
+    let mut to_hash: Vec<(String, String)> = Vec::new();
+    let mut fields = raw.split('\0').filter(|f| !f.is_empty());
+    while let (Some(meta), Some(path)) = (fields.next(), fields.next()) {
+        if !external.contains(path) {
+            continue;
+        }
+        let meta: Vec<&str> = meta.trim_start_matches(':').split(' ').collect();
+        let (Some(mode), Some(new_oid), Some(tip_oid), Some(status)) =
+            (meta.first(), meta.get(2), meta.get(3), meta.get(4))
+        else {
+            continue;
+        };
+        // 只差 mode（filemode=false 下提交过 `--chmod=+x`）：内容没对不上，不报（review 第 5 条）
+        if new_oid == tip_oid {
+            continue;
+        }
+        let on_disk = Path::new(repo).join(path).symlink_metadata();
+        if status.starts_with('A') {
+            // NEW 里没有、tip 里有：磁盘上也没有就是被带回来的
+            if on_disk.is_err() {
+                drift.push(path.to_string());
+            }
+        } else if (*mode == "100644" || *mode == "100755")
+            && on_disk.map(|m| m.is_file()).unwrap_or(false)
+        {
+            to_hash.push((path.to_string(), new_oid.to_string()));
+        }
+    }
+    if !to_hash.is_empty() {
+        let input: String = to_hash.iter().map(|(p, _)| format!("{p}\n")).collect();
+        let out = run_git_stdin(repo, &["hash-object", "--stdin-paths"], input.as_bytes())?;
+        let disk: Vec<&str> = out.lines().map(str::trim).collect();
+        if disk.len() != to_hash.len() {
+            return Err(GitError::new(
+                "svn_follow_hash_failed",
+                "核对磁盘内容时 git hash-object 的输出行数对不上。这次什么都没动，请再点一次「跟进」。",
+            ));
+        }
+        for ((p, new_oid), d) in to_hash.iter().zip(disk) {
+            if d == new_oid {
+                drift.push(p.clone());
+            }
+        }
+    }
+    drift.sort();
+    Ok(drift)
+}
+
 enum Replayed {
     Moved {
         tip: String,
@@ -1112,6 +1469,8 @@ enum Replayed {
     Conflict {
         at: String,
         files: Vec<String>,
+        /// merge-tree 的冲突树，见 [`ReplayOutcome::Conflict`]。
+        tree: String,
     },
 }
 
@@ -1163,7 +1522,7 @@ fn replay_branch(
             dropped,
             rewritten,
         },
-        ReplayOutcome::Conflict { at, files } => Replayed::Conflict { at, files },
+        ReplayOutcome::Conflict { at, files, tree } => Replayed::Conflict { at, files, tree },
     })
 }
 
@@ -1258,7 +1617,9 @@ struct OthersCtx<'a> {
     prev_base: Option<&'a str>,
     new_base: &'a str,
     paths: &'a BTreeSet<String>,
+    /// F2 ①。6.10 的快照规则按各分支自己的基线算，见 `snapshot`。
     superseded: &'a dyn Fn(&ReplayCommit) -> BTreeSet<String>,
+    snapshot: &'a SnapshotRule<'a>,
 }
 
 /// 其他分支（分析 §6.11.3）。范围是包含旧基线的本地分支；跳过当前分支、任何 worktree 里是
@@ -1315,18 +1676,15 @@ fn plan_other(
     if !leaks.is_empty() {
         report.leaks.extend(leaks);
         return Ok(Err(
-            "分支上的 Local-Only 补丁可能被一起提交到了 SVN，不自动移动".to_string(),
+            "分支上的 Local-Only 补丁里有改动已经或可能出现在 SVN 上，不自动移动".to_string(),
         ));
     }
-    let replayed = replay_branch(
-        repo,
-        &own,
-        &b.oid,
-        ctx.new_base,
-        &commits,
-        ctx.superseded,
-        memo,
-    );
+    let sup = |c: &ReplayCommit| -> BTreeSet<String> {
+        let mut p = (ctx.superseded)(c);
+        p.extend(ctx.snapshot.paths(&own, c));
+        p
+    };
+    let replayed = replay_branch(repo, &own, &b.oid, ctx.new_base, &commits, &sup, memo);
     match replayed {
         Ok(Replayed::Moved {
             tip,
@@ -1338,14 +1696,21 @@ fn plan_other(
                     report.dropped.push(d);
                 }
             }
-            for r in rewritten {
+            let (snap, own_rewritten) =
+                split_snapshot(rewritten, &commits, ctx.superseded, ctx.snapshot, &own);
+            for r in own_rewritten {
                 if !report.rewritten.contains(&r) {
                     report.rewritten.push(r);
                 }
             }
+            for r in snap {
+                if !report.snapshot.contains(&r) {
+                    report.snapshot.push(r);
+                }
+            }
             Ok(Ok(tip))
         }
-        Ok(Replayed::Conflict { at, files }) => Ok(Err(format!(
+        Ok(Replayed::Conflict { at, files, .. }) => Ok(Err(format!(
             "重放 {} 时冲突：{}",
             &at[..at.len().min(10)],
             files.join("、")
@@ -1529,12 +1894,7 @@ fn publish(repo: &str, opid: &str, plan: Plan) -> Result<FollowOutcome> {
         // 当前分支冲突：只发布基线，等用户手动跟进。快照留着，这条分支还没跟上
         svn_journal::remove(repo)?;
         return Ok(match target {
-            Target::Conflict {
-                at,
-                files,
-                leaks,
-                stale_disk,
-            } => needs_manual(&at, &files, &leaks, stale_disk),
+            Target::Conflict(m) => needs_manual(&m),
             Target::Tip(_) => unreachable!("tip 取自 target"),
         });
     };

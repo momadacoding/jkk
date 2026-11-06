@@ -968,7 +968,7 @@ fn externally_advanced_serializes_camel_case() {
 fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     // 计划 Task 10。三层嵌套（Outcome → Report → Leak / ComposeReport），每一层都要是 camelCase；
     // 只测 Refused 的话，变体字段与结构体字段的 serde 属性写错都测不到
-    use app_lib::engine::svn_follow::{Evidence, FollowOutcome, FollowReport};
+    use app_lib::engine::svn_follow::{ConflictDetail, Evidence, FollowOutcome, FollowReport};
     use app_lib::engine::svn_follow_index::{ComposeReport, StageDecision};
     use app_lib::engine::svn_leak::{HunkLeak, Leak, LeakVerdict};
     use app_lib::engine::svn_sync::ExternalChange;
@@ -990,6 +990,14 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
             }],
         }],
         stale_disk: true,
+        snapshot: vec![("s1".into(), vec!["Code/B.cs".into()])],
+        details: vec![ConflictDetail {
+            path: "Code/A.cs".into(),
+            svn_rev: Some(7),
+            svn_author: Some("li".into()),
+            svn_removed: false,
+            preview: Some("<<<<<<< 新基线（SVN）".into()),
+        }],
     })
     .unwrap();
     assert_eq!(
@@ -1007,6 +1015,14 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
                 "hunks": [{ "oldStart": 3, "lines": 1, "verdict": "unknown" }],
             }],
             "staleDisk": true,
+            "snapshot": [["s1", ["Code/B.cs"]]],
+            "details": [{
+                "path": "Code/A.cs",
+                "svnRev": 7,
+                "svnAuthor": "li",
+                "svnRemoved": false,
+                "preview": "<<<<<<< 新基线（SVN）",
+            }],
         })
     );
 
@@ -1040,6 +1056,8 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
             removed: vec!["Code/Old.cs".into()],
             dropped: vec!["c1".into()],
             rewritten: vec![("c2".into(), vec!["Code/A.cs".into()])],
+            snapshot: vec![("c3".into(), vec!["Code/B.cs".into()])],
+            drift: vec!["Code/E.cs".into()],
             stage: ComposeReport {
                 decisions,
                 uncertain: vec!["Code/B.cs".into()],
@@ -1080,6 +1098,8 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     assert_eq!(r["removed"][0], "Code/Old.cs");
     assert_eq!(r["dropped"][0], "c1");
     assert_eq!(r["rewritten"][0], serde_json::json!(["c2", ["Code/A.cs"]]));
+    assert_eq!(r["snapshot"][0], serde_json::json!(["c3", ["Code/B.cs"]]));
+    assert_eq!(r["drift"][0], "Code/E.cs");
     assert_eq!(r["movedBranches"][0], "feature");
     assert_eq!(r["behindBranches"][0], serde_json::json!(["old", "冲突"]));
     assert_eq!(r["pinnedRef"], "refs/mygitclient/follow/x", "实际 {v}");
@@ -1089,11 +1109,15 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     let mut old = r.clone();
     old.as_object_mut().unwrap().remove("evidence");
     old.as_object_mut().unwrap().remove("evidenceCutoffMs");
+    // 6.10 之前的 journal 也没有 snapshot / drift
+    old.as_object_mut().unwrap().remove("snapshot");
+    old.as_object_mut().unwrap().remove("drift");
     let back: FollowReport = serde_json::from_value(old).unwrap();
     assert_eq!(
         (back.evidence, back.evidence_cutoff_ms),
         (Evidence::Heuristic, None)
     );
+    assert!(back.snapshot.is_empty() && back.drift.is_empty());
 
     let s = &r["stage"];
     assert_eq!(s["decisions"]["Code/A.cs"], "takeNew", "实际 {v}");

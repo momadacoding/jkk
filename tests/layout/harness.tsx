@@ -99,6 +99,8 @@ function Follow() {
     removed: paths(100),
     dropped: [],
     rewritten: [],
+    snapshot: [['f'.repeat(40), paths(100)]],
+    drift: paths(100),
     stage: { decisions: {}, uncertain: paths(100), lost: paths(100), discarded: [] },
     movedBranches: [],
     behindBranches: [],

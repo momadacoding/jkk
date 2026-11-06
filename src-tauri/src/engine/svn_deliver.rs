@@ -137,7 +137,7 @@ fn replay(
     };
     match replay_onto(repo, onto, picks, &opts, &mut BTreeMap::new())? {
         ReplayOutcome::Done { tip, .. } => Ok(tip),
-        ReplayOutcome::Conflict { at, files } => {
+        ReplayOutcome::Conflict { at, files, .. } => {
             let c = picks.iter().find(|c| c.oid == at).ok_or_else(|| {
                 GitError::new(
                     DELIVER_CODES.failed,
