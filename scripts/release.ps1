@@ -263,7 +263,7 @@ if ($DryRun -and $behind -gt 0) {
 # 本地 tag 打在 HEAD 上、版本号却还要 bump：bump 会产生新提交，tag 必然对不上。
 # 在这里就停，别等 40 分钟预检跑完才发现
 if ($localTagSha -and $current -ne $Version) {
-    throw "本地已有 $tag（指向 HEAD），但版本号还是 $current。确认后删掉本地 tag 再重跑"
+    throw "本地已有 $tag（指向 $localTagSha），但版本号还是 $current。确认后删掉本地 tag 再重跑"
 }
 
 # 版本号早已在 origin/master 上时，引入它的那个发版提交；预检复用和打 tag 以它为准，见下方「预检」
@@ -330,10 +330,16 @@ if ($releaseSha -and $releaseSha -ne $sha) {
         Where-Object { $_.conclusion -eq 'success' -or $_.status -ne 'completed' }
     if ($prior) {
         Write-Host "master 在发版提交 $($releaseSha.Substring(0, 8)) 之后又进了提交；沿用发版提交上的预检，tag 也打在它上面"
+        # 上面核对的版本号是 HEAD 的工作区；tag 要打在发版提交上，它自己也得是纯版本号提交
+        Assert-ReleaseOnly (Invoke-Checked '核对发版提交' { git diff --numstat "$releaseSha~1" $releaseSha })
         $sha = $releaseSha
     } else {
         Write-Host "发版提交 $($releaseSha.Substring(0, 8)) 上没有成功或进行中的预检，对当前 master 重新预检" -ForegroundColor Yellow
     }
+}
+# 本地 tag 只能打在最终要发的提交上；在这里就停，别等 40 分钟预检跑完才在打 tag 时发现
+if ($localTagSha -and $localTagSha -ne $sha) {
+    throw "本地 $tag 指向 $localTagSha，而这次要预检和打 tag 的是 $sha。确认后删掉本地 tag 再重跑"
 }
 
 # --- 预检 ---
