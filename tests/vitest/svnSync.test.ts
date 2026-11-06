@@ -714,20 +714,30 @@ describe('syncIfRootRevOrWcDbChanged（6.11：文件变动时也比 wc.db）', (
     const wc: WcDbStampMemo = { value: [a] }
 
     // X 读到最终戳 a2，开跑；T（尾随复查）在 X 回来之前也开跑，成为最新的一次
+    // 两边都等「第二档已开跑」再往下走，不靠数微任务
     let finishX!: (wrote: boolean) => void
+    let xStarted!: () => void
+    const xRunning = new Promise<void>((res) => {
+      xStarted = res
+    })
     const x = syncIfRootRevOrWcDbChanged(root, wc, async () => 'wc=7', async () => [a2], () =>
       new Promise<boolean>((res) => {
         finishX = res
+        xStarted()
       }),
     )
     let failT!: (err: Error) => void
+    let tStarted!: () => void
+    const tRunning = new Promise<void>((res) => {
+      tStarted = res
+    })
     const t = syncIfRootRevOrWcDbChanged(root, wc, async () => 'wc=7', async () => [a2], () =>
       new Promise<boolean>((_, rej) => {
         failT = rej
+        tStarted()
       }),
     )
-    await Promise.resolve()
-    await Promise.resolve()
+    await Promise.all([xRunning, tRunning])
 
     finishX(false) // 被 T 顶替，结论没写回
     expect(await x).toBe(true)

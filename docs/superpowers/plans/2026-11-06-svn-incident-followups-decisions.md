@@ -8,7 +8,7 @@
 
 | Task | 条目 | 分支 / PR | 状态 | 验证 |
 |---|---|---|---|---|
-| 1 | 6.11 横幅出现晚：文件变动时也比 wc.db | `worktree-fix-svn-banner-wcdb-on-change` | review 修复完成 | `pnpm build` 过；`pnpm test` 74 文件 1239 条全过；未进 `pnpm tauri dev` 真实窗口（只改前端接线，命令签名没变） |
+| 1 | 6.11 横幅出现晚：文件变动时也比 wc.db | `worktree-fix-svn-banner-wcdb-on-change` | 两轮 review 通过，开 PR 合并 | `pnpm build` 过；`pnpm test` 74 文件 1239 条全过；未进 `pnpm tauri dev` 真实窗口（只改前端接线，命令签名没变） |
 | 2 | 6.10 重放时快照内容按基线走（含 PR 119 遗留：对象层跟进合错也报 Done） | | 未开始 | |
 | 3 | 6.8 泄漏提醒分两档、6.7 手动跟进入口、6.5 冲突弹框补上下文、6.2 不带历史的 replaced | | 未开始 | |
 | 4 | 6.6 提交前提醒「先跟进」 | | 未开始 | |
@@ -38,8 +38,15 @@
 | 中偏高 | 被更晚发起的一次顶替的校验（`applySvnSync` 在 `isLatest` 为假时静默返回）也被当成成功，记下观测值；最新那次再失败时两份记录都被推进，焦点检测也比不出变化，横幅长期不出现 | `applySvnSync` 返回结论有没有写回；`FullCheck` 返回 `false` 时所有 `sync*` / `recordAfterSuccess` 都不记。补交错场景测试 |
 | 中 | 戳一变后端就重新枚举工作副本（`svn info` + `svn status`），外部更新进行中每个事件都会叠起一轮；注释说「只有几次 stat」不对 | `checkSvnSyncIfChanged` 走 `refreshFlights` 单飞（在跑时只补跑一次）；注释改写实际成本 |
 | 低 | 读根 revision 失败时戳那一档也跟着失效 | 对称处理：任一样读不到只按另一样判，都读不到才抛 |
-| 低 | 打开仓库后第一次存盘会白跑一次第二档（`refreshSvnSync` 不记戳） | **不改**：试过在 `refreshSvnSync` 里一并读戳，打乱了 3 个按 invoke 顺序逐个应答的 store 测试；代价只是多一次本地校验，记为已知代价 |
+| 低 | 打开仓库后第一次存盘会白跑一次第二档（`refreshSvnSync` 不记戳） | **不改**：代价只是打开仓库后多一次本地校验，记为已知代价。另外试过在 `refreshSvnSync` 里一并读戳，会打乱 3 个按 invoke 顺序逐个应答的 store 测试，这是次要原因 |
 | 低 | 注释与日志不准确 | `markOnBlur` 注释、`lastWcDbStamps` 共用说明、本日志的成本与假设都已改 |
+
+**独立 review 第 2 轮**：没有高危、中危。
+
+| 级别 | 发现 | 处理 |
+|---|---|---|
+| 低 | 交错测试靠 `await Promise.resolve()` 的个数等两边开跑 | 改成等「第二档已开跑」的 promise |
+| 低 | 两样观测值并行读，戳变化那一刻后端同时枚举两次工作副本 | 不改：总成本与顺序读相同，单飞已把轮数压到最多一轮 |
 
 **为什么这么改是安全的**
 - 纯只读：只多了 `stat`、后端已有的工作副本枚举与第二档本地校验，不写工作副本、不写 git。第二档用到的 `svn info` / `svn status` 不写 wc.db（E19），不会自激。
