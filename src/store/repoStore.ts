@@ -898,6 +898,8 @@ export function useRepoStore() {
         // 什么都不动：既保留上一次的结论，也不清这个标记——基线确实丢了的时候，
         // 一次锁错误不该让恢复横幅闪掉（PR 115 review）
         if (toErrorCode(err) === 'svn_no_baseline') {
+          // 提交前的提醒不能再按丢失之前的旧清单弹（6.6 第 2 轮 review 低危第 2 条）
+          latestSync.current = null
           setState((s) => (samePath(s.path ?? '', path)
             ? { ...s, svnBaselineMissing: true, svnSync: null }
             : s))
