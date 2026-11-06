@@ -990,6 +990,7 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
             }],
         }],
         stale_disk: true,
+        snapshot: vec![("s1".into(), vec!["Code/B.cs".into()])],
     })
     .unwrap();
     assert_eq!(
@@ -1007,6 +1008,7 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
                 "hunks": [{ "oldStart": 3, "lines": 1, "verdict": "unknown" }],
             }],
             "staleDisk": true,
+            "snapshot": [["s1", ["Code/B.cs"]]],
         })
     );
 

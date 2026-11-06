@@ -1388,7 +1388,9 @@ fn follow_conflict_publishes_only_baseline() {
             baseline_published,
             leaks,
             stale_disk,
+            snapshot,
         } => {
+            assert!(snapshot.is_empty(), "没有快照内容：{snapshot:?}");
             assert_eq!(at, c);
             assert_eq!(files, vec![A.to_string()]);
             assert!(baseline_published);

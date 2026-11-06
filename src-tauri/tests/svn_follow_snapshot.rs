@@ -11,11 +11,13 @@
 mod svn_fixtures;
 
 use app_lib::engine::git_cli::run_git;
+use app_lib::engine::svn_follow::fault::{self, Crashed, Point};
 use app_lib::engine::svn_follow::{follow, manual_follow, FollowOutcome, FollowReport};
 use app_lib::engine::svn_journal;
 use app_lib::engine::svn_replay::{commits_between, ReplayCodes};
 use app_lib::engine::svn_snapshot::SnapshotRule;
 use app_lib::engine::svn_sync_in::{abort_sync, continue_sync, SyncInOutcome};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::process::Command;
 use svn_fixtures::{hybrid_with_colleague, svn_cmd, SvnFixture};
 
@@ -202,7 +204,7 @@ fn snapshot_does_not_bring_back_a_file_svn_deleted() {
 fn only_the_real_conflict_is_left_and_manual_follow_sees_only_it() {
     // 37 个冲突里 35 个是快照内容：它们不该出现，真冲突（A，我和同事都改了）照旧交给人
     let fx = hybrid_with_colleague();
-    lagging_snapshot(&fx, B, Some("b2\n"), &[(A, "a-mine\n")]);
+    let (_, snap) = lagging_snapshot(&fx, B, Some("b2\n"), &[(A, "a-mine\n")]);
     colleague(&fx, B, "b3\n");
     colleague(&fx, A, "a-colleague\n");
     // 我的 A 没提交到 SVN：update 会让 SVN 也冲突，这里先还原，模拟「已经交给 TortoiseSVN 合好了」
@@ -210,7 +212,13 @@ fn only_the_real_conflict_is_left_and_manual_follow_sees_only_it() {
     svn_update(&fx);
 
     match run(&fx) {
-        FollowOutcome::NeedsManual { files, .. } => assert_eq!(files, vec![A.to_string()]),
+        FollowOutcome::NeedsManual {
+            files, snapshot, ..
+        } => {
+            assert_eq!(files, vec![A.to_string()]);
+            // review 第 2 条：动手之前告诉用户，手动跟进会直接采用基线的是哪些
+            assert_eq!(snapshot, vec![(snap, vec![B.to_string()])]);
+        }
         other => panic!("应当交给手动跟进：{other:?}"),
     }
 
@@ -293,14 +301,112 @@ fn rule_ignores_local_only_commits_and_reverts_to_the_branch_baseline() {
 }
 
 #[test]
+fn rule_skips_a_commit_whose_parent_holds_my_own_content() {
+    // review 第 1 条：C0 是我自己的改动（没交 SVN）；后来在 SVN 侧撤掉、update 后整包提交 C。
+    // C 的内容是基线 1 的，但把 B 写回 C^ 会把撤掉的 b-mine 复活，所以不能命中
+    let fx = hybrid_with_colleague();
+    let base0 = oid(&fx, "svn/base");
+    colleague(&fx, B, "b2\n");
+    svn_update(&fx);
+    done(run(&fx));
+    git(&fx, &["checkout", "-q", "-B", "work", &base0]);
+    write(&fx, B, "b-mine\n");
+    commit_all(&fx, "我自己的改动");
+    write(&fx, B, "b2\n");
+    commit_all(&fx, "svn up 之后整包提交");
+    let new = oid(&fx, "svn/base");
+    let head = oid(&fx, "HEAD");
+
+    let repo = fx.wc_str();
+    let rule = SnapshotRule::new(&repo, &new);
+    let commits = commits_between(&repo, &base0, &head, &CODES).unwrap();
+
+    assert!(
+        rule.paths(&base0, &commits[0]).is_empty(),
+        "b-mine 不是 SVN 的"
+    );
+    assert!(
+        rule.paths(&base0, &commits[1]).is_empty(),
+        "C^ 里是我的内容，写回它会复活 b-mine"
+    );
+}
+
+#[test]
+fn snapshot_equal_to_the_new_baseline_is_not_reported() {
+    // review 第 7 条：快照里的内容就是 NEW 的，换不换都一样，报出来只是噪音
+    let fx = hybrid_with_colleague();
+    lagging_snapshot(&fx, B, Some("b2\n"), &[]);
+    colleague(&fx, A, "a2\n");
+    svn_update(&fx);
+
+    let rep = done(run(&fx));
+
+    assert_eq!(show(&fx, "HEAD:Code/B.cs"), "b2");
+    assert!(rep.snapshot.is_empty(), "{:?}", rep.snapshot);
+    assert!(rep.rewritten.is_empty(), "{:?}", rep.rewritten);
+}
+
+#[test]
+fn manual_follow_of_a_pure_snapshot_leaves_no_empty_commit() {
+    // review 第 3 条：快照里全是 SVN 内容。rebase 会留下「一开始就为空」的 commit，所以根本不 pick
+    let fx = hybrid_with_colleague();
+    let (_, snap) = lagging_snapshot(&fx, B, Some("b2\n"), &[]);
+    // 磁盘就是基线 1：判定 InSync，分支落后基线，可以直接手动跟进
+    let o = manual_follow(&fx.wc_str(), "mf1").unwrap();
+    assert!(matches!(o, SyncInOutcome::Done { .. }), "{o:?}");
+
+    assert_eq!(oid(&fx, "HEAD"), oid(&fx, "svn/base"), "没有留下空 commit");
+    assert_ne!(oid(&fx, "HEAD"), snap);
+    assert_eq!(git(&fx, &["symbolic-ref", "--short", "HEAD"]), "work");
+    assert_eq!(read(&fx, B), "b2\n");
+    assert_eq!(git(&fx, &["status", "--porcelain", "--", "Code"]), "");
+}
+
+#[test]
+fn manual_follow_resumes_with_the_prepared_todo_after_a_crash() {
+    let fx = hybrid_with_colleague();
+    lagging_snapshot(&fx, B, Some("b2\n"), &[(A, "a-mine\n")]);
+    colleague(&fx, B, "b3\n");
+    colleague(&fx, A, "a-colleague\n");
+    svn_cmd(&fx.wc(), &["revert", "--", A]);
+    svn_update(&fx);
+    assert!(matches!(run(&fx), FollowOutcome::NeedsManual { .. }));
+
+    // 收起改动之后、rebase 之前进程没了
+    let armed = fault::crash_at(Point::ManualStashed);
+    let wc = fx.wc_str();
+    let r = catch_unwind(AssertUnwindSafe(|| manual_follow(&wc, "mf1")));
+    drop(armed);
+    match r {
+        Err(p) => assert!(p.is::<Crashed>(), "是别的 panic"),
+        Ok(o) => panic!("没有走到崩溃点：{:?}", o.map_err(|e| e.message)),
+    }
+    assert!(!svn_journal::read(&wc)
+        .unwrap()
+        .unwrap()
+        .rebase_todo
+        .is_empty());
+
+    match continue_sync(&wc).unwrap() {
+        SyncInOutcome::RebaseConflict { files } => assert_eq!(files, vec![A.to_string()]),
+        other => panic!("继续时照样用待重放列表，只停在 A：{other:?}"),
+    }
+}
+
+#[test]
 fn a_clean_but_wrong_replay_is_reported_as_drift() {
     // PR 119 遗留：对象层跟进只移 HEAD，重放干净却合错（W14）时照样报完成。用「把两边拼起来、
-    // 退出 0」的 merge driver 代替真实现场里 diff3 的错误对齐
+    // 退出 0」的 merge driver 代替真实现场里 diff3 的错误对齐。
+    //
+    // 形状：我在 git 里改了 A，也用 TortoiseSVN 把它交了；之后同事又改了 A。没有失焦快照，F2 ①
+    // 不生效；我的版本也不在任何基线里，6.10 不命中。正确的重放会冲突，合错时磁盘（= NEW）与 tip 不同
     let fx = hybrid_with_colleague();
     write(&fx, A, "a-git\n");
     commit_all(&fx, "git 里的版本");
-    // 我没把它交给 SVN，还在磁盘上把它撤了：磁盘 = SVN 的 BASE
-    write(&fx, A, "a1\n");
+    svn_cmd(
+        &fx.wc(),
+        &["commit", "-m", "tortoise", "--non-interactive", "--", A],
+    );
     colleague(&fx, A, "a-colleague\n");
     svn_update(&fx);
     assert_eq!(read(&fx, A), "a-colleague\n");

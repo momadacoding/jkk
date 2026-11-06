@@ -363,6 +363,24 @@ describe('describeFollowOutcome', () => {
     expect(n.detail).toContain('加日志')
   })
 
+  it('6.10：手动跟进会直接采用基线的快照内容，动手之前列出来', () => {
+    const base = {
+      kind: 'needsManual' as const,
+      at: 'c'.repeat(40),
+      files: ['Code/A.cs'],
+      baselinePublished: true,
+      leaks: [],
+      staleDisk: false,
+    }
+    const n = describeFollowOutcome({ ...base, snapshot: [['f'.repeat(40), ['Code/B.cs']]] })
+    expect(n.detail).toContain('Code/B.cs（ffffffffff）')
+    expect(n.detail).toContain('直接采用新基线的版本')
+    expect(n.detail).toContain('有意')
+    // 旧后端没有这个字段、或者没有命中：不出这一段
+    expect(describeFollowOutcome(base).detail).not.toContain('逐字节相同')
+    expect(describeFollowOutcome({ ...base, snapshot: [] }).detail).not.toContain('逐字节相同')
+  })
+
   it('磁盘上还是旧分支内容（Review 3 第 2 条）：不说冲突，说清只移分支会造出回退', () => {
     const n = describeFollowOutcome({
       kind: 'needsManual',

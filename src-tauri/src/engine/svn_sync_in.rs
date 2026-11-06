@@ -17,7 +17,7 @@
 //! 结束后再补发一次 `repo-changed`（`commands/svn_sync.rs`）。
 
 use crate::engine::file_lock::{describe, find_blockers};
-use crate::engine::git_cli::{run_git, run_git_code, run_git_env};
+use crate::engine::git_cli::{run_git, run_git_code, run_git_env, run_git_stdin};
 use crate::engine::svn_baseline::{
     create_baseline_commit, git_dir, move_baseline_ref, read_baseline, refresh_index_stat,
     swap_index_to_tree, TempIndex,
@@ -591,7 +591,13 @@ pub(crate) fn from_baseline_ready(
 /// rebase 会拒绝；`autoSquash=false`，免得 `fixup!` commit 在我们写 todo 之前被挪动；另外两项同上。
 fn rebase_with_todo(repo: &str, new_base: &str, todo: &[String]) -> Result<String> {
     let mut list = String::new();
+    let mut oids = String::new();
     for oid in todo {
+        // 分支上全是快照内容：什么都不 pick，分支落到新基线上
+        if oid == crate::engine::svn_follow::NOOP {
+            list.push_str("noop\n");
+            continue;
+        }
         // 只放 OID：todo 里的说明文字随用户配置变，pick 只认 OID
         if oid.len() != 40 || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(GitError::new(
@@ -602,6 +608,18 @@ fn rebase_with_todo(repo: &str, new_base: &str, todo: &[String]) -> Result<Strin
         list.push_str("pick ");
         list.push_str(oid);
         list.push('\n');
+        oids.push_str(oid);
+        oids.push('\n');
+    }
+    // C' 没有 ref 指着：记录搁置太久又碰上 gc 时会被清掉。在 rebase 开始之前查，免得它停在半路
+    // （独立 review 第 9 条）。这时什么都还没动，HEAD 仍在原分支上
+    let check = run_git_stdin(repo, &["cat-file", "--batch-check"], oids.as_bytes())?;
+    if check.lines().any(|l| l.ends_with(" missing")) {
+        return Err(GitError::new(
+            "sync_in_rebase_failed",
+            "手动跟进事先准备好的提交已经被 git 清理掉了（记录搁置太久）。分支没动，未提交的改动收在备份里：\
+             点「放弃」会把它们放回来，然后再点一次「跟进」重新开始。",
+        ));
     }
     run_git_env(
         repo,

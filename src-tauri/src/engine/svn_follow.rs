@@ -149,6 +149,9 @@ pub enum FollowOutcome {
         /// 重放没冲突，但分支落后、磁盘上还是旧 HEAD 的内容（见 [`stale_disk_paths`]）：对象层跟进
         /// 只移 HEAD，「本地改动」会变成把 SVN 的内容改回去（Review 3 第 2 条）。
         stale_disk: bool,
+        /// 手动跟进时会直接采用新基线版本的快照内容（事故分析 6.10，独立 review 第 2 条）：在用户点
+        /// 「手动跟进」之前告诉他，有意停住的旧版本会被换掉。
+        snapshot: PathsByCommit,
     },
     /// 什么都没动：前置条件不满足，或者准备阶段失败。
     Refused {
@@ -237,10 +240,11 @@ pub fn follow(repo: &str, opid: &str) -> Result<FollowOutcome> {
                 files,
                 leaks,
                 stale_disk,
+                snapshot,
             },
         ) = (plan.old_base == plan.new_base, &plan.target)
         {
-            return Ok(needs_manual(at, files, leaks, *stale_disk));
+            return Ok(needs_manual(at, files, leaks, *stale_disk, snapshot));
         }
         // 同步锁活到 publish 返回：冲突出口这种提前返回也在 Drop 里放掉
         let _lock = match svn_lock::acquire(repo, opid) {
@@ -307,13 +311,20 @@ fn refused(e: GitError) -> FollowOutcome {
     }
 }
 
-fn needs_manual(at: &str, files: &[String], leaks: &[Leak], stale_disk: bool) -> FollowOutcome {
+fn needs_manual(
+    at: &str,
+    files: &[String],
+    leaks: &[Leak],
+    stale_disk: bool,
+    snapshot: &PathsByCommit,
+) -> FollowOutcome {
     FollowOutcome::NeedsManual {
         at: at.to_string(),
         files: files.to_vec(),
         baseline_published: true,
         leaks: leaks.to_vec(),
         stale_disk,
+        snapshot: snapshot.clone(),
     }
 }
 
@@ -390,7 +401,15 @@ pub fn manual_follow(repo: &str, opid: &str) -> Result<SyncInOutcome> {
 /// rebase 原样 pick 分支上的 commit，快照进来的 SVN 内容会和新基线撞上：对象层重放已经把它们换成了
 /// SVN 版本，手动跟进不跟着换的话，11-05 那 35 个冲突在磁盘上又回来了。这里为命中的 commit 造 C'
 /// （[`commit_without`]），其余照用原 commit。一个都没命中时返回空，S9 照原样 `rebase <新基线>`。
+///
+/// 整个 commit 都是快照内容时（C' 的树等于 C^ 的树、原 C 本来不空），不放进列表（独立 review 第 3 条）：
+/// rebase 会保留「一开始就为空」的 commit，`--empty=drop` 只丢重放后才变空的，分支上就会留下一个空的
+/// 「svn up 之后整包提交」，与对象层把它记成 `dropped` 不一致。一个都不剩时列表是 [`NOOP`]。
+///
+/// 列表放在环境变量里交给 rebase（见 `svn_sync_in::rebase_with_todo`）。超过 Windows 单个环境变量
+/// 约 32K 字符的上限时退回原样 rebase，并记日志（独立 review 第 9 条）。
 fn snapshot_todo(repo: &str, scope: &str, head: &str, new: &str) -> Result<Vec<String>> {
+    const MAX_TODO_CHARS: usize = 30_000;
     let commits = commits_between(repo, scope, head, &FOLLOW_CODES)?;
     let rule = SnapshotRule::new(repo, new);
     let mut any = false;
@@ -398,10 +417,54 @@ fn snapshot_todo(repo: &str, scope: &str, head: &str, new: &str) -> Result<Vec<S
     for c in &commits {
         let hits = rule.paths(scope, c);
         let oid = commit_without(repo, c, &hits, &FOLLOW_CODES)?;
-        any |= oid != c.oid;
-        todo.push(oid);
+        if oid == c.oid {
+            todo.push(oid);
+            continue;
+        }
+        any = true;
+        let trees = run_git(
+            repo,
+            &[
+                "rev-parse",
+                &format!("{oid}^{{tree}}"),
+                &format!("{oid}^^{{tree}}"),
+            ],
+        )?;
+        let mut t = trees.lines();
+        // C' 换过路径所以原 C 一定改过东西；C' 再与父提交同树就是整个变空了
+        if t.next() != t.next() {
+            todo.push(oid);
+        }
     }
-    Ok(if any { todo } else { Vec::new() })
+    if !any {
+        return Ok(Vec::new());
+    }
+    if todo.is_empty() {
+        return Ok(vec![NOOP.to_string()]);
+    }
+    if todo.len() * 46 > MAX_TODO_CHARS {
+        log::warn!(
+            "待重放的 commit 有 {} 个，环境变量放不下，手动跟进按原样 rebase（快照内容不按基线走）",
+            todo.len()
+        );
+        return Ok(Vec::new());
+    }
+    Ok(todo)
+}
+
+/// 待重放列表里「什么都不 pick」的那一行：分支上的 commit 全是快照内容。
+pub(crate) const NOOP: &str = "noop";
+
+/// 冲突出口告诉用户的：手动跟进时哪些 commit 里的哪些路径会直接采用新基线（方案 §3）。
+/// 与 [`snapshot_todo`] 用同一条规则；内容本来就等于 NEW 的不列（见 [`SnapshotRule::reported_paths`]）。
+fn manual_snapshot(commits: &[ReplayCommit], rule: &SnapshotRule, scope: &str) -> PathsByCommit {
+    commits
+        .iter()
+        .filter_map(|c| {
+            let p = rule.reported_paths(scope, c);
+            (!p.is_empty()).then(|| (c.oid.clone(), p.into_iter().collect()))
+        })
+        .collect()
 }
 
 /// S1 的 stash 只收白名单，rebase 却要求整个工作区干净，白名单外的已跟踪改动放过去就是 stash 完才
@@ -448,6 +511,8 @@ enum Target {
         files: Vec<String>,
         leaks: Vec<Leak>,
         stale_disk: bool,
+        /// 手动跟进会按 6.10 直接采用新基线版本的路径，见 [`manual_snapshot`]。
+        snapshot: PathsByCommit,
     },
 }
 
@@ -965,6 +1030,7 @@ fn prepare(repo: &str) -> Result<Plan> {
                     files,
                     leaks,
                     stale_disk: false,
+                    snapshot: manual_snapshot(&commits, &snapshot, &scope),
                 },
                 Vec::new(),
             )
@@ -978,6 +1044,7 @@ fn prepare(repo: &str) -> Result<Plan> {
                     files: stale,
                     leaks,
                     stale_disk: true,
+                    snapshot: manual_snapshot(&commits, &snapshot, &scope),
                 },
                 Vec::new(),
             )
@@ -991,7 +1058,11 @@ fn prepare(repo: &str) -> Result<Plan> {
             let (snap, own) = split_snapshot(rewritten, &commits, &superseded, &snapshot, &scope);
             report.rewritten = own;
             report.snapshot = snap;
-            report.drift = drift_paths(repo, &new_base, &tip, &paths)?;
+            // 只是告警：核对本身出错（文件被独占锁住之类）不能让跟进失败（review 第 6 条）
+            report.drift = drift_paths(repo, &new_base, &tip, &paths).unwrap_or_else(|e| {
+                log::warn!("核对重放结果与磁盘时出错，跳过：{}", e.message);
+                Vec::new()
+            });
             // F3：按原始 commit 算，不受 F2 ① 换路径影响。手动跟进不拦，只告警（§6.12 条件 8 管自动）
             report.leaks = local_only_leaks(repo, &branch, &commits, &paths, &new_base)?;
             let others = plan_others(
@@ -1153,13 +1224,20 @@ fn split_snapshot(
     let mut snap = Vec::new();
     let mut own = Vec::new();
     for (oid, paths) in rewritten {
-        let (hits, mine) = match commits.iter().find(|c| c.oid == oid) {
-            Some(c) => (rule.paths(scope, c), f2(c)),
-            None => (BTreeSet::new(), BTreeSet::new()),
+        let (hits, reported, mine) = match commits.iter().find(|c| c.oid == oid) {
+            Some(c) => (rule.paths(scope, c), rule.reported_paths(scope, c), f2(c)),
+            None => (BTreeSet::new(), BTreeSet::new(), BTreeSet::new()),
         };
-        let (s, o): (Vec<String>, Vec<String>) = paths
-            .into_iter()
-            .partition(|p| hits.contains(p) && !mine.contains(p));
+        let mut s = Vec::new();
+        let mut o = Vec::new();
+        for p in paths {
+            if mine.contains(&p) || !hits.contains(&p) {
+                o.push(p);
+            } else if reported.contains(&p) {
+                s.push(p);
+            }
+            // 其余：快照命中、且 commit 里的内容本来就与 NEW 相同，换不换都一样，不报（review 第 7 条）
+        }
         if !s.is_empty() {
             snap.push((oid.clone(), s));
         }
@@ -1196,10 +1274,15 @@ fn drift_paths(
             continue;
         }
         let meta: Vec<&str> = meta.trim_start_matches(':').split(' ').collect();
-        let (Some(mode), Some(new_oid), Some(status)) = (meta.first(), meta.get(2), meta.get(4))
+        let (Some(mode), Some(new_oid), Some(tip_oid), Some(status)) =
+            (meta.first(), meta.get(2), meta.get(3), meta.get(4))
         else {
             continue;
         };
+        // 只差 mode（filemode=false 下提交过 `--chmod=+x`）：内容没对不上，不报（review 第 5 条）
+        if new_oid == tip_oid {
+            continue;
+        }
         let on_disk = Path::new(repo).join(path).symlink_metadata();
         if status.starts_with('A') {
             // NEW 里没有、tip 里有：磁盘上也没有就是被带回来的
@@ -1669,7 +1752,8 @@ fn publish(repo: &str, opid: &str, plan: Plan) -> Result<FollowOutcome> {
                 files,
                 leaks,
                 stale_disk,
-            } => needs_manual(&at, &files, &leaks, stale_disk),
+                snapshot,
+            } => needs_manual(&at, &files, &leaks, stale_disk, &snapshot),
             Target::Tip(_) => unreachable!("tip 取自 target"),
         });
     };

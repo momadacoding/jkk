@@ -88,6 +88,8 @@ export type FollowOutcome =
        * 造出把 SVN 内容改回去的修改（Review 3 第 2 条）。`at` 是当前 HEAD。
        */
       staleDisk: boolean
+      /** 手动跟进时会直接采用新基线版本的快照内容（6.10）：动手之前告诉用户。旧后端没有。 */
+      snapshot?: [string, string[]][]
     }
   /** 什么都没动：前置条件不满足，或者准备阶段失败。 */
   | { kind: 'refused'; code: string; message: string }
@@ -156,6 +158,11 @@ function capped(items: string[]): string[] {
 
 const LEAK_NOTE = '这些本地补丁（Local-Only）可能被提交到了 SVN，请检查'
 
+/** 6.10 的快照内容：报告与冲突框共用的开头。 */
+const SNAPSHOT_NOTE =
+  '下面这些文件在 commit 里的内容与 SVN 上某个较新的版本逐字节相同（多半是 svn update 之后整包提交进 git 的）。' +
+  '如果你是有意停在那个版本，请从原 commit 里取回。'
+
 function leakLine(l: Leak): string {
   return `${l.path}（分支 ${l.branch}：${l.subject}）`
 }
@@ -207,11 +214,12 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
   const candidates: FollowReportSection[] = [
     {
       id: 'drift',
-      title: '重放后与磁盘对不上',
+      title: '分支与磁盘对不上',
       warn: true,
       note:
-        '这些文件在磁盘上是 SVN 的版本，分支里却成了别的内容（或者把 SVN 已删的文件带了回来），' +
-        '多半是重放时合错了。「本地改动」里会出现它们的反向修改：磁盘上的版本是对的话，暂存后 amend 进分支的最后一个 commit。',
+        '这些文件在磁盘上是 SVN 的版本，重放后的分支里却是别的内容（或者把 SVN 已删的文件带了回来），' +
+        '「本地改动」里会出现它们的修改。可能是重放时合错了，也可能是你在磁盘上撤掉了某个 commit 的改动、' +
+        '还没提交这次撤销。请逐个核对：磁盘上的版本是对的，就把它提交进分支。',
       groups: [{ label: '', items: drift }],
     },
     {
@@ -268,9 +276,7 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
       id: 'snapshot',
       title: '按基线对齐的快照内容',
       warn: false,
-      note:
-        '这些文件在 commit 里的内容与 SVN 上某个较新的版本逐字节相同（多半是 svn update 之后整包提交进 git 的），' +
-        '重放时直接采用了新基线的版本。如果你是有意停在那个版本，请从原 commit 里取回。',
+      note: `${SNAPSHOT_NOTE}重放时直接采用了新基线的版本。`,
       groups: snapshot.map(([c, paths]) => ({ label: c.slice(0, 10), items: paths })),
     },
     {
@@ -355,6 +361,14 @@ export function describeFollowOutcome(o: Exclude<FollowOutcome, { kind: 'done' }
             '分支和暂存区都没动。这需要人来判断：点「手动跟进」，未提交的改动会先收起来，分支重放到' +
               '新基线上，冲突由你解决，最后再把改动放回来。这一步会写工作区里的文件。',
           ]
+      const snapshot = (o.snapshot ?? []).flatMap(([c, paths]) =>
+        paths.map((p) => `${p}（${c.slice(0, 10)}）`),
+      )
+      if (snapshot.length > 0) {
+        sections.push(
+          `${SNAPSHOT_NOTE}手动跟进时这些文件会直接采用新基线的版本，不会报冲突：\n${listed(snapshot)}`,
+        )
+      }
       if (o.leaks.length > 0) sections.push(leakSection(o.leaks))
       return {
         tone: 'attention',
