@@ -35,7 +35,8 @@ import {
 import { toErrorCode, toErrorMessage } from '../engine/errors'
 import { createLatestGate } from '@/engine/latestGate'
 import { createSingleFlight } from '@/engine/singleFlight'
-import { changesSection, type FileSection, type FileSelection } from '@/engine/fileSelection'
+import { applyStatusPatch, type StatusPatch } from '@/engine/statusPatch'
+import { changesDiffScope, isChangesFileScope, type FileSelection } from '@/engine/fileSelection'
 import type { DriverReport } from '@/engine/mergeDrivers'
 import type {
   Health,
@@ -503,13 +504,21 @@ export function svnServerAudit(path: string): Promise<ServerAudit> {
   return invoke<ServerAudit>('svn_server_audit', { path })
 }
 
+/**
+ * 每个标签的 store 都登记在这里，收「本应用在某个仓库写了 index」的通知（`afterIndexWrite`）。
+ * 所有标签在同一个页面里，进程内通知就够了，不必绕 Tauri 事件。
+ */
+const indexWriteSubscribers = new Set<(path: string, origin: object) => void>()
+
 export function useRepoStore() {
+  /** 这个 store 的身份：通知里认出「是自己发的」。 */
+  const storeIdentity = useRef({}).current
   const [state, setState] = useState<RepoState>(initialState)
   /**
    * 上一次观测到的每个工作副本根的 revision，序列化成字符串好比对。
    *
    * **放 ref 不放 state**：读它的是 `repo-changed` 监听器，而那个 `useEffect`
-   * 的依赖是 `[state.path, diffScope]`。放进 state 的话监听器会**永远闭包住
+   * 的依赖是 `[state.path, state.capabilities.vcs]`。放进 state 的话监听器会**永远闭包住
    * 注册那一刻的值**（`null`），比较恒为不等，于是第二档的全量校验
    * 每次文件变动都跑一遍——分层就白做了。这是独立 review 抓到的。
    *
@@ -570,6 +579,20 @@ export function useRepoStore() {
    */
   const lastStatusPath = useRef<string | null>(null)
   const lastDiffPath = useRef<string | null>(null)
+  /**
+   * 排队等下一轮状态读取的需求，按仓库路径分开：要不要全量、要局部重读哪些路径。
+   * 见 `refreshStatus` 为什么不能交给单飞的「最后一个任务」决定。
+   */
+  const statusWanted = useRef(new Map<string, { full: boolean, paths: Set<string> }>())
+  /**
+   * 每个仓库最后一次读到的状态，局部重读在它上面合并（`applyStatusPatch`）。
+   * 只在单飞里写：同一个仓库的读取串行，它就总是最后开读的那一轮的结果。
+   */
+  const knownStatus = useRef(new Map<string, StatusData>())
+  /** 写操作之后的刷新（`refreshChanges`）开始的次数，`refreshDiff` 据此判断在跑的那轮能不能复用。 */
+  const writeSeq = useRef(0)
+  /** 每个 diff 单飞队列里正在跑的那一轮：读的是哪个 scope、开读时的 `writeSeq`、读完的信号。 */
+  const diffRunning = useRef(new Map<string, { scope: string, seq: number, done: Promise<void> }>())
   /**
    * 当前视图要显示哪一份 diff，由 `useRepoEffects` 每次渲染写入。
    *
@@ -708,11 +731,30 @@ export function useRepoStore() {
    * 文件监听、外部工具退出、用户操作会先后各发一次。同时只读一轮，在读时再来的只补读一次，
    * 交回的状态一定是调用之后才开读的（`createSingleFlight`）。各轮串行、按开读先后到达，
    * 写回不必再核对代次，先读完的那轮也不会被作废。
+   *
+   * @param touched 刚 Stage / Unstage 的路径。给了就只重读这几个路径（`read_status_paths`，
+   *   2026-11-05 排查报告 6.13 方案 A）；不给就全量读。同一轮里只要有一个调用方要全量，就全量
    */
-  const refreshStatus = async (path: string): Promise<StatusData> => {
+  const refreshStatus = async (path: string, touched?: string[]): Promise<StatusData> => {
     lastStatusPath.current = path
+    // 先登记这次要读什么，再排进单飞：补跑那一轮开跑时把排队期间登记的合起来读一次。
+    // 不能让补跑「用最后一次传进来的任务」决定：全量刷新排在前、局部重读排在后时，
+    // 那样补跑就只读几个路径，排队的外部改动被漏掉
+    const want = statusWanted.current.get(path) ?? { full: false, paths: new Set<string>() }
+    if (touched) for (const p of touched) want.paths.add(p)
+    else want.full = true
+    statusWanted.current.set(path, want)
     const status = await refreshFlights.run(`status:${path}`, async () => {
-      const read = await invoke<StatusData>('read_status', { path })
+      let read: StatusData
+      try {
+        read = await readStatus(path)
+      } catch (err) {
+        // 这一轮没读到，「上一次的状态」就落后于磁盘：它本该反映的改动（比如文件监听那轮要读的保存）
+        // 不在里面。下一次局部重读不能在它上面合并，清掉让下一轮走全量（第二轮独立 review 第 1 条）
+        knownStatus.current.delete(path)
+        throw err
+      }
+      knownStatus.current.set(path, read)
       if (lastStatusPath.current === path) setState((s) => ({ ...s, status: read }))
       return read
     })
@@ -721,6 +763,34 @@ export function useRepoStore() {
     // 放在单飞外面：它有自己的代次闸，不该让下一轮状态读取排在它后面
     await refreshConflicts(path, status)
     return status
+  }
+
+  /**
+   * 单飞里真正的那次读取：取走登记的需求，能局部就局部。
+   *
+   * 局部重读要在「上一次读到的状态」上合并，所以只在读过这个仓库之后才走；合并发现 git 的
+   * 连带改动、或者局部重读本身失败时，退回全量读——列表不能停在 Stage 之前的样子。
+   */
+  const readStatus = async (path: string): Promise<StatusData> => {
+    const want = statusWanted.current.get(path)
+    statusWanted.current.delete(path)
+    const prev = knownStatus.current.get(path)
+    // 暂存区里的 .gitattributes 决定别的文件按什么 eol / text 规则比较：Stage / Unstage 它会让别的文件
+    // 在 Unstaged 里出现或消失，而 Staged 里看不出来，合并检测不到（第二轮独立 review 第 3 条）
+    const touchesAttributes = [...(want?.paths ?? [])].some(
+      (p) => p === '.gitattributes' || p.endsWith('/.gitattributes'),
+    )
+    if (want && !want.full && want.paths.size > 0 && prev && !touchesAttributes) {
+      const touched = [...want.paths]
+      try {
+        const patch = await invoke<StatusPatch>('read_status_paths', { path, paths: touched })
+        const merged = applyStatusPatch(prev, touched, patch)
+        if (merged) return merged
+      } catch (err) {
+        console.warn('局部重读状态失败，改为全量读：', err)
+      }
+    }
+    return invoke<StatusData>('read_status', { path })
   }
 
   /**
@@ -1053,7 +1123,14 @@ export function useRepoStore() {
     }
   }
 
-  const refreshDiff = async (path: string, scope: string) => {
+  /**
+   * @param joinSince 给了就允许复用正在跑的那一轮：同一个 scope、且那一轮在第 `joinSince` 次写操作刷新
+   *   开始之后才开读（`writeSeq`）。按选中读的 effect 传 0（任何一轮都行，它只要数据）；写操作之后的刷新
+   *   传自己开始时的序号（写之前就在读的那轮读到的是旧数据，不能复用）。不给就照旧排补跑
+   *   （文件监听：在跑的那轮可能早于这次改动）。没有它的话，Stage 让选中的文件换到 Staged 时，
+   *   写之后的刷新和选中跟着变的 effect 会把同一个文件连读两次（第二轮独立 review 第 7 条）
+   */
+  const refreshDiff = async (path: string, scope: string, joinSince?: number) => {
     // 写回前再核对：只认当前视图要的那一份，切走之后才回来的旧 scope 结果丢掉
     lastDiffPath.current = path
     const stillWanted = () => {
@@ -1062,21 +1139,37 @@ export function useRepoStore() {
       return wanted === undefined || wanted === scope
     }
     // 按仓库和 scope 分开单飞（同 `refreshStatus`）：别的 scope 的读取不用排队。
-    // 同一个 scope 各轮串行、按开读先后到达，写回不必再核对代次
-    await refreshFlights.run(`diff:${path}:${scope}`, async () => {
-      let diff: DiffData
+    // 同一个 scope 各轮串行、按开读先后到达，写回不必再核对代次。
+    // 「本地改动」的单文件 scope 例外，全部排在同一队里：方向键一路按下去，每个文件都会来一次，
+    // 补跑只做最后一个，中间跳过的不读（6.13 方案 C）。各轮仍串行，写回照旧只认当前要的那一份
+    const flight = isChangesFileScope(scope) ? `diff:${path}:changes-file` : `diff:${path}:${scope}`
+    const running = diffRunning.current.get(flight)
+    if (joinSince !== undefined && running?.scope === scope && running.seq >= joinSince) {
+      // 复用的调用方只等它读完，成败由发起那一轮的调用方报
+      return running.done
+    }
+    await refreshFlights.run(flight, async () => {
+      let finish!: () => void
+      const entry = { scope, seq: writeSeq.current, done: new Promise<void>((r) => { finish = r }) }
+      diffRunning.current.set(flight, entry)
       try {
-        diff = await invoke<DiffData>('read_diff', { path, scope })
-      } catch (err) {
-        // 读失败也要把这个 scope 记成「读过了」，不然界面会一直说「正在读取」；错误照旧抛给调用方。
-        // 带上原因：光一个空列表，界面上就成了「这个提交没有改动」（第 72 条）
-        // 用户已经离开的那份读失败了就安静地丢掉：照常抛的话，界面显示的是 B 的 diff，
-        // 顶部错误条却报 A 的「bad object」（PR 113 review）
-        if (!stillWanted()) return
-        setState((s) => ({ ...s, diff: { files: [], error: toErrorMessage(err) }, diffScope: scope }))
-        throw err
+        let diff: DiffData
+        try {
+          diff = await invoke<DiffData>('read_diff', { path, scope })
+        } catch (err) {
+          // 读失败也要把这个 scope 记成「读过了」，不然界面会一直说「正在读取」；错误照旧抛给调用方。
+          // 带上原因：光一个空列表，界面上就成了「这个提交没有改动」（第 72 条）
+          // 用户已经离开的那份读失败了就安静地丢掉：照常抛的话，界面显示的是 B 的 diff，
+          // 顶部错误条却报 A 的「bad object」（PR 113 review）
+          if (!stillWanted()) return
+          setState((s) => ({ ...s, diff: { files: [], error: toErrorMessage(err) }, diffScope: scope }))
+          throw err
+        }
+        if (stillWanted()) setState((s) => ({ ...s, diff, diffScope: scope }))
+      } finally {
+        if (diffRunning.current.get(flight) === entry) diffRunning.current.delete(flight)
+        finish()
       }
-      if (stillWanted()) setState((s) => ({ ...s, diff, diffScope: scope }))
     })
   }
 
@@ -1085,11 +1178,46 @@ export function useRepoStore() {
    *
    * 按**刷新后**的状态算该读哪个区（第 65 条）：选中的文件可能刚换了区，按点击那一刻的区去读，
    * 读回来的整份 diff 只会被丢掉。`selection` 是取值函数，调用方传最新的选中。
+   *
+   * @param touched 只改了 index 的操作（Stage / Unstage）传刚操作的路径，状态只重读这几个路径。
+   *   会动工作区的操作（丢弃、提交、DU/UD 二选一）不传，照常全量读
    */
-  const refreshChanges = async (path: string, selection: () => FileSelection) => {
-    const status = await refreshStatus(path)
-    await refreshDiff(path, changesSection(selection(), status))
+  const refreshChanges = async (path: string, selection: () => FileSelection, touched?: string[]) => {
+    // 这次写操作之后才开读的 diff 可以复用，之前的不行（`refreshDiff` 的 `joinSince`）
+    const since = ++writeSeq.current
+    const status = await refreshStatus(path, touched)
+    const scope = changesDiffScope(selection(), status)
+    if (scope) await refreshDiff(path, scope, since)
   }
+
+  /**
+   * 本应用自己写了 index（Stage / Unstage）之后调，补上原来靠监听那一轮顺带做的事。
+   *
+   * 自己写的 index 不再触发 `repo-changed`（`commands::watch::OwnIndexWrite`，6.13 方案 B），于是：
+   * - merge driver 要重查：检查的指纹覆盖 index 里的路径和暂存的 `.gitattributes`（独立 review 第 2 条）
+   * - 同一个仓库开在别的标签里时，那些标签收不到任何事件，要通知它们全量刷新（第 6 条）
+   */
+  const afterIndexWrite = (path: string) => {
+    void refreshMergeDrivers(path).catch((err) => console.warn('merge driver 检查失败：', err))
+    for (const notify of indexWriteSubscribers) notify(path, storeIdentity)
+  }
+
+  // 别的标签写了同一个仓库的 index：全量刷新状态和当前视图的 diff。
+  // 依赖为空：处理函数只读 ref，刷新函数也只碰 ref 和 setState，闭包住第一次渲染的那份不会读到旧值
+  useEffect(() => {
+    const onIndexWrite = (path: string, origin: object) => {
+      if (origin === storeIdentity) return
+      const mine = lastStatusPath.current
+      if (!mine || !samePath(mine, path)) return
+      void refreshStatus(mine).catch(() => undefined)
+      // merge driver 的检查也看 index（暂存的 .gitattributes），同样要重查（第二轮独立 review 第 2 条）
+      void refreshMergeDrivers(mine).catch(() => undefined)
+      const scope = wantedDiffScope.current
+      if (scope) void refreshDiff(mine, scope).catch(() => undefined)
+    }
+    indexWriteSubscribers.add(onIndexWrite)
+    return () => { indexWriteSubscribers.delete(onIndexWrite) }
+  }, [])
 
   const selectCommit = (id: string) => {
     setState((s) => ({ ...s, selectedId: id }))
@@ -1136,6 +1264,7 @@ export function useRepoStore() {
     reportError,
     wantedDiffScope,
     refreshChanges,
+    afterIndexWrite,
   }
 }
 
@@ -1147,7 +1276,7 @@ export interface RepoRefreshers {
   refreshWorktrees: (path: string) => Promise<void>
   /** `.gitattributes` 或 git 配置变了要重查；后端按指纹缓存，没变时不重扫。 */
   refreshMergeDrivers: (path: string) => Promise<DriverReport>
-  refreshDiff: (path: string, scope: string) => Promise<void>
+  refreshDiff: (path: string, scope: string, joinSince?: number) => Promise<void>
   refreshUpstream: (path: string) => Promise<void>
   refreshStashes: (path: string) => Promise<void>
   /** §6.6.3 第二档。只在第一档报告「有人动过」之后才调。 */
@@ -1170,15 +1299,16 @@ export interface RepoRefreshers {
 }
 
 /**
- * @param changesScope 「本地改动」视图右侧 diff 的 scope：选中文件在 Unstaged 是 `unstaged`
- *   （暂存区对比工作区），在 Staged 是 `staged`（HEAD 对比暂存区），见第 65 条
+ * @param changesScope 「本地改动」视图右侧 diff 的 scope（`changesDiffScope`）：选中文件在 Unstaged 是
+ *   `unstaged:<路径>`（暂存区对比工作区），在 Staged 是 `staged:<路径>`（HEAD 对比暂存区），见第 65 条；
+ *   没有文件可显示时为 null
  * @param active 这个标签是不是当前显示的那个。所有标签都挂载着，焦点事件每个标签都收得到
  */
 export function useRepoEffects(
   state: RepoState,
   refreshers: RepoRefreshers,
   viewMode: string,
-  changesScope: FileSection,
+  changesScope: string | null,
   active: boolean,
 ) {
   const { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, checkSvnSyncOnFocus, markSvnFollowOnBlur, refreshSvnSyncState, refreshSvnBranchesBehind, auditSvnIfDue, reportError } = refreshers
@@ -1193,14 +1323,18 @@ export function useRepoEffects(
     if (!state.path || !diffScope) return
     // 不 catch 的话失败是一个未处理的 rejection，顶部错误条什么都不显示（第 72 条）。
     // 与文件监听那条不同，这里是用户点了才读的，失败要让他看见
-    refreshDiff(state.path, diffScope).catch(reportError)
+    // 只要这一份数据：已经在读同一个 scope 就复用那一轮（Stage 之后写操作的刷新多半刚发出它）
+    refreshDiff(state.path, diffScope, 0).catch(reportError)
   }, [state.selectedId, state.path, diffScope])
 
   useEffect(() => {
     if (!state.path) return
     let unlisten: (() => void) | undefined
-    // 依赖里有 diffScope，换选中、换区都会重新注册。`listen` 是一次 IPC 往返，
-    // 清理时它可能还没回来：回来之后立刻注销，否则每换一次就多挂一个监听器（同 `useExternalToolExit`）
+    // 依赖里**没有** diffScope：「本地改动」的 scope 随选中的文件变（6.13 方案 C），方向键每按一下就变，
+    // 跟着重新注册的话注销与重新注册之间那一次 IPC 往返里的事件会丢（独立 review 第 4 条）。处理函数按
+    // 事件到达时的 `wantedDiffScope` 读，不需要它。`vcs` 在依赖里：处理函数按它决定要不要跑 SVN 那几项。
+    // 换仓库时仍会重新注册。`listen` 是一次 IPC 往返，清理时它可能还没回来：回来之后立刻注销，
+    // 否则每换一次就多挂一个监听器（同 `useExternalToolExit`）
     let disposed = false
     listen<string>('repo-changed', (event) => {
       const path = state.path!
@@ -1231,7 +1365,7 @@ export function useRepoEffects(
       // ——那是本地读，但在几万文件的工作副本上仍然是可感知的开销。
       //
       // 比对用的「上次观测值」存在 **ref** 里（见 `useRepoStore` 的
-      // `lastRootRevs`）：这个监听器的 `useEffect` 依赖是 `[state.path, diffScope]`，
+      // `lastRootRevs`）：这个监听器的 `useEffect` 依赖是 `[state.path, state.capabilities.vcs]`，
       // 把它放进 state 的话闭包会永远读到注册那一刻的值，比较恒为不等，
       // 第二档还是每次都跑——分层白做。
       if (state.capabilities.vcs === 'svn') {
@@ -1254,7 +1388,7 @@ export function useRepoEffects(
       disposed = true
       unlisten?.()
     }
-  }, [state.path, diffScope])
+  }, [state.path, state.capabilities.vcs])
 
   /**
    * 锁被持有期间轮询同步状态，直到它松开（spec §5.1）。

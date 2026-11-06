@@ -174,13 +174,17 @@ pub fn save_patch(path: String, rev: String, out: String) -> Result<()> {
     Ok(())
 }
 
+/// Stage / Unstage 只写 index，前端随后自己就地刷新。登记成「自己写的」，
+/// 监听就不再为这次 index 变化补发一整轮刷新（`commands::watch::OwnIndexWrite`）。
 #[tauri::command(async)]
 pub fn stage(path: String, paths: Vec<String>) -> Result<()> {
+    let _own = crate::commands::watch::OwnIndexWrite::begin(&path);
     crate::vcs::backend_for(&path)?.stage(&paths)
 }
 
 #[tauri::command(async)]
 pub fn unstage(path: String, paths: Vec<String>) -> Result<()> {
+    let _own = crate::commands::watch::OwnIndexWrite::begin(&path);
     crate::vcs::backend_for(&path)?.unstage(&paths)
 }
 

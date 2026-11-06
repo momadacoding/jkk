@@ -41,6 +41,7 @@ const READ_METHODS: &[&str] = &[
     "open",
     "graph",
     "status",
+    "status_paths",
     "diff",
     "list_stashes",
 ];

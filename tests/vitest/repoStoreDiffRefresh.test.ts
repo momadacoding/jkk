@@ -101,6 +101,84 @@ describe('refreshDiff 只写回当前视图要的那一份', () => {
     await answer('workdir', diffOf('a.txt'))
     expect(result.current.state.diff.files.map((f) => f.path)).toEqual(['a.txt'])
   })
+
+  // 6.13 方案 C：右侧按选中的单个文件读，方向键一路按下去，每个文件都会发一次读取。
+  // 不排队的话几十个读取同时打开仓库、读 index；中间那些文件用户根本没停下来看
+  it('「本地改动」里连着换选中的文件：同时只读一个，中间跳过的不读，只补读最后一个', async () => {
+    const { result } = renderHook(() => useRepoStore())
+    result.current.wantedDiffScope.current = 'unstaged:a.txt'
+    act(() => { void result.current.refreshDiff('C:/r', 'unstaged:a.txt') })
+    for (const f of ['b.txt', 'c.txt', 'd.txt']) {
+      result.current.wantedDiffScope.current = `unstaged:${f}`
+      act(() => { void result.current.refreshDiff('C:/r', `unstaged:${f}`) })
+    }
+    // 换到 Staged 里的文件也排在同一队里
+    result.current.wantedDiffScope.current = 'staged:s.txt'
+    act(() => { void result.current.refreshDiff('C:/r', 'staged:s.txt') })
+    expect(pending.filter((p) => p.cmd === 'read_diff').map((p) => p.args.scope)).toEqual(['unstaged:a.txt'])
+    // 用户已经离开 a.txt：它的结果不写
+    await answer('unstaged:a.txt', diffOf('a.txt'))
+    expect(result.current.state.diffScope).toBeNull()
+    expect(pending.filter((p) => p.cmd === 'read_diff').map((p) => p.args.scope)).toEqual(['staged:s.txt'])
+    await answer('staged:s.txt', diffOf('s.txt'))
+    expect(result.current.state.diffScope).toBe('staged:s.txt')
+  })
+
+  // 第二轮独立 review 第 7 条：Stage 选中的文件后它换到了 Staged，写操作之后的刷新读一次
+  // `staged:a.txt`，选中跟着变又让 effect 再要一次。后一次不需要更新的数据，直接用在跑的那一轮
+  it('按选中读（可复用）：同一个 scope 已经在读，就用那一轮，不再补读', async () => {
+    const { result } = renderHook(() => useRepoStore())
+    result.current.wantedDiffScope.current = 'staged:a.txt'
+    act(() => {
+      void result.current.refreshChanges('C:/r', () => ({ section: 'staged', paths: ['a.txt'], anchor: 'a.txt' }), ['a.txt'])
+    })
+    const status = pending.find((p) => p.cmd === 'read_status')!
+    pending.splice(pending.indexOf(status), 1)
+    await act(async () => { status.resolve({ unstaged: [], staged: [{ path: 'a.txt', status: 'modified', additions: 1, deletions: 0 }] }) })
+    expect(pending.filter((p) => p.cmd === 'read_diff').map((p) => p.args.scope)).toEqual(['staged:a.txt'])
+    let joined!: Promise<void>
+    act(() => { joined = result.current.refreshDiff('C:/r', 'staged:a.txt', 0) })
+    await answer('staged:a.txt', diffOf('a.txt'))
+    await act(async () => { await joined })
+    expect(pending.filter((p) => p.cmd === 'read_diff')).toEqual([])
+  })
+
+  it('反过来：选中先读、写操作之后的刷新随后要同一个 scope，同样复用（那一轮是在写之后开读的）', async () => {
+    const { result } = renderHook(() => useRepoStore())
+    result.current.wantedDiffScope.current = 'staged:a.txt'
+    act(() => {
+      void result.current.refreshChanges('C:/r', () => ({ section: 'staged', paths: ['a.txt'], anchor: 'a.txt' }), ['a.txt'])
+    })
+    // 状态还没回来，选中就先触发了读取
+    act(() => { void result.current.refreshDiff('C:/r', 'staged:a.txt', 0) })
+    const status = pending.find((p) => p.cmd === 'read_status')!
+    pending.splice(pending.indexOf(status), 1)
+    await act(async () => { status.resolve({ unstaged: [], staged: [{ path: 'a.txt', status: 'modified', additions: 1, deletions: 0 }] }) })
+    expect(pending.filter((p) => p.cmd === 'read_diff').map((p) => p.args.scope)).toEqual(['staged:a.txt'])
+  })
+
+  it('写操作之前就在读的同一个 scope：写操作之后的刷新不复用它，照常补读', async () => {
+    const { result } = renderHook(() => useRepoStore())
+    result.current.wantedDiffScope.current = 'staged:a.txt'
+    act(() => { void result.current.refreshDiff('C:/r', 'staged:a.txt', 0) })
+    act(() => {
+      void result.current.refreshChanges('C:/r', () => ({ section: 'staged', paths: ['a.txt'], anchor: 'a.txt' }), ['a.txt'])
+    })
+    const status = pending.find((p) => p.cmd === 'read_status')!
+    pending.splice(pending.indexOf(status), 1)
+    await act(async () => { status.resolve({ unstaged: [], staged: [{ path: 'a.txt', status: 'modified', additions: 1, deletions: 0 }] }) })
+    await answer('staged:a.txt', diffOf('a.txt'))
+    expect(pending.filter((p) => p.cmd === 'read_diff').map((p) => p.args.scope)).toEqual(['staged:a.txt'])
+  })
+
+  it('单个文件的读取不和提交详情的排在一起', () => {
+    const { result } = renderHook(() => useRepoStore())
+    act(() => {
+      void result.current.refreshDiff('C:/r', 'unstaged:a.txt')
+      void result.current.refreshDiff('C:/r', 'commit:B')
+    })
+    expect(pending.filter((p) => p.cmd === 'read_diff').map((p) => p.args.scope)).toEqual(['unstaged:a.txt', 'commit:B'])
+  })
 })
 
 // 第 65 条：Stage / Unstage 之后选中的文件可能换了区，刷新 diff 要按**新的**状态算读哪个区，
@@ -171,7 +249,7 @@ describe('refreshChanges', () => {
     act(() => { void result.current.refreshChanges('C:/r', unstagedA) })
     const status = pending.find((p) => p.cmd === 'read_status')!
     await act(async () => { status.resolve({ unstaged: [ch('b.txt')], staged: [ch('a.txt')] }) })
-    expect(pending.filter((p) => p.cmd === 'read_diff').map((p) => p.args.scope)).toEqual(['staged'])
+    expect(pending.filter((p) => p.cmd === 'read_diff').map((p) => p.args.scope)).toEqual(['staged:a.txt'])
   })
 
   // Stage 的回调先读状态，文件监听那一轮在它读的过程中到达：不并发，也不让它作废
@@ -185,7 +263,7 @@ describe('refreshChanges', () => {
     const own = pending.find((p) => p.cmd === 'read_status')!
     pending.splice(pending.indexOf(own), 1)
     await act(async () => { own.resolve({ unstaged: [ch('b.txt')], staged: [ch('a.txt')] }) })
-    expect(pending.filter((p) => p.cmd === 'read_diff').map((p) => p.args.scope)).toEqual(['staged'])
+    expect(pending.filter((p) => p.cmd === 'read_diff').map((p) => p.args.scope)).toEqual(['staged:a.txt'])
   })
 
   // 在读的那一轮可能是写操作之前发起的（比如上一次保存触发的监听），它读到的是旧状态
@@ -201,7 +279,7 @@ describe('refreshChanges', () => {
     const fresh = pending.find((p) => p.cmd === 'read_status')!
     pending.splice(pending.indexOf(fresh), 1)
     await act(async () => { fresh.resolve({ unstaged: [ch('b.txt')], staged: [ch('a.txt')] }) })
-    expect(pending.filter((p) => p.cmd === 'read_diff').map((p) => p.args.scope)).toEqual(['staged'])
+    expect(pending.filter((p) => p.cmd === 'read_diff').map((p) => p.args.scope)).toEqual(['staged:a.txt'])
   })
 })
 

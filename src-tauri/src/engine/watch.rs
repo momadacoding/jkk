@@ -45,6 +45,6 @@ pub fn watch_targets(root: &Path, repo: Option<&git2::Repository>) -> Vec<PathBu
 ///
 /// 解析失败（路径已被删、权限不足）时退回原值：那种情况下多挂一次监听远好过
 /// 少挂——少挂意味着界面收不到刷新事件。
-fn canonical(path: &Path) -> PathBuf {
+pub fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
