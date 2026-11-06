@@ -33,6 +33,7 @@ pub mod svn_dirty;
 pub mod svn_exclude;
 pub mod svn_externals;
 pub mod svn_follow;
+pub mod svn_follow_audit;
 pub mod svn_follow_index;
 pub mod svn_follow_mark;
 pub mod svn_gitignore;

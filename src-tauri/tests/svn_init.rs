@@ -2043,6 +2043,42 @@ fn a_file_replaced_by_a_copy_is_refused_instead_of_recorded_with_the_copy_source
 }
 
 #[test]
+fn a_replaced_file_without_history_names_the_replacement_instead_of_asking_to_retry() {
+    // 事故分析 6.3：`svn rm X` 后同名 `svn add`（不带历史、文件还在磁盘上），`svn cat -r BASE`
+    // 报 E200009，录制停在 `svn_baseline_classification_conflict`。原文案说「多半是录制过程中
+    // 被外部改动了，请重试一次」——工作副本不变，重试多少次都一样，用户 11-05 就反复重试过。
+    let fx = svn_repo();
+    let wc = fx.wc();
+    svn(&wc, &["rm", "Code/A.cs"]);
+    std::fs::write(wc.join("Code/A.cs"), "new\n").unwrap();
+    svn(&wc, &["add", "Code/A.cs"]);
+
+    let err = init_hybrid(&req(&fx)).expect_err("取不到服务器上的旧内容，必须停下");
+    assert_eq!(
+        err.code, "svn_baseline_classification_conflict",
+        "实际：{}",
+        err.message
+    );
+    assert!(err.message.contains("Code/A.cs"), "{}", err.message);
+    assert!(
+        err.message.contains("替换"),
+        "要说出最常见的原因：{}",
+        err.message
+    );
+    assert!(
+        err.message.contains("还原"),
+        "要给出能走通的处理办法：{}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("请重试一次"),
+        "重试没用：{}",
+        err.message
+    );
+    assert!(!wc.join(".git").exists(), "失败要整个回退");
+}
+
+#[test]
 fn a_replaced_file_deleted_from_disk_is_refused_not_silently_dropped() {
     // 独立 review 发现：它在 svn status 里与「add 后删」同形（`missing revision="-1"`），
     // 只按 revision 判会把服务器上确实有的 `Code/A.cs` 摘出基线，且体检全绿。

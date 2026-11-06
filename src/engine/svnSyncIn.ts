@@ -57,6 +57,24 @@ export type SyncInOutcome =
    * stash 已被外部删掉时。
    */
   | { kind: 'stageLost'; newRev: number | null; stashOid: string | null; files: string[] }
+  /**
+   * 手动跟进收尾了，但收尾核对发现重放结果与跟进前不一致（事故分析 6.9）：`changed` 是跟进前后
+   * 磁盘内容不同的文件，`resurrected` 是分支里有、新基线和磁盘上都没有的文件。只有手动跟进会报。
+   *
+   * `before` 是代表跟进前磁盘的提交（stash 或原分支 HEAD）。`stashOid` 为 null：这次没有未提交的
+   * 改动，没有备份可留。`stageLost` 非 null：暂存状态也没保住，含义同 `stageLost.files`。
+   * `auditError` 非 null：核对没跑成（这时两个清单为空），流程照常收尾、备份留着。
+   */
+  | {
+      kind: 'followDrift'
+      newRev: number
+      changed: string[]
+      resurrected: string[]
+      before: string
+      stashOid: string | null
+      stageLost: string[] | null
+      auditError: string | null
+    }
 
 /** 与 `ConfirmRequest` 同名的那几个字段，组件直接展开。 */
 export interface SyncConfirmModel {
@@ -124,6 +142,62 @@ export function stageLostDetail(o: Extract<SyncInOutcome, { kind: 'stageLost' }>
     `· 放回暂存区（不动磁盘）：git restore --source=${oid}^2 --staged -- <文件>\n` +
     `也可以在侧栏的 STASHES 里找到这一条。另有 refs/mygitclient/sync/ 下的一个引用钉着它，确认不再需要时一并删掉。`
   )
+}
+
+/**
+ * 手动跟进收尾核对有发现时的说明（事故分析 6.9）。命令里给完整 OID：用户要照抄。
+ *
+ * 不能说成「完成」了事：2026-11-05 磁盘上的文件被静默合错，界面报完成，正确内容唯一的副本
+ * （stash 备份）也随之被删。
+ */
+export function describeFollowDrift(o: Extract<SyncInOutcome, { kind: 'followDrift' }>): OutcomeNotice {
+  const parts: string[] = [
+    o.auditError
+      ? '分支已经在新基线上，但收尾核对没能跑完，没法确认磁盘上的内容都对。'
+      : '分支已经在新基线上，但收尾核对发现有文件不对，请看一下。',
+  ]
+  if (o.auditError) {
+    parts.push(`核对失败的原因：${o.auditError}`)
+  }
+  if (o.changed.length > 0) {
+    // `git restore --worktree` 只写磁盘、不动暂存区；`git checkout <提交> -- <文件>` 会顺手把它暂存。
+    // 引号不能省：cmd.exe 里 `^` 是转义符，不加引号 `<oid>^3` 会被吃成 `<oid>3`
+    const untrackedNote = o.stashOid
+      ? '\n跟进前还没被 git 跟踪的文件，把命令里的提交换成它的第三个父提交：\n' +
+        `git restore --source="${o.before}^3" --worktree -- <文件>`
+      : ''
+    parts.push(
+      `下面这些文件跟进后的内容和跟进前不一样：\n${listFiles(o.changed)}\n\n` +
+        '如果是你刚才解决冲突时有意改的，可以忽略；否则多半是重放时被合错了（git 没有报冲突）。' +
+        '跟进前的版本可以这样查看、取回（在仓库根目录执行）：\n' +
+        `· 查看：git show "${o.before}:<文件>"\n` +
+        `· 写回磁盘（不动暂存区）：git restore --source="${o.before}" --worktree -- <文件>` +
+        untrackedNote +
+        '\n跟进前根本不存在的文件（跟进后多出来的）没有旧版本可取，不需要的话直接删掉。',
+    )
+  }
+  if (o.resurrected.length > 0) {
+    parts.push(
+      `下面这些文件还在重放后的分支里，但 SVN 新基线里已经没有了：\n${listFiles(o.resurrected)}\n\n` +
+        '多半是 SVN 上已经删除或改名、又被旧的快照提交带了回来。确认不需要的话：\n' +
+        '· 磁盘上没有的：「本地改动」里显示为删除，提交这条删除即可\n' +
+        '· 磁盘上还在的：用 git rm --cached -- <文件> 只从 git 里删、不动磁盘上那份，再提交',
+    )
+  }
+  if (o.stashOid) {
+    parts.push(
+      `跟进前的未提交改动没有删，原始备份还在 stash 列表里（mygitclient-sync:…，${o.stashOid}）。` +
+        '它可能是正确内容唯一的副本，核对完之后再自己删掉。',
+    )
+  }
+  if (o.stageLost) {
+    parts.push(stageLostDetail({ kind: 'stageLost', newRev: o.newRev, stashOid: o.stashOid, files: o.stageLost }))
+  }
+  return {
+    tone: 'attention',
+    title: o.auditError ? '手动跟进完成，但收尾核对没跑成' : '手动跟进完成，但有文件和跟进前不一样',
+    detail: parts.join('\n\n'),
+  }
 }
 
 /** 计划 A8：S10 用不带 `--index` 的 stash apply。 */
@@ -235,6 +309,9 @@ export function describeSyncOutcome(o: SyncInOutcome): OutcomeNotice | null {
         title: o.newRev === null ? '已放弃这次更新，暂存状态没保住' : '更新完成，暂存状态没保住',
         detail: (o.newRev === null ? '分支已回到更新前的位置。' : '') + stageLostDetail(o),
       }
+    case 'followDrift':
+      // 只有手动跟进会报；走到这里也照实说，不吞掉
+      return describeFollowDrift(o)
   }
 }
 

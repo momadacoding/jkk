@@ -8,6 +8,7 @@
  */
 import type { ExternalChange } from './svnSync'
 import {
+  describeFollowDrift,
   stageLostDetail,
   type NoticeTone,
   type OutcomeNotice,
@@ -477,5 +478,7 @@ export function describeManualFollowOutcome(o: SyncInOutcome): OutcomeNotice | n
           `为防万一，改动的原始备份没有删，还在 stash 列表里（mygitclient-sync:…，${short}）。` +
           '确认工作区里的内容没问题之后，可以自己把它删掉。',
       }
+    case 'followDrift':
+      return describeFollowDrift(o)
   }
 }
