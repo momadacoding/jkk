@@ -9,7 +9,7 @@
 #[path = "common/svn_fixtures.rs"]
 mod svn_fixtures;
 
-use app_lib::engine::svn_dirty::{classify, Fix};
+use app_lib::engine::svn_dirty::{classify, replaced_without_history_paths, Fix};
 use app_lib::engine::svn_xml::StatusEntry;
 
 /// 一个**已提交过**的节点（`revision="1"`、不是复制来的）。
@@ -52,6 +52,8 @@ fn every_svn_status_item_maps_to_exactly_one_outcome() {
     for (item, want) in [
         // 磁盘上的不是服务器内容（或磁盘上根本没有）→ 取服务器那一版
         ("modified", Some(Fix::TakeBase)),
+        // 不带历史的 `replaced` 照旧是 TakeBase：要不要停下由录制器按「归不归 git 管」判
+        // （事故分析 6.2，`replaced_without_history_paths`）；带历史的按复制子树判，见下面几条
         ("replaced", Some(Fix::TakeBase)),
         ("conflicted", Some(Fix::TakeBase)),
         ("deleted", Some(Fix::TakeBase)),
@@ -293,11 +295,42 @@ fn everything_under_a_directory_replaced_by_a_copy_is_refused() {
 }
 
 #[test]
-fn a_replaced_node_without_history_keeps_its_current_classification() {
-    // `svn rm` 后同名 `svn add`（不带历史）：`revision="1"`、没有 copied。这一种的
-    // 取数来源另有待决策（分析文档 6.2），这次不改它的行为。
-    let got = classify(&[node("Code/A.cs", "replaced", Some(1), false)]).unwrap();
-    assert_eq!(got.get("Code/A.cs"), Some(&Fix::TakeBase), "实际：{got:?}");
+fn replaced_nodes_without_history_are_listed_for_the_recorder() {
+    // 事故分析 6.2：`svn rm` 后同名 `svn add`（不带历史）：`revision="1"`、没有 copied。服务器 rN
+    // 上有旧内容，但 `svn cat -r BASE` 报 E200009。分类不拒绝（独立 review H1：它不知道归不归
+    // git 管），只把它们列出来，由录制器对归 git 管的路径停下
+    let entries = [
+        node("Code/A.cs", "replaced", Some(1), false),
+        node("Code/D", "replaced", Some(1), false),
+        node("Code/D/x.cs", "added", Some(-1), false),
+        node("Code/M.cs", "modified", Some(1), false),
+    ];
+    let got: Vec<String> = replaced_without_history_paths(&entries)
+        .into_iter()
+        .collect();
+    assert_eq!(got, vec!["Code/A.cs".to_string(), "Code/D".to_string()]);
+    assert!(classify(&entries).is_ok(), "分类本身照常");
+}
+
+#[test]
+fn a_replaced_node_with_history_is_not_listed() {
+    // 带历史的由 classify 按复制根处理（报 svn_dirty_replaced_with_history），不重复列
+    let entries = [node("Code/A.cs", "replaced", None, true)];
+    assert!(replaced_without_history_paths(&entries).is_empty());
+}
+
+#[test]
+fn an_svn_rm_then_add_inside_a_copied_directory_is_dropped_with_the_copy() {
+    // 6.2 独立 review 实测：`svn cp Code/Y Code/C; svn rm --force Code/C/y.cs; …; svn add Code/C/y.cs`。
+    // C 是 `added copied`，y.cs 是 `replaced revision="-1"`、没有 copied 标记。服务器上根本没有 C，
+    // 应当随复制根一起摘掉，不能报「服务器上这个位置有旧内容」
+    let entries = [
+        node("Code/C", "added", None, true),
+        node("Code/C/y.cs", "replaced", Some(-1), false),
+    ];
+    let got = classify(&entries).unwrap();
+    assert_eq!(got.get("Code/C/y.cs"), Some(&Fix::Drop), "实际：{got:?}");
+    assert!(replaced_without_history_paths(&entries).is_empty());
 }
 
 #[test]

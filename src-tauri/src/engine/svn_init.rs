@@ -20,7 +20,10 @@ use crate::engine::svn_config::{
     normalize_whitelist_entry, write_config, DisabledGitignore, SvnConfig, BASELINE_BRANCH,
     RESPECT_GITIGNORE_VERSION, SVN_GIT_MODE,
 };
-use crate::engine::svn_dirty::{classify, explained_paths, read_dirty, Fix};
+use crate::engine::svn_dirty::{
+    classify, explained_paths, read_dirty, replaced_without_history,
+    replaced_without_history_paths, Fix,
+};
 use crate::engine::svn_exclude::{generate_exclude, write_exclude};
 use crate::engine::svn_externals::{detect_pinned, PinnedExternal};
 use crate::engine::svn_gitignore::{
@@ -703,6 +706,17 @@ fn record_server_tree_timed(
     Ok((tree, touched))
 }
 
+/// `path` 自己或最近的一个祖先在 `replaced` 里时返回它。
+fn replaced_at_or_above<'a>(path: &str, replaced: &'a BTreeSet<String>) -> Option<&'a str> {
+    let mut cur = path;
+    loop {
+        if let Some(r) = replaced.get(cur) {
+            return Some(r.as_str());
+        }
+        cur = &cur[..cur.rfind('/')?];
+    }
+}
+
 /// R2b 的逐条改写：脏条目换成服务器 rN 的内容，或从候选索引里剔除。
 fn rewrite_to_server(
     repo_root: &str,
@@ -711,6 +725,10 @@ fn rewrite_to_server(
     fixes: &std::collections::BTreeMap<String, Fix>,
     touched: &BTreeSet<String>,
 ) -> Result<()> {
+    // 事故分析 6.2：自己或某个祖先是不带历史的替换，服务器上的旧内容取不到。文件走 TakeBase 会撞
+    // E200009；目录底下重新加的子文件走 Drop 会静默少录（PR 116 遗留）。初始化与重建在 `git add`
+    // 之前已经查过一次（`dry_run_before_add`）；同步 S7、交付 D7a、跟进没有那一步，这里是兜底
+    refuse_replaced(pre, fixes, touched)?;
     for (path, fix) in fixes {
         if !touched.contains(path) {
             // 不归 git 管，树里本来就没有它。见上面「`S` 必须恰好」。
@@ -723,20 +741,20 @@ fn rewrite_to_server(
                 // 不能自作主张把它当成 Drop 处理掉——那等于用一个猜测悄悄改变
                 // 基线的内容集合。
                 //
-                // 文案不说「请重试」（事故分析 6.3）：PR 116 之后走到这里的主要是不带历史的
-                // 替换（`svn rm X` 后同名 `svn add`，item `replaced` revision=N），工作副本
-                // 不变就每次都停在同一处。录制期间被外部改动是另一种、少见得多的原因。
+                // 文案不能只说「请重试」（事故分析 6.3）：工作副本不变时重试每次都停在同一处。
+                // 不带历史的替换（原来最常见的原因）从 6.2 起在分类时就停下了
+                // （`svn_dirty_replaced_without_history`），走到这里的是录制期间被外部改动，
+                // 或者分类还不认识的工作副本状态。
                 BaseContent::NotOnServer => {
                     return Err(GitError::new(
                         "svn_baseline_classification_conflict",
                         format!(
                             "`{path}` 按 svn status 是服务器上有的文件，但取它在服务器 r{} 上的内容时，\
                              svn 说它还没提交过，本地拿不到服务器上的那一版。\n\
-                             最常见的原因是这个文件被「替换」过：先在 svn 里删掉，又在同一位置重新添加\
-                             （TortoiseSVN 里显示为 R）。请先把这次替换提交，或者对它做「还原」，然后再试。\
-                             工作副本不变的话，重试还会停在这里。\n\
-                             如果没有做过这类操作，可能是录制过程中 TortoiseSVN 正在提交或更新，\
-                             等它做完之后再试。",
+                             如果录制过程中 TortoiseSVN 正在提交或更新，等它做完之后再试一次。\n\
+                             工作副本不变而仍停在这里，说明这个文件处在本应用还不认识的状态\
+                             （例如在 svn 里被删掉又重新添加过）：请在 TortoiseSVN 里把它提交，\
+                             或者对它做「还原」，然后再试。",
                             pre.node_rev
                         ),
                     ))
@@ -815,8 +833,30 @@ fn dry_run_before_add(
         let scope = WScope::for_repo(root, cfg)?;
         let fixes = classify(&pre.dirty)?;
         let touched = explained_paths(&fixes, &scope)?;
+        // 6.2 第 2 轮 review M-a：在 `git add` 之前就停，大工程上 add 要跑很久
+        refuse_replaced(pre, &fixes, &touched)?;
         dry_run_include_set(root, &scope, &fixes, &touched)
     })
+}
+
+/// 归 git 管的脏路径里，自己或某个祖先是不带历史的替换时停下（事故分析 6.2）。
+///
+/// 一次预扫，不边取内容边判：逐条改写时排在前面的路径可能先撞上别的错误（第 2 轮 review L-a）。
+fn refuse_replaced(
+    pre: &Preflight,
+    fixes: &std::collections::BTreeMap<String, Fix>,
+    touched: &BTreeSet<String>,
+) -> Result<()> {
+    let replaced = replaced_without_history_paths(&pre.dirty);
+    if replaced.is_empty() {
+        return Ok(());
+    }
+    for path in fixes.keys().filter(|p| touched.contains(*p)) {
+        if let Some(root) = replaced_at_or_above(path, &replaced) {
+            return Err(replaced_without_history(path, root));
+        }
+    }
+    Ok(())
 }
 
 /// `git init` 之后的全部步骤。抽出来是为了让**唯一的**回退点长在一个地方——

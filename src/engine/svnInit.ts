@@ -574,8 +574,8 @@ export function wizardErrorHint(code: string, message = ''): string {
       '录制过程中工作副本被外部改动了（多半是 TortoiseSVN 那边提交或更新了一次）。' +
       '基线没有改动，等它做完之后重新点一次即可。',
     svn_baseline_classification_conflict:
-      '最常见的原因是上面那个文件在 svn 里被「替换」过（先删掉、又在同一位置重新添加，TortoiseSVN 里显示为 R），' +
-      '本地取不到它在服务器上的旧内容。先提交这次替换或者对它做「还原」再试；工作副本不变的话，重试还会停在同一处。',
+      '录制过程中 TortoiseSVN 正在提交或更新的话，等它做完再试一次就好。' +
+      '工作副本不变而重试仍停在同一处，就是这个文件处在本应用还不认识的状态：在 TortoiseSVN 里把它提交，或者对它做「还原」，再试。',
     include_set_mismatch:
       '上面的清单按「是哪条规则做的决定」分组，每组列几个样例；查不到规则的单独成组。' +
       '被某个 .gitignore 挡掉的：把那个 .gitignore 挪走或删掉对应的行——' +

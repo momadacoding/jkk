@@ -476,6 +476,10 @@ pub fn classify(entries: &[StatusEntry]) -> Result<BTreeMap<String, Fix>> {
             // 磁盘上的不是服务器内容。`deleted` / `missing` 是磁盘上干脆没有——
             // 它们仍然要取回来，因为基线记的是**服务器**上的样子，本地的删除是
             // 一处待交付的改动，不是基线的一部分。
+            //
+            // 不带历史的 `replaced` 也留在 TakeBase：分类不知道它归不归 git 管（白名单目录里替换过的
+            // `.png` 不归），只读的调用方（体检、服务器侧核对）也不该因它停下。要不要拒绝由录制器按
+            // `touched` 判，见 [`replaced_without_history_paths`]（事故分析 6.2，独立 review H1）
             "modified" | "replaced" | "conflicted" | "deleted" | "missing" => Fix::TakeBase,
 
             // 服务器 rN 上根本没有它们。`ignored` 与 `unversioned` 都算：
@@ -564,6 +568,9 @@ fn copy_root<'a>(
                     }
                 }
             }
+            // 复制子树里 `svn rm` 再 `svn add` 的节点（6.2 独立 review 实测）：`replaced`、
+            // `revision="-1"`、没有 copied 标记。它自己不是复制根，要穿过去找上面的
+            Some(e) if cur == path && e.item == "replaced" && e.revision == Some(-1) => {}
             _ => return root,
         }
         cur = &cur[..cur.rfind('/')?];
@@ -608,6 +615,53 @@ fn copy_origin_unknown(path: &str, root: &str, root_item: &str) -> GitError {
             "{}是复制过来的，但往上找到的 `{root}`（svn status 里是 `{root_item}`）也是复制来的，\
              真正的复制起点在白名单之外，看不到。服务器上这些路径有没有、是什么，在本地判断不了。\n\
              请先在 TortoiseSVN 里把这次复制提交，然后再试。本应用什么都没改。",
+            under(path, root)
+        ),
+    )
+}
+
+/// 不带复制历史的 replaced 节点（`svn rm X` 后在同一位置 `svn add`；目录同理），复制子树里的除外
+/// （那些由 [`classify`] 按复制根处理）。事故分析 6.2。
+///
+/// 录制器对**归 git 管的路径**（`touched`）问：它自己或它的某个祖先在不在这个集合里，在就停下
+/// （[`replaced_without_history`]）。不在 `classify` 里拒绝（独立 review H1）：白名单目录里替换过的
+/// `.png` 不归 git 管，原来录制时直接跳过，体检、服务器侧核对也只读不录，都不该被它挡住。
+pub fn replaced_without_history_paths(entries: &[StatusEntry]) -> BTreeSet<String> {
+    let by_path: BTreeMap<String, &StatusEntry> = entries
+        .iter()
+        .map(|e| (e.path.replace('\\', "/"), e))
+        .collect();
+    by_path
+        .iter()
+        .filter(|(path, e)| {
+            e.item == "replaced" && !e.copied && copy_root(path, &by_path).is_none()
+        })
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
+/// 不带历史的替换（见 [`replaced_without_history_paths`]）挡住了归 git 管的 `path`。事故分析 6.2
+/// 选定的做法：离线取不到服务器上的旧内容（`svn cat -r BASE` 报 E200009，2026-11-05 实测），也不为它
+/// 破例联网，明确停下并说清怎么办。
+///
+/// 目录也停（PR 116 遗留）：`svn rm D; mkdir D; svn add D` 之后，D 底下重新加的同名文件 schedule 是
+/// `add`，单看它会被摘出基线，可服务器上旧的 D 里有它。
+///
+/// **边界（未修）**：只有 D 落在 `svn status` 的 target 视野里才看得见。白名单根本身在被替换的父目录
+/// 里时（白名单 `Code/Sub/Inner`，替换的是 `Code/Sub`），status 只给出 `added -1` 的子节点、看不到
+/// replaced 的 D，子文件照旧按 Drop 静默少录。要修得对白名单根的父目录查 `svn info` 的 schedule，
+/// 留作后续（6.2 第 2 轮 review M2）。
+///
+/// 不说「本应用什么都没改」：同步的 S7、交付的 D7a 走到这里时 SVN 那边已经动过了。
+pub fn replaced_without_history(path: &str, root: &str) -> GitError {
+    GitError::new(
+        "svn_dirty_replaced_without_history",
+        format!(
+            "{}在 svn 里被替换过：先删掉，又在同一位置重新添加（TortoiseSVN 里显示为 R）。\
+             服务器上这个位置有旧内容，但本地取不到它（svn 只记着「替换」这件事，旧内容要联网才拿得到），\
+             录进基线就会少录或者录错，所以基线没有录。\n\
+             请先在 TortoiseSVN 里把这次替换提交，或者对 `{root}` 做「还原」，然后再试。\
+             工作副本不变的话，重试还会停在这里。",
             under(path, root)
         ),
     )

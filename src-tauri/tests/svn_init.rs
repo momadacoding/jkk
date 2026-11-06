@@ -2044,10 +2044,69 @@ fn a_file_replaced_by_a_copy_is_refused_instead_of_recorded_with_the_copy_source
 }
 
 #[test]
+fn a_replaced_file_git_does_not_track_neither_blocks_init_nor_the_baseline_check() {
+    // 6.2 独立 review H1：白名单目录里替换过的 `.png` 不归 git 管（扩展名只有 `.cs`），原来录制时
+    // 直接跳过。在分类里一刀切地拒绝的话，初始化、同步 S7、交付 D7a 都会被它挡住，后两者此时
+    // SVN 已经写过了；只读的体检也一样
+    let fx = svn_repo();
+    let wc = fx.wc();
+    std::fs::write(wc.join("Code/icon.png"), "png1\n").unwrap();
+    svn(&wc, &["add", "Code/icon.png"]);
+    svn(&wc, &["commit", "-m", "icon", "--non-interactive"]);
+    svn(&wc, &["update", "--non-interactive"]);
+    svn(&wc, &["rm", "Code/icon.png"]);
+    std::fs::write(wc.join("Code/icon.png"), "png2\n").unwrap();
+    svn(&wc, &["add", "Code/icon.png"]);
+
+    init_hybrid(&req(&fx)).unwrap_or_else(|e| panic!("{}: {}", e.code, e.message));
+    check_current_baseline(&fx.wc_str()).unwrap_or_else(|e| panic!("{}: {}", e.code, e.message));
+}
+
+#[test]
+fn a_directory_replaced_without_history_is_refused_not_recorded_without_its_files() {
+    // PR 116 遗留：`svn rm D; mkdir D; svn add D`。D 底下重新加的同名文件 schedule 是 `add`，
+    // 单看它会被摘出基线，可服务器上旧的 D 里有它：静默少录一个服务器上的文件
+    let fx = svn_repo();
+    let wc = fx.wc();
+    std::fs::create_dir_all(wc.join("Code/Sub")).unwrap();
+    std::fs::write(wc.join("Code/Sub/x.cs"), "x1\n").unwrap();
+    svn(&wc, &["add", "Code/Sub"]);
+    svn(&wc, &["commit", "-m", "sub", "--non-interactive"]);
+    svn(&wc, &["update", "--non-interactive"]);
+    svn(&wc, &["rm", "Code/Sub"]);
+    std::fs::create_dir_all(wc.join("Code/Sub")).unwrap();
+    std::fs::write(wc.join("Code/Sub/x.cs"), "x2\n").unwrap();
+    svn(&wc, &["add", "Code/Sub"]);
+
+    let err = init_hybrid(&req(&fx)).expect_err("服务器上旧的 Sub 取不到，必须停下");
+    assert_eq!(
+        err.code, "svn_dirty_replaced_without_history",
+        "实际：{}",
+        err.message
+    );
+    assert!(err.message.contains("Code/Sub"), "{}", err.message);
+    assert!(!wc.join(".git").exists(), "失败要整个回退");
+    assert_stopped_before_git_add(&err.message);
+}
+
+/// 6.2 第 2 轮 review M-a：替换在 `git add` 之前的纳入集合预检里就停下（大工程上 add 要跑很久）。
+fn assert_stopped_before_git_add(msg: &str) {
+    let tail = msg
+        .split("各阶段耗时")
+        .nth(1)
+        .unwrap_or_else(|| panic!("错误正文里没有耗时：{msg}"));
+    assert!(
+        tail.contains("纳入集合预检") && tail.contains("← 在这一步失败"),
+        "要停在预检：{tail}"
+    );
+    assert!(!tail.contains("git add"), "不该走到 git add：{tail}");
+}
+
+#[test]
 fn a_replaced_file_without_history_names_the_replacement_instead_of_asking_to_retry() {
     // 事故分析 6.3：`svn rm X` 后同名 `svn add`（不带历史、文件还在磁盘上），`svn cat -r BASE`
-    // 报 E200009，录制停在 `svn_baseline_classification_conflict`。原文案说「多半是录制过程中
-    // 被外部改动了，请重试一次」——工作副本不变，重试多少次都一样，用户 11-05 就反复重试过。
+    // 报 E200009。原文案说「多半是录制过程中被外部改动了，请重试一次」——工作副本不变，重试
+    // 多少次都一样，用户 11-05 就反复重试过。6.2 之后在分类时就停下，不再走到取数那一步
     let fx = svn_repo();
     let wc = fx.wc();
     svn(&wc, &["rm", "Code/A.cs"]);
@@ -2056,7 +2115,7 @@ fn a_replaced_file_without_history_names_the_replacement_instead_of_asking_to_re
 
     let err = init_hybrid(&req(&fx)).expect_err("取不到服务器上的旧内容，必须停下");
     assert_eq!(
-        err.code, "svn_baseline_classification_conflict",
+        err.code, "svn_dirty_replaced_without_history",
         "实际：{}",
         err.message
     );
@@ -2077,6 +2136,7 @@ fn a_replaced_file_without_history_names_the_replacement_instead_of_asking_to_re
         err.message
     );
     assert!(!wc.join(".git").exists(), "失败要整个回退");
+    assert_stopped_before_git_add(&err.message);
 }
 
 #[test]
