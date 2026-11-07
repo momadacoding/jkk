@@ -11,7 +11,7 @@
 | 3 | 前端：判定写回后触发、与横幅「跟进」共用 `exclusive`、同一现场不重试、完成提示、横幅写明没自动的原因、设置框开关 | 完成 | `pnpm build` 过；`pnpm test` 77 个文件 1297 条全过（新增 `svnSyncFlow` 6 条、`BaselineBanner` 4 条、`svnFollow` 4 条、`SettingsDialog` 2 条） |
 | 4 | watcher 放行收件箱里新到的事件（钩子一写事件就跑检测） | 完成 | `watch.rs` 单测 `a_hook_event_landing_in_the_inbox_wakes_the_check` |
 | 5 | 文档：分析 §6.12 状态、计划状态、E2E 清单 | 完成 | 新增 `e2e/2026-11-07-svn-auto-follow-e2e.md`（7 个场景，未跑） |
-| 6 | `pnpm tauri dev` 真实窗口验证新命令 | 未开始 | |
+| 6 | `pnpm tauri dev` 真实窗口验证新命令 | 完成 | 2026-11-07，确认跑的是本 worktree 的 `target\debug\app.exe`，`--config` 换 identifier 隔离。E2E 场景 1、4、6（关掉那一半）、7 通过，`set_svn_auto_follow` 参数名正反例都验了，见 `e2e/2026-11-07-svn-auto-follow-e2e.md`。tauri dev 又把 `Cargo.toml` 改成 LF，用 `unix2dos` 改回 |
 
 ## 决策条目
 
