@@ -18,7 +18,7 @@ import {
   type RepoTabInfo,
   type SessionView,
 } from './engine/session'
-import { readAppSettings, saveAppSettings } from './store/appSettingsStore'
+import { readAppSettings, saveAllSettings } from './store/appSettingsStore'
 import './styles.css'
 
 /** 设置框：每次打开都重读，快捷键注册状态可能在框外变过（启动时被占、别的程序释放了）。 */
@@ -183,7 +183,11 @@ function App() {
         <SettingsDialog
           initial={settings.kind === 'open' ? settings.view : null}
           loadError={settings.kind === 'failed' ? settings.message : null}
-          onSave={saveAppSettings}
+          onSave={(closeToTray, showShortcut, svnAutoFollow) =>
+            settings.kind === 'open'
+              ? saveAllSettings(settings.view, closeToTray, showShortcut, svnAutoFollow)
+              : Promise.reject(new Error('设置还没读出来'))
+          }
           onClose={closeSettings}
         />
       )}

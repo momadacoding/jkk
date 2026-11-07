@@ -48,7 +48,7 @@ import type {
   RebuildReport,
 } from '../engine/svnInit'
 import { samePath } from '../engine/path'
-import type { FollowOutcome, SvnUserInfo } from '../engine/svnFollow'
+import type { AutoFollowOutcome, FollowOutcome, SvnUserInfo } from '../engine/svnFollow'
 import type { HookHealth, TsvnHooksStatus } from '../engine/tsvnHooks'
 import type { SyncInExpect, SyncInOutcome, SyncInPreview } from '../engine/svnSyncIn'
 import type { SyncOutExpect, SyncOutOutcome, SyncOutPreview } from '../engine/svnSyncOut'
@@ -388,6 +388,14 @@ export function svnSyncAbort(path: string): Promise<SyncInOutcome> {
 /** 跟进外部提交（分析 §6.5）：录新基线、对象层重放分支、发布。不写磁盘，不发 SVN 写命令。 */
 export function svnFollow(path: string): Promise<FollowOutcome> {
   return invoke<FollowOutcome>('svn_follow', { path })
+}
+
+/**
+ * 自动跟进（事故分析 6.12）：条件全部满足才发布，否则 `skipped`、一个 ref 都不动。设置里关掉时
+ * 后端直接返回 `skipped`（`AUTO_FOLLOW_OFF`）。
+ */
+export function svnFollowAuto(path: string): Promise<AutoFollowOutcome> {
+  return invoke<AutoFollowOutcome>('svn_follow_auto', { path })
 }
 
 /** 把崩溃留下的跟进走完，或回到一致状态后重新跟进。 */

@@ -32,6 +32,26 @@ fn missing_fields_fall_back_to_their_own_defaults() {
 }
 
 #[test]
+fn a_settings_file_from_before_auto_follow_turns_it_on() {
+    // 0.7.3 写的文件没有这个字段：升级之后自动跟进默认开（事故分析 6.12，用户 2026-10-30 选定）
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("settings.json");
+    fs::write(
+        &path,
+        r#"{ "closeToTray": true, "showShortcut": "Ctrl+Alt+J" }"#,
+    )
+    .unwrap();
+    assert!(app_settings::load_from(&path).svn_auto_follow);
+    assert!(AppSettings::default().svn_auto_follow);
+
+    fs::write(&path, r#"{ "svnAutoFollow": false }"#).unwrap();
+    assert!(
+        !app_settings::load_from(&path).svn_auto_follow,
+        "关掉的要留着关"
+    );
+}
+
+#[test]
 fn explicit_null_shortcut_stays_disabled() {
     // 用户主动关掉快捷键后，下次启动不能被默认值「复活」
     let dir = TempDir::new().unwrap();
@@ -47,6 +67,7 @@ fn save_then_load_round_trips_and_overwrites() {
     let first = AppSettings {
         close_to_tray: false,
         show_shortcut: None,
+        svn_auto_follow: false,
     };
     app_settings::save_to(&path, &first).unwrap();
     assert_eq!(app_settings::load_from(&path), first);
@@ -54,6 +75,7 @@ fn save_then_load_round_trips_and_overwrites() {
     let second = AppSettings {
         close_to_tray: true,
         show_shortcut: Some("Ctrl+Shift+F12".into()),
+        svn_auto_follow: true,
     };
     app_settings::save_to(&path, &second).unwrap();
     assert_eq!(app_settings::load_from(&path), second);

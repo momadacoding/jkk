@@ -16,7 +16,11 @@ import {
   type SyncState,
   type SyncStateUnreadable,
 } from '../engine/svnJournal'
-import type { FollowActionId } from '../engine/svnFollow'
+import {
+  describeAutoFollowSkip,
+  type AutoFollowNotice,
+  type FollowActionId,
+} from '../engine/svnFollow'
 import type { SyncActionId } from '../engine/svnSyncIn'
 import type { SyncOutActionId } from '../engine/svnSyncOut'
 import type { BannerAction } from '../engine/svnSync'
@@ -71,6 +75,17 @@ interface BaselineBannerProps {
   onOpenHooks?: () => void
   /** 失效横幅上的「撤销注册」。调用方负责先弹确认。 */
   onUnregisterHooks?: () => void
+  /**
+   * 这一次为什么没自动跟进（事故分析 6.12）。只挂在「SVN 侧有新内容」那条横幅上；调用方按现场
+   * 核对过（`autoFollowKey`），过时的原因不会传进来。
+   */
+  autoFollowSkip?: string | null
+  /** 自动跟进完成后那条不打断操作的提示。`null` 不渲染。 */
+  autoFollowed?: AutoFollowNotice | null
+  /** 提示上的「查看详情」：弹同一份跟进报告。 */
+  onAutoFollowedDetails?: () => void
+  /** 提示上的「知道了」。 */
+  onAutoFollowedDismiss?: () => void
 }
 
 /**
@@ -122,6 +137,10 @@ export function BaselineBanner({
   hooks = null,
   onOpenHooks,
   onUnregisterHooks,
+  autoFollowSkip = null,
+  autoFollowed = null,
+  onAutoFollowedDetails,
+  onAutoFollowedDismiss,
 }: BaselineBannerProps) {
   // 未收尾 / 同步进行中排在最前，其余一律让位：那两种状态下仓库停在中间态，
   // 别的横幅拿半推进的基线算出来的结论可能是错的，而它们的出口（重建基线）
@@ -142,11 +161,32 @@ export function BaselineBanner({
   const [copied, setCopied] = useState(false)
   // 「跟进」只在调用方接了流程时才出现（见 `onFollow` 的说明）
   const modelActions = (model?.actions ?? []).filter((a) => a.id !== 'follow' || onFollow)
+  // 只挂在「SVN 侧有新内容」上：别的横幅（回退、钉死的 external）本来就不会自动跟进
+  const skipNote =
+    model && autoFollowSkip && sync?.verdict.kind === 'externallyAdvanced'
+      ? describeAutoFollowSkip(autoFollowSkip)
+      : null
+  // 自动跟进的提示不受 hushed 影响：它说的是已经做完的事
+  const notice = isSvn ? autoFollowed : null
 
-  if (!unfinished && !eolModel && !model && !auditModel && !standalone && !staleHooks) return null
+  if (!unfinished && !eolModel && !model && !auditModel && !standalone && !staleHooks && !notice) {
+    return null
+  }
 
   return (
     <>
+      {notice && (
+        <div className={`banner-baseline ${notice.tone}`} role="status">
+          <div className="banner-baseline-head">
+            <strong>{notice.title}</strong>
+          </div>
+          <p className="banner-baseline-detail">{notice.detail}</p>
+          <div className="banner-baseline-actions">
+            {onAutoFollowedDetails && <button onClick={onAutoFollowedDetails}>查看详情</button>}
+            {onAutoFollowedDismiss && <button onClick={onAutoFollowedDismiss}>知道了</button>}
+          </div>
+        </div>
+      )}
       {unfinished && (
         <div className={`banner-baseline ${unfinished.tone}`}>
           <div className="banner-baseline-head">
@@ -203,6 +243,7 @@ export function BaselineBanner({
             <pre className="banner-baseline-command">{model.command}</pre>
           )}
           {model.note && <p className="banner-baseline-note">{model.note}</p>}
+          {skipNote && <p className="banner-baseline-note">{skipNote}</p>}
           {model.files && model.files.length > 0 && (
             <ul className="banner-baseline-files">
               {model.files.map((f) => (

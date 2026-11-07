@@ -321,6 +321,9 @@ const DEBOUNCE: Duration = Duration::from_millis(300);
 /// 轮询 channel 的间隔，需要明显小于 DEBOUNCE 才能及时判定静默。
 const TICK: Duration = Duration::from_millis(100);
 
+/// TortoiseSVN 钩子收件箱（`tsvn_inbox::inbox_dir`）在 `.git` 下的位置，正斜杠形式。
+const INBOX_EVENTS: &str = "/.git/mygitclient/tsvn-inbox/";
+
 /// 判断一个文件事件是否值得触发刷新。
 ///
 /// 注意：路径要先归一化成正斜杠——Windows 上 notify 给出的是
@@ -333,6 +336,13 @@ fn is_relevant(repo: Option<&git2::Repository>, root: &Path, target: &Path) -> b
         // 碰巧有别的变动才会更新。界面自己探测它不产生事件，见
         // `probing_the_sync_lock_does_not_trigger_a_refresh`，所以不会形成刷新回路。
         if target.file_name() == Some(std::ffi::OsStr::new(svn_lock::LOCK_FILE)) {
+            return true;
+        }
+        // TortoiseSVN 钩子刚写进收件箱的事件（事故分析 6.12；分析 §6.13.6）：提交 / 更新刚做完，
+        // 前端收到 repo-changed 就比 wc.db 戳、跑第二档，判定前进了就自动跟进，不用等下一次焦点。
+        // 只认改名落地的 `.json`，钩子先写的 `.tmp` 不算。跟进收尾清收件箱时 watcher 是挂起的
+        // （`with_watch_suspended`），删除事件进不来，不会自激
+        if s.contains(INBOX_EVENTS) && s.ends_with(".json") {
             return true;
         }
         // 失焦快照（`svn_follow_mark`）是客户端自己写的线索，每次切窗口写一次，放过去
@@ -801,6 +811,27 @@ mod tests {
         // 只挡这个子目录：同名前缀的 journal 仍然相关
         let journal = root.join(".git").join("mygitclient-sync.json");
         assert!(is_relevant(None, &root, &journal));
+    }
+
+    #[test]
+    fn a_hook_event_landing_in_the_inbox_wakes_the_check() {
+        // 事故分析 6.12：TortoiseSVN 提交 / 更新完，钩子写一条事件，前端马上跑检测、自动跟进。
+        // 路径形状取 `tsvn_inbox` 自己的，两边写法一漂移这条就失败
+        let (_d, root) = wc();
+        let repo = root.to_str().unwrap();
+        let dir = crate::engine::tsvn_inbox::inbox_dir(repo);
+        assert!(is_relevant(
+            None,
+            &root,
+            &dir.join("1730000000000-42-post_update.json")
+        ));
+        // 写到一半的临时文件、目录本身都还不算
+        for p in [
+            dir.join("1730000000000-42-post_update.json.tmp"),
+            dir.clone(),
+        ] {
+            assert!(!is_relevant(None, &root, &p), "{}", p.display());
+        }
     }
 
     /// 界面探测锁（`probe` 独占打开、`holder` 宽松读）**本身**不能产生相关事件。

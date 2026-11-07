@@ -37,6 +37,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::app_settings::read_app_settings,
             commands::app_settings::save_app_settings,
+            commands::app_settings::set_svn_auto_follow,
             commands::diff::read_diff,
             commands::conflict::check_merge_drivers,
             commands::conflict::read_conflicts,
@@ -107,6 +108,7 @@ pub fn run() {
             commands::svn_sync::svn_sync_out_abort,
             commands::svn_sync::svn_follow,
             commands::svn_sync::svn_follow_continue,
+            commands::svn_sync::svn_follow_auto,
             commands::svn_sync::svn_follow_manual,
             commands::svn::svn_sync_status,
             commands::repo::read_capabilities,

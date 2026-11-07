@@ -20,3 +20,12 @@ pub fn save_app_settings(
 ) -> Result<AppSettingsView> {
     state.apply(&app, close_to_tray, show_shortcut)
 }
+
+/// 打开 / 关掉 SVN 自动跟进（事故分析 6.12）。JS 侧是 `invoke('set_svn_auto_follow', { enabled })`。
+#[tauri::command(async)]
+pub fn set_svn_auto_follow(
+    state: State<'_, DesktopState>,
+    enabled: bool,
+) -> Result<AppSettingsView> {
+    state.set_svn_auto_follow(enabled)
+}

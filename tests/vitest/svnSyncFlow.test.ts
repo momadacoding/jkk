@@ -7,6 +7,7 @@ vi.mock('@/store/repoStore', () => ({
   svnSyncContinue: vi.fn(),
   svnSyncAbort: vi.fn(),
   svnFollow: vi.fn(),
+  svnFollowAuto: vi.fn(),
   svnFollowContinue: vi.fn(),
   svnFollowManual: vi.fn(),
 }))
@@ -64,6 +65,12 @@ function deps(log: string[], confirm?: (r: ConfirmRequest) => Promise<boolean>):
     checkoutBranch: async (name) => {
       log.push(`checkout:${name}`)
     },
+    mergeRiskForAuto: async () => {
+      log.push('mergeRiskForAuto')
+      return null
+    },
+    setAutoFollowSkip: (s) => log.push(`autoSkip:${s ? `${s.key}|${s.message}` : 'null'}`),
+    showAutoFollowed: () => log.push('showAutoFollowed'),
   }
 }
 
@@ -96,8 +103,119 @@ beforeEach(() => {
   vi.mocked(store.svnSyncContinue).mockReset()
   vi.mocked(store.svnSyncAbort).mockReset()
   vi.mocked(store.svnFollow).mockReset()
+  vi.mocked(store.svnFollowAuto).mockReset()
   vi.mocked(store.svnFollowContinue).mockReset()
   vi.mocked(store.svnFollowManual).mockReset()
+})
+
+describe('handleAutoFollow（事故分析 6.12）', () => {
+  /** 自动跟进在后台跑完：等到按钮复位再断言。 */
+  const settled = (log: string[]) => vi.waitFor(() => expect(log).toContain('following:false'))
+
+  it('完成：不清错误条、不弹 merge driver 确认框，刷新之后挂提示，不弹报告框', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnFollowAuto).mockImplementation(async () => {
+      log.push('svnFollowAuto')
+      return { kind: 'done', report }
+    })
+
+    expect(createSvnSyncFlow(deps(log)).handleAutoFollow('k1')).toBe(true)
+    await settled(log)
+    await vi.waitFor(() => expect(log).toContain('showAutoFollowed'))
+
+    expect(store.svnFollowAuto).toHaveBeenCalledWith('C:/wc1')
+    expect(log).toEqual([
+      'mergeRiskForAuto',
+      'following:true',
+      'svnFollowAuto',
+      'refreshAfterFollow',
+      'refreshSvnSyncState',
+      'refreshSvnSync',
+      'fetchSvnLog',
+      'following:false',
+      'autoSkip:null',
+      'showAutoFollowed',
+    ])
+  })
+
+  it('不自动：原因按现场记给横幅，什么都不刷新、不挂提示', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnFollowAuto).mockResolvedValue({
+      kind: 'skipped',
+      code: 'svn_auto_follow_conflict',
+      message: '有冲突',
+    })
+
+    createSvnSyncFlow(deps(log)).handleAutoFollow('k1')
+    await vi.waitFor(() => expect(log).toContain('autoSkip:k1|有冲突'))
+
+    expect(log).not.toContain('refreshAfterFollow')
+    expect(log).not.toContain('showAutoFollowed')
+    expect(log).not.toContain('clearError')
+  })
+
+  it('设置里关掉了：不写原因，横幅照旧', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnFollowAuto).mockResolvedValue({
+      kind: 'skipped',
+      code: 'svn_auto_follow_off',
+      message: '设置里关掉了自动跟进。',
+    })
+
+    createSvnSyncFlow(deps(log)).handleAutoFollow('k1')
+    await settled(log)
+    await vi.waitFor(() => expect(log).toContain('autoSkip:null'))
+    expect(log.filter((l) => l.startsWith('autoSkip:k1'))).toEqual([])
+  })
+
+  it('merge driver 有风险：不发命令、不问人，原因写进横幅', async () => {
+    const log: string[] = []
+    createSvnSyncFlow({
+      ...deps(log),
+      mergeRiskForAuto: async () => '没配 merge driver',
+    }).handleAutoFollow('k1')
+    await vi.waitFor(() => expect(log).toContain('autoSkip:k1|没配 merge driver'))
+
+    expect(store.svnFollowAuto).not.toHaveBeenCalled()
+    expect(log).not.toContain('guardMerge')
+    expect(log).not.toContain('following:true')
+  })
+
+  it('有流程在走时不发起、返回 false；自动跟进在跑时横幅的「跟进」也不重入', async () => {
+    const busy = deps([])
+    busy.running.current = true
+    expect(createSvnSyncFlow(busy).handleAutoFollow('k1')).toBe(false)
+    expect(store.svnFollowAuto).not.toHaveBeenCalled()
+
+    const log: string[] = []
+    let release!: () => void
+    vi.mocked(store.svnFollowAuto).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = () => resolve({ kind: 'skipped', code: 'x', message: 'm' })
+        }),
+    )
+    const d = deps(log)
+    const flow = createSvnSyncFlow(d)
+    flow.handleAutoFollow('k1')
+    await vi.waitFor(() => expect(store.svnFollowAuto).toHaveBeenCalled())
+    await flow.handleFollow()
+    expect(store.svnFollow).not.toHaveBeenCalled()
+    expect(flow.handleAutoFollow('k2')).toBe(false)
+    release()
+    await vi.waitFor(() => expect(d.running.current).toBe(false))
+  })
+
+  it('动过 ref 之后才失败：照常进错误条，不挂提示', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnFollowAuto).mockRejectedValue({ code: 'svn_follow_index_rename_failed' })
+
+    createSvnSyncFlow(deps(log)).handleAutoFollow('k1')
+    await settled(log)
+
+    expect(log).toContain('reportError:svn_follow_index_rename_failed')
+    expect(log).not.toContain('showAutoFollowed')
+  })
 })
 
 describe('handleFollow', () => {

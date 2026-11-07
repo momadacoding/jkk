@@ -1,5 +1,5 @@
 /**
- * 应用级设置（关窗进托盘、全局快捷键）的类型，与设置框里录制快捷键的纯逻辑。
+ * 应用级设置（关窗进托盘、全局快捷键、SVN 自动跟进）的类型，与设置框里录制快捷键的纯逻辑。
  */
 
 /** 后端 `read_app_settings` / `save_app_settings` 的返回值。 */
@@ -12,6 +12,8 @@ export interface AppSettingsView {
   /** 已保存的快捷键此刻没注册上（被别的程序占了等）的原因。 */
   shortcutError: string | null
   defaultShortcut: string
+  /** SVN 混合仓库里自动跟进 TortoiseSVN 的提交 / 更新（事故分析 6.12）。 */
+  svnAutoFollow: boolean
 }
 
 /** 录制只用到 KeyboardEvent 的这几个字段，单测不必造真事件。 */

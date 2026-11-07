@@ -34,6 +34,7 @@ import { createSvnSyncFlow } from './svnSyncFlow'
 import { createSvnSyncOutFlow } from './svnSyncOutFlow'
 import { useDeliverDialog } from './DeliverDialog'
 import { useFollowReportDialog } from './FollowReportDialog'
+import { autoFollowKey, describeAutoFollowDone, type FollowReport } from '../engine/svnFollow'
 import SvnInitWizard from './SvnInitWizard'
 import BaselineBanner from './BaselineBanner'
 import { baselineMap, findDelivered, selectionDiffScope } from '../engine/svnGraph'
@@ -199,6 +200,13 @@ export function RepoTab({
   const { showFollowReport, dialog: followReportDialog } = useFollowReportDialog()
   // 跟进执行中（svnSyncFlow 写），横幅上的按钮据此禁用
   const [following, setFollowing] = useState(false)
+  // 自动跟进（事故分析 6.12）：没自动的原因（按现场 key 记，过时的不显示）与完成后的提示
+  const [autoSkip, setAutoSkip] = useState<{ key: string; message: string } | null>(null)
+  const [autoFollowed, setAutoFollowed] = useState<FollowReport | null>(null)
+  // 试过的现场：同一个现场只试一次（见 `autoFollowKey`）。放 ref：effect 里读写，不该引起渲染
+  const autoTried = useRef<string | null>(null)
+  // 流程在下面 loading 的提前 return 之后才建出来，effect 经这个 ref 调它
+  const autoFollowRef = useRef<((key: string) => boolean) | null>(null)
   // TortoiseSVN 钩子（C1h）：健康状态给横幅；注册框开着时是读到的状态
   const [hooksHealth, setHooksHealth] = useState<HookHealth | null>(null)
   const [hooksDialog, setHooksDialog] = useState<TsvnHooksStatus | null>(null)
@@ -236,6 +244,30 @@ export function RepoTab({
     changesScope,
     active,
   )
+
+  /**
+   * 自动跟进用的 merge driver 检查：与 `guardMerge` 同一个判据，但不弹框，有风险就返回原因。
+   * 检查本身失败时不自动（`guardMerge` 在这时放行，是因为有人在场点了按钮）。
+   */
+  const mergeRiskForAuto = useCallback(async (): Promise<string | null> => {
+    const path = state.path
+    if (!path) return '仓库还没打开完。'
+    try {
+      const request = mergeRiskConfirm(await refreshMergeDrivers(path))
+      return request ? `${request.message}${request.warning}点「跟进」会先请你确认。` : null
+    } catch (err) {
+      return `没能检查 merge driver 的配置（${toErrorMessage(err)}）。点「跟进」照样可以完成。`
+    }
+  }, [state.path, refreshMergeDrivers])
+
+  // 判定写回 ExternallyAdvanced 就自动跟进一次（事故分析 6.12）。只在当前标签：报告与提示要有人看得见，
+  // 切回来时 effect 会再跑。有流程在走时不记现场，那个流程收尾刷新判定之后 svnSync 会再变
+  useEffect(() => {
+    if (!active || state.capabilities.vcs !== 'svn') return
+    const key = autoFollowKey(state.svnSync, state.headHash)
+    if (!key || autoTried.current === key) return
+    if (autoFollowRef.current?.(key)) autoTried.current = key
+  }, [active, state.capabilities.vcs, state.svnSync, state.headHash])
 
   useEffect(() => {
     openRepo(repoPath)
@@ -805,7 +837,19 @@ export function RepoTab({
   }
 
   // 「更新」「跟进」与横幅上的继续 / 放弃。流程在 `svnSyncFlow.ts`，这里只注入依赖
-  const { handleSvnUpdate, handleSyncAction, handleFollow, handleCheckoutBehind } = createSvnSyncFlow({
+  const showReport = (report: FollowReport) =>
+    showFollowReport({
+      report,
+      readUser: () => svnGetUser(repoPath),
+      saveUser: (user) => svnSetUser(repoPath, user),
+    })
+  const {
+    handleSvnUpdate,
+    handleSyncAction,
+    handleFollow,
+    handleCheckoutBehind,
+    handleAutoFollow,
+  } = createSvnSyncFlow({
     running: syncFlowRunning,
     repoPath,
     syncState: () => state.svnSyncState,
@@ -824,17 +868,16 @@ export function RepoTab({
       await refreshSvnBranchesBehind(repoPath)
       void refreshHooksHealth()
     },
-    showFollowReport: (report) =>
-      showFollowReport({
-        report,
-        readUser: () => svnGetUser(repoPath),
-        saveUser: (user) => svnSetUser(repoPath, user),
-      }),
+    showFollowReport: showReport,
     checkoutBranch: async (name) => {
       await invoke('checkout', { path: repoPath, rev: name })
       await refreshAfterCheckout()
     },
+    mergeRiskForAuto,
+    setAutoFollowSkip: setAutoSkip,
+    showAutoFollowed: setAutoFollowed,
   })
+  autoFollowRef.current = handleAutoFollow
 
   // 「交付」与横幅上交付那一组按钮。`running` 与更新共用
   const { handleSvnDeliver, handleSyncOutAction } = createSvnSyncOutFlow({
@@ -957,6 +1000,16 @@ export function RepoTab({
         hooks={hooksHealth}
         onOpenHooks={() => void openHooks()}
         onUnregisterHooks={() => void unregisterHooks()}
+        autoFollowSkip={
+          autoSkip && autoSkip.key === autoFollowKey(state.svnSync, state.headHash)
+            ? autoSkip.message
+            : null
+        }
+        autoFollowed={autoFollowed ? describeAutoFollowDone(autoFollowed) : null}
+        onAutoFollowedDetails={() => {
+          if (autoFollowed) void showReport(autoFollowed)
+        }}
+        onAutoFollowedDismiss={() => setAutoFollowed(null)}
       />
       {hooksDialog && (
         <TsvnHooksDialog

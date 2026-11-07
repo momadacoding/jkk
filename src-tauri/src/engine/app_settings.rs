@@ -1,4 +1,4 @@
-//! 应用级设置（与仓库无关）：关窗是否进托盘、呼出主界面的全局快捷键。
+//! 应用级设置（与仓库无关）：关窗是否进托盘、呼出主界面的全局快捷键、SVN 自动跟进。
 //!
 //! 落在 `app_config_dir()/settings.json`，与 `session.json` 同目录。
 
@@ -26,9 +26,17 @@ pub struct AppSettings {
     /// 否则用户关掉的快捷键会在下次启动时被默认值「复活」。
     #[serde(default = "default_show_shortcut")]
     pub show_shortcut: Option<String>,
+    /// SVN 混合仓库里 TortoiseSVN 提交 / 更新之后自动跟进（事故分析 6.12）。默认开（用户
+    /// 2026-10-30 选定）；关掉后回到横幅上的「跟进」按钮。所有混合仓库共用这一个开关。
+    #[serde(default = "default_svn_auto_follow")]
+    pub svn_auto_follow: bool,
 }
 
 fn default_close_to_tray() -> bool {
+    true
+}
+
+fn default_svn_auto_follow() -> bool {
     true
 }
 
@@ -41,6 +49,7 @@ impl Default for AppSettings {
         Self {
             close_to_tray: default_close_to_tray(),
             show_shortcut: default_show_shortcut(),
+            svn_auto_follow: default_svn_auto_follow(),
         }
     }
 }

@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
+  autoFollowKey,
+  describeAutoFollowDone,
+  describeAutoFollowSkip,
   describeCheckoutBehind,
   describeFollowContinue,
   describeFollowConflict,
@@ -32,6 +35,53 @@ const report: FollowReport = {
   evidence: 'heuristic',
   evidenceCutoffMs: null,
 }
+
+describe('自动跟进（事故分析 6.12）', () => {
+  const advanced = {
+    verdict: {
+      kind: 'externallyAdvanced',
+      changed: [{ path: 'Code/A.cs', rev: 4, author: 'me' }],
+      added: [],
+      removed: [],
+    },
+  }
+
+  it('只有 SVN 侧有新内容时才有现场键；同步、分支落后、读不到判定都没有', () => {
+    expect(autoFollowKey(advanced, 'h1')).not.toBeNull()
+    expect(autoFollowKey({ verdict: { kind: 'inSync' } }, 'h1')).toBeNull()
+    expect(autoFollowKey({ verdict: { kind: 'wcLocked' } }, 'h1')).toBeNull()
+    expect(autoFollowKey(null, 'h1')).toBeNull()
+  })
+
+  it('同一个现场键相同；SVN 侧又有新内容、或 HEAD 动了，键就变了', () => {
+    const again = JSON.parse(JSON.stringify(advanced))
+    expect(autoFollowKey(again, 'h1')).toBe(autoFollowKey(advanced, 'h1'))
+    expect(autoFollowKey(advanced, 'h2')).not.toBe(autoFollowKey(advanced, 'h1'))
+    const more = {
+      verdict: { ...advanced.verdict, added: [{ path: 'Code/B.cs', rev: 5, author: 'zhang' }] },
+    }
+    expect(autoFollowKey(more, 'h1')).not.toBe(autoFollowKey(advanced, 'h1'))
+  })
+
+  it('没自动的原因前面写明「没有自动跟进」', () => {
+    expect(describeAutoFollowSkip('有冲突。')).toBe('没有自动跟进：有冲突。')
+  })
+
+  it('完成提示：一切顺利是灰色；有要留意的内容时变黄，并让人点开看', () => {
+    const ok = describeAutoFollowDone({
+      ...report,
+      changes: [{ path: 'Code/A.cs', rev: 4, author: 'me' }],
+    })
+    expect(ok.tone).toBe('quiet')
+    expect(ok.title).toBe('已自动跟进 SVN 侧的新内容')
+    expect(ok.detail).toContain('跟进了 1 个文件')
+    expect(ok.detail).not.toContain('查看详情')
+
+    const behind = describeAutoFollowDone({ ...report, behindBranches: [['old', '有冲突']] })
+    expect(behind.tone).toBe('warn')
+    expect(behind.detail).toContain('「查看详情」')
+  })
+})
 
 describe('describeFollowReport 的判定依据（C1h）', () => {
   it('写明按什么判定的暂存与 commit', () => {

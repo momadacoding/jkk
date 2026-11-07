@@ -12,6 +12,7 @@ const VIEW: AppSettingsView = {
   showShortcut: 'Ctrl+Alt+J',
   shortcutError: null,
   defaultShortcut: 'Ctrl+Alt+J',
+  svnAutoFollow: true,
 }
 
 function setup(view: AppSettingsView | null = VIEW, onSave = vi.fn(async () => {})) {
@@ -24,7 +25,23 @@ const recorder = () => screen.getByRole('button', { name: '快捷键' })
 const button = (name: string) => screen.getByRole('button', { name }) as HTMLButtonElement
 
 describe('SettingsDialog', () => {
-  it('录下新组合键后保存，参数是两项设置', async () => {
+  it('关掉自动跟进后保存传 false，说明随之换成关掉之后的样子', async () => {
+    const { onSave } = setup()
+    const box = screen.getByLabelText(/自动跟进/) as HTMLInputElement
+    expect(box.checked).toBe(true)
+    expect(screen.getByText(/不改工作区里的文件/)).toBeTruthy()
+    fireEvent.click(box)
+    expect(screen.getByText(/点「跟进」才会跟上/)).toBeTruthy()
+    fireEvent.click(button('保存'))
+    await waitFor(() => expect(onSave).toHaveBeenCalledWith(true, 'Ctrl+Alt+J', false))
+  })
+
+  it('已关掉的自动跟进打开框时就是不勾的', () => {
+    setup({ ...VIEW, svnAutoFollow: false })
+    expect((screen.getByLabelText(/自动跟进/) as HTMLInputElement).checked).toBe(false)
+  })
+
+  it('录下新组合键后保存，参数是三项设置', async () => {
     const { onSave, onClose } = setup()
     fireEvent.click(recorder())
     expect(recorder().textContent).toBe('请按下组合键…')
@@ -34,7 +51,7 @@ describe('SettingsDialog', () => {
     expect(recorder().textContent).toBe('Ctrl+Alt+K')
     fireEvent.click(button('保存'))
     await waitFor(() => expect(onClose).toHaveBeenCalled())
-    expect(onSave).toHaveBeenCalledWith(true, 'Ctrl+Alt+K')
+    expect(onSave).toHaveBeenCalledWith(true, 'Ctrl+Alt+K', true)
   })
 
   it('录制中按 Esc 只取消录制，不关框', () => {
@@ -63,7 +80,7 @@ describe('SettingsDialog', () => {
     fireEvent.click(screen.getByLabelText(/呼出主界面/))
     expect(recorder().disabled).toBe(true)
     fireEvent.click(button('保存'))
-    await waitFor(() => expect(onSave).toHaveBeenCalledWith(false, null))
+    await waitFor(() => expect(onSave).toHaveBeenCalledWith(false, null, true))
   })
 
   it('保存失败时错误留在框里，不关框，可以再点', async () => {

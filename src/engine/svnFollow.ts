@@ -107,6 +107,55 @@ export type FollowOutcome =
   /** 什么都没动：前置条件不满足，或者准备阶段失败。 */
   | { kind: 'refused'; code: string; message: string }
 
+/**
+ * 后端 `svn_follow::AutoFollowOutcome`（事故分析 6.12）。`skipped` 时一个 ref 都没动，`message` 直接
+ * 给横幅：说清是哪一条条件没满足、点「跟进」会怎样。
+ */
+export type AutoFollowOutcome =
+  | { kind: 'done'; report: FollowReport }
+  | { kind: 'skipped'; code: string; message: string }
+
+/** 设置里关掉了自动跟进（后端 `commands::svn_sync::AUTO_FOLLOW_OFF`）。横幅照旧，不写原因。 */
+export const AUTO_FOLLOW_OFF = 'svn_auto_follow_off'
+
+/**
+ * 这一次判定值不值得自动跟进一次，值得就返回它的「现场」键，否则 `null`。
+ *
+ * 只认 ExternallyAdvanced（日志 Task 1「偏离计划」：分支跟进入口不自动）。键由判定的全部内容与
+ * HEAD 组成：同一个现场只试一次，不自动之后不会每次存盘、每次切回窗口都重跑一遍录制与服务器体检；
+ * SVN 侧又有新内容、或者切了分支 / 提交了，键就变了，再试一次。
+ */
+export function autoFollowKey(
+  sync: { verdict: { kind: string } } | null,
+  head: string | null,
+): string | null {
+  if (!sync || sync.verdict.kind !== 'externallyAdvanced') return null
+  return `${head ?? ''}\n${JSON.stringify(sync.verdict)}`
+}
+
+/** 横幅上「为什么没自动跟进」的那一行。 */
+export function describeAutoFollowSkip(message: string): string {
+  return `没有自动跟进：${message}`
+}
+
+/** 自动跟进完成后那条不打断操作的提示（分析 §6.12「通知」）。详情是同一份跟进报告。 */
+export interface AutoFollowNotice {
+  /** `warn`：报告里有要你留意的内容（落后的分支、快照内容等），点开看。 */
+  tone: 'quiet' | 'warn'
+  title: string
+  detail: string
+}
+
+export function describeAutoFollowDone(r: FollowReport): AutoFollowNotice {
+  const m = describeFollowReport(r)
+  const look = m.tone === 'ok' ? '' : '报告里有要你留意的内容，请点「查看详情」。'
+  return {
+    tone: m.tone === 'ok' ? 'quiet' : 'warn',
+    title: '已自动跟进 SVN 侧的新内容',
+    detail: `${m.summary}${look}`,
+  }
+}
+
 export type FollowActionId = 'followContinue'
 
 /** 后端 `svn_follow_mark::SvnUserInfo`：「我的 SVN 用户名」的两个来源。 */

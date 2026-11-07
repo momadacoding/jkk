@@ -6,6 +6,7 @@
  */
 import {
   svnFollow,
+  svnFollowAuto,
   svnFollowContinue,
   svnFollowManual,
   svnSyncAbort,
@@ -14,6 +15,7 @@ import {
   svnSyncInPreview,
 } from '../store/repoStore'
 import {
+  AUTO_FOLLOW_OFF,
   describeCheckoutBehind,
   describeFollowConflict,
   describeFollowContinue,
@@ -21,6 +23,7 @@ import {
   describeManualFollow,
   describeManualFollowAction,
   describeManualFollowOutcome,
+  type AutoFollowOutcome,
   type FollowActionId,
   type FollowOutcome,
   type FollowReport,
@@ -65,6 +68,15 @@ export interface SvnSyncFlowDeps {
   showFollowReport: (report: FollowReport) => Promise<void>
   /** 切分支并刷新。失败要抛：「切换并手动跟进」据此停下。 */
   checkoutBranch: (name: string) => Promise<void>
+  /**
+   * 自动跟进用的 merge driver 检查（spec §4.6）：有风险时返回给横幅的原因，没有风险返回 `null`。
+   * 不弹框：自动跟进不能停下来问人，有风险就不自动，留给会弹确认框的「跟进」按钮。
+   */
+  mergeRiskForAuto: () => Promise<string | null>
+  /** 没自动跟进的原因，给横幅；`null` 清掉。`key` 是 `autoFollowKey` 算的现场。 */
+  setAutoFollowSkip: (skip: { key: string; message: string } | null) => void
+  /** 自动跟进完成：挂那条不打断操作的提示，详情是同一份报告。 */
+  showAutoFollowed: (report: FollowReport) => void
 }
 
 export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
@@ -236,6 +248,39 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
   }
 
   /**
+   * 自动跟进（事故分析 6.12）：判定写回 ExternallyAdvanced 之后由 `RepoTab` 发起，与横幅上的「跟进」
+   * 共用 `exclusive`，在跑时谁都不重入。
+   *
+   * 和按钮的差别：不清错误条（用户没做任何事）、不弹框（merge driver 有风险就不自动）、不自动时
+   * 只在横幅上写一行原因、完成时挂一条不打断操作的提示。出错（动过 ref 之后才失败）照常进错误条，
+   * 文案里写着此刻的状态。
+   */
+  const autoFollow = async (key: string) => {
+    const risk = await d.mergeRiskForAuto()
+    if (risk) {
+      d.setAutoFollowSkip({ key, message: risk })
+      return
+    }
+    d.setFollowing(true)
+    let outcome: AutoFollowOutcome
+    try {
+      outcome = await svnFollowAuto(d.repoPath)
+      if (outcome.kind === 'done') await afterFollow()
+    } catch (err) {
+      d.reportError(err)
+      return
+    } finally {
+      d.setFollowing(false)
+    }
+    if (outcome.kind === 'skipped') {
+      d.setAutoFollowSkip(outcome.code === AUTO_FOLLOW_OFF ? null : { key, message: outcome.message })
+      return
+    }
+    d.setAutoFollowSkip(null)
+    d.showAutoFollowed(outcome.report)
+  }
+
+  /**
    * 切到落后基线的分支（分析 §6.11.3）。切分支被工作区改动挡住时报错就停，不替用户 stash：
    * 那是另一次要确认的操作，手动跟进自己的 stash 要等切过去之后才轮得到。
    */
@@ -283,6 +328,15 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
   return {
     handleSvnUpdate: () => exclusive(svnUpdate),
     handleFollow: () => exclusive(follow),
+    /**
+     * 有流程在走时什么都不做、返回 `false`：调用方不记这个现场，等那个流程收尾刷新判定之后再来。
+     * 判断是同步的（`running` 在第一个 await 之前就置上），调用方在 `true` 时可以放心记下。
+     */
+    handleAutoFollow: (key: string): boolean => {
+      if (d.running.current) return false
+      void exclusive(() => autoFollow(key))
+      return true
+    },
     // 没有单独的「手动跟进」入口（Review 3 第 4 条）：它只经由跟进冲突的确认框与「切换并手动跟进」
     // 发起，两处都已在 `exclusive` 里，见 `settleFollow` 与 `checkoutBehind`
     handleCheckoutBehind: (branch: string) => exclusive(() => checkoutBehind(branch)),
