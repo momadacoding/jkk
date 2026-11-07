@@ -34,6 +34,7 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(desktop::on_window_event)
+        .on_page_load(desktop::on_page_load)
         .invoke_handler(tauri::generate_handler![
             commands::app_settings::read_app_settings,
             commands::app_settings::save_app_settings,

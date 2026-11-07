@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{App, AppHandle, Manager, Runtime, Window, WindowEvent};
+use tauri::webview::{PageLoadEvent, PageLoadPayload};
+use tauri::{App, AppHandle, Manager, Runtime, Webview, Window, WindowEvent};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 const MAIN_WINDOW: &str = "main";
@@ -297,6 +298,25 @@ pub fn on_window_event<R: Runtime>(window: &Window<R>, event: &WindowEvent) {
     }
 }
 
+/// 主窗口开始加载新页面时要不要清掉录快捷键标记。
+///
+/// 录到一半刷新页面（F5 / 开发时 HMR 整页重载），设置框的 cleanup 不会执行，
+/// 标记会一直停在 true，之后快捷键就只呼出、再也不隐藏。只在 `Started` 清：
+/// 那时旧页面已经没了，新页面还没来得及开始录。
+pub fn resets_recording_on_page_load(label: &str, event: PageLoadEvent) -> bool {
+    label == MAIN_WINDOW && event == PageLoadEvent::Started
+}
+
+/// 页面加载钩子，见 `resets_recording_on_page_load`。
+pub fn on_page_load<R: Runtime>(webview: &Webview<R>, payload: &PageLoadPayload<'_>) {
+    if !resets_recording_on_page_load(webview.label(), payload.event()) {
+        return;
+    }
+    if let Some(state) = webview.try_state::<DesktopState>() {
+        state.set_recording_shortcut(false);
+    }
+}
+
 /// 呼出快捷键：在前台就藏起来，否则呼出。规则见 `shortcut_action`。
 fn toggle_main_window<R: Runtime>(app: &AppHandle<R>) {
     let Some(w) = app.get_webview_window(MAIN_WINDOW) else {
@@ -305,7 +325,7 @@ fn toggle_main_window<R: Runtime>(app: &AppHandle<R>) {
     // 读不到状态时当作不在前台：宁可多呼出一次，也不能把用户正要找的窗口藏掉
     let window = WindowState {
         visible: w.is_visible().unwrap_or(false),
-        minimized: w.is_minimized().unwrap_or(false),
+        minimized: w.is_minimized().unwrap_or(true),
         focused: w.is_focused().unwrap_or(false),
     };
     let recording = app

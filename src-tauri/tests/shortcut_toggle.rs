@@ -1,5 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::panic)] // 测试里 unwrap / panic 即断言，见 clippy.toml
-use app_lib::desktop::{shortcut_action, ShortcutAction, WindowState};
+use app_lib::desktop::{
+    resets_recording_on_page_load, shortcut_action, ShortcutAction, WindowState,
+};
+use tauri::webview::PageLoadEvent;
 
 fn win(visible: bool, minimized: bool, focused: bool) -> WindowState {
     WindowState {
@@ -60,4 +63,28 @@ fn recording_never_hides() {
         shortcut_action(win(false, false, false), true),
         ShortcutAction::Show
     );
+}
+
+#[test]
+fn main_page_reload_clears_recording_flag() {
+    // 录到一半刷新页面（F5 / HMR 整页重载），React 的 cleanup 不会跑，
+    // 后端标记会一直停在 true，之后快捷键就只呼出、再也不隐藏
+    assert!(resets_recording_on_page_load(
+        "main",
+        PageLoadEvent::Started
+    ));
+}
+
+#[test]
+fn page_load_finish_or_other_window_keeps_recording_flag() {
+    // 只在新页面开始加载时清一次：Finished 时新页面可能已经开始录了；
+    // 别的窗口加载也与主窗口的设置框无关
+    assert!(!resets_recording_on_page_load(
+        "main",
+        PageLoadEvent::Finished
+    ));
+    assert!(!resets_recording_on_page_load(
+        "other",
+        PageLoadEvent::Started
+    ));
 }
