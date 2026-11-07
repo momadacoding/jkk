@@ -35,6 +35,7 @@ import { createSvnSyncOutFlow } from './svnSyncOutFlow'
 import { useDeliverDialog } from './DeliverDialog'
 import { useFollowReportDialog } from './FollowReportDialog'
 import { autoFollowKey, describeAutoFollowDone, type FollowReport } from '../engine/svnFollow'
+import { readAppSettings } from '@/store/appSettingsStore'
 import SvnInitWizard from './SvnInitWizard'
 import BaselineBanner from './BaselineBanner'
 import { baselineMap, findDelivered, selectionDiffScope } from '../engine/svnGraph'
@@ -207,6 +208,11 @@ export function RepoTab({
   const autoTried = useRef<string | null>(null)
   // 流程在下面 loading 的提前 return 之后才建出来，effect 经这个 ref 调它
   const autoFollowRef = useRef<((key: string) => boolean) | null>(null)
+  // 应用内「提交」从提交前的检查到 commit 结束（review 中-3）：提交前的检查会刷新判定，effect 不能在
+  // 这时发起自动跟进，否则跟进的 index.lock / 分支 CAS 与 `git commit` 交错。提交结束时 `autoNudge`
+  // 加一，让 effect 再看一次（用户在提醒框里取消提交时 HEAD 不变，判定也不会再写回）
+  const committing = useRef(false)
+  const [autoNudge, setAutoNudge] = useState(0)
   // TortoiseSVN 钩子（C1h）：健康状态给横幅；注册框开着时是读到的状态
   const [hooksHealth, setHooksHealth] = useState<HookHealth | null>(null)
   const [hooksDialog, setHooksDialog] = useState<TsvnHooksStatus | null>(null)
@@ -263,11 +269,11 @@ export function RepoTab({
   // 判定写回 ExternallyAdvanced 就自动跟进一次（事故分析 6.12）。只在当前标签：报告与提示要有人看得见，
   // 切回来时 effect 会再跑。有流程在走时不记现场，那个流程收尾刷新判定之后 svnSync 会再变
   useEffect(() => {
-    if (!active || state.capabilities.vcs !== 'svn') return
+    if (!active || state.capabilities.vcs !== 'svn' || committing.current) return
     const key = autoFollowKey(state.svnSync, state.headHash)
     if (!key || autoTried.current === key) return
     if (autoFollowRef.current?.(key)) autoTried.current = key
-  }, [active, state.capabilities.vcs, state.svnSync, state.headHash])
+  }, [active, state.capabilities.vcs, state.svnSync, state.headHash, autoNudge])
 
   useEffect(() => {
     openRepo(repoPath)
@@ -318,27 +324,38 @@ export function RepoTab({
   const handleCommit = useCallback(async (msg: string, amend: boolean): Promise<boolean> => {
     const path = state.path
     if (!path) return false
-    // 事故分析 6.6：SVN 带进来的内容还没跟进就提交，会被记成「你的提交」（11-05 的快照提交）。
-    // 结论先刷一次：TortoiseSVN 刚更新完时 state 里的可能还是旧的（review 第 4 条）
-    if (state.capabilities.vcs === 'svn') {
-      const staged = (state.status?.staged ?? []).map((f) => f.path)
-      if (staged.length > 0) {
-        const warning = commitBeforeFollowWarning(staged, await freshSvnSync(path))
-        if (warning && !(await confirm({ ...warning, focusCancel: true }))) return false
-      }
-    }
-    try {
-      await invoke('commit', { path, message: msg, amend })
-    } catch (err) {
-      reportError(err)
-      // 没提交上（hook 拒绝、同步进行中……）：写好的说明留着（review 第 6 条）
+    // 跟进（自动的或按钮的）正拿着索引锁、要 CAS 分支：这时提交只会撞锁或让跟进中途回退（review 中-3）
+    if (following) {
+      reportError('正在跟进 SVN 侧的新内容，等它做完再提交。写好的说明留着。')
       return false
     }
-    // 提交已经成功：刷新失败不影响「说明可以清空」
-    await refreshGraph(path).catch(reportError)
-    await refreshChanges(path).catch(reportError)
-    return true
-  }, [state.path, state.capabilities.vcs, state.status, freshSvnSync, confirm, refreshGraph, refreshChanges, reportError])
+    committing.current = true
+    try {
+      // 事故分析 6.6：SVN 带进来的内容还没跟进就提交，会被记成「你的提交」（11-05 的快照提交）。
+      // 结论先刷一次：TortoiseSVN 刚更新完时 state 里的可能还是旧的（review 第 4 条）
+      if (state.capabilities.vcs === 'svn') {
+        const staged = (state.status?.staged ?? []).map((f) => f.path)
+        if (staged.length > 0) {
+          const warning = commitBeforeFollowWarning(staged, await freshSvnSync(path))
+          if (warning && !(await confirm({ ...warning, focusCancel: true }))) return false
+        }
+      }
+      try {
+        await invoke('commit', { path, message: msg, amend })
+      } catch (err) {
+        reportError(err)
+        // 没提交上（hook 拒绝、同步进行中……）：写好的说明留着（review 第 6 条）
+        return false
+      }
+      // 提交已经成功：刷新失败不影响「说明可以清空」
+      await refreshGraph(path).catch(reportError)
+      await refreshChanges(path).catch(reportError)
+      return true
+    } finally {
+      committing.current = false
+      setAutoNudge((n) => n + 1)
+    }
+  }, [state.path, state.capabilities.vcs, state.status, following, freshSvnSync, confirm, refreshGraph, refreshChanges, reportError])
 
   const runAndRefresh = useCallback(async (cmd: string, args: Record<string, unknown>, refresh: () => Promise<void>) => {
     if (!state.path) return
@@ -874,6 +891,14 @@ export function RepoTab({
       await refreshAfterCheckout()
     },
     mergeRiskForAuto,
+    autoFollowEnabled: async () => {
+      try {
+        return (await readAppSettings()).svnAutoFollow
+      } catch {
+        return true
+      }
+    },
+    wait: (ms) => new Promise((resolve) => window.setTimeout(resolve, ms)),
     setAutoFollowSkip: setAutoSkip,
     showAutoFollowed: setAutoFollowed,
   })

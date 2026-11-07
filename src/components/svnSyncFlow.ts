@@ -73,11 +73,22 @@ export interface SvnSyncFlowDeps {
    * 不弹框：自动跟进不能停下来问人，有风险就不自动，留给会弹确认框的「跟进」按钮。
    */
   mergeRiskForAuto: () => Promise<string | null>
+  /** 设置里自动跟进开着没有。读不出来按开着：后端还会再判一次。 */
+  autoFollowEnabled: () => Promise<boolean>
+  /** 暂时性原因重试前的等待。测试里换成立即返回。 */
+  wait: (ms: number) => Promise<void>
   /** 没自动跟进的原因，给横幅；`null` 清掉。`key` 是 `autoFollowKey` 算的现场。 */
   setAutoFollowSkip: (skip: { key: string; message: string } | null) => void
   /** 自动跟进完成：挂那条不打断操作的提示，详情是同一份报告。 */
   showAutoFollowed: (report: FollowReport) => void
 }
+
+/**
+ * 自动跟进没跑成、但过一会儿多半就能跑的原因：外部 git 拿着索引锁（IDE 看到文件变了跑 `git status`）、
+ * 准备期间仓库一直在变、另一次同步正在进行。钩子事件让检测紧跟在 TortoiseSVN 之后，正撞上这些。
+ */
+const TRANSIENT_SKIPS = new Set(['svn_index_busy', 'svn_follow_state_changed', 'sync_in_progress'])
+const TRANSIENT_RETRY_MS = 2000
 
 export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
   /**
@@ -256,6 +267,11 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
    * 文案里写着此刻的状态。
    */
   const autoFollow = async (key: string) => {
+    // 先看开关：关着时横幅照旧，连 merge driver 的原因也不该写（review 中-2）
+    if (!(await d.autoFollowEnabled())) {
+      d.setAutoFollowSkip(null)
+      return
+    }
     const risk = await d.mergeRiskForAuto()
     if (risk) {
       d.setAutoFollowSkip({ key, message: risk })
@@ -265,6 +281,12 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
     let outcome: AutoFollowOutcome
     try {
       outcome = await svnFollowAuto(d.repoPath)
+      // 暂时性的原因（外部 git 刚好拿着索引锁、另一次同步刚好在跑）：同一个现场只试一次，不重试的话
+      // 就再也不自动了（review 中-1）。等一下再试一次，还不行才写进横幅
+      if (outcome.kind === 'skipped' && TRANSIENT_SKIPS.has(outcome.code)) {
+        await d.wait(TRANSIENT_RETRY_MS)
+        outcome = await svnFollowAuto(d.repoPath)
+      }
       if (outcome.kind === 'done') await afterFollow()
     } catch (err) {
       d.reportError(err)

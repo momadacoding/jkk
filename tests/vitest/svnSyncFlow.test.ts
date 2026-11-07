@@ -69,6 +69,10 @@ function deps(log: string[], confirm?: (r: ConfirmRequest) => Promise<boolean>):
       log.push('mergeRiskForAuto')
       return null
     },
+    autoFollowEnabled: async () => true,
+    wait: async (ms) => {
+      log.push(`wait:${ms}`)
+    },
     setAutoFollowSkip: (s) => log.push(`autoSkip:${s ? `${s.key}|${s.message}` : 'null'}`),
     showAutoFollowed: () => log.push('showAutoFollowed'),
   }
@@ -166,6 +170,60 @@ describe('handleAutoFollow（事故分析 6.12）', () => {
     await settled(log)
     await vi.waitFor(() => expect(log).toContain('autoSkip:null'))
     expect(log.filter((l) => l.startsWith('autoSkip:k1'))).toEqual([])
+  })
+
+  it('开关关着时先返回：不查 merge driver，也不写原因（review 中-2）', async () => {
+    const log: string[] = []
+    createSvnSyncFlow({
+      ...deps(log),
+      autoFollowEnabled: async () => false,
+      mergeRiskForAuto: async () => {
+        log.push('mergeRiskForAuto')
+        return '没配 merge driver'
+      },
+    }).handleAutoFollow('k1')
+    await vi.waitFor(() => expect(log).toContain('autoSkip:null'))
+
+    expect(log).toEqual(['autoSkip:null'])
+    expect(store.svnFollowAuto).not.toHaveBeenCalled()
+  })
+
+  it('暂时性原因（索引锁被占）等一下再试一次，成了就照常完成（review 中-1）', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnFollowAuto)
+      .mockResolvedValueOnce({ kind: 'skipped', code: 'svn_index_busy', message: '锁着' })
+      .mockResolvedValueOnce({ kind: 'done', report })
+
+    createSvnSyncFlow(deps(log)).handleAutoFollow('k1')
+    await vi.waitFor(() => expect(log).toContain('showAutoFollowed'))
+
+    expect(store.svnFollowAuto).toHaveBeenCalledTimes(2)
+    expect(log).toContain('wait:2000')
+    expect(log.filter((l) => l.startsWith('autoSkip:k1'))).toEqual([])
+  })
+
+  it('暂时性原因只重试一次，还不行就写进横幅；别的原因不重试', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnFollowAuto).mockResolvedValue({
+      kind: 'skipped',
+      code: 'sync_in_progress',
+      message: '在同步',
+    })
+    createSvnSyncFlow(deps(log)).handleAutoFollow('k1')
+    await vi.waitFor(() => expect(log).toContain('autoSkip:k1|在同步'))
+    expect(store.svnFollowAuto).toHaveBeenCalledTimes(2)
+
+    vi.mocked(store.svnFollowAuto).mockClear()
+    vi.mocked(store.svnFollowAuto).mockResolvedValue({
+      kind: 'skipped',
+      code: 'svn_auto_follow_conflict',
+      message: '冲突',
+    })
+    const other: string[] = []
+    createSvnSyncFlow(deps(other)).handleAutoFollow('k2')
+    await vi.waitFor(() => expect(other).toContain('autoSkip:k2|冲突'))
+    expect(store.svnFollowAuto).toHaveBeenCalledTimes(1)
+    expect(other.some((l) => l.startsWith('wait:'))).toBe(false)
   })
 
   it('merge driver 有风险：不发命令、不问人，原因写进横幅', async () => {

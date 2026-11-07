@@ -16,7 +16,7 @@ use app_lib::engine::svn_follow::{
     FollowReport,
 };
 use app_lib::engine::svn_follow_mark::write_mark;
-use app_lib::engine::svn_journal::{self, FollowStep};
+use app_lib::engine::svn_journal::{self, Flow, FollowStep, Journal, Phase};
 use app_lib::engine::svn_lock;
 use app_lib::engine::svn_sync::{check_sync, SyncVerdict};
 use app_lib::engine::svn_sync_in::SyncInOutcome;
@@ -320,6 +320,27 @@ fn condition_1_an_unfinished_record_or_a_held_lock_stops_it() {
     let fx = hybrid_with_colleague();
     write(&fx, A, "a2\n");
     tortoise_commit(&fx, A);
+    // 未收尾的记录（别的同步留下的）：记录不碰，原样留着
+    let record = Journal {
+        opid: "someone-else".into(),
+        flow: Flow::SyncIn,
+        phase: Phase::Stashed,
+        started_at: 1,
+        ..Default::default()
+    };
+    svn_journal::write(&fx.wc_str(), &record).unwrap();
+    let before = state(&fx);
+    let (code, _) = skipped(auto(&fx));
+    assert_eq!(code, "svn_follow_unfinished");
+    assert_eq!(state(&fx), before);
+    assert_eq!(
+        svn_journal::read(&fx.wc_str()).unwrap().map(|j| j.opid),
+        Some("someone-else".to_string()),
+        "别人的记录不碰"
+    );
+    svn_journal::remove(&fx.wc_str()).unwrap();
+
+    // 同步锁被另一次同步拿着
     let held = svn_lock::acquire(&fx.wc_str(), "someone").unwrap();
     let before = state(&fx);
     let (code, _) = skipped(auto(&fx));
@@ -359,15 +380,20 @@ fn condition_4_an_svn_conflict_stops_it() {
     let fx = hybrid_with_colleague();
     fx.colleague_commits(A, "a-colleague\n");
     write(&fx, A, "a-mine\n");
-    svn_update(&fx, A);
+    svn_cmd(
+        &fx.wc(),
+        &[
+            "update",
+            "--accept",
+            "postpone",
+            "--non-interactive",
+            "--",
+            A,
+        ],
+    );
     assert!(read(&fx, A).contains("<<<<<<<"), "前提：SVN 冲突");
-    let before = state(&fx);
 
-    let (code, _) = skipped(auto(&fx));
-
-    assert!(code.starts_with("svn_"), "{code}");
-    assert_eq!(state(&fx), before);
-    assert_no_residue(&fx);
+    assert_skipped_untouched(&fx, "svn_preflight_conflicted");
 }
 
 #[test]
@@ -467,6 +493,9 @@ fn condition_11_a_branch_commit_on_a_file_svn_also_changed_is_not_followed() {
     fx.colleague_commits(B, "1\n2\n3\n4\n5\n6\n7\ncolleague\n");
     let r = youngest(&fx);
     set_author(&fx, r, "colleague");
+    // 两个保留下来的 commit：只有第二个碰到 B（钉住 `git log -z` 多个 commit 首尾相接时的解析）
+    write(&fx, "Code/W.cs", "w\n");
+    commit_all(&fx, "只改 W");
     write(&fx, B, "mine\n2\n3\n4\n5\n6\n7\n8\n");
     commit_all(&fx, "我的改动");
     svn_update(&fx, B);
@@ -475,6 +504,10 @@ fn condition_11_a_branch_commit_on_a_file_svn_also_changed_is_not_followed() {
     let message = assert_skipped_untouched(&fx, "svn_auto_follow_overlap");
 
     assert!(message.contains(B), "{message}");
+    assert!(
+        !message.contains("W.cs"),
+        "只改 W 的 commit 不算：{message}"
+    );
     manual_done(follow(&fx.wc_str(), "manual").unwrap());
     assert_eq!(
         show(&fx, "HEAD:Code/B.cs"),
@@ -632,6 +665,33 @@ fn a_crash_at_any_step_of_an_automatic_follow_is_recoverable() {
         assert_eq!(read(&fx, B), "b-disk\n", "{at:?}");
         assert_eq!(oid(&fx, "feature^"), base, "{at:?}");
     }
+}
+
+#[test]
+fn a_lock_swapped_for_someone_elses_before_the_baseline_was_published_is_left_alone() {
+    // review 低-3：自动跟进拼好索引、还没发布基线时崩了，残锁被手工删掉、别的 git 又拿了锁。
+    // journal 里有指纹，「继续」要认出这不是我们的锁，不删
+    let (fx, old_head) = crash_scene();
+    crash_auto_at(&fx, Point::IndexPrepared);
+    let lock = fx.wc().join(".git/index.lock");
+    std::fs::write(&lock, b"someone else's lock").unwrap();
+
+    let err = resume_follow(&fx.wc_str()).unwrap_err();
+
+    assert_eq!(err.code, "svn_index_busy", "{}", err.message);
+    assert_eq!(std::fs::read(&lock).unwrap(), b"someone else's lock");
+    assert_eq!(oid(&fx, "work"), old_head);
+    assert!(
+        svn_journal::read(&fx.wc_str()).unwrap().is_some(),
+        "记录留着"
+    );
+
+    // 那个 git 结束之后「继续」照常走完
+    std::fs::remove_file(&lock).unwrap();
+    assert!(matches!(
+        resume_follow(&fx.wc_str()).unwrap(),
+        FollowOutcome::Done { .. }
+    ));
 }
 
 #[test]

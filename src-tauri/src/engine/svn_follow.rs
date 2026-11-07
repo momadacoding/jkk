@@ -2643,7 +2643,16 @@ fn resume_locked(repo: &str, j: &mut Journal) -> Result<Resumed> {
         // 索引，只能删。没记过「锁是我方建的」的不是我们的：活着的 git 等编辑器时 index.lock 在、
         // 句柄已关，删除照样成功（Review 2 探针 P7）。报忙，记录留着，对方结束后再点「继续」
         FollowStep::PrepareIndex => {
-            if steps(j)?.lock_created {
+            let s = steps(j)?;
+            // 自动跟进拼好索引之后、发布基线之前也停在这一步，这时 journal 里已有指纹：拿它核对，
+            // 锁要是被换成了别人的（残锁被手工删掉、又有 git 拿了锁），不删（review 低-3）。
+            // 没有指纹（手动跟进拼到一半）时照旧：记过「锁是我方建的」就只能是我们的半成品
+            let lock = git_dir(repo)?.join("index.lock");
+            let ours = match &s.index_blob {
+                Some(_) if lock.exists() => lock_is_ours(repo, &lock, s.index_blob.as_deref())?,
+                _ => s.lock_created,
+            };
+            if ours {
                 remove_lock(repo)?;
             } else {
                 require_index_free(repo)?;

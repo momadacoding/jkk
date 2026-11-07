@@ -340,9 +340,13 @@ fn is_relevant(repo: Option<&git2::Repository>, root: &Path, target: &Path) -> b
         }
         // TortoiseSVN 钩子刚写进收件箱的事件（事故分析 6.12；分析 §6.13.6）：提交 / 更新刚做完，
         // 前端收到 repo-changed 就比 wc.db 戳、跑第二档，判定前进了就自动跟进，不用等下一次焦点。
-        // 只认改名落地的 `.json`，钩子先写的 `.tmp` 不算。跟进收尾清收件箱时 watcher 是挂起的
-        // （`with_watch_suspended`），删除事件进不来，不会自激
-        if s.contains(INBOX_EVENTS) && s.ends_with(".json") {
+        // 只认做完了的那两种（文件名 `<at>-<pid>-<kind>.json`，见 `tsvn_inbox::write_event`）：
+        // `pre_commit` 在提交开始时写，那时去检测只会撞上被锁的工作副本（review 低-1）；钩子先写的
+        // `.tmp` 也不算。跟进收尾清收件箱时 watcher 挂着（`with_watch_suspended`），最多在恢复后
+        // 多一轮刷新，那时判定已是 InSync，不会再跟进
+        if s.contains(INBOX_EVENTS)
+            && (s.ends_with("-post_commit.json") || s.ends_with("-post_update.json"))
+        {
             return true;
         }
         // 失焦快照（`svn_follow_mark`）是客户端自己写的线索，每次切窗口写一次，放过去
@@ -820,13 +824,13 @@ mod tests {
         let (_d, root) = wc();
         let repo = root.to_str().unwrap();
         let dir = crate::engine::tsvn_inbox::inbox_dir(repo);
-        assert!(is_relevant(
-            None,
-            &root,
-            &dir.join("1730000000000-42-post_update.json")
-        ));
-        // 写到一半的临时文件、目录本身都还不算
+        for kind in ["post_update", "post_commit"] {
+            let p = dir.join(format!("1730000000000-42-{kind}.json"));
+            assert!(is_relevant(None, &root, &p), "{}", p.display());
+        }
+        // 提交刚开始的事件、写到一半的临时文件、目录本身都还不算
         for p in [
+            dir.join("1730000000000-42-pre_commit.json"),
             dir.join("1730000000000-42-post_update.json.tmp"),
             dir.clone(),
         ] {

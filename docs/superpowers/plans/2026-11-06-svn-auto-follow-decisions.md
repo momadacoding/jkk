@@ -10,7 +10,7 @@
 | 2 | 设置 `svnAutoFollow`（默认开）与命令 `svn_follow_auto` / `set_svn_auto_follow` | 完成 | `tests/app_settings.rs`（旧文件没有这个字段时默认开、关掉的留着关）、`tests/svn_backend.rs`（`AutoFollowOutcome` 的序列化形状）、`tests/commands_are_async.rs` 通过 |
 | 3 | 前端：判定写回后触发、与横幅「跟进」共用 `exclusive`、同一现场不重试、完成提示、横幅写明没自动的原因、设置框开关 | 完成 | `pnpm build` 过；`pnpm test` 77 个文件 1297 条全过（新增 `svnSyncFlow` 6 条、`BaselineBanner` 4 条、`svnFollow` 4 条、`SettingsDialog` 2 条） |
 | 4 | watcher 放行收件箱里新到的事件（钩子一写事件就跑检测） | 完成 | `watch.rs` 单测 `a_hook_event_landing_in_the_inbox_wakes_the_check` |
-| 5 | 文档：分析 §6.12 状态、计划状态、E2E 清单 | 未开始 | |
+| 5 | 文档：分析 §6.12 状态、计划状态、E2E 清单 | 完成 | 新增 `e2e/2026-11-07-svn-auto-follow-e2e.md`（7 个场景，未跑） |
 | 6 | `pnpm tauri dev` 真实窗口验证新命令 | 未开始 | |
 
 ## 决策条目
@@ -65,7 +65,28 @@
 ### Task 4：watcher
 
 **偏离计划**
-- 计划只写了 `post_update`。收件箱里的提交事件（`post_commit`）同样放行：TortoiseSVN 只提交、不更新时根 revision 不动，原来要等下一次焦点才检测到，这正是 11-05 的形态。
+- 计划只写了 `post_update`。收件箱里的提交事件（`post_commit`）同样放行：TortoiseSVN 只提交、不更新时根 revision 不动，原来要等下一次焦点才检测到，这正是 11-05 的形态。`pre_commit` 不放行（review 低-1）：它在提交开始时写，那时去检测只会撞上被锁的工作副本。
 
 **为什么这么改是安全的**
-- 只放行改名落地的 `.json`，钩子先写的 `.tmp` 和目录本身不算。跟进收尾清收件箱发生在 `with_watch_suspended` 里，删除事件被丢弃，不会形成「跟进 → 清收件箱 → 事件 → 再检测」的回路；即使有一轮，判定已是 InSync，不会再跟进。
+- 只放行改名落地的 `-post_commit.json` / `-post_update.json`，钩子先写的 `.tmp`、`pre_commit` 和目录本身不算。跟进收尾清收件箱发生在 `with_watch_suspended` 里。挂起是在去抖之后、发事件时才判的，删除若落在恢复前的 300ms 内，恢复后最多再发一次 `repo-changed`（review 低-1 指出原写法「删除事件被丢弃」不严格），那时判定已是 InSync，不会再跟进，不构成回路。
+
+### 独立 review（opus subagent，commit 5eaee73）
+
+没有高危。崩溃恢复与「不自动时一个 ref 都不动」逐条核过，成立；手动 `publish` 的重构逐步对照，行为不变。
+
+| 级别 | 发现 | 处理 |
+|---|---|---|
+| 中-1 | 暂时性原因（外部 git 拿着索引锁、准备期间仓库在变、另一次同步在跑）跳过之后，同一现场永不重试。钩子事件让检测紧跟在 TortoiseSVN 之后，正好撞上 IDE 跑 `git status` | 这三个 code（`svn_index_busy`、`svn_follow_state_changed`、`sync_in_progress`）在流程里等 2 秒再试一次，还不行才写进横幅。不选「不记现场」：每次 `with_watch_suspended` 补发的 `repo-changed` 都会再跑一遍服务器体检 |
+| 中-2 | 设置关着时，merge driver 有风险的话横幅仍写「没有自动跟进：merge driver……」 | 前端先读开关（`autoFollowEnabled`），关着直接返回，不查 merge driver；后端仍判一次 |
+| 中-3 | 应用内「提交」的提交前检查会刷新判定，effect 随即发起自动跟进，与 `git commit` 交错（撞索引锁、跟进中途回退并报错） | 提交期间（`committing` ref）effect 不发起，提交结束 `autoNudge` 让它再看一次；跟进在跑时点「提交」直接提示等它做完，写好的说明留着 |
+| 中-4 | `condition_1_…` 名为「未收尾的记录或同步锁」，只测了同步锁；`condition_4_…` 只断言 `starts_with("svn_")` | 补上未收尾记录（断言 `svn_follow_unfinished`、别人的记录不碰）；SVN 冲突改成 `assert_skipped_untouched(.., "svn_preflight_conflicted")` |
+| 中-5 | 总账 Task 5 过时；Task 6（`pnpm tauri dev`）没做；`pnpm test:layout` 没有运行记录 | 总账已更新；`pnpm test:layout` 第一次 2 条失败（`confirm-long-warning` 打开页面超时，本 PR 没动它，当时完整 `cargo test` 正占满 CPU），重跑 140 条全过；Task 6 见总账 |
+| 低-1 | watcher 也放行了 `pre_commit`；「删除事件被丢弃」措辞不严格 | 只放行 `post_commit` / `post_update`，测试补 `pre_commit` 不算；措辞已改（见 Task 4） |
+| 低-2 | 自动跟进崩在基线 CAS 之后时，「继续」走手动跟进，横幅文案没说；之后自动跟进以「分支落后」跳过，原因文案与真实原因不符 | 不改：点「继续」时有人在场，结果与点「跟进」一样；记为已知限制 |
+| 低-3 | `PrepareIndex` 的恢复不核对锁是不是我方的；自动模式这一步已记下指纹，窗口变大 | 有指纹且锁在时用 `lock_is_ours` 核对，不是我方的报 `svn_index_busy`、记录留着。补测试 `a_lock_swapped_for_someone_elses_before_the_baseline_was_published_is_left_alone` |
+| 低-4 | `give_up` 里删 journal 失败时返回 `Err`，而什么都没动 | 不改：记录删不掉时下一次跟进会被它挡住，报错比静默返回 `Skipped` 更诚实 |
+| 低-5 | 现场键的时序缝：在跑时来的新现场返回 `false`、不记，之后判定若不再写回就不会再试 | 不改：只是少一次自动尝试，下一次判定写回（存盘、切窗口、钩子事件）就会补上 |
+| 低-6 | `retained_overlap` 只被一个保留下来的 commit 测过；Windows 大小写不敏感没处理 | 条件 11 的测试改成两个保留下来的 commit、只有第二个碰到 B。大小写：SVN 与 git 都以大小写敏感的形式记路径，同一个文件两边写法相同，不处理 |
+| 低-7 | `saveAllSettings` 没测；merge driver 检查期间按钮没反馈 | 不改：前者是两次 invoke 的串联，失败时框里有错误；后者只有几十毫秒 |
+
+另外：设置关着时这一次的现场也记下了，随后打开开关不会对当前现场补跑，要等下一次判定变化（review 中-2 附带的低危）。不改，记为已知限制。
