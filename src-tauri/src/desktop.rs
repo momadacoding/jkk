@@ -1,4 +1,4 @@
-//! 桌面外壳：托盘、关窗进托盘、全局快捷键呼出主界面。
+//! 桌面外壳：托盘、关窗进托盘、全局快捷键呼出 / 隐藏主界面。
 //!
 //! 只做窗口层面的事，不碰任何 git 状态。
 
@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{App, AppHandle, Manager, Runtime, Window, WindowEvent};
+use tauri::webview::{PageLoadEvent, PageLoadPayload};
+use tauri::{App, AppHandle, Manager, Runtime, Webview, Window, WindowEvent};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 const MAIN_WINDOW: &str = "main";
@@ -24,8 +25,40 @@ const MENU_QUIT: &str = "tray-quit";
 /// 主线程等锁、保存线程等主线程，两边一起卡死。
 pub struct DesktopState {
     close_to_tray: AtomicBool,
+    /// 设置框正在录快捷键。快捷键回调跑在主线程上，同样不能去碰 `inner` 的锁，所以也用原子量。
+    recording_shortcut: AtomicBool,
     inner: Mutex<Inner>,
     path: PathBuf,
+}
+
+/// 按下呼出快捷键时主窗口的样子，判断切换方向用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowState {
+    pub visible: bool,
+    pub minimized: bool,
+    pub focused: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutAction {
+    Show,
+    Hide,
+}
+
+/// 呼出快捷键是开关：窗口在前台就藏起来，其余情况（在托盘里、最小化、被别的窗口挡着）都呼出。
+///
+/// 只认「看得见、没最小化、有焦点」为在前台。被挡住时按快捷键是想看它，藏起来就反了；
+/// 最小化时 Windows 仍可能报可见、有焦点，不能算。
+///
+/// 设置框录快捷键期间一律只呼出：用户重录同一个组合键时，系统会先把这次按键当成
+/// 全局快捷键派过来，切换的话窗口会当场消失。
+pub fn shortcut_action(window: WindowState, recording: bool) -> ShortcutAction {
+    let in_front = window.visible && !window.minimized && window.focused;
+    if in_front && !recording {
+        ShortcutAction::Hide
+    } else {
+        ShortcutAction::Show
+    }
 }
 
 struct Inner {
@@ -54,6 +87,11 @@ impl DesktopState {
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         // 锁中毒只说明另一次保存 panic 了，设置本身没有跨字段不变量，拿回内层值继续用
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 设置框开始 / 结束录快捷键时调用，见 `shortcut_action`。
+    pub fn set_recording_shortcut(&self, recording: bool) {
+        self.recording_shortcut.store(recording, Ordering::SeqCst);
     }
 
     pub fn view(&self) -> AppSettingsView {
@@ -162,12 +200,9 @@ pub fn setup(app: &mut App) -> std::result::Result<(), Box<dyn std::error::Error
     app.handle().plugin(
         tauri_plugin_global_shortcut::Builder::new()
             .with_handler(|app, _shortcut, event| {
-                // 只注册了一个快捷键，不用比对是哪个；只认按下，松开不再触发一次。
-                //
-                // 只呼出、不做「已在前台就隐藏」的切换：用户在设置框里重录同一个组合键时，
-                // 系统会先把这次按键当成全局快捷键派过来，切换的话窗口当场消失
+                // 只注册了一个快捷键，不用比对是哪个；只认按下，松开不再触发一次
                 if event.state() == ShortcutState::Pressed {
-                    show_main_window(app);
+                    toggle_main_window(app);
                 }
             })
             .build(),
@@ -190,6 +225,7 @@ pub fn setup(app: &mut App) -> std::result::Result<(), Box<dyn std::error::Error
 
     app.manage(DesktopState {
         close_to_tray: AtomicBool::new(settings.close_to_tray),
+        recording_shortcut: AtomicBool::new(false),
         inner: Mutex::new(Inner {
             settings,
             registered,
@@ -259,6 +295,50 @@ pub fn on_window_event<R: Runtime>(window: &Window<R>, event: &WindowEvent) {
         if let Err(e) = window.hide() {
             log::warn!("隐藏主窗口失败: {e}");
         }
+    }
+}
+
+/// 主窗口开始加载新页面时要不要清掉录快捷键标记。
+///
+/// 录到一半刷新页面（F5 / 开发时 HMR 整页重载），设置框的 cleanup 不会执行，
+/// 标记会一直停在 true，之后快捷键就只呼出、再也不隐藏。只在 `Started` 清：
+/// 那时旧页面已经没了，新页面还没来得及开始录。
+pub fn resets_recording_on_page_load(label: &str, event: PageLoadEvent) -> bool {
+    label == MAIN_WINDOW && event == PageLoadEvent::Started
+}
+
+/// 页面加载钩子，见 `resets_recording_on_page_load`。
+pub fn on_page_load<R: Runtime>(webview: &Webview<R>, payload: &PageLoadPayload<'_>) {
+    if !resets_recording_on_page_load(webview.label(), payload.event()) {
+        return;
+    }
+    if let Some(state) = webview.try_state::<DesktopState>() {
+        state.set_recording_shortcut(false);
+    }
+}
+
+/// 呼出快捷键：在前台就藏起来，否则呼出。规则见 `shortcut_action`。
+fn toggle_main_window<R: Runtime>(app: &AppHandle<R>) {
+    let Some(w) = app.get_webview_window(MAIN_WINDOW) else {
+        return;
+    };
+    // 读不到状态时当作不在前台：宁可多呼出一次，也不能把用户正要找的窗口藏掉
+    let window = WindowState {
+        visible: w.is_visible().unwrap_or(false),
+        minimized: w.is_minimized().unwrap_or(true),
+        focused: w.is_focused().unwrap_or(false),
+    };
+    let recording = app
+        .try_state::<DesktopState>()
+        .is_some_and(|s| s.recording_shortcut.load(Ordering::SeqCst));
+    match shortcut_action(window, recording) {
+        ShortcutAction::Hide => {
+            // 藏到托盘而不是最小化，和关窗进托盘一致；快捷键注册着，总能再按回来
+            if let Err(e) = w.hide() {
+                log::warn!("隐藏主窗口失败: {e}");
+            }
+        }
+        ShortcutAction::Show => show_main_window(app),
     }
 }
 
