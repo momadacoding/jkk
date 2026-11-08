@@ -13,7 +13,7 @@ dev-dependencies 与 build-dependencies），npm 侧为 production 依赖
 
 ## 组件清单
 
-共 260 个组件。
+共 262 个组件。
 
 | 来源 | 组件 | 版本 | 许可 |
 |---|---|---|---|
@@ -194,6 +194,7 @@ dev-dependencies 与 build-dependencies），npm 侧为 production 依赖
 | cargo | tauri-plugin-fs | 2.5.1 | Apache-2.0 OR MIT |
 | cargo | tauri-plugin-global-shortcut | 2.3.2 | Apache-2.0 OR MIT |
 | cargo | tauri-plugin-log | 2.9.0 | Apache-2.0 OR MIT |
+| cargo | tauri-plugin-single-instance | 2.4.5 | Apache-2.0 OR MIT |
 | cargo | tauri-runtime | 2.11.3 | Apache-2.0 OR MIT |
 | cargo | tauri-runtime-wry | 2.11.4 | Apache-2.0 OR MIT |
 | cargo | tauri-utils | 2.9.3 | Apache-2.0 OR MIT |
@@ -214,6 +215,7 @@ dev-dependencies 与 build-dependencies），npm 侧为 production 依赖
 | cargo | toml_parser | 1.1.3+spec-1.1.0 | MIT OR Apache-2.0 |
 | cargo | toml_writer | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 |
 | cargo | tracing | 0.1.44 | MIT |
+| cargo | tracing-attributes | 0.1.31 | MIT |
 | cargo | tracing-core | 0.1.36 | MIT |
 | cargo | tray-icon | 0.24.2 | MIT OR Apache-2.0 |
 | cargo | typeid | 1.0.3 | MIT OR Apache-2.0 |
@@ -506,7 +508,7 @@ limitations under the License.
 </details>
 
 <details>
-<summary>6 个组件共用此许可正文：@tauri-apps/plugin-dialog 2.7.2 (npm) 等</summary>
+<summary>7 个组件共用此许可正文：@tauri-apps/plugin-dialog 2.7.2 (npm) 等</summary>
 
 适用于：
 - @tauri-apps/plugin-dialog 2.7.2 (npm)
@@ -515,6 +517,7 @@ limitations under the License.
 - tauri-plugin-fs 2.5.1 (cargo)
 - tauri-plugin-global-shortcut 2.3.2 (cargo)
 - tauri-plugin-log 2.9.0 (cargo)
+- tauri-plugin-single-instance 2.4.5 (cargo)
 
 ```text
 SPDXVersion: SPDX-2.1
@@ -11448,10 +11451,11 @@ SOFTWARE.
 </details>
 
 <details>
-<summary>2 个组件共用此许可正文：tracing 0.1.44 (cargo) 等</summary>
+<summary>3 个组件共用此许可正文：tracing 0.1.44 (cargo) 等</summary>
 
 适用于：
 - tracing 0.1.44 (cargo)
+- tracing-attributes 0.1.31 (cargo)
 - tracing-core 0.1.36 (cargo)
 
 ```text
