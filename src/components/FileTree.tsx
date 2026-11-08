@@ -3,7 +3,7 @@ import type { TreeNode } from '../engine/fileTree'
 import type { FileStatus } from '../engine/types'
 
 /** 状态角标的字形与配色，和 Fork 一致：一眼扫过去就知道这次动了什么。 */
-const STATUS_MARK: Record<FileStatus, { label: string; kind: string }> = {
+export const STATUS_MARK: Record<FileStatus, { label: string; kind: string }> = {
   added: { label: '+', kind: 'added' },
   modified: { label: 'M', kind: 'modified' },
   deleted: { label: '−', kind: 'deleted' },
@@ -12,7 +12,7 @@ const STATUS_MARK: Record<FileStatus, { label: string; kind: string }> = {
   conflicted: { label: '!', kind: 'conflicted' },
 }
 
-function Chevron({ open }: { open: boolean }) {
+export function Chevron({ open }: { open: boolean }) {
   return (
     <svg
       className={open ? 'ft-chevron open' : 'ft-chevron'}
@@ -26,7 +26,7 @@ function Chevron({ open }: { open: boolean }) {
   )
 }
 
-function FolderIcon() {
+export function FolderIcon() {
   return (
     <svg className="ft-icon folder" width="13" height="13" viewBox="0 0 16 16" fill="currentColor">
       <path d="M1.5 3h4l1.2 1.5h7.8v8H1.5z" />
@@ -34,7 +34,7 @@ function FolderIcon() {
   )
 }
 
-function FileIcon() {
+export function FileIcon() {
   return (
     <svg className="ft-icon" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.2">
       <path d="M3.5 1.5h6l3 3v10h-9z" />

@@ -32,12 +32,21 @@ function compare(a: TreeNode, b: TreeNode): number {
   return a.name.localeCompare(b.name)
 }
 
-function sortDeep(nodes: TreeNode[]): TreeNode[] {
-  nodes.sort(compare)
+/**
+ * 递归排序，返回这一层里有没有冲突文件。
+ *
+ * 冲突文件、以及含冲突的目录排在同层最前面（第 85 条）：merge / rebase 停下来之后
+ * 它们是唯一必须先处理的东西，平铺列表时代就是冲突置顶，树形显示后不能被埋进
+ * 按字母排在后面的目录里。提交详情的树没有 `conflicted` 状态，排序不受影响。
+ */
+function sortDeep(nodes: TreeNode[]): boolean {
+  const hasConflict = new Map<TreeNode, boolean>()
   for (const node of nodes) {
-    if (node.kind === 'dir') sortDeep(node.children)
+    hasConflict.set(node, node.kind === 'dir' ? sortDeep(node.children) : node.status === 'conflicted')
   }
-  return nodes
+  const rank = (node: TreeNode) => (hasConflict.get(node) ? 0 : 1)
+  nodes.sort((a, b) => rank(a) - rank(b) || compare(a, b))
+  return nodes.some((node) => hasConflict.get(node))
 }
 
 /**
@@ -88,7 +97,29 @@ export function buildFileTree(entries: TreeEntry[]): TreeNode[] {
     siblings.push(file)
   }
 
-  return sortDeep(roots)
+  sortDeep(roots)
+  return roots
+}
+
+/**
+ * 树里的文件路径，按显示顺序（深度优先，目录在前）。
+ *
+ * 本地改动的选中、Shift 范围、默认显示哪一个都按「眼睛看到的顺序」算，
+ * 这里是那份顺序的唯一来源。
+ *
+ * @param isOpen 传了就跳过收起目录里的文件——Shift / 拖动选一段只该选到看得见的行，
+ *   否则收起的目录被整段夹进选中，接着按 Delete 就会丢掉看不见的文件
+ */
+export function treeFilePaths(nodes: TreeNode[], isOpen?: (dirPath: string) => boolean): string[] {
+  const out: string[] = []
+  const walk = (list: TreeNode[]) => {
+    for (const node of list) {
+      if (node.kind === 'file') out.push(node.path)
+      else if (!isOpen || isOpen(node.path)) walk(node.children)
+    }
+  }
+  walk(nodes)
+  return out
 }
 
 /** 树里所有目录的路径。用来把树默认全展开。 */
