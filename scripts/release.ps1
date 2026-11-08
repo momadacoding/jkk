@@ -21,7 +21,8 @@
   只改发版提交例外允许的内容（AGENTS.md §4.1）：三个清单与 Cargo.lock 各恰好一行版本号，
   外加重新生成的 THIRD_PARTY_NOTICES.md；按 numstat 校验，多出任何改动直接失败。
 
-  全程约 80 分钟（预检、正式构建各约 40 分钟）。需要 gh 已登录。
+  全程约 45 分钟：预检约 40 分钟；正式构建查到同一提交的预检成功了就跳过测试、只打包，约 6 分钟
+  （release.yml 的 Check preflight）。需要 gh 已登录。
   用 `pwsh -NoProfile -File scripts/release.ps1 ...` 运行，避免 profile 改了原生命令的错误处理。
 .PARAMETER Version
   要发的版本号，形如 0.7.3（不带 v）。
