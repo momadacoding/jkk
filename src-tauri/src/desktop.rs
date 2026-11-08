@@ -81,6 +81,7 @@ pub struct AppSettingsView {
     /// 已保存的快捷键此刻没注册上的原因；`None` 表示正常（或快捷键已关闭）。
     pub shortcut_error: Option<String>,
     pub default_shortcut: String,
+    pub svn_auto_follow: bool,
 }
 
 impl DesktopState {
@@ -142,6 +143,8 @@ impl DesktopState {
         let next = AppSettings {
             close_to_tray,
             show_shortcut,
+            // 设置框的「保存」不管这一项，它有自己的命令（`set_svn_auto_follow`）
+            svn_auto_follow: inner.settings.svn_auto_follow,
         };
         if let Err(e) = app_settings::save_to(&self.path, &next) {
             if changed {
@@ -157,6 +160,25 @@ impl DesktopState {
         inner.shortcut_error = None;
         inner.settings = next;
         self.close_to_tray.store(close_to_tray, Ordering::SeqCst);
+        Ok(view_of(&inner))
+    }
+
+    /// SVN 自动跟进开着没有。`svn_follow_auto` 每次执行前读，关掉之后马上生效。
+    pub fn svn_auto_follow(&self) -> bool {
+        self.lock().settings.svn_auto_follow
+    }
+
+    /// 打开 / 关掉 SVN 自动跟进并落盘。写盘失败时内存里也不变，报错。
+    ///
+    /// 不并进 [`Self::apply`]：那一个要换全局快捷键，失败回滚的路径与这里无关，参数也不该跟着变。
+    pub fn set_svn_auto_follow(&self, enabled: bool) -> Result<AppSettingsView> {
+        let mut inner = self.lock();
+        let next = AppSettings {
+            svn_auto_follow: enabled,
+            ..inner.settings.clone()
+        };
+        app_settings::save_to(&self.path, &next)?;
+        inner.settings = next;
         Ok(view_of(&inner))
     }
 }
@@ -180,6 +202,7 @@ fn view_of(inner: &Inner) -> AppSettingsView {
         show_shortcut: inner.settings.show_shortcut.clone(),
         shortcut_error: inner.shortcut_error.clone(),
         default_shortcut: app_settings::DEFAULT_SHOW_SHORTCUT.to_string(),
+        svn_auto_follow: inner.settings.svn_auto_follow,
     }
 }
 

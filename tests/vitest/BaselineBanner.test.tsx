@@ -251,3 +251,80 @@ describe('BaselineBanner：基线分支丢了（第 70 条）', () => {
     expect(document.querySelectorAll('.banner-baseline')).toHaveLength(1)
   })
 })
+
+describe('BaselineBanner：自动跟进（事故分析 6.12）', () => {
+  const advanced: SyncStatus = {
+    baselineRev: 3,
+    nodeRevs: [3, 4],
+    base: { floor: 3, newer: 0, gone: 0 },
+    headBehindBase: false,
+    verdict: {
+      kind: 'externallyAdvanced',
+      changed: [{ path: 'Code/B.cs', rev: 4, author: 'zhang' }],
+      added: [],
+      removed: [],
+    },
+  }
+  const base = {
+    isSvn: true,
+    audit: null,
+    eol: null,
+    syncState: { locked: false, holder: null, unfinished: null },
+    onRebuild: () => {},
+    onCheck: () => {},
+    onMigrateEol: () => {},
+    onSyncAction: () => {},
+    onSyncOutAction: () => {},
+    onSvnUpdate: () => {},
+    onFollow: () => {},
+  }
+
+  it('没自动跟进时，「SVN 侧有新内容」横幅上写明原因，「跟进」照旧在', () => {
+    render(<BaselineBanner {...base} sync={advanced} autoFollowSkip="当前分支重放有冲突。" />)
+    expect(screen.getByText('没有自动跟进：当前分支重放有冲突。')).toBeTruthy()
+    expect(screen.getByRole('button', { name: '跟进' })).toBeTruthy()
+  })
+
+  it('原因只挂在「SVN 侧有新内容」上：分支落后基线的横幅不写', () => {
+    render(
+      <BaselineBanner
+        {...base}
+        sync={{ ...advanced, verdict: { kind: 'inSync' }, headBehindBase: true }}
+        autoFollowSkip="过时的原因"
+      />,
+    )
+    expect(screen.getByText('当前分支落后基线')).toBeTruthy()
+    expect(screen.queryByText(/过时的原因/)).toBeNull()
+  })
+
+  it('完成后的提示不拦操作：「查看详情」弹报告，「知道了」关掉；判定已同步时也挂', () => {
+    const onDetails = vi.fn()
+    const onDismiss = vi.fn()
+    render(
+      <BaselineBanner
+        {...base}
+        sync={{ ...advanced, verdict: { kind: 'inSync' } }}
+        autoFollowed={{ tone: 'quiet', title: '已自动跟进 SVN 侧的新内容', detail: '跟进了 1 个文件' }}
+        onAutoFollowedDetails={onDetails}
+        onAutoFollowedDismiss={onDismiss}
+      />,
+    )
+    expect(screen.getByRole('status').textContent).toContain('已自动跟进')
+    fireEvent.click(screen.getByRole('button', { name: '查看详情' }))
+    fireEvent.click(screen.getByRole('button', { name: '知道了' }))
+    expect(onDetails).toHaveBeenCalledTimes(1)
+    expect(onDismiss).toHaveBeenCalledTimes(1)
+  })
+
+  it('普通 git 仓库不挂自动跟进的提示', () => {
+    render(
+      <BaselineBanner
+        {...base}
+        isSvn={false}
+        sync={null}
+        autoFollowed={{ tone: 'quiet', title: '已自动跟进 SVN 侧的新内容', detail: 'x' }}
+      />,
+    )
+    expect(document.querySelectorAll('.banner-baseline')).toHaveLength(0)
+  })
+})

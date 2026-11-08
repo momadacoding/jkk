@@ -10,12 +10,16 @@ interface SettingsDialogProps {
   initial: AppSettingsView | null
   loadError?: string | null
   /** 保存成功就关框；失败抛出，错误留在框里。 */
-  onSave: (closeToTray: boolean, showShortcut: string | null) => Promise<unknown>
+  onSave: (
+    closeToTray: boolean,
+    showShortcut: string | null,
+    svnAutoFollow: boolean,
+  ) => Promise<unknown>
   onClose: () => void
 }
 
 /**
- * 应用设置：关窗进托盘、全局快捷键。
+ * 应用设置：关窗进托盘、全局快捷键、SVN 自动跟进。
  *
  * 快捷键靠按键录制而不是手填：手填要用户自己知道 `Backquote` 这种键名，
  * 录制直接取 `KeyboardEvent.code`，规则与后端校验共用一份（`engine/appSettings.ts`）。
@@ -26,6 +30,7 @@ export function SettingsDialog({ initial, loadError = null, onSave, onClose }: S
   const [shortcut, setShortcut] = useState(
     initial?.showShortcut ?? initial?.defaultShortcut ?? '',
   )
+  const [autoFollow, setAutoFollow] = useState(initial?.svnAutoFollow ?? true)
   const [recording, setRecording] = useState(false)
   const [hint, setHint] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -90,7 +95,7 @@ export function SettingsDialog({ initial, loadError = null, onSave, onClose }: S
     setBusy(true)
     setError(null)
     try {
-      await onSave(closeToTray, shortcutOn ? shortcut : null)
+      await onSave(closeToTray, shortcutOn ? shortcut : null, autoFollow)
       onClose()
     } catch (err) {
       setError(toErrorMessage(err))
@@ -191,6 +196,23 @@ export function SettingsDialog({ initial, loadError = null, onSave, onClose }: S
                 {hint ?? '点击上面的按钮后按下新的组合键，Esc 取消。必须带 Ctrl、Alt 或 Win。'}
               </div>
               {staleError && <div className="dlg-warning">{staleError}</div>}
+            </div>
+            <div className="settings-section">
+              <div className="settings-heading">SVN 混合仓库</div>
+              <label className="dlg-check">
+                <input
+                  type="checkbox"
+                  checked={autoFollow}
+                  onChange={(e) => setAutoFollow(e.target.checked)}
+                />{' '}
+                TortoiseSVN 提交或更新之后自动跟进
+              </label>
+              <div className="settings-note">
+                {autoFollow
+                  ? '只移动 git 侧的基线与分支，不改工作区里的文件。有冲突、连不上服务器、暂存区拿不准时' +
+                    '不自动，横幅上会写明原因，点「跟进」照样可以完成。'
+                  : '关掉后，SVN 侧有新内容时只挂横幅，点「跟进」才会跟上。'}
+              </div>
             </div>
           </>
         )}

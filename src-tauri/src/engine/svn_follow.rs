@@ -230,7 +230,7 @@ pub fn git_version_ok(text: &str) -> bool {
 pub fn follow(repo: &str, opid: &str) -> Result<FollowOutcome> {
     for _ in 0..MAX_ATTEMPTS {
         // 准备阶段里同一条 svn 扫描只跑一次（性能 P2）；发布前的复核在范围外，照常读最新的
-        let plan = match with_scan_cache(|| prepare(repo)) {
+        let plan = match with_scan_cache(|| prepare(repo, false)) {
             Ok(p) => p,
             Err(e) => return Ok(refused(e)),
         };
@@ -276,6 +276,322 @@ pub fn resume_follow(repo: &str) -> Result<FollowOutcome> {
         Resumed::Finished(o) => Ok(o),
         // follow 自己要拿同步锁，上面那把已经放了
         Resumed::Again => follow(repo, &new_opid()),
+    }
+}
+
+// —— 自动跟进（分析 §6.12；计划 2026-11-06-svn-auto-follow） ——
+
+/// `svn_follow_auto` 的结局。只有两种：做完了，或者**一个 ref 都没动**、留给横幅上的「跟进」。
+///
+/// 没有 `NeedsManual`：冲突要人判断（条件 7），自动跟进连基线都不发布。动过 ref 之后的失败与
+/// [`follow`] 一样走 `Err`。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum AutoFollowOutcome {
+    Done {
+        report: Box<FollowReport>,
+    },
+    /// 没自动跟进。`code` 区分是哪一条条件，`message` 直接给横幅，说清为什么、点「跟进」会怎样。
+    Skipped {
+        code: String,
+        message: String,
+    },
+}
+
+/// 判定写回 ExternallyAdvanced 之后由前端发起（设置里关掉时命令层直接返回 `Skipped`）。
+///
+/// 与 [`follow`] 走同一套准备与发布，多出分析 §6.12 的条件：
+///
+/// | # | 落点 |
+/// |---|---|
+/// | 1–4、10 | [`prepare`] 与 [`still_valid`] 的前置检查，原样拒绝 |
+/// | 5 | 录制拒绝没确认成的删除（`HealthMap::Unconfirmed`），断网时由条件 6 挡住 |
+/// | 6、7、8、11 | [`auto_blocker`]，在拿同步锁之前判 |
+/// | 9 | 录制拒绝超过 `MAX_MAP_ENTRIES` 的映射 |
+/// | 12 | [`publish_auto`]：先拼索引、看过决策再发布基线 |
+/// | 13 | 没有撤销功能，恒真 |
+pub fn follow_auto(repo: &str, opid: &str) -> Result<AutoFollowOutcome> {
+    for _ in 0..MAX_ATTEMPTS {
+        let plan = match with_scan_cache(|| prepare(repo, true)) {
+            Ok(p) => p,
+            Err(e) => return Ok(skipped(e)),
+        };
+        fault::reach(fault::Point::Prepared, None);
+        if let Some(e) = auto_blocker(repo, &plan) {
+            return Ok(skipped(e));
+        }
+        let _lock = match svn_lock::acquire(repo, opid) {
+            Ok(l) => l,
+            Err(e) => return Ok(skipped(e)),
+        };
+        match still_valid(repo, &plan) {
+            Ok(true) => return publish_auto(repo, opid, plan),
+            Ok(false) => continue,
+            Err(e) => return Ok(skipped(e)),
+        }
+    }
+    Ok(skipped(GitError::new(
+        "svn_follow_state_changed",
+        "准备跟进期间仓库一直在变（有别的工具在提交或切分支？），这次没有自动跟进，什么都没动。",
+    )))
+}
+
+fn skipped(e: GitError) -> AutoFollowOutcome {
+    AutoFollowOutcome::Skipped {
+        code: e.code,
+        message: e.message,
+    }
+}
+
+/// 点「跟进」的结果与自动跟进不同的那几条，横幅上要说清楚：按钮仍然可以完成。
+const TAIL_FOLLOW: &str = "点「跟进」照样可以完成。";
+
+fn branch_behind_not_auto() -> GitError {
+    GitError::new(
+        "svn_auto_follow_branch_behind",
+        format!(
+            "当前分支落后基线，但 SVN 侧没有新内容：这是切到了旧分支，或者上次跟进遇到了冲突。\
+             自动跟进只处理 SVN 侧的新内容，分支要不要跟上由你决定。{TAIL_FOLLOW}"
+        ),
+    )
+}
+
+/// 条件 6、7、8、11。返回第一条不满足的，按表里的顺序。
+fn auto_blocker(repo: &str, plan: &Plan) -> Option<GitError> {
+    // prepare(auto) 已经挡在前面，这里只是兜底：分支跟进入口没有新基线可发布
+    if plan.old_base == plan.new_base {
+        return Some(branch_behind_not_auto());
+    }
+    if !plan.report.verified {
+        return Some(GitError::new(
+            "svn_auto_follow_not_verified",
+            format!(
+                "这次没能向服务器核对新基线（多半是连不上 SVN 服务器）。没核对过的基线不自动发布。\
+                 {TAIL_FOLLOW}报告里会标出「未经体检」。"
+            ),
+        ));
+    }
+    let tip = match &plan.target {
+        Target::Tip(t) => t,
+        Target::Conflict(m) if m.stale_disk => {
+            return Some(GitError::new(
+                "svn_auto_follow_stale_disk",
+                format!(
+                    "磁盘上还是这条分支的旧内容（{}），只移分支的话「本地改动」会变成把 SVN 的内容改回去。\
+                     这要用会写磁盘的手动跟进，不能自动做。点「跟进」会给出手动跟进的入口。",
+                    capped(m.files.clone(), "个文件")
+                ),
+            ))
+        }
+        Target::Conflict(m) => {
+            return Some(GitError::new(
+                "svn_auto_follow_conflict",
+                format!(
+                    "当前分支的提交重放到新基线上有冲突（{}），要你来判断。点「跟进」会弹出冲突的详情。",
+                    capped(m.files.clone(), "个文件")
+                ),
+            ))
+        }
+    };
+    if !plan.report.leaks.is_empty() {
+        let paths: BTreeSet<String> = plan.report.leaks.iter().map(|l| l.path.clone()).collect();
+        return Some(GitError::new(
+            "svn_auto_follow_leak",
+            format!(
+                "当前分支的 Local-Only 补丁可能已经被带上了 SVN 服务器（{}）。这要你第一时间知道，\
+                 不能被一次自动跟进带过去。{TAIL_FOLLOW}报告里会列出每一处。",
+                capped(paths.into_iter().collect(), "个文件")
+            ),
+        ));
+    }
+    let overlap = match retained_overlap(repo, &plan.new_base, tip, &plan.external) {
+        Ok(o) => o,
+        Err(e) => {
+            return Some(GitError::new(
+                "svn_auto_follow_overlap_unknown",
+                format!(
+                    "没能核对分支上的提交与 SVN 新内容有没有碰到同一批文件（{}），这次不自动跟进。\
+                     {TAIL_FOLLOW}",
+                    e.message
+                ),
+            ))
+        }
+    };
+    // drift 是条件 11 的子集（tip 与 NEW 不同的外部路径一定被保留的 commit 改过），兜底再看一次
+    let mut overlap: BTreeSet<String> = overlap;
+    overlap.extend(plan.report.drift.iter().cloned());
+    if !overlap.is_empty() {
+        return Some(GitError::new(
+            "svn_auto_follow_overlap",
+            format!(
+                "当前分支上的提交改过的文件，SVN 侧也有新内容（{}）。重放即使没有冲突，结果也可能和\
+                 磁盘对不上，要你看一眼。{TAIL_FOLLOW}跟进之后请对照报告检查这些文件。",
+                capped(overlap.into_iter().collect(), "个文件")
+            ),
+        ));
+    }
+    None
+}
+
+/// 条件 11：重放后留下的 commit（`new..tip`）相对各自新父提交仍改动的路径，与外部变更的交集。
+///
+/// 按重放之后算：F2 ① 换成 SVN 版本的路径、6.10 的快照内容已经不在 commit 里了，「C1 改了 a 和
+/// e、只有 a 被提交」这种情形 C1' 只剩 e，不受影响（分析 §6.12 条件 11）。
+fn retained_overlap(
+    repo: &str,
+    new: &str,
+    tip: &str,
+    external: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    if new == tip || external.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    // `--format=` 加 `-z`：每条路径以 NUL 结尾，commit 之间没有分隔（2026-11-07 实测 git 2.51）
+    let out = run_git_bytes(
+        repo,
+        &[
+            "log",
+            "--format=",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            &format!("{new}..{tip}"),
+        ],
+    )?;
+    let mut hit = BTreeSet::new();
+    for raw in out.split(|b| *b == 0) {
+        let raw = raw.strip_prefix(b"\n").unwrap_or(raw);
+        if raw.is_empty() {
+            continue;
+        }
+        // 外部路径都是 UTF-8（来自 svn 的 XML）。读不懂的路径不可能命中，但宁可不自动
+        let path = std::str::from_utf8(raw).map_err(|_| {
+            GitError::new(
+                "svn_follow_path_not_utf8",
+                "分支上的提交里有不是 UTF-8 的路径。",
+            )
+        })?;
+        if external.contains(path) {
+            hit.insert(path.to_string());
+        }
+    }
+    Ok(hit)
+}
+
+/// 条件 12：拼索引时有暂存内容没能保留（三方合并冲突、二进制、删除 / mode 变化、文件与目录
+/// 撞名，即 `lost`），或「作者是我但先后拿不准」（`uncertain`）。
+///
+/// 放行的两种，通知里都会列出来（分析 §6.12「通知」）：
+/// - 三方合并干净（`Merged`）：暂存内容与 SVN 的改动都在，是分析 §6.11.1 表里确定的一行。计划
+///   原写「无三方合并」，比分析的「无三方合并冲突」严，按分析（日志 Task 1「计划的错误」）
+/// - `discarded`：作者是我、确定早于提交的中间版本。原内容钉在 `refs/mygitclient/follow/<opid>`
+fn stage_blocker(report: &ComposeReport) -> Option<GitError> {
+    let mut paths: BTreeSet<String> = report.lost.iter().cloned().collect();
+    paths.extend(report.uncertain.iter().cloned());
+    if paths.is_empty() {
+        return None;
+    }
+    Some(GitError::new(
+        "svn_auto_follow_stage",
+        format!(
+            "暂存区里有文件保不住暂存的内容（和 SVN 的改动合不到一起），或者拿不准是不是比 SVN 上的\
+             更新（{}）。自动跟进不替你决定暂存内容的去留。{TAIL_FOLLOW}报告会写明每个文件怎么处理的。",
+            capped(paths.into_iter().collect(), "个文件")
+        ),
+    ))
+}
+
+/// 自动跟进的发布：**先拼索引、后发布基线**（计划 §3 条件 12 的「结构性缺口」）。
+///
+/// [`publish`] 先 CAS `svn/base` 再拼索引，拼索引的决策出来时基线已经动了。这里把顺序倒过来：
+/// 拿着 `.git/index.lock` 拼好索引、看过 [`stage_blocker`]，不满足就删锁、删 journal，一个 ref
+/// 都没动；满足才 CAS 基线，之后与 [`publish`] 相同（[`swap_in`]）。
+///
+/// 崩溃恢复不用改：journal 一开始就记 [`FollowStep::PrepareIndex`]，这一步的恢复是「删掉我方的
+/// 锁、清记录、重新跟进」，不管基线动没动都是一致状态（[`resume_locked`]）。代价是 index.lock
+/// 多拿一次 `update-ref` 的时间。手动跟进的顺序不变：它不看决策，没理由多锁这一下。
+fn publish_auto(repo: &str, opid: &str, plan: Plan) -> Result<AutoFollowOutcome> {
+    let Plan {
+        branch,
+        old_head,
+        old_base,
+        new_base,
+        target,
+        others,
+        report,
+        who,
+        ..
+    } = plan;
+    let Target::Tip(tip) = target else {
+        // auto_blocker 已经挡掉了冲突
+        return Ok(skipped(GitError::new(
+            "svn_auto_follow_conflict",
+            format!("当前分支重放有冲突，要你来判断。{TAIL_FOLLOW}"),
+        )));
+    };
+    let mut j = publishing_journal(
+        opid,
+        Moves {
+            branch: &branch,
+            old_head: &old_head,
+            old_base: &old_base,
+            new_base: &new_base,
+            tip: Some(tip.clone()),
+        },
+        others,
+        report,
+        FollowStep::PrepareIndex,
+    );
+    if let Err(e) = svn_journal::write(repo, &j) {
+        return Ok(skipped(e));
+    }
+    fault::reach(fault::Point::Journaled, None);
+    fault::reach(fault::Point::BeforePrepare, None);
+
+    // 什么都还没动：失败与不满足条件 12 都是删锁、删记录、丢掉钉住的旧索引（它就是此刻的真实索引）
+    let give_up = |prepared: Option<PreparedIndex>, e: GitError| -> Result<AutoFollowOutcome> {
+        let pin = prepared.as_ref().map(|p| p.pinned_ref().to_string());
+        drop(prepared);
+        svn_journal::remove(repo)?;
+        let pin = pin.unwrap_or_else(|| format!("refs/mygitclient/follow/{opid}"));
+        if let Err(err) = run_git(repo, &["update-ref", "-d", &pin]) {
+            log::warn!("删除钉住的索引 {pin} 失败：{}", err.message);
+        }
+        Ok(skipped(e))
+    };
+    // 步骤留在 PrepareIndex：基线还没发布，恢复不能往前移分支（见 record_prepared）
+    let heads = (old_head.as_str(), tip.as_str());
+    let mut prepared =
+        match compose_index(repo, opid, &mut j, &who, heads, FollowStep::PrepareIndex) {
+            Ok(p) => p,
+            Err(e) => return give_up(None, e),
+        };
+    if let Some(e) = stage_blocker(&prepared.report) {
+        return give_up(Some(prepared), e);
+    }
+    if let Err(e) = move_baseline_ref(repo, &new_base, Some(&old_base)) {
+        return give_up(Some(prepared), e);
+    }
+    fault::reach(fault::Point::BaseMoved, Some(&mut prepared));
+    // 基线发布了才能推进：从这里起恢复会把分支往前移。写不进去时基线已动、分支没动，按
+    // publish 拼索引失败那样收场（一致状态，「跟进」会走分支跟进入口）
+    if let Err(e) = advance(repo, &mut j, FollowStep::MoveBranch) {
+        prepared.abandon();
+        svn_journal::remove(repo)?;
+        return Err(baseline_kept(e));
+    }
+
+    match swap_in(repo, &mut j, prepared, &branch, &old_head, &tip)? {
+        FollowOutcome::Done { report } => Ok(AutoFollowOutcome::Done { report }),
+        // swap_in 只会以 Done 结束；万一不是，照实交给横幅
+        other => Ok(skipped(GitError::new(
+            "svn_follow_index_failed",
+            format!("自动跟进的结局不是「完成」：{other:?}"),
+        ))),
     }
 }
 
@@ -545,6 +861,8 @@ struct Plan {
     /// 这次录的映射。锁内要再核对一遍（R3c）；分支跟进没有录制。
     recorded: Option<BaseMap>,
     who: Who,
+    /// 分支自己的基线到 NEW 之间外部变过的路径（[`External::paths`]）。自动跟进的条件 11 要它。
+    external: BTreeSet<String>,
 }
 
 /// 判定「是不是我提交的」「早于外部提交吗」的线索（计划 Task 9）。全部拿不准时走保守分支。
@@ -895,7 +1213,9 @@ fn branch_baseline(repo: &str, head: &str, base: &str) -> Result<String> {
 }
 
 /// 预检与 F1–F3。**一个 ref 都不动**：基线 commit 与重放结果只是对象。
-fn prepare(repo: &str) -> Result<Plan> {
+///
+/// `auto`：自动跟进只接 ExternallyAdvanced（日志 Task 1「偏离计划」），分支跟进入口在录制之前就停。
+fn prepare(repo: &str, auto: bool) -> Result<Plan> {
     if detect_repo_kind(repo) != RepoKind::SvnHybrid {
         return Err(not_hybrid());
     }
@@ -965,6 +1285,7 @@ fn prepare(repo: &str) -> Result<Plan> {
                 "基线已经和工作副本一致，分支也在基线上，没有要跟进的。",
             ))
         }
+        SyncVerdict::InSync if auto => return Err(branch_behind_not_auto()),
         // 分支跟进入口：以现有的 svn/base 为 NEW。不录制，也就没有 R1 那道检查，这里补上
         SyncVerdict::InSync => {
             run_preflight_with(repo, &cfg.whitelist, true)?;
@@ -1112,6 +1433,7 @@ fn prepare(repo: &str) -> Result<Plan> {
         report,
         recorded,
         who,
+        external: paths,
     })
 }
 
@@ -1852,30 +2174,24 @@ fn publish(repo: &str, opid: &str, plan: Plan) -> Result<FollowOutcome> {
         Target::Tip(t) => Some(t.clone()),
         Target::Conflict { .. } => None,
     };
-    let mut j = Journal {
-        opid: opid.to_string(),
-        flow: Flow::Follow,
-        phase: Phase::FollowPublishing,
-        started_at: now_secs(),
-        orig_branch: Some(branch.clone()),
-        orig_head: Some(old_head.clone()),
-        baseline_oid_before: Some(old_base.clone()),
-        new_baseline_oid: Some(new_base.clone()),
-        follow_steps: Some(FollowSteps {
-            step: if old_base == new_base {
-                FollowStep::PrepareIndex
-            } else {
-                FollowStep::Baseline
-            },
-            new_tip: tip.clone(),
-            others,
-            index_blob: None,
-            index_stages: None,
-            lock_created: false,
-            report,
-        }),
-        ..Default::default()
+    let first = if old_base == new_base {
+        FollowStep::PrepareIndex
+    } else {
+        FollowStep::Baseline
     };
+    let mut j = publishing_journal(
+        opid,
+        Moves {
+            branch: &branch,
+            old_head: &old_head,
+            old_base: &old_base,
+            new_base: &new_base,
+            tip: tip.clone(),
+        },
+        others,
+        report,
+        first,
+    );
     if let Err(e) = svn_journal::write(repo, &j) {
         return Ok(refused(e));
     }
@@ -1902,66 +2218,123 @@ fn publish(repo: &str, opid: &str, plan: Plan) -> Result<FollowOutcome> {
     // ② 拼索引
     advance(repo, &mut j, FollowStep::PrepareIndex)?;
     fault::reach(fault::Point::BeforePrepare, None);
-    // 暂存 blob 要在持索引锁之后读（facts 只在 prepare_index 持锁时调用），否则外部一次 add
-    // 能让这里读到的与拼索引看到的不是同一份。交集为空时一次都不用读
-    let staged = OnceCell::new();
-    let facts = |p: &str| who.facts(p, staged.get_or_init(|| staged_blobs(repo)).as_ref());
-    // 建好锁立刻记下来：恢复时只有这个记录能证明路径上的锁是我们的（Review 2 第 7 条）
-    let mut on_locked = || -> Result<()> {
-        steps_mut(&mut j)?.lock_created = true;
-        svn_journal::write(repo, &j)?;
-        fault::reach(fault::Point::IndexLocked, None);
-        Ok(())
-    };
-    let mut prepared = match prepare_index_with(repo, opid, &old_head, &tip, &facts, &mut on_locked)
-    {
+    let heads = (old_head.as_str(), tip.as_str());
+    let prepared = match compose_index(repo, opid, &mut j, &who, heads, FollowStep::MoveBranch) {
         Ok(p) => p,
         Err(e) => {
             svn_journal::remove(repo)?;
             return Err(baseline_kept(e));
         }
     };
-    if let Err(e) = record_prepared(repo, &mut j, &prepared) {
+    swap_in(repo, &mut j, prepared, &branch, &old_head, &tip)
+}
+
+/// 发布要动的几个 ref 的旧值与新值，[`publishing_journal`] 的参数。
+struct Moves<'a> {
+    branch: &'a str,
+    old_head: &'a str,
+    old_base: &'a str,
+    new_base: &'a str,
+    tip: Option<String>,
+}
+
+/// 发布用的 journal，步骤从 `first` 开始。
+fn publishing_journal(
+    opid: &str,
+    m: Moves<'_>,
+    others: Vec<BranchMove>,
+    report: FollowReport,
+    first: FollowStep,
+) -> Journal {
+    Journal {
+        opid: opid.to_string(),
+        flow: Flow::Follow,
+        phase: Phase::FollowPublishing,
+        started_at: now_secs(),
+        orig_branch: Some(m.branch.to_string()),
+        orig_head: Some(m.old_head.to_string()),
+        baseline_oid_before: Some(m.old_base.to_string()),
+        new_baseline_oid: Some(m.new_base.to_string()),
+        follow_steps: Some(FollowSteps {
+            step: first,
+            new_tip: m.tip,
+            others,
+            index_blob: None,
+            index_stages: None,
+            lock_created: false,
+            report,
+        }),
+        ..Default::default()
+    }
+}
+
+/// 拼索引（OLD → NEW_TIP），留在 `.git/index.lock` 里，并把指纹记进 journal、步骤推进到 `next`
+/// （见 [`record_prepared`]）。失败时锁已删，journal 由调用方处理。
+fn compose_index(
+    repo: &str,
+    opid: &str,
+    j: &mut Journal,
+    who: &Who,
+    (old_head, tip): (&str, &str),
+    next: FollowStep,
+) -> Result<PreparedIndex> {
+    // 暂存 blob 要在持索引锁之后读（facts 只在 prepare_index 持锁时调用），否则外部一次 add
+    // 能让这里读到的与拼索引看到的不是同一份。交集为空时一次都不用读
+    let staged = OnceCell::new();
+    let facts = |p: &str| who.facts(p, staged.get_or_init(|| staged_blobs(repo)).as_ref());
+    // 建好锁立刻记下来：恢复时只有这个记录能证明路径上的锁是我们的（Review 2 第 7 条）
+    let mut on_locked = || -> Result<()> {
+        steps_mut(j)?.lock_created = true;
+        svn_journal::write(repo, j)?;
+        fault::reach(fault::Point::IndexLocked, None);
+        Ok(())
+    };
+    let mut prepared = prepare_index_with(repo, opid, old_head, tip, &facts, &mut on_locked)?;
+    if let Err(e) = record_prepared(repo, j, &prepared, next) {
         prepared.abandon();
-        svn_journal::remove(repo)?;
-        return Err(baseline_kept(e));
+        return Err(e);
     }
     fault::reach(fault::Point::IndexPrepared, Some(&mut prepared));
+    Ok(prepared)
+}
 
+/// ③–⑤：核对 HEAD → CAS 当前分支 → 再核对 HEAD → 换入索引 → 其他分支与 F6。基线此时已发布。
+fn swap_in(
+    repo: &str,
+    j: &mut Journal,
+    mut prepared: PreparedIndex,
+    branch: &str,
+    old_head: &str,
+    tip: &str,
+) -> Result<FollowOutcome> {
     // ③ 核对 HEAD → CAS 当前分支 → 再核对 HEAD
-    if !head_on(repo, &branch) {
-        return Err(back_out(repo, &j, prepared, false, head_moved(&branch)));
+    if !head_on(repo, branch) {
+        return Err(back_out(repo, j, prepared, false, head_moved(branch)));
     }
     fault::reach(fault::Point::HeadChecked, Some(&mut prepared));
-    if let Err(e) = move_branch(repo, &branch, &tip, &old_head) {
-        return Err(back_out(
-            repo,
-            &j,
-            prepared,
-            false,
-            branch_moved(&branch, &e),
-        ));
+    if let Err(e) = move_branch(repo, branch, tip, old_head) {
+        return Err(back_out(repo, j, prepared, false, branch_moved(branch, &e)));
     }
     fault::reach(fault::Point::BranchMoved, Some(&mut prepared));
     // checkout -b 绕得过 index.lock（W23）。落在这里时新分支建在 NEW_TIP 上，拼好的索引对得上它，
     // 往前走；只有 HEAD 不在 NEW_TIP 上（CAS 之前切走的、symbolic-ref 指到别处的），换入才是错的
-    if !head_at(repo, &tip) {
-        return Err(back_out(repo, &j, prepared, true, head_moved(&branch)));
+    if !head_at(repo, tip) {
+        return Err(back_out(repo, j, prepared, true, head_moved(branch)));
     }
 
     // ④ 换入索引
-    if let Err(e) = advance(repo, &mut j, FollowStep::SwapIndex) {
-        return Err(back_out(repo, &j, prepared, true, e));
+    if let Err(e) = advance(repo, j, FollowStep::SwapIndex) {
+        return Err(back_out(repo, j, prepared, true, e));
     }
     fault::reach(fault::Point::BeforeSwap, Some(&mut prepared));
     if let Err(e) = prepared.commit() {
-        return Err(back_out(repo, &j, prepared, true, e));
+        return Err(back_out(repo, j, prepared, true, e));
     }
     fault::reach(fault::Point::IndexSwapped, None);
 
     // ⑤ 其他分支 + F6
-    advance(repo, &mut j, FollowStep::MoveOthers)?;
-    finish(repo, &mut j)
+    advance(repo, j, FollowStep::MoveOthers)?;
+    finish(repo, j)
 }
 
 fn now_secs() -> u64 {
@@ -1991,8 +2364,16 @@ fn advance(repo: &str, j: &mut Journal, step: FollowStep) -> Result<()> {
     svn_journal::write(repo, j)
 }
 
-/// 记下拼好的索引的指纹与暂存报告。之后崩溃时靠它认锁文件，报告也不会丢。
-fn record_prepared(repo: &str, j: &mut Journal, prepared: &PreparedIndex) -> Result<()> {
+/// 记下拼好的索引的指纹与暂存报告，步骤推进到 `next`。之后崩溃时靠指纹认锁文件，报告也不会丢。
+///
+/// `next` 是 [`FollowStep::MoveBranch`] 的前提是基线已经发布：恢复走到这一步会把分支往前移。
+/// 自动跟进在这里还没 CAS 基线，所以留在 [`FollowStep::PrepareIndex`]，发布基线之后再推进。
+fn record_prepared(
+    repo: &str,
+    j: &mut Journal,
+    prepared: &PreparedIndex,
+    next: FollowStep,
+) -> Result<()> {
     let lock = git_dir(repo)?.join("index.lock");
     let blob = blob_of(repo, &std::fs::read(lock)?)?;
     let work = prepared.lock_abs_path()?;
@@ -2003,7 +2384,7 @@ fn record_prepared(repo: &str, j: &mut Journal, prepared: &PreparedIndex) -> Res
     s.index_stages = Some(stages);
     s.report.stage = prepared.report.clone();
     s.report.pinned_ref = Some(prepared.pinned_ref().to_string());
-    s.step = FollowStep::MoveBranch;
+    s.step = next;
     svn_journal::write(repo, j)
 }
 
@@ -2262,7 +2643,16 @@ fn resume_locked(repo: &str, j: &mut Journal) -> Result<Resumed> {
         // 索引，只能删。没记过「锁是我方建的」的不是我们的：活着的 git 等编辑器时 index.lock 在、
         // 句柄已关，删除照样成功（Review 2 探针 P7）。报忙，记录留着，对方结束后再点「继续」
         FollowStep::PrepareIndex => {
-            if steps(j)?.lock_created {
+            let s = steps(j)?;
+            // 自动跟进拼好索引之后、发布基线之前也停在这一步，这时 journal 里已有指纹：拿它核对，
+            // 锁要是被换成了别人的（残锁被手工删掉、又有 git 拿了锁），不删（review 低-3）。
+            // 没有指纹（手动跟进拼到一半）时照旧：记过「锁是我方建的」就只能是我们的半成品
+            let lock = git_dir(repo)?.join("index.lock");
+            let ours = match &s.index_blob {
+                Some(_) if lock.exists() => lock_is_ours(repo, &lock, s.index_blob.as_deref())?,
+                _ => s.lock_created,
+            };
+            if ours {
                 remove_lock(repo)?;
             } else {
                 require_index_free(repo)?;
@@ -2324,7 +2714,7 @@ fn restore_branch(repo: &str, branch: &str, old_head: &str, new_tip: &str) -> Re
 fn recompose_index(repo: &str, j: &mut Journal, old_head: &str, new_tip: &str) -> Result<Resumed> {
     let opid = j.opid.clone();
     let mut prepared = prepare_index(repo, &opid, old_head, new_tip, &|_| PathFacts::default())?;
-    record_prepared(repo, j, &prepared)?;
+    record_prepared(repo, j, &prepared, FollowStep::MoveBranch)?;
     prepared.keep_lock_on_drop();
     settle_branch_and_index(repo, j)
 }

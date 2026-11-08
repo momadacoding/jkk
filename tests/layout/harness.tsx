@@ -252,6 +252,7 @@ const SCENES: Record<string, () => ReactNode> = {
         showShortcut: 'Ctrl+Alt+Shift+Super+F12',
         shortcutError: LONG_ERROR,
         defaultShortcut: 'Ctrl+Alt+J',
+        svnAutoFollow: true,
       }}
       onSave={async () => {
         throw new Error(LONG_ERROR)

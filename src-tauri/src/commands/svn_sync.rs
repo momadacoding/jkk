@@ -10,7 +10,10 @@
 //! （`AGENTS.md` §7.3）。
 
 use crate::commands::watch::WatchSuspension;
-use crate::engine::svn_follow::{follow, manual_follow, resume_follow, FollowOutcome};
+use crate::desktop::DesktopState;
+use crate::engine::svn_follow::{
+    follow, follow_auto, manual_follow, resume_follow, AutoFollowOutcome, FollowOutcome,
+};
 use crate::engine::svn_sync_check::{preview_sync_in, SyncInPreview};
 use crate::engine::svn_sync_in::{
     abort_sync, continue_sync, new_opid, run_sync_in, SyncInExpect, SyncInOutcome,
@@ -20,7 +23,7 @@ use crate::engine::svn_sync_out::{
 };
 use crate::engine::svn_sync_out_check::{preview_sync_out, SyncOutPreview};
 use crate::error::GitError;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, State};
 
 /// 预览：前置检查 1–6，**什么都不改**。确认框里的全部事实都来自这里。
 #[tauri::command(async)]
@@ -83,6 +86,26 @@ pub fn svn_sync_out_abort(handle: AppHandle, path: String) -> Result<SyncOutOutc
 pub fn svn_follow(handle: AppHandle, path: String) -> Result<FollowOutcome, GitError> {
     with_watch_suspended(&handle, &path, || follow(&path, &new_opid()))
 }
+
+/// 自动跟进（事故分析 6.12）：判定写回 ExternallyAdvanced 之后由前端发起。条件全部满足才发布，
+/// 否则 `Skipped`、一个 ref 都不动。设置里关掉时直接 `Skipped`，不读工作副本。
+#[tauri::command(async)]
+pub fn svn_follow_auto(
+    handle: AppHandle,
+    state: State<'_, DesktopState>,
+    path: String,
+) -> Result<AutoFollowOutcome, GitError> {
+    if !state.svn_auto_follow() {
+        return Ok(AutoFollowOutcome::Skipped {
+            code: AUTO_FOLLOW_OFF.to_string(),
+            message: "设置里关掉了自动跟进。".to_string(),
+        });
+    }
+    with_watch_suspended(&handle, &path, || follow_auto(&path, &new_opid()))
+}
+
+/// 自动跟进关着。前端认这个 code：不挂原因，横幅照旧。
+pub const AUTO_FOLLOW_OFF: &str = "svn_auto_follow_off";
 
 /// 把崩溃留下的跟进走完，或回滚到一致状态再重新跟进（计划 Task 10）。
 #[tauri::command(async)]

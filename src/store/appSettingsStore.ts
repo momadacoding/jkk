@@ -17,6 +17,27 @@ export function saveAppSettings(
   return invoke<AppSettingsView>('save_app_settings', { closeToTray, showShortcut })
 }
 
+/** 打开 / 关掉 SVN 自动跟进（事故分析 6.12）。后端 `set_svn_auto_follow(enabled)`。 */
+export function setSvnAutoFollow(enabled: boolean): Promise<AppSettingsView> {
+  return invoke<AppSettingsView>('set_svn_auto_follow', { enabled })
+}
+
+/**
+ * 设置框的「保存」：快捷键那一组走 `save_app_settings`，自动跟进单独一条命令，只在改了时发。
+ *
+ * 先存快捷键：它会失败（被别的程序占了），失败时自动跟进也不动，框里只有一条错误。
+ */
+export async function saveAllSettings(
+  before: AppSettingsView,
+  closeToTray: boolean,
+  showShortcut: string | null,
+  svnAutoFollow: boolean,
+): Promise<AppSettingsView> {
+  const view = await saveAppSettings(closeToTray, showShortcut)
+  if (svnAutoFollow === before.svnAutoFollow) return view
+  return setSvnAutoFollow(svnAutoFollow)
+}
+
 /**
  * 告诉后端设置框是否正在录快捷键。录制期间按下全局快捷键只呼出、不隐藏：
  * 重录同一个组合键时系统会先把这次按键当成全局快捷键派过来，切换的话窗口当场消失。

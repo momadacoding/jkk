@@ -1036,6 +1036,25 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
         serde_json::json!({ "kind": "refused", "code": "svn_follow_wc_locked", "message": "m" })
     );
 
+    // 自动跟进（事故分析 6.12）的两种结局，前端 `AutoFollowOutcome` 照这个形状读
+    use app_lib::engine::svn_follow::AutoFollowOutcome;
+    let v = serde_json::to_value(AutoFollowOutcome::Skipped {
+        code: "svn_auto_follow_stage".into(),
+        message: "m".into(),
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({ "kind": "skipped", "code": "svn_auto_follow_stage", "message": "m" })
+    );
+    let v = serde_json::to_value(AutoFollowOutcome::Done {
+        report: Box::default(),
+    })
+    .unwrap();
+    assert_eq!(v["kind"], "done");
+    assert_eq!(v["report"]["verified"], false);
+    assert!(v["report"]["stage"]["discarded"].is_array());
+
     let mut decisions = BTreeMap::new();
     decisions.insert("Code/A.cs".to_string(), StageDecision::TakeNew);
     decisions.insert("Code/B.cs".to_string(), StageDecision::KeepStaged);
