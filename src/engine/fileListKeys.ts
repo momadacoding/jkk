@@ -64,8 +64,9 @@ export function discardShortcut(
   if (e.repeat || e.isComposing) return null
 
   if (selection.section !== focused) return null
-  const present = files[focused]
-  const paths = selection.paths.filter((p) => present.includes(p))
+  // Set：选中一个大文件夹按 Delete，展开出来就是上万个文件，逐个 includes 是平方级，确认框弹出前界面会卡住
+  const present = new Set(files[focused])
+  const paths = selection.paths.filter((p) => present.has(p))
   if (paths.length === 0) return null
   return { paths, staged: focused === 'staged' }
 }

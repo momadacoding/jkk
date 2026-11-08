@@ -939,6 +939,13 @@ describe('LocalChangesView 的树形列表与状态角标', () => {
     return el
   }
 
+  /** 文件夹行的展开 / 收起箭头。单击文件夹行本身是选中它，收起要点箭头。 */
+  function toggleDir(name: string) {
+    const el = dirRow(name).querySelector('.changes-dir-toggle')
+    if (!(el instanceof HTMLElement)) throw new Error(`目录 ${name} 没有展开箭头`)
+    fireEvent.click(el)
+  }
+
   const dirNames = (sec: HTMLElement) =>
     Array.from(sec.querySelectorAll('.changes-dir-name')).map((el) => el.textContent)
 
@@ -977,9 +984,24 @@ describe('LocalChangesView 的树形列表与状态角标', () => {
     expect(onUnstage).toHaveBeenCalledWith(['s.txt'])
   })
 
-  it('双击目录行不暂存任何东西', () => {
-    const { onStage } = mountTree({ unstaged: [ch('src/a.ts')], staged: [] })
+  it('双击目录行：暂存目录下的全部文件，含收起的子目录里的', async () => {
+    const { onStage } = mountTree({ unstaged: [ch('src/a.ts'), ch('src/lib/x.ts'), ch('b.txt')], staged: [] })
+    toggleDir('lib')
     fireEvent.doubleClick(dirRow('src'))
+    await waitFor(() => expect(onStage).toHaveBeenCalledWith(['src/lib/x.ts', 'src/a.ts']))
+  })
+
+  it('双击 Staged 里的目录行：取消暂存目录下的全部文件', () => {
+    const { onUnstage } = mountTree({ unstaged: [], staged: [ch('src/a.ts'), ch('src/b.ts'), ch('c.txt')] })
+    fireEvent.doubleClick(dirRow('src'))
+    expect(onUnstage).toHaveBeenCalledWith(['src/a.ts', 'src/b.ts'])
+  })
+
+  it('双击箭头只是快速收起又展开，不暂存', () => {
+    const { onStage } = mountTree({ unstaged: [ch('src/a.ts')], staged: [] })
+    const toggle = dirRow('src').querySelector('.changes-dir-toggle')
+    if (!(toggle instanceof HTMLElement)) throw new Error('没有箭头')
+    fireEvent.doubleClick(toggle)
     expect(onStage).not.toHaveBeenCalled()
   })
 
@@ -1000,26 +1022,32 @@ describe('LocalChangesView 的树形列表与状态角标', () => {
     await waitFor(() => expect(onStage).toHaveBeenCalledWith(['a.txt', 'c.txt']))
   })
 
-  it('点目录行收起，里面的文件不再显示；再点展开', () => {
+  it('点目录行的箭头收起，里面的文件不再显示；再点展开', () => {
     mountTree({ unstaged: [ch('src/a.ts'), ch('b.txt')], staged: [] })
-    fireEvent.click(dirRow('src'))
+    toggleDir('src')
     expect(screen.queryByText('a.ts')).toBeNull()
     expect(screen.getByText('b.txt')).toBeTruthy()
-    fireEvent.click(dirRow('src'))
+    toggleDir('src')
     expect(screen.getByText('a.ts')).toBeTruthy()
   })
 
-  it('Shift 选一段按树里看到的顺序，跳过收起目录里的文件', async () => {
+  it('Shift 选一段按树里看到的顺序，不把收起目录里的行单独夹进来', async () => {
     const { onStage } = mountTree({
       unstaged: [ch('b.txt'), ch('src/x.ts'), ch('a.txt'), ch('lib/y.ts')],
       staged: [],
     })
-    // 树：lib/ y.ts、src/ x.ts、a.txt、b.txt；收起 src 之后看得见的是 y.ts、a.txt、b.txt
-    fireEvent.click(dirRow('src'))
+    // 树：lib/ y.ts、src/ x.ts、a.txt、b.txt；收起 src 之后看得见的行是 lib/、y.ts、src/、a.txt、b.txt
+    toggleDir('src')
     fireEvent.click(fileRow('y.ts'))
-    fireEvent.click(fileRow('a.txt'), { shiftKey: true })
+    fireEvent.click(fileRow('b.txt'), { shiftKey: true })
     fireEvent.click(screen.getByRole('button', { name: 'Stage Selected' }))
-    await waitFor(() => expect(onStage).toHaveBeenCalledWith(['lib/y.ts', 'a.txt']))
+    await waitFor(() => expect(onStage).toHaveBeenCalledTimes(1))
+    // 2026-11-08 起文件夹行可选中：收起的 src 那一行在这一段里、高亮着，动作带上它下面的文件（同 Fork）。
+    // x.ts 是作为「src 的内容」进来的，不是作为一行被单独选中：展开 src 也不会看到它被选中
+    expect(dirRow('src').classList.contains('selected')).toBe(true)
+    expect(onStage).toHaveBeenCalledWith(['lib/y.ts', 'src/x.ts', 'a.txt', 'b.txt'])
+    toggleDir('src')
+    expect(fileRow('x.ts').classList.contains('selected')).toBe(false)
   })
 
   // 选中只含看得见的文件：否则区头「Stage Selected」、Delete 丢弃都会打到看不见的文件上
@@ -1027,7 +1055,7 @@ describe('LocalChangesView 的树形列表与状态角标', () => {
     const { onStage } = mountTree({ unstaged: [ch('src/a.ts'), ch('src/b.ts'), ch('c.txt')], staged: [] })
     fireEvent.click(fileRow('a.ts'))
     fireEvent.click(fileRow('c.txt'), { shiftKey: true })
-    fireEvent.click(dirRow('src'))
+    toggleDir('src')
     fireEvent.click(screen.getByRole('button', { name: 'Stage Selected' }))
     await waitFor(() => expect(onStage).toHaveBeenCalledWith(['c.txt']))
   })
@@ -1035,16 +1063,19 @@ describe('LocalChangesView 的树形列表与状态角标', () => {
   it('收起了全部选中文件所在的目录：区头回到 Stage All', () => {
     mountTree({ unstaged: [ch('src/a.ts'), ch('c.txt')], staged: [] })
     fireEvent.click(fileRow('a.ts'))
-    fireEvent.click(dirRow('src'))
+    toggleDir('src')
     expect(screen.getByRole('button', { name: 'Stage All' })).toBeTruthy()
   })
 
-  it('Ctrl+A 只选看得见的文件，跳过收起的目录', async () => {
+  // 2026-11-08 起文件夹行可选中：收起的文件夹那一行看得见、会被 Ctrl+A 选中并高亮，
+  // 作用到它下面的全部文件（与 Fork 一致）；看不见的是它里面的行，那些不单独进选中
+  it('Ctrl+A 选中看得见的全部行：收起的目录那一行也在里面，暂存时带上它下面的文件', async () => {
     const { onStage } = mountTree({ unstaged: [ch('vendor/x.ts'), ch('a.txt'), ch('b.txt')], staged: [] })
-    fireEvent.click(dirRow('vendor'))
+    toggleDir('vendor')
     fireEvent.keyDown(listOf('a.txt'), { key: 'a', ctrlKey: true })
+    expect(dirRow('vendor').classList.contains('selected')).toBe(true)
     fireEvent.click(screen.getByRole('button', { name: 'Stage Selected' }))
-    await waitFor(() => expect(onStage).toHaveBeenCalledWith(['a.txt', 'b.txt']))
+    await waitFor(() => expect(onStage).toHaveBeenCalledWith(['vendor/x.ts', 'a.txt', 'b.txt']))
   })
 
   it('收起的目录整个离开列表、之后又出现：重新出现时是展开的', () => {
@@ -1061,7 +1092,7 @@ describe('LocalChangesView 的树形列表与状态角标', () => {
       />
     )
     const { rerender } = render(view([ch('src/a.ts'), ch('b.txt')]))
-    fireEvent.click(dirRow('src'))
+    toggleDir('src')
     rerender(view([ch('b.txt')]))
     rerender(view([ch('src/x.ts'), ch('b.txt')]))
     expect(screen.getByText('x.ts')).toBeTruthy()
@@ -1079,5 +1110,176 @@ describe('LocalChangesView 的树形列表与状态角标', () => {
     expect(dirNames(section('Unstaged'))).toEqual(['z', 'a'])
     // 右侧是冲突说明而不是 a/plain.ts 的 diff
     expect(document.querySelector('.conflict-pane')).not.toBeNull()
+  })
+
+  // 2026-11-08 方案 A：文件夹行本身可以选中，和 Fork 一致
+  describe('选中文件夹', () => {
+    function menu(): HTMLElement {
+      const el = document.querySelector('.context-menu')
+      if (!(el instanceof HTMLElement)) throw new Error('右键菜单没弹出来')
+      return el
+    }
+
+    it('单击目录行选中它（高亮），不收起', () => {
+      mountTree({ unstaged: [ch('src/a.ts'), ch('b.txt')], staged: [] })
+      fireEvent.click(dirRow('src'))
+      expect(dirRow('src').classList.contains('selected')).toBe(true)
+      expect(screen.getByText('a.ts')).toBeTruthy()
+    })
+
+    // 独立 review 第 1 条：收起时按文件过滤选中，文件夹行全被当成看不见清掉了
+    it('选中文件夹再收起它：仍然选中，区头还是 Stage Selected', () => {
+      mountTree({ unstaged: [ch('src/a.ts'), ch('lib/b.ts'), ch('c.txt')], staged: [] })
+      fireEvent.click(dirRow('src'))
+      toggleDir('src')
+      expect(dirRow('src').classList.contains('selected')).toBe(true)
+      expect(screen.getByRole('button', { name: 'Stage Selected' })).toBeTruthy()
+      toggleDir('lib')
+      expect(dirRow('src').classList.contains('selected')).toBe(true)
+    })
+
+    it('选中文件夹时，它下面的行标成「随文件夹一起」，看得出动作会覆盖哪些文件', () => {
+      mountTree({ unstaged: [ch('src/a.ts'), ch('src/lib/b.ts'), ch('c.txt')], staged: [] })
+      fireEvent.click(dirRow('src'))
+      expect(fileRow('a.ts').classList.contains('in-selected')).toBe(true)
+      expect(dirRow('lib').classList.contains('in-selected')).toBe(true)
+      expect(fileRow('b.ts').classList.contains('in-selected')).toBe(true)
+      expect(fileRow('c.txt').classList.contains('in-selected')).toBe(false)
+    })
+
+    it('点箭头只收起，不改选中', () => {
+      mountTree({ unstaged: [ch('src/a.ts'), ch('b.txt')], staged: [] })
+      fireEvent.click(fileRow('b.txt'))
+      toggleDir('src')
+      expect(fileRow('b.txt').classList.contains('selected')).toBe(true)
+      expect(dirRow('src').classList.contains('selected')).toBe(false)
+    })
+
+    it('选中目录后区头是 Stage Selected，暂存目录下的全部文件', async () => {
+      const { onStage } = mountTree({ unstaged: [ch('src/a.ts'), ch('src/b.ts'), ch('c.txt')], staged: [] })
+      fireEvent.click(dirRow('src'))
+      fireEvent.click(screen.getByRole('button', { name: 'Stage Selected' }))
+      await waitFor(() => expect(onStage).toHaveBeenCalledWith(['src/a.ts', 'src/b.ts']))
+    })
+
+    it('目录和目录外的文件一起选（Ctrl）：两部分都暂存，不重复', async () => {
+      const { onStage } = mountTree({ unstaged: [ch('src/a.ts'), ch('c.txt')], staged: [] })
+      fireEvent.click(fileRow('a.ts'))
+      fireEvent.click(dirRow('src'), { ctrlKey: true })
+      fireEvent.click(fileRow('c.txt'), { ctrlKey: true })
+      fireEvent.click(screen.getByRole('button', { name: 'Stage Selected' }))
+      await waitFor(() => expect(onStage).toHaveBeenCalledWith(['src/a.ts', 'c.txt']))
+    })
+
+    it('Shift 从文件选到目录：中间的目录行也算一行', () => {
+      mountTree({ unstaged: [ch('lib/y.ts'), ch('src/x.ts'), ch('a.txt')], staged: [] })
+      fireEvent.click(fileRow('y.ts'))
+      fireEvent.click(dirRow('src'), { shiftKey: true })
+      expect(fileRow('y.ts').classList.contains('selected')).toBe(true)
+      expect(dirRow('src').classList.contains('selected')).toBe(true)
+      expect(fileRow('x.ts').classList.contains('selected')).toBe(false)
+    })
+
+    it('右键目录：弹我们的菜单（挡掉 WebView 自带的），Stage (n) 暂存目录下全部文件', async () => {
+      const { onStage } = mountTree({ unstaged: [ch('src/a.ts'), ch('src/b.ts'), ch('c.txt')], staged: [] })
+      const notPrevented = fireEvent.contextMenu(dirRow('src'))
+      expect(notPrevented).toBe(false)
+      expect(dirRow('src').classList.contains('selected')).toBe(true)
+      fireEvent.click(within(menu()).getByText('Stage (2)'))
+      await waitFor(() => expect(onStage).toHaveBeenCalledWith(['src/a.ts', 'src/b.ts']))
+    })
+
+    it('右键目录的 Discard 交出目录下全部文件（确认框由 onDiscard 弹）', async () => {
+      const onDiscard = vi.fn()
+      render(
+        <LocalChangesView
+          status={{ unstaged: [ch('src/a.ts'), ch('src/b.ts'), ch('c.txt')], staged: [] }}
+          diff={{ files: [] }}
+          onStage={vi.fn()}
+          onUnstage={vi.fn()}
+          onDiscard={onDiscard}
+          onCommit={vi.fn()}
+          svnMode={false}
+          onBaselineBranch={false}
+        />,
+      )
+      fireEvent.contextMenu(dirRow('src'))
+      fireEvent.click(within(menu()).getByText('Discard changes (2)…'))
+      await waitFor(() => expect(onDiscard).toHaveBeenCalledWith(['src/a.ts', 'src/b.ts'], false))
+    })
+
+    it('右键目录的 Copy path 复制目录路径，不是下面每个文件', async () => {
+      const writeText = vi.fn(() => Promise.resolve())
+      Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
+      mountTree({ unstaged: [ch('src/a.ts'), ch('src/b.ts')], staged: [] })
+      fireEvent.contextMenu(dirRow('src'))
+      fireEvent.click(within(menu()).getByText('Copy path'))
+      await waitFor(() => expect(writeText).toHaveBeenCalledWith('src'))
+    })
+
+    it('右键已选中的多行之一（目录）：保持整片选中', async () => {
+      const { onStage } = mountTree({ unstaged: [ch('src/a.ts'), ch('c.txt')], staged: [] })
+      fireEvent.click(dirRow('src'))
+      fireEvent.click(fileRow('c.txt'), { ctrlKey: true })
+      fireEvent.contextMenu(dirRow('src'))
+      fireEvent.click(within(menu()).getByText('Stage (2)'))
+      await waitFor(() => expect(onStage).toHaveBeenCalledWith(['src/a.ts', 'c.txt']))
+    })
+
+    it('选中目录按 Delete：丢弃请求带目录下全部文件', () => {
+      const onDiscard = vi.fn()
+      render(
+        <LocalChangesView
+          status={{ unstaged: [ch('src/a.ts'), ch('src/b.ts'), ch('c.txt')], staged: [] }}
+          diff={{ files: [] }}
+          onStage={vi.fn()}
+          onUnstage={vi.fn()}
+          onDiscard={onDiscard}
+          onCommit={vi.fn()}
+          svnMode={false}
+          onBaselineBranch={false}
+        />,
+      )
+      fireEvent.click(dirRow('src'))
+      fireEvent.keyDown(listOf('c.txt'), { key: 'Delete' })
+      expect(onDiscard).toHaveBeenCalledWith(['src/a.ts', 'src/b.ts'], false)
+    })
+
+    it('最后点的是目录：右侧说明选中了哪个文件夹、几个文件，不说正在读取', () => {
+      render(
+        <LocalChangesView
+          status={{ unstaged: [ch('src/a.ts'), ch('src/b.ts')], staged: [] }}
+          diff={null}
+          onStage={vi.fn()}
+          onUnstage={vi.fn()}
+          onDiscard={vi.fn()}
+          onCommit={vi.fn()}
+          svnMode={false}
+          onBaselineBranch={false}
+        />,
+      )
+      fireEvent.click(dirRow('src'))
+      const note = document.querySelector('.diff-note')
+      expect(note?.textContent).toContain('src')
+      expect(note?.textContent).toContain('2 个文件')
+      expect(note?.textContent).not.toContain('正在读取')
+    })
+
+    // 多选时 active 是显示顺序里的最后一个（Ctrl 多选按显示顺序排，见 nextFileSelection）
+    it('目录行带 active 标记：多选时标出右侧对应的是它', () => {
+      mountTree({ unstaged: [ch('lib/y.ts'), ch('src/x.ts')], staged: [] })
+      fireEvent.click(fileRow('y.ts'))
+      fireEvent.click(dirRow('src'), { ctrlKey: true })
+      expect(dirRow('src').classList.contains('active')).toBe(true)
+      expect(fileRow('y.ts').classList.contains('active')).toBe(false)
+    })
+
+    it('按住从文件拖到目录行：选中这一段', () => {
+      mountTree({ unstaged: [ch('lib/y.ts'), ch('src/x.ts')], staged: [] })
+      fireEvent.mouseDown(fileRow('y.ts'), { button: 0 })
+      fireEvent.mouseEnter(dirRow('src'), { buttons: 1 })
+      expect(fileRow('y.ts').classList.contains('selected')).toBe(true)
+      expect(dirRow('src').classList.contains('selected')).toBe(true)
+    })
   })
 })

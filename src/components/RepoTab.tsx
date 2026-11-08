@@ -43,7 +43,7 @@ import { describeToolExit } from '@/engine/externalTools'
 import { currentDiff } from '@/engine/currentDiff'
 import { runBranchDeletion, type BranchDeletionStep } from '@/engine/deleteBranchTargets'
 import {
-  changesPaths,
+  changesRows,
   changesDiffScope,
   emptyFileSelection,
   reconcileSelection,
@@ -180,7 +180,8 @@ export function RepoTab({
   // 那份算了，这里只是存档：不存的话 a.txt 之后再被改动、两边都有时，选中会跳回 Unstaged。
   // 放在选中的持有者这里而不是 LocalChangesView：在提交图视图里它没挂载，状态照样会变
   useEffect(() => {
-    const paths = changesPaths(state.status)
+    // 按行对齐（文件夹行 `目录/` 也在里面）：只用文件列表的话，选中的文件夹会被当成不在了清掉
+    const paths = changesRows(state.status)
     // 没变时 reconcileSelection 返回同一个对象，setState 不会触发渲染
     setChangesSelection((s) => reconcileSelection(s, paths.unstaged, paths.staged))
   }, [state.status])
