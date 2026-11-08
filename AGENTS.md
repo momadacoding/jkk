@@ -1,4 +1,4 @@
-[MUST][HIGHEST PRIORITY] 本项目是一个 Git 客户端，开发和调试过程中禁止把任何真实仓库当试验场。所有涉及 git 写操作的验证（commit、branch、checkout、stage、discard、stash、worktree、remote 等）必须在**临时 fixture 仓库**中进行，参照 `src-tauri/tests/fixtures.rs` 的做法。禁止在本仓库、用户其他仓库或用户当前打开的仓库上执行 `reset --hard`、`clean -fd`、`checkout -- .`、`branch -D`、`push --force`、`worktree remove`、`rebase`、`stash drop/clear`、`gc --prune` 等破坏性命令，除非用户在当前对话中针对**该条具体命令和目标仓库**明确批准。笼统的「测试一下 / 验证一下 / 继续」不构成授权。破坏性命令失败或表现异常后必须立即停止，禁止现场修正、重试或追加命令；只能基于现有证据评估影响、如实披露，并重新取得明确授权。
+[MUST][HIGHEST PRIORITY] 本项目是一个 Git 客户端，开发和调试过程中禁止把任何真实仓库当试验场。所有涉及 git 写操作的验证（commit、branch、checkout、stage、discard、stash、worktree、remote 等）必须在**临时 fixture 仓库**中进行，参照 `src-tauri/tests/fixtures.rs` 的做法。禁止在本仓库、用户其他仓库或用户当前打开的仓库上执行 `reset --hard`、`clean -fd`、`checkout -- .`、`branch -D`、`push --force`、`worktree remove`、`rebase`、`stash drop/clear`、`gc --prune` 等破坏性命令，除非用户在当前对话中针对**该条具体命令和目标仓库**明确批准（唯一例外：§4.5 合并后清理本会话自己的 worktree 与分支，条件逐条满足才适用）。笼统的「测试一下 / 验证一下 / 继续」不构成授权。破坏性命令失败或表现异常后必须立即停止，禁止现场修正、重试或追加命令；只能基于现有证据评估影响、如实披露，并重新取得明确授权。
 
 # AI Agent 规范
 
@@ -214,6 +214,23 @@ Commit message 格式：
 `scope` 使用模块名，例如 `graph`、`branch`、`worktree`、`diff`、`stash`、`toolbar`、`engine`。
 
 禁止使用 `update`、`fix things`、`harden flow` 等无法判断行为的描述。
+
+### 4.5 合并后清理
+
+本仓库用 squash 合并，分支提交永远不进 `master` 历史，`git branch --merged` 认不出已合并的分支；合并后没人清理，残留分支只能事后逐个查 PR、比内容，还会和并发会话的清理撞车。所以清理放在合并的那一刻做。
+
+- 远端：仓库已开启 GitHub 的 `deleteBranchOnMerge`（2026-11-08 起），PR 合并后 head 分支自动删除；叠加 PR 的 base 分支被删后，GitHub 会把上层 PR 自动改指向 `master`。不需要再手动 `push --delete` 刚合并的分支。
+- MUST：**谁合并谁清理**。会话在当前对话中合并了自己的 PR 后，下列条件**全部**满足时，可直接清理本会话用 `EnterWorktree` 建的那个 worktree 和本地分支，不需要再单独授权：
+  1. 用本会话刚合并的 **PR 编号**（不是分支名：同名分支可能开过更早的 PR）执行 `gh pr view <编号>`，确认 `state` 为 `MERGED`、`baseRefName` 为 `master`
+  2. 清理前一刻用 `git rev-parse <分支>` 取本地 tip，等于该 PR 的 `headRefOid`（合并之后没有新提交）
+  3. 该 worktree 的 `git status --porcelain --ignored=matching` 里，除了能重新生成的依赖与构建产物（`.gitignore` 里的 `node_modules/`、`dist/`、`src-tauri/target/` 等）和 `.claude/settings.local.json`，没有别的条目——untracked 和被忽略的文件都会被 remove 一起删掉
+- MUST：§4.3 的前置照做：执行前先跑 `git worktree list` 记录状态。只清理自己这一个 worktree 不属于 §4.3 禁止的仓库级清理，有并发会话时也可以做；但 `prune`、批量删分支仍然禁止。
+- MUST：清理用 `ExitWorktree` 的 `remove`。squash 合并后分支提交不在 `master` 上，它会拒绝并列出这些提交；**核对列出的正是该 PR 的提交**之后，才可以带 `discard_changes: true` 重新调用。没有 `ExitWorktree` 的 agent：先回到主工作区，再 `git worktree remove <路径>`、`git branch -D <分支>`；`-D` 不会再核对提交，条件 2 必须在紧挨着它之前刚做过。
+- MUST：上述条件任何一条不满足，或任何一条清理命令失败（例如 Windows 上 `git worktree remove` 在 `node_modules` 上报 `Directory not empty`、留下半删的目录），立即回到文件开头的总规则：停下、如实报告、等授权，不重试、不手动补删。
+- MUST：例外只覆盖**本会话自己建的**那一个 worktree 和分支，不顺手清理别的。
+- SHOULD：用户在 GitHub 页面上合并、或合并的会话没来得及清理时，用 `pwsh -NoProfile -File scripts/stale-branches.ps1` 盘点。它只读，只打印建议的清理命令；执行这些命令仍需用户授权，有并发会话时逐条执行、不要批量。
+- MUST：worktree 只用于建它的那个分支。验证、模拟合并这类实验放到 scratch 目录的临时 fixture 里做，不要在已有 worktree 里 `checkout` 别的分支——目录名和分支对不上之后，没人能判断里面的东西还要不要。
+- SHOULD：尽量不用叠加 PR。必须用时先合下层、再合上层；先把上层合进下层分支，上层的内容就只能跟着下层的 squash 间接进 `master`，事后很难核对。
 
 ## 5. 验证规则
 
