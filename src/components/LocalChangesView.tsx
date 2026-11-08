@@ -2,7 +2,13 @@ import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { Panel, Group, Separator } from 'react-resizable-panels'
 import { PANEL_GROUP_IDS } from '@/engine/layoutMemory'
 import { usePanelLayout } from '@/store/layoutStore'
-import type { ConflictInfo, DiffData, FileChange, StatusData } from '../engine/types'
+import type { ConflictInfo, DiffData, FileChange, FileStatus, StatusData } from '../engine/types'
+import {
+  historyTargetForWorkdir,
+  workdirHistoryAvailable,
+  type FileHistoryTarget,
+} from '@/engine/fileHistory'
+import { fileHistoryItems } from './fileHistoryItems'
 import { DiffView } from './DiffView'
 import { ContextMenu, useContextMenu, type MenuItem } from './ContextMenu'
 import {
@@ -265,9 +271,11 @@ interface LocalChangesViewProps {
    */
   selection?: FileSelection
   onSelectionChange?: (selection: FileSelection) => void
+  /** 文件右键菜单里的「File History」「Blame」；不传时没有这两项。 */
+  onOpenFileHistory?: (target: FileHistoryTarget) => void
 }
 
-export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, onCommit, svnMode, onBaselineBranch, externalTools, conflicts, onResolveDeleteModify, selection: selectionProp, onSelectionChange }: LocalChangesViewProps) {
+export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, onCommit, svnMode, onBaselineBranch, externalTools, conflicts, onResolveDeleteModify, selection: selectionProp, onSelectionChange, onOpenFileHistory }: LocalChangesViewProps) {
   const [ownSelection, setOwnSelection] = useState<FileSelection>(emptyFileSelection)
   const setSelection = onSelectionChange ?? setOwnSelection
   // 文件列表 | diff、Unstaged / Staged 两处分割都记住，所有仓库标签共用
@@ -381,6 +389,22 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
     }))
   }
 
+  const historyItems = (path: string, fileStatus: FileStatus | null) =>
+    fileHistoryItems(
+      onOpenFileHistory,
+      (tab) => historyTargetForWorkdir(path, fileStatus, tab),
+      workdirHistoryAvailable(fileStatus) ? null : '新文件还没有历史',
+    )
+
+  /**
+   * 判「能不能看历史」用的状态：暂存了新增、又在工作区改过的文件，在 Unstaged 里是 `modified`，
+   * 但 HEAD 里照样没有它（独立 review 第 4 条）。哪个区里是新增都按新增算。
+   */
+  const historyStatus = (path: string, section: FileSection): FileStatus | null => {
+    const isNew = [...status.unstaged, ...status.staged].some((f) => f.path === path && f.status === 'added')
+    return isNew ? 'added' : status[section].find((f) => f.path === path)?.status ?? null
+  }
+
   const contextMenu = (section: FileSection, files: string[], path: string, e: React.MouseEvent) => {
     // 右键点在已选中的项上不该把整片选中缩成一个——那是最容易误删的交互
     const next = nextFileSelection(selection, section, files, path, {
@@ -409,6 +433,8 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
         label: copied.length > 1 ? `Copy paths (${copied.length})` : 'Copy path',
         onSelect: () => { void navigator.clipboard.writeText(copied.join('\n')) },
       },
+      // 历史 / Blame 同样只看右键点中的那一个文件；文件夹不给
+      ...(isDirRowKey(path) ? [] : historyItems(path, historyStatus(path, section))),
       // 外部工具一次只开右键点中的那一个文件，不跟随多选；冲突文件只做 merge，不给对比。
       // 文件夹没有可对比的单个文件，不给
       ...(isDirRowKey(path)

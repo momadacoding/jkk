@@ -527,7 +527,7 @@ fn diff_to_data(diff: git2::Diff) -> Result<DiffData> {
 /// 未跟踪的同名目录时，点名 `assets` 会带出目录下每一个文件。`diff.print` 会把它们的内容全读一遍，
 /// 「只读一个文件」反而比整区读还慢（第二轮独立 review 第 6 条）。所以列表只建精确匹配的那一项，
 /// 补丁也只对它生成（`Patch::from_diff`），其余 delta 不碰内容。
-fn diff_to_data_only(diff: git2::Diff, exact: Option<&str>) -> Result<DiffData> {
+pub(crate) fn diff_to_data_only(diff: git2::Diff, exact: Option<&str>) -> Result<DiffData> {
     let mut files: Vec<FileDiff> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     let wanted = |path: &str| exact.map_or(true, |e| e == path);

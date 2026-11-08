@@ -38,6 +38,7 @@ import { createSingleFlight } from '@/engine/singleFlight'
 import { createSvnCheckQueue } from '@/engine/svnCheckQueue'
 import { applyStatusPatch, type StatusPatch } from '@/engine/statusPatch'
 import { changesDiffScope, isChangesFileScope, type FileSelection } from '@/engine/fileSelection'
+import type { BlameData, FileHistory } from '@/engine/fileHistory'
 import type { DriverReport } from '@/engine/mergeDrivers'
 import type {
   Health,
@@ -488,6 +489,26 @@ export function svnFetchLog(path: string, older: boolean, limit: number): Promis
 /** 服务器侧清单核对（§6.3.1 / NB-2）。**走网络**，可能不便宜。 */
 export function svnServerAudit(path: string): Promise<ServerAudit> {
   return invoke<ServerAudit>('svn_server_audit', { path })
+}
+
+/** 这个文件改动过的提交（`git log --follow`，跨重命名），从新到旧。`revs` 是起点，取并集。 */
+export function readFileHistory(path: string, file: string, revs: string[]): Promise<FileHistory> {
+  return invoke<FileHistory>('file_history', { path, file, revs })
+}
+
+/** 逐行 Blame。`rev` 为 null 时 blame 工作区里的文件，没提交的行归到全 0 的 sha。 */
+export function readBlame(path: string, file: string, rev: string | null): Promise<BlameData> {
+  return invoke<BlameData>('blame_file', { path, file, rev })
+}
+
+/** 一个文件在某次提交里的 diff（对第一个父提交）。改名那一条要带上 `oldFile` 才配得成对。 */
+export function readCommitFileDiff(
+  path: string,
+  rev: string,
+  file: string,
+  oldFile: string | null,
+): Promise<DiffData> {
+  return invoke<DiffData>('commit_file_diff', { path, rev, file, oldFile })
 }
 
 /**

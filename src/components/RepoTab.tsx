@@ -10,6 +10,8 @@ import { TagView } from './TagView'
 import { WorktreeView } from './WorktreeView'
 import { CommitDetailView } from './CommitDetailView'
 import { LocalChangesView } from './LocalChangesView'
+import { FileHistoryView } from './FileHistoryView'
+import { graphSelectionFor, type FileHistoryTarget } from '@/engine/fileHistory'
 import { Toolbar } from './Toolbar'
 import { StashView } from './StashView'
 import {
@@ -74,7 +76,8 @@ import {
   type CommitAction,
 } from '../engine/commitActions'
 
-type ViewMode = 'commits' | 'changes'
+/** `history` = 某个文件的历史与 Blame（决策 D3），从文件右键菜单进，侧边栏两项都不高亮。 */
+type ViewMode = 'commits' | 'changes' | 'history'
 
 /** 确认框上按钮的文字，照抄菜单项的动词，点下去做什么一目了然。 */
 const CONFIRM_LABELS: Partial<Record<CommitAction, string>> = {
@@ -161,6 +164,15 @@ export function RepoTab({
   // ——`create_tag` 与整个 commands/worktree.rs 都还没进接缝，仍直接跑 git CLI。
   const sections = visibleSections(state.capabilities)
   const [viewMode, setViewMode] = useState<ViewMode>('commits')
+  // 文件历史视图看哪个文件；`seq` 每次打开递增，当 key 用：再从别处打开同一个文件也要从头读、回到打开时的选中
+  const [fileHistory, setFileHistory] = useState<{ target: FileHistoryTarget; seq: number } | null>(null)
+  // 从哪个视图进的文件历史，「← 返回」回到那里
+  const [historyReturn, setHistoryReturn] = useState<'commits' | 'changes'>('commits')
+  const openFileHistory = useCallback((target: FileHistoryTarget) => {
+    setFileHistory((cur) => ({ target, seq: (cur?.seq ?? 0) + 1 }))
+    if (viewMode !== 'history') setHistoryReturn(viewMode)
+    setViewMode('history')
+  }, [viewMode])
   // 面板分割比例记在所有仓库标签共用的存档里：拖宽侧边栏是对「这个应用」的偏好，不是对某个仓库的
   const mainLayout = usePanelLayout(PANEL_GROUP_IDS.repoMain)
   const commitsLayout = usePanelLayout(PANEL_GROUP_IDS.repoCommits)
@@ -247,7 +259,8 @@ export function RepoTab({
   useRepoEffects(
     state,
     { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, checkSvnSyncOnFocus, markSvnFollowOnBlur, refreshSvnSyncState, refreshSvnBranchesBehind, auditSvnIfDue, wantedDiffScope, reportError },
-    viewMode,
+    // 文件历史视图自己读数据；这里按要回去的那个视图读，返回时不用再等一次
+    viewMode === 'history' ? historyReturn : viewMode,
     changesScope,
     active,
   )
@@ -664,6 +677,23 @@ export function RepoTab({
     revealCommit(headHash)
   }, [revealCommit, state.commits, reportError])
 
+  /**
+   * 文件历史 / Blame 里的「在提交图中定位」。
+   *
+   * 混合仓库里基线提交被接合成了 `svn:N` 节点，按它找；交付过的本地提交收在 svn 节点里，
+   * 选中它即可（详情显示它自己，图定位到收着它的节点，同 svn 节点详情里点开它）。
+   * 都不在（超过 5000 条上限、只在别的起点上）时同 `handleSelectWorktree`：明说原因，不留悬空的选中。
+   */
+  const revealFromHistory = useCallback((id: string) => {
+    const graphId = graphSelectionFor(id, state.commits, state.capabilities.vcs === 'svn' ? state.gitCommits : null)
+    if (!graphId) {
+      reportError(`提交 ${id.slice(0, 7)} 不在当前提交图中`)
+      return
+    }
+    setViewMode('commits')
+    revealCommit(graphId)
+  }, [state.capabilities.vcs, state.gitCommits, state.commits, revealCommit, reportError])
+
   // stash 提交不被任何分支引用，所以不在 load_graph 的输出里。选中一条 stash 时
   // 从它自己的元数据现搭一个 CommitNode，否则详情面板只会显示 "Select a commit"——
   // diff 明明已经取回来了，却因为查不到提交而整片空白。
@@ -717,7 +747,8 @@ export function RepoTab({
   useExternalToolExit(state.path, (exit) => {
     const path = state.path
     if (!path) return
-    if (viewMode === 'changes') {
+    // 文件历史视图下按要回去的那个视图刷新，同 `useRepoEffects`
+    if ((viewMode === 'history' ? historyReturn : viewMode) === 'changes') {
       void refreshChanges(path).catch(reportError)
     } else {
       void refreshStatus(path).catch(reportError)
@@ -1144,7 +1175,16 @@ export function RepoTab({
           </Panel>
           <Separator style={{ width: 4, background: '#333' }} />
           <Panel id="main" minSize="30%">
-            {viewMode === 'commits' ? (
+            {viewMode === 'history' && fileHistory && state.path ? (
+              <FileHistoryView
+                key={fileHistory.seq}
+                repoPath={state.path}
+                target={fileHistory.target}
+                headHash={state.headHash}
+                onClose={() => setViewMode(historyReturn)}
+                onRevealCommit={revealFromHistory}
+              />
+            ) : viewMode !== 'changes' ? (
               <Group orientation="vertical" {...commitsLayout}>
                 <Panel id="graph" minSize="30%">
                   <GraphView
@@ -1178,6 +1218,7 @@ export function RepoTab({
                     branch={detailBranch}
                     diffScope={commitScope}
                     externalTools={externalToolsMenu}
+                    onOpenFileHistory={openFileHistory}
                   />
                 </Panel>
               </Group>
@@ -1196,6 +1237,7 @@ export function RepoTab({
                 externalTools={externalToolsMenu}
                 conflicts={state.conflicts}
                 onResolveDeleteModify={(file, keep) => runAndRefresh('resolve_delete_modify', { file, keep }, () => refreshChanges(state.path!))}
+                onOpenFileHistory={openFileHistory}
               />
             )}
           </Panel>
