@@ -96,7 +96,8 @@ function FileSectionList({
     }
     next.add(dir)
     setCollapsed(next)
-    onCollapse(section, treeFilePaths(tree, (d) => !next.has(d)))
+    // 按行过滤：收起的文件夹自己那一行还看得见，选着它的话要留着（独立 review 第 1 条）
+    onCollapse(section, treeRowKeys(tree, (d) => !next.has(d)))
   }
   const allPaths = useMemo(() => treeFilePaths(tree), [tree])
   // 看得见的行（文件夹 + 文件）：选中、Shift / 拖动选一段、Ctrl+A 都按它算
@@ -106,7 +107,11 @@ function FileSectionList({
   // Ctrl+A 之后上万行每行都要查一次，用 Set
   const selectedSet = useMemo(() => new Set(selectedHere), [selectedHere])
 
-  const rows = (nodes: TreeNode[], depth: number): React.ReactNode[] => nodes.map((node) => {
+  /**
+   * @param underSelected 某个上层文件夹被选中了：这一行会随它一起被动作覆盖，标出来（`in-selected`），
+   *   否则选中一个展开的文件夹时，看不出 Stage / Discard 会动到下面哪些文件
+   */
+  const rows = (nodes: TreeNode[], depth: number, underSelected: boolean): React.ReactNode[] => nodes.map((node) => {
     // 每层缩进 14px，与提交详情的文件树一致；文件行留出折叠箭头的位置，名字才对得齐
     const indent = { paddingLeft: 6 + depth * 14 }
     if (node.kind === 'dir') {
@@ -117,7 +122,7 @@ function FileSectionList({
           <div
             className={[
               'changes-dir',
-              selectedSet.has(key) ? 'selected' : '',
+              selectedSet.has(key) ? 'selected' : underSelected ? 'in-selected' : '',
               key === activePath && selection.section === section ? 'active' : '',
             ].filter(Boolean).join(' ')}
             style={indent}
@@ -125,8 +130,9 @@ function FileSectionList({
             onClick={(e) => onRowClick(section, visible, key, e)}
             onDoubleClick={(e) => {
               if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return
-              // 含收起的子文件夹里的：双击的是这个文件夹，不是它眼下展开着的那部分
-              onActivate(treeFilePaths(node.children))
+              // 含收起的子文件夹里的：双击的是这个文件夹，不是它眼下展开着的那部分。
+              // 和区头按钮、右键、Delete 用同一个展开，免得两处规则分叉
+              onActivate(expandRowKeys([key], tree))
             }}
             onContextMenu={(e) => onRowContextMenu(section, visible, key, e)}
             onMouseDown={(e) => onRowMouseDown(section, key, e)}
@@ -145,7 +151,7 @@ function FileSectionList({
             <FolderIcon />
             <span className="changes-dir-name">{node.name}</span>
           </div>
-          {open && rows(node.children, depth + 1)}
+          {open && rows(node.children, depth + 1, underSelected || selectedSet.has(key))}
         </Fragment>
       )
     }
@@ -156,7 +162,7 @@ function FileSectionList({
         key={`file:${node.path}`}
         className={[
           'changes-file',
-          selectedSet.has(node.path) ? 'selected' : '',
+          selectedSet.has(node.path) ? 'selected' : underSelected ? 'in-selected' : '',
           node.path === activePath && selection.section === section ? 'active' : '',
           node.status === 'conflicted' ? 'conflicted' : '',
         ].filter(Boolean).join(' ')}
@@ -212,7 +218,7 @@ function FileSectionList({
       {/* 可聚焦，点一下行焦点就落在这里：快捷键只在文件列表有焦点时生效，
           挂在 window 上的话 commit 输入框里按 Delete 删字也会被当成丢弃 */}
       <div className="changes-section-files" tabIndex={0} onKeyDown={(e) => onKeyDown(section, visible, e)}>
-        {rows(tree, 0)}
+        {rows(tree, 0, false)}
         {files.length === 0 && <div className="changes-empty">No files</div>}
       </div>
     </div>
@@ -305,9 +311,14 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
   // 这时不能说正在读取，按空 diff 显示
   // 只读选中的那一个文件之后，换选中也要等一次读取（通常几十毫秒）：提示延迟出现，读得快就不闪
   // 最后点的是文件夹：父组件不读 diff（`changesDiffScope` 为 null），这里说明选中了什么
-  const activeDirFiles = active && isDirRowKey(active.path)
-    ? expandRowKeys([active.path], changesTree(status[active.section])).length
-    : null
+  // 要走一遍整棵树：记住，拖选、在提交说明里打字都会重渲染
+  const activeSection = active?.section ?? null
+  const activeDirFiles = useMemo(
+    () => activeSection && activeFile && isDirRowKey(activeFile)
+      ? expandRowKeys([activeFile], changesTree(status[activeSection])).length
+      : null,
+    [activeSection, activeFile, status],
+  )
   const diffPane = active && activeDirFiles !== null
     ? <div className="diff-note">
         已选中文件夹 {rowPath(active.path)}，{activeDirFiles} 个文件。
@@ -479,7 +490,9 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
       setSelection(selectAllFiles(selection, section, visible))
       return
     }
-    // 选中的文件夹先展开成文件：快捷键和右键 Discard 丢的是同一批
+    // 选中的文件夹先展开成文件：快捷键和右键 Discard 丢的是同一批。
+    // 展开要走一遍整棵树，只在按的是 Delete 时才做，方向键、打字不付这个代价
+    if (key.key !== 'Delete') return
     const req = discardShortcut(key, section, { ...selection, paths: selectedFiles(selection, status) }, paths)
     if (!req) return
     e.preventDefault()

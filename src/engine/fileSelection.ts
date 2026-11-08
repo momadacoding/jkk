@@ -155,7 +155,26 @@ export function rangeSelection(
   const to = files.indexOf(path)
   if (from < 0 || to < 0) return { section, paths: [path], anchor: path }
   const [lo, hi] = from <= to ? [from, to] : [to, from]
-  return { section, paths: files.slice(lo, hi + 1), anchor }
+  // 中间扫过的展开文件夹头不算：它一进选中，动作就覆盖整个文件夹，连范围之外、没扫到的文件也算上
+  // （独立 review 第 2 条）。两个端点是用户点的，照算
+  const paths: string[] = []
+  for (let i = lo; i <= hi; i++) {
+    if (i !== from && i !== to && isExpandedDirAt(files, i)) continue
+    paths.push(files[i])
+  }
+  return { section, paths, anchor }
+}
+
+/**
+ * `rows[i]` 是不是一个展开着的文件夹头：它下一行就是它的内容。收起的文件夹下一行不在它里面
+ * （行列表跳过了收起文件夹的内容），文件夹不会是空的（只有含改动文件的目录才成行）。
+ */
+function isExpandedDirAt(rows: string[], i: number): boolean {
+  const key = rows[i]
+  if (!isDirRowKey(key)) return false
+  const next = rows[i + 1]
+  // 文件行是状态里的原样路径，可能带反斜杠；文件夹行一律是正斜杠
+  return next !== undefined && next.replace(/\\/g, '/').startsWith(key)
 }
 
 /**
@@ -172,10 +191,12 @@ export function selectAllFiles(
   files: string[],
 ): FileSelection {
   if (files.length === 0) return current
-  const anchor = current.section === section && current.anchor !== null && files.includes(current.anchor)
+  // 展开着的文件夹头不选，理由同 rangeSelection：它的内容已经一行行在里面了；收起的文件夹那一行要选
+  const paths = files.filter((_, i) => !isExpandedDirAt(files, i))
+  const anchor = current.section === section && current.anchor !== null && paths.includes(current.anchor)
     ? current.anchor
-    : files[0]
-  return { section, paths: [...files], anchor }
+    : paths[0]
+  return { section, paths, anchor }
 }
 
 /** 右侧 diff 正在显示的那一项：哪个文件、在哪个区。 */
@@ -213,7 +234,9 @@ export function reconcileSelection(
   if (kept.length > 0) return { section: selection.section, paths: kept, anchor: keepAnchor(kept) }
   const other: FileSection = selection.section === 'unstaged' ? 'staged' : 'unstaged'
   const wanted = new Set(selection.paths)
-  const moved = list(other).filter((p) => wanted.has(p))
+  // 只有文件跟过去，文件夹行不跟：另一个区的同名文件夹装的可能比这边多，跟过去之后再按 Delete /
+  // Unstage 就会动到用户没选过的文件（独立 review 第 3 条）
+  const moved = list(other).filter((p) => wanted.has(p) && !isDirRowKey(p))
   if (moved.length > 0) return { section: other, paths: moved, anchor: keepAnchor(moved) }
   return emptyFileSelection
 }
@@ -270,9 +293,24 @@ export function changesPaths(status: StatusData): { unstaged: string[], staged: 
  */
 export function changesRows(status: StatusData): { unstaged: string[], staged: string[] } {
   return {
-    unstaged: treeRowKeys(changesTree(status.unstaged)),
-    staged: treeRowKeys(changesTree(status.staged)),
+    unstaged: allRowKeys(changesTree(status.unstaged)),
+    staged: allRowKeys(changesTree(status.staged)),
   }
+}
+
+/**
+ * 按树缓存的全部行。一次状态刷新里 RepoTab 对齐选中、算 diff scope，LocalChangesView 对齐选中，
+ * store 写操作后的刷新都要它；树本身已按列表缓存（`changesTree`），同一棵树的行不会变。
+ * 返回的数组是共享的，调用方不要改它。
+ */
+const rowsCache = new WeakMap<TreeNode[], string[]>()
+
+function allRowKeys(tree: TreeNode[]): string[] {
+  const cached = rowsCache.get(tree)
+  if (cached) return cached
+  const rows = treeRowKeys(tree)
+  rowsCache.set(tree, rows)
+  return rows
 }
 
 /**

@@ -1813,6 +1813,12 @@ body {
   background: var(--selected-bg);
 }
 
+/* 上层文件夹被选中：这些行会随它一起被 Stage / Discard，用淡一档的底色标出来 */
+.changes-file.in-selected,
+.changes-dir.in-selected {
+  background: rgba(58, 110, 165, 0.22);
+}
+
 .changes-dir.active::before {
   content: '';
   position: absolute;

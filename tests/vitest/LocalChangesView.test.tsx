@@ -1127,6 +1127,26 @@ describe('LocalChangesView 的树形列表与状态角标', () => {
       expect(screen.getByText('a.ts')).toBeTruthy()
     })
 
+    // 独立 review 第 1 条：收起时按文件过滤选中，文件夹行全被当成看不见清掉了
+    it('选中文件夹再收起它：仍然选中，区头还是 Stage Selected', () => {
+      mountTree({ unstaged: [ch('src/a.ts'), ch('lib/b.ts'), ch('c.txt')], staged: [] })
+      fireEvent.click(dirRow('src'))
+      toggleDir('src')
+      expect(dirRow('src').classList.contains('selected')).toBe(true)
+      expect(screen.getByRole('button', { name: 'Stage Selected' })).toBeTruthy()
+      toggleDir('lib')
+      expect(dirRow('src').classList.contains('selected')).toBe(true)
+    })
+
+    it('选中文件夹时，它下面的行标成「随文件夹一起」，看得出动作会覆盖哪些文件', () => {
+      mountTree({ unstaged: [ch('src/a.ts'), ch('src/lib/b.ts'), ch('c.txt')], staged: [] })
+      fireEvent.click(dirRow('src'))
+      expect(fileRow('a.ts').classList.contains('in-selected')).toBe(true)
+      expect(dirRow('lib').classList.contains('in-selected')).toBe(true)
+      expect(fileRow('b.ts').classList.contains('in-selected')).toBe(true)
+      expect(fileRow('c.txt').classList.contains('in-selected')).toBe(false)
+    })
+
     it('点箭头只收起，不改选中', () => {
       mountTree({ unstaged: [ch('src/a.ts'), ch('b.txt')], staged: [] })
       fireEvent.click(fileRow('b.txt'))

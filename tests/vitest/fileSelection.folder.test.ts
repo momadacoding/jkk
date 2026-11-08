@@ -6,6 +6,7 @@ import {
   changesTree,
   dirRowKey,
   isDirRowKey,
+  rangeSelection,
   reconcileSelection,
   rowPath,
   selectAllFiles,
@@ -90,10 +91,52 @@ describe('selectedFiles（动作落地前把选中展开成文件）', () => {
   })
 })
 
+// 独立 review 第 2 条：范围跨过展开着的文件夹头，那一行一进选中，动作就覆盖整个文件夹——
+// 包括范围之外、没扫到的文件。展开着的文件夹，它的内容本身就是一行行看得见的，范围选到哪些就是哪些
+describe('Shift / 拖动 / Ctrl+A 跨过展开着的文件夹', () => {
+  // lib/、lib/y.ts、src/、src/x.ts、src/z.ts、a.txt
+  const rows = treeRowKeys(changesTree([ch('lib/y.ts'), ch('src/x.ts'), ch('src/z.ts'), ch('a.txt')]))
+
+  it('范围中间的展开文件夹头不进选中', () => {
+    expect(rangeSelection('unstaged', rows, 'src/x.ts', 'lib/y.ts').paths).toEqual(['lib/y.ts', 'src/x.ts'])
+  })
+
+  it('收起的文件夹头在范围中间：进选中（那一行代表它的全部内容，看得见、会高亮）', () => {
+    const collapsed = treeRowKeys(changesTree([ch('lib/y.ts'), ch('src/x.ts'), ch('a.txt')]), (d) => d !== 'src')
+    expect(rangeSelection('unstaged', collapsed, 'lib/y.ts', 'a.txt').paths).toEqual(['lib/y.ts', 'src/', 'a.txt'])
+  })
+
+  it('端点是用户点的：Shift 点在展开的文件夹头上，它进选中', () => {
+    expect(rangeSelection('unstaged', rows, 'a.txt', 'src/').paths).toEqual(['src/', 'src/x.ts', 'src/z.ts', 'a.txt'])
+  })
+
+  it('Ctrl+A 不选展开着的文件夹头，选它看得见的内容', () => {
+    expect(selectAllFiles({ section: null, paths: [], anchor: null }, 'unstaged', rows).paths)
+      .toEqual(['lib/y.ts', 'src/x.ts', 'src/z.ts', 'a.txt'])
+  })
+
+  it('子文件路径带反斜杠也认得出文件夹是展开的', () => {
+    const bs = treeRowKeys(changesTree([ch('src\\x.ts'), ch('a.txt'), ch('lib\\y.ts')]))
+    expect(rangeSelection('unstaged', bs, 'lib\\y.ts', 'a.txt').paths).toEqual(['lib\\y.ts', 'src\\x.ts', 'a.txt'])
+  })
+})
+
 describe('选中文件夹之后的对齐 / 默认项 / diff', () => {
-  it('整个文件夹刚被暂存：选中跟到 Staged 的同一个文件夹（马上反悔还能整个 Unstage）', () => {
-    const rows = changesRows(status(['b.txt'], ['src/a.ts', 'src/b.ts']))
-    expect(reconcileSelection(sel('unstaged', 'src/'), rows.unstaged, rows.staged)).toEqual(sel('staged', 'src/'))
+  // 独立 review 第 3 条：另一个区的同名文件夹可能装着更多文件，跟过去就会动到用户没选的
+  it('文件夹整个暂存走、Staged 里本来就有同名文件夹：选中不跟过去', () => {
+    const rows = changesRows(status(['b.txt'], ['src/a.ts', 'src/b.ts', 'src/c.ts']))
+    expect(reconcileSelection(sel('unstaged', 'src/'), rows.unstaged, rows.staged))
+      .toEqual({ section: null, paths: [], anchor: null })
+  })
+
+  it('文件夹和文件一起整批暂存：只有文件跟过去', () => {
+    const rows = changesRows(status(['b.txt'], ['src/a.ts', 'c.txt']))
+    expect(reconcileSelection(sel('unstaged', 'src/', 'c.txt'), rows.unstaged, rows.staged)).toEqual(sel('staged', 'c.txt'))
+  })
+
+  it('changesRows 同一份状态只走一遍树：两次调用拿到同一个数组', () => {
+    const st = status(['src/a.ts'])
+    expect(changesRows(st).unstaged).toBe(changesRows(st).unstaged)
   })
 
   it('文件夹里还有文件没暂存走：选中留在 Unstaged 的这个文件夹', () => {
@@ -119,10 +162,10 @@ describe('选中文件夹之后的对齐 / 默认项 / diff', () => {
     expect(changesDiffScope(sel('unstaged', 'src/a.ts'), status(['src/a.ts']))).toBe('unstaged:src/a.ts')
   })
 
-  it('Ctrl+A 按看得见的行选，文件夹行也在里面', () => {
+  it('Ctrl+A 按看得见的行选，收起的文件夹行在里面', () => {
     const tree = changesTree([ch('src/a.ts'), ch('b.txt')])
-    const rows = treeRowKeys(tree)
+    const rows = treeRowKeys(tree, () => false)
     expect(selectAllFiles({ section: null, paths: [], anchor: null }, 'unstaged', rows).paths)
-      .toEqual(['src/', 'src/a.ts', 'b.txt'])
+      .toEqual(['src/', 'b.txt'])
   })
 })
