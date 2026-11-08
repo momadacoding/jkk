@@ -1,0 +1,4 @@
+# Tauri CLI 在 `tauri dev` / `tauri build` 时会重写 Cargo.toml，写出来固定是 LF。
+# core.autocrlf=true 的机器检出成 CRLF，重写后每个 worktree 都会出现「内容不变、只改换行」的假修改。
+# 工作区固定 LF，和 Tauri 写出的字节一致。
+src-tauri/Cargo.toml text eol=lf
