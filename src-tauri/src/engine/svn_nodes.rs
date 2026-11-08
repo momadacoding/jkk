@@ -21,7 +21,7 @@
 //! 总是安全的：c(f) > F 的文件自动单列，标签仍然成立，只是映射多几条。
 
 use crate::engine::svn_basemap::{BaseMap, MAX_MAP_ENTRIES};
-use crate::engine::svn_cli::run_svn;
+use crate::engine::svn_cli::run_svn_targets;
 use crate::engine::svn_sync::status_targets;
 use crate::engine::svn_wc::{peg_safe, WcIdentity};
 use crate::error::{GitError, Result};
@@ -29,11 +29,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub use crate::engine::svn_xml::{parse_node_status, NodeStatus};
 
-/// 逐个 target 跑 `svn status -v --xml --ignore-externals`，合并成一份按路径升序的节点表。
+/// 对全部 target 跑 `svn status -v --xml --ignore-externals`，合并成一份按路径升序的节点表。
 ///
 /// target 与失同步判定相同（[`status_targets`]）：白名单条目 + 每个 wc(P) 的根。
-/// 每个 wc 单独跑是因为 external 是独立的工作副本，`--ignore-externals` 只挡住更深一层，
-/// 那一层由 `enumerate_wcs` 枚举出来各查一次（Review Focus 1）。
+/// 每个 wc 都要单独作为一个 target，因为 external 是独立的工作副本，`--ignore-externals`
+/// 只挡住更深一层，那一层由 `enumerate_wcs` 枚举出来各查一次（Review Focus 1）。全部 target
+/// 在同一条命令里传（计划 2026-11-09 Task 3），每个 target 一个 `<target>` 块。
 ///
 /// # 去重
 ///
@@ -47,13 +48,18 @@ pub fn read_node_status(
     wcs: &[WcIdentity],
 ) -> Result<Vec<NodeStatus>> {
     let mut merged: BTreeMap<String, NodeStatus> = BTreeMap::new();
-    for t in status_targets(whitelist, wcs)? {
-        // target 必须过 peg_safe：svn 把最后一个 `@` 之后的部分当 peg revision
-        let arg = peg_safe(&t);
-        let xml = run_svn(
-            repo,
-            &["status", "-v", "--xml", "--ignore-externals", "--", &arg],
-        )?;
+    // target 必须过 peg_safe：svn 把最后一个 `@` 之后的部分当 peg revision。
+    // 全部 target 一次传（计划 2026-11-09 Task 3）：输出是每个 target 一个 `<target>` 块，
+    // 与逐个跑的拼接相同，`parse_node_status` 的 external 守卫按块判（实测 M3）
+    let args: Vec<String> = status_targets(whitelist, wcs)?
+        .iter()
+        .map(|t| peg_safe(t))
+        .collect();
+    for xml in run_svn_targets(
+        repo,
+        &["status", "-v", "--xml", "--ignore-externals", "--"],
+        &args,
+    )? {
         for n in parse_node_status(&xml)? {
             match merged.get(&n.path) {
                 Some(old) if old.node_rev.is_some() || n.node_rev.is_none() => {}

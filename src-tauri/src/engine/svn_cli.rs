@@ -48,6 +48,71 @@ pub fn run_svn(path: &str, args: &[&str]) -> Result<String> {
     Ok(out)
 }
 
+/// 一条多目标命令的命令行上限（字符数按 UTF-8 字节估，偏保守）。
+///
+/// Windows 的命令行上限是 32767 个 UTF-16 单元，留出余量给 svn 路径与全局参数。
+/// 与 `svn_health::MAX_DIFF_CMDLINE` 同一口径。
+pub const MAX_TARGETS_CMDLINE: usize = 24000;
+
+/// 命令行长度的保守估计：每个参数按字节数 + 两个引号 + 一个空格。
+pub fn cmdline_estimate(head: &[&str], targets: &[String]) -> usize {
+    "svn --non-interactive".len()
+        + head.iter().map(|a| a.len() + 3).sum::<usize>()
+        + targets.iter().map(|a| a.len() + 3).sum::<usize>()
+}
+
+/// 把 `targets` 按顺序切成若干批，每批接在 `head` 后面不超过 `max`。
+///
+/// 空列表返回空：svn 不带 target 时作用于当前目录，也就是整个工作副本。单个 target
+/// 就超过上限时自成一批，交给 svn 去报错，不静默丢掉。
+pub fn chunk_targets<'a>(head: &[&str], targets: &'a [String], max: usize) -> Vec<&'a [String]> {
+    let base = cmdline_estimate(head, &[]);
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut len = base;
+    for (i, t) in targets.iter().enumerate() {
+        let add = t.len() + 3;
+        if i > start && len + add > max {
+            out.push(&targets[start..i]);
+            start = i;
+            len = base;
+        }
+        len += add;
+    }
+    if start < targets.len() {
+        out.push(&targets[start..]);
+    }
+    out
+}
+
+/// 同一条命令一次带多个 target 跑，按命令行长度分批，每批一份输出（按批的顺序）。
+///
+/// # 为什么
+///
+/// 跟进与后台检查原来每个白名单目录起一个 svn 进程。公司机器上起一个进程（打开 117 MB
+/// 的 wc.db、过四层文件过滤驱动）就要几十到上百毫秒，23 个目录一次传：`info` 1251 → 82 ms、
+/// `status` 8126 → 4139 ms（2026-11-07 报告 3.4 节）。
+///
+/// # 与逐个跑的差别
+///
+/// - 输出是逐个 target 结果的拼接：`status` 每个 target 一个 `<target>` 块，`info` 每个
+///   target 一条 entry、按传入顺序，`ls` 每个 target 一个 `<list>`（计划 2026-11-09 实测
+///   M1–M12）。调用方要按块或按顺序对回 target。
+/// - 任何一个 target 失败整批报错，与逐个跑时第一个失败就 `?` 相同。
+/// - `targets` 为空时不起进程，返回空列表（`head` 末尾的 `--` 之后什么都没有时，svn 会
+///   拿当前目录当 target）。
+///
+/// `head` 必须以 `--` 结尾；target 要不要过 `svn_wc::peg_safe` 由调用方决定。
+pub fn run_svn_targets(path: &str, head: &[&str], targets: &[String]) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for batch in chunk_targets(head, targets, MAX_TARGETS_CMDLINE) {
+        let mut args: Vec<&str> = head.to_vec();
+        args.extend(batch.iter().map(String::as_str));
+        out.push(run_svn(path, &args)?);
+    }
+    Ok(out)
+}
+
 thread_local! {
     /// [`with_scan_cache`] 范围内的 `svn info` / `svn status` 输出。`None` = 不在范围内。
     static SCANS: RefCell<Option<HashMap<String, String>>> = const { RefCell::new(None) };

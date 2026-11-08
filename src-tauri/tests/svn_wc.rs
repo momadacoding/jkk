@@ -6,7 +6,7 @@ mod svn_fixtures;
 
 use app_lib::engine::svn_wc::{check_single_repository, enumerate_wcs};
 use svn_fixtures::{
-    svn_repo, svn_repo_with_at_sign_in_path, svn_repo_with_cross_repo_nested_external,
+    svn_cmd, svn_repo, svn_repo_with_at_sign_in_path, svn_repo_with_cross_repo_nested_external,
 };
 
 #[test]
@@ -89,6 +89,62 @@ fn an_empty_whitelist_enumerates_nothing() {
     assert!(wcs.is_empty());
     // 空列表进 P4 也必须是通过而不是 panic
     check_single_repository(&wcs).unwrap();
+}
+
+#[test]
+fn many_whitelist_entries_in_one_call_resolve_each_to_its_own_identity() {
+    // 计划 2026-11-09 Task 2：枚举改成每层一次 `info`、一次 `status`。`info` 的 entry 要按
+    // 顺序对回各自的 target——错位一条，某个目录就会拿到别人的 URL / UUID。混进单文件、
+    // 带 `@` 的目录、重复条目和一条跨仓库的嵌套 external
+    let fx = svn_repo_with_cross_repo_nested_external();
+    let wc = fx.wc();
+    std::fs::create_dir_all(wc.join("Code/Team@Home")).unwrap();
+    std::fs::write(wc.join("Code/Team@Home/C.cs"), "c\n").unwrap();
+    std::fs::create_dir_all(wc.join("Tools")).unwrap();
+    std::fs::write(wc.join("Tools/T.cs"), "t\n").unwrap();
+    svn_cmd(
+        &wc,
+        &["add", "Code/Team@Home@", "Tools", "--non-interactive"],
+    );
+    svn_cmd(&wc, &["commit", "-m", "more", "--non-interactive"]);
+    svn_cmd(&wc, &["update", "--non-interactive"]);
+
+    let whitelist: Vec<String> = ["Tools/", "Code/Team@Home/", "Code/", "Code/A.cs", "Code"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let wcs = enumerate_wcs(&fx.wc_str(), &whitelist).unwrap();
+    let roots: Vec<&str> = wcs.iter().map(|w| w.wc_root.as_str()).collect();
+    assert_eq!(
+        roots,
+        [
+            "Code",
+            "Code/A.cs",
+            "Code/Team@Home",
+            "Code/Vendor",
+            "Tools"
+        ],
+        "{wcs:?}"
+    );
+    for w in &wcs {
+        if w.wc_root == "Code/Vendor" {
+            // external 的 URL 是另一个仓库的根，不是 `<repo1>/Code/Vendor`
+            assert!(!w.url.ends_with("Code/Vendor"), "{w:?}");
+            assert_ne!(w.uuid, wcs[0].uuid, "{w:?}");
+        } else {
+            assert!(w.url.ends_with(&w.wc_root), "{w:?}");
+            assert_eq!(w.uuid, wcs[0].uuid, "{w:?}");
+        }
+    }
+}
+
+#[test]
+fn a_missing_whitelist_entry_still_fails_the_enumeration() {
+    // 批量之后一个 target 不存在仍是整体报错，不能只返回其余几个
+    let fx = svn_repo();
+    let err = enumerate_wcs(&fx.wc_str(), &["Code/".to_string(), "Nope/".to_string()])
+        .expect_err("Nope 不在工作副本里");
+    assert!(err.message.contains("Nope"), "{}", err.message);
 }
 
 #[test]

@@ -284,6 +284,8 @@ pub mod fault {
         FirstDiff,
         /// 体检第二条起的 `svn diff`
         LaterDiff,
+        /// 体检里把多个单元的 floor diff 合在一起的那条 `svn diff`（失败时退回逐单元）
+        MergedDiff,
         /// 把 `svn diff` 输出里的路径还原成仓库相对路径
         DiffPath,
     }

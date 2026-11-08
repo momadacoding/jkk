@@ -6,7 +6,7 @@
 //! P5（external 有没有被 `-r` 钉死）不在这里：它**不阻断**，只切换到 pinned
 //! 模式，属于另一条路径（`engine::svn_externals`）。
 
-use crate::engine::svn_cli::run_svn;
+use crate::engine::svn_cli::{run_svn, run_svn_targets};
 use crate::engine::svn_dirty::read_dirty;
 use crate::engine::svn_nodes::{read_node_status, NodeStatus};
 use crate::engine::svn_wc::{check_single_repository, enumerate_wcs, peg_safe, WcIdentity};
@@ -453,12 +453,13 @@ fn check_single_node_rev(
     wcs: &[WcIdentity],
 ) -> Result<u64> {
     let mut entries: Vec<(String, i64)> = Vec::new();
-    for root in targets {
-        let arg = peg_safe(root);
-        let xml = run_svn(
-            repo_root,
-            &["status", "-v", "--xml", "--ignore-externals", "--", &arg],
-        )?;
+    // 全部 target 一次传（计划 2026-11-09 Task 3）；external 守卫按 `<target>` 块判（实测 M3）
+    let args: Vec<String> = targets.iter().map(|t| peg_safe(t)).collect();
+    for xml in run_svn_targets(
+        repo_root,
+        &["status", "-v", "--xml", "--ignore-externals", "--"],
+        &args,
+    )? {
         entries.extend(parse_node_rev_entries(&xml)?);
     }
     let all: BTreeSet<i64> = entries.iter().map(|(_, r)| *r).collect();

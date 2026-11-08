@@ -379,8 +379,30 @@ pub fn parse_external_roots(xml: &str) -> Result<Vec<String>> {
 /// 的 revision 序列（实测 `{29825, 1938156}`），后果是永久误报失同步、初始化向导
 /// 永远过不去，**而且一切看起来都正常**（spec §6.6.4 陷阱一）。把它变成一个响亮的
 /// 错误，比指望下一个人读到文档可靠。
+///
+/// # 按 `<target>` 块各判一次
+///
+/// 一次 status 可以传多个 target，每个 target 一个 `<target>` 块（计划 2026-11-09 实测 M3）。
+/// 同时传外层 `Code` 与 external 根 `Code/Vendor` 时，前者的块里有 `Code\Vendor` 的 external
+/// 标记、后者的块里是它自己的节点——两块各自都是带 `--ignore-externals` 跑的。按整份输出判，
+/// 后者的节点「落在 external 根之内」，正确的输入会被拒。漏了参数时外层块自己就含 external
+/// 内部的节点，按块判照样拦得住。没有 `<target>` 块的输入（手写片段）按整份判。
 pub fn assert_externals_were_ignored(doc: &Document) -> Result<()> {
-    let externals: Vec<String> = doc
+    let blocks: Vec<Node> = doc
+        .descendants()
+        .filter(|n| n.has_tag_name("target"))
+        .collect();
+    if blocks.is_empty() {
+        return assert_block_ignored_externals(doc.root());
+    }
+    for b in blocks {
+        assert_block_ignored_externals(b)?;
+    }
+    Ok(())
+}
+
+fn assert_block_ignored_externals(block: Node) -> Result<()> {
+    let externals: Vec<String> = block
         .descendants()
         .filter(|n| n.has_tag_name("entry"))
         .filter(|n| {
@@ -395,7 +417,7 @@ pub fn assert_externals_were_ignored(doc: &Document) -> Result<()> {
     if externals.is_empty() {
         return Ok(());
     }
-    for entry in doc.descendants().filter(|n| n.has_tag_name("entry")) {
+    for entry in block.descendants().filter(|n| n.has_tag_name("entry")) {
         let is_external_marker = entry
             .children()
             .find(|c| c.has_tag_name("wc-status"))
@@ -823,6 +845,7 @@ pub struct SvnListEntry {
 }
 
 /// `svn ls -R --xml` 的解析结果。
+#[derive(Debug, Clone, PartialEq)]
 pub struct SvnListResult {
     /// `<list path="…">` 的值，即本次列举的基准 URL（已去尾斜杠）。
     pub base: String,
@@ -849,6 +872,28 @@ pub fn parse_list(xml: &str) -> Result<SvnListResult> {
         .descendants()
         .find(|n| n.has_tag_name("list"))
         .ok_or_else(|| GitError::new("svn_xml_list_no_list", "svn ls 的输出里没有 <list> 元素"))?;
+    Ok(list_of(&list))
+}
+
+/// 解析一次列了多个 target 的 `svn ls -R --xml`：每个 target 一个 `<list>`，按出现顺序
+/// （计划 2026-11-09 实测 M9：与传入顺序相同）。一个 `<list>` 都没有时报错，同 [`parse_list`]。
+pub fn parse_lists(xml: &str) -> Result<Vec<SvnListResult>> {
+    let doc = parse_doc(xml)?;
+    let lists: Vec<SvnListResult> = doc
+        .descendants()
+        .filter(|n| n.has_tag_name("list"))
+        .map(|l| list_of(&l))
+        .collect();
+    if lists.is_empty() {
+        return Err(GitError::new(
+            "svn_xml_list_no_list",
+            "svn ls 的输出里没有 <list> 元素",
+        ));
+    }
+    Ok(lists)
+}
+
+fn list_of(list: &Node) -> SvnListResult {
     let base = list
         .attribute("path")
         .unwrap_or("")
@@ -869,7 +914,7 @@ pub fn parse_list(xml: &str) -> Result<SvnListResult> {
             kind: node.attribute("kind").unwrap_or("").to_string(),
         });
     }
-    Ok(SvnListResult { base, entries })
+    SvnListResult { base, entries }
 }
 
 /// 取某个直接子元素的全部文本，缺失时返回空串。

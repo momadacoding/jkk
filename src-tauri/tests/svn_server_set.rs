@@ -99,6 +99,48 @@ fn a_depth_excluded_subtree_is_reported_as_missing() {
 }
 
 #[test]
+fn a_depth_excluded_subtree_in_a_second_root_is_reported_under_that_root() {
+    // 计划 2026-11-09 Task 5：所有单元一次 `svn ls -R`，每个 `<list>` 要按顺序对回自己的单元。
+    // 错位的话 Code 的清单会被接到 Tools 前面，报出一串不存在的 `Tools/A.cs`
+    let fx = svn_repo_for_health();
+    let wc = fx.wc();
+    std::fs::create_dir_all(wc.join("Tools/Deep")).unwrap();
+    std::fs::write(wc.join("Tools/T.cs"), "t\n").unwrap();
+    std::fs::write(wc.join("Tools/Deep/T2.cs"), "t2\n").unwrap();
+    svn_cmd(&wc, &["add", "Tools", "--non-interactive"]);
+    svn_cmd(&wc, &["commit", "-m", "r2 add T.cs", "--non-interactive"]);
+    svn_cmd(&wc, &["update", "--non-interactive"]);
+    init_hybrid(&InitRequest {
+        repo_root: fx.wc_str(),
+        whitelist: vec!["Code/".to_string(), "Tools/".to_string()],
+        extensions: vec![".cs".to_string()],
+    })
+    .unwrap();
+    assert!(matches!(
+        svn_server_set::audit_server_set(&fx.wc_str(), 2).unwrap(),
+        ServerAudit::Matched
+    ));
+
+    svn_cmd(
+        &wc,
+        &[
+            "update",
+            "--set-depth=exclude",
+            "--non-interactive",
+            "--",
+            "Tools/Deep@",
+        ],
+    );
+    match svn_server_set::audit_server_set(&fx.wc_str(), 2).unwrap() {
+        ServerAudit::Missing { files, total } => {
+            assert_eq!(files, ["Tools/Deep/T2.cs"]);
+            assert_eq!(total, 1);
+        }
+        other => panic!("应当报漏收，实际 {other:?}"),
+    }
+}
+
+#[test]
 fn local_checks_cannot_tell_a_depth_excluded_subtree_from_a_deletion() {
     // 这条**不测新代码**，它把「为什么需要这块新机制」钉成回归测试。
     // 少了它，将来有人「优化」掉这次网络调用时，不会有任何测试变红。

@@ -11,7 +11,8 @@ mod svn_fixtures;
 use app_lib::engine::svn_cli::run_svn;
 use app_lib::engine::svn_xml::{
     parse_diff_summary, parse_external_roots, parse_externals_props, parse_info, parse_list,
-    parse_log, parse_node_revs, parse_status_entries,
+    parse_lists, parse_log, parse_node_rev_entries, parse_node_revs, parse_node_status,
+    parse_status_entries,
 };
 use svn_fixtures::{svn_repo_dirty, svn_repo_with_cross_repo_nested_external, DirtyKind};
 
@@ -154,6 +155,43 @@ fn the_guard_holds_against_real_svn_output_in_both_directions() {
     // 错误用法：不带 → 必须被拦下，而不是静默算出一个多值集合
     let bad = run_svn(&wc, &["status", "-v", "--xml", "--", "Code"]).unwrap();
     let err = parse_node_revs(&bad).expect_err("不带 --ignore-externals 的输出必须被拒");
+    assert_eq!(err.code, "svn_xml_externals_not_ignored");
+}
+
+#[test]
+fn the_guard_judges_each_target_block_on_its_own() {
+    // 计划 2026-11-09 实测 M3：一次 status 同时传外层与 external 根，外层块里有
+    // `Code\Vendor` 的 external 标记、external 自己那块里是它的节点。按整份输出判，
+    // 后者「落在 external 根之内」，正确的输入被当成漏了 --ignore-externals
+    let fx = svn_repo_with_cross_repo_nested_external();
+    let wc = fx.wc_str();
+    let both = run_svn(
+        &wc,
+        &[
+            "status",
+            "-v",
+            "--xml",
+            "--ignore-externals",
+            "--",
+            "Code@",
+            "Code/Vendor@",
+        ],
+    )
+    .unwrap();
+    let nodes = parse_node_status(&both).expect("两个 target 各自都带了 --ignore-externals");
+    assert!(
+        nodes.iter().any(|n| n.path == "Code/Vendor/V.cs"),
+        "{nodes:?}"
+    );
+    assert!(parse_node_rev_entries(&both).is_ok());
+
+    // 反方向：同样两个 target，不带 --ignore-externals，外层那块混进了 external 的内容
+    let bad = run_svn(
+        &wc,
+        &["status", "-v", "--xml", "--", "Code@", "Code/Vendor@"],
+    )
+    .unwrap();
+    let err = parse_node_status(&bad).expect_err("外层块里有 external 内部的节点");
     assert_eq!(err.code, "svn_xml_externals_not_ignored");
 }
 
@@ -768,6 +806,42 @@ fn a_legitimately_empty_listing_is_not_an_error() {
     let got = parse_list(xml).unwrap();
     assert_eq!(got.base, "file:///C:/tmp/empty");
     assert!(got.entries.is_empty());
+}
+
+#[test]
+fn lists_reads_every_list_in_order() {
+    // 计划 2026-11-09 实测 M9：`svn ls -R -- <a>@N <b>@N` 一个 <lists> 下每个 target
+    // 一个 <list>，按传入顺序；空的那个也在
+    let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
+<lists>\r\n\
+<list\r\n   path=\"file:///C:/tmp/repo/Code\">\r\n\
+<entry\r\n   kind=\"file\">\r\n<name>A.cs</name>\r\n<size>2</size>\r\n\
+<commit\r\n   revision=\"1\">\r\n<author>x</author>\r\n</commit>\r\n</entry>\r\n\
+</list>\r\n\
+<list\r\n   path=\"file:///C:/tmp/repo/Late\">\r\n</list>\r\n\
+<list\r\n   path=\"file:///C:/tmp/repo/Tools\">\r\n\
+<entry\r\n   kind=\"dir\">\r\n<name>Sub</name>\r\n</entry>\r\n\
+<entry\r\n   kind=\"file\">\r\n<name>Sub/S.cs</name>\r\n</entry>\r\n\
+</list>\r\n\
+</lists>\r\n";
+    let got = parse_lists(xml).unwrap();
+    let bases: Vec<&str> = got.iter().map(|l| l.base.as_str()).collect();
+    assert_eq!(
+        bases,
+        [
+            "file:///C:/tmp/repo/Code",
+            "file:///C:/tmp/repo/Late",
+            "file:///C:/tmp/repo/Tools"
+        ]
+    );
+    assert_eq!(got[0].entries.len(), 1);
+    assert!(got[1].entries.is_empty());
+    assert_eq!(got[2].entries[1].name, "Sub/S.cs");
+    // 单个 <list> 时与 parse_list 相同
+    assert_eq!(
+        parse_lists(LIST_XML).unwrap(),
+        vec![parse_list(LIST_XML).unwrap()]
+    );
 }
 
 /// `svn add` 了没提交的节点**不能**参与 `nodeRevs`。

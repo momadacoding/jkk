@@ -5,7 +5,7 @@
 //! 仓库**的子树已经进了白名单——它会被 git 跟踪、进基线、进交付清单，却从不
 //! 参与 `nodeRevs` 校验，最后在 D5 撞上 `E200007`（spec §6.5.5）。
 
-use crate::engine::svn_cli::run_svn;
+use crate::engine::svn_cli::run_svn_targets;
 use crate::engine::svn_xml::{parse_external_roots, parse_info};
 use crate::error::{GitError, Result};
 
@@ -36,6 +36,12 @@ pub struct WcIdentity {
 /// 枚举白名单递归覆盖到的全部工作副本。
 ///
 /// 空白名单返回空列表，**一条 svn 命令都不发**（spec §12.2）。
+///
+/// # 按层批量
+///
+/// 每一层（先是白名单，再是上一层里新冒出来的 external 根）只发一次 `svn info`、一次
+/// `svn status`，所有 target 一起传（计划 2026-11-09 Task 2）。原来每个 target 各两个进程，
+/// 公司机器上 23 个目录光 `info` 就 1.25 s、一次传 82 ms。外部嵌套通常只有一两层。
 pub fn enumerate_wcs(repo_root: &str, whitelist: &[String]) -> Result<Vec<WcIdentity>> {
     let mut out: Vec<WcIdentity> = Vec::new();
     let mut pending: Vec<String> = whitelist
@@ -44,39 +50,62 @@ pub fn enumerate_wcs(repo_root: &str, whitelist: &[String]) -> Result<Vec<WcIden
         .filter(|w| !w.is_empty())
         .collect();
 
-    while let Some(target) = pending.pop() {
+    while !pending.is_empty() {
         // 已经收过的子树不重复展开：两条白名单可能落在同一个 WC 里，
         // 而 external 也可能被两条白名单同时覆盖到。不去重会死循环。
-        if out.iter().any(|w| w.wc_root == target) {
-            continue;
+        let mut layer: Vec<String> = Vec::new();
+        for t in pending.drain(..) {
+            if !out.iter().any(|w| w.wc_root == t) && !layer.contains(&t) {
+                layer.push(t);
+            }
         }
+        if layer.is_empty() {
+            break;
+        }
+        let args: Vec<String> = layer.iter().map(|t| peg_safe(t)).collect();
+
         // ⚠️ `svn info` **不接受** `--ignore-externals`（spec §4.4）。它默认也
         // 不遍历 externals，所以这里本来就不需要那个参数。
-        let arg = peg_safe(&target);
-        let xml = run_svn(repo_root, &["info", "--xml", "--", &arg])?;
-        let entry = parse_info(&xml)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| GitError::new("svn_wc", format!("svn info 对 {target} 没有输出")))?;
-        out.push(WcIdentity {
-            wc_root: target.clone(),
-            url: entry.url,
-            repos_root: entry.repos_root,
-            uuid: entry.uuid,
-            wc_root_abspath: entry.wc_root,
-        });
+        //
+        // 多个 target 时每个 target 一条 entry、按传入顺序（实测 M1），按顺序对回。条数
+        // 对不上就报错：错位一条，某个目录就拿到了别人的 URL / UUID。
+        let mut entries = Vec::new();
+        for xml in run_svn_targets(repo_root, &["info", "--xml", "--"], &args)? {
+            entries.extend(parse_info(&xml)?);
+        }
+        if entries.len() != layer.len() {
+            return Err(GitError::new(
+                "svn_wc",
+                format!(
+                    "svn info 对 {} 个 target 返回了 {} 条结果，没法对回各自的目录：{}",
+                    layer.len(),
+                    entries.len(),
+                    layer.join("、")
+                ),
+            ));
+        }
+        for (target, entry) in layer.iter().zip(entries) {
+            out.push(WcIdentity {
+                wc_root: target.clone(),
+                url: entry.url,
+                repos_root: entry.repos_root,
+                uuid: entry.uuid,
+                wc_root_abspath: entry.wc_root,
+            });
+        }
 
-        // 找这棵子树里的嵌套 external 根。**这一次故意不带 `--ignore-externals`**
+        // 找这些子树里的嵌套 external 根。**这一次故意不带 `--ignore-externals`**
         // ——要的就是让它们出现（`item="external"`），见 spec §6.6.4 的枚举方式。
-        let st = run_svn(repo_root, &["status", "--xml", "--", &arg])?;
-        for rel in parse_external_roots(&st)? {
-            // svn 在 Windows 上返回反斜杠（`Code\Vendor`，2026-09-13 实测）。
-            // 不转换就和正斜杠形式的 `wc_root` 比不中，去重失效，这个 external
-            // 会被反复塞回队列——解析层有意不做这层转换，见 `svn_xml` 的
-            // `external_root_paths_come_back_with_windows_separators_verbatim`。
-            let rel = normalize(&rel);
-            if !out.iter().any(|w| w.wc_root == rel) && !pending.contains(&rel) {
-                pending.push(rel);
+        for st in run_svn_targets(repo_root, &["status", "--xml", "--"], &args)? {
+            for rel in parse_external_roots(&st)? {
+                // svn 在 Windows 上返回反斜杠（`Code\Vendor`，2026-09-13 实测）。
+                // 不转换就和正斜杠形式的 `wc_root` 比不中，去重失效，这个 external
+                // 会被反复塞回队列——解析层有意不做这层转换，见 `svn_xml` 的
+                // `external_root_paths_come_back_with_windows_separators_verbatim`。
+                let rel = normalize(&rel);
+                if !out.iter().any(|w| w.wc_root == rel) && !pending.contains(&rel) {
+                    pending.push(rel);
+                }
             }
         }
     }
