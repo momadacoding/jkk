@@ -431,6 +431,15 @@ describe('错误码到引导语的映射', () => {
     expect(h).not.toContain('请重试一次')
   })
 
+  it('文件 / 目录冲突给出在 TortoiseSVN 里怎么处理（R2b 批量化独立 review）', () => {
+    const backend =
+      '要放进候选索引的 `Code/F/Y.cs` 与已有的 `Code/F` 一个是文件、一个是目录，放进去会把 `Code/F` 挤掉，' +
+      '而它不在这次要改写的清单里。没有写入任何条目。'
+    const h = wizardErrorHint('svn_baseline_index_conflict', backend)
+    expect(h).toContain('TortoiseSVN')
+    expect(h).toContain('还原')
+  })
+
   it('后端原文已经说清了的，提示不重复显示（6.2 独立 review L3）', () => {
     // 界面上总是带着后端消息调用：后端文案里已有「录制过程中 TortoiseSVN…」，提示不再叠一遍
     const backend =

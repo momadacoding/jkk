@@ -1316,6 +1316,65 @@ fn recording_a_file_produces_the_same_blob_whether_it_was_dirty_or_not() {
 }
 
 #[test]
+fn rebuild_records_server_content_for_many_dirty_files() {
+    // R2b 并行取数 + 一次写索引（计划 2026-11-08-svn-follow-batch Task 2）的回归保护：
+    // 文件一多，取数分到几个线程上、乱序完成，录出来的仍须逐个是服务器内容，剔除的仍须不在树里。
+    let fx = svn_repo_for_health();
+    let wc = fx.wc();
+    std::fs::create_dir_all(wc.join("Code/Many")).unwrap();
+    for i in 0..40 {
+        std::fs::write(
+            wc.join(format!("Code/Many/F{i:02}.cs")),
+            format!("server {i}\n"),
+        )
+        .unwrap();
+    }
+    svn(&wc, &["add", "Code/Many", "--non-interactive"]);
+    svn(&wc, &["commit", "-m", "r2", "--non-interactive"]);
+    svn(&wc, &["update", "--non-interactive"]);
+    init_hybrid(&req(&fx)).unwrap();
+
+    for i in 0..30 {
+        std::fs::write(wc.join(format!("Code/Many/F{i:02}.cs")), "LOCAL EDIT\n").unwrap();
+    }
+    for i in 30..35 {
+        svn(
+            &wc,
+            &[
+                "delete",
+                &format!("Code/Many/F{i:02}.cs"),
+                "--non-interactive",
+            ],
+        );
+    }
+    for i in 0..10 {
+        std::fs::write(wc.join(format!("Code/Many/New{i}.cs")), "brand new\n").unwrap();
+    }
+    let before = snapshot_disk(&wc);
+
+    let report = rebuild_baseline(&fx.wc_str()).expect("脏工作副本必须能重建");
+
+    assert_eq!(report.node_rev, 2);
+    for i in 0..35 {
+        assert_eq!(
+            baseline_blob(&fx.wc_str(), &format!("Code/Many/F{i:02}.cs")),
+            format!("server {i}\n").into_bytes(),
+            "F{i:02}：基线里必须是服务器 r2 的内容"
+        );
+    }
+    let listed = run_git(
+        &fx.wc_str(),
+        &["ls-tree", "-r", "--name-only", "refs/heads/svn/base"],
+    )
+    .unwrap();
+    assert!(
+        !listed.contains("Code/Many/New"),
+        "服务器上没有的不该进基线。实际树：\n{listed}"
+    );
+    assert_eq!(before, snapshot_disk(&wc), "重建动了磁盘");
+}
+
+#[test]
 fn rebuild_refuses_only_when_a_node_is_obstructed() {
     // R1 与 P1 同一套判据。§16.1 之后那套判据只剩 `~` 一条——普通的本地修改
     // **必须放行**（见 `rebuild_records_server_content_on_a_dirty_working_copy`）。
