@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { Panel, Group, Separator } from 'react-resizable-panels'
 import { PANEL_GROUP_IDS } from '@/engine/layoutMemory'
 import { usePanelLayout } from '@/store/layoutStore'
@@ -13,13 +13,16 @@ import {
   rangeSelection,
   reconcileSelection,
   selectAllFiles,
+  changesTree,
   type FileSection,
   type FileSelection,
 } from '../engine/fileSelection'
+import { collectDirPaths, treeFilePaths, type TreeNode } from '../engine/fileTree'
+import { Chevron, FileIcon, FolderIcon, STATUS_MARK } from './FileTree'
 import { commitKeyAction, type CommitField } from '../engine/commitKeys'
 import { discardShortcut, isSelectAllShortcut } from '../engine/fileListKeys'
 import { buildCommitMessage } from '../engine/commitActions'
-import { conflictsFirst, describeStageConflicts } from '../engine/conflicts'
+import { describeStageConflicts } from '../engine/conflicts'
 import { externalDiffItems, externalMergeItems, type ExternalToolsMenu } from './externalToolItems'
 import { canExternalMerge, conflictView, PENDING_CONFLICT_VIEW } from '@/engine/conflictView'
 import { toolFor } from '@/engine/externalTools'
@@ -35,22 +38,122 @@ interface FileSectionProps {
   selection: FileSelection
   /** diff 面板正在显示的那个文件。 */
   activePath: string | null
-  onRowClick: (section: FileSection, files: string[], path: string, e: React.MouseEvent) => void
-  onRowContextMenu: (section: FileSection, files: string[], path: string, e: React.MouseEvent) => void
+  /**
+   * 行的鼠标事件都带上本区**看得见的**文件（树的显示顺序，跳过收起的目录）：
+   * Shift / 拖动选一段按它算，不会把收起目录里看不见的文件夹进选中。
+   */
+  onRowClick: (section: FileSection, visible: string[], path: string, e: React.MouseEvent) => void
+  onRowContextMenu: (section: FileSection, visible: string[], path: string, e: React.MouseEvent) => void
   /** 按住拖动多选：在行上按下开始，划进别的行时扩到那一行。 */
   onRowMouseDown: (section: FileSection, path: string, e: React.MouseEvent) => void
-  onRowMouseEnter: (section: FileSection, files: string[], path: string, e: React.MouseEvent) => void
-  onToggleOne: (path: string) => void
-  onToggleAll: () => void
-  onKeyDown: (section: FileSection, e: React.KeyboardEvent) => void
+  onRowMouseEnter: (section: FileSection, visible: string[], path: string, e: React.MouseEvent) => void
+  /** 双击文件行：只对这一个文件做本区的动作（Stage / Unstage）。 */
+  onActivate: (path: string) => void
+  /** 区头按钮：本区有选中时传选中的，没有时传整区。 */
+  onAction: (paths: string[]) => void
+  /**
+   * 收起目录之后，本区还看得见的文件。选中只含看得见的文件——收起的目录里还留着选中的话，
+   * 区头「Stage Selected」、Delete 丢弃、右键动作都会打到看不见的文件上。
+   */
+  onCollapse: (section: FileSection, visible: string[]) => void
+  /** Ctrl+A 按 `visible` 选，同样不选收起目录里的文件。 */
+  onKeyDown: (section: FileSection, visible: string[], e: React.KeyboardEvent) => void
 }
 
 function FileSectionList({
   title, section, files, actionLabel, selection, activePath,
-  onRowClick, onRowContextMenu, onRowMouseDown, onRowMouseEnter, onToggleOne, onToggleAll, onKeyDown,
+  onRowClick, onRowContextMenu, onRowMouseDown, onRowMouseEnter, onActivate, onAction, onCollapse, onKeyDown,
 }: FileSectionProps) {
-  const paths = files.map((f) => f.path)
+  // 与 changesPaths 用的是同一棵树，显示顺序和选中、默认项用的顺序一致
+  const tree = changesTree(files)
+  /**
+   * 只记收起的目录，没记的一律展开：改动列表要全展开才看得到，状态刷新后
+   * 新冒出来的目录也该是展开的，记覆盖项天然做到这一点（同 FileTree）。
+   */
+  const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(() => new Set())
+  // 目录整个离开列表（里面的文件都暂存走了）就忘掉它收起过：之后再出现的是新改动，该展开给人看
+  useEffect(() => {
+    setCollapsed((cur) => {
+      if (cur.size === 0) return cur
+      const dirs = new Set(collectDirPaths(tree))
+      const kept = [...cur].filter((dir) => dirs.has(dir))
+      return kept.length === cur.size ? cur : new Set(kept)
+    })
+  }, [tree])
+  const toggleDir = (dir: string) => {
+    const next = new Set(collapsed)
+    if (next.delete(dir)) {
+      setCollapsed(next)
+      return
+    }
+    next.add(dir)
+    setCollapsed(next)
+    onCollapse(section, treeFilePaths(tree, (d) => !next.has(d)))
+  }
+  const allPaths = useMemo(() => treeFilePaths(tree), [tree])
+  const visible = useMemo(() => treeFilePaths(tree, (dir) => !collapsed.has(dir)), [tree, collapsed])
+  const changeByPath = useMemo(() => new Map(files.map((f) => [f.path, f])), [files])
   const selectedHere = selection.section === section ? selection.paths : []
+  // Ctrl+A 之后上万行每行都要查一次，用 Set
+  const selectedSet = useMemo(() => new Set(selectedHere), [selectedHere])
+
+  const rows = (nodes: TreeNode[], depth: number): React.ReactNode[] => nodes.map((node) => {
+    // 每层缩进 14px，与提交详情的文件树一致；文件行留出折叠箭头的位置，名字才对得齐
+    const indent = { paddingLeft: 6 + depth * 14 }
+    if (node.kind === 'dir') {
+      const open = !collapsed.has(node.path)
+      return (
+        <Fragment key={`dir:${node.path}`}>
+          <div className="changes-dir" style={indent} title={node.path} onClick={() => toggleDir(node.path)}>
+            <Chevron open={open} />
+            <FolderIcon />
+            <span className="changes-dir-name">{node.name}</span>
+          </div>
+          {open && rows(node.children, depth + 1)}
+        </Fragment>
+      )
+    }
+    const change = changeByPath.get(node.path)
+    const mark = node.status ? STATUS_MARK[node.status] : null
+    return (
+      <div
+        key={`file:${node.path}`}
+        className={[
+          'changes-file',
+          selectedSet.has(node.path) ? 'selected' : '',
+          node.path === activePath && selection.section === section ? 'active' : '',
+          node.status === 'conflicted' ? 'conflicted' : '',
+        ].filter(Boolean).join(' ')}
+        style={indent}
+        title={`${node.path}\n双击 ${actionLabel} · Ctrl+单击多选 · Shift+单击或按住拖动选一段 · Ctrl+A 全选 · Delete 丢弃 · 右键更多操作`}
+        onClick={(e) => onRowClick(section, visible, node.path, e)}
+        onDoubleClick={(e) => {
+          // 带修饰键的双击是在连点多选，不是要暂存
+          if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return
+          onActivate(node.path)
+        }}
+        onContextMenu={(e) => onRowContextMenu(section, visible, node.path, e)}
+        onMouseDown={(e) => onRowMouseDown(section, node.path, e)}
+        onMouseEnter={(e) => onRowMouseEnter(section, visible, node.path, e)}
+      >
+        <span className="ft-chevron-spacer" />
+        {mark && (
+          <span
+            className={`ft-badge ${mark.kind}`}
+            title={node.status === 'conflicted' ? '有冲突，处理完再 Stage' : undefined}
+          >
+            {mark.label}
+          </span>
+        )}
+        <FileIcon />
+        <span className="changes-file-path">{node.name}</span>
+        {/* 冲突行的行数没有意义（libgit2 给冲突条目的永远是 0/0），只留角标 */}
+        {change && node.status !== 'conflicted' && (
+          <span className="changes-file-stats">+{change.additions}/-{change.deletions}</span>
+        )}
+      </div>
+    )
+  })
 
   return (
     <div className="changes-section">
@@ -59,45 +162,20 @@ function FileSectionList({
           {title} ({files.length})
           {selectedHere.length > 1 && <span className="changes-selcount">已选 {selectedHere.length}</span>}
         </span>
+        {/* 行内不再各带一个按钮（像 Fork 那样）：区头这一个按钮有选中时管选中的，没有时管整区 */}
         {files.length > 0 && (
-          <button className="changes-action" onClick={onToggleAll}>{actionLabel} All</button>
+          <button
+            className="changes-action"
+            onClick={() => onAction(selectedHere.length > 0 ? selectedHere : allPaths)}
+          >
+            {actionLabel} {selectedHere.length > 0 ? 'Selected' : 'All'}
+          </button>
         )}
       </div>
       {/* 可聚焦，点一下行焦点就落在这里：快捷键只在文件列表有焦点时生效，
           挂在 window 上的话 commit 输入框里按 Delete 删字也会被当成丢弃 */}
-      <div className="changes-section-files" tabIndex={0} onKeyDown={(e) => onKeyDown(section, e)}>
-        {files.map((f) => (
-          <div
-            key={f.path}
-            className={[
-              'changes-file',
-              selectedHere.includes(f.path) ? 'selected' : '',
-              f.path === activePath && selection.section === section ? 'active' : '',
-              f.status === 'conflicted' ? 'conflicted' : '',
-            ].filter(Boolean).join(' ')}
-            title={`${f.path}\nCtrl+单击多选 · Shift+单击或按住拖动选一段 · Ctrl+A 全选 · Delete 丢弃 · 右键更多操作`}
-            onClick={(e) => onRowClick(section, paths, f.path, e)}
-            onContextMenu={(e) => onRowContextMenu(section, paths, f.path, e)}
-            onMouseDown={(e) => onRowMouseDown(section, f.path, e)}
-            onMouseEnter={(e) => onRowMouseEnter(section, paths, f.path, e)}
-          >
-            <button
-              className="changes-toggle"
-              onClick={(e) => { e.stopPropagation(); onToggleOne(f.path) }}
-            >
-              {actionLabel}
-            </button>
-            {/* 只给冲突行加角标：普通改动看所在分区就够了，冲突却和它们混在 Unstaged 里 */}
-            {f.status === 'conflicted' && (
-              <span className="ft-badge conflicted" title="有冲突，处理完再 Stage">!</span>
-            )}
-            <span className="changes-file-path">{f.path}</span>
-            {/* 冲突行的行数没有意义（libgit2 给冲突条目的永远是 0/0），只留角标 */}
-            {f.status !== 'conflicted' && (
-              <span className="changes-file-stats">+{f.additions}/-{f.deletions}</span>
-            )}
-          </div>
-        ))}
+      <div className="changes-section-files" tabIndex={0} onKeyDown={(e) => onKeyDown(section, visible, e)}>
+        {rows(tree, 0)}
         {files.length === 0 && <div className="changes-empty">No files</div>}
       </div>
     </div>
@@ -160,7 +238,6 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
   const { menu, open, close } = useContextMenu()
   const { confirm, dialog: confirmDialog } = useConfirm()
 
-  const unstaged = useMemo(() => conflictsFirst(status.unstaged), [status.unstaged])
   const conflicted = useMemo(
     () => new Set(status.unstaged.filter((f) => f.status === 'conflicted').map((f) => f.path)),
     [status.unstaged],
@@ -228,7 +305,7 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
   }
 
   /**
-   * 所有 Stage 入口（行按钮、Stage All、右键、冲突说明里的按钮）的唯一出口。
+   * 所有 Stage 入口（双击行、区头 Stage Selected / All、右键、冲突说明里的按钮）的唯一出口。
    * 还留着冲突标记、或冲突信息没读到的文件，先确认；取消就整批不暂存（第 85 条）。
    * 没传 `conflicts` 与 null 同义：还没读到。
    */
@@ -292,10 +369,8 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
   }, [])
 
   const rowMouseDown = (section: FileSection, path: string, e: React.MouseEvent) => {
-    // 只认不带修饰键的左键：Ctrl / Shift 按下去是单击多选，交给 onClick；
-    // 行内的 Stage 按钮是按钮，从它上面按下去不是要选东西
+    // 只认不带修饰键的左键：Ctrl / Shift 按下去是单击多选，交给 onClick
     if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return
-    if (e.target instanceof Element && e.target.closest('.changes-toggle')) return
     // 不改选中、不 preventDefault：没拖动就松开时由 onClick 照常处理；
     // 挡掉默认行为的话列表拿不到焦点，Ctrl+A 和 Delete 就失效了
     dragRef.current = { section, anchor: path }
@@ -319,7 +394,21 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
     setSelection(next)
   }
 
-  const fileListKeyDown = (section: FileSection, e: React.KeyboardEvent) => {
+  /** 收起目录后，本区选中里看不见的文件退出选中（见 `FileSectionProps.onCollapse`）。 */
+  const collapseDir = (section: FileSection, visible: string[]) => {
+    if (selection.section !== section) return
+    const shown = new Set(visible)
+    const kept = selection.paths.filter((p) => shown.has(p))
+    if (kept.length === selection.paths.length) return
+    if (kept.length === 0) {
+      setSelection(emptyFileSelection)
+      return
+    }
+    const anchor = selection.anchor !== null && shown.has(selection.anchor) ? selection.anchor : kept[0]
+    setSelection({ section, paths: kept, anchor })
+  }
+
+  const fileListKeyDown = (section: FileSection, visible: string[], e: React.KeyboardEvent) => {
     // isComposing 只在 nativeEvent 上，原因同 commitKeyDown
     const key = {
       key: e.key,
@@ -334,7 +423,7 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
     if (isSelectAllShortcut(key)) {
       // 不挡的话 WebView 会把整页文字全选上
       e.preventDefault()
-      setSelection(selectAllFiles(selection, section, paths[section]))
+      setSelection(selectAllFiles(selection, section, visible))
       return
     }
     const req = discardShortcut(key, section, selection, paths)
@@ -400,7 +489,7 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
                 <FileSectionList
                   title="Unstaged"
                   section="unstaged"
-                  files={unstaged}
+                  files={status.unstaged}
                   actionLabel="Stage"
                   selection={selection}
                   activePath={activeFile}
@@ -408,8 +497,9 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
                   onRowContextMenu={contextMenu}
                   onRowMouseDown={rowMouseDown}
                   onRowMouseEnter={rowMouseEnter}
-                  onToggleOne={(path) => { void stage([path]) }}
-                  onToggleAll={() => { void stage(status.unstaged.map((f) => f.path)) }}
+                  onActivate={(path) => { void stage([path]) }}
+                  onAction={(paths) => { void stage(paths) }}
+                  onCollapse={collapseDir}
                   onKeyDown={fileListKeyDown}
                 />
               </Panel>
@@ -426,8 +516,9 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
                   onRowContextMenu={contextMenu}
                   onRowMouseDown={rowMouseDown}
                   onRowMouseEnter={rowMouseEnter}
-                  onToggleOne={(path) => onUnstage([path])}
-                  onToggleAll={() => onUnstage(status.staged.map((f) => f.path))}
+                  onActivate={(path) => onUnstage([path])}
+                  onAction={onUnstage}
+                  onCollapse={collapseDir}
                   onKeyDown={fileListKeyDown}
                 />
               </Panel>

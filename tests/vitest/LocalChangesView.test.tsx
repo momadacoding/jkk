@@ -5,7 +5,7 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { beforeAll, describe, expect, it, vi } from 'vitest'
 import { LocalChangesView } from '@/components/LocalChangesView'
 import type { ExternalTool, ExternalToolsConfig } from '@/engine/externalTools'
-import type { ConflictInfo, DiffData, FileChange, StatusData } from '@/engine/types'
+import type { ConflictInfo, DiffData, FileChange, FileStatus, StatusData } from '@/engine/types'
 import type { FileSelection } from '@/engine/fileSelection'
 
 // react-resizable-panels 挂载时要 new 一个 ResizeObserver，jsdom 没有。
@@ -285,7 +285,9 @@ describe('LocalChangesView 的冲突文件', () => {
 
   it('② 没有标记时显示 HEAD 对比工作区的 diff 和 Stage 按钮', async () => {
     const { onStage } = mountConflicts([conflictInfo('c.txt', { case: 'noMarkers' })])
-    fireEvent.click(screen.getByText('c.txt'))
+    // 按树的顺序 c.txt 是第一个冲突文件，没选中时右侧已经显示它，文件名会出现两次：点的是行
+    const row = screen.getAllByText('c.txt').find((el) => el.closest('.changes-file'))
+    fireEvent.click(row as HTMLElement)
     expect(screen.getByText('未检测到冲突标记，检查后可以暂存')).toBeTruthy()
     expect(screen.getByText('hand merged')).toBeTruthy()
     fireEvent.click(document.querySelector('.conflict-notice button') as HTMLElement)
@@ -440,10 +442,11 @@ describe('LocalChangesView：有冲突标记的文件暂存前要确认', () => 
   }
   const infos = [conflictInfo('c.txt'), conflictInfo('clean.txt', { case: 'noMarkers' })]
 
-  function rowToggle(path: string): HTMLElement {
-    const btn = screen.getByText(path).closest('.changes-file')?.querySelector('.changes-toggle')
-    if (!(btn instanceof HTMLElement)) throw new Error(`找不到 ${path} 的 Stage 按钮`)
-    return btn
+  /** 行内不再有 Stage 按钮，单个文件靠双击行暂存。 */
+  function doubleClickRow(path: string) {
+    const row = screen.getByText(path).closest('.changes-file')
+    if (!(row instanceof HTMLElement)) throw new Error(`找不到 ${path} 的行`)
+    fireEvent.doubleClick(row)
   }
 
   async function guardDialog(): Promise<HTMLElement> {
@@ -465,9 +468,9 @@ describe('LocalChangesView：有冲突标记的文件暂存前要确认', () => 
     await waitFor(() => expect(document.querySelector('.dialog-actions')).toBeNull())
   }
 
-  it('行上的 Stage 按钮：弹确认，取消后不暂存', async () => {
+  it('双击行暂存：弹确认，取消后不暂存', async () => {
     const { onStage } = mountGuard(infos)
-    fireEvent.click(rowToggle('c.txt'))
+    doubleClickRow('c.txt')
     const dialog = await guardDialog()
     expect(dialog.textContent).toContain('c.txt')
     expect(dialog.textContent).toContain('冲突标记')
@@ -478,14 +481,14 @@ describe('LocalChangesView：有冲突标记的文件暂存前要确认', () => 
   // 只断言焦点：Dialog 没有全局回车处理，回车触发的是有焦点的那个按钮
   it('打开时焦点落在取消上', async () => {
     mountGuard(infos)
-    fireEvent.click(rowToggle('c.txt'))
+    doubleClickRow('c.txt')
     const dialog = await guardDialog()
     await waitFor(() => expect(document.activeElement).toBe(within(dialog).getByRole('button', { name: 'Cancel' })))
   })
 
   it('确认之后才暂存', async () => {
     const { onStage } = mountGuard(infos)
-    fireEvent.click(rowToggle('c.txt'))
+    doubleClickRow('c.txt')
     const dialog = await guardDialog()
     fireEvent.click(within(dialog).getByRole('button', { name: '仍然暂存' }))
     await waitFor(() => expect(onStage).toHaveBeenCalledWith(['c.txt']))
@@ -527,7 +530,7 @@ describe('LocalChangesView：有冲突标记的文件暂存前要确认', () => 
 
   it('冲突信息还没读到（null）：没有标记的那个冲突文件也要拦', async () => {
     const { onStage } = mountGuard(null)
-    fireEvent.click(rowToggle('clean.txt'))
+    doubleClickRow('clean.txt')
     const dialog = await guardDialog()
     expect(dialog.textContent).toContain('clean.txt')
     await cancel(dialog)
@@ -536,14 +539,14 @@ describe('LocalChangesView：有冲突标记的文件暂存前要确认', () => 
 
   it('确认没有冲突标记的冲突文件直接暂存，不弹框', async () => {
     const { onStage } = mountGuard(infos)
-    fireEvent.click(rowToggle('clean.txt'))
+    doubleClickRow('clean.txt')
     await waitFor(() => expect(onStage).toHaveBeenCalledWith(['clean.txt']))
     expect(document.querySelector('.dialog-actions')).toBeNull()
   })
 
   it('普通文件照旧直接暂存，不弹框', async () => {
     const { onStage } = mountGuard(infos)
-    fireEvent.click(rowToggle('a.txt'))
+    doubleClickRow('a.txt')
     await waitFor(() => expect(onStage).toHaveBeenCalledWith(['a.txt']))
     expect(document.querySelector('.dialog-actions')).toBeNull()
   })
@@ -772,13 +775,6 @@ describe('LocalChangesView 的拖动多选与 Ctrl+A', () => {
     expect(selected()).toEqual(['b.txt', 'c.txt', 'd.txt'])
   })
 
-  it('从行内的 Stage 按钮上按下不开始拖动', () => {
-    mountThree()
-    fireEvent.mouseDown(within(row('a.txt')).getByText('Stage'), { button: 0, buttons: 1 })
-    fireEvent.mouseEnter(row('c.txt'), { buttons: 1 })
-    expect(selected()).toEqual([])
-  })
-
   it('右键按下不开始拖动', () => {
     mountThree()
     fireEvent.mouseDown(row('a.txt'), { button: 2, buttons: 2 })
@@ -899,5 +895,189 @@ describe('LocalChangesView 的提交说明（事故分析 6.6）', () => {
     await act(async () => finish(true))
     await settle()
     expect(subject.value).toBe('')
+  })
+})
+
+describe('LocalChangesView 的树形列表与状态角标', () => {
+  function mountTree(status: StatusData) {
+    const onStage = vi.fn()
+    const onUnstage = vi.fn()
+    render(
+      <LocalChangesView
+        status={status}
+        diff={{ files: [] }}
+        onStage={onStage}
+        onUnstage={onUnstage}
+        onDiscard={vi.fn()}
+        onCommit={vi.fn()}
+        svnMode={false}
+        onBaselineBranch={false}
+      />,
+    )
+    return { onStage, onUnstage }
+  }
+
+  const ch = (path: string, status: FileStatus = 'modified'): FileChange =>
+    ({ path, status, additions: 1, deletions: 0 })
+
+  function section(title: 'Unstaged' | 'Staged'): HTMLElement {
+    const header = screen.getByText((_, el) => el?.tagName === 'SPAN' && el.textContent?.startsWith(`${title} (`) === true)
+    const el = header.closest('.changes-section')
+    if (!(el instanceof HTMLElement)) throw new Error(`找不到 ${title} 区`)
+    return el
+  }
+
+  function fileRow(name: string): HTMLElement {
+    const el = screen.getByText(name).closest('.changes-file')
+    if (!(el instanceof HTMLElement)) throw new Error(`找不到 ${name} 的行`)
+    return el
+  }
+
+  function dirRow(name: string): HTMLElement {
+    const el = screen.getByText(name).closest('.changes-dir')
+    if (!(el instanceof HTMLElement)) throw new Error(`找不到目录 ${name}`)
+    return el
+  }
+
+  const dirNames = (sec: HTMLElement) =>
+    Array.from(sec.querySelectorAll('.changes-dir-name')).map((el) => el.textContent)
+
+  it('按目录分层：目录单独一行，文件行只显示文件名，完整路径在提示里', () => {
+    mountTree({ unstaged: [ch('src/store/repoStore.ts'), ch('docs/plan.md')], staged: [] })
+    expect(dirNames(section('Unstaged'))).toEqual(['docs', 'src', 'store'])
+    expect(screen.queryByText('src/store/repoStore.ts')).toBeNull()
+    expect(fileRow('repoStore.ts').getAttribute('title')).toContain('src/store/repoStore.ts')
+  })
+
+  it('每个文件都有状态角标：新增 +、修改 M、删除 −、重命名 R', () => {
+    mountTree({
+      unstaged: [ch('new.txt', 'added'), ch('mod.txt'), ch('gone.txt', 'deleted')],
+      staged: [ch('moved.txt', 'renamed')],
+    })
+    const badge = (name: string) => fileRow(name).querySelector('.ft-badge')
+    expect(badge('new.txt')?.textContent).toBe('+')
+    expect(badge('new.txt')?.classList.contains('added')).toBe(true)
+    expect(badge('mod.txt')?.textContent).toBe('M')
+    expect(badge('mod.txt')?.classList.contains('modified')).toBe(true)
+    expect(badge('gone.txt')?.textContent).toBe('−')
+    expect(badge('gone.txt')?.classList.contains('deleted')).toBe(true)
+    expect(badge('moved.txt')?.textContent).toBe('R')
+    expect(badge('moved.txt')?.classList.contains('renamed')).toBe(true)
+  })
+
+  it('文件行里没有 Stage / Unstage 按钮', () => {
+    mountTree({ unstaged: [ch('a.txt')], staged: [ch('s.txt')] })
+    expect(fileRow('a.txt').querySelector('button')).toBeNull()
+    expect(fileRow('s.txt').querySelector('button')).toBeNull()
+  })
+
+  it('双击 Staged 里的行：只取消暂存这一个', () => {
+    const { onUnstage } = mountTree({ unstaged: [], staged: [ch('s.txt'), ch('t.txt')] })
+    fireEvent.doubleClick(fileRow('s.txt'))
+    expect(onUnstage).toHaveBeenCalledWith(['s.txt'])
+  })
+
+  it('双击目录行不暂存任何东西', () => {
+    const { onStage } = mountTree({ unstaged: [ch('src/a.ts')], staged: [] })
+    fireEvent.doubleClick(dirRow('src'))
+    expect(onStage).not.toHaveBeenCalled()
+  })
+
+  it('区头按钮：本区没有选中时是 Stage All，暂存整区', async () => {
+    const { onStage } = mountTree({ unstaged: [ch('a.txt'), ch('src/b.ts')], staged: [ch('s.txt')] })
+    fireEvent.click(screen.getByRole('button', { name: 'Stage All' }))
+    await waitFor(() => expect(onStage).toHaveBeenCalledTimes(1))
+    expect([...onStage.mock.calls[0][0]].sort()).toEqual(['a.txt', 'src/b.ts'])
+  })
+
+  it('区头按钮：本区有选中时变成 Stage Selected，只暂存选中的；另一个区仍是 All', async () => {
+    const { onStage } = mountTree({ unstaged: [ch('a.txt'), ch('b.txt'), ch('c.txt')], staged: [ch('s.txt')] })
+    fireEvent.click(fileRow('a.txt'))
+    fireEvent.click(fileRow('c.txt'), { ctrlKey: true })
+    expect(screen.queryByRole('button', { name: 'Stage All' })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Unstage All' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Stage Selected' }))
+    await waitFor(() => expect(onStage).toHaveBeenCalledWith(['a.txt', 'c.txt']))
+  })
+
+  it('点目录行收起，里面的文件不再显示；再点展开', () => {
+    mountTree({ unstaged: [ch('src/a.ts'), ch('b.txt')], staged: [] })
+    fireEvent.click(dirRow('src'))
+    expect(screen.queryByText('a.ts')).toBeNull()
+    expect(screen.getByText('b.txt')).toBeTruthy()
+    fireEvent.click(dirRow('src'))
+    expect(screen.getByText('a.ts')).toBeTruthy()
+  })
+
+  it('Shift 选一段按树里看到的顺序，跳过收起目录里的文件', async () => {
+    const { onStage } = mountTree({
+      unstaged: [ch('b.txt'), ch('src/x.ts'), ch('a.txt'), ch('lib/y.ts')],
+      staged: [],
+    })
+    // 树：lib/ y.ts、src/ x.ts、a.txt、b.txt；收起 src 之后看得见的是 y.ts、a.txt、b.txt
+    fireEvent.click(dirRow('src'))
+    fireEvent.click(fileRow('y.ts'))
+    fireEvent.click(fileRow('a.txt'), { shiftKey: true })
+    fireEvent.click(screen.getByRole('button', { name: 'Stage Selected' }))
+    await waitFor(() => expect(onStage).toHaveBeenCalledWith(['lib/y.ts', 'a.txt']))
+  })
+
+  // 选中只含看得见的文件：否则区头「Stage Selected」、Delete 丢弃都会打到看不见的文件上
+  it('收起目录时，目录里选中的文件退出选中', async () => {
+    const { onStage } = mountTree({ unstaged: [ch('src/a.ts'), ch('src/b.ts'), ch('c.txt')], staged: [] })
+    fireEvent.click(fileRow('a.ts'))
+    fireEvent.click(fileRow('c.txt'), { shiftKey: true })
+    fireEvent.click(dirRow('src'))
+    fireEvent.click(screen.getByRole('button', { name: 'Stage Selected' }))
+    await waitFor(() => expect(onStage).toHaveBeenCalledWith(['c.txt']))
+  })
+
+  it('收起了全部选中文件所在的目录：区头回到 Stage All', () => {
+    mountTree({ unstaged: [ch('src/a.ts'), ch('c.txt')], staged: [] })
+    fireEvent.click(fileRow('a.ts'))
+    fireEvent.click(dirRow('src'))
+    expect(screen.getByRole('button', { name: 'Stage All' })).toBeTruthy()
+  })
+
+  it('Ctrl+A 只选看得见的文件，跳过收起的目录', async () => {
+    const { onStage } = mountTree({ unstaged: [ch('vendor/x.ts'), ch('a.txt'), ch('b.txt')], staged: [] })
+    fireEvent.click(dirRow('vendor'))
+    fireEvent.keyDown(listOf('a.txt'), { key: 'a', ctrlKey: true })
+    fireEvent.click(screen.getByRole('button', { name: 'Stage Selected' }))
+    await waitFor(() => expect(onStage).toHaveBeenCalledWith(['a.txt', 'b.txt']))
+  })
+
+  it('收起的目录整个离开列表、之后又出现：重新出现时是展开的', () => {
+    const view = (unstaged: FileChange[]) => (
+      <LocalChangesView
+        status={{ unstaged, staged: [] }}
+        diff={{ files: [] }}
+        onStage={vi.fn()}
+        onUnstage={vi.fn()}
+        onDiscard={vi.fn()}
+        onCommit={vi.fn()}
+        svnMode={false}
+        onBaselineBranch={false}
+      />
+    )
+    const { rerender } = render(view([ch('src/a.ts'), ch('b.txt')]))
+    fireEvent.click(dirRow('src'))
+    rerender(view([ch('b.txt')]))
+    rerender(view([ch('src/x.ts'), ch('b.txt')]))
+    expect(screen.getByText('x.ts')).toBeTruthy()
+  })
+
+  it('按着 Ctrl / Shift 双击不暂存：那是在多选', () => {
+    const { onStage } = mountTree({ unstaged: [ch('a.txt'), ch('b.txt')], staged: [] })
+    fireEvent.doubleClick(fileRow('a.txt'), { ctrlKey: true })
+    fireEvent.doubleClick(fileRow('b.txt'), { shiftKey: true })
+    expect(onStage).not.toHaveBeenCalled()
+  })
+
+  it('有冲突时：冲突文件所在的目录排在最前面，什么都没选时右侧显示的就是它', () => {
+    mountTree({ unstaged: [ch('a/plain.ts'), ch('z/c.ts', 'conflicted')], staged: [] })
+    expect(dirNames(section('Unstaged'))).toEqual(['z', 'a'])
+    // 右侧是冲突说明而不是 a/plain.ts 的 diff
+    expect(document.querySelector('.conflict-pane')).not.toBeNull()
   })
 })

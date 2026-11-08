@@ -3,6 +3,7 @@ import {
   activeChange,
   changesDiffScope,
   changesPaths,
+  changesTree,
   isChangesFileScope,
   nextFileSelection,
   rangeSelection,
@@ -217,6 +218,27 @@ describe('changesPaths', () => {
     const ch = (path: string, status = 'modified'): FileChange => ({ path, status, additions: 0, deletions: 0 })
     expect(changesPaths({ unstaged: [ch('plain'), ch('c', 'conflicted')], staged: [ch('s')] }))
       .toEqual({ unstaged: ['c', 'plain'], staged: ['s'] })
+  })
+
+  it('两个区都按树形显示的顺序：同层目录在文件前面，同类按名字排', () => {
+    const ch = (path: string): FileChange => ({ path, status: 'modified', additions: 0, deletions: 0 })
+    expect(changesPaths({
+      unstaged: [ch('z.txt'), ch('src/b.ts'), ch('a.txt'), ch('src/a.ts')],
+      staged: [ch('b.txt'), ch('lib/x.ts')],
+    })).toEqual({ unstaged: ['src/a.ts', 'src/b.ts', 'a.txt', 'z.txt'], staged: ['lib/x.ts', 'b.txt'] })
+  })
+
+  // 建树会把反斜杠统一成正斜杠；交给 stage / discard / 冲突查找的必须是 git 报上来的原样路径
+  it('路径里带反斜杠时，给出的仍是状态里的原样路径', () => {
+    const ch = (path: string): FileChange => ({ path, status: 'modified', additions: 0, deletions: 0 })
+    expect(changesPaths({ unstaged: [ch('src\\a.ts'), ch('b.txt')], staged: [] }).unstaged)
+      .toEqual(['src\\a.ts', 'b.txt'])
+  })
+
+  it('同一份列表只建一次树：两次调用拿到同一个结果', () => {
+    const ch = (path: string): FileChange => ({ path, status: 'modified', additions: 0, deletions: 0 })
+    const files = [ch('src/a.ts'), ch('b.txt')]
+    expect(changesTree(files)).toBe(changesTree(files))
   })
 })
 

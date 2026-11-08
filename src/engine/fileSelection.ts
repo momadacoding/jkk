@@ -1,5 +1,5 @@
-import { conflictsFirst } from './conflicts'
-import type { StatusData } from './types'
+import { buildFileTree, treeFilePaths, type TreeNode } from './fileTree'
+import type { FileChange, StatusData } from './types'
 
 /** 文件列表的两个区。两边的操作语义不同，选中不能跨区。 */
 export type FileSection = 'unstaged' | 'staged'
@@ -165,14 +165,49 @@ export function activeChange(
 }
 
 /**
- * 两个列表在界面上的顺序（Unstaged 里冲突文件排最前）。`RepoTab` 算该读哪个区、
- * `LocalChangesView` 算显示哪一项，都用这一份，默认项才不会两边算得不一样。
+ * 两个列表在界面上的顺序：按目录树显示的顺序（目录在前、同类按名字，含冲突的排最前，
+ * 见 `buildFileTree`）。`RepoTab` 算该读哪个区、`LocalChangesView` 算显示哪一项，
+ * 都用这一份，默认项才不会两边算得不一样。
+ *
+ * 这里是**全部**文件、不管目录收没收起：收起只是 `LocalChangesView` 里的显示状态，
+ * Ctrl+A、对齐选中、默认项都不该随它变。
  */
 export function changesPaths(status: StatusData): { unstaged: string[], staged: string[] } {
   return {
-    unstaged: conflictsFirst(status.unstaged).map((f) => f.path),
-    staged: status.staged.map((f) => f.path),
+    unstaged: treeFilePaths(changesTree(status.unstaged)),
+    staged: treeFilePaths(changesTree(status.staged)),
   }
+}
+
+/**
+ * 按列表对象缓存的树。一次状态刷新里 RepoTab 对齐选中、算 diff scope，
+ * LocalChangesView 算默认项、画两个区，都要这棵树；改动可能上万条，不能每处各建一遍。
+ * 状态对象是整份替换的，同一个数组引用内容不会变，按引用缓存是安全的。
+ */
+const treeCache = new WeakMap<FileChange[], TreeNode[]>()
+
+/**
+ * 本地改动一个区的目录树。`changesPaths` 和 `LocalChangesView` 画树共用这一棵，
+ * 显示顺序与选中、默认项用的顺序才不会分叉。
+ *
+ * 文件节点的 `path` 换回状态里的原样路径：`buildFileTree` 会把反斜杠统一成正斜杠，
+ * 而选中、stage / discard、冲突查找都要拿 git 报上来的那个写法去对。
+ * 返回的树是共享的，调用方不要改它。
+ */
+export function changesTree(files: FileChange[]): TreeNode[] {
+  const cached = treeCache.get(files)
+  if (cached) return cached
+  const original = new Map(files.map((f) => [f.path.replace(/\\/g, '/'), f.path]))
+  const tree = buildFileTree(files.map((f) => ({ path: f.path, status: f.status })))
+  const restore = (nodes: TreeNode[]) => {
+    for (const node of nodes) {
+      if (node.kind === 'dir') restore(node.children)
+      else node.path = original.get(node.path) ?? node.path
+    }
+  }
+  restore(tree)
+  treeCache.set(files, tree)
+  return tree
 }
 
 /**
