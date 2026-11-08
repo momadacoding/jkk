@@ -17,7 +17,7 @@
 //! 结束后再补发一次 `repo-changed`（`commands/svn_sync.rs`）。
 
 use crate::engine::file_lock::{describe, find_blockers};
-use crate::engine::git_cli::{run_git, run_git_code, run_git_env, run_git_stdin};
+use crate::engine::git_cli::{run_git, run_git_code, run_git_env, run_git_paths, run_git_stdin};
 use crate::engine::svn_baseline::{
     create_baseline_commit, git_dir, move_baseline_ref, read_baseline, refresh_index_stat,
     swap_index_to_tree, TempIndex,
@@ -1376,10 +1376,9 @@ pub(crate) fn settle_residue(
         ));
     }
     if !stale.is_empty() {
-        // 非空才调：空 pathspec 会变成「全部」（§12.2）
-        let mut args: Vec<&str> = vec!["checkout", "HEAD", "--"];
-        args.extend(stale.iter().map(String::as_str));
-        run_git(repo, &args)?;
+        // 非空才调：空 pathspec 会变成「全部」（§12.2）。路径走 stdin：大工作副本上
+        // 几百个文件拼进命令行会撞上 Windows 的长度上限（`git_cli::run_git_paths`）
+        run_git_paths(repo, &["checkout", "HEAD"], &stale)?;
     }
     for p in &left {
         // 删不掉（仍被占着）不在这里报：下面的复核会指名它
