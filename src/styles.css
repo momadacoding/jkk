@@ -1735,10 +1735,13 @@ body {
   color: #666;
 }
 
+/* 行高 24px 对齐 Fork：只靠文字撑开时约 20px，鼠标稍偏一点就点到上下行或拖选成两行 */
 .changes-file {
   display: flex;
   align-items: center;
   gap: 4px;
+  box-sizing: border-box;
+  min-height: 24px;
   padding: 2px 4px 2px 6px;
   cursor: pointer;
   position: relative;
@@ -1746,11 +1749,22 @@ body {
 }
 
 .changes-file:hover {
-  background: rgba(255, 255, 255, 0.055);
+  background: rgba(255, 255, 255, 0.07);
 }
 
+/* 选中用实色而不是全局的 --selected-bg（白 10%）：深底上那层灰几乎看不出来，
+   点完分不清点中没有 */
 .changes-file.selected {
-  background: var(--selected-bg);
+  background: #3a6ea5;
+  color: #fff;
+}
+
+.changes-file.selected .ft-icon {
+  color: #dfe6ee;
+}
+
+.changes-file.selected .changes-file-stats {
+  color: #c8d6e8;
 }
 
 /* 多选时 diff 面板只显示其中一个文件，左边一道亮条标出是哪个——
@@ -1763,6 +1777,11 @@ body {
   bottom: 2px;
   width: 2px;
   background: #4fc3f7;
+}
+
+/* 青色叠在选中的蓝底上看不清；什么都没选时 active 落在第一个文件上、没有蓝底，仍用青色 */
+.changes-file.selected.active::before {
+  background: #fff;
 }
 
 .changes-selcount {
@@ -1798,6 +1817,8 @@ body {
   display: flex;
   align-items: center;
   gap: 4px;
+  box-sizing: border-box;
+  min-height: 24px;
   padding: 2px 4px 2px 6px;
   cursor: pointer;
   user-select: none;
@@ -1805,7 +1826,7 @@ body {
 }
 
 .changes-dir:hover {
-  background: rgba(255, 255, 255, 0.055);
+  background: rgba(255, 255, 255, 0.07);
 }
 
 .changes-dir-name {
