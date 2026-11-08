@@ -226,6 +226,128 @@ fn history_and_blame_around_a_conflict_resolving_merge() {
     assert_eq!(b.commits[&merge].summary, "merge side");
 }
 
+/// `git log --follow` 整个遍历只有一份「当前路径」：多个起点时，一条分支上跨过改名之后，
+/// 别的分支上的提交也按旧名去匹配（/code-review 第 4 条）。
+///
+/// base 建 f.txt；side 上把它改名成 g.txt（S1）再改 g.txt（S2）；main 上在 base 与 S1 之间改了 f.txt（M1）。
+/// 从 HEAD(main) + S2 打开 g.txt 的历史：M1 从来不在 g.txt 的历史里。
+#[test]
+fn history_from_two_starts_keeps_each_branchs_rename_to_itself() {
+    let dir = init();
+    let d = dir.path();
+    let at = |date: &str, args: &[&str]| {
+        let ok = Command::new("git")
+            .current_dir(d)
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    fs::write(d.join("f.txt"), "1\n2\n3\n").unwrap();
+    git(d, &["add", "."]);
+    at("2026-01-01T00:00:00+00:00", &["commit", "-qm", "base"]);
+    git(d, &["checkout", "-q", "-b", "side"]);
+    git(d, &["mv", "f.txt", "g.txt"]);
+    at("2026-01-03T00:00:00+00:00", &["commit", "-qm", "S1 rename"]);
+    fs::write(d.join("g.txt"), "1\n2\n3\n4\n").unwrap();
+    at(
+        "2026-01-04T00:00:00+00:00",
+        &["commit", "-qam", "S2 edit g"],
+    );
+    let s2 = rev(d, "HEAD");
+    git(d, &["checkout", "-q", "main"]);
+    fs::write(d.join("f.txt"), "1\nmain\n3\n").unwrap();
+    at(
+        "2026-01-02T00:00:00+00:00",
+        &["commit", "-qam", "M1 edit f on main"],
+    );
+
+    let h = file_history::file_history(&p(&dir), "g.txt", &["HEAD".to_string(), s2]).unwrap();
+    let subjects: Vec<&str> = h.entries.iter().map(|e| e.subject.as_str()).collect();
+    assert_eq!(subjects, ["S2 edit g", "S1 rename", "base"]);
+}
+
+/// `diff.renames=false` 时 libgit2 的 `find_similar(None)` 按配置不做改名检测，
+/// 历史里那条 `renamed`（git log 带了 -M）的 diff 就成了整份新增（/code-review 第 2 条）。
+#[test]
+fn file_diff_pairs_a_rename_even_when_diff_renames_is_off() {
+    let dir = renamed_repo();
+    git(dir.path(), &["config", "diff.renames", "false"]);
+    let h = file_history::file_history(&p(&dir), RENAMED, &head()).unwrap();
+    let rename = h.entries.iter().find(|e| e.subject == "rename").unwrap();
+    assert_eq!(rename.status, "renamed", "git log 加了 -M，历史里仍是改名");
+    let data = file_history::commit_file_diff(
+        &p(&dir),
+        &rename.id,
+        &rename.path,
+        rename.old_path.as_deref(),
+    )
+    .unwrap();
+    assert_eq!(data.files.len(), 1);
+    assert_eq!(data.files[0].status, "renamed");
+    assert_eq!(data.files[0].old_path.as_deref(), Some("a.txt"));
+}
+
+/// `git rm --cached` 之后：暂存区里是删除、工作区里是未跟踪，但 HEAD 里有它，工作区 Blame 照样能做
+/// （/code-review 第 1 条的反例：前端原来把它当新文件置灰）。
+#[test]
+fn blame_of_the_workdir_works_after_rm_cached() {
+    let dir = renamed_repo();
+    git(dir.path(), &["rm", "-q", "--cached", RENAMED]);
+    let b = file_history::blame_file(&p(&dir), RENAMED, None).unwrap();
+    assert_eq!(b.lines.len(), 4);
+    assert_eq!(b.lines[0].commit, rev(dir.path(), "HEAD~4"));
+}
+
+/// 二进制判定两侧同一个口径（前 8000 字节里有 NUL）。很多控制字符、没有 NUL 的文本，
+/// libgit2 的 `is_binary` 会判成二进制，`git blame` 照常按行处理（/code-review 第 6 条）。
+#[test]
+fn blame_binary_check_is_the_same_for_a_commit_and_the_workdir() {
+    let dir = init();
+    let d = dir.path();
+    let body: String = (0..200)
+        .map(|i| format!("{i}\x01\x02\x03\x04\x05\x06\n"))
+        .collect();
+    fs::write(d.join("ctl.txt"), &body).unwrap();
+    git(d, &["add", "."]);
+    git(d, &["commit", "-qm", "ctl"]);
+    let at_head = file_history::blame_file(&p(&dir), "ctl.txt", Some("HEAD")).unwrap();
+    let workdir = file_history::blame_file(&p(&dir), "ctl.txt", None).unwrap();
+    assert_eq!(at_head.binary, workdir.binary);
+    assert!(!at_head.binary);
+    assert_eq!(at_head.lines.len(), 200);
+}
+
+/// 上限用 `-L` 交给 git，少算的那部分不用算；恰好等于上限、比上限少的文件 `-L` 不能越界报错。
+#[test]
+fn blame_limit_boundaries() {
+    let dir = init();
+    let d = dir.path();
+    fs::write(d.join("four.txt"), "1\n2\n3\n4\n").unwrap();
+    fs::write(d.join("no-eol.txt"), "1\n2\n3\n4\n5").unwrap();
+    git(d, &["add", "."]);
+    git(d, &["commit", "-qm", "files"]);
+    for rev in [Some("HEAD"), None] {
+        let exact = file_history::blame_file_limited(&p(&dir), "four.txt", rev, 4).unwrap();
+        assert_eq!(
+            (exact.lines.len(), exact.truncated, exact.total_lines),
+            (4, false, 4)
+        );
+        let more = file_history::blame_file_limited(&p(&dir), "four.txt", rev, 10).unwrap();
+        assert_eq!((more.lines.len(), more.truncated), (4, false));
+        // 最后一行没有换行也算一行
+        let cut = file_history::blame_file_limited(&p(&dir), "no-eol.txt", rev, 3).unwrap();
+        assert_eq!(
+            (cut.lines.len(), cut.truncated, cut.total_lines),
+            (3, true, 5)
+        );
+        assert_eq!(cut.lines[2].content, "3");
+    }
+}
+
 #[test]
 fn history_rejects_empty_file_and_option_like_revs() {
     let dir = renamed_repo();

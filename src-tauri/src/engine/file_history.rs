@@ -126,6 +126,13 @@ pub fn file_history(repo: &str, file: &str, revs: &[String]) -> Result<FileHisto
 }
 
 /// 同 [`file_history`]，上限可调（测试用）。
+///
+/// # 每个起点单独走一遍
+///
+/// `git log --follow` 整个遍历只有一份「当前路径」：多个起点放进同一条命令时，一条分支上跨过改名之后，
+/// 别的分支上的提交也按旧名去匹配，混进根本不在这个文件历史里的提交（/code-review 第 4 条，
+/// `history_from_two_starts_keeps_each_branchs_rename_to_itself` 实测）。所以每个起点各跑一次，
+/// 按提交时间从新到旧合并、按 id 去重（先出现的起点优先）。
 pub fn file_history_limited(
     repo: &str,
     file: &str,
@@ -139,9 +146,47 @@ pub fn file_history_limited(
     for r in revs {
         check_rev(r)?;
     }
-    // 多要一条，才分得清「恰好这么多」与「被截断了」
+    let mut starts: Vec<&str> = Vec::new();
+    for r in revs {
+        if !starts.contains(&r.as_str()) {
+            starts.push(r);
+        }
+    }
+    let several = starts.len() > 1;
+    let mut merged: Vec<(i64, FileHistoryEntry)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut truncated = false;
+    for start in starts {
+        let mut one = follow_one(repo, file, start, limit)?;
+        truncated |= one.len() > limit;
+        one.truncate(limit);
+        for item in one {
+            if seen.insert(item.1.id.clone()) {
+                merged.push(item);
+            }
+        }
+    }
+    // 只有一个起点时保持 git 自己的顺序；多个起点按提交时间合并。
+    // 稳定排序：同一时间的提交保持各自起点里的先后
+    if several {
+        merged.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
+    }
+    truncated |= merged.len() > limit;
+    let mut entries: Vec<FileHistoryEntry> = merged.into_iter().map(|(_, e)| e).collect();
+    entries.truncate(limit);
+    Ok(FileHistory { entries, truncated })
+}
+
+/// 从一个起点跑 `git log --follow`。返回（提交时间, 条目），最多 `limit + 1` 条——多要一条，
+/// 才分得清「恰好这么多」与「被截断了」。
+fn follow_one(
+    repo: &str,
+    file: &str,
+    start: &str,
+    limit: usize,
+) -> Result<Vec<(i64, FileHistoryEntry)>> {
     let max = format!("--max-count={}", limit + 1);
-    let mut args: Vec<&str> = vec![
+    let args: Vec<&str> = vec![
         // 路径按字面量匹配：`a[1].txt` 不能当通配符匹配到 `a1.txt`，`:` 开头不能当 pathspec magic
         // （与 `commit_file_diff` 的 `disable_pathspec_match` 同一口径，独立 review 第 3 条）
         "--literal-pathspecs",
@@ -151,19 +196,17 @@ pub fn file_history_limited(
         "-M",
         "-z",
         "--no-color",
-        // 记录之间用 \x1e，头里的字段之间用 \x1f：标题里可能有 tab、引号、竖线
-        "--format=%x1e%H%x1f%P%x1f%an%x1f%at%x1f%s",
+        // 记录之间用 \x1e，头里的字段之间用 \x1f：标题里可能有 tab、引号、竖线。
+        // %ct（提交时间）只用来合并多个起点的结果，不往前端送
+        "--format=%x1e%H%x1f%P%x1f%an%x1f%at%x1f%ct%x1f%s",
         "--name-status",
         &max,
+        start,
+        "--",
+        file,
     ];
-    args.extend(revs.iter().map(String::as_str));
-    args.push("--");
-    args.push(file);
     let out = run_git_bytes(repo, &args)?;
-    let mut entries = parse_log(&out, file);
-    let truncated = entries.len() > limit;
-    entries.truncate(limit);
-    Ok(FileHistory { entries, truncated })
+    Ok(parse_log(&out, file))
 }
 
 /// 解析 `git log -z --format=<上面那个> --name-status` 的输出。
@@ -173,14 +216,16 @@ pub fn file_history_limited(
 ///
 /// `current` 从新到旧往下传，改名那一条之后换成旧路径。万一出现只有头、没有 name-status 的记录
 /// （防御，真实 git 目前不给），它沿用上一条（更新的那一条）追到的路径。
-fn parse_log(out: &[u8], file: &str) -> Vec<FileHistoryEntry> {
+fn parse_log(out: &[u8], file: &str) -> Vec<(i64, FileHistoryEntry)> {
     let text = String::from_utf8_lossy(out);
     let mut current = file.to_string();
     let mut entries = Vec::new();
     for record in text.split('\x1e').filter(|r| !r.is_empty()) {
         let (head, rest) = record.split_once('\0').unwrap_or((record, ""));
-        let mut fields = head.split('\x1f');
-        let (Some(id), Some(parents), Some(author), Some(time), Some(subject)) = (
+        // 标题在最后，最多切 6 段：标题里万一有 \x1f 也原样留在标题里
+        let mut fields = head.splitn(6, '\x1f');
+        let (Some(id), Some(parents), Some(author), Some(time), Some(ctime), Some(subject)) = (
+            fields.next(),
             fields.next(),
             fields.next(),
             fields.next(),
@@ -214,7 +259,7 @@ fn parse_log(out: &[u8], file: &str) -> Vec<FileHistoryEntry> {
                 current = p.to_string();
             }
         }
-        entries.push(FileHistoryEntry {
+        let entry = FileHistoryEntry {
             id: id.to_string(),
             parents: parents
                 .split(' ')
@@ -227,7 +272,8 @@ fn parse_log(out: &[u8], file: &str) -> Vec<FileHistoryEntry> {
             path,
             old_path,
             status: status.to_string(),
-        });
+        };
+        entries.push((ctime.parse().unwrap_or(0), entry));
     }
     entries
 }
@@ -248,8 +294,9 @@ pub fn blame_file_limited(
     if let Some(r) = rev {
         check_rev(r)?;
     }
+    let probe = probe(repo, file, rev)?;
     // 二进制先挡掉：git blame 会把它按行切开照样输出，大文件还要算很久
-    if is_binary(repo, file, rev)? {
+    if probe.as_ref().is_some_and(|p| p.binary) {
         return Ok(BlameData {
             lines: Vec::new(),
             commits: HashMap::new(),
@@ -258,16 +305,34 @@ pub fn blame_file_limited(
             total_lines: 0,
         });
     }
-    // quotePath 关掉，`filename` / `previous` 里的中文路径才不会被转成八进制；
-    // 引号、控制字符仍会被 C 风格转义，`unquote` 负责还原
-    let mut args = vec!["-c", "core.quotePath=false", "blame", "--porcelain"];
-    if let Some(r) = rev {
-        args.push(r);
-    }
-    args.push("--");
-    args.push(file);
-    let out = run_git_bytes(repo, &args)?;
-    let data = parse_porcelain(&out, limit);
+    // 超过上限时用 `-L` 让 git 只算前面那些行：只在送出去之前截断的话，几十万行的生成文件 git 照样
+    // 全算一遍（/code-review 第 5 条）。`-L` 越过文件末尾会报错，所以只在确实更长时才加
+    let total = probe.map(|p| p.lines);
+    let range = total
+        .filter(|n| *n > limit && limit > 0)
+        .map(|_| format!("1,{limit}"));
+    let run = |range: Option<&str>| {
+        // quotePath 关掉，`filename` / `previous` 里的中文路径才不会被转成八进制；
+        // 引号、控制字符仍会被 C 风格转义，`unquote` 负责还原
+        let mut args = vec!["-c", "core.quotePath=false", "blame", "--porcelain"];
+        if let Some(r) = range {
+            args.push("-L");
+            args.push(r);
+        }
+        if let Some(r) = rev {
+            args.push(r);
+        }
+        args.push("--");
+        args.push(file);
+        run_git_bytes(repo, &args)
+    };
+    // 工作区的行数是按磁盘上的字节数的；有 clean 过滤器（如 LFS）时 git blame 看到的内容可能更短，
+    // `-L` 越界报错——那就不限范围重跑一次，退回「全算、送前截断」
+    let out = match range.as_deref() {
+        Some(r) => run(Some(r)).or_else(|_| run(None))?,
+        None => run(None)?,
+    };
+    let mut data = parse_porcelain(&out, limit);
     // 有输出却一行都没认出来：格式变了，报出来，不要显示成「空文件」
     if data.total_lines == 0 && out.iter().any(|b| !b.is_ascii_whitespace()) {
         return Err(GitError::new(
@@ -275,39 +340,59 @@ pub fn blame_file_limited(
             "认不出 git blame 的输出格式".to_string(),
         ));
     }
+    // 用了 `-L` 时 git 只输出前 `limit` 行，总行数以事先数的为准
+    if let Some(n) = total.filter(|n| *n > data.total_lines) {
+        data.total_lines = n;
+        data.truncated = true;
+    }
     Ok(data)
 }
 
-/// 用 git 的判据（前 8000 字节里有 NUL）判断是不是二进制。读不到就交给 `git blame` 去报错。
-fn is_binary(repo: &str, file: &str, rev: Option<&str>) -> Result<bool> {
-    const PROBE: usize = 8000;
+/// blame 之前读一眼文件：是不是二进制、有几行。
+struct Probe {
+    binary: bool,
+    lines: usize,
+}
+
+/// 二进制的判据两侧一致，都是 git 自己的（前 8000 字节里有 NUL，`buffer_is_binary`）。
+/// 不用 libgit2 的 `Blob::is_binary`：它还按不可打印字符的比例判，控制字符多的文本会被它判成二进制，
+/// 而 `git blame` 照常按行处理，工作区与提交里的同一份内容就会一边能 blame 一边不能（/code-review 第 6 条）。
+/// 不读 `.gitattributes`：`git blame` 本身也不因 `binary` / `-diff` 属性拒绝。
+///
+/// 读不到（路径不存在、rev 解析不了）时返回 None，交给 `git blame` 去报真正的错误。
+fn probe(repo: &str, file: &str, rev: Option<&str>) -> Result<Option<Probe>> {
+    const SNIFF: usize = 8000;
+    let measure = |bytes: &[u8]| Probe {
+        binary: bytes[..bytes.len().min(SNIFF)].contains(&0),
+        // 与 git 一致：最后一行没有换行也算一行
+        lines: bytecount_newlines(bytes) + usize::from(bytes.last().is_some_and(|b| *b != b'\n')),
+    };
     match rev {
         Some(r) => {
             let repo = Repository::open(repo)?;
             let Ok(obj) = repo.revparse_single(r) else {
-                return Ok(false);
+                return Ok(None);
             };
             let Ok(entry) = obj
                 .peel_to_tree()
                 .and_then(|t| t.get_path(std::path::Path::new(file)))
             else {
-                return Ok(false);
+                return Ok(None);
             };
             let Ok(blob) = entry.to_object(&repo).and_then(|o| o.peel_to_blob()) else {
-                return Ok(false);
+                return Ok(None);
             };
-            Ok(blob.is_binary())
+            Ok(Some(measure(blob.content())))
         }
-        None => {
-            use std::io::Read;
-            let Ok(f) = std::fs::File::open(std::path::Path::new(repo).join(file)) else {
-                return Ok(false);
-            };
-            let mut head = Vec::with_capacity(PROBE);
-            f.take(PROBE as u64).read_to_end(&mut head)?;
-            Ok(head.contains(&0))
-        }
+        None => match std::fs::read(std::path::Path::new(repo).join(file)) {
+            Ok(bytes) => Ok(Some(measure(&bytes))),
+            Err(_) => Ok(None),
+        },
     }
+}
+
+fn bytecount_newlines(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|b| **b == b'\n').count()
 }
 
 /// 解析 porcelain 输出（2026-11-08 fixture 实测）：
@@ -489,7 +574,9 @@ pub fn commit_file_diff(
     // 字面量匹配：`f[1].txt` 不能当成模式去匹配 `f1.txt`
     opts.disable_pathspec_match(true);
     let mut diff = r.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))?;
-    diff.find_similar(None)?;
+    // 显式打开改名检测：`find_similar(None)` 按 `diff.renames` 配置走，用户关掉时改名会摊成整份新增，
+    // 而历史列表那边 `git log -M` 照样把它列成改名（/code-review 第 2 条，fixture 实测）
+    diff.find_similar(Some(git2::DiffFindOptions::new().renames(true)))?;
     crate::engine::diff::diff_to_data_only(diff, Some(file))
 }
 
@@ -507,10 +594,15 @@ mod tests {
     #[test]
     fn parse_log_tolerates_a_record_without_name_status() {
         // 防御用例，不是真实形态：`--follow` 下 git 不输出这种只有头的记录（真实形态见 tests/file_history.rs 的合并用例）。万一出现，路径沿用上一条追到的
-        let out = "\x1eaaa\x1fp1 p2\x1fA\x1f10\x1fmerge\0\
-                   \x1ebbb\x1fp1\x1fA\x1f9\x1frename\0\nR090\0old.txt\0new.txt\0\
-                   \x1eccc\x1f\x1fA\x1f8\x1fadd\0\nA\0old.txt\0";
-        let e = parse_log(out.as_bytes(), "new.txt");
+        let out = "\x1eaaa\x1fp1 p2\x1fA\x1f10\x1f10\x1fmerge\0\
+                   \x1ebbb\x1fp1\x1fA\x1f9\x1f9\x1frename\0\nR090\0old.txt\0new.txt\0\
+                   \x1eccc\x1f\x1fA\x1f8\x1f8\x1fadd\0\nA\0old.txt\0";
+        let parsed = parse_log(out.as_bytes(), "new.txt");
+        assert_eq!(
+            parsed.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+            [10, 9, 8]
+        );
+        let e: Vec<FileHistoryEntry> = parsed.into_iter().map(|(_, e)| e).collect();
         assert_eq!(e.len(), 3);
         assert_eq!(
             (e[0].path.as_str(), e[0].status.as_str()),

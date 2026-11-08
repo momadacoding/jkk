@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Panel, Group, Separator } from 'react-resizable-panels'
 import { PANEL_GROUP_IDS } from '@/engine/layoutMemory'
 import { usePanelLayout } from '@/store/layoutStore'
@@ -30,6 +30,11 @@ interface FileHistoryViewProps {
   target: FileHistoryTarget
   /** HEAD 变了（提交、切分支之后）就重读历史与 Blame。 */
   headHash: string
+  /**
+   * 工作区的版本号：每次工作区状态重读之后换一个新值（RepoTab 传 `state.status` 这个对象）。
+   * 只有 Blame 工作区时用它——编辑器里改了文件、HEAD 没动，Blame 也要跟上。
+   */
+  workdirVersion?: unknown
   /** 回到打开之前的视图。 */
   onClose: () => void
   /** 在提交图中定位这个提交；不在图上时由调用方说明原因。 */
@@ -51,7 +56,7 @@ function formatTime(time: number): string {
  *
  * 换一个文件时由调用方换 `key` 重新挂载，所以这里的状态只管「同一个文件」之内。
  */
-export function FileHistoryView({ repoPath, target, headHash, onClose, onRevealCommit }: FileHistoryViewProps) {
+export function FileHistoryView({ repoPath, target, headHash, workdirVersion = null, onClose, onRevealCommit }: FileHistoryViewProps) {
   const [tab, setTab] = useState<FileHistoryTab>(target.tab)
   const [history, setHistory] = useState<FileHistory | null>(null)
   const [historyError, setHistoryError] = useState<string | null>(null)
@@ -139,6 +144,7 @@ export function FileHistoryView({ repoPath, target, headHash, onClose, onRevealC
           rev={blameRev}
           initial={target.blame}
           headHash={headHash}
+          workdirVersion={workdirVersion}
           entries={entries}
           onBlameRev={setBlameRev}
           onShowEntry={showEntry}
@@ -249,12 +255,13 @@ function EntryDiff({ repoPath, entry, onBlame, onReveal }: {
   )
 }
 
-function BlamePane({ repoPath, rev, initial, headHash, entries, onBlameRev, onShowEntry, onReveal }: {
+function BlamePane({ repoPath, rev, initial, headHash, workdirVersion, entries, onBlameRev, onShowEntry, onReveal }: {
   repoPath: string
   rev: BlameRev
   /** 打开时看的那一版：翻到别的版本之后给一个回去的按钮。 */
   initial: BlameRev
   headHash: string
+  workdirVersion: unknown
   entries: FileHistoryEntry[]
   onBlameRev: (rev: BlameRev) => void
   onShowEntry: (id: string) => void
@@ -263,17 +270,26 @@ function BlamePane({ repoPath, rev, initial, headHash, entries, onBlameRev, onSh
   const [blame, setBlame] = useState<BlameData | null>(null)
   const [error, setError] = useState<string | null>(null)
   const { menu, open, close } = useContextMenu()
+  // 上一次读的是哪一版：换版本时先清空（不能把别的版本当成这一版显示），同一版因工作区变化重读时
+  // 留着旧的直到新的回来，编辑器每存一次都闪一下「正在 Blame…」太吵
+  const shownKey = useRef<string | null>(null)
+  // 看工作区时，工作区一变就重读（/code-review 第 3 条）；看固定版本时与它无关
+  const workdirKey = rev.rev === null ? workdirVersion : null
 
   useEffect(() => {
     let cancelled = false
-    setBlame(null)
+    const key = `${rev.rev ?? ''}\n${rev.path}`
+    if (shownKey.current !== key) {
+      shownKey.current = key
+      setBlame(null)
+    }
     setError(null)
     readBlame(repoPath, rev.path, rev.rev)
       .then((data) => { if (!cancelled) setBlame(data) })
-      .catch((err) => { if (!cancelled) setError(toErrorMessage(err)) })
+      .catch((err) => { if (!cancelled) { setBlame(null); setError(toErrorMessage(err)) } })
     return () => { cancelled = true }
     // 看工作区时 HEAD 变了（刚提交）未提交的行就变成了提交过的；看固定版本时重读一次也无妨
-  }, [repoPath, rev.rev, rev.path, headHash])
+  }, [repoPath, rev.rev, rev.path, headHash, workdirKey])
 
   const blocks = useMemo(() => blameBlocks(blame?.lines ?? []), [blame])
   const heat = useMemo(() => blameHeat(blame?.commits ?? {}), [blame])

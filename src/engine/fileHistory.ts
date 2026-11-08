@@ -3,7 +3,7 @@
  *
  * 数据形状与 `src-tauri/src/engine/file_history.rs` 一一对应；Rust 的 `Option` 到这边是 `null`。
  */
-import type { CommitNode, FileStatus } from './types'
+import type { CommitNode, ConflictInfo, FileStatus, StatusData } from './types'
 import { baselineMap, findDelivered } from './svnGraph'
 
 /** 工作区里还没提交的行，`git blame` 把它归到这个全 0 的 sha 上。 */
@@ -126,24 +126,56 @@ export function historyTargetForCommit(
 }
 
 /**
- * 从 Local Changes 打开：Blame 看工作区，没提交的行单独标出来。
- * 工作区里删掉了的文件没得 blame，看 HEAD 里那一版。
+ * 从 Local Changes 打开。`blameRev` 来自 `workdirHistoryInfo`：null 是 Blame 工作区（没提交的行单独标出来），
+ * `'HEAD'` 是工作区里已经没有这个文件、退回 HEAD 那一版。
  */
 export function historyTargetForWorkdir(
   path: string,
-  status: FileStatus | null,
+  blameRev: string | null,
   tab: FileHistoryTab,
 ): FileHistoryTarget {
-  const blame = { rev: status === 'deleted' ? 'HEAD' : null, path }
-  return { path, revs: ['HEAD'], focus: null, blame, tab }
+  return { path, revs: ['HEAD'], focus: null, blame: { rev: blameRev, path }, tab }
+}
+
+export interface WorkdirHistoryInfo {
+  /** 非空时历史 / Blame 两项置灰，并在标签后写明原因。 */
+  disabledReason: string | null
+  /** Blame 看哪一版：null = 工作区，`'HEAD'` = 工作区里没有这个文件了。 */
+  blameRev: string | null
 }
 
 /**
- * Local Changes 里这个文件能不能看历史 / Blame：新增的文件（含 `git mv` 的新路径，`read_status`
- * 把它列成一删一增）HEAD 里还没有，`git blame` 会报「no such path in HEAD」，历史也是空的。
+ * Local Changes 里右键一个文件：能不能看历史 / Blame，Blame 看哪一版。
+ *
+ * 两个区一起看，不只看右键点的那个区（/code-review 第 1 条）——同一个文件可能两边各有一条：
+ *
+ * - **HEAD 里有没有它**（没有的话 `git blame` 报「no such path in HEAD」，历史也是空的）：
+ *   暂存区里有它就按暂存区那条判（新增 / 改名 / 复制的新路径 = 没有；`git rm --cached` 之后暂存区是删除、
+ *   工作区是未跟踪，HEAD 里照样有）；否则按工作区那条（未跟踪 = 没有）。冲突文件看 `ours`（stage 2，
+ *   恒为 HEAD 那一侧）：`AA` / `DU` 这类 HEAD 里没有；冲突信息还没读到时先放行，blame 失败会如实报错。
+ * - **工作区里有没有它**：工作区那条是删除，或者只有暂存区一条删除（`git rm`），就没有，Blame 退回 HEAD。
  */
-export function workdirHistoryAvailable(status: FileStatus | null): boolean {
-  return status !== 'added'
+export function workdirHistoryInfo(
+  path: string,
+  status: StatusData,
+  conflicts: ConflictInfo[] | null,
+): WorkdirHistoryInfo {
+  const staged = status.staged.find((f) => f.path === path)
+  const unstaged = status.unstaged.find((f) => f.path === path)
+  const notInHead: FileStatus[] = ['added', 'renamed', 'copied']
+  let inHead: boolean
+  if (staged) inHead = !notInHead.includes(staged.status)
+  else if (unstaged?.status === 'conflicted') {
+    const info = conflicts?.find((c) => c.path === path)
+    inHead = info ? info.ours !== null : true
+  } else inHead = unstaged ? unstaged.status !== 'added' : true
+  const inWorktree = unstaged
+    ? unstaged.status !== 'deleted'
+    : staged?.status !== 'deleted'
+  return {
+    disabledReason: inHead ? null : '新文件还没有历史',
+    blameRev: inWorktree ? null : 'HEAD',
+  }
 }
 
 /** 初始选中：focus 在列表里就选它，否则第一条。 */
@@ -198,9 +230,11 @@ export function blameHeat(commits: Record<string, BlameCommit>): Map<string, num
     .sort((a, b) => a - b)
   const ranks = times.length + (hasUncommitted ? 1 : 0)
   const scale = (rank: number) => (ranks <= 1 ? 1 : rank / (ranks - 1))
+  // 名次表建一次：在循环里 indexOf 是「提交数 × 时间数」，几千个提交的 blame 每次加载都要几百万次比较
+  const rankOf = new Map(times.map((t, i) => [t, i]))
   const heat = new Map<string, number>()
   for (const id of ids) {
-    heat.set(id, isUncommitted(id) ? 1 : scale(times.indexOf(commits[id].time)))
+    heat.set(id, isUncommitted(id) ? 1 : scale(rankOf.get(commits[id].time) ?? 0))
   }
   return heat
 }

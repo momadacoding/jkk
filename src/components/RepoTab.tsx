@@ -1181,6 +1181,7 @@ export function RepoTab({
                 repoPath={state.path}
                 target={fileHistory.target}
                 headHash={state.headHash}
+                workdirVersion={state.status}
                 onClose={() => setViewMode(historyReturn)}
                 onRevealCommit={revealFromHistory}
               />

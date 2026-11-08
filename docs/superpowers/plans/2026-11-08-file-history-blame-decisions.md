@@ -63,7 +63,24 @@
 | 7 | 低 | 从旧提交、按旧文件名打开时，HEAD 那一侧追不到改名之后的历史，未记录 | 记在这里；列表上方的说明同第 2 条 |
 | 8 | 低 | blame 头只认 40 位 sha，SHA-256 仓库会静默显示「空文件」 | 认 40 / 64 位；有输出却一行没认出来时报 `blame_unparsed`；前端 `isFullOid` / `isUncommitted` 同步 |
 
+第二轮：用户跑的 `/code-review high`（8 条，未经验证）。逐条先写 fixture / 单测核实，再修：
+
+| # | 结论 | 问题 | 处理 |
+|---|---|---|---|
+| 1 | 成立 | Local Changes 只看右键点的那个区：暂存了修改又在工作区删掉的文件，Blame 工作区报 `Cannot lstat`；AA 冲突 HEAD 里没有却放行；`git rm --cached`（暂存区删除 + 工作区未跟踪）HEAD 里有却被置灰 | 抽成纯函数 `workdirHistoryInfo`：两个区一起判「HEAD 里有没有」「工作区里有没有」，冲突看 `ours`。`blame_of_the_workdir_works_after_rm_cached` 实测 `rm --cached` 后工作区 Blame 可用 |
+| 2 | 成立（fixture 红） | `diff.renames=false` 时 `find_similar(None)` 不做改名检测，改名那一条的 diff 成了整份新增 | 显式 `DiffFindOptions::renames(true)` |
+| 3 | 成立 | Blame 工作区只随 HEAD 重读，编辑器里改了文件不跟 | `workdirVersion`（`state.status` 对象，每次重读换新）只在 Blame 工作区时进依赖；同一版重读时留着旧内容，不闪 |
+| 4 | 成立（fixture 红） | 多个起点放进一条 `git log --follow`：只有一份「当前路径」，一条分支跨过改名后，别的分支按旧名匹配，混进无关提交 | 每个起点单独跑，按提交时间（`%ct`）合并、按 id 去重 |
+| 5 | 成立 | 5000 行上限只是送前截断，git 照样全算 | 事先数行数，超出时 `-L 1,<上限>`；`-L` 越界失败（如 clean 过滤器让 blame 看到的内容更短）就不限范围重跑 |
+| 6 | 成立（fixture 红） | 二进制判定两侧口径不同：提交里用 libgit2 `is_binary`（含不可打印字符比例），工作区只看 NUL | 两侧都用 git 的口径：前 8000 字节有 NUL。`.gitattributes` 不读，与 `git blame` 自身一致（它也不因 `binary` 拒绝），注释写明 |
+| 7 | 成立 | `blameHeat` 循环里 `indexOf`，O(提交数 × 时间数) | 名次表 `Map` 建一次 |
+| 8 | 成立 | 「能不能看历史」的判定写在组件里 | 同第 1 条，下沉到 `src/engine/fileHistory.ts` 并单测 |
+
+- **范围外、未改**：`engine::diff::read_diff` 的 `commit:` / `range:` 同样是 `find_similar(None)`，`diff.renames=false` 时提交详情里的改名也会摊成一删一增。属于既有行为，不在本 PR 范围，另行处理。
+
 - **计划没写的坑**：`tests/svn_write_guard.rs` 要求 `commands/` 下每个命令要么走 `trait Vcs`、要么 `require_capability`、要么进 `NOT_GIT_ONLY` 写明理由。`history.rs` 整个文件按只读放行。
 - **真实窗口才发现的坑**（`pnpm tauri dev`，独立 identifier，CDP 驱动 WebView2，非 headless）：Blame 横向滚动时，短行的提交栏和行号跟着内容滚走，只有最长那一行吸住了。原因是短行只有视口那么宽，sticky 元素在它的包含块里没有可以位移的余地。修法同 `.diff-file`：外面包一层 `width: max-content; min-width: 100%` 的 `.fh-rows`。jsdom 不做布局，组件测试测不到这一点。
 - **真实窗口验证范围**：工作区 Blame（含未提交行）、横向吸附、跨改名历史、旧路径 diff、改名配对、Blame 旧版本 / 之前的版本、在提交图中定位、File Tree 入口、返回、新文件置灰、`oldFile` 参数名（带一条写成 `old_file` 的反例：被忽略、改名退化成新增）、空文件名被后端拒绝。fixture 仓库建在会话 scratch 目录，验完删除；独立 identifier 的配置目录也已删除。
+- **第二轮验证**：`pnpm build` 通过；`pnpm test` 84 / 1441；`cargo fmt --check` / `clippy --all-targets` 干净；`cargo test --no-fail-fast` 89 组结果 1806 通过、1 失败（下一条那个 watch 用例）；真实窗口第一轮 16 项回归全过，另加两项：Blame 工作区时在磁盘上改文件（HEAD 不动），Blame 跟上；暂存了修改又删掉的文件在 Staged 里右键 Blame，看 HEAD 那一版而不是报错。
+- **watch 用例的结论**：`commands::watch::tests::stage_and_unstage_only_touch_the_index` 在本分支和 master（`561f919`，`--target-dir` 放 scratch 目录单独编）上各单独跑 3 次，全部通过；失败的几次都发生在机器上同时有别的重活（并行编译、review agent 跑测试）的时候。它在 1 秒窗口里收文件事件，判断是负载下的时序抖动，与本 PR 无关。下面那条是第一次遇到时的记录。
 - **计划没写的坑**：`commands::watch::tests::stage_and_unstage_only_touch_the_index` 在本机时好时坏（一轮里连续 3 次失败，后来整跑一次通过）（unstage 时看到临时 fixture 的 `.git/hooks` 目录事件，git 2.51.2）。本 PR 没有改 watch / stage / `git_cli`，判断是环境问题；没在 master 上复跑确认（worktree 隔离下跑不了别的检出）。

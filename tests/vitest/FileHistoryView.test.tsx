@@ -85,7 +85,7 @@ describe('FileHistoryView：History', () => {
   })
 
   it('点另一条：用那一条当时的路径读 diff；双击在提交图中定位', async () => {
-    const { onReveal } = mountView(historyTargetForWorkdir('new.txt', 'modified', 'history'))
+    const { onReveal } = mountView(historyTargetForWorkdir('new.txt', null, 'history'))
     fireEvent.click(await screen.findByRole('option', { name: /新增/ }))
     await waitFor(() => expect(store.readCommitFileDiff).toHaveBeenCalledWith('C:/r', A, 'old.txt', null))
     fireEvent.doubleClick(screen.getByRole('option', { name: /新增/ }))
@@ -93,7 +93,7 @@ describe('FileHistoryView：History', () => {
   })
 
   it('「Blame 这一版」：Blame 那个提交里那时的路径', async () => {
-    mountView(historyTargetForWorkdir('new.txt', 'modified', 'history'))
+    mountView(historyTargetForWorkdir('new.txt', null, 'history'))
     fireEvent.click(await screen.findByRole('option', { name: /新增/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Blame 这一版' }))
     await waitFor(() => expect(store.readBlame).toHaveBeenCalledWith('C:/r', 'old.txt', A))
@@ -114,19 +114,19 @@ describe('FileHistoryView：History', () => {
 
   it('没有历史时说明原因，读失败时说读取失败', async () => {
     store.readFileHistory.mockResolvedValueOnce({ entries: [], truncated: false })
-    mountView(historyTargetForWorkdir('x.txt', 'modified', 'history'))
+    mountView(historyTargetForWorkdir('x.txt', null, 'history'))
     expect(await screen.findByText(/没有找到改动过这个文件的提交/)).toBeTruthy()
   })
 
   it('读失败', async () => {
     store.readFileHistory.mockRejectedValueOnce({ code: 'git_cli', message: 'fatal: boom' })
-    mountView(historyTargetForWorkdir('x.txt', 'modified', 'history'))
+    mountView(historyTargetForWorkdir('x.txt', null, 'history'))
     expect(await screen.findByText(/读取文件历史失败/)).toBeTruthy()
   })
 
   it('截断时标签带 +、列表底下说明', async () => {
     store.readFileHistory.mockResolvedValueOnce({ ...history, truncated: true })
-    mountView(historyTargetForWorkdir('new.txt', 'modified', 'history'))
+    mountView(historyTargetForWorkdir('new.txt', null, 'history'))
     expect(await screen.findByText('History (3+)')).toBeTruthy()
     expect(screen.getByText('只列出最近 3 条。')).toBeTruthy()
   })
@@ -134,7 +134,7 @@ describe('FileHistoryView：History', () => {
 
 describe('FileHistoryView：Blame', () => {
   it('从工作区打开：blame 工作区，同一提交连着的行只在块首显示一次，未提交的行单独标', async () => {
-    mountView(historyTargetForWorkdir('new.txt', 'modified', 'blame'))
+    mountView(historyTargetForWorkdir('new.txt', null, 'blame'))
     await waitFor(() => expect(store.readBlame).toHaveBeenCalledWith('C:/r', 'new.txt', null))
     expect(await screen.findByText('two')).toBeTruthy()
     expect(screen.getAllByText('aaaaaaa')).toHaveLength(1)
@@ -143,7 +143,7 @@ describe('FileHistoryView：Blame', () => {
   })
 
   it('点块首：历史里有这个提交就跳到 History 选中它', async () => {
-    mountView(historyTargetForWorkdir('new.txt', 'modified', 'blame'))
+    mountView(historyTargetForWorkdir('new.txt', null, 'blame'))
     fireEvent.click(await screen.findByText('aaaaaaa'))
     await waitFor(() =>
       expect(screen.getByRole('option', { name: /新增/ }).getAttribute('aria-selected')).toBe('true'),
@@ -151,7 +151,7 @@ describe('FileHistoryView：Blame', () => {
   })
 
   it('右键「Blame 这次改动之前的版本」：换到 previous 那一版，并能回到打开时的版本', async () => {
-    mountView(historyTargetForWorkdir('new.txt', 'modified', 'blame'))
+    mountView(historyTargetForWorkdir('new.txt', null, 'blame'))
     fireEvent.contextMenu(await screen.findByText('work'))
     fireEvent.click(screen.getByText('Blame 这次改动之前的版本'))
     await waitFor(() => expect(store.readBlame).toHaveBeenCalledWith('C:/r', 'new.txt', C))
@@ -160,7 +160,7 @@ describe('FileHistoryView：Blame', () => {
   })
 
   it('根提交没有 previous：那一项置灰；未提交的行不能定位、不能复制 hash', async () => {
-    mountView(historyTargetForWorkdir('new.txt', 'modified', 'blame'))
+    mountView(historyTargetForWorkdir('new.txt', null, 'blame'))
     fireEvent.contextMenu(await screen.findByText('one'))
     expect((screen.getByText('Blame 这次改动之前的版本') as HTMLButtonElement).disabled).toBe(true)
     fireEvent.keyDown(window, { key: 'Escape' })
@@ -169,15 +169,45 @@ describe('FileHistoryView：Blame', () => {
     expect((screen.getByText('复制提交 hash') as HTMLButtonElement).disabled).toBe(true)
   })
 
+  it('Blame 工作区：工作区一变就重读，期间留着旧内容不闪（/code-review 第 3 条）', async () => {
+    const target = historyTargetForWorkdir('new.txt', null, 'blame')
+    const view = (version: object) => (
+      <FileHistoryView repoPath="C:/r" target={target} headHash={C} workdirVersion={version} onClose={vi.fn()} onRevealCommit={vi.fn()} />
+    )
+    const { rerender } = render(view({}))
+    await screen.findByText('work')
+    expect(store.readBlame).toHaveBeenCalledTimes(1)
+    let release: (d: BlameData) => void = () => {}
+    store.readBlame.mockReturnValueOnce(new Promise<BlameData>((r) => { release = r }))
+    rerender(view({}))
+    await waitFor(() => expect(store.readBlame).toHaveBeenCalledTimes(2))
+    expect(screen.getByText('work')).toBeTruthy()
+    expect(screen.queryByText('正在 Blame…')).toBeNull()
+    release({ ...blame, lines: [{ ...blame.lines[2], content: 'edited' }] })
+    expect(await screen.findByText('edited')).toBeTruthy()
+  })
+
+  it('Blame 固定版本：工作区变化不重读', async () => {
+    const target = historyTargetForCommit('new.txt', { id: C }, 'modified', 'blame')
+    const view = (version: object) => (
+      <FileHistoryView repoPath="C:/r" target={target} headHash={C} workdirVersion={version} onClose={vi.fn()} onRevealCommit={vi.fn()} />
+    )
+    const { rerender } = render(view({}))
+    await screen.findByText('work')
+    rerender(view({}))
+    await new Promise((r) => setTimeout(r, 20))
+    expect(store.readBlame).toHaveBeenCalledTimes(1)
+  })
+
   it('二进制文件不按行显示', async () => {
     store.readBlame.mockResolvedValueOnce({ ...blame, binary: true, lines: [], commits: {} })
-    mountView(historyTargetForWorkdir('a.png', 'modified', 'blame'))
+    mountView(historyTargetForWorkdir('a.png', null, 'blame'))
     expect(await screen.findByText('二进制文件，无法按行 Blame')).toBeTruthy()
   })
 
   it('Blame 失败时说明', async () => {
     store.readBlame.mockRejectedValueOnce({ code: 'git_cli', message: "fatal: no such path 'x' in HEAD" })
-    mountView(historyTargetForWorkdir('x', 'modified', 'blame'))
+    mountView(historyTargetForWorkdir('x', null, 'blame'))
     expect(await screen.findByText(/Blame 失败/)).toBeTruthy()
   })
 })
@@ -249,7 +279,28 @@ describe('入口：Local Changes', () => {
     const onOpen = mountChanges()
     fireEvent.contextMenu(screen.getByText('m.txt'))
     fireEvent.click(screen.getByText('Blame'))
-    return waitFor(() => expect(onOpen).toHaveBeenCalledWith(historyTargetForWorkdir('m.txt', 'modified', 'blame')))
+    return waitFor(() => expect(onOpen).toHaveBeenCalledWith(historyTargetForWorkdir('m.txt', null, 'blame')))
+  })
+
+  it('在 Staged 里右键「暂存了修改、工作区又删掉」的文件 → Blame HEAD（/code-review 第 1 条）', () => {
+    const onOpen = vi.fn()
+    render(
+      <LocalChangesView
+        status={{ unstaged: [file('d.txt', 'deleted')], staged: [file('d.txt', 'modified')] }}
+        diff={{ files: [] }}
+        onStage={vi.fn()}
+        onUnstage={vi.fn()}
+        onDiscard={vi.fn()}
+        onCommit={vi.fn()}
+        svnMode={false}
+        onBaselineBranch={false}
+        onOpenFileHistory={onOpen}
+      />,
+    )
+    // 两个区各有一行 d.txt：第二个是 Staged 那一行
+    fireEvent.contextMenu(screen.getAllByText('d.txt')[1])
+    fireEvent.click(screen.getByText('Blame'))
+    return waitFor(() => expect(onOpen).toHaveBeenCalledWith(historyTargetForWorkdir('d.txt', 'HEAD', 'blame')))
   })
 
   it('新文件：两项置灰并说明原因', () => {

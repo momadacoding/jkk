@@ -2,10 +2,10 @@ import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { Panel, Group, Separator } from 'react-resizable-panels'
 import { PANEL_GROUP_IDS } from '@/engine/layoutMemory'
 import { usePanelLayout } from '@/store/layoutStore'
-import type { ConflictInfo, DiffData, FileChange, FileStatus, StatusData } from '../engine/types'
+import type { ConflictInfo, DiffData, FileChange, StatusData } from '../engine/types'
 import {
   historyTargetForWorkdir,
-  workdirHistoryAvailable,
+  workdirHistoryInfo,
   type FileHistoryTarget,
 } from '@/engine/fileHistory'
 import { fileHistoryItems } from './fileHistoryItems'
@@ -389,20 +389,14 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
     }))
   }
 
-  const historyItems = (path: string, fileStatus: FileStatus | null) =>
-    fileHistoryItems(
+  // 能不能看、Blame 看哪一版由两个区一起决定，不看右键点的是哪个区（`workdirHistoryInfo`）
+  const historyItems = (path: string) => {
+    const info = workdirHistoryInfo(path, status, conflicts ?? null)
+    return fileHistoryItems(
       onOpenFileHistory,
-      (tab) => historyTargetForWorkdir(path, fileStatus, tab),
-      workdirHistoryAvailable(fileStatus) ? null : '新文件还没有历史',
+      (tab) => historyTargetForWorkdir(path, info.blameRev, tab),
+      info.disabledReason,
     )
-
-  /**
-   * 判「能不能看历史」用的状态：暂存了新增、又在工作区改过的文件，在 Unstaged 里是 `modified`，
-   * 但 HEAD 里照样没有它（独立 review 第 4 条）。哪个区里是新增都按新增算。
-   */
-  const historyStatus = (path: string, section: FileSection): FileStatus | null => {
-    const isNew = [...status.unstaged, ...status.staged].some((f) => f.path === path && f.status === 'added')
-    return isNew ? 'added' : status[section].find((f) => f.path === path)?.status ?? null
   }
 
   const contextMenu = (section: FileSection, files: string[], path: string, e: React.MouseEvent) => {
@@ -434,7 +428,7 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
         onSelect: () => { void navigator.clipboard.writeText(copied.join('\n')) },
       },
       // 历史 / Blame 同样只看右键点中的那一个文件；文件夹不给
-      ...(isDirRowKey(path) ? [] : historyItems(path, historyStatus(path, section))),
+      ...(isDirRowKey(path) ? [] : historyItems(path)),
       // 外部工具一次只开右键点中的那一个文件，不跟随多选；冲突文件只做 merge，不给对比。
       // 文件夹没有可对比的单个文件，不给
       ...(isDirRowKey(path)

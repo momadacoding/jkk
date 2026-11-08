@@ -10,13 +10,13 @@ import {
   initialEntryId,
   isFullOid,
   previousBlameRev,
-  workdirHistoryAvailable,
+  workdirHistoryInfo,
   graphSelectionFor,
   type BlameCommit,
   type BlameLine,
   type FileHistoryEntry,
 } from '@/engine/fileHistory'
-import type { CommitNode } from '@/engine/types'
+import type { CommitNode, ConflictInfo, FileChange, FileStatus, StatusData } from '@/engine/types'
 
 const OID_A = 'a'.repeat(40)
 const OID_B = 'b'.repeat(40)
@@ -79,24 +79,51 @@ describe('historyTargetForCommit', () => {
 })
 
 describe('historyTargetForWorkdir', () => {
-  it('从 Local Changes 进来：只从 HEAD 走，Blame 看工作区', () => {
-    const t = historyTargetForWorkdir('a.ts', 'modified', 'blame')
+  it('从 Local Changes 进来：只从 HEAD 走，Blame 看给定的那一版', () => {
+    const t = historyTargetForWorkdir('a.ts', null, 'blame')
     expect(t.revs).toEqual(['HEAD'])
     expect(t.focus).toBeNull()
     expect(t.blame).toEqual({ rev: null, path: 'a.ts' })
-  })
-  it('工作区里删掉了：Blame 看 HEAD 里那一版', () => {
-    expect(historyTargetForWorkdir('a.ts', 'deleted', 'blame').blame).toEqual({ rev: 'HEAD', path: 'a.ts' })
+    expect(historyTargetForWorkdir('a.ts', 'HEAD', 'blame').blame).toEqual({ rev: 'HEAD', path: 'a.ts' })
   })
 })
 
-describe('workdirHistoryAvailable', () => {
-  it('新增的文件 HEAD 里还没有，其余都可以', () => {
-    expect(workdirHistoryAvailable('added')).toBe(false)
-    for (const s of ['modified', 'deleted', 'conflicted', 'renamed'] as const) {
-      expect(workdirHistoryAvailable(s)).toBe(true)
-    }
-    expect(workdirHistoryAvailable(null)).toBe(true)
+describe('workdirHistoryInfo：两个区一起看（/code-review 第 1 条）', () => {
+  const f = (path: string, status: FileStatus): FileChange => ({ path, status, additions: 0, deletions: 0 })
+  const st = (unstaged: FileChange[], staged: FileChange[]): StatusData => ({ unstaged, staged })
+  const NEW = '新文件还没有历史'
+
+  it('只在工作区改过：可以，Blame 工作区', () => {
+    expect(workdirHistoryInfo('a', st([f('a', 'modified')], []), null)).toEqual({ disabledReason: null, blameRev: null })
+  })
+
+  it('未跟踪的新文件、暂存了的新增（不管点哪个区）：置灰', () => {
+    expect(workdirHistoryInfo('a', st([f('a', 'added')], []), null).disabledReason).toBe(NEW)
+    expect(workdirHistoryInfo('a', st([f('a', 'modified')], [f('a', 'added')]), null).disabledReason).toBe(NEW)
+  })
+
+  it('暂存了修改、又在工作区删掉：HEAD 里有，工作区里没有 → Blame HEAD', () => {
+    expect(workdirHistoryInfo('a', st([f('a', 'deleted')], [f('a', 'modified')]), null))
+      .toEqual({ disabledReason: null, blameRev: 'HEAD' })
+  })
+
+  it('git rm：只有暂存区一条删除 → Blame HEAD', () => {
+    expect(workdirHistoryInfo('a', st([], [f('a', 'deleted')]), null)).toEqual({ disabledReason: null, blameRev: 'HEAD' })
+  })
+
+  it('git rm --cached：暂存区删除 + 工作区未跟踪，HEAD 里照样有 → 可以，Blame 工作区', () => {
+    expect(workdirHistoryInfo('a', st([f('a', 'added')], [f('a', 'deleted')]), null))
+      .toEqual({ disabledReason: null, blameRev: null })
+  })
+
+  it('冲突：ours（HEAD 那一侧）为空的 AA / DU 置灰；UU 可以；冲突信息还没读到先放行', () => {
+    const stage = { oid: 'x', mode: '100644' } as unknown as NonNullable<ConflictInfo['ours']>
+    const conflict = (code: string, ours: ConflictInfo['ours']) =>
+      ({ path: 'a', code, base: null, ours, theirs: stage, case: 'text', reason: null, driver: null, sameAsHead: false }) as unknown as ConflictInfo
+    const s = st([f('a', 'conflicted')], [])
+    expect(workdirHistoryInfo('a', s, [conflict('AA', null)]).disabledReason).toBe(NEW)
+    expect(workdirHistoryInfo('a', s, [conflict('UU', stage)]).disabledReason).toBeNull()
+    expect(workdirHistoryInfo('a', s, null).disabledReason).toBeNull()
   })
 })
 
