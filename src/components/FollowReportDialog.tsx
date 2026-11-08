@@ -117,13 +117,12 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
   }, [])
 
   return (
-    <div className="dialog-overlay" onMouseDown={finish}>
+    <div className="dialog-overlay">
       <div
         ref={boxRef}
         className="dialog dialog-wide"
         role="dialog"
         aria-label={m.title}
-        onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="dlg-head">
           <span className={`dlg-icon ${m.tone}`}>

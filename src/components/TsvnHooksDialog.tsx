@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   entriesToWrite,
   healthLabel,
@@ -53,19 +53,25 @@ export function TsvnHooksDialog({
   )
   const boxRef = useRef<HTMLDivElement>(null)
   useFocusTrap(boxRef)
+  // 遮罩不关框之后，Esc 是「关闭」按钮之外唯一的快捷出口。挂 window：打开时焦点不在框里。
+  // 执行中也照关，与「关闭」按钮一致（它不随 busy 禁用）
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
   const registered = status.health.state !== 'notRegistered'
   const toWrite = entriesToWrite(status.planned, blockLeaks)
   const conflicts = entriesToWrite(status.conflicts, blockLeaks)
   const blocked = conflicts.length > 0 || status.planned.length === 0
 
   return (
-    <div className="dialog-overlay" onMouseDown={onClose}>
+    <div className="dialog-overlay">
       <div
         ref={boxRef}
         className="dialog dialog-wide"
         role="dialog"
         aria-label="TortoiseSVN 钩子"
-        onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="dialog-title">TortoiseSVN 钩子</div>
         {!status.supported ? (

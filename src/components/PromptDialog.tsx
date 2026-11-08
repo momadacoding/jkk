@@ -36,9 +36,16 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
   const trimmed = value.trim()
 
   return (
-    <div className="dialog-overlay" onMouseDown={() => finish(null)}>
-      {/* 点遮罩关闭，但点框内不能穿透过去 */}
-      <div ref={boxRef} className="dialog" onMouseDown={(e) => e.stopPropagation()}>
+    <div className="dialog-overlay">
+      {/* Esc 挂在框上而不是输入框上：Tab 到按钮之后也得能取消（遮罩不关框，见 dialogGuards.test.ts）。
+          不挂 window：框里的按键才归这个框，叠在别的框上时不连带关掉下面那个 */}
+      <div
+        ref={boxRef}
+        className="dialog"
+        onKeyDown={(e) => {
+          if (e.key === 'Escape') finish(null)
+        }}
+      >
         <div className="dialog-title">{request.title}</div>
         <label className="dialog-message" htmlFor="prompt-input">{request.message}</label>
         <input
@@ -48,7 +55,6 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
           onChange={(e) => setValue(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && trimmed) finish(trimmed)
-            if (e.key === 'Escape') finish(null)
           }}
         />
         <div className="dialog-actions">

@@ -10,7 +10,29 @@ const FOCUSABLE = [
   '[tabindex]:not([tabindex="-1"])',
 ].join(', ')
 
-/** 当前开着的弹框，后打开的在最后；只有最上面那层管 Tab。 */
+/**
+ * 焦点在按钮行（`.dialog-actions`）的按钮上时，← / → 在这一行的按钮之间挪，到头绕回。
+ *
+ * 系统对话框都这么走，用户的手也这么习惯（2026-11-08 丢弃确认框实测方向键不动）。
+ * 只认按钮行里的按钮：焦点在输入框里时方向键要挪光标，在正文的滚动区里要能滚。
+ */
+function moveInActions(box: HTMLElement, e: KeyboardEvent) {
+  if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return
+  const current = document.activeElement
+  if (!(current instanceof HTMLButtonElement)) return
+  const row = current.closest('.dialog-actions')
+  if (!row || !box.contains(row)) return
+  // 与 Tab 认的可聚焦元素一致：tabindex=-1 的按钮 focus() 不一定落得上，落不上方向键就被白吃
+  const items = Array.from(
+    row.querySelectorAll<HTMLButtonElement>('button:not([disabled]):not([tabindex="-1"])'),
+  )
+  const next = nextFocusIndex(items.length, items.indexOf(current), e.key === 'ArrowLeft')
+  if (next === null) return
+  e.preventDefault()
+  items[next].focus()
+}
+
+/** 当前开着的弹框，后打开的在最后；只有最上面那层管 Tab 和方向键。 */
 const open: RefObject<HTMLElement | null>[] = []
 
 /**
@@ -22,6 +44,12 @@ const open: RefObject<HTMLElement | null>[] = []
  * 每次 Tab 都由这里挪焦点（不只在首尾）：焦点已经漏到框外、或框里没有可聚焦元素时，
  * 浏览器默认的下一个落点都在框外，只拦首尾拦不住。监听挂在 window 的捕获阶段，
  * 焦点在框外时也收得到。
+ *
+ * 顺带管按钮行里的 ← / →，见 `moveInActions`：所有弹框都挂这个 hook，放这里一处就全有。
+ *
+ * 也管鼠标按在框外：遮罩不关框之后，点它的默认动作会把焦点从框里的按钮挪到 body，
+ * 框还开着，回车、方向键却都没了着落（2026-11-08 PR review 第 1 条）。框外的 mousedown
+ * 一律取消默认动作，焦点留在原处；click 照常派发，框外的右键菜单之类不受影响。
  */
 export function useFocusTrap(ref: RefObject<HTMLElement | null>) {
   // 打开前的焦点在**首次渲染时**记下：effect 里再读就晚了，`autoFocus` 在提交阶段已经把它挪进框里
@@ -31,18 +59,30 @@ export function useFocusTrap(ref: RefObject<HTMLElement | null>) {
   useEffect(() => {
     open.push(ref)
     const onKey = (e: KeyboardEvent) => {
-      if (e.key !== 'Tab' || open[open.length - 1] !== ref) return
+      if (open[open.length - 1] !== ref) return
       const box = ref.current
       if (!box) return
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        moveInActions(box, e)
+        return
+      }
+      if (e.key !== 'Tab') return
       e.preventDefault()
       const items = Array.from(box.querySelectorAll<HTMLElement>(FOCUSABLE))
       const current = items.indexOf(document.activeElement as HTMLElement)
       const next = nextFocusIndex(items.length, current, e.shiftKey)
       if (next !== null) items[next].focus()
     }
+    const onMouseDown = (e: MouseEvent) => {
+      if (open[open.length - 1] !== ref) return
+      const box = ref.current
+      if (box && e.target instanceof Node && !box.contains(e.target)) e.preventDefault()
+    }
     window.addEventListener('keydown', onKey, true)
+    window.addEventListener('mousedown', onMouseDown, true)
     return () => {
       window.removeEventListener('keydown', onKey, true)
+      window.removeEventListener('mousedown', onMouseDown, true)
       open.splice(open.indexOf(ref), 1)
       // 关框后把焦点还回去：不还的话落到 body，文件列表的 Del / Ctrl+A 就收不到了。
       // 焦点已被别处接走（比如紧接着弹出的下一个框）时不抢
