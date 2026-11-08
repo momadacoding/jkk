@@ -7,7 +7,10 @@ export type FileSection = 'unstaged' | 'staged'
 export interface FileSelection {
   /** 选中所属的区；还没选过任何东西时为 null。 */
   section: FileSection | null
-  /** 选中的路径，顺序与列表显示顺序一致。 */
+  /**
+   * 选中的行，顺序与列表显示顺序一致。文件行是文件路径，文件夹行是 `目录/`（`dirRowKey`）。
+   * 动作要的是文件：落地前用 `selectedFiles` 展开，不要直接把它交给 stage / discard。
+   */
   paths: string[]
   /** Shift 范围选择的起点。Shift 不移动它，所以能连续调整范围。 */
   anchor: string | null
@@ -24,6 +27,77 @@ export interface ClickModifiers {
 }
 
 export const emptyFileSelection: FileSelection = { section: null, paths: [], anchor: null }
+
+/**
+ * 文件夹行在选中里的 key：目录路径加一个斜杠。
+ *
+ * git 报上来的文件路径不会以斜杠结尾（未跟踪目录也是逐个文件列出的，`recurse_untracked_dirs`），
+ * 所以和文件路径不会撞，选中、锚点、Shift 范围都能把两种行放在同一个列表里算。
+ */
+export function dirRowKey(dirPath: string): string {
+  return `${dirPath}/`
+}
+
+export function isDirRowKey(key: string): boolean {
+  return key.endsWith('/')
+}
+
+/** 行 key 对应的路径：文件夹去掉末尾斜杠。复制路径用。 */
+export function rowPath(key: string): string {
+  return isDirRowKey(key) ? key.slice(0, -1) : key
+}
+
+/**
+ * 树里看得见的行，按显示顺序：文件夹行在它的内容前面。
+ *
+ * @param isOpen 传了就跳过收起文件夹里的行（文件夹自己那一行还在）
+ */
+export function treeRowKeys(nodes: TreeNode[], isOpen?: (dirPath: string) => boolean): string[] {
+  const out: string[] = []
+  const walk = (list: TreeNode[]) => {
+    for (const node of list) {
+      if (node.kind === 'file') {
+        out.push(node.path)
+        continue
+      }
+      out.push(dirRowKey(node.path))
+      if (!isOpen || isOpen(node.path)) walk(node.children)
+    }
+  }
+  walk(nodes)
+  return out
+}
+
+/**
+ * 把行 key 展开成文件：选中的文件夹换成它下面的全部文件（含收起的子文件夹里的），
+ * 和直接选中的文件合在一起去重，按显示顺序。
+ *
+ * 选中的文件夹是用户看得见、高亮着的那一行，动作作用到它下面看不见的文件是用户要的；
+ * 这和「Shift 选一段不能把收起文件夹里的文件夹进来」不矛盾，那里夹进来的是没被点到的行。
+ */
+export function expandRowKeys(keys: string[], tree: TreeNode[]): string[] {
+  if (keys.length === 0) return []
+  const wanted = new Set(keys)
+  const out: string[] = []
+  const walk = (list: TreeNode[], inherited: boolean) => {
+    for (const node of list) {
+      if (node.kind === 'dir') walk(node.children, inherited || wanted.has(dirRowKey(node.path)))
+      else if (inherited || wanted.has(node.path)) out.push(node.path)
+    }
+  }
+  walk(tree, false)
+  return out
+}
+
+/**
+ * 选中落到动作上的文件：本区的树里展开（`expandRowKeys`）。
+ *
+ * 只在选中所属的区里展开：同一个文件夹两个区都可能有，Staged 里的 `src/` 不能把 Unstaged 的文件带进来。
+ */
+export function selectedFiles(selection: FileSelection, status: StatusData): string[] {
+  if (!selection.section) return []
+  return expandRowKeys(selection.paths, changesTree(status[selection.section]))
+}
 
 /**
  * 算出一次点击之后的选中状态。
@@ -148,8 +222,13 @@ export function reconcileSelection(
  * 右侧 diff 显示哪一项。区决定读哪种 diff（第 65 条），所以不能只给文件名：
  * 同一个文件可能两个区都有，两边显示的内容不同。
  *
- * 先按 [`reconcileSelection`] 对齐，再取最后点的那一个；没有选中时取 Unstaged 的第一个，
- * Unstaged 空了取 Staged 的第一个。这个默认项只决定右侧显示什么，不算选中、不高亮。
+ * 先按 [`reconcileSelection`] 对齐，再取最后点的那一个；没有选中时取 Unstaged 的第一个文件，
+ * Unstaged 空了取 Staged 的第一个文件。这个默认项只决定右侧显示什么，不算选中、不高亮。
+ *
+ * 最后点的是文件夹时给出的就是文件夹的行 key（`isDirRowKey`）：高亮它，右侧不读 diff。
+ *
+ * @param unstaged Unstaged 区的行（`changesRows`），只有文件时也一样能用
+ * @param staged Staged 区的行
  */
 export function activeChange(
   selection: FileSelection,
@@ -159,8 +238,12 @@ export function activeChange(
   const s = reconcileSelection(selection, unstaged, staged)
   const path = s.paths[s.paths.length - 1]
   if (path !== undefined && s.section) return { path, section: s.section }
-  if (unstaged.length > 0) return { path: unstaged[0], section: 'unstaged' }
-  if (staged.length > 0) return { path: staged[0], section: 'staged' }
+  // 默认项要的是文件：行列表里文件夹行排在它的内容前面
+  const firstFile = (rows: string[]) => rows.find((r) => !isDirRowKey(r))
+  const u = firstFile(unstaged)
+  if (u !== undefined) return { path: u, section: 'unstaged' }
+  const st = firstFile(staged)
+  if (st !== undefined) return { path: st, section: 'staged' }
   return null
 }
 
@@ -176,6 +259,19 @@ export function changesPaths(status: StatusData): { unstaged: string[], staged: 
   return {
     unstaged: treeFilePaths(changesTree(status.unstaged)),
     staged: treeFilePaths(changesTree(status.staged)),
+  }
+}
+
+/**
+ * 两个区全部的行（文件夹 + 文件），按显示顺序，不管收没收起。
+ *
+ * 选中里可能有文件夹行，对齐选中（`reconcileSelection`）、算默认项和 diff scope 都要用它，
+ * 只用 `changesPaths` 的话，选中的文件夹会被当成「已经不在列表里」清掉。
+ */
+export function changesRows(status: StatusData): { unstaged: string[], staged: string[] } {
+  return {
+    unstaged: treeRowKeys(changesTree(status.unstaged)),
+    staged: treeRowKeys(changesTree(status.staged)),
   }
 }
 
@@ -216,11 +312,13 @@ export function changesTree(files: FileChange[]): TreeNode[] {
  * 按选中文件所在的区读（第 65 条）：Unstaged 读暂存区对比工作区，Staged 读 HEAD 对比暂存区。
  * 只读一个文件（2026-11-05 排查报告 6.13 方案 C）：右侧本来就只显示这一个，整区读要把整个工作区
  * stat 一遍、再读出每个改动文件的内容。两边都空时为 `null`，什么都不读。
+ * 最后点的是文件夹时也是 `null`：右侧只说明选中了哪个文件夹，不读整个文件夹的 diff。
  */
 export function changesDiffScope(selection: FileSelection, status: StatusData): string | null {
-  const { unstaged, staged } = changesPaths(status)
+  const { unstaged, staged } = changesRows(status)
   const active = activeChange(selection, unstaged, staged)
-  return active ? `${active.section}:${active.path}` : null
+  if (!active || isDirRowKey(active.path)) return null
+  return `${active.section}:${active.path}`
 }
 
 /** 是不是 `changesDiffScope` 给出的单文件 scope。提交详情的 `commit:` / `range:` 不算。 */
