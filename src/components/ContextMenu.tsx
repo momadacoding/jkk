@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 export interface MenuItem {
   label: string
@@ -28,19 +28,25 @@ export interface MenuState {
  */
 export function ContextMenu({ menu, onClose }: { menu: MenuState | null; onClose: () => void }) {
   const ref = useRef<HTMLDivElement>(null)
-  const [pos, setPos] = useState({ x: 0, y: 0 })
+  /** 量过尺寸、收回可视区域之后的位置；记着是哪一次右键量的，换了一次就不算数。 */
+  const [fitted, setFitted] = useState<{ menu: MenuState, x: number, y: number } | null>(null)
 
-  // 贴着窗口边缘弹出时会被截断，量完自身尺寸再回收进可视区域
-  useEffect(() => {
+  // 贴着窗口边缘弹出时会被截断，量完自身尺寸再回收进可视区域。
+  // 必须是 layout effect：它在浏览器画这一帧之前跑，里面的 setState 也在画之前重渲染完。
+  // 普通 useEffect 在画完之后才跑，菜单会先在旧位置（初始是左上角 0,0）露一帧再跳过来
+  useLayoutEffect(() => {
     if (!menu) return
     const el = ref.current
     if (!el) return
     const { width, height } = el.getBoundingClientRect()
-    setPos({
+    setFitted({
+      menu,
       x: Math.min(menu.x, window.innerWidth - width - 4),
       y: Math.min(menu.y, window.innerHeight - height - 4),
     })
   }, [menu])
+  // 还没量到这一次时先放在鼠标处，不用上一次量出来的位置
+  const pos = fitted && fitted.menu === menu ? fitted : menu
 
   useEffect(() => {
     if (!menu) return
@@ -62,7 +68,7 @@ export function ContextMenu({ menu, onClose }: { menu: MenuState | null; onClose
     }
   }, [menu, onClose])
 
-  if (!menu) return null
+  if (!menu || !pos) return null
 
   return (
     <div
