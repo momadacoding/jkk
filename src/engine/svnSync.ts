@@ -430,7 +430,8 @@ export function auditIsDue(now: number, lastAt: number, inFlight: boolean): bool
 }
 
 /**
- * §6.6.3 第一档比对用的「上次观测值」。
+ * 一个字符串观测值的「上次观测值」（现在只剩 HEAD 用它，见 `repoStore` 的 `lastCheckedHead`；
+ * 第一档的 rootRevs 已退出，计划 2026-11-08 Task 1）。
  *
  * 用可变盒子而不是返回值：它在 `repoStore` 里的真身是一个 `useRef`，而这里要
  * 表达的恰恰是**什么时候允许写它**——那条规则写成纯函数才测得到（§7.2）。
@@ -468,9 +469,9 @@ export type FullCheck = () => Promise<boolean | void>
  *
  * 校验被顶替（返回 `false`，见 {@link FullCheck}）同样不记。返回是否记了。
  */
-export async function recordAfterSuccess(
-  memo: RootRevMemo,
-  observed: string,
+export async function recordAfterSuccess<T>(
+  memo: { value: T | null },
+  observed: T,
   runFullCheck: FullCheck,
 ): Promise<boolean> {
   if ((await runFullCheck()) === false) return false
@@ -478,23 +479,6 @@ export async function recordAfterSuccess(
   return true
 }
 
-/**
- * 第一档（O(1)）：rootRevs 与上次观测值比，变了才跑第二档。
- *
- * 返回是否真的跑了第二档。第二档抛错时本函数**一并抛出**，memo 不动——
- * 调用点可以继续吞掉这个错误（横幅是留给 git 操作的），但吞掉之后下一次
- * 事件仍然会重试。
- */
-export async function syncIfRootRevChanged(
-  memo: RootRevMemo,
-  readRootRevs: () => Promise<string>,
-  runFullCheck: FullCheck,
-): Promise<boolean> {
-  const now = await readRootRevs()
-  if (now === memo.value) return false
-  await recordAfterSuccess(memo, now, runFullCheck)
-  return true
-}
 
 /** 焦点检测的「上次观测值」。`null` = 还没成功校验过。放 ref 的理由同 {@link RootRevMemo}。 */
 export interface WcDbStampMemo {
@@ -511,23 +495,44 @@ export function wcDbStampsChanged(prev: WcDbStamp[] | null, next: WcDbStamp[]): 
   })
 }
 
+/** 一轮检测的结局：没跑第二档 / 跑了但被更晚的一次顶替 / 跑了并写回。 */
+export type SvnCheckOutcome = 'skipped' | 'superseded' | 'applied'
+
 /**
- * 窗口拿到焦点时的检测（分析 §6.6）：wc.db 变了才跑第二档校验。
+ * 一轮失同步检测（§6.6.3 两档）：第一档比 wc.db 戳，变了才跑第二档；`force` 时不比，直接跑。
  *
- * 来回切窗口很频繁，而第二档要跑 `svn status`，这里只有几次 `stat`。`svn status` 不写 wc.db
- * （E19），所以校验本身不会让下一次判成变了。
+ * # 第一档只看 wc.db 戳（计划 2026-11-08 Task 1）
  *
- * 记录的规矩同 {@link recordAfterSuccess}：记开跑之前读到的值，校验成功且写回了才记。
+ * 原来文件变动时还要读各工作副本根的 revision（`svn_root_revs`）。它每次都重新枚举工作副本，
+ * 公司机器上 23 个白名单目录一轮就是 69 个 svn 进程、约 10 秒，存一次盘跑两轮。而 revision 就存在
+ * wc.db 里：`svn update` 改了 revision 必然写 wc.db，戳的信号已经覆盖它；反过来只提交不更新时
+ * revision 不动、wc.db 变。戳没变时后端只有几次 `stat`（枚举结果有缓存，见 Rust `wc_db_stamps`）。
+ * `svn status` 不写 wc.db（E19），所以校验本身不会让下一次判成变了。
+ *
+ * # 读戳失败
+ *
+ * 非强制时抛错、不跑：没有依据判断变没变。强制时照跑第二档、只是不记——打开仓库与 HEAD 变化
+ * 本来就要一个结论，不能因为读不到戳就没有横幅。
+ *
+ * 记录的规矩同 {@link recordAfterSuccess}：记开跑之前读到的戳，校验成功且写回了才记。
  */
-export async function syncIfWcDbChanged(
+export async function runSvnSyncCheck(
   memo: WcDbStampMemo,
+  force: boolean,
   readStamps: () => Promise<WcDbStamp[]>,
   runFullCheck: FullCheck,
-): Promise<boolean> {
-  const stamps = await readStamps()
-  if (!wcDbStampsChanged(memo.value, stamps)) return false
-  if ((await runFullCheck()) !== false) memo.value = stamps
-  return true
+): Promise<SvnCheckOutcome> {
+  let stamps: WcDbStamp[] | null
+  try {
+    stamps = await readStamps()
+  } catch (err) {
+    if (!force) throw err
+    stamps = null
+  }
+  if (!force && stamps && !wcDbStampsChanged(memo.value, stamps)) return 'skipped'
+  if ((await runFullCheck()) === false) return 'superseded'
+  if (stamps) memo.value = stamps
+  return 'applied'
 }
 
 /**
@@ -541,39 +546,6 @@ export async function syncIfWcDbChanged(
  * 横幅退回到等下一次焦点，与改动前相同，不会更差。
  */
 export const SVN_TRAILING_RECHECK_MS = 2000
-
-/**
- * 文件变动时的检测（事故分析 6.11）：根 revision **或** wc.db 戳变了就跑第二档。
- *
- * 只看根 revision 不够：TortoiseSVN 只更新一个子目录时根的 revision 不动，「本地改动」立刻出现
- * 一大片，「跟进」却要等下一次窗口焦点才挂出来。
- *
- * 成本：戳没变时后端只有几次 `stat`；戳一变，后端要重新枚举工作副本（`svn info` + `svn status`），
- * 随后第二档还要跑一遍 `svn status`。外部更新进行中 wc.db 一直在变，所以调用方必须单飞，
- * 不能每个事件都并发起一轮。
- *
- * 两样观测值任一读失败，就只按另一样判断，读失败的那份记录不动；都读不到才抛错。
- * 记录的规矩同 {@link recordAfterSuccess}：都在开跑前读，校验成功且写回了才记。
- */
-export async function syncIfRootRevOrWcDbChanged(
-  rootMemo: RootRevMemo,
-  wcDbMemo: WcDbStampMemo,
-  readRootRevs: () => Promise<string>,
-  readStamps: () => Promise<WcDbStamp[]>,
-  runFullCheck: FullCheck,
-): Promise<boolean> {
-  const [rootRead, stampsRead] = await Promise.allSettled([readRootRevs(), readStamps()])
-  if (rootRead.status === 'rejected' && stampsRead.status === 'rejected') throw rootRead.reason
-  const rootRevs = rootRead.status === 'fulfilled' ? rootRead.value : null
-  const stamps = stampsRead.status === 'fulfilled' ? stampsRead.value : null
-  const changed = (rootRevs !== null && rootRevs !== rootMemo.value)
-    || (stamps !== null && wcDbStampsChanged(wcDbMemo.value, stamps))
-  if (!changed) return false
-  if ((await runFullCheck()) === false) return true
-  if (rootRevs !== null) rootMemo.value = rootRevs
-  if (stamps !== null) wcDbMemo.value = stamps
-  return true
-}
 
 /**
  * 窗口失焦时要不要记快照（日志 Task 0，W26）。

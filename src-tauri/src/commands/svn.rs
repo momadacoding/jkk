@@ -191,20 +191,21 @@ pub fn svn_pinned_externals(path: String) -> Result<Vec<PinnedExternal>, GitErro
 
 /// 完整的失同步校验（spec §6.6.3 的**第二档**）。
 ///
-/// 纯本地读（`svn status` / `svn info`），不走网络。时机：打开仓库、以及第一档
-/// 的 [`svn_root_revs`] 报告「有人动过」之后。
+/// 纯本地读（`svn status` / `svn info`），不走网络。时机：打开仓库、HEAD 变了，以及第一档
+/// 的 [`svn_wc_db_stamps`] 报告「有人动过」之后。
 #[tauri::command(async)]
 pub fn svn_sync_status(path: String) -> Result<SyncStatus, GitError> {
     check_sync(&path)
 }
 
-/// 每个工作副本根的 revision（spec §6.6.3 的**第一档**，O(1)）。
+/// 每个工作副本根的 revision。
 ///
-/// 挂在高频的 `repo-changed` 刷新上。**与上次观测值比**，变了才跑第二档；
-/// 拿它跟 `baselineRev` 比是错的——交付之后根节点会长期停在旧 revision，
-/// 那样每次刷新都会判不等，分层的意义直接归零（spec §6.6.3 有实测）。
+/// **前端已不再调用**（计划 2026-11-08 Task 1）：它原来是第一档，挂在高频的 `repo-changed`
+/// 上，但每次都重新枚举工作副本，并不便宜（见 [`read_root_revs`]）。第一档改由
+/// [`svn_wc_db_stamps`] 承担。命令先留着，删除另起清理。
 ///
-/// 上次观测值由前端 store 持有，后端保持无状态。
+/// 若要再用：**与上次观测值比**，不要跟 `baselineRev` 比——交付之后根节点会长期停在旧
+/// revision，那样每次都会判不等（spec §6.6.3 有实测）。
 #[tauri::command(async)]
 pub fn svn_root_revs(path: String) -> Result<Vec<RootRev>, GitError> {
     read_root_revs(&path)
@@ -223,10 +224,11 @@ pub fn svn_follow_mark(path: String) -> Result<(), GitError> {
     write_mark(&path)
 }
 
-/// 各工作副本 `wc.db` 的 mtime + size（分析 §6.6）。前端在窗口拿到焦点时调用，
-/// **与上次观测值比**，变了才跑第二档校验；上次观测值由前端持有。
+/// 各工作副本 `wc.db` 的 mtime + size（分析 §6.6），spec §6.6.3 的**第一档**。前端在打开仓库、
+/// 文件变动、窗口拿到焦点时调用，**与上次观测值比**，变了才跑第二档校验；上次观测值由前端持有。
 ///
-/// wc.db 没变时只有几次 `stat`，不发 svn 命令。不是混合仓库时返回空列表。
+/// wc.db 没变时只有几次 `stat`，不发 svn 命令；变了时重新枚举工作副本（每个一次 `svn info` +
+/// `svn status`，见 `wc_db_stamps_with`）。不是混合仓库时返回空列表。
 #[tauri::command(async)]
 pub fn svn_wc_db_stamps(path: String) -> Result<Vec<WcDbStamp>, GitError> {
     if detect_repo_kind(&path) != RepoKind::SvnHybrid {
