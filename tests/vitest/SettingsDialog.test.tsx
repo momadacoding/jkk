@@ -1,10 +1,21 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { invoke } from '@tauri-apps/api/core'
 import { SettingsDialog } from '@/components/SettingsDialog'
 import type { AppSettingsView } from '@/engine/appSettings'
 
-afterEach(cleanup)
+vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn(async () => undefined) }))
+const invokeMock = vi.mocked(invoke)
+const recordingCalls = () =>
+  invokeMock.mock.calls
+    .filter(([cmd]) => cmd === 'set_shortcut_recording')
+    .map(([, args]) => (args as { recording: boolean }).recording)
+
+afterEach(() => {
+  cleanup()
+  invokeMock.mockClear()
+})
 
 const VIEW: AppSettingsView = {
   closeToTray: true,
@@ -52,6 +63,22 @@ describe('SettingsDialog', () => {
     fireEvent.click(button('保存'))
     await waitFor(() => expect(onClose).toHaveBeenCalled())
     expect(onSave).toHaveBeenCalledWith(true, 'Ctrl+Alt+K', true)
+  })
+
+  it('录制开始 / 录完各通知后端一次：录制期间全局快捷键只呼出、不隐藏', async () => {
+    setup()
+    expect(recordingCalls()).toEqual([])
+    fireEvent.click(recorder())
+    await waitFor(() => expect(recordingCalls()).toEqual([true]))
+    fireEvent.keyDown(recorder(), { code: 'KeyK', key: 'k', ctrlKey: true, altKey: true })
+    await waitFor(() => expect(recordingCalls()).toEqual([true, false]))
+  })
+
+  it('录到一半直接关框（卸载）也复位，不能把「正在录制」留在后端', async () => {
+    setup()
+    fireEvent.click(recorder())
+    cleanup()
+    await waitFor(() => expect(recordingCalls()).toEqual([true, false]))
   })
 
   it('录制中按 Esc 只取消录制，不关框', () => {

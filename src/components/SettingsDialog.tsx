@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { captureShortcut, displayShortcut, type AppSettingsView } from '../engine/appSettings'
 import { toErrorMessage } from '../engine/errors'
+import { setShortcutRecording } from '@/store/appSettingsStore'
 import { Reveal } from './Reveal'
 import { useFocusTrap } from './useFocusTrap'
 
@@ -36,6 +37,14 @@ export function SettingsDialog({ initial, loadError = null, onSave, onClose }: S
   const [busy, setBusy] = useState(false)
   const boxRef = useRef<HTMLDivElement>(null)
   useFocusTrap(boxRef)
+
+  // 录制状态同步给后端。cleanup 里复位：录到一半直接关框（Esc、点遮罩、保存）也不能留着标记，
+  // 否则之后快捷键就再也不会隐藏窗口
+  useEffect(() => {
+    if (!recording) return
+    void setShortcutRecording(true)
+    return () => { void setShortcutRecording(false) }
+  }, [recording])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {

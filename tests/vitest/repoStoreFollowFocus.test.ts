@@ -81,8 +81,19 @@ async function fire(event: 'focus' | 'blur') {
   })
 }
 
+/**
+ * 等 `openRepo` 走到记下 `openedPath`（随后挂在 refreshGraph 上）。早于这一刻写回的结论会被
+ * `samePath` 守卫当成「已切到别的仓库」丢掉，戳也就不记（第一档只读戳之后，校验比打开快）。
+ */
+async function opened() {
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 0))
+  })
+}
+
 /** 焦点检测跑完一轮：下面的失焦才有「最近一次判定」。 */
 async function settleOn(verdict: SyncVerdict) {
+  await opened()
   answers.set('svn_sync_status', syncStatus(verdict))
   await fire('focus')
   expect(count('svn_sync_status')).toBeGreaterThan(0)
@@ -94,7 +105,6 @@ beforeEach(() => {
   answers.clear()
   answers.set('open_repo', () => ({ path: 'C:/r', head: 'work', headHash: 'h' }))
   answers.set('read_capabilities', () => SVN)
-  answers.set('svn_root_revs', () => [])
   answers.set('svn_wc_db_stamps', stamps('1'))
   answers.set('svn_follow_mark', () => undefined)
 })
@@ -131,6 +141,18 @@ describe('窗口拿到焦点', () => {
 
     expect(count('svn_sync_status')).toBe(2)
     expect(result.current.state.svnSync?.verdict.kind).toBe('externallyAdvanced')
+  })
+
+  it('打开仓库（refreshSvnSync）记下戳：之后 wc.db 没变就不再跑第二档', async () => {
+    const { result } = mount()
+    await opened()
+    answers.set('svn_sync_status', syncStatus(IN_SYNC))
+    await act(async () => {
+      await result.current.refreshSvnSync('C:/r')
+    })
+    expect(count('svn_sync_status')).toBe(1)
+    await fire('focus')
+    expect(count('svn_sync_status')).toBe(1)
   })
 
   it('校验失败：下一次焦点重试，wc.db 没再变也要重试', async () => {
@@ -223,7 +245,7 @@ describe('窗口失焦', () => {
       await new Promise((r) => setTimeout(r, 0))
     })
 
-    answers.set('svn_root_revs', () => new Promise(() => {}))
+    answers.set('svn_wc_db_stamps', () => new Promise(() => {}))
     await act(async () => {
       repoChanged.at(-1)?.({ payload: 'C:/r' })
     })
@@ -240,10 +262,15 @@ describe('窗口失焦', () => {
   })
 
   it('上一次校验失败：没有判定，不写', async () => {
-    // 走 repo-changed：wc.db 的戳没动，挡住快照的只能是「这次判定失败了」
+    // 走 HEAD 变化：wc.db 的戳没动，挡住快照的只能是「这次判定失败了」
     mount()
     await settleOn(IN_SYNC)
-    answers.set('svn_root_revs', () => [{ wcRoot: 'C:/r', rev: 9 }])
+    answers.set('open_repo', () => ({ head: 'work', headHash: 'a'.repeat(40) }))
+    await act(async () => {
+      repoChanged.at(-1)?.({ payload: 'C:/r' })
+      await new Promise((r) => setTimeout(r, 0))
+    })
+    answers.set('open_repo', () => ({ head: 'work', headHash: 'b'.repeat(40) }))
     answers.set('svn_sync_status', () => {
       throw { code: 'svn_failed', message: 'x' }
     })
@@ -272,34 +299,152 @@ describe('窗口失焦', () => {
   })
 })
 
-describe('校验的先后', () => {
-  it('先发起的校验晚到：不能把新结论盖掉', async () => {
-    // A 看到的是提交之前的工作副本，B 看到的是提交之后的。A 晚到时盖回 InSync 的话，
-    // 横幅消失，下一次失焦还会写一份晚于提交的快照
+describe('校验的先后（计划 2026-11-08 Task 2：所有入口共用一个单飞队列）', () => {
+  /** 第二档挂住，直到测试放行；记下同时在跑的最多几轮。 */
+  function heldStatus(verdict: SyncVerdict) {
+    const releases: (() => void)[] = []
+    let running = 0
+    let max = 0
+    answers.set('svn_sync_status', () => {
+      running += 1
+      max = Math.max(max, running)
+      return new Promise((resolve) => {
+        releases.push(() => {
+          running -= 1
+          resolve(syncStatus(verdict)())
+        })
+      })
+    })
+    return {
+      get max() {
+        return max
+      },
+      async releaseOne() {
+        await act(async () => {
+          releases.shift()?.()
+          await new Promise((r) => setTimeout(r, 0))
+        })
+      },
+    }
+  }
+
+  async function changed() {
+    await act(async () => {
+      repoChanged.at(-1)?.({ payload: 'C:/r' })
+      await new Promise((r) => setTimeout(r, 0))
+    })
+  }
+
+  it('先发起的校验在跑时又来一次：排队，等它写回之后补跑，最终是新结论', async () => {
+    // A 看到的是提交之前的工作副本，B 看到的是提交之后的。B 必须在 A 之后开跑、写回，
+    // 否则 A 晚到时盖回 InSync，横幅消失，下一次失焦还会写一份晚于提交的快照
     const { result } = mount()
     await settleOn(IN_SYNC)
 
-    let finishA!: () => void
-    const gate = new Promise<void>((r) => {
-      finishA = r
-    })
     answers.set('svn_wc_db_stamps', stamps('2'))
-    answers.set('svn_sync_status', () => gate.then(syncStatus(IN_SYNC)))
+    const a = heldStatus(IN_SYNC)
+    await fire('focus')
+
+    answers.set('svn_wc_db_stamps', stamps('3'))
+    await fire('focus')
+    expect(count('svn_sync_status')).toBe(2) // settleOn 一次 + A；B 在排队
+
+    answers.set('svn_sync_status', syncStatus(ADVANCED))
+    await a.releaseOne()
+
+    expect(count('svn_sync_status')).toBe(3)
+    expect(result.current.state.svnSync?.verdict.kind).toBe('externallyAdvanced')
+    await fire('blur')
+    expect(count('svn_follow_mark')).toBe(0)
+  })
+
+  it('焦点、文件事件、HEAD 变化一起来：第二档不并发', async () => {
+    mount()
+    await settleOn(IN_SYNC)
+    answers.set('svn_wc_db_stamps', stamps('2'))
+    answers.set('open_repo', () => ({ head: 'work', headHash: 'b'.repeat(40) }))
+    const held = heldStatus(IN_SYNC)
+
+    await fire('focus')
+    await changed()
+    await fire('focus')
+    await changed()
+
+    expect(held.max).toBe(1)
+    await held.releaseOne()
+    await held.releaseOne()
+    expect(held.max).toBe(1)
+  })
+
+  it('一轮比戳的检测在跑时 HEAD 动了：补跑那轮强制跑第二档', async () => {
+    mount()
+    await settleOn(IN_SYNC)
+    answers.set('open_repo', () => ({ head: 'work', headHash: 'a'.repeat(40) }))
+    await changed() // 记下 HEAD = a
+
+    answers.set('svn_wc_db_stamps', stamps('2'))
+    const held = heldStatus(IN_SYNC)
+    await fire('focus')
+    const before = count('svn_sync_status')
+
+    // 切分支：不写 wc.db，戳还是 2，只有强制才会跑
+    answers.set('open_repo', () => ({ head: 'work', headHash: 'b'.repeat(40) }))
+    await changed()
+    // 最后合并进来的是一次比戳的焦点检测：补跑仍要强制
+    await fire('focus')
+    expect(count('svn_sync_status')).toBe(before)
+
+    await held.releaseOne()
+    expect(count('svn_sync_status')).toBe(before + 1)
+    await held.releaseOne()
+
+    // HEAD 已记成 b：再来文件事件不再跑
+    await changed()
+    expect(count('svn_sync_status')).toBe(before + 1)
+  })
+
+  it('提交前的 freshSvnSync 不排在卡住的检测后面：自己跑一轮，旧的那轮晚到也盖不掉', async () => {
+    const { result } = mount()
+    await settleOn(IN_SYNC)
+
+    // 在跑的那轮开跑于 TortoiseSVN 更新完之前，看到的还是 InSync，而且一直不回来
+    answers.set('svn_wc_db_stamps', stamps('2'))
+    const held = heldStatus(IN_SYNC)
     await fire('focus')
 
     answers.set('svn_wc_db_stamps', stamps('3'))
     answers.set('svn_sync_status', syncStatus(ADVANCED))
-    await fire('focus')
-    expect(result.current.state.svnSync?.verdict.kind).toBe('externallyAdvanced')
-
+    let got: { verdict: SyncVerdict } | null = null
     await act(async () => {
-      finishA()
-      await new Promise((r) => setTimeout(r, 0))
+      got = await result.current.freshSvnSync('C:/r')
     })
+    expect(got!.verdict.kind).toBe('externallyAdvanced')
 
+    await held.releaseOne()
     expect(result.current.state.svnSync?.verdict.kind).toBe('externallyAdvanced')
-    await fire('blur')
-    expect(count('svn_follow_mark')).toBe(0)
+  })
+
+  it('一轮在跑时 HEAD 切走又切回：最后记下的是切回来的 HEAD', async () => {
+    mount()
+    await settleOn(IN_SYNC)
+    answers.set('open_repo', () => ({ head: 'work', headHash: 'a'.repeat(40) }))
+    await changed() // 记下 HEAD = a
+
+    answers.set('svn_wc_db_stamps', stamps('2'))
+    const held = heldStatus(IN_SYNC)
+    await fire('focus')
+    answers.set('open_repo', () => ({ head: 'work', headHash: 'b'.repeat(40) }))
+    await changed()
+    answers.set('open_repo', () => ({ head: 'work', headHash: 'a'.repeat(40) }))
+    await changed()
+
+    answers.set('svn_sync_status', syncStatus(IN_SYNC))
+    await held.releaseOne()
+    const after = count('svn_sync_status')
+
+    // HEAD 一直是 a：记成 b 的话，这次文件事件会判「HEAD 变了」再跑一轮
+    await changed()
+    expect(count('svn_sync_status')).toBe(after)
   })
 })
 
@@ -366,6 +511,19 @@ describe('HEAD 动了（§6.11.3：切到落后的分支要出「跟进」）', 
     await changed()
 
     expect(count('svn_sync_status')).toBe(after + 1)
+  })
+
+  it('文件事件、wc.db 没变：不调 svn_root_revs（每次都重新枚举工作副本），也不跑第二档', async () => {
+    mount()
+    await settleOn(IN_SYNC)
+    head('a'.repeat(40))
+    await changed()
+    const after = count('svn_sync_status')
+
+    await changed()
+
+    expect(count('svn_root_revs')).toBe(0)
+    expect(count('svn_sync_status')).toBe(after)
   })
 
   it('HEAD 没动：文件事件不跑第二档', async () => {

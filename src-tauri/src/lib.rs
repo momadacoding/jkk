@@ -34,10 +34,12 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(desktop::on_window_event)
+        .on_page_load(desktop::on_page_load)
         .invoke_handler(tauri::generate_handler![
             commands::app_settings::read_app_settings,
             commands::app_settings::save_app_settings,
             commands::app_settings::set_svn_auto_follow,
+            commands::app_settings::set_shortcut_recording,
             commands::diff::read_diff,
             commands::conflict::check_merge_drivers,
             commands::conflict::read_conflicts,

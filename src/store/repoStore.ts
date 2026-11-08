@@ -7,9 +7,7 @@ import {
   auditIsDue,
   markOnBlur,
   recordAfterSuccess,
-  syncIfRootRevChanged,
-  syncIfRootRevOrWcDbChanged,
-  syncIfWcDbChanged,
+  runSvnSyncCheck,
   SVN_AUDIT_POLL_MS,
   SVN_TRAILING_RECHECK_MS,
   type EolStatus,
@@ -37,6 +35,7 @@ import {
 import { toErrorCode, toErrorMessage } from '../engine/errors'
 import { createLatestGate } from '@/engine/latestGate'
 import { createSingleFlight } from '@/engine/singleFlight'
+import { createSvnCheckQueue } from '@/engine/svnCheckQueue'
 import { applyStatusPatch, type StatusPatch } from '@/engine/statusPatch'
 import { changesDiffScope, isChangesFileScope, type FileSelection } from '@/engine/fileSelection'
 import type { DriverReport } from '@/engine/mergeDrivers'
@@ -54,27 +53,8 @@ import type { SyncInExpect, SyncInOutcome, SyncInPreview } from '../engine/svnSy
 import type { SyncOutExpect, SyncOutOutcome, SyncOutPreview } from '../engine/svnSyncOut'
 import { nextSelection } from '../engine/selection'
 
-/** 后端 `svn_sync::RootRev`。 */
-interface RootRev {
-  wcRoot: string
-  rev: number
-}
-
 /** 首屏与每次「加载更多」拉多少条（spec §10.2：不做无限滚动）。 */
 const SVN_LOG_PAGE = 200
-
-/**
- * 把一次 rootRev 观测压成一个可比字符串。
- *
- * 排序是必须的：`enumerate_wcs` 的返回顺序没有契约，顺序一飘就会被当成
- * 「有人动过」，于是每次刷新都触发全量校验。
- */
-function serializeRootRevs(revs: RootRev[]): string {
-  return revs
-    .map((r) => `${r.wcRoot}@${r.rev}`)
-    .sort()
-    .join('|')
-}
 
 /**
  * 把 SVN 序列接进 git 历史——**只在 SVN 模式下**。
@@ -470,19 +450,15 @@ export function svnSyncStatus(path: string): Promise<SyncStatus> {
   return invoke<SyncStatus>('svn_sync_status', { path })
 }
 
-/** 每个工作副本根的 revision（第一档，O(1)）。挂在高频刷新上。 */
-export function svnRootRevs(path: string): Promise<RootRev[]> {
-  return invoke<RootRev[]>('svn_root_revs', { path })
-}
-
 /** 记一份失焦快照（只看索引与 HEAD）。非混合仓库什么也不做。 */
 export function svnFollowMark(path: string): Promise<void> {
   return invoke<void>('svn_follow_mark', { path })
 }
 
 /**
- * 各工作副本 `wc.db` 的 mtime + size（分析 §6.6）。窗口拿到焦点时调用，与上次观测值比。
- * wc.db 没变时后端只有几次 `stat`，不发 svn 命令。非混合仓库返回空列表。
+ * 各工作副本 `wc.db` 的 mtime + size（分析 §6.6），§6.6.3 的第一档：与上次观测值比，变了才跑第二档。
+ * wc.db 没变时后端只有几次 `stat`；变了时后端重新枚举工作副本（每个一次 `svn info` + `svn status`）。
+ * 非混合仓库返回空列表。
  */
 export function svnWcDbStamps(path: string): Promise<WcDbStamp[]> {
   return invoke<WcDbStamp[]>('svn_wc_db_stamps', { path })
@@ -524,29 +500,23 @@ export function useRepoStore() {
   /** 这个 store 的身份：通知里认出「是自己发的」。 */
   const storeIdentity = useRef({}).current
   const [state, setState] = useState<RepoState>(initialState)
+  /** 上一次校验成功时的 HEAD。见 `checkSvnSyncIfHeadMoved`。放 ref 的理由同 `lastWcDbStamps`。 */
+  const lastCheckedHead = useRef<RootRevMemo>({ value: null })
+  /** 已经为它请求了强制校验、还没落定的 HEAD。见 `checkSvnSyncIfHeadMoved`。 */
+  const headRequested = useRef<string | null>(null)
   /**
-   * 上一次观测到的每个工作副本根的 revision，序列化成字符串好比对。
+   * §6.6.3 第一档的「上次观测值」：最近一次写回了结论的校验开跑之前读到的各 wc.db 戳。
+   * 文件变动、焦点检测、打开仓库共用，失焦快照也按它判断。
    *
    * **放 ref 不放 state**：读它的是 `repo-changed` 监听器，而那个 `useEffect`
    * 的依赖是 `[state.path, state.capabilities.vcs]`。放进 state 的话监听器会**永远闭包住
    * 注册那一刻的值**（`null`），比较恒为不等，于是第二档的全量校验
    * 每次文件变动都跑一遍——分层就白做了。这是独立 review 抓到的。
    *
-   * §6.6.3 第一档的判据是「与**上次观测值**比」，**不是**与 `baselineRev` 比：
-   * 交付之后根节点会长期停在旧 revision（spec §6.6.2 有实测），拿它跟
-   * `baselineRev` 比会每次刷新都判不等，同样让分层归零。
-   *
-   * 进程重启后是 `null`，第一次刷新当作「变了」跑一次全量——那正是打开仓库
-   * 本来就要做的事。
-   *
-   * 盒子里那个 `value` **什么时候可以写**是 `svnSync.ts` 里
-   * `recordAfterSuccess` 的事：只有第二档真的跑成功了才记。
+   * 进程重启后是 `null`，第一次检测当作「变了」跑一次全量。盒子里那个 `value`
+   * **什么时候可以写**是 `svnSync.ts` 里 `runSvnSyncCheck` / `recordAfterSuccess` 的事：
+   * 只有第二档真的跑成功、写回了才记。
    */
-  const lastRootRevs = useRef<RootRevMemo>({ value: null })
-
-  /** 上一次校验成功时的 HEAD。见 `checkSvnSyncIfHeadMoved`。 */
-  const lastCheckedHead = useRef<RootRevMemo>({ value: null })
-  /** 焦点检测的上次观测值。放 ref 的理由同 `lastRootRevs`。 */
   const lastWcDbStamps = useRef<WcDbStampMemo>({ value: null })
   /**
    * 最近一次第二档校验的结论，失败时是 `null`。失焦快照要它。
@@ -571,7 +541,7 @@ export function useRepoStore() {
   /**
    * 上一次**开始**服务器侧核对的时刻，与 `auditInFlight` 一起构成
    * `auditIsDue` 的输入。用 ref 而不是 state：写它不该引起重渲染，
-   * 而且定时器闭包读 state 会永远读到注册那一刻的值（`lastRootRevs`
+   * 而且定时器闭包读 state 会永远读到注册那一刻的值（`lastWcDbStamps`
    * 的注释里记的是同一个坑）。
    */
   const lastAuditAt = useRef(0)
@@ -584,6 +554,8 @@ export function useRepoStore() {
    * 放 ref：在跑的那一轮要跨渲染记住。
    */
   const refreshFlights = useRef(createSingleFlight()).current
+  /** SVN 失同步检测的单飞队列，见 `requestSvnCheck`。放 ref 的理由同上。 */
+  const svnCheckQueue = useRef(createSvnCheckQueue()).current
   /**
    * 最后一次请求状态 / diff 的仓库路径。单飞按路径分开（不同仓库的读取不能互相顶替），
    * 旧仓库晚到的结果就要靠它挡住，不让它盖掉新仓库的。现在每个标签页的路径是固定的，
@@ -943,89 +915,87 @@ export function useRepoStore() {
     }
   }
 
-  const readRootRevs = async (path: string) => serializeRootRevs(await svnRootRevs(path))
+  /** 立刻跑一轮检测（`runSvnSyncCheck`），从读戳到结论写回都记在 `svnChecksRunning` 里。 */
+  const runSvnCheckNow = (path: string, force: boolean) =>
+    trackSvnCheck(() =>
+      runSvnSyncCheck(lastWcDbStamps.current, force, () => svnWcDbStamps(path), () => applySvnSync(path)),
+    )
+
+  /**
+   * 后台的失同步检测都从这里排队（`createSvnCheckQueue`）：同一个仓库任一时刻只有一轮在跑，
+   * 在跑时来的合并成一轮补跑，`force` 取或。计数包在开跑的那一轮上：排队期间前一轮还在跑，
+   * 计数本来就不是 0。唯一不排队的是提交前的 `freshSvnSync`，见那里。
+   */
+  const requestSvnCheck = (path: string, force: boolean) =>
+    svnCheckQueue.request(path, force, (forced) => runSvnCheckNow(path, forced))
 
   /**
    * 第二档的**无条件**入口：打开仓库、重建基线之后各用一次。
    *
-   * 顺带把观测到的 rootRevs 记下来当基准——不记的话下一次刷新会因为
-   * `lastRootRevs` 还是 `null` 而再跑一次全量。**先读 revision 再跑校验**，
-   * 而且只在校验成功后才记，理由见 `recordAfterSuccess`。
-   *
-   * 不记 wc.db 戳：打开仓库后第一次存盘，文件变动检测看到戳的记录是空的，会多跑一次第二档。
-   * 只多一次，已知代价（6.11 review 第 4 条，见实现日志）。返回结论有没有写回。
+   * 顺带把 wc.db 戳记下来当基准——不记的话打开仓库后第一次存盘或焦点会因为记录还是 `null`
+   * 而再跑一次全量。先读戳再跑校验，而且只在校验写回后才记（`runSvnSyncCheck`）。
    */
-  const refreshSvnSyncReporting = (path: string) =>
-    trackSvnCheck(async () => {
-      const observed = await readRootRevs(path)
-      return recordAfterSuccess(lastRootRevs.current, observed, () => applySvnSync(path))
-    })
-  /** 对外的入口不关心写没写回，签名保持 `Promise<void>`。 */
   const refreshSvnSync = async (path: string): Promise<void> => {
-    await refreshSvnSyncReporting(path)
+    await requestSvnCheck(path, true)
   }
 
   /**
-   * 第一档：rootRev 或 wc.db 戳与**上次观测值**比，变了才跑第二档。
+   * 文件变动时的检测：wc.db 戳与**上次观测值**比，变了才跑第二档（`runSvnSyncCheck`）。
    *
-   * wc.db 那一半是事故分析 6.11：只更新子目录时根 revision 不动，原来要等下一次焦点才挂出「跟进」。
-   * 与焦点检测共用 `lastWcDbStamps`：两边记的都是「最近一次写回了结论的校验开跑之前的戳」，
-   * 失焦快照按它判断。
-   *
-   * 单飞（6.11 review 第 2 条）：外部更新进行中 wc.db 一直在变，每个事件都并发起一轮的话会叠起
-   * 多个秒级的 `svn status`，还和 TortoiseSVN 抢 wc.db 的锁。在跑时再来的只补跑一次。
+   * 外部更新进行中 wc.db 一直在变，每个事件都并发起一轮的话会叠起多个秒级的 `svn status`，
+   * 还和 TortoiseSVN 抢 wc.db 的锁（6.11 review 第 2 条），所以走 `requestSvnCheck` 排队。
    *
    * 返回是否真的跑了第二档，只为让调用方能读懂日志；调用方不依赖它。
    */
-  const checkSvnSyncIfChanged = (path: string) =>
-    refreshFlights.run(`svnCheck:${path}`, () =>
-      trackSvnCheck(() =>
-        syncIfRootRevOrWcDbChanged(
-          lastRootRevs.current,
-          lastWcDbStamps.current,
-          () => readRootRevs(path),
-          () => svnWcDbStamps(path),
-          () => applySvnSync(path),
-        ),
-      ),
-    )
+  const checkSvnSyncIfChanged = async (path: string) => (await requestSvnCheck(path, false)) !== 'skipped'
 
   /**
    * HEAD 动了就跑第二档（分析 §6.11.3）。`headBehindBase` 是第二档的结论，而切分支不改 revision、
-   * 不写 wc.db，上面两档都看不见：不补这一条的话，切到落后的分支（包括外部工具切的）横幅上
+   * 不写 wc.db，第一档看不见：不补这一条的话，切到落后的分支（包括外部工具切的）横幅上
    * 没有「跟进」，切回来又留着一条过时的横幅。只在 HEAD 真的变了时跑，存盘不会走到第二档。
+   *
+   * 排队时是强制的一轮：合并进比戳的补跑也不会被吞掉（见 `createSvnCheckQueue`）。写回了才记 HEAD
+   * （`recordAfterSuccess`）。
+   *
+   * 比的是「已经请求过、还没落定的 HEAD」，没有才比上次记下的（独立 review）：一轮排队或在跑时
+   * HEAD 从 a 切到 b 又切回 a，只比记录的话切回 a 那次看到的还是 a、直接返回，等 b 那轮写回把
+   * 记录改成 b，HEAD 明明是 a，横幅却停在按 b 算的结论上，直到下一次 HEAD 或 wc.db 变化。
    */
-  const checkSvnSyncIfHeadMoved = (path: string, head: string) =>
-    trackSvnCheck(() =>
-      syncIfRootRevChanged(
+  const checkSvnSyncIfHeadMoved = async (path: string, head: string) => {
+    if (head === (headRequested.current ?? lastCheckedHead.current.value)) return false
+    headRequested.current = head
+    try {
+      await recordAfterSuccess(
         lastCheckedHead.current,
-        async () => head,
-        () => applySvnSync(path),
-      ),
-    )
+        head,
+        async () => (await requestSvnCheck(path, true)) === 'applied',
+      )
+    } finally {
+      // 更晚的一次已经接手时不清：它落定前，再来的同一个 HEAD 不必重复请求
+      if (headRequested.current === head) headRequested.current = null
+    }
+    return true
+  }
 
   /**
    * 窗口拿到焦点、或切到这个标签时的检测（分析 §6.6）：wc.db 变了才跑第二档。
    *
-   * 不能只靠 `checkSvnSyncIfChanged`：TortoiseSVN 只提交、不更新时根节点的 revision 不动，
-   * 第一档看不见，也没有文件事件（`.svn` 被 watcher 过滤）。
+   * 不能只靠 `checkSvnSyncIfChanged`：TortoiseSVN 只提交、不更新时没有文件事件
+   * （`.svn` 被 watcher 过滤），只有 wc.db 变了。
    */
-  const checkSvnSyncOnFocus = (path: string) =>
-    trackSvnCheck(() =>
-      syncIfWcDbChanged(
-        lastWcDbStamps.current,
-        () => svnWcDbStamps(path),
-        () => refreshSvnSyncReporting(path),
-      ),
-    )
+  const checkSvnSyncOnFocus = async (path: string) => (await requestSvnCheck(path, false)) !== 'skipped'
 
   /**
    * 提交前要用的结论（事故分析 6.6，独立 review 第 4 条）：TortoiseSVN 刚更新完、焦点检测还没写回时，
    * `state.svnSync` 还是旧的 InSync，提醒就漏了。先跑一次焦点检测：wc.db 没变只是几次 stat，变了才跑
    * 第二档并等它写回。再从同步写的 ref 读，不读闭包里的 state。检测失败时用已有的结论，不挡提交。
+   *
+   * **不排队**（独立 review）：排在后台那轮后面的话，那轮卡住（svn 进程不退出）提交就跟着卡住，
+   * 不卡也要多等一整轮。自己立刻跑一轮，结论一定晚于这次请求；后台那轮晚到时被 `refreshGate`
+   * 顶替，不会盖掉它。代价是提交那一刻可能与后台那轮并发一次。
    */
   const freshSvnSync = async (path: string): Promise<SyncStatus | null> => {
-    await checkSvnSyncOnFocus(path).catch(() => undefined)
+    await runSvnCheckNow(path, false).catch(() => undefined)
     return samePath(openedPath.current ?? '', path) ? latestSync.current : null
   }
 
@@ -1411,13 +1381,16 @@ export function useRepoEffects(
       // 可能已经换了区，旧区那一份读回来只会被丢掉
       const scope = refreshers.wantedDiffScope.current
       if (scope) void refreshDiff(path, scope).catch(ignore)
-      // §6.6.3 的**分层**：高频通道上只跑 O(1) 的第一档，变了才跑第二档。
+      // §6.6.3 的**分层**：高频通道上只跑第一档（比 wc.db 戳，戳没变时后端只有几次 `stat`），
+      // 变了才跑第二档。
       //
       // 不分层的话，每一次文件保存都会触发一遍白名单子树的 `svn status -v`
-      // ——那是本地读，但在几万文件的工作副本上仍然是可感知的开销。
+      // ——那是本地读，但在几万文件的工作副本上仍然是可感知的开销。第一档本身也不能起
+      // svn 进程：原来读各工作副本根的 revision，每次都要重新枚举工作副本，公司机器上一轮
+      // 69 个进程、约 10 秒（计划 2026-11-08 Task 1）。
       //
       // 比对用的「上次观测值」存在 **ref** 里（见 `useRepoStore` 的
-      // `lastRootRevs`）：这个监听器的 `useEffect` 依赖是 `[state.path, state.capabilities.vcs]`，
+      // `lastWcDbStamps`）：这个监听器的 `useEffect` 依赖是 `[state.path, state.capabilities.vcs]`，
       // 把它放进 state 的话闭包会永远读到注册那一刻的值，比较恒为不等，
       // 第二档还是每次都跑——分层白做。
       if (state.capabilities.vcs === 'svn') {

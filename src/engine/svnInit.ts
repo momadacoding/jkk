@@ -576,6 +576,9 @@ export function wizardErrorHint(code: string, message = ''): string {
     svn_baseline_classification_conflict:
       '录制过程中 TortoiseSVN 正在提交或更新的话，等它做完再试一次就好。' +
       '工作副本不变而重试仍停在同一处，就是这个文件处在本应用还不认识的状态：在 TortoiseSVN 里把它提交，或者对它做「还原」，再试。',
+    svn_baseline_index_conflict:
+      '同一个路径在服务器上和本地一边是文件、一边是目录，录进基线会把其中一个悄悄丢掉，所以停下了。' +
+      '在 TortoiseSVN 里对报出的路径做 Update 或「还原」，让本地与服务器一致之后再试。',
     include_set_mismatch:
       '上面的清单按「是哪条规则做的决定」分组，每组列几个样例；查不到规则的单独成组。' +
       '被某个 .gitignore 挡掉的：把那个 .gitignore 挪走或删掉对应的行——' +

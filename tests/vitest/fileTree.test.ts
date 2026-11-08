@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { buildFileTree, collectDirPaths, type TreeDir, type TreeNode } from '../../src/engine/fileTree'
+import { buildFileTree, collectDirPaths, treeFilePaths, type TreeDir, type TreeNode } from '../../src/engine/fileTree'
 import type { FileStatus } from '../../src/engine/types'
 
 const entry = (path: string, status: FileStatus | null = 'modified') => ({ path, status })
@@ -41,6 +41,28 @@ describe('buildFileTree', () => {
     expect(render(tree)).toEqual(['a/', '  y.ts', 'b/', '  x.ts', 'a.ts', 'z.ts'])
   })
 
+  // 本地改动的 Unstaged 区（第 85 条）：merge / rebase 停下来后冲突是唯一必须先处理的东西，
+  // 树形显示后不能被埋进按字母排在后面的目录里
+  it('冲突文件和含冲突的目录排在同层最前面，其余照旧', () => {
+    const tree = buildFileTree([
+      entry('a/plain.ts'),
+      entry('z/deep/c.ts', 'conflicted'),
+      entry('z/deep/b.ts'),
+      entry('root.ts', 'conflicted'),
+      entry('b.ts'),
+    ])
+    expect(render(tree)).toEqual([
+      'z/',
+      '  deep/',
+      '    c.ts',
+      '    b.ts',
+      'root.ts',
+      'a/',
+      '  plain.ts',
+      'b.ts',
+    ])
+  })
+
   it('同名目录只建一次，文件都挂在同一个节点下', () => {
     const tree = buildFileTree([entry('src/a.ts'), entry('src/b.ts'), entry('src/c.ts')])
     expect(tree).toHaveLength(1)
@@ -80,5 +102,22 @@ describe('collectDirPaths', () => {
   it('返回每一层目录，文件不算', () => {
     const tree = buildFileTree([entry('src/engine/types.ts'), entry('tests/a.ts'), entry('README.md')])
     expect(collectDirPaths(tree).sort()).toEqual(['src', 'src/engine', 'tests'])
+  })
+})
+
+describe('treeFilePaths', () => {
+  const tree = buildFileTree([entry('src/b.ts'), entry('src/a/x.ts'), entry('README.md')])
+
+  it('按树的显示顺序列出全部文件，目录不算', () => {
+    expect(treeFilePaths(tree)).toEqual(['src/a/x.ts', 'src/b.ts', 'README.md'])
+  })
+
+  it('传了展开判断时跳过收起目录里的文件（Shift / 拖动选一段只选看得见的）', () => {
+    expect(treeFilePaths(tree, (dir) => dir !== 'src/a')).toEqual(['src/b.ts', 'README.md'])
+    expect(treeFilePaths(tree, (dir) => dir !== 'src')).toEqual(['README.md'])
+  })
+
+  it('空树是空列表', () => {
+    expect(treeFilePaths([])).toEqual([])
   })
 })

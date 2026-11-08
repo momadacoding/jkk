@@ -7,6 +7,15 @@ pub fn read_app_settings(state: State<'_, DesktopState>) -> AppSettingsView {
     state.view()
 }
 
+/// 设置框开始 / 结束录快捷键。录制期间按下全局快捷键只呼出、不隐藏，见 `desktop::shortcut_action`。
+///
+/// async 命令各自落在线程池上，先后发出的两次调用不保证按序执行；
+/// 顺序由前端保证（`setShortcutRecording` 串行发送），这里只管写原子量。
+#[tauri::command(async)]
+pub fn set_shortcut_recording(state: State<'_, DesktopState>, recording: bool) {
+    state.set_recording_shortcut(recording);
+}
+
 /// 保存应用设置。`show_shortcut` 传 `null` 表示关掉快捷键。
 ///
 /// 用 async 命令：换快捷键要派到主线程执行注册，放在工作线程上等，不占住主线程的事件循环。
