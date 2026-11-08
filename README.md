@@ -68,17 +68,21 @@ pnpm tauri dev
 
 > 如果端口 5174 被占用，先杀掉占用进程再启动。
 
-dev（以及任何 debug 构建）的 identifier 在运行期加上 `.dev` 后缀，配置和 WebView2 数据都与安装版分开：
+`pnpm tauri dev` 的 identifier 在运行期加上 `.dev` 后缀，配置和 WebView2 数据都与安装版分开
+（按 `tauri dev` / `tauri build` 区分，与 debug / release 无关）：
 
 | | 安装版 | dev |
 |---|---|---|
 | 配置（settings / session / 外部工具 / 自定义命令） | `%APPDATA%\com.momadacoding.jkk\` | `%APPDATA%\com.momadacoding.jkk.dev\` |
 | WebView2 数据（界面布局等） | `%LOCALAPPDATA%\com.momadacoding.jkk\` | `%LOCALAPPDATA%\com.momadacoding.jkk.dev\` |
 
-- `.dev` 配置目录还不存在时（第一次跑 dev），从安装版的配置目录复制一份，之后两边各写各的。
-  想重新从安装版同步，删掉 `%APPDATA%\com.momadacoding.jkk.dev\` 再启动 dev。
-- 全局快捷键是系统级的，不随 identifier 隔开：安装版开着时 dev 注册同一个快捷键会失败，设置里会提示。
-- 全局单例只在 release 构建生效，dev 可以和安装版、和别的 worktree 的 dev 同时开。
+- 第一次跑 dev（`.dev` 配置目录还不存在）时，从安装版复制**外部工具**和**自定义命令**两份配置，之后两边各写各的。
+  想重新同步，删掉 `%APPDATA%\com.momadacoding.jkk.dev\` 再启动 dev。
+- 会话和设置**不**复制：带过去的话 dev 一启动就打开你的真实仓库，设置里的全局快捷键也会和安装版抢。
+  dev 从空白的标签栏、默认设置起步。
+- 用 `pnpm tauri dev --config '{"identifier":"…"}'` 换了 identifier 时照原样使用，不加 `.dev`、也不复制，
+  事先写进那个目录的 `session.json` 照读。
+- 全局单例只对 `tauri build` 的产物生效，dev 可以和安装版、和别的 worktree 的 dev 同时开。
 
 ## 构建
 
