@@ -80,3 +80,29 @@
 | 10 | `refreshSvnSyncReporting` 只剩一层包装 | 成立 | **已修**：并进 `refreshSvnSync` |
 
 顺带：第 3 条改完后 `syncIfRootRevChanged` 没有生产代码在用，连同它的 5 条测试删除；「失败不记、同一个值必须重试」由保留的 `recordAfterSuccess` 测试守着（HEAD 变化直接用 `recordAfterSuccess`）。
+
+### 真实窗口 E2E（2026-11-08，合并后的 master `3e68e0b`，含 P1 与 P2）
+
+驱动方式：在 worktree `e2e-svn-scan-perf` 里跑 `pnpm tauri dev --config`（换 identifier 隔离配置；核对过 `app.exe` 在该 worktree 的 `target\debug` 下），通过 WebView2 的 CDP 端口读 DOM、点按钮。焦点用页面内派发的 `window` blur / focus，和真实切窗口走同一组监听。fixture 用 `scripts/e2e-svn-fixture.ps1` 建在 `%TEMP%`，跑完已删。初始化直接调 `svn_init_hybrid`，没走向导（向导不在本轮范围）。暂存用 fixture 里的 `git add`。
+
+#### 计划没写的坑
+
+- `__TAURI_INTERNALS__.invoke` 是不可写、不可配置的属性，包不上。要统计调用了哪些命令，只能包 `window.fetch`：Tauri 2 在 Windows 上把每次 invoke 发成 `http://ipc.localhost/<cmd>`。
+
+#### 结果
+
+按 `e2e/2026-11-01-svn-mixed-baseline-follow-e2e.md` 跑了场景 1、2、4、8、11、12，各项核对全部通过。
+
+| 核对 | 结果 |
+|---|---|
+| wc.db 没变时切走、切回 5 次 | 10 次 `svn_wc_db_stamps`，0 次 `svn_sync_status` |
+| 改白名单内的文件（文件监听） | 2 次 `svn_wc_db_stamps`（立即一次加补查一次），0 次 `svn_sync_status` |
+| 场景 1、2、4、12：外部提交 / 局部更新 / 根目录整体更新 | 每次都出横幅，列的文件、revision、作者都对；跟进耗时 2.3～3.3 s。改文件时，监听在切回窗口之前就跑完了完整检查，切回时只读了戳 |
+| 场景 8：「仅切换」到落后分支（HEAD 变化入口） | 0.6 s 出「当前分支落后基线」，只跑了 1 次 `svn_sync_status`；跟进时转手动跟进，冲突解掉、继续之后分支到了新基线上 |
+| 场景 11：工作副本被锁时切回 | 灰色「SVN 正在更新…」、没有按钮。锁解除后切走再切回，0.2 s 变成黄色横幅，只跑了 1 次完整检查。这次磁盘文件没变，只能靠焦点检测的戳 |
+| 压力测试：外部 5 次 `svn update` 加改文件，同时连发 10 次焦点事件 | 5 次 `svn_sync_status` 依次执行，0 次重叠，每次都对应 wc.db 确实又变了；横幅结论正确 |
+
+#### 没覆盖
+
+- TortoiseSVN 钩子路径（`e2e/2026-11-02-svn-c1h-tsvn-hooks-e2e.md`）：注册钩子要写开发机的 `HKCU`，留给用户手动跑。
+- 公司机器上的实际耗时（计划 P5）。
