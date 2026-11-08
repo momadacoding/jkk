@@ -17,11 +17,18 @@ pub fn run() {
     // 只在 release 构建注册：插件按 identifier 认实例，`pnpm tauri dev` 与安装版共用
     // identifier，开着安装版时 dev 会直接唤起安装版然后退出；几个 worktree 同时跑 dev，
     // 后起的也会悄悄唤起先起的那个。TortoiseSVN 钩子不受影响：main.rs 在进 Tauri 之前就分流了。
-    // 这几条由 tests/single_instance.rs 守着
-    #[cfg(all(desktop, not(debug_assertions)))]
-    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-        desktop::show_main_window(app);
-    }));
+    // 这几条由 tests/single_instance.rs 守着。
+    //
+    // 用运行期的 `cfg!` 而不是 `#[cfg(not(debug_assertions))]`：后者让 debug 下的
+    // clippy / cargo test 根本不编译这段，插件升级改了回调签名也要等打 tag 才炸
+    #[cfg(desktop)]
+    let builder = if cfg!(debug_assertions) {
+        builder
+    } else {
+        builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            desktop::show_main_window(app);
+        }))
+    };
     builder
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {

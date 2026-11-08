@@ -44,12 +44,17 @@ if (Instances) { throw "已有同路径进程在跑，先关掉：$Exe" }
 # 1. 第一个实例
 $first = Launch @()
 $hwnd = [IntPtr]::Zero
+# 认标题：单例插件自己也建了一个顶层的消息窗口（标题是 `<identifier>-siw`），
+# MainWindowHandle 可能先落到它上面，往它发 WM_CLOSE 会把插件的接收端销毁
 for ($i = 0; $i -lt 60 -and $hwnd -eq [IntPtr]::Zero; $i++) {
   Start-Sleep -Milliseconds 500
   $first.Refresh()
-  $hwnd = $first.MainWindowHandle
+  if ($first.MainWindowTitle -like 'jkk*') { $hwnd = $first.MainWindowHandle }
 }
-if ($hwnd -eq [IntPtr]::Zero) { Stop-Process -Id $first.Id; throw '第一个实例 30 秒内没出窗口' }
+if ($hwnd -eq [IntPtr]::Zero) {
+  Stop-Process -Id $first.Id -Force -ErrorAction SilentlyContinue
+  throw '第一个实例 30 秒内没出标题为 jkk… 的窗口'
+}
 Start-Sleep -Seconds 2
 Check '第一个实例起来了' ([W]::IsWindowVisible($hwnd)) "pid=$($first.Id)"
 
@@ -91,7 +96,8 @@ try {
   Check '仍只有一个实例' ((Instances).Count -eq 1) "count=$((Instances).Count)"
 }
 finally {
-  Instances | Stop-Process -Force
+  # 列出来到结束之间进程可能已经自己退了；这里抛错会把下面的结果表吞掉
+  Instances | Stop-Process -Force -ErrorAction SilentlyContinue
 }
 
 $results
