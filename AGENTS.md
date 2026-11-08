@@ -221,10 +221,11 @@ Commit message 格式：
 
 - 远端：仓库已开启 GitHub 的 `deleteBranchOnMerge`（2026-11-08 起），PR 合并后 head 分支自动删除；叠加 PR 的 base 分支被删后，GitHub 会把上层 PR 自动改指向 `master`。不需要再手动 `push --delete` 刚合并的分支。
 - MUST：**谁合并谁清理**。会话在当前对话中合并了自己的 PR 后，下列条件**全部**满足时，可直接清理本会话用 `EnterWorktree` 建的那个 worktree 和本地分支，不需要再单独授权：
-  1. `gh pr view <分支>` 确认 `state` 为 `MERGED`、`baseRefName` 为 `master`
-  2. 本地分支 tip 等于 PR 的 `headRefOid`（合并之后没有新提交）
-  3. 该 worktree 的 `git status --porcelain` 为空（含 untracked）
-- MUST：清理用 `ExitWorktree` 的 `remove`。squash 合并后分支提交不在 `master` 上，它会拒绝并列出这些提交；**核对列出的正是该 PR 的提交**之后，才可以带 `discard_changes: true` 重新调用。没有 `ExitWorktree` 的 agent：先回到主工作区，再 `git worktree remove <路径>`、`git branch -D <分支>`。
+  1. 用本会话刚合并的 **PR 编号**（不是分支名：同名分支可能开过更早的 PR）执行 `gh pr view <编号>`，确认 `state` 为 `MERGED`、`baseRefName` 为 `master`
+  2. 清理前一刻用 `git rev-parse <分支>` 取本地 tip，等于该 PR 的 `headRefOid`（合并之后没有新提交）
+  3. 该 worktree 的 `git status --porcelain --ignored=matching` 里，除了能重新生成的依赖与构建产物（`.gitignore` 里的 `node_modules/`、`dist/`、`src-tauri/target/` 等）和 `.claude/settings.local.json`，没有别的条目——untracked 和被忽略的文件都会被 remove 一起删掉
+- MUST：§4.3 的前置照做：执行前先跑 `git worktree list` 记录状态。只清理自己这一个 worktree 不属于 §4.3 禁止的仓库级清理，有并发会话时也可以做；但 `prune`、批量删分支仍然禁止。
+- MUST：清理用 `ExitWorktree` 的 `remove`。squash 合并后分支提交不在 `master` 上，它会拒绝并列出这些提交；**核对列出的正是该 PR 的提交**之后，才可以带 `discard_changes: true` 重新调用。没有 `ExitWorktree` 的 agent：先回到主工作区，再 `git worktree remove <路径>`、`git branch -D <分支>`；`-D` 不会再核对提交，条件 2 必须在紧挨着它之前刚做过。
 - MUST：上述条件任何一条不满足，或任何一条清理命令失败（例如 Windows 上 `git worktree remove` 在 `node_modules` 上报 `Directory not empty`、留下半删的目录），立即回到文件开头的总规则：停下、如实报告、等授权，不重试、不手动补删。
 - MUST：例外只覆盖**本会话自己建的**那一个 worktree 和分支，不顺手清理别的。
 - SHOULD：用户在 GitHub 页面上合并、或合并的会话没来得及清理时，用 `pwsh -NoProfile -File scripts/stale-branches.ps1` 盘点。它只读，只打印建议的清理命令；执行这些命令仍需用户授权，有并发会话时逐条执行、不要批量。
