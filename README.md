@@ -82,6 +82,13 @@ pnpm tauri build
 测试与 lint 门槛、`pnpm tauri build`，然后把安装包传上去建一个 **draft** Release，
 由人过目后再点发布。
 
+同一提交在 master 上已经有**成功的**预检（workflow_dispatch）时，tag 构建跳过测试与 lint、
+只打包（约 6 分钟）；查不到就照常全跑。门槛只是挪到了预检，同一提交、同一份 workflow
+再跑一遍结论不会变，而私有仓库的 Windows runner 按 2 倍计费。`tauri build` 失败时会等 30 秒
+重试一次，挡掉打包时从 GitHub 下载 WiX 工具碰上的偶发 5xx。
+
+产物是 MSI 安装包和绿色版 zip，从 0.7.4 起不再出 NSIS 的 `setup.exe`。
+
 发版走脚本，在 master 的主工作区里执行（需要 `gh` 已登录）：
 
 ```powershell
@@ -93,7 +100,7 @@ pwsh -NoProfile -File scripts/release.ps1 -Version 0.7.3 -DryRun    # 只检查�
 脚本依次：检查在 master、工作区干净、与 origin 同步、tag 不存在 → 改四处版本号
 （三个清单 + `Cargo.lock` 里 app 那一条）并重新生成许可清单 → 本地 `cargo fmt --check` /
 `clippy` → 提交并推 master → **对这个提交手动触发一次 release workflow 预检** → 预检绿了
-才把 tag 打在**这个提交**上 → 等正式构建。全程约 80 分钟。
+才把 tag 打在**这个提交**上 → 等正式构建。全程约 45 分钟（预检约 40 分钟，正式构建约 6 分钟）。
 
 发版提交按 numstat 校验：四个版本文件必须恰好各改一行，许可清单可以随依赖变化，
 其它任何改动都会让脚本停下（范围见 AGENTS.md「发版提交例外」）。
@@ -113,6 +120,8 @@ SlikSvn 版本等）本地复现不了，以前只能打了 tag 才发现，挂�
 | 版本号提交没推上去，而 origin/master 已前进 | 停下说明，需要先手工把本地 master 对齐 origin |
 
 脚本从不删 tag、不 reset。tag 构建真的失败时，按 AGENTS.md「发版提交例外」的规则改发下一个补丁版本。
+偶发的网络或 API 错误（例如 `Check preflight` 查预检、下载打包工具时 GitHub 返回 5xx）不算真的失败：
+在 Actions 页面对那次 run 点 re-run，再用同一个版本号重跑脚本即可，不用废版本号。
 
 Rust 版本由仓库根的 `rust-toolchain.toml` 钉死，本地 rustup 与 CI 用的是同一个，
 新版 clippy 的 lint 不会再在发版那天才冒出来。升级 Rust 就是改那一行，走 PR。
@@ -187,7 +196,7 @@ workflow 会在构建前自行校验三件事，任何一项不过都在几秒�
 `SIGNING_CERT_PASSWORD` 后，构建会自动用 signtool 给 exe 和安装包签名
 （脚本：`scripts/sign-windows.ps1`）；没配就发未签名包。
 
-签名之前，Windows 会对安装器和绿色版弹 SmartScreen「未知发布者」警告，
+签名之前，Windows 会对安装包和绿色版弹 SmartScreen「未知发布者」警告，
 点「更多信息」→「仍要运行」即可。
 
 ### 应用图标

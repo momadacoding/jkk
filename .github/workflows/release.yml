@@ -41,6 +41,8 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: read
+      # 只给「查同一提交上的预检有没有成功」用（见 Check preflight），只读
+      actions: read
     env:
       # build.rs 取不到 git describe 时直接让构建失败，而不是静默编出标题为
       # 「未知提交」的安装包（见 src-tauri/build.rs）。设在 job 级别：
@@ -112,6 +114,44 @@ jobs:
             throw "git describe 得到 '$describe'，不是 '$ref'：构建出来的窗口标题不会显示为正式版"
           }
           Write-Output "校验通过：$ref @ $env:SHA（相对 master：$cmp，describe：$describe）"
+
+      # 正式构建（打 tag）要不要再跑一遍测试。
+      #
+      # `scripts/release.ps1` 先在同一个提交上跑预检（workflow_dispatch），绿了才打 tag，
+      # tag 就打在那个提交上。同一提交、同一份 workflow、同样的门槛再跑一遍，结论不会变，
+      # 却要再花约 30 分钟（cargo test 占九成），私有仓库的 Windows runner 还按 2 倍计费。
+      # 所以查到同一提交在 master 上有**成功的**预检就跳过测试，只打包；查不到（手工打的 tag、
+      # 预检没跑或没过）就照常全跑——门槛只是挪到预检，没有变少。
+      #
+      # 只认 success：进行中、失败、取消的预检都不算。查询失败时让这一步直接失败，
+      # 不静默当成「没查到」——那样会退回全跑，看起来没事，却每次都白花 30 分钟。
+      - name: Check preflight
+        id: preflight
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # 原生命令非零退出不抛异常，下面自己看 $LASTEXITCODE（同 scripts/sign-windows.ps1）
+          $PSNativeCommandUseErrorActionPreference = $false
+          # API 偶发 5xx 时隔几秒再问，别让一次抖动挂掉整次 tag 构建
+          for ($i = 1; $i -le 3; $i++) {
+            $runs = gh api "repos/$env:REPO/actions/workflows/release.yml/runs?event=workflow_dispatch&branch=master&status=success&head_sha=$env:SHA&per_page=10" --jq '[.workflow_runs[] | select(.head_sha == env.SHA) | .html_url]'
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($i -eq 3) { throw '查询预检失败（已重试两次）。这是 API 问题，不是构建失败：在 Actions 页面 re-run 即可' }
+            Start-Sleep -Seconds 10
+          }
+          $urls = @($runs | ConvertFrom-Json)
+          if ($urls.Count -gt 0) {
+            Write-Output "同一提交已有成功的预检，跳过测试：$($urls[0])"
+            'verified=true' >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Output "同一提交上没有成功的预检，照常跑全部测试"
+            'verified=false' >> $env:GITHUB_OUTPUT
+          }
 
       # Release 说明里的「新功能 / 修复」，取自上一个正式版以来的 feat / fix 提交。
       # 放在 build job 而不是 publish job：publish job 持有 contents: write，
@@ -185,6 +225,7 @@ jobs:
       # 用 SlikSvn 是为了和本地开发环境同一发行版；钉死版本，升级要手工改。
       # choco 改的是机器 PATH，后续 step 看不到，得显式写进 GITHUB_PATH。
       - name: Install SVN
+        if: steps.preflight.outputs.verified != 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -203,6 +244,7 @@ jobs:
       # 必须写**全局配置**而不是设 GIT_AUTHOR_* 环境变量：环境变量会压过 fixture
       # 自己设的仓库级身份，让断言作者名的测试反过来挂掉（本地实测过）。
       - name: Configure git identity for tests
+        if: steps.preflight.outputs.verified != 'true'
         run: |
           git config --global user.name CI
           git config --global user.email ci@localhost
@@ -211,13 +253,20 @@ jobs:
 
       # 发版前把本地那套门槛在干净环境里再走一遍。
       # 没有 PR CI，这是唯一一次「不是在我这台机器上」的验证。
-      - run: pnpm test
+      # 正式构建在同一提交的预检已经过了时跳过这几步，见 Check preflight。pnpm build 照跑：
+      # 几秒钟，tauri build 的 beforeBuildCommand 反正也要再跑一次
+      - name: pnpm test
+        if: steps.preflight.outputs.verified != 'true'
+        run: pnpm test
       - run: pnpm build
       - name: cargo fmt --check
+        if: steps.preflight.outputs.verified != 'true'
         run: cargo fmt --check --manifest-path src-tauri/Cargo.toml
       - name: cargo clippy
+        if: steps.preflight.outputs.verified != 'true'
         run: cargo clippy --all-targets --manifest-path src-tauri/Cargo.toml -- -D warnings
       - name: cargo test
+        if: steps.preflight.outputs.verified != 'true'
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
       # 第三方许可清单必须和锁文件一致。生成物进了仓库（安装包要带上它），
@@ -272,13 +321,34 @@ jobs:
           } | ConvertTo-Json -Depth 6 -Compress
           $cfgPath = Join-Path $env:RUNNER_TEMP 'tauri-sign.conf.json'
           [IO.File]::WriteAllText($cfgPath, $cfg)
-          pnpm tauri build -c $cfgPath
-          if ($LASTEXITCODE -ne 0) { throw 'tauri build (signed) 失败' }
+          # 重试一次，理由见 unsigned 那一步
+          $PSNativeCommandUseErrorActionPreference = $false
+          for ($i = 1; $i -le 2; $i++) {
+            pnpm tauri build -c $cfgPath
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($i -eq 2) { throw 'tauri build (signed) 失败（已重试一次）' }
+            Write-Output "::warning::tauri build 第 $i 次失败，30 秒后重试"
+            Start-Sleep -Seconds 30
+          }
 
-      # 无证书路径必须与接线前逐字节一致
+      # 无证书路径必须与接线前逐字节一致（重试不改变命令本身）。
+      #
+      # 失败了重试一次：打包时 tauri 现从 GitHub 下 WiX 工具，失败多是 GitHub 那头的抖动
+      # （2026-11-08 预检挂在下载 NSIS 时的 `http status: 504`，前面 35 分钟的测试全白跑）。
+      # 重试只重跑打包；第二次还失败就是真问题，照常让 job 失败
       - name: tauri build (unsigned)
         if: steps.cert.outputs.has_cert == 'false'
-        run: pnpm tauri build
+        shell: pwsh
+        run: |
+          # 第一次非零退出不能直接抛异常，否则重试形同虚设
+          $PSNativeCommandUseErrorActionPreference = $false
+          for ($i = 1; $i -le 2; $i++) {
+            pnpm tauri build
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($i -eq 2) { throw 'tauri build (unsigned) 失败（已重试一次）' }
+            Write-Output "::warning::tauri build 第 $i 次失败，30 秒后重试"
+            Start-Sleep -Seconds 30
+          }
 
       # runner 是一次性 VM，但证书不该陪跑到 job 结束
       - name: Remove signing certificate
@@ -346,9 +416,11 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Path artifacts -Force | Out-Null
-          $bundle = 'src-tauri/target/release/bundle'
-          $found = Get-ChildItem $bundle -Recurse -Include *.exe, *.msi -ErrorAction SilentlyContinue
-          if (-not $found) { throw "在 $bundle 下没找到任何 .exe/.msi 产物" }
+          # 只出 MSI（tauri.conf.json 的 bundle.targets）。在这里就要求它在，
+          # 别等 publish 建好 draft 才发现缺了、留下一个残缺的 draft
+          $bundle = 'src-tauri/target/release/bundle/msi'
+          $found = Get-ChildItem $bundle -Filter *.msi -ErrorAction SilentlyContinue
+          if (-not $found) { throw "在 $bundle 下没找到 .msi 产物" }
           $found | ForEach-Object { Copy-Item $_.FullName artifacts/ }
           Get-ChildItem artifacts | Select-Object Name, Length
 
@@ -409,11 +481,13 @@ jobs:
           点「更多信息」→「仍要运行」即可。
 
           产物：
-          - `*-setup.exe` —— NSIS 安装器
           - `*.msi` —— MSI 安装包
           - `*-portable.zip` —— 免安装绿色版（解压即用；缺 WebView2 运行时的旧系统
             需先装 https://developer.microsoft.com/microsoft-edge/webview2/ ）
           - `SHA256SUMS.txt` —— 上面文件的校验和
+
+          从 0.7.4 起不再提供 `setup.exe`。之前用 setup.exe 装过的，请先在「设置 → 应用」里
+          卸载旧版再装 MSI（MSI 是另一套安装，不会替换旧版），或者改用绿色版。
 
           第三方组件的许可声明见安装目录下的 THIRD_PARTY_NOTICES.md。'
 
@@ -446,11 +520,12 @@ jobs:
 
           gh release upload "$REF_NAME" artifacts/* --clobber
 
-          # 传完核对一遍：两种安装包和绿色 zip 都必须在，否则等于发了个残缺的 Release
+          # 传完核对一遍：安装包和绿色 zip 都必须在，否则等于发了个残缺的 Release。
+          # 不再出 NSIS 安装器（tauri.conf.json 的 bundle.targets 只有 msi）：没有签名时两种安装器
+          # 一样弹 SmartScreen，多一种只是多一次从 GitHub 下载工具、多一个出错的机会
           assets=$(gh release view "$REF_NAME" --json assets --jq '.assets[].name')
           echo "已上传的资产："
           echo "$assets"
           echo "$assets" | grep -q '\.msi$'         || { echo "::error::缺少 .msi 资产"; exit 1; }
-          echo "$assets" | grep -q 'setup\.exe$'    || { echo "::error::缺少 setup.exe 资产"; exit 1; }
           echo "$assets" | grep -q 'portable\.zip$' || { echo "::error::缺少 portable zip 资产"; exit 1; }
           echo "$assets" | grep -q '^SHA256SUMS.txt$' || { echo "::error::缺少 SHA256SUMS.txt"; exit 1; }
