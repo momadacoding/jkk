@@ -12,11 +12,9 @@ import {
   markOnBlur,
   needsStandaloneCheck,
   recordAfterSuccess,
+  runSvnSyncCheck,
   shouldMarkOnBlur,
   syncBannerIsSuppressed,
-  syncIfRootRevChanged,
-  syncIfRootRevOrWcDbChanged,
-  syncIfWcDbChanged,
   wcDbStampsChanged,
   type EolStatus,
   type RootRevMemo,
@@ -292,66 +290,9 @@ describe('§6.6.3 两档同步检测：什么时候才允许把观测值记下�
     }
   }
 
-  it('rootRevs 没变就不跑第二档', async () => {
-    const memo: RootRevMemo = { value: 'wc=7' }
-    const full = fakeFullCheck()
-    const ran = await syncIfRootRevChanged(memo, async () => 'wc=7', full.run)
-    expect(ran).toBe(false)
-    expect(full.calls).toHaveLength(0)
-    expect(memo.value).toBe('wc=7')
-  })
-
-  it('rootRevs 变了就跑第二档，成功后记下新值', async () => {
-    const memo: RootRevMemo = { value: 'wc=7' }
-    const full = fakeFullCheck()
-    const ran = await syncIfRootRevChanged(memo, async () => 'wc=8', full.run)
-    expect(ran).toBe(true)
-    expect(full.calls).toHaveLength(1)
-    expect(memo.value).toBe('wc=8')
-  })
-
-  it('第一次启动时 memo 是 null，第一档一律判「变了」', async () => {
-    // 进程刚起来没有基准，这一次全量正是打开仓库本来就要做的事。
-    const memo: RootRevMemo = { value: null }
-    const full = fakeFullCheck()
-    expect(await syncIfRootRevChanged(memo, async () => 'wc=1', full.run)).toBe(true)
-    expect(memo.value).toBe('wc=1')
-  })
-
-  it('第二档失败时不记观测值，**同一个 revision 第二次必须重试**', async () => {
-    // 这一条是这组测试存在的理由（2026-09-21 独立 review）。
-    // 改之前：观测值在 await 之前就推进了，失败之后下一次事件看到同一个
-    // revision 直接返回，失同步横幅永远停在旧值，直到 revision 再变或重开仓库。
-    const memo: RootRevMemo = { value: 'wc=7' }
-    const full = fakeFullCheck()
-    const read = async () => 'wc=8'
-
-    full.failNext(true)
-    await expect(syncIfRootRevChanged(memo, read, full.run)).rejects.toThrow()
-    expect(full.calls).toHaveLength(1)
-    expect(memo.value).toBe('wc=7') // ← 没推进
-
-    // 下一次文件变动事件：revision 还是 wc=8，但必须真的再跑一遍
-    full.failNext(false)
-    expect(await syncIfRootRevChanged(memo, read, full.run)).toBe(true)
-    expect(full.calls).toHaveLength(2)
-    expect(memo.value).toBe('wc=8')
-  })
-
-  it('第一档自己读不到 rootRevs 时，既不跑第二档也不动观测值', async () => {
-    const memo: RootRevMemo = { value: 'wc=7' }
-    const full = fakeFullCheck()
-    const boom = async (): Promise<string> => {
-      throw new Error('svn info 失败')
-    }
-    await expect(syncIfRootRevChanged(memo, boom, full.run)).rejects.toThrow()
-    expect(full.calls).toHaveLength(0)
-    expect(memo.value).toBe('wc=7')
-  })
-
-  it('无条件入口（打开仓库 / 重建之后）同样是成功才记', async () => {
-    // 这两个入口不经过第一档，但「失败就不记」这条规则必须共用一份实现，
-    // 否则迟早有一份会和另一份分叉。
+  it('第二档失败时不记观测值，同一个值第二次必须重试（HEAD 变化用它）', async () => {
+    // 2026-09-21 独立 review：观测值在 await 之前就推进的话，失败之后下一次事件看到同一个值
+    // 直接返回，横幅永远停在旧结论。
     const memo: RootRevMemo = { value: null }
     const full = fakeFullCheck()
 
@@ -500,94 +441,7 @@ describe('wcDbStampsChanged', () => {
   })
 })
 
-describe('syncIfWcDbChanged', () => {
-  const a: WcDbStamp = { wcRoot: 'C:/wc', mtimeNs: '1', size: 1 }
-  const a2: WcDbStamp = { ...a, mtimeNs: '2' }
-
-  it('focus refreshes sync only when wc.db stamp changed', async () => {
-    const memo: WcDbStampMemo = { value: null }
-    let checks = 0
-    const check = async () => {
-      checks += 1
-    }
-
-    // 第一次没有记录，要跑
-    expect(await syncIfWcDbChanged(memo, async () => [a], check)).toBe(true)
-    expect(checks).toBe(1)
-    expect(memo.value).toEqual([a])
-
-    // 来回切窗口，wc.db 没变：一次校验都不发
-    expect(await syncIfWcDbChanged(memo, async () => [a], check)).toBe(false)
-    expect(await syncIfWcDbChanged(memo, async () => [{ ...a }], check)).toBe(false)
-    expect(checks).toBe(1)
-
-    // TortoiseSVN 提交之后切回来
-    expect(await syncIfWcDbChanged(memo, async () => [a2], check)).toBe(true)
-    expect(checks).toBe(2)
-    expect(memo.value).toEqual([a2])
-  })
-
-  it('校验失败不记：下一次焦点重试，不能让横幅长期撒谎', async () => {
-    const memo: WcDbStampMemo = { value: [a] }
-
-    await expect(
-      syncIfWcDbChanged(
-        memo,
-        async () => [a2],
-        async () => {
-          throw new Error('wc locked')
-        },
-      ),
-    ).rejects.toThrow('wc locked')
-
-    expect(memo.value).toEqual([a])
-    let checks = 0
-    await syncIfWcDbChanged(
-      memo,
-      async () => [a2],
-      async () => {
-        checks += 1
-      },
-    )
-    expect(checks).toBe(1)
-  })
-
-  it('读戳失败时不跑校验、记录不动，错误交给调用方', async () => {
-    const memo: WcDbStampMemo = { value: [a] }
-    let checks = 0
-
-    await expect(
-      syncIfWcDbChanged(
-        memo,
-        async () => {
-          throw new Error('stat failed')
-        },
-        async () => {
-          checks += 1
-        },
-      ),
-    ).rejects.toThrow('stat failed')
-
-    expect(checks).toBe(0)
-    expect(memo.value).toEqual([a])
-  })
-
-  it('记的是开跑之前读到的戳：校验期间又变了，下一次还会判不等', async () => {
-    const memo: WcDbStampMemo = { value: null }
-    let disk = a
-    await syncIfWcDbChanged(
-      memo,
-      async () => [disk],
-      async () => {
-        disk = a2
-      },
-    )
-    expect(memo.value).toEqual([a])
-    expect(wcDbStampsChanged(memo.value, [disk])).toBe(true)
-  })
-})
-
-describe('syncIfRootRevOrWcDbChanged（6.11：文件变动时也比 wc.db）', () => {
+describe('runSvnSyncCheck（第一档只比 wc.db 戳，计划 2026-11-08 Task 1）', () => {
   const a: WcDbStamp = { wcRoot: 'C:/wc', mtimeNs: '1', size: 1 }
   const a2: WcDbStamp = { ...a, mtimeNs: '2' }
   const counter = () => {
@@ -601,133 +455,94 @@ describe('syncIfRootRevOrWcDbChanged（6.11：文件变动时也比 wc.db）', (
       },
     }
   }
+  const boom = async (): Promise<WcDbStamp[]> => {
+    throw new Error('stat failed')
+  }
 
-  it('只更新子目录：根 revision 不变、wc.db 变了，也要跑第二档', async () => {
-    const root: RootRevMemo = { value: 'wc=7' }
-    const wc: WcDbStampMemo = { value: [a] }
+  it('第一次没有记录：要跑，记下戳', async () => {
+    const memo: WcDbStampMemo = { value: null }
     const full = counter()
-
-    const ran = await syncIfRootRevOrWcDbChanged(root, wc, async () => 'wc=7', async () => [a2], full.run)
-
-    expect(ran).toBe(true)
+    expect(await runSvnSyncCheck(memo, false, async () => [a], full.run)).toBe('applied')
     expect(full.count).toBe(1)
-    expect(wc.value).toEqual([a2])
-    expect(root.value).toBe('wc=7')
+    expect(memo.value).toEqual([a])
   })
 
-  it('两样都没变：一次校验都不发（存盘是高频事件）', async () => {
-    const root: RootRevMemo = { value: 'wc=7' }
-    const wc: WcDbStampMemo = { value: [a] }
+  it('非强制、戳没变：不跑第二档，返回 skipped（存盘、来回切窗口是高频事件）', async () => {
+    const memo: WcDbStampMemo = { value: [a] }
     const full = counter()
-
-    expect(await syncIfRootRevOrWcDbChanged(root, wc, async () => 'wc=7', async () => [{ ...a }], full.run)).toBe(false)
+    expect(await runSvnSyncCheck(memo, false, async () => [{ ...a }], full.run)).toBe('skipped')
     expect(full.count).toBe(0)
   })
 
-  it('根 revision 变了照旧跑，两份观测值都记下', async () => {
-    const root: RootRevMemo = { value: 'wc=7' }
-    const wc: WcDbStampMemo = { value: [a] }
+  it('非强制、戳变了：跑第二档，写回后记下开跑前读到的戳', async () => {
+    const memo: WcDbStampMemo = { value: [a] }
+    let disk = a2
+    const a3: WcDbStamp = { ...a, mtimeNs: '3' }
+    expect(
+      await runSvnSyncCheck(memo, false, async () => [disk], async () => {
+        disk = a3
+      }),
+    ).toBe('applied')
+    expect(memo.value).toEqual([a2])
+    // 校验期间 wc.db 又写了一笔：尾随复查还会判不等
     const full = counter()
-
-    expect(await syncIfRootRevOrWcDbChanged(root, wc, async () => 'wc=8', async () => [a2], full.run)).toBe(true)
-    expect(root.value).toBe('wc=8')
-    expect(wc.value).toEqual([a2])
+    expect(await runSvnSyncCheck(memo, false, async () => [disk], full.run)).toBe('applied')
+    expect(full.count).toBe(1)
   })
 
-  it('校验失败两份都不记：下一次事件重试', async () => {
-    const root: RootRevMemo = { value: 'wc=7' }
-    const wc: WcDbStampMemo = { value: [a] }
+  it('强制、戳没变：照样跑第二档（打开仓库、HEAD 动了）', async () => {
+    const memo: WcDbStampMemo = { value: [a] }
+    const full = counter()
+    expect(await runSvnSyncCheck(memo, true, async () => [a], full.run)).toBe('applied')
+    expect(full.count).toBe(1)
+    expect(memo.value).toEqual([a])
+  })
 
+  it('强制、读戳失败：照样跑第二档，记录不动', async () => {
+    const memo: WcDbStampMemo = { value: [a] }
+    const full = counter()
+    expect(await runSvnSyncCheck(memo, true, boom, full.run)).toBe('applied')
+    expect(full.count).toBe(1)
+    expect(memo.value).toEqual([a])
+  })
+
+  it('非强制、读戳失败：抛错，不跑第二档，记录不动', async () => {
+    const memo: WcDbStampMemo = { value: [a] }
+    const full = counter()
+    await expect(runSvnSyncCheck(memo, false, boom, full.run)).rejects.toThrow('stat failed')
+    expect(full.count).toBe(0)
+    expect(memo.value).toEqual([a])
+  })
+
+  it('第二档被顶替（返回 false）：返回 superseded，记录不动', async () => {
+    const memo: WcDbStampMemo = { value: [a] }
+    expect(await runSvnSyncCheck(memo, false, async () => [a2], async () => false)).toBe('superseded')
+    expect(memo.value).toEqual([a])
+  })
+
+  it('第二档抛错：一并抛出，记录不动，下一次事件重试', async () => {
+    const memo: WcDbStampMemo = { value: [a] }
     await expect(
-      syncIfRootRevOrWcDbChanged(root, wc, async () => 'wc=8', async () => [a2], async () => {
+      runSvnSyncCheck(memo, false, async () => [a2], async () => {
         throw new Error('wc locked')
       }),
     ).rejects.toThrow('wc locked')
-
-    expect(root.value).toBe('wc=7')
-    expect(wc.value).toEqual([a])
-  })
-
-  it('读 wc.db 戳失败：退回只看根 revision，戳的记录不动', async () => {
-    const root: RootRevMemo = { value: 'wc=7' }
-    const wc: WcDbStampMemo = { value: [a] }
-    const boom = async (): Promise<WcDbStamp[]> => {
-      throw new Error('stat failed')
-    }
+    expect(memo.value).toEqual([a])
     const full = counter()
-
-    expect(await syncIfRootRevOrWcDbChanged(root, wc, async () => 'wc=7', boom, full.run)).toBe(false)
-    expect(full.count).toBe(0)
-
-    expect(await syncIfRootRevOrWcDbChanged(root, wc, async () => 'wc=8', boom, full.run)).toBe(true)
-    expect(full.count).toBe(1)
-    expect(root.value).toBe('wc=8')
-    expect(wc.value).toEqual([a])
-  })
-
-  it('记的是开跑之前读到的戳：校验期间 wc.db 又写了一笔，尾随复查还会判不等', async () => {
-    const root: RootRevMemo = { value: 'wc=7' }
-    const wc: WcDbStampMemo = { value: [a] }
-    let disk = a2
-    const a3: WcDbStamp = { ...a, mtimeNs: '3' }
-
-    await syncIfRootRevOrWcDbChanged(root, wc, async () => 'wc=7', async () => [disk], async () => {
-      disk = a3
-    })
-    expect(wc.value).toEqual([a2])
-
-    const full = counter()
-    expect(await syncIfRootRevOrWcDbChanged(root, wc, async () => 'wc=7', async () => [disk], full.run)).toBe(true)
+    expect(await runSvnSyncCheck(memo, false, async () => [a2], full.run)).toBe('applied')
     expect(full.count).toBe(1)
   })
 
-  it('读根 revision 失败：只按戳判断，根的记录不动', async () => {
-    const root: RootRevMemo = { value: 'wc=7' }
-    const wc: WcDbStampMemo = { value: [a] }
-    const boom = async (): Promise<string> => {
-      throw new Error('svn info failed')
-    }
-    const full = counter()
+  it('review 第 1 条：先开跑的被顶替、后开跑的失败，记录不能推进', async () => {
+    const memo: WcDbStampMemo = { value: [a] }
 
-    expect(await syncIfRootRevOrWcDbChanged(root, wc, boom, async () => [a], full.run)).toBe(false)
-    expect(await syncIfRootRevOrWcDbChanged(root, wc, boom, async () => [a2], full.run)).toBe(true)
-    expect(full.count).toBe(1)
-    expect(root.value).toBe('wc=7')
-    expect(wc.value).toEqual([a2])
-  })
-
-  it('两样都读不到：抛错，什么都不记', async () => {
-    const root: RootRevMemo = { value: 'wc=7' }
-    const wc: WcDbStampMemo = { value: [a] }
-    await expect(
-      syncIfRootRevOrWcDbChanged(
-        root,
-        wc,
-        async () => {
-          throw new Error('svn info failed')
-        },
-        async () => {
-          throw new Error('stat failed')
-        },
-        async () => undefined,
-      ),
-    ).rejects.toThrow('svn info failed')
-    expect(root.value).toBe('wc=7')
-    expect(wc.value).toEqual([a])
-  })
-
-  it('review 第 1 条：先开跑的被顶替、后开跑的失败，两份记录都不能推进', async () => {
-    const root: RootRevMemo = { value: 'wc=7' }
-    const wc: WcDbStampMemo = { value: [a] }
-
-    // X 读到最终戳 a2，开跑；T（尾随复查）在 X 回来之前也开跑，成为最新的一次
     // 两边都等「第二档已开跑」再往下走，不靠数微任务
     let finishX!: (wrote: boolean) => void
     let xStarted!: () => void
     const xRunning = new Promise<void>((res) => {
       xStarted = res
     })
-    const x = syncIfRootRevOrWcDbChanged(root, wc, async () => 'wc=7', async () => [a2], () =>
+    const x = runSvnSyncCheck(memo, false, async () => [a2], () =>
       new Promise<boolean>((res) => {
         finishX = res
         xStarted()
@@ -738,7 +553,7 @@ describe('syncIfRootRevOrWcDbChanged（6.11：文件变动时也比 wc.db）', (
     const tRunning = new Promise<void>((res) => {
       tStarted = res
     })
-    const t = syncIfRootRevOrWcDbChanged(root, wc, async () => 'wc=7', async () => [a2], () =>
+    const t = runSvnSyncCheck(memo, false, async () => [a2], () =>
       new Promise<boolean>((_, rej) => {
         failT = rej
         tStarted()
@@ -746,33 +561,24 @@ describe('syncIfRootRevOrWcDbChanged（6.11：文件变动时也比 wc.db）', (
     )
     await Promise.all([xRunning, tRunning])
 
-    finishX(false) // 被 T 顶替，结论没写回
-    expect(await x).toBe(true)
+    finishX(false)
+    expect(await x).toBe('superseded')
     failT(new Error('sqlite busy'))
     await expect(t).rejects.toThrow('sqlite busy')
 
-    expect(root.value).toBe('wc=7')
-    expect(wc.value).toEqual([a])
-    // 之后不管哪个通道再来，都还会跑第二档：焦点检测
-    const focus = counter()
-    expect(await syncIfWcDbChanged({ value: wc.value }, async () => [a2], focus.run)).toBe(true)
-    expect(focus.count).toBe(1)
-    // 文件变动 / 尾随复查
+    expect(memo.value).toEqual([a])
     const full = counter()
-    expect(await syncIfRootRevOrWcDbChanged(root, wc, async () => 'wc=7', async () => [a2], full.run)).toBe(true)
+    expect(await runSvnSyncCheck(memo, false, async () => [a2], full.run)).toBe('applied')
     expect(full.count).toBe(1)
   })
 
-  it('被顶替时焦点检测与 recordAfterSuccess 也不记', async () => {
-    const wc: WcDbStampMemo = { value: [a] }
-    expect(await syncIfWcDbChanged(wc, async () => [a2], async () => false)).toBe(true)
-    expect(wc.value).toEqual([a])
-
-    const root: RootRevMemo = { value: 'wc=7' }
-    expect(await recordAfterSuccess(root, 'wc=8', async () => false)).toBe(false)
-    expect(root.value).toBe('wc=7')
-    expect(await syncIfRootRevChanged(root, async () => 'wc=8', async () => false)).toBe(true)
-    expect(root.value).toBe('wc=7')
+  it('recordAfterSuccess 被顶替时不记，任意类型的观测值都一样', async () => {
+    const head: RootRevMemo = { value: 'h1' }
+    expect(await recordAfterSuccess(head, 'h2', async () => false)).toBe(false)
+    expect(head.value).toBe('h1')
+    const memo: WcDbStampMemo = { value: [a] }
+    expect(await recordAfterSuccess(memo, [a2], async () => undefined)).toBe(true)
+    expect(memo.value).toEqual([a2])
   })
 
   it('尾随复查的间隔比 watcher 的去抖长', () => {

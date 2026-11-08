@@ -74,7 +74,7 @@ describe('SVN 刷新：请求在飞时切到了别的仓库', () => {
     const { result } = renderHook(() => useRepoStore())
     await openAt(result, 'C:/a')
     act(() => { void result.current.refreshSvnSync('C:/a') })
-    await answer('svn_root_revs', 'C:/a', [{ wcRoot: 'C:/a', rev: 7 }])
+    await answer('svn_wc_db_stamps', 'C:/a', [{ wcRoot: 'C:/a', mtimeNs: '7', size: 1 }])
     await openAt(result, 'C:/b')
     await answer('svn_sync_status', 'C:/a', syncStatus)
     expect(result.current.state.svnSync).toBeNull()
@@ -85,7 +85,7 @@ describe('SVN 刷新：请求在飞时切到了别的仓库', () => {
     const { result } = renderHook(() => useRepoStore())
     await openAt(result, 'C:/a')
     act(() => { void result.current.refreshSvnSync('C:/a') })
-    await answer('svn_root_revs', 'C:/a', [{ wcRoot: 'C:/a', rev: 7 }])
+    await answer('svn_wc_db_stamps', 'C:/a', [{ wcRoot: 'C:/a', mtimeNs: '7', size: 1 }])
     await openAt(result, 'C:/b')
     await answer('svn_sync_status', 'C:/a', syncStatus)
     // 不 await：会写快照的话 svn_follow_mark 挂在 pending 里永远不回
@@ -98,10 +98,11 @@ describe('SVN 刷新：请求在飞时切到了别的仓库', () => {
     const { result } = renderHook(() => useRepoStore())
     await openAt(result, 'C:/a')
     act(() => { void result.current.refreshSvnSync('C:/a') })
-    await answer('svn_root_revs', 'C:/a', [{ wcRoot: 'C:/a', rev: 7 }])
+    await answer('svn_wc_db_stamps', 'C:/a', [{ wcRoot: 'C:/a', mtimeNs: '7', size: 1 }])
     await answer('svn_sync_status', 'C:/a', syncStatus)
     act(() => { void result.current.markSvnFollowOnBlur('C:/a') })
-    await act(async () => {})
+    // 打开时记下了戳，失焦先核对 wc.db 没变（TortoiseSVN 在 jkk 前台时完成的提交要挡住）
+    await answer('svn_wc_db_stamps', 'C:/a', [{ wcRoot: 'C:/a', mtimeNs: '7', size: 1 }])
     expect(pending.some((p) => p.cmd === 'svn_follow_mark' && p.args.path === 'C:/a')).toBe(true)
   })
 
@@ -113,7 +114,7 @@ describe('SVN 刷新：请求在飞时切到了别的仓库', () => {
     expect(result.current.state.svnRevs.map((r) => r.rev)).toEqual([7])
 
     act(() => { void result.current.refreshSvnSync('C:/a') })
-    await answer('svn_root_revs', 'C:/a', [{ wcRoot: 'C:/a', rev: 7 }])
+    await answer('svn_wc_db_stamps', 'C:/a', [{ wcRoot: 'C:/a', mtimeNs: '7', size: 1 }])
     await answer('svn_sync_status', 'C:/a', syncStatus)
     expect(result.current.state.svnSync).toEqual(syncStatus)
   })

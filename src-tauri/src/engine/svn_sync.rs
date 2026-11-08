@@ -403,12 +403,18 @@ pub(crate) fn tree_files(repo_root: &str, oid: &str) -> Result<BTreeSet<String>>
     crate::engine::git_read::tree_paths(repo_root, oid)
 }
 
-/// 每个工作副本根的 revision（spec §6.6.3 的**第一档**，O(1)）。
+/// 每个工作副本根的 revision。
 ///
 /// 走 `svn info --show-item revision`：实测 stdout 就是裸的十进制数字，
 /// 不用过 XML 解析。**`svn info` 绝不能带 `--ignore-externals`**（它拒绝这个参数）。
 ///
-/// 返回值给前端与**上次观测值**比对用；任一条变了就该跑一次 [`check_sync`]。
+/// # 不是 O(1)
+///
+/// 每次调用都先跑一遍 [`enumerate_wcs`]（每个工作副本一次 `svn info --xml` + 一次完整递归的
+/// `svn status --xml`），再每个工作副本一次 `--show-item`。2026-11-07 公司机器实测：23 个白名单
+/// 目录一轮 69 个 svn 进程、约 10 秒。它原来是前端的第一档，挂在每次 `repo-changed` 上；
+/// 计划 2026-11-08 Task 1 起第一档改看 wc.db 戳（`svn_follow_mark::wc_db_stamps`，枚举有缓存），
+/// 前端不再调用它。
 pub fn read_root_revs(repo_root: &str) -> Result<Vec<RootRev>> {
     let cfg = read_config(repo_root)?;
     let wcs = enumerate_wcs(repo_root, &cfg.whitelist)?;

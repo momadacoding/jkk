@@ -33,7 +33,7 @@ beforeEach(() => {
   answers.clear()
   answers.set('open_repo', () => ({ path: 'C:/r', head: 'work', headHash: 'h' }))
   answers.set('read_capabilities', () => SVN)
-  answers.set('svn_root_revs', () => [{ wcRoot: 'C:/r', rev: 1 }])
+  answers.set('svn_wc_db_stamps', () => [{ wcRoot: 'C:/r', mtimeNs: '1', size: 1 }])
 })
 
 async function opened() {
@@ -50,8 +50,8 @@ describe('失同步判定报 svn_no_baseline', () => {
     await act(async () => { await result.current.refreshSvnSync('C:/r') })
     expect(result.current.state.svnSync).toEqual(inSync)
 
-    // 换一个 revision，第一档才会再跑第二档
-    answers.set('svn_root_revs', () => [{ wcRoot: 'C:/r', rev: 2 }])
+    // wc.db 也变了（refreshSvnSync 本身不看戳，无条件跑第二档）
+    answers.set('svn_wc_db_stamps', () => [{ wcRoot: 'C:/r', mtimeNs: '2', size: 1 }])
     answers.set('svn_sync_status', () => Promise.reject({ code: 'svn_no_baseline', message: '读不到基线分支' }))
     await act(async () => { await result.current.refreshSvnSync('C:/r').catch(() => undefined) })
     expect(result.current.state.svnBaselineMissing).toBe(true)
@@ -62,7 +62,7 @@ describe('失同步判定报 svn_no_baseline', () => {
     const { result } = await opened()
     answers.set('svn_sync_status', () => Promise.reject({ code: 'svn_no_baseline', message: '读不到基线分支' }))
     await act(async () => { await result.current.refreshSvnSync('C:/r').catch(() => undefined) })
-    answers.set('svn_root_revs', () => [{ wcRoot: 'C:/r', rev: 2 }])
+    answers.set('svn_wc_db_stamps', () => [{ wcRoot: 'C:/r', mtimeNs: '2', size: 1 }])
     answers.set('svn_sync_status', () => Promise.reject({ code: 'svn_wc_locked', message: 'E155004' }))
     await act(async () => { await result.current.refreshSvnSync('C:/r').catch(() => undefined) })
     expect(result.current.state.svnBaselineMissing).toBe(true)
@@ -73,7 +73,7 @@ describe('失同步判定报 svn_no_baseline', () => {
     const { result } = await opened()
     answers.set('svn_sync_status', () => inSync)
     await act(async () => { await result.current.refreshSvnSync('C:/r') })
-    answers.set('svn_root_revs', () => [{ wcRoot: 'C:/r', rev: 2 }])
+    answers.set('svn_wc_db_stamps', () => [{ wcRoot: 'C:/r', mtimeNs: '2', size: 1 }])
     answers.set('svn_sync_status', () => Promise.reject({ code: 'svn_cli', message: 'E170013' }))
     await act(async () => { await result.current.refreshSvnSync('C:/r').catch(() => undefined) })
     expect(result.current.state.svnBaselineMissing).toBe(false)
