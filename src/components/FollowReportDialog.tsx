@@ -117,7 +117,7 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
   }, [])
 
   return (
-    <div className="dialog-overlay" onMouseDown={finish}>
+    <div className="dialog-overlay">
       <div
         ref={boxRef}
         className="dialog dialog-wide"

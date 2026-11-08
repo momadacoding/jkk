@@ -59,7 +59,7 @@ export function TsvnHooksDialog({
   const blocked = conflicts.length > 0 || status.planned.length === 0
 
   return (
-    <div className="dialog-overlay" onMouseDown={onClose}>
+    <div className="dialog-overlay">
       <div
         ref={boxRef}
         className="dialog dialog-wide"

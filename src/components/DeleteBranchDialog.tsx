@@ -260,7 +260,7 @@ export function DeleteBranchDialog({
   }, [onCancel, busy])
 
   return (
-    <div className="dialog-overlay" onMouseDown={() => { if (!busy) onCancel() }}>
+    <div className="dialog-overlay">
       <div ref={boxRef} className="dialog dialog-wide" onMouseDown={(e) => e.stopPropagation()}>
         <div className="dlg-head">
           <span className="dlg-icon danger"><TrashGlyph /></span>

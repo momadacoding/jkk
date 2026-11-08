@@ -36,8 +36,8 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
   const trimmed = value.trim()
 
   return (
-    <div className="dialog-overlay" onMouseDown={() => finish(null)}>
-      {/* 点遮罩关闭，但点框内不能穿透过去 */}
+    <div className="dialog-overlay">
+      {/* 点遮罩不关框（见 dialogGuards.test.ts），点框内也不往外传 */}
       <div ref={boxRef} className="dialog" onMouseDown={(e) => e.stopPropagation()}>
         <div className="dialog-title">{request.title}</div>
         <label className="dialog-message" htmlFor="prompt-input">{request.message}</label>

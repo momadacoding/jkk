@@ -351,3 +351,30 @@ describe('第二个选择 alternative（§6.11.3 切到落后基线的分支）'
     expect(screen.getAllByRole('button').map((b) => b.textContent)).toEqual(['Cancel', 'OK'])
   })
 })
+
+describe('关框的途径', () => {
+  it('点遮罩不关框：只有按钮和 Esc 能关（2026-11-08 丢弃确认框实测点背景就没了）', async () => {
+    const { confirm } = mount()
+    let settled = false
+    act(() => {
+      void confirm()({ title: 'Discard changes', message: '丢弃以下改动？', confirmLabel: 'Discard', danger: true })
+        .then(() => (settled = true))
+    })
+    const overlay = document.querySelector('.dialog-overlay')!
+    fireEvent.mouseDown(overlay)
+    fireEvent.click(overlay)
+    await act(async () => {})
+    expect(button('Discard')).toBeTruthy()
+    expect(settled).toBe(false)
+  })
+
+  it('Esc 仍然取消', async () => {
+    const { confirm } = mount()
+    let result!: Promise<boolean>
+    act(() => {
+      result = confirm()({ title: 'Discard changes', message: '丢弃以下改动？', confirmLabel: 'Discard' })
+    })
+    fireEvent.keyDown(window, { key: 'Escape' })
+    await expect(result).resolves.toBe(false)
+  })
+})

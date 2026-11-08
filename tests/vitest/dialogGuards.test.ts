@@ -46,6 +46,15 @@ describe('弹框的结构约定', () => {
     expect(missing).toEqual([])
   })
 
+  it('点遮罩不关框：关框只走按钮和 Esc', () => {
+    // 点背景就关，是确认框里点偏一下就丢了的根源（2026-11-08 丢弃确认框实测），
+    // 有输入框的框（PromptDialog、DeliverDialog）还会连带丢掉已经打的字
+    const offenders = sources(join(SRC, 'components'))
+      .filter((f) => /className="dialog-overlay"[^>]*\bon(MouseDown|Click|PointerDown)=/.test(readFileSync(f, 'utf8')))
+      .map(rel)
+    expect(offenders).toEqual([])
+  })
+
   it('原生确认框只留给固定文案：动态清单要走应用内确认框', () => {
     // 原生框的布局不归我们管，布局测试也量不到它（Windows 上是 TaskDialog，长文案下的表现没实测过）
     const callers = sources(SRC)

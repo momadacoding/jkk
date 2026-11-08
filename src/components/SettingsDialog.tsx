@@ -38,7 +38,7 @@ export function SettingsDialog({ initial, loadError = null, onSave, onClose }: S
   const boxRef = useRef<HTMLDivElement>(null)
   useFocusTrap(boxRef)
 
-  // 录制状态同步给后端。cleanup 里复位：录到一半直接关框（Esc、点遮罩、保存）也不能留着标记，
+  // 录制状态同步给后端。cleanup 里复位：录到一半直接关框（Esc、取消、保存）也不能留着标记，
   // 否则之后快捷键就再也不会隐藏窗口
   useEffect(() => {
     if (!recording) return
@@ -110,7 +110,7 @@ export function SettingsDialog({ initial, loadError = null, onSave, onClose }: S
       : null
 
   return (
-    <div className="dialog-overlay" onMouseDown={() => !busy && onClose()}>
+    <div className="dialog-overlay">
       <div
         ref={boxRef}
         className="dialog settings-dialog"
