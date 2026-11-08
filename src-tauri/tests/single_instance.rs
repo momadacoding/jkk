@@ -6,9 +6,8 @@
 //! 这几条写错都不会编译失败，也不会被 clippy 抓到：
 //! - 插件不是第一个注册：官方文档要求它先于其他插件，否则第二个实例可能已经初始化了
 //!   托盘、注册了全局快捷键才退出——托盘图标闪一下，快捷键注册失败还会弹设置告警。
-//! - debug 构建也注册：`pnpm tauri dev` 与安装版共用 identifier，开着安装版时 dev 会
-//!   直接唤起安装版然后退出；多个 worktree 同时跑 dev，后起的会悄悄唤起先起的那个，
-//!   看到的不是自己的代码。
+//! - debug 构建也注册：多个 worktree 同时跑 dev 时共用 `<identifier>.dev`（见 dev_profile），
+//!   后起的会悄悄唤起先起的那个，看到的不是自己的代码。
 //! - TortoiseSVN 钩子分流晚于 `run()`：钩子是同一个 exe 带 `--tsvn-hook` 被调起，
 //!   jkk 开着时它会被单例插件转给已有实例后退出，提交前的拦截就静默失效了。
 
@@ -32,9 +31,10 @@ fn run_body(lib: &str) -> &str {
         .find("pub fn run()")
         .expect("lib.rs 里没有 pub fn run()");
     let body = &lib[start..];
+    // context 先生成、改过 identifier 再交给 run，见 dev_profile
     let end = body
-        .find(".run(tauri::generate_context!())")
-        .expect("run() 里没有 .run(generate_context!())");
+        .find(".run(context)")
+        .expect("run() 里没有 .run(context)");
     &body[..end]
 }
 

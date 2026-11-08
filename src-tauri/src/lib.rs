@@ -1,6 +1,7 @@
 pub mod build_info;
 pub mod commands;
 pub mod desktop;
+pub mod dev_profile;
 pub mod engine;
 pub mod error;
 pub mod vcs;
@@ -9,14 +10,20 @@ use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // debug 构建用 `<identifier>.dev`：配置目录、WebView2 数据都与安装版分开，见 dev_profile
+    let mut context = tauri::generate_context!();
+    let installed_identifier = context.config().identifier.clone();
+    context.config_mut().identifier =
+        dev_profile::runtime_identifier(&installed_identifier, cfg!(debug_assertions));
+
     let builder = tauri::Builder::default();
     // 全局单例：再次启动时唤起已有窗口（关到托盘的也拿出来），自己直接退出。
     // 托盘、全局快捷键、session.json、settings.json 都按「一台机器一个进程」设计，多开会互相覆盖。
     //
     // 必须是第一个插件：第二个实例要在装托盘、注册快捷键之前就退出（官方文档的要求）。
-    // 只在 release 构建注册：插件按 identifier 认实例，`pnpm tauri dev` 与安装版共用
-    // identifier，开着安装版时 dev 会直接唤起安装版然后退出；几个 worktree 同时跑 dev，
-    // 后起的也会悄悄唤起先起的那个。TortoiseSVN 钩子不受影响：main.rs 在进 Tauri 之前就分流了。
+    // 只在 release 构建注册：插件按 identifier 认实例，几个 worktree 同时跑 dev 时它们共用
+    // `.dev` 这一个 identifier，后起的会悄悄唤起先起的那个，看到的不是自己的代码。
+    // TortoiseSVN 钩子不受影响：main.rs 在进 Tauri 之前就分流了。
     // 这几条由 tests/single_instance.rs 守着。
     //
     // 用运行期的 `cfg!` 而不是 `#[cfg(not(debug_assertions))]`：后者让 debug 下的
@@ -31,7 +38,7 @@ pub fn run() {
     };
     builder
         .plugin(tauri_plugin_dialog::init())
-        .setup(|app| {
+        .setup(move |app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
@@ -39,6 +46,8 @@ pub fn run() {
                         .build(),
                 )?;
             }
+            // 必须在 desktop::setup 读 settings.json 之前
+            dev_profile::seed_on_first_dev_launch(app, &installed_identifier);
             // tauri.conf.json 里的 "jkk" 只是兜底，带版本的标题只能在运行期设。
             // 标题只是外观，设失败不能让应用起不来，所以不用 `?`
             if let Some(window) = app.get_webview_window("main") {
@@ -151,6 +160,6 @@ pub fn run() {
             commands::worktree::delete_worktree,
             commands::worktree::read_worktrees_cmd,
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running tauri application");
 }

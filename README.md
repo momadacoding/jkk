@@ -68,6 +68,18 @@ pnpm tauri dev
 
 > 如果端口 5174 被占用，先杀掉占用进程再启动。
 
+dev（以及任何 debug 构建）的 identifier 在运行期加上 `.dev` 后缀，配置和 WebView2 数据都与安装版分开：
+
+| | 安装版 | dev |
+|---|---|---|
+| 配置（settings / session / 外部工具 / 自定义命令） | `%APPDATA%\com.momadacoding.jkk\` | `%APPDATA%\com.momadacoding.jkk.dev\` |
+| WebView2 数据（界面布局等） | `%LOCALAPPDATA%\com.momadacoding.jkk\` | `%LOCALAPPDATA%\com.momadacoding.jkk.dev\` |
+
+- `.dev` 配置目录还不存在时（第一次跑 dev），从安装版的配置目录复制一份，之后两边各写各的。
+  想重新从安装版同步，删掉 `%APPDATA%\com.momadacoding.jkk.dev\` 再启动 dev。
+- 全局快捷键是系统级的，不随 identifier 隔开：安装版开着时 dev 注册同一个快捷键会失败，设置里会提示。
+- 全局单例只在 release 构建生效，dev 可以和安装版、和别的 worktree 的 dev 同时开。
+
 ## 构建
 
 ```bash
