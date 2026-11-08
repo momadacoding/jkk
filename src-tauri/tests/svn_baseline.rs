@@ -10,7 +10,9 @@
 //! 4. `update-ref` 必须带旧 OID 作比较条件
 
 use app_lib::engine::git_cli::{run_git, run_git_code};
-use app_lib::engine::svn_baseline::{parse_trailer, publish_baseline, TempIndex};
+use app_lib::engine::svn_baseline::{
+    hash_blob, parse_trailer, publish_baseline, IndexEdit, TempIndex,
+};
 use app_lib::engine::svn_basemap::BaseMap;
 use app_lib::engine::svn_exclude::{generate_exclude, write_exclude};
 use std::fs;
@@ -442,6 +444,220 @@ fn an_empty_path_is_refused_by_both_writers() {
         idx.remove_path(root, "").unwrap_err().code,
         "svn_baseline_empty_path"
     );
+}
+
+// ---------------------------------------------------------------------------
+// R2b 批量写索引（计划 2026-11-08-svn-follow-batch Task 1）
+//
+// `apply_edits` 一次 `update-index -z --index-info` 代替逐条 `--cacheinfo` / `--force-remove`。
+// 实测（实现日志 X3）：`--index-info` 遇到文件 / 目录冲突会静默替换，旧写法报错，这里要保留报错。
+// ---------------------------------------------------------------------------
+
+/// 候选索引里收了 `Code/A.cs`、`Code/B.cs`、`Code/Deep/D.cs`。
+fn index_with_three() -> (TempDir, TempIndex) {
+    let dir = workdir_with_exclude();
+    let p = dir.path();
+    fs::write(p.join("Code/B.cs"), "b").unwrap();
+    fs::create_dir_all(p.join("Code/Deep")).unwrap();
+    fs::write(p.join("Code/Deep/D.cs"), "d").unwrap();
+    let root = p.to_str().unwrap();
+    let idx = TempIndex::empty(root).unwrap();
+    idx.add_all(root, &wl()).unwrap();
+    (dir, idx)
+}
+
+fn put(path: &str, root: &str, bytes: &[u8]) -> IndexEdit {
+    IndexEdit::Put {
+        path: path.to_string(),
+        oid: hash_blob(root, path, bytes).unwrap(),
+    }
+}
+
+fn remove(path: &str) -> IndexEdit {
+    IndexEdit::Remove {
+        path: path.to_string(),
+    }
+}
+
+#[test]
+fn apply_edits_puts_and_removes_in_one_batch() {
+    let (dir, idx) = index_with_three();
+    let root = dir.path().to_str().unwrap();
+
+    idx.apply_edits(
+        root,
+        &[
+            put("Code/A.cs", root, b"from-server\n"),
+            remove("Code/B.cs"),
+            put("Code/New.cs", root, b"still-on-server\n"),
+        ],
+    )
+    .unwrap();
+    let tree = idx.write_tree(root).unwrap();
+
+    assert_eq!(blob_in_tree(root, &tree, "Code/A.cs"), b"from-server\n");
+    assert_eq!(
+        blob_in_tree(root, &tree, "Code/New.cs"),
+        b"still-on-server\n"
+    );
+    assert!(!idx.ls_files(root).unwrap().contains("Code/B.cs"));
+    assert!(
+        dir.path().join("Code/B.cs").exists(),
+        "剔除只摘索引条目，磁盘不动"
+    );
+    assert!(
+        !dir.path().join("Code/New.cs").exists(),
+        "只进 tree，不许写回磁盘"
+    );
+    assert_eq!(fs::read(dir.path().join("Code/A.cs")).unwrap(), b"a");
+}
+
+#[test]
+fn apply_edits_keeps_existing_modes() {
+    let (dir, idx) = index_with_three();
+    let root = dir.path().to_str().unwrap();
+    let before = idx.stage_mode(root, "Code/A.cs").unwrap();
+
+    idx.apply_edits(
+        root,
+        &[
+            put("Code/A.cs", root, b"x\n"),
+            put("Code/New.cs", root, b"y\n"),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(idx.stage_mode(root, "Code/A.cs").unwrap(), before);
+    assert_eq!(
+        idx.stage_mode(root, "Code/New.cs").unwrap().as_deref(),
+        Some("100644")
+    );
+}
+
+#[test]
+fn apply_edits_does_not_carry_a_mode_over_a_remove_in_the_same_batch() {
+    // 独立 review：逐条执行时「先剔除、再放」放的那一刻条目已经不在了，得到的是 100644
+    let (dir, idx) = index_with_three();
+    let root = dir.path().to_str().unwrap();
+    let ok = Command::new("git")
+        .current_dir(dir.path())
+        .env("GIT_INDEX_FILE", idx.abs_path().unwrap())
+        .args(["update-index", "--chmod=+x", "Code/A.cs"])
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    assert_eq!(
+        idx.stage_mode(root, "Code/A.cs").unwrap().as_deref(),
+        Some("100755")
+    );
+
+    idx.apply_edits(root, &[put("Code/A.cs", root, b"x\n")])
+        .unwrap();
+    assert_eq!(
+        idx.stage_mode(root, "Code/A.cs").unwrap().as_deref(),
+        Some("100755"),
+        "只替换：沿用已有的 mode"
+    );
+
+    idx.apply_edits(root, &[remove("Code/A.cs"), put("Code/A.cs", root, b"y\n")])
+        .unwrap();
+    assert_eq!(
+        idx.stage_mode(root, "Code/A.cs").unwrap().as_deref(),
+        Some("100644"),
+        "先剔除再放：与逐条执行一样回到 100644"
+    );
+}
+
+#[test]
+fn apply_edits_with_an_empty_list_is_a_no_op() {
+    let (dir, idx) = index_with_three();
+    let root = dir.path().to_str().unwrap();
+    let before = idx.write_tree(root).unwrap();
+
+    idx.apply_edits(root, &[]).unwrap();
+
+    assert_eq!(idx.write_tree(root).unwrap(), before);
+}
+
+#[test]
+fn apply_edits_refuses_an_empty_path() {
+    // 实测 X6：`--index-info` 对空路径只打印 `Ignoring path`、exit 0，不能交给它
+    let (dir, idx) = index_with_three();
+    let root = dir.path().to_str().unwrap();
+    let before = idx.write_tree(root).unwrap();
+    let oid = hash_blob(root, "Code/A.cs", b"x").unwrap();
+
+    let put_empty = IndexEdit::Put {
+        path: String::new(),
+        oid,
+    };
+    assert_eq!(
+        idx.apply_edits(root, &[remove("Code/B.cs"), put_empty])
+            .unwrap_err()
+            .code,
+        "svn_baseline_empty_path"
+    );
+    assert_eq!(
+        idx.apply_edits(root, &[remove("")]).unwrap_err().code,
+        "svn_baseline_empty_path"
+    );
+    assert_eq!(idx.write_tree(root).unwrap(), before, "拒绝时一条都不写");
+}
+
+#[test]
+fn apply_edits_refuses_a_file_directory_conflict() {
+    // 实测 X3：`--index-info` 会静默挤掉冲突的那一条，旧写法 `--cacheinfo` 报错。
+    // 挤掉的条目不在 `S` 里，基线就悄悄少了一个文件。
+    let (dir, idx) = index_with_three();
+    let root = dir.path().to_str().unwrap();
+    let before = idx.write_tree(root).unwrap();
+
+    assert_eq!(
+        idx.apply_edits(root, &[put("Code/A.cs/X.cs", root, b"x")])
+            .unwrap_err()
+            .code,
+        "svn_baseline_index_conflict",
+        "文件 Code/A.cs 下面放东西"
+    );
+    assert_eq!(
+        idx.apply_edits(root, &[put("Code/Deep", root, b"x")])
+            .unwrap_err()
+            .code,
+        "svn_baseline_index_conflict",
+        "目录 Code/Deep 的位置放文件"
+    );
+    assert_eq!(idx.write_tree(root).unwrap(), before);
+}
+
+#[test]
+fn apply_edits_allows_a_file_that_becomes_a_directory_when_the_file_is_removed_in_the_same_batch() {
+    // 旧的逐条写法按路径顺序先剔除 `Code/A.cs` 再放 `Code/A.cs/X.cs`，能成功；批量版不能更严
+    let (dir, idx) = index_with_three();
+    let root = dir.path().to_str().unwrap();
+
+    idx.apply_edits(
+        root,
+        &[remove("Code/A.cs"), put("Code/A.cs/X.cs", root, b"x\n")],
+    )
+    .unwrap();
+
+    let files = idx.ls_files(root).unwrap();
+    assert!(files.contains("Code/A.cs/X.cs"));
+    assert!(!files.contains("Code/A.cs"));
+}
+
+#[test]
+fn apply_edits_handles_non_ascii_and_spaces() {
+    let (dir, idx) = index_with_three();
+    let root = dir.path().to_str().unwrap();
+
+    idx.apply_edits(root, &[put("Code/角色 x.cs", root, b"gbk?\n")])
+        .unwrap();
+    let tree = idx.write_tree(root).unwrap();
+
+    assert!(idx.ls_files(root).unwrap().contains("Code/角色 x.cs"));
+    assert_eq!(blob_in_tree(root, &tree, "Code/角色 x.cs"), b"gbk?\n");
 }
 
 mod split_publish {

@@ -17,7 +17,7 @@ use crate::engine::git_cli::{
 use crate::engine::svn_basemap::{format_message, parse_message, BaseMap, MAX_MAP_ENTRIES};
 use crate::engine::svn_config::BASELINE_BRANCH;
 use crate::error::{GitError, Result};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -232,46 +232,14 @@ impl TempIndex {
     /// false，`git add` 一律给 100644，替换动作没有理由顺手改掉一个与本期无关的
     /// 属性。
     pub fn replace_blob(&self, repo_root: &str, path: &str, bytes: &[u8]) -> Result<()> {
-        let p = normalize_entry_path(path)?;
-        let mode = self
-            .stage_mode(repo_root, &p)?
-            .unwrap_or_else(|| "100644".to_string());
-        // ⚠️ **`--path` 不能省。**
-        //
-        // `git hash-object --stdin` 默认**不跑任何过滤器**，而 `git add` 会。本机
-        // （以及多数 Windows 开发机）`core.autocrlf=true`，于是同一个文件走两条路会
-        // 得到两个不同的 blob。2026-09-17 实测，一个 `svn:eol-style=native` 的文件：
-        //
-        // ```text
-        // 磁盘                    = "n1\r\n"   CRLF
-        // git add -A 之后的 blob  = "n1\n"     LF    ← autocrlf 归一了
-        // hash-object --stdin     = "n1\r\n"   CRLF  ← 没归一
-        // ```
-        //
-        // 后果是**这个文件在基线里长什么样，取决于它当时脏不脏**：在脏工作副本上
-        // 重建一次，行尾整个翻一遍，工作分支上凭空出现「每一行都改了」的假 diff。
-        //
-        // `--path <路径>` 让 hash-object 按该路径**应当适用的**属性跑过滤器
-        // （autocrlf、`.gitattributes` 的 text/eol 规则都算），与 `git add` 对齐。
-        // 对齐的基准必须是 `git add`——树里绝大部分内容是它录进去的。
-        let oid = run_git_stdin(
+        let oid = hash_blob(repo_root, path, bytes)?;
+        self.apply_edits(
             repo_root,
-            &["hash-object", "-w", "--path", &p, "--stdin"],
-            bytes,
-        )?
-        .trim()
-        .to_string();
-        if oid.is_empty() {
-            return Err(GitError::new(
-                "svn_baseline_hash_object",
-                format!("`{p}` 的内容写成 blob 之后没拿到 OID"),
-            ));
-        }
-        // `--add` 让索引里没有的路径也能建出来；`--cacheinfo` 直接指定
-        // (mode, oid, path) 三元组，不经过磁盘。
-        let info = format!("{mode},{oid},{p}");
-        self.git(repo_root, &["update-index", "--add", "--cacheinfo", &info])?;
-        Ok(())
+            &[IndexEdit::Put {
+                path: path.to_string(),
+                oid,
+            }],
+        )
     }
 
     /// 把一条路径从候选索引里摘掉。
@@ -280,11 +248,102 @@ impl TempIndex {
     /// 没提交，或者压根没版本控制）。**磁盘上的文件原样保留**——它是用户的内容，
     /// 只是不属于基线。
     pub fn remove_path(&self, repo_root: &str, path: &str) -> Result<()> {
-        let p = normalize_entry_path(path)?;
-        // `--force-remove` 才会在文件**仍然存在于磁盘上**时也把条目摘掉；
-        // 不带它的 `--remove` 只对磁盘上已消失的文件生效，而这里正相反。
-        self.git(repo_root, &["update-index", "--force-remove", "--", &p])?;
+        self.apply_edits(
+            repo_root,
+            &[IndexEdit::Remove {
+                path: path.to_string(),
+            }],
+        )
+    }
+
+    /// 一次写入一批替换与剔除（R2b 批量版，计划 2026-11-08-svn-follow-batch Task 1）。
+    ///
+    /// 原来每个脏文件一次 `ls-files -s` + 一次 `update-index --cacheinfo`、每个剔除一次
+    /// `update-index --force-remove`；公司机器上一次跟进 192 个脏文件，单这几类就是近 300 个进程。
+    /// 这里固定两个：一次 `ls-files -s -z` 读出现有条目，一次 `update-index -z --index-info`。
+    ///
+    /// - `Put` 沿用索引里此刻已有的 mode（本批前面剔除过的不算），没有则 `100644`，理由见
+    ///   [`TempIndex::replace_blob`]。
+    /// - `Remove` 等价于 `--force-remove`：磁盘上还在也摘掉（`0 <零 OID>` 行，实测 X1）。
+    /// - 编辑按给定顺序生效，与逐条执行的结果相同。
+    /// - 空列表 no-op，不起进程；任何一条路径为空都整批拒绝（实测 X6：git 只警告不报错）。
+    ///
+    /// # 文件 / 目录冲突必须自己查
+    ///
+    /// 实测 X3：`--index-info` 遇到「索引里有文件 `Code/F`，又放 `Code/F/Y.cs`」会**静默替换**，
+    /// 把 `Code/F` 挤掉；旧写法 `--cacheinfo` 同样情形报错退出。挤掉的条目不在改写清单 `S` 里，
+    /// 基线就悄悄少一个文件、体检的判据也跟着变了。所以：放进来的路径的祖先是现有条目、或者有
+    /// 现有条目在它下面，而那个条目不在本批的剔除里，就整批报 `svn_baseline_index_conflict`，
+    /// 索引不动。本批里先剔除再放（文件变目录）与逐条执行一样是允许的。
+    ///
+    /// 一批是原子的：校验在写之前做完，git 自己遇到坏行也是整批不写（实测 X8）。
+    pub fn apply_edits(&self, repo_root: &str, edits: &[IndexEdit]) -> Result<()> {
+        if edits.is_empty() {
+            return Ok(());
+        }
+        let mut normalized: Vec<(Option<&str>, String)> = Vec::with_capacity(edits.len());
+        for e in edits {
+            match e {
+                IndexEdit::Put { path, oid } => {
+                    normalized.push((Some(oid.as_str()), normalize_entry_path(path)?))
+                }
+                IndexEdit::Remove { path } => normalized.push((None, normalize_entry_path(path)?)),
+            }
+        }
+        let current = self.stage_modes(repo_root)?;
+        // 按顺序模拟每一步之后索引里有哪些路径，冲突判定与旧的逐条执行一致
+        let mut present: BTreeSet<String> = current.keys().cloned().collect();
+        let mut input = Vec::new();
+        for (oid, p) in &normalized {
+            match oid {
+                Some(oid) => {
+                    if let Some(other) = displaced_entry(&present, p) {
+                        return Err(GitError::new(
+                            "svn_baseline_index_conflict",
+                            format!(
+                                "要放进候选索引的 `{p}` 与已有的 `{other}` 一个是文件、一个是目录，\
+                                 放进去会把 `{other}` 挤掉，而它不在这次要改写的清单里。\
+                                 没有写入任何条目。"
+                            ),
+                        ));
+                    }
+                    // 本批里先剔除过的路径不再沿用旧 mode：逐条执行时它已经不在索引里了（独立 review）
+                    let mode = current
+                        .get(p)
+                        .filter(|_| present.contains(p))
+                        .map_or("100644", String::as_str);
+                    input.extend_from_slice(format!("{mode} {oid}\t{p}\0").as_bytes());
+                    present.insert(p.clone());
+                }
+                None => {
+                    input.extend_from_slice(format!("0 {ZERO_OID}\t{p}\0").as_bytes());
+                    present.remove(p);
+                }
+            }
+        }
+        self.git_stdin(
+            repo_root,
+            &["update-index", "-z", "--add", "--index-info"],
+            &input,
+        )?;
         Ok(())
+    }
+
+    /// 候选索引里全部条目的路径 → mode（`git ls-files -s -z`，一个进程）。
+    ///
+    /// 只取 stage 0 之外的条目也照收：候选索引从树或磁盘建出来，不会有冲突态，
+    /// 万一有，同一路径后出现的覆盖先出现的，mode 只用来沿用、不影响内容。
+    pub fn stage_modes(&self, repo_root: &str) -> Result<BTreeMap<String, String>> {
+        let out = self.git(repo_root, &["ls-files", "-s", "-z"])?;
+        // 实测 X9：每条形如 `<mode> <oid> <stage>\t<path>`，路径里可以有空格，按第一个 `\t` 切
+        Ok(out
+            .split('\0')
+            .filter_map(|rec| {
+                let (meta, path) = rec.split_once('\t')?;
+                let mode = meta.split_whitespace().next()?;
+                Some((path.to_string(), mode.to_string()))
+            })
+            .collect())
     }
 
     /// 把候选索引写成一棵 tree，返回它的 OID。
@@ -329,6 +388,74 @@ fn normalize_entry_path(path: &str) -> Result<String> {
         ));
     }
     Ok(p)
+}
+
+/// [`TempIndex::apply_edits`] 的一条编辑。路径是仓库相对路径。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexEdit {
+    /// 把这个 blob 挂到路径上：替换已有条目（沿用 mode），或新建（`100644`）。
+    Put { path: String, oid: String },
+    /// 摘掉这条路径的条目，磁盘不动。
+    Remove { path: String },
+}
+
+/// 把 `bytes` 当作 `path` 的内容写成 blob，返回 OID。只写对象库，不动任何索引。
+///
+/// 可以多线程同时调：对象写入是「临时文件 + 改名」，并发写同一个对象也安全。
+pub fn hash_blob(repo_root: &str, path: &str, bytes: &[u8]) -> Result<String> {
+    let p = normalize_entry_path(path)?;
+    // ⚠️ **`--path` 不能省。**
+    //
+    // `git hash-object --stdin` 默认**不跑任何过滤器**，而 `git add` 会。本机
+    // （以及多数 Windows 开发机）`core.autocrlf=true`，于是同一个文件走两条路会
+    // 得到两个不同的 blob。2026-09-17 实测，一个 `svn:eol-style=native` 的文件：
+    //
+    // ```text
+    // 磁盘                    = "n1\r\n"   CRLF
+    // git add -A 之后的 blob  = "n1\n"     LF    ← autocrlf 归一了
+    // hash-object --stdin     = "n1\r\n"   CRLF  ← 没归一
+    // ```
+    //
+    // 后果是**这个文件在基线里长什么样，取决于它当时脏不脏**：在脏工作副本上
+    // 重建一次，行尾整个翻一遍，工作分支上凭空出现「每一行都改了」的假 diff。
+    //
+    // `--path <路径>` 让 hash-object 按该路径**应当适用的**属性跑过滤器
+    // （autocrlf、`.gitattributes` 的 text/eol 规则都算），与 `git add` 对齐。
+    // 对齐的基准必须是 `git add`——树里绝大部分内容是它录进去的。
+    //
+    // 也因此不能为了批量改用 `--stdin-paths`：那条读的是磁盘文件，按的是磁盘路径的属性。
+    let oid = run_git_stdin(
+        repo_root,
+        &["hash-object", "-w", "--path", &p, "--stdin"],
+        bytes,
+    )?
+    .trim()
+    .to_string();
+    if oid.is_empty() {
+        return Err(GitError::new(
+            "svn_baseline_hash_object",
+            format!("`{p}` 的内容写成 blob 之后没拿到 OID"),
+        ));
+    }
+    Ok(oid)
+}
+
+/// 把 `p` 放进 `present` 这组路径时会被挤掉的那一条：`p` 的某个祖先是文件条目，或者有条目在
+/// `p/` 下面。没有冲突时 `None`。
+fn displaced_entry(present: &BTreeSet<String>, p: &str) -> Option<String> {
+    let ancestor = p
+        .match_indices('/')
+        .map(|(i, _)| &p[..i])
+        .find(|a| present.contains(*a));
+    if let Some(a) = ancestor {
+        return Some(a.to_string());
+    }
+    let prefix = format!("{p}/");
+    present
+        .range(prefix.clone()..)
+        .next()
+        .filter(|k| k.starts_with(&prefix))
+        .cloned()
 }
 
 impl Drop for TempIndex {

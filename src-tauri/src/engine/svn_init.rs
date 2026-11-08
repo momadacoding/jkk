@@ -12,7 +12,8 @@
 use crate::engine::git_cli::{run_git, run_git_code};
 use crate::engine::svn_attributes::{has_eol_rule, restore_attributes, write_attributes};
 use crate::engine::svn_baseline::{
-    git_dir, publish_baseline, refresh_index_stat, swap_index_to_tree, TempIndex,
+    git_dir, hash_blob, publish_baseline, refresh_index_stat, swap_index_to_tree, IndexEdit,
+    TempIndex,
 };
 use crate::engine::svn_basemap::{read_base_map, BaseMap};
 use crate::engine::svn_cli::run_svn;
@@ -44,6 +45,8 @@ use crate::engine::svn_xml::{parse_info, StatusEntry};
 use crate::error::{GitError, Result};
 use crate::vcs::{detect_repo_kind, RepoKind};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 /// 初始化完成后立刻切上去的工作分支。UI 禁止在基线分支上开发提交（spec §6.4）。
 const WORK_BRANCH: &str = "work";
@@ -717,7 +720,33 @@ fn replaced_at_or_above<'a>(path: &str, replaced: &'a BTreeSet<String>) -> Optio
     }
 }
 
-/// R2b 的逐条改写：脏条目换成服务器 rN 的内容，或从候选索引里剔除。
+/// R2b 并行取服务器内容的线程数上限（计划 2026-11-08-svn-follow-batch Task 2），实际取它与
+/// 机器核数的较小值（[`fetch_workers`]）。
+///
+/// 每个文件两个进程（`svn cat -r BASE` + `hash-object`），开销主要是起进程，公司机器上
+/// 大半耗在安全软件的文件过滤驱动里（内核态 CPU），可以摊到多个核上。都是只读：`svn cat -r BASE`
+/// 读 pristine 与 wc.db；`hash-object -w` 写对象是「临时文件 + 改名」。不开太多是为了
+/// 不和用户手上的 IDE、TortoiseSVN 抢磁盘与 CPU。
+///
+/// 已知代价：同一时刻最多有这么多个文件的完整内容在内存里（原来是一个）。白名单按扩展名收的是
+/// 代码类文件，单个通常很小。
+const BASE_FETCH_WORKERS: usize = 6;
+
+fn fetch_workers() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(BASE_FETCH_WORKERS)
+}
+
+/// R2b 的改写：脏条目换成服务器 rN 的内容，或从候选索引里剔除。
+///
+/// 原来逐条串行，每个取 BASE 的文件 4 个进程、每个剔除 1 个；2026-11-07 公司机器上一次跟进
+/// 192 个脏文件单这一步约 65 秒。现在取数（每个文件 2 个进程）并行，写索引合成一次
+/// [`TempIndex::apply_edits`]。录出的 tree 与原来逐条执行相同：编辑按 `fixes` 的路径顺序排，
+/// 文件 / 目录冲突照旧报错（见 `apply_edits`）。
+///
+/// 任何一个文件取不到就整批报错、一条都不写；报的错与串行时相同，是路径顺序里第一个失败的
+/// （见 [`run_parallel`]）。
 fn rewrite_to_server(
     repo_root: &str,
     pre: &Preflight,
@@ -729,41 +758,108 @@ fn rewrite_to_server(
     // E200009；目录底下重新加的子文件走 Drop 会静默少录（PR 116 遗留）。初始化与重建在 `git add`
     // 之前已经查过一次（`dry_run_before_add`）；同步 S7、交付 D7a、跟进没有那一步，这里是兜底
     refuse_replaced(pre, fixes, touched)?;
-    for (path, fix) in fixes {
-        if !touched.contains(path) {
-            // 不归 git 管，树里本来就没有它。见上面「`S` 必须恰好」。
-            continue;
-        }
-        match fix {
-            Fix::TakeBase => match cat_base(repo_root, path)? {
-                BaseContent::Bytes(bytes) => idx.replace_blob(repo_root, path, &bytes)?,
-                // 分类说「服务器上有」，服务器说「没有」。两边对不上时**停下**，
-                // 不能自作主张把它当成 Drop 处理掉——那等于用一个猜测悄悄改变
-                // 基线的内容集合。
-                //
-                // 文案不能只说「请重试」（事故分析 6.3）：工作副本不变时重试每次都停在同一处。
-                // 不带历史的替换（原来最常见的原因）从 6.2 起在分类时就停下了
-                // （`svn_dirty_replaced_without_history`），走到这里的是录制期间被外部改动，
-                // 或者分类还不认识的工作副本状态。
-                BaseContent::NotOnServer => {
-                    return Err(GitError::new(
-                        "svn_baseline_classification_conflict",
-                        format!(
-                            "`{path}` 按 svn status 是服务器上有的文件，但取它在服务器 r{} 上的内容时，\
-                             svn 说它还没提交过，本地拿不到服务器上的那一版。\n\
-                             如果录制过程中 TortoiseSVN 正在提交或更新，等它做完之后再试一次。\n\
-                             工作副本不变而仍停在这里，说明这个文件处在本应用还不认识的状态\
-                             （例如在 svn 里被删掉又重新添加过）：请在 TortoiseSVN 里把它提交，\
-                             或者对它做「还原」，然后再试。",
-                            pre.node_rev
-                        ),
-                    ))
-                }
+    // 不在 `touched` 里的不归 git 管，树里本来就没有它。见上面「`S` 必须恰好」。
+    let todo: Vec<(&str, Fix)> = fixes
+        .iter()
+        .filter(|(path, _)| touched.contains(*path))
+        .map(|(path, fix)| (path.as_str(), *fix))
+        .collect();
+    // 剔除不用取数，一并放进来只是为了按原顺序一一对上结果
+    let oids = run_parallel(&todo, fetch_workers(), |(path, fix)| match fix {
+        Fix::TakeBase => fetch_base_blob(repo_root, pre.node_rev, path).map(Some),
+        Fix::Drop => Ok(None),
+    })?;
+    let edits: Vec<IndexEdit> = todo
+        .iter()
+        .zip(oids)
+        .map(|((path, _), oid)| match oid {
+            Some(oid) => IndexEdit::Put {
+                path: path.to_string(),
+                oid,
             },
-            Fix::Drop => idx.remove_path(repo_root, path)?,
+            None => IndexEdit::Remove {
+                path: path.to_string(),
+            },
+        })
+        .collect();
+    idx.apply_edits(repo_root, &edits)
+}
+
+/// 用最多 `workers` 个线程对每一项跑 `f`，按 `items` 的顺序返回结果；任何一项失败就返回 `Err`。
+///
+/// # 报的错与串行时相同
+///
+/// 任务按下标从小到大领取，一项失败之后各线程不再领新任务，但已领的照常跑完。于是下标最小的那个
+/// 失败项一定已被领走、跑完：它要么就是第一个报错的，要么下标比第一个报错的还小——而下标更小的
+/// 在第一个报错的被领走之前就都已领完。返回的就是它的错误，即串行执行时会停下的那一项。
+fn run_parallel<I: Sync, T: Send>(
+    items: &[I],
+    workers: usize,
+    f: impl Fn(&I) -> Result<T> + Sync,
+) -> Result<Vec<T>> {
+    let workers = workers.min(items.len());
+    if workers <= 1 {
+        return items.iter().map(&f).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let slots: Vec<Mutex<Option<Result<T>>>> = items.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| {
+                while !failed.load(Ordering::Relaxed) {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(i) else { break };
+                    let got = f(item);
+                    if got.is_err() {
+                        failed.store(true, Ordering::Relaxed);
+                    }
+                    *slots[i].lock().unwrap_or_else(PoisonError::into_inner) = Some(got);
+                }
+            });
+        }
+    });
+    let mut out = Vec::with_capacity(items.len());
+    for slot in slots {
+        match slot.into_inner().unwrap_or_else(PoisonError::into_inner) {
+            Some(Ok(v)) => out.push(v),
+            Some(Err(e)) => return Err(e),
+            // 只会出现在某个失败项之后（失败之后没再领），而那个失败项已经先返回了
+            None => {}
         }
     }
-    Ok(())
+    Ok(out)
+}
+
+/// 一个文件：`svn cat -r BASE` 取字节，`hash-object --path` 写成 blob。
+fn fetch_base_blob(repo_root: &str, node_rev: u64, path: &str) -> Result<String> {
+    match cat_base(repo_root, path)? {
+        // 失败重试一次（独立 review）：并行时内容相同的两个文件可能同时写同一个对象，
+        // Windows 上改名撞上另一个进程或杀软开着的文件会报权限错。hash-object 是幂等的，
+        // 重试拿到的是同一个 OID；串行时碰不到这种情形。
+        BaseContent::Bytes(bytes) => {
+            hash_blob(repo_root, path, &bytes).or_else(|_| hash_blob(repo_root, path, &bytes))
+        }
+        // 分类说「服务器上有」，服务器说「没有」。两边对不上时**停下**，
+        // 不能自作主张把它当成 Drop 处理掉——那等于用一个猜测悄悄改变
+        // 基线的内容集合。
+        //
+        // 文案不能只说「请重试」（事故分析 6.3）：工作副本不变时重试每次都停在同一处。
+        // 不带历史的替换（原来最常见的原因）从 6.2 起在分类时就停下了
+        // （`svn_dirty_replaced_without_history`），走到这里的是录制期间被外部改动，
+        // 或者分类还不认识的工作副本状态。
+        BaseContent::NotOnServer => Err(GitError::new(
+            "svn_baseline_classification_conflict",
+            format!(
+                "`{path}` 按 svn status 是服务器上有的文件，但取它在服务器 r{node_rev} 上的内容时，\
+                 svn 说它还没提交过，本地拿不到服务器上的那一版。\n\
+                 如果录制过程中 TortoiseSVN 正在提交或更新，等它做完之后再试一次。\n\
+                 工作副本不变而仍停在这里，说明这个文件处在本应用还不认识的状态\
+                 （例如在 svn 里被删掉又重新添加过）：请在 TortoiseSVN 里把它提交，\
+                 或者对它做「还原」，然后再试。"
+            ),
+        )),
+    }
 }
 
 /// 原子地创建 `.git` 目录，作为「这次初始化拥有它」的凭据。
@@ -2008,4 +2104,86 @@ fn working_copy_url(repo_root: &str) -> Result<String> {
         .next()
         .map(|e| e.url)
         .ok_or_else(|| GitError::new("svn_init", "svn info 对工作副本根没有输出"))
+}
+
+#[cfg(test)]
+mod parallel_tests {
+    use super::run_parallel;
+    use crate::error::GitError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    fn sleep_ms(ms: u64) {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+
+    #[test]
+    fn results_come_back_in_input_order_even_when_they_finish_out_of_order() {
+        let items: Vec<u64> = (0..40).collect();
+        // 下标小的睡得久，完成顺序与输入顺序相反
+        let got = run_parallel(&items, 6, |i| {
+            sleep_ms(40 - i);
+            Ok(i * 10)
+        })
+        .unwrap();
+        assert_eq!(got, items.iter().map(|i| i * 10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn the_error_is_the_first_failing_item_in_input_order_like_a_serial_run() {
+        // 下标 30 立刻失败，下标 7 晚一点才失败：报的必须是 7，与串行时停下的那一项相同
+        let items: Vec<u64> = (0..50).collect();
+        for _ in 0..5 {
+            let err = run_parallel(&items, 6, |i| match i {
+                7 => {
+                    sleep_ms(50);
+                    Err(GitError::new("seven", "7"))
+                }
+                30 => Err(GitError::new("thirty", "30")),
+                _ => {
+                    sleep_ms(5);
+                    Ok(*i)
+                }
+            })
+            .unwrap_err();
+            assert_eq!(err.code, "seven");
+        }
+    }
+
+    #[test]
+    fn after_a_failure_no_new_items_are_started() {
+        let items: Vec<u64> = (0..200).collect();
+        let started = AtomicUsize::new(0);
+        let err = run_parallel(&items, 4, |i| {
+            started.fetch_add(1, Ordering::Relaxed);
+            if *i == 0 {
+                return Err(GitError::new("first", "0"));
+            }
+            sleep_ms(20);
+            Ok(*i)
+        });
+        assert_eq!(err.unwrap_err().code, "first");
+        assert!(
+            started.load(Ordering::Relaxed) < 50,
+            "失败之后还在领新任务：开跑了 {} 项",
+            started.load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn one_worker_and_empty_input_run_serially() {
+        let empty: Vec<u64> = Vec::new();
+        assert!(run_parallel(&empty, 6, |i| Ok(*i)).unwrap().is_empty());
+        let items = vec![1u64, 2, 3];
+        assert_eq!(run_parallel(&items, 1, |i| Ok(*i)).unwrap(), items);
+        let err = run_parallel(&items, 1, |i| {
+            if *i >= 2 {
+                Err(GitError::new(&format!("e{i}"), "x"))
+            } else {
+                Ok(*i)
+            }
+        })
+        .unwrap_err();
+        assert_eq!(err.code, "e2");
+    }
 }
