@@ -131,7 +131,7 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
   return (
     // 遮罩只挡点击、不关框：点偏一下框就没了，关框只走按钮和 Esc（见 dialogGuards.test.ts）
     <div className="dialog-overlay">
-      <div ref={boxRef} className="dialog dialog-wide" onMouseDown={(e) => e.stopPropagation()}>
+      <div ref={boxRef} className="dialog dialog-wide">
         {/* 正文长短由调用方决定，只有这一块滚；按钮、错误、进度在外面，滚到哪都看得见。
             tabIndex：焦点默认在按钮上，不给的话键盘滚不动这里 */}
         <div className="dialog-body" tabIndex={0}>

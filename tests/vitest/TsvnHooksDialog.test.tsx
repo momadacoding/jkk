@@ -49,6 +49,12 @@ describe('TsvnHooksDialog', () => {
     expect(onRegister).toHaveBeenCalledWith(true)
   })
 
+  it('Esc 关框：点遮罩不再关框之后，没有 Esc 就只剩「关闭」按钮一条路', () => {
+    const { onClose } = renderWith(base)
+    fireEvent.keyDown(window, { key: 'Escape' })
+    expect(onClose).toHaveBeenCalledTimes(1)
+  })
+
   it('提醒先关掉 TortoiseSVN 的设置窗口：它开着时点确定可能把钩子盖掉，事后没有横幅', () => {
     renderWith(base)
     expect(screen.getByText(/注册前请先关掉 TortoiseSVN 的设置窗口/)).toBeTruthy()

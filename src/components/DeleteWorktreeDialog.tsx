@@ -83,7 +83,7 @@ export function DeleteWorktreeDialog({ worktree, onCancel, onConfirm }: DeleteWo
 
   return (
     <div className="dialog-overlay">
-      <div ref={boxRef} className="dialog dialog-wide" onMouseDown={(e) => e.stopPropagation()}>
+      <div ref={boxRef} className="dialog dialog-wide">
         <div className="dlg-head">
           <span className="dlg-icon danger"><TrashGlyph /></span>
           <div>

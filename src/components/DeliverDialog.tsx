@@ -64,7 +64,6 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
         className="dialog dialog-wide"
         role="dialog"
         aria-label={m.title}
-        onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="dlg-head">
           {/* 提交不能撤回、直接影响全组：与删除类确认同一个红色图标 */}

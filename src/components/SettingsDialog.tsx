@@ -116,7 +116,6 @@ export function SettingsDialog({ initial, loadError = null, onSave, onClose }: S
         className="dialog settings-dialog"
         role="dialog"
         aria-label="设置"
-        onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="dialog-title">设置</div>
         {!initial ? (

@@ -142,6 +142,13 @@ describe('useFocusTrap：左右方向键在按钮行里切换', () => {
     expect(document.activeElement).toBe(input)
   })
 
+  it('tabindex=-1 的按钮跳过：和 Tab 认的可聚焦元素一致', () => {
+    render(<Actions><button>Cancel</button><button tabIndex={-1}>辅助</button><button>OK</button></Actions>)
+    btn('Cancel').focus()
+    arrow('ArrowRight')
+    expect(document.activeElement).toBe(btn('OK'))
+  })
+
   it('焦点在按钮行之外的按钮上：不管', () => {
     render(<Actions before={<button>正文里的按钮</button>}><button>Cancel</button><button>OK</button></Actions>)
     btn('正文里的按钮').focus()
@@ -162,5 +169,31 @@ describe('useFocusTrap：左右方向键在按钮行里切换', () => {
     btn('下层 A').focus()
     arrow('ArrowRight')
     expect(document.activeElement).toBe(btn('下层 A'))
+  })
+})
+
+describe('useFocusTrap：点框外不抢走焦点', () => {
+  // jsdom 不会在 mousedown 的默认动作里挪焦点，所以断言的是 preventDefault 本身——
+  // 真实窗口里正是它让点遮罩之后焦点留在按钮上，回车 / 方向键 / Esc 还有着落
+  it('在框外按下鼠标：取消默认动作，焦点留在框里的按钮上', () => {
+    render(<Page><button>Cancel</button><button>OK</button></Page>)
+    btn('OK').focus()
+    const prevented = !fireEvent.mouseDown(btn('背后的 Push'))
+    expect(prevented).toBe(true)
+    expect(document.activeElement).toBe(btn('OK'))
+  })
+
+  it('在框里按下鼠标照常：输入框要能点进去、文字要能选', () => {
+    render(<Page><input aria-label="名字" /><button>OK</button></Page>)
+    const prevented = !fireEvent.mouseDown(screen.getByLabelText('名字'))
+    expect(prevented).toBe(false)
+  })
+
+  it('框关掉之后不再拦', () => {
+    const { unmount } = render(<Trap><button>OK</button></Trap>)
+    unmount()
+    render(<button>别处</button>)
+    const prevented = !fireEvent.mouseDown(btn('别处'))
+    expect(prevented).toBe(false)
   })
 })

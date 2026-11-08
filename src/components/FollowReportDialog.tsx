@@ -123,7 +123,6 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
         className="dialog dialog-wide"
         role="dialog"
         aria-label={m.title}
-        onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="dlg-head">
           <span className={`dlg-icon ${m.tone}`}>
