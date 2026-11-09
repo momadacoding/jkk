@@ -13,7 +13,7 @@
 | 4 | 体检 floor diff 合并 | 完成 | `svn_health.rs`（`plan_diffs_for`、`DiffCommand::fallback`、执行队列）、`svn_tombstone.rs`（`Point::MergedDiff`）；测试 `svn_health.rs` +4 | 新测试编译失败（`plan_diffs_for` 不存在）→ 绿；`svn_health` 47 全过；变异「合并失败不退回」被 `a_failed_merged_diff_falls_back_to_one_diff_per_root` 抓到 |
 | 5 | 服务器核对 `ls -R` 批量 | 完成 | `svn_server_set.rs`；测试 `svn_server_set.rs` +1 | 新测试在旧代码上也绿（回归保护）；`svn_server_set` 13、`svn_follow_audit` 3 全过；变异「清单倒序对回」被 2 条抓到 |
 | 6 | 开发机实测 | 完成 | 临时 `tests/zz_perf_multi_target.rs`（已删） | 结果见下；两版结论逐项相同 |
-| 7 | 验证、review、PR | 进行中 | | `cargo fmt --check` 过；`cargo clippy --all-targets` 无告警；`cargo test --no-fail-fast` 89 个测试二进制全过（1794 passed、0 failed、1 ignored） |
+| 7 | 验证、review、PR | 完成 | review 修复见下表 | review 前：`cargo test --no-fail-fast` 89 个测试二进制全过（1794 passed、0 failed、1 ignored）。review 修复后：`cargo fmt --check` 过；`cargo clippy --all-targets` 无告警；`cargo test --no-fail-fast -j 4 -- --test-threads=4` 88 个 `test result` 全 ok（1796 passed、0 failed、1 ignored） |
 
 ## 决策条目
 
@@ -127,3 +127,15 @@
 #### 为什么这么改是安全的
 
 - 跟进的 3 次都走完整条链路（判定、预检、录基线、体检、重放、发布前复核、发布），结论与改动前相同；全量 `cargo test` 也覆盖了跟进、初始化、重建、交付的既有用例。
+
+### 独立 review（`/code-review high`，Task 1–6 完成后，提交 `f8cd48d`）
+
+| # | 发现 | 结论 | 处理 |
+|---|---|---|---|
+| 1 | 合并命令的 `--old` 用配置的 svnUrl，而判定可否合并、`url_mismatch`、`whitelist_not_under_base` 都不分大小写；大小写敏感的服务器上 `<svnUrl>@F` 不存在，按 M6 整片报 `added`、判成 Lying，命令成功、不退回 | 成立 | **已修**：`--old` 与 `unit_url` 用单元**实际** URL 去掉 `/<wc_root>` 的前缀；只合并实际 URL 逐字节等于「同一前缀 + `/` + `wc_root`」的单元（白名单写法与服务器目录只差大小写的也不合并）。测试 `the_merged_floor_diff_uses_the_real_url_not_the_configured_spelling` |
+| 2 | 合并命令任何失败都退回逐单元，断网 / 认证失败 / 超时时多等一轮 | 成立 | **已修**：`server_unreachable` 按错误码认「整台服务器够不着」（连不上、认证、`ra_local` 打不开、DNS、WSA 超时 / 拒绝 / 重置），这类失败不退回，按第一条失败落 NotChecked。合并的单元同一前缀、同一台服务器，退回也只会在第一条上再失败一次，结论相同。认错的代价只是多跑一条。测试 `server_unreachable_is_judged_by_error_code_only`、`an_unreachable_server_fails_the_merged_diff_without_falling_back`（删掉 `file://` 仓库，理由点名合并命令的全部根，证明没退回） |
+| 3 | `plan_diffs_for` 靠「`plan_diffs` 前 `units.len()` 条就是逐单元 floor 命令」这条没核对的约定 | 成立 | **已修**：合并前逐条核对 `wc_root`、`scope == Floor`、无尾随 `--`、无 `fallback`，对不上就原样返回、不合并 |
+| 4 | external 守卫按 `<target>` 块判，依赖「不带 `--ignore-externals` 时 external 的内容落在外层块里」，只在 SlikSvn 1.14.2 上实测过 | 成立，属遗留风险 | 不改：块的布局由 libsvn 决定，不是客户端各自实现；真实 svn 输出的双向测试 `the_guard_judges_each_target_block_on_its_own`、`the_guard_holds_against_real_svn_output_in_both_directions` 在换 svn 版本后会第一时间变红 |
+| 5 | 服务器核对失败理由列出全部单元，看不出是哪个 | 成立 | **已修**：`failing_units` 按 svn 报错里的 `'<仓库内路径>'` 认出失败的单元，认不出时才列全部。测试在 `a_depth_excluded_subtree_in_a_second_root_is_reported_under_that_root` 里补了 r1 上 Tools 不存在的断言 |
+| 6 | 命令行长度估算与上限三处重复 | 成立 | **已修**：`MAX_DIFF_CMDLINE = MAX_TARGETS_CMDLINE`，`cmdline_len` 改调 `cmdline_estimate`，合并命令分批改用 `chunk_targets`。`push_batches` 的循环带着路径集合一起切，没并进来 |
+| 7 | 合并命令靠空 `wc_root` 当哨兵，别处要特判 | 部分成立 | **已修**报错文案（合并命令失败时点名它的全部根，不会打出空名字）；不改成枚举：`DiffCommand` 是公开结构、测试直接断言它的字段，改形状牵动面大于收益 |

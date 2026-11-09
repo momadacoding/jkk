@@ -12,8 +12,8 @@ mod svn_fixtures;
 use app_lib::engine::svn_basemap::BaseMap;
 use app_lib::engine::svn_cli::run_svn;
 use app_lib::engine::svn_health::{
-    check_baseline, check_baseline_map, plan_diffs, plan_diffs_for, DiffScope, ExplainedOrigin,
-    Health, HealthMap, MAX_DIFF_CMDLINE,
+    check_baseline, check_baseline_map, plan_diffs, plan_diffs_for, server_unreachable, DiffScope,
+    ExplainedOrigin, Health, HealthMap, MAX_DIFF_CMDLINE,
 };
 use app_lib::engine::svn_nodes::{compute_map, read_node_status};
 use app_lib::engine::svn_scope::WScope;
@@ -1234,6 +1234,51 @@ fn floor_diffs_of_roots_under_the_svn_url_go_out_as_one_command() {
         p1,
         plan_diffs(&one, &map, &BTreeSet::new(), &BTreeSet::new()).unwrap()
     );
+}
+
+#[test]
+fn the_merged_floor_diff_uses_the_real_url_not_the_configured_spelling() {
+    // 独立 review 第 1 条：前面的核对比 URL 不分大小写。svnUrl 只差大小写时，大小写敏感的
+    // 服务器上 `<svnUrl>@F` 不存在，按 M6 整片报 `added`、判成 Lying，命令还是成功的
+    let fx = two_roots();
+    let url = repo_url(&fx);
+    let us = enumerate_wcs(&fx.wc_str(), &wl(&["Code/", "Tools/"])).unwrap();
+    let map = BaseMap::single(us[0].repos_root.clone(), us[0].uuid.clone(), 2);
+    let shouty = url.to_uppercase();
+    assert_ne!(shouty, url, "前提：URL 里有小写字母");
+    let plan = plan_diffs_for(&us, &map, &BTreeSet::new(), &BTreeSet::new(), &shouty).unwrap();
+    assert_eq!(plan.commands.len(), 1, "{plan:?}");
+    assert_eq!(plan.commands[0].args[1], format!("--old={url}@2"));
+    assert_eq!(plan.commands[0].unit_url, url);
+}
+
+#[test]
+fn server_unreachable_is_judged_by_error_code_only() {
+    assert!(server_unreachable(
+        "svn: E170013: Unable to connect to a repository at URL 'https://x/svn'\n\
+         svn: E731001: No such host is known."
+    ));
+    assert!(server_unreachable("svn: E215004: 认证失败次数过多"));
+    // 某个目标的问题：退回逐单元才知道是哪一个
+    assert!(!server_unreachable(
+        "svn: E155010: The node 'C:\\wc\\Nope' was not found."
+    ));
+    assert!(!server_unreachable("测试注入的失败：MergedDiff"));
+    assert!(!server_unreachable(""));
+}
+
+#[test]
+fn an_unreachable_server_fails_the_merged_diff_without_falling_back() {
+    // 独立 review 第 2 条：服务器整个够不着时退回逐单元只会在第一条上再等一轮超时。
+    // 理由里点到的是合并命令的全部根（退回的话会是第一条退回命令的 `Code`）
+    let fx = two_roots();
+    std::fs::remove_dir_all(fx.repo()).unwrap();
+    match check_roots(&fx, &["Code/", "Tools/"], 2) {
+        Health::NotChecked { reason } => {
+            assert!(reason.contains("`Code、Tools`"), "{reason}")
+        }
+        other => panic!("服务器不在时不能下结论，实际 {other:?}"),
+    }
 }
 
 #[test]

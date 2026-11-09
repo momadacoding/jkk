@@ -15,7 +15,9 @@
 //! 调用时必须满足「磁盘上白名单内的内容 == 基线树的内容」。spec §6.8.5 列的四个
 //! 时机全部满足它：HEAD 在 `svn/base` 上且工作区干净，或基线树刚从磁盘录出来。
 
-use crate::engine::svn_cli::{run_svn, run_svn_code, run_svn_targets};
+use crate::engine::svn_cli::{
+    chunk_targets, cmdline_estimate, run_svn, run_svn_code, run_svn_targets, MAX_TARGETS_CMDLINE,
+};
 // W-file 判据原本是本模块的私有函数，Phase 1c 提到 `svn_include_check` 共用，
 // 2026-10-28 再收进 `svn_scope`——`svn_server_set` 等要用**同一套**判据。
 // 两份「什么算 W-file」迟早分叉，而分叉的表现是「每次打开都报几千条漏收」或者
@@ -226,8 +228,8 @@ struct Grouped<'a> {
 /// 尾随 PATH 那批命令的命令行上限（字符数按 UTF-8 字节估，偏保守）。
 ///
 /// Windows 的命令行上限是 32767 个 UTF-16 单元，留出余量给 svn 路径、引号与全局参数。
-/// `svn diff` 没有 `--targets`（分析 §6.4），只能分批。
-pub const MAX_DIFF_CMDLINE: usize = 24000;
+/// `svn diff` 没有 `--targets`（分析 §6.4），只能分批。与多目标批量同一个上限。
+pub const MAX_DIFF_CMDLINE: usize = MAX_TARGETS_CMDLINE;
 
 /// 一条体检用的 `svn diff` 负责哪些结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -381,9 +383,19 @@ pub fn plan_diffs(
 /// 单元报 `added` 而不是失败（M6）。输出路径都是 `<svn_url>/<wc_root>/…`，剥掉 `svn_url`
 /// 就是仓库相对路径。
 ///
-/// 只合并：`url == <svn_url>/<wc_root>`（嵌套 external 的 URL 在别处，照旧单独比）、`wc_root`
-/// 纯 ASCII（尾随 PATH 走系统代码页，见 [`plan_diffs`]）、不含 `@`（尾随 PATH 的 `@` 是字面
-/// 字符，`--new=` 那侧怎么解析没实测过，不冒险）。可合并的不到两个时原样返回。
+/// 只合并：单元的**实际** URL 恰好是「同一个前缀 + `/` + `wc_root`」（逐字节相同，大小写也要
+/// 一致），且这个前缀与 svnUrl 只差大小写；`wc_root` 纯 ASCII（尾随 PATH 走系统代码页，见
+/// [`plan_diffs`]）、不含 `@`（尾随 PATH 的 `@` 是字面字符，`--new=` 那侧怎么解析没实测过，
+/// 不冒险）。嵌套 external 的 URL 在别处，照旧单独比。可合并的不到两个时原样返回。
+///
+/// # 为什么 `--old` 用单元的实际 URL，不用 svnUrl（独立 review 第 1 条）
+///
+/// 前面几道核对（`url_mismatch`、`whitelist_not_under_base`）比 URL 都不分大小写。svnUrl 与
+/// 实际 URL 只差大小写时，大小写敏感的服务器上 `<svnUrl>@F` 根本不存在；按 M6，旧 revision 上
+/// 不存在的目标报 `added` 而不是失败，于是整片白名单被报成差异、判成 Lying，而命令成功了，
+/// 不会退回。改动前逐单元的命令用的是 `u.url`，不受影响，合并命令也必须如此。`wc_root` 与 URL
+/// 末段只差大小写时（白名单写成 `code/`、服务器上是 `Code`）同理不合并：尾随 PATH 会被同时
+/// 接到 `--old` 与 `--new` 两侧。
 ///
 /// 合并命令带着它替代的逐单元命令（[`DiffCommand::fallback`]），失败时改跑它们。
 pub fn plan_diffs_for(
@@ -395,82 +407,109 @@ pub fn plan_diffs_for(
 ) -> Result<DiffPlan> {
     let mut plan = plan_diffs(units, map, skip, excluded)?;
     let base = svn_url.trim_end_matches('/');
-    let mergeable: Vec<bool> = units
+
+    // `plan_diffs` 的前 `units.len()` 条就是逐单元的 floor 命令，与 `units` 同序。这层约定
+    // 只在本文件里成立，这里逐条核对一次（独立 review 第 3 条）：对不上就不合并，宁可慢
+    let aligned = plan.commands.len() >= units.len()
+        && units.iter().zip(&plan.commands).all(|(u, c)| {
+            c.wc_root == u.wc_root
+                && c.scope == DiffScope::Floor
+                && c.fallback.is_empty()
+                && !c.args.iter().any(|a| a == "--")
+        });
+    if !aligned {
+        return Ok(plan);
+    }
+
+    // 每个单元的实际 URL 去掉末尾的 `/<wc_root>`（逐字节匹配）就是它的前缀；不满足条件的为 None
+    let prefix_of = |u: &WcIdentity| -> Option<String> {
+        let root = u.wc_root.trim_end_matches('/');
+        if root.is_empty() || !root.is_ascii() || root.contains('@') {
+            return None;
+        }
+        let url = u.url.trim_end_matches('/');
+        let prefix = url.strip_suffix(root)?.strip_suffix('/')?;
+        prefix
+            .eq_ignore_ascii_case(base)
+            .then(|| prefix.to_string())
+    };
+    let prefixes: Vec<Option<String>> = units.iter().map(prefix_of).collect();
+    // 只合并与第一个可合并单元同一前缀的：前缀不同（写法不一致）的照旧单独比
+    let Some(real_base) = prefixes.iter().flatten().next().cloned() else {
+        return Ok(plan);
+    };
+    let mergeable: Vec<bool> = prefixes
         .iter()
-        .map(|u| {
-            let root = u.wc_root.trim_end_matches('/');
-            !root.is_empty()
-                && root.is_ascii()
-                && !root.contains('@')
-                && u.url
-                    .trim_end_matches('/')
-                    .eq_ignore_ascii_case(&format!("{base}/{root}"))
-        })
+        .map(|p| p.as_deref() == Some(real_base.as_str()))
         .collect();
     if mergeable.iter().filter(|&&m| m).count() < 2 {
         return Ok(plan);
     }
 
-    // `plan_diffs` 的前 `units.len()` 条就是逐单元的 floor 命令，与 `units` 同序
     let rest = plan.commands.split_off(units.len());
     let floor_cmds = std::mem::take(&mut plan.commands);
-    let mut merged: Vec<(String, DiffCommand)> = Vec::new();
+    let mut roots: Vec<String> = Vec::new();
+    let mut replaced: Vec<DiffCommand> = Vec::new();
     let mut kept: Vec<DiffCommand> = Vec::new();
     for ((u, cmd), m) in units.iter().zip(floor_cmds).zip(&mergeable) {
         if *m {
-            merged.push((u.wc_root.trim_end_matches('/').to_string(), cmd));
+            roots.push(u.wc_root.trim_end_matches('/').to_string());
+            replaced.push(cmd);
         } else {
             kept.push(cmd);
         }
     }
 
-    let mut head = vec![
-        "diff".to_string(),
-        format!("--old={base}@{}", map.floor),
-        "--new=.".to_string(),
-        "--summarize".to_string(),
-        "--xml".to_string(),
-    ];
+    let old = format!("--old={real_base}@{}", map.floor);
+    let mut head: Vec<&str> = vec!["diff", &old, "--new=.", "--summarize", "--xml"];
     if !map.is_single() {
-        head.push("--ignore-properties".to_string());
+        head.push("--ignore-properties");
     }
-    head.push("--".to_string());
-    let base_len = cmdline_len(&head);
+    head.push("--");
     let mut commands = Vec::new();
-    let mut args = head.clone();
-    let mut fallback: Vec<DiffCommand> = Vec::new();
-    let mut len = base_len;
-    let flush = |commands: &mut Vec<DiffCommand>, args: Vec<String>, fallback: Vec<DiffCommand>| {
+    let mut replaced = replaced.into_iter();
+    for batch in chunk_targets(&head, &roots, MAX_DIFF_CMDLINE) {
+        let mut args: Vec<String> = head.iter().map(|a| a.to_string()).collect();
+        args.extend(batch.iter().cloned());
         commands.push(DiffCommand {
             wc_root: String::new(),
-            unit_url: base.to_string(),
+            unit_url: real_base.clone(),
             rev: map.floor,
             args,
             scope: DiffScope::Floor,
-            fallback,
+            fallback: replaced.by_ref().take(batch.len()).collect(),
         });
-    };
-    for (root, cmd) in merged {
-        let add = root.len() + 3;
-        if !fallback.is_empty() && len + add > MAX_DIFF_CMDLINE {
-            flush(
-                &mut commands,
-                std::mem::replace(&mut args, head.clone()),
-                std::mem::take(&mut fallback),
-            );
-            len = base_len;
-        }
-        args.push(root);
-        fallback.push(cmd);
-        len += add;
-    }
-    if !fallback.is_empty() {
-        flush(&mut commands, args, fallback);
     }
     commands.extend(kept);
     commands.extend(rest);
     plan.commands = commands;
     Ok(plan)
+}
+
+/// svn 的失败是不是「整台服务器都够不着」：连不上、认证失败、仓库打不开、网络超时。
+///
+/// 合并命令失败时，这类失败退回逐单元也只会在第一条上再失败一次（合并的单元都在同一个 URL
+/// 前缀下），白等一轮超时（独立 review 第 2 条）。别的失败（某个单元的路径不对之类）才退回。
+/// 只认错误码：svn 的提示语会本地化。认错了的代价是退回时多跑一条，不会改变结论。
+pub fn server_unreachable(stderr: &str) -> bool {
+    const CODES: &[&str] = &[
+        "E170013", // Unable to connect to a repository at URL
+        "E170001", // Authorization failed
+        "E215004", // No more credentials or we tried too many times
+        "E175002", // 连接 / DAV 请求失败
+        "E175012", // Connection timed out
+        "E180001", // Unable to open an ra_local session（file:// 仓库不在了）
+        "E210002", // svnserve 网络连接被关闭
+        "E670002", // 域名解析失败
+        "E670008", // 域名解析失败
+        "E730054", // WSAECONNRESET
+        "E730060", // WSAETIMEDOUT
+        "E730061", // WSAECONNREFUSED
+        "E731001", // No such host is known
+    ];
+    crate::engine::svn_tombstone::error_codes(stderr)
+        .iter()
+        .any(|c| CODES.contains(&c.as_str()))
 }
 
 /// 尾随 PATH 那类命令的固定前缀，最后一个参数是 `--`。
@@ -529,9 +568,9 @@ fn push_batches(
     }
 }
 
-/// 命令行长度的保守估计：每个参数按字节数 + 两个引号 + 一个空格。
+/// 命令行长度的保守估计，口径见 [`cmdline_estimate`]。
 fn cmdline_len(args: &[String]) -> usize {
-    "svn --non-interactive".len() + args.iter().map(|a| a.len() + 3).sum::<usize>()
+    cmdline_estimate(&[], args)
 }
 
 /// 仓库相对路径归哪个单元：取最长的 `wc_root` 前缀（嵌套 external 比外层更具体）。
@@ -847,19 +886,24 @@ fn check_grouped(
         };
         let xml = match result {
             Ok(x) => x,
-            Err(_) if merged => {
-                // 不拿合并命令的失败下结论：一个单元的问题（比如磁盘上没了，实测 M7）会让整条
-                // 失败，按逐单元跑才知道是哪一个、前面那几个比出了什么
+            // 不拿合并命令的失败下结论：一个单元的问题（比如磁盘上没了，实测 M7）会让整条
+            // 失败，按逐单元跑才知道是哪一个、前面那几个比出了什么。服务器整个够不着时例外：
+            // 合并的单元都在同一个 URL 前缀下，退回只会在第一条上再等一轮超时
+            Err(e) if merged && !server_unreachable(&e.message) => {
                 for f in cmd.fallback.into_iter().rev() {
                     queue.push_front(f);
                 }
                 continue;
             }
             Err(e) => {
-                let reason = format!(
-                    "比对 `{}`（r{}）时失败：{}",
-                    cmd.wc_root, cmd.rev, e.message
-                );
+                let what = if cmd.wc_root.is_empty() {
+                    let roots: Vec<&str> =
+                        cmd.fallback.iter().map(|f| f.wc_root.as_str()).collect();
+                    roots.join("、")
+                } else {
+                    cmd.wc_root.clone()
+                };
+                let reason = format!("比对 `{what}`（r{}）时失败：{}", cmd.rev, e.message);
                 return if ran == 0 {
                     not_checked(reason)
                 } else {

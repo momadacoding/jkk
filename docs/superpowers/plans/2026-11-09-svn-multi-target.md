@@ -90,4 +90,4 @@
 ### Task 7: 验证、独立 review、Draft PR
 
 - [x] `cargo fmt --check`、`cargo clippy --all-targets`、`cargo test`
-- [ ] 独立 review（`/code-review high`），修完高危后提交、推送、开 Draft PR
+- [x] 独立 review（`/code-review high`），修完高危后提交、推送、开 Draft PR

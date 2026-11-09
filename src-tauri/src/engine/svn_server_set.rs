@@ -48,6 +48,30 @@ fn dirty_fixes(
     classify(&read_dirty(repo_root, &targets)?)
 }
 
+/// svn 的报错里点到了哪些单位，按单位顺序拼成一句；一个都认不出时返回 `None`。
+///
+/// 一次列全部单位之后，失败理由不能再像逐个列时那样自带单位名（独立 review 第 5 条）。
+/// svn 对列不出的 target 报 `W160013: Path '/Tools' not found`（实测 M10），路径相对仓库根，
+/// 拿每个单位的 URL 去掉 `<repository><root>` 之后的那段去认。
+fn failing_units(units: &[WcIdentity], stderr: &str) -> Option<String> {
+    let hit: Vec<&str> = units
+        .iter()
+        .filter(|u| {
+            let url = u.url.trim_end_matches('/');
+            let root = u.repos_root.trim_end_matches('/');
+            match url.get(..root.len()) {
+                Some(p) if p.eq_ignore_ascii_case(root) => {
+                    let rel = &url[root.len()..];
+                    !rel.is_empty() && stderr.contains(&format!("'{rel}'"))
+                }
+                _ => false,
+            }
+        })
+        .map(|u| u.wc_root.as_str())
+        .collect();
+    (!hit.is_empty()).then(|| hit.join("、"))
+}
+
 /// 列出来给用户看的上限。再多就只报个数——几千行的清单没人看，还会把界面撑爆。
 const MAX_LISTED: usize = 20;
 
@@ -138,9 +162,13 @@ fn audit_inner(repo_root: &str, rev: u64, gone: &BTreeSet<String>) -> Result<Ser
         Err(e) => {
             // 一个单位没列成就整体判「没验成」（svn 对整条命令 exit 1，实测 M10）。
             // 「其余的都对得上所以 Matched」是这条检查最坏的结论——它要防的就是
-            // 「以为受保护、实际没有」。svn 的原话里点了是哪个 URL。
+            // 「以为受保护、实际没有」。
             return Ok(ServerAudit::NotChecked {
-                reason: format!("列举 {} 的服务器内容失败：{}", names(), e.message),
+                reason: format!(
+                    "列举 {} 的服务器内容失败：{}",
+                    failing_units(&units, &e.message).unwrap_or_else(names),
+                    e.message
+                ),
             });
         }
     };

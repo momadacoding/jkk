@@ -120,6 +120,14 @@ fn a_depth_excluded_subtree_in_a_second_root_is_reported_under_that_root() {
         svn_server_set::audit_server_set(&fx.wc_str(), 2).unwrap(),
         ServerAudit::Matched
     ));
+    // 独立 review 第 5 条：Tools 在 r1 上还没有，整条 `svn ls` 失败。理由要点名 Tools，
+    // 不能把全部单位都列一遍
+    match svn_server_set::audit_server_set(&fx.wc_str(), 1).unwrap() {
+        ServerAudit::NotChecked { reason } => {
+            assert!(reason.starts_with("列举 Tools 的"), "{reason}")
+        }
+        other => panic!("Tools 在 r1 上不存在，实际 {other:?}"),
+    }
 
     svn_cmd(
         &wc,
