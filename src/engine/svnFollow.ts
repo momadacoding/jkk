@@ -148,11 +148,11 @@ export interface AutoFollowNotice {
 
 export function describeAutoFollowDone(r: FollowReport): AutoFollowNotice {
   const m = describeFollowReport(r)
-  const look = m.tone === 'ok' ? '' : '报告里有要你留意的内容，请点「查看详情」。'
+  const look = m.tone === 'ok' ? '' : `报告里有 ${m.todo} 项要你留意，请点「查看详情」。`
   return {
     tone: m.tone === 'ok' ? 'quiet' : 'warn',
     title: '已自动跟进 SVN 侧的新内容',
-    detail: `${m.summary}${look}`,
+    detail: `${m.summary}${m.safe}。${look}`,
   }
 }
 
@@ -166,9 +166,31 @@ export interface SvnUserInfo {
   detected: string | null
 }
 
+/**
+ * 报告里一节的轻重，决定颜色与排序。
+ *
+ * - `danger`：不处理会出错，或者已经丢了东西（红）
+ * - `attention`：要你确认一下（琥珀）
+ * - `info`：只是告知（灰）
+ */
+export type ReportLevel = 'danger' | 'attention' | 'info'
+
+const RANK: Record<ReportLevel, number> = { danger: 0, attention: 1, info: 2 }
+
+/** 清单里的一行。路径与它的附注分开，才能让路径对齐、附注退到一边。 */
+export interface ReportItem {
+  /** 路径、分支名或 commit。 */
+  text: string
+  /** revision、所在分支与提交说明、落后的原因等。 */
+  meta?: string
+  /** 「…还有 N 个」那一行。 */
+  more?: boolean
+}
+
 /** {@link describeFollowReport} 的一节。没发生的事不成节。 */
 export interface FollowReportSection {
   id:
+    | 'unverified'
     | 'leaks'
     | 'lost'
     | 'uncertain'
@@ -182,19 +204,26 @@ export interface FollowReportSection {
     | 'moved'
     | 'behind'
   title: string
-  /** 要用户留意：说明走红底警告条，这一节排在前面。 */
-  warn: boolean
+  /** 非 `info` 的节排在前面，见 {@link ReportLevel}。 */
+  level: ReportLevel
+  /** 截断之前的真实条数。 */
+  count: number
   note?: string
   /** `label` 为空的组不画小标题。 */
-  groups: { label: string; items: string[] }[]
+  groups: { label: string; items: ReportItem[] }[]
 }
 
 export interface FollowReportModel {
   tone: NoticeTone
+  /** 最重的一级，决定图标颜色。 */
+  level: ReportLevel | 'ok'
+  /** 要你留意的项数：非 `info` 的节数（没体检也是一节）。 */
+  todo: number
+  /** 结果写进标题：有几项要处理一眼就能看到。 */
   title: string
   summary: string
-  /** 整份报告的前提有问题（这次没向服务器验证过）。 */
-  warning?: string
+  /** 跟进不变的保证（工作区没被写），单独一行让人放心。 */
+  safe: string
   /** 暂存与 commit 是按什么判定的（C1h）。 */
   basis: string
   sections: FollowReportSection[]
@@ -210,13 +239,15 @@ function listed(items: string[]): string {
   return shown.join('\n')
 }
 
-function capped(items: string[]): string[] {
+function capped(items: ReportItem[]): ReportItem[] {
   if (items.length <= MAX_REPORT_ITEMS) return items
   return [
     ...items.slice(0, MAX_REPORT_ITEMS),
-    `…还有 ${items.length - MAX_REPORT_ITEMS} 个`,
+    { text: `…还有 ${items.length - MAX_REPORT_ITEMS} 个`, more: true },
   ]
 }
+
+const plain = (items: string[]): ReportItem[] => items.map((text) => ({ text }))
 
 /**
  * 泄漏提醒（事故分析 6.8）：原来一句「可能被提交到了 SVN，请检查」，用户分不清哪些已确认、哪些只是拿不准，
@@ -231,6 +262,10 @@ const SNAPSHOT_NOTE =
 
 function leakLine(l: Leak): string {
   return `${l.path}（分支 ${l.branch}：${l.subject}）`
+}
+
+function leakItem(l: Leak): ReportItem {
+  return { text: l.path, meta: `分支 ${l.branch}：${l.subject}` }
 }
 
 /** 所有 hunk 都原样出现在新基线里的算「已确认」；有任何一处对不上的算「拿不准」。 */
@@ -260,10 +295,10 @@ function pinnedNote(ref: string | null): string {
 
 /** 按作者分组：看一眼就知道哪些是别人的改动（分析 §6.10，U7）。作者按名字排，匿名排在后面。 */
 function changeGroups(r: FollowReport): FollowReportSection['groups'] {
-  const byAuthor = new Map<string, string[]>()
-  const anonymous: string[] = []
+  const byAuthor = new Map<string, ReportItem[]>()
+  const anonymous: ReportItem[] = []
   for (const c of r.changes) {
-    const line = `${c.path}  r${c.rev}`
+    const line = { text: c.path, meta: `r${c.rev}` }
     if (!c.author) anonymous.push(line)
     else byAuthor.set(c.author, [...(byAuthor.get(c.author) ?? []), line])
   }
@@ -271,9 +306,11 @@ function changeGroups(r: FollowReport): FollowReportSection['groups'] {
   return [
     ...named,
     { label: '（没有作者）', items: anonymous },
-    { label: '已在 SVN 上删除', items: r.removed },
+    { label: '已在 SVN 上删除', items: plain(r.removed) },
   ]
 }
+
+const commitLabel = (c: string) => `commit ${c.slice(0, 10)}`
 
 /**
  * 跟进报告的展示模型（分析 §6.10、§6.12）。
@@ -289,113 +326,143 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
   // 旧后端没有这两个字段
   const snapshot = r.snapshot ?? []
   const drift = r.drift ?? []
-  const candidates: FollowReportSection[] = [
+  const { sure, unsure } = leakTiers(r.leaks)
+  // 顺序就是展示顺序：先 danger，再 attention，最后 info；info 里与这次跟进最相关的在前
+  const candidates: Omit<FollowReportSection, 'count'>[] = [
     {
       id: 'drift',
       title: '分支与磁盘对不上',
-      warn: true,
+      level: 'danger',
       note:
-        '这些文件在磁盘上是 SVN 的版本，重放后的分支里却是别的内容（或者把 SVN 已删的文件带了回来），' +
-        '「本地改动」里会出现它们的修改。可能是重放时合错了，也可能是你在磁盘上撤掉了某个 commit 的改动、' +
-        '还没提交这次撤销。请逐个核对：磁盘上的版本是对的，就把它提交进分支。',
-      groups: [{ label: '', items: drift }],
+        '「本地改动」里会出现这些文件的修改：磁盘上是 SVN 的版本，重放后的分支里却是别的内容' +
+        '（或者把 SVN 已删的文件带了回来）。请逐个核对，磁盘上的版本是对的，就把它提交进分支。' +
+        '可能是重放时合错了，也可能是你在磁盘上撤掉了某个 commit 的改动、还没提交这次撤销。',
+      groups: [{ label: '', items: plain(drift) }],
     },
     {
       id: 'leaks',
       title: '泄漏告警',
-      warn: true,
+      level: 'danger',
       note:
         `${LEAK_NOTE}。只是提醒，不影响这次跟进；` +
         '带着这些补丁的其他分支不会自动移动，切过去时会提示手动跟进。确认是你有意提交的，就可以不管它。',
       groups: [
-        { label: '这些改动已确认在 SVN 上', items: leakTiers(r.leaks).sure.map(leakLine) },
-        { label: '拿不准', items: leakTiers(r.leaks).unsure.map(leakLine) },
+        { label: '这些改动已确认在 SVN 上', items: sure.map(leakItem) },
+        { label: '拿不准', items: unsure.map(leakItem) },
       ],
     },
     {
       id: 'lost',
       title: '丢失的暂存',
-      warn: true,
+      level: 'danger',
       note: `这些暂存内容没能保留，已取 SVN 的版本。${pinned}`,
-      groups: [{ label: '', items: r.stage.lost }],
+      groups: [{ label: '', items: plain(r.stage.lost) }],
     },
     {
       id: 'uncertain',
       title: '拿不准的暂存',
-      warn: true,
+      level: 'attention',
       note: '这些暂存原样保留：分不清它和你的提交谁先谁后，请确认。不需要的话取消暂存即可。',
-      groups: [{ label: '', items: r.stage.uncertain }],
-    },
-    {
-      id: 'discarded',
-      title: '丢弃的暂存',
-      warn: false,
-      note: `这些暂存是已提交版本之前的中间版本，已丢弃。${pinned}`,
-      groups: [{ label: '', items: r.stage.discarded }],
-    },
-    {
-      id: 'merged',
-      title: '合并的暂存',
-      warn: false,
-      note: '这些暂存和 SVN 的新内容做了三方合并，结果留在暂存区。',
-      groups: [{ label: '', items: merged }],
-    },
-    { id: 'changes', title: '跟进的文件', warn: false, groups: changeGroups(r) },
-    {
-      id: 'dropped',
-      title: '丢弃的 commit',
-      warn: false,
-      note: '这些 commit 的内容都已经在 SVN 上，重放之后变空，不再保留。',
-      groups: [{ label: '', items: r.dropped.map((c) => c.slice(0, 10)) }],
-    },
-    {
-      id: 'rewritten',
-      title: '换成 SVN 版本的路径',
-      warn: false,
-      note: '这些路径你已经提交到了 SVN，commit 里的版本让位给 SVN 的版本。',
-      groups: r.rewritten.map(([c, paths]) => ({ label: c.slice(0, 10), items: paths })),
+      groups: [{ label: '', items: plain(r.stage.uncertain) }],
     },
     {
       id: 'snapshot',
       title: '按基线对齐的快照内容',
-      warn: false,
+      level: 'attention',
       note: `${SNAPSHOT_NOTE}重放时直接采用了新基线的版本。`,
-      groups: snapshot.map(([c, paths]) => ({ label: c.slice(0, 10), items: paths })),
-    },
-    {
-      id: 'moved',
-      title: '移动的分支',
-      warn: false,
-      note: '这些分支一起重放到了新基线上，没有动工作区。',
-      groups: [{ label: '', items: r.movedBranches }],
+      groups: snapshot.map(([c, paths]) => ({ label: commitLabel(c), items: plain(paths) })),
     },
     {
       id: 'behind',
       title: '落后的分支',
-      warn: false,
+      level: 'attention',
       note: '这些分支没有移动，切过去时会提示手动跟进。',
-      groups: [{ label: '', items: r.behindBranches.map(([b, why]) => `${b}：${why}`) }],
+      groups: [
+        { label: '', items: r.behindBranches.map(([b, why]) => ({ text: b, meta: why })) },
+      ],
+    },
+    { id: 'changes', title: '跟进的文件', level: 'info', groups: changeGroups(r) },
+    {
+      id: 'moved',
+      title: '一起移动的分支',
+      level: 'info',
+      note: '这些分支一起重放到了新基线上，没有动工作区。',
+      groups: [{ label: '', items: plain(r.movedBranches) }],
+    },
+    {
+      id: 'merged',
+      title: '合并的暂存',
+      level: 'info',
+      note: '这些暂存和 SVN 的新内容做了三方合并，结果留在暂存区。',
+      groups: [{ label: '', items: plain(merged) }],
+    },
+    {
+      id: 'discarded',
+      title: '丢弃的暂存',
+      level: 'info',
+      note: `这些暂存是已提交版本之前的中间版本，已丢弃。${pinned}`,
+      groups: [{ label: '', items: plain(r.stage.discarded) }],
+    },
+    {
+      id: 'rewritten',
+      title: '换成 SVN 版本的路径',
+      level: 'info',
+      note: '这些路径你已经提交到了 SVN，commit 里的版本让位给 SVN 的版本。',
+      groups: r.rewritten.map(([c, paths]) => ({ label: commitLabel(c), items: plain(paths) })),
+    },
+    {
+      id: 'dropped',
+      title: '丢弃的 commit',
+      level: 'info',
+      note: '这些 commit 的内容都已经在 SVN 上，重放之后变空，不再保留。',
+      groups: [{ label: '', items: plain(r.dropped.map((c) => c.slice(0, 10))) }],
     },
   ]
-  const sections = candidates
-    .map((s) => ({
-      ...s,
-      groups: s.groups
-        .filter((g) => g.items.length > 0)
-        .map((g) => ({ ...g, items: capped(g.items) })),
-    }))
+  const listed = candidates
+    .map((s) => {
+      const groups = s.groups.filter((g) => g.items.length > 0)
+      return {
+        ...s,
+        count: groups.reduce((n, g) => n + g.items.length, 0),
+        groups: groups.map((g) => ({ ...g, items: capped(g.items) })),
+      }
+    })
     .filter((s) => s.groups.length > 0)
-  const warned = !r.verified || r.leaks.length > 0 || r.stage.lost.length > 0 || drift.length > 0
-  const pending = r.stage.uncertain.length > 0 || r.behindBranches.length > 0 || snapshot.length > 0
+  // 没有清单，只有一句话；排在最前：整份报告的前提有问题
+  const unverified: FollowReportSection[] = r.verified
+    ? []
+    : [
+        {
+          id: 'unverified',
+          title: '新基线没向服务器体检',
+          level: 'danger',
+          count: 0,
+          note: '这次没能向服务器体检新基线（可能是断网），基线照样发布了。连上之后建议手动体检一次。',
+          groups: [],
+        },
+      ]
+  // 按轻重排，同级保持书写顺序（sort 是稳定的）：以后加候选时写错位置，也不会排到文件清单后面去
+  const sections = [...unverified, ...listed].sort((a, b) => RANK[a.level] - RANK[b.level])
+
+  const todo = sections.filter((s) => s.level !== 'info').length
+  const danger = sections.some((s) => s.level === 'danger')
+  const level = danger ? 'danger' : todo > 0 ? 'attention' : 'ok'
+
   const count = r.changes.length + r.removed.length
-  const what = count > 0 ? `跟进了 ${count} 个文件` : '分支已跟上基线'
+  const facts = [count > 0 ? `跟进了 ${count} 个文件` : '分支已跟上基线']
+  if (r.movedBranches.length > 0) facts.push(`${r.movedBranches.length} 条分支一起移动`)
+  facts.push(`基线最低在 r${r.newFloor}`)
+
   return {
-    tone: warned || pending ? 'attention' : 'ok',
-    title: '跟进完成',
-    summary: `${what}，基线最低在 r${r.newFloor}。工作区里的文件没有改动。`,
-    warning: r.verified
-      ? undefined
-      : '这次没能向服务器体检新基线（可能是断网），基线照样发布了。连上之后建议手动体检一次。',
+    tone: level === 'ok' ? 'ok' : 'attention',
+    level,
+    todo,
+    title:
+      todo === 0
+        ? '跟进完成'
+        : `跟进完成，有 ${todo} 项${danger ? '需要处理' : '请确认'}`,
+    summary: `${facts.join('，')}。`,
+    safe: '工作区里的文件没有改动',
     basis:
       r.evidence === 'hooks' ? '判定依据：TortoiseSVN 钩子事件' : '判定依据：作者 + 失焦快照',
     sections,

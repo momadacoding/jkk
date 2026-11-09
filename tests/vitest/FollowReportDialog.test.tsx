@@ -45,7 +45,9 @@ describe('FollowReportDialog', () => {
     open(report)
     expect(await screen.findByText('跟进完成')).toBeTruthy()
     expect(screen.getByText('zhang')).toBeTruthy()
-    expect(screen.getByText(/Code\/A\.cs\s+r7/)).toBeTruthy()
+    // 路径与 revision 在两个 span 里：getByText 只认元素自己的文本，比对整行
+    const row = screen.getByText('Code/A.cs').closest('li')!
+    expect(row.querySelector('.follow-meta')?.textContent).toBe('r7')
     await waitFor(() => expect(screen.queryByLabelText('我的 SVN 用户名')).toBeNull())
   })
 
@@ -63,7 +65,7 @@ describe('FollowReportDialog', () => {
     expect(screen.queryByRole('dialog')).toBeNull()
   })
 
-  it('离线没验证、泄漏告警都用警告条', () => {
+  it('离线没验证、泄漏告警都是红色的「需处理」卡片，排在「需要你留意」里', () => {
     open({
       ...report,
       verified: false,
@@ -77,9 +79,80 @@ describe('FollowReportDialog', () => {
         },
       ],
     })
-    const warnings = Array.from(document.querySelectorAll('.dlg-warning')).map((n) => n.textContent)
-    expect(warnings.some((t) => t?.includes('服务器'))).toBe(true)
-    expect(warnings.some((t) => t?.includes('Local-Only'))).toBe(true)
+    const danger = Array.from(document.querySelectorAll('.follow-section.danger')).map(
+      (n) => n.textContent,
+    )
+    // 没体检排在最前：整份报告的前提
+    expect(danger[0]).toContain('服务器')
+    expect(danger.some((t) => t?.includes('Local-Only'))).toBe(true)
+    expect(screen.getByText('跟进完成，有 2 项需要处理')).toBeTruthy()
+  })
+
+  it('要留意的节展开；只是告知、条数多的节折起来', () => {
+    const changes = Array.from({ length: 9 }, (_, i) => ({
+      path: `Code/${i}.cs`,
+      rev: 7,
+      author: 'zhang',
+    }))
+    open({ ...report, changes, behindBranches: [['old', '有冲突']] })
+    const sections = Array.from(document.querySelectorAll<HTMLDetailsElement>('details.follow-section'))
+    const byTitle = (t: string) => sections.find((d) => d.textContent?.includes(t))!
+    expect(byTitle('落后的分支').open).toBe(true)
+    expect(byTitle('跟进的文件').open).toBe(false)
+  })
+
+  it('一节超过 10 条时先列 10 条，点「再显示」铺开剩下的', () => {
+    const uncertain = Array.from({ length: 12 }, (_, i) => `Code/U${i}.cs`)
+    open({ ...report, stage: { ...report.stage, uncertain } })
+    expect(screen.queryByText('Code/U10.cs')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: '再显示 2 个' }))
+    expect(screen.getByText('Code/U10.cs')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '收起' }))
+    expect(screen.queryByText('Code/U10.cs')).toBeNull()
+  })
+
+  it('「再显示」的数目是真能铺开的条数，不把 engine 截掉的算进去', () => {
+    // engine 只留 200 条，后面是「…还有 50 个」
+    const uncertain = Array.from({ length: 250 }, (_, i) => `Code/U${i}.cs`)
+    open({ ...report, stage: { ...report.stage, uncertain } })
+    fireEvent.click(screen.getByRole('button', { name: '再显示 190 个' }))
+    const section = document.querySelector('.follow-section.attention')!
+    expect(section.querySelectorAll('.follow-items li:not(.more)')).toHaveLength(200)
+    expect(screen.getByText('…还有 50 个')).toBeTruthy()
+  })
+
+  it('预览按组分：第一组很长时，后面的组与它们的小标题照样看得到', () => {
+    const sure = Array.from({ length: 12 }, (_, i) => ({
+      branch: 'work',
+      commit: 'c'.repeat(40),
+      subject: '加日志',
+      path: `Code/S${i}.cs`,
+      hunks: [{ oldStart: 1, lines: 1, verdict: 'present' as const }],
+    }))
+    const unsure = { ...sure[0], path: 'Code/Unsure.cs', hunks: [{ oldStart: 1, lines: 1, verdict: 'unknown' as const }] }
+    open({ ...report, leaks: [...sure, unsure] })
+    expect(screen.getByText('拿不准')).toBeTruthy()
+    expect(screen.getByText('Code/Unsure.cs')).toBeTruthy()
+  })
+
+  it('折起来的节：标题能 Tab 到；正文不在 DOM 里，Tab 不会落到藏着的按钮上', () => {
+    const changes = Array.from({ length: 12 }, (_, i) => ({
+      path: `Code/${i}.cs`,
+      rev: 7,
+      author: 'zhang',
+    }))
+    open({ ...report, changes })
+    const summary = document.querySelector('details.follow-section > summary') as HTMLElement
+    expect(screen.queryByText('Code/0.cs')).toBeNull()
+    expect(screen.queryByRole('button', { name: /再显示/ })).toBeNull()
+
+    // 焦点在「知道了」上，Tab 绕回框里第一个可聚焦元素
+    fireEvent.keyDown(window, { key: 'Tab' })
+    expect(document.activeElement).toBe(summary)
+
+    fireEvent.click(summary)
+    expect(screen.getByText('Code/0.cs')).toBeTruthy()
+    expect(screen.getByRole('button', { name: '再显示 2 个' })).toBeTruthy()
   })
 
   it('取不到用户时显示一行输入框，说明它的用途', async () => {
