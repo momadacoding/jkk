@@ -18,7 +18,10 @@
 - [PowerShell](https://github.com/PowerShell/PowerShell) 7.4+：仅发版脚本需要
 - [Node.js](https://nodejs.org/) + [pnpm](https://pnpm.io/)
 - Windows / macOS / Linux 均可（当前主要在 Windows 11 开发）
-- 本地已安装 `git` 2.26 及以上（Stage / Unstage / Discard 用 `--pathspec-from-file` 从 stdin 传路径，避开 Windows 命令行长度上限）
+- 本地已安装 `git`：
+  - 2.36 及以上：客户端第一次调用 git 时检查版本，低于这个版本的任何 git 操作都会被拒绝，并提示升级
+  - SVN 混合模式的「跟进」需要 2.43 及以上，「交付」的慢路径需要 2.40 及以上。这两项按功能单独检查，git 不够新时只是这个功能不能用
+  - 每个参数要求的版本列在 `src-tauri/src/engine/git_cli.rs` 的 `MIN_GIT_VERSION` 注释里
 
 ## 目录结构
 

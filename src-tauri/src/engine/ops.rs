@@ -153,8 +153,9 @@ pub fn discard(path: &str, paths: &[String], staged: bool) -> Result<()> {
     // 下面每条带路径的命令都加 `--literal-pathspecs`：`--` 之后的路径 git 仍按 glob 匹配，
     // 丢弃 `f[1].txt` 会连带 checkout / rm 掉用户没选中的 `f1.txt`，而这一步不可逆
     // （实测 2026-11-04：f1.txt 未暂存的改动被抹掉，`rm -f` 路径下整个文件被删）。
-    // 两条探测都是只读的，按命令行长度分批跑再合并（`path_set_batched`）；后面三条写命令
-    // 不能拆批，路径走 stdin（`run_git_paths`）。一次几百个路径拼进一条命令行会撞上
+    // 两条探测都是只读的，按命令行长度分批跑再合并（`path_set_batched`）；后面的两条 git
+    // 写命令（checkout、rm）不能拆批，路径走 stdin（`run_git_paths`）。未跟踪文件直接从磁盘删，
+    // 不经过 git，也不是原子的。一次几百个路径拼进一条命令行会撞上
     // Windows 的长度上限（`tests/long_pathspec.rs`）
     let all: Vec<&str> = paths.iter().map(String::as_str).collect();
     let untracked = path_set_batched(
