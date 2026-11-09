@@ -34,14 +34,26 @@ describe('contentSegments', () => {
     expect(contentSegments('a\rb', false)).toEqual([{ text: 'a\rb', mark: null }])
   })
 
-  it('开着时空格、制表符、行尾 \\r 各自成段', () => {
-    expect(contentSegments('\tx  y\r', true)).toEqual([
+  it('开着时空格、制表符、行尾 \\r 各自成段；连续空格并成一段，制表符一个一段', () => {
+    expect(contentSegments('\t\tx  y \tz\r', true)).toEqual([
+      { text: '\t', mark: 'tab' },
       { text: '\t', mark: 'tab' },
       { text: 'x', mark: null },
-      { text: ' ', mark: 'space' },
-      { text: ' ', mark: 'space' },
+      { text: '  ', mark: 'space' },
       { text: 'y', mark: null },
+      { text: ' ', mark: 'space' },
+      { text: '\t', mark: 'tab' },
+      { text: 'z', mark: null },
       { text: '', mark: 'cr' },
+    ])
+  })
+
+  it('8 个空格缩进是一段，不是 8 段', () => {
+    expect(contentSegments('        return x', true)).toEqual([
+      { text: '        ', mark: 'space' },
+      { text: 'return', mark: null },
+      { text: ' ', mark: 'space' },
+      { text: 'x', mark: null },
     ])
   })
 

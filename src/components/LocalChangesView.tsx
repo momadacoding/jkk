@@ -312,9 +312,12 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
   // 父组件按它所在的区读 diff，传下来的 `diff` 里同一路径最多一条
   const active = activeChange(selection, paths.unstaged, paths.staged)
   const activeFile = active?.path ?? null
+  // 「上下文被后端退回默认」的标记要跟着带过去，理由同 `CommitDetailView` 的 `activeDiff`
+  const contextNarrowed = diff?.contextNarrowed
   const activeDiff: DiffData = useMemo(() => ({
     files: (diff?.files ?? []).filter((f) => f.path === activeFile),
-  }), [diff, activeFile])
+    contextNarrowed,
+  }), [diff, activeFile, contextNarrowed])
   // 没有文件可显示时父组件什么都不读（`changesDiffScope` 为 null），diff 一直是 null：
   // 这时不能说正在读取，按空 diff 显示
   // 只读选中的那一个文件之后，换选中也要等一次读取（通常几十毫秒）：提示延迟出现，读得快就不闪

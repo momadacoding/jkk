@@ -105,6 +105,29 @@ describe('useRepoEffects：开关变了就重读当前视图的 diff', () => {
     ])
   })
 
+  it('没显示的标签开关变了先不读，切回来时补读一次；切换本身不重读', async () => {
+    const { rerender } = renderHook(({ active }) => {
+      const store = useRepoStore()
+      useRepoEffects({ ...store.state, path: 'C:/r' }, store, 'changes', 'unstaged:a.txt', active)
+      return store
+    }, { initialProps: { active: false } })
+    // 刚挂载时照常读：后台恢复的标签也要有内容
+    expect(reads()).toHaveLength(1)
+    await answerFirst(diffOf('a.txt'))
+    act(() => { setDiffPrefs({ fullFile: true }) })
+    expect(reads()).toHaveLength(1)
+    rerender({ active: true })
+    expect(reads().map((r) => r.options)).toEqual([
+      { contextLines: 3, ignoreWhitespace: false },
+      { contextLines: FULL_FILE_CONTEXT, ignoreWhitespace: false },
+    ])
+    await answerFirst(diffOf('a.txt'))
+    // 选项没再变：来回切标签不发请求
+    rerender({ active: false })
+    rerender({ active: true })
+    expect(reads()).toHaveLength(2)
+  })
+
   it('忽略空白变了也重读', async () => {
     mount()
     await answerFirst(diffOf('a.txt'))

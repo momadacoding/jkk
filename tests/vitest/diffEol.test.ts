@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { diffSequences, ignoreEolChanges, stripCr } from '@/engine/diffEol'
+import { countChanges, diffSequences, ignoreEolChanges, stripCr } from '@/engine/diffEol'
 import type { DiffHunk, DiffLine } from '@/engine/types'
 
 const ctx = (content: string, o: number, n: number): DiffLine => ({ origin: ' ', content, oldLineno: o, newLineno: n })
@@ -183,5 +183,21 @@ describe('ignoreEolChanges', () => {
 
   it('空 hunk 列表', () => {
     expect(ignoreEolChanges([], 3)).toEqual({ hunks: [], hidden: false })
+  })
+})
+
+describe('countChanges', () => {
+  it('忽略换行符时只差 \\r 的不算，真改的照算', () => {
+    const hunk = crlfHunk(lines(2000), 5)
+    expect(countChanges([hunk], true)).toEqual({ additions: 1, deletions: 1 })
+    expect(countChanges([hunk], false)).toEqual({ additions: 2000, deletions: 2000 })
+  })
+
+  it('只换了换行符：+0/-0', () => {
+    expect(countChanges([crlfHunk(lines(10))], true)).toEqual({ additions: 0, deletions: 0 })
+  })
+
+  it('空输入', () => {
+    expect(countChanges([], true)).toEqual({ additions: 0, deletions: 0 })
   })
 })

@@ -77,7 +77,8 @@ function fileNote(shown: ShownFile, prefs: DiffPrefs): string | null {
   if (shown.file.binary) return '二进制文件，无法按行显示'
   if (shown.hunks.length > 0) return null
   if (shown.eolHidden) return '只有换行符（CRLF / LF）改动，已按设置忽略'
-  if (prefs.ignoreWhitespace) return '没有文本改动（已忽略空白）'
+  // 不说「已忽略空白」：改名、只改权限、空的新文件同样没有 hunk，那里并没有藏掉什么（第二轮独立 review 第 8 条）
+  if (prefs.ignoreWhitespace) return '没有文本改动（忽略空白开着，只改了空白的行不显示）'
   return '没有文本改动'
 }
 
@@ -137,20 +138,25 @@ function FileList({ files, prefs, showPath, renderRows }: {
 function SplitPanes({ files, prefs, showPath }: { files: ShownFile[], prefs: DiffPrefs, showPath: boolean }) {
   const left = useRef<HTMLDivElement>(null)
   const right = useRef<HTMLDivElement>(null)
-  /** 刚被代码改了滚动位置、下一次 scroll 事件是跟随引起的那一侧。 */
-  const echo = useRef<HTMLDivElement | null>(null)
+  /** 刚被代码改了滚动位置的那一侧，和改完之后它实际停在的位置（被夹到尽头时不等于赋的值）。 */
+  const echo = useRef<{ pane: HTMLDivElement, top: number, left: number } | null>(null)
   const follow = (from: HTMLDivElement | null, to: HTMLDivElement | null) => {
     if (!from || !to) return
-    if (echo.current === from) {
+    const pending = echo.current
+    if (pending?.pane === from) {
       echo.current = null
-      return
+      // 停在代码设的位置上：这次 scroll 是跟随引起的，不反推。位置不一样说明用户在同一帧里也滚了
+      // 这一侧，浏览器把两次合成了一个事件，要照常跟随（第二轮独立 review 第 7 条）
+      if (from.scrollTop === pending.top && from.scrollLeft === pending.left) return
     }
     const top = to.scrollTop
     const leftPos = to.scrollLeft
     if (top !== from.scrollTop) to.scrollTop = from.scrollTop
     if (leftPos !== from.scrollLeft) to.scrollLeft = from.scrollLeft
     // 只有真的动了才会有那次 scroll：赋的值被夹回原处时不会触发，标记留着就会吞掉用户下一次滚动
-    if (to.scrollTop !== top || to.scrollLeft !== leftPos) echo.current = to
+    if (to.scrollTop !== top || to.scrollLeft !== leftPos) {
+      echo.current = { pane: to, top: to.scrollTop, left: to.scrollLeft }
+    }
   }
   const side = (s: 'old' | 'new') => (h: ShownHunk) =>
     h.rows!.map((row, j) => (
@@ -283,15 +289,15 @@ interface DiffViewProps {
 export function DiffView({ diff, showPath = true, note }: DiffViewProps) {
   const prefs = useDiffPrefs()
   const context = effectiveContext(prefs)
-  const files = useMemo<ShownFile[]>(() => diff.files.map((file) => {
+  // 两步分开记：重比换行符（Myers）贵，分栏只是换个画法，切分栏不该把它重跑一遍（第二轮独立 review 第 5 条）
+  const eolFiles = useMemo(() => diff.files.map((file) => {
     const eol = prefs.ignoreEol && !file.binary ? ignoreEolChanges(file.hunks, context) : null
-    const hunks = eol ? eol.hunks : file.hunks
-    return {
-      file,
-      hunks: hunks.map((hunk) => ({ hunk, rows: prefs.split ? toSplitRows(hunk.lines) : null })),
-      eolHidden: eol?.hidden ?? false,
-    }
-  }), [diff, prefs.ignoreEol, prefs.split, context])
+    return { file, hunks: eol ? eol.hunks : file.hunks, eolHidden: eol?.hidden ?? false }
+  }), [diff, prefs.ignoreEol, context])
+  const files = useMemo<ShownFile[]>(() => eolFiles.map((f) => ({
+    ...f,
+    hunks: f.hunks.map((hunk) => ({ hunk, rows: prefs.split ? toSplitRows(hunk.lines) : null })),
+  })), [eolFiles, prefs.split])
 
   const invisibles = prefs.showInvisibles
   let body: ReactNode

@@ -43,23 +43,31 @@ export interface ContentSegment {
 /**
  * 「显示不可见字符」：把空格、制表符、行尾 `\r` 切成单独的段，组件给它们画上 `·` `→` `␍`。
  * 关着时只去掉行尾的 `\r`——`white-space: pre` 下它画不出东西，留着只会让复制出去的文本多一个字符。
+ *
+ * 连续的空格并成一段：每段是一个 `<span>`，8 个空格缩进的万行文件逐个切会多出几万个节点
+ * （第二轮独立 review 第 6 条）。一段里每个空格一个点由 CSS 的重复背景画。制表符仍一个一段：
+ * 它的宽度随所在列变，画不成等距的重复背景。
  */
 export function contentSegments(content: string, showInvisibles: boolean): ContentSegment[] {
   const hasCr = content.endsWith('\r')
   const body = hasCr ? content.slice(0, -1) : content
   if (!showInvisibles) return [{ text: body, mark: null }]
   const out: ContentSegment[] = []
-  let plain = ''
-  for (const ch of body) {
-    if (ch === ' ' || ch === '\t') {
-      if (plain) out.push({ text: plain, mark: null })
-      plain = ''
-      out.push({ text: ch, mark: ch === ' ' ? 'space' : 'tab' })
-    } else {
-      plain += ch
-    }
+  let run = ''
+  let runMark: ContentSegment['mark'] = null
+  const flush = () => {
+    if (run) out.push({ text: run, mark: runMark })
+    run = ''
   }
-  if (plain) out.push({ text: plain, mark: null })
+  for (const ch of body) {
+    const mark = ch === ' ' ? 'space' : ch === '\t' ? 'tab' : null
+    if (mark !== runMark || mark === 'tab') {
+      flush()
+      runMark = mark
+    }
+    run += ch
+  }
+  flush()
   if (hasCr) out.push({ text: '', mark: 'cr' })
   return out
 }

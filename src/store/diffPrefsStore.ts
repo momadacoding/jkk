@@ -46,6 +46,11 @@ export function useDiffPrefs(): DiffPrefs {
   return useSyncExternalStore(subscribe, getDiffPrefs)
 }
 
+/** 只订阅一个开关：快照是这个开关的值（都是原始类型），别的开关变了不重渲染。 */
+export function useDiffPref<K extends keyof DiffPrefs>(key: K): DiffPrefs[K] {
+  return useSyncExternalStore(subscribe, () => current[key])
+}
+
 function optionsKeySnapshot(): string {
   return diffOptionsKey(backendDiffOptions(current))
 }

@@ -216,6 +216,22 @@ export interface EolResult {
  * 把只差换行符的改动藏起来。`context` 是当前的上下文行数（整个文件时为 Infinity）。
  * 一个 hunk 里一处都没藏的话原样返回（同一个对象），不重切。
  */
+/**
+ * 文件列表上的增删行数，与 diff 面板同一口径：开着忽略换行符时，只差行尾 `\r` 的那几对不算
+ * （第二轮独立 review 第 4 条：一个文件从 LF 换成 CRLF，列表显示 +2000/-2000，点开却说只有换行符改动）。
+ */
+export function countChanges(hunks: readonly DiffHunk[], ignoreEol: boolean): { additions: number; deletions: number } {
+  let additions = 0
+  let deletions = 0
+  for (const hunk of hunks) {
+    for (const line of ignoreEol ? realignHunk(hunk.lines).lines : hunk.lines) {
+      if (line.origin === '+') additions++
+      else if (line.origin === '-') deletions++
+    }
+  }
+  return { additions, deletions }
+}
+
 export function ignoreEolChanges(hunks: readonly DiffHunk[], context: number): EolResult {
   const out: DiffHunk[] = []
   let hidden = false

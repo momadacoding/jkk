@@ -132,9 +132,59 @@ describe('DiffView 工具栏', () => {
     expect(screen.getByText(/文件太多/)).toBeTruthy()
   })
 
+  it('忽略空白开着、文件没有 hunk 时不说「已忽略」：改名、只改权限时并没有藏掉什么', () => {
+    act(() => { setDiffPrefs({ ignoreWhitespace: true }) })
+    render(<DiffView diff={{
+      files: [{ path: 'new.txt', status: 'renamed', oldPath: 'old.txt', binary: false, hunks: [] }],
+    }} />)
+    expect(screen.getByText(/没有文本改动/).textContent).not.toContain('已忽略')
+  })
+
   it('没有文件时也有工具栏', () => {
     render(<DiffView diff={{ files: [] }} />)
     expect(screen.getByRole('toolbar')).toBeTruthy()
     expect(screen.getByText('No changes')).toBeTruthy()
+  })
+})
+
+/** jsdom 不排版、scrollTop 恒为 0：换成一个会夹到 [0, max] 的假滚动位置。 */
+function fakeScroll(el: Element, maxTop: number) {
+  let top = 0
+  Object.defineProperty(el, 'scrollTop', {
+    configurable: true,
+    get: () => top,
+    set: (v: number) => { top = Math.max(0, Math.min(maxTop, v)) },
+  })
+  Object.defineProperty(el, 'scrollLeft', { configurable: true, get: () => 0, set: () => {} })
+}
+
+describe('DiffView 分栏滚动跟随', () => {
+  function panes(leftMax: number, rightMax: number) {
+    const { container } = render(<DiffView diff={mixed} />)
+    fireEvent.click(screen.getByRole('button', { name: '左右分栏' }))
+    const [l, r] = Array.from(container.querySelectorAll('.diff-split-pane')) as HTMLElement[]
+    fakeScroll(l, leftMax)
+    fakeScroll(r, rightMax)
+    return [l, r]
+  }
+
+  it('跟随引起的那次 scroll 不反推：长的一侧滚过短的一侧的尽头，不被拉回去', () => {
+    const [l, r] = panes(1000, 50)
+    l.scrollTop = 100
+    fireEvent.scroll(l)
+    expect(r.scrollTop).toBe(50)
+    fireEvent.scroll(r)
+    expect(l.scrollTop).toBe(100)
+  })
+
+  it('同一帧里用户也滚了跟随的那一侧（两次合成一个事件）：照常跟随', () => {
+    const [l, r] = panes(1000, 1000)
+    l.scrollTop = 100
+    fireEvent.scroll(l)
+    expect(r.scrollTop).toBe(100)
+    // 跟随的 scroll 还没派发，用户又把右边滚到 150，浏览器只给一个事件
+    r.scrollTop = 150
+    fireEvent.scroll(r)
+    expect(l.scrollTop).toBe(150)
   })
 })

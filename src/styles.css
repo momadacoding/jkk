@@ -801,21 +801,21 @@ body {
   background: repeating-linear-gradient(135deg, #1c1c1c 0 4px, #222 4px 8px);
 }
 
-/* 不可见字符：符号画在伪元素里、绝对定位，不占宽度，复制出去的也还是原来的字符 */
+/* 不可见字符：符号画在背景或伪元素里，不占宽度，复制出去的也还是原来的字符 */
 .diff-ws { position: relative; }
-.diff-ws-space::before,
+/* 连续空格是一个 span（`contentSegments`）：等宽字体下每个字符 1ch 宽，背景按 1ch 重复，一个空格一个点 */
+.diff-ws-space {
+  background-image: radial-gradient(circle, #5c5c5c 0 1px, transparent 1.5px);
+  background-size: 1ch 100%;
+  background-repeat: repeat-x;
+}
 .diff-ws-tab::before {
+  content: '→';
   position: absolute;
   left: 0;
   color: #5c5c5c;
   pointer-events: none;
 }
-.diff-ws-space::before {
-  content: '·';
-  width: 100%;
-  text-align: center;
-}
-.diff-ws-tab::before { content: '→'; }
 .diff-ws-cr::after {
   content: '␍';
   color: #5c5c5c;

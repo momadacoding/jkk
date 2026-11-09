@@ -1383,14 +1383,22 @@ export function useRepoEffects(
   refreshers.wantedDiffScope.current = diffScope
   // 上下文行数 / 忽略空白一变就重读；其余开关只是换个画法，键不变，不发请求（`backendDiffOptions`）
   const diffOptions = useDiffOptionsKey()
+  /** 这个标签上一次因为下面这个 effect 读的是哪一份、按什么开关读的。 */
+  const lastDiffRead = useRef<{ target: string, options: string } | null>(null)
 
   useEffect(() => {
     if (!state.path || !diffScope) return
+    // 开关是全局的，一变所有标签都会走到这里。没显示的标签先不读，切回来（`active` 变 true）时再补：
+    // 否则开一次「整个文件」，后台每个标签都把自己那个提交整份全文读一遍（第二轮独立 review 第 1 条）
+    const target = `${state.path}\n${diffScope}\n${state.selectedId ?? ''}`
+    const last = lastDiffRead.current
+    if (last?.target === target && (last.options === diffOptions || !active)) return
+    lastDiffRead.current = { target, options: diffOptions }
     // 不 catch 的话失败是一个未处理的 rejection，顶部错误条什么都不显示（第 72 条）。
     // 与文件监听那条不同，这里是用户点了才读的，失败要让他看见
     // 只要这一份数据：已经在读同一个 scope 就复用那一轮（Stage 之后写操作的刷新多半刚发出它）
     refreshDiff(state.path, diffScope, 0).catch(reportError)
-  }, [state.selectedId, state.path, diffScope, diffOptions])
+  }, [state.selectedId, state.path, diffScope, diffOptions, active])
 
   useEffect(() => {
     if (!state.path) return

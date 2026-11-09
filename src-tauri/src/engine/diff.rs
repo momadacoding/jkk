@@ -133,16 +133,36 @@ impl DiffViewOptions {
 
 /// 按 `view` 构造 diff；上下文调大了而文件又超过 `WIDE_CONTEXT_FILE_LIMIT` 时，按默认上下文重建一遍。
 /// 返回实际用的选项。deltas 在构造时就列好了，行内容要到输出时才读，所以先数一遍是廉价的。
+///
+/// `prepare` 在数之前跑（改名检测）：不合并的话 120 个改名是 240 个 delta，没超也被退回
+/// （第二轮独立 review 第 2 条）。`limit` 为 false 时不数：单文件 scope 最后只留精确匹配的
+/// 那一项（`diff_to_data_only`），字面量 pathspec 按目录前缀带出来的 delta 再多也不会进结果。
+/// 重建只在真的退回时发生，工作区 scope 这时会多扫一遍目录。
 fn build_limited<'r>(
     view: &DiffViewOptions,
+    limit: bool,
     build: impl Fn(&DiffViewOptions) -> std::result::Result<git2::Diff<'r>, git2::Error>,
+    prepare: impl Fn(&mut git2::Diff<'r>) -> std::result::Result<(), git2::Error>,
 ) -> std::result::Result<(git2::Diff<'r>, DiffViewOptions), git2::Error> {
-    let diff = build(view)?;
-    if view.is_wide() && diff.deltas().len() > WIDE_CONTEXT_FILE_LIMIT {
+    let mut diff = build(view)?;
+    prepare(&mut diff)?;
+    if limit && view.is_wide() && diff.deltas().len() > WIDE_CONTEXT_FILE_LIMIT {
         let narrow = view.narrowed();
-        return Ok((build(&narrow)?, narrow));
+        let mut diff = build(&narrow)?;
+        prepare(&mut diff)?;
+        return Ok((diff, narrow));
     }
     Ok((diff, *view))
+}
+
+/// 不需要在数之前处理的 scope 传给 `build_limited` 的 `prepare`。
+fn no_prepare(_: &mut git2::Diff) -> std::result::Result<(), git2::Error> {
+    Ok(())
+}
+
+/// 改名检测（`find_similar`），提交与 range 的 scope 在数文件之前做。
+fn find_renames(diff: &mut git2::Diff) -> std::result::Result<(), git2::Error> {
+    diff.find_similar(None)
 }
 
 /// 工作区 diff 的通用选项：未跟踪文件也要出现在 diff 里，
@@ -440,11 +460,13 @@ pub fn read_diff_with(path: &str, scope: String, view: &DiffViewOptions) -> Resu
         } else {
             None
         };
-        let (mut diff, used) = build_limited(view, |v| {
-            repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut v.options()))
-        })?;
         // 不做改名检测的话，一次重命名会摊成一加一删两条，文件树里看不出是同一个文件
-        diff.find_similar(None)?;
+        let (diff, used) = build_limited(
+            view,
+            true,
+            |v| repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut v.options())),
+            find_renames,
+        )?;
         let mut data = diff_to_data(diff)?;
         data.context_narrowed = used != *view;
         return Ok(data);
@@ -464,10 +486,12 @@ pub fn read_diff_with(path: &str, scope: String, view: &DiffViewOptions) -> Resu
             })?;
         let old = repo.find_commit(git2::Oid::from_str(from)?)?.tree()?;
         let new = repo.find_commit(git2::Oid::from_str(to)?)?.tree()?;
-        let (mut diff, used) = build_limited(view, |v| {
-            repo.diff_tree_to_tree(Some(&old), Some(&new), Some(&mut v.options()))
-        })?;
-        diff.find_similar(None)?;
+        let (diff, used) = build_limited(
+            view,
+            true,
+            |v| repo.diff_tree_to_tree(Some(&old), Some(&new), Some(&mut v.options())),
+            find_renames,
+        )?;
         let mut data = diff_to_data(diff)?;
         data.context_narrowed = used != *view;
         return Ok(data);
@@ -529,9 +553,12 @@ fn staged_side(
     };
     // 不做改名检测：Staged 列表来自 `read_status`，它把 `git mv` 列成一删一增两项。
     // 这里若合成一条改名，点到旧路径那一项时右侧就找不到它的 diff
-    let (diff, used) = build_limited(view, |v| {
-        repo.diff_tree_to_index(tree, None, Some(&mut opts(v)))
-    })?;
+    let (diff, used) = build_limited(
+        view,
+        file.is_none(),
+        |v| repo.diff_tree_to_index(tree, None, Some(&mut opts(v))),
+        no_prepare,
+    )?;
     let mut data = diff_to_data_only(diff, file)?;
     data.context_narrowed = used != *view;
     // 合并冲突中 index 里的冲突条目也会出现在这里，但 `read_status` 只把冲突文件放进
@@ -555,7 +582,12 @@ fn workdir_side<'r>(
         v.apply(&mut o);
         o
     };
-    let (diff, used) = build_limited(view, |v| build(&mut opts(only.as_deref(), v)))?;
+    let (diff, used) = build_limited(
+        view,
+        file.is_none(),
+        |v| build(&mut opts(only.as_deref(), v)),
+        no_prepare,
+    )?;
     let mut data = match readable_only(repo, &diff) {
         None => diff_to_data_only(diff, file)?,
         // 一个能读的都没有：返回空 diff 而不是让整个视图报错。

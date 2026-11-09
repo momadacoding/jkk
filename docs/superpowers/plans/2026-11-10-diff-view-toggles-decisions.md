@@ -14,6 +14,7 @@
 | 3 | store：偏好存储；diff 读取带上选项，换选项重读 | 完成 | `src/store/diffPrefsStore.ts`、`repoStore.ts`（`refreshDiff` / `useRepoEffects` / `readCommitFileDiff`）、`FileHistoryView.tsx`、`tests/vitest/repoStoreDiffOptions.test.ts` | 5/5；`FileHistoryView.test.tsx` 两条断言补上 `options` |
 | 4 | UI：工具栏 + 分栏 / 换行 / 不可见字符渲染 + CSS | 完成 | `DiffView.tsx`、`styles.css`、`tests/vitest/DiffView.test.tsx` | 9/9 |
 | 5 | 验证：两侧门槛 + `pnpm tauri dev` 实测 + 独立 review | 完成 | review 修复见下 | 最终：`pnpm build` ✓、`pnpm test` 1507/1507、`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓、`cargo test` 93 个测试文件全过（内存紧张被回收一次，`-j 2 -- --test-threads=4` 重跑）；真实窗口逐项实测 |
+| 6 | 第二轮独立 review 修复 | 完成 | 见 Task 6 | `pnpm build` ✓、`pnpm test` 1516/1516、`cargo fmt --check` ✓、`cargo clippy --all-targets` ✓、`cargo test` 全过（`-j 2 -- --test-threads=4`，`diff_view_options` 15/15）；真实窗口看空格点 |
 
 ## 决策条目
 
@@ -92,6 +93,24 @@ review 修复后再进真实窗口复验：
 
 - 分栏横向：右侧（更宽）一次滚到 1707，左侧停在自己的尽头 1654，右侧不再被拉回；接着从左侧往回滚，右侧跟过来；再滚右侧也不被吞。
 - **实测抓到的坑**：201 个文件的提交开「整个文件」，后端确实退回了 3 行上下文，但说明条没出现。`CommitDetailView` 只留选中文件时把 diff 重新拼成 `{ files }`，`contextNarrowed` 丢了。改成一起带过去，补了组件测试；复验说明条出现、关掉「整个文件」后消失。
+
+### Task 6：第二轮独立 review（`/code-review high`，PR 开出之后）
+
+共 9 条，处理如下：
+
+| 条目 | 结论 | 处理 |
+|---|---|---|
+| 第 1 条：开关是全局的，换一次上下文 / 忽略空白，后台每个标签都重读 | 成立（5 个标签开「整个文件」就是 5 次整份全文读取） | `useRepoEffects` 记下上次读的目标和选项：没显示的标签只是选项变了就先不读，`active` 变 true 时补读；选项没变时来回切标签不发请求。刚挂载的后台标签照常读 |
+| 第 2 条：`build_limited` 数的是改名检测之前、精确匹配之前的 delta | 成立：120 个改名按 240 个算被退回；单文件 scope 被前缀匹配带出来的 delta 退回 | 数之前先跑 `prepare`（提交 / range 的 `find_similar`）；单文件 scope 不数（结果只留精确匹配的一项）。两条 Rust 测试，单文件那条临时把限制改回去确认会失败。重建两遍只在真的退回时发生，写进注释 |
+| 第 3 条：`LocalChangesView` 只留选中文件时丢了 `contextNarrowed` | 成立，与第一轮实测抓到的 `CommitDetailView` 同一个坑 | 一起带过去。改了第 2 条之后单文件 scope 不再退回，这里多是防御；整区 scope 仍可能退回 |
+| 第 4 条：提交详情列表的 +/- 不算忽略换行符，列表 +2000/-2000、点开说只有换行符改动 | 成立 | `diffEol.ts` 加 `countChanges`，和 diff 面板用同一套重新配对；列表只订阅 `ignoreEol`（新的 `useDiffPref`） |
+| 第 5 条：切分栏把换行符重比（Myers）也重跑一遍 | 成立 | `DiffView` 拆成两个 `useMemo`：换行符处理不依赖 `split` |
+| 第 6 条：不可见字符每个空格一个 `<span>` | 成立 | 连续空格并成一段，一个空格一个点改由 `1ch` 重复的背景画；制表符宽度随列变，仍一个一段 |
+| 第 7 条：跟随标记是一次性的，同一帧里用户也滚了跟随侧时那次滚动被吞 | 成立 | 标记里记下跟随侧实际停住的位置，事件到达时位置相同才当回声吞掉，否则照常跟随。jsdom 用假的滚动位置（带夹紧）测两种情形 |
+| 第 8 条：忽略空白开着时，改名、只改权限也说「已忽略空白」 | 成立（前端分不出 hunk 是被忽略掉的还是本来就没有） | 文案改成说明设置，不说藏掉了什么：「没有文本改动（忽略空白开着，只改了空白的行不显示）」 |
+| 第 9 条：`context_narrowed = used != *view` 在四处重复 | 不改 | 四处的 `DiffData` 在不同位置构造，收拢要么改 `build_limited` 的返回形状要么加一层包装，收益只是少三行；每个多文件 scope 的退回都有测试钉住，漏写会失败 |
+
+真实窗口复验（同一套隔离方式，`app.exe` 核对在本 worktree 下）：连续 8 个空格的一段宽 52.78px（= 8 × 6.6，1ch），画出 8 个等距的点；复制出的文本仍是 8 个空格；单个空格、制表符箭头照旧。
 
 ### 遗留
 

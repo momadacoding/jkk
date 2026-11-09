@@ -349,3 +349,45 @@ fn single_file_scopes_are_never_narrowed() {
     let whole = read(d, "unstaged", ctx(FULL_FILE_CONTEXT));
     assert!(whole.context_narrowed, "整区读超过上限时同样退回");
 }
+
+#[test]
+fn renames_count_once_toward_the_limit() {
+    // 120 个改名（各改一行）：改名检测之前是 240 个 delta，按那个数会超过上限、被退回
+    let n = 120;
+    assert!(2 * n > WIDE_CONTEXT_FILE_LIMIT && n <= WIDE_CONTEXT_FILE_LIMIT);
+    let dir = init_repo();
+    let d = dir.path();
+    for i in 0..n {
+        fs::write(d.join(format!("f{i}.txt")), numbered(None)).unwrap();
+    }
+    commit_all(d, "base");
+    for i in 0..n {
+        fs::remove_file(d.join(format!("f{i}.txt"))).unwrap();
+        fs::write(d.join(format!("g{i}.txt")), numbered(Some(10))).unwrap();
+    }
+    let head = commit_all(d, "rename all");
+    let data = read(d, &format!("commit:{head}"), ctx(FULL_FILE_CONTEXT));
+    assert_eq!(data.files.len(), n);
+    assert!(data.files.iter().all(|f| f.status == "renamed"));
+    assert!(!data.context_narrowed);
+    assert!(data.files.iter().all(|f| f.hunks[0].lines.len() == 21));
+}
+
+#[test]
+fn single_file_scope_ignores_deltas_the_literal_pathspec_drags_in() {
+    // 已跟踪的文件 `assets` 换成同名的未跟踪目录：字面量 pathspec 按目录前缀把目录下每个文件都带出来，
+    // 结果里只留 `assets` 这一项，不能因为那些 delta 被退回
+    let dir = init_repo();
+    let d = dir.path();
+    fs::write(d.join("assets"), numbered(None)).unwrap();
+    commit_all(d, "base");
+    fs::remove_file(d.join("assets")).unwrap();
+    fs::create_dir(d.join("assets")).unwrap();
+    for i in 0..=WIDE_CONTEXT_FILE_LIMIT {
+        fs::write(d.join("assets").join(format!("a{i}.txt")), "x\n").unwrap();
+    }
+    let data = read(d, "unstaged:assets", ctx(FULL_FILE_CONTEXT));
+    assert_eq!(data.files.len(), 1);
+    assert_eq!(data.files[0].path, "assets");
+    assert!(!data.context_narrowed);
+}
