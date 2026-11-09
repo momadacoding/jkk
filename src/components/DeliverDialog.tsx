@@ -48,7 +48,6 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
     textRef.current?.focus()
   }, [])
 
-
   return (
     <div className="dialog-overlay">
       <div

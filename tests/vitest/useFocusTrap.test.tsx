@@ -252,6 +252,41 @@ describe('useFocusTrap：Esc 只关最上面那层', () => {
     expect(closed).toEqual(['执行中'])
   })
 
+  it('按住 Esc 的自动重复不连关两层：上层关掉后，重复的那一下不能落到下层', () => {
+    const closed: string[] = []
+    const { rerender } = render(
+      <>
+        <EscTrap name="下层" onEscape={() => closed.push('下层')} />
+        <EscTrap name="上层" onEscape={() => closed.push('上层')} />
+      </>,
+    )
+    fireEvent.keyDown(window, { key: 'Escape' })
+    rerender(<EscTrap name="下层" onEscape={() => closed.push('下层')} />)
+    fireEvent.keyDown(window, { key: 'Escape', repeat: true })
+    expect(closed).toEqual(['上层'])
+  })
+
+  it('输入法组字中按 Esc 是取消候选，不关框', () => {
+    const closed: string[] = []
+    render(<EscTrap name="框" onEscape={() => closed.push('框')} />)
+    fireEvent.keyDown(window, { key: 'Escape', isComposing: true })
+    expect(closed).toEqual([])
+  })
+
+  it('隐藏标签里的框不算「最上面那层」：Esc 关的是看得见的那个', () => {
+    const closed: string[] = []
+    render(
+      <>
+        <EscTrap name="可见" onEscape={() => closed.push('可见')} />
+        <div style={{ display: 'none' }}>
+          <EscTrap name="隐藏标签里的" onEscape={() => closed.push('隐藏')} />
+        </div>
+      </>,
+    )
+    fireEvent.keyDown(window, { key: 'Escape' })
+    expect(closed).toEqual(['可见'])
+  })
+
   it('其他键不触发', () => {
     const closed: string[] = []
     render(<EscTrap name="框" onEscape={() => closed.push('框')} />)

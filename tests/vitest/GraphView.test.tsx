@@ -113,10 +113,13 @@ describe('GraphView 键盘导航', () => {
     return <div ref={ref} className="dialog"><button>OK</button></div>
   }
 
-  function renderWithSpy(dialog: boolean) {
+  function renderWithSpy(dialog: boolean, opts: { hiddenTab?: boolean; dialogInHiddenTab?: boolean } = {}) {
     const picked: string[] = []
     render(
       <>
+        {/* App 把非活动标签整个 display:none 掉，标签里的弹框也跟着藏起来 */}
+        {opts.dialogInHiddenTab && <div style={{ display: 'none' }}><Dialog /></div>}
+        <div style={{ display: opts.hiddenTab ? 'none' : 'flex' }}>
         <GraphView
           commits={commits}
           refs={[]}
@@ -130,7 +133,9 @@ describe('GraphView 键盘导航', () => {
           onCommitAction={() => {}}
           capabilities={ALL_CAPABILITIES}
         />
+        </div>
         {dialog && <Dialog />}
+        <input aria-label="新分支名" />
       </>,
     )
     return picked
@@ -147,6 +152,35 @@ describe('GraphView 键盘导航', () => {
     const picked = renderWithSpy(true)
     fireEvent.keyDown(window, { key: 'ArrowDown' })
     fireEvent.keyDown(window, { key: 'ArrowUp' })
+    expect(picked).toEqual([])
+  })
+
+  it('右键菜单开着时不动选中：菜单项捕获的是右键那一条，选中跑了就会对着别的提交 Reset', () => {
+    const picked = renderWithSpy(false)
+    const row = document.querySelector('[data-id="c5"]')!
+    fireEvent.contextMenu(row)
+    picked.length = 0 // 右键本身会选中 c5
+    fireEvent.keyDown(window, { key: 'ArrowDown' })
+    expect(picked).toEqual([])
+  })
+
+  it('隐藏标签里的 graph 不跟着当前标签的方向键动', () => {
+    const picked = renderWithSpy(false, { hiddenTab: true })
+    fireEvent.keyDown(window, { key: 'ArrowDown' })
+    expect(picked).toEqual([])
+  })
+
+  it('隐藏标签里开着的弹框不挡当前标签的方向键', () => {
+    const picked = renderWithSpy(false, { dialogInHiddenTab: true })
+    fireEvent.keyDown(window, { key: 'ArrowDown' })
+    expect(picked).toEqual(['c6'])
+  })
+
+  it('焦点在输入框里：↑ / ↓ 归输入框挪光标，graph 不动', () => {
+    const picked = renderWithSpy(false)
+    const input = document.querySelector('input[aria-label="新分支名"]') as HTMLInputElement
+    input.focus()
+    fireEvent.keyDown(input, { key: 'ArrowDown' })
     expect(picked).toEqual([])
   })
 })

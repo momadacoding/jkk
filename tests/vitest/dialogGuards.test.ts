@@ -85,13 +85,21 @@ describe('弹框的结构约定', () => {
     expect(offenders).toEqual([])
   })
 
-  it('Esc 统一交给 useFocusTrap：弹框不自己往 window 上挂 keydown，且都传了 Esc 回调', () => {
+  it('弹框不自挂键盘监听、不自己认 Escape，useFocusTrap 的 Esc 回调不为 undefined', () => {
     // 各框各挂一个 window 监听时，叠两层框一次 Esc 两层一起关（PR 139 review 第 5 条）。
-    // hook 只调最上面那层的回调
+    // hook 只调看得见的最上面那层的回调。认法是读源码文本：拦的是常见写法，不是所有可能
     const files = sources(join(SRC, 'components')).filter((f) => readFileSync(f, 'utf8').includes('dialog-overlay'))
-    const ownListener = files.filter((f) => readFileSync(f, 'utf8').includes("addEventListener('keydown'")).map(rel)
+    const text = (f: string) => readFileSync(f, 'utf8')
+    // keydown / keyup / keypress，单双引号都算
+    const ownListener = files.filter((f) => /addEventListener\(\s*['"]key/.test(text(f))).map(rel)
     expect(ownListener).toEqual([])
-    const noEscape = files.filter((f) => !/useFocusTrap\(\s*\w+\s*,/.test(readFileSync(f, 'utf8'))).map(rel)
+    // 唯一例外：设置框的录制框用 Esc 取消录制，并且 stopPropagation 让它到不了 hook——这正是要的
+    const ownEscape = files
+      .filter((f) => /['"]Escape['"]/.test(text(f)))
+      .map(rel)
+      .filter((f) => f !== 'src/components/SettingsDialog.tsx')
+    expect(ownEscape).toEqual([])
+    const noEscape = files.filter((f) => !/useFocusTrap\(\s*\w+\s*,\s*(?!undefined\b)\S/.test(text(f))).map(rel)
     expect(noEscape).toEqual([])
   })
 

@@ -8,7 +8,13 @@ import { WORKDIR_ID, withWorkdirRow } from '../engine/workdir'
 import { findDelivered } from '../engine/svnGraph'
 import { CommitRow } from './CommitRow'
 import { ContextMenu, useContextMenu } from './ContextMenu'
-import { anyDialogOpen } from './useFocusTrap'
+import { anyDialogOpen, isShown } from './useFocusTrap'
+
+/** 按键落在可编辑的控件上：方向键归它挪光标。 */
+function isEditable(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false
+  return target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)
+}
 import { commitMenu, type CommitAction } from '../engine/commitActions'
 import type { Capabilities } from '../engine/capabilities'
 
@@ -181,8 +187,12 @@ export function GraphView({
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      // 弹框开着时让路：弹框盖着 graph，背后的选中不能跟着按键变
-      if (!selectedId || anyDialogOpen()) return
+      if (!selectedId) return
+      // 让路的几种情况，选中都不能跟着按键变：
+      // - 弹框或右键菜单开着：它们说的是右键 / 打开时的那一条，选中跑了，菜单的 Reset 就对着别的提交
+      // - 这个 graph 所在的标签被藏起来了（所有标签都挂载着，按键会同时到每个 graph）
+      // - 焦点在输入框里：↑ / ↓ 是在挪光标
+      if (menu || anyDialogOpen() || !isShown(containerRef.current) || isEditable(e.target)) return
       // commits 不含伪行，键盘导航天然跳过它
       const idx = commits.findIndex((c) => c.id === selectedId)
       if (idx < 0) return
@@ -191,7 +201,7 @@ export function GraphView({
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [commits, selectedId, onSelect])
+  }, [commits, selectedId, onSelect, menu])
 
   const totalHeight = layout.rows.length * ROW_HEIGHT
   const layoutWidth = layout.laneCount * LANE_WIDTH
