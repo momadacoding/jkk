@@ -148,13 +148,18 @@ export function CommitDetailView({
     ? picked
     : files[0]?.path ?? null
 
+  // 只留选中的那个文件，但「上下文被后端退回默认」的标记要跟着带过去：它说的是整次读取，
+  // 丢掉的话「整个文件」开着、界面却只有 3 行上下文，也没有任何说明（真实窗口实测）
+  const contextNarrowed = diff?.contextNarrowed
   const activeDiff: DiffData = useMemo(
-    () => ({ files: files.filter((f) => f.path === activePath) }),
-    [files, activePath],
+    () => ({ files: files.filter((f) => f.path === activePath), contextNarrowed }),
+    [files, activePath, contextNarrowed],
   )
 
   // 改动列表与 diff 的分栏；diff 还没读回来时整块换成一句说明
-  const changesSplit = loading || failedNote ? <div className="diff-note">{failedNote ?? LOADING_NOTE}</div> : (
+  // 读失败的说明放进 DiffView：工具栏还在，开关调成了读不出来的样子时能在这里调回去
+  const changesSplit = failedNote ? <DiffView diff={{ files: [] }} note={failedNote} />
+    : loading ? <div className="diff-note">{LOADING_NOTE}</div> : (
     <div className="commit-split">
       <Group orientation="horizontal" {...changesLayout}>
         <Panel id="files" defaultSize="30%" minSize="15%" maxSize="60%">

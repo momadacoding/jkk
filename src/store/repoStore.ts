@@ -38,6 +38,8 @@ import { createSingleFlight } from '@/engine/singleFlight'
 import { createSvnCheckQueue } from '@/engine/svnCheckQueue'
 import { applyStatusPatch, type StatusPatch } from '@/engine/statusPatch'
 import { changesDiffScope, isChangesFileScope, type FileSelection } from '@/engine/fileSelection'
+import { backendDiffOptions, diffOptionsKey, type BackendDiffOptions } from '@/engine/diffPrefs'
+import { getDiffPrefs, useDiffOptionsKey } from './diffPrefsStore'
 import type { BlameData, FileHistory } from '@/engine/fileHistory'
 import type { DriverReport } from '@/engine/mergeDrivers'
 import type {
@@ -501,14 +503,24 @@ export function readBlame(path: string, file: string, rev: string | null): Promi
   return invoke<BlameData>('blame_file', { path, file, rev })
 }
 
-/** 一个文件在某次提交里的 diff（对第一个父提交）。改名那一条要带上 `oldFile` 才配得成对。 */
+/**
+ * 一个文件在某次提交里的 diff（对第一个父提交）。改名那一条要带上 `oldFile` 才配得成对。
+ * `options` 是 diff 面板的上下文行数 / 忽略空白（`backendDiffOptions`）。
+ */
 export function readCommitFileDiff(
   path: string,
   rev: string,
   file: string,
   oldFile: string | null,
+  options: BackendDiffOptions,
 ): Promise<DiffData> {
-  return invoke<DiffData>('commit_file_diff', { path, rev, file, oldFile })
+  return invoke<DiffData>('commit_file_diff', { path, rev, file, oldFile, options })
+}
+
+/** 当前 diff 面板开关对应的后端选项和它的键。 */
+function currentDiffOptions(): { options: BackendDiffOptions, key: string } {
+  const options = backendDiffOptions(getDiffPrefs())
+  return { options, key: diffOptionsKey(options) }
 }
 
 /**
@@ -596,8 +608,11 @@ export function useRepoStore() {
   const knownStatus = useRef(new Map<string, StatusData>())
   /** 写操作之后的刷新（`refreshChanges`）开始的次数，`refreshDiff` 据此判断在跑的那轮能不能复用。 */
   const writeSeq = useRef(0)
-  /** 每个 diff 单飞队列里正在跑的那一轮：读的是哪个 scope、开读时的 `writeSeq`、读完的信号。 */
-  const diffRunning = useRef(new Map<string, { scope: string, seq: number, done: Promise<void> }>())
+  /**
+   * 每个 diff 单飞队列里正在跑的那一轮：读的是哪个 scope、带的哪份后端选项（`diffOptionsKey`）、
+   * 开读时的 `writeSeq`、读完的信号。
+   */
+  const diffRunning = useRef(new Map<string, { scope: string, optionsKey: string, seq: number, done: Promise<void> }>())
   /**
    * 当前视图要显示哪一份 diff，由 `useRepoEffects` 每次渲染写入。
    *
@@ -1173,8 +1188,10 @@ export function useRepoStore() {
   const refreshDiff = async (path: string, scope: string, joinSince?: number) => {
     // 写回前再核对：只认当前视图要的那一份，切走之后才回来的旧 scope 结果丢掉
     lastDiffPath.current = path
-    const stillWanted = () => {
+    // 读之前开关又变了（比如连按两下「增加上下文」）的那一份也丢掉：变了的那一下已经排了一轮新的
+    const stillWanted = (optionsKey: string) => {
       if (lastDiffPath.current !== path) return false
+      if (currentDiffOptions().key !== optionsKey) return false
       const wanted = wantedDiffScope.current
       return wanted === undefined || wanted === scope
     }
@@ -1184,28 +1201,33 @@ export function useRepoStore() {
     // 补跑只做最后一个，中间跳过的不读（6.13 方案 C）。各轮仍串行，写回照旧只认当前要的那一份
     const flight = isChangesFileScope(scope) ? `diff:${path}:changes-file` : `diff:${path}:${scope}`
     const running = diffRunning.current.get(flight)
-    if (joinSince !== undefined && running?.scope === scope && running.seq >= joinSince) {
+    if (
+      joinSince !== undefined && running?.scope === scope && running.optionsKey === currentDiffOptions().key
+      && running.seq >= joinSince
+    ) {
       // 复用的调用方只等它读完，成败由发起那一轮的调用方报
       return running.done
     }
     await refreshFlights.run(flight, async () => {
       let finish!: () => void
-      const entry = { scope, seq: writeSeq.current, done: new Promise<void>((r) => { finish = r }) }
+      // 开关在真正开读的这一刻取：排在补跑里的这一轮可能是开关变了之前登记的
+      const { options, key: optionsKey } = currentDiffOptions()
+      const entry = { scope, optionsKey, seq: writeSeq.current, done: new Promise<void>((r) => { finish = r }) }
       diffRunning.current.set(flight, entry)
       try {
         let diff: DiffData
         try {
-          diff = await invoke<DiffData>('read_diff', { path, scope })
+          diff = await invoke<DiffData>('read_diff', { path, scope, options })
         } catch (err) {
           // 读失败也要把这个 scope 记成「读过了」，不然界面会一直说「正在读取」；错误照旧抛给调用方。
           // 带上原因：光一个空列表，界面上就成了「这个提交没有改动」（第 72 条）
           // 用户已经离开的那份读失败了就安静地丢掉：照常抛的话，界面显示的是 B 的 diff，
           // 顶部错误条却报 A 的「bad object」（PR 113 review）
-          if (!stillWanted()) return
+          if (!stillWanted(optionsKey)) return
           setState((s) => ({ ...s, diff: { files: [], error: toErrorMessage(err) }, diffScope: scope }))
           throw err
         }
-        if (stillWanted()) setState((s) => ({ ...s, diff, diffScope: scope }))
+        if (stillWanted(optionsKey)) setState((s) => ({ ...s, diff, diffScope: scope }))
       } finally {
         if (diffRunning.current.get(flight) === entry) diffRunning.current.delete(flight)
         finish()
@@ -1359,6 +1381,8 @@ export function useRepoEffects(
     : selectionDiffScope(state.commits, state.selectedId)
   // 在渲染里写而不是在 effect 里写：下面那个按选中刷新 diff 的 effect 发请求之前，它必须已经是新值
   refreshers.wantedDiffScope.current = diffScope
+  // 上下文行数 / 忽略空白一变就重读；其余开关只是换个画法，键不变，不发请求（`backendDiffOptions`）
+  const diffOptions = useDiffOptionsKey()
 
   useEffect(() => {
     if (!state.path || !diffScope) return
@@ -1366,7 +1390,7 @@ export function useRepoEffects(
     // 与文件监听那条不同，这里是用户点了才读的，失败要让他看见
     // 只要这一份数据：已经在读同一个 scope 就复用那一轮（Stage 之后写操作的刷新多半刚发出它）
     refreshDiff(state.path, diffScope, 0).catch(reportError)
-  }, [state.selectedId, state.path, diffScope])
+  }, [state.selectedId, state.path, diffScope, diffOptions])
 
   useEffect(() => {
     if (!state.path) return

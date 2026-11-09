@@ -9,10 +9,10 @@
 //! - `file` 为空直接报错：空 pathspec 在 git 里是「全部」（AGENTS.md §6.2）。
 //! - rev 为空或以 `-` 开头直接报错：它排在 `--` 前面，`--output=x` 这种会被 git 当成选项执行。
 
-use crate::engine::diff::DiffData;
+use crate::engine::diff::{DiffData, DiffViewOptions};
 use crate::engine::git_cli::run_git_bytes;
 use crate::error::{GitError, Result};
-use git2::{DiffOptions, Repository};
+use git2::Repository;
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -556,6 +556,17 @@ pub fn commit_file_diff(
     file: &str,
     old_file: Option<&str>,
 ) -> Result<DiffData> {
+    commit_file_diff_with(repo, rev, file, old_file, &DiffViewOptions::default())
+}
+
+/// 同 `commit_file_diff`，带上 diff 面板的上下文行数 / 忽略空白（`DiffViewOptions`）。
+pub fn commit_file_diff_with(
+    repo: &str,
+    rev: &str,
+    file: &str,
+    old_file: Option<&str>,
+    view: &DiffViewOptions,
+) -> Result<DiffData> {
     check_file(file)?;
     check_rev(rev)?;
     let r = Repository::open(repo)?;
@@ -566,7 +577,7 @@ pub fn commit_file_diff(
     } else {
         None
     };
-    let mut opts = DiffOptions::new();
+    let mut opts = view.options();
     opts.pathspec(file);
     if let Some(old) = old_file.filter(|o| !o.is_empty() && *o != file) {
         opts.pathspec(old);

@@ -6,7 +6,7 @@
 
 use super::{Capabilities, Vcs};
 use crate::engine;
-use crate::engine::diff::{DiffData, StatusData, StatusPatch};
+use crate::engine::diff::{DiffData, DiffViewOptions, StatusData, StatusPatch};
 use crate::engine::graph::GraphData;
 use crate::engine::repo::RepoInfo;
 use crate::engine::stash::StashEntry;
@@ -47,10 +47,10 @@ impl Vcs for GitBackend {
         engine::diff::read_status_paths(&self.root, paths)
     }
 
-    fn diff(&self, scope: &str) -> Result<DiffData> {
+    fn diff(&self, scope: &str, view: &DiffViewOptions) -> Result<DiffData> {
         // engine 侧收 String，这里做一次转换。trait 用 &str 是为了调用方省事，
         // 多出来的这次分配相对一次 diff 计算可以忽略。
-        engine::diff::read_diff(&self.root, scope.to_string())
+        engine::diff::read_diff_with(&self.root, scope.to_string(), view)
     }
 
     fn stage(&self, paths: &[String]) -> Result<()> {

@@ -606,13 +606,86 @@ body {
 
 /* ---------- diff（带行号栏，Fork 风格） ---------- */
 
+/* 上面一条工具栏、下面滚动的内容。滚动放在里层（`.diff-scroll`），工具栏才不会跟着滚走 */
 .diff-view {
+  display: flex;
+  flex-direction: column;
   height: 100%;
-  overflow: auto;
+  min-height: 0;
   font-family: Consolas, 'Courier New', monospace;
   font-size: 12px;
   line-height: 18px;
   tab-size: 4;
+}
+
+.diff-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* ---------- diff 工具栏（Fork 风格的一排开关，靠右） ---------- */
+
+.diff-toolbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 2px;
+  padding: 2px 6px;
+  background: #252525;
+  border-bottom: 1px solid #2e2e2e;
+  font-family: system-ui, sans-serif;
+}
+
+.diff-tool {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  height: 22px;
+  padding: 0 3px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  color: #8a8a8a;
+  cursor: pointer;
+}
+.diff-tool:hover:not(:disabled) { background: #333; color: #ccc; }
+.diff-tool.on { color: #4fa3ff; background: #26354a; border-color: #2f4a6b; }
+.diff-tool.on:hover:not(:disabled) { background: #2c3e57; color: #6fb5ff; }
+.diff-tool:disabled { opacity: 0.35; cursor: default; }
+
+.diff-tool-text {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+}
+
+.diff-tool-count {
+  min-width: 26px;
+  color: #888;
+  font-size: 11px;
+  text-align: center;
+  user-select: none;
+}
+
+/* 后端没按调大的上下文读时的说明条（`DiffData.contextNarrowed`） */
+.diff-banner {
+  flex: none;
+  padding: 4px 8px;
+  background: #3a2f16;
+  border-bottom: 1px solid #6b5a20;
+  color: #f0e2b8;
+  font-family: system-ui, sans-serif;
+  font-size: 12px;
+}
+
+.diff-tool-sep {
+  width: 1px;
+  height: 14px;
+  margin: 0 4px;
+  background: #3a3a3a;
 }
 
 /* max-content 让整行跟着最长的一行走，min-width 保证容器更宽时高亮铺满 */
@@ -648,8 +721,10 @@ body {
   display: inline-block;
 }
 
+/* min-height：分栏里对面多出来的占位行没有任何文字，也要和别的行一样高，两侧才对得齐 */
 .diff-line {
   display: flex;
+  min-height: 18px;
   white-space: pre;
 }
 
@@ -689,6 +764,61 @@ body {
 
 .diff-code {
   padding: 0 8px;
+}
+
+/* 自动换行：整行不再跟着最长的一行走，长行折到下一行；行号栏照旧在左边 */
+.diff-view.wrap .diff-file { width: auto; }
+.diff-view.wrap .diff-line { white-space: pre-wrap; }
+.diff-view.wrap .diff-code {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* 分栏 + 自动换行：一行一个两列的格子，两侧取较高的那一侧 */
+.diff-split-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+.diff-split-row > .diff-line + .diff-line { border-left: 1px solid #333; }
+
+/* 分栏不换行：左右两个窗格各自滚动、互相跟随（`SplitPanes`）。
+   横向滚动条一直留着：只有一侧有的话两侧可视高度不同，滚到底时最后几行会错开 */
+.diff-split-panes {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+.diff-split-pane {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow-x: scroll;
+}
+.diff-split-pane + .diff-split-pane { border-left: 1px solid #333; }
+
+/* 对面多出来的行：这一侧没有对应内容，画成浅色斜纹 */
+.diff-line.empty {
+  background: repeating-linear-gradient(135deg, #1c1c1c 0 4px, #222 4px 8px);
+}
+
+/* 不可见字符：符号画在伪元素里、绝对定位，不占宽度，复制出去的也还是原来的字符 */
+.diff-ws { position: relative; }
+.diff-ws-space::before,
+.diff-ws-tab::before {
+  position: absolute;
+  left: 0;
+  color: #5c5c5c;
+  pointer-events: none;
+}
+.diff-ws-space::before {
+  content: '·';
+  width: 100%;
+  text-align: center;
+}
+.diff-ws-tab::before { content: '→'; }
+.diff-ws-cr::after {
+  content: '␍';
+  color: #5c5c5c;
 }
 
 .diff-note {

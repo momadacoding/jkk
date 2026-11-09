@@ -3,6 +3,8 @@ import { Panel, Group, Separator } from 'react-resizable-panels'
 import { PANEL_GROUP_IDS } from '@/engine/layoutMemory'
 import { usePanelLayout } from '@/store/layoutStore'
 import { readBlame, readCommitFileDiff, readFileHistory } from '@/store/repoStore'
+import { getDiffPrefs, useDiffOptionsKey } from '@/store/diffPrefsStore'
+import { backendDiffOptions } from '@/engine/diffPrefs'
 import { toErrorMessage } from '@/engine/errors'
 import {
   isUncommitted,
@@ -212,17 +214,26 @@ function EntryDiff({ repoPath, entry, onBlame, onReveal }: {
   const id = entry?.id ?? null
   const path = entry?.path ?? null
   const oldPath = entry?.oldPath ?? null
+  // 只在要后端重读的开关变了时重读；选项在发请求那一刻取
+  const optionsKey = useDiffOptionsKey()
+  /** 上一次读的是哪一条。只是开关变了时不清空：旧的 diff 留着，新的回来再换，工具栏不会闪掉。 */
+  const shownFor = useRef<string | null>(null)
 
   useEffect(() => {
     if (!id || !path) return
     let cancelled = false
-    setDiff(null)
+    const target = JSON.stringify([repoPath, id, path, oldPath])
+    if (shownFor.current !== target) {
+      shownFor.current = target
+      setDiff(null)
+    }
     setError(null)
-    readCommitFileDiff(repoPath, id, path, oldPath)
+    readCommitFileDiff(repoPath, id, path, oldPath, backendDiffOptions(getDiffPrefs()))
       .then((data) => { if (!cancelled) setDiff(data) })
       .catch((err) => { if (!cancelled) setError(toErrorMessage(err)) })
     return () => { cancelled = true }
-  }, [repoPath, id, path, oldPath])
+    // `optionsKey` 只用来触发重读，选项本身在上面现取
+  }, [repoPath, id, path, oldPath, optionsKey])
 
   if (!entry) return <div className="diff-note">选择一个提交</div>
   return (
@@ -246,7 +257,8 @@ function EntryDiff({ repoPath, entry, onBlame, onReveal }: {
       </div>
       <div className="fh-diff">
         {error
-          ? <div className="diff-note">读取改动失败：{error}</div>
+          // 说明放进 DiffView：工具栏还在，开关调坏了能在这里调回去
+          ? <DiffView diff={{ files: [] }} note={`读取改动失败：${error}`} />
           : diff
             ? <DiffView diff={diff} />
             : <div className="diff-note diff-note-pending">正在读取改动…</div>}

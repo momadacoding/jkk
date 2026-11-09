@@ -228,4 +228,23 @@ describe('CommitDetailView：diff 读失败', () => {
     fireEvent.click(screen.getByRole('button', { name: /Changes/ }))
     expect(screen.queryByText(/读取改动失败/)).toBeNull()
   })
+
+  it('失败说明里带着 diff 工具栏：开关调成读不出来的样子时能在这里调回去', () => {
+    render(<CommitDetailView commit={three[1]} diff={failed} repoPath="C:/r" onSelectCommit={vi.fn()} />)
+    fireEvent.click(screen.getByRole('button', { name: /Changes/ }))
+    expect(screen.getByRole('toolbar', { name: 'diff 显示选项' })).toBeTruthy()
+  })
+})
+
+// diff 面板开关：后端因为文件太多按默认上下文读了，只显示选中文件时这个标记也要带过去（真实窗口里丢过）
+describe('CommitDetailView：上下文被后端退回默认', () => {
+  it('Changes 标签里 diff 上方有说明', () => {
+    const narrowed: DiffData = {
+      files: [{ path: 'a.txt', status: 'modified', oldPath: null, binary: false, hunks: [] }],
+      contextNarrowed: true,
+    }
+    render(<CommitDetailView commit={three[1]} diff={narrowed} repoPath="C:/r" onSelectCommit={vi.fn()} />)
+    fireEvent.click(screen.getByRole('button', { name: /Changes/ }))
+    expect(screen.getByText(/文件太多/)).toBeTruthy()
+  })
 })
