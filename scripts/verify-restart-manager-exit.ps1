@@ -10,16 +10,16 @@
 # RmShutdown（不强杀）。窗口可见、关到托盘两种状态各测一次。
 #
 # 用隔离的 identifier 构建，别碰本机的安装版：
-#   1. 在仓库根写一个 si.conf.json：{ "identifier": "com.momadacoding.jkk.sitest" }
+#   1. 在 %TEMP% 下写一个 si.conf.json：{ "identifier": "com.momadacoding.jkk.sitest" }
+#      （别放进仓库：AGENTS.md 不许在根目录加文件，git add -A 也会把它带进提交）
 #   2. pnpm tauri build --no-bundle --config <si.conf.json 的绝对路径>
-#   3. pwsh -NoProfile -File scripts/verify-restart-manager-exit.ps1 -Exe <src-tauri\target\release\jkk.exe 的绝对路径>
-#   4. 删掉 %APPDATA% 与 %LOCALAPPDATA% 下的 com.momadacoding.jkk.sitest
+#   3. pwsh -NoProfile -File scripts/verify-restart-manager-exit.ps1 -Exe <src-tauri\target\release\jkk.exe 的路径>
+#   4. 删掉 si.conf.json，以及 %APPDATA% 与 %LOCALAPPDATA% 下的 com.momadacoding.jkk.sitest
 #
 # 全部 PASS 时退出码 0。
 param([Parameter(Mandatory)][string]$Exe)
 $ErrorActionPreference = 'Stop'
 if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) { throw "找不到 exe：$Exe" }
-$Exe = (Resolve-Path -LiteralPath $Exe).Path
 
 Add-Type @'
 using System;
@@ -43,8 +43,15 @@ public static class RM {
   [DllImport("rstrtmgr.dll")] public static extern int RmShutdown(uint h, uint flags, IntPtr cb);
   [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern uint GetLongPathNameW(string shortPath, StringBuilder longPath, uint size);
 }
 '@
+
+# 展开成长路径：进程的 Path 是长路径，用 8.3 短路径（LIUHAO~1）或别的写法传进来时，
+# 按路径找进程会找不到——残留进程既拦不住、也清不掉，下一轮会被单例插件转给它
+$Exe = (Resolve-Path -LiteralPath $Exe).ProviderPath
+$long = [Text.StringBuilder]::new(32768)
+if ([RM]::GetLongPathNameW($Exe, $long, [uint32]$long.Capacity) -gt 0) { $Exe = $long.ToString() }
 
 $results = [System.Collections.Generic.List[string]]::new()
 function Check([string]$name, [bool]$ok, [string]$detail = '') {
@@ -57,6 +64,9 @@ function Probe([string]$label, [bool]$hideToTray) {
   $errLog = Join-Path ([IO.Path]::GetTempPath()) "jkk-rm-probe-$PID.log"
   $env:RUST_BACKTRACE = '1'
   $p = Start-Process -FilePath $Exe -PassThru -RedirectStandardError $errLog
+  # 立刻取一次句柄：Start-Process 返回的对象是按 PID 查来的，不先缓存句柄的话，
+  # 进程退出后 ExitCode 可能读出 $null，正常退出也会被判成 FAIL
+  $null = $p.Handle
   try {
     # 认标题：单例插件的隐藏消息窗口也是顶层窗口，MainWindowHandle 可能先落到它上面
     $hwnd = [IntPtr]::Zero
@@ -99,7 +109,10 @@ function Probe([string]$label, [bool]$hideToTray) {
   }
 }
 
-Probe '窗口可见' $false
-Probe '关到托盘' $true
+# 一轮抛错不能让另一轮不跑、结果表不打印：记成 FAIL 接着走
+foreach ($case in @(@('窗口可见', $false), @('关到托盘', $true))) {
+  try { Probe $case[0] $case[1] }
+  catch { Check "$($case[0])：探测本身出错" $false "$_" }
+}
 $results
 if ($results -match '^FAIL') { exit 1 }
