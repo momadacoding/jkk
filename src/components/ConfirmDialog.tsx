@@ -88,7 +88,6 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
   const confirmRef = useRef<HTMLButtonElement>(null)
   const cancelRef = useRef<HTMLButtonElement>(null)
   const boxRef = useRef<HTMLDivElement>(null)
-  useFocusTrap(boxRef)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -96,6 +95,8 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
     request.resolve(ok)
     onDone()
   }
+  // 活跑起来之后 Esc 不再关闭，关掉只会让用户以为取消了
+  useFocusTrap(boxRef, () => { if (!busy) finish(false) })
 
   const accept = async () => {
     if (busy) return
@@ -119,14 +120,6 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
     if (request.focusCancel && cancelRef.current) cancelRef.current.focus()
     else confirmRef.current?.focus()
   }, [])
-
-  useEffect(() => {
-    // 活跑起来之后 Esc 不再关闭，关掉只会让用户以为取消了
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !busy) finish(false) }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [busy])
 
   return (
     // 遮罩只挡点击、不关框：点偏一下框就没了，关框只走按钮和 Esc（见 dialogGuards.test.ts）

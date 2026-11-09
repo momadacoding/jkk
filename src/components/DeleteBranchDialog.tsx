@@ -170,7 +170,8 @@ export function DeleteBranchDialog({
   const [busy, setBusy] = useState(false)
   const confirmRef = useRef<HTMLButtonElement>(null)
   const boxRef = useRef<HTMLDivElement>(null)
-  useFocusTrap(boxRef)
+  // 删除跑起来之后 Esc 不再关闭：git 已经在动远程了，关掉只会让用户以为取消了
+  useFocusTrap(boxRef, () => { if (!busy) onCancel() })
   /** 勾选框的默认值是否已经按第一次拿到的信息设过。 */
   const defaultsApplied = useRef(false)
 
@@ -251,13 +252,6 @@ export function DeleteBranchDialog({
   // 信息回来之后再聚焦确认按钮：焦点得先落进弹框里，回车/Esc 才有着落，
   // 而且这样 Tab 一下就能到勾选框
   useEffect(() => { if (ready) confirmRef.current?.focus() }, [ready])
-
-  useEffect(() => {
-    // 删除跑起来之后 Esc 不再关闭：git 已经在动远程了，关掉只会让用户以为取消了
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !busy) onCancel() }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onCancel, busy])
 
   return (
     <div className="dialog-overlay">

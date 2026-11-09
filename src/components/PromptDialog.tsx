@@ -20,7 +20,6 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
   const [value, setValue] = useState(request.defaultValue ?? '')
   const inputRef = useRef<HTMLInputElement>(null)
   const boxRef = useRef<HTMLDivElement>(null)
-  useFocusTrap(boxRef)
 
   // 弹出来就聚焦并整段选中，对齐 window.prompt 的手感：直接打字就是覆写
   useEffect(() => {
@@ -32,20 +31,14 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
     request.resolve(result)
     onDone()
   }
+  // Esc 交给 hook：焦点在输入框、按钮上都认，叠在别的框上时只关自己
+  useFocusTrap(boxRef, () => finish(null))
 
   const trimmed = value.trim()
 
   return (
     <div className="dialog-overlay">
-      {/* Esc 挂在框上而不是输入框上：Tab 到按钮之后也得能取消（遮罩不关框，见 dialogGuards.test.ts）。
-          不挂 window：框里的按键才归这个框，叠在别的框上时不连带关掉下面那个 */}
-      <div
-        ref={boxRef}
-        className="dialog"
-        onKeyDown={(e) => {
-          if (e.key === 'Escape') finish(null)
-        }}
-      >
+      <div ref={boxRef} className="dialog">
         <div className="dialog-title">{request.title}</div>
         <label className="dialog-message" htmlFor="prompt-input">{request.message}</label>
         <input

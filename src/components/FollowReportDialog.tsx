@@ -82,12 +82,12 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
   const [info, setInfo] = useState<SvnUserInfo | null>(null)
   const okRef = useRef<HTMLButtonElement>(null)
   const boxRef = useRef<HTMLDivElement>(null)
-  useFocusTrap(boxRef)
 
   const finish = () => {
     request.resolve()
     onDone()
   }
+  useFocusTrap(boxRef, finish)
 
   useEffect(() => {
     okRef.current?.focus()
@@ -104,15 +104,6 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
     return () => {
       alive = false
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') finish()
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 

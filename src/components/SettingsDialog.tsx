@@ -36,7 +36,8 @@ export function SettingsDialog({ initial, loadError = null, onSave, onClose }: S
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const boxRef = useRef<HTMLDivElement>(null)
-  useFocusTrap(boxRef)
+  // 录制中的 Esc 由录制框自己吃掉（stopPropagation），到不了 hook 的冒泡监听
+  useFocusTrap(boxRef, () => { if (!busy) onClose() })
 
   // 录制状态同步给后端。cleanup 里复位：录到一半直接关框（Esc、取消、保存）也不能留着标记，
   // 否则之后快捷键就再也不会隐藏窗口
@@ -45,15 +46,6 @@ export function SettingsDialog({ initial, loadError = null, onSave, onClose }: S
     void setShortcutRecording(true)
     return () => { void setShortcutRecording(false) }
   }, [recording])
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      // 录制中的 Esc 由录制框自己吃掉（stopPropagation），到不了这里
-      if (e.key === 'Escape' && !busy) onClose()
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose, busy])
 
   /**
    * 物理右 Alt（AltGr）是否按着。不用 `getModifierState('AltGraph')`：Windows 上的 Chromium

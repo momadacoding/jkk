@@ -197,3 +197,100 @@ describe('useFocusTrap：点框外不抢走焦点', () => {
     expect(prevented).toBe(false)
   })
 })
+
+describe('useFocusTrap：Esc 只关最上面那层', () => {
+  function EscTrap({ name, onEscape, children }: { name: string; onEscape: () => void; children?: ReactNode }) {
+    const ref = useRef<HTMLDivElement>(null)
+    useFocusTrap(ref, onEscape)
+    return <div ref={ref} className="dialog"><button>{name}</button>{children}</div>
+  }
+
+  it('叠了两层框：一次 Esc 只关上层，下层不动（PR 139 review 第 5 条）', () => {
+    const closed: string[] = []
+    render(
+      <>
+        <EscTrap name="下层" onEscape={() => closed.push('下层')} />
+        <EscTrap name="上层" onEscape={() => closed.push('上层')} />
+      </>,
+    )
+    btn('上层').focus()
+    fireEvent.keyDown(btn('上层'), { key: 'Escape' })
+    expect(closed).toEqual(['上层'])
+  })
+
+  it('上层关掉之后，下一次 Esc 轮到下层', () => {
+    const closed: string[] = []
+    const { rerender } = render(
+      <>
+        <EscTrap name="下层" onEscape={() => closed.push('下层')} />
+        <EscTrap name="上层" onEscape={() => closed.push('上层')} />
+      </>,
+    )
+    rerender(<EscTrap name="下层" onEscape={() => closed.push('下层')} />)
+    fireEvent.keyDown(window, { key: 'Escape' })
+    expect(closed).toEqual(['下层'])
+  })
+
+  it('框里的控件自己吃掉了 Esc（设置框录快捷键时）：不关框', () => {
+    const closed: string[] = []
+    render(
+      <EscTrap name="设置" onEscape={() => closed.push('设置')}>
+        <input aria-label="录制" onKeyDown={(e) => { if (e.key === 'Escape') e.stopPropagation() }} />
+      </EscTrap>,
+    )
+    const rec = screen.getByLabelText('录制')
+    rec.focus()
+    fireEvent.keyDown(rec, { key: 'Escape' })
+    expect(closed).toEqual([])
+  })
+
+  it('用的是最新一次渲染的回调：执行中（busy）变了，Esc 跟着变', () => {
+    const closed: string[] = []
+    const { rerender } = render(<EscTrap name="框" onEscape={() => closed.push('空闲')} />)
+    rerender(<EscTrap name="框" onEscape={() => closed.push('执行中')} />)
+    fireEvent.keyDown(window, { key: 'Escape' })
+    expect(closed).toEqual(['执行中'])
+  })
+
+  it('按住 Esc 的自动重复不连关两层：上层关掉后，重复的那一下不能落到下层', () => {
+    const closed: string[] = []
+    const { rerender } = render(
+      <>
+        <EscTrap name="下层" onEscape={() => closed.push('下层')} />
+        <EscTrap name="上层" onEscape={() => closed.push('上层')} />
+      </>,
+    )
+    fireEvent.keyDown(window, { key: 'Escape' })
+    rerender(<EscTrap name="下层" onEscape={() => closed.push('下层')} />)
+    fireEvent.keyDown(window, { key: 'Escape', repeat: true })
+    expect(closed).toEqual(['上层'])
+  })
+
+  it('输入法组字中按 Esc 是取消候选，不关框', () => {
+    const closed: string[] = []
+    render(<EscTrap name="框" onEscape={() => closed.push('框')} />)
+    fireEvent.keyDown(window, { key: 'Escape', isComposing: true })
+    expect(closed).toEqual([])
+  })
+
+  it('隐藏标签里的框不算「最上面那层」：Esc 关的是看得见的那个', () => {
+    const closed: string[] = []
+    render(
+      <>
+        <EscTrap name="可见" onEscape={() => closed.push('可见')} />
+        <div style={{ display: 'none' }}>
+          <EscTrap name="隐藏标签里的" onEscape={() => closed.push('隐藏')} />
+        </div>
+      </>,
+    )
+    fireEvent.keyDown(window, { key: 'Escape' })
+    expect(closed).toEqual(['可见'])
+  })
+
+  it('其他键不触发', () => {
+    const closed: string[] = []
+    render(<EscTrap name="框" onEscape={() => closed.push('框')} />)
+    fireEvent.keyDown(window, { key: 'Enter' })
+    expect(closed).toEqual([])
+  })
+})

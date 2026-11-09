@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useRef, useState } from 'react'
 import {
   entriesToWrite,
   healthLabel,
@@ -52,14 +52,9 @@ export function TsvnHooksDialog({
     status.health.state === 'healthy' ? status.health.blockLeaks : true,
   )
   const boxRef = useRef<HTMLDivElement>(null)
-  useFocusTrap(boxRef)
-  // 遮罩不关框之后，Esc 是「关闭」按钮之外唯一的快捷出口。挂 window：打开时焦点不在框里。
+  // 遮罩不关框之后，Esc 是「关闭」按钮之外唯一的快捷出口。
   // 执行中也照关，与「关闭」按钮一致（它不随 busy 禁用）
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
+  useFocusTrap(boxRef, onClose)
   const registered = status.health.state !== 'notRegistered'
   const toWrite = entriesToWrite(status.planned, blockLeaks)
   const conflicts = entriesToWrite(status.conflicts, blockLeaks)
