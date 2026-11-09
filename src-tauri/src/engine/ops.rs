@@ -3,9 +3,24 @@
 //! 这段逻辑原本直接写在 `commands/ops.rs` 的命令函数里。下沉到 engine 是为了
 //! 让 `vcs::GitBackend` 能调用它——命令层往后只做分发，不放业务逻辑。
 
-use crate::engine::git_cli::{run_git, run_git_code};
+use crate::engine::git_cli::{cmdline_batches, run_git, run_git_code, run_git_paths};
 use crate::error::{GitError, Result};
 use std::collections::HashSet;
+
+/// 同 [`path_set`]，但 `paths` 按命令行长度分批接在 `args` 后面，各批结果取并集。
+///
+/// 只给只读探测用（理由见 `git_cli::cmdline_batches`）。空 `paths` 是零批、得到空集，
+/// 不会跑出一条不带 pathspec 的命令——那条命令列的是整个仓库。任一批失败整体失败，
+/// 理由同 [`path_set`]。
+fn path_set_batched(path: &str, args: &[&str], paths: &[&str]) -> Result<HashSet<String>> {
+    let mut out = HashSet::new();
+    for batch in cmdline_batches(paths) {
+        let mut full: Vec<&str> = args.to_vec();
+        full.extend(batch);
+        out.extend(path_set(path, &full)?);
+    }
+    Ok(out)
+}
 
 /// 跑一条会输出 NUL 分隔路径列表的 git 命令，收成集合。
 ///
@@ -138,21 +153,27 @@ pub fn discard(path: &str, paths: &[String], staged: bool) -> Result<()> {
     // 下面每条带路径的命令都加 `--literal-pathspecs`：`--` 之后的路径 git 仍按 glob 匹配，
     // 丢弃 `f[1].txt` 会连带 checkout / rm 掉用户没选中的 `f1.txt`，而这一步不可逆
     // （实测 2026-11-04：f1.txt 未暂存的改动被抹掉，`rm -f` 路径下整个文件被删）。
-    let mut probe: Vec<&str> = vec![
-        "--literal-pathspecs",
-        "ls-files",
-        "--others",
-        "--exclude-standard",
-        "-z",
-        "--",
-    ];
-    probe.extend(paths.iter().map(String::as_str));
-    let untracked = path_set(path, &probe)?;
+    // 两条探测都是只读的，按命令行长度分批跑再合并（`path_set_batched`）；后面三条写命令
+    // 不能拆批，路径走 stdin（`run_git_paths`）。一次几百个路径拼进一条命令行会撞上
+    // Windows 的长度上限（`tests/long_pathspec.rs`）
+    let all: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let untracked = path_set_batched(
+        path,
+        &[
+            "--literal-pathspecs",
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+        ],
+        &all,
+    )?;
 
     // `staged == false` 时下面的判断被 `staged &&` 短路，in_head 根本用不到。
     // 那就别跑这条命令——少一次进程，也少一个能出错的面。
     let in_head = if staged {
-        let mut head_probe: Vec<&str> = vec![
+        let head_probe = [
             "--literal-pathspecs",
             "ls-tree",
             "-r",
@@ -161,8 +182,7 @@ pub fn discard(path: &str, paths: &[String], staged: bool) -> Result<()> {
             "-z",
             "--",
         ];
-        head_probe.extend(paths.iter().map(String::as_str));
-        match path_set(path, &head_probe) {
+        match path_set_batched(path, &head_probe, &all) {
             Ok(set) => set,
             // 只有「仓库还没有任何提交」这一种失败是合法的，其余必须抛出。
             // 判不清也算抛出——这里的默认值会直接决定文件是被恢复还是被删掉。
@@ -207,9 +227,7 @@ pub fn discard(path: &str, paths: &[String], staged: bool) -> Result<()> {
         if staged {
             args.push("HEAD");
         }
-        args.push("--");
-        args.extend(restore.iter().copied());
-        if let Err(err) = run_git(path, &args) {
+        if let Err(err) = run_git_paths(path, &args, &restore) {
             let mut skipped = remove.clone();
             skipped.extend(unlink.iter().copied());
             return Err(partial_failure(
@@ -224,9 +242,7 @@ pub fn discard(path: &str, paths: &[String], staged: bool) -> Result<()> {
     }
 
     if !remove.is_empty() {
-        let mut args: Vec<&str> = vec!["--literal-pathspecs", "rm", "-f", "--"];
-        args.extend(remove.iter().copied());
-        if let Err(err) = run_git(path, &args) {
+        if let Err(err) = run_git_paths(path, &["--literal-pathspecs", "rm", "-f"], &remove) {
             return Err(partial_failure(
                 "移出暂存区并删除",
                 &err.message,

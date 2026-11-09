@@ -59,14 +59,12 @@ impl Vcs for GitBackend {
         if paths.is_empty() {
             return Ok(());
         }
-        // `--` 不能省：没有它，`-dash.txt` 这种文件名会被 git 当成选项解析，
-        // 报 `error: unknown switch 'd'`（实测 2026-09-12）。
-        // `--literal-pathspecs` 也不能省：`--` 之后的路径仍按 glob 匹配，暂存 `f[1].txt`
+        // 路径走 stdin（`run_git_paths`）：一次几百个路径拼进命令行会撞上 Windows 的长度上限。
+        // 从文件读的路径不会被当成选项，`-dash.txt` 不会再报 `unknown switch`（实测 2026-09-12）。
+        // `--literal-pathspecs` 不能省：不带它路径按 glob 匹配，暂存 `f[1].txt`
         // 会连带暂存 `f1.txt`。`f1.txt` 若是还留着冲突标记的冲突文件，就绕过了前端的
         // 确认、被标记为已解决（第 85 条，实测 2026-11-04）。
-        let mut args: Vec<&str> = vec!["--literal-pathspecs", "add", "--"];
-        args.extend(paths.iter().map(String::as_str));
-        engine::git_cli::run_git(&self.root, &args)?;
+        engine::git_cli::run_git_paths(&self.root, &["--literal-pathspecs", "add"], paths)?;
         Ok(())
     }
 
@@ -77,10 +75,14 @@ impl Vcs for GitBackend {
         if paths.is_empty() {
             return Ok(());
         }
-        // `--literal-pathspecs`：同 stage，撤 `f[1].txt` 不能把 `f1.txt` 一起撤出暂存区
-        let mut args: Vec<&str> = vec!["--literal-pathspecs", "reset", "HEAD", "--"];
-        args.extend(paths.iter().map(String::as_str));
-        engine::git_cli::run_git(&self.root, &args)?;
+        // 路径走 stdin，理由同 stage。`--literal-pathspecs`：撤 `f[1].txt` 不能把 `f1.txt`
+        // 一起撤出暂存区。`HEAD` 之后的 `--` 由 `run_git_paths` 补：没有它，还没提交的仓库
+        // 和根目录有 `HEAD` 文件的仓库里都会报 ambiguous argument
+        engine::git_cli::run_git_paths(
+            &self.root,
+            &["--literal-pathspecs", "reset", "HEAD"],
+            paths,
+        )?;
         Ok(())
     }
 

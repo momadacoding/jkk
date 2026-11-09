@@ -18,7 +18,7 @@
 - [PowerShell](https://github.com/PowerShell/PowerShell) 7.4+：仅发版脚本需要
 - [Node.js](https://nodejs.org/) + [pnpm](https://pnpm.io/)
 - Windows / macOS / Linux 均可（当前主要在 Windows 11 开发）
-- 本地已安装 `git`
+- 本地已安装 `git` 2.26 及以上（Stage / Unstage / Discard 用 `--pathspec-from-file` 从 stdin 传路径，避开 Windows 命令行长度上限）
 
 ## 目录结构
 

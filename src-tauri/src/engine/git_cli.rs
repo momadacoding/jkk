@@ -108,6 +108,88 @@ pub fn run_git_stdin_env(
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// 让 git 从 stdin 读 NUL 分隔的路径。由 [`run_git_paths`] 自己接在参数末尾，调用方不拼。
+///
+/// `add` / `reset` / `checkout` / `rm` 都认（git 2.26 起 `rm` 也认）；`ls-files`、`ls-tree`
+/// 不认，那两条只读探测改用 [`cmdline_batches`] 分批。
+const PATHSPEC_STDIN: [&str; 3] = ["--pathspec-from-file=-", "--pathspec-file-nul", "--"];
+
+/// 跑一条带路径列表的 git **写**命令，路径从 stdin 喂，不拼进命令行。
+///
+/// `args` 只写到路径之前为止（如 `["--literal-pathspecs", "reset", "HEAD"]`），这里在末尾补上
+/// `--pathspec-from-file=- --pathspec-file-nul --`。
+///
+/// # 为什么
+///
+/// Windows 的命令行上限是 32767 个 UTF-16 字符。2 万文件的 SVN 混合 fixture 上实测
+/// （2026-11-09）：区头 Stage All 一次交下 631 个路径，`git add -- <路径…>` 起不来，
+/// 报 `The filename or extension is too long. (os error 206)`。写命令不能拆批：拆了就
+/// 不再是一次原子操作，中途失败时一半路径已经改了、一半没改。从 stdin 读还是一条命令。
+///
+/// # 为什么末尾的 `--` 不能省
+///
+/// 从文件读的路径不会被当成选项，但 `reset HEAD` / `checkout HEAD` 里的 `HEAD` 没有 `--`
+/// 收尾时，git 要先判断它是 revision 还是文件名：还没有提交的仓库里报
+/// `ambiguous argument 'HEAD': unknown revision`，根目录有个叫 `HEAD` 的文件时报
+/// `both revision and filename`，Unstage 整个用不了（独立 review 实测，2026-11-09）。
+/// 由这里统一补，不交给每个调用方记——stdin 参数漏写同样危险：git 不读 stdin，
+/// `reset HEAD --` 就成了清空整个暂存区。
+///
+/// `--literal-pathspecs` 对从文件读的路径照样生效（`tests/long_pathspec.rs` 里的 `f[1].txt`）。
+///
+/// # 空列表是错误，不是 no-op
+///
+/// 空的 pathspec 文件对 git 来说就是「没给 pathspec」，`reset` 会因此清空整个暂存区
+/// （`AGENTS.md` §6.2）。调用方本该先挡住空列表；漏挡时这里报错，绝不起进程。
+pub fn run_git_paths<S: AsRef<str>>(path: &str, args: &[&str], paths: &[S]) -> Result<String> {
+    if paths.is_empty() {
+        return Err(GitError::new(
+            "empty_pathspec",
+            "内部错误：没有路径却要执行带路径的 git 命令，已拒绝（空 pathspec 等于「全部」）"
+                .to_string(),
+        ));
+    }
+    let mut input = Vec::new();
+    for p in paths {
+        input.extend_from_slice(p.as_ref().as_bytes());
+        input.push(0);
+    }
+    let mut full: Vec<&str> = args.to_vec();
+    full.extend(PATHSPEC_STDIN);
+    run_git_stdin(path, &full, &input)
+}
+
+/// 每一批路径在命令行上最多占多少个 UTF-16 字符。
+///
+/// 上限 32767 还要装下 git 的路径和前面的参数，留 8000 余量。批数要少：`ls-files --others`
+/// 每跑一批都可能扫一遍工作区（独立 review 指出），预算越小扫得越多。
+const CMDLINE_BATCH_BUDGET: usize = 24000;
+
+/// 把路径切成一批批，每批拼进命令行都放得下。只给**只读**命令用（见 [`run_git_paths`]
+/// 为什么写命令不能拆批）。
+///
+/// 每批都非空，空输入得到零批：调用方按批跑命令，永远不会跑出一条不带 pathspec、
+/// 等于查询「全部」的命令。单个路径就超出预算时独占一批（真实路径到不了这个长度）。
+pub fn cmdline_batches<'a>(paths: &[&'a str]) -> Vec<Vec<&'a str>> {
+    let mut batches: Vec<Vec<&'a str>> = Vec::new();
+    let mut current: Vec<&'a str> = Vec::new();
+    let mut used = 0;
+    for &p in paths {
+        // 加 3：引号一对、分隔的空格一个
+        let cost = p.encode_utf16().count() + 3;
+        if !current.is_empty() && used + cost > CMDLINE_BATCH_BUDGET {
+            batches.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        current.push(p);
+        used += cost;
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
 /// 同 [`run_git_stdin`]，但退出码 1 不算失败（与 [`run_git_code`] 同理），
 /// 而且 fatal 时**把已经输出的部分一并交回**。返回 `(stdout, fatal)`。
 ///
@@ -193,4 +275,49 @@ pub fn run_git_env(path: &str, args: &[&str], envs: &[(&str, &str)]) -> Result<S
         cmd.env(k, v);
     }
     Ok(String::from_utf8_lossy(&output_or_error(cmd)?).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_paths_are_refused_without_starting_git() {
+        // 路径根本不存在：要是起了进程，报的会是 io 错误而不是 empty_pathspec
+        let none: [&str; 0] = [];
+        let err = run_git_paths("Z:/no/such/dir", &["reset", "HEAD"], &none).unwrap_err();
+        assert_eq!(err.code, "empty_pathspec");
+    }
+
+    #[test]
+    fn batches_keep_every_path_in_order_and_stay_under_budget() {
+        let owned: Vec<String> = (0..5000)
+            .map(|i| format!("目录/sub/file_{i:05}.txt"))
+            .collect();
+        let paths: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let batches = cmdline_batches(&paths);
+        assert!(batches.len() > 1, "这么多路径应当分成多批");
+        for b in &batches {
+            assert!(!b.is_empty());
+            let cost: usize = b.iter().map(|p| p.encode_utf16().count() + 3).sum();
+            assert!(cost <= CMDLINE_BATCH_BUDGET, "一批 {cost} 超出预算");
+        }
+        let flat: Vec<&str> = batches.concat();
+        assert_eq!(flat, paths, "不丢、不重、不乱序");
+    }
+
+    #[test]
+    fn empty_input_gives_no_batches() {
+        assert!(cmdline_batches(&[]).is_empty());
+    }
+
+    #[test]
+    fn an_oversized_path_gets_a_batch_of_its_own() {
+        let long = "x".repeat(CMDLINE_BATCH_BUDGET + 10);
+        let batches = cmdline_batches(&["a.txt", &long, "b.txt"]);
+        assert_eq!(
+            batches,
+            vec![vec!["a.txt"], vec![long.as_str()], vec!["b.txt"]]
+        );
+    }
 }
