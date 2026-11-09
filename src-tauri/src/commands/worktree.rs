@@ -423,6 +423,12 @@ fn has_entry(dir: &Path, name: &str) -> bool {
     )
 }
 
+/// 目录是空的吗？读不出来一律按「不空」处理——这个判断决定要不要跳过确认，
+/// 错的方向必须是多问一句。
+fn dir_is_empty(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_none())
+}
+
 /// 被 git 忽略的条目超过这个大小，就不在回收站里保留。
 ///
 /// 占空间的几乎全是 `target`、`node_modules`、`.venv`、`dist`、Unity 的 `Library`
@@ -749,6 +755,16 @@ pub fn delete_worktree(
     // 无权限）折叠成 false，那种情况下走「目录已丢」分支会跳过脏检查、只搬登记，
     // 仍真实存在的工作树和里面的未提交内容就成了无主数据。
     let worktree_exists = dir_exists(Path::new(&worktree_path))?;
+    // 删了一半：目录还在，根上的 `.git` 没了（Windows 上 worktree remove 栽在中途的
+    // 实测形态）。这种目录里 git 会一路往上找到**主仓库**——rev-parse 答的是主仓库
+    // 的 .git，status 答的是主仓库脏不脏，一个都不能信。所以和「目录已丢」一样从
+    // 登记反查管理目录，只是目录本身还得搬。
+    //
+    // 判据用「根上有没有 `.git`」而不是比 `--show-toplevel` 和入参：后者遇上 8.3
+    // 短名、junction 别名会把健康的 worktree 误判成残缺，跳过脏检查。`has_entry`
+    // 探测出错按「有」算，错的方向是走原来的流程。
+    let half_removed = worktree_exists && !has_entry(Path::new(&worktree_path), ".git");
+    let git_usable = worktree_exists && !half_removed;
 
     // 主工作区一票否决，而且要排在所有检查最前面。
     //
@@ -759,7 +775,7 @@ pub fn delete_worktree(
     //
     // 判据：主工作区的 `--absolute-git-dir` 和 `--git-common-dir` 相等，linked
     // worktree 的前者是 `.git/worktrees/<name>`，不相等。
-    let admin = if worktree_exists {
+    let admin = if git_usable {
         let admin = admin_dir(&worktree_path)?;
         if same_path(
             &admin.to_string_lossy(),
@@ -773,16 +789,21 @@ pub fn delete_worktree(
         admin
     } else {
         // 目录已丢（prunable）：git 进程没法在不存在的目录里启动（Windows 上 io
-        // error 267），`admin_dir` 走不通，改从登记里反查。主工作区不在
-        // `.git/worktrees/` 下登记，扫不到只会换来「找不到登记」的拒绝——
-        // 一票否决仍然成立，只是换个说法。
+        // error 267），`admin_dir` 走不通，改从登记里反查。删了一半的同理：能启动，
+        // 但答的是主仓库。主工作区不在 `.git/worktrees/` 下登记，扫不到只会换来
+        // 「找不到登记」的拒绝——一票否决仍然成立，只是换个说法。
         let common = common_git_dir(&path)?;
         admin_from_registry(&common, &worktree_path)?.ok_or_else(|| {
+            let state = if half_removed {
+                "目录还在，但里面没有 .git，已经不是 worktree 了"
+            } else {
+                "目录已经不在盘上"
+            };
             GitError::new(
                 "worktree_not_registered",
                 format!(
                     "git 的登记里找不到这个 worktree：\n{worktree_path}\n\n\
-                     目录已经不在盘上，登记也对不上，没什么可删的。"
+                     {state}，登记也对不上，没什么可删的。"
                 ),
             )
         })?
@@ -801,12 +822,13 @@ pub fn delete_worktree(
     }
 
     // 列被忽略条目和脏检查各扫一遍工作树，耗时同一个量级（实测都是 status 级别），
-    // 并行跑，删除不必为多出来的这一遍多等。目录已丢时没有可列的，git 也起不来。
+    // 并行跑，删除不必为多出来的这一遍多等。目录已丢时没有可列的，git 也起不来；
+    // 删了一半时 git 列的是主仓库的，不能用。
     //
     // 用分离线程而不是 scoped：脏检查拦下来时直接返回，不必等一个结果要被扔掉的
     // 扫描跑完；那个线程自己跑完就结束，只读不写，没有副作用。线程起不来
     // （资源耗尽）就当没有被忽略条目，不能让删除 panic。
-    let listing = if worktree_exists {
+    let listing = if git_usable {
         let (tx, rx) = std::sync::mpsc::channel();
         let worktree_path = worktree_path.clone();
         std::thread::Builder::new()
@@ -824,7 +846,19 @@ pub fn delete_worktree(
     // 让人没法收拾，交给 force 放行。
     //
     // 目录已丢时不查：未提交内容随目录一起没了，没有可保护的数据，git 进程也起不来。
-    if !force && worktree_exists {
+    //
+    // 删了一半时 status 答的是主仓库，不能问。空目录没什么可保护的，直接放行；
+    // 还剩东西就分不清是不是有用的，按「坏了」要用户确认（确认后整个进回收站）。
+    if !force && half_removed && !dir_is_empty(Path::new(&worktree_path)) {
+        return Err(GitError::new(
+            "worktree_broken",
+            "这个目录里没有 .git 了，git 已经不认它是 worktree；但目录不是空的，\
+             里面的文件 git 判断不了要不要（可能是删了一半的残留，也可能是完好的工作文件）。\n\n\
+             确认要删的话可以继续，目录会整个移到仓库内的回收站，不是直接抹掉。"
+                .to_string(),
+        ));
+    }
+    if !force && git_usable {
         match is_dirty(&worktree_path) {
             Ok(true) => {
                 return Err(GitError::new(
