@@ -20,13 +20,14 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
   const [error, setError] = useState<string | null>(null)
   const textRef = useRef<HTMLTextAreaElement>(null)
   const boxRef = useRef<HTMLDivElement>(null)
-  useFocusTrap(boxRef)
   const ready = canDeliver(message, ack, m) && !busy
 
   const finish = (ok: boolean) => {
     request.resolve(ok)
     onDone()
   }
+  // 交付跑起来之后 Esc 不再关闭：关掉只会让用户以为取消了，而 svn commit 可能已经发出
+  useFocusTrap(boxRef, () => { if (!busy) finish(false) })
 
   const accept = async () => {
     if (!ready) return
@@ -47,15 +48,6 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
     textRef.current?.focus()
   }, [])
 
-  useEffect(() => {
-    // 交付跑起来之后 Esc 不再关闭：关掉只会让用户以为取消了，而 svn commit 可能已经发出
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !busy) finish(false)
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [busy])
 
   return (
     <div className="dialog-overlay">

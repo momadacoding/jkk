@@ -4,8 +4,10 @@
 // 回归：目标就是当前选中的提交（打开仓库时默认选中 HEAD）时，滚走之后再点同一个分支，
 // selectedId 没变，定位 effect 不重跑，图停在原地（2026-11-01 用户报告，Fork 会重新定位）。
 import { fireEvent, render } from '@testing-library/react'
+import { useRef } from 'react'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { GraphView } from '@/components/GraphView'
+import { useFocusTrap } from '@/components/useFocusTrap'
 import { ALL_CAPABILITIES } from '@/engine/capabilities'
 import type { CommitNode } from '@/engine/types'
 
@@ -101,5 +103,50 @@ describe('GraphView 定位请求', () => {
 
     const { el } = renderGraph({ commits: withSvn, selectedId: 'local1', revealSeq: 1 })
     expect(el.scrollTop).toBe(centered(60))
+  })
+})
+
+describe('GraphView 键盘导航', () => {
+  function Dialog() {
+    const ref = useRef<HTMLDivElement>(null)
+    useFocusTrap(ref)
+    return <div ref={ref} className="dialog"><button>OK</button></div>
+  }
+
+  function renderWithSpy(dialog: boolean) {
+    const picked: string[] = []
+    render(
+      <>
+        <GraphView
+          commits={commits}
+          refs={[]}
+          pullRequests={[]}
+          selectedId="c5"
+          revealSeq={0}
+          onSelect={(id) => picked.push(id)}
+          headHash=""
+          changeCount={0}
+          onOpenChanges={() => {}}
+          onCommitAction={() => {}}
+          capabilities={ALL_CAPABILITIES}
+        />
+        {dialog && <Dialog />}
+      </>,
+    )
+    return picked
+  }
+
+  it('↑ / ↓ 换选中的提交', () => {
+    const picked = renderWithSpy(false)
+    fireEvent.keyDown(window, { key: 'ArrowDown' })
+    fireEvent.keyDown(window, { key: 'ArrowUp' })
+    expect(picked).toEqual(['c6', 'c4'])
+  })
+
+  it('弹框开着时不动背后的选中：弹框说的是哪一条，关掉之后看到的还得是那一条（PR 139 review 第 6 条）', () => {
+    const picked = renderWithSpy(true)
+    fireEvent.keyDown(window, { key: 'ArrowDown' })
+    fireEvent.keyDown(window, { key: 'ArrowUp' })
+    expect(picked).toEqual([])
   })
 })

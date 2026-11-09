@@ -8,6 +8,7 @@ import { WORKDIR_ID, withWorkdirRow } from '../engine/workdir'
 import { findDelivered } from '../engine/svnGraph'
 import { CommitRow } from './CommitRow'
 import { ContextMenu, useContextMenu } from './ContextMenu'
+import { anyDialogOpen } from './useFocusTrap'
 import { commitMenu, type CommitAction } from '../engine/commitActions'
 import type { Capabilities } from '../engine/capabilities'
 
@@ -180,7 +181,8 @@ export function GraphView({
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (!selectedId) return
+      // 弹框开着时让路：弹框盖着 graph，背后的选中不能跟着按键变
+      if (!selectedId || anyDialogOpen()) return
       // commits 不含伪行，键盘导航天然跳过它
       const idx = commits.findIndex((c) => c.id === selectedId)
       if (idx < 0) return

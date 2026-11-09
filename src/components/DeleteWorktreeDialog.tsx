@@ -56,15 +56,9 @@ export function DeleteWorktreeDialog({ worktree, onCancel, onConfirm }: DeleteWo
   const [busy, setBusy] = useState(false)
   const confirmRef = useRef<HTMLButtonElement>(null)
   const boxRef = useRef<HTMLDivElement>(null)
-  useFocusTrap(boxRef)
+  useFocusTrap(boxRef, () => { if (!busy) onCancel() })
 
   useEffect(() => { confirmRef.current?.focus() }, [])
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !busy) onCancel() }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onCancel, busy])
 
   const confirm = async () => {
     if (busy) return

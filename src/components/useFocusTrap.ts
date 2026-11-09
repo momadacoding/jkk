@@ -32,8 +32,16 @@ function moveInActions(box: HTMLElement, e: KeyboardEvent) {
   items[next].focus()
 }
 
-/** 当前开着的弹框，后打开的在最后；只有最上面那层管 Tab 和方向键。 */
+/** 当前开着的弹框，后打开的在最后；只有最上面那层管 Tab、方向键和 Esc。 */
 const open: RefObject<HTMLElement | null>[] = []
+
+/**
+ * 有没有弹框开着。挂在 window 上的全局快捷键（graph 的 ↑ / ↓）据此让路：弹框盖住了主界面，
+ * 背后的选中还在跟着按键变，关框之后看到的就不是弹框说的那一条了（PR 139 review 第 6 条）。
+ */
+export function anyDialogOpen(): boolean {
+  return open.length > 0
+}
 
 /**
  * 把 Tab / Shift+Tab 圈在弹框里。
@@ -50,11 +58,18 @@ const open: RefObject<HTMLElement | null>[] = []
  * 也管鼠标按在框外：遮罩不关框之后，点它的默认动作会把焦点从框里的按钮挪到 body，
  * 框还开着，回车、方向键却都没了着落（2026-11-08 PR review 第 1 条）。框外的 mousedown
  * 一律取消默认动作，焦点留在原处；click 照常派发，框外的右键菜单之类不受影响。
+ *
+ * `onEscape`：按 Esc 时调用，只调最上面那层的。各框原来各自往 window 上挂 Esc 监听，
+ * 叠两层框时一次 Esc 两层一起关（PR 139 review 第 5 条）。这条挂在**冒泡**阶段：框里的控件
+ * 自己吃掉 Esc（设置框录快捷键时 stopPropagation）就到不了这里，不会顺手把框关了。
+ * 回调取最新一次渲染的，「执行中不许关」这类判断写在回调里即可。
  */
-export function useFocusTrap(ref: RefObject<HTMLElement | null>) {
+export function useFocusTrap(ref: RefObject<HTMLElement | null>, onEscape?: () => void) {
   // 打开前的焦点在**首次渲染时**记下：effect 里再读就晚了，`autoFocus` 在提交阶段已经把它挪进框里
   const before = useRef<Element | null | undefined>(undefined)
   if (before.current === undefined) before.current = document.activeElement
+  const escape = useRef(onEscape)
+  escape.current = onEscape
 
   useEffect(() => {
     open.push(ref)
@@ -78,10 +93,16 @@ export function useFocusTrap(ref: RefObject<HTMLElement | null>) {
       const box = ref.current
       if (box && e.target instanceof Node && !box.contains(e.target)) e.preventDefault()
     }
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || open[open.length - 1] !== ref) return
+      escape.current?.()
+    }
     window.addEventListener('keydown', onKey, true)
+    window.addEventListener('keydown', onEsc)
     window.addEventListener('mousedown', onMouseDown, true)
     return () => {
       window.removeEventListener('keydown', onKey, true)
+      window.removeEventListener('keydown', onEsc)
       window.removeEventListener('mousedown', onMouseDown, true)
       open.splice(open.indexOf(ref), 1)
       // 关框后把焦点还回去：不还的话落到 body，文件列表的 Del / Ctrl+A 就收不到了。

@@ -85,6 +85,16 @@ describe('弹框的结构约定', () => {
     expect(offenders).toEqual([])
   })
 
+  it('Esc 统一交给 useFocusTrap：弹框不自己往 window 上挂 keydown，且都传了 Esc 回调', () => {
+    // 各框各挂一个 window 监听时，叠两层框一次 Esc 两层一起关（PR 139 review 第 5 条）。
+    // hook 只调最上面那层的回调
+    const files = sources(join(SRC, 'components')).filter((f) => readFileSync(f, 'utf8').includes('dialog-overlay'))
+    const ownListener = files.filter((f) => readFileSync(f, 'utf8').includes("addEventListener('keydown'")).map(rel)
+    expect(ownListener).toEqual([])
+    const noEscape = files.filter((f) => !/useFocusTrap\(\s*\w+\s*,/.test(readFileSync(f, 'utf8'))).map(rel)
+    expect(noEscape).toEqual([])
+  })
+
   it('取遮罩开始标签的写法拦得住各种绕法（守卫自己的用例）', () => {
     const cases = [
       '<div className="dialog-overlay" onKeyDown={(e) => e.key} onMouseDown={close}>',
