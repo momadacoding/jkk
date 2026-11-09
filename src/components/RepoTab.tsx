@@ -18,6 +18,7 @@ import {
   useRepoStore,
   useRepoEffects,
   checkRemoteDeletable,
+  forgetGoneRemoteBranch,
   svnInitHybrid,
   svnPreflightCheck,
   svnRebuildBaseline,
@@ -43,7 +44,11 @@ import BaselineBanner from './BaselineBanner'
 import { baselineMap, findDelivered, selectionDiffScope } from '../engine/svnGraph'
 import { describeToolExit } from '@/engine/externalTools'
 import { currentDiff } from '@/engine/currentDiff'
-import { runBranchDeletion, type BranchDeletionStep } from '@/engine/deleteBranchTargets'
+import {
+  runBranchDeletion,
+  type BranchDeletionStep,
+  type DeleteBranchTargets,
+} from '@/engine/deleteBranchTargets'
 import {
   changesRows,
   changesDiffScope,
@@ -541,7 +546,7 @@ export function RepoTab({
    */
   const handleDeleteBranch = useCallback(async (
     name: string,
-    targets: { remote: { remote: string; branch: string } | null; worktreePath: string | null },
+    targets: DeleteBranchTargets,
     onStepDone: (step: BranchDeletionStep) => void,
   ) => {
     const path = state.path
@@ -560,6 +565,7 @@ export function RepoTab({
       },
       deleteRemote: ({ remote, branch }) => invoke<void>('delete_remote_branch', { path, remote, branch }),
       deleteLocal: () => invoke<void>('delete_branch', { path, name }),
+      forgetGoneRemote: ({ remote, branch }) => forgetGoneRemoteBranch(path, remote, branch),
     })
     // 到这里已经全删完了：刷新失败不能再抛给确认框，它会显示成删除失败，让用户去重试
     await refreshGraph(path).catch(reportError)

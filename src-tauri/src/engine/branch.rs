@@ -389,11 +389,109 @@ fn remote_default_branch(repo: &Repository, remote: &str) -> Option<String> {
 fn remote_default_branch_from_network(path: &str, ask: &str) -> Option<String> {
     let out = crate::engine::git_cli::run_git(path, &["ls-remote", "--symref", "--", ask, "HEAD"])
         .ok()?;
-    out.lines()
+    default_branch_in(&out)
+}
+
+/// 从 `ls-remote --symref ... HEAD` 的输出里取 HEAD 指向的分支名。
+fn default_branch_in(ls_remote: &str) -> Option<String> {
+    ls_remote
+        .lines()
         .find_map(|line| line.strip_prefix("ref: "))
         .and_then(|rest| rest.split('\t').next())
         .and_then(|r| r.strip_prefix("refs/heads/"))
         .map(|s| s.to_string())
+}
+
+/// `ls-remote` 的输出里有没有 `wanted`（完整 ref 名）这一行。
+///
+/// 按 ref 名**整段相等**认：ls-remote 的模式是按后缀匹配的，`refs/heads/feat/x` 这个模式
+/// 也会匹配到 `refs/heads/team/refs/heads/feat/x` 这种名字，只看有没有输出会认错。
+fn ref_in(ls_remote: &str, wanted: &str) -> bool {
+    ls_remote
+        .lines()
+        .any(|line| line.split('\t').nth(1) == Some(wanted))
+}
+
+/// 只问 `wanted` 这条 ref 在不在。问不到为 None。
+fn ref_on_target(path: &str, ask: &str, wanted: &str) -> Option<bool> {
+    let out = crate::engine::git_cli::run_git(path, &["ls-remote", "--", ask, wanted]).ok()?;
+    Some(ref_in(&out, wanted))
+}
+
+/// 探测一个 push 目标：这条分支在不在，顺带替护栏问好默认分支。问不到为 None。
+///
+/// 走缓存的 [`prefetch`](crate::engine::remote_head_cache::PrefetchCache::prefetch)，
+/// 交给缓存的仍只是默认分支名，护栏的安全边界一条不变。缓存因为结果还新鲜、或已有查询在
+/// 路上而**不跑**这次查询时，拿不到存在性，再单独问一次这条分支。
+fn probe_target(path: &str, remote: &str, target: &PushTarget, wanted: &str) -> Option<bool> {
+    use crate::engine::remote_head_cache::{global, TTL};
+    let key = remote_head_cache_key(path, remote, target);
+    let mut ran = false;
+    let mut present = None;
+    global().prefetch(&key, TTL, || {
+        ran = true;
+        let out = crate::engine::git_cli::run_git(
+            path,
+            &["ls-remote", "--symref", "--", &target.ask, "HEAD", wanted],
+        )
+        .ok()?;
+        present = Some(ref_in(&out, wanted));
+        default_branch_in(&out)
+    });
+    if ran {
+        present
+    } else {
+        ref_on_target(path, &target.ask, wanted)
+    }
+}
+
+/// 用户勾上「顺便删远程」时调：远程上还有没有这条分支。**只读**，不碰本地任何 ref。
+///
+/// - `Some(true)`：至少一个 push 目标上还有，删除有事可做。
+/// - `Some(false)`：每个 push 目标都明确答了没有。PR 合并时 GitHub 的 `deleteBranchOnMerge`
+///   已经删了它、本地没 `fetch --prune` 的典型情况。
+/// - `None`：有 push 目标问不到，不知道。界面不能据此下任何结论。
+///
+/// 不在这里清掉过期的跟踪 ref：这时用户还没确认任何删除，而且清掉之后弹框的重查会
+/// 退到别的远程上的同名分支（`find_remote_branch`），勾选框就指向一条用户没选过的分支。
+/// 清理放在删除完成之后，见 [`forget_gone_remote_branch`]。
+///
+/// 和 [`prefetch_remote_default`] 用同一次 `ls-remote`，不为存在性多握一次手。
+pub fn probe_remote_branch(path: &str, remote: &str, branch: &str) -> Option<bool> {
+    let wanted = format!("refs/heads/{branch}");
+    let wanted = wanted.as_str();
+    let targets = push_targets(path, remote);
+    let answers: Vec<Option<bool>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = targets
+            .iter()
+            .map(|target| scope.spawn(move || probe_target(path, remote, target, wanted)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().ok().flatten())
+            .collect()
+    });
+    if answers.contains(&Some(true)) {
+        return Some(true);
+    }
+    if answers.is_empty() || answers.iter().any(Option::is_none) {
+        return None;
+    }
+    Some(false)
+}
+
+/// 探测答了「远程上已经没有」、用户确认的删除做完之后调：清掉本地过期的跟踪 ref。
+///
+/// 只在 push 目标就是 fetch 侧（按远程名问的那种）时清。跟踪 ref 镜像的是 fetch 侧，pushurl
+/// 指向别处时 push 目标上没有说明不了 fetch 侧也没有。判断只读本地配置，不走网络。
+///
+/// 尽力而为：删除已经完成，清理失败不能反过来让删除显示成失败。
+pub fn forget_gone_remote_branch(path: &str, remote: &str, branch: &str) {
+    if let [only] = push_targets(path, remote).as_slice() {
+        if only.ask == remote {
+            drop_stale_tracking_refs(path, remote, branch);
+        }
+    }
 }
 
 /// `git push <remote>` 会到达的一个仓库。
@@ -505,7 +603,8 @@ pub fn prefetch_remote_default_for_ref(path: &str, remote_ref: &str) {
 /// pushurl，所以任何一个的默认分支都不能删。fetch 侧的默认分支不看，那个仓库不会被动到。
 ///
 /// 那次 ls-remote 是一整趟 SSH 握手（实测到 GitHub 3 秒多，和 push 一样贵），
-/// 所以用户表明要删远程时会用 [`prefetch_remote_default`] 提前发出去，这里优先
+/// 所以用户表明要删远程时会提前发出去（删除弹框走 [`probe_remote_branch`]，侧边栏走
+/// [`prefetch_remote_default_for_ref`]），这里优先
 /// 复用那个结果，安全边界见 [`crate::engine::remote_head_cache`]。
 ///
 /// 两条路都问不出来时**放行**：这时候要么是断网（push 一样会失败），要么这个

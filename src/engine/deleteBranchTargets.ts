@@ -19,16 +19,30 @@ export interface DeleteBranchInfo {
   worktree: { path: string } | null
 }
 
-/** 用户在两个勾选框上的选择。 */
+/** 用户在两个勾选框上的选择，加上探测对远程那条分支的结论。 */
 export interface DeleteBranchChoice {
   alsoRemote: boolean
   alsoWorktree: boolean
+  /** 探测明确答了「远程上已经没有这条分支」。没探测过、问不到都是 false。 */
+  remoteGone?: boolean
 }
 
 /** 这一次删除真正会发出去的目标。 */
 export interface DeleteBranchTargets {
   remote: { remote: string; branch: string } | null
   worktreePath: string | null
+  /**
+   * 远程上已经没有的那条远程分支：删除做完后清掉它在本地的过期跟踪 ref。
+   *
+   * 不在探测时就清：那时用户还没确认任何删除，清掉之后弹框的重查还会退到别的远程上的
+   * 同名分支，勾选框就指向一条用户没选过的分支。
+   */
+  staleRemote: { remote: string; branch: string } | null
+}
+
+/** 远程分支坐标的字符串形式，当 effect 依赖与比较用。弹框里所有比较都走它，免得两处拼法不一致。 */
+export function remoteKey(target: { remote: string; branch: string } | null): string | null {
+  return target ? `${target.remote}\0${target.branch}` : null
 }
 
 /**
@@ -53,13 +67,15 @@ export function deleteBranchTargets(
   info: DeleteBranchInfo,
   choice: DeleteBranchChoice,
 ): DeleteBranchTargets {
-  const remote =
-    caps.remotes && choice.alsoRemote && !info.remoteProtected && info.remote && info.remoteBranch
-      ? { remote: info.remote, branch: info.remoteBranch }
-      : null
+  const coord = caps.remotes && info.remote && info.remoteBranch
+    ? { remote: info.remote, branch: info.remoteBranch }
+    : null
+  // 远程上已经没有就不再删：push 只会白握一次手
+  const remote = coord && choice.alsoRemote && !choice.remoteGone && !info.remoteProtected ? coord : null
+  const staleRemote = coord && choice.remoteGone ? coord : null
   const worktreePath =
     caps.worktrees && choice.alsoWorktree && info.worktree ? info.worktree.path : null
-  return { remote, worktreePath }
+  return { remote, worktreePath, staleRemote }
 }
 
 /** 做完就回不了头、重试时不能再做一遍的步骤。本地分支是最后一步，它做完序列就结束了。 */
@@ -72,6 +88,8 @@ export interface BranchDeletionSteps {
   deleteWorktree: (worktreePath: string) => Promise<void>
   deleteRemote: (remote: NonNullable<DeleteBranchTargets['remote']>) => Promise<void>
   deleteLocal: () => Promise<void>
+  /** 清掉一条远程已经没有的分支在本地的过期跟踪 ref。只读本地配置，不走网络。失败只记日志。 */
+  forgetGoneRemote: (remote: { remote: string; branch: string }) => Promise<void>
 }
 
 /**
@@ -95,7 +113,7 @@ export interface BranchDeletionSteps {
  * 没做完的步骤。
  */
 export async function runBranchDeletion(
-  { remote, worktreePath }: DeleteBranchTargets,
+  { remote, worktreePath, staleRemote }: DeleteBranchTargets,
   onStepDone: (step: BranchDeletionStep) => void,
   steps: BranchDeletionSteps,
 ): Promise<void> {
@@ -109,6 +127,12 @@ export async function runBranchDeletion(
     onStepDone('remote')
   }
   await steps.deleteLocal()
+  // 删除已经全部完成，清理只是顺手：失败也不能抛出去，否则确认框会把它显示成删除失败
+  if (staleRemote) {
+    await steps.forgetGoneRemote(staleRemote).catch((err) => {
+      console.warn('清理过期的远程跟踪分支失败：', err)
+    })
+  }
 }
 
 /**

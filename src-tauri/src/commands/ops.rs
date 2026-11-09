@@ -71,6 +71,40 @@ pub fn prefetch_remote_default(path: String, remote: String) {
     });
 }
 
+/// 用户勾上「顺便删远程」时调：远程上还有没有这条分支（`null` 表示问不到）。
+/// 顺带替护栏预取默认分支，见 [`crate::engine::branch::probe_remote_branch`]。
+///
+/// 要把答案交回前端，所以不能像预取那样立刻返回。写成 `async fn`、查询放进
+/// `spawn_blocking`：`run_git` 没有超时，卡住时只占阻塞线程池的一个线程，不占 tokio 工作线程。
+#[tauri::command(async)]
+pub async fn probe_remote_branch(
+    path: String,
+    remote: String,
+    branch: String,
+) -> Result<Option<bool>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::vcs::require_capability(&path, "远程分支", |c| c.remotes)?;
+        Ok(crate::engine::branch::probe_remote_branch(
+            &path, &remote, &branch,
+        ))
+    })
+    .await
+    .unwrap_or_else(|e| {
+        // 线程 panic 了：当成问不到，界面不据此下结论；记下来，免得和断网分不清
+        log::warn!("探测远程分支的线程异常退出: {e}");
+        Ok(None)
+    })
+}
+
+/// 删除弹框在探测答了「远程上已经没有」、且用户确认的删除做完之后调：清掉本地过期的
+/// 跟踪 ref。只读本地配置、不走网络，见 [`crate::engine::branch::forget_gone_remote_branch`]。
+#[tauri::command(async)]
+pub fn forget_gone_remote_branch(path: String, remote: String, branch: String) -> Result<()> {
+    crate::vcs::require_capability(&path, "远程分支", |c| c.remotes)?;
+    crate::engine::branch::forget_gone_remote_branch(&path, &remote, &branch);
+    Ok(())
+}
+
 /// 同 [`prefetch_remote_default`]，按侧边栏给的 `origin/feat/x` 形式定位远程。
 #[tauri::command(async)]
 pub fn prefetch_remote_default_for_ref(path: String, remote_branch: String) {

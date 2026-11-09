@@ -10,6 +10,11 @@ export interface LayoutScenario {
   component: string
   /** 打开后点主按钮：错误要等 action 失败才出现。 */
   clickPrimary?: boolean
+  /**
+   * 打开后先点这个元素，再等 `thenShows` 这段文字出现才开始量：有的说明要用户操作之后才出现
+   * （勾上「顺便删远程」→ 探测答「远程已经没有」）。
+   */
+  clickFirst?: { selector: string; thenShows: string }
 }
 
 export const SCENARIOS: LayoutScenario[] = [
@@ -19,6 +24,12 @@ export const SCENARIOS: LayoutScenario[] = [
   { id: 'confirm-discard-long', component: 'ConfirmDialog' },
   { id: 'prompt-long-message', component: 'PromptDialog' },
   { id: 'delete-branch-long-error', component: 'DeleteBranchDialog' },
+  {
+    id: 'delete-branch-remote-gone',
+    component: 'DeleteBranchDialog',
+    clickFirst: { selector: '.dlg-check input >> nth=0', thenShows: '远程上已经没有这条分支了' },
+    clickPrimary: true,
+  },
   { id: 'delete-worktree-long-error', component: 'DeleteWorktreeDialog', clickPrimary: true },
   { id: 'deliver-long', component: 'DeliverDialog' },
   // 错误在内容末尾、只有一行：从顶部点交付，它最容易出在视野外或藏在按钮条下面

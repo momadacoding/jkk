@@ -102,6 +102,8 @@ pub fn run() {
             commands::ops::delete_remote_ref,
             commands::ops::prefetch_remote_default,
             commands::ops::prefetch_remote_default_for_ref,
+            commands::ops::probe_remote_branch,
+            commands::ops::forget_gone_remote_branch,
             commands::ops::check_remote_deletable,
             commands::ops::discard,
             commands::ops::rename_branch,

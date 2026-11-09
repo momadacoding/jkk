@@ -6,12 +6,14 @@ import { toErrorMessage } from '../engine/errors'
 import type { Capabilities } from '../engine/capabilities'
 import {
   deleteBranchTargets,
+  remoteKey,
   withoutCompletedSteps,
   type BranchDeletionStep,
+  type DeleteBranchTargets,
 } from '../engine/deleteBranchTargets'
 import { unmergedNote } from '../engine/deleteBranchNote'
 import type { PullRequest } from '../engine/types'
-import { prefetchRemoteDefault } from '@/store/repoStore'
+import { probeRemoteBranch } from '@/store/repoStore'
 
 /** 检出了待删分支的 worktree（主工作区除外）。 */
 export interface WorktreeTarget {
@@ -63,13 +65,11 @@ export interface RemoteTarget {
   branch: string
 }
 
-/** 这一次删除都要动哪些东西。 */
-export interface DeleteTargets {
-  /** 非 null 时连远程分支一起删。 */
-  remote: RemoteTarget | null
-  /** 非 null 时先把这个 worktree 删掉，否则本地分支根本删不动。 */
-  worktreePath: string | null
-}
+/**
+ * 这一次删除都要动哪些东西。就是 `deleteBranchTargets` 算出来的那个结构：confirm() 原样
+ * 交给 onConfirm，两边不另写一份，免得字段对不上。
+ */
+export type DeleteTargets = DeleteBranchTargets
 
 function BranchGlyph() {
   return (
@@ -160,6 +160,13 @@ export function DeleteBranchDialog({
   const [deleteError, setDeleteError] = useState<string | null>(null)
   const [alsoRemote, setAlsoRemote] = useState(false)
   /**
+   * 探测答了「远程上已经没有」的那条远程分支，形如 `origin\0feat/x`。
+   *
+   * 记坐标而不是一个布尔：PR 列表晚到的重查可能换了远程（见上面 `completed` 的注释），
+   * 换了之后旧答案不能沿用到新的那条上。
+   */
+  const [goneOnRemote, setGoneOnRemote] = useState<string | null>(null)
+  /**
    * 是否连 worktree 一起删。有 worktree 时**默认勾上**。
    *
    * 这一项和「删远程」不同，它不是可选的附赠动作：git 拒绝删除被 worktree
@@ -168,6 +175,8 @@ export function DeleteBranchDialog({
   const [alsoWorktree, setAlsoWorktree] = useState(false)
   /** 删除正在进行中。勾了远程时这一步要走网络，实测能到四五秒。 */
   const [busy, setBusy] = useState(false)
+  /** 同 `busy`，给探测的回调读：回调闭包里的 state 是旧的。 */
+  const busyRef = useRef(false)
   const confirmRef = useRef<HTMLButtonElement>(null)
   const boxRef = useRef<HTMLDivElement>(null)
   // 删除跑起来之后 Esc 不再关闭：git 已经在动远程了，关掉只会让用户以为取消了
@@ -201,19 +210,51 @@ export function DeleteBranchDialog({
     return () => { cancelled = true }
   }, [repoPath, name, capabilities.worktrees, mergedHeadsKey])
 
-  // 勾上「同时删除远程」的那一刻，趁用户移向 Delete 按钮先把护栏要的默认分支问好：
-  // 那是一整趟 SSH 握手（实测 3 秒多），不预取的话点确认后要连两次网。
+  const currentKey = info
+    ? remoteKey(deleteBranchTargets(capabilities, info, { alsoRemote: true, alsoWorktree: false }).remote)
+    : null
+  const remoteGone = currentKey !== null && goneOnRemote === currentKey
+
+  // 勾上「同时删除远程」的那一刻探测远程：这条分支还在不在，顺带把护栏要的默认分支问好。
+  // 后者是一整趟 SSH 握手（实测 3 秒多），不预取的话点确认后要连两次网；前者让「PR 合并时
+  // 已被自动删掉」的那种分支在点删除之前就说清楚，而不是让用户勾着一个没事可做的选项。
   // **不在弹框打开时就发**：只删本地分支的人不该因此走网络（SSH agent 审批、
   // GCM 凭据框都可能弹出来）。条件直接用 deleteBranchTargets——真正发出删除的
-  // 也是它，删不了的就不白跑网络。依赖远程名而不是 info：PR 列表晚到的重查不该再发一趟；
-  // 只有取消再勾选才会再发一次，重复由后端去重。删除失败后直接重试不会触发预取，
-  // 这时护栏当场问：只是慢，结论不变
-  const prefetchTarget = info
-    ? deleteBranchTargets(capabilities, info, { alsoRemote, alsoWorktree: false }).remote?.remote
-    : undefined
+  // 也是它，删不了的就不白跑网络。依赖坐标字符串而不是 info：PR 列表晚到的重查不该再发一趟。
+  //
+  // **同一条分支在这个弹框里只探测一次**（`probes`）：取消再勾选复用上次那个 Promise，
+  // 还在路上的也一样。不复用的话每勾一次就是一次 SSH 握手（可能又弹一次凭据框），远程卡住时
+  // 每次还留下一个卡死的线程。只有上次问不到（null）才重新探测。删除失败后直接重试不会触发
+  // 探测，这时护栏当场问：只是慢，结论不变
+  //
+  // 探测答「没有」时直接取消勾选，勾选框灰掉；删除那一步交给 deleteBranchTargets 按
+  // remoteGone 再判一次。**删除进行中回来的答案不用**：push 已经发出去了，这时改勾选框，
+  // push 若因别的原因失败，重试会悄悄跳过远程、勾选框还灰着改不回来
+  const probes = useRef(new Map<string, Promise<boolean | null>>())
+  const probeTarget = info
+    ? deleteBranchTargets(capabilities, info, { alsoRemote, alsoWorktree: false }).remote
+    : null
+  const probeKey = remoteKey(probeTarget)
   useEffect(() => {
-    if (repoPath && prefetchTarget) prefetchRemoteDefault(repoPath, prefetchTarget)
-  }, [repoPath, prefetchTarget])
+    if (!repoPath || !probeKey) return
+    const [remote, branch] = probeKey.split('\0')
+    let probe = probes.current.get(probeKey)
+    if (!probe) {
+      probe = probeRemoteBranch(repoPath, remote, branch)
+      probes.current.set(probeKey, probe)
+      void probe.then((present) => {
+        if (present === null) probes.current.delete(probeKey)
+      })
+    }
+    let cancelled = false
+    void probe.then((present) => {
+      // 用户已经取消勾选、或弹框已关：不再改界面。只认明确的 false，问不到（null）不下结论
+      if (cancelled || busyRef.current || present !== false) return
+      setGoneOnRemote(probeKey)
+      setAlsoRemote(false)
+    })
+    return () => { cancelled = true }
+  }, [repoPath, probeKey])
 
   // 远程信息还没回来就先不给删：这时候勾选框还没出现，
   // 用户根本没机会决定要不要连远程一起删
@@ -233,18 +274,21 @@ export function DeleteBranchDialog({
     // 地方，不该依赖上游控件禁用没禁用、渲染没渲染。以前这里是两段分开写的
     // 三元表达式，结果 worktree 那半接上了能力判断、远程那半没有——两轮 review
     // 才把同一个缺口的两半抓齐（见该函数的注释）。
-    const { remote, worktreePath } = deleteBranchTargets(capabilities, info, {
+    const targets = deleteBranchTargets(capabilities, info, {
       alsoRemote,
       alsoWorktree,
+      remoteGone,
     })
+    busyRef.current = true
     setBusy(true)
     setDeleteError(null)
     try {
-      await onConfirm({ remote, worktreePath }, (step) => {
+      await onConfirm(targets, (step) => {
         setCompleted((steps) => [...steps, step])
       })
     } catch (err) {
       setDeleteError(toErrorMessage(err))
+      busyRef.current = false
       setBusy(false)
     }
   }
@@ -284,7 +328,7 @@ export function DeleteBranchDialog({
               <input
                 type="checkbox"
                 checked={alsoRemote && !info.remoteProtected}
-                disabled={busy || info.remoteProtected}
+                disabled={busy || info.remoteProtected || remoteGone}
                 onChange={(e) => setAlsoRemote(e.target.checked)}
               />
               <span>Also delete remote branch</span>
@@ -294,6 +338,11 @@ export function DeleteBranchDialog({
             {info.remoteProtected && (
               <div className="dlg-note under-check">
                 {info.upstream} 是该远程的默认分支，不提供删除。本地分支照样可以删。
+              </div>
+            )}
+            {remoteGone && !info.remoteProtected && (
+              <div className="dlg-note under-check">
+                远程上已经没有这条分支了（多半是合并 PR 时被自动删掉的），不用再删。本地分支照样可以删。
               </div>
             )}
           </>
@@ -356,7 +405,7 @@ export function DeleteBranchDialog({
         {busy && (
           <Reveal className="dlg-progress">
             <span className="dlg-spinner" />
-            {prefetchTarget ? '正在联系远程…' : '正在删除…'}
+            {probeTarget ? '正在联系远程…' : '正在删除…'}
           </Reveal>
         )}
 

@@ -28,9 +28,30 @@ const paths = (n: number) =>
 const LONG_ERROR = paths(200).join('\n')
 const noop = () => {}
 
-// `invoke` 走这个全局。删除分支的框一打开就读分支信息，这里让它失败，错误文案撑满框
+// 名字在框里单行省略，不会撑高；长名字只是确认省略之后说明文字照样排得下
+const LONG_NAME = `feat/${'very-long-branch-name-'.repeat(6)}end`
+
+// `invoke` 走这个全局。删除分支的框一打开就读分支信息，默认让它失败，错误文案撑满框。
+// 「远程已经没有」那个场景要真的拿到信息、探测答 false，弹框里的说明才会全部出现
 ;(window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
-  invoke: async () => {
+  invoke: async (cmd: string) => {
+    if (new URLSearchParams(location.search).get('scenario') === 'delete-branch-remote-gone') {
+      if (cmd === 'branch_delete_info') {
+        return {
+          upstream: `origin/${LONG_NAME}`,
+          remote: 'origin',
+          remoteBranch: LONG_NAME,
+          remoteProtected: false,
+          unmerged: 12,
+          comparedTo: 'master',
+          contentMerged: false,
+          mergedVia: null,
+          mergedInto: null,
+          worktree: { name: LONG_NAME.replace(/\//g, '-'), path: 'C:/r/.worktrees/wt' },
+        }
+      }
+      if (cmd === 'probe_remote_branch') return false
+    }
     throw new Error(LONG_ERROR)
   },
 }
@@ -178,6 +199,20 @@ const SCENES: Record<string, () => ReactNode> = {
     <Confirm request={describeDiscard(paths(600), paths(300), false)} />
   ),
   'prompt-long-message': () => <Prompt />,
+  // 「远程已经没有」的说明 + worktree 说明 + 未合并警告都在框里，再点删除失败、错误撑满框：
+  // 说明只在勾选之后出现，最容易把下面的错误挤到视野外
+  'delete-branch-remote-gone': () => (
+    <DeleteBranchDialog
+      repoPath="C:\\repo"
+      name={LONG_NAME}
+      capabilities={ALL_CAPABILITIES}
+      mergedPullRequests={[]}
+      onCancel={noop}
+      onConfirm={async () => {
+        throw new Error(LONG_ERROR)
+      }}
+    />
+  ),
   'delete-branch-long-error': () => (
     <DeleteBranchDialog
       repoPath="C:\\repo"
