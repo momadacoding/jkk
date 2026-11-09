@@ -522,6 +522,89 @@ pub fn check_deletable_on_remote(path: &str, remote: &str, branch: &str) -> Resu
     refuse_default_branch(path, remote, branch, Answer::Keep)
 }
 
+/// 在远程上删掉 `branch`。远程上本来就没有这条分支时**算成功**，并删掉本地过期的跟踪 ref。
+///
+/// 常见来源：GitHub 的 `deleteBranchOnMerge` 在 PR 合并时已经删了 head 分支，本地没
+/// `fetch --prune`，`origin/x` 还挂着，删除弹框照着它提议「顺便删远程」。用户要的结果是
+/// 「远程上没有这条分支」，已经成立；报错只会让人以为删除序列出了事。
+///
+/// 护栏（默认分支不给删）由调用方先跑，这里只管 push。
+///
+/// 跟踪 ref 删的是本地的、fetch 侧的镜像。pushurl 和 fetch URL 不同时，它和 git 自己
+/// 在 `push --delete` 成功后的做法一致（git 也会删跟踪 ref，不管 fetch 侧还有没有）。
+pub fn push_delete(path: &str, remote: &str, branch: &str) -> Result<()> {
+    // 要按 stderr 文本认「已经不在」，必须固定成英文：这条消息在 git 里是可翻译的，
+    // 装了中文语言包的 git 会说别的话。代价是这条命令的其他报错也变成英文
+    let err = match crate::engine::git_cli::run_git_env(
+        path,
+        &["push", remote, "--delete", branch],
+        &[("LC_ALL", "C"), ("LANGUAGE", "C")],
+    ) {
+        Ok(_) => return Ok(()),
+        Err(e) => e,
+    };
+    if !only_says_remote_ref_is_gone(&err.message, branch) {
+        return Err(err);
+    }
+    drop_stale_tracking_refs(path, remote, branch);
+    Ok(())
+}
+
+/// stderr 是否**只**在说「远程上没有这条分支」。
+///
+/// 有多个 pushurl 时一次 push 会推好几处，一处说「不在」、另一处失败也是可能的，那时
+/// 不能当成功。所以按白名单逐行认：那句「不在」、它固定跟着的 `failed to push some refs`、
+/// 另一处删成功时的 `To <url>` 与 ` - [deleted]`、服务端的 `remote:` 提示。**认不出的行
+/// 一律当失败**——认错的代价是退回原来的报错，而认漏的代价是把没删成说成删掉了。
+fn only_says_remote_ref_is_gone(stderr: &str, branch: &str) -> bool {
+    let gone = format!("error: unable to delete '{branch}': remote ref does not exist");
+    let mut saw_gone = false;
+    for line in stderr.lines() {
+        if line == gone {
+            saw_gone = true;
+        } else if !(line.trim().is_empty()
+            || line.starts_with("error: failed to push some refs to ")
+            || line.starts_with("To ")
+            || line.starts_with(" - [deleted]")
+            || line.starts_with("remote:"))
+        {
+            return false;
+        }
+    }
+    saw_gone
+}
+
+/// 删掉 `branch` 在本地的跟踪 ref。**尽力而为**：失败不报。
+///
+/// 远程上没有这条分支已经成立，这一步只是清理；`.lock` 撞上并发 fetch 之类的失败
+/// 若往上报，弹框会把一个已经达成的删除说成失败，那正是这次要修的问题。
+///
+/// 跟踪 ref 的名字按该远程的 fetch refspec 映射，不硬编码 `refs/remotes/<remote>/`：
+/// 自定义 refspec 下硬编码的名字可能不是它，甚至是别的 ref。
+fn drop_stale_tracking_refs(path: &str, remote: &str, branch: &str) {
+    let Ok(repo) = Repository::open(path) else {
+        return;
+    };
+    let Ok(remote) = repo.find_remote(remote) else {
+        return;
+    };
+    let head = format!("refs/heads/{branch}");
+    for spec in remote.refspecs() {
+        if spec.direction() != git2::Direction::Fetch || !spec.src_matches(&head) {
+            continue;
+        }
+        let Some(tracking) = spec
+            .transform(&head)
+            .ok()
+            .and_then(|b| b.as_str().map(String::from))
+        else {
+            continue;
+        };
+        // update-ref -d 对不存在的 ref 也返回成功，不必先查
+        let _ = crate::engine::git_cli::run_git(path, &["update-ref", "-d", &tracking]);
+    }
+}
+
 fn refuse_default_branch(path: &str, remote: &str, branch: &str, answer: Answer) -> Result<()> {
     use crate::engine::remote_head_cache::{global, MAX_WAIT, TTL};
     for target in push_targets(path, remote) {
@@ -671,4 +754,54 @@ pub fn delete_info_with_merged_heads(
         merged_into,
         worktree: find_worktree(path, name),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::only_says_remote_ref_is_gone;
+
+    const GONE: &str = "error: unable to delete 'feat/x': remote ref does not exist";
+    const FAILED: &str = "error: failed to push some refs to 'github.com:o/r.git'";
+
+    #[test]
+    fn the_plain_gone_message_counts_as_gone() {
+        assert!(only_says_remote_ref_is_gone(
+            &format!("{GONE}\n{FAILED}\n"),
+            "feat/x"
+        ));
+    }
+
+    #[test]
+    fn a_gone_message_for_another_branch_does_not_count() {
+        let other = "error: unable to delete 'feat/y': remote ref does not exist";
+        assert!(!only_says_remote_ref_is_gone(
+            &format!("{other}\n{FAILED}\n"),
+            "feat/x"
+        ));
+    }
+
+    /// 另一个 pushurl 走 ssh 连不上：那几行不以 `error:` 开头也得当失败。
+    #[test]
+    fn an_ssh_failure_on_another_push_url_is_not_gone() {
+        let stderr = format!(
+            "{GONE}\n{FAILED}\n\
+             ssh: Could not resolve hostname mirror.example: No such host is known.\r\n\
+             fatal: Could not read from remote repository.\n\n\
+             Please make sure you have the correct access rights\n\
+             and the repository exists.\n"
+        );
+        assert!(!only_says_remote_ref_is_gone(&stderr, "feat/x"));
+    }
+
+    /// 另一处删成功时 git 打印的 `To` / ` - [deleted]` 行不影响判断。
+    #[test]
+    fn a_successful_delete_on_another_push_url_is_still_gone() {
+        let stderr = format!("To C:/mirror.git\n - [deleted]         feat/x\n{GONE}\n{FAILED}\n");
+        assert!(only_says_remote_ref_is_gone(&stderr, "feat/x"));
+    }
+
+    #[test]
+    fn an_empty_stderr_is_not_gone() {
+        assert!(!only_says_remote_ref_is_gone("", "feat/x"));
+    }
 }

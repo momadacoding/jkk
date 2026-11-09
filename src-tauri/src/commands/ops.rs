@@ -41,12 +41,12 @@ pub fn delete_remote_branch(path: String, remote: String, branch: String) -> Res
     crate::vcs::require_capability(&path, "远程分支", |c| c.remotes)?;
     // 护栏放在 push 之前：默认分支删掉就没了，不能等服务端心情好才挡
     crate::engine::branch::ensure_deletable_on_remote(&path, &remote, &branch)?;
-    run_git(&path, &["push", &remote, "--delete", &branch])?;
-    Ok(())
+    crate::engine::branch::push_delete(&path, &remote, &branch)
 }
 
 /// 只跑护栏、不删任何东西：删除序列的第一步不可撤销时，先用它确认后面不会被**护栏**拒绝。
-/// push 自身的失败（断网、分支已经不在）它防不了。
+/// push 自身的失败（断网、鉴权）它防不了；远程上分支已经不在则算成功，见
+/// [`crate::engine::branch::push_delete`]。
 ///
 /// 删除顺序是 worktree → 远程 → 本地分支。`git remote add` 接上的远程没有本地的
 /// `origin/HEAD`，弹框勾选框不会灰掉，到远程那一步才被护栏拒绝的话 worktree 已经没了。
