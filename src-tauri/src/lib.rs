@@ -1,6 +1,7 @@
 pub mod build_info;
 pub mod commands;
 pub mod desktop;
+pub mod dev_profile;
 pub mod engine;
 pub mod error;
 pub mod vcs;
@@ -9,25 +10,39 @@ use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // `pnpm tauri dev` 用 `<identifier>.dev`：配置目录、WebView2 数据都与安装版分开，见 dev_profile。
+    // 「dev」按 tauri::is_dev() 认（有没有 custom-protocol），不按 debug_assertions
+    let mut context = tauri::generate_context!();
+    let configured_identifier = context.config().identifier.clone();
+    let identifier = dev_profile::runtime_identifier(&configured_identifier, tauri::is_dev());
+    let seed_from_installed = identifier != configured_identifier;
+    context.config_mut().identifier = identifier;
+
     let builder = tauri::Builder::default();
     // 全局单例：再次启动时唤起已有窗口（关到托盘的也拿出来），自己直接退出。
     // 托盘、全局快捷键、session.json、settings.json 都按「一台机器一个进程」设计，多开会互相覆盖。
     //
     // 必须是第一个插件：第二个实例要在装托盘、注册快捷键之前就退出（官方文档的要求）。
-    // 只在 release 构建注册：插件按 identifier 认实例，`pnpm tauri dev` 与安装版共用
-    // identifier，开着安装版时 dev 会直接唤起安装版然后退出；几个 worktree 同时跑 dev，
-    // 后起的也会悄悄唤起先起的那个。TortoiseSVN 钩子不受影响：main.rs 在进 Tauri 之前就分流了。
+    // dev 不注册：插件按 identifier 认实例，几个 worktree 同时跑 dev 时它们共用
+    // `.dev` 这一个 identifier，后起的会悄悄唤起先起的那个，看到的不是自己的代码。
+    // TortoiseSVN 钩子不受影响：main.rs 在进 Tauri 之前就分流了。
     // 这几条由 tests/single_instance.rs 守着。
     //
-    // 用运行期的 `cfg!` 而不是 `#[cfg(not(debug_assertions))]`：后者让 debug 下的
-    // clippy / cargo test 根本不编译这段，插件升级改了回调签名也要等打 tag 才炸
+    // 用运行期判断而不是 `#[cfg(...)]` 属性：后者让一种构建下的 clippy / cargo test 根本不编译
+    // 这段，插件升级改了回调签名也要等打 tag 才炸
     #[cfg(desktop)]
-    let builder = if cfg!(debug_assertions) {
+    let builder = if tauri::is_dev() {
         builder
     } else {
         builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             desktop::show_main_window(app);
         }))
+    };
+    // dev 首次启动从安装版复制种子。必须是插件：要赶在建窗口、前端读配置之前，见 dev_profile::plugin
+    let builder = if seed_from_installed {
+        builder.plugin(dev_profile::plugin(configured_identifier))
+    } else {
+        builder
     };
     builder
         .plugin(tauri_plugin_dialog::init())
@@ -39,6 +54,7 @@ pub fn run() {
                         .build(),
                 )?;
             }
+            dev_profile::log_seed_outcome(app);
             // tauri.conf.json 里的 "jkk" 只是兜底，带版本的标题只能在运行期设。
             // 标题只是外观，设失败不能让应用起不来，所以不用 `?`
             if let Some(window) = app.get_webview_window("main") {
@@ -154,6 +170,6 @@ pub fn run() {
             commands::worktree::delete_worktree,
             commands::worktree::read_worktrees_cmd,
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running tauri application");
 }

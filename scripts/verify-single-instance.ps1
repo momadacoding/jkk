@@ -2,7 +2,7 @@
 # 实测全局单例：起真实的多个进程，看第二次启动、TortoiseSVN 钩子调用时已有窗口和进程的反应。
 # tests/single_instance.rs 只守装配顺序，两个进程之间的行为只能这样测。
 #
-# 单例只在 release 构建生效（见 src-tauri/src/lib.rs），而且按 identifier 认实例。
+# 单例只对 `tauri build` 的产物生效、`tauri dev` 不开（见 src-tauri/src/lib.rs），而且按 identifier 认实例。
 # 必须换一个 identifier 构建，否则会撞上本机开着的安装版：第二次启动唤起的是安装版的窗口，
 # 也会改写安装版的 session.json。
 #
