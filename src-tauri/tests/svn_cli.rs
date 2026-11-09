@@ -9,8 +9,8 @@
 mod svn_fixtures;
 
 use app_lib::engine::svn_cli::{
-    forget_node_scans, path_dirs_from_reg_output, probe_svn, run_svn, run_svn_code, with_global,
-    with_scan_cache, SvnAvailability,
+    chunk_targets, cmdline_estimate, forget_node_scans, path_dirs_from_reg_output, probe_svn,
+    run_svn, run_svn_code, run_svn_targets, with_global, with_scan_cache, SvnAvailability,
 };
 use svn_fixtures::svn_repo;
 
@@ -209,4 +209,78 @@ fn reg_output_parsing_tolerates_a_missing_value() {
     // 查不到值时 reg 的输出里没有类型标记，必须给出空列表而不是把键名当目录。
     assert!(path_dirs_from_reg_output("ERROR: The system was unable to find").is_empty());
     assert!(path_dirs_from_reg_output("").is_empty());
+}
+
+// ── 多目标批量（计划 2026-11-09 Task 1） ─────────────────────────────────────
+
+fn targets(names: &[&str]) -> Vec<String> {
+    names.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn an_empty_target_list_makes_no_batches() {
+    // svn 不带 target 时作用于当前目录——整个工作副本。空列表必须一批都不切
+    assert!(chunk_targets(&["status", "--"], &[], 100).is_empty());
+}
+
+#[test]
+fn targets_are_cut_into_batches_by_command_line_length() {
+    let t = targets(&["aaaa", "bbbb", "cccc", "dddd", "eeee"]);
+    let head = ["info", "--xml", "--"];
+    let base = cmdline_estimate(&head, &[]);
+    // 每个 target 估 4 + 3 = 7；上限放得下两个
+    let batches = chunk_targets(&head, &t, base + 14);
+    assert_eq!(
+        batches,
+        vec![&t[0..2], &t[2..4], &t[4..5]],
+        "按顺序切、不重排、不丢"
+    );
+    // 上限足够时就一批
+    assert_eq!(chunk_targets(&head, &t, 24000), vec![&t[..]]);
+}
+
+#[test]
+fn a_target_longer_than_the_limit_still_gets_a_batch_of_its_own() {
+    // 切不开的单个 target 照样发出去，交给 svn 报错，而不是被静默丢掉
+    let t = targets(&["short", &"x".repeat(200), "tail"]);
+    let batches = chunk_targets(&["info", "--"], &t, 60);
+    assert_eq!(batches, vec![&t[0..1], &t[1..2], &t[2..3]]);
+}
+
+#[test]
+fn run_svn_targets_with_no_targets_starts_no_process() {
+    // 工作目录不存在：一旦真起了进程就会报 io 错误
+    let out = run_svn_targets("Z:/definitely/not/here", &["status", "--xml", "--"], &[]).unwrap();
+    assert!(out.is_empty());
+}
+
+#[test]
+fn run_svn_targets_returns_one_output_per_batch() {
+    let fx = svn_repo();
+    let wc = fx.wc_str();
+    let out = run_svn_targets(
+        &wc,
+        &["info", "--xml", "--"],
+        &targets(&["Code@", "Code/A.cs@"]),
+    )
+    .unwrap();
+    assert_eq!(out.len(), 1, "两个短 target 一批");
+    assert!(
+        out[0].contains("path=\"Code\"") && out[0].contains("A.cs"),
+        "{}",
+        out[0]
+    );
+}
+
+#[test]
+fn run_svn_targets_fails_when_any_target_fails() {
+    // 与逐个跑时第一个失败就 `?` 相同：不能拿到一半的结果当完整的
+    let fx = svn_repo();
+    let err = run_svn_targets(
+        &fx.wc_str(),
+        &["info", "--xml", "--"],
+        &targets(&["Code@", "Nope@"]),
+    )
+    .expect_err("有一个 target 不存在");
+    assert!(err.message.contains("Nope"), "{}", err.message);
 }

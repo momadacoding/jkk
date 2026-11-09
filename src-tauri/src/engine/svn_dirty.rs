@@ -20,7 +20,7 @@
 //! 判错一条就是一个假基线，而假基线看起来完全正常——这是整套设计里最贵的那类
 //! 错误（§6.8.1）。所以这里对没见过的 item **报错而不是跳过**。
 
-use crate::engine::svn_cli::run_svn;
+use crate::engine::svn_cli::{run_svn, run_svn_targets};
 use crate::engine::svn_scope::WScope;
 use crate::engine::svn_wc::peg_safe;
 use crate::engine::svn_xml::{parse_info_schedules, parse_status_entries, StatusEntry};
@@ -93,25 +93,26 @@ use std::path::Path;
 /// 不该因为一处 obstructed 就让仓库打不开。判定留给各自的调用点。
 pub fn read_dirty(repo_root: &str, targets: &[String]) -> Result<Vec<StatusEntry>> {
     let mut dirty: Vec<StatusEntry> = Vec::new();
-    for target in targets {
-        let arg = peg_safe(target);
-        let xml = run_svn(
-            repo_root,
-            &[
-                "status",
-                // `-v` 是为了**被 `svn delete` 掉的目录**：不带它，`svn status`
-                // 只报目录本身，里面那些服务器上还在的文件一条都拿不到。
-                // 代价是所有干净条目也一并返回，下面按 `normal` + `props=none`
-                // 滤掉；解析一遍的开销远小于漏掉整棵子树。
-                "-v",
-                "--no-ignore",
-                "--ignore-externals",
-                "--xml",
-                "--",
-                &arg,
-            ],
-        )?;
-        for e in parse_status_entries(&xml)? {
+    // 全部 target 一次传（计划 2026-11-09 Task 3），输出是每个 target 一个 `<target>` 块
+    let args: Vec<String> = targets.iter().map(|t| peg_safe(t)).collect();
+    let outputs = run_svn_targets(
+        repo_root,
+        &[
+            "status",
+            // `-v` 是为了**被 `svn delete` 掉的目录**：不带它，`svn status`
+            // 只报目录本身，里面那些服务器上还在的文件一条都拿不到。
+            // 代价是所有干净条目也一并返回，下面按 `normal` + `props=none`
+            // 滤掉；解析一遍的开销远小于漏掉整棵子树。
+            "-v",
+            "--no-ignore",
+            "--ignore-externals",
+            "--xml",
+            "--",
+        ],
+        &args,
+    )?;
+    for xml in &outputs {
+        for e in parse_status_entries(xml)? {
             // `item="external"` 即使带了 `--ignore-externals` 也照样出现（实测），
             // 它不是脏状态。本设计的核心场景就是「代码在 external 里」，把它判脏
             // 会让向导在目标仓库上永远过不去。

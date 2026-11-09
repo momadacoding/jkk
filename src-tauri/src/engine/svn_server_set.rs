@@ -23,14 +23,14 @@
 //! 只在界面上多挂一条说明。误报的代价止于噪音，漏报的代价与改动前相同。
 
 use crate::engine::svn_basemap::BaseMap;
-use crate::engine::svn_cli::run_svn;
+use crate::engine::svn_cli::run_svn_targets;
 use crate::engine::svn_config::{read_config, SvnConfig};
 use crate::engine::svn_dirty::{classify, read_dirty, Fix};
 use crate::engine::svn_include_check::{normalize_roots, server_expected_set};
 use crate::engine::svn_preflight::check_targets;
 use crate::engine::svn_scope::WScope;
 use crate::engine::svn_wc::{enumerate_wcs, WcIdentity};
-use crate::engine::svn_xml::parse_list;
+use crate::engine::svn_xml::parse_lists;
 use crate::error::Result;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -46,6 +46,30 @@ fn dirty_fixes(
 ) -> Result<BTreeMap<String, Fix>> {
     let targets = check_targets(&normalize_roots(&cfg.whitelist), units);
     classify(&read_dirty(repo_root, &targets)?)
+}
+
+/// svn 的报错里点到了哪些单位，按单位顺序拼成一句；一个都认不出时返回 `None`。
+///
+/// 一次列全部单位之后，失败理由不能再像逐个列时那样自带单位名（独立 review 第 5 条）。
+/// svn 对列不出的 target 报 `W160013: Path '/Tools' not found`（实测 M10），路径相对仓库根，
+/// 拿每个单位的 URL 去掉 `<repository><root>` 之后的那段去认。
+fn failing_units(units: &[WcIdentity], stderr: &str) -> Option<String> {
+    let hit: Vec<&str> = units
+        .iter()
+        .filter(|u| {
+            let url = u.url.trim_end_matches('/');
+            let root = u.repos_root.trim_end_matches('/');
+            match url.get(..root.len()) {
+                Some(p) if p.eq_ignore_ascii_case(root) => {
+                    let rel = &url[root.len()..];
+                    !rel.is_empty() && stderr.contains(&format!("'{rel}'"))
+                }
+                _ => false,
+            }
+        })
+        .map(|u| u.wc_root.as_str())
+        .collect();
+    (!hit.is_empty()).then(|| hit.join("、"))
 }
 
 /// 列出来给用户看的上限。再多就只报个数——几千行的清单没人看，还会把界面撑爆。
@@ -120,31 +144,59 @@ fn audit_inner(repo_root: &str, rev: u64, gone: &BTreeSet<String>) -> Result<Ser
     }
     let units = enumerate_wcs(repo_root, &cfg.whitelist)?;
 
-    // 服务器侧集合：每个记账单位各列一次，用它自己的 url(P)。
-    let mut server: BTreeSet<String> = BTreeSet::new();
-    for unit in &units {
-        let unit_url = unit.url.trim_end_matches('/');
-        let target = format!("{unit_url}@{rev}");
-        let xml = match run_svn(repo_root, &["ls", "-R", "--xml", "--", &target]) {
-            Ok(x) => x,
-            Err(e) => {
-                // 一个单位没列成就整体判「没验成」。「其余的都对得上所以 Matched」
-                // 是这条检查最坏的结论——它要防的就是「以为受保护、实际没有」。
-                return Ok(ServerAudit::NotChecked {
-                    reason: format!("列举 `{}` 的服务器内容失败：{}", unit.wc_root, e.message),
-                });
-            }
-        };
-        let listed = match parse_list(&xml) {
-            Ok(l) => l,
+    // 服务器侧集合：每个记账单位用它自己的 url(P) 列，所有单位一次 `svn ls -R`
+    // （计划 2026-11-09 Task 5）。每个 target 一个 `<list>`、按传入顺序（实测 M9），按顺序对回。
+    let targets: Vec<String> = units
+        .iter()
+        .map(|u| format!("{}@{rev}", u.url.trim_end_matches('/')))
+        .collect();
+    let names = || {
+        units
+            .iter()
+            .map(|u| u.wc_root.as_str())
+            .collect::<Vec<_>>()
+            .join("、")
+    };
+    let outputs = match run_svn_targets(repo_root, &["ls", "-R", "--xml", "--"], &targets) {
+        Ok(x) => x,
+        Err(e) => {
+            // 一个单位没列成就整体判「没验成」（svn 对整条命令 exit 1，实测 M10）。
+            // 「其余的都对得上所以 Matched」是这条检查最坏的结论——它要防的就是
+            // 「以为受保护、实际没有」。
+            return Ok(ServerAudit::NotChecked {
+                reason: format!(
+                    "列举 {} 的服务器内容失败：{}",
+                    failing_units(&units, &e.message).unwrap_or_else(names),
+                    e.message
+                ),
+            });
+        }
+    };
+    let mut lists = Vec::new();
+    for xml in &outputs {
+        match parse_lists(xml) {
+            Ok(l) => lists.extend(l),
             // revision 不存在时 svn 把 XML 截断在半路（实测 P2），解析会失败。
             // 这条检查是锦上添花，不该让打开仓库失败——落成 NotChecked。
             Err(e) => {
                 return Ok(ServerAudit::NotChecked {
-                    reason: format!("解析 `{}` 的服务器清单失败：{}", unit.wc_root, e.message),
+                    reason: format!("解析 {} 的服务器清单失败：{}", names(), e.message),
                 })
             }
-        };
+        }
+    }
+    if lists.len() != units.len() {
+        return Ok(ServerAudit::NotChecked {
+            reason: format!(
+                "svn ls 对 {} 个单位返回了 {} 份清单，没法对回各自的目录",
+                units.len(),
+                lists.len()
+            ),
+        });
+    }
+    let mut server: BTreeSet<String> = BTreeSet::new();
+    for (unit, listed) in units.iter().zip(lists) {
+        let unit_url = unit.url.trim_end_matches('/');
         // **单文件记账单位**：白名单条目可以是一个具体文件（设计明确支持，
         // 见 `is_w_file` 的文档）。那时这个单位的 url 直接指向那个文件，
         // 2026-09-16 实测 `svn ls -R --xml <url>/Code/notes.txt@N` 返回：

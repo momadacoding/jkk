@@ -15,7 +15,9 @@
 //! 调用时必须满足「磁盘上白名单内的内容 == 基线树的内容」。spec §6.8.5 列的四个
 //! 时机全部满足它：HEAD 在 `svn/base` 上且工作区干净，或基线树刚从磁盘录出来。
 
-use crate::engine::svn_cli::{run_svn, run_svn_code};
+use crate::engine::svn_cli::{
+    chunk_targets, cmdline_estimate, run_svn, run_svn_code, run_svn_targets, MAX_TARGETS_CMDLINE,
+};
 // W-file 判据原本是本模块的私有函数，Phase 1c 提到 `svn_include_check` 共用，
 // 2026-10-28 再收进 `svn_scope`——`svn_server_set` 等要用**同一套**判据。
 // 两份「什么算 W-file」迟早分叉，而分叉的表现是「每次打开都报几千条漏收」或者
@@ -226,8 +228,8 @@ struct Grouped<'a> {
 /// 尾随 PATH 那批命令的命令行上限（字符数按 UTF-8 字节估，偏保守）。
 ///
 /// Windows 的命令行上限是 32767 个 UTF-16 单元，留出余量给 svn 路径、引号与全局参数。
-/// `svn diff` 没有 `--targets`（分析 §6.4），只能分批。
-pub const MAX_DIFF_CMDLINE: usize = 24000;
+/// `svn diff` 没有 `--targets`（分析 §6.4），只能分批。与多目标批量同一个上限。
+pub const MAX_DIFF_CMDLINE: usize = MAX_TARGETS_CMDLINE;
 
 /// 一条体检用的 `svn diff` 负责哪些结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +251,10 @@ pub struct DiffCommand {
     /// 传给 `run_svn` 的参数（不含 `--non-interactive`，那由 `run_svn` 注入）。
     pub args: Vec<String>,
     pub scope: DiffScope,
+    /// 非空 = 这是一条把多个单元的 floor diff 合在一起的命令（[`plan_diffs_for`]），这里是它
+    /// 替代的逐单元命令。合并命令失败时按顺序改跑它们，失败语义就与改动前相同。
+    /// 合并命令的 `wc_root` 是空串、`unit_url` 是 svnUrl。
+    pub fallback: Vec<DiffCommand>,
 }
 
 /// [`plan_diffs`] 的结果。
@@ -299,6 +305,7 @@ pub fn plan_diffs(
             rev: map.floor,
             args,
             scope: DiffScope::Floor,
+            fallback: Vec::new(),
         });
     }
 
@@ -324,6 +331,7 @@ pub fn plan_diffs(
                 rev: r,
                 args: head[..head.len() - 1].to_vec(),
                 scope: DiffScope::Only(whole.into_iter().map(|(p, _)| p).collect()),
+                fallback: Vec::new(),
             });
         }
         push_batches(&mut commands, u, r, head, pathable, false);
@@ -354,6 +362,154 @@ pub fn plan_diffs(
         commands,
         unaddressable,
     })
+}
+
+/// 同 [`plan_diffs`]，再把 URL 就在 `svn_url` 底下的单元的 floor diff 合成一条
+/// （计划 2026-11-09 Task 4）：
+///
+/// ```text
+/// svn diff --old=<svn_url>@<F> --new=. --summarize --xml [--ignore-properties] -- <wc_root...>
+/// ```
+///
+/// # 为什么
+///
+/// 这一步问服务器。公司机器上 23 个白名单目录逐个比一次跟进要 33.3 s，单目录最长 6.3 s；
+/// 每条命令都要单独起进程、连服务器、认证。
+///
+/// # 为什么结论相同
+///
+/// 实测 M5：`--old=<root>@N --new=. -- Code Tools` 的结果就是逐单元
+/// `--old=<root>/Code@N --new=Code` 结果的并集，同样不下沉进 external；旧 revision 上没有的
+/// 单元报 `added` 而不是失败（M6）。输出路径都是 `<svn_url>/<wc_root>/…`，剥掉 `svn_url`
+/// 就是仓库相对路径。
+///
+/// 只合并：单元的**实际** URL 恰好是「同一个前缀 + `/` + `wc_root`」（逐字节相同，大小写也要
+/// 一致），且这个前缀与 svnUrl 只差大小写；`wc_root` 纯 ASCII（尾随 PATH 走系统代码页，见
+/// [`plan_diffs`]）、不含 `@`（尾随 PATH 的 `@` 是字面字符，`--new=` 那侧怎么解析没实测过，
+/// 不冒险）。嵌套 external 的 URL 在别处，照旧单独比。可合并的不到两个时原样返回。
+///
+/// # 为什么 `--old` 用单元的实际 URL，不用 svnUrl（独立 review 第 1 条）
+///
+/// 前面几道核对（`url_mismatch`、`whitelist_not_under_base`）比 URL 都不分大小写。svnUrl 与
+/// 实际 URL 只差大小写时，大小写敏感的服务器上 `<svnUrl>@F` 根本不存在；按 M6，旧 revision 上
+/// 不存在的目标报 `added` 而不是失败，于是整片白名单被报成差异、判成 Lying，而命令成功了，
+/// 不会退回。改动前逐单元的命令用的是 `u.url`，不受影响，合并命令也必须如此。`wc_root` 与 URL
+/// 末段只差大小写时（白名单写成 `code/`、服务器上是 `Code`）同理不合并：尾随 PATH 会被同时
+/// 接到 `--old` 与 `--new` 两侧。
+///
+/// 合并命令带着它替代的逐单元命令（[`DiffCommand::fallback`]），失败时改跑它们。
+pub fn plan_diffs_for(
+    units: &[WcIdentity],
+    map: &BaseMap,
+    skip: &BTreeSet<String>,
+    excluded: &BTreeSet<String>,
+    svn_url: &str,
+) -> Result<DiffPlan> {
+    let mut plan = plan_diffs(units, map, skip, excluded)?;
+    let base = svn_url.trim_end_matches('/');
+
+    // `plan_diffs` 的前 `units.len()` 条就是逐单元的 floor 命令，与 `units` 同序。这层约定
+    // 只在本文件里成立，这里逐条核对一次（独立 review 第 3 条）：对不上就不合并，宁可慢
+    let aligned = plan.commands.len() >= units.len()
+        && units.iter().zip(&plan.commands).all(|(u, c)| {
+            c.wc_root == u.wc_root
+                && c.scope == DiffScope::Floor
+                && c.fallback.is_empty()
+                && !c.args.iter().any(|a| a == "--")
+        });
+    if !aligned {
+        return Ok(plan);
+    }
+
+    // 每个单元的实际 URL 去掉末尾的 `/<wc_root>`（逐字节匹配）就是它的前缀；不满足条件的为 None
+    let prefix_of = |u: &WcIdentity| -> Option<String> {
+        let root = u.wc_root.trim_end_matches('/');
+        if root.is_empty() || !root.is_ascii() || root.contains('@') {
+            return None;
+        }
+        let url = u.url.trim_end_matches('/');
+        let prefix = url.strip_suffix(root)?.strip_suffix('/')?;
+        prefix
+            .eq_ignore_ascii_case(base)
+            .then(|| prefix.to_string())
+    };
+    let prefixes: Vec<Option<String>> = units.iter().map(prefix_of).collect();
+    // 只合并与第一个可合并单元同一前缀的：前缀不同（写法不一致）的照旧单独比
+    let Some(real_base) = prefixes.iter().flatten().next().cloned() else {
+        return Ok(plan);
+    };
+    let mergeable: Vec<bool> = prefixes
+        .iter()
+        .map(|p| p.as_deref() == Some(real_base.as_str()))
+        .collect();
+    if mergeable.iter().filter(|&&m| m).count() < 2 {
+        return Ok(plan);
+    }
+
+    let rest = plan.commands.split_off(units.len());
+    let floor_cmds = std::mem::take(&mut plan.commands);
+    let mut roots: Vec<String> = Vec::new();
+    let mut replaced: Vec<DiffCommand> = Vec::new();
+    let mut kept: Vec<DiffCommand> = Vec::new();
+    for ((u, cmd), m) in units.iter().zip(floor_cmds).zip(&mergeable) {
+        if *m {
+            roots.push(u.wc_root.trim_end_matches('/').to_string());
+            replaced.push(cmd);
+        } else {
+            kept.push(cmd);
+        }
+    }
+
+    let old = format!("--old={real_base}@{}", map.floor);
+    let mut head: Vec<&str> = vec!["diff", &old, "--new=.", "--summarize", "--xml"];
+    if !map.is_single() {
+        head.push("--ignore-properties");
+    }
+    head.push("--");
+    let mut commands = Vec::new();
+    let mut replaced = replaced.into_iter();
+    for batch in chunk_targets(&head, &roots, MAX_DIFF_CMDLINE) {
+        let mut args: Vec<String> = head.iter().map(|a| a.to_string()).collect();
+        args.extend(batch.iter().cloned());
+        commands.push(DiffCommand {
+            wc_root: String::new(),
+            unit_url: real_base.clone(),
+            rev: map.floor,
+            args,
+            scope: DiffScope::Floor,
+            fallback: replaced.by_ref().take(batch.len()).collect(),
+        });
+    }
+    commands.extend(kept);
+    commands.extend(rest);
+    plan.commands = commands;
+    Ok(plan)
+}
+
+/// svn 的失败是不是「整台服务器都够不着」：连不上、认证失败、仓库打不开、网络超时。
+///
+/// 合并命令失败时，这类失败退回逐单元也只会在第一条上再失败一次（合并的单元都在同一个 URL
+/// 前缀下），白等一轮超时（独立 review 第 2 条）。别的失败（某个单元的路径不对之类）才退回。
+/// 只认错误码：svn 的提示语会本地化。认错了的代价是退回时多跑一条，不会改变结论。
+pub fn server_unreachable(stderr: &str) -> bool {
+    const CODES: &[&str] = &[
+        "E170013", // Unable to connect to a repository at URL
+        "E170001", // Authorization failed
+        "E215004", // No more credentials or we tried too many times
+        "E175002", // 连接 / DAV 请求失败
+        "E175012", // Connection timed out
+        "E180001", // Unable to open an ra_local session（file:// 仓库不在了）
+        "E210002", // svnserve 网络连接被关闭
+        "E670002", // 域名解析失败
+        "E670008", // 域名解析失败
+        "E730054", // WSAECONNRESET
+        "E730060", // WSAETIMEDOUT
+        "E730061", // WSAECONNREFUSED
+        "E731001", // No such host is known
+    ];
+    crate::engine::svn_tombstone::error_codes(stderr)
+        .iter()
+        .any(|c| CODES.contains(&c.as_str()))
 }
 
 /// 尾随 PATH 那类命令的固定前缀，最后一个参数是 `--`。
@@ -393,6 +549,7 @@ fn push_batches(
             } else {
                 DiffScope::Only(std::mem::take(set))
             },
+            fallback: Vec::new(),
         });
         set.clear();
     };
@@ -411,9 +568,9 @@ fn push_batches(
     }
 }
 
-/// 命令行长度的保守估计：每个参数按字节数 + 两个引号 + 一个空格。
+/// 命令行长度的保守估计，口径见 [`cmdline_estimate`]。
 fn cmdline_len(args: &[String]) -> usize {
-    "svn --non-interactive".len() + args.iter().map(|a| a.len() + 3).sum::<usize>()
+    cmdline_estimate(&[], args)
 }
 
 /// 仓库相对路径归哪个单元：取最长的 `wc_root` 前缀（嵌套 external 比外层更具体）。
@@ -466,10 +623,14 @@ fn server_url_at(units: &[WcIdentity], p: &str, rev: u64) -> Option<String> {
 fn excluded_nodes(repo_root: &str, units: &[WcIdentity]) -> Result<BTreeMap<String, String>> {
     fault::hit(Point::ExcludedScan)?;
     let mut out = BTreeMap::new();
-    for u in units {
-        // info 的 target 必须过 peg_safe（与 diff 的尾随 PATH 相反，见 `svn_wc::peg_safe`）
-        let arg = crate::engine::svn_wc::peg_safe(&u.wc_root);
-        let xml = run_svn(repo_root, &["info", "-R", "--xml", "--", &arg])?;
+    // info 的 target 必须过 peg_safe（与 diff 的尾随 PATH 相反，见 `svn_wc::peg_safe`）。
+    // 全部单元一次传（计划 2026-11-09 Task 3）：输出是各单元递归结果的拼接（实测 M4）。
+    // 公司机器上逐单元跑一次跟进要 22.9 s
+    let args: Vec<String> = units
+        .iter()
+        .map(|u| crate::engine::svn_wc::peg_safe(&u.wc_root))
+        .collect();
+    for xml in run_svn_targets(repo_root, &["info", "-R", "--xml", "--"], &args)? {
         for (p, kind) in parse_excluded_nodes(&xml)? {
             out.insert(p, kind);
         }
@@ -527,10 +688,12 @@ fn excluded_files_at_floor(
 fn repo_rel_of(path: &str, cmd: &DiffCommand, prefix: &str) -> std::result::Result<String, String> {
     fault::hit(Point::DiffPath).map_err(|e| e.message)?;
     // 单文件白名单条目：`--new` 就是那个文件本身，svn 打出来的路径恰好
-    // 等于 `unit_url`，没有尾随的子路径可剥。
-    if path
-        .trim_end_matches('/')
-        .eq_ignore_ascii_case(&cmd.unit_url)
+    // 等于 `unit_url`，没有尾随的子路径可剥。合并命令里单文件条目的路径是
+    // `<svnUrl>/<文件>`，走下面的通则；它的 `unit_url` 是 svnUrl（一个目录），不会命中这里
+    if !cmd.wc_root.is_empty()
+        && path
+            .trim_end_matches('/')
+            .eq_ignore_ascii_case(&cmd.unit_url)
     {
         return Ok(cmd.wc_root.clone());
     }
@@ -545,6 +708,8 @@ fn repo_rel_of(path: &str, cmd: &DiffCommand, prefix: &str) -> std::result::Resu
     // 输出是 URL：空格是 `%20`、中文是 `%XX` 序列、`%` 是 `%25`。
     // 不解码的话，这类路径既对不上 S，报给用户的也是编码后的样子
     match decode_url(&sub) {
+        // 合并命令（`wc_root` 为空）的前缀就是 svnUrl，剥完就是仓库相对路径
+        Some(d) if cmd.wc_root.is_empty() => Ok(d),
         Some(d) => Ok(format!("{}/{}", cmd.wc_root, d)),
         None => Err(format!(
             "svn diff 输出里的路径 `{path}` 不是合法的百分号编码，没法还原成\
@@ -663,7 +828,10 @@ fn check_grouped(
         BTreeMap::new()
     };
     let excluded_paths: BTreeSet<String> = excluded.keys().cloned().collect();
-    let plan = match plan_diffs(&units, map, &skip, &excluded_paths) {
+    let DiffPlan {
+        commands,
+        unaddressable,
+    } = match plan_diffs_for(&units, map, &skip, &excluded_paths, base) {
         Ok(p) => p,
         Err(e) => return not_checked(e.message),
     };
@@ -681,8 +849,12 @@ fn check_grouped(
             .collect();
         known.into_iter().collect()
     };
-    for (i, cmd) in plan.commands.iter().enumerate() {
-        let args: Vec<&str> = cmd.args.iter().map(String::as_str).collect();
+    // 合并命令失败时把它替代的逐单元命令插回队头（`DiffCommand::fallback`）
+    let mut queue: std::collections::VecDeque<DiffCommand> = commands.into();
+    // 已经跑成的命令数。改动前按下标判「第一条」；失败即返回，所以下标为 0 ⇔ 一条都还没跑成，
+    // 合并命令失败退回之后按这个数判，逐单元那几条的失败语义与改动前相同
+    let mut ran = 0usize;
+    while let Some(cmd) = queue.pop_front() {
         // 命令失败一律落到 NotChecked，**不能**当成「没有差异」。
         //
         // 不能用「解析得出来就算成功」：2026-09-14 实测，URL 不可达时 svn 仍然
@@ -694,25 +866,52 @@ fn check_grouped(
         //
         // 例外是录制时的第二条起（见 `incomplete`）：第一条就失败时（通常是断网）什么都不知道，
         // 离线录制照旧放行；后面失败时前面的结果已经摆在这里了。
-        let point = if i == 0 {
+        let point = if ran == 0 {
             Point::FirstDiff
         } else {
             Point::LaterDiff
         };
-        let xml = match fault::hit(point).and_then(|()| run_svn(repo_root, &args)) {
+        let merged = !cmd.fallback.is_empty();
+        let result = {
+            let args: Vec<&str> = cmd.args.iter().map(String::as_str).collect();
+            fault::hit(point)
+                .and_then(|()| {
+                    if merged {
+                        fault::hit(Point::MergedDiff)
+                    } else {
+                        Ok(())
+                    }
+                })
+                .and_then(|()| run_svn(repo_root, &args))
+        };
+        let xml = match result {
             Ok(x) => x,
+            // 不拿合并命令的失败下结论：一个单元的问题（比如磁盘上没了，实测 M7）会让整条
+            // 失败，按逐单元跑才知道是哪一个、前面那几个比出了什么。服务器整个够不着时例外：
+            // 合并的单元都在同一个 URL 前缀下，退回只会在第一条上再等一轮超时
+            Err(e) if merged && !server_unreachable(&e.message) => {
+                for f in cmd.fallback.into_iter().rev() {
+                    queue.push_front(f);
+                }
+                continue;
+            }
             Err(e) => {
-                let reason = format!(
-                    "比对 `{}`（r{}）时失败：{}",
-                    cmd.wc_root, cmd.rev, e.message
-                );
-                return if i == 0 {
+                let what = if cmd.wc_root.is_empty() {
+                    let roots: Vec<&str> =
+                        cmd.fallback.iter().map(|f| f.wc_root.as_str()).collect();
+                    roots.join("、")
+                } else {
+                    cmd.wc_root.clone()
+                };
+                let reason = format!("比对 `{what}`（r{}）时失败：{}", cmd.rev, e.message);
+                return if ran == 0 {
                     not_checked(reason)
                 } else {
                     incomplete(deleted_so_far(&diffs), reason)
                 };
             }
         };
+        ran += 1;
 
         let prefix = format!("{}/", cmd.unit_url);
         for entry in parse_diff_summary(&xml)? {
@@ -725,7 +924,7 @@ fn check_grouped(
             if entry.item == "none" {
                 continue;
             }
-            let repo_rel = match repo_rel_of(&entry.path, cmd, &prefix) {
+            let repo_rel = match repo_rel_of(&entry.path, &cmd, &prefix) {
                 Ok(p) => p,
                 Err(reason) => return incomplete(deleted_so_far(&diffs), reason),
             };
@@ -819,7 +1018,7 @@ fn check_grouped(
 
         // D8：点不了名的被排除节点，列出它在 floor 上的内容，按 W-file 口径筛。筛出来的与
         // 点得了名的走同一条确认；一个 W-file 都没有的不阻断
-        for p in &plan.unaddressable {
+        for p in &unaddressable {
             let kind = excluded.get(p).map(String::as_str);
             let listed = match excluded_files_at_floor(repo_root, &units, p, kind, map.floor) {
                 Ok(l) => l,
@@ -952,16 +1151,28 @@ fn whitelist_not_under_base(
     base: &str,
     roots: &[String],
 ) -> Result<Option<String>> {
-    for root in roots {
-        let arg = crate::engine::svn_wc::peg_safe(root);
-        // 单个 target 一条命令：白名单通常只有个位数条目，而且这是降级路径不是热路径
-        let xml = match run_svn(repo_root, &["info", "--xml", "--", &arg]) {
-            Ok(x) => x,
-            Err(e) => return Ok(Some(e.message)),
-        };
-        let Some(entry) = crate::engine::svn_xml::parse_info(&xml)?.into_iter().next() else {
-            return Ok(Some(format!("svn info 对白名单根 `{root}` 没有输出")));
-        };
+    // 全部白名单根一次传（计划 2026-11-09 Task 3）。每次体检都要过这一步，公司机器上白名单
+    // 有 23 个目录，逐个跑约 1.25 s。entry 按传入顺序对回（实测 M1）
+    let args: Vec<String> = roots
+        .iter()
+        .map(|r| crate::engine::svn_wc::peg_safe(r))
+        .collect();
+    let outputs = match run_svn_targets(repo_root, &["info", "--xml", "--"], &args) {
+        Ok(x) => x,
+        Err(e) => return Ok(Some(e.message)),
+    };
+    let mut entries = Vec::new();
+    for xml in &outputs {
+        entries.extend(crate::engine::svn_xml::parse_info(xml)?);
+    }
+    if entries.len() != roots.len() {
+        return Ok(Some(format!(
+            "svn info 对 {} 个白名单根返回了 {} 条结果，没法对回各自的目录",
+            roots.len(),
+            entries.len()
+        )));
+    }
+    for (root, entry) in roots.iter().zip(entries) {
         let actual = entry.url.trim_end_matches('/');
         let expected = format!("{base}/{root}");
         if !actual.eq_ignore_ascii_case(&expected) {

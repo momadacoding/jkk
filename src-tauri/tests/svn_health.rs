@@ -12,8 +12,8 @@ mod svn_fixtures;
 use app_lib::engine::svn_basemap::BaseMap;
 use app_lib::engine::svn_cli::run_svn;
 use app_lib::engine::svn_health::{
-    check_baseline, check_baseline_map, plan_diffs, DiffScope, ExplainedOrigin, Health, HealthMap,
-    MAX_DIFF_CMDLINE,
+    check_baseline, check_baseline_map, plan_diffs, plan_diffs_for, server_unreachable, DiffScope,
+    ExplainedOrigin, Health, HealthMap, MAX_DIFF_CMDLINE,
 };
 use app_lib::engine::svn_nodes::{compute_map, read_node_status};
 use app_lib::engine::svn_scope::WScope;
@@ -1170,4 +1170,194 @@ fn non_ascii_excluded_directory_with_a_code_file_is_refused_file_by_file() {
             files: vec!["Code/中文目录/b.cs".to_string()]
         }
     );
+}
+
+// ---------------------------------------------------------------------------
+// 计划 2026-11-09 Task 4：URL 就在 svnUrl 底下的单元，floor diff 合成一条
+// ---------------------------------------------------------------------------
+
+/// [`svn_repo_for_health`] 再加一个白名单根 `Tools/T.cs`，停在 r2。
+fn two_roots() -> SvnFixture {
+    let fx = svn_repo_for_health();
+    let wc = fx.wc();
+    std::fs::create_dir_all(wc.join("Tools")).unwrap();
+    std::fs::write(wc.join("Tools/T.cs"), "t1\n").unwrap();
+    svn_cmd(&wc, &["add", "Tools", "--non-interactive"]);
+    svn_cmd(&wc, &["commit", "-m", "r2", "--non-interactive"]);
+    svn_cmd(&wc, &["update", "--non-interactive"]);
+    fx
+}
+
+fn check_roots(fx: &SvnFixture, roots: &[&str], rev: u64) -> Health {
+    check_baseline(
+        &fx.wc_str(),
+        &repo_url(fx),
+        rev,
+        &WScope::plain(&wl(roots), &cs()),
+        &nothing_explained(),
+        ExplainedOrigin::Unknown,
+    )
+    .unwrap()
+}
+
+#[test]
+fn floor_diffs_of_roots_under_the_svn_url_go_out_as_one_command() {
+    let fx = two_roots();
+    let url = repo_url(&fx);
+    let us = enumerate_wcs(&fx.wc_str(), &wl(&["Code/", "Tools/"])).unwrap();
+    let map = BaseMap::single(us[0].repos_root.clone(), us[0].uuid.clone(), 2);
+    let legacy = plan_diffs(&us, &map, &BTreeSet::new(), &BTreeSet::new()).unwrap();
+    let plan = plan_diffs_for(&us, &map, &BTreeSet::new(), &BTreeSet::new(), &url).unwrap();
+    assert_eq!(plan.commands.len(), 1, "{plan:?}");
+    let m = &plan.commands[0];
+    assert_eq!(
+        m.args,
+        [
+            "diff".to_string(),
+            format!("--old={url}@2"),
+            "--new=.".to_string(),
+            "--summarize".to_string(),
+            "--xml".to_string(),
+            "--".to_string(),
+            "Code".to_string(),
+            "Tools".to_string(),
+        ]
+    );
+    assert_eq!(m.scope, DiffScope::Floor);
+    // 合并命令失败时退回的，就是改动前每个单元那一条
+    assert_eq!(m.fallback, legacy.commands);
+
+    // 只有一个单元：不合并，与改动前逐字相同
+    let one = units(&fx);
+    let p1 = plan_diffs_for(&one, &map, &BTreeSet::new(), &BTreeSet::new(), &url).unwrap();
+    assert_eq!(
+        p1,
+        plan_diffs(&one, &map, &BTreeSet::new(), &BTreeSet::new()).unwrap()
+    );
+}
+
+#[test]
+fn the_merged_floor_diff_uses_the_real_url_not_the_configured_spelling() {
+    // 独立 review 第 1 条：前面的核对比 URL 不分大小写。svnUrl 只差大小写时，大小写敏感的
+    // 服务器上 `<svnUrl>@F` 不存在，按 M6 整片报 `added`、判成 Lying，命令还是成功的
+    let fx = two_roots();
+    let url = repo_url(&fx);
+    let us = enumerate_wcs(&fx.wc_str(), &wl(&["Code/", "Tools/"])).unwrap();
+    let map = BaseMap::single(us[0].repos_root.clone(), us[0].uuid.clone(), 2);
+    let shouty = url.to_uppercase();
+    assert_ne!(shouty, url, "前提：URL 里有小写字母");
+    let plan = plan_diffs_for(&us, &map, &BTreeSet::new(), &BTreeSet::new(), &shouty).unwrap();
+    assert_eq!(plan.commands.len(), 1, "{plan:?}");
+    assert_eq!(plan.commands[0].args[1], format!("--old={url}@2"));
+    assert_eq!(plan.commands[0].unit_url, url);
+}
+
+#[test]
+fn server_unreachable_is_judged_by_error_code_only() {
+    assert!(server_unreachable(
+        "svn: E170013: Unable to connect to a repository at URL 'https://x/svn'\n\
+         svn: E731001: No such host is known."
+    ));
+    assert!(server_unreachable("svn: E215004: 认证失败次数过多"));
+    // 某个目标的问题：退回逐单元才知道是哪一个
+    assert!(!server_unreachable(
+        "svn: E155010: The node 'C:\\wc\\Nope' was not found."
+    ));
+    assert!(!server_unreachable("测试注入的失败：MergedDiff"));
+    assert!(!server_unreachable(""));
+}
+
+#[test]
+fn an_unreachable_server_fails_the_merged_diff_without_falling_back() {
+    // 独立 review 第 2 条：服务器整个够不着时退回逐单元只会在第一条上再等一轮超时。
+    // 理由里点到的是合并命令的全部根（退回的话会是第一条退回命令的 `Code`）
+    let fx = two_roots();
+    std::fs::remove_dir_all(fx.repo()).unwrap();
+    match check_roots(&fx, &["Code/", "Tools/"], 2) {
+        Health::NotChecked { reason } => {
+            assert!(reason.contains("`Code、Tools`"), "{reason}")
+        }
+        other => panic!("服务器不在时不能下结论，实际 {other:?}"),
+    }
+}
+
+#[test]
+fn a_nested_external_keeps_its_own_floor_diff() {
+    // external 的 URL 不在 `<svnUrl>/<wc_root>`，合并命令的 `--old=<svnUrl>` 那侧根本没有这个
+    // 节点（diff 也不下沉进 external，实测 M5），必须照旧用自己的 URL 单独比
+    let fx = svn_repo_with_same_repo_nested_external(NestedExternal::Clean);
+    let wc = fx.wc();
+    std::fs::create_dir_all(wc.join("Tools")).unwrap();
+    std::fs::write(wc.join("Tools/T.cs"), "t1\n").unwrap();
+    svn_cmd(&wc, &["add", "Tools", "--non-interactive"]);
+    svn_cmd(&wc, &["commit", "-m", "r3 add T.cs", "--non-interactive"]);
+    svn_cmd(&wc, &["update", "--non-interactive"]);
+    let url = file_url(&fx.repo());
+    let us = enumerate_wcs(&fx.wc_str(), &wl(&["Code/", "Tools/"])).unwrap();
+    assert_eq!(us.len(), 3, "前提：Code、Code/Vendor、Tools：{us:?}");
+    let rev = 3;
+    let map = BaseMap::single(us[0].repos_root.clone(), us[0].uuid.clone(), rev);
+    let plan = plan_diffs_for(&us, &map, &BTreeSet::new(), &BTreeSet::new(), &url).unwrap();
+    assert_eq!(plan.commands.len(), 2, "{plan:?}");
+    assert_eq!(
+        plan.commands[0].args[6..],
+        ["Code".to_string(), "Tools".to_string()]
+    );
+    let vendor = &plan.commands[1];
+    assert_eq!(vendor.wc_root, "Code/Vendor");
+    assert!(vendor.fallback.is_empty());
+    assert!(vendor.args[1].contains("/vendor@3"), "{vendor:?}");
+
+    // 结论：干净时 Verified；external 里改脏时照样抓得到
+    let roots = ["Code/", "Tools/"];
+    assert!(matches!(
+        check_roots(&fx, &roots, rev),
+        Health::Verified { .. }
+    ));
+    std::fs::write(wc.join("Code/Vendor/V.cs"), "LOCAL\n").unwrap();
+    std::fs::write(wc.join("Tools/T.cs"), "LOCAL\n").unwrap();
+    assert_eq!(
+        lying_files(&check_roots(&fx, &roots, rev)),
+        ["Code/Vendor/V.cs", "Tools/T.cs"]
+    );
+}
+
+#[test]
+fn a_merged_floor_diff_reports_the_same_files_as_one_diff_per_root() {
+    let fx = two_roots();
+    assert!(matches!(
+        check_roots(&fx, &["Code/", "Tools/"], 2),
+        Health::Verified { .. }
+    ));
+    std::fs::write(fx.wc().join("Code/A.cs"), "LOCAL\n").unwrap();
+    std::fs::write(fx.wc().join("Tools/T.cs"), "LOCAL\n").unwrap();
+    assert_eq!(
+        lying_files(&check_roots(&fx, &["Code/", "Tools/"], 2)),
+        ["Code/A.cs", "Tools/T.cs"]
+    );
+    // 单文件白名单条目混在合并命令里：输出路径就是 `<svnUrl>/Code/A.cs`，还原成仓库相对路径
+    assert_eq!(
+        lying_files(&check_roots(&fx, &["Code/A.cs", "Tools/"], 2)),
+        ["Code/A.cs", "Tools/T.cs"]
+    );
+}
+
+#[test]
+fn a_failed_merged_diff_falls_back_to_one_diff_per_root() {
+    // 合并命令失败时退回逐单元：失败语义（第一条失败 = NotChecked、比对开始后失败 =
+    // Unconfirmed）按逐单元的那几条算，与改动前相同
+    let fx = two_roots();
+    std::fs::write(fx.wc().join("Tools/T.cs"), "LOCAL\n").unwrap();
+    {
+        let _armed = fault::arm(Point::MergedDiff);
+        assert_eq!(
+            lying_files(&check_roots(&fx, &["Code/", "Tools/"], 2)),
+            ["Tools/T.cs"]
+        );
+    }
+    let _armed = fault::arm(Point::FirstDiff);
+    assert!(matches!(
+        check_roots(&fx, &["Code/", "Tools/"], 2),
+        Health::NotChecked { .. }
+    ));
 }
