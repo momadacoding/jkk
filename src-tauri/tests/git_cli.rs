@@ -31,7 +31,7 @@ fn repo_with_commit() -> TempDir {
 fn git_command_disables_terminal_prompt() {
     // GUI 里没人能回答 git 的 "Username:" 提示，子进程会永久挂死。
     // 这个变量是唯一的防线，改动 git_cli 时不能把它弄丢。
-    let cmd = git_cli::git_command(".");
+    let cmd = git_cli::git_command(".").unwrap();
     let envs: Vec<_> = cmd.get_envs().collect();
     let prompt = envs
         .iter()
