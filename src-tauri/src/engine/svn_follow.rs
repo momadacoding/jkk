@@ -215,15 +215,9 @@ pub enum Evidence {
 }
 
 /// 外部 git 的版本够不够。解析不了按不够：宁可让用户看一眼版本，也不要发布到一半才失败。
+/// 解析与全局那道检查共用 `git_cli::parse_git_version`，两边对同一段输出不会得出不同结论。
 pub fn git_version_ok(text: &str) -> bool {
-    let Some(rest) = text.trim().strip_prefix("git version ") else {
-        return false;
-    };
-    let mut parts = rest.split('.').map(|p| p.parse::<u32>());
-    match (parts.next(), parts.next()) {
-        (Some(Ok(major)), Some(Ok(minor))) => (major, minor) >= MIN_GIT,
-        _ => false,
-    }
+    crate::engine::git_cli::parse_git_version(text).is_some_and(|v| (v.0, v.1) >= MIN_GIT)
 }
 
 /// 跟进一次：判定为 ExternallyAdvanced 时走 F1–F6，InSync 而分支落后时走「分支跟进」入口。
