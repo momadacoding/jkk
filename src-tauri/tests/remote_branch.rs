@@ -174,6 +174,77 @@ fn delete_remote_ref_removes_the_branch_from_the_remote() {
     assert!(git_out(work.path(), &["ls-remote", "--heads", "origin", "feat/x"]).is_empty());
 }
 
+/// 本地跟踪 ref 还在，但远程上的分支已经被别人删掉了（GitHub 的
+/// `deleteBranchOnMerge` 在 PR 合并时自动删 head 分支，本地没 `fetch --prune`）。
+///
+/// 用户要的是「远程上没有这条分支」，这已经是事实，不能报错——删除序列里前面的
+/// worktree 已经删掉了，报错只会让用户以为出了事。过期的跟踪 ref 要顺手删掉，
+/// 否则侧边栏会一直挂着一条不存在的 `origin/feat/x`，删除弹框也会再次提议删它。
+#[test]
+fn deleting_a_remote_branch_that_is_already_gone_succeeds_and_drops_the_stale_ref() {
+    let (remote, work) = cloned_repo();
+    run_git(remote.path(), &["branch", "-D", "feat/x"]);
+    assert!(!git_out(work.path(), &["for-each-ref", "refs/remotes/origin/feat/x"]).is_empty());
+
+    ops::delete_remote_ref(p(&work), "origin/feat/x".into()).unwrap();
+
+    assert!(git_out(work.path(), &["for-each-ref", "refs/remotes/origin/feat/x"]).is_empty());
+}
+
+/// 自定义 fetch refspec 把 origin 的分支映射到 `refs/remotes/mirror/*`：要删的是映射出来
+/// 的那条，硬编码出来的 `refs/remotes/origin/feat/x` 此时不归 origin 管，不能动。
+#[test]
+fn the_stale_ref_is_found_through_the_remotes_fetch_refspec() {
+    let (remote, work) = cloned_repo();
+    run_git(
+        work.path(),
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/mirror/*",
+        ],
+    );
+    run_git(
+        work.path(),
+        &["update-ref", "refs/remotes/mirror/feat/x", "origin/feat/x"],
+    );
+    run_git(remote.path(), &["branch", "-D", "feat/x"]);
+
+    ops::delete_remote_branch(p(&work), "origin".into(), "feat/x".into()).unwrap();
+
+    assert!(git_out(work.path(), &["for-each-ref", "refs/remotes/mirror/feat/x"]).is_empty());
+    assert!(!git_out(work.path(), &["for-each-ref", "refs/remotes/origin/feat/x"]).is_empty());
+}
+
+/// 同上，走删除弹框用的那个入口（按远程名 + 分支名）。
+#[test]
+fn delete_remote_branch_also_tolerates_a_branch_that_is_already_gone() {
+    let (remote, work) = cloned_repo();
+    run_git(remote.path(), &["branch", "-D", "feat/x"]);
+
+    ops::delete_remote_branch(p(&work), "origin".into(), "feat/x".into()).unwrap();
+
+    assert!(git_out(work.path(), &["for-each-ref", "refs/remotes/origin/feat/x"]).is_empty());
+}
+
+/// 「已经不在」只认远程明确说没有这条分支。远程仓库没了（本地路径被挪走）时 push
+/// 同样失败，但那时没有证据说分支不在——必须照常报错，也不能把本地跟踪 ref 删掉，
+/// 那会把「没删成」伪装成「删掉了」。
+///
+/// 只覆盖本地路径这一种失败形态；ssh / https 的网络、鉴权报错形态不同，靠
+/// `only_says_remote_ref_is_gone` 的白名单兜底（认不出的行一律当失败）。
+#[test]
+fn a_missing_remote_repo_is_still_an_error_and_keeps_the_tracking_ref() {
+    let (remote, work) = cloned_repo();
+
+    let result = with_remote_moved_away(&remote, || {
+        ops::delete_remote_branch(p(&work), "origin".into(), "feat/x".into())
+    });
+
+    assert!(result.is_err());
+    assert!(!git_out(work.path(), &["for-each-ref", "refs/remotes/origin/feat/x"]).is_empty());
+}
+
 /// 远程的默认分支一律不给删，push 都不发出去。
 ///
 /// 这是算错要删哪条分支时的最后一道护栏，不能把安全性外包给服务端：GitHub 会
@@ -416,6 +487,44 @@ fn has_branch(bare: &TempDir, name: &str) -> bool {
 
 fn delete_on_origin(work: &TempDir, branch: &str) -> app_lib::error::Result<()> {
     ops::delete_remote_branch(p(work), "origin".into(), branch.into())
+}
+
+/// 两个 pushurl：一处已经没有这条分支，另一处连不上。push 的 stderr 里会有
+/// 「remote ref does not exist」，但另一处根本没删成，不能当成功。
+#[test]
+fn a_gone_branch_on_one_push_url_does_not_hide_a_failure_on_another() {
+    let (_fetch_side, work) = cloned_repo();
+    let gone_side = bare_repo_with_default(&work, "trunk");
+    run_git(gone_side.path(), &["branch", "-D", "feat/x"]);
+    add_push_url(&work, &p(&gone_side));
+    let missing = TempDir::new().unwrap();
+    add_push_url(&work, &missing.path().join("nowhere").to_string_lossy());
+
+    let err = delete_on_origin(&work, "feat/x").expect_err("连不上的那处没删成，却报了成功");
+
+    // 确认真的走到了「一处说不在」这个形态，而不是在别处就失败了
+    assert!(
+        err.message.contains("remote ref does not exist"),
+        "{}",
+        err.message
+    );
+    assert!(!git_out(work.path(), &["for-each-ref", "refs/remotes/origin/feat/x"]).is_empty());
+}
+
+/// 两个 pushurl：一处已经没有，另一处删成功了。终态是两处都没有，算成功。
+#[test]
+fn a_gone_branch_on_one_push_url_and_a_delete_on_another_is_a_success() {
+    let (_fetch_side, work) = cloned_repo();
+    let gone_side = bare_repo_with_default(&work, "trunk");
+    run_git(gone_side.path(), &["branch", "-D", "feat/x"]);
+    let live_side = bare_repo_with_default(&work, "trunk");
+    add_push_url(&work, &p(&gone_side));
+    add_push_url(&work, &p(&live_side));
+
+    delete_on_origin(&work, "feat/x").unwrap();
+
+    assert!(!has_branch(&live_side, "feat/x"));
+    assert!(git_out(work.path(), &["for-each-ref", "refs/remotes/origin/feat/x"]).is_empty());
 }
 
 /// push 走 pushurl 时，护栏要看 **push 到达的那个仓库**。
