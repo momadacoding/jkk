@@ -278,6 +278,11 @@ const NOT_GIT_ONLY: &[(&str, &str, &str)] = &[
     ("diff.rs", "*", "只读"),
     ("graph.rs", "*", "只读"),
     ("tree.rs", "*", "只读"),
+    (
+        "history.rs",
+        "*",
+        "只读：文件历史 / Blame / 单文件 diff，混合仓库看的是 git 这边的历史",
+    ),
     ("repo.rs", "*", "只读：打开仓库、读能力"),
     ("watch.rs", "*", "文件监听，不写仓库"),
     (

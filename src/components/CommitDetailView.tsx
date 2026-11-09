@@ -3,7 +3,9 @@ import { invoke } from '@tauri-apps/api/core'
 import { Panel, Group, Separator } from 'react-resizable-panels'
 import { PANEL_GROUP_IDS } from '@/engine/layoutMemory'
 import { usePanelLayout } from '@/store/layoutStore'
-import type { CommitNode, DiffData } from '../engine/types'
+import type { CommitNode, DiffData, FileStatus } from '../engine/types'
+import { historyTargetForCommit, type FileHistoryTarget } from '@/engine/fileHistory'
+import { fileHistoryItems } from './fileHistoryItems'
 import { buildFileTree } from '../engine/fileTree'
 import { deliveredNote, svnDiffGap } from '../engine/svnGraph'
 import { DiffView } from './DiffView'
@@ -42,8 +44,10 @@ interface CommitDetailViewProps {
    * 只认 `commit:` / `range:`；null 或别的值时右键菜单里没有对比项。
    */
   diffScope?: string | null
-  /** 外部 diff 工具的菜单项；不传时文件树没有右键菜单。 */
+  /** 外部 diff 工具的菜单项。 */
   externalTools?: ExternalToolsMenu
+  /** 文件右键菜单里的「File History」「Blame」；不传时没有这两项。两者都不传时文件没有右键菜单。 */
+  onOpenFileHistory?: (target: FileHistoryTarget) => void
 }
 
 /** 信息条上的分支一栏；三个标签页和 svn 节点共用，换标签页时不该消失。 */
@@ -77,7 +81,7 @@ function CommitHeader({ commit, branch }: { commit: CommitNode; branch?: string 
 }
 
 export function CommitDetailView({
-  commit, diff, repoPath, onSelectCommit, backTo, branch, diffScope = null, externalTools,
+  commit, diff, repoPath, onSelectCommit, backTo, branch, diffScope = null, externalTools, onOpenFileHistory,
 }: CommitDetailViewProps) {
   const [tab, setTab] = useState<Tab>('commit')
   const [picked, setPicked] = useState<string | null>(null)
@@ -92,12 +96,29 @@ export function CommitDetailView({
   // 读失败时 files 是空的：不说明的话就成了「这个提交没有改动」（第 72 条）
   const failedNote = diff?.error ? `读取改动失败：${diff.error}` : null
 
-  // 改动列表里的文件右键：两侧由 diff scope 决定，改名时左边用旧路径
+  // 文件历史 / Blame 从这个提交出发；svn 节点按它的本地基线提交算，见 `historyTargetForCommit`
+  const historyItems = (path: string, status: FileStatus | null) =>
+    commit
+      ? fileHistoryItems(onOpenFileHistory, (tab) => historyTargetForCommit(path, commit, status, tab))
+      : []
+
+  // 改动列表里的文件右键：外部 diff 的两侧由 diff scope 决定，改名时左边用旧路径
   const fileContextMenu = (path: string, e: React.MouseEvent) => {
-    const oldPath = files.find((f) => f.path === path)?.oldPath ?? null
-    const target = diffTargetFromScope(diffScope, path, oldPath)
-    if (!externalTools || !target) return
-    open(e, externalDiffItems(externalTools, target))
+    const file = files.find((f) => f.path === path)
+    const target = diffTargetFromScope(diffScope, path, file?.oldPath ?? null)
+    const items = [
+      ...historyItems(path, file?.status ?? null),
+      ...(externalTools && target ? externalDiffItems(externalTools, target) : []),
+    ]
+    if (items.length === 0) return
+    open(e, items)
+  }
+
+  // File Tree 里的文件都在这个提交里，不会是删除
+  const treeContextMenu = (path: string, e: React.MouseEvent) => {
+    const items = historyItems(path, null)
+    if (items.length === 0) return
+    open(e, items)
   }
 
   const fileStats = useMemo(
@@ -296,6 +317,7 @@ export function CommitDetailView({
                     selectedPath={picked}
                     onSelect={setPicked}
                     defaultOpen={false}
+                    onContextMenu={treeContextMenu}
                   />
                 </>
               )}
@@ -306,6 +328,7 @@ export function CommitDetailView({
               <FileContentView repoPath={repoPath} rev={commit.id} path={picked} />
             </Panel>
           </Group>
+          <ContextMenu menu={menu} onClose={close} />
         </div>
       )}
     </div>

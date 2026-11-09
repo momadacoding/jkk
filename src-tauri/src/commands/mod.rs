@@ -4,6 +4,7 @@ pub mod custom;
 pub mod diff;
 pub mod external;
 pub mod graph;
+pub mod history;
 pub mod ops;
 pub mod pr;
 pub mod remote;

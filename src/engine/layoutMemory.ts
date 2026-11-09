@@ -42,6 +42,8 @@ export const PANEL_GROUP_IDS = {
   commitChanges: 'mygitclient.layout.commit-changes.v1',
   /** 提交详情 File Tree 页的 文件树 | 文件内容 */
   commitTree: 'mygitclient.layout.commit-tree.v1',
+  /** 文件历史视图的 提交列表 | diff */
+  fileHistory: 'mygitclient.layout.file-history.v1',
 } as const
 
 export type PanelGroupId = (typeof PANEL_GROUP_IDS)[keyof typeof PANEL_GROUP_IDS]
