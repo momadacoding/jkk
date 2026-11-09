@@ -137,7 +137,7 @@ pub fn path_attrs(repo: &str, paths: &[&str]) -> Result<HashMap<String, PathAttr
     )?;
     // 输出是 `<path>\0<attr>\0<value>\0` 的三元组
     let fields: Vec<&str> = text.split('\0').collect();
-    for triple in fields.chunks_exact(3) {
+    for triple in fields.as_chunks::<3>().0 {
         let entry: &mut PathAttrs = out.entry(triple[0].to_string()).or_default();
         match triple[1] {
             "merge" => entry.merge = triple[2].to_string(),

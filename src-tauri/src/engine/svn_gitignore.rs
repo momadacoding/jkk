@@ -235,7 +235,7 @@ fn verdict_batch(
     )?;
     let parts: Vec<&str> = stdout.split('\0').collect();
     let mut answered = 0;
-    for c in parts.chunks_exact(4) {
+    for c in parts.as_chunks::<4>().0 {
         // 答案按输入顺序一条对一条；对不上就不再往后数，第一个没对上的当成出事的那个
         if files.get(answered) == Some(&c[3]) {
             answered += 1;

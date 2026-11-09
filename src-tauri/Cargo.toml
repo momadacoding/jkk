@@ -6,7 +6,8 @@ authors = ["you"]
 license = ""
 repository = ""
 edition = "2021"
-rust-version = "1.77.2"
+# Tauri 2.12 起的 MSRV
+rust-version = "1.90"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -15,13 +16,18 @@ name = "app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2.6.3", features = [] }
+# 2.7 起静态链接 VC 运行库改由 tauri.conf.json 的 build.windows.staticVCRuntime 决定、默认开：
+# 安装包与以前一样是静态的（CLI 以前就设 STATIC_VCRUNTIME=true），变化只在裸 cargo build / test
+# 现在也静态链接——测试都是在这个状态下跑通的
+tauri-build = { version = "2.7.4", features = [] }
 
 [dependencies]
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
-tauri = { version = "2.11.3", features = ["tray-icon"] }
+# 2.12 起 tauri-runtime-wry 依赖 tao 0.37：修掉收到 WM_ENDSESSION（MSI 升级时的
+# Restart Manager、关机、注销）后在 tao runner 里 panic、退出码 101 的问题（tao issue 1310）
+tauri = { version = "2.12.5", features = ["tray-icon"] }
 tauri-plugin-log = "2"
 git2 = "0.20"
 notify = "7"
@@ -31,7 +37,7 @@ tauri-plugin-dialog = "2.7.2"
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-global-shortcut = "2.3.2"
 # 全局单例：再次启动时唤起已有窗口而不是多开。托盘、全局快捷键、session.json、
-# settings.json 都按「一台机器一个进程」设计，多开会互相覆盖。只在 release 构建注册，见 lib.rs
+# settings.json 都按「一台机器一个进程」设计，多开会互相覆盖。只对 tauri build 的产物注册（tauri dev 不开），见 lib.rs
 tauri-plugin-single-instance = "2.4.5"
 
 # svn 的 --xml 输出必须用真 parser 解析：`<wc-status` 与 `revision="…"` 不在同一行
@@ -41,14 +47,14 @@ tauri-plugin-single-instance = "2.4.5"
 # 选 roxmltree 而非 quick-xml：我们只读不写，DOM 查询能直接表达「取 <wc-status> 的
 # revision 而不是内层 <commit> 的」，不必手写嵌套状态机——取错那一层正是 spec
 # §6.6.4 陷阱二记录的永久误报。0.21 的依赖只有 memchr（已在树里），
-# rust-version 1.60，低于本 crate 声明的 1.77.2。
+# rust-version 1.60，低于本 crate 声明的 MSRV。
 roxmltree = "0.21"
 
 # 删 worktree 撞上「文件被占用」时，用 Restart Manager 查出到底是哪个进程占着。
 # 这个 crate 本来就在依赖树里（tao → tauri），这里只是显式声明并打开需要的
 # feature，不会新增下载。非 Windows 平台不引入。
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61", features = [
+windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_System_RestartManager",
   # TortoiseSVN 钩子：读写 HKCU\Software\TortoiseSVN\hooks（C1h 计划 Task 1）

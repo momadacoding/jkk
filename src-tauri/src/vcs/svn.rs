@@ -28,11 +28,10 @@ pub struct SvnGitBackend {
     ///
     /// Phase 1a 只在 `open()` 里用它做校验，字段本身还没有读者——Phase 1b 的
     /// 状态判定、基线与体检都要用。现在就持有是为了不在 1b 改构造函数签名。
-    ///
-    /// 用裸 `#[allow(dead_code)]` 而不是带 `reason = "…"`：后者需要 Rust 1.81，
-    /// 而 `Cargo.toml` 声明的 `rust-version` 是 1.77.2，用它等于悄悄抬高 MSRV。
-    /// `AGENTS.md` §7.3 要求的「必须说明理由」由上面这段注释满足。
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "Phase 1b 的状态判定、基线与体检要读；现在持有是为了不改构造函数签名"
+    )]
     config: SvnConfig,
     /// 工作目录根。`GitBackend` 自己也存了一份，但那个字段是私有的、没有访问器，
     /// 而同步锁守卫（spec §5.1）每个写方法都要用它，所以这里自己留一份。

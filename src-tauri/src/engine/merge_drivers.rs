@@ -203,7 +203,7 @@ fn compute(repo: &str, cfg: &MergeConfig) -> Result<DriverReport> {
     }
     // 输出是 `<path>\0merge\0<value>\0` 的三元组
     let fields: Vec<&str> = attrs.split('\0').collect();
-    for triple in fields.chunks_exact(3) {
+    for triple in fields.as_chunks::<3>().0 {
         let (path, value) = (triple[0], triple[2]);
         let name = match value {
             "unspecified" => match default_custom {

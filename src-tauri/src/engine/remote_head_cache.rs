@@ -72,7 +72,7 @@ impl State {
     /// 记下一次成功的查询。预取和预检可能同时在路上，后回来的不一定是后发出的，
     /// 按发出时刻取新，不能拿旧答案盖掉新答案。
     fn remember(&mut self, started: Instant, value: String) {
-        if self.last.as_ref().map_or(true, |p| p.started < started) {
+        if self.last.as_ref().is_none_or(|p| p.started < started) {
             self.last = Some(Prefetched { started, value });
         }
     }
