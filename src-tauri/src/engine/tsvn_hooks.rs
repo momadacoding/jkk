@@ -71,7 +71,9 @@ pub struct RegPlan {
 pub fn parse_hooks(value: &str) -> Vec<HookEntry> {
     let lines: Vec<&str> = value.split('\n').collect();
     lines
-        .chunks_exact(6)
+        .as_chunks::<6>()
+        .0
+        .iter()
         .map(|c| HookEntry {
             kind: c[0].strip_suffix("_hook").unwrap_or(c[0]).to_string(),
             wc_path: c[1].to_string(),

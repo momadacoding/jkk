@@ -56,7 +56,7 @@ impl FollowMark {
     /// oid 以后要进 git 命令行，坏文件里的值不能往下传。
     fn is_well_formed(&self) -> bool {
         is_oid(&self.head_oid)
-            && self.base_oid.as_deref().map_or(true, is_oid)
+            && self.base_oid.as_deref().is_none_or(is_oid)
             && self.staged.values().all(|v| is_oid(v))
     }
 }

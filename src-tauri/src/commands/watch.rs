@@ -230,7 +230,7 @@ fn own_write_verdict(key: &str, index: &Path, since: Instant) -> OwnVerdict {
         match m.get(key) {
             None => return OwnVerdict::NotOwn,
             Some(w) if w.running > 0 => return OwnVerdict::Pending,
-            Some(w) if w.started.map_or(true, |s| since < s) => return OwnVerdict::NotOwn,
+            Some(w) if w.started.is_none_or(|s| since < s) => return OwnVerdict::NotOwn,
             Some(w) => w.stamp.clone(),
         }
     };

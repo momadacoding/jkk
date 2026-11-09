@@ -530,7 +530,7 @@ fn diff_to_data(diff: git2::Diff) -> Result<DiffData> {
 pub(crate) fn diff_to_data_only(diff: git2::Diff, exact: Option<&str>) -> Result<DiffData> {
     let mut files: Vec<FileDiff> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
-    let wanted = |path: &str| exact.map_or(true, |e| e == path);
+    let wanted = |path: &str| exact.is_none_or(|e| e == path);
 
     for delta in diff.deltas() {
         let path = delta_path(&delta);

@@ -937,7 +937,7 @@ impl Who {
             staged_before_mark: Some(false),
         };
         match (commit, update) {
-            (Some(c), u) if u.map_or(true, |u| u.revision <= c.revision) => {
+            (Some(c), u) if u.is_none_or(|u| u.revision <= c.revision) => {
                 if !self.committed_after_mark(c) {
                     return uncertain;
                 }
