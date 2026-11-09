@@ -15,6 +15,7 @@ import {
   type FollowOutcome,
   type FollowReport,
   type Leak,
+  type ReportItem,
 } from '@/engine/svnFollow'
 import type { SyncInOutcome } from '@/engine/svnSyncIn'
 
@@ -100,6 +101,9 @@ const leak: Leak = {
   hunks: [{ oldStart: 3, lines: 1, verdict: 'unknown' }],
 }
 
+/** 只比路径：附注另有用例。 */
+const texts = (items: ReportItem[]) => items.map((i) => i.text)
+
 describe('describeFollowReport', () => {
   const section = (r: FollowReport, id: string) =>
     describeFollowReport(r).sections.find((s) => s.id === id)
@@ -108,11 +112,10 @@ describe('describeFollowReport', () => {
     return [
       m.title,
       m.summary,
-      m.warning ?? '',
       ...m.sections.flatMap((s) => [
         s.title,
         s.note ?? '',
-        ...s.groups.flatMap((g) => [g.label, ...g.items]),
+        ...s.groups.flatMap((g) => [g.label, ...g.items.flatMap((i) => [i.text, i.meta ?? ''])]),
       ]),
     ].join('\n')
   }
@@ -133,8 +136,12 @@ describe('describeFollowReport', () => {
     )!.groups
 
     expect(groups.map((g) => g.label)).toEqual(['li', 'zhang', '（没有作者）', '已在 SVN 上删除'])
-    expect(groups[1].items).toEqual(['Code/B.cs  r12', 'Code/C.cs  r12'])
-    expect(groups[3].items).toEqual(['Code/Gone.cs'])
+    // 路径与 revision 分开：路径对齐，revision 退到一边
+    expect(groups[1].items).toEqual([
+      { text: 'Code/B.cs', meta: 'r12' },
+      { text: 'Code/C.cs', meta: 'r12' },
+    ])
+    expect(groups[3].items).toEqual([{ text: 'Code/Gone.cs' }])
   })
 
   it('uncertain stages are listed with a keep note', () => {
@@ -142,7 +149,9 @@ describe('describeFollowReport', () => {
       { ...report, stage: { ...report.stage, uncertain: ['Code/U.cs'] } },
       'uncertain',
     )!
-    expect(s.groups[0].items).toEqual(['Code/U.cs'])
+    expect(texts(s.groups[0].items)).toEqual(['Code/U.cs'])
+    // 只要确认，不是红色告警
+    expect(s.level).toBe('attention')
     expect(s.note).toContain('保留')
     expect(describeFollowReport({ ...report, stage: { ...report.stage, uncertain: ['x'] } }).tone).toBe(
       'attention',
@@ -152,11 +161,11 @@ describe('describeFollowReport', () => {
   it('leaks are shown as a warning section', () => {
     const m = describeFollowReport({ ...report, leaks: [leak] })
     const s = m.sections.find((x) => x.id === 'leaks')!
-    expect(s.warn).toBe(true)
+    expect(s.level).toBe('danger')
     expect(s.note).toContain('Local-Only')
-    expect(s.groups[0].items[0]).toContain('Code/L.cs')
-    expect(s.groups[0].items[0]).toContain('work')
-    expect(s.groups[0].items[0]).toContain('加日志')
+    expect(s.groups[0].items[0].text).toBe('Code/L.cs')
+    expect(s.groups[0].items[0].meta).toContain('work')
+    expect(s.groups[0].items[0].meta).toContain('加日志')
     expect(m.tone).toBe('attention')
   })
 
@@ -165,8 +174,8 @@ describe('describeFollowReport', () => {
     const m = describeFollowReport({ ...report, leaks: [sure, leak] })
     const s = m.sections.find((x) => x.id === 'leaks')!
     expect(s.groups.map((g) => g.label)).toEqual(['这些改动已确认在 SVN 上', '拿不准'])
-    expect(s.groups[0].items[0]).toContain('Code/S.cs')
-    expect(s.groups[1].items[0]).toContain('Code/L.cs')
+    expect(s.groups[0].items[0].text).toBe('Code/S.cs')
+    expect(s.groups[1].items[0].text).toBe('Code/L.cs')
     expect(s.note).toContain('不影响这次跟进')
     expect(s.note).toContain('其他分支')
     expect(s.note).not.toContain('请检查')
@@ -197,12 +206,63 @@ describe('describeFollowReport', () => {
     expect(m.sections.map((s) => s.id)).toEqual(['leaks', 'lost', 'changes'])
   })
 
+  it('先 danger、再 attention、最后 info', () => {
+    const m = describeFollowReport({
+      ...report,
+      changes: [{ path: 'Code/A.cs', rev: 2, author: 'zhang' }],
+      movedBranches: ['feature'],
+      behindBranches: [['old', '有冲突']],
+      snapshot: [['f'.repeat(40), ['Code/B.cs']]],
+      stage: { ...report.stage, uncertain: ['Code/U.cs'] },
+      drift: ['Code/D.cs'],
+    })
+    expect(m.sections.map((s) => s.id)).toEqual([
+      'drift',
+      'uncertain',
+      'snapshot',
+      'behind',
+      'changes',
+      'moved',
+    ])
+  })
+
+  it('标题写出要处理几项：有 danger 说「需要处理」，只有 attention 说「请确认」', () => {
+    const confirm = describeFollowReport({ ...report, behindBranches: [['old', '有冲突']] })
+    expect(confirm.title).toBe('跟进完成，有 1 项请确认')
+    expect(confirm.level).toBe('attention')
+    expect(confirm.todo).toBe(1)
+
+    // 没体检本身也算一项，而且是 danger
+    const handle = describeFollowReport({
+      ...report,
+      verified: false,
+      behindBranches: [['old', '有冲突']],
+    })
+    expect(handle.title).toBe('跟进完成，有 2 项需要处理')
+    expect(handle.level).toBe('danger')
+
+    // 只是告知的节不算
+    const info = describeFollowReport({ ...report, movedBranches: ['feature'] })
+    expect(info.title).toBe('跟进完成')
+    expect(info.level).toBe('ok')
+    expect(info.todo).toBe(0)
+  })
+
+  it('摘要带上一起移动的分支数，「工作区没改」单独一行', () => {
+    const m = describeFollowReport({
+      ...report,
+      changes: [{ path: 'Code/A.cs', rev: 3, author: 'zhang' }],
+      movedBranches: ['a', 'b'],
+    })
+    expect(m.summary).toBe('跟进了 1 个文件，2 条分支一起移动，基线最低在 r3。')
+    expect(m.safe).toBe('工作区里的文件没有改动')
+  })
+
   it('干净完成只是告知，没发生的节一个都不渲染', () => {
     const m = describeFollowReport(report)
     expect(m.tone).toBe('ok')
     expect(m.title).toBe('跟进完成')
     expect(m.sections).toEqual([])
-    expect(m.warning).toBeUndefined()
     expect(m.summary).toContain('r3')
   })
 
@@ -215,8 +275,8 @@ describe('describeFollowReport', () => {
       },
       'lost',
     )!
-    expect(s.warn).toBe(true)
-    expect(s.groups[0].items).toEqual(['Code/A.cs'])
+    expect(s.level).toBe('danger')
+    expect(texts(s.groups[0].items)).toEqual(['Code/A.cs'])
     expect(s.note).toContain('refs/mygitclient/follow/op9')
     expect(s.note).toContain('git show refs/mygitclient/follow/op9:blobs/')
   })
@@ -241,10 +301,20 @@ describe('describeFollowReport', () => {
   })
 
   it('离线没验证要明确提示：基线照样发布了', () => {
-    const m = describeFollowReport({ ...report, verified: false })
+    const m = describeFollowReport({
+      ...report,
+      verified: false,
+      changes: [{ path: 'Code/A.cs', rev: 2, author: 'zhang' }],
+      drift: ['Code/D.cs'],
+    })
     expect(m.tone).toBe('attention')
-    expect(m.warning).toContain('服务器')
-    expect(m.warning).toContain('体检')
+    // 是一节 danger，而且排在最前：整份报告的前提有问题
+    const s = m.sections[0]
+    expect(s.id).toBe('unverified')
+    expect(s.level).toBe('danger')
+    expect(s.note).toContain('服务器')
+    expect(s.note).toContain('体检')
+    expect(m.sections.map((x) => x.id)).toEqual(['unverified', 'drift', 'changes'])
   })
 
   it('合并的暂存只列三方合并过的路径', () => {
@@ -263,7 +333,7 @@ describe('describeFollowReport', () => {
       },
       'merged',
     )!
-    expect(s.groups[0].items).toEqual(['Code/A.cs'])
+    expect(texts(s.groups[0].items)).toEqual(['Code/A.cs'])
   })
 
   it('丢弃的 commit 与换成 SVN 版本的路径', () => {
@@ -272,10 +342,10 @@ describe('describeFollowReport', () => {
       dropped: ['d'.repeat(40)],
       rewritten: [['e'.repeat(40), ['Code/A.cs', 'Code/B.cs']]],
     }
-    expect(section(r, 'dropped')!.groups[0].items).toEqual(['d'.repeat(10)])
+    expect(texts(section(r, 'dropped')!.groups[0].items)).toEqual(['d'.repeat(10)])
     const rewritten = section(r, 'rewritten')!.groups[0]
     expect(rewritten.label).toContain('e'.repeat(10))
-    expect(rewritten.items).toEqual(['Code/A.cs', 'Code/B.cs'])
+    expect(texts(rewritten.items)).toEqual(['Code/A.cs', 'Code/B.cs'])
     // 这两节只是告知
     expect(describeFollowReport(r).tone).toBe('ok')
   })
@@ -283,9 +353,10 @@ describe('describeFollowReport', () => {
   it('6.10：快照进来的 SVN 内容单独成节，要用户看一眼', () => {
     const r: FollowReport = { ...report, snapshot: [['f'.repeat(40), ['Code/B.cs']]] }
     const s = section(r, 'snapshot')!
-    expect(s.warn).toBe(false)
+    // 会让图标变黄，节本身也得是黄的、排在文件清单前面（以前是灰的、排在后面）
+    expect(s.level).toBe('attention')
     expect(s.groups[0].label).toContain('f'.repeat(10))
-    expect(s.groups[0].items).toEqual(['Code/B.cs'])
+    expect(texts(s.groups[0].items)).toEqual(['Code/B.cs'])
     expect(s.note).toContain('逐字节相同')
     expect(s.note).toContain('有意')
     // 可能把用户故意停住的旧版本换掉了：不能只是「完成」
@@ -300,8 +371,8 @@ describe('describeFollowReport', () => {
     }
     const m = describeFollowReport(r)
     const s = section(r, 'drift')!
-    expect(s.warn).toBe(true)
-    expect(s.groups[0].items).toEqual(['Code/A.cs'])
+    expect(s.level).toBe('danger')
+    expect(texts(s.groups[0].items)).toEqual(['Code/A.cs'])
     expect(s.note).toContain('磁盘')
     expect(m.tone).toBe('attention')
     expect(m.sections.findIndex((x) => x.id === 'drift')).toBeLessThan(
@@ -322,8 +393,10 @@ describe('describeFollowReport', () => {
       movedBranches: ['feature'],
       behindBranches: [['old', '重放 abc 时冲突']],
     }
-    expect(section(r, 'moved')!.groups[0].items).toEqual(['feature'])
-    expect(section(r, 'behind')!.groups[0].items).toEqual(['old：重放 abc 时冲突'])
+    expect(section(r, 'moved')!.level).toBe('info')
+    expect(texts(section(r, 'moved')!.groups[0].items)).toEqual(['feature'])
+    expect(section(r, 'behind')!.level).toBe('attention')
+    expect(section(r, 'behind')!.groups[0].items).toEqual([{ text: 'old', meta: '重放 abc 时冲突' }])
     expect(describeFollowReport(r).tone).toBe('attention')
     expect(describeFollowReport({ ...report, movedBranches: ['feature'] }).tone).toBe('ok')
   })
@@ -334,9 +407,12 @@ describe('describeFollowReport', () => {
       rev: 2,
       author: 'zhang',
     }))
-    const items = section({ ...report, changes }, 'changes')!.groups[0].items
+    const s = section({ ...report, changes }, 'changes')!
+    const items = s.groups[0].items
     expect(items).toHaveLength(201)
-    expect(items.at(-1)).toContain('5')
+    expect(items.at(-1)).toEqual({ text: '…还有 5 个', more: true })
+    // 条数是截断之前的
+    expect(s.count).toBe(205)
   })
 
   it('文案里不能带 Markdown 记号（按纯文本渲染）', () => {

@@ -1150,26 +1150,291 @@ body {
   border-color: #4fc3f7;
 }
 
-/* 跟进报告：节多，放在一个滚动区里。说明已在 .deliver-files 的缩进里，不再缩一次 */
-.follow-report {
-  max-height: 50vh;
+/* ---------- 跟进报告（FollowReportDialog） ---------- */
+
+/*
+ * 结构：头部（结果 + 摘要 + 不变的保证）→「需要你留意」→「这次跟进做了什么」→ 页脚（判定依据、用户名）。
+ * 只有 .dialog 自己滚：以前报告区另有一条滚动条，长报告时两条叠在一起。
+ * 正文不缩进到图标下面：路径很长，54px 的缩进会让它多折一行。
+ */
+.follow-dialog {
+  width: 640px;
+  gap: 12px;
 }
 
-.follow-report .dlg-note,
-.follow-report .dlg-warning {
+.follow-safe {
+  margin-top: 4px;
+  color: #81c784;
+  font-size: 12px;
+}
+
+.follow-zone {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.follow-zone-title {
+  color: #9aa0a6;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+/* 一节一张卡片，左边框的颜色就是轻重：红要处理、琥珀要确认、灰只是告知 */
+.follow-section {
+  padding: 7px 10px 8px;
+  background: #262626;
+  border: 1px solid #363636;
+  border-left: 3px solid #5a5a5a;
+  border-radius: 3px;
+}
+
+.follow-section.danger {
+  background: rgba(229, 115, 115, 0.07);
+  border-left-color: #e57373;
+}
+
+.follow-section.attention {
+  background: rgba(255, 183, 77, 0.06);
+  border-left-color: #ffb74d;
+}
+
+.follow-section > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+}
+
+.follow-section > summary::-webkit-details-marker {
+  display: none;
+}
+
+/* 折叠三角：原生的那个在 WebView2 里是黑色的，深色底上看不见 */
+.follow-section > summary::before {
+  content: '';
+  flex: none;
+  width: 0;
+  height: 0;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  border-left: 5px solid #8a8a8a;
+  transition: transform 0.12s;
+}
+
+.follow-section[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.follow-section > summary:focus-visible {
+  outline: 2px solid #4fc3f7;
+  outline-offset: 2px;
+}
+
+.follow-section-title {
+  color: #e6e6e6;
+  font-weight: 600;
+}
+
+.follow-section.danger .follow-section-title {
+  color: #f1a7a7;
+}
+
+.follow-section.attention .follow-section-title {
+  color: #ffcc80;
+}
+
+.follow-count {
+  min-width: 18px;
+  padding: 0 6px;
+  border-radius: 8px;
+  background: #3a3a3a;
+  color: #bbb;
+  font-size: 11px;
+  line-height: 16px;
+  text-align: center;
+}
+
+.follow-mark {
+  margin-left: auto;
+  font-size: 11px;
+}
+
+.follow-section.danger .follow-count {
+  background: rgba(229, 115, 115, 0.2);
+  color: #f1a7a7;
+}
+
+.follow-section.danger .follow-mark {
+  color: #e57373;
+}
+
+.follow-section.attention .follow-count {
+  background: rgba(255, 183, 77, 0.18);
+  color: #ffcc80;
+}
+
+.follow-section.attention .follow-mark {
+  color: #ffb74d;
+}
+
+/* 要留意的节，说明就是「该怎么办」，用正文颜色；只是告知的退成灰色 */
+.follow-note {
+  margin-top: 5px;
+  color: #cfcfcf;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.follow-section.info .follow-note {
+  color: #9aa0a6;
+}
+
+.follow-group {
+  margin-top: 6px;
+}
+
+.follow-group-label {
+  margin-bottom: 2px;
+  color: #9aa0a6;
+  font-size: 11px;
+}
+
+.follow-items {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.follow-items li {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 1px 0 1px 10px;
+}
+
+.follow-items li:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+/* 只有路径用等宽字体：标题、作者、附注都是给人读的 */
+.follow-path {
+  flex: 1;
+  min-width: 0;
+  color: #ddd;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  /* 路径可能很长：任意位置断行，不撑出横向滚动条 */
+  overflow-wrap: anywhere;
+}
+
+.follow-meta {
+  flex: 0 1 auto;
+  max-width: 45%;
+  color: #8a8a8a;
+  font-size: 11px;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.follow-items li.more .follow-path {
+  color: #8a8a8a;
+  font-family: inherit;
+}
+
+.follow-more {
+  margin: 4px 0 0 10px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  color: #4fc3f7;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.follow-more:hover {
+  text-decoration: underline;
+}
+
+.follow-more:focus-visible {
+  outline: 2px solid #4fc3f7;
+  outline-offset: 2px;
+}
+
+.follow-footer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid #3a3a3a;
+}
+
+.follow-basis {
+  color: #7e848a;
+  font-size: 11px;
+}
+
+.follow-footer .dlg-warning {
   margin-left: 0;
-  font-family: system-ui, -apple-system, sans-serif;
 }
 
-/* 「我的 SVN 用户名」一行：输入框占满，按钮跟在后面 */
+/* 「我的 SVN 用户名」：标签 → 一句用途 → 输入框 + 按钮 */
 .follow-user {
   display: flex;
-  gap: 8px;
-  margin: 4px 0 0 54px;
+  flex-direction: column;
+  gap: 4px;
 }
 
-.follow-user input {
+.follow-user-label {
+  color: #ddd;
+  font-weight: 600;
+}
+
+.follow-user-hint {
+  color: #9aa0a6;
+  line-height: 1.5;
+}
+
+.follow-user-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.follow-user-row input {
   flex: 1;
+  min-width: 0;
+}
+
+.follow-user-row input::placeholder {
+  color: #6a6a6a;
+}
+
+/* 与 .dialog-actions 的次按钮同一套外观：浏览器默认的白按钮在深色框里很扎眼 */
+.follow-user-row button {
+  min-width: 64px;
+  padding: 4px 12px;
+  background: #3a3a3a;
+  border: 1px solid #555;
+  border-radius: 3px;
+  color: var(--fg);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.follow-user-row button:hover {
+  background: #464646;
+}
+
+.follow-user-row button:focus-visible {
+  outline: 2px solid #4fc3f7;
+  outline-offset: 2px;
+}
+
+.follow-user-saved {
+  color: #81c784;
 }
 
 /* ---------- 文件内容（File Tree 右侧，只读） ---------- */
