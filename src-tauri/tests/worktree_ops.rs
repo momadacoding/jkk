@@ -821,6 +821,74 @@ fn a_worktree_whose_directory_is_gone_can_still_be_deleted() {
     assert!(!slot.join("worktree").exists(), "丢了的工作树变不出来");
 }
 
+/// 把 worktree 弄成「删了一半」：目录还在，`.git` 文件和其余内容都没了，只剩
+/// `leftovers` 里的文件。实测形态：Windows 上 worktree remove 栽在中途，留下空目录，
+/// `git worktree list` 标 `prunable gitdir file points to non-existent location`。
+fn half_remove(wt: &std::path::Path, leftovers: &[&str]) {
+    fs::remove_dir_all(wt).unwrap();
+    fs::create_dir_all(wt).unwrap();
+    for name in leftovers {
+        fs::write(wt.join(name), "leftover").unwrap();
+    }
+    assert!(!wt.join(".git").exists(), "前提没造对：.git 还在");
+}
+
+/// 删了一半的 worktree 不能被当成主工作区拒掉。
+///
+/// 目录里没有 `.git`，git 在里面会一路往上找到主仓库，`--absolute-git-dir` 和
+/// `--git-common-dir` 都是主仓库的 `.git`，原先的主工作区判据因此误报
+/// `worktree_is_main`。主仓库特意弄脏：要是修复后还在那个目录里跑 status，拿到的
+/// 是主仓库的脏状态，这一条会以 `worktree_dirty` 红掉。
+#[test]
+fn a_half_removed_worktree_is_not_mistaken_for_the_main_one() {
+    let (_dir, wt) = repo_with_worktree("half");
+    let main = main_of(&wt);
+    fs::write(main.join("dirty.txt"), "main is dirty").unwrap();
+    half_remove(&wt, &[]);
+
+    let deleted = delete(&main, &wt, false);
+
+    assert!(
+        !git_out(&main, &["worktree", "list"]).contains("half"),
+        "登记该清掉，branch -D 不再被挡"
+    );
+    run_git(&main, &["branch", "-D", "half"]);
+    assert!(!wt.exists(), "空目录该一起挪走");
+    let slot = std::path::Path::new(&deleted.trash_path);
+    assert!(slot.join("admin").exists(), "管理目录该进回收站");
+    assert!(slot.join("worktree").is_dir(), "残留目录该进回收站");
+    // 主仓库原样
+    assert!(main.join(".git").is_dir(), "主仓库的 .git 被动了");
+    assert!(main.join("dirty.txt").exists());
+}
+
+/// 删了一半、但目录里还剩东西：git 没法判断那些东西要不要，按「坏了的 worktree」
+/// 要求确认（`worktree_broken` → 界面升级成「仍要删除」），确认后整个进回收站。
+#[test]
+fn a_half_removed_worktree_with_leftovers_needs_force() {
+    let (_dir, wt) = repo_with_worktree("half");
+    let main = main_of(&wt);
+    half_remove(&wt, &["notes.txt"]);
+
+    let err = try_delete(&main, &wt, false);
+    assert_eq!(err.code, "worktree_broken", "{}", err.message);
+    assert!(wt.join("notes.txt").exists(), "没确认就动了残留");
+    assert!(
+        git_out(&main, &["worktree", "list"]).contains("half"),
+        "没确认就动了登记"
+    );
+
+    let deleted = delete(&main, &wt, true);
+
+    let slot = std::path::Path::new(&deleted.trash_path);
+    assert!(
+        slot.join("worktree").join("notes.txt").exists(),
+        "残留内容该进回收站，不是被抹掉"
+    );
+    assert!(slot.join("admin").exists());
+    assert!(!git_out(&main, &["worktree", "list"]).contains("half"));
+}
+
 /// 同一目录可以有两种拼写：8.3 短名（`RUNNER~1`）和长名。CI runner 的 %TEMP%
 /// 就带短名，上面那个「目录已丢」的用例曾在那里红过——登记反查是精确匹配，
 /// 别名拼写必须**拒绝**（over-refusal 是安全方向，绝不猜着去搬别人的登记）；
