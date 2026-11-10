@@ -251,6 +251,10 @@ cd src-tauri
 cargo test
 ```
 
+`tests/` 下每个文件都单独编成一个测试二进制，每个都要 link 一次。为了不让并行 link 吃光内存，仓库做了两处限制：
+`.cargo/config.toml` 把并行数限在 8（需要满速时用 `cargo test -j 16`）；`Cargo.toml` 的 dev profile 只保留行号表，依赖不带 debug 信息。
+要用调试器看局部变量时，改用 `cargo build --profile debugging`，这会全量重编一遍。
+
 类型检查：
 
 ```bash

@@ -66,6 +66,22 @@ windows = { version = "0.62", features = [
 [dev-dependencies]
 tempfile = "3.14"
 
+# tests/ 下每个文件都是一个独立的测试二进制（现在有 89 个），每个都要把 tauri、git2
+# 整棵依赖树重新链接一遍。全量 debug 信息下单个 link.exe 约 1 GB，cargo 按核数并行
+# 链接时能吃掉二十多 GB 内存、把机器卡到没法用。照 Cargo 构建性能指南的推荐写法：
+# 本 crate 只留 panic backtrace 需要的行号表，依赖不带 debug 信息。
+# 要用调试器看局部变量时，换 `--profile debugging` 全量重编一遍。
+# 只影响 dev / test，release 本来就不带 debug 信息。
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.debugging]
+inherits = "dev"
+debug = true
+
 # 机械护栏：防止以后的改动悄悄引入会让后端 panic 的写法。
 # clippy 类只在 `cargo clippy` 时检查；测试代码的豁免见 clippy.toml 与各测试文件顶部。
 [lints.rust]

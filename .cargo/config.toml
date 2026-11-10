@@ -1,0 +1,9 @@
+# 放在仓库根而不是 src-tauri/：cargo 从「当前目录」往上找 config，不看 --manifest-path。
+# release workflow 在仓库根跑 `cargo ... --manifest-path src-tauri/Cargo.toml`，
+# 日常在 src-tauri/ 里跑 `cargo test`，放这里两种都能找到。
+[build]
+# cargo 默认按核数并行（开发机 16 核），tests/ 下 89 个测试二进制会同时 link，
+# 和多个 worktree 会话叠在一起时把机器卡到没法用。8 个并行、每个 link 约 0.6 GB
+# （见 Cargo.toml 的 [profile.dev]），峰值约 5 GB，也留一半核心给前台。
+# 临时要满速时用 `cargo test -j 16` 覆盖。
+jobs = 8
