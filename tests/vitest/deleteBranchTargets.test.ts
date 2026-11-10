@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { ALL_CAPABILITIES, NO_GIT_ONLY_CAPABILITIES } from '@/engine/capabilities'
 import {
   deleteBranchTargets,
+  remoteKey,
   runBranchDeletion,
   withoutCompletedSteps,
   type DeleteBranchInfo,
@@ -23,9 +24,76 @@ function recordSteps(fail?: string) {
       deleteWorktree: step('deleteWorktree'),
       deleteRemote: step('deleteRemote'),
       deleteLocal: step('deleteLocal'),
+      forgetGoneRemote: step('forgetGoneRemote'),
     },
   }
 }
+
+describe('runBranchDeletion 清理远程已经没有的分支', () => {
+  it('删完本地分支之后才清：用户确认的删除做完之前不碰跟踪 ref', async () => {
+    const { calls, steps } = recordSteps()
+    await runBranchDeletion(
+      { remote: null, worktreePath: 'C:/wt/x', staleRemote: remoteTarget },
+      vi.fn(),
+      steps,
+    )
+    expect(calls).toEqual(['deleteWorktree', 'deleteLocal', 'forgetGoneRemote'])
+    expect(steps.forgetGoneRemote).toHaveBeenCalledWith(remoteTarget)
+  })
+
+  it('清理失败不算删除失败：删除已经做完了', async () => {
+    const { calls, steps } = recordSteps('forgetGoneRemote')
+    await runBranchDeletion({ remote: null, worktreePath: null, staleRemote: remoteTarget }, vi.fn(), steps)
+    expect(calls).toEqual(['deleteLocal', 'forgetGoneRemote'])
+  })
+
+  it('本地分支没删成：不清理', async () => {
+    const { calls, steps } = recordSteps('deleteLocal')
+    await expect(
+      runBranchDeletion({ remote: null, worktreePath: null, staleRemote: remoteTarget }, vi.fn(), steps),
+    ).rejects.toThrow()
+    expect(calls).toEqual(['deleteLocal'])
+  })
+})
+
+describe('deleteBranchTargets 远程已经没有时', () => {
+  const info: DeleteBranchInfo = {
+    upstream: 'origin/feat/x',
+    remote: 'origin',
+    remoteBranch: 'feat/x',
+    remoteProtected: false,
+    worktree: null,
+  }
+  const gone = { alsoRemote: true, alsoWorktree: false, remoteGone: true }
+
+  it('不再删远程（只会白握一次手），删完后清过期的跟踪 ref', () => {
+    expect(deleteBranchTargets(ALL_CAPABILITIES, info, gone)).toEqual({
+      remote: null,
+      worktreePath: null,
+      staleRemote: remoteTarget,
+    })
+  })
+
+  it('没探测过或问不到：照常删远程，不清', () => {
+    const t = deleteBranchTargets(ALL_CAPABILITIES, info, { ...gone, remoteGone: false })
+    expect(t.remote).toEqual(remoteTarget)
+    expect(t.staleRemote).toBeNull()
+  })
+
+  it('不管理远程的模式不清', () => {
+    expect(deleteBranchTargets(NO_GIT_ONLY_CAPABILITIES, info, gone).staleRemote).toBeNull()
+  })
+
+  it('没有远程分支坐标时不清', () => {
+    expect(deleteBranchTargets(ALL_CAPABILITIES, { ...info, remote: null }, gone).staleRemote).toBeNull()
+  })
+
+  it('remoteKey：同一坐标同一个键，没有坐标就是 null', () => {
+    expect(remoteKey(remoteTarget)).toBe(remoteKey({ ...remoteTarget }))
+    expect(remoteKey(remoteTarget)).not.toBe(remoteKey({ remote: 'upstream', branch: 'feat/x' }))
+    expect(remoteKey(null)).toBeNull()
+  })
+})
 
 describe('runBranchDeletion', () => {
   it('worktree 和远程都要删时，先预检远程，再按 worktree → 远程 → 本地走', async () => {
@@ -119,6 +187,7 @@ describe('withoutCompletedSteps', () => {
     expect(deleteBranchTargets(ALL_CAPABILITIES, left, choice)).toEqual({
       remote: { remote: 'origin', branch: 'feat/x' },
       worktreePath: null,
+      staleRemote: null,
     })
   })
 
@@ -127,6 +196,7 @@ describe('withoutCompletedSteps', () => {
     expect(deleteBranchTargets(ALL_CAPABILITIES, left, choice)).toEqual({
       remote: null,
       worktreePath: 'C:/wt/feat-x',
+      staleRemote: null,
     })
     expect(left.upstream).toBeNull()
   })
@@ -136,6 +206,7 @@ describe('withoutCompletedSteps', () => {
     expect(deleteBranchTargets(ALL_CAPABILITIES, left, choice)).toEqual({
       remote: null,
       worktreePath: null,
+      staleRemote: null,
     })
   })
 })
@@ -156,6 +227,7 @@ describe('deleteBranchTargets', () => {
     expect(deleteBranchTargets(ALL_CAPABILITIES, info, bothChecked)).toEqual({
       remote: { remote: 'origin', branch: 'feat/x' },
       worktreePath: 'C:/wt/feat-x',
+      staleRemote: null,
     })
   })
 
@@ -168,6 +240,7 @@ describe('deleteBranchTargets', () => {
     expect(deleteBranchTargets(NO_GIT_ONLY_CAPABILITIES, info, bothChecked)).toEqual({
       remote: null,
       worktreePath: null,
+      staleRemote: null,
     })
   })
 
@@ -176,11 +249,13 @@ describe('deleteBranchTargets', () => {
     expect(deleteBranchTargets(noWorktree, info, bothChecked)).toEqual({
       remote: { remote: 'origin', branch: 'feat/x' },
       worktreePath: null,
+      staleRemote: null,
     })
     const noRemote = { ...ALL_CAPABILITIES, remotes: false }
     expect(deleteBranchTargets(noRemote, info, bothChecked)).toEqual({
       remote: null,
       worktreePath: 'C:/wt/feat-x',
+      staleRemote: null,
     })
   })
 
@@ -192,7 +267,7 @@ describe('deleteBranchTargets', () => {
   it('没勾就不发', () => {
     expect(
       deleteBranchTargets(ALL_CAPABILITIES, info, { alsoRemote: false, alsoWorktree: false }),
-    ).toEqual({ remote: null, worktreePath: null })
+    ).toEqual({ remote: null, worktreePath: null, staleRemote: null })
   })
 
   it('信息缺失时不硬凑目标', () => {

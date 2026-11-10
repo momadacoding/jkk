@@ -818,3 +818,182 @@ fn an_unreachable_preflight_does_not_block_or_disarm_the_guard() {
     let err = delete_on_origin(&work, &default_branch).unwrap_err();
     assert_eq!(err.code, "protected_branch", "{}", err.message);
 }
+
+// ---- 勾上「顺便删远程」时探测远程上还有没有这条分支 ----
+
+fn tracking_ref(work: &TempDir, name: &str) -> String {
+    git_out(work.path(), &["for-each-ref", name])
+}
+
+fn probe(work: &TempDir, branch_name: &str) -> Option<bool> {
+    branch::probe_remote_branch(&p(work), "origin", branch_name)
+}
+
+#[test]
+fn the_probe_reports_a_branch_that_is_still_on_the_remote() {
+    let (_remote, work) = cloned_repo();
+
+    assert_eq!(probe(&work, "feat/x"), Some(true));
+    assert!(!tracking_ref(&work, "refs/remotes/origin/feat/x").is_empty());
+}
+
+/// 截图里的那种情况：PR 合并时 GitHub 已删了 head 分支，本地还挂着 `origin/feat/x`。
+///
+/// 探测只读：跟踪 ref 留着。这时用户还没确认任何删除；而且清掉之后弹框的重查会退到
+/// 别的远程上的同名分支，勾选框就指向一条用户没选过的分支。
+#[test]
+fn the_probe_reports_a_gone_branch_without_touching_the_tracking_ref() {
+    let (remote, work) = cloned_repo();
+    run_git(remote.path(), &["branch", "-D", "feat/x"]);
+
+    assert_eq!(probe(&work, "feat/x"), Some(false));
+    assert!(!tracking_ref(&work, "refs/remotes/origin/feat/x").is_empty());
+}
+
+/// 删除做完之后清理：push 目标就是 fetch 侧时，过期的跟踪 ref 删掉。
+#[test]
+fn forgetting_a_gone_branch_drops_the_stale_tracking_ref() {
+    let (remote, work) = cloned_repo();
+    run_git(remote.path(), &["branch", "-D", "feat/x"]);
+
+    ops::forget_gone_remote_branch(p(&work), "origin".into(), "feat/x".into()).unwrap();
+
+    assert!(tracking_ref(&work, "refs/remotes/origin/feat/x").is_empty());
+}
+
+/// pushurl 指向别处：push 目标上没有说明不了 fetch 侧，跟踪 ref 镜像的是 fetch 侧，不删。
+#[test]
+fn forgetting_keeps_the_tracking_ref_when_the_push_target_is_elsewhere() {
+    let (_fetch_side, work) = cloned_repo();
+    let push_side = bare_repo_with_default(&work, "trunk");
+    run_git(
+        work.path(),
+        &["remote", "set-url", "--push", "origin", &p(&push_side)],
+    );
+
+    ops::forget_gone_remote_branch(p(&work), "origin".into(), "feat/x".into()).unwrap();
+
+    assert!(!tracking_ref(&work, "refs/remotes/origin/feat/x").is_empty());
+}
+
+/// 清理不走网络：远程连不上也照样清（判断只读本地配置）。
+#[test]
+fn forgetting_does_not_need_the_remote() {
+    let (remote, work) = cloned_repo();
+
+    with_remote_moved_away(&remote, || {
+        ops::forget_gone_remote_branch(p(&work), "origin".into(), "feat/x".into())
+    })
+    .unwrap();
+
+    assert!(tracking_ref(&work, "refs/remotes/origin/feat/x").is_empty());
+}
+
+/// 问不到就是不知道：不能当成「不在」，跟踪 ref 也不能动。
+#[test]
+fn an_unreachable_remote_makes_the_probe_unknown_and_keeps_the_tracking_ref() {
+    let (remote, work) = cloned_repo();
+
+    let got = with_remote_moved_away(&remote, || probe(&work, "feat/x"));
+
+    assert_eq!(got, None);
+    assert!(!tracking_ref(&work, "refs/remotes/origin/feat/x").is_empty());
+}
+
+/// 分支名只是远程上某条分支的后缀时不算存在：ls-remote 的模式按后缀匹配。
+#[test]
+fn a_branch_that_only_shares_a_suffix_does_not_count_as_present() {
+    let (remote, work) = cloned_repo();
+    run_git(remote.path(), &["branch", "-D", "feat/x"]);
+    run_git(remote.path(), &["branch", "team/refs/heads/feat/x", "HEAD"]);
+    // 先确认这个诱饵真的会被模式匹配出来，否则这条测试什么也没证明
+    assert!(
+        git_out(work.path(), &["ls-remote", "origin", "refs/heads/feat/x"])
+            .contains("refs/heads/team/refs/heads/feat/x")
+    );
+
+    assert_eq!(probe(&work, "feat/x"), Some(false));
+}
+
+/// pushurl 指向别处：push 目标上没有，就答「不在」（删除不会动到任何东西）。
+#[test]
+fn a_push_target_without_the_branch_counts_as_gone() {
+    let (_fetch_side, work) = cloned_repo();
+    let push_side = bare_repo_with_default(&work, "trunk");
+    run_git(push_side.path(), &["branch", "-D", "feat/x"]);
+    run_git(
+        work.path(),
+        &["remote", "set-url", "--push", "origin", &p(&push_side)],
+    );
+
+    assert_eq!(probe(&work, "feat/x"), Some(false));
+    assert!(!tracking_ref(&work, "refs/remotes/origin/feat/x").is_empty());
+}
+
+/// 多个 pushurl：任何一个上还有，删除就还有事可做。
+#[test]
+fn the_branch_counts_as_present_when_any_push_target_has_it() {
+    let (_fetch_side, work) = cloned_repo();
+    let gone_side = bare_repo_with_default(&work, "trunk");
+    run_git(gone_side.path(), &["branch", "-D", "feat/x"]);
+    let live_side = bare_repo_with_default(&work, "trunk");
+    add_push_url(&work, &p(&gone_side));
+    add_push_url(&work, &p(&live_side));
+
+    assert_eq!(probe(&work, "feat/x"), Some(true));
+}
+
+/// 多个 pushurl：一个说没有、另一个问不到——不知道，不能当成「不在」。
+#[test]
+fn one_unreachable_push_target_makes_the_probe_unknown() {
+    let (_fetch_side, work) = cloned_repo();
+    let gone_side = bare_repo_with_default(&work, "trunk");
+    run_git(gone_side.path(), &["branch", "-D", "feat/x"]);
+    add_push_url(&work, &p(&gone_side));
+    let missing = TempDir::new().unwrap();
+    add_push_url(&work, &missing.path().join("nowhere").to_string_lossy());
+
+    assert_eq!(probe(&work, "feat/x"), None);
+}
+
+/// 探测同时替护栏问好了默认分支：之后远程连不上，护栏仍用探测结果挡住默认分支。
+/// 没用上的话护栏无依据放行，报的会是 push 失败的 `git_cli`。
+#[test]
+fn the_probe_also_prefetches_the_default_branch_for_the_guard() {
+    let (remote, work) = repo_with_added_remote();
+    let default_branch = default_branch_of(&remote);
+
+    assert_eq!(probe(&work, &default_branch), Some(true));
+
+    let err =
+        with_remote_moved_away(&remote, || delete_on_origin(&work, &default_branch)).unwrap_err();
+    assert_eq!(err.code, "protected_branch", "{}", err.message);
+}
+
+/// 紧接着再探测一次（取消又重新勾选）：默认分支的预取结果还新鲜、不会重跑，
+/// 存在性仍要问得出来。
+#[test]
+fn a_second_probe_right_after_the_first_still_answers() {
+    let (remote, work) = cloned_repo();
+    assert_eq!(probe(&work, "feat/x"), Some(true));
+
+    run_git(remote.path(), &["branch", "-D", "feat/x"]);
+
+    assert_eq!(probe(&work, "feat/x"), Some(false));
+}
+
+/// 命令入口（`async fn` + `spawn_blocking`）把引擎的答案原样交回。
+#[test]
+fn the_probe_command_answers_through_the_command_entry() {
+    let (remote, work) = cloned_repo();
+    run_git(remote.path(), &["branch", "-D", "feat/x"]);
+
+    let got = tauri::async_runtime::block_on(ops::probe_remote_branch(
+        p(&work),
+        "origin".into(),
+        "feat/x".into(),
+    ))
+    .unwrap();
+
+    assert_eq!(got, Some(false));
+}

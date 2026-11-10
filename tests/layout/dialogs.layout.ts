@@ -44,6 +44,10 @@ for (const size of SIZES) {
     test.describe(`${s.id} @ ${size.width}x${size.height}`, () => {
       test.beforeEach(async ({ page }) => {
         await open(page, s.id, size)
+        if (s.clickFirst) {
+          await page.locator(s.clickFirst.selector).click()
+          await expect(page.getByText(s.clickFirst.thenShows)).toBeVisible()
+        }
         if (s.clickPrimary) {
           // 从滚动区顶部点：按钮贴底以后这是最常见的点法，错误不能出在视野外
           await page.evaluate(() => {

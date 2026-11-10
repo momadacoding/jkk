@@ -314,11 +314,41 @@ export function svnPinnedExternals(path: string): Promise<PinnedExternal[]> {
  * 这次 `ls-remote` 是一整趟 SSH 握手，实测到 GitHub 3 秒多。放在用户读弹框的
  * 时间里做，点确认时就只剩 push 一次连接。**只是提速**：护栏只认成功的结果，
  * 预取失败或没回来，它会限时等待后自己再问，所以这里吞掉一切错误，调用方不必 await。
+ *
+ * 删除弹框已改用 {@link probeRemoteBranch}（同一次查询顺带问分支在不在）。
  */
 export function prefetchRemoteDefault(path: string, remote: string): void {
   invoke('prefetch_remote_default', { path, remote }).catch((err) => {
     console.warn('预取远程默认分支失败：', err)
   })
+}
+
+/**
+ * 用户勾上「顺便删远程」时调：远程上还有没有这条分支。`null` 表示问不到。
+ *
+ * 顺带替删除护栏问好远程默认分支：这次 `ls-remote` 是一整趟 SSH 握手，实测到 GitHub
+ * 3 秒多，放在用户读弹框的时间里做，点确认时就只剩 push 一次连接。护栏只认成功的结果，
+ * 这里失败或没回来，它会限时等待后自己再问。
+ * **只读**：过期的跟踪 ref 等删除做完后用 {@link forgetGoneRemoteBranch} 清。
+ * 这只是提前告知：删除那一步对「远程已经没有」本来就按成功处理，所以出错一律当问不到。
+ */
+export function probeRemoteBranch(
+  path: string,
+  remote: string,
+  branch: string,
+): Promise<boolean | null> {
+  return invoke<boolean | null>('probe_remote_branch', { path, remote, branch }).catch((err) => {
+    console.warn('探测远程分支失败：', err)
+    return null
+  })
+}
+
+/**
+ * 探测答了「远程上已经没有」、确认的删除做完之后调：清掉本地过期的跟踪 ref。
+ * 只读本地配置、不走网络；push 目标不是 fetch 侧时后端什么都不做。
+ */
+export function forgetGoneRemoteBranch(path: string, remote: string, branch: string): Promise<void> {
+  return invoke<void>('forget_gone_remote_branch', { path, remote, branch })
 }
 
 /** 同 {@link prefetchRemoteDefault}，按侧边栏的 `origin/feat/x` 形式给出（拆远程名在后端做）。 */

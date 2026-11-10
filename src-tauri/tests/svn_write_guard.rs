@@ -418,10 +418,14 @@ fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
         .find(&format!("fn {name}("))
         .unwrap_or_else(|| panic!("找不到 `fn {name}(`——改名了？"));
     let rest = &src[start + 1..];
+    // `async fn` 也要算边界：否则它前面那个命令的函数体会一直延伸进它，把它的
+    // `require_capability` 算到前一个命令头上
     let end = [
         rest.find("\npub fn "),
         rest.find("\nfn "),
         rest.find("\npub(crate) fn "),
+        rest.find("\npub async fn "),
+        rest.find("\nasync fn "),
     ]
     .into_iter()
     .flatten()
