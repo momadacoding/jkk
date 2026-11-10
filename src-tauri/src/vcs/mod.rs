@@ -11,7 +11,7 @@
 pub mod git;
 pub mod svn;
 
-use crate::engine::diff::{DiffData, StatusData, StatusPatch};
+use crate::engine::diff::{DiffData, DiffViewOptions, StatusData, StatusPatch};
 use crate::engine::graph::GraphData;
 use crate::engine::repo::RepoInfo;
 use crate::engine::stash::StashEntry;
@@ -121,7 +121,8 @@ pub trait Vcs: Send + Sync {
     fn status_paths(&self, paths: &[String]) -> Result<StatusPatch>;
 
     /// 读取指定 scope 的 diff。scope 的取值形式由各后端自行解释。
-    fn diff(&self, scope: &str) -> Result<DiffData>;
+    /// `view` 是 diff 面板的上下文行数 / 忽略空白，见 [`DiffViewOptions`]。
+    fn diff(&self, scope: &str, view: &DiffViewOptions) -> Result<DiffData>;
 
     /// 把指定路径加入暂存区。
     ///

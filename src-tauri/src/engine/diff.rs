@@ -1,6 +1,6 @@
 use crate::error::Result;
 use git2::{DiffOptions, Repository};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Serialize, Debug, Clone)]
@@ -55,6 +55,114 @@ pub struct FileDiff {
 #[serde(rename_all = "camelCase")]
 pub struct DiffData {
     pub files: Vec<FileDiff>,
+    /// 要的上下文比默认多（含「整个文件」），但文件太多，按默认上下文读了（`WIDE_CONTEXT_FILE_LIMIT`）。
+    /// 界面据此说明为什么「整个文件」没生效。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub context_narrowed: bool,
+}
+
+impl DiffData {
+    pub(crate) fn new(files: Vec<FileDiff>) -> Self {
+        DiffData {
+            files,
+            context_narrowed: false,
+        }
+    }
+}
+
+/// 「整个文件」时的上下文行数。
+///
+/// 不用 `u32::MAX`：xdiff 的 `ctxlen` 是 `long`（libgit2 `diff_xdiff.c` 直接赋值），Windows 上 `long`
+/// 是 32 位，`u32::MAX` 过去就成了 -1。1600 万行足够盖住任何能按行显示的文件。
+pub const FULL_FILE_CONTEXT: u32 = 1 << 24;
+
+/// libgit2 的默认上下文行数。
+const DEFAULT_CONTEXT: u32 = 3;
+
+/// 一次读出来的文件超过这么多个时，上下文按默认的 3 行读，不按面板上调大的值。
+///
+/// 提交详情一次读整个提交的 diff、只显示其中一个文件（`CommitDetailView`）。「整个文件」开着时，
+/// 几万个文件的提交会把每个文件的全文都读出来再序列化过 IPC，几百 MB，界面直接卡死。
+/// 单文件的 scope（「本地改动」、文件历史）不受影响。
+pub const WIDE_CONTEXT_FILE_LIMIT: usize = 200;
+
+/// diff 面板上影响**数据**的那几个开关（前端 `diffPrefs.ts` 的 `backendDiffOptions`）。
+///
+/// 只放必须由 libgit2 来做的：上下文行数要的是 diff 里本来没有的行；忽略空白用 libgit2 的
+/// `IGNORE_WHITESPACE`，与 `git diff -w` 同一语义。「忽略换行符」不在这里：libgit2 没有
+/// `IGNORE_CR_AT_EOL`，`IGNORE_WHITESPACE_EOL` 又会连行尾空格的改动一起吞掉，所以由前端后处理
+/// （`src/engine/diffEol.ts`）。字段全有默认值，前端不传就是原来的行为。
+#[derive(Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DiffViewOptions {
+    /// 每个 hunk 前后的上下文行数；`None` = libgit2 默认的 3 行。超过 `FULL_FILE_CONTEXT` 按它算。
+    pub context_lines: Option<u32>,
+    /// 忽略所有空白的改动（`git diff -w`）。
+    pub ignore_whitespace: bool,
+}
+
+impl DiffViewOptions {
+    pub(crate) fn apply(&self, opts: &mut DiffOptions) {
+        if let Some(n) = self.context_lines {
+            opts.context_lines(n.min(FULL_FILE_CONTEXT));
+        }
+        if self.ignore_whitespace {
+            opts.ignore_whitespace(true);
+        }
+    }
+
+    pub(crate) fn options(&self) -> DiffOptions {
+        let mut opts = DiffOptions::new();
+        self.apply(&mut opts);
+        opts
+    }
+
+    /// 上下文比默认多（`WIDE_CONTEXT_FILE_LIMIT` 要限制的那种）。
+    fn is_wide(&self) -> bool {
+        self.context_lines.is_some_and(|n| n > DEFAULT_CONTEXT)
+    }
+
+    /// 同样的开关，上下文回到默认。
+    fn narrowed(&self) -> Self {
+        DiffViewOptions {
+            context_lines: None,
+            ..*self
+        }
+    }
+}
+
+/// 按 `view` 构造 diff；上下文调大了而文件又超过 `WIDE_CONTEXT_FILE_LIMIT` 时，按默认上下文重建一遍。
+/// 返回实际用的选项。deltas 在构造时就列好了，行内容要到输出时才读，所以先数一遍是廉价的。
+///
+/// `prepare` 在数之前跑（改名检测）：不合并的话 120 个改名是 240 个 delta，没超也被退回
+/// （第二轮独立 review 第 2 条）。`limit` 为 false 时不数：单文件 scope 最后只留精确匹配的
+/// 那一项（`diff_to_data_only`），字面量 pathspec 按目录前缀带出来的 delta 再多也不会进结果。
+/// 重建只在真的退回时发生，工作区 scope 这时会多扫一遍目录。
+fn build_limited<'r>(
+    view: &DiffViewOptions,
+    limit: bool,
+    build: impl Fn(&DiffViewOptions) -> std::result::Result<git2::Diff<'r>, git2::Error>,
+    prepare: impl Fn(&mut git2::Diff<'r>) -> std::result::Result<(), git2::Error>,
+) -> std::result::Result<(git2::Diff<'r>, DiffViewOptions), git2::Error> {
+    let mut diff = build(view)?;
+    prepare(&mut diff)?;
+    if limit && view.is_wide() && diff.deltas().len() > WIDE_CONTEXT_FILE_LIMIT {
+        let narrow = view.narrowed();
+        let mut diff = build(&narrow)?;
+        prepare(&mut diff)?;
+        return Ok((diff, narrow));
+    }
+    Ok((diff, *view))
+}
+
+/// 不需要在数之前处理的 scope 传给 `build_limited` 的 `prepare`。
+fn no_prepare(_: &mut git2::Diff) -> std::result::Result<(), git2::Error> {
+    Ok(())
+}
+
+/// 改名检测（`find_similar`），提交与 range 的 scope 在数文件之前做。
+fn find_renames(diff: &mut git2::Diff) -> std::result::Result<(), git2::Error> {
+    diff.find_similar(None)
 }
 
 /// 工作区 diff 的通用选项：未跟踪文件也要出现在 diff 里，
@@ -332,7 +440,17 @@ fn unstaged_list(
     Ok(unstaged)
 }
 
+/// 按默认选项读 diff，见 `read_diff_with`。
 pub fn read_diff(path: &str, scope: String) -> Result<DiffData> {
+    read_diff_with(path, scope, &DiffViewOptions::default())
+}
+
+/// 读 `scope` 的 diff，`view` 是 diff 面板上的上下文行数 / 忽略空白（`DiffViewOptions`）。
+///
+/// 「本地改动」列表的增删行数来自 `read_status`，不受它影响。提交详情的文件列表是从这里读出的
+/// diff 现算的，开着忽略空白时只改空白的文件会显示 +0/-0，与右侧 diff 一致。
+/// 读出的文件超过 `WIDE_CONTEXT_FILE_LIMIT` 个时上下文不按 `view` 调大，见那里。
+pub fn read_diff_with(path: &str, scope: String, view: &DiffViewOptions) -> Result<DiffData> {
     let repo = Repository::open(path)?;
     if let Some(hash) = scope.strip_prefix("commit:") {
         let commit = repo.find_commit(git2::Oid::from_str(hash)?)?;
@@ -342,10 +460,16 @@ pub fn read_diff(path: &str, scope: String) -> Result<DiffData> {
         } else {
             None
         };
-        let mut diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
         // 不做改名检测的话，一次重命名会摊成一加一删两条，文件树里看不出是同一个文件
-        diff.find_similar(None)?;
-        return diff_to_data(diff);
+        let (diff, used) = build_limited(
+            view,
+            true,
+            |v| repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut v.options())),
+            find_renames,
+        )?;
+        let mut data = diff_to_data(diff)?;
+        data.context_narrowed = used != *view;
+        return Ok(data);
     }
     // `range:<a>..<b>`：两个任意 commit 之间。SVN 节点用它比前后两版本地基线——交付录的
     // 基线以交付树为父（spec §8.2.2），`commit:<基线>` 比的是它和交付树，恰好漏掉
@@ -362,9 +486,15 @@ pub fn read_diff(path: &str, scope: String) -> Result<DiffData> {
             })?;
         let old = repo.find_commit(git2::Oid::from_str(from)?)?.tree()?;
         let new = repo.find_commit(git2::Oid::from_str(to)?)?.tree()?;
-        let mut diff = repo.diff_tree_to_tree(Some(&old), Some(&new), None)?;
-        diff.find_similar(None)?;
-        return diff_to_data(diff);
+        let (diff, used) = build_limited(
+            view,
+            true,
+            |v| repo.diff_tree_to_tree(Some(&old), Some(&new), Some(&mut v.options())),
+            find_renames,
+        )?;
+        let mut data = diff_to_data(diff)?;
+        data.context_narrowed = used != *view;
+        return Ok(data);
     }
     // 空仓库没有 HEAD，此时与空树比较
     let tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
@@ -383,9 +513,9 @@ pub fn read_diff(path: &str, scope: String) -> Result<DiffData> {
             ));
         }
         return if section == "staged" {
-            staged_side(&repo, tree.as_ref(), Some(file))
+            staged_side(&repo, tree.as_ref(), Some(file), view)
         } else {
-            workdir_side(&repo, tree.as_ref(), Some(file), |opts| {
+            workdir_side(&repo, tree.as_ref(), Some(file), view, |opts| {
                 repo.diff_index_to_workdir(None, Some(opts))
             })
         };
@@ -393,13 +523,13 @@ pub fn read_diff(path: &str, scope: String) -> Result<DiffData> {
     match scope.as_str() {
         // 「本地改动」按分区比较（第 65 条），与外部 diff 的两侧取法一致：
         // Staged = HEAD 对比暂存区，即这次提交会提交什么
-        "staged" => staged_side(&repo, tree.as_ref(), None),
+        "staged" => staged_side(&repo, tree.as_ref(), None, view),
         // Unstaged = 暂存区对比工作区，即还没暂存的那部分
-        "unstaged" => workdir_side(&repo, tree.as_ref(), None, |opts| {
+        "unstaged" => workdir_side(&repo, tree.as_ref(), None, view, |opts| {
             repo.diff_index_to_workdir(None, Some(opts))
         }),
         // workdir（以及其余认不出的 scope）：HEAD 对比工作区
-        _ => workdir_side(&repo, tree.as_ref(), None, |opts| {
+        _ => workdir_side(&repo, tree.as_ref(), None, view, |opts| {
             repo.diff_tree_to_workdir_with_index(tree.as_ref(), Some(opts))
         }),
     }
@@ -410,17 +540,27 @@ fn staged_side(
     repo: &Repository,
     tree: Option<&git2::Tree>,
     file: Option<&str>,
+    view: &DiffViewOptions,
 ) -> Result<DiffData> {
-    let mut opts = DiffOptions::new();
-    if let Some(f) = file {
-        opts.pathspec(f);
-        // 字面量匹配，理由同 `workdir_diff_opts`
-        opts.disable_pathspec_match(true);
-    }
+    let opts = |v: &DiffViewOptions| {
+        let mut opts = v.options();
+        if let Some(f) = file {
+            opts.pathspec(f);
+            // 字面量匹配，理由同 `workdir_diff_opts`
+            opts.disable_pathspec_match(true);
+        }
+        opts
+    };
     // 不做改名检测：Staged 列表来自 `read_status`，它把 `git mv` 列成一删一增两项。
     // 这里若合成一条改名，点到旧路径那一项时右侧就找不到它的 diff
-    let diff = repo.diff_tree_to_index(tree, None, Some(&mut opts))?;
+    let (diff, used) = build_limited(
+        view,
+        file.is_none(),
+        |v| repo.diff_tree_to_index(tree, None, Some(&mut opts(v))),
+        no_prepare,
+    )?;
     let mut data = diff_to_data_only(diff, file)?;
+    data.context_narrowed = used != *view;
     // 合并冲突中 index 里的冲突条目也会出现在这里，但 `read_status` 只把冲突文件放进
     // Unstaged（显示 HEAD 对比工作区）。留着它，Staged 的 diff 就多出列表里没有的项
     data.files.retain(|f| f.status != "conflicted");
@@ -433,19 +573,31 @@ fn workdir_side<'r>(
     repo: &'r Repository,
     head_tree: Option<&git2::Tree>,
     file: Option<&str>,
+    view: &DiffViewOptions,
     build: impl Fn(&mut DiffOptions) -> std::result::Result<git2::Diff<'r>, git2::Error>,
 ) -> Result<DiffData> {
     let only = file.map(|f| vec![f.to_string()]);
-    let diff = build(&mut workdir_diff_opts(only.as_deref()))?;
+    let opts = |paths: Option<&[String]>, v: &DiffViewOptions| {
+        let mut o = workdir_diff_opts(paths);
+        v.apply(&mut o);
+        o
+    };
+    let (diff, used) = build_limited(
+        view,
+        file.is_none(),
+        |v| build(&mut opts(only.as_deref(), v)),
+        no_prepare,
+    )?;
     let mut data = match readable_only(repo, &diff) {
         None => diff_to_data_only(diff, file)?,
         // 一个能读的都没有：返回空 diff 而不是让整个视图报错。
         // 注意此时不能拿空的 pathspec 去重建——那等于不加限制，又会撞上坏路径。
-        Some(good) if good.is_empty() => DiffData { files: Vec::new() },
-        Some(good) => diff_to_data_only(build(&mut workdir_diff_opts(Some(&good)))?, file)?,
+        Some(good) if good.is_empty() => DiffData::new(Vec::new()),
+        Some(good) => diff_to_data_only(build(&mut opts(Some(&good), &used))?, file)?,
     };
+    data.context_narrowed = used != *view;
     // 补不出来只是冲突文件没有行内容，不能让整个变更视图跟着报错
-    if let Err(e) = fill_conflicted(repo, head_tree, &mut data) {
+    if let Err(e) = fill_conflicted(repo, head_tree, &used, &mut data) {
         log::warn!("冲突文件的 diff 读取失败：{}", e.message);
     }
     Ok(data)
@@ -460,6 +612,7 @@ fn workdir_side<'r>(
 fn fill_conflicted(
     repo: &Repository,
     tree: Option<&git2::Tree>,
+    view: &DiffViewOptions,
     data: &mut DiffData,
 ) -> Result<()> {
     let paths: Vec<String> = data
@@ -472,6 +625,7 @@ fn fill_conflicted(
         return Ok(());
     }
     let mut opts = workdir_diff_opts(Some(&paths));
+    view.apply(&mut opts);
     // 路径按字面量匹配：`f[1].txt` 不能被当成模式去匹配 `f1.txt`
     opts.disable_pathspec_match(true);
     let extra = diff_to_data(repo.diff_tree_to_workdir(tree, Some(&mut opts))?)?;
@@ -629,5 +783,5 @@ pub(crate) fn diff_to_data_only(diff: git2::Diff, exact: Option<&str>) -> Result
             e.message()
         );
     }
-    Ok(DiffData { files })
+    Ok(DiffData::new(files))
 }

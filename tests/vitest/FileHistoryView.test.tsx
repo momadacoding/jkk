@@ -57,6 +57,8 @@ const blame: BlameData = {
 }
 
 const emptyDiff: DiffData = { files: [] }
+/** diff 面板开关的默认值对应的后端选项（`backendDiffOptions(DEFAULT_DIFF_PREFS)`）。 */
+const DEFAULT_OPTIONS = { contextLines: 3, ignoreWhitespace: false }
 
 beforeEach(() => {
   store.readFileHistory.mockReset().mockResolvedValue(history)
@@ -79,7 +81,7 @@ describe('FileHistoryView：History', () => {
     expect(store.readFileHistory).toHaveBeenCalledWith('C:/r', 'new.txt', ['HEAD', B])
     await screen.findByRole('option', { name: /改名/ })
     // 改名那一条要带上旧路径，diff 才配得成一对
-    await waitFor(() => expect(store.readCommitFileDiff).toHaveBeenCalledWith('C:/r', B, 'new.txt', 'old.txt'))
+    await waitFor(() => expect(store.readCommitFileDiff).toHaveBeenCalledWith('C:/r', B, 'new.txt', 'old.txt', DEFAULT_OPTIONS))
     expect(screen.getByRole('option', { name: /改名/ }).getAttribute('aria-selected')).toBe('true')
     expect(screen.getByText('History (3)')).toBeTruthy()
   })
@@ -87,7 +89,7 @@ describe('FileHistoryView：History', () => {
   it('点另一条：用那一条当时的路径读 diff；双击在提交图中定位', async () => {
     const { onReveal } = mountView(historyTargetForWorkdir('new.txt', null, 'history'))
     fireEvent.click(await screen.findByRole('option', { name: /新增/ }))
-    await waitFor(() => expect(store.readCommitFileDiff).toHaveBeenCalledWith('C:/r', A, 'old.txt', null))
+    await waitFor(() => expect(store.readCommitFileDiff).toHaveBeenCalledWith('C:/r', A, 'old.txt', null, DEFAULT_OPTIONS))
     fireEvent.doubleClick(screen.getByRole('option', { name: /新增/ }))
     expect(onReveal).toHaveBeenCalledWith(A)
   })

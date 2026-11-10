@@ -150,6 +150,11 @@ export interface FileDiff {
 export interface DiffData {
   files: FileDiff[]
   /**
+   * 面板上调大了上下文（含「整个文件」），但这次读出的文件太多，后端按默认 3 行读了
+   * （Rust `WIDE_CONTEXT_FILE_LIMIT`）。只在为真时出现。
+   */
+  contextNarrowed?: boolean
+  /**
    * 只在前端出现，Rust 侧不返回：`read_diff` 失败时 store 记下的原因。
    * 有它时 `files` 是空的，但意思是「没读出来」，不是「没有改动」（第 72 条）。
    */

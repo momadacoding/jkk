@@ -11,7 +11,7 @@
 
 use super::git::GitBackend;
 use super::{Capabilities, Vcs};
-use crate::engine::diff::{DiffData, StatusData, StatusPatch};
+use crate::engine::diff::{DiffData, DiffViewOptions, StatusData, StatusPatch};
 use crate::engine::graph::GraphData;
 use crate::engine::repo::RepoInfo;
 use crate::engine::stash::StashEntry;
@@ -88,8 +88,8 @@ impl Vcs for SvnGitBackend {
     fn status_paths(&self, paths: &[String]) -> Result<StatusPatch> {
         self.git.status_paths(paths)
     }
-    fn diff(&self, scope: &str) -> Result<DiffData> {
-        self.git.diff(scope)
+    fn diff(&self, scope: &str, view: &DiffViewOptions) -> Result<DiffData> {
+        self.git.diff(scope, view)
     }
     fn stage(&self, paths: &[String]) -> Result<()> {
         assert_not_syncing(&self.root)?;

@@ -85,7 +85,10 @@ fn backend_diff_matches_engine() {
     // 走 workdir 分支，所以随便写个字符串也能通过——但那样测的就不是真实输入形态了。
     let dir = repo();
     let path = p(&dir);
-    let via_backend = backend_for(&path).unwrap().diff("workdir").unwrap();
+    let via_backend = backend_for(&path)
+        .unwrap()
+        .diff("workdir", &Default::default())
+        .unwrap();
     let via_engine = engine::diff::read_diff(&path, "workdir".to_string()).unwrap();
     assert_eq!(via_backend.files.len(), via_engine.files.len());
     assert!(
@@ -101,7 +104,10 @@ fn backend_diff_handles_commit_scope() {
     let path = p(&dir);
     let head = backend_for(&path).unwrap().open().unwrap().head_hash;
     let scope = format!("commit:{head}");
-    let via_backend = backend_for(&path).unwrap().diff(&scope).unwrap();
+    let via_backend = backend_for(&path)
+        .unwrap()
+        .diff(&scope, &Default::default())
+        .unwrap();
     let via_engine = engine::diff::read_diff(&path, scope.clone()).unwrap();
     assert_eq!(via_backend.files.len(), via_engine.files.len());
     assert!(!via_backend.files.is_empty(), "c2 相对 c1 应当有变更");

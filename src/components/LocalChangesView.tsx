@@ -312,9 +312,12 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
   // 父组件按它所在的区读 diff，传下来的 `diff` 里同一路径最多一条
   const active = activeChange(selection, paths.unstaged, paths.staged)
   const activeFile = active?.path ?? null
+  // 「上下文被后端退回默认」的标记要跟着带过去，理由同 `CommitDetailView` 的 `activeDiff`
+  const contextNarrowed = diff?.contextNarrowed
   const activeDiff: DiffData = useMemo(() => ({
     files: (diff?.files ?? []).filter((f) => f.path === activeFile),
-  }), [diff, activeFile])
+    contextNarrowed,
+  }), [diff, activeFile, contextNarrowed])
   // 没有文件可显示时父组件什么都不读（`changesDiffScope` 为 null），diff 一直是 null：
   // 这时不能说正在读取，按空 diff 显示
   // 只读选中的那一个文件之后，换选中也要等一次读取（通常几十毫秒）：提示延迟出现，读得快就不闪
@@ -336,10 +339,9 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
     ? <div className="diff-note diff-note-pending">
         {active.section === 'staged' ? '正在读取暂存区的改动…' : '正在读取工作区的改动…'}
       </div>
-    // 读失败时 files 是空的：不说明的话就成了「没有改动」（第 72 条）
-    : diff?.error
-      ? <div className="diff-note">读取改动失败：{diff.error}</div>
-      : <DiffView diff={activeDiff} />
+    // 读失败时 files 是空的：不说明的话就成了「没有改动」（第 72 条）。
+    // 说明放进 DiffView：工具栏还在，开关调坏了能在这里调回去
+    : <DiffView diff={activeDiff} note={diff?.error ? `读取改动失败：${diff.error}` : undefined} />
   const conflictByPath = useMemo(
     () => new Map((conflicts ?? []).map((c) => [c.path, c])),
     [conflicts],

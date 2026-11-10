@@ -16,10 +16,12 @@ pub fn read_status_paths(
     backend_for(&path)?.status_paths(&paths)
 }
 
+/// JS 侧参数名：`{ path, scope, options }`。`options` 可以不传，就是原来的默认行为。
 #[tauri::command(async)]
 pub fn read_diff(
     path: String,
     scope: String,
+    options: Option<crate::engine::diff::DiffViewOptions>,
 ) -> Result<crate::engine::diff::DiffData, crate::error::GitError> {
-    backend_for(&path)?.diff(&scope)
+    backend_for(&path)?.diff(&scope, &options.unwrap_or_default())
 }

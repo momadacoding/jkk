@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 //
 // svn 节点详情里「这次交付包含的本地提交」：能点开单个提交，点开后能回到 svn 节点（2026-10-16 用户要求）。
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import { CommitDetailView } from '@/components/CommitDetailView'
+import { setDiffPrefs } from '@/store/diffPrefsStore'
 import type { ExternalToolsConfig } from '@/engine/externalTools'
 import type { CommitNode, DiffData } from '@/engine/types'
 
@@ -227,5 +228,47 @@ describe('CommitDetailView：diff 读失败', () => {
     render(<CommitDetailView commit={three[1]} diff={empty} repoPath="C:/r" onSelectCommit={vi.fn()} />)
     fireEvent.click(screen.getByRole('button', { name: /Changes/ }))
     expect(screen.queryByText(/读取改动失败/)).toBeNull()
+  })
+
+  it('失败说明里带着 diff 工具栏：开关调成读不出来的样子时能在这里调回去', () => {
+    render(<CommitDetailView commit={three[1]} diff={failed} repoPath="C:/r" onSelectCommit={vi.fn()} />)
+    fireEvent.click(screen.getByRole('button', { name: /Changes/ }))
+    expect(screen.getByRole('toolbar', { name: 'diff 显示选项' })).toBeTruthy()
+  })
+})
+
+// diff 面板开关：后端因为文件太多按默认上下文读了，只显示选中文件时这个标记也要带过去（真实窗口里丢过）
+describe('CommitDetailView：上下文被后端退回默认', () => {
+  it('Changes 标签里 diff 上方有说明', () => {
+    const narrowed: DiffData = {
+      files: [{ path: 'a.txt', status: 'modified', oldPath: null, binary: false, hunks: [] }],
+      contextNarrowed: true,
+    }
+    render(<CommitDetailView commit={three[1]} diff={narrowed} repoPath="C:/r" onSelectCommit={vi.fn()} />)
+    fireEvent.click(screen.getByRole('button', { name: /Changes/ }))
+    expect(screen.getByText(/文件太多/)).toBeTruthy()
+  })
+})
+
+// 文件列表的增删行数与右侧 diff 同一口径：只换了换行符的文件在 diff 里被藏掉，列表也不能说 +3/-3
+describe('CommitDetailView：增删行数跟着忽略换行符', () => {
+  const del = (content: string, o: number) => ({ origin: '-' as const, content, oldLineno: o, newLineno: null })
+  const add = (content: string, n: number) => ({ origin: '+' as const, content, oldLineno: null, newLineno: n })
+  const crlf: DiffData = {
+    files: [{
+      path: 'a.txt', status: 'modified', oldPath: null, binary: false,
+      hunks: [{
+        oldStart: 1, newStart: 1, header: '@@ -1,3 +1,3 @@',
+        lines: [del('one', 1), del('two', 2), del('three', 3), add('one\r', 1), add('TWO\r', 2), add('three\r', 3)],
+      }],
+    }],
+  }
+
+  it('默认（忽略换行符开着）只算真改的那一行；关掉后每行都算', () => {
+    render(<CommitDetailView commit={three[1]} diff={crlf} repoPath="C:/r" onSelectCommit={vi.fn()} />)
+    expect(screen.getByText('+1/-1')).toBeTruthy()
+    act(() => { setDiffPrefs({ ignoreEol: false }) })
+    expect(screen.getByText('+3/-3')).toBeTruthy()
+    act(() => { setDiffPrefs({ ignoreEol: true }) })
   })
 })
