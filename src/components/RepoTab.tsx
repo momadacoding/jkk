@@ -159,9 +159,9 @@ export function RepoTab({
   repoPath, active, openPaths, onOpenInNewTab, onRepoRemoved,
 }: RepoTabProps) {
   const {
-    state, openRepo, refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers,
+    state, openRepo, refreshHead, refreshHeadInfo, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers,
     refreshDiff, refreshUpstream, refreshStashes, refreshPullRequests,
-    refreshSvnSync, refreshSvnEol, refreshSvnSyncState, refreshSvnBranchesBehind, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, checkSvnSyncOnFocus, freshSvnSync, markSvnFollowOnBlur, fetchSvnLog, refreshSvnAudit, auditSvnIfDue,
+    refreshSvnSync, refreshSvnEol, refreshSvnSyncState, refreshSvnBranchesBehind, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, noteOwnCommit, checkSvnSyncOnFocus, freshSvnSync, markSvnFollowOnBlur, fetchSvnLog, refreshSvnAudit, auditSvnIfDue,
     selectCommit, clearError, reportError, wantedDiffScope, refreshChanges: refreshChangesIn, afterIndexWrite,
   } = useRepoStore()
   const [repoState, setRepoState] = useState<string>('normal')
@@ -263,7 +263,7 @@ export function RepoTab({
 
   useRepoEffects(
     state,
-    { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, checkSvnSyncOnFocus, markSvnFollowOnBlur, refreshSvnSyncState, refreshSvnBranchesBehind, auditSvnIfDue, wantedDiffScope, reportError },
+    { refreshHeadInfo, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, checkSvnSyncOnFocus, markSvnFollowOnBlur, refreshSvnSyncState, refreshSvnBranchesBehind, auditSvnIfDue, wantedDiffScope, reportError },
     // 文件历史视图自己读数据；这里按要回去的那个视图读，返回时不用再等一次
     viewMode === 'history' ? historyReturn : viewMode,
     changesScope,
@@ -366,15 +366,24 @@ export function RepoTab({
         // 没提交上（hook 拒绝、同步进行中……）：写好的说明留着（review 第 6 条）
         return false
       }
-      // 提交已经成功：刷新失败不影响「说明可以清空」
-      await refreshGraph(path).catch(reportError)
-      await refreshChanges(path).catch(reportError)
+      // 提交已经成功：刷新失败不影响「说明可以清空」。
+      // 几项并发、状态不排在读图后面（H5）：提交写了 refs，监听约半秒后会发起一轮全量状态读取。串行的话
+      // 状态读取排在读图后面，多半撞上监听那一轮、要等它读完再补读一轮，提交要等两轮全量状态。
+      // 和读图同时发的话监听那轮排到它后面补跑，提交只等自己这一轮
+      await Promise.all([
+        // 普通提交叠在原来的 HEAD 上，第二档的结论不变：记下新 HEAD，监听随后就不再跑那两次秒级的
+        // svn status（H1）。amend 换了父提交，照常校验。要赶在监听（去抖 300 ms）之前；它只读一次 HEAD
+        // （libgit2，毫秒级），排在状态前面不拖慢状态
+        state.capabilities.vcs === 'svn' && !amend ? noteOwnCommit(path).catch(() => undefined) : undefined,
+        refreshChanges(path).catch(reportError),
+        refreshGraph(path).catch(reportError),
+      ])
       return true
     } finally {
       committing.current = false
       setAutoNudge((n) => n + 1)
     }
-  }, [state.path, state.capabilities.vcs, state.status, following, freshSvnSync, confirm, refreshGraph, refreshChanges, reportError])
+  }, [state.path, state.capabilities.vcs, state.status, following, freshSvnSync, noteOwnCommit, confirm, refreshGraph, refreshChanges, reportError])
 
   const runAndRefresh = useCallback(async (cmd: string, args: Record<string, unknown>, refresh: () => Promise<void>) => {
     if (!state.path) return

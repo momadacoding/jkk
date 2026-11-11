@@ -10,6 +10,10 @@ pub struct RepoInfo {
     pub head: String,
     /// HEAD 解析出的完整 oid。工作区伪行靠它挂到图上。
     pub head_hash: String,
+    /// HEAD 的父提交，顺序同 git（第一个是提交 / 合并前的 HEAD）。根提交为空。
+    /// 前端据此认出「叠在原来 HEAD 上的单父新提交」，本应用提交后不必再跑 SVN 第二档
+    /// （`svnSync.ts` 的 `isPlainCommitOn`、`repoStore.ts` 的 `noteOwnCommit`）。
+    pub head_parents: Vec<String>,
 }
 
 pub fn open(path: &str) -> Result<RepoInfo> {
@@ -18,16 +22,18 @@ pub fn open(path: &str) -> Result<RepoInfo> {
     let head = repo.head()?;
     let head_name = head.shorthand().unwrap_or("HEAD").to_string();
     // 符号引用要 resolve 之后才有 target
-    let head_hash = head
-        .resolve()
-        .ok()
-        .and_then(|r| r.target())
-        .map(|oid| oid.to_string())
+    let head_oid = head.resolve().ok().and_then(|r| r.target());
+    let head_hash = head_oid.map(|oid| oid.to_string()).unwrap_or_default();
+    // 读不出来按空：前端拿空列表一律当「要校验」，只是少省一次
+    let head_parents = head_oid
+        .and_then(|oid| repo.find_commit(oid).ok())
+        .map(|c| c.parent_ids().map(|p| p.to_string()).collect())
         .unwrap_or_default();
     Ok(RepoInfo {
         path: path.to_string(),
         head: head_name,
         head_hash,
+        head_parents,
     })
 }
 

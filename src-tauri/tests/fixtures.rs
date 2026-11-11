@@ -308,6 +308,43 @@ fn open_repo_reports_both_head_name_and_hash() {
     assert_eq!(info.head_hash, data.commits[0].id);
 }
 
+/// 提交后的 SVN 第二档能不能省，要看新 HEAD 是不是旧 HEAD 的单父子提交（`headMoveNeedsCheck`）。
+#[test]
+fn open_repo_reports_head_parents() {
+    let dir = linear_repo();
+    let path = dir.path().to_str().unwrap();
+    let info = engine::repo::open(path).unwrap();
+    let data = engine::graph::load(path).unwrap();
+    assert_eq!(info.head_parents, vec![data.commits[1].id.clone()]);
+    // 前端按 `headParents` 读（`repoStore.ts` 的 `refreshHeadInfo`），键名写错只会让优化静默失效
+    let json = serde_json::to_value(&info).unwrap();
+    assert_eq!(json["headParents"][0], data.commits[1].id.as_str());
+
+    // 根提交没有父提交
+    let root = TempDir::new().unwrap();
+    let r = root.path();
+    run_git(r, &["init", "-q"]);
+    run_git(r, &["config", "user.email", "test@test.com"]);
+    run_git(r, &["config", "user.name", "Test"]);
+    fs::write(r.join("a.txt"), "a").unwrap();
+    run_git(r, &["add", "a.txt"]);
+    run_git(r, &["commit", "-qm", "root"]);
+    let info = engine::repo::open(r.to_str().unwrap()).unwrap();
+    assert!(info.head_parents.is_empty());
+
+    // merge 提交有两个父提交，顺序同 git：第一个是合并前的 HEAD
+    let before = info.head_hash.clone();
+    run_git(r, &["checkout", "-qb", "side"]);
+    fs::write(r.join("b.txt"), "b").unwrap();
+    run_git(r, &["add", "b.txt"]);
+    run_git(r, &["commit", "-qm", "side"]);
+    let side = engine::repo::open(r.to_str().unwrap()).unwrap().head_hash;
+    run_git(r, &["checkout", "-q", "-"]);
+    run_git(r, &["merge", "-q", "--no-ff", "-m", "merge", "side"]);
+    let info = engine::repo::open(r.to_str().unwrap()).unwrap();
+    assert_eq!(info.head_parents, vec![before, side]);
+}
+
 /// 用固定时间戳提交，避免同一秒内多次提交导致排序断言不稳定。
 fn commit_at(dir: &std::path::Path, name: &str, date: &str) {
     fs::write(dir.join(format!("{name}.txt")), name).unwrap();

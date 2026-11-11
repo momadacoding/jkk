@@ -17,7 +17,7 @@ import {
   syncBannerIsSuppressed,
   wcDbStampsChanged,
   type EolStatus,
-  type RootRevMemo,
+  type ObservationMemo,
   type SyncStatus,
   type SyncVerdict,
   type WcDbStamp,
@@ -293,7 +293,7 @@ describe('§6.6.3 两档同步检测：什么时候才允许把观测值记下�
   it('第二档失败时不记观测值，同一个值第二次必须重试（HEAD 变化用它）', async () => {
     // 2026-09-21 独立 review：观测值在 await 之前就推进的话，失败之后下一次事件看到同一个值
     // 直接返回，横幅永远停在旧结论。
-    const memo: RootRevMemo = { value: null }
+    const memo: ObservationMemo<string> = { value: null }
     const full = fakeFullCheck()
 
     full.failNext(true)
@@ -573,7 +573,7 @@ describe('runSvnSyncCheck（第一档只比 wc.db 戳，计划 2026-11-08 Task 1
   })
 
   it('recordAfterSuccess 被顶替时不记，任意类型的观测值都一样', async () => {
-    const head: RootRevMemo = { value: 'h1' }
+    const head: ObservationMemo<string> = { value: 'h1' }
     expect(await recordAfterSuccess(head, 'h2', async () => false)).toBe(false)
     expect(head.value).toBe('h1')
     const memo: WcDbStampMemo = { value: [a] }
