@@ -185,6 +185,10 @@ pub struct FollowReport {
     /// 已删的文件带了回来。多半是重放干净却合错了（W14；PR 119 遗留）。只告警，不拦。
     #[serde(default)]
     pub drift: Vec<String>,
+    /// 分支上保留下来的 commit 改过、SVN 侧也有新内容的文件（分析 §6.12 条件 11），逐个标出重放
+    /// 结果与磁盘是否逐字节相同。核对出错时为空（自动跟进因此不做，见 [`auto_blocker`]）。
+    #[serde(default)]
+    pub overlap: Vec<OverlapFile>,
     pub stage: ComposeReport,
     /// 移动过的其他分支。当前分支不在内。
     pub moved_branches: Vec<String>,
@@ -201,6 +205,17 @@ pub struct FollowReport {
     /// 不按钩子判定时为 `None`，收件箱不动。
     #[serde(default)]
     pub evidence_cutoff_ms: Option<i64>,
+}
+
+/// 条件 11 的一个重叠文件（2026-11-11 使用报告第 2 节，方案 B）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlapFile {
+    pub path: String,
+    /// 改过它、重放后仍保留的 commit：`短 hash 提交说明`，按提交顺序从新到旧。
+    pub commits: Vec<String>,
+    /// 重放后的 tip 与磁盘逐字节相同（磁盘按 `git add` 的过滤规则算；两边都没有这个文件也算）。
+    pub matches_disk: bool,
 }
 
 /// 跟进判定「暂存是不是中间版本」的依据（C1h；分析 §6.13.3）。
@@ -315,7 +330,7 @@ pub fn follow_auto(repo: &str, opid: &str) -> Result<AutoFollowOutcome> {
             Err(e) => return Ok(skipped(e)),
         };
         fault::reach(fault::Point::Prepared, None);
-        if let Some(e) = auto_blocker(repo, &plan) {
+        if let Some(e) = auto_blocker(&plan) {
             return Ok(skipped(e));
         }
         let _lock = match svn_lock::acquire(repo, opid) {
@@ -355,7 +370,7 @@ fn branch_behind_not_auto() -> GitError {
 }
 
 /// 条件 6、7、8、11。返回第一条不满足的，按表里的顺序。
-fn auto_blocker(repo: &str, plan: &Plan) -> Option<GitError> {
+fn auto_blocker(plan: &Plan) -> Option<GitError> {
     // prepare(auto) 已经挡在前面，这里只是兜底：分支跟进入口没有新基线可发布
     if plan.old_base == plan.new_base {
         return Some(branch_behind_not_auto());
@@ -369,8 +384,8 @@ fn auto_blocker(repo: &str, plan: &Plan) -> Option<GitError> {
             ),
         ));
     }
-    let tip = match &plan.target {
-        Target::Tip(t) => t,
+    match &plan.target {
+        Target::Tip(_) => {}
         Target::Conflict(m) if m.stale_disk => {
             return Some(GitError::new(
                 "svn_auto_follow_stale_disk",
@@ -402,62 +417,143 @@ fn auto_blocker(repo: &str, plan: &Plan) -> Option<GitError> {
             ),
         ));
     }
-    let overlap = match retained_overlap(repo, &plan.new_base, tip, &plan.external) {
-        Ok(o) => o,
-        Err(e) => {
-            return Some(GitError::new(
-                "svn_auto_follow_overlap_unknown",
-                format!(
-                    "没能核对分支上的提交与 SVN 新内容有没有碰到同一批文件（{}），这次不自动跟进。\
-                     {TAIL_FOLLOW}",
-                    e.message
-                ),
-            ))
+    if let Some(e) = &plan.overlap_err {
+        return Some(GitError::new(
+            "svn_auto_follow_overlap_unknown",
+            format!(
+                "没能核对分支上的提交与 SVN 新内容有没有碰到同一批文件（{}），这次不自动跟进。\
+                 {TAIL_FOLLOW}",
+                e.message
+            ),
+        ));
+    }
+    // 方案 B：重叠但重放结果与磁盘逐字节相同的放行。「本地改动」= 磁盘 − tip，两者相同就不会有
+    // W14 那种反向改动；drift 一定是 tip ≠ 磁盘，照样拦
+    let bad: Vec<&OverlapFile> = plan
+        .report
+        .overlap
+        .iter()
+        .filter(|o| !o.matches_disk)
+        .collect();
+    if !bad.is_empty() {
+        let mut commits: Vec<String> = Vec::new();
+        for c in bad.iter().flat_map(|o| o.commits.iter()) {
+            if !commits.contains(c) {
+                commits.push(c.clone());
+            }
         }
-    };
-    // drift 是条件 11 的子集（tip 与 NEW 不同的外部路径一定被保留的 commit 改过），兜底再看一次
-    let mut overlap: BTreeSet<String> = overlap;
-    overlap.extend(plan.report.drift.iter().cloned());
-    if !overlap.is_empty() {
+        let by = if commits.is_empty() {
+            String::new()
+        } else {
+            format!("（{}）", capped(commits, "个提交"))
+        };
         return Some(GitError::new(
             "svn_auto_follow_overlap",
             format!(
-                "当前分支上的提交改过的文件，SVN 侧也有新内容（{}）。重放即使没有冲突，结果也可能和\
-                 磁盘对不上，要你看一眼。{TAIL_FOLLOW}跟进之后请对照报告检查这些文件。",
-                capped(overlap.into_iter().collect(), "个文件")
+                "当前分支上的提交{by}改过的文件，SVN 侧也有新内容，重放出来的结果和磁盘对不上（{}）。\
+                 可能是文件里还有没提交的改动，也可能是重放合错了，要你看一眼。{TAIL_FOLLOW}\
+                 报告会逐个标出这些文件是否与磁盘一致。",
+                capped(bad.iter().map(|o| o.path.clone()).collect(), "个文件")
             ),
         ));
     }
     None
 }
 
-/// 条件 11：重放后留下的 commit（`new..tip`）相对各自新父提交仍改动的路径，与外部变更的交集。
+/// 条件 11 的重叠文件：重放后留下的 commit（`new..tip`）相对各自新父提交仍改动的路径与外部变更的
+/// 交集，再并上 `drift`（是它的子集，兜底），逐个核对 tip 与磁盘是否逐字节相同（方案 B）。
 ///
 /// 按重放之后算：F2 ① 换成 SVN 版本的路径、6.10 的快照内容已经不在 commit 里了，「C1 改了 a 和
 /// e、只有 a 被提交」这种情形 C1' 只剩 e，不受影响（分析 §6.12 条件 11）。
-fn retained_overlap(
+///
+/// 磁盘内容按 `git add` 的过滤规则算（同 [`drift_paths`]）。tip 与磁盘都没有这个文件算相同；只差
+/// 可执行位不算不同（同 [`drift_paths`] 的 review 第 5 条）；符号链接、子模块、目录一律算不同。
+fn overlap_files(
     repo: &str,
     new: &str,
     tip: &str,
     external: &BTreeSet<String>,
-) -> Result<BTreeSet<String>> {
-    if new == tip || external.is_empty() {
-        return Ok(BTreeSet::new());
+    drift: &[String],
+) -> Result<Vec<OverlapFile>> {
+    let mut by_path = retained_by_path(repo, new, tip, external)?;
+    for p in drift {
+        by_path.entry(p.clone()).or_default();
     }
-    // `--format=` 加 `-z`：每条路径以 NUL 结尾，commit 之间没有分隔（2026-11-07 实测 git 2.51）
+    if by_path.is_empty() {
+        return Ok(Vec::new());
+    }
+    let r = Repository::open(repo)?;
+    let tree = r.revparse_single(tip)?.peel_to_tree()?;
+    let mut out: Vec<OverlapFile> = Vec::new();
+    // (out 的下标, tip 的 blob)
+    let mut to_hash: Vec<(usize, String)> = Vec::new();
+    for (path, commits) in by_path {
+        let entry = tree.get_path(Path::new(&path)).ok();
+        let on_disk = Path::new(repo).join(&path).symlink_metadata().ok();
+        let matches_disk = match (&entry, &on_disk) {
+            (None, None) => true,
+            (Some(e), Some(m)) if matches!(e.filemode(), 0o100644 | 0o100755) && m.is_file() => {
+                to_hash.push((out.len(), e.id().to_string()));
+                false
+            }
+            _ => false,
+        };
+        out.push(OverlapFile {
+            path,
+            commits,
+            matches_disk,
+        });
+    }
+    if !to_hash.is_empty() {
+        let input: String = to_hash
+            .iter()
+            .map(|(i, _)| format!("{}\n", out[*i].path))
+            .collect();
+        let hashed = run_git_stdin(repo, &["hash-object", "--stdin-paths"], input.as_bytes())?;
+        let disk: Vec<&str> = hashed.lines().map(str::trim).collect();
+        if disk.len() != to_hash.len() {
+            return Err(GitError::new(
+                "svn_follow_hash_failed",
+                "核对磁盘内容时 git hash-object 的输出行数对不上。这次什么都没动，请再点一次「跟进」。",
+            ));
+        }
+        for ((i, blob), d) in to_hash.iter().zip(disk) {
+            out[*i].matches_disk = d == blob;
+        }
+    }
+    Ok(out)
+}
+
+/// 重放后留下的 commit 改过、又在外部变更里的路径 → 改过它的 commit（`短 hash 提交说明`，从新到旧）。
+fn retained_by_path(
+    repo: &str,
+    new: &str,
+    tip: &str,
+    external: &BTreeSet<String>,
+) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut hit: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    if new == tip || external.is_empty() {
+        return Ok(hit);
+    }
+    // 每个 commit 是 `\x01<短 hash>\x02<说明>` NUL，再跟 `\n<路径>` NUL、`<路径>` NUL ……；没改任何
+    // 路径的 commit 只有头（2026-11-11 实测 git 2.51）
     let out = run_git_bytes(
         repo,
         &[
             "log",
-            "--format=",
+            "--format=%x01%h%x02%s",
             "--name-only",
             "--no-renames",
             "-z",
             &format!("{new}..{tip}"),
         ],
     )?;
-    let mut hit = BTreeSet::new();
+    let mut current = String::new();
     for raw in out.split(|b| *b == 0) {
+        if let Some(head) = raw.strip_prefix(b"\x01") {
+            current = String::from_utf8_lossy(head).replacen('\x02', " ", 1);
+            continue;
+        }
         let raw = raw.strip_prefix(b"\n").unwrap_or(raw);
         if raw.is_empty() {
             continue;
@@ -470,7 +566,10 @@ fn retained_overlap(
             )
         })?;
         if external.contains(path) {
-            hit.insert(path.to_string());
+            let commits = hit.entry(path.to_string()).or_default();
+            if !commits.contains(&current) {
+                commits.push(current.clone());
+            }
         }
     }
     Ok(hit)
@@ -855,8 +954,9 @@ struct Plan {
     /// 这次录的映射。锁内要再核对一遍（R3c）；分支跟进没有录制。
     recorded: Option<BaseMap>,
     who: Who,
-    /// 分支自己的基线到 NEW 之间外部变过的路径（[`External::paths`]）。自动跟进的条件 11 要它。
-    external: BTreeSet<String>,
+    /// 条件 11 的核对没做成（[`overlap_files`] 出错）。报告里的 `overlap` 这时为空，自动跟进
+    /// 不能把它当成「没有重叠」。
+    overlap_err: Option<GitError>,
 }
 
 /// 判定「是不是我提交的」「早于外部提交吗」的线索（计划 Task 9）。全部拿不准时走保守分支。
@@ -1352,6 +1452,7 @@ fn prepare(repo: &str, auto: bool) -> Result<Plan> {
         Replayed::Moved { tip, .. } => stale_disk_paths(repo, &scope, &old_base, &old_head, tip)?,
         Replayed::Conflict { .. } => Vec::new(),
     };
+    let mut overlap_err = None;
     let (target, others) = match replayed {
         Replayed::Conflict { at, files, tree } => {
             // F3 也要算：分支没重放，但补丁可能已经上了服务器，用户要在手动跟进之前知道
@@ -1398,6 +1499,14 @@ fn prepare(repo: &str, auto: bool) -> Result<Plan> {
                 log::warn!("核对重放结果与磁盘时出错，跳过：{}", e.message);
                 Vec::new()
             });
+            // 条件 11 的逐文件核对。手动跟进只写进报告；出错时自动跟进不做（auto_blocker）
+            match overlap_files(repo, &new_base, &tip, &paths, &report.drift) {
+                Ok(o) => report.overlap = o,
+                Err(e) => {
+                    log::warn!("核对重叠文件与磁盘时出错，跳过：{}", e.message);
+                    overlap_err = Some(e);
+                }
+            }
             // F3：按原始 commit 算，不受 F2 ① 换路径影响。手动跟进不拦，只告警（§6.12 条件 8 管自动）
             report.leaks = local_only_leaks(repo, &branch, &commits, &paths, &new_base)?;
             let others = plan_others(
@@ -1427,7 +1536,7 @@ fn prepare(repo: &str, auto: bool) -> Result<Plan> {
         report,
         recorded,
         who,
-        external: paths,
+        overlap_err,
     })
 }
 

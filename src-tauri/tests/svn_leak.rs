@@ -830,3 +830,100 @@ fn trailing_newline_is_not_part_of_the_comparison() {
     let n = "l1\nl2\nfeature\nlog\n";
     assert_eq!(judge(b, l, n), vec![(2, 0, LeakVerdict::Present)]);
 }
+
+// ── 暂存是否已在 NEW 里（方案 C）：判据比泄漏严，误判成「在」会把真丢的暂存藏起来 ──
+
+fn tally(base: &str, staged: &str, new: &str) -> (usize, usize) {
+    let t = app_lib::engine::svn_leak::stage_hunks_in_new(
+        base.as_bytes(),
+        staged.as_bytes(),
+        new.as_bytes(),
+    )
+    .unwrap();
+    (t.present, t.total)
+}
+
+#[test]
+fn stage_change_already_in_new_counts_even_when_new_changed_more_around_it() {
+    // 使用报告第 4 节的形状：暂存加了几条，SVN 在同一片加了这几条，还多加了别的
+    let base = "k1\nk2\nk3\n";
+    let staged = "k1\na\nb\nk2\nk3\n";
+    let new = "k1\nz\na\nb\nc\nk2\nk3\n";
+    assert_eq!(tally(base, staged, new), (1, 1));
+}
+
+#[test]
+fn stage_lines_scattered_in_new_do_not_count() {
+    // 泄漏判定按条去找，这里要求连续、按顺序：a 和 b 都在，但中间隔着别的
+    let base = "k1\nk2\n";
+    let staged = "k1\na\nb\nk2\n";
+    let new = "k1\na\nx\nb\nk2\n";
+    assert_eq!(tally(base, staged, new), (0, 1));
+}
+
+#[test]
+fn stage_lines_only_elsewhere_in_the_file_do_not_count() {
+    // `end` 到处都是：NEW 在文件别处也加了，但暂存那一片 NEW 改成了别的
+    let base = "f\nk1\ng\nk2\n";
+    let staged = "f\nend\nk1\ng\nk2\n";
+    let new = "f\nother\nk1\ng\nend\nk2\n";
+    assert_eq!(tally(base, staged, new), (0, 1));
+}
+
+#[test]
+fn stage_deletion_must_also_be_in_new() {
+    // 暂存把 old 换成 a；NEW 加了 a，却还留着 old
+    let base = "k1\nold\nk2\n";
+    let staged = "k1\na\nk2\n";
+    assert_eq!(tally(base, staged, "k1\na\nold\nk2\n"), (0, 1));
+    // 删除也在了才算
+    assert_eq!(tally(base, staged, "k1\na\nb\nk2\n"), (1, 1));
+}
+
+#[test]
+fn two_stage_hunks_cannot_share_one_new_change() {
+    // 独立 review M1：暂存在两处各加了 foo，NEW 只在一处加了。两处都去同一段 NEW 里找，
+    // 同一行被认领两次，就成了「全在」
+    let base = "k1\nk2\nk3\n";
+    let staged = "k1\nfoo\nk2\nfoo\nk3\n";
+    let new = "k1\nfoo\nK2\nk3\n";
+    assert_eq!(tally(base, staged, new), (0, 2));
+}
+
+#[test]
+fn stage_of_a_file_new_also_added_is_judged_against_an_empty_base() {
+    assert_eq!(tally("", "a\nb\n", "a\nb\n"), (1, 1));
+    assert_eq!(tally("", "a\nb\n", "z\na\nb\n"), (1, 1));
+    assert_eq!(tally("", "a\nb\n", "a\nx\n"), (0, 1));
+}
+
+#[test]
+fn stage_deletions_at_the_start_and_end_of_the_file() {
+    let base = "1\n2\n3\n";
+    // 暂存删掉第 1 行：NEW 也删了才算
+    assert_eq!(tally(base, "2\n3\n", "2\n3x\n"), (1, 1));
+    assert_eq!(tally(base, "2\n3\n", "1\n2\n3x\n"), (0, 1));
+    // 暂存删掉最后一行
+    assert_eq!(tally(base, "1\n2\n", "1x\n2\n3\n"), (0, 1));
+    assert_eq!(
+        tally(base, "1\n2\n", "1x\n2\n"),
+        (1, 1),
+        "NEW 也删了第 3 行"
+    );
+    assert_eq!(tally(base, "1\n2\n", "1\n2\n4\n"), (1, 1));
+}
+
+#[test]
+fn stage_last_line_without_newline_is_compared_with_its_line_ending() {
+    // 行尾也比：暂存末行没换行、NEW 有，算不在（宁可多报）
+    assert_eq!(tally("1\n", "1\nend", "1\nend\nmore\n"), (0, 1));
+    assert_eq!(tally("1\n", "1\nend", "1\nend"), (1, 1));
+}
+
+#[test]
+fn stage_hunks_untouched_by_new_are_not_in_new() {
+    let base = "1\n2\n3\n4\n5\n6\n";
+    let staged = "one\n2\n3\n4\nfive\n6\n";
+    let new = "one\ntwo\n3\n4\n5\n6\n";
+    assert_eq!(tally(base, staged, new), (1, 2));
+}

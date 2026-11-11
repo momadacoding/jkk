@@ -502,3 +502,122 @@ fn body(line: &[u8]) -> &[u8] {
     let line = line.strip_suffix(b"\n").unwrap_or(line);
     line.strip_suffix(b"\r").unwrap_or(line)
 }
+
+// ── 暂存的改动是否已经在 SVN 上（2026-11-11 使用报告第 4 节，方案 C）─────────────
+
+/// OLD → 暂存的改动块（零上下文 hunk）里，有几处已经原样在 NEW 里。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StageTally {
+    pub present: usize,
+    pub total: usize,
+}
+
+/// 跟进拼索引时三方合并冲突、保不住的暂存（`lost`），它的每处改动在 NEW 里有没有。
+///
+/// # 误判方向与泄漏相反
+///
+/// 泄漏判定把拿不准的算 `Present`（宁可多一条告警），这里的「在」会把红色的「丢失的暂存」降成灰色，
+/// 误判成「在」就是把真丢了的内容藏起来，所以不复用 [`judge_hunk`]：它在映射位置对不上时逐行到
+/// NEW 的改动里去找，`end`、`}` 这种行到处都是。一处改动 h（OLD 的 `[s, e)` 换成 `+` 行）只在
+/// 下面全部成立时算在：
+///
+/// 1. NEW 动过这一片：有 OLD→NEW 的 hunk 与 h 重叠（纯插入碰到边界也算）。没动过就是没有。
+/// 2. 取这些重叠 hunk 与 h 的并集区域，算出它在 NEW 里的那一段：`+` 行**按顺序、连续地**出现在
+///    这一段里（逐字节，行尾也比）。只在这一段里找，不到全文里找。
+/// 3. h 删掉的行，NEW 那一段里不比暂存同一片区域里更多：删除也要已经在 NEW 里。
+/// 4. 与 h 重叠的 NEW hunk 不再与暂存的别的 hunk 重叠。每处单独去同一段 NEW 里找，同一行会被
+///    认领两次（独立 review M1：暂存两处各加 `foo`，NEW 只加了一处），合起来判又说不准，一律不算。
+///
+/// 只比文本。调用方负责二进制、删除、mode 之类的整文件情形。
+pub fn stage_hunks_in_new(base: &[u8], staged: &[u8], new: &[u8]) -> Result<StageTally> {
+    let s_hunks = spans(base, staged)?;
+    let n_hunks = spans(base, new)?;
+    fn lines(b: &[u8]) -> Vec<&[u8]> {
+        b.split_inclusive(|c| *c == b'\n').collect()
+    }
+    let (b, s, n) = (lines(base), lines(staged), lines(new));
+    let shared: Vec<bool> = n_hunks
+        .iter()
+        .map(|k| s_hunks.iter().filter(|h| overlaps(h, k)).count() > 1)
+        .collect();
+    let present = s_hunks
+        .iter()
+        .filter(|h| {
+            let alone = n_hunks
+                .iter()
+                .zip(&shared)
+                .all(|(k, shared)| !(*shared && overlaps(h, k)));
+            alone && hunk_in_new(h, &n_hunks, &b, &s, &n)
+        })
+        .count();
+    Ok(StageTally {
+        present,
+        total: s_hunks.len(),
+    })
+}
+
+/// OLD 里的两段改动重叠。有一侧是纯插入（区间为空）时，碰到边界也算。
+fn overlaps(h: &Span, k: &Span) -> bool {
+    let (hs, he, ks, ke) = (h.start, h.end(), k.start, k.end());
+    if h.oc == 0 || k.oc == 0 {
+        ks <= he && hs <= ke
+    } else {
+        ks < he && hs < ke
+    }
+}
+
+fn hunk_in_new(h: &Span, news: &[Span], b: &[&[u8]], s: &[&[u8]], n: &[&[u8]]) -> bool {
+    let (hs, he) = (h.start, h.end());
+    // 纯删除时 `new_start` 可能是 0，不拿它取行
+    let plus = if h.nc == 0 {
+        &[][..]
+    } else {
+        match slice(s, i64::from(h.new_start), h.nc as usize) {
+            Some(p) => p,
+            None => return false,
+        }
+    };
+    let Some(minus) = slice(b, i64::from(hs), h.oc as usize) else {
+        return false;
+    };
+    // 并集区域之前 NEW 的累计行数变化，与并集区域内 NEW 的行数变化
+    let (mut delta, mut net) = (0i64, 0i64);
+    let (mut us, mut ue) = (hs, he);
+    let mut overlap = false;
+    for k in news {
+        let (ks, ke) = (k.start, k.end());
+        let change = i64::from(k.nc) - i64::from(k.oc);
+        if overlaps(h, k) {
+            overlap = true;
+            us = us.min(ks);
+            ue = ue.max(ke);
+            net += change;
+        } else if ke <= hs {
+            delta += change;
+        }
+    }
+    if !overlap {
+        return false;
+    }
+    let Ok(len) = usize::try_from(i64::from(ue - us) + net) else {
+        return false;
+    };
+    let Some(region) = slice(n, i64::from(us) + delta, len) else {
+        return false;
+    };
+    if !plus.is_empty() && !region.windows(plus.len()).any(|w| w == plus) {
+        return false;
+    }
+    // 暂存在同一片区域里的样子：OLD[us, hs) + `+` 行 + OLD[he, ue)
+    let (Some(left), Some(right)) = (
+        slice(b, i64::from(us), (hs - us) as usize),
+        slice(b, i64::from(he), (ue - he) as usize),
+    ) else {
+        return false;
+    };
+    let count = |pool: &[&[u8]], line: &[u8]| pool.iter().filter(|l| **l == line).count();
+    minus.iter().all(|line| {
+        count(region, line) <= count(left, line) + count(plus, line) + count(right, line)
+    })
+}
