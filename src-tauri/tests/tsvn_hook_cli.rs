@@ -148,6 +148,13 @@ fn check_commit_hit_exits_one_with_message() {
         out.stderr.lines().last(),
         Some("取消勾选这些文件，或用「提交后恢复」删掉这些改动再提交。")
     );
+    // 英文备用说明带同样的路径与 commit 标题，线程代码页装不下中文时发它
+    assert!(out.stderr_en.contains("Code/A.cs"), "{}", out.stderr_en);
+    assert!(out.stderr_en.contains("调试补丁"), "{}", out.stderr_en);
+    assert_eq!(
+        out.stderr_en.lines().last(),
+        Some("Uncheck these files, or use \"Restore after commit\" to drop these changes before committing.")
+    );
     // 拦截也不写事件
     assert!(fx.events().is_empty());
 }
@@ -551,6 +558,91 @@ fn stderr_text_follows_the_thread_code_page_not_the_system_one() {
     let got = encode_thread_acp("钩子");
     let _ = unsafe { SetThreadLocale(before) };
     assert_eq!(got, vec![0xB9, 0xB3, 0xD7, 0xD3]);
+}
+
+/// 在本测试线程上临时换 locale 跑 `f`，跑完换回。
+#[cfg(windows)]
+#[allow(unsafe_code)] // 改本线程 locale 只有 Win32 C API
+fn with_thread_locale<T>(lcid: u32, f: impl FnOnce() -> T) -> T {
+    use windows::Win32::Globalization::{GetThreadLocale, SetThreadLocale};
+    let before = unsafe { GetThreadLocale() };
+    assert!(unsafe { SetThreadLocale(lcid) }.as_bool());
+    let got = f();
+    let _ = unsafe { SetThreadLocale(before) };
+    got
+}
+
+#[cfg(windows)]
+const EN_CA: u32 = 0x1009;
+#[cfg(windows)]
+const ZH_CN: u32 = 0x0804;
+
+/// 真实形态（2026-11-11 使用报告）：系统 locale 中文、区域格式 en-CA，线程代码页 1252。
+/// 中文提示编码后全是 `?`，要改发英文版。
+#[cfg(windows)]
+#[test]
+fn hook_stderr_falls_back_to_english_when_the_thread_code_page_cannot_hold_chinese() {
+    use app_lib::engine::tsvn_hook_cli::hook_stderr_bytes;
+    let got = with_thread_locale(EN_CA, || hook_stderr_bytes("jkk：中文", "jkk: English"));
+    assert_eq!(got, b"jkk: English".to_vec());
+}
+
+#[cfg(windows)]
+#[test]
+fn hook_stderr_keeps_chinese_when_the_thread_code_page_holds_it() {
+    use app_lib::engine::tsvn_hook_cli::hook_stderr_bytes;
+    let got = with_thread_locale(ZH_CN, || hook_stderr_bytes("钩子", "hook"));
+    assert_eq!(got, vec![0xB9, 0xB3, 0xD7, 0xD3]);
+}
+
+/// 1252 会把全角「，」best-fit 成 `,`、不加 `WC_NO_BEST_FIT_CHARS` 时不报替换。汉字本身不靠这个
+/// flag 也会报；这条守的是「能原样显示」这个判据，不让 best-fit 过的文字算作装得下。
+#[cfg(windows)]
+#[test]
+fn best_fit_substitution_counts_as_lossy() {
+    use app_lib::engine::tsvn_hook_cli::hook_stderr_bytes;
+    let got = with_thread_locale(EN_CA, || hook_stderr_bytes("a，b", "fallback"));
+    assert_eq!(got, b"fallback".to_vec());
+}
+
+/// 英文版里的路径与 commit 标题可能本身是中文：模板照样是英文，装不下的字照旧变 `?`，
+/// 不会因此退回中文版或整段丢掉。
+#[cfg(windows)]
+#[test]
+fn english_fallback_with_chinese_path_keeps_the_english_template() {
+    use app_lib::engine::tsvn_hook_cli::hook_stderr_bytes;
+    let got = with_thread_locale(EN_CA, || {
+        hook_stderr_bytes("jkk：代码/甲.lua", "jkk: 代码/A.lua from \"小婉\"")
+    });
+    assert_eq!(got, b"jkk: ??/A.lua from \"??\"".to_vec());
+}
+
+/// 真实拦截消息走一遍：en-CA 下发出去的是英文版，中文的 commit 标题变 `?`。
+#[cfg(windows)]
+#[test]
+fn real_leak_message_under_en_ca_is_sent_in_english() {
+    use app_lib::engine::tsvn_hook_cli::hook_stderr_bytes;
+    let fx = fx();
+    git_repo(&fx, true);
+    let out = check_commit(&fx);
+    assert_eq!(out.code, 1);
+    let got = with_thread_locale(EN_CA, || hook_stderr_bytes(&out.stderr, &out.stderr_en));
+    let text = String::from_utf8(got).unwrap();
+    assert!(
+        text.starts_with("jkk: these files contain Local-Only patches"),
+        "{text}"
+    );
+    assert!(text.contains("Code/A.cs: line "), "{text}");
+    assert!(text.contains("from commit \"????\""), "{text}");
+    // 同一条消息在 zh-CN 下照发中文
+    let zh = with_thread_locale(ZH_CN, || hook_stderr_bytes(&out.stderr, &out.stderr_en));
+    assert!(zh.starts_with(&[b'j', b'k', b'k', 0xA3, 0xBA]), "{zh:?}");
+}
+
+#[test]
+fn empty_fallback_sends_the_original_text() {
+    use app_lib::engine::tsvn_hook_cli::hook_stderr_bytes;
+    assert_eq!(hook_stderr_bytes("plain", ""), b"plain".to_vec());
 }
 
 /// 注册的命令行里盘符根写成 `--repo "D:"`（`hook_command` 必须去掉结尾的 `\`），而 `D:` 是

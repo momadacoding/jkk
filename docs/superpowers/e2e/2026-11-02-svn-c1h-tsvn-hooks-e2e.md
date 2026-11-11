@@ -227,6 +227,17 @@ function Hooks {
 
 7. **应用：** 点回应用 → 跟进。报告里没有「泄漏告警」，Local-Only commit 还在分支上。
 
+### 5c：区域格式不是中文（2026-11-11 使用报告）
+
+真实形态是「系统 locale 中文、区域格式 en-CA」：线程代码页 1252，装不下中文。这一步改的是**当前用户的区域格式**，做完必须改回。
+
+1. 记下「设置 → 时间和语言 → 语言和区域 → 区域格式」的当前值，改成 **English (Canada)**。
+2. 5b 之后 `L.cs` 第 2 行又是 `line 02 DEBUG_PATCH`。资源管理器 → `WC` 右键 → **SVN Commit...**，只勾 `Code\L.cs`，点 OK。
+
+**应该看到（5c）：** 弹「Hook script failed」，内容是英文，没有成串的 `?`：`jkk: these files contain Local-Only patches; committing would upload them to the server:`、`Code/L.cs: line 2 onward, from commit "????"`（commit 标题「调试补丁」是中文，在 1252 里照样变 `?`，这是预期），最后一行 `Uncheck these files, or use "Restore after commit" to drop these changes before committing.`。点 **Abort**。仍是中文问号时先注销重登再试一次（新进程从用户 locale 初始化线程 locale），还不对就记为失败。
+
+3. 区域格式改回第 1 步记下的值。
+
 ## 场景 6：过期导致提交失败
 
 先造种子：`wc1` 里要有 `B.cs` 的旧版本，提交才会过期（这份清单原来少了这一步，`B.cs` 在 `wc1` 不存在时造不出过期）。
@@ -312,6 +323,7 @@ if (Test-Path $bak) { Move-Item -Force $bak "$env:APPDATA\com.momadacoding.jkk\s
 | 写注册表的 CAS：值被别人改过不写，写完被覆盖能发现 | `src-tauri/tests/tsvn_hooks.rs` 的 `cas_*` |
 | 钩子参数按位置解析、仓库外路径丢弃、RESULTPATH 含被删文件、错误一律放行 | `src-tauri/tests/tsvn_hook_cli.rs` |
 | stderr 按线程代码页编码（系统 ACP 不是 936 的机器上，中文不变 `?`） | `stderr_text_follows_the_thread_code_page_not_the_system_one` |
+| 线程代码页装不下中文时改发英文版（含 best-fit 全角标点、英文版里带中文路径） | `hook_stderr_*`、`best_fit_substitution_counts_as_lossy`、`english_fallback_with_chinese_path_keeps_the_english_template`、`svn_leak.rs` 的 `leak_message_en_*` |
 | Pre / Post 配对、孤儿 Pre 不配对、清理 | `src-tauri/tests/tsvn_inbox.rs` |
 | Check-commit 按磁盘判定（提交后恢复、整文件、大小写、fail-open） | `src-tauri/tests/svn_leak.rs` 的 disk_* 与 `tsvn_hook_cli.rs` 的 check_commit_* |
 | 跟进按事件判定的每一行（含失效退回、清理收件箱） | `src-tauri/tests/svn_follow_hooks.rs` |

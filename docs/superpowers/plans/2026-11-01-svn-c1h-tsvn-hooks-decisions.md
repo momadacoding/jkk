@@ -284,6 +284,8 @@ E2E 于 2026-11-02 在真实窗口和真实 TortoiseSVN 上跑完，场景 1–8
 ### 延后的 Minor
 
 - Final: minor (deferred): 用户 locale 不是中文时，线程代码页表示不了中文，拦截提示会变 `?`。文件名和行号（ASCII 部分）还在，退出码不受影响。
+  - **已修（2026-11-12）：** 2026-11-11 在「系统 locale 中文、区域格式 en-CA」（线程代码页 1252）的机器上真实出现。修法：`hook_stderr_bytes` 先用 `WC_NO_BEST_FIT_CHARS` + `lpUsedDefaultChar` 试编中文版，有一个字装不下（含全角标点被 best-fit 成半角）就改发 `leak_message_en`。没做「改按别的代码页编码」：H4/H5 的机器 ACP 1252、线程 936 时 GBK 显示正常，说明 TortoiseSVN 不按 `CP_ACP` 解读；线程代码页装不下的字，换什么编码都显示不出来。英文版里的路径与 commit 标题是原文，中文部分照样变 `?`。线程代码页是 UTF-8（Beta 选项）时这两个参数不受支持、调用失败，按不丢字处理。E2E 补了场景 5c。
+  - 遗留（minor）：判定看的是整条中文消息，含路径与 commit 标题。936 的机器上标题里有 GBK 之外的字（如 emoji）时也会改发英文，其实中文模板显示得了。两版里用户内容丢的字一样，只是换了模板语言，暂不处理。
 - Final: minor (deferred): 钩子健康时，报告仍可能问 SVN 用户名。
 - Final: minor (deferred): 失效横幅只列第一条原因。
 - Final: minor (deferred): 新测试在 ACP = 936 的机器上抓不到退回 `CP_ACP`。
