@@ -7,7 +7,7 @@
 
 use app_lib::engine::git_cli::{run_git, run_git_env, run_git_stdin_env};
 use app_lib::engine::svn_leak::{
-    leak_message, local_only_leaks, local_only_leaks_on_disk, Leak, LeakVerdict,
+    leak_message, leak_message_en, local_only_leaks, local_only_leaks_on_disk, Leak, LeakVerdict,
 };
 use app_lib::engine::svn_replay::{commits_between, ReplayCodes, ReplayCommit};
 use std::collections::BTreeSet;
@@ -732,6 +732,23 @@ fn leak_message_names_paths_subjects_and_the_way_out() {
     assert_eq!(
         msg.lines().last(),
         Some("取消勾选这些文件，或用「提交后恢复」删掉这些改动再提交。")
+    );
+}
+
+/// 线程代码页装不下中文时发的英文版（2026-11-11 使用报告）：内容与中文版逐条对应。
+#[test]
+fn leak_message_en_names_the_same_paths_lines_and_subjects() {
+    let b: String = (1..=20).map(|i| format!("line {i:02}\r\n")).collect();
+    let l = b.replace("line 02\r\n", "line 02 DEBUG_LOCAL_PATCH\r\n");
+    let (r, _) = disk_repo(&b, &l, Some(&l));
+    let msg = leak_message_en(&local_only_leaks_on_disk(&r.s(), &[abs(&r, F)]).unwrap());
+    assert_eq!(
+        msg,
+        format!(
+            "jkk: these files contain Local-Only patches; committing would upload them to the server:\n  \
+             {F}: line 2 onward, from commit \"L: 注释掉 log\"\n\
+             Uncheck these files, or use \"Restore after commit\" to drop these changes before committing."
+        )
     );
 }
 

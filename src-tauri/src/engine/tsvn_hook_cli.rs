@@ -39,6 +39,9 @@ pub struct HookOutcome {
     pub code: i32,
     /// 给 TortoiseSVN 显示的错误。只有 Check-commit 拦截时非空。
     pub stderr: String,
+    /// `stderr` 的英文版。线程代码页装不下 `stderr` 时改发它（[`hook_stderr_bytes`]）；
+    /// 空表示没有英文版，照发 `stderr`。
+    pub stderr_en: String,
 }
 
 /// 盘符根在命令行里只能写成 `--repo "D:"`（`hook_command` 的注释），而 `D:` 是驱动器相对路径，
@@ -164,7 +167,7 @@ pub fn run_hook(a: &HookArgs, now_ms: i64) -> HookOutcome {
 /// 按勾选的文件检查 Local-Only 泄漏（分析 §6.13.4；日志 H3：拦截放在 Check-commit，用户
 /// Abort 后回到提交框，消息还在）。命中退出 1；读不到、算不出一律放行，由跟进时的 F3 兜底。
 fn check_commit(a: &HookArgs) -> HookOutcome {
-    use crate::engine::svn_leak::{leak_message, local_only_leaks_on_disk};
+    use crate::engine::svn_leak::{leak_message, leak_message_en, local_only_leaks_on_disk};
     let Some(paths) = a.path_file.as_ref().and_then(read_list) else {
         return HookOutcome::default();
     };
@@ -172,6 +175,7 @@ fn check_commit(a: &HookArgs) -> HookOutcome {
         Ok(leaks) if !leaks.is_empty() => HookOutcome {
             code: 1,
             stderr: leak_message(&leaks),
+            stderr_en: leak_message_en(&leaks),
         },
         Ok(_) => HookOutcome::default(),
         Err(e) => {
@@ -213,6 +217,78 @@ pub fn encode_thread_acp(s: &str) -> Vec<u8> {
     }
 }
 
+/// 按线程代码页编码，一个字都不丢时返回 `Some`。没有 best-fit 映射的汉字不加 flag 也会置
+/// `lpUsedDefaultChar`；`WC_NO_BEST_FIT_CHARS` 管的是有 best-fit 的字符（全角「，」→ `,`），
+/// 让它们也算丢字，「能原样显示」才是判据。
+/// 线程代码页不支持这两个参数时（UTF-8 代码页，「Beta：使用 Unicode UTF-8」），调用会失败；
+/// UTF-8 装得下任何字符，按不丢字处理，退回 [`encode_thread_acp`]。`&str` 里没有孤立代理项、
+/// 也没传 `WC_ERR_INVALID_CHARS`，失败不会是别的原因。
+#[allow(unsafe_code)] // 同 encode_thread_acp
+fn encode_thread_acp_exact(s: &str) -> Option<Vec<u8>> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Globalization::{
+            WideCharToMultiByte, CP_THREAD_ACP, WC_NO_BEST_FIT_CHARS,
+        };
+        let wide: Vec<u16> = s.encode_utf16().collect();
+        if wide.is_empty() {
+            return Some(Vec::new());
+        }
+        let mut lossy = windows::core::BOOL(0);
+        // SAFETY：先问长度，再按长度分配缓冲；lossy 活过两次调用
+        let n = unsafe {
+            WideCharToMultiByte(
+                CP_THREAD_ACP,
+                WC_NO_BEST_FIT_CHARS,
+                &wide,
+                None,
+                None,
+                Some(&mut lossy),
+            )
+        };
+        if n <= 0 {
+            return Some(encode_thread_acp(s));
+        }
+        if lossy.as_bool() {
+            return None;
+        }
+        let mut buf = vec![0u8; n as usize];
+        let n = unsafe {
+            WideCharToMultiByte(
+                CP_THREAD_ACP,
+                WC_NO_BEST_FIT_CHARS,
+                &wide,
+                Some(&mut buf),
+                None,
+                Some(&mut lossy),
+            )
+        };
+        if n <= 0 {
+            return Some(encode_thread_acp(s));
+        }
+        if lossy.as_bool() {
+            return None;
+        }
+        buf.truncate(n as usize);
+        Some(buf)
+    }
+    #[cfg(not(windows))]
+    {
+        Some(s.as_bytes().to_vec())
+    }
+}
+
+/// 钩子写给 TortoiseSVN 的 stderr 字节。`text` 在线程代码页里一个字不丢就发它，否则发
+/// `fallback`（英文版，见 [`HookOutcome::stderr_en`]）；没有 `fallback` 就照发 `text`。
+/// 只看线程代码页能不能装下，不猜 TortoiseSVN 用哪个代码页：日志 H4 已实测它按线程代码页解读，
+/// 装不下的中文不管发 GBK 还是 UTF-8 都显示不出来（2026-11-11 使用报告）。
+pub fn hook_stderr_bytes(text: &str, fallback: &str) -> Vec<u8> {
+    if fallback.is_empty() {
+        return encode_thread_acp(text);
+    }
+    encode_thread_acp_exact(text).unwrap_or_else(|| encode_thread_acp(fallback))
+}
+
 /// `main.rs` 的入口。`args` 含 argv0。不是钩子调用返回 `None`，照常启动 GUI；是钩子调用就
 /// 一定返回 `Some`，哪怕参数不全：TortoiseSVN 在等这个进程退出，绝不能落到 GUI。
 pub fn tsvn_hook_main(args: Vec<OsString>) -> Option<i32> {
@@ -232,7 +308,7 @@ pub fn tsvn_hook_main(args: Vec<OsString>) -> Option<i32> {
     if !outcome.stderr.is_empty() {
         use std::io::Write;
         let mut err = std::io::stderr();
-        let _ = err.write_all(&encode_thread_acp(&outcome.stderr));
+        let _ = err.write_all(&hook_stderr_bytes(&outcome.stderr, &outcome.stderr_en));
         let _ = err.flush();
     }
     Some(outcome.code)

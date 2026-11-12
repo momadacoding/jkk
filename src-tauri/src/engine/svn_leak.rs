@@ -243,6 +243,36 @@ pub fn leak_message(leaks: &[Leak]) -> String {
     s
 }
 
+/// [`leak_message`] 的英文版，逐条对应。钩子的线程代码页装不下中文时发它（2026-11-11 使用
+/// 报告：系统 locale 中文、区域格式 en-CA 的机器上线程代码页是 1252，中文提示全成了 `?`）。
+/// 路径与 commit 标题原样保留，它们本身是中文时照样会丢字，但模板读得懂。
+pub fn leak_message_en(leaks: &[Leak]) -> String {
+    let mut s = String::from(
+        "jkk: these files contain Local-Only patches; committing would upload them to the server:\n",
+    );
+    for leak in leaks {
+        for h in &leak.hunks {
+            let at = if h.old_start == 0 && h.lines == 0 {
+                "whole file".to_string()
+            } else {
+                format!("line {} onward", h.old_start)
+            };
+            let maybe = match h.verdict {
+                LeakVerdict::Present => "",
+                LeakVerdict::Unknown => " (possibly)",
+            };
+            s.push_str(&format!(
+                "  {}: {at}{maybe}, from commit \"{}\"\n",
+                leak.path, leak.subject
+            ));
+        }
+    }
+    s.push_str(
+        "Uncheck these files, or use \"Restore after commit\" to drop these changes before committing.",
+    );
+    s
+}
+
 /// 树里某个路径的条目：(OID, 对象类型)。`filemode` 不参与判定：只改 mode 的泄漏
 /// 不在 F3 的范围内（见日志 Task 7「遗留风险」）。
 type Entry = Option<(Oid, Option<ObjectType>)>;
