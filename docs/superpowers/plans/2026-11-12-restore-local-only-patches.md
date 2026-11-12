@@ -25,6 +25,7 @@
 | 索引里 `p` 只有 stage 0，且等于 `HEAD:p` | 用户没暂存别的版本；写完后磁盘 = 索引 = HEAD，状态干净 |
 | 磁盘上 `p` 是普通文件，按 `git add` 的过滤规则算出的 hash 等于 `svn/base:p` | 磁盘就是 SVN 的版本，没有用户自己的编辑 |
 | `svn/base..HEAD` 里改过 `p` 的 commit 至少一个，而且全是 Local-Only | 分支比 SVN 多出来的只有 Local-Only 改动 |
+| （review 后补）HEAD 是 `svn/base` 的后代；仓库装了换行规则；索引条目没标 skip-worktree / assume-unchanged | 分支没落后；写出的字节不会变换行；不改用户有意隐藏的文件 |
 
 ### 不做
 

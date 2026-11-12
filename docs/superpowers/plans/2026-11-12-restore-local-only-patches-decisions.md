@@ -6,7 +6,7 @@
 
 | Task | 状态 | 产出 | 验证 |
 |---|---|---|---|
-| T1 | 完成 | `engine/svn_restore_local_only.rs` 的 `restorable_paths`；`svn_follow.rs` 报告加 `restorable` | `svn_restore_local_only.rs` 10 条全过；`svn_follow_snapshot.rs` 的普通 commit 合错用例断言 `restorable` 为空；`svn_backend.rs` 钉住字段名与旧 journal |
+| T1 | 完成 | `engine/svn_restore_local_only.rs` 的 `restorable_paths`；`svn_follow.rs` 报告加 `restorable` | `svn_restore_local_only.rs` 15 条全过（review 后由 10 条补到 15 条）；`svn_follow_snapshot.rs` 的普通 commit 合错用例断言 `restorable` 为空；`svn_backend.rs` 钉住字段名与旧 journal |
 | T2 | 完成 | `restore_local_only` | 同上 |
 | T3 | 完成 | `commands/svn_sync.rs::svn_restore_local_only`、`lib.rs` 注册、`repoStore.ts::svnRestoreLocalOnly` | clippy 0 告警；`pnpm build` |
 | T4 | 完成 | `svnFollow.ts` 类型与 `restorablePaths` / `describeRestoreOutcome`；`FollowReportDialog.tsx` 的 `RestoreRow`；`RepoTab.tsx` 接线；`styles.css` | `pnpm test` 1575 过；`pnpm test:layout` 152 过（长报告场景加了 100 个可放回文件） |
@@ -43,6 +43,25 @@
   - 普通 git 仓库返回结构化 `GitError`（`git_cli`，找不到 `svn/base`）；
   - 参数名故意写成 `pathz` 时报 `missing required key paths`。
   验完删掉了两个隔离目录。按钮本身没在真实窗口里点：要造 SVN 混合仓库，见 E2E 场景 9B。
+
+### Review（opus，high；PR 159）
+
+没有高危问题，没有找到「覆盖了 git 与 SVN 都拿不回的内容」的路径。中危 4 条、低危 6 条，修了下面这些：
+
+- **第 1 条（中）：写了一半被报成全部失败。** 实测 git 2.51.2：一个条目写不进去时，`checkout-index -f -z --stdin` 照样写完其余的，最后退出非零。原来 `?` 直接返回错误，界面只看到 git 的 stderr；再点一次，写成的那个会被说成「可能有你自己的编辑」。改为：写的错误只记下来，不管成败都逐个重新 hash，按磁盘实际内容分成「已放回」「没写进去（附 git 的原因）」「与分支、SVN 都不一样」。`disk_hashes` 整批失败时退到逐个算，读不了的文件只影响它自己。skip-worktree 与 assume-unchanged 的条目写之前就跳过。测试：`a_locked_file_does_not_hide_the_ones_that_were_restored`（锁住读写）、`a_write_failure_midway_reports_each_file_by_what_is_on_disk`（只锁写，真走到写一半）、`skip_worktree_entry_is_skipped`。
+- **第 2 条（中）：没做换行迁移的旧仓库会把 LF 写成 CRLF。** 没有 `* -text` 规则、`core.autocrlf=true` 时，hash 前后都按规则归一化，核对看着都对，SVN 里却是整个文件每一行都变了。改为：`has_eol_rule` 为假时命令直接拒绝（`svn_restore_needs_eol_migration`），跟进时也不给按钮。测试：`refuses_in_a_repo_without_the_eol_rule`。
+- **第 3 条（中）：没核对 HEAD 是基线的后代。** 分支落后基线时，`base..HEAD` 只剩 Local-Only commit，写回 HEAD 的版本会撤掉基线后来的 SVN 改动。改为要求 `HEAD == base` 或 HEAD 是 base 的后代，否则全部跳过并说明。测试：`branch_behind_the_baseline_is_not_restored`。
+- **第 4 条（中）：测试缺 EOL、写一半、skip-worktree、落后分支。** 上面四条测试补齐。
+- **第 7 条（低）：重复点给的原因吓人、测试名不符。** 加了「磁盘上已经是分支的版本，不用放回」这个原因，测试改名为 `file_already_matching_the_branch_is_skipped_with_its_own_reason` 并断言原因。
+- **第 8 条（低）：** 放回成功后刷新状态失败，不再吞掉结果。
+- **第 9 条（低）：** `--stdin-paths` 按行喂的安全性写进注释。
+- **第 10 条（低）：** 按钮加 `type="button"`，结果区加 `aria-live`。
+
+不改：
+
+- 第 5 条：`touches` 只比第一个父提交是对的，merge 总会判成「有普通 commit」，偏保守。
+- 第 6 条：不加 `-u`，索引的 stat 旧了只是下次 status 多 hash 一次，加 `-u` 就要拿 `index.lock`。
+- 第 10 条的一半：放回之后「分支与磁盘对不上」那一节仍列着这些文件。结果就显示在它下面，不另改节内容。
 
 ### 验证中遇到的无关失败
 

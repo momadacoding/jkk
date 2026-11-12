@@ -80,17 +80,30 @@ fn feature_text() -> String {
 
 /// 真实现场的形状，返回跟进报告。之后：磁盘 = SVN = `feature_text()`，分支 = `CLASS` + 它。
 fn report_case(fx: &SvnFixture) -> FollowReport {
+    report_case_for(fx, &[A])
+}
+
+/// 同 [`report_case`]，几个文件一起。
+fn report_case_for(fx: &SvnFixture, files: &[&str]) -> FollowReport {
     i_commit(fx);
-    write(fx, A, &base_text());
-    tortoise_commit(fx, A);
+    for f in files {
+        write(fx, f, &base_text());
+        tortoise_commit(fx, f);
+    }
     done(follow(&fx.wc_str(), "op0").unwrap());
-    write(fx, A, &format!("{CLASS}{}", base_text()));
+    for f in files {
+        write(fx, f, &format!("{CLASS}{}", base_text()));
+    }
     commit_all(fx, L_MSG);
     // 「小婉问答」：在 git 里删掉这一行，另加功能，再整个文件用 TortoiseSVN 提交
-    write(fx, A, &feature_text());
+    for f in files {
+        write(fx, f, &feature_text());
+    }
     commit_all(fx, "小婉问答");
     write_mark(&fx.wc_str()).unwrap();
-    tortoise_commit(fx, A);
+    for f in files {
+        tortoise_commit(fx, f);
+    }
     done(follow(&fx.wc_str(), "op1").unwrap())
 }
 
@@ -161,16 +174,133 @@ fn a_normal_commit_touching_the_file_makes_it_not_restorable() {
 }
 
 #[test]
-fn file_already_matching_the_branch_is_skipped_quietly() {
+fn file_already_matching_the_branch_is_skipped_with_its_own_reason() {
     let fx = hybrid_with_colleague();
     report_case(&fx);
     restore_local_only(&fx.wc_str(), "op2", &[A.to_string()]).unwrap();
 
-    // 第二次点：磁盘已经是分支的版本，不再等于 SVN
+    // 第二次点：磁盘已经是分支的版本，不再等于 SVN。原因要说清，不能报成「可能有你自己的编辑」
     let out = restore_local_only(&fx.wc_str(), "op3", &[A.to_string()]).unwrap();
 
     assert!(out.restored.is_empty(), "{out:?}");
+    assert_eq!(out.skipped[0].reason, "磁盘上已经是分支的版本，不用放回。");
     assert_eq!(read(&fx, A), format!("{CLASS}{}", feature_text()));
+}
+
+/// PR 159 review 第 2 条：没装换行规则的旧仓库，`checkout-index` 按 autocrlf 写出 CRLF，SVN 里整个
+/// 文件都变了。按钮直接拒绝，什么都不写。
+#[test]
+fn refuses_in_a_repo_without_the_eol_rule() {
+    let fx = hybrid_with_colleague();
+    report_case(&fx);
+    std::fs::write(fx.wc().join(".git/info/attributes"), "").unwrap();
+
+    let e = restore_local_only(&fx.wc_str(), "op2", &[A.to_string()]).unwrap_err();
+
+    assert_eq!(e.code, "svn_restore_needs_eol_migration", "{}", e.message);
+    assert_eq!(read(&fx, A), feature_text());
+}
+
+/// 第 1 条：skip-worktree 的条目 `checkout-index` 拒绝写；用户有意设的，跳过并说明。
+#[test]
+fn skip_worktree_entry_is_skipped() {
+    let fx = hybrid_with_colleague();
+    report_case(&fx);
+    git(&fx, &["update-index", "--skip-worktree", A]);
+
+    let out = restore_local_only(&fx.wc_str(), "op2", &[A.to_string()]).unwrap();
+
+    assert!(out.restored.is_empty(), "{out:?}");
+    assert!(out.skipped[0].reason.contains("skip-worktree"), "{out:?}");
+    assert_eq!(read(&fx, A), feature_text());
+}
+
+/// 第 3 条：分支落后基线时 `base..HEAD` 只剩 Local-Only commit，但写回 HEAD 的版本会撤掉基线
+/// 后来的 SVN 改动。
+#[test]
+fn branch_behind_the_baseline_is_not_restored() {
+    let fx = hybrid_with_colleague();
+    report_case(&fx);
+    // 基线往前走一步、改 A：HEAD 不再是它的后代
+    let tree = git(&fx, &["write-tree"]);
+    let base = git(&fx, &["rev-parse", "svn/base"]);
+    let ahead = git(
+        &fx,
+        &["commit-tree", &tree, "-p", &base, "-m", "SVN 后来的改动"],
+    );
+    git(&fx, &["update-ref", "refs/heads/svn/base", &ahead]);
+
+    let out = restore_local_only(&fx.wc_str(), "op2", &[A.to_string()]).unwrap();
+
+    assert!(out.restored.is_empty(), "{out:?}");
+    assert!(out.skipped[0].reason.contains("落后"), "{out:?}");
+    assert_eq!(read(&fx, A), feature_text());
+}
+
+/// 第 1 条：一个文件被别的程序独占打开、写不进去时，其余的照样写成，各自报实际结果；
+/// 不能整体报错，也不能把写成的那个说成失败。
+#[cfg(windows)]
+#[test]
+fn a_locked_file_does_not_hide_the_ones_that_were_restored() {
+    use std::os::windows::fs::OpenOptionsExt;
+    const B: &str = "Code/B.cs";
+    let fx = hybrid_with_colleague();
+    let rep = report_case_for(&fx, &[A, B]);
+    assert_eq!(rep.restorable, vec![A.to_string(), B.to_string()]);
+    // share_mode(0)：不许别人读写删，`checkout-index` 换不掉它，`hash-object` 也读不了
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(fx.wc().join(B))
+        .unwrap();
+
+    let out = restore_local_only(&fx.wc_str(), "op2", &[A.to_string(), B.to_string()]).unwrap();
+    drop(held);
+
+    assert_eq!(out.restored, vec![A.to_string()], "{out:?}");
+    assert_eq!(out.skipped.len(), 1, "{out:?}");
+    assert_eq!(out.skipped[0].path, B);
+    assert_eq!(read(&fx, A), format!("{CLASS}{}", feature_text()));
+    assert_eq!(read(&fx, B), feature_text(), "被锁住的没被改");
+}
+
+/// 同上，但锁只挡写、不挡读：写之前的核对通过，`checkout-index` 写到 B 时失败、退出非零。
+/// 这才走到「写了一半」的路径。
+#[cfg(windows)]
+#[test]
+fn a_write_failure_midway_reports_each_file_by_what_is_on_disk() {
+    use std::os::windows::fs::OpenOptionsExt;
+    const B: &str = "Code/B.cs";
+    const FILE_SHARE_READ: u32 = 1;
+    let fx = hybrid_with_colleague();
+    report_case_for(&fx, &[A, B]);
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(fx.wc().join(B))
+        .unwrap();
+
+    let out = restore_local_only(&fx.wc_str(), "op2", &[A.to_string(), B.to_string()]).unwrap();
+    drop(held);
+
+    assert_eq!(out.restored, vec![A.to_string()], "{out:?}");
+    assert_eq!(out.skipped.len(), 1, "{out:?}");
+    assert_eq!(out.skipped[0].path, B);
+    assert!(
+        out.skipped[0]
+            .reason
+            .starts_with("没写进去，磁盘上还是 SVN 的版本"),
+        "{out:?}"
+    );
+    assert_eq!(read(&fx, B), feature_text());
+
+    // 再点一次：A 已经放回，B 这回能写了
+    let again = restore_local_only(&fx.wc_str(), "op3", &[A.to_string(), B.to_string()]).unwrap();
+    assert_eq!(again.restored, vec![B.to_string()], "{again:?}");
+    assert_eq!(
+        again.skipped[0].reason,
+        "磁盘上已经是分支的版本，不用放回。"
+    );
 }
 
 #[test]

@@ -1050,7 +1050,7 @@ Remove-Item -Recurse -Force $fix.FullName
 | 工作副本被锁时判为「正在更新」 | `svn_sync.rs::locked_working_copy_reports_wc_locked` |
 | 已提交的删除成为墓碑；漏收（depth-exclude）拒绝录制；确认失败拒绝 | `svn_health.rs::committed_deletion_becomes_tombstone_when_just_recorded` 及同文件的 exclude / unconfirmed 测试 |
 | Local-Only 泄漏按 hunk 判定（含相邻行、行号偏移） | `svn_leak.rs::leak_by_hunk_matches_w21_scenarios` 等 |
-| 放回 Local-Only 补丁：真实现场形状、磁盘有编辑 / 有暂存 / 有普通 commit 时跳过、重复点、空列表、仓库外路径、同步中途 / 索引被占时拒绝、空格与 `%` 路径；普通 commit 合错的 drift 不算可放回 | `src-tauri/tests/svn_restore_local_only.rs`、`svn_follow_snapshot.rs::a_clean_but_wrong_replay_is_reported_as_drift` |
+| 放回 Local-Only 补丁：真实现场形状、磁盘有编辑 / 有暂存 / 有普通 commit / skip-worktree / 分支落后基线时跳过、重复点、空列表、仓库外路径、文件被锁、写到一半失败、同步中途 / 索引被占 / 没做换行迁移时拒绝、空格与 `%` 路径；普通 commit 合错的 drift 不算可放回 | `src-tauri/tests/svn_restore_local_only.rs`、`svn_follow_snapshot.rs::a_clean_but_wrong_replay_is_reported_as_drift` |
 | 落后分支磁盘还是旧内容时转手动跟进 | `branch_entry_sends_a_stale_disk_to_manual_follow`、`a_stale_disk_on_a_lagging_branch_also_stops_a_recording_follow` |
 | 手动跟进带着暂存 / 未暂存 / 未跟踪的改动：继续、放弃、崩溃后续上都原样放回 | `manual_follow_restores_staging_with_index_when_possible`、`manual_follow_abort_after_a_crash_restores_everything` 等用 `wip()` 造现场的一组 |
 | 手动跟进暂存没保住时 stash 保留、能取回 | `manual_follow_stage_lost_keeps_a_stage_that_differs_from_disk` |

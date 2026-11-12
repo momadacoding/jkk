@@ -910,7 +910,12 @@ export function RepoTab({
       // 写了磁盘：「本地改动」要跟着变（watcher 也会刷，这里不等它）
       restoreLocalOnly: async (paths) => {
         const outcome = await svnRestoreLocalOnly(repoPath, paths)
-        await refreshStatus(repoPath)
+        // 刷新失败不能吞掉已经写成的结果：再点一次只会看到误导的跳过原因（PR 159 review 第 8 条）
+        try {
+          await refreshStatus(repoPath)
+        } catch (err) {
+          console.warn('放回 Local-Only 补丁后刷新状态失败：', err)
+        }
         return outcome
       },
     })

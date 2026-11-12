@@ -117,15 +117,16 @@ function RestoreRow({
   }
 
   const said = outcome && describeRestoreOutcome(outcome)
+  // aria-live：结果是点完之后才出现的，读屏要能听到
   return (
-    <div className="follow-restore">
+    <div className="follow-restore" aria-live="polite">
       {!outcome && (
         <>
           <div className="follow-note">
             其中 {paths.length} 个文件，分支比磁盘多出来的只有 Local-Only 补丁，磁盘上就是 SVN
             的版本。可以把补丁放回磁盘：SVN 里它们会显示为已修改，git 里是干净的。
           </div>
-          <button onClick={() => void run()} disabled={busy}>
+          <button type="button" onClick={() => void run()} disabled={busy}>
             {busy ? '正在放回…' : `放回 Local-Only 补丁（${paths.length} 个文件）`}
           </button>
         </>

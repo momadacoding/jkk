@@ -22,19 +22,23 @@
 //! 1. 磁盘按 `git add` 的过滤规则算出的 hash 等于 `svn/base` 里的版本：磁盘就是 SVN 的内容，
 //!    没有用户自己的编辑；
 //! 2. `svn/base..HEAD` 里改过它的 commit 全是 Local-Only：分支比 SVN 多出来的只有本地补丁；
-//! 3. （写的时候）索引里只有 stage 0、且等于 HEAD：用户没暂存别的版本，写完磁盘 = 索引 = HEAD。
+//! 3. （写的时候）索引里只有 stage 0、且等于 HEAD，没标 skip-worktree / assume-unchanged：用户
+//!    没暂存别的版本，写完磁盘 = 索引 = HEAD；
+//! 4. HEAD 是 `svn/base` 的后代：分支没落后，写回 HEAD 的版本不会撤掉 SVN 后来的改动；
+//! 5. 仓库装了换行规则（`* -text`）：写出来的字节就是 blob，SVN 里不会整个文件变换行。
 //!
 //! 写回去的内容在 git 里，原来的内容在 SVN 里（`svn revert` 就能拿回来），两边都丢不了东西。
 
 use crate::engine::git_cli::run_git_stdin;
 use crate::engine::graph::parse_local_only;
+use crate::engine::svn_attributes::has_eol_rule;
 use crate::engine::svn_baseline::git_dir;
 use crate::engine::svn_config::BASELINE_BRANCH;
 use crate::engine::svn_journal;
 use crate::engine::svn_lock;
 use crate::engine::svn_sync_check::{check_git_idle, current_branch, rev_parse};
 use crate::error::{GitError, Result};
-use git2::{Commit, ObjectType, Oid, Repository, Tree};
+use git2::{Commit, IndexEntryExtendedFlag, IndexEntryFlag, ObjectType, Oid, Repository, Tree};
 use std::path::Path;
 
 /// [`restore_local_only`] 的结果。
@@ -64,11 +68,12 @@ pub fn restorable_paths(
     head: &str,
     candidates: &[String],
 ) -> Result<Vec<String>> {
-    if candidates.is_empty() {
+    // 没做换行迁移时按钮会拒绝，就别给按钮
+    if candidates.is_empty() || !has_eol_rule(repo) {
         return Ok(Vec::new());
     }
     let (ok, _) = check_paths(repo, base, head, candidates, false)?;
-    Ok(ok)
+    Ok(ok.into_iter().map(|(p, _, _)| p).collect())
 }
 
 /// 按钮：把 `paths` 里满足条件的文件写回成分支（HEAD）的版本。
@@ -107,6 +112,15 @@ pub fn restore_local_only(repo: &str, opid: &str, paths: &[String]) -> Result<Re
             ))
         }
     }
+    // 没装换行规则的旧仓库：`checkout-index` 按 autocrlf 写出 CRLF，SVN 里整个文件每一行都变了
+    // （`svn_attributes` 模块头的「最坏的下游后果」；PR 159 review 第 2 条）
+    if !has_eol_rule(repo) {
+        return Err(GitError::new(
+            "svn_restore_needs_eol_migration",
+            "这个仓库还没做换行迁移，写回的文件换行可能和 SVN 里不一样。请先按顶部的提示做换行迁移，\
+             再放回 Local-Only 补丁。",
+        ));
+    }
     let base = rev_parse(repo, &format!("refs/heads/{BASELINE_BRANCH}"))?;
     let head = rev_parse(repo, "HEAD")?;
     let (ok, mut skipped) = check_paths(repo, &base, &head, paths, true)?;
@@ -118,34 +132,43 @@ pub fn restore_local_only(repo: &str, opid: &str, paths: &[String]) -> Result<Re
     }
     // `--stdin -z`：路径不经命令行，空格、中文、上万个文件都不用拆参。`ok` 非空，不会出现
     // 「空列表 = 全部」（AGENTS.md §6.2）；`checkout-index` 本来也不把空输入当成全部
-    let input: Vec<u8> = ok.iter().flat_map(|p| p.bytes().chain([0])).collect();
-    run_git_stdin(repo, &["checkout-index", "-f", "-z", "--stdin"], &input)?;
-    // 写完核对一遍：过滤规则（eol / autocrlf）不对称时磁盘可能不等于分支。核对本身失败时
-    // 已经写过了，不能报「什么都没写」的错，按写成了算
-    let after = match disk_hashes(repo, &ok) {
-        Ok(h) => h,
-        Err(e) => {
-            log::warn!(
-                "放回 Local-Only 补丁后核对磁盘出错，跳过核对：{}",
-                e.message
-            );
-            return Ok(RestoreOutcome {
-                restored: ok,
-                skipped,
-            });
-        }
-    };
-    let git = Repository::open(repo)?;
-    let head_tree = git.find_commit(Oid::from_str(&head)?)?.tree()?;
+    let input: Vec<u8> = ok
+        .iter()
+        .flat_map(|(p, _, _)| p.bytes().chain([0]))
+        .collect();
+    // 一个文件写不进去（被编辑器独占打开之类），`checkout-index` 照样写完其余的、最后退出 1。
+    // 所以失败不能直接 `?`：那会把已经写成的也报成失败，下次再点还会给出错的原因（PR 159
+    // review 第 1 条）。不管成败都逐个核对磁盘，按实际结果分类
+    let write_error = run_git_stdin(repo, &["checkout-index", "-f", "-z", "--stdin"], &input)
+        .err()
+        .map(|e| e.message);
+    if let Some(msg) = &write_error {
+        log::warn!("放回 Local-Only 补丁时 checkout-index 报错：{msg}");
+    }
+    let names: Vec<String> = ok.iter().map(|(p, _, _)| p.clone()).collect();
+    let after = disk_hashes(repo, &names);
     let mut restored = Vec::with_capacity(ok.len());
-    for (p, disk) in ok.into_iter().zip(after) {
-        let want = entry(&head_tree, &p).map(|(oid, _)| oid.to_string());
-        if want.as_deref() == Some(disk.as_str()) {
+    for ((p, head_oid, svn_oid), disk) in ok.into_iter().zip(after) {
+        let Some(disk) = disk else {
+            // 写没写成说不准：不能报「没写」，也不能说写成了
+            skipped.push(RestoreSkip {
+                path: p,
+                reason: "写回之后读不了磁盘上的这个文件，请在「本地改动」里看一眼。".into(),
+            });
+            continue;
+        };
+        if disk == head_oid {
             restored.push(p);
+        } else if disk == svn_oid {
+            let why = write_error.as_deref().unwrap_or("git 没有给出原因");
+            skipped.push(RestoreSkip {
+                path: p,
+                reason: format!("没写进去，磁盘上还是 SVN 的版本：{why}"),
+            });
         } else {
             skipped.push(RestoreSkip {
                 path: p,
-                reason: "已经写回磁盘，但内容与分支里的版本不同（可能是换行或过滤规则）。\
+                reason: "写回之后磁盘内容与分支、SVN 都不一样（可能被别的程序同时改了）。\
                          请在「本地改动」里核对。"
                     .into(),
             });
@@ -165,6 +188,9 @@ fn is_regular(mode: i32) -> bool {
     mode == 0o100644 || mode == 0o100755
 }
 
+/// 能放回的文件：(路径, 分支版本的 OID, SVN 版本的 OID)。
+type Restorable = (String, String, String);
+
 /// 逐个文件判定，返回 (能放回的, 跳过的及原因)，各自按 `paths` 的顺序。见模块头「为什么安全」。
 fn check_paths(
     repo: &str,
@@ -172,10 +198,27 @@ fn check_paths(
     head: &str,
     paths: &[String],
     with_index: bool,
-) -> Result<(Vec<String>, Vec<RestoreSkip>)> {
+) -> Result<(Vec<Restorable>, Vec<RestoreSkip>)> {
     let git = Repository::open(repo)?;
     let base = git.find_commit(Oid::from_str(base)?)?;
     let head = git.find_commit(Oid::from_str(head)?)?;
+    let skip_all = |why: &str| {
+        let skipped = paths
+            .iter()
+            .map(|p| RestoreSkip {
+                path: p.clone(),
+                reason: why.to_string(),
+            })
+            .collect();
+        Ok((Vec::new(), skipped))
+    };
+    // 分支落后基线：`base..HEAD` 只剩 Local-Only commit，但 HEAD 缺着基线后来的 SVN 改动，
+    // 写回 HEAD 的版本等于在磁盘上撤销它们（PR 159 review 第 3 条）
+    if base.id() != head.id() && !git.graph_descendant_of(head.id(), base.id())? {
+        return skip_all(
+            "当前分支落后于基线，写回分支的版本会撤掉 SVN 后来的改动。请先跟进这条分支。",
+        );
+    }
     let (base_tree, head_tree) = (base.tree()?, head.tree()?);
     let commits = range(&git, &base, &head)?;
     let index = if with_index { Some(git.index()?) } else { None };
@@ -187,8 +230,8 @@ fn check_paths(
             reason: why.to_string(),
         })
     };
-    // 过了树与索引这几关、还要看磁盘的：(路径, SVN 版本的 OID)
-    let mut pending: Vec<(String, String)> = Vec::new();
+    // 过了树与索引这几关、还要看磁盘的：(路径, 分支版本的 OID, SVN 版本的 OID)
+    let mut pending: Vec<Restorable> = Vec::new();
     for p in paths {
         let Some((head_oid, head_mode)) = entry(&head_tree, p).filter(|(_, m)| is_regular(*m))
         else {
@@ -254,14 +297,28 @@ fn check_paths(
                 );
                 continue;
             }
+            // skip-worktree 的条目 `checkout-index` 拒绝写；assume-unchanged 写了 git 也看不见。
+            // 都是用户有意设的，不替他改（PR 159 review 第 1 条）
+            let hidden = staged.as_ref().is_some_and(|e| {
+                e.flags_extended & IndexEntryExtendedFlag::SKIP_WORKTREE.bits() != 0
+                    || e.flags & IndexEntryFlag::VALID.bits() != 0
+            });
+            if hidden {
+                skip(
+                    &mut skipped,
+                    p,
+                    "暂存区里这个文件标了 skip-worktree 或 assume-unchanged，不替你改。",
+                );
+                continue;
+            }
         }
-        pending.push((p.clone(), base_oid.to_string()));
+        pending.push((p.clone(), head_oid.to_string(), base_oid.to_string()));
     }
 
     // 磁盘：普通文件，且按 `git add` 的规则算出的 hash 等于 SVN 版本
-    let on_disk: Vec<(String, String)> = pending
+    let on_disk: Vec<Restorable> = pending
         .into_iter()
-        .filter(|(p, _)| {
+        .filter(|(p, _, _)| {
             let regular = Path::new(repo)
                 .join(p)
                 .symlink_metadata()
@@ -272,12 +329,23 @@ fn check_paths(
             regular
         })
         .collect();
-    let names: Vec<String> = on_disk.iter().map(|(p, _)| p.clone()).collect();
-    let hashes = disk_hashes(repo, &names)?;
+    let names: Vec<String> = on_disk.iter().map(|(p, _, _)| p.clone()).collect();
+    let hashes = disk_hashes(repo, &names);
     let mut ok = Vec::new();
-    for ((p, svn), disk) in on_disk.into_iter().zip(hashes) {
+    for ((p, head_oid, svn), disk) in on_disk.into_iter().zip(hashes) {
+        let Some(disk) = disk else {
+            skip(
+                &mut skipped,
+                &p,
+                "读不了磁盘上的这个文件（可能被别的程序占用），没动它。",
+            );
+            continue;
+        };
         if disk == svn {
-            ok.push(p);
+            ok.push((p, head_oid, svn));
+        } else if disk == head_oid {
+            // 已经放回过（重复点、或用户自己丢弃过本地改动）：不是用户的编辑，别吓人
+            skip(&mut skipped, &p, "磁盘上已经是分支的版本，不用放回。");
         } else {
             skip(
                 &mut skipped,
@@ -316,20 +384,29 @@ fn touches(c: &Commit, path: &str) -> bool {
     mine != parent
 }
 
-/// 磁盘上这些文件按 `git add` 的过滤规则算出的 blob OID（不写对象库），与 `paths` 同序。
-/// 与 `svn_follow::drift_paths` 同一口径：`--stdin-paths` 逐个按路径套 attributes。
-fn disk_hashes(repo: &str, paths: &[String]) -> Result<Vec<String>> {
+/// 磁盘上这些文件按 `git add` 的过滤规则算出的 blob OID（不写对象库），与 `paths` 同序；读不了的
+/// （被别的程序独占打开之类）为 `None`。与 `svn_follow::drift_paths` 同一口径：`--stdin-paths`
+/// 逐个按路径套 attributes。
+///
+/// 先整批算；整批失败时 git 只说第一个读不了的文件，所以逐个重算，免得一个被锁住的文件把
+/// 其余的都拖成「核对不了」。
+fn disk_hashes(repo: &str, paths: &[String]) -> Vec<Option<String>> {
+    let batch = |ps: &[String]| -> Option<Vec<String>> {
+        // `--stdin-paths` 按行读，以 `"` 开头的行会被当成 C 风格引号去掉；Windows 文件名里不能有
+        // `"`，换行也进不了文件名，所以按行喂是安全的（`checkout-index` 那边用的是 NUL 分隔）
+        let input: String = ps.iter().map(|p| format!("{p}\n")).collect();
+        let out = run_git_stdin(repo, &["hash-object", "--stdin-paths"], input.as_bytes()).ok()?;
+        let hashes: Vec<String> = out.lines().map(|l| l.trim().to_string()).collect();
+        (hashes.len() == ps.len()).then_some(hashes)
+    };
     if paths.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
-    let input: String = paths.iter().map(|p| format!("{p}\n")).collect();
-    let out = run_git_stdin(repo, &["hash-object", "--stdin-paths"], input.as_bytes())?;
-    let hashes: Vec<String> = out.lines().map(|l| l.trim().to_string()).collect();
-    if hashes.len() != paths.len() {
-        return Err(GitError::new(
-            "svn_restore_hash_failed",
-            "核对磁盘内容时 git hash-object 的输出行数对不上。这次什么都没写，请再试一次。",
-        ));
+    if let Some(all) = batch(paths) {
+        return all.into_iter().map(Some).collect();
     }
-    Ok(hashes)
+    paths
+        .iter()
+        .map(|p| batch(std::slice::from_ref(p)).and_then(|mut h| h.pop()))
+        .collect()
 }
