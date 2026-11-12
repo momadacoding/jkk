@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from '@/store/ipc'
 import type { AppSettingsView } from '@/engine/appSettings'
 
 export function readAppSettings(): Promise<AppSettingsView> {

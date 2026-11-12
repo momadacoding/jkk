@@ -1,4 +1,5 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from '@/store/ipc'
+import { perfMark, perfSpan } from '@/store/perf'
 import { listen } from '@tauri-apps/api/event'
 import { useCallback, useEffect, useRef, useState, type MutableRefObject } from 'react'
 import type { CommitNode, ConflictInfo, DiffData, GraphData, PullRequest, RefPointer, RepoInfo, StashEntry, StatusData, UpstreamInfo, Worktree } from '../engine/types'
@@ -652,7 +653,8 @@ export function useRepoStore() {
    */
   const wantedDiffScope = useRef<string | null | undefined>(undefined)
 
-  const openRepo = useCallback(async (path: string) => {
+  // 整体一个 span（性能记录模式，设计 §4.4）。函数体没有重新缩进，免得 diff 盖住整段
+  const openRepo = useCallback((path: string) => perfSpan('openRepo', async () => {
     setState((s) => ({ ...s, loading: true, error: null, errorCode: null }))
     try {
       const info = await invoke<RepoInfo>('open_repo', { path })
@@ -728,8 +730,10 @@ export function useRepoStore() {
         error: toErrorMessage(err),
         errorCode: toErrorCode(err),
       }))
+      // 错误在这里吞掉了，span 本身记的是 ok；单独打一个点，汇总时才看得出这次打开失败
+      perfMark('openRepo.error')
     }
-  }, [])
+  }), [])
 
   /**
    * 重新读取 HEAD，返回新的 headHash。
@@ -1445,6 +1449,7 @@ export function useRepoEffects(
       const path = state.path!
       // 事件是全局广播的，每个标签只认自己那个仓库的变更
       if (!samePath(event.payload, path)) return
+      perfMark('repo-changed')
       // 刷新期间仓库可能正处于中间态（比如 checkout 写到一半），失败就等下一次事件
       const ignore = () => undefined
       // 外部 checkout 同样会改 HEAD 和 worktree 归属，两者都要跟着刷新

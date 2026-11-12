@@ -77,3 +77,65 @@ fn every_subprocess_goes_through_hidden_command() {
          这个测试已经失去意义，请同步更新 ALLOWED。"
     );
 }
+
+/// 自己 `spawn()` 的地方及各自允许的次数：`git_cli` 的 stdin 管道手工计时，两个外部程序启动器
+/// 只记 `mark`。按次数而不是按文件放行：同一文件里再加一个 `spawn()` 也要过这里（review 第 7 条）。
+///
+/// 已知盲区：`Command::status()` 不在扫描范围内——libgit2 的 `delta.status()` 同名，按行匹配会误报。
+/// 目前 src 里非测试代码没有 `Command::status()`。
+const SPAWN_ALLOWED: [(&str, usize); 3] = [
+    ("git_cli.rs", 1),
+    ("launcher.rs", 1),
+    ("external_launch.rs", 1),
+];
+
+/// 记录模式（`--perf`）要看到每个子进程：`output()` 一律走 `engine::proc::output`，
+/// 漏一个不会报错，只会让记录里少一类进程、时间线对不上（设计 §4.3）。
+#[test]
+fn every_output_goes_through_the_timed_wrapper() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    collect_rs(&src, &mut files);
+
+    let mut offenders = Vec::new();
+    let mut wrapped = 0usize;
+    for path in &files {
+        let text = fs::read_to_string(path).expect("读取源文件失败");
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let spawn_budget = SPAWN_ALLOWED
+            .iter()
+            .find(|(f, _)| *f == name)
+            .map_or(0, |(_, n)| *n);
+        let mut spawns = Vec::new();
+        for (i, line) in text.lines().enumerate() {
+            if line.trim_start().starts_with("#[cfg(test)]") {
+                break;
+            }
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            if line.contains("proc::output(") {
+                wrapped += 1;
+            }
+            let here = format!("{}:{}: {}", name, i + 1, line.trim());
+            if line.contains(".output()") && name != ALLOWED {
+                offenders.push(here.clone());
+            }
+            if line.contains(".spawn()") {
+                spawns.push(here);
+            }
+        }
+        if spawns.len() > spawn_budget {
+            offenders.extend(spawns);
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "以下位置直接起了子进程，记录模式看不到它们：\n  {}\n改用 engine::proc::output。",
+        offenders.join("\n  ")
+    );
+    assert!(
+        wrapped > 5,
+        "只扫到 {wrapped} 处 proc::output，扫描本身可能失效了"
+    );
+}

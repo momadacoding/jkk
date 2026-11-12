@@ -1,5 +1,6 @@
 //! 启动子进程的唯一入口。
 
+use crate::engine::perf;
 use std::ffi::OsStr;
 use std::process::Command;
 
@@ -34,4 +35,17 @@ pub fn hidden_command<S: AsRef<OsStr>>(program: S) -> Command {
 #[cfg(not(windows))]
 pub fn hidden_command<S: AsRef<OsStr>>(program: S) -> Command {
     Command::new(program)
+}
+
+/// `cmd.output()`，记录模式（`--perf`）开着时顺便记一条 `proc`。
+///
+/// git / svn / gh 的 `output()` 一律走这里，记录才覆盖得全；关闭时只多一次
+/// `OnceLock::get`，起进程的方式与直接 `output()` 完全相同。
+pub fn output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    let timer = perf::ProcTimer::start(cmd);
+    let out = cmd.output();
+    if let Some(timer) = timer {
+        timer.finish(out.as_ref().map(|o| &o.status));
+    }
+    out
 }

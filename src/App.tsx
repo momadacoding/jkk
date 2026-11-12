@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from '@/store/ipc'
 import { open } from '@tauri-apps/plugin-dialog'
 import { EmptyState } from './components/EmptyState'
 import { RepoTab } from './components/RepoTab'

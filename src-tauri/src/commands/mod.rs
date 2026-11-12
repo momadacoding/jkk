@@ -6,6 +6,7 @@ pub mod external;
 pub mod graph;
 pub mod history;
 pub mod ops;
+pub mod perf;
 pub mod pr;
 pub mod remote;
 pub mod repo;

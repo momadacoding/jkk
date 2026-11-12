@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useFocusTrap } from './useFocusTrap'
 import { Reveal } from './Reveal'
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from '@/store/ipc'
 import { toErrorMessage } from '../engine/errors'
 import type { Capabilities } from '../engine/capabilities'
 import {

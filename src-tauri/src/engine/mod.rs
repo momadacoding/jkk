@@ -18,6 +18,7 @@ pub mod launcher;
 pub mod merge_drivers;
 pub mod ops;
 pub mod path;
+pub mod perf;
 pub mod proc;
 pub mod refs;
 pub mod remote_head_cache;
