@@ -452,4 +452,6 @@ fn a_clean_but_wrong_replay_is_reported_as_drift() {
         "前提：merge driver 合出了别的东西"
     );
     assert_eq!(rep.drift, vec![A.to_string()]);
+    // 合错的是普通 commit：不能当成 Local-Only 补丁放回磁盘（9.1）
+    assert!(rep.restorable.is_empty(), "{:?}", rep.restorable);
 }

@@ -3,10 +3,13 @@ import { useFocusTrap } from './useFocusTrap'
 import { toErrorMessage } from '../engine/errors'
 import {
   describeFollowReport,
+  describeRestoreOutcome,
   needsSvnUserPrompt,
+  restorablePaths,
   type FollowReport,
   type FollowReportSection,
   type ReportLevel,
+  type RestoreOutcome,
   type SvnUserInfo,
 } from '../engine/svnFollow'
 import { CheckGlyph, WarnGlyph } from './ConfirmDialog'
@@ -16,6 +19,10 @@ export interface FollowReportRequest {
   /** 读「我的 SVN 用户名」。读不出来按取不到处理：报告本身不依赖它。 */
   readUser: () => Promise<SvnUserInfo>
   saveUser: (user: string) => Promise<void>
+  /**
+   * 「放回 Local-Only 补丁」（使用报告 9.1）。不给就不显示按钮。实现方负责写完之后刷新状态。
+   */
+  restoreLocalOnly?: (paths: string[]) => Promise<RestoreOutcome>
 }
 
 interface Pending extends FollowReportRequest {
@@ -77,6 +84,68 @@ function SvnUserRow({
         <button onClick={() => void submit()}>保存</button>
       </div>
       {saved && <div className="follow-user-saved">已保存，下次跟进时生效。</div>}
+      {error && <div className="dlg-warning">{error}</div>}
+    </div>
+  )
+}
+
+/**
+ * 「分支与磁盘对不上」里能安全放回的文件（使用报告 9.1）：一个按钮把分支版本写回磁盘。
+ * 点一次就够：成功之后按钮消失，只留结果；失败可以再点。
+ */
+function RestoreRow({
+  paths,
+  restore,
+}: {
+  paths: string[]
+  restore: (paths: string[]) => Promise<RestoreOutcome>
+}) {
+  const [busy, setBusy] = useState(false)
+  const [outcome, setOutcome] = useState<RestoreOutcome | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  const run = async () => {
+    setBusy(true)
+    setError(null)
+    try {
+      setOutcome(await restore(paths))
+    } catch (err) {
+      setError(toErrorMessage(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const said = outcome && describeRestoreOutcome(outcome)
+  // aria-live：结果是点完之后才出现的，读屏要能听到
+  return (
+    <div className="follow-restore" aria-live="polite">
+      {!outcome && (
+        <>
+          <div className="follow-note">
+            其中 {paths.length} 个文件，分支比磁盘多出来的只有 Local-Only 补丁，磁盘上就是 SVN
+            的版本。可以把补丁放回磁盘：SVN 里它们会显示为已修改，git 里是干净的。
+          </div>
+          <button type="button" onClick={() => void run()} disabled={busy}>
+            {busy ? '正在放回…' : `放回 Local-Only 补丁（${paths.length} 个文件）`}
+          </button>
+        </>
+      )}
+      {said && (
+        <div className={said.ok ? 'follow-user-saved' : 'dlg-warning'}>
+          {said.text}
+          {outcome.skipped.length > 0 && (
+            <ul className="follow-items">
+              {outcome.skipped.map((s) => (
+                <li key={s.path}>
+                  <span className="follow-path">{s.path}</span>
+                  <span className="follow-meta">{s.reason}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
       {error && <div className="dlg-warning">{error}</div>}
     </div>
   )
@@ -188,6 +257,8 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
 
   const flagged = m.sections.filter((s) => s.level !== 'info')
   const done = m.sections.filter((s) => s.level === 'info')
+  const restorable = restorablePaths(request.report)
+  const restore = request.restoreLocalOnly
 
   return (
     <div className="dialog-overlay">
@@ -214,6 +285,9 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
             {flagged.map((s) => (
               <Section key={s.id} s={s} />
             ))}
+            {restore && restorable.length > 0 && (
+              <RestoreRow paths={restorable} restore={restore} />
+            )}
           </div>
         )}
 

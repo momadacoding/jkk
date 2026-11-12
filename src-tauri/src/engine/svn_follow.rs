@@ -77,6 +77,7 @@ use crate::engine::svn_replay::{
     all_committed, commit_without, commits_between, replay_onto, ReplayCodes, ReplayCommit,
     ReplayOpts, ReplayOutcome,
 };
+use crate::engine::svn_restore_local_only::restorable_paths;
 use crate::engine::svn_snapshot::SnapshotRule;
 use crate::engine::svn_sync::{
     check_sync_with_nodes, read_baseline_map, tree_files, ExternalChange, SyncVerdict,
@@ -185,6 +186,11 @@ pub struct FollowReport {
     /// 已删的文件带了回来。多半是重放干净却合错了（W14；PR 119 遗留）。只告警，不拦。
     #[serde(default)]
     pub drift: Vec<String>,
+    /// `drift` 里分支比磁盘多出来的只有 Local-Only 改动、磁盘就是 SVN 版本的文件：可以用
+    /// 「放回 Local-Only 补丁」写回磁盘（使用报告 9.1，[`crate::engine::svn_restore_local_only`]）。
+    /// 跟进本身不写；点按钮时每条条件现场重验。
+    #[serde(default)]
+    pub restorable: Vec<String>,
     /// 分支上保留下来的 commit 改过、SVN 侧也有新内容的文件（分析 §6.12 条件 11），逐个标出重放
     /// 结果与磁盘是否逐字节相同。核对出错时为空（自动跟进因此不做，见 [`auto_blocker`]）。
     #[serde(default)]
@@ -1499,6 +1505,12 @@ fn prepare(repo: &str, auto: bool) -> Result<Plan> {
                 log::warn!("核对重放结果与磁盘时出错，跳过：{}", e.message);
                 Vec::new()
             });
+            // 9.1：只读挑出能放回的。出错只是少一个按钮
+            report.restorable = restorable_paths(repo, &new_base, &tip, &report.drift)
+                .unwrap_or_else(|e| {
+                    log::warn!("判断能否放回 Local-Only 补丁时出错，跳过：{}", e.message);
+                    Vec::new()
+                });
             // 条件 11 的逐文件核对。手动跟进只写进报告；出错时自动跟进不做（auto_blocker）
             match overlap_files(repo, &new_base, &tip, &paths, &report.drift) {
                 Ok(o) => report.overlap = o,

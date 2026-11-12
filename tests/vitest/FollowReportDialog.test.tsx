@@ -249,3 +249,73 @@ describe('FollowReportDialog', () => {
     expect(again.value).toBe('')
   })
 })
+
+describe('放回 Local-Only 补丁（使用报告 9.1）', () => {
+  const drift: FollowReport = {
+    ...report,
+    drift: ['Code/A.cs', 'Code/B.cs'],
+    restorable: ['Code/A.cs'],
+  }
+  type Outcome = { restored: string[]; skipped: { path: string; reason: string }[] }
+
+  it('没给 restoreLocalOnly 时不显示按钮', () => {
+    open(drift)
+    expect(screen.queryByRole('button', { name: /放回 Local-Only 补丁/ })).toBeNull()
+  })
+
+  it('没有可放回的文件时不显示按钮', () => {
+    open({ ...drift, restorable: [] }, { restoreLocalOnly: vi.fn() })
+    expect(screen.queryByRole('button', { name: /放回 Local-Only 补丁/ })).toBeNull()
+  })
+
+  it('点按钮只传 restorable，成功后按钮消失、显示结果', async () => {
+    const restoreLocalOnly = vi.fn(async (): Promise<Outcome> => ({
+      restored: ['Code/A.cs'],
+      skipped: [],
+    }))
+    open(drift, { restoreLocalOnly })
+    fireEvent.click(screen.getByRole('button', { name: '放回 Local-Only 补丁（1 个文件）' }))
+
+    expect(await screen.findByText(/已放回 1 个文件/)).toBeTruthy()
+    expect(restoreLocalOnly).toHaveBeenCalledWith(['Code/A.cs'])
+    expect(screen.queryByRole('button', { name: /放回 Local-Only 补丁/ })).toBeNull()
+  })
+
+  it('跳过的文件逐个列出原因', async () => {
+    const restoreLocalOnly = vi.fn(async (): Promise<Outcome> => ({
+      restored: [],
+      skipped: [{ path: 'Code/A.cs', reason: '磁盘上的内容不是 SVN 的版本' }],
+    }))
+    open(drift, { restoreLocalOnly })
+    fireEvent.click(screen.getByRole('button', { name: /放回 Local-Only 补丁/ }))
+
+    expect(await screen.findByText('一个文件都没放回，1 个跳过了：')).toBeTruthy()
+    expect(screen.getByText('磁盘上的内容不是 SVN 的版本')).toBeTruthy()
+  })
+
+  it('出错时显示错误，按钮还在、可以再点', async () => {
+    const restoreLocalOnly = vi
+      .fn<(paths: string[]) => Promise<Outcome>>()
+      .mockRejectedValueOnce({ code: 'svn_index_busy', message: '另一个 git 进程正在占用' })
+      .mockResolvedValueOnce({ restored: ['Code/A.cs'], skipped: [] })
+    open(drift, { restoreLocalOnly })
+    fireEvent.click(screen.getByRole('button', { name: /放回 Local-Only 补丁/ }))
+    expect(await screen.findByText(/另一个 git 进程正在占用/)).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: /放回 Local-Only 补丁/ }))
+    expect(await screen.findByText(/已放回 1 个文件/)).toBeTruthy()
+    expect(restoreLocalOnly).toHaveBeenCalledTimes(2)
+  })
+
+  it('放回进行中按钮禁用，不会重复调用', async () => {
+    let finish!: (o: Outcome) => void
+    const restoreLocalOnly = vi.fn(() => new Promise<Outcome>((r) => (finish = r)))
+    open(drift, { restoreLocalOnly })
+    fireEvent.click(screen.getByRole('button', { name: /放回 Local-Only 补丁/ }))
+    const busy = await screen.findByRole('button', { name: '正在放回…' })
+    expect((busy as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(busy)
+    expect(restoreLocalOnly).toHaveBeenCalledTimes(1)
+    await act(async () => finish({ restored: ['Code/A.cs'], skipped: [] }))
+  })
+})

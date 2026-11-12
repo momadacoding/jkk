@@ -150,6 +150,7 @@ pub fn run() {
             commands::svn_sync::svn_follow_continue,
             commands::svn_sync::svn_follow_auto,
             commands::svn_sync::svn_follow_manual,
+            commands::svn_sync::svn_restore_local_only,
             commands::svn::svn_sync_status,
             commands::repo::read_capabilities,
             commands::repo::read_upstream,

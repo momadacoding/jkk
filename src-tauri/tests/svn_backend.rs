@@ -1080,6 +1080,7 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
             rewritten: vec![("c2".into(), vec!["Code/A.cs".into()])],
             snapshot: vec![("c3".into(), vec!["Code/B.cs".into()])],
             drift: vec!["Code/E.cs".into()],
+            restorable: vec!["Code/E.cs".into()],
             overlap: vec![OverlapFile {
                 path: "Code/F.cs".into(),
                 commits: vec!["e381033 add".into()],
@@ -1139,6 +1140,7 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     assert_eq!(r["rewritten"][0], serde_json::json!(["c2", ["Code/A.cs"]]));
     assert_eq!(r["snapshot"][0], serde_json::json!(["c3", ["Code/B.cs"]]));
     assert_eq!(r["drift"][0], "Code/E.cs");
+    assert_eq!(r["restorable"][0], "Code/E.cs", "实际 {v}");
     assert_eq!(
         r["overlap"][0],
         serde_json::json!({ "path": "Code/F.cs", "commits": ["e381033 add"], "matchesDisk": true })
@@ -1155,6 +1157,8 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     // 6.10 之前的 journal 也没有 snapshot / drift
     old.as_object_mut().unwrap().remove("snapshot");
     old.as_object_mut().unwrap().remove("drift");
+    // 9.1 之前的 journal 没有 restorable
+    old.as_object_mut().unwrap().remove("restorable");
     // 方案 B 之前的 journal 没有 overlap
     old.as_object_mut().unwrap().remove("overlap");
     let back: FollowReport = serde_json::from_value(old).unwrap();
@@ -1163,6 +1167,7 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
         (Evidence::Heuristic, None)
     );
     assert!(back.snapshot.is_empty() && back.drift.is_empty() && back.overlap.is_empty());
+    assert!(back.restorable.is_empty());
 
     let s = &r["stage"];
     assert_eq!(s["decisions"]["Code/A.cs"], "takeNew", "实际 {v}");

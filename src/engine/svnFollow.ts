@@ -77,6 +77,11 @@ export interface FollowReport {
   snapshot: [string, string[]][]
   /** 重放后与磁盘对不上的文件：多半是重放干净却合错了（PR 119 遗留）。 */
   drift: string[]
+  /**
+   * `drift` 里能用「放回 Local-Only 补丁」写回磁盘的（使用报告 9.1）：分支比磁盘多出来的只有
+   * Local-Only 改动，磁盘就是 SVN 的版本。旧后端没有。
+   */
+  restorable?: string[]
   /** 条件 11 的重叠文件，逐个标出是否与磁盘一致。旧后端没有。 */
   overlap?: OverlapFile[]
   stage: ComposeReport
@@ -777,4 +782,36 @@ export function describeManualFollowOutcome(o: SyncInOutcome): OutcomeNotice | n
     case 'followDrift':
       return describeFollowDrift(o)
   }
+}
+
+/** 后端 `svn_restore_local_only::RestoreSkip`。 */
+export interface RestoreSkip {
+  path: string
+  /** 给人看的原因。 */
+  reason: string
+}
+
+/** 后端 `svn_restore_local_only::RestoreOutcome`：「放回 Local-Only 补丁」的结果。 */
+export interface RestoreOutcome {
+  restored: string[]
+  skipped: RestoreSkip[]
+}
+
+/** 报告里能放回 Local-Only 补丁的文件；旧后端没有这个字段时为空。 */
+export function restorablePaths(r: FollowReport): string[] {
+  return r.restorable ?? []
+}
+
+/** 「放回 Local-Only 补丁」之后在报告里说什么。`ok` 为 false 时要用户留意跳过的文件。 */
+export function describeRestoreOutcome(o: RestoreOutcome): { ok: boolean; text: string } {
+  const done = o.restored.length
+  const skipped = o.skipped.length
+  if (skipped === 0) {
+    return {
+      ok: true,
+      text: `已放回 ${done} 个文件的 Local-Only 补丁。SVN 里它们会显示为已修改，git 里是干净的。`,
+    }
+  }
+  const head = done > 0 ? `已放回 ${done} 个文件，` : '一个文件都没放回，'
+  return { ok: false, text: `${head}${skipped} 个跳过了：` }
 }
