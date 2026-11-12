@@ -14,7 +14,9 @@ use crate::desktop::DesktopState;
 use crate::engine::svn_follow::{
     follow, follow_auto, manual_follow, resume_follow, AutoFollowOutcome, FollowOutcome,
 };
-use crate::engine::svn_restore_local_only::{restore_local_only, RestoreOutcome};
+use crate::engine::svn_restore_local_only::{
+    dismiss_pending_restores, pending_restores, restore_local_only, PendingRestore, RestoreOutcome,
+};
 use crate::engine::svn_sync_check::{preview_sync_in, SyncInPreview};
 use crate::engine::svn_sync_in::{
     abort_sync, continue_sync, new_opid, run_sync_in, SyncInExpect, SyncInOutcome,
@@ -93,7 +95,24 @@ pub fn svn_restore_local_only(
     restore_local_only(&path, &new_opid(), &paths)
 }
 
-/// 跟进外部提交（分析 §6.5）：录新基线、对象层重放分支、发布。不写磁盘，不发 SVN 写命令。
+/// 「N 个文件缺 Local-Only 补丁」横幅的数据：跟进记下的待放回文件里，此刻现场重验能放回的。
+/// 只读、不拿同步锁（跟着状态刷新跑，拿锁会让 watcher 再刷一轮）。JS 侧：
+/// `invoke('svn_pending_restores', { path })`。
+#[tauri::command(async)]
+pub fn svn_pending_restores(path: String) -> Result<Vec<PendingRestore>, GitError> {
+    pending_restores(&path)
+}
+
+/// 横幅上的「不放回」：从待放回清单删掉，不碰磁盘。JS 侧：
+/// `invoke('svn_dismiss_pending_restores', { path, paths })`。
+#[tauri::command(async)]
+pub fn svn_dismiss_pending_restores(path: String, paths: Vec<String>) -> Result<(), GitError> {
+    dismiss_pending_restores(&path, &new_opid(), &paths)
+}
+
+/// 跟进外部提交（分析 §6.5）：录新基线、对象层重放分支、发布。不发 SVN 写命令；发布完成后
+/// 只把「我最后提交的」文件的 Local-Only 补丁放回磁盘（计划 2026-11-12-auto-restore-local-only），
+/// 自动跟进同样如此。
 #[tauri::command(async)]
 pub fn svn_follow(handle: AppHandle, path: String) -> Result<FollowOutcome, GitError> {
     with_watch_suspended(&handle, &path, || follow(&path, &new_opid()))

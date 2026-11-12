@@ -862,3 +862,90 @@ fn the_journal_stays_at_prepare_index_until_the_baseline_is_published() {
         assert_eq!(j.follow_steps.unwrap().step, want, "{at:?}");
     }
 }
+
+// —— 使用报告 2026-11-12：提交 SVN 前去掉 Local-Only 补丁（计划 2026-11-12-auto-restore-local-only） ——
+
+const PATCH: &str = "---@class Avatar\n";
+
+fn lines8(last: &str) -> String {
+    format!("1\n2\n3\n4\n5\n6\n7\n{last}\n")
+}
+
+/// 分支上有 Local-Only 提交给 B 加了一行，跟进过一次，磁盘带着补丁。
+fn patched_scene(fx: &SvnFixture) {
+    i_commit(fx);
+    write(fx, B, &lines8("8"));
+    tortoise_commit(fx, B);
+    manual_done(follow(&fx.wc_str(), "seed").unwrap());
+    write(fx, B, &format!("{PATCH}{}", lines8("8")));
+    commit_all(fx, L_MSG);
+}
+
+#[test]
+fn stripping_the_patch_before_an_svn_commit_is_followed_and_the_patch_comes_back() {
+    // 真实现场：磁盘上去掉补丁、顺手改了别的，TortoiseSVN 提交。以前重放结果和磁盘对不上被拦
+    let fx = hybrid_with_colleague();
+    patched_scene(&fx);
+    write(&fx, B, &lines8("8 mine"));
+    tortoise_commit(&fx, B);
+
+    let rep = done(auto(&fx));
+
+    assert_eq!(
+        overlap_of(&rep),
+        vec![(B.to_string(), false)],
+        "前提：放回前对不上"
+    );
+    let restore = rep.restore.expect("有放回结果");
+    assert_eq!(restore.restored, vec![B.to_string()], "{restore:?}");
+    let want = format!("{PATCH}{}", lines8("8 mine"));
+    assert_eq!(read(&fx, B), want);
+    assert_eq!(show(&fx, "HEAD:Code/B.cs"), want.trim_end());
+    assert!(modified_paths(&fx).is_empty(), "{:?}", modified_paths(&fx));
+    assert!(staged_paths(&fx).is_empty(), "{:?}", staged_paths(&fx));
+}
+
+#[test]
+fn a_stripped_patch_with_further_edits_is_not_followed_or_written() {
+    // 提交之后又改了这个文件：磁盘不是 SVN 的版本，不能放回，照旧拦
+    let fx = hybrid_with_colleague();
+    patched_scene(&fx);
+    write(&fx, B, &lines8("8 mine"));
+    tortoise_commit(&fx, B);
+    let edited = format!("{}more\n", lines8("8 mine"));
+    write(&fx, B, &edited);
+
+    let message = assert_skipped_untouched(&fx, "svn_auto_follow_overlap");
+
+    assert!(message.contains(B), "{message}");
+    assert_eq!(read(&fx, B), edited, "编辑原样保留");
+}
+
+#[test]
+fn a_stripped_patch_last_changed_by_a_colleague_is_not_restored_automatically() {
+    // 有意去掉补丁、还没提交，svn update 带来同事的改动：可能是在准备提交，不替用户放回
+    let fx = hybrid_with_colleague();
+    patched_scene(&fx);
+    write(&fx, B, &lines8("8"));
+    fx.colleague_commits(B, &lines8("colleague"));
+    let r = youngest(&fx);
+    set_author(&fx, r, "colleague");
+    svn_update(&fx, B);
+    assert_eq!(read(&fx, B), lines8("colleague"));
+
+    let message = assert_skipped_untouched(&fx, "svn_auto_follow_overlap");
+
+    assert!(message.contains(B), "{message}");
+    assert!(
+        message.contains("Local-Only 补丁"),
+        "说清是这种情况（缺陷 7）：{message}"
+    );
+    assert!(message.contains("不是你"), "{message}");
+    assert_eq!(read(&fx, B), lines8("colleague"));
+
+    // 点「跟进」：跟进完成，同样不写磁盘，留给横幅
+    let rep = manual_done(follow(&fx.wc_str(), "manual").unwrap());
+    let restore = rep.restore.expect("有放回结果");
+    assert!(restore.restored.is_empty(), "{restore:?}");
+    assert_eq!(read(&fx, B), lines8("colleague"));
+}

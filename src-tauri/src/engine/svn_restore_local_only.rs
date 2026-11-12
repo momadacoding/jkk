@@ -9,11 +9,17 @@
 //!
 //! # 做法
 //!
-//! 跟进不写磁盘（`svn_follow` 模块头的不变量），所以分两步：
+//! 跟进在 journal 存续期间不写磁盘（`svn_follow` 模块头的不变量），所以分三步：
 //!
 //! - [`restorable_paths`]：跟进时只读地挑出能放回的文件，记进报告；
-//! - [`restore_local_only`]：用户点按钮时持同步锁、**每条条件现场重验**，再用
-//!   `git checkout-index` 把分支版本写回磁盘。
+//! - [`restore_locked`]：跟进发布完成、journal 删掉之后，还拿着同步锁时，把其中「SVN 上最后
+//!   一次改它的是我」的文件放回（计划 `2026-11-12-auto-restore-local-only.md` 的 A）。**每条
+//!   条件现场重验**，再用 `git checkout-index` 把分支版本写回磁盘；
+//! - 没放回的记进待放回清单（[`record_pending`]），横幅上按 [`pending_restores`] 现场重验后
+//!   给「放回」按钮（[`restore_local_only`]）。
+//!
+//! 只自动放回「我最后提交的」：用户有意去掉补丁、还没提交时，`svn update` 带来别人对这个文件
+//! 的改动，跟进后它同样满足下面的条件。自动写回会撤销用户的准备，接着整包提交就把补丁带上 SVN。
 //!
 //! # 为什么安全
 //!
@@ -39,7 +45,8 @@ use crate::engine::svn_lock;
 use crate::engine::svn_sync_check::{check_git_idle, current_branch, rev_parse};
 use crate::error::{GitError, Result};
 use git2::{Commit, IndexEntryExtendedFlag, IndexEntryFlag, ObjectType, Oid, Repository, Tree};
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 /// [`restore_local_only`] 的结果。
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -49,6 +56,10 @@ pub struct RestoreOutcome {
     pub restored: Vec<String>,
     /// 没写的文件和原因。
     pub skipped: Vec<RestoreSkip>,
+    /// 路径 → 改过它的 Local-Only 提交（`短 hash 说明`，从新到旧）。只有过了树这几关的文件才有，
+    /// 报告与横幅用它写「文件 ← 提交」（使用报告 2026-11-12 缺陷 6）。
+    #[serde(default)]
+    pub commits: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -57,26 +68,40 @@ pub struct RestoreSkip {
     pub path: String,
     /// 给人看的原因。
     pub reason: String,
+    /// 过一会儿可能就满足了（文件被占用、暂存了别的版本、分支落后、还没自动放回），留在待放回
+    /// 清单里；为假的是再等也不会变的（普通 commit 改过、磁盘有用户的编辑、已经放回过），从清单
+    /// 里删掉。只在后端用。
+    #[serde(skip)]
+    pub retry: bool,
+}
+
+/// 横幅上的一个待放回文件（[`pending_restores`]）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingRestore {
+    pub path: String,
+    /// 改过它的 Local-Only 提交，同 [`RestoreOutcome::commits`]。
+    pub commits: Vec<String>,
 }
 
 /// 跟进时用：`candidates`（报告的 `drift`）里哪些能放回。`base` 是新基线，`head` 是重放后的
-/// tip，两者都还没发布成 ref，所以按 OID 给。只读；不看索引（发布时才拼出新索引），按钮按下时
-/// [`restore_local_only`] 会再查。
+/// tip，两者都还没发布成 ref，所以按 OID 给。只读；不看索引（发布时才拼出新索引），写之前
+/// [`restore_locked`] 会再查。
 pub fn restorable_paths(
     repo: &str,
     base: &str,
     head: &str,
     candidates: &[String],
 ) -> Result<Vec<String>> {
-    // 没做换行迁移时按钮会拒绝，就别给按钮
+    // 没做换行迁移时放回会拒绝，就别列出来
     if candidates.is_empty() || !has_eol_rule(repo) {
         return Ok(Vec::new());
     }
     let (ok, _) = check_paths(repo, base, head, candidates, false)?;
-    Ok(ok.into_iter().map(|(p, _, _)| p).collect())
+    Ok(ok.into_iter().map(|r| r.path).collect())
 }
 
-/// 按钮：把 `paths` 里满足条件的文件写回成分支（HEAD）的版本。
+/// 按钮：把 `paths` 里满足条件的文件写回成分支（HEAD）的版本。放回成功的同时从待放回清单里删掉。
 ///
 /// 持同步锁；有没做完的 SVN 同步、git 正忙、索引被占用、HEAD 不在工作分支上时报错，什么都不写。
 /// 单个文件不满足条件只是跳过，写进 [`RestoreOutcome::skipped`]。
@@ -85,6 +110,32 @@ pub fn restore_local_only(repo: &str, opid: &str, paths: &[String]) -> Result<Re
         return Ok(RestoreOutcome::default());
     }
     let _lock = svn_lock::acquire(repo, opid)?;
+    let out = restore_locked(repo, paths)?;
+    let gone: Vec<String> = out
+        .restored
+        .iter()
+        .cloned()
+        .chain(
+            out.skipped
+                .iter()
+                .filter(|s| !s.retry)
+                .map(|s| s.path.clone()),
+        )
+        .collect();
+    if let Err(e) = update_pending(repo, &[], &gone) {
+        log::warn!("更新待放回清单失败：{}", e.message);
+    }
+    Ok(out)
+}
+
+/// [`restore_local_only`] 去掉拿锁那一步：**调用方持同步锁**。跟进发布完成、journal 删掉之后在
+/// 同一把锁里调用，中间不给别的写操作留空档（使用报告 2026-11-12 的 A）。
+///
+/// 前置条件不满足时返回 `Err`，什么都不写；不碰待放回清单，由调用方决定怎么记。
+pub fn restore_locked(repo: &str, paths: &[String]) -> Result<RestoreOutcome> {
+    if paths.is_empty() {
+        return Ok(RestoreOutcome::default());
+    }
     if svn_journal::read(repo)?.is_some() {
         return Err(GitError::new(
             "svn_restore_unfinished_sync",
@@ -124,18 +175,20 @@ pub fn restore_local_only(repo: &str, opid: &str, paths: &[String]) -> Result<Re
     let base = rev_parse(repo, &format!("refs/heads/{BASELINE_BRANCH}"))?;
     let head = rev_parse(repo, "HEAD")?;
     let (ok, mut skipped) = check_paths(repo, &base, &head, paths, true)?;
+    let mut commits: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for r in &ok {
+        commits.insert(r.path.clone(), r.commits.clone());
+    }
     if ok.is_empty() {
         return Ok(RestoreOutcome {
             restored: Vec::new(),
             skipped,
+            commits,
         });
     }
     // `--stdin -z`：路径不经命令行，空格、中文、上万个文件都不用拆参。`ok` 非空，不会出现
     // 「空列表 = 全部」（AGENTS.md §6.2）；`checkout-index` 本来也不把空输入当成全部
-    let input: Vec<u8> = ok
-        .iter()
-        .flat_map(|(p, _, _)| p.bytes().chain([0]))
-        .collect();
+    let input: Vec<u8> = ok.iter().flat_map(|r| r.path.bytes().chain([0])).collect();
     // 一个文件写不进去（被编辑器独占打开之类），`checkout-index` 照样写完其余的、最后退出 1。
     // 所以失败不能直接 `?`：那会把已经写成的也报成失败，下次再点还会给出错的原因（PR 159
     // review 第 1 条）。不管成败都逐个核对磁盘，按实际结果分类
@@ -145,36 +198,235 @@ pub fn restore_local_only(repo: &str, opid: &str, paths: &[String]) -> Result<Re
     if let Some(msg) = &write_error {
         log::warn!("放回 Local-Only 补丁时 checkout-index 报错：{msg}");
     }
-    let names: Vec<String> = ok.iter().map(|(p, _, _)| p.clone()).collect();
+    let names: Vec<String> = ok.iter().map(|r| r.path.clone()).collect();
     let after = disk_hashes(repo, &names);
     let mut restored = Vec::with_capacity(ok.len());
-    for ((p, head_oid, svn_oid), disk) in ok.into_iter().zip(after) {
+    for (r, disk) in ok.into_iter().zip(after) {
         let Some(disk) = disk else {
             // 写没写成说不准：不能报「没写」，也不能说写成了
             skipped.push(RestoreSkip {
-                path: p,
+                path: r.path,
                 reason: "写回之后读不了磁盘上的这个文件，请在「本地改动」里看一眼。".into(),
+                retry: true,
             });
             continue;
         };
-        if disk == head_oid {
-            restored.push(p);
-        } else if disk == svn_oid {
+        if disk == r.head_oid {
+            restored.push(r.path);
+        } else if disk == r.svn_oid {
             let why = write_error.as_deref().unwrap_or("git 没有给出原因");
             skipped.push(RestoreSkip {
-                path: p,
+                path: r.path,
                 reason: format!("没写进去，磁盘上还是 SVN 的版本：{why}"),
+                retry: true,
             });
         } else {
             skipped.push(RestoreSkip {
-                path: p,
+                path: r.path,
                 reason: "写回之后磁盘内容与分支、SVN 都不一样（可能被别的程序同时改了）。\
                          请在「本地改动」里核对。"
                     .into(),
+                retry: false,
             });
         }
     }
-    Ok(RestoreOutcome { restored, skipped })
+    Ok(RestoreOutcome {
+        restored,
+        skipped,
+        commits,
+    })
+}
+
+// —— 待放回清单（计划 `2026-11-12-auto-restore-local-only.md` 的 C） ——
+//
+// 横幅不按「当前状态」推断哪些文件缺补丁：用户提交 SVN 前有意去掉补丁时，磁盘 = SVN、分支多出
+// Local-Only，正好满足放回条件，横幅会在他准备提交时让他放回。所以只认跟进记下的文件。
+//
+// 文件在 `.git/mygitclient/` 下，watcher 不把那里的变化当成刷新信号（`commands/watch.rs`）。
+
+const PENDING_DIR: &str = "mygitclient";
+const PENDING_FILE: &str = "restore-pending.json";
+
+fn pending_path(repo: &str) -> Result<PathBuf> {
+    Ok(git_dir(repo)?.join(PENDING_DIR).join(PENDING_FILE))
+}
+
+/// 读清单。没有文件、读不了、内容坏了都按空清单：它只是提醒，不能挡住别的操作。
+fn read_pending(repo: &str) -> Vec<String> {
+    let Ok(path) = pending_path(repo) else {
+        return Vec::new();
+    };
+    let raw = match std::fs::read(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            log::warn!("待放回清单读不了，按空清单处理：{e}");
+            return Vec::new();
+        }
+    };
+    serde_json::from_slice::<Vec<String>>(&raw).unwrap_or_else(|e| {
+        log::warn!("待放回清单坏了，按空清单处理：{e}");
+        Vec::new()
+    })
+}
+
+fn write_pending(repo: &str, paths: &[String]) -> Result<()> {
+    let path = pending_path(repo)?;
+    if paths.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        };
+    }
+    let dir = path.parent().expect("清单路径一定有父目录");
+    std::fs::create_dir_all(dir)?;
+    let body = serde_json::to_vec(paths)
+        .map_err(|e| GitError::new("svn_restore_pending", format!("清单序列化失败: {e}")))?;
+    // 写临时文件再换名：写一半崩溃留下的是旧清单，不是半个 JSON
+    let tmp = dir.join(format!("{PENDING_FILE}.{}.tmp", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp, &body) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        GitError::new("io", format!("替换待放回清单失败: {e}"))
+    })
+}
+
+/// 清单 = (旧清单 ∪ `add`) − `remove`，保持先来的在前。**调用方持同步锁**：跟进、放回、
+/// 「不放回」都在锁里改它，读-改-写不会互相盖掉。
+fn update_pending(repo: &str, add: &[String], remove: &[String]) -> Result<()> {
+    let old = read_pending(repo);
+    let gone: BTreeSet<&String> = remove.iter().collect();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let next: Vec<String> = old
+        .iter()
+        .chain(add)
+        .filter(|p| !gone.contains(p) && seen.insert((*p).clone()))
+        .cloned()
+        .collect();
+    if next == old {
+        return Ok(());
+    }
+    write_pending(repo, &next)
+}
+
+/// 跟进结束时调用（持同步锁）：这次可放回却没放回的记进清单，放回了的删掉；旧条目顺手按放回
+/// 条件现场重验，再等也不会满足的（普通 commit 改过、磁盘有用户的编辑、已经是分支的版本）删掉。
+///
+/// 修剪只在这里与 [`restore_local_only`] 做，都持同步锁。横幅的 [`pending_restores`] 只读：它跟着
+/// 状态刷新跑，拿同步锁会让 watcher 看到锁文件变化、再刷一轮，形成回路。
+pub fn record_pending(repo: &str, add: &[String], remove: &[String]) -> Result<()> {
+    let gone: BTreeSet<&String> = remove.iter().collect();
+    let fresh: BTreeSet<&String> = add.iter().collect();
+    let old: Vec<String> = read_pending(repo)
+        .into_iter()
+        .filter(|p| !gone.contains(p) && !fresh.contains(p))
+        .collect();
+    // 修剪失败只是少删几条：这次要加、要删的照样写进去（review L1）
+    let stale = if old.is_empty() {
+        Vec::new()
+    } else {
+        stale_entries(repo, &old).unwrap_or_else(|e| {
+            log::warn!("修剪待放回清单时核对失败，这次不修剪：{}", e.message);
+            Vec::new()
+        })
+    };
+    let remove: Vec<String> = remove.iter().cloned().chain(stale).collect();
+    update_pending(repo, add, &remove)
+}
+
+/// `paths` 里再等也不会满足放回条件的（[`RestoreSkip::retry`] 为假）。
+fn stale_entries(repo: &str, paths: &[String]) -> Result<Vec<String>> {
+    let Some((base, head)) = live_refs(repo)? else {
+        return Ok(Vec::new());
+    };
+    let (_, skipped) = check_paths(repo, &base, &head, paths, true)?;
+    Ok(skipped
+        .into_iter()
+        .filter(|s| !s.retry)
+        .map(|s| s.path)
+        .collect())
+}
+
+/// 待放回清单的原样内容，按记下的顺序。给测试核对修剪用；界面走 [`pending_restores`]。
+pub fn pending_list(repo: &str) -> Vec<String> {
+    read_pending(repo)
+}
+
+/// 现场重验要的 (`svn/base`, HEAD)。HEAD 不在工作分支上时 `None`：先不下结论，切回来再看。
+fn live_refs(repo: &str) -> Result<Option<(String, String)>> {
+    match current_branch(repo)? {
+        Some(b) if b != BASELINE_BRANCH => {}
+        _ => return Ok(None),
+    }
+    let base = rev_parse(repo, &format!("refs/heads/{BASELINE_BRANCH}"))?;
+    let head = rev_parse(repo, "HEAD")?;
+    Ok(Some((base, head)))
+}
+
+/// 横幅：清单里此刻能放回的文件，逐个按放回条件现场重验（含索引）。只读，不拿同步锁（见
+/// [`record_pending`]）；正在同步、有没做完的同步、没装换行规则、HEAD 不在工作分支上时返回空。
+/// 清单为空时不碰 git：它跟着每次状态刷新跑。
+pub fn pending_restores(repo: &str) -> Result<Vec<PendingRestore>> {
+    let paths = read_pending(repo);
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    // 仓库停在中间态时现场重验的结论不可靠，等同步做完
+    if svn_lock::is_held(repo) || svn_journal::read(repo)?.is_some() || !has_eol_rule(repo) {
+        return Ok(Vec::new());
+    }
+    let Some((base, head)) = live_refs(repo)? else {
+        return Ok(Vec::new());
+    };
+    let (ok, _) = check_paths(repo, &base, &head, &paths, true)?;
+    Ok(ok
+        .into_iter()
+        .map(|r| PendingRestore {
+            path: r.path,
+            commits: r.commits,
+        })
+        .collect())
+}
+
+/// `svn/base..HEAD` 里改过这些文件的 Local-Only 提交（`短 hash 说明`，从新到旧），给报告写
+/// 「文件 ← 提交」。只读；不判断能不能放回。HEAD 不在工作分支上、或者一个都没有时不出现在结果里。
+pub fn local_only_commits(repo: &str, paths: &[String]) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut out = BTreeMap::new();
+    if paths.is_empty() {
+        return Ok(out);
+    }
+    let Some((base, head)) = live_refs(repo)? else {
+        return Ok(out);
+    };
+    let git = Repository::open(repo)?;
+    let base = git.find_commit(Oid::from_str(&base)?)?;
+    let head = git.find_commit(Oid::from_str(&head)?)?;
+    let commits = range(&git, &base, &head)?;
+    for p in paths {
+        let labels: Vec<String> = commits
+            .iter()
+            .filter(|c| touches(c, p))
+            .filter(|c| parse_local_only(&String::from_utf8_lossy(c.message_bytes())))
+            .map(label)
+            .collect();
+        if !labels.is_empty() {
+            out.insert(p.clone(), labels);
+        }
+    }
+    Ok(out)
+}
+
+/// 横幅上的「不放回」：从清单里删掉，不碰磁盘。
+pub fn dismiss_pending_restores(repo: &str, opid: &str, paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let _lock = svn_lock::acquire(repo, opid)?;
+    update_pending(repo, &[], paths)
 }
 
 /// 树里某个路径的 (OID, filemode)；不存在为 `None`。
@@ -188,8 +440,16 @@ fn is_regular(mode: i32) -> bool {
     mode == 0o100644 || mode == 0o100755
 }
 
-/// 能放回的文件：(路径, 分支版本的 OID, SVN 版本的 OID)。
-type Restorable = (String, String, String);
+/// 能放回的文件。
+struct Restorable {
+    path: String,
+    /// 分支（HEAD）版本的 OID。
+    head_oid: String,
+    /// SVN（`svn/base`）版本的 OID。
+    svn_oid: String,
+    /// 改过它的 Local-Only 提交，`短 hash 说明`，从新到旧。
+    commits: Vec<String>,
+}
 
 /// 逐个文件判定，返回 (能放回的, 跳过的及原因)，各自按 `paths` 的顺序。见模块头「为什么安全」。
 fn check_paths(
@@ -208,6 +468,8 @@ fn check_paths(
             .map(|p| RestoreSkip {
                 path: p.clone(),
                 reason: why.to_string(),
+                // 跟进之后就不落后了
+                retry: true,
             })
             .collect();
         Ok((Vec::new(), skipped))
@@ -224,13 +486,23 @@ fn check_paths(
     let index = if with_index { Some(git.index()?) } else { None };
 
     let mut skipped = Vec::new();
+    // 再等也不会变的原因
     let skip = |skipped: &mut Vec<RestoreSkip>, p: &str, why: &str| {
         skipped.push(RestoreSkip {
             path: p.to_string(),
             reason: why.to_string(),
+            retry: false,
         })
     };
-    // 过了树与索引这几关、还要看磁盘的：(路径, 分支版本的 OID, SVN 版本的 OID)
+    // 过一会儿可能就满足了的原因（见 [`RestoreSkip::retry`]）
+    let skip_for_now = |skipped: &mut Vec<RestoreSkip>, p: &str, why: &str| {
+        skipped.push(RestoreSkip {
+            path: p.to_string(),
+            reason: why.to_string(),
+            retry: true,
+        })
+    };
+    // 过了树与索引这几关、还要看磁盘的
     let mut pending: Vec<Restorable> = Vec::new();
     for p in paths {
         let Some((head_oid, head_mode)) = entry(&head_tree, p).filter(|(_, m)| is_regular(*m))
@@ -290,7 +562,7 @@ fn check_paths(
                 .as_ref()
                 .is_some_and(|e| e.id == head_oid && e.mode as i32 == head_mode);
             if conflicted || !same {
-                skip(
+                skip_for_now(
                     &mut skipped,
                     p,
                     "暂存区里是别的版本：先处理暂存，免得放回去把它盖掉。",
@@ -312,44 +584,49 @@ fn check_paths(
                 continue;
             }
         }
-        pending.push((p.clone(), head_oid.to_string(), base_oid.to_string()));
+        pending.push(Restorable {
+            path: p.clone(),
+            head_oid: head_oid.to_string(),
+            svn_oid: base_oid.to_string(),
+            commits: touching.iter().map(|c| label(c)).collect(),
+        });
     }
 
     // 磁盘：普通文件，且按 `git add` 的规则算出的 hash 等于 SVN 版本
     let on_disk: Vec<Restorable> = pending
         .into_iter()
-        .filter(|(p, _, _)| {
+        .filter(|r| {
             let regular = Path::new(repo)
-                .join(p)
+                .join(&r.path)
                 .symlink_metadata()
                 .is_ok_and(|m| m.is_file());
             if !regular {
-                skip(&mut skipped, p, "磁盘上没有这个文件。");
+                skip(&mut skipped, &r.path, "磁盘上没有这个文件。");
             }
             regular
         })
         .collect();
-    let names: Vec<String> = on_disk.iter().map(|(p, _, _)| p.clone()).collect();
+    let names: Vec<String> = on_disk.iter().map(|r| r.path.clone()).collect();
     let hashes = disk_hashes(repo, &names);
     let mut ok = Vec::new();
-    for ((p, head_oid, svn), disk) in on_disk.into_iter().zip(hashes) {
+    for (r, disk) in on_disk.into_iter().zip(hashes) {
         let Some(disk) = disk else {
-            skip(
+            skip_for_now(
                 &mut skipped,
-                &p,
+                &r.path,
                 "读不了磁盘上的这个文件（可能被别的程序占用），没动它。",
             );
             continue;
         };
-        if disk == svn {
-            ok.push((p, head_oid, svn));
-        } else if disk == head_oid {
+        if disk == r.svn_oid {
+            ok.push(r);
+        } else if disk == r.head_oid {
             // 已经放回过（重复点、或用户自己丢弃过本地改动）：不是用户的编辑，别吓人
-            skip(&mut skipped, &p, "磁盘上已经是分支的版本，不用放回。");
+            skip(&mut skipped, &r.path, "磁盘上已经是分支的版本，不用放回。");
         } else {
             skip(
                 &mut skipped,
-                &p,
+                &r.path,
                 "磁盘上的内容不是 SVN 的版本（可能有你自己的编辑），不覆盖。",
             );
         }
@@ -358,6 +635,17 @@ fn check_paths(
     let order = |p: &str| paths.iter().position(|q| q == p).unwrap_or(usize::MAX);
     skipped.sort_by_key(|s| order(&s.path));
     Ok((ok, skipped))
+}
+
+/// 报告里提交的写法：`短 hash 说明`，与跟进报告的 `overlap` 同一口径（`git log --format=%h %s`）。
+fn label(c: &Commit) -> String {
+    let id = c
+        .as_object()
+        .short_id()
+        .ok()
+        .and_then(|b| b.as_str().map(str::to_string))
+        .unwrap_or_else(|| c.id().to_string()[..7].to_string());
+    format!("{id} {}", c.summary().unwrap_or_default())
 }
 
 /// `base..head` 的 commit（不含 base）。

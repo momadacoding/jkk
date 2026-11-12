@@ -1,9 +1,14 @@
 //! 跟进外部提交（分析 §6.5、§6.11.1、§6.11.3；计划 Task 10；日志「偏离计划」的发布顺序）。
 //!
 //! 用户在 TortoiseSVN 里只提交、不更新，或者只更新某个子目录之后，把基线推进到各文件的真实
-//! revision，把分支重放上去，暂存区拼回来。**全程不写磁盘，不发 SVN 写命令。**
+//! revision，把分支重放上去，暂存区拼回来。**journal 存续期间不写磁盘，全程不发 SVN 写命令。**
 //!
-//! 唯一的例外是冲突兜底 [`manual_follow`]：它走 stash + rebase，会写磁盘，只由用户显式发起。
+//! 例外有两个：
+//!
+//! - 冲突兜底 [`manual_follow`]：它走 stash + rebase，会写磁盘，只由用户显式发起；
+//! - 发布完成、journal 删掉之后，还拿着同步锁时放回 Local-Only 补丁（[`with_restore`]；计划
+//!   `2026-11-12-auto-restore-local-only.md`）。崩溃恢复只看 journal，这一步落在它外面：崩在
+//!   放回中途，看到的是一次已经做完的跟进加上「本地改动」里缺补丁的文件，横幅的待放回清单兜底。
 //!
 //! # 两段
 //!
@@ -77,7 +82,10 @@ use crate::engine::svn_replay::{
     all_committed, commit_without, commits_between, replay_onto, ReplayCodes, ReplayCommit,
     ReplayOpts, ReplayOutcome,
 };
-use crate::engine::svn_restore_local_only::restorable_paths;
+use crate::engine::svn_restore_local_only::{
+    local_only_commits, record_pending, restorable_paths, restore_locked, RestoreOutcome,
+    RestoreSkip,
+};
 use crate::engine::svn_snapshot::SnapshotRule;
 use crate::engine::svn_sync::{
     check_sync_with_nodes, read_baseline_map, tree_files, ExternalChange, SyncVerdict,
@@ -191,6 +199,10 @@ pub struct FollowReport {
     /// 跟进本身不写；点按钮时每条条件现场重验。
     #[serde(default)]
     pub restorable: Vec<String>,
+    /// 跟进完成后自动放回的结果（[`with_restore`]）。`restorable` 为空、或者跟进没走到完成时为
+    /// `None`。`restorable` 里没放回的文件都在 `skipped` 里，写着原因，也进了待放回清单。
+    #[serde(default)]
+    pub restore: Option<RestoreOutcome>,
     /// 分支上保留下来的 commit 改过、SVN 侧也有新内容的文件（分析 §6.12 条件 11），逐个标出重放
     /// 结果与磁盘是否逐字节相同。核对出错时为空（自动跟进因此不做，见 [`auto_blocker`]）。
     #[serde(default)]
@@ -260,7 +272,18 @@ pub fn follow(repo: &str, opid: &str) -> Result<FollowOutcome> {
             Err(e) => return Ok(refused(e)),
         };
         match still_valid(repo, &plan) {
-            Ok(true) => return publish(repo, opid, plan),
+            Ok(true) => {
+                let auto = auto_restorable(&plan);
+                let out = publish(repo, opid, plan)?;
+                // 同步锁还拿着
+                return Ok(match out {
+                    FollowOutcome::Done { mut report } => {
+                        with_restore(repo, &mut report, &auto, NOT_MINE);
+                        FollowOutcome::Done { report }
+                    }
+                    other => other,
+                });
+            }
             Ok(false) => continue,
             Err(e) => return Ok(refused(e)),
         }
@@ -285,7 +308,15 @@ pub fn resume_follow(repo: &str) -> Result<FollowOutcome> {
         if j.opid != first.opid || j.flow != Flow::Follow {
             return Err(wrong_flow());
         }
-        resume_locked(repo, &mut j)?
+        // 崩溃前那次的作者信息没有记进 journal，分不清哪些是我最后提交的：一个都不自动写，
+        // 只记进待放回清单
+        match resume_locked(repo, &mut j)? {
+            Resumed::Finished(FollowOutcome::Done { mut report }) => {
+                with_restore(repo, &mut report, &[], RESUMED);
+                Resumed::Finished(FollowOutcome::Done { report })
+            }
+            other => other,
+        }
     };
     match next {
         Resumed::Finished(o) => Ok(o),
@@ -344,7 +375,18 @@ pub fn follow_auto(repo: &str, opid: &str) -> Result<AutoFollowOutcome> {
             Err(e) => return Ok(skipped(e)),
         };
         match still_valid(repo, &plan) {
-            Ok(true) => return publish_auto(repo, opid, plan),
+            Ok(true) => {
+                let auto = auto_restorable(&plan);
+                let out = publish_auto(repo, opid, plan)?;
+                // 同步锁还拿着
+                return Ok(match out {
+                    AutoFollowOutcome::Done { mut report } => {
+                        with_restore(repo, &mut report, &auto, NOT_MINE);
+                        AutoFollowOutcome::Done { report }
+                    }
+                    other => other,
+                });
+            }
             Ok(false) => continue,
             Err(e) => return Ok(skipped(e)),
         }
@@ -434,12 +476,14 @@ fn auto_blocker(plan: &Plan) -> Option<GitError> {
         ));
     }
     // 方案 B：重叠但重放结果与磁盘逐字节相同的放行。「本地改动」= 磁盘 − tip，两者相同就不会有
-    // W14 那种反向改动；drift 一定是 tip ≠ 磁盘，照样拦
+    // W14 那种反向改动；drift 一定是 tip ≠ 磁盘，照样拦。例外是发布后会自动放回的文件
+    // （[`auto_restorable`]）：放回之后磁盘 = tip（使用报告 2026-11-12 的 B）
+    let auto: BTreeSet<String> = auto_restorable(plan).into_iter().collect();
     let bad: Vec<&OverlapFile> = plan
         .report
         .overlap
         .iter()
-        .filter(|o| !o.matches_disk)
+        .filter(|o| !o.matches_disk && !auto.contains(&o.path))
         .collect();
     if !bad.is_empty() {
         let mut commits: Vec<String> = Vec::new();
@@ -453,17 +497,117 @@ fn auto_blocker(plan: &Plan) -> Option<GitError> {
         } else {
             format!("（{}）", capped(commits, "个提交"))
         };
+        // 只比磁盘多 Local-Only 补丁、但不是我最后提交的：多半是我有意去掉了补丁（缺陷 7）
+        let held: Vec<String> = bad
+            .iter()
+            .filter(|o| plan.report.restorable.contains(&o.path))
+            .map(|o| o.path.clone())
+            .collect();
+        let why = if held.len() == bad.len() {
+            format!(
+                "分支只比磁盘多 Local-Only 补丁，但 SVN 上最后改它的不是你（或认不出是谁），可能是你\
+                 有意去掉的补丁，不自动放回。{TAIL_FOLLOW}要放回的话，报告里有按钮。"
+            )
+        } else if !held.is_empty() {
+            format!(
+                "其中 {} 只比磁盘多 Local-Only 补丁，但 SVN 上最后改它的不是你，不自动放回；其余的可能是\
+                 文件里还有没提交的改动，也可能是重放合错了，要你看一眼。{TAIL_FOLLOW}\
+                 报告会逐个标出这些文件是否与磁盘一致。",
+                capped(held, "个文件")
+            )
+        } else {
+            format!(
+                "可能是文件里还有没提交的改动，也可能是重放合错了，要你看一眼。{TAIL_FOLLOW}\
+                 报告会逐个标出这些文件是否与磁盘一致。"
+            )
+        };
         return Some(GitError::new(
             "svn_auto_follow_overlap",
             format!(
-                "当前分支上的提交{by}改过的文件，SVN 侧也有新内容，重放出来的结果和磁盘对不上（{}）。\
-                 可能是文件里还有没提交的改动，也可能是重放合错了，要你看一眼。{TAIL_FOLLOW}\
-                 报告会逐个标出这些文件是否与磁盘一致。",
+                "当前分支上的提交{by}改过的文件，SVN 侧也有新内容，重放出来的结果和磁盘对不上（{}）。{why}",
                 capped(bad.iter().map(|o| o.path.clone()).collect(), "个文件")
             ),
         ));
     }
     None
+}
+
+/// 发布后会自动放回的文件：能放回（`restorable`），而且 SVN 上最后一次改它的是我。
+///
+/// 不是我的不自动写：用户有意去掉补丁、还没提交时，`svn update` 带来别人对这个文件的改动，跟进后
+/// 它同样能放回，自动写回会撤销用户的准备（计划 `2026-11-12-auto-restore-local-only.md` 的 A）。
+fn auto_restorable(plan: &Plan) -> Vec<String> {
+    plan.report
+        .restorable
+        .iter()
+        .filter(|p| plan.who.is_me(p) == Some(true))
+        .cloned()
+        .collect()
+}
+
+const NOT_MINE: &str =
+    "SVN 上最后改它的不是你（或认不出是谁），可能是你有意去掉的补丁，没有自动放回。";
+
+/// 崩溃恢复走完的跟进：作者信息没进 journal，分不清是谁最后提交的（review M3：不能说成「不是你」）。
+const RESUMED: &str =
+    "这次跟进是崩溃后续上的，分不清 SVN 上最后改它的是不是你，没有自动放回。请确认后再放回。";
+
+/// 跟进完成之后、**同步锁还拿着**时调用：放回 `auto`，结果写进 `report.restore`，`restorable`
+/// 里没放回的记进待放回清单（横幅兜底）。`held` 是不在 `auto` 里的那些文件写给用户看的原因。
+/// 没有可放回的文件时只修剪清单。
+///
+/// 跟进已经做完了，这里出什么错都不能让它变成失败：放回的前置条件不满足时，`auto` 全部记成没放回、
+/// 写上原因；清单写不进去只记日志。
+fn with_restore(repo: &str, report: &mut FollowReport, auto: &[String], held: &str) {
+    if report.restorable.is_empty() {
+        // 没有新的可放回文件也要修剪旧条目：否则失效的条目要等下一次碰巧有可放回文件的跟进才删得掉，
+        // 期间每次状态刷新都白跑一遍核对（review M2）
+        if let Err(e) = record_pending(repo, &[], &[]) {
+            log::warn!("修剪待放回清单失败：{}", e.message);
+        }
+        return;
+    }
+    let mut out = restore_locked(repo, auto).unwrap_or_else(|e| RestoreOutcome {
+        skipped: auto
+            .iter()
+            .map(|p| RestoreSkip {
+                path: p.clone(),
+                reason: format!("没能自动放回：{}", e.message),
+                retry: true,
+            })
+            .collect(),
+        ..RestoreOutcome::default()
+    });
+    for p in &report.restorable {
+        if !auto.contains(p) {
+            out.skipped.push(RestoreSkip {
+                path: p.clone(),
+                reason: held.to_string(),
+                retry: true,
+            });
+        }
+    }
+    // 没过树这几关的（放回前置条件不满足、不是我的）也要写清是哪个补丁
+    let missing: Vec<String> = report
+        .restorable
+        .iter()
+        .filter(|p| !out.commits.contains_key(*p))
+        .cloned()
+        .collect();
+    match local_only_commits(repo, &missing) {
+        Ok(more) => out.commits.extend(more),
+        Err(e) => log::warn!("读改过待放回文件的 Local-Only 提交失败：{}", e.message),
+    }
+    let later: Vec<String> = out
+        .skipped
+        .iter()
+        .filter(|s| s.retry)
+        .map(|s| s.path.clone())
+        .collect();
+    if let Err(e) = record_pending(repo, &later, &out.restored) {
+        log::warn!("更新待放回清单失败：{}", e.message);
+    }
+    report.restore = Some(out);
 }
 
 /// 条件 11 的重叠文件：重放后留下的 commit（`new..tip`）相对各自新父提交仍改动的路径与外部变更的

@@ -26,6 +26,8 @@ import {
   svnGetUser,
   svnMigrateEol,
   svnRestoreLocalOnly,
+  svnPendingRestores,
+  svnDismissPendingRestores,
   svnSetUser,
   tsvnHooksRegister,
   tsvnHooksStatus,
@@ -38,7 +40,13 @@ import { createSvnSyncFlow } from './svnSyncFlow'
 import { createSvnSyncOutFlow } from './svnSyncOutFlow'
 import { useDeliverDialog } from './DeliverDialog'
 import { useFollowReportDialog } from './FollowReportDialog'
-import { autoFollowKey, describeAutoFollowDone, type FollowReport } from '../engine/svnFollow'
+import {
+  autoFollowKey,
+  describeAutoFollowDone,
+  describeRestoreSkips,
+  type FollowReport,
+  type PendingRestore,
+} from '../engine/svnFollow'
 import { readAppSettings } from '@/store/appSettingsStore'
 import SvnInitWizard from './SvnInitWizard'
 import BaselineBanner from './BaselineBanner'
@@ -223,6 +231,29 @@ export function RepoTab({
   // 自动跟进（事故分析 6.12）：没自动的原因（按现场 key 记，过时的不显示）与完成后的提示
   const [autoSkip, setAutoSkip] = useState<{ key: string; message: string } | null>(null)
   const [autoFollowed, setAutoFollowed] = useState<FollowReport | null>(null)
+  // 「N 个文件缺 Local-Only 补丁」横幅（计划 2026-11-12-auto-restore-local-only 的 C）
+  const [pendingRestores, setPendingRestores] = useState<PendingRestore[]>([])
+  const [restoreBusy, setRestoreBusy] = useState(false)
+  // 只认最后一次查询的结果：状态刷新很密，早发的请求晚回来会盖掉新的（review L5）
+  const pendingSeq = useRef(0)
+  const svnTab = state.capabilities.vcs === 'svn'
+  const refreshPendingRestores = useCallback(async () => {
+    const seq = ++pendingSeq.current
+    let list: PendingRestore[] = []
+    if (svnTab) {
+      try {
+        list = await svnPendingRestores(repoPath)
+      } catch (err) {
+        // 只是提醒：读不出来就不挂，不进错误条
+        console.warn('读待放回的 Local-Only 补丁失败：', err)
+      }
+    }
+    if (seq === pendingSeq.current) setPendingRestores(list)
+  }, [svnTab, repoPath])
+  // 跟着状态刷新：跟进、放回、用户自己改文件之后「本地改动」都会变。清单为空时后端不碰 git
+  useEffect(() => {
+    void refreshPendingRestores()
+  }, [refreshPendingRestores, state.status])
   // 试过的现场：同一个现场只试一次（见 `autoFollowKey`）。放 ref：effect 里读写，不该引起渲染
   const autoTried = useRef<string | null>(null)
   // 流程在下面 loading 的提前 return 之后才建出来，effect 经这个 ref 调它
@@ -919,6 +950,38 @@ export function RepoTab({
         return outcome
       },
     })
+  const handleRestorePending = async () => {
+    setRestoreBusy(true)
+    try {
+      const outcome = await svnRestoreLocalOnly(
+        repoPath,
+        pendingRestores.map((p) => p.path),
+      )
+      const skipped = describeRestoreSkips(outcome)
+      if (skipped) reportError(skipped)
+      try {
+        await refreshStatus(repoPath)
+      } catch (err) {
+        console.warn('放回 Local-Only 补丁后刷新状态失败：', err)
+      }
+    } catch (err) {
+      reportError(err)
+    } finally {
+      setRestoreBusy(false)
+      await refreshPendingRestores()
+    }
+  }
+  const handleDismissPending = async () => {
+    try {
+      await svnDismissPendingRestores(
+        repoPath,
+        pendingRestores.map((p) => p.path),
+      )
+    } catch (err) {
+      reportError(err)
+    }
+    await refreshPendingRestores()
+  }
   const {
     handleSvnUpdate,
     handleSyncAction,
@@ -1094,6 +1157,10 @@ export function RepoTab({
           if (autoFollowed) void showReport(autoFollowed)
         }}
         onAutoFollowedDismiss={() => setAutoFollowed(null)}
+        pendingRestores={pendingRestores}
+        onRestorePending={() => void handleRestorePending()}
+        onDismissPending={() => void handleDismissPending()}
+        restoreBusy={restoreBusy}
       />
       {hooksDialog && (
         <TsvnHooksDialog

@@ -307,6 +307,31 @@ describe('放回 Local-Only 补丁（使用报告 9.1）', () => {
     expect(restoreLocalOnly).toHaveBeenCalledTimes(2)
   })
 
+  it('按钮上方列出文件和补丁，跟进时已经放回的不再给按钮（缺陷 6）', () => {
+    open(
+      {
+        ...drift,
+        restorable: ['Code/A.cs', 'Code/B.cs'],
+        restore: {
+          restored: ['Code/B.cs'],
+          skipped: [{ path: 'Code/A.cs', reason: '不是你' }],
+          commits: { 'Code/A.cs': ['fae50a8 add @avatarclass'] },
+        },
+      },
+      { restoreLocalOnly: vi.fn() },
+    )
+    expect(screen.getByRole('button', { name: '放回 Local-Only 补丁（1 个文件）' })).toBeTruthy()
+    expect(screen.getAllByText('← fae50a8 add @avatarclass').length).toBe(1)
+  })
+
+  it('全部自动放回了：不给按钮', () => {
+    open(
+      { ...drift, restore: { restored: ['Code/A.cs'], skipped: [] } },
+      { restoreLocalOnly: vi.fn() },
+    )
+    expect(screen.queryByRole('button', { name: /放回 Local-Only 补丁/ })).toBeNull()
+  })
+
   it('放回进行中按钮禁用，不会重复调用', async () => {
     let finish!: (o: Outcome) => void
     const restoreLocalOnly = vi.fn(() => new Promise<Outcome>((r) => (finish = r)))

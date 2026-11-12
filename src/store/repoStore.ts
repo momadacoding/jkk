@@ -56,6 +56,7 @@ import { samePath } from '../engine/path'
 import type {
   AutoFollowOutcome,
   FollowOutcome,
+  PendingRestore,
   RestoreOutcome,
   SvnUserInfo,
 } from '../engine/svnFollow'
@@ -435,6 +436,19 @@ export function svnFollowManual(path: string): Promise<SyncInOutcome> {
  */
 export function svnRestoreLocalOnly(path: string, paths: string[]): Promise<RestoreOutcome> {
   return invoke<RestoreOutcome>('svn_restore_local_only', { path, paths })
+}
+
+/**
+ * 「N 个文件缺 Local-Only 补丁」横幅的数据：跟进记下的待放回文件里，此刻现场重验能放回的。
+ * 只读；清单为空时后端不碰 git，可以跟着每次状态刷新调用。
+ */
+export function svnPendingRestores(path: string): Promise<PendingRestore[]> {
+  return invoke<PendingRestore[]>('svn_pending_restores', { path })
+}
+
+/** 横幅上的「不放回」：从待放回清单删掉，不碰磁盘。 */
+export function svnDismissPendingRestores(path: string, paths: string[]): Promise<void> {
+  return invoke<void>('svn_dismiss_pending_restores', { path, paths })
 }
 
 /** 落后基线的本地分支。纯本地读；非混合仓库或没有基线时返回空列表。 */

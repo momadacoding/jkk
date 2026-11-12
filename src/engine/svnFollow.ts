@@ -82,6 +82,11 @@ export interface FollowReport {
    * Local-Only 改动，磁盘就是 SVN 的版本。旧后端没有。
    */
   restorable?: string[]
+  /**
+   * 跟进完成后自动放回的结果（计划 2026-11-12-auto-restore-local-only）。`restorable` 里没放回的
+   * 都在 `skipped` 里写着原因。`restorable` 为空、或者旧后端时没有。
+   */
+  restore?: RestoreOutcome | null
   /** 条件 11 的重叠文件，逐个标出是否与磁盘一致。旧后端没有。 */
   overlap?: OverlapFile[]
   stage: ComposeReport
@@ -171,6 +176,7 @@ export interface AutoFollowNotice {
 
 export function describeAutoFollowDone(r: FollowReport): AutoFollowNotice {
   const m = describeFollowReport(r)
+  // 放回的结果已经在 `safe` 里；没放回的会算进 todo
   const look = m.tone === 'ok' ? '' : `报告里有 ${m.todo} 项要你留意，请点「查看详情」。`
   return {
     tone: m.tone === 'ok' ? 'quiet' : 'warn',
@@ -226,6 +232,8 @@ export interface FollowReportSection {
     | 'rewritten'
     | 'snapshot'
     | 'drift'
+    | 'restorePending'
+    | 'restored'
     | 'overlapDiffers'
     | 'overlapMatches'
     | 'moved'
@@ -352,11 +360,25 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
   const pinned = pinnedNote(r.pinnedRef)
   // 旧后端没有这两个字段
   const snapshot = r.snapshot ?? []
-  const drift = r.drift ?? []
+  // 能放回的单列成 Local-Only 那两节：留在「对不上」里，文案会让用户把磁盘版本提交进分支，
+  // 照做补丁就丢了（使用报告 2026-11-12 缺陷 5）
+  const restorable = r.restorable ?? []
+  const drift = (r.drift ?? []).filter((p) => !restorable.includes(p))
+  const restored = r.restore?.restored ?? []
+  const commitsOf = (p: string) => (r.restore?.commits?.[p] ?? []).join('、')
+  const reasonOf = new Map((r.restore?.skipped ?? []).map((k) => [k.path, k.reason]))
+  const notRestored = restorable
+    .filter((p) => !restored.includes(p))
+    .map((p): ReportItem => {
+      const parts = [commitsOf(p), reasonOf.get(p) ?? ''].filter((t) => t !== '')
+      return parts.length > 0 ? { text: p, meta: parts.join(' · ') } : { text: p }
+    })
   const overlap = r.overlap ?? []
   const overlapItem = (o: OverlapFile): ReportItem => ({ text: o.path, meta: o.commits.join('、') })
   // drift 里的已经在「分支与磁盘对不上」那一节，不重复列
-  const differs = overlap.filter((o) => !o.matchesDisk && !drift.includes(o.path))
+  // 后端把整个 drift（含能放回的）并进了 overlap。能放回的已经在 Local-Only 那两节，按原始 drift
+  // 排除；只排除剩下的 drift 会把它们漏进这一节，那里的文案同样建议以磁盘为准提交（review H1）
+  const differs = overlap.filter((o) => !o.matchesDisk && !(r.drift ?? []).includes(o.path))
   const matches = overlap.filter((o) => o.matchesDisk)
   const partial = r.stage.partial ?? {}
   // 不用 `in`：根目录下叫 `constructor` 的文件会命中原型链，真丢的暂存被降一级（独立 review L1）
@@ -378,8 +400,18 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
       note:
         '「本地改动」里会出现这些文件的修改：磁盘上是 SVN 的版本，重放后的分支里却是别的内容' +
         '（或者把 SVN 已删的文件带了回来）。请逐个核对，磁盘上的版本是对的，就把它提交进分支。' +
-        '可能是重放时合错了，也可能是你在磁盘上撤掉了某个 commit 的改动、还没提交这次撤销。',
+        '可能是重放时合错了，也可能是你在磁盘上撤掉了某个 commit 的改动、还没提交这次撤销。' +
+        '如果多出来的是 Local-Only 提交的内容，不要把磁盘版本提交进分支：那会把补丁删掉。',
       groups: [{ label: '', items: plain(drift) }],
+    },
+    {
+      id: 'restorePending',
+      title: '没放回的 Local-Only 补丁',
+      level: 'attention',
+      note:
+        '分支比磁盘只多 Local-Only 补丁，磁盘就是 SVN 的版本。不要把磁盘版本提交进分支，那会把补丁删掉。' +
+        '要放回就点下面的按钮；关掉报告之后，顶部横幅上也能放回。',
+      groups: [{ label: '', items: notRestored }],
     },
     {
       id: 'leaks',
@@ -449,6 +481,21 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
       level: 'info',
       note: '这些分支一起重放到了新基线上，没有动工作区。',
       groups: [{ label: '', items: plain(r.movedBranches) }],
+    },
+    {
+      id: 'restored',
+      title: '已放回的 Local-Only 补丁',
+      level: 'info',
+      note: '跟进之后把这些补丁写回了磁盘：git 里是干净的，SVN 里它们会显示为已修改。',
+      groups: [
+        {
+          label: '',
+          items: restored.map((p) => {
+            const c = commitsOf(p)
+            return c ? { text: p, meta: c } : { text: p }
+          }),
+        },
+      ],
     },
     {
       id: 'overlapMatches',
@@ -537,7 +584,10 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
         ? '跟进完成'
         : `跟进完成，有 ${todo} 项${danger ? '需要处理' : '请确认'}`,
     summary: `${facts.join('，')}。`,
-    safe: '工作区里的文件没有改动',
+    safe:
+      restored.length > 0
+        ? `工作区里只放回了 ${restored.length} 个文件的 Local-Only 补丁，其余文件没有改动`
+        : '工作区里的文件没有改动',
     basis:
       r.evidence === 'hooks' ? '判定依据：TortoiseSVN 钩子事件' : '判定依据：作者 + 失焦快照',
     sections,
@@ -795,11 +845,47 @@ export interface RestoreSkip {
 export interface RestoreOutcome {
   restored: string[]
   skipped: RestoreSkip[]
+  /** 路径 → 改过它的 Local-Only 提交（`短 hash 说明`）。旧后端没有。 */
+  commits?: Record<string, string[]>
 }
 
-/** 报告里能放回 Local-Only 补丁的文件；旧后端没有这个字段时为空。 */
+/** 后端 `svn_restore_local_only::PendingRestore`：横幅上一个缺 Local-Only 补丁的文件。 */
+export interface PendingRestore {
+  path: string
+  /** 改过它的 Local-Only 提交（`短 hash 说明`）。 */
+  commits: string[]
+}
+
+/**
+ * 报告里还能点按钮放回的文件：能放回、跟进时又没自动放回的。旧后端没有 `restore`，全部算没放回。
+ */
 export function restorablePaths(r: FollowReport): string[] {
-  return r.restorable ?? []
+  const done = r.restore?.restored ?? []
+  return (r.restorable ?? []).filter((p) => !done.includes(p))
+}
+
+/**
+ * 横幅上点「放回」后没写成的文件，给错误条的一句话；全部写成时 `null`。不挂在横幅上：再等也不会
+ * 满足的文件会被移出清单，横幅随之消失，原因就看不到了（review L2）。
+ */
+export function describeRestoreSkips(o: RestoreOutcome): string | null {
+  if (o.skipped.length === 0) return null
+  const each = o.skipped.map((k) => `${k.path}（${k.reason}）`).join('；')
+  return `有 ${o.skipped.length} 个文件没放回 Local-Only 补丁：${each}`
+}
+
+/** 横幅「N 个文件缺 Local-Only 补丁」（计划 2026-11-12-auto-restore-local-only 的 C）。空清单不挂。 */
+export function describePendingRestores(
+  list: PendingRestore[],
+): { title: string; detail: string; files: string[] } | null {
+  if (list.length === 0) return null
+  return {
+    title: `${list.length} 个文件缺 Local-Only 补丁`,
+    detail:
+      '跟进之后这些文件的磁盘上是 SVN 的版本，分支里还多着 Local-Only 补丁，「本地改动」里显示成删掉了补丁。' +
+      '不要把它提交进分支，那会把补丁删掉。点「放回」把补丁写回磁盘；如果是你有意去掉的，点「不放回」。',
+    files: list.map((p) => (p.commits.length > 0 ? `${p.path} ← ${p.commits.join('、')}` : p.path)),
+  }
 }
 
 /** 「放回 Local-Only 补丁」之后在报告里说什么。`ok` 为 false 时要用户留意跳过的文件。 */

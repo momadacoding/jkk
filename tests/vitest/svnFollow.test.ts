@@ -11,7 +11,9 @@ import {
   describeManualFollow,
   describeManualFollowAction,
   describeManualFollowOutcome,
+  describePendingRestores,
   describeRestoreOutcome,
+  describeRestoreSkips,
   needsSvnUserPrompt,
   restorablePaths,
   type FollowOutcome,
@@ -908,6 +910,15 @@ describe('放回 Local-Only 补丁（使用报告 9.1）', () => {
     expect(restorablePaths({ ...report, restorable: ['Code/A.cs'] })).toEqual(['Code/A.cs'])
   })
 
+  it('按钮只给还没放回的：跟进时自动放回了的不再列', () => {
+    const r: FollowReport = {
+      ...report,
+      restorable: ['Code/A.cs', 'Code/B.cs'],
+      restore: { restored: ['Code/A.cs'], skipped: [{ path: 'Code/B.cs', reason: '不是你' }] },
+    }
+    expect(restorablePaths(r)).toEqual(['Code/B.cs'])
+  })
+
   it('全部放回：成功，说明 SVN 里会显示已修改', () => {
     const d = describeRestoreOutcome({ restored: ['a', 'b'], skipped: [] })
     expect(d.ok).toBe(true)
@@ -924,5 +935,118 @@ describe('放回 Local-Only 补丁（使用报告 9.1）', () => {
     expect(describeRestoreOutcome({ restored: [], skipped: [skip] }).text).toBe(
       '一个文件都没放回，1 个跳过了：',
     )
+  })
+})
+
+describe('跟进后自动放回 Local-Only 补丁（计划 2026-11-12-auto-restore-local-only）', () => {
+  // 后端的真实形状：`overlap_files` 把整个 drift 并进 overlap，能放回的文件磁盘 ≠ tip，
+  // matchesDisk 一定是 false（`svn_follow_auto.rs` 的现场断言过）。不带 overlap 的 fixture 是虚假信心
+  const overlapOf = (paths: string[]) =>
+    paths.map((path) => ({ path, commits: ['fae50a8 add @avatarclass'], matchesDisk: false }))
+  const restoredReport: FollowReport = {
+    ...report,
+    drift: ['Code/A.cs', 'Code/B.cs', 'Code/C.cs'],
+    overlap: overlapOf(['Code/A.cs', 'Code/B.cs', 'Code/C.cs']),
+    restorable: ['Code/A.cs', 'Code/B.cs'],
+    restore: {
+      restored: ['Code/A.cs'],
+      skipped: [{ path: 'Code/B.cs', reason: 'SVN 上最后改它的不是你' }],
+      commits: { 'Code/A.cs': ['fae50a8 add @avatarclass'], 'Code/B.cs': ['1234567 补丁'] },
+    },
+  }
+  const section = (id: string) => describeFollowReport(restoredReport).sections.find((s) => s.id === id)
+
+  it('能放回的不留在红色「分支与磁盘对不上」里（缺陷 5）', () => {
+    const drift = section('drift')!
+    expect(drift.groups.flatMap((g) => g.items.map((i) => i.text))).toEqual(['Code/C.cs'])
+    expect(drift.note).toContain('不要把磁盘版本提交进分支')
+  })
+
+  it('已放回的单列一节，写明路径和提交（缺陷 6）', () => {
+    const s = section('restored')!
+    expect(s.level).toBe('info')
+    expect(s.groups[0].items).toEqual([{ text: 'Code/A.cs', meta: 'fae50a8 add @avatarclass' }])
+  })
+
+  it('没放回的列成要留意的一节，写明提交与原因', () => {
+    const s = section('restorePending')!
+    expect(s.level).toBe('attention')
+    expect(s.groups[0].items).toEqual([
+      { text: 'Code/B.cs', meta: '1234567 补丁 · SVN 上最后改它的不是你' },
+    ])
+    expect(s.note).toContain('顶部横幅')
+  })
+
+  it('旧后端没有 restore：能放回的全部算没放回，不写附注', () => {
+    const r: FollowReport = { ...report, drift: ['Code/A.cs'], restorable: ['Code/A.cs'] }
+    const m = describeFollowReport(r)
+    expect(m.sections.find((s) => s.id === 'drift')).toBeUndefined()
+    expect(m.sections.find((s) => s.id === 'restorePending')!.groups[0].items).toEqual([
+      { text: 'Code/A.cs' },
+    ])
+    expect(m.safe).toBe('工作区里的文件没有改动')
+  })
+
+  it('放回了文件时不再说「工作区没有改动」', () => {
+    expect(describeFollowReport(restoredReport).safe).toBe(
+      '工作区里只放回了 1 个文件的 Local-Only 补丁，其余文件没有改动',
+    )
+  })
+
+  it('能放回的文件不落进「和磁盘不一致」那一节（review H1：那里也建议以磁盘为准提交）', () => {
+    const differs = section('overlapDiffers')
+    const listed = differs?.groups.flatMap((g) => g.items.map((i) => i.text)) ?? []
+    expect(listed).not.toContain('Code/A.cs')
+    expect(listed).not.toContain('Code/B.cs')
+    // C 已经在红色「对不上」里，不重复列
+    expect(listed).not.toContain('Code/C.cs')
+  })
+
+  it('全部放回时自动跟进的提示是安静的，说明放回了', () => {
+    const r: FollowReport = {
+      ...report,
+      drift: ['Code/A.cs'],
+      overlap: overlapOf(['Code/A.cs']),
+      restorable: ['Code/A.cs'],
+      restore: { restored: ['Code/A.cs'], skipped: [] },
+    }
+    const m = describeFollowReport(r)
+    expect(m.sections.map((s) => s.id)).not.toContain('overlapDiffers')
+    const n = describeAutoFollowDone(r)
+    expect(n.tone).toBe('quiet')
+    expect(n.detail).toContain('放回了 1 个文件的 Local-Only 补丁')
+  })
+
+  it('有没放回的：自动跟进的提示要人看', () => {
+    expect(describeAutoFollowDone(restoredReport).tone).toBe('warn')
+  })
+})
+
+describe('「缺 Local-Only 补丁」横幅（计划的 C）', () => {
+  it('放回后没写成的原因交给错误条：全部写成时不说话', () => {
+    expect(describeRestoreSkips({ restored: ['Code/A.cs'], skipped: [] })).toBeNull()
+    expect(
+      describeRestoreSkips({
+        restored: [],
+        skipped: [
+          { path: 'Code/A.cs', reason: '被占用' },
+          { path: 'Code/B.cs', reason: '磁盘有你的编辑' },
+        ],
+      }),
+    ).toBe('有 2 个文件没放回 Local-Only 补丁：Code/A.cs（被占用）；Code/B.cs（磁盘有你的编辑）')
+  })
+
+  it('空清单不挂', () => {
+    expect(describePendingRestores([])).toBeNull()
+  })
+
+  it('写明个数、文件和补丁', () => {
+    const m = describePendingRestores([
+      { path: 'Code/A.cs', commits: ['fae50a8 add @avatarclass'] },
+      { path: 'Code/B.cs', commits: [] },
+    ])!
+    expect(m.title).toBe('2 个文件缺 Local-Only 补丁')
+    expect(m.files).toEqual(['Code/A.cs ← fae50a8 add @avatarclass', 'Code/B.cs'])
+    expect(m.detail).toContain('不要把它提交进分支')
   })
 })
