@@ -66,8 +66,9 @@ pub struct HunkLeak {
     pub lines: u32,
     pub verdict: LeakVerdict,
     /// 这个 hunk 的第一行改动，给人辨认用（使用报告 9.4）：L 的第一条非空 `+` 行前面加 `+`；
-    /// 纯删除时是 B 里被删的第一条非空行前面加 `-`。去掉行首缩进，超过
-    /// [`PREVIEW_CHARS`] 个字符截断加 `…`。整文件判定、内容不是 UTF-8 时没有。
+    /// `+` 行全是空行或纯删除时，是 B 里被换掉的第一条非空行前面加 `-`。去掉首尾空白与 BOM，
+    /// 控制字符换成空格，超过 [`PREVIEW_CHARS`] 个字符截断加 `…`。整文件判定、内容不是 UTF-8、
+    /// 两边都只有空行时没有。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
 }
@@ -75,7 +76,7 @@ pub struct HunkLeak {
 /// [`HunkLeak::preview`] 最多保留的字符数（不含前缀与 `…`）。
 pub const PREVIEW_CHARS: usize = 60;
 
-/// 一组行里第一条非空行的预览；见 [`HunkLeak::preview`]。
+/// 一组行里第一条非空行的预览；见 [`HunkLeak::preview`]。全是空行时返回 `None`。
 fn preview_of(sign: char, lines: &[&[u8]]) -> Option<String> {
     let mut texts = Vec::with_capacity(lines.len());
     for l in lines {
@@ -83,14 +84,19 @@ fn preview_of(sign: char, lines: &[&[u8]]) -> Option<String> {
         // 半个 GBK 字比没有预览更误导
         texts.push(std::str::from_utf8(l).ok()?);
     }
+    // BOM 不是 White_Space，`trim` 去不掉；它在 GBK / 1252 里都编不出来
     let text = texts
         .iter()
-        .map(|t| t.trim())
-        .find(|t| !t.is_empty())
-        .unwrap_or("");
+        .map(|t| t.trim_start_matches('\u{FEFF}').trim())
+        .find(|t| !t.is_empty())?;
     let mut out = String::with_capacity(text.len() + 4);
     out.push(sign);
-    out.extend(text.chars().take(PREVIEW_CHARS));
+    // 只有 CR 换行的文件整个是一「行」，`\r` 和制表符原样进 stderr 会搅乱提交框里的排版
+    out.extend(
+        text.chars()
+            .take(PREVIEW_CHARS)
+            .map(|c| if c.is_control() { ' ' } else { c }),
+    );
     if text.chars().nth(PREVIEW_CHARS).is_some() {
         out.push('…');
     }
@@ -250,7 +256,11 @@ fn oid_string(c: &git2::Commit) -> String {
 }
 
 /// 给 TortoiseSVN 提交框显示的拦截说明（日志 H3：只显示 stderr，`\n` 换行）。
-pub fn leak_message(leaks: &[Leak]) -> String {
+///
+/// `keep_preview` 决定某条预览进不进消息。钩子拿它滤掉线程代码页编不出来的预览：源码里的
+/// emoji、GBK 之外的字会让整条中文消息退回英文版，预览本身也只剩 `?`（PR 158 review 第 1 条）。
+/// 是否退回英文只该取决于模板、路径与标题。
+pub fn leak_message(leaks: &[Leak], keep_preview: &dyn Fn(&str) -> bool) -> String {
     let mut s = String::from("jkk：这些文件里有 Local-Only 补丁，提交会把它带上服务器：\n");
     for leak in leaks {
         for h in &leak.hunks {
@@ -267,7 +277,7 @@ pub fn leak_message(leaks: &[Leak]) -> String {
                 "  {}：{at}{maybe}，来自「{}」\n",
                 leak.path, leak.subject
             ));
-            push_preview(&mut s, h);
+            push_preview(&mut s, h, keep_preview);
         }
     }
     s.push_str("取消勾选这些文件，或用「提交后恢复」删掉这些改动再提交。");
@@ -275,8 +285,8 @@ pub fn leak_message(leaks: &[Leak]) -> String {
 }
 
 /// 拦截说明里 hunk 那一行下面的预览行（两种语言共用）。
-fn push_preview(s: &mut String, h: &HunkLeak) {
-    if let Some(p) = &h.preview {
+fn push_preview(s: &mut String, h: &HunkLeak, keep: &dyn Fn(&str) -> bool) {
+    if let Some(p) = h.preview.as_deref().filter(|p| keep(p)) {
         s.push_str("    ");
         s.push_str(p);
         s.push('\n');
@@ -286,7 +296,7 @@ fn push_preview(s: &mut String, h: &HunkLeak) {
 /// [`leak_message`] 的英文版，逐条对应。钩子的线程代码页装不下中文时发它（2026-11-11 使用
 /// 报告：系统 locale 中文、区域格式 en-CA 的机器上线程代码页是 1252，中文提示全成了 `?`）。
 /// 路径与 commit 标题原样保留，它们本身是中文时照样会丢字，但模板读得懂。
-pub fn leak_message_en(leaks: &[Leak]) -> String {
+pub fn leak_message_en(leaks: &[Leak], keep_preview: &dyn Fn(&str) -> bool) -> String {
     let mut s = String::from(
         "jkk: these files contain Local-Only patches; committing would upload them to the server:\n",
     );
@@ -305,7 +315,7 @@ pub fn leak_message_en(leaks: &[Leak]) -> String {
                 "  {}: {at}{maybe}, from commit \"{}\"\n",
                 leak.path, leak.subject
             ));
-            push_preview(&mut s, h);
+            push_preview(&mut s, h, keep_preview);
         }
     }
     s.push_str(
@@ -428,13 +438,11 @@ fn judge_sides(b: Side, l: Side, n: Side) -> Result<Vec<HunkLeak>> {
             slice(&l_lines, h.new_start as i64, h.nc as usize).unwrap_or(&[])
         };
         if let Some(verdict) = judge_hunk(h, &n_hunks, &n_lines, plus) {
-            let preview = if plus.is_empty() {
-                // 纯删除：B 里从 start 起的 oc 行
+            // `+` 行没有可看的（纯删除、只改成空行）就退到 B 里被换掉的行：B 中从 start 起的 oc 行
+            let preview = preview_of('+', plus).or_else(|| {
                 slice(&b_lines, i64::from(h.start), h.oc as usize)
                     .and_then(|minus| preview_of('-', minus))
-            } else {
-                preview_of('+', plus)
-            };
+            });
             out.push(HunkLeak {
                 old_start: h.old_start,
                 lines: h.oc,

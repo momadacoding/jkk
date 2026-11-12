@@ -725,7 +725,10 @@ fn leak_message_names_paths_subjects_and_the_way_out() {
     let b: String = (1..=20).map(|i| format!("line {i:02}\r\n")).collect();
     let l = b.replace("line 02\r\n", "line 02 DEBUG_LOCAL_PATCH\r\n");
     let (r, _) = disk_repo(&b, &l, Some(&l));
-    let msg = leak_message(&local_only_leaks_on_disk(&r.s(), &[abs(&r, F)]).unwrap());
+    let msg = leak_message(
+        &local_only_leaks_on_disk(&r.s(), &[abs(&r, F)]).unwrap(),
+        &|_| true,
+    );
     assert!(msg.contains(F), "{msg}");
     assert!(msg.contains("L: 注释掉 log"), "{msg}");
     assert!(msg.contains("第 2 行"), "{msg}");
@@ -741,7 +744,10 @@ fn leak_message_en_names_the_same_paths_lines_and_subjects() {
     let b: String = (1..=20).map(|i| format!("line {i:02}\r\n")).collect();
     let l = b.replace("line 02\r\n", "line 02 DEBUG_LOCAL_PATCH\r\n");
     let (r, _) = disk_repo(&b, &l, Some(&l));
-    let msg = leak_message_en(&local_only_leaks_on_disk(&r.s(), &[abs(&r, F)]).unwrap());
+    let msg = leak_message_en(
+        &local_only_leaks_on_disk(&r.s(), &[abs(&r, F)]).unwrap(),
+        &|_| true,
+    );
     assert_eq!(
         msg,
         format!(
@@ -759,7 +765,10 @@ fn leak_message_shows_the_first_changed_line_under_each_hunk() {
     let b: String = (1..=20).map(|i| format!("line {i:02}\r\n")).collect();
     let l = b.replace("line 02\r\n", "line 02 DEBUG_LOCAL_PATCH\r\n");
     let (r, _) = disk_repo(&b, &l, Some(&l));
-    let msg = leak_message(&local_only_leaks_on_disk(&r.s(), &[abs(&r, F)]).unwrap());
+    let msg = leak_message(
+        &local_only_leaks_on_disk(&r.s(), &[abs(&r, F)]).unwrap(),
+        &|_| true,
+    );
     let lines: Vec<&str> = msg.lines().collect();
     assert_eq!(
         lines[1..3],
@@ -817,7 +826,7 @@ fn preview_of_non_utf8_content_is_omitted() {
     assert_eq!(leaks[0].hunks.len(), 1, "{leaks:?}");
     assert_eq!(leaks[0].hunks[0].preview, None);
     // 没有预览时消息里不多出空行
-    assert_eq!(leak_message(&leaks).lines().count(), 3);
+    assert_eq!(leak_message(&leaks, &|_| true).lines().count(), 3);
 }
 
 #[test]
@@ -825,6 +834,81 @@ fn whole_file_verdict_has_no_preview() {
     let (r, _) = disk_repo_bytes(Some(b"a\0b"), Some(b"a\0c"), Some(b"a\0c"));
     let leaks = local_only_leaks_on_disk(&r.s(), &[abs(&r, F)]).unwrap();
     assert_eq!(leaks[0].hunks[0].preview, None, "{leaks:?}");
+}
+
+/// PR 158 review 第 1 条：VS 默认给 .cs 存 UTF-8 BOM，第 1 行的预览不能带着它（GBK 编不出来）。
+#[test]
+fn preview_drops_the_utf8_bom() {
+    let b = "\u{FEFF}using A;\nl2\nl3\n";
+    let l = "\u{FEFF}using B;\nl2\nl3\n";
+    assert_eq!(disk_previews(b, l, l), vec![Some("+using B;".to_string())]);
+}
+
+/// 第 2 条：把一行改成空行时 `+` 那边没东西可看，退到被换掉的那行。
+#[test]
+fn preview_of_a_line_blanked_out_shows_the_old_line() {
+    let b = ten();
+    let l = b.replace("l4\n", "\n");
+    assert_eq!(disk_previews(&b, &l, &l), vec![Some("-l4".to_string())]);
+}
+
+#[test]
+fn preview_of_inserted_blank_lines_is_omitted() {
+    let b = ten();
+    let l = b.replace("l4\n", "l4\n\n  \n");
+    assert_eq!(disk_previews(&b, &l, &l), vec![None]);
+}
+
+#[test]
+fn preview_at_the_edges_of_the_file() {
+    let b = ten();
+    // 删第 1 行
+    let l = b.replacen("l1\n", "", 1);
+    assert_eq!(disk_previews(&b, &l, &l), vec![Some("-l1".to_string())]);
+    // 开头插入（old_start = 0）
+    let l = format!("top\n{b}");
+    assert_eq!(disk_previews(&b, &l, &l), vec![Some("+top".to_string())]);
+    // 没有结尾换行的最后一行被删
+    let b = "a\nb\nc";
+    let l = "a\nb\n";
+    assert_eq!(disk_previews(b, l, l), vec![Some("-c".to_string())]);
+}
+
+/// 第 4 条：只有 CR 换行的文件整个是一「行」，里面的 `\r` 不能原样进 stderr。
+#[test]
+fn preview_replaces_control_characters() {
+    let b = "x\ry\r";
+    let l = "x\rz\r";
+    assert_eq!(disk_previews(b, l, l), vec![Some("+x z".to_string())]);
+}
+
+/// 跟进走的是树里的 L 与 NEW（`local_only_leaks`），不只是钩子的磁盘路径。
+#[test]
+fn follow_side_leaks_carry_the_preview_too() {
+    let r = Repo::new();
+    let b = ten();
+    let l = b.replace("l4\n", "l4 DEBUG\n");
+    let base = commit_on(&r, None, &[Ch::Put(F, b.as_bytes())], "B");
+    let lc = commit_on(&r, Some(&base), &[Ch::Put(F, l.as_bytes())], LOCAL_ONLY_MSG);
+    let new = commit_on(&r, Some(&base), &[Ch::Put(F, l.as_bytes())], "NEW");
+    let commits = commits_between(&r.s(), &base, &lc, &CODES).unwrap();
+    let leaks = local_only_leaks(&r.s(), "main", &commits, &set(&[F]), &new).unwrap();
+    assert_eq!(leaks[0].hunks[0].preview.as_deref(), Some("+l4 DEBUG"));
+}
+
+#[test]
+fn rejected_previews_are_left_out_of_both_messages() {
+    let b = ten();
+    let l = b.replace("l4\n", "l4 DEBUG\n");
+    let (r, _) = disk_repo(&b, &l, Some(&l));
+    let leaks = local_only_leaks_on_disk(&r.s(), &[abs(&r, F)]).unwrap();
+    for msg in [
+        leak_message(&leaks, &|_| false),
+        leak_message_en(&leaks, &|_| false),
+    ] {
+        assert!(!msg.contains("DEBUG"), "{msg}");
+        assert_eq!(msg.lines().count(), 3, "{msg}");
+    }
 }
 
 #[test]

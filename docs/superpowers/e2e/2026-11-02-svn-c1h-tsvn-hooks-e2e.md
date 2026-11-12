@@ -323,7 +323,10 @@ if (Test-Path $bak) { Move-Item -Force $bak "$env:APPDATA\com.momadacoding.jkk\s
 | 写注册表的 CAS：值被别人改过不写，写完被覆盖能发现 | `src-tauri/tests/tsvn_hooks.rs` 的 `cas_*` |
 | 钩子参数按位置解析、仓库外路径丢弃、RESULTPATH 含被删文件、错误一律放行 | `src-tauri/tests/tsvn_hook_cli.rs` |
 | stderr 按线程代码页编码（系统 ACP 不是 936 的机器上，中文不变 `?`） | `stderr_text_follows_the_thread_code_page_not_the_system_one` |
-| 拦截说明里每个 hunk 下面的第一行改动（跳过缩进与空行、纯删除给 `-`、60 字截断、非 UTF-8 不给、整文件不给；旧 journal 没有该字段） | `svn_leak.rs` 的 `preview_*`、`leak_message_shows_the_first_changed_line_under_each_hunk`、`whole_file_verdict_has_no_preview`；`svn_backend.rs` 的 `follow_outcome_*` |
+| 拦截说明里每个 hunk 下面的第一行改动（跳过缩进与空行、去 BOM、控制字符换空格、纯删除或改成空行给 `-`、60 字截断、文件首尾、非 UTF-8 不给、整文件不给；旧 journal 没有该字段） | `svn_leak.rs` 的 `preview_*`、`leak_message_shows_the_first_changed_line_under_each_hunk`、`whole_file_verdict_has_no_preview`、`follow_side_leaks_carry_the_preview_too`；`svn_backend.rs` 的 `follow_outcome_*` |
+| 线程代码页编不出来的预览（emoji、GBK 之外的字）不进消息，不把中文消息挤成英文版 | `tsvn_hook_cli.rs` 的 `unencodable_preview_is_dropped_instead_of_forcing_english`、`svn_leak.rs` 的 `rejected_previews_are_left_out_of_both_messages` |
+
+> 已知限制：GBK 编码的源文件（SVN 混合仓库常见）没有预览。猜不了编码，宁缺不错。
 | 线程代码页装不下中文时改发英文版（含 best-fit 全角标点、英文版里带中文路径） | `hook_stderr_*`、`best_fit_substitution_counts_as_lossy`、`english_fallback_with_chinese_path_keeps_the_english_template`、`svn_leak.rs` 的 `leak_message_en_*` |
 | Pre / Post 配对、孤儿 Pre 不配对、清理 | `src-tauri/tests/tsvn_inbox.rs` |
 | Check-commit 按磁盘判定（提交后恢复、整文件、大小写、fail-open） | `src-tauri/tests/svn_leak.rs` 的 disk_* 与 `tsvn_hook_cli.rs` 的 check_commit_* |

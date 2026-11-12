@@ -164,19 +164,27 @@ pub fn run_hook(a: &HookArgs, now_ms: i64) -> HookOutcome {
     HookOutcome::default()
 }
 
+/// 有泄漏时钩子的结果：退出 1，带中英文两版说明。编不出来的预览不进消息，免得一行源码就把
+/// 中文消息挤成英文版（见 `leak_message`）。判定用的是本线程的代码页，与写 stderr 时一致。
+pub fn leak_outcome(leaks: &[crate::engine::svn_leak::Leak]) -> HookOutcome {
+    use crate::engine::svn_leak::{leak_message, leak_message_en};
+    let fits = |p: &str| encodes_exactly(p);
+    HookOutcome {
+        code: 1,
+        stderr: leak_message(leaks, &fits),
+        stderr_en: leak_message_en(leaks, &fits),
+    }
+}
+
 /// 按勾选的文件检查 Local-Only 泄漏（分析 §6.13.4；日志 H3：拦截放在 Check-commit，用户
 /// Abort 后回到提交框，消息还在）。命中退出 1；读不到、算不出一律放行，由跟进时的 F3 兜底。
 fn check_commit(a: &HookArgs) -> HookOutcome {
-    use crate::engine::svn_leak::{leak_message, leak_message_en, local_only_leaks_on_disk};
+    use crate::engine::svn_leak::local_only_leaks_on_disk;
     let Some(paths) = a.path_file.as_ref().and_then(read_list) else {
         return HookOutcome::default();
     };
     match local_only_leaks_on_disk(&a.repo, &paths) {
-        Ok(leaks) if !leaks.is_empty() => HookOutcome {
-            code: 1,
-            stderr: leak_message(&leaks),
-            stderr_en: leak_message_en(&leaks),
-        },
+        Ok(leaks) if !leaks.is_empty() => leak_outcome(&leaks),
         Ok(_) => HookOutcome::default(),
         Err(e) => {
             log::warn!("Check-commit 读不出 Local-Only 信息，放行：{}", e.message);
@@ -276,6 +284,11 @@ fn encode_thread_acp_exact(s: &str) -> Option<Vec<u8>> {
     {
         Some(s.as_bytes().to_vec())
     }
+}
+
+/// `s` 在当前线程代码页里一个字都不丢。
+pub fn encodes_exactly(s: &str) -> bool {
+    encode_thread_acp_exact(s).is_some()
 }
 
 /// 钩子写给 TortoiseSVN 的 stderr 字节。`text` 在线程代码页里一个字不丢就发它，否则发
