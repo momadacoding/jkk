@@ -59,12 +59,48 @@ pub struct Leak {
 ///
 /// 整文件的判定（二进制、L 删了文件且 NEW 也删了）没有行号可给，记为 `old_start = 0`、
 /// `lines = 0`，与「从空文件新增」的 hunk 头 `@@ -0,0` 同形。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HunkLeak {
     pub old_start: u32,
     pub lines: u32,
     pub verdict: LeakVerdict,
+    /// 这个 hunk 的第一行改动，给人辨认用（使用报告 9.4）：L 的第一条非空 `+` 行前面加 `+`；
+    /// `+` 行全是空行或纯删除时，是 B 里被换掉的第一条非空行前面加 `-`。去掉首尾空白与 BOM，
+    /// 控制字符换成空格，超过 [`PREVIEW_CHARS`] 个字符截断加 `…`。整文件判定、内容不是 UTF-8、
+    /// 两边都只有空行时没有。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+}
+
+/// [`HunkLeak::preview`] 最多保留的字符数（不含前缀与 `…`）。
+pub const PREVIEW_CHARS: usize = 60;
+
+/// 一组行里第一条非空行的预览；见 [`HunkLeak::preview`]。全是空行时返回 `None`。
+fn preview_of(sign: char, lines: &[&[u8]]) -> Option<String> {
+    let mut texts = Vec::with_capacity(lines.len());
+    for l in lines {
+        // 有一行不是 UTF-8 就整段不给：同一个 hunk 里编码混用的可能很小，而按字节截出来的
+        // 半个 GBK 字比没有预览更误导
+        texts.push(std::str::from_utf8(l).ok()?);
+    }
+    // BOM 不是 White_Space，`trim` 去不掉；它在 GBK / 1252 里都编不出来
+    let text = texts
+        .iter()
+        .map(|t| t.trim_start_matches('\u{FEFF}').trim())
+        .find(|t| !t.is_empty())?;
+    let mut out = String::with_capacity(text.len() + 4);
+    out.push(sign);
+    // 只有 CR 换行的文件整个是一「行」，`\r` 和制表符原样进 stderr 会搅乱提交框里的排版
+    out.extend(
+        text.chars()
+            .take(PREVIEW_CHARS)
+            .map(|c| if c.is_control() { ' ' } else { c }),
+    );
+    if text.chars().nth(PREVIEW_CHARS).is_some() {
+        out.push('…');
+    }
+    Some(out)
 }
 
 /// Absent（没泄漏）不输出。
@@ -220,7 +256,11 @@ fn oid_string(c: &git2::Commit) -> String {
 }
 
 /// 给 TortoiseSVN 提交框显示的拦截说明（日志 H3：只显示 stderr，`\n` 换行）。
-pub fn leak_message(leaks: &[Leak]) -> String {
+///
+/// `keep_preview` 决定某条预览进不进消息。钩子拿它滤掉线程代码页编不出来的预览：源码里的
+/// emoji、GBK 之外的字会让整条中文消息退回英文版，预览本身也只剩 `?`（PR 158 review 第 1 条）。
+/// 是否退回英文只该取决于模板、路径与标题。
+pub fn leak_message(leaks: &[Leak], keep_preview: &dyn Fn(&str) -> bool) -> String {
     let mut s = String::from("jkk：这些文件里有 Local-Only 补丁，提交会把它带上服务器：\n");
     for leak in leaks {
         for h in &leak.hunks {
@@ -237,16 +277,26 @@ pub fn leak_message(leaks: &[Leak]) -> String {
                 "  {}：{at}{maybe}，来自「{}」\n",
                 leak.path, leak.subject
             ));
+            push_preview(&mut s, h, keep_preview);
         }
     }
     s.push_str("取消勾选这些文件，或用「提交后恢复」删掉这些改动再提交。");
     s
 }
 
+/// 拦截说明里 hunk 那一行下面的预览行（两种语言共用）。
+fn push_preview(s: &mut String, h: &HunkLeak, keep: &dyn Fn(&str) -> bool) {
+    if let Some(p) = h.preview.as_deref().filter(|p| keep(p)) {
+        s.push_str("    ");
+        s.push_str(p);
+        s.push('\n');
+    }
+}
+
 /// [`leak_message`] 的英文版，逐条对应。钩子的线程代码页装不下中文时发它（2026-11-11 使用
 /// 报告：系统 locale 中文、区域格式 en-CA 的机器上线程代码页是 1252，中文提示全成了 `?`）。
 /// 路径与 commit 标题原样保留，它们本身是中文时照样会丢字，但模板读得懂。
-pub fn leak_message_en(leaks: &[Leak]) -> String {
+pub fn leak_message_en(leaks: &[Leak], keep_preview: &dyn Fn(&str) -> bool) -> String {
     let mut s = String::from(
         "jkk: these files contain Local-Only patches; committing would upload them to the server:\n",
     );
@@ -265,6 +315,7 @@ pub fn leak_message_en(leaks: &[Leak]) -> String {
                 "  {}: {at}{maybe}, from commit \"{}\"\n",
                 leak.path, leak.subject
             ));
+            push_preview(&mut s, h, keep_preview);
         }
     }
     s.push_str(
@@ -306,6 +357,7 @@ fn whole_file(verdict: LeakVerdict) -> Vec<HunkLeak> {
         old_start: 0,
         lines: 0,
         verdict,
+        preview: None,
     }]
 }
 
@@ -374,6 +426,7 @@ fn judge_sides(b: Side, l: Side, n: Side) -> Result<Vec<HunkLeak>> {
     };
     let l_hunks = spans(&b_bytes, &l_bytes)?;
     let n_hunks = spans(&b_bytes, &n_bytes)?;
+    let b_lines: Vec<&[u8]> = b_bytes.split_inclusive(|c| *c == b'\n').collect();
     let l_lines: Vec<&[u8]> = l_bytes.split_inclusive(|c| *c == b'\n').collect();
     let n_lines: Vec<&[u8]> = n_bytes.split_inclusive(|c| *c == b'\n').collect();
     let mut out = Vec::new();
@@ -385,10 +438,16 @@ fn judge_sides(b: Side, l: Side, n: Side) -> Result<Vec<HunkLeak>> {
             slice(&l_lines, h.new_start as i64, h.nc as usize).unwrap_or(&[])
         };
         if let Some(verdict) = judge_hunk(h, &n_hunks, &n_lines, plus) {
+            // `+` 行没有可看的（纯删除、只改成空行）就退到 B 里被换掉的行：B 中从 start 起的 oc 行
+            let preview = preview_of('+', plus).or_else(|| {
+                slice(&b_lines, i64::from(h.start), h.oc as usize)
+                    .and_then(|minus| preview_of('-', minus))
+            });
             out.push(HunkLeak {
                 old_start: h.old_start,
                 lines: h.oc,
                 verdict,
+                preview,
             });
         }
     }
@@ -531,4 +590,123 @@ fn take(pool: &mut Vec<&[u8]>, line: &[u8]) -> bool {
 fn body(line: &[u8]) -> &[u8] {
     let line = line.strip_suffix(b"\n").unwrap_or(line);
     line.strip_suffix(b"\r").unwrap_or(line)
+}
+
+// ── 暂存的改动是否已经在 SVN 上（2026-11-11 使用报告第 4 节，方案 C）─────────────
+
+/// OLD → 暂存的改动块（零上下文 hunk）里，有几处已经原样在 NEW 里。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StageTally {
+    pub present: usize,
+    pub total: usize,
+}
+
+/// 跟进拼索引时三方合并冲突、保不住的暂存（`lost`），它的每处改动在 NEW 里有没有。
+///
+/// # 误判方向与泄漏相反
+///
+/// 泄漏判定把拿不准的算 `Present`（宁可多一条告警），这里的「在」会把红色的「丢失的暂存」降成灰色，
+/// 误判成「在」就是把真丢了的内容藏起来，所以不复用 [`judge_hunk`]：它在映射位置对不上时逐行到
+/// NEW 的改动里去找，`end`、`}` 这种行到处都是。一处改动 h（OLD 的 `[s, e)` 换成 `+` 行）只在
+/// 下面全部成立时算在：
+///
+/// 1. NEW 动过这一片：有 OLD→NEW 的 hunk 与 h 重叠（纯插入碰到边界也算）。没动过就是没有。
+/// 2. 取这些重叠 hunk 与 h 的并集区域，算出它在 NEW 里的那一段：`+` 行**按顺序、连续地**出现在
+///    这一段里（逐字节，行尾也比）。只在这一段里找，不到全文里找。
+/// 3. h 删掉的行，NEW 那一段里不比暂存同一片区域里更多：删除也要已经在 NEW 里。
+/// 4. 与 h 重叠的 NEW hunk 不再与暂存的别的 hunk 重叠。每处单独去同一段 NEW 里找，同一行会被
+///    认领两次（独立 review M1：暂存两处各加 `foo`，NEW 只加了一处），合起来判又说不准，一律不算。
+///
+/// 只比文本。调用方负责二进制、删除、mode 之类的整文件情形。
+pub fn stage_hunks_in_new(base: &[u8], staged: &[u8], new: &[u8]) -> Result<StageTally> {
+    let s_hunks = spans(base, staged)?;
+    let n_hunks = spans(base, new)?;
+    fn lines(b: &[u8]) -> Vec<&[u8]> {
+        b.split_inclusive(|c| *c == b'\n').collect()
+    }
+    let (b, s, n) = (lines(base), lines(staged), lines(new));
+    let shared: Vec<bool> = n_hunks
+        .iter()
+        .map(|k| s_hunks.iter().filter(|h| overlaps(h, k)).count() > 1)
+        .collect();
+    let present = s_hunks
+        .iter()
+        .filter(|h| {
+            let alone = n_hunks
+                .iter()
+                .zip(&shared)
+                .all(|(k, shared)| !(*shared && overlaps(h, k)));
+            alone && hunk_in_new(h, &n_hunks, &b, &s, &n)
+        })
+        .count();
+    Ok(StageTally {
+        present,
+        total: s_hunks.len(),
+    })
+}
+
+/// OLD 里的两段改动重叠。有一侧是纯插入（区间为空）时，碰到边界也算。
+fn overlaps(h: &Span, k: &Span) -> bool {
+    let (hs, he, ks, ke) = (h.start, h.end(), k.start, k.end());
+    if h.oc == 0 || k.oc == 0 {
+        ks <= he && hs <= ke
+    } else {
+        ks < he && hs < ke
+    }
+}
+
+fn hunk_in_new(h: &Span, news: &[Span], b: &[&[u8]], s: &[&[u8]], n: &[&[u8]]) -> bool {
+    let (hs, he) = (h.start, h.end());
+    // 纯删除时 `new_start` 可能是 0，不拿它取行
+    let plus = if h.nc == 0 {
+        &[][..]
+    } else {
+        match slice(s, i64::from(h.new_start), h.nc as usize) {
+            Some(p) => p,
+            None => return false,
+        }
+    };
+    let Some(minus) = slice(b, i64::from(hs), h.oc as usize) else {
+        return false;
+    };
+    // 并集区域之前 NEW 的累计行数变化，与并集区域内 NEW 的行数变化
+    let (mut delta, mut net) = (0i64, 0i64);
+    let (mut us, mut ue) = (hs, he);
+    let mut overlap = false;
+    for k in news {
+        let (ks, ke) = (k.start, k.end());
+        let change = i64::from(k.nc) - i64::from(k.oc);
+        if overlaps(h, k) {
+            overlap = true;
+            us = us.min(ks);
+            ue = ue.max(ke);
+            net += change;
+        } else if ke <= hs {
+            delta += change;
+        }
+    }
+    if !overlap {
+        return false;
+    }
+    let Ok(len) = usize::try_from(i64::from(ue - us) + net) else {
+        return false;
+    };
+    let Some(region) = slice(n, i64::from(us) + delta, len) else {
+        return false;
+    };
+    if !plus.is_empty() && !region.windows(plus.len()).any(|w| w == plus) {
+        return false;
+    }
+    // 暂存在同一片区域里的样子：OLD[us, hs) + `+` 行 + OLD[he, ue)
+    let (Some(left), Some(right)) = (
+        slice(b, i64::from(us), (hs - us) as usize),
+        slice(b, i64::from(he), (ue - he) as usize),
+    ) else {
+        return false;
+    };
+    let count = |pool: &[&[u8]], line: &[u8]| pool.iter().filter(|l| **l == line).count();
+    minus.iter().all(|line| {
+        count(region, line) <= count(left, line) + count(plus, line) + count(right, line)
+    })
 }

@@ -26,6 +26,7 @@ import {
   svnCheckBaseline,
   svnGetUser,
   svnMigrateEol,
+  svnRestoreLocalOnly,
   svnSetUser,
   tsvnHooksRegister,
   tsvnHooksStatus,
@@ -160,9 +161,9 @@ export function RepoTab({
   repoPath, active, openPaths, onOpenInNewTab, onRepoRemoved,
 }: RepoTabProps) {
   const {
-    state, openRepo, refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers,
+    state, openRepo, refreshHead, refreshHeadInfo, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers,
     refreshDiff, refreshUpstream, refreshStashes, refreshPullRequests,
-    refreshSvnSync, refreshSvnEol, refreshSvnSyncState, refreshSvnBranchesBehind, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, checkSvnSyncOnFocus, freshSvnSync, markSvnFollowOnBlur, fetchSvnLog, refreshSvnAudit, auditSvnIfDue,
+    refreshSvnSync, refreshSvnEol, refreshSvnSyncState, refreshSvnBranchesBehind, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, noteOwnCommit, checkSvnSyncOnFocus, freshSvnSync, markSvnFollowOnBlur, fetchSvnLog, refreshSvnAudit, auditSvnIfDue,
     selectCommit, clearError, reportError, wantedDiffScope, refreshChanges: refreshChangesIn, afterIndexWrite,
   } = useRepoStore()
   const [repoState, setRepoState] = useState<string>('normal')
@@ -264,7 +265,7 @@ export function RepoTab({
 
   useRepoEffects(
     state,
-    { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, checkSvnSyncOnFocus, markSvnFollowOnBlur, refreshSvnSyncState, refreshSvnBranchesBehind, auditSvnIfDue, wantedDiffScope, reportError },
+    { refreshHeadInfo, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, checkSvnSyncOnFocus, markSvnFollowOnBlur, refreshSvnSyncState, refreshSvnBranchesBehind, auditSvnIfDue, wantedDiffScope, reportError },
     // 文件历史视图自己读数据；这里按要回去的那个视图读，返回时不用再等一次
     viewMode === 'history' ? historyReturn : viewMode,
     changesScope,
@@ -369,15 +370,27 @@ export function RepoTab({
         // 没提交上（hook 拒绝、同步进行中……）：写好的说明留着（review 第 6 条）
         return false
       }
-      // 提交已经成功：刷新失败不影响「说明可以清空」
-      await perfSpan('commit.refreshGraph', () => refreshGraph(path)).catch(reportError)
-      await perfSpan('commit.refreshChanges', () => refreshChanges(path)).catch(reportError)
+      // 提交已经成功：刷新失败不影响「说明可以清空」。
+      // 几项并发、状态不排在读图后面（H5）：提交写了 refs，监听约半秒后会发起一轮全量状态读取。串行的话
+      // 状态读取排在读图后面，多半撞上监听那一轮、要等它读完再补读一轮，提交要等两轮全量状态。
+      // 和读图同时发的话监听那轮排到它后面补跑，提交只等自己这一轮
+      await Promise.all([
+        // 普通提交叠在原来的 HEAD 上，第二档的结论不变：记下新 HEAD，监听随后就不再跑那两次秒级的
+        // svn status（H1）。amend 换了父提交，照常校验。要赶在监听（去抖 300 ms）之前；它只读一次 HEAD
+        // （libgit2，毫秒级），排在状态前面不拖慢状态
+        // 三项各一个子 span：并发之后时间线上看得出谁在等谁（性能记录模式，决策日志 D4）
+        state.capabilities.vcs === 'svn' && !amend
+          ? perfSpan('commit.noteOwnCommit', () => noteOwnCommit(path)).catch(() => undefined)
+          : undefined,
+        perfSpan('commit.refreshChanges', () => refreshChanges(path)).catch(reportError),
+        perfSpan('commit.refreshGraph', () => refreshGraph(path)).catch(reportError),
+      ])
       return true
     } finally {
       committing.current = false
       setAutoNudge((n) => n + 1)
     }
-  }, { staged: state.status?.staged.length ?? 0, amend }, (committed) => committed), [state.path, state.capabilities.vcs, state.status, following, freshSvnSync, confirm, refreshGraph, refreshChanges, reportError])
+  }, { staged: state.status?.staged.length ?? 0, amend }, (committed) => committed), [state.path, state.capabilities.vcs, state.status, following, freshSvnSync, noteOwnCommit, confirm, refreshGraph, refreshChanges, reportError])
 
   const runAndRefresh = useCallback(async (cmd: string, args: Record<string, unknown>, refresh: () => Promise<void>) => {
     if (!state.path) return
@@ -900,6 +913,17 @@ export function RepoTab({
       report,
       readUser: () => svnGetUser(repoPath),
       saveUser: (user) => svnSetUser(repoPath, user),
+      // 写了磁盘：「本地改动」要跟着变（watcher 也会刷，这里不等它）
+      restoreLocalOnly: async (paths) => {
+        const outcome = await svnRestoreLocalOnly(repoPath, paths)
+        // 刷新失败不能吞掉已经写成的结果：再点一次只会看到误导的跳过原因（PR 159 review 第 8 条）
+        try {
+          await refreshStatus(repoPath)
+        } catch (err) {
+          console.warn('放回 Local-Only 补丁后刷新状态失败：', err)
+        }
+        return outcome
+      },
     })
   const {
     handleSvnUpdate,

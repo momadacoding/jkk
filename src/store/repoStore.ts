@@ -6,13 +6,16 @@ import type { CommitNode, ConflictInfo, DiffData, GraphData, PullRequest, RefPoi
 import { ALL_CAPABILITIES, type Capabilities } from '../engine/capabilities'
 import {
   auditIsDue,
+  isPlainCommitOn,
   markOnBlur,
   recordAfterSuccess,
   runSvnSyncCheck,
+  sameHeadForSync,
   SVN_AUDIT_POLL_MS,
   SVN_TRAILING_RECHECK_MS,
   type EolStatus,
-  type RootRevMemo,
+  type HeadObservation,
+  type ObservationMemo,
   type ServerAudit,
   type SyncStatus,
   type SyncVerdict,
@@ -51,7 +54,12 @@ import type {
   RebuildReport,
 } from '../engine/svnInit'
 import { samePath } from '../engine/path'
-import type { AutoFollowOutcome, FollowOutcome, SvnUserInfo } from '../engine/svnFollow'
+import type {
+  AutoFollowOutcome,
+  FollowOutcome,
+  RestoreOutcome,
+  SvnUserInfo,
+} from '../engine/svnFollow'
 import type { HookHealth, TsvnHooksStatus } from '../engine/tsvnHooks'
 import type { SyncInExpect, SyncInOutcome, SyncInPreview } from '../engine/svnSyncIn'
 import type { SyncOutExpect, SyncOutOutcome, SyncOutPreview } from '../engine/svnSyncOut'
@@ -422,6 +430,14 @@ export function svnFollowManual(path: string): Promise<SyncInOutcome> {
   return invoke<SyncInOutcome>('svn_follow_manual', { path })
 }
 
+/**
+ * 跟进报告里的「放回 Local-Only 补丁」（使用报告 9.1）：把 `paths` 写回成分支的版本。后端锁内
+ * 逐个重验条件，不满足的跳过并给出原因；会写磁盘，调用方随后刷新状态。
+ */
+export function svnRestoreLocalOnly(path: string, paths: string[]): Promise<RestoreOutcome> {
+  return invoke<RestoreOutcome>('svn_restore_local_only', { path, paths })
+}
+
 /** 落后基线的本地分支。纯本地读；非混合仓库或没有基线时返回空列表。 */
 export function svnBranchesBehind(path: string): Promise<string[]> {
   return invoke<string[]>('svn_branches_behind', { path })
@@ -565,9 +581,14 @@ export function useRepoStore() {
   const storeIdentity = useRef({}).current
   const [state, setState] = useState<RepoState>(initialState)
   /** 上一次校验成功时的 HEAD。见 `checkSvnSyncIfHeadMoved`。放 ref 的理由同 `lastWcDbStamps`。 */
-  const lastCheckedHead = useRef<RootRevMemo>({ value: null })
+  const lastCheckedHead = useRef<ObservationMemo<HeadObservation>>({ value: null })
   /** 已经为它请求了强制校验、还没落定的 HEAD。见 `checkSvnSyncIfHeadMoved`。 */
-  const headRequested = useRef<string | null>(null)
+  const headRequested = useRef<HeadObservation | null>(null)
+  /**
+   * 本应用叠在还没落定的那一轮（`on`，就是当时的 `headRequested` 那个对象）上的普通提交（`noteOwnCommit`）。
+   * 那一轮写回后直接记成它，不再为它排一轮（独立 review 第 8 条）；没写回就替它补一轮（第二轮第 1 条）。
+   */
+  const ownCommitOnPending = useRef<{ on: HeadObservation, head: HeadObservation } | null>(null)
   /**
    * §6.6.3 第一档的「上次观测值」：最近一次写回了结论的校验开跑之前读到的各 wc.db 戳。
    * 文件变动、焦点检测、打开仓库共用，失焦快照也按它判断。
@@ -689,8 +710,12 @@ export function useRepoStore() {
       void refreshPinned(path)
       if (caps.vcs === 'svn') {
         // 第二档的完整校验：打开仓库是正确性的闸门之一，必须问到底（spec §6.6.3）。
-        // 纯本地读，await 得起。
-        await refreshSvnSync(path).catch(() => undefined)
+        // 纯本地读，await 得起。顺带记下 HEAD（`forceCheckAtHead`）：不记的话打开后第一次 HEAD 事件
+        // （常常就是第一次提交）会因为记录还是 `null` 再跑一遍，同 wc.db 戳在这里就记的理由。
+        // HEAD 在校验前现读：开头读的那份可能已经过时（打开要读图、状态，大仓库上要一会儿）
+        await refreshHeadInfo(path)
+          .then((head) => forceCheckAtHead(path, head), () => refreshSvnSync(path))
+          .catch(() => undefined)
         // 同样是纯本地读，且它决定要不要挂迁移横幅——那条横幅会让失同步横幅
         // 和常驻体检入口都让位，所以必须在第一帧之前读到，否则界面会先挂出
         // 一条随后又被替换掉的横幅（spec §7.3.0）。
@@ -741,10 +766,13 @@ export function useRepoStore() {
    * checkout 之后必须调用，否则 header 与分支高亮会停在旧分支。返回值让调用方
    * 能判断 HEAD 有没有动——上面那次 setState 是异步的，读 state 拿到的是旧值。
    */
-  const refreshHead = async (path: string): Promise<string> => {
+  const refreshHead = async (path: string): Promise<string> => (await refreshHeadInfo(path)).hash
+
+  /** 同 `refreshHead`，另外交出分支名与父提交：SVN 第二档据此判断 HEAD 的变化要不要校验。 */
+  const refreshHeadInfo = async (path: string): Promise<HeadObservation> => {
     const info = await invoke<RepoInfo>('open_repo', { path })
     setState((s) => ({ ...s, head: info.head, headHash: info.headHash }))
-    return info.headHash
+    return { branch: info.head, hash: info.headHash, parents: info.headParents ?? [] }
   }
 
   /**
@@ -1000,7 +1028,8 @@ export function useRepoStore() {
     svnCheckQueue.request(path, force, (forced) => runSvnCheckNow(path, forced))
 
   /**
-   * 第二档的**无条件**入口：打开仓库、重建基线之后各用一次。
+   * 第二档的**无条件**入口：重建基线、同步之后用。打开仓库走 `forceCheckAtHead`（同样无条件，另外
+   * 记下 HEAD），读不出 HEAD 时才退回这里。
    *
    * 顺带把 wc.db 戳记下来当基准——不记的话打开仓库后第一次存盘或焦点会因为记录还是 `null`
    * 而再跑一次全量。先读戳再跑校验，而且只在校验写回后才记（`runSvnSyncCheck`）。
@@ -1031,11 +1060,28 @@ export function useRepoStore() {
    * HEAD 从 a 切到 b 又切回 a，只比记录的话切回 a 那次看到的还是 a、直接返回，等 b 那轮写回把
    * 记录改成 b，HEAD 明明是 a，横幅却停在按 b 算的结论上，直到下一次 HEAD 或 wc.db 变化。
    */
-  const checkSvnSyncIfHeadMoved = async (path: string, head: string) => {
-    if (head === (headRequested.current ?? lastCheckedHead.current.value)) return false
+  const checkSvnSyncIfHeadMoved = async (path: string, head: HeadObservation) => {
+    const pending = headRequested.current
+    const base = pending ?? lastCheckedHead.current.value
+    if (base && sameHeadForSync(base, head)) return false
+    // 本应用叠在还没落定的那一轮上的提交（`noteOwnCommit`）：那一轮落定时记成它，或者替它补一轮
+    const own = ownCommitOnPending.current
+    if (pending && own?.on === pending && sameHeadForSync(own.head, head)) return false
+    await forceCheckAtHead(path, head)
+    return true
+  }
+
+  /**
+   * 按 `head` 强制跑一轮第二档，写回了才记成「上次校验的 HEAD」。`checkSvnSyncIfHeadMoved` 判定 HEAD 变了
+   * 之后、打开仓库时都走这里。
+   *
+   * 跑的过程中 `headRequested` 是它（见 `checkSvnSyncIfHeadMoved` 为什么要比还没落定的 HEAD）。
+   */
+  const forceCheckAtHead = async (path: string, head: HeadObservation) => {
     headRequested.current = head
+    let recorded = false
     try {
-      await recordAfterSuccess(
+      recorded = await recordAfterSuccess(
         lastCheckedHead.current,
         head,
         async () => (await requestSvnCheck(path, true)) === 'applied',
@@ -1043,8 +1089,45 @@ export function useRepoStore() {
     } finally {
       // 更晚的一次已经接手时不清：它落定前，再来的同一个 HEAD 不必重复请求
       if (headRequested.current === head) headRequested.current = null
+      // 按对象认登记时的那一轮，不按 hash：同一个提交上的另一轮（比如游离在同一个提交上）不是它
+      const own = ownCommitOnPending.current
+      if (own?.on === head) {
+        ownCommitOnPending.current = null
+        if (recorded && !headRequested.current && lastCheckedHead.current.value === head) {
+          // 按 head 写回了：叠在它上面的本应用提交结论相同，直接记
+          lastCheckedHead.current.value = own.head
+        } else if (!headRequested.current) {
+          // 没写回（失败、被顶替）：那次提交的事件已经被 `checkSvnSyncIfHeadMoved` 吞掉，不会再来，
+          // 替它补一轮（第二轮独立 review 第 1、2 条）。更晚的请求接手时不补：它对应更新的 HEAD
+          void checkSvnSyncIfHeadMoved(path, own.head).catch(() => undefined)
+        }
+      }
     }
-    return true
+    return recorded
+  }
+
+  /**
+   * 本应用的普通提交（不是 amend）**成功之后**立刻调：现读 HEAD，是叠在已校验 HEAD 上的单父提交，就直接
+   * 记成新的「上次校验的 HEAD」，监听随后读到它时不再跑第二档（`isPlainCommitOn`，2026-11-11 提交慢排查 H1）。
+   *
+   * 为什么在提交之后、而不是之前登记（独立 review 第 1、2、5 条）：之前登记的话，第一个不同的 HEAD 就会被
+   * 当成本应用的提交，提交期间外部快进到基线也会被认领，落后横幅不撤。提交之后现读：提交期间分支被挪走时
+   * `git commit` 本身会失败（不会走到这里），成功时紧接着读到的 HEAD 就是这次提交。不用 React state 里的
+   * HEAD，那份可能还没刷新。
+   *
+   * 监听（去抖 300 ms）多半晚于这里；早于这里时它已经为新 HEAD 排了一轮校验，这里看到的
+   * `headRequested` 就是新 HEAD 本身，不做任何事，只是没省下。
+   */
+  const noteOwnCommit = async (path: string) => {
+    if (!samePath(openedPath.current ?? '', path)) return
+    const head = await refreshHeadInfo(path)
+    // 读的过程中仓库可能重开或切走（第二轮独立 review 第 3 条）：记录是按打开的那个仓库算的
+    if (!samePath(openedPath.current ?? '', path)) return
+    const pending = headRequested.current
+    const base = pending ?? lastCheckedHead.current.value
+    if (!base || !isPlainCommitOn(base, head)) return
+    if (pending) ownCommitOnPending.current = { on: pending, head }
+    else lastCheckedHead.current.value = head
   }
 
   /**
@@ -1335,6 +1418,7 @@ export function useRepoStore() {
     state,
     openRepo,
     refreshHead,
+    refreshHeadInfo,
     refreshGraph,
     refreshStatus,
     refreshWorktrees,
@@ -1349,6 +1433,7 @@ export function useRepoStore() {
     refreshSvnBranchesBehind,
     checkSvnSyncIfChanged,
     checkSvnSyncIfHeadMoved,
+    noteOwnCommit,
     checkSvnSyncOnFocus,
     freshSvnSync,
     markSvnFollowOnBlur,
@@ -1367,7 +1452,7 @@ export function useRepoStore() {
 
 /** `useRepoEffects` 需要的刷新函数集合。 */
 export interface RepoRefreshers {
-  refreshHead: (path: string) => Promise<string>
+  refreshHeadInfo: (path: string) => Promise<HeadObservation>
   refreshGraph: (path: string) => Promise<void>
   refreshStatus: (path: string) => Promise<StatusData>
   refreshWorktrees: (path: string) => Promise<void>
@@ -1380,7 +1465,7 @@ export interface RepoRefreshers {
   /** §6.6.3 的第一档 + 条件触发第二档。挂在高频的 repo-changed 上。 */
   checkSvnSyncIfChanged: (path: string) => Promise<boolean>
   /** §6.11.3：HEAD 变了才跑第二档。挂在 repo-changed 读到的新 HEAD 上。 */
-  checkSvnSyncIfHeadMoved: (path: string, head: string) => Promise<boolean>
+  checkSvnSyncIfHeadMoved: (path: string, head: HeadObservation) => Promise<boolean>
   /** §6.6 的焦点检测：wc.db 变了才跑第二档。挂窗口焦点与切标签。 */
   checkSvnSyncOnFocus: (path: string) => Promise<boolean>
   /** 失焦快照，自带是否该写的判断，不抛。挂窗口失焦与切标签。 */
@@ -1408,7 +1493,7 @@ export function useRepoEffects(
   changesScope: string | null,
   active: boolean,
 ) {
-  const { refreshHead, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, checkSvnSyncOnFocus, markSvnFollowOnBlur, refreshSvnSyncState, refreshSvnBranchesBehind, auditSvnIfDue, reportError } = refreshers
+  const { refreshHeadInfo, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, checkSvnSyncOnFocus, markSvnFollowOnBlur, refreshSvnSyncState, refreshSvnBranchesBehind, auditSvnIfDue, reportError } = refreshers
   // svn 节点有两版本地基线时读两版之差（`range:`）；不在图上的选中（stash）照旧按 oid 读
   const diffScope = viewMode === 'changes'
     ? changesScope
@@ -1453,7 +1538,7 @@ export function useRepoEffects(
       // 刷新期间仓库可能正处于中间态（比如 checkout 写到一半），失败就等下一次事件
       const ignore = () => undefined
       // 外部 checkout 同样会改 HEAD 和 worktree 归属，两者都要跟着刷新
-      void refreshHead(path)
+      void refreshHeadInfo(path)
         .then((head) => {
           if (state.capabilities.vcs === 'svn') return checkSvnSyncIfHeadMoved(path, head)
         })

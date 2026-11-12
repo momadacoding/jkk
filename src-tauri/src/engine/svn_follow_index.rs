@@ -30,6 +30,7 @@ use crate::engine::git_cli::{
     run_git, run_git_bytes, run_git_code, run_git_env, run_git_stdin, run_git_stdin_env,
 };
 use crate::engine::svn_baseline::{copy_with_mtime, parse_entry_flags, IndexLock, TempFile};
+use crate::engine::svn_leak::{stage_hunks_in_new, StageTally};
 use crate::error::{GitError, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -76,8 +77,16 @@ pub struct ComposeReport {
     pub decisions: BTreeMap<String, StageDecision>,
     /// 作者是我但先后拿不准，暂存留着，交给用户确认。
     pub uncertain: Vec<String>,
-    /// 暂存内容没能保留。
+    /// 暂存内容没能保留，而且其中有改动不在 NEW 里（`superseded` 的不在此列）。
     pub lost: Vec<String>,
+    /// 暂存内容没能保留，但它相对 OLD 的每处改动 NEW 里都有了：没丢东西，暂存区取 NEW
+    /// （2026-11-11 使用报告第 4 节，方案 C；判据见 [`stage_hunks_in_new`]）。原内容照旧钉住。
+    #[serde(default)]
+    pub superseded: Vec<String>,
+    /// `lost` 里一部分改动已在 NEW 里的：路径 → 计数。一处都不在、或判不了（二进制、删除、
+    /// mode 变化）的不在这里。
+    #[serde(default)]
+    pub partial: BTreeMap<String, StageTally>,
     /// 作者是我、确定早于提交，按中间版本丢弃（分析 §6.12 的通知要列出来）。
     /// 与 `TakeNew` 里「索引本来就等于 NEW」的路径不同，那些没有丢东西。
     pub discarded: Vec<String>,
@@ -440,11 +449,57 @@ fn compose(
                 });
                 plan.finals.push((path.clone(), merged));
             }
-            StageDecision::LostToNew => plan.report.lost.push(path.clone()),
+            StageDecision::LostToNew => {
+                match stage_tally(repo, c.old.as_ref(), in_index, c.new.as_ref()) {
+                    Some(t) if t.total > 0 && t.present == t.total => {
+                        plan.report.superseded.push(path.clone())
+                    }
+                    Some(t) if t.present > 0 => {
+                        plan.report.lost.push(path.clone());
+                        plan.report.partial.insert(path.clone(), t);
+                    }
+                    _ => plan.report.lost.push(path.clone()),
+                }
+            }
         }
         plan.report.decisions.insert(path.clone(), decision);
     }
     Ok(plan)
+}
+
+/// 保不住的暂存（OLD = `base`、暂存 = `staged`、NEW = `new`），每处改动在 NEW 里有没有（方案 C）。
+///
+/// 只判暂存与 NEW 都是普通文件、OLD 是普通文件或没有的情形；其余（删除、mode 变化、二进制）以及
+/// 读对象出错都返回 `None`，照旧算丢失：这是只能往「多报」错的判定。
+fn stage_tally(
+    repo: &str,
+    base: Option<&Entry>,
+    staged: Option<&Entry>,
+    new: Option<&Entry>,
+) -> Option<StageTally> {
+    let (staged, new) = (staged?, new?);
+    if !staged.is_regular_file() || !new.is_regular_file() || staged.mode != new.mode {
+        return None;
+    }
+    if base.is_some_and(|b| !b.is_regular_file() || b.mode != staged.mode) {
+        return None;
+    }
+    let r = git2::Repository::open(repo).ok()?;
+    let text = |e: &Entry| -> Option<Vec<u8>> {
+        let blob = r.find_blob(git2::Oid::from_str(&e.oid).ok()?).ok()?;
+        (!blob.is_binary()).then(|| blob.content().to_vec())
+    };
+    let b = match base {
+        Some(b) => text(b)?,
+        None => Vec::new(),
+    };
+    match stage_hunks_in_new(&b, &text(staged)?, &text(new)?) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            log::warn!("判断暂存是否已在 SVN 上时出错，按丢失报告：{}", e.message);
+            None
+        }
+    }
 }
 
 /// 索引与 NEW 不同的路径（`ours != theirs` 已判过）怎么办。

@@ -639,6 +639,41 @@ fn real_leak_message_under_en_ca_is_sent_in_english() {
     assert!(zh.starts_with(&[b'j', b'k', b'k', 0xA3, 0xBA]), "{zh:?}");
 }
 
+/// PR 158 review 第 1 条：936 的机器上，一行带 emoji 的源码预览不能把整条中文消息挤成英文版。
+/// 编不出来的预览直接不进消息，编得出来的照留。
+#[cfg(windows)]
+#[test]
+fn unencodable_preview_is_dropped_instead_of_forcing_english() {
+    use app_lib::engine::svn_leak::{HunkLeak, Leak, LeakVerdict};
+    use app_lib::engine::tsvn_hook_cli::{hook_stderr_bytes, leak_outcome};
+    let hunk = |old_start, preview: &str| HunkLeak {
+        old_start,
+        lines: 1,
+        verdict: LeakVerdict::Present,
+        preview: Some(preview.to_string()),
+    };
+    let leaks = vec![Leak {
+        branch: "work".into(),
+        commit: "c".into(),
+        subject: "调试补丁".into(),
+        path: "Code/A.cs".into(),
+        hunks: vec![hunk(2, "+log(\"😀\")"), hunk(9, "+log(\"ok\")")],
+    }];
+    let (out, bytes) = with_thread_locale(ZH_CN, || {
+        let out = leak_outcome(&leaks);
+        let bytes = hook_stderr_bytes(&out.stderr, &out.stderr_en);
+        (out, bytes)
+    });
+    assert_eq!(out.code, 1);
+    assert!(!out.stderr.contains('😀'), "{}", out.stderr);
+    assert!(out.stderr.contains("    +log(\"ok\")"), "{}", out.stderr);
+    // 发出去的是中文版（GBK 的「：」是 A3 BA）
+    assert!(
+        bytes.starts_with(&[b'j', b'k', b'k', 0xA3, 0xBA]),
+        "{bytes:?}"
+    );
+}
+
 #[test]
 fn empty_fallback_sends_the_original_text() {
     use app_lib::engine::tsvn_hook_cli::hook_stderr_bytes;

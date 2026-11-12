@@ -72,6 +72,8 @@
 - **偏离计划**：设计 §4.4 第一批打点含 `commit.noteOwnCommit`。
 - **为什么**：`noteOwnCommit` 在 PR 156（`worktree-commit-latency`）里，本分支从 master 切出，还没有它。两个 PR 都改 `handleCommit`，后合并的那个负责补上这个子 span。
 
+**后续（2026-11-13 合并 master）**：PR 156 先合进了 master，`handleCommit` 冲突。解法：保留 master 的并发刷新（H5：`noteOwnCommit` / `refreshChanges` / `refreshGraph` 放在一个 `Promise.all` 里），三项各包一个子 span（`commit.noteOwnCommit` / `commit.refreshChanges` / `commit.refreshGraph`）；依赖数组用 master 的（多了 `noteOwnCommit`），span 的 meta 与 `okOf` 用本分支的。`.catch` 挂在 `perfSpan(...)` 外面，关闭时与 master 的写法返回同一个 Promise 链。`openRepo` 与 `repo-changed` 监听是自动合并的，核对过 span / mark 都还在。
+
 ### D5 脱敏规则比设计多三条
 
 - **计划没写的坑**：

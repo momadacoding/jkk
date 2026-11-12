@@ -11,7 +11,9 @@ import {
   describeManualFollow,
   describeManualFollowAction,
   describeManualFollowOutcome,
+  describeRestoreOutcome,
   needsSvnUserPrompt,
+  restorablePaths,
   type FollowOutcome,
   type FollowReport,
   type Leak,
@@ -378,6 +380,81 @@ describe('describeFollowReport', () => {
     expect(m.sections.findIndex((x) => x.id === 'drift')).toBeLessThan(
       m.sections.findIndex((x) => x.id === 'changes'),
     )
+  })
+
+  it('条件 11 的重叠文件逐个标出与磁盘是否一致；不一致的要确认，一致的只告知，drift 不重复列', () => {
+    const r: FollowReport = {
+      ...report,
+      drift: ['Code/D.cs'],
+      overlap: [
+        { path: 'Code/A.cs', commits: ['e381033 add @x'], matchesDisk: true },
+        { path: 'Code/B.cs', commits: ['e381033 add @x', '1234567 more'], matchesDisk: false },
+        { path: 'Code/D.cs', commits: ['e381033 add @x'], matchesDisk: false },
+      ],
+      changes: [{ path: 'Code/A.cs', rev: 4, author: 'x' }],
+    }
+    const m = describeFollowReport(r)
+    const differs = section(r, 'overlapDiffers')!
+    expect(differs.level).toBe('attention')
+    expect(differs.groups[0].items).toEqual([
+      { text: 'Code/B.cs', meta: 'e381033 add @x、1234567 more' },
+    ])
+    const matches = section(r, 'overlapMatches')!
+    expect(matches.level).toBe('info')
+    expect(texts(matches.groups[0].items)).toEqual(['Code/A.cs'])
+    expect(m.sections.map((s) => s.id)).toEqual([
+      'drift',
+      'overlapDiffers',
+      'changes',
+      'overlapMatches',
+    ])
+  })
+
+  it('保不住的暂存分三档：都不在是红色，部分在是琥珀并给计数，全在是灰色', () => {
+    const r: FollowReport = {
+      ...report,
+      stage: {
+        ...report.stage,
+        lost: ['Code/L.cs', 'Code/P.cs'],
+        partial: { 'Code/P.cs': { present: 24, total: 25 } },
+        superseded: ['Code/S.cs'],
+      },
+    }
+    const m = describeFollowReport(r)
+    expect(texts(section(r, 'lost')!.groups[0].items)).toEqual(['Code/L.cs'])
+    const part = section(r, 'lostPartial')!
+    expect(part.level).toBe('attention')
+    expect(part.groups[0].items).toEqual([
+      { text: 'Code/P.cs', meta: '25 处改动里 24 处已在 SVN 上' },
+    ])
+    const sup = section(r, 'superseded')!
+    expect(sup.level).toBe('info')
+    expect(texts(sup.groups[0].items)).toEqual(['Code/S.cs'])
+    expect(sup.note).toContain('refs/mygitclient/follow/')
+    expect(m.sections.map((s) => s.id)).toEqual(['lost', 'lostPartial', 'superseded'])
+  })
+
+  it('丢失的文件名与对象原型上的属性同名时，照旧是红色', () => {
+    const r: FollowReport = {
+      ...report,
+      stage: { ...report.stage, lost: ['constructor', 'toString'], partial: {} },
+    }
+    expect(texts(section(r, 'lost')!.groups[0].items)).toEqual(['constructor', 'toString'])
+    expect(section(r, 'lostPartial')).toBeUndefined()
+  })
+
+  it('只有已被取代的暂存时，跟进照常算「完成」', () => {
+    const m = describeFollowReport({
+      ...report,
+      stage: { ...report.stage, superseded: ['Code/S.cs'] },
+    })
+    expect(m.todo).toBe(0)
+    expect(m.title).toBe('跟进完成')
+  })
+
+  it('旧后端没有 overlap 时不成节', () => {
+    const m = describeFollowReport({ ...report, changes: [{ path: 'Code/A.cs', rev: 4, author: 'x' }] })
+    expect(m.sections.map((s) => s.id)).toEqual(['changes'])
   })
 
   it('旧后端没有这两个字段时照常描述', () => {
@@ -822,5 +899,30 @@ describe('手动跟进', () => {
     const m = describeManualFollowAction('syncAbort', 'applying-stash')
     expect(m.message).toContain('新基线')
     expect(m.message).toContain('stash')
+  })
+})
+
+describe('放回 Local-Only 补丁（使用报告 9.1）', () => {
+  it('旧后端没有 restorable 字段时为空', () => {
+    expect(restorablePaths(report)).toEqual([])
+    expect(restorablePaths({ ...report, restorable: ['Code/A.cs'] })).toEqual(['Code/A.cs'])
+  })
+
+  it('全部放回：成功，说明 SVN 里会显示已修改', () => {
+    const d = describeRestoreOutcome({ restored: ['a', 'b'], skipped: [] })
+    expect(d.ok).toBe(true)
+    expect(d.text).toContain('2 个文件')
+    expect(d.text).toContain('SVN 里')
+  })
+
+  it('有跳过的：要留意，写清放回与跳过各几个', () => {
+    const skip = { path: 'b', reason: '磁盘上有你的编辑' }
+    expect(describeRestoreOutcome({ restored: ['a'], skipped: [skip] })).toEqual({
+      ok: false,
+      text: '已放回 1 个文件，1 个跳过了：',
+    })
+    expect(describeRestoreOutcome({ restored: [], skipped: [skip] }).text).toBe(
+      '一个文件都没放回，1 个跳过了：',
+    )
   })
 })
