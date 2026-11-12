@@ -5,6 +5,8 @@
  * 出来，不自己判断哪种情况给哪条出口——那种判断散进组件之后就再也测不到了。
  */
 
+import { BASELINE_BRANCH } from './capabilities'
+
 /**
  * 后端 `svn_sync::SyncVerdict` 的形状。
  *
@@ -430,14 +432,60 @@ export function auditIsDue(now: number, lastAt: number, inFlight: boolean): bool
 }
 
 /**
- * 一个字符串观测值的「上次观测值」（现在只剩 HEAD 用它，见 `repoStore` 的 `lastCheckedHead`；
- * 第一档的 rootRevs 已退出，计划 2026-11-08 Task 1）。
+ * 一个观测值的「上次观测值」。现在只有 HEAD 用它（`repoStore` 的 `lastCheckedHead`）；第一档的
+ * rootRevs 已退出（计划 2026-11-08 Task 1）。
  *
  * 用可变盒子而不是返回值：它在 `repoStore` 里的真身是一个 `useRef`，而这里要
  * 表达的恰恰是**什么时候允许写它**——那条规则写成纯函数才测得到（§7.2）。
  */
-export interface RootRevMemo {
-  value: string | null
+export interface ObservationMemo<T> {
+  value: T | null
+}
+
+/** 读到的一次 HEAD（`open_repo`）。`branch` 是给人看的分支名，游离时是 `HEAD`。 */
+export interface HeadObservation {
+  branch: string
+  hash: string
+  /** 顺序同 git，第一个是提交前的 HEAD。根提交为空。 */
+  parents: string[]
+}
+
+/**
+ * 第二档的 `behind_fork` 眼里 HEAD 的三种处境：游离与基线分支本身一律不算落后，其余分支按
+ * `merge-base(HEAD, svn/base)` 算，**与分支叫什么无关**。
+ */
+function headKind(branch: string): 'detached' | 'baseline' | 'branch' {
+  if (branch === 'HEAD') return 'detached'
+  return branch === BASELINE_BRANCH ? 'baseline' : 'branch'
+}
+
+/**
+ * 对第二档来说两次 HEAD 是不是同一个：同一个提交、处境相同（`headKind`）。
+ *
+ * 只比 hash 不够：同一个提交从普通分支切到 `svn/base`，落后的结论会变。比分支名又太严：从当前提交
+ * `checkout -b` 一条新分支，结论不可能变，却要多跑两次秒级的 `svn status`（独立 review 第 3 条）。
+ */
+export function sameHeadForSync(a: HeadObservation, b: HeadObservation): boolean {
+  return a.hash === b.hash && headKind(a.branch) === headKind(b.branch)
+}
+
+/**
+ * `next` 是不是叠在 `base` 上的一个普通提交：同一条非基线分支、只有一个父提交、就是 `base`。
+ *
+ * 第二档里只有 `behind_fork` 看 HEAD。新提交是一个新对象，不可能是 `svn/base` 的祖先，
+ * `merge-base(next, svn/base)` 与 `merge-base(base, svn/base)` 相同，结论不变，不用再跑那两次秒级的
+ * `svn status`（2026-11-11 提交慢排查 H1）。
+ *
+ * **形状相同不等于是新提交**：快进到 `svn/base` 也是「旧 HEAD 的单父子提交」，merge-base 却变成了新基线。
+ * 所以只能用在本应用刚提交成功、紧接着读到的 HEAD 上（`noteOwnCommit`）：提交期间分支被别人挪走时
+ * `git commit` 会报 `cannot lock ref 'HEAD'` 失败（日志 H1 的 fixture 实测），成功就说明新提交叠在原来的
+ * HEAD 上。amend（父提交不是 `base`）、解决 merge 后的提交（两个父提交）一律不算。
+ */
+export function isPlainCommitOn(base: HeadObservation, next: HeadObservation): boolean {
+  return headKind(next.branch) !== 'baseline'
+    && next.branch === base.branch
+    && next.parents.length === 1
+    && next.parents[0] === base.hash
 }
 
 /**
@@ -480,7 +528,7 @@ export async function recordAfterSuccess<T>(
 }
 
 
-/** 焦点检测的「上次观测值」。`null` = 还没成功校验过。放 ref 的理由同 {@link RootRevMemo}。 */
+/** 焦点检测的「上次观测值」。`null` = 还没成功校验过。放 ref 的理由同 {@link ObservationMemo}。 */
 export interface WcDbStampMemo {
   value: WcDbStamp[] | null
 }

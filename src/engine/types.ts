@@ -12,6 +12,8 @@ export interface RepoInfo {
   head: string
   /** HEAD 的完整 oid，工作区伪行挂在它上面。 */
   headHash: string
+  /** HEAD 的父提交，顺序同 git。根提交为空。 */
+  headParents: string[]
 }
 
 export interface RefPointer {
