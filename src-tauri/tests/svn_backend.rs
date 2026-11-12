@@ -987,6 +987,7 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
                 old_start: 3,
                 lines: 1,
                 verdict: LeakVerdict::Unknown,
+                preview: None,
             }],
         }],
         stale_disk: true,
@@ -1098,11 +1099,13 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
                         old_start: 5,
                         lines: 1,
                         verdict: LeakVerdict::Present,
+                        preview: Some("+log".into()),
                     },
                     HunkLeak {
                         old_start: 0,
                         lines: 0,
                         verdict: LeakVerdict::Unknown,
+                        preview: None,
                     },
                 ],
             }],
@@ -1160,11 +1163,15 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
             "subject": "s",
             "path": "Code/A.cs",
             "hunks": [
-                { "oldStart": 5, "lines": 1, "verdict": "present" },
+                { "oldStart": 5, "lines": 1, "verdict": "present", "preview": "+log" },
+                // 没有预览时不写这个字段；9.4 之前的 journal 也没有它，读回来是 None
                 { "oldStart": 0, "lines": 0, "verdict": "unknown" },
             ],
         })
     );
+    let back: Leak = serde_json::from_value(l.clone()).unwrap();
+    assert_eq!(back.hunks[0].preview.as_deref(), Some("+log"));
+    assert_eq!(back.hunks[1].preview, None);
 }
 
 #[test]

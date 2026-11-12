@@ -25,6 +25,8 @@ export interface HunkLeak {
   oldStart: number
   lines: number
   verdict: LeakVerdict
+  /** 第一行改动（`+…` / `-…`），给人辨认用；整文件判定或内容不是 UTF-8 时没有这个字段。 */
+  preview?: string
 }
 
 /** 后端 `svn_leak::Leak`。 */

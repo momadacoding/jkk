@@ -746,10 +746,85 @@ fn leak_message_en_names_the_same_paths_lines_and_subjects() {
         msg,
         format!(
             "jkk: these files contain Local-Only patches; committing would upload them to the server:\n  \
-             {F}: line 2 onward, from commit \"L: 注释掉 log\"\n\
+             {F}: line 2 onward, from commit \"L: 注释掉 log\"\n    \
+             +line 02 DEBUG_LOCAL_PATCH\n\
              Uncheck these files, or use \"Restore after commit\" to drop these changes before committing."
         )
     );
+}
+
+/// 使用报告 9.4：提示里只有「第 2 行起」，看不出是哪段改动。每个 hunk 下面附第一行改动。
+#[test]
+fn leak_message_shows_the_first_changed_line_under_each_hunk() {
+    let b: String = (1..=20).map(|i| format!("line {i:02}\r\n")).collect();
+    let l = b.replace("line 02\r\n", "line 02 DEBUG_LOCAL_PATCH\r\n");
+    let (r, _) = disk_repo(&b, &l, Some(&l));
+    let msg = leak_message(&local_only_leaks_on_disk(&r.s(), &[abs(&r, F)]).unwrap());
+    let lines: Vec<&str> = msg.lines().collect();
+    assert_eq!(
+        lines[1..3],
+        [
+            format!("  {F}：第 2 行起，来自「L: 注释掉 log」").as_str(),
+            "    +line 02 DEBUG_LOCAL_PATCH",
+        ],
+        "{msg}"
+    );
+}
+
+/// 磁盘判定时每个 hunk 的预览；只有一个 leak。
+fn disk_previews(b: &str, l: &str, disk: &str) -> Vec<Option<String>> {
+    let (r, _) = disk_repo(b, l, Some(disk));
+    let leaks = local_only_leaks_on_disk(&r.s(), &[abs(&r, F)]).unwrap();
+    assert_eq!(leaks.len(), 1, "{leaks:?}");
+    leaks[0].hunks.iter().map(|h| h.preview.clone()).collect()
+}
+
+#[test]
+fn preview_skips_indentation_and_blank_added_lines() {
+    let b = ten();
+    let l = b.replace("l4\n", "l4\n\n    \t---@class Avatar\nmore\n");
+    assert_eq!(
+        disk_previews(&b, &l, &l),
+        vec![Some("+---@class Avatar".to_string())]
+    );
+}
+
+#[test]
+fn preview_of_a_pure_deletion_shows_the_removed_line() {
+    let b = ten();
+    let l = b.replace("l4\nl5\n", "");
+    assert_eq!(disk_previews(&b, &l, &l), vec![Some("-l4".to_string())]);
+}
+
+#[test]
+fn preview_is_cut_at_sixty_characters() {
+    let b = ten();
+    let long = "中".repeat(70);
+    let l = b.replace("l4\n", &format!("{long}\r\n"));
+    let want = format!("+{}…", "中".repeat(60));
+    assert_eq!(disk_previews(&b, &l, &l), vec![Some(want)]);
+}
+
+/// SVN 混合仓库里常有 GBK 源文件。猜不了编码，宁可不给预览，也不发一串替换字符
+/// （它们会让钩子提示在 936 下也装不下、退回英文版）。
+#[test]
+fn preview_of_non_utf8_content_is_omitted() {
+    let b = ten();
+    let mut l = b.clone().into_bytes();
+    l.splice(3..3, [0xB5, 0xF7, 0xCA, 0xD4, b'\n']); // GBK「调试」
+    let (r, _) = disk_repo_bytes(Some(b.as_bytes()), Some(&l), Some(&l));
+    let leaks = local_only_leaks_on_disk(&r.s(), &[abs(&r, F)]).unwrap();
+    assert_eq!(leaks[0].hunks.len(), 1, "{leaks:?}");
+    assert_eq!(leaks[0].hunks[0].preview, None);
+    // 没有预览时消息里不多出空行
+    assert_eq!(leak_message(&leaks).lines().count(), 3);
+}
+
+#[test]
+fn whole_file_verdict_has_no_preview() {
+    let (r, _) = disk_repo_bytes(Some(b"a\0b"), Some(b"a\0c"), Some(b"a\0c"));
+    let leaks = local_only_leaks_on_disk(&r.s(), &[abs(&r, F)]).unwrap();
+    assert_eq!(leaks[0].hunks[0].preview, None, "{leaks:?}");
 }
 
 #[test]

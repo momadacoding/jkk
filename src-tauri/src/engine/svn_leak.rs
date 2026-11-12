@@ -59,12 +59,42 @@ pub struct Leak {
 ///
 /// 整文件的判定（二进制、L 删了文件且 NEW 也删了）没有行号可给，记为 `old_start = 0`、
 /// `lines = 0`，与「从空文件新增」的 hunk 头 `@@ -0,0` 同形。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HunkLeak {
     pub old_start: u32,
     pub lines: u32,
     pub verdict: LeakVerdict,
+    /// 这个 hunk 的第一行改动，给人辨认用（使用报告 9.4）：L 的第一条非空 `+` 行前面加 `+`；
+    /// 纯删除时是 B 里被删的第一条非空行前面加 `-`。去掉行首缩进，超过
+    /// [`PREVIEW_CHARS`] 个字符截断加 `…`。整文件判定、内容不是 UTF-8 时没有。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+}
+
+/// [`HunkLeak::preview`] 最多保留的字符数（不含前缀与 `…`）。
+pub const PREVIEW_CHARS: usize = 60;
+
+/// 一组行里第一条非空行的预览；见 [`HunkLeak::preview`]。
+fn preview_of(sign: char, lines: &[&[u8]]) -> Option<String> {
+    let mut texts = Vec::with_capacity(lines.len());
+    for l in lines {
+        // 有一行不是 UTF-8 就整段不给：同一个 hunk 里编码混用的可能很小，而按字节截出来的
+        // 半个 GBK 字比没有预览更误导
+        texts.push(std::str::from_utf8(l).ok()?);
+    }
+    let text = texts
+        .iter()
+        .map(|t| t.trim())
+        .find(|t| !t.is_empty())
+        .unwrap_or("");
+    let mut out = String::with_capacity(text.len() + 4);
+    out.push(sign);
+    out.extend(text.chars().take(PREVIEW_CHARS));
+    if text.chars().nth(PREVIEW_CHARS).is_some() {
+        out.push('…');
+    }
+    Some(out)
 }
 
 /// Absent（没泄漏）不输出。
@@ -237,10 +267,20 @@ pub fn leak_message(leaks: &[Leak]) -> String {
                 "  {}：{at}{maybe}，来自「{}」\n",
                 leak.path, leak.subject
             ));
+            push_preview(&mut s, h);
         }
     }
     s.push_str("取消勾选这些文件，或用「提交后恢复」删掉这些改动再提交。");
     s
+}
+
+/// 拦截说明里 hunk 那一行下面的预览行（两种语言共用）。
+fn push_preview(s: &mut String, h: &HunkLeak) {
+    if let Some(p) = &h.preview {
+        s.push_str("    ");
+        s.push_str(p);
+        s.push('\n');
+    }
 }
 
 /// [`leak_message`] 的英文版，逐条对应。钩子的线程代码页装不下中文时发它（2026-11-11 使用
@@ -265,6 +305,7 @@ pub fn leak_message_en(leaks: &[Leak]) -> String {
                 "  {}: {at}{maybe}, from commit \"{}\"\n",
                 leak.path, leak.subject
             ));
+            push_preview(&mut s, h);
         }
     }
     s.push_str(
@@ -306,6 +347,7 @@ fn whole_file(verdict: LeakVerdict) -> Vec<HunkLeak> {
         old_start: 0,
         lines: 0,
         verdict,
+        preview: None,
     }]
 }
 
@@ -374,6 +416,7 @@ fn judge_sides(b: Side, l: Side, n: Side) -> Result<Vec<HunkLeak>> {
     };
     let l_hunks = spans(&b_bytes, &l_bytes)?;
     let n_hunks = spans(&b_bytes, &n_bytes)?;
+    let b_lines: Vec<&[u8]> = b_bytes.split_inclusive(|c| *c == b'\n').collect();
     let l_lines: Vec<&[u8]> = l_bytes.split_inclusive(|c| *c == b'\n').collect();
     let n_lines: Vec<&[u8]> = n_bytes.split_inclusive(|c| *c == b'\n').collect();
     let mut out = Vec::new();
@@ -385,10 +428,18 @@ fn judge_sides(b: Side, l: Side, n: Side) -> Result<Vec<HunkLeak>> {
             slice(&l_lines, h.new_start as i64, h.nc as usize).unwrap_or(&[])
         };
         if let Some(verdict) = judge_hunk(h, &n_hunks, &n_lines, plus) {
+            let preview = if plus.is_empty() {
+                // 纯删除：B 里从 start 起的 oc 行
+                slice(&b_lines, i64::from(h.start), h.oc as usize)
+                    .and_then(|minus| preview_of('-', minus))
+            } else {
+                preview_of('+', plus)
+            };
             out.push(HunkLeak {
                 old_start: h.old_start,
                 lines: h.oc,
                 verdict,
+                preview,
             });
         }
     }
