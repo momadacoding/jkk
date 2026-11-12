@@ -436,3 +436,140 @@ fn publish_baseline_without(fx: &SvnFixture, path: &str, rev: u64) {
     let oid = create_baseline_commit_with(&repo, &tree, Some(old), &map, &[], None).unwrap();
     run_git(&repo, &["update-ref", "refs/heads/svn/base", &oid, old]).unwrap();
 }
+
+// ── 2026-11-11 使用报告第 3 节：update 之后、跟进之前的误报 ─────────────────────
+//
+// 同事在 SVN 上删了文件，我 update 了、还没跟进：floor 还是旧的，那个版本的服务器清单里
+// 有这些文件，磁盘上已经没有，墓碑要到跟进录制时才记。不剔掉就被报成「服务器上有代码文件
+// 不在本地」。但被 `--set-depth=exclude` 掉的文件在失同步判定里也是「消失」（见
+// `local_checks_cannot_tell_a_depth_excluded_subtree_from_a_deletion`），只按判定的 removed
+// 剔会把真正的漏收一起藏掉，所以被排除的节点下面的一律照报。
+
+/// 同事直接在服务器上删掉 `rel`（不经过我的工作副本），我再 update。
+fn colleague_removes_then_update(fx: &SvnFixture, rel: &str) {
+    let url = format!("{}/{rel}", file_url(&fx.repo()));
+    svn_cmd(
+        &fx.wc(),
+        &["rm", "-m", "colleague rm", "--non-interactive", "--", &url],
+    );
+    svn_cmd(&fx.wc(), &["update", "--non-interactive"]);
+    assert!(!fx.wc().join(rel).exists(), "前提：update 把 {rel} 删掉了");
+}
+
+fn exclude(fx: &SvnFixture, rel: &str) {
+    let target = format!("{rel}@");
+    svn_cmd(
+        &fx.wc(),
+        &[
+            "update",
+            "--set-depth=exclude",
+            "--non-interactive",
+            "--",
+            &target,
+        ],
+    );
+}
+
+#[test]
+fn a_file_removed_by_update_before_follow_is_not_reported_as_missing() {
+    let fx = svn_repo_for_health();
+    init(&fx);
+    colleague_removes_then_update(&fx, "Code/A.cs");
+
+    let got = svn_server_set::audit_server_set_at_baseline(&fx.wc_str()).unwrap();
+    assert_eq!(got, ServerAudit::Matched, "同事删的文件不是漏收");
+}
+
+#[test]
+fn an_exclude_in_the_same_window_is_still_reported() {
+    let fx = svn_repo_for_health();
+    init(&fx);
+    colleague_removes_then_update(&fx, "Code/A.cs");
+    exclude(&fx, "Code/Deep");
+
+    match svn_server_set::audit_server_set_at_baseline(&fx.wc_str()).unwrap() {
+        ServerAudit::Missing { files, total } => {
+            assert_eq!(files, vec!["Code/Deep/D.cs".to_string()]);
+            assert_eq!(total, 1);
+        }
+        other => panic!("被排除的目录必须照报，实际 {other:?}"),
+    }
+}
+
+#[test]
+fn a_removed_file_under_an_excluded_node_is_still_reported() {
+    // 同事删了 D.cs，我 update 之后又把 Code/Deep 排除掉：本地分不清 D.cs 是哪种「消失」，
+    // 宁可照报，跟进录制时向服务器确认后自然消失
+    let fx = svn_repo_for_health();
+    init(&fx);
+    colleague_removes_then_update(&fx, "Code/Deep/D.cs");
+    exclude(&fx, "Code/Deep");
+
+    match svn_server_set::audit_server_set_at_baseline(&fx.wc_str()).unwrap() {
+        ServerAudit::Missing { files, .. } => {
+            assert_eq!(files, vec!["Code/Deep/D.cs".to_string()])
+        }
+        other => panic!("排除节点下面的不剔，实际 {other:?}"),
+    }
+}
+
+#[test]
+fn a_file_removed_by_update_stays_matched_after_follow() {
+    let fx = svn_fixtures::hybrid_with_colleague();
+    let wc2 = fx.wc2();
+    svn_cmd(&wc2, &["update", "--non-interactive"]);
+    svn_cmd(&wc2, &["rm", "--non-interactive", "--", "Code/B.cs@"]);
+    svn_cmd(&wc2, &["commit", "-m", "rm B", "--non-interactive"]);
+    svn_cmd(&fx.wc(), &["update", "--non-interactive"]);
+    assert!(!fx.wc().join("Code/B.cs").exists());
+
+    let repo = fx.wc_str();
+    assert_eq!(
+        svn_server_set::audit_server_set_at_baseline(&repo).unwrap(),
+        ServerAudit::Matched,
+        "跟进之前"
+    );
+    let out = app_lib::engine::svn_follow::follow(&repo, "op-audit").unwrap();
+    assert!(
+        matches!(out, app_lib::engine::svn_follow::FollowOutcome::Done { .. }),
+        "{out:?}"
+    );
+    assert_eq!(
+        svn_server_set::audit_server_set_at_baseline(&repo).unwrap(),
+        ServerAudit::Matched,
+        "跟进之后：墓碑接手"
+    );
+}
+
+/// 独立 review M2：`--set-depth=files / immediates` 把子目录裁掉时不留 exclude 节点，
+/// 被裁掉的文件同样是「消失」，不能被当成 update 删掉的剔除。
+fn assert_depth_reduced_is_reported(depth: &str) {
+    let fx = svn_repo_for_health();
+    init(&fx);
+    let arg = format!("--set-depth={depth}");
+    svn_cmd(
+        &fx.wc(),
+        &["update", &arg, "--non-interactive", "--", "Code@"],
+    );
+    assert!(
+        !fx.wc().join("Code/Deep/D.cs").exists(),
+        "前提：{depth} 把 D.cs 从磁盘上拿掉了"
+    );
+
+    match svn_server_set::audit_server_set_at_baseline(&fx.wc_str()).unwrap() {
+        ServerAudit::Missing { files, .. } => {
+            assert_eq!(files, vec!["Code/Deep/D.cs".to_string()], "{depth}")
+        }
+        other => panic!("{depth} 裁掉的文件必须照报，实际 {other:?}"),
+    }
+}
+
+#[test]
+fn a_directory_reduced_to_depth_files_is_still_reported() {
+    assert_depth_reduced_is_reported("files");
+}
+
+#[test]
+fn a_directory_reduced_to_depth_immediates_is_still_reported() {
+    assert_depth_reduced_is_reported("immediates");
+}

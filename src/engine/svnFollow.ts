@@ -43,8 +43,22 @@ export type StageDecision = 'takeNew' | 'keepStaged' | 'lostToNew' | { merged: s
 export interface ComposeReport {
   decisions: Record<string, StageDecision>
   uncertain: string[]
+  /** 暂存没能保留，而且其中有改动不在 SVN 新版本里。 */
   lost: string[]
   discarded: string[]
+  /** 暂存没能保留，但它的每处改动 SVN 新版本里都有了（方案 C）。旧后端没有。 */
+  superseded?: string[]
+  /** `lost` 里一部分改动已在 SVN 上的：路径 → 计数。旧后端没有。 */
+  partial?: Record<string, { present: number; total: number }>
+}
+
+/** 后端 `svn_follow::OverlapFile`：分支上的提交改过、SVN 侧也有新内容的文件（分析 §6.12 条件 11）。 */
+export interface OverlapFile {
+  path: string
+  /** 改过它、重放后仍保留的提交：`短 hash 提交说明`。 */
+  commits: string[]
+  /** 重放出来的分支版本与磁盘逐字节相同。 */
+  matchesDisk: boolean
 }
 
 /** 后端 `svn_follow::FollowReport`。 */
@@ -61,6 +75,8 @@ export interface FollowReport {
   snapshot: [string, string[]][]
   /** 重放后与磁盘对不上的文件：多半是重放干净却合错了（PR 119 遗留）。 */
   drift: string[]
+  /** 条件 11 的重叠文件，逐个标出是否与磁盘一致。旧后端没有。 */
+  overlap?: OverlapFile[]
   stage: ComposeReport
   movedBranches: string[]
   behindBranches: [string, string][]
@@ -193,6 +209,8 @@ export interface FollowReportSection {
     | 'unverified'
     | 'leaks'
     | 'lost'
+    | 'lostPartial'
+    | 'superseded'
     | 'uncertain'
     | 'discarded'
     | 'merged'
@@ -201,6 +219,8 @@ export interface FollowReportSection {
     | 'rewritten'
     | 'snapshot'
     | 'drift'
+    | 'overlapDiffers'
+    | 'overlapMatches'
     | 'moved'
     | 'behind'
   title: string
@@ -326,6 +346,21 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
   // 旧后端没有这两个字段
   const snapshot = r.snapshot ?? []
   const drift = r.drift ?? []
+  const overlap = r.overlap ?? []
+  const overlapItem = (o: OverlapFile): ReportItem => ({ text: o.path, meta: o.commits.join('、') })
+  // drift 里的已经在「分支与磁盘对不上」那一节，不重复列
+  const differs = overlap.filter((o) => !o.matchesDisk && !drift.includes(o.path))
+  const matches = overlap.filter((o) => o.matchesDisk)
+  const partial = r.stage.partial ?? {}
+  // 不用 `in`：根目录下叫 `constructor` 的文件会命中原型链，真丢的暂存被降一级（独立 review L1）
+  const hasPartial = (p: string) => Object.prototype.hasOwnProperty.call(partial, p)
+  const lostAll = r.stage.lost.filter((p) => !hasPartial(p))
+  const lostPart = r.stage.lost
+    .filter(hasPartial)
+    .map((p) => ({
+      text: p,
+      meta: `${partial[p].total} 处改动里 ${partial[p].present} 处已在 SVN 上`,
+    }))
   const { sure, unsure } = leakTiers(r.leaks)
   // 顺序就是展示顺序：先 danger，再 attention，最后 info；info 里与这次跟进最相关的在前
   const candidates: Omit<FollowReportSection, 'count'>[] = [
@@ -356,7 +391,16 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
       title: '丢失的暂存',
       level: 'danger',
       note: `这些暂存内容没能保留，已取 SVN 的版本。${pinned}`,
-      groups: [{ label: '', items: plain(r.stage.lost) }],
+      groups: [{ label: '', items: plain(lostAll) }],
+    },
+    {
+      id: 'lostPartial',
+      title: '部分已在 SVN 上的暂存',
+      level: 'attention',
+      note:
+        '这些暂存和 SVN 的新内容合不到一起，已取 SVN 的版本；暂存里有一部分改动 SVN 上已经有了，' +
+        `其余的请对照原内容确认还要不要。${pinned}`,
+      groups: [{ label: '', items: lostPart }],
     },
     {
       id: 'uncertain',
@@ -371,6 +415,16 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
       level: 'attention',
       note: `${SNAPSHOT_NOTE}重放时直接采用了新基线的版本。`,
       groups: snapshot.map(([c, paths]) => ({ label: commitLabel(c), items: plain(paths) })),
+    },
+    {
+      id: 'overlapDiffers',
+      title: '提交与 SVN 都改过、和磁盘不一致的文件',
+      level: 'attention',
+      note:
+        '分支上的提交改过这些文件，SVN 侧也有新内容，重放出来的分支版本和磁盘不一致，' +
+        '「本地改动」里显示的就是两者的差别。那是你还没提交的改动就不用管；' +
+        '如果出现了不是你做的改动（比如把同事的改动改回去），说明重放合错了，请以磁盘为准提交进分支。',
+      groups: [{ label: '', items: differs.map(overlapItem) }],
     },
     {
       id: 'behind',
@@ -390,11 +444,25 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
       groups: [{ label: '', items: plain(r.movedBranches) }],
     },
     {
+      id: 'overlapMatches',
+      title: '提交与 SVN 都改过、和磁盘一致的文件',
+      level: 'info',
+      note: '分支上的提交改过这些文件，SVN 侧也有新内容；重放出来的分支版本与磁盘逐字节相同，不用处理。',
+      groups: [{ label: '', items: matches.map(overlapItem) }],
+    },
+    {
       id: 'merged',
       title: '合并的暂存',
       level: 'info',
       note: '这些暂存和 SVN 的新内容做了三方合并，结果留在暂存区。',
       groups: [{ label: '', items: plain(merged) }],
+    },
+    {
+      id: 'superseded',
+      title: '已被 SVN 取代的暂存',
+      level: 'info',
+      note: `这些暂存的改动 SVN 的新版本里都已经有了，暂存区取了 SVN 的版本，没有丢内容。${pinned}`,
+      groups: [{ label: '', items: plain(r.stage.superseded ?? []) }],
     },
     {
       id: 'discarded',

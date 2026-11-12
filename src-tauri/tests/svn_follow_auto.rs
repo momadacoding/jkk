@@ -480,55 +480,200 @@ fn condition_8_a_local_only_leak_is_not_followed_silently() {
     assert_eq!(rep.leaks.len(), 1, "按钮照常完成，报告里列出泄漏");
 }
 
-#[test]
-fn condition_11_a_branch_commit_on_a_file_svn_also_changed_is_not_followed() {
-    // 我在分支上改了 B 第 1 行，同事改了 B 第 8 行、我局部 update 了 B：重放干净，但碰到同一个文件
-    let fx = hybrid_with_colleague();
-    set_me(&fx, "me");
-    let lines = "1\n2\n3\n4\n5\n6\n7\n8\n";
-    write(&fx, B, lines);
-    tortoise_commit(&fx, B);
+/// 我在分支上改了 B 第 1 行（commit「我的改动」），同事改了 B 第 8 行、我局部 update 了 B：重放干净，
+/// 碰到同一个文件。另有一个只改 W 的 commit 排在前面（钉住 `git log -z` 多个 commit 首尾相接时的
+/// 解析）。`eol` 是文件里的换行符。
+fn overlap_scene(fx: &SvnFixture, eol: &str) {
+    let text = |lines: &[&str]| {
+        lines
+            .iter()
+            .map(|l| format!("{l}{eol}"))
+            .collect::<String>()
+    };
+    set_me(fx, "me");
+    write(fx, B, &text(&["1", "2", "3", "4", "5", "6", "7", "8"]));
+    tortoise_commit(fx, B);
     manual_done(follow(&fx.wc_str(), "seed").unwrap());
 
-    fx.colleague_commits(B, "1\n2\n3\n4\n5\n6\n7\ncolleague\n");
-    let r = youngest(&fx);
-    set_author(&fx, r, "colleague");
-    // 两个保留下来的 commit：只有第二个碰到 B（钉住 `git log -z` 多个 commit 首尾相接时的解析）
-    write(&fx, "Code/W.cs", "w\n");
-    commit_all(&fx, "只改 W");
-    write(&fx, B, "mine\n2\n3\n4\n5\n6\n7\n8\n");
-    commit_all(&fx, "我的改动");
-    svn_update(&fx, B);
-    assert_eq!(read(&fx, B), "mine\n2\n3\n4\n5\n6\n7\ncolleague\n");
-
-    let message = assert_skipped_untouched(&fx, "svn_auto_follow_overlap");
-
-    assert!(message.contains(B), "{message}");
-    assert!(
-        !message.contains("W.cs"),
-        "只改 W 的 commit 不算：{message}"
+    fx.colleague_commits(B, &text(&["1", "2", "3", "4", "5", "6", "7", "colleague"]));
+    let r = youngest(fx);
+    set_author(fx, r, "colleague");
+    write(fx, "Code/W.cs", &text(&["w"]));
+    commit_all(fx, "只改 W");
+    write(fx, B, &text(&["mine", "2", "3", "4", "5", "6", "7", "8"]));
+    commit_all(fx, "我的改动");
+    svn_update(fx, B);
+    assert_eq!(
+        read(fx, B),
+        text(&["mine", "2", "3", "4", "5", "6", "7", "colleague"])
     );
-    manual_done(follow(&fx.wc_str(), "manual").unwrap());
+}
+
+fn overlap_of(rep: &FollowReport) -> Vec<(String, bool)> {
+    rep.overlap
+        .iter()
+        .map(|o| (o.path.clone(), o.matches_disk))
+        .collect()
+}
+
+#[test]
+fn condition_11_an_overlap_whose_replay_equals_the_disk_is_followed() {
+    // 2026-11-11 使用报告第 2 节（方案 B）：重放结果与磁盘（svn update 合出来的）逐字节相同时，
+    // 「本地改动」里不会出现 W14 那种反向改动，不必拦
+    let fx = hybrid_with_colleague();
+    overlap_scene(&fx, "\n");
+
+    let rep = done(auto(&fx));
+
     assert_eq!(
         show(&fx, "HEAD:Code/B.cs"),
         "mine\n2\n3\n4\n5\n6\n7\ncolleague"
     );
+    assert!(modified_paths(&fx).is_empty(), "{:?}", modified_paths(&fx));
+    assert_eq!(
+        overlap_of(&rep),
+        vec![(B.to_string(), true)],
+        "报告逐个标出"
+    );
+    let commits = &rep.overlap[0].commits;
+    assert_eq!(commits.len(), 1, "只改 W 的 commit 不算：{commits:?}");
+    assert!(
+        commits[0].ends_with(" 我的改动"),
+        "短 hash + 提交说明：{commits:?}"
+    );
+}
+
+#[test]
+fn condition_11_an_overlap_with_uncommitted_edits_is_not_followed() {
+    // 重叠文件里还有没提交的改动：磁盘本来就和 tip 不同，分不清是用户的改动还是合错，交给人看
+    let fx = hybrid_with_colleague();
+    overlap_scene(&fx, "\n");
+    write(&fx, B, "mine\n2\n3\n4\n5\n6\n7\ncolleague\nuncommitted\n");
+
+    let message = assert_skipped_untouched(&fx, "svn_auto_follow_overlap");
+
+    assert!(message.contains(B), "{message}");
+    assert!(message.contains("我的改动"), "写出是哪个提交：{message}");
+    assert!(
+        !message.contains("W.cs"),
+        "只改 W 的 commit 不算：{message}"
+    );
+    assert!(
+        !message.contains("对照报告检查"),
+        "不再要用户做报告支持不了的核对：{message}"
+    );
+    let rep = manual_done(follow(&fx.wc_str(), "manual").unwrap());
+    assert_eq!(
+        show(&fx, "HEAD:Code/B.cs"),
+        "mine\n2\n3\n4\n5\n6\n7\ncolleague"
+    );
+    assert_eq!(overlap_of(&rep), vec![(B.to_string(), false)]);
+}
+
+#[test]
+fn condition_11_a_clean_but_wrong_replay_is_not_followed() {
+    // W14：重放没冲突，结果却与磁盘不同。用「把两边拼起来、退出 0」的 merge driver 代替真实现场里
+    // diff3 的错误对齐（同 svn_follow_snapshot.rs 的 a_clean_but_wrong_replay_is_reported_as_drift）
+    let fx = hybrid_with_colleague();
+    overlap_scene(&fx, "\n");
+    let attrs = fx.wc().join(".git/info/attributes");
+    let mut rules = std::fs::read_to_string(&attrs).unwrap_or_default();
+    rules.push_str("\nCode/B.cs merge=concat\n");
+    std::fs::write(&attrs, rules).unwrap();
+    git(&fx, &["config", "merge.concat.driver", "cat %B >> %A"]);
+
+    let message = assert_skipped_untouched(&fx, "svn_auto_follow_overlap");
+
+    assert!(message.contains(B), "{message}");
+    let rep = manual_done(follow(&fx.wc_str(), "manual").unwrap());
+    assert_ne!(
+        show(&fx, "HEAD:Code/B.cs"),
+        "mine\n2\n3\n4\n5\n6\n7\ncolleague",
+        "前提：merge driver 合出了别的东西"
+    );
+    assert_eq!(overlap_of(&rep), vec![(B.to_string(), false)]);
+}
+
+#[test]
+fn condition_11_an_overlap_equal_after_eol_conversion_is_followed() {
+    // 磁盘是 CRLF、blob 是 LF：磁盘内容按 `git add` 的过滤规则算（hash-object --stdin-paths）
+    let fx = hybrid_with_colleague();
+    git(&fx, &["config", "core.autocrlf", "true"]);
+    overlap_scene(&fx, "\r\n");
+
+    let rep = done(auto(&fx));
+
+    assert_eq!(overlap_of(&rep), vec![(B.to_string(), true)]);
+    assert!(modified_paths(&fx).is_empty(), "{:?}", modified_paths(&fx));
 }
 
 /// 我暂存了 A 第 1 行（`mine`），同事改了 A 第 8 行（`colleague_line`），我局部 update 了 A。
 fn staged_against_colleague(fx: &SvnFixture, mine: &str, colleague_line: &str) {
+    staged_scene(
+        fx,
+        &format!("{mine}2\n3\n4\n5\n6\n7\n8\n"),
+        &format!("{colleague_line}2\n3\n4\n5\n6\n7\ncolleague\n"),
+    );
+}
+
+/// OLD 里 A 是 `1..8`。我把 A 暂存成 `staged`（磁盘上撤回 OLD），同事把 A 提交成 `colleague`，
+/// 我局部 update 了 A。
+fn staged_scene(fx: &SvnFixture, staged: &str, colleague: &str) {
     i_commit(fx);
     write(fx, A, "1\n2\n3\n4\n5\n6\n7\n8\n");
     tortoise_commit(fx, A);
     manual_done(follow(&fx.wc_str(), "seed").unwrap());
 
-    fx.colleague_commits(A, &format!("{colleague_line}2\n3\n4\n5\n6\n7\ncolleague\n"));
+    fx.colleague_commits(A, colleague);
     let r = youngest(fx);
     set_author(fx, r, "colleague");
-    write(fx, A, &format!("{mine}2\n3\n4\n5\n6\n7\n8\n"));
+    write(fx, A, staged);
     git(fx, &["add", A]);
     write(fx, A, "1\n2\n3\n4\n5\n6\n7\n8\n");
     svn_update(fx, A);
+}
+
+#[test]
+fn condition_12_a_stage_already_in_svn_is_followed_and_reported_superseded() {
+    // 2026-11-11 使用报告第 4 节（方案 C）：暂存只改了第 1 行，同事在同一片区域改得更多（第 1、2
+    // 行），三方合并冲突；但暂存的改动 SVN 新版本里已经有了，没有丢任何内容
+    let fx = hybrid_with_colleague();
+    staged_scene(
+        &fx,
+        "mine\n2\n3\n4\n5\n6\n7\n8\n",
+        "mine\nchanged2\n3\n4\n5\n6\n7\ncolleague\n",
+    );
+
+    let rep = done(auto(&fx));
+
+    assert!(rep.stage.lost.is_empty(), "{:?}", rep.stage.lost);
+    assert_eq!(rep.stage.superseded, vec![A.to_string()]);
+    assert_eq!(
+        show(&fx, ":Code/A.cs"),
+        "mine\nchanged2\n3\n4\n5\n6\n7\ncolleague"
+    );
+    let pinned = rep.pinned_ref.expect("原内容照旧钉住");
+    assert!(!git(&fx, &["ls-tree", "-r", &pinned]).is_empty());
+}
+
+#[test]
+fn condition_12_a_partly_superseded_stage_is_left_to_the_button() {
+    // 暂存改了第 1、5 行；SVN 上只有第 1 行那处：两处里一处已在
+    let fx = hybrid_with_colleague();
+    staged_scene(
+        &fx,
+        "mine\n2\n3\n4\nmine5\n6\n7\n8\n",
+        "mine\nchanged2\n3\n4\n5\n6\n7\ncolleague\n",
+    );
+
+    let message = assert_skipped_untouched(&fx, "svn_auto_follow_stage");
+
+    assert!(message.contains(A), "{message}");
+    let rep = manual_done(follow(&fx.wc_str(), "manual").unwrap());
+    assert_eq!(rep.stage.lost, vec![A.to_string()]);
+    let t = rep.stage.partial.get(A).expect("给出计数");
+    assert_eq!((t.present, t.total), (1, 2));
+    assert!(rep.stage.superseded.is_empty());
 }
 
 #[test]
@@ -568,6 +713,12 @@ fn condition_12_a_stage_that_cannot_be_kept_is_left_to_the_button() {
         vec![A.to_string()],
         "按钮照原规则处理，报告里写明"
     );
+    assert!(
+        rep.stage.partial.is_empty(),
+        "一处都不在 SVN 上：{:?}",
+        rep.stage.partial
+    );
+    assert!(rep.stage.superseded.is_empty());
 }
 
 #[test]

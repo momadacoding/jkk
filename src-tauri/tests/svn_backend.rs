@@ -968,9 +968,11 @@ fn externally_advanced_serializes_camel_case() {
 fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     // 计划 Task 10。三层嵌套（Outcome → Report → Leak / ComposeReport），每一层都要是 camelCase；
     // 只测 Refused 的话，变体字段与结构体字段的 serde 属性写错都测不到
-    use app_lib::engine::svn_follow::{ConflictDetail, Evidence, FollowOutcome, FollowReport};
+    use app_lib::engine::svn_follow::{
+        ConflictDetail, Evidence, FollowOutcome, FollowReport, OverlapFile,
+    };
     use app_lib::engine::svn_follow_index::{ComposeReport, StageDecision};
-    use app_lib::engine::svn_leak::{HunkLeak, Leak, LeakVerdict};
+    use app_lib::engine::svn_leak::{HunkLeak, Leak, LeakVerdict, StageTally};
     use app_lib::engine::svn_sync::ExternalChange;
     use std::collections::BTreeMap;
 
@@ -1077,11 +1079,26 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
             rewritten: vec![("c2".into(), vec!["Code/A.cs".into()])],
             snapshot: vec![("c3".into(), vec!["Code/B.cs".into()])],
             drift: vec!["Code/E.cs".into()],
+            overlap: vec![OverlapFile {
+                path: "Code/F.cs".into(),
+                commits: vec!["e381033 add".into()],
+                matches_disk: true,
+            }],
             stage: ComposeReport {
                 decisions,
                 uncertain: vec!["Code/B.cs".into()],
                 lost: vec!["Code/D.cs".into()],
                 discarded: vec!["Code/A.cs".into()],
+                superseded: vec!["Code/G.cs".into()],
+                partial: [(
+                    "Code/D.cs".to_string(),
+                    StageTally {
+                        present: 1,
+                        total: 2,
+                    },
+                )]
+                .into_iter()
+                .collect(),
             },
             moved_branches: vec!["feature".into()],
             behind_branches: vec![("old".into(), "冲突".into())],
@@ -1119,6 +1136,10 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     assert_eq!(r["rewritten"][0], serde_json::json!(["c2", ["Code/A.cs"]]));
     assert_eq!(r["snapshot"][0], serde_json::json!(["c3", ["Code/B.cs"]]));
     assert_eq!(r["drift"][0], "Code/E.cs");
+    assert_eq!(
+        r["overlap"][0],
+        serde_json::json!({ "path": "Code/F.cs", "commits": ["e381033 add"], "matchesDisk": true })
+    );
     assert_eq!(r["movedBranches"][0], "feature");
     assert_eq!(r["behindBranches"][0], serde_json::json!(["old", "冲突"]));
     assert_eq!(r["pinnedRef"], "refs/mygitclient/follow/x", "实际 {v}");
@@ -1131,12 +1152,14 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     // 6.10 之前的 journal 也没有 snapshot / drift
     old.as_object_mut().unwrap().remove("snapshot");
     old.as_object_mut().unwrap().remove("drift");
+    // 方案 B 之前的 journal 没有 overlap
+    old.as_object_mut().unwrap().remove("overlap");
     let back: FollowReport = serde_json::from_value(old).unwrap();
     assert_eq!(
         (back.evidence, back.evidence_cutoff_ms),
         (Evidence::Heuristic, None)
     );
-    assert!(back.snapshot.is_empty() && back.drift.is_empty());
+    assert!(back.snapshot.is_empty() && back.drift.is_empty() && back.overlap.is_empty());
 
     let s = &r["stage"];
     assert_eq!(s["decisions"]["Code/A.cs"], "takeNew", "实际 {v}");
@@ -1150,6 +1173,17 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     assert_eq!(s["uncertain"][0], "Code/B.cs");
     assert_eq!(s["lost"][0], "Code/D.cs");
     assert_eq!(s["discarded"][0], "Code/A.cs");
+    assert_eq!(s["superseded"][0], "Code/G.cs");
+    assert_eq!(
+        s["partial"]["Code/D.cs"],
+        serde_json::json!({ "present": 1, "total": 2 })
+    );
+    // 方案 C 之前的 journal 没有这两个字段
+    let mut old_stage = s.clone();
+    old_stage.as_object_mut().unwrap().remove("superseded");
+    old_stage.as_object_mut().unwrap().remove("partial");
+    let back: ComposeReport = serde_json::from_value(old_stage).unwrap();
+    assert!(back.superseded.is_empty() && back.partial.is_empty());
 
     let l = &r["leaks"][0];
     assert_eq!(

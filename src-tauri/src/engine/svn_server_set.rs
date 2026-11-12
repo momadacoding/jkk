@@ -29,8 +29,8 @@ use crate::engine::svn_dirty::{classify, read_dirty, Fix};
 use crate::engine::svn_include_check::{normalize_roots, server_expected_set};
 use crate::engine::svn_preflight::check_targets;
 use crate::engine::svn_scope::WScope;
-use crate::engine::svn_wc::{enumerate_wcs, WcIdentity};
-use crate::engine::svn_xml::parse_lists;
+use crate::engine::svn_wc::{enumerate_wcs, peg_safe, WcIdentity};
+use crate::engine::svn_xml::{parse_lists, parse_trimmed_nodes};
 use crate::error::Result;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -98,11 +98,76 @@ pub enum ServerAudit {
 /// 调用方是「打开仓库」那条热路径，没有基线是一个正常状态。
 pub fn audit_server_set_at_baseline(repo_root: &str) -> Result<ServerAudit> {
     match crate::engine::svn_sync::read_baseline_map(repo_root) {
-        Ok(map) => audit_server_set_map(repo_root, &map),
+        Ok(map) => {
+            let gone: BTreeSet<String> = map.gone.keys().cloned().collect();
+            audit_inner(
+                repo_root,
+                map.floor,
+                &gone,
+                &removed_since_baseline(repo_root),
+            )
+        }
         Err(e) => Ok(ServerAudit::NotChecked {
             reason: format!("读不到基线 revision，没法核对服务器内容：{}", e.message),
         }),
     }
+}
+
+/// 失同步判定里「工作副本里已没有」的基线文件（2026-11-11 使用报告第 3 节）。
+///
+/// update 删掉同事在 SVN 上删的文件之后、点「跟进」之前，floor 还是旧的，那个版本的服务器
+/// 清单里有它们，墓碑要到跟进录制时才记，于是被报成漏收。这一批交给跟进录制去向服务器确认
+/// （不存在记墓碑、仍存在判 `Excluded`、确认不了拒绝录制），这里先不报。
+///
+/// 被 `--set-depth=exclude` 掉、或被 `--set-depth=empty / files / immediates` 裁掉的文件在判定里
+/// 也是「消失」（E17；独立 review M2），候选里一定混着它们，剔除前必须再减掉这些子树下面的
+/// （见 [`trimmed_roots`]、[`audit_inner`]）。判定读不出来时不剔，与改动前相同。
+fn removed_since_baseline(repo_root: &str) -> BTreeSet<String> {
+    match crate::engine::svn_sync::check_sync(repo_root) {
+        Ok(st) => match st.verdict {
+            crate::engine::svn_sync::SyncVerdict::ExternallyAdvanced { removed, .. } => {
+                removed.into_iter().collect()
+            }
+            _ => BTreeSet::new(),
+        },
+        Err(e) => {
+            log::warn!(
+                "读不出失同步判定，服务器侧核对不剔除已消失的文件：{}",
+                e.message
+            );
+            BTreeSet::new()
+        }
+    }
+}
+
+/// 本地被裁掉的子树的根（仓库相对）：exclude 掉的节点与 depth 不是 infinity 的目录。每个单元
+/// `svn info -R --xml` 一次，所有单元一条命令（同 `svn_health::excluded_nodes`），纯本地读。
+fn trimmed_roots(repo_root: &str, units: &[WcIdentity]) -> Result<BTreeSet<String>> {
+    let args: Vec<String> = units.iter().map(|u| peg_safe(&u.wc_root)).collect();
+    let mut out = BTreeSet::new();
+    for xml in run_svn_targets(repo_root, &["info", "-R", "--xml", "--"], &args)? {
+        out.extend(parse_trimmed_nodes(&xml)?);
+    }
+    Ok(out)
+}
+
+/// `pending` 里不在任何被裁掉的子树（`trimmed`，仓库相对）之下的。按不区分大小写比：Windows
+/// 上两边的大小写可能不一致，比宽了只是多报，比窄了会藏掉真正的漏收。
+fn outside_excluded(pending: &BTreeSet<String>, trimmed: &BTreeSet<String>) -> BTreeSet<String> {
+    let ex: Vec<String> = trimmed
+        .iter()
+        .map(|p| p.trim_end_matches('/').to_lowercase())
+        .collect();
+    pending
+        .iter()
+        .filter(|f| {
+            let f = f.to_lowercase();
+            !ex.iter().any(|p| {
+                f == *p || (f.starts_with(p.as_str()) && f.as_bytes().get(p.len()) == Some(&b'/'))
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 /// 按映射核对（计划 Task 4）：列 floor 上的服务器清单，墓碑路径不算缺失。
@@ -115,7 +180,7 @@ pub fn audit_server_set_at_baseline(repo_root: &str) -> Result<ServerAudit> {
 ///   「服务器上有代码文件不在本地」，指控方向完全反了（分析 §6.4 末条）
 pub fn audit_server_set_map(repo_root: &str, map: &BaseMap) -> Result<ServerAudit> {
     let gone: BTreeSet<String> = map.gone.keys().cloned().collect();
-    audit_inner(repo_root, map.floor, &gone)
+    audit_inner(repo_root, map.floor, &gone, &BTreeSet::new())
 }
 
 /// 拿服务器在 `rev` 上的文件清单与磁盘上的 W-file 比一次。
@@ -130,11 +195,17 @@ pub fn audit_server_set_map(repo_root: &str, map: &BaseMap) -> Result<ServerAudi
 /// 「服务器有、磁盘没有」的差集在空集上**恒为空** ⇒ 报告「没有漏收」。
 /// 那就是用修 NB-2 的代码重新造一个 NB-2。
 pub fn audit_server_set(repo_root: &str, rev: u64) -> Result<ServerAudit> {
-    audit_inner(repo_root, rev, &BTreeSet::new())
+    audit_inner(repo_root, rev, &BTreeSet::new(), &BTreeSet::new())
 }
 
-/// `gone`：墓碑路径，从「服务器有、本地没有」里剔除。
-fn audit_inner(repo_root: &str, rev: u64, gone: &BTreeSet<String>) -> Result<ServerAudit> {
+/// `gone`：墓碑路径，从「服务器有、本地没有」里剔除。`pending`：update 删掉、还没跟进的
+/// 候选（[`removed_since_baseline`]），减掉排除节点下面的之后同样剔除。
+fn audit_inner(
+    repo_root: &str,
+    rev: u64,
+    gone: &BTreeSet<String>,
+    pending: &BTreeSet<String>,
+) -> Result<ServerAudit> {
     let cfg = read_config(repo_root)?;
     let scope = WScope::for_repo(repo_root, &cfg)?;
     if scope.roots().is_empty() {
@@ -262,11 +333,27 @@ fn audit_inner(repo_root: &str, rev: u64, gone: &BTreeSet<String>) -> Result<Ser
         }
     };
 
+    // 被裁掉的子树读不出来时一个都不剔：剔错的代价是把真正的漏收藏掉
+    let skip = if pending.is_empty() {
+        BTreeSet::new()
+    } else {
+        match trimmed_roots(repo_root, &units) {
+            Ok(trimmed) => outside_excluded(pending, &trimmed),
+            Err(e) => {
+                log::warn!(
+                    "找不出被裁掉的子树，服务器侧核对不剔除已消失的文件：{}",
+                    e.message
+                );
+                BTreeSet::new()
+            }
+        }
+    };
+
     // **只报这一个方向。** 反方向（磁盘有、服务器没有）是「本地新增还没 svn add」，
     // 完全正常；报了就是噪音，而噪音会让用户学会忽略这条提示。
     let missing: Vec<String> = server
         .difference(&expected)
-        .filter(|p| !gone.contains(*p))
+        .filter(|p| !gone.contains(*p) && !skip.contains(*p))
         .cloned()
         .collect();
     if missing.is_empty() {
@@ -277,4 +364,27 @@ fn audit_inner(repo_root: &str, rev: u64, gone: &BTreeSet<String>) -> Result<Ser
         files: missing.into_iter().take(MAX_LISTED).collect(),
         total,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::outside_excluded;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn only_paths_at_or_under_an_excluded_node_are_kept_out() {
+        let pending: BTreeSet<String> =
+            ["Code/Deep/D.cs", "Code/DeepX.cs", "Code/a.cs", "Code/B.cs"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        // `code/A.cs`：大小写与判定里的不一致，比宽，照样算在排除节点下
+        let excluded: BTreeSet<String> = ["Code/Deep", "code/A.cs"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let got: Vec<String> = outside_excluded(&pending, &excluded).into_iter().collect();
+        // `Code/DeepX.cs` 只是前缀相同，不在 `Code/Deep` 下面
+        assert_eq!(got, ["Code/B.cs", "Code/DeepX.cs"]);
+    }
 }

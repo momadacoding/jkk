@@ -94,6 +94,34 @@ pub fn parse_excluded_nodes(xml: &str) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
+/// 从 `svn info -R --xml` 里挑出本地被裁掉的子树的根（正斜杠 path 属性）：`exclude` 掉的节点，
+/// 以及 depth 是 `empty` / `files` / `immediates` 的目录。
+///
+/// 后者把子目录从工作副本里拿掉时不留 exclude 节点（2026-11-12 fixture 实测
+/// `a_directory_reduced_to_depth_files_is_still_reported`），被拿掉的文件在失同步判定里同样是
+/// 「消失」。只要 depth 不是 `infinity` 就整棵子树算进来：比宽只是多报。
+pub fn parse_trimmed_nodes(xml: &str) -> Result<Vec<String>> {
+    let doc = parse_doc(xml)?;
+    let mut out = Vec::new();
+    for entry in doc.descendants().filter(|n| n.has_tag_name("entry")) {
+        let depth = entry
+            .children()
+            .find(|n| n.has_tag_name("wc-info"))
+            .and_then(|w| w.children().find(|n| n.has_tag_name("depth")))
+            .and_then(|n| n.text());
+        let is_dir = entry.attribute("kind") == Some("dir");
+        let trimmed = match depth {
+            Some("exclude") => true,
+            Some("empty" | "files" | "immediates") => is_dir,
+            _ => false,
+        };
+        if trimmed {
+            out.push(norm_sep(&attr(&entry, "path")?));
+        }
+    }
+    Ok(out)
+}
+
 /// 从 `svn status -v --xml` 里取每个已版本控制节点的 revision 集合。
 ///
 /// # ⚠️ 输入必须来自带 `-v` **和** `--ignore-externals` 的 status
