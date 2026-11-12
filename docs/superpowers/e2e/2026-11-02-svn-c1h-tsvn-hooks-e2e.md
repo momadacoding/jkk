@@ -219,7 +219,7 @@ function Hooks {
    ```
 5. 资源管理器 → `WC` 右键 → **SVN Commit...**，只勾 `Code\L.cs`，点 OK。
 
-**应该看到（5a）：** 弹「Hook script failed」，内容是中文：`jkk：这些文件里有 Local-Only 补丁…`、`Code/L.cs：第 2 行起，来自「调试补丁」`，最后一行「取消勾选这些文件，或用「提交后恢复」删掉这些改动再提交。」点 **Abort**：回到提交框，消息还在。
+**应该看到（5a）：** 弹「Hook script failed」，内容是中文：`jkk：这些文件里有 Local-Only 补丁…`、`Code/L.cs：第 2 行起，来自「调试补丁」`，下一行缩进 4 格是第一行改动 `+line 02 DEBUG_PATCH`，最后一行「取消勾选这些文件，或用「提交后恢复」删掉这些改动再提交。」点 **Abort**：回到提交框，消息还在。
 
 6. 在提交框里右键 `Code/L.cs` → **Restore after commit**；用记事本打开 `WC\Code\L.cs`，把第 2 行改回 `line 02`（只删 ` DEBUG_PATCH`，**别留行尾空格**），保存；回提交框点 OK。
 
@@ -234,7 +234,7 @@ function Hooks {
 1. 记下「设置 → 时间和语言 → 语言和区域 → 区域格式」的当前值，改成 **English (Canada)**。
 2. 5b 之后 `L.cs` 第 2 行又是 `line 02 DEBUG_PATCH`。资源管理器 → `WC` 右键 → **SVN Commit...**，只勾 `Code\L.cs`，点 OK。
 
-**应该看到（5c）：** 弹「Hook script failed」，内容是英文，没有成串的 `?`：`jkk: these files contain Local-Only patches; committing would upload them to the server:`、`Code/L.cs: line 2 onward, from commit "????"`（commit 标题「调试补丁」是中文，在 1252 里照样变 `?`，这是预期），最后一行 `Uncheck these files, or use "Restore after commit" to drop these changes before committing.`。点 **Abort**。仍是中文问号时先注销重登再试一次（新进程从用户 locale 初始化线程 locale），还不对就记为失败。
+**应该看到（5c）：** 弹「Hook script failed」，内容是英文，没有成串的 `?`：`jkk: these files contain Local-Only patches; committing would upload them to the server:`、`Code/L.cs: line 2 onward, from commit "????"`（commit 标题「调试补丁」是中文，在 1252 里照样变 `?`，这是预期），下一行缩进 4 格 `+line 02 DEBUG_PATCH`，最后一行 `Uncheck these files, or use "Restore after commit" to drop these changes before committing.`。点 **Abort**。仍是中文问号时先注销重登再试一次（新进程从用户 locale 初始化线程 locale），还不对就记为失败。
 
 3. 区域格式改回第 1 步记下的值。
 
@@ -323,6 +323,10 @@ if (Test-Path $bak) { Move-Item -Force $bak "$env:APPDATA\com.momadacoding.jkk\s
 | 写注册表的 CAS：值被别人改过不写，写完被覆盖能发现 | `src-tauri/tests/tsvn_hooks.rs` 的 `cas_*` |
 | 钩子参数按位置解析、仓库外路径丢弃、RESULTPATH 含被删文件、错误一律放行 | `src-tauri/tests/tsvn_hook_cli.rs` |
 | stderr 按线程代码页编码（系统 ACP 不是 936 的机器上，中文不变 `?`） | `stderr_text_follows_the_thread_code_page_not_the_system_one` |
+| 拦截说明里每个 hunk 下面的第一行改动（跳过缩进与空行、去 BOM、控制字符换空格、纯删除或改成空行给 `-`、60 字截断、文件首尾、非 UTF-8 不给、整文件不给；旧 journal 没有该字段） | `svn_leak.rs` 的 `preview_*`、`leak_message_shows_the_first_changed_line_under_each_hunk`、`whole_file_verdict_has_no_preview`、`follow_side_leaks_carry_the_preview_too`；`svn_backend.rs` 的 `follow_outcome_*` |
+| 线程代码页编不出来的预览（emoji、GBK 之外的字）不进消息，不把中文消息挤成英文版 | `tsvn_hook_cli.rs` 的 `unencodable_preview_is_dropped_instead_of_forcing_english`、`svn_leak.rs` 的 `rejected_previews_are_left_out_of_both_messages` |
+
+> 已知限制：GBK 编码的源文件（SVN 混合仓库常见）没有预览。猜不了编码，宁缺不错。
 | 线程代码页装不下中文时改发英文版（含 best-fit 全角标点、英文版里带中文路径） | `hook_stderr_*`、`best_fit_substitution_counts_as_lossy`、`english_fallback_with_chinese_path_keeps_the_english_template`、`svn_leak.rs` 的 `leak_message_en_*` |
 | Pre / Post 配对、孤儿 Pre 不配对、清理 | `src-tauri/tests/tsvn_inbox.rs` |
 | Check-commit 按磁盘判定（提交后恢复、整文件、大小写、fail-open） | `src-tauri/tests/svn_leak.rs` 的 disk_* 与 `tsvn_hook_cli.rs` 的 check_commit_* |
