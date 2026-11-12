@@ -11,7 +11,9 @@ import {
   describeManualFollow,
   describeManualFollowAction,
   describeManualFollowOutcome,
+  describeRestoreOutcome,
   needsSvnUserPrompt,
+  restorablePaths,
   type FollowOutcome,
   type FollowReport,
   type Leak,
@@ -897,5 +899,30 @@ describe('手动跟进', () => {
     const m = describeManualFollowAction('syncAbort', 'applying-stash')
     expect(m.message).toContain('新基线')
     expect(m.message).toContain('stash')
+  })
+})
+
+describe('放回 Local-Only 补丁（使用报告 9.1）', () => {
+  it('旧后端没有 restorable 字段时为空', () => {
+    expect(restorablePaths(report)).toEqual([])
+    expect(restorablePaths({ ...report, restorable: ['Code/A.cs'] })).toEqual(['Code/A.cs'])
+  })
+
+  it('全部放回：成功，说明 SVN 里会显示已修改', () => {
+    const d = describeRestoreOutcome({ restored: ['a', 'b'], skipped: [] })
+    expect(d.ok).toBe(true)
+    expect(d.text).toContain('2 个文件')
+    expect(d.text).toContain('SVN 里')
+  })
+
+  it('有跳过的：要留意，写清放回与跳过各几个', () => {
+    const skip = { path: 'b', reason: '磁盘上有你的编辑' }
+    expect(describeRestoreOutcome({ restored: ['a'], skipped: [skip] })).toEqual({
+      ok: false,
+      text: '已放回 1 个文件，1 个跳过了：',
+    })
+    expect(describeRestoreOutcome({ restored: [], skipped: [skip] }).text).toBe(
+      '一个文件都没放回，1 个跳过了：',
+    )
   })
 })

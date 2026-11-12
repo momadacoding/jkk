@@ -53,7 +53,12 @@ import type {
   RebuildReport,
 } from '../engine/svnInit'
 import { samePath } from '../engine/path'
-import type { AutoFollowOutcome, FollowOutcome, SvnUserInfo } from '../engine/svnFollow'
+import type {
+  AutoFollowOutcome,
+  FollowOutcome,
+  RestoreOutcome,
+  SvnUserInfo,
+} from '../engine/svnFollow'
 import type { HookHealth, TsvnHooksStatus } from '../engine/tsvnHooks'
 import type { SyncInExpect, SyncInOutcome, SyncInPreview } from '../engine/svnSyncIn'
 import type { SyncOutExpect, SyncOutOutcome, SyncOutPreview } from '../engine/svnSyncOut'
@@ -422,6 +427,14 @@ export function svnFollowContinue(path: string): Promise<FollowOutcome> {
 /** 手动跟进：跟进冲突时的兜底，会写磁盘。冲突之后的继续 / 放弃走 `svnSyncContinue` / `svnSyncAbort`。 */
 export function svnFollowManual(path: string): Promise<SyncInOutcome> {
   return invoke<SyncInOutcome>('svn_follow_manual', { path })
+}
+
+/**
+ * 跟进报告里的「放回 Local-Only 补丁」（使用报告 9.1）：把 `paths` 写回成分支的版本。后端锁内
+ * 逐个重验条件，不满足的跳过并给出原因；会写磁盘，调用方随后刷新状态。
+ */
+export function svnRestoreLocalOnly(path: string, paths: string[]): Promise<RestoreOutcome> {
+  return invoke<RestoreOutcome>('svn_restore_local_only', { path, paths })
 }
 
 /** 落后基线的本地分支。纯本地读；非混合仓库或没有基线时返回空列表。 */

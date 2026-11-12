@@ -1567,6 +1567,22 @@ body {
   color: #81c784;
 }
 
+/* 「放回 Local-Only 补丁」（使用报告 9.1）：挂在「需要你留意」里，紧跟「分支与磁盘对不上」 */
+.follow-restore {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 7px 10px 8px;
+  border: 1px solid #363636;
+  border-radius: 3px;
+  min-width: 0;
+}
+
+.follow-restore > div {
+  overflow-wrap: anywhere;
+}
+
 /* ---------- 文件内容（File Tree 右侧，只读） ---------- */
 
 .file-content {

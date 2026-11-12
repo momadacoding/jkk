@@ -50,6 +50,7 @@ pub mod svn_nodes;
 pub mod svn_preflight;
 pub mod svn_pristine;
 pub mod svn_replay;
+pub mod svn_restore_local_only;
 pub mod svn_scope;
 pub mod svn_server_set;
 pub mod svn_snapshot;

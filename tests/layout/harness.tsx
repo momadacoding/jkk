@@ -122,6 +122,8 @@ function Follow() {
     rewritten: [],
     snapshot: [['f'.repeat(40), paths(100)]],
     drift: paths(100),
+    // 9.1 的按钮在「需要你留意」最后，最容易被挤到够不着的地方
+    restorable: paths(100),
     stage: { decisions: {}, uncertain: paths(100), lost: paths(100), discarded: [] },
     movedBranches: [],
     behindBranches: [],
@@ -137,6 +139,10 @@ function Follow() {
           report,
           readUser: async () => ({ configured: null, detected: null }),
           saveUser: async () => {},
+          restoreLocalOnly: async (ps) => ({
+            restored: [],
+            skipped: ps.map((path) => ({ path, reason: LONG_ERROR })),
+          }),
         })
       }
     >

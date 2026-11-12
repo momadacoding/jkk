@@ -42,6 +42,7 @@
 - [x] 场景 7：feature 与提交冲突 → 标「落后基线」→「切换并手动跟进」→ 解冲突 → 继续
 - [x] 场景 8：「仅切换」到落后分支 → 横幅「当前分支落后基线」→ 跟进 → 转手动跟进
 - [x] 场景 9：Local-Only 补丁 + 「提交后恢复」只提交功能改动 → 不告警、补丁还在；整文件提交 → 告警
+- [ ] 场景 9B：跟进后「放回 Local-Only 补丁」→ 磁盘带回补丁、git 干净；磁盘有自己的编辑时跳过（2026-11-12 新增，未跑）
 - [x] 场景 10：只提交删除 → 跟进后记成墓碑
 - [x] 场景 11：SVN 操作进行中切回 jkk → 「SVN 正在更新…」
 - [x] 场景 12：周一根目录整体更新 → 跟进后基线回到单值旧格式
@@ -622,6 +623,61 @@ SvnCommit 'Code/Deep/D.cs'
 
 ---
 
+## 场景 9B：跟进后把 Local-Only 补丁放回磁盘（使用报告 9.1）
+
+2026-11-11 的真实现场：Local-Only commit 加了一行，之后一个普通 commit 在 git 里删掉了它，这个文件随 TortoiseSVN 提交上了 SVN。跟进后分支里有这一行，磁盘（= SVN）没有。
+
+**造现场 1（操作窗口）：** 新建一个文件，提交到 SVN。
+
+```powershell
+Wc 'Code/Deep/R.cs' "class R {`n  int a;`n}`n"
+svn add -q --non-interactive (Join-Path $WC 'Code/Deep/R.cs')
+SvnCommit 'Code/Deep/R.cs'
+```
+
+**应用：** 点回应用 → 跟进。
+
+**造现场 2（操作窗口）：**
+
+```powershell
+# Local-Only commit：加一行
+Wc 'Code/Deep/R.cs' "---@class R`nclass R {`n  int a;`n}`n"
+G add Code/Deep/R.cs; G commit -q -m "add class`n`nLocal-Only: true"
+# 普通 commit：删掉这一行，另加功能
+Wc 'Code/Deep/R.cs' "class R {`n  int a;`n  int b;`n}`n"
+G add Code/Deep/R.cs; G commit -q -m '小婉问答'
+SvnCommit 'Code/Deep/R.cs'
+```
+
+**操作（应用）：** 点回应用 → 跟进。
+
+**应该看到：** 「跟进完成」的「需要你留意」里：
+
+- 「分支与磁盘对不上」列出 `Code/Deep/R.cs`；
+- 下面一行说明，加按钮 **「放回 Local-Only 补丁（1 个文件）」**。
+
+点按钮。按钮消失，显示「已放回 1 个文件的 Local-Only 补丁。…」。
+
+```powershell
+Get-Content (Join-Path $WC 'Code/Deep/R.cs') -TotalCount 1   # ---@class R
+G status --short                                              # 没有 R.cs
+svn status (Join-Path $WC 'Code/Deep/R.cs')                    # M
+```
+
+**反例（操作窗口 + 应用）：** 磁盘上有你自己的编辑时不覆盖。重做造现场 2，换一个文件 `Code/Deep/R2.cs`（同样先做造现场 1）。跟进之后、点按钮之前，先在操作窗口执行 `Wc 'Code/Deep/R2.cs' "mine`n"`，再点按钮。
+
+**应该看到：** 「一个文件都没放回，1 个跳过了：」，原因是「磁盘上的内容不是 SVN 的版本」。`R2.cs` 的内容仍是 `mine`。
+
+**看到别的说明：**
+
+| 现象 | 含义 |
+|---|---|
+| 没有按钮 | `restorable` 没算出来：看日志里「判断能否放回 Local-Only 补丁时出错」 |
+| 点完 `G status` 里有 `R.cs` | 写回的内容与 HEAD 不同（换行或过滤规则），或者索引不是 HEAD |
+| 反例里 `mine` 被覆盖 | 磁盘核对失效，**阻断问题** |
+
+---
+
 ## 场景 10：只提交删除
 
 **造现场（操作窗口）：**
@@ -994,6 +1050,7 @@ Remove-Item -Recurse -Force $fix.FullName
 | 工作副本被锁时判为「正在更新」 | `svn_sync.rs::locked_working_copy_reports_wc_locked` |
 | 已提交的删除成为墓碑；漏收（depth-exclude）拒绝录制；确认失败拒绝 | `svn_health.rs::committed_deletion_becomes_tombstone_when_just_recorded` 及同文件的 exclude / unconfirmed 测试 |
 | Local-Only 泄漏按 hunk 判定（含相邻行、行号偏移） | `svn_leak.rs::leak_by_hunk_matches_w21_scenarios` 等 |
+| 放回 Local-Only 补丁：真实现场形状、磁盘有编辑 / 有暂存 / 有普通 commit 时跳过、重复点、空列表、仓库外路径、同步中途 / 索引被占时拒绝、空格与 `%` 路径；普通 commit 合错的 drift 不算可放回 | `src-tauri/tests/svn_restore_local_only.rs`、`svn_follow_snapshot.rs::a_clean_but_wrong_replay_is_reported_as_drift` |
 | 落后分支磁盘还是旧内容时转手动跟进 | `branch_entry_sends_a_stale_disk_to_manual_follow`、`a_stale_disk_on_a_lagging_branch_also_stops_a_recording_follow` |
 | 手动跟进带着暂存 / 未暂存 / 未跟踪的改动：继续、放弃、崩溃后续上都原样放回 | `manual_follow_restores_staging_with_index_when_possible`、`manual_follow_abort_after_a_crash_restores_everything` 等用 `wip()` 造现场的一组 |
 | 手动跟进暂存没保住时 stash 保留、能取回 | `manual_follow_stage_lost_keeps_a_stage_that_differs_from_disk` |

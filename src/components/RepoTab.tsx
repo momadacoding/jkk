@@ -25,6 +25,7 @@ import {
   svnCheckBaseline,
   svnGetUser,
   svnMigrateEol,
+  svnRestoreLocalOnly,
   svnSetUser,
   tsvnHooksRegister,
   tsvnHooksStatus,
@@ -906,6 +907,12 @@ export function RepoTab({
       report,
       readUser: () => svnGetUser(repoPath),
       saveUser: (user) => svnSetUser(repoPath, user),
+      // 写了磁盘：「本地改动」要跟着变（watcher 也会刷，这里不等它）
+      restoreLocalOnly: async (paths) => {
+        const outcome = await svnRestoreLocalOnly(repoPath, paths)
+        await refreshStatus(repoPath)
+        return outcome
+      },
     })
   const {
     handleSvnUpdate,
