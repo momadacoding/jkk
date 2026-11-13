@@ -1094,6 +1094,29 @@ const INFO_KEYS_XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <depth>infinity</depth>
 </wc-info>
 </entry>
+<entry
+   kind=\"file\"
+   path=\"Code\\Copied.cs\"
+   revision=\"202\">
+<url>file:///C:/r/trunk/Code/Copied.cs</url>
+<repository>
+<root>file:///C:/r</root>
+<uuid>8569f55e-87b3-144b-ad76-7581640ee523</uuid>
+</repository>
+<wc-info>
+<wcroot-abspath>C:/wc</wcroot-abspath>
+<schedule>replace</schedule>
+<copy-from-url>file:///C:/r/trunk/Code/Other.cs</copy-from-url>
+<copy-from-rev>5</copy-from-rev>
+<depth>infinity</depth>
+<checksum>0123456789abcdef0123456789abcdef01234567</checksum>
+</wc-info>
+<commit
+   revision=\"5\">
+<author>someone</author>
+<date>2026-11-01T00:00:00.000000Z</date>
+</commit>
+</entry>
 </info>
 ";
 
@@ -1109,11 +1132,15 @@ fn info_base_keys_take_url_uuid_last_changed_revision_and_checksum() {
                     url: "file:///C:/r/trunk/Code/A.cs".to_string(),
                     uuid: "8569f55e-87b3-144b-ad76-7581640ee523".to_string(),
                     commit_rev: 1,
+                    author: Some("liuhao".to_string()),
+                    date: "2026-11-08T16:56:33.866691Z".to_string(),
                     checksum: "7fcfcddddbcb63dedf6d38e97c9de2c0e92da45a".to_string(),
                 })
             ),
             // 节点 revision（202 / 0）不进键：整体 update 会推高它，内容却没变
             ("Code/New.cs".to_string(), None),
+            // 替换过来的节点：校验和与 <commit> 是复制源的（工作层），不是 BASE 层的
+            ("Code/Copied.cs".to_string(), None),
         ]
     );
 }

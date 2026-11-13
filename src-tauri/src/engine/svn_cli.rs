@@ -155,6 +155,24 @@ pub fn with_scan_cache<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// 在范围里临时不用扫描缓存：`f` 里的 `info` / `status` 都去读最新的，也不往缓存里记。
+/// 结束（含 panic 展开）时把原来的缓存放回去。
+///
+/// 给「专门用来发现期间有没有变化」的重读用（`svn_base_blobs` 写缓存前的复核）：在缓存里它会
+/// 拿到第一次读的结果，等于没查（独立 review 2026-11-14）。
+pub fn bypass_scan_cache<T>(f: impl FnOnce() -> T) -> T {
+    type Scans = Option<HashMap<String, String>>;
+    struct Restore(Scans);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let saved = self.0.take();
+            SCANS.with(|s| *s.borrow_mut() = saved);
+        }
+    }
+    let _restore = Restore(SCANS.with(|s| s.borrow_mut().take()));
+    f()
+}
+
 /// 忘掉缓存里的节点状态扫描（`status -v`），下一次照常去读。R3c 用：它存在的意义就是发现录制
 /// 期间工作副本被外部改了，读缓存等于没查。`info` 与找 external 的 `status` 留着——那是工作副本
 /// 的布局，不是 revision。不在范围内时什么都不做。

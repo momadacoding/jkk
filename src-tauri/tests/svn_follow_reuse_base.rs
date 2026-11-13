@@ -71,4 +71,15 @@ fn dirty_files_whose_server_version_did_not_change_reuse_the_last_blob() {
         1,
         "A 的服务器版本没变，不该再 svn cat"
     );
+
+    // 第三次：git 的过滤属性变了（hash-object 的结果可能跟着变），A、B 都要重取
+    let attrs = fx.wc().join(".git/info/attributes");
+    let mut text = std::fs::read_to_string(&attrs).unwrap_or_default();
+    text.push_str("*.cs ident\n");
+    std::fs::write(&attrs, text).unwrap();
+    fx.colleague_commits("Code/C.cs", "c1\n");
+    svn_cmd(&fx.wc(), &["update", "--non-interactive"]);
+    let before = svn_cats(&log);
+    follow_done(&fx);
+    assert_eq!(svn_cats(&log) - before, 2, "过滤属性变了，缓存不能再用");
 }
