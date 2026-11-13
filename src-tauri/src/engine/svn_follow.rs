@@ -72,7 +72,7 @@ use crate::engine::svn_follow_index::{
 use crate::engine::svn_follow_mark::{clear_mark, my_svn_user, read_mark, FollowMark};
 use crate::engine::svn_health::Health;
 use crate::engine::svn_include_check::normalize_roots;
-use crate::engine::svn_init::{confirm_tombstones, record_mixed, Recorded};
+use crate::engine::svn_init::{confirm_tombstones, record_mixed_reusing, Recorded};
 use crate::engine::svn_journal::{self, BranchMove, Flow, FollowStep, FollowSteps, Journal, Phase};
 use crate::engine::svn_leak::{local_only_leaks, Leak};
 use crate::engine::svn_lock;
@@ -1977,15 +1977,18 @@ fn prepare(repo: &str, auto: bool, partial: Option<&Partial>) -> Result<Plan> {
 ///   重新 clean，blob 仍是旧规则的结果；体检比的是磁盘与服务器，看不出来。已迁移的仓库由
 ///   `.git/info/attributes` 钉住 text / eol（`svn_attributes`），基本碰不到；碰到时「重建基线」
 ///   从空索引录，可以纠正。
+///
+/// 本地改过的文件同理：服务器版本没变的沿用上次取到的 blob，不再逐个 `svn cat`
+/// （`svn_base_blobs`：服务器版本与上次取的时候完全相同才用，判据与取舍写在那里）。
 fn record_from_old_base(repo: &str, cfg: &SvnConfig, old_base: &str) -> Result<Recorded> {
     let idx = TempIndex::from_tree_keeping_stat(repo, old_base)?;
-    match record_mixed(repo, cfg, &idx) {
+    match record_mixed_reusing(repo, cfg, &idx, true) {
         Err(e) if e.code == "include_set_mismatch" => {
             log::info!(
                 "从旧基线起步的候选索引多收了文件，退回空索引重录：{}",
                 e.message
             );
-            record_mixed(repo, cfg, &TempIndex::empty(repo)?)
+            record_mixed_reusing(repo, cfg, &TempIndex::empty(repo)?, true)
         }
         r => r,
     }

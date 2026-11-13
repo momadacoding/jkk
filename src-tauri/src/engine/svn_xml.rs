@@ -600,6 +600,48 @@ pub fn parse_status_entries(xml: &str) -> Result<Vec<StatusEntry>> {
     Ok(out)
 }
 
+/// 决定一个文件 `svn cat -r BASE` 输出的全部输入：节点在哪（URL、仓库 UUID）、BASE 的字节
+/// （pristine 校验和）、关键字展开用的最后修改信息（revision；作者与时间由它决定）。
+/// eol / keywords 属性只能随提交改变，提交就会改变最后修改的 revision。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BaseKey {
+    pub url: String,
+    pub uuid: String,
+    pub commit_rev: u64,
+    pub checksum: String,
+}
+
+/// 从 `svn info --xml` 里取每个 entry 的 [`BaseKey`]，返回 `(path, key)`，path 归一成正斜杠。
+///
+/// 缺任何一样给 `None`：目录没有 checksum，added 没有 `<commit>`。调用方当成「说不清」，
+/// 不沿用任何东西。
+pub fn parse_info_base_keys(xml: &str) -> Result<Vec<(String, Option<BaseKey>)>> {
+    let doc = parse_doc(xml)?;
+    let mut out = Vec::new();
+    for entry in doc.descendants().filter(|n| n.has_tag_name("entry")) {
+        let path = norm_sep(&attr(&entry, "path")?);
+        let text = |parent: Option<Node>, tag: &str| {
+            parent
+                .and_then(|p| p.children().find(|n| n.has_tag_name(tag)))
+                .and_then(|n| n.text())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        let find = |tag: &str| entry.children().find(|n| n.has_tag_name(tag));
+        let key = (|| {
+            Some(BaseKey {
+                url: text(Some(entry), "url")?,
+                uuid: text(find("repository"), "uuid")?,
+                commit_rev: find("commit")?.attribute("revision")?.parse().ok()?,
+                checksum: text(find("wc-info"), "checksum")?,
+            })
+        })();
+        out.push((path, key));
+    }
+    Ok(out)
+}
+
 /// 从 `svn info --xml` 里取每个 entry 的 `<wc-info><schedule>`，返回 `(path, schedule)`，
 /// path 归一成正斜杠（与 [`parse_status_entries`] 同一套，方便对回去）。
 ///

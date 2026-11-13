@@ -11,6 +11,7 @@
 
 use crate::engine::git_cli::{run_git, run_git_code};
 use crate::engine::svn_attributes::{has_eol_rule, restore_attributes, write_attributes};
+use crate::engine::svn_base_blobs::BaseBlobs;
 use crate::engine::svn_baseline::{
     git_dir, hash_blob, publish_baseline, refresh_index_stat, swap_index_to_tree, IndexEdit,
     TempIndex,
@@ -506,6 +507,18 @@ pub(crate) fn confirm_tombstones(
 ///
 /// `idx` 由调用方给：重建与初始化从空索引起步，S7 从 HEAD 树起步（spec §6.3.1）。
 pub fn record_mixed(repo: &str, cfg: &SvnConfig, idx: &TempIndex) -> Result<Recorded> {
+    record_mixed_reusing(repo, cfg, idx, false)
+}
+
+/// 同 [`record_mixed`]，`reuse` 时本地改过的文件先查 [`BaseBlobs`] 缓存：服务器版本与上次
+/// 取的时候完全相同就直接用那个 blob，不再 `svn cat`，并把这次用的 blob 记回缓存。跟进用：
+/// 每天整体 update 一次之后，每个长期改着没提交的文件原来每次跟进都要起两个进程。
+pub fn record_mixed_reusing(
+    repo: &str,
+    cfg: &SvnConfig,
+    idx: &TempIndex,
+    reuse: bool,
+) -> Result<Recorded> {
     let pre = run_preflight_with(repo, &cfg.whitelist, true)?;
     let svn_url = working_copy_url(repo)?;
     record_mixed_with(
@@ -516,11 +529,14 @@ pub fn record_mixed(repo: &str, cfg: &SvnConfig, idx: &TempIndex) -> Result<Reco
         &svn_url,
         &mut PhaseClock::new("同步录制"),
         "基线没有推进。",
+        reuse,
     )
 }
 
 /// [`record_mixed`] 的本体。初始化与重建已经跑过 R1（`pre`，必须是 `allow_mixed` 的结果），
-/// 不再跑第二遍；`tail` 接在拒绝文案里，说明此刻仓库处在什么状态。
+/// 不再跑第二遍；`tail` 接在拒绝文案里，说明此刻仓库处在什么状态。`reuse` 见
+/// [`record_mixed_reusing`]。
+#[allow(clippy::too_many_arguments)] // 都是录制要的上下文；包成结构体只为过 lint，调用点反而更难读
 fn record_mixed_with(
     repo: &str,
     cfg: &SvnConfig,
@@ -529,6 +545,7 @@ fn record_mixed_with(
     svn_url: &str,
     clock: &mut PhaseClock,
     tail: &str,
+    reuse: bool,
 ) -> Result<Recorded> {
     let nodes = pre.nodes.as_deref().ok_or_else(|| {
         GitError::new(
@@ -537,7 +554,7 @@ fn record_mixed_with(
         )
     })?;
     // R2a–R2c
-    let (tree, explained) = record_server_tree_timed(repo, cfg, pre, idx, clock)?;
+    let (tree, explained) = record_server_tree_timed(repo, cfg, pre, idx, clock, reuse)?;
     // 映射的键取录出来的树（分析 §6.2：不从 status 推）
     let files = tree_files(repo, &tree)?;
     let recorded = compute_map(&pre.repos_root, &pre.uuid, &files, nodes, BTreeMap::new())?;
@@ -719,7 +736,14 @@ pub fn record_server_tree_into(
     idx: &TempIndex,
 ) -> Result<(String, BTreeSet<String>)> {
     // 同步（S7 / D7a）不报耗时，计时器用完即弃；`scope` 只决定开发日志里怎么称呼
-    record_server_tree_timed(repo_root, cfg, pre, idx, &mut PhaseClock::new("同步录制"))
+    record_server_tree_timed(
+        repo_root,
+        cfg,
+        pre,
+        idx,
+        &mut PhaseClock::new("同步录制"),
+        false,
+    )
 }
 
 /// [`record_server_tree_into`] 的本体，额外按子步骤计时。只有初始化把这份耗时
@@ -730,6 +754,7 @@ fn record_server_tree_timed(
     pre: &Preflight,
     idx: &TempIndex,
     clock: &mut PhaseClock,
+    reuse: bool,
 ) -> Result<(String, BTreeSet<String>)> {
     let scope = WScope::for_repo(repo_root, cfg)?;
     let fixes = classify(&pre.dirty)?;
@@ -746,7 +771,7 @@ fn record_server_tree_timed(
     })?;
 
     clock.run("把本地改动换回服务器内容（svn cat）", || {
-        rewrite_to_server(repo_root, pre, idx, &fixes, &touched)
+        rewrite_to_server(repo_root, pre, idx, &fixes, &touched, reuse)
     })?;
 
     // R2c：核对与录制**共用同一份候选索引**（spec §6.3.1），核对完之后在同一个
@@ -802,6 +827,7 @@ fn rewrite_to_server(
     idx: &TempIndex,
     fixes: &std::collections::BTreeMap<String, Fix>,
     touched: &BTreeSet<String>,
+    reuse: bool,
 ) -> Result<()> {
     // 事故分析 6.2：自己或某个祖先是不带历史的替换，服务器上的旧内容取不到。文件走 TakeBase 会撞
     // E200009；目录底下重新加的子文件走 Drop 会静默少录（PR 116 遗留）。初始化与重建在 `git add`
@@ -813,11 +839,32 @@ fn rewrite_to_server(
         .filter(|(path, _)| touched.contains(*path))
         .map(|(path, fix)| (path.as_str(), *fix))
         .collect();
+    let cache = if reuse {
+        let take: Vec<&str> = todo
+            .iter()
+            .filter(|(_, fix)| *fix == Fix::TakeBase)
+            .map(|(path, _)| *path)
+            .collect();
+        BaseBlobs::load(repo_root, &take)
+    } else {
+        None
+    };
     // 剔除不用取数，一并放进来只是为了按原顺序一一对上结果
     let oids = run_parallel(&todo, fetch_workers(), |(path, fix)| match fix {
-        Fix::TakeBase => fetch_base_blob(repo_root, pre.node_rev, path).map(Some),
+        Fix::TakeBase => match cache.as_ref().and_then(|c| c.reusable(path)) {
+            Some(oid) => Ok(Some(oid)),
+            None => fetch_base_blob(repo_root, pre.node_rev, path).map(Some),
+        },
         Fix::Drop => Ok(None),
     })?;
+    if let Some(c) = &cache {
+        let used: Vec<(&str, &str)> = todo
+            .iter()
+            .zip(&oids)
+            .filter_map(|((path, _), oid)| Some((*path, oid.as_deref()?)))
+            .collect();
+        c.save(repo_root, &used);
+    }
     let edits: Vec<IndexEdit> = todo
         .iter()
         .zip(oids)
@@ -1130,6 +1177,7 @@ fn build_repo(
         svn_url,
         clock,
         "继续下去会得到一个从一开始就在撒谎的基线，所以整个回退了。",
+        false,
     )?;
     let tree = rec.tree.clone();
 
@@ -1852,6 +1900,8 @@ fn rebuild_from(repo_root: &str, old_baseline: Option<String>) -> Result<Rebuild
         &svn_url,
         &mut clock,
         "基线指针没有改动。",
+        // 重建就是为了不信以前录下的东西，一个 blob 都不沿用
+        false,
     )?;
 
     // R3 + R4：建 commit 并以旧 OID 作比较条件更新指针。父提交仍是旧基线；
