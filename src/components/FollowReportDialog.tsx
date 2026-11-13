@@ -95,9 +95,12 @@ function SvnUserRow({
  */
 function RestoreRow({
   paths,
+  commits,
   restore,
 }: {
   paths: string[]
+  /** 路径 → 改过它的 Local-Only 提交，写在按钮上方（使用报告 2026-11-12 缺陷 6）。 */
+  commits: Record<string, string[]>
   restore: (paths: string[]) => Promise<RestoreOutcome>
 }) {
   const [busy, setBusy] = useState(false)
@@ -123,9 +126,19 @@ function RestoreRow({
       {!outcome && (
         <>
           <div className="follow-note">
-            其中 {paths.length} 个文件，分支比磁盘多出来的只有 Local-Only 补丁，磁盘上就是 SVN
+            这 {paths.length} 个文件分支比磁盘多出来的只有 Local-Only 补丁，磁盘上就是 SVN
             的版本。可以把补丁放回磁盘：SVN 里它们会显示为已修改，git 里是干净的。
           </div>
+          <ul className="follow-items">
+            {paths.map((p) => (
+              <li key={p}>
+                <span className="follow-path">{p}</span>
+                {(commits[p] ?? []).length > 0 && (
+                  <span className="follow-meta">← {commits[p].join('、')}</span>
+                )}
+              </li>
+            ))}
+          </ul>
           <button type="button" onClick={() => void run()} disabled={busy}>
             {busy ? '正在放回…' : `放回 Local-Only 补丁（${paths.length} 个文件）`}
           </button>
@@ -286,7 +299,11 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
               <Section key={s.id} s={s} />
             ))}
             {restore && restorable.length > 0 && (
-              <RestoreRow paths={restorable} restore={restore} />
+              <RestoreRow
+                paths={restorable}
+                commits={request.report.restore?.commits ?? {}}
+                restore={restore}
+              />
             )}
           </div>
         )}

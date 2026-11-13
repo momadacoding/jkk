@@ -13,7 +13,9 @@ use app_lib::engine::svn_config::{read_config, write_config};
 use app_lib::engine::svn_follow::{follow, FollowOutcome, FollowReport};
 use app_lib::engine::svn_follow_mark::write_mark;
 use app_lib::engine::svn_journal::{self, Flow, Journal, Phase};
-use app_lib::engine::svn_restore_local_only::restore_local_only;
+use app_lib::engine::svn_restore_local_only::{
+    dismiss_pending_restores, pending_list, pending_restores, restore_local_only,
+};
 use std::process::Command;
 use svn_fixtures::{hybrid_with_colleague, svn_cmd, SvnFixture};
 
@@ -84,7 +86,19 @@ fn report_case(fx: &SvnFixture) -> FollowReport {
 }
 
 /// 同 [`report_case`]，几个文件一起。
+///
+/// 跟进会自动放回（SVN 上最后改它的是我），这里再把磁盘改回 SVN 的版本：按钮测的是「磁盘缺补丁」
+/// 的现场（自动放回没写成、或者用户又去掉了补丁）。
 fn report_case_for(fx: &SvnFixture, files: &[&str]) -> FollowReport {
+    let rep = followed_case_for(fx, files);
+    for f in files {
+        write(fx, f, &feature_text());
+    }
+    rep
+}
+
+/// 真实现场走到跟进完成为止，不碰之后的磁盘。
+fn followed_case_for(fx: &SvnFixture, files: &[&str]) -> FollowReport {
     i_commit(fx);
     for f in files {
         write(fx, f, &base_text());
@@ -108,16 +122,41 @@ fn report_case_for(fx: &SvnFixture, files: &[&str]) -> FollowReport {
 }
 
 #[test]
-fn report_case_lists_the_file_as_restorable_and_the_button_puts_the_patch_back() {
+fn follow_puts_the_patch_back_when_i_was_the_last_to_commit_the_file() {
+    // 计划 2026-11-12-auto-restore-local-only 的 A：跟进完成后在同一把锁里放回
     let fx = hybrid_with_colleague();
-    let rep = report_case(&fx);
+    let rep = followed_case_for(&fx, &[A]);
     assert_eq!(
         rep.drift,
         vec![A.to_string()],
         "前提：报「分支与磁盘对不上」"
     );
     assert_eq!(rep.restorable, vec![A.to_string()]);
-    assert_eq!(read(&fx, A), feature_text(), "跟进本身不写磁盘");
+
+    let restore = rep.restore.expect("跟进结果里有放回结果");
+    assert_eq!(restore.restored, vec![A.to_string()], "{restore:?}");
+    assert!(restore.skipped.is_empty(), "{restore:?}");
+    let commits = &restore.commits[A];
+    assert_eq!(commits.len(), 1, "{commits:?}");
+    assert!(
+        commits[0].ends_with(" add @avatarclass"),
+        "写明是哪个补丁：{commits:?}"
+    );
+    assert_eq!(read(&fx, A), format!("{CLASS}{}", feature_text()));
+    assert!(modified_paths(&fx).is_empty(), "磁盘 = 索引 = HEAD");
+    assert_eq!(git(&fx, &["diff", "--cached", "--name-only"]), "");
+    assert!(
+        pending_restores(&fx.wc_str()).unwrap().is_empty(),
+        "放回了就不挂横幅"
+    );
+}
+
+#[test]
+fn report_case_lists_the_file_as_restorable_and_the_button_puts_the_patch_back() {
+    let fx = hybrid_with_colleague();
+    let rep = report_case(&fx);
+    assert_eq!(rep.restorable, vec![A.to_string()]);
+    assert_eq!(read(&fx, A), feature_text(), "前提：磁盘缺补丁");
 
     let out = restore_local_only(&fx.wc_str(), "op2", &[A.to_string()]).unwrap();
 
@@ -381,9 +420,245 @@ fn path_with_spaces_and_percent_is_restored() {
     tortoise_commit(&fx, p);
     let rep = done(follow(&fx.wc_str(), "op1").unwrap());
     assert_eq!(rep.restorable, vec![p.to_string()], "{rep:?}");
+    assert_eq!(
+        rep.restore.map(|r| r.restored),
+        Some(vec![p.to_string()]),
+        "自动放回"
+    );
+    assert_eq!(read(&fx, p), format!("{CLASS}{}", feature_text()));
 
+    // 按钮同样走 `--stdin -z`
+    write(&fx, p, &feature_text());
     let out = restore_local_only(&fx.wc_str(), "op2", &[p.to_string()]).unwrap();
 
     assert_eq!(out.restored, vec![p.to_string()], "{out:?}");
     assert_eq!(read(&fx, p), format!("{CLASS}{}", feature_text()));
+}
+
+// —— 待放回清单（计划的 C） ——
+
+/// 跟进时 B 被别的程序挡着写（锁只放行读）：A 照样放回，B 记进待放回清单；锁放开后横幅能放回它，
+/// 放回之后清单清空。
+#[cfg(windows)]
+#[test]
+fn a_file_held_open_during_follow_stays_pending_until_the_banner_restores_it() {
+    use std::os::windows::fs::OpenOptionsExt;
+    const B: &str = "Code/B.cs";
+    const FILE_SHARE_READ: u32 = 1;
+    let fx = hybrid_with_colleague();
+    // 先把现场造到最后一次跟进之前：followed_case_for 内部会跟进，这里自己展开
+    i_commit(&fx);
+    for f in [A, B] {
+        write(&fx, f, &base_text());
+        tortoise_commit(&fx, f);
+    }
+    done(follow(&fx.wc_str(), "op0").unwrap());
+    for f in [A, B] {
+        write(&fx, f, &format!("{CLASS}{}", base_text()));
+    }
+    commit_all(&fx, L_MSG);
+    for f in [A, B] {
+        write(&fx, f, &feature_text());
+    }
+    commit_all(&fx, "小婉问答");
+    write_mark(&fx.wc_str()).unwrap();
+    for f in [A, B] {
+        tortoise_commit(&fx, f);
+    }
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(fx.wc().join(B))
+        .unwrap();
+
+    let rep = done(follow(&fx.wc_str(), "op1").unwrap());
+
+    let restore = rep.restore.expect("有放回结果");
+    assert_eq!(restore.restored, vec![A.to_string()], "{restore:?}");
+    assert_eq!(restore.skipped.len(), 1, "{restore:?}");
+    assert_eq!(restore.skipped[0].path, B);
+    assert!(
+        restore.commits.contains_key(B),
+        "没放回的也写明补丁：{restore:?}"
+    );
+    // 锁还在时横幅照样列出：核对只读，读得了
+    let pending = pending_restores(&fx.wc_str()).unwrap();
+    assert_eq!(
+        pending.iter().map(|p| p.path.as_str()).collect::<Vec<_>>(),
+        vec![B]
+    );
+    drop(held);
+
+    let out = restore_local_only(&fx.wc_str(), "op2", &[B.to_string()]).unwrap();
+
+    assert_eq!(out.restored, vec![B.to_string()], "{out:?}");
+    assert_eq!(read(&fx, B), format!("{CLASS}{}", feature_text()));
+    assert!(pending_restores(&fx.wc_str()).unwrap().is_empty());
+}
+
+/// 「不放回」：从清单删掉，磁盘不动；空列表什么都不做。
+#[test]
+fn dismissing_a_pending_restore_leaves_the_disk_alone() {
+    let fx = hybrid_with_colleague();
+    let held = not_mine_case(&fx);
+    let pending = pending_restores(&fx.wc_str()).unwrap();
+    assert_eq!(pending.len(), 1, "{pending:?}");
+
+    dismiss_pending_restores(&fx.wc_str(), "op3", &[]).unwrap();
+    assert_eq!(
+        pending_restores(&fx.wc_str()).unwrap().len(),
+        1,
+        "空列表不删"
+    );
+
+    dismiss_pending_restores(&fx.wc_str(), "op3", &[A.to_string()]).unwrap();
+
+    assert!(pending_restores(&fx.wc_str()).unwrap().is_empty());
+    assert_eq!(read(&fx, A), held, "磁盘不动");
+}
+
+/// 不是我最后提交的：跟进不写磁盘，原因写进放回结果，横幅列出文件和补丁，按钮能放回。
+#[test]
+fn a_file_last_committed_by_someone_else_is_left_to_the_banner() {
+    let fx = hybrid_with_colleague();
+    let held = not_mine_case(&fx);
+
+    let pending = pending_restores(&fx.wc_str()).unwrap();
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    assert_eq!(pending[0].path, A);
+    assert!(
+        pending[0]
+            .commits
+            .iter()
+            .any(|c| c.ends_with(" add @avatarclass")),
+        "{pending:?}"
+    );
+
+    let out = restore_local_only(&fx.wc_str(), "op3", &[A.to_string()]).unwrap();
+
+    assert_eq!(out.restored, vec![A.to_string()], "{out:?}");
+    assert_eq!(read(&fx, A), format!("{CLASS}{held}"));
+    assert!(
+        pending_restores(&fx.wc_str()).unwrap().is_empty(),
+        "放回后清单清空"
+    );
+}
+
+/// 跟进之后磁盘上有了用户自己的编辑：横幅不再列它，下一次跟进把它从清单里修剪掉。
+#[test]
+fn an_edit_after_follow_drops_the_file_from_the_banner() {
+    let fx = hybrid_with_colleague();
+    let held = not_mine_case(&fx);
+    write(&fx, A, &format!("{held}my edit\n"));
+
+    // 横幅现场重验不过，不再列；清单文件里的条目还在（横幅只读、不修剪）
+    assert!(pending_restores(&fx.wc_str()).unwrap().is_empty());
+    assert_eq!(pending_list(&fx.wc_str()), vec![A.to_string()]);
+}
+
+/// 下一次真正完成的跟进把「再等也不会满足」的条目从清单里删掉，即使这次没有新的可放回文件
+/// （review M1、M2）。
+#[test]
+fn the_next_completed_follow_prunes_entries_that_can_never_be_restored() {
+    const C: &str = "Code/C.cs";
+    let fx = hybrid_with_colleague();
+    let held = not_mine_case(&fx);
+    write(&fx, A, &format!("{held}my edit\n"));
+    assert_eq!(pending_list(&fx.wc_str()), vec![A.to_string()], "前提");
+    // 同事改了一个无关的文件：这次跟进能完成，但没有可放回的文件
+    fx.colleague_commits(C, "c\n");
+    svn_cmd(&fx.wc(), &["update", "--non-interactive", "--", C]);
+
+    let rep = done(follow(&fx.wc_str(), "op4").unwrap());
+
+    assert!(rep.restorable.is_empty(), "{rep:?}");
+    assert!(
+        pending_list(&fx.wc_str()).is_empty(),
+        "磁盘有编辑的条目被修剪掉"
+    );
+    assert_eq!(read(&fx, A), format!("{held}my edit\n"), "编辑原样保留");
+}
+
+/// 暂时满足不了的（暂存了别的版本）留在清单里，修剪不删。
+#[test]
+fn pruning_keeps_entries_that_may_become_restorable_later() {
+    const C: &str = "Code/C.cs";
+    let fx = hybrid_with_colleague();
+    not_mine_case(&fx);
+    // 暂存一个别的版本：放回条件不满足，但取消暂存之后又满足
+    let held = read(&fx, A);
+    write(&fx, A, "staged\n");
+    git(&fx, &["add", A]);
+    write(&fx, A, &held);
+    fx.colleague_commits(C, "c\n");
+    svn_cmd(&fx.wc(), &["update", "--non-interactive", "--", C]);
+
+    done(follow(&fx.wc_str(), "op4").unwrap());
+
+    assert_eq!(pending_list(&fx.wc_str()), vec![A.to_string()]);
+}
+
+/// 有意去掉补丁、还没提交时，`svn update` 带来同事对这个文件的改动（同 `svn_follow_auto.rs` 的
+/// 同名场景）。返回跟进后的磁盘内容（同事的版本，没有补丁）。
+fn not_mine_case(fx: &SvnFixture) -> String {
+    i_commit(fx);
+    write(fx, A, &base_text());
+    tortoise_commit(fx, A);
+    done(follow(&fx.wc_str(), "op0").unwrap());
+    write(fx, A, &format!("{CLASS}{}", base_text()));
+    commit_all(fx, L_MSG);
+    // 提交 SVN 前去掉补丁
+    write(fx, A, &base_text());
+    // 改最后一行：补丁加在第一行前面，挨着改会重放冲突
+    let theirs = base_text().replace("l6\n", "l6 colleague\n");
+    fx.colleague_commits(A, &theirs);
+    set_author(fx, youngest(fx), "colleague");
+    svn_cmd(&fx.wc(), &["update", "--non-interactive", "--", A]);
+    assert_eq!(
+        read(fx, A),
+        theirs,
+        "前提：update 带来同事的改动，补丁仍不在磁盘上"
+    );
+
+    let rep = done(follow(&fx.wc_str(), "op1").unwrap());
+
+    assert_eq!(rep.restorable, vec![A.to_string()], "{rep:?}");
+    let restore = rep.restore.expect("有放回结果");
+    assert!(restore.restored.is_empty(), "{restore:?}");
+    assert_eq!(restore.skipped.len(), 1, "{restore:?}");
+    assert!(restore.skipped[0].reason.contains("不是你"), "{restore:?}");
+    assert!(restore.commits.contains_key(A), "{restore:?}");
+    assert_eq!(read(fx, A), theirs, "不自动写");
+    theirs
+}
+
+fn youngest(fx: &SvnFixture) -> u64 {
+    let out = Command::new("svnlook")
+        .args(["youngest", &fx.repo().to_string_lossy()])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+}
+
+/// file:// 下作者都是系统用户，同事的 revision 要在 update 之前改 revprop（同 `svn_follow_auto.rs`）。
+fn set_author(fx: &SvnFixture, rev: u64, who: &str) {
+    let f = fx.path().join(format!("author-{rev}.txt"));
+    std::fs::write(&f, who).unwrap();
+    let out = Command::new("svnadmin")
+        .args([
+            "setrevprop",
+            &fx.repo().to_string_lossy(),
+            "-r",
+            &rev.to_string(),
+            "svn:author",
+            &f.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

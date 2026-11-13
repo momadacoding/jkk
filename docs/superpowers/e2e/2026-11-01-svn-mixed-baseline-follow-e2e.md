@@ -42,7 +42,8 @@
 - [x] 场景 7：feature 与提交冲突 → 标「落后基线」→「切换并手动跟进」→ 解冲突 → 继续
 - [x] 场景 8：「仅切换」到落后分支 → 横幅「当前分支落后基线」→ 跟进 → 转手动跟进
 - [x] 场景 9：Local-Only 补丁 + 「提交后恢复」只提交功能改动 → 不告警、补丁还在；整文件提交 → 告警
-- [ ] 场景 9B：跟进后「放回 Local-Only 补丁」→ 磁盘带回补丁、git 干净；磁盘有自己的编辑时跳过（2026-11-12 新增，未跑）
+- [x] 场景 9B：跟进后自动把 Local-Only 补丁放回磁盘 → 磁盘带回补丁、git 干净；磁盘有自己的编辑时不写（2026-11-13 agent 经 CDP 驱动真实窗口跑过；修正了清单里漏的「commit 之后先点回应用」）
+- [x] 场景 9C：提交 SVN 前去掉补丁 → 自动跟进直接完成并放回；同事改过的不自动放回、横幅「缺 Local-Only 补丁」放回 / 不放回（2026-11-13 同上；修正了同事那一步会造出空 commit 的命令）
 - [x] 场景 10：只提交删除 → 跟进后记成墓碑
 - [x] 场景 11：SVN 操作进行中切回 jkk → 「SVN 正在更新…」
 - [x] 场景 12：周一根目录整体更新 → 跟进后基线回到单值旧格式
@@ -646,17 +647,17 @@ G add Code/Deep/R.cs; G commit -q -m "add class`n`nLocal-Only: true"
 # 普通 commit：删掉这一行，另加功能
 Wc 'Code/Deep/R.cs' "class R {`n  int a;`n  int b;`n}`n"
 G add Code/Deep/R.cs; G commit -q -m '小婉问答'
+```
+
+**先点一下应用窗口，再点回操作窗口**（真实工作流里这两个 commit 是在 jkk 里做的，切去 TortoiseSVN 的那一刻失焦快照才包含它们；漏了这一步，快照停在两个 commit 之前，跟进会把「小婉问答」当成还没上 SVN 的提交照常重放，分支与磁盘一致，看不到放回）：
+
+```powershell
 SvnCommit 'Code/Deep/R.cs'
 ```
 
-**操作（应用）：** 点回应用 → 跟进。
+**操作（应用）：** 点回应用 → 跟进（或者等自动跟进）。前提：场景 1 里填过「我的 SVN 用户名」（`file://` 仓库探测不到；没填时所有提交都算别人的，同样看不到放回）。
 
-**应该看到：** 「跟进完成」的「需要你留意」里：
-
-- 「分支与磁盘对不上」列出 `Code/Deep/R.cs`；
-- 下面一行说明，加按钮 **「放回 Local-Only 补丁（1 个文件）」**。
-
-点按钮。按钮消失，显示「已放回 1 个文件的 Local-Only 补丁。…」。
+**应该看到：** 跟进完成，报告「这次跟进做了什么」里有 **「已放回的 Local-Only 补丁」**，列出 `Code/Deep/R.cs ← <短 hash> add class`。摘要下面一行写「工作区里只放回了 1 个文件的 Local-Only 补丁，其余文件没有改动」。「分支与磁盘对不上」里**没有** R.cs，也没有放回按钮。
 
 ```powershell
 Get-Content (Join-Path $WC 'Code/Deep/R.cs') -TotalCount 1   # ---@class R
@@ -664,17 +665,76 @@ G status --short                                              # 没有 R.cs
 svn status (Join-Path $WC 'Code/Deep/R.cs')                    # M
 ```
 
-**反例（操作窗口 + 应用）：** 磁盘上有你自己的编辑时不覆盖。重做造现场 2，换一个文件 `Code/Deep/R2.cs`（同样先做造现场 1）。跟进之后、点按钮之前，先在操作窗口执行 `Wc 'Code/Deep/R2.cs' "mine`n"`，再点按钮。
+**反例（操作窗口 + 应用）：** 磁盘上有你自己的编辑时不覆盖。重做造现场 2，换一个文件 `Code/Deep/R2.cs`（同样先做造现场 1），但 `SvnCommit` 之后、跟进之前，先在操作窗口执行 `Wc 'Code/Deep/R2.cs' "mine`n"`，再跟进。
 
-**应该看到：** 「一个文件都没放回，1 个跳过了：」，原因是「磁盘上的内容不是 SVN 的版本」。`R2.cs` 的内容仍是 `mine`。
+**应该看到：** 横幅「没有自动跟进：……重放出来的结果和磁盘对不上（Code/Deep/R2.cs）。可能是文件里还有没提交的改动……」；点「跟进」后报告里 R2.cs 列在「提交与 SVN 都改过、和磁盘不一致的文件」，不在 Local-Only 那两节里；`R2.cs` 的内容仍是 `mine`；顶部不出现「缺 Local-Only 补丁」横幅。
 
 **看到别的说明：**
 
 | 现象 | 含义 |
 |---|---|
-| 没有按钮 | `restorable` 没算出来：看日志里「判断能否放回 Local-Only 补丁时出错」 |
-| 点完 `G status` 里有 `R.cs` | 写回的内容与 HEAD 不同（换行或过滤规则），或者索引不是 HEAD |
+| R.cs 在「没放回的 Local-Only 补丁」里，原因「SVN 上最后改它的不是你」 | 「我的 SVN 用户名」没认出来：在报告底部填上再试 |
+| R.cs 在「分支与磁盘对不上」里 | `restorable` 没算出来：看日志里「判断能否放回 Local-Only 补丁时出错」 |
+| `G status` 里有 `R.cs` | 写回的内容与 HEAD 不同（换行或过滤规则），或者索引不是 HEAD |
 | 反例里 `mine` 被覆盖 | 磁盘核对失效，**阻断问题** |
+
+---
+
+## 场景 9C：提交 SVN 前去掉 Local-Only 补丁（使用报告 2026-11-12）
+
+真实工作流：分支上有 Local-Only 提交，提交 SVN 前在磁盘上去掉补丁，用 TortoiseSVN 提交，再 update。以前自动跟进被拦（「重放出来的结果和磁盘对不上」），补丁要手动点按钮才放回，报告还建议把磁盘版本提交进分支。
+
+**造现场 1（操作窗口）：** 同 9B 的造现场 1，文件换成 `Code/Deep/S.cs`；回应用跟进。然后：
+
+```powershell
+# Local-Only commit：加一行，磁盘带着补丁
+Wc 'Code/Deep/S.cs' "---@class S`nclass R {`n  int a;`n}`n"
+G add Code/Deep/S.cs; G commit -q -m "add @avatarclass`n`nLocal-Only: true"
+```
+
+**先点一下应用窗口，再点回操作窗口**（理由同 9B：失焦快照要包含这个 commit），然后：
+
+```powershell
+# 提交 SVN 前：去掉补丁，顺手改一处，提交
+Wc 'Code/Deep/S.cs' "class R {`n  int a;`n  int b;`n}`n"
+SvnCommit 'Code/Deep/S.cs'
+```
+
+**操作（应用）：** 点回应用，等自动跟进（钩子注册了的话 TortoiseSVN 提交完就会触发）。
+
+**应该看到：**
+
+- 横幅上**没有**「没有自动跟进」的原因行；出现「已自动跟进 SVN 侧的新内容」，提示是安静的灰色；
+- 点「查看详情」：「已放回的 Local-Only 补丁」列出 `Code/Deep/S.cs ← <短 hash> add @avatarclass`；
+- `Get-Content` 第一行是 `---@class S`；`G status --short` 里没有 S.cs；`svn status` 是 `M`。
+
+**同事改过的（操作窗口 + 应用）：** 有意去掉补丁、还没提交时，update 带来同事的改动，这时不替你放回。
+
+```powershell
+# 上一步已经放回了补丁，分支上的 Local-Only commit 还在，这里只在磁盘上再去掉一次（模拟准备提交）
+Wc 'Code/Deep/S.cs' "class R {`n  int a;`n  int b;`n}`n"
+# 同事改最后一行并提交（Colleague 自带 --username colleague，作者就是别人），然后 update
+Colleague 'Code/Deep/S.cs' "class R {`n  int a;`n  int b;`n} // colleague`n"
+svn update -q --non-interactive (Join-Path $WC 'Code/Deep/S.cs')
+```
+
+点回应用。
+
+**应该看到：**
+
+- 横幅「SVN 侧有新内容」的原因行写着「分支只比磁盘多 Local-Only 补丁，但 SVN 上最后改它的不是你……可能是你有意去掉的补丁，不自动放回」；
+- 点「跟进」：报告「没放回的 Local-Only 补丁」列出 S.cs，附注是提交和原因；下面有「放回 Local-Only 补丁（1 个文件）」按钮，按钮上方列出 `S.cs ← …`；
+- **不点按钮**，关掉报告：顶部多一条横幅「1 个文件缺 Local-Only 补丁」，列出 `Code/Deep/S.cs ← …`，按钮「放回」「不放回」；
+- 点「不放回」：横幅消失，磁盘不变。重做一遍，这次点「放回」：横幅消失，磁盘第一行回到 `---@class S`，`G status` 干净。
+
+**看到别的说明：**
+
+| 现象 | 含义 |
+|---|---|
+| 同事那一步磁盘被自动写了 | 「我的」判断失效（`auto_restorable`），**阻断问题** |
+| 关掉报告后没有横幅 | 待放回清单没写进去：看日志「更新待放回清单失败」；或者 `.git/mygitclient/restore-pending.json` 不存在 |
+| 横幅在 TortoiseSVN 提交前、自己去掉补丁时冒出来 | 横幅在按「当前状态」推断，违背计划的 C，**阻断问题** |
+| 状态栏一直在刷新 | 横幅查询拿了同步锁，watcher 回路 |
 
 ---
 
@@ -1050,7 +1110,7 @@ Remove-Item -Recurse -Force $fix.FullName
 | 工作副本被锁时判为「正在更新」 | `svn_sync.rs::locked_working_copy_reports_wc_locked` |
 | 已提交的删除成为墓碑；漏收（depth-exclude）拒绝录制；确认失败拒绝 | `svn_health.rs::committed_deletion_becomes_tombstone_when_just_recorded` 及同文件的 exclude / unconfirmed 测试 |
 | Local-Only 泄漏按 hunk 判定（含相邻行、行号偏移） | `svn_leak.rs::leak_by_hunk_matches_w21_scenarios` 等 |
-| 放回 Local-Only 补丁：真实现场形状、磁盘有编辑 / 有暂存 / 有普通 commit / skip-worktree / 分支落后基线时跳过、重复点、空列表、仓库外路径、文件被锁、写到一半失败、同步中途 / 索引被占 / 没做换行迁移时拒绝、空格与 `%` 路径；普通 commit 合错的 drift 不算可放回 | `src-tauri/tests/svn_restore_local_only.rs`、`svn_follow_snapshot.rs::a_clean_but_wrong_replay_is_reported_as_drift` |
+| 放回 Local-Only 补丁：跟进后自动放回（我最后提交的）、同事最后改的不自动写而进待放回清单、跟进时文件被占用留在清单里、横幅放回 / 不放回、跟进后有编辑就不再列；真实现场形状、磁盘有编辑 / 有暂存 / 有普通 commit / skip-worktree / 分支落后基线时跳过、重复点、空列表、仓库外路径、文件被锁、写到一半失败、同步中途 / 索引被占 / 没做换行迁移时拒绝、空格与 `%` 路径；普通 commit 合错的 drift 不算可放回。自动跟进：提交 SVN 前去掉补丁不再被拦、去掉后又编辑照旧拦、同事改过的照旧拦并说明原因（`svn_follow_auto.rs` 末尾三条） | `src-tauri/tests/svn_restore_local_only.rs`、`svn_follow_snapshot.rs::a_clean_but_wrong_replay_is_reported_as_drift` |
 | 落后分支磁盘还是旧内容时转手动跟进 | `branch_entry_sends_a_stale_disk_to_manual_follow`、`a_stale_disk_on_a_lagging_branch_also_stops_a_recording_follow` |
 | 手动跟进带着暂存 / 未暂存 / 未跟踪的改动：继续、放弃、崩溃后续上都原样放回 | `manual_follow_restores_staging_with_index_when_possible`、`manual_follow_abort_after_a_crash_restores_everything` 等用 `wip()` 造现场的一组 |
 | 手动跟进暂存没保住时 stash 保留、能取回 | `manual_follow_stage_lost_keeps_a_stage_that_differs_from_disk` |

@@ -18,8 +18,10 @@ import {
 } from '../engine/svnJournal'
 import {
   describeAutoFollowSkip,
+  describePendingRestores,
   type AutoFollowNotice,
   type FollowActionId,
+  type PendingRestore,
 } from '../engine/svnFollow'
 import type { SyncActionId } from '../engine/svnSyncIn'
 import type { SyncOutActionId } from '../engine/svnSyncOut'
@@ -86,6 +88,16 @@ interface BaselineBannerProps {
   onAutoFollowedDetails?: () => void
   /** 提示上的「知道了」。 */
   onAutoFollowedDismiss?: () => void
+  /**
+   * 跟进记下、此刻现场重验能放回的文件（计划 2026-11-12-auto-restore-local-only 的 C）。空数组不挂。
+   */
+  pendingRestores?: PendingRestore[]
+  /** 「放回」。没传时不渲染这一条横幅。 */
+  onRestorePending?: () => void
+  /** 「不放回」。 */
+  onDismissPending?: () => void
+  /** 放回执行中。 */
+  restoreBusy?: boolean
 }
 
 /**
@@ -141,6 +153,10 @@ export function BaselineBanner({
   autoFollowed = null,
   onAutoFollowedDetails,
   onAutoFollowedDismiss,
+  pendingRestores = [],
+  onRestorePending,
+  onDismissPending,
+  restoreBusy = false,
 }: BaselineBannerProps) {
   // 未收尾 / 同步进行中排在最前，其余一律让位：那两种状态下仓库停在中间态，
   // 别的横幅拿半推进的基线算出来的结论可能是错的，而它们的出口（重建基线）
@@ -168,8 +184,20 @@ export function BaselineBanner({
       : null
   // 自动跟进的提示不受 hushed 影响：它说的是已经做完的事
   const notice = isSvn ? autoFollowed : null
+  // 中间态时让位：后端那时也不给数据，这里再挡一次
+  const missingPatch =
+    isSvn && !hushed && onRestorePending ? describePendingRestores(pendingRestores) : null
 
-  if (!unfinished && !eolModel && !model && !auditModel && !standalone && !staleHooks && !notice) {
+  if (
+    !unfinished &&
+    !eolModel &&
+    !model &&
+    !auditModel &&
+    !standalone &&
+    !staleHooks &&
+    !notice &&
+    !missingPatch
+  ) {
     return null
   }
 
@@ -184,6 +212,29 @@ export function BaselineBanner({
           <div className="banner-baseline-actions">
             {onAutoFollowedDetails && <button onClick={onAutoFollowedDetails}>查看详情</button>}
             {onAutoFollowedDismiss && <button onClick={onAutoFollowedDismiss}>知道了</button>}
+          </div>
+        </div>
+      )}
+      {missingPatch && (
+        <div className="banner-baseline warn">
+          <div className="banner-baseline-head">
+            <strong>{missingPatch.title}</strong>
+          </div>
+          <p className="banner-baseline-detail">{missingPatch.detail}</p>
+          <ul className="banner-baseline-files">
+            {missingPatch.files.map((f) => (
+              <li key={f}>{f}</li>
+            ))}
+          </ul>
+          <div className="banner-baseline-actions">
+            <button disabled={restoreBusy} onClick={onRestorePending}>
+              {restoreBusy ? '正在放回…' : '放回'}
+            </button>
+            {onDismissPending && (
+              <button disabled={restoreBusy} onClick={onDismissPending}>
+                不放回
+              </button>
+            )}
           </div>
         </div>
       )}

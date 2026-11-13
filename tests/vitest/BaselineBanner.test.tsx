@@ -328,3 +328,79 @@ describe('BaselineBanner：自动跟进（事故分析 6.12）', () => {
     expect(document.querySelectorAll('.banner-baseline')).toHaveLength(0)
   })
 })
+
+describe('BaselineBanner「缺 Local-Only 补丁」横幅（计划 2026-11-12-auto-restore-local-only 的 C）', () => {
+  const pending = [{ path: 'Code/A.cs', commits: ['fae50a8 add @avatarclass'] }]
+  const idle: SyncState = { locked: false, holder: null, unfinished: null }
+
+  function renderPending(over: Partial<Parameters<typeof BaselineBanner>[0]> = {}) {
+    const onRestorePending = vi.fn()
+    const onDismissPending = vi.fn()
+    render(
+      <BaselineBanner
+        isSvn
+        sync={null}
+        audit={null}
+        eol={null}
+        syncState={idle}
+        onRebuild={() => {}}
+        onCheck={() => {}}
+        onMigrateEol={() => {}}
+        onSyncAction={() => {}}
+        onSyncOutAction={() => {}}
+        onSvnUpdate={() => {}}
+        pendingRestores={pending}
+        onRestorePending={onRestorePending}
+        onDismissPending={onDismissPending}
+        {...over}
+      />,
+    )
+    return { onRestorePending, onDismissPending }
+  }
+
+  it('列出文件和补丁，「放回」「不放回」各走各的', () => {
+    const { onRestorePending, onDismissPending } = renderPending()
+    expect(screen.getByText('1 个文件缺 Local-Only 补丁')).toBeTruthy()
+    expect(screen.getByText('Code/A.cs ← fae50a8 add @avatarclass')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '放回' }))
+    fireEvent.click(screen.getByRole('button', { name: '不放回' }))
+    expect(onRestorePending).toHaveBeenCalledTimes(1)
+    expect(onDismissPending).toHaveBeenCalledTimes(1)
+  })
+
+  it('放回进行中两颗按钮都禁用', () => {
+    renderPending({ restoreBusy: true })
+    expect((screen.getByRole('button', { name: '正在放回…' }) as HTMLButtonElement).disabled).toBe(
+      true,
+    )
+    expect((screen.getByRole('button', { name: '不放回' }) as HTMLButtonElement).disabled).toBe(
+      true,
+    )
+  })
+
+  it('空清单不挂', () => {
+    renderPending({ pendingRestores: [] })
+    expect(screen.queryByText(/缺 Local-Only 补丁/)).toBeNull()
+  })
+
+  it('没接「放回」时不挂：留一颗点了没反应的按钮比没有更糟', () => {
+    renderPending({ onRestorePending: undefined })
+    expect(screen.queryByText(/缺 Local-Only 补丁/)).toBeNull()
+  })
+
+  it('同步停在中途时让位', () => {
+    renderPending({
+      syncState: {
+        locked: false,
+        holder: null,
+        unfinished: { flow: 'follow', phase: 'follow-publishing', opid: 'x', startedAt: 1 },
+      },
+    })
+    expect(screen.queryByText(/缺 Local-Only 补丁/)).toBeNull()
+  })
+
+  it('不是 SVN 仓库时不挂', () => {
+    renderPending({ isSvn: false })
+    expect(screen.queryByText(/缺 Local-Only 补丁/)).toBeNull()
+  })
+})

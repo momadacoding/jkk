@@ -973,6 +973,7 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     };
     use app_lib::engine::svn_follow_index::{ComposeReport, StageDecision};
     use app_lib::engine::svn_leak::{HunkLeak, Leak, LeakVerdict, StageTally};
+    use app_lib::engine::svn_restore_local_only::{RestoreOutcome, RestoreSkip};
     use app_lib::engine::svn_sync::ExternalChange;
     use std::collections::BTreeMap;
 
@@ -1081,6 +1082,17 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
             snapshot: vec![("c3".into(), vec!["Code/B.cs".into()])],
             drift: vec!["Code/E.cs".into()],
             restorable: vec!["Code/E.cs".into()],
+            restore: Some(RestoreOutcome {
+                restored: vec!["Code/E.cs".into()],
+                skipped: vec![RestoreSkip {
+                    path: "Code/H.cs".into(),
+                    reason: "不是你".into(),
+                    retry: true,
+                }],
+                commits: [("Code/E.cs".to_string(), vec!["fae50a8 add".to_string()])]
+                    .into_iter()
+                    .collect(),
+            }),
             overlap: vec![OverlapFile {
                 path: "Code/F.cs".into(),
                 commits: vec!["e381033 add".into()],
@@ -1141,6 +1153,16 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     assert_eq!(r["snapshot"][0], serde_json::json!(["c3", ["Code/B.cs"]]));
     assert_eq!(r["drift"][0], "Code/E.cs");
     assert_eq!(r["restorable"][0], "Code/E.cs", "实际 {v}");
+    // 前端读这几个字段；retry 只在后端用，不出现在 JSON 里
+    assert_eq!(
+        r["restore"],
+        serde_json::json!({
+            "restored": ["Code/E.cs"],
+            "skipped": [{ "path": "Code/H.cs", "reason": "不是你" }],
+            "commits": { "Code/E.cs": ["fae50a8 add"] },
+        }),
+        "实际 {v}"
+    );
     assert_eq!(
         r["overlap"][0],
         serde_json::json!({ "path": "Code/F.cs", "commits": ["e381033 add"], "matchesDisk": true })
@@ -1157,8 +1179,9 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     // 6.10 之前的 journal 也没有 snapshot / drift
     old.as_object_mut().unwrap().remove("snapshot");
     old.as_object_mut().unwrap().remove("drift");
-    // 9.1 之前的 journal 没有 restorable
+    // 9.1 之前的 journal 没有 restorable，自动放回之前的没有 restore
     old.as_object_mut().unwrap().remove("restorable");
+    old.as_object_mut().unwrap().remove("restore");
     // 方案 B 之前的 journal 没有 overlap
     old.as_object_mut().unwrap().remove("overlap");
     let back: FollowReport = serde_json::from_value(old).unwrap();
@@ -1167,7 +1190,7 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
         (Evidence::Heuristic, None)
     );
     assert!(back.snapshot.is_empty() && back.drift.is_empty() && back.overlap.is_empty());
-    assert!(back.restorable.is_empty());
+    assert!(back.restorable.is_empty() && back.restore.is_none());
 
     let s = &r["stage"];
     assert_eq!(s["decisions"]["Code/A.cs"], "takeNew", "实际 {v}");
