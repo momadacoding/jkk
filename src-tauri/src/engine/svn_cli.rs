@@ -1,6 +1,7 @@
 //! svn 子进程的唯一入口。形状对齐 `engine::git_cli`。
 
-use crate::engine::proc::hidden_command;
+use crate::engine::perf;
+use crate::engine::proc::{self, hidden_command};
 use crate::error::{GitError, Result};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -34,9 +35,12 @@ pub fn svn_command(path: &str) -> Command {
 pub fn run_svn(path: &str, args: &[&str]) -> Result<String> {
     let key = scan_key(path, args);
     if let Some(hit) = key.as_deref().and_then(cached_scan) {
+        if perf::enabled() {
+            perf::record_cached(svn_command(path).args(with_global(args)));
+        }
         return Ok(hit);
     }
-    let output = svn_command(path).args(with_global(args)).output()?;
+    let output = proc::output(svn_command(path).args(with_global(args)))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         return Err(GitError::new("svn_cli", stderr));
@@ -204,7 +208,7 @@ fn remember_scan(key: String, out: &str) {
 /// （`E195002`，本地 add 了没提交）是**正常分类结果**而非错误，调用方必须看得到
 /// stderr 才能分辨，见 [`crate::engine::svn_pristine`]。
 pub fn run_svn_bytes(path: &str, args: &[&str]) -> Result<SvnBytes> {
-    let output = svn_command(path).args(with_global(args)).output()?;
+    let output = proc::output(svn_command(path).args(with_global(args)))?;
     Ok(SvnBytes {
         code: output.status.code().unwrap_or(-1),
         stdout: output.stdout,
@@ -231,7 +235,7 @@ pub struct SvnBytes {
 ///
 /// 进程本身起不来仍然返回 `Err`。
 pub fn run_svn_code(path: &str, args: &[&str]) -> Result<SvnOutput> {
-    let output = svn_command(path).args(with_global(args)).output()?;
+    let output = proc::output(svn_command(path).args(with_global(args)))?;
     // 正常退出时 code() 必有值；拿不到只可能是被信号杀掉（Windows 上不存在），
     // 那种情况用 -1 表示「未知」，调用方不会把它误当成某个有意义的退出码。
     Ok(SvnOutput {
@@ -284,10 +288,7 @@ pub fn probe_svn() -> SvnAvailability {
     // `--version --quiet` 只打一行版本号，是最便宜的存活探测（实测输出
     // `1.14.2-SlikSvn`）。用 `hidden_command` 而不是 `svn_command`：这里没有
     // 工作目录可言，设 current_dir 反而可能指向一个不存在的路径。
-    if let Ok(out) = hidden_command("svn")
-        .args(["--version", "--quiet"])
-        .output()
-    {
+    if let Ok(out) = proc::output(hidden_command("svn").args(["--version", "--quiet"])) {
         if out.status.success() {
             let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if !version.is_empty() {
@@ -318,10 +319,7 @@ fn persistent_path_has_svn() -> bool {
     const MACHINE: &str = r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
     const USER: &str = r"HKCU\Environment";
     [MACHINE, USER].iter().any(|key| {
-        let Ok(out) = hidden_command("reg")
-            .args(["query", key, "/v", "Path"])
-            .output()
-        else {
+        let Ok(out) = proc::output(hidden_command("reg").args(["query", key, "/v", "Path"])) else {
             return false;
         };
         if !out.status.success() {

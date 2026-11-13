@@ -268,7 +268,7 @@ pub fn svn_auth_listing(repo: &str, config_dir: Option<&Path>) -> Option<String>
         cmd.arg("--config-dir").arg(dir);
     }
     cmd.env("LC_ALL", "C").stdin(Stdio::null());
-    match cmd.output() {
+    match crate::engine::proc::output(&mut cmd) {
         Ok(out) if out.status.success() => Some(String::from_utf8_lossy(&out.stdout).into_owned()),
         Ok(out) => {
             log::warn!("svn auth 退出码 {:?}，取不到用户名", out.status.code());

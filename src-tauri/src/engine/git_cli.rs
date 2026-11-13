@@ -1,4 +1,5 @@
-use crate::engine::proc::hidden_command;
+use crate::engine::perf;
+use crate::engine::proc::{self, hidden_command};
 use crate::error::{GitError, Result};
 use std::fmt;
 use std::process::Command;
@@ -92,10 +93,11 @@ static SUPPORTED_GIT: OnceLock<GitVersion> = OnceLock::new();
 /// 在 2.25 上 `checkout` 成功、`rm` 不认 `--pathspec-from-file`，选中的文件只丢弃了一部分。
 fn ensure_supported_git() -> Result<()> {
     ensure_supported_git_with(&SUPPORTED_GIT, || {
-        hidden_command("git")
-            .arg("--version")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
+        proc::output(
+            hidden_command("git")
+                .arg("--version")
+                .env("GIT_TERMINAL_PROMPT", "0"),
+        )
     })
 }
 
@@ -175,7 +177,7 @@ pub fn run_git(path: &str, args: &[&str]) -> Result<String> {
 ///
 /// 进程本身起不来（git 不在 PATH）仍然是错误，照常返回 `Err`。
 pub fn run_git_code(path: &str, args: &[&str]) -> Result<(i32, String)> {
-    let output = git_command(path)?.args(args).output()?;
+    let output = proc::output(git_command(path)?.args(args))?;
     // 正常退出时 code() 必有值；拿不到只可能是被信号杀掉（Windows 上不存在），
     // 那种情况用 -1 表示「未知」，调用方不会把它误当成某个有意义的退出码
     let code = output.status.code().unwrap_or(-1);
@@ -188,7 +190,7 @@ pub fn run_git_code(path: &str, args: &[&str]) -> Result<(i32, String)> {
 /// 两处各写一遍 `if !status.success()`，迟早会有一处漏掉而把失败当成空输出——
 /// 对基线录制来说「`git add` 悄悄失败」会直接录出一个残缺的 tree。
 fn output_or_error(mut cmd: Command) -> Result<Vec<u8>> {
-    let output = cmd.output()?;
+    let output = proc::output(&mut cmd)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         return Err(GitError::new("git_cli", stderr));
@@ -375,20 +377,42 @@ fn pipe_through(
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    let mut child = cmd
-        .args(args)
+    cmd.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let mut sink = child.stdin.take().ok_or_else(|| {
-        GitError::new("git_cli", "拿不到子进程的 stdin，无法喂入内容".to_string())
-    })?;
+        .stderr(Stdio::piped());
+    // 从 spawn 计到 wait 结束（设计 §4.3）
+    let timer = perf::ProcTimer::start(&cmd);
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            if let Some(timer) = timer {
+                timer.finish(Err(&e));
+            }
+            return Err(e.into());
+        }
+    };
+    let Some(mut sink) = child.stdin.take() else {
+        // 设了 piped 就不该走到这里；万一走到，收掉子进程，记录也照常结账，
+        // 不让「每个子进程都看得见」在这条路上破例（review 第 6 条）
+        let _ = child.kill();
+        let waited = child.wait();
+        if let Some(timer) = timer {
+            timer.finish(waited.as_ref());
+        }
+        return Err(GitError::new(
+            "git_cli",
+            "拿不到子进程的 stdin，无法喂入内容".to_string(),
+        ));
+    };
     let (output, written) = std::thread::scope(|scope| {
         let writer = scope.spawn(move || sink.write_all(stdin_bytes));
         let output = child.wait_with_output();
         (output, writer.join())
     });
+    if let Some(timer) = timer {
+        timer.finish(output.as_ref().map(|o| &o.status));
+    }
     let written = match written {
         Ok(r) => r.map_err(GitError::from),
         Err(_) => Err(GitError::new(

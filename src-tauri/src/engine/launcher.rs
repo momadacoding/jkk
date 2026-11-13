@@ -65,6 +65,7 @@ pub fn spawn_detached(program: &str, args: &[String], cwd: Option<&str>) -> Resu
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }
+    crate::engine::perf::record_launch(command.get_program());
     let child = command.spawn().map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => not_found(program),
         _ => GitError::new("launcher", format!("启动 `{program}` 失败：{e}")),

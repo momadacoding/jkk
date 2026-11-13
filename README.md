@@ -528,7 +528,27 @@ Unity 场景用 UnityYAMLMerge 解冲突、看 diff 仍用 BC 的写法（路径
 | 限制 | 说明 |
 |---|---|
 | 快捷键被占用 | 别的程序先注册了同一组合时注册会失败：改快捷键时直接报错、保留原来的；启动时失败会在设置框里提示 |
-| 多开 | 没有做单实例。窗口藏在托盘里时再从开始菜单启动会开出第二个实例，它注册不上同一个快捷键 |
+| 多开 | 安装版 / 绿色版是单实例：再次启动只唤起已有窗口（包括藏在托盘里的），自己直接退出。`pnpm tauri dev` 不做单实例，几个 worktree 可以同时跑 |
+
+## 排查：性能记录模式
+
+带 `--perf` 启动时，jkk 把子进程（git / svn / gh）、前端每个命令的往返、提交等业务阶段的耗时写进一个 JSONL 文件，排查「慢在哪」不需要 ETW。默认关闭。设计见 `docs/superpowers/specs/2026-11-12-performance-monitor-design.md`。
+
+1. 完全退出 jkk，**包括托盘图标**。jkk 已在运行时再带参数启动只会唤起已有窗口，这次的 `--perf` 不生效，会弹框提示。
+2. 带参数启动：
+   - 安装版 / 绿色版：PowerShell 里 `& '<jkk.exe 的路径>' --perf`，或建一个目标末尾带 ` --perf` 的快捷方式。
+   - 开发：`pnpm tauri dev -- -- --perf`（第一个 `--` 之后交给 cargo，第二个之后才是应用的参数）。
+3. 标题末尾出现 `[perf]` 说明开着。照常操作：提交、切分支、等待空闲核对。
+4. 退出 jkk。记录在 `%LOCALAPPDATA%\com.momadacoding.jkk\logs\perf\`（开发版是 `com.momadacoding.jkk.dev`），每次启动一个文件，文件名里的时间是 UTC。
+5. 汇总：
+
+```powershell
+node scripts/perf-summary.mjs <文件>                  # 按名称的 count / p50 / p95 / max / total
+node scripts/perf-summary.mjs <文件> --around commit  # 每次提交前 0.5 s 到结束后 3 s 的时间线
+node scripts/perf-summary.mjs <文件> --json           # 同上，JSON 输出
+```
+
+记录里没有文件路径、提交说明和仓库内容：子进程只留子命令和选项名，其余参数只计个数；仓库只记目录名最后一段；命令参数和返回值只记数组长度。发给别人之前仍建议自己扫一眼。
 
 ## 注意事项
 

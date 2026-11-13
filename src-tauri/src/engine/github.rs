@@ -127,11 +127,11 @@ pub fn parse_pr_list(json: &str) -> Result<Vec<PullRequest>> {
 
 /// 查一种状态的 PR。`None` 表示这次查不到（gh 起不来或非零退出），已记日志。
 fn list_prs_in_state(path: &str, state: &str) -> Result<Option<Vec<PullRequest>>> {
-    let output = match gh_command(path)
-        .args(["pr", "list", "--state", state, "--limit", PR_LIMIT])
-        .args(["--json", PR_FIELDS])
-        .output()
-    {
+    let output = match crate::engine::proc::output(
+        gh_command(path)
+            .args(["pr", "list", "--state", state, "--limit", PR_LIMIT])
+            .args(["--json", PR_FIELDS]),
+    ) {
         Ok(output) => output,
         // 最常见的一种：这台机器上没装 gh
         Err(err) => {

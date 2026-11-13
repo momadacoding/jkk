@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from '@/store/ipc'
+import { perfSpan } from '@/store/perf'
 import { listen } from '@tauri-apps/api/event'
 import { Panel, Group, Separator } from 'react-resizable-panels'
 import { PANEL_GROUP_IDS } from '@/engine/layoutMemory'
@@ -341,7 +342,8 @@ export function RepoTab({
     [refreshChangesIn],
   )
 
-  const handleCommit = useCallback(async (msg: string, amend: boolean): Promise<boolean> => {
+  // 性能记录模式下整体一个 `commit` span，各步一个子 span（设计 §4.4）。函数体没有重新缩进
+  const handleCommit = useCallback((msg: string, amend: boolean): Promise<boolean> => perfSpan('commit', async () => {
     const path = state.path
     if (!path) return false
     // 跟进（自动的或按钮的）正拿着索引锁、要 CAS 分支：这时提交只会撞锁或让跟进中途回退（review 中-3）
@@ -356,12 +358,13 @@ export function RepoTab({
       if (state.capabilities.vcs === 'svn') {
         const staged = (state.status?.staged ?? []).map((f) => f.path)
         if (staged.length > 0) {
-          const warning = commitBeforeFollowWarning(staged, await freshSvnSync(path))
-          if (warning && !(await confirm({ ...warning, focusCancel: true }))) return false
+          const warning = commitBeforeFollowWarning(staged, await perfSpan('commit.freshSvnSync', () => freshSvnSync(path)))
+          // 等用户回答的时间单独一段，免得把整段 commit 的耗时撑大还看不出来
+          if (warning && !(await perfSpan('commit.confirm', () => confirm({ ...warning, focusCancel: true })))) return false
         }
       }
       try {
-        await invoke('commit', { path, message: msg, amend })
+        await perfSpan('commit.invoke', () => invoke('commit', { path, message: msg, amend }))
       } catch (err) {
         reportError(err)
         // 没提交上（hook 拒绝、同步进行中……）：写好的说明留着（review 第 6 条）
@@ -375,16 +378,19 @@ export function RepoTab({
         // 普通提交叠在原来的 HEAD 上，第二档的结论不变：记下新 HEAD，监听随后就不再跑那两次秒级的
         // svn status（H1）。amend 换了父提交，照常校验。要赶在监听（去抖 300 ms）之前；它只读一次 HEAD
         // （libgit2，毫秒级），排在状态前面不拖慢状态
-        state.capabilities.vcs === 'svn' && !amend ? noteOwnCommit(path).catch(() => undefined) : undefined,
-        refreshChanges(path).catch(reportError),
-        refreshGraph(path).catch(reportError),
+        // 三项各一个子 span：并发之后时间线上看得出谁在等谁（性能记录模式，决策日志 D4）
+        state.capabilities.vcs === 'svn' && !amend
+          ? perfSpan('commit.noteOwnCommit', () => noteOwnCommit(path)).catch(() => undefined)
+          : undefined,
+        perfSpan('commit.refreshChanges', () => refreshChanges(path)).catch(reportError),
+        perfSpan('commit.refreshGraph', () => refreshGraph(path)).catch(reportError),
       ])
       return true
     } finally {
       committing.current = false
       setAutoNudge((n) => n + 1)
     }
-  }, [state.path, state.capabilities.vcs, state.status, following, freshSvnSync, noteOwnCommit, confirm, refreshGraph, refreshChanges, reportError])
+  }, { staged: state.status?.staged.length ?? 0, amend }, (committed) => committed), [state.path, state.capabilities.vcs, state.status, following, freshSvnSync, noteOwnCommit, confirm, refreshGraph, refreshChanges, reportError])
 
   const runAndRefresh = useCallback(async (cmd: string, args: Record<string, unknown>, refresh: () => Promise<void>) => {
     if (!state.path) return

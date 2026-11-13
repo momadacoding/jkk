@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from '@/store/ipc'
 import { toErrorMessage } from '../engine/errors'
 
 /** 一次最多铺多少行。行数上万时 React 建 DOM 的开销肉眼可见。 */

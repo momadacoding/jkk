@@ -253,6 +253,7 @@ pub fn spawn_watched(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    crate::engine::perf::record_launch(command.get_program());
     let mut child = command.spawn().map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => not_found(),
         _ => GitError::new("launcher", format!("启动 `{program}` 失败：{e}")),

@@ -8,6 +8,46 @@ pub mod vcs;
 
 use tauri::Manager;
 
+/// 在 `app_log_dir()/perf/` 新建这次启动的记录文件，写文件头（设计 §4.1）。
+///
+/// 建不出来不能让应用起不来，但要让用户知道：这时日志插件还没装（release 根本不装），
+/// 光 `log::warn!` 没人看得见（review 第 3 条），所以弹一个不阻塞的提示框。标题不带 `[perf]`，
+/// 前端第一次 `perf_append` 拿到 `false` 后关掉自己。
+fn open_perf_log<R: tauri::Runtime>(app: &tauri::App<R>, extra_args: usize) {
+    let opened = app
+        .path()
+        .app_log_dir()
+        .map_err(|e| format!("取不到日志目录：{e}"))
+        .and_then(|dir| {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let path = dir
+                .join("perf")
+                .join(engine::perf::file_name(secs, std::process::id()));
+            engine::perf::PerfLog::create(path.clone())
+                .map_err(|e| format!("建不出 {}：{e}", path.display()))
+        });
+    match opened {
+        Ok(log) => {
+            engine::perf::install(log);
+            engine::perf::record(&engine::perf::meta_record(extra_args, tauri::is_dev()));
+        }
+        Err(reason) => {
+            log::warn!("性能记录没有打开：{reason}");
+            use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+            app.dialog()
+                .message(format!(
+                    "这次启动带了 --perf，但记录文件建不出来，性能记录没有打开。\n\n{reason}"
+                ))
+                .title("性能记录没有打开")
+                .kind(MessageDialogKind::Warning)
+                .show(|_| {});
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // `pnpm tauri dev` 用 `<identifier>.dev`：配置目录、WebView2 数据都与安装版分开，见 dev_profile。
@@ -17,6 +57,15 @@ pub fn run() {
     let identifier = dev_profile::runtime_identifier(&configured_identifier, tauri::is_dev());
     let seed_from_installed = identifier != configured_identifier;
     context.config_mut().identifier = identifier;
+
+    // 性能记录模式只认启动参数（设计 §4.1）。main.rs 已经先分流了 TortoiseSVN 钩子调用
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let perf_on = engine::perf::flag_in(&args);
+    let perf_extra_args = args
+        .iter()
+        .skip(1)
+        .filter(|a| a.as_os_str() != engine::perf::FLAG)
+        .count();
 
     let builder = tauri::Builder::default();
     // 全局单例：再次启动时唤起已有窗口（关到托盘的也拿出来），自己直接退出。
@@ -34,9 +83,33 @@ pub fn run() {
     let builder = if tauri::is_dev() {
         builder
     } else {
-        builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             desktop::show_main_window(app);
+            // 第二个实例带着 --perf 来、本进程没开：它马上就退出了，记录模式不会打开。
+            // 不在运行中途打开（设计 §4.1），只告诉用户怎么做
+            if engine::perf::flag_in(&args) && !engine::perf::enabled() {
+                log::warn!("已有 jkk 在运行，--perf 没有生效");
+                use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+                app.dialog()
+                    .message(
+                        "jkk 已经在运行，这次的 --perf 没有生效。\n\
+                         要打开性能记录，先完全退出 jkk（包括托盘图标），再带 --perf 启动。",
+                    )
+                    .title("性能记录没有打开")
+                    .kind(MessageDialogKind::Warning)
+                    .show(|_| {});
+            }
         }))
+    };
+    // 前端在页面脚本执行前就知道开没开，关闭时 invoke 从第一条起就原样转发（决策日志 D1）
+    let builder = if perf_on {
+        builder.plugin(
+            tauri::plugin::Builder::<tauri::Wry>::new("jkk-perf")
+                .js_init_script(engine::perf::INIT_SCRIPT)
+                .build(),
+        )
+    } else {
+        builder
     };
     // dev 首次启动从安装版复制种子。必须是插件：要赶在建窗口、前端读配置之前，见 dev_profile::plugin
     let builder = if seed_from_installed {
@@ -46,7 +119,10 @@ pub fn run() {
     };
     builder
         .plugin(tauri_plugin_dialog::init())
-        .setup(|app| {
+        .setup(move |app| {
+            if perf_on {
+                open_perf_log(app, perf_extra_args);
+            }
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
@@ -58,7 +134,11 @@ pub fn run() {
             // tauri.conf.json 里的 "jkk" 只是兜底，带版本的标题只能在运行期设。
             // 标题只是外观，设失败不能让应用起不来，所以不用 `?`
             if let Some(window) = app.get_webview_window("main") {
-                if let Err(e) = window.set_title(&build_info::window_title()) {
+                let mut title = build_info::window_title();
+                if engine::perf::enabled() {
+                    title.push_str(" [perf]");
+                }
+                if let Err(e) = window.set_title(&title) {
                     log::warn!("设置窗口标题失败: {e}");
                 }
             }
@@ -111,6 +191,7 @@ pub fn run() {
             commands::ops::save_patch,
             commands::ops::stage,
             commands::ops::unstage,
+            commands::perf::perf_append,
             commands::pr::list_pull_requests,
             commands::remote::fetch,
             commands::remote::pull,

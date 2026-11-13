@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from '@/store/ipc'
 import { Panel, Group, Separator } from 'react-resizable-panels'
 import { PANEL_GROUP_IDS } from '@/engine/layoutMemory'
 import { usePanelLayout } from '@/store/layoutStore'

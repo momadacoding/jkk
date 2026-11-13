@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from '@/store/ipc'
 import { useCallback, useEffect, useState } from 'react'
 import type { CustomCommand, CustomCommandPlan } from '../engine/customCommands'
 import { toErrorMessage } from '../engine/errors'
