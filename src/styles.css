@@ -1127,6 +1127,73 @@ body {
   overflow-wrap: anywhere;
 }
 
+/* 占着 worktree 的进程列表（WorktreeHoldersPanel）。挂在 worktree_busy 的错误下面，
+   每行左边是谁、怎么占的，右边是结束按钮。名字和路径可能很长，文字那列必须能断行、
+   按钮那列不能被挤没 */
+.dlg-holders {
+  margin-left: 54px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.dlg-holders-title {
+  color: #bbb;
+  font-size: 12px;
+}
+
+.dlg-holder {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 3px;
+}
+
+.dlg-holder-text {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.dlg-holder-name {
+  color: #ddd;
+  font-weight: 600;
+}
+
+.dlg-holder-pid {
+  margin-left: 8px;
+  color: #9aa0a6;
+  font-size: 12px;
+}
+
+.dlg-holder-reason {
+  color: #9aa0a6;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.dlg-holder button {
+  flex-shrink: 0;
+}
+
+/* 命令行一档的依据：等宽小字，长命令行任意处断行 */
+.dlg-holder-cmdline {
+  margin-top: 2px;
+  color: #7e848a;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+/* 点过一下、等确认：变红，和「结束进程」那一态分得开 */
+.dlg-holder button.danger:not(:disabled) {
+  color: #f3cdcd;
+  border-color: #e57373;
+  background: #4a1f1f;
+}
+
 /* ---------- 设置框（SettingsDialog） ---------- */
 
 /* 没有 .dlg-icon 那一列，警告不缩进 */

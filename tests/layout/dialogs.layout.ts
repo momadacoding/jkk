@@ -55,6 +55,7 @@ for (const size of SIZES) {
           })
           await page.locator('.dialog-actions button.primary').click()
           await expect(page.locator('.dlg-warning').last()).toBeVisible()
+          if (s.afterPrimaryShows) await expect(page.getByText(s.afterPrimaryShows)).toBeAttached()
         }
       })
 

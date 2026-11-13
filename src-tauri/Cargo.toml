@@ -61,6 +61,12 @@ windows = { version = "0.62", features = [
   "Win32_System_Registry",
   # 钩子的 stderr 按线程 ANSI 代码页写，TortoiseSVN 按它解读（C1h 日志 H4）
   "Win32_Globalization",
+  # 删 worktree 撞上「工作目录停在里面」时查出是哪个进程、按用户要求结束它
+  # （engine/process_holders.rs）：枚举进程、读 PEB / 命令行、TerminateProcess
+  "Win32_System_Threading",
+  "Win32_System_Diagnostics_Debug",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Wdk_System_Threading",
 ] }
 
 [dev-dependencies]

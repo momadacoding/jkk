@@ -20,6 +20,7 @@ pub mod ops;
 pub mod path;
 pub mod perf;
 pub mod proc;
+pub mod process_holders;
 pub mod refs;
 pub mod remote_head_cache;
 pub mod repo;

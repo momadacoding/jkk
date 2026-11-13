@@ -1054,3 +1054,100 @@ fn create_surfaces_the_real_git_error() {
         err.message,
     );
 }
+
+/// 起一个工作目录停在 `cwd` 的空转 cmd，**不是本测试进程的后代**：经 PowerShell 的
+/// Start-Process 起，起它的 powershell 随即退出。复刻真实案例：一个父进程早已退出的
+/// 孤儿（当时是 Codex 的 broker）把 worktree 当工作目录挂着，删除一直失败。本进程直接
+/// 起的子进程会被认成「本应用自己的」，不给结束。
+#[cfg(windows)]
+struct Orphan(u32);
+
+#[cfg(windows)]
+impl Orphan {
+    fn start_in(cwd: &std::path::Path) -> Self {
+        let script = format!(
+            "(Start-Process -FilePath cmd.exe -ArgumentList '/k' -WorkingDirectory '{}' \
+             -WindowStyle Hidden -PassThru).Id",
+            cwd.display()
+        );
+        let out = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+            .unwrap();
+        let pid = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        // 等它真的把 cwd 设进去
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        Orphan(pid)
+    }
+
+    fn alive(&self) -> bool {
+        let out = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", self.0), "/NH"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).contains(&self.0.to_string())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Orphan {
+    fn drop(&mut self) {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/PID", &self.0.to_string()])
+            .output();
+    }
+}
+
+/// 整条路：删除撞上 `worktree_busy` → 报错里点名进程 → 列出持有者 → 结束它 → 再删成功。
+#[cfg(windows)]
+#[test]
+fn a_worktree_held_as_a_working_directory_can_be_freed_and_deleted() {
+    let (_dir, wt) = repo_with_worktree("held");
+    let main = main_of(&wt);
+    let (main_s, wt_s) = (
+        main.to_str().unwrap().to_string(),
+        wt.to_str().unwrap().to_string(),
+    );
+    let src = wt.join("src");
+    fs::create_dir_all(&src).unwrap();
+    let orphan = Orphan::start_in(&src);
+    let pid = orphan.0;
+
+    let busy = try_delete(&main, &wt, false);
+    assert_eq!(busy.code, "worktree_busy");
+    assert!(
+        busy.message.contains(&format!("PID {pid}")),
+        "报错该点名占着它的进程：{}",
+        busy.message
+    );
+    let holders = cmd::worktree_holders(main_s.clone(), wt_s.clone()).unwrap();
+    let h = holders
+        .iter()
+        .find(|h| h.pid == pid)
+        .unwrap_or_else(|| panic!("该列出 {pid}：{holders:?}"));
+    assert!(h.killable, "{h:?}");
+
+    cmd::terminate_worktree_holder(main_s, wt_s, pid, Some(h.path.clone())).unwrap();
+    assert!(!orphan.alive(), "结束之后进程该已退出");
+
+    delete(&main, &wt, false);
+    assert!(!wt.exists(), "进程结束后该删得掉");
+}
+
+/// 只认这个仓库登记在册的 linked worktree：别的目录、主工作区都不查也不结束。
+/// 否则前端传个用户目录进来，半个系统的进程都成了「持有者」。
+#[test]
+fn holders_are_only_looked_up_for_registered_linked_worktrees() {
+    let (dir, wt) = repo_with_worktree("feature");
+    let main = main_of(&wt);
+    let main_s = main.to_str().unwrap().to_string();
+    let elsewhere = dir.path().to_string_lossy().to_string();
+
+    for target in [elsewhere, main_s.clone()] {
+        let err = cmd::worktree_holders(main_s.clone(), target.clone()).unwrap_err();
+        assert_eq!(err.code, "worktree_not_registered", "{target}");
+        let err = cmd::terminate_worktree_holder(main_s.clone(), target.clone(), u32::MAX, None)
+            .unwrap_err();
+        assert_eq!(err.code, "worktree_not_registered", "{target}");
+    }
+}

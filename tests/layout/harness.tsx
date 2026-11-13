@@ -22,6 +22,7 @@ import { describeHealth } from '@/engine/svnInit'
 import { describeSyncInPreview } from '@/engine/svnSyncIn'
 import { describeDeliverPreview } from '@/engine/svnSyncOut'
 import type { HookEntry } from '@/engine/tsvnHooks'
+import type { WorktreeHolder } from '@/engine/worktreeHolders'
 
 const paths = (n: number) =>
   Array.from({ length: n }, (_, i) => `Assets/Scripts/Gameplay/Battle/Skill/SkillEffect${i}.cs`)
@@ -31,11 +32,33 @@ const noop = () => {}
 // 名字在框里单行省略，不会撑高；长名字只是确认省略之后说明文字照样排得下
 const LONG_NAME = `feat/${'very-long-branch-name-'.repeat(6)}end`
 
+// 占着 worktree 的进程：名字和路径都长，夹一个不给结束的（本应用自己）
+const BUSY_WT = 'C:/r/.worktrees/wt'
+const BUSY_HOLDERS = Array.from({ length: 12 }, (_, i): WorktreeHolder => ({
+  pid: 10000 + i,
+  name: `${'very-long-process-name-'.repeat(3)}${i}.exe`,
+  kind: i % 3 === 0 ? 'cwd' : i % 3 === 1 ? 'openFile' : 'commandLine',
+  path: `${BUSY_WT}/${paths(1)[0].replace('0.cs', `${i}.cs`)}`,
+  killable: i !== 5,
+  isSelf: i === 5,
+  commandLine: i % 3 === 2 ? `node.exe server.mjs --cwd ${BUSY_WT} ${'--flag '.repeat(20)}` : null,
+}))
+const BUSY_ERROR = {
+  code: 'worktree_busy',
+  message:
+    '移不动这个 worktree：The process cannot access the file because it is being used by another process. (os error 32)\n\n' +
+    '卡在这些地方：\n  （worktree 目录本身）  —— 工作目录停在这里：node.exe (PID 15268)、bash.exe (PID 60764)',
+}
+
 // `invoke` 走这个全局。删除分支的框一打开就读分支信息，默认让它失败，错误文案撑满框。
 // 「远程已经没有」那个场景要真的拿到信息、探测答 false，弹框里的说明才会全部出现
 ;(window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
   invoke: async (cmd: string) => {
-    if (new URLSearchParams(location.search).get('scenario') === 'delete-branch-remote-gone') {
+    const scenario = new URLSearchParams(location.search).get('scenario')
+    if (scenario === 'delete-worktree-busy-holders' && cmd === 'worktree_holders') {
+      return BUSY_HOLDERS
+    }
+    if (scenario === 'delete-branch-remote-gone') {
       if (cmd === 'branch_delete_info') {
         return {
           upstream: `origin/${LONG_NAME}`,
@@ -231,10 +254,21 @@ const SCENES: Record<string, () => ReactNode> = {
   ),
   'delete-worktree-long-error': () => (
     <DeleteWorktreeDialog
+      repoPath="C:/r"
       worktree={{ name: 'wt', path: 'C:/r/.worktrees/wt', head: 'h', branch: 'feat/x', isMain: false }}
       onCancel={noop}
       onConfirm={async () => {
         throw new Error(LONG_ERROR)
+      }}
+    />
+  ),
+  'delete-worktree-busy-holders': () => (
+    <DeleteWorktreeDialog
+      repoPath="C:/r"
+      worktree={{ name: 'wt', path: BUSY_WT, head: 'h', branch: 'feat/x', isMain: false }}
+      onCancel={noop}
+      onConfirm={async () => {
+        throw BUSY_ERROR
       }}
     />
   ),

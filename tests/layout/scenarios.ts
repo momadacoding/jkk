@@ -15,6 +15,11 @@ export interface LayoutScenario {
    * （勾上「顺便删远程」→ 探测答「远程已经没有」）。
    */
   clickFirst?: { selector: string; thenShows: string }
+  /**
+   * 点了主按钮、错误出来之后，再等这段文字出现才开始量：有的内容是失败之后另查一趟才补上的
+   * （删 worktree 撞上 worktree_busy → 查出占着它的进程列表）。
+   */
+  afterPrimaryShows?: string
 }
 
 export const SCENARIOS: LayoutScenario[] = [
@@ -31,6 +36,13 @@ export const SCENARIOS: LayoutScenario[] = [
     clickPrimary: true,
   },
   { id: 'delete-worktree-long-error', component: 'DeleteWorktreeDialog', clickPrimary: true },
+  // 撞上 worktree_busy：错误下面再挂一长串占用进程，每行带「结束进程」按钮
+  {
+    id: 'delete-worktree-busy-holders',
+    component: 'DeleteWorktreeDialog',
+    clickPrimary: true,
+    afterPrimaryShows: '占着这个 worktree 的进程',
+  },
   { id: 'deliver-long', component: 'DeliverDialog' },
   // 错误在内容末尾、只有一行：从顶部点交付，它最容易出在视野外或藏在按钮条下面
   { id: 'deliver-short-error', component: 'DeliverDialog', clickPrimary: true },

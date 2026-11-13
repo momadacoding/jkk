@@ -9,11 +9,11 @@
 //! | 占用方式 | 例子 | 查得到进程吗 |
 //! |---|---|---|
 //! | 打开了里面的**文件** | 编辑器开着某个源文件 | 能，Restart Manager 直接给进程名和 PID |
-//! | 把目录当**工作目录**（cwd） | 一个终端 `cd` 在里面 | 查不到进程。RM 只认文件，枚举进程 cwd 要走 `NtQueryInformationProcess` |
+//! | 把目录当**工作目录**（cwd） | 一个终端 `cd` 在里面 | RM 查不到；改读各进程 PEB 里的工作目录（[`crate::engine::process_holders`]） |
 //!
 //! 所以这里分两步：先用「独占打开」探测出**是哪个路径**被占（两种都能测出来），
-//! 再对那个路径问一次 RM 要进程（只有第一种能拿到）。拿不到进程也是有用的结论——
-//! 那基本就是有程序的工作目录停在里面。
+//! 再对那个路径问一次 RM 要进程；RM 答不上来时，再看谁的工作目录落在那个路径里。
+//! 两样都查不到（提权进程读不了 PEB）也是有用的结论——那基本就是有程序的工作目录停在里面。
 
 use std::path::{Path, PathBuf};
 
@@ -22,13 +22,17 @@ use std::path::{Path, PathBuf};
 pub struct BlockingProcess {
     pub name: String,
     pub pid: u32,
+    /// 是靠「工作目录落在这里」查出来的，不是 RM 报的。
+    pub via_cwd: bool,
+    /// RM 把它标成系统关键进程（`RmCritical`）。界面上不给结束。
+    pub critical: bool,
 }
 
 /// 一个占用点：哪个路径被占了，以及（如果查得到）被谁占着。
 #[derive(Debug, Clone)]
 pub struct Blocker {
     pub path: PathBuf,
-    /// 空表示查不出进程——通常意味着这是个「工作目录停在里面」的占用。
+    /// 空表示查不出进程——通常意味着有个读不了 PEB 的（提权）进程把工作目录停在里面。
     pub processes: Vec<BlockingProcess>,
 }
 
@@ -42,14 +46,27 @@ const MAX_PROBES: usize = 20_000;
 ///
 /// 探测是**只读**的：只尝试独占打开，不移动、不修改任何东西。
 pub fn find_blockers(root: &Path, limit: usize) -> Vec<Blocker> {
+    find_blockers_with(root, limit, true)
+}
+
+/// 同 [`find_blockers`]。`cwd_fallback` 为假时，RM 答不出进程的目录不再枚举全部进程去找
+/// 工作目录停在里面的——调用方（[`crate::engine::process_holders::find_holders`]）已经
+/// 逐个读过所有进程的工作目录，再来一遍是白花的。
+pub fn find_blockers_with(root: &Path, limit: usize, cwd_fallback: bool) -> Vec<Blocker> {
     let mut found = Vec::new();
     let mut probes = 0usize;
     // 先测根自己：整个 worktree 目录被当成 cwd 是最常见的情形
-    probe_into(root, limit, &mut probes, &mut found);
+    probe_into(root, limit, cwd_fallback, &mut probes, &mut found);
     found
 }
 
-fn probe_into(path: &Path, limit: usize, probes: &mut usize, found: &mut Vec<Blocker>) {
+fn probe_into(
+    path: &Path,
+    limit: usize,
+    cwd_fallback: bool,
+    probes: &mut usize,
+    found: &mut Vec<Blocker>,
+) {
     if found.len() >= limit || *probes >= MAX_PROBES {
         return;
     }
@@ -60,9 +77,22 @@ fn probe_into(path: &Path, limit: usize, probes: &mut usize, found: &mut Vec<Blo
         // 去找，比不报还糟。实测这类瞬时占用几十毫秒内就消失。
         std::thread::sleep(std::time::Duration::from_millis(30));
         if is_occupied(path) {
+            let mut processes = blocking_processes(path);
+            if cwd_fallback && processes.is_empty() && path.is_dir() {
+                // RM 只认文件句柄。目录被占时最常见的是有进程把工作目录停在这里
+                processes = crate::engine::process_holders::cwd_holders(path)
+                    .into_iter()
+                    .map(|(pid, name)| BlockingProcess {
+                        name,
+                        pid,
+                        via_cwd: true,
+                        critical: false,
+                    })
+                    .collect();
+            }
             found.push(Blocker {
                 path: path.to_path_buf(),
-                processes: blocking_processes(path),
+                processes,
             });
             // 目录本身被占住时不必再往里钻，报出来就够动手了
             return;
@@ -86,7 +116,7 @@ fn probe_into(path: &Path, limit: usize, probes: &mut usize, found: &mut Vec<Blo
         if found.len() >= limit || *probes >= MAX_PROBES {
             return;
         }
-        probe_into(&entry.path(), limit, probes, found);
+        probe_into(&entry.path(), limit, cwd_fallback, probes, found);
     }
 }
 
@@ -121,10 +151,10 @@ fn is_occupied(_path: &Path) -> bool {
 /// 只对**文件句柄**有效。目录被当成工作目录占用时 RM 什么也给不出来，返回空。
 #[cfg(windows)]
 #[allow(unsafe_code)] // Restart Manager 只有 Win32 C API，没有安全封装
-fn blocking_processes(path: &Path) -> Vec<BlockingProcess> {
+pub(crate) fn blocking_processes(path: &Path) -> Vec<BlockingProcess> {
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::System::RestartManager::{
-        RmEndSession, RmGetList, RmRegisterResources, RmStartSession, RM_PROCESS_INFO,
+        RmCritical, RmEndSession, RmGetList, RmRegisterResources, RmStartSession, RM_PROCESS_INFO,
     };
 
     let wide: Vec<u16> = {
@@ -176,6 +206,8 @@ fn blocking_processes(path: &Path) -> Vec<BlockingProcess> {
                                 name
                             },
                             pid: info.Process.dwProcessId,
+                            via_cwd: false,
+                            critical: info.ApplicationType == RmCritical,
                         });
                     }
                 }
@@ -187,7 +219,7 @@ fn blocking_processes(path: &Path) -> Vec<BlockingProcess> {
 }
 
 #[cfg(not(windows))]
-fn blocking_processes(_path: &Path) -> Vec<BlockingProcess> {
+pub(crate) fn blocking_processes(_path: &Path) -> Vec<BlockingProcess> {
     Vec::new()
 }
 
@@ -211,9 +243,10 @@ pub fn describe(root: &Path, blockers: &[Blocker]) -> String {
             shown.to_string_lossy().to_string()
         };
         if b.processes.is_empty() {
-            // 查不出进程本身就是个结论，别让它看起来像「查了但没查到」
+            // 查不出进程本身就是个结论，别让它看起来像「查了但没查到」。
+            // 工作目录已经挨个读过了，读不到的通常是以管理员身份跑的程序
             lines.push(format!(
-                "  {shown}  —— 查不出是哪个进程，多半是有程序的工作目录停在这里"
+                "  {shown}  —— 查不出是哪个进程，多半是有程序（可能以管理员身份运行）的工作目录停在这里"
             ));
         } else {
             let who = b
@@ -222,7 +255,12 @@ pub fn describe(root: &Path, blockers: &[Blocker]) -> String {
                 .map(|p| format!("{} (PID {})", p.name, p.pid))
                 .collect::<Vec<_>>()
                 .join("、");
-            lines.push(format!("  {shown}  —— {who}"));
+            // 两种占用要说清楚：开着文件的去关文件，工作目录停在这的去关终端 / 进程
+            if b.processes.iter().all(|p| p.via_cwd) {
+                lines.push(format!("  {shown}  —— 工作目录停在这里：{who}"));
+            } else {
+                lines.push(format!("  {shown}  —— {who}"));
+            }
         }
     }
     lines.join("\n")
@@ -314,8 +352,8 @@ mod tests {
         );
     }
 
-    /// 有进程把目录当工作目录时也要定位得到——这是删 worktree 最常撞上的情形，
-    /// 而它恰恰是 RM 查不出进程的那一种，所以只断言路径。
+    /// 有进程把目录当工作目录时也要定位得到——这是删 worktree 最常撞上的情形。
+    /// RM 查不出这种进程，要靠读工作目录点出 PID。
     #[cfg(windows)]
     #[test]
     fn a_directory_held_as_a_working_directory_is_found() {
@@ -336,14 +374,28 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(600));
 
         let blockers = find_blockers(dir.path(), 5);
+        let pid = child.id();
 
         // 先收拾子进程，再断言——断言失败也不能把进程漏在外面
         let _ = child.kill();
         let _ = child.wait();
 
+        let sub_entry = blockers
+            .iter()
+            .find(|b| b.path.ends_with("sub"))
+            .unwrap_or_else(|| panic!("把目录当 cwd 的占用该被找到，实际：{blockers:?}"));
         assert!(
-            blockers.iter().any(|b| b.path.ends_with("sub")),
-            "把目录当 cwd 的占用该被找到，实际：{blockers:?}"
+            sub_entry
+                .processes
+                .iter()
+                .any(|p| p.pid == pid && p.via_cwd),
+            "该点出工作目录停在里面的子进程 {pid}，实际：{:?}",
+            sub_entry.processes,
+        );
+        let text = describe(dir.path(), &blockers);
+        assert!(
+            text.contains(&format!("PID {pid}")) && text.contains("工作目录停在这里"),
+            "{text}"
         );
     }
 
@@ -360,6 +412,8 @@ mod tests {
             processes: vec![BlockingProcess {
                 name: "Code.exe".into(),
                 pid: 1234,
+                via_cwd: false,
+                critical: false,
             }],
         }];
         let text = describe(Path::new("C:/repo/wt"), &blockers);

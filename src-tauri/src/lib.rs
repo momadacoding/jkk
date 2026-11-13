@@ -254,6 +254,8 @@ pub fn run() {
             commands::watch::watch_repo,
             commands::worktree::create_worktree,
             commands::worktree::delete_worktree,
+            commands::worktree::worktree_holders,
+            commands::worktree::terminate_worktree_holder,
             commands::worktree::read_worktrees_cmd,
         ])
         .run(context)

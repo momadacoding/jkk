@@ -110,6 +110,7 @@ export function WorktreeView({
       <ContextMenu menu={menu} onClose={close} />
       {deleting && (
         <DeleteWorktreeDialog
+          repoPath={currentPath}
           worktree={deleting}
           onCancel={() => setDeleting(null)}
           // 成功才关；失败时 onDelete 抛出，确认框自己接住并留在原地

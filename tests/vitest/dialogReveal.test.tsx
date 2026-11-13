@@ -20,6 +20,7 @@ describe('弹框里新出现的错误滚进视野', () => {
     }
     render(
       <DeleteWorktreeDialog
+        repoPath="C:/r"
         worktree={{ name: 'wt', path: 'C:/r/.worktrees/wt', head: 'h', branch: 'feat/x', isMain: false }}
         onCancel={() => {}}
         onConfirm={async () => {
