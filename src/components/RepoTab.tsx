@@ -45,6 +45,7 @@ import {
   autoFollowKey,
   describeAutoFollowDone,
   describeRestoreSkips,
+  keepOnNewFollow,
   type FollowReport,
   type PendingRestore,
 } from '../engine/svnFollow'
@@ -1029,6 +1030,7 @@ export function RepoTab({
     wait: (ms) => new Promise((resolve) => window.setTimeout(resolve, ms)),
     setAutoFollowSkip: setAutoSkip,
     showAutoFollowed: setAutoFollowed,
+    clearAutoFollowed: () => setAutoFollowed(keepOnNewFollow),
   })
   autoFollowRef.current = handleAutoFollow
 
