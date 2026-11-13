@@ -46,6 +46,13 @@
   - dev 下 `openRepo` span 与 `load_session` 各出现两次：React StrictMode 在开发构建里会把 effect 跑两遍，release 不会。
   - `pnpm tauri dev --config X -- -- --perf` 实测能把 `--perf` 交到应用（设计 §5 留的待实测项）。
 
+## 合并后：v0.8.2 发版预检挂在 `perfSummary.test.ts`（2026-11-13）
+
+- **计划没写的坑**：`scripts/perf-summary.mjs` 第一行写了 shebang。worktree 里这个文件是工具直接写出的 LF，vitest 能吃下；CI（`windows-latest`）和主工作区按 `core.autocrlf` 检出成 CRLF 后，Vite 导入时报 `SyntaxError: Invalid or unexpected token`。`gen-notices.mjs` 顶部早就注明了同一个坑。
+- **修法**：去掉 shebang，文件头注释写明原因；`perfSummary.test.ts` 加一条断言「开头不是 `#!`」，LF 检出的机器上也能拦住回退。用法本来就是 `node scripts/perf-summary.mjs`，不受影响。
+- **复现与验证**：新 worktree（CRLF 检出）里修之前 `pnpm vitest run tests/vitest/perfSummary.test.ts` 失败，修之后 `pnpm test` 94 个文件 1608 个通过。
+- `v0.8.2` tag 已推、发版 run 失败、没有生成 Release；不删 tag 重打，改发 `0.8.3`。
+
 ## 开工前定下的偏离
 
 ### D1 前端靠初始化脚本得知开关，不调 `perf_status`
