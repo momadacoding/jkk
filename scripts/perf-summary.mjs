@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+// 顶部不写 shebang：这个文件同时被 vitest 从 .ts 测试导入，CRLF 检出时 shebang 会让 Vite 解析报错（v0.8.2 发版预检就挂在这里）。
 // 汇总 jkk 性能记录模式（`jkk.exe --perf`）写出的 JSONL。只用 Node 内置模块。
 //
 //   node scripts/perf-summary.mjs <file.jsonl>                 按 kind + name 出 count / p50 / p95 / max / total

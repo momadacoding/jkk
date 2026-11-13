@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -104,6 +104,13 @@ describe('around', () => {
 
   it('没有这个 span 时为空', () => {
     expect(around(parseLines(text).records, 'nope')).toEqual([])
+  })
+})
+
+describe('脚本文件', () => {
+  it('开头没有 shebang：本地 LF 检出时 Vite 能吃下，CI 的 CRLF 检出会在导入时报 SyntaxError', () => {
+    const source = readFileSync(path.resolve(__dirname, '../../scripts/perf-summary.mjs'), 'utf8')
+    expect(source.startsWith('#!')).toBe(false)
   })
 })
 
