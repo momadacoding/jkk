@@ -72,7 +72,7 @@ use crate::engine::svn_follow_index::{
 use crate::engine::svn_follow_mark::{clear_mark, my_svn_user, read_mark, FollowMark};
 use crate::engine::svn_health::Health;
 use crate::engine::svn_include_check::normalize_roots;
-use crate::engine::svn_init::{record_mixed, Recorded};
+use crate::engine::svn_init::{confirm_tombstones, record_mixed, Recorded};
 use crate::engine::svn_journal::{self, BranchMove, Flow, FollowStep, FollowSteps, Journal, Phase};
 use crate::engine::svn_leak::{local_only_leaks, Leak};
 use crate::engine::svn_lock;
@@ -453,13 +453,12 @@ const HELD_NOT_MINE: &str =
     "分支只比磁盘多 Local-Only 补丁，但 SVN 上最后改它的不是你（或认不出是谁），\
      可能是你有意去掉的补丁。";
 const HELD_CONFLICT: &str = "分支上的提交重放到 SVN 的新内容上有冲突，要你来判断。";
-const HELD_STALE: &str = "磁盘上还是这条分支的旧内容，要用会写磁盘的手动跟进。";
 const HELD_LEAK: &str = "分支的 Local-Only 补丁可能已经被带上了 SVN 服务器，要你先看一眼。";
 
 /// 能留在旧基线上的文件 → 原因。`None`：这次只能整次拦。
 ///
-/// - 不能按文件处理的原因（没核对成服务器、重叠核对出错、分支跟进入口）：`None`
-/// - 冲突 / 磁盘是旧内容 / 泄漏 / 重放与磁盘对不上：涉及的文件
+/// - 不能按文件处理的原因（没核对成服务器、重叠核对出错、分支跟进入口、磁盘是分支的旧内容）：`None`
+/// - 冲突 / 泄漏 / 重放与磁盘对不上：涉及的文件
 /// - 每个文件都必须是这次的**外部修改**（旧基线与新基线里都有、mode 没变、内容变了）。新增、删除
 ///   的文件留不住：改名是「删 + 加」，留一半基线就对不上；删掉的目录里也没有东西可留
 /// - 留下之后什么都不剩（外部变化全在里面）：`None`，照原来整次拦
@@ -474,12 +473,12 @@ fn held_candidates(repo: &str, plan: &Plan) -> Option<BTreeMap<String, String>> 
         }
     };
     if let Target::Conflict(m) = &plan.target {
-        let why = if m.stale_disk {
-            HELD_STALE
-        } else {
-            HELD_CONFLICT
-        };
-        hold(&mut m.files.iter(), why);
+        // 磁盘是旧内容留不住：`stale_disk_paths` 看的是分支落后的那一段，与这次的外部变化无关，
+        // 留下之后第二遍照样报（独立 review 中 2）
+        if m.stale_disk {
+            return None;
+        }
+        hold(&mut m.files.iter(), HELD_CONFLICT);
         hold(&mut m.leaks.iter().map(|l| &l.path), HELD_LEAK);
     }
     hold(&mut plan.report.leaks.iter().map(|l| &l.path), HELD_LEAK);
@@ -561,9 +560,10 @@ fn tree_diff(repo: &str, from: &str, to: &str) -> Result<Vec<TreeChange>> {
 /// 映射记的 revision。floor 可能因此降下来（根目录 update 之后最常见），这时原来按 floor 不单列的
 /// 文件按 `commit_rev > floor` 单列，规则不变。
 ///
-/// floor 降下来之后，这次跟进里删掉的文件要有墓碑：它们在新 floor 时服务器上还在，没有墓碑的话
-/// 服务器文件集合的审计会把它们报成漏收。完整录制只给删除 revision 高于**原** floor 的发了墓碑；
-/// 其余的删除不晚于原 floor，墓碑记成原 floor（删除确认时它已经不在了）。
+/// floor 降下来之后，新 floor 与原 floor 之间删掉的文件在新 floor 上服务器还有，要有墓碑，否则
+/// 服务器文件集合的审计会把它们报成漏收。完整录制只为原 floor 体检过；旧基线带的墓碑、旧基线之后
+/// 加进来又删掉的文件本地都推不全（独立 review 高 1、低 3），所以按部分基线再体检一次
+/// （[`confirm_tombstones`]，联网），由服务器确认。floor 没降时不用：完整录制的墓碑就够。
 ///
 /// 完整录制的映射仍是锁内复核（[`still_valid`]）的对照：被留下的都是修改，部分基线的文件集合与
 /// 完整基线相同，按节点状态重算出来的就是完整映射。
@@ -615,24 +615,26 @@ fn partial_record(
             None => n.clone(),
         })
         .collect();
-    let mut gone = full.map.gone.clone();
-    for d in tree_diff(repo, old_base, &full.tree)? {
-        if d.status == "D" {
-            gone.entry(d.path).or_insert(full.map.floor);
+    let files = tree_files(repo, &tree)?;
+    let map_with = |gone| compute_map(&full.map.repos_root, &full.map.uuid, &files, &nodes, gone);
+    let mut map = map_with(full.map.gone.clone())?;
+    if map.floor < full.map.floor {
+        let mut explained = full.explained.clone();
+        explained.extend(held.keys().cloned());
+        let new_gone =
+            confirm_tombstones(repo, &read_config(repo)?, &map, &explained, &full.nodes)?;
+        if !new_gone.is_empty() {
+            let mut gone = map.gone.clone();
+            gone.extend(new_gone);
+            map = map_with(gone)?;
         }
     }
-    let map = compute_map(
-        &full.map.repos_root,
-        &full.map.uuid,
-        &tree_files(repo, &tree)?,
-        &nodes,
-        gone,
-    )?;
     Ok(Recorded {
         tree,
         map,
         nodes: full.nodes.clone(),
         health: full.health.clone(),
+        explained: full.explained.clone(),
     })
 }
 

@@ -443,6 +443,54 @@ pub struct Recorded {
     pub nodes: Vec<NodeStatus>,
     /// 体检结论：`Verified` 或 `NotChecked`（`Lying` 与漏收都已在录制里拒绝）。
     pub health: Health,
+    /// `S`：录制时换成服务器内容的路径（磁盘上有本地改动的）。部分自动跟进再体检一次时要用
+    /// （[`confirm_tombstones`]），否则这些本地改动会被当成基线撒谎。
+    pub explained: BTreeSet<String>,
+}
+
+/// 部分自动跟进（`svn_follow::partial_record`）的基线 floor 低于完整录制时，按它再体检一次，
+/// 返回服务器确认已删除的新墓碑。
+///
+/// floor 降下来之后，floor 与原 floor 之间删掉的文件在新 floor 上服务器还有：旧基线带的墓碑、
+/// 这次跟进删掉的、旧基线之后加进来又删掉的都可能是。完整录制只为原 floor 体检过，本地推不全，
+/// 只能照录制的办法向服务器确认（独立 review 高 1、低 3）。
+///
+/// `explained` 是完整录制的 `S` 加上被留下的文件：后者在基线里是旧 revision 的内容，磁盘上是
+/// 新的，不是撒谎。体检没过（撒谎、漏收、确认不成、没核对成）一律 `Err`，调用方放弃部分跟进。
+pub(crate) fn confirm_tombstones(
+    repo: &str,
+    cfg: &SvnConfig,
+    map: &BaseMap,
+    explained: &BTreeSet<String>,
+    nodes: &[NodeStatus],
+) -> Result<BTreeMap<String, u64>> {
+    const TAIL: &str = "这次没有部分跟进。";
+    let svn_url = working_copy_url(repo)?;
+    let scope = WScope::for_repo(repo, cfg)?;
+    match check_baseline_map_with_nodes(
+        repo,
+        &svn_url,
+        map,
+        &scope,
+        explained,
+        ExplainedOrigin::JustRecorded,
+        Some(nodes),
+    )? {
+        HealthMap::Excluded { files } => Err(excluded_error(&files, TAIL)),
+        HealthMap::Unconfirmed { files, reason } => Err(not_confirmed_error(&files, &reason, TAIL)),
+        HealthMap::Verified {
+            health: Health::Verified { .. },
+            new_gone,
+        } => Ok(new_gone),
+        HealthMap::Verified {
+            health: Health::Lying { files },
+            ..
+        } => Err(lying_error(map, &files, TAIL)),
+        HealthMap::Verified { health, .. } => Err(GitError::new(
+            "svn_follow_partial",
+            format!("部分跟进的基线没能向服务器核对（{health:?}），{TAIL}"),
+        )),
+    }
 }
 
 /// 录一个可能是混合版本的基线：R1–R3c（分析 §6.3）。**不建 commit、不动任何 ref**。
@@ -547,6 +595,7 @@ fn record_mixed_with(
         map,
         nodes: nodes.to_vec(),
         health,
+        explained,
     })
 }
 

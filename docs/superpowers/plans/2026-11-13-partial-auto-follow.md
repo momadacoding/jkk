@@ -21,7 +21,7 @@
 |---|---|
 | 重放结果和磁盘对不上（overlap 里 `matches_disk = false` 且不会自动放回） | 排除这些文件 |
 | 重放冲突（`Target::Conflict`） | 排除冲突文件 |
-| 磁盘上还是分支的旧内容（`stale_disk`） | 排除这些文件 |
+| 磁盘上还是分支的旧内容（`stale_disk`） | ~~排除这些文件~~ 整次拦（独立 review 中 2：它看的是分支落后那段，留下也照样报，见决策日志） |
 | 泄漏告警 | 排除泄漏的文件。不跟进，横幅一直挂着，提醒作用还在 |
 | 没能向服务器核对、核对本身出错、仓库一直在变、分支落后 | 仍然整次拦 |
 
@@ -37,7 +37,7 @@
 
 ### 部分基线的映射
 
-用 `compute_map` 重算：节点状态里被排除文件的 `node_rev`、`commit_rev` 都换成旧基线映射里它的 revision。floor 因此可能降低，此时原来按 floor 不单列的文件会按 `commit_rev > floor` 的规则单列，记账规则不变。墓碑不受影响（被排除的都不是删除）。
+用 `compute_map` 重算：节点状态里被排除文件的 `node_rev`、`commit_rev` 都换成旧基线映射里它的 revision。floor 因此可能降低，此时原来按 floor 不单列的文件会按 `commit_rev > floor` 的规则单列，记账规则不变。floor 降低时按部分基线再体检一次，让新 floor 与原 floor 之间删掉的文件由服务器确认成墓碑（实现时补上，见决策日志）。
 
 下一次状态检测时，被排除的文件节点 revision 仍高于基线：照旧判 ExternallyAdvanced，横幅只剩这些文件。
 
