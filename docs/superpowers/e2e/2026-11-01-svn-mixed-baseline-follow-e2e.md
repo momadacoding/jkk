@@ -42,8 +42,8 @@
 - [x] 场景 7：feature 与提交冲突 → 标「落后基线」→「切换并手动跟进」→ 解冲突 → 继续
 - [x] 场景 8：「仅切换」到落后分支 → 横幅「当前分支落后基线」→ 跟进 → 转手动跟进
 - [x] 场景 9：Local-Only 补丁 + 「提交后恢复」只提交功能改动 → 不告警、补丁还在；整文件提交 → 告警
-- [ ] 场景 9B：跟进后自动把 Local-Only 补丁放回磁盘 → 磁盘带回补丁、git 干净；磁盘有自己的编辑时不写（2026-11-12 新增，同日改为自动放回，未跑）
-- [ ] 场景 9C：提交 SVN 前去掉补丁 → 自动跟进直接完成并放回；同事改过的不自动放回、横幅「缺 Local-Only 补丁」放回 / 不放回（2026-11-12 新增，未跑）
+- [x] 场景 9B：跟进后自动把 Local-Only 补丁放回磁盘 → 磁盘带回补丁、git 干净；磁盘有自己的编辑时不写（2026-11-13 agent 经 CDP 驱动真实窗口跑过；修正了清单里漏的「commit 之后先点回应用」）
+- [x] 场景 9C：提交 SVN 前去掉补丁 → 自动跟进直接完成并放回；同事改过的不自动放回、横幅「缺 Local-Only 补丁」放回 / 不放回（2026-11-13 同上；修正了同事那一步会造出空 commit 的命令）
 - [x] 场景 10：只提交删除 → 跟进后记成墓碑
 - [x] 场景 11：SVN 操作进行中切回 jkk → 「SVN 正在更新…」
 - [x] 场景 12：周一根目录整体更新 → 跟进后基线回到单值旧格式
@@ -647,10 +647,15 @@ G add Code/Deep/R.cs; G commit -q -m "add class`n`nLocal-Only: true"
 # 普通 commit：删掉这一行，另加功能
 Wc 'Code/Deep/R.cs' "class R {`n  int a;`n  int b;`n}`n"
 G add Code/Deep/R.cs; G commit -q -m '小婉问答'
+```
+
+**先点一下应用窗口，再点回操作窗口**（真实工作流里这两个 commit 是在 jkk 里做的，切去 TortoiseSVN 的那一刻失焦快照才包含它们；漏了这一步，快照停在两个 commit 之前，跟进会把「小婉问答」当成还没上 SVN 的提交照常重放，分支与磁盘一致，看不到放回）：
+
+```powershell
 SvnCommit 'Code/Deep/R.cs'
 ```
 
-**操作（应用）：** 点回应用 → 跟进（或者等自动跟进）。
+**操作（应用）：** 点回应用 → 跟进（或者等自动跟进）。前提：场景 1 里填过「我的 SVN 用户名」（`file://` 仓库探测不到；没填时所有提交都算别人的，同样看不到放回）。
 
 **应该看到：** 跟进完成，报告「这次跟进做了什么」里有 **「已放回的 Local-Only 补丁」**，列出 `Code/Deep/R.cs ← <短 hash> add class`。摘要下面一行写「工作区里只放回了 1 个文件的 Local-Only 补丁，其余文件没有改动」。「分支与磁盘对不上」里**没有** R.cs，也没有放回按钮。
 
@@ -662,7 +667,7 @@ svn status (Join-Path $WC 'Code/Deep/R.cs')                    # M
 
 **反例（操作窗口 + 应用）：** 磁盘上有你自己的编辑时不覆盖。重做造现场 2，换一个文件 `Code/Deep/R2.cs`（同样先做造现场 1），但 `SvnCommit` 之后、跟进之前，先在操作窗口执行 `Wc 'Code/Deep/R2.cs' "mine`n"`，再跟进。
 
-**应该看到：** 报告里 R2.cs 列在「分支与磁盘对不上」，不在 Local-Only 那两节里；`R2.cs` 的内容仍是 `mine`。
+**应该看到：** 横幅「没有自动跟进：……重放出来的结果和磁盘对不上（Code/Deep/R2.cs）。可能是文件里还有没提交的改动……」；点「跟进」后报告里 R2.cs 列在「提交与 SVN 都改过、和磁盘不一致的文件」，不在 Local-Only 那两节里；`R2.cs` 的内容仍是 `mine`；顶部不出现「缺 Local-Only 补丁」横幅。
 
 **看到别的说明：**
 
@@ -685,6 +690,11 @@ svn status (Join-Path $WC 'Code/Deep/R.cs')                    # M
 # Local-Only commit：加一行，磁盘带着补丁
 Wc 'Code/Deep/S.cs' "---@class S`nclass R {`n  int a;`n}`n"
 G add Code/Deep/S.cs; G commit -q -m "add @avatarclass`n`nLocal-Only: true"
+```
+
+**先点一下应用窗口，再点回操作窗口**（理由同 9B：失焦快照要包含这个 commit），然后：
+
+```powershell
 # 提交 SVN 前：去掉补丁，顺手改一处，提交
 Wc 'Code/Deep/S.cs' "class R {`n  int a;`n  int b;`n}`n"
 SvnCommit 'Code/Deep/S.cs'
@@ -701,14 +711,14 @@ SvnCommit 'Code/Deep/S.cs'
 **同事改过的（操作窗口 + 应用）：** 有意去掉补丁、还没提交时，update 带来同事的改动，这时不替你放回。
 
 ```powershell
-# 再加一次补丁，再去掉（模拟准备提交）
-Wc 'Code/Deep/S.cs' "---@class S`nclass R {`n  int a;`n  int b;`n}`n"
-G add Code/Deep/S.cs; G commit -q -m "add @avatarclass 2`n`nLocal-Only: true"
+# 上一步已经放回了补丁，分支上的 Local-Only commit 还在，这里只在磁盘上再去掉一次（模拟准备提交）
 Wc 'Code/Deep/S.cs' "class R {`n  int a;`n  int b;`n}`n"
-# 同事改最后一行并提交（wc2），作者改成别人，然后 update
+# 同事改最后一行并提交（Colleague 自带 --username colleague，作者就是别人），然后 update
+Colleague 'Code/Deep/S.cs' "class R {`n  int a;`n  int b;`n} // colleague`n"
+svn update -q --non-interactive (Join-Path $WC 'Code/Deep/S.cs')
 ```
 
-用 0.3 里的同事辅助函数在 wc2 改 `S.cs` 的最后一行并提交，`svnadmin setrevprop` 把那个 revision 的作者改成 `colleague`，再 `svn update` 这个文件。点回应用。
+点回应用。
 
 **应该看到：**
 

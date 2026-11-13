@@ -10,7 +10,7 @@
 | T2 | 完成 | `svn_follow.rs`：`auto_restorable`、`with_restore`（follow / follow_auto / resume_follow 串联）、`auto_blocker` 排除我的可放回文件并改原因行、`FollowReport.restore` | `svn_follow_auto.rs` 末尾 3 条新测试过；`svn_backend.rs` 钉住 `restore` 的 JSON 形状与旧 journal |
 | T3 | 完成 | 待放回清单 `record_pending` / `pending_restores` / `dismiss_pending_restores` / `local_only_commits`；命令 `svn_pending_restores`、`svn_dismiss_pending_restores` | `svn_restore_local_only.rs` 里 4 条清单测试 |
 | T4 | 完成 | `svnFollow.ts`：`restore` 类型、`restorePending` / `restored` 两节、`drift` 排除可放回、`safe` 文案、`describePendingRestores`；`FollowReportDialog` 按钮上方列「文件 ← 提交」；`BaselineBanner` 新横幅；`RepoTab` 接线；`repoStore` 两个 invoke | `pnpm build` 过；`pnpm test` 1594 过（+19）；`pnpm test:layout` 152 过 |
-| T5 | 完成 | E2E `2026-11-01-svn-mixed-baseline-follow-e2e.md` 改写 9B、新增 9C、覆盖表；独立 review 一轮（1 高 3 中 5 低），修完后复核 | 文档；真实窗口未跑（见遗留风险） |
+| T5 | 完成 | E2E `2026-11-01-svn-mixed-baseline-follow-e2e.md` 改写 9B、新增 9C、覆盖表；独立 review 一轮（1 高 3 中 5 低），修完后复核 | `pnpm tauri dev` 真实窗口经 CDP 跑完 9B（含反例）、9C（含同事改过、横幅放回 / 不放回）全过；两个新命令参数名正反例都验过 |
 
 ## 决策条目
 
@@ -57,6 +57,13 @@
 - **L5：** 横幅查询加序号，只认最后一次的结果。
 - **L4 没改代码，记为遗留风险**：见下。
 
+### 真实窗口 E2E（2026-11-13）
+
+- **怎么跑的：** `scripts/e2e-svn-fixture.ps1` 造 `%TEMP%` 下的一次性 fixture；`pnpm tauri dev --config` 换 identifier 隔离安装版配置，`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222`；Playwright `connectOverCDP` 派发 `blur` / `focus` 模拟切窗口、点横幅和报告里的按钮、读 DOM。核对过运行的是本 worktree 的 `target\debug\app.exe`。
+- **结果：** 9B 主路径（报告「已放回」、磁盘第一行带补丁、`git status` 干净、`svn status` 是 `M`）、9B 反例（`mine` 不被覆盖，不进 Local-Only 两节，不进清单）、9C 主路径（使用报告的现场：自动跟进不被拦、直接放回）、9C 去掉补丁未提交时清单为空（横幅不误报）、同事改过的（原因行、报告「没放回」+ 按钮、关掉报告后横幅、「不放回」清掉横幅不动磁盘、「放回」写回）全部符合预期。`svn_pending_restores` 带 `repoPath`、`svn_dismiss_pending_restores` 带 `files` 都被 Tauri 拒绝（参数名缺了），正确的形状通过。横幅挂着时 10 秒内 0 次 IPC，没有刷新回路。
+- **清单的错误（已改）：** ① 9B / 9C 在操作窗口里连着做 git commit 和 `SvnCommit`，失焦快照停在 commit 之前，跟进把普通 commit 当成没上 SVN 的照常重放，分支与磁盘一致、看不到放回。真实工作流里 commit 在 jkk 里做，切去 TortoiseSVN 时快照已包含它们。补上「先点回应用再回操作窗口」。② 9B 反例的文件实际出现在「和磁盘不一致」（overlap）一节，不是「分支与磁盘对不上」。③ 9C 同事那一步「再加一次补丁再 commit」在补丁已放回时是空 commit，`git commit` 会失败；改成只在磁盘上去掉，并直接用 `Colleague`（自带作者）。
+- **计划没写的坑：** `file://` 仓库探测不到 SVN 用户名，没走场景 1 填用户名时所有提交都算别人的，放回一律不发生。清单里补了前提。
+
 ### 全量测试里的一条偶发失败
 
 - `commands::watch::tests::stage_and_unstage_only_touch_the_index` 在 worktree 里第一次全量跑连续失败 3 次（unstage 时 fixture 的 `.git/hooks` 冒出一个目录事件）。基点 1ac8025 的 scratch clone 里跑过；之后在 worktree 里再跑 3 次全过。本 diff 没碰 `watch.rs` 与 stage / unstage。判断为与本改动无关的偶发失败，如实记录，未修。
@@ -65,7 +72,7 @@
 
 - **L4：「我的」只看 `svn status -v` 的最后提交作者。** 钩子健康时别处用本机事件判定，这里没用；分支跟进入口（InSync）上「最后作者是我」可能是很久以前的提交，不再满足「自己刚提交过」的前提。按计划实现，暂不改。
 
-- **没在 `pnpm tauri dev` 真实窗口里验过。** 新增两个命令（`svn_pending_restores`、`svn_dismiss_pending_restores`）的 invoke 参数名靠代码核对（review 也核过），没有实际调用。E2E 场景 9B、9C 待人工走一遍。
+- **E2E 用的是 CDP 派发的 `focus` / `blur` 和 `svn` 命令行，不是真的切窗口和 TortoiseSVN。** 钩子触发的那条路径（TortoiseSVN 提交完自动检测）没有走。
 - 编辑器保存撞上写盘的毫秒级窗口，同 PR 159 decisions 第 30 行的论证，接受。
 - 「我的」靠 `svn status -v` 的最后提交作者：在别的机器上以自己名义提交、本机又有意去掉了补丁，仍会被自动放回。极少见；泄漏检测兜底。
 - 横幅查询跟着每次状态刷新跑：清单为空时只读一个不存在的文件；非空时跑一次 revwalk 与 `hash-object`。未实测大仓库耗时。
