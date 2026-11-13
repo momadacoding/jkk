@@ -14,6 +14,7 @@ import {
   describePendingRestores,
   describeRestoreOutcome,
   describeRestoreSkips,
+  keepOnNewFollow,
   needsSvnUserPrompt,
   restorablePaths,
   type FollowOutcome,
@@ -85,6 +86,24 @@ describe('自动跟进（事故分析 6.12）', () => {
     const behind = describeAutoFollowDone({ ...report, behindBranches: [['old', '有冲突']] })
     expect(behind.tone).toBe('warn')
     expect(behind.detail).toContain('「查看详情」')
+  })
+})
+
+describe('keepOnNewFollow：新的跟进开始时旧提示留不留（E2E 2026-11-13，独立 review 中-1）', () => {
+  it('安静的提示收起：只说「做完了」，留着会和新横幅打架', () => {
+    const quiet = { ...report, changes: [{ path: 'Code/A.cs', rev: 4, author: 'me' }] }
+    expect(describeAutoFollowDone(quiet).tone).toBe('quiet')
+    expect(keepOnNewFollow(quiet)).toBeNull()
+  })
+
+  it('要你留意的报告留着：「查看详情」是唯一入口，没点「知道了」不替用户扔', () => {
+    const warn = { ...report, behindBranches: [['old', '有冲突']] as [string, string][] }
+    expect(describeAutoFollowDone(warn).tone).toBe('warn')
+    expect(keepOnNewFollow(warn)).toBe(warn)
+  })
+
+  it('本来就没有提示：还是没有', () => {
+    expect(keepOnNewFollow(null)).toBeNull()
   })
 })
 

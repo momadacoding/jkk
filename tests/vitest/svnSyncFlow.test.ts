@@ -75,7 +75,14 @@ function deps(log: string[], confirm?: (r: ConfirmRequest) => Promise<boolean>):
     },
     setAutoFollowSkip: (s) => log.push(`autoSkip:${s ? `${s.key}|${s.message}` : 'null'}`),
     showAutoFollowed: () => log.push('showAutoFollowed'),
+    // 不记日志：上面那些按顺序断言的用例不该因为它变；要看它的用例自己覆盖
+    clearAutoFollowed: () => {},
   }
+}
+
+/** 记下「清掉旧的已自动跟进提示」发生在哪一步之前。 */
+function tracked(log: string[], confirm?: (r: ConfirmRequest) => Promise<boolean>) {
+  return { ...deps(log, confirm), clearAutoFollowed: () => log.push('clearAutoFollowed') }
 }
 
 const report = {
@@ -273,6 +280,136 @@ describe('handleAutoFollow（事故分析 6.12）', () => {
 
     expect(log).toContain('reportError:svn_follow_index_rename_failed')
     expect(log).not.toContain('showAutoFollowed')
+  })
+})
+
+describe('新的一次跟进开始时清掉旧的「已自动跟进」提示（E2E 2026-11-13）', () => {
+  // 旧提示说「放回了 1 个文件」，同时新横幅说「1 个文件缺 Local-Only 补丁」，两条挂在一起看着矛盾
+  it('自动跟进：一开始就清，不自动时旧提示也不留', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnFollowAuto).mockResolvedValue({
+      kind: 'skipped',
+      code: 'svn_auto_follow_conflict',
+      message: '有冲突',
+    })
+    createSvnSyncFlow(tracked(log)).handleAutoFollow('k1')
+    await vi.waitFor(() => expect(log).toContain('autoSkip:k1|有冲突'))
+    expect(log[0]).toBe('clearAutoFollowed')
+  })
+
+  it('自动跟进完成：先清旧的，再挂新的', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnFollowAuto).mockResolvedValue({ kind: 'done', report })
+    createSvnSyncFlow(tracked(log)).handleAutoFollow('k1')
+    await vi.waitFor(() => expect(log).toContain('showAutoFollowed'))
+    expect(log.indexOf('clearAutoFollowed')).toBeLessThan(log.indexOf('showAutoFollowed'))
+    expect(log.filter((l) => l === 'clearAutoFollowed')).toHaveLength(1)
+  })
+
+  it('横幅上的「跟进」：merge driver 确认之后、发命令之前清', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnFollow).mockImplementation(async () => {
+      log.push('svnFollow')
+      return { kind: 'done', report }
+    })
+    await createSvnSyncFlow(tracked(log)).handleFollow()
+    const i = log.indexOf('clearAutoFollowed')
+    expect(i).toBeGreaterThan(log.indexOf('guardMerge'))
+    expect(i).toBeLessThan(log.indexOf('svnFollow'))
+  })
+
+  it('merge driver 没确认：什么都没发生，旧提示留着', async () => {
+    const log: string[] = []
+    await createSvnSyncFlow({ ...tracked(log), guardMerge: async () => false }).handleFollow()
+    expect(log).not.toContain('clearAutoFollowed')
+  })
+
+  /** 确认框：记下弹出，再按 `yes` 决定执不执行 action。 */
+  const answer = (log: string[], yes: boolean) => async (r: ConfirmRequest) => {
+    log.push(`confirm:${r.title}`)
+    if (yes) await r.action?.()
+    return yes
+  }
+
+  it('「更新」：确认框弹出之后、执行时才清（更新完会再跟进，旧提示说的是更新前的事）', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncInPreview).mockResolvedValue(preview)
+    vi.mocked(store.svnSyncIn).mockImplementation(async () => {
+      log.push('svnSyncIn')
+      return { kind: 'done' } as never
+    })
+    await createSvnSyncFlow(tracked(log, answer(log, true))).handleSvnUpdate()
+    const i = log.indexOf('clearAutoFollowed')
+    expect(i).toBeGreaterThan(log.findIndex((l) => l.startsWith('confirm:')))
+    expect(i).toBeLessThan(log.indexOf('svnSyncIn'))
+  })
+
+  it('「更新」确认框取消：不清', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncInPreview).mockResolvedValue(preview)
+    await createSvnSyncFlow(tracked(log, answer(log, false))).handleSvnUpdate()
+    expect(log.some((l) => l.startsWith('confirm:'))).toBe(true)
+    expect(log).not.toContain('clearAutoFollowed')
+  })
+
+  it('跟进冲突转手动跟进：确认了清（跟进开始已清一次），取消不再清', async () => {
+    vi.mocked(store.svnFollow).mockResolvedValue(conflict)
+    vi.mocked(store.svnFollowManual).mockResolvedValue({ kind: 'done' } as never)
+    const yes: string[] = []
+    await createSvnSyncFlow(tracked(yes, answer(yes, true))).handleFollow()
+    expect(store.svnFollowManual).toHaveBeenCalled()
+    expect(yes.filter((l) => l === 'clearAutoFollowed')).toHaveLength(2)
+
+    vi.mocked(store.svnFollowManual).mockClear()
+    const no: string[] = []
+    await createSvnSyncFlow(tracked(no, answer(no, false))).handleFollow()
+    expect(store.svnFollowManual).not.toHaveBeenCalled()
+    expect(no.filter((l) => l === 'clearAutoFollowed')).toHaveLength(1)
+  })
+
+  it('跟进记录的「继续」：确认了清，取消不清', async () => {
+    vi.mocked(store.svnFollowContinue).mockResolvedValue({ kind: 'done', report })
+    const yes: string[] = []
+    await createSvnSyncFlow(tracked(yes, answer(yes, true))).handleSyncAction('followContinue')
+    expect(store.svnFollowContinue).toHaveBeenCalled()
+    expect(yes).toContain('clearAutoFollowed')
+
+    const no: string[] = []
+    await createSvnSyncFlow(tracked(no, answer(no, false))).handleSyncAction('followContinue')
+    expect(no).not.toContain('clearAutoFollowed')
+  })
+
+  it('更新记录的继续 / 放弃：不是新的跟进，不清', async () => {
+    vi.mocked(store.svnSyncContinue).mockResolvedValue({ kind: 'done' } as never)
+    vi.mocked(store.svnSyncAbort).mockResolvedValue({ kind: 'done' } as never)
+    for (const id of ['syncContinue', 'syncAbort'] as const) {
+      const log: string[] = []
+      await createSvnSyncFlow(tracked(log, answer(log, true))).handleSyncAction(id)
+      expect(log.some((l) => l.startsWith('confirm:'))).toBe(true)
+      expect(log).not.toContain('clearAutoFollowed')
+    }
+  })
+
+  it('自动跟进开关关着、merge driver 有风险：也清（又来了新的变化，旧提示过时；要留意的报告由 keepOnNewFollow 留住）', async () => {
+    const off: string[] = []
+    createSvnSyncFlow({ ...tracked(off), autoFollowEnabled: async () => false }).handleAutoFollow('k1')
+    await vi.waitFor(() => expect(off).toContain('autoSkip:null'))
+    expect(off[0]).toBe('clearAutoFollowed')
+
+    const risky: string[] = []
+    createSvnSyncFlow({ ...tracked(risky), mergeRiskForAuto: async () => '没配' }).handleAutoFollow('k1')
+    await vi.waitFor(() => expect(risky).toContain('autoSkip:k1|没配'))
+    expect(risky[0]).toBe('clearAutoFollowed')
+    expect(store.svnFollowAuto).not.toHaveBeenCalled()
+  })
+
+  it('有流程在走时不发起，也不清', async () => {
+    const log: string[] = []
+    const d = tracked(log)
+    d.running.current = true
+    expect(createSvnSyncFlow(d).handleAutoFollow('k1')).toBe(false)
+    await createSvnSyncFlow(d).handleFollow()
+    expect(log).not.toContain('clearAutoFollowed')
   })
 })
 

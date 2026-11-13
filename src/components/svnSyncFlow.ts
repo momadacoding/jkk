@@ -81,6 +81,13 @@ export interface SvnSyncFlowDeps {
   setAutoFollowSkip: (skip: { key: string; message: string } | null) => void
   /** 自动跟进完成：挂那条不打断操作的提示，详情是同一份报告。 */
   showAutoFollowed: (report: FollowReport) => void
+  /**
+   * 收起上一次「已自动跟进」的提示。新的一次跟进（自动、横幅按钮、手动、更新）真的开始时调用：
+   * 旧提示说的是上一次的事，留着会和新横幅打架（E2E 2026-11-13：旧提示写「放回了 1 个文件」，
+   * 下面的新横幅写「1 个文件缺 Local-Only 补丁」）。只收安静的那种，要你留意的报告留着
+   * （`keepOnNewFollow`），所以这里清得早一点（例如更新的前置检查没过）也不丢东西。
+   */
+  clearAutoFollowed: () => void
 }
 
 /**
@@ -170,6 +177,8 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
     await d.confirm({
       ...describeSyncInPreview(preview),
       action: async () => {
+        // 确认了才清；前置检查在后端没过时也已经收起了，只收安静的提示，不丢报告
+        d.clearAutoFollowed()
         box.outcome = await svnSyncIn(d.repoPath, expectFromPreview(preview))
         await afterSync()
       },
@@ -208,6 +217,7 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
     await d.confirm({
       ...model,
       action: async () => {
+        d.clearAutoFollowed()
         box.outcome = await svnFollowManual(d.repoPath)
         await afterSync()
       },
@@ -244,6 +254,7 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
   const follow = async () => {
     d.clearError()
     if (!(await d.guardMerge())) return
+    d.clearAutoFollowed()
     d.setFollowing(true)
     let outcome: FollowOutcome
     try {
@@ -267,6 +278,8 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
    * 文案里写着此刻的状态。
    */
   const autoFollow = async (key: string) => {
+    // 又检测到一次新的 SVN 变化：不管这次自动不自动，上一次的提示都过时了
+    d.clearAutoFollowed()
     // 先看开关：关着时横幅照旧，连 merge driver 的原因也不该写（review 中-2）
     if (!(await d.autoFollowEnabled())) {
       d.setAutoFollowSkip(null)
@@ -340,6 +353,7 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
     await d.confirm({
       ...describeFollowContinue(),
       action: async () => {
+        d.clearAutoFollowed()
         box.outcome = await svnFollowContinue(d.repoPath)
         await afterFollow()
       },

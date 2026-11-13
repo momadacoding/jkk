@@ -185,6 +185,17 @@ export function describeAutoFollowDone(r: FollowReport): AutoFollowNotice {
   }
 }
 
+/**
+ * 新的一次跟进开始时，上一次「已自动跟进」的提示还留不留。
+ *
+ * 安静的提示只是告诉你「做完了」，留着会和新横幅打架（E2E 2026-11-13：旧提示写「放回了 1 个文件」，
+ * 新横幅写「1 个文件缺 Local-Only 补丁」），收起。`warn` 的报告里有要你处理的内容（丢失的暂存、
+ * 泄漏、落后的分支），「查看详情」是看它的唯一入口，用户没点「知道了」之前不替他扔掉（独立 review 中-1）。
+ */
+export function keepOnNewFollow(r: FollowReport | null): FollowReport | null {
+  return r && describeAutoFollowDone(r).tone === 'warn' ? r : null
+}
+
 export type FollowActionId = 'followContinue'
 
 /** 后端 `svn_follow_mark::SvnUserInfo`：「我的 SVN 用户名」的两个来源。 */
