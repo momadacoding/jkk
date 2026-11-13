@@ -3,6 +3,8 @@ import { useFocusTrap } from './useFocusTrap'
 import { Reveal } from './Reveal'
 import type { Worktree } from '../engine/types'
 import { toErrorCode, toErrorMessage } from '../engine/errors'
+import { WORKTREE_BUSY } from '../engine/worktreeHolders'
+import { WorktreeHoldersPanel } from './WorktreeHoldersPanel'
 
 function TrashGlyph() {
   return (
@@ -32,6 +34,8 @@ function BranchGlyph() {
 }
 
 interface DeleteWorktreeDialogProps {
+  /** 主仓库路径。撞上 `worktree_busy` 时查占用进程要用。 */
+  repoPath: string
   worktree: Worktree
   onCancel: () => void
   /** 失败时应当抛出——弹框据此留在原地并把错误显示出来，好让用户重试。 */
@@ -49,8 +53,15 @@ interface DeleteWorktreeDialogProps {
  * 查询命令，而且判据和真正执行删除的是同一段代码，不会出现「弹框说干净、
  * 删的时候又说脏」这种自相矛盾。
  */
-export function DeleteWorktreeDialog({ worktree, onCancel, onConfirm }: DeleteWorktreeDialogProps) {
+export function DeleteWorktreeDialog({ repoPath, worktree, onCancel, onConfirm }: DeleteWorktreeDialogProps) {
   const [error, setError] = useState<string | null>(null)
+  /**
+   * 第几次撞上 `worktree_busy`；0 是没撞上。当占用面板的 key 用：每次重试失败都整个
+   * 重建、重新查一遍进程，不沿用上一次的列表。
+   */
+  const [busyAttempt, setBusyAttempt] = useState(0)
+  /** 占用面板正在结束某个进程：这时点删除会和它并发，先禁掉。 */
+  const [endingHolder, setEndingHolder] = useState(false)
   /** 后端说这个 worktree 是脏的，再点一次就带 force 删。 */
   const [needsForce, setNeedsForce] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -61,7 +72,7 @@ export function DeleteWorktreeDialog({ worktree, onCancel, onConfirm }: DeleteWo
   useEffect(() => { confirmRef.current?.focus() }, [])
 
   const confirm = async () => {
-    if (busy) return
+    if (busy || endingHolder) return
     setBusy(true)
     setError(null)
     try {
@@ -70,6 +81,7 @@ export function DeleteWorktreeDialog({ worktree, onCancel, onConfirm }: DeleteWo
       const code = toErrorCode(err)
       // 脏和坏都是「用户确认后可以继续」的，其余（锁住、目录被占用）再点也没用
       if (code === 'worktree_dirty' || code === 'worktree_broken') setNeedsForce(true)
+      setBusyAttempt((n) => (code === WORKTREE_BUSY ? n + 1 : 0))
       setError(toErrorMessage(err))
       setBusy(false)
     }
@@ -112,6 +124,17 @@ export function DeleteWorktreeDialog({ worktree, onCancel, onConfirm }: DeleteWo
 
         {error && <Reveal className="dlg-warning">{error}</Reveal>}
 
+        {/* 重试时 busyAttempt 不清零：面板留着，免得一点删除列表就闪没；失败回来换 key 重查 */}
+        {busyAttempt > 0 && (
+          <WorktreeHoldersPanel
+            key={busyAttempt}
+            repoPath={repoPath}
+            worktreePath={worktree.path}
+            disabled={busy}
+            onEndingChange={setEndingHolder}
+          />
+        )}
+
         {busy && (
           <Reveal className="dlg-progress">
             <span className="dlg-spinner" />
@@ -124,7 +147,7 @@ export function DeleteWorktreeDialog({ worktree, onCancel, onConfirm }: DeleteWo
           <button
             ref={confirmRef}
             className="primary danger"
-            disabled={busy}
+            disabled={busy || endingHolder}
             onClick={() => void confirm()}
           >
             {busy ? 'Deleting…' : needsForce ? '仍要删除' : 'Delete'}

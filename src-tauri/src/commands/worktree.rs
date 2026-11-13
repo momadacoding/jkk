@@ -172,6 +172,62 @@ pub fn read_worktrees_cmd(path: String) -> Result<Vec<Worktree>> {
     read_worktrees(&path)
 }
 
+/// `worktree_path` 必须是 `path` 这个仓库**登记在册的 linked worktree**。
+///
+/// 结束进程的判据是「它占着这个目录」，目录本身要是前端随便传的，这道判据就形同虚设
+/// ——传个 `C:\Users\me` 进来，半个系统的进程都「占着」它。主工作区不在
+/// `.git/worktrees/` 下登记，同样被挡在外面：删除流程本来就不会删它。
+fn require_registered_worktree(path: &str, worktree_path: &str) -> Result<()> {
+    let common = common_git_dir(path)?;
+    match admin_from_registry(&common, worktree_path)? {
+        Some(_) => Ok(()),
+        None => Err(GitError::new(
+            "worktree_not_registered",
+            format!(
+                "{worktree_path}\n\n不是这个仓库登记在册的 worktree，不查也不结束占用它的进程。"
+            ),
+        )),
+    }
+}
+
+/// 删 worktree 撞上 `worktree_busy` 后，弹框调这个列出占着它的进程。
+///
+/// 要遍历全部进程、可能还要探测目录，放在 async 命令里，不卡界面线程。
+#[tauri::command(async)]
+pub fn worktree_holders(
+    path: String,
+    worktree_path: String,
+) -> Result<Vec<crate::engine::process_holders::Holder>> {
+    crate::vcs::require_capability(&path, "worktree", |c| c.worktrees)?;
+    require_registered_worktree(&path, &worktree_path)?;
+    Ok(crate::engine::process_holders::find_holders(Path::new(
+        &worktree_path,
+    )))
+}
+
+/// 用户在弹框里点了「结束进程」。
+///
+/// 前端传来的 PID 不可信（可能已经被复用），结束之前按「它确实占着这个 worktree」
+/// 再核一遍，见 [`crate::engine::process_holders::terminate_holder`]。
+///
+/// `held_path` 是列表里给这个进程报的被占路径（`Holder.path`），后端只拿它问 Restart
+/// Manager，并要求它落在 worktree 底下。
+#[tauri::command(async)]
+pub fn terminate_worktree_holder(
+    path: String,
+    worktree_path: String,
+    pid: u32,
+    held_path: Option<String>,
+) -> Result<()> {
+    crate::vcs::require_capability(&path, "worktree", |c| c.worktrees)?;
+    require_registered_worktree(&path, &worktree_path)?;
+    crate::engine::process_holders::terminate_holder(
+        Path::new(&worktree_path),
+        pid,
+        held_path.as_deref(),
+    )
+}
+
 #[tauri::command(async)]
 pub fn create_worktree(path: String, name: String, branch: Option<String>) -> Result<()> {
     // 不走 trait Vcs：SVN 混合仓库由这一行拦（第 69 条）。读列表的命令不拦，打开仓库要用

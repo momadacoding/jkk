@@ -67,6 +67,7 @@ describe('五个弹框都把 Tab 圈在框里', () => {
   it('DeleteWorktreeDialog', () => {
     render(
       <DeleteWorktreeDialog
+        repoPath="C:/r"
         worktree={{ name: 'wt', path: 'C:/r/.worktrees/wt', head: 'h', branch: 'feat/x', isMain: false }}
         onCancel={() => {}}
         onConfirm={async () => {}}

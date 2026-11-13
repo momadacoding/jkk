@@ -4,6 +4,7 @@ import { listen } from '@tauri-apps/api/event'
 import { useCallback, useEffect, useRef, useState, type MutableRefObject } from 'react'
 import type { CommitNode, ConflictInfo, DiffData, GraphData, PullRequest, RefPointer, RepoInfo, StashEntry, StatusData, UpstreamInfo, Worktree } from '../engine/types'
 import { ALL_CAPABILITIES, type Capabilities } from '../engine/capabilities'
+import type { WorktreeHolder } from '../engine/worktreeHolders'
 import {
   auditIsDue,
   isPlainCommitOn,
@@ -361,6 +362,33 @@ export function probeRemoteBranch(
  */
 export function forgetGoneRemoteBranch(path: string, remote: string, branch: string): Promise<void> {
   return invoke<void>('forget_gone_remote_branch', { path, remote, branch })
+}
+
+/**
+ * 删 worktree 撞上 `worktree_busy` 后调：列出占着它的进程。
+ *
+ * 后端只认这个仓库登记在册的 linked worktree，别的路径一律拒绝。
+ */
+export function listWorktreeHolders(path: string, worktreePath: string): Promise<WorktreeHolder[]> {
+  return invoke<WorktreeHolder[]>('worktree_holders', { path, worktreePath })
+}
+
+/**
+ * 结束一个占着 worktree 的进程。后端会先核对它**此刻**确实还占着这个 worktree，
+ * 不占着就 reject（`holder_not_found`），不会结束一个 PID 被复用后的无关进程。
+ */
+export function terminateWorktreeHolder(
+  path: string,
+  worktreePath: string,
+  holder: Pick<WorktreeHolder, 'pid' | 'path'>,
+): Promise<void> {
+  // heldPath 是列表里报的被占路径：开着文件的那一类后端只拿它问 Restart Manager
+  return invoke<void>('terminate_worktree_holder', {
+    path,
+    worktreePath,
+    pid: holder.pid,
+    heldPath: holder.path,
+  })
 }
 
 /** 同 {@link prefetchRemoteDefault}，按侧边栏的 `origin/feat/x` 形式给出（拆远程名在后端做）。 */

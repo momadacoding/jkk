@@ -2,7 +2,9 @@ import { useEffect, useRef, useState } from 'react'
 import { useFocusTrap } from './useFocusTrap'
 import { Reveal } from './Reveal'
 import { invoke } from '@/store/ipc'
-import { toErrorMessage } from '../engine/errors'
+import { toErrorCode, toErrorMessage } from '../engine/errors'
+import { WORKTREE_BUSY } from '../engine/worktreeHolders'
+import { WorktreeHoldersPanel } from './WorktreeHoldersPanel'
 import type { Capabilities } from '../engine/capabilities'
 import {
   deleteBranchTargets,
@@ -158,6 +160,13 @@ export function DeleteBranchDialog({
    */
   const [infoError, setInfoError] = useState<string | null>(null)
   const [deleteError, setDeleteError] = useState<string | null>(null)
+  /**
+   * 删 worktree 那一步撞上 `worktree_busy` 的次数；0 是没撞上。当占用面板的 key 用，
+   * 每次失败都重新查一遍进程。
+   */
+  const [busyAttempt, setBusyAttempt] = useState(0)
+  /** 占用面板正在结束某个进程：这时点删除会和它并发，先禁掉。 */
+  const [endingHolder, setEndingHolder] = useState(false)
   const [alsoRemote, setAlsoRemote] = useState(false)
   /**
    * 探测答了「远程上已经没有」的那条远程分支，形如 `origin\0feat/x`。
@@ -269,7 +278,7 @@ export function DeleteBranchDialog({
    * 失败也不关，错误就地显示，用户可以直接再点一次。
    */
   const confirm = async () => {
-    if (!info || busy) return
+    if (!info || busy || endingHolder) return
     // 两个目标一起交给 `deleteBranchTargets` 算：这一步是真正发出破坏性动作的
     // 地方，不该依赖上游控件禁用没禁用、渲染没渲染。以前这里是两段分开写的
     // 三元表达式，结果 worktree 那半接上了能力判断、远程那半没有——两轮 review
@@ -287,6 +296,7 @@ export function DeleteBranchDialog({
         setCompleted((steps) => [...steps, step])
       })
     } catch (err) {
+      setBusyAttempt((n) => (toErrorCode(err) === WORKTREE_BUSY ? n + 1 : 0))
       setDeleteError(toErrorMessage(err))
       busyRef.current = false
       setBusy(false)
@@ -392,6 +402,17 @@ export function DeleteBranchDialog({
         {infoError && <Reveal className="dlg-warning">{infoError}</Reveal>}
         {deleteError && <Reveal className="dlg-warning">{deleteError}</Reveal>}
 
+        {/* 只有删 worktree 那一步会报 worktree_busy，那时它还没进 completed，info.worktree 还在 */}
+        {busyAttempt > 0 && repoPath && info?.worktree && (
+          <WorktreeHoldersPanel
+            key={busyAttempt}
+            repoPath={repoPath}
+            worktreePath={info.worktree.path}
+            disabled={busy}
+            onEndingChange={setEndingHolder}
+          />
+        )}
+
         {/* 做完的步骤对应的勾选框消失了，不说一声的话用户点 Cancel 会以为什么都没发生 */}
         {!busy && completed.length > 0 && (
           <div className="dlg-note">
@@ -414,7 +435,7 @@ export function DeleteBranchDialog({
           <button
             ref={confirmRef}
             className="primary danger"
-            disabled={!ready || busy}
+            disabled={!ready || busy || endingHolder}
             onClick={() => void confirm()}
           >
             {busy ? 'Deleting…' : 'Delete'}
