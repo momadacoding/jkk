@@ -1022,6 +1022,39 @@ describe('跟进后自动放回 Local-Only 补丁（计划 2026-11-12-auto-resto
   })
 })
 
+describe('部分自动跟进（计划 2026-11-13-partial-auto-follow）', () => {
+  const partial: FollowReport = {
+    ...report,
+    changes: [{ path: 'Code/A.cs', rev: 5, author: 'me' }],
+    heldBack: [
+      { path: 'Code/B.cs', reason: '重放出来的结果和磁盘对不上' },
+      { path: 'Code/C.cs', reason: '有冲突' },
+    ],
+  }
+
+  it('留在旧基线上的文件单列一节，写明原因；要人看', () => {
+    const m = describeFollowReport(partial)
+    const s = m.sections.find((x) => x.id === 'heldBack')
+    expect(s?.level).toBe('attention')
+    expect(s?.count).toBe(2)
+    expect(s?.groups[0].items).toEqual([
+      { text: 'Code/B.cs', meta: '重放出来的结果和磁盘对不上' },
+      { text: 'Code/C.cs', meta: '有冲突' },
+    ])
+    expect(s?.note).toContain('顶部横幅')
+    expect(m.summary).toContain('2 个文件留在旧基线上')
+    expect(describeAutoFollowDone(partial).tone).toBe('warn')
+  })
+
+  it('整次跟进、旧后端：没有这一节，摘要不提', () => {
+    for (const r of [report, { ...report, heldBack: [] }]) {
+      const m = describeFollowReport(r)
+      expect(m.sections.some((x) => x.id === 'heldBack')).toBe(false)
+      expect(m.summary).not.toContain('留在旧基线上')
+    }
+  })
+})
+
 describe('「缺 Local-Only 补丁」横幅（计划的 C）', () => {
   it('放回后没写成的原因交给错误条：全部写成时不说话', () => {
     expect(describeRestoreSkips({ restored: ['Code/A.cs'], skipped: [] })).toBeNull()

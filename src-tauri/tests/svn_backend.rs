@@ -969,7 +969,7 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     // 计划 Task 10。三层嵌套（Outcome → Report → Leak / ComposeReport），每一层都要是 camelCase；
     // 只测 Refused 的话，变体字段与结构体字段的 serde 属性写错都测不到
     use app_lib::engine::svn_follow::{
-        ConflictDetail, Evidence, FollowOutcome, FollowReport, OverlapFile,
+        ConflictDetail, Evidence, FollowOutcome, FollowReport, HeldBack, OverlapFile,
     };
     use app_lib::engine::svn_follow_index::{ComposeReport, StageDecision};
     use app_lib::engine::svn_leak::{HunkLeak, Leak, LeakVerdict, StageTally};
@@ -1098,6 +1098,10 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
                 commits: vec!["e381033 add".into()],
                 matches_disk: true,
             }],
+            held_back: vec![HeldBack {
+                path: "Code/I.cs".into(),
+                reason: "冲突".into(),
+            }],
             stage: ComposeReport {
                 decisions,
                 uncertain: vec!["Code/B.cs".into()],
@@ -1167,6 +1171,10 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
         r["overlap"][0],
         serde_json::json!({ "path": "Code/F.cs", "commits": ["e381033 add"], "matchesDisk": true })
     );
+    assert_eq!(
+        r["heldBack"][0],
+        serde_json::json!({ "path": "Code/I.cs", "reason": "冲突" })
+    );
     assert_eq!(r["movedBranches"][0], "feature");
     assert_eq!(r["behindBranches"][0], serde_json::json!(["old", "冲突"]));
     assert_eq!(r["pinnedRef"], "refs/mygitclient/follow/x", "实际 {v}");
@@ -1184,7 +1192,10 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     old.as_object_mut().unwrap().remove("restore");
     // 方案 B 之前的 journal 没有 overlap
     old.as_object_mut().unwrap().remove("overlap");
+    // 部分自动跟进之前的 journal 没有 heldBack
+    old.as_object_mut().unwrap().remove("heldBack");
     let back: FollowReport = serde_json::from_value(old).unwrap();
+    assert!(back.held_back.is_empty());
     assert_eq!(
         (back.evidence, back.evidence_cutoff_ms),
         (Evidence::Heuristic, None)

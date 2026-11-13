@@ -63,6 +63,13 @@ export interface OverlapFile {
   matchesDisk: boolean
 }
 
+/** 后端 `svn_follow::HeldBack`：部分自动跟进留在旧基线上的一个文件。 */
+export interface HeldBack {
+  path: string
+  /** 整次跟进时拦下它的那条原因。 */
+  reason: string
+}
+
 /** 后端 `svn_follow::FollowReport`。 */
 export interface FollowReport {
   newFloor: number
@@ -89,6 +96,11 @@ export interface FollowReport {
   restore?: RestoreOutcome | null
   /** 条件 11 的重叠文件，逐个标出是否与磁盘一致。旧后端没有。 */
   overlap?: OverlapFile[]
+  /**
+   * 部分自动跟进时留在旧基线上的文件与原因（计划 2026-11-13-partial-auto-follow）。它们 SVN 侧的
+   * 新内容这次没跟，横幅会继续列出。整次跟进、旧后端时没有或为空。
+   */
+  heldBack?: HeldBack[]
   stage: ComposeReport
   movedBranches: string[]
   behindBranches: [string, string][]
@@ -232,6 +244,7 @@ export interface FollowReportSection {
     | 'rewritten'
     | 'snapshot'
     | 'drift'
+    | 'heldBack'
     | 'restorePending'
     | 'restored'
     | 'overlapDiffers'
@@ -405,6 +418,20 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
       groups: [{ label: '', items: plain(drift) }],
     },
     {
+      id: 'heldBack',
+      title: '留在旧基线上的文件',
+      level: 'attention',
+      note:
+        '这些文件 SVN 侧的新内容这次没有跟进，原因写在每个文件后面；其余文件照常跟进了。' +
+        '顶部横幅会继续列出它们：处理好之后点「跟进」，或者等下一次自动跟进。',
+      groups: [
+        {
+          label: '',
+          items: (r.heldBack ?? []).map((h) => ({ text: h.path, meta: h.reason })),
+        },
+      ],
+    },
+    {
       id: 'restorePending',
       title: '没放回的 Local-Only 补丁',
       level: 'attention',
@@ -573,6 +600,8 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
   const count = r.changes.length + r.removed.length
   const facts = [count > 0 ? `跟进了 ${count} 个文件` : '分支已跟上基线']
   if (r.movedBranches.length > 0) facts.push(`${r.movedBranches.length} 条分支一起移动`)
+  const held = r.heldBack?.length ?? 0
+  if (held > 0) facts.push(`${held} 个文件留在旧基线上`)
   facts.push(`基线最低在 r${r.newFloor}`)
 
   return {
