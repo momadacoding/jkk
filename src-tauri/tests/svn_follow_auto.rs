@@ -1080,6 +1080,20 @@ fn a_file_deleted_in_the_same_follow_gets_a_tombstone_when_the_floor_drops() {
         audit_server_set_at_baseline(&fx.wc_str()).unwrap(),
         ServerAudit::Matched
     );
+
+    // 独立 review 高 1：再来一次部分跟进（B 还留着，floor 还在 B 的旧 revision）。完整录制不带
+    // 旧基线的墓碑，C 的墓碑不能因此丢
+    fx.colleague_commits(A, "a-colleague-2\n");
+    svn_cmd(&fx.wc(), &["update", "--non-interactive"]);
+    let rep = done(auto(&fx));
+    assert_eq!(held(&rep), vec![B.to_string()]);
+    let map = read_base_map(&fx.wc_str(), "svn/base").unwrap();
+    assert!(map.gone.contains_key(c), "{map:?}");
+    assert_eq!(show(&fx, "svn/base:Code/A.cs"), "a-colleague-2");
+    assert_eq!(
+        audit_server_set_at_baseline(&fx.wc_str()).unwrap(),
+        ServerAudit::Matched
+    );
 }
 
 #[test]
