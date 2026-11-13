@@ -60,7 +60,7 @@
 
 use crate::engine::git_cli::{run_git, run_git_bytes, run_git_code, run_git_env, run_git_stdin};
 use crate::engine::svn_baseline::{
-    create_baseline_commit_with, git_dir, move_baseline_ref, TempIndex,
+    create_baseline_commit_with, git_dir, move_baseline_ref, IndexEdit, TempIndex,
 };
 use crate::engine::svn_basemap::{read_base_map, BaseMap};
 use crate::engine::svn_cli::with_scan_cache;
@@ -207,6 +207,10 @@ pub struct FollowReport {
     /// 结果与磁盘是否逐字节相同。核对出错时为空（自动跟进因此不做，见 [`auto_blocker`]）。
     #[serde(default)]
     pub overlap: Vec<OverlapFile>,
+    /// 部分自动跟进时留在旧基线上的文件（计划 `2026-11-13-partial-auto-follow.md`）：内容与
+    /// revision 都还是旧基线的，下一次检测照旧报「SVN 侧有新内容」。整次跟进时为空。
+    #[serde(default)]
+    pub held_back: Vec<HeldBack>,
     pub stage: ComposeReport,
     /// 移动过的其他分支。当前分支不在内。
     pub moved_branches: Vec<String>,
@@ -236,6 +240,15 @@ pub struct OverlapFile {
     pub matches_disk: bool,
 }
 
+/// 部分自动跟进留在旧基线上的一个文件。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeldBack {
+    pub path: String,
+    /// 为什么没跟：就是整次跟进时拦下它的那条原因。
+    pub reason: String,
+}
+
 /// 跟进判定「暂存是不是中间版本」的依据（C1h；分析 §6.13.3）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -257,7 +270,7 @@ pub fn git_version_ok(text: &str) -> bool {
 pub fn follow(repo: &str, opid: &str) -> Result<FollowOutcome> {
     for _ in 0..MAX_ATTEMPTS {
         // 准备阶段里同一条 svn 扫描只跑一次（性能 P2）；发布前的复核在范围外，照常读最新的
-        let plan = match with_scan_cache(|| prepare(repo, false)) {
+        let plan = match with_scan_cache(|| prepare(repo, false, None)) {
             Ok(p) => p,
             Err(e) => return Ok(refused(e)),
         };
@@ -362,14 +375,12 @@ pub enum AutoFollowOutcome {
 /// | 13 | 没有撤销功能，恒真 |
 pub fn follow_auto(repo: &str, opid: &str) -> Result<AutoFollowOutcome> {
     for _ in 0..MAX_ATTEMPTS {
-        let plan = match with_scan_cache(|| prepare(repo, true)) {
+        // 两遍准备都在同一个扫描缓存里：第二遍不重扫白名单
+        let plan = match with_scan_cache(|| prepare_auto(repo)) {
             Ok(p) => p,
             Err(e) => return Ok(skipped(e)),
         };
         fault::reach(fault::Point::Prepared, None);
-        if let Some(e) = auto_blocker(&plan) {
-            return Ok(skipped(e));
-        }
         let _lock = match svn_lock::acquire(repo, opid) {
             Ok(l) => l,
             Err(e) => return Ok(skipped(e)),
@@ -402,6 +413,227 @@ fn skipped(e: GitError) -> AutoFollowOutcome {
         code: e.code,
         message: e.message,
     }
+}
+
+/// 自动跟进的准备：整次准备一遍，被 [`auto_blocker`] 拦下时试一次部分跟进（计划
+/// `2026-11-13-partial-auto-follow.md`，使用报告 2026-11-12 第 5.5 节）。
+///
+/// 拦下的原因都能落到具体文件、这些文件都是外部修改（[`held_candidates`]）时，把它们留在旧基线上
+/// 再准备一遍，复用第一遍录好的基线（不再联网体检）。第二遍还被拦就整次不做，返回**第一遍**的
+/// 原因：它说的是用户看得懂的那个问题，第二遍的原因可能只是排除之后的连带结果。
+///
+/// `Err` 就是不自动跟进的原因，一个 ref 都没动。
+fn prepare_auto(repo: &str) -> Result<Plan> {
+    let plan = prepare(repo, true, None)?;
+    let Some(first) = auto_blocker(&plan) else {
+        return Ok(plan);
+    };
+    let (Some(held), Some(rec)) = (held_candidates(repo, &plan), plan.rec.clone()) else {
+        return Err(first);
+    };
+    match prepare(repo, true, Some(&Partial { rec, held })) {
+        Ok(p) if auto_blocker(&p).is_none() => Ok(p),
+        Ok(_) => Err(first),
+        Err(e) => {
+            log::info!("部分跟进没准备成，按整次跟进的原因跳过：{}", e.message);
+            Err(first)
+        }
+    }
+}
+
+/// 第二遍准备用的：第一遍录好的完整基线，和要留在旧基线上的文件 → 原因。
+struct Partial {
+    rec: Recorded,
+    held: BTreeMap<String, String>,
+}
+
+const HELD_OVERLAP: &str =
+    "重放出来的结果和磁盘对不上：可能是文件里还有没提交的改动，也可能是重放合错了，要你看一眼。";
+const HELD_NOT_MINE: &str =
+    "分支只比磁盘多 Local-Only 补丁，但 SVN 上最后改它的不是你（或认不出是谁），\
+     可能是你有意去掉的补丁。";
+const HELD_CONFLICT: &str = "分支上的提交重放到 SVN 的新内容上有冲突，要你来判断。";
+const HELD_STALE: &str = "磁盘上还是这条分支的旧内容，要用会写磁盘的手动跟进。";
+const HELD_LEAK: &str = "分支的 Local-Only 补丁可能已经被带上了 SVN 服务器，要你先看一眼。";
+
+/// 能留在旧基线上的文件 → 原因。`None`：这次只能整次拦。
+///
+/// - 不能按文件处理的原因（没核对成服务器、重叠核对出错、分支跟进入口）：`None`
+/// - 冲突 / 磁盘是旧内容 / 泄漏 / 重放与磁盘对不上：涉及的文件
+/// - 每个文件都必须是这次的**外部修改**（旧基线与新基线里都有、mode 没变、内容变了）。新增、删除
+///   的文件留不住：改名是「删 + 加」，留一半基线就对不上；删掉的目录里也没有东西可留
+/// - 留下之后什么都不剩（外部变化全在里面）：`None`，照原来整次拦
+fn held_candidates(repo: &str, plan: &Plan) -> Option<BTreeMap<String, String>> {
+    if plan.old_base == plan.new_base || !plan.report.verified || plan.overlap_err.is_some() {
+        return None;
+    }
+    let mut held: BTreeMap<String, String> = BTreeMap::new();
+    let mut hold = |paths: &mut dyn Iterator<Item = &String>, why: &str| {
+        for p in paths {
+            held.entry(p.clone()).or_insert_with(|| why.to_string());
+        }
+    };
+    if let Target::Conflict(m) = &plan.target {
+        let why = if m.stale_disk {
+            HELD_STALE
+        } else {
+            HELD_CONFLICT
+        };
+        hold(&mut m.files.iter(), why);
+        hold(&mut m.leaks.iter().map(|l| &l.path), HELD_LEAK);
+    }
+    hold(&mut plan.report.leaks.iter().map(|l| &l.path), HELD_LEAK);
+    let auto: BTreeSet<String> = auto_restorable(plan).into_iter().collect();
+    for o in &plan.report.overlap {
+        if o.matches_disk || auto.contains(&o.path) {
+            continue;
+        }
+        let why = if plan.report.restorable.contains(&o.path) {
+            HELD_NOT_MINE
+        } else {
+            HELD_OVERLAP
+        };
+        hold(&mut std::iter::once(&o.path), why);
+    }
+    if held.is_empty() {
+        return None;
+    }
+    let diff = match tree_diff(repo, &plan.old_base, &plan.new_base) {
+        Ok(d) => d,
+        Err(e) => {
+            log::warn!("部分跟进读不出基线的变化，整次拦：{}", e.message);
+            return None;
+        }
+    };
+    let modified = |p: &String| diff.iter().any(|d| d.path == *p && d.is_modification());
+    if !held.keys().all(modified) {
+        return None;
+    }
+    if diff.iter().all(|d| held.contains_key(&d.path)) {
+        return None;
+    }
+    Some(held)
+}
+
+/// `diff-tree --raw` 的一行。
+struct TreeChange {
+    path: String,
+    status: String,
+    same_mode: bool,
+}
+
+impl TreeChange {
+    /// 只改了内容：两边都在、mode 相同。
+    fn is_modification(&self) -> bool {
+        self.status == "M" && self.same_mode
+    }
+}
+
+/// 两棵树（或 commit）之间变了的文件。不认改名：改名就是一删一加。
+fn tree_diff(repo: &str, from: &str, to: &str) -> Result<Vec<TreeChange>> {
+    let out = run_git(
+        repo,
+        &["diff-tree", "-r", "-z", "--no-renames", "--raw", from, to],
+    )?;
+    let mut changes = Vec::new();
+    let mut fields = out.split('\0').filter(|f| !f.is_empty());
+    // `:<旧 mode> <新 mode> <旧 oid> <新 oid> <状态>` 后跟路径
+    while let (Some(meta), Some(path)) = (fields.next(), fields.next()) {
+        let parts: Vec<&str> = meta.trim_start_matches(':').split(' ').collect();
+        let [old_mode, new_mode, _, _, status] = parts[..] else {
+            return Err(GitError::new(
+                "svn_follow_partial",
+                format!("读不懂 git diff-tree 的输出：{meta}"),
+            ));
+        };
+        changes.push(TreeChange {
+            path: path.to_string(),
+            status: status.to_string(),
+            same_mode: old_mode == new_mode,
+        });
+    }
+    Ok(changes)
+}
+
+/// 部分基线：在完整录制的基础上，把 `held` 里的文件换回旧基线的内容与 revision。
+///
+/// 映射用 [`compute_map`] 重算，被留下的文件在节点状态里的 `node_rev`、`commit_rev` 换成旧基线
+/// 映射记的 revision。floor 可能因此降下来（根目录 update 之后最常见），这时原来按 floor 不单列的
+/// 文件按 `commit_rev > floor` 单列，规则不变。
+///
+/// floor 降下来之后，这次跟进里删掉的文件要有墓碑：它们在新 floor 时服务器上还在，没有墓碑的话
+/// 服务器文件集合的审计会把它们报成漏收。完整录制只给删除 revision 高于**原** floor 的发了墓碑；
+/// 其余的删除不晚于原 floor，墓碑记成原 floor（删除确认时它已经不在了）。
+///
+/// 完整录制的映射仍是锁内复核（[`still_valid`]）的对照：被留下的都是修改，部分基线的文件集合与
+/// 完整基线相同，按节点状态重算出来的就是完整映射。
+fn partial_record(
+    repo: &str,
+    old_base: &str,
+    full: &Recorded,
+    held: &BTreeMap<String, String>,
+) -> Result<Recorded> {
+    let old_map = read_base_map(repo, old_base)?;
+    let mut args = vec!["ls-tree", "-r", "-z", old_base, "--"];
+    args.extend(held.keys().map(String::as_str));
+    let out = run_git(repo, &args)?;
+    let mut edits = Vec::new();
+    // `<mode> blob <oid>\t<路径>`
+    for entry in out.split('\0').filter(|e| !e.is_empty()) {
+        let (meta, path) = entry.split_once('\t').unwrap_or_default();
+        if let Some(oid) = meta.split(' ').nth(2) {
+            if held.contains_key(path) {
+                edits.push(IndexEdit::Put {
+                    path: path.to_string(),
+                    oid: oid.to_string(),
+                });
+            }
+        }
+    }
+    if edits.len() != held.len() {
+        return Err(GitError::new(
+            "svn_follow_partial",
+            "要留在旧基线上的文件在旧基线里找不全。这是实现缺陷：只该留外部修改的文件。",
+        ));
+    }
+    let idx = TempIndex::from_tree_keeping_stat(repo, &full.tree)?;
+    idx.apply_edits(repo, &edits)?;
+    let tree = idx.write_tree(repo)?;
+
+    let nodes: Vec<NodeStatus> = full
+        .nodes
+        .iter()
+        .map(|n| match held.get(&n.path) {
+            Some(_) => {
+                let r = old_map.rev_of(&n.path);
+                NodeStatus {
+                    node_rev: Some(r),
+                    commit_rev: Some(r),
+                    ..n.clone()
+                }
+            }
+            None => n.clone(),
+        })
+        .collect();
+    let mut gone = full.map.gone.clone();
+    for d in tree_diff(repo, old_base, &full.tree)? {
+        if d.status == "D" {
+            gone.entry(d.path).or_insert(full.map.floor);
+        }
+    }
+    let map = compute_map(
+        &full.map.repos_root,
+        &full.map.uuid,
+        &tree_files(repo, &tree)?,
+        &nodes,
+        gone,
+    )?;
+    Ok(Recorded {
+        tree,
+        map,
+        nodes: full.nodes.clone(),
+        health: full.health.clone(),
+    })
 }
 
 /// 点「跟进」的结果与自动跟进不同的那几条，横幅上要说清楚：按钮仍然可以完成。
@@ -1101,8 +1333,11 @@ struct Plan {
     target: Target,
     others: Vec<BranchMove>,
     report: FollowReport,
-    /// 这次录的映射。锁内要再核对一遍（R3c）；分支跟进没有录制。
+    /// 这次录的映射。锁内要再核对一遍（R3c）；分支跟进没有录制。部分跟进时也是**完整**录制的
+    /// 映射，见 [`partial_record`]。
     recorded: Option<BaseMap>,
+    /// 完整录制本身，部分跟进的第二遍复用（[`prepare_auto`]）。
+    rec: Option<Recorded>,
     who: Who,
     /// 条件 11 的核对没做成（[`overlap_files`] 出错）。报告里的 `overlap` 这时为空，自动跟进
     /// 不能把它当成「没有重叠」。
@@ -1459,7 +1694,8 @@ fn branch_baseline(repo: &str, head: &str, base: &str) -> Result<String> {
 /// 预检与 F1–F3。**一个 ref 都不动**：基线 commit 与重放结果只是对象。
 ///
 /// `auto`：自动跟进只接 ExternallyAdvanced（日志 Task 1「偏离计划」），分支跟进入口在录制之前就停。
-fn prepare(repo: &str, auto: bool) -> Result<Plan> {
+/// `partial`：部分自动跟进的第二遍（[`prepare_auto`]）。按钮走的整次跟进恒为 `None`。
+fn prepare(repo: &str, auto: bool, partial: Option<&Partial>) -> Result<Plan> {
     if detect_repo_kind(repo) != RepoKind::SvnHybrid {
         return Err(not_hybrid());
     }
@@ -1480,6 +1716,8 @@ fn prepare(repo: &str, auto: bool) -> Result<Plan> {
 
     // F1：只有 ExternallyAdvanced 要录新基线
     let mut recorded = None;
+    let mut full_rec = None;
+    let mut held_back = Vec::new();
     let (new_base, nodes, changes, removed, verified, mut who) = match status.verdict {
         SyncVerdict::WcLocked { dirs } => {
             return Err(GitError::new(
@@ -1505,9 +1743,31 @@ fn prepare(repo: &str, auto: bool) -> Result<Plan> {
             added,
             removed,
         } => {
-            let rec = record_from_old_base(repo, &cfg, &old_base)?;
+            let full = match partial {
+                Some(p) => p.rec.clone(),
+                None => record_from_old_base(repo, &cfg, &old_base)?,
+            };
+            let rec = match partial {
+                Some(p) => partial_record(repo, &old_base, &full, &p.held)?,
+                None => full.clone(),
+            };
+            let held: Vec<HeldBack> = partial
+                .map(|p| {
+                    p.held
+                        .iter()
+                        .map(|(path, reason)| HeldBack {
+                            path: path.clone(),
+                            reason: reason.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let who = Who::gather(repo, &rec.map.repos_root, &rec.nodes)?;
-            let mut changes: Vec<ExternalChange> = changed.into_iter().chain(added).collect();
+            let mut changes: Vec<ExternalChange> = changed
+                .into_iter()
+                .chain(added)
+                .filter(|c| !held.iter().any(|h| h.path == c.path))
+                .collect();
             changes.sort_by(|a, b| (a.rev, &a.path).cmp(&(b.rev, &b.path)));
             let summary = summary_lines(&changes, removed.len(), who.me.as_deref());
             let new_base = create_baseline_commit_with(
@@ -1519,7 +1779,9 @@ fn prepare(repo: &str, auto: bool) -> Result<Plan> {
                 None,
             )?;
             let verified = matches!(rec.health, Health::Verified { .. });
-            recorded = Some(rec.map);
+            recorded = Some(full.map.clone());
+            full_rec = Some(full);
+            held_back = held;
             (new_base, rec.nodes, changes, removed, verified, who)
         }
         // 判定说没有新内容，分支也已在基线上：真的没事可做
@@ -1589,6 +1851,7 @@ fn prepare(repo: &str, auto: bool) -> Result<Plan> {
             Evidence::Heuristic
         },
         evidence_cutoff_ms: who.events_read_at_ms,
+        held_back,
         ..Default::default()
     };
 
@@ -1691,6 +1954,7 @@ fn prepare(repo: &str, auto: bool) -> Result<Plan> {
         others,
         report,
         recorded,
+        rec: full_rec,
         who,
         overlap_err,
     })

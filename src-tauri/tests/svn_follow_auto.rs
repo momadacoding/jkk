@@ -9,6 +9,7 @@
 mod svn_fixtures;
 
 use app_lib::engine::git_cli::run_git;
+use app_lib::engine::svn_basemap::read_base_map;
 use app_lib::engine::svn_config::{read_config, write_config};
 use app_lib::engine::svn_follow::fault::{self, Crashed, Point};
 use app_lib::engine::svn_follow::{
@@ -18,6 +19,7 @@ use app_lib::engine::svn_follow::{
 use app_lib::engine::svn_follow_mark::write_mark;
 use app_lib::engine::svn_journal::{self, Flow, FollowStep, Journal, Phase};
 use app_lib::engine::svn_lock;
+use app_lib::engine::svn_server_set::{audit_server_set_at_baseline, ServerAudit};
 use app_lib::engine::svn_sync::{check_sync, SyncVerdict};
 use app_lib::engine::svn_sync_in::SyncInOutcome;
 use std::collections::BTreeMap;
@@ -948,4 +950,249 @@ fn a_stripped_patch_last_changed_by_a_colleague_is_not_restored_automatically() 
     let restore = rep.restore.expect("有放回结果");
     assert!(restore.restored.is_empty(), "{restore:?}");
     assert_eq!(read(&fx, B), lines8("colleague"));
+}
+
+// —— 部分自动跟进（计划 2026-11-13-partial-auto-follow，使用报告 2026-11-12 第 5.5 节） ——
+
+fn held(rep: &FollowReport) -> Vec<String> {
+    rep.held_back.iter().map(|h| h.path.clone()).collect()
+}
+
+/// 跟进之后再判一次：SVN 侧还有新内容的文件。
+fn still_new(fx: &SvnFixture) -> Vec<String> {
+    match check_sync(&fx.wc_str()).unwrap().verdict {
+        SyncVerdict::ExternallyAdvanced {
+            changed,
+            added,
+            removed,
+        } => {
+            let mut v: Vec<String> = changed
+                .into_iter()
+                .chain(added)
+                .map(|c| c.path)
+                .chain(removed)
+                .collect();
+            v.sort();
+            v
+        }
+        SyncVerdict::InSync => Vec::new(),
+        other => panic!("意外的判定：{other:?}"),
+    }
+}
+
+const B_EDITED: &str = "mine\n2\n3\n4\n5\n6\n7\ncolleague\nuncommitted\n";
+
+#[test]
+fn one_file_that_does_not_match_the_disk_stays_behind_and_the_rest_is_followed() {
+    // 验收：1 个文件对不上时，其余文件照常自动跟进，横幅只剩该文件
+    let fx = hybrid_with_colleague();
+    overlap_scene(&fx, "\n");
+    write(&fx, B, B_EDITED);
+    let old_b = show(&fx, "svn/base:Code/B.cs");
+    write(&fx, A, "a2\n");
+    tortoise_commit(&fx, A);
+    let before = wc_snapshot(&fx);
+
+    let rep = done(auto(&fx));
+
+    assert_eq!(wc_snapshot(&fx), before, "磁盘一个字节都不动");
+    assert_eq!(show(&fx, "svn/base:Code/A.cs"), "a2", "A 跟上了");
+    assert_eq!(show(&fx, "svn/base:Code/B.cs"), old_b, "B 留在旧基线上");
+    assert_eq!(held(&rep), vec![B.to_string()]);
+    assert!(
+        rep.held_back[0].reason.contains("磁盘"),
+        "写明为什么留下：{:?}",
+        rep.held_back
+    );
+    assert!(
+        rep.changes.iter().all(|c| c.path != B),
+        "跟进的文件里不列 B：{:?}",
+        rep.changes
+    );
+    assert!(rep.overlap.iter().all(|o| o.path != B));
+    assert_no_residue(&fx);
+    assert_eq!(still_new(&fx), vec![B.to_string()], "横幅只剩 B");
+    assert_eq!(read(&fx, B), B_EDITED);
+
+    // 再来一次只剩 B：没有可跟的了，照原来整次不做
+    assert_skipped_untouched(&fx, "svn_auto_follow_overlap");
+}
+
+#[test]
+fn a_held_back_file_keeps_its_old_revision_after_a_root_update() {
+    // 每天早上根目录 update：所有节点都到 HEAD，floor 跟着到 HEAD。留下的文件要记旧 revision，
+    // floor 因此降下来，其余文件按「commit_rev > floor」单列
+    let fx = hybrid_with_colleague();
+    overlap_scene(&fx, "\n");
+    write(&fx, B, B_EDITED);
+    let old_map = read_base_map(&fx.wc_str(), "svn/base").unwrap();
+    let old_b = show(&fx, "svn/base:Code/B.cs");
+    fx.colleague_commits(A, "a-colleague\n");
+    svn_cmd(&fx.wc(), &["update", "--non-interactive"]);
+    let head = youngest(&fx);
+
+    let rep = done(auto(&fx));
+
+    let map = read_base_map(&fx.wc_str(), "svn/base").unwrap();
+    assert_eq!(held(&rep), vec![B.to_string()]);
+    assert_eq!(map.rev_of(B), old_map.rev_of(B), "{map:?}");
+    assert_eq!(map.rev_of(A), head, "{map:?}");
+    assert!(map.floor <= old_map.rev_of(B), "{map:?}");
+    assert_eq!(show(&fx, "svn/base:Code/B.cs"), old_b);
+    assert_eq!(show(&fx, "svn/base:Code/A.cs"), "a-colleague");
+    assert_eq!(still_new(&fx), vec![B.to_string()]);
+}
+
+#[test]
+fn a_file_deleted_in_the_same_follow_gets_a_tombstone_when_the_floor_drops() {
+    // floor 降回留下文件的旧 revision 时，这次跟进删掉的 C 在新 floor 上服务器里还在。完整录制
+    // 没给它墓碑（删除不晚于原 floor），服务器文件集合的审计就会把它报成漏收
+    let fx = hybrid_with_colleague();
+    let c = "Code/C.cs";
+    fx.colleague_commits(c, "c\n");
+    svn_cmd(&fx.wc(), &["update", "--non-interactive"]);
+    manual_done(follow(&fx.wc_str(), "seed-c").unwrap());
+    overlap_scene(&fx, "\n");
+    write(&fx, B, B_EDITED);
+    let wc2 = fx.wc2();
+    svn_cmd(&wc2, &["update", "--non-interactive"]);
+    svn_cmd(&wc2, &["rm", "--non-interactive", c]);
+    std::fs::write(wc2.join(A), "a-colleague\n").unwrap();
+    svn_cmd(
+        &wc2,
+        &[
+            "commit",
+            "-m",
+            "colleague",
+            "--non-interactive",
+            "--no-auth-cache",
+        ],
+    );
+    svn_cmd(&fx.wc(), &["update", "--non-interactive"]);
+
+    let rep = done(auto(&fx));
+
+    assert_eq!(held(&rep), vec![B.to_string()]);
+    assert_eq!(rep.removed, vec![c.to_string()]);
+    let map = read_base_map(&fx.wc_str(), "svn/base").unwrap();
+    assert!(map.gone.contains_key(c), "{map:?}");
+    assert_eq!(
+        audit_server_set_at_baseline(&fx.wc_str()).unwrap(),
+        ServerAudit::Matched
+    );
+}
+
+#[test]
+fn a_replay_conflict_on_one_file_leaves_only_that_file_behind() {
+    let fx = hybrid_with_colleague();
+    i_commit(&fx);
+    write(&fx, A, "a2\n");
+    commit_all(&fx, "中间版本");
+    write(&fx, A, "a3\n");
+    tortoise_commit(&fx, A);
+    fx.colleague_commits(B, "b2\n");
+    svn_update(&fx, B);
+
+    let rep = done(auto(&fx));
+
+    assert_eq!(held(&rep), vec![A.to_string()]);
+    assert!(
+        rep.held_back[0].reason.contains("冲突"),
+        "{:?}",
+        rep.held_back
+    );
+    assert_eq!(show(&fx, "svn/base:Code/A.cs"), "a1");
+    assert_eq!(show(&fx, "svn/base:Code/B.cs"), "b2");
+    assert_eq!(still_new(&fx), vec![A.to_string()]);
+    assert_eq!(read(&fx, A), "a3\n", "不写磁盘");
+    assert_skipped_untouched(&fx, "svn_auto_follow_conflict");
+}
+
+#[test]
+fn a_leaked_file_stays_behind_so_the_warning_keeps_showing() {
+    let fx = hybrid_with_colleague();
+    write(&fx, A, "a-log\n");
+    commit_all(&fx, L_MSG);
+    tortoise_commit(&fx, A);
+    fx.colleague_commits(B, "b2\n");
+    svn_update(&fx, B);
+
+    let rep = done(auto(&fx));
+
+    assert_eq!(held(&rep), vec![A.to_string()]);
+    assert!(
+        rep.held_back[0].reason.contains("Local-Only"),
+        "{:?}",
+        rep.held_back
+    );
+    assert_eq!(show(&fx, "svn/base:Code/B.cs"), "b2");
+    assert_eq!(still_new(&fx), vec![A.to_string()]);
+    // 只剩 A 时照原来拦下，横幅写泄漏的原因
+    let message = assert_skipped_untouched(&fx, "svn_auto_follow_leak");
+    assert!(message.contains(A), "{message}");
+}
+
+#[test]
+fn a_problem_on_a_file_added_in_svn_stops_the_whole_follow() {
+    // 只排除外部「修改」的文件：新增的文件出问题，整次不做
+    let fx = hybrid_with_colleague();
+    let n = "Code/N.cs";
+    write(&fx, n, "n-log\n");
+    commit_all(&fx, L_MSG);
+    svn_cmd(&fx.wc(), &["add", "--non-interactive", "--", n]);
+    tortoise_commit(&fx, n);
+    write(&fx, A, "a2\n");
+    tortoise_commit(&fx, A);
+
+    let message = assert_skipped_untouched(&fx, "svn_auto_follow_leak");
+    assert!(message.contains(n), "{message}");
+}
+
+/// 分支上有一个改了 `rel` 的 commit，磁盘上的 `rel` 换回 SVN 版本（免得 update 时撞上本地修改），
+/// 再由同事 `op` 把它删掉或改名，同时改了 A；我根目录 update。
+fn removed_in_svn_scene(fx: &SvnFixture, rel: &str, op: &[&str]) {
+    write(fx, rel, "branch\n");
+    commit_all(fx, "改它");
+    svn_cmd(&fx.wc(), &["revert", "--non-interactive", "--", rel]);
+    let wc2 = fx.wc2();
+    svn_cmd(&wc2, &["update", "--non-interactive"]);
+    svn_cmd(&wc2, op);
+    std::fs::write(wc2.join(A), "a-colleague\n").unwrap();
+    svn_cmd(
+        &wc2,
+        &[
+            "commit",
+            "-m",
+            "colleague",
+            "--non-interactive",
+            "--no-auth-cache",
+        ],
+    );
+    svn_cmd(&fx.wc(), &["update", "--non-interactive"]);
+}
+
+#[test]
+fn a_problem_on_a_file_renamed_in_svn_stops_the_whole_follow() {
+    // 改名 = 删 B + 加 B2：只跟一半基线就对不上了，整次不做
+    let fx = hybrid_with_colleague();
+    removed_in_svn_scene(&fx, B, &["mv", "--non-interactive", B, "Code/B2.cs"]);
+    assert!(!fx.wc().join(B).exists(), "前提：B 已在 SVN 上改名");
+
+    // 实测：merge-tree 认出了改名，把分支的改动带到 B2 上，拦下它的是「B2 与磁盘对不上」。
+    // B2 是新增的，留不住，所以整次不做
+    let message = assert_skipped_untouched(&fx, "svn_auto_follow_overlap");
+    assert!(message.contains("Code/B2.cs"), "{message}");
+}
+
+#[test]
+fn a_problem_in_a_directory_deleted_in_svn_stops_the_whole_follow() {
+    let fx = hybrid_with_colleague();
+    let s = "Code/Sub/S.cs";
+    fx.colleague_commits(s, "s1\n");
+    svn_cmd(&fx.wc(), &["update", "--non-interactive"]);
+    manual_done(follow(&fx.wc_str(), "seed").unwrap());
+    removed_in_svn_scene(&fx, s, &["rm", "--non-interactive", "Code/Sub"]);
+    assert!(!fx.wc().join(s).exists(), "前提：目录已在 SVN 上删除");
+
+    assert_skipped_untouched(&fx, "svn_auto_follow_conflict");
 }
