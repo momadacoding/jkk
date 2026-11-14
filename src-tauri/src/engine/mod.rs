@@ -27,6 +27,7 @@ pub mod repo;
 pub mod session;
 pub mod stash;
 pub mod svn_attributes;
+pub mod svn_base_blobs;
 pub mod svn_baseline;
 pub mod svn_basemap;
 pub mod svn_cli;

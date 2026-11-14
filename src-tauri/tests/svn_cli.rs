@@ -9,8 +9,9 @@
 mod svn_fixtures;
 
 use app_lib::engine::svn_cli::{
-    chunk_targets, cmdline_estimate, forget_node_scans, path_dirs_from_reg_output, probe_svn,
-    run_svn, run_svn_code, run_svn_targets, with_global, with_scan_cache, SvnAvailability,
+    bypass_scan_cache, chunk_targets, cmdline_estimate, forget_node_scans,
+    path_dirs_from_reg_output, probe_svn, run_svn, run_svn_code, run_svn_targets, with_global,
+    with_scan_cache, SvnAvailability,
 };
 use svn_fixtures::svn_repo;
 
@@ -182,6 +183,24 @@ fn a_scan_cache_serves_the_same_status_until_node_scans_are_forgotten() {
             node_scan(&wc),
             first,
             "忘掉之后必须重新读：R3c 靠它发现录制期间的变化"
+        );
+    });
+}
+
+#[test]
+fn a_bypassed_scan_reads_fresh_and_leaves_the_cache_in_place() {
+    // svn_base_blobs 写缓存前的复核靠它：在缓存里重读等于没查（独立 review 2026-11-14）
+    let fx = svn_repo();
+    let wc = fx.wc_str();
+    with_scan_cache(|| {
+        let first = node_scan(&wc);
+        std::fs::write(fx.wc().join("Code/A.cs"), "edited\n").unwrap();
+        let fresh = bypass_scan_cache(|| node_scan(&wc));
+        assert_ne!(fresh, first, "绕过缓存必须读到最新的");
+        assert_eq!(
+            node_scan(&wc),
+            first,
+            "绕过之后原来的缓存还在，也没记进新结果"
         );
     });
 }
