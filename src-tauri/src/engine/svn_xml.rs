@@ -365,7 +365,9 @@ fn joined_text(node: &Node) -> String {
         .concat()
 }
 
-/// 从 `svn status --xml`（**不带** `--ignore-externals`）里列出 external 根。
+/// 从 `svn status --xml` 里列出 external 根。带不带 `--ignore-externals` 都行：external 根那条
+/// `item="external"` 两种情况下都出现（见 [`assert_externals_were_ignored`] 的实测表），带的时候
+/// 只列得出这一层的，更深的要到它自己的工作副本里再找（`svn_wc::enumerate_wcs` 按层循环）。
 ///
 /// 走 `item="external"` 而不是解析 `svn:externals` 属性文本：后者要处理 `-r` peg、
 /// `^/` 相对 URL、引号和多行格式，实测前者能干净列出（spec §6.6.4）。

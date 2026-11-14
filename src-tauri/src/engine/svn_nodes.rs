@@ -21,7 +21,7 @@
 //! 总是安全的：c(f) > F 的文件自动单列，标签仍然成立，只是映射多几条。
 
 use crate::engine::svn_basemap::{BaseMap, MAX_MAP_ENTRIES};
-use crate::engine::svn_cli::run_svn_targets;
+use crate::engine::svn_cli::{run_svn_targets, STATUS_SCAN};
 use crate::engine::svn_sync::status_targets;
 use crate::engine::svn_wc::{peg_safe, WcIdentity};
 use crate::error::{GitError, Result};
@@ -29,7 +29,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub use crate::engine::svn_xml::{parse_node_status, NodeStatus};
 
-/// 对全部 target 跑 `svn status -v --xml --ignore-externals`，合并成一份按路径升序的节点表。
+/// 对全部 target 跑一遍全量扫描（[`STATUS_SCAN`]，即 `svn status -v --ignore-externals --xml`
+/// 外加脏条目清点要的 `--no-ignore`），合并成一份按路径升序的节点表。被忽略的条目不进表。
 ///
 /// target 与失同步判定相同（[`status_targets`]）：白名单条目 + 每个 wc(P) 的根。
 /// 每个 wc 都要单独作为一个 target，因为 external 是独立的工作副本，`--ignore-externals`
@@ -55,12 +56,14 @@ pub fn read_node_status(
         .iter()
         .map(|t| peg_safe(t))
         .collect();
-    for xml in run_svn_targets(
-        repo,
-        &["status", "-v", "--xml", "--ignore-externals", "--"],
-        &args,
-    )? {
+    for xml in run_svn_targets(repo, STATUS_SCAN, &args)? {
         for n in parse_node_status(&xml)? {
+            // `STATUS_SCAN` 比这里原来的命令多一个 `--no-ignore`（脏条目清点要它），多出来的只有
+            // `item="ignored"` 的条目。丢掉它们，节点表与原来逐条相同：留着的话，只含被忽略文件的
+            // 目录会被 `dir_revs` 认成目录、参与 floor，映射就和以前算的不是同一个了
+            if n.item == "ignored" {
+                continue;
+            }
             match merged.get(&n.path) {
                 Some(old) if old.node_rev.is_some() || n.node_rev.is_none() => {}
                 _ => {

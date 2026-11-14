@@ -268,10 +268,22 @@ pub fn verify_include_set(
     scope: &WScope,
     fixes: &BTreeMap<String, Fix>,
 ) -> Result<()> {
+    verify_include_set_listing(repo_root, idx, scope, fixes).map(|_listed| ())
+}
+
+/// 同 [`verify_include_set`]，通过时另外返回候选索引里的文件清单（就是核对用的那份
+/// `git ls-files -z`）。
+pub(crate) fn verify_include_set_listing(
+    repo_root: &str,
+    idx: &TempIndex,
+    scope: &WScope,
+    fixes: &BTreeMap<String, Fix>,
+) -> Result<BTreeSet<String>> {
     let expected = server_expected_set(repo_root, scope, fixes)?;
     let actual = idx.ls_files(repo_root)?;
     if expected == actual {
-        return Ok(());
+        // 核对通过时把读到的清单交出去：跟进的录制拿它当基线树的文件清单用，不必再读一遍索引
+        return Ok(actual);
     }
     let missing: Vec<String> = expected.difference(&actual).cloned().collect();
     let unexpected: Vec<String> = actual.difference(&expected).cloned().collect();

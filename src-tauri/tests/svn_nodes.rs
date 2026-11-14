@@ -7,12 +7,13 @@
 #[path = "common/svn_fixtures.rs"]
 mod svn_fixtures;
 
+use app_lib::engine::svn_cli::{run_svn, STATUS_SCAN};
 use app_lib::engine::svn_config::read_config;
 use app_lib::engine::svn_nodes::{compute_map, read_node_status, NodeStatus};
 use app_lib::engine::svn_wc::enumerate_wcs;
 use app_lib::engine::svn_xml::parse_node_status;
 use std::collections::{BTreeMap, BTreeSet};
-use svn_fixtures::{hybrid_with_colleague, svn_cmd, SvnFixture};
+use svn_fixtures::{hybrid_with_colleague, svn_cmd, svn_repo_with_svn_ignored_cs, SvnFixture};
 
 const ROOT: &str = "file:///fixture/repo";
 const UUID: &str = "8f3a1c7e-4b21-0410-9d2f-1a7b3c5d9e01";
@@ -173,6 +174,76 @@ fn parse_node_status_refuses_output_without_externals_ignored() {
 </target></status>"#;
     let err = parse_node_status(xml).unwrap_err();
     assert_eq!(err.code, "svn_xml_externals_not_ignored");
+}
+
+#[test]
+fn the_shared_scan_yields_the_same_nodes_as_the_command_it_replaced() {
+    // 日志 2026-11-14-follow-latency 的 T1：`read_node_status` 现在发的是找 external、清点脏条目
+    // 也在用的那条全量扫描，比它原来的命令多一个 `--no-ignore`。节点表必须与原来逐条相同，
+    // 否则映射（floor、单列的文件）会跟着变
+    let fx = svn_repo_with_svn_ignored_cs();
+    let repo = fx.wc_str();
+    let whitelist = vec!["Code/".to_string()];
+    // 一个只装着被忽略文件的受版本控制目录：被忽略的条目留在节点表里的话，`dir_revs` 会因为它
+    // 有了子项而把它认成目录
+    svn_cmd(
+        &fx.wc(),
+        &["mkdir", "Code/OnlyIgnored", "--non-interactive"],
+    );
+    svn_cmd(
+        &fx.wc(),
+        &[
+            "propset",
+            "svn:ignore",
+            "*.cs",
+            "Code/OnlyIgnored",
+            "--non-interactive",
+        ],
+    );
+    svn_cmd(&fx.wc(), &["commit", "-m", "dir", "--non-interactive"]);
+    svn_cmd(&fx.wc(), &["update", "--non-interactive"]);
+    std::fs::write(fx.wc().join("Code/OnlyIgnored/Gen.cs"), "g\n").unwrap();
+    // 让那个目录停在比别的节点旧的 revision：再提交一次，只更新 `Code` 与它的直接文件
+    std::fs::write(fx.wc().join("Code/A.cs"), "a2\n").unwrap();
+    svn_cmd(&fx.wc(), &["commit", "-m", "a2", "--non-interactive"]);
+    svn_cmd(
+        &fx.wc(),
+        &["update", "--depth=files", "--non-interactive", "Code"],
+    );
+
+    let wcs = enumerate_wcs(&repo, &whitelist).unwrap();
+    let nodes = read_node_status(&repo, &whitelist, &wcs).unwrap();
+
+    let old = run_svn(
+        &repo,
+        &["status", "-v", "--xml", "--ignore-externals", "--", "Code@"],
+    )
+    .unwrap();
+    assert_eq!(nodes, parse_node_status(&old).unwrap());
+
+    // 前提：共用的那条扫描里真的多出了被忽略的文件，否则上面比的是两份本来就一样的输出
+    let mut shared: Vec<&str> = STATUS_SCAN.to_vec();
+    shared.push("Code@");
+    let shared = parse_node_status(&run_svn(&repo, &shared).unwrap()).unwrap();
+    let ignored: Vec<&str> = shared
+        .iter()
+        .filter(|n| n.item == "ignored")
+        .map(|n| n.path.as_str())
+        .collect();
+    assert_eq!(ignored, ["Code/Generated.cs", "Code/OnlyIgnored/Gen.cs"]);
+
+    // 为什么要丢掉它们：留着的话 `Code/OnlyIgnored` 有了子项、被认成目录，floor 被它拖低
+    let rev = |p: &str| by_path(&nodes, p).node_rev.unwrap();
+    let (newer, older) = (rev("Code"), rev("Code/OnlyIgnored"));
+    assert!(older < newer, "fixture 没造出停在旧 revision 的目录");
+    let tree = files(&["Code/A.cs", "Code/B.cs"]);
+    let floor = |nodes: &[NodeStatus]| {
+        compute_map(ROOT, UUID, &tree, nodes, BTreeMap::new())
+            .unwrap()
+            .floor
+    };
+    assert_eq!(floor(&nodes), newer);
+    assert_eq!(floor(&shared), older);
 }
 
 fn nodes_of(fx: &SvnFixture) -> Vec<NodeStatus> {
