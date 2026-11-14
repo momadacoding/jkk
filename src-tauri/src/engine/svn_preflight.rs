@@ -6,7 +6,7 @@
 //! P5（external 有没有被 `-r` 钉死）不在这里：它**不阻断**，只切换到 pinned
 //! 模式，属于另一条路径（`engine::svn_externals`）。
 
-use crate::engine::svn_cli::{run_svn, run_svn_targets};
+use crate::engine::svn_cli::{run_svn, run_svn_targets, with_scan_cache};
 use crate::engine::svn_dirty::read_dirty;
 use crate::engine::svn_nodes::{read_node_status, NodeStatus};
 use crate::engine::svn_wc::{check_single_repository, enumerate_wcs, peg_safe, WcIdentity};
@@ -91,6 +91,17 @@ pub fn run_preflight(repo_root: &str, whitelist: &[String]) -> Result<Preflight>
 /// `node_rev` 此时取所有节点（含目录）revision 的最小值，只给向导展示；真正的 floor 由
 /// `svn_nodes::compute_map` 按基线树的文件算。
 pub fn run_preflight_with(
+    repo_root: &str,
+    whitelist: &[String],
+    allow_mixed: bool,
+) -> Result<Preflight> {
+    // 枚举工作副本、清点脏条目、读节点状态发的是同一条全量扫描（`svn_cli::STATUS_SCAN`），在一个
+    // 范围里只跑一遍。整次校验是对工作副本的一次只读快照，范围就是这一次调用；调用方已经开了
+    // 范围（跟进的准备阶段）时沿用它的
+    with_scan_cache(|| preflight_uncached(repo_root, whitelist, allow_mixed))
+}
+
+fn preflight_uncached(
     repo_root: &str,
     whitelist: &[String],
     allow_mixed: bool,

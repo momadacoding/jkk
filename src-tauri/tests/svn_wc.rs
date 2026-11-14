@@ -4,9 +4,11 @@
 #[path = "common/svn_fixtures.rs"]
 mod svn_fixtures;
 
+use app_lib::engine::svn_cli::with_scan_cache;
 use app_lib::engine::svn_wc::{check_single_repository, enumerate_wcs};
 use svn_fixtures::{
-    svn_cmd, svn_repo, svn_repo_with_at_sign_in_path, svn_repo_with_cross_repo_nested_external,
+    file_url, svn_cmd, svn_repo, svn_repo_with_at_sign_in_path,
+    svn_repo_with_cross_repo_nested_external, SvnFixture,
 };
 
 #[test]
@@ -79,6 +81,74 @@ fn the_two_nested_wcs_really_belong_to_different_repositories() {
     let fx = svn_repo_with_cross_repo_nested_external();
     let wcs = enumerate_wcs(&fx.wc_str(), &["Code/".to_string()]).unwrap();
     assert_ne!(wcs[0].uuid, wcs[1].uuid, "fixture 没造出跨仓库的形态");
+}
+
+/// `Code` 上挂 external `Vendor`（→ `^/vendor`），`vendor` 自己又挂 external `Deep`（→ `^/deep`）。
+/// wc1 检出之后是三层工作副本：`Code`、`Code/Vendor`、`Code/Vendor/Deep`。
+fn two_levels_of_nested_externals() -> SvnFixture {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let created = std::process::Command::new("svnadmin")
+        .current_dir(&root)
+        .args(["create", "repo"])
+        .output()
+        .unwrap();
+    assert!(created.status.success());
+    let url = file_url(&root.join("repo"));
+    svn_cmd(&root, &["checkout", &url, "seed", "--non-interactive"]);
+    let seed = root.join("seed");
+    for (d, f) in [("Code", "A.cs"), ("vendor", "V.cs"), ("deep", "D.cs")] {
+        std::fs::create_dir_all(seed.join(d)).unwrap();
+        std::fs::write(seed.join(d).join(f), "x\n").unwrap();
+    }
+    svn_cmd(
+        &seed,
+        &["add", "Code", "vendor", "deep", "--non-interactive"],
+    );
+    svn_cmd(&seed, &["commit", "-m", "r1", "--non-interactive"]);
+    svn_cmd(&seed, &["update", "--non-interactive"]);
+    // 属性值走 `-F` 文件（同 `svn_repo_with_same_repo_nested_external`）
+    for (on, value) in [("Code", "vendor Vendor"), ("vendor", "deep Deep")] {
+        let (from, to) = value.split_once(' ').unwrap();
+        let ext = root.join(format!("externals-{on}.txt"));
+        std::fs::write(&ext, format!("{url}/{from} {to}\n")).unwrap();
+        svn_cmd(
+            &seed,
+            &[
+                "propset",
+                "svn:externals",
+                "-F",
+                ext.to_str().unwrap(),
+                on,
+                "--non-interactive",
+            ],
+        );
+    }
+    svn_cmd(&seed, &["commit", "-m", "externals", "--non-interactive"]);
+    svn_cmd(&root, &["checkout", &url, "wc1", "--non-interactive"]);
+    SvnFixture { dir }
+}
+
+#[test]
+fn externals_nested_two_levels_deep_are_found_layer_by_layer() {
+    // 日志 2026-11-14-follow-latency 的 T1：在扫描缓存范围里，找 external 用的是与读节点
+    // revision 共用的那条扫描，它带 `--ignore-externals`，一次只看得到直接挂在这一层的
+    // external。第二层的要靠按层循环，到第一层 external 自己的工作副本里去找。不在范围里时
+    // 照旧不带这个参数，一次就看到全部。两条路径必须枚举出同一份结果
+    let fx = two_levels_of_nested_externals();
+    // fixture 自检：第二层真的检出来了，否则下面断言 3 个也只是碰巧
+    assert!(
+        fx.wc().join("Code/Vendor/Deep/D.cs").is_file(),
+        "fixture 没造出两层嵌套的 external"
+    );
+    let whitelist = ["Code/".to_string()];
+    let plain = enumerate_wcs(&fx.wc_str(), &whitelist).unwrap();
+    let shared = with_scan_cache(|| enumerate_wcs(&fx.wc_str(), &whitelist)).unwrap();
+    for (how, wcs) in [("范围外", &plain), ("范围内", &shared)] {
+        let roots: Vec<&str> = wcs.iter().map(|w| w.wc_root.as_str()).collect();
+        assert_eq!(roots, ["Code", "Code/Vendor", "Code/Vendor/Deep"], "{how}");
+    }
+    assert_eq!(plain, shared);
 }
 
 #[test]
