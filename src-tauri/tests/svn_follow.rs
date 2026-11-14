@@ -3632,6 +3632,46 @@ fn a_stale_scan_cache_cannot_record_a_lying_baseline() {
 }
 
 #[test]
+fn a_follow_that_recorded_from_stale_scans_is_stopped_by_the_recheck_in_the_lock() {
+    // 跟进的录制不再自己做 R3c（`svn_init::RecordMode::Follow`），「读完节点状态之后 TortoiseSVN
+    // 又提交了一次」只靠发布前的锁内复核拦。这里用外层的扫描缓存造出那个时序：跟进的准备阶段
+    // 读到的全是提交之前的节点状态。
+    //
+    // A 改着没提交 → 缓存里它是脏文件、停在 r1。缓存之后把它提交成 r3：录制按「脏文件取
+    // BASE」拿到的是 r3 的内容，映射却照缓存记成 r1。体检不比换成 BASE 的文件，查不出来。
+    let fx = hybrid_with_colleague();
+    write(&fx, B, "b2\n");
+    tortoise_commit(&fx, B);
+    write(&fx, A, "a2\n");
+    let base = oid(&fx, "svn/base");
+    let head = oid(&fx, "HEAD");
+
+    let out = with_scan_cache(|| {
+        let seen = check_sync(&fx.wc_str()).unwrap();
+        assert!(
+            matches!(seen.verdict, SyncVerdict::ExternallyAdvanced { .. }),
+            "前提：缓存里的判定是有新内容，{:?}",
+            seen.verdict
+        );
+        tortoise_commit(&fx, A);
+        run(&fx)
+    });
+
+    // 复核必须绕过外层缓存读到此刻的工作副本：两次准备都对不上，一个 ref 都不动
+    let (code, _) = refused(out);
+    assert_eq!(code, "svn_follow_state_changed");
+    assert_eq!(oid(&fx, "svn/base"), base);
+    assert_eq!(oid(&fx, "HEAD"), head);
+    assert_no_residue(&fx);
+
+    // 出了缓存范围再跟进：A 的新内容按 r3 录进去
+    done(run(&fx));
+    assert_eq!(show(&fx, "svn/base:Code/A.cs"), "a2");
+    let map = read_base_map(&fx.wc_str(), "svn/base").unwrap();
+    assert_eq!(map.rev_of(A), 3);
+}
+
+#[test]
 fn follow_falls_back_to_an_empty_index_when_the_old_base_has_files_outside_the_whitelist() {
     // 旧基线里有现在已不算 W 的文件（比如扩展名清单收窄过）：从旧基线起步时 `add -A`
     // 会把这个已跟踪的文件留下，纳入集合核对不过。这时要退回空索引照旧录一次，

@@ -117,6 +117,40 @@ pub fn run_svn_targets(path: &str, head: &[&str], targets: &[String]) -> Result<
     Ok(out)
 }
 
+/// 白名单的全量扫描：找嵌套 external（`svn_wc::enumerate_wcs`）、读节点 revision
+/// （`svn_nodes::read_node_status`）、清点脏条目（`svn_dirty::read_dirty`）**共用这一条命令**，
+/// target 接在后面。
+///
+/// # 为什么三处必须逐字相同
+///
+/// [`with_scan_cache`] 按「工作目录 + 全部参数」认同一条命令。原来三处各带各的参数
+/// （`status`、`status -v --ignore-externals`、`status -v --no-ignore --ignore-externals`），同一片
+/// 白名单每个范围里要遍历三遍；一遍在公司机器上约 4 秒（2026-11-07 报告 3.4 节），一次自动跟进
+/// 连同前后的检测一共十遍。参数取三者的并集之后，白名单底下没有嵌套 external 时三处发的是同一条
+/// 命令，一个范围里只遍历一遍（`tests/svn_follow_scan_budget.rs` 钉住遍数）。有嵌套 external 时
+/// 枚举按层发、另两处一次传全部 target，命令不同，多遍历一遍，不比原来多。
+///
+/// 找嵌套 external 只在范围里才用它；不在范围里时没有人共用，照旧发它自己那条输出很小的命令
+/// （`svn_wc::enumerate_wcs`）。
+///
+/// # 为什么并集对三处都够用
+///
+/// | 参数 | 谁要它 | 对另外两处的影响 |
+/// |---|---|---|
+/// | `-v` | 节点 revision（不带它干净节点不输出）、脏条目（被 `svn delete` 的目录的子文件） | 找 external 只看 `item="external"`，多出来的条目不看 |
+/// | `--no-ignore` | 脏条目（SVN-ignored 而 git 照收的文件） | 只多出 `item="ignored"` 的条目；节点 revision 那边读完就丢掉它们，结果与原来逐条相同 |
+/// | `--ignore-externals` | 节点 revision、脏条目（external 内部是另一个仓库的 revision 序列） | external 根那条 `item="external"` 带不带它都出现（`svn_xml::assert_externals_were_ignored` 的实测表）；更深一层的由枚举下一层去找 |
+///
+/// 以 `--` 结尾，是 `run_svn_targets` 的 `head`。target 要过 `svn_wc::peg_safe`。
+pub const STATUS_SCAN: &[&str] = &[
+    "status",
+    "-v",
+    "--no-ignore",
+    "--ignore-externals",
+    "--xml",
+    "--",
+];
+
 thread_local! {
     /// [`with_scan_cache`] 范围内的 `svn info` / `svn status` 输出。`None` = 不在范围内。
     static SCANS: RefCell<Option<HashMap<String, String>>> = const { RefCell::new(None) };
@@ -134,8 +168,9 @@ thread_local! {
 ///
 /// - 只缓存只读的 `info` / `status`，范围由调用方划定（跟进只包住准备阶段），出了范围就丢。
 /// - 范围内不发生 SVN 写操作：跟进全程不写工作区、不发 SVN 写命令。外部（TortoiseSVN）在范围内
-///   的改动由两道防线兜住：R3c 重读节点状态前先 [`forget_node_scans`]，体检直接问服务器；发布前
-///   的复核不在范围内，照常读最新的。
+///   的改动由两道防线兜住：体检直接问服务器；发布前的锁内复核（跟进的 R3c，
+///   `svn_follow::still_valid`）不在范围内，照常读最新的。别的录制入口在范围里做 R3c 时先
+///   [`forget_node_scans`]。
 /// - 只按线程缓存：Tauri 命令在线程池里跑，一次跟进从头到尾在同一个线程上。
 ///
 /// 嵌套调用沿用外层的缓存，不重置。
@@ -153,6 +188,11 @@ pub fn with_scan_cache<T>(f: impl FnOnce() -> T) -> T {
     SCANS.with(|s| *s.borrow_mut() = Some(HashMap::new()));
     let _scope = Scope;
     f()
+}
+
+/// 当前线程是不是在 [`with_scan_cache`] 的范围里。
+pub fn in_scan_cache() -> bool {
+    SCANS.with(|s| s.borrow().is_some())
 }
 
 /// 在范围里临时不用扫描缓存：`f` 里的 `info` / `status` 都去读最新的，也不往缓存里记。
@@ -173,9 +213,9 @@ pub fn bypass_scan_cache<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
-/// 忘掉缓存里的节点状态扫描（`status -v`），下一次照常去读。R3c 用：它存在的意义就是发现录制
-/// 期间工作副本被外部改了，读缓存等于没查。`info` 与找 external 的 `status` 留着——那是工作副本
-/// 的布局，不是 revision。不在范围内时什么都不做。
+/// 忘掉缓存里的节点状态扫描（`status -v`，即 [`STATUS_SCAN`]），下一次照常去读。R3c 用：它存在的
+/// 意义就是发现录制期间工作副本被外部改了，读缓存等于没查。`info` 留着——那是工作副本的布局，
+/// 不是 revision。找 external 用的也是同一条扫描，跟着一起重读。不在范围内时什么都不做。
 pub fn forget_node_scans() {
     SCANS.with(|s| {
         if let Some(m) = s.borrow_mut().as_mut() {
@@ -200,16 +240,106 @@ fn scan_key(path: &str, args: &[&str]) -> Option<String> {
     Some(k)
 }
 
+/// 在后台线程里提前跑的一条多目标扫描，见 [`prefetch_scan`]。
+pub struct ScanAhead {
+    /// 每一批的缓存键，与 [`run_svn_targets`] 分批后逐条 [`run_svn`] 用的键相同。
+    keys: Vec<String>,
+    handle: Option<std::thread::JoinHandle<Result<Vec<String>>>>,
+}
+
+impl ScanAhead {
+    /// 等后台那条命令跑完，把输出记进**当前线程**的扫描缓存。之后同一条命令（[`run_svn_targets`]
+    /// 带同样的 `head` 与 `targets`）直接拿到这份输出。
+    ///
+    /// 后台那条失败时什么都不记：调用方随后照常自己跑一遍，错误从那里报出来，与没有预跑时相同。
+    pub fn adopt(mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        match handle.join() {
+            Ok(Ok(outputs)) if outputs.len() == self.keys.len() => {
+                for (key, out) in std::mem::take(&mut self.keys).into_iter().zip(outputs) {
+                    store_scan(key, out);
+                }
+            }
+            Ok(Ok(_)) => log::warn!("预跑的 svn 扫描批数对不上，不用它的结果"),
+            Ok(Err(e)) => log::info!("预跑的 svn 扫描失败，稍后照常重跑：{}", e.message),
+            Err(_) => log::warn!("预跑 svn 扫描的线程 panic 了，稍后照常重跑"),
+        }
+    }
+}
+
+impl Drop for ScanAhead {
+    /// 没被 [`ScanAhead::adopt`] 的（调用方中途报错返回）也等它跑完：不留一个还在读工作副本的
+    /// svn 进程在调用方返回之后继续跑（测试的临时目录这时正要删）。
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// 在后台线程里提前跑 `run_svn_targets(path, head, targets)`，让它与调用方接下来的工作并行。
+/// 返回的 [`ScanAhead`] 在真正要用结果之前 [`ScanAhead::adopt`] 一下。
+///
+/// 只对 [`with_scan_cache`] 范围内、可以缓存的只读扫描（`info` / `status`）有意义，其余情况
+/// 返回 `None`、不起线程：
+///
+/// - 不在范围内：结果没地方放；
+/// - 每一批都已经在缓存里：没有可省的；
+/// - `targets` 为空：[`run_svn_targets`] 这时一个进程都不起。
+///
+/// # 为什么是安全的
+///
+/// 与 [`with_scan_cache`] 相同：只读命令，结果只在调用方划定的范围里用。提前跑只是把同一条
+/// 命令的执行时刻往前挪了一点，仍在范围之内；范围内本来就约定同一条扫描只读一次。svn 的只读
+/// 命令可以并发（录制里取服务器内容早就是多个 `svn cat` 并行）。
+pub fn prefetch_scan(path: &str, head: &[&str], targets: &[String]) -> Option<ScanAhead> {
+    let mut keys = Vec::new();
+    for batch in chunk_targets(head, targets, MAX_TARGETS_CMDLINE) {
+        let mut args: Vec<&str> = head.to_vec();
+        args.extend(batch.iter().map(String::as_str));
+        keys.push(scan_key(path, &args)?);
+    }
+    if keys.is_empty() || keys.iter().all(|k| scan_is_cached(k)) {
+        return None;
+    }
+    let (path, targets) = (path.to_string(), targets.to_vec());
+    let head: Vec<String> = head.iter().map(|a| a.to_string()).collect();
+    let handle = std::thread::Builder::new()
+        .name("svn-scan-ahead".to_string())
+        .spawn(move || {
+            let head: Vec<&str> = head.iter().map(String::as_str).collect();
+            // 新线程不在任何扫描缓存范围里，这里一定真的起进程
+            run_svn_targets(&path, &head, &targets)
+        })
+        .ok()?;
+    Some(ScanAhead {
+        keys,
+        handle: Some(handle),
+    })
+}
+
 fn cached_scan(key: &str) -> Option<String> {
     SCANS.with(|s| s.borrow().as_ref().and_then(|m| m.get(key).cloned()))
 }
 
 fn remember_scan(key: String, out: &str) {
+    store_scan(key, out.to_string());
+}
+
+/// 同 [`remember_scan`]，调用方已经拥有这份输出时用：全量扫描的输出有十几 MB，不多拷一份。
+fn store_scan(key: String, out: String) {
     SCANS.with(|s| {
         if let Some(m) = s.borrow_mut().as_mut() {
-            m.insert(key, out.to_string());
+            m.insert(key, out);
         }
     });
+}
+
+/// 缓存里有没有这条扫描。只问有没有，不像 [`cached_scan`] 那样把输出拷出来。
+fn scan_is_cached(key: &str) -> bool {
+    SCANS.with(|s| s.borrow().as_ref().is_some_and(|m| m.contains_key(key)))
 }
 
 /// 同 [`run_svn`]，但把 stdout 按**原始字节**返回，且把退出码和 stderr 一起给出去。

@@ -5,7 +5,7 @@
 //! 仓库**的子树已经进了白名单——它会被 git 跟踪、进基线、进交付清单，却从不
 //! 参与 `nodeRevs` 校验，最后在 D5 撞上 `E200007`（spec §6.5.5）。
 
-use crate::engine::svn_cli::run_svn_targets;
+use crate::engine::svn_cli::{in_scan_cache, run_svn_targets, STATUS_SCAN};
 use crate::engine::svn_xml::{parse_external_roots, parse_info};
 use crate::error::{GitError, Result};
 
@@ -42,6 +42,10 @@ pub struct WcIdentity {
 /// 每一层（先是白名单，再是上一层里新冒出来的 external 根）只发一次 `svn info`、一次
 /// `svn status`，所有 target 一起传（计划 2026-11-09 Task 2）。原来每个 target 各两个进程，
 /// 公司机器上 23 个目录光 `info` 就 1.25 s、一次传 82 ms。外部嵌套通常只有一两层。
+///
+/// 在 `svn_cli::with_scan_cache` 的范围里，`svn status` 用的是 [`STATUS_SCAN`]：紧接着读节点
+/// revision 或脏条目的调用方拿到的是这里已经读过的那份输出，不再遍历一遍磁盘。不在范围里时
+/// 没有人能共用它，照旧发只为找 external 的 [`EXTERNALS_ONLY_SCAN`]。
 pub fn enumerate_wcs(repo_root: &str, whitelist: &[String]) -> Result<Vec<WcIdentity>> {
     let mut out: Vec<WcIdentity> = Vec::new();
     let mut pending: Vec<String> = whitelist
@@ -94,9 +98,26 @@ pub fn enumerate_wcs(repo_root: &str, whitelist: &[String]) -> Result<Vec<WcIden
             });
         }
 
-        // 找这些子树里的嵌套 external 根。**这一次故意不带 `--ignore-externals`**
-        // ——要的就是让它们出现（`item="external"`），见 spec §6.6.4 的枚举方式。
-        for st in run_svn_targets(repo_root, &["status", "--xml", "--"], &args)? {
+        // 找这些子树里的嵌套 external 根（`item="external"`，spec §6.6.4 的枚举方式）。
+        //
+        // 在扫描缓存范围里，用的是与读节点 revision、清点脏条目相同的那条扫描（`STATUS_SCAN`），
+        // 三处只遍历一遍。它带 `--ignore-externals`：external 根那条标记照样出现（实测见
+        // `svn_xml::assert_externals_were_ignored` 的表），只是不再下沉进去——更深一层的
+        // external 由下一轮循环在它自己的工作副本里找，结果与不带参数、一次看到全部层相同。
+        let shared = in_scan_cache();
+        let scan = if shared {
+            STATUS_SCAN
+        } else {
+            EXTERNALS_ONLY_SCAN
+        };
+        for st in run_svn_targets(repo_root, scan, &args)? {
+            // 共用的那份输出带 `-v`，几万个节点时有十几 MB，而没有 external 是常态：不为一个空
+            // 结果把整份文档解析一遍。属性值里的引号在 XML 里一定被转义，这个子串只可能是一个
+            // 真的属性。这份输出随后由读节点 revision / 脏条目的调用方完整解析，坏掉的 XML 在
+            // 那里报错；只为找 external 的那条命令输出很小，照旧每次都解析
+            if shared && !st.contains(r#"item="external""#) {
+                continue;
+            }
             for rel in parse_external_roots(&st)? {
                 // svn 在 Windows 上返回反斜杠（`Code\Vendor`，2026-09-13 实测）。
                 // 不转换就和正斜杠形式的 `wc_root` 比不中，去重失效，这个 external
@@ -113,6 +134,10 @@ pub fn enumerate_wcs(repo_root: &str, whitelist: &[String]) -> Result<Vec<WcIden
     out.sort_by(|a, b| a.wc_root.cmp(&b.wc_root));
     Ok(out)
 }
+
+/// 不在扫描缓存范围里时找嵌套 external 用的命令：**故意不带 `--ignore-externals`**，要的就是
+/// 让它们出现（`item="external"`，spec §6.6.4）；不带 `-v`，干净的节点不输出，输出很小。
+const EXTERNALS_ONLY_SCAN: &[&str] = &["status", "--xml", "--"];
 
 /// 把一个工作副本内的路径变成安全的 svn target：**追加一个空的 peg revision
 /// 后缀 `@`**。

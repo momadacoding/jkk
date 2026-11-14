@@ -17,7 +17,7 @@ use crate::engine::svn_baseline::{
     TempIndex,
 };
 use crate::engine::svn_basemap::{read_base_map, BaseMap};
-use crate::engine::svn_cli::run_svn;
+use crate::engine::svn_cli::{run_svn, ScanAhead};
 use crate::engine::svn_config::{
     normalize_whitelist_entry, write_config, DisabledGitignore, SvnConfig, BASELINE_BRANCH,
     RESPECT_GITIGNORE_VERSION, SVN_GIT_MODE,
@@ -33,9 +33,10 @@ use crate::engine::svn_gitignore::{
     scan_tree, GitCtx, GitignoreConflict, ProbeGitDir, RuleEffect, MAX_RENAME_ROUNDS,
 };
 use crate::engine::svn_health::{
-    check_baseline_map, check_baseline_map_with_nodes, ExplainedOrigin, Health, HealthMap,
+    check_baseline_map, check_baseline_map_with_nodes, prefetch_excluded_nodes, ExplainedOrigin,
+    Health, HealthMap,
 };
-use crate::engine::svn_include_check::{dry_run_include_set, verify_include_set};
+use crate::engine::svn_include_check::{dry_run_include_set, verify_include_set_listing};
 use crate::engine::svn_nodes::{compute_map, read_node_status, NodeStatus};
 use crate::engine::svn_preflight::{check_targets, run_preflight_with, Preflight};
 use crate::engine::svn_pristine::{cat_base, BaseContent};
@@ -507,17 +508,25 @@ pub(crate) fn confirm_tombstones(
 ///
 /// `idx` 由调用方给：重建与初始化从空索引起步，S7 从 HEAD 树起步（spec §6.3.1）。
 pub fn record_mixed(repo: &str, cfg: &SvnConfig, idx: &TempIndex) -> Result<Recorded> {
-    record_mixed_reusing(repo, cfg, idx, false)
+    record_mixed_as(repo, cfg, idx, RecordMode::Standalone)
 }
 
-/// 同 [`record_mixed`]，`reuse` 时本地改过的文件先查 [`BaseBlobs`] 缓存：服务器版本与上次
-/// 取的时候完全相同就直接用那个 blob，不再 `svn cat`，并把这次用的 blob 记回缓存。跟进用：
-/// 每天整体 update 一次之后，每个长期改着没提交的文件原来每次跟进都要起两个进程。
-pub fn record_mixed_reusing(
+/// 跟进的录制：同 [`record_mixed`]，两处不同（[`RecordMode::Follow`]）：
+///
+/// - 本地改过的文件先查 [`BaseBlobs`] 缓存：服务器版本与上次取的时候完全相同就直接用那个 blob，
+///   不再 `svn cat`，并把这次用的 blob 记回缓存。每天整体 update 一次之后，每个长期改着没提交的
+///   文件原来每次跟进都要起两个进程。
+/// - **不做 R3c**。调用方必须在动任何 ref 之前、持同步锁重读一次节点状态，按同一规则重算映射并
+///   与 [`Recorded::map`] 比较（`svn_follow::still_valid`）。理由见 [`RecordMode::Follow`]。
+pub fn record_mixed_for_follow(repo: &str, cfg: &SvnConfig, idx: &TempIndex) -> Result<Recorded> {
+    record_mixed_as(repo, cfg, idx, RecordMode::Follow)
+}
+
+fn record_mixed_as(
     repo: &str,
     cfg: &SvnConfig,
     idx: &TempIndex,
-    reuse: bool,
+    mode: RecordMode,
 ) -> Result<Recorded> {
     let pre = run_preflight_with(repo, &cfg.whitelist, true)?;
     let svn_url = working_copy_url(repo)?;
@@ -529,13 +538,34 @@ pub fn record_mixed_reusing(
         &svn_url,
         &mut PhaseClock::new("同步录制"),
         "基线没有推进。",
-        reuse,
+        mode,
     )
 }
 
+/// 录制由哪条流程发起。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordMode {
+    /// 初始化、重建、更新：脏文件每次都取服务器内容，录完自己做 R3c。
+    Standalone,
+    /// 跟进：脏文件沿用 blob 缓存；R3c 交给发布前的锁内复核。
+    ///
+    /// # 为什么跟进可以不在这里做 R3c
+    ///
+    /// R3c 防的是「R2a 读节点状态之后，有人在 TortoiseSVN 里提交或更新，某个文件的 BASE 换了
+    /// revision」：换成 BASE 的那批文件（`S`）体检不比，只有重读节点状态、发现映射变了才拦得住。
+    /// 跟进在发布前还有一次同样的重读（`svn_follow::still_valid`，原来叫「R3c 的第三道」）：同一条
+    /// 规则、同一份文件清单、同一个比较对象，只是时间更晚、而且拿着同步锁。BASE 一旦换了
+    /// revision 不会自己换回去，这里看得到的变化那里一定也看得到，所以两次重读里留后一次就够。
+    ///
+    /// 省下的是一遍白名单的 `svn status` 全量扫描，公司机器上约 4 秒（日志
+    /// `2026-11-14-follow-latency-decisions.md` 的 T2）。
+    ///
+    /// 其余入口录完就发布，后面没有第二次重读，必须留着自己的 R3c。
+    Follow,
+}
+
 /// [`record_mixed`] 的本体。初始化与重建已经跑过 R1（`pre`，必须是 `allow_mixed` 的结果），
-/// 不再跑第二遍；`tail` 接在拒绝文案里，说明此刻仓库处在什么状态。`reuse` 见
-/// [`record_mixed_reusing`]。
+/// 不再跑第二遍；`tail` 接在拒绝文案里，说明此刻仓库处在什么状态。`mode` 见 [`RecordMode`]。
 #[allow(clippy::too_many_arguments)] // 都是录制要的上下文；包成结构体只为过 lint，调用点反而更难读
 fn record_mixed_with(
     repo: &str,
@@ -545,46 +575,106 @@ fn record_mixed_with(
     svn_url: &str,
     clock: &mut PhaseClock,
     tail: &str,
-    reuse: bool,
+    mode: RecordMode,
 ) -> Result<Recorded> {
+    let reuse = mode == RecordMode::Follow;
     let nodes = pre.nodes.as_deref().ok_or_else(|| {
         GitError::new(
             "svn_init",
             "录混合基线要用允许混合版本的前置校验结果（带节点状态），这里拿到的不是。这是实现缺陷。",
         )
     })?;
-    // R2a–R2c
-    let (tree, explained) = record_server_tree_timed(repo, cfg, pre, idx, clock, reuse)?;
-    // 映射的键取录出来的树（分析 §6.2：不从 status 推）
-    let files = tree_files(repo, &tree)?;
-    let recorded = compute_map(&pre.repos_root, &pre.uuid, &files, nodes, BTreeMap::new())?;
-
-    // R3b。Lying / 漏收的判定放在阶段**里面**：初始化的耗时表要把失败标在体检上
+    // R2a–R2c，到写树之前为止。`excluded_ahead` 是体检要的 `svn info -R`，磁盘一录完就在后台
+    // 跑起来了（见 `Indexed::excluded_ahead`）。下面任何一步提前返回，它在 drop 时等后台那条
+    // 跑完，不留进程
+    let Indexed {
+        touched: explained,
+        listed,
+        mut excluded_ahead,
+    } = record_server_index_timed(repo, cfg, pre, idx, clock, reuse)?;
     let scope = WScope::for_repo(repo, cfg)?;
-    let (health, new_gone) = clock.run("基线体检（svn diff）", || {
-        match check_baseline_map_with_nodes(
-            repo,
-            svn_url,
-            &recorded,
-            &scope,
-            &explained,
-            // 刚由 R2b 从 `svn cat -r BASE` 写进去；映射按节点 revision 记，BASE 就是那个
-            // revision 的内容——这批路径由构造保证正确，不必报成「未覆盖」
-            ExplainedOrigin::JustRecorded,
-            Some(nodes),
-        )? {
-            HealthMap::Excluded { files } => Err(excluded_error(&files, tail)),
-            // Review 1 第 1 条：没确认成的不能降成 NotChecked 放行
-            HealthMap::Unconfirmed { files, reason } => {
-                Err(not_confirmed_error(&files, &reason, tail))
-            }
-            HealthMap::Verified {
-                health: Health::Lying { files },
-                ..
-            } => Err(lying_error(&recorded, &files, tail)),
-            HealthMap::Verified { health, new_gone } => Ok((health, new_gone)),
+
+    // 映射 + R3b。`files` 是基线树里的文件：映射的键取录出来的树（分析 §6.2：不从 status 推）。
+    // Lying / 漏收的判定放在阶段**里面**：初始化的耗时表要把失败标在体检上
+    let mut audit = |files: &BTreeSet<String>, clock: &mut PhaseClock| {
+        let recorded = compute_map(&pre.repos_root, &pre.uuid, files, nodes, BTreeMap::new())?;
+        if let Some(ahead) = excluded_ahead.take() {
+            clock.run("等被排除节点的扫描（svn info -R）", || {
+                ahead.adopt();
+                Ok(())
+            })?;
         }
-    })?;
+        let (health, new_gone) = clock.run("基线体检（svn diff）", || {
+            match check_baseline_map_with_nodes(
+                repo,
+                svn_url,
+                &recorded,
+                &scope,
+                &explained,
+                // 刚由 R2b 从 `svn cat -r BASE` 写进去；映射按节点 revision 记，BASE 就是那个
+                // revision 的内容——这批路径由构造保证正确，不必报成「未覆盖」
+                ExplainedOrigin::JustRecorded,
+                Some(nodes),
+            )? {
+                HealthMap::Excluded { files } => Err(excluded_error(&files, tail)),
+                // Review 1 第 1 条：没确认成的不能降成 NotChecked 放行
+                HealthMap::Unconfirmed { files, reason } => {
+                    Err(not_confirmed_error(&files, &reason, tail))
+                }
+                HealthMap::Verified {
+                    health: Health::Lying { files },
+                    ..
+                } => Err(lying_error(&recorded, &files, tail)),
+                HealthMap::Verified { health, new_gone } => Ok((health, new_gone)),
+            }
+        })?;
+        Ok::<_, GitError>((recorded, health, new_gone))
+    };
+
+    let (tree, files, (recorded, health, new_gone)) = match mode {
+        RecordMode::Standalone => {
+            let tree = clock.run("写树（git write-tree）", || idx.write_tree(repo))?;
+            let files = tree_files(repo, &tree)?;
+            let audited = audit(&files, clock)?;
+            (tree, files, audited)
+        }
+        // 跟进：写树与体检同时进行。写树要新建上百个松散对象，Windows 上每个几毫秒（实测与
+        // fsync 设置无关），体检要等服务器，两者互不依赖。体检要的文件清单先取候选索引里的
+        // （纳入集合核对刚读过，索引此后没再动），树写出来之后核对两份清单相同：映射的键仍然
+        // 是录出来的树，只是先用后验
+        RecordMode::Follow => {
+            let (written, audited) = std::thread::scope(|s| {
+                let writer = s.spawn(|| {
+                    let started = std::time::Instant::now();
+                    let tree = idx.write_tree(repo);
+                    // 不进 `clock`（它在体检那个线程手里）；耗时只进开发日志
+                    log::info!(
+                        "同步录制阶段「写树（git write-tree）」耗时 {} ms（与体检并行）",
+                        started.elapsed().as_millis()
+                    );
+                    tree
+                });
+                let audited = audit(&listed, clock);
+                (writer.join(), audited)
+            });
+            // 报错的先后与串行时相同：写树失败先报。已知代价：写树失败时要等并行的体检返回
+            // 才报得出来（服务器慢的话就是它的超时），串行时是立刻报
+            let tree = written.map_err(|_| {
+                GitError::new("svn_init", "写基线树的线程异常退出了。基线没有推进。")
+            })??;
+            let files = tree_files(repo, &tree)?;
+            // 先比清单、再看体检的结论：清单对不上时，按候选索引算出来的映射与体检（不管是
+            // 过了还是报了错）都不作数，按串行的口径（树里的文件）重来一遍
+            let audited = if files == listed {
+                audited?
+            } else {
+                // 目前没有已知的输入能走到这里
+                log::warn!("候选索引的文件清单与写出来的树不一致，按树重新体检");
+                audit(&files, clock)?
+            };
+            (tree, files, audited)
+        }
+    };
     // 墓碑与 floor 的保留规则只在 compute_map 里写一处，合进去时再算一次
     let map = if new_gone.is_empty() {
         recorded.clone()
@@ -597,14 +687,17 @@ fn record_mixed_with(
     // 旧 revision（spec §16.1 末的竞态表）。体检通常已先一步拦下，这里是第二道。
     // 比较的是「按同一规则算出的映射」，不是逐节点 revision：局部 update 只推高没改过的
     // 文件时映射不变，录下的内容也仍然对。
-    // 跟进的准备阶段缓存了 svn 扫描（`with_scan_cache`），这里必须读最新的节点状态
-    crate::engine::svn_cli::forget_node_scans();
-    let wcs = enumerate_wcs(repo, &cfg.whitelist)?;
-    let now = read_node_status(repo, &cfg.whitelist, &wcs)?;
-    match compute_map(&pre.repos_root, &pre.uuid, &files, &now, BTreeMap::new()) {
-        Ok(again) if again == recorded => {}
-        // 算不出来（文件在 status 里消失了）同样是录制期间被改了
-        _ => return Err(moved_error(&recorded, tail)),
+    // 跟进不在这里做，交给发布前的锁内复核（见 `RecordMode::Follow`）
+    if mode == RecordMode::Standalone {
+        // 调用方开着扫描缓存时（`with_scan_cache`），这里必须读最新的节点状态
+        crate::engine::svn_cli::forget_node_scans();
+        let wcs = enumerate_wcs(repo, &cfg.whitelist)?;
+        let now = read_node_status(repo, &cfg.whitelist, &wcs)?;
+        match compute_map(&pre.repos_root, &pre.uuid, &files, &now, BTreeMap::new()) {
+            Ok(again) if again == recorded => {}
+            // 算不出来（文件在 status 里消失了）同样是录制期间被改了
+            _ => return Err(moved_error(&recorded, tail)),
+        }
     }
 
     Ok(Recorded {
@@ -756,6 +849,45 @@ fn record_server_tree_timed(
     clock: &mut PhaseClock,
     reuse: bool,
 ) -> Result<(String, BTreeSet<String>)> {
+    let Indexed { touched, .. } =
+        record_server_index_timed(repo_root, cfg, pre, idx, clock, reuse)?;
+    let tree = clock.run("写树（git write-tree）", || idx.write_tree(repo_root))?;
+    Ok((tree, touched))
+}
+
+/// [`record_server_index_timed`] 的结果。
+struct Indexed {
+    /// `S`：本次实际动过的路径。
+    touched: BTreeSet<String>,
+    /// 候选索引里的文件清单（纳入集合核对读的那份）。
+    listed: BTreeSet<String>,
+    /// 体检要的 `svn info -R`（找被 `--set-depth=exclude` 掉的节点），已经在后台跑。只在扫描
+    /// 缓存范围内（跟进的准备阶段）有；其余入口是 `None`，体检照常自己跑。
+    ///
+    /// # 必须在磁盘录完之后才起
+    ///
+    /// 它是发现「工作副本里被排除了、服务器上还在」的唯一手段（整单元 `svn diff` 不报被排除的
+    /// 节点）。排在 `git add -A` 之前的话：扫描时目录还在 → 用户在 TortoiseSVN 里把它排除 →
+    /// `git add` 时文件已经没了，录出的树少了这些文件，扫描却说没有被排除的节点，基线就静默
+    /// 丢了它们、也没有墓碑（独立 review 2026-11-14 第 1 条）。排在录完之后，与原来「写完树再
+    /// 扫」是同一个先后：这之后才发生的排除，树里还留着那些文件，纳入集合核对（重新遍历磁盘）
+    /// 或下一次检测会看到。
+    excluded_ahead: Option<ScanAhead>,
+}
+
+/// R2a–R2c 到写树之前为止：候选索引已经是「服务器 rN 的树」的内容，并且过了纳入集合核对。
+/// 调用方接着在**同一份** `idx` 上 `write_tree`。
+///
+/// 从 [`record_server_tree_timed`] 里拆出来，是为了让跟进把写树与体检并行
+/// （`record_mixed_with` 的 `RecordMode::Follow`）；其余入口仍走那个函数，步骤与原来相同。
+fn record_server_index_timed(
+    repo_root: &str,
+    cfg: &SvnConfig,
+    pre: &Preflight,
+    idx: &TempIndex,
+    clock: &mut PhaseClock,
+    reuse: bool,
+) -> Result<Indexed> {
     let scope = WScope::for_repo(repo_root, cfg)?;
     let fixes = classify(&pre.dirty)?;
     // `S` 先算出来，再拿它驱动改写——**同一个集合**既决定动哪些路径，也交给体检。
@@ -769,6 +901,8 @@ fn record_server_tree_timed(
         // 不补回来基线会悄悄变小（设计 §4）。从 HEAD 起步时它们本来就在，再加一次无害。
         idx.add_paths(repo_root, &scope.hidden_tracked_on_disk()?)
     })?;
+    // 磁盘录完了，体检要的扫描从这里起跑，与下面的改写、核对、写树并行
+    let excluded_ahead = prefetch_excluded_nodes(repo_root, &cfg.whitelist);
 
     clock.run("把本地改动换回服务器内容（svn cat）", || {
         rewrite_to_server(repo_root, pre, idx, &fixes, &touched, reuse)
@@ -776,11 +910,14 @@ fn record_server_tree_timed(
 
     // R2c：核对与录制**共用同一份候选索引**（spec §6.3.1），核对完之后在同一个
     // `idx` 上 `write_tree`——不得核对一次后又重新 add 另录一棵树。
-    clock.run("纳入集合核对（git ls-files）", || {
-        verify_include_set(repo_root, idx, &scope, &fixes)
+    let listed = clock.run("纳入集合核对（git ls-files）", || {
+        verify_include_set_listing(repo_root, idx, &scope, &fixes)
     })?;
-    let tree = clock.run("写树（git write-tree）", || idx.write_tree(repo_root))?;
-    Ok((tree, touched))
+    Ok(Indexed {
+        touched,
+        listed,
+        excluded_ahead,
+    })
 }
 
 /// `path` 自己或最近的一个祖先在 `replaced` 里时返回它。
@@ -1177,7 +1314,7 @@ fn build_repo(
         svn_url,
         clock,
         "继续下去会得到一个从一开始就在撒谎的基线，所以整个回退了。",
-        false,
+        RecordMode::Standalone,
     )?;
     let tree = rec.tree.clone();
 
@@ -1901,7 +2038,7 @@ fn rebuild_from(repo_root: &str, old_baseline: Option<String>) -> Result<Rebuild
         &mut clock,
         "基线指针没有改动。",
         // 重建就是为了不信以前录下的东西，一个 blob 都不沿用
-        false,
+        RecordMode::Standalone,
     )?;
 
     // R3 + R4：建 commit 并以旧 OID 作比较条件更新指针。父提交仍是旧基线；

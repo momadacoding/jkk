@@ -42,7 +42,7 @@
 
 use crate::engine::git_cli::run_git;
 use crate::engine::svn_basemap::{read_base_map, BaseMap};
-use crate::engine::svn_cli::run_svn;
+use crate::engine::svn_cli::{run_svn, with_scan_cache};
 use crate::engine::svn_config::read_config;
 use crate::engine::svn_nodes::{read_node_status, NodeStatus};
 use crate::engine::svn_scope::WScope;
@@ -184,6 +184,12 @@ pub fn check_sync(repo_root: &str) -> Result<SyncStatus> {
 ///
 /// `sync_in` 的 A16 接管要知道「所有节点是否在同一个 revision」，与判定共用同一次 status。
 pub(crate) fn check_sync_with_nodes(repo_root: &str) -> Result<(SyncStatus, Vec<NodeStatus>)> {
+    // 找 external 与读节点 revision 发的是同一条扫描（`svn_cli::STATUS_SCAN`），在一个范围里只跑
+    // 一遍。整个判定是一次只读的快照，范围就是这一次调用；调用方已经开了范围时沿用它的
+    with_scan_cache(|| check_sync_uncached(repo_root))
+}
+
+fn check_sync_uncached(repo_root: &str) -> Result<(SyncStatus, Vec<NodeStatus>)> {
     let oid = baseline_oid(repo_root)?;
     // 映射与文件清单取自同一个 OID：分两次按 ref 名读，中间基线被移动就会拼出一个不存在的 R
     let map = read_base_map(repo_root, &oid)?;

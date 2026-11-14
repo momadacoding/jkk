@@ -16,7 +16,8 @@
 //! 时机全部满足它：HEAD 在 `svn/base` 上且工作区干净，或基线树刚从磁盘录出来。
 
 use crate::engine::svn_cli::{
-    chunk_targets, cmdline_estimate, run_svn, run_svn_code, run_svn_targets, MAX_TARGETS_CMDLINE,
+    chunk_targets, cmdline_estimate, in_scan_cache, prefetch_scan, run_svn, run_svn_code,
+    run_svn_targets, ScanAhead, MAX_TARGETS_CMDLINE,
 };
 // W-file 判据原本是本模块的私有函数，Phase 1c 提到 `svn_include_check` 共用，
 // 2026-10-28 再收进 `svn_scope`——`svn_server_set` 等要用**同一套**判据。
@@ -623,19 +624,45 @@ fn server_url_at(units: &[WcIdentity], p: &str, rev: u64) -> Option<String> {
 fn excluded_nodes(repo_root: &str, units: &[WcIdentity]) -> Result<BTreeMap<String, String>> {
     fault::hit(Point::ExcludedScan)?;
     let mut out = BTreeMap::new();
-    // info 的 target 必须过 peg_safe（与 diff 的尾随 PATH 相反，见 `svn_wc::peg_safe`）。
     // 全部单元一次传（计划 2026-11-09 Task 3）：输出是各单元递归结果的拼接（实测 M4）。
     // 公司机器上逐单元跑一次跟进要 22.9 s
-    let args: Vec<String> = units
-        .iter()
-        .map(|u| crate::engine::svn_wc::peg_safe(&u.wc_root))
-        .collect();
-    for xml in run_svn_targets(repo_root, &["info", "-R", "--xml", "--"], &args)? {
+    for xml in run_svn_targets(repo_root, EXCLUDED_SCAN, &excluded_scan_targets(units))? {
         for (p, kind) in parse_excluded_nodes(&xml)? {
             out.insert(p, kind);
         }
     }
     Ok(out)
+}
+
+/// [`excluded_nodes`] 发的命令（target 之前的部分）。
+const EXCLUDED_SCAN: &[&str] = &["info", "-R", "--xml", "--"];
+
+/// [`excluded_nodes`] 的 target。info 的 target 必须过 peg_safe（与 diff 的尾随 PATH 相反，
+/// 见 `svn_wc::peg_safe`）。
+fn excluded_scan_targets(units: &[WcIdentity]) -> Vec<String> {
+    units
+        .iter()
+        .map(|u| crate::engine::svn_wc::peg_safe(&u.wc_root))
+        .collect()
+}
+
+/// 把 [`excluded_nodes`] 那条 `svn info -R` 提前放到后台线程里跑（`svn_cli::prefetch_scan`），
+/// 让它与调用方接下来的工作并行。体检开始之前调用方 `adopt` 一下，[`excluded_nodes`] 发同一条
+/// 命令时就直接拿到输出。
+///
+/// 这条命令要把白名单里每个节点的信息都打出来，是纯本地读，与录磁盘内容互不依赖；跟进里原来
+/// 排在录完之后串行等它（fixture 上约 0.7 秒，公司机器上按节点数放大）。
+///
+/// 只在扫描缓存范围内起作用（跟进的准备阶段）；不在范围内返回 `None`，体检照常自己跑。
+/// 这里读不出工作副本时也返回 `None`：错误留给体检在原来的位置报。
+pub(crate) fn prefetch_excluded_nodes(repo_root: &str, whitelist: &[String]) -> Option<ScanAhead> {
+    // 先看在不在范围里：不在的话下面的枚举没有缓存可用，会白跑一次 `svn info` 和一遍全量扫描
+    // （初始化、重建、更新的录制都不在范围里）
+    if !in_scan_cache() {
+        return None;
+    }
+    let units = crate::engine::svn_wc::enumerate_wcs(repo_root, whitelist).ok()?;
+    prefetch_scan(repo_root, EXCLUDED_SCAN, &excluded_scan_targets(&units))
 }
 
 /// 点不了名的被排除节点 `p` 在 floor 上有哪些文件（仓库相对路径），D8。

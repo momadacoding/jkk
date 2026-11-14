@@ -10,8 +10,8 @@ mod svn_fixtures;
 
 use app_lib::engine::svn_cli::{
     bypass_scan_cache, chunk_targets, cmdline_estimate, forget_node_scans,
-    path_dirs_from_reg_output, probe_svn, run_svn, run_svn_code, run_svn_targets, with_global,
-    with_scan_cache, SvnAvailability,
+    path_dirs_from_reg_output, prefetch_scan, probe_svn, run_svn, run_svn_code, run_svn_targets,
+    with_global, with_scan_cache, SvnAvailability,
 };
 use svn_fixtures::svn_repo;
 
@@ -221,6 +221,94 @@ fn a_scan_cache_does_not_outlive_its_scope() {
     let inside = with_scan_cache(|| node_scan(&wc));
     std::fs::write(fx.wc().join("Code/A.cs"), "edited\n").unwrap();
     assert_ne!(node_scan(&wc), inside, "范围结束后不能再拿旧结果");
+}
+
+// —— 后台预跑的扫描（日志 2026-11-14-follow-latency-decisions 的 T3）——
+
+const NODE_SCAN: &[&str] = &["status", "-v", "--xml", "--"];
+
+fn code_target() -> Vec<String> {
+    vec!["Code@".to_string()]
+}
+
+#[test]
+fn an_adopted_prefetch_serves_the_later_identical_scan() {
+    let fx = svn_repo();
+    let wc = fx.wc_str();
+    with_scan_cache(|| {
+        let ahead = prefetch_scan(&wc, NODE_SCAN, &code_target()).expect("范围内应当起预跑");
+        ahead.adopt();
+        // 预跑已经结束。这之后的改动，同一条扫描不该看得见：它拿到的是预跑的输出
+        std::fs::write(fx.wc().join("Code/A.cs"), "edited\n").unwrap();
+        let served = run_svn_targets(&wc, NODE_SCAN, &code_target()).unwrap();
+        assert_eq!(served.len(), 1);
+        assert!(
+            !served[0].contains(r#"item="modified""#),
+            "应当是预跑时读到的输出，不该重新起进程：{}",
+            served[0]
+        );
+        let fresh = bypass_scan_cache(|| run_svn_targets(&wc, NODE_SCAN, &code_target())).unwrap();
+        assert!(
+            fresh[0].contains(r#"item="modified""#),
+            "对照：真的重读时看得见这次改动"
+        );
+    });
+}
+
+#[test]
+fn prefetch_is_a_no_op_outside_a_scan_cache_or_when_there_is_nothing_to_save() {
+    let fx = svn_repo();
+    let wc = fx.wc_str();
+    assert!(
+        prefetch_scan(&wc, NODE_SCAN, &code_target()).is_none(),
+        "不在范围内：结果没地方放，不该起线程"
+    );
+    with_scan_cache(|| {
+        assert!(
+            prefetch_scan(&wc, NODE_SCAN, &[]).is_none(),
+            "没有 target：run_svn_targets 这时一个进程都不起"
+        );
+        assert!(
+            prefetch_scan(&wc, &["log", "--xml", "--"], &code_target()).is_none(),
+            "不是可以缓存的只读扫描"
+        );
+        run_svn_targets(&wc, NODE_SCAN, &code_target()).unwrap();
+        assert!(
+            prefetch_scan(&wc, NODE_SCAN, &code_target()).is_none(),
+            "已经在缓存里：没有可省的"
+        );
+    });
+}
+
+#[test]
+fn a_failed_prefetch_caches_nothing_and_the_real_call_reports_the_error() {
+    let fx = svn_repo();
+    let wc = fx.wc_str();
+    let missing = vec!["NoSuchDir@".to_string()];
+    with_scan_cache(|| {
+        let ahead = prefetch_scan(&wc, &["info", "--xml", "--"], &missing).expect("应当起预跑");
+        ahead.adopt();
+        let err = run_svn_targets(&wc, &["info", "--xml", "--"], &missing)
+            .expect_err("预跑失败时不能留下一份「成功」的缓存");
+        assert_eq!(err.code, "svn_cli");
+    });
+}
+
+#[test]
+fn a_prefetch_that_is_never_adopted_caches_nothing() {
+    // 调用方中途报错返回时 ScanAhead 直接被 drop：等后台跑完，但结果不进缓存
+    let fx = svn_repo();
+    let wc = fx.wc_str();
+    with_scan_cache(|| {
+        drop(prefetch_scan(&wc, NODE_SCAN, &code_target()).expect("应当起预跑"));
+        std::fs::write(fx.wc().join("Code/A.cs"), "edited\n").unwrap();
+        let later = run_svn_targets(&wc, NODE_SCAN, &code_target()).unwrap();
+        assert!(
+            later[0].contains(r#"item="modified""#),
+            "没 adopt 的预跑不该进缓存：{}",
+            later[0]
+        );
+    });
 }
 
 #[test]

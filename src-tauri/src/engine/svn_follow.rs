@@ -63,7 +63,7 @@ use crate::engine::svn_baseline::{
     create_baseline_commit_with, git_dir, move_baseline_ref, IndexEdit, TempIndex,
 };
 use crate::engine::svn_basemap::{read_base_map, BaseMap};
-use crate::engine::svn_cli::with_scan_cache;
+use crate::engine::svn_cli::{bypass_scan_cache, with_scan_cache};
 use crate::engine::svn_config::{read_config, SvnConfig, BASELINE_BRANCH};
 use crate::engine::svn_follow_index::{
     prepare_index, prepare_index_with, rename_lock_into_index, ComposeReport, PathFacts,
@@ -72,7 +72,7 @@ use crate::engine::svn_follow_index::{
 use crate::engine::svn_follow_mark::{clear_mark, my_svn_user, read_mark, FollowMark};
 use crate::engine::svn_health::Health;
 use crate::engine::svn_include_check::normalize_roots;
-use crate::engine::svn_init::{confirm_tombstones, record_mixed_reusing, Recorded};
+use crate::engine::svn_init::{confirm_tombstones, record_mixed_for_follow, Recorded};
 use crate::engine::svn_journal::{self, BranchMove, Flow, FollowStep, FollowSteps, Journal, Phase};
 use crate::engine::svn_leak::{local_only_leaks, Leak};
 use crate::engine::svn_lock;
@@ -1982,13 +1982,13 @@ fn prepare(repo: &str, auto: bool, partial: Option<&Partial>) -> Result<Plan> {
 /// （`svn_base_blobs`：服务器版本与上次取的时候完全相同才用，判据与取舍写在那里）。
 fn record_from_old_base(repo: &str, cfg: &SvnConfig, old_base: &str) -> Result<Recorded> {
     let idx = TempIndex::from_tree_keeping_stat(repo, old_base)?;
-    match record_mixed_reusing(repo, cfg, &idx, true) {
+    match record_mixed_for_follow(repo, cfg, &idx) {
         Err(e) if e.code == "include_set_mismatch" => {
             log::info!(
                 "从旧基线起步的候选索引多收了文件，退回空索引重录：{}",
                 e.message
             );
-            record_mixed_reusing(repo, cfg, &TempIndex::empty(repo)?, true)
+            record_mixed_for_follow(repo, cfg, &TempIndex::empty(repo)?)
         }
         r => r,
     }
@@ -2672,10 +2672,20 @@ fn still_valid(repo: &str, plan: &Plan) -> Result<bool> {
     let Some(map) = &plan.recorded else {
         return Ok(true);
     };
-    // R3c 的第三道：录完到现在又隔了一段重放。按同一规则重算，算不出来也是被改了
+    // 跟进的 R3c 就在这里（录制里那一次不做，见 `svn_init::RecordMode::Follow`）：从录制读节点
+    // 状态到现在，中间隔着取服务器内容、体检和重放。按同一规则重算，算不出来也是被改了。
+    // **不能删，也不能挪到锁外**：换成 BASE 的那批文件体检不比，只有这次重读拦得住录制期间的
+    // 外部提交。
+    // 必须读此刻的工作副本：先把外层的扫描缓存拿开（现在的调用方都不在范围里，这是防着以后
+    // 有人把整次跟进包进一个范围），再开一个只包住这次重读的范围，让找 external 与读节点
+    // revision 共用一遍扫描
     let cfg = read_config(repo)?;
-    let wcs = enumerate_wcs(repo, &cfg.whitelist)?;
-    let nodes = read_node_status(repo, &cfg.whitelist, &wcs)?;
+    let nodes = bypass_scan_cache(|| {
+        with_scan_cache(|| {
+            let wcs = enumerate_wcs(repo, &cfg.whitelist)?;
+            read_node_status(repo, &cfg.whitelist, &wcs)
+        })
+    })?;
     let files = tree_files(repo, &plan.new_base)?;
     Ok(
         match compute_map(&map.repos_root, &map.uuid, &files, &nodes, map.gone.clone()) {

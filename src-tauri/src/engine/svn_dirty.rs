@@ -20,7 +20,7 @@
 //! 判错一条就是一个假基线，而假基线看起来完全正常——这是整套设计里最贵的那类
 //! 错误（§6.8.1）。所以这里对没见过的 item **报错而不是跳过**。
 
-use crate::engine::svn_cli::{run_svn, run_svn_targets};
+use crate::engine::svn_cli::{run_svn, run_svn_targets, STATUS_SCAN};
 use crate::engine::svn_scope::WScope;
 use crate::engine::svn_wc::peg_safe;
 use crate::engine::svn_xml::{parse_info_schedules, parse_status_entries, StatusEntry};
@@ -95,22 +95,11 @@ pub fn read_dirty(repo_root: &str, targets: &[String]) -> Result<Vec<StatusEntry
     let mut dirty: Vec<StatusEntry> = Vec::new();
     // 全部 target 一次传（计划 2026-11-09 Task 3），输出是每个 target 一个 `<target>` 块
     let args: Vec<String> = targets.iter().map(|t| peg_safe(t)).collect();
-    let outputs = run_svn_targets(
-        repo_root,
-        &[
-            "status",
-            // `-v` 是为了**被 `svn delete` 掉的目录**：不带它，`svn status`
-            // 只报目录本身，里面那些服务器上还在的文件一条都拿不到。
-            // 代价是所有干净条目也一并返回，下面按 `normal` + `props=none`
-            // 滤掉；解析一遍的开销远小于漏掉整棵子树。
-            "-v",
-            "--no-ignore",
-            "--ignore-externals",
-            "--xml",
-            "--",
-        ],
-        &args,
-    )?;
+    // 参数就是 `STATUS_SCAN`（与读节点 revision、找 external 共用，同一个范围里只遍历一遍）。
+    // 其中 `-v` 在这里是为了**被 `svn delete` 掉的目录**：不带它，`svn status` 只报目录本身，
+    // 里面那些服务器上还在的文件一条都拿不到。代价是所有干净条目也一并返回，下面按
+    // `normal` + `props=none` 滤掉；解析一遍的开销远小于漏掉整棵子树。
+    let outputs = run_svn_targets(repo_root, STATUS_SCAN, &args)?;
     for xml in &outputs {
         for e in parse_status_entries(xml)? {
             // `item="external"` 即使带了 `--ignore-externals` 也照样出现（实测），
