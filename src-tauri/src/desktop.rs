@@ -13,7 +13,9 @@ use tauri::webview::{PageLoadEvent, PageLoadPayload};
 use tauri::{App, AppHandle, Manager, Runtime, Webview, Window, WindowEvent};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
-const MAIN_WINDOW: &str = "main";
+pub(crate) const MAIN_WINDOW: &str = "main";
+/// 托盘图标的 id。`attention` 按它找回托盘，改图标和提示。
+pub(crate) const TRAY_ID: &str = "main";
 const MENU_SHOW: &str = "tray-show";
 const MENU_QUIT: &str = "tray-quit";
 
@@ -275,7 +277,7 @@ fn build_tray(app: &App) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, MENU_SHOW, "显示主界面", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, MENU_QUIT, "退出", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &quit])?;
-    let mut builder = TrayIconBuilder::with_id("main")
+    let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .tooltip(crate::build_info::window_title())
         .menu(&menu)
         // 左键直接回到主界面，菜单留给右键
@@ -302,8 +304,13 @@ fn build_tray(app: &App) -> tauri::Result<()> {
     Ok(())
 }
 
-/// 窗口事件：关主窗口时按设置决定藏到托盘还是照常退出。
+/// 窗口事件：关主窗口时按设置决定藏到托盘还是照常退出；主窗口失焦时补上欠着的那次任务栏闪烁
+/// （`attention::on_blur`）。
 pub fn on_window_event<R: Runtime>(window: &Window<R>, event: &WindowEvent) {
+    if window.label() == MAIN_WINDOW && matches!(event, WindowEvent::Focused(false)) {
+        crate::attention::on_blur(window.app_handle());
+        return;
+    }
     let WindowEvent::CloseRequested { api, .. } = event else {
         return;
     };
@@ -330,7 +337,8 @@ pub fn resets_recording_on_page_load(label: &str, event: PageLoadEvent) -> bool 
     label == MAIN_WINDOW && event == PageLoadEvent::Started
 }
 
-/// 页面加载钩子，见 `resets_recording_on_page_load`。
+/// 页面加载钩子，见 `resets_recording_on_page_load`。同一时刻也撤掉提醒：新页面的汇总从头开始，
+/// 后端不清的话角标再也撤不掉（`attention::on_page_reload`）。
 pub fn on_page_load<R: Runtime>(webview: &Webview<R>, payload: &PageLoadPayload<'_>) {
     if !resets_recording_on_page_load(webview.label(), payload.event()) {
         return;
@@ -338,6 +346,7 @@ pub fn on_page_load<R: Runtime>(webview: &Webview<R>, payload: &PageLoadPayload<
     if let Some(state) = webview.try_state::<DesktopState>() {
         state.set_recording_shortcut(false);
     }
+    crate::attention::on_page_reload(webview.app_handle());
 }
 
 /// 呼出快捷键：在前台就藏起来，否则呼出。规则见 `shortcut_action`。
@@ -372,4 +381,6 @@ pub fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
     let _ = w.unminimize();
     let _ = w.show();
     let _ = w.set_focus();
+    // 藏到托盘时任务栏按钮被销毁，重新显示后是新的按钮，角标要再挂一次
+    crate::attention::on_show(app);
 }
