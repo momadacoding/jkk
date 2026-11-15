@@ -29,7 +29,10 @@
 use crate::engine::git_cli::{
     run_git, run_git_bytes, run_git_code, run_git_env, run_git_stdin, run_git_stdin_env,
 };
-use crate::engine::svn_baseline::{copy_with_mtime, parse_entry_flags, IndexLock, TempFile};
+use crate::engine::git_read;
+use crate::engine::svn_baseline::{
+    copy_with_mtime, index_listing, parse_entry_flags, IndexLock, ListAs, TempFile,
+};
 use crate::engine::svn_leak::{stage_hunks_in_new, StageTally};
 use crate::error::{GitError, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -192,7 +195,17 @@ pub fn prepare_index_with(
     let lock = IndexLock::acquire(repo)?;
     locked()?;
     let index_file = lock.path().with_file_name("index");
-    if !run_git(repo, &["ls-files", "-u", "-z"])?.is_empty() {
+    let conflicted = git_read::or_cli(
+        "看暂存区有没有冲突",
+        || {
+            Ok(git_read::has_unmerged(&git_read::index_records(
+                repo,
+                &index_file,
+            )?))
+        },
+        || Ok(!run_git(repo, &["ls-files", "-u", "-z"])?.is_empty()),
+    )?;
+    if conflicted {
         return Err(GitError::new(
             "svn_follow_index_conflicted",
             "暂存区里有未解决的冲突，请先解决再跟进。",
@@ -211,6 +224,8 @@ pub fn prepare_index_with(
         Err(e) => return Err(e.into()),
     };
 
+    // 留在 git：libgit2 没有索引的 cache-tree，进程内只能把整棵 OLD 树走一遍，2 万文件约
+    // 75–100 ms，比起一个 git 进程还慢（日志 2026-11-16-follow-git-inproc-reads-decisions.md T4）
     let staged = read_changes(repo, &["diff-index", "--cached", "--no-renames", "-z", old])?;
 
     // 2. 钉原始字节（W28）：write-tree 还原不了 i-t-a、标志与 stat
@@ -221,10 +236,14 @@ pub fn prepare_index_with(
     let work = lock.abs_path()?;
     let env = [("GIT_INDEX_FILE", work.as_str())];
     // 第 4、6 步的 --index-info 与 read-tree 都会丢标志，要在动手之前记
-    let flags_before = run_git_env(repo, &["ls-files", "-v", "-z"], &env)?;
+    let flags_before = index_listing(repo, Path::new(&work), ListAs::Flags)?;
 
     // 4. 求交集、定最终结果，交集全部先写成 NEW（W25）
-    let changed = read_changes(repo, &["diff-tree", "-r", "--no-renames", "-z", old, new])?;
+    let changed = git_read::or_cli(
+        "比 OLD 与 NEW 的树",
+        || Ok(by_path(git_read::tree_changes(repo, old, new)?)),
+        || read_changes(repo, &["diff-tree", "-r", "--no-renames", "-z", old, new]),
+    )?;
     let plan = compose(repo, &index_file, &staged, &changed, facts)?;
     let zero = "0".repeat(old.len());
     write_entries(repo, &env, &zero, &plan.to_new)?;
@@ -236,7 +255,7 @@ pub fn prepare_index_with(
     write_entries(repo, &env, &zero, &plan.finals)?;
 
     // 7. 补回标志
-    restore_flags(repo, &env, &flags_before)?;
+    restore_flags(repo, &work, &env, &flags_before)?;
 
     // 8. stat 只关乎快慢，失败不让跟进失败（约定同 refresh_index_stat）
     if let Err(e) = run_git_env(repo, &["update-index", "-q", "--refresh"], &env) {
@@ -303,6 +322,14 @@ fn existing_blobs(repo: &str, staged: &BTreeMap<String, Change>) -> Result<BTree
     if wanted.is_empty() {
         return Ok(BTreeSet::new());
     }
+    git_read::or_cli(
+        "查对象库里有哪些 blob",
+        || git_read::present_blobs(repo, wanted.iter().copied()),
+        || existing_blobs_by_cli(repo, &wanted),
+    )
+}
+
+fn existing_blobs_by_cli(repo: &str, wanted: &BTreeSet<&str>) -> Result<BTreeSet<String>> {
     let input: String = wanted.iter().map(|o| format!("{o}\n")).collect();
     let out = run_git_stdin(repo, &["cat-file", "--batch-check"], input.as_bytes())?;
     Ok(out
@@ -364,6 +391,19 @@ fn read_changes(repo: &str, args: &[&str]) -> Result<BTreeMap<String, Change>> {
         );
     }
     Ok(map)
+}
+
+/// libgit2 一侧（`git_read`）的 raw 记录，整理成与 [`read_changes`] 相同的形状。
+fn by_path(raw: Vec<git_read::RawChange>) -> BTreeMap<String, Change> {
+    raw.into_iter()
+        .map(|c| {
+            let change = Change {
+                old: entry(&c.old_mode, &c.old_oid),
+                new: entry(&c.new_mode, &c.new_oid),
+            };
+            (c.path, change)
+        })
+        .collect()
 }
 
 fn entry(mode: &str, oid: &str) -> Option<Entry> {
@@ -623,8 +663,8 @@ fn write_entries(repo: &str, env: &[(&str, &str)], zero: &str, entries: &Writes)
 
 /// 补回 assume-unchanged（read-tree 换掉条目时丢，W25）与 skip-worktree（`--index-info` 丢，
 /// Task 8 实测）。只补「之前有、现在没有、条目还在」的路径：条目已不在时补标志是 fatal。
-fn restore_flags(repo: &str, env: &[(&str, &str)], before: &str) -> Result<()> {
-    let after = run_git_env(repo, &["ls-files", "-v", "-z"], env)?;
+fn restore_flags(repo: &str, work: &str, env: &[(&str, &str)], before: &str) -> Result<()> {
+    let after = index_listing(repo, Path::new(work), ListAs::Flags)?;
     let present: BTreeSet<&str> = after
         .split('\0')
         .filter_map(|r| r.split_once(' '))

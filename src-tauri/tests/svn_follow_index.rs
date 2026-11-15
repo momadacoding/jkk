@@ -773,6 +773,60 @@ fn skip_worktree_flag_survives_changes_and_entry_writes() {
     }
 }
 
+#[test]
+fn index_reads_handed_back_to_git_compose_the_same() {
+    // 索引读走 libgit2，`index.sparse` 打开时 git_read::index_records 不接：每一步都退回 git 命令，
+    // 拼出来的结果与平常一样（日志 2026-11-16-follow-git-inproc-reads-decisions.md T3）。没开
+    // sparse checkout 时 git 照样写普通索引，所以只有「退回 git」这一点与平常不同。
+    // （split index 更直接，但拼索引里原有的 `intent_to_add_paths` 本来就用 libgit2 读索引，
+    // 碰上 split index 会报错，见日志「计划没写的坑」）
+    let (r, old) = Repo::seeded(&[
+        ("del.txt", b"d\n"),
+        ("mode.sh", b"#!\n"),
+        ("edit.txt", b"e\n"),
+        ("other.txt", b"o\n"),
+        ("assumed.txt", b"a\n"),
+        ("skipped.txt", b"s\n"),
+    ]);
+    r.git(&["config", "index.sparse", "true"]);
+    // 前提：libgit2 这一侧确实不接，下面走的是 git（以后 libgit2 接了，这条测试就不再测退回）
+    assert!(
+        app_lib::engine::git_read::index_records(&r.s(), &r.index_path()).is_err(),
+        "前提：index.sparse 打开时进程内读不接"
+    );
+    r.git(&["rm", "-q", "--cached", "del.txt"]);
+    r.git(&["update-index", "--chmod=+x", "mode.sh"]);
+    r.stage("edit.txt", b"e2\n");
+    r.stage("added.txt", b"new\n");
+    r.git(&["update-index", "--assume-unchanged", "assumed.txt"]);
+    r.git(&["update-index", "--skip-worktree", "skipped.txt"]);
+    let new = r.commit_on(
+        &old,
+        &[
+            ("other.txt", Some(b"o2\n")),
+            ("assumed.txt", Some(b"a2\n")),
+            ("skipped.txt", Some(b"s2\n")),
+        ],
+    );
+    let disk = r.disk();
+
+    let report = r.publish(&old, &new, &all(COLLEAGUE));
+
+    assert!(report.decisions.is_empty(), "交集为空：{report:?}");
+    // HEAD 已经是 NEW：NEW 改过的三条等于 NEW，不在暂存差异里
+    assert_eq!(
+        r.staged_vs("HEAD"),
+        vec!["A\tadded.txt", "D\tdel.txt", "M\tedit.txt", "M\tmode.sh"]
+    );
+    for p in ["other.txt", "assumed.txt", "skipped.txt"] {
+        assert_eq!(r.entry(p), Some(r.at(&new, p)), "{p}");
+    }
+    let flags = r.flags();
+    assert_eq!(flags["assumed.txt"], "h");
+    assert_eq!(flags["skipped.txt"], "S");
+    assert_eq!(r.disk(), disk);
+}
+
 // ---- 目录 / 文件碰撞 ----
 
 #[test]
