@@ -47,6 +47,7 @@ pub mod svn_include_check;
 pub mod svn_init;
 pub mod svn_journal;
 pub mod svn_leak;
+pub mod svn_local_only_edit;
 pub mod svn_lock;
 pub mod svn_log;
 pub mod svn_log_cache;
