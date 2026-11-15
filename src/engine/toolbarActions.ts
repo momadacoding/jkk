@@ -25,6 +25,8 @@ export interface ToolbarPlan {
   args: Record<string, unknown>
   /** 非空时先弹确认框，文案即此字符串。 */
   confirm: string | null
+  /** 按钮的悬停说明；`null` 不显示。 */
+  title: string | null
 }
 
 /**
@@ -45,6 +47,7 @@ export function planToolbarAction(
         command: 'fetch',
         args: { all: ctrl },
         confirm: null,
+        title: null,
       }
     case 'pull':
       return {
@@ -52,6 +55,7 @@ export function planToolbarAction(
         command: 'pull',
         args: { rebase: ctrl },
         confirm: null,
+        title: null,
       }
     case 'push':
       return {
@@ -62,13 +66,19 @@ export function planToolbarAction(
         confirm: ctrl
           ? `Force-push ${branch}? This can overwrite commits on the remote.`
           : null,
+        title: null,
       }
     case 'stash':
+      // 默认连新增文件一起收（第 99 号 issue）：「收起改动」就该是全部改动，落下的新增文件
+      // 切分支、修 bug 时很容易混进别的提交。Ctrl 留给少数只想收已跟踪文件的时候
       return {
-        label: ctrl ? 'Stash all' : 'Stash',
+        label: ctrl ? 'Stash tracked' : 'Stash',
         command: 'stash_push',
-        args: { message: null, includeUntracked: ctrl },
+        args: { message: null, includeUntracked: !ctrl },
         confirm: null,
+        title: ctrl
+          ? '只收已跟踪文件的改动，新增文件留在磁盘上'
+          : '收起所有改动，包括新增文件；被 .gitignore 忽略的不收。按住 Ctrl：只收已跟踪文件',
       }
   }
 }

@@ -126,6 +126,8 @@ describe('commitMenu 按能力裁剪', () => {
       'revert',
       'copy-hash',
       'copy-info',
+      // 只在 SVN 混合仓库里有：改「仅本地」标记（使用报告 9.2，见 localOnlyEdit.test.ts）
+      'local-only-on',
     ])
   })
 

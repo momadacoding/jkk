@@ -287,7 +287,7 @@ pub fn all_committed(repo: &str, old_base: &str, head: &str, new: &str) -> Resul
     Ok(!bodies.iter().any(|b| parse_local_only(b)))
 }
 
-fn changed_paths(repo: &str, a: &str, b: &str) -> Result<BTreeSet<String>> {
+pub(crate) fn changed_paths(repo: &str, a: &str, b: &str) -> Result<BTreeSet<String>> {
     crate::engine::git_read::or_cli(
         "比两棵树改了哪些路径",
         || {
@@ -543,6 +543,26 @@ fn conflict_files(out: &str) -> Vec<String> {
     files
 }
 
+/// C 里 `paths` 的条目换回 C^ 的之后的树（[`commit_without`] 的树，不建 commit）。`paths` 里 C 没改过的
+/// 不算；一条都没换时就是 C 的树。Local-Only 拆分用（`svn_local_only_edit`）。
+pub(crate) fn tree_without(
+    repo: &str,
+    c: &ReplayCommit,
+    paths: &BTreeSet<String>,
+    codes: &ReplayCodes,
+) -> Result<String> {
+    let parent = single_parent(c, codes)?;
+    let swaps = swaps_for(repo, c, parent, paths, codes)?;
+    if swaps.is_empty() {
+        return Ok(
+            run_git(repo, &["rev-parse", &format!("{}^{{tree}}", c.oid)])?
+                .trim()
+                .to_string(),
+        );
+    }
+    c_prime_tree(repo, c, &swaps, codes)
+}
+
 /// 用 `like` 的作者与 message 在 `parent` 上创建 `tree` 的 commit（计划 B15）。
 fn commit_like(repo: &str, tree: &str, parent: &str, like: &str) -> Result<String> {
     let meta = run_git(
@@ -562,6 +582,22 @@ fn commit_like(repo: &str, tree: &str, parent: &str, like: &str) -> Result<Strin
         f.next().unwrap_or(""),
         f.next().unwrap_or("").trim_end_matches('\n'),
     );
+    write_commit(repo, tree, parent, name, email, date, msg)
+}
+
+/// 用给定的作者与 message 在 `parent` 上创建 `tree` 的 commit；提交者取当前环境（同 `git rebase`）。
+/// `date` 是 `--date=raw` 的形态。Local-Only 改写一次读出整条链的元数据之后逐个调它，省掉每个
+/// commit 一次 `git log -1`（`svn_local_only_edit`，独立 review 第 5 条）。
+pub(crate) fn write_commit(
+    repo: &str,
+    tree: &str,
+    parent: &str,
+    name: &str,
+    email: &str,
+    date: &str,
+    msg: &str,
+) -> Result<String> {
+    let msg = msg.trim_end_matches('\n');
     // message 走 `-F <文件>`（W27）：`-m` 受 Windows 命令行约 32K 字符的上限；`-F -`（stdin）
     // 在 run_git* 下读到的是 null，会产出空 message。内容按 `-m` 的规矩补一个结尾换行
     // （commit-tree 对 `-m` 做 complete_line、对 `-F` 不做），与改造前逐字节相同

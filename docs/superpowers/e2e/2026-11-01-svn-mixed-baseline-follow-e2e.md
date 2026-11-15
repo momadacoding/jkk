@@ -375,8 +375,8 @@ G commit -qm 'e2e 4 B2'
 
 ## 场景 5：stash 去修 bug，回来继续
 
-这一步在操作窗口里用命令做（只在 fixture 里）。工具栏上的 Stash 按钮在场景 14 里单独验；
-普通 Stash 默认不收新增文件，已记为 momadacoding/jkk 第 99 号 issue，后续优化。
+这一步在操作窗口里用命令做（只在 fixture 里）。工具栏上的 Stash 按钮在场景 14C 里单独验
+（第 99 号 issue 之后它默认连新增文件一起收）。
 
 **造现场（操作窗口）：**
 
@@ -922,13 +922,15 @@ Get-Content (Join-Path $WC 'Code/New14b.cs')
 - `status` 是和手动跟进之前完全一样的三行：`M  Code/Bag/B1.cs`（**仍然是已暂存**）、` M Code/Mail/M1.cs`、`?? Code/New14b.cs`；
 - 内容依次是 `staged14b`、`unstaged14b`、`class New14b { }`。
 
-### 14C：工具栏 Stash 与「Stash all」
+### 14C：工具栏 Stash 与「Stash tracked」
 
-这是改造前就有的按钮，这一期没动它，记在这里是让你知道它的边界。接着 14B 的现场，仍在 side14 上：
+第 99 号 issue 之后，普通 **Stash** 连新增（未跟踪）文件一起收（`git stash push -u`）；按住 Ctrl 变成
+**Stash tracked**，只收已跟踪文件。两者都不收被 `.gitignore` / `.git/info/exclude` 忽略的文件，
+所以 `.svn/` 不会被收走。接着 14B 的现场，仍在 side14 上：
 
-1. **应用：** 直接点工具栏的 **Stash**。**操作窗口：** `G status --short --untracked-files=all`
+1. **应用：** 鼠标停在工具栏的 **Stash** 上，悬停说明是「收起所有改动，包括新增文件；被 .gitignore 忽略的不收。按住 Ctrl：只收已跟踪文件」。点它。**操作窗口：** `G status --short --untracked-files=all`
 
-   应当**只剩** `?? Code/New14b.cs`：普通 Stash 收走已暂存和改了没暂存的，**不收新增文件**。
+   应当**什么都不输出**：三行（包括 `?? Code/New14b.cs`）都被收走了。
 
 2. **操作窗口：** 放回来。
 
@@ -939,8 +941,45 @@ Get-Content (Join-Path $WC 'Code/New14b.cs')
 
    回到 14B 核对时的三行，B1 仍是已暂存（`--index` 才会恢复暂存状态）。
 
-3. **应用：** 按住 **Ctrl** 点工具栏，按钮名变成 **Stash all**，点它。**操作窗口：** `G status --short --untracked-files=all` 应当是空的。
+3. **应用：** 按住 **Ctrl**，按钮名变成 **Stash tracked**，点它。**操作窗口：** `G status --short --untracked-files=all` 应当**只剩** `?? Code/New14b.cs`。
 4. **操作窗口：** `G stash pop -q --index`，然后 `G status --short --untracked-files=all`，还是那三行。
+
+5. **撞名时一个字节都不动。** **应用：** 再点一次 **Stash**（不按 Ctrl）。**操作窗口：** 在原处放一个同名的新文件，看一眼现场：
+
+   ```powershell
+   Wc 'Code/New14b.cs' 'mine14c'
+   G status --short --untracked-files=all
+   ```
+
+   只有一行 `?? Code/New14b.cs`。
+
+6. **应用：** 左侧 **STASHES** 里，在最上面那条（`{0}`）上右键 → **Pop**。顶部错误条应当出现：
+
+   `[stash_untracked_exists] 这条 stash 里的新增文件，工作区里已经有同名的了：Code/New14b.cs。git 碰到这种情况会只恢复一半，所以这次什么都没动，stash 也还在。把这些文件改名、移走或删掉之后再试一次。`
+
+   **操作窗口：** 核对确实什么都没动。
+
+   ```powershell
+   G status --short --untracked-files=all
+   Get-Content (Join-Path $WC 'Code/New14b.cs')
+   G stash list
+   ```
+
+   仍然只有 `?? Code/New14b.cs`（B1、M1 的改动**没有**被放回来）；文件内容是 `mine14c`；`stash list` 里那条还在。
+
+7. **操作窗口：** 拿掉挡路的文件，再把 stash 放回来：
+
+   ```powershell
+   Remove-Item (Join-Path $WC 'Code/New14b.cs')
+   G stash pop -q --index
+   G status --short --untracked-files=all
+   ```
+
+   还是 14B 核对时的那三行，`Code/New14b.cs` 的内容是 `class New14b { }`。
+
+   挡路的文件和 stash 里的**字节相同、而且已经进了 HEAD** 时不拦，直接放回（计划 A17：同事新增的文件被
+   Stash 收走，跟进后又作为已跟踪文件回到磁盘）。这个形状由 Rust 测试
+   `pop_goes_through_when_the_new_file_came_back_identical_and_tracked` 覆盖，这里不单独造现场。
 
 **收尾：** **操作窗口**把改动提交到 side14，然后在**应用**里切回 `work`。
 
@@ -957,7 +996,9 @@ G commit -qm 'e2e 14b wip'
 | 14A 跟进后 `?? Code/Mine14.cs` 还在 | 自己 `svn add` 提交的新文件没进基线，或进了基线但索引没跟上 |
 | 14B 继续之后 B1 变成 ` M`（没暂存了），且弹了「暂存没保住」 | `stash apply --index` 失败退回了不带 `--index` 的 apply；记下弹框内容反馈回来 |
 | 14B 继续之后 `New14b.cs` 不见了 | 手动跟进的 stash 收了新增文件却没放回——严重，**先别做别的操作**，把 `G stash list` 的输出发回来 |
-| 14C 第 1 步 New14b 也被收走了 | 普通 Stash 的行为和预期不同（预期是只有 Stash all 才收新增文件） |
+| 14C 第 1 步之后还剩 `?? Code/New14b.cs` | 普通 Stash 没带 `-u`：跑的是旧版本，或第 99 号 issue 的改动没生效 |
+| 14C 第 1 步之后 `.svn` 出了问题（SVN 命令报工作副本损坏） | `.svn/` 被 `-u` 收走了，说明 `.git/info/exclude` 里缺了 `.svn/`——严重，**先别做别的操作**，把 `G stash list` 和 `Get-Content (Join-Path $WC '.git/info/exclude')` 的输出发回来 |
+| 14C 第 6 步 B1 / M1 的改动被放回来了，或文件内容不是 `mine14c` | pop 前的撞名检查没拦住，git 半套 apply 了——把 `G status --short` 和 `G stash list` 的输出发回来 |
 
 ---
 

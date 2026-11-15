@@ -147,44 +147,83 @@ fn restore(repo: &str, oid: &str, keep_index: bool) -> Result<(RestoreOutcome, b
     // apply 一次又会撞上自己刚写下的改动。
     let mut same_file = Vec::new();
     if let Some(untracked) = parents.get(2) {
-        let out = run_git(repo, &["ls-tree", "-r", "--name-only", "-z", untracked])?;
-        let mut collisions = Vec::new();
-        for p in out.split('\0').filter(|p| !p.is_empty()) {
-            // 祖先路径被非目录占着时，对 `p` 取元数据会报错，看起来像「不存在」——
-            // 但 git 建不出那一级目录，照样半套 apply（PR #49 review 第三轮 #3，实测）
-            if let Some(block) = blocking_ancestor(repo, p) {
-                if !collisions.contains(&block) {
-                    collisions.push(block);
-                }
-                continue;
-            }
-            if Path::new(repo).join(p).symlink_metadata().is_err() {
-                continue;
-            }
-            if is_same_file_everywhere(repo, untracked, p)? {
-                same_file.push(p.to_string());
-            } else {
-                collisions.push(p.to_string());
-            }
-        }
+        let clashes = untracked_clashes(repo, untracked)?;
         // 真撞名时**一个字节都不动**：字节相同的那批也还没删
-        if !collisions.is_empty() {
-            return Ok((RestoreOutcome::Blocked { collisions }, false));
+        if !clashes.collisions.is_empty() {
+            return Ok((
+                RestoreOutcome::Blocked {
+                    collisions: clashes.collisions,
+                },
+                false,
+            ));
         }
-        // 计划 A17：三处同一个 blob 的，先从磁盘拿掉，让 apply 把同样的字节写回来。
-        // 删的是 HEAD 里原样存着的内容，不是用户独有的数据
-        for p in &same_file {
-            std::fs::remove_file(Path::new(repo).join(p))?;
+        same_file = clashes.same_file;
+    }
+    with_same_files_lifted(repo, &same_file, || {
+        if keep_index {
+            apply_keeping_index(repo, oid)
+        } else {
+            apply_plain(repo, oid).map(|o| (o, false))
+        }
+    })
+}
+
+/// stash 的未跟踪树（第三个父提交）里，磁盘上已经被占住的路径，分成两类。
+pub(crate) struct UntrackedClashes {
+    /// 真撞名：apply 会半套写上去再失败，必须在 apply 之前拦下。
+    pub collisions: Vec<String>,
+    /// 计划 A17：stash、HEAD、磁盘三处是同一个 blob（见 [`is_same_file_everywhere`]），
+    /// 可以先从磁盘拿掉再 apply（[`with_same_files_lifted`]）。
+    pub same_file: Vec<String>,
+}
+
+/// 对 `untracked`（stash 的第三个父提交）里每个路径查磁盘，分出 [`UntrackedClashes`]。
+///
+/// ⚠️ 必须在 apply **之前**查：2026-09-25 实测，撞名时 git 先把已跟踪
+/// 部分写上去、再在未跟踪上失败（退出 1、没有 `UU`）——半套 apply，而再
+/// apply 一次又会撞上自己刚写下的改动。工具栏的 apply / pop 也走这里（第 99 号 issue）。
+pub(crate) fn untracked_clashes(repo: &str, untracked: &str) -> Result<UntrackedClashes> {
+    let out = run_git(repo, &["ls-tree", "-r", "--name-only", "-z", untracked])?;
+    let mut clashes = UntrackedClashes {
+        collisions: Vec::new(),
+        same_file: Vec::new(),
+    };
+    for p in out.split('\0').filter(|p| !p.is_empty()) {
+        // 祖先路径被非目录占着时，对 `p` 取元数据会报错，看起来像「不存在」——
+        // 但 git 建不出那一级目录，照样半套 apply（PR #49 review 第三轮 #3，实测）
+        if let Some(block) = blocking_ancestor(repo, p) {
+            if !clashes.collisions.contains(&block) {
+                clashes.collisions.push(block);
+            }
+            continue;
+        }
+        if Path::new(repo).join(p).symlink_metadata().is_err() {
+            continue;
+        }
+        if is_same_file_everywhere(repo, untracked, p)? {
+            clashes.same_file.push(p.to_string());
+        } else {
+            clashes.collisions.push(p.to_string());
         }
     }
-    let result = if keep_index {
-        apply_keeping_index(repo, oid)
-    } else {
-        apply_plain(repo, oid).map(|o| (o, false))
-    };
-    // apply 没把它们写回来（中途失败）时从 HEAD 取回：HEAD 里就是同一个 blob。
-    // `p` 来自 ls-tree，不会是空 pathspec（§12.2）
-    for p in &same_file {
+    Ok(clashes)
+}
+
+/// 计划 A17：把三处同一个 blob 的文件先从磁盘拿掉，跑 `apply`，让它把同样的字节写回来。
+/// 删的是 HEAD 里原样存着的内容，不是用户独有的数据。
+///
+/// `apply` 没把它们写回来（中途失败）时从 HEAD 取回：HEAD 里就是同一个 blob。
+/// `p` 来自 ls-tree，不会是空 pathspec（§12.2）。
+pub(crate) fn with_same_files_lifted<T>(
+    repo: &str,
+    same_file: &[String],
+    apply: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    for p in same_file {
+        std::fs::remove_file(Path::new(repo).join(p))?;
+    }
+    let result = apply();
+    for p in same_file {
         if Path::new(repo).join(p).symlink_metadata().is_err() {
             run_git(repo, &["checkout", "HEAD", "--", p])?;
         }
@@ -274,15 +313,6 @@ fn status_all(repo: &str) -> Result<String> {
     )
 }
 
-/// 计划 A17：stash 里的这个未跟踪文件，与磁盘上撞名的文件、HEAD 里的同名文件是
-/// **同一个 blob**——它不是两份内容在抢一个路径，而是同一个文件出现了三次。
-///
-/// 实际场景：外部在项目根 `svn update` 带来了服务器新增的文件，git 视它为未跟踪，
-/// S1 的 `-u` 把它收进 stash；基线跟上之后它又作为已跟踪文件回到磁盘
-/// （2026-09-25 实测，`probe-ext-added.ps1`）。按 A3 一律拦下的话，只要同事新增过
-/// 文件，每次接管都会停在 `StashBlocked`。
-///
-/// 任何一处不同、HEAD 里没有它、或它不是普通文件，都按真撞名处理。
 /// `p`（正斜杠、相对仓库根）的某一级祖先在磁盘上存在却不是目录时，返回那一级。
 ///
 /// 符号链接也算挡路：git 不会穿过它写文件。
@@ -299,6 +329,16 @@ fn blocking_ancestor(repo: &str, p: &str) -> Option<String> {
     None
 }
 
+/// 计划 A17：stash 里的这个未跟踪文件，与磁盘上撞名的文件、HEAD 里的同名文件是
+/// **同一个 blob**——它不是两份内容在抢一个路径，而是同一个文件出现了三次。
+///
+/// 实际场景：外部在项目根 `svn update` 带来了服务器新增的文件，git 视它为未跟踪，
+/// S1 的 `-u` 把它收进 stash；基线跟上之后它又作为已跟踪文件回到磁盘
+/// （2026-09-25 实测，`probe-ext-added.ps1`）。按 A3 一律拦下的话，只要同事新增过
+/// 文件，每次接管都会停在 `StashBlocked`。工具栏 Stash 默认带 `-u` 之后，手动 pop
+/// 也是同一个场景（第 99 号 issue 独立 review 第 1 条）。
+///
+/// 任何一处不同、HEAD 里没有它、或它不是普通文件，都按真撞名处理。
 fn is_same_file_everywhere(repo: &str, untracked: &str, p: &str) -> Result<bool> {
     if !Path::new(repo).join(p).is_file() {
         return Ok(false);

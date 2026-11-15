@@ -48,6 +48,13 @@ export const SCENARIOS: LayoutScenario[] = [
   { id: 'deliver-short-error', component: 'DeliverDialog', clickPrimary: true },
   { id: 'follow-report-long', component: 'FollowReportDialog' },
   { id: 'tsvn-hooks-long', component: 'TsvnHooksDialog' },
+  // 报告里那个 Local-Only commit 改了 66 个文件；勾一个、点拆分，后端失败的长错误要看得见
+  {
+    id: 'split-local-only-long',
+    component: 'SplitLocalOnlyDialog',
+    clickFirst: { selector: '.dlg-check input >> nth=0', thenShows: '拆出 1 个文件' },
+    clickPrimary: true,
+  },
   // 已保存的快捷键注册失败的说明 + 保存失败的错误同时在框里
   { id: 'settings-long-error', component: 'SettingsDialog', clickPrimary: true },
   { id: 'settings-load-failed', component: 'SettingsDialog' },

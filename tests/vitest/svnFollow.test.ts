@@ -14,6 +14,7 @@ import {
   describePendingRestores,
   describeRestoreOutcome,
   describeRestoreSkips,
+  heldBackScene,
   keepOnNewFollow,
   needsSvnUserPrompt,
   restorablePaths,
@@ -71,6 +72,75 @@ describe('自动跟进（事故分析 6.12）', () => {
 
   it('没自动的原因前面写明「没有自动跟进」', () => {
     expect(describeAutoFollowSkip('有冲突。')).toBe('没有自动跟进：有冲突。')
+  })
+
+  describe('部分跟进之后只剩留下的文件：这个现场不必再自动试一次', () => {
+    const held = [{ path: 'Code/A.cs', reason: '重放有冲突，要你来判断。' }]
+
+    it('判定里只有留下的文件：给出现场键和横幅上的原因', () => {
+      const scene = heldBackScene(held, advanced, 'h2')
+      expect(scene?.key).toBe(autoFollowKey(advanced, 'h2'))
+      expect(scene?.message).toBe(
+        '还有 1 个文件留在旧基线上（上一次自动跟进留下的），要你来处理。' +
+          'Code/A.cs：重放有冲突，要你来判断。点「跟进」来处理。',
+      )
+    })
+
+    it('原因没带句号时补上，不和后面的话粘在一起', () => {
+      const bare = [{ path: 'Code/A.cs', reason: '有冲突' }]
+      expect(heldBackScene(bare, advanced, 'h2')?.message).toBe(
+        '还有 1 个文件留在旧基线上（上一次自动跟进留下的），要你来处理。' +
+          'Code/A.cs：有冲突。点「跟进」来处理。',
+      )
+    })
+
+    it('原因不止一种时按原因分开写，文件多了只点名前几个', () => {
+      const many = [
+        ...['A', 'B', 'C', 'D', 'E', 'F'].map((n) => ({ path: `Code/${n}.cs`, reason: '有冲突。' })),
+        { path: 'Code/Z.cs', reason: '和磁盘对不上。' },
+      ]
+      const sync = {
+        verdict: {
+          kind: 'externallyAdvanced',
+          changed: many.map((h) => ({ path: h.path, rev: 4, author: 'zhang' })),
+          added: [],
+          removed: [],
+        },
+      }
+      expect(heldBackScene(many, sync, 'h2')?.message).toBe(
+        '还有 7 个文件留在旧基线上（上一次自动跟进留下的），要你来处理。' +
+          'Code/A.cs、Code/B.cs、Code/C.cs、Code/D.cs、Code/E.cs 等 6 个文件：有冲突。' +
+          'Code/Z.cs：和磁盘对不上。点「跟进」来处理。',
+      )
+    })
+
+    it('SVN 侧还有别的新内容（多了文件、新增、删除）：照常自动试', () => {
+      const more = {
+        verdict: {
+          ...advanced.verdict,
+          changed: [...advanced.verdict.changed, { path: 'Code/B.cs', rev: 5, author: 'zhang' }],
+        },
+      }
+      expect(heldBackScene(held, more, 'h2')).toBeNull()
+      const added = {
+        verdict: { ...advanced.verdict, added: [{ path: 'Code/N.cs', rev: 5, author: 'zhang' }] },
+      }
+      expect(heldBackScene(held, added, 'h2')).toBeNull()
+      const removed = { verdict: { ...advanced.verdict, removed: ['Code/Gone.cs'] } }
+      expect(heldBackScene(held, removed, 'h2')).toBeNull()
+    })
+
+    it('留下的文件有一个不在判定里了：现场变了，照常自动试', () => {
+      const two = [...held, { path: 'Code/B.cs', reason: '有冲突。' }]
+      expect(heldBackScene(two, advanced, 'h2')).toBeNull()
+    })
+
+    it('没有留下文件、读不到判定、判定不是「SVN 侧有新内容」时没有', () => {
+      expect(heldBackScene([], advanced, 'h2')).toBeNull()
+      expect(heldBackScene(undefined, advanced, 'h2')).toBeNull()
+      expect(heldBackScene(held, null, 'h2')).toBeNull()
+      expect(heldBackScene(held, { verdict: { kind: 'inSync' } }, 'h2')).toBeNull()
+    })
   })
 
   it('完成提示：一切顺利是灰色；有要留意的内容时变黄，并让人点开看', () => {

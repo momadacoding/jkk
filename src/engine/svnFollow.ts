@@ -6,7 +6,7 @@
  *
  * ⚠️ 横幅与对话框都按**纯文本**渲染：不要写 `**`。
  */
-import type { ExternalChange } from './svnSync'
+import type { ExternalChange, SyncVerdict } from './svnSync'
 import { formatDuration } from './svnInit'
 import {
   describeFollowDrift,
@@ -182,6 +182,54 @@ export function autoFollowKey(
 /** 横幅上「为什么没自动跟进」的那一行。 */
 export function describeAutoFollowSkip(message: string): string {
   return `没有自动跟进：${message}`
+}
+
+/**
+ * 被这些原因拦下时不记现场：原因在工作副本里，用户在 TortoiseSVN 里处理掉（Resolve）之后 HEAD 与判定
+ * 都不变，现场键还是原来那个，记成「试过」就再也不自动了。不记的话，判定下一次写回时会再试一次；
+ * 还拦着也只是多一遍 `svn status`（预检在录制与服务器体检之前就拒绝了）。
+ */
+export const RECHECK_SKIPS: ReadonlySet<string> = new Set(['svn_preflight_conflicted'])
+
+/** 横幅原因里一组文件最多点名几个，同后端 `svn_follow::SUMMARY_NAMES`。 */
+const HELD_NAMES = 5
+
+/**
+ * 部分自动跟进（计划 2026-11-13-partial-auto-follow）做完之后的现场是不是只剩它留下的那些文件。
+ * 是就返回这个现场的键与横幅上的原因，调用方把它记成「试过」，不再自动发起一次。
+ *
+ * 不记的话：基线变了，现场键跟着变，自动跟进会立刻再跑一遍录制、服务器体检与重放，而结论一定
+ * 还是被同样的文件拦下（留下它们的原因一条都没变），白等几秒，横幅上最后也只是多这一行原因。
+ *
+ * 判定里有任何别的文件（又来了新内容）、或者留下的文件已经不在判定里，现场就不是做完那一刻的了，
+ * 返回 `null`，照常自动试。
+ */
+export function heldBackScene(
+  held: HeldBack[] | undefined,
+  sync: { verdict: { kind: string } } | null,
+  head: string | null,
+): { key: string; message: string } | null {
+  const key = autoFollowKey(sync, head)
+  if (!key || !sync || !held || held.length === 0) return null
+  const v = sync.verdict as Extract<SyncVerdict, { kind: 'externallyAdvanced' }>
+  if (v.added.length > 0 || v.removed.length > 0) return null
+  const left = new Set(v.changed.map((c) => c.path))
+  if (left.size !== held.length || !held.every((h) => left.has(h.path))) return null
+  const byReason = new Map<string, string[]>()
+  for (const h of held) byReason.set(h.reason, [...(byReason.get(h.reason) ?? []), h.path])
+  const groups = [...byReason].map(([reason, paths]) => {
+    const names = paths.slice(0, HELD_NAMES).join('、')
+    const more = paths.length > HELD_NAMES ? ` 等 ${paths.length} 个文件` : ''
+    // 原因是后端写的整句；万一哪条没带句号，也不和下一组粘在一起
+    return `${names}${more}：${reason}${reason.endsWith('。') ? '' : '。'}`
+  })
+  return {
+    key,
+    // 前面会接上「没有自动跟进：」（`describeAutoFollowSkip`）
+    message:
+      `还有 ${held.length} 个文件留在旧基线上（上一次自动跟进留下的），要你来处理。` +
+      `${groups.join('')}点「跟进」来处理。`,
+  }
 }
 
 /** 自动跟进完成后那条不打断操作的提示（分析 §6.12「通知」）。详情是同一份跟进报告。 */

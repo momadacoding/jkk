@@ -43,6 +43,7 @@ import { toErrorCode, toErrorMessage } from '../engine/errors'
 import { createLatestGate } from '@/engine/latestGate'
 import { createSingleFlight } from '@/engine/singleFlight'
 import { createSvnCheckQueue } from '@/engine/svnCheckQueue'
+import type { LocalOnlyEditOutcome } from '@/engine/localOnlyEdit'
 import { applyStatusPatch, type StatusPatch } from '@/engine/statusPatch'
 import { changesDiffScope, isChangesFileScope, type FileSelection } from '@/engine/fileSelection'
 import { backendDiffOptions, diffOptionsKey, type BackendDiffOptions } from '@/engine/diffPrefs'
@@ -467,6 +468,21 @@ export function svnFollowManual(path: string): Promise<SyncInOutcome> {
  */
 export function svnRestoreLocalOnly(path: string, paths: string[]): Promise<RestoreOutcome> {
   return invoke<RestoreOutcome>('svn_restore_local_only', { path, paths })
+}
+
+/** 取消（`on = false`）或加上 commit 的 Local-Only 标记（使用报告 9.2）。后端 `svn_set_local_only`。 */
+export function svnSetLocalOnly(path: string, commit: string, on: boolean): Promise<LocalOnlyEditOutcome> {
+  return invoke<LocalOnlyEditOutcome>('svn_set_local_only', { path, commit, on })
+}
+
+/** 把 Local-Only commit 里的 `paths` 拆成它前面的一个普通 commit。后端 `svn_split_local_only`。 */
+export function svnSplitLocalOnly(path: string, commit: string, paths: string[]): Promise<LocalOnlyEditOutcome> {
+  return invoke<LocalOnlyEditOutcome>('svn_split_local_only', { path, commit, paths })
+}
+
+/** 拆分弹框里列的文件：与后端校验选中项用的是同一份。只读。 */
+export function svnLocalOnlyFiles(path: string, commit: string): Promise<string[]> {
+  return invoke<string[]>('svn_local_only_files', { path, commit })
 }
 
 /**
@@ -1088,7 +1104,7 @@ export function useRepoStore() {
   /**
    * 后台的失同步检测都从这里排队（`createSvnCheckQueue`）：同一个仓库任一时刻只有一轮在跑，
    * 在跑时来的合并成一轮补跑，`force` 取或。计数包在开跑的那一轮上：排队期间前一轮还在跑，
-   * 计数本来就不是 0。唯一不排队的是提交前的 `freshSvnSync`，见那里。
+   * 计数本来就不是 0。不排队的只有 `freshSvnSync`（提交前、部分自动跟进做完时各用一次），见那里。
    */
   /**
    * `head` 是这次请求按哪次 HEAD 观测来的（`forceCheckAtHead`）；`since` 是调用方取的号。两个都给、而且
