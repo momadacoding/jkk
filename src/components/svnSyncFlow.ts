@@ -16,6 +16,7 @@ import {
 } from '../store/repoStore'
 import {
   AUTO_FOLLOW_OFF,
+  RECHECK_SKIPS,
   describeCheckoutBehind,
   describeFollowConflict,
   describeFollowContinue,
@@ -23,6 +24,7 @@ import {
   describeManualFollow,
   describeManualFollowAction,
   describeManualFollowOutcome,
+  heldBackScene,
   type AutoFollowOutcome,
   type FollowActionId,
   type FollowOutcome,
@@ -75,6 +77,27 @@ export interface SvnSyncFlowDeps {
   mergeRiskForAuto: () => Promise<string | null>
   /** 设置里自动跟进开着没有。读不出来按开着：后端还会再判一次。 */
   autoFollowEnabled: () => Promise<boolean>
+  /**
+   * 自动跟进试过的现场（`autoFollowKey`）。`handleAutoFollow` 返回 `true` 时由调用方记下；这里只在两处
+   * 改它：部分跟进做完后把剩下的现场也记成试过，被 `RECHECK_SKIPS` 拦下时把这次的现场放掉。
+   * 用 ref 的理由同 `running`。
+   */
+  autoTried: { current: string | null }
+  /**
+   * 跟进并刷新完之后**此刻**的判定与 HEAD。要现读：流程在跑的这几秒里，闭包里的 state 还是发起时的。
+   * 可以抛，流程接住。
+   */
+  sceneAfterFollow: () => Promise<{
+    sync: { verdict: { kind: string } } | null
+    head: string | null
+  }>
+  /**
+   * 让调用方再看一次要不要自动跟进。自动跟进**做完**、`running` 放开之后调用（独立 review 中 1）：
+   * 跟进后的刷新会写回新的判定，调用方那一次检查落在流程还在走的时候，被 `running` 挡掉、不记现场，
+   * 流程收尾之后没有别的东西再触发它。新现场已经记成试过（只剩留下的文件）时这一次是空转；
+   * 没记（跟进期间又来了新内容、读不出现场）就照常自动试。被拦下时不调：现场没变，调了就是原地打转。
+   */
+  nudgeAutoFollow: () => void
   /** 暂时性原因重试前的等待。测试里换成立即返回。 */
   wait: (ms: number) => Promise<void>
   /** 没自动跟进的原因，给横幅；`null` 清掉。`key` 是 `autoFollowKey` 算的现场。 */
@@ -277,18 +300,19 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
    * 只在横幅上写一行原因、完成时挂一条不打断操作的提示。出错（动过 ref 之后才失败）照常进错误条，
    * 文案里写着此刻的状态。
    */
-  const autoFollow = async (key: string) => {
+  /** 返回这次有没有跟进成（`done`）：成了，调用方在 `running` 放开之后叫醒一次（`nudgeAutoFollow`）。 */
+  const autoFollow = async (key: string): Promise<boolean> => {
     // 又检测到一次新的 SVN 变化：不管这次自动不自动，上一次的提示都过时了
     d.clearAutoFollowed()
     // 先看开关：关着时横幅照旧，连 merge driver 的原因也不该写（review 中-2）
     if (!(await d.autoFollowEnabled())) {
       d.setAutoFollowSkip(null)
-      return
+      return false
     }
     const risk = await d.mergeRiskForAuto()
     if (risk) {
       d.setAutoFollowSkip({ key, message: risk })
-      return
+      return false
     }
     d.setFollowing(true)
     let outcome: AutoFollowOutcome
@@ -303,16 +327,42 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
       if (outcome.kind === 'done') await afterFollow()
     } catch (err) {
       d.reportError(err)
-      return
+      return false
     } finally {
       d.setFollowing(false)
     }
     if (outcome.kind === 'skipped') {
       d.setAutoFollowSkip(outcome.code === AUTO_FOLLOW_OFF ? null : { key, message: outcome.message })
-      return
+      // 原因在工作副本里（SVN 冲突）：处理掉之后现场键不变，不放掉就再也不自动了。
+      // 期间记下的已经是别的现场时不动它
+      if (RECHECK_SKIPS.has(outcome.code) && d.autoTried.current === key) d.autoTried.current = null
+      return false
     }
-    d.setAutoFollowSkip(null)
+    const left = await sceneLeftBy(outcome.report)
+    if (left) {
+      // 只剩留下的文件：再试一次结论相同，直接把这个现场记成试过，原因写给横幅
+      d.autoTried.current = left.key
+      d.setAutoFollowSkip(left)
+    } else {
+      d.setAutoFollowSkip(null)
+    }
     d.showAutoFollowed(outcome.report)
+    return true
+  }
+
+  /**
+   * 部分跟进做完、刷新之后的现场是不是只剩它留下的文件（`heldBackScene`）。整次跟进时不去读。
+   * 读不出来就当不是：只是少省一次，下一次判定写回时照常自动试。
+   */
+  const sceneLeftBy = async (report: FollowReport) => {
+    if (!report.heldBack?.length) return null
+    try {
+      const { sync, head } = await d.sceneAfterFollow()
+      return heldBackScene(report.heldBack, sync, head)
+    } catch (err) {
+      console.warn('读部分跟进之后的现场失败：', err)
+      return null
+    }
   }
 
   /**
@@ -370,7 +420,13 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
      */
     handleAutoFollow: (key: string): boolean => {
       if (d.running.current) return false
-      void exclusive(() => autoFollow(key))
+      // 用盒子的理由同 `svnUpdate`。`then` 排在 `exclusive` 的 finally 之后：叫醒时 `running` 已经放开
+      const box = { done: false }
+      void exclusive(async () => {
+        box.done = await autoFollow(key)
+      }).then(() => {
+        if (box.done) d.nudgeAutoFollow()
+      })
       return true
     },
     // 没有单独的「手动跟进」入口（Review 3 第 4 条）：它只经由跟进冲突的确认框与「切换并手动跟进」
