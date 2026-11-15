@@ -1088,7 +1088,7 @@ export function useRepoStore() {
   /**
    * 后台的失同步检测都从这里排队（`createSvnCheckQueue`）：同一个仓库任一时刻只有一轮在跑，
    * 在跑时来的合并成一轮补跑，`force` 取或。计数包在开跑的那一轮上：排队期间前一轮还在跑，
-   * 计数本来就不是 0。唯一不排队的是提交前的 `freshSvnSync`，见那里。
+   * 计数本来就不是 0。不排队的只有 `freshSvnSync`（提交前、部分自动跟进做完时各用一次），见那里。
    */
   /**
    * `head` 是这次请求按哪次 HEAD 观测来的（`forceCheckAtHead`）；`since` 是调用方取的号。两个都给、而且

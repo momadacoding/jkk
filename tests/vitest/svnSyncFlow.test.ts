@@ -15,6 +15,7 @@ vi.mock('@/store/repoStore', () => ({
 import * as store from '@/store/repoStore'
 import { createSvnSyncFlow, type SvnSyncFlowDeps } from '@/components/svnSyncFlow'
 import type { ConfirmRequest } from '@/components/ConfirmDialog'
+import { autoFollowKey, heldBackScene } from '@/engine/svnFollow'
 import type { SyncInPreview } from '@/engine/svnSyncIn'
 
 const preview: SyncInPreview = {
@@ -70,6 +71,13 @@ function deps(log: string[], confirm?: (r: ConfirmRequest) => Promise<boolean>):
       return null
     },
     autoFollowEnabled: async () => true,
+    autoTried: { current: null },
+    sceneAfterFollow: async () => {
+      log.push('sceneAfterFollow')
+      return { sync: null, head: null }
+    },
+    // 不记日志，理由同 `clearAutoFollowed`
+    nudgeAutoFollow: () => {},
     wait: async (ms) => {
       log.push(`wait:${ms}`)
     },
@@ -301,6 +309,249 @@ describe('handleAutoFollow（事故分析 6.12）', () => {
 
     expect(log).toContain('reportError:svn_follow_index_rename_failed')
     expect(log).not.toContain('showAutoFollowed')
+  })
+
+  describe('部分跟进之后剩下的现场不再自动试一次', () => {
+    // 再试要重录基线、走服务器体检、重放，结论一定还是被同样的文件拦下
+    const held = [{ path: 'Code/A.cs', reason: '有冲突。' }]
+    const left = {
+      verdict: {
+        kind: 'externallyAdvanced' as const,
+        changed: [{ path: 'Code/A.cs', rev: 4, author: 'zhang' }],
+        added: [],
+        removed: [],
+      },
+    }
+    /** 发起一次，并像 `RepoTab` 那样在返回 true 时记下现场。 */
+    const start = (d: SvnSyncFlowDeps) => {
+      if (createSvnSyncFlow(d).handleAutoFollow('k1')) d.autoTried.current = 'k1'
+    }
+
+    it('刷新之后只剩留下的文件：把新现场记成试过，原因写进横幅', async () => {
+      const log: string[] = []
+      vi.mocked(store.svnFollowAuto).mockResolvedValue({
+        kind: 'done',
+        report: { ...report, heldBack: held },
+      })
+      const d: SvnSyncFlowDeps = {
+        ...deps(log),
+        sceneAfterFollow: async () => {
+          log.push('sceneAfterFollow')
+          return { sync: left, head: 'h2' }
+        },
+      }
+      start(d)
+      await vi.waitFor(() => expect(log).toContain('showAutoFollowed'))
+
+      const scene = heldBackScene(held, left, 'h2')
+      expect(scene).not.toBeNull()
+      expect(d.autoTried.current).toBe(scene?.key)
+      expect(log).toContain(`autoSkip:${scene?.key}|${scene?.message}`)
+      expect(log).not.toContain('autoSkip:null')
+      // 读的是刷新之后的判定
+      expect(log.indexOf('sceneAfterFollow')).toBeGreaterThan(log.indexOf('refreshSvnSync'))
+    })
+
+    it('刷新之后 SVN 侧还有别的新内容：不记成试过，也不写留下的原因（再试一次见下面接线的用例）', async () => {
+      const log: string[] = []
+      vi.mocked(store.svnFollowAuto).mockResolvedValue({
+        kind: 'done',
+        report: { ...report, heldBack: held },
+      })
+      const more = {
+        verdict: {
+          ...left.verdict,
+          added: [{ path: 'Code/N.cs', rev: 5, author: 'zhang' }],
+        },
+      }
+      const d: SvnSyncFlowDeps = {
+        ...deps(log),
+        sceneAfterFollow: async () => ({ sync: more, head: 'h2' }),
+      }
+      start(d)
+      await vi.waitFor(() => expect(log).toContain('showAutoFollowed'))
+
+      expect(d.autoTried.current).toBe('k1')
+      expect(log).toContain('autoSkip:null')
+    })
+
+    it('读不出刷新之后的现场：照原样收尾，不进错误条', async () => {
+      const log: string[] = []
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      vi.mocked(store.svnFollowAuto).mockResolvedValue({
+        kind: 'done',
+        report: { ...report, heldBack: held },
+      })
+      const d: SvnSyncFlowDeps = {
+        ...deps(log),
+        sceneAfterFollow: async () => {
+          throw new Error('读不到')
+        },
+      }
+      start(d)
+      await vi.waitFor(() => expect(log).toContain('showAutoFollowed'))
+
+      expect(d.autoTried.current).toBe('k1')
+      expect(log).toContain('autoSkip:null')
+      expect(log.some((l) => l.startsWith('reportError'))).toBe(false)
+      expect(warn).toHaveBeenCalledTimes(1)
+      warn.mockRestore()
+    })
+
+    describe('和 RepoTab 的 effect 接在一起（独立 review 中 1）', () => {
+      // 流程在走时判定写回，effect 那一次被 `running` 挡掉、不记现场；流程收尾之后没有别的东西再叫它。
+      // 所以做完要自己再叫一次：现场已经记成试过就是空转，没记就照常自动试
+      const more = {
+        verdict: { ...left.verdict, added: [{ path: 'Code/N.cs', rev: 5, author: 'zhang' }] },
+      }
+      /** 照 `RepoTab` 的 effect 接线：判定写回、被叫醒时各看一次要不要发起。 */
+      const wired = (
+        log: string[],
+        after: () => Promise<{ sync: typeof left | typeof more; head: string }>,
+        afterKey: string | null,
+      ) => {
+        const scene: { key: string | null } = { key: 'k1' }
+        const poke = () => {
+          const key = scene.key
+          if (!key || d.autoTried.current === key) return
+          if (flow.handleAutoFollow(key)) d.autoTried.current = key
+        }
+        const d: SvnSyncFlowDeps = {
+          ...deps(log),
+          refreshSvnSync: async () => {
+            scene.key = afterKey
+            poke()
+          },
+          sceneAfterFollow: after,
+          nudgeAutoFollow: () => {
+            log.push('nudgeAutoFollow')
+            poke()
+          },
+        }
+        const flow = createSvnSyncFlow(d)
+        return { d, poke }
+      }
+      const partialThenBlocked = () =>
+        vi
+          .mocked(store.svnFollowAuto)
+          .mockResolvedValueOnce({ kind: 'done', report: { ...report, heldBack: held } })
+          .mockResolvedValue({ kind: 'skipped', code: 'svn_auto_follow_overlap', message: '拦' })
+      const idle = async (d: SvnSyncFlowDeps, log: string[]) => {
+        await vi.waitFor(() => expect(log).toContain('nudgeAutoFollow'))
+        await vi.waitFor(() => expect(d.running.current).toBe(false))
+      }
+
+      it('只剩留下的文件：一共只发起一次', async () => {
+        const log: string[] = []
+        partialThenBlocked()
+        const { d, poke } = wired(log, async () => ({ sync: left, head: 'h2' }), autoFollowKey(left, 'h2'))
+        poke()
+        await idle(d, log)
+
+        expect(store.svnFollowAuto).toHaveBeenCalledTimes(1)
+      })
+
+      it('跟进期间 SVN 侧又来了新内容：做完之后照常再试一次', async () => {
+        const log: string[] = []
+        partialThenBlocked()
+        const key = autoFollowKey(more, 'h2')
+        const { d, poke } = wired(log, async () => ({ sync: more, head: 'h2' }), key)
+        poke()
+        await vi.waitFor(() => expect(store.svnFollowAuto).toHaveBeenCalledTimes(2))
+        await vi.waitFor(() => expect(d.running.current).toBe(false))
+
+        expect(d.autoTried.current).toBe(key)
+        expect(log).toContain(`autoSkip:${key}|拦`)
+      })
+
+      it('读不出做完之后的现场：照常再试一次', async () => {
+        const log: string[] = []
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        partialThenBlocked()
+        const { d, poke } = wired(
+          log,
+          async () => {
+            throw new Error('读不到')
+          },
+          autoFollowKey(left, 'h2'),
+        )
+        poke()
+        await vi.waitFor(() => expect(store.svnFollowAuto).toHaveBeenCalledTimes(2))
+        await vi.waitFor(() => expect(d.running.current).toBe(false))
+        warn.mockRestore()
+      })
+
+      it('没跟进（被拦下）时不叫醒：现场没变，叫醒就是原地打转', async () => {
+        const log: string[] = []
+        vi.mocked(store.svnFollowAuto).mockResolvedValue({
+          kind: 'skipped',
+          code: 'svn_preflight_conflicted',
+          message: '原因',
+        })
+        const { d, poke } = wired(log, async () => ({ sync: left, head: 'h2' }), 'k1')
+        poke()
+        await vi.waitFor(() => expect(log).toContain('autoSkip:k1|原因'))
+        await vi.waitFor(() => expect(d.running.current).toBe(false))
+        await new Promise((resolve) => setTimeout(resolve, 20))
+
+        expect(log).not.toContain('nudgeAutoFollow')
+        expect(store.svnFollowAuto).toHaveBeenCalledTimes(1)
+      })
+    })
+
+    it('整次跟进（没有留下文件）：不去读现场', async () => {
+      const log: string[] = []
+      vi.mocked(store.svnFollowAuto).mockResolvedValue({ kind: 'done', report })
+      start(deps(log))
+      await vi.waitFor(() => expect(log).toContain('showAutoFollowed'))
+
+      expect(log).not.toContain('sceneAfterFollow')
+      expect(log).toContain('autoSkip:null')
+    })
+  })
+
+  describe('被 SVN 冲突拦下：在 TortoiseSVN 里解决之后要能再自动试', () => {
+    // Resolve 不改 HEAD 也不改判定，现场键不变；记成「试过」的话就再也不自动了
+    const skip = (code: string) =>
+      vi.mocked(store.svnFollowAuto).mockResolvedValue({ kind: 'skipped', code, message: '原因' })
+    const run = async (d: SvnSyncFlowDeps, log: string[]) => {
+      if (createSvnSyncFlow(d).handleAutoFollow('k1')) d.autoTried.current = 'k1'
+      await vi.waitFor(() => expect(log).toContain('autoSkip:k1|原因'))
+      await vi.waitFor(() => expect(d.running.current).toBe(false))
+    }
+
+    it('原因照样写进横幅，但不记现场：判定再刷新一次时会再试', async () => {
+      const log: string[] = []
+      skip('svn_preflight_conflicted')
+      const d = deps(log)
+      await run(d, log)
+
+      expect(d.autoTried.current).toBeNull()
+      // 不是暂时性原因：不原地等两秒重试，要等用户去解决
+      expect(store.svnFollowAuto).toHaveBeenCalledTimes(1)
+    })
+
+    it('别的原因（分支重放冲突）：现场照记，不反复重跑录制与体检', async () => {
+      const log: string[] = []
+      skip('svn_auto_follow_conflict')
+      const d = deps(log)
+      await run(d, log)
+
+      expect(d.autoTried.current).toBe('k1')
+    })
+
+    // 现在的接线走不到：流程在走时 `handleAutoFollow` 返回 false，调用方不会改记录。只是防着以后有人改接线
+    it('兜底：记录已经不是这次的现场时不动它', async () => {
+      const log: string[] = []
+      skip('svn_preflight_conflicted')
+      const d = deps(log)
+      createSvnSyncFlow(d).handleAutoFollow('k1')
+      d.autoTried.current = 'k9'
+      await vi.waitFor(() => expect(log).toContain('autoSkip:k1|原因'))
+      await vi.waitFor(() => expect(d.running.current).toBe(false))
+
+      expect(d.autoTried.current).toBe('k9')
+    })
   })
 })
 

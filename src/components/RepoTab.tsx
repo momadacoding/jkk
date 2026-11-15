@@ -257,7 +257,9 @@ export function RepoTab({
   useEffect(() => {
     void refreshPendingRestores()
   }, [refreshPendingRestores, state.status])
-  // 试过的现场：同一个现场只试一次（见 `autoFollowKey`）。放 ref：effect 里读写，不该引起渲染
+  // 试过的现场：同一个现场只试一次（见 `autoFollowKey`）。放 ref：effect 里读写，不该引起渲染。
+  // 流程（svnSyncFlow）也写它：部分跟进后剩下的现场直接记成试过；被 SVN 冲突拦下的现场放掉，
+  // 判定下一次写回时再试
   const autoTried = useRef<string | null>(null)
   // 流程在下面 loading 的提前 return 之后才建出来，effect 经这个 ref 调它
   const autoFollowRef = useRef<((key: string) => boolean) | null>(null)
@@ -1047,6 +1049,15 @@ export function RepoTab({
         return true
       }
     },
+    autoTried,
+    // 都现读：流程跑了几秒，闭包里的 state 还是发起时的。跟进后的强制校验刚记过 wc.db 戳，
+    // `freshSvnSync` 这里只是比一次戳、从 ref 取最新的结论
+    sceneAfterFollow: async () => ({
+      head: await refreshHead(repoPath),
+      sync: await freshSvnSync(repoPath),
+    }),
+    // 同提交结束时那一下：让上面的 effect 再看一次
+    nudgeAutoFollow: () => setAutoNudge((n) => n + 1),
     wait: (ms) => new Promise((resolve) => window.setTimeout(resolve, ms)),
     setAutoFollowSkip: setAutoSkip,
     showAutoFollowed: setAutoFollowed,
