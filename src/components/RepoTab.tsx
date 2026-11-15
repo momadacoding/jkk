@@ -951,13 +951,16 @@ export function RepoTab({
   }
 
   // 「更新」「跟进」与横幅上的继续 / 放弃。流程在 `svnSyncFlow.ts`，这里只注入依赖
-  const showReport = (report: FollowReport) =>
+  const showReport = (report: FollowReport, refreshed?: Promise<void>) =>
     showFollowReport({
       report,
       readUser: () => svnGetUser(repoPath),
       saveUser: (user) => svnSetUser(repoPath, user),
       // 写了磁盘：「本地改动」要跟着变（watcher 也会刷，这里不等它）
       restoreLocalOnly: async (paths) => {
+        // 报告不等跟进之后的刷新就弹出来了：放回要写工作区，等那一轮读状态和 `svn status` 跑完再动，
+        // 否则会撞上索引锁被拒，或者让扫描读到写了一半的文件（独立 review 第 2 条）。按钮这时显示进行中
+        await refreshed
         const outcome = await svnRestoreLocalOnly(repoPath, paths)
         // 刷新失败不能吞掉已经写成的结果：再点一次只会看到误导的跳过原因（PR 159 review 第 8 条）
         try {
@@ -1019,11 +1022,17 @@ export function RepoTab({
     fetchSvnLog,
     setFollowing,
     refreshAfterFollow: async () => {
-      await refreshHead(repoPath)
-      await refreshGraph(repoPath)
-      await refreshStatus(repoPath)
-      await refreshSvnBranchesBehind(repoPath)
       void refreshHooksHealth()
+      // 三路同时发，不一项等一项（使用报告 10.5）。读图排在读 HEAD 后面：接 SVN 历史时要拿新的 HEAD 当
+      // 「还被指着」的起点（`repoStore` 的 `merge`），先写回图的话游离 HEAD 上的提交会被当成已交付藏起来
+      const results = await Promise.allSettled([
+        refreshHead(repoPath).then(() => refreshGraph(repoPath)),
+        refreshStatus(repoPath),
+        refreshSvnBranchesBehind(repoPath),
+      ])
+      // 全部落定才返回：一项先失败就返回的话，流程以为刷新完了、放开自动跟进，另外几项却还在写 state
+      const failed = results.find((r) => r.status === 'rejected')
+      if (failed) throw failed.reason
     },
     showFollowReport: showReport,
     checkoutBranch: async (name) => {

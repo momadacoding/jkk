@@ -51,6 +51,17 @@ describe('FollowReportDialog', () => {
     await waitFor(() => expect(screen.queryByLabelText('我的 SVN 用户名')).toBeNull())
   })
 
+  it('页脚写出这次跟进的用时；没有就不占一行', async () => {
+    const first = open({ ...report, elapsedMs: 12_340 })
+    expect(await screen.findByText('跟进用时 12.3 秒')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '知道了' }))
+    await first.closed()
+
+    open(report)
+    await screen.findByText('跟进完成')
+    expect(screen.queryByText(/跟进用时/)).toBeNull()
+  })
+
   it('点「知道了」关闭，Promise 结束', async () => {
     const { closed } = open(report)
     fireEvent.click(screen.getByRole('button', { name: '知道了' }))
