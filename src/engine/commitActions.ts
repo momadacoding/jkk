@@ -38,6 +38,10 @@ export type CommitAction =
   | 'save-patch'
   | 'copy-hash'
   | 'copy-info'
+  // 只在 SVN 混合仓库里有（使用报告 9.2）
+  | 'local-only-on'
+  | 'local-only-off'
+  | 'local-only-split'
 
 export interface CommitMenuEntry {
   action: CommitAction
@@ -134,7 +138,23 @@ export function commitMenu(commit: CommitNode, ctx: CommitMenuContext): CommitMe
     'cherry-pick': ctx.caps.cherryPick,
     'save-patch': ctx.caps.patches,
   }
-  return all.filter((e) => enabled[e.action] ?? true)
+  const menu = all.filter((e) => enabled[e.action] ?? true)
+  // 「仅本地」只在 SVN 混合仓库里有意义；SVN 节点和基线 commit 不是工作分支上的本地提交，改了也没用
+  // （后端还会再查一遍是否在当前分支、是否已在基线里）
+  if (ctx.caps.vcs === 'svn' && isLocalCommit(commit)) {
+    if (commit.localOnly) {
+      menu.push({ action: 'local-only-off', label: '取消「仅本地」…' })
+      menu.push({ action: 'local-only-split', label: '拆出部分文件上服务器…' })
+    } else {
+      menu.push({ action: 'local-only-on', label: '标为「仅本地」…' })
+    }
+  }
+  return menu
+}
+
+/** 工作分支上的本地提交：不是 SVN 节点，也不是基线 commit（单值或混合）。 */
+function isLocalCommit(c: CommitNode): boolean {
+  return c.svnRev === undefined && c.baselineRev === undefined && c.baselineFloor === undefined
 }
 
 /**

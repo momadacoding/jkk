@@ -14,6 +14,9 @@ use crate::desktop::DesktopState;
 use crate::engine::svn_follow::{
     follow, follow_auto, manual_follow, resume_follow, AutoFollowOutcome, FollowOutcome,
 };
+use crate::engine::svn_local_only_edit::{
+    local_only_files, set_local_only, split_local_only, EditOutcome,
+};
 use crate::engine::svn_restore_local_only::{
     dismiss_pending_restores, pending_restores, restore_local_only, PendingRestore, RestoreOutcome,
 };
@@ -82,6 +85,41 @@ pub fn svn_sync_out_continue(handle: AppHandle, path: String) -> Result<SyncOutO
 #[tauri::command(async)]
 pub fn svn_sync_out_abort(handle: AppHandle, path: String) -> Result<SyncOutOutcome, GitError> {
     with_watch_suspended(&handle, &path, || abort_sync_out(&path))
+}
+
+/// graph 右键菜单的「取消仅本地」/「标为仅本地」（使用报告 9.2）：改写当前分支上 `commit` 及之后的
+/// commit，只改这一个的说明，树原样搬，工作区与索引不动。JS 侧：
+/// `invoke('svn_set_local_only', { path, commit, on })`。
+#[tauri::command(async)]
+pub fn svn_set_local_only(
+    handle: AppHandle,
+    path: String,
+    commit: String,
+    on: bool,
+) -> Result<EditOutcome, GitError> {
+    with_watch_suspended(&handle, &path, || {
+        set_local_only(&path, &new_opid(), &commit, on)
+    })
+}
+
+/// 「把选中的文件拆成普通 commit」（使用报告 9.2）：`paths` 从 Local-Only commit 里拆出来，放在它前面
+/// 成一个普通 commit。JS 侧：`invoke('svn_split_local_only', { path, commit, paths })`。
+#[tauri::command(async)]
+pub fn svn_split_local_only(
+    handle: AppHandle,
+    path: String,
+    commit: String,
+    paths: Vec<String>,
+) -> Result<EditOutcome, GitError> {
+    with_watch_suspended(&handle, &path, || {
+        split_local_only(&path, &new_opid(), &commit, &paths)
+    })
+}
+
+/// 拆分弹框里列的文件（只读）。JS 侧：`invoke('svn_local_only_files', { path, commit })`。
+#[tauri::command(async)]
+pub fn svn_local_only_files(path: String, commit: String) -> Result<Vec<String>, GitError> {
+    local_only_files(&path, &commit)
 }
 
 /// 跟进报告里的「放回 Local-Only 补丁」（使用报告 9.1）。`paths` 是报告的 `restorable`；每条

@@ -41,6 +41,7 @@ import { toErrorCode, toErrorMessage } from '../engine/errors'
 import { createLatestGate } from '@/engine/latestGate'
 import { createSingleFlight } from '@/engine/singleFlight'
 import { createSvnCheckQueue } from '@/engine/svnCheckQueue'
+import type { LocalOnlyEditOutcome } from '@/engine/localOnlyEdit'
 import { applyStatusPatch, type StatusPatch } from '@/engine/statusPatch'
 import { changesDiffScope, isChangesFileScope, type FileSelection } from '@/engine/fileSelection'
 import { backendDiffOptions, diffOptionsKey, type BackendDiffOptions } from '@/engine/diffPrefs'
@@ -465,6 +466,21 @@ export function svnFollowManual(path: string): Promise<SyncInOutcome> {
  */
 export function svnRestoreLocalOnly(path: string, paths: string[]): Promise<RestoreOutcome> {
   return invoke<RestoreOutcome>('svn_restore_local_only', { path, paths })
+}
+
+/** 取消（`on = false`）或加上 commit 的 Local-Only 标记（使用报告 9.2）。后端 `svn_set_local_only`。 */
+export function svnSetLocalOnly(path: string, commit: string, on: boolean): Promise<LocalOnlyEditOutcome> {
+  return invoke<LocalOnlyEditOutcome>('svn_set_local_only', { path, commit, on })
+}
+
+/** 把 Local-Only commit 里的 `paths` 拆成它前面的一个普通 commit。后端 `svn_split_local_only`。 */
+export function svnSplitLocalOnly(path: string, commit: string, paths: string[]): Promise<LocalOnlyEditOutcome> {
+  return invoke<LocalOnlyEditOutcome>('svn_split_local_only', { path, commit, paths })
+}
+
+/** 拆分弹框里列的文件：与后端校验选中项用的是同一份。只读。 */
+export function svnLocalOnlyFiles(path: string, commit: string): Promise<string[]> {
+  return invoke<string[]>('svn_local_only_files', { path, commit })
 }
 
 /**

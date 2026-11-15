@@ -7,6 +7,7 @@ import { createRoot } from 'react-dom/client'
 import '@/styles.css'
 import { useConfirm, type ConfirmRequest } from '@/components/ConfirmDialog'
 import { DeleteBranchDialog } from '@/components/DeleteBranchDialog'
+import { SplitLocalOnlyDialog } from '@/components/SplitLocalOnlyDialog'
 import { DeleteWorktreeDialog } from '@/components/DeleteWorktreeDialog'
 import { useDeliverDialog } from '@/components/DeliverDialog'
 import { useFollowReportDialog } from '@/components/FollowReportDialog'
@@ -304,6 +305,16 @@ const SCENES: Record<string, () => ReactNode> = {
   'deliver-long': () => <Deliver />,
   'deliver-short-error': () => <Deliver fail />,
   'follow-report-long': () => <Follow />,
+  'split-local-only-long': () => (
+    <SplitLocalOnlyDialog
+      request={{
+        label: `fae50a8 ${'add @avatarclass '.repeat(8)}`,
+        files: paths(66),
+        split: () => Promise.reject(new Error(LONG_ERROR)),
+      }}
+      onClose={noop}
+    />
+  ),
   'tsvn-hooks-long': () => (
     <TsvnHooksDialog
       status={{

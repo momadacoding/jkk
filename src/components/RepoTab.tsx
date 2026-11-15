@@ -27,6 +27,9 @@ import {
   svnGetUser,
   svnMigrateEol,
   svnRestoreLocalOnly,
+  svnLocalOnlyFiles,
+  svnSetLocalOnly,
+  svnSplitLocalOnly,
   svnPendingRestores,
   svnDismissPendingRestores,
   svnSetUser,
@@ -41,6 +44,8 @@ import { createSvnSyncFlow } from './svnSyncFlow'
 import { createSvnSyncOutFlow } from './svnSyncOutFlow'
 import { useDeliverDialog } from './DeliverDialog'
 import { useFollowReportDialog } from './FollowReportDialog'
+import { SplitLocalOnlyDialog, type SplitLocalOnlyRequest } from './SplitLocalOnlyDialog'
+import { describeLocalOnlyEditDone, describeLocalOnlyToggle, type LocalOnlyEditOutcome } from '../engine/localOnlyEdit'
 import {
   autoFollowKey,
   describeAutoFollowDone,
@@ -236,6 +241,8 @@ export function RepoTab({
   // 「N 个文件缺 Local-Only 补丁」横幅（计划 2026-11-12-auto-restore-local-only 的 C）
   const [pendingRestores, setPendingRestores] = useState<PendingRestore[]>([])
   const [restoreBusy, setRestoreBusy] = useState(false)
+  /** 「拆出部分文件上服务器」弹框；`null` 时不显示。 */
+  const [splitRequest, setSplitRequest] = useState<SplitLocalOnlyRequest | null>(null)
   // 只认最后一次查询的结果：状态刷新很密，早发的请求晚回来会盖掉新的（review L5）
   const pendingSeq = useRef(0)
   const svnTab = state.capabilities.vcs === 'svn'
@@ -488,6 +495,17 @@ export function RepoTab({
   }, [state.path, state.headHash, refreshHead, refreshGraph, refreshStatus, refreshUpstream, refreshStashes, refreshPullRequests, reportError, guardMerge])
 
   /**
+   * 改完「仅本地」标记之后：图上的 commit 都换了 OID，重画并选中改写后的那一个（不是分支末端：改的可能是
+   * 下面第 30 个，跳到末端就看不到结果了，独立 review 第 4 条）；别的分支上也有这个 commit 时说一声。
+   * 后端结束时补发的 `repo-changed` 也会刷，这里不等它，免得选中项停在已经不在图上的旧 commit 上。
+   */
+  const afterLocalOnlyEdit = useCallback(async (path: string, done: LocalOnlyEditOutcome) => {
+    await refreshGraph(path, done.commit, true)
+    const notice = describeLocalOnlyEditDone(done)
+    if (notice) await confirm({ ...notice, confirmLabel: '知道了', notice: 'attention' })
+  }, [refreshGraph, confirm])
+
+  /**
    * graph 行右键菜单的调度。
    *
    * 菜单长什么样由 `engine/commitActions` 决定，这里只负责补齐它拿不到的东西：
@@ -529,6 +547,34 @@ export function RepoTab({
           await refreshGraph(path)
           return
         }
+        case 'local-only-on':
+        case 'local-only-off': {
+          const on = action === 'local-only-on'
+          const box: { done: LocalOnlyEditOutcome | null } = { done: null }
+          // 走 action：改写要拿同步锁、逐个建 commit，大分支上要一会儿，确认完就关框的话界面上没动静
+          await confirm({
+            ...describeLocalOnlyToggle(commit, on),
+            busyLabel: '正在改写…',
+            action: async () => {
+              box.done = await svnSetLocalOnly(path, commit.id, on)
+            },
+          })
+          if (box.done) await afterLocalOnlyEdit(path, box.done)
+          return
+        }
+        case 'local-only-split': {
+          const files = await svnLocalOnlyFiles(path, commit.id)
+          setSplitRequest({
+            label: `${short} ${commit.message.split('\n')[0]}`,
+            files,
+            split: async (paths) => {
+              const done = await svnSplitLocalOnly(path, commit.id, paths)
+              // 框随后自己关；结局提示排在它后面。拆分已经成了，刷新失败只进错误条（独立 review 第 2 条）
+              void afterLocalOnlyEdit(path, done).catch(reportError)
+            },
+          })
+          return
+        }
         case 'save-patch': {
           const file = await save({
             title: 'Save as Patch',
@@ -558,7 +604,7 @@ export function RepoTab({
     } catch (err) {
       reportError(err)
     }
-  }, [state.path, state.headHash, prompt, confirm, runToolbar, refreshGraph, reportError])
+  }, [state.path, state.headHash, prompt, confirm, runToolbar, refreshGraph, reportError, afterLocalOnlyEdit])
 
   /**
    * 丢弃改动。这是界面上少数不可逆的操作之一，必须先确认。
@@ -1349,6 +1395,9 @@ export function RepoTab({
       {promptDialog}
       {deliverDialog}
       {followReportDialog}
+      {splitRequest && (
+        <SplitLocalOnlyDialog request={splitRequest} onClose={() => setSplitRequest(null)} />
+      )}
       {/* 排在交付框之后：交付结局的提示框（走 confirm）要盖在上面 */}
       {confirmDialog}
     </div>
