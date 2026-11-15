@@ -619,10 +619,17 @@ fn server_url_at(units: &[WcIdentity], p: &str, rev: u64) -> Option<String> {
     })
 }
 
-/// 每个单元 `svn info -R --xml` 一次，找出被 `--set-depth=exclude` 掉的节点
-/// （仓库相对路径 → kind）。纯本地读，不写 wc.db（E19）。
+/// 找出被 `--set-depth=exclude` 掉的节点（仓库相对路径 → kind）。纯本地读，不写 wc.db（E19）。
+///
+/// 先直接查 `wc.db`（`svn_wcdb`，几十毫秒）；它认不出这个工作副本（格式不是 31、有没做完的
+/// 操作等）时，照旧每个单元 `svn info -R --xml` 一次。两条路的结果由 `tests/svn_wcdb.rs` 逐个
+/// 场景比对过（日志 `2026-11-15-wcdb-excluded-decisions.md`）。
 fn excluded_nodes(repo_root: &str, units: &[WcIdentity]) -> Result<BTreeMap<String, String>> {
     fault::hit(Point::ExcludedScan)?;
+    match crate::engine::svn_wcdb::excluded_nodes(repo_root, units) {
+        Ok(found) => return Ok(found),
+        Err(why) => log::info!("被排除的节点改用 svn info -R 找：{why}"),
+    }
     let mut out = BTreeMap::new();
     // 全部单元一次传（计划 2026-11-09 Task 3）：输出是各单元递归结果的拼接（实测 M4）。
     // 公司机器上逐单元跑一次跟进要 22.9 s
@@ -646,23 +653,53 @@ fn excluded_scan_targets(units: &[WcIdentity]) -> Vec<String> {
         .collect()
 }
 
-/// 把 [`excluded_nodes`] 那条 `svn info -R` 提前放到后台线程里跑（`svn_cli::prefetch_scan`），
-/// 让它与调用方接下来的工作并行。体检开始之前调用方 `adopt` 一下，[`excluded_nodes`] 发同一条
-/// 命令时就直接拿到输出。
+/// 磁盘一录完就把体检要的被排除节点准备好（[`excluded_nodes`]）：先直接查 `wc.db`
+/// （`svn_wcdb::probe`，几十毫秒）；查不了时把那条 `svn info -R` 放到后台线程里跑
+/// （`svn_cli::prefetch_scan`），与调用方接下来的工作并行。体检开始之前调用方
+/// [`ExcludedAhead::adopt`] 一下，[`excluded_nodes`] 直接拿到这份结果，不再查第二次。
 ///
-/// 这条命令要把白名单里每个节点的信息都打出来，是纯本地读，与录磁盘内容互不依赖；跟进里原来
-/// 排在录完之后串行等它（fixture 上约 0.7 秒，公司机器上按节点数放大）。
+/// # 必须在磁盘录完（`git add -A`）之后才调用
 ///
-/// 只在扫描缓存范围内起作用（跟进的准备阶段）；不在范围内返回 `None`，体检照常自己跑。
+/// 不论走哪条路，这里得出的就是体检用的「被排除节点」，时刻定在这里。理由见
+/// `svn_init::Indexed::excluded_ahead`。
+///
+/// 只在扫描缓存范围内起作用（跟进的准备阶段）；不在范围内返回 `None`，体检照常自己查。
 /// 这里读不出工作副本时也返回 `None`：错误留给体检在原来的位置报。
-pub(crate) fn prefetch_excluded_nodes(repo_root: &str, whitelist: &[String]) -> Option<ScanAhead> {
+pub(crate) fn prefetch_excluded_nodes(
+    repo_root: &str,
+    whitelist: &[String],
+) -> Option<ExcludedAhead> {
     // 先看在不在范围里：不在的话下面的枚举没有缓存可用，会白跑一次 `svn info` 和一遍全量扫描
     // （初始化、重建、更新的录制都不在范围里）
     if !in_scan_cache() {
         return None;
     }
     let units = crate::engine::svn_wc::enumerate_wcs(repo_root, whitelist).ok()?;
-    prefetch_scan(repo_root, EXCLUDED_SCAN, &excluded_scan_targets(&units))
+    let probe = crate::engine::svn_wcdb::probe(repo_root, &units);
+    // 查得了就不起 svn：那条 `svn info -R` 用不上，提前跑只会与体检的 `svn diff` 抢锁
+    let svn = if probe.is_ok() {
+        None
+    } else {
+        prefetch_scan(repo_root, EXCLUDED_SCAN, &excluded_scan_targets(&units))
+    };
+    Some(ExcludedAhead { probe, svn })
+}
+
+/// [`prefetch_excluded_nodes`] 准备好的被排除节点。
+pub(crate) struct ExcludedAhead {
+    probe: crate::engine::svn_wcdb::Probe,
+    svn: Option<ScanAhead>,
+}
+
+impl ExcludedAhead {
+    /// 交给当前线程上随后的体检。返回的守卫要活到体检结束；drop 时没被取走的作废。
+    /// 后台有 `svn info -R` 时等它跑完、记进扫描缓存。
+    pub(crate) fn adopt(self) -> crate::engine::svn_wcdb::Adopted {
+        if let Some(svn) = self.svn {
+            svn.adopt();
+        }
+        self.probe.adopt()
+    }
 }
 
 /// 点不了名的被排除节点 `p` 在 floor 上有哪些文件（仓库相对路径），D8。
