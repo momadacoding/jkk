@@ -16,8 +16,8 @@
 //! 时机全部满足它：HEAD 在 `svn/base` 上且工作区干净，或基线树刚从磁盘录出来。
 
 use crate::engine::svn_cli::{
-    chunk_targets, cmdline_estimate, in_scan_cache, prefetch_scan, run_svn, run_svn_code,
-    run_svn_targets, ScanAhead, MAX_TARGETS_CMDLINE,
+    chunk_targets, cmdline_estimate, in_scan_cache, prefetch_scan, run_ahead, run_svn,
+    run_svn_code, run_svn_targets, RunAhead, ScanAhead, MAX_TARGETS_CMDLINE,
 };
 // W-file 判据原本是本模块的私有函数，Phase 1c 提到 `svn_include_check` 共用，
 // 2026-10-28 再收进 `svn_scope`——`svn_server_set` 等要用**同一套**判据。
@@ -619,10 +619,17 @@ fn server_url_at(units: &[WcIdentity], p: &str, rev: u64) -> Option<String> {
     })
 }
 
-/// 每个单元 `svn info -R --xml` 一次，找出被 `--set-depth=exclude` 掉的节点
-/// （仓库相对路径 → kind）。纯本地读，不写 wc.db（E19）。
+/// 找出被 `--set-depth=exclude` 掉的节点（仓库相对路径 → kind）。纯本地读，不写 wc.db（E19）。
+///
+/// 先直接查 `wc.db`（`svn_wcdb`，几十毫秒）；它认不出这个工作副本（格式不是 31、有没做完的
+/// 操作等）时，照旧每个单元 `svn info -R --xml` 一次。两条路的结果由 `tests/svn_wcdb.rs` 逐个
+/// 场景比对过（日志 `2026-11-15-wcdb-excluded-decisions.md`）。
 fn excluded_nodes(repo_root: &str, units: &[WcIdentity]) -> Result<BTreeMap<String, String>> {
     fault::hit(Point::ExcludedScan)?;
+    match crate::engine::svn_wcdb::excluded_nodes(repo_root, units) {
+        Ok(found) => return Ok(found),
+        Err(why) => log::info!("被排除的节点改用 svn info -R 找：{why}"),
+    }
     let mut out = BTreeMap::new();
     // 全部单元一次传（计划 2026-11-09 Task 3）：输出是各单元递归结果的拼接（实测 M4）。
     // 公司机器上逐单元跑一次跟进要 22.9 s
@@ -646,23 +653,113 @@ fn excluded_scan_targets(units: &[WcIdentity]) -> Vec<String> {
         .collect()
 }
 
-/// 把 [`excluded_nodes`] 那条 `svn info -R` 提前放到后台线程里跑（`svn_cli::prefetch_scan`），
-/// 让它与调用方接下来的工作并行。体检开始之前调用方 `adopt` 一下，[`excluded_nodes`] 发同一条
-/// 命令时就直接拿到输出。
+/// 磁盘一录完就把体检要的被排除节点准备好（[`excluded_nodes`]）：先直接查 `wc.db`
+/// （`svn_wcdb::probe`，几十毫秒）；查不了时把那条 `svn info -R` 放到后台线程里跑
+/// （`svn_cli::prefetch_scan`），与调用方接下来的工作并行。体检开始之前调用方
+/// [`ExcludedAhead::adopt`] 一下，[`excluded_nodes`] 直接拿到这份结果，不再查第二次。
 ///
-/// 这条命令要把白名单里每个节点的信息都打出来，是纯本地读，与录磁盘内容互不依赖；跟进里原来
-/// 排在录完之后串行等它（fixture 上约 0.7 秒，公司机器上按节点数放大）。
+/// # 必须在磁盘录完（`git add -A`）之后才调用
 ///
-/// 只在扫描缓存范围内起作用（跟进的准备阶段）；不在范围内返回 `None`，体检照常自己跑。
+/// 不论走哪条路，这里得出的就是体检用的「被排除节点」，时刻定在这里。理由见
+/// `svn_init::Indexed::excluded_ahead`。
+///
+/// 只在扫描缓存范围内起作用（跟进的准备阶段）；不在范围内返回 `None`，体检照常自己查。
 /// 这里读不出工作副本时也返回 `None`：错误留给体检在原来的位置报。
-pub(crate) fn prefetch_excluded_nodes(repo_root: &str, whitelist: &[String]) -> Option<ScanAhead> {
+pub(crate) fn prefetch_excluded_nodes(
+    repo_root: &str,
+    whitelist: &[String],
+) -> Option<ExcludedAhead> {
     // 先看在不在范围里：不在的话下面的枚举没有缓存可用，会白跑一次 `svn info` 和一遍全量扫描
     // （初始化、重建、更新的录制都不在范围里）
     if !in_scan_cache() {
         return None;
     }
     let units = crate::engine::svn_wc::enumerate_wcs(repo_root, whitelist).ok()?;
-    prefetch_scan(repo_root, EXCLUDED_SCAN, &excluded_scan_targets(&units))
+    let probe = crate::engine::svn_wcdb::probe(repo_root, &units);
+    // 查得了就不起 svn：那条 `svn info -R` 用不上，提前跑只会与体检的 `svn diff` 抢锁
+    let svn = if probe.is_ok() {
+        None
+    } else {
+        prefetch_scan(repo_root, EXCLUDED_SCAN, &excluded_scan_targets(&units))
+    };
+    Some(ExcludedAhead { probe, svn })
+}
+
+/// [`prefetch_excluded_nodes`] 准备好的被排除节点。
+pub(crate) struct ExcludedAhead {
+    probe: crate::engine::svn_wcdb::Probe,
+    svn: Option<ScanAhead>,
+}
+
+impl ExcludedAhead {
+    /// 交给当前线程上随后的体检。返回的守卫要活到体检结束；drop 时没被取走的作废。
+    /// 后台有 `svn info -R` 时等它跑完、记进扫描缓存。
+    pub(crate) fn adopt(self) -> crate::engine::svn_wcdb::Adopted {
+        if let Some(svn) = self.svn {
+            svn.adopt();
+        }
+        self.probe.adopt()
+    }
+}
+
+/// 跟进录制里，磁盘一录完就把体检的 floor `svn diff` 放到后台跑（`svn_cli::run_ahead`），让它与
+/// blob 缓存、改写、纳入集合核对、写树并行（日志 `2026-11-14-follow-overlap-decisions.md` T1）。
+/// 体检开始前调用方 `adopt` 一下，[`check_grouped`] 发**参数逐字相同**的命令时直接拿到结果。
+///
+/// `files` 是对体检那份文件清单的预测（调用方按候选索引与改写计划算）。映射、单元都按体检里
+/// 同样的函数算；floor 组的命令只取决于单元、floor 与映射是不是单值，与要剔除的 PATH、被排除的
+/// 节点无关，所以只预跑 floor 组（[`DiffScope::Floor`] 且不是被排除节点那几条）。预测错了只是
+/// 参数对不上、体检照常自己跑一遍，结论不受影响。
+///
+/// # 为什么挪到这里是安全的
+///
+/// - **仍在 `git add` 之后**。体检比的是磁盘与服务器，它能拦住「状态扫描之后、`git add` 读到之前
+///   被改过的文件」靠的是它读磁盘排在 `git add` 之后；起跑点就是 `git add` 结束，这个先后不变。
+/// - **从起跑到原来的位置之间，本进程不改变它的输入**：blob 缓存（读）、改写（只写候选索引）、
+///   纳入集合核对（读）、写树（写对象库），都不碰工作副本、不发 SVN 写命令。期间外部的改动，
+///   原来起跑之后发生的同样看不到，由发布前的锁内复核与下一次检测兜住，与原来相同。
+/// - 失败（断网、超时）原样交给体检，与它自己跑失败是同一个结论（`NotChecked`），不重跑一遍再等
+///   一轮超时。
+///
+/// 读不出单元、算不出映射、排不出命令时返回 `None`：错误留给体检在原来的位置报。
+///
+/// # 已知代价
+///
+/// 预跑起在改写之前。之后任何一步本地出错，返回前要等这条 diff 跑完（`RunAhead` 的 drop），
+/// 改动前那些路径根本不发 diff：在线时多等约一秒，离线时多等一轮网络超时。
+pub(crate) fn prefetch_floor_diffs(
+    repo_root: &str,
+    svn_url: &str,
+    scope: &WScope,
+    repos_root: &str,
+    uuid: &str,
+    files: &BTreeSet<String>,
+    nodes: &[NodeStatus],
+) -> Option<RunAhead> {
+    // 体检在发任何 diff 之前先过这三道（[`check_grouped`]），过不了就不问服务器。预跑照做，
+    // 免得每次都白问一次（独立 review 第 6 条）。两次 `svn info` 在跟进的扫描缓存范围里，体检
+    // 随后再问时命中缓存，不多起进程
+    let base = svn_url.trim_end_matches('/');
+    let roots = scope.roots();
+    if roots.is_empty()
+        || !matches!(url_mismatch(repo_root, base), Ok(None))
+        || !matches!(whitelist_not_under_base(repo_root, base, roots), Ok(None))
+    {
+        return None;
+    }
+    let map =
+        crate::engine::svn_nodes::compute_map(repos_root, uuid, files, nodes, BTreeMap::new())
+            .ok()?;
+    let units = crate::engine::svn_wc::enumerate_wcs(repo_root, scope.whitelist()).ok()?;
+    let none = BTreeSet::new();
+    let plan = plan_diffs_for(&units, &map, &none, &none, base).ok()?;
+    let commands: Vec<Vec<String>> = plan
+        .commands
+        .into_iter()
+        .filter(|c| c.scope == DiffScope::Floor)
+        .map(|c| c.args)
+        .collect();
+    run_ahead(repo_root, commands)
 }
 
 /// 点不了名的被排除节点 `p` 在 floor 上有哪些文件（仓库相对路径），D8。

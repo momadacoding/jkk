@@ -432,6 +432,55 @@ export function auditIsDue(now: number, lastAt: number, inFlight: boolean): bool
 }
 
 /**
+ * 后台重跑的兜底上限（毫秒）：现场一直没变也隔这么久跑一次，防着文件监听漏了事件
+ * （目录监听的缓冲区溢出时会丢）。
+ */
+export const SVN_AUDIT_MAX_AGE_MS = 60 * 60_000
+
+/** 上一次服务器侧核对**开始**那一刻的现场，以及它有没有得出结论。 */
+export interface AuditMark {
+  at: number
+  /** 那一刻的 `repo-changed` 计数（`repoStore` 的 `auditEpoch`）。 */
+  epoch: number
+  /** 那一刻读到的 wc.db 戳；读不到时为 `null`。 */
+  stamps: WcDbStamp[] | null
+  /** 得出了结论（`matched` / `missing`）。没验成、抛错、还没回来时为 `false`。 */
+  conclusive: boolean
+}
+
+/**
+ * 后台（定时器、窗口焦点）这一次该不该真的去核对（2026-11-11 提交慢报告第 7 节）。
+ *
+ * # 为什么现场没变就可以不跑
+ *
+ * 结论只取决于基线（floor 与墓碑）、floor 上的服务器清单、工作副本状态和磁盘上的白名单文件。
+ * 服务器清单按 revision 列，revision 不可变；基线动了、磁盘上的文件变了都会发 `repo-changed`；
+ * 工作副本的变化（update、commit、`--set-depth`）都写 wc.db。所以「上次核对之后 wc.db 戳没变、
+ * 没来过 `repo-changed`、上次得出了结论」时重跑一定得出同一个结论。原来空闲时每 5 分钟照跑，
+ * 公司机器上每轮约 18 秒的 svn 进程，其中 `svn ls -R` 要访问服务器。
+ *
+ * 比的是核对**开始**那一刻的现场：核对期间变了的，下一次照跑（同 `recordAfterSuccess` 的规矩）。
+ * 读不出戳、上次没得出结论、离上次超过 `SVN_AUDIT_MAX_AGE_MS` 时照跑。
+ *
+ * 不看时间闸与在跑：调用方先用 `auditIsDue` 过那两道（它不用读戳，便宜），过了才读戳来问这里。
+ *
+ * 没有覆盖到的输入：全局 `core.excludesFile` 改了（白名单的过滤跟着变）不发 `repo-changed`、不写
+ * wc.db，要等 `SVN_AUDIT_MAX_AGE_MS`。监听出错（`watch-error`）由 store 当成现场变了处理。
+ */
+export function idleAuditIsDue(
+  now: number,
+  last: AuditMark | null,
+  epoch: number,
+  stamps: WcDbStamp[] | null,
+): boolean {
+  if (!last || !last.conclusive) return true
+  if (now - last.at >= SVN_AUDIT_MAX_AGE_MS) return true
+  if (epoch !== last.epoch) return true
+  if (!stamps || !last.stamps) return true
+  return wcDbStampsChanged(last.stamps, stamps)
+}
+
+/**
  * 一个观测值的「上次观测值」。现在只有 HEAD 用它（`repoStore` 的 `lastCheckedHead`）；第一档的
  * rootRevs 已退出（计划 2026-11-08 Task 1）。
  *

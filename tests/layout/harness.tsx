@@ -154,6 +154,8 @@ function Follow() {
     pinnedRef: null,
     evidence: 'heuristic',
     evidenceCutoffMs: null,
+    // 页脚多一行「跟进用时」：超长场景里它也得在
+    elapsedMs: 70_400,
   }
   return (
     <OpenOnMount

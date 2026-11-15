@@ -186,6 +186,18 @@ describe('describeFollowReport 的判定依据（C1h）', () => {
   })
 })
 
+describe('describeFollowReport 的用时（2026-11-11 使用报告 10.5）', () => {
+  it('流程补了用时就写出来，口径同初始化报告（不到一分钟带一位小数）', () => {
+    expect(describeFollowReport({ ...report, elapsedMs: 12_340 }).elapsed).toBe('跟进用时 12.3 秒')
+    expect(describeFollowReport({ ...report, elapsedMs: 70_400 }).elapsed).toBe('跟进用时 1 分 10 秒')
+    expect(describeFollowReport({ ...report, elapsedMs: 0 }).elapsed).toBe('跟进用时 0.0 秒')
+  })
+
+  it('没有用时（崩溃后续上的、旧流程）就不写', () => {
+    expect(describeFollowReport(report).elapsed).toBeNull()
+  })
+})
+
 const leak: Leak = {
   branch: 'work',
   commit: 'l'.repeat(40),

@@ -156,10 +156,62 @@ fn ensure_supported_git_with(
 /// 走 [`hidden_command`] 是为了不在装机版上闪出 console 黑框，理由见该函数。
 pub fn git_command(path: &str) -> Result<Command> {
     ensure_supported_git()?;
-    let mut cmd = hidden_command("git");
+    let mut cmd = new_git_process();
     cmd.current_dir(path);
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     Ok(cmd)
+}
+
+/// 直接起的 git（见 `engine::git_program`），进程内只解析一次。`None`：照旧起 PATH 上的 `git`。
+#[cfg(windows)]
+static DIRECT_GIT: OnceLock<Option<crate::engine::git_program::Direct>> = OnceLock::new();
+
+/// 一个还没设工作目录与参数的 git 进程。认得出 Git for Windows 的 `cmd\git.exe` 启动器时直接起
+/// 真正的 `git.exe`，并照启动器的样子设好 PATH 与 `MSYSTEM`（子进程看到的环境与原来逐行相同，
+/// 论证与实测见 `engine::git_program`）；否则照旧起 `git`。
+fn new_git_process() -> Command {
+    #[cfg(windows)]
+    if std::env::var_os("MSYSTEM").is_none() {
+        if let Some(d) = DIRECT_GIT.get_or_init(resolve_direct_git).as_ref() {
+            use crate::engine::git_program::{launcher_home, launcher_path};
+            let mut cmd = hidden_command(&d.exe);
+            let home = launcher_home(|k| std::env::var_os(k), std::path::Path::exists);
+            let parent = std::env::var_os("PATH");
+            cmd.env("PATH", launcher_path(d, home.as_deref(), parent.as_deref()));
+            cmd.env("MSYSTEM", &d.msystem);
+            // 启动器也把算出来的 HOME 交给子进程。不交的话 git 自己再按同样的顺序算一遍：结果相同，
+            // 但 HOMEPATH 是掉线的漫游共享时，要多一次卡住的 stat（独立 review 第 7 条）
+            if let Some(h) = &home {
+                cmd.env("HOME", h);
+            }
+            return cmd;
+        }
+    }
+    hidden_command("git")
+}
+
+/// 经过启动器问一次 `git --exec-path`，判断能不能直接起。任何一步不成都是 `None`。
+#[cfg(windows)]
+fn resolve_direct_git() -> Option<crate::engine::git_program::Direct> {
+    let out = proc::output(
+        hidden_command("git")
+            .arg("--exec-path")
+            .env("GIT_TERMINAL_PROMPT", "0"),
+    )
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let exec_path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let path = std::env::var_os("PATH")?;
+    let direct = crate::engine::git_program::plan_direct(
+        &path,
+        &exec_path,
+        std::path::Path::is_file,
+        std::path::Path::is_dir,
+    );
+    log::info!("git 子进程：{direct:?}（None = 照旧经 PATH 上的 git 起）");
+    direct
 }
 
 /// 执行一条 git 命令，成功返回 stdout，失败把 stderr 包成 GitError。

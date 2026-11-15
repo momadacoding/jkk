@@ -40,6 +40,7 @@ import {
   type SyncInOutcome,
 } from '../engine/svnSyncIn'
 import type { SyncState, SyncStateUnreadable } from '../engine/svnJournal'
+import { perfMark, perfSpan } from '../store/perf'
 import type { ConfirmRequest } from './ConfirmDialog'
 
 export interface SvnSyncFlowDeps {
@@ -60,14 +61,26 @@ export interface SvnSyncFlowDeps {
   clearError: () => void
   reportError: (err: unknown) => void
   refreshSvnSyncState: (path: string) => Promise<void>
+  /**
+   * 同步之后的强制复查。流程在命令返回的同一拍里调它，不先等别的刷新：store 靠这一点与后端补发的
+   * `repo-changed` 共用一轮（`repoStore` 的 `refreshSvnSync`）。
+   */
   refreshSvnSync: (path: string) => Promise<void>
   fetchSvnLog: (path: string) => Promise<unknown>
-  /** 跟进执行中。横幅上的按钮据此禁用：跟进要走服务器体检，这几秒里没有框挡着。 */
+  /**
+   * 跟进执行中，含跟进之后的刷新。横幅上的按钮据此禁用：跟进要走服务器体检，这几秒里没有框挡着；
+   * 刷新写回之前横幅说的还是跟进前的事，那时点「跟进」只会白跑一次。
+   */
   setFollowing: (busy: boolean) => void
   /** 跟进之后刷新 HEAD、提交图、本地改动与落后基线的分支。可以抛，流程接住。 */
   refreshAfterFollow: () => Promise<void>
-  /** 弹跟进报告，关掉时结束。 */
-  showFollowReport: (report: FollowReport) => Promise<void>
+  /**
+   * 弹跟进报告，关掉时结束。报告里带着这次命令的用时（`FollowReport.elapsedMs`）。
+   *
+   * `refreshed` 给了，说明报告是抢在跟进之后的刷新前面弹的：报告里会写工作区的动作（放回 Local-Only
+   * 补丁）要等它落定再做。它不会 reject。
+   */
+  showFollowReport: (report: FollowReport, refreshed?: Promise<void>) => Promise<void>
   /** 切分支并刷新。失败要抛：「切换并手动跟进」据此停下。 */
   checkoutBranch: (name: string) => Promise<void>
   /**
@@ -129,26 +142,34 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
    * 刷新失败只进错误条。
    */
   const afterSync = async () => {
-    try {
-      await d.refreshSvnSyncState(d.repoPath)
-      await d.refreshSvnSync(d.repoPath)
-    } catch (err) {
-      d.reportError(err)
-    }
+    // 两项同时发、各报各的错。复查必须在命令返回的这一拍里进去（见 `SvnSyncFlowDeps.refreshSvnSync`），
+    // 排在读同步状态后面的话多半要白扫一遍 `svn status`；同步状态读不出来也不该让复查不跑
+    const results = await Promise.allSettled([
+      d.refreshSvnSyncState(d.repoPath),
+      d.refreshSvnSync(d.repoPath),
+    ])
+    for (const r of results) if (r.status === 'rejected') d.reportError(r.reason)
     void d.fetchSvnLog(d.repoPath)
   }
 
   /**
-   * 跟进之后多刷一份。`repo-changed` 也会补发，这里不靠它：报告弹出来时界面要已经是新的。
+   * 跟进之后多刷一份：HEAD、提交图、本地改动，加上 SVN 侧的状态。`repo-changed` 也会补发，这里不靠它。
    * 同样不抛，跟进已经落地了。
+   *
+   * 几项同时发（2026-11-11 使用报告 10.5）：原来一项等一项，公司机器上报告要等它们加起来那么久。
+   * 它们写的是 state 里互不相干的字段，后端补发的 `repo-changed` 本来也是同时发的。
    */
-  const afterFollow = async () => {
-    try {
-      await d.refreshAfterFollow()
-    } catch (err) {
-      d.reportError(err)
-    }
-    await afterSync()
+  const afterFollow = () =>
+    perfSpan('follow.refresh', async () => {
+      const [git] = await Promise.allSettled([d.refreshAfterFollow(), afterSync()])
+      if (git.status === 'rejected') d.reportError(git.reason)
+    })
+
+  /** 计一次跟进命令的用时，补进报告（`FollowReport.elapsedMs`）。只量命令本身，不含之后的刷新。 */
+  const timed = async <T>(run: () => Promise<T>): Promise<{ value: T; ms: number }> => {
+    const t0 = performance.now()
+    const value = await run()
+    return { value, ms: performance.now() - t0 }
   }
 
   /** 冲突、撞名、放弃这几种结局要让用户看见；成功不打扰。`notice` 让它只有一个按钮。 */
@@ -273,23 +294,50 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
   /**
    * 横幅上的「跟进」（分析 §6.5）。不写工作区，所以不要确认框；重放走 merge-tree，要过
    * merge driver 确认。跑的时候没有框挡着，靠 `setFollowing` 让按钮有反应。
+   *
+   * # 完成时报告先弹，不等刷新（2026-11-11 使用报告 10.5）
+   *
+   * 原来等刷新完才弹，为的是报告弹出来时界面已经是新的。但报告是模态框，挡着后面的界面；那几项刷新
+   * 加一遍 `svn status` 在公司机器上是好几秒，用户盯着的是「跟进中」的按钮。现在命令一返回就弹，
+   * 刷新在框后面跑。
+   *
+   * 流程要等**报告关掉和刷新完成两件事都结束**才算走完：`running` 提前放开的话，刷新写回 HEAD 的那一刻
+   * 判定还是跟进前的 ExternallyAdvanced，自动跟进会按这个过时的现场再发起一次（`RepoTab` 的 effect）。
+   * 按钮在刷新完成时复位，不等报告。
+   *
+   * 拒绝、冲突这些结局不改：照旧刷新完再弹。冲突的下一步是手动跟进（会写磁盘），它的确认框弹出时
+   * 不该还有一轮检测在后台读工作副本。
    */
   const follow = async () => {
     d.clearError()
     if (!(await d.guardMerge())) return
     d.clearAutoFollowed()
     d.setFollowing(true)
-    let outcome: FollowOutcome
+    // 用盒子的理由同 `svnUpdate`
+    const box: { outcome: FollowOutcome | null; reportClosed: Promise<void> | null } = {
+      outcome: null,
+      reportClosed: null,
+    }
     try {
-      outcome = await svnFollow(d.repoPath)
-      await afterFollow()
+      await perfSpan('follow', async () => {
+        const run = await timed(() => svnFollow(d.repoPath))
+        box.outcome = run.value
+        // 先发刷新再弹报告，中间不 await：复查要赶在命令返回的这一拍里进去
+        const refreshed = afterFollow()
+        if (run.value.kind === 'done') {
+          perfMark('follow.report')
+          box.reportClosed = d.showFollowReport({ ...run.value.report, elapsedMs: run.ms }, refreshed)
+        }
+        await refreshed
+      })
     } catch (err) {
       d.reportError(err)
       return
     } finally {
       d.setFollowing(false)
     }
-    await settleFollow(outcome)
+    if (box.reportClosed) await box.reportClosed
+    else if (box.outcome) await settleFollow(box.outcome)
   }
 
   /**
@@ -317,14 +365,19 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
     d.setFollowing(true)
     let outcome: AutoFollowOutcome
     try {
-      outcome = await svnFollowAuto(d.repoPath)
-      // 暂时性的原因（外部 git 刚好拿着索引锁、另一次同步刚好在跑）：同一个现场只试一次，不重试的话
-      // 就再也不自动了（review 中-1）。等一下再试一次，还不行才写进横幅
-      if (outcome.kind === 'skipped' && TRANSIENT_SKIPS.has(outcome.code)) {
-        await d.wait(TRANSIENT_RETRY_MS)
-        outcome = await svnFollowAuto(d.repoPath)
-      }
-      if (outcome.kind === 'done') await afterFollow()
+      outcome = await perfSpan('autoFollow', async () => {
+        let run = await timed(() => svnFollowAuto(d.repoPath))
+        // 暂时性的原因（外部 git 刚好拿着索引锁、另一次同步刚好在跑）：同一个现场只试一次，不重试的话
+        // 就再也不自动了（review 中-1）。等一下再试一次，还不行才写进横幅
+        if (run.value.kind === 'skipped' && TRANSIENT_SKIPS.has(run.value.code)) {
+          await d.wait(TRANSIENT_RETRY_MS)
+          run = await timed(() => svnFollowAuto(d.repoPath))
+        }
+        if (run.value.kind !== 'done') return run.value
+        // 提示照旧等刷新完再挂：它不挡操作，早挂出来反而会和还没撤的「有新内容」横幅叠在一起
+        await afterFollow()
+        return { ...run.value, report: { ...run.value.report, elapsedMs: run.ms } }
+      })
     } catch (err) {
       d.reportError(err)
       return false
@@ -346,6 +399,7 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
     } else {
       d.setAutoFollowSkip(null)
     }
+    perfMark('autoFollow.done')
     d.showAutoFollowed(outcome.report)
     return true
   }

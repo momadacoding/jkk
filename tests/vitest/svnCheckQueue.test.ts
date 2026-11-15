@@ -121,3 +121,91 @@ describe('createSvnCheckQueue（计划 2026-11-08 Task 2）', () => {
     expect(c.runs.map((r) => r.force)).toEqual([false, false])
   })
 })
+
+describe('复用取号之后才开跑的强制一轮（2026-11-14 跟进耗时）', () => {
+  it('取号之后开跑的强制一轮：带着号来的请求直接复用它，不再补跑', async () => {
+    const q = createSvnCheckQueue()
+    const c = controlled()
+    const since = q.mark()
+    const theirs = q.request('C:/r', true, c.run)
+    const ours = q.request('C:/r', true, c.run, since)
+
+    c.runs[0].finish('applied')
+    expect(await theirs).toBe('applied')
+    expect(await ours).toBe('applied')
+    await flush()
+    expect(c.runs).toHaveLength(1)
+  })
+
+  it('取号之前就在跑的一轮不复用：它可能开跑在调用方的写操作之前，照旧补跑', async () => {
+    const q = createSvnCheckQueue()
+    const c = controlled()
+    void q.request('C:/r', true, c.run)
+    const since = q.mark()
+    const ours = q.request('C:/r', true, c.run, since)
+
+    c.runs[0].finish('applied')
+    await flush()
+    expect(c.runs.map((r) => r.force)).toEqual([true, true])
+    c.runs[1].finish('applied')
+    expect(await ours).toBe('applied')
+  })
+
+  it('取号之后开跑的是比戳的一轮：戳没变它就不跑第二档，不能顶替强制请求', async () => {
+    const q = createSvnCheckQueue()
+    const c = controlled()
+    const since = q.mark()
+    void q.request('C:/r', false, c.run)
+    const ours = q.request('C:/r', true, c.run, since)
+
+    c.runs[0].finish('skipped')
+    await flush()
+    expect(c.runs.map((r) => r.force)).toEqual([false, true])
+    c.runs[1].finish('applied')
+    expect(await ours).toBe('applied')
+  })
+
+  it('补跑那一轮也算：它开跑在取号之后，之后带同一个号再来的请求复用它', async () => {
+    const q = createSvnCheckQueue()
+    const c = controlled()
+    void q.request('C:/r', false, c.run)
+    const since = q.mark()
+    void q.request('C:/r', true, c.run)
+    c.runs[0].finish('skipped')
+    await flush()
+    expect(c.runs).toHaveLength(2)
+
+    const ours = q.request('C:/r', true, c.run, since)
+    c.runs[1].finish('applied')
+    expect(await ours).toBe('applied')
+    await flush()
+    expect(c.runs).toHaveLength(2)
+  })
+
+  it('别的路径上在跑的一轮不算', () => {
+    const q = createSvnCheckQueue()
+    const c = controlled()
+    const since = q.mark()
+    void q.request('C:/a', true, c.run)
+    void q.request('C:/b', true, c.run, since)
+    expect(c.runs).toHaveLength(2)
+  })
+
+  it('被复用的那一轮抛错：复用它的调用方拿到同一个错，这一轮收尾后可以再请求', async () => {
+    const q = createSvnCheckQueue()
+    const c = controlled()
+    const since = q.mark()
+    const theirs = q.request('C:/r', true, c.run)
+    const ours = q.request('C:/r', true, c.run, since)
+
+    c.runs[0].fail(new Error('wc locked'))
+    await expect(theirs).rejects.toThrow('wc locked')
+    await expect(ours).rejects.toThrow('wc locked')
+    await flush()
+    // 收尾之后不再有「在跑的一轮」可复用：带着旧号来也要新开一轮
+    const again = q.request('C:/r', true, c.run, since)
+    expect(c.runs).toHaveLength(2)
+    c.runs[1].finish('applied')
+    expect(await again).toBe('applied')
+  })
+})

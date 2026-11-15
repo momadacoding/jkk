@@ -33,6 +33,12 @@ git2 = "0.20"
 notify = "7"
 tauri-plugin-dialog = "2.7.2"
 
+# 只读查询 svn 工作副本的 wc.db（找被 `--set-depth=exclude` 掉的节点），代替跟进体检里那条
+# `svn info -R`：后者在 2 万文件的 fixture 上要 0.75–1.9 s，还与体检的 `svn diff` 抢 wc.db 的锁。
+# 只认格式号 31，其余退回 svn（engine::svn_wcdb）。`bundled`：Windows 上没有可以链接、版本
+# 可控的系统 SQLite，随包编译一份；不开默认 feature（语句缓存、wasm 后端都用不上）。
+rusqlite = { version = "0.43", default-features = false, features = ["bundled"] }
+
 # 系统级快捷键呼出主界面。只在 Rust 侧注册，不引入对应的 npm 包、不开 JS 权限
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-global-shortcut = "2.3.2"

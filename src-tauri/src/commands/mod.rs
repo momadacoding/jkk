@@ -1,4 +1,5 @@
 pub mod app_settings;
+pub mod attention;
 pub mod conflict;
 pub mod custom;
 pub mod diff;

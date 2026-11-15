@@ -50,7 +50,21 @@ const syncStatus: SyncStatus = {
   headBehindBase: false,
 }
 
+/** `refreshSvnSync` 先现读 HEAD 再校验（2026-11-14）：这是它读到的那一份。 */
+const HEAD_A = { path: 'C:/a', head: 'main', headHash: 'h', headParents: [] }
+
 describe('SVN 刷新：请求在飞时切到了别的仓库', () => {
+  it('refreshSvnSync：读 HEAD 的那一拍里切走了，不为旧仓库发校验，旧仓库的 HEAD 也不写进新仓库', async () => {
+    const { result } = renderHook(() => useRepoStore())
+    await openAt(result, 'C:/a')
+    act(() => { void result.current.refreshSvnSync('C:/a') })
+    await openAt(result, 'C:/b')
+    await answer('open_repo', 'C:/a', { ...HEAD_A, head: 'feature-of-a', headHash: 'x' })
+    expect(result.current.state.head).toBe('main')
+    expect(result.current.state.headHash).toBe('h')
+    expect(pending.some((p) => p.cmd === 'svn_wc_db_stamps' || p.cmd === 'svn_sync_status')).toBe(false)
+  })
+
   it('fetchSvnLog：旧仓库晚到的 SVN 历史不接进新仓库的图', async () => {
     const { result } = renderHook(() => useRepoStore())
     await openAt(result, 'C:/a')
@@ -74,6 +88,7 @@ describe('SVN 刷新：请求在飞时切到了别的仓库', () => {
     const { result } = renderHook(() => useRepoStore())
     await openAt(result, 'C:/a')
     act(() => { void result.current.refreshSvnSync('C:/a') })
+    await answer('open_repo', 'C:/a', HEAD_A)
     await answer('svn_wc_db_stamps', 'C:/a', [{ wcRoot: 'C:/a', mtimeNs: '7', size: 1 }])
     await openAt(result, 'C:/b')
     await answer('svn_sync_status', 'C:/a', syncStatus)
@@ -85,6 +100,7 @@ describe('SVN 刷新：请求在飞时切到了别的仓库', () => {
     const { result } = renderHook(() => useRepoStore())
     await openAt(result, 'C:/a')
     act(() => { void result.current.refreshSvnSync('C:/a') })
+    await answer('open_repo', 'C:/a', HEAD_A)
     await answer('svn_wc_db_stamps', 'C:/a', [{ wcRoot: 'C:/a', mtimeNs: '7', size: 1 }])
     await openAt(result, 'C:/b')
     await answer('svn_sync_status', 'C:/a', syncStatus)
@@ -98,6 +114,7 @@ describe('SVN 刷新：请求在飞时切到了别的仓库', () => {
     const { result } = renderHook(() => useRepoStore())
     await openAt(result, 'C:/a')
     act(() => { void result.current.refreshSvnSync('C:/a') })
+    await answer('open_repo', 'C:/a', HEAD_A)
     await answer('svn_wc_db_stamps', 'C:/a', [{ wcRoot: 'C:/a', mtimeNs: '7', size: 1 }])
     await answer('svn_sync_status', 'C:/a', syncStatus)
     act(() => { void result.current.markSvnFollowOnBlur('C:/a') })
@@ -114,6 +131,7 @@ describe('SVN 刷新：请求在飞时切到了别的仓库', () => {
     expect(result.current.state.svnRevs.map((r) => r.rev)).toEqual([7])
 
     act(() => { void result.current.refreshSvnSync('C:/a') })
+    await answer('open_repo', 'C:/a', HEAD_A)
     await answer('svn_wc_db_stamps', 'C:/a', [{ wcRoot: 'C:/a', mtimeNs: '7', size: 1 }])
     await answer('svn_sync_status', 'C:/a', syncStatus)
     expect(result.current.state.svnSync).toEqual(syncStatus)

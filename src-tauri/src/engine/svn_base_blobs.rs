@@ -37,6 +37,7 @@ use crate::engine::svn_xml::{parse_info_base_keys, BaseKey};
 use crate::error::{GitError, Result};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// 缓存文件名，放在 `.git/` 下。
 pub const CACHE_FILE: &str = "mygitclient-base-blobs.json";
@@ -179,12 +180,71 @@ impl BaseBlobs {
             );
         }
     }
+
+    /// 同 [`BaseBlobs::save`]，放到后台线程里做，让调用方接着往下走（日志
+    /// `2026-11-14-follow-overlap-decisions.md` T2）。返回的 [`Saving`] drop 时等它写完。
+    ///
+    /// 这一步只写缓存文件，不影响录出的内容：录制的后续步骤（写索引、核对、写树、体检）不读它。
+    /// 写前复核（[`BaseBlobs::save`] 里绕过扫描缓存的那次重读）仍然排在全部 `svn cat` 之后，判据
+    /// 不变；挪晚了只会让「前后输入不同、这条不存」的判定更严，不会更松。新线程本来就不在扫描
+    /// 缓存范围里，复核读到的就是最新的。
+    pub fn save_in_background(self, repo_root: &str, used: Vec<(String, String)>) -> Saving {
+        // 活放在一个共享的格子里：线程起不来时闭包连同 `self` 一起被丢掉，格子里的还能拿回来，
+        // 退回改动前的同步写（独立 review 第 8 条）
+        type Job = (BaseBlobs, String, Vec<(String, String)>);
+        let job: Arc<Mutex<Option<Job>>> =
+            Arc::new(Mutex::new(Some((self, repo_root.to_string(), used))));
+        let run = |job: &Mutex<Option<Job>>| {
+            let taken = job.lock().unwrap_or_else(PoisonError::into_inner).take();
+            if let Some((blobs, root, used)) = taken {
+                let used: Vec<(&str, &str)> =
+                    used.iter().map(|(p, o)| (p.as_str(), o.as_str())).collect();
+                blobs.save(&root, &used);
+            }
+        };
+        let shared = Arc::clone(&job);
+        let handle = std::thread::Builder::new()
+            .name("svn-base-blobs-save".to_string())
+            .spawn(move || run(&shared));
+        match handle {
+            Ok(h) => Saving(Some(h)),
+            Err(e) => {
+                log::warn!("起不了写 blob 缓存的线程，改为当场写：{e}");
+                run(&job);
+                Saving(None)
+            }
+        }
+    }
+}
+
+/// [`BaseBlobs::save_in_background`] 在跑的那次写入。drop 时等它写完：录制返回之前缓存文件
+/// 就落了盘，不留一个还在读工作副本的 svn 进程（测试的临时目录这时可能正要删）。
+pub struct Saving(Option<std::thread::JoinHandle<()>>);
+
+impl Drop for Saving {
+    fn drop(&mut self) {
+        if let Some(h) = self.0.take() {
+            if h.join().is_err() {
+                log::warn!("写 blob 缓存的线程 panic 了，这次没写成");
+            }
+        }
+    }
 }
 
 /// 每个路径的输入。说不清的路径（[`parse_info_base_keys`] 给 `None` 的）不在结果里。
+///
+/// `svn info` 与 `git check-attr` 互不依赖，同时跑（日志 `2026-11-14-follow-overlap-decisions.md`
+/// T2）。`svn info` 留在调用线程上：在扫描缓存范围里时它照旧走缓存（`bypass_scan_cache` 也只对
+/// 调用线程起作用）；`check-attr` 不缓存，放到哪个线程都一样。报错的先后与串行时相同：键先报。
 fn read_inputs(repo_root: &str, paths: &[&str]) -> Result<BTreeMap<String, Inputs>> {
-    let keys = read_keys(repo_root, paths)?;
-    let mut attrs = read_attrs(repo_root, paths)?;
+    let (keys, attrs) = std::thread::scope(|s| {
+        let attrs = s.spawn(|| read_attrs(repo_root, paths));
+        let keys = read_keys(repo_root, paths);
+        (keys, attrs.join())
+    });
+    let keys = keys?;
+    let mut attrs =
+        attrs.map_err(|_| GitError::new("svn_base_blobs", "读 git 过滤属性的线程异常退出了"))??;
     Ok(keys
         .into_iter()
         .filter_map(|(path, key)| {

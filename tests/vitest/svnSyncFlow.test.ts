@@ -157,6 +157,27 @@ describe('handleAutoFollow（事故分析 6.12）', () => {
     ])
   })
 
+  it('完成的提示带上这次命令的用时；重试过的话只算成功的那一次', async () => {
+    const shown: { elapsedMs?: number }[] = []
+    vi.mocked(store.svnFollowAuto)
+      .mockResolvedValueOnce({ kind: 'skipped', code: 'svn_index_busy', message: '索引被占' })
+      .mockResolvedValueOnce({ kind: 'done', report })
+    const log: string[] = []
+    const d = {
+      ...deps(log),
+      showAutoFollowed: (r: { elapsedMs?: number }) => {
+        shown.push(r)
+      },
+    }
+
+    createSvnSyncFlow(d).handleAutoFollow('k1')
+    await settled(log)
+    await vi.waitFor(() => expect(shown).toHaveLength(1))
+
+    expect(shown[0]).toMatchObject(report)
+    expect(shown[0].elapsedMs).toBeGreaterThanOrEqual(0)
+  })
+
   it('不自动：原因按现场记给横幅，什么都不刷新、不挂提示', async () => {
     const log: string[] = []
     vi.mocked(store.svnFollowAuto).mockResolvedValue({
@@ -665,7 +686,7 @@ describe('新的一次跟进开始时清掉旧的「已自动跟进」提示（E
 })
 
 describe('handleFollow', () => {
-  it('banner follow button invokes svnFollow：执行中按钮禁用，完成后刷新再弹报告', async () => {
+  it('banner follow button invokes svnFollow：执行中按钮禁用，命令一返回就发刷新、弹报告，刷新完按钮复位', async () => {
     const log: string[] = []
     vi.mocked(store.svnFollow).mockImplementation(async () => {
       log.push('svnFollow')
@@ -680,25 +701,90 @@ describe('handleFollow', () => {
       'guardMerge',
       'following:true',
       'svnFollow',
+      // 三项刷新在命令返回的同一拍里发出去，不互相等（`refreshSvnSync` 要求调用方这么做）
       'refreshAfterFollow',
       'refreshSvnSyncState',
       'refreshSvnSync',
+      'showFollowReport',
       'fetchSvnLog',
       'following:false',
-      'showFollowReport',
     ])
   })
 
-  it('报告拿到的是后端给的那一份', async () => {
+  it('报告不等刷新（2026-11-11 使用报告 10.5）：刷新还在跑，报告已经弹出来；刷新完按钮才复位', async () => {
+    const log: string[] = []
+    const d = deps(log)
+    let refreshed!: () => void
+    d.refreshSvnSync = () =>
+      new Promise<void>((r) => {
+        refreshed = r
+      })
     vi.mocked(store.svnFollow).mockResolvedValue({ kind: 'done', report })
-    const shown: unknown[] = []
+
+    const flow = createSvnSyncFlow(d).handleFollow()
+    await vi.waitFor(() => expect(log).toContain('showFollowReport'))
+    expect(log).not.toContain('following:false')
+
+    refreshed()
+    await flow
+    expect(log.at(-1)).toBe('following:false')
+  })
+
+  it('报告关掉了、刷新还没完：流程不算走完，自动跟进不会按还没刷新的旧结论发起', async () => {
+    const log: string[] = []
+    const d = deps(log)
+    let refreshed!: () => void
+    d.refreshSvnSync = () =>
+      new Promise<void>((r) => {
+        refreshed = r
+      })
+    vi.mocked(store.svnFollow).mockResolvedValue({ kind: 'done', report })
+
+    const flow = createSvnSyncFlow(d).handleFollow()
+    // deps 里的报告框一弹就关
+    await vi.waitFor(() => expect(log).toContain('showFollowReport'))
+    await new Promise((r) => setTimeout(r, 0))
+    expect(createSvnSyncFlow(d).handleAutoFollow('k')).toBe(false)
+    expect(d.running.current).toBe(true)
+
+    refreshed()
+    await flow
+    expect(d.running.current).toBe(false)
+  })
+
+  it('刷新先完、报告还开着：按钮先复位，流程等报告关掉才走完', async () => {
+    const log: string[] = []
+    const d = deps(log)
+    let close!: () => void
+    d.showFollowReport = () => {
+      log.push('showFollowReport')
+      return new Promise<void>((r) => {
+        close = r
+      })
+    }
+    vi.mocked(store.svnFollow).mockResolvedValue({ kind: 'done', report })
+
+    const flow = createSvnSyncFlow(d).handleFollow()
+    await vi.waitFor(() => expect(log).toContain('following:false'))
+    expect(d.running.current).toBe(true)
+
+    close()
+    await flow
+    expect(d.running.current).toBe(false)
+  })
+
+  it('报告拿到的是后端给的那一份，另外带上这次命令的用时', async () => {
+    vi.mocked(store.svnFollow).mockResolvedValue({ kind: 'done', report })
+    const shown: { elapsedMs?: number }[] = []
     await createSvnSyncFlow({
       ...deps([]),
       showFollowReport: async (r) => {
         shown.push(r)
       },
     }).handleFollow()
-    expect(shown).toEqual([report])
+    expect(shown).toHaveLength(1)
+    expect(shown[0]).toMatchObject(report)
+    expect(shown[0].elapsedMs).toBeGreaterThanOrEqual(0)
   })
 
   it('merge driver 没确认时什么都不发，按钮也不动', async () => {
@@ -773,7 +859,72 @@ describe('handleFollow', () => {
     await createSvnSyncFlow(d).handleFollow()
 
     expect(log).toContain('reportError:load_graph_failed')
-    expect(log.at(-1)).toBe('showFollowReport')
+    expect(log).toContain('showFollowReport')
+    // 一项刷新失败不连累另外几项：SVN 侧的状态照样刷
+    expect(log).toContain('refreshSvnSync')
+    expect(log.at(-1)).toBe('following:false')
+  })
+
+  it('拒绝：照旧先刷新完再弹', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnFollow).mockResolvedValue({
+      kind: 'refused',
+      code: 'svn_follow_git_busy',
+      message: 'git 正在 rebase',
+    })
+
+    await createSvnSyncFlow(deps(log)).handleFollow()
+
+    expect(log.indexOf('following:false')).toBeLessThan(log.findIndex((l) => l.startsWith('confirm:')))
+    expect(log.indexOf('fetchSvnLog')).toBeLessThan(log.indexOf('following:false'))
+  })
+
+  it('冲突：手动跟进的确认框等刷新完才弹，它会写磁盘，弹出时不该还有一轮检测在读工作副本', async () => {
+    const log: string[] = []
+    const d = deps(log, async (r) => {
+      log.push(`confirm:${r.title}`)
+      return false
+    })
+    let refreshed!: () => void
+    d.refreshSvnSync = () =>
+      new Promise<void>((r) => {
+        refreshed = r
+      })
+    vi.mocked(store.svnFollow).mockResolvedValue(conflict)
+
+    const flow = createSvnSyncFlow(d).handleFollow()
+    await vi.waitFor(() => expect(log).toContain('refreshSvnSyncState'))
+    await new Promise((r) => setTimeout(r, 0))
+    expect(log.some((l) => l.startsWith('confirm:'))).toBe(false)
+
+    refreshed()
+    await flow
+    expect(log.indexOf('following:false')).toBeLessThan(log.findIndex((l) => l.startsWith('confirm:')))
+  })
+
+  it('报告里「放回 Local-Only 补丁」会写磁盘：流程把「刷新完成」交给报告，放回等它（独立 review 第 2 条）', async () => {
+    const log: string[] = []
+    const d = deps(log)
+    let refreshed!: () => void
+    d.refreshSvnSync = () =>
+      new Promise<void>((r) => {
+        refreshed = r
+      })
+    let settled: Promise<void> | undefined
+    d.showFollowReport = async (_report, whenRefreshed) => {
+      settled = whenRefreshed
+      whenRefreshed?.then(() => log.push('report:refreshed'))
+    }
+    vi.mocked(store.svnFollow).mockResolvedValue({ kind: 'done', report })
+
+    const flow = createSvnSyncFlow(d).handleFollow()
+    await vi.waitFor(() => expect(settled).toBeDefined())
+    await new Promise((r) => setTimeout(r, 0))
+    expect(log).not.toContain('report:refreshed')
+
+    refreshed()
+    await flow
+    expect(log).toContain('report:refreshed')
   })
 
   it('冲突：确认之后才走手动跟进，确认框上有冲突的文件，不再过一遍 merge driver', async () => {
@@ -1158,6 +1309,8 @@ describe('收尾之后的刷新失败（3a 最终 review 第 3 条在「更新�
 
     expect(log.some((l) => l.startsWith('dialogError'))).toBe(false)
     expect(log).toContain('reportError:journal_unreadable')
+    // 同步状态读不出来不该让失同步的复查也不跑：两项同时发、各报各的错
+    expect(log).toContain('refreshSvnSync')
   })
 
   it('执行本身失败：对话框里显示的仍是后端原本的错误', async () => {

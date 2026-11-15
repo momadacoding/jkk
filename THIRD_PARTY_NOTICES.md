@@ -13,7 +13,7 @@ dev-dependencies 与 build-dependencies），npm 侧为 production 依赖
 
 ## 组件清单
 
-共 253 个组件。
+共 257 个组件。
 
 | 来源 | 组件 | 版本 | 许可 |
 |---|---|---|---|
@@ -66,6 +66,8 @@ dev-dependencies 与 build-dependencies），npm 侧为 production 依赖
 | cargo | dyn-clone | 1.0.20 | MIT OR Apache-2.0 |
 | cargo | equivalent | 1.0.2 | Apache-2.0 OR MIT |
 | cargo | erased-serde | 0.4.10 | MIT OR Apache-2.0 |
+| cargo | fallible-iterator | 0.3.0 | MIT/Apache-2.0 |
+| cargo | fallible-streaming-iterator | 0.1.9 | MIT/Apache-2.0 |
 | cargo | fastrand | 2.5.0 | Apache-2.0 OR MIT |
 | cargo | fdeflate | 0.3.7 | MIT OR Apache-2.0 |
 | cargo | fern | 0.7.1 | MIT |
@@ -108,6 +110,7 @@ dev-dependencies 与 build-dependencies），npm 侧为 production 依赖
 | cargo | keyboard-types | 0.8.3 | MIT OR Apache-2.0 |
 | cargo | libc | 0.2.189 | MIT OR Apache-2.0 |
 | cargo | libgit2-sys | 0.18.7+1.9.6 | MIT OR Apache-2.0 |
+| cargo | libsqlite3-sys | 0.40.0 | MIT |
 | cargo | libssh2-sys | 0.3.2 | MIT OR Apache-2.0 |
 | cargo | libz-sys | 1.1.29 | MIT OR Apache-2.0 |
 | cargo | litemap | 0.8.2 | Unicode-3.0 |
@@ -150,6 +153,7 @@ dev-dependencies 与 build-dependencies），npm 侧为 production 依赖
 | cargo | regex-syntax | 0.8.11 | MIT OR Apache-2.0 |
 | cargo | rfd | 0.16.0 | MIT |
 | cargo | roxmltree | 0.21.1 | MIT OR Apache-2.0 |
+| cargo | rusqlite | 0.43.0 | MIT |
 | cargo | rustc-hash | 2.1.3 | Apache-2.0 OR MIT |
 | cargo | same-file | 1.0.6 | Unlicense/MIT |
 | cargo | schemars | 0.8.22 | MIT |
@@ -2801,12 +2805,14 @@ DEALINGS IN THE SOFTWARE.
 </details>
 
 <details>
-<summary>11 个组件共用此许可正文：crc32fast 1.5.0 (cargo) 等</summary>
+<summary>13 个组件共用此许可正文：crc32fast 1.5.0 (cargo) 等</summary>
 
 适用于：
 - crc32fast 1.5.0 (cargo)
 - ctor 1.0.13 (cargo)
 - dpi 0.1.2 (cargo)
+- fallible-iterator 0.3.0 (cargo)
+- fallible-streaming-iterator 0.1.9 (cargo)
 - hex 0.4.3 (cargo)
 - json-patch 4.2.0 (cargo)
 - serde_spanned 1.1.1 (cargo)
@@ -5346,6 +5352,66 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+```
+
+</details>
+
+<details>
+<summary>1 个组件共用此许可正文：fallible-iterator 0.3.0 (cargo)</summary>
+
+适用于：
+- fallible-iterator 0.3.0 (cargo)
+
+```text
+Copyright (c) 2015 The rust-openssl-verify Developers
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+</details>
+
+<details>
+<summary>1 个组件共用此许可正文：fallible-streaming-iterator 0.1.9 (cargo)</summary>
+
+适用于：
+- fallible-streaming-iterator 0.1.9 (cargo)
+
+```text
+Copyright (c) 2016 The fallible-streaming-iterator Developers
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 ```
 
 </details>
@@ -8497,6 +8563,37 @@ NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
 DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
 OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+</details>
+
+<details>
+<summary>2 个组件共用此许可正文：libsqlite3-sys 0.40.0 (cargo) 等</summary>
+
+适用于：
+- libsqlite3-sys 0.40.0 (cargo)
+- rusqlite 0.43.0 (cargo)
+
+```text
+Copyright (c) 2014 The rusqlite developers
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 ```
 
 </details>

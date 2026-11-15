@@ -38,6 +38,7 @@ import TsvnHooksDialog from './TsvnHooksDialog'
 import { toErrorMessage } from '../engine/errors'
 import type { HookHealth, TsvnHooksStatus } from '../engine/tsvnHooks'
 import { createSvnSyncFlow } from './svnSyncFlow'
+import { reportAutoFollowBlocked } from '@/store/attentionStore'
 import { createSvnSyncOutFlow } from './svnSyncOutFlow'
 import { useDeliverDialog } from './DeliverDialog'
 import { useFollowReportDialog } from './FollowReportDialog'
@@ -172,7 +173,7 @@ export function RepoTab({
   const {
     state, openRepo, refreshHead, refreshHeadInfo, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers,
     refreshDiff, refreshUpstream, refreshStashes, refreshPullRequests,
-    refreshSvnSync, refreshSvnEol, refreshSvnSyncState, refreshSvnBranchesBehind, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, noteOwnCommit, checkSvnSyncOnFocus, freshSvnSync, markSvnFollowOnBlur, fetchSvnLog, refreshSvnAudit, auditSvnIfDue,
+    refreshSvnSync, refreshSvnEol, refreshSvnSyncState, refreshSvnBranchesBehind, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, noteOwnCommit, checkSvnSyncOnFocus, freshSvnSync, markSvnFollowOnBlur, fetchSvnLog, refreshSvnAudit, auditSvnIfDue, noteRepoChanged,
     selectCommit, clearError, reportError, wantedDiffScope, refreshChanges: refreshChangesIn, afterIndexWrite,
   } = useRepoStore()
   const [repoState, setRepoState] = useState<string>('normal')
@@ -299,7 +300,7 @@ export function RepoTab({
 
   useRepoEffects(
     state,
-    { refreshHeadInfo, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, checkSvnSyncOnFocus, markSvnFollowOnBlur, refreshSvnSyncState, refreshSvnBranchesBehind, auditSvnIfDue, wantedDiffScope, reportError },
+    { refreshHeadInfo, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, checkSvnSyncOnFocus, markSvnFollowOnBlur, refreshSvnSyncState, refreshSvnBranchesBehind, auditSvnIfDue, noteRepoChanged, wantedDiffScope, reportError },
     // 文件历史视图自己读数据；这里按要回去的那个视图读，返回时不用再等一次
     viewMode === 'history' ? historyReturn : viewMode,
     changesScope,
@@ -329,6 +330,16 @@ export function RepoTab({
     if (!key || autoTried.current === key) return
     if (autoFollowRef.current?.(key)) autoTried.current = key
   }, [active, state.capabilities.vcs, state.svnSync, state.headHash, autoNudge])
+
+  // 横幅上「没有自动跟进」的那行原因：只认当前现场的（`autoFollowKey`），现场变了旧原因就不作数
+  const autoFollowBlocked =
+    autoSkip && autoSkip.key === autoFollowKey(state.svnSync, state.headHash) ? autoSkip.message : null
+  // 同一行原因也挂到任务栏和托盘上（使用报告 9.5）：人不在看这个窗口时横幅没人看见。
+  // 原因行没了就撤；标签关掉时也撤，不留一个没有出处的角标
+  useEffect(() => {
+    reportAutoFollowBlocked(repoPath, autoFollowBlocked)
+  }, [repoPath, autoFollowBlocked])
+  useEffect(() => () => reportAutoFollowBlocked(repoPath, null), [repoPath])
 
   useEffect(() => {
     openRepo(repoPath)
@@ -942,13 +953,16 @@ export function RepoTab({
   }
 
   // 「更新」「跟进」与横幅上的继续 / 放弃。流程在 `svnSyncFlow.ts`，这里只注入依赖
-  const showReport = (report: FollowReport) =>
+  const showReport = (report: FollowReport, refreshed?: Promise<void>) =>
     showFollowReport({
       report,
       readUser: () => svnGetUser(repoPath),
       saveUser: (user) => svnSetUser(repoPath, user),
       // 写了磁盘：「本地改动」要跟着变（watcher 也会刷，这里不等它）
       restoreLocalOnly: async (paths) => {
+        // 报告不等跟进之后的刷新就弹出来了：放回要写工作区，等那一轮读状态和 `svn status` 跑完再动，
+        // 否则会撞上索引锁被拒，或者让扫描读到写了一半的文件（独立 review 第 2 条）。按钮这时显示进行中
+        await refreshed
         const outcome = await svnRestoreLocalOnly(repoPath, paths)
         // 刷新失败不能吞掉已经写成的结果：再点一次只会看到误导的跳过原因（PR 159 review 第 8 条）
         try {
@@ -1010,11 +1024,17 @@ export function RepoTab({
     fetchSvnLog,
     setFollowing,
     refreshAfterFollow: async () => {
-      await refreshHead(repoPath)
-      await refreshGraph(repoPath)
-      await refreshStatus(repoPath)
-      await refreshSvnBranchesBehind(repoPath)
       void refreshHooksHealth()
+      // 三路同时发，不一项等一项（使用报告 10.5）。读图排在读 HEAD 后面：接 SVN 历史时要拿新的 HEAD 当
+      // 「还被指着」的起点（`repoStore` 的 `merge`），先写回图的话游离 HEAD 上的提交会被当成已交付藏起来
+      const results = await Promise.allSettled([
+        refreshHead(repoPath).then(() => refreshGraph(repoPath)),
+        refreshStatus(repoPath),
+        refreshSvnBranchesBehind(repoPath),
+      ])
+      // 全部落定才返回：一项先失败就返回的话，流程以为刷新完了、放开自动跟进，另外几项却还在写 state
+      const failed = results.find((r) => r.status === 'rejected')
+      if (failed) throw failed.reason
     },
     showFollowReport: showReport,
     checkoutBranch: async (name) => {
@@ -1166,11 +1186,7 @@ export function RepoTab({
         hooks={hooksHealth}
         onOpenHooks={() => void openHooks()}
         onUnregisterHooks={() => void unregisterHooks()}
-        autoFollowSkip={
-          autoSkip && autoSkip.key === autoFollowKey(state.svnSync, state.headHash)
-            ? autoSkip.message
-            : null
-        }
+        autoFollowSkip={autoFollowBlocked}
         autoFollowed={autoFollowed ? describeAutoFollowDone(autoFollowed) : null}
         onAutoFollowedDetails={() => {
           if (autoFollowed) void showReport(autoFollowed)

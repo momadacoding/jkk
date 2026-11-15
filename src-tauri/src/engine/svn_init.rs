@@ -11,13 +11,13 @@
 
 use crate::engine::git_cli::{run_git, run_git_code};
 use crate::engine::svn_attributes::{has_eol_rule, restore_attributes, write_attributes};
-use crate::engine::svn_base_blobs::BaseBlobs;
+use crate::engine::svn_base_blobs::{BaseBlobs, Saving};
 use crate::engine::svn_baseline::{
     git_dir, hash_blob, publish_baseline, refresh_index_stat, swap_index_to_tree, IndexEdit,
     TempIndex,
 };
 use crate::engine::svn_basemap::{read_base_map, BaseMap};
-use crate::engine::svn_cli::{run_svn, ScanAhead};
+use crate::engine::svn_cli::{run_svn, RunAhead};
 use crate::engine::svn_config::{
     normalize_whitelist_entry, write_config, DisabledGitignore, SvnConfig, BASELINE_BRANCH,
     RESPECT_GITIGNORE_VERSION, SVN_GIT_MODE,
@@ -33,8 +33,8 @@ use crate::engine::svn_gitignore::{
     scan_tree, GitCtx, GitignoreConflict, ProbeGitDir, RuleEffect, MAX_RENAME_ROUNDS,
 };
 use crate::engine::svn_health::{
-    check_baseline_map, check_baseline_map_with_nodes, prefetch_excluded_nodes, ExplainedOrigin,
-    Health, HealthMap,
+    check_baseline_map, check_baseline_map_with_nodes, prefetch_excluded_nodes,
+    prefetch_floor_diffs, ExcludedAhead, ExplainedOrigin, Health, HealthMap,
 };
 use crate::engine::svn_include_check::{dry_run_include_set, verify_include_set_listing};
 use crate::engine::svn_nodes::{compute_map, read_node_status, NodeStatus};
@@ -584,26 +584,36 @@ fn record_mixed_with(
             "录混合基线要用允许混合版本的前置校验结果（带节点状态），这里拿到的不是。这是实现缺陷。",
         )
     })?;
-    // R2a–R2c，到写树之前为止。`excluded_ahead` 是体检要的 `svn info -R`，磁盘一录完就在后台
-    // 跑起来了（见 `Indexed::excluded_ahead`）。下面任何一步提前返回，它在 drop 时等后台那条
-    // 跑完，不留进程
+    // R2a–R2c，到写树之前为止。`excluded_ahead` 是体检要的被排除节点，磁盘一录完就准备好了
+    // （常态是查 wc.db 的结果；查不了时是后台跑着的 `svn info -R`，见 `Indexed::excluded_ahead`）。
+    // 下面任何一步提前返回，它在 drop 时等后台那条跑完，不留进程
     let Indexed {
         touched: explained,
         listed,
         mut excluded_ahead,
-    } = record_server_index_timed(repo, cfg, pre, idx, clock, reuse)?;
+        mut diff_ahead,
+        // 活到录制结束（含体检），drop 时等缓存写完
+        blobs_saving: _blobs_saving,
+    } = record_server_index_timed(repo, cfg, pre, idx, clock, reuse, reuse.then_some(svn_url))?;
     let scope = WScope::for_repo(repo, cfg)?;
 
     // 映射 + R3b。`files` 是基线树里的文件：映射的键取录出来的树（分析 §6.2：不从 status 推）。
     // Lying / 漏收的判定放在阶段**里面**：初始化的耗时表要把失败标在体检上
     let mut audit = |files: &BTreeSet<String>, clock: &mut PhaseClock| {
         let recorded = compute_map(&pre.repos_root, &pre.uuid, files, nodes, BTreeMap::new())?;
-        if let Some(ahead) = excluded_ahead.take() {
-            clock.run("等被排除节点的扫描（svn info -R）", || {
-                ahead.adopt();
-                Ok(())
-            })?;
-        }
+        // 守卫活到体检结束：体检拿走提前准备好的那份，没拿走的随它作废
+        let _excluded = match excluded_ahead.take() {
+            Some(ahead) => Some(clock.run(
+                "等被排除节点的扫描（wc.db / svn info -R）",
+                || Ok(ahead.adopt()),
+            )?),
+            None => None,
+        };
+        // 守卫活到体检结束：没被体检取走的预跑结果（预测的清单对不上）随它作废
+        let _diff_ahead = match diff_ahead.take() {
+            Some(ahead) => Some(clock.run("等预跑的体检（svn diff）", || Ok(ahead.adopt()))?),
+            None => None,
+        };
         let (health, new_gone) = clock.run("基线体检（svn diff）", || {
             match check_baseline_map_with_nodes(
                 repo,
@@ -850,7 +860,7 @@ fn record_server_tree_timed(
     reuse: bool,
 ) -> Result<(String, BTreeSet<String>)> {
     let Indexed { touched, .. } =
-        record_server_index_timed(repo_root, cfg, pre, idx, clock, reuse)?;
+        record_server_index_timed(repo_root, cfg, pre, idx, clock, reuse, None)?;
     let tree = clock.run("写树（git write-tree）", || idx.write_tree(repo_root))?;
     Ok((tree, touched))
 }
@@ -861,10 +871,11 @@ struct Indexed {
     touched: BTreeSet<String>,
     /// 候选索引里的文件清单（纳入集合核对读的那份）。
     listed: BTreeSet<String>,
-    /// 体检要的 `svn info -R`（找被 `--set-depth=exclude` 掉的节点），已经在后台跑。只在扫描
-    /// 缓存范围内（跟进的准备阶段）有；其余入口是 `None`，体检照常自己跑。
+    /// 体检要的被排除节点（`--set-depth=exclude`），磁盘一录完就准备好：常态是直接查 wc.db 的
+    /// 结果，查不了时是后台跑着的 `svn info -R`（`svn_health::prefetch_excluded_nodes`）。只在
+    /// 扫描缓存范围内（跟进的准备阶段）有；其余入口是 `None`，体检照常自己查。
     ///
-    /// # 必须在磁盘录完之后才起
+    /// # 必须在磁盘录完之后才准备（查 wc.db 与起 svn 都一样）
     ///
     /// 它是发现「工作副本里被排除了、服务器上还在」的唯一手段（整单元 `svn diff` 不报被排除的
     /// 节点）。排在 `git add -A` 之前的话：扫描时目录还在 → 用户在 TortoiseSVN 里把它排除 →
@@ -872,7 +883,13 @@ struct Indexed {
     /// 丢了它们、也没有墓碑（独立 review 2026-11-14 第 1 条）。排在录完之后，与原来「写完树再
     /// 扫」是同一个先后：这之后才发生的排除，树里还留着那些文件，纳入集合核对（重新遍历磁盘）
     /// 或下一次检测会看到。
-    excluded_ahead: Option<ScanAhead>,
+    excluded_ahead: Option<ExcludedAhead>,
+    /// 体检的 floor `svn diff`，同样在磁盘录完之后就在后台跑（`svn_health::prefetch_floor_diffs`，
+    /// 先后的论证在那里）。只在跟进（`RecordMode::Follow`）里有。
+    diff_ahead: Option<RunAhead>,
+    /// blob 缓存在后台的那次写入（`BaseBlobs::save_in_background`）。只在跟进里有；调用方让它
+    /// 活到录制结束，drop 时等它写完。
+    blobs_saving: Option<Saving>,
 }
 
 /// R2a–R2c 到写树之前为止：候选索引已经是「服务器 rN 的树」的内容，并且过了纳入集合核对。
@@ -880,6 +897,8 @@ struct Indexed {
 ///
 /// 从 [`record_server_tree_timed`] 里拆出来，是为了让跟进把写树与体检并行
 /// （`record_mixed_with` 的 `RecordMode::Follow`）；其余入口仍走那个函数，步骤与原来相同。
+///
+/// `ahead_url`：跟进时是 svnUrl，磁盘录完就预跑体检的 floor `svn diff`；其余入口 `None`。
 fn record_server_index_timed(
     repo_root: &str,
     cfg: &SvnConfig,
@@ -887,6 +906,7 @@ fn record_server_index_timed(
     idx: &TempIndex,
     clock: &mut PhaseClock,
     reuse: bool,
+    ahead_url: Option<&str>,
 ) -> Result<Indexed> {
     let scope = WScope::for_repo(repo_root, cfg)?;
     let fixes = classify(&pre.dirty)?;
@@ -903,8 +923,21 @@ fn record_server_index_timed(
     })?;
     // 磁盘录完了，体检要的扫描从这里起跑，与下面的改写、核对、写树并行
     let excluded_ahead = prefetch_excluded_nodes(repo_root, &cfg.whitelist);
+    // 体检的 floor `svn diff` 同一时刻起跑（只在跟进里，见 `Indexed::diff_ahead`）
+    let diff_ahead = ahead_url.and_then(|url| {
+        let files = predicted_listing(repo_root, idx, &fixes, &touched)?;
+        prefetch_floor_diffs(
+            repo_root,
+            url,
+            &scope,
+            &pre.repos_root,
+            &pre.uuid,
+            &files,
+            pre.nodes.as_deref()?,
+        )
+    });
 
-    clock.run("把本地改动换回服务器内容（svn cat）", || {
+    let blobs_saving = clock.run("把本地改动换回服务器内容（svn cat）", || {
         rewrite_to_server(repo_root, pre, idx, &fixes, &touched, reuse)
     })?;
 
@@ -917,7 +950,31 @@ fn record_server_index_timed(
         touched,
         listed,
         excluded_ahead,
+        diff_ahead,
+        blobs_saving,
     })
+}
+
+/// 改写之后候选索引里会有哪些文件：此刻（`git add` 刚录完）的清单，加上要取回服务器内容的、
+/// 去掉要剔除的。与 [`rewrite_to_server`] 用同一个筛法（`fixes` 里在 `touched` 中的），所以就是
+/// 纳入集合核对随后读到的那份清单——体检拿它当文件清单（`RecordMode::Follow`）。
+///
+/// 只用来预跑体检（[`prefetch_floor_diffs`]）：猜错了只是预跑的命令对不上、体检自己再跑一遍。
+/// 读不出索引时返回 `None`。
+fn predicted_listing(
+    repo_root: &str,
+    idx: &TempIndex,
+    fixes: &std::collections::BTreeMap<String, Fix>,
+    touched: &BTreeSet<String>,
+) -> Option<BTreeSet<String>> {
+    let mut files = idx.ls_files(repo_root).ok()?;
+    for (path, fix) in fixes.iter().filter(|(p, _)| touched.contains(*p)) {
+        match fix {
+            Fix::TakeBase => files.insert(path.clone()),
+            Fix::Drop => files.remove(path),
+        };
+    }
+    Some(files)
 }
 
 /// `path` 自己或最近的一个祖先在 `replaced` 里时返回它。
@@ -965,7 +1022,7 @@ fn rewrite_to_server(
     fixes: &std::collections::BTreeMap<String, Fix>,
     touched: &BTreeSet<String>,
     reuse: bool,
-) -> Result<()> {
+) -> Result<Option<Saving>> {
     // 事故分析 6.2：自己或某个祖先是不带历史的替换，服务器上的旧内容取不到。文件走 TakeBase 会撞
     // E200009；目录底下重新加的子文件走 Drop 会静默少录（PR 116 遗留）。初始化与重建在 `git add`
     // 之前已经查过一次（`dry_run_before_add`）；同步 S7、交付 D7a、跟进没有那一步，这里是兜底
@@ -994,14 +1051,16 @@ fn rewrite_to_server(
         },
         Fix::Drop => Ok(None),
     })?;
-    if let Some(c) = &cache {
-        let used: Vec<(&str, &str)> = todo
+    // 缓存的写前复核要再跑一遍 `svn info` 与 `check-attr`，放到后台，与下面写索引、核对、写树、
+    // 体检并行（日志 `2026-11-14-follow-overlap-decisions.md` T2）
+    let saving = cache.map(|c| {
+        let used: Vec<(String, String)> = todo
             .iter()
             .zip(&oids)
-            .filter_map(|((path, _), oid)| Some((*path, oid.as_deref()?)))
+            .filter_map(|((path, _), oid)| Some((path.to_string(), oid.clone()?)))
             .collect();
-        c.save(repo_root, &used);
-    }
+        c.save_in_background(repo_root, used)
+    });
     let edits: Vec<IndexEdit> = todo
         .iter()
         .zip(oids)
@@ -1015,7 +1074,8 @@ fn rewrite_to_server(
             },
         })
         .collect();
-    idx.apply_edits(repo_root, &edits)
+    idx.apply_edits(repo_root, &edits)?;
+    Ok(saving)
 }
 
 /// 用最多 `workers` 个线程对每一项跑 `f`，按 `items` 的顺序返回结果；任何一项失败就返回 `Err`。

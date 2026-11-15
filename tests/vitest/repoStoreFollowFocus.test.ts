@@ -107,6 +107,8 @@ beforeEach(() => {
   answers.set('read_capabilities', () => SVN)
   answers.set('svn_wc_db_stamps', stamps('1'))
   answers.set('svn_follow_mark', () => undefined)
+  // 服务器侧核对也挂在焦点上（每个标签核对自己的仓库）。给它回答，它就照常跑完；它读的戳见下面几条
+  answers.set('svn_server_audit', () => ({ status: 'matched' }))
 })
 
 afterEach(() => {
@@ -118,7 +120,9 @@ describe('窗口拿到焦点', () => {
     mount()
     answers.set('svn_sync_status', syncStatus(IN_SYNC))
     await fire('focus')
-    expect(count('svn_wc_db_stamps')).toBe(1)
+    // 2 次：焦点检测 1 次，服务器侧核对的后台入口 1 次（它也挂在焦点上，读戳判断现场变没变，
+    // 2026-11-15 `idleAuditIsDue`）。它一分钟最多读一次，这几条测试都在一分钟以内
+    expect(count('svn_wc_db_stamps')).toBe(2)
     expect(count('svn_sync_status')).toBe(1)
   })
 
@@ -127,7 +131,8 @@ describe('窗口拿到焦点', () => {
     await settleOn(IN_SYNC)
     await fire('focus')
     await fire('focus')
-    expect(count('svn_wc_db_stamps')).toBe(3)
+    // 焦点检测 3 次，加服务器侧核对第一次读的 1 次（见上一条；之后两次焦点在一分钟内，它不再读）
+    expect(count('svn_wc_db_stamps')).toBe(4)
     expect(count('svn_sync_status')).toBe(1)
   })
 
@@ -170,7 +175,10 @@ describe('窗口拿到焦点', () => {
     mount(false)
     await fire('focus')
     await fire('blur')
-    expect(count('svn_wc_db_stamps')).toBe(0)
+    // 失同步检测与快照都不跑。服务器侧核对不看是不是当前标签（每个标签核对自己的仓库，原来就这样），
+    // 它读的那 1 次戳不算
+    expect(count('svn_wc_db_stamps')).toBe(1)
+    expect(count('svn_sync_status')).toBe(0)
     expect(count('svn_follow_mark')).toBe(0)
   })
 })

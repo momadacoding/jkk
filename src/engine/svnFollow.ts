@@ -7,6 +7,7 @@
  * ⚠️ 横幅与对话框都按**纯文本**渲染：不要写 `**`。
  */
 import type { ExternalChange, SyncVerdict } from './svnSync'
+import { formatDuration } from './svnInit'
 import {
   describeFollowDrift,
   stageLostDetail,
@@ -111,6 +112,11 @@ export interface FollowReport {
   evidence: 'hooks' | 'heuristic'
   /** 读收件箱的时刻。前端不用，随 journal 走。 */
   evidenceCutoffMs: number | null
+  /**
+   * 这次跟进命令从发出到返回的毫秒数。**后端不发**，流程在命令返回后补上（`svnSyncFlow`），
+   * 报告页脚据此写「跟进用时」。不含之后的界面刷新；崩溃后续上的那次没有。
+   */
+  elapsedMs?: number
 }
 
 /** 后端 `svn_follow::ConflictDetail`：冲突框里一个冲突文件的上下文（事故分析 6.5）。 */
@@ -333,6 +339,8 @@ export interface FollowReportModel {
   safe: string
   /** 暂存与 commit 是按什么判定的（C1h）。 */
   basis: string
+  /** 「跟进用时 …」，没量到时为 `null`。慢不慢要有个数：2026-11-11 那次的 70 秒只能靠估。 */
+  elapsed: string | null
   sections: FollowReportSection[]
 }
 
@@ -678,6 +686,7 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
         : '工作区里的文件没有改动',
     basis:
       r.evidence === 'hooks' ? '判定依据：TortoiseSVN 钩子事件' : '判定依据：作者 + 失焦快照',
+    elapsed: r.elapsedMs === undefined ? null : `跟进用时 ${formatDuration(r.elapsedMs)}`,
     sections,
   }
 }

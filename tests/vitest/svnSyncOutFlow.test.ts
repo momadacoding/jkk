@@ -175,6 +175,8 @@ describe('handleSvnDeliver', () => {
     expect(log.some((l) => l.startsWith('dialogError'))).toBe(false)
     expect(log).toContain('reportError:journal_unreadable')
     expect(log).toContain('confirm:已交付 r2')
+    // 同步状态读不出来不连累失同步的复查：两项同时发（2026-11-14，同 svnSyncFlow）
+    expect(log).toContain('refreshSvnSync')
   })
 
   it('同一时间只走一个流程', async () => {
