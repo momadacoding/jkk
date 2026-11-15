@@ -159,7 +159,7 @@
 - MUST：切入后所有实现、验证和 git 操作都在当前 worktree 内进行；禁止再用 `git -C <其他 worktree>` 或跨 worktree 绝对路径修改文件。
 - MUST：**未切入的自检信号**——statusline 显示的目录仍是启动目录，或 `Get-Location` / `pwd` 的实测值不在目标 worktree 内。出现任一信号立即停止实现，先用当前 agent 可用的会话级入口切入再继续；没有 `EnterWorktree` 本身不构成违规。
 - MUST：**每个任务开新分支**。已合并进 `master` 的分支不得继续堆新提交；开工前先确认当前分支状态（是否已合并、是否落后 `master`），需要时从最新 `master` 重新切分支。
-- SHOULD：worktree 目录放在仓库内的 `.worktrees/`（已在 `.gitignore` 中）。Claude Code 的 `EnterWorktree` 默认建在 `.claude/worktrees/`，该路径目前**不在** `.gitignore` 中，首次使用时需一并加入。
+- SHOULD：worktree 目录放在仓库内的 `.worktrees/`（已在 `.gitignore` 中）。Claude Code 的 `EnterWorktree` 默认建在 `.claude/worktrees/`，该路径也已在 `.gitignore` 中。
 - SHOULD：`EnterWorktree` 生成的分支名固定为 `worktree-<name>`，与 §4.4 的 `feat/` `fix/` 约定不一致，属已知取舍，可接受。
 - SHOULD：例外仅限一行级别的拼写、注释、文档小修（参见 1.1），这类可在当前位置直接处理，无需单独 worktree。
 - MUST：所有功能分支通过 PR 合并到 `master`，不要直接 push 到 `master`。
@@ -326,7 +326,8 @@ cargo fmt --check
 ### 7.2 前端 TypeScript / React
 
 - MUST：`tsconfig.json` 已开启 `strict`、`noUnusedLocals`、`noUnusedParameters`，不要为了让编译通过而放宽这些选项或加 `any` / `@ts-ignore`。
-- MUST：跨模块导入使用 `@/` 别名（已在 `tsconfig.json` 和 `vitest.config.ts` 中配置）；改别名必须两处同步。
+- SHOULD：新加的导入跟随所在文件已有的写法（相对路径或 `@/` 别名）；文件里已经两种都有的（如 `RepoTab.tsx`），跟随其中较多的那种。新文件：`src/` 内用相对路径，`tests/` 里用 `@/`（2026-11-16 统计：`src/` 相对 270 处 / `@/` 75 处，`tests/vitest/` `@/` 151 处 / 相对 50 处）。不为统一写法单独改动已有导入。原来的 MUST「一律 `@/`」与代码库多数写法冲突，第 82 号 issue 选了改规则而不是迁移代码。
+- MUST：`@/` 别名配置在 `tsconfig.json`、`vite.config.ts`、`vitest.config.ts` 三处；改别名必须三处同步。
 - SHOULD：单引号、尾随逗号。
 - SHOULD：纯逻辑（布局、路径、选择、路径解析、错误映射）放 `src/engine/`，保持无 React 依赖、可直接单测；组件只做渲染与事件绑定。
 
