@@ -96,6 +96,18 @@ fn detection_and_auto_follow_stay_within_their_scan_budget() {
         excluded.ts < write_tree.ts,
         "svn info -R 应当在写树之前就起跑（并行），实际排在了后面：{excluded:?} / {write_tree:?}"
     );
+    // 体检的 floor `svn diff` 同理（日志 `2026-11-14-follow-overlap-decisions.md` T1）：它比的是
+    // 磁盘与服务器，必须在磁盘录完之后才起，否则两者之间的改动进了基线、体检却没看到；又要与
+    // blob 缓存、改写、核对、写树并行。只跑一次：预跑的参数与体检真正发的对不上时会多出一条
+    let diff = one("svn diff", "--summarize");
+    assert!(
+        diff.ts >= add.ts + add.dur,
+        "svn diff 起在 git add 结束之前：{diff:?} / {add:?}"
+    );
+    assert!(
+        diff.ts < write_tree.ts,
+        "svn diff 应当在写树之前就起跑（并行），实际排在了后面：{diff:?} / {write_tree:?}"
+    );
 
     // 跟进完再检测：已经一致，仍然只扫一遍
     let before = scans(&log);
