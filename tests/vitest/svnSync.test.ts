@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import {
   auditIsDue,
+  idleAuditIsDue,
+  SVN_AUDIT_MAX_AGE_MS,
   SVN_AUDIT_MIN_GAP_MS,
   SVN_AUDIT_POLL_MS,
+  type AuditMark,
   SVN_TRAILING_RECHECK_MS,
   describeAudit,
   describeEolMigration,
@@ -270,6 +273,58 @@ describe('auditIsDue', () => {
     // 不该把定时器自己也挡掉。反过来配的话定时器会变成隔一次跑一次。
     expect(SVN_AUDIT_POLL_MS).toBeGreaterThan(SVN_AUDIT_MIN_GAP_MS)
     expect(auditIsDue(NOW, NOW - SVN_AUDIT_POLL_MS, false)).toBe(true)
+  })
+})
+
+describe('idleAuditIsDue（2026-11-11 提交慢报告第 7 节）', () => {
+  const NOW = 1_770_000_000_000
+  const S1 = [{ wcRoot: 'C:/wc', mtimeNs: '1', size: 10 }]
+  const S2 = [{ wcRoot: 'C:/wc', mtimeNs: '2', size: 10 }]
+  /** 上次核对：`ago` 毫秒前开始，那时的事件计数 3、戳 S1，得出了结论。 */
+  const mark = (ago: number, over: Partial<AuditMark> = {}): AuditMark => ({
+    at: NOW - ago,
+    epoch: 3,
+    stamps: S1,
+    conclusive: true,
+    ...over,
+  })
+  const IDLE = SVN_AUDIT_POLL_MS
+
+  it('从来没核对过：放行', () => {
+    expect(idleAuditIsDue(NOW, null, 0, S1)).toBe(true)
+  })
+
+  it('现场没变（戳相同、没来过文件事件、上次有结论）：不跑。空闲时就是这种', () => {
+    expect(idleAuditIsDue(NOW, mark(IDLE), 3, S1)).toBe(false)
+    expect(idleAuditIsDue(NOW, mark(IDLE * 11), 3, S1)).toBe(false)
+  })
+
+  it('wc.db 变了（update、commit、--set-depth=exclude）：跑', () => {
+    expect(idleAuditIsDue(NOW, mark(IDLE), 3, S2)).toBe(true)
+  })
+
+  it('来过文件事件（删了白名单里的文件、跟进动了基线）：跑', () => {
+    expect(idleAuditIsDue(NOW, mark(IDLE), 4, S1)).toBe(true)
+  })
+
+  it('上次没得出结论（断网、还没回来就被顶掉）：跑', () => {
+    expect(idleAuditIsDue(NOW, mark(IDLE, { conclusive: false }), 3, S1)).toBe(true)
+  })
+
+  it('读不出戳（这次或上次）：跑，没有依据判断没变', () => {
+    expect(idleAuditIsDue(NOW, mark(IDLE), 3, null)).toBe(true)
+    expect(idleAuditIsDue(NOW, mark(IDLE, { stamps: null }), 3, S1)).toBe(true)
+  })
+
+  it('离上次超过上限：跑，防着监听漏了事件', () => {
+    expect(idleAuditIsDue(NOW, mark(SVN_AUDIT_MAX_AGE_MS), 3, S1)).toBe(true)
+    expect(idleAuditIsDue(NOW, mark(SVN_AUDIT_MAX_AGE_MS - 1), 3, S1)).toBe(false)
+    expect(SVN_AUDIT_MAX_AGE_MS).toBeGreaterThan(SVN_AUDIT_POLL_MS)
+  })
+
+  it('只看现场，不管时间闸与在跑：那两道由调用方先用 auditIsDue 过（独立 review 第 8 条）', () => {
+    // 离上次不到一分钟、现场变了：这里照样说该跑，挡不挡交给 auditIsDue
+    expect(idleAuditIsDue(NOW, mark(SVN_AUDIT_MIN_GAP_MS - 1), 4, S2)).toBe(true)
   })
 })
 

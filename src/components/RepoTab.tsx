@@ -173,7 +173,7 @@ export function RepoTab({
   const {
     state, openRepo, refreshHead, refreshHeadInfo, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers,
     refreshDiff, refreshUpstream, refreshStashes, refreshPullRequests,
-    refreshSvnSync, refreshSvnEol, refreshSvnSyncState, refreshSvnBranchesBehind, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, noteOwnCommit, checkSvnSyncOnFocus, freshSvnSync, markSvnFollowOnBlur, fetchSvnLog, refreshSvnAudit, auditSvnIfDue,
+    refreshSvnSync, refreshSvnEol, refreshSvnSyncState, refreshSvnBranchesBehind, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, noteOwnCommit, checkSvnSyncOnFocus, freshSvnSync, markSvnFollowOnBlur, fetchSvnLog, refreshSvnAudit, auditSvnIfDue, noteRepoChanged,
     selectCommit, clearError, reportError, wantedDiffScope, refreshChanges: refreshChangesIn, afterIndexWrite,
   } = useRepoStore()
   const [repoState, setRepoState] = useState<string>('normal')
@@ -298,7 +298,7 @@ export function RepoTab({
 
   useRepoEffects(
     state,
-    { refreshHeadInfo, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, checkSvnSyncOnFocus, markSvnFollowOnBlur, refreshSvnSyncState, refreshSvnBranchesBehind, auditSvnIfDue, wantedDiffScope, reportError },
+    { refreshHeadInfo, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, checkSvnSyncOnFocus, markSvnFollowOnBlur, refreshSvnSyncState, refreshSvnBranchesBehind, auditSvnIfDue, noteRepoChanged, wantedDiffScope, reportError },
     // 文件历史视图自己读数据；这里按要回去的那个视图读，返回时不用再等一次
     viewMode === 'history' ? historyReturn : viewMode,
     changesScope,
