@@ -683,6 +683,8 @@ export function useRepoStore() {
   const refreshFlights = useRef(createSingleFlight()).current
   /** SVN 失同步检测的单飞队列，见 `requestSvnCheck`。放 ref 的理由同上。 */
   const svnCheckQueue = useRef(createSvnCheckQueue()).current
+  /** 在跑的那一轮检测是替哪次 HEAD 观测开跑的；不是替某个 HEAD 开跑的（比戳、读不出 HEAD）时 `head` 为空。见 `requestSvnCheck`。 */
+  const roundHead = useRef<{ path: string, head: HeadObservation | null } | null>(null)
   /**
    * 最后一次请求状态 / diff 的仓库路径。单飞按路径分开（不同仓库的读取不能互相顶替），
    * 旧仓库晚到的结果就要靠它挡住，不让它盖掉新仓库的。现在每个标签页的路径是固定的，
@@ -814,8 +816,18 @@ export function useRepoStore() {
   const refreshHeadInfo = async (path: string): Promise<HeadObservation> => {
     const info = await invoke<RepoInfo>('open_repo', { path })
     setState((s) => ({ ...s, head: info.head, headHash: info.headHash }))
-    return { branch: info.head, hash: info.headHash, parents: info.headParents ?? [] }
+    return observedHead(info)
   }
+
+  const observedHead = (info: RepoInfo): HeadObservation =>
+    ({ branch: info.head, hash: info.headHash, parents: info.headParents ?? [] })
+
+  /**
+   * 只读 HEAD，不写 state。同步之后的复查（`refreshSvnSync`）用：它可能在用户切到别的仓库之后才
+   * 读回来，写 state 会把旧仓库的分支名挂到新仓库的标题上；界面上的 HEAD 另有人刷。
+   */
+  const readHeadInfo = async (path: string): Promise<HeadObservation> =>
+    observedHead(await invoke<RepoInfo>('open_repo', { path }))
 
   /**
    * 重新加载提交图。
@@ -1066,18 +1078,75 @@ export function useRepoStore() {
    * 在跑时来的合并成一轮补跑，`force` 取或。计数包在开跑的那一轮上：排队期间前一轮还在跑，
    * 计数本来就不是 0。唯一不排队的是提交前的 `freshSvnSync`，见那里。
    */
-  const requestSvnCheck = (path: string, force: boolean) =>
-    svnCheckQueue.request(path, force, (forced) => runSvnCheckNow(path, forced))
+  /**
+   * `head` 是这次请求按哪次 HEAD 观测来的（`forceCheckAtHead`）；`since` 是调用方取的号。两个都给、而且
+   * 在跑的那一轮正是替**同一个 HEAD** 开跑的，才复用它（`svnCheckQueue` 的「什么时候可以复用」）。
+   *
+   * 为什么要比 HEAD（独立 review 第 3 条）：调用方的 HEAD 是在那一轮开跑**之后**读的。那一轮替 X 开跑，
+   * 调用方读到的已经是 Y，复用之后把 Y 记成「按它校验过」，Y 的事件就被当成没变而跳过，横幅停在按 X
+   * 算的结论上。`recordAfterSuccess` 要求观测值不晚于校验，这里用「与开跑前那次观测相同」守住它。
+   */
+  const requestSvnCheck = (path: string, force: boolean, head?: HeadObservation, since?: number) => {
+    const running = roundHead.current
+    const sameRound = head && running?.head && samePath(running.path, path) && sameHeadForSync(running.head, head)
+    return svnCheckQueue.request(
+      path,
+      force,
+      (forced) => {
+        // 补跑用的是最后一次传进来的闭包：比戳的请求合并进来时这里没有 HEAD，那一轮就不给人复用
+        const round = { path, head: head ?? null }
+        roundHead.current = round
+        return runSvnCheckNow(path, forced).finally(() => {
+          if (roundHead.current === round) roundHead.current = null
+        })
+      },
+      sameRound ? since : undefined,
+    )
+  }
 
   /**
-   * 第二档的**无条件**入口：重建基线、同步之后用。打开仓库走 `forceCheckAtHead`（同样无条件，另外
-   * 记下 HEAD），读不出 HEAD 时才退回这里。
+   * 第二档的**无条件**入口：重建基线、同步（更新、跟进、交付）之后用。打开仓库直接走
+   * `forceCheckAtHead`。
    *
    * 顺带把 wc.db 戳记下来当基准——不记的话打开仓库后第一次存盘或焦点会因为记录还是 `null`
    * 而再跑一次全量。先读戳再跑校验，而且只在校验写回后才记（`runSvnSyncCheck`）。
+   *
+   * # 与后端补发的 `repo-changed` 共用一轮（2026-11-11 使用报告「跟进耗时」10.5 的 P3）
+   *
+   * 同步命令返回前后端补发一次 `repo-changed`，同步多半又挪了 HEAD：监听读到新 HEAD 强制跑一轮，
+   * 这里再强制跑一轮，两轮各是一遍 `svn status` 全量扫描，结论相同。两处配合起来只跑一轮：
+   *
+   * - 按现读的 HEAD 校验（`forceCheckAtHead`）：这一轮在跑时监听读到同一个 HEAD，认出已经有人在
+   *   校验，不再排；写回后记下 HEAD，之后的事件也不再跑。
+   * - 进来的那一刻取号（`svnCheckQueue.mark`）：读 HEAD 的这一拍里监听那一轮先开跑了的话，它开跑在
+   *   调用之后、替的又是同一个 HEAD（`requestSvnCheck`），结论不比这里自己跑的旧，直接复用。进来之前
+   *   就在跑的、替别的 HEAD 开跑的都不复用，照旧补跑。
+   *
+   * 所以调用方要在命令返回的**同一拍**里调它，中间不要先 await 别的刷新：晚进来一步，监听那一轮
+   * 已经开跑，就只能再补一轮（结论仍然对，只是白扫一遍）。「更新」之后仍是两轮：它改了 wc.db，监听那边
+   * 比戳的一轮在取号之前就开跑并跑了第二档，不是强制的，认不出来。读不出 HEAD 时退回不认 HEAD 的强制一轮。
+   *
+   * 失败了自己再试一次（独立 review 第 6 条）：原来监听与这里各跑一轮，一轮撞上 wc.db 被锁还有另一轮；
+   * 共用之后那一轮失败，监听的事件已经用掉，之后比戳的检测又因为戳没变而不跑，横幅会停在同步之前。
    */
   const refreshSvnSync = async (path: string): Promise<void> => {
-    await requestSvnCheck(path, true)
+    const since = svnCheckQueue.mark()
+    let head: HeadObservation
+    try {
+      head = await readHeadInfo(path)
+    } catch {
+      await requestSvnCheck(path, true)
+      return
+    }
+    // 读 HEAD 的这一拍里切到了别的仓库：`headRequested` 记的是当前打开的那个仓库，不能写进旧仓库的 HEAD；
+    // 结论反正也写不回去（`applySvnSync` 的守卫）
+    if (!samePath(openedPath.current ?? '', path)) return
+    try {
+      await forceCheckAtHead(path, head, since)
+    } catch {
+      if (!samePath(openedPath.current ?? '', path)) return
+      await forceCheckAtHead(path, head)
+    }
   }
 
   /**
@@ -1118,15 +1187,16 @@ export function useRepoStore() {
    * 之后、打开仓库时都走这里。
    *
    * 跑的过程中 `headRequested` 是它（见 `checkSvnSyncIfHeadMoved` 为什么要比还没落定的 HEAD）。
+   * `since` 是调用方取的号（`refreshSvnSync`）：之后才开跑的强制一轮可以直接复用。
    */
-  const forceCheckAtHead = async (path: string, head: HeadObservation) => {
+  const forceCheckAtHead = async (path: string, head: HeadObservation, since?: number) => {
     headRequested.current = head
     let recorded = false
     try {
       recorded = await recordAfterSuccess(
         lastCheckedHead.current,
         head,
-        async () => (await requestSvnCheck(path, true)) === 'applied',
+        async () => (await requestSvnCheck(path, true, head, since)) === 'applied',
       )
     } finally {
       // 更晚的一次已经接手时不清：它落定前，再来的同一个 HEAD 不必重复请求
