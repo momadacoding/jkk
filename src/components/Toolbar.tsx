@@ -132,6 +132,7 @@ export function Toolbar({
             key={action}
             className={`toolbar-button${ctrl ? ' variant' : ''}`}
             disabled={busy !== null}
+            title={plan.title ?? undefined}
             onClick={() => void run(action)}
             data-action={action}
           >

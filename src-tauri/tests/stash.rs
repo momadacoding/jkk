@@ -169,3 +169,183 @@ fn drop_removes_the_entry_without_touching_the_working_tree() {
     assert!(stash::list(&p).unwrap().is_empty());
     assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "1");
 }
+
+/// 已跟踪改动 + 一个新增文件，用 `-u` 压进 stash，工作区回到干净。
+fn stash_with_untracked(dir: &std::path::Path, rel: &str) -> String {
+    let p = dir.to_str().unwrap().to_string();
+    fs::write(dir.join("a.txt"), "changed").unwrap();
+    let full = dir.join(rel);
+    fs::create_dir_all(full.parent().unwrap()).unwrap();
+    fs::write(&full, "from stash").unwrap();
+    cmd::stash_push(p.clone(), None, true).unwrap();
+    assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "1");
+    assert!(!full.exists());
+    p
+}
+
+/// 撞名被拦下之后：stash 还在，已跟踪的改动**没有**写上去，挡路的文件原样。
+/// git 自己撞名时会先写已跟踪部分、再在未跟踪上失败（2026-11-16 实测 git 2.51，半套 apply）。
+fn assert_untouched(dir: &std::path::Path, p: &str, blocker: &str, blocker_content: &str) {
+    assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "1");
+    assert_eq!(
+        fs::read_to_string(dir.join(blocker)).unwrap(),
+        blocker_content
+    );
+    assert_eq!(stash::list(p).unwrap().len(), 1);
+}
+
+#[test]
+fn pop_with_untracked_restores_new_files_too() {
+    let dir = repo();
+    let p = stash_with_untracked(dir.path(), "new.txt");
+
+    cmd::stash_pop(p.clone(), 0).unwrap();
+    assert_eq!(
+        fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "changed"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("new.txt")).unwrap(),
+        "from stash"
+    );
+    assert!(stash::list(&p).unwrap().is_empty());
+}
+
+#[test]
+fn pop_refuses_without_touching_anything_when_a_new_file_is_already_on_disk() {
+    let dir = repo();
+    let p = stash_with_untracked(dir.path(), "new.txt");
+    fs::write(dir.path().join("new.txt"), "mine").unwrap();
+
+    let err = cmd::stash_pop(p.clone(), 0).unwrap_err();
+    assert_eq!(err.code, "stash_untracked_exists");
+    assert!(err.message.contains("new.txt"), "got {}", err.message);
+    assert_untouched(dir.path(), &p, "new.txt", "mine");
+}
+
+#[test]
+fn apply_refuses_without_touching_anything_when_a_new_file_is_already_on_disk() {
+    let dir = repo();
+    let p = stash_with_untracked(dir.path(), "sub/new.txt");
+    // `-u` 收走文件时连空下来的 `sub/` 一起删了
+    fs::create_dir_all(dir.path().join("sub")).unwrap();
+    fs::write(dir.path().join("sub/new.txt"), "mine").unwrap();
+
+    let err = cmd::stash_apply(p.clone(), 0).unwrap_err();
+    assert_eq!(err.code, "stash_untracked_exists");
+    assert!(err.message.contains("sub/new.txt"), "got {}", err.message);
+    assert_untouched(dir.path(), &p, "sub/new.txt", "mine");
+}
+
+#[test]
+fn pop_refuses_when_a_file_sits_where_a_new_files_directory_should_be() {
+    // `sub` 被一个普通文件占着：对 `sub/new.txt` 取元数据会报错、看着像「不存在」，
+    // 但 git 建不出这一级目录，照样半套 apply
+    let dir = repo();
+    let p = stash_with_untracked(dir.path(), "sub/new.txt");
+    fs::remove_dir_all(dir.path().join("sub")).ok();
+    fs::write(dir.path().join("sub"), "a file").unwrap();
+
+    let err = cmd::stash_pop(p.clone(), 0).unwrap_err();
+    assert_eq!(err.code, "stash_untracked_exists");
+    assert!(err.message.contains("sub"), "got {}", err.message);
+    assert_untouched(dir.path(), &p, "sub", "a file");
+}
+
+#[test]
+fn the_check_looks_at_the_stash_being_applied_not_the_newest_one() {
+    // stash@{1} 带新增文件且撞名，stash@{0} 只有已跟踪改动。查错条目（总看 {0}）的话
+    // apply(1) 会放行、git 半套 apply
+    let dir = repo();
+    let p = stash_with_untracked(dir.path(), "new.txt");
+    fs::write(dir.path().join("b.txt"), "tracked later").unwrap();
+    run_git(dir.path(), &["add", "b.txt"]);
+    run_git(dir.path(), &["commit", "-qm", "c2"]);
+    fs::write(dir.path().join("b.txt"), "changed b").unwrap();
+    cmd::stash_push(p.clone(), None, false).unwrap();
+    fs::write(dir.path().join("new.txt"), "mine").unwrap();
+
+    let err = cmd::stash_apply(p.clone(), 1).unwrap_err();
+    assert_eq!(err.code, "stash_untracked_exists");
+    assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "1");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+        "tracked later"
+    );
+
+    // {0} 没有新增文件：磁盘上的 new.txt 不挡它
+    cmd::stash_apply(p.clone(), 0).unwrap();
+    assert_eq!(
+        fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+        "changed b"
+    );
+    assert_eq!(stash::list(&p).unwrap().len(), 2);
+}
+
+#[test]
+fn pop_refuses_when_a_directory_sits_at_a_new_files_path() {
+    let dir = repo();
+    let p = stash_with_untracked(dir.path(), "new.txt");
+    fs::create_dir_all(dir.path().join("new.txt")).unwrap();
+    fs::write(dir.path().join("new.txt/inner.txt"), "mine").unwrap();
+
+    let err = cmd::stash_pop(p.clone(), 0).unwrap_err();
+    assert_eq!(err.code, "stash_untracked_exists");
+    assert!(err.message.contains("new.txt"), "got {}", err.message);
+    assert_untouched(dir.path(), &p, "new.txt/inner.txt", "mine");
+}
+
+#[test]
+fn pop_goes_through_when_the_new_file_came_back_identical_and_tracked() {
+    // 计划 A17 的形状：混合仓库里同事新增的文件被 `-u` 收进 stash，跟进之后它作为已跟踪文件、
+    // 同样的字节回到磁盘。stash、HEAD、磁盘三处同一个 blob，不算撞名
+    let dir = repo();
+    let p = stash_with_untracked(dir.path(), "new.txt");
+    fs::write(dir.path().join("new.txt"), "from stash").unwrap();
+    run_git(dir.path(), &["add", "new.txt"]);
+    run_git(dir.path(), &["commit", "-qm", "colleague"]);
+
+    cmd::stash_pop(p.clone(), 0).unwrap();
+    assert_eq!(
+        fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "changed"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("new.txt")).unwrap(),
+        "from stash"
+    );
+    assert!(stash::list(&p).unwrap().is_empty());
+    // new.txt 是已跟踪的、和 HEAD 一样：不该留下 ` D` 或 `??`
+    let status = git_out(dir.path(), &["status", "--porcelain"]);
+    assert_eq!(status, "M a.txt", "status: {status}");
+}
+
+#[test]
+fn pop_still_refuses_when_the_tracked_copy_differs() {
+    // 同名文件已被提交，但字节和 stash 里的不同：真撞名，照样拦
+    let dir = repo();
+    let p = stash_with_untracked(dir.path(), "new.txt");
+    fs::write(dir.path().join("new.txt"), "colleague's version").unwrap();
+    run_git(dir.path(), &["add", "new.txt"]);
+    run_git(dir.path(), &["commit", "-qm", "colleague"]);
+
+    let err = cmd::stash_pop(p.clone(), 0).unwrap_err();
+    assert_eq!(err.code, "stash_untracked_exists");
+    assert_untouched(dir.path(), &p, "new.txt", "colleague's version");
+}
+
+#[test]
+fn pop_of_a_stash_without_untracked_ignores_unrelated_new_files() {
+    // 没带 `-u` 的 stash 没有第三个父提交：磁盘上随便有什么新增文件都不挡
+    let dir = repo();
+    let p = dir.path().to_str().unwrap().to_string();
+    fs::write(dir.path().join("a.txt"), "changed").unwrap();
+    cmd::stash_push(p.clone(), None, false).unwrap();
+    fs::write(dir.path().join("new.txt"), "mine").unwrap();
+
+    cmd::stash_pop(p.clone(), 0).unwrap();
+    assert_eq!(
+        fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "changed"
+    );
+}

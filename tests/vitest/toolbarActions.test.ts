@@ -43,9 +43,16 @@ describe('planToolbarAction', () => {
     expect(planToolbarAction('push', true, 'release/2.0').confirm).toContain('release/2.0')
   })
 
-  it('Ctrl+stash 连未跟踪文件一起存', () => {
-    expect(planToolbarAction('stash', false, 'master').args).toEqual({ message: null, includeUntracked: false })
-    expect(planToolbarAction('stash', true, 'master').args).toEqual({ message: null, includeUntracked: true })
+  it('默认 stash 连新增（未跟踪）文件一起收，Ctrl 只收已跟踪的（第 99 号 issue）', () => {
+    expect(planToolbarAction('stash', false, 'master').args).toEqual({ message: null, includeUntracked: true })
+    expect(planToolbarAction('stash', true, 'master').args).toEqual({ message: null, includeUntracked: false })
+    expect(planToolbarAction('stash', true, 'master').label).toBe('Stash tracked')
+  })
+
+  it('stash 的悬停说明写明收不收新增文件、被忽略的文件不收', () => {
+    expect(planToolbarAction('stash', false, 'master').title).toContain('新增文件')
+    expect(planToolbarAction('stash', false, 'master').title).toContain('.gitignore')
+    expect(planToolbarAction('stash', true, 'master').title).toContain('只收已跟踪')
   })
 
   it('按住 Ctrl 时按钮文字要跟着变，否则这功能没人发现得了', () => {
