@@ -67,6 +67,7 @@ pub mod svn_sync_out_check;
 pub mod svn_sync_stash;
 pub mod svn_tombstone;
 pub mod svn_wc;
+pub mod svn_wcdb;
 pub mod svn_xml;
 pub mod tree;
 pub mod tsvn_hook_cli;

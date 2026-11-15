@@ -61,6 +61,7 @@ fn detection_and_auto_follow_stay_within_their_scan_budget() {
     // 自动跟进：准备阶段一遍（找 external、节点 revision、脏文件共用），发布前锁内复核一遍
     let (before, before_info_r) = (scans(&log), procs(&log, "info", ""));
     let lines_before = records(&log).len();
+    let follow_started = perf::now_ms();
     let out =
         follow_auto(&fx.wc_str(), "op1").unwrap_or_else(|e| panic!("{}: {}", e.code, e.message));
     assert!(matches!(out, AutoFollowOutcome::Done { .. }), "{out:?}");
@@ -71,10 +72,30 @@ fn detection_and_auto_follow_stay_within_their_scan_budget() {
         procs(&log, "info", "") - before_info_r
     );
 
-    // 找被排除节点的 `svn info -R` 是提前放到后台跑的，但必须在磁盘录完（`git add -A`）之后才
-    // 起：排在前面的话，两者之间发生的 `--set-depth=exclude` 会让基线静默丢文件（见
-    // `svn_init::Indexed::excluded_ahead`）。它要与后面的步骤并行，所以也不能拖到写树之后
+    // 找被排除节点改为直接查 wc.db（`svn_wcdb`，日志 `2026-11-15-wcdb-excluded-decisions.md`）：
+    // 常态下整次跟进不再起 `svn info -R`。查询仍必须在磁盘录完（`git add -A`）之后：排在前面
+    // 的话，两者之间发生的 `--set-depth=exclude` 会让基线静默丢文件（见
+    // `svn_init::Indexed::excluded_ahead`）
     let during: Vec<Rec> = records(&log).split_off(lines_before);
+    let info_r = during
+        .iter()
+        .filter(|r| r.name == "svn info" && r.flags.iter().any(|f| f == "-R"))
+        .count();
+    assert_eq!(info_r, 0, "常态下不该再起 svn info -R：{during:?}");
+    let adds: Vec<&Rec> = during
+        .iter()
+        .filter(|r| r.name == "git add" && r.flags.iter().any(|f| f == "-A"))
+        .collect();
+    assert_eq!(adds.len(), 1, "应当恰好一条 git add -A：{during:?}");
+    let add_end = adds[0].ts + adds[0].dur;
+    let queries = wcdb_queries(&log, follow_started);
+    assert_eq!(queries.len(), 1, "wc.db 只该查一次（录完时查，体检拿那份）");
+    for q in &queries {
+        assert!(
+            *q >= add_end,
+            "wc.db 的查询起在 git add 结束之前：{q} / {add_end}"
+        );
+    }
     let one = |name: &str, flag: &str| -> Rec {
         let hits: Vec<&Rec> = during
             .iter()
@@ -83,19 +104,7 @@ fn detection_and_auto_follow_stay_within_their_scan_budget() {
         assert_eq!(hits.len(), 1, "应当恰好一条 {name} {flag}：{during:?}");
         hits[0].clone()
     };
-    let (add, excluded, write_tree) = (
-        one("git add", "-A"),
-        one("svn info", "-R"),
-        one("git write-tree", ""),
-    );
-    assert!(
-        excluded.ts >= add.ts + add.dur,
-        "svn info -R 起在 git add 结束之前：{excluded:?} / {add:?}"
-    );
-    assert!(
-        excluded.ts < write_tree.ts,
-        "svn info -R 应当在写树之前就起跑（并行），实际排在了后面：{excluded:?} / {write_tree:?}"
-    );
+    let (add, write_tree) = (one("git add", "-A"), one("git write-tree", ""));
     // 体检的 floor `svn diff` 同理（日志 `2026-11-14-follow-overlap-decisions.md` T1）：它比的是
     // 磁盘与服务器，必须在磁盘录完之后才起，否则两者之间的改动进了基线、体检却没看到；又要与
     // blob 缓存、改写、核对、写树并行。只跑一次：预跑的参数与体检真正发的对不上时会多出一条
@@ -119,6 +128,19 @@ fn detection_and_auto_follow_stay_within_their_scan_budget() {
     let before = scans(&log);
     run_preflight_with(&fx.wc_str(), &["Code/".to_string()], true).unwrap();
     assert_eq!(scans(&log) - before, 1, "前置校验只该扫一遍");
+}
+
+/// 查 wc.db 找被排除节点的那几条记录（`svn_wcdb::excluded_nodes`）的起跑时刻，只取 `since`
+/// 之后的。
+fn wcdb_queries(log: &std::path::Path, since: f64) -> Vec<f64> {
+    std::fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|v| v["kind"] == "query" && v["name"] == "wc.db excluded nodes")
+        .map(|v| v["ts"].as_f64().unwrap())
+        .filter(|ts| *ts >= since)
+        .collect()
 }
 
 /// 记录文件里的一条子进程记录。

@@ -17,7 +17,7 @@ use crate::engine::svn_baseline::{
     TempIndex,
 };
 use crate::engine::svn_basemap::{read_base_map, BaseMap};
-use crate::engine::svn_cli::{run_svn, RunAhead, ScanAhead};
+use crate::engine::svn_cli::{run_svn, RunAhead};
 use crate::engine::svn_config::{
     normalize_whitelist_entry, write_config, DisabledGitignore, SvnConfig, BASELINE_BRANCH,
     RESPECT_GITIGNORE_VERSION, SVN_GIT_MODE,
@@ -34,7 +34,7 @@ use crate::engine::svn_gitignore::{
 };
 use crate::engine::svn_health::{
     check_baseline_map, check_baseline_map_with_nodes, prefetch_excluded_nodes,
-    prefetch_floor_diffs, ExplainedOrigin, Health, HealthMap,
+    prefetch_floor_diffs, ExcludedAhead, ExplainedOrigin, Health, HealthMap,
 };
 use crate::engine::svn_include_check::{dry_run_include_set, verify_include_set_listing};
 use crate::engine::svn_nodes::{compute_map, read_node_status, NodeStatus};
@@ -584,9 +584,9 @@ fn record_mixed_with(
             "录混合基线要用允许混合版本的前置校验结果（带节点状态），这里拿到的不是。这是实现缺陷。",
         )
     })?;
-    // R2a–R2c，到写树之前为止。`excluded_ahead` 是体检要的 `svn info -R`，磁盘一录完就在后台
-    // 跑起来了（见 `Indexed::excluded_ahead`）。下面任何一步提前返回，它在 drop 时等后台那条
-    // 跑完，不留进程
+    // R2a–R2c，到写树之前为止。`excluded_ahead` 是体检要的被排除节点，磁盘一录完就准备好了
+    // （常态是查 wc.db 的结果；查不了时是后台跑着的 `svn info -R`，见 `Indexed::excluded_ahead`）。
+    // 下面任何一步提前返回，它在 drop 时等后台那条跑完，不留进程
     let Indexed {
         touched: explained,
         listed,
@@ -601,12 +601,14 @@ fn record_mixed_with(
     // Lying / 漏收的判定放在阶段**里面**：初始化的耗时表要把失败标在体检上
     let mut audit = |files: &BTreeSet<String>, clock: &mut PhaseClock| {
         let recorded = compute_map(&pre.repos_root, &pre.uuid, files, nodes, BTreeMap::new())?;
-        if let Some(ahead) = excluded_ahead.take() {
-            clock.run("等被排除节点的扫描（svn info -R）", || {
-                ahead.adopt();
-                Ok(())
-            })?;
-        }
+        // 守卫活到体检结束：体检拿走提前准备好的那份，没拿走的随它作废
+        let _excluded = match excluded_ahead.take() {
+            Some(ahead) => Some(clock.run(
+                "等被排除节点的扫描（wc.db / svn info -R）",
+                || Ok(ahead.adopt()),
+            )?),
+            None => None,
+        };
         // 守卫活到体检结束：没被体检取走的预跑结果（预测的清单对不上）随它作废
         let _diff_ahead = match diff_ahead.take() {
             Some(ahead) => Some(clock.run("等预跑的体检（svn diff）", || Ok(ahead.adopt()))?),
@@ -869,10 +871,11 @@ struct Indexed {
     touched: BTreeSet<String>,
     /// 候选索引里的文件清单（纳入集合核对读的那份）。
     listed: BTreeSet<String>,
-    /// 体检要的 `svn info -R`（找被 `--set-depth=exclude` 掉的节点），已经在后台跑。只在扫描
-    /// 缓存范围内（跟进的准备阶段）有；其余入口是 `None`，体检照常自己跑。
+    /// 体检要的被排除节点（`--set-depth=exclude`），磁盘一录完就准备好：常态是直接查 wc.db 的
+    /// 结果，查不了时是后台跑着的 `svn info -R`（`svn_health::prefetch_excluded_nodes`）。只在
+    /// 扫描缓存范围内（跟进的准备阶段）有；其余入口是 `None`，体检照常自己查。
     ///
-    /// # 必须在磁盘录完之后才起
+    /// # 必须在磁盘录完之后才准备（查 wc.db 与起 svn 都一样）
     ///
     /// 它是发现「工作副本里被排除了、服务器上还在」的唯一手段（整单元 `svn diff` 不报被排除的
     /// 节点）。排在 `git add -A` 之前的话：扫描时目录还在 → 用户在 TortoiseSVN 里把它排除 →
@@ -880,7 +883,7 @@ struct Indexed {
     /// 丢了它们、也没有墓碑（独立 review 2026-11-14 第 1 条）。排在录完之后，与原来「写完树再
     /// 扫」是同一个先后：这之后才发生的排除，树里还留着那些文件，纳入集合核对（重新遍历磁盘）
     /// 或下一次检测会看到。
-    excluded_ahead: Option<ScanAhead>,
+    excluded_ahead: Option<ExcludedAhead>,
     /// 体检的 floor `svn diff`，同样在磁盘录完之后就在后台跑（`svn_health::prefetch_floor_diffs`，
     /// 先后的论证在那里）。只在跟进（`RecordMode::Follow`）里有。
     diff_ahead: Option<RunAhead>,

@@ -276,8 +276,10 @@ pub mod fault {
         ServerHead,
         /// [`super::confirm_absent`]
         ConfirmAbsent,
-        /// 体检里每单元一次的 `svn info -R`（找被 depth-exclude 的节点）
+        /// 体检里找被 depth-exclude 的节点（先查 wc.db，不行再 `svn info -R`）
         ExcludedScan,
+        /// 查 wc.db 那一步认不出这个工作副本（`svn_wcdb`）：体检退回 `svn info -R`
+        WcdbRefused,
         /// 体检里对点不了名的被排除节点跑的 `svn ls -R`（D8）
         ListAtFloor,
         /// 体检的第一条 `svn diff`

@@ -670,6 +670,33 @@ fn excluded_directory_is_refused_file_by_file() {
 }
 
 #[test]
+fn excluded_nodes_are_still_found_when_wc_db_cannot_be_read() {
+    // wc.db 认不出这个工作副本（格式不是 31 等）时退回 svn info -R，结论与直接查 wc.db 相同。
+    // 退回那条路坏了的话被排除的文件看不见，这里会变成 Verified
+    let fx = svn_repo_for_health();
+    svn_cmd(
+        &fx.wc(),
+        &[
+            "update",
+            "--set-depth=exclude",
+            "--non-interactive",
+            "--",
+            "Code/Deep@",
+        ],
+    );
+    let map = map_of(&fx, BTreeMap::new());
+    let direct = check_map(&fx, &map, ExplainedOrigin::JustRecorded);
+    let _refused = fault::arm(Point::WcdbRefused);
+    assert_eq!(check_map(&fx, &map, ExplainedOrigin::JustRecorded), direct);
+    assert_eq!(
+        direct,
+        HealthMap::Excluded {
+            files: vec!["Code/Deep/D.cs".to_string()]
+        }
+    );
+}
+
+#[test]
 fn excluded_non_code_file_does_not_refuse_recording() {
     // 不误报的一侧：排除掉的是美术文件（扩展名不在白名单里），基线本来就不收它
     let fx = svn_repo_for_health();
