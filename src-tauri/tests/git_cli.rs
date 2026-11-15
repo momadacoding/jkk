@@ -41,6 +41,50 @@ fn git_command_disables_terminal_prompt() {
 }
 
 #[test]
+fn the_git_we_start_sees_the_same_environment_as_the_one_on_path() {
+    // git_cli 认得出 Git for Windows 的 cmd\git.exe 启动器时直接起真正的 git.exe，并照启动器的
+    // 样子设 PATH 与 MSYSTEM（engine::git_program）。钩子、凭据、ssh 都从 git 起的子进程里跑，
+    // 它们看到的环境必须与经过启动器时逐行相同。认不出来时两边起的是同一个程序，这条也成立。
+    let dir = TempDir::new().unwrap();
+    fixture_git(dir.path(), &["init"]);
+    let repo = dir.path().to_str().unwrap();
+    let alias = "alias.envdump=!env | sort";
+    let ours = git_cli::run_git(repo, &["-c", alias, "envdump"]).unwrap();
+    let out = std::process::Command::new("git")
+        .current_dir(repo)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["-c", alias, "envdump"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let theirs = String::from_utf8_lossy(&out.stdout);
+    let differ: Vec<String> = {
+        let a: std::collections::BTreeSet<&str> = ours.lines().collect();
+        let b: std::collections::BTreeSet<&str> = theirs.lines().collect();
+        a.symmetric_difference(&b).map(|l| l.to_string()).collect()
+    };
+    assert!(differ.is_empty(), "子进程环境不同：{differ:#?}");
+
+    // 开发机装的是 Git for Windows，PATH 上是启动器：这时必须真的绕过了，上面的比较才不是同一个
+    // 程序跟自己比
+    let launcher_on_path = std::env::var_os("PATH").is_some_and(|p| {
+        std::env::split_paths(&p)
+            .find(|d| d.join("git.exe").is_file())
+            .and_then(|d| d.file_name().map(|n| n.eq_ignore_ascii_case("cmd")))
+            .unwrap_or(false)
+    });
+    if cfg!(windows) && launcher_on_path && std::env::var_os("MSYSTEM").is_none() {
+        let program = git_cli::git_command(repo).unwrap().get_program().to_owned();
+        let program = std::path::Path::new(&program);
+        assert!(
+            program.is_absolute()
+                && program.parent().and_then(|p| p.file_name()) == Some("bin".as_ref()),
+            "PATH 上是启动器，应当直接起 <prefix>\\bin\\git.exe，实际是 {program:?}"
+        );
+    }
+}
+
+#[test]
 fn run_git_surfaces_stderr_on_failure() {
     let dir = tempfile::TempDir::new().unwrap();
     let err = git_cli::run_git(dir.path().to_str().unwrap(), &["rev-parse", "HEAD"])
