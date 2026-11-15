@@ -11,13 +11,13 @@
 | T3 前端：graph 右键菜单三项、确认框、拆分弹框 | 完成 | `engine/localOnlyEdit.ts`、`engine/commitActions.ts`、`store/repoStore.ts`、`components/SplitLocalOnlyDialog.tsx`、`RepoTab.tsx`；布局场景 `split-local-only-long` | `localOnlyEdit.test.ts` 11 条、`SplitLocalOnlyDialog.test.tsx` 6 条；`capabilities.test.ts` 的 SVN 菜单清单加一项；`pnpm test:layout` 176 条（review 之前跑的） |
 | T4 真实窗口验证 | 完成 | — | 见「真实窗口验证」 |
 | 独立 review（`/code-review high`） | 10 条：修 9 条、1 条已在 review 期间修掉 | 见「review 处理」 | 新增测试修之前红或编译不过 |
-| Rust 全量测试 | 进行中 | — | 见「Rust 全量测试」 |
+| Rust 全量测试 | 完成 | — | 集成 95 个套件 1869 条通过、0 失败；lib 150 / 151（已知不稳定的 watch 用例），见「Rust 全量测试」 |
 
 ## Rust 全量测试（2026-11-16，开发机）
 
 - 本机内存紧（空闲 2.5–7 GB / 31 GB，大头不在普通进程里），后台测试被 Claude Code 按内存压力回收了 4 次；改成逐个套件跑、结果记日志、断点续跑。
 - lib 单元测试 151 条里 150 条通过。`commands::watch::tests::stage_and_unstage_only_touch_the_index` 连续失败（多收到一条 `.git/hooks` 目录事件），单独跑通过。本分支没改 `watch.rs`、`vcs/`；这条在 2026-11-08、11-11（未改动的基线 6883b03 上也失败）、11-12、11-14 的实现日志里都记过同样的现象，判断为本机负载下的已知不稳定测试，未修。
-- 集成测试：95 个套件里 54 个通过、0 失败（含 `svn_local_only_edit` 18 条之外的、与本次改动无关的套件）；本次改动相关的 17 个套件（`svn_local_only_edit`、`svn_write_guard`、`svn_restore_local_only`、`svn_follow_auto` 与重放相关套件）在压缩前已单独跑过全部通过。用户要求先开 PR，剩下的套件跑完补进本节和 PR 描述。
+- 集成测试：95 个套件全部通过，1869 条通过、0 失败、1 条 ignored（`merge_drivers` 里原本就标了 ignore）。前 54 个单线程、后 41 个 `--test-threads=4`，都是 `-j 1`。PR 先于全量测试开出（用户要求），结果随后补进本节和 PR 描述。
 
 ## 设计
 
