@@ -719,6 +719,25 @@ impl UpdateStatusEntry {
         self.repos_item.as_deref().is_some_and(|r| r != "none")
             || self.repos_props.as_deref().is_some_and(|r| r != "none")
     }
+
+    /// 工作副本里有本地改动：内容改了、不见了、被替换，或者属性改了。
+    /// 更新与交付的「白名单外的改动」都按这一条判（第 77 号 issue 去重）。
+    pub fn is_local_change(&self) -> bool {
+        matches!(self.item.as_str(), "modified" | "missing" | "replaced")
+            || self.props == "modified"
+    }
+
+    /// 只因为「不见了」才算改动：属性没改。是别的条目的祖先时，就是被删掉的目录。
+    pub fn is_only_missing(&self) -> bool {
+        self.item == "missing" && self.props != "modified"
+    }
+}
+
+/// `path`（正斜杠）的各级祖先目录，由近到远：`a/b/c` → `a/b`、`a`。
+pub fn ancestor_dirs(path: &str) -> impl Iterator<Item = &str> {
+    std::iter::successors(path.rsplit_once('/').map(|(up, _)| up), |p| {
+        p.rsplit_once('/').map(|(up, _)| up)
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]

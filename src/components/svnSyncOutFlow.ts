@@ -21,6 +21,7 @@ import {
 } from '../engine/svnSyncOut'
 import type { SyncState, SyncStateUnreadable } from '../engine/svnJournal'
 import type { ConfirmRequest } from './ConfirmDialog'
+import { createAfterSync, exclusive, showOutcomeNotice } from './svnFlowShared'
 
 /** 交付对话框的请求。`action` 抛错时对话框留在原地显示错误。 */
 export interface DeliverRequest {
@@ -54,28 +55,15 @@ export interface SvnSyncOutFlowDeps {
 }
 
 export function createSvnSyncOutFlow(d: SvnSyncOutFlowDeps) {
-  /**
-   * 收尾之后的刷新。`repo-changed` 由后端补发，这里只补它不管的 SVN 侧状态。
-   *
-   * **自己不抛**：刷新失败进错误条，不能改写交付本身的结局（最终 review 第 3 条）——
-   * 成功后抛的话对话框留在原地报错、「交付」还能点，用户以为没提交上去；失败后抛的话
-   * 后端原文（D6 失败时那是用户唯一知道「提交已经成功、点继续」的地方）被顶掉。
-   */
-  const afterSync = async () => {
-    // 两项同时发、各报各的错，同 `svnSyncFlow` 的 `afterSync`：复查要在命令返回的这一拍里进去，才能与
-    // 后端补发的 `repo-changed` 共用一轮 `svn status`（`repoStore` 的 `refreshSvnSync`）
-    const results = await Promise.allSettled([
-      d.refreshSvnSyncState(d.repoPath),
-      d.refreshSvnSync(d.repoPath),
-    ])
-    for (const r of results) if (r.status === 'rejected') d.reportError(r.reason)
-    void d.fetchSvnLog(d.repoPath)
-  }
+  const afterSync = createAfterSync(d)
 
   /**
    * 失败也可能留下或推进了记录（D5 状态未知、D6 失败、继续时从 post-commit 走到
    * publishing-baseline 再停下），横幅要立刻跟上——停在旧 phase 的话按钮与文案都是错的。
    * 错误原样抛回给对话框显示。
+   *
+   * 后端无论成败都补发 `repo-changed`、监听器也会刷同步状态，所以它对最终状态不是必需的；
+   * 它保证的是**先后**：用户看到错误时横幅已经是新 phase（第 77 号 issue 的确认，见决策日志）。
    */
   const refreshing = async <T>(run: () => Promise<T>): Promise<T> => {
     try {
@@ -86,23 +74,8 @@ export function createSvnSyncOutFlow(d: SvnSyncOutFlowDeps) {
     }
   }
 
-  /** 结局提示，`notice` 让它只有一个按钮（理由同 `svnSyncFlow`）。 */
-  const showOutcome = async (o: SyncOutOutcome | null) => {
-    const n = o && describeSyncOutOutcome(o)
-    if (!n) return
-    await d.confirm({ title: n.title, message: n.detail, confirmLabel: '知道了', notice: n.tone })
-  }
-
-  /** 同一时间只走一个流程（理由同 `svnSyncFlow` 的 `exclusive`）。 */
-  const exclusive = async (run: () => Promise<void>) => {
-    if (d.running.current) return
-    d.running.current = true
-    try {
-      await run()
-    } finally {
-      d.running.current = false
-    }
-  }
+  const showOutcome = (o: SyncOutOutcome | null) =>
+    showOutcomeNotice(d.confirm, o && describeSyncOutOutcome(o))
 
   /** 「交付」：预览 → 对话框（写信息、确认）→ 执行。 */
   const svnDeliver = async () => {
@@ -158,7 +131,7 @@ export function createSvnSyncOutFlow(d: SvnSyncOutFlowDeps) {
   }
 
   return {
-    handleSvnDeliver: () => exclusive(svnDeliver),
-    handleSyncOutAction: (id: SyncOutActionId) => exclusive(() => syncOutAction(id)),
+    handleSvnDeliver: () => exclusive(d.running, svnDeliver),
+    handleSyncOutAction: (id: SyncOutActionId) => exclusive(d.running, () => syncOutAction(id)),
   }
 }

@@ -20,6 +20,7 @@ use crate::engine::svn_replay::{
     changed_paths, tree_without, write_commit, ReplayCodes, ReplayCommit,
 };
 use crate::engine::svn_sync_check::{check_git_idle, current_branch, rev_parse};
+use crate::engine::svn_util::short;
 use crate::error::{GitError, Result};
 use std::collections::BTreeSet;
 
@@ -282,7 +283,7 @@ fn finish(repo: &str, ctx: &Prepared, first: String, verb: &str) -> Result<EditO
     }
     let refname = format!("refs/heads/{}", ctx.branch);
     let target = &ctx.chain[0].oid;
-    let reason = format!("mygitclient: {verb} {}", &target[..target.len().min(10)]);
+    let reason = format!("mygitclient: {verb} {}", short(target));
     // CAS：读完 HEAD 到这里之间分支被别人挪了，就什么都不改
     match run_git_code(
         repo,

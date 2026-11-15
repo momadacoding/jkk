@@ -21,6 +21,7 @@ use crate::engine::svn_replay::{
     commits_between, no_superseded, replay_onto, ReplayCodes, ReplayCommit, ReplayOpts,
     ReplayOutcome,
 };
+use crate::engine::svn_util::short;
 use crate::error::{GitError, Result};
 use std::collections::{BTreeMap, HashMap};
 
@@ -246,8 +247,4 @@ fn merge_in_slow_path(m: &ReplayCommit) -> GitError {
             m.subject
         ),
     )
-}
-
-fn short(oid: &str) -> &str {
-    &oid[..oid.len().min(10)]
 }

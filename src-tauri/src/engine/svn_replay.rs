@@ -22,6 +22,7 @@
 use crate::engine::git_cli::{run_git, run_git_code, run_git_env, run_git_stdin_env};
 use crate::engine::graph::parse_local_only;
 use crate::engine::svn_baseline::{TempFile, TempIndex};
+use crate::engine::svn_util::short;
 use crate::error::{GitError, Result};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -637,8 +638,4 @@ fn require_oid(oid: &str, code: &str) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-fn short(oid: &str) -> &str {
-    &oid[..oid.len().min(10)]
 }

@@ -17,8 +17,9 @@ use crate::engine::svn_sync_check::{
     check_git_idle, current_branch, list_paths, precheck_include_set, rev_parse, unfinished_error,
 };
 use crate::engine::svn_tombstone::server_head_rev_with;
+use crate::engine::svn_util::short;
 use crate::engine::svn_wc::peg_safe;
-use crate::engine::svn_xml::parse_update_status;
+use crate::engine::svn_xml::{ancestor_dirs, parse_update_status};
 use crate::error::{GitError, Result};
 use crate::vcs::{detect_repo_kind, RepoKind};
 
@@ -155,7 +156,7 @@ fn attached_branch(repo: &str) -> Result<String> {
             format!(
                 "HEAD 没有附着在分支上（停在 {}）。交付之后要把一个分支接到新基线上，\
                  detached HEAD 没有分支可接。请 `git switch -c <新分支名>` 或切回原来的分支。",
-                &at[..at.len().min(10)]
+                short(&at)
             ),
         ));
     };
@@ -347,11 +348,7 @@ fn outside_changes(repo: &str, cfg: &SvnConfig) -> Result<Vec<String>> {
     // 整批判一次：「尊重 .gitignore」时每次判定都是一次 git 子进程
     let w_files = WScope::for_repo(repo, cfg)?.filter(entries.iter().map(|e| e.path.as_str()))?;
     for e in entries {
-        let mut p = e.path.as_str();
-        while let Some((up, _)) = p.rsplit_once('/') {
-            parents.insert(up.to_string());
-            p = up;
-        }
+        parents.extend(ancestor_dirs(&e.path).map(str::to_string));
         if e.is_conflicted() {
             conflicted.push(e.path.clone());
             continue;
@@ -359,10 +356,8 @@ fn outside_changes(repo: &str, cfg: &SvnConfig) -> Result<Vec<String>> {
         if w_files.contains(&e.path) {
             continue; // git 管着，上面的 git_dirty 已经要求它干净
         }
-        let changed =
-            matches!(e.item.as_str(), "modified" | "missing" | "replaced") || e.props == "modified";
-        if changed {
-            if e.item == "missing" && e.props != "modified" {
+        if e.is_local_change() {
+            if e.is_only_missing() {
                 only_missing.insert(e.path.clone());
             }
             local.push(e.path.clone());

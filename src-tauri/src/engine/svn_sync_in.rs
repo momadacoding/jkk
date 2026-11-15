@@ -39,6 +39,7 @@ use crate::engine::svn_sync_check::{
     unmerged_paths, SyncInPreview,
 };
 use crate::engine::svn_sync_stash::{self as wip, RestoreOutcome};
+use crate::engine::svn_util::now_secs;
 use crate::engine::svn_wc::enumerate_wcs;
 use crate::engine::svn_xml::parse_update_status;
 use crate::error::{GitError, Result};
@@ -920,35 +921,51 @@ pub(crate) fn restore_step_with(
     Ok(RestoreStep::Finished)
 }
 
-/// `git checkout` 之后核对它真的切干净了（计划 A15）。
-///
-/// 2026-09-25 实测：文件被以 share=Read 打开（Unity 的方式）时，checkout **退出 0**、
-/// HEAD 已经切走，而那个文件还是原来的内容——git 只在 stderr 里打一行
-/// `unable to unlink old`。所以退出码证明不了任何事，只能事后看。
+/// 切到分支 `branch`，事后核对真的切干净了（见 [`run_checkout_verified`]）。
 pub(crate) fn checkout_verified(
     repo: &str,
     cfg: &SvnConfig,
     branch: &str,
     force: bool,
 ) -> Result<()> {
-    let from = rev_parse(repo, "HEAD")?;
     let mut args: Vec<&str> = vec!["checkout"];
     if force {
         args.push("-f");
     }
     args.push(branch);
-    let ran = run_git(repo, &args);
-    let on_target = current_branch(repo)?.as_deref() == Some(branch);
+    run_checkout_verified(repo, cfg, &args, branch, || {
+        Ok(current_branch(repo)?.as_deref() == Some(branch))
+    })
+}
+
+/// 跑一次 `git checkout`（`args` 是完整参数），之后核对它真的切干净了（计划 A15）。
+/// `sync_out` 的 detached checkout 也走这里（第 77 号 issue 去重）。
+///
+/// 2026-09-25 实测：文件被以 share=Read 打开（Unity 的方式）时，checkout **退出 0**、
+/// HEAD 已经切走，而那个文件还是原来的内容——git 只在 stderr 里打一行
+/// `unable to unlink old`。所以退出码证明不了任何事，只能事后看。
+///
+/// `on_target`：HEAD 是不是落在了目标上，checkout 之后、核对文件之前调用。`label` 是报错里的目标名。
+pub(crate) fn run_checkout_verified(
+    repo: &str,
+    cfg: &SvnConfig,
+    args: &[&str],
+    label: &str,
+    on_target: impl FnOnce() -> Result<bool>,
+) -> Result<()> {
+    let from = rev_parse(repo, "HEAD")?;
+    let ran = run_git(repo, args);
+    let on_target = on_target()?;
     let mut stale = tracked_changes(repo, cfg)?;
     // 该删却没删掉的文件退出 0 地留下，成了未跟踪文件（PR #49 review #7）
     stale.extend(untracked_leftovers(repo, cfg, &[from])?);
     if on_target && stale.is_empty() {
         return Ok(());
     }
-    Err(checkout_failed(repo, branch, &stale, ran))
+    Err(checkout_failed(repo, label, &stale, ran))
 }
 
-/// checkout 没切干净时的报错（计划 A15）。`sync_out` 的 detached checkout 也用它。
+/// checkout 没切干净时的报错（计划 A15）。经 [`run_checkout_verified`]，`sync_out` 的 detached checkout 也用它。
 pub(crate) fn checkout_failed(
     repo: &str,
     target: &str,
@@ -1110,13 +1127,6 @@ pub(crate) fn new_opid() -> String {
         .unwrap_or(0);
     // 只含十六进制字符：它会进 stash message 与 ref 名（`refs/mygitclient/sync/<opid>`）
     format!("{nanos:x}{:x}", std::process::id())
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 // —— 继续 / 放弃（spec §7.6：「提供继续 / 放弃两个入口」）——

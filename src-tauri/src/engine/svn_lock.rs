@@ -23,6 +23,7 @@
 //!
 //! `pid` / `startedAt` 仍然落盘：§13 要求显示给用户，只是不再用作判据。
 
+use crate::engine::svn_util::now_secs;
 use crate::error::{GitError, Result};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -167,13 +168,6 @@ pub fn holder(repo_root: &str) -> Option<LockHolder> {
     let mut s = String::new();
     f.read_to_string(&mut s).ok()?;
     serde_json::from_str(&s).ok()
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// 「原子创建且必须不存在」+ 独占共享模式。两件事必须在**同一次**打开里完成：

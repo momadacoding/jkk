@@ -42,6 +42,7 @@ import {
 import type { SyncState, SyncStateUnreadable } from '../engine/svnJournal'
 import { perfMark, perfSpan } from '../store/perf'
 import type { ConfirmRequest } from './ConfirmDialog'
+import { createAfterSync, exclusive as sharedExclusive, showOutcomeNotice } from './svnFlowShared'
 
 export interface SvnSyncFlowDeps {
   repoPath: string
@@ -134,23 +135,7 @@ const TRANSIENT_SKIPS = new Set(['svn_index_busy', 'svn_follow_state_changed', '
 const TRANSIENT_RETRY_MS = 2000
 
 export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
-  /**
-   * 同步收尾之后的刷新。`repo-changed` 由后端补发，这里只补它不管的 SVN 侧状态。
-   *
-   * **自己不抛**，理由同 `svnSyncOutFlow` 的 `afterSync`：它跑在对话框的 `action` 里，
-   * 更新已经落地之后再抛，对话框会留在原地报错、「更新」还能点，用户以为没更新上。
-   * 刷新失败只进错误条。
-   */
-  const afterSync = async () => {
-    // 两项同时发、各报各的错。复查必须在命令返回的这一拍里进去（见 `SvnSyncFlowDeps.refreshSvnSync`），
-    // 排在读同步状态后面的话多半要白扫一遍 `svn status`；同步状态读不出来也不该让复查不跑
-    const results = await Promise.allSettled([
-      d.refreshSvnSyncState(d.repoPath),
-      d.refreshSvnSync(d.repoPath),
-    ])
-    for (const r of results) if (r.status === 'rejected') d.reportError(r.reason)
-    void d.fetchSvnLog(d.repoPath)
-  }
+  const afterSync = createAfterSync(d)
 
   /**
    * 跟进之后多刷一份：HEAD、提交图、本地改动，加上 SVN 侧的状态。`repo-changed` 也会补发，这里不靠它。
@@ -172,27 +157,14 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
     return { value, ms: performance.now() - t0 }
   }
 
-  /** 冲突、撞名、放弃这几种结局要让用户看见；成功不打扰。`notice` 让它只有一个按钮。 */
-  const showOutcome = async (o: SyncInOutcome | null, manual = false) => {
-    const n = o && (manual ? describeManualFollowOutcome(o) : describeSyncOutcome(o))
-    if (!n) return
-    await d.confirm({ title: n.title, message: n.detail, confirmLabel: '知道了', notice: n.tone })
-  }
+  /** 冲突、撞名、放弃这几种结局要让用户看见；成功不打扰。 */
+  const showOutcome = (o: SyncInOutcome | null, manual = false) =>
+    showOutcomeNotice(
+      d.confirm,
+      o && (manual ? describeManualFollowOutcome(o) : describeSyncOutcome(o)),
+    )
 
-  /**
-   * 同一时间只走一个流程。预览要跑 `svn status -u`（网络），那几秒里界面上没有框挡着，
-   * 工具栏的「更新」和横幅上的按钮都点得到；两个流程的确认框会互相顶替
-   * （PR #49 Codex review #5）。后端的锁拦得住第二次执行，拦不住界面的错乱。
-   */
-  const exclusive = async (run: () => Promise<void>) => {
-    if (d.running.current) return
-    d.running.current = true
-    try {
-      await run()
-    } finally {
-      d.running.current = false
-    }
-  }
+  const exclusive = (run: () => Promise<void>) => sharedExclusive(d.running, run)
 
   /**
    * 「更新」（spec §7）：预览 → 确认 → 执行。

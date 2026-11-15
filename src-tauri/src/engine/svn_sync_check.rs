@@ -16,7 +16,8 @@ use crate::engine::svn_externals::detect_pinned;
 use crate::engine::svn_include_check::verify_include_set;
 use crate::engine::svn_scope::WScope;
 use crate::engine::svn_sync::{check_sync_with_nodes, SyncVerdict};
-use crate::engine::svn_xml::parse_update_status;
+use crate::engine::svn_util::short;
+use crate::engine::svn_xml::{ancestor_dirs, parse_update_status};
 use crate::engine::{svn_journal, svn_lock};
 use crate::error::{GitError, Result};
 use crate::vcs::{detect_repo_kind, RepoKind};
@@ -141,24 +142,17 @@ pub(crate) fn check_sync_in(repo_root: &str) -> Result<SyncInPreview> {
     // 丢掉的非 W-file 逐个列出来；这里只列带 incoming 的，服务器上没动的 `x.psd` 不会单独出现，
     // 用户在资源管理器里删掉整个目录时，目录条目是唯一的提醒（review 第 1 条，fixture 场景 D）。
     // 目录自己的属性改动照样要确认
-    let mut parents = std::collections::HashSet::new();
+    let parents: std::collections::HashSet<&str> = st
+        .entries
+        .iter()
+        .flat_map(|e| ancestor_dirs(&e.path))
+        .collect();
     let mut lost_non_w = std::collections::HashSet::new();
-    for e in &st.entries {
-        let mut p = e.path.as_str();
-        while let Some((up, _)) = p.rsplit_once('/') {
-            parents.insert(up);
-            p = up;
-        }
-    }
     for e in &st.entries {
         // 只从叶子往上标：被删的子目录自己也是「丢掉的非 W 条目」，从它标会把嵌套目录全拦下
         let leaf = !parents.contains(e.path.as_str());
         if leaf && e.item == "missing" && !w_files.contains(&e.path) {
-            let mut p = e.path.as_str();
-            while let Some((up, _)) = p.rsplit_once('/') {
-                lost_non_w.insert(up);
-                p = up;
-            }
+            lost_non_w.extend(ancestor_dirs(&e.path));
         }
     }
     let mut conflicted = Vec::new();
@@ -172,13 +166,9 @@ pub(crate) fn check_sync_in(repo_root: &str) -> Result<SyncInPreview> {
             continue; // git 管着，S1 会压进 stash
         }
         let path = e.path.as_str();
-        let removed_dir = e.item == "missing"
-            && e.props != "modified"
-            && parents.contains(path)
-            && !lost_non_w.contains(path);
-        let local =
-            matches!(e.item.as_str(), "modified" | "missing" | "replaced") || e.props == "modified";
-        if local && !removed_dir && e.is_incoming() {
+        let removed_dir =
+            e.is_only_missing() && parents.contains(path) && !lost_non_w.contains(path);
+        if e.is_local_change() && !removed_dir && e.is_incoming() {
             outside.push(e.path.clone());
         }
     }
@@ -343,7 +333,7 @@ fn attached_branch(repo_root: &str) -> Result<String> {
             format!(
                 "HEAD 没有附着在分支上（停在 {}）。更新要把一个分支重放到新基线上，\
                  detached HEAD 没有分支可搬。请 `git switch -c <新分支名>` 或切回原来的分支。",
-                &at[..at.len().min(10)]
+                short(&at)
             ),
         ));
     };

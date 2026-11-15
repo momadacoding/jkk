@@ -67,6 +67,7 @@ pub mod svn_sync_out;
 pub mod svn_sync_out_check;
 pub mod svn_sync_stash;
 pub mod svn_tombstone;
+pub(crate) mod svn_util;
 pub mod svn_wc;
 pub mod svn_wcdb;
 pub mod svn_xml;
