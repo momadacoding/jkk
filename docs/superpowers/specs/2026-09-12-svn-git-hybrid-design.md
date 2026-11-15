@@ -3583,7 +3583,8 @@ R2b 用一个**临时索引**把磁盘内容录成 tree，全程不碰真实 ind
       GIT_INDEX_FILE=<tmp> git read-tree --empty
       GIT_INDEX_FILE=<tmp> git add -A -- <W-path>
     再按 R2a 的分类逐条改写，把这棵「磁盘树」变成「服务器 rN 的树」：
-      取回 BASE：svn cat -r BASE -- <path>@  →  git hash-object -w --stdin  → OID
+      取回 BASE：svn cat -r BASE -- <path>@  →  git hash-object -w --path <path> --stdin  → OID
+                 ⚠️ **必须带 `--path`**，否则 `core.autocrlf` 会让两条录制路径分叉，见 §16.2.1
                  GIT_INDEX_FILE=<tmp> git update-index --add --cacheinfo <mode>,<OID>,<path>
                  <mode> 取该路径在临时索引里已有的 mode，不在索引里（D / !）则用 100644
       剔除    ：GIT_INDEX_FILE=<tmp> git update-index --force-remove -- <path>
