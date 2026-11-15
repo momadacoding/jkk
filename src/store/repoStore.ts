@@ -7,6 +7,8 @@ import { ALL_CAPABILITIES, type Capabilities } from '../engine/capabilities'
 import type { WorktreeHolder } from '../engine/worktreeHolders'
 import {
   auditIsDue,
+  idleAuditIsDue,
+  type AuditMark,
   isPlainCommitOn,
   markOnBlur,
   recordAfterSuccess,
@@ -666,13 +668,20 @@ export function useRepoStore() {
   const svnChecksRunning = useRef(0)
 
   /**
-   * 上一次**开始**服务器侧核对的时刻，与 `auditInFlight` 一起构成
-   * `auditIsDue` 的输入。用 ref 而不是 state：写它不该引起重渲染，
+   * 上一次服务器侧核对**开始**时的现场（`AuditMark`），与 `auditInFlight`、`auditEpoch` 一起构成
+   * `idleAuditIsDue` 的输入。用 ref 而不是 state：写它不该引起重渲染，
    * 而且定时器闭包读 state 会永远读到注册那一刻的值（`lastWcDbStamps`
    * 的注释里记的是同一个坑）。
    */
-  const lastAuditAt = useRef(0)
+  const lastAudit = useRef<AuditMark | null>(null)
+  /** 后台入口正在读戳、判定或核对。 */
   const auditInFlight = useRef(false)
+  /** 在跑的核对轮数，显式与后台都算：显式核对在跑时后台不再并发一轮。 */
+  const auditsRunning = useRef(0)
+  /** 后台入口上一次真的去问现场（读戳）的时刻。见 `auditSvnIfDue`。 */
+  const lastAuditGateAt = useRef(0)
+  /** 这个仓库来过几次 `repo-changed`（`noteRepoChanged`）。磁盘上的文件变了、基线动了都会来。 */
+  const auditEpoch = useRef(0)
 
   /** `refreshConflicts` 的请求代次，见 `createLatestGate`。放 ref：要跨渲染保持计数。 */
   const refreshGate = useRef(createLatestGate()).current
@@ -683,6 +692,8 @@ export function useRepoStore() {
   const refreshFlights = useRef(createSingleFlight()).current
   /** SVN 失同步检测的单飞队列，见 `requestSvnCheck`。放 ref 的理由同上。 */
   const svnCheckQueue = useRef(createSvnCheckQueue()).current
+  /** 在跑的那一轮检测是替哪次 HEAD 观测开跑的；不是替某个 HEAD 开跑的（比戳、读不出 HEAD）时 `head` 为空。见 `requestSvnCheck`。 */
+  const roundHead = useRef<{ path: string, head: HeadObservation | null } | null>(null)
   /**
    * 最后一次请求状态 / diff 的仓库路径。单飞按路径分开（不同仓库的读取不能互相顶替），
    * 旧仓库晚到的结果就要靠它挡住，不让它盖掉新仓库的。现在每个标签页的路径是固定的，
@@ -725,6 +736,9 @@ export function useRepoStore() {
       // 会把下一个普通 git 仓库的入口一起关掉。
       const caps = await readCapabilities(path)
       openedPath.current = path
+      // 上一个仓库的核对现场不算这个仓库的（独立 review 第 4 条）
+      lastAudit.current = null
+      lastAuditGateAt.current = 0
       setState((s) => ({
         ...s,
         path,
@@ -814,8 +828,18 @@ export function useRepoStore() {
   const refreshHeadInfo = async (path: string): Promise<HeadObservation> => {
     const info = await invoke<RepoInfo>('open_repo', { path })
     setState((s) => ({ ...s, head: info.head, headHash: info.headHash }))
-    return { branch: info.head, hash: info.headHash, parents: info.headParents ?? [] }
+    return observedHead(info)
   }
+
+  const observedHead = (info: RepoInfo): HeadObservation =>
+    ({ branch: info.head, hash: info.headHash, parents: info.headParents ?? [] })
+
+  /**
+   * 只读 HEAD，不写 state。同步之后的复查（`refreshSvnSync`）用：它可能在用户切到别的仓库之后才
+   * 读回来，写 state 会把旧仓库的分支名挂到新仓库的标题上；界面上的 HEAD 另有人刷。
+   */
+  const readHeadInfo = async (path: string): Promise<HeadObservation> =>
+    observedHead(await invoke<RepoInfo>('open_repo', { path }))
 
   /**
    * 重新加载提交图。
@@ -1066,18 +1090,75 @@ export function useRepoStore() {
    * 在跑时来的合并成一轮补跑，`force` 取或。计数包在开跑的那一轮上：排队期间前一轮还在跑，
    * 计数本来就不是 0。唯一不排队的是提交前的 `freshSvnSync`，见那里。
    */
-  const requestSvnCheck = (path: string, force: boolean) =>
-    svnCheckQueue.request(path, force, (forced) => runSvnCheckNow(path, forced))
+  /**
+   * `head` 是这次请求按哪次 HEAD 观测来的（`forceCheckAtHead`）；`since` 是调用方取的号。两个都给、而且
+   * 在跑的那一轮正是替**同一个 HEAD** 开跑的，才复用它（`svnCheckQueue` 的「什么时候可以复用」）。
+   *
+   * 为什么要比 HEAD（独立 review 第 3 条）：调用方的 HEAD 是在那一轮开跑**之后**读的。那一轮替 X 开跑，
+   * 调用方读到的已经是 Y，复用之后把 Y 记成「按它校验过」，Y 的事件就被当成没变而跳过，横幅停在按 X
+   * 算的结论上。`recordAfterSuccess` 要求观测值不晚于校验，这里用「与开跑前那次观测相同」守住它。
+   */
+  const requestSvnCheck = (path: string, force: boolean, head?: HeadObservation, since?: number) => {
+    const running = roundHead.current
+    const sameRound = head && running?.head && samePath(running.path, path) && sameHeadForSync(running.head, head)
+    return svnCheckQueue.request(
+      path,
+      force,
+      (forced) => {
+        // 补跑用的是最后一次传进来的闭包：比戳的请求合并进来时这里没有 HEAD，那一轮就不给人复用
+        const round = { path, head: head ?? null }
+        roundHead.current = round
+        return runSvnCheckNow(path, forced).finally(() => {
+          if (roundHead.current === round) roundHead.current = null
+        })
+      },
+      sameRound ? since : undefined,
+    )
+  }
 
   /**
-   * 第二档的**无条件**入口：重建基线、同步之后用。打开仓库走 `forceCheckAtHead`（同样无条件，另外
-   * 记下 HEAD），读不出 HEAD 时才退回这里。
+   * 第二档的**无条件**入口：重建基线、同步（更新、跟进、交付）之后用。打开仓库直接走
+   * `forceCheckAtHead`。
    *
    * 顺带把 wc.db 戳记下来当基准——不记的话打开仓库后第一次存盘或焦点会因为记录还是 `null`
    * 而再跑一次全量。先读戳再跑校验，而且只在校验写回后才记（`runSvnSyncCheck`）。
+   *
+   * # 与后端补发的 `repo-changed` 共用一轮（2026-11-11 使用报告「跟进耗时」10.5 的 P3）
+   *
+   * 同步命令返回前后端补发一次 `repo-changed`，同步多半又挪了 HEAD：监听读到新 HEAD 强制跑一轮，
+   * 这里再强制跑一轮，两轮各是一遍 `svn status` 全量扫描，结论相同。两处配合起来只跑一轮：
+   *
+   * - 按现读的 HEAD 校验（`forceCheckAtHead`）：这一轮在跑时监听读到同一个 HEAD，认出已经有人在
+   *   校验，不再排；写回后记下 HEAD，之后的事件也不再跑。
+   * - 进来的那一刻取号（`svnCheckQueue.mark`）：读 HEAD 的这一拍里监听那一轮先开跑了的话，它开跑在
+   *   调用之后、替的又是同一个 HEAD（`requestSvnCheck`），结论不比这里自己跑的旧，直接复用。进来之前
+   *   就在跑的、替别的 HEAD 开跑的都不复用，照旧补跑。
+   *
+   * 所以调用方要在命令返回的**同一拍**里调它，中间不要先 await 别的刷新：晚进来一步，监听那一轮
+   * 已经开跑，就只能再补一轮（结论仍然对，只是白扫一遍）。「更新」之后仍是两轮：它改了 wc.db，监听那边
+   * 比戳的一轮在取号之前就开跑并跑了第二档，不是强制的，认不出来。读不出 HEAD 时退回不认 HEAD 的强制一轮。
+   *
+   * 失败了自己再试一次（独立 review 第 6 条）：原来监听与这里各跑一轮，一轮撞上 wc.db 被锁还有另一轮；
+   * 共用之后那一轮失败，监听的事件已经用掉，之后比戳的检测又因为戳没变而不跑，横幅会停在同步之前。
    */
   const refreshSvnSync = async (path: string): Promise<void> => {
-    await requestSvnCheck(path, true)
+    const since = svnCheckQueue.mark()
+    let head: HeadObservation
+    try {
+      head = await readHeadInfo(path)
+    } catch {
+      await requestSvnCheck(path, true)
+      return
+    }
+    // 读 HEAD 的这一拍里切到了别的仓库：`headRequested` 记的是当前打开的那个仓库，不能写进旧仓库的 HEAD；
+    // 结论反正也写不回去（`applySvnSync` 的守卫）
+    if (!samePath(openedPath.current ?? '', path)) return
+    try {
+      await forceCheckAtHead(path, head, since)
+    } catch {
+      if (!samePath(openedPath.current ?? '', path)) return
+      await forceCheckAtHead(path, head)
+    }
   }
 
   /**
@@ -1118,15 +1199,16 @@ export function useRepoStore() {
    * 之后、打开仓库时都走这里。
    *
    * 跑的过程中 `headRequested` 是它（见 `checkSvnSyncIfHeadMoved` 为什么要比还没落定的 HEAD）。
+   * `since` 是调用方取的号（`refreshSvnSync`）：之后才开跑的强制一轮可以直接复用。
    */
-  const forceCheckAtHead = async (path: string, head: HeadObservation) => {
+  const forceCheckAtHead = async (path: string, head: HeadObservation, since?: number) => {
     headRequested.current = head
     let recorded = false
     try {
       recorded = await recordAfterSuccess(
         lastCheckedHead.current,
         head,
-        async () => (await requestSvnCheck(path, true)) === 'applied',
+        async () => (await requestSvnCheck(path, true, head, since)) === 'applied',
       )
     } finally {
       // 更晚的一次已经接手时不清：它落定前，再来的同一个 HEAD 不必重复请求
@@ -1269,34 +1351,85 @@ export function useRepoStore() {
    *   已经成立的漏收警告抹掉，是把真警报降级成沉默——而这条检查存在的全部理由
    *   就是那个沉默很危险。
    */
-  const refreshSvnAudit = async (path: string, keepOnError = false) => {
-    lastAuditAt.current = Date.now()
+  const refreshSvnAudit = async (
+    path: string,
+    keepOnError = false,
+    observed?: { epoch: number, stamps: WcDbStamp[] | null },
+  ) => {
+    // 记下开始这一刻的现场：之后的后台触发据此判断要不要重跑（`idleAuditIsDue`）。**同步**记，
+    // 不在前面 await：显式核对（打开仓库、重建之后）原来先等一次读戳，后台触发落在那个空档里
+    // 就并发跑第二轮（独立 review 第 1 条）。显式核对用失同步检测刚记下的戳：它只会比此刻旧，
+    // 旧了只会让下一次多跑，不会漏
+    const mark: AuditMark = {
+      at: Date.now(),
+      epoch: observed?.epoch ?? auditEpoch.current,
+      stamps: observed ? observed.stamps : lastWcDbStamps.current.value,
+      conclusive: false,
+    }
+    lastAudit.current = mark
+    // 只认最后发起的一次：后台那轮比重建之后的显式一轮晚回来时，带的是重建前的结论，不能盖上去；
+    // 而新闸会让它最长挂一小时（独立 review 第 2 条）
+    const token = refreshGate.begin('svnAudit')
+    auditsRunning.current += 1
     try {
       const audit = await svnServerAudit(path)
+      if (!refreshGate.isLatest(token, 'svnAudit')) return
       // 核对期间用户可能已经切到别的仓库了。不比一下路径的话，这次的结果会写进
       // 另一个完全无关的仓库的横幅里——后台定时重跑之后这个窗口大了很多。
       setState((s) => (samePath(s.path ?? '', path) ? { ...s, svnAudit: audit } : s))
+      // 结果没写进去（已切走）就不算这个仓库得出过结论
+      if (samePath(openedPath.current ?? '', path)) mark.conclusive = audit.status !== 'notChecked'
     } catch (err) {
       console.warn('服务器侧清单核对失败：', err)
-      if (keepOnError) return
+      if (keepOnError || !refreshGate.isLatest(token, 'svnAudit')) return
       setState((s) => (samePath(s.path ?? '', path) ? { ...s, svnAudit: null } : s))
+    } finally {
+      auditsRunning.current -= 1
     }
   }
 
   /**
-   * 后台自动重跑的入口：过了闸才真的发请求（`auditIsDue`）。
+   * 后台自动重跑的入口：过了闸才真的发请求（`idleAuditIsDue`）。
    *
    * 这条检查要抓的是用户**不知情**的漏收，所以不能只靠手动入口——不知道出事的人
-   * 不会去点那颗按钮（2026-09-19 用户决定）。
+   * 不会去点那颗按钮（2026-09-19 用户决定）。但现场没变时重跑一定得出同一个结论，
+   * 空闲时就不再每 5 分钟访问一次服务器（2026-11-11 提交慢报告第 7 节）。
+   *
+   * 先读事件计数、再读戳，都在判定之前：判定用的就是之后记进 `lastAudit` 的那一份。
+   * 读戳这一拍里就标成在跑，两次触发挤在一起时不会都过闸。
+   *
+   * 时间闸按「上次核对或上次问过现场」里较晚的那个算：只按上次核对算的话，空闲久了每次焦点、
+   * 每个标签都要读一次戳（独立 review 第 3 条）。现在每个标签一分钟最多读一次。
    */
   const auditSvnIfDue = async (path: string) => {
-    if (!auditIsDue(Date.now(), lastAuditAt.current, auditInFlight.current)) return
+    const now = Date.now()
+    const busy = auditInFlight.current || auditsRunning.current > 0
+    const last = Math.max(lastAudit.current?.at ?? 0, lastAuditGateAt.current)
+    if (!auditIsDue(now, last, busy)) return
+    lastAuditGateAt.current = now
     auditInFlight.current = true
     try {
-      await refreshSvnAudit(path, true)
+      const epoch = auditEpoch.current
+      const stamps = await readStampsOrNull(path)
+      if (!idleAuditIsDue(Date.now(), lastAudit.current, epoch, stamps)) return
+      await refreshSvnAudit(path, true, { epoch, stamps })
     } finally {
       auditInFlight.current = false
     }
+  }
+
+  /** 读 wc.db 戳，读不出来交回 `null`（`idleAuditIsDue` 按「没有依据判断没变」处理）。 */
+  const readStampsOrNull = async (path: string): Promise<WcDbStamp[] | null> => {
+    try {
+      return await svnWcDbStamps(path)
+    } catch {
+      return null
+    }
+  }
+
+  /** 来了一次本仓库的 `repo-changed`：磁盘上的文件或基线可能变了，下一次后台核对照跑。 */
+  const noteRepoChanged = () => {
+    auditEpoch.current += 1
   }
 
   /**
@@ -1483,6 +1616,7 @@ export function useRepoStore() {
     fetchSvnLog,
     refreshSvnAudit,
     auditSvnIfDue,
+    noteRepoChanged,
     selectCommit,
     clearError,
     reportError,
@@ -1516,6 +1650,8 @@ export interface RepoRefreshers {
   refreshSvnBranchesBehind: (path: string) => Promise<void>
   /** 服务器侧核对的**后台**入口，自带频率闸。挂定时器与窗口焦点。 */
   auditSvnIfDue: (path: string) => Promise<void>
+  /** 本仓库来了一次 `repo-changed`。后台核对据此知道现场可能变了（`idleAuditIsDue`）。 */
+  noteRepoChanged: () => void
   /** `useRepoStore` 的 `wantedDiffScope`：这里每次渲染写入当前视图的 scope。 */
   wantedDiffScope: MutableRefObject<string | null | undefined>
   /** 用户操作引起的读取失败交给顶部错误条。 */
@@ -1535,7 +1671,7 @@ export function useRepoEffects(
   changesScope: string | null,
   active: boolean,
 ) {
-  const { refreshHeadInfo, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, checkSvnSyncOnFocus, markSvnFollowOnBlur, refreshSvnSyncState, refreshSvnBranchesBehind, auditSvnIfDue, reportError } = refreshers
+  const { refreshHeadInfo, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers, refreshDiff, refreshUpstream, refreshStashes, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, checkSvnSyncOnFocus, markSvnFollowOnBlur, refreshSvnSyncState, refreshSvnBranchesBehind, auditSvnIfDue, noteRepoChanged, reportError } = refreshers
   // svn 节点有两版本地基线时读两版之差（`range:`）；不在图上的选中（stash）照旧按 oid 读
   const diffScope = viewMode === 'changes'
     ? changesScope
@@ -1577,6 +1713,7 @@ export function useRepoEffects(
       // 事件是全局广播的，每个标签只认自己那个仓库的变更
       if (!samePath(event.payload, path)) return
       perfMark('repo-changed')
+      noteRepoChanged()
       // 刷新期间仓库可能正处于中间态（比如 checkout 写到一半），失败就等下一次事件
       const ignore = () => undefined
       // 外部 checkout 同样会改 HEAD 和 worktree 归属，两者都要跟着刷新
@@ -1688,9 +1825,19 @@ export function useRepoEffects(
     }
     const timer = window.setInterval(tick, SVN_AUDIT_POLL_MS)
     window.addEventListener('focus', tick)
+    // 监听出错（缓冲区溢出、目录挂不上）时文件事件可能漏了，后台核对的「现场没变」就不可信：
+    // 当成来了一次 repo-changed。事件不带路径，每个标签都记（独立 review 第 5 条）
+    let disposed = false
+    let unlisten: (() => void) | undefined
+    void listen<string>('watch-error', () => noteRepoChanged()).then((fn) => {
+      if (disposed) fn()
+      else unlisten = fn
+    })
     return () => {
       window.clearInterval(timer)
       window.removeEventListener('focus', tick)
+      disposed = true
+      unlisten?.()
     }
     // ⚠️ 依赖里**不放** `auditSvnIfDue`：它每次渲染都是新函数，放进去会让这个
     // effect 每渲染一次就重装一次定时器，五分钟的计时永远归零、一次都不会触发。

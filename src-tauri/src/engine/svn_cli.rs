@@ -33,6 +33,12 @@ pub fn svn_command(path: &str) -> Command {
 /// 这三处全部失败，仓库根本打不开。哪些调用该带由调用点决定，见 spec §4.4 的
 /// 子命令表。
 pub fn run_svn(path: &str, args: &[&str]) -> Result<String> {
+    if let Some(ahead) = take_ahead(path, args) {
+        if perf::enabled() {
+            perf::record_cached(svn_command(path).args(with_global(args)));
+        }
+        return ahead;
+    }
     let key = scan_key(path, args);
     if let Some(hit) = key.as_deref().and_then(cached_scan) {
         if perf::enabled() {
@@ -210,7 +216,19 @@ pub fn bypass_scan_cache<T>(f: impl FnOnce() -> T) -> T {
         }
     }
     let _restore = Restore(SCANS.with(|s| s.borrow_mut().take()));
+    // 预跑结果（[`run_ahead`]）同理：要读最新的，就不能拿到起跑时那一份（独立 review 第 4 条）
+    let _ahead = RestoreAhead(AHEAD.with(|a| std::mem::take(&mut *a.borrow_mut())));
     f()
+}
+
+/// [`bypass_scan_cache`] 结束（含 panic 展开）时把挪开的预跑结果放回去。
+struct RestoreAhead(HashMap<String, Result<String>>);
+
+impl Drop for RestoreAhead {
+    fn drop(&mut self) {
+        let saved = std::mem::take(&mut self.0);
+        AHEAD.with(|a| a.borrow_mut().extend(saved));
+    }
 }
 
 /// 忘掉缓存里的节点状态扫描（`status -v`，即 [`STATUS_SCAN`]），下一次照常去读。R3c 用：它存在的
@@ -232,12 +250,17 @@ fn scan_key(path: &str, args: &[&str]) -> Option<String> {
     if SCANS.with(|s| s.borrow().is_none()) {
         return None;
     }
+    Some(command_key(path, args))
+}
+
+/// 「同一条命令」的键：工作目录 + 全部参数。扫描缓存与预跑结果共用这一种写法。
+fn command_key(path: &str, args: &[&str]) -> String {
     let mut k = path.to_string();
     for a in args {
         k.push('\0');
         k.push_str(a);
     }
-    Some(k)
+    k
 }
 
 /// 在后台线程里提前跑的一条多目标扫描，见 [`prefetch_scan`]。
@@ -317,6 +340,138 @@ pub fn prefetch_scan(path: &str, head: &[&str], targets: &[String]) -> Option<Sc
     Some(ScanAhead {
         keys,
         handle: Some(handle),
+    })
+}
+
+thread_local! {
+    /// [`RunAhead::adopt`] 放进来、还没被 [`run_svn`] 取走的预跑结果，键同 [`command_key`]。
+    static AHEAD: RefCell<HashMap<String, Result<String>>> = RefCell::new(HashMap::new());
+}
+
+/// 在后台线程里提前跑的几条 svn 命令，见 [`run_ahead`]。
+pub struct RunAhead {
+    keys: Vec<String>,
+    handle: Option<std::thread::JoinHandle<Vec<Result<String>>>>,
+}
+
+impl RunAhead {
+    /// 等后台跑完，把每条命令的结果（成功或失败）交给**当前线程**接下来的 [`run_svn`]：同一工作
+    /// 目录、参数逐字相同的那一次调用直接拿到它，**只拿一次**。返回的守卫 drop 时，没被取走的
+    /// 一并作废，不会留给范围之外的调用。
+    ///
+    /// 后台线程 panic 时什么都不放：调用方随后照常自己跑。
+    pub fn adopt(mut self) -> AdoptedAhead {
+        let keys = std::mem::take(&mut self.keys);
+        let Some(handle) = self.handle.take() else {
+            return AdoptedAhead { keys: Vec::new() };
+        };
+        match handle.join() {
+            Ok(outputs) if outputs.len() == keys.len() => {
+                // 只放进、也只在 drop 时删掉自己的：同一条命令已有别的守卫放着结果时（嵌套）不动它
+                // （独立 review 第 5 条）。让掉的这条，调用方照常自己跑
+                let mine = AHEAD.with(|a| {
+                    let mut a = a.borrow_mut();
+                    let mut mine = Vec::new();
+                    for (k, out) in keys.into_iter().zip(outputs) {
+                        if let std::collections::hash_map::Entry::Vacant(e) = a.entry(k.clone()) {
+                            e.insert(out);
+                            mine.push(k);
+                        }
+                    }
+                    mine
+                });
+                AdoptedAhead { keys: mine }
+            }
+            Ok(_) => {
+                log::warn!("预跑的 svn 命令条数对不上，不用它的结果");
+                AdoptedAhead { keys: Vec::new() }
+            }
+            Err(_) => {
+                log::warn!("预跑 svn 命令的线程 panic 了，稍后照常重跑");
+                AdoptedAhead { keys: Vec::new() }
+            }
+        }
+    }
+}
+
+impl Drop for RunAhead {
+    /// 没被 adopt 的（调用方中途报错返回）也等它跑完，理由同 [`ScanAhead`] 的 drop。
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// [`RunAhead::adopt`] 的守卫：drop 时把没被取走的预跑结果作废。
+#[must_use = "守卫一 drop，没被取走的预跑结果就作废"]
+pub struct AdoptedAhead {
+    keys: Vec<String>,
+}
+
+impl Drop for AdoptedAhead {
+    fn drop(&mut self) {
+        AHEAD.with(|a| {
+            let mut a = a.borrow_mut();
+            for k in &self.keys {
+                a.remove(k);
+            }
+        });
+    }
+}
+
+/// 在后台线程里按顺序跑 `commands`（每条是传给 [`run_svn`] 的 `args`），让它们与调用方接下来的
+/// 工作并行。结果在 [`RunAhead::adopt`] 之后由同样参数的 [`run_svn`] 取用。
+///
+/// 与 [`prefetch_scan`] 的分别：那个只管可缓存的 `info` / `status`，结果进扫描缓存，范围内可以
+/// 反复命中；这个管任意命令（体检的 `svn diff`），每条结果只给一次调用，失败也原样交出去。
+///
+/// # 调用方的义务
+///
+/// 预跑只是把命令的执行时刻往前挪。调用方要论证：从起跑到真正调用之间，本进程不做任何会改变
+/// 这条命令结果的事（不写工作副本、不发 SVN 写命令），而且挪到的那个时刻仍满足这条命令自己对
+/// 先后的要求（体检的 `svn diff` 必须在 `git add` 之后，见 `svn_health::prefetch_floor_diffs`）。
+///
+/// `commands` 为空时返回 `None`、不起线程。
+pub fn run_ahead(path: &str, commands: Vec<Vec<String>>) -> Option<RunAhead> {
+    if commands.is_empty() {
+        return None;
+    }
+    let keys: Vec<String> = commands
+        .iter()
+        .map(|args| {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            command_key(path, &args)
+        })
+        .collect();
+    let path = path.to_string();
+    let handle = std::thread::Builder::new()
+        .name("svn-run-ahead".to_string())
+        .spawn(move || {
+            commands
+                .iter()
+                .map(|args| {
+                    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                    // 新线程的 AHEAD 是空的、也不在扫描缓存范围里，这里一定真的起进程
+                    run_svn(&path, &args)
+                })
+                .collect()
+        })
+        .ok()?;
+    Some(RunAhead {
+        keys,
+        handle: Some(handle),
+    })
+}
+
+/// 有预跑结果就取走（只此一次）。没有任何预跑结果时不拼键。
+fn take_ahead(path: &str, args: &[&str]) -> Option<Result<String>> {
+    AHEAD.with(|a| {
+        let mut a = a.borrow_mut();
+        if a.is_empty() {
+            return None;
+        }
+        a.remove(&command_key(path, args))
     })
 }
 

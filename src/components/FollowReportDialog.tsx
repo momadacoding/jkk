@@ -319,6 +319,7 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
 
         <div className="follow-footer">
           <div className="follow-basis">{m.basis}</div>
+          {m.elapsed && <div className="follow-basis">{m.elapsed}</div>}
           {info && needsSvnUserPrompt(request.report, info) && (
             <SvnUserRow initial={info.configured ?? info.detected ?? ''} save={request.saveUser} />
           )}

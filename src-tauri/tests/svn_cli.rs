@@ -10,10 +10,10 @@ mod svn_fixtures;
 
 use app_lib::engine::svn_cli::{
     bypass_scan_cache, chunk_targets, cmdline_estimate, forget_node_scans,
-    path_dirs_from_reg_output, prefetch_scan, probe_svn, run_svn, run_svn_code, run_svn_targets,
-    with_global, with_scan_cache, SvnAvailability,
+    path_dirs_from_reg_output, prefetch_scan, probe_svn, run_ahead, run_svn, run_svn_code,
+    run_svn_targets, with_global, with_scan_cache, SvnAvailability,
 };
-use svn_fixtures::svn_repo;
+use svn_fixtures::{svn_cmd, svn_repo};
 
 #[test]
 fn probe_reports_the_installed_version() {
@@ -309,6 +309,115 @@ fn a_prefetch_that_is_never_adopted_caches_nothing() {
             later[0]
         );
     });
+}
+
+// —— 预跑任意命令、结果只给一次（日志 2026-11-14-follow-overlap-decisions 的 T1）——
+
+fn node_scan_args() -> Vec<String> {
+    ["status", "-v", "--xml", "--", "Code@"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+#[test]
+fn an_adopted_run_ahead_serves_exactly_one_identical_call() {
+    let fx = svn_repo();
+    let wc = fx.wc_str();
+    let ahead = run_ahead(&wc, vec![node_scan_args()]).expect("有命令就该起预跑");
+    let _guard = ahead.adopt();
+    // 预跑已经结束。这之后的改动，第一次调用看不见（拿的是预跑结果），第二次看得见
+    std::fs::write(fx.wc().join("Code/A.cs"), "edited\n").unwrap();
+    let first = node_scan(&wc);
+    assert!(
+        !first.contains(r#"item="modified""#),
+        "第一次应当拿预跑的结果：{first}"
+    );
+    let second = node_scan(&wc);
+    assert!(
+        second.contains(r#"item="modified""#),
+        "结果只给一次，第二次必须真的重跑：{second}"
+    );
+}
+
+#[test]
+fn a_run_ahead_result_does_not_outlive_its_guard() {
+    let fx = svn_repo();
+    let wc = fx.wc_str();
+    drop(run_ahead(&wc, vec![node_scan_args()]).unwrap().adopt());
+    std::fs::write(fx.wc().join("Code/A.cs"), "edited\n").unwrap();
+    assert!(
+        node_scan(&wc).contains(r#"item="modified""#),
+        "守卫 drop 之后，没取走的预跑结果必须作废"
+    );
+    // 没 adopt 就 drop 的同理（调用方中途报错返回）
+    drop(run_ahead(&wc, vec![node_scan_args()]).unwrap());
+    std::fs::write(fx.wc().join("Code/B.cs"), "edited\n").unwrap();
+    assert!(
+        entry_is_modified(&node_scan(&wc), "B.cs"),
+        "没 adopt 就 drop 的预跑结果也不能留下"
+    );
+}
+
+/// `svn status --xml` 里以 `name` 结尾的那条 entry 是不是 `item="modified"`。
+fn entry_is_modified(xml: &str, name: &str) -> bool {
+    xml.split("<entry").any(|e| {
+        e.split('"').nth(1).is_some_and(|p| p.ends_with(name)) && e.contains(r#"item="modified""#)
+    })
+}
+
+#[test]
+fn a_bypassed_read_does_not_take_a_run_ahead_result() {
+    // 「专门读最新的」那种重读（bypass_scan_cache）不能拿到起跑时的预跑结果；结束之后预跑结果
+    // 还在，留给原来要它的那次调用（独立 review 第 4 条）
+    let fx = svn_repo();
+    let wc = fx.wc_str();
+    let _guard = run_ahead(&wc, vec![node_scan_args()]).unwrap().adopt();
+    std::fs::write(fx.wc().join("Code/A.cs"), "edited\n").unwrap();
+    assert!(
+        entry_is_modified(&bypass_scan_cache(|| node_scan(&wc)), "A.cs"),
+        "绕过时必须真的重读"
+    );
+    assert!(
+        !entry_is_modified(&node_scan(&wc), "A.cs"),
+        "绕过结束后预跑结果放回去了"
+    );
+}
+
+#[test]
+fn a_nested_run_ahead_leaves_the_outer_result_alone() {
+    // 两个守卫放同一条命令：后放的让给先放的，drop 时也不删先放的（独立 review 第 5 条）
+    let fx = svn_repo();
+    let wc = fx.wc_str();
+    let _outer = run_ahead(&wc, vec![node_scan_args()]).unwrap().adopt();
+    std::fs::write(fx.wc().join("Code/A.cs"), "edited\n").unwrap();
+    drop(run_ahead(&wc, vec![node_scan_args()]).unwrap().adopt());
+    assert!(
+        !entry_is_modified(&node_scan(&wc), "A.cs"),
+        "外层守卫的结果应当还在，而且没被内层（改动之后跑的）覆盖"
+    );
+}
+
+#[test]
+fn a_failed_run_ahead_hands_its_error_to_the_call() {
+    let fx = svn_repo();
+    let wc = fx.wc_str();
+    // 预跑时 New.cs 还没纳入版本控制，`svn info` 失败；之后把它 add 进来，真的重跑就会成功。
+    // 所以调用拿到失败，只能是拿了预跑的结果（独立 review：只比错误码分不出来）
+    std::fs::write(fx.wc().join("Code/New.cs"), "new\n").unwrap();
+    let args: Vec<String> = ["info", "--xml", "--", "Code/New.cs@"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let _guard = run_ahead(&wc, vec![args]).unwrap().adopt();
+    svn_cmd(&fx.wc(), &["add", "Code/New.cs"]);
+    // 体检里断网、超时就是这一支：拿预跑的失败下结论，不再重跑一遍、再等一轮超时
+    let err = run_svn(&wc, &["info", "--xml", "--", "Code/New.cs@"])
+        .expect_err("预跑失败时应当把失败原样交出去");
+    assert_eq!(err.code, "svn_cli");
+    run_svn(&wc, &["info", "--xml", "--", "Code/New.cs@"])
+        .expect("对照：结果只给一次，第二次真的重跑，add 之后成功");
+    assert!(run_ahead(&wc, Vec::new()).is_none(), "没有命令不该起线程");
 }
 
 #[test]

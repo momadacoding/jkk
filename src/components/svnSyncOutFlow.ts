@@ -62,12 +62,13 @@ export function createSvnSyncOutFlow(d: SvnSyncOutFlowDeps) {
    * 后端原文（D6 失败时那是用户唯一知道「提交已经成功、点继续」的地方）被顶掉。
    */
   const afterSync = async () => {
-    try {
-      await d.refreshSvnSyncState(d.repoPath)
-      await d.refreshSvnSync(d.repoPath)
-    } catch (err) {
-      d.reportError(err)
-    }
+    // 两项同时发、各报各的错，同 `svnSyncFlow` 的 `afterSync`：复查要在命令返回的这一拍里进去，才能与
+    // 后端补发的 `repo-changed` 共用一轮 `svn status`（`repoStore` 的 `refreshSvnSync`）
+    const results = await Promise.allSettled([
+      d.refreshSvnSyncState(d.repoPath),
+      d.refreshSvnSync(d.repoPath),
+    ])
+    for (const r of results) if (r.status === 'rejected') d.reportError(r.reason)
     void d.fetchSvnLog(d.repoPath)
   }
 
