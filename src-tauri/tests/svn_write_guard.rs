@@ -272,6 +272,11 @@ const NOT_GIT_ONLY: &[(&str, &str, &str)] = &[
     ("conflict.rs", "check_merge_drivers", "只读"),
     // 整个文件放行：这些命令不碰 git 写操作
     ("app_settings.rs", "*", "应用设置，不碰仓库"),
+    (
+        "attention.rs",
+        "*",
+        "任务栏与托盘上的提醒，只动窗口，不碰仓库",
+    ),
     ("session.rs", "*", "会话文件，不碰仓库"),
     ("custom.rs", "*", "用户自己配的外部命令，按用户的意思跑"),
     ("external.rs", "*", "拉起外部 diff / merge 工具，只导出文件"),

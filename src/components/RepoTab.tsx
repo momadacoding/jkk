@@ -38,6 +38,7 @@ import TsvnHooksDialog from './TsvnHooksDialog'
 import { toErrorMessage } from '../engine/errors'
 import type { HookHealth, TsvnHooksStatus } from '../engine/tsvnHooks'
 import { createSvnSyncFlow } from './svnSyncFlow'
+import { reportAutoFollowBlocked } from '@/store/attentionStore'
 import { createSvnSyncOutFlow } from './svnSyncOutFlow'
 import { useDeliverDialog } from './DeliverDialog'
 import { useFollowReportDialog } from './FollowReportDialog'
@@ -327,6 +328,16 @@ export function RepoTab({
     if (!key || autoTried.current === key) return
     if (autoFollowRef.current?.(key)) autoTried.current = key
   }, [active, state.capabilities.vcs, state.svnSync, state.headHash, autoNudge])
+
+  // 横幅上「没有自动跟进」的那行原因：只认当前现场的（`autoFollowKey`），现场变了旧原因就不作数
+  const autoFollowBlocked =
+    autoSkip && autoSkip.key === autoFollowKey(state.svnSync, state.headHash) ? autoSkip.message : null
+  // 同一行原因也挂到任务栏和托盘上（使用报告 9.5）：人不在看这个窗口时横幅没人看见。
+  // 原因行没了就撤；标签关掉时也撤，不留一个没有出处的角标
+  useEffect(() => {
+    reportAutoFollowBlocked(repoPath, autoFollowBlocked)
+  }, [repoPath, autoFollowBlocked])
+  useEffect(() => () => reportAutoFollowBlocked(repoPath, null), [repoPath])
 
   useEffect(() => {
     openRepo(repoPath)
@@ -1155,11 +1166,7 @@ export function RepoTab({
         hooks={hooksHealth}
         onOpenHooks={() => void openHooks()}
         onUnregisterHooks={() => void unregisterHooks()}
-        autoFollowSkip={
-          autoSkip && autoSkip.key === autoFollowKey(state.svnSync, state.headHash)
-            ? autoSkip.message
-            : null
-        }
+        autoFollowSkip={autoFollowBlocked}
         autoFollowed={autoFollowed ? describeAutoFollowDone(autoFollowed) : null}
         onAutoFollowedDetails={() => {
           if (autoFollowed) void showReport(autoFollowed)

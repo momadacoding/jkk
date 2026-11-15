@@ -1,3 +1,4 @@
+pub mod attention;
 pub mod build_info;
 pub mod commands;
 pub mod desktop;
@@ -152,6 +153,7 @@ pub fn run() {
         .on_window_event(desktop::on_window_event)
         .on_page_load(desktop::on_page_load)
         .invoke_handler(tauri::generate_handler![
+            commands::attention::set_attention,
             commands::app_settings::read_app_settings,
             commands::app_settings::save_app_settings,
             commands::app_settings::set_svn_auto_follow,
