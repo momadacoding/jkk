@@ -691,10 +691,31 @@ fn auto_blocker(plan: &Plan) -> Option<GitError> {
     };
     if !plan.report.leaks.is_empty() {
         let paths: BTreeSet<String> = plan.report.leaks.iter().map(|l| l.path.clone()).collect();
+        // 重放后变空、要被丢弃的提交：内容整个在 SVN 上了，不是「可能」。只说「可能」的话，用户看报告时
+        // 会以为补丁还在分支上（计划 2026-11-16-follow-report-usability 的 A）。只认当前分支：别的分支
+        // 带着同一个提交时没重放（`plan_other` 见泄漏就停），提交还在那条分支上
+        // 按提交去重、按说明点名：同一个提交泄漏多个文件只点一次，两个同名的提交（「wip」）各算一个
+        let mut removed: Vec<(&str, String)> = Vec::new();
+        for l in &plan.report.leaks {
+            if l.branch == plan.branch
+                && plan.report.dropped.contains(&l.commit)
+                && !removed.iter().any(|(c, _)| *c == l.commit)
+            {
+                removed.push((&l.commit, format!("「{}」", l.subject)));
+            }
+        }
+        let removed = if removed.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "其中{}的内容都已经在 SVN 上，跟进后会从分支上移除。",
+                capped(removed.into_iter().map(|(_, s)| s).collect(), "个提交")
+            )
+        };
         return Some(GitError::new(
             "svn_auto_follow_leak",
             format!(
-                "当前分支的 Local-Only 补丁可能已经被带上了 SVN 服务器（{}）。这要你第一时间知道，\
+                "当前分支的 Local-Only 补丁可能已经被带上了 SVN 服务器（{}）。{removed}这要你第一时间知道，\
                  不能被一次自动跟进带过去。{TAIL_FOLLOW}报告里会列出每一处。",
                 capped(paths.into_iter().collect(), "个文件")
             ),
