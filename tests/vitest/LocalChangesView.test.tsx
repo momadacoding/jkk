@@ -1283,3 +1283,54 @@ describe('LocalChangesView 的树形列表与状态角标', () => {
     })
   })
 })
+
+// 第 74 条：合并进行中的提交按钮——有冲突时拦下并说中文，冲突解决后改叫「提交合并」、Staged 为空也能点
+describe('LocalChangesView：操作进行中的提交按钮', () => {
+  function mountState(repoState: string, status: StatusData) {
+    const onCommit = vi.fn().mockResolvedValue(true)
+    render(
+      <LocalChangesView
+        status={status}
+        diff={{ files: [] }}
+        onStage={vi.fn()}
+        onUnstage={vi.fn()}
+        onDiscard={vi.fn()}
+        onCommit={onCommit}
+        svnMode={false}
+        onBaselineBranch={false}
+        repoState={repoState}
+      />,
+    )
+    fireEvent.change(screen.getByPlaceholderText('Commit subject'), { target: { value: 'Merge side' } })
+    return { onCommit }
+  }
+
+  it('还有冲突时按钮置灰、给出中文原因，Ctrl+Enter 也不提交', () => {
+    const { onCommit } = mountState('merge', { unstaged: [conflicted('a.txt'), conflicted('b.txt')], staged: [] })
+    const button = screen.getByRole('button', { name: '提交合并' })
+    expect((button as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.getByText('还有 2 个冲突文件未解决，解决并暂存之后才能提交')).toBeTruthy()
+    fireEvent.keyDown(screen.getByPlaceholderText('Commit subject'), { key: 'Enter', ctrlKey: true })
+    expect(onCommit).not.toHaveBeenCalled()
+  })
+
+  it('冲突都解决了、Staged 为空时按钮叫「提交合并」且可以点', async () => {
+    const { onCommit } = mountState('merge', { unstaged: [], staged: [] })
+    expect(screen.getByText('Staged 为空也可以提交：合并提交记下的是「这两条历史已经合到一起」。')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '提交合并' }))
+    await waitFor(() => expect(onCommit).toHaveBeenCalledWith('Merge side', false))
+  })
+
+  it('合并中勾上 Amend 时按钮置灰并说明', () => {
+    const { onCommit } = mountState('merge', { unstaged: [], staged: [] })
+    fireEvent.click(screen.getByRole('checkbox', { name: /Amend/ }))
+    expect((screen.getByRole('button', { name: '提交合并' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.getByText('merge 进行中不能 Amend，取消勾选后再提交')).toBeTruthy()
+    expect(onCommit).not.toHaveBeenCalled()
+  })
+
+  it('不传 repoState 时仍是原来的 Commit 按钮', () => {
+    mount()
+    expect(screen.getByRole('button', { name: 'Commit' })).toBeTruthy()
+  })
+})

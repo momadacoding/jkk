@@ -2647,7 +2647,10 @@ body {
   font-size: 10px;
   line-height: 15px;
 }
-.changes-baseline-warning {
+/* 提交框下方的说明条：基线分支警告、操作进行中拦下的原因（第 74 条）用警告色，收尾说明用中性色。 */
+.changes-baseline-warning,
+.changes-commit-blocked,
+.changes-commit-note {
   margin: 6px 0 0;
   padding: 6px 8px;
   background: #4a1f1f;
@@ -2656,6 +2659,7 @@ body {
   font-size: 11px;
   line-height: 1.5;
 }
+.changes-commit-note { background: #1f3a4a; color: #cde3f3; }
 
 /* 「仅本地，不交付」勾选框与它的窗口期警告（spec §6.7、§16）。 */
 .changes-local-only { display: flex; align-items: center; gap: 4px; font-size: 12px; }
