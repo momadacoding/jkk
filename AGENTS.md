@@ -229,6 +229,7 @@ Commit message 格式：
 - MUST：上述条件任何一条不满足，或任何一条清理命令失败（例如 Windows 上 `git worktree remove` 在 `node_modules` 上报 `Directory not empty`、留下半删的目录），立即回到文件开头的总规则：停下、如实报告、等授权，不重试、不手动补删。
 - MUST：例外只覆盖**本会话自己建的**那一个 worktree 和分支，不顺手清理别的。
 - SHOULD：用户在 GitHub 页面上合并、或合并的会话没来得及清理时，用 `pwsh -NoProfile -File scripts/stale-branches.ps1` 盘点。它只读，只打印建议的清理命令；执行这些命令仍需用户授权，有并发会话时逐条执行、不要批量。
+- SHOULD：磁盘吃紧（编译报 `LNK1318`、空间不足）时，用 `node scripts/worktree-targets.mjs` 盘点各 worktree 的 `src-tauri/target`（只读，用法见 README「清理 worktree 的编译产物」）。`--clean` 只删构建产物、不碰 git，被 lock 的 worktree 一律不删；但它会让别的 worktree 下次全量重编，执行前先在当前对话里征得用户同意。
 - MUST：worktree 只用于建它的那个分支。验证、模拟合并这类实验放到 scratch 目录的临时 fixture 里做，不要在已有 worktree 里 `checkout` 别的分支——目录名和分支对不上之后，没人能判断里面的东西还要不要。
 - SHOULD：尽量不用叠加 PR。必须用时先合下层、再合上层；先把上层合进下层分支，上层的内容就只能跟着下层的 squash 间接进 `master`，事后很难核对。
 
