@@ -32,11 +32,11 @@ use crate::engine::svn_sync_check::{
     assert_linear, current_branch, list_paths, rev_parse, unfinished_error, unmerged_paths,
 };
 use crate::engine::svn_sync_in::{
-    checkout_failed, checkout_verified, dirty_w_files, is_baseline_bytes, is_our_rebase, need,
-    new_opid, no_unfinished, rebase_in_progress, settle_residue, tracked_changes,
-    untracked_leftovers,
+    checkout_verified, dirty_w_files, is_baseline_bytes, is_our_rebase, need, new_opid,
+    no_unfinished, rebase_in_progress, run_checkout_verified, settle_residue, tracked_changes,
 };
 use crate::engine::svn_sync_out_check::{check_sync_out, git_dirty, DeliverChange, SyncOutPreview};
+use crate::engine::svn_util::{now_secs, short};
 use crate::engine::svn_wc::peg_safe;
 use crate::engine::svn_xml::parse_update_status;
 use crate::error::{GitError, Result};
@@ -314,20 +314,13 @@ fn verify_expect(p: &SyncOutPreview, e: &SyncOutExpect) -> Result<()> {
 
 /// D3.8：detached 切到交付树，事后核对真的切干净了（计划 A15 同一手法：退出码证明不了什么）。
 fn checkout_detached(repo: &str, cfg: &SvnConfig, oid: &str) -> Result<()> {
-    let from = rev_parse(repo, "HEAD")?;
-    let ran = run_git(repo, &["checkout", "--detach", oid]);
-    let on_target = current_branch(repo)?.is_none() && rev_parse(repo, "HEAD")? == oid;
-    let mut stale = tracked_changes(repo, cfg)?;
-    stale.extend(untracked_leftovers(repo, cfg, &[from])?);
-    if on_target && stale.is_empty() {
-        return Ok(());
-    }
-    Err(checkout_failed(
+    run_checkout_verified(
         repo,
-        &oid[..oid.len().min(10)],
-        &stale,
-        ran,
-    ))
+        cfg,
+        &["checkout", "--detach", oid],
+        short(oid),
+        || Ok(current_branch(repo)?.is_none() && rev_parse(repo, "HEAD")? == oid),
+    )
 }
 
 /// D4.9（spec §8.2.5）：HEAD 仍是交付树，白名单里 git 没有任何改动。
@@ -341,8 +334,8 @@ fn assert_still_delivering(repo: &str, cfg: &SvnConfig, deliver: &str) -> Result
     if head != deliver {
         what.push(format!(
             "HEAD 现在是 {}，应为交付树 {}",
-            &head[..head.len().min(10)],
-            &deliver[..deliver.len().min(10)]
+            short(&head),
+            short(deliver)
         ));
     }
     if !dirty.is_empty() {
@@ -632,7 +625,7 @@ pub(crate) fn restore_branch(
                 "提交已在服务器上（r{rev}），基线已推进，但 HEAD 现在在 {}，既不在新基线上也不在原分支 \
                  `{orig}` 上。中断期间若在那里做过提交，切走就会丢掉它们，所以不动。先处理好它们，再 \
                  `git checkout {BASELINE_BRANCH}` 回到新基线后点「我已解决，继续」",
-                cur.unwrap_or_else(|| head[..head.len().min(10)].to_string()),
+                cur.unwrap_or_else(|| short(&head).to_string()),
             )));
         }
         // 计划 B10：快进 = 直接把分支指针移到新基线（CAS），再从基线切过去——两者是同一个
@@ -751,7 +744,7 @@ pub(crate) fn finish(repo: &str, j: &Journal, rev: u64) -> Result<SyncOutOutcome
         if parse_local_only(body) {
             left += 1;
         } else {
-            undelivered.push(format!("{} {subject}", &oid[..oid.len().min(10)]));
+            undelivered.push(format!("{} {subject}", short(oid)));
         }
     }
     if !undelivered.is_empty() {
@@ -928,13 +921,6 @@ fn paths_with(changes: &[DeliverChange], status: &str) -> Vec<String> {
         .filter(|c| c.status == status)
         .map(|c| c.path.clone())
         .collect()
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 // —— 继续 / 放弃（spec §7.6「提供继续 / 放弃两个入口」；计划 B4 / B7 / B8）——
@@ -1187,13 +1173,13 @@ fn require_left_in_place(repo: &str, j: &Journal) -> Result<()> {
     let target = j
         .deliver_ref
         .clone()
-        .unwrap_or_else(|| deliver[..deliver.len().min(10)].to_string());
+        .unwrap_or_else(|| short(&deliver).to_string());
     Err(state_changed(&format!(
         "HEAD 已经不在本次交付放它的位置上了（应在交付树 {} 上，现在在 {}）。中断期间若在这里做过\
          提交，切走就会丢掉它们，所以不动。只是切了分支的话，先 `git checkout --detach {target}` \
          回到交付树",
-        &deliver[..deliver.len().min(10)],
-        branch.unwrap_or_else(|| head[..head.len().min(10)].to_string()),
+        short(&deliver),
+        branch.unwrap_or_else(|| short(&head).to_string()),
     )))
 }
 

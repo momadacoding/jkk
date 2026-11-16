@@ -18,6 +18,7 @@
 
 use crate::engine::git_cli::run_git;
 use crate::engine::svn_replay::ReplayCommit;
+use crate::engine::svn_util::short;
 use crate::error::Result;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -274,8 +275,4 @@ fn entries_for(
         start = end;
     }
     Ok(found)
-}
-
-fn short(oid: &str) -> &str {
-    &oid[..oid.len().min(10)]
 }

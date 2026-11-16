@@ -97,6 +97,7 @@ use crate::engine::svn_sync_in::{
     from_baseline_ready, is_ancestor, need, new_opid, no_unfinished, SyncInOutcome,
 };
 use crate::engine::svn_sync_stash::stash_wip;
+use crate::engine::svn_util::{now_secs, short};
 use crate::engine::svn_wc::enumerate_wcs;
 use crate::engine::tsvn_hooks::{quick_health, HookHealth};
 use crate::engine::tsvn_inbox::{prune_inbox, read_evidence, CommitEvidence, HookEvidence};
@@ -2562,7 +2563,7 @@ fn plan_other(
         }
         Ok(Replayed::Conflict { at, files, .. }) => Ok(Err(format!(
             "重放 {} 时冲突：{}",
-            &at[..at.len().min(10)],
+            short(&at),
             files.join("、")
         ))),
         Err(e) if e.code == "svn_follow_merge_in_range" => Ok(Err(
@@ -2873,13 +2874,6 @@ fn swap_in(
     // ⑤ 其他分支 + F6
     advance(repo, j, FollowStep::MoveOthers)?;
     finish(repo, j)
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 fn steps(j: &Journal) -> Result<&FollowSteps> {

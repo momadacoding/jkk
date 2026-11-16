@@ -1144,3 +1144,46 @@ fn info_base_keys_take_url_uuid_last_changed_revision_and_checksum() {
         ]
     );
 }
+
+fn update_entry(item: &str, props: &str) -> app_lib::engine::svn_xml::UpdateStatusEntry {
+    app_lib::engine::svn_xml::UpdateStatusEntry {
+        path: "Code/x".to_string(),
+        item: item.to_string(),
+        props: props.to_string(),
+        tree_conflicted: false,
+        repos_item: None,
+        repos_props: None,
+    }
+}
+
+#[test]
+fn local_change_is_content_missing_replaced_or_property_change() {
+    // 更新与交付共用的判据（第 77 号 issue 去重前两边各写一份 `matches!`）
+    for item in ["modified", "missing", "replaced"] {
+        assert!(update_entry(item, "none").is_local_change(), "{item}");
+    }
+    assert!(update_entry("normal", "modified").is_local_change());
+    for item in ["normal", "added", "unversioned", "deleted"] {
+        assert!(!update_entry(item, "none").is_local_change(), "{item}");
+    }
+}
+
+#[test]
+fn only_missing_means_missing_without_a_property_change() {
+    assert!(update_entry("missing", "none").is_only_missing());
+    assert!(update_entry("missing", "normal").is_only_missing());
+    // 目录自己的属性改动是它自己的本地改动，不能当成「只是被删了」跳过
+    assert!(!update_entry("missing", "modified").is_only_missing());
+    assert!(!update_entry("modified", "none").is_only_missing());
+}
+
+#[test]
+fn ancestor_dirs_walks_up_from_the_nearest_parent() {
+    use app_lib::engine::svn_xml::ancestor_dirs;
+    assert_eq!(
+        ancestor_dirs("Code/Deep/D.cs").collect::<Vec<_>>(),
+        ["Code/Deep", "Code"]
+    );
+    assert_eq!(ancestor_dirs("top.cs").count(), 0);
+    assert_eq!(ancestor_dirs("").count(), 0);
+}
