@@ -27,9 +27,73 @@ export function countConflicts(files: FileChange[]): number {
  */
 export function repoStateBanner(state: string, conflicts: number): string | null {
   if (state === 'normal') return null
-  return conflicts > 0
-    ? `${state} in progress · ${conflicts} 个文件有冲突`
-    : `${state} in progress`
+  const sequenceOf = SEQUENCES[state]
+  const head = sequenceOf ? `${sequenceOf} in progress（一次处理多个提交）` : `${state} in progress`
+  if (conflicts > 0) return `${head} · ${conflicts} 个文件有冲突`
+  // 第 74 条：冲突都解决了、Staged 又是空的时候，界面上只剩这一行，用户会以为没事可做。
+  // 说「没有未解决的冲突」而不是「已全部解决」：`merge --no-commit` 停下时本来就没有冲突
+  const name = FINISHED_BY_COMMIT[state]
+  return name ? `${head} · 没有未解决的冲突，提交以完成${spaced(name)}` : head
+}
+
+/**
+ * 提交一次就能收尾的操作，值是给人看的名字。
+ * rebase 与一次处理多个提交（sequencer）的收尾都是 `--continue`（第 51 条），不在此列。
+ */
+const FINISHED_BY_COMMIT: Record<string, string> = { merge: '合并', 'cherry-pick': 'cherry-pick', revert: 'revert' }
+
+/** `repo_state` 对一次处理多个提交的报法，值是对应的单个操作名（后端 `engine::repo::state`）。 */
+const SEQUENCES: Record<string, string> = { 'cherry-pick-sequence': 'cherry-pick', 'revert-sequence': 'revert' }
+
+/** 中文紧挨着中文，英文词前空一格：「提交合并」「提交 cherry-pick」。 */
+function spaced(name: string): string {
+  return /^[a-z]/i.test(name) ? ` ${name}` : name
+}
+
+/** 提交按钮的状态。纯逻辑，组件只负责渲染。 */
+export interface CommitGate {
+  /** 按钮文字 */
+  label: string
+  /** 非 null 时按钮与 Ctrl+Enter 都不可用，这句话显示在按钮下方 */
+  blocked: string | null
+  /** 可以提交、但需要额外说明的情形（Staged 为空） */
+  note: string | null
+}
+
+/**
+ * 第 74 条：合并 / cherry-pick / revert 进行中的提交流程。
+ *
+ * - 还有未解决的冲突：拦下。git 也会拒绝，但只给英文原文。不看 state：
+ *   `stash pop` 撞出的冲突不留任何进行中的状态，提交照样会被 git 拒绝
+ * - 冲突都解决了：按钮改叫「提交合并」等，让人知道提交这一下就是在收尾
+ * - Staged 为空：仍然能提交（后端对单个 cherry-pick / revert 带 `--allow-empty`），说明为什么
+ * - 勾了 Amend：merge / cherry-pick / revert 进行中 git 拒绝 `--amend`，只给英文原文，这里先拦。
+ *   rebase 不拦：停在 edit 上改提交正是它的用法
+ *
+ * 一次处理多个提交（`*-sequence`）时提交只了结当前这一个，按钮与说明都不改。
+ *
+ * @param state `repo_state` 的结果
+ * @param conflicts Unstaged 区里的冲突文件数
+ * @param staged Staged 区的文件数
+ * @param amend Amend 勾选框
+ */
+export function commitGate(state: string, conflicts: number, staged: number, amend = false): CommitGate {
+  const name = FINISHED_BY_COMMIT[state]
+  const label = name ? `提交${spaced(name)}` : 'Commit'
+  if (conflicts > 0) {
+    return { label, blocked: `还有 ${conflicts} 个冲突文件未解决，解决并暂存之后才能提交`, note: null }
+  }
+  const amendRefused = name ? state : SEQUENCES[state]
+  if (amend && amendRefused) {
+    return { label, blocked: `${amendRefused} 进行中不能 Amend，取消勾选后再提交`, note: null }
+  }
+  let note: string | null = null
+  if (staged === 0 && state === 'merge') {
+    note = 'Staged 为空也可以提交：合并提交记下的是「这两条历史已经合到一起」。'
+  } else if (staged === 0 && name) {
+    note = `结果与当前 HEAD 相同，提交会记一个没有改动的${spaced(name)} 提交。`
+  }
+  return { label, blocked: null, note }
 }
 
 /** 暂存前的冲突标记确认框文案。纯逻辑，组件只负责弹出来。 */

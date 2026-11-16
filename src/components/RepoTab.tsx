@@ -436,13 +436,18 @@ export function RepoTab({
           : undefined,
         perfSpan('commit.refreshChanges', () => refreshChanges(path)).catch(reportError),
         perfSpan('commit.refreshGraph', () => refreshGraph(path)).catch(reportError),
+        // 第 74 条：这次提交可能刚结束 merge / cherry-pick / revert。不等监听：按钮还叫「提交合并」、
+        // 还写着「Staged 为空也可以提交」的话，用户会照着再点一次
+        repoState !== 'normal'
+          ? invoke<string>('repo_state', { path }).then(setRepoState).catch(() => undefined)
+          : undefined,
       ])
       return true
     } finally {
       committing.current = false
       setAutoNudge((n) => n + 1)
     }
-  }, { staged: state.status?.staged.length ?? 0, amend }, (committed) => committed), [state.path, state.capabilities.vcs, state.status, following, freshSvnSync, noteOwnCommit, confirm, refreshGraph, refreshChanges, reportError])
+  }, { staged: state.status?.staged.length ?? 0, amend }, (committed) => committed), [state.path, state.capabilities.vcs, state.status, following, freshSvnSync, noteOwnCommit, confirm, refreshGraph, refreshChanges, reportError, repoState])
 
   const runAndRefresh = useCallback(async (cmd: string, args: Record<string, unknown>, refresh: () => Promise<void>) => {
     if (!state.path) return
@@ -1414,6 +1419,7 @@ export function RepoTab({
                 conflicts={state.conflicts}
                 onResolveDeleteModify={(file, keep) => runAndRefresh('resolve_delete_modify', { file, keep }, () => refreshChanges(state.path!))}
                 onOpenFileHistory={openFileHistory}
+                repoState={repoState}
               />
             )}
           </Panel>

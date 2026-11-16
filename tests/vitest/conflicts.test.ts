@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { conflictsFirst, countConflicts, describeStageConflicts, repoStateBanner } from '../../src/engine/conflicts'
+import { commitGate, conflictsFirst, countConflicts, describeStageConflicts, repoStateBanner } from '../../src/engine/conflicts'
 import type { ConflictInfo, FileChange, FileStatus } from '../../src/engine/types'
 
 const file = (path: string, status: FileStatus): FileChange => ({
@@ -62,6 +62,88 @@ describe('repoStateBanner', () => {
 
   it('没有冲突时不编造「已处理」——interactive rebase 停在 edit 上本来就没有冲突', () => {
     expect(repoStateBanner('rebase', 0)).toBe('rebase in progress')
+  })
+
+  // 第 74 条：冲突都解决了、Staged 又是空的，用户以为没事可做，仓库就一直停在合并中
+  it('merge 没有未解决的冲突时提示提交以完成合并', () => {
+    expect(repoStateBanner('merge', 0)).toBe('merge in progress · 没有未解决的冲突，提交以完成合并')
+  })
+
+  it('cherry-pick / revert 同样提示提交收尾', () => {
+    expect(repoStateBanner('cherry-pick', 0)).toBe('cherry-pick in progress · 没有未解决的冲突，提交以完成 cherry-pick')
+    expect(repoStateBanner('revert', 0)).toBe('revert in progress · 没有未解决的冲突，提交以完成 revert')
+  })
+
+  it('一次挑多个提交时说明还有后续，不说提交以完成', () => {
+    expect(repoStateBanner('cherry-pick-sequence', 0)).toBe('cherry-pick in progress（一次处理多个提交）')
+    expect(repoStateBanner('revert-sequence', 2)).toBe('revert in progress（一次处理多个提交） · 2 个文件有冲突')
+  })
+})
+
+describe('commitGate', () => {
+  it('平时什么都不改', () => {
+    expect(commitGate('normal', 0, 1)).toEqual({ label: 'Commit', blocked: null, note: null })
+  })
+
+  it('有未解决的冲突时拦下并说清还剩几个', () => {
+    expect(commitGate('merge', 2, 0).blocked).toBe('还有 2 个冲突文件未解决，解决并暂存之后才能提交')
+  })
+
+  it('不在任何操作中间也会有未解决冲突（stash pop 撞车），照样拦', () => {
+    expect(commitGate('normal', 1, 0).blocked).toBe('还有 1 个冲突文件未解决，解决并暂存之后才能提交')
+  })
+
+  it('merge 中按钮叫「提交合并」', () => {
+    expect(commitGate('merge', 0, 3)).toEqual({ label: '提交合并', blocked: null, note: null })
+  })
+
+  it('merge 中 Staged 为空也能提交，并说明为什么', () => {
+    expect(commitGate('merge', 0, 0)).toEqual({
+      label: '提交合并',
+      blocked: null,
+      note: 'Staged 为空也可以提交：合并提交记下的是「这两条历史已经合到一起」。',
+    })
+  })
+
+  it('cherry-pick / revert 中 Staged 为空时说明会记一个空提交', () => {
+    expect(commitGate('cherry-pick', 0, 0)).toEqual({
+      label: '提交 cherry-pick',
+      blocked: null,
+      note: '结果与当前 HEAD 相同，提交会记一个没有改动的 cherry-pick 提交。',
+    })
+    expect(commitGate('revert', 0, 0).label).toBe('提交 revert')
+  })
+
+  it('rebase 中不改按钮：收尾是 rebase --continue，不是一次普通提交', () => {
+    expect(commitGate('rebase', 0, 0)).toEqual({ label: 'Commit', blocked: null, note: null })
+  })
+
+  it('一次挑多个提交时不改按钮：提交只了结当前这一个，不是收尾', () => {
+    expect(commitGate('cherry-pick-sequence', 0, 0)).toEqual({ label: 'Commit', blocked: null, note: null })
+    expect(commitGate('revert-sequence', 0, 0)).toEqual({ label: 'Commit', blocked: null, note: null })
+  })
+
+  it('一次挑多个提交时仍然拦未解决的冲突', () => {
+    expect(commitGate('cherry-pick-sequence', 1, 0).blocked).toBe('还有 1 个冲突文件未解决，解决并暂存之后才能提交')
+  })
+
+  // git 在这些状态下拒绝 --amend，只给英文原文
+  it('合并 / cherry-pick / revert 进行中勾了 Amend 时拦下', () => {
+    expect(commitGate('merge', 0, 0, true).blocked).toBe('merge 进行中不能 Amend，取消勾选后再提交')
+    expect(commitGate('cherry-pick', 0, 1, true).blocked).toBe('cherry-pick 进行中不能 Amend，取消勾选后再提交')
+    expect(commitGate('revert-sequence', 0, 1, true).blocked).toBe('revert 进行中不能 Amend，取消勾选后再提交')
+  })
+
+  it('rebase 中允许 Amend：停在 edit 上改提交正是 rebase 的用法', () => {
+    expect(commitGate('rebase', 0, 0, true).blocked).toBeNull()
+  })
+
+  it('平时勾 Amend 不拦', () => {
+    expect(commitGate('normal', 0, 0, true).blocked).toBeNull()
+  })
+
+  it('冲突优先于 Amend 说', () => {
+    expect(commitGate('merge', 2, 0, true).blocked).toBe('还有 2 个冲突文件未解决，解决并暂存之后才能提交')
   })
 })
 

@@ -34,7 +34,7 @@ import { Chevron, FileIcon, FolderIcon, STATUS_MARK } from './FileTree'
 import { commitKeyAction, type CommitField } from '../engine/commitKeys'
 import { discardShortcut, isSelectAllShortcut } from '../engine/fileListKeys'
 import { buildCommitMessage } from '../engine/commitActions'
-import { describeStageConflicts } from '../engine/conflicts'
+import { commitGate, describeStageConflicts } from '../engine/conflicts'
 import { externalDiffItems, externalMergeItems, type ExternalToolsMenu } from './externalToolItems'
 import { canExternalMerge, conflictView, PENDING_CONFLICT_VIEW } from '@/engine/conflictView'
 import { toolFor } from '@/engine/externalTools'
@@ -273,9 +273,11 @@ interface LocalChangesViewProps {
   onSelectionChange?: (selection: FileSelection) => void
   /** 文件右键菜单里的「File History」「Blame」；不传时没有这两项。 */
   onOpenFileHistory?: (target: FileHistoryTarget) => void
+  /** `repo_state` 的结果（merge / cherry-pick / …）；不传按 normal。决定提交按钮叫什么（第 74 条）。 */
+  repoState?: string
 }
 
-export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, onCommit, svnMode, onBaselineBranch, externalTools, conflicts, onResolveDeleteModify, selection: selectionProp, onSelectionChange, onOpenFileHistory }: LocalChangesViewProps) {
+export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, onCommit, svnMode, onBaselineBranch, externalTools, conflicts, onResolveDeleteModify, selection: selectionProp, onSelectionChange, onOpenFileHistory, repoState = 'normal' }: LocalChangesViewProps) {
   const [ownSelection, setOwnSelection] = useState<FileSelection>(emptyFileSelection)
   const setSelection = onSelectionChange ?? setOwnSelection
   // 文件列表 | diff、Unstaged / Staged 两处分割都记住，所有仓库标签共用
@@ -528,7 +530,9 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
   // state 管按钮置灰，ref 挡同一帧里的第二次调用（state 要等下一次渲染才生效）
   const [committing, setCommitting] = useState(false)
   const committingRef = useRef(false)
-  const canCommit = subject.trim().length > 0 && !onBaselineBranch && !committing
+  // 还有未解决冲突时同样从这个判据拦（第 74 条），Ctrl+Enter 走的也是它
+  const gate = commitGate(repoState, conflicted.size, status.staged.length, amend)
+  const canCommit = subject.trim().length > 0 && !onBaselineBranch && !committing && gate.blocked === null
 
   const handleCommit = async () => {
     if (committingRef.current || !canCommit) return
@@ -669,11 +673,13 @@ export function LocalChangesView({ status, diff, onStage, onUnstage, onDiscard, 
           <button
             disabled={!canCommit}
             onClick={handleCommit}
-            title={onBaselineBranch ? '基线分支不能用于开发提交' : 'Ctrl+Enter'}
+            title={onBaselineBranch ? '基线分支不能用于开发提交' : gate.blocked ?? 'Ctrl+Enter'}
           >
-            Commit
+            {gate.label}
           </button>
         </div>
+        {gate.blocked && <p className="changes-commit-blocked">{gate.blocked}</p>}
+        {!gate.blocked && gate.note && <p className="changes-commit-note">{gate.note}</p>}
         {onBaselineBranch && (
           <p className="changes-baseline-warning">
             当前在 <code>svn/base</code> 基线分支上。它记的是「上次与服务器对齐时的

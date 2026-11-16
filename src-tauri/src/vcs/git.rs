@@ -91,11 +91,14 @@ impl Vcs for GitBackend {
     }
 
     fn commit(&self, message: &str, amend: bool) -> Result<()> {
+        // 未解决的冲突、操作进行中的 amend 在这里拦成中文报错；cherry-pick / revert 收尾时带上 --allow-empty
+        let mut args = vec!["commit"];
+        args.extend_from_slice(engine::repo::commit_extra_args(&self.root, amend)?);
         if amend {
-            engine::git_cli::run_git(&self.root, &["commit", "--amend", "-m", message])?;
-        } else {
-            engine::git_cli::run_git(&self.root, &["commit", "-m", message])?;
+            args.push("--amend");
         }
+        args.extend_from_slice(&["-m", message]);
+        engine::git_cli::run_git(&self.root, &args)?;
         Ok(())
     }
 
