@@ -93,6 +93,30 @@ pub fn commits_between(
     for oid in [base, head] {
         require_oid(oid, codes.failed)?;
     }
+    crate::engine::git_read::or_cli(
+        "列分支上的提交",
+        || {
+            Ok(crate::engine::git_read::linear_commits(repo, base, head)?
+                .into_iter()
+                .map(|c| ReplayCommit {
+                    local_only: parse_local_only(&c.body),
+                    oid: c.oid,
+                    parents: c.parents,
+                    subject: c.subject,
+                    body: c.body,
+                })
+                .collect())
+        },
+        || commits_between_by_cli(repo, base, head, codes),
+    )
+}
+
+fn commits_between_by_cli(
+    repo: &str,
+    base: &str,
+    head: &str,
+    codes: &ReplayCodes,
+) -> Result<Vec<ReplayCommit>> {
     let out = run_git(
         repo,
         &[
@@ -250,14 +274,34 @@ pub fn all_committed(repo: &str, old_base: &str, head: &str, new: &str) -> Resul
         }
     }
     // Local-Only 被 TortoiseSVN 一起提交上去时内容也会对上（泄漏），那正是不能静默收掉的情形
-    let log = run_git(
-        repo,
-        &["log", "--format=%B%x1e", &format!("{old_base}..{head}")],
+    let bodies = crate::engine::git_read::or_cli(
+        "读区间里的提交说明",
+        || crate::engine::git_read::bodies(repo, old_base, head),
+        || {
+            let log = run_git(
+                repo,
+                &["log", "--format=%B%x1e", &format!("{old_base}..{head}")],
+            )?;
+            Ok(log.split('\u{1e}').map(str::to_string).collect())
+        },
     )?;
-    Ok(!log.split('\u{1e}').any(parse_local_only))
+    Ok(!bodies.iter().any(|b| parse_local_only(b)))
 }
 
 pub(crate) fn changed_paths(repo: &str, a: &str, b: &str) -> Result<BTreeSet<String>> {
+    crate::engine::git_read::or_cli(
+        "比两棵树改了哪些路径",
+        || {
+            Ok(crate::engine::git_read::tree_changes(repo, a, b)?
+                .into_iter()
+                .map(|c| c.path)
+                .collect())
+        },
+        || changed_paths_by_cli(repo, a, b),
+    )
+}
+
+fn changed_paths_by_cli(repo: &str, a: &str, b: &str) -> Result<BTreeSet<String>> {
     let out = run_git(
         repo,
         &[

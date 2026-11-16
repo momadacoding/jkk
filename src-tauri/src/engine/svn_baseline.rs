@@ -172,7 +172,7 @@ impl TempIndex {
     /// `"Code/\350\247\222\350\211\262.cs"`，而期望集合是遍历磁盘得到的原始字符串，
     /// 两者永远对不上——每个装了中文文件名的工程都会在初始化时被误报阻断。
     pub fn ls_files(&self, repo_root: &str) -> Result<BTreeSet<String>> {
-        let out = self.git(repo_root, &["ls-files", "-z"])?;
+        let out = self.listing(repo_root, ListAs::Plain)?;
         Ok(out
             .split('\0')
             .filter(|s| !s.is_empty())
@@ -367,6 +367,11 @@ impl TempIndex {
     fn git(&self, repo_root: &str, args: &[&str]) -> Result<String> {
         let p = self.path.to_string_lossy().to_string();
         run_git_env(repo_root, args, &[("GIT_INDEX_FILE", &p)])
+    }
+
+    /// 这份索引的 `ls-files` 列表，走 libgit2（[`index_listing`]）。
+    fn listing(&self, repo_root: &str, how: ListAs) -> Result<String> {
+        index_listing(repo_root, &self.path, how)
     }
 
     fn git_stdin(&self, repo_root: &str, args: &[&str], stdin: &[u8]) -> Result<String> {
@@ -791,7 +796,7 @@ fn merge_onto_copy(repo_root: &str, index: &Path, target: &str) -> Result<TempIn
 /// `--no-*` 选项**必须分两次**：实测写在同一条命令里只有后一个生效。路径走 stdin，
 /// 数量可能成千上万（sparse checkout），放命令行会撞上 Windows 的长度上限。
 fn clear_entry_flags(repo_root: &str, idx: &TempIndex) -> Result<()> {
-    let listing = idx.git(repo_root, &["ls-files", "-v", "-z"])?;
+    let listing = idx.listing(repo_root, ListAs::Flags)?;
     let (skipped, assumed) = parse_entry_flags(&listing);
     for (flag, paths) in [
         ("--no-skip-worktree", skipped),
@@ -806,6 +811,44 @@ fn clear_entry_flags(repo_root: &str, idx: &TempIndex) -> Result<()> {
         idx.git_stdin(repo_root, &["update-index", "-z", flag, "--stdin"], &stdin)?;
     }
     Ok(())
+}
+
+/// 要哪一种 `ls-files` 列表。
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ListAs {
+    /// `ls-files -z`
+    Plain,
+    /// `ls-files -v -z`（带 skip-worktree / assume-unchanged 标记）
+    Flags,
+    /// `ls-files --stage -z`
+    Stage,
+}
+
+/// `index_file` 的 `ls-files` 列表，与 `GIT_INDEX_FILE=<index_file> git ls-files …` 逐字节相同。
+/// 先走 libgit2（日志 `2026-11-16-follow-git-inproc-reads-decisions.md` T3），它不接的形状
+/// （split / sparse index、有未合并条目……）退回 git。`index_file` 必须是绝对路径。
+pub(crate) fn index_listing(repo_root: &str, index_file: &Path, how: ListAs) -> Result<String> {
+    use crate::engine::git_read as gr;
+    let args: &[&str] = match how {
+        ListAs::Plain => &["ls-files", "-z"],
+        ListAs::Flags => &["ls-files", "-v", "-z"],
+        ListAs::Stage => &["ls-files", "--stage", "-z"],
+    };
+    gr::or_cli(
+        "列索引",
+        || {
+            let records = gr::index_records(repo_root, index_file)?;
+            match how {
+                ListAs::Plain => gr::ls_files(&records),
+                ListAs::Flags => gr::ls_files_v(&records),
+                ListAs::Stage => gr::ls_files_stage(&records),
+            }
+        },
+        || {
+            let p = index_file.to_string_lossy().to_string();
+            run_git_env(repo_root, args, &[("GIT_INDEX_FILE", &p)])
+        },
+    )
 }
 
 /// 解析 `ls-files -v -z`：`(skip-worktree 的路径, assume-unchanged 的路径)`。标记含义见

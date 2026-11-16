@@ -58,7 +58,7 @@
 //! 本模块全程持锁或者不写，不走 `trait Vcs`（理由同 `svn_sync_in` 模块头）。watcher 由命令层
 //! 用 `with_watch_suspended` 包住。
 
-use crate::engine::git_cli::{run_git, run_git_bytes, run_git_code, run_git_env, run_git_stdin};
+use crate::engine::git_cli::{run_git, run_git_bytes, run_git_code, run_git_stdin};
 use crate::engine::svn_baseline::{
     create_baseline_commit_with, git_dir, move_baseline_ref, IndexEdit, TempIndex,
 };
@@ -1504,13 +1504,24 @@ fn paths_after_mark(repo: &str, mark: Option<&FollowMark>, new: &str) -> Option<
         base,
         new,
     ];
-    match run_git(repo, &args) {
-        Ok(out) => Some(
-            out.split('\0')
+    let listed = crate::engine::git_read::or_cli(
+        "比快照之后的基线变化",
+        || {
+            Ok(crate::engine::git_read::tree_changes(repo, base, new)?
+                .into_iter()
+                .map(|c| c.path)
+                .collect())
+        },
+        || {
+            Ok(run_git(repo, &args)?
+                .split('\0')
                 .filter(|p| !p.is_empty())
                 .map(str::to_string)
-                .collect(),
-        ),
+                .collect())
+        },
+    );
+    match listed {
+        Ok(paths) => Some(paths),
         Err(e) => {
             log::warn!("比不出快照之后的基线变化，按拿不准处理：{}", e.message);
             None
@@ -1545,22 +1556,39 @@ impl External {
     fn read(repo: &str, from: &str, to: &str, nodes: &[NodeStatus]) -> Result<Self> {
         let by_path: BTreeMap<&str, &NodeStatus> =
             nodes.iter().map(|n| (n.path.as_str(), n)).collect();
-        let out = run_git(
-            repo,
-            &[
-                "diff-tree",
-                "-r",
-                "-z",
-                "--no-renames",
-                "--name-status",
-                from,
-                to,
-            ],
+        let listed: Vec<(String, String)> = crate::engine::git_read::or_cli(
+            "比两个基线的树",
+            || {
+                Ok(crate::engine::git_read::tree_changes(repo, from, to)?
+                    .into_iter()
+                    .map(|c| (c.status, c.path))
+                    .collect())
+            },
+            || {
+                let out = run_git(
+                    repo,
+                    &[
+                        "diff-tree",
+                        "-r",
+                        "-z",
+                        "--no-renames",
+                        "--name-status",
+                        from,
+                        to,
+                    ],
+                )?;
+                let mut v = Vec::new();
+                let mut fields = out.split('\0').filter(|f| !f.is_empty());
+                while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
+                    v.push((status.to_string(), path.to_string()));
+                }
+                Ok(v)
+            },
         )?;
         let mut changes = Vec::new();
         let mut removed = Vec::new();
-        let mut fields = out.split('\0').filter(|f| !f.is_empty());
-        while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
+        for (status, path) in &listed {
+            let (status, path) = (status.as_str(), path.as_str());
             if status == "D" {
                 removed.push(path.to_string());
                 continue;
@@ -2384,6 +2412,23 @@ struct LocalBranch {
 }
 
 fn local_branches(repo: &str) -> Result<Vec<LocalBranch>> {
+    crate::engine::git_read::or_cli(
+        "列本地分支",
+        || {
+            Ok(crate::engine::git_read::local_branches(repo)?
+                .into_iter()
+                .map(|(name, oid, upstream)| LocalBranch {
+                    name,
+                    oid,
+                    upstream,
+                })
+                .collect())
+        },
+        || local_branches_by_cli(repo),
+    )
+}
+
+fn local_branches_by_cli(repo: &str) -> Result<Vec<LocalBranch>> {
     let out = run_git(
         repo,
         &[
@@ -2443,11 +2488,17 @@ pub fn branches_behind(repo: &str) -> Result<Vec<String>> {
 
 /// 所有 worktree 的 HEAD 指着的分支（含主工作区）。
 fn worktree_heads(repo: &str) -> Result<BTreeSet<String>> {
-    Ok(run_git(repo, &["worktree", "list", "--porcelain"])?
-        .lines()
-        .filter_map(|l| l.strip_prefix("branch refs/heads/"))
-        .map(str::to_string)
-        .collect())
+    crate::engine::git_read::or_cli(
+        "列 worktree 的分支",
+        || crate::engine::git_read::worktree_branches(repo),
+        || {
+            Ok(run_git(repo, &["worktree", "list", "--porcelain"])?
+                .lines()
+                .filter_map(|l| l.strip_prefix("branch refs/heads/"))
+                .map(str::to_string)
+                .collect())
+        },
+    )
 }
 
 /// §6.11.3 的「旧基线」：这次发布之前的 `svn/base`。
@@ -2909,7 +2960,13 @@ fn record_prepared(
     let lock = git_dir(repo)?.join("index.lock");
     let blob = blob_of(repo, &std::fs::read(lock)?)?;
     let work = prepared.lock_abs_path()?;
-    let stages = run_git_env(repo, LS_STAGE, &[("GIT_INDEX_FILE", work.as_str())])?;
+    // 指纹要与恢复时 `index_was_swapped` 用 `git ls-files --stage -z` 读真实索引得到的逐字节相同：
+    // index_listing 与那条命令逐字节相同（`tests/git_read_follow.rs`），恢复那边照旧走 git
+    let stages = crate::engine::svn_baseline::index_listing(
+        repo,
+        Path::new(&work),
+        crate::engine::svn_baseline::ListAs::Stage,
+    )?;
     let stages = blob_of(repo, stages.as_bytes())?;
     let s = steps_mut(j)?;
     s.index_blob = Some(blob);
@@ -2922,10 +2979,16 @@ fn record_prepared(
 
 /// 这段字节的 blob OID（不写对象库）。`--no-filters`：比的是字节，不能过 autocrlf。
 fn blob_of(repo: &str, bytes: &[u8]) -> Result<String> {
-    Ok(
-        run_git_stdin(repo, &["hash-object", "--no-filters", "--stdin"], bytes)?
-            .trim()
-            .to_string(),
+    crate::engine::git_read::or_cli(
+        "算 blob OID",
+        || crate::engine::git_read::blob_oid(repo, bytes),
+        || {
+            Ok(
+                run_git_stdin(repo, &["hash-object", "--no-filters", "--stdin"], bytes)?
+                    .trim()
+                    .to_string(),
+            )
+        },
     )
 }
 
@@ -3121,16 +3184,26 @@ fn finish(repo: &str, j: &mut Journal) -> Result<FollowOutcome> {
 
 /// 钉住旧索引的 ref 只留最近 [`KEEP_PINS`] 个【待决 D3】。失败不让跟进失败：ref 多几个无害。
 fn trim_pins(repo: &str, opid: &str) {
-    let out = run_git(
-        repo,
-        &[
-            "for-each-ref",
-            // 后写的键优先。同一秒的按名字：opid 以纳秒开头，新的排前面
-            "--sort=-refname",
-            "--sort=-committerdate",
-            "--format=%(refname)",
-            "refs/mygitclient/follow/",
-        ],
+    const PINS: &str = "refs/mygitclient/follow/";
+    let out = crate::engine::git_read::or_cli(
+        "列钉住的索引",
+        || crate::engine::git_read::refs_newest_first(repo, PINS),
+        || {
+            Ok(run_git(
+                repo,
+                &[
+                    "for-each-ref",
+                    // 后写的键优先。同一秒的按名字：opid 以纳秒开头，新的排前面
+                    "--sort=-refname",
+                    "--sort=-committerdate",
+                    "--format=%(refname)",
+                    PINS,
+                ],
+            )?
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>())
+        },
     );
     let out = match out {
         Ok(o) => o,
@@ -3139,8 +3212,8 @@ fn trim_pins(repo: &str, opid: &str) {
             return;
         }
     };
-    let current = format!("refs/mygitclient/follow/{opid}");
-    for name in out.lines().skip(KEEP_PINS).filter(|n| *n != current) {
+    let current = format!("{PINS}{opid}");
+    for name in out.iter().skip(KEEP_PINS).filter(|n| **n != current) {
         if let Err(e) = run_git(repo, &["update-ref", "-d", name]) {
             log::warn!("删除钉住的索引 {name} 失败：{}", e.message);
         }
