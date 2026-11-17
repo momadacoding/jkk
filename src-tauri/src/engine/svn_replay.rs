@@ -353,11 +353,36 @@ fn swaps_for(
 }
 
 /// `rev` 的树里 `paths` 各自的 (mode, oid)；不存在的不出现在结果里。目录报内部错误。
+///
+/// 目录只在 ls-tree 列出它自己的条目时才拦得住：同时问到它下面的路径时，ls-tree 钻进去、不列目录
+/// 本身（git 2.51 实测），这里照旧（`git_read::tree_entries` 与 CLI 一致）。
 fn ls_entries(
     repo: &str,
     rev: &str,
     paths: &BTreeSet<String>,
     c: &ReplayCommit,
+    codes: &ReplayCodes,
+) -> Result<BTreeMap<String, (String, String)>> {
+    let list: Vec<String> = paths.iter().cloned().collect();
+    let found = crate::engine::git_read::or_cli(
+        "列出提交里几条路径的条目",
+        || crate::engine::git_read::tree_entries(repo, rev, &list),
+        || ls_entries_by_cli(repo, rev, paths, codes),
+    )?;
+    if let Some(dir) = found
+        .iter()
+        .find_map(|(p, (mode, _))| (mode == "040000").then_some(p))
+    {
+        return Err(not_a_file(c, dir, codes));
+    }
+    Ok(found)
+}
+
+/// [`ls_entries`] 原来的 git 命令。目录照样放进结果（mode `040000`），由调用方拒绝。
+fn ls_entries_by_cli(
+    repo: &str,
+    rev: &str,
+    paths: &BTreeSet<String>,
     codes: &ReplayCodes,
 ) -> Result<BTreeMap<String, (String, String)>> {
     let mut found = BTreeMap::new();
@@ -400,9 +425,8 @@ fn ls_entries(
                     format!("读不懂 git ls-tree 的输出：{rec:?}"),
                 ));
             };
-            if kind == "tree" {
-                return Err(not_a_file(c, path, codes));
-            }
+            // ls-tree 给树打的 mode 就是 040000；按 kind 判，免得 mode 写法有出入时漏拦
+            let mode = if kind == "tree" { "040000" } else { mode };
             found.insert(path.to_string(), (mode.to_string(), oid.to_string()));
         }
         start = end;
@@ -555,35 +579,63 @@ pub(crate) fn tree_without(
     let parent = single_parent(c, codes)?;
     let swaps = swaps_for(repo, c, parent, paths, codes)?;
     if swaps.is_empty() {
-        return Ok(
-            run_git(repo, &["rev-parse", &format!("{}^{{tree}}", c.oid)])?
-                .trim()
-                .to_string(),
-        );
+        return Ok(trees_of(repo, &[c.oid.as_str()])?.remove(0));
     }
     c_prime_tree(repo, c, &swaps, codes)
 }
 
+/// `git rev-parse <oid>^{tree} …`，逐个。
+fn trees_of(repo: &str, oids: &[&str]) -> Result<Vec<String>> {
+    crate::engine::git_read::or_cli(
+        "取提交的树",
+        || crate::engine::git_read::trees_of(repo, oids),
+        || {
+            let specs: Vec<String> = oids.iter().map(|o| format!("{o}^{{tree}}")).collect();
+            let mut args = vec!["rev-parse"];
+            args.extend(specs.iter().map(String::as_str));
+            let out = run_git(repo, &args)?;
+            let trees: Vec<String> = out.lines().map(|l| l.trim().to_string()).collect();
+            if trees.len() != oids.len() {
+                return Err(GitError::new(
+                    "git_cli",
+                    format!(
+                        "git rev-parse 给了 {} 行，要 {} 行",
+                        trees.len(),
+                        oids.len()
+                    ),
+                ));
+            }
+            Ok(trees)
+        },
+    )
+}
+
 /// 用 `like` 的作者与 message 在 `parent` 上创建 `tree` 的 commit（计划 B15）。
 fn commit_like(repo: &str, tree: &str, parent: &str, like: &str) -> Result<String> {
-    let meta = run_git(
-        repo,
-        &[
-            "log",
-            "-1",
-            "--date=raw",
-            "--format=%an%x00%ae%x00%ad%x00%B",
-            like,
-        ],
+    let m = crate::engine::git_read::or_cli(
+        "读提交的作者与说明",
+        || crate::engine::git_read::commit_meta(repo, like),
+        || {
+            let meta = run_git(
+                repo,
+                &[
+                    "log",
+                    "-1",
+                    "--date=raw",
+                    "--format=%an%x00%ae%x00%ad%x00%B",
+                    like,
+                ],
+            )?;
+            let mut f = meta.splitn(4, '\0');
+            Ok(crate::engine::git_read::CommitMeta {
+                name: f.next().unwrap_or("").to_string(),
+                email: f.next().unwrap_or("").to_string(),
+                date: f.next().unwrap_or("").to_string(),
+                message: f.next().unwrap_or("").trim_end_matches('\n').to_string(),
+            })
+        },
     )?;
-    let mut f = meta.splitn(4, '\0');
-    let (name, email, date, msg) = (
-        f.next().unwrap_or(""),
-        f.next().unwrap_or(""),
-        f.next().unwrap_or(""),
-        f.next().unwrap_or("").trim_end_matches('\n'),
-    );
-    write_commit(repo, tree, parent, name, email, date, msg)
+    write_commit(repo, tree, parent, &m.name, &m.email, &m.date, &m.message)
 }
 
 /// 用给定的作者与 message 在 `parent` 上创建 `tree` 的 commit；提交者取当前环境（同 `git rebase`）。
@@ -626,16 +678,8 @@ pub(crate) fn write_commit(
 
 /// 原本就空（C 的树 == C^ 的树）的 commit 不算「变空」，保留。
 fn originally_empty(repo: &str, oid: &str, parent: &str) -> Result<bool> {
-    let out = run_git(
-        repo,
-        &[
-            "rev-parse",
-            &format!("{oid}^{{tree}}"),
-            &format!("{parent}^{{tree}}"),
-        ],
-    )?;
-    let mut l = out.lines();
-    Ok(l.next() == l.next())
+    let t = trees_of(repo, &[oid, parent])?;
+    Ok(t[0] == t[1])
 }
 
 fn single_parent<'c>(c: &'c ReplayCommit, codes: &ReplayCodes) -> Result<&'c str> {

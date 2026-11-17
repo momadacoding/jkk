@@ -19,8 +19,8 @@
 
 use crate::error::Result;
 use git2::{ErrorClass, ErrorCode, ObjectType, Repository, TreeWalkMode, TreeWalkResult};
-use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 fn open(repo: &str) -> Result<Repository> {
     Ok(Repository::open(repo)?)
@@ -662,6 +662,186 @@ pub fn bodies(repo: &str, base: &str, head: &str) -> Result<Vec<String>> {
         out.push(utf8_message(&r.find_commit(oid?)?)?);
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// 重放路径：每个提交一次的读（日志 `2026-11-17-replay-inproc-reads-decisions.md`）
+// ---------------------------------------------------------------------------
+
+fn is_oid(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// `git rev-parse <oid>^{tree}`，逐个。只接 40 位 OID：调用点传的都是，别的写法两边的解析规则不必去对。
+pub fn trees_of(repo: &str, oids: &[&str]) -> Result<Vec<String>> {
+    if oids.is_empty() {
+        return Ok(Vec::new());
+    }
+    if let Some(bad) = oids.iter().find(|o| !is_oid(o)) {
+        return Err(unsupported(format!("{bad:?} 不是 OID")));
+    }
+    let r = open(repo)?;
+    sha1_repo(&r)?;
+    // 替换对象换的是整个提交，树也跟着换
+    no_replace(&r)?;
+    oids.iter()
+        .map(|o| {
+            Ok(r.find_object(git2::Oid::from_str(o)?, None)?
+                .peel_to_tree()?
+                .id()
+                .to_string())
+        })
+        .collect()
+}
+
+/// 重放时新提交沿用的作者与说明：`git log -1 --date=raw --format=%an%x00%ae%x00%ad%x00%B <oid>`，
+/// 说明去掉结尾的换行（同 `svn_replay::commit_like` 原来的解析）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitMeta {
+    pub name: String,
+    pub email: String,
+    /// `--date=raw`：`<秒> <±hhmm>`。
+    pub date: String,
+    pub message: String,
+}
+
+/// 见 [`CommitMeta`]。作者取自提交头里原样的 `author` 行，照 git 的 `split_ident_line` 拆；只接规整的
+/// 那种（`名字 <邮箱> 秒数 ±四位`，各段之间一个空格），别的交回 git：残缺的 ident git 有一套容错，
+/// 时区按整数重新打印（`%+05d`），对不上就是新提交的 OID 变了。
+///
+/// `.mailmap` 不用管：`log.mailmap` 只影响 `%aN` / `%aE`，`%an` / `%ae` 是原样的作者（git 2.51 实测，
+/// `tests/git_read_replay.rs`）。
+pub fn commit_meta(repo: &str, oid: &str) -> Result<CommitMeta> {
+    if !is_oid(oid) {
+        return Err(unsupported(format!("{oid:?} 不是 OID")));
+    }
+    let r = open(repo)?;
+    sha1_repo(&r)?;
+    no_replace(&r)?;
+    utf8_log_output(&r)?;
+    let c = r
+        .find_object(git2::Oid::from_str(oid)?, None)?
+        .peel_to_commit()?;
+    let message = utf8_message(&c)?.trim_end_matches('\n').to_string();
+    let header = std::str::from_utf8(c.raw_header_bytes())
+        .map_err(|_| unsupported(format!("{oid} 的提交头不是 UTF-8")))?;
+    // 续行以空格开头，不会被当成 author 行；按 `\n` 切，`\r` 留在行里，下面的严格解析会拒绝它。
+    // 不止一条时 git 取最后一条（`pretty.c` 的 `parse_commit_header` 一路覆盖），libgit2 两种都收：
+    // 只接恰好一条的（独立 review 第 1 条）
+    let authors: Vec<&str> = header
+        .split('\n')
+        .filter_map(|l| l.strip_prefix("author "))
+        .collect();
+    let [line] = authors[..] else {
+        return Err(unsupported(format!(
+            "{oid} 有 {} 条 author 行",
+            authors.len()
+        )));
+    };
+    // 头后面没有空行时 libgit2 把说明当成头、给空说明，git 的 %B 则读到对象之外（独立 review nit 3）
+    let odb = r.odb()?;
+    let raw = odb.read(c.id())?;
+    if !raw.data().windows(2).any(|w| w == b"\n\n") {
+        return Err(unsupported(format!("{oid} 的提交头后面没有空行")));
+    }
+    let (name, email, date) =
+        strict_ident(line).ok_or_else(|| unsupported(format!("{oid} 的 author 行不规整")))?;
+    Ok(CommitMeta {
+        name,
+        email,
+        date,
+        message,
+    })
+}
+
+/// `名字 <邮箱> 秒数 ±hhmm`，与 git 拆出来的 `%an`、`%ae`、`%ad`（raw）逐字节相同时才返回。
+fn strict_ident(line: &str) -> Option<(String, String, String)> {
+    let (person, when) = line.rsplit_once("> ")?;
+    let (name, email) = person.split_once(" <")?;
+    let odd = |c: char| c == '<' || c == '>' || c.is_control();
+    // git 去掉名字末尾的空白；两头有空白、名字或邮箱里还有尖括号的都是残缺的形状
+    if name.starts_with(char::is_whitespace)
+        || name.ends_with(char::is_whitespace)
+        || name.contains(odd)
+        || email.contains(odd)
+    {
+        return None;
+    }
+    let (secs, tz) = when.split_once(' ')?;
+    if secs.is_empty() || !secs.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // git 按数打印：前导零会消失；太大的数 git 另有处理，交回去
+    let secs: u64 = secs.parse().ok().filter(|s| *s < 1 << 53)?;
+    let (sign, digits) = tz.split_at_checked(1)?;
+    if !matches!(sign, "+" | "-")
+        || digits.len() != 4
+        || !digits.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    // `%+05d`：-0000 是 0，打成 +0000；其余四位数原样
+    let tz = if digits == "0000" {
+        "+0000".to_string()
+    } else {
+        tz.to_string()
+    };
+    Some((name.to_string(), email.to_string(), format!("{secs} {tz}")))
+}
+
+/// `git --literal-pathspecs ls-tree --full-tree -z <oid> -- <paths>` 里各条路径**自己**的条目
+/// （不带 `-r`：目录给出它自己的 tree 条目），值是 `(mode, oid)`，mode 是 ls-tree 的六位八进制。
+/// 不存在的不出现。
+///
+/// 路径必须是规整的仓库相对路径。末尾带 `/` 时 ls-tree 列的是目录里面的东西，`.`、`..`、空段、
+/// 反斜杠在 pathspec 里另有解释，一律交回 git。mode 不是 git 的五种规范值（树里存了畸形的 mode）
+/// 时两边归一的方式不同，同样交回去。
+pub fn tree_entries(
+    repo: &str,
+    oid: &str,
+    paths: &[String],
+) -> Result<BTreeMap<String, (String, String)>> {
+    if !is_oid(oid) {
+        return Err(unsupported(format!("{oid:?} 不是 OID")));
+    }
+    if let Some(bad) = paths.iter().find(|p| !plain_path(p)) {
+        return Err(unsupported(format!("路径 {bad:?} 的写法 ls-tree 另有解释")));
+    }
+    let r = open(repo)?;
+    sha1_repo(&r)?;
+    no_replace(&r)?;
+    let tree = r
+        .find_object(git2::Oid::from_str(oid)?, None)?
+        .peel_to_tree()?;
+    let mut out = BTreeMap::new();
+    for p in paths {
+        match tree.get_path(Path::new(p)) {
+            Ok(e) => {
+                let mode = e.filemode_raw();
+                if !matches!(mode, 0o100644 | 0o100755 | 0o120000 | 0o040000 | 0o160000) {
+                    return Err(unsupported(format!("{p} 的 mode 是 {mode:o}")));
+                }
+                out.insert(p.clone(), (format!("{mode:06o}"), e.id().to_string()));
+            }
+            Err(e) if e.code() == ErrorCode::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    // 问到的路径里有在某个目录下面的，ls-tree 就钻进那个目录，不列目录自己（不管下面那条存不存在，
+    // git 2.51 实测）
+    out.retain(|p, (mode, _)| {
+        mode != "040000"
+            || !paths
+                .iter()
+                .any(|q| q.len() > p.len() + 1 && q.starts_with(&format!("{p}/")))
+    });
+    Ok(out)
+}
+
+fn plain_path(p: &str) -> bool {
+    !p.contains('\\')
+        && p.split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
 }
 
 /// 一个 HEAD 文件指着哪条分支：`Some(Some(名字))` 是 `refs/heads/` 下的分支，`Some(None)` 是游离
