@@ -1,6 +1,6 @@
 # 跟进报告可读性与跟进速度：实现日志
 
-计划：[2026-11-16-follow-report-usability.md](2026-11-16-follow-report-usability.md)。本 PR 只做 A。
+计划：[2026-11-16-follow-report-usability.md](2026-11-16-follow-report-usability.md)。A 在 PR 182，B 在下一个 PR，各自单独 review。
 
 ## 进度总账
 
@@ -11,6 +11,10 @@
 | A3 泄漏告警标出已从分支移除的提交 | 完成 | `svnFollow.ts` 的 `removedLeakItem`、`REMOVED_LEAKS` | `svnFollow.test.ts` 新增 3 条 |
 | A4 自动跟进被挡时的泄漏横幅 | 完成 | `svn_follow.rs` 的 `auto_blocker` 条件 8 | `svn_follow_auto.rs` 改 1 条、新增 1 条，2/2 通过 |
 | A5 验证、review、PR | 完成 | 独立 review 1 阻断 + 3 建议 + 3 nit 已修，见下 | 最终代码上：`pnpm build` 通过；`pnpm test` 103 个文件 1783 条全过；`pnpm test:layout` 176 条全过；`cargo fmt --check`、`cargo clippy --all-targets` 无告警；`cargo test --lib` 177/177、`--test svn_follow_auto` 38/38。全量 `cargo test` 在 review 修复之前跑过一次 92 个测试二进制全过；修复后的全量重跑因系统内存不足被回收，只重跑了受影响的两组（后端只改了 `auto_blocker` 条件 8 的文案，只有 `svn_follow_auto.rs` 断言它） |
+| B1 `git_read::line_stats`：两个提交之间逐路径的增删行数 | 完成 | `git_read::{LineStat, line_stats, line_stat, blob_at}` | `tests/git_read_line_stats.rs` 2 条，逐路径与 `git diff --numstat` 对照，正反两个方向 |
+| B2 跟进报告带上 `driftLines` | 完成 | `FollowReport.drift_lines`；`svn_follow.rs` 在 `drift_paths` 之后算 | `svn_follow_snapshot.rs` 新增 1 条端到端（2026-11-16 的形状）、原 drift 用例加 1 条断言；`svn_backend.rs` 序列化与旧 journal |
+| B3 前端「对不上」逐行写差几行 | 完成 | `svnFollow.ts` 的 `LineStat`、`driftLinesText`；布局 harness 加 `driftLines` / `overlap` | `svnFollow.test.ts` 新增 5 条 |
+| B4 验证、review、PR | 完成 | 独立 review 0 阻断、2 建议、6 nit，处理见下 | `pnpm build`；`pnpm test` 1808 条全过；`pnpm test:layout` 176 条全过；`cargo fmt --check`、`clippy` 无告警；全量 `cargo test` 见 PR |
 
 ## 决策条目
 
@@ -57,3 +61,37 @@
 | （自查截图发现）放回结果的红框缩进 54px | — | 已修：`.dlg-warning` 默认让出图标位，在节里改为 0 并占满宽度。有头 Edge 截 `follow-report-long` 场景核对过 |
 | nit 没给 `restoreLocalOnly` 时说明仍暗示有按钮 | nit | 不改：改动之前就有；应用里 `RepoTab` 总是传它 |
 - **计划没写的坑**：Rust 这条没有先看到红就改了实现。旧文案里没有「从分支上移除」这几个字，断言必然失败，所以判断这条测试确实钉住了改动；新增的「提交还在分支上时不提移除」覆盖了反向。
+
+### B1 `git_read::line_stats`
+
+- **偏离计划**：计划 §3.2 写「磁盘内容按 `git add` 的过滤规则取，与 `drift_paths` 同口径」。实际比的是新基线 → tip 两个 blob，不读磁盘（§8.1）：`drift_paths` 挑出的修改类文件，条件就是「磁盘按 `git add` 过滤后的 hash == 新基线的 blob」，所以磁盘内容就是新基线的 blob。计划 §5 里 autocrlf 那条风险因此不存在。
+- **计划没写的坑**：git2 0.20 的 `Patch::from_blobs` 两边都要 blob，没有「一边没有」的入口。新增 / 删除的文件改用 `from_blob_and_buffer` 对空内容比；新增的文件反着比再把增删对调。这样两种情形都由仓库里的 blob 带路径，`.gitattributes` 的 `-diff` 照样认成二进制。`tests/git_read_line_stats.rs` 在同一个 fixture 上逐路径与 `git diff --numstat` 对照：改、增、删、CRLF、末尾换行、二进制、`-diff`、中文路径、两边相同、两边都没有。
+- 两边内容相同、两边都没有的路径不出现在结果里，与 numstat 一致。子模块指针、目录算没有。
+
+### B2 跟进报告带上 `driftLines`
+
+- `FollowReport.drift_lines`，`#[serde(default)]`：旧 journal 读回来为空（`svn_backend.rs` 的序列化用例覆盖）。
+- 只在重放成功（`Replayed::Moved`）那一处算，紧跟 `drift_paths`。出错只记日志、给空表，跟进不因它失败；前端没有行数时照原样只写提交。
+- **计划没写的坑**：照 2026-11-16 的形状搭 fixture（一个提交加 7 行、下一个撤销，同事把同样 7 行提交进 SVN），起初不会对不上：分支相对旧基线的净改动为空，「已全部提交」的捷径把两个提交都收掉，分支直接等于新基线，结果是对的。真实现场分支上还有别的、SVN 上没有的改动，捷径不适用，才逐个重放、出现「撤销照样删」。测试里加了一个改别的文件的提交来复现。
+
+### B3 前端
+
+- 附注：「分支比 SVN 多 N 行 / 少 N 行 / 多 N 行、少 M 行」，二进制写「二进制文件，内容不同」，后面接「改过它的提交：…」。说不出来（旧后端、算不出、0/0）时只写提交。
+- 布局 harness 的 `follow-report-long`：`restorable` 改成 drift 的一半。原来两者相同，能放回的文件不进「对不上」那一节，那一节是空的，长附注量不到。放回按钮仍在（50 个文件）。
+- **偏离计划**：§2 的验收写「分支比 SVN 少 7 行 · c028e264 小婉问答」，实际是「分支比 SVN 少 7 行 · 改过它的提交：c028e264 小婉问答」：A 的 review 给提交加了前缀，B 沿用。
+- SVN 上已删、分支把它带回来的文件（`report.removed` 里有它）写「SVN 上已删除，分支里还有这个文件（N 行）」，不写「多 N 行」：后者看不出是整个文件（独立 review nit 5）。分支把文件删了、SVN 上还有的情形前端分不出来，照写「少 N 行」。
+
+### B 的独立 review（2026-11-17，opus subagent）
+
+| 条目 | 级别 | 处理 |
+|---|---|---|
+| 1 只有一边有 blob 时的二进制、空文件没测，正是另走一条路的地方 | 建议 | 已修：fixture 加新增 / 删除的二进制、`-diff`、空文件，正反两个方向都与 numstat 对照 |
+| 2 实现日志状态没更新、缺 B 的决策条目 | 建议 | 已修，见上 |
+| nit 3 注释说「同 numstat」太满；对照测试受全局 `diff.algorithm` 影响 | nit | 已修：注释写明默认配置与不同之处（只差 mode、myers、textconv、bigFileThreshold）；测试里 git 一侧固定 `-c diff.algorithm=myers` |
+| nit 4 一条路径读不出来，整份行数都没了 | nit | 已修：逐路径出错只跳过并记日志 |
+| nit 5 被带回来的文件只写「多 120 行」 | nit | 已修：见 B3 |
+| nit 6 harness 注释说量长附注，场景里却没有 `overlap` | nit | 已修：harness 加两条长提交说明；有头 Edge 截图核对，路径不被挤没 |
+| nit 7 测试里开 autocrlf 不起作用 | nit | 改注释：两边都是 blob，autocrlf 本来不参与；真正覆盖 autocrlf 的仍是 `drift_paths` 已有的用例 |
+| nit 8 每个 drift 文件做一次完整 diff，没有大小上限 | nit | 不改：drift 通常几个文件；Unity 大 YAML 成批对不上时再加上限，单独写「太大」 |
+
+- **计划没写的坑**：全量 `cargo test` 第一次跑时 `svn_config.rs` 的 `concurrent_set_svn_user_calls_do_not_collide_on_the_temp_file` 失败一次，单独重跑 3/3 通过。本 PR 没碰 `svn_config`：8 个线程在 Windows 上并发 rename，负载高时偶发。cargo 默认在第一个失败的测试二进制处停下，之后改用 `--no-fail-fast` 跑全量。

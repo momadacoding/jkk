@@ -146,8 +146,22 @@ function Follow() {
     rewritten: [],
     snapshot: [['f'.repeat(40), paths(100)]],
     drift: paths(100),
+    // 附注是「分支比 SVN 多 120 行、少 7 行 · 改过它的提交：…」（计划 2026-11-16 的 B），提交说明可能
+    // 很长：长附注也不能把路径挤没
+    driftLines: Object.fromEntries(
+      paths(100).map((p) => [p, { added: 120, removed: 7, binary: false }]),
+    ),
+    overlap: paths(100).map((path) => ({
+      path,
+      commits: [
+        'c028e264 小婉问答：把联盟主界面的入口改成按钮，顺带修掉切页时的闪烁',
+        '9f1e2d3a [Local-Only] 调试日志',
+      ],
+      matchesDisk: false,
+    })),
     // 9.1 的按钮在「需要你留意」最后，最容易被挤到够不着的地方
-    restorable: paths(100),
+    // 只取一半：drift 里能放回的不进「对不上」那一节，全取的话那一节是空的，上面的长附注量不到
+    restorable: paths(100).slice(50),
     stage: { decisions: {}, uncertain: paths(100), lost: paths(100), discarded: [] },
     movedBranches: [],
     behindBranches: [],

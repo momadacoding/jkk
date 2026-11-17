@@ -59,6 +59,7 @@
 //! 用 `with_watch_suspended` 包住。
 
 use crate::engine::git_cli::{run_git, run_git_bytes, run_git_code, run_git_stdin};
+use crate::engine::git_read::{self, LineStat};
 use crate::engine::svn_baseline::{
     create_baseline_commit_with, git_dir, move_baseline_ref, IndexEdit, TempIndex,
 };
@@ -195,6 +196,11 @@ pub struct FollowReport {
     /// 已删的文件带了回来。多半是重放干净却合错了（W14；PR 119 遗留）。只告警，不拦。
     #[serde(default)]
     pub drift: Vec<String>,
+    /// `drift` 里每个文件分支相对磁盘（= 新基线）的增删行数：`added` 是分支多出来的行，`removed`
+    /// 是分支少了的行（计划 `2026-11-16-follow-report-usability.md` 的 B）。算不出来时为空，前端
+    /// 照原样只列文件名。
+    #[serde(default)]
+    pub drift_lines: BTreeMap<String, LineStat>,
     /// `drift` 里分支比磁盘多出来的只有 Local-Only 改动、磁盘就是 SVN 版本的文件：可以用
     /// 「放回 Local-Only 补丁」写回磁盘（使用报告 9.1，[`crate::engine::svn_restore_local_only`]）。
     /// 跟进本身不写；点按钮时每条条件现场重验。
@@ -1964,6 +1970,13 @@ fn prepare(repo: &str, auto: bool, partial: Option<&Partial>) -> Result<Plan> {
                 log::warn!("核对重放结果与磁盘时出错，跳过：{}", e.message);
                 Vec::new()
             });
+            // B：每个对不上的文件差几行。drift 的磁盘就是新基线的 blob（`drift_paths` 按这个挑的），
+            // 所以比新基线 → tip 就行，不读磁盘。出错只是少一行字
+            report.drift_lines = git_read::line_stats(repo, &new_base, &tip, &report.drift)
+                .unwrap_or_else(|e| {
+                    log::warn!("统计对不上的文件差几行时出错，跳过：{}", e.message);
+                    BTreeMap::new()
+                });
             // 9.1：只读挑出能放回的。出错只是少一个按钮
             report.restorable = restorable_paths(repo, &new_base, &tip, &report.drift)
                 .unwrap_or_else(|e| {

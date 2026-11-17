@@ -968,6 +968,7 @@ fn externally_advanced_serializes_camel_case() {
 fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     // 计划 Task 10。三层嵌套（Outcome → Report → Leak / ComposeReport），每一层都要是 camelCase；
     // 只测 Refused 的话，变体字段与结构体字段的 serde 属性写错都测不到
+    use app_lib::engine::git_read::LineStat;
     use app_lib::engine::svn_follow::{
         ConflictDetail, Evidence, FollowOutcome, FollowReport, HeldBack, OverlapFile,
     };
@@ -1081,6 +1082,16 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
             rewritten: vec![("c2".into(), vec!["Code/A.cs".into()])],
             snapshot: vec![("c3".into(), vec!["Code/B.cs".into()])],
             drift: vec!["Code/E.cs".into()],
+            drift_lines: [(
+                "Code/E.cs".to_string(),
+                LineStat {
+                    added: 0,
+                    removed: 7,
+                    binary: false,
+                },
+            )]
+            .into_iter()
+            .collect(),
             restorable: vec!["Code/E.cs".into()],
             restore: Some(RestoreOutcome {
                 restored: vec!["Code/E.cs".into()],
@@ -1156,6 +1167,12 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     assert_eq!(r["rewritten"][0], serde_json::json!(["c2", ["Code/A.cs"]]));
     assert_eq!(r["snapshot"][0], serde_json::json!(["c3", ["Code/B.cs"]]));
     assert_eq!(r["drift"][0], "Code/E.cs");
+    // 前端按路径取：{ added, removed, binary }
+    assert_eq!(
+        r["driftLines"],
+        serde_json::json!({ "Code/E.cs": { "added": 0, "removed": 7, "binary": false } }),
+        "实际 {v}"
+    );
     assert_eq!(r["restorable"][0], "Code/E.cs", "实际 {v}");
     // 前端读这几个字段；retry 只在后端用，不出现在 JSON 里
     assert_eq!(
@@ -1194,8 +1211,11 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     old.as_object_mut().unwrap().remove("overlap");
     // 部分自动跟进之前的 journal 没有 heldBack
     old.as_object_mut().unwrap().remove("heldBack");
+    // 计划 2026-11-16 的 B 之前的 journal 没有 driftLines
+    old.as_object_mut().unwrap().remove("driftLines");
     let back: FollowReport = serde_json::from_value(old).unwrap();
     assert!(back.held_back.is_empty());
+    assert!(back.drift_lines.is_empty());
     assert_eq!(
         (back.evidence, back.evidence_cutoff_ms),
         (Evidence::Heuristic, None)

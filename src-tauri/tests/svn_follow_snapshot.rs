@@ -11,12 +11,14 @@
 mod svn_fixtures;
 
 use app_lib::engine::git_cli::run_git;
+use app_lib::engine::git_read::LineStat;
 use app_lib::engine::svn_follow::fault::{self, Crashed, Point};
 use app_lib::engine::svn_follow::{follow, manual_follow, FollowOutcome, FollowReport};
 use app_lib::engine::svn_journal;
 use app_lib::engine::svn_replay::{commits_between, ReplayCodes};
 use app_lib::engine::svn_snapshot::SnapshotRule;
 use app_lib::engine::svn_sync_in::{abort_sync, continue_sync, SyncInOutcome};
+use std::collections::BTreeMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::process::Command;
 use svn_fixtures::{hybrid_with_colleague, svn_cmd, SvnFixture};
@@ -454,4 +456,53 @@ fn a_clean_but_wrong_replay_is_reported_as_drift() {
     assert_eq!(rep.drift, vec![A.to_string()]);
     // 合错的是普通 commit：不能当成 Local-Only 补丁放回磁盘（9.1）
     assert!(rep.restorable.is_empty(), "{:?}", rep.restorable);
+    // 合出来的是「我的版本 + 同事的版本」：分支比 SVN 多一行（计划 2026-11-16 的 B）
+    assert_eq!(
+        rep.drift_lines.get(A),
+        Some(&LineStat {
+            added: 1,
+            removed: 0,
+            binary: false
+        }),
+        "{:?}",
+        rep.drift_lines
+    );
+}
+
+#[test]
+fn reverting_a_change_that_svn_now_has_reports_how_many_lines_the_branch_lacks() {
+    // 2026-11-16 UnionMainBaseUI.lua：一个提交加了 7 行、下一个又撤销；同事把同样的 7 行提交进 SVN。
+    // 重放后加行的提交变空，撤销的提交照样删 → 分支比 SVN 少 7 行（计划 2026-11-16 的 B）
+    let fx = hybrid_with_colleague();
+    let orig = read(&fx, A);
+    let more: String = (1..=7).map(|i| format!("added {i}\n")).collect();
+    write(&fx, A, &format!("{orig}{more}"));
+    commit_all(&fx, "加 7 行");
+    write(&fx, A, &orig);
+    commit_all(&fx, "撤销");
+    // 分支上还有别的、SVN 上没有的改动（真实现场就是这样）。没有它的话分支相对旧基线的净改动为空，
+    // 「已全部提交」的捷径把两个提交都收掉，分支直接等于新基线，不会对不上
+    write(&fx, B, "b-mine\n");
+    commit_all(&fx, "别的改动");
+    colleague(&fx, A, &format!("{orig}{more}"));
+    svn_update(&fx);
+    assert_eq!(read(&fx, A), format!("{orig}{more}"), "前提");
+
+    let rep = done(run(&fx));
+
+    assert_eq!(rep.drift, vec![A.to_string()], "{rep:?}");
+    assert_eq!(
+        rep.drift_lines,
+        BTreeMap::from([(
+            A.to_string(),
+            LineStat {
+                added: 0,
+                removed: 7,
+                binary: false
+            }
+        )])
+    );
+    // 造成差异的提交在 overlap 里，前端写在行数后面
+    let o = rep.overlap.iter().find(|o| o.path == A).unwrap();
+    assert!(o.commits.iter().any(|c| c.ends_with("撤销")), "{o:?}");
 }
