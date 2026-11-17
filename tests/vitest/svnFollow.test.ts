@@ -1060,7 +1060,8 @@ describe('跟进后自动放回 Local-Only 补丁（计划 2026-11-12-auto-resto
   it('能放回的不留在红色「分支与磁盘对不上」里（缺陷 5）', () => {
     const drift = section('drift')!
     expect(drift.groups.flatMap((g) => g.items.map((i) => i.text))).toEqual(['Code/C.cs'])
-    expect(drift.note).toContain('不要把磁盘版本提交进分支')
+    // 例外那句留着：restorable_paths 出错时能放回的文件会落进这一节
+    expect(drift.note).toContain('Local-Only 补丁时别提交')
   })
 
   it('已放回的单列一节，写明路径和提交（缺陷 6）', () => {
@@ -1072,9 +1073,9 @@ describe('跟进后自动放回 Local-Only 补丁（计划 2026-11-12-auto-resto
   it('没放回的列成要留意的一节，写明提交与原因', () => {
     const s = section('restorePending')!
     expect(s.level).toBe('attention')
-    expect(s.groups[0].items).toEqual([
-      { text: 'Code/B.cs', meta: '1234567 补丁 · SVN 上最后改它的不是你' },
-    ])
+    // 只有一种原因：写进说明一次，不在每个文件后面重复
+    expect(s.groups[0].items).toEqual([{ text: 'Code/B.cs', meta: '补丁来自 1234567 补丁' }])
+    expect(s.note).toContain('SVN 上最后改它的不是你')
     expect(s.note).toContain('顶部横幅')
   })
 
@@ -1182,5 +1183,198 @@ describe('「缺 Local-Only 补丁」横幅（计划的 C）', () => {
     expect(m.title).toBe('2 个文件缺 Local-Only 补丁')
     expect(m.files).toEqual(['Code/A.cs ← fae50a8 add @avatarclass', 'Code/B.cs'])
     expect(m.detail).toContain('不要把它提交进分支')
+  })
+})
+
+describe('报告三节的写法（计划 2026-11-16-follow-report-usability 的 A）', () => {
+  // 2026-11-16 Client 仓库那次跟进的形状：后端把整个 drift 并进 overlap（带上改过它的提交），
+  // 能放回的两个文件 SVN 最后提交者是同事，没自动放回；「lua worktree」重放后变空被丢弃，
+  // 它的泄漏仍在 leaks 里
+  const NOT_MINE = 'SVN 上最后改它的不是你（或认不出是谁），可能是你有意去掉的补丁，没有自动放回。'
+  const luaWorktree = 'a'.repeat(40)
+  const editorTweak = 'b'.repeat(40)
+  const real: FollowReport = {
+    ...report,
+    changes: [
+      { path: 'Lua/ImpChat.lua', rev: 68460, author: 'xiebin' },
+      { path: 'Lua/ImpUnionParade.lua', rev: 68461, author: 'xiebin' },
+      { path: 'Lua/UnionMainBaseUI.lua', rev: 68463, author: 'xiebin' },
+      { path: 'Editor/LuaSourceRoot.cs', rev: 68339, author: 'liuhao' },
+    ],
+    dropped: [luaWorktree],
+    drift: ['Lua/ImpChat.lua', 'Lua/ImpUnionParade.lua', 'Lua/UnionMainBaseUI.lua'],
+    overlap: [
+      { path: 'Lua/ImpChat.lua', commits: ['9f1e2d3 [Local-Only] 调试日志'], matchesDisk: false },
+      { path: 'Lua/ImpUnionParade.lua', commits: ['9f1e2d3 [Local-Only] 调试日志'], matchesDisk: false },
+      { path: 'Lua/UnionMainBaseUI.lua', commits: ['c028e264 小婉问答'], matchesDisk: false },
+    ],
+    restorable: ['Lua/ImpChat.lua', 'Lua/ImpUnionParade.lua'],
+    restore: {
+      restored: [],
+      skipped: [
+        { path: 'Lua/ImpChat.lua', reason: NOT_MINE },
+        { path: 'Lua/ImpUnionParade.lua', reason: NOT_MINE },
+      ],
+      commits: {
+        'Lua/ImpChat.lua': ['9f1e2d3 [Local-Only] 调试日志'],
+        'Lua/ImpUnionParade.lua': ['9f1e2d3 [Local-Only] 调试日志'],
+      },
+    },
+    leaks: [
+      {
+        branch: 'work',
+        commit: luaWorktree,
+        subject: 'lua worktree',
+        path: 'Editor/LuaSourceRoot.cs',
+        hunks: [{ oldStart: 0, lines: 0, verdict: 'present' }],
+      },
+      {
+        branch: 'work',
+        commit: editorTweak,
+        subject: 'editor 便利性优化',
+        path: 'Editor/RuntimePrefabSourceTracker.cs',
+        hunks: [{ oldStart: 4, lines: 2, verdict: 'unknown' }],
+      },
+    ],
+  }
+  const m = describeFollowReport(real)
+  const section = (id: string) => m.sections.find((s) => s.id === id)!
+
+  describe('没放回的补丁：问一句要不要，原因只说一次', () => {
+    const s = section('restorePending')
+
+    it('标题就是要用户做的决定，带上文件数', () => {
+      expect(s.title).toBe('要不要放回这 2 个文件的 Local-Only 补丁？')
+    })
+
+    it('原因写在说明里一次，每个文件后面只写补丁来自哪个提交、SVN 最后提交者', () => {
+      expect(s.note!.split(NOT_MINE)).toHaveLength(2)
+      expect(s.groups).toEqual([
+        {
+          label: '',
+          items: [
+            {
+              text: 'Lua/ImpChat.lua',
+              meta: '补丁来自 9f1e2d3 [Local-Only] 调试日志 · SVN 最后提交：xiebin（r68460）',
+            },
+            {
+              text: 'Lua/ImpUnionParade.lua',
+              meta: '补丁来自 9f1e2d3 [Local-Only] 调试日志 · SVN 最后提交：xiebin（r68461）',
+            },
+          ],
+        },
+      ])
+    })
+
+    it('两条路都写清，和顶部横幅说的一样：要补丁就放回，有意去掉的就点「不放回」', () => {
+      expect(s.note).toContain('要补丁就放回')
+      expect(s.note).toContain('有意去掉的')
+      expect(s.note).toContain('「不放回」')
+      // 旧文案「不要把磁盘版本提交进分支」把「不要补丁」这条路堵死了；也不叫人提交：没放回的原因可能是
+      // 磁盘或暂存区里另有内容，提交会把不知道是什么的东西带进分支（独立 review 第 2、3 条）
+      expect(s.note).not.toContain('提交进分支')
+      // 「磁盘上是 SVN 的版本」只在跟进那一刻成立
+      expect(s.note).toMatch(/^跟进时/)
+    })
+
+    it('原因各不相同时按原因分组，说明里不再写某一条', () => {
+      const r: FollowReport = {
+        ...real,
+        restore: {
+          ...real.restore!,
+          skipped: [
+            { path: 'Lua/ImpChat.lua', reason: NOT_MINE },
+            { path: 'Lua/ImpUnionParade.lua', reason: '文件被别的程序占用' },
+          ],
+        },
+      }
+      const g = describeFollowReport(r).sections.find((x) => x.id === 'restorePending')!
+      expect(g.groups.map((x) => x.label)).toEqual([NOT_MINE, '文件被别的程序占用'])
+      expect(g.note).not.toContain(NOT_MINE)
+      expect(g.count).toBe(2)
+    })
+
+    it('SVN 最后提交者没有作者、或这次没跟进到它：照实写或不写', () => {
+      const r: FollowReport = {
+        ...real,
+        changes: [{ path: 'Lua/ImpChat.lua', rev: 68460, author: null }],
+      }
+      const items = describeFollowReport(r).sections.find((x) => x.id === 'restorePending')!
+        .groups[0].items
+      expect(items[0].meta).toBe(
+        '补丁来自 9f1e2d3 [Local-Only] 调试日志 · SVN 最后提交：没有作者（r68460）',
+      )
+      expect(items[1].meta).toBe('补丁来自 9f1e2d3 [Local-Only] 调试日志')
+    })
+  })
+
+  describe('分支与磁盘对不上：三句话，带上改过它的提交', () => {
+    const s = section('drift')
+
+    it('只列不能放回的文件，后面写上重放后仍改过它的提交', () => {
+      expect(s.groups[0].items).toEqual([
+        { text: 'Lua/UnionMainBaseUI.lua', meta: '改过它的提交：c028e264 小婉问答' },
+      ])
+    })
+
+    it('说明只有三句：是什么、怎么办、例外', () => {
+      const sentences = s.note!.split('。').filter((t) => t !== '')
+      expect(sentences).toHaveLength(3)
+      expect(sentences[0]).toContain('本地改动')
+      expect(sentences[1]).toContain('提交进分支')
+      expect(sentences[2]).toContain('Local-Only')
+    })
+
+    it('旧后端没有 overlap：照原样只列文件名', () => {
+      const r: FollowReport = { ...real, overlap: undefined }
+      const d = describeFollowReport(r).sections.find((x) => x.id === 'drift')!
+      expect(d.groups[0].items).toEqual([{ text: 'Lua/UnionMainBaseUI.lua' }])
+    })
+  })
+
+  describe('泄漏告警：重放后被丢弃的提交标成已从分支移除', () => {
+    const s = section('leaks')
+
+    it('丢弃的提交单列一组，不再写成「分支 work：…」', () => {
+      expect(s.groups.map((g) => g.label)).toEqual(['拿不准', '已从分支移除：内容都在 SVN 上了'])
+      expect(s.groups[1].items).toEqual([
+        { text: 'Editor/LuaSourceRoot.cs', meta: 'lua worktree，原在分支 work' },
+      ])
+      expect(s.groups[0].items[0].meta).toBe('分支 work：editor 便利性优化')
+      expect(s.note).toContain('已从分支移除')
+    })
+
+    it('还是红色：补丁内容上了服务器这件事本身要你知道', () => {
+      expect(s.level).toBe('danger')
+      const only = describeFollowReport({ ...real, leaks: [real.leaks[0]] })
+      expect(only.sections.find((x) => x.id === 'leaks')!.level).toBe('danger')
+    })
+
+    it('别的分支带着同一个提交：它没重放、没移动（plan_other 见泄漏就停），不能标成已移除', () => {
+      const other = { ...real.leaks[0], branch: 'work2' }
+      const r: FollowReport = {
+        ...real,
+        leaks: [real.leaks[0], other],
+        behindBranches: [['work2', '分支上的 Local-Only 补丁里有改动已经或可能出现在 SVN 上，不自动移动']],
+      }
+      const l = describeFollowReport(r).sections.find((x) => x.id === 'leaks')!
+      expect(l.groups).toEqual([
+        {
+          label: '这些改动已确认在 SVN 上',
+          items: [{ text: 'Editor/LuaSourceRoot.cs', meta: '分支 work2：lua worktree' }],
+        },
+        {
+          label: '已从分支移除：内容都在 SVN 上了',
+          items: [{ text: 'Editor/LuaSourceRoot.cs', meta: 'lua worktree，原在分支 work' }],
+        },
+      ])
+    })
+
+    it('没有丢弃的提交时说明不提「已从分支移除」', () => {
+      const r: FollowReport = { ...real, dropped: [] }
+      const l = describeFollowReport(r).sections.find((x) => x.id === 'leaks')!
+      expect(l.groups.map((g) => g.label)).toEqual(['这些改动已确认在 SVN 上', '拿不准'])
+      expect(l.note).not.toContain('已从分支移除')
+    })
   })
 })

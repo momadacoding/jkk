@@ -478,8 +478,32 @@ fn condition_8_a_local_only_leak_is_not_followed_silently() {
     let message = assert_skipped_untouched(&fx, "svn_auto_follow_leak");
 
     assert!(message.contains(A), "{message}");
+    // 补丁的内容整个上了 SVN：重放后变空、会被丢弃。横幅要说它会从分支上移除，不能只说「可能」
+    // （计划 2026-11-16-follow-report-usability 的 A）
+    assert!(message.contains("「本地补丁」"), "{message}");
+    assert!(message.contains("从分支上移除"), "{message}");
     let rep = manual_done(follow(&fx.wc_str(), "manual").unwrap());
     assert_eq!(rep.leaks.len(), 1, "按钮照常完成，报告里列出泄漏");
+    assert_eq!(
+        rep.dropped,
+        vec![rep.leaks[0].commit.clone()],
+        "泄漏所在的提交被丢弃"
+    );
+}
+
+#[test]
+fn condition_8_a_leak_still_on_the_branch_does_not_say_it_is_removed() {
+    // 补丁只有一部分上了 SVN：提交重放后还在，横幅不提移除
+    let fx = hybrid_with_colleague();
+    write(&fx, A, "a-log\n");
+    write(&fx, B, "b-log\n");
+    commit_all(&fx, L_MSG);
+    tortoise_commit(&fx, A);
+
+    let message = assert_skipped_untouched(&fx, "svn_auto_follow_leak");
+
+    assert!(message.contains(A), "{message}");
+    assert!(!message.contains("移除"), "{message}");
 }
 
 /// 我在分支上改了 B 第 1 行（commit「我的改动」），同事改了 B 第 8 行、我局部 update 了 B：重放干净，

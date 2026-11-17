@@ -1634,16 +1634,27 @@ body {
   color: #81c784;
 }
 
-/* 「放回 Local-Only 补丁」（使用报告 9.1）：挂在「需要你留意」里，紧跟「分支与磁盘对不上」 */
+/* 「放回 Local-Only 补丁」（使用报告 9.1）：在「要不要放回」那一节的清单下面，不再另起一个框
+   （计划 2026-11-16 的 A）；与清单的路径对齐 */
 .follow-restore {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
   gap: 6px;
-  padding: 7px 10px 8px;
-  border: 1px solid #363636;
-  border-radius: 3px;
+  margin-top: 8px;
+  padding-left: 10px;
   min-width: 0;
+}
+
+/* 放回后跳过的清单：外层已经缩进过一次 */
+.follow-restore .follow-items li {
+  padding-left: 0;
+}
+
+/* .dlg-warning 默认让出图标的 54px；在节里要和清单对齐，并占满宽度 */
+.follow-restore .dlg-warning {
+  margin-left: 0;
+  align-self: stretch;
 }
 
 .follow-restore > div {

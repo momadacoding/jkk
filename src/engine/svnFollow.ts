@@ -383,6 +383,45 @@ function leakItem(l: Leak): ReportItem {
   return { text: l.path, meta: `分支 ${l.branch}：${l.subject}` }
 }
 
+/** 重放后变空、已丢弃的提交上的泄漏：分支上已经没有它，不能再写成「分支 work：…」（计划 2026-11-16 的 A）。 */
+function removedLeakItem(l: Leak): ReportItem {
+  return { text: l.path, meta: `${l.subject}，原在分支 ${l.branch}` }
+}
+
+const REMOVED_LEAKS = '已从分支移除：内容都在 SVN 上了'
+
+/**
+ * 「要不要放回」一节的清单：原因只有一种时写进说明一次（返回 `reason`），每个文件后面只写补丁来自哪个
+ * 提交与 SVN 最后提交者；原因各不相同时按原因分组，组名就是原因。
+ */
+function pendingRestoreGroups(
+  items: { item: ReportItem; reason: string }[],
+): { reason: string | null; groups: FollowReportSection['groups'] } {
+  const reasons = [...new Set(items.map((i) => i.reason))]
+  if (reasons.length <= 1) {
+    const r = reasons[0] ?? ''
+    return {
+      // 原因是后端写的整句，接在说明中间；万一没带句号，也不和下一句粘在一起
+      reason: r === '' ? null : r.endsWith('。') ? r : `${r}。`,
+      groups: [{ label: '', items: items.map((i) => i.item) }],
+    }
+  }
+  return {
+    reason: null,
+    groups: reasons.map((r) => ({
+      label: r || '（没有原因）',
+      items: items.filter((i) => i.reason === r).map((i) => i.item),
+    })),
+  }
+}
+
+/** SVN 上最后一次改它的提交：这次跟进到了才有（能放回的文件都在外部变更里，见 `drift_paths`）。 */
+function svnLastCommit(r: FollowReport, path: string): string | null {
+  const c = r.changes.find((x) => x.path === path)
+  if (!c) return null
+  return `SVN 最后提交：${c.author ?? '没有作者'}（r${c.rev}）`
+}
+
 /** 所有 hunk 都原样出现在新基线里的算「已确认」；有任何一处对不上的算「拿不准」。 */
 function leakTiers(leaks: Leak[]): { sure: Leak[]; unsure: Leak[] } {
   const isSure = (l: Leak) => l.hunks.length > 0 && l.hunks.every((h) => h.verdict === 'present')
@@ -449,11 +488,26 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
   const reasonOf = new Map((r.restore?.skipped ?? []).map((k) => [k.path, k.reason]))
   const notRestored = restorable
     .filter((p) => !restored.includes(p))
-    .map((p): ReportItem => {
-      const parts = [commitsOf(p), reasonOf.get(p) ?? ''].filter((t) => t !== '')
-      return parts.length > 0 ? { text: p, meta: parts.join(' · ') } : { text: p }
+    .map((p) => {
+      const c = commitsOf(p)
+      const parts = [c ? `补丁来自 ${c}` : '', svnLastCommit(r, p) ?? ''].filter((t) => t !== '')
+      const item: ReportItem = parts.length > 0 ? { text: p, meta: parts.join(' · ') } : { text: p }
+      return { item, reason: reasonOf.get(p) ?? '' }
     })
+  const pending = pendingRestoreGroups(notRestored)
   const overlap = r.overlap ?? []
+  const commitsByPath = new Map(overlap.map((o) => [o.path, o.commits.join('、')]))
+  const driftItem = (p: string): ReportItem => {
+    const c = commitsByPath.get(p)
+    return c ? { text: p, meta: `改过它的提交：${c}` } : { text: p }
+  }
+  // 重放后变空、已丢弃的提交上的泄漏单列一组：它已经不在分支上了（计划 2026-11-16 的 A）。
+  // 只认移动了的分支：别的分支带着同一个提交时，`plan_other` 见泄漏就停，那条分支没重放、提交还在，
+  // 而且一定进了 behindBranches。报告里没有当前分支名，只能这样排除
+  const gone = new Set(r.dropped)
+  const stayed = new Set(r.behindBranches.map(([b]) => b))
+  const isRemoved = (l: Leak) => gone.has(l.commit) && !stayed.has(l.branch)
+  const removedLeaks = r.leaks.filter(isRemoved)
   const overlapItem = (o: OverlapFile): ReportItem => ({ text: o.path, meta: o.commits.join('、') })
   // drift 里的已经在「分支与磁盘对不上」那一节，不重复列
   // 后端把整个 drift（含能放回的）并进了 overlap。能放回的已经在 Local-Only 那两节，按原始 drift
@@ -470,19 +524,19 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
       text: p,
       meta: `${partial[p].total} 处改动里 ${partial[p].present} 处已在 SVN 上`,
     }))
-  const { sure, unsure } = leakTiers(r.leaks)
+  const { sure, unsure } = leakTiers(r.leaks.filter((l) => !isRemoved(l)))
   // 顺序就是展示顺序：先 danger，再 attention，最后 info；info 里与这次跟进最相关的在前
   const candidates: Omit<FollowReportSection, 'count'>[] = [
     {
       id: 'drift',
       title: '分支与磁盘对不上',
       level: 'danger',
+      // 三句：是什么、怎么办、例外。能放回的已经单列，例外只在后端没挑出它们时（出错）才用得上
       note:
-        '「本地改动」里会出现这些文件的修改：磁盘上是 SVN 的版本，重放后的分支里却是别的内容' +
-        '（或者把 SVN 已删的文件带了回来）。请逐个核对，磁盘上的版本是对的，就把它提交进分支。' +
-        '可能是重放时合错了，也可能是你在磁盘上撤掉了某个 commit 的改动、还没提交这次撤销。' +
-        '如果多出来的是 Local-Only 提交的内容，不要把磁盘版本提交进分支：那会把补丁删掉。',
-      groups: [{ label: '', items: plain(drift) }],
+        '这些文件分支里的内容和磁盘上的 SVN 版本不同（或者分支把 SVN 已删的文件带了回来），' +
+        '「本地改动」里会出现它们。磁盘上的版本是对的，就把它提交进分支。' +
+        '例外：差的是 Local-Only 补丁时别提交，那会把补丁删掉。',
+      groups: [{ label: '', items: drift.map(driftItem) }],
     },
     {
       id: 'heldBack',
@@ -500,12 +554,17 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
     },
     {
       id: 'restorePending',
-      title: '没放回的 Local-Only 补丁',
+      // 标题就是要用户做的决定（计划 2026-11-16 的 A）：原来写「没放回」，下面却给放回按钮
+      title: `要不要放回这 ${notRestored.length} 个文件的 Local-Only 补丁？`,
       level: 'attention',
+      // 「磁盘上是 SVN 的版本」只在跟进那一刻成立：没放回的原因可能正是磁盘或暂存区里另有内容，所以
+      // 不叫人提交，「不要补丁」这条路与顶部横幅一致，点「不放回」（独立 review 第 2、3 条）
       note:
-        '分支比磁盘只多 Local-Only 补丁，磁盘就是 SVN 的版本。不要把磁盘版本提交进分支，那会把补丁删掉。' +
-        '要放回就点下面的按钮；关掉报告之后，顶部横幅上也能放回。',
-      groups: [{ label: '', items: notRestored }],
+        '跟进时，这些文件分支比磁盘只多 Local-Only 补丁，磁盘上是 SVN 的版本。' +
+        (pending.reason ?? '') +
+        '要补丁就放回：SVN 里它们会显示为已修改，git 里是干净的；关掉报告之后，顶部横幅上也能放回。' +
+        '是你有意去掉的，就在顶部横幅上点「不放回」。',
+      groups: pending.groups,
     },
     {
       id: 'leaks',
@@ -513,10 +572,14 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
       level: 'danger',
       note:
         `${LEAK_NOTE}。只是提醒，不影响这次跟进；` +
-        '带着这些补丁的其他分支不会自动移动，切过去时会提示手动跟进。确认是你有意提交的，就可以不管它。',
+        '带着这些补丁的其他分支不会自动移动，切过去时会提示手动跟进。确认是你有意提交的，就可以不管它。' +
+        (removedLeaks.length > 0
+          ? '「已从分支移除」的提交重放后变空，已经丢弃，分支上不会再有它们。'
+          : ''),
       groups: [
         { label: '这些改动已确认在 SVN 上', items: sure.map(leakItem) },
         { label: '拿不准', items: unsure.map(leakItem) },
+        { label: REMOVED_LEAKS, items: removedLeaks.map(removedLeakItem) },
       ],
     },
     {

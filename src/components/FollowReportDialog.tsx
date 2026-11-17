@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useFocusTrap } from './useFocusTrap'
 import { toErrorMessage } from '../engine/errors'
 import {
@@ -89,60 +89,47 @@ function SvnUserRow({
   )
 }
 
-/**
- * 「分支与磁盘对不上」里能安全放回的文件（使用报告 9.1）：一个按钮把分支版本写回磁盘。
- * 点一次就够：成功之后按钮消失，只留结果；失败可以再点。
- */
-function RestoreRow({
-  paths,
-  commits,
-  restore,
-}: {
-  paths: string[]
-  /** 路径 → 改过它的 Local-Only 提交，写在按钮上方（使用报告 2026-11-12 缺陷 6）。 */
-  commits: Record<string, string[]>
-  restore: (paths: string[]) => Promise<RestoreOutcome>
-}) {
-  const [busy, setBusy] = useState(false)
-  const [outcome, setOutcome] = useState<RestoreOutcome | null>(null)
-  const [error, setError] = useState<string | null>(null)
+interface RestoreState {
+  busy: boolean
+  outcome: RestoreOutcome | null
+  error: string | null
+}
 
-  const run = async () => {
-    setBusy(true)
-    setError(null)
-    try {
-      setOutcome(await restore(paths))
-    } catch (err) {
-      setError(toErrorMessage(err))
-    } finally {
-      setBusy(false)
-    }
+/** 「放回」的状态与动作，活得和报告框一样长（见 {@link RestoreRow}）。 */
+function useRestore(
+  paths: string[],
+  restore: ((paths: string[]) => Promise<RestoreOutcome>) | undefined,
+): { state: RestoreState; run: () => void } {
+  const [state, setState] = useState<RestoreState>({ busy: false, outcome: null, error: null })
+  const run = () => {
+    if (!restore) return
+    setState((s) => ({ ...s, busy: true, error: null }))
+    restore(paths).then(
+      (outcome) => setState({ busy: false, outcome, error: null }),
+      (err) => setState((s) => ({ ...s, busy: false, error: toErrorMessage(err) })),
+    )
   }
+  return { state, run }
+}
 
+/**
+ * 「要不要放回」那一节里的按钮（使用报告 9.1）：把分支版本写回磁盘。文件、补丁和原因由那一节列出，
+ * 这里只放按钮与结果（计划 2026-11-16 的 A：原来另起一块，同一批文件列了两遍）。
+ * 点一次就够：成功之后按钮消失，只留结果；失败可以再点。
+ *
+ * 状态由 {@link useRestore} 放在 `Dialog` 里：那一节折起来时正文不渲染，状态放在这里的话，折起再展开
+ * 结果就没了、按钮又回来，再点一次只会报「已经是分支的版本」（独立 review 第 4 条）。
+ */
+function RestoreRow({ paths, state, run }: { paths: string[]; state: RestoreState; run: () => void }) {
+  const { busy, outcome, error } = state
   const said = outcome && describeRestoreOutcome(outcome)
   // aria-live：结果是点完之后才出现的，读屏要能听到
   return (
     <div className="follow-restore" aria-live="polite">
       {!outcome && (
-        <>
-          <div className="follow-note">
-            这 {paths.length} 个文件分支比磁盘多出来的只有 Local-Only 补丁，磁盘上就是 SVN
-            的版本。可以把补丁放回磁盘：SVN 里它们会显示为已修改，git 里是干净的。
-          </div>
-          <ul className="follow-items">
-            {paths.map((p) => (
-              <li key={p}>
-                <span className="follow-path">{p}</span>
-                {(commits[p] ?? []).length > 0 && (
-                  <span className="follow-meta">← {commits[p].join('、')}</span>
-                )}
-              </li>
-            ))}
-          </ul>
-          <button type="button" onClick={() => void run()} disabled={busy}>
-            {busy ? '正在放回…' : `放回 Local-Only 补丁（${paths.length} 个文件）`}
-          </button>
-        </>
+        <button type="button" onClick={run} disabled={busy}>
+          {busy ? '正在放回…' : `放回 Local-Only 补丁（${paths.length} 个文件）`}
+        </button>
       )}
       {said && (
         <div className={said.ok ? 'follow-user-saved' : 'dlg-warning'}>
@@ -190,7 +177,7 @@ const real = (groups: FollowReportSection['groups']) =>
  * `<details>` 里的按钮也会被挑中，focus() 落不上，Tab 就卡在原地。`<summary>` 带 tabIndex
  * 才进得了那个选择器。
  */
-function Section({ s }: { s: FollowReportSection }) {
+function Section({ s, children }: { s: FollowReportSection; children?: ReactNode }) {
   const [open, setOpen] = useState(s.level !== 'info' || s.count <= INFO_OPEN_MAX)
   const [all, setAll] = useState(false)
   const shown = all ? s.groups : preview(s.groups)
@@ -231,6 +218,7 @@ function Section({ s }: { s: FollowReportSection }) {
               {all ? '收起' : `再显示 ${hidden} 个`}
             </button>
           )}
+          {children}
         </>
       )}
     </details>
@@ -270,8 +258,9 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
 
   const flagged = m.sections.filter((s) => s.level !== 'info')
   const done = m.sections.filter((s) => s.level === 'info')
-  const restorable = restorablePaths(request.report)
+  const restorable = useMemo(() => restorablePaths(request.report), [request.report])
   const restore = request.restoreLocalOnly
+  const restoring = useRestore(restorable, restore)
 
   return (
     <div className="dialog-overlay">
@@ -296,15 +285,12 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
           <div className="follow-zone">
             <div className="follow-zone-title">需要你留意</div>
             {flagged.map((s) => (
-              <Section key={s.id} s={s} />
+              <Section key={s.id} s={s}>
+                {s.id === 'restorePending' && restore && restorable.length > 0 && (
+                  <RestoreRow paths={restorable} state={restoring.state} run={restoring.run} />
+                )}
+              </Section>
             ))}
-            {restore && restorable.length > 0 && (
-              <RestoreRow
-                paths={restorable}
-                commits={request.report.restore?.commits ?? {}}
-                restore={restore}
-              />
-            )}
           </div>
         )}
 

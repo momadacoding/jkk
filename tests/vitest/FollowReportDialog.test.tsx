@@ -304,6 +304,24 @@ describe('放回 Local-Only 补丁（使用报告 9.1）', () => {
     expect(screen.getByText('磁盘上的内容不是 SVN 的版本')).toBeTruthy()
   })
 
+  it('放回之后折起再展开那一节：结果还在，按钮不回来（独立 review 第 4 条）', async () => {
+    const restoreLocalOnly = vi.fn(async (): Promise<Outcome> => ({
+      restored: ['Code/A.cs'],
+      skipped: [],
+    }))
+    open(drift, { restoreLocalOnly })
+    fireEvent.click(screen.getByRole('button', { name: /放回 Local-Only 补丁/ }))
+    expect(await screen.findByText(/已放回 1 个文件/)).toBeTruthy()
+
+    const summary = screen.getByText(/要不要放回这 1 个文件/).closest('summary')!
+    fireEvent.click(summary)
+    expect(screen.queryByText(/已放回 1 个文件/)).toBeNull()
+    fireEvent.click(summary)
+    expect(screen.getByText(/已放回 1 个文件/)).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /放回 Local-Only 补丁/ })).toBeNull()
+    expect(restoreLocalOnly).toHaveBeenCalledTimes(1)
+  })
+
   it('出错时显示错误，按钮还在、可以再点', async () => {
     const restoreLocalOnly = vi
       .fn<(paths: string[]) => Promise<Outcome>>()
@@ -332,7 +350,33 @@ describe('放回 Local-Only 补丁（使用报告 9.1）', () => {
       { restoreLocalOnly: vi.fn() },
     )
     expect(screen.getByRole('button', { name: '放回 Local-Only 补丁（1 个文件）' })).toBeTruthy()
-    expect(screen.getAllByText('← fae50a8 add @avatarclass').length).toBe(1)
+    expect(screen.getAllByText(/fae50a8 add @avatarclass/).length).toBe(1)
+  })
+
+  it('放回按钮就在「要不要放回」那一节里，文件和原因只出现一次（计划 2026-11-16 的 A）', () => {
+    open(
+      {
+        ...drift,
+        restore: {
+          restored: [],
+          skipped: [{ path: 'Code/A.cs', reason: '不是你。' }],
+          commits: { 'Code/A.cs': ['fae50a8 add @avatarclass'] },
+        },
+      },
+      { restoreLocalOnly: vi.fn() },
+    )
+    const button = screen.getByRole('button', { name: '放回 Local-Only 补丁（1 个文件）' })
+    const section = button.closest('details')!
+    expect(section.querySelector('summary')!.textContent).toContain(
+      '要不要放回这 1 个文件的 Local-Only 补丁？',
+    )
+    // 「跟进的文件」那一节（info）照常列它；要留意的节里只列一次
+    const flagged = Array.from(
+      document.querySelectorAll('.follow-section:not(.info) .follow-path'),
+    ).filter((n) => n.textContent === 'Code/A.cs')
+    expect(flagged).toHaveLength(1)
+    expect(section.textContent).toContain('不是你。')
+    expect(screen.getAllByText(/不是你。/)).toHaveLength(1)
   })
 
   it('全部自动放回了：不给按钮', () => {
