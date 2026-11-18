@@ -970,7 +970,7 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     // 只测 Refused 的话，变体字段与结构体字段的 serde 属性写错都测不到
     use app_lib::engine::git_read::LineStat;
     use app_lib::engine::svn_follow::{
-        ConflictDetail, Evidence, FollowOutcome, FollowReport, HeldBack, OverlapFile,
+        ConflictDetail, DriftRange, Evidence, FollowOutcome, FollowReport, HeldBack, OverlapFile,
     };
     use app_lib::engine::svn_follow_index::{ComposeReport, StageDecision};
     use app_lib::engine::svn_leak::{HunkLeak, Leak, LeakVerdict, StageTally};
@@ -1092,6 +1092,10 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
             )]
             .into_iter()
             .collect(),
+            drift_range: Some(DriftRange {
+                from: "b".repeat(40),
+                to: "t".repeat(40),
+            }),
             restorable: vec!["Code/E.cs".into()],
             restore: Some(RestoreOutcome {
                 restored: vec!["Code/E.cs".into()],
@@ -1173,6 +1177,12 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
         serde_json::json!({ "Code/E.cs": { "added": 0, "removed": 7, "binary": false } }),
         "实际 {v}"
     );
+    // 前端拿它开外部对比：{ from, to }
+    assert_eq!(
+        r["driftRange"],
+        serde_json::json!({ "from": "b".repeat(40), "to": "t".repeat(40) }),
+        "实际 {v}"
+    );
     assert_eq!(r["restorable"][0], "Code/E.cs", "实际 {v}");
     // 前端读这几个字段；retry 只在后端用，不出现在 JSON 里
     assert_eq!(
@@ -1213,9 +1223,12 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     old.as_object_mut().unwrap().remove("heldBack");
     // 计划 2026-11-16 的 B 之前的 journal 没有 driftLines
     old.as_object_mut().unwrap().remove("driftLines");
+    // 「对比」按钮之前的 journal 没有 driftRange
+    old.as_object_mut().unwrap().remove("driftRange");
     let back: FollowReport = serde_json::from_value(old).unwrap();
     assert!(back.held_back.is_empty());
     assert!(back.drift_lines.is_empty());
+    assert_eq!(back.drift_range, None);
     assert_eq!(
         (back.evidence, back.evidence_cutoff_ms),
         (Evidence::Heuristic, None)

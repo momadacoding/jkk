@@ -59,7 +59,7 @@ import { readAppSettings } from '@/store/appSettingsStore'
 import SvnInitWizard from './SvnInitWizard'
 import BaselineBanner from './BaselineBanner'
 import { baselineMap, findDelivered, selectionDiffScope } from '../engine/svnGraph'
-import { describeToolExit } from '@/engine/externalTools'
+import { describeToolExit, toolFor } from '@/engine/externalTools'
 import { currentDiff } from '@/engine/currentDiff'
 import {
   runBranchDeletion,
@@ -1023,7 +1023,29 @@ export function RepoTab({
         }
         return outcome
       },
+      compare: compareDrift(report),
     })
+  /** 报告里「对不上」的文件的「对比」：SVN 版本（新基线）在左、分支版本在右。没配对比工具就没有按钮。 */
+  const compareDrift = (report: FollowReport) => {
+    const range = report.driftRange
+    const cfg = externalTools.config
+    if (!range || !cfg) return undefined
+    return (file: string) => {
+      const tool = toolFor(cfg, file, 'diff')
+      if (!tool) return null
+      return {
+        label: tool.label,
+        open: () =>
+          openExternalDiff(repoPath, tool.id, {
+            kind: 'range' as const,
+            from: range.from,
+            to: range.to,
+            file,
+            oldFile: null,
+          }),
+      }
+    }
+  }
   const handleRestorePending = async () => {
     setRestoreBusy(true)
     try {

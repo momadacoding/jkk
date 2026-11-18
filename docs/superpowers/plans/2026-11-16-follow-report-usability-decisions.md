@@ -15,6 +15,7 @@
 | B2 跟进报告带上 `driftLines` | 完成 | `FollowReport.drift_lines`；`svn_follow.rs` 在 `drift_paths` 之后算 | `svn_follow_snapshot.rs` 新增 1 条端到端（2026-11-16 的形状）、原 drift 用例加 1 条断言；`svn_backend.rs` 序列化与旧 journal |
 | B3 前端「对不上」逐行写差几行 | 完成 | `svnFollow.ts` 的 `LineStat`、`driftLinesText`；布局 harness 加 `driftLines` / `overlap` | `svnFollow.test.ts` 新增 5 条 |
 | B4 验证、review、PR | 完成 | 独立 review 0 阻断、2 建议、6 nit，处理见下 | `pnpm build`；`pnpm test` 1808 条全过；`pnpm test:layout` 176 条全过；`cargo fmt --check`、`clippy` 无告警；全量 `cargo test` 见 PR |
+| B5 每个对不上的文件一个「对比」 | 完成 | `FollowReport.drift_range`（`DriftRange { from, to }`）；`svnFollow.ts` 的 `ReportItem.compare`；`FollowReportDialog.tsx` 的 `CompareAction` 与按钮；`RepoTab.tsx` 的 `compareDrift`；`.follow-compare` | `svn_follow_snapshot.rs` 新增 1 条、原用例加断言（from / to 里的内容就是 SVN 版本与分支版本）；`svn_backend.rs` 序列化与旧 journal；`svnFollow.test.ts` 新增 1 条、`FollowReportDialog.test.tsx` 新增 4 条；`pnpm test` 1813 条、`pnpm test:layout` 176 条全过；有头 Edge 截图 |
 
 ## 决策条目
 
@@ -80,6 +81,20 @@
 - 布局 harness 的 `follow-report-long`：`restorable` 改成 drift 的一半。原来两者相同，能放回的文件不进「对不上」那一节，那一节是空的，长附注量不到。放回按钮仍在（50 个文件）。
 - **偏离计划**：§2 的验收写「分支比 SVN 少 7 行 · c028e264 小婉问答」，实际是「分支比 SVN 少 7 行 · 改过它的提交：c028e264 小婉问答」：A 的 review 给提交加了前缀，B 沿用。
 - SVN 上已删、分支把它带回来的文件（`report.removed` 里有它）写「SVN 上已删除，分支里还有这个文件（N 行）」，不写「多 N 行」：后者看不出是整个文件（独立 review nit 5）。分支把文件删了、SVN 上还有的情形前端分不出来，照写「少 N 行」。
+
+### B5 「对比」（2026-11-18，用户反馈）
+
+- **偏离计划**：计划 B 只要求写出差几行。用户看了 PR 之后指出：几处改动混在一起时，「多 12 行、少 9 行」说明不了差在哪，
+  也帮不了判断该不该把磁盘的版本提交进分支。复杂的 diff 用文字描述不出来，改为每个文件旁边一个「对比」，用外部对比工具
+  （Beyond Compare）直接打开。行数保留，只当大小的提示。
+- **为什么比的是两个提交，不是「本地改动」**：跟进刚结束时，这些文件确实出现在「本地改动」里，可那里比的是暂存区与工作区：
+  跟进会拼回暂存（`svn_follow_index`），暂存区不一定等于 tip；用户之后改了磁盘，比出来的也不再是报告说的那件事。
+  对不上的文件按定义磁盘上就是新基线的 blob（`drift_paths`），所以比「新基线提交 → 重放后的 tip」同一个文件，正好是
+  「SVN 的版本 → 分支的版本」，而且不随之后的操作变。复用现有的 `DiffTarget::Range`：左边 from、右边 to，一侧没有这个
+  文件（SVN 上已删）时用空文件，过滤器照 `.gitattributes`。
+- 两个都是提交 OID，不是 ref：tip 在分支历史里、新基线在 `svn/base` 历史里，之后的提交不会让它们变得不可达。
+- 没配对比工具（`toolFor` 找不到）时不显示按钮；工具起不来时把原因写在那一节里；工具退出由 `RepoTab` 原有的
+  `useExternalToolExit` 处理。
 
 ### B 的独立 review（2026-11-17，opus subagent）
 

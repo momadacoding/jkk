@@ -151,6 +151,8 @@ function Follow() {
     driftLines: Object.fromEntries(
       paths(100).map((p) => [p, { added: 120, removed: 7, binary: false }]),
     ),
+    // 每个对不上的文件后面还有一个「对比」：按钮跟在长路径后面，不能把附注挤没
+    driftRange: { from: 'b'.repeat(40), to: 't'.repeat(40) },
     overlap: paths(100).map((path) => ({
       path,
       commits: [
@@ -183,6 +185,7 @@ function Follow() {
             restored: [],
             skipped: ps.map((path) => ({ path, reason: LONG_ERROR })),
           }),
+          compare: () => ({ label: 'Beyond Compare', open: async () => {} }),
         })
       }
     >

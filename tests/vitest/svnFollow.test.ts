@@ -485,6 +485,19 @@ describe('describeFollowReport', () => {
     )
   })
 
+  it('带了对比的两个提交时，对不上的每个文件都能「对比」；旧后端没带就不能', () => {
+    const r: FollowReport = { ...report, drift: ['Code/A.cs', 'Code/B.cs'] }
+    expect(section(r, 'drift')!.groups[0].items.map((i) => i.compare)).toEqual([
+      undefined,
+      undefined,
+    ])
+    const withRange = { ...r, driftRange: { from: 'b'.repeat(40), to: 't'.repeat(40) } }
+    expect(section(withRange, 'drift')!.groups[0].items.map((i) => i.compare)).toEqual([
+      'Code/A.cs',
+      'Code/B.cs',
+    ])
+  })
+
   it('条件 11 的重叠文件逐个标出与磁盘是否一致；不一致的要确认，一致的只告知，drift 不重复列', () => {
     const r: FollowReport = {
       ...report,

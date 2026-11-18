@@ -505,4 +505,25 @@ fn reverting_a_change_that_svn_now_has_reports_how_many_lines_the_branch_lacks()
     // 造成差异的提交在 overlap 里，前端写在行数后面
     let o = rep.overlap.iter().find(|o| o.path == A).unwrap();
     assert!(o.commits.iter().any(|c| c.ends_with("撤销")), "{o:?}");
+    // 「对比」打开的两侧：from 里是磁盘上的 SVN 版本，to 里是分支的版本，而且就是此刻的 tip
+    let range = rep
+        .drift_range
+        .as_ref()
+        .expect("有 drift 时要带上对比的两个提交");
+    assert_eq!(
+        show(&fx, &format!("{}:{A}", range.from)),
+        read(&fx, A).trim_end()
+    );
+    assert_eq!(show(&fx, &format!("{}:{A}", range.to)), orig.trim_end());
+    assert_eq!(range.to, oid(&fx, "HEAD"));
+}
+
+#[test]
+fn no_drift_means_no_range_to_compare() {
+    let fx = hybrid_with_colleague();
+    colleague(&fx, A, "a-colleague\n");
+    svn_update(&fx);
+    let rep = done(run(&fx));
+    assert!(rep.drift.is_empty(), "前提：{rep:?}");
+    assert_eq!(rep.drift_range, None);
 }

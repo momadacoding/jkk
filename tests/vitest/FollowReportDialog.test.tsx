@@ -399,3 +399,45 @@ describe('放回 Local-Only 补丁（使用报告 9.1）', () => {
     await act(async () => finish({ restored: ['Code/A.cs'], skipped: [] }))
   })
 })
+
+describe('对不上的文件「对比」（行数说不清差在哪，要看就看 diff）', () => {
+  const drift: FollowReport = {
+    ...report,
+    drift: ['Code/A.cs', 'Code/B.png'],
+    driftRange: { from: 'b'.repeat(40), to: 't'.repeat(40) },
+  }
+  const action = (run: () => Promise<void>) => ({ label: 'Beyond Compare', open: run })
+
+  it('每个有工具的文件一个按钮，点了打开那个文件', async () => {
+    const opened: string[] = []
+    const compare = vi.fn((file: string) =>
+      action(async () => {
+        opened.push(file)
+      }),
+    )
+    open(drift, { compare })
+    const buttons = screen.getAllByRole('button', { name: '对比' })
+    expect(buttons).toHaveLength(2)
+    expect(buttons[0].getAttribute('title')).toContain('Beyond Compare')
+    fireEvent.click(buttons[1])
+    await waitFor(() => expect(opened).toEqual(['Code/B.png']))
+  })
+
+  it('没有对比工具的文件不放按钮', () => {
+    open(drift, { compare: (f) => (f.endsWith('.cs') ? action(async () => {}) : null) })
+    expect(screen.getAllByRole('button', { name: '对比' })).toHaveLength(1)
+  })
+
+  it('不给 compare 时一个按钮都没有', () => {
+    open(drift)
+    expect(screen.queryByRole('button', { name: '对比' })).toBeNull()
+  })
+
+  it('工具起不来时把原因写在那一节里', async () => {
+    open(drift, {
+      compare: () => action(async () => Promise.reject(new Error('找不到 BCompare.exe'))),
+    })
+    fireEvent.click(screen.getAllByRole('button', { name: '对比' })[0])
+    expect(await screen.findByText(/找不到 BCompare.exe/)).toBeTruthy()
+  })
+})

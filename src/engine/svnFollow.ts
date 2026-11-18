@@ -89,6 +89,12 @@ function driftLinesText(l: LineStat | undefined, svnRemoved: boolean): string | 
   return said ? `分支比 SVN ${said}` : null
 }
 
+/** 后端 `svn_follow::DriftRange`：两个提交的 OID。 */
+export interface DriftRange {
+  from: string
+  to: string
+}
+
 /** 后端 `svn_follow::HeldBack`：部分自动跟进留在旧基线上的一个文件。 */
 export interface HeldBack {
   path: string
@@ -115,6 +121,11 @@ export interface FollowReport {
    * 多出来的行，`removed` 是分支少了的行。旧后端、或者后端算不出来时没有。
    */
   driftLines?: Record<string, LineStat>
+  /**
+   * `drift` 比的两个提交：`from` 是新基线（里面就是磁盘上的 SVN 版本），`to` 是重放后的分支 tip。
+   * 报告里每个对不上的文件旁边的「对比」用外部工具打开这两侧。旧后端、没有 drift 时没有。
+   */
+  driftRange?: DriftRange
   /**
    * `drift` 里能用「放回 Local-Only 补丁」写回磁盘的（使用报告 9.1）：分支比磁盘多出来的只有
    * Local-Only 改动，磁盘就是 SVN 的版本。旧后端没有。
@@ -321,6 +332,11 @@ export interface ReportItem {
   meta?: string
   /** 「…还有 N 个」那一行。 */
   more?: boolean
+  /**
+   * 能用外部工具对比时，要比的那个文件（仓库相对路径）。行数说不清差在哪，复杂的改动只能看 diff，
+   * 所以「对不上」的每个文件旁边放一个「对比」（报告框决定有没有可用的工具）。
+   */
+  compare?: string
 }
 
 /** {@link describeFollowReport} 的一节。没发生的事不成节。 */
@@ -535,7 +551,8 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
       c ? `改过它的提交：${c}` : null,
     ]
     const meta = parts.filter((t): t is string => t !== null).join(' · ')
-    return meta ? { text: p, meta } : { text: p }
+    const item: ReportItem = meta ? { text: p, meta } : { text: p }
+    return r.driftRange ? { ...item, compare: p } : item
   }
   // 重放后变空、已丢弃的提交上的泄漏单列一组：它已经不在分支上了（计划 2026-11-16 的 A）。
   // 只认移动了的分支：别的分支带着同一个提交时，`plan_other` 见泄漏就停，那条分支没重放、提交还在，

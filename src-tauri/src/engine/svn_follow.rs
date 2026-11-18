@@ -174,6 +174,16 @@ pub enum FollowOutcome {
     },
 }
 
+/// [`FollowReport::drift_range`]：两个提交的 OID。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DriftRange {
+    /// 新基线提交：SVN 的版本。
+    pub from: String,
+    /// 重放后的分支 tip：分支的版本。
+    pub to: String,
+}
+
 /// 跟进做了什么（分析 §6.10、§6.12 的通知内容）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -201,6 +211,11 @@ pub struct FollowReport {
     /// 照原样只列文件名。
     #[serde(default)]
     pub drift_lines: BTreeMap<String, LineStat>,
+    /// `drift` 比的那两个提交：新基线（对不上的文件在它里面就是磁盘上的 SVN 版本）与重放后的分支 tip。
+    /// 报告里点「对比」时，用外部对比工具打开这两个提交里的同一个文件。行数说不清差在哪，要看就看 diff。
+    /// 没有 drift 时为 `None`。
+    #[serde(default)]
+    pub drift_range: Option<DriftRange>,
     /// `drift` 里分支比磁盘多出来的只有 Local-Only 改动、磁盘就是 SVN 版本的文件：可以用
     /// 「放回 Local-Only 补丁」写回磁盘（使用报告 9.1，[`crate::engine::svn_restore_local_only`]）。
     /// 跟进本身不写；点按钮时每条条件现场重验。
@@ -1977,6 +1992,12 @@ fn prepare(repo: &str, auto: bool, partial: Option<&Partial>) -> Result<Plan> {
                     log::warn!("统计对不上的文件差几行时出错，跳过：{}", e.message);
                     BTreeMap::new()
                 });
+            if !report.drift.is_empty() {
+                report.drift_range = Some(DriftRange {
+                    from: new_base.clone(),
+                    to: tip.clone(),
+                });
+            }
             // 9.1：只读挑出能放回的。出错只是少一个按钮
             report.restorable = restorable_paths(repo, &new_base, &tip, &report.drift)
                 .unwrap_or_else(|e| {
