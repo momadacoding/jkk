@@ -573,4 +573,189 @@ fn a_failing_first_server_contact_is_not_checked() {
     )
     .unwrap();
     assert!(matches!(health(h), Health::NotChecked { .. }));
+    // 前提：这个工作副本走的是本地 floor，注入点落在探测上，不是空过（独立 review nit 7）
+    drop(_fail);
+    let us = enumerate_wcs(&fx.wc_str(), &wl(&["Code/"])).unwrap();
+    let shapes = svn_wcdb::floor_shapes(&fx.wc_str(), &us, map.floor).unwrap();
+    assert!(
+        matches!(shapes.get("Code"), Some(FloorShape::Regular { .. })),
+        "{shapes:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 独立 review（2026-11-18）补的场景
+// ---------------------------------------------------------------------------
+
+/// 单值映射（用户手动体检、基线停在 `rev`）两遍体检，结论必须相同；返回结论与本地单元。
+fn both_at(fx: &SvnFixture, svn_url: &str, rev: u64) -> (Result<Health, String>, Vec<String>) {
+    let sc = scope(&["Code/"]);
+    let run = || {
+        check_baseline(
+            &fx.wc_str(),
+            svn_url,
+            rev,
+            &sc,
+            &BTreeSet::new(),
+            ExplainedOrigin::Unknown,
+        )
+        .map_err(|e| e.code)
+    };
+    let server = {
+        let _refuse = fault::arm(Point::FloorShapeRefused);
+        run()
+    };
+    let local = run();
+    let used = floor_answered_locally_last();
+    let aside = |r: &Result<Health, String>| match r {
+        Ok(Health::NotChecked { .. }) => Ok(Health::NotChecked {
+            reason: String::new(),
+        }),
+        other => other.clone(),
+    };
+    assert_eq!(aside(&local), aside(&server), "本地单元：{used:?}");
+    (local, used)
+}
+
+/// 只用 URL 操作建仓库：`trunk/Code/A.cs` 在 r1 建、r2 改成 `v2`，再由 `steps` 往下走，最后把
+/// `checkout` 检出到 `wc1`。
+fn trunk_repo(steps: impl FnOnce(&Path, &str), checkout: &str) -> SvnFixture {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    let made = std::process::Command::new("svnadmin")
+        .current_dir(&root)
+        .args(["create", "repo"])
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let url = file_url(&root.join("repo"));
+    let tmp = root.join("wc0");
+    svn(
+        &root,
+        &[
+            "mkdir",
+            "--parents",
+            &format!("{url}/trunk/Code"),
+            "-m",
+            "r1",
+        ],
+    );
+    svn(&root, &["checkout", &format!("{url}/trunk"), "wc0"]);
+    std::fs::write(tmp.join("Code/A.cs"), "v1\n").unwrap();
+    svn(&tmp, &["add", "Code/A.cs"]);
+    svn(&tmp, &["commit", "-m", "r2"]);
+    steps(&tmp, &url);
+    svn(&root, &["checkout", &format!("{url}/{checkout}"), "wc1"]);
+    SvnFixture { dir }
+}
+
+#[test]
+fn a_unit_whose_parent_was_copied_after_the_floor_goes_to_the_server() {
+    // 独立 review 第 1 条反例 A：`svn cp trunk branches/b`（r3）之后检出分支。FSFS 惰性复制，
+    // `Code` 的最后修改仍是 r2，拿 F = r2 体检时 `c ≤ F ≤ n` 成立；可 F 上根本还没有
+    // `branches/b/Code`，原来的 diff 报 added（M6）
+    let fx = trunk_repo(
+        |_, url| {
+            svn(
+                Path::new("."),
+                &[
+                    "copy",
+                    &format!("{url}/trunk"),
+                    &format!("{url}/branches/b"),
+                    "--parents",
+                    "-m",
+                    "r3",
+                ],
+            )
+        },
+        "branches/b",
+    );
+    let base = format!("{}/branches/b", url(&fx));
+    let (h, used) = both_at(&fx, &base, 2);
+    assert_eq!(
+        h,
+        Ok(Health::Lying {
+            files: vec!["Code/A.cs".to_string()]
+        })
+    );
+    assert_eq!(used, none());
+}
+
+#[test]
+fn a_unit_whose_parent_was_replaced_after_the_floor_goes_to_the_server() {
+    // 反例 B：分支在 r4 改过 A.cs，r5 删掉分支，r6 从 trunk 重新拷一份。工作副本里 `Code` 的最后修改是 r2，
+    // F = r4 时 `c ≤ F ≤ n` 成立，可 F 上 `branches/b/Code/A.cs` 是分支改过的内容
+    let fx = trunk_repo(
+        |root, url| {
+            let b = format!("{url}/branches/b");
+            svn(
+                root,
+                &["copy", &format!("{url}/trunk"), &b, "--parents", "-m", "r3"],
+            );
+            svn(root, &["switch", &b]);
+            std::fs::write(root.join("Code/A.cs"), "b-mod\n").unwrap();
+            svn(root, &["commit", "-m", "r4"]);
+            svn(root, &["delete", &b, "-m", "r5"]);
+            svn(root, &["copy", &format!("{url}/trunk@5"), &b, "-m", "r6"]);
+        },
+        "branches/b",
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.wc().join("Code/A.cs")).unwrap(),
+        "v1\n"
+    );
+    let base = format!("{}/branches/b", url(&fx));
+    let (h, used) = both_at(&fx, &base, 4);
+    assert_eq!(
+        h,
+        Ok(Health::Lying {
+            files: vec!["Code/A.cs".to_string()]
+        })
+    );
+    assert_eq!(used, none());
+}
+
+#[test]
+fn a_stale_w_file_outside_the_map_goes_to_the_server() {
+    // 独立 review 第 4 条：A.cs 提交到 r2、没 update，父目录还在 r1；单值映射 F = r1 时目录合格、
+    // A.cs 进 stale，又不在映射里、是 W-file——只有服务器知道 r1 上是什么
+    let fx = svn_repo_for_health();
+    std::fs::write(fx.wc().join("Code/A.cs"), "v2\n").unwrap();
+    svn(&fx.wc(), &["commit", "-m", "r2"]);
+    let (h, used) = both_at(&fx, &url(&fx), 1);
+    assert_eq!(
+        h,
+        Ok(Health::Lying {
+            files: vec!["Code/A.cs".to_string()]
+        })
+    );
+    assert_eq!(used, none());
+    let us = enumerate_wcs(&fx.wc_str(), &wl(&["Code/"])).unwrap();
+    match svn_wcdb::floor_shapes(&fx.wc_str(), &us, 1)
+        .unwrap()
+        .remove("Code")
+    {
+        Some(FloorShape::Regular { stale, .. }) => assert_eq!(stale, vec!["Code/A.cs".to_string()]),
+        other => panic!("前提：目录合格、A.cs 进 stale，实际 {other:?}"),
+    }
+}
+
+#[test]
+fn a_missing_directory_goes_to_the_server() {
+    // 独立 review 第 3 条：目录从磁盘上整个没了，wc.db 不变、形状规整；status 报目录 missing
+    let fx = svn_repo_for_health();
+    std::fs::remove_dir_all(fx.wc().join("Code/Deep")).unwrap();
+    let (_, used) = both_at(&fx, &url(&fx), 1);
+    assert_eq!(used, none());
+}
+
+#[test]
+fn a_missing_unit_root_goes_to_the_server() {
+    let fx = svn_repo_for_health();
+    std::fs::remove_dir_all(fx.wc().join("Code")).unwrap();
+    // 2026-11-18 实测：原来的 diff 这时也不失败、报 Verified（丢失的目录 diff 不报）。这是原有的行为，
+    // 不在本次范围；这里只钉住两条路相同、而且交给了服务器
+    let (h, used) = both_at(&fx, &url(&fx), 1);
+    assert!(matches!(h, Ok(Health::Verified { .. })), "{h:?}");
+    assert_eq!(used, none());
 }

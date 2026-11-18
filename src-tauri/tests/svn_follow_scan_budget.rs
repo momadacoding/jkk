@@ -151,7 +151,7 @@ fn detection_and_auto_follow_stay_within_their_scan_budget() {
         st.ts < write_tree.ts,
         "本地 floor 的 status 应当在写树之前就起跑（并行），实际排在了后面：{st:?} / {write_tree:?}"
     );
-    // 断网时结论要与原来相同，所以仍连一次服务器（仓库根的可达性探测）
+    // 仍连一次服务器：每个单元 `<url>@F` 的探测，断网时结论与原来相同，也核对 F 上挂的是同一条历史
     one("svn info", "--depth");
 
     // 跟进完再检测：已经一致，仍然只扫一遍

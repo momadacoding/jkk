@@ -256,13 +256,18 @@ pub enum FloorShape {
         /// 不满足 `c ≤ F ≤ n` 的**文件**（仓库相对）。F 上的内容可能与 pristine 不同，diff 会
         /// 向服务器要它们。调用方确认它们都另有归属（映射单列，或不是 W-file）才能用本地结论。
         stale: Vec<String>,
+        /// 单元根的 `changed_revision`。`c ≤ F ≤ n` 只沿**节点的历史**成立，不沿路径：单元的上级目录
+        /// 在 F 之后被复制或替换过时，F 上这个 URL 挂的是另一条历史（或者根本还没有）。调用方要向
+        /// 服务器确认 `<url>@F` 的最后修改正是它（独立 review 第 1 条）。
+        root_changed: u64,
     },
     /// 必须问服务器。字符串说明为什么（写进日志与性能打点）。
     Irregular(String),
 }
 
-/// 每个单元的 [`FloorShape`]，键是 `WcIdentity::wc_root`。外层 `Err` 是 wc.db 读不了或认不出
-/// （格式、未完成的操作……，同 [`excluded_nodes`]），调用方全部照旧跑 diff。
+/// 每个单元的 [`FloorShape`]，键是 `WcIdentity::wc_root`。某个单元读不了或认不出（格式、未完成的
+/// 操作、根查不到……，同 [`excluded_nodes`]）时，那个单元是 `Irregular`，不连累别的单元。外层 `Err`
+/// 只有测试注入。
 pub fn floor_shapes(
     repo_root: &str,
     units: &[WcIdentity],
@@ -274,7 +279,9 @@ pub fn floor_shapes(
     let started = perf::enabled().then(perf::now_ms);
     let mut out = BTreeMap::new();
     for u in units {
-        out.insert(u.wc_root.clone(), shape_of_unit(repo_root, u, floor)?);
+        let shape = shape_of_unit(repo_root, u, floor)
+            .unwrap_or_else(|why| FloorShape::Irregular(format!("wc.db 认不出：{why}")));
+        out.insert(u.wc_root.clone(), shape);
     }
     if let Some(ts) = started {
         let mut rec = perf::Record::rust("query", "wc.db floor shape");
@@ -300,7 +307,11 @@ fn shape_of_unit(
     let db = open(&Path::new(wc_root).join(".svn").join("wc.db"))?;
     let shape = query_shape(&db, &sub, floor).map_err(|e| format!("查询 wc.db 失败：{e}"))??;
     Ok(match shape {
-        FloorShape::Regular { dirs, stale } => FloorShape::Regular {
+        FloorShape::Regular {
+            dirs,
+            stale,
+            root_changed,
+        } => FloorShape::Regular {
             dirs: dirs
                 .iter()
                 .map(|p| repo_relative(&u.wc_root, &sub, p))
@@ -309,6 +320,7 @@ fn shape_of_unit(
                 .iter()
                 .map(|p| repo_relative(&u.wc_root, &sub, p))
                 .collect(),
+            root_changed,
         },
         irregular => irregular,
     })
@@ -437,6 +449,9 @@ fn query_shape(
     let (Some(root_repos), Some(root_path)) = (root.repos_id, root.repos_path.clone()) else {
         return Ok(Err(format!("单元的根 `{sub}` 没有仓库位置")));
     };
+    let Some(root_changed) = root.changed.and_then(|c| u64::try_from(c).ok()) else {
+        return Ok(Err(format!("单元的根 `{sub}` 没有最后修改的 revision")));
+    };
 
     let floor = i64::try_from(floor).unwrap_or(i64::MAX);
     let mut dirs = BTreeSet::new();
@@ -496,7 +511,11 @@ fn query_shape(
         }
         stale.push(r.relpath.clone());
     }
-    Ok(Ok(FloorShape::Regular { dirs, stale }))
+    Ok(Ok(FloorShape::Regular {
+        dirs,
+        stale,
+        root_changed,
+    }))
 }
 
 /// wc.db 里的 `relpath`（相对工作副本根）换成仓库相对：单元那一段用调用方给的写法（svn info

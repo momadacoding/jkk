@@ -35,7 +35,7 @@
 | T3 体检接入：形状规整的单元用 status 结果，其余照旧 diff；预跑同步改 | 完成 | `svn_health` 的 `LocalFloor`、`local_floor_commands`、`read_local_floor`、`plan_diffs_for_except`；`svn_cli::run_svn_fresh`；`fault` 可同时 arm 多个点 | 同上 |
 | T4 等价测试：同一工作副本走两条路，体检结论逐项相同 | 完成 | `tests/svn_health_local_floor.rs` 28 条 | 28/28 |
 | T5 进程预算：规整的跟进里不再有 floor `svn diff` | 完成 | `tests/svn_follow_scan_budget.rs` 改写 diff 那段断言 | 1/1 |
-| T6 review、PR | 进行中 | | `cargo fmt --check`、`clippy --all-targets` 无告警；33 个 SVN 测试二进制全过（见 T6） |
+| T6 review、PR | 完成 | 独立 review 1 阻断、3 建议、4 nit，处理见下 | review 修复后：`cargo fmt --check`、`clippy --all-targets` 无告警；`svn_health_local_floor` 33 条；`svn_health` 51、`svn_follow` 137、`svn_sync_in` 77、`svn_follow_auto` 100、`svn_init` 38 等 20 个测试二进制全过。`--lib` 的 `commands::watch::tests::stage_and_unstage_only_touch_the_index` 偶发失败（watcher 收到临时仓库 `.git/hooks` 的事件，单独跑 3 次 1 次通过），本分支没有改 `src/commands`，与改动无关 |
 
 ## 决策条目
 
@@ -70,9 +70,10 @@
     代码路径与 diff 的结果汇合在同一个 `diffs` 里。规整的单元里 diff 不可能报 `added` / `deleted`（那需要 WORKING 层或
     F 上的子项与 BASE 不同，都已判成不规整），所以墓碑候选不受影响。
   - 失败语义：原来 floor diff 是体检第一次连服务器，断网 = `NotChecked`，录制放行；比对开始之后失败 = `Unconfirmed`。
-    本地 floor 先对每个仓库根做一次 `svn info --depth empty <仓库根>@F`，用同一个注入点 `FirstDiff`，再读 status。
-    这样断网仍是 `NotChecked`，不会因为本地答得出来就报 `Verified`；之后的失败照旧算「比对开始之后」。探测仓库根，
-    不探测单元的 URL：单元在 F 上可能还不存在，原来的 diff 那时报 added 而不是失败（M6）。
+    本地 floor 先对每个单元做一次 `svn info --depth empty <单元 URL>@F`（多目标、分批），用同一个注入点 `FirstDiff`，
+    再读 status。这样断网仍是 `NotChecked`，不会因为本地答得出来就报 `Verified`；之后的失败照旧算「比对开始之后」。
+    第一版探测的是仓库根，review 第 1、2 条改成了单元 URL，见下面的 review 表：探测同时核对 F 上的 URL 挂的是不是
+    同一条节点历史；单元在 F 上不存在时这一批改回 diff，由 diff 照原来那样报 added（M6）。
   - 时刻：status 读磁盘，与 diff 一样必须在 `git add` 之后。体检里走 `run_svn_fresh`（不读扫描缓存：缓存里的 status
     是准备阶段、`git add` 之前读的），预跑在 `git add` 刚结束时起跑，与原来 diff 的起跑点相同。
     `svn_follow_scan_budget.rs` 钉住了这条 status 排在 `git add` 之后、写树之前。
@@ -96,6 +97,22 @@
 - `tests/svn_health.rs` 里合并 floor diff 那一节（合并、退回逐单元、服务器不可达不退回）用的工作副本是规整的，本地
   floor 之后一条 floor diff 都不发，有一条变红、两条空过。`check_roots` 改为注入 `FloorShapeRefused`。为此
   `fault::arm` 改成可以同时 arm 几个点（原来一次只能一个）。
+
+### 独立 review（2026-11-18，opus subagent）
+
+| 条目 | 级别 | 处理 |
+|---|---|---|
+| 1 `c ≤ F ≤ n` 只沿节点的历史成立，不沿路径：单元的上级目录在 F 之后被复制（`svn cp trunk branches/b`）或替换过时，F 上的 URL 要么还不存在（原 diff 报 added），要么挂着另一条历史的内容，本地却报 Verified | 阻断 | 已修：探测从仓库根改为每个单元的 `<url>@F`（多目标 `svn info --depth empty`），要求存在、且最后修改 revision 等于 wc.db 里单元根的 `changed_revision`，否则这个单元改回 diff。两条反例写成测试（`a_unit_whose_parent_was_copied…`、`…replaced…`），各自在去掉对应那条核对时变红（已验证，随后恢复） |
+| 2 探测仓库根：按路径授权的服务器上读不了 `/`，每次 NotChecked，体检被静默关掉 | 建议 | 随第 1 条修掉：探测的就是单元自己的 URL，原来的 diff 也要读它 |
+| 3 单元根整个从磁盘上没了时 `missing` 被当成「diff 不报」 | 建议 | 已修：目录或单元根 `missing` 时这个单元改回 diff。**与 review 的判断不同**：实测原来的 diff 这时也不失败、报 Verified（review 说按 M7 会失败，M7 说的是合并命令里单元路径不对的形态）。所以这是原有的行为，本 PR 只保证两条路相同，`a_missing_unit_root_goes_to_the_server` 钉住 |
+| 4 「stale 的 W-file 不在映射里」让单元改回 diff 的分支没有测试 | 建议 | 已补 `a_stale_w_file_outside_the_map_goes_to_the_server`，并断言前提（目录合格、A.cs 进 stale） |
+| nit 5 一个单元认不出就让全部单元走 diff；每个单元重开一次 wc.db | nit | 前半已修：按单元降级成 `Irregular`。重开不改：SQLite 只读打开不读表，23 次的开销在毫秒级 |
+| nit 6 探测失败的理由不点名单元 | nit | 已修：连不上时理由列出这一批的单元 |
+| nit 7 「第一次连服务器失败」那条测试没断言自己走的是本地 | nit | 已补：断言形状是 `Regular` |
+| nit 8 第二批起的探测失败返回 `Unconfirmed{files: []}`，此时其实什么都还不知道 | nit | 不改：与原来「第二条 diff 失败」同一个语义 |
+
+- **为什么这么改是安全的（第 1 条）**：单元根在 F 上与 BASE 是同一条节点历史时，F 上它的最后修改就是 `c`（`c ≤ F`，F 之后到 `n` 之间没再改过）。挂的是另一条历史（复制、替换）时，最后修改是那条历史上的 revision，只有在两条历史恰好在同一个提交里各被改过一次时才会相同——同一个提交在两条线上各改一次同一相对路径，实际可以忽略，记在这里。子树内部的复制、替换会让单元根的 `c` 前进，原来的判据已经挡住（review 确认）。
+- 一批探测里有单元在 F 上不存在时，svn 整条非 0 退出，哪个不存在不好对：这一批的单元全部改回 diff。白名单在 F 之后才加的目录会让这一次体检全走 diff，只是慢，下一次就好。
 
 ### 偏离计划
 
