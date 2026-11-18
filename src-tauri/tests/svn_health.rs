@@ -1215,7 +1215,10 @@ fn two_roots() -> SvnFixture {
     fx
 }
 
+/// 这一节测的是 floor diff 的合并与退回，所以强制走 diff：这些工作副本形状规整，不注入的话
+/// 体检由本地回答 floor（`svn_health_local_floor.rs`），一条 floor diff 都不发，测试就空过了。
 fn check_roots(fx: &SvnFixture, roots: &[&str], rev: u64) -> Health {
+    let _diff = fault::arm(Point::FloorShapeRefused);
     check_baseline(
         &fx.wc_str(),
         &repo_url(fx),

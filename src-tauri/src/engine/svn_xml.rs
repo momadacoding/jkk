@@ -69,6 +69,33 @@ pub fn parse_info(xml: &str) -> Result<Vec<SvnInfoEntry>> {
     Ok(out)
 }
 
+/// 解析对 URL 跑的 `svn info --xml`，每个 entry 给出 `(url, 最后修改的 revision)`，按出现顺序。
+///
+/// 体检的本地 floor 用它确认「服务器上这个 URL 在 F 上挂的就是工作副本里那条节点历史」
+/// （`svn_health` 的 `LocalFloor`）。没有 `<commit>` 或 revision 不是非负整数时报错：拿不准就不能
+/// 拿它下结论。
+pub fn parse_info_commit_revs(xml: &str) -> Result<Vec<(String, u64)>> {
+    let doc = parse_doc(xml)?;
+    let mut out = Vec::new();
+    for entry in doc.descendants().filter(|n| n.has_tag_name("entry")) {
+        let url = child_text(&entry, "url")?;
+        let rev = entry
+            .children()
+            .find(|n| n.has_tag_name("commit"))
+            .and_then(|c| c.attribute("revision"))
+            .ok_or_else(|| GitError::new("svn_xml", format!("svn info 里 `{url}` 没有 <commit>")))?
+            .parse::<u64>()
+            .map_err(|_| {
+                GitError::new(
+                    "svn_xml",
+                    format!("svn info 里 `{url}` 的 commit revision 不是非负整数"),
+                )
+            })?;
+        out.push((url, rev));
+    }
+    Ok(out)
+}
+
 /// 从 `svn info -R --xml` 里挑出 `--set-depth=exclude` 掉的节点，返回 `(path, kind)`：
 /// path 是 entry 的 path 属性（正斜杠），kind 是 `file` / `dir`（缺失时为空串），按出现顺序。
 ///

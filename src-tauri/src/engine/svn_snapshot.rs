@@ -200,7 +200,27 @@ fn read_versions(repo: &str, scope: &str, new: &str) -> Result<Versions> {
 }
 
 /// `diff-tree -r a b` 的每个路径与它在 `a`、`b` 里的条目（不存在时为 `None`）。
+///
+/// 重放时每个提交调一次（`compute`），先走 libgit2（`git_read::tree_changes`，PR 179 已与这条命令
+/// 逐个场景对照过），认不出的形状退回命令（日志 `2026-11-17-replay-inproc-reads-decisions.md`）。
 fn raw_diff(repo: &str, a: &str, b: &str) -> Result<Vec<(String, Entry, Entry)>> {
+    crate::engine::git_read::or_cli(
+        "比提交与父提交的树",
+        || {
+            Ok(crate::engine::git_read::tree_changes(repo, a, b)?
+                .into_iter()
+                .map(|c| {
+                    let before = (!c.status.starts_with('A')).then_some((c.old_mode, c.old_oid));
+                    let after = (!c.status.starts_with('D')).then_some((c.new_mode, c.new_oid));
+                    (c.path, before, after)
+                })
+                .collect())
+        },
+        || raw_diff_by_cli(repo, a, b),
+    )
+}
+
+fn raw_diff_by_cli(repo: &str, a: &str, b: &str) -> Result<Vec<(String, Entry, Entry)>> {
     // raw 格式：`:<旧 mode> <新 mode> <旧 oid> <新 oid> <状态>` NUL `<路径>` NUL
     let out = run_git(repo, &["diff-tree", "-r", "-z", "--no-renames", a, b])?;
     let mut list = Vec::new();
@@ -232,8 +252,22 @@ fn raw_diff(repo: &str, a: &str, b: &str) -> Result<Vec<(String, Entry, Entry)>>
 }
 
 /// `rev` 树里 `paths` 各自的条目；不存在的不出现在结果里。只查用得到的路径（独立 review 第 10 条：
-/// 大仓库整棵 `ls-tree -r` 的输出很长）。
+/// 大仓库整棵 `ls-tree -r` 的输出很长）。先走 libgit2（`git_read::tree_entries`，与下面这条命令逐个
+/// 场景对照过），认不出的形状退回命令。
 fn entries_for(
+    repo: &str,
+    rev: &str,
+    paths: &[&str],
+) -> Result<BTreeMap<String, (String, String)>> {
+    let list: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+    crate::engine::git_read::or_cli(
+        "列出基线里几条路径的条目",
+        || crate::engine::git_read::tree_entries(repo, rev, &list),
+        || entries_for_by_cli(repo, rev, paths),
+    )
+}
+
+fn entries_for_by_cli(
     repo: &str,
     rev: &str,
     paths: &[&str],
