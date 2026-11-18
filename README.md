@@ -262,6 +262,90 @@ pnpm exec tsc --noEmit
 cd src-tauri && cargo check
 ```
 
+## 清理 worktree 的编译产物
+
+每个 worktree 各编一份 `src-tauri/target`，一份 2–18 GB，合并之后也不会自己消失
+（2026-11-17 本机实测：16 份合计 90.3 GB；之前撞过磁盘写满导致的 `LNK1318` 链接失败）。
+`scripts/worktree-targets.mjs` 列出每一份的大小，按需删掉用不着的。
+
+| 名字 | 是什么 | 脚本会不会删 |
+|---|---|---|
+| `src-tauri/target` | Rust 编译产物，`cargo build` / `pnpm tauri dev` 能重新生成 | 只删这个 |
+| worktree 本身（`.claude/worktrees/<名字>/` 下签出的文件） | 某个分支的工作目录 | 不删 |
+| 本地分支、远端分支 | git 引用 | 不碰；清理分支和 worktree 用 `scripts/stale-branches.ps1` |
+| 残留目录 | `.claude/worktrees/`、`.worktrees/` 下 git 已经不认的目录，或 `git worktree list` 标为 `prunable` 但目录还在的（`git worktree remove` 在 Windows 上常删不干净） | 只删它里面的 `src-tauri/target`，目录本身不删 |
+
+### 步骤
+
+前提：本机的仓库里已经有 `scripts/worktree-targets.mjs`（没有就先在主工作区 `git pull`）。
+
+1. 打开 PowerShell，进入**主工作区**根目录（不要在要清理的那个 worktree 里运行）：
+
+   ```powershell
+   cd <主工作区路径>
+   ```
+
+   `<主工作区路径>` 换成本仓库主工作区的绝对路径，尖括号去掉，例如 `cd C:\code\mygitclient`。
+   不在仓库根目录运行时，下一步会报 `Error: Cannot find module '...\scripts\worktree-targets.mjs'`，回到这一步。
+
+2. 先只看不删：
+
+   ```powershell
+   node scripts/worktree-targets.mjs
+   ```
+
+   要量每个 target 的大小，需要等一会儿（实测 90 GB 用了 18 秒，当时文件缓存是热的；冷缓存会更慢，没单独测）。
+   输出形如（节选，路径换成了示例）：
+
+   ```text
+   可清    17.6 GB  C:\code\mygitclient\.claude\worktrees\fix-stage-long-pathspec
+                    PR 第 143 条已合并
+   保留     7.2 GB  C:\code\mygitclient
+                    主工作区
+   可清     6.2 GB  C:\code\mygitclient\.claude\worktrees\vcs-phase0
+                    没登记在 git 里的残留目录
+   保留     4.8 GB  C:\code\mygitclient\.claude\worktrees\follow-report-wording
+                    被 lock：claude session follow-report-wording (pid 36508)
+
+   合计 90.3 GB，其中可清 14 个、78.3 GB
+   加 --clean 删除标为「可清」的 target（会先确认）
+   ```
+
+   大小按实际占用算：同一份数据的硬链接（cargo 会把 `deps/` 里的产物硬链接到 `debug/`）只算一次。
+
+3. 确认「可清」的那些确实不用了，再删：
+
+   ```powershell
+   node scripts/worktree-targets.mjs --clean
+   ```
+
+   它会重新盘点一遍、列出同样的表，然后问 `删除以上 N 个 target（X GB）？输入 yes 确认：`。
+   输入 `yes` 回车才删，输入别的都不删。每个 target 删完打印 `已删除  <路径>`。
+
+   删每一个之前还会再查一次 lock、占用进程和最近写入：盘点和等你确认的这段时间里，别的会话可能刚进了
+   那个 worktree 或开始编译。这时打印 `跳过    <路径>：<原因>`，这个 target 保持原样。
+
+### 哪些会标为「可清」
+
+| 情形 | 默认 | 加 `--all` |
+|---|---|---|
+| 分支最新的 PR 已合并或已关闭 | 可清 | 可清 |
+| 残留目录 | 可清 | 可清 |
+| PR 还开着、没有 PR、读不到 PR（`gh` 没装 / 没登录 / 没网络） | 保留 | 可清 |
+| 主工作区；运行脚本时所在的目录（当前目录、脚本文件所在的 worktree） | 保留 | 保留 |
+| `src-tauri/target` 本身是链接（junction / 符号链接） | 保留 | 保留 |
+| 被 lock 的 worktree（Claude Code 给正在进行的会话加的锁，`git worktree list` 里显示 `locked claude session …`，2026-11-17 实测） | 保留 | 保留 |
+| 有进程从这个 target 里运行（比如那个 worktree 的 `pnpm tauri dev` 开着的 `app.exe`） | 保留 | 保留 |
+| target 里最近 30 分钟有文件写入（可能正在编译） | 保留 | 保留 |
+
+`--all` 只能和 `--clean` 一起用。在不能交互的环境（脚本、CI）里运行 `--clean` 会停下并提示，确定要删时再加 `--yes` 跳过确认。
+
+### 删了之后
+
+- 被清的 worktree 下次 `cargo test` / `pnpm tauri dev` 从零编译，比平时多等几分钟；没别的影响
+- 某一行显示 `失败` 时退出码为 1：多半是有文件被别的程序占着。删掉的部分不影响编译，
+  关掉占用的程序（比如那个 worktree 里开着的 `app.exe`）后重跑第 3 步即可
+
 ## MVP 功能范围
 
 - [x] 打开本地仓库，读取 HEAD
