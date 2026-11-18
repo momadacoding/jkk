@@ -267,7 +267,7 @@ pub fn decode_url(s: &str) -> Option<String> {
 #[doc(hidden)]
 pub mod fault {
     use crate::error::{GitError, Result};
-    use std::cell::Cell;
+    use std::cell::RefCell;
 
     /// 可注入失败的位置。
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,7 +282,9 @@ pub mod fault {
         WcdbRefused,
         /// 体检里对点不了名的被排除节点跑的 `svn ls -R`（D8）
         ListAtFloor,
-        /// 体检的第一条 `svn diff`
+        /// 查 wc.db 判 floor 形状那一步认不出（`svn_wcdb::floor_shapes`）：体检全部照旧跑 diff
+        FloorShapeRefused,
+        /// 体检的第一条 `svn diff`；有单元走本地 floor 时，是它之前那次服务器可达性探测
         FirstDiff,
         /// 体检第二条起的 `svn diff`
         LaterDiff,
@@ -293,28 +295,34 @@ pub mod fault {
     }
 
     thread_local! {
-        static ARMED: Cell<Option<Point>> = const { Cell::new(None) };
+        static ARMED: RefCell<Vec<Point>> = const { RefCell::new(Vec::new()) };
     }
 
-    /// 本线程上 `p` 此后每次都失败，直到返回的守卫被 drop。
+    /// 本线程上 `p` 此后每次都失败，直到返回的守卫被 drop。可以同时 arm 几个不同的点
+    /// （例如 `FloorShapeRefused` 强制体检走 diff，再在 diff 上注入失败）。
     #[must_use = "守卫一 drop，注入就撤销"]
     pub fn arm(p: Point) -> Armed {
-        ARMED.with(|a| a.set(Some(p)));
-        Armed(())
+        ARMED.with(|a| a.borrow_mut().push(p));
+        Armed(p)
     }
 
     /// [`arm`] 的守卫。
-    pub struct Armed(());
+    pub struct Armed(Point);
 
     impl Drop for Armed {
         fn drop(&mut self) {
-            ARMED.with(|a| a.set(None));
+            ARMED.with(|a| {
+                let mut a = a.borrow_mut();
+                if let Some(i) = a.iter().rposition(|&p| p == self.0) {
+                    a.remove(i);
+                }
+            });
         }
     }
 
     /// 注入点本身：`p` 被 arm 时报 `svn_fault_injected`。
     pub(crate) fn hit(p: Point) -> Result<()> {
-        if ARMED.with(|a| a.get()) == Some(p) {
+        if ARMED.with(|a| a.borrow().contains(&p)) {
             return Err(GitError::new(
                 "svn_fault_injected",
                 format!("测试注入的失败：{p:?}"),

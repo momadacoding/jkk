@@ -28,9 +28,27 @@ fn procs(log: &std::path::Path, sub: &str, skip_flag: &str) -> usize {
         .count()
 }
 
-/// `svn status` 的全量扫描。`--depth=empty` 只看一个节点（P3），不遍历磁盘，不算。
+/// `svn status` 的全量扫描（`-v`，`svn_cli::STATUS_SCAN`）。`--depth=empty` 只看一个节点（P3），
+/// 不遍历磁盘，不算；体检本地 floor 的那条 status 不带 `-v`，另外数（[`local_floor_statuses`]）。
 fn scans(log: &std::path::Path) -> usize {
-    procs(log, "status", "--depth")
+    records(log)
+        .iter()
+        .filter(|r| r.name == "svn status" && r.flags.iter().any(|f| f == "-v"))
+        .count()
+}
+
+/// 体检本地 floor 的 status（`svn_health` 的 `LOCAL_STATUS`）：不带 `-v`、不带 `--depth`。
+fn local_floor_statuses(recs: &[Rec]) -> Vec<Rec> {
+    recs.iter()
+        .filter(|r| {
+            r.name == "svn status"
+                && !r
+                    .flags
+                    .iter()
+                    .any(|f| f == "-v" || f.starts_with("--depth"))
+        })
+        .cloned()
+        .collect()
 }
 
 fn colleague_changes(fx: &SvnFixture, rel: &str, content: &str) {
@@ -105,18 +123,36 @@ fn detection_and_auto_follow_stay_within_their_scan_budget() {
         hits[0].clone()
     };
     let (add, write_tree) = (one("git add", "-A"), one("git write-tree", ""));
-    // 体检的 floor `svn diff` 同理（日志 `2026-11-14-follow-overlap-decisions.md` T1）：它比的是
-    // 磁盘与服务器，必须在磁盘录完之后才起，否则两者之间的改动进了基线、体检却没看到；又要与
+    // 体检的 floor：这个工作副本形状规整，由本地回答，不再发 floor `svn diff`（日志
+    // `2026-11-17-floor-check-by-status-decisions.md`；公司机器上那条 diff 7–15 s）
+    let floor_diffs: Vec<&Rec> = during
+        .iter()
+        .filter(|r| r.name == "svn diff" && r.flags.iter().any(|f| f == "--summarize"))
+        .collect();
+    assert!(
+        floor_diffs.is_empty(),
+        "规整的工作副本不该再发 floor svn diff：{floor_diffs:?}"
+    );
+    // 本地 floor 的 status 与原来的 diff 同一个约束（日志 `2026-11-14-follow-overlap-decisions.md`
+    // T1）：读的是磁盘，必须在磁盘录完之后才起，否则两者之间的改动进了基线、体检却没看到；又要与
     // blob 缓存、改写、核对、写树并行。只跑一次：预跑的参数与体检真正发的对不上时会多出一条
-    let diff = one("svn diff", "--summarize");
+    let statuses = local_floor_statuses(&during);
+    assert_eq!(
+        statuses.len(),
+        1,
+        "本地 floor 的 status 应当恰好一条：{during:?}"
+    );
+    let st = &statuses[0];
     assert!(
-        diff.ts >= add.ts + add.dur,
-        "svn diff 起在 git add 结束之前：{diff:?} / {add:?}"
+        st.ts >= add.ts + add.dur,
+        "本地 floor 的 status 起在 git add 结束之前：{st:?} / {add:?}"
     );
     assert!(
-        diff.ts < write_tree.ts,
-        "svn diff 应当在写树之前就起跑（并行），实际排在了后面：{diff:?} / {write_tree:?}"
+        st.ts < write_tree.ts,
+        "本地 floor 的 status 应当在写树之前就起跑（并行），实际排在了后面：{st:?} / {write_tree:?}"
     );
+    // 断网时结论要与原来相同，所以仍连一次服务器（仓库根的可达性探测）
+    one("svn info", "--depth");
 
     // 跟进完再检测：已经一致，仍然只扫一遍
     let before = scans(&log);

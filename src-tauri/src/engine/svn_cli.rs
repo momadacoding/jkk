@@ -46,16 +46,35 @@ pub fn run_svn(path: &str, args: &[&str]) -> Result<String> {
         }
         return Ok(hit);
     }
+    let out = spawn_svn(path, args)?;
+    if let Some(k) = key {
+        remember_scan(k, &out);
+    }
+    Ok(out)
+}
+
+/// 同 [`run_svn`]，但不读也不写扫描缓存（[`with_scan_cache`]）：`info` / `status` 也去读此刻的
+/// 工作副本。预跑结果（[`run_ahead`]）照样取用——它是调用方算准了时刻、专为这一次跑的。
+///
+/// 给体检的本地 floor 用：它的 `svn status` 必须读 `git add` 之后的磁盘，而扫描缓存里的 status
+/// 是跟进准备阶段（`git add` 之前）读的（`svn_health` 的本地 floor）。
+pub fn run_svn_fresh(path: &str, args: &[&str]) -> Result<String> {
+    if let Some(ahead) = take_ahead(path, args) {
+        if perf::enabled() {
+            perf::record_cached(svn_command(path).args(with_global(args)));
+        }
+        return ahead;
+    }
+    spawn_svn(path, args)
+}
+
+fn spawn_svn(path: &str, args: &[&str]) -> Result<String> {
     let output = proc::output(svn_command(path).args(with_global(args)))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         return Err(GitError::new("svn_cli", stderr));
     }
-    let out = String::from_utf8_lossy(&output.stdout).to_string();
-    if let Some(k) = key {
-        remember_scan(k, &out);
-    }
-    Ok(out)
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 /// 一条多目标命令的命令行上限（字符数按 UTF-8 字节估，偏保守）。

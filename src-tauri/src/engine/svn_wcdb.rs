@@ -32,7 +32,7 @@ use crate::engine::perf;
 use crate::engine::svn_tombstone::fault::{self, Point};
 use crate::engine::svn_wc::WcIdentity;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -241,6 +241,262 @@ fn query(db: &Connection, sub: &str) -> rusqlite::Result<Rows> {
         return Ok(Err(format!("`{p}` 的 kind 是 {k}")));
     }
     Ok(Ok(found))
+}
+
+/// 一个单元在 wc.db 里的形状，决定体检的 floor 比对能不能由工作副本自己回答
+/// （`svn_health` 的本地 floor，日志 `2026-11-17-floor-check-by-status-decisions.md`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FloorShape {
+    /// 每个节点都满足 `changed_revision ≤ F ≤ revision`（`stale` 里的文件除外），没有 switch、
+    /// 稀疏检出、not-present、本地 add/delete/copy/move、冲突、file external、未完成的操作。
+    /// 这时 `svn diff --old=<url>@F --new=<单元>` 的结论只取决于本地修改。
+    Regular {
+        /// 单元底下的目录（仓库相对）。status 不给 kind，体检要剔掉目录条目时用。
+        dirs: BTreeSet<String>,
+        /// 不满足 `c ≤ F ≤ n` 的**文件**（仓库相对）。F 上的内容可能与 pristine 不同，diff 会
+        /// 向服务器要它们。调用方确认它们都另有归属（映射单列，或不是 W-file）才能用本地结论。
+        stale: Vec<String>,
+    },
+    /// 必须问服务器。字符串说明为什么（写进日志与性能打点）。
+    Irregular(String),
+}
+
+/// 每个单元的 [`FloorShape`]，键是 `WcIdentity::wc_root`。外层 `Err` 是 wc.db 读不了或认不出
+/// （格式、未完成的操作……，同 [`excluded_nodes`]），调用方全部照旧跑 diff。
+pub fn floor_shapes(
+    repo_root: &str,
+    units: &[WcIdentity],
+    floor: u64,
+) -> std::result::Result<BTreeMap<String, FloorShape>, String> {
+    if fault::hit(Point::FloorShapeRefused).is_err() {
+        return Err("测试注入：不用本地 floor".to_string());
+    }
+    let started = perf::enabled().then(perf::now_ms);
+    let mut out = BTreeMap::new();
+    for u in units {
+        out.insert(u.wc_root.clone(), shape_of_unit(repo_root, u, floor)?);
+    }
+    if let Some(ts) = started {
+        let mut rec = perf::Record::rust("query", "wc.db floor shape");
+        rec.ts = ts;
+        rec.dur = perf::now_ms() - ts;
+        perf::record(&rec);
+    }
+    Ok(out)
+}
+
+fn shape_of_unit(
+    repo_root: &str,
+    u: &WcIdentity,
+    floor: u64,
+) -> std::result::Result<FloorShape, String> {
+    let wc_root = u
+        .wc_root_abspath
+        .as_deref()
+        .ok_or_else(|| format!("`{}` 没有工作副本根", u.wc_root))?;
+    let unit_abs = format!("{}/{}", norm(repo_root), norm(&u.wc_root));
+    let sub = within(&unit_abs, &norm(wc_root))
+        .ok_or_else(|| format!("`{}` 不在工作副本根 `{wc_root}` 底下", u.wc_root))?;
+    let db = open(&Path::new(wc_root).join(".svn").join("wc.db"))?;
+    let shape = query_shape(&db, &sub, floor).map_err(|e| format!("查询 wc.db 失败：{e}"))??;
+    Ok(match shape {
+        FloorShape::Regular { dirs, stale } => FloorShape::Regular {
+            dirs: dirs
+                .iter()
+                .map(|p| repo_relative(&u.wc_root, &sub, p))
+                .collect(),
+            stale: stale
+                .iter()
+                .map(|p| repo_relative(&u.wc_root, &sub, p))
+                .collect(),
+        },
+        irregular => irregular,
+    })
+}
+
+/// 子树条件：`local_relpath` 是 `?2` 本身或在它底下（`?2` 为空串时是整个工作副本）。区间写法的
+/// 理由见 [`query`]。
+const IN_SUBTREE: &str = "(?2 = '' OR local_relpath = ?2 OR \
+                          (local_relpath >= ?2 || '/' AND local_relpath < ?2 || '0'))";
+
+/// [`FloorShape`] 的查询本体。路径是 wc.db 的 relpath，调用方换算。外层 `Err` 是 SQLite 报的错，
+/// 中层 `Err` 是认不出来（照旧跑 diff）。
+fn query_shape(
+    db: &Connection,
+    sub: &str,
+    floor: u64,
+) -> rusqlite::Result<std::result::Result<FloorShape, String>> {
+    let tx = db.unchecked_transaction()?;
+    let format: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if format != FORMAT {
+        return Ok(Err(format!("工作副本格式是 {format}，只认 {FORMAT}")));
+    }
+    let pending: Option<i64> = tx
+        .query_row("SELECT 1 FROM work_queue LIMIT 1", [], |r| r.get(0))
+        .optional()?;
+    if pending.is_some() {
+        return Ok(Err("有没做完的操作（WORK_QUEUE 非空）".to_string()));
+    }
+    let ids: Vec<i64> = tx
+        .prepare("SELECT id FROM wcroot WHERE local_abspath IS NULL")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let [wc_id] = ids[..] else {
+        return Ok(Err(format!("WCROOT 里有 {} 个根", ids.len())));
+    };
+    let irregular = |why: String| Ok(Ok(FloorShape::Irregular(why)));
+
+    // 有人拿着工作副本锁：svn 操作正在进行或中途被杀（status 的 wc-locked）。不分子树：锁记在
+    // 目录上、可以向下覆盖整棵树，判断它管不管到这个单元不值得
+    let locked: Option<i64> = tx
+        .query_row(
+            "SELECT 1 FROM wc_lock WHERE wc_id = ?1 LIMIT 1",
+            [wc_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if locked.is_some() {
+        return irregular("工作副本被锁着（有 svn 操作正在进行或中途被杀）".to_string());
+    }
+
+    // WORKING 层（op_depth > 0）= 本地 add / delete / copy / move。diff 对它们的报法（added、
+    // deleted、带历史的复制）status 给不全，交给 diff
+    let working: Option<String> = tx
+        .query_row(
+            &format!(
+                "SELECT local_relpath FROM nodes WHERE wc_id = ?1 AND op_depth > 0 \
+                 AND {IN_SUBTREE} LIMIT 1"
+            ),
+            rusqlite::params![wc_id, sub],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(p) = working {
+        return irregular(format!(
+            "`{p}` 有本地的增删或复制（svn add / delete / copy）"
+        ));
+    }
+
+    // 冲突（文本、属性、树）。格式 31 全部记在 conflict_data 里（wc-metadata.sql 的 ACTUAL_NODE
+    // 注释：老的几列在升级到格式 30 时并进来了）
+    let conflict: Option<String> = tx
+        .query_row(
+            &format!(
+                "SELECT local_relpath FROM actual_node WHERE wc_id = ?1 \
+                 AND conflict_data IS NOT NULL AND {IN_SUBTREE} LIMIT 1"
+            ),
+            rusqlite::params![wc_id, sub],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(p) = conflict {
+        return irregular(format!("`{p}` 有冲突"));
+    }
+
+    struct Row {
+        relpath: String,
+        kind: String,
+        presence: String,
+        depth: Option<String>,
+        revision: Option<i64>,
+        changed: Option<i64>,
+        repos_id: Option<i64>,
+        repos_path: Option<String>,
+        file_external: Option<i64>,
+    }
+    let rows: Vec<Row> = tx
+        .prepare(&format!(
+            "SELECT local_relpath, kind, presence, depth, revision, changed_revision, \
+             repos_id, repos_path, file_external FROM nodes \
+             WHERE wc_id = ?1 AND op_depth = 0 AND {IN_SUBTREE} ORDER BY local_relpath"
+        ))?
+        .query_map(rusqlite::params![wc_id, sub], |r| {
+            Ok(Row {
+                relpath: r.get(0)?,
+                kind: r.get(1)?,
+                presence: r.get(2)?,
+                depth: r.get(3)?,
+                revision: r.get(4)?,
+                changed: r.get(5)?,
+                repos_id: r.get(6)?,
+                repos_path: r.get(7)?,
+                file_external: r.get(8)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let Some(root) = rows.iter().find(|r| r.relpath == sub) else {
+        return Ok(Err(format!("单元的根 `{sub}` 在 wc.db 的 BASE 里查不到")));
+    };
+    if root.presence != "normal" {
+        return Ok(Err(format!(
+            "单元的根 `{sub}` 在 wc.db 里是 {}",
+            root.presence
+        )));
+    }
+    let (Some(root_repos), Some(root_path)) = (root.repos_id, root.repos_path.clone()) else {
+        return Ok(Err(format!("单元的根 `{sub}` 没有仓库位置")));
+    };
+
+    let floor = i64::try_from(floor).unwrap_or(i64::MAX);
+    let mut dirs = BTreeSet::new();
+    let mut stale = Vec::new();
+    for r in &rows {
+        // 被排除的节点整单元 diff 本来就不报，体检另外点名比（`svn_health` 的 excluded）
+        if r.presence == "excluded" {
+            continue;
+        }
+        if r.presence != "normal" {
+            // not-present（提交了删除、父目录还没更新）、server-excluded、incomplete：F 上可能
+            // 有工作副本里没有的东西
+            return irregular(format!("`{}` 在 wc.db 里是 {}", r.relpath, r.presence));
+        }
+        if r.file_external.is_some() {
+            return irregular(format!("`{}` 是 file external", r.relpath));
+        }
+        if r.kind != "file" && r.kind != "dir" {
+            return irregular(format!("`{}` 的 kind 是 {}", r.relpath, r.kind));
+        }
+        // switch 过的子树：diff 拿它自己的 URL 去比，F 上的内容另有来处
+        let rel = if sub.is_empty() {
+            r.relpath.as_str()
+        } else {
+            r.relpath[sub.len()..].trim_start_matches('/')
+        };
+        let expect = match (root_path.is_empty(), rel.is_empty()) {
+            (_, true) => root_path.clone(),
+            (true, false) => rel.to_string(),
+            (false, false) => format!("{root_path}/{rel}"),
+        };
+        if r.repos_id != Some(root_repos) || r.repos_path.as_deref() != Some(expect.as_str()) {
+            return irregular(format!("`{}` 被 switch 到了别处", r.relpath));
+        }
+        if r.kind == "dir" {
+            if r.depth.as_deref() != Some("infinity") {
+                return irregular(format!(
+                    "`{}` 是稀疏检出（depth={}）",
+                    r.relpath,
+                    r.depth.as_deref().unwrap_or("?")
+                ));
+            }
+            dirs.insert(r.relpath.clone());
+        }
+        let (Some(n), Some(c)) = (r.revision, r.changed) else {
+            return irregular(format!("`{}` 没有 revision", r.relpath));
+        };
+        if c <= floor && floor <= n {
+            continue;
+        }
+        if r.kind == "dir" {
+            // 目录的子项清单在 F 上可能不同：子项增删会让目录的 committed-rev 前进
+            return irregular(format!(
+                "目录 `{}` 在 r{n}（最后修改 r{c}），F 上的子项可能不同",
+                r.relpath
+            ));
+        }
+        stale.push(r.relpath.clone());
+    }
+    Ok(Ok(FloorShape::Regular { dirs, stale }))
 }
 
 /// wc.db 里的 `relpath`（相对工作副本根）换成仓库相对：单元那一段用调用方给的写法（svn info
