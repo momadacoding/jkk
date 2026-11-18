@@ -200,7 +200,7 @@ function Section({
   /** 条目带 `compare` 时用它找对比工具；返回 `null` 就不放按钮。 */
   compareOf?: (file: string) => CompareAction | null
   /** 点了「对比」：报告框统一接住启动失败。 */
-  runCompare?: (action: CompareAction) => void
+  runCompare?: (file: string, action: CompareAction) => void
   children?: ReactNode
 }) {
   const [open, setOpen] = useState(s.level !== 'info' || s.count <= INFO_OPEN_MAX)
@@ -233,19 +233,19 @@ function Section({
                   const action = item.compare && runCompare ? compareOf?.(item.compare) : null
                   return (
                     <li key={i} className={item.more ? 'more' : undefined}>
-                      <span className="follow-path">
-                        {item.text}
-                        {action && (
-                          <button
-                            type="button"
-                            className="follow-compare"
-                            title={`用 ${action.label} 对比：左边是 SVN 的版本，右边是分支的版本`}
-                            onClick={() => runCompare?.(action)}
-                          >
-                            对比
-                          </button>
-                        )}
-                      </span>
+                      <span className="follow-path">{item.text}</span>
+                      {/* 放在路径外面：选中路径复制时不带上按钮的字 */}
+                      {action && item.compare && (
+                        <button
+                          type="button"
+                          className="follow-compare"
+                          aria-label={`对比 ${item.compare}`}
+                          title={`用 ${action.label} 对比：左边是 SVN 的版本，右边是分支的版本`}
+                          onClick={() => runCompare?.(item.compare ?? '', action)}
+                        >
+                          对比
+                        </button>
+                      )}
                       {item.meta && <span className="follow-meta">{item.meta}</span>}
                     </li>
                   )
@@ -301,11 +301,12 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
   const restorable = useMemo(() => restorablePaths(request.report), [request.report])
   const restore = request.restoreLocalOnly
   const restoring = useRestore(restorable, restore)
-  // 工具起不来（路径配错之类）就写在那一节里；工具退出后的结果由调用方的退出事件处理
+  // 工具起不来（路径配错之类）就写在那一节里，点名是哪个文件：先点的慢、后点的快时，错误可能后到
+  // （独立 review nit 3）。工具退出后的结果由调用方的退出事件处理
   const [compareError, setCompareError] = useState<string | null>(null)
-  const runCompare = (action: CompareAction) => {
+  const runCompare = (file: string, action: CompareAction) => {
     setCompareError(null)
-    action.open().catch((err) => setCompareError(toErrorMessage(err)))
+    action.open().catch((err) => setCompareError(`${file}：${toErrorMessage(err)}`))
   }
 
   return (
@@ -336,7 +337,7 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
                   <RestoreRow paths={restorable} state={restoring.state} run={restoring.run} />
                 )}
                 {s.id === 'drift' && compareError && (
-                  <div className="dlg-warning" aria-live="polite">
+                  <div className="dlg-warning follow-compare-error" aria-live="polite">
                     {compareError}
                   </div>
                 )}

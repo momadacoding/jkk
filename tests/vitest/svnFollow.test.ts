@@ -8,6 +8,7 @@ import {
   describeFollowConflict,
   describeFollowOutcome,
   describeFollowReport,
+  driftDiffTarget,
   describeManualFollow,
   describeManualFollowAction,
   describeManualFollowOutcome,
@@ -496,6 +497,16 @@ describe('describeFollowReport', () => {
       'Code/A.cs',
       'Code/B.cs',
     ])
+  })
+
+  it('「对比」左边是 SVN 的版本（from），右边是分支的版本（to）', () => {
+    expect(driftDiffTarget({ from: 'svn-base', to: 'branch-tip' }, 'Code/A.cs')).toEqual({
+      kind: 'range',
+      from: 'svn-base',
+      to: 'branch-tip',
+      file: 'Code/A.cs',
+      oldFile: null,
+    })
   })
 
   it('条件 11 的重叠文件逐个标出与磁盘是否一致；不一致的要确认，一致的只告知，drift 不重复列', () => {

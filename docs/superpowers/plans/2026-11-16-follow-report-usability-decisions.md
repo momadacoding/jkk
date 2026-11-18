@@ -15,7 +15,7 @@
 | B2 跟进报告带上 `driftLines` | 完成 | `FollowReport.drift_lines`；`svn_follow.rs` 在 `drift_paths` 之后算 | `svn_follow_snapshot.rs` 新增 1 条端到端（2026-11-16 的形状）、原 drift 用例加 1 条断言；`svn_backend.rs` 序列化与旧 journal |
 | B3 前端「对不上」逐行写差几行 | 完成 | `svnFollow.ts` 的 `LineStat`、`driftLinesText`；布局 harness 加 `driftLines` / `overlap` | `svnFollow.test.ts` 新增 5 条 |
 | B4 验证、review、PR | 完成 | 独立 review 0 阻断、2 建议、6 nit，处理见下 | `pnpm build`；`pnpm test` 1808 条全过；`pnpm test:layout` 176 条全过；`cargo fmt --check`、`clippy` 无告警；全量 `cargo test` 见 PR |
-| B5 每个对不上的文件一个「对比」 | 完成 | `FollowReport.drift_range`（`DriftRange { from, to }`）；`svnFollow.ts` 的 `ReportItem.compare`；`FollowReportDialog.tsx` 的 `CompareAction` 与按钮；`RepoTab.tsx` 的 `compareDrift`；`.follow-compare` | `svn_follow_snapshot.rs` 新增 1 条、原用例加断言（from / to 里的内容就是 SVN 版本与分支版本）；`svn_backend.rs` 序列化与旧 journal；`svnFollow.test.ts` 新增 1 条、`FollowReportDialog.test.tsx` 新增 4 条；`pnpm test` 1813 条、`pnpm test:layout` 176 条全过；有头 Edge 截图 |
+| B5 每个对不上的文件一个「对比」 | 完成 | `FollowReport.drift_range`（`DriftRange { from, to }`）；`svnFollow.ts` 的 `ReportItem.compare`；`FollowReportDialog.tsx` 的 `CompareAction` 与按钮；`RepoTab.tsx` 的 `compareDrift`；`.follow-compare` | `svn_follow_snapshot.rs` 新增 1 条、原用例加断言（from / to 里的内容就是 SVN 版本与分支版本）；`svn_backend.rs` 序列化与旧 journal；`svnFollow.test.ts` 新增 1 条、`FollowReportDialog.test.tsx` 新增 4 条；`pnpm test` 1813 条、`pnpm test:layout` 176 条全过；有头 Edge 截图。review 修复后 `pnpm build` 通过、`pnpm test` 1814 条、`pnpm test:layout` 176 条全过，再截图核对 |
 
 ## 决策条目
 
@@ -95,6 +95,21 @@
 - 两个都是提交 OID，不是 ref：tip 在分支历史里、新基线在 `svn/base` 历史里，之后的提交不会让它们变得不可达。
 - 没配对比工具（`toolFor` 找不到）时不显示按钮；工具起不来时把原因写在那一节里；工具退出由 `RepoTab` 原有的
   `useExternalToolExit` 处理。
+
+#### B5 的独立 review（2026-11-18，opus subagent）
+
+0 阻断、3 建议、5 nit。
+
+| 条目 | 级别 | 处理 |
+|---|---|---|
+| 1 `driftRange` → `DiffTarget` 的拼装写在组件里、没有测试：from / to 写反时所有测试照过，工具里左右与提示相反，用户会把分支版本当 SVN 版本提交 | 建议 | 已修：抽成 `svnFollow.ts` 的 `driftDiffTarget`，vitest 钉住方向 |
+| 2 工具起来之后异常退出时，`useExternalToolExit` 走顶部红条，被报告框的遮罩挡住，用户看不见 | 建议 | 不改，记为已知限制：只在对比工具自己崩溃时发生；关掉报告就看得到红条。要在报告框里显示，得把退出事件接进对话框，牵动面大于这个风险 |
+| 3 工具配置在点「跟进」那次渲染时就定死了：那一刻配置重读失败是 null，报告里一个按钮都没有 | 建议 | 已修：`RepoTab` 用 ref 存最新的配置与仓库路径，报告框每次渲染时按最新的找工具 |
+| nit 1 每个按钮的可访问名都只是「对比」；按钮在路径的 span 里，复制路径会带上「对比」 | nit | 已修：`aria-label="对比 <路径>"`；按钮挪到路径外面，成为 li 的子元素（于是排成一列，位于路径与附注之间，截图核对过） |
+| nit 2 错误条吃了 `.dlg-warning` 给图标留的 54px 缩进 | nit | 已修：`.follow-compare-error` 清掉；harness 的「对比」改成点了就报超长错误，截图核对对齐 |
+| nit 3 错误不说是哪个文件 | nit | 已修：`<路径>：<原因>` |
+| nit 4 工具窗口两侧的标题只有「路径（短 SHA）」，看不出哪边是 SVN | nit | 不改，记为后续：`DiffTarget` 目前不能传自定义标题，方向写在按钮的提示里 |
+| nit 5 开工具用 `repoPath`、退出监听比对的是 `state.path` | nit | 已修：随建议 3 改用 `state.path` |
 
 ### B 的独立 review（2026-11-17，opus subagent）
 

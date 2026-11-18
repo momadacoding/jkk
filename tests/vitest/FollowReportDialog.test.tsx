@@ -416,28 +416,34 @@ describe('对不上的文件「对比」（行数说不清差在哪，要看就�
       }),
     )
     open(drift, { compare })
-    const buttons = screen.getAllByRole('button', { name: '对比' })
+    const buttons = screen.getAllByRole('button', { name: /^对比 / })
     expect(buttons).toHaveLength(2)
     expect(buttons[0].getAttribute('title')).toContain('Beyond Compare')
+    // 读屏分得出是哪个文件；按钮不在路径的文字里，复制路径时不带上「对比」
+    expect(buttons.map((b) => b.getAttribute('aria-label'))).toEqual([
+      '对比 Code/A.cs',
+      '对比 Code/B.png',
+    ])
+    expect(buttons[0].closest('li')?.querySelector('.follow-path')?.textContent).toBe('Code/A.cs')
     fireEvent.click(buttons[1])
     await waitFor(() => expect(opened).toEqual(['Code/B.png']))
   })
 
   it('没有对比工具的文件不放按钮', () => {
     open(drift, { compare: (f) => (f.endsWith('.cs') ? action(async () => {}) : null) })
-    expect(screen.getAllByRole('button', { name: '对比' })).toHaveLength(1)
+    expect(screen.getAllByRole('button', { name: /^对比 / })).toHaveLength(1)
   })
 
   it('不给 compare 时一个按钮都没有', () => {
     open(drift)
-    expect(screen.queryByRole('button', { name: '对比' })).toBeNull()
+    expect(screen.queryByRole('button', { name: /^对比 / })).toBeNull()
   })
 
   it('工具起不来时把原因写在那一节里', async () => {
     open(drift, {
       compare: () => action(async () => Promise.reject(new Error('找不到 BCompare.exe'))),
     })
-    fireEvent.click(screen.getAllByRole('button', { name: '对比' })[0])
-    expect(await screen.findByText(/找不到 BCompare.exe/)).toBeTruthy()
+    fireEvent.click(screen.getAllByRole('button', { name: /^对比 / })[0])
+    expect(await screen.findByText('Code/A.cs：找不到 BCompare.exe')).toBeTruthy()
   })
 })

@@ -7,6 +7,7 @@
  * ⚠️ 横幅与对话框都按**纯文本**渲染：不要写 `**`。
  */
 import type { ExternalChange, SyncVerdict } from './svnSync'
+import type { DiffTarget } from './externalTools'
 import { formatDuration } from './svnInit'
 import {
   describeFollowDrift,
@@ -93,6 +94,14 @@ function driftLinesText(l: LineStat | undefined, svnRemoved: boolean): string | 
 export interface DriftRange {
   from: string
   to: string
+}
+
+/**
+ * 「对比」交给外部工具的两侧：左边（from）是 SVN 的版本，右边（to）是分支的版本。报告框的按钮提示
+ * 照这个方向写；方向一反，用户会把分支的版本当成 SVN 的去提交（独立 review 建议 1）。
+ */
+export function driftDiffTarget(range: DriftRange, file: string): DiffTarget {
+  return { kind: 'range', from: range.from, to: range.to, file, oldFile: null }
 }
 
 /** 后端 `svn_follow::HeldBack`：部分自动跟进留在旧基线上的一个文件。 */

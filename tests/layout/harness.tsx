@@ -185,7 +185,13 @@ function Follow() {
             restored: [],
             skipped: ps.map((path) => ({ path, reason: LONG_ERROR })),
           }),
-          compare: () => ({ label: 'Beyond Compare', open: async () => {} }),
+          // 点了就报一条超长的启动失败：截图核对那一行的缩进与断行（布局测试不点它）
+          compare: () => ({
+            label: 'Beyond Compare',
+            open: async () => {
+              throw new Error(LONG_ERROR)
+            },
+          }),
         })
       }
     >
