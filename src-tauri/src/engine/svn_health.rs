@@ -15,9 +15,10 @@
 //! 调用时必须满足「磁盘上白名单内的内容 == 基线树的内容」。spec §6.8.5 列的四个
 //! 时机全部满足它：HEAD 在 `svn/base` 上且工作区干净，或基线树刚从磁盘录出来。
 
+use crate::engine::perf;
 use crate::engine::svn_cli::{
     chunk_targets, cmdline_estimate, in_scan_cache, prefetch_scan, run_ahead, run_svn,
-    run_svn_code, run_svn_targets, RunAhead, ScanAhead, MAX_TARGETS_CMDLINE,
+    run_svn_code, run_svn_fresh, run_svn_targets, RunAhead, ScanAhead, MAX_TARGETS_CMDLINE,
 };
 // W-file 判据原本是本模块的私有函数，Phase 1c 提到 `svn_include_check` 共用，
 // 2026-10-28 再收进 `svn_scope`——`svn_server_set` 等要用**同一套**判据。
@@ -286,9 +287,22 @@ pub fn plan_diffs(
     skip: &BTreeSet<String>,
     excluded: &BTreeSet<String>,
 ) -> Result<DiffPlan> {
+    plan_diffs_except(units, map, skip, excluded, &BTreeSet::new())
+}
+
+/// 同 [`plan_diffs`]，`local` 里的单元（`wc_root`）不发 floor 命令：它们的 floor 由本地回答
+/// （[`local_floor`]）。映射单列的组、被排除节点的点名照旧。前若干条仍是逐单元的 floor 命令，
+/// 顺序与 `units` 去掉 `local` 之后相同。
+fn plan_diffs_except(
+    units: &[WcIdentity],
+    map: &BaseMap,
+    skip: &BTreeSet<String>,
+    excluded: &BTreeSet<String>,
+    local: &BTreeSet<String>,
+) -> Result<DiffPlan> {
     let mixed = !map.is_single();
     let mut commands = Vec::new();
-    for u in units {
+    for u in units.iter().filter(|u| !local.contains(&u.wc_root)) {
         let url = u.url.trim_end_matches('/');
         let mut args = vec![
             "diff".to_string(),
@@ -406,8 +420,27 @@ pub fn plan_diffs_for(
     excluded: &BTreeSet<String>,
     svn_url: &str,
 ) -> Result<DiffPlan> {
-    let mut plan = plan_diffs(units, map, skip, excluded)?;
+    plan_diffs_for_except(units, map, skip, excluded, svn_url, &BTreeSet::new())
+}
+
+/// 同 [`plan_diffs_for`]，`local` 里的单元不发 floor 命令（[`plan_diffs_except`]）。
+fn plan_diffs_for_except(
+    all_units: &[WcIdentity],
+    map: &BaseMap,
+    skip: &BTreeSet<String>,
+    excluded: &BTreeSet<String>,
+    svn_url: &str,
+    local: &BTreeSet<String>,
+) -> Result<DiffPlan> {
+    let mut plan = plan_diffs_except(all_units, map, skip, excluded, local)?;
     let base = svn_url.trim_end_matches('/');
+    // 合并只涉及发 floor 命令的单元
+    let units: Vec<WcIdentity> = all_units
+        .iter()
+        .filter(|u| !local.contains(&u.wc_root))
+        .cloned()
+        .collect();
+    let units = units.as_slice();
 
     // `plan_diffs` 的前 `units.len()` 条就是逐单元的 floor 命令，与 `units` 同序。这层约定
     // 只在本文件里成立，这里逐条核对一次（独立 review 第 3 条）：对不上就不合并，宁可慢
@@ -723,6 +756,10 @@ impl ExcludedAhead {
 ///
 /// 读不出单元、算不出映射、排不出命令时返回 `None`：错误留给体检在原来的位置报。
 ///
+/// 形状规整、由本地回答 floor 的单元（[`LocalFloor`]），预跑的是它们的可达性探测与 `svn status`，
+/// 不是 diff。status 读磁盘，与 diff 同一个先后约束（`git add` 之后），上面的论证对它逐条成立；
+/// 体检里用 [`run_svn_fresh`] 取它，不会拿到扫描缓存里 `git add` 之前那份。
+///
 /// # 已知代价
 ///
 /// 预跑起在改写之前。之后任何一步本地出错，返回前要等这条 diff 跑完（`RunAhead` 的 drop），
@@ -752,13 +789,22 @@ pub(crate) fn prefetch_floor_diffs(
             .ok()?;
     let units = crate::engine::svn_wc::enumerate_wcs(repo_root, scope.whitelist()).ok()?;
     let none = BTreeSet::new();
-    let plan = plan_diffs_for(&units, &map, &none, &none, base).ok()?;
-    let commands: Vec<Vec<String>> = plan
-        .commands
-        .into_iter()
-        .filter(|c| c.scope == DiffScope::Floor)
-        .map(|c| c.args)
-        .collect();
+    // 本地 floor 的单元（[`LocalFloor`]）预跑探测与 status，其余照旧预跑 floor diff。与体检用同一个
+    // 判法，判得不一样（映射预测错了、期间有人动了工作副本）只是参数对不上，体检自己再跑
+    let local = local_floor(repo_root, &units, &map, scope);
+    let mut commands: Vec<Vec<String>> = Vec::new();
+    if !local.units.is_empty() {
+        let (probes, statuses) = local_floor_commands(&units, &local.units, map.floor);
+        commands.extend(probes);
+        commands.extend(statuses);
+    }
+    let plan = plan_diffs_for_except(&units, &map, &none, &none, base, &local.units).ok()?;
+    commands.extend(
+        plan.commands
+            .into_iter()
+            .filter(|c| c.scope == DiffScope::Floor)
+            .map(|c| c.args),
+    );
     run_ahead(repo_root, commands)
 }
 
@@ -842,6 +888,343 @@ fn repo_rel_of(path: &str, cmd: &DiffCommand, prefix: &str) -> std::result::Resu
     }
 }
 
+/// 由工作副本自己回答 floor 比对的单元（日志 `2026-11-17-floor-check-by-status-decisions.md`）。
+///
+/// # 为什么结论与 floor `svn diff` 相同
+///
+/// `svn diff --old=<url>@F --new=<单元>` 把每个节点的 BASE revision 报给服务器，服务器只发「从这些
+/// BASE 到 F」的变化，再叠上本地修改。单元形状规整（[`svn_wcdb::FloorShape::Regular`]：每个节点
+/// `c ≤ F ≤ n`，没有 switch / 稀疏 / not-present / 本地增删 / 冲突）时服务器没有变化可发，diff 报出来的
+/// 只有本地修改——与 `svn status` 的 `modified` 用的是同一个判据（时间戳与大小没变就不读内容，
+/// 2026-11-17 实测两者对「内容变了、时间与大小没变」都不报）。
+///
+/// 不满足 `c ≤ F ≤ n` 的文件（`stale`）只在它们另有归属时放过：映射单列的（结果本来就归各自的组）、
+/// 不是 W-file 的（结果本来就被筛掉）。
+///
+/// # 为什么快
+///
+/// 公司机器上 floor diff 7.4–15.8 s，慢在 svn 对每个文件的本地开销（内核态 12.9 s），同一片目录的
+/// `svn status` 1.4 s（2026-11-16 报告 §7）。
+#[derive(Debug, Default)]
+struct LocalFloor {
+    /// 单元的 `wc_root`。
+    units: BTreeSet<String>,
+    /// 这些单元底下的目录（仓库相对）：status 不给 kind，目录条目要剔掉。
+    dirs: BTreeSet<String>,
+    /// 每个单元根在 wc.db 里的最后修改 revision，与服务器上 `<url>@F` 的核对（[`check_probes`]）。
+    root_changed: BTreeMap<String, u64>,
+}
+
+/// 判出哪些单元能用本地 floor。读不了 wc.db、筛不了 W-file 时一律照旧跑 diff，只记日志：
+/// 本地 floor 是提速，不是判据。
+fn local_floor(repo_root: &str, units: &[WcIdentity], map: &BaseMap, scope: &WScope) -> LocalFloor {
+    let shapes = match crate::engine::svn_wcdb::floor_shapes(repo_root, units, map.floor) {
+        Ok(s) => s,
+        Err(why) => {
+            log::info!("体检照旧向服务器比对 floor：{why}");
+            return LocalFloor::default();
+        }
+    };
+    let mut out = LocalFloor::default();
+    for (wc_root, shape) in shapes {
+        let (dirs, stale, root_changed) = match shape {
+            crate::engine::svn_wcdb::FloorShape::Regular {
+                dirs,
+                stale,
+                root_changed,
+            } => (dirs, stale, root_changed),
+            crate::engine::svn_wcdb::FloorShape::Irregular(why) => {
+                log::info!("体检 `{wc_root}` 照旧向服务器比对 floor：{why}");
+                continue;
+            }
+        };
+        let unowned: Vec<&str> = stale
+            .iter()
+            .map(String::as_str)
+            .filter(|p| !map.revs.contains_key(*p))
+            .collect();
+        if !unowned.is_empty() {
+            match scope.filter(unowned.iter().copied()) {
+                Ok(w) if w.is_empty() => {}
+                Ok(w) => {
+                    let first = w.iter().next().map(String::as_str).unwrap_or_default();
+                    log::info!(
+                        "体检 `{wc_root}` 照旧向服务器比对 floor：`{first}` 等 {} 个文件在 r{} 上的内容\
+                         可能与工作副本的版本不同",
+                        w.len(),
+                        map.floor
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    log::info!("体检 `{wc_root}` 照旧向服务器比对 floor：{}", e.message);
+                    continue;
+                }
+            }
+        }
+        out.root_changed.insert(wc_root.clone(), root_changed);
+        out.units.insert(wc_root);
+        out.dirs.extend(dirs);
+    }
+    out
+}
+
+impl LocalFloor {
+    /// 这个单元改回 diff。
+    fn drop_unit(&mut self, wc_root: &str) {
+        self.units.remove(wc_root);
+        self.root_changed.remove(wc_root);
+    }
+}
+
+thread_local! {
+    static LAST_LOCAL: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// 本线程上一次体检里由本地回答 floor 的单元（`wc_root`，升序）。体检还没走到那一步就返回时为空。
+///
+/// 给测试用：体检的结论两条路必须相同，光看结论分不出走了哪条，「本地这条路真的被走到了」要另外断言。
+pub fn floor_answered_locally_last() -> Vec<String> {
+    LAST_LOCAL.with(|l| l.borrow().clone())
+}
+
+/// [`LocalFloor`] 要发的命令：先是每个单元 `<url>@F` 的 `svn info`（多目标，按命令行长度分批），
+/// 再是 status（同样分批）。
+///
+/// # 探测做两件事
+///
+/// 1. **连不上服务器的结论与原来相同**：原来 floor diff 就是第一次连服务器，断网时体检是 `NotChecked`。
+///    本地回答不连服务器的话，断网时会报 `Verified`。
+/// 2. **F 上这个 URL 挂的就是工作副本里那条节点历史**（独立 review 第 1 条）：`c ≤ F ≤ n` 只沿节点的
+///    历史成立。单元的上级目录在 F 之后被复制或替换过（`svn cp trunk branches/b` 之后检出分支），
+///    F 上的 `branches/b/Code` 要么还不存在（原来的 diff 报 added），要么是另一条历史上的内容。
+///    [`check_probes`] 要求 `<url>@F` 存在、最后修改 revision 等于 wc.db 里单元根的。
+///
+/// 探测单元自己的 URL，不探测仓库根：按路径授权的服务器上用户常常读不了仓库根，那样每次都 NotChecked，
+/// 等于把体检关掉（独立 review 第 2 条）。
+fn local_floor_commands(
+    units: &[WcIdentity],
+    local: &BTreeSet<String>,
+    floor: u64,
+) -> (Vec<Vec<String>>, Vec<Vec<String>>) {
+    let mine: Vec<&WcIdentity> = units
+        .iter()
+        .filter(|u| local.contains(&u.wc_root))
+        .collect();
+    let batched = |head: &[&str], targets: Vec<String>| -> Vec<Vec<String>> {
+        chunk_targets(head, &targets, MAX_TARGETS_CMDLINE)
+            .into_iter()
+            .map(|batch| {
+                let mut args: Vec<String> = head.iter().map(|a| a.to_string()).collect();
+                args.extend(batch.iter().cloned());
+                args
+            })
+            .collect()
+    };
+    let probes = batched(
+        LOCAL_PROBE,
+        mine.iter()
+            .map(|u| format!("{}@{floor}", u.url.trim_end_matches('/')))
+            .collect(),
+    );
+    let statuses = batched(
+        LOCAL_STATUS,
+        mine.iter()
+            .map(|u| crate::engine::svn_wc::peg_safe(&u.wc_root))
+            .collect(),
+    );
+    (probes, statuses)
+}
+
+/// 本地 floor 的探测（[`local_floor_commands`]）。
+const LOCAL_PROBE: &[&str] = &["info", "--xml", "--depth", "empty", "--"];
+
+/// 探测的结论。
+enum Probed {
+    /// 都跑成了。`mismatched`：这些单元 F 上的 URL 不是工作副本里那条历史（或没有），改回 diff。
+    Ok {
+        mismatched: Vec<(String, String)>,
+        /// 至少有一批跑成了：比对已经开始，之后再失败就是「比对开始之后」（`incomplete`）。
+        contacted: bool,
+    },
+    /// 连不上服务器：与原来 floor diff 失败同一个结论。
+    Unreachable(String),
+}
+
+/// 跑探测并逐单元核对（理由见 [`local_floor_commands`]）。
+///
+/// 一批里有单元的 URL 在 F 上不存在时，svn 整条以非 0 退出（W170000 / E200009），哪个不存在不好对：
+/// 这一批的单元全部改回 diff，由 diff 照原来那样报 added。只有连不上服务器（[`server_unreachable`]）
+/// 或测试注入才算 `Unreachable`。
+fn check_probes(
+    repo_root: &str,
+    units: &[WcIdentity],
+    local: &LocalFloor,
+    probes: &[Vec<String>],
+    first: bool,
+) -> Probed {
+    let mut mismatched = Vec::new();
+    let mut contacted = false;
+    let mut first = first;
+    for args in probes {
+        let point = if first {
+            Point::FirstDiff
+        } else {
+            Point::LaterDiff
+        };
+        first = false;
+        let targets: Vec<&str> = args[LOCAL_PROBE.len()..]
+            .iter()
+            .map(String::as_str)
+            .collect();
+        // target 是 `<url>@F`，对回单元
+        let batch: Vec<&WcIdentity> = units
+            .iter()
+            .filter(|u| local.units.contains(&u.wc_root))
+            .filter(|u| {
+                targets.iter().any(|t| {
+                    t.rsplit_once('@')
+                        .is_some_and(|(url, _)| url == u.url.trim_end_matches('/'))
+                })
+            })
+            .collect();
+        if let Err(e) = fault::hit(point) {
+            return Probed::Unreachable(e.message);
+        }
+        let a: Vec<&str> = args.iter().map(String::as_str).collect();
+        let xml = match run_svn_fresh(repo_root, &a) {
+            Ok(x) => x,
+            Err(e) if server_unreachable(&e.message) => {
+                let names: Vec<&str> = batch.iter().map(|u| u.wc_root.as_str()).collect();
+                return Probed::Unreachable(format!(
+                    "比对 `{}` 时连不上服务器：{}",
+                    names.join("、"),
+                    e.message
+                ));
+            }
+            Err(e) => {
+                for u in &batch {
+                    mismatched.push((
+                        u.wc_root.clone(),
+                        format!("向服务器确认 `{}` 没跑成：{}", u.url, e.message.trim()),
+                    ));
+                }
+                continue;
+            }
+        };
+        contacted = true;
+        let revs = match crate::engine::svn_xml::parse_info_commit_revs(&xml) {
+            Ok(r) => r,
+            Err(e) => {
+                for u in &batch {
+                    mismatched.push((u.wc_root.clone(), e.message.clone()));
+                }
+                continue;
+            }
+        };
+        for u in &batch {
+            let url = u.url.trim_end_matches('/');
+            let server = revs
+                .iter()
+                .find(|(got, _)| got.trim_end_matches('/') == url)
+                .map(|&(_, r)| r);
+            let mine = local.root_changed.get(&u.wc_root).copied();
+            if server.is_none() || server != mine {
+                mismatched.push((
+                    u.wc_root.clone(),
+                    format!(
+                        "服务器上 `{url}` 的最后修改是 {}，工作副本里是 {}：上级目录在这之间被复制或替换过",
+                        server.map_or("（没有）".to_string(), |r| format!("r{r}")),
+                        mine.map_or("（没有）".to_string(), |r| format!("r{r}")),
+                    ),
+                ));
+            }
+        }
+    }
+    Probed::Ok {
+        mismatched,
+        contacted,
+    }
+}
+
+/// 本地 floor 的 status。不带 `-v`：只要有改动的条目。与扫描缓存里的 [`crate::engine::svn_cli::STATUS_SCAN`]
+/// 参数不同，而且走 [`run_svn_fresh`]：那份是 `git add` 之前读的。
+const LOCAL_STATUS: &[&str] = &["status", "--xml", "--ignore-externals", "--"];
+
+/// [`read_local_floor`] 的结果。
+struct LocalFloorRead {
+    /// floor 组的差异：(仓库相对路径, item)，item 与 diff 的同名。
+    diffs: Vec<(String, String)>,
+    /// status 里出现了意外条目、要改回 diff 的单元（`wc_root`）。
+    fallback: BTreeSet<String>,
+}
+
+/// 跑本地 floor 的 status。命令失败时 `Err`，调用方全部改回 diff。
+fn read_local_floor(
+    repo_root: &str,
+    units: &[WcIdentity],
+    local: &LocalFloor,
+    statuses: &[Vec<String>],
+) -> Result<LocalFloorRead> {
+    let mut found: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    let mut fallback: BTreeSet<String> = BTreeSet::new();
+    for args in statuses {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let xml = run_svn_fresh(repo_root, &args)?;
+        // 不是 `parse_node_status`：那个是给 `-v` 的输出用的，空结果当错误；这里空结果就是干净
+        for n in crate::engine::svn_xml::parse_status_entries(&xml)? {
+            // 外层单元的 status 不进 external（`--ignore-externals`），只列出它的根
+            if n.item == "external" {
+                continue;
+            }
+            let unit = unit_of(units, &n.path)
+                .map(|(i, _)| units[i].wc_root.clone())
+                .filter(|w| local.units.contains(w))
+                .ok_or_else(|| {
+                    GitError::new(
+                        "svn_local_floor_unexpected",
+                        format!("status 列出的 `{}` 不在要比的单元里", n.path),
+                    )
+                })?;
+            match n.item.as_str() {
+                // 目录没有文本修改；万一报了，diff 那边也会被「剔除目录条目」去掉
+                "modified" if local.dirs.contains(&n.path) => {}
+                "modified" => found
+                    .entry(unit)
+                    .or_default()
+                    .push((n.path, "modified".to_string())),
+                // 目录或整个单元从磁盘上没了：原来的 diff 在这种形态下整条失败（M7），不能当成
+                // 「丢失的文件 diff 不报」放过去，否则整片没比过的内容报 Verified（独立 review 第 3 条）
+                "missing"
+                    if local.dirs.contains(&n.path)
+                        || n.path.eq_ignore_ascii_case(unit.trim_end_matches('/')) =>
+                {
+                    log::info!(
+                        "体检 `{unit}` 照旧向服务器比对 floor：`{}` 不在磁盘上",
+                        n.path
+                    );
+                    fallback.insert(unit);
+                }
+                // diff 不报：只改属性（diff 的 item="none" 本来就剔）、未版本化、丢失的文件（T1 实测）
+                "normal" | "none" | "unversioned" | "ignored" | "missing" => {}
+                other => {
+                    log::info!(
+                        "体检 `{unit}` 照旧向服务器比对 floor：status 里 `{}` 是 {other}",
+                        n.path
+                    );
+                    fallback.insert(unit);
+                }
+            }
+        }
+    }
+    let diffs = found
+        .into_iter()
+        .filter(|(u, _)| !fallback.contains(u))
+        .flat_map(|(_, v)| v)
+        .collect();
+    Ok(LocalFloorRead { diffs, fallback })
+}
+
 /// 体检本体。`tombstoning` 为假时不产生墓碑、不问服务器 HEAD、不扫被排除的节点
 /// （单值包装 [`check_baseline`] 走这条，行为与改造前相同）。
 fn check_grouped(
@@ -854,6 +1237,7 @@ fn check_grouped(
     opts: Grouped,
 ) -> Result<HealthMap> {
     let tombstoning = opts.tombstoning;
+    LAST_LOCAL.with(|l| l.borrow_mut().clear());
     let done = |health: Health| {
         Ok(HealthMap::Verified {
             health,
@@ -952,16 +1336,93 @@ fn check_grouped(
         BTreeMap::new()
     };
     let excluded_paths: BTreeSet<String> = excluded.keys().cloned().collect();
-    let DiffPlan {
-        commands,
-        unaddressable,
-    } = match plan_diffs_for(&units, map, &skip, &excluded_paths, base) {
-        Ok(p) => p,
-        Err(e) => return not_checked(e.message),
-    };
 
     // (仓库相对路径, item, 是否 floor 组)
     let mut diffs: Vec<(String, String, bool)> = Vec::new();
+    // 已经跑成的服务器命令数，含本地 floor 之前的可达性探测（见下面队列处的说明）
+    let mut ran = 0usize;
+
+    // 本地 floor：形状规整的单元不发 floor diff，改由 status 回答（[`LocalFloor`]）
+    let mut local = local_floor(repo_root, &units, map, scope);
+    if !local.units.is_empty() {
+        let (probes, statuses) = local_floor_commands(&units, &local.units, map.floor);
+        // 它就是这次体检第一次连服务器，失败语义与原来第一条 diff 失败相同
+        let mismatched = match check_probes(repo_root, &units, &local, &probes, ran == 0) {
+            Probed::Unreachable(reason) => {
+                return if ran == 0 {
+                    not_checked(reason)
+                } else {
+                    incomplete(Vec::new(), reason)
+                };
+            }
+            Probed::Ok {
+                mismatched,
+                contacted,
+            } => {
+                if contacted {
+                    ran += 1;
+                }
+                mismatched
+            }
+        };
+        // status 照探测前的单元跑（参数与预跑的一致），读完再把探测没过的去掉
+        let read = read_local_floor(repo_root, &units, &local, &statuses);
+        for (u, why) in &mismatched {
+            log::info!("体检 `{u}` 照旧向服务器比对 floor：{why}");
+            local.drop_unit(u);
+        }
+        match read {
+            Ok(LocalFloorRead {
+                diffs: found,
+                fallback,
+            }) => {
+                for u in &fallback {
+                    local.drop_unit(u);
+                }
+                let mismatched: BTreeSet<&str> =
+                    mismatched.iter().map(|(u, _)| u.as_str()).collect();
+                let found: Vec<(String, String)> = found
+                    .into_iter()
+                    .filter(|(p, _)| {
+                        unit_of(&units, p)
+                            .is_some_and(|(i, _)| !mismatched.contains(units[i].wc_root.as_str()))
+                    })
+                    .collect();
+                diffs.extend(
+                    found
+                        .into_iter()
+                        .filter(|(p, _)| !map.revs.contains_key(p))
+                        .map(|(p, item)| (p, item, true)),
+                );
+            }
+            Err(e) => {
+                log::info!(
+                    "体检照旧向服务器比对 floor：本地 status 没跑成：{}",
+                    e.message
+                );
+                local.units.clear();
+            }
+        }
+        LAST_LOCAL.with(|l| *l.borrow_mut() = local.units.iter().cloned().collect());
+        if perf::enabled() {
+            let mut rec = perf::Record::rust("query", "health floor answered locally");
+            rec.meta
+                .insert("local".into(), serde_json::json!(local.units.len()));
+            rec.meta.insert(
+                "server".into(),
+                serde_json::json!(units.len() - local.units.len()),
+            );
+            perf::record(&rec);
+        }
+    }
+
+    let DiffPlan {
+        commands,
+        unaddressable,
+    } = match plan_diffs_for_except(&units, map, &skip, &excluded_paths, base, &local.units) {
+        Ok(p) => p,
+        Err(e) => return not_checked(e.message),
+    };
     // 到此刻为止已知的 floor 上有、工作副本里没有的文件
     let deleted_so_far = |diffs: &[(String, String, bool)]| -> Vec<String> {
         let known: BTreeSet<String> = diffs
@@ -975,9 +1436,9 @@ fn check_grouped(
     };
     // 合并命令失败时把它替代的逐单元命令插回队头（`DiffCommand::fallback`）
     let mut queue: std::collections::VecDeque<DiffCommand> = commands.into();
-    // 已经跑成的命令数。改动前按下标判「第一条」；失败即返回，所以下标为 0 ⇔ 一条都还没跑成，
-    // 合并命令失败退回之后按这个数判，逐单元那几条的失败语义与改动前相同
-    let mut ran = 0usize;
+    // `ran`：已经跑成的命令数。改动前按下标判「第一条」；失败即返回，所以下标为 0 ⇔ 一条都还没
+    // 跑成，合并命令失败退回之后按这个数判，逐单元那几条的失败语义与改动前相同。本地 floor 的
+    // 可达性探测算一条：它之后再失败，前面的结果（本地 floor 的差异）已经摆在这里了
     while let Some(cmd) = queue.pop_front() {
         // 命令失败一律落到 NotChecked，**不能**当成「没有差异」。
         //
