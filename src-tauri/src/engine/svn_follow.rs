@@ -701,11 +701,21 @@ fn auto_blocker(plan: &Plan) -> Option<GitError> {
             ))
         }
         Target::Conflict(m) => {
+            // 2026-11-19 使用报告问题 1：这句原因挂在「SVN 侧有 N 个文件有新内容」的横幅下面，冲突的文件
+            // 却可能不在那份列表里，第一眼像是列表里的文件冲突了。写出它是哪个 revision 改的；分支落后时
+            // 再说清它为什么不在列表里
+            let lag = if plan.lagging {
+                // 原因与 `branch_behind_not_auto` 同一套说法：落后不只是跟进冲突一种来路（独立 review）
+                "当前分支还停在更早的基线上（切到了旧分支，或者上次跟进遇到了冲突），重放要补上那之后 \
+                 SVN 上的全部改动，所以冲突的文件可能不在这次的新内容里。"
+            } else {
+                ""
+            };
             return Some(GitError::new(
                 "svn_auto_follow_conflict",
                 format!(
-                    "当前分支的提交重放到新基线上有冲突（{}），要你来判断。点「跟进」会弹出冲突的详情。",
-                    capped(m.files.clone(), "个文件")
+                    "当前分支的提交重放到新基线上有冲突：{}。{lag}要你来判断。点「跟进」会弹出冲突的详情。",
+                    capped(conflict_names(m), "个文件")
                 ),
             ))
         }
@@ -1375,6 +1385,9 @@ struct Plan {
     /// `svn/base` 的 CAS 旧值。等于 `new_base` 时是分支跟进入口，不动基线。
     old_base: String,
     new_base: String,
+    /// 分支自己的基线（[`branch_baseline`]）比 `old_base` 早：切到了旧分支，或者上次跟进只发布了基线。
+    /// 这时重放要补上那之后 SVN 上的全部改动，冲突的文件不一定在这次的新内容里。
+    lagging: bool,
     target: Target,
     others: Vec<BranchMove>,
     report: FollowReport,
@@ -2034,6 +2047,7 @@ fn prepare(repo: &str, auto: bool, partial: Option<&Partial>) -> Result<Plan> {
     Ok(Plan {
         branch,
         old_head,
+        lagging: scope != old_base,
         old_base,
         new_base,
         target,
@@ -2737,6 +2751,25 @@ fn summary_lines(changes: &[ExternalChange], removed: usize, me: Option<&str>) -
         lines.push(format!("{removed} 个文件已从 SVN 删除"));
     }
     lines
+}
+
+/// 冲突的文件，带上 SVN 上最后改它的 revision 与作者（读得到时）：`Code/A.cs（r69007 xiebin）`。
+/// SVN 上删掉了的标成「SVN 上已删除」，不然看着像一个没有任何信息的文件名（独立 review）。
+fn conflict_names(m: &ManualNeeded) -> Vec<String> {
+    m.files
+        .iter()
+        .map(|f| {
+            let Some(d) = m.details.iter().find(|d| &d.path == f) else {
+                return f.clone();
+            };
+            match (d.svn_removed, d.svn_rev, d.svn_author.as_deref()) {
+                (true, _, _) => format!("{f}（SVN 上已删除）"),
+                (false, Some(r), Some(who)) => format!("{f}（r{r} {who}）"),
+                (false, Some(r), None) => format!("{f}（r{r}）"),
+                (false, None, _) => f.clone(),
+            }
+        })
+        .collect()
 }
 
 fn capped(items: Vec<String>, unit: &str) -> String {

@@ -432,11 +432,53 @@ fn condition_7_a_replay_conflict_does_not_even_publish_the_baseline() {
 
     let message = assert_skipped_untouched(&fx, "svn_auto_follow_conflict");
 
-    assert!(message.contains(A), "{message}");
+    assert!(
+        message.contains(&format!("{A}（r")),
+        "带上 revision：{message}"
+    );
+    assert!(
+        !message.contains("更早的基线"),
+        "分支没落后，不说落后：{message}"
+    );
     assert!(matches!(
         follow(&fx.wc_str(), "manual").unwrap(),
         FollowOutcome::NeedsManual { .. }
     ));
+}
+
+#[test]
+fn condition_7_on_a_lagging_branch_names_the_revision_and_says_the_file_is_not_new() {
+    // 2026-11-19 使用报告问题 1：横幅写着「SVN 侧有 1 个文件有新内容」，列的是 B；冲突的 A 只出现在
+    // 灰字原因里，第一眼像是 B 冲突了。A 是更早的 revision 改的：分支停在更早的基线上，重放要补上
+    // 那之后的全部改动。原因里要说清这一点，并写出 A 是哪个 revision 改的
+    let fx = hybrid_with_colleague();
+    write(&fx, A, "a-git\n");
+    commit_all(&fx, "git 里的版本");
+    write(&fx, A, "a-svn\n");
+    tortoise_commit(&fx, A);
+    let rev_a = youngest(&fx);
+    // 上一次跟进只发布了基线，分支冲突、没跟上
+    assert!(matches!(
+        follow(&fx.wc_str(), "first").unwrap(),
+        FollowOutcome::NeedsManual { .. }
+    ));
+    fx.colleague_commits(B, "b2\n");
+    set_author(&fx, youngest(&fx), "colleague");
+    svn_update(&fx, B);
+
+    let message = assert_skipped_untouched(&fx, "svn_auto_follow_conflict");
+
+    assert!(message.contains(&format!("{A}（r{rev_a}")), "{message}");
+    assert!(
+        !message.contains(B),
+        "新内容里的 B 没冲突，不能被点名：{message}"
+    );
+    assert!(message.contains("更早的基线"), "{message}");
+    assert!(
+        message.contains("切到了旧分支，或者上次跟进遇到了冲突"),
+        "{message}"
+    );
+    assert!(message.contains("不在这次的新内容里"), "{message}");
 }
 
 #[test]
