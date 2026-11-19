@@ -558,15 +558,31 @@ pub fn changelists(
 
 /// 从 `abs` 往上第一个有 `.svn/wc.db` 的目录（svn 1.7 起只有工作副本根有 `.svn`；目录 external
 /// 是独立的工作副本，有它自己的）。`abs` 是文件或不存在时也照样往上找。
+///
+/// 工作副本根可以在仓库根之上（`.git` 放在工作副本的子目录里），所以不在仓库根处停。
 fn find_wc_root(abs: &str) -> Option<String> {
-    let mut p = abs.to_string();
+    let mut p = abs;
     loop {
         if Path::new(&format!("{p}/.svn/wc.db")).is_file() {
-            return Some(p);
+            return Some(p.to_string());
         }
-        let cut = p.rfind('/')?;
-        p.truncate(cut);
+        p = parent_dir(p)?;
     }
+}
+
+/// 正斜杠路径的上一级；到盘符根（`C:`）或 UNC 共享根（`//server/share`）为止，再往上是 `None`。
+///
+/// 不能一路截到空串：那会去查 `/.svn/wc.db`，也就是**当前盘**的根，与这个仓库毫无关系（独立
+/// review 第 5 条）。
+fn parent_dir(p: &str) -> Option<&str> {
+    let parent = &p[..p.rfind('/')?];
+    let unc_host = parent
+        .strip_prefix("//")
+        .is_some_and(|rest| !rest.contains('/'));
+    if parent.is_empty() || unc_host {
+        return None;
+    }
+    Some(parent)
 }
 
 fn changelists_in(
@@ -709,6 +725,22 @@ mod tests {
         if cfg!(windows) {
             assert_eq!(within("c:/W/Code", "C:/w").as_deref(), Some("Code"));
         }
+    }
+
+    #[test]
+    fn parent_dir_stops_at_the_drive_or_share_root() {
+        assert_eq!(parent_dir("C:/w/Code"), Some("C:/w"));
+        assert_eq!(parent_dir("C:/w"), Some("C:"));
+        assert_eq!(parent_dir("C:"), None);
+        assert_eq!(parent_dir("//server/share/repo"), Some("//server/share"));
+        assert_eq!(
+            parent_dir("//server/share"),
+            None,
+            "不能截到 //server 或空串"
+        );
+        assert_eq!(parent_dir("//?/C:/w"), Some("//?/C:"));
+        assert_eq!(parent_dir("/home/u"), Some("/home"));
+        assert_eq!(parent_dir("/home"), None);
     }
 
     #[test]

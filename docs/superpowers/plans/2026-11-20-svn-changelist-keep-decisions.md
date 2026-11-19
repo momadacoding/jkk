@@ -5,10 +5,10 @@
 | Task | 状态 | 产出 | 验证 |
 |---|---|---|---|
 | T1 wc.db 查 changelist | 完成 | `svn_wcdb::changelists`、`svn_xml::parse_changelist_status`；`tests/svn_wcdb.rs` 8 个 `changelists_*` | `cargo test --test svn_wcdb` 32/32 |
-| T2 记录 / 补挂 / 核对 | 完成 | `engine/svn_changelist.rs`；`tests/svn_changelist.rs` 16 个 | `cargo test --test svn_changelist` 16/16 |
+| T2 记录 / 补挂 / 核对 | 完成 | `engine/svn_changelist.rs`；`tests/svn_changelist.rs` 22 个（review 后补 6 个） | `cargo test --test svn_changelist` 22/22 |
 | T3 接入流程与命令层 | 完成 | `svn_sync_in.rs`（S0 之后 S1 之前）、`svn_follow.rs`（`manual_follow` stash 之前）、`svn_sync_out.rs`（D0.5 之后 D3.8 之前）、`commands/svn_sync.rs`（`with_watch_suspended`） | 见 T4 |
 | T4 端到端测试 | 完成 | `svn_sync_in.rs` 2 个、`svn_sync_out.rs` 2 个、`svn_follow.rs` 1 个 | 5/5 |
-| T5 验证、review、PR | 进行中 | | |
+| T5 验证、review、PR | 进行中 | 独立 review（`/code-review high`）6 条全部处理，见「T5」 | fmt / clippy 通过；全部 105 个集成测试二进制通过；lib 178/178 |
 
 ## 开工前实测（2026-11-20，svn 1.14.5，临时 fixture）
 
@@ -57,8 +57,8 @@
 - **为什么安全**：
   - 只对记录里的路径发 `svn changelist <名>`，不发 `--remove`，不碰内容；已经在别的列表里的文件不动。
   - 记录、补挂失败只写日志，不改变流程的结局；recheck 之后无论成败删记录，不会无限重试。
-  - `settle` / `recheck` 先拿同步锁，拿不到就跳过；`recheck` 只处理自己 opid 的记录，不会删掉下一次
-    流程刚写的那份（`recheck_leaves_a_newer_flows_record_alone`）。
+  - `settle` / `recheck` 在有流程正在跑或停在半路时跳过（最初是拿同步锁，review 后改为只探测，见 T5）；
+    `recheck` 只处理自己 opid 的记录，不会删掉下一次流程刚写的那份（`recheck_leaves_a_newer_flows_record_alone`）。
 
 ### T3
 
@@ -77,6 +77,25 @@
 - **计划没写的坑**：「IDE 摘 changelist」无法在流程中途注入（`sync_in` 没有 probe）。更新与手动跟进
   用冲突出口停住流程、在暂停期间模拟；交付用现有的 `run_sync_out_probed` 在 `Step::CheckedOut` 模拟，
   顺带断言记录发生在 D3.8 之前（否则记录里没有 B，`settle` 返回 `None`）。
+
+### T5（独立 review 之后的修改）
+
+`/code-review high` 报了 6 条（2 条 important、4 条 nit），全部修了：
+
+| 条 | 问题 | 处理 |
+|---|---|---|
+| 1（important） | `settle` 与 10 秒后的 `recheck` 各拿一次同步锁：这期间钩子触发的自动跟进、git 写操作被挡成「正忙」，锁文件变化让横幅闪一下 | **不再拿同步锁**。改为进程内互斥（`GUARD`）+ 只探测的 `svn_lock::is_held` + journal 检查；有流程在跑就跳过。测试 `settle_does_not_take_the_sync_lock` |
+| 2（important） | 没等到 recheck 的记录永不过期，几天后用户有意摘掉的 changelist 会被旧记录挂回去 | 记录加 `settledAt`（第一次 settle 时写、之后不推后），settle 过且超过 120 秒的作废删除。**没 settle 过的不按时间作废**：停在冲突上的流程可能隔几小时才继续。测试 3 个 |
+| 3（nit） | `settle` 先读记录后拿锁，中间可能被别的流程换掉 | 先占互斥再读 |
+| 4（nit） | recheck 挂回东西后界面不刷新；记录文件与锁文件的变化各触发一次无用刷新 | recheck 挂回了东西就发 `repo-changed`；记录文件挪到 `.git/mygitclient/changelists.json`，watcher 本来就忽略那个目录（`watch.rs::is_relevant`），不用改 watch.rs；锁文件不再碰 |
+| 5（nit） | `find_wc_root` 一路截到空串会去查当前盘根的 `/.svn/wc.db`（UNC 仓库） | 抽出 `parent_dir`：到盘符根或 UNC 共享根为止。**不在仓库根处停**：工作副本根可以在仓库根之上。单测 `parent_dir_stops_at_the_drive_or_share_root` |
+| 6（nit） | 空白名单没有测试（AGENTS §6.2） | `an_empty_whitelist_reads_nothing_and_records_nothing`：wc.db 与退回 svn 两条路都断言不拿空 target 去问整个工作副本 |
+
+- **偏离计划**：计划写「补挂与核对都先拿同步锁」，按第 1 条改掉；计划写记录在 `.git/mygitclient-changelists.json`，
+  按第 4 条挪进 `.git/mygitclient/`。
+- **计划没写的坑**：`commands::watch::tests::stage_and_unstage_only_touch_the_index` 第一轮在本分支与基线
+  提交 740f4b3（导出到临时目录、共用 target 实跑）上都 3/3 失败（`.git/hooks` 出现事件），review 修完后
+  再跑通过。与本改动无关，是环境相关的不稳定用例，记在这里免得下一个人当成回归。
 
 ## 遗留
 

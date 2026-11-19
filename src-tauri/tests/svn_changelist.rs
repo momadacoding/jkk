@@ -328,7 +328,9 @@ fn no_record_is_written_when_nothing_has_a_changelist() {
 #[test]
 fn a_corrupt_record_is_dropped() {
     let fx = hybrid_with_colleague();
-    std::fs::write(record_path(&fx.wc_str()), "{not json").unwrap();
+    let p = record_path(&fx.wc_str());
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, "{not json").unwrap();
     assert!(read_record(&fx.wc_str()).is_none());
     assert!(!record_path(&fx.wc_str()).exists());
 }
@@ -344,9 +346,146 @@ fn the_record_survives_a_round_trip() {
         Record {
             opid: "op1".into(),
             recorded_at: r.recorded_at,
+            settled_at: None,
             entries: pairs(&[("Code/A.cs", "speed"), ("Code/B.cs", "logs")]),
         }
     );
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// 把记录的 settledAt 改到 `secs_ago` 秒前，模拟「settle 过、程序在核对前退出了」。
+fn settled_long_ago(fx: &SvnFixture, secs_ago: u64) {
+    let mut r = read_record(&fx.wc_str()).unwrap();
+    r.settled_at = Some(now() - secs_ago);
+    std::fs::write(
+        record_path(&fx.wc_str()),
+        serde_json::to_string(&r).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn settle_stamps_the_record_once() {
+    let fx = hybrid_with_colleague();
+    two_lists(&fx);
+    record(&fx.wc_str(), &wl(), "op1");
+    settle(&fx.wc_str()).unwrap();
+    let first = read_record(&fx.wc_str()).unwrap().settled_at;
+    assert!(first.is_some(), "settle 记下时刻");
+    settled_long_ago(&fx, 30);
+    let stamped = read_record(&fx.wc_str()).unwrap().settled_at;
+    settle(&fx.wc_str()).expect("还没过期，照样补挂");
+    assert_eq!(
+        read_record(&fx.wc_str()).unwrap().settled_at,
+        stamped,
+        "再 settle 不往后推，过期从流程结束算起"
+    );
+}
+
+#[test]
+fn a_record_settled_long_ago_is_dropped_instead_of_put_back() {
+    // 独立 review 第 2 条：程序在核对前退出，第二天用户在 IDE 里有意摘掉了 A 的 changelist，
+    // 下一次 settle 不能拿旧记录把它挂回去
+    let fx = hybrid_with_colleague();
+    two_lists(&fx);
+    record(&fx.wc_str(), &wl(), "op1");
+    settle(&fx.wc_str()).unwrap();
+    settled_long_ago(&fx, 24 * 3600);
+    ide_removes(&fx, "Code/A.cs");
+
+    assert!(settle(&fx.wc_str()).is_none());
+    assert!(!record_path(&fx.wc_str()).exists(), "过期记录删掉");
+    assert_eq!(lists(&fx), pairs(&[("Code/B.cs", "logs")]));
+}
+
+#[test]
+fn a_record_settled_long_ago_is_not_put_back_by_the_next_flow_either() {
+    let fx = hybrid_with_colleague();
+    two_lists(&fx);
+    record(&fx.wc_str(), &wl(), "op1");
+    settle(&fx.wc_str()).unwrap();
+    settled_long_ago(&fx, 24 * 3600);
+    ide_removes(&fx, "Code/A.cs");
+
+    record(&fx.wc_str(), &wl(), "op2");
+    assert_eq!(lists(&fx), pairs(&[("Code/B.cs", "logs")]));
+    assert_eq!(read_record(&fx.wc_str()).unwrap().opid, "op2");
+}
+
+#[test]
+fn an_unsettled_record_does_not_expire() {
+    // 停在冲突上的流程可能隔几小时才继续：没 settle 过的记录不按时间作废
+    let fx = hybrid_with_colleague();
+    two_lists(&fx);
+    record(&fx.wc_str(), &wl(), "op1");
+    let mut r = read_record(&fx.wc_str()).unwrap();
+    r.recorded_at = now() - 24 * 3600;
+    std::fs::write(
+        record_path(&fx.wc_str()),
+        serde_json::to_string(&r).unwrap(),
+    )
+    .unwrap();
+    ide_removes(&fx, "Code/A.cs");
+
+    settle(&fx.wc_str()).expect("没 settle 过，照样补挂");
+    assert_eq!(
+        lists(&fx),
+        pairs(&[("Code/A.cs", "speed"), ("Code/B.cs", "logs")])
+    );
+}
+
+#[test]
+fn settle_does_not_take_the_sync_lock() {
+    // 独立 review 第 1 条：拿同步锁会把这期间的自动跟进、git 提交挡成「正忙」，还让横幅闪一下。
+    // settle 结束时锁文件若被建过又删掉也看不出来，所以另一线程在 settle 的全程（两次起 svn 进程，
+    // 上百毫秒）不停地探测锁
+    let fx = hybrid_with_colleague();
+    two_lists(&fx);
+    record(&fx.wc_str(), &wl(), "op1");
+    ide_removes(&fx, "Code/A.cs");
+    let repo = fx.wc_str();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = {
+        let (repo, stop) = (repo.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut seen = false;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                seen |= svn_lock::is_held(&repo);
+            }
+            seen
+        })
+    };
+    settle(&repo).unwrap();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(!seen.join().unwrap(), "settle 期间同步锁被占过");
+    assert_eq!(
+        lists(&fx),
+        pairs(&[("Code/A.cs", "speed"), ("Code/B.cs", "logs")])
+    );
+}
+
+#[test]
+fn an_empty_whitelist_reads_nothing_and_records_nothing() {
+    // 空 target 的 svn status 作用于整个工作副本（AGENTS.md §6.2）：空白名单必须什么都不问
+    let fx = hybrid_with_colleague();
+    cl(&fx, "outside", "Code/A.cs");
+    assert!(read_changelists(&fx.wc_str(), &[]).unwrap().is_empty());
+    assert!(app_lib::engine::svn_wcdb::changelists(&fx.wc_str(), &[])
+        .unwrap()
+        .is_empty());
+    let _armed = fault::arm(Point::WcdbRefused);
+    assert!(
+        read_changelists(&fx.wc_str(), &[]).unwrap().is_empty(),
+        "退回 svn 那条路也不能拿空 target 去问整个工作副本"
+    );
+    record(&fx.wc_str(), &[], "op1");
+    assert!(!record_path(&fx.wc_str()).exists());
 }
 
 #[test]

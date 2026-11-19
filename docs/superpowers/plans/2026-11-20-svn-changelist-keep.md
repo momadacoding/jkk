@@ -31,7 +31,7 @@ IDEA / Rider 的 SVN 插件刚好在这段时间刷新时，会把这些「已�
 
 ## 关键设计
 
-- **记录文件独立于 journal**：`.git/mygitclient-changelists.json`，带 opid。journal 在 S11 / 各种收尾点被删
+- **记录文件独立于 journal**：`.git/mygitclient/changelists.json`（review 后从 `.git/` 根挪进来），带 opid。journal 在 S11 / 各种收尾点被删
   （`restore_step_with` 里有五处），延迟核对发生在 journal 删掉之后，记录必须活得比 journal 长。
 - **记录走 wc.db**：`svn status` 遍历白名单在公司机器上约 4 秒；`ACTUAL_NODE.changelist` 一条查询。
   认不出 wc.db（格式不是 31、WORK_QUEUE 非空、打不开）时退回 `svn status --xml`。
@@ -41,4 +41,5 @@ IDEA / Rider 的 SVN 插件刚好在这段时间刷新时，会把这些「已�
   journal 还在（停在冲突上）时不补挂：那时文件可能仍是原版，挂上也会被 IDE 再摘掉。
 - **失败不影响流程结局**：记录或补挂失败只写日志；补挂失败时记录留着，10 秒后的核对再试一次，
   之后无论成败都删记录，不无限重试。
-- **并发**：补挂与核对都先拿同步锁，拿不到就跳过（记录留着，下一次流程开始记录前先补挂旧记录）。
+- **并发**：（原计划：补挂与核对都先拿同步锁。review 第 1 条指出这会挡住自动跟进与 git 写操作，改为进程内
+  互斥 + 只探测同步锁，见决策日志 T5。）有流程在跑就跳过，记录留着，下一次流程开始记录前先补挂旧记录。

@@ -3504,6 +3504,13 @@ exclude 生成与图合成都在 Rust 侧，由 cargo test 覆盖。
     差异都当作内容丢失，也不能把含冲突标记的 TREE 当成用户应得到的结果。本设计
     不再依赖 `merge-tree` 的能力探测或「未经校验仍继续」的降级路径；merge 门槛查询
     失败必须停止
+28. **IDE 的 SVN changelist 在 `sync_in` / 手动跟进 / `sync_out` 期间可能被 IDE 摘掉，
+    客户端事后补挂，但不保证**（2026-11-19 事故；计划 `2026-11-20-svn-changelist-keep.md`）。
+    这三个流程会让有本地改动的文件暂时等于 SVN 原版，IDEA / Rider 的 SVN 插件这时刷新就
+    执行 `svn changelist --remove`。客户端在动磁盘前记下「文件 → changelist」，流程结束后把
+    没挂 changelist、仍有修改的文件挂回原列表，约 10 秒后再核对一次。补不上的情况：
+    中文文件名或列表名在系统 ACP 不是 936 的机器上（svn.exe 按 ACP 转换命令行参数）；
+    IDE 的那次刷新晚于核对。补挂失败只写日志，界面上没有提示
 
 ## 16. 分期
 

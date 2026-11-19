@@ -209,9 +209,15 @@ fn with_watch_suspended<T>(
     };
     if let Some(s) = svn_changelist::settle(path) {
         let repo = path.to_string();
+        let handle = handle.clone();
         std::thread::spawn(move || {
             std::thread::sleep(svn_changelist::RECHECK_DELAY);
-            svn_changelist::recheck(&repo, &s.opid);
+            // 补挂只写 `.svn/wc.db`，watcher 看不见；挂回了东西就告诉前端刷新一次
+            let changed =
+                svn_changelist::recheck(&repo, &s.opid).is_some_and(|r| !r.reattached.is_empty());
+            if changed {
+                let _ = handle.emit("repo-changed", &repo);
+            }
         });
     }
     let _ = handle.emit("repo-changed", path);
