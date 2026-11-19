@@ -1,5 +1,15 @@
 import { execFileSync } from 'node:child_process'
-import { existsSync, linkSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -198,7 +208,9 @@ describe('collect / cleanTargets（临时 fixture 仓库）', () => {
   const targetOf = (dir: string) => path.join(dir, 'src-tauri', 'target')
 
   beforeEach(() => {
-    root = mkdtempSync(path.join(tmpdir(), 'wt-targets-'))
+    // CI runner 的 %TEMP% 是 8.3 短路径（C:\Users\RUNNER~1\...）。git 和脚本拿到的是长路径，测试自己拼的
+    // 是短路径，断言里按字符串比 target 就对不上；不存在的 app.exe 也解析不成长路径。先在这里归一成长路径
+    root = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'wt-targets-')))
     repo = path.join(root, 'repo 带空格')
     mkdirSync(repo)
     git(repo, 'init', '-q', '-b', 'master')
