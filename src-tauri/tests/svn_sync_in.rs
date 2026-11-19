@@ -696,6 +696,90 @@ fn continue_after_resolving_a_rebase_conflict() {
     assert_eq!(phase(&fx), None);
 }
 
+// —— 保住 changelist（计划 2026-11-20-svn-changelist-keep T4）——
+
+fn svn_lists(fx: &SvnFixture) -> Vec<(String, String)> {
+    let xml = app_lib::engine::svn_cli::run_svn(&fx.wc_str(), &["status", "--xml", "--", "Code@"])
+        .unwrap();
+    app_lib::engine::svn_xml::parse_changelist_status(&xml)
+        .unwrap()
+        .into_iter()
+        .filter_map(|s| s.changelist.map(|c| (s.path, c)))
+        .collect()
+}
+
+fn svn_in_wc(fx: &SvnFixture, args: &[&str]) {
+    svn_fixtures::svn_cmd(&fx.wc(), args);
+}
+
+/// 11-19 的真实形态：文件只在 git 工作区里改、没提交，挂在 IDE 的 changelist 上；更新停在冲突上，
+/// 这段时间它在 stash 里、磁盘上是 SVN 原版，IDE 刷新摘掉了 changelist。
+#[test]
+fn a_changelist_removed_while_an_update_is_stopped_on_a_conflict_comes_back() {
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/A.cs", "a-server\n");
+    write(&fx, "Code/A.cs", "a-local\n");
+    commit(&fx, "local A");
+    write(&fx, "Code/B.cs", "b-wip\n");
+    svn_in_wc(
+        &fx,
+        &["changelist", "bundle-build-speed", "--", "Code/B.cs"],
+    );
+    assert!(matches!(sync(&fx), SyncInOutcome::RebaseConflict { .. }));
+    assert_eq!(
+        read(&fx, "Code/B.cs"),
+        "b1\n",
+        "前提：停在冲突上时 B 在 stash 里"
+    );
+    // 此刻 B 等于 SVN 原版，IDE 刷新时发的就是这条
+    svn_in_wc(&fx, &["changelist", "--remove", "--", "Code/B.cs"]);
+    assert!(
+        app_lib::engine::svn_changelist::settle(&fx.wc_str()).is_none(),
+        "停在冲突上时不补挂：B 还是原版，挂上也会被再摘掉"
+    );
+
+    write(&fx, "Code/A.cs", "a-resolved\n");
+    git(&fx, &["add", "Code/A.cs"]);
+    assert_eq!(
+        continue_sync(&fx.wc_str()).unwrap(),
+        SyncInOutcome::Done { new_rev: 2 }
+    );
+    let s = app_lib::engine::svn_changelist::settle(&fx.wc_str()).expect("流程走完，应当补挂");
+    assert_eq!(
+        s.report.reattached,
+        vec![("Code/B.cs".to_string(), "bundle-build-speed".to_string())]
+    );
+    assert_eq!(
+        svn_lists(&fx),
+        vec![("Code/B.cs".to_string(), "bundle-build-speed".to_string())]
+    );
+    assert!(app_lib::engine::svn_changelist::recheck(&fx.wc_str(), &s.opid).is_some());
+    assert!(!app_lib::engine::svn_changelist::record_path(&fx.wc_str()).exists());
+}
+
+#[test]
+fn a_changelist_removed_during_an_update_that_is_aborted_comes_back() {
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/A.cs", "a-server\n");
+    write(&fx, "Code/A.cs", "a-local\n");
+    commit(&fx, "local A");
+    write(&fx, "Code/B.cs", "b-wip\n");
+    svn_in_wc(
+        &fx,
+        &["changelist", "lua-compile-parallel", "--", "Code/B.cs"],
+    );
+    assert!(matches!(sync(&fx), SyncInOutcome::RebaseConflict { .. }));
+    svn_in_wc(&fx, &["changelist", "--remove", "--", "Code/B.cs"]);
+
+    assert_eq!(abort_sync(&fx.wc_str()).unwrap(), SyncInOutcome::Aborted);
+    assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
+    app_lib::engine::svn_changelist::settle(&fx.wc_str()).expect("放弃完了，应当补挂");
+    assert_eq!(
+        svn_lists(&fx),
+        vec![("Code/B.cs".to_string(), "lua-compile-parallel".to_string())]
+    );
+}
+
 #[test]
 fn continue_with_unresolved_files_is_refused() {
     let fx = hybrid_with_colleague();

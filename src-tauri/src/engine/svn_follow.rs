@@ -64,6 +64,7 @@ use crate::engine::svn_baseline::{
     create_baseline_commit_with, git_dir, move_baseline_ref, IndexEdit, TempIndex,
 };
 use crate::engine::svn_basemap::{read_base_map, BaseMap};
+use crate::engine::svn_changelist;
 use crate::engine::svn_cli::{bypass_scan_cache, with_scan_cache};
 use crate::engine::svn_config::{read_config, SvnConfig, BASELINE_BRANCH};
 use crate::engine::svn_follow_index::{
@@ -1230,6 +1231,8 @@ pub fn manual_follow(repo: &str, opid: &str) -> Result<SyncInOutcome> {
         ..Default::default()
     };
     svn_journal::write(repo, &j)?;
+    // stash 与 rebase 会让文件暂时等于 SVN 原版，IDE 这时刷新会摘掉 changelist（`svn_changelist`）
+    svn_changelist::record(repo, &cfg.whitelist, opid);
     stash_wip(repo, &mut j, &cfg.whitelist)?;
     fault::reach(fault::Point::ManualStashed, None);
     // S8 在这里不切分支（HEAD 一直在原分支上），只做复核；S9 重放到 `newBaselineOid`

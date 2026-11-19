@@ -23,6 +23,7 @@ use crate::engine::svn_baseline::{
     swap_index_to_tree, TempIndex,
 };
 use crate::engine::svn_basemap::BaseMap;
+use crate::engine::svn_changelist;
 use crate::engine::svn_cli::{run_svn, run_svn_code};
 use crate::engine::svn_config::{read_config, SvnConfig, BASELINE_BRANCH};
 use crate::engine::svn_dirty::read_dirty;
@@ -176,6 +177,9 @@ pub fn run_sync_in(repo: &str, expect: &SyncInExpect) -> Result<SyncInOutcome> {
         ..Default::default()
     };
     svn_journal::write(repo, &j)?;
+
+    // S1 起文件会暂时等于 SVN 原版，IDE 这时刷新会摘掉 changelist：先记下，收尾后补挂（`svn_changelist`）
+    svn_changelist::record(repo, &cfg.whitelist, &j.opid);
 
     // S1（S2 的 origBranch 已在 S0 落盘，这里只推进 phase）
     wip::stash_wip(repo, &mut j, &cfg.whitelist)?;

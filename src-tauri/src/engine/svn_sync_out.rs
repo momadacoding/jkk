@@ -19,6 +19,7 @@ use crate::engine::svn_baseline::{
     swap_index_to_tree, TempIndex,
 };
 use crate::engine::svn_basemap::{read_base_map, BaseMap};
+use crate::engine::svn_changelist;
 use crate::engine::svn_cli::{run_svn, run_svn_code};
 use crate::engine::svn_config::{read_config, SvnConfig, BASELINE_BRANCH};
 use crate::engine::svn_deliver::{deliver_ref, pin, unpin};
@@ -182,6 +183,10 @@ pub fn run_sync_out_probed(
     j.phase = Phase::DeliverBuilt;
     svn_journal::write(repo, &j)?;
     probe.at(Step::Built, repo);
+
+    // D3.8 之后只存在于 Local-Only 提交里的改动会暂时消失，IDE 这时刷新会摘掉 changelist
+    // （`ignore-on-commit` 也在其中）：先记下，收尾后补挂（`svn_changelist`）
+    svn_changelist::record(repo, &cfg.whitelist, &opid);
 
     // D3.8：全流程第一次动主工作副本，在用户确认之后
     j.phase = Phase::CheckedOut;
