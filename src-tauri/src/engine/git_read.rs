@@ -18,7 +18,7 @@
 //! 悬空 ref 退出 0 照样打印 OID。这里有意比 CLI 严（`tests/git_read.rs`，独立 review 2026-11-01）。
 
 use crate::error::Result;
-use git2::{ErrorClass, ErrorCode, ObjectType, Repository, TreeWalkMode, TreeWalkResult};
+use git2::{ErrorClass, ErrorCode, ObjectType, Patch, Repository, TreeWalkMode, TreeWalkResult};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -114,6 +114,86 @@ pub fn unmerged_paths(repo: &str) -> Result<Vec<String>> {
         }
     }
     Ok(out.into_iter().collect())
+}
+
+/// 一条路径在两个提交之间的增删行数，同 `git diff --numstat` 的一行。二进制时行数为 0、`binary` 为真
+/// （numstat 写 `-`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LineStat {
+    pub added: usize,
+    pub removed: usize,
+    pub binary: bool,
+}
+
+/// 默认配置下的 `git diff --numstat --no-renames <from> <to> -- <paths>`：只回答问到的路径，两边内容
+/// 相同或两边都没有的不出现。比的是对象库里的 blob，不经过 autocrlf / eol 过滤；二进制按
+/// `.gitattributes`（`-diff`、`binary`）与内容判定（`tests/git_read_line_stats.rs` 逐个对照）。
+///
+/// 与 numstat 不同的地方（跟进报告碰不到或不在乎）：只差 mode 的路径不出现（numstat 写 `0 0`，
+/// `drift_paths` 本来就不报它）；固定 myers，不认用户的 `diff.algorithm`；不跑 textconv；不按
+/// `core.bigFileThreshold` 把大文件当二进制。
+///
+/// 跟进报告用它写「分支比 SVN 少 7 行」（计划 `2026-11-16-follow-report-usability.md` 的 B）：drift
+/// 的文件磁盘就是新基线的 blob，所以分支相对磁盘差几行 = 新基线对重放后的 tip，不用读磁盘。
+///
+/// 某一条路径读不出来（对象缺失之类）只跳过它、记日志，其余照常回答：这是给人看的附注，一个坏对象
+/// 不该让整份报告的行数都没了（独立 review nit 4）。打不开仓库、解析不了两个提交才返回 `Err`。
+pub fn line_stats(
+    repo: &str,
+    from: &str,
+    to: &str,
+    paths: &[String],
+) -> Result<BTreeMap<String, LineStat>> {
+    let mut out = BTreeMap::new();
+    if paths.is_empty() {
+        return Ok(out);
+    }
+    let r = open(repo)?;
+    let a = r.revparse_single(from)?.peel_to_tree()?;
+    let b = r.revparse_single(to)?.peel_to_tree()?;
+    for p in paths {
+        match line_stat(&r, &a, &b, p) {
+            Ok(Some(s)) => {
+                out.insert(p.clone(), s);
+            }
+            Ok(None) => {}
+            Err(e) => log::warn!("统计 {p} 差几行时出错，跳过：{}", e.message),
+        }
+    }
+    Ok(out)
+}
+
+/// [`line_stats`] 的一条路径。两边相同或两边都没有时 `None`。
+fn line_stat(r: &Repository, a: &git2::Tree, b: &git2::Tree, p: &str) -> Result<Option<LineStat>> {
+    let at = Some(Path::new(p));
+    // git2 的 Patch 没有「一边没有 blob」的入口：只有一边时拿它对空内容比。新增的文件反着比再把
+    // 增删对调，这样两种情形都由仓库里的 blob 带路径，`.gitattributes` 的二进制判定照样生效
+    let (patch, swap) = match (blob_at(r, a, p)?, blob_at(r, b, p)?) {
+        (None, None) => return Ok(None),
+        (Some(o), Some(n)) if o.id() == n.id() => return Ok(None),
+        (Some(o), Some(n)) => (Patch::from_blobs(&o, at, &n, at, None)?, false),
+        (Some(o), None) => (Patch::from_blob_and_buffer(&o, at, b"", at, None)?, false),
+        (None, Some(n)) => (Patch::from_blob_and_buffer(&n, at, b"", at, None)?, true),
+    };
+    let binary = patch.delta().flags().is_binary();
+    let (_, plus, minus) = patch.line_stats()?;
+    let (added, removed) = if swap { (minus, plus) } else { (plus, minus) };
+    Ok(Some(LineStat {
+        added,
+        removed,
+        binary,
+    }))
+}
+
+/// 树里 `p` 处的 blob。子模块指针、目录算没有：numstat 对子模块写的是提交号的变化，跟进报告里不会有它们。
+fn blob_at<'r>(r: &'r Repository, t: &git2::Tree, p: &str) -> Result<Option<git2::Blob<'r>>> {
+    match t.get_path(Path::new(p)) {
+        Ok(e) if e.kind() == Some(ObjectType::Blob) => Ok(Some(r.find_blob(e.id())?)),
+        Ok(_) => Ok(None),
+        Err(e) if e.code() == ErrorCode::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// `git config --bool --get core.ignoreCase`；没设或读不出来都按 `false`。

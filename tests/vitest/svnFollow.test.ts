@@ -8,6 +8,7 @@ import {
   describeFollowConflict,
   describeFollowOutcome,
   describeFollowReport,
+  driftDiffTarget,
   describeManualFollow,
   describeManualFollowAction,
   describeManualFollowOutcome,
@@ -483,6 +484,29 @@ describe('describeFollowReport', () => {
     expect(m.sections.findIndex((x) => x.id === 'drift')).toBeLessThan(
       m.sections.findIndex((x) => x.id === 'changes'),
     )
+  })
+
+  it('带了对比的两个提交时，对不上的每个文件都能「对比」；旧后端没带就不能', () => {
+    const r: FollowReport = { ...report, drift: ['Code/A.cs', 'Code/B.cs'] }
+    expect(section(r, 'drift')!.groups[0].items.map((i) => i.compare)).toEqual([
+      undefined,
+      undefined,
+    ])
+    const withRange = { ...r, driftRange: { from: 'b'.repeat(40), to: 't'.repeat(40) } }
+    expect(section(withRange, 'drift')!.groups[0].items.map((i) => i.compare)).toEqual([
+      'Code/A.cs',
+      'Code/B.cs',
+    ])
+  })
+
+  it('「对比」左边是 SVN 的版本（from），右边是分支的版本（to）', () => {
+    expect(driftDiffTarget({ from: 'svn-base', to: 'branch-tip' }, 'Code/A.cs')).toEqual({
+      kind: 'range',
+      from: 'svn-base',
+      to: 'branch-tip',
+      file: 'Code/A.cs',
+      oldFile: null,
+    })
   })
 
   it('条件 11 的重叠文件逐个标出与磁盘是否一致；不一致的要确认，一致的只告知，drift 不重复列', () => {
@@ -1329,6 +1353,63 @@ describe('报告三节的写法（计划 2026-11-16-follow-report-usability 的 
       const r: FollowReport = { ...real, overlap: undefined }
       const d = describeFollowReport(r).sections.find((x) => x.id === 'drift')!
       expect(d.groups[0].items).toEqual([{ text: 'Lua/UnionMainBaseUI.lua' }])
+    })
+  })
+
+  describe('分支与磁盘对不上：写出分支比 SVN 差几行（计划 2026-11-16 的 B）', () => {
+    const drift = (lines: FollowReport['driftLines']) =>
+      describeFollowReport({ ...real, driftLines: lines }).sections.find((x) => x.id === 'drift')!
+        .groups[0].items[0]
+
+    it('2026-11-16 那次：分支比 SVN 少 7 行，后面跟着造成差异的提交', () => {
+      expect(
+        drift({ 'Lua/UnionMainBaseUI.lua': { added: 0, removed: 7, binary: false } }),
+      ).toEqual({
+        text: 'Lua/UnionMainBaseUI.lua',
+        meta: '分支比 SVN 少 7 行 · 改过它的提交：c028e264 小婉问答',
+      })
+    })
+
+    it('多出来的、两边都有的、二进制的各有说法', () => {
+      const meta = (added: number, removed: number, binary = false) =>
+        drift({ 'Lua/UnionMainBaseUI.lua': { added, removed, binary } }).meta
+      expect(meta(3, 0)).toBe('分支比 SVN 多 3 行 · 改过它的提交：c028e264 小婉问答')
+      expect(meta(2, 7)).toBe('分支比 SVN 多 2 行、少 7 行 · 改过它的提交：c028e264 小婉问答')
+      expect(meta(0, 0, true)).toBe('二进制文件，内容不同 · 改过它的提交：c028e264 小婉问答')
+    })
+
+    it('SVN 上已删、分支把它带回来的文件：说清是整个文件，不只是「多 N 行」（独立 review nit 5）', () => {
+      const r: FollowReport = {
+        ...real,
+        removed: ['Lua/UnionMainBaseUI.lua'],
+        driftLines: { 'Lua/UnionMainBaseUI.lua': { added: 120, removed: 0, binary: false } },
+      }
+      const item = describeFollowReport(r).sections.find((x) => x.id === 'drift')!.groups[0].items[0]
+      expect(item.meta).toBe(
+        'SVN 上已删除，分支里还有这个文件（120 行） · 改过它的提交：c028e264 小婉问答',
+      )
+      const bin: FollowReport = {
+        ...r,
+        driftLines: { 'Lua/UnionMainBaseUI.lua': { added: 0, removed: 0, binary: true } },
+      }
+      expect(
+        describeFollowReport(bin).sections.find((x) => x.id === 'drift')!.groups[0].items[0].meta,
+      ).toBe('SVN 上已删除，分支里还有这个文件 · 改过它的提交：c028e264 小婉问答')
+    })
+
+    it('没有行数（旧后端、后端算不出来）：照原样只写提交', () => {
+      expect(drift(undefined).meta).toBe('改过它的提交：c028e264 小婉问答')
+      expect(drift({}).meta).toBe('改过它的提交：c028e264 小婉问答')
+    })
+
+    it('有行数、没有提交时只写行数', () => {
+      const r: FollowReport = {
+        ...real,
+        overlap: undefined,
+        driftLines: { 'Lua/UnionMainBaseUI.lua': { added: 0, removed: 7, binary: false } },
+      }
+      const d = describeFollowReport(r).sections.find((x) => x.id === 'drift')!
+      expect(d.groups[0].items).toEqual([{ text: 'Lua/UnionMainBaseUI.lua', meta: '分支比 SVN 少 7 行' }])
     })
   })
 

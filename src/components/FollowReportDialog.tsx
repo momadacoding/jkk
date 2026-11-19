@@ -23,6 +23,19 @@ export interface FollowReportRequest {
    * 「放回 Local-Only 补丁」（使用报告 9.1）。不给就不显示按钮。实现方负责写完之后刷新状态。
    */
   restoreLocalOnly?: (paths: string[]) => Promise<RestoreOutcome>
+  /**
+   * 「对比」：用外部工具打开对不上的文件的 SVN 版本与分支版本（`report.driftRange`）。返回 `null`
+   * 表示这个文件没有可用的对比工具，不显示按钮；不给就一个都不显示。
+   */
+  compare?: (file: string) => CompareAction | null
+}
+
+/** 一个文件的「对比」。 */
+export interface CompareAction {
+  /** 工具名，写在按钮的提示里。 */
+  label: string
+  /** 启动工具，立即返回；工具退出由调用方另行处理。 */
+  open: () => Promise<void>
 }
 
 interface Pending extends FollowReportRequest {
@@ -177,7 +190,19 @@ const real = (groups: FollowReportSection['groups']) =>
  * `<details>` 里的按钮也会被挑中，focus() 落不上，Tab 就卡在原地。`<summary>` 带 tabIndex
  * 才进得了那个选择器。
  */
-function Section({ s, children }: { s: FollowReportSection; children?: ReactNode }) {
+function Section({
+  s,
+  compareOf,
+  runCompare,
+  children,
+}: {
+  s: FollowReportSection
+  /** 条目带 `compare` 时用它找对比工具；返回 `null` 就不放按钮。 */
+  compareOf?: (file: string) => CompareAction | null
+  /** 点了「对比」：报告框统一接住启动失败。 */
+  runCompare?: (file: string, action: CompareAction) => void
+  children?: ReactNode
+}) {
   const [open, setOpen] = useState(s.level !== 'info' || s.count <= INFO_OPEN_MAX)
   const [all, setAll] = useState(false)
   const shown = all ? s.groups : preview(s.groups)
@@ -204,12 +229,27 @@ function Section({ s, children }: { s: FollowReportSection; children?: ReactNode
               {g.label && <div className="follow-group-label">{g.label}</div>}
               <ul className="follow-items">
                 {/* 同一路径可能在两个 commit 里泄漏，文案相同，不能拿它做 key */}
-                {g.items.map((item, i) => (
-                  <li key={i} className={item.more ? 'more' : undefined}>
-                    <span className="follow-path">{item.text}</span>
-                    {item.meta && <span className="follow-meta">{item.meta}</span>}
-                  </li>
-                ))}
+                {g.items.map((item, i) => {
+                  const action = item.compare && runCompare ? compareOf?.(item.compare) : null
+                  return (
+                    <li key={i} className={item.more ? 'more' : undefined}>
+                      <span className="follow-path">{item.text}</span>
+                      {/* 放在路径外面：选中路径复制时不带上按钮的字 */}
+                      {action && item.compare && (
+                        <button
+                          type="button"
+                          className="follow-compare"
+                          aria-label={`对比 ${item.compare}`}
+                          title={`用 ${action.label} 对比：左边是 SVN 的版本，右边是分支的版本`}
+                          onClick={() => runCompare?.(item.compare ?? '', action)}
+                        >
+                          对比
+                        </button>
+                      )}
+                      {item.meta && <span className="follow-meta">{item.meta}</span>}
+                    </li>
+                  )
+                })}
               </ul>
             </div>
           ))}
@@ -261,6 +301,13 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
   const restorable = useMemo(() => restorablePaths(request.report), [request.report])
   const restore = request.restoreLocalOnly
   const restoring = useRestore(restorable, restore)
+  // 工具起不来（路径配错之类）就写在那一节里，点名是哪个文件：先点的慢、后点的快时，错误可能后到
+  // （独立 review nit 3）。工具退出后的结果由调用方的退出事件处理
+  const [compareError, setCompareError] = useState<string | null>(null)
+  const runCompare = (file: string, action: CompareAction) => {
+    setCompareError(null)
+    action.open().catch((err) => setCompareError(`${file}：${toErrorMessage(err)}`))
+  }
 
   return (
     <div className="dialog-overlay">
@@ -285,9 +332,14 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
           <div className="follow-zone">
             <div className="follow-zone-title">需要你留意</div>
             {flagged.map((s) => (
-              <Section key={s.id} s={s}>
+              <Section key={s.id} s={s} compareOf={request.compare} runCompare={runCompare}>
                 {s.id === 'restorePending' && restore && restorable.length > 0 && (
                   <RestoreRow paths={restorable} state={restoring.state} run={restoring.run} />
+                )}
+                {s.id === 'drift' && compareError && (
+                  <div className="dlg-warning follow-compare-error" aria-live="polite">
+                    {compareError}
+                  </div>
                 )}
               </Section>
             ))}

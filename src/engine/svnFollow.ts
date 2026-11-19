@@ -7,6 +7,7 @@
  * ⚠️ 横幅与对话框都按**纯文本**渲染：不要写 `**`。
  */
 import type { ExternalChange, SyncVerdict } from './svnSync'
+import type { DiffTarget } from './externalTools'
 import { formatDuration } from './svnInit'
 import {
   describeFollowDrift,
@@ -64,6 +65,45 @@ export interface OverlapFile {
   matchesDisk: boolean
 }
 
+/** 后端 `git_read::LineStat`：同 `git diff --numstat` 的一行，二进制时行数为 0。 */
+export interface LineStat {
+  added: number
+  removed: number
+  binary: boolean
+}
+
+/**
+ * 「分支比 SVN 少 7 行」：对不上的文件差在哪（计划 2026-11-16 的 B）。说不出来时 `null`。
+ *
+ * `svnRemoved`：SVN 上已删、分支把它带了回来。这时多出来的是整个文件，只写「多 120 行」看不出来
+ * （独立 review nit 5）。
+ */
+function driftLinesText(l: LineStat | undefined, svnRemoved: boolean): string | null {
+  if (svnRemoved) {
+    const n = l && !l.binary && l.added > 0 ? `（${l.added} 行）` : ''
+    return `SVN 上已删除，分支里还有这个文件${n}`
+  }
+  if (!l) return null
+  if (l.binary) return '二进制文件，内容不同'
+  const parts = [l.added > 0 ? `多 ${l.added} 行` : '', l.removed > 0 ? `少 ${l.removed} 行` : '']
+  const said = parts.filter((p) => p !== '').join('、')
+  return said ? `分支比 SVN ${said}` : null
+}
+
+/** 后端 `svn_follow::DriftRange`：两个提交的 OID。 */
+export interface DriftRange {
+  from: string
+  to: string
+}
+
+/**
+ * 「对比」交给外部工具的两侧：左边（from）是 SVN 的版本，右边（to）是分支的版本。报告框的按钮提示
+ * 照这个方向写；方向一反，用户会把分支的版本当成 SVN 的去提交（独立 review 建议 1）。
+ */
+export function driftDiffTarget(range: DriftRange, file: string): DiffTarget {
+  return { kind: 'range', from: range.from, to: range.to, file, oldFile: null }
+}
+
 /** 后端 `svn_follow::HeldBack`：部分自动跟进留在旧基线上的一个文件。 */
 export interface HeldBack {
   path: string
@@ -85,6 +125,16 @@ export interface FollowReport {
   snapshot: [string, string[]][]
   /** 重放后与磁盘对不上的文件：多半是重放干净却合错了（PR 119 遗留）。 */
   drift: string[]
+  /**
+   * `drift` 里每个文件分支相对磁盘（= SVN 版本）的增删行数（计划 2026-11-16 的 B）。`added` 是分支
+   * 多出来的行，`removed` 是分支少了的行。旧后端、或者后端算不出来时没有。
+   */
+  driftLines?: Record<string, LineStat>
+  /**
+   * `drift` 比的两个提交：`from` 是新基线（里面就是磁盘上的 SVN 版本），`to` 是重放后的分支 tip。
+   * 报告里每个对不上的文件旁边的「对比」用外部工具打开这两侧。旧后端、没有 drift 时没有。
+   */
+  driftRange?: DriftRange
   /**
    * `drift` 里能用「放回 Local-Only 补丁」写回磁盘的（使用报告 9.1）：分支比磁盘多出来的只有
    * Local-Only 改动，磁盘就是 SVN 的版本。旧后端没有。
@@ -291,6 +341,11 @@ export interface ReportItem {
   meta?: string
   /** 「…还有 N 个」那一行。 */
   more?: boolean
+  /**
+   * 能用外部工具对比时，要比的那个文件（仓库相对路径）。行数说不清差在哪，复杂的改动只能看 diff，
+   * 所以「对不上」的每个文件旁边放一个「对比」（报告框决定有没有可用的工具）。
+   */
+  compare?: string
 }
 
 /** {@link describeFollowReport} 的一节。没发生的事不成节。 */
@@ -497,9 +552,16 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
   const pending = pendingRestoreGroups(notRestored)
   const overlap = r.overlap ?? []
   const commitsByPath = new Map(overlap.map((o) => [o.path, o.commits.join('、')]))
+  const svnRemoved = new Set(r.removed)
   const driftItem = (p: string): ReportItem => {
     const c = commitsByPath.get(p)
-    return c ? { text: p, meta: `改过它的提交：${c}` } : { text: p }
+    const parts = [
+      driftLinesText(r.driftLines?.[p], svnRemoved.has(p)),
+      c ? `改过它的提交：${c}` : null,
+    ]
+    const meta = parts.filter((t): t is string => t !== null).join(' · ')
+    const item: ReportItem = meta ? { text: p, meta } : { text: p }
+    return r.driftRange ? { ...item, compare: p } : item
   }
   // 重放后变空、已丢弃的提交上的泄漏单列一组：它已经不在分支上了（计划 2026-11-16 的 A）。
   // 只认移动了的分支：别的分支带着同一个提交时，`plan_other` 见泄漏就停，那条分支没重放、提交还在，

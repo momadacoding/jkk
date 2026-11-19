@@ -1555,6 +1555,31 @@ body {
   text-decoration: underline;
 }
 
+/* 「对不上」的文件旁边的「对比」：跟在路径后面，像链接一样轻，不抢路径的位置 */
+.follow-compare {
+  /* li 是 flex 行、路径占满剩余宽度：按钮排在路径与附注之间，上下对齐成一列，不被压扁 */
+  flex: none;
+  padding: 0 6px;
+  background: transparent;
+  border: 1px solid #3a3a3a;
+  border-radius: 3px;
+  color: #4fc3f7;
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 16px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.follow-compare:hover {
+  border-color: #4fc3f7;
+}
+
+.follow-compare:focus-visible {
+  outline: 2px solid #4fc3f7;
+  outline-offset: 2px;
+}
+
 .follow-more:focus-visible {
   outline: 2px solid #4fc3f7;
   outline-offset: 2px;
@@ -1655,6 +1680,11 @@ body {
 .follow-restore .dlg-warning {
   margin-left: 0;
   align-self: stretch;
+}
+
+/* 「对比」起不来时的原因：与上面的清单对齐，不吃 .dlg-warning 给图标留的 54px */
+.dlg-warning.follow-compare-error {
+  margin: 6px 0 0 10px;
 }
 
 .follow-restore > div {

@@ -51,6 +51,7 @@ import {
   autoFollowKey,
   describeAutoFollowDone,
   describeRestoreSkips,
+  driftDiffTarget,
   keepOnNewFollow,
   type FollowReport,
   type PendingRestore,
@@ -59,7 +60,7 @@ import { readAppSettings } from '@/store/appSettingsStore'
 import SvnInitWizard from './SvnInitWizard'
 import BaselineBanner from './BaselineBanner'
 import { baselineMap, findDelivered, selectionDiffScope } from '../engine/svnGraph'
-import { describeToolExit } from '@/engine/externalTools'
+import { describeToolExit, toolFor } from '@/engine/externalTools'
 import { currentDiff } from '@/engine/currentDiff'
 import {
   runBranchDeletion,
@@ -846,6 +847,11 @@ export function RepoTab({
   // 提交详情的 diff 按哪个 scope 读的，与 `useRepoEffects` 的算法相同；外部 diff 据此定两侧
   const commitScope = selectionDiffScope(state.commits, state.selectedId)
   const externalTools = useExternalTools()
+  // 跟进报告的「对比」在报告框渲染时读最新的（见 `compareDrift`）
+  const toolsConfigRef = useRef(externalTools.config)
+  toolsConfigRef.current = externalTools.config
+  const statePathRef = useRef(state.path)
+  statePathRef.current = state.path
   useEffect(() => {
     if (externalTools.error) reportError(externalTools.error)
   }, [externalTools.error, reportError])
@@ -1023,7 +1029,31 @@ export function RepoTab({
         }
         return outcome
       },
+      compare: compareDrift(report),
     })
+  /**
+   * 报告里「对不上」的文件的「对比」：SVN 版本（新基线）在左、分支版本在右。这个文件没有可用的对比工具
+   * 就没有按钮。
+   *
+   * 工具配置与仓库路径都按报告框渲染时的最新值读（ref），不按点「跟进」那一刻的：那一刻配置可能正好
+   * 重读失败是 null，报告里就一个按钮都没有（独立 review 建议 3）。路径与工具退出的监听用同一个
+   * `state.path`，退出后的刷新与报错才对得上（nit 5）。
+   */
+  const compareDrift = (report: FollowReport) => {
+    const range = report.driftRange
+    if (!range) return undefined
+    return (file: string) => {
+      const cfg = toolsConfigRef.current
+      const path = statePathRef.current
+      if (!cfg || !path) return null
+      const tool = toolFor(cfg, file, 'diff')
+      if (!tool) return null
+      return {
+        label: tool.label,
+        open: () => openExternalDiff(path, tool.id, driftDiffTarget(range, file)),
+      }
+    }
+  }
   const handleRestorePending = async () => {
     setRestoreBusy(true)
     try {
