@@ -103,9 +103,20 @@ describe('conflictView', () => {
   it('③ 一边删一边改：保留 / 删除', () => {
     const du = conflictView(info({ case: 'deleteModify', code: 'DU', ours: null }), bc)
     expect(du.actions).toEqual(['keep', 'delete'])
-    expect(du.heading).toBe('HEAD 这边删除了这个文件，另一边修改了它')
+    expect(du.heading).toBe('HEAD 这边没有这个文件，另一边修改了它')
     const ud = conflictView(info({ case: 'deleteModify', code: 'UD', theirs: null }), bc)
-    expect(ud.heading).toBe('HEAD 这边修改了这个文件，另一边删除了它')
+    expect(ud.heading).toBe('HEAD 这边修改了这个文件，另一边没有它')
+  })
+
+  it('③ 不把「没有它」说成「删除了它」：git 会把别处的改名认成这里被删除', () => {
+    // 2026-11-19 使用报告问题 4：SVN 挪走的文件被报成「另一边删除了它」，用户读成 SVN 删了文件。
+    // 冲突索引里只有这个路径的几个阶段，分不出删除与改名，只能如实说「没有」并提醒先确认
+    for (const code of ['DU', 'UD']) {
+      const v = conflictView(info({ case: 'deleteModify', code }), bc)
+      expect(v.heading).not.toContain('删除了')
+      expect(v.body).toContain('改名')
+      expect(v.body).toContain('删除前')
+    }
   })
 
   it('⑤ 结构冲突：没有任何操作', () => {

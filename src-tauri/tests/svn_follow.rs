@@ -2982,6 +2982,177 @@ fn manual_follow_abort_at_stash_conflict_releases_like_sync_in() {
     assert_no_residue(&fx);
 }
 
+// —— 放回时的假冲突（2026-11-19 使用报告问题 4、5）——
+//
+// 分支落后时，跟进前的磁盘已经是 SVN 的新内容，stash 却以旧 HEAD 为基准，于是放回时 SVN 的
+// 改动被再合一次。本地提交没碰过的文件，正确结果就是跟进前的磁盘。
+
+/// B 在基线里有 8 行。之后同事改了第 5 行，svn update 把它带到磁盘上，你又在同一行上接着改；
+/// A 照 W10-R2 造一处重放冲突，对象层才会交给手动跟进。停在 rebase 冲突、已解成 `a_resolved`。
+fn edit_on_top_of_svn_scene(fx: &SvnFixture, a_resolved: &str) {
+    edit_on_top_of_svn_scene_with(fx, a_resolved, |_| {});
+}
+/// 同上；`extra` 在本地提交之后、跟进之前运行，用来再加一份未提交改动。
+fn edit_on_top_of_svn_scene_with(
+    fx: &SvnFixture,
+    a_resolved: &str,
+    extra: impl FnOnce(&SvnFixture),
+) {
+    write(fx, B, "1\n2\n3\n4\n5\n6\n7\n8\n");
+    tortoise_commit(fx, B);
+    done(follow(&fx.wc_str(), "seed").unwrap());
+    write(fx, A, "a-git\n");
+    commit_all(fx, "git 里的版本");
+    colleague(fx, B, "1\n2\n3\n4\n5-colleague\n6\n7\n8\n");
+    svn_update(fx, B);
+    write(fx, B, "1\n2\n3\n4\n5-colleague-mine\n6\n7\n8\n");
+    write(fx, A, "a-svn\n");
+    tortoise_commit(fx, A);
+    extra(fx);
+    assert!(matches!(run(fx), FollowOutcome::NeedsManual { .. }));
+    expect_rebase_conflict(fx);
+    resolve_a(fx, a_resolved);
+}
+
+#[test]
+fn manual_follow_puts_back_the_disk_for_a_file_no_local_commit_touched() {
+    // 问题 5（SkillDetailInfoBaseUI.lua）：基准是旧 HEAD 的「5」，一边是 SVN 的「5-colleague」，
+    // 一边是磁盘上的「5-colleague-mine」——同一行两种改法。可磁盘上那份本来就含着 SVN 的改动
+    let fx = hybrid_with_colleague();
+    edit_on_top_of_svn_scene(&fx, "a-svn\n");
+
+    let o = resume(&fx);
+    assert!(matches!(o, SyncInOutcome::Done { .. }), "{o:?}");
+    assert_eq!(read(&fx, B), "1\n2\n3\n4\n5-colleague-mine\n6\n7\n8\n");
+    assert_eq!(
+        porcelain(&fx),
+        " M Code/B.cs\n",
+        "与跟进前一样：未暂存的修改"
+    );
+    assert_eq!(git(&fx, &["ls-files", "-u"]), "");
+    assert_eq!(
+        stash_list(&fx),
+        "",
+        "磁盘与跟进前一致，核对通过，备份照常删"
+    );
+    assert_no_residue(&fx);
+}
+
+#[test]
+fn manual_follow_leaves_only_files_a_local_commit_touched_in_conflict() {
+    // 问题 3 与问题 5 同时出现：A 被本地提交改过、又在 rebase 时解成了第三种内容，放回时该由人判断；
+    // B 没被本地提交碰过，按跟进前的磁盘放回，不再列进冲突
+    let fx = hybrid_with_colleague();
+    edit_on_top_of_svn_scene(&fx, "a-merged\n");
+
+    match resume(&fx) {
+        SyncInOutcome::StashConflict { files, .. } => assert_eq!(files, vec![A.to_string()]),
+        other => panic!("应当只有 A 冲突：{other:?}"),
+    }
+    assert_eq!(read(&fx, B), "1\n2\n3\n4\n5-colleague-mine\n6\n7\n8\n");
+    assert_eq!(
+        git(&fx, &["ls-files", "-u", "--", B]),
+        "",
+        "B 已经不在冲突里"
+    );
+    assert!(stash_list(&fx).contains("mygitclient-sync:mf1"), "备份留着");
+}
+
+#[test]
+fn manual_follow_keeps_a_file_deleted_before_the_follow_deleted() {
+    // 你在资源管理器里删了 B，同事同时改了 B：stash 记的是「删除」，新 HEAD 是同事的版本，
+    // 放回时报 modify/delete。跟进前磁盘上就没有它，结果也该没有
+    let fx = hybrid_with_colleague();
+    write(&fx, A, "a-git\n");
+    commit_all(&fx, "git 里的版本");
+    colleague(&fx, B, "b-colleague\n");
+    svn_update(&fx, B);
+    std::fs::remove_file(fx.wc().join(B)).unwrap();
+    write(&fx, A, "a-svn\n");
+    tortoise_commit(&fx, A);
+    assert!(matches!(run(&fx), FollowOutcome::NeedsManual { .. }));
+    expect_rebase_conflict(&fx);
+    resolve_a(&fx, "a-svn\n");
+
+    let o = resume(&fx);
+    assert!(matches!(o, SyncInOutcome::Done { .. }), "{o:?}");
+    assert!(!fx.wc().join(B).exists(), "跟进前就删掉了");
+    assert_eq!(
+        porcelain(&fx),
+        " D Code/B.cs\n",
+        "与跟进前一样：未暂存的删除"
+    );
+    assert_eq!(show(&fx, &format!("HEAD:{B}")), "b-colleague");
+    assert_no_residue(&fx);
+}
+
+#[test]
+fn manual_follow_keeps_the_backup_when_a_settled_conflict_meets_a_stage() {
+    // 跟进前暂存过东西：冲突照样按跟进前的磁盘解决，但暂存区没法原样放回，备份必须留着
+    let fx = hybrid_with_colleague();
+    edit_on_top_of_svn_scene_with(&fx, "a-svn\n", |fx| {
+        write(fx, "Code/N.cs", "staged-new\n");
+        git(fx, &["add", "--", "Code/N.cs"]);
+    });
+
+    let (_, stash, _) = stage_lost(resume(&fx));
+    assert_eq!(read(&fx, B), "1\n2\n3\n4\n5-colleague-mine\n6\n7\n8\n");
+    assert_eq!(read(&fx, "Code/N.cs"), "staged-new\n");
+    let st = porcelain(&fx);
+    assert!(st.contains("A  Code/N.cs"), "新文件还是已添加：{st}");
+    assert!(st.contains(" M Code/B.cs"), "{st}");
+    assert_eq!(git(&fx, &["ls-files", "-u"]), "");
+    let stash = stash.expect("备份留着");
+    assert!(stash_list(&fx).contains("mygitclient-sync:mf1"), "备份留着");
+    assert_eq!(show(&fx, &format!("{stash}^2:Code/N.cs")), "staged-new");
+    assert_no_residue(&fx);
+}
+
+#[test]
+fn manual_follow_does_not_report_a_svn_move_as_rename_delete() {
+    // 问题 4（map_resource.lua）：同事把文件挪了目录、顺手改了一行。svn update 之后 git 看到的是
+    // 「旧路径已删除 + 新路径未跟踪」，stash 把两者分开收；放回时只有已跟踪部分参与三方合并，
+    // 新 HEAD 那边被认成改名，于是报 rename/delete。两边的最终状态其实一致
+    let fx = hybrid_with_colleague();
+    let body: String = (1..=20).map(|i| format!("line {i}\n")).collect();
+    colleague(&fx, "Code/Old.cs", &body);
+    svn_update(&fx, "Code");
+    done(run(&fx));
+    let wc2 = fx.wc2();
+    svn_cmd(&wc2, &["update", "--non-interactive"]);
+    svn_cmd(&wc2, &["mkdir", "Code/Sub", "--non-interactive"]);
+    svn_cmd(
+        &wc2,
+        &["mv", "Code/Old.cs", "Code/Sub/Old.cs", "--non-interactive"],
+    );
+    let moved = body.replace("line 7\n", "line 7 moved\n");
+    std::fs::write(wc2.join("Code/Sub/Old.cs"), &moved).unwrap();
+    svn_cmd(&wc2, &["commit", "-m", "move", "--non-interactive"]);
+    set_author(&fx, youngest(&fx), "colleague");
+    write(&fx, A, "a-git\n");
+    git(&fx, &["add", "--", A]);
+    git(&fx, &["commit", "-qm", "git 里的版本"]);
+    write(&fx, A, "a-svn\n");
+    tortoise_commit(&fx, A);
+    svn_update(&fx, "Code");
+    assert!(
+        !fx.wc().join("Code/Old.cs").exists(),
+        "前提：SVN 已挪走旧路径"
+    );
+    assert_eq!(read(&fx, "Code/Sub/Old.cs"), moved, "前提：新路径在磁盘上");
+    let o = run(&fx);
+    assert!(matches!(o, FollowOutcome::NeedsManual { .. }), "{o:?}");
+    expect_rebase_conflict(&fx);
+    resolve_a(&fx, "a-svn\n");
+
+    let o = resume(&fx);
+    assert!(matches!(o, SyncInOutcome::Done { .. }), "{o:?}");
+    assert_eq!(read(&fx, "Code/Sub/Old.cs"), moved);
+    assert!(!fx.wc().join("Code/Old.cs").exists());
+    assert_eq!(porcelain(&fx), "");
+    assert_no_residue(&fx);
+}
+
 #[test]
 fn manual_follow_stash_blocked_exit_resumes_after_the_file_moves() {
     let fx = hybrid_with_colleague();
