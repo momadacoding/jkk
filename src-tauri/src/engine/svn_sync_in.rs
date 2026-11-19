@@ -846,9 +846,25 @@ pub(crate) fn restore_step_with(
         match outcome {
             RestoreOutcome::Applied => {}
             RestoreOutcome::Conflicted { files } => {
+                // 先落盘：下面的自动解决写了磁盘，崩在中途重开时不能再 apply 一次（计划 A2）
                 j.stash_applied = true;
                 svn_journal::write(repo, j)?;
-                return Ok(RestoreStep::Conflict { files, oid });
+                // 手动跟进时，新 HEAD 与新基线相同的冲突文件按跟进前的磁盘解决（使用报告问题 4、5）。
+                // 更新流程不用：它的 stash 是在 svn update 之前压的，基准就是对的。
+                // 回滚不用：回滚没有收尾核对，checkout 静默没写进去（被占用的文件）时没人发现，
+                // 而后面紧跟着 drop（独立 review 第 3 条）
+                let files = if j.flow == Flow::FollowManual && !j.rolling_back {
+                    let new_base = need(&j.new_baseline_oid, "newBaselineOid")?;
+                    wip::settle_untouched_conflicts(repo, &oid, &new_base, &files)?
+                } else {
+                    files
+                };
+                if !files.is_empty() {
+                    return Ok(RestoreStep::Conflict { files, oid });
+                }
+                // 全部解决：与干净放回同路（核对、drop）。暂存只在跟进前真有暂存时才算没保住
+                wip::unstage_applied(repo)?;
+                j.stage_lost = wip::had_staged(repo, &oid)?;
             }
             RestoreOutcome::Blocked { collisions } => {
                 return Ok(RestoreStep::Blocked { collisions, oid })

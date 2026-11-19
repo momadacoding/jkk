@@ -6,7 +6,7 @@
 //! 写进 message，事后按 opid 在 reflog 里找；找到之后立刻钉一个
 //! `refs/mygitclient/sync/<opid>`，此后一律按不可变 OID 操作。
 
-use crate::engine::git_cli::{run_git, run_git_code};
+use crate::engine::git_cli::{run_git, run_git_code, run_git_env, run_git_stdin_env};
 use crate::engine::svn_include_check::normalize_roots;
 use crate::engine::svn_journal::{self, Journal, Phase};
 use crate::engine::svn_sync_check::unmerged_paths;
@@ -166,6 +166,195 @@ fn restore(repo: &str, oid: &str, keep_index: bool) -> Result<(RestoreOutcome, b
             apply_plain(repo, oid).map(|o| (o, false))
         }
     })
+}
+
+/// 路径按字面解释：下面几处 `-- <path>` 的路径来自 git 自己的输出，文件名里的 `*`、`?`
+/// 不能被当成通配符，一条命令改到别的文件上。
+const LITERAL: [(&str, &str); 1] = [("GIT_LITERAL_PATHSPECS", "1")];
+
+/// 手动跟进放回改动冲突之后（2026-11-19 使用报告问题 4、5）：新 HEAD 与新基线里**相同**的冲突文件，
+/// 按跟进前的磁盘解决。返回仍要用户处理的冲突文件。
+///
+/// # 为什么会冲突
+///
+/// 分支落后基线时，跟进前的磁盘已经是 SVN 的新内容，git 却把这部分 SVN 改动也算成未提交改动收进了
+/// stash。`stash apply` 以旧 HEAD 为基准，等于把 SVN 的改动再合一次：本地改动挨着 SVN 的改动
+/// （问题 5），或 SVN 移动了文件、新 HEAD 那边被认成改名而 stash 那边只是「旧路径删除」（问题 4，
+/// 新路径收在未跟踪部分、不参与三方合并），就报冲突。
+///
+/// # 为什么取跟进前的磁盘是对的
+///
+/// 新 HEAD 与新基线里这个文件相同，说明重放后的分支没给它带来任何东西；跟进只是让 git 的历史追上
+/// 磁盘，磁盘内容应当不变（[`crate::engine::svn_follow_audit`] 的收尾核对按同一口径判对错）。结果
+/// 就是用户点「跟进」之前的内容（与任何一次 stash apply 一样经过换行 / 过滤器），什么都不丢；stash
+/// 备份由调用方照常处理。也包括本地提交改过、但用户在 rebase 冲突里解成了 SVN 版本的文件：放回的
+/// 磁盘内容里带着那笔提交的改动，变成未提交改动，同样不丢东西（独立 review 第 5 条）。
+///
+/// 新 HEAD 与新基线不同的文件（问题 3）不碰：用户在 rebase 冲突里亲手解出的内容可以有意与跟进前
+/// 不同。认不准跟进前样子的也不碰，留给用户：符号链接、子模块、只差大小写的路径（Windows 上
+/// 改名检测会把冲突记在另一种大小写上），以及任何一步出错的文件。
+///
+/// 解决后索引里这个文件等于新 HEAD（未暂存），与跟进前「改动都没暂存」时的样子一致。
+pub fn settle_untouched_conflicts(
+    repo: &str,
+    oid: &str,
+    new_base: &str,
+    files: &[String],
+) -> Result<Vec<String>> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parents = stash_parents(repo, oid)?;
+    let orig = parents[0].as_str();
+    let untracked = parents.get(2).map(String::as_str);
+    // 新 HEAD 与新基线不同的全部路径。`--no-renames`：改名两头都要算「不同」
+    let replayed: BTreeSet<String> = run_git(
+        repo,
+        &[
+            "diff-tree",
+            "-r",
+            "-z",
+            "--no-renames",
+            "--name-only",
+            new_base,
+            "HEAD",
+        ],
+    )?
+    .split('\0')
+    .filter(|p| !p.is_empty())
+    .map(str::to_string)
+    .collect();
+    let mut left = Vec::new();
+    for p in files {
+        if replayed.contains(p) {
+            left.push(p.clone());
+            continue;
+        }
+        // 一个文件出错不拖住别的：留在冲突里交给用户，比整步报错、已解决的几个也看不见要好
+        // （独立 review 第 2 条）
+        match settle_one(repo, oid, orig, untracked, p) {
+            Ok(true) => {}
+            Ok(false) => left.push(p.clone()),
+            Err(e) => {
+                log::warn!(
+                    "放回冲突自动解决 {p} 失败，留给用户：{} {}",
+                    e.code,
+                    e.message
+                );
+                left.push(p.clone());
+            }
+        }
+    }
+    Ok(left)
+}
+
+/// 把 `p` 恢复成跟进前磁盘上的样子；认不准那个样子时返回 `false`，什么都不动。
+fn settle_one(repo: &str, oid: &str, orig: &str, untracked: Option<&str>, p: &str) -> Result<bool> {
+    // 跟进前磁盘上的样子：已跟踪部分（含改动），否则未跟踪部分
+    let source = match regular_entry(repo, oid, p)? {
+        Entry::Regular => Some(oid),
+        Entry::Other => return Ok(false),
+        Entry::Missing => match untracked {
+            Some(u) => match regular_entry(repo, u, p)? {
+                Entry::Regular => Some(u),
+                Entry::Other => return Ok(false),
+                Entry::Missing => None,
+            },
+            None => None,
+        },
+    };
+    match source {
+        Some(src) => {
+            // checkout 写磁盘与索引（同时清掉冲突的几个阶段），reset 把索引退回新 HEAD
+            run_git_env(repo, &["checkout", src, "--", p], &LITERAL)?;
+            run_git_env(repo, &["reset", "-q", "--", p], &LITERAL)?;
+            Ok(true)
+        }
+        // 两处都没有，只有 stash 明确记下了「删除」才算跟进前已经不在了：旧 HEAD 里有、stash 里没有。
+        // 否则可能是路径对不上（大小写），删下去就是删掉用户的文件（独立 review 第 1 条）
+        None if matches!(regular_entry(repo, orig, p)?, Entry::Regular) => {
+            settle_as_absent(repo, p)
+        }
+        None => Ok(false),
+    }
+}
+
+/// 跟进前磁盘上没有这个文件：从磁盘拿掉，索引退回新 HEAD（新 HEAD 里有它时显示为未暂存的删除）。
+/// 磁盘上是目录之类的东西时不动，返回 `false`。
+fn settle_as_absent(repo: &str, p: &str) -> Result<bool> {
+    let full = Path::new(repo).join(p);
+    match full.symlink_metadata() {
+        Ok(m) if m.is_dir() => return Ok(false),
+        Ok(_) => std::fs::remove_file(&full)?,
+        Err(_) => {}
+    }
+    run_git_env(repo, &["reset", "-q", "--", p], &LITERAL)?;
+    Ok(true)
+}
+
+enum Entry {
+    Regular,
+    Other,
+    Missing,
+}
+
+/// `tree` 里 `p` 是普通文件（100644 / 100755）、别的东西、还是不存在。
+fn regular_entry(repo: &str, tree: &str, p: &str) -> Result<Entry> {
+    let out = run_git_env(repo, &["ls-tree", "-z", tree, "--", p], &LITERAL)?;
+    // 形如 `<mode> <type> <oid>\t<path>\0`；路径要逐字相等，`p` 是目录前缀时 ls-tree 也会列出东西
+    let hit = out
+        .split('\0')
+        .filter_map(|l| l.split_once('\t'))
+        .find(|(_, path)| *path == p);
+    Ok(match hit {
+        None => Entry::Missing,
+        Some((meta, _)) if meta.starts_with("100644 blob") || meta.starts_with("100755 blob") => {
+            Entry::Regular
+        }
+        Some(_) => Entry::Other,
+    })
+}
+
+/// stash 里有没有暂存过的改动：暂存的那一份（第二个父提交）与旧 HEAD（第一个父提交）的树不同。
+pub fn had_staged(repo: &str, oid: &str) -> Result<bool> {
+    let parents = stash_parents(repo, oid)?;
+    let tree = |c: &str| run_git(repo, &["rev-parse", &format!("{c}^{{tree}}")]);
+    Ok(tree(&parents[0])?.trim() != tree(&parents[1])?.trim())
+}
+
+/// 冲突都按跟进前的磁盘解决之后，把 apply 留在索引里的暂存退回新 HEAD。
+///
+/// 有冲突的 `stash apply` 不做干净放回时的「取消暂存」，合得上的文件全都停在暂存区里。跟进前
+/// 没有暂存时（调用方用 [`had_staged`] 判断），索引就是新 HEAD，退回去正是跟进前的样子。
+///
+/// 新增的文件留在暂存区：干净放回时 git 也这样做（不然它们会变回未跟踪文件）。
+pub fn unstage_applied(repo: &str) -> Result<()> {
+    let staged = run_git(
+        repo,
+        &[
+            "diff",
+            "--cached",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            "--diff-filter=a",
+        ],
+    )?;
+    if staged.split('\0').all(str::is_empty) {
+        return Ok(()); // 空 pathspec 是「全部」（§12.2），什么都没有就不调用
+    }
+    run_git_stdin_env(
+        repo,
+        &[
+            "reset",
+            "-q",
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+        ],
+        staged.as_bytes(),
+        &LITERAL,
+    )?;
+    Ok(())
 }
 
 /// stash 的未跟踪树（第三个父提交）里，磁盘上已经被占住的路径，分成两类。

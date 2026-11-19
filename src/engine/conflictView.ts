@@ -72,10 +72,13 @@ function baseView(info: ConflictInfo): ConflictViewModel {
     case 'deleteModify':
       return {
         ...none,
+        // 不说「删除了它」：git 会把别处的改名认成这里被删除，冲突索引里分不出两者（2026-11-19
+        // 使用报告问题 4，SVN 挪走的文件被读成「SVN 删了它」）
         heading: info.code === 'DU'
-          ? 'HEAD 这边删除了这个文件，另一边修改了它'
-          : 'HEAD 这边修改了这个文件，另一边删除了它',
-        body: '选择保留修改后的文件，或删除它。选择后立即暂存。',
+          ? 'HEAD 这边没有这个文件，另一边修改了它'
+          : 'HEAD 这边修改了这个文件，另一边没有它',
+        body: '「没有它」可能是删除了，也可能是改名到了别的路径。删除前先确认这个文件还要不要。'
+          + '选择保留修改后的文件，或删除它。选择后立即暂存。',
         actions: ['keep', 'delete'],
       }
     case 'markers':
