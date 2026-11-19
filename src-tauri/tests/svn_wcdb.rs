@@ -13,7 +13,7 @@ use app_lib::engine::svn_cli::run_svn;
 use app_lib::engine::svn_tombstone::fault::{self, Point};
 use app_lib::engine::svn_wc::{enumerate_wcs, peg_safe, WcIdentity};
 use app_lib::engine::svn_wcdb;
-use app_lib::engine::svn_xml::parse_excluded_nodes;
+use app_lib::engine::svn_xml::{parse_changelist_status, parse_excluded_nodes};
 use std::collections::BTreeMap;
 use std::path::Path;
 use svn_fixtures::{
@@ -421,4 +421,137 @@ fn reading_leaves_wc_db_untouched() {
     by_wcdb(&fx, &u);
     assert!(before.iter().any(|(n, _)| n == "wc.db"));
     assert!(snapshot() == before, "wc.db* 被改过");
+}
+
+// —— changelist（`svn_wcdb::changelists`，计划 2026-11-20-svn-changelist-keep T1）——
+//
+// 同样只断言「与 svn 自己给的相同」：svn 那一侧是 `svn status --xml -- <白名单>`，它会列出挂了
+// changelist 的全部文件（没修改的也列，开工前实测），挑出 `<changelist>` 块里的 entry。
+
+fn cl_by_svn(fx: &SvnFixture, whitelist: &[&str]) -> BTreeMap<String, String> {
+    let mut args = vec!["status", "--xml", "--"];
+    let targets: Vec<String> = whitelist
+        .iter()
+        .map(|w| peg_safe(w.trim_end_matches('/')))
+        .collect();
+    args.extend(targets.iter().map(String::as_str));
+    let xml = run_svn(&fx.wc_str(), &args).unwrap();
+    parse_changelist_status(&xml)
+        .unwrap()
+        .into_iter()
+        .filter_map(|s| s.changelist.map(|c| (s.path, c)))
+        .collect()
+}
+
+fn cl_same(fx: &SvnFixture, whitelist: &[&str]) -> BTreeMap<String, String> {
+    let wl: Vec<String> = whitelist.iter().map(|s| s.to_string()).collect();
+    let svn = cl_by_svn(fx, whitelist);
+    let db =
+        svn_wcdb::changelists(&fx.wc_str(), &wl).unwrap_or_else(|e| panic!("wc.db 读不了：{e}"));
+    assert_eq!(db, svn, "wc.db 的 changelist 与 svn status 不同");
+    svn
+}
+
+fn cl(dir: &Path, name: &str, file: &str) {
+    svn_cmd(dir, &["changelist", name, "--non-interactive", "--", file]);
+}
+
+#[test]
+fn changelists_none() {
+    let fx = svn_repo_for_health();
+    assert!(cl_same(&fx, &["Code/"]).is_empty());
+}
+
+#[test]
+fn changelists_modified_and_unmodified_members() {
+    let fx = svn_repo_for_health();
+    let wc = fx.wc();
+    std::fs::write(wc.join("Code/A.cs"), "v2\n").unwrap();
+    cl(&wc, "speed", "Code/A.cs");
+    // 没修改也能挂 changelist，svn status 照样列出它
+    cl(&wc, "logs", "Code/Deep/D.cs");
+    // 白名单外的不报
+    cl(&wc, "art", "Art/boss.fbx");
+    assert_eq!(
+        keys(&cl_same(&fx, &["Code/"])),
+        vec![("Code/A.cs", "speed"), ("Code/Deep/D.cs", "logs")]
+    );
+}
+
+#[test]
+fn changelists_below_the_working_copy_root_and_two_entries() {
+    let fx = svn_repo_for_health();
+    let wc = fx.wc();
+    cl(&wc, "a", "Code/A.cs");
+    cl(&wc, "d", "Code/Deep/D.cs");
+    cl(&wc, "art", "Art/boss.fbx");
+    assert_eq!(
+        keys(&cl_same(&fx, &["Code/Deep/", "Art/"])),
+        vec![("Art/boss.fbx", "art"), ("Code/Deep/D.cs", "d")]
+    );
+}
+
+#[test]
+fn changelists_a_single_file_whitelist_entry() {
+    let fx = svn_repo_for_health();
+    let wc = fx.wc();
+    cl(&wc, "a", "Code/A.cs");
+    cl(&wc, "d", "Code/Deep/D.cs");
+    assert_eq!(
+        keys(&cl_same(&fx, &["Code/A.cs"])),
+        vec![("Code/A.cs", "a")]
+    );
+}
+
+#[test]
+fn changelists_a_sibling_whose_name_extends_the_whitelist_entry() {
+    let fx = svn_repo_for_health();
+    let wc = fx.wc();
+    std::fs::create_dir_all(wc.join("Code2")).unwrap();
+    std::fs::write(wc.join("Code2/X.cs"), "x\n").unwrap();
+    svn_cmd(&wc, &["add", "Code2", "--non-interactive"]);
+    svn_cmd(&wc, &["commit", "-m", "r2", "--non-interactive"]);
+    cl(&wc, "x", "Code2/X.cs");
+    assert!(cl_same(&fx, &["Code/"]).is_empty());
+}
+
+#[test]
+fn changelists_in_a_non_ascii_directory() {
+    let fx = svn_repo_for_health();
+    let wc = fx.wc();
+    let dir = wc.join("Code/中文目录");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.cs"), "x\n").unwrap();
+    svn_cmd(&wc, &["add", "--force", "--non-interactive", "--", "Code@"]);
+    svn_cmd(&wc, &["commit", "-m", "r2", "--non-interactive"]);
+    // svn.exe 收不了中文参数（开发机代码页），以那个目录为 cwd 挂上
+    cl(&dir, "cn", "a.cs");
+    assert_eq!(
+        keys(&cl_same(&fx, &["Code/"])),
+        vec![("Code/中文目录/a.cs", "cn")]
+    );
+}
+
+#[test]
+fn changelists_inside_a_nested_external() {
+    // external 是另一个工作副本，changelist 记在它自己的 wc.db 里
+    let fx = svn_repo_with_same_repo_nested_external(NestedExternal::Clean);
+    let wc = fx.wc();
+    cl(&wc, "a", "Code/A.cs");
+    cl(&wc.join("Code/Vendor"), "v", "V.cs");
+    assert_eq!(
+        keys(&cl_same(&fx, &["Code/"])),
+        vec![("Code/A.cs", "a"), ("Code/Vendor/V.cs", "v")]
+    );
+}
+
+#[test]
+fn changelists_refused_while_an_operation_is_unfinished() {
+    let fx = svn_repo_for_health();
+    let db = rusqlite::Connection::open(wc_db(&fx)).unwrap();
+    db.execute("INSERT INTO work_queue (work) VALUES (x'00')", [])
+        .unwrap();
+    drop(db);
+    let err = svn_wcdb::changelists(&fx.wc_str(), &["Code/".to_string()]).unwrap_err();
+    assert!(err.contains("WORK_QUEUE"), "{err}");
 }

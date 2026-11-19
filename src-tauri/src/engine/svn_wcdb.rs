@@ -518,6 +518,154 @@ fn query_shape(
     }))
 }
 
+/// external 最多跟几层。真实工程一两层；有环的定义（external 指回祖先）在磁盘上也展不开，这里只是
+/// 不让一份坏掉的 wc.db 把递归带进死循环。
+const MAX_EXTERNAL_DEPTH: usize = 16;
+
+/// 白名单（含其中的目录 external）底下挂了 changelist 的文件：仓库相对路径（正斜杠）→ 列表名。
+///
+/// 与 `svn status --xml -- <白名单>` 里 `<changelist>` 块的 entry 相同（`tests/svn_wcdb.rs` 的
+/// `changelists_*` 逐场景比对）。用途见 `svn_changelist`：更新、手动跟进、交付动磁盘之前记一份。
+///
+/// # 为什么不用 `svn_wc::enumerate_wcs` 找单元
+///
+/// 那要起 `svn info`，还要遍历一遍白名单找 external，而这次记录落在每次更新 / 交付的路上。这里从
+/// 白名单条目往上找 `.svn/wc.db` 定位工作副本根，external 从 wc.db 的 `EXTERNALS` 表里读，全程
+/// 不起进程。文件 external 的 changelist 记在所在工作副本的 `ACTUAL_NODE` 里，不用单独跟。
+///
+/// 认不出来时（模块头那几条，外加某条白名单不在任何工作副本里）返回 `Err`，调用方改用 svn。
+pub fn changelists(
+    repo_root: &str,
+    whitelist: &[String],
+) -> std::result::Result<BTreeMap<String, String>, String> {
+    if fault::hit(Point::WcdbRefused).is_err() {
+        return Err("测试注入：认不出这个工作副本".to_string());
+    }
+    let mut out = BTreeMap::new();
+    for w in whitelist {
+        let unit = norm(w);
+        if unit.is_empty() {
+            continue;
+        }
+        let unit_abs = format!("{}/{unit}", norm(repo_root));
+        let wc_root =
+            find_wc_root(&unit_abs).ok_or_else(|| format!("`{unit}` 不在任何 svn 工作副本里"))?;
+        let sub = within(&unit_abs, &wc_root).unwrap_or_default();
+        changelists_in(&wc_root, &unit, &sub, 0, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// 从 `abs` 往上第一个有 `.svn/wc.db` 的目录（svn 1.7 起只有工作副本根有 `.svn`；目录 external
+/// 是独立的工作副本，有它自己的）。`abs` 是文件或不存在时也照样往上找。
+///
+/// 工作副本根可以在仓库根之上（`.git` 放在工作副本的子目录里），所以不在仓库根处停。
+fn find_wc_root(abs: &str) -> Option<String> {
+    let mut p = abs;
+    loop {
+        if Path::new(&format!("{p}/.svn/wc.db")).is_file() {
+            return Some(p.to_string());
+        }
+        p = parent_dir(p)?;
+    }
+}
+
+/// 正斜杠路径的上一级；到盘符根（`C:`）或 UNC 共享根（`//server/share`）为止，再往上是 `None`。
+///
+/// 不能一路截到空串：那会去查 `/.svn/wc.db`，也就是**当前盘**的根，与这个仓库毫无关系（独立
+/// review 第 5 条）。
+fn parent_dir(p: &str) -> Option<&str> {
+    let parent = &p[..p.rfind('/')?];
+    let unc_host = parent
+        .strip_prefix("//")
+        .is_some_and(|rest| !rest.contains('/'));
+    if parent.is_empty() || unc_host {
+        return None;
+    }
+    Some(parent)
+}
+
+fn changelists_in(
+    wc_root: &str,
+    unit: &str,
+    sub: &str,
+    depth: usize,
+    out: &mut BTreeMap<String, String>,
+) -> std::result::Result<(), String> {
+    if depth > MAX_EXTERNAL_DEPTH {
+        return Err(format!(
+            "external 嵌套超过 {MAX_EXTERNAL_DEPTH} 层：`{unit}`"
+        ));
+    }
+    let db = open(&Path::new(wc_root).join(".svn").join("wc.db"))?;
+    let (rows, externals) =
+        query_changelists(&db, sub).map_err(|e| format!("查询 wc.db 失败：{e}"))??;
+    for (relpath, name) in rows {
+        out.insert(repo_relative(unit, sub, &relpath), name);
+    }
+    for ext in externals {
+        let ext_abs = format!("{wc_root}/{ext}");
+        // 没检出的 external、文件 external 都没有自己的 wc.db：前者没有可丢的 changelist，后者的
+        // changelist 已经在上面的 ACTUAL_NODE 里
+        if !Path::new(&ext_abs).join(".svn").join("wc.db").is_file() {
+            continue;
+        }
+        changelists_in(
+            &ext_abs,
+            &repo_relative(unit, sub, &ext),
+            "",
+            depth + 1,
+            out,
+        )?;
+    }
+    Ok(())
+}
+
+/// 挂了 changelist 的 `(relpath, 列表名)`，以及子树里 external 的 relpath。外层 `Err` 是 SQLite
+/// 报的错，内层 `Err` 是「认不出来」。
+type ChangelistRows = std::result::Result<(Vec<(String, String)>, Vec<String>), String>;
+
+fn query_changelists(db: &Connection, sub: &str) -> rusqlite::Result<ChangelistRows> {
+    let tx = db.unchecked_transaction()?;
+    let format: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if format != FORMAT {
+        return Ok(Err(format!("工作副本格式是 {format}，只认 {FORMAT}")));
+    }
+    let pending: Option<i64> = tx
+        .query_row("SELECT 1 FROM work_queue LIMIT 1", [], |r| r.get(0))
+        .optional()?;
+    if pending.is_some() {
+        return Ok(Err("有没做完的操作（WORK_QUEUE 非空）".to_string()));
+    }
+    let ids: Vec<i64> = tx
+        .prepare("SELECT id FROM wcroot WHERE local_abspath IS NULL")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let [wc_id] = ids[..] else {
+        return Ok(Err(format!("WCROOT 里有 {} 个根", ids.len())));
+    };
+    // 子树的写法与 `query` 相同：区间比较，不用 LIKE
+    const SUBTREE: &str = "(?2 = '' OR local_relpath = ?2 \
+                           OR (local_relpath >= ?2 || '/' AND local_relpath < ?2 || '0'))";
+    let rows: Vec<(String, String)> = tx
+        .prepare(&format!(
+            "SELECT local_relpath, changelist FROM actual_node \
+             WHERE wc_id = ?1 AND changelist IS NOT NULL AND {SUBTREE} ORDER BY local_relpath"
+        ))?
+        .query_map(rusqlite::params![wc_id, sub], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let externals: Vec<String> = tx
+        .prepare(&format!(
+            "SELECT local_relpath FROM externals WHERE wc_id = ?1 AND {SUBTREE} \
+             ORDER BY local_relpath"
+        ))?
+        .query_map(rusqlite::params![wc_id, sub], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(Ok((rows, externals)))
+}
+
 /// wc.db 里的 `relpath`（相对工作副本根）换成仓库相对：单元那一段用调用方给的写法（svn info
 /// 的 entry path 也是照抄 target），往下的部分用 wc.db 的。
 fn repo_relative(unit: &str, sub: &str, relpath: &str) -> String {
@@ -577,6 +725,22 @@ mod tests {
         if cfg!(windows) {
             assert_eq!(within("c:/W/Code", "C:/w").as_deref(), Some("Code"));
         }
+    }
+
+    #[test]
+    fn parent_dir_stops_at_the_drive_or_share_root() {
+        assert_eq!(parent_dir("C:/w/Code"), Some("C:/w"));
+        assert_eq!(parent_dir("C:/w"), Some("C:"));
+        assert_eq!(parent_dir("C:"), None);
+        assert_eq!(parent_dir("//server/share/repo"), Some("//server/share"));
+        assert_eq!(
+            parent_dir("//server/share"),
+            None,
+            "不能截到 //server 或空串"
+        );
+        assert_eq!(parent_dir("//?/C:/w"), Some("//?/C:"));
+        assert_eq!(parent_dir("/home/u"), Some("/home"));
+        assert_eq!(parent_dir("/home"), None);
     }
 
     #[test]

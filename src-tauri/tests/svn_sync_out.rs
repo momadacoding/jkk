@@ -511,6 +511,113 @@ fn a_local_only_patch_in_the_middle_is_never_delivered_and_survives() {
     assert_settled(&fx);
 }
 
+// —— 保住 changelist（计划 2026-11-20-svn-changelist-keep T4）——
+
+fn svn_lists(fx: &SvnFixture) -> Vec<(String, String)> {
+    let xml = svn_in(&fx.wc(), &["status", "--xml", "--", "Code@"]);
+    app_lib::engine::svn_xml::parse_changelist_status(&xml)
+        .unwrap()
+        .into_iter()
+        .filter_map(|s| s.changelist.map(|c| (s.path, c)))
+        .collect()
+}
+
+/// 交付切到交付树（D3.8）时，只在 Local-Only 提交里的改动从磁盘上消失，IDE 刷新摘掉它的
+/// changelist——`ignore-on-commit` 正是 TortoiseSVN 用来挡住误提交的那个列表。交付提交掉的文件
+/// 由 svn commit 摘掉 changelist，不补挂。
+#[test]
+fn a_local_only_files_changelist_removed_at_checkout_comes_back_after_delivery() {
+    let fx = hybrid_with_colleague();
+    write(&fx, "Code/B.cs", "b-local\n");
+    git(&fx, &["commit", "-qam", "mute log\n\nLocal-Only: true"]);
+    write(&fx, "Code/A.cs", "a2\n");
+    git(&fx, &["commit", "-qam", "deliver A"]);
+    svn_in(
+        &fx.wc(),
+        &["changelist", "ignore-on-commit", "--", "Code/B.cs"],
+    );
+    svn_in(&fx.wc(), &["changelist", "speed", "--", "Code/A.cs"]);
+
+    let out = deliver_probed(&fx, "deliver A", &|step, repo| {
+        if step == Step::CheckedOut {
+            let disk = std::fs::read_to_string(std::path::Path::new(repo).join("Code/B.cs"));
+            assert_eq!(
+                disk.unwrap(),
+                "b1\n",
+                "前提：交付树里没有 Local-Only 的改动"
+            );
+            svn_in(
+                std::path::Path::new(repo),
+                &["changelist", "--remove", "--", "Code/B.cs"],
+            );
+        }
+    })
+    .unwrap();
+    assert!(
+        matches!(
+            out,
+            SyncOutOutcome::Delivered {
+                local_only_left: 1,
+                ..
+            }
+        ),
+        "{out:?}"
+    );
+    assert_settled(&fx);
+    assert_eq!(
+        svn_lists(&fx),
+        vec![],
+        "前提：A 被提交摘掉，B 被「IDE」摘掉"
+    );
+
+    let s = app_lib::engine::svn_changelist::settle(&fx.wc_str()).expect("应当补挂");
+    assert_eq!(
+        s.report.reattached,
+        vec![("Code/B.cs".to_string(), "ignore-on-commit".to_string())]
+    );
+    assert_eq!(
+        svn_lists(&fx),
+        vec![("Code/B.cs".to_string(), "ignore-on-commit".to_string())],
+        "提交掉的 A 不挂回去"
+    );
+}
+
+/// 决策日志 T3「偏离计划」第 2 条：同一个文件既有交付出去的改动、又有 Local-Only 补丁时，提交摘掉了
+/// 它的 changelist，但交付之后它仍有修改（补丁），按规则挂回原列表。
+#[test]
+fn a_partly_delivered_file_that_still_carries_a_local_only_patch_gets_its_list_back() {
+    let fx = hybrid_with_colleague();
+    thirty_lines(&fx);
+    edit_line(&fx, 1, "one", "C1");
+    edit_line(&fx, 10, "ten-LOCAL", "mute log\n\nLocal-Only: true");
+    edit_line(&fx, 20, "twenty", "C2");
+    // thirty_lines 那一提交还没进 SVN：交付会把它与 C1、C2 一起提交
+    svn_in(&fx.wc(), &["changelist", "mixed", "--", "Code/A.cs"]);
+
+    let out = deliver(&fx, "jump fix").unwrap();
+    assert!(
+        matches!(
+            out,
+            SyncOutOutcome::Delivered {
+                local_only_left: 1,
+                ..
+            }
+        ),
+        "{out:?}"
+    );
+    assert_eq!(
+        svn_lists(&fx),
+        vec![],
+        "前提：svn commit 摘掉了 A 的 changelist"
+    );
+
+    app_lib::engine::svn_changelist::settle(&fx.wc_str()).expect("应当补挂");
+    assert_eq!(
+        svn_lists(&fx),
+        vec![("Code/A.cs".to_string(), "mixed".to_string())]
+    );
+}
+
 #[test]
 fn a_local_only_suffix_takes_the_fast_path_and_is_rebased_back_on_top() {
     let fx = hybrid_with_colleague();

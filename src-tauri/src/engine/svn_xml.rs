@@ -302,6 +302,69 @@ pub struct NodeStatus {
     pub changelist: Option<String>,
 }
 
+/// `svn status --xml` 里一个 entry 的修改状态与所在 changelist（`svn_changelist` 补挂用）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangelistStatus {
+    /// entry 的 path 属性归一成正斜杠。target 是仓库相对路径时，它也是仓库相对路径。
+    pub path: String,
+    /// `<wc-status item>` 原样。
+    pub item: String,
+    /// `<wc-status props>` 原样，没有这个属性时是 `none`。
+    pub props: String,
+    pub tree_conflicted: bool,
+    /// 父元素 `<changelist name>`（E14）。
+    pub changelist: Option<String>,
+}
+
+impl ChangelistStatus {
+    /// 有没有本地修改，也就是 IDE 会不会把它列成一条改动。
+    ///
+    /// `missing` 不算：文件不在磁盘上，IDE 把它报成「本地删除」之前，用户多半还要处理它；
+    /// 补挂只给「改动回来了」的文件，不替用户猜。
+    pub fn is_modified(&self) -> bool {
+        matches!(
+            self.item.as_str(),
+            "modified" | "added" | "replaced" | "conflicted" | "merged" | "deleted"
+        ) || matches!(self.props.as_str(), "modified" | "conflicted")
+            || self.tree_conflicted
+    }
+}
+
+/// 解析 `svn status --xml`（带不带 `-v` 都行），逐 entry 给出 [`ChangelistStatus`]。
+///
+/// changelist 成员**只**出现在 `</target>` 之后与之平级的 `<changelist>` 块里（E14），遍历整份
+/// 文档的 `<entry>` 才不会漏掉它们。不做 [`parse_node_status`] 那几条输入守卫：这里只按传入的
+/// 路径逐个问状态，全是新增文件、没有 external 标记都是正常输入。
+pub fn parse_changelist_status(xml: &str) -> Result<Vec<ChangelistStatus>> {
+    let doc = parse_doc(xml)?;
+    let mut out = Vec::new();
+    for entry in doc.descendants().filter(|n| n.has_tag_name("entry")) {
+        let path = norm_sep(&attr(&entry, "path")?);
+        let st = entry
+            .children()
+            .find(|n| n.has_tag_name("wc-status"))
+            .ok_or_else(|| {
+                GitError::new(
+                    "svn_xml",
+                    format!("svn status 的 entry `{path}` 底下没有 <wc-status>"),
+                )
+            })?;
+        let changelist = entry
+            .parent_element()
+            .filter(|p| p.has_tag_name("changelist"))
+            .and_then(|p| p.attribute("name"))
+            .map(str::to_string);
+        out.push(ChangelistStatus {
+            path,
+            item: attr(&st, "item")?,
+            props: st.attribute("props").unwrap_or("none").to_string(),
+            tree_conflicted: st.attribute("tree-conflicted") == Some("true"),
+            changelist,
+        });
+    }
+    Ok(out)
+}
+
 /// 解析 `svn status -v --xml --ignore-externals`，逐节点给出 [`NodeStatus`]。
 ///
 /// - 遍历**整份文档**的 `<entry>`：changelist 成员在 `</target>` 之后与之平级的

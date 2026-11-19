@@ -11,6 +11,7 @@
 
 use crate::commands::watch::WatchSuspension;
 use crate::desktop::DesktopState;
+use crate::engine::svn_changelist;
 use crate::engine::svn_follow::{
     follow, follow_auto, manual_follow, resume_follow, AutoFollowOutcome, FollowOutcome,
 };
@@ -194,6 +195,9 @@ pub fn svn_follow_manual(handle: AppHandle, path: String) -> Result<SyncInOutcom
 /// spec §5.2：挂起期间事件被丢弃而不是攒着，所以结束时必须主动告诉前端
 /// 「仓库变了」，否则 update 带来的那一大批改动界面看不见。失败也要发：回退
 /// 本身就动过分支和工作区。
+///
+/// 流程函数返回之后补挂 SVN changelist，约 10 秒后再核对一次（`svn_changelist` 模块头）。
+/// 成败都做：失败的流程也可能已经动过磁盘再回退。没有记录时只是读一次文件。
 fn with_watch_suspended<T>(
     handle: &AppHandle,
     path: &str,
@@ -203,6 +207,19 @@ fn with_watch_suspended<T>(
         let _w = WatchSuspension::new(path);
         f()
     };
+    if let Some(s) = svn_changelist::settle(path) {
+        let repo = path.to_string();
+        let handle = handle.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(svn_changelist::RECHECK_DELAY);
+            // 补挂只写 `.svn/wc.db`，watcher 看不见；挂回了东西就告诉前端刷新一次
+            let changed =
+                svn_changelist::recheck(&repo, &s.opid).is_some_and(|r| !r.reattached.is_empty());
+            if changed {
+                let _ = handle.emit("repo-changed", &repo);
+            }
+        });
+    }
     let _ = handle.emit("repo-changed", path);
     r
 }

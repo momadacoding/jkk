@@ -2664,6 +2664,29 @@ fn manual_follow_resolves_w10_r2_via_rebase_conflict_exit() {
     ));
 }
 
+/// 11-19 那次就是手动跟进：B 只在工作区里改、挂在 IDE 的 changelist 上，停在冲突上的几分钟里
+/// 它在 stash 里，IDE 刷新摘掉了 changelist（计划 2026-11-20-svn-changelist-keep T4）。
+#[test]
+fn manual_follow_puts_back_a_changelist_removed_while_stopped_on_a_conflict() {
+    let fx = hybrid_with_colleague();
+    conflict_scene(&fx);
+    write(&fx, B, "b-wip\n");
+    svn_fixtures::svn_cmd(&fx.wc(), &["changelist", "bundle-build-speed", "--", B]);
+
+    expect_rebase_conflict(&fx);
+    assert_eq!(read(&fx, B), "b1\n", "前提：停在冲突上时 B 在 stash 里");
+    svn_fixtures::svn_cmd(&fx.wc(), &["changelist", "--remove", "--", B]);
+    resolve_a(&fx, "a-svn\n");
+    assert!(matches!(resume(&fx), SyncInOutcome::Done { .. }));
+    assert_eq!(read(&fx, B), "b-wip\n");
+
+    let s = app_lib::engine::svn_changelist::settle(&fx.wc_str()).expect("应当补挂");
+    assert_eq!(
+        s.report.reattached,
+        vec![(B.to_string(), "bundle-build-speed".to_string())]
+    );
+}
+
 #[test]
 fn manual_follow_restores_staging_with_index_when_possible() {
     let fx = hybrid_with_colleague();
