@@ -228,6 +228,9 @@ describe('collect / cleanTargets（临时 fixture 仓库）', () => {
     fakeTarget(wt('open'), 2000)
     fakeTarget(wt('locked'), 3000)
     fakeTarget(wt('busy'), 4000)
+    // 正在运行的 exe 删不掉、一定存在：pathKey 对它走 realpath，而不是解析失败后的字面退路（PR 186 review）
+    writeFileSync(path.join(targetOf(wt('busy')), 'debug', 'app.exe'), '')
+    utimesSync(path.join(targetOf(wt('busy')), 'debug'), OLD, OLD)
     fakeTarget(wt('nopr'), 5000)
     fakeTarget(wt('recent'), 6000, new Date(NOW - 60 * 1000))
     // worktree remove 删到一半留下的目录：git 已经不认它
