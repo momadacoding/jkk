@@ -302,6 +302,59 @@ describe('describeFollowReport', () => {
     expect(n.detail).toContain('不拦手动跟进')
   })
 
+  describe('提交时已确认的 Local-Only 改动（设计 2026-11-16-tsvn-acknowledged-leaks）', () => {
+    const acked: Leak = { ...leak, path: 'Code/K.cs', hunks: [{ oldStart: 2, lines: 1, verdict: 'present' }] }
+
+    it('是留档用的 info 节，不是红色告警，也不算要处理的一项', () => {
+      const m = describeFollowReport({ ...report, acknowledgedLeaks: [acked] })
+      const s = section({ ...report, acknowledgedLeaks: [acked] }, 'acknowledgedLeaks')!
+      expect(s.level).toBe('info')
+      expect(s.title).toBe('提交时已确认的 Local-Only 改动')
+      expect(s.note).toContain('TortoiseSVN')
+      expect(s.note).toContain('Proceed anyway')
+      expect(texts(s.groups[0].items)).toEqual(['Code/K.cs'])
+      expect(s.groups[0].items[0].meta).toContain('加日志')
+      expect(m.sections.some((x) => x.id === 'leaks')).toBe(false)
+      expect(m.todo).toBe(0)
+      expect(m.level).toBe('ok')
+    })
+
+    it('与没确认的泄漏同时出现时各列各的', () => {
+      const m = describeFollowReport({ ...report, leaks: [leak], acknowledgedLeaks: [acked] })
+      expect(texts(m.sections.find((x) => x.id === 'leaks')!.groups.flatMap((g) => g.items))).toEqual([
+        'Code/L.cs',
+      ])
+      expect(
+        texts(m.sections.find((x) => x.id === 'acknowledgedLeaks')!.groups.flatMap((g) => g.items)),
+      ).toEqual(['Code/K.cs'])
+    })
+
+    it('重放后变空、已丢弃的提交单列一组，不写成还在分支上', () => {
+      const s = section({ ...report, dropped: [acked.commit], acknowledgedLeaks: [acked] }, 'acknowledgedLeaks')!
+      expect(s.groups.map((g) => g.label)).toEqual(['已从分支移除：内容都在 SVN 上了'])
+      expect(s.groups[0].items[0].meta).toContain('原在分支 work')
+    })
+
+    it('旧后端没有这个字段：不出这一节', () => {
+      expect(section(report, 'acknowledgedLeaks')).toBeUndefined()
+    })
+
+    it('冲突框里也列出来，没有未确认的泄漏时不出泄漏那段', () => {
+      const n = describeFollowOutcome({
+        kind: 'needsManual',
+        at: 'c'.repeat(40),
+        files: ['Code/A.cs'],
+        baselinePublished: true,
+        leaks: [],
+        acknowledgedLeaks: [acked],
+        staleDisk: false,
+      })
+      expect(n.detail).toContain('提交时已确认')
+      expect(n.detail).toContain('Code/K.cs')
+      expect(n.detail).not.toContain('拿不准')
+    })
+  })
+
   it('要用户留意的节排在最前：列表很长时不能被文件清单压到看不见', () => {
     const m = describeFollowReport({
       ...report,

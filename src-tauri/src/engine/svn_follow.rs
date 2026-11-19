@@ -101,7 +101,9 @@ use crate::engine::svn_sync_stash::stash_wip;
 use crate::engine::svn_util::{now_secs, short};
 use crate::engine::svn_wc::enumerate_wcs;
 use crate::engine::tsvn_hooks::{quick_health, HookHealth};
-use crate::engine::tsvn_inbox::{prune_inbox, read_evidence, CommitEvidence, HookEvidence};
+use crate::engine::tsvn_inbox::{
+    prune_inbox, read_evidence, CommitEvidence, HookEvidence, WarnedHunk,
+};
 use crate::error::{GitError, Result};
 use crate::vcs::{detect_repo_kind, RepoKind};
 use git2::{BranchType, Repository};
@@ -157,6 +159,8 @@ pub enum FollowOutcome {
         baseline_published: bool,
         /// F3：分支没有重放，但 Local-Only 补丁可能已经被带上了服务器，用户要在动手之前知道。
         leaks: Vec<Leak>,
+        /// 同上，但用户在 TortoiseSVN 提交框里看过警告、仍然提交了，见 [`FollowReport::acknowledged_leaks`]。
+        acknowledged_leaks: Vec<Leak>,
         /// 重放没冲突，但分支落后、磁盘上还是旧 HEAD 的内容（见 [`stale_disk_paths`]）：对象层跟进
         /// 只移 HEAD，「本地改动」会变成把 SVN 的内容改回去（Review 3 第 2 条）。
         stale_disk: bool,
@@ -238,7 +242,13 @@ pub struct FollowReport {
     pub moved_branches: Vec<String>,
     /// (分支, 原因)：不移动，分支列表标「落后基线」。
     pub behind_branches: Vec<(String, String)>,
+    /// 用户不知情（或认不出知情）的泄漏。非空时自动跟进不做（[`auto_blocker`] 条件 8）。
     pub leaks: Vec<Leak>,
+    /// 用户在 TortoiseSVN 提交框里看过 Check-commit 的警告、点 Proceed anyway 提交了的泄漏 hunk
+    /// （设计 `2026-11-16-tsvn-acknowledged-leaks.md`）。只留档，不拦自动跟进、不留在旧基线。同一个
+    /// 文件里没对上的 hunk 仍在 `leaks`。钩子不健康时不读事件，这里总是空的。
+    #[serde(default)]
+    pub acknowledged_leaks: Vec<Leak>,
     /// 钉着换入之前的原始索引与暂存 blob 的 ref。没拼过索引时（只发布了基线）是 `None`。
     #[serde(default)]
     pub pinned_ref: Option<String>,
@@ -1146,6 +1156,7 @@ fn needs_manual(m: &ManualNeeded) -> FollowOutcome {
         files: m.files.clone(),
         baseline_published: true,
         leaks: m.leaks.clone(),
+        acknowledged_leaks: m.acknowledged_leaks.clone(),
         stale_disk: m.stale_disk,
         snapshot: m.snapshot.clone(),
         details: m.details.clone(),
@@ -1363,6 +1374,7 @@ struct ManualNeeded {
     at: String,
     files: Vec<String>,
     leaks: Vec<Leak>,
+    acknowledged_leaks: Vec<Leak>,
     stale_disk: bool,
     /// 手动跟进会按 6.10 直接采用新基线版本的路径，见 [`manual_snapshot`]。
     snapshot: PathsByCommit,
@@ -1429,6 +1441,13 @@ impl Who {
             events,
             events_read_at_ms,
         })
+    }
+
+    /// 用户在 TortoiseSVN 提交框里看过警告、仍然提交了的 hunk。钩子不健康时没读事件，是空集：
+    /// 认不出知情，泄漏照旧拦。
+    fn acknowledged(&self) -> &BTreeSet<WarnedHunk> {
+        static NONE: BTreeSet<WarnedHunk> = BTreeSet::new();
+        self.events.as_ref().map_or(&NONE, |e| &e.acknowledged)
     }
 
     /// 本机提交事件里、提交开始时刻晚于失焦快照的路径（分析 §6.13.3 表第 1、3 行的前提）。
@@ -1942,13 +1961,17 @@ fn prepare(repo: &str, auto: bool, partial: Option<&Partial>) -> Result<Plan> {
     let (target, others) = match replayed {
         Replayed::Conflict { at, files, tree } => {
             // F3 也要算：分支没重放，但补丁可能已经上了服务器，用户要在手动跟进之前知道
-            let leaks = local_only_leaks(repo, &branch, &commits, &paths, &new_base)?;
+            let (leaks, acknowledged_leaks) = split_acknowledged(
+                local_only_leaks(repo, &branch, &commits, &paths, &new_base)?,
+                who.acknowledged(),
+            );
             let details = conflict_details(repo, &files, &tree, &ext);
             (
                 Target::Conflict(ManualNeeded {
                     at,
                     files,
                     leaks,
+                    acknowledged_leaks,
                     stale_disk: false,
                     snapshot: manual_snapshot(&commits, &snapshot, &scope),
                     details,
@@ -1958,12 +1981,16 @@ fn prepare(repo: &str, auto: bool, partial: Option<&Partial>) -> Result<Plan> {
         }
         // 重放得上，但只移 HEAD 会在「本地改动」里造出反向修改：交给会写磁盘的手动跟进
         Replayed::Moved { .. } if !stale.is_empty() => {
-            let leaks = local_only_leaks(repo, &branch, &commits, &paths, &new_base)?;
+            let (leaks, acknowledged_leaks) = split_acknowledged(
+                local_only_leaks(repo, &branch, &commits, &paths, &new_base)?,
+                who.acknowledged(),
+            );
             (
                 Target::Conflict(ManualNeeded {
                     at: old_head.clone(),
                     files: stale,
                     leaks,
+                    acknowledged_leaks,
                     stale_disk: true,
                     snapshot: manual_snapshot(&commits, &snapshot, &scope),
                     details: Vec::new(),
@@ -2013,7 +2040,11 @@ fn prepare(repo: &str, auto: bool, partial: Option<&Partial>) -> Result<Plan> {
                 }
             }
             // F3：按原始 commit 算，不受 F2 ① 换路径影响。手动跟进不拦，只告警（§6.12 条件 8 管自动）
-            report.leaks = local_only_leaks(repo, &branch, &commits, &paths, &new_base)?;
+            // 用户在提交框里看过警告的 hunk 拆出去：只留档，不拦自动跟进（设计 2026-11-16-tsvn-acknowledged-leaks）
+            (report.leaks, report.acknowledged_leaks) = split_acknowledged(
+                local_only_leaks(repo, &branch, &commits, &paths, &new_base)?,
+                who.acknowledged(),
+            );
             let others = plan_others(
                 repo,
                 &OthersCtx {
@@ -2023,6 +2054,7 @@ fn prepare(repo: &str, auto: bool, partial: Option<&Partial>) -> Result<Plan> {
                     paths: &paths,
                     superseded: &superseded,
                     snapshot: &snapshot,
+                    acknowledged: who.acknowledged(),
                 },
                 &mut memo,
                 &mut report,
@@ -2568,6 +2600,33 @@ fn previous_baseline(repo: &str, old_base: &str, new_base: &str) -> Result<Optio
     crate::engine::git_read::resolve(repo, &format!("{new_base}^1^{{commit}}"))
 }
 
+/// 把泄漏按 hunk 拆成（不知情的，看过警告的）。一个 hunk 算看过，要求 `(commit, path, old_start,
+/// lines)` 与某条 Check-commit 警告完全相同（设计 `2026-11-16-tsvn-acknowledged-leaks.md` §5.2 第 2、3
+/// 条）：commit 重写过（OID 变了）、或者同一个文件里另有没警告过的 hunk，那一处照旧算泄漏。
+fn split_acknowledged(leaks: Vec<Leak>, ack: &BTreeSet<WarnedHunk>) -> (Vec<Leak>, Vec<Leak>) {
+    if ack.is_empty() {
+        return (leaks, Vec::new());
+    }
+    let mut unknown = Vec::new();
+    let mut known = Vec::new();
+    for l in leaks {
+        let (seen, unseen): (Vec<_>, Vec<_>) = l.hunks.iter().cloned().partition(|h| {
+            ack.contains(&WarnedHunk {
+                commit: l.commit.clone(),
+                path: l.path.clone(),
+                old_start: h.old_start,
+                lines: h.lines,
+            })
+        });
+        for (hunks, out) in [(unseen, &mut unknown), (seen, &mut known)] {
+            if !hunks.is_empty() {
+                out.push(Leak { hunks, ..l.clone() });
+            }
+        }
+    }
+    (unknown, known)
+}
+
 struct OthersCtx<'a> {
     current: &'a str,
     /// `None`：基线没有父提交，也就没有「旧基线」，没有要动的分支。
@@ -2577,6 +2636,8 @@ struct OthersCtx<'a> {
     /// F2 ①。6.10 的快照规则按各分支自己的基线算，见 `snapshot`。
     superseded: &'a dyn Fn(&ReplayCommit) -> BTreeSet<String>,
     snapshot: &'a SnapshotRule<'a>,
+    /// 见 [`Who::acknowledged`]。
+    acknowledged: &'a BTreeSet<WarnedHunk>,
 }
 
 /// 其他分支（分析 §6.11.3）。范围是包含旧基线的本地分支；跳过当前分支、任何 worktree 里是
@@ -2629,9 +2690,15 @@ fn plan_other(
 ) -> Result<std::result::Result<String, String>> {
     let own = branch_baseline(repo, &b.oid, ctx.new_base)?;
     let commits = commits_between(repo, &own, &b.oid, &FOLLOW_CODES)?;
-    let leaks = local_only_leaks(repo, &b.name, &commits, ctx.paths, ctx.new_base)?;
-    if !leaks.is_empty() {
+    let (leaks, acknowledged) = split_acknowledged(
+        local_only_leaks(repo, &b.name, &commits, ctx.paths, ctx.new_base)?,
+        ctx.acknowledged,
+    );
+    // 看过警告的也照旧不移动：本期不处理其他分支的落后基线（设计 §2.2）。拆开只是为了它不挡住当前
+    // 分支的自动跟进——同一个 commit（OID 相同）在当前分支上已经算确认了
+    if !leaks.is_empty() || !acknowledged.is_empty() {
         report.leaks.extend(leaks);
+        report.acknowledged_leaks.extend(acknowledged);
         return Ok(Err(
             "分支上的 Local-Only 补丁里有改动已经或可能出现在 SVN 上，不自动移动".to_string(),
         ));

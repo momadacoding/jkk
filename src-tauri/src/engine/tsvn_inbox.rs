@@ -3,8 +3,8 @@
 //! 钩子进程只往这里写一条事件就退出，不连接 jkk、不读 git。jkk 跟进时再读。事件只是线索：
 //! 真相仍是基线映射，读不懂的文件跳过即可。
 //!
-//! 事件里不记提交消息：只有路径、revision、时刻与错误文本，够判定用就行（AGENTS.md §11 的
-//! 精神，用户的仓库内容不往外多带）。
+//! 事件里不记提交消息：只有路径、revision、时刻与错误文本，Check-commit 另记警告过的 hunk 的
+//! commit OID 与行号，够判定用就行（AGENTS.md §11 的精神，用户的仓库内容不往外多带）。
 
 use crate::error::{GitError, Result};
 use std::collections::{BTreeSet, HashSet};
@@ -43,13 +43,16 @@ pub struct UpdateEvidence {
 pub struct HookEvidence {
     pub commits: Vec<CommitEvidence>,
     pub updates: Vec<UpdateEvidence>,
+    /// 用户在 TortoiseSVN 提交框里看过警告、仍然提交了的 hunk：成功的 Post 配上的 Pre 又配上了一条
+    /// Check-commit，取那条 Check-commit 的 `warned`（设计 `2026-11-16-tsvn-acknowledged-leaks.md` §5.2）。
+    pub acknowledged: BTreeSet<WarnedHunk>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TsvnEvent {
     pub version: u32,
-    /// `pre_commit` / `post_commit` / `post_update`。
+    /// `check_commit` / `pre_commit` / `post_commit` / `post_update`。
     pub kind: String,
     /// 钩子进程启动时的本机时刻（unix 毫秒）。
     pub at_ms: i64,
@@ -58,6 +61,24 @@ pub struct TsvnEvent {
     pub revision: Option<u64>,
     /// `ERROR` 文件的内容；成功时为 `None`。
     pub error: Option<String>,
+    /// 只有 `check_commit` 有：这次提交框弹出的警告里列了哪些 hunk。`Some(空)` 表示检查过、没有泄漏
+    /// （设计 `2026-11-16-tsvn-acknowledged-leaks.md` §5.1）。可选字段，`EVENT_VERSION` 不变：旧版
+    /// jkk 读到时忽略它。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warned: Option<Vec<WarnedHunk>>,
+}
+
+/// Check-commit 警告过的一个 hunk。坐标与 [`crate::engine::svn_leak::HunkLeak`] 相同（L 的父提交 B 侧），
+/// 跟进按 `(commit, path, old_start, lines)` 逐项比对。
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WarnedHunk {
+    /// Local-Only commit 的 OID。
+    pub commit: String,
+    /// 仓库相对路径（`/` 分隔），与 [`crate::engine::svn_leak::Leak::path`] 同一写法。
+    pub path: String,
+    pub old_start: u32,
+    pub lines: u32,
 }
 
 pub const EVENT_VERSION: u32 = 1;
@@ -120,21 +141,32 @@ fn is_commit_post(e: &TsvnEvent) -> bool {
     e.kind == "post_commit" && e.error.is_none() && e.revision.is_some()
 }
 
-/// 给每条 Post 找 Pre：同一路径集合、不晚于 Post、相隔不超过窗口里最晚的那条。返回 Pre 的下标。
-fn pair_of(events: &[(PathBuf, TsvnEvent)], post: usize) -> Option<usize> {
-    let p = &events[post].1;
+/// 在 `later` 之前找 `kind` 事件：同一路径集合、不晚于它、相隔不超过窗口里最晚的那条。返回下标。
+fn latest_before(events: &[(PathBuf, TsvnEvent)], later: usize, kind: &str) -> Option<usize> {
+    let p = &events[later].1;
     let paths: BTreeSet<&String> = p.paths.iter().collect();
     events
         .iter()
         .enumerate()
         .filter(|(_, (_, e))| {
-            e.kind == "pre_commit"
+            e.kind == kind
                 && e.at_ms <= p.at_ms
                 && p.at_ms - e.at_ms <= PAIR_WINDOW_MS
                 && e.paths.iter().collect::<BTreeSet<_>>() == paths
         })
         .max_by_key(|(_, (_, e))| e.at_ms)
         .map(|(i, _)| i)
+}
+
+/// 给每条 Post 找 Pre。返回 Pre 的下标。
+fn pair_of(events: &[(PathBuf, TsvnEvent)], post: usize) -> Option<usize> {
+    latest_before(events, post, "pre_commit")
+}
+
+/// 给 Pre 找它之前的 Check-commit（设计 §5.2 第 1 条）。取最晚的那条：Abort、删掉补丁、再提交时，
+/// 第二次检查是干净的，不能配到第一次的警告上。
+fn check_of(events: &[(PathBuf, TsvnEvent)], pre: usize) -> Option<usize> {
+    latest_before(events, pre, "check_commit")
 }
 
 /// 读出判定用的证据。读不了的一律跳过，不报错：没有证据只会落到「拿不准」。
@@ -147,8 +179,15 @@ pub fn read_evidence(repo: &str) -> HookEvidence {
         };
         let paths: BTreeSet<String> = e.paths.iter().cloned().collect();
         if is_commit_post(e) {
+            let pre = pair_of(&events, i);
+            // 成功的 Q ← P ← C 整条链都在，C 的警告才算用户看过之后仍然提交了
+            let warned = pre
+                .and_then(|j| check_of(&events, j))
+                .and_then(|k| events[k].1.warned.as_ref());
+            out.acknowledged
+                .extend(warned.into_iter().flatten().cloned());
             out.commits.push(CommitEvidence {
-                t_commit_ms: pair_of(&events, i).map(|j| events[j].1.at_ms),
+                t_commit_ms: pre.map(|j| events[j].1.at_ms),
                 revision,
                 paths,
             });
@@ -160,9 +199,16 @@ pub fn read_evidence(repo: &str) -> HookEvidence {
     out
 }
 
+/// 只靠配对才有意义的事件：自己不会被「已处理」直接删掉，跟着配上的 Post 走，配不上的按孤儿 TTL 删。
+fn is_lead_up(e: &TsvnEvent) -> bool {
+    e.kind == "pre_commit" || e.kind == "check_commit"
+}
+
 /// 清理收件箱：
-/// - `processed` 认定已处理的事件删掉；被删的成功 Post 连同它配上的 Pre 一起删；
-/// - 没配上的 Pre 超过 [`ORPHAN_PRE_TTL_MS`] 删；
+/// - `processed` 认定已处理的事件删掉；被删的成功 Post 连同它配上的 Pre、Pre 配上的 Check-commit
+///   一起删；
+/// - 没配上的 Pre、Check-commit 超过 [`ORPHAN_PRE_TTL_MS`] 删。它们不按 `processed` 直接删：用户盯着
+///   警告框时跑了一次跟进，那条 Check-commit 要留给之后的 Pre / Post 配对；
 /// - 任何事件超过 [`EVENT_TTL_MS`] 删；
 /// - 剩下的超过 [`MAX_EVENTS`] 条时从最旧的删起。
 ///
@@ -176,18 +222,19 @@ pub fn prune_inbox(repo: &str, processed: &dyn Fn(&TsvnEvent) -> bool, now_ms: i
             continue;
         }
         if let Some(j) = pair_of(&events, i) {
-            paired.insert(j);
+            let chain: Vec<usize> = std::iter::once(j).chain(check_of(&events, j)).collect();
+            paired.extend(&chain);
             if processed(e) {
-                drop.insert(j);
+                drop.extend(chain);
             }
         }
     }
     for (i, (_, e)) in events.iter().enumerate() {
         let age = now_ms - e.at_ms;
-        let orphan_pre = e.kind == "pre_commit" && !paired.contains(&i);
-        if (e.kind != "pre_commit" && processed(e))
+        let orphan = is_lead_up(e) && !paired.contains(&i);
+        if (!is_lead_up(e) && processed(e))
             || age > EVENT_TTL_MS
-            || (orphan_pre && age > ORPHAN_PRE_TTL_MS)
+            || (orphan && age > ORPHAN_PRE_TTL_MS)
         {
             drop.insert(i);
         }

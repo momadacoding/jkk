@@ -2,8 +2,8 @@
 //! 收件箱读取、配对与清理（计划 Task 3；日志 H3、H4）。
 
 use app_lib::engine::tsvn_inbox::{
-    inbox_dir, prune_inbox, read_evidence, write_event, TsvnEvent, EVENT_TTL_MS, MAX_EVENTS,
-    ORPHAN_PRE_TTL_MS, PAIR_WINDOW_MS,
+    inbox_dir, prune_inbox, read_evidence, write_event, TsvnEvent, WarnedHunk, EVENT_TTL_MS,
+    MAX_EVENTS, ORPHAN_PRE_TTL_MS, PAIR_WINDOW_MS,
 };
 use std::collections::BTreeSet;
 use std::fs;
@@ -32,7 +32,38 @@ fn ev(kind: &str, at_ms: i64, paths: &[&str], revision: Option<u64>) -> TsvnEven
         paths: paths.iter().map(|p| p.to_string()).collect(),
         revision,
         error: None,
+        warned: None,
     }
+}
+
+const A: &str = "Code/A.cs";
+
+fn hunk(commit: &str, old_start: u32) -> WarnedHunk {
+    WarnedHunk {
+        commit: commit.to_string(),
+        path: A.to_string(),
+        old_start,
+        lines: 1,
+    }
+}
+
+/// Check-commit 事件，`warned` 为警告过的 hunk。
+fn check(at_ms: i64, paths: &[&str], warned: &[WarnedHunk]) -> TsvnEvent {
+    TsvnEvent {
+        warned: Some(warned.to_vec()),
+        ..ev("check_commit", at_ms, paths, None)
+    }
+}
+
+/// 一次完整的 TortoiseSVN 提交：C → P → Q，各相隔 100 ms。
+fn proceed_anyway(fx: &Fx, at_ms: i64, warned: &[WarnedHunk], revision: u64) {
+    put(fx, check(at_ms, &[A], warned));
+    put(fx, ev("pre_commit", at_ms + 100, &[A], None));
+    put(fx, ev("post_commit", at_ms + 200, &[A], Some(revision)));
+}
+
+fn acked(fx: &Fx) -> Vec<WarnedHunk> {
+    read_evidence(&fx.repo).acknowledged.into_iter().collect()
 }
 
 fn put(fx: &Fx, e: TsvnEvent) {
@@ -234,6 +265,137 @@ fn prune_caps_count_by_dropping_the_oldest() {
     let left = remaining(&fx);
     assert_eq!(left.len(), MAX_EVENTS);
     assert_eq!(left[0].1, 1_003);
+}
+
+// ---- Check-commit 的警告与成功提交配对（设计 2026-11-16-tsvn-acknowledged-leaks §5.2） ----
+
+#[test]
+fn warned_hunks_of_a_check_chained_to_a_successful_commit_are_acknowledged() {
+    let fx = fx();
+    proceed_anyway(&fx, 1_000, &[hunk("c1", 2), hunk("c1", 9)], 7);
+    assert_eq!(acked(&fx), vec![hunk("c1", 2), hunk("c1", 9)]);
+    // 提交证据照旧
+    assert_eq!(read_evidence(&fx.repo).commits[0].t_commit_ms, Some(1_100));
+}
+
+#[test]
+fn a_check_alone_acknowledges_nothing() {
+    // 被警告后 Abort，再用命令行 svn ci：收件箱里只有 C
+    let fx = fx();
+    put(&fx, check(1_000, &[A], &[hunk("c1", 2)]));
+    assert!(acked(&fx).is_empty());
+}
+
+#[test]
+fn a_commit_without_a_check_acknowledges_nothing() {
+    // 关掉了拦截、或者 Check-commit 算不出：只有 P → Q
+    let fx = fx();
+    put(&fx, ev("pre_commit", 1_000, &[A], None));
+    put(&fx, ev("post_commit", 1_100, &[A], Some(3)));
+    assert!(acked(&fx).is_empty());
+}
+
+#[test]
+fn the_latest_check_before_the_pre_is_the_one_that_counts() {
+    // Abort → 用「提交后恢复」删掉补丁 → 再提交：第二次检查是干净的
+    let fx = fx();
+    put(&fx, check(800, &[A], &[hunk("c1", 2)]));
+    proceed_anyway(&fx, 900, &[], 3);
+    assert!(acked(&fx).is_empty());
+}
+
+#[test]
+fn a_check_after_the_pre_does_not_pair() {
+    let fx = fx();
+    put(&fx, ev("pre_commit", 1_000, &[A], None));
+    put(&fx, check(1_050, &[A], &[hunk("c1", 2)]));
+    put(&fx, ev("post_commit", 1_100, &[A], Some(3)));
+    assert!(acked(&fx).is_empty());
+}
+
+#[test]
+fn a_check_with_other_paths_does_not_pair() {
+    let fx = fx();
+    put(&fx, check(900, &[A, "Code/B.cs"], &[hunk("c1", 2)]));
+    put(&fx, ev("pre_commit", 1_000, &[A], None));
+    put(&fx, ev("post_commit", 1_100, &[A], Some(3)));
+    assert!(acked(&fx).is_empty());
+}
+
+#[test]
+fn a_check_outside_the_window_does_not_pair() {
+    let fx = fx();
+    let pre = 1_000 + PAIR_WINDOW_MS + 1;
+    put(&fx, check(1_000, &[A], &[hunk("c1", 2)]));
+    put(&fx, ev("pre_commit", pre, &[A], None));
+    put(&fx, ev("post_commit", pre + 100, &[A], Some(3)));
+    assert!(acked(&fx).is_empty());
+
+    // 窗口边上还算
+    let fx2 = self::fx();
+    put(&fx2, check(1_000, &[A], &[hunk("c1", 2)]));
+    put(&fx2, ev("pre_commit", 1_000 + PAIR_WINDOW_MS, &[A], None));
+    put(
+        &fx2,
+        ev("post_commit", 1_000 + PAIR_WINDOW_MS + 1, &[A], Some(3)),
+    );
+    assert_eq!(acked(&fx2), vec![hunk("c1", 2)]);
+}
+
+#[test]
+fn a_failed_commit_acknowledges_nothing() {
+    let fx = fx();
+    put(&fx, check(900, &[A], &[hunk("c1", 2)]));
+    put(&fx, ev("pre_commit", 1_000, &[A], None));
+    let mut post = ev("post_commit", 1_100, &[A], Some(3));
+    post.error = Some("E155011".into());
+    put(&fx, post);
+    assert!(acked(&fx).is_empty());
+}
+
+#[test]
+fn a_check_written_without_warned_acknowledges_nothing() {
+    // 没有 warned 字段的 check_commit（手写、或者以后格式变了）照样读得懂，但不算确认
+    let fx = fx();
+    put(&fx, ev("check_commit", 900, &[A], None));
+    put(&fx, ev("pre_commit", 1_000, &[A], None));
+    put(&fx, ev("post_commit", 1_100, &[A], Some(3)));
+    assert!(acked(&fx).is_empty());
+    assert_eq!(read_evidence(&fx.repo).commits.len(), 1);
+}
+
+#[test]
+fn prune_takes_the_check_along_with_a_processed_commit() {
+    let fx = fx();
+    proceed_anyway(&fx, 1_000, &[hunk("c1", 2)], 3);
+    proceed_anyway(&fx, 5_000, &[hunk("c1", 2)], 4);
+    prune_inbox(&fx.repo, &|e| e.revision == Some(3), 9_000);
+    assert_eq!(
+        remaining(&fx),
+        vec![
+            ("check_commit".to_string(), 5_000),
+            ("pre_commit".to_string(), 5_100),
+            ("post_commit".to_string(), 5_200),
+        ]
+    );
+}
+
+#[test]
+fn prune_keeps_a_young_check_even_if_it_is_older_than_the_cutoff() {
+    // 跟进按「早于读收件箱的时刻」清理。用户盯着警告框时恰好跑了一次跟进，C 不能因此被清掉：
+    // 之后点 Proceed anyway 写下的 P / Q 要配上它
+    let fx = fx();
+    let now = 10 * ORPHAN_PRE_TTL_MS;
+    put(&fx, check(now - 1_000, &[A], &[hunk("c1", 2)]));
+    put(
+        &fx,
+        check(now - ORPHAN_PRE_TTL_MS - 1, &[A], &[hunk("c1", 2)]),
+    );
+    prune_inbox(&fx.repo, &|e| e.at_ms <= now, now);
+    assert_eq!(
+        remaining(&fx),
+        vec![("check_commit".to_string(), now - 1_000)]
+    );
 }
 
 #[test]

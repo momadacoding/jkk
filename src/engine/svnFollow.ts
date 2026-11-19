@@ -156,6 +156,11 @@ export interface FollowReport {
   movedBranches: string[]
   behindBranches: [string, string][]
   leaks: Leak[]
+  /**
+   * 在 TortoiseSVN 提交框里看过 jkk 的警告、点 Proceed anyway 提交了的泄漏（设计
+   * 2026-11-16-tsvn-acknowledged-leaks）。只留档，不拦自动跟进。旧后端没有。
+   */
+  acknowledgedLeaks?: Leak[]
   /** 钉着换入之前的原始索引与暂存 blob 的 ref。 */
   pinnedRef: string | null
   /** 判定依据（C1h）：钩子健康时按本机事件，否则按作者 + 失焦快照。 */
@@ -190,6 +195,8 @@ export type FollowOutcome =
       baselinePublished: boolean
       /** 分支没重放，但本地补丁可能已经上了服务器：用户要在动手之前知道。 */
       leaks: Leak[]
+      /** 同上，但是在 TortoiseSVN 提交框里看过警告后提交的。旧后端没有。 */
+      acknowledgedLeaks?: Leak[]
       /**
        * 不是重放冲突：分支落后、磁盘上还是这条分支的旧内容（`files`），只移分支会在「本地改动」里
        * 造出把 SVN 内容改回去的修改（Review 3 第 2 条）。`at` 是当前 HEAD。
@@ -353,6 +360,7 @@ export interface FollowReportSection {
   id:
     | 'unverified'
     | 'leaks'
+    | 'acknowledgedLeaks'
     | 'lost'
     | 'lostPartial'
     | 'superseded'
@@ -483,6 +491,19 @@ function leakTiers(leaks: Leak[]): { sure: Leak[]; unsure: Leak[] } {
   return { sure: leaks.filter(isSure), unsure: leaks.filter((l) => !isSure(l)) }
 }
 
+/**
+ * 提交时看过警告的泄漏：用户在 TortoiseSVN 提交框里已经确认过一次，这里只留档（设计
+ * 2026-11-16-tsvn-acknowledged-leaks）。
+ */
+const ACKED_TITLE = '提交时已确认的 Local-Only 改动'
+const ACKED_NOTE =
+  '这些 Local-Only 改动是你在 TortoiseSVN 提交框里看过 jkk 的警告、点了 Proceed anyway 提交的，' +
+  '所以这次没有拦下跟进。只是留个记录，不用处理。'
+
+function ackedLeakSection(leaks: Leak[]): string {
+  return `${ACKED_TITLE}：${ACKED_NOTE}\n${listed(leaks.map(leakLine))}`
+}
+
 function leakSection(leaks: Leak[]): string {
   const { sure, unsure } = leakTiers(leaks)
   const parts = [`${LEAK_NOTE}。只是提醒，不拦手动跟进，也不改任何文件。`]
@@ -570,6 +591,7 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
   const stayed = new Set(r.behindBranches.map(([b]) => b))
   const isRemoved = (l: Leak) => gone.has(l.commit) && !stayed.has(l.branch)
   const removedLeaks = r.leaks.filter(isRemoved)
+  const acked = r.acknowledgedLeaks ?? []
   const overlapItem = (o: OverlapFile): ReportItem => ({ text: o.path, meta: o.commits.join('、') })
   // drift 里的已经在「分支与磁盘对不上」那一节，不重复列
   // 后端把整个 drift（含能放回的）并进了 overlap。能放回的已经在 Local-Only 那两节，按原始 drift
@@ -691,6 +713,17 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
       note: '这些分支没有移动，切过去时会提示手动跟进。',
       groups: [
         { label: '', items: r.behindBranches.map(([b, why]) => ({ text: b, meta: why })) },
+      ],
+    },
+    // 排在文件清单前面：清单可能上千行，留档也要看得到
+    {
+      id: 'acknowledgedLeaks',
+      title: ACKED_TITLE,
+      level: 'info',
+      note: ACKED_NOTE,
+      groups: [
+        { label: '', items: acked.filter((l) => !isRemoved(l)).map(leakItem) },
+        { label: REMOVED_LEAKS, items: acked.filter(isRemoved).map(removedLeakItem) },
       ],
     },
     { id: 'changes', title: '跟进的文件', level: 'info', groups: changeGroups(r) },
@@ -901,6 +934,8 @@ export function describeFollowOutcome(o: Exclude<FollowOutcome, { kind: 'done' }
         )
       }
       if (o.leaks.length > 0) sections.push(leakSection(o.leaks))
+      const acked = o.acknowledgedLeaks ?? []
+      if (acked.length > 0) sections.push(ackedLeakSection(acked))
       return {
         tone: 'attention',
         title: o.staleDisk ? '这次要手动跟进' : '跟进遇到冲突',

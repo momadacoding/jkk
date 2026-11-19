@@ -99,6 +99,24 @@ describe('FollowReportDialog', () => {
     expect(screen.getByText('跟进完成，有 2 项需要处理')).toBeTruthy()
   })
 
+  it('提交时已确认的泄漏不是红色卡片，也不算要处理的一项', () => {
+    open({
+      ...report,
+      acknowledgedLeaks: [
+        {
+          branch: 'work',
+          commit: 'c'.repeat(40),
+          subject: '加日志',
+          path: 'Code/L.cs',
+          hunks: [{ oldStart: 3, lines: 1, verdict: 'present' }],
+        },
+      ],
+    })
+    expect(document.querySelectorAll('.follow-section.danger')).toHaveLength(0)
+    expect(screen.getByText('提交时已确认的 Local-Only 改动')).toBeTruthy()
+    expect(screen.getByText('跟进完成')).toBeTruthy()
+  })
+
   it('要留意的节展开；只是告知、条数多的节折起来', () => {
     const changes = Array.from({ length: 9 }, (_, i) => ({
       path: `Code/${i}.cs`,
