@@ -31,6 +31,7 @@ import {
   type FollowReport,
 } from '../engine/svnFollow'
 import {
+  continueNeedsConfirm,
   describeSyncAction,
   describeSyncInPreview,
   describeSyncOutcome,
@@ -42,7 +43,13 @@ import {
 import type { SyncState, SyncStateUnreadable } from '../engine/svnJournal'
 import { perfMark, perfSpan } from '../store/perf'
 import type { ConfirmRequest } from './ConfirmDialog'
-import { createAfterSync, exclusive as sharedExclusive, showOutcomeNotice } from './svnFlowShared'
+import {
+  createAfterSync,
+  exclusive as sharedExclusive,
+  runOnBanner,
+  showOutcomeNotice,
+  type SyncActionBusy,
+} from './svnFlowShared'
 
 export interface SvnSyncFlowDeps {
   repoPath: string
@@ -73,6 +80,11 @@ export interface SvnSyncFlowDeps {
    * 刷新写回之前横幅说的还是跟进前的事，那时点「跟进」只会白跑一次。
    */
   setFollowing: (busy: boolean) => void
+  /**
+   * 未收尾横幅上执行中的那颗按钮。rebase 冲突时的「继续」不弹确认框，进度只能显示在按钮上；
+   * 与交付流程共用同一份状态（同一条横幅）。
+   */
+  setSyncActionBusy: (busy: SyncActionBusy | null) => void
   /** 跟进之后刷新 HEAD、提交图、本地改动与落后基线的分支。可以抛，流程接住。 */
   refreshAfterFollow: () => Promise<void>
   /**
@@ -202,7 +214,10 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
     await showOutcome(box.outcome)
   }
 
-  /** 横幅上的继续 / 放弃（spec §7.6）。 */
+  /**
+   * 横幅上的继续 / 放弃（spec §7.6）。rebase 冲突时的「继续」不弹确认框，进度显示在按钮上
+   * （`continueNeedsConfirm`，2026-11-19 使用报告问题 2）。
+   */
   const syncAction = async (id: SyncActionId) => {
     d.clearError() // 同 svnUpdate
     // 「继续」会接着跑 rebase；「放弃」只是回退，不合并
@@ -212,9 +227,17 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
     const phase = unfinished ? unfinished.phase : 'start'
     // 手动跟进的记录走同一对命令，只换说法（后端 `take_over` 接手两种 flow）
     const manual = unfinished?.flow === 'follow_manual'
+    const model = manual ? describeManualFollowAction(id, phase) : describeSyncAction(id, phase)
+    if (id === 'syncContinue' && !continueNeedsConfirm(phase)) {
+      const outcome = await runOnBanner(d, afterSync, { id, label: model.busyLabel }, () =>
+        svnSyncContinue(d.repoPath),
+      )
+      await showOutcome(outcome, manual)
+      return
+    }
     const box: { outcome: SyncInOutcome | null } = { outcome: null }
     await d.confirm({
-      ...(manual ? describeManualFollowAction(id, phase) : describeSyncAction(id, phase)),
+      ...model,
       action: async () => {
         box.outcome =
           id === 'syncContinue' ? await svnSyncContinue(d.repoPath) : await svnSyncAbort(d.repoPath)

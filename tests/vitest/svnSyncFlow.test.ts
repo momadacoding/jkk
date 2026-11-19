@@ -57,6 +57,8 @@ function deps(log: string[], confirm?: (r: ConfirmRequest) => Promise<boolean>):
       log.push('fetchSvnLog')
     },
     setFollowing: (busy) => log.push(`following:${busy}`),
+    // 不记日志：只有 rebase 阶段的「继续」用它，那几个用例自己接
+    setSyncActionBusy: () => {},
     refreshAfterFollow: async () => {
       log.push('refreshAfterFollow')
     },
@@ -1120,12 +1122,14 @@ describe('横幅上手动跟进记录的继续 / 放弃', () => {
   })
 
   it('走更新的继续命令，文案说手动跟进', async () => {
+    // 放回那一步：rebase 冲突时的「继续」不弹框（见下面问题 2 的用例），那里也走同一个命令
     const log: string[] = []
     vi.mocked(store.svnSyncContinue).mockResolvedValue({ kind: 'done', newRev: 2 })
 
-    await createSvnSyncFlow({ ...deps(log), syncState: unfinished('rebase') }).handleSyncAction(
-      'syncContinue',
-    )
+    await createSvnSyncFlow({
+      ...deps(log),
+      syncState: unfinished('applying-stash'),
+    }).handleSyncAction('syncContinue')
 
     expect(store.svnSyncContinue).toHaveBeenCalledWith('C:/wc1')
     expect(store.svnFollowContinue).not.toHaveBeenCalled()
@@ -1449,5 +1453,135 @@ describe('合并前的 merge driver 确认', () => {
     vi.mocked(store.svnSyncAbort).mockResolvedValue({ kind: 'aborted' } as never)
     await createSvnSyncFlow({ ...deps(log), guardMerge: async () => false }).handleSyncAction('syncAbort')
     expect(store.svnSyncAbort).toHaveBeenCalled()
+  })
+})
+
+describe('rebase 冲突时的「我已解决，继续」不再弹确认框（2026-11-19 使用报告问题 2）', () => {
+  // 按钮文字本身就是确认；还有没解决的文件时后端什么都不改就拒绝（`continue_sync`）
+  const at = (flow: 'sync_in' | 'follow_manual', phase: 'rebase' | 'applying-stash') => () => ({
+    locked: false,
+    holder: null,
+    unfinished: { flow, phase, opid: 'x', startedAt: 1 },
+  })
+  const busyLog = (log: string[]) => (b: { id: string; label: string } | null) => {
+    log.push(b ? `busy:${b.id}|${b.label}` : 'busy:null')
+  }
+
+  for (const flow of ['sync_in', 'follow_manual'] as const) {
+    it(`${flow}：清错 → merge driver → 按钮显示「正在继续…」→ 执行 → 刷新 → 复位，不弹框`, async () => {
+      const log: string[] = []
+      vi.mocked(store.svnSyncContinue).mockImplementation(async () => {
+        log.push('continue')
+        return { kind: 'done', newRev: 2 }
+      })
+
+      await createSvnSyncFlow({
+        ...deps(log),
+        syncState: at(flow, 'rebase'),
+        setSyncActionBusy: busyLog(log),
+      }).handleSyncAction('syncContinue')
+
+      expect(log).toEqual([
+        'clearError',
+        'guardMerge',
+        'busy:syncContinue|正在继续…',
+        'continue',
+        'refreshSvnSyncState',
+        'refreshSvnSync',
+        'fetchSvnLog',
+        'busy:null',
+      ])
+    })
+  }
+
+  it('还有没解决的文件：后端拒绝，先刷新横幅再进错误条，按钮复位', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncContinue).mockRejectedValue({ code: 'sync_in_unresolved' })
+
+    await createSvnSyncFlow({
+      ...deps(log),
+      syncState: at('follow_manual', 'rebase'),
+      setSyncActionBusy: busyLog(log),
+    }).handleSyncAction('syncContinue')
+
+    expect(log.some((l) => l.startsWith('confirm:'))).toBe(false)
+    expect(log.indexOf('refreshSvnSyncState')).toBeGreaterThan(-1)
+    expect(log.indexOf('refreshSvnSyncState')).toBeLessThan(log.indexOf('reportError:sync_in_unresolved'))
+    expect(log.at(-1)).toBe('busy:null')
+  })
+
+  it('继续之后又停在冲突上：按钮先复位，结局照常报出来', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncContinue).mockResolvedValue({ kind: 'rebaseConflict', files: ['A'] })
+
+    await createSvnSyncFlow({
+      ...deps(log),
+      syncState: at('follow_manual', 'rebase'),
+      setSyncActionBusy: busyLog(log),
+    }).handleSyncAction('syncContinue')
+
+    expect(log.at(-1)).toBe('confirm:手动跟进遇到冲突')
+    expect(log.indexOf('busy:null')).toBeLessThan(log.indexOf('confirm:手动跟进遇到冲突'))
+  })
+
+  it('执行中再点一次：没有框挡着，第二次被 `exclusive` 挡掉，只发一次命令', async () => {
+    const log: string[] = []
+    let release!: () => void
+    vi.mocked(store.svnSyncContinue).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = () => resolve({ kind: 'done', newRev: 2 })
+        }),
+    )
+    // 同一个 `running`：RepoTab 每次渲染都重新 create 流程，靠 ref 共用这个标记
+    const flow = createSvnSyncFlow({
+      ...deps(log),
+      syncState: at('sync_in', 'rebase'),
+      setSyncActionBusy: busyLog(log),
+    })
+
+    const first = flow.handleSyncAction('syncContinue')
+    await vi.waitFor(() => expect(store.svnSyncContinue).toHaveBeenCalledTimes(1))
+    await flow.handleSyncAction('syncContinue')
+    release()
+    await first
+
+    expect(store.svnSyncContinue).toHaveBeenCalledTimes(1)
+    expect(log.filter((l) => l.startsWith('busy:syncContinue'))).toHaveLength(1)
+  })
+
+  it('merge driver 没确认：什么都不做，按钮不动', async () => {
+    const log: string[] = []
+    await createSvnSyncFlow({
+      ...deps(log),
+      guardMerge: async () => false,
+      syncState: at('sync_in', 'rebase'),
+      setSyncActionBusy: busyLog(log),
+    }).handleSyncAction('syncContinue')
+    expect(store.svnSyncContinue).not.toHaveBeenCalled()
+    expect(log.some((l) => l.startsWith('busy:'))).toBe(false)
+  })
+
+  it('放回改动阶段的「继续」照旧确认：框里有「备份留在 stash 列表里、由你自己删」这条新信息', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncContinue).mockResolvedValue({ kind: 'done', newRev: 2 })
+    await createSvnSyncFlow({
+      ...deps(log),
+      syncState: at('follow_manual', 'applying-stash'),
+      setSyncActionBusy: busyLog(log),
+    }).handleSyncAction('syncContinue')
+    expect(log).toContain('confirm:继续手动跟进')
+    expect(log.some((l) => l.startsWith('busy:'))).toBe(false)
+  })
+
+  it('「放弃」照旧确认（danger）', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncAbort).mockResolvedValue({ kind: 'aborted' })
+    await createSvnSyncFlow({
+      ...deps(log),
+      syncState: at('sync_in', 'rebase'),
+      setSyncActionBusy: busyLog(log),
+    }).handleSyncAction('syncAbort')
+    expect(log).toContain('confirm:放弃这次更新')
   })
 })

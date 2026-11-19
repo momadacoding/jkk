@@ -15,13 +15,20 @@ import {
   describeSyncOutAction,
   describeSyncOutOutcome,
   expectFromDeliverPreview,
+  syncOutContinueNeedsConfirm,
   type DeliverDialogModel,
   type SyncOutActionId,
   type SyncOutOutcome,
 } from '../engine/svnSyncOut'
 import type { SyncState, SyncStateUnreadable } from '../engine/svnJournal'
 import type { ConfirmRequest } from './ConfirmDialog'
-import { createAfterSync, exclusive, showOutcomeNotice } from './svnFlowShared'
+import {
+  createAfterSync,
+  exclusive,
+  runOnBanner,
+  showOutcomeNotice,
+  type SyncActionBusy,
+} from './svnFlowShared'
 
 /** 交付对话框的请求。`action` 抛错时对话框留在原地显示错误。 */
 export interface DeliverRequest {
@@ -52,6 +59,8 @@ export interface SvnSyncOutFlowDeps {
   refreshSvnSyncState: (path: string) => Promise<void>
   refreshSvnSync: (path: string) => Promise<void>
   fetchSvnLog: (path: string) => Promise<unknown>
+  /** 未收尾横幅上执行中的那颗按钮，与更新流程共用（同一条横幅）。 */
+  setSyncActionBusy: (busy: SyncActionBusy | null) => void
 }
 
 export function createSvnSyncOutFlow(d: SvnSyncOutFlowDeps) {
@@ -110,16 +119,28 @@ export function createSvnSyncOutFlow(d: SvnSyncOutFlowDeps) {
     await showOutcome(box.outcome)
   }
 
-  /** 横幅上交付那一组按钮。「清理」与「停止」都走放弃命令（计划 B8）。 */
+  /**
+   * 横幅上交付那一组按钮。「清理」与「停止」都走放弃命令（计划 B8）。补丁落回冲突时的「继续」
+   * 不弹确认框（`syncOutContinueNeedsConfirm`，2026-11-19 使用报告问题 2）。
+   */
   const syncOutAction = async (id: SyncOutActionId) => {
     d.clearError()
     // 只有「继续」会接着合并；「清理」与「停止」都走放弃命令
     if (id === 'syncOutContinue' && !(await d.guardMerge())) return
     const s = d.syncState()
     const phase = s && !('readError' in s) && s.unfinished ? s.unfinished.phase : 'prepare'
+    const model = describeSyncOutAction(id, phase)
+    if (id === 'syncOutContinue' && !syncOutContinueNeedsConfirm(phase)) {
+      // 不套 `refreshing`：`runOnBanner` 失败时自己先刷新再报
+      const outcome = await runOnBanner(d, afterSync, { id, label: model.busyLabel }, () =>
+        svnSyncOutContinue(d.repoPath),
+      )
+      await showOutcome(outcome)
+      return
+    }
     const box: { outcome: SyncOutOutcome | null } = { outcome: null }
     await d.confirm({
-      ...describeSyncOutAction(id, phase),
+      ...model,
       action: async () => {
         box.outcome = await refreshing(() =>
           id === 'syncOutContinue' ? svnSyncOutContinue(d.repoPath) : svnSyncOutAbort(d.repoPath),

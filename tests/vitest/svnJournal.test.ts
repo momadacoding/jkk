@@ -443,6 +443,20 @@ describe('未收尾的手动跟进', () => {
     }
   })
 
+  it('rebase 冲突：「继续」不再弹框，它做什么写在横幅上（2026-11-19 使用报告问题 2）', () => {
+    // 原来这句话只在确认框里；框去掉之后挪到横幅，点之前就看得到
+    const inUpdate = describeUnfinishedSync({
+      locked: false,
+      holder: null,
+      unfinished: { flow: 'sync_in', phase: 'rebase', opid: 'x', startedAt: 1 },
+    })!
+    for (const b of [describeUnfinishedSync(manual('rebase'))!, inUpdate]) {
+      expect(b.note).toContain('我已解决，继续')
+      expect(b.note).toContain('会接着把剩下的提交重放完，再放回未提交的改动')
+      expect(b.note).toContain('还有没解决的文件')
+    }
+  })
+
   it('放回那一步的按钮与更新相同：放弃不回滚', () => {
     const b = describeUnfinishedSync(manual('applying-stash'))!
     expect(b.actions).toEqual([

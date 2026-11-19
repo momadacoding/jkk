@@ -5,7 +5,8 @@
  * 只收两边**完全相同**的部分；各自不同的（更新侧的跟进刷新、交付侧失败时也刷新的 `refreshing`）
  * 留在各自的流程里。
  */
-import type { OutcomeNotice } from '../engine/svnSyncIn'
+import type { OutcomeNotice, SyncActionId } from '../engine/svnSyncIn'
+import type { SyncOutActionId } from '../engine/svnSyncOut'
 import type { ConfirmRequest } from './ConfirmDialog'
 
 export interface AfterSyncDeps {
@@ -56,6 +57,49 @@ export async function exclusive(
     await run()
   } finally {
     running.current = false
+  }
+}
+
+/** 横幅上正在执行的那颗按钮：`id` 是按钮的 id，`label` 是执行中替换上去的文案。 */
+export interface SyncActionBusy {
+  id: SyncActionId | SyncOutActionId
+  label: string
+}
+
+export interface OnBannerDeps {
+  reportError: (err: unknown) => void
+  /** 横幅上的进度。`null` 复位。 */
+  setSyncActionBusy: (busy: SyncActionBusy | null) => void
+}
+
+/**
+ * 不弹确认框、直接执行横幅上的按钮（2026-11-19 使用报告问题 2：rebase 冲突时的「我已解决，继续」）。
+ *
+ * 确认框原来还兼着两件事，这里接过来：
+ *
+ * - 执行中的进度：挪到按钮上（`setSyncActionBusy`），不然点完没有任何反馈；
+ * - 出错时的去处：没有框可以留在原地显示错误，进错误条。先刷新再报：失败也可能推进了记录，
+ *   用户看到错误时横幅要已经是新的样子（同交付的 `refreshing`）。
+ *
+ * 返回结局；出错返回 `null`（错误已经报过）。
+ */
+export async function runOnBanner<T>(
+  d: OnBannerDeps,
+  afterSync: () => Promise<void>,
+  busy: SyncActionBusy,
+  run: () => Promise<T>,
+): Promise<T | null> {
+  d.setSyncActionBusy(busy)
+  try {
+    const outcome = await run()
+    await afterSync()
+    return outcome
+  } catch (err) {
+    await afterSync()
+    d.reportError(err)
+    return null
+  } finally {
+    d.setSyncActionBusy(null)
   }
 }
 

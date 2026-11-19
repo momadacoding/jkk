@@ -118,6 +118,16 @@ const NOTE_FOLLOW =
 const NOTE_SYNC_IN =
   '点「继续」从中断的地方接着走；点「放弃」回到更新前。两者都不会丢掉你的提交和未提交的改动。'
 
+/**
+ * rebase 冲突时「继续」不弹确认框（2026-11-19 使用报告问题 2），它做什么原来写在框里，挪到这里，
+ * 点之前就看得到。
+ */
+const CONTINUE_AFTER_REBASE =
+  '冲突文件都改好并暂存之后，点「我已解决，继续」：会接着把剩下的提交重放完，再放回未提交的改动。' +
+  '还有没解决的文件时它什么都不改，只提示还剩哪些。'
+
+const NOTE_SYNC_IN_REBASE = `${CONTINUE_AFTER_REBASE}点「放弃」回到更新前。两者都不会丢掉你的提交和未提交的改动。`
+
 /** 手动跟进放弃途中停下，同 {@link APPLYING_STASH_BACK}。 */
 const APPLYING_STASH_BACK_MANUAL =
   '这次手动跟进已经退回，分支回到了原来的位置，正在把未提交的改动放回来。' +
@@ -125,6 +135,9 @@ const APPLYING_STASH_BACK_MANUAL =
 
 const NOTE_FOLLOW_MANUAL =
   '点「继续」从中断的地方接着走；点「放弃」回到手动跟进之前，基线保持在新的位置。两者都不会丢掉你的提交和未提交的改动。'
+
+const NOTE_FOLLOW_MANUAL_REBASE =
+  `${CONTINUE_AFTER_REBASE}点「放弃」回到手动跟进之前，基线保持在新的位置。两者都不会丢掉你的提交和未提交的改动。`
 
 /** 「已经持续多久」。与后端 `svn_lock::describe_age` 同一套说法。 */
 export function sinceText(startedAt: number, nowSecs: number): string {
@@ -245,7 +258,14 @@ export function describeUnfinishedSync(
     title: manual ? '上次手动跟进没有正常结束' : '上次同步没有正常结束',
     detail,
     actions: syncActions(s.unfinished.phase, manual ? '放弃，回到手动跟进前' : undefined),
-    note: manual ? NOTE_FOLLOW_MANUAL : NOTE_SYNC_IN,
+    note:
+      s.unfinished.phase === 'rebase'
+        ? manual
+          ? NOTE_FOLLOW_MANUAL_REBASE
+          : NOTE_SYNC_IN_REBASE
+        : manual
+          ? NOTE_FOLLOW_MANUAL
+          : NOTE_SYNC_IN,
   }
 }
 

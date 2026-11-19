@@ -288,7 +288,8 @@ export function describeSyncOutBanner(u: SyncOutUnfinished): SyncOutBanner | und
           `${safe}还差收尾：把本地补丁放回到最新版本之上（${b} 随之更新到最新版本）。` +
           `如果提示冲突，先在「本地改动」里改好冲突的文件并暂存。${PARKED_AFTER}`,
         note:
-          '「我已解决，继续」放完补丁、完成收尾。' +
+          // 这颗按钮不弹确认框（`syncOutContinueNeedsConfirm`），它做什么只写在这里
+          '「我已解决，继续」放完补丁、完成收尾，不会重复提交；还有没解决的文件时它什么都不改，只提示还剩哪些。' +
           `「停止收尾」不放了，直接切回 ${b} 交付前的状态，本地补丁不会丢；` +
           '之后点「更新」把它更新到最新版本，否则下次交付会被拒。',
       }
@@ -322,6 +323,17 @@ export function syncOutActions(phase: string): BannerAction[] {
     default:
       return [] // committing（3b 才能查证）与认不出的 phase
   }
+}
+
+/**
+ * 横幅上的「继续」要不要先弹确认框，理由同更新的 `continueNeedsConfirm`（2026-11-19 使用报告问题 2）。
+ *
+ * 补丁落回冲突（`restoring-branch`）时不要：按钮写着「我已解决，继续」，还有没解决的文件时后端什么都
+ * 不改就拒绝（`continue_sync_out`），它做什么横幅的说明里写着。其余阶段的「继续交付」要：框里说清
+ * 要先更新白名单目录、需要网络。
+ */
+export function syncOutContinueNeedsConfirm(phase: string): boolean {
+  return phase !== 'restoring-branch'
 }
 
 export function describeSyncOutAction(id: SyncOutActionId, phase: string): SyncConfirmModel {

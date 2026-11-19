@@ -27,6 +27,7 @@ import type { SyncActionId } from '../engine/svnSyncIn'
 import type { SyncOutActionId } from '../engine/svnSyncOut'
 import type { BannerAction } from '../engine/svnSync'
 import { describeStaleHooks, type HookHealth } from '../engine/tsvnHooks'
+import type { SyncActionBusy } from './svnFlowShared'
 
 /** 交付那一组按钮的 id。`BannerAction.id` 是所有横幅共用的联合类型，在这里收窄。 */
 function isSyncOutAction(id: BannerAction['id']): id is SyncOutActionId {
@@ -59,6 +60,11 @@ interface BaselineBannerProps {
   onSyncAction: (id: SyncActionId | FollowActionId) => void
   /** 未收尾同步横幅上「交付」那一组的「清理 / 继续 / 停止」。 */
   onSyncOutAction: (id: SyncOutActionId) => void
+  /**
+   * 未收尾横幅上执行中的那颗按钮（2026-11-19 使用报告问题 2）：rebase 冲突时的「继续」不弹确认框，
+   * 进度只能显示在按钮上。有值时整条横幅的按钮禁用。
+   */
+  syncActionBusy?: SyncActionBusy | null
   /**
    * 横幅上的「更新…」，与工具栏的「更新」是同一个入口。计划 Task 3 起整体前进归入
    * 「SVN 侧有新内容」，出口改成「跟进」，`describeSync` 暂时不再产出这颗按钮。
@@ -143,6 +149,7 @@ export function BaselineBanner({
   onMigrateEol,
   onSyncAction,
   onSyncOutAction,
+  syncActionBusy = null,
   onSvnUpdate,
   onFollow,
   followBusy = false,
@@ -253,15 +260,17 @@ export function BaselineBanner({
                 // 按 id 分流：交付记录的按钮交给「更新」的继续 / 放弃，后端会以
                 // sync_out_not_supported 拒绝。其余只可能是 `syncActions` 的那两个值
                 // 或跟进的 `followContinue`（Task 9 的测试钉着）
+                // 执行中整条横幅的按钮都禁用：rebase 冲突时的「继续」不弹框，没有框挡着
                 <button
                   key={a.id}
+                  disabled={!!syncActionBusy}
                   onClick={() =>
                     isSyncOutAction(a.id)
                       ? onSyncOutAction(a.id)
                       : onSyncAction(a.id as SyncActionId | FollowActionId)
                   }
                 >
-                  {a.label}
+                  {syncActionBusy?.id === a.id ? syncActionBusy.label : a.label}
                 </button>
               ))}
             </div>
