@@ -461,7 +461,7 @@ fn auto_done(fx: &SvnFixture) -> FollowReport {
 }
 fn auto_skipped(fx: &SvnFixture) -> String {
     match auto(fx) {
-        AutoFollowOutcome::Skipped { code, message } => {
+        AutoFollowOutcome::Skipped { code, message, .. } => {
             assert_eq!(code, "svn_auto_follow_leak", "{message}");
             message
         }
