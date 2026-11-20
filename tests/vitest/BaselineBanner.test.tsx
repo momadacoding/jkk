@@ -326,6 +326,47 @@ describe('BaselineBanner：自动跟进（事故分析 6.12）', () => {
     expect(screen.getByRole('button', { name: '跟进' })).toBeTruthy()
   })
 
+  it('被重放冲突拦下：冲突文件单独成组、排在新内容列表上面，不再是一行灰字（使用报告 11-19 问题 1）', () => {
+    const { container } = render(
+      <BaselineBanner
+        {...base}
+        sync={advanced}
+        autoFollowSkip="当前分支的提交重放到新基线上有冲突：Code/A.cs（r2 li）。"
+        autoFollowConflict={{
+          files: [{ path: 'Code/A.cs', rev: 2, author: 'li', svnRemoved: false }],
+          lagging: true,
+        }}
+      />,
+    )
+    const group = screen.getByRole('alert')
+    expect(group.textContent).toContain('没有自动跟进：当前分支的提交重放到新基线上，有 1 个文件冲突')
+    expect(group.textContent).toContain('Code/A.cs  r2  li')
+    expect(group.textContent).toContain('不一定在下面的新内容里')
+    // 新内容里的 B 不在冲突组里，列表另有标签
+    expect(group.textContent).not.toContain('Code/B.cs')
+    expect(screen.getByText('SVN 侧的新内容：')).toBeTruthy()
+    // 整句原因不再重复挂一行
+    expect(screen.queryByText(/Code\/A\.cs（r2 li）/)).toBeNull()
+    // 冲突组在新内容列表前面
+    const html = container.innerHTML
+    expect(html.indexOf('Code/A.cs')).toBeLessThan(html.indexOf('Code/B.cs'))
+    expect(screen.getByRole('button', { name: '跟进' })).toBeTruthy()
+  })
+
+  it('冲突清单为空或没有时照旧写那一行原因、不加列表标签', () => {
+    render(
+      <BaselineBanner
+        {...base}
+        sync={advanced}
+        autoFollowSkip="当前分支重放有冲突。"
+        autoFollowConflict={{ files: [], lagging: false }}
+      />,
+    )
+    expect(screen.getByText('没有自动跟进：当前分支重放有冲突。')).toBeTruthy()
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.queryByText('SVN 侧的新内容：')).toBeNull()
+  })
+
   it('原因只挂在「SVN 侧有新内容」上：分支落后基线的横幅不写', () => {
     render(
       <BaselineBanner

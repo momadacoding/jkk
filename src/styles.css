@@ -2823,6 +2823,20 @@ body {
   white-space: pre-wrap;
 }
 .banner-baseline-actions { display: flex; gap: 6px; }
+/* 自动跟进被重放冲突拦下：冲突文件单独成组，比下面的新内容列表更抢眼。只是一行灰字时，第一眼看到的
+   是新内容列表，像是列表里的文件冲突了（2026-11-19 使用报告问题 1） */
+.banner-baseline-conflict {
+  margin: 2px 0 8px;
+  padding: 6px 10px;
+  background: #5a2424;
+  border-left: 3px solid #e06c6c;
+  border-radius: 3px;
+  color: #ffd9d9;
+}
+.banner-baseline-conflict strong { display: block; margin-bottom: 4px; font-size: 13px; }
+.banner-baseline-conflict .banner-baseline-files { margin-bottom: 4px; font-weight: 600; opacity: 1; }
+.banner-baseline-conflict .banner-baseline-note { margin: 0; opacity: 0.9; }
+.banner-baseline-files-label { margin: 0 0 2px; opacity: 0.75; font-size: 11px; }
 .banner-baseline-files {
   margin: 0;
   padding-left: 18px;

@@ -13,8 +13,8 @@ use app_lib::engine::svn_basemap::read_base_map;
 use app_lib::engine::svn_config::{read_config, write_config};
 use app_lib::engine::svn_follow::fault::{self, Crashed, Point};
 use app_lib::engine::svn_follow::{
-    follow, follow_auto, manual_follow, resume_follow, AutoFollowOutcome, FollowOutcome,
-    FollowReport,
+    follow, follow_auto, manual_follow, resume_follow, AutoConflict, AutoConflictFile,
+    AutoFollowOutcome, FollowOutcome, FollowReport,
 };
 use app_lib::engine::svn_follow_mark::write_mark;
 use app_lib::engine::svn_journal::{self, Flow, FollowStep, Journal, Phase};
@@ -123,7 +123,7 @@ fn done(o: AutoFollowOutcome) -> FollowReport {
 /// 没自动跟进：返回原因的 code 与文案。
 fn skipped(o: AutoFollowOutcome) -> (String, String) {
     match o {
-        AutoFollowOutcome::Skipped { code, message } => (code, message),
+        AutoFollowOutcome::Skipped { code, message, .. } => (code, message),
         other => panic!("应当不自动跟进：{other:?}"),
     }
 }
@@ -432,11 +432,110 @@ fn condition_7_a_replay_conflict_does_not_even_publish_the_baseline() {
 
     let message = assert_skipped_untouched(&fx, "svn_auto_follow_conflict");
 
-    assert!(message.contains(A), "{message}");
+    assert!(
+        message.contains(&format!("{A}（r")),
+        "带上 revision：{message}"
+    );
+    assert!(
+        !message.contains("更早的基线"),
+        "分支没落后，不说落后：{message}"
+    );
+    let c = conflict_of(&fx);
+    assert!(!c.lagging);
+    assert_eq!(
+        c.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+        [A]
+    );
+    assert!(c.files[0].rev.is_some());
     assert!(matches!(
         follow(&fx.wc_str(), "manual").unwrap(),
         FollowOutcome::NeedsManual { .. }
     ));
+}
+
+#[test]
+fn condition_7_on_a_lagging_branch_names_the_revision_and_says_the_file_is_not_new() {
+    // 2026-11-19 使用报告问题 1：横幅写着「SVN 侧有 1 个文件有新内容」，列的是 B；冲突的 A 只出现在
+    // 灰字原因里，第一眼像是 B 冲突了。A 是更早的 revision 改的：分支停在更早的基线上，重放要补上
+    // 那之后的全部改动。原因里要说清这一点，并写出 A 是哪个 revision 改的
+    let fx = hybrid_with_colleague();
+    write(&fx, A, "a-git\n");
+    commit_all(&fx, "git 里的版本");
+    write(&fx, A, "a-svn\n");
+    tortoise_commit(&fx, A);
+    let rev_a = youngest(&fx);
+    // 上一次跟进只发布了基线，分支冲突、没跟上
+    assert!(matches!(
+        follow(&fx.wc_str(), "first").unwrap(),
+        FollowOutcome::NeedsManual { .. }
+    ));
+    fx.colleague_commits(B, "b2\n");
+    set_author(&fx, youngest(&fx), "colleague");
+    svn_update(&fx, B);
+
+    let message = assert_skipped_untouched(&fx, "svn_auto_follow_conflict");
+
+    assert!(message.contains(&format!("{A}（r{rev_a}")), "{message}");
+    assert!(
+        !message.contains(B),
+        "新内容里的 B 没冲突，不能被点名：{message}"
+    );
+    assert!(message.contains("更早的基线"), "{message}");
+    assert!(
+        message.contains("切到了旧分支，或者上次跟进遇到了冲突"),
+        "{message}"
+    );
+    assert!(message.contains("不在这次的新内容里"), "{message}");
+
+    // 横幅按这份清单把冲突文件单独列一组，不再只是一行灰字
+    let c = conflict_of(&fx);
+    assert!(c.lagging);
+    assert_eq!(
+        c.files,
+        vec![AutoConflictFile {
+            path: A.into(),
+            rev: Some(rev_a),
+            author: c.files[0].author.clone(),
+            svn_removed: false,
+        }]
+    );
+    assert!(c.files[0].author.is_some(), "file:// 下作者是系统用户");
+}
+
+#[test]
+fn a_conflict_stopped_first_by_an_unverified_baseline_carries_no_conflict_list() {
+    // 条件 6 排在条件 7 前面：重放会冲突、但先因连不上服务器被拦下时，原因是「没核对成」，
+    // 横幅不能挂冲突那一组（冲突清单只跟着 `svn_auto_follow_conflict` 走，独立 review）
+    let fx = hybrid_with_colleague();
+    i_commit(&fx);
+    write(&fx, A, "a2\n");
+    commit_all(&fx, "中间版本");
+    write(&fx, A, "a3\n");
+    tortoise_commit(&fx, A);
+    let repo = fx.repo();
+    let away = fx.path().join("repo-offline");
+    std::fs::rename(&repo, &away).unwrap();
+    let out = catch_unwind(AssertUnwindSafe(|| auto(&fx)));
+    std::fs::rename(&away, &repo).unwrap();
+    match out.unwrap() {
+        AutoFollowOutcome::Skipped { code, conflict, .. } => {
+            assert_eq!(code, "svn_auto_follow_not_verified");
+            assert_eq!(conflict, None);
+        }
+        other => panic!("应当不自动跟进：{other:?}"),
+    }
+    // 连上之后同一个现场是冲突，带清单
+    assert_eq!(conflict_of(&fx).files.len(), 1);
+}
+
+/// 再跑一次自动跟进（不自动时什么都不动，可以重跑），取条件 7 的冲突清单。
+fn conflict_of(fx: &SvnFixture) -> AutoConflict {
+    match auto(fx) {
+        AutoFollowOutcome::Skipped {
+            conflict: Some(c), ..
+        } => c,
+        other => panic!("应当带冲突清单：{other:?}"),
+    }
 }
 
 #[test]

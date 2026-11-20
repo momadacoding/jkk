@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   autoFollowKey,
   describeAutoFollowDone,
+  describeAutoFollowConflict,
   describeAutoFollowSkip,
   describeCheckoutBehind,
   describeFollowContinue,
@@ -73,6 +74,33 @@ describe('自动跟进（事故分析 6.12）', () => {
 
   it('没自动的原因前面写明「没有自动跟进」', () => {
     expect(describeAutoFollowSkip('有冲突。')).toBe('没有自动跟进：有冲突。')
+  })
+
+  it('重放冲突的文件组：文件行与新内容列表同一种写法，分支落后时说清它们不一定在新内容里', () => {
+    const m = describeAutoFollowConflict({
+      files: [
+        { path: 'Code/A.cs', rev: 69007, author: 'xiebin', svnRemoved: false },
+        { path: 'Code/C.cs', rev: 5, author: null, svnRemoved: false },
+        { path: 'Code/D.cs', rev: null, author: null, svnRemoved: false },
+        { path: 'Code/E.cs', rev: 6, author: 'li', svnRemoved: true },
+      ],
+      lagging: true,
+    })
+    expect(m.title).toBe('没有自动跟进：当前分支的提交重放到新基线上，有 4 个文件冲突')
+    expect(m.files).toEqual([
+      'Code/A.cs  r69007  xiebin',
+      'Code/C.cs  r5',
+      'Code/D.cs',
+      'Code/E.cs  SVN 上已删除',
+    ])
+    expect(m.note).toContain('不一定在下面的新内容里')
+    expect(m.note).toContain('点「跟进」会弹出冲突的详情')
+
+    const fresh = describeAutoFollowConflict({
+      files: [{ path: 'Code/A.cs', rev: 2, author: 'li', svnRemoved: false }],
+      lagging: false,
+    })
+    expect(fresh.note).not.toContain('新内容')
   })
 
   describe('部分跟进之后只剩留下的文件：这个现场不必再自动试一次', () => {

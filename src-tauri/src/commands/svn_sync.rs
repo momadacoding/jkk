@@ -169,6 +169,7 @@ pub fn svn_follow_auto(
         return Ok(AutoFollowOutcome::Skipped {
             code: AUTO_FOLLOW_OFF.to_string(),
             message: "设置里关掉了自动跟进。".to_string(),
+            conflict: None,
         });
     }
     with_watch_suspended(&handle, &path, || follow_auto(&path, &new_opid()))

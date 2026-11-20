@@ -391,7 +391,47 @@ pub enum AutoFollowOutcome {
     Skipped {
         code: String,
         message: String,
+        /// 被重放冲突拦下（条件 7）时的冲突文件。`message` 是给托盘提示的一整句；横幅按这里把冲突
+        /// 文件单独列成一组，不然它们只是新内容列表上方的一行灰字（2026-11-19 使用报告问题 1）。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        conflict: Option<AutoConflict>,
     },
+}
+
+/// 自动跟进被重放冲突拦下时，横幅上那一组冲突文件。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoConflict {
+    /// 全部冲突文件，与 `ManualNeeded::files` 同序。
+    pub files: Vec<AutoConflictFile>,
+    /// 当前分支停在更早的基线上：冲突的文件可能不在这次的新内容里。
+    pub lagging: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoConflictFile {
+    pub path: String,
+    /// SVN 上最后改它的 revision。读不到时没有。
+    pub rev: Option<u64>,
+    pub author: Option<String>,
+    /// SVN 上已经删掉了。
+    pub svn_removed: bool,
+}
+
+/// 不自动跟进的原因，外加条件 7 的冲突文件（[`AutoFollowOutcome::Skipped`]）。
+struct AutoSkip {
+    err: GitError,
+    conflict: Option<AutoConflict>,
+}
+
+impl From<GitError> for AutoSkip {
+    fn from(err: GitError) -> Self {
+        AutoSkip {
+            err,
+            conflict: None,
+        }
+    }
 }
 
 /// 判定写回 ExternallyAdvanced 之后由前端发起（设置里关掉时命令层直接返回 `Skipped`）。
@@ -441,10 +481,12 @@ pub fn follow_auto(repo: &str, opid: &str) -> Result<AutoFollowOutcome> {
     )))
 }
 
-fn skipped(e: GitError) -> AutoFollowOutcome {
+fn skipped(e: impl Into<AutoSkip>) -> AutoFollowOutcome {
+    let s = e.into();
     AutoFollowOutcome::Skipped {
-        code: e.code,
-        message: e.message,
+        code: s.err.code,
+        message: s.err.message,
+        conflict: s.conflict,
     }
 }
 
@@ -456,10 +498,16 @@ fn skipped(e: GitError) -> AutoFollowOutcome {
 /// 原因：它说的是用户看得懂的那个问题，第二遍的原因可能只是排除之后的连带结果。
 ///
 /// `Err` 就是不自动跟进的原因，一个 ref 都没动。
-fn prepare_auto(repo: &str) -> Result<Plan> {
+fn prepare_auto(repo: &str) -> std::result::Result<Plan, AutoSkip> {
     let plan = prepare(repo, true, None)?;
-    let Some(first) = auto_blocker(&plan) else {
+    let Some(err) = auto_blocker(&plan) else {
         return Ok(plan);
+    };
+    let first = AutoSkip {
+        conflict: (err.code == "svn_auto_follow_conflict")
+            .then(|| auto_conflict(&plan))
+            .flatten(),
+        err,
     };
     let (Some(held), Some(rec)) = (held_candidates(repo, &plan), plan.rec.clone()) else {
         return Err(first);
@@ -712,11 +760,23 @@ fn auto_blocker(plan: &Plan) -> Option<GitError> {
             ))
         }
         Target::Conflict(m) => {
+            // 2026-11-19 使用报告问题 1：这句原因挂在「SVN 侧有 N 个文件有新内容」的横幅下面，冲突的文件
+            // 却可能不在那份列表里，第一眼像是列表里的文件冲突了。写出它是哪个 revision 改的；分支落后时
+            // 再说清它为什么不在列表里
+            let lag = if plan.lagging {
+                // 原因与 `branch_behind_not_auto` 同一套说法：落后不只是跟进冲突一种来路（独立 review）。
+                // 横幅不用这句（前端 `describeAutoFollowConflict` 按 `AutoConflict` 自己写了一份），只有托盘
+                // 用；改一边记得改另一边
+                "当前分支还停在更早的基线上（切到了旧分支，或者上次跟进遇到了冲突），重放要补上那之后 \
+                 SVN 上的全部改动，所以冲突的文件可能不在这次的新内容里。"
+            } else {
+                ""
+            };
             return Some(GitError::new(
                 "svn_auto_follow_conflict",
                 format!(
-                    "当前分支的提交重放到新基线上有冲突（{}），要你来判断。点「跟进」会弹出冲突的详情。",
-                    capped(m.files.clone(), "个文件")
+                    "当前分支的提交重放到新基线上有冲突：{}。{lag}要你来判断。点「跟进」会弹出冲突的详情。",
+                    capped(conflict_names(m), "个文件")
                 ),
             ))
         }
@@ -1390,6 +1450,9 @@ struct Plan {
     /// `svn/base` 的 CAS 旧值。等于 `new_base` 时是分支跟进入口，不动基线。
     old_base: String,
     new_base: String,
+    /// 分支自己的基线（[`branch_baseline`]）比 `old_base` 早：切到了旧分支，或者上次跟进只发布了基线。
+    /// 这时重放要补上那之后 SVN 上的全部改动，冲突的文件不一定在这次的新内容里。
+    lagging: bool,
     target: Target,
     others: Vec<BranchMove>,
     report: FollowReport,
@@ -2069,6 +2132,7 @@ fn prepare(repo: &str, auto: bool, partial: Option<&Partial>) -> Result<Plan> {
     Ok(Plan {
         branch,
         old_head,
+        lagging: scope != old_base,
         old_base,
         new_base,
         target,
@@ -2807,6 +2871,52 @@ fn summary_lines(changes: &[ExternalChange], removed: usize, me: Option<&str>) -
         lines.push(format!("{removed} 个文件已从 SVN 删除"));
     }
     lines
+}
+
+/// 冲突的文件，带上 SVN 上最后改它的 revision 与作者（读得到时）：`Code/A.cs（r69007 xiebin）`。
+/// SVN 上删掉了的标成「SVN 上已删除」，不然看着像一个没有任何信息的文件名（独立 review）。
+fn conflict_names(m: &ManualNeeded) -> Vec<String> {
+    m.files
+        .iter()
+        .map(|f| {
+            let Some(d) = m.details.iter().find(|d| &d.path == f) else {
+                return f.clone();
+            };
+            match (d.svn_removed, d.svn_rev, d.svn_author.as_deref()) {
+                (true, _, _) => format!("{f}（SVN 上已删除）"),
+                (false, Some(r), Some(who)) => format!("{f}（r{r} {who}）"),
+                (false, Some(r), None) => format!("{f}（r{r}）"),
+                (false, None, _) => f.clone(),
+            }
+        })
+        .collect()
+}
+
+/// 条件 7 的冲突文件，给横幅单独列一组。不是重放冲突（或磁盘是旧内容，那是另一条原因）时 `None`。
+fn auto_conflict(plan: &Plan) -> Option<AutoConflict> {
+    let Target::Conflict(m) = &plan.target else {
+        return None;
+    };
+    if m.stale_disk {
+        return None;
+    }
+    let files = m
+        .files
+        .iter()
+        .map(|f| {
+            let d = m.details.iter().find(|d| &d.path == f);
+            AutoConflictFile {
+                path: f.clone(),
+                rev: d.and_then(|d| d.svn_rev),
+                author: d.and_then(|d| d.svn_author.clone()),
+                svn_removed: d.is_some_and(|d| d.svn_removed),
+            }
+        })
+        .collect();
+    Some(AutoConflict {
+        files,
+        lagging: plan.lagging,
+    })
 }
 
 fn capped(items: Vec<String>, unit: &str) -> String {

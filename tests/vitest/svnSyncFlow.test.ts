@@ -196,6 +196,26 @@ describe('handleAutoFollow（事故分析 6.12）', () => {
     expect(log).not.toContain('clearError')
   })
 
+  it('被重放冲突拦下：冲突清单跟原因一起交给横幅', async () => {
+    const conflict = {
+      files: [{ path: 'Code/A.cs', rev: 2, author: 'li', svnRemoved: false }],
+      lagging: true,
+    }
+    vi.mocked(store.svnFollowAuto).mockResolvedValue({
+      kind: 'skipped',
+      code: 'svn_auto_follow_conflict',
+      message: '有冲突',
+      conflict,
+    })
+    const skips: unknown[] = []
+    const d = { ...deps([]), setAutoFollowSkip: (s: unknown) => skips.push(s) }
+
+    createSvnSyncFlow(d).handleAutoFollow('k1')
+    await vi.waitFor(() => expect(skips.length).toBeGreaterThan(0))
+
+    expect(skips.at(-1)).toEqual({ key: 'k1', message: '有冲突', conflict })
+  })
+
   it('设置里关掉了：不写原因，横幅照旧', async () => {
     const log: string[] = []
     vi.mocked(store.svnFollowAuto).mockResolvedValue({
