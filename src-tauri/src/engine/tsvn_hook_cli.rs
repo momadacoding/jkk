@@ -125,10 +125,18 @@ fn read_list(path: &PathBuf) -> Option<Vec<String>> {
     )
 }
 
+/// PATH 文件里的仓库相对路径。读不了、或者全在仓库外时返回 `None`：不写事件。
+fn repo_paths(repo: &str, lines: &[String]) -> Option<Vec<String>> {
+    let paths: Vec<String> = lines
+        .iter()
+        .filter_map(|l| to_repo_relative(repo, l))
+        .collect();
+    (!paths.is_empty()).then_some(paths)
+}
+
 pub fn run_hook(a: &HookArgs, now_ms: i64) -> HookOutcome {
     if a.kind == "check_commit" {
-        // Check-commit 不写事件：判定用不上它，只会在收件箱里堆垃圾
-        return check_commit(a);
+        return check_commit(a, now_ms);
     }
     let list = if a.kind == "post_update" {
         &a.result_file
@@ -138,13 +146,9 @@ pub fn run_hook(a: &HookArgs, now_ms: i64) -> HookOutcome {
     let Some(lines) = list.as_ref().and_then(read_list) else {
         return HookOutcome::default();
     };
-    let paths: Vec<String> = lines
-        .iter()
-        .filter_map(|l| to_repo_relative(&a.repo, l))
-        .collect();
-    if paths.is_empty() {
+    let Some(paths) = repo_paths(&a.repo, &lines) else {
         return HookOutcome::default();
-    }
+    };
     let error = a
         .error_file
         .as_ref()
@@ -158,6 +162,7 @@ pub fn run_hook(a: &HookArgs, now_ms: i64) -> HookOutcome {
         paths,
         revision: a.revision,
         error,
+        warned: None,
     };
     // 写不进去也放行：跟进时没有这条事件，只会落到「拿不准」
     let _ = write_event(&a.repo, &ev);
@@ -178,18 +183,53 @@ pub fn leak_outcome(leaks: &[crate::engine::svn_leak::Leak]) -> HookOutcome {
 
 /// 按勾选的文件检查 Local-Only 泄漏（分析 §6.13.4；日志 H3：拦截放在 Check-commit，用户
 /// Abort 后回到提交框，消息还在）。命中退出 1；读不到、算不出一律放行，由跟进时的 F3 兜底。
-fn check_commit(a: &HookArgs) -> HookOutcome {
+///
+/// 算出了结果就记一条 `check_commit` 事件，写明警告过的 hunk（没有泄漏时是空列表）：用户点
+/// Proceed anyway 提交之后，跟进凭它认出这些泄漏是看过警告的，不再拦自动跟进（设计
+/// `2026-11-16-tsvn-acknowledged-leaks.md` §5.1）。没有泄漏也记，是为了 Abort、删掉补丁、再提交时，
+/// 配上的是干净的这一次而不是前一次的警告。算不出时不记：没有事件，跟进照拦。写不进去不改判定。
+fn check_commit(a: &HookArgs, now_ms: i64) -> HookOutcome {
     use crate::engine::svn_leak::local_only_leaks_on_disk;
-    let Some(paths) = a.path_file.as_ref().and_then(read_list) else {
+    use crate::engine::tsvn_inbox::WarnedHunk;
+    let Some(lines) = a.path_file.as_ref().and_then(read_list) else {
         return HookOutcome::default();
     };
-    match local_only_leaks_on_disk(&a.repo, &paths) {
-        Ok(leaks) if !leaks.is_empty() => leak_outcome(&leaks),
-        Ok(_) => HookOutcome::default(),
+    let leaks = match local_only_leaks_on_disk(&a.repo, &lines) {
+        Ok(leaks) => leaks,
         Err(e) => {
             log::warn!("Check-commit 读不出 Local-Only 信息，放行：{}", e.message);
-            HookOutcome::default()
+            return HookOutcome::default();
         }
+    };
+    if let Some(paths) = repo_paths(&a.repo, &lines) {
+        let warned = leaks
+            .iter()
+            .flat_map(|l| {
+                l.hunks.iter().map(|h| WarnedHunk {
+                    commit: l.commit.clone(),
+                    path: l.path.clone(),
+                    old_start: h.old_start,
+                    lines: h.lines,
+                })
+            })
+            .collect();
+        let ev = TsvnEvent {
+            version: EVENT_VERSION,
+            kind: a.kind.clone(),
+            at_ms: now_ms,
+            paths,
+            revision: None,
+            error: None,
+            warned: Some(warned),
+        };
+        if let Err(e) = write_event(&a.repo, &ev) {
+            log::warn!("Check-commit 的事件写不进收件箱，判定照旧：{}", e.message);
+        }
+    }
+    if leaks.is_empty() {
+        HookOutcome::default()
+    } else {
+        leak_outcome(&leaks)
     }
 }
 

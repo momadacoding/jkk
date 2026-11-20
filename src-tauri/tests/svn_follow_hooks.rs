@@ -14,11 +14,15 @@ mod svn_fixtures;
 use app_lib::engine::git_cli::run_git;
 use app_lib::engine::svn_config::{read_config, write_config};
 use app_lib::engine::svn_follow::fault;
-use app_lib::engine::svn_follow::{follow, Evidence, FollowOutcome, FollowReport};
+use app_lib::engine::svn_follow::{
+    follow, follow_auto, AutoFollowOutcome, Evidence, FollowOutcome, FollowReport,
+};
 use app_lib::engine::svn_follow_index::StageDecision;
 use app_lib::engine::svn_follow_mark::{mark_path, write_mark};
+use app_lib::engine::svn_leak::Leak;
+use app_lib::engine::tsvn_hook_cli::{parse_hook_args, run_hook};
 use app_lib::engine::tsvn_hooks::HookHealth;
-use app_lib::engine::tsvn_inbox::{inbox_dir, write_event, TsvnEvent};
+use app_lib::engine::tsvn_inbox::{inbox_dir, write_event, TsvnEvent, WarnedHunk};
 use std::process::Command;
 use svn_fixtures::{hybrid_with_colleague, svn_cmd, SvnFixture};
 
@@ -96,6 +100,7 @@ fn event(fx: &SvnFixture, kind: &str, at_ms: i64, paths: &[&str], revision: Opti
             paths: paths.iter().map(|p| p.to_string()).collect(),
             revision,
             error: None,
+            warned: None,
         },
     )
     .unwrap();
@@ -397,4 +402,322 @@ fn follow_prunes_processed_events() {
     done(&fx);
 
     assert_eq!(inbox_count(&fx), 1);
+}
+
+// ---- 提交框里看过警告的泄漏（设计 2026-11-16-tsvn-acknowledged-leaks） ----
+//
+// Check-commit 用真的钩子入口跑（`run_hook`），磁盘上是什么它就警告什么；Pre / Post 照旧手写。
+
+const L_MSG: &str = "本地补丁\n\nLocal-Only: true";
+
+/// 真跑一次 Check-commit：PATH 是 `rels`，时刻 `at_ms`。返回退出码（1 = 拦下、弹了警告）。
+fn hook_check(fx: &SvnFixture, rels: &[&str], at_ms: i64) -> i32 {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = fx.wc_str().replace('\\', "/");
+    let body: String = rels.iter().map(|r| format!("{root}/{r}\r\n")).collect();
+    let p = tmp.path().join("p.tmp");
+    std::fs::write(&p, body).unwrap();
+    let m = tmp.path().join("m.tmp");
+    std::fs::write(&m, "").unwrap();
+    let args: Vec<std::ffi::OsString> = [
+        "--tsvn-hook".to_string(),
+        "check_commit".into(),
+        "--repo".into(),
+        fx.wc_str(),
+        p.display().to_string(),
+        m.display().to_string(),
+        fx.wc_str(),
+    ]
+    .iter()
+    .map(Into::into)
+    .collect();
+    run_hook(&parse_hook_args(&args).unwrap(), at_ms).code
+}
+
+/// 被警告后点 Proceed anyway：Check-commit 拦下（弹框）→ Pre → 真提交 → Post。
+fn proceed_anyway(fx: &SvnFixture, rel: &str, at_ms: i64) -> u64 {
+    assert_eq!(
+        hook_check(fx, &[rel], at_ms),
+        1,
+        "Check-commit 应当弹出警告"
+    );
+    hook_commit(fx, rel, at_ms + 100, at_ms + 200)
+}
+
+/// 分支上一个 Local-Only commit，把 A 改成补丁版本。返回它的 OID。
+fn local_only_on_a(fx: &SvnFixture) -> String {
+    write(fx, A, "a-log\n");
+    commit_all(fx, L_MSG)
+}
+
+fn auto(fx: &SvnFixture) -> AutoFollowOutcome {
+    follow_auto(&fx.wc_str(), "auto1").unwrap_or_else(|e| panic!("{}: {}", e.code, e.message))
+}
+fn auto_done(fx: &SvnFixture) -> FollowReport {
+    match auto(fx) {
+        AutoFollowOutcome::Done { report } => *report,
+        other => panic!("应当自动跟进完成：{other:?}"),
+    }
+}
+fn auto_skipped(fx: &SvnFixture) -> String {
+    match auto(fx) {
+        AutoFollowOutcome::Skipped { code, message } => {
+            assert_eq!(code, "svn_auto_follow_leak", "{message}");
+            message
+        }
+        other => panic!("应当因泄漏不自动跟进：{other:?}"),
+    }
+}
+fn leak_paths(leaks: &[Leak]) -> Vec<String> {
+    leaks.iter().map(|l| l.path.clone()).collect()
+}
+
+#[test]
+fn proceed_anyway_leak_does_not_stop_auto_follow() {
+    let fx = hybrid_with_colleague();
+    let l = local_only_on_a(&fx);
+    // 用真实时刻：1970 年的事件会被 14 天 TTL 清掉，测不出 C / P / Q 是跟着处理过的 Post 一起删的
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    proceed_anyway(&fx, A, now - 60_000);
+    // 跟进开始之后才到的事件（时刻在很远的将来）：留着给下一次，证明清理不是一刀切
+    event(&fx, "post_update", i64::MAX / 2, &[B], Some(99));
+    let _h = healthy();
+
+    let rep = auto_done(&fx);
+
+    assert!(rep.leaks.is_empty(), "{:?}", rep.leaks);
+    assert_eq!(leak_paths(&rep.acknowledged_leaks), vec![A.to_string()]);
+    assert_eq!(rep.acknowledged_leaks[0].commit, l);
+    assert!(
+        rep.held_back.is_empty(),
+        "不留在旧基线：{:?}",
+        rep.held_back
+    );
+    assert_eq!(show(&fx, "svn/base:Code/A.cs"), "a-log");
+    assert_eq!(rep.dropped, vec![l], "补丁整个上了 SVN，重放后变空、丢弃");
+    assert_eq!(
+        inbox_count(&fx),
+        1,
+        "用过的 C / P / Q 一起清掉，将来的那条留着"
+    );
+}
+
+#[test]
+fn a_clean_recheck_after_an_abort_is_the_one_that_counts() {
+    // Abort → 提交后恢复删掉补丁 → 再提交：第二次 Check-commit 是干净的。即使补丁另从别处上了服务器，
+    // 配上的也是干净的那次，不算确认（设计 §5.2 表第 3 行）
+    let fx = hybrid_with_colleague();
+    local_only_on_a(&fx);
+    assert_eq!(hook_check(&fx, &[A], 1_000), 1);
+    write_event(
+        &fx.wc_str(),
+        &TsvnEvent {
+            version: 1,
+            kind: "check_commit".into(),
+            at_ms: 1_050,
+            paths: vec![A.to_string()],
+            revision: None,
+            error: None,
+            warned: Some(Vec::new()),
+        },
+    )
+    .unwrap();
+    hook_commit(&fx, A, 1_100, 1_200);
+    let _h = healthy();
+
+    auto_skipped(&fx);
+}
+
+#[test]
+fn proceed_anyway_leak_is_reported_apart_in_a_manual_follow() {
+    let fx = hybrid_with_colleague();
+    local_only_on_a(&fx);
+    proceed_anyway(&fx, A, 1_000);
+    let _h = healthy();
+
+    let rep = done(&fx);
+
+    assert!(rep.leaks.is_empty(), "{:?}", rep.leaks);
+    assert_eq!(leak_paths(&rep.acknowledged_leaks), vec![A.to_string()]);
+}
+
+#[test]
+fn warned_then_committed_from_the_command_line_still_stops_auto_follow() {
+    // Abort 之后用命令行 svn ci：只有 C，没有 P / Q
+    let fx = hybrid_with_colleague();
+    local_only_on_a(&fx);
+    assert_eq!(hook_check(&fx, &[A], 1_000), 1);
+    tortoise_commit(&fx, A);
+    let _h = healthy();
+
+    auto_skipped(&fx);
+    let rep = done(&fx);
+    assert_eq!(leak_paths(&rep.leaks), vec![A.to_string()]);
+    assert!(rep.acknowledged_leaks.is_empty());
+}
+
+#[test]
+fn a_tortoise_commit_without_a_check_still_stops_auto_follow() {
+    // 关掉了「提交前拦截本地补丁」，或 Check-commit 算不出：P → Q，没有 C
+    let fx = hybrid_with_colleague();
+    local_only_on_a(&fx);
+    hook_commit(&fx, A, 1_100, 1_200);
+    let _h = healthy();
+
+    auto_skipped(&fx);
+}
+
+#[test]
+fn acknowledgement_is_not_used_when_hooks_are_not_healthy() {
+    let fx = hybrid_with_colleague();
+    local_only_on_a(&fx);
+    proceed_anyway(&fx, A, 1_000);
+    let _h = fault::pretend_hook_health(HookHealth::Stale {
+        reasons: vec!["exe 换了位置".into()],
+    });
+
+    auto_skipped(&fx);
+}
+
+#[test]
+fn a_local_only_commit_rewritten_after_the_warning_still_stops_auto_follow() {
+    let fx = hybrid_with_colleague();
+    local_only_on_a(&fx);
+    assert_eq!(hook_check(&fx, &[A], 1_000), 1);
+    // 警告之后、提交之前重写了这个 commit：OID 变了，对不上
+    git(
+        &fx,
+        &[
+            "commit",
+            "--amend",
+            "-qm",
+            "本地补丁（改过说明）\n\nLocal-Only: true",
+        ],
+    );
+    hook_commit(&fx, A, 1_100, 1_200);
+    let _h = healthy();
+
+    auto_skipped(&fx);
+}
+
+#[test]
+fn only_the_unacknowledged_file_stays_behind() {
+    // 补丁改了 A 和 B：A 是在提交框里看过警告后提交的，B 是命令行提交的
+    let fx = hybrid_with_colleague();
+    write(&fx, A, "a-log\n");
+    write(&fx, B, "b-log\n");
+    commit_all(&fx, L_MSG);
+    proceed_anyway(&fx, A, 1_000);
+    tortoise_commit(&fx, B);
+    let _h = healthy();
+
+    let rep = auto_done(&fx);
+
+    // 部分跟进的报告是第二遍（排除留下的文件之后）算的，B 的泄漏只出现在留下的原因里
+    assert_eq!(leak_paths(&rep.acknowledged_leaks), vec![A.to_string()]);
+    let held: Vec<String> = rep.held_back.iter().map(|h| h.path.clone()).collect();
+    assert_eq!(held, vec![B.to_string()]);
+    assert!(
+        rep.held_back[0].reason.contains("Local-Only"),
+        "{:?}",
+        rep.held_back
+    );
+    assert_eq!(show(&fx, "svn/base:Code/A.cs"), "a-log");
+    assert_eq!(show(&fx, "svn/base:Code/B.cs"), "b1");
+}
+
+#[test]
+fn an_unwarned_hunk_in_the_same_file_still_stops_auto_follow() {
+    // 同一个文件两处补丁，C 里只警告过第 2 行那一处（手写 C，模拟警告之后又改了磁盘）
+    let fx = hybrid_with_colleague();
+    seed_lines(&fx, A);
+    write(&fx, A, "1\n2-log\n3\n4\n5\n6\n7-log\n8\n");
+    let l = commit_all(&fx, L_MSG);
+    write_event(
+        &fx.wc_str(),
+        &TsvnEvent {
+            version: 1,
+            kind: "check_commit".into(),
+            at_ms: 1_000,
+            paths: vec![A.to_string()],
+            revision: None,
+            error: None,
+            warned: Some(vec![WarnedHunk {
+                commit: l.clone(),
+                path: A.to_string(),
+                old_start: 2,
+                lines: 1,
+            }]),
+        },
+    )
+    .unwrap();
+    hook_commit(&fx, A, 1_100, 1_200);
+    let _h = healthy();
+
+    let message = auto_skipped(&fx);
+    assert!(message.contains(A), "{message}");
+    let rep = done(&fx);
+    let starts = |leaks: &[Leak]| -> Vec<u32> {
+        leaks
+            .iter()
+            .flat_map(|l| l.hunks.iter().map(|h| h.old_start))
+            .collect()
+    };
+    assert_eq!(starts(&rep.leaks), vec![7]);
+    assert_eq!(starts(&rep.acknowledged_leaks), vec![2]);
+}
+
+#[test]
+fn a_sibling_branch_with_the_same_commit_stays_behind_without_stopping_auto_follow() {
+    // 另一条分支带着同一个 Local-Only commit（同一个 OID）：它照旧不移动（本期不处理落后基线），
+    // 但它的泄漏同样是看过警告的，不该挡住当前分支的自动跟进
+    let fx = hybrid_with_colleague();
+    local_only_on_a(&fx);
+    git(&fx, &["branch", "sib"]);
+    proceed_anyway(&fx, A, 1_000);
+    let _h = healthy();
+
+    let rep = auto_done(&fx);
+
+    assert!(rep.leaks.is_empty(), "{:?}", rep.leaks);
+    let branches: Vec<&str> = rep
+        .acknowledged_leaks
+        .iter()
+        .map(|l| l.branch.as_str())
+        .collect();
+    assert!(branches.contains(&"sib"), "{branches:?}");
+    assert!(
+        rep.behind_branches.iter().any(|(b, _)| b == "sib"),
+        "{:?}",
+        rep.behind_branches
+    );
+}
+
+#[test]
+fn a_conflict_reports_acknowledged_leaks_apart() {
+    // 当前分支另有一个 commit 改了 B，与同事的 B 冲突：转手动跟进，泄漏照样拆开
+    let fx = hybrid_with_colleague();
+    local_only_on_a(&fx);
+    write(&fx, B, "b-mine\n");
+    commit_all(&fx, "我的 B");
+    svn_cmd(&fx.wc(), &["revert", "--non-interactive", "--", B]);
+    proceed_anyway(&fx, A, 1_000);
+    fx.colleague_commits(B, "b2\n");
+    svn_update(&fx, B);
+    let _h = healthy();
+
+    match follow(&fx.wc_str(), "op1").unwrap() {
+        FollowOutcome::NeedsManual {
+            leaks,
+            acknowledged_leaks,
+            ..
+        } => {
+            assert!(leaks.is_empty(), "{leaks:?}");
+            assert_eq!(leak_paths(&acknowledged_leaks), vec![A.to_string()]);
+        }
+        other => panic!("应当转手动跟进：{other:?}"),
+    }
 }

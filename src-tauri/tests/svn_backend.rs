@@ -994,6 +994,18 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
                 preview: None,
             }],
         }],
+        acknowledged_leaks: vec![Leak {
+            branch: "work".into(),
+            commit: "l".into(),
+            subject: "s".into(),
+            path: "Code/B.cs".into(),
+            hunks: vec![HunkLeak {
+                old_start: 2,
+                lines: 1,
+                verdict: LeakVerdict::Present,
+                preview: None,
+            }],
+        }],
         stale_disk: true,
         snapshot: vec![("s1".into(), vec!["Code/B.cs".into()])],
         details: vec![ConflictDetail {
@@ -1018,6 +1030,13 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
                 "subject": "s",
                 "path": "Code/A.cs",
                 "hunks": [{ "oldStart": 3, "lines": 1, "verdict": "unknown" }],
+            }],
+            "acknowledgedLeaks": [{
+                "branch": "work",
+                "commit": "l",
+                "subject": "s",
+                "path": "Code/B.cs",
+                "hunks": [{ "oldStart": 2, "lines": 1, "verdict": "present" }],
             }],
             "staleDisk": true,
             "snapshot": [["s1", ["Code/B.cs"]]],
@@ -1158,6 +1177,18 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
                     },
                 ],
             }],
+            acknowledged_leaks: vec![Leak {
+                branch: "work".into(),
+                commit: "l".into(),
+                subject: "s".into(),
+                path: "Code/J.cs".into(),
+                hunks: vec![HunkLeak {
+                    old_start: 2,
+                    lines: 1,
+                    verdict: LeakVerdict::Present,
+                    preview: None,
+                }],
+            }],
         }),
     })
     .unwrap();
@@ -1207,6 +1238,11 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     assert_eq!(r["pinnedRef"], "refs/mygitclient/follow/x", "实际 {v}");
     assert_eq!(r["evidence"], "hooks", "实际 {v}");
     assert_eq!(r["evidenceCutoffMs"], 42, "实际 {v}");
+    assert_eq!(r["acknowledgedLeaks"][0]["path"], "Code/J.cs", "实际 {v}");
+    assert_eq!(
+        r["acknowledgedLeaks"][0]["hunks"][0]["oldStart"], 2,
+        "实际 {v}"
+    );
     // journal 里的旧报告没有这两个字段：读回来按作者 + 快照判定
     let mut old = r.clone();
     old.as_object_mut().unwrap().remove("evidence");
@@ -1225,7 +1261,10 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     old.as_object_mut().unwrap().remove("driftLines");
     // 「对比」按钮之前的 journal 没有 driftRange
     old.as_object_mut().unwrap().remove("driftRange");
+    // 提交时已确认的泄漏（设计 2026-11-16-tsvn-acknowledged-leaks）之前的 journal 没有 acknowledgedLeaks
+    old.as_object_mut().unwrap().remove("acknowledgedLeaks");
     let back: FollowReport = serde_json::from_value(old).unwrap();
+    assert!(back.acknowledged_leaks.is_empty());
     assert!(back.held_back.is_empty());
     assert!(back.drift_lines.is_empty());
     assert_eq!(back.drift_range, None);

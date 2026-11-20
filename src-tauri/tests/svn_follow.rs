@@ -1387,10 +1387,12 @@ fn follow_conflict_publishes_only_baseline() {
             files,
             baseline_published,
             leaks,
+            acknowledged_leaks,
             stale_disk,
             snapshot,
             details,
         } => {
+            assert!(acknowledged_leaks.is_empty());
             assert!(snapshot.is_empty(), "没有快照内容：{snapshot:?}");
             assert_eq!(details.len(), files.len(), "每个冲突文件一条上下文");
             assert_eq!(at, c);

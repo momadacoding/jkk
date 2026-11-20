@@ -36,6 +36,11 @@
 - [x] 场景 3：同一路径用命令行 `svn ci` 提交（不经过钩子）→ 暂存保留、标「拿不准」
 - [x] 场景 4：TortoiseSVN 对子目录 Update，带下同事改动 → 与暂存三方合并
 - [x] 场景 5：Local-Only 补丁：「提交后恢复」删掉补丁再提交不拦；整文件提交被 Check-commit 拦下，中文正常，Abort 回到提交框
+- [x] 场景 5d（2026-11-20 新增）：被拦后点 Proceed anyway 提交 → 跟进不再因泄漏拦下，报告里是「提交时已确认」。
+  2026-11-20 全部 4 步通过（Claude 用 UI Automation 点真 TortoiseSVN 1.14.9，应用是本分支的 dev 构建）：弹框中文正常；Proceed anyway
+  后提交成功（r3）；收件箱三条事件齐全，`check_commit` 的 `warned` 为 `Code/L.cs` 第 2 行 1 行，**`pre_commit` 与 `check_commit` 的
+  `paths` 完全相同**（设计 §8 第 4 条实测通过），C→P 相隔 18.3 秒、P→Q 0.2 秒。应用启动即自动跟进完成（1.3 秒），无泄漏横幅；报告
+  有「提交时已确认的 Local-Only 改动」一节，`Code/L.cs` 在「已从分支移除」组下；「调试补丁」commit 被丢弃，不再在 `work` 上；收件箱已空
 - [x] 场景 6：过期导致提交失败，更新之后再提交 → 跟进正常，孤儿 Pre 不误配对
 - [x] 场景 7：jkk 换了位置 → 横幅提示失效；原位置的 exe 不存在时 TortoiseSVN 提交的真实表现；重新注册后恢复
 - [ ] 场景 7c（可选）：盘符根目录，未跑，见场景 7 末尾
@@ -237,6 +242,31 @@ function Hooks {
 **应该看到（5c）：** 弹「Hook script failed」，内容是英文，没有成串的 `?`：`jkk: these files contain Local-Only patches; committing would upload them to the server:`、`Code/L.cs: line 2 onward, from commit "????"`（commit 标题「调试补丁」是中文，在 1252 里照样变 `?`，这是预期），下一行缩进 4 格 `+line 02 DEBUG_PATCH`，最后一行 `Uncheck these files, or use "Restore after commit" to drop these changes before committing.`。点 **Abort**。仍是中文问号时先注销重登再试一次（新进程从用户 locale 初始化线程 locale），还不对就记为失败。
 
 3. 区域格式改回第 1 步记下的值。
+
+### 5d：看过警告仍然提交，跟进不再拦第二次（2026-11-20 新增）
+
+设计见 `docs/superpowers/specs/2026-11-16-tsvn-acknowledged-leaks.md`，对应分支 `worktree-tsvn-ack-leaks`。
+
+> ⚠️ 这一步要跑**那个分支的** exe：0.1 里的 `$w` 换成 `C:\Users\liuhao\workspace\dev\Dev\mygitclient\.claude\worktrees\tsvn-ack-leaks`，
+> 起来后照 0.1 核对进程路径在这个 worktree 下。钩子注册的命令行指向注册时那个 exe：先在注册框里点「重新注册」，再用 `Hooks` 确认
+> jkk 条目还是 4 条。旧 exe 的 Check-commit 不写事件，用它做这一步一定会被拦。
+
+1. 5c 做完之后 `L.cs` 第 2 行仍是 `line 02 DEBUG_PATCH`，第 18 行是 `line 18 FEATURE`。资源管理器 → `WC` 右键 → **SVN Commit...**，
+   只勾 `Code\L.cs`，点 OK。
+2. 弹「Hook script failed」（与 5a 同一个框）。这次点 **Proceed anyway**，提交完成后关掉进度框。
+3. **操作窗口：** `Inbox`
+
+   **应该看到：** 三条事件，`kind` 依次是 `check_commit`、`pre_commit`、`post_commit`，`paths` 都是 `["Code/L.cs"]`。
+   `check_commit` 那条有 `warned`，里面一项 `"path":"Code/L.cs"`、`"oldStart":2`、`"lines":1`。
+   **`check_commit` 与 `pre_commit` 的 `paths` 必须完全相同**：这是设计 §8 第 4 条要实测的（Proceed anyway 之后 PATH 不变）。不同就记下两边原文，
+   这时跟进会照旧拦（配不上），不算这一步失败，但要回报。
+4. **应用：** 点回应用。
+
+**应该看到（5d）：** 顶部**没有**「当前分支的 Local-Only 补丁可能已经被带上了 SVN 服务器」这条横幅，而是「已自动跟进 SVN 侧的新内容」的提示，
+点它的 **查看详情** 打开跟进报告（设置里关了自动跟进时，改为点横幅上的「跟进」，报告直接弹出）。报告里**没有**红色的「泄漏告警」，
+有一节灰色的「提交时已确认的 Local-Only 改动」，列着 `Code/L.cs`，在「已从分支移除：内容都在 SVN 上了」那一组下面。操作窗口 `G log --oneline -3` 里已经没有「调试补丁」这个 commit；再跑一次 `Inbox`：空了。
+
+**看到别的说明：** 还是出了泄漏横幅：先看第 3 步三条事件齐不齐、`paths` 是否相同、钩子状态是不是「已注册」（钩子失效时不读事件）。
 
 ## 场景 6：过期导致提交失败
 

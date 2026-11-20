@@ -6,7 +6,7 @@
 use app_lib::engine::tsvn_hook_cli::{
     parse_hook_args, run_hook, to_repo_relative, tsvn_hook_main, HookArgs,
 };
-use app_lib::engine::tsvn_inbox::{inbox_dir, TsvnEvent};
+use app_lib::engine::tsvn_inbox::{inbox_dir, TsvnEvent, WarnedHunk};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -155,8 +155,73 @@ fn check_commit_hit_exits_one_with_message() {
         out.stderr_en.lines().last(),
         Some("Uncheck these files, or use \"Restore after commit\" to drop these changes before committing.")
     );
-    // 拦截也不写事件
-    assert!(fx.events().is_empty());
+    // 拦下的同时记一条事件，写明警告过哪些 hunk：用户点 Proceed anyway 提交之后，跟进据此认出
+    // 这是「看过警告的」（设计 2026-11-16-tsvn-acknowledged-leaks §5.1）
+    let evs = fx.events();
+    assert_eq!(evs.len(), 1);
+    assert_eq!(
+        (evs[0].kind.as_str(), evs[0].at_ms, evs[0].revision),
+        ("check_commit", 1, None)
+    );
+    assert_eq!(evs[0].paths, vec!["Code/A.cs".to_string()]);
+    assert_eq!(
+        evs[0].warned,
+        Some(vec![WarnedHunk {
+            commit: head(&fx),
+            path: "Code/A.cs".into(),
+            old_start: 2,
+            lines: 1,
+        }])
+    );
+}
+
+fn head(fx: &Fx) -> String {
+    app_lib::engine::git_cli::run_git(&fx.repo_str(), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+#[test]
+fn check_commit_event_is_written_in_the_shape_old_versions_can_read() {
+    // 旧版 jkk 读到它只当一条没有 revision 的事件：版本仍是 1，字段名是 camelCase
+    let fx = fx();
+    git_repo(&fx, true);
+    check_commit(&fx);
+    let dir = inbox_dir(&fx.repo_str());
+    let file = fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+    let v: serde_json::Value = serde_json::from_slice(&fs::read(file).unwrap()).unwrap();
+    assert_eq!(v["version"], 1);
+    assert_eq!(v["warned"][0]["oldStart"], 2);
+    assert_eq!(v["warned"][0]["path"], "Code/A.cs");
+}
+
+/// 收件箱的位置被一个文件占了：建不了目录，写事件失败。
+fn block_inbox(fx: &Fx) {
+    let inbox = inbox_dir(&fx.repo_str());
+    fs::create_dir_all(inbox.parent().unwrap()).unwrap();
+    fs::write(&inbox, "not a dir").unwrap();
+}
+
+#[test]
+fn check_commit_still_blocks_when_the_event_cannot_be_written() {
+    let fx = fx();
+    git_repo(&fx, true);
+    block_inbox(&fx);
+    let out = check_commit(&fx);
+    assert_eq!(out.code, 1, "写事件失败不改判定");
+    assert!(out.stderr.contains("Code/A.cs"), "{}", out.stderr);
+    // 写入确实失败了：收件箱的位置还是那个文件，没有冒出事件
+    assert!(inbox_dir(&fx.repo_str()).is_file());
+}
+
+#[test]
+fn check_commit_without_leaks_still_exits_zero_when_the_event_cannot_be_written() {
+    let fx = fx();
+    git_repo(&fx, false);
+    block_inbox(&fx);
+    assert_eq!(check_commit(&fx).code, 0);
+    assert!(inbox_dir(&fx.repo_str()).is_file());
 }
 
 #[test]
@@ -165,6 +230,12 @@ fn check_commit_without_local_only_commits_exits_zero() {
     git_repo(&fx, false);
     let out = check_commit(&fx);
     assert_eq!((out.code, out.stderr.as_str()), (0, ""));
+    // 检查过、没有泄漏也记一条，`warned` 是空列表：Abort 之后删掉补丁再提交时，配对配上的是这一条，
+    // 不是前一次的警告（设计 §5.1）
+    let evs = fx.events();
+    assert_eq!(evs.len(), 1);
+    assert_eq!(evs[0].kind, "check_commit");
+    assert_eq!(evs[0].warned, Some(Vec::new()));
 }
 
 #[test]
@@ -175,6 +246,8 @@ fn check_commit_on_error_fails_open() {
         .unwrap();
     let out = check_commit(&fx);
     assert_eq!((out.code, out.stderr.as_str()), (0, ""));
+    // 算不出泄漏就不记：没有这条事件，跟进不会把任何泄漏当成已确认
+    assert!(fx.events().is_empty());
 }
 
 /// 真实进程、真实命令行：注册时写的 `hook_command` 原样拼上 TortoiseSVN 追加的参数，交给
@@ -485,7 +558,7 @@ fn post_commit_with_nonempty_error_records_the_error() {
 }
 
 #[test]
-fn check_commit_writes_no_event_and_exits_zero() {
+fn check_commit_in_a_directory_that_is_not_a_repo_writes_no_event_and_exits_zero() {
     let fx = fx();
     let p = fx.list_file("p.tmp", &[fx.tsvn_path("Code/A.cs")]);
     let m = fx.file("m.tmp", "");
