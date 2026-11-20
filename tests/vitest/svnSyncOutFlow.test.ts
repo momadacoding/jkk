@@ -74,6 +74,8 @@ function deps(log: string[], typed = '修复跳跃'): SvnSyncOutFlowDeps & { dra
     fetchSvnLog: async () => {
       log.push('fetchSvnLog')
     },
+    // 不记日志：只有补丁落回阶段的「继续」用它，那几个用例自己接
+    setSyncActionBusy: () => {},
   }
 }
 
@@ -245,5 +247,86 @@ describe('交付前的 merge driver 确认', () => {
     await flow.handleSyncOutAction('syncOutAbort')
     await flow.handleSyncOutAction('syncOutCleanup')
     expect(store.svnSyncOutAbort).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('补丁落回冲突时的「我已解决，继续」不再弹确认框（2026-11-19 使用报告问题 2）', () => {
+  const at = (phase: string) => () => ({
+    locked: false,
+    holder: null,
+    unfinished: { flow: 'sync_out' as const, phase: phase as never, opid: 'x', startedAt: 1 },
+  })
+  const busyLog = (log: string[]) => (b: { id: string; label: string } | null) => {
+    log.push(b ? `busy:${b.id}|${b.label}` : 'busy:null')
+  }
+
+  it('restoring-branch：按钮显示「正在继续…」→ 执行 → 刷新 → 复位，不弹确认框', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncOutContinue).mockImplementation(async () => {
+      log.push('continue')
+      return { kind: 'delivered', rev: 2, branch: 'work', localOnlyLeft: 0 }
+    })
+
+    await createSvnSyncOutFlow({
+      ...deps(log),
+      syncState: at('restoring-branch'),
+      setSyncActionBusy: busyLog(log),
+    }).handleSyncOutAction('syncOutContinue')
+
+    expect(log.slice(0, 8)).toEqual([
+      'clearError',
+      'guardMerge',
+      'busy:syncOutContinue|正在继续…',
+      'continue',
+      'refreshSvnSyncState',
+      'refreshSvnSync',
+      'fetchSvnLog',
+      'busy:null',
+    ])
+    expect(log).not.toContain('confirm:继续交付')
+  })
+
+  it('restoring-branch 还有没解决的文件：刷新横幅、进错误条、按钮复位', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncOutContinue).mockRejectedValue({ code: 'sync_out_unresolved' })
+
+    await createSvnSyncOutFlow({
+      ...deps(log),
+      syncState: at('restoring-branch'),
+      setSyncActionBusy: busyLog(log),
+    }).handleSyncOutAction('syncOutContinue')
+
+    expect(log.some((l) => l.startsWith('confirm:'))).toBe(false)
+    expect(log.indexOf('refreshSvnSyncState')).toBeGreaterThan(-1)
+    expect(log.indexOf('refreshSvnSyncState')).toBeLessThan(log.indexOf('reportError:sync_out_unresolved'))
+    expect(log.at(-1)).toBe('busy:null')
+  })
+
+  it('restoring-branch 继续之后又停在冲突上：按钮先复位，结局照常报出来', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncOutContinue).mockResolvedValue({ kind: 'rebaseConflict', rev: 7, files: ['Code/P.cs'] })
+
+    await createSvnSyncOutFlow({
+      ...deps(log),
+      syncState: at('restoring-branch'),
+      setSyncActionBusy: busyLog(log),
+    }).handleSyncOutAction('syncOutContinue')
+
+    const notice = log.findIndex((l) => l.startsWith('confirm:'))
+    expect(notice).toBeGreaterThan(log.indexOf('busy:null'))
+    expect(log.filter((l) => l.startsWith('confirm:'))).toHaveLength(1) // 只有结局提示，没有确认框
+    expect(log).not.toContain('confirm:继续交付')
+  })
+
+  it('post-commit 的「继续交付」照旧确认：框里说要先更新白名单目录、需要网络', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncOutContinue).mockResolvedValue({ kind: 'delivered', rev: 2, branch: 'work', localOnlyLeft: 0 })
+    await createSvnSyncOutFlow({
+      ...deps(log),
+      syncState: at('post-commit'),
+      setSyncActionBusy: busyLog(log),
+    }).handleSyncOutAction('syncOutContinue')
+    expect(log).toContain('confirm:继续交付')
+    expect(log.some((l) => l.startsWith('busy:'))).toBe(false)
   })
 })

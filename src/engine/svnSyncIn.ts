@@ -341,6 +341,17 @@ export function syncActions(phase: string, abortLabel = '放弃，回到更新�
   }
 }
 
+/**
+ * 横幅上的「继续」要不要先弹确认框（2026-11-19 使用报告问题 2）。手动跟进共用。
+ *
+ * rebase 冲突时不要：按钮写着「我已解决，继续」，本身就是确认；还有没解决的文件时后端什么都不改
+ * 就拒绝（`continue_sync`），误点也没有危害，它做什么写在横幅说明里。放回改动那一步要：框里有
+ * 「备份留在 stash 列表里、由你确认后自己删」这条新信息。
+ */
+export function continueNeedsConfirm(phase: string): boolean {
+  return phase !== 'rebase'
+}
+
 const AFTER_UPDATE_ABORT =
   '回到更新前的分支，放回未提交的改动。SVN 那一侧已经更新的部分不会退回——' +
   '如果基线还没跟上，顶部会提示失同步，用「重建基线」即可。'

@@ -27,6 +27,47 @@ function renderWith(syncState: SyncState) {
   return { onSyncAction, onSyncOutAction }
 }
 
+describe('BaselineBanner 未收尾横幅：「继续」执行中（2026-11-19 使用报告问题 2）', () => {
+  // rebase 冲突时的「我已解决，继续」不再弹框，进度挪到按钮上；不然点完没有任何反馈
+  const rebase: SyncState = {
+    locked: false,
+    holder: null,
+    unfinished: { flow: 'follow_manual', phase: 'rebase', opid: 'x', startedAt: 1 },
+  }
+
+  it('执行中的那颗按钮换成进度文案，同一条横幅上的按钮都禁用', () => {
+    const onSyncAction = vi.fn()
+    render(
+      <BaselineBanner
+        isSvn
+        sync={null}
+        audit={null}
+        eol={null}
+        syncState={rebase}
+        onRebuild={() => {}}
+        onCheck={() => {}}
+        onMigrateEol={() => {}}
+        onSyncAction={onSyncAction}
+        onSyncOutAction={() => {}}
+        onSvnUpdate={() => {}}
+        syncActionBusy={{ id: 'syncContinue', label: '正在继续…' }}
+      />,
+    )
+    const busy = screen.getByRole('button', { name: '正在继续…' }) as HTMLButtonElement
+    expect(busy.disabled).toBe(true)
+    const abort = screen.getByRole('button', { name: '放弃，回到手动跟进前' }) as HTMLButtonElement
+    expect(abort.disabled).toBe(true)
+    fireEvent.click(abort)
+    expect(onSyncAction).not.toHaveBeenCalled()
+  })
+
+  it('没在执行：按原文案、可以点', () => {
+    const { onSyncAction } = renderWith(rebase)
+    fireEvent.click(screen.getByRole('button', { name: '我已解决，继续' }))
+    expect(onSyncAction.mock.calls).toEqual([['syncContinue']])
+  })
+})
+
 describe('BaselineBanner 未收尾横幅的按钮分发', () => {
   it('交付记录的按钮走交付流程，绝不交给「更新」的继续 / 放弃', () => {
     // 那两个命令会以 sync_out_not_supported 拒绝交付记录——按钮点了只会报错

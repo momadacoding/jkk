@@ -43,6 +43,7 @@ import type { HookHealth, TsvnHooksStatus } from '../engine/tsvnHooks'
 import { createSvnSyncFlow } from './svnSyncFlow'
 import { reportAutoFollowBlocked } from '@/store/attentionStore'
 import { createSvnSyncOutFlow } from './svnSyncOutFlow'
+import type { SyncActionBusy } from './svnFlowShared'
 import { useDeliverDialog } from './DeliverDialog'
 import { useFollowReportDialog } from './FollowReportDialog'
 import { SplitLocalOnlyDialog, type SplitLocalOnlyRequest } from './SplitLocalOnlyDialog'
@@ -237,6 +238,8 @@ export function RepoTab({
   const { showFollowReport, dialog: followReportDialog } = useFollowReportDialog()
   // 跟进执行中（svnSyncFlow 写），横幅上的按钮据此禁用
   const [following, setFollowing] = useState(false)
+  // 未收尾横幅上执行中的那颗按钮（更新、交付两个流程写）：rebase 冲突时的「继续」不弹框，进度在按钮上
+  const [syncActionBusy, setSyncActionBusy] = useState<SyncActionBusy | null>(null)
   // 自动跟进（事故分析 6.12）：没自动的原因（按现场 key 记，过时的不显示）与完成后的提示
   const [autoSkip, setAutoSkip] = useState<{ key: string; message: string } | null>(null)
   const [autoFollowed, setAutoFollowed] = useState<FollowReport | null>(null)
@@ -1104,6 +1107,7 @@ export function RepoTab({
     refreshSvnSync,
     fetchSvnLog,
     setFollowing,
+    setSyncActionBusy,
     refreshAfterFollow: async () => {
       void refreshHooksHealth()
       // 三路同时发，不一项等一项（使用报告 10.5）。读图排在读 HEAD 后面：接 SVN 历史时要拿新的 HEAD 当
@@ -1160,6 +1164,7 @@ export function RepoTab({
     refreshSvnSyncState,
     refreshSvnSync,
     fetchSvnLog,
+    setSyncActionBusy,
   })
 
   /**
@@ -1261,6 +1266,7 @@ export function RepoTab({
         onMigrateEol={() => void handleMigrateEol()}
         onSyncAction={(id) => void handleSyncAction(id)}
         onSyncOutAction={(id) => void handleSyncOutAction(id)}
+        syncActionBusy={syncActionBusy}
         onSvnUpdate={() => void handleSvnUpdate()}
         onFollow={() => void handleFollow()}
         followBusy={following}
