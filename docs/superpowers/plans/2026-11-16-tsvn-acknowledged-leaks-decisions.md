@@ -11,7 +11,7 @@
 | T2 收件箱 C↔P 配对、已确认集合、清理 | 完成 | `tsvn_inbox::{HookEvidence::acknowledged, latest_before, check_of, is_lead_up}`；`read_evidence`、`prune_inbox` | `tests/tsvn_inbox.rs` 新增 11 条，25/25 |
 | T3 跟进拆分 `leaks` / `acknowledgedLeaks`；journal 兼容 | 完成 | `FollowReport::acknowledged_leaks`、`FollowOutcome::NeedsManual::acknowledged_leaks`、`ManualNeeded`、`Who::acknowledged`、`split_acknowledged`、`OthersCtx::acknowledged` | `tests/svn_follow_hooks.rs` 新增 11 条（含 review 后补的 1 条），24/24；`svn_backend.rs` 序列化与旧 journal；`svn_follow.rs` 的 `NeedsManual` 解构补字段 |
 | T4 前端报告分节 | 完成 | `svnFollow.ts` 的 `acknowledgedLeaks` 类型、`acknowledgedLeaks` 节、冲突框的 `ackedLeakSection` | `svnFollow.test.ts` 新增 5 条；`FollowReportDialog.test.tsx` 新增 1 条 |
-| T5 E2E 5d、独立 review、PR | 进行中：review 完成；E2E 5d 未跑 | E2E 5d 写进 `e2e/2026-11-02-svn-c1h-tsvn-hooks-e2e.md`；review 修复见 T5 节 | review 后 `svn_follow_hooks` 24/24、`tsvn_hook_cli` 30/30，fmt / clippy 干净 |
+| T5 E2E 5d、独立 review、PR | 完成（PR 187，Draft） | E2E 5d 写进 `e2e/2026-11-02-svn-c1h-tsvn-hooks-e2e.md`；review 修复见 T5 节 | review 后 `svn_follow_hooks` 24/24、`tsvn_hook_cli` 30/30，fmt / clippy 干净；E2E 5d 4/4 步通过（2026-11-20，真 TortoiseSVN 1.14.9） |
 
 T1–T4 的整体验证（2026-11-20，本 worktree）：
 
@@ -30,6 +30,8 @@ T1–T4 的整体验证（2026-11-20，本 worktree）：
 - **§8 第 3 条 窗口**：沿用 `PAIR_WINDOW_MS`（10 分钟），没有实测数据前不另起常量。
 - **§8 第 4 条**：留到 T5 的 E2E 5d 实测。实测之前，配对规则按设计要求路径集合完全相同；万一 Proceed anyway 之后 PATH
   不同，结果是配不上、照旧拦（安全方向），不会错误放行。
+  **2026-11-20 实测（TortoiseSVN 1.14.9）**：Proceed anyway 之后 `pre_commit` 的 `paths` 与 `check_commit` 完全相同（都是
+  `["Code/L.cs"]`）。用户盯着警告框的那段时间计入 C→P 间隔，这次 18.3 秒，远小于 10 分钟窗口。
 
 ### T1 Check-commit 写事件
 
@@ -94,3 +96,14 @@ T1–T4 的整体验证（2026-11-20，本 worktree）：
 4. **nit，不改**：整文件判定的哨兵 `(0, 0)` 与「文件开头纯插入」的 hunk 同形。只有磁盘与 NEW 对二进制的判断不一致、且补丁另从别处上了
    服务器时才会误认，本期不改；以后要收紧，就在 `WarnedHunk` 里区分整文件。
 5. **nit，已补**：两条「写事件失败」的用例加断言：收件箱位置仍是那个文件，确实没写进去。
+
+### T5 E2E 5d（2026-11-20）
+
+- 环境：真 TortoiseSVN 1.14.9；本分支 `pnpm tauri dev`，用 `--config` 换成独立 identifier，核对过进程路径在本 worktree 下；
+  fixture 在 scratch 目录。TortoiseSVN 的按钮用 Windows UI Automation 找到后发 `BM_CLICK` 点击（这些 Win32 按钮被 UIA 报成 Pane，没有 Invoke）。
+- 结果：第 1–3 步见上面 §8 第 4 条。第 4 步：应用启动即自动跟进（1.3 秒），不出泄漏横幅；报告的「提交时已确认的 Local-Only 改动」
+  一节列 `Code/L.cs`，在「已从分支移除」组下；「丢弃的 commit」是 `2abbb6b`，判定依据是钩子事件；收件箱跟进后清空（C / P / Q 连带删除，
+  与 T2 的清理规则一致）。
+- **计划没写的坑**：中间 dev 应用被系统以内存不足停掉过一次，重启后由「打开仓库时的自动跟进」完成第 4 步，不需要再点回窗口。
+- 收尾：用 `tsvn_hooks_unregister` 撤销 fixture 的钩子注册，`HKCU\Software\TortoiseSVN` 的 `hooks` 值恢复为不存在（注册前就不存在）；
+  删掉 fixture 目录与该 identifier 的 `%APPDATA%`、`%LOCALAPPDATA%` 目录。
