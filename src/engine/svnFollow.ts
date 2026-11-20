@@ -209,7 +209,53 @@ export type FollowOutcome =
  */
 export type AutoFollowOutcome =
   | { kind: 'done'; report: FollowReport }
-  | { kind: 'skipped'; code: string; message: string }
+  | { kind: 'skipped'; code: string; message: string; conflict?: AutoFollowConflict }
+
+/**
+ * 后端 `svn_follow::AutoConflict`：被重放冲突拦下时的冲突文件。`message` 是给托盘的一整句，横幅按这里
+ * 把冲突文件单独列成一组（2026-11-19 使用报告问题 1）。旧后端没有。
+ */
+export interface AutoFollowConflict {
+  files: { path: string; rev: number | null; author: string | null; svnRemoved: boolean }[]
+  /** 当前分支停在更早的基线上：冲突的文件可能不在这次的新内容里。 */
+  lagging: boolean
+}
+
+/** 横幅上「为什么没自动跟进」的原因：一整句，被重放冲突拦下时另带冲突文件。 */
+export interface AutoFollowSkip {
+  message: string
+  conflict?: AutoFollowConflict
+}
+
+/** 横幅上冲突文件那一组。 */
+export interface AutoFollowConflictModel {
+  title: string
+  files: string[]
+  note: string
+}
+
+/**
+ * 冲突文件单独成组，排在新内容列表上面、用醒目的颜色。只是一行灰字的话，第一眼看到的是下面的新内容
+ * 列表，像是列表里的文件冲突了（2026-11-19 使用报告问题 1）。文件行与新内容列表同一种写法。
+ */
+export function describeAutoFollowConflict(c: AutoFollowConflict): AutoFollowConflictModel {
+  const files = c.files.map((f) => {
+    if (f.svnRemoved) return `${f.path}  SVN 上已删除`
+    if (f.rev == null) return f.path
+    return `${f.path}  r${f.rev}${f.author ? `  ${f.author}` : ''}`
+  })
+  // 同一个意思后端也写了一份（`svn_follow::auto_blocker` 条件 7 的 `lag`），那句只给托盘；改一边记得改另一边
+  const lag = c.lagging
+    ? '这些文件不一定在下面的新内容里：当前分支还停在更早的基线上（切到了旧分支，或者上次跟进遇到了冲突），' +
+      '重放要补上那之后 SVN 上的全部改动。'
+    : ''
+  return {
+    // 重放的是提交，不是文件（独立 review）
+    title: `没有自动跟进：当前分支的提交重放到新基线上，有 ${c.files.length} 个文件冲突`,
+    files,
+    note: `${lag}要你来判断，点「跟进」会弹出冲突的详情。`,
+  }
+}
 
 /** 设置里关掉了自动跟进（后端 `commands::svn_sync::AUTO_FOLLOW_OFF`）。横幅照旧，不写原因。 */
 export const AUTO_FOLLOW_OFF = 'svn_auto_follow_off'

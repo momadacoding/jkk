@@ -17,8 +17,10 @@ import {
   type SyncStateUnreadable,
 } from '../engine/svnJournal'
 import {
+  describeAutoFollowConflict,
   describeAutoFollowSkip,
   describePendingRestores,
+  type AutoFollowConflict,
   type AutoFollowNotice,
   type FollowActionId,
   type PendingRestore,
@@ -82,6 +84,11 @@ interface BaselineBannerProps {
    * 核对过（`autoFollowKey`），过时的原因不会传进来。
    */
   autoFollowSkip?: string | null
+  /**
+   * 被重放冲突拦下时的冲突文件（与 `autoFollowSkip` 同一次结果）。有它时不写那一行灰字，冲突文件
+   * 单独成组、排在新内容列表上面（2026-11-19 使用报告问题 1）。
+   */
+  autoFollowConflict?: AutoFollowConflict | null
   /** 自动跟进完成后那条不打断操作的提示。`null` 不渲染。 */
   autoFollowed?: AutoFollowNotice | null
   /** 提示上的「查看详情」：弹同一份跟进报告。 */
@@ -150,6 +157,7 @@ export function BaselineBanner({
   onOpenHooks,
   onUnregisterHooks,
   autoFollowSkip = null,
+  autoFollowConflict = null,
   autoFollowed = null,
   onAutoFollowedDetails,
   onAutoFollowedDismiss,
@@ -178,10 +186,13 @@ export function BaselineBanner({
   // 「跟进」只在调用方接了流程时才出现（见 `onFollow` 的说明）
   const modelActions = (model?.actions ?? []).filter((a) => a.id !== 'follow' || onFollow)
   // 只挂在「SVN 侧有新内容」上：别的横幅（回退、钉死的 external）本来就不会自动跟进
-  const skipNote =
-    model && autoFollowSkip && sync?.verdict.kind === 'externallyAdvanced'
-      ? describeAutoFollowSkip(autoFollowSkip)
+  const skipApplies = !!model && !!autoFollowSkip && sync?.verdict.kind === 'externallyAdvanced'
+  const conflictGroup =
+    skipApplies && autoFollowConflict && autoFollowConflict.files.length > 0
+      ? describeAutoFollowConflict(autoFollowConflict)
       : null
+  const skipNote =
+    skipApplies && !conflictGroup && autoFollowSkip ? describeAutoFollowSkip(autoFollowSkip) : null
   // 自动跟进的提示不受 hushed 影响：它说的是已经做完的事
   const notice = isSvn ? autoFollowed : null
   // 中间态时让位：后端那时也不给数据，这里再挡一次
@@ -295,6 +306,20 @@ export function BaselineBanner({
           )}
           {model.note && <p className="banner-baseline-note">{model.note}</p>}
           {skipNote && <p className="banner-baseline-note">{skipNote}</p>}
+          {conflictGroup && (
+            <div className="banner-baseline-conflict" role="alert">
+              <strong>{conflictGroup.title}</strong>
+              <ul className="banner-baseline-files">
+                {conflictGroup.files.map((f) => (
+                  <li key={f}>{f}</li>
+                ))}
+              </ul>
+              <p className="banner-baseline-note">{conflictGroup.note}</p>
+            </div>
+          )}
+          {conflictGroup && model.files && model.files.length > 0 && (
+            <p className="banner-baseline-files-label">SVN 侧的新内容：</p>
+          )}
           {model.files && model.files.length > 0 && (
             <ul className="banner-baseline-files">
               {model.files.map((f) => (

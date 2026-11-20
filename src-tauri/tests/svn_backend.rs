@@ -1042,15 +1042,38 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     );
 
     // 自动跟进（事故分析 6.12）的两种结局，前端 `AutoFollowOutcome` 照这个形状读
-    use app_lib::engine::svn_follow::AutoFollowOutcome;
+    use app_lib::engine::svn_follow::{AutoConflict, AutoConflictFile, AutoFollowOutcome};
     let v = serde_json::to_value(AutoFollowOutcome::Skipped {
         code: "svn_auto_follow_stage".into(),
         message: "m".into(),
+        conflict: None,
     })
     .unwrap();
     assert_eq!(
         v,
         serde_json::json!({ "kind": "skipped", "code": "svn_auto_follow_stage", "message": "m" })
+    );
+    // 条件 7：横幅按 `conflict` 单独列出冲突文件（2026-11-19 使用报告问题 1）
+    let v = serde_json::to_value(AutoFollowOutcome::Skipped {
+        code: "svn_auto_follow_conflict".into(),
+        message: "m".into(),
+        conflict: Some(AutoConflict {
+            files: vec![AutoConflictFile {
+                path: "Code/A.cs".into(),
+                rev: Some(7),
+                author: None,
+                svn_removed: false,
+            }],
+            lagging: true,
+        }),
+    })
+    .unwrap();
+    assert_eq!(
+        v["conflict"],
+        serde_json::json!({
+            "files": [{ "path": "Code/A.cs", "rev": 7, "author": null, "svnRemoved": false }],
+            "lagging": true,
+        })
     );
     let v = serde_json::to_value(AutoFollowOutcome::Done {
         report: Box::default(),

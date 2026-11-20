@@ -26,6 +26,7 @@ import {
   describeManualFollowOutcome,
   heldBackScene,
   type AutoFollowOutcome,
+  type AutoFollowSkip,
   type FollowActionId,
   type FollowOutcome,
   type FollowReport,
@@ -115,7 +116,7 @@ export interface SvnSyncFlowDeps {
   /** 暂时性原因重试前的等待。测试里换成立即返回。 */
   wait: (ms: number) => Promise<void>
   /** 没自动跟进的原因，给横幅；`null` 清掉。`key` 是 `autoFollowKey` 算的现场。 */
-  setAutoFollowSkip: (skip: { key: string; message: string } | null) => void
+  setAutoFollowSkip: (skip: (AutoFollowSkip & { key: string }) | null) => void
   /** 自动跟进完成：挂那条不打断操作的提示，详情是同一份报告。 */
   showAutoFollowed: (report: FollowReport) => void
   /**
@@ -357,7 +358,11 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
       d.setFollowing(false)
     }
     if (outcome.kind === 'skipped') {
-      d.setAutoFollowSkip(outcome.code === AUTO_FOLLOW_OFF ? null : { key, message: outcome.message })
+      d.setAutoFollowSkip(
+        outcome.code === AUTO_FOLLOW_OFF
+          ? null
+          : { key, message: outcome.message, conflict: outcome.conflict },
+      )
       // 原因在工作副本里（SVN 冲突）：处理掉之后现场键不变，不放掉就再也不自动了。
       // 期间记下的已经是别的现场时不动它
       if (RECHECK_SKIPS.has(outcome.code) && d.autoTried.current === key) d.autoTried.current = null

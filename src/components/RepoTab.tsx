@@ -53,6 +53,7 @@ import {
   describeRestoreSkips,
   driftDiffTarget,
   keepOnNewFollow,
+  type AutoFollowSkip,
   type FollowReport,
   type PendingRestore,
 } from '../engine/svnFollow'
@@ -238,7 +239,7 @@ export function RepoTab({
   // 跟进执行中（svnSyncFlow 写），横幅上的按钮据此禁用
   const [following, setFollowing] = useState(false)
   // 自动跟进（事故分析 6.12）：没自动的原因（按现场 key 记，过时的不显示）与完成后的提示
-  const [autoSkip, setAutoSkip] = useState<{ key: string; message: string } | null>(null)
+  const [autoSkip, setAutoSkip] = useState<(AutoFollowSkip & { key: string }) | null>(null)
   const [autoFollowed, setAutoFollowed] = useState<FollowReport | null>(null)
   // 「N 个文件缺 Local-Only 补丁」横幅（计划 2026-11-12-auto-restore-local-only 的 C）
   const [pendingRestores, setPendingRestores] = useState<PendingRestore[]>([])
@@ -340,8 +341,9 @@ export function RepoTab({
   }, [active, state.capabilities.vcs, state.svnSync, state.headHash, autoNudge])
 
   // 横幅上「没有自动跟进」的那行原因：只认当前现场的（`autoFollowKey`），现场变了旧原因就不作数
-  const autoFollowBlocked =
-    autoSkip && autoSkip.key === autoFollowKey(state.svnSync, state.headHash) ? autoSkip.message : null
+  const autoSkipNow =
+    autoSkip && autoSkip.key === autoFollowKey(state.svnSync, state.headHash) ? autoSkip : null
+  const autoFollowBlocked = autoSkipNow?.message ?? null
   // 同一行原因也挂到任务栏和托盘上（使用报告 9.5）：人不在看这个窗口时横幅没人看见。
   // 原因行没了就撤；标签关掉时也撤，不留一个没有出处的角标
   useEffect(() => {
@@ -1268,6 +1270,7 @@ export function RepoTab({
         onOpenHooks={() => void openHooks()}
         onUnregisterHooks={() => void unregisterHooks()}
         autoFollowSkip={autoFollowBlocked}
+        autoFollowConflict={autoSkipNow?.conflict ?? null}
         autoFollowed={autoFollowed ? describeAutoFollowDone(autoFollowed) : null}
         onAutoFollowedDetails={() => {
           if (autoFollowed) void showReport(autoFollowed)
