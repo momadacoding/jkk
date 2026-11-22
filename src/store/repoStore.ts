@@ -624,6 +624,20 @@ export function readCommitFileDiff(
   return invoke<DiffData>('commit_file_diff', { path, rev, file, oldFile, options })
 }
 
+/**
+ * `commit:` / `range:` scope 里一个文件的 diff。`read_diff` 因为文件太多只列了文件（`summaryOnly`）时，
+ * 提交详情点到哪个文件读哪个（第 73 条）。改名那一条要带上 `oldFile` 才配得成对。
+ */
+export function readDiffFile(
+  path: string,
+  scope: string,
+  file: string,
+  oldFile: string | null,
+  options: BackendDiffOptions,
+): Promise<DiffData> {
+  return invoke<DiffData>('read_diff_file', { path, scope, file, oldFile, options })
+}
+
 /** 当前 diff 面板开关对应的后端选项和它的键。 */
 function currentDiffOptions(): { options: BackendDiffOptions, key: string } {
   const options = backendDiffOptions(getDiffPrefs())
