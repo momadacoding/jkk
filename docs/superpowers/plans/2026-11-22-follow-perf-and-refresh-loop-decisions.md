@@ -7,7 +7,7 @@
 | T1 冲突后刷新死循环 | 完成（根因待现场确认，见 T1） | `commands/watch.rs`：`.git` 下的目录事件不叫醒刷新；`repo-changed cause` 打点；`is_relevant` 公开。`tests/svn_follow.rs` 1 个、`watch.rs` 单测 3 个 | `cargo test --lib commands::watch` 13/13（连跑 3 次）；`cargo test --test svn_follow` 144/144；fmt / clippy 干净 |
 | T2 手动跟进共用一次扫描 | 完成 | `svn_follow.rs` `manual_follow` 前置三项包进 `with_scan_cache`；新测试二进制 `tests/svn_follow_manual_scan_budget.rs` | 改前 2 遍 → 改后 1 遍；`svn_follow manual` 35/35；`svn_follow_scan_budget` 1/1；fmt / clippy 干净 |
 | T3 floor shape 只读一次 | 完成 | `svn_cli::scan_scope_generation`；`svn_wcdb::floor_shapes` 按（代次, 仓库, 单元, floor）缓存；`svn_follow_scan_budget` 加断言；`svn_cli.rs` 1 个测试 | 改前 2 次 → 改后 1 次；svn_cli 29、svn_wcdb 32、svn_health_local_floor 33、svn_health 51、svn_follow_auto 40、svn_follow 144、svn_init 100、svn_baseline 31、reuse_base 1、reuse_safety 2 全过；fmt / clippy 干净 |
-| T4 暂存区预判 | 未开始 | | |
+| T4 暂存区预判 | 完成 | `svn_follow_index::judge_staging`；`svn_follow::staging_blocks_partial` 接进 `prepare_auto`，注释改正；新测试二进制 `tests/svn_follow_auto_stage_early.rs`（a）；`svn_follow_auto.rs` 2 个（b、c） | a 改前第二遍照跑（floor shape 2 次）→ 改后 1 次；svn_follow_auto 42、svn_follow_index 35、svn_follow_hooks 24、svn_follow_snapshot 12、svn_follow 144、scan_budget 1 全过；fmt / clippy 干净 |
 | T5 验证、review、PR | 未开始 | | |
 
 ## 决策条目
@@ -70,5 +70,30 @@
   照常生效。
 
 ### T4
+
+- **计划的错误**：测试 a 计划用「`health floor answered locally` 只出现一次」作「第二遍没跑」的标记。
+  实测这条记录只在有单元由本地回答时才写；fixture 里第二遍的体检全部问服务器，记录一条都不写，
+  改前改后都是 1，测不出差别。改用 `wc.db floor shape` 的次数：它只在体检里读；第二遍 floor 更低，
+  T3 的缓存不命中，所以改前 2 次、改后 1 次。
+- **计划没写的坑**：
+  1. 只对 B 做局部 `svn update` 时，部分跟进的 floor 与整次相同，第二遍**不会**重新确认墓碑、也不再体检，
+     测不出现场那 28 s。要根目录整体 update（每天早上的常态）把全部节点带到最新 revision，A 留在旧基线上
+     floor 才会往下掉。测试 a 用的就是这个形状。
+  2. 铺场景时那次「跟进」按规矩留着 `refs/mygitclient/follow/seed`，残留断言只能查这次的 `auto1`。
+  3. 变异检查：去掉 `touched` 过滤，测试 c 变红（B 被提前判成「拿不准」）；去掉 `held` 过滤，测试 b 仍是绿的。
+     原因：留下的文件（冲突、泄漏、重放与磁盘对不上）都来自分支提交，必然在 `old_base → old_head`
+     改过的路径里，`touched` 已经盖住它们。Ruling：`held` 过滤保留，作冗余防线 —— 代价：无（多一次集合查找）；
+     测试 b 守的是「留下的文件暂存照旧」这一结局，名字与它测的一致。
+- **偏离计划**：
+  1. 索引里有冲突时 `judge_staging` 返回空报告、不提前拦：原流程会报它自己的原因（`svn_follow_index_conflicted`），
+     预判不该换掉那个原因。
+  2. 读不出分支改过的路径（`tree_diff` 出错）时不提前拦：没法安全过滤，就照原流程走。
+  3. 提前拦时返回的是暂存区的原因（`svn_auto_follow_stage`），不是第一遍的原因（例如冲突）。原来第二遍跑完、
+     发布时也是返回暂存区的原因，所以结局与原来相同；只有「第二遍本来会因别的原因失败」时，原来返回第一遍的
+     原因、现在返回暂存区的原因。Ruling：接受 —— 两者都是真实的跳过原因，暂存区那条更具体 —— 代价：横幅文案
+     在这一小类场景里换了一条。
+- **为什么这么改是安全的**：见 `staging_blocks_partial` 的注释。判「拦」时什么都没动过（测试 a 断言 ref、索引
+  字节、`index.lock`、钉住的 ref、journal 全部不变）；判「不拦」照原流程、发布时持锁重判。`compose` 里的三方合并
+  只往对象库写 blob（`.git/objects/` 被 watcher 忽略）。
 
 ### T5

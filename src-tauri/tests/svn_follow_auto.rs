@@ -1245,6 +1245,64 @@ fn a_replay_conflict_on_one_file_leaves_only_that_file_behind() {
     assert_skipped_untouched(&fx, "svn_auto_follow_conflict");
 }
 
+/// 计划 2026-11-22 T4 测试 b：部分跟进之前会先判一次暂存区（OLD → NEW），保不住就不跑第二遍。
+/// 暂存的正是被留在旧基线上的冲突文件时，第二遍不会动它，提前判出来的「保不住」不能算数。
+#[test]
+fn staging_on_the_held_conflict_file_is_not_judged_early() {
+    let fx = hybrid_with_colleague();
+    i_commit(&fx);
+    write(&fx, A, "a2\n");
+    commit_all(&fx, "中间版本");
+    write(&fx, A, "a3\n");
+    tortoise_commit(&fx, A);
+    fx.colleague_commits(B, "b2\n");
+    svn_update(&fx, B);
+    // A 暂存成第三种内容，磁盘留着 SVN 的版本
+    write(&fx, A, "a-staged\n");
+    git(&fx, &["add", A]);
+    write(&fx, A, "a3\n");
+
+    let rep = done(auto(&fx));
+
+    assert_eq!(held(&rep), vec![A.to_string()]);
+    assert_eq!(show(&fx, "svn/base:Code/B.cs"), "b2");
+    assert_eq!(
+        show(&fx, ":Code/A.cs"),
+        "a-staged",
+        "留在旧基线上的文件，暂存照旧"
+    );
+}
+
+/// 计划 2026-11-22 T4 测试 c：暂存的路径被分支提交改过、又不在留下的文件里。发布时拼索引比的是
+/// 分支重放前后（`old_head → tip`），这条路径在两边相同、根本不进判定；提前判用的 OLD → NEW 却会
+/// 看到它（「作者是我、分不清先后」→ 拿不准）。这类路径不能提前判。
+#[test]
+fn staging_on_a_path_the_branch_changed_is_not_judged_early() {
+    let fx = hybrid_with_colleague();
+    i_commit(&fx);
+    // 分支一笔提交同时改了 A 与 B；B 原样提交到 SVN（重放时这一半已在 SVN 上），A 提交成别的内容（冲突）
+    write(&fx, A, "a2\n");
+    write(&fx, B, "b-branch\n");
+    commit_all(&fx, "分支");
+    tortoise_commit(&fx, B);
+    write(&fx, A, "a3\n");
+    tortoise_commit(&fx, A);
+    // B 再暂存一版，磁盘留着 SVN 的版本
+    write(&fx, B, "b-staged\n");
+    git(&fx, &["add", B]);
+    write(&fx, B, "b-branch\n");
+
+    let out = auto(&fx);
+
+    if let AutoFollowOutcome::Skipped { code, message, .. } = &out {
+        assert_ne!(
+            code, "svn_auto_follow_stage",
+            "分支改过的暂存路径被提前判成保不住：{message}"
+        );
+    }
+    assert_eq!(show(&fx, ":Code/B.cs"), "b-staged", "暂存照旧");
+}
+
 #[test]
 fn a_leaked_file_stays_behind_so_the_warning_keeps_showing() {
     let fx = hybrid_with_colleague();
