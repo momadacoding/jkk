@@ -5,7 +5,7 @@
 | Task | 状态 | 产出 | 验证 |
 |---|---|---|---|
 | T1 冲突后刷新死循环 | 完成（根因待现场确认，见 T1） | `commands/watch.rs`：`.git` 下的目录事件不叫醒刷新；`repo-changed cause` 打点；`is_relevant` 公开。`tests/svn_follow.rs` 1 个、`watch.rs` 单测 3 个 | `cargo test --lib commands::watch` 13/13（连跑 3 次）；`cargo test --test svn_follow` 144/144；fmt / clippy 干净 |
-| T2 手动跟进共用一次扫描 | 未开始 | | |
+| T2 手动跟进共用一次扫描 | 完成 | `svn_follow.rs` `manual_follow` 前置三项包进 `with_scan_cache`；新测试二进制 `tests/svn_follow_manual_scan_budget.rs` | 改前 2 遍 → 改后 1 遍；`svn_follow manual` 35/35；`svn_follow_scan_budget` 1/1；fmt / clippy 干净 |
 | T3 floor shape 只读一次 | 未开始 | | |
 | T4 暂存区预判 | 未开始 | | |
 | T5 验证、review、PR | 未开始 | | |
@@ -45,6 +45,13 @@
   `--perf` 验；`repo-changed cause` 会直接给出源头路径。
 
 ### T2
+
+- **偏离计划**：无。`require_changes_in_whitelist` 也一起包进范围：它在 `run_preflight_with` 之后、
+  `svn_journal::write` 之前，同样只读。
+- **计划没写的坑**：改前实测 `manual_follow` 期间真实执行的全量扫描正好 2 遍（与现场一致），stash 与 rebase
+  之后的步骤一遍都没有，所以断言写成精确的「1 遍」。
+- **为什么这么改是安全的**：范围止于 `svn_journal::write` 之前，`stash_wip` / rebase 改工作副本之后的读取
+  不在缓存里。缓存范围内的两次检查之间没有任何写操作。手动跟进的 35 个集成测试全过。
 
 ### T3
 

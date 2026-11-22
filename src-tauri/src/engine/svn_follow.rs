@@ -1275,16 +1275,21 @@ pub fn manual_follow(repo: &str, opid: &str) -> Result<SyncInOutcome> {
     let scope = branch_baseline(repo, &head, &base)?;
     require_linear(repo, &scope, &head)?;
     let cfg = read_config(repo)?;
-    if !matches!(check_sync_with_nodes(repo)?.0.verdict, SyncVerdict::InSync) {
-        return Err(GitError::new(
-            "svn_follow_manual_stale",
-            "基线和工作副本又对不上了（可能又有新的外部提交，或者 SVN 操作还没做完）。手动跟进只把\
-             分支重放到已发布的基线上，请先点一次「跟进」。什么都没有改动。",
-        ));
-    }
-    // 这个入口不录制，分析 §6.5 的前置条件没有别处把关（同分支跟进入口）
-    run_preflight_with(repo, &cfg.whitelist, true)?;
-    require_changes_in_whitelist(repo, &cfg.whitelist)?;
+    // 判定一致与前置校验都只读、之间工作副本没动，共用一遍全量 `svn status`（2026-11-21 使用报告
+    // §2.5：现场各扫一遍，合计 5.5 s）。范围到此为止：下面的 stash 与 rebase 会改工作副本，之后的
+    // 读取必须是新的
+    with_scan_cache(|| -> Result<()> {
+        if !matches!(check_sync_with_nodes(repo)?.0.verdict, SyncVerdict::InSync) {
+            return Err(GitError::new(
+                "svn_follow_manual_stale",
+                "基线和工作副本又对不上了（可能又有新的外部提交，或者 SVN 操作还没做完）。手动跟进只把\
+                 分支重放到已发布的基线上，请先点一次「跟进」。什么都没有改动。",
+            ));
+        }
+        // 这个入口不录制，分析 §6.5 的前置条件没有别处把关（同分支跟进入口）
+        run_preflight_with(repo, &cfg.whitelist, true)?;
+        require_changes_in_whitelist(repo, &cfg.whitelist)
+    })?;
 
     let floor = read_base_map(repo, &scope)?.floor;
     let rebase_todo = snapshot_todo(repo, &scope, &head, &base)?;
