@@ -246,6 +246,9 @@ fn own_write_verdict(key: &str, index: &Path, since: Instant) -> OwnVerdict {
 /// （新对象落进新的两位前缀子目录）。后两个是 `stage_and_unstage_only_touch_the_index` 实测出来的；
 /// 它们本身不带信息，外部真有改动时总有自己那条子路径的事件（index、refs……）。linked worktree 的
 /// index 在 per-worktree gitdir 里，对象库在 commondir 里，所以两个目录分开取。
+///
+/// 路径里带 `/.git/` 的常见布局下，这两个目录事件已经被 `is_relevant` 当成目录丢掉，到不了这里
+/// （2026-11-22 T1）；留着是给路径里没有 `.git` 的 gitdir（`--separate-git-dir`）。
 struct OwnWritePaths {
     index: PathBuf,
     gitdir: PathBuf,
@@ -324,11 +327,25 @@ const TICK: Duration = Duration::from_millis(100);
 /// TortoiseSVN 钩子收件箱（`tsvn_inbox::inbox_dir`）在 `.git` 下的位置，正斜杠形式。
 const INBOX_EVENTS: &str = "/.git/mygitclient/tsvn-inbox/";
 
+/// 一次 `repo-changed` 是被哪条路径叫醒的（性能记录模式）。
+///
+/// 2026-11-21 使用报告 §2.1：停在 rebase 冲突上时一秒一轮全量刷新，日志里只有刷新本身，
+/// 看不出是哪个文件在变；fixture 里又复现不出来。记下这一批里第一条起作用的路径（`Wake::Yes`，
+/// 或核对后不是自己写的 index 一类），下次现场就能直接看到源头。
+fn cause_record(path: &Path) -> crate::engine::perf::Record {
+    let mut rec = crate::engine::perf::Record::rust("watch", "repo-changed cause");
+    rec.meta.insert(
+        "path".to_string(),
+        path.to_string_lossy().into_owned().into(),
+    );
+    rec
+}
+
 /// 判断一个文件事件是否值得触发刷新。
 ///
 /// 注意：路径要先归一化成正斜杠——Windows 上 notify 给出的是
 /// `C:\repo\.git\index`，直接匹配 `/.git/` 永远不成立。
-fn is_relevant(repo: Option<&git2::Repository>, root: &Path, target: &Path) -> bool {
+pub fn is_relevant(repo: Option<&git2::Repository>, root: &Path, target: &Path) -> bool {
     let s = target.to_string_lossy().replace('\\', "/");
     if s.contains("/.git/") || s.ends_with("/.git") {
         // 同步锁是例外：另一个进程开始 / 结束同步时，界面要跟着挂上 / 撤掉横幅
@@ -352,6 +369,14 @@ fn is_relevant(repo: Option<&git2::Repository>, root: &Path, target: &Path) -> b
         // 失焦快照（`svn_follow_mark`）是客户端自己写的线索，每次切窗口写一次，放过去
         // 就是每次切窗口多一轮全量刷新。里面的内容不影响任何面板
         if s.contains("/.git/mygitclient/") || s.ends_with("/.git/mygitclient") {
+            return false;
+        }
+        // git 内部的**目录**本身不带信息（决策日志 2026-11-22 T1）：`.git` 下建了又删一个临时文件
+        // （git 的 index.lock、本应用的临时索引），Windows 会对所在目录报一次 Modify，哪怕什么都没改。
+        // 一条只读的 `git status` 就有一次（`an_idle_git_status_does_not_wake_a_refresh`）。真有改动时
+        // 被改的文件（index、HEAD、refs/…）总有自己那条路径的事件，所以丢掉目录事件不漏刷新。
+        // 删掉的目录查不到类型，按文件处理，照常刷新
+        if target.is_dir() {
             return false;
         }
         // git 内部：锁文件和对象库写入是高频噪声，refs / HEAD / index 才有意义
@@ -419,6 +444,11 @@ pub fn watch_repo(handle: AppHandle, path: String) -> Result<()> {
         // 攒着的「自己写 index 也会碰到的路径」里最早那条到达的时刻：到点核对再决定
         let mut own_only_since: Option<Instant> = None;
         let mut last_change = Instant::now();
+        // 性能记录模式下，这一批里第一条起作用的路径（`cause_record`）：一定要刷新的优先，
+        // 没有时取第一条 index 一类的。不开记录时不攒，免得每个事件多一次分配
+        let perf_on = crate::engine::perf::enabled();
+        let mut cause: Option<PathBuf> = None;
+        let mut own_cause: Option<PathBuf> = None;
         loop {
             let still_mine = watchers()
                 .lock()
@@ -434,8 +464,16 @@ pub fn watch_repo(handle: AppHandle, path: String) -> Result<()> {
                             Wake::No => continue,
                             Wake::IfNotOwn => {
                                 own_only_since.get_or_insert_with(Instant::now);
+                                if perf_on && own_cause.is_none() {
+                                    own_cause = Some(p.clone());
+                                }
                             }
-                            Wake::Yes => pending = true,
+                            Wake::Yes => {
+                                pending = true;
+                                if perf_on && cause.is_none() {
+                                    cause = Some(p.clone());
+                                }
+                            }
                         }
                         last_change = Instant::now();
                     }
@@ -454,6 +492,7 @@ pub fn watch_repo(handle: AppHandle, path: String) -> Result<()> {
                         OwnVerdict::Pending => continue,
                         OwnVerdict::Own => {
                             own_only_since = None;
+                            own_cause = None;
                             continue;
                         }
                         OwnVerdict::NotOwn => {}
@@ -461,11 +500,16 @@ pub fn watch_repo(handle: AppHandle, path: String) -> Result<()> {
                 }
                 pending = false;
                 own_only_since = None;
+                let woke_by = cause.take().or(own_cause.take());
+                own_cause = None;
                 // 挂起期间**丢弃**事件而不是攒着：同步结束时调用方会主动发一次，
                 // 攒着只会在恢复的瞬间连发几百条。
                 if !is_watch_suspended(&path) {
                     // 带上路径，前端各标签据此只刷新自己那个仓库
                     let _ = handle.emit("repo-changed", &path);
+                    if let Some(p) = woke_by {
+                        crate::engine::perf::record(&cause_record(&p));
+                    }
                 }
             }
         }
@@ -514,17 +558,143 @@ mod tests {
     }
 
     #[test]
+    fn directory_events_inside_the_git_dir_do_not_wake_a_refresh() {
+        // 2026-11-21 使用报告 §2.1 的排查（决策日志 T1）：`.git` 下建了又删一个临时文件
+        // （git 的 index.lock、本应用的临时索引），Windows 会对**目录本身**报一次 Modify。
+        // 目录事件不带信息：真有改动时，被改的那个文件总有自己那条路径的事件
+        let (_d, root, repo) = real_repo();
+        std::fs::create_dir_all(root.join(".git/refs/heads")).unwrap();
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        for dir in [".git", ".git/hooks", ".git/refs/heads", ".git/objects"] {
+            assert!(
+                !is_relevant(Some(&repo), &root, &root.join(dir)),
+                "{dir} 是目录，不该叫醒刷新"
+            );
+        }
+        for file in [
+            ".git/index",
+            ".git/HEAD",
+            ".git/refs/heads/main",
+            ".git/packed-refs",
+        ] {
+            assert!(
+                is_relevant(Some(&repo), &root, &root.join(file)),
+                "{file} 照常要刷新"
+            );
+        }
+        // 工作区里的目录不受影响：新建一个目录（里面还没有文件）也要显示出来
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        assert!(is_relevant(Some(&repo), &root, &root.join("src")));
+    }
+
+    /// 实测（2026-11-22）：索引已是最新时，`git status` 仍会建了又删 `.git/index.lock`，留下一条
+    /// `.git` 目录的 Modify。外部工具（IDE 的 git 插件）每次刷新都这样，本应用不能把它当成仓库变了。
+    #[cfg(windows)]
+    #[test]
+    fn an_idle_git_status_does_not_wake_a_refresh() {
+        use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let (_d, root, _) = real_repo();
+        let git = |args: &[&str]| {
+            assert!(Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        std::fs::write(root.join("a.txt"), "1\n").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=T",
+            "commit",
+            "-qm",
+            "base",
+        ]);
+        // 文件与 index 落在同一秒时 git 认为它「racily clean」，之后每次 status 都会重写 index
+        // （真改动，不归这条测试管）。等过这一秒再刷新一次 stat，之后的 status 就不再写 index
+        std::thread::sleep(Duration::from_millis(2100));
+        git(&["status", "--porcelain"]);
+        let repo = git2::Repository::open(&root).unwrap();
+        let own = super::OwnWritePaths::of(&repo);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut w = RecommendedWatcher::new(
+            move |res: notify::Result<notify::Event>| {
+                let _ = tx.send(res);
+            },
+            Config::default(),
+        )
+        .unwrap();
+        w.watch(&root, RecursiveMode::Recursive).unwrap();
+        let collect = |d: Duration| {
+            let end = Instant::now() + d;
+            let mut seen = Vec::new();
+            while let Some(left) = end.checked_duration_since(Instant::now()) {
+                match rx.recv_timeout(left) {
+                    Ok(Ok(ev)) => {
+                        for p in ev.paths {
+                            let wake = classify(Some(&repo), &root, Some(&own), &p);
+                            if wake != Wake::No {
+                                seen.push((p, wake));
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => panic!("watcher 报错：{e}"),
+                    Err(_) => break,
+                }
+            }
+            seen
+        };
+        let _ = collect(Duration::from_millis(1500));
+        for _ in 0..3 {
+            git(&["status", "--porcelain"]);
+        }
+        let seen = collect(Duration::from_millis(1000));
+        assert!(seen.is_empty(), "空闲的 git status 叫醒了刷新：{seen:?}");
+
+        // 对照：真改了 index，照常要看见
+        std::fs::write(root.join("a.txt"), "2\n").unwrap();
+        git(&["add", "a.txt"]);
+        let seen = collect(Duration::from_millis(1000));
+        assert!(
+            seen.iter().any(|(p, _)| p.ends_with(".git/index")),
+            "git add 改了 index 却没看见：{seen:?}"
+        );
+    }
+
+    #[test]
+    fn the_perf_record_names_the_path_that_woke_the_refresh() {
+        // 2026-11-21 使用报告 §2.1：现场一秒一轮刷新，日志里看不出是哪个文件在变，只能猜。
+        // 每次发 `repo-changed` 都记下这一批里第一条起作用的路径
+        let rec = super::cause_record(std::path::Path::new(r"C:\repo\.git\index"));
+        assert_eq!(rec.kind, "watch");
+        assert_eq!(rec.name, "repo-changed cause");
+        assert_eq!(rec.meta["path"], r"C:\repo\.git\index");
+    }
+
+    #[test]
     fn what_our_own_index_write_touches_is_checked_not_refreshed_outright() {
         // 2026-11-05 排查报告 6.13 方案 B：Stage 之后前端自己会就地刷新；监听再看到 `.git/index`
         // 被改，300ms 后又触发一整轮刷新（状态全量扫描、提交图、stash、svn info……），和前端那轮
-        // 抢磁盘和 CPU。这三条路径要先核对是不是自己写的
+        // 抢磁盘和 CPU。index 要先核对是不是自己写的；另外两条是目录，`.git` 下的目录事件
+        // 连核对都不用（2026-11-22 T1，`directory_events_inside_the_git_dir_do_not_wake_a_refresh`）
         let (_d, root, repo) = real_repo();
         let own = super::OwnWritePaths::of(&repo);
         let git = root.join(".git");
-        for p in [git.join("index"), git.clone(), git.join("objects")] {
+        assert_eq!(
+            classify(Some(&repo), &root, Some(&own), &git.join("index")),
+            Wake::IfNotOwn
+        );
+        for p in [git.clone(), git.join("objects")] {
             assert_eq!(
                 classify(Some(&repo), &root, Some(&own), &p),
-                Wake::IfNotOwn,
+                Wake::No,
                 "{}",
                 p.display()
             );

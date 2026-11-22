@@ -179,6 +179,20 @@ pub const STATUS_SCAN: &[&str] = &[
 thread_local! {
     /// [`with_scan_cache`] 范围内的 `svn info` / `svn status` 输出。`None` = 不在范围内。
     static SCANS: RefCell<Option<HashMap<String, String>>> = const { RefCell::new(None) };
+    /// 扫描快照的代次，见 [`scan_scope_generation`]。
+    static SCAN_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 当前扫描快照的代次；不在 [`with_scan_cache`] 范围里（含 [`bypass_scan_cache`] 期间）时为 `None`。
+///
+/// 给范围内别的进程内缓存用（`svn_wcdb::floor_shapes`，计划 2026-11-22 T3）：代次相同就是同一次快照，
+/// 可以沿用；最外层范围开始、[`forget_node_scans`]（R3c 要读最新的）都换代。嵌套不换代。
+pub fn scan_scope_generation() -> Option<u64> {
+    in_scan_cache().then(|| SCAN_GEN.with(std::cell::Cell::get))
+}
+
+fn next_scan_generation() {
+    SCAN_GEN.with(|g| g.set(g.get().wrapping_add(1)));
 }
 
 /// 在 `f` 执行期间，同一条 `svn info` / `svn status`（同一工作目录、同样的参数）只跑一次。
@@ -211,6 +225,7 @@ pub fn with_scan_cache<T>(f: impl FnOnce() -> T) -> T {
         return f();
     }
     SCANS.with(|s| *s.borrow_mut() = Some(HashMap::new()));
+    next_scan_generation();
     let _scope = Scope;
     f()
 }
@@ -259,6 +274,8 @@ pub fn forget_node_scans() {
             m.retain(|k, _| !k.split('\0').any(|a| a == "-v"));
         }
     });
+    // 节点 revision 要重读，按它算的 floor 形状也要重读
+    next_scan_generation();
 }
 
 /// 可以缓存的扫描的键；其余命令返回 `None`。

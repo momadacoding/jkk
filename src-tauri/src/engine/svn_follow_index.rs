@@ -269,6 +269,49 @@ pub fn prepare_index_with(
     })
 }
 
+/// 只判不拼：HEAD 从 `old` 换到 `new` 时，暂存区里每条「已暂存 ∩ old→new 改过」的路径会怎么处理，
+/// 与 [`prepare_index`] 的报告同一个判法（[`compose`]）。不拿锁、不钉 ref、不写索引。
+///
+/// 给自动跟进在部分跟进的第二遍之前先判一次用（计划 2026-11-22 T4；2026-11-21 使用报告 §2.2）：
+/// 判出「保不住」就不跑第二遍。没拿锁时读的索引可能下一刻就变，所以它只能用来**提前放弃**；
+/// 判「保得住」时照原流程走，发布时持锁重判。三方合并会往对象库写结果 blob，别的什么都不写。
+///
+/// `unchanged`：调用方知道发布时不会变的路径（部分跟进留在旧基线上的文件），从 old→new 的变化里拿掉。
+/// 不拿掉的话，它们还会参与撞名判定（[`compose`] 的 `incoming`）：暂存区里把留下的文件换成目录，就会被
+/// 判成保不住，而发布时这条路径根本不进判定（独立 review M-1）。
+///
+/// 索引里有冲突时报告为空：那不是暂存区去留的问题，留给原流程报它自己的原因。
+pub fn judge_staging(
+    repo: &str,
+    old: &str,
+    new: &str,
+    unchanged: &BTreeSet<String>,
+    facts: &dyn Fn(&str) -> PathFacts,
+) -> Result<ComposeReport> {
+    let index_file = git2::Repository::open(repo)?.path().join("index");
+    let conflicted = git_read::or_cli(
+        "看暂存区有没有冲突",
+        || {
+            Ok(git_read::has_unmerged(&git_read::index_records(
+                repo,
+                &index_file,
+            )?))
+        },
+        || Ok(!run_git(repo, &["ls-files", "-u", "-z"])?.is_empty()),
+    )?;
+    if conflicted {
+        return Ok(ComposeReport::default());
+    }
+    let staged = read_changes(repo, &["diff-index", "--cached", "--no-renames", "-z", old])?;
+    let mut changed = git_read::or_cli(
+        "比 OLD 与 NEW 的树",
+        || Ok(by_path(git_read::tree_changes(repo, old, new)?)),
+        || read_changes(repo, &["diff-tree", "-r", "--no-renames", "-z", old, new]),
+    )?;
+    changed.retain(|p, _| !unchanged.contains(p));
+    Ok(compose(repo, &index_file, &staged, &changed, facts)?.report)
+}
+
 /// 存成 blob、包进 commit，挂在 `refs/mygitclient/follow/<opid>`：树里 `index` 是原始字节，
 /// `blobs/<oid>` 是全部已暂存的 blob。
 ///

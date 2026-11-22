@@ -170,6 +170,40 @@ fn node_scan(wc: &str) -> String {
     run_svn(wc, &["status", "-v", "--xml", "--", "Code@"]).unwrap()
 }
 
+/// 扫描范围的代次（计划 2026-11-22 T3）：跟着 [`with_scan_cache`] 走的进程内缓存（wc.db floor
+/// 形状）凭它判断「还是不是同一次快照」。范围外、临时不用缓存时为 `None`；嵌套不换代；新的范围、
+/// `forget_node_scans`（R3c 要读最新的）都换代。
+#[test]
+fn the_scan_scope_generation_follows_the_scan_cache() {
+    use app_lib::engine::svn_cli::scan_scope_generation;
+    assert_eq!(scan_scope_generation(), None, "范围外没有代次");
+    let first = with_scan_cache(|| {
+        let g = scan_scope_generation().expect("范围内有代次");
+        assert_eq!(
+            with_scan_cache(scan_scope_generation),
+            Some(g),
+            "嵌套沿用外层"
+        );
+        assert_eq!(
+            bypass_scan_cache(scan_scope_generation),
+            None,
+            "临时不用缓存"
+        );
+        assert_eq!(
+            scan_scope_generation(),
+            Some(g),
+            "bypass 结束后回到原来的代次"
+        );
+        forget_node_scans();
+        let after = scan_scope_generation().unwrap();
+        assert_ne!(after, g, "忘掉节点扫描之后换代");
+        after
+    });
+    assert_eq!(scan_scope_generation(), None);
+    let second = with_scan_cache(scan_scope_generation).unwrap();
+    assert_ne!(second, first, "新的范围是新的代次");
+}
+
 #[test]
 fn a_scan_cache_serves_the_same_status_until_node_scans_are_forgotten() {
     let fx = svn_repo();

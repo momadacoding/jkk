@@ -108,6 +108,13 @@ fn detection_and_auto_follow_stay_within_their_scan_budget() {
     let add_end = adds[0].ts + adds[0].dur;
     let queries = wcdb_queries(&log, follow_started);
     assert_eq!(queries.len(), 1, "wc.db 只该查一次（录完时查，体检拿那份）");
+    // floor 形状：预跑（`svn_health` 判哪些单元本地回答）与体检本身各读一次，同一次准备里 floor 与
+    // 工作副本都没变（计划 2026-11-22 T3；2026-11-21 使用报告 §2.7，现场每次 1.5 s）
+    assert_eq!(
+        queries_named(&log, "wc.db floor shape", follow_started),
+        1,
+        "一次跟进里 wc.db floor shape 只该读一次"
+    );
     for q in &queries {
         assert!(
             *q >= add_end,
@@ -177,6 +184,17 @@ fn wcdb_queries(log: &std::path::Path, since: f64) -> Vec<f64> {
         .map(|v| v["ts"].as_f64().unwrap())
         .filter(|ts| *ts >= since)
         .collect()
+}
+
+/// `since` 之后名为 `name` 的进程内查询记录（`kind: "query"`）条数。
+fn queries_named(log: &std::path::Path, name: &str, since: f64) -> usize {
+    std::fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|v| v["kind"] == "query" && v["name"] == name)
+        .filter(|v| v["ts"].as_f64().unwrap() >= since)
+        .count()
 }
 
 /// 记录文件里的一条子进程记录。

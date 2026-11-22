@@ -68,8 +68,8 @@ use crate::engine::svn_changelist;
 use crate::engine::svn_cli::{bypass_scan_cache, with_scan_cache};
 use crate::engine::svn_config::{read_config, SvnConfig, BASELINE_BRANCH};
 use crate::engine::svn_follow_index::{
-    prepare_index, prepare_index_with, rename_lock_into_index, ComposeReport, PathFacts,
-    PreparedIndex,
+    judge_staging, prepare_index, prepare_index_with, rename_lock_into_index, ComposeReport,
+    PathFacts, PreparedIndex,
 };
 use crate::engine::svn_follow_mark::{clear_mark, my_svn_user, read_mark, FollowMark};
 use crate::engine::svn_health::Health;
@@ -494,8 +494,12 @@ fn skipped(e: impl Into<AutoSkip>) -> AutoFollowOutcome {
 /// `2026-11-13-partial-auto-follow.md`，使用报告 2026-11-12 第 5.5 节）。
 ///
 /// 拦下的原因都能落到具体文件、这些文件都是外部修改（[`held_candidates`]）时，把它们留在旧基线上
-/// 再准备一遍，复用第一遍录好的基线（不再联网体检）。第二遍还被拦就整次不做，返回**第一遍**的
-/// 原因：它说的是用户看得懂的那个问题，第二遍的原因可能只是排除之后的连带结果。
+/// 再准备一遍，复用第一遍录好的基线。留下的文件让 floor 变低时，第二遍要重新确认墓碑
+/// （[`partial_record`] 里的 `confirm_tombstones`），会再体检一次、可能联网（2026-11-21 使用报告 §2.3
+/// 现场 28 s）。第二遍还被拦就整次不做，返回**第一遍**的原因：它说的是用户看得懂的那个问题，第二遍的
+/// 原因可能只是排除之后的连带结果。
+///
+/// 第二遍之前先判一次暂存区（[`staging_blocks_partial`]）：发布前拼索引一定会拦的，就不跑第二遍。
 ///
 /// `Err` 就是不自动跟进的原因，一个 ref 都没动。
 fn prepare_auto(repo: &str) -> std::result::Result<Plan, AutoSkip> {
@@ -512,6 +516,12 @@ fn prepare_auto(repo: &str) -> std::result::Result<Plan, AutoSkip> {
     let (Some(held), Some(rec)) = (held_candidates(repo, &plan), plan.rec.clone()) else {
         return Err(first);
     };
+    if let Some(err) = staging_blocks_partial(repo, &plan, &held) {
+        return Err(AutoSkip {
+            err,
+            conflict: None,
+        });
+    }
     match prepare(repo, true, Some(&Partial { rec, held })) {
         Ok(p) if auto_blocker(&p).is_none() => Ok(p),
         Ok(_) => Err(first),
@@ -520,6 +530,65 @@ fn prepare_auto(repo: &str) -> std::result::Result<Plan, AutoSkip> {
             Err(first)
         }
     }
+}
+
+/// 部分跟进发布前拼索引一定会拦下的暂存（[`stage_blocker`]），在跑第二遍之前就判出来（计划
+/// 2026-11-22 T4；2026-11-21 使用报告 §2.2：现场第二遍跑了约 35 s，最后被暂存区拦下）。
+///
+/// # 为什么用 OLD → NEW 判出来的结论与发布时一样
+///
+/// 发布时比的是分支重放前后（`old_head → tip`）。对一条既不在 `held` 里、也没被分支提交改过的暂存
+/// 路径 P：`old_head:P == old_base:P`；第二遍只把 `held` 留在旧基线上，所以 `tip:P == new_base:P`。
+/// 两组输入在 P 上相同，判定也相同。所以只看这类路径；其余的照旧留到发布时判。
+/// 分支落后（`lagging`）时 `old_base → old_head` 还带着 SVN 上的改动，一并排除，只会少拦。
+///
+/// P 的判定还看「NEW 带进来的路径」会不会与它撞名（文件 `a` 与 `a/b`，`compose` 的 `incoming`）。
+/// `held` 与分支改过的路径 Q 在发布时不一定还在 `old_head → tip` 里（留下的文件两边相同），所以它们
+/// 不参与提前判的撞名检查（`judge_staging` 的 `unchanged`，独立 review M-1）。真撞上的，发布时照样拦。
+///
+/// # 为什么判错了也不比现在危险
+///
+/// 这时没拿索引锁，读到的索引下一刻可能就变。判「拦」就整次跳过，一个 ref 都没动；判「不拦」照原流程
+/// 走，发布时持锁重判。判定本身出错只记日志，照原流程走：这一步是提速，不是判据。
+///
+/// 「作者是我、早于快照吗」的线索用的是第一遍的 `plan.who`；第二遍会重读失焦快照和钩子事件，两遍之间
+/// 来了新事件时同一条路径的线索可能不同（独立 review M-6）。方向同上：最多多拦一次，什么都没动，下一次
+/// 自动跟进重判。
+fn staging_blocks_partial(
+    repo: &str,
+    plan: &Plan,
+    held: &BTreeMap<String, String>,
+) -> Option<GitError> {
+    let touched: BTreeSet<String> = match tree_diff(repo, &plan.old_base, &plan.old_head) {
+        Ok(d) => d.into_iter().map(|c| c.path).collect(),
+        Err(e) => {
+            log::info!(
+                "部分跟进前读不出分支改过的路径，照常跑第二遍：{}",
+                e.message
+            );
+            return None;
+        }
+    };
+    let unchanged: BTreeSet<String> = held.keys().cloned().chain(touched).collect();
+    let staged = OnceCell::new();
+    let facts = |p: &str| {
+        plan.who
+            .facts(p, staged.get_or_init(|| staged_blobs(repo)).as_ref())
+    };
+    let report = match judge_staging(repo, &plan.old_base, &plan.new_base, &unchanged, &facts) {
+        Ok(r) => r,
+        Err(e) => {
+            log::info!("部分跟进前判暂存区失败，照常跑第二遍：{}", e.message);
+            return None;
+        }
+    };
+    let keep = |p: &String| !unchanged.contains(p);
+    let judged = ComposeReport {
+        lost: report.lost.into_iter().filter(keep).collect(),
+        uncertain: report.uncertain.into_iter().filter(keep).collect(),
+        ..ComposeReport::default()
+    };
+    stage_blocker(&judged)
 }
 
 /// 第二遍准备用的：第一遍录好的完整基线，和要留在旧基线上的文件 → 原因。
@@ -1275,16 +1344,21 @@ pub fn manual_follow(repo: &str, opid: &str) -> Result<SyncInOutcome> {
     let scope = branch_baseline(repo, &head, &base)?;
     require_linear(repo, &scope, &head)?;
     let cfg = read_config(repo)?;
-    if !matches!(check_sync_with_nodes(repo)?.0.verdict, SyncVerdict::InSync) {
-        return Err(GitError::new(
-            "svn_follow_manual_stale",
-            "基线和工作副本又对不上了（可能又有新的外部提交，或者 SVN 操作还没做完）。手动跟进只把\
-             分支重放到已发布的基线上，请先点一次「跟进」。什么都没有改动。",
-        ));
-    }
-    // 这个入口不录制，分析 §6.5 的前置条件没有别处把关（同分支跟进入口）
-    run_preflight_with(repo, &cfg.whitelist, true)?;
-    require_changes_in_whitelist(repo, &cfg.whitelist)?;
+    // 判定一致与前置校验都只读、之间工作副本没动，共用一遍全量 `svn status`（2026-11-21 使用报告
+    // §2.5：现场各扫一遍，合计 5.5 s）。范围到此为止：下面的 stash 与 rebase 会改工作副本，之后的
+    // 读取必须是新的
+    with_scan_cache(|| -> Result<()> {
+        if !matches!(check_sync_with_nodes(repo)?.0.verdict, SyncVerdict::InSync) {
+            return Err(GitError::new(
+                "svn_follow_manual_stale",
+                "基线和工作副本又对不上了（可能又有新的外部提交，或者 SVN 操作还没做完）。手动跟进只把\
+                 分支重放到已发布的基线上，请先点一次「跟进」。什么都没有改动。",
+            ));
+        }
+        // 这个入口不录制，分析 §6.5 的前置条件没有别处把关（同分支跟进入口）
+        run_preflight_with(repo, &cfg.whitelist, true)?;
+        require_changes_in_whitelist(repo, &cfg.whitelist)
+    })?;
 
     let floor = read_base_map(repo, &scope)?.floor;
     let rebase_todo = snapshot_todo(repo, &scope, &head, &base)?;
