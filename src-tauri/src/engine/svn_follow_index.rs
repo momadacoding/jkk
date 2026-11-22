@@ -276,11 +276,16 @@ pub fn prepare_index_with(
 /// 判出「保不住」就不跑第二遍。没拿锁时读的索引可能下一刻就变，所以它只能用来**提前放弃**；
 /// 判「保得住」时照原流程走，发布时持锁重判。三方合并会往对象库写结果 blob，别的什么都不写。
 ///
+/// `unchanged`：调用方知道发布时不会变的路径（部分跟进留在旧基线上的文件），从 old→new 的变化里拿掉。
+/// 不拿掉的话，它们还会参与撞名判定（[`compose`] 的 `incoming`）：暂存区里把留下的文件换成目录，就会被
+/// 判成保不住，而发布时这条路径根本不进判定（独立 review M-1）。
+///
 /// 索引里有冲突时报告为空：那不是暂存区去留的问题，留给原流程报它自己的原因。
 pub fn judge_staging(
     repo: &str,
     old: &str,
     new: &str,
+    unchanged: &BTreeSet<String>,
     facts: &dyn Fn(&str) -> PathFacts,
 ) -> Result<ComposeReport> {
     let index_file = git2::Repository::open(repo)?.path().join("index");
@@ -298,11 +303,12 @@ pub fn judge_staging(
         return Ok(ComposeReport::default());
     }
     let staged = read_changes(repo, &["diff-index", "--cached", "--no-renames", "-z", old])?;
-    let changed = git_read::or_cli(
+    let mut changed = git_read::or_cli(
         "比 OLD 与 NEW 的树",
         || Ok(by_path(git_read::tree_changes(repo, old, new)?)),
         || read_changes(repo, &["diff-tree", "-r", "--no-renames", "-z", old, new]),
     )?;
+    changed.retain(|p, _| !unchanged.contains(p));
     Ok(compose(repo, &index_file, &staged, &changed, facts)?.report)
 }
 

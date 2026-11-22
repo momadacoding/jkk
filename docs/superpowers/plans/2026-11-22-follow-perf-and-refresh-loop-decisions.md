@@ -8,7 +8,7 @@
 | T2 手动跟进共用一次扫描 | 完成 | `svn_follow.rs` `manual_follow` 前置三项包进 `with_scan_cache`；新测试二进制 `tests/svn_follow_manual_scan_budget.rs` | 改前 2 遍 → 改后 1 遍；`svn_follow manual` 35/35；`svn_follow_scan_budget` 1/1；fmt / clippy 干净 |
 | T3 floor shape 只读一次 | 完成 | `svn_cli::scan_scope_generation`；`svn_wcdb::floor_shapes` 按（代次, 仓库, 单元, floor）缓存；`svn_follow_scan_budget` 加断言；`svn_cli.rs` 1 个测试 | 改前 2 次 → 改后 1 次；svn_cli 29、svn_wcdb 32、svn_health_local_floor 33、svn_health 51、svn_follow_auto 40、svn_follow 144、svn_init 100、svn_baseline 31、reuse_base 1、reuse_safety 2 全过；fmt / clippy 干净 |
 | T4 暂存区预判 | 完成 | `svn_follow_index::judge_staging`；`svn_follow::staging_blocks_partial` 接进 `prepare_auto`，注释改正；新测试二进制 `tests/svn_follow_auto_stage_early.rs`（a）；`svn_follow_auto.rs` 2 个（b、c） | a 改前第二遍照跑（floor shape 2 次）→ 改后 1 次；svn_follow_auto 42、svn_follow_index 35、svn_follow_hooks 24、svn_follow_snapshot 12、svn_follow 144、scan_budget 1 全过；fmt / clippy 干净 |
-| T5 验证、review、PR | 未开始 | | |
+| T5 验证、review、PR | 完成 | 独立 review（opus subagent）：无 Critical；I-1 措辞照改；M-1 升为 Important 已修（见 T5）；M-2～M-7 记为后续 | `cargo test --lib` 181/181；`tests/*.rs` 107 个测试二进制逐个跑，全部 ok（分批前台跑，见 memory「全量 cargo test 会被内存回收」）；fmt / clippy 干净。前端未改，未跑 `pnpm build` / `pnpm test` |
 
 ## 决策条目
 
@@ -97,3 +97,16 @@
   只往对象库写 blob（`.git/objects/` 被 watcher 忽略）。
 
 ### T5
+
+独立 review（opus subagent，只读）结论：可以合并，无阻断问题。逐条处理：
+
+| # | 内容 | 处理 |
+|---|---|---|
+| I-1 | T1 没证明报告 §2.1 的死循环已止住，PR 不能写成「修复死循环」 | 照办：PR 写「去掉一类无信息的目录事件 + 根因打点」，验收标未验证，cause 打点随本 PR |
+| M-1 | 提前判的撞名检查里有留下的文件：暂存区把它换成目录时会误拦 | **重评为 Important 并修复**：它违背 T4 的核心约定「只在发布时一定会拦时才提前拦」。`judge_staging` 加 `unchanged` 参数，留下的文件与分支改过的路径不参与撞名；测试 `a_staged_path_colliding_only_with_a_held_file_is_not_judged_early` 红→绿；svn_follow_auto 43、svn_follow 144、svn_follow_index 35、hooks 24、stage_early 1 全过 |
+| M-2 | `is_dir()` 排在字符串过滤之前，`objects` 下每条事件多一次 stat | 后续：结论不错，fetch / gc 时 watcher 线程稍慢 |
+| M-3 | `bypass_scan_cache` 里新开范围会改掉外层代次 | 后续：现在没有调用路径受影响（R3c 在范围外、内层不读 floor 形状） |
+| M-4 | 测试 c 没断言真的走到了部分跟进 | 后续：变异检查已证明它目前能区分对错 |
+| M-5 | 测试 a 的「第二遍没跑」只靠一个间接标记 | 后续 |
+| M-6 | 提前判与发布时的 `Who` 不是同一份 | 只补注释（方向是多拦、什么都没动） |
+| M-7 | 测试 b 守不住 `held` 过滤 | 后续：已知缺口，`held` 过滤保留 |

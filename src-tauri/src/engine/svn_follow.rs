@@ -542,30 +542,23 @@ fn prepare_auto(repo: &str) -> std::result::Result<Plan, AutoSkip> {
 /// 两组输入在 P 上相同，判定也相同。所以只看这类路径；其余的照旧留到发布时判。
 /// 分支落后（`lagging`）时 `old_base → old_head` 还带着 SVN 上的改动，一并排除，只会少拦。
 ///
+/// P 的判定还看「NEW 带进来的路径」会不会与它撞名（文件 `a` 与 `a/b`，`compose` 的 `incoming`）。
+/// `held` 与分支改过的路径 Q 在发布时不一定还在 `old_head → tip` 里（留下的文件两边相同），所以它们
+/// 不参与提前判的撞名检查（`judge_staging` 的 `unchanged`，独立 review M-1）。真撞上的，发布时照样拦。
+///
 /// # 为什么判错了也不比现在危险
 ///
 /// 这时没拿索引锁，读到的索引下一刻可能就变。判「拦」就整次跳过，一个 ref 都没动；判「不拦」照原流程
 /// 走，发布时持锁重判。判定本身出错只记日志，照原流程走：这一步是提速，不是判据。
+///
+/// 「作者是我、早于快照吗」的线索用的是第一遍的 `plan.who`；第二遍会重读失焦快照和钩子事件，两遍之间
+/// 来了新事件时同一条路径的线索可能不同（独立 review M-6）。方向同上：最多多拦一次，什么都没动，下一次
+/// 自动跟进重判。
 fn staging_blocks_partial(
     repo: &str,
     plan: &Plan,
     held: &BTreeMap<String, String>,
 ) -> Option<GitError> {
-    let staged = OnceCell::new();
-    let facts = |p: &str| {
-        plan.who
-            .facts(p, staged.get_or_init(|| staged_blobs(repo)).as_ref())
-    };
-    let report = match judge_staging(repo, &plan.old_base, &plan.new_base, &facts) {
-        Ok(r) => r,
-        Err(e) => {
-            log::info!("部分跟进前判暂存区失败，照常跑第二遍：{}", e.message);
-            return None;
-        }
-    };
-    if report.lost.is_empty() && report.uncertain.is_empty() {
-        return None;
-    }
     let touched: BTreeSet<String> = match tree_diff(repo, &plan.old_base, &plan.old_head) {
         Ok(d) => d.into_iter().map(|c| c.path).collect(),
         Err(e) => {
@@ -576,7 +569,20 @@ fn staging_blocks_partial(
             return None;
         }
     };
-    let keep = |p: &String| !held.contains_key(p) && !touched.contains(p);
+    let unchanged: BTreeSet<String> = held.keys().cloned().chain(touched).collect();
+    let staged = OnceCell::new();
+    let facts = |p: &str| {
+        plan.who
+            .facts(p, staged.get_or_init(|| staged_blobs(repo)).as_ref())
+    };
+    let report = match judge_staging(repo, &plan.old_base, &plan.new_base, &unchanged, &facts) {
+        Ok(r) => r,
+        Err(e) => {
+            log::info!("部分跟进前判暂存区失败，照常跑第二遍：{}", e.message);
+            return None;
+        }
+    };
+    let keep = |p: &String| !unchanged.contains(p);
     let judged = ComposeReport {
         lost: report.lost.into_iter().filter(keep).collect(),
         uncertain: report.uncertain.into_iter().filter(keep).collect(),

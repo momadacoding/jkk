@@ -8,7 +8,7 @@
 #[path = "common/svn_fixtures.rs"]
 mod svn_fixtures;
 
-use app_lib::engine::git_cli::run_git;
+use app_lib::engine::git_cli::{run_git, run_git_stdin};
 use app_lib::engine::svn_basemap::read_base_map;
 use app_lib::engine::svn_config::{read_config, write_config};
 use app_lib::engine::svn_follow::fault::{self, Crashed, Point};
@@ -1301,6 +1301,42 @@ fn staging_on_a_path_the_branch_changed_is_not_judged_early() {
         );
     }
     assert_eq!(show(&fx, ":Code/B.cs"), "b-staged", "暂存照旧");
+}
+
+/// 独立 review M-1：留下的冲突文件 A 在暂存区里被换成了目录（`Code/A.cs/inner`）。提前判用的
+/// OLD → NEW 里有 A，`inner` 与它撞名会被判成保不住；发布时 A 留在旧基线上、不进判定，撞名并不存在。
+/// 留下的文件不能参与提前判的撞名检查。
+#[test]
+fn a_staged_path_colliding_only_with_a_held_file_is_not_judged_early() {
+    let fx = hybrid_with_colleague();
+    i_commit(&fx);
+    write(&fx, A, "a2\n");
+    commit_all(&fx, "中间版本");
+    write(&fx, A, "a3\n");
+    tortoise_commit(&fx, A);
+    fx.colleague_commits(B, "b2\n");
+    svn_update(&fx, B);
+    // 暂存区里 A 换成目录：磁盘不动，只改索引
+    let blob = run_git_stdin(&fx.wc_str(), &["hash-object", "-w", "--stdin"], b"inner\n").unwrap();
+    git(&fx, &["rm", "-q", "--cached", "--", A]);
+    git(
+        &fx,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{},Code/A.cs/inner", blob.trim()),
+        ],
+    );
+
+    let out = auto(&fx);
+
+    if let AutoFollowOutcome::Skipped { code, message, .. } = &out {
+        assert_ne!(
+            code, "svn_auto_follow_stage",
+            "只和留下的文件撞名的暂存被提前判成保不住：{message}"
+        );
+    }
 }
 
 #[test]
