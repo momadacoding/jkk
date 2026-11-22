@@ -2666,6 +2666,88 @@ fn manual_follow_resolves_w10_r2_via_rebase_conflict_exit() {
     ));
 }
 
+/// 2026-11-21 使用报告 §2.1：手动跟进停在 rebase 冲突上之后，应用每秒约一轮全量刷新、持续半小时。
+/// 一轮刷新应当只读：这里按前端 `repo-changed` 处理函数（`repoStore.ts` 与 `RepoTab.tsx` 的
+/// `repo_state`）调一轮同样的命令，监听器不该看到任何会再触发刷新的写入。
+///
+/// 末尾的外部 `git add` 是对照：它必须被看见，否则前面的「什么都没看到」不算数。
+#[test]
+fn refresh_round_while_stopped_on_a_rebase_conflict_writes_nothing_the_watcher_cares_about() {
+    use app_lib::commands::{conflict, diff, graph, repo, stash, svn, watch, worktree};
+    use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
+    use std::time::{Duration, Instant};
+
+    let fx = hybrid_with_colleague();
+    conflict_scene(&fx);
+    expect_rebase_conflict(&fx);
+
+    let root = fx.wc();
+    let path = fx.wc_str();
+    let repo2 = git2::Repository::open(&root).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut w = RecommendedWatcher::new(
+        move |res: notify::Result<notify::Event>| {
+            let _ = tx.send(res);
+        },
+        Config::default(),
+    )
+    .unwrap();
+    for t in app_lib::engine::watch::watch_targets(&root, Some(&repo2)) {
+        w.watch(&t, RecursiveMode::Recursive).unwrap();
+    }
+    // 监听会认的路径（去重，保留到达顺序）
+    let collect = |d: Duration| -> Vec<std::path::PathBuf> {
+        let end = Instant::now() + d;
+        let mut seen: Vec<std::path::PathBuf> = Vec::new();
+        while let Some(left) = end.checked_duration_since(Instant::now()) {
+            match rx.recv_timeout(left) {
+                Ok(Ok(ev)) => {
+                    for p in ev.paths {
+                        if watch::is_relevant(Some(&repo2), &root, &p) && !seen.contains(&p) {
+                            seen.push(p);
+                        }
+                    }
+                }
+                Ok(Err(e)) => panic!("watcher 报错：{e}"),
+                Err(_) => break,
+            }
+        }
+        seen
+    };
+    let round = || {
+        let p = || path.clone();
+        // 结果不重要（冲突中间态下个别读取失败是允许的），重要的是它们碰了什么
+        let _ = repo::open_repo(p());
+        let _ = repo::repo_state(p());
+        let _ = graph::load_graph(p());
+        let _ = diff::read_status(p());
+        let _ = conflict::read_conflicts(p());
+        let _ = worktree::read_worktrees_cmd(p());
+        let _ = repo::read_upstream(p());
+        let _ = stash::read_stashes(p());
+        let _ = conflict::check_merge_drivers(p());
+        let _ = diff::read_diff(p(), format!("unstaged:{A}"), None);
+        let _ = svn::svn_wc_db_stamps(p());
+        let _ = svn::svn_sync_status(p());
+        let _ = svn::svn_sync_state(p());
+        let _ = svn::svn_branches_behind(p());
+    };
+    let _ = collect(Duration::from_millis(1000));
+    // 第一轮允许有一次性的写入（例如首次刷新 index 的 stat），之后每一轮都不该有
+    round();
+    let _ = collect(Duration::from_millis(1500));
+    round();
+    let noisy = collect(Duration::from_millis(1500));
+    assert!(
+        noisy.is_empty(),
+        "停在冲突上时一轮只读刷新写了监听会认的路径：{noisy:?}"
+    );
+
+    resolve_a(&fx, "a-svn\n");
+    let seen = collect(Duration::from_millis(1500));
+    assert!(!seen.is_empty(), "外部 git add 没被看见，watcher 没工作？");
+}
+
 /// 11-19 那次就是手动跟进：B 只在工作区里改、挂在 IDE 的 changelist 上，停在冲突上的几分钟里
 /// 它在 stash 里，IDE 刷新摘掉了 changelist（计划 2026-11-20-svn-changelist-keep T4）。
 #[test]
