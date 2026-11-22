@@ -265,6 +265,15 @@ pub enum FloorShape {
     Irregular(String),
 }
 
+/// (仓库根, 单元 `wc_root`, floor) → 形状。
+type FloorShapeKey = (String, String, u64);
+
+thread_local! {
+    /// [`floor_shapes`] 在一次扫描快照里读过的结果，带着快照的代次；代次变了就整份作废。
+    static FLOOR_SHAPES: std::cell::RefCell<Option<(u64, BTreeMap<FloorShapeKey, FloorShape>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// 每个单元的 [`FloorShape`]，键是 `WcIdentity::wc_root`。某个单元读不了或认不出（格式、未完成的
 /// 操作、根查不到……，同 [`excluded_nodes`]）时，那个单元是 `Irregular`，不连累别的单元。外层 `Err`
 /// 只有测试注入。
@@ -276,12 +285,44 @@ pub fn floor_shapes(
     if fault::hit(Point::FloorShapeRefused).is_err() {
         return Err("测试注入：不用本地 floor".to_string());
     }
+    // 同一次扫描快照里（`svn_cli::scan_scope_generation`）同一个单元、同一个 floor 只读一次：体检的预跑
+    // 与体检本身各问一次，部分跟进的第二遍再问两次，之间工作副本没被 SVN 改过（计划 2026-11-22 T3；
+    // 2026-11-21 使用报告 §2.7，现场每次 1.5 s）。范围内的 `svn status` 本来就是同一份快照
+    let generation = crate::engine::svn_cli::scan_scope_generation();
+    let key = |u: &WcIdentity| (repo_root.to_string(), u.wc_root.clone(), floor);
+    if let Some(g) = generation {
+        let hit = FLOOR_SHAPES.with(|c| match &*c.borrow() {
+            Some((cg, m)) if *cg == g => units
+                .iter()
+                .map(|u| m.get(&key(u)).map(|s| (u.wc_root.clone(), s.clone())))
+                .collect::<Option<BTreeMap<_, _>>>(),
+            _ => None,
+        });
+        if let Some(out) = hit {
+            return Ok(out);
+        }
+    }
     let started = perf::enabled().then(perf::now_ms);
     let mut out = BTreeMap::new();
     for u in units {
         let shape = shape_of_unit(repo_root, u, floor)
             .unwrap_or_else(|why| FloorShape::Irregular(format!("wc.db 认不出：{why}")));
         out.insert(u.wc_root.clone(), shape);
+    }
+    if let Some(g) = generation {
+        FLOOR_SHAPES.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.as_ref().is_none_or(|(cg, _)| *cg != g) {
+                *c = Some((g, BTreeMap::new()));
+            }
+            if let Some((_, m)) = c.as_mut() {
+                for u in units {
+                    if let Some(s) = out.get(&u.wc_root) {
+                        m.insert(key(u), s.clone());
+                    }
+                }
+            }
+        });
     }
     if let Some(ts) = started {
         let mut rec = perf::Record::rust("query", "wc.db floor shape");

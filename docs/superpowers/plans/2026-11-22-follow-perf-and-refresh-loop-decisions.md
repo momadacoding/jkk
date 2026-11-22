@@ -6,7 +6,7 @@
 |---|---|---|---|
 | T1 冲突后刷新死循环 | 完成（根因待现场确认，见 T1） | `commands/watch.rs`：`.git` 下的目录事件不叫醒刷新；`repo-changed cause` 打点；`is_relevant` 公开。`tests/svn_follow.rs` 1 个、`watch.rs` 单测 3 个 | `cargo test --lib commands::watch` 13/13（连跑 3 次）；`cargo test --test svn_follow` 144/144；fmt / clippy 干净 |
 | T2 手动跟进共用一次扫描 | 完成 | `svn_follow.rs` `manual_follow` 前置三项包进 `with_scan_cache`；新测试二进制 `tests/svn_follow_manual_scan_budget.rs` | 改前 2 遍 → 改后 1 遍；`svn_follow manual` 35/35；`svn_follow_scan_budget` 1/1；fmt / clippy 干净 |
-| T3 floor shape 只读一次 | 未开始 | | |
+| T3 floor shape 只读一次 | 完成 | `svn_cli::scan_scope_generation`；`svn_wcdb::floor_shapes` 按（代次, 仓库, 单元, floor）缓存；`svn_follow_scan_budget` 加断言；`svn_cli.rs` 1 个测试 | 改前 2 次 → 改后 1 次；svn_cli 29、svn_wcdb 32、svn_health_local_floor 33、svn_health 51、svn_follow_auto 40、svn_follow 144、svn_init 100、svn_baseline 31、reuse_base 1、reuse_safety 2 全过；fmt / clippy 干净 |
 | T4 暂存区预判 | 未开始 | | |
 | T5 验证、review、PR | 未开始 | | |
 
@@ -54,6 +54,20 @@
   不在缓存里。缓存范围内的两次检查之间没有任何写操作。手动跟进的 35 个集成测试全过。
 
 ### T3
+
+- **第 1 步查出来的（临时打日志，已删）**：整次自动跟进里两次读来自 `svn_health.rs` 的预跑
+  （`local_floor`，第 794 行，判哪些单元本地回答、提前发命令）和体检本身（第 1346 行）；floor 相同
+  （fixture 里都是 2），都在 `follow_auto` 的 `with_scan_cache` 范围里。部分跟进的现场
+  （`a_replay_conflict_on_one_file_leaves_only_that_file_behind`）一共 4 次，floor 都是 1，也都在同一范围。
+  所以本 Task 照做。
+- **偏离计划**：缓存键多了仓库根（同一线程理论上可能在一个范围里碰两个仓库）。代次除了「最外层范围开始」
+  之外，`forget_node_scans` 也换代 —— Ruling：R3c 用它表达「要读最新的节点 revision」，按节点 revision 算出的
+  floor 形状跟着作废 —— 代价：R3c 之后若再体检会多读一次 wc.db（约 1.5 s），不影响正确性。
+  `bypass_scan_cache` 期间 `in_scan_cache()` 为假，代次是 `None`，不读也不写缓存。
+- **为什么这么改是安全的**：范围的约定本来就是「这段时间里的 `svn info` / `svn status` 是同一份快照」
+  （`with_scan_cache` 的注释：范围内不发生 SVN 写操作；外部改动由服务器体检和范围外的锁内复核兜住）。
+  wc.db 形状属于同一份快照，与范围内缓存的 status 一致。测试注入点 `FloorShapeRefused` 在缓存之前，
+  照常生效。
 
 ### T4
 
