@@ -159,6 +159,7 @@ pub fn run() {
             commands::app_settings::set_svn_auto_follow,
             commands::app_settings::set_shortcut_recording,
             commands::diff::read_diff,
+            commands::diff::read_diff_file,
             commands::conflict::check_merge_drivers,
             commands::conflict::read_conflicts,
             commands::conflict::resolve_delete_modify,

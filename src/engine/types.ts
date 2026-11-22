@@ -157,6 +157,11 @@ export interface DiffData {
    */
   contextNarrowed?: boolean
   /**
+   * 文件太多（Rust `SUMMARY_FILE_LIMIT`），后端只列了文件、没读内容：每个文件的 `hunks` 都是空的，
+   * 也没有行数。点到哪个文件再用 `read_diff_file` 读它（第 73 条）。只在为真时出现。
+   */
+  summaryOnly?: boolean
+  /**
    * 只在前端出现，Rust 侧不返回：`read_diff` 失败时 store 记下的原因。
    * 有它时 `files` 是空的，但意思是「没读出来」，不是「没有改动」（第 72 条）。
    */

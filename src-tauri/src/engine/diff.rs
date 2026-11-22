@@ -59,6 +59,10 @@ pub struct DiffData {
     /// 界面据此说明为什么「整个文件」没生效。
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub context_narrowed: bool,
+    /// 文件超过 `SUMMARY_FILE_LIMIT` 个，只列了文件、没读内容：每个文件的 `hunks` 都是空的，
+    /// 行数也没有。点到哪个文件再用 `read_diff_file` 读它。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub summary_only: bool,
 }
 
 impl DiffData {
@@ -66,9 +70,18 @@ impl DiffData {
         DiffData {
             files,
             context_narrowed: false,
+            summary_only: false,
         }
     }
 }
+
+/// 提交 / range 的 diff 超过这么多个文件时，`read_diff` 只列文件、不读内容（第 73 条）。
+///
+/// 时间几乎全花在读 blob 上：5 万个文件的提交，建 delta 列表 12 ms、改名检测 1 ms，
+/// 而算行数或出 hunk 都要把 5 万个 blob 解压一遍，约 22 秒（loose 对象，release 构建）。
+/// 行数本身就要读 blob，所以只给列表时连行数也不给。按改名配对之前的 delta 数算，
+/// 见 `tree_diff`。
+pub const SUMMARY_FILE_LIMIT: usize = 1000;
 
 /// 「整个文件」时的上下文行数。
 ///
@@ -452,49 +465,8 @@ pub fn read_diff(path: &str, scope: String) -> Result<DiffData> {
 /// 读出的文件超过 `WIDE_CONTEXT_FILE_LIMIT` 个时上下文不按 `view` 调大，见那里。
 pub fn read_diff_with(path: &str, scope: String, view: &DiffViewOptions) -> Result<DiffData> {
     let repo = Repository::open(path)?;
-    if let Some(hash) = scope.strip_prefix("commit:") {
-        let commit = repo.find_commit(git2::Oid::from_str(hash)?)?;
-        let tree = commit.tree()?;
-        let parent_tree = if commit.parent_count() > 0 {
-            Some(commit.parent(0)?.tree()?)
-        } else {
-            None
-        };
-        // 不做改名检测的话，一次重命名会摊成一加一删两条，文件树里看不出是同一个文件
-        let (diff, used) = build_limited(
-            view,
-            true,
-            |v| repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut v.options())),
-            find_renames,
-        )?;
-        let mut data = diff_to_data(diff)?;
-        data.context_narrowed = used != *view;
-        return Ok(data);
-    }
-    // `range:<a>..<b>`：两个任意 commit 之间。SVN 节点用它比前后两版本地基线——交付录的
-    // 基线以交付树为父（spec §8.2.2），`commit:<基线>` 比的是它和交付树，恰好漏掉
-    // 「这一版交付了什么」。解析不了必须报错：落到下面的默认分支会把工作区改动当成节点的变化
-    if let Some(range) = scope.strip_prefix("range:") {
-        let (from, to) = range
-            .split_once("..")
-            .filter(|(a, b)| !a.is_empty() && !b.is_empty())
-            .ok_or_else(|| {
-                crate::error::GitError::new(
-                    "bad_diff_scope",
-                    format!("无法解析的 diff 范围：{scope}"),
-                )
-            })?;
-        let old = repo.find_commit(git2::Oid::from_str(from)?)?.tree()?;
-        let new = repo.find_commit(git2::Oid::from_str(to)?)?.tree()?;
-        let (diff, used) = build_limited(
-            view,
-            true,
-            |v| repo.diff_tree_to_tree(Some(&old), Some(&new), Some(&mut v.options())),
-            find_renames,
-        )?;
-        let mut data = diff_to_data(diff)?;
-        data.context_narrowed = used != *view;
-        return Ok(data);
+    if let Some((old, new)) = scope_trees(&repo, &scope)? {
+        return tree_diff(&repo, old.as_ref(), &new, view);
     }
     // 空仓库没有 HEAD，此时与空树比较
     let tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
@@ -533,6 +505,187 @@ pub fn read_diff_with(path: &str, scope: String, view: &DiffViewOptions) -> Resu
             repo.diff_tree_to_workdir_with_index(tree.as_ref(), Some(opts))
         }),
     }
+}
+
+fn bad_scope(scope: &str) -> crate::error::GitError {
+    crate::error::GitError::new("bad_diff_scope", format!("无法解析的 diff 范围：{scope}"))
+}
+
+/// `commit:` / `range:` scope 要比的两棵树（旧、新）；别的 scope 返回 `None`。
+///
+/// `commit:<oid>` 比它和第一个父提交，根提交和空树比。
+/// `range:<a>..<b>`：两个任意 commit 之间。SVN 节点用它比前后两版本地基线——交付录的
+/// 基线以交付树为父（spec §8.2.2），`commit:<基线>` 比的是它和交付树，恰好漏掉
+/// 「这一版交付了什么」。解析不了必须报错：落到 `read_diff_with` 的默认分支会把工作区改动当成节点的变化
+fn scope_trees<'r>(
+    repo: &'r Repository,
+    scope: &str,
+) -> Result<Option<(Option<git2::Tree<'r>>, git2::Tree<'r>)>> {
+    if let Some(hash) = scope.strip_prefix("commit:") {
+        let commit = repo.find_commit(git2::Oid::from_str(hash)?)?;
+        let parent_tree = if commit.parent_count() > 0 {
+            Some(commit.parent(0)?.tree()?)
+        } else {
+            None
+        };
+        return Ok(Some((parent_tree, commit.tree()?)));
+    }
+    if let Some(range) = scope.strip_prefix("range:") {
+        let (from, to) = range
+            .split_once("..")
+            .filter(|(a, b)| !a.is_empty() && !b.is_empty())
+            .ok_or_else(|| bad_scope(scope))?;
+        let old = repo.find_commit(git2::Oid::from_str(from)?)?.tree()?;
+        let new = repo.find_commit(git2::Oid::from_str(to)?)?.tree()?;
+        return Ok(Some((Some(old), new)));
+    }
+    Ok(None)
+}
+
+/// 两棵树之间的 diff（提交详情、svn 节点）。
+///
+/// 先只建 delta 列表数一下：这一步不读 blob，5 万个文件也只要十几毫秒。超过 `SUMMARY_FILE_LIMIT`
+/// 就只列文件（`summary_only`）；没超过的走原来的路，结果与第 73 条之前相同。没超过时 delta 会
+/// 再建一遍（`build_limited` 要按选项重建），tree 对 tree 只比 OID，这一遍可以忽略。
+fn tree_diff(
+    repo: &Repository,
+    old: Option<&git2::Tree>,
+    new: &git2::Tree,
+    view: &DiffViewOptions,
+) -> Result<DiffData> {
+    let raw = repo.diff_tree_to_tree(old, Some(new), None)?;
+    if raw.deltas().len() > SUMMARY_FILE_LIMIT {
+        // 与没超上限时的 `find_similar(None)` 同一口径：用户把 `diff.renames` 关了就不配改名。
+        // 取不到或不是布尔值（`copies`）按开着算，与 libgit2 的默认一致
+        let renames = repo
+            .config()
+            .and_then(|c| c.get_bool("diff.renames"))
+            .unwrap_or(true);
+        return Ok(summary_data(&raw, renames));
+    }
+    // 不做改名检测的话，一次重命名会摊成一加一删两条，文件树里看不出是同一个文件
+    let (diff, used) = build_limited(
+        view,
+        true,
+        |v| repo.diff_tree_to_tree(old, Some(new), Some(&mut v.options())),
+        find_renames,
+    )?;
+    let mut data = diff_to_data(diff)?;
+    data.context_narrowed = used != *view;
+    Ok(data)
+}
+
+/// 只从 delta 建文件列表，不读内容（`summary_only`）。路径、状态的取法与 `diff_to_data_only` 相同。
+///
+/// 改名只配内容完全相同的：删掉的和新增的 blob OID 相同就合成一条改名，比 OID 不读 blob。
+/// 内容也改了的那种要读 blob 才算得出相似度，这里摊成一删一增。不用 libgit2 的 `find_similar`：
+/// 它即使 `EXACT_MATCH_ONLY` 也是逐对比较，每个新增项只试前 `diff.renameLimit`（默认 1000）个来源
+/// （`diff_tform.c` 的 `find_best_matches`），挪 5 万个文件的目录只能配上前一千来个。
+///
+/// 只配普通文件（同 libgit2 `similarity_measure` 的 `GIT_MODE_ISBLOB`），不配空文件：
+/// 内容全是空的，配成哪一对都是猜。同一份内容删了好几个时，按路径顺序先删的先配。
+fn summary_data(diff: &git2::Diff, renames: bool) -> DiffData {
+    use std::collections::{HashMap, HashSet, VecDeque};
+    let empty = git2::Oid::hash_object(git2::ObjectType::Blob, b"").ok();
+    let pairable = |f: &git2::DiffFile| {
+        renames
+            && matches!(
+                f.mode(),
+                git2::FileMode::Blob | git2::FileMode::BlobExecutable
+            )
+            && Some(f.id()) != empty
+    };
+
+    let deltas: Vec<git2::DiffDelta> = diff.deltas().collect();
+    // 删掉的文件按 OID 排队，等同样内容的新增项来认领
+    let mut deleted: HashMap<git2::Oid, VecDeque<usize>> = HashMap::new();
+    for (i, d) in deltas.iter().enumerate() {
+        if d.status() == git2::Delta::Deleted && pairable(&d.old_file()) {
+            deleted.entry(d.old_file().id()).or_default().push_back(i);
+        }
+    }
+    // 新增项下标 → 配上的那个删除项下标
+    let mut renamed_from: HashMap<usize, usize> = HashMap::new();
+    let mut consumed: HashSet<usize> = HashSet::new();
+    for (i, d) in deltas.iter().enumerate() {
+        if d.status() != git2::Delta::Added || !pairable(&d.new_file()) {
+            continue;
+        }
+        if let Some(src) = deleted
+            .get_mut(&d.new_file().id())
+            .and_then(|q| q.pop_front())
+        {
+            renamed_from.insert(i, src);
+            consumed.insert(src);
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut files = Vec::new();
+    for (i, delta) in deltas.iter().enumerate() {
+        if consumed.contains(&i) {
+            continue;
+        }
+        let path = delta_path(delta);
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let (status, old_path) = match renamed_from.get(&i) {
+            Some(&src) => ("renamed", Some(delta_path(&deltas[src]))),
+            None => (delta_status(delta.status()), None),
+        };
+        files.push(FileDiff {
+            path,
+            status: status.to_string(),
+            old_path,
+            // 没读内容就不知道是不是二进制，这时多半是 false；读那一个文件时才确定
+            binary: delta.flags().contains(git2::DiffFlags::BINARY),
+            hunks: Vec::new(),
+        });
+    }
+    DiffData {
+        files,
+        context_narrowed: false,
+        summary_only: true,
+    }
+}
+
+/// 提交 / range 里一个文件的 diff。`read_diff` 只列了文件（`summary_only`）时，点到哪个读哪个。
+///
+/// `old_file` 是列表里的改名前路径：pathspec 要把新旧两个路径都放进来，改名才配得成对，
+/// 否则一次改名读出来是整份新增。空串当没有。与列表的口径一致：列表里配成对的改名
+/// 内容相同，这里也配得上；列表里摊成一删一增的，这里只点名新路径，读出来也是新增。
+///
+/// 只认 `commit:` / `range:`，别的 scope 报 `bad_diff_scope`。`file` 为空也报错：
+/// 空 pathspec 在 libgit2 里是「全部」，就成了读整个提交。
+pub fn read_diff_file(
+    path: &str,
+    scope: &str,
+    file: &str,
+    old_file: Option<&str>,
+    view: &DiffViewOptions,
+) -> Result<DiffData> {
+    if file.is_empty() {
+        return Err(crate::error::GitError::new(
+            "bad_diff_scope",
+            "没有指定要读的文件",
+        ));
+    }
+    let repo = Repository::open(path)?;
+    let Some((old, new)) = scope_trees(&repo, scope)? else {
+        return Err(bad_scope(scope));
+    };
+    let mut opts = view.options();
+    opts.pathspec(file);
+    if let Some(o) = old_file.filter(|o| !o.is_empty() && *o != file) {
+        opts.pathspec(o);
+    }
+    // 字面量匹配：`f[1].txt` 不能当成模式去匹配 `f1.txt`
+    opts.disable_pathspec_match(true);
+    let mut diff = repo.diff_tree_to_tree(old.as_ref(), Some(&new), Some(&mut opts))?;
+    diff.find_similar(Some(git2::DiffFindOptions::new().renames(true)))?;
+    // 字面量 pathspec 仍按目录前缀匹配，只留路径恰好是 `file` 的那一项
+    diff_to_data_only(diff, Some(file))
 }
 
 /// HEAD 对比暂存区，即这次提交会提交什么。`file` 非空时只要这一个文件，见 `diff_to_data_only`。

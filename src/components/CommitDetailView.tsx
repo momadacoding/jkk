@@ -1,5 +1,8 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { invoke } from '@/store/ipc'
+import { readDiffFile } from '@/store/repoStore'
+import { getDiffPrefs, useDiffOptionsKey } from '@/store/diffPrefsStore'
+import { backendDiffOptions } from '@/engine/diffPrefs'
 import { Panel, Group, Separator } from 'react-resizable-panels'
 import { PANEL_GROUP_IDS } from '@/engine/layoutMemory'
 import { usePanelLayout } from '@/store/layoutStore'
@@ -22,6 +25,49 @@ type Tab = 'commit' | 'changes' | 'tree'
 
 const NO_FILES: DiffData['files'] = []
 const LOADING_NOTE = '正在读取这个提交的改动…'
+
+/**
+ * Commit 标签页的平铺列表最多画这么多行（第 73 条）。后端超过 `SUMMARY_FILE_LIMIT`（1000）个文件才只列文件，
+ * 没超过的提交行数不会超过它，显示不变；5 万行的平铺列表光渲染就要卡好几秒，完整列表在 Changes 的树里。
+ */
+export const COMMIT_LIST_LIMIT = 1000
+
+/**
+ * 后端只列了文件（`summaryOnly`）时，右侧 diff 按选中的那一个文件单独读（`read_diff_file`）。
+ * 写法同文件历史的 `EntryDiff`：只是开关变了时旧的留着、新的回来再换，换了文件才说正在读取。
+ */
+function FileDiffOnDemand({ repoPath, scope, file, oldFile }: {
+  repoPath: string
+  scope: string
+  file: string
+  oldFile: string | null
+}) {
+  const [diff, setDiff] = useState<DiffData | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  // 只在要后端重读的开关变了时重读；选项在发请求那一刻取
+  const optionsKey = useDiffOptionsKey()
+  const shownFor = useRef<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    const target = JSON.stringify([repoPath, scope, file, oldFile])
+    if (shownFor.current !== target) {
+      shownFor.current = target
+      setDiff(null)
+    }
+    setError(null)
+    readDiffFile(repoPath, scope, file, oldFile, backendDiffOptions(getDiffPrefs()))
+      .then((data) => { if (!cancelled) setDiff(data) })
+      .catch((err) => { if (!cancelled) setError(toErrorMessage(err)) })
+    return () => { cancelled = true }
+    // `optionsKey` 只用来触发重读，选项本身在上面现取
+  }, [repoPath, scope, file, oldFile, optionsKey])
+
+  if (error) return <DiffView diff={{ files: [] }} note={`读取改动失败：${error}`} />
+  if (!diff) return <div className="diff-note">正在读取这个文件的改动…</div>
+  // 带上路径：树默认收起，选中的文件多半藏在没展开的目录里，看 diff 时得知道是哪个文件
+  return <DiffView diff={diff} />
+}
 
 interface CommitDetailViewProps {
   commit: CommitNode | null
@@ -97,6 +143,8 @@ export function CommitDetailView({
   const files = diff?.files ?? NO_FILES
   // 读失败时 files 是空的：不说明的话就成了「这个提交没有改动」（第 72 条）
   const failedNote = diff?.error ? `读取改动失败：${diff.error}` : null
+  // 文件太多，后端只列了文件：没有 hunk 也没有行数，右侧按选中文件单独读（第 73 条）
+  const summaryOnly = diff?.summaryOnly === true
 
   // 文件历史 / Blame 从这个提交出发；svn 节点按它的本地基线提交算，见 `historyTargetForCommit`
   const historyItems = (path: string, status: FileStatus | null) =>
@@ -127,7 +175,7 @@ export function CommitDetailView({
   const ignoreEol = useDiffPref('ignoreEol')
   const fileStats = useMemo(
     () =>
-      files.map((f) => ({
+      files.slice(0, COMMIT_LIST_LIMIT).map((f) => ({
         path: f.path,
         status: f.status,
         ...countChanges(f.hunks, ignoreEol && !f.binary),
@@ -158,6 +206,14 @@ export function CommitDetailView({
     () => ({ files: files.filter((f) => f.path === activePath), contextNarrowed }),
     [files, activePath, contextNarrowed],
   )
+  const activeFile = activeDiff.files[0] ?? null
+
+  // 只列了文件时按选中的文件单独读；读不了（没有仓库路径或 scope）就说明，不显示一个空的 diff
+  const diffPane = !summaryOnly ? <DiffView diff={activeDiff} showPath={false} />
+    : !activeFile ? <DiffView diff={{ files: [] }} />
+    : repoPath && diffScope
+      ? <FileDiffOnDemand repoPath={repoPath} scope={diffScope} file={activeFile.path} oldFile={activeFile.oldPath} />
+      : <div className="diff-note">这个提交的文件太多，没有一次读出改动，这里也读不到单个文件。</div>
 
   // 改动列表与 diff 的分栏；diff 还没读回来时整块换成一句说明
   // 读失败的说明放进 DiffView：工具栏还在，开关调成了读不出来的样子时能在这里调回去
@@ -166,16 +222,18 @@ export function CommitDetailView({
     <div className="commit-split">
       <Group orientation="horizontal" {...changesLayout}>
         <Panel id="files" defaultSize="30%" minSize="15%" maxSize="60%">
+          {/* 上千个文件全展开光渲染就要卡住，同 File Tree 标签页默认收起 */}
           <FileTree
             nodes={changesTree}
             selectedPath={activePath}
             onSelect={setPicked}
+            defaultOpen={!summaryOnly}
             onContextMenu={fileContextMenu}
           />
         </Panel>
         <Separator className="separator-v" />
         <Panel id="diff" minSize="30%">
-          <DiffView diff={activeDiff} showPath={false} />
+          {diffPane}
         </Panel>
       </Group>
       <ContextMenu menu={menu} onClose={close} />
@@ -295,11 +353,19 @@ export function CommitDetailView({
           <div className="commit-files">
             {loading && <div className="diff-note">{LOADING_NOTE}</div>}
             {failedNote && <div className="diff-note">{failedNote}</div>}
+            {summaryOnly && (
+              <div className="diff-note">
+                这个提交改了 {files.length} 个文件，太多了，没有一次读出改动，也没有统计增删行数；
+                在 Changes 标签页点开哪个文件就读哪个。
+                {files.length > COMMIT_LIST_LIMIT && ` 下面只列前 ${COMMIT_LIST_LIMIT} 个，完整列表在 Changes 标签页。`}
+              </div>
+            )}
             {fileStats.map((f) => (
               <div key={f.path} className="commit-file-row">
                 <span className={`commit-file-status ${f.status}`}>{f.status.slice(0, 1).toUpperCase()}</span>
                 <span className="commit-file-path">{f.path}</span>
-                <span className="file-stats">+{f.additions}/-{f.deletions}</span>
+                {/* 没读内容就没有行数，写 +0/-0 会让人以为文件没改 */}
+                {!summaryOnly && <span className="file-stats">+{f.additions}/-{f.deletions}</span>}
               </div>
             ))}
           </div>

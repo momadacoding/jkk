@@ -2,11 +2,15 @@
 //
 // svn 节点详情里「这次交付包含的本地提交」：能点开单个提交，点开后能回到 svn 节点（2026-10-16 用户要求）。
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { describe, expect, it, vi } from 'vitest'
-import { CommitDetailView } from '@/components/CommitDetailView'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { invoke } from '@tauri-apps/api/core'
+import { COMMIT_LIST_LIMIT, CommitDetailView } from '@/components/CommitDetailView'
 import { setDiffPrefs } from '@/store/diffPrefsStore'
 import type { ExternalToolsConfig } from '@/engine/externalTools'
 import type { CommitNode, DiffData } from '@/engine/types'
+
+vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn(async () => undefined) }))
+const invokeMock = vi.mocked(invoke)
 
 // 文件树 + diff 的分栏（react-resizable-panels）要 ResizeObserver，jsdom 没有。这里只看文字，不量尺寸
 globalThis.ResizeObserver ??= class {
@@ -270,5 +274,99 @@ describe('CommitDetailView：增删行数跟着忽略换行符', () => {
     act(() => { setDiffPrefs({ ignoreEol: false }) })
     expect(screen.getByText('+3/-3')).toBeTruthy()
     act(() => { setDiffPrefs({ ignoreEol: true }) })
+  })
+})
+
+// 第 73 条：文件太多时后端只列文件（summaryOnly），右侧按选中的文件单独读
+describe('CommitDetailView：大提交只列了文件', () => {
+  const listed = (n: number): DiffData => ({
+    files: Array.from({ length: n }, (_, i) => ({
+      path: `big/F${String(i).padStart(5, '0')}.txt`,
+      status: i === 1 ? 'renamed' as const : 'added' as const,
+      oldPath: i === 1 ? 'old/F00001.txt' : null,
+      binary: false,
+      hunks: [],
+    })),
+    summaryOnly: true,
+  })
+  const oneFile = (path: string): DiffData => ({
+    files: [{
+      path, status: 'added', oldPath: null, binary: false,
+      hunks: [{
+        oldStart: 0, newStart: 1, header: '@@ -0,0 +1 @@',
+        lines: [{ origin: '+', content: `content of ${path}`, oldLineno: null, newLineno: 1 }],
+      }],
+    }],
+  })
+
+  beforeEach(() => {
+    invokeMock.mockReset()
+    invokeMock.mockImplementation(async (_cmd, args) => oneFile((args as { file: string }).file))
+  })
+
+  function mount(diff: DiffData) {
+    render(<CommitDetailView commit={three[1]} diff={diff} repoPath="C:/r" onSelectCommit={vi.fn()} diffScope="commit:abc" />)
+  }
+
+  it('Commit 标签：说明没统计行数，不显示 +0/-0，平铺列表截到上限', () => {
+    mount(listed(COMMIT_LIST_LIMIT + 5))
+    expect(screen.getByText(/改了 1005 个文件/)).toBeTruthy()
+    expect(screen.getByText(/只列前 1000 个/)).toBeTruthy()
+    expect(document.querySelectorAll('.commit-file-row').length).toBe(COMMIT_LIST_LIMIT)
+    expect(document.querySelector('.file-stats')).toBeNull()
+    expect(invokeMock).not.toHaveBeenCalled()
+  })
+
+  it('不超过上限时不提截断', () => {
+    mount(listed(3))
+    expect(screen.queryByText(/只列前/)).toBeNull()
+    expect(document.querySelectorAll('.commit-file-row').length).toBe(3)
+  })
+
+  it('Changes 标签：按选中的文件读 read_diff_file，改名带旧路径；树默认收起', async () => {
+    mount(listed(3))
+    fireEvent.click(screen.getByRole('button', { name: /Changes/ }))
+    expect(screen.getByText('正在读取这个文件的改动…')).toBeTruthy()
+    await waitFor(() => expect(screen.getByText('content of big/F00000.txt')).toBeTruthy())
+    expect(invokeMock).toHaveBeenCalledWith('read_diff_file', expect.objectContaining({
+      path: 'C:/r', scope: 'commit:abc', file: 'big/F00000.txt', oldFile: null,
+    }))
+    // 树收起：文件行不在，只有目录
+    expect(screen.queryByText('F00001.txt')).toBeNull()
+    fireEvent.click(screen.getByText('big'))
+    fireEvent.click(screen.getByText('F00001.txt'))
+    await waitFor(() => expect(screen.getByText('content of big/F00001.txt')).toBeTruthy())
+    expect(invokeMock).toHaveBeenLastCalledWith('read_diff_file', expect.objectContaining({
+      file: 'big/F00001.txt', oldFile: 'old/F00001.txt',
+    }))
+  })
+
+  it('改了 diff 开关就按新选项重读这个文件', async () => {
+    mount(listed(2))
+    fireEvent.click(screen.getByRole('button', { name: /Changes/ }))
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledTimes(1))
+    act(() => { setDiffPrefs({ ignoreWhitespace: true }) })
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledTimes(2))
+    expect(invokeMock).toHaveBeenLastCalledWith('read_diff_file', expect.objectContaining({
+      options: expect.objectContaining({ ignoreWhitespace: true }),
+    }))
+    act(() => { setDiffPrefs({ ignoreWhitespace: false }) })
+    // 改回去也会重读一次，等它回来再结束，免得结果落在测试之外
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledTimes(3))
+    expect(await screen.findByText('content of big/F00000.txt')).toBeTruthy()
+  })
+
+  it('单个文件读失败：写明原因', async () => {
+    invokeMock.mockImplementation(async () => { throw { code: 'git', message: 'bad object' } })
+    mount(listed(2))
+    fireEvent.click(screen.getByRole('button', { name: /Changes/ }))
+    await waitFor(() => expect(screen.getByText(/读取改动失败/)).toBeTruthy())
+  })
+
+  it('普通提交不走单文件读', () => {
+    const normal: DiffData = { files: [{ path: 'a.txt', status: 'added', oldPath: null, binary: false, hunks: [] }] }
+    mount(normal)
+    fireEvent.click(screen.getByRole('button', { name: /Changes/ }))
+    expect(invokeMock).not.toHaveBeenCalled()
   })
 })
