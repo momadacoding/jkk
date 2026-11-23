@@ -2836,6 +2836,8 @@ body {
 .banner-baseline-conflict strong { display: block; margin-bottom: 4px; font-size: 13px; }
 .banner-baseline-conflict .banner-baseline-files { margin-bottom: 4px; font-weight: 600; opacity: 1; }
 .banner-baseline-conflict .banner-baseline-note { margin: 0; opacity: 0.9; }
+/* 留下的文件那一组按原因分组：原因在上、文件在下 */
+.banner-baseline-conflict .banner-baseline-held-reason { margin: 0 0 2px; }
 .banner-baseline-files-label { margin: 0 0 2px; opacity: 0.75; font-size: 11px; }
 .banner-baseline-files {
   margin: 0;

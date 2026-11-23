@@ -53,9 +53,11 @@ import {
   describeAutoFollowDone,
   describeRestoreSkips,
   driftDiffTarget,
+  heldBackFor,
   keepOnNewFollow,
   type AutoFollowSkip,
   type FollowReport,
+  type HeldBackPin,
   type PendingRestore,
 } from '../engine/svnFollow'
 import { readAppSettings } from '@/store/appSettingsStore'
@@ -244,6 +246,8 @@ export function RepoTab({
   // 自动跟进（事故分析 6.12）：没自动的原因（按现场 key 记，过时的不显示）与完成后的提示
   const [autoSkip, setAutoSkip] = useState<(AutoFollowSkip & { key: string }) | null>(null)
   const [autoFollowed, setAutoFollowed] = useState<FollowReport | null>(null)
+  // 上一次部分自动跟进留下的文件：横幅一直按原因列着，不随提示收起（使用报告 2026-11-23）
+  const [heldPin, setHeldPin] = useState<HeldBackPin | null>(null)
   // 「N 个文件缺 Local-Only 补丁」横幅（计划 2026-11-12-auto-restore-local-only 的 C）
   const [pendingRestores, setPendingRestores] = useState<PendingRestore[]>([])
   const [restoreBusy, setRestoreBusy] = useState(false)
@@ -1149,6 +1153,7 @@ export function RepoTab({
     setAutoFollowSkip: setAutoSkip,
     showAutoFollowed: setAutoFollowed,
     clearAutoFollowed: () => setAutoFollowed(keepOnNewFollow),
+    setHeldBack: setHeldPin,
   })
   autoFollowRef.current = handleAutoFollow
 
@@ -1275,8 +1280,10 @@ export function RepoTab({
         hooks={hooksHealth}
         onOpenHooks={() => void openHooks()}
         onUnregisterHooks={() => void unregisterHooks()}
-        autoFollowSkip={autoFollowBlocked}
+        // 留下的文件那一行原因不写在横幅上：那一组按原因列着它们（`AutoFollowSkip.held`）
+        autoFollowSkip={autoSkipNow?.held ? null : autoFollowBlocked}
         autoFollowConflict={autoSkipNow?.conflict ?? null}
+        heldBack={heldBackFor(heldPin, state.headHash)}
         autoFollowed={autoFollowed ? describeAutoFollowDone(autoFollowed) : null}
         onAutoFollowedDetails={() => {
           if (autoFollowed) void showReport(autoFollowed)
