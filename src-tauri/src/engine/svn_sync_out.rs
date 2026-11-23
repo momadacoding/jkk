@@ -15,29 +15,28 @@
 use crate::engine::git_cli::{run_git, run_git_code, run_git_env};
 use crate::engine::graph::parse_local_only;
 use crate::engine::svn_baseline::{
-    create_baseline_commit_with, move_baseline_ref, read_baseline, refresh_index_stat,
-    swap_index_to_tree, TempIndex,
+    create_baseline_commit_with, read_baseline, refresh_index_stat, swap_index_to_tree, TempIndex,
 };
-use crate::engine::svn_basemap::{read_base_map, BaseMap};
+use crate::engine::svn_basemap::read_base_map;
 use crate::engine::svn_changelist;
 use crate::engine::svn_cli::{run_svn, run_svn_code};
 use crate::engine::svn_config::{read_config, SvnConfig, BASELINE_BRANCH};
 use crate::engine::svn_deliver::{deliver_ref, pin, unpin};
 use crate::engine::svn_include_check::normalize_roots;
-use crate::engine::svn_init::record_server_tree_into;
 use crate::engine::svn_journal::{self, Flow, Journal, Phase};
 use crate::engine::svn_lock;
-use crate::engine::svn_preflight::{read_node_rev, run_preflight, svn_targets};
+use crate::engine::svn_preflight::{run_preflight, svn_targets};
 use crate::engine::svn_stage::{snapshot, stage, unstage};
 use crate::engine::svn_sync_check::{
     assert_linear, current_branch, list_paths, rev_parse, unfinished_error, unmerged_paths,
 };
 use crate::engine::svn_sync_in::{
-    checkout_verified, dirty_w_files, is_baseline_bytes, is_our_rebase, need, new_opid,
-    no_unfinished, rebase_in_progress, run_checkout_verified, settle_residue, tracked_changes,
+    checkout_verified, force_back_when_w_clean, is_baseline_bytes, is_our_rebase, need, new_opid,
+    no_unfinished, publish_baseline_ref, rebase_in_progress, record_single_rev,
+    run_checkout_verified, settle_residue, tracked_changes,
 };
 use crate::engine::svn_sync_out_check::{check_sync_out, git_dirty, DeliverChange, SyncOutPreview};
-use crate::engine::svn_util::{now_secs, short};
+use crate::engine::svn_util::{now_secs, pinned_rebase, short};
 use crate::engine::svn_wc::peg_safe;
 use crate::engine::svn_xml::parse_update_status;
 use crate::error::{GitError, Result};
@@ -541,25 +540,25 @@ fn capture_delivered(repo: &str, cfg: &SvnConfig, j: &mut Journal) -> Result<()>
     }
     let pre = run_preflight(repo, &cfg.whitelist)?; // D7：nodeRevs 单值
     let idx = TempIndex::from_head(repo)?;
-    let (tree, _explained) = record_server_tree_into(repo, cfg, &pre, &idx)?; // D7a
-    let now = read_node_rev(repo, &cfg.whitelist)?;
-    if now != pre.node_rev {
-        return Err(GitError::new(
-            "sync_out_revision_moved",
-            format!(
-                "{}，但录新基线的过程中工作副本被外部改动了（r{} → r{now}）。基线没有推进，\
-                 记录已保留；外部操作结束后在顶部横幅上点「继续交付」。",
-                committed_text(j),
-                pre.node_rev
-            ),
-        ));
-    }
+    // D7a，录完复核 revision 没被挪
+    let (tree, map) = match record_single_rev(repo, cfg, pre, &idx)? {
+        Ok(done) => done,
+        Err(moved) => {
+            return Err(GitError::new(
+                "sync_out_revision_moved",
+                format!(
+                    "{}，但录新基线的过程中工作副本被外部改动了（{moved}）。基线没有推进，\
+                     记录已保留；外部操作结束后在顶部横幅上点「继续交付」。",
+                    committed_text(j),
+                ),
+            ));
+        }
+    };
     // 创建 commit 前记录 captureTree（§7.6）
     j.phase = Phase::PublishingBaseline;
     j.capture_tree = Some(tree.clone());
     j.new_baseline_oid = None;
     svn_journal::write(repo, j)?;
-    let map = BaseMap::single(pre.repos_root, pre.uuid, pre.node_rev);
     // 父提交是交付树，不是旧基线（spec §8.2.2；§7.6 末「不能套用 S7 的旧基线父」）
     // 另记真正提交出去的 revision：D5 与 D6 之间同事又提交时，trailer 记的是同事那个
     let commit =
@@ -574,19 +573,7 @@ pub(crate) fn publish_delivered(repo: &str, cfg: &SvnConfig, j: &mut Journal) ->
     let old = need(&j.baseline_oid_before, "baselineOidBefore")?;
     let new = need(&j.new_baseline_oid, "newBaselineOid")?;
     let deliver = need(&j.deliver_oid, "deliverOid")?;
-    match read_baseline(repo)?.as_deref() {
-        Some(cur) if cur == new => {} // 已发布（崩溃恢复时会走到）
-        Some(cur) if cur == old => move_baseline_ref(repo, &new, Some(&old))?,
-        other => {
-            return Err(GitError::new(
-                "svn_baseline_moved",
-                format!(
-                    "基线分支现在是 {other:?}，既不是交付前的 {old}，也不是本次录好的 {new}。\
-                     有别的工具动过它，这里停下，不覆盖。提交已在服务器上，记录已保留。"
-                ),
-            ))
-        }
-    }
+    publish_baseline_ref(repo, &old, &new, "交付前", "提交已在服务器上，记录已保留。")?;
     // D8c：索引从交付树换成新基线树（CAS），磁盘不动——磁盘已经是 D6 之后的候选快照
     let (code, _) = run_git_code(repo, &["diff-index", "--cached", "--quiet", &new])?;
     let swapped = code != 0;
@@ -685,19 +672,8 @@ pub(crate) fn restore_branch(
             .trim()
             .to_string();
         assert_linear(repo, &mb, &orig_head)?;
-        // 与 sync_in 的 S9 同一组 -c：用户配置不能改变 rebase 的语义（2c 独立 review C1）
-        if let Err(e) = run_git(
-            repo,
-            &[
-                "-c",
-                "rebase.autoStash=false",
-                "-c",
-                "rebase.updateRefs=false",
-                "rebase",
-                "--empty=drop",
-                &new,
-            ],
-        ) {
+        // 与 sync_in 的 S9 同一组 -c：用户配置不能改变 rebase 的语义（`PINNED_REBASE_CONFIG`）
+        if let Err(e) = run_git(repo, &pinned_rebase(&["rebase", "--empty=drop", &new])) {
             return rebase_conflict_or_error(repo, rev, e);
         }
     }
@@ -1040,20 +1016,18 @@ fn stop_after_commit(repo: &str, cfg: &SvnConfig, j: &Journal) -> Result<SyncOut
         // `-f` 会把 HEAD 从这里切走：中断期间在 detached HEAD 上做的提交、切去的别的分支，
         // 都不在下面 W-file 的检查范围里（里程碑 review 第 7 条）
         require_left_in_place(repo, j)?;
-        // 能 -f 的前提：W-file 在 svn 看来全部干净 = 磁盘就是服务器内容，能取回（2c 的 A5）
-        let dirty = dirty_w_files(repo, cfg)?;
-        if !dirty.is_empty() {
-            return Err(GitError::new(
+        // 能 -f 的前提：W-file 在 svn 看来全部干净（2c 的 A5，见 `force_back_when_w_clean`）
+        force_back_when_w_clean(repo, cfg, &orig, |dirty| {
+            GitError::new(
                 "sync_out_unsafe_to_return",
                 format!(
                     "要回到分支 `{orig}` 就得覆盖工作区里的文件，而下面这些文件的内容既不是 git 写的、\
                      也不是服务器上的，不知道是谁改的，不能覆盖：\n{}\n记录已保留。请先确认这些改动\
                      （需要的话自己备份），再点「停止收尾」。",
-                    list_paths(&dirty)
+                    list_paths(dirty)
                 ),
-            ));
-        }
-        checkout_verified(repo, cfg, &orig, true)?;
+            )
+        })?;
     }
     // 原分支已经接在本次发布的基线上（D8d 的快进 update-ref 做完、或 rebase 走完只差 D10）：
     // 交付其实已经完成，报「已停止、分支回到交付前、请更新」是假话（最终 review 第 7 条）
@@ -1085,14 +1059,7 @@ fn continue_restoring(repo: &str, cfg: &SvnConfig, j: &mut Journal) -> Result<Sy
         // GIT_EDITOR=true：非交互地接受 git 给的提交信息（2c 实测）
         if let Err(e) = run_git_env(
             repo,
-            &[
-                "-c",
-                "rebase.autoStash=false",
-                "-c",
-                "rebase.updateRefs=false",
-                "rebase",
-                "--continue",
-            ],
+            &pinned_rebase(&["rebase", "--continue"]),
             &[("GIT_EDITOR", "true")],
         ) {
             return rebase_conflict_or_error(repo, rev, e);

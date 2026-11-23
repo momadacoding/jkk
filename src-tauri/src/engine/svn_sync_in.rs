@@ -33,14 +33,14 @@ use crate::engine::svn_include_check::normalize_roots;
 use crate::engine::svn_init::{rebuild_baseline, record_mixed, record_server_tree_into};
 use crate::engine::svn_journal::{self, Flow, Journal, Phase};
 use crate::engine::svn_lock;
-use crate::engine::svn_preflight::{check_targets, read_node_rev, run_preflight};
+use crate::engine::svn_preflight::{check_targets, read_node_rev, run_preflight, Preflight};
 use crate::engine::svn_scope::WScope;
 use crate::engine::svn_sync_check::{
     assert_linear, check_sync_in, current_branch, list_paths, rev_parse, unfinished_error,
     unmerged_paths, SyncInPreview,
 };
 use crate::engine::svn_sync_stash::{self as wip, RestoreOutcome};
-use crate::engine::svn_util::now_secs;
+use crate::engine::svn_util::{now_secs, pinned_rebase};
 use crate::engine::svn_wc::enumerate_wcs;
 use crate::engine::svn_xml::parse_update_status;
 use crate::error::{GitError, Result};
@@ -472,14 +472,46 @@ fn capture_single(
         Err(e) if e.code == "svn_preflight_mixed_revision" => return Ok(None),
         Err(e) => return Err(e),
     };
+    match record_single_rev(repo, cfg, pre, idx)? {
+        Ok(done) => Ok(Some(done)),
+        Err(moved) => Err(moved_error(&moved.to_string())),
+    }
+}
+
+/// 录制期间 revision 被挪了：录之前与录完之后读到的 `nodeRevs`。
+pub(crate) struct RevisionMoved {
+    pub before: u64,
+    pub now: u64,
+}
+
+impl std::fmt::Display for RevisionMoved {
+    /// 报错里的写法：`r5 → r6`。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "r{} → r{}", self.before, self.now)
+    }
+}
+
+/// 按 `pre` 的单值 revision 把服务器内容录进 `idx`，录完再读一次 `nodeRevs` 核对没被挪
+/// （与 R3c 同一道：录制期间有人在 TortoiseSVN 里 commit / update）。返回树与单值 base map。
+///
+/// 更新的 S7 与交付的 D7a 共用（第 77 号 issue 第二批）。revision 被挪了返回内层的 `Err`，
+/// 由调用方报各自的错误：两边的错误码与说法不同。
+pub(crate) fn record_single_rev(
+    repo: &str,
+    cfg: &SvnConfig,
+    pre: Preflight,
+    idx: &TempIndex,
+) -> Result<std::result::Result<(String, BaseMap), RevisionMoved>> {
     let (tree, _explained) = record_server_tree_into(repo, cfg, &pre, idx)?;
-    // 与 R3c 同一道：录制期间有人在 TortoiseSVN 里 commit / update
     let now = read_node_rev(repo, &cfg.whitelist)?;
     if now != pre.node_rev {
-        return Err(moved_error(&format!("r{} → r{now}", pre.node_rev)));
+        return Ok(Err(RevisionMoved {
+            before: pre.node_rev,
+            now,
+        }));
     }
     let map = BaseMap::single(pre.repos_root, pre.uuid, pre.node_rev);
-    Ok(Some((tree, map)))
+    Ok(Ok((tree, map)))
 }
 
 fn moved_error(detail: &str) -> GitError {
@@ -496,22 +528,34 @@ fn moved_error(detail: &str) -> GitError {
 pub(crate) fn finish_publish(repo: &str, j: &mut Journal) -> Result<()> {
     let old = need(&j.baseline_oid_before, "baselineOidBefore")?;
     let new = need(&j.new_baseline_oid, "newBaselineOid")?;
-    match read_baseline(repo)?.as_deref() {
-        Some(cur) if cur == new => {} // 已发布（崩溃恢复时会走到）
-        Some(cur) if cur == old => move_baseline_ref(repo, &new, Some(&old))?,
-        other => {
-            return Err(GitError::new(
-                "svn_baseline_moved",
-                format!(
-                    "基线分支现在是 {other:?}，既不是更新前的 {old}，也不是本次录好的 {new}。\
-                     有别的工具动过它，这里停下，不覆盖。"
-                ),
-            ))
-        }
-    }
+    publish_baseline_ref(repo, &old, &new, "更新前", "")?;
     align_index(repo, &old, &new)?;
     j.phase = Phase::BaselineReady;
     svn_journal::write(repo, j)
+}
+
+/// 把基线分支从 `old` 挪到本次录好的 `new`（CAS）。已经是 `new` 时什么都不做（崩溃恢复时会走到）；
+/// 既不是 `old` 也不是 `new` 就停下、不覆盖。更新（S7）与交付（D8b）共用（第 77 号 issue 第二批）。
+///
+/// `before` 是报错里旧基线的叫法（「更新前」「交付前」），`tail` 接在报错末尾（交付要说提交已在服务器上）。
+pub(crate) fn publish_baseline_ref(
+    repo: &str,
+    old: &str,
+    new: &str,
+    before: &str,
+    tail: &str,
+) -> Result<()> {
+    match read_baseline(repo)?.as_deref() {
+        Some(cur) if cur == new => Ok(()),
+        Some(cur) if cur == old => move_baseline_ref(repo, new, Some(old)),
+        other => Err(GitError::new(
+            "svn_baseline_moved",
+            format!(
+                "基线分支现在是 {other:?}，既不是{before}的 {old}，也不是本次录好的 {new}。\
+                 有别的工具动过它，这里停下，不覆盖。{tail}"
+            ),
+        )),
+    }
 }
 
 /// S3 之后真实索引 == 旧基线树，而 HEAD 跟着 `svn/base` 移到了新 commit。
@@ -558,24 +602,9 @@ pub(crate) fn from_baseline_ready(
     assert_linear(repo, &new_base, &orig_head)?;
     j.phase = Phase::Rebase;
     svn_journal::write(repo, j)?;
-    // 用户配置不能改变 rebase 的语义（2c 独立 review C1，实测）：
-    // - `rebase.autoStash=true` 会把工作区里的任何残留收起、重放、再放回，退出 0——
-    //   残留若是基线的字节，就悄悄撤掉了用户提交过的内容，而结局报 Done；
-    // - `rebase.updateRefs=true` 会顺手移动指向被重放区间的其它分支。
-    // 与 `--empty=drop` 同一个原则：不依赖默认值，也不依赖用户配置
+    // 用户配置不能改变 rebase 的语义，见 `PINNED_REBASE_CONFIG`
     let ran = if j.rebase_todo.is_empty() {
-        run_git(
-            repo,
-            &[
-                "-c",
-                "rebase.autoStash=false",
-                "-c",
-                "rebase.updateRefs=false",
-                "rebase",
-                "--empty=drop",
-                &new_base,
-            ],
-        )
+        run_git(repo, &pinned_rebase(&["rebase", "--empty=drop", &new_base]))
     } else {
         rebase_with_todo(repo, &new_base, &j.rebase_todo)
     };
@@ -633,11 +662,7 @@ fn rebase_with_todo(repo: &str, new_base: &str, todo: &[String]) -> Result<Strin
     }
     run_git_env(
         repo,
-        &[
-            "-c",
-            "rebase.autoStash=false",
-            "-c",
-            "rebase.updateRefs=false",
+        &pinned_rebase(&[
             "-c",
             "rebase.missingCommitsCheck=ignore",
             "-c",
@@ -646,7 +671,7 @@ fn rebase_with_todo(repo: &str, new_base: &str, todo: &[String]) -> Result<Strin
             "-i",
             "--empty=drop",
             new_base,
-        ],
+        ]),
         &[
             (
                 "GIT_SEQUENCE_EDITOR",
@@ -1300,21 +1325,20 @@ pub(crate) fn back_to_orig(
             )));
         }
         if disk == Disk::MaybeUpdated {
-            // A5：能 -f 的前提是 W-file 在 svn 看来全部干净 = 磁盘上就是服务器内容
-            let dirty = dirty_w_files(repo, cfg)?;
-            if !dirty.is_empty() {
-                return Err(GitError::new(
+            force_back_when_w_clean(repo, cfg, &orig, |dirty| {
+                GitError::new(
                     "sync_in_unsafe_to_return",
                     format!(
                         "要回到分支 `{orig}` 就得覆盖工作区里的文件，而下面这些文件的内容\
                          既不是 git 写的、也不是服务器上的——不知道是谁改的，不能覆盖：\n{}\n\
                          记录已保留。请先确认这些改动（需要的话自己备份），再点「放弃」。",
-                        list_paths(&dirty)
+                        list_paths(dirty)
                     ),
-                ));
-            }
+                )
+            })?;
+        } else {
+            checkout_verified(repo, cfg, &orig, true)?;
         }
-        checkout_verified(repo, cfg, &orig, true)?;
     }
     // HEAD 仍在原分支上（S3 失败时 git 整体拒绝、一个字节没写——计划 A15）
     // 或刚切回来：都要求分支本身没被动过
@@ -1326,6 +1350,24 @@ pub(crate) fn back_to_orig(
     // 随 restore_step 进入 applying-stash 时一起落盘（PR #49 review #3）
     j.rolling_back = true;
     restore_step(repo, j)
+}
+
+/// 用 `-f` 切回原分支（计划 A5）：能 `-f` 的前提是 W-file 在 svn 看来全部干净 = 磁盘上就是服务器内容，
+/// 覆盖掉也能从服务器取回。有不干净的就用 `dirty_error` 报错、什么都不动。
+///
+/// 更新的「放弃」与交付的「停止收尾」共用（第 77 号 issue 第二批）。报错由调用方给：两边的错误码、
+/// 横幅按钮名与措辞都不同。
+pub(crate) fn force_back_when_w_clean(
+    repo: &str,
+    cfg: &SvnConfig,
+    orig: &str,
+    dirty_error: impl FnOnce(&[String]) -> GitError,
+) -> Result<()> {
+    let dirty = dirty_w_files(repo, cfg)?;
+    if !dirty.is_empty() {
+        return Err(dirty_error(&dirty));
+    }
+    checkout_verified(repo, cfg, orig, true)
 }
 
 /// HEAD 已在原分支上，但白名单内被跟踪文件与 HEAD 不一致时怎么办（2c 独立 review C1）。
@@ -1678,4 +1720,16 @@ fn sync_out_unsupported() -> GitError {
         "sync_out_not_supported",
         "这条记录是「交付」流程留下的。请用顶部横幅上交付那一组按钮处理，不要手工去动分支指针。",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 更新与交付的「录制期间 revision 被挪了」报错都靠它拼 `r前 → r后`，两个数不能写反。
+    #[test]
+    fn revision_moved_reads_before_then_now() {
+        let moved = RevisionMoved { before: 5, now: 6 };
+        assert_eq!(moved.to_string(), "r5 → r6");
+    }
 }
