@@ -24,6 +24,50 @@ pub struct RefPointer {
     /// prune 过。此时远程跟踪 ref 没了，graph 上画不出远程标签，↑↓ 也没有可比的
     /// 对象——界面看起来和「从没推过」一模一样，只能靠这个字段区分。
     pub gone_upstream: Option<String>,
+    /// 本地分支 reflog 记录的、在这条分支上**新建**的提交（完整 oid）；其余 ref 为空。
+    ///
+    /// git 不记录提交是在哪条分支上做的，本机 reflog 是唯一的来源。graph 靠它判断
+    /// 两条分支共享的那段历史原本属于谁，见前端 `owners.ts` 的 `orderByMadeHere`。
+    ///
+    /// 只是证据，不保证还在分支上：amend 掉的旧提交照样列着。`git gc` / `git reflog expire`
+    /// 运行时会删掉过期条目（`gc.reflogExpire` 默认 90 天，从不 gc 的仓库就一直留着）；
+    /// 新 clone、rebase 重写之后也没有记录。没有记录时前端按原来的行序认领。
+    ///
+    /// `collect` 照实列出 reflog 里的全部记录，[`crate::engine::graph::load`] 再裁到图里有的提交，
+    /// 否则从不 gc 的仓库每次刷新都要多传一大串用不上的 oid。为空时不序列化。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub made_here: Vec<String>,
+}
+
+/// reflog 条目是否表示「在这条分支上新建了一个提交」。消息格式按 git 2.51 实测，
+/// 见 `docs/superpowers/plans/2026-11-24-graph-reflog-ownership-decisions.md` Task 1。
+///
+/// 不算的：`branch: Created from`、快进（`merge x: Fast-forward`、`pull: Fast-forward`）、
+/// `reset`、`rebase (finish)`——这些只是把分支挪到别处已有的提交上。
+///
+/// 已知漏网：rebase 重写出来的提交只在 HEAD 的 reflog 里逐个记录，分支上没有。
+fn creates_commit(message: &str) -> bool {
+    message.starts_with("commit:")
+        || message.starts_with("commit (")
+        || message.starts_with("cherry-pick:")
+        || message.starts_with("revert:")
+        || message.starts_with("am:")
+        // `merge x: Merge made by …`，以及 pull 产生合并时的 `pull <参数>: Merge made by …`
+        || ((message.starts_with("merge ") || message.starts_with("pull"))
+            && message.contains(": Merge made by"))
+}
+
+/// 见 [`RefPointer::made_here`]。读不到 reflog 时返回空，不报错：证据缺失是常态。
+fn made_here(repo: &Repository, full_name: &str) -> Vec<String> {
+    let Ok(log) = repo.reflog(full_name) else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    log.iter()
+        .filter(|entry| entry.message().is_some_and(creates_commit))
+        .map(|entry| entry.id_new().to_string())
+        .filter(|oid| seen.insert(oid.clone()))
+        .collect()
 }
 
 /// 一个本地分支相对其上游的领先/落后数。
@@ -182,6 +226,11 @@ pub fn collect(repo: &Repository) -> Result<Vec<RefPointer>> {
             } else {
                 None
             };
+            let made = if kind == "branch" {
+                made_here(repo, &name)
+            } else {
+                Vec::new()
+            };
             refs.push(RefPointer {
                 name: name.clone(),
                 hash: oid.to_string(),
@@ -189,6 +238,7 @@ pub fn collect(repo: &Repository) -> Result<Vec<RefPointer>> {
                 ahead: counts.map(|(a, _)| a),
                 behind: counts.map(|(_, b)| b),
                 gone_upstream: gone,
+                made_here: made,
             });
         }
     }
@@ -204,6 +254,7 @@ pub fn collect(repo: &Repository) -> Result<Vec<RefPointer>> {
                 ahead: None,
                 behind: None,
                 gone_upstream: None,
+                made_here: Vec::new(),
             });
         }
     }

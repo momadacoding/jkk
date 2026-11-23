@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { computeLaneBranches } from '../../src/engine/laneBranch'
 import { collectTips, computeOwners } from '../../src/engine/owners'
 import type { CommitNode, RefPointer } from '../../src/engine/types'
 
@@ -158,5 +159,109 @@ describe('computeOwners', () => {
     const { ownerOf } = computeOwners(commits, [])
     expect(ownerOf.get('c1')).toBe(0)
     expect(ownerOf.has('truncated')).toBe(false)
+  })
+})
+
+describe('按 reflog 证据判定分叉方向', () => {
+  // readwise-alternative 的真实形状（2026-11-23）：mobile 上做了 e、f，design 从 f 切出来做了 x1、x2。
+  // design 的 tip 比 mobile 的新，排在上面。那个仓库里 mobile 的 tip y1 是 pull 快进来的，reflog 里
+  // 没有 commit 记录，这里照它不给 y1 证据；判定只看分叉点 f，y1 有没有证据都不影响结果。
+  const commits = [
+    node('x2', ['x1']),
+    node('y1', ['f']),
+    node('x1', ['f']),
+    node('f', ['e']),
+    node('e', ['m']),
+    node('m', []),
+  ]
+  const branch = (name: string, hash: string, madeHere?: string[]): RefPointer => ({
+    ...ref(`refs/heads/${name}`, hash, 'branch'),
+    ...(madeHere ? { madeHere } : {}),
+  })
+  const master = branch('master', 'm', ['m'])
+
+  it('共享的那段归 reflog 里做了分叉点的分支，哪怕它的 tip 更旧', () => {
+    const refs = [master, branch('design', 'x2', ['x2', 'x1']), branch('mobile', 'y1', ['f', 'e'])]
+    const { ownerOf } = computeOwners(commits, refs)
+    expect(ownerOf.get('f')).toBe(ownerOf.get('y1'))
+    expect(ownerOf.get('e')).toBe(ownerOf.get('y1'))
+    expect(ownerOf.get('x1')).not.toBe(ownerOf.get('f'))
+    expect(computeLaneBranches(commits, refs).get('f')).toEqual({
+      kind: 'branch',
+      names: ['mobile'],
+    })
+  })
+
+  it('没有证据时退回按 tip 行序，和改动前一样', () => {
+    // reflog 过期、新 clone、换机器：上面那张图又画回 design 占主线
+    const refs = [master, branch('design', 'x2'), branch('mobile', 'y1')]
+    const { ownerOf } = computeOwners(commits, refs)
+    expect(ownerOf.get('f')).toBe(ownerOf.get('x2'))
+  })
+
+  it('只看分叉点：别处的证据不改变顺序', () => {
+    // mobile 的证据只有 e（f 被 rebase 或过期了）。分叉点 f 没有证据，不能凭更老的 e 反推
+    const refs = [master, branch('design', 'x2', ['x2', 'x1']), branch('mobile', 'y1', ['e'])]
+    const { ownerOf } = computeOwners(commits, refs)
+    expect(ownerOf.get('f')).toBe(ownerOf.get('x2'))
+  })
+
+  it('证据指向不在本分支第一父链上的提交时不算数', () => {
+    // amend 掉的旧提交照样留在 reflog 里，它已经不在分支上了
+    const refs = [master, branch('design', 'x2', ['x2']), branch('mobile', 'y1', ['gone', 'x1'])]
+    const { ownerOf } = computeOwners(commits, refs)
+    expect(ownerOf.get('f')).toBe(ownerOf.get('x2'))
+  })
+
+  it('主干照样先认领，证据抢不走主干上的提交', () => {
+    // e 是在 feature 上做的，后来 master 快进到了它
+    const trunk = [node('g1', ['e']), node('e', ['m']), node('m', [])]
+    const refs = [branch('master', 'e', ['m']), branch('feature', 'g1', ['g1', 'e'])]
+    const { ownerOf } = computeOwners(trunk, refs)
+    expect(ownerOf.get('e')).toBe(0)
+    expect(ownerOf.get('g1')).not.toBe(0)
+  })
+
+  it('没有 master/main 的仓库照样按证据判定', () => {
+    // 主干缺席时 lane 0 归第一个 tip，其余本地分支仍按证据排
+    const refs = [branch('design', 'x2', ['x2', 'x1']), branch('mobile', 'y1', ['f', 'e'])]
+    const { ownerOf } = computeOwners(commits, refs)
+    expect(ownerOf.get('f')).toBe(ownerOf.get('y1'))
+    expect(ownerOf.get('x1')).not.toBe(ownerOf.get('f'))
+  })
+
+  it('比最老的证据还靠下的提交不影响判定', () => {
+    // 两条链在证据范围之外才汇合：没有可用的分叉点证据，按行序
+    const deep = [node('a1', ['a0']), node('b1', ['b0']), node('a0', ['r']), node('b0', ['r']), node('r', [])]
+    const refs = [branch('a', 'a1', ['a1']), branch('b', 'b1', ['b1'])]
+    expect(collectTips(deep, refs).slice(0, 2)).toEqual(['a1', 'b1'])
+  })
+
+  it('两边都声称做了分叉点时按行序，不死循环', () => {
+    const refs = [master, branch('design', 'x2', ['f']), branch('mobile', 'y1', ['f'])]
+    const { ownerOf } = computeOwners(commits, refs)
+    expect(ownerOf.get('f')).toBe(ownerOf.get('x2'))
+  })
+
+  it('三条分支的依赖按证据传递', () => {
+    // a 做了 p，b 从 p 切出做了 q，c 从 q 切出。tip 行序是 c、b、a，正好全反
+    const chain = [
+      node('c1', ['q']),
+      node('b1', ['q']),
+      node('a1', ['p']),
+      node('q', ['p']),
+      node('p', ['m']),
+      node('m', []),
+    ]
+    const refs = [
+      master,
+      branch('c', 'c1', ['c1']),
+      branch('b', 'b1', ['q']),
+      branch('a', 'a1', ['a1', 'p']),
+    ]
+    const { ownerOf } = computeOwners(chain, refs)
+    expect(ownerOf.get('p')).toBe(ownerOf.get('a1'))
+    expect(ownerOf.get('q')).toBe(ownerOf.get('b1'))
+    expect(ownerOf.get('c1')).not.toBe(ownerOf.get('q'))
   })
 })

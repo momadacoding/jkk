@@ -468,3 +468,244 @@ fn branches_filters_by_kind_and_sees_loose_refs_behind_a_long_ref() {
         "None 应是两类之和"
     );
 }
+
+// ---- reflog 证据：分支上新建过哪些提交（图上判定分叉方向用） ----
+
+fn plain_repo() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    run_git(dir.path(), &["init", "-q", "-b", "master"]);
+    run_git(dir.path(), &["config", "user.email", "test@test.com"]);
+    run_git(dir.path(), &["config", "user.name", "Test"]);
+    commit(dir.path(), "base");
+    dir
+}
+
+fn made_here(all: &[refs::RefPointer], name: &str) -> Vec<String> {
+    let mut list = find(all, name).made_here.clone();
+    list.sort();
+    list
+}
+
+#[test]
+fn made_here_lists_commits_created_on_the_branch() {
+    let dir = plain_repo();
+    let d = dir.path();
+    run_git(d, &["switch", "-q", "-c", "a"]);
+    commit(d, "a1");
+    run_git(d, &["switch", "-q", "-c", "b"]);
+    commit(d, "b1");
+    run_git(d, &["switch", "-q", "a"]);
+    commit(d, "a2");
+    run_git(d, &["commit", "-q", "--amend", "-m", "a2x"]);
+    run_git(d, &["cherry-pick", "b"]);
+    run_git(d, &["revert", "--no-edit", "HEAD"]);
+    run_git(d, &["switch", "-q", "master"]);
+    commit(d, "m1");
+    run_git(d, &["switch", "-q", "a"]);
+    run_git(
+        d,
+        &["merge", "-q", "--no-ff", "-m", "merge master", "master"],
+    );
+
+    let a1 = rev_parse(d, "a~4");
+    let a2_amended = rev_parse(d, "a~3");
+    let picked = rev_parse(d, "a~2");
+    let reverted = rev_parse(d, "a~1");
+    let merge = rev_parse(d, "a");
+    let b1 = rev_parse(d, "b");
+
+    let repo = Repository::open(d).unwrap();
+    let all = refs::collect(&repo).unwrap();
+
+    // amend 掉的旧 a2 也在 reflog 里：它确实是在 a 上做的，只是已经不在 a 上了。
+    // 后端照实报，是否在第一父链上由前端判断。
+    let mine = made_here(&all, "refs/heads/a");
+    for oid in [&a1, &a2_amended, &picked, &reverted, &merge] {
+        assert!(mine.contains(oid), "a 的 made_here 缺 {oid}：{mine:?}");
+    }
+    assert_eq!(
+        mine.len(),
+        6,
+        "a1、a2、a2x、cherry-pick、revert、merge：{mine:?}"
+    );
+    // b1 是在 b 上做的；a 上那份 cherry-pick 是另一个提交
+    assert!(!mine.contains(&b1), "{mine:?}");
+    assert_eq!(made_here(&all, "refs/heads/b"), vec![b1]);
+}
+
+#[test]
+fn made_here_counts_am_and_merges_made_by_pull() {
+    // 实测消息：`am: <标题>`、`pull <参数>: Merge made by the 'ort' strategy.`
+    let dir = plain_repo();
+    let d = dir.path();
+    let holder = TempDir::new().unwrap();
+    let other = holder.path().join("other");
+    run_git(
+        holder.path(),
+        &["clone", "-q", d.to_str().unwrap(), other.to_str().unwrap()],
+    );
+    run_git(&other, &["config", "user.email", "test@test.com"]);
+    run_git(&other, &["config", "user.name", "Test"]);
+    commit(&other, "theirs");
+    commit(d, "mine");
+    run_git(
+        d,
+        &[
+            "-c",
+            "pull.ff=true",
+            "pull",
+            "-q",
+            "--no-rebase",
+            "--no-edit",
+            other.to_str().unwrap(),
+            "master",
+        ],
+    );
+    let merge = rev_parse(d, "master");
+
+    let patches = holder.path().join("patches");
+    run_git(
+        &other,
+        &["format-patch", "-1", "-q", "-o", patches.to_str().unwrap()],
+    );
+    run_git(d, &["switch", "-q", "-c", "applied", "master~1"]);
+    let patch = fs::read_dir(&patches)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    run_git(d, &["am", "-q", patch.to_str().unwrap()]);
+    let applied = rev_parse(d, "applied");
+
+    let repo = Repository::open(d).unwrap();
+    let all = refs::collect(&repo).unwrap();
+
+    assert!(made_here(&all, "refs/heads/master").contains(&merge));
+    assert_eq!(made_here(&all, "refs/heads/applied"), vec![applied]);
+}
+
+#[test]
+fn graph_load_keeps_only_made_here_commits_that_are_in_the_graph() {
+    // amend 掉的旧提交还在 reflog 里，但已经不在任何分支上、不进图：不该随 payload 发给前端
+    let dir = plain_repo();
+    let d = dir.path();
+    run_git(d, &["switch", "-q", "-c", "topic"]);
+    commit(d, "t1");
+    let old = rev_parse(d, "topic");
+    run_git(d, &["commit", "-q", "--amend", "-m", "t1x"]);
+    let new = rev_parse(d, "topic");
+
+    let repo = Repository::open(d).unwrap();
+    assert!(made_here(&refs::collect(&repo).unwrap(), "refs/heads/topic").contains(&old));
+
+    let data = app_lib::engine::graph::load(d.to_str().unwrap()).unwrap();
+    assert_eq!(made_here(&data.refs, "refs/heads/topic"), vec![new]);
+}
+
+#[test]
+fn made_here_skips_branch_creation_and_fast_forward() {
+    let dir = plain_repo();
+    let d = dir.path();
+    run_git(d, &["switch", "-q", "-c", "topic"]);
+    commit(d, "t1");
+    run_git(d, &["switch", "-q", "master"]);
+    // 建分支（`branch: Created from`）和快进（`merge topic: Fast-forward`）都没有新建提交
+    run_git(d, &["branch", "copy", "topic"]);
+    run_git(d, &["merge", "-q", "--ff-only", "topic"]);
+
+    let repo = Repository::open(d).unwrap();
+    let all = refs::collect(&repo).unwrap();
+
+    assert_eq!(
+        made_here(&all, "refs/heads/master"),
+        vec![rev_parse(d, "master~1")],
+        "master 只做过 base 这一个提交"
+    );
+    assert!(made_here(&all, "refs/heads/copy").is_empty());
+    assert_eq!(
+        made_here(&all, "refs/heads/topic"),
+        vec![rev_parse(d, "topic")]
+    );
+}
+
+#[test]
+fn made_here_misses_rebased_commits() {
+    // 分支 reflog 只记一条 `rebase (finish)`，重写出来的提交没有逐个记录：证据缺失，前端按行序退化
+    let dir = plain_repo();
+    let d = dir.path();
+    run_git(d, &["switch", "-q", "-c", "topic"]);
+    commit(d, "t1");
+    run_git(d, &["switch", "-q", "master"]);
+    commit(d, "m1");
+    run_git(d, &["switch", "-q", "topic"]);
+    run_git(d, &["rebase", "-q", "master"]);
+
+    let repo = Repository::open(d).unwrap();
+    let all = refs::collect(&repo).unwrap();
+
+    assert!(!made_here(&all, "refs/heads/topic").contains(&rev_parse(d, "topic")));
+}
+
+#[test]
+fn made_here_is_empty_without_a_reflog() {
+    let dir = plain_repo();
+    let d = dir.path();
+    run_git(d, &["switch", "-q", "-c", "topic"]);
+    commit(d, "t1");
+    // 只在本用例自建的临时 fixture 里清 reflog，模拟过期
+    run_git(d, &["reflog", "expire", "--expire=now", "--all"]);
+
+    let repo = Repository::open(d).unwrap();
+    let all = refs::collect(&repo).unwrap();
+
+    assert!(made_here(&all, "refs/heads/topic").is_empty());
+    assert!(made_here(&all, "refs/heads/master").is_empty());
+}
+
+#[test]
+fn only_local_branches_carry_made_here() {
+    let (local, _remote) = repo_with_remote();
+    run_git(local.path(), &["tag", "v1"]);
+
+    let repo = Repository::open(local.path()).unwrap();
+    let all = refs::collect(&repo).unwrap();
+
+    let local_branch = all.iter().find(|r| r.kind == "branch").expect("本地分支");
+    assert!(!local_branch.made_here.is_empty());
+    for r in all.iter().filter(|r| r.kind != "branch") {
+        assert!(r.made_here.is_empty(), "{} 不该带 made_here", r.name);
+    }
+}
+
+#[test]
+fn made_here_sees_commits_made_in_a_linked_worktree() {
+    // 分支 reflog 放在 commondir，从主工作区和 linked worktree 打开都要读得到
+    let dir = plain_repo();
+    let d = dir.path();
+    let holder = TempDir::new().unwrap();
+    let linked = holder.path().join("wt");
+    run_git(
+        d,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "wt",
+            linked.to_str().unwrap(),
+        ],
+    );
+    commit(&linked, "w1");
+    let w1 = rev_parse(&linked, "HEAD");
+
+    for path in [d, linked.as_path()] {
+        let repo = Repository::open(path).unwrap();
+        let all = refs::collect(&repo).unwrap();
+        assert_eq!(
+            made_here(&all, "refs/heads/wt"),
+            vec![w1.clone()],
+            "从 {path:?} 打开"
+        );
+    }
+}

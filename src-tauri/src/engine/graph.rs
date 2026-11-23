@@ -80,7 +80,7 @@ pub fn load(path: &str) -> Result<GraphData> {
     let repo = Repository::open(path)?;
     // 先收 refs：下面 revwalk 要用里面已经 peel 好的 tag 目标做起点，
     // 在这里重新 peel 一遍等于把 refs.rs 的逻辑抄第二份。
-    let refs = crate::engine::refs::collect(&repo)?;
+    let mut refs = crate::engine::refs::collect(&repo)?;
     let mut walk = repo.revwalk()?;
     // TOPOLOGICAL 只保证「子在父之前」，互不相关的两个提交之间顺序是任意的，
     // 取决于下面 push 的顺序。加上 TIME 才是 `git log --date-order` 的语义：
@@ -144,6 +144,13 @@ pub fn load(path: &str) -> Result<GraphData> {
             "empty_repo",
             "This repository has no commits yet",
         ));
+    }
+
+    // reflog 证据只对图里的提交有用：amend 掉的、5000 条之外的都用不上。从不 gc 的仓库
+    // reflog 会一直长，不裁的话每次刷新都把它整串发给前端。
+    let in_graph: std::collections::HashSet<&str> = commits.iter().map(|c| c.id.as_str()).collect();
+    for r in &mut refs {
+        r.made_here.retain(|oid| in_graph.contains(oid.as_str()));
     }
 
     Ok(GraphData { commits, refs })
