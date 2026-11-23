@@ -382,12 +382,17 @@ export function pinHeldBack(
 }
 
 /**
- * 当前 HEAD 下还作不作数。提交、切分支之后不作数：留下的原因（重放冲突、补丁泄漏）是那条分支、
- * 那个 HEAD 上的结论；宁可这一组暂时不显示，也不把别的分支的原因安到这里。
+ * 当前 HEAD 下怎么显示。提交、切分支之后（`stale`）：留下的原因（重放冲突、补丁泄漏）是那个 HEAD 上
+ * 的结论，不一定还成立，但也不能藏起来——完成提示已经是灰色、下一次跟进一开始就收起，自动跟进又
+ * 没跑成时，这一组是唯一说明这些文件为什么没跟上的地方（独立 review 中 1）。照旧列着，说明里写明
+ * 是之前的提交上判定的。没记 HEAD（读不出现场）时不比。
  */
-export function heldBackFor(pin: HeldBackPin | null, head: string | null): HeldBackFile[] | null {
+export function heldBackFor(
+  pin: HeldBackPin | null,
+  head: string | null,
+): { files: HeldBackFile[]; stale: boolean } | null {
   if (!pin) return null
-  return pin.head === null || pin.head === head ? pin.files : null
+  return { files: pin.files, stale: pin.head !== null && pin.head !== head }
 }
 
 /** 横幅上留下的文件那一组。 */
@@ -410,6 +415,8 @@ export function describeHeldBack(
   files: HeldBackFile[] | null | undefined,
   sync: { verdict: { kind: string } } | null,
   conflict?: AutoFollowConflict | null,
+  /** 钉住之后 HEAD 变过（`heldBackFor`）。 */
+  stale = false,
 ): HeldBackModel | null {
   if (!files || files.length === 0 || !sync || sync.verdict.kind !== 'externallyAdvanced') {
     return null
@@ -432,7 +439,9 @@ export function describeHeldBack(
     groups: [...byReason].map(([reason, list]) => ({ reason, files: list })),
     // 又有新内容会换一个现场键，`RepoTab` 的 effect 照常自动发起；设置里关掉了就不会（E2E 2026-11-24
     // 关着开关时看到原来那句「也会自动再试」是错的）
-    note: '点「跟进」来处理；设置里开着自动的话，SVN 侧又有新内容时会再试一次。',
+    note: stale
+      ? '这是在之前的提交上判定的，分支变了之后原因不一定还成立，点「跟进」重新判断。'
+      : '点「跟进」来处理；设置里开着自动的话，SVN 侧又有新内容时会再试一次。',
     lines,
   }
 }
@@ -451,7 +460,8 @@ export function describeAutoFollowDone(r: FollowReport): AutoFollowNotice {
   // 列着它们，这里再算一项就是同一件事说两遍（使用报告 2026-11-23）。报告框里照旧算
   const todo = m.sections.filter((s) => s.level !== 'info' && s.id !== 'heldBack').length
   const look = todo > 0 ? `报告里有 ${todo} 项要你留意，请点「查看详情」。` : ''
-  const below = (r.heldBack?.length ?? 0) > 0 ? '留下的文件和原因列在下面的横幅上。' : ''
+  // 不只说「下面的横幅」：横幅被同步中间态压着、刷新之后判定变了时那一组不在（独立 review 低 1）
+  const below = (r.heldBack?.length ?? 0) > 0 ? '留下的文件和原因见下方横幅或「查看详情」。' : ''
   return {
     tone: todo > 0 ? 'warn' : 'quiet',
     title: '已自动跟进 SVN 侧的新内容',

@@ -1265,7 +1265,8 @@ describe('部分自动跟进（计划 2026-11-13-partial-auto-follow）', () => 
       const n = describeAutoFollowDone(partial)
       expect(n.tone).toBe('quiet')
       expect(n.detail).toContain('2 个文件留在旧基线上')
-      expect(n.detail).toContain('留下的文件和原因列在下面的横幅上')
+      // 红框可能不在（横幅被同步中间态压着、刷新后判定变了）：措辞同时指向「查看详情」（独立 review 低 1）
+      expect(n.detail).toContain('留下的文件和原因见下方横幅或「查看详情」')
       expect(n.detail).not.toContain('要你留意')
       expect(keepOnNewFollow(partial)).toBeNull()
     })
@@ -1278,7 +1279,7 @@ describe('部分自动跟进（计划 2026-11-13-partial-auto-follow）', () => 
 
     it('没留下文件：不提下方横幅', () => {
       const n = describeAutoFollowDone({ ...partial, heldBack: [] })
-      expect(n.detail).not.toContain('下面的横幅')
+      expect(n.detail).not.toContain('下方横幅')
     })
   })
 })
@@ -1329,13 +1330,14 @@ describe('留下的文件钉在当时的 revision 上（使用报告 2026-11-23�
     expect(pinHeldBack(held, { sync: null, head: 'h2' })).toBeNull()
   })
 
-  it('HEAD 动了（提交、切分支）就不作数；没记 HEAD 时不比', () => {
+  it('HEAD 动了（提交、切分支）照样列着，但标成「之前的提交上判定的」；没记 HEAD 时不比', () => {
+    // 不能藏起来：完成提示已经是灰色、会被下一次跟进收起，藏了就哪里都看不到原因（独立 review 中 1）
     const pin = pinHeldBack(held, { sync, head: 'h2' })
-    expect(heldBackFor(pin, 'h2')).toBe(pin?.files)
-    expect(heldBackFor(pin, 'h3')).toBeNull()
+    expect(heldBackFor(pin, 'h2')).toEqual({ files: pin?.files, stale: false })
+    expect(heldBackFor(pin, 'h3')).toEqual({ files: pin?.files, stale: true })
     expect(heldBackFor(null, 'h2')).toBeNull()
     const loose = pinHeldBack(held, null)
-    expect(heldBackFor(loose, 'h9')).toBe(loose?.files)
+    expect(heldBackFor(loose, 'h9')).toEqual({ files: loose?.files, stale: false })
   })
 })
 
@@ -1402,6 +1404,16 @@ describe('横幅上留下的文件那一组（使用报告 2026-11-23）', () =>
   it('没钉 revision 时只按路径认', () => {
     const m = describeHeldBack([{ path: 'Code/A.cs', reason: reasons.conflict, rev: null }], sync)
     expect(m?.groups[0].files).toEqual(['Code/A.cs  r4  zhang'])
+  })
+
+  it('HEAD 变了之后：说明换成「之前的提交上判定的，点跟进重新判断」，「跟进」仍只出现一次', () => {
+    const one = [{ path: 'Code/A.cs', reason: reasons.conflict, rev: 4 }]
+    const m = describeHeldBack(one, sync, null, true)
+    expect(m?.groups[0].reason).toBe(reasons.conflict)
+    expect(m?.note).toContain('之前的提交上判定的')
+    expect(m?.note).toContain('点「跟进」重新判断')
+    expect(m?.note.match(/跟进/g)?.length).toBe(1)
+    expect(describeHeldBack(one, sync)?.note).not.toContain('之前的提交')
   })
 
   it('已经在整次冲突那一组里的文件不重复列', () => {

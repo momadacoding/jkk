@@ -364,7 +364,8 @@ describe('BaselineBanner：自动跟进（事故分析 6.12）', () => {
         removed: [],
       },
     }
-    const heldBack = [{ path: 'LuaScripts/UI/Common/UIBaseWindow.lua', reason, rev: 70514 }]
+    const files = [{ path: 'LuaScripts/UI/Common/UIBaseWindow.lua', reason, rev: 70514 }]
+    const heldBack = { files, stale: false }
 
     it('按原因单独成组、样式同整次冲突；路径只出现一次，「跟进」只在按钮和组里那句说明里', () => {
       const { container } = render(<BaselineBanner {...base} sync={onlyHeld} heldBack={heldBack} />)
@@ -406,12 +407,23 @@ describe('BaselineBanner：自动跟进（事故分析 6.12）', () => {
 
     it('SVN 侧那个文件又有了更新的 revision：不再当成留下的', () => {
       render(
-        <BaselineBanner {...base} sync={onlyHeld} heldBack={[{ ...heldBack[0], rev: 70424 }]} />,
+        <BaselineBanner
+          {...base}
+          sync={onlyHeld}
+          heldBack={{ files: [{ ...files[0], rev: 70424 }], stale: false }}
+        />,
       )
       expect(screen.queryByRole('alert')).toBeNull()
       expect(
         screen.getByText('LuaScripts/UI/Common/UIBaseWindow.lua  r70514  gao', { normalizer: (s) => s }),
       ).toBeTruthy()
+    })
+
+    it('HEAD 变了（提交、切分支）：红框照旧在，说明换成「之前的提交上判定的」（独立 review 中 1）', () => {
+      render(<BaselineBanner {...base} sync={onlyHeld} heldBack={{ files, stale: true }} />)
+      const group = screen.getByRole('alert')
+      expect(group.textContent).toContain(reason)
+      expect(group.textContent).toContain('之前的提交上判定的')
     })
   })
 

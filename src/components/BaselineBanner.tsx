@@ -98,10 +98,10 @@ interface BaselineBannerProps {
    */
   autoFollowConflict?: AutoFollowConflict | null
   /**
-   * 上一次部分自动跟进留下的文件（调用方已按 HEAD 核对过，`heldBackFor`）。还在新内容里、revision
+   * 上一次部分自动跟进留下的文件（`heldBackFor`；`stale`：之后 HEAD 变过）。还在新内容里、revision
    * 没变的那些按原因单独成组，从新内容列表里摘掉（使用报告 2026-11-23）。
    */
-  heldBack?: HeldBackFile[] | null
+  heldBack?: { files: HeldBackFile[]; stale: boolean } | null
   /** 自动跟进完成后那条不打断操作的提示。`null` 不渲染。 */
   autoFollowed?: AutoFollowNotice | null
   /** 提示上的「查看详情」：弹同一份跟进报告。 */
@@ -210,7 +210,14 @@ export function BaselineBanner({
     skipApplies && !conflictGroup && autoFollowSkip ? describeAutoFollowSkip(autoFollowSkip) : null
   // 同样只挂在「SVN 侧有新内容」上（`describeHeldBack` 自己核对判定）；基线丢了时那条横幅不是它
   const heldGroup =
-    model && !missing ? describeHeldBack(heldBack, sync, conflictGroup ? autoFollowConflict : null) : null
+    model && !missing && heldBack
+      ? describeHeldBack(
+          heldBack.files,
+          sync,
+          conflictGroup ? autoFollowConflict : null,
+          heldBack.stale,
+        )
+      : null
   // 留下的文件已经在那一组里，新内容列表不再列一遍
   const newFiles = (model?.files ?? []).filter((f) => !heldGroup?.lines.has(f))
   // 自动跟进的提示不受 hushed 影响：它说的是已经做完的事
