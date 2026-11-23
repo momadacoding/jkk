@@ -25,7 +25,9 @@ import {
   describeManualFollowAction,
   describeManualFollowOutcome,
   heldBackScene,
+  pinHeldBack,
   type AutoFollowOutcome,
+  type HeldBackPin,
   type AutoFollowSkip,
   type FollowActionId,
   type FollowOutcome,
@@ -138,6 +140,11 @@ export interface SvnSyncFlowDeps {
    * （`keepOnNewFollow`），所以这里清得早一点（例如更新的前置检查没过）也不丢东西。
    */
   clearAutoFollowed: () => void
+  /**
+   * 自动跟进完成时记下这一次留下的文件，横幅一直按原因列着（`describeHeldBack`）；没留下就是
+   * `null`，撤掉上一次的。这一次没跟进（被拦下、开关关着）时不调：上一次留下的照旧成立。
+   */
+  setHeldBack: (pin: HeldBackPin | null) => void
 }
 
 /**
@@ -391,7 +398,8 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
       if (RECHECK_SKIPS.has(outcome.code) && d.autoTried.current === key) d.autoTried.current = null
       return false
     }
-    const left = await sceneLeftBy(outcome.report)
+    const { left, pin } = await sceneLeftBy(outcome.report)
+    d.setHeldBack(pin)
     if (left) {
       // 只剩留下的文件：再试一次结论相同，直接把这个现场记成试过，原因写给横幅
       d.autoTried.current = left.key
@@ -405,17 +413,21 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
   }
 
   /**
-   * 部分跟进做完、刷新之后的现场是不是只剩它留下的文件（`heldBackScene`）。整次跟进时不去读。
-   * 读不出来就当不是：只是少省一次，下一次判定写回时照常自动试。
+   * 部分跟进做完、刷新之后的现场是不是只剩它留下的文件（`heldBackScene`），以及把留下的文件钉在
+   * 这个现场上（`pinHeldBack`）。整次跟进时不去读。
+   * 读不出来就当不是：只是少省一次，下一次判定写回时照常自动试；留下的文件照样记下，不按现场比。
    */
   const sceneLeftBy = async (report: FollowReport) => {
-    if (!report.heldBack?.length) return null
+    if (!report.heldBack?.length) return { left: null, pin: null }
     try {
-      const { sync, head } = await d.sceneAfterFollow()
-      return heldBackScene(report.heldBack, sync, head)
+      const scene = await d.sceneAfterFollow()
+      return {
+        left: heldBackScene(report.heldBack, scene.sync, scene.head),
+        pin: pinHeldBack(report.heldBack, scene),
+      }
     } catch (err) {
       console.warn('读部分跟进之后的现场失败：', err)
-      return null
+      return { left: null, pin: pinHeldBack(report.heldBack, null) }
     }
   }
 

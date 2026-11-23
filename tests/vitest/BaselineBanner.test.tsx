@@ -353,6 +353,68 @@ describe('BaselineBanner：自动跟进（事故分析 6.12）', () => {
     expect(screen.getByRole('button', { name: '跟进' })).toBeTruthy()
   })
 
+  describe('部分跟进留下的文件（使用报告 2026-11-23）', () => {
+    const reason = '分支上的提交重放到 SVN 的新内容上有冲突，要你来判断。'
+    const onlyHeld: SyncStatus = {
+      ...advanced,
+      verdict: {
+        kind: 'externallyAdvanced',
+        changed: [{ path: 'LuaScripts/UI/Common/UIBaseWindow.lua', rev: 70514, author: 'gao' }],
+        added: [],
+        removed: [],
+      },
+    }
+    const heldBack = [{ path: 'LuaScripts/UI/Common/UIBaseWindow.lua', reason, rev: 70514 }]
+
+    it('按原因单独成组、样式同整次冲突；路径只出现一次，「跟进」只在按钮和组里那句说明里', () => {
+      const { container } = render(<BaselineBanner {...base} sync={onlyHeld} heldBack={heldBack} />)
+      const group = screen.getByRole('alert')
+      expect(group.className).toContain('banner-baseline-conflict')
+      expect(group.textContent).toContain('上一次自动跟进留下了 1 个文件，还停在旧基线上')
+      expect(group.textContent).toContain(reason)
+      expect(group.textContent).toContain('LuaScripts/UI/Common/UIBaseWindow.lua  r70514  gao')
+      const text = container.textContent ?? ''
+      expect(text.split('UIBaseWindow.lua').length - 1).toBe(1)
+      // 「跟进」出现在：组里的说明、按钮；正文里那句通用说明是「点「跟进」把基线推进……」，不是这次的事
+      const detail = container.querySelector('.banner-baseline-detail')?.textContent ?? ''
+      const outside = text.replace(detail, '')
+      expect(outside.match(/跟进/g)?.length).toBe(3) // 组标题「自动跟进」+ 组说明 + 按钮
+      expect(screen.getByRole('button', { name: '跟进' })).toBeTruthy()
+      expect(screen.queryByText('SVN 侧的新内容：')).toBeNull()
+    })
+
+    it('又来了新内容：留下的那组照旧在，新内容另列在标签下面', () => {
+      const more: SyncStatus = {
+        ...onlyHeld,
+        verdict: {
+          kind: 'externallyAdvanced',
+          changed: [
+            ...(onlyHeld.verdict.kind === 'externallyAdvanced' ? onlyHeld.verdict.changed : []),
+            { path: 'Code/B.cs', rev: 70600, author: 'zhang' },
+          ],
+          added: [],
+          removed: [],
+        },
+      }
+      render(<BaselineBanner {...base} sync={more} heldBack={heldBack} />)
+      const group = screen.getByRole('alert')
+      expect(group.textContent).toContain(reason)
+      expect(group.textContent).not.toContain('Code/B.cs')
+      expect(screen.getByText('SVN 侧的新内容：')).toBeTruthy()
+      expect(screen.getByText('Code/B.cs  r70600  zhang', { normalizer: (s) => s })).toBeTruthy()
+    })
+
+    it('SVN 侧那个文件又有了更新的 revision：不再当成留下的', () => {
+      render(
+        <BaselineBanner {...base} sync={onlyHeld} heldBack={[{ ...heldBack[0], rev: 70424 }]} />,
+      )
+      expect(screen.queryByRole('alert')).toBeNull()
+      expect(
+        screen.getByText('LuaScripts/UI/Common/UIBaseWindow.lua  r70514  gao', { normalizer: (s) => s }),
+      ).toBeTruthy()
+    })
+  })
+
   it('冲突清单为空或没有时照旧写那一行原因、不加列表标签', () => {
     render(
       <BaselineBanner

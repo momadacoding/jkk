@@ -16,8 +16,11 @@ import {
   describePendingRestores,
   describeRestoreOutcome,
   describeRestoreSkips,
+  describeHeldBack,
+  heldBackFor,
   heldBackScene,
   keepOnNewFollow,
+  pinHeldBack,
   needsSvnUserPrompt,
   restorablePaths,
   type FollowOutcome,
@@ -109,6 +112,8 @@ describe('自动跟进（事故分析 6.12）', () => {
     it('判定里只有留下的文件：给出现场键和横幅上的原因', () => {
       const scene = heldBackScene(held, advanced, 'h2')
       expect(scene?.key).toBe(autoFollowKey(advanced, 'h2'))
+      // 横幅凭它不再写这一行：原因由留下的文件那一组显示（使用报告 2026-11-23）
+      expect(scene?.held).toBe(true)
       expect(scene?.message).toBe(
         '还有 1 个文件留在旧基线上（上一次自动跟进留下的），要你来处理。' +
           'Code/A.cs：重放有冲突，要你来判断。点「跟进」来处理。',
@@ -1250,7 +1255,176 @@ describe('部分自动跟进（计划 2026-11-13-partial-auto-follow）', () => 
     ])
     expect(s?.note).toContain('顶部横幅')
     expect(m.summary).toContain('2 个文件留在旧基线上')
-    expect(describeAutoFollowDone(partial).tone).toBe('warn')
+    // 报告框里照旧算一项（非目标：不改报告）
+    expect(m.todo).toBe(1)
+  })
+
+  describe('完成提示不再把留下的文件算成「要你留意」（使用报告 2026-11-23）', () => {
+    // 下方横幅一直列着它们和原因，提示再说一遍就是同一件事说两次
+    it('只留下了文件：提示是安静的，指向下方横幅，不叫人点详情', () => {
+      const n = describeAutoFollowDone(partial)
+      expect(n.tone).toBe('quiet')
+      expect(n.detail).toContain('2 个文件留在旧基线上')
+      expect(n.detail).toContain('留下的文件和原因列在下面的横幅上')
+      expect(n.detail).not.toContain('要你留意')
+      expect(keepOnNewFollow(partial)).toBeNull()
+    })
+
+    it('另有要留意的内容：照旧变黄，项数不含留下的文件', () => {
+      const n = describeAutoFollowDone({ ...partial, behindBranches: [['old', '有冲突']] })
+      expect(n.tone).toBe('warn')
+      expect(n.detail).toContain('报告里有 1 项要你留意')
+    })
+
+    it('没留下文件：不提下方横幅', () => {
+      const n = describeAutoFollowDone({ ...partial, heldBack: [] })
+      expect(n.detail).not.toContain('下面的横幅')
+    })
+  })
+})
+
+describe('留下的文件钉在当时的 revision 上（使用报告 2026-11-23）', () => {
+  const held = [
+    { path: 'Code/A.cs', reason: '重放有冲突。' },
+    { path: 'Code/B.cs', reason: '和磁盘对不上。' },
+  ]
+  const sync = {
+    verdict: {
+      kind: 'externallyAdvanced',
+      changed: [
+        { path: 'Code/A.cs', rev: 4, author: 'zhang' },
+        { path: 'Code/B.cs', rev: 5, author: null },
+        { path: 'Code/C.cs', rev: 6, author: 'li' },
+      ],
+      added: [],
+      removed: [],
+    },
+  }
+
+  it('钉住刷新之后的 revision 与 HEAD；判定里已经没有的文件不钉', () => {
+    const pin = pinHeldBack([...held, { path: 'Code/Gone.cs', reason: '有冲突。' }], {
+      sync,
+      head: 'h2',
+    })
+    expect(pin).toEqual({
+      head: 'h2',
+      files: [
+        { path: 'Code/A.cs', reason: '重放有冲突。', rev: 4 },
+        { path: 'Code/B.cs', reason: '和磁盘对不上。', rev: 5 },
+      ],
+    })
+  })
+
+  it('读不出刷新之后的现场：照样记下，不按 revision 与 HEAD 比', () => {
+    expect(pinHeldBack(held, null)).toEqual({
+      head: null,
+      files: held.map((h) => ({ ...h, rev: null })),
+    })
+  })
+
+  it('没留下文件、刷新之后已不是「SVN 侧有新内容」：不记', () => {
+    expect(pinHeldBack([], { sync, head: 'h2' })).toBeNull()
+    expect(pinHeldBack(undefined, { sync, head: 'h2' })).toBeNull()
+    expect(pinHeldBack(held, { sync: { verdict: { kind: 'inSync' } }, head: 'h2' })).toBeNull()
+    expect(pinHeldBack(held, { sync: null, head: 'h2' })).toBeNull()
+  })
+
+  it('HEAD 动了（提交、切分支）就不作数；没记 HEAD 时不比', () => {
+    const pin = pinHeldBack(held, { sync, head: 'h2' })
+    expect(heldBackFor(pin, 'h2')).toBe(pin?.files)
+    expect(heldBackFor(pin, 'h3')).toBeNull()
+    expect(heldBackFor(null, 'h2')).toBeNull()
+    const loose = pinHeldBack(held, null)
+    expect(heldBackFor(loose, 'h9')).toBe(loose?.files)
+  })
+})
+
+describe('横幅上留下的文件那一组（使用报告 2026-11-23）', () => {
+  const sync = {
+    verdict: {
+      kind: 'externallyAdvanced' as const,
+      changed: [
+        { path: 'Code/A.cs', rev: 4, author: 'zhang' },
+        { path: 'Code/B.cs', rev: 5, author: null },
+        { path: 'Code/C.cs', rev: 6, author: 'li' },
+        { path: 'Code/D.cs', rev: 7, author: 'li' },
+        { path: 'Code/E.cs', rev: 8, author: 'li' },
+      ],
+      added: [],
+      removed: [],
+    },
+  }
+  // 后端 `svn_follow::HELD_*` 四种原因
+  const reasons = {
+    conflict: '分支上的提交重放到 SVN 的新内容上有冲突，要你来判断。',
+    leak: '分支的 Local-Only 补丁可能已经被带上了 SVN 服务器，要你先看一眼。',
+    overlap: '重放出来的结果和磁盘对不上：可能是文件里还有没提交的改动，也可能是重放合错了，要你看一眼。',
+    notMine: '分支只比磁盘多 Local-Only 补丁，但 SVN 上最后改它的不是你（或认不出是谁），可能是你有意去掉的补丁。',
+  }
+
+  it('四种原因各成一组，原因就是组的标题；文件行与新内容列表同一种写法', () => {
+    const m = describeHeldBack(
+      [
+        { path: 'Code/A.cs', reason: reasons.conflict, rev: 4 },
+        { path: 'Code/B.cs', reason: reasons.leak, rev: 5 },
+        { path: 'Code/C.cs', reason: reasons.overlap, rev: 6 },
+        { path: 'Code/D.cs', reason: reasons.notMine, rev: 7 },
+        { path: 'Code/E.cs', reason: reasons.conflict, rev: 8 },
+      ],
+      sync,
+    )
+    expect(m?.title).toBe('上一次自动跟进留下了 5 个文件，还停在旧基线上')
+    expect(m?.groups).toEqual([
+      { reason: reasons.conflict, files: ['Code/A.cs  r4  zhang', 'Code/E.cs  r8  li'] },
+      { reason: reasons.leak, files: ['Code/B.cs  r5'] },
+      { reason: reasons.overlap, files: ['Code/C.cs  r6  li'] },
+      { reason: reasons.notMine, files: ['Code/D.cs  r7  li'] },
+    ])
+    expect(m?.lines.has('Code/A.cs  r4  zhang')).toBe(true)
+    // 「跟进」只在这一处说明里出现一次，路径不在说明里重复
+    expect(m?.note.match(/跟进/g)?.length).toBe(1)
+    expect(m?.note).not.toContain('Code/')
+  })
+
+  it('SVN 侧又有了更新的 revision、或文件已经跟上：那个文件不算留下的', () => {
+    const m = describeHeldBack(
+      [
+        { path: 'Code/A.cs', reason: reasons.conflict, rev: 3 },
+        { path: 'Code/Gone.cs', reason: reasons.conflict, rev: 1 },
+        { path: 'Code/B.cs', reason: reasons.leak, rev: 5 },
+      ],
+      sync,
+    )
+    expect(m?.groups).toEqual([{ reason: reasons.leak, files: ['Code/B.cs  r5'] }])
+    expect(m?.title).toContain('1 个文件')
+  })
+
+  it('没钉 revision 时只按路径认', () => {
+    const m = describeHeldBack([{ path: 'Code/A.cs', reason: reasons.conflict, rev: null }], sync)
+    expect(m?.groups[0].files).toEqual(['Code/A.cs  r4  zhang'])
+  })
+
+  it('已经在整次冲突那一组里的文件不重复列', () => {
+    const files = [
+      { path: 'Code/A.cs', reason: reasons.conflict, rev: 4 },
+      { path: 'Code/B.cs', reason: reasons.leak, rev: 5 },
+    ]
+    const conflict = {
+      files: [{ path: 'Code/A.cs', rev: 4, author: 'zhang', svnRemoved: false }],
+      lagging: false,
+    }
+    expect(describeHeldBack(files, sync, conflict)?.groups).toEqual([
+      { reason: reasons.leak, files: ['Code/B.cs  r5'] },
+    ])
+    expect(describeHeldBack(files.slice(0, 1), sync, conflict)).toBeNull()
+  })
+
+  it('没有留下的文件、判定不是「SVN 侧有新内容」时没有这一组', () => {
+    const one = [{ path: 'Code/A.cs', reason: reasons.conflict, rev: 4 }]
+    expect(describeHeldBack(null, sync)).toBeNull()
+    expect(describeHeldBack([], sync)).toBeNull()
+    expect(describeHeldBack(one, null)).toBeNull()
+    expect(describeHeldBack(one, { verdict: { kind: 'inSync' } })).toBeNull()
   })
 
   it('整次跟进、旧后端：没有这一节，摘要不提', () => {

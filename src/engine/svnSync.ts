@@ -129,6 +129,14 @@ const REBUILD: BannerAction = { id: 'rebuild', label: '重建基线…' }
 const CHECK: BannerAction = { id: 'check', label: '体检基线' }
 
 /**
+ * 「SVN 侧有新内容」列表里一个修改过的文件那一行。留下的文件那一组（`svnFollow::describeHeldBack`）
+ * 用同一个函数写，横幅按整行把它们从新内容列表里摘掉，写法一变两边一起变。
+ */
+export function externalChangeLine(c: ExternalChange): string {
+  return `${c.path}  r${c.rev}${c.author ? `  ${c.author}` : ''}`
+}
+
+/**
  * 失同步状态 → 横幅。同步（或还没读到状态）时返回 `null`，整个横幅不渲染。
  *
  * `null` 与「一切正常」的横幅是两回事：打开仓库的那一瞬间状态是 `null`，
@@ -175,10 +183,9 @@ export function describeSync(status: SyncStatus | null): BannerModel | null {
       // 报成「基线与服务器不符」，而跟进本身就包含体检。措辞不说「你提交了」：局部 update
       // 拉下的同事改动也是这个判定，作者列出来让用户自己分辨
       const n = v.changed.length + v.added.length + v.removed.length
-      const by = (c: ExternalChange) => (c.author ? `  ${c.author}` : '')
       const files = [
-        ...v.changed.map((c) => `${c.path}  r${c.rev}${by(c)}`),
-        ...v.added.map((c) => `${c.path}  r${c.rev}${by(c)}（新增）`),
+        ...v.changed.map(externalChangeLine),
+        ...v.added.map((c) => `${externalChangeLine(c)}（新增）`),
         // 不写「已在 SVN 上删除」：本地分不出提交删除与 `--set-depth=exclude` 漏收（E17），
         // 要跟进时向服务器确认才知道
         ...v.removed.map((p) => `${p}（工作副本里已没有）`),

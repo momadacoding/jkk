@@ -87,6 +87,8 @@ function deps(log: string[], confirm?: (r: ConfirmRequest) => Promise<boolean>):
     showAutoFollowed: () => log.push('showAutoFollowed'),
     // 不记日志：上面那些按顺序断言的用例不该因为它变；要看它的用例自己覆盖
     clearAutoFollowed: () => {},
+    // 不记日志，理由同上
+    setHeldBack: () => {},
   }
 }
 
@@ -418,6 +420,90 @@ describe('handleAutoFollow（事故分析 6.12）', () => {
       expect(log.some((l) => l.startsWith('reportError'))).toBe(false)
       expect(warn).toHaveBeenCalledTimes(1)
       warn.mockRestore()
+    })
+
+    describe('留下的文件交给横幅一直列着（使用报告 2026-11-23）', () => {
+      /** 只看 `setHeldBack` 的那几次调用。 */
+      const pins = (d: SvnSyncFlowDeps) => {
+        const got: unknown[] = []
+        return { d: { ...d, setHeldBack: (p: unknown) => got.push(p) } as SvnSyncFlowDeps, got }
+      }
+
+      it('只剩留下的文件：钉在刷新之后的 revision 与 HEAD 上', async () => {
+        const log: string[] = []
+        vi.mocked(store.svnFollowAuto).mockResolvedValue({
+          kind: 'done',
+          report: { ...report, heldBack: held },
+        })
+        const { d, got } = pins({ ...deps(log), sceneAfterFollow: async () => ({ sync: left, head: 'h2' }) })
+        start(d)
+        await vi.waitFor(() => expect(log).toContain('showAutoFollowed'))
+        expect(got).toEqual([
+          { head: 'h2', files: [{ path: 'Code/A.cs', reason: '有冲突。', rev: 4 }] },
+        ])
+      })
+
+      it('刷新之后又有新内容：照样钉住（这时横幅上没有原因行，只剩这一组说明为什么留下）', async () => {
+        const log: string[] = []
+        vi.mocked(store.svnFollowAuto).mockResolvedValue({
+          kind: 'done',
+          report: { ...report, heldBack: held },
+        })
+        const more = {
+          verdict: { ...left.verdict, added: [{ path: 'Code/N.cs', rev: 5, author: 'zhang' }] },
+        }
+        const { d, got } = pins({ ...deps(log), sceneAfterFollow: async () => ({ sync: more, head: 'h2' }) })
+        start(d)
+        await vi.waitFor(() => expect(log).toContain('showAutoFollowed'))
+        expect(got).toEqual([
+          { head: 'h2', files: [{ path: 'Code/A.cs', reason: '有冲突。', rev: 4 }] },
+        ])
+      })
+
+      it('读不出刷新之后的现场：照样记下，不按 revision 与 HEAD 比', async () => {
+        const log: string[] = []
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        vi.mocked(store.svnFollowAuto).mockResolvedValue({
+          kind: 'done',
+          report: { ...report, heldBack: held },
+        })
+        const { d, got } = pins({
+          ...deps(log),
+          sceneAfterFollow: async () => {
+            throw new Error('读不到')
+          },
+        })
+        start(d)
+        await vi.waitFor(() => expect(log).toContain('showAutoFollowed'))
+        expect(got).toEqual([{ head: null, files: [{ path: 'Code/A.cs', reason: '有冲突。', rev: null }] }])
+        warn.mockRestore()
+      })
+
+      it('整次跟进完、没留下文件：撤掉上一次留下的', async () => {
+        const log: string[] = []
+        vi.mocked(store.svnFollowAuto).mockResolvedValue({ kind: 'done', report })
+        const { d, got } = pins(deps(log))
+        start(d)
+        await vi.waitFor(() => expect(log).toContain('showAutoFollowed'))
+        expect(got).toEqual([null])
+      })
+
+      it('这一次没跟进（被拦下、开关关着）：上一次留下的照旧列着', async () => {
+        const log: string[] = []
+        vi.mocked(store.svnFollowAuto).mockResolvedValue({
+          kind: 'skipped',
+          code: 'svn_auto_follow_overlap',
+          message: '拦',
+        })
+        const { d, got } = pins(deps(log))
+        start(d)
+        await vi.waitFor(() => expect(log.some((l) => l.startsWith('autoSkip:'))).toBe(true))
+        const off = pins({ ...deps(log), autoFollowEnabled: async () => false })
+        start(off.d)
+        await vi.waitFor(() => expect(log).toContain('autoSkip:null'))
+        expect(got).toEqual([])
+        expect(off.got).toEqual([])
+      })
     })
 
     describe('和 RepoTab 的 effect 接在一起（独立 review 中 1）', () => {

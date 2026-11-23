@@ -19,10 +19,12 @@ import {
 import {
   describeAutoFollowConflict,
   describeAutoFollowSkip,
+  describeHeldBack,
   describePendingRestores,
   type AutoFollowConflict,
   type AutoFollowNotice,
   type FollowActionId,
+  type HeldBackFile,
   type PendingRestore,
 } from '../engine/svnFollow'
 import type { SyncActionId } from '../engine/svnSyncIn'
@@ -95,6 +97,11 @@ interface BaselineBannerProps {
    * 单独成组、排在新内容列表上面（2026-11-19 使用报告问题 1）。
    */
   autoFollowConflict?: AutoFollowConflict | null
+  /**
+   * 上一次部分自动跟进留下的文件（调用方已按 HEAD 核对过，`heldBackFor`）。还在新内容里、revision
+   * 没变的那些按原因单独成组，从新内容列表里摘掉（使用报告 2026-11-23）。
+   */
+  heldBack?: HeldBackFile[] | null
   /** 自动跟进完成后那条不打断操作的提示。`null` 不渲染。 */
   autoFollowed?: AutoFollowNotice | null
   /** 提示上的「查看详情」：弹同一份跟进报告。 */
@@ -165,6 +172,7 @@ export function BaselineBanner({
   onUnregisterHooks,
   autoFollowSkip = null,
   autoFollowConflict = null,
+  heldBack = null,
   autoFollowed = null,
   onAutoFollowedDetails,
   onAutoFollowedDismiss,
@@ -200,6 +208,11 @@ export function BaselineBanner({
       : null
   const skipNote =
     skipApplies && !conflictGroup && autoFollowSkip ? describeAutoFollowSkip(autoFollowSkip) : null
+  // 同样只挂在「SVN 侧有新内容」上（`describeHeldBack` 自己核对判定）；基线丢了时那条横幅不是它
+  const heldGroup =
+    model && !missing ? describeHeldBack(heldBack, sync, conflictGroup ? autoFollowConflict : null) : null
+  // 留下的文件已经在那一组里，新内容列表不再列一遍
+  const newFiles = (model?.files ?? []).filter((f) => !heldGroup?.lines.has(f))
   // 自动跟进的提示不受 hushed 影响：它说的是已经做完的事
   const notice = isSvn ? autoFollowed : null
   // 中间态时让位：后端那时也不给数据，这里再挡一次
@@ -326,12 +339,28 @@ export function BaselineBanner({
               <p className="banner-baseline-note">{conflictGroup.note}</p>
             </div>
           )}
-          {conflictGroup && model.files && model.files.length > 0 && (
+          {heldGroup && (
+            <div className="banner-baseline-conflict" role="alert">
+              <strong>{heldGroup.title}</strong>
+              {heldGroup.groups.map((g) => (
+                <div key={g.reason}>
+                  <p className="banner-baseline-held-reason">{g.reason}</p>
+                  <ul className="banner-baseline-files">
+                    {g.files.map((f) => (
+                      <li key={f}>{f}</li>
+                    ))}
+                  </ul>
+                </div>
+              ))}
+              <p className="banner-baseline-note">{heldGroup.note}</p>
+            </div>
+          )}
+          {(conflictGroup || heldGroup) && newFiles.length > 0 && (
             <p className="banner-baseline-files-label">SVN 侧的新内容：</p>
           )}
-          {model.files && model.files.length > 0 && (
+          {newFiles.length > 0 && (
             <ul className="banner-baseline-files">
-              {model.files.map((f) => (
+              {newFiles.map((f) => (
                 <li key={f}>{f}</li>
               ))}
             </ul>

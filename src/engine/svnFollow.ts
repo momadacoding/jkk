@@ -6,7 +6,7 @@
  *
  * ⚠️ 横幅与对话框都按**纯文本**渲染：不要写 `**`。
  */
-import type { ExternalChange, SyncVerdict } from './svnSync'
+import { externalChangeLine, type ExternalChange, type SyncVerdict } from './svnSync'
 import type { DiffTarget } from './externalTools'
 import { formatDuration } from './svnInit'
 import {
@@ -232,6 +232,11 @@ export interface AutoFollowConflict {
 export interface AutoFollowSkip {
   message: string
   conflict?: AutoFollowConflict
+  /**
+   * 原因是部分跟进留下的文件（`heldBackScene`）。横幅不写这一行，留下的文件那一组（`describeHeldBack`）
+   * 已经按原因列着；整句仍给任务栏与托盘，那里没有那一组（使用报告 2026-11-23）。
+   */
+  held?: boolean
 }
 
 /** 横幅上冲突文件那一组。 */
@@ -311,7 +316,7 @@ export function heldBackScene(
   held: HeldBack[] | undefined,
   sync: { verdict: { kind: string } } | null,
   head: string | null,
-): { key: string; message: string } | null {
+): { key: string; message: string; held: true } | null {
   const key = autoFollowKey(sync, head)
   if (!key || !sync || !held || held.length === 0) return null
   const v = sync.verdict as Extract<SyncVerdict, { kind: 'externallyAdvanced' }>
@@ -328,10 +333,107 @@ export function heldBackScene(
   })
   return {
     key,
-    // 前面会接上「没有自动跟进：」（`describeAutoFollowSkip`）
+    // 横幅不写它（见 `AutoFollowSkip.held`），只给任务栏与托盘；前面会接上「没有自动跟进：」
     message:
       `还有 ${held.length} 个文件留在旧基线上（上一次自动跟进留下的），要你来处理。` +
       `${groups.join('')}点「跟进」来处理。`,
+    held: true,
+  }
+}
+
+/** 部分跟进留下的文件，钉在留下那一刻 SVN 侧的 revision 与 HEAD 上。 */
+export interface HeldBackPin {
+  /** 留下之后的 HEAD；`null`：没读出来，不按 HEAD 比。 */
+  head: string | null
+  files: HeldBackFile[]
+}
+
+export interface HeldBackFile {
+  path: string
+  reason: string
+  /** 留下那一刻 SVN 侧的 revision；`null`：没读出来，只按路径认。 */
+  rev: number | null
+}
+
+/**
+ * 跟进完成后把留下的文件钉住，交给横幅一直列着（使用报告 2026-11-23）。
+ *
+ * 不能只靠 `heldBackScene` 的原因行：那一行只在现场只剩留下的文件时才有，又来了新内容、而这一次
+ * 自动跟进没跑成（开关关了、merge driver 有风险、预检拦下）时，横幅上就没有任何地方说为什么留下。
+ * 钉住 revision：SVN 侧那个文件又有了提交，原来的原因就不一定成立了，那时不再当成留下的。
+ *
+ * `scene` 为 `null`：读不出刷新之后的现场，照样记下，不按 revision 与 HEAD 比（少一层保护，
+ * 但不至于把原因丢掉）。
+ */
+export function pinHeldBack(
+  held: HeldBack[] | undefined,
+  scene: { sync: { verdict: { kind: string } } | null; head: string | null } | null,
+): HeldBackPin | null {
+  if (!held || held.length === 0) return null
+  if (!scene) return { head: null, files: held.map((h) => ({ ...h, rev: null })) }
+  if (!scene.sync || scene.sync.verdict.kind !== 'externallyAdvanced') return null
+  const v = scene.sync.verdict as Extract<SyncVerdict, { kind: 'externallyAdvanced' }>
+  const revs = new Map(v.changed.map((c) => [c.path, c.rev]))
+  const files = held.flatMap((h) => {
+    const rev = revs.get(h.path)
+    return rev === undefined ? [] : [{ path: h.path, reason: h.reason, rev }]
+  })
+  return files.length > 0 ? { head: scene.head, files } : null
+}
+
+/**
+ * 当前 HEAD 下还作不作数。提交、切分支之后不作数：留下的原因（重放冲突、补丁泄漏）是那条分支、
+ * 那个 HEAD 上的结论；宁可这一组暂时不显示，也不把别的分支的原因安到这里。
+ */
+export function heldBackFor(pin: HeldBackPin | null, head: string | null): HeldBackFile[] | null {
+  if (!pin) return null
+  return pin.head === null || pin.head === head ? pin.files : null
+}
+
+/** 横幅上留下的文件那一组。 */
+export interface HeldBackModel {
+  title: string
+  /** 按原因分组，原因就是组的标题（后端 `svn_follow::HELD_*` 的整句）。 */
+  groups: { reason: string; files: string[] }[]
+  note: string
+  /** 组里的文件行，横幅按整行把它们从新内容列表里摘掉，路径只出现一次。 */
+  lines: Set<string>
+}
+
+/**
+ * 部分跟进留下的文件单独成组，样式同整次冲突那一组（`describeAutoFollowConflict`），排在新内容
+ * 列表上面。原来只是一行灰字，真实原因被上面那段通用说明盖住（使用报告 2026-11-23）。
+ *
+ * 只认还在判定里、revision 没变的文件；已经在整次冲突那一组里的不重复列。
+ */
+export function describeHeldBack(
+  files: HeldBackFile[] | null | undefined,
+  sync: { verdict: { kind: string } } | null,
+  conflict?: AutoFollowConflict | null,
+): HeldBackModel | null {
+  if (!files || files.length === 0 || !sync || sync.verdict.kind !== 'externallyAdvanced') {
+    return null
+  }
+  const v = sync.verdict as Extract<SyncVerdict, { kind: 'externallyAdvanced' }>
+  const changed = new Map(v.changed.map((c) => [c.path, c]))
+  const inConflict = new Set((conflict?.files ?? []).map((f) => f.path))
+  const byReason = new Map<string, string[]>()
+  const lines = new Set<string>()
+  for (const f of files) {
+    const c = changed.get(f.path)
+    if (!c || inConflict.has(f.path) || (f.rev !== null && f.rev !== c.rev)) continue
+    const line = externalChangeLine(c)
+    byReason.set(f.reason, [...(byReason.get(f.reason) ?? []), line])
+    lines.add(line)
+  }
+  if (lines.size === 0) return null
+  return {
+    title: `上一次自动跟进留下了 ${lines.size} 个文件，还停在旧基线上`,
+    groups: [...byReason].map(([reason, list]) => ({ reason, files: list })),
+    // 又有新内容会换一个现场键，`RepoTab` 的 effect 照常自动发起；设置里关掉了就不会（E2E 2026-11-24
+    // 关着开关时看到原来那句「也会自动再试」是错的）
+    note: '点「跟进」来处理；设置里开着自动的话，SVN 侧又有新内容时会再试一次。',
+    lines,
   }
 }
 
@@ -345,12 +447,15 @@ export interface AutoFollowNotice {
 
 export function describeAutoFollowDone(r: FollowReport): AutoFollowNotice {
   const m = describeFollowReport(r)
-  // 放回的结果已经在 `safe` 里；没放回的会算进 todo
-  const look = m.tone === 'ok' ? '' : `报告里有 ${m.todo} 项要你留意，请点「查看详情」。`
+  // 放回的结果已经在 `safe` 里；没放回的会算进 todo。留在旧基线上的文件不算：下方横幅一直按原因
+  // 列着它们，这里再算一项就是同一件事说两遍（使用报告 2026-11-23）。报告框里照旧算
+  const todo = m.sections.filter((s) => s.level !== 'info' && s.id !== 'heldBack').length
+  const look = todo > 0 ? `报告里有 ${todo} 项要你留意，请点「查看详情」。` : ''
+  const below = (r.heldBack?.length ?? 0) > 0 ? '留下的文件和原因列在下面的横幅上。' : ''
   return {
-    tone: m.tone === 'ok' ? 'quiet' : 'warn',
+    tone: todo > 0 ? 'warn' : 'quiet',
     title: '已自动跟进 SVN 侧的新内容',
-    detail: `${m.summary}${m.safe}。${look}`,
+    detail: `${m.summary}${m.safe}。${below}${look}`,
   }
 }
 
