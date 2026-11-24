@@ -65,6 +65,25 @@ impl WScope {
         Ok(scope)
     }
 
+    /// 同 [`WScope::for_repo`]，「尊重」的参照用调用方已经读好的基线文件，不再自己读 ref、走树。
+    ///
+    /// `tracked` 必须是**当前** `svn/base` 树里的文件（[`baseline_files`] 的结果）。调用方按同一个 OID
+    /// 读映射与文件清单时用它：两次按 ref 名读，中间基线被移动的话两边就不是同一个基线了。
+    pub fn for_repo_with_tracked(
+        repo_root: &str,
+        cfg: &SvnConfig,
+        tracked: &BTreeSet<String>,
+    ) -> Self {
+        let mut scope = Self::plain(&cfg.whitelist, &cfg.extensions);
+        if cfg.respect_gitignore {
+            scope.respect = Some(Respect {
+                repo_root: repo_root.to_string(),
+                tracked: tracked.clone(),
+            });
+        }
+        scope
+    }
+
     pub fn whitelist(&self) -> &[String] {
         &self.whitelist
     }
@@ -84,13 +103,24 @@ impl WScope {
 
     /// 这批路径里哪些是 W-file。尊重 `.gitignore` 时整批只问 git 一次。
     pub fn filter<'a>(&self, paths: impl IntoIterator<Item = &'a str>) -> Result<BTreeSet<String>> {
-        let mut out: BTreeSet<String> = paths
+        let mut out: BTreeSet<String> = self
+            .w_paths(paths)
             .into_iter()
-            .filter(|p| path_is_w(p, &self.roots, &self.extensions))
             .map(str::to_string)
             .collect();
         self.retain_not_ignored(&mut out)?;
         Ok(out)
+    }
+
+    /// [`WScope::filter`] 的前一半：只做路径判断（白名单 ∧ 扩展名），不问 `.gitignore`。
+    ///
+    /// 调用方要在两步之间插别的逐路径判断（例如查磁盘）时用它，之后**必须**再过
+    /// [`WScope::retain_not_ignored`]，否则「尊重 .gitignore」的仓库会多收。
+    pub(crate) fn w_paths<'a>(&self, paths: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+        paths
+            .into_iter()
+            .filter(|p| path_is_w(p, &self.roots, &self.extensions))
+            .collect()
     }
 
     /// 只做「尊重」那一半：从 `set` 里去掉被工作树 `.gitignore` 排除、且不在基线里的路径。

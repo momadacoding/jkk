@@ -913,6 +913,26 @@ struct LocalFloor {
     dirs: BTreeSet<String>,
     /// 每个单元根在 wc.db 里的最后修改 revision，与服务器上 `<url>@F` 的核对（[`check_probes`]）。
     root_changed: BTreeMap<String, u64>,
+    /// 改回问服务器的单元，按原因计数，写进性能记录（2026-11-24 分析方案 5）。原因不带路径：
+    /// 性能记录按设计不记路径（`perf` 的 D5），反引号里的部分一律换成 `…`（[`path_free`]）。
+    server_reasons: BTreeMap<String, usize>,
+}
+
+/// 原因里反引号括起来的部分（路径、URL）换成 `` `…` ``，其余照留。
+fn path_free(why: &str) -> String {
+    let mut out = String::new();
+    let mut inside = false;
+    for ch in why.chars() {
+        if ch == '`' {
+            if !inside {
+                out.push_str("`…`");
+            }
+            inside = !inside;
+        } else if !inside {
+            out.push(ch);
+        }
+    }
+    out.chars().take(200).collect()
 }
 
 /// 判出哪些单元能用本地 floor。读不了 wc.db、筛不了 W-file 时一律照旧跑 diff，只记日志：
@@ -922,7 +942,9 @@ fn local_floor(repo_root: &str, units: &[WcIdentity], map: &BaseMap, scope: &WSc
         Ok(s) => s,
         Err(why) => {
             log::info!("体检照旧向服务器比对 floor：{why}");
-            return LocalFloor::default();
+            let mut out = LocalFloor::default();
+            out.server_reasons.insert(path_free(&why), units.len());
+            return out;
         }
     };
     let mut out = LocalFloor::default();
@@ -935,6 +957,7 @@ fn local_floor(repo_root: &str, units: &[WcIdentity], map: &BaseMap, scope: &WSc
             } => (dirs, stale, root_changed),
             crate::engine::svn_wcdb::FloorShape::Irregular(why) => {
                 log::info!("体检 `{wc_root}` 照旧向服务器比对 floor：{why}");
+                out.note(&why);
                 continue;
             }
         };
@@ -954,10 +977,12 @@ fn local_floor(repo_root: &str, units: &[WcIdentity], map: &BaseMap, scope: &WSc
                         w.len(),
                         map.floor
                     );
+                    out.note("有 W-file 在 F 上的内容可能与工作副本的版本不同（stale）");
                     continue;
                 }
                 Err(e) => {
                     log::info!("体检 `{wc_root}` 照旧向服务器比对 floor：{}", e.message);
+                    out.note("筛不了 stale 里的 W-file");
                     continue;
                 }
             }
@@ -970,10 +995,16 @@ fn local_floor(repo_root: &str, units: &[WcIdentity], map: &BaseMap, scope: &WSc
 }
 
 impl LocalFloor {
-    /// 这个单元改回 diff。
-    fn drop_unit(&mut self, wc_root: &str) {
-        self.units.remove(wc_root);
+    /// 这个单元改回 diff，原因计一次。
+    fn drop_unit(&mut self, wc_root: &str, why: &str) {
+        if self.units.remove(wc_root) {
+            self.note(why);
+        }
         self.root_changed.remove(wc_root);
+    }
+
+    fn note(&mut self, why: &str) {
+        *self.server_reasons.entry(path_free(why)).or_default() += 1;
     }
 }
 
@@ -1369,7 +1400,8 @@ fn check_grouped(
         let read = read_local_floor(repo_root, &units, &local, &statuses);
         for (u, why) in &mismatched {
             log::info!("体检 `{u}` 照旧向服务器比对 floor：{why}");
-            local.drop_unit(u);
+            // 只留冒号前那段：后面是 svn 的原始报错，可能带服务器地址
+            local.drop_unit(u, why.split('：').next().unwrap_or_default());
         }
         match read {
             Ok(LocalFloorRead {
@@ -1377,7 +1409,7 @@ fn check_grouped(
                 fallback,
             }) => {
                 for u in &fallback {
-                    local.drop_unit(u);
+                    local.drop_unit(u, "本地 status 里有只有 diff 才认得的形态");
                 }
                 let mismatched: BTreeSet<&str> =
                     mismatched.iter().map(|(u, _)| u.as_str()).collect();
@@ -1400,20 +1432,27 @@ fn check_grouped(
                     "体检照旧向服务器比对 floor：本地 status 没跑成：{}",
                     e.message
                 );
-                local.units.clear();
+                for u in std::mem::take(&mut local.units) {
+                    local.drop_unit(&u, "本地 status 没跑成");
+                }
             }
         }
         LAST_LOCAL.with(|l| *l.borrow_mut() = local.units.iter().cloned().collect());
-        if perf::enabled() {
-            let mut rec = perf::Record::rust("query", "health floor answered locally");
-            rec.meta
-                .insert("local".into(), serde_json::json!(local.units.len()));
-            rec.meta.insert(
-                "server".into(),
-                serde_json::json!(units.len() - local.units.len()),
-            );
-            perf::record(&rec);
-        }
+    }
+    // 一个单元都没走本地时也记：要知道的正是为什么（2026-11-24 分析方案 5）
+    if perf::enabled() && (!local.units.is_empty() || !local.server_reasons.is_empty()) {
+        let mut rec = perf::Record::rust("query", "health floor answered locally");
+        rec.meta
+            .insert("local".into(), serde_json::json!(local.units.len()));
+        rec.meta.insert(
+            "server".into(),
+            serde_json::json!(units.len() - local.units.len()),
+        );
+        rec.meta.insert(
+            "server_reasons".into(),
+            serde_json::json!(local.server_reasons),
+        );
+        perf::record(&rec);
     }
 
     let DiffPlan {

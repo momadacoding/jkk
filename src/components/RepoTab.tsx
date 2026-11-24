@@ -1114,8 +1114,8 @@ export function RepoTab({
     fetchSvnLog,
     setFollowing,
     setSyncActionBusy,
+    refreshHooksHealth: () => void refreshHooksHealth(),
     refreshAfterFollow: async () => {
-      void refreshHooksHealth()
       // 三路同时发，不一项等一项（使用报告 10.5）。读图排在读 HEAD 后面：接 SVN 历史时要拿新的 HEAD 当
       // 「还被指着」的起点（`repoStore` 的 `merge`），先写回图的话游离 HEAD 上的提交会被当成已交付藏起来
       const results = await Promise.allSettled([

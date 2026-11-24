@@ -41,6 +41,7 @@
 //! 出现修改或改动凭空消失），由现有的 watcher + `git status` 负责，**不归本模块**。
 
 use crate::engine::git_cli::run_git;
+use crate::engine::perf;
 use crate::engine::svn_basemap::{read_base_map, BaseMap};
 use crate::engine::svn_cli::{run_svn, with_scan_cache};
 use crate::engine::svn_config::read_config;
@@ -192,21 +193,21 @@ pub(crate) fn check_sync_with_nodes(repo_root: &str) -> Result<(SyncStatus, Vec<
 fn check_sync_uncached(repo_root: &str) -> Result<(SyncStatus, Vec<NodeStatus>)> {
     let oid = baseline_oid(repo_root)?;
     // 映射与文件清单取自同一个 OID：分两次按 ref 名读，中间基线被移动就会拼出一个不存在的 R
-    let map = read_base_map(repo_root, &oid)?;
-    let files = tree_files(repo_root, &oid)?;
+    let map = perf::inproc("sync read base map", || read_base_map(repo_root, &oid))?;
+    let files = perf::inproc("sync baseline tree", || tree_files(repo_root, &oid))?;
     let cfg = read_config(repo_root)?;
     let wcs = enumerate_wcs(repo_root, &cfg.whitelist)?;
     let nodes = read_node_status(repo_root, &cfg.whitelist, &wcs)?;
-    let scope = WScope::for_repo(repo_root, &cfg)?;
+    // 「尊重 .gitignore」的参照就是刚按同一个 OID 读出的基线文件，不再按 ref 名重走一遍基线树
+    // （日志 `2026-11-24-follow-perf-pr1-decisions.md` Task 2）
+    let scope = perf::inproc("sync w scope", || {
+        Ok::<_, GitError>(WScope::for_repo_with_tracked(repo_root, &cfg, &files))
+    })?;
 
-    let j = judge(&map, &files, &nodes, |cands| {
-        // 外部新增要看磁盘是文件：status 不给 kind，扩展名为 `*` 时目录也会过 W-path 判断
-        let on_disk: Vec<&str> = cands
-            .iter()
-            .copied()
-            .filter(|p| Path::new(repo_root).join(p).is_file())
-            .collect();
-        scope.filter(on_disk)
+    let j = perf::inproc("sync judge", || {
+        judge(&map, &files, &nodes, |cands| {
+            added_w_files(repo_root, &scope, cands, |p| p.is_file())
+        })
     })?;
     let verdict = if !j.locked.is_empty() {
         SyncVerdict::WcLocked { dirs: j.locked }
@@ -387,6 +388,40 @@ fn judge(
     })
 }
 
+/// 外部新增的候选里「磁盘上是文件的 W-file」。
+///
+/// 候选是所有有 revision、不在基线树里的节点：全部目录、白名单内的非 W 文件（美术文件等）都在里面，
+/// 现场可能上万个。所以先按路径筛 W，只对剩下的查磁盘，最后问 `.gitignore`（2026-11-24 分析方案 1）。
+/// 三步都是逐路径的判断、结果取交集，换顺序集合不变。还要查磁盘是因为 status 不给 kind，
+/// 扩展名为 `*` 时目录也会过路径判断。
+fn added_w_files(
+    repo_root: &str,
+    scope: &WScope,
+    cands: &[&str],
+    is_file: impl Fn(&Path) -> bool,
+) -> Result<BTreeSet<String>> {
+    let started = perf::enabled().then(perf::now_ms);
+    let w = scope.w_paths(cands.iter().copied());
+    let mut out: BTreeSet<String> = w
+        .iter()
+        .filter(|p| is_file(&Path::new(repo_root).join(p)))
+        .map(|p| p.to_string())
+        .collect();
+    let on_disk = out.len();
+    scope.retain_not_ignored(&mut out)?;
+    if let Some(ts) = started {
+        let mut rec = perf::Record::rust("inproc", "sync added w-files on disk");
+        rec.ts = ts;
+        rec.dur = perf::now_ms() - ts;
+        rec.meta.insert("candidates".into(), cands.len().into());
+        rec.meta.insert("disk_checks".into(), w.len().into());
+        rec.meta.insert("on_disk".into(), on_disk.into());
+        rec.meta.insert("added".into(), out.len().into());
+        perf::record(&rec);
+    }
+    Ok(out)
+}
+
 /// `svn/base` 顶端的 OID。分支不存在时报 `svn_no_baseline`（理由见 [`read_baseline_rev`]）。
 fn baseline_oid(repo_root: &str) -> Result<String> {
     let reference = format!("refs/heads/{BASELINE_BRANCH}");
@@ -531,4 +566,41 @@ fn normalize(whitelist: &[String]) -> Vec<String> {
         .map(|w| w.replace('\\', "/").trim_end_matches('/').to_string())
         .filter(|w| !w.is_empty())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)] // 测试里 unwrap 即断言，见 clippy.toml
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn added_w_files_checks_disk_only_for_w_candidates() {
+        let scope = WScope::plain(&["Code/".to_string()], &[".cs".to_string()]);
+        let asked = RefCell::new(Vec::new());
+        let cands = [
+            "Code",
+            "Code/C.cs",
+            "Code/notes.txt",
+            "Code/Sub",
+            "Code/Sub/D.cs",
+            "Art/x.cs",
+        ];
+        let got = added_w_files("R", &scope, &cands, |p| {
+            let rel = p
+                .strip_prefix("R")
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            asked.borrow_mut().push(rel.clone());
+            // `Code` 是白名单根，按路径算 W，但它是目录
+            rel != "Code"
+        })
+        .unwrap();
+        assert_eq!(
+            got.into_iter().collect::<Vec<_>>(),
+            ["Code/C.cs", "Code/Sub/D.cs"]
+        );
+        assert_eq!(*asked.borrow(), ["Code", "Code/C.cs", "Code/Sub/D.cs"]);
+    }
 }

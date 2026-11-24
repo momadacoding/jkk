@@ -202,11 +202,6 @@ fn query(db: &Connection, sub: &str) -> rusqlite::Result<Rows> {
         return Ok(Err(format!("WCROOT 里有 {} 个根", ids.len())));
     };
 
-    // 每个路径取 op_depth 最大的那一层：那是这个节点此刻的样子（BASE 是 0，WORKING 层更大，
-    // wc-metadata.sql 的 NODES 注释）。svn info 报的也是这一层
-    const TOP: &str = "op_depth = (SELECT MAX(op_depth) FROM nodes m \
-                       WHERE m.wc_id = n.wc_id AND m.local_relpath = n.local_relpath)";
-
     let root: Option<String> = tx
         .query_row(
             &format!(
@@ -223,16 +218,8 @@ fn query(db: &Connection, sub: &str) -> rusqlite::Result<Rows> {
         )));
     }
 
-    // 子树用区间而不是 LIKE：LIKE 不区分大小写，还要转义 `_` `%`。`/` 是 0x2F、`0` 是 0x30，
-    // `sub/` 到 `sub0` 之间正好是 `sub/` 开头的全部路径（local_relpath 按字节比较）
-    let sql = format!(
-        "SELECT local_relpath, kind FROM nodes n \
-         WHERE wc_id = ?1 AND presence = 'excluded' AND {TOP} \
-         AND (?2 = '' OR local_relpath = ?2 OR (local_relpath >= ?2 || '/' AND local_relpath < ?2 || '0')) \
-         ORDER BY local_relpath"
-    );
     let found: Vec<(String, String)> = tx
-        .prepare(&sql)?
+        .prepare(&excluded_sql(sub))?
         .query_map(rusqlite::params![wc_id, sub], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })?
@@ -367,10 +354,68 @@ fn shape_of_unit(
     })
 }
 
-/// 子树条件：`local_relpath` 是 `?2` 本身或在它底下（`?2` 为空串时是整个工作副本）。区间写法的
-/// 理由见 [`query`]。
-const IN_SUBTREE: &str = "(?2 = '' OR local_relpath = ?2 OR \
-                          (local_relpath >= ?2 || '/' AND local_relpath < ?2 || '0'))";
+/// 每个路径取 op_depth 最大的那一层：那是这个节点此刻的样子（BASE 是 0，WORKING 层更大，
+/// wc-metadata.sql 的 NODES 注释）。svn info 报的也是这一层
+const TOP: &str = "op_depth = (SELECT MAX(op_depth) FROM nodes m \
+                   WHERE m.wc_id = n.wc_id AND m.local_relpath = n.local_relpath)";
+
+/// 子树条件：`local_relpath` 是 `?2` 本身或在它底下（`?2` 为空串时是整个工作副本）。
+///
+/// 用区间而不是 LIKE：LIKE 不区分大小写，还要转义 `_` `%`。`/` 是 0x2F、`0` 是 0x30，
+/// `sub/` 到 `sub0` 之间正好是 `sub/` 开头的全部路径（local_relpath 按字节比较）。
+///
+/// 写成「`sub` 到 `sub0` 的区间 + 残余条件」，空串单独一条。原来的 `?2 = '' OR local_relpath = ?2
+/// OR (区间)` 结论相同，但 SQLite 规划时不知道 `?2` 的值，OR 里有一项与列无关，整个条件用不上主键，
+/// 每个单元都扫一遍整个工作副本（2026-11-24 分析方案 2；`EXPLAIN QUERY PLAN` 见本文件的测试）。
+/// 区间 `[sub, sub0)` 里除了 `sub` 本身和 `sub/…`，还有 `sub-x`、`sub.x` 这类兄弟（`-` `.` 都小于
+/// `/`），残余条件把它们剔掉。
+fn in_subtree(sub: &str) -> &'static str {
+    if sub.is_empty() {
+        // 仍然引用 `?2`：调用方总是绑两个参数
+        "(?2 = '')"
+    } else {
+        "(local_relpath >= ?2 AND local_relpath < ?2 || '0' \
+         AND (local_relpath = ?2 OR local_relpath >= ?2 || '/'))"
+    }
+}
+
+/// [`query`] 的被排除节点。
+fn excluded_sql(sub: &str) -> String {
+    format!(
+        "SELECT local_relpath, kind FROM nodes n \
+         WHERE wc_id = ?1 AND presence = 'excluded' AND {TOP} AND {} \
+         ORDER BY local_relpath",
+        in_subtree(sub)
+    )
+}
+
+/// [`query_shape`] 的 WORKING 层（本地增删、复制）。
+fn working_sql(sub: &str) -> String {
+    format!(
+        "SELECT local_relpath FROM nodes WHERE wc_id = ?1 AND op_depth > 0 \
+         AND {} LIMIT 1",
+        in_subtree(sub)
+    )
+}
+
+/// [`query_shape`] 的冲突。
+fn conflict_sql(sub: &str) -> String {
+    format!(
+        "SELECT local_relpath FROM actual_node WHERE wc_id = ?1 \
+         AND conflict_data IS NOT NULL AND {} LIMIT 1",
+        in_subtree(sub)
+    )
+}
+
+/// [`query_shape`] 的 BASE 层全部节点。
+fn base_rows_sql(sub: &str) -> String {
+    format!(
+        "SELECT local_relpath, kind, presence, depth, revision, changed_revision, \
+         repos_id, repos_path, file_external FROM nodes \
+         WHERE wc_id = ?1 AND op_depth = 0 AND {} ORDER BY local_relpath",
+        in_subtree(sub)
+    )
+}
 
 /// [`FloorShape`] 的查询本体。路径是 wc.db 的 relpath，调用方换算。外层 `Err` 是 SQLite 报的错，
 /// 中层 `Err` 是认不出来（照旧跑 diff）。
@@ -415,14 +460,9 @@ fn query_shape(
     // WORKING 层（op_depth > 0）= 本地 add / delete / copy / move。diff 对它们的报法（added、
     // deleted、带历史的复制）status 给不全，交给 diff
     let working: Option<String> = tx
-        .query_row(
-            &format!(
-                "SELECT local_relpath FROM nodes WHERE wc_id = ?1 AND op_depth > 0 \
-                 AND {IN_SUBTREE} LIMIT 1"
-            ),
-            rusqlite::params![wc_id, sub],
-            |r| r.get(0),
-        )
+        .query_row(&working_sql(sub), rusqlite::params![wc_id, sub], |r| {
+            r.get(0)
+        })
         .optional()?;
     if let Some(p) = working {
         return irregular(format!(
@@ -433,14 +473,9 @@ fn query_shape(
     // 冲突（文本、属性、树）。格式 31 全部记在 conflict_data 里（wc-metadata.sql 的 ACTUAL_NODE
     // 注释：老的几列在升级到格式 30 时并进来了）
     let conflict: Option<String> = tx
-        .query_row(
-            &format!(
-                "SELECT local_relpath FROM actual_node WHERE wc_id = ?1 \
-                 AND conflict_data IS NOT NULL AND {IN_SUBTREE} LIMIT 1"
-            ),
-            rusqlite::params![wc_id, sub],
-            |r| r.get(0),
-        )
+        .query_row(&conflict_sql(sub), rusqlite::params![wc_id, sub], |r| {
+            r.get(0)
+        })
         .optional()?;
     if let Some(p) = conflict {
         return irregular(format!("`{p}` 有冲突"));
@@ -458,11 +493,7 @@ fn query_shape(
         file_external: Option<i64>,
     }
     let rows: Vec<Row> = tx
-        .prepare(&format!(
-            "SELECT local_relpath, kind, presence, depth, revision, changed_revision, \
-             repos_id, repos_path, file_external FROM nodes \
-             WHERE wc_id = ?1 AND op_depth = 0 AND {IN_SUBTREE} ORDER BY local_relpath"
-        ))?
+        .prepare(&base_rows_sql(sub))?
         .query_map(rusqlite::params![wc_id, sub], |r| {
             Ok(Row {
                 relpath: r.get(0)?,
@@ -755,7 +786,123 @@ fn same_char(a: char, b: char) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)] // 测试里 unwrap 即断言，见 clippy.toml
     use super::*;
+
+    /// svn 1.14.2（SlikSvn）新检出的 wc.db 里 NODES、ACTUAL_NODE 的表与索引，以及 svn 自己装进
+    /// `sqlite_stat1` 的统计（2026-11-24 从真实 wc.db 导出）。查询计划取决于这两样，缺一样测的就不是现场
+    const SCHEMA: &str = "
+        CREATE TABLE NODES (wc_id INTEGER NOT NULL, local_relpath TEXT NOT NULL,
+          op_depth INTEGER NOT NULL, parent_relpath TEXT, repos_id INTEGER, repos_path TEXT,
+          revision INTEGER, presence TEXT NOT NULL, moved_here INTEGER, moved_to TEXT,
+          kind TEXT NOT NULL, properties BLOB, depth TEXT, checksum TEXT, symlink_target TEXT,
+          changed_revision INTEGER, changed_date INTEGER, changed_author TEXT,
+          translated_size INTEGER, last_mod_time INTEGER, dav_cache BLOB, file_external INTEGER,
+          inherited_props BLOB, PRIMARY KEY (wc_id, local_relpath, op_depth));
+        CREATE UNIQUE INDEX I_NODES_PARENT ON NODES (wc_id, parent_relpath, local_relpath, op_depth);
+        CREATE UNIQUE INDEX I_NODES_MOVED ON NODES (wc_id, moved_to, op_depth);
+        CREATE TABLE ACTUAL_NODE (wc_id INTEGER NOT NULL, local_relpath TEXT NOT NULL,
+          parent_relpath TEXT, properties BLOB, conflict_old TEXT, conflict_new TEXT,
+          conflict_working TEXT, prop_reject TEXT, changelist TEXT, text_mod TEXT,
+          tree_conflict_data TEXT, conflict_data BLOB, older_checksum TEXT, left_checksum TEXT,
+          right_checksum TEXT, PRIMARY KEY (wc_id, local_relpath));
+        CREATE UNIQUE INDEX I_ACTUAL_PARENT ON ACTUAL_NODE (wc_id, parent_relpath, local_relpath);
+        ANALYZE sqlite_master;
+        INSERT INTO sqlite_stat1 VALUES
+          ('NODES', 'sqlite_autoindex_NODES_1', '8000 8000 2 1'),
+          ('NODES', 'I_NODES_PARENT', '8000 8000 10 2 1'),
+          ('NODES', 'I_NODES_MOVED', '8000 8000 1 1'),
+          ('ACTUAL_NODE', 'sqlite_autoindex_ACTUAL_NODE_1', '8000 8000 1'),
+          ('ACTUAL_NODE', 'I_ACTUAL_PARENT', '8000 8000 10 1');
+    ";
+
+    /// 建库后关掉重开：统计在打开连接、读 schema 时才装进查询规划器。
+    fn wc_db(dir: &tempfile::TempDir, paths: &[&str]) -> Connection {
+        let file = dir.path().join("wc.db");
+        {
+            let db = Connection::open(&file).unwrap();
+            db.execute_batch(SCHEMA).unwrap();
+            for p in paths {
+                db.execute(
+                    "INSERT INTO nodes (wc_id, local_relpath, op_depth, presence, kind) \
+                     VALUES (1, ?1, 0, 'excluded', 'file')",
+                    [p],
+                )
+                .unwrap();
+            }
+        }
+        Connection::open(&file).unwrap()
+    }
+
+    fn plan(db: &Connection, sql: &str) -> String {
+        db.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map(rusqlite::params![1, "Code"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" | ")
+    }
+
+    #[test]
+    fn subtree_queries_use_the_primary_key_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = wc_db(&dir, &[]);
+        for (what, sql, index) in [
+            ("excluded", excluded_sql("Code"), "sqlite_autoindex_NODES_1"),
+            ("working", working_sql("Code"), "sqlite_autoindex_NODES_1"),
+            (
+                "conflict",
+                conflict_sql("Code"),
+                "sqlite_autoindex_ACTUAL_NODE_1",
+            ),
+            (
+                "base rows",
+                base_rows_sql("Code"),
+                "sqlite_autoindex_NODES_1",
+            ),
+        ] {
+            let p = plan(&db, &sql);
+            // 只取外层那一行：`TOP` 的关联子查询本来就按 (wc_id, local_relpath) 等值查
+            let outer = p.split(" | ").next().unwrap_or_default();
+            assert!(
+                outer.contains(index)
+                    && outer.contains("local_relpath>?")
+                    && outer.contains("local_relpath<?"),
+                "{what} 没走主键区间：{p}"
+            );
+        }
+    }
+
+    #[test]
+    fn subtree_is_the_root_itself_and_what_is_below_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let all = [
+            "",
+            "Code",
+            "Code/A.cs",
+            "Code/Sub/B.cs",
+            "Code-x/C.cs",
+            "Code.x",
+            "Code0",
+            "Codex",
+            "Other/Code/D.cs",
+        ];
+        let db = wc_db(&dir, &all);
+        let rows = |sub: &str| -> Vec<String> {
+            db.prepare(&excluded_sql(sub))
+                .unwrap()
+                .query_map(rusqlite::params![1, sub], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(rows("Code"), ["Code", "Code/A.cs", "Code/Sub/B.cs"]);
+        assert_eq!(rows("Code/Sub"), ["Code/Sub/B.cs"]);
+        let mut sorted = all.map(str::to_string).to_vec();
+        sorted.sort();
+        assert_eq!(rows(""), sorted, "空串是整个工作副本");
+    }
 
     #[test]
     fn within_root() {

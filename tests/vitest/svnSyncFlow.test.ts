@@ -62,6 +62,8 @@ function deps(log: string[], confirm?: (r: ConfirmRequest) => Promise<boolean>):
     refreshAfterFollow: async () => {
       log.push('refreshAfterFollow')
     },
+    // 不记日志：按顺序断言的用例不该因为它变；要看它的用例自己接
+    refreshHooksHealth: () => {},
     showFollowReport: async () => {
       log.push('showFollowReport')
     },
@@ -134,6 +136,31 @@ beforeEach(() => {
 describe('handleAutoFollow（事故分析 6.12）', () => {
   /** 自动跟进在后台跑完：等到按钮复位再断言。 */
   const settled = (log: string[]) => vi.waitFor(() => expect(log).toContain('following:false'))
+
+  it('钩子状态等跟进后的刷新全部落定再读：不与判定的全量 svn status 并行抢磁盘', async () => {
+    const log: string[] = []
+    let releaseSync: () => void = () => {}
+    const d: SvnSyncFlowDeps = {
+      ...deps(log),
+      refreshSvnSync: () =>
+        new Promise<void>((resolve) => {
+          log.push('refreshSvnSync')
+          releaseSync = resolve
+        }),
+      refreshHooksHealth: () => log.push('refreshHooksHealth'),
+    }
+    vi.mocked(store.svnFollowAuto).mockResolvedValue({ kind: 'done', report })
+
+    expect(createSvnSyncFlow(d).handleAutoFollow('k1')).toBe(true)
+    await vi.waitFor(() => expect(log).toContain('refreshSvnSync'))
+    await new Promise((r) => setTimeout(r, 0))
+    expect(log).toContain('refreshAfterFollow')
+    expect(log).not.toContain('refreshHooksHealth')
+
+    releaseSync()
+    await vi.waitFor(() => expect(log).toContain('showAutoFollowed'))
+    expect(log.filter((l) => l === 'refreshHooksHealth')).toHaveLength(1)
+  })
 
   it('完成：不清错误条、不弹 merge driver 确认框，刷新之后挂提示，不弹报告框', async () => {
     const log: string[] = []
