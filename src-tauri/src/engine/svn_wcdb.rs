@@ -407,6 +407,24 @@ fn conflict_sql(sub: &str) -> String {
     )
 }
 
+/// [`query_changelists`] 的 changelist。
+fn changelist_sql(sub: &str) -> String {
+    format!(
+        "SELECT local_relpath, changelist FROM actual_node \
+         WHERE wc_id = ?1 AND changelist IS NOT NULL AND {} ORDER BY local_relpath",
+        in_subtree(sub)
+    )
+}
+
+/// [`query_changelists`] 的 external。
+fn externals_sql(sub: &str) -> String {
+    format!(
+        "SELECT local_relpath FROM externals WHERE wc_id = ?1 AND {} \
+         ORDER BY local_relpath",
+        in_subtree(sub)
+    )
+}
+
 /// [`query_shape`] 的 BASE 层全部节点。
 fn base_rows_sql(sub: &str) -> String {
     format!(
@@ -716,23 +734,14 @@ fn query_changelists(db: &Connection, sub: &str) -> rusqlite::Result<ChangelistR
     let [wc_id] = ids[..] else {
         return Ok(Err(format!("WCROOT 里有 {} 个根", ids.len())));
     };
-    // 子树的写法与 `query` 相同：区间比较，不用 LIKE
-    const SUBTREE: &str = "(?2 = '' OR local_relpath = ?2 \
-                           OR (local_relpath >= ?2 || '/' AND local_relpath < ?2 || '0'))";
     let rows: Vec<(String, String)> = tx
-        .prepare(&format!(
-            "SELECT local_relpath, changelist FROM actual_node \
-             WHERE wc_id = ?1 AND changelist IS NOT NULL AND {SUBTREE} ORDER BY local_relpath"
-        ))?
+        .prepare(&changelist_sql(sub))?
         .query_map(rusqlite::params![wc_id, sub], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
     let externals: Vec<String> = tx
-        .prepare(&format!(
-            "SELECT local_relpath FROM externals WHERE wc_id = ?1 AND {SUBTREE} \
-             ORDER BY local_relpath"
-        ))?
+        .prepare(&externals_sql(sub))?
         .query_map(rusqlite::params![wc_id, sub], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     Ok(Ok((rows, externals)))
@@ -807,13 +816,20 @@ mod tests {
           tree_conflict_data TEXT, conflict_data BLOB, older_checksum TEXT, left_checksum TEXT,
           right_checksum TEXT, PRIMARY KEY (wc_id, local_relpath));
         CREATE UNIQUE INDEX I_ACTUAL_PARENT ON ACTUAL_NODE (wc_id, parent_relpath, local_relpath);
+        CREATE TABLE EXTERNALS (wc_id INTEGER NOT NULL, local_relpath TEXT NOT NULL,
+          parent_relpath TEXT NOT NULL, repos_id INTEGER NOT NULL, presence TEXT NOT NULL,
+          kind TEXT NOT NULL, def_local_relpath TEXT NOT NULL, def_repos_relpath TEXT NOT NULL,
+          def_operational_revision TEXT, def_revision TEXT, PRIMARY KEY (wc_id, local_relpath));
+        CREATE UNIQUE INDEX I_EXTERNALS_DEFINED ON EXTERNALS (wc_id, def_local_relpath, local_relpath);
         ANALYZE sqlite_master;
         INSERT INTO sqlite_stat1 VALUES
           ('NODES', 'sqlite_autoindex_NODES_1', '8000 8000 2 1'),
           ('NODES', 'I_NODES_PARENT', '8000 8000 10 2 1'),
           ('NODES', 'I_NODES_MOVED', '8000 8000 1 1'),
           ('ACTUAL_NODE', 'sqlite_autoindex_ACTUAL_NODE_1', '8000 8000 1'),
-          ('ACTUAL_NODE', 'I_ACTUAL_PARENT', '8000 8000 10 1');
+          ('ACTUAL_NODE', 'I_ACTUAL_PARENT', '8000 8000 10 1'),
+          ('EXTERNALS', 'sqlite_autoindex_EXTERNALS_1', '100 100 1'),
+          ('EXTERNALS', 'I_EXTERNALS_DEFINED', '100 100 3 1');
     ";
 
     /// 建库后关掉重开：统计在打开连接、读 schema 时才装进查询规划器。
@@ -860,6 +876,16 @@ mod tests {
                 "base rows",
                 base_rows_sql("Code"),
                 "sqlite_autoindex_NODES_1",
+            ),
+            (
+                "changelist",
+                changelist_sql("Code"),
+                "sqlite_autoindex_ACTUAL_NODE_1",
+            ),
+            (
+                "externals",
+                externals_sql("Code"),
+                "sqlite_autoindex_EXTERNALS_1",
             ),
         ] {
             let p = plan(&db, &sql);

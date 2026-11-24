@@ -408,17 +408,20 @@ fn added_w_files(
         .map(|p| p.to_string())
         .collect();
     let on_disk = out.len();
-    scope.retain_not_ignored(&mut out)?;
+    // 问 `.gitignore` 失败时也先记下这一段（`ok = false`），再往上抛：否则记录里看不出是哪一步出的错
+    let kept = scope.retain_not_ignored(&mut out);
     if let Some(ts) = started {
         let mut rec = perf::Record::rust("inproc", "sync added w-files on disk");
         rec.ts = ts;
         rec.dur = perf::now_ms() - ts;
+        rec.ok = kept.is_ok();
         rec.meta.insert("candidates".into(), cands.len().into());
         rec.meta.insert("disk_checks".into(), w.len().into());
         rec.meta.insert("on_disk".into(), on_disk.into());
         rec.meta.insert("added".into(), out.len().into());
         perf::record(&rec);
     }
+    kept?;
     Ok(out)
 }
 

@@ -11,7 +11,7 @@
 | 3 | wc.db 子树条件走主键区间 | 完成 | `svn_wcdb::in_subtree` 与四个 SQL 构造函数 | `svn_wcdb` 单测 2 条新增；`tests/svn_wcdb.rs` 33 条、`tests/svn_health_local_floor.rs` 32 条全过 |
 | 4 | 钩子状态等刷新结束再读 | 完成 | `SvnSyncFlowDeps.refreshHooksHealth`、`RepoTab` | `svnSyncFlow.test.ts` 新增 1 条，93 条全过 |
 | 5 | floor 不规整原因进性能记录 | 完成 | `svn_health::LocalFloor.server_reasons`、`path_free` | `tests/svn_health_floor_reasons.rs` |
-| 6 | 门槛、review、PR | 进行中 | | |
+| 6 | 门槛、review、PR | 完成 | PR 198（Draft） | 两侧门槛全过；独立 review 5 条全部修复，修复后重跑全部 112 个测试二进制 |
 
 ## 决策条目
 
@@ -66,6 +66,10 @@
   空串单独 `(?2 = '')`（仍引用 `?2`，调用方总绑两个参数）。区间 `[sub, sub0)` 里还有 `sub-x`、`sub.x` 这类兄弟
   （`-` `.` 小于 `/`），残余条件剔掉；测试 `subtree_is_the_root_itself_and_what_is_below_it` 覆盖这些兄弟、
   `sub0`、`Codex`、更深一层的同名目录、空串。
+- **量级（开发机，Python 自带 SQLite 3.50.4，内存库，10 万行 NODES、23 个单元，同样的统计）**：
+  excluded 查询旧条件合计 67 ms（`SCAN n`），新条件 9.3 ms（走主键区间），约 7 倍。现场两条查询合计约 6 秒，
+  这个量级解释不了全部：现场 wc.db 更大、冷读磁盘，旧写法每个单元把整张表从磁盘读一遍，新写法只读子树。
+  现场能省多少**未验证**，要看 PR 合并后带 `--perf` 的 `wc.db floor shape` / excluded 两条记录。
 - 四条 SQL 抽成 `excluded_sql` / `working_sql` / `conflict_sql` / `base_rows_sql`，测试与运行时用同一份字符串。
   `TOP` 从函数内常量挪到模块级。
 
@@ -86,3 +90,17 @@
 - 原来这条记录只在至少一个单元规整时才写；现在一个单元都没走本地时也写（`local: 0` 带原因），
   要查的正是这种情况。`local`、`server` 两个字段的含义不变。
 - 「本地 status 没跑成」原来是 `units.clear()`，改成逐个 `drop_unit` 记原因，`LAST_LOCAL` 结果相同（空）。
+  第一版写成 `std::mem::take` 后再 `drop_unit`，原因记不上，见 Task 6 第 1 条。
+
+### Task 6：独立 review（`/code-review high`）与修复
+
+| 第几条 | 级别 | 发现 | 处理 |
+|---|---|---|---|
+| 1 | important | 本地 status 没跑成时，`std::mem::take` 先清空了 `units`，`drop_unit` 的 `remove` 返回假，原因没记上；全部单元原本规整时连 floor 记录都不写了（改动前还会写 `local: 0`） | 改为遍历 `units` 的副本逐个 `drop_unit`。新增注入点 `Point::LocalFloorStatus`，`svn_health_floor_reasons` 加场景二；临时退回旧写法确认该场景失败 |
+| 2 | important | `path_free` 只遮反引号里的内容，rusqlite 打不开文件时会在报错后面再附一遍路径，落在反引号外，路径会进性能记录 | 新增 `wcdb_reason`：打开、查询失败一律换成固定的「wc.db 认不出：打不开或查询失败」；格式、未完成操作这几种自己的话照留。单测覆盖 |
+| 3 | nit | 探测没过的原因按冒号切，revision 留在里面，每对 revision 各成一类；svn info 解析报错整段原文进记录 | `Probed::Ok.mismatched` 每条带一个固定原因（三种），日志照旧用完整原因。`path_free` 同时把 `r<数字>` 换成 `r…`，目录 stale 那条原因也能按类计数 |
+| 4 | nit | `query_changelists` 的 changelist、external 两条查询还是旧的子树条件，注释「与 `query` 相同」已不对 | 改用 `in_subtree`，抽成 `changelist_sql` / `externals_sql`，查询计划测试加上这两条（表结构加 EXTERNALS 与它的统计） |
+| 5 | nit | `.gitignore` 查询失败时 `?` 先返回，`sync added w-files on disk` 不记 | 先记（`ok = false`）再抛 |
+
+- **为什么安全（第 1 条）**：只改记账，`LAST_LOCAL` 与 `units` 的最终状态与改动前相同（空），体检结论不受影响。
+- **为什么安全（第 4 条）**：与 Task 3 同一个 `in_subtree`，`tests/svn_changelist.rs` 22 条、`tests/svn_wcdb.rs` 32 条等价测试全过。

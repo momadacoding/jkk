@@ -292,6 +292,8 @@ pub mod fault {
         MergedDiff,
         /// 把 `svn diff` 输出里的路径还原成仓库相对路径
         DiffPath,
+        /// 体检本地 floor 的 `svn status`（`svn_health` 的 `read_local_floor`）：失败时这些单元照旧跑 diff
+        LocalFloorStatus,
     }
 
     thread_local! {
