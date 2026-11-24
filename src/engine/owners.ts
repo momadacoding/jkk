@@ -89,6 +89,10 @@ export function collectTips(commits: CommitNode[], refs: RefPointer[]): string[]
     childless(commits),
   ].map((tier, i) => (i === 0 ? tier : tier.filter((h) => !hasFirstParentChild.has(h))))
 
+  // 本地分支默认按 tip 行序认领，谁的 tip 新谁先拿走共享的那段历史。两条分支共享一段不在
+  // 主干上的提交时，这就把「后切出来、但刚提交过」的分支画成了原分支。reflog 证据能纠正它。
+  tiers[2] = orderByMadeHere(tiers[2], local, commits, [...tiers[0], ...tiers[1]])
+
   const seen = new Set<string>()
   const tips: string[] = []
   for (const tier of tiers) {
@@ -99,6 +103,126 @@ export function collectTips(commits: CommitNode[], refs: RefPointer[]): string[]
     }
   }
   return tips
+}
+
+/** 从这些起点沿第一父链能走到的所有提交（只算图里有的）。 */
+function firstParentChains(commits: CommitNode[], starts: string[]): Set<string> {
+  const byId = new Map(commits.map((c) => [c.id, c]))
+  const reached = new Set<string>()
+  for (const start of starts) {
+    let cur: string | undefined = start
+    while (cur && byId.has(cur) && !reached.has(cur)) {
+      reached.add(cur)
+      cur = byId.get(cur)!.parents[0]
+    }
+  }
+  return reached
+}
+
+/**
+ * 按 reflog 证据调整本地分支的认领顺序；没有证据时原样返回（tip 行序）。
+ *
+ * git 不记录提交是在哪条分支上做的，后端从本机 reflog 读出每条本地分支「在这里新建过」的
+ * 提交（`RefPointer.madeHere`）。两条分支的第一父链在主干之外汇合时，汇合处那个提交（分叉点）
+ * 是在哪条分支上做的，那条分支就是原分支，排到另一条前面，先把共享的那段认领走。
+ *
+ * 只看分叉点、不看更老的共享提交：分叉点之下的历史两边都有，更老的证据说明不了是谁从谁切出来的。
+ * 证据有矛盾（成环）时按 tip 行序打破，所以最坏也只是退回原来的画法。
+ *
+ * 不依赖 HEAD，checkout 不会让图重排；reflog 有新记录时图才会变。
+ */
+function orderByMadeHere(
+  tips: string[],
+  local: RefPointer[],
+  commits: CommitNode[],
+  trunkTips: string[],
+): string[] {
+  // 同一个提交上挂着两个本地分支时 hash 会重复，后面按 hash 去重，这里先去掉
+  const unique = [...new Set(tips)]
+  const tipSet = new Set(unique)
+  /** 提交 → 在它上面新建过它的那些分支的 tip */
+  const madeOn = new Map<string, Set<string>>()
+  for (const r of local) {
+    if (!tipSet.has(r.hash)) continue
+    for (const oid of r.madeHere ?? []) {
+      let set = madeOn.get(oid)
+      if (!set) madeOn.set(oid, (set = new Set()))
+      set.add(r.hash)
+    }
+  }
+  if (madeOn.size === 0) return tips
+
+  const byId = new Map<string, CommitNode>()
+  const rowOf = new Map<string, number>()
+  /** 以它为第一父的子提交个数 */
+  const firstParentChildren = new Map<string, number>()
+  commits.forEach((c, i) => {
+    byId.set(c.id, c)
+    rowOf.set(c.id, i)
+    const p = c.parents[0]
+    if (p) firstParentChildren.set(p, (firstParentChildren.get(p) ?? 0) + 1)
+  })
+  // 两条链从不同的子走进分叉点，所以分叉点至少有两个以它为第一父的子。别的证据用不上，先扔掉：
+  // 分支自己的提交大多是单链，这一步通常把证据砍到只剩几个。
+  for (const oid of [...madeOn.keys()]) {
+    if ((firstParentChildren.get(oid) ?? 0) < 2) madeOn.delete(oid)
+  }
+  // 行序里比最老的候选分叉点还靠下的提交不可能是分叉点，链走到那里就停。没有主干（develop、
+  // trunk 这类仓库）时链本来会一路走到窗口底部，这条界限让开销只跟证据的跨度有关。
+  let lastEvidenceRow = -1
+  for (const oid of madeOn.keys()) lastEvidenceRow = Math.max(lastEvidenceRow, rowOf.get(oid) ?? -1)
+  if (lastEvidenceRow < 0) return tips
+
+  // 主干先于所有本地分支认领，它的第一父链不参与比较：证据抢不走主干上的提交
+  const trunkClaimed = firstParentChains(commits, trunkTips)
+  const chainOf = new Map<string, string[]>()
+  for (const tip of unique) {
+    const chain: string[] = []
+    let cur: string | undefined = tip
+    while (cur && byId.has(cur) && !trunkClaimed.has(cur) && rowOf.get(cur)! <= lastEvidenceRow) {
+      chain.push(cur)
+      cur = byId.get(cur)!.parents[0]
+    }
+    chainOf.set(tip, chain)
+  }
+  // 只有做过证据提交的分支才可能被排到别人前面，只给它们建查找集合
+  const chainSetOf = new Map<string, Set<string>>()
+  for (const makers of madeOn.values()) {
+    for (const maker of makers) {
+      if (!chainSetOf.has(maker)) chainSetOf.set(maker, new Set(chainOf.get(maker)))
+    }
+  }
+
+  /** tip → 必须排在它前面的 tip */
+  const before = new Map<string, Set<string>>()
+  for (const tip of unique) {
+    const chain = chainOf.get(tip)!
+    chain.forEach((oid, i) => {
+      const makers = madeOn.get(oid)
+      if (!makers || makers.has(tip)) return
+      for (const maker of makers) {
+        const theirs = chainSetOf.get(maker)!
+        // 第一父链汇合之后就一直重合。oid 在对方链上、而 tip 走到 oid 之前的那个提交不在，
+        // 说明两条链在 oid 第一次汇合：oid 是两者的分叉点
+        if (!theirs.has(oid) || (i > 0 && theirs.has(chain[i - 1]))) continue
+        let set = before.get(tip)
+        if (!set) before.set(tip, (set = new Set()))
+        set.add(maker)
+      }
+    })
+  }
+
+  const placed = new Set<string>()
+  const ordered: string[] = []
+  const remaining = [...unique]
+  while (remaining.length > 0) {
+    let pick = remaining.findIndex((t) => [...(before.get(t) ?? [])].every((u) => placed.has(u)))
+    if (pick < 0) pick = 0 // 成环：按行序打破
+    const [tip] = remaining.splice(pick, 1)
+    placed.add(tip)
+    ordered.push(tip)
+  }
+  return ordered
 }
 
 /**

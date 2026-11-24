@@ -35,6 +35,14 @@ export interface RefPointer {
    * 也没有 ↑↓，不看这个字段就和「从没推过」分不开。
    */
   goneUpstream: string | null
+  /**
+   * 本地分支 reflog 记录的、在这条分支上**新建**的提交；其余 ref 与没有记录时后端不发这个字段。
+   *
+   * 只用于 graph 判断两条分支共享的那段历史原本属于谁（`owners.ts` 的 `orderByMadeHere`）。
+   * 后端已裁到图里有的提交。`git gc` 清掉过期的 reflog（`gc.reflogExpire` 默认 90 天）、
+   * 新 clone、rebase 之后就没有记录，这时按原来的行序画。
+   */
+  madeHere?: string[]
 }
 
 export interface CommitNode {
