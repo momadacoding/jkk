@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   describeBaselineMismatch,
   manualCheckBlockedReason,
+  mismatchAckAfterCheck,
   mismatchCheckApplies,
   mismatchKey,
   type BaselineMismatch,
@@ -116,6 +117,34 @@ describe('describeBaselineMismatch', () => {
     const files = ['Code/A.cs']
     expect(describeBaselineMismatch(hit(files), mismatchKey(files))).toBeNull()
     expect(describeBaselineMismatch(hit(['Code/A.cs', 'Code/C.cs']), mismatchKey(files))).not.toBeNull()
+  })
+})
+
+describe('mismatchAckAfterCheck', () => {
+  const files = ['Code/A.cs', 'Code/B.cs']
+
+  it('体检通过、横幅上的文件都覆盖到了：记下这组文件', () => {
+    expect(mismatchAckAfterCheck({ status: 'verified', rev: 3, unverified: [] }, files)).toBe(
+      mismatchKey(files),
+    )
+  })
+
+  it('有文件在 unverified 里（体检没比过它）：不记，否则横幅被永久压掉', () => {
+    expect(
+      mismatchAckAfterCheck({ status: 'verified', rev: 3, unverified: ['Code/B.cs'] }, files),
+    ).toBeNull()
+  })
+
+  it('unverified 里是别的文件：照记', () => {
+    expect(
+      mismatchAckAfterCheck({ status: 'verified', rev: 3, unverified: ['Code/Other.cs'] }, files),
+    ).toBe(mismatchKey(files))
+  })
+
+  it('撒谎、断网、横幅上本来没文件：都不记', () => {
+    expect(mismatchAckAfterCheck({ status: 'lying', files: ['Code/A.cs'] }, files)).toBeNull()
+    expect(mismatchAckAfterCheck({ status: 'notChecked', reason: 'offline' }, files)).toBeNull()
+    expect(mismatchAckAfterCheck({ status: 'verified', rev: 3, unverified: [] }, [])).toBeNull()
   })
 })
 

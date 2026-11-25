@@ -12,6 +12,7 @@
  * 纯逻辑，无 React 依赖（`AGENTS.md` §7.2）。
  */
 
+import type { Health } from './svnInit'
 import { otherBannersAreSuppressed, type SyncState, type SyncStateUnreadable } from './svnJournal'
 import {
   describeEolMigration,
@@ -57,6 +58,29 @@ export function mismatchCheckApplies(
   if (otherBannersAreSuppressed(syncState)) return false
   if (describeEolMigration(eol, sync) !== null) return false
   return sync.verdict.kind === 'inSync' && !sync.headBehindBase
+}
+
+/**
+ * 「本地改动」刷新之后等多久再查（毫秒）。
+ *
+ * 查询要对候选文件起一个 `svn status` 进程（公司机器上打开 wc.db 就要几十到上百毫秒），而候选
+ * 通常就是用户手上正在改的文件：不防抖的话每存一次盘起一个进程，连续保存时还会叠起来
+ * （2026-11-25 独立 review 第 2 条）。这条提示不急，等编辑停下来再查。
+ */
+export const MISMATCH_DEBOUNCE_MS = 1500
+
+/**
+ * 体检之后要不要记下「这组文件没问题」（返回 `mismatchKey`，`null` = 不记）。
+ *
+ * 只有 `verified` 且横幅上的文件**都被这次体检覆盖到**才记。`unverified` 里的路径体检没有比过
+ * （比如路径带 `@`，体检的命令跑不了它），把它们一起记成没问题，横幅就被永久压掉了
+ * （2026-11-25 独立 review 第 3 条）。断网（`notChecked`）和撒谎（`lying`）都不记。
+ */
+export function mismatchAckAfterCheck(health: Health, shown: string[]): string | null {
+  if (health.status !== 'verified' || shown.length === 0) return null
+  const skipped = new Set(health.unverified)
+  if (shown.some((p) => skipped.has(p))) return null
+  return mismatchKey(shown)
 }
 
 /**

@@ -20,7 +20,8 @@
 //!
 //! 第 1 条前提（同步正常、分支不落后基线、没有未收尾的同步）由前端判定后才来调这里，
 //! 见 `svnSync.ts::mismatchCheckApplies`。前提不成立时这三条会误报：例如 TortoiseSVN 刚
-//! update 下来、jkk 还没跟进的文件同样满足三条。
+//! update 下来、jkk 还没跟进的文件同样满足三条。前端手上的失同步结论可能还没跟上（见
+//! [`same_revision`]），所以这里另加一条：SVN 手上的 revision 必须与基线记的对得上。
 //!
 //! # 为什么 svn status 必须现跑
 //!
@@ -29,15 +30,16 @@
 //! 报成「基线记错了」。所以只对候选文件现跑一次，不进扫描缓存。
 
 use crate::engine::git_cli::run_git;
-use crate::engine::svn_cli::run_svn_targets;
+use crate::engine::svn_basemap::read_base_map;
+use crate::engine::svn_cli::{chunk_targets, run_svn_fresh, MAX_TARGETS_CMDLINE};
 use crate::engine::svn_config::read_config;
 use crate::engine::svn_scope::WScope;
 use crate::engine::svn_wc::peg_safe;
-use crate::engine::svn_xml::parse_status_entries;
+use crate::engine::svn_xml::{parse_node_status, parse_status_entries, NodeStatus};
 use crate::error::{GitError, Result};
 use crate::vcs::{detect_repo_kind, RepoKind};
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// 一次最多现查多少个候选文件。
 ///
@@ -139,16 +141,34 @@ pub fn find_baseline_mismatch(repo_root: &str) -> Result<BaselineMismatch> {
     candidates.truncate(MAX_MISMATCH_CANDIDATES);
     let wanted: BTreeSet<&str> = candidates.iter().map(String::as_str).collect();
 
+    // 记账与树取自同一个 OID（同 `check_current_baseline`）
+    let map = read_base_map(repo_root, &base)?;
+
     // `-v`：不带它干净文件不输出，「没输出」与「不在工作副本里」分不开。不带 `--ignore-externals`：
     // target 是文件本身，落在 external 里的文件也要按它自己的工作副本报
     let targets: Vec<String> = candidates.iter().map(|p| peg_safe(p)).collect();
     let mut hits: BTreeSet<String> = BTreeSet::new();
-    for xml in run_svn_targets(repo_root, &["status", "-v", "--xml", "--"], &targets)? {
+    for batch in chunk_targets(STATUS_HEAD, &targets, MAX_TARGETS_CMDLINE) {
+        let mut args: Vec<&str> = STATUS_HEAD.to_vec();
+        args.extend(batch.iter().map(String::as_str));
+        // 现跑，不读扫描缓存、不进缓存（模块头「为什么 svn status 必须现跑」）。这条命令本来
+        // 只在自己的 Tauri 线程上跑、不在任何缓存范围里，但不靠这个隐含前提
+        let xml = run_svn_fresh(repo_root, &args)?;
+        let revs: BTreeMap<String, NodeStatus> = parse_node_status(&xml)?
+            .into_iter()
+            .map(|n| (n.path.trim_end_matches('@').to_string(), n))
+            .collect();
         for e in parse_status_entries(&xml)? {
             let path = e.path.trim_end_matches('@');
             // 完全干净才算「SVN 说没改」：只改了属性的是 normal + props=modified，复制来的
             // 是 normal + copied（服务器上根本没有这个路径），都不等于服务器内容
-            if e.item == "normal" && e.props == "none" && !e.copied && wanted.contains(path) {
+            if !(e.item == "normal" && e.props == "none" && !e.copied && wanted.contains(path)) {
+                continue;
+            }
+            if revs
+                .get(path)
+                .is_some_and(|n| same_revision(n, map.rev_of(path)))
+            {
                 hits.insert(path.to_string());
             }
         }
@@ -159,6 +179,30 @@ pub fn find_baseline_mismatch(repo_root: &str) -> Result<BaselineMismatch> {
         total,
         truncated,
     })
+}
+
+/// 现查候选用的 `svn status`，target 接在后面。
+const STATUS_HEAD: &[&str] = &["status", "-v", "--xml", "--"];
+
+/// SVN 手上的这个文件与基线记的是不是同一个 revision 的内容（判据与失同步判定 `svn_sync::judge`
+/// 相同：`c(f) > R(f)` 是前进，`n(f) < R(f)` 是回退）。
+///
+/// # 为什么判定自己也要查，不能只靠前端的前提门槛（2026-11-25 独立 review 阻断项）
+///
+/// TortoiseSVN update 之后，文件事件同时触发「本地改动」刷新和失同步检测；前者很快，后者要对
+/// 整个白名单跑 `svn status -v`，公司机器上几秒，wc.db 的最后一笔写入还要等尾随复查。这段时间
+/// 前端手上的失同步结论还是旧的 InSync，前提门槛放行，刚 update 下来的文件就会被报成「基线记
+/// 错了」，出口还是重建基线。用户每天早上都 update，这是每天必现的误报。
+///
+/// 刚 update 下来的文件 `c(f) > R(f)`，在这里被丢掉；基线真的记错时 revision 是对得上的
+/// （这正是这条症状存在的理由：revision 对得上，内容不对）。
+fn same_revision(n: &NodeStatus, r: u64) -> bool {
+    match (n.node_rev, n.commit_rev) {
+        (Some(node), Some(commit)) => node >= r && commit <= r,
+        // 没有服务器 revision（本地新增、复制来的）不会走到这里（上面已经要求 normal 且非 copied），
+        // 万一走到，按「对不上」处理：宁可漏报，不误报
+        _ => false,
+    }
 }
 
 /// `-z` 输出切成路径，去掉空项。

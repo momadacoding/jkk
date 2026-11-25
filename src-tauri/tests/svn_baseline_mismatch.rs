@@ -133,9 +133,10 @@ fn only_the_wrong_file_is_reported_among_user_edits() {
 }
 
 #[test]
-fn files_updated_by_svn_before_follow_look_the_same_so_the_frontend_gate_is_required() {
-    // 钉住设计 §6.1 第 1 条为什么必须由前端先挡：TortoiseSVN update 下来、jkk 还没跟进的
-    // 文件也满足这三条。判定本身分不出来，只能在失同步结论是 InSync 时才调它
+fn files_updated_by_svn_before_follow_are_not_reported() {
+    // 2026-11-25 独立 review 阻断项：TortoiseSVN update 下来、jkk 还没跟进的文件同样是「git 说
+    // 改了、SVN 说没改、分支没碰过」。前端的前提门槛看的失同步结论在 update 之后要几秒才跟上，
+    // 那段时间门槛放行，所以判定自己必须分得开：SVN 手上的 revision 比基线记的新，丢掉
     let fx = hybrid_with_colleague();
     let wc = fx.wc();
     fx.colleague_commits("Code/A.cs", "a2\n");
@@ -150,8 +151,43 @@ fn files_updated_by_svn_before_follow_look_the_same_so_the_frontend_gate_is_requ
         ),
         "前提：此刻顶部是「跟进」横幅，实际：{verdict:?}"
     );
+    assert!(
+        git(&wc, &["diff", "--name-only", "HEAD"]).contains("Code/A.cs"),
+        "前提：git 说它改了"
+    );
+
+    assert_eq!(mismatch(&wc).files, Vec::<String>::new());
+}
+
+#[test]
+fn a_wrong_baseline_is_still_reported_after_an_unrelated_svn_update() {
+    // 上一条的反面：update 只带来了 B.cs 的新内容，A.cs 的 revision 仍与基线记的对得上，
+    // 基线把 A.cs 记错了照样要报
+    let fx = hybrid_with_colleague();
+    let wc = fx.wc();
+    commit_on_work(&wc, "Code/A.cs", "WRONG\n", "svn/base");
+    let head = git(&wc, &["rev-parse", "HEAD"]);
+    git(&wc, &["update-ref", "refs/heads/svn/base", head.trim()]);
+    svn_cmd(&wc, &["revert", "Code/A.cs"]);
+    fx.colleague_commits("Code/B.cs", "b2\n");
+    svn_cmd(&wc, &["update", "--non-interactive"]);
 
     assert_eq!(mismatch(&wc).files, vec!["Code/A.cs".to_string()]);
+}
+
+#[test]
+fn a_file_with_only_a_property_change_is_not_reported() {
+    // spec §6.1 第 4 条：只改了属性的是 item=normal、props=modified，不是「SVN 说完全干净」。
+    // 基线把它记错了也不报：体检对 SVN 认为改过的文件本来就证明不了什么
+    let fx = hybrid_with_colleague();
+    let wc = fx.wc();
+    commit_on_work(&wc, "Code/A.cs", "WRONG\n", "svn/base");
+    let head = git(&wc, &["rev-parse", "HEAD"]);
+    git(&wc, &["update-ref", "refs/heads/svn/base", head.trim()]);
+    svn_cmd(&wc, &["revert", "Code/A.cs"]);
+    svn_cmd(&wc, &["propset", "x:test", "1", "Code/A.cs"]);
+
+    assert_eq!(mismatch(&wc).files, Vec::<String>::new());
 }
 
 #[test]

@@ -12,6 +12,18 @@
 | 4 C 的菜单 | 完成 | `Toolbar.tsx`「SVN ▾」、`ContextMenu.tsx` 加 `title` 与 `openAt`、`Toolbar.test.tsx` | 同上 |
 | 5 注释、文档、验证 | 完成 | `svn_init.rs` 过时注释、e2e 文档提示、`svnSync.ts` / `repoStore.ts` 注释 | fmt / clippy 0 告警；cargo test 相关 6 个二进制（`--lib`、`svn_baseline_mismatch`、`commands_are_async`、`svn_backend`、`svn_init`、`svn_sync`）全过，其余二进制没跑；真实窗口验收见下 |
 
+### 独立 review（2026-11-25，opus 子 agent，只读）
+
+| 条目 | 级别 | 处理 |
+|---|---|---|
+| 1. TortoiseSVN update 之后，失同步检测要几秒才跟上，这段时间前端门槛看的是旧的 InSync，刚 update 下来的文件被报成「基线记错」，出口是重建基线。每天早上必现 | 阻断 | **已修**。判定自己比对 revision：SVN 的 `c(f) > R(f)`（前进）或 `n(f) < R(f)`（回退）就丢掉（`svn_mismatch.rs::same_revision`，判据与 `svn_sync::judge` 相同）。原来钉「前端必须挡」的用例改成断言为空，另补「无关的 update 之后，记错的文件照样报」 |
+| 2. 每次「本地改动」刷新都起一个 svn 进程，连续保存会叠起来 | 应修 | **已修**。RepoTab 里 1.5 秒防抖（`MISMATCH_DEBOUNCE_MS`）+ `createSingleFlight` 单飞补跑。没有按路径集合跳过：同一组脏文件里，TortoiseSVN revert 一下就可能从「SVN 说改了」变成「SVN 说干净」，路径集合不变，跳过会漏 |
+| 3. 体检 `verified` 时，横幅上的文件可能在 `unverified` 里（体检没比过），照样记 ack 会把横幅永久压掉 | 应修 | **已修**。`mismatchAckAfterCheck`：有交集就不记，补 vitest |
+| 4. 一个候选让 `svn status` 非零退出，整批作废，横幅静默不出 | 建议 | 未改。候选都是白名单内、git 跟踪的 W-file，必在工作副本里；即使发生，后果是漏报（只打 `console.warn`），手动体检仍在 |
+| 5. 注释说必须现跑，代码走的是会读扫描缓存的 `run_svn` | 建议 | **已修**。改成 `chunk_targets` + `run_svn_fresh` |
+| 6. 缺 props 改过、copied、external、截断、`@` 路径的用例 | 建议 | 补了 props 改过的 fixture 用例；其余未补，copied 与 external 的过滤与 `svn_dirty::read_dirty` 同一写法 |
+| 7. 菜单开着时置灰状态不刷新 | 建议 | 未改，影响很小 |
+
 ### 真实窗口验收（2026-11-25，`pnpm tauri dev --config` 隔离 identifier，scratchpad 临时 fixture）
 
 `app.exe` 路径核对为本 worktree 的 `src-tauri\target\debug\app.exe`。
@@ -25,6 +37,8 @@
 | 重建 | 横幅换成「当前分支落后基线 → 跟进」（设计 §6.2 预期的让位） |
 | 跟进 | 跟进完成，「No changes」，没有横幅，fixture 的 `git status` 为空 |
 | 用户自己改 `Code/B.cs` | 「Local Changes (1)」，没有横幅 |
+
+修完 review 之后在同一个 fixture 上再验一次：重新改坏 `Code/A.cs` 的基线、同时开着用户对 `Code/B.cs` 的未提交改动，横幅在防抖之后出现，只列 `Code/A.cs`。「update 之后、失同步检测跟上之前」那几秒的时序在真实窗口里不好稳定复现，由 Rust 用例 `files_updated_by_svn_before_follow_are_not_reported` 覆盖判据本身。
 
 小瑕疵（未修）：菜单开着时顶部冒出横幅，工具栏被推下去，菜单停在原坐标。`ContextMenu` 只在窗口 resize 时关，点别处就关，影响很小。
 
