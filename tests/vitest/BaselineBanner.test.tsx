@@ -5,6 +5,7 @@ import { BaselineBanner } from '@/components/BaselineBanner'
 import type { SyncState } from '@/engine/svnJournal'
 import type { SyncStatus } from '@/engine/svnSync'
 import type { HookHealth } from '@/engine/tsvnHooks'
+import { mismatchKey, type BaselineMismatch } from '@/engine/svnMismatch'
 
 function renderWith(syncState: SyncState) {
   const onSyncAction = vi.fn()
@@ -221,10 +222,12 @@ describe('BaselineBanner 的 TortoiseSVN 钩子入口（C1h）', () => {
     return { onOpenHooks, onUnregisterHooks }
   }
 
-  it('体检基线旁有「TortoiseSVN 钩子…」', () => {
-    const { onOpenHooks } = renderHooks({ state: 'notRegistered' })
-    fireEvent.click(screen.getByRole('button', { name: 'TortoiseSVN 钩子…' }))
-    expect(onOpenHooks).toHaveBeenCalledTimes(1)
+  it('同步正常时顶部什么都不挂：体检和钩子的入口挪到了工具栏「SVN ▾」（设计 2026-11-25 §7）', () => {
+    // 原来这里常驻一行「revision 对得上不代表……」+「体检基线」「TortoiseSVN 钩子…」，
+    // 用户读成了告警：「这是干啥？我需要做什么吗？」
+    renderHooks({ state: 'notRegistered' })
+    expect(screen.queryAllByRole('button')).toHaveLength(0)
+    expect(screen.queryByText(/revision 对得上/)).toBeNull()
   })
 
   it('失效时挂横幅，可以重新注册，也可以撤销注册', () => {
@@ -243,6 +246,79 @@ describe('BaselineBanner 的 TortoiseSVN 钩子入口（C1h）', () => {
   it('健康时不挂失效横幅', () => {
     renderHooks({ state: 'healthy', blockLeaks: true })
     expect(screen.queryByText('TortoiseSVN 钩子已失效')).toBeNull()
+  })
+})
+
+describe('BaselineBanner：jkk 与 TortoiseSVN 看法不一致（设计 2026-11-25 §6）', () => {
+  const inSync: SyncStatus = {
+    baselineRev: 3,
+    nodeRevs: [3],
+    base: { floor: 3, newer: 0, gone: 0 },
+    verdict: { kind: 'inSync' },
+    headBehindBase: false,
+  }
+  const eolDone = { ruleInstalled: true, needsMigration: false }
+  const files = ['Code/A.cs']
+
+  function renderMismatch(
+    sync: SyncStatus,
+    mismatch: BaselineMismatch | null,
+    mismatchAck: string | null = null,
+  ) {
+    const onCheck = vi.fn()
+    render(
+      <BaselineBanner
+        isSvn
+        sync={sync}
+        audit={null}
+        eol={eolDone}
+        syncState={{ locked: false, holder: null, unfinished: null }}
+        onRebuild={() => {}}
+        onCheck={onCheck}
+        onMigrateEol={() => {}}
+        onSyncAction={() => {}}
+        onSyncOutAction={() => {}}
+        onSvnUpdate={() => {}}
+        mismatch={mismatch}
+        mismatchAck={mismatchAck}
+      />,
+    )
+    return { onCheck }
+  }
+
+  it('有命中时挂横幅、列出文件，「体检」交给 onCheck', () => {
+    const { onCheck } = renderMismatch(inSync, { files, total: 1, truncated: false })
+    expect(screen.getByText(/^点「体检」核对 1 个文件/)).toBeTruthy()
+    expect(screen.getByText('Code/A.cs')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '体检' }))
+    expect(onCheck).toHaveBeenCalledTimes(1)
+  })
+
+  it('没有命中时什么都不挂', () => {
+    renderMismatch(inSync, { files: [], total: 0, truncated: false })
+    expect(screen.queryAllByRole('button')).toHaveLength(0)
+  })
+
+  it('上一次的结果还在、但同步结论已经变成「SVN 侧有新内容」：不挂，那时判据不成立', () => {
+    renderMismatch(
+      {
+        ...inSync,
+        verdict: {
+          kind: 'externallyAdvanced',
+          changed: [{ path: 'Code/A.cs', rev: 4, author: 'x' }],
+          added: [],
+          removed: [],
+        },
+      },
+      { files, total: 1, truncated: false },
+    )
+    expect(screen.queryByText(/核对 1 个文件/)).toBeNull()
+    expect(screen.getByText('SVN 侧有 1 个文件有新内容')).toBeTruthy()
+  })
+
+  it('这组文件体检过没问题：不再挂', () => {
+    renderMismatch(inSync, { files, total: 1, truncated: false }, mismatchKey(files))
+    expect(screen.queryAllByRole('button')).toHaveLength(0)
   })
 })
 

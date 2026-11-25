@@ -426,7 +426,7 @@ fn added_w_files(
 }
 
 /// `svn/base` 顶端的 OID。分支不存在时报 `svn_no_baseline`（理由见 [`read_baseline_rev`]）。
-fn baseline_oid(repo_root: &str) -> Result<String> {
+pub(crate) fn baseline_oid(repo_root: &str) -> Result<String> {
     let reference = format!("refs/heads/{BASELINE_BRANCH}");
     let no_baseline = |detail: &str| {
         GitError::new(

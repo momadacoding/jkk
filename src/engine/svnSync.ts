@@ -74,7 +74,7 @@ export type ServerAudit =
   | { status: 'missing'; files: string[]; total: number }
   | { status: 'notChecked'; reason: string }
 
-/** `quiet` 是灰色：只告知、不需要用户动手（与常驻体检入口同一套样式）。 */
+/** `quiet` 是灰色：只告知、不需要用户动手（「SVN 正在更新…」那一条）。 */
 export type BannerTone = 'warn' | 'danger' | 'quiet'
 
 export interface BannerAction {
@@ -232,39 +232,6 @@ export function describeSync(status: SyncStatus | null): BannerModel | null {
         note: REBUILD_NOTE,
       }
   }
-}
-
-/**
- * 常驻的「体检基线」入口要不要渲染。
- *
- * # 为什么不能只把它挂在失同步横幅里
- *
- * `describeSync` 对 `InSync` 返回 `null`，整条横幅不渲染，连带把唯一的体检入口
- * 也带走了（2026-09-16 独立 review）。而 **revision 一致根本不能证明基线内容
- * 正确**——`check_current_baseline` 报的 `Lying`（基线记的内容与服务器不符）
- * 恰恰发生在 revision 完全对得上的时候，`svn revert` 那类外部操作也不动 revision。
- *
- * 换句话说，把体检入口绑在失同步状态上，等于**只在不需要它的时候提供它**。
- *
- * 失同步横幅自己带了一个体检按钮，所以那时不重复渲染，保证任何时刻恰好一个入口。
- */
-export function needsStandaloneCheck(
-  isSvn: boolean,
-  sync: SyncStatus | null,
-  eol: EolStatus | null,
-  /** 基线分支不存在（第 70 条）：体检同样要读基线，入口点了只会报错，出口在恢复横幅上。 */
-  baselineMissing = false,
-): boolean {
-  // 只看「丢了且还没有结论」：标记在判定成功时不清，重建之后有了结论，入口就该回来
-  // （PR 115 review）
-  if (baselineMissing && !sync) return false
-  // 迁移没做完时基线本来就不可信，挂一个「体检基线」只会给出误导性的结论
-  // ——体检比的是磁盘与服务器，而此刻的问题出在基线自己的形状上。
-  //
-  // 第三个参数**故意不给默认值**：给了默认值，漏传的调用点会被编译器放过，
-  // 而漏传的后果正是这条规则要防的。让 tsc 把每个调用点都逼出来。
-  if (describeEolMigration(eol, sync) !== null) return false
-  return isSvn && describeSync(sync) === null
 }
 
 /**
