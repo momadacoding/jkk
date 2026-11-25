@@ -9,6 +9,7 @@ import {
   svnFollowAuto,
   svnFollowContinue,
   svnFollowManual,
+  svnFollowWithDisk,
   svnSyncAbort,
   svnSyncContinue,
   svnSyncIn,
@@ -19,6 +20,7 @@ import {
   RECHECK_SKIPS,
   describeCheckoutBehind,
   describeFollowConflict,
+  describeFollowConflictModel,
   describeFollowContinue,
   describeFollowOutcome,
   describeManualFollow,
@@ -30,9 +32,11 @@ import {
   type HeldBackPin,
   type AutoFollowSkip,
   type FollowActionId,
+  type FollowConflictModel,
   type FollowOutcome,
   type FollowReport,
 } from '../engine/svnFollow'
+import type { FollowConflictChoice } from './FollowConflictDialog'
 import {
   continueNeedsConfirm,
   describeSyncAction,
@@ -102,6 +106,14 @@ export interface SvnSyncFlowDeps {
    * 补丁）要等它落定再做。它不会 reject。
    */
   showFollowReport: (report: FollowReport, refreshed?: Promise<void>) => Promise<void>
+  /**
+   * 跟进冲突框（设计 2026-11-25-follow-resolve-with-disk）：实现方按工具配置补上每个文件的「对比」。点了出路
+   * 之后框调 `run`，跑完关框；关掉时 Promise 结束。
+   */
+  showFollowConflict: (
+    model: FollowConflictModel,
+    run: (choice: FollowConflictChoice) => Promise<void>,
+  ) => Promise<void>
   /** 切分支并刷新。失败要抛：「切换并手动跟进」据此停下。 */
   checkoutBranch: (name: string) => Promise<void>
   /**
@@ -287,6 +299,44 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
     await confirmManualFollow(describeManualFollow())
   }
 
+  /**
+   * 跟进冲突框（设计 2026-11-25-follow-resolve-with-disk §4）。两个出路：
+   *
+   * - 「用磁盘上的内容跟进」：不写工作区，与「跟进」同一套发布。磁盘在弹框之后变了、不能用了，后端
+   *   返回新的 `needsManual`，按新结果重开这个框。
+   * - 「手动跟进」：会写工作区。能用磁盘内容时冲突框上没有那条红色警告，所以另弹现有的手动跟进确认框；
+   *   只剩手动跟进时冲突框本身带着警告，点了就跑（§5.3）。
+   *
+   * 结局都等框关掉再处理，与 {@link confirmManualFollow} 相同。
+   */
+  const showConflict = async (o: Extract<FollowOutcome, { kind: 'needsManual' }>) => {
+    const model = describeFollowConflictModel(o)
+    const box: {
+      disk: FollowOutcome | null
+      manual: SyncInOutcome | null
+      confirmManual: boolean
+    } = { disk: null, manual: null, confirmManual: false }
+    await d.showFollowConflict(model, async (choice) => {
+      if (choice === 'manual' && model.diskReady) {
+        box.confirmManual = true
+        return
+      }
+      d.clearAutoFollowed()
+      if (choice === 'disk') {
+        // diskReady 已经要求有 base；这里再挡一次，免得「点磁盘」落进下面会写磁盘的手动跟进
+        if (!model.base) return
+        box.disk = await svnFollowWithDisk(d.repoPath, model.confirmed, model.base)
+        await afterFollow()
+      } else {
+        box.manual = await svnFollowManual(d.repoPath)
+        await afterSync()
+      }
+    })
+    if (box.disk) await settleFollow(box.disk)
+    else if (box.confirmManual) await confirmManualFollow(describeManualFollow())
+    else if (box.manual) await showOutcome(box.manual, true)
+  }
+
   /** 按跟进的结局走下一步。`needsManual` 这时 merge driver 已经确认过了。 */
   const settleFollow = async (o: FollowOutcome) => {
     if (o.kind === 'done') {
@@ -294,7 +344,9 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
       return
     }
     if (o.kind === 'needsManual') {
-      await confirmManualFollow(describeFollowConflict(o))
+      // 磁盘上是旧内容（staleDisk）不是重放冲突，没有逐文件的对比可看：照旧是手动跟进的确认框
+      if (o.staleDisk) await confirmManualFollow(describeFollowConflict(o))
+      else await showConflict(o)
       return
     }
     const n = describeFollowOutcome(o)

@@ -102,6 +102,8 @@ export type DiffTarget =
   | { kind: 'staged'; file: string }
   | { kind: 'commit'; oid: string; file: string; oldFile: string | null }
   | { kind: 'range'; from: string; to: string; file: string; oldFile: string | null }
+  /** 某个提交里的版本 vs 工作区里的真实文件（跟进冲突框，设计 2026-11-25-follow-resolve-with-disk）。 */
+  | { kind: 'worktree'; from: string; file: string }
 
 /** 每个外部工具菜单的最后一项（spec §4.5）。 */
 export const EDIT_CONFIG_LABEL = '编辑外部工具配置…'

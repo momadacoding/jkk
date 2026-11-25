@@ -18,8 +18,8 @@
 
 use crate::engine::git_cli::{run_git, run_git_code};
 use crate::engine::svn_replay::{
-    commits_between, no_superseded, replay_onto, ReplayCodes, ReplayCommit, ReplayOpts,
-    ReplayOutcome,
+    commits_between, no_resolved, no_superseded, replay_onto, ReplayCodes, ReplayCommit,
+    ReplayOpts, ReplayOutcome,
 };
 use crate::engine::svn_util::short;
 use crate::error::{GitError, Result};
@@ -134,6 +134,7 @@ fn replay(
     let opts = ReplayOpts {
         drop_empty: false,
         superseded: &no_superseded,
+        resolved: &no_resolved,
         codes: DELIVER_CODES,
     };
     match replay_onto(repo, onto, picks, &opts, &mut BTreeMap::new())? {

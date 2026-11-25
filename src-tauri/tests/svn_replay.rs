@@ -10,8 +10,8 @@ mod svn_fixtures;
 
 use app_lib::engine::git_cli::{run_git, run_git_env, run_git_stdin_env};
 use app_lib::engine::svn_replay::{
-    all_committed, commits_between, no_superseded, replay_onto, ReplayCodes, ReplayCommit,
-    ReplayOpts, ReplayOutcome,
+    all_committed, commits_between, no_resolved, no_superseded, replay_onto, ReplayCodes,
+    ReplayCommit, ReplayOpts, ReplayOutcome, Resolution,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -138,6 +138,7 @@ fn opts<'a>(
     ReplayOpts {
         drop_empty,
         superseded,
+        resolved: &no_resolved,
         codes: CODES,
     }
 }
@@ -157,6 +158,7 @@ fn done(o: ReplayOutcome) -> Done {
             map,
             dropped,
             rewritten,
+            ..
         } => (tip, map, dropped, rewritten),
         other => panic!("期望 Done，实际 {other:?}"),
     }
@@ -322,7 +324,9 @@ fn superseded_path_resolves_w10_r2_conflict() {
     )
     .unwrap()
     {
-        ReplayOutcome::Conflict { at, files, tree } => {
+        ReplayOutcome::Conflict {
+            at, files, tree, ..
+        } => {
             assert_eq!(at, c1);
             assert_eq!(files, vec![A.to_string()]);
             // 事故分析 6.5：冲突树里的文件带着冲突标记，冲突框从这里取预览
@@ -655,4 +659,253 @@ fn replay_cjk_path_conflict_is_reported_verbatim() {
         }
         other => panic!("期望冲突，实际 {other:?}"),
     }
+}
+
+// —— 冲突时用指定的 blob（设计 2026-11-25-follow-resolve-with-disk §8.1）——
+
+fn blob(fx: &SvnFixture, body: &str) -> String {
+    run_git_stdin_env(
+        &fx.wc_str(),
+        &["hash-object", "-w", "--stdin"],
+        body.as_bytes(),
+        &[],
+    )
+    .unwrap()
+    .trim()
+    .to_string()
+}
+
+/// 只给 `at` 这一个 commit 的这些路径指定结果。
+fn resolving(
+    at: String,
+    pairs: Vec<(&'static str, String)>,
+) -> impl Fn(&ReplayCommit) -> BTreeMap<String, Resolution> {
+    move |c: &ReplayCommit| {
+        if c.oid != at {
+            return BTreeMap::new();
+        }
+        pairs
+            .iter()
+            .map(|(p, b)| {
+                (
+                    p.to_string(),
+                    Resolution {
+                        mode: "100644".to_string(),
+                        blob: b.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
+#[test]
+fn a_conflict_without_any_stage_entry_still_conflicts() {
+    // 独立 review 高危 1：目录被拆到两处（ours 把 a/1→b/1、a/2→c/2），theirs 往 a/ 里加文件。
+    // merge-tree 退出 1、却没有一条 stage 行（`directory rename unclear split`）。`files` 为空时
+    // 不能当成「冲突都已解决」，否则跟进、自动跟进、交付都会把冲突树当成干净结果发布
+    let fx = hybrid_with_colleague();
+    let wc = fx.wc_str();
+    let o = commit_on(
+        &fx,
+        &[&svn_base(&fx)],
+        &[
+            Ch::Put("Code/a/1.cs", "one\n"),
+            Ch::Put("Code/a/2.cs", "two\n"),
+        ],
+        "old base",
+    );
+    let new = commit_on(
+        &fx,
+        &[&o],
+        &[
+            Ch::Del("Code/a/1.cs"),
+            Ch::Del("Code/a/2.cs"),
+            Ch::Put("Code/b/1.cs", "one\n"),
+            Ch::Put("Code/c/2.cs", "two\n"),
+        ],
+        "NEW",
+    );
+    let c = commit_on(&fx, &[&o], &[Ch::Put("Code/a/3.cs", "three\n")], "C");
+    let commits = commits_between(&wc, &o, &c, &CODES).unwrap();
+    let out = replay_onto(
+        &wc,
+        &new,
+        &commits,
+        &opts(true, &no_superseded),
+        &mut BTreeMap::new(),
+    )
+    .unwrap();
+    match out {
+        ReplayOutcome::Conflict { at, files, .. } => {
+            assert_eq!(at, c);
+            assert!(files.is_empty(), "这种冲突本来就没有文件条目：{files:?}");
+        }
+        other => panic!("期望冲突，实际 {other:?}"),
+    }
+}
+
+#[test]
+fn conflict_reports_the_three_stages_of_each_file() {
+    let fx = hybrid_with_colleague();
+    let wc = fx.wc_str();
+    let o = thirty_line_base(&fx);
+    let c = commit_on(&fx, &[&o], &[Ch::Put(A, &lines(&[(2, "two-C")], &[]))], "C");
+    let new = commit_on(
+        &fx,
+        &[&o],
+        &[Ch::Put(A, &lines(&[(2, "two-NEW")], &[]))],
+        "NEW",
+    );
+    let commits = commits_between(&wc, &o, &c, &CODES).unwrap();
+    match replay_onto(
+        &wc,
+        &new,
+        &commits,
+        &opts(true, &no_superseded),
+        &mut BTreeMap::new(),
+    )
+    .unwrap()
+    {
+        ReplayOutcome::Conflict { stages, .. } => {
+            let s = stages.get(A).expect("冲突文件有 stage 条目");
+            let nums: Vec<u8> = s.iter().map(|e| e.stage).collect();
+            assert_eq!(nums, vec![1, 2, 3]);
+            assert!(s.iter().all(|e| e.mode == "100644"));
+            assert_eq!(s[1].oid, git(&fx, &["rev-parse", &format!("{new}:{A}")]));
+            assert_eq!(s[2].oid, git(&fx, &["rev-parse", &format!("{c}:{A}")]));
+        }
+        other => panic!("期望冲突，实际 {other:?}"),
+    }
+}
+
+#[test]
+fn resolved_blob_becomes_the_merge_result_of_the_conflicted_file() {
+    let fx = hybrid_with_colleague();
+    let wc = fx.wc_str();
+    let o = thirty_line_base(&fx);
+    let c = commit_on(&fx, &[&o], &[Ch::Put(A, &lines(&[(2, "two-C")], &[]))], "C");
+    let new = commit_on(
+        &fx,
+        &[&o],
+        &[Ch::Put(
+            A,
+            &lines(&[(2, "two-NEW"), (20, "twenty-NEW")], &[]),
+        )],
+        "NEW",
+    );
+    let both = lines(&[(2, "two-BOTH"), (20, "twenty-NEW")], &[]);
+    let b = blob(&fx, &both);
+    let commits = commits_between(&wc, &o, &c, &CODES).unwrap();
+    let r = resolving(c.clone(), vec![(A, b.clone())]);
+    let o2 = ReplayOpts {
+        drop_empty: true,
+        superseded: &no_superseded,
+        resolved: &r,
+        codes: CODES,
+    };
+    match replay_onto(&wc, &new, &commits, &o2, &mut BTreeMap::new()).unwrap() {
+        ReplayOutcome::Done {
+            tip,
+            dropped,
+            resolved,
+            ..
+        } => {
+            assert!(dropped.is_empty());
+            assert_eq!(parent_of(&fx, &tip), new, "挂在新基线上");
+            assert_eq!(show(&fx, &tip, A), both, "冲突文件就是指定的内容");
+            assert_eq!(subject(&fx, &tip), "C", "元数据仍取自原 commit");
+            assert_eq!(resolved, vec![(c.clone(), vec![A.to_string()])]);
+        }
+        other => panic!("期望 Done，实际 {other:?}"),
+    }
+}
+
+#[test]
+fn a_conflicted_file_without_a_resolution_still_conflicts() {
+    let fx = hybrid_with_colleague();
+    let wc = fx.wc_str();
+    let o = commit_on(
+        &fx,
+        &[&svn_base(&fx)],
+        &[Ch::Put(A, &lines(&[], &[])), Ch::Put(E, &lines(&[], &[]))],
+        "old base",
+    );
+    let c = commit_on(
+        &fx,
+        &[&o],
+        &[
+            Ch::Put(A, &lines(&[(2, "two-C")], &[])),
+            Ch::Put(E, &lines(&[(3, "three-C")], &[])),
+        ],
+        "C",
+    );
+    let new = commit_on(
+        &fx,
+        &[&o],
+        &[
+            Ch::Put(A, &lines(&[(2, "two-NEW")], &[])),
+            Ch::Put(E, &lines(&[(3, "three-NEW")], &[])),
+        ],
+        "NEW",
+    );
+    let b = blob(&fx, &lines(&[(2, "two-BOTH")], &[]));
+    let commits = commits_between(&wc, &o, &c, &CODES).unwrap();
+    let r = resolving(c.clone(), vec![(A, b)]);
+    let o2 = ReplayOpts {
+        drop_empty: true,
+        superseded: &no_superseded,
+        resolved: &r,
+        codes: CODES,
+    };
+    match replay_onto(&wc, &new, &commits, &o2, &mut BTreeMap::new()).unwrap() {
+        ReplayOutcome::Conflict {
+            at, files, stages, ..
+        } => {
+            assert_eq!(at, c);
+            assert_eq!(files, vec![E.to_string()], "只列没解决的");
+            assert!(stages.contains_key(E) && !stages.contains_key(A));
+        }
+        other => panic!("期望冲突，实际 {other:?}"),
+    }
+}
+
+#[test]
+fn resolved_commits_and_their_descendants_stay_out_of_the_memo() {
+    // 设计 §11 第 2 条：其他分支共用 memo，命中就会悄悄带上磁盘内容
+    let fx = hybrid_with_colleague();
+    let wc = fx.wc_str();
+    let o = thirty_line_base(&fx);
+    let c1 = commit_on(
+        &fx,
+        &[&o],
+        &[Ch::Put(A, &lines(&[(2, "two-C")], &[]))],
+        "C1",
+    );
+    let c2 = commit_on(&fx, &[&c1], &[Ch::Put(E, "e2\n")], "C2");
+    let new = commit_on(
+        &fx,
+        &[&o],
+        &[Ch::Put(A, &lines(&[(2, "two-NEW")], &[]))],
+        "NEW",
+    );
+    let b = blob(&fx, &lines(&[(2, "two-BOTH")], &[]));
+    let commits = commits_between(&wc, &o, &c2, &CODES).unwrap();
+    let r = resolving(c1.clone(), vec![(A, b)]);
+    let o2 = ReplayOpts {
+        drop_empty: true,
+        superseded: &no_superseded,
+        resolved: &r,
+        codes: CODES,
+    };
+    let mut memo = BTreeMap::new();
+    match replay_onto(&wc, &new, &commits, &o2, &mut memo).unwrap() {
+        ReplayOutcome::Done { tip, .. } => assert_eq!(show(&fx, &tip, E), "e2\n"),
+        other => panic!("期望 Done，实际 {other:?}"),
+    }
+    assert!(memo.is_empty(), "用过替换的链一个都不进 memo：{memo:?}");
+
+    // 同一份 memo 再给「另一条分支」重放：仍然冲突，不会命中替换过的结果
+    let again = replay_onto(&wc, &new, &commits, &opts(true, &no_superseded), &mut memo).unwrap();
+    assert!(matches!(again, ReplayOutcome::Conflict { .. }), "{again:?}");
 }

@@ -46,6 +46,7 @@ import { createSvnSyncOutFlow } from './svnSyncOutFlow'
 import type { SyncActionBusy } from './svnFlowShared'
 import { useDeliverDialog } from './DeliverDialog'
 import { useFollowReportDialog } from './FollowReportDialog'
+import { useFollowConflictDialog } from './FollowConflictDialog'
 import { SplitLocalOnlyDialog, type SplitLocalOnlyRequest } from './SplitLocalOnlyDialog'
 import { describeLocalOnlyEditDone, describeLocalOnlyToggle, type LocalOnlyEditOutcome } from '../engine/localOnlyEdit'
 import {
@@ -56,6 +57,7 @@ import {
   heldBackFor,
   keepOnNewFollow,
   type AutoFollowSkip,
+  type FollowConflictFile,
   type FollowReport,
   type HeldBackPin,
   type PendingRestore,
@@ -239,6 +241,7 @@ export function RepoTab({
   const { confirm, dialog: confirmDialog } = useConfirm()
   const { deliver, dialog: deliverDialog } = useDeliverDialog()
   const { showFollowReport, dialog: followReportDialog } = useFollowReportDialog()
+  const { showFollowConflict, dialog: followConflictDialog } = useFollowConflictDialog()
   // 跟进执行中（svnSyncFlow 写），横幅上的按钮据此禁用
   const [following, setFollowing] = useState(false)
   // 未收尾横幅上执行中的那颗按钮（更新、交付两个流程写）：rebase 冲突时的「继续」不弹框，进度在按钮上
@@ -1063,6 +1066,19 @@ export function RepoTab({
       }
     }
   }
+  /**
+   * 跟进冲突框里每个文件的「对比」（设计 2026-11-25-follow-resolve-with-disk §5）。工具配置与路径按框渲染时的
+   * 最新值读，理由同 {@link compareDrift}。没有可用的工具就返回 `null`，框里退回文本预览。
+   */
+  const compareConflict = (f: FollowConflictFile) => {
+    const cfg = toolsConfigRef.current
+    const path = statePathRef.current
+    const target = f.compare
+    if (!cfg || !path || !target) return null
+    const tool = toolFor(cfg, f.path, 'diff')
+    if (!tool) return null
+    return { label: tool.label, open: () => openExternalDiff(path, tool.id, target) }
+  }
   const handleRestorePending = async () => {
     setRestoreBusy(true)
     try {
@@ -1128,6 +1144,8 @@ export function RepoTab({
       if (failed) throw failed.reason
     },
     showFollowReport: showReport,
+    showFollowConflict: (model, run) =>
+      showFollowConflict({ model, run, compare: compareConflict }),
     checkoutBranch: async (name) => {
       await invoke('checkout', { path: repoPath, rev: name })
       await refreshAfterCheckout()
@@ -1474,6 +1492,7 @@ export function RepoTab({
       {promptDialog}
       {deliverDialog}
       {followReportDialog}
+      {followConflictDialog}
       {splitRequest && (
         <SplitLocalOnlyDialog request={splitRequest} onClose={() => setSplitRequest(null)} />
       )}

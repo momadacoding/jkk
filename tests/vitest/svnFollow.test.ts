@@ -7,6 +7,7 @@ import {
   describeCheckoutBehind,
   describeFollowContinue,
   describeFollowConflict,
+  describeFollowConflictModel,
   describeFollowOutcome,
   describeFollowReport,
   driftDiffTarget,
@@ -1724,5 +1725,120 @@ describe('报告三节的写法（计划 2026-11-16-follow-report-usability 的 
       expect(l.groups.map((g) => g.label)).toEqual(['这些改动已确认在 SVN 上', '拿不准'])
       expect(l.note).not.toContain('已从分支移除')
     })
+  })
+})
+
+describe('describeFollowConflictModel（设计 2026-11-25-follow-resolve-with-disk §5）', () => {
+  const base = 'b'.repeat(40)
+  const at = 'c'.repeat(40)
+  const o = (
+    disk: { kind: 'usable' } | { kind: 'refused'; reason: string } | null,
+    diskReady: boolean,
+  ): Extract<FollowOutcome, { kind: 'needsManual' }> => ({
+    kind: 'needsManual',
+    at,
+    files: ['LuaScripts/Client/SettingMgr.lua'],
+    baselinePublished: true,
+    leaks: [],
+    staleDisk: false,
+    base,
+    diskReady,
+    details: [
+      {
+        path: 'LuaScripts/Client/SettingMgr.lua',
+        svnRev: 70760,
+        svnAuthor: 'li',
+        svnRemoved: false,
+        preview: '<<<<<<< 新基线（SVN）\nnew\n=======\nmine\n>>>>>>> 你的提交',
+        disk,
+      },
+    ],
+  })
+
+  it('能用磁盘内容：✓ 一行，对比 SVN 新版本与磁盘上的真实文件，没有红色警告', () => {
+    const m = describeFollowConflictModel(o({ kind: 'usable' }, true))
+    expect(m.title).toBe('跟进遇到冲突')
+    expect(m.intro).toContain(at.slice(0, 10))
+    expect(m.intro).toContain('1 个文件冲突')
+    expect(m.diskReady).toBe(true)
+    expect(m.warning).toBeNull()
+    expect(m.action).toContain('不写工作区')
+    const f = m.files[0]
+    expect(f.origin).toBe('SVN 上 r70760 li 改过，你的提交也改了同一处。')
+    expect(f.diskLine).toBe('✓ 你已经在 SVN 里合并好了，磁盘上就是合并结果。')
+    expect(f.compare).toEqual({ kind: 'worktree', from: base, file: f.path })
+    expect(f.sides).toBe('左：SVN 新版本 r70760　右：磁盘上的合并结果')
+    expect(m.confirmed).toEqual([f.path])
+  })
+
+  it('不能用：✗ 写明原因，对比 SVN 新版本与你的提交，只剩手动跟进时才有红色警告', () => {
+    const m = describeFollowConflictModel(o({ kind: 'refused', reason: '磁盘上还有冲突标记' }, false))
+    expect(m.diskReady).toBe(false)
+    expect(m.warning).toContain('会写工作区')
+    const f = m.files[0]
+    expect(f.diskLine).toBe('✗ 不能直接用磁盘上的内容：磁盘上还有冲突标记')
+    expect(f.compare).toEqual({ kind: 'range', from: base, to: at, file: f.path, oldFile: null })
+    expect(f.sides).toBe('左：SVN 新版本 r70760　右：你的提交')
+  })
+
+  it('不内嵌冲突标记：预览只作为没有对比工具时的退路交给框', () => {
+    const m = describeFollowConflictModel(o({ kind: 'usable' }, true))
+    expect([m.intro, m.action, ...m.notes].join('\n')).not.toContain('<<<<<<<')
+    expect(m.files[0].preview).toContain('新基线（SVN）')
+  })
+
+  it('冲突分属几个 commit：对比你的提交时右边取文件自己的 commit，说明里写清从哪个起', () => {
+    const second = 'd'.repeat(40)
+    const one = o({ kind: 'refused', reason: 'x' }, false)
+    const m = describeFollowConflictModel({
+      ...one,
+      files: [...one.files, 'Code/G.cs'],
+      details: [
+        { ...one.details![0], commit: at },
+        {
+          path: 'Code/G.cs',
+          svnRev: 70761,
+          svnAuthor: null,
+          svnRemoved: false,
+          preview: null,
+          disk: { kind: 'refused', reason: '冲突处以外还有别的改动' },
+          commit: second,
+        },
+      ],
+    })
+    expect(m.files[1].compare).toEqual({
+      kind: 'range',
+      from: base,
+      to: second,
+      file: 'Code/G.cs',
+      oldFile: null,
+    })
+    expect(m.intro).toContain('2 个提交')
+    expect(m.intro).toContain('2 个文件冲突')
+  })
+
+  it('有磁盘结论但没有新基线：不给磁盘按钮（后端没法核对冲突框对比的是哪个基线）', () => {
+    const m = describeFollowConflictModel({ ...o({ kind: 'usable' }, true), base: undefined })
+    expect(m.diskReady).toBe(false)
+    expect(m.base).toBeNull()
+  })
+
+  it('旧后端（没有 base / disk）：不给对比，不显示磁盘按钮', () => {
+    const old = { ...o(null, false), base: undefined, diskReady: undefined }
+    const m = describeFollowConflictModel(old)
+    expect(m.diskReady).toBe(false)
+    expect(m.files[0].compare).toBeNull()
+    expect(m.files[0].diskLine).toBeNull()
+  })
+
+  it('跟进报告单列按磁盘内容解决的文件', () => {
+    const r = describeFollowReport({
+      ...report,
+      diskResolved: [[at, ['LuaScripts/Client/SettingMgr.lua']]],
+    })
+    const s = r.sections.find((x) => x.id === 'diskResolved')
+    expect(s?.title).toBe('按磁盘内容解决的冲突')
+    expect(s?.count).toBe(1)
+    expect(describeFollowReport(report).sections.some((x) => x.id === 'diskResolved')).toBe(false)
   })
 })

@@ -161,6 +161,11 @@ export interface FollowReport {
    * 2026-11-16-tsvn-acknowledged-leaks）。只留档，不拦自动跟进。旧后端没有。
    */
   acknowledgedLeaks?: Leak[]
+  /**
+   * (原 commit, 冲突时直接采用了磁盘内容的路径)：冲突框里点了「用磁盘上的内容跟进」（设计
+   * 2026-11-25-follow-resolve-with-disk）。旧后端没有。
+   */
+  diskResolved?: [string, string[]][]
   /** 钉着换入之前的原始索引与暂存 blob 的 ref。 */
   pinnedRef: string | null
   /** 判定依据（C1h）：钩子健康时按本机事件，否则按作者 + 失焦快照。 */
@@ -183,7 +188,20 @@ export interface ConflictDetail {
   svnRemoved: boolean
   /** 第一处冲突块，标签已换成「新基线（SVN）/ 你的提交」。二进制、太大、没有冲突标记时为 null。 */
   preview: string | null
+  /**
+   * 能不能直接用磁盘上的内容（设计 2026-11-25-follow-resolve-with-disk）。没探测（自动跟进、试重放没走到
+   * 这个文件）时为 null；旧后端没有。
+   */
+  disk?: DiskVerdict | null
+  /**
+   * 这个文件在哪个原 commit 处冲突。试重放一路走下去时，后面的文件不在 `at` 那个 commit 上。
+   * 没探测（自动跟进）、旧后端时没有。
+   */
+  commit?: string | null
 }
+
+/** 后端 `svn_follow::DiskVerdict`。 */
+export type DiskVerdict = { kind: 'usable' } | { kind: 'refused'; reason: string }
 
 /** 后端 `svn_follow::FollowOutcome`。 */
 export type FollowOutcome =
@@ -206,6 +224,13 @@ export type FollowOutcome =
       snapshot?: [string, string[]][]
       /** 每个冲突文件的上下文（6.5），与 `files` 同序。旧后端没有。 */
       details?: ConflictDetail[]
+      /** 新基线（`svn/base`）：冲突框里「对比」的左边。旧后端没有。 */
+      base?: string
+      /**
+       * 每个冲突文件都能直接用磁盘内容、试重放整条分支也没有别的冲突：冲突框给「用磁盘上的内容跟进」。
+       * 旧后端没有。
+       */
+      diskReady?: boolean
     }
   /** 什么都没动：前置条件不满足，或者准备阶段失败。 */
   | { kind: 'refused'; code: string; message: string }
@@ -531,6 +556,7 @@ export interface FollowReportSection {
     | 'changes'
     | 'dropped'
     | 'rewritten'
+    | 'diskResolved'
     | 'snapshot'
     | 'drift'
     | 'heldBack'
@@ -946,6 +972,16 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
       groups: r.rewritten.map(([c, paths]) => ({ label: commitLabel(c), items: plain(paths) })),
     },
     {
+      id: 'diskResolved',
+      title: '按磁盘内容解决的冲突',
+      level: 'info',
+      note: '这些文件重放时冲突，按你在冲突框里的选择直接用了磁盘上的内容（你在 SVN 里合并好的结果），commit 里就是磁盘上的样子。',
+      groups: (r.diskResolved ?? []).map(([c, paths]) => ({
+        label: commitLabel(c),
+        items: plain(paths),
+      })),
+    },
+    {
       id: 'dropped',
       title: '丢弃的 commit',
       level: 'info',
@@ -1132,6 +1168,129 @@ export function describeFollowConflict(
 ): SyncConfirmModel {
   const n = describeFollowOutcome(o)
   return { ...describeManualFollow(), title: n.title, message: n.detail }
+}
+
+/** 冲突框里的一个冲突文件（设计 2026-11-25-follow-resolve-with-disk §5）。 */
+export interface FollowConflictFile {
+  path: string
+  /** SVN 上是谁、在哪个 revision 改的。 */
+  origin: string
+  /** 能不能直接用磁盘上的内容；没探测过（旧后端）为 null。 */
+  disk: 'usable' | 'refused' | null
+  /** ✓ / ✗ 那一行。`disk` 为 null 时没有。 */
+  diskLine: string | null
+  /** 「对比」打开的两侧；旧后端没给新基线时没有。 */
+  compare: DiffTarget | null
+  /** 对比按钮旁写清左右各是什么。 */
+  sides: string
+  /** 没有对比工具时退回的文本预览（第一处冲突块）。 */
+  preview: string | null
+}
+
+/** {@link describeFollowConflictModel} 的结果。 */
+export interface FollowConflictModel {
+  title: string
+  intro: string
+  files: FollowConflictFile[]
+  /** 显示「用磁盘上的内容跟进」。 */
+  diskReady: boolean
+  /** 按钮上方那句：点了会怎样。 */
+  action: string
+  /** 「会写工作区」的红色警告，只在只剩手动跟进时有（§5.3）。 */
+  warning: string | null
+  /** 快照内容、泄漏、怎么回到这一步：原冲突框里的其余几段。 */
+  notes: string[]
+  /** `files` 里所有的路径：点按钮时原样交给后端，作「冲突框列过的文件」。 */
+  confirmed: string[]
+  /** 冲突框给人对比的新基线：点按钮时交给后端核对，SVN 又前进了就回到冲突框。旧后端没有。 */
+  base: string | null
+}
+
+/** 没有对比工具、退回文本预览时的说明：原来的预览看不出上下两半各是什么（2026-11-25 报告 1.2 第 3 条）。 */
+export const CONFLICT_PREVIEW_NOTE =
+  '没有配置对比工具，下面是第一处冲突的文本：上半是 SVN 的新版本（新基线），下半是你的提交。'
+
+export const DISK_FOLLOW_LABEL = '用磁盘上的内容跟进'
+
+function conflictOrigin(d: ConflictDetail | undefined): string {
+  if (d?.svnRemoved) return 'SVN 上删除了它，你的提交改过它。'
+  if (d && d.svnRev !== null) {
+    return `SVN 上 r${d.svnRev}${d.svnAuthor ? ` ${d.svnAuthor}` : ''} 改过，你的提交也改了同一处。`
+  }
+  return '你的提交和 SVN 的新内容改了同一处。'
+}
+
+/**
+ * 跟进冲突框（设计 2026-11-25-follow-resolve-with-disk §5）。不再内嵌冲突标记，每个文件一个外部对比按钮：
+ * 能用磁盘内容时比「SVN 新版本 vs 磁盘上的合并结果」（右边是真实文件，改了也算数），不能用时比
+ * 「SVN 新版本 vs 你的提交」。`staleDisk` 不走这里，仍是 {@link describeFollowConflict}。
+ */
+export function describeFollowConflictModel(
+  o: Extract<FollowOutcome, { kind: 'needsManual' }>,
+): FollowConflictModel {
+  const byPath = new Map((o.details ?? []).map((d) => [d.path, d]))
+  const rev = (d: ConflictDetail | undefined) => (d && d.svnRev !== null ? ` r${d.svnRev}` : '')
+  const files = o.files.map((path): FollowConflictFile => {
+    const d = byPath.get(path)
+    const v = d?.disk ?? null
+    const usable = v?.kind === 'usable'
+    const compare: DiffTarget | null = !o.base
+      ? null
+      : usable
+        ? { kind: 'worktree', from: o.base, file: path }
+        : // 右边取这个文件自己冲突的那个 commit：`at` 只是第一个冲突的（独立 review 低 4）
+          { kind: 'range', from: o.base, to: d?.commit ?? o.at, file: path, oldFile: null }
+    return {
+      path,
+      origin: conflictOrigin(d),
+      disk: v ? v.kind : null,
+      diskLine: !v
+        ? null
+        : v.kind === 'usable'
+          ? '✓ 你已经在 SVN 里合并好了，磁盘上就是合并结果。'
+          : `✗ 不能直接用磁盘上的内容：${v.reason}`,
+      compare,
+      sides: usable
+        ? `左：SVN 新版本${rev(d)}　右：磁盘上的合并结果`
+        : `左：SVN 新版本${rev(d)}　右：你的提交`,
+      preview: d?.preview ?? null,
+    }
+  })
+  // 没有新基线（旧后端）就没法让后端核对冲突框对比的是哪个基线：不给磁盘按钮
+  const diskReady = o.diskReady === true && !!o.base
+  const n = o.files.length
+  // 试重放一路走下去时，冲突的文件可能分属几个 commit
+  const commits = new Set((o.details ?? []).map((d) => d.commit ?? o.at)).size
+  const notes: string[] = []
+  const snapshot = (o.snapshot ?? []).flatMap(([c, paths]) =>
+    paths.map((p) => `${p}（${c.slice(0, 10)}）`),
+  )
+  if (snapshot.length > 0) {
+    notes.push(
+      `${SNAPSHOT_NOTE}手动跟进时这些文件会直接采用新基线的版本，不会报冲突：\n${listed(snapshot)}`,
+    )
+  }
+  if (o.leaks.length > 0) notes.push(leakSection(o.leaks))
+  const acked = o.acknowledgedLeaks ?? []
+  if (acked.length > 0) notes.push(ackedLeakSection(acked))
+  notes.push(COME_BACK_NOTE)
+  return {
+    title: '跟进遇到冲突',
+    intro:
+      (commits > 1
+        ? `基线已经发布，但把分支上的提交重放到新基线上时（从 ${o.at.slice(0, 10)} 起 ${commits} 个提交），有 ${n} 个文件冲突。`
+        : `基线已经发布，但把提交 ${o.at.slice(0, 10)} 重放到新基线上时，有 ${n} 个文件冲突。`) +
+      '分支和暂存区都没动。',
+    files,
+    diskReady,
+    action: diskReady
+      ? `点「${DISK_FOLLOW_LABEL}」：你的提交里${n > 1 ? '这些' : '这个'}文件会变成磁盘上的样子，不写工作区。`
+      : '这需要人来判断：点「手动跟进」，未提交的改动会先收起来，分支重放到新基线上，冲突由你解决，最后再把改动放回来。',
+    warning: diskReady ? null : (describeManualFollow().warning ?? null),
+    notes,
+    confirmed: [...o.files],
+    base: o.base ?? null,
+  }
 }
 
 /**

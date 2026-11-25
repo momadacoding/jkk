@@ -13,7 +13,8 @@ use crate::commands::watch::WatchSuspension;
 use crate::desktop::DesktopState;
 use crate::engine::svn_changelist;
 use crate::engine::svn_follow::{
-    follow, follow_auto, manual_follow, resume_follow, AutoFollowOutcome, FollowOutcome,
+    follow, follow_auto, follow_with_disk, manual_follow, resume_follow, AutoFollowOutcome,
+    FollowOutcome,
 };
 use crate::engine::svn_local_only_edit::{
     local_only_files, set_local_only, split_local_only, EditOutcome,
@@ -155,6 +156,21 @@ pub fn svn_dismiss_pending_restores(path: String, paths: Vec<String>) -> Result<
 #[tauri::command(async)]
 pub fn svn_follow(handle: AppHandle, path: String) -> Result<FollowOutcome, GitError> {
     with_watch_suspended(&handle, &path, || follow(&path, &new_opid()))
+}
+
+/// 冲突框里的「用磁盘上的内容跟进」（设计 2026-11-25-follow-resolve-with-disk）：冲突文件直接用
+/// 磁盘上的内容，不写工作区。`files` 是冲突框里列过的文件，`base` 是冲突框对比用的新基线。JS 侧：
+/// `invoke('svn_follow_with_disk', { path, files, base })`。
+#[tauri::command(async)]
+pub fn svn_follow_with_disk(
+    handle: AppHandle,
+    path: String,
+    files: Vec<String>,
+    base: String,
+) -> Result<FollowOutcome, GitError> {
+    with_watch_suspended(&handle, &path, || {
+        follow_with_disk(&path, &new_opid(), &files, &base)
+    })
 }
 
 /// 自动跟进（事故分析 6.12）：判定写回 ExternallyAdvanced 之后由前端发起。条件全部满足才发布，

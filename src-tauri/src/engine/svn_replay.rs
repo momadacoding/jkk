@@ -55,7 +55,30 @@ pub struct ReplayOpts<'a> {
     /// 对每个 commit 给出「已被自己更晚的 SVN 提交取代」的路径集合 P。**只能放文件路径**
     /// （W19：喂目录会写坏索引），遇到目录报 `codes.failed`。
     pub superseded: &'a dyn Fn(&ReplayCommit) -> BTreeSet<String>,
+    /// 对每个 commit 给出「冲突时直接采用的结果」（路径 → blob，设计
+    /// `2026-11-25-follow-resolve-with-disk.md`）。merge 冲突、且冲突路径**全部**在里面时，在冲突树上
+    /// 把这些条目换掉，当作干净的结果继续；有一个不在里面就照旧冲突。不冲突的路径不用它。
+    ///
+    /// 用过它的 commit 以及之后的 commit 都不进 `memo`：其他分支共用 memo，命中就会悄悄带上
+    /// 只属于当前分支的结果（设计 §11 第 2 条）。
+    pub resolved: &'a dyn Fn(&ReplayCommit) -> BTreeMap<String, Resolution>,
     pub codes: ReplayCodes,
+}
+
+/// 冲突文件在 merge-tree 输出里的一个条目。`stage` 1 是合并基础（C^，换过路径时是 C' 的父提交），
+/// 2 是我们这边（onto 加上已重放的提交），3 是被重放的 commit；缺哪个就是哪边没有这个文件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictStage {
+    pub stage: u8,
+    pub mode: String,
+    pub oid: String,
+}
+
+/// [`ReplayOpts::resolved`] 的一项：冲突文件直接采用的 blob 与 mode。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolution {
+    pub mode: String,
+    pub blob: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,20 +90,30 @@ pub enum ReplayOutcome {
         dropped: Vec<String>,
         /// (原 OID, 换成 SVN 版本的路径)。只列真正换了条目的路径（C 没改的路径换不换都一样）。
         rewritten: Vec<(String, Vec<String>)>,
+        /// (原 OID, 冲突时采用了 [`ReplayOpts::resolved`] 的路径)。
+        resolved: Vec<(String, Vec<String>)>,
     },
     /// 在原 commit `at` 处冲突。什么都没有发布——重放只建了对象。
     Conflict {
         at: String,
+        /// 没有解决的冲突文件（[`ReplayOpts::resolved`] 给了结果的不在内）。
         files: Vec<String>,
         /// merge-tree 写出的冲突树：冲突文件里带着冲突标记。只是对象，没有 ref 指着；
         /// 给冲突框取预览用（事故分析 6.5）。
         tree: String,
+        /// `files` 里每个文件的 stage 条目，按 stage 升序。
+        stages: BTreeMap<String, Vec<ConflictStage>>,
     },
 }
 
 /// 交付用：不换任何路径。
 pub fn no_superseded(_: &ReplayCommit) -> BTreeSet<String> {
     BTreeSet::new()
+}
+
+/// 不给任何冲突指定结果：冲突就是冲突。
+pub fn no_resolved(_: &ReplayCommit) -> BTreeMap<String, Resolution> {
+    BTreeMap::new()
 }
 
 /// `base..head`，从旧到新（`--topo-order --reverse`；区间里有 merge 也照列）。
@@ -174,6 +207,9 @@ pub fn replay_onto(
     let mut map = BTreeMap::new();
     let mut dropped = Vec::new();
     let mut rewritten = Vec::new();
+    let mut resolved_paths = Vec::new();
+    // 用过指定结果之后，这条链上的重放结果只属于这一次调用：不查也不写 memo（[`ReplayOpts::resolved`]）
+    let mut private = false;
 
     for c in commits {
         let parent = single_parent(c, codes)?;
@@ -190,7 +226,7 @@ pub fn replay_onto(
             ));
         }
 
-        if let Some(prev) = memo.get(&c.oid).cloned() {
+        if let Some(prev) = memo.get(&c.oid).filter(|_| !private).cloned() {
             // 新 commit 不可能等于它自己的父提交，所以 prev == cur ⇔ 上次是丢弃
             if prev == cur {
                 dropped.push(c.oid.clone());
@@ -221,12 +257,38 @@ pub fn replay_onto(
         };
         let tree = match merge(repo, &cur, parent, &theirs, c, codes)? {
             Merged::Clean(t) => t,
-            Merged::Conflict { files, tree } => {
-                return Ok(ReplayOutcome::Conflict {
-                    at: c.oid.clone(),
-                    files,
-                    tree,
-                })
+            Merged::Conflict {
+                files,
+                tree,
+                mut stages,
+            } => {
+                let given = (opts.resolved)(c);
+                let open: Vec<String> = files
+                    .iter()
+                    .filter(|f| !given.contains_key(*f))
+                    .cloned()
+                    .collect();
+                // 没有一条 stage 行的冲突（目录被拆到两处之类，独立 review 高危 1）没有可替换的文件，
+                // 照旧是冲突：空的 `open` 不等于「都解决了」
+                if files.is_empty() || !open.is_empty() {
+                    stages.retain(|p, _| open.contains(p));
+                    return Ok(ReplayOutcome::Conflict {
+                        at: c.oid.clone(),
+                        files: open,
+                        tree,
+                        stages,
+                    });
+                }
+                let edits: Vec<(String, Option<(String, String)>)> = files
+                    .iter()
+                    .map(|f| {
+                        let r = &given[f];
+                        (f.clone(), Some((r.mode.clone(), r.blob.clone())))
+                    })
+                    .collect();
+                private = true;
+                resolved_paths.push((c.oid.clone(), files));
+                edit_tree(repo, &tree, &edits, codes)?
             }
         };
         if opts.drop_empty {
@@ -239,20 +301,25 @@ pub fn replay_onto(
             if became_empty {
                 dropped.push(c.oid.clone());
                 map.insert(c.oid.clone(), cur.clone());
-                memo.insert(c.oid.clone(), cur.clone());
+                if !private {
+                    memo.insert(c.oid.clone(), cur.clone());
+                }
                 continue;
             }
         }
         cur = commit_like(repo, &tree, &cur, &c.oid)?;
         cur_tree = Some(tree);
         map.insert(c.oid.clone(), cur.clone());
-        memo.insert(c.oid.clone(), cur.clone());
+        if !private {
+            memo.insert(c.oid.clone(), cur.clone());
+        }
     }
     Ok(ReplayOutcome::Done {
         tip: cur,
         map,
         dropped,
         rewritten,
+        resolved: resolved_paths,
     })
 }
 
@@ -489,18 +556,34 @@ fn c_prime_tree(
     swaps: &[Swap],
     codes: &ReplayCodes,
 ) -> Result<String> {
+    let edits: Vec<(String, Option<(String, String)>)> = swaps
+        .iter()
+        .map(|s| (s.path.clone(), s.entry.clone()))
+        .collect();
+    edit_tree(repo, &c.oid, &edits, codes)
+}
+
+/// `treeish` 的树把 `edits` 里的条目换掉（`None` 是删掉）之后的树：临时索引读入、
+/// `update-index --index-info`、`write-tree`。只放文件路径（W19）。
+fn edit_tree(
+    repo: &str,
+    treeish: &str,
+    edits: &[(String, Option<(String, String)>)],
+    codes: &ReplayCodes,
+) -> Result<String> {
     let idx = TempIndex::empty(repo)?;
     let abs = idx
         .abs_path()
         .map_err(|e| GitError::new(codes.failed, e.message))?;
     let env = [("GIT_INDEX_FILE", abs.as_str())];
-    run_git_env(repo, &["read-tree", &c.oid], &env)?;
-    let zero = "0".repeat(c.oid.len());
+    run_git_env(repo, &["read-tree", treeish], &env)?;
+    // 两个调用方给的都是完整 OID（commit 或 tree），长度跟着对象格式走
+    let zero = "0".repeat(treeish.len());
     let mut input = Vec::new();
-    for s in swaps {
-        let line = match &s.entry {
-            Some((mode, oid)) => format!("{mode} {oid}\t{}", s.path),
-            None => format!("0 {zero}\t{}", s.path),
+    for (path, entry) in edits {
+        let line = match entry {
+            Some((mode, oid)) => format!("{mode} {oid}\t{path}"),
+            None => format!("0 {zero}\t{path}"),
         };
         input.extend_from_slice(line.as_bytes());
         input.push(0);
@@ -514,7 +597,11 @@ fn c_prime_tree(
 
 enum Merged {
     Clean(String),
-    Conflict { files: Vec<String>, tree: String },
+    Conflict {
+        files: Vec<String>,
+        tree: String,
+        stages: BTreeMap<String, Vec<ConflictStage>>,
+    },
 }
 
 fn merge(
@@ -540,6 +627,7 @@ fn merge(
         1 => Ok(Merged::Conflict {
             files: conflict_files(&out),
             tree: out.split('\0').next().unwrap_or("").trim().to_string(),
+            stages: conflict_stages(&out),
         }),
         // 129 = 用法错误：多半是 git 太旧，不认识 --merge-base
         129 => Err(GitError::new(codes.too_old, codes.too_old_message)),
@@ -566,6 +654,35 @@ fn conflict_files(out: &str) -> Vec<String> {
     files.sort();
     files.dedup();
     files
+}
+
+/// 同 [`conflict_files`] 的 stage 行，按路径收拢成条目。读不懂的行跳过：它只给「能不能用磁盘
+/// 内容」做判断，缺条目时那边按「不是文本内容冲突」处理，方向是安全的。
+fn conflict_stages(out: &str) -> BTreeMap<String, Vec<ConflictStage>> {
+    let mut map: BTreeMap<String, Vec<ConflictStage>> = BTreeMap::new();
+    for line in out.split('\0').skip(1).take_while(|l| !l.is_empty()) {
+        let Some((meta, path)) = line.split_once('\t') else {
+            continue;
+        };
+        let mut m = meta.split(' ');
+        let (Some(mode), Some(oid), Some(stage)) = (m.next(), m.next(), m.next()) else {
+            continue;
+        };
+        let Ok(stage) = stage.parse::<u8>() else {
+            continue;
+        };
+        map.entry(path.to_string())
+            .or_default()
+            .push(ConflictStage {
+                stage,
+                mode: mode.to_string(),
+                oid: oid.to_string(),
+            });
+    }
+    for v in map.values_mut() {
+        v.sort_by_key(|s| s.stage);
+    }
+    map
 }
 
 /// C 里 `paths` 的条目换回 C^ 的之后的树（[`commit_without`] 的树，不建 commit）。`paths` 里 C 没改过的

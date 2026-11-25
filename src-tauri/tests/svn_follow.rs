@@ -1391,7 +1391,12 @@ fn follow_conflict_publishes_only_baseline() {
             stale_disk,
             snapshot,
             details,
+            base,
+            disk_ready,
         } => {
+            assert_eq!(base, oid(&fx, "svn/base"));
+            // 磁盘上就是 SVN 的新版本（TortoiseSVN 提交的那一份）：第一版不给磁盘按钮（设计 2026-11-25 §10）
+            assert!(!disk_ready, "{details:?}");
             assert!(acknowledged_leaks.is_empty());
             assert!(snapshot.is_empty(), "没有快照内容：{snapshot:?}");
             assert_eq!(details.len(), files.len(), "每个冲突文件一条上下文");

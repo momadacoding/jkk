@@ -1580,6 +1580,83 @@ body {
   outline-offset: 2px;
 }
 
+/* 跟进冲突框（设计 2026-11-25-follow-resolve-with-disk §5）：一个文件一块，路径、谁改的、能不能用磁盘、对比 */
+.conflict-files {
+  margin-left: 54px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.conflict-files li.conflict-file {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 3px;
+  padding: 6px 10px;
+  border-left: 2px solid #444;
+}
+
+.conflict-origin {
+  color: #9aa0a6;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.conflict-disk {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.conflict-disk.ok {
+  color: #81c784;
+}
+
+.conflict-disk.bad {
+  color: #e0a9a9;
+}
+
+.conflict-compare {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  margin-top: 2px;
+}
+
+.conflict-sides {
+  color: #8a8a8a;
+  font-size: 11px;
+}
+
+/* 没配对比工具时的退路：等宽、保留换行，长行横向滚动而不是撑宽整个框 */
+.conflict-preview {
+  margin: 2px 0 0;
+  padding: 6px 8px;
+  max-height: 180px;
+  overflow: auto;
+  background: #232323;
+  border-radius: 2px;
+  color: #ccc;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 11px;
+  white-space: pre;
+}
+
+.conflict-action,
+.conflict-note {
+  margin-left: 54px;
+  color: #cfcfcf;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.conflict-note {
+  color: #9aa0a6;
+  font-size: 12px;
+}
+
 .follow-more:focus-visible {
   outline: 2px solid #4fc3f7;
   outline-offset: 2px;
