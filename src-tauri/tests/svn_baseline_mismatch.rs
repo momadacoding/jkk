@@ -191,6 +191,20 @@ fn a_file_with_only_a_property_change_is_not_reported() {
 }
 
 #[test]
+fn a_candidate_that_svn_does_not_know_does_not_fail_the_query() {
+    // 复核 review 的建议：一批候选在 SVN 侧都没有 revision（这里是 `svn rm --keep-local` 提交后
+    // 磁盘上留下的 unversioned 文件）时，节点解析的守卫会报 `svn_xml_empty_node_revs`，整次查询
+    // 失败、横幅静默不出。它只是「这批没有命中」
+    let fx = hybrid_with_colleague();
+    let wc = fx.wc();
+    svn_cmd(&wc, &["rm", "--keep-local", "Code/A.cs"]);
+    svn_cmd(&wc, &["commit", "-m", "drop A", "--non-interactive"]);
+    std::fs::write(wc.join("Code/A.cs"), "a1 edited\n").unwrap();
+
+    assert_eq!(mismatch(&wc).files, Vec::<String>::new());
+}
+
+#[test]
 fn refuses_a_directory_that_was_never_initialized() {
     let fx = svn_repo();
     let err = find_baseline_mismatch(&fx.wc_str()).unwrap_err();

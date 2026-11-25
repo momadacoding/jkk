@@ -24,6 +24,11 @@
 | 6. 缺 props 改过、copied、external、截断、`@` 路径的用例 | 建议 | 补了 props 改过的 fixture 用例；其余未补，copied 与 external 的过滤与 `svn_dirty::read_dirty` 同一写法 |
 | 7. 菜单开着时置灰状态不刷新 | 建议 | 未改，影响很小 |
 
+复核（同一个 review agent，只读看 b01d8b9）：无阻断。两条建议：
+
+- 一批候选在 SVN 侧都没有 revision（unversioned / added）时，`parse_node_status` 为全量扫描设的守卫报 `svn_xml_empty_node_revs`，整次查询失败、横幅静默不出。**已修**：这两个错误码按「这批没有命中」处理；先写用例 `a_candidate_that_svn_does_not_know_does_not_fail_the_query` 复现到这个错误码，再改。
+- ack 的键只取横幅上的前 50 个文件，只对它们和 `unverified` 求交集。未改：超过 50 个命中时体检本来就会报 `lying`，不会走到记 ack。
+
 ### 真实窗口验收（2026-11-25，`pnpm tauri dev --config` 隔离 identifier，scratchpad 临时 fixture）
 
 `app.exe` 路径核对为本 worktree 的 `src-tauri\target\debug\app.exe`。

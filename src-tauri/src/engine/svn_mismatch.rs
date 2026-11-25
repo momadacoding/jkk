@@ -154,7 +154,23 @@ pub fn find_baseline_mismatch(repo_root: &str) -> Result<BaselineMismatch> {
         // 现跑，不读扫描缓存、不进缓存（模块头「为什么 svn status 必须现跑」）。这条命令本来
         // 只在自己的 Tauri 线程上跑、不在任何缓存范围里，但不靠这个隐含前提
         let xml = run_svn_fresh(repo_root, &args)?;
-        let revs: BTreeMap<String, NodeStatus> = parse_node_status(&xml)?
+        // 节点解析有两道为全量扫描设的守卫：一个带 revision 的节点都没有就报错（防漏了 `-v`）。
+        // 这里的 target 是逐个文件，整批都是 SVN 不认识或刚 add 的文件时同样触发，那只是「这批
+        // 没有命中」：它们本来就不是「SVN 说完全干净」（复核 review 的建议，用例
+        // `a_candidate_that_svn_does_not_know_does_not_fail_the_query`）
+        let nodes = match parse_node_status(&xml) {
+            Ok(nodes) => nodes,
+            Err(e)
+                if matches!(
+                    e.code.as_str(),
+                    "svn_xml_empty_node_revs" | "svn_xml_all_nodes_uncommitted"
+                ) =>
+            {
+                continue
+            }
+            Err(e) => return Err(e),
+        };
+        let revs: BTreeMap<String, NodeStatus> = nodes
             .into_iter()
             .map(|n| (n.path.trim_end_matches('@').to_string(), n))
             .collect();
