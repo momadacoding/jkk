@@ -198,14 +198,40 @@ fn check_sync_uncached(repo_root: &str) -> Result<(SyncStatus, Vec<NodeStatus>)>
     let cfg = read_config(repo_root)?;
     let wcs = enumerate_wcs(repo_root, &cfg.whitelist)?;
     let nodes = read_node_status(repo_root, &cfg.whitelist, &wcs)?;
+    let status = judge_at(repo_root, &oid, &map, &files, &cfg, &nodes)?;
+    Ok((status, nodes))
+}
+
+/// 按调用方读好的节点判定，其余输入（基线、配置、磁盘、HEAD）此刻现读。
+///
+/// 跟进发布之后用（2026-11-24 分析方案 4）：锁内复核（R3c）刚读过节点，跟进又不写 SVN 工作副本，
+/// 再扫一遍 `svn status` 读到的是同一份。与 [`check_sync`] 走同一个判定，结论逐项相同；节点读完之后
+/// 工作副本又变了的，由前端比 wc.db 戳兜住（`svnSync.ts` 的 `runSvnSyncCheck`）。
+pub(crate) fn judge_nodes(repo_root: &str, nodes: &[NodeStatus]) -> Result<SyncStatus> {
+    let oid = baseline_oid(repo_root)?;
+    let map = perf::inproc("sync read base map", || read_base_map(repo_root, &oid))?;
+    let files = perf::inproc("sync baseline tree", || tree_files(repo_root, &oid))?;
+    let cfg = read_config(repo_root)?;
+    judge_at(repo_root, &oid, &map, &files, &cfg, nodes)
+}
+
+/// [`check_sync`] 与 [`judge_nodes`] 共用的判定：基线 `oid` 的映射与文件清单对上这批节点。
+fn judge_at(
+    repo_root: &str,
+    oid: &str,
+    map: &BaseMap,
+    files: &BTreeSet<String>,
+    cfg: &crate::engine::svn_config::SvnConfig,
+    nodes: &[NodeStatus],
+) -> Result<SyncStatus> {
     // 「尊重 .gitignore」的参照就是刚按同一个 OID 读出的基线文件，不再按 ref 名重走一遍基线树
     // （日志 `2026-11-24-follow-perf-pr1-decisions.md` Task 2）
     let scope = perf::inproc("sync w scope", || {
-        Ok::<_, GitError>(WScope::for_repo_with_tracked(repo_root, &cfg, &files))
+        Ok::<_, GitError>(WScope::for_repo_with_tracked(repo_root, cfg, files))
     })?;
 
     let j = perf::inproc("sync judge", || {
-        judge(&map, &files, &nodes, |cands| {
+        judge(map, files, nodes, |cands| {
             added_w_files(repo_root, &scope, cands, |p| p.is_file())
         })
     })?;
@@ -232,18 +258,17 @@ fn check_sync_uncached(repo_root: &str) -> Result<(SyncStatus, Vec<NodeStatus>)>
             removed: j.removed,
         }
     };
-    let fork = behind_fork(repo_root, &oid);
-    let status = SyncStatus {
+    let fork = behind_fork(repo_root, oid);
+    Ok(SyncStatus {
         baseline_rev: map.floor,
         node_revs: j.node_revs.into_iter().collect(),
         verdict,
-        base: BaseMapSummary::of(&map),
+        base: BaseMapSummary::of(map),
         head_behind_base: fork.is_some(),
         behind_paths: fork
-            .map(|f| paths_between(repo_root, &f, &oid))
+            .map(|f| paths_between(repo_root, &f, oid))
             .unwrap_or_default(),
-    };
-    Ok((status, nodes))
+    })
 }
 
 /// 基线发布了、当前分支没跟上：上次跟进冲突，或者切到了一条旧分支（分析 §6.11.3）。返回分支自己的
