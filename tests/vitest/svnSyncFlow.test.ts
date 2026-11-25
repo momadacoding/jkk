@@ -15,7 +15,7 @@ vi.mock('@/store/repoStore', () => ({
 import * as store from '@/store/repoStore'
 import { createSvnSyncFlow, type SvnSyncFlowDeps } from '@/components/svnSyncFlow'
 import type { ConfirmRequest } from '@/components/ConfirmDialog'
-import { autoFollowKey, heldBackScene } from '@/engine/svnFollow'
+import { autoFollowKey, heldBackScene, type SyncAfterFollow } from '@/engine/svnFollow'
 import type { SyncInPreview } from '@/engine/svnSyncIn'
 
 const preview: SyncInPreview = {
@@ -52,6 +52,11 @@ function deps(log: string[], confirm?: (r: ConfirmRequest) => Promise<boolean>):
     },
     refreshSvnSync: async () => {
       log.push('refreshSvnSync')
+    },
+    svnSyncMark: () => 0,
+    applyFollowedSync: () => {
+      log.push('applyFollowedSync')
+      return true
     },
     fetchSvnLog: async () => {
       log.push('fetchSvnLog')
@@ -111,6 +116,19 @@ const report = {
   behindBranches: [],
   leaks: [],
   pinnedRef: null,
+}
+
+/** 跟进带回的发布之后的判定（后端 `SyncAfterFollow`）。 */
+const carried: SyncAfterFollow = {
+  status: {
+    baselineRev: 2,
+    nodeRevs: [2],
+    verdict: { kind: 'inSync' },
+    base: { floor: 2, newer: 0, gone: 0 },
+    headBehindBase: false,
+    behindPaths: [],
+  },
+  head: { path: 'C:/wc1', head: 'work', headHash: 'd'.repeat(40), headParents: ['b'.repeat(40)] },
 }
 
 const conflict = {
@@ -186,6 +204,78 @@ describe('handleAutoFollow（事故分析 6.12）', () => {
       'autoSkip:null',
       'showAutoFollowed',
     ])
+  })
+
+  it('带回了发布之后的判定：直接写回，跟进之后的刷新不再复查（分析方案 4）', async () => {
+    const log: string[] = []
+    const applied: [SyncAfterFollow, number][] = []
+    // 号在命令发起之前取：命令跑的这几秒里写回的检测要能被认出来
+    let writes = 3
+    const d: SvnSyncFlowDeps = {
+      ...deps(log),
+      svnSyncMark: () => writes,
+      applyFollowedSync: (path, sync, since) => {
+        log.push(`applyFollowedSync:${path}`)
+        applied.push([sync, since])
+        return true
+      },
+    }
+    vi.mocked(store.svnFollowAuto).mockImplementation(async () => {
+      writes = 4
+      return { kind: 'done', report, sync: carried }
+    })
+
+    expect(createSvnSyncFlow(d).handleAutoFollow('k1')).toBe(true)
+    await vi.waitFor(() => expect(log).toContain('showAutoFollowed'))
+
+    expect(applied).toEqual([[carried, 3]])
+    expect(log).toEqual([
+      'mergeRiskForAuto',
+      'following:true',
+      // 写回在刷新之前、命令返回的同一拍里：赶在补发的 repo-changed 读到新 HEAD 之前记下它
+      'applyFollowedSync:C:/wc1',
+      'refreshAfterFollow',
+      'refreshSvnSyncState',
+      'fetchSvnLog',
+      'following:false',
+      'autoSkip:null',
+      'showAutoFollowed',
+    ])
+  })
+
+  it('暂时性原因重试过：号按成功的那一次命令发起前取', async () => {
+    const since: number[] = []
+    let writes = 1
+    const d: SvnSyncFlowDeps = {
+      ...deps([]),
+      svnSyncMark: () => writes,
+      applyFollowedSync: (_path, _sync, s) => {
+        since.push(s)
+        return true
+      },
+      wait: async () => {
+        writes = 2
+      },
+    }
+    vi.mocked(store.svnFollowAuto)
+      .mockResolvedValueOnce({ kind: 'skipped', code: 'svn_index_busy', message: '锁着' })
+      .mockResolvedValueOnce({ kind: 'done', report, sync: carried })
+
+    expect(createSvnSyncFlow(d).handleAutoFollow('k1')).toBe(true)
+    await vi.waitFor(() => expect(since).toHaveLength(1))
+
+    expect(since).toEqual([2])
+  })
+
+  it('带回的判定写不回去（仓库已切走、期间有检测写回过……）：照原来复查', async () => {
+    const log: string[] = []
+    const d: SvnSyncFlowDeps = { ...deps(log), applyFollowedSync: () => false }
+    vi.mocked(store.svnFollowAuto).mockResolvedValue({ kind: 'done', report, sync: carried })
+
+    expect(createSvnSyncFlow(d).handleAutoFollow('k1')).toBe(true)
+    await vi.waitFor(() => expect(log).toContain('showAutoFollowed'))
+
+    expect(log).toContain('refreshSvnSync')
   })
 
   it('完成的提示带上这次命令的用时；重试过的话只算成功的那一次', async () => {
@@ -844,6 +934,41 @@ describe('handleFollow', () => {
       'fetchSvnLog',
       'following:false',
     ])
+  })
+
+  it('带回了发布之后的判定：写回之后不再复查，报告照样先弹', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnFollow).mockResolvedValue({ kind: 'done', report, sync: carried })
+
+    await createSvnSyncFlow(deps(log)).handleFollow()
+
+    expect(log).toEqual([
+      'clearError',
+      'guardMerge',
+      'following:true',
+      'applyFollowedSync',
+      'refreshAfterFollow',
+      'refreshSvnSyncState',
+      'showFollowReport',
+      'fetchSvnLog',
+      'following:false',
+    ])
+  })
+
+  it('冲突也带回判定（基线发布了、分支落后）：手动跟进的确认框弹出前不再复查', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnFollow).mockResolvedValue({ ...conflict, sync: carried })
+
+    await createSvnSyncFlow(deps(log, async (r) => {
+      log.push(`confirm:${r.title}`)
+      return false
+    })).handleFollow()
+
+    expect(log).toContain('applyFollowedSync')
+    expect(log).not.toContain('refreshSvnSync')
+    expect(log.indexOf('applyFollowedSync')).toBeLessThan(
+      log.findIndex((l) => l.startsWith('confirm:')),
+    )
   })
 
   it('报告不等刷新（2026-11-11 使用报告 10.5）：刷新还在跑，报告已经弹出来；刷新完按钮才复位', async () => {

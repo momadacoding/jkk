@@ -183,7 +183,7 @@ export function RepoTab({
   const {
     state, openRepo, refreshHead, refreshHeadInfo, refreshGraph, refreshStatus, refreshWorktrees, refreshMergeDrivers,
     refreshDiff, refreshUpstream, refreshStashes, refreshPullRequests,
-    refreshSvnSync, refreshSvnEol, refreshSvnSyncState, refreshSvnBranchesBehind, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, noteOwnCommit, checkSvnSyncOnFocus, freshSvnSync, markSvnFollowOnBlur, fetchSvnLog, refreshSvnAudit, auditSvnIfDue, noteRepoChanged,
+    refreshSvnSync, svnSyncMark, applyFollowedSync, refreshSvnEol, refreshSvnSyncState, refreshSvnBranchesBehind, checkSvnSyncIfChanged, checkSvnSyncIfHeadMoved, noteOwnCommit, checkSvnSyncOnFocus, freshSvnSync, markSvnFollowOnBlur, fetchSvnLog, refreshSvnAudit, auditSvnIfDue, noteRepoChanged,
     selectCommit, clearError, reportError, wantedDiffScope, refreshChanges: refreshChangesIn, afterIndexWrite,
   } = useRepoStore()
   const [repoState, setRepoState] = useState<string>('normal')
@@ -1111,6 +1111,8 @@ export function RepoTab({
     reportError,
     refreshSvnSyncState,
     refreshSvnSync,
+    svnSyncMark,
+    applyFollowedSync,
     fetchSvnLog,
     setFollowing,
     setSyncActionBusy,
@@ -1141,8 +1143,9 @@ export function RepoTab({
       }
     },
     autoTried,
-    // 都现读：流程跑了几秒，闭包里的 state 还是发起时的。跟进后的强制校验刚记过 wc.db 戳，
-    // `freshSvnSync` 这里只是比一次戳、从 ref 取最新的结论
+    // 都现读：流程跑了几秒，闭包里的 state 还是发起时的。`freshSvnSync` 比一次 wc.db 戳、从 ref 取最新的
+    // 结论。跟进带回了判定（`applyFollowedSync`）时没有新记戳，比的是跟进前那次检测的戳：跟进期间 wc.db
+    // 变过（TortoiseSVN 又提交了、changelist 补挂）就会跑一遍全量检测，没变就是带回的那份结论
     sceneAfterFollow: async () => ({
       head: await refreshHead(repoPath),
       sync: await freshSvnSync(repoPath),

@@ -525,6 +525,38 @@ export function sameHeadForSync(a: HeadObservation, b: HeadObservation): boolean
   return a.hash === b.hash && headKind(a.branch) === headKind(b.branch)
 }
 
+/** {@link canApplyFollowedSync} 要看的现场，都是 `repoStore` 此刻的 ref。 */
+export interface FollowedSyncScene {
+  /** 跟进命令发起之后，有没有哪一轮检测把结论写回了界面。 */
+  writtenSinceFollow: boolean
+  /** wc.db 戳记过没有（`lastWcDbStamps` 不是 `null`）。 */
+  stampsKnown: boolean
+  /** 正在替哪个 HEAD 跑强制校验（`headRequested`）。 */
+  pending: HeadObservation | null
+}
+
+/**
+ * 跟进带回的判定（`SyncAfterFollow`，2026-11-24 分析方案 4）能不能直接写回、把带回的 HEAD 记成「上次校验的
+ * HEAD」。不能就照原来跑一轮第二档（`refreshSvnSync`），只是少省一次。
+ *
+ * 带回的判定按锁内复核（R3c）读的节点算，那之后工作副本还可能变。写回要顶掉别的检测（领 `svnSync` 闸的号），
+ * 所以下面三种情形都不写（独立 review 第 1–3 条）：
+ *
+ * - 命令发起之后已经有一轮检测写回了：它读节点可能晚于 R3c，还记下了那一刻的戳。盖上去的话横幅退回旧结论，
+ *   之后比戳又判没变，一直不纠正。
+ * - 戳还没记过：写回之后不会有人补记，失焦快照在戳是 `null` 时不比戳（`markOnBlur`），会把快照写在一个
+ *   没核对过的 InSync 上。
+ * - 有一轮替**别的** HEAD 排着：写回会把它顶掉、它的事件已经用掉，没人再替那个 HEAD 校验。替同一个 HEAD
+ *   排着的那轮被顶掉也无妨：结论与带回的相同，HEAD 由这里记。
+ *
+ * 带回的 HEAD 是后端判定之前读的，按 `recordAfterSuccess` 的规矩可以记。不记的话，后端跟进后补发的
+ * `repo-changed` 读到新 HEAD 会强制再跑一轮，省下的那遍 `svn status` 只是挪到了后台。
+ */
+export function canApplyFollowedSync(scene: FollowedSyncScene, carried: HeadObservation): boolean {
+  if (scene.writtenSinceFollow || !scene.stampsKnown) return false
+  return !scene.pending || sameHeadForSync(scene.pending, carried)
+}
+
 /**
  * `next` 是不是叠在 `base` 上的一个普通提交：同一条非基线分支、只有一个父提交、就是 `base`。
  *

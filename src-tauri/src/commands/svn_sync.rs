@@ -13,7 +13,8 @@ use crate::commands::watch::WatchSuspension;
 use crate::desktop::DesktopState;
 use crate::engine::svn_changelist;
 use crate::engine::svn_follow::{
-    follow, follow_auto, manual_follow, resume_follow, AutoFollowOutcome, FollowOutcome,
+    follow_auto_with_sync, follow_with_sync, manual_follow, resume_follow, AutoFollowOutcome,
+    FollowOutcome, Followed,
 };
 use crate::engine::svn_local_only_edit::{
     local_only_files, set_local_only, split_local_only, EditOutcome,
@@ -152,27 +153,37 @@ pub fn svn_dismiss_pending_restores(path: String, paths: Vec<String>) -> Result<
 /// 跟进外部提交（分析 §6.5）：录新基线、对象层重放分支、发布。不发 SVN 写命令；发布完成后
 /// 只把「我最后提交的」文件的 Local-Only 补丁放回磁盘（计划 2026-11-12-auto-restore-local-only），
 /// 自动跟进同样如此。
+///
+/// 基线发布了时带回发布之后的判定（`sync`，2026-11-24 分析方案 4），前端据此写回横幅，不再调
+/// `svn_sync_status`。
 #[tauri::command(async)]
-pub fn svn_follow(handle: AppHandle, path: String) -> Result<FollowOutcome, GitError> {
-    with_watch_suspended(&handle, &path, || follow(&path, &new_opid()))
+pub fn svn_follow(handle: AppHandle, path: String) -> Result<Followed<FollowOutcome>, GitError> {
+    with_watch_suspended(&handle, &path, || {
+        follow_with_sync(&path, &new_opid()).map(Followed::from)
+    })
 }
 
 /// 自动跟进（事故分析 6.12）：判定写回 ExternallyAdvanced 之后由前端发起。条件全部满足才发布，
-/// 否则 `Skipped`、一个 ref 都不动。设置里关掉时直接 `Skipped`，不读工作副本。
+/// 否则 `Skipped`、一个 ref 都不动。设置里关掉时直接 `Skipped`，不读工作副本。完成时带回判定，同上。
 #[tauri::command(async)]
 pub fn svn_follow_auto(
     handle: AppHandle,
     state: State<'_, DesktopState>,
     path: String,
-) -> Result<AutoFollowOutcome, GitError> {
+) -> Result<Followed<AutoFollowOutcome>, GitError> {
     if !state.svn_auto_follow() {
-        return Ok(AutoFollowOutcome::Skipped {
-            code: AUTO_FOLLOW_OFF.to_string(),
-            message: "设置里关掉了自动跟进。".to_string(),
-            conflict: None,
+        return Ok(Followed {
+            outcome: AutoFollowOutcome::Skipped {
+                code: AUTO_FOLLOW_OFF.to_string(),
+                message: "设置里关掉了自动跟进。".to_string(),
+                conflict: None,
+            },
+            sync: None,
         });
     }
-    with_watch_suspended(&handle, &path, || follow_auto(&path, &new_opid()))
+    with_watch_suspended(&handle, &path, || {
+        follow_auto_with_sync(&path, &new_opid()).map(Followed::from)
+    })
 }
 
 /// 自动跟进关着。前端认这个 code：不挂原因，横幅照旧。

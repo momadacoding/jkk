@@ -32,6 +32,7 @@ import {
   type FollowActionId,
   type FollowOutcome,
   type FollowReport,
+  type SyncAfterFollow,
 } from '../engine/svnFollow'
 import {
   continueNeedsConfirm,
@@ -77,6 +78,17 @@ export interface SvnSyncFlowDeps {
    * `repo-changed` 共用一轮（`repoStore` 的 `refreshSvnSync`）。
    */
   refreshSvnSync: (path: string) => Promise<void>
+  /**
+   * 跟进命令发起前取一次号（`repoStore` 的 `svnSyncMark`），写回带回的判定时交回去：期间有检测写回过就不用
+   * 带回的那份。
+   */
+  svnSyncMark: () => number
+  /**
+   * 跟进带回的判定直接写回（`repoStore` 的 `applyFollowedSync`）。返回 `true` 时跟进之后的刷新不再调
+   * `refreshSvnSync`（2026-11-24 分析方案 4）；`false`（仓库已切走、期间有检测写回过、戳没记过、别的 HEAD
+   * 在排队，见 `canApplyFollowedSync`）照原来复查。
+   */
+  applyFollowedSync: (path: string, sync: SyncAfterFollow, since: number) => boolean
   fetchSvnLog: (path: string) => Promise<unknown>
   /**
    * 跟进执行中，含跟进之后的刷新。横幅上的按钮据此禁用：跟进要走服务器体检，这几秒里没有框挡着；
@@ -168,10 +180,16 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
    *
    * 几项同时发（2026-11-11 使用报告 10.5）：原来一项等一项，公司机器上报告要等它们加起来那么久。
    * 它们写的是 state 里互不相干的字段，后端补发的 `repo-changed` 本来也是同时发的。
+   *
+   * 命令带回了发布之后的判定（`sync`）就直接写回，不再复查：省掉的是一遍全量 `svn status` 加判定，刷新里
+   * 最长的那一项（2026-11-24 分析方案 4）。写回与原来的复查一样在命令返回的这一拍里做，赶在补发的
+   * `repo-changed` 读到新 HEAD 之前把它记下。`since` 是命令发起前取的号（`svnSyncMark`）。
    */
-  const afterFollow = () =>
+  const afterFollow = (sync?: SyncAfterFollow, since?: number) =>
     perfSpan('follow.refresh', async () => {
-      const [git] = await Promise.allSettled([d.refreshAfterFollow(), afterSync()])
+      const checked =
+        sync && since !== undefined ? d.applyFollowedSync(d.repoPath, sync, since) : false
+      const [git] = await Promise.allSettled([d.refreshAfterFollow(), afterSync(checked)])
       if (git.status === 'rejected') d.reportError(git.reason)
       // 不 await：不拖住「跟进中」和完成提示，只是错开磁盘
       d.refreshHooksHealth()
@@ -330,10 +348,11 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
     }
     try {
       await perfSpan('follow', async () => {
+        const since = d.svnSyncMark()
         const run = await timed(() => svnFollow(d.repoPath))
         box.outcome = run.value
         // 先发刷新再弹报告，中间不 await：复查要赶在命令返回的这一拍里进去
-        const refreshed = afterFollow()
+        const refreshed = afterFollow(run.value.sync, since)
         if (run.value.kind === 'done') {
           perfMark('follow.report')
           box.reportClosed = d.showFollowReport({ ...run.value.report, elapsedMs: run.ms }, refreshed)
@@ -376,16 +395,18 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
     let outcome: AutoFollowOutcome
     try {
       outcome = await perfSpan('autoFollow', async () => {
+        let since = d.svnSyncMark()
         let run = await timed(() => svnFollowAuto(d.repoPath))
         // 暂时性的原因（外部 git 刚好拿着索引锁、另一次同步刚好在跑）：同一个现场只试一次，不重试的话
         // 就再也不自动了（review 中-1）。等一下再试一次，还不行才写进横幅
         if (run.value.kind === 'skipped' && TRANSIENT_SKIPS.has(run.value.code)) {
           await d.wait(TRANSIENT_RETRY_MS)
+          since = d.svnSyncMark()
           run = await timed(() => svnFollowAuto(d.repoPath))
         }
         if (run.value.kind !== 'done') return run.value
         // 提示照旧等刷新完再挂：它不挡操作，早挂出来反而会和还没撤的「有新内容」横幅叠在一起
-        await afterFollow()
+        await afterFollow(run.value.sync, since)
         return { ...run.value, report: { ...run.value.report, elapsedMs: run.ms } }
       })
     } catch (err) {

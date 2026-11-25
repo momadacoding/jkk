@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { isPlainCommitOn, sameHeadForSync, type HeadObservation } from '@/engine/svnSync'
+import {
+  canApplyFollowedSync,
+  isPlainCommitOn,
+  sameHeadForSync,
+  type HeadObservation,
+} from '@/engine/svnSync'
 
 // 第二档里只有 `behind_fork` 看 HEAD：处境（游离 / 基线分支 / 其余分支）+ merge-base(HEAD, svn/base)。
 // 2026-11-11 提交慢排查 H1。
@@ -62,5 +67,31 @@ describe('isPlainCommitOn', () => {
 
   it('根提交（没有父提交）：不是', () => {
     expect(isPlainCommitOn(atP, { branch: 'work', hash: N, parents: [] })).toBe(false)
+  })
+})
+
+describe('canApplyFollowedSync（跟进带回判定，2026-11-24 分析方案 4）', () => {
+  const atN: HeadObservation = { branch: 'work', hash: N, parents: [P] }
+  const quiet = { writtenSinceFollow: false, stampsKnown: true, pending: null }
+
+  it('跟进期间没人写回、戳记过、没有排着的校验：写回，记带回的 HEAD', () => {
+    expect(canApplyFollowedSync(quiet, atN)).toBe(true)
+  })
+
+  it('排着的就是同一个 HEAD：写回（那一轮被顶掉也无妨，结论相同）', () => {
+    expect(canApplyFollowedSync({ ...quiet, pending: { ...atN, branch: 'feature' } }, atN)).toBe(true)
+  })
+
+  it('排着的是别的 HEAD：不写，写了会把那一轮顶掉、没人再替它校验', () => {
+    expect(canApplyFollowedSync({ ...quiet, pending: atP }, atN)).toBe(false)
+    expect(canApplyFollowedSync({ ...quiet, pending: { ...atN, branch: 'HEAD' } }, atN)).toBe(false)
+  })
+
+  it('跟进期间已有检测写回：不写，那一轮可能晚于锁内复核、还记下了那一刻的戳', () => {
+    expect(canApplyFollowedSync({ ...quiet, writtenSinceFollow: true }, atN)).toBe(false)
+  })
+
+  it('戳还没记过：不写，否则之后没人补记、失焦快照不比戳', () => {
+    expect(canApplyFollowedSync({ ...quiet, stampsKnown: false }, atN)).toBe(false)
   })
 })
