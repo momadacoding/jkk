@@ -57,7 +57,9 @@ pub fn read_node_status(
         .map(|t| peg_safe(t))
         .collect();
     for xml in run_svn_targets(repo, STATUS_SCAN, &args)? {
-        for n in parse_node_status(&xml)? {
+        // 解析大输出的耗时在性能记录里单列：扫描缓存命中时子进程不再出现，剩下的就是它
+        let parsed = crate::engine::perf::inproc("svn status parse", || parse_node_status(&xml))?;
+        for n in parsed {
             // `STATUS_SCAN` 比这里原来的命令多一个 `--no-ignore`（脏条目清点要它），多出来的只有
             // `item="ignored"` 的条目。丢掉它们，节点表与原来逐条相同：留着的话，只含被忽略文件的
             // 目录会被 `dir_revs` 认成目录、参与 floor，映射就和以前算的不是同一个了

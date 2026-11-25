@@ -161,6 +161,33 @@ pub fn current_file() -> Option<&'static Path> {
     LOG.get().map(PerfLog::path)
 }
 
+/// 进程内的一段工作记一条 `kind = "inproc"`，与子进程并列，看得出两条子进程之间的空档花在哪
+/// （日志 `2026-11-24-follow-perf-pr1-decisions.md` Task 1）。关闭时只多一次 [`enabled`]。
+/// `ok` 只在结果是 `Err` 时为假，见 [`InprocOk`]。
+pub fn inproc<T: InprocOk>(name: &str, f: impl FnOnce() -> T) -> T {
+    let Some(ts) = enabled().then(now_ms) else {
+        return f();
+    };
+    let out = f();
+    let mut rec = Record::rust("inproc", name);
+    rec.ts = ts;
+    rec.dur = now_ms() - ts;
+    rec.ok = out.inproc_ok();
+    record(&rec);
+    out
+}
+
+/// [`inproc`] 的结果算不算成功。
+pub trait InprocOk {
+    fn inproc_ok(&self) -> bool;
+}
+
+impl<T, E> InprocOk for std::result::Result<T, E> {
+    fn inproc_ok(&self) -> bool {
+        self.is_ok()
+    }
+}
+
 /// 写一条记录；关闭时什么都不做。
 pub fn record(rec: &Record) {
     if let Some(log) = LOG.get() {

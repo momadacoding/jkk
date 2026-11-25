@@ -913,6 +913,51 @@ struct LocalFloor {
     dirs: BTreeSet<String>,
     /// 每个单元根在 wc.db 里的最后修改 revision，与服务器上 `<url>@F` 的核对（[`check_probes`]）。
     root_changed: BTreeMap<String, u64>,
+    /// 改回问服务器的单元，按原因计数，写进性能记录（2026-11-24 分析方案 5）。原因不带路径：
+    /// 性能记录按设计不记路径（`perf` 的 D5），反引号里的部分一律换成 `…`（[`path_free`]）。
+    server_reasons: BTreeMap<String, usize>,
+}
+
+/// 原因里反引号括起来的部分（路径、URL）换成 `` `…` ``，`r` 后面的数字换成 `r…`（同一类原因只差
+/// revision 时要计到一起），其余照留。
+///
+/// 只用于**我们自己拼的**原因（路径一律放在反引号里）。夹着外部报错原文的（svn、SQLite 的报错可能在
+/// 反引号外再带一遍路径或服务器地址）调用方要先换成固定的说法，见 [`wcdb_reason`]、`check_probes`。
+fn path_free(why: &str) -> String {
+    let mut out = String::new();
+    let mut inside = false;
+    let mut chars = why.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '`' {
+            if !inside {
+                out.push_str("`…`");
+            }
+            inside = !inside;
+            continue;
+        }
+        if inside {
+            continue;
+        }
+        if ch == 'r' && chars.peek().is_some_and(char::is_ascii_digit) {
+            out.push_str("r…");
+            while chars.peek().is_some_and(char::is_ascii_digit) {
+                chars.next();
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out.chars().take(200).collect()
+}
+
+/// wc.db 读不成时的原因。打开、查询失败带着 SQLite 的报错原文（rusqlite 打不开时会在后面再附一遍
+/// 文件路径），换成固定的说法；格式、未完成的操作这几种是我们自己的话，照留。
+fn wcdb_reason(why: &str) -> &str {
+    if why.contains("打不开") || why.contains("查询 wc.db 失败") {
+        "wc.db 认不出：打不开或查询失败"
+    } else {
+        why
+    }
 }
 
 /// 判出哪些单元能用本地 floor。读不了 wc.db、筛不了 W-file 时一律照旧跑 diff，只记日志：
@@ -922,7 +967,10 @@ fn local_floor(repo_root: &str, units: &[WcIdentity], map: &BaseMap, scope: &WSc
         Ok(s) => s,
         Err(why) => {
             log::info!("体检照旧向服务器比对 floor：{why}");
-            return LocalFloor::default();
+            let mut out = LocalFloor::default();
+            out.server_reasons
+                .insert(path_free(wcdb_reason(&why)), units.len());
+            return out;
         }
     };
     let mut out = LocalFloor::default();
@@ -935,6 +983,7 @@ fn local_floor(repo_root: &str, units: &[WcIdentity], map: &BaseMap, scope: &WSc
             } => (dirs, stale, root_changed),
             crate::engine::svn_wcdb::FloorShape::Irregular(why) => {
                 log::info!("体检 `{wc_root}` 照旧向服务器比对 floor：{why}");
+                out.note(wcdb_reason(&why));
                 continue;
             }
         };
@@ -954,10 +1003,12 @@ fn local_floor(repo_root: &str, units: &[WcIdentity], map: &BaseMap, scope: &WSc
                         w.len(),
                         map.floor
                     );
+                    out.note("有 W-file 在 F 上的内容可能与工作副本的版本不同（stale）");
                     continue;
                 }
                 Err(e) => {
                     log::info!("体检 `{wc_root}` 照旧向服务器比对 floor：{}", e.message);
+                    out.note("筛不了 stale 里的 W-file");
                     continue;
                 }
             }
@@ -970,10 +1021,16 @@ fn local_floor(repo_root: &str, units: &[WcIdentity], map: &BaseMap, scope: &WSc
 }
 
 impl LocalFloor {
-    /// 这个单元改回 diff。
-    fn drop_unit(&mut self, wc_root: &str) {
-        self.units.remove(wc_root);
+    /// 这个单元改回 diff，原因计一次。
+    fn drop_unit(&mut self, wc_root: &str, why: &str) {
+        if self.units.remove(wc_root) {
+            self.note(why);
+        }
         self.root_changed.remove(wc_root);
+    }
+
+    fn note(&mut self, why: &str) {
+        *self.server_reasons.entry(path_free(why)).or_default() += 1;
     }
 }
 
@@ -1043,7 +1100,8 @@ const LOCAL_PROBE: &[&str] = &["info", "--xml", "--depth", "empty", "--"];
 enum Probed {
     /// 都跑成了。`mismatched`：这些单元 F 上的 URL 不是工作副本里那条历史（或没有），改回 diff。
     Ok {
-        mismatched: Vec<(String, String)>,
+        /// (单元, 给日志的原因, 给性能记录的固定原因)。后者不带路径、URL、revision，才能按类计数。
+        mismatched: Vec<(String, String, &'static str)>,
         /// 至少有一批跑成了：比对已经开始，之后再失败就是「比对开始之后」（`incomplete`）。
         contacted: bool,
     },
@@ -1107,6 +1165,7 @@ fn check_probes(
                     mismatched.push((
                         u.wc_root.clone(),
                         format!("向服务器确认 `{}` 没跑成：{}", u.url, e.message.trim()),
+                        "向服务器确认单元根没跑成",
                     ));
                 }
                 continue;
@@ -1117,7 +1176,11 @@ fn check_probes(
             Ok(r) => r,
             Err(e) => {
                 for u in &batch {
-                    mismatched.push((u.wc_root.clone(), e.message.clone()));
+                    mismatched.push((
+                        u.wc_root.clone(),
+                        e.message.clone(),
+                        "读不懂服务器回的 svn info",
+                    ));
                 }
                 continue;
             }
@@ -1137,6 +1200,7 @@ fn check_probes(
                         server.map_or("（没有）".to_string(), |r| format!("r{r}")),
                         mine.map_or("（没有）".to_string(), |r| format!("r{r}")),
                     ),
+                    "服务器上单元根的最后修改与工作副本不同",
                 ));
             }
         }
@@ -1168,6 +1232,7 @@ fn read_local_floor(
 ) -> Result<LocalFloorRead> {
     let mut found: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     let mut fallback: BTreeSet<String> = BTreeSet::new();
+    fault::hit(Point::LocalFloorStatus)?;
     for args in statuses {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let xml = run_svn_fresh(repo_root, &args)?;
@@ -1367,9 +1432,9 @@ fn check_grouped(
         };
         // status 照探测前的单元跑（参数与预跑的一致），读完再把探测没过的去掉
         let read = read_local_floor(repo_root, &units, &local, &statuses);
-        for (u, why) in &mismatched {
+        for (u, why, kind) in &mismatched {
             log::info!("体检 `{u}` 照旧向服务器比对 floor：{why}");
-            local.drop_unit(u);
+            local.drop_unit(u, kind);
         }
         match read {
             Ok(LocalFloorRead {
@@ -1377,10 +1442,10 @@ fn check_grouped(
                 fallback,
             }) => {
                 for u in &fallback {
-                    local.drop_unit(u);
+                    local.drop_unit(u, "本地 status 里有只有 diff 才认得的形态");
                 }
                 let mismatched: BTreeSet<&str> =
-                    mismatched.iter().map(|(u, _)| u.as_str()).collect();
+                    mismatched.iter().map(|(u, _, _)| u.as_str()).collect();
                 let found: Vec<(String, String)> = found
                     .into_iter()
                     .filter(|(p, _)| {
@@ -1400,20 +1465,27 @@ fn check_grouped(
                     "体检照旧向服务器比对 floor：本地 status 没跑成：{}",
                     e.message
                 );
-                local.units.clear();
+                for u in local.units.clone() {
+                    local.drop_unit(&u, "本地 status 没跑成");
+                }
             }
         }
         LAST_LOCAL.with(|l| *l.borrow_mut() = local.units.iter().cloned().collect());
-        if perf::enabled() {
-            let mut rec = perf::Record::rust("query", "health floor answered locally");
-            rec.meta
-                .insert("local".into(), serde_json::json!(local.units.len()));
-            rec.meta.insert(
-                "server".into(),
-                serde_json::json!(units.len() - local.units.len()),
-            );
-            perf::record(&rec);
-        }
+    }
+    // 一个单元都没走本地时也记：要知道的正是为什么（2026-11-24 分析方案 5）
+    if perf::enabled() && (!local.units.is_empty() || !local.server_reasons.is_empty()) {
+        let mut rec = perf::Record::rust("query", "health floor answered locally");
+        rec.meta
+            .insert("local".into(), serde_json::json!(local.units.len()));
+        rec.meta.insert(
+            "server".into(),
+            serde_json::json!(units.len() - local.units.len()),
+        );
+        rec.meta.insert(
+            "server_reasons".into(),
+            serde_json::json!(local.server_reasons),
+        );
+        perf::record(&rec);
     }
 
     let DiffPlan {
@@ -1798,5 +1870,34 @@ fn strip_prefix_ci(path: &str, prefix: &str) -> Option<String> {
         Some(path[prefix.len()..].to_string())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reasons_lose_paths_and_revisions() {
+        assert_eq!(
+            path_free("目录 `Code/Deep` 在 r120（最后修改 r118），F 上的子项可能不同"),
+            "目录 `…` 在 r…（最后修改 r…），F 上的子项可能不同"
+        );
+        assert_eq!(path_free("`Code/A.cs` 有冲突"), "`…` 有冲突");
+        // 反引号没配对：后面整段当成路径丢掉，宁可少说
+        assert_eq!(path_free("`Code/A.cs 有冲突"), "`…`");
+        assert_eq!(path_free("工作副本被锁着"), "工作副本被锁着");
+    }
+
+    #[test]
+    fn wcdb_errors_quoting_sqlite_become_a_fixed_reason() {
+        let open = "wc.db 认不出：打不开 `C:/w/.svn/wc.db`：unable to open database file: C:\\w\\.svn\\wc.db";
+        assert_eq!(wcdb_reason(open), "wc.db 认不出：打不开或查询失败");
+        assert_eq!(
+            wcdb_reason("wc.db 认不出：查询 wc.db 失败：disk I/O error"),
+            "wc.db 认不出：打不开或查询失败"
+        );
+        let format = "wc.db 认不出：工作副本格式是 29，只认 31";
+        assert_eq!(wcdb_reason(format), format);
     }
 }

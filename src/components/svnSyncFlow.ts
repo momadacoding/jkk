@@ -91,6 +91,11 @@ export interface SvnSyncFlowDeps {
   /** 跟进之后刷新 HEAD、提交图、本地改动与落后基线的分支。可以抛，流程接住。 */
   refreshAfterFollow: () => Promise<void>
   /**
+   * 跟进之后重读 TortoiseSVN 钩子状态。不等、不抛（读失败自己记 console）。流程在跟进后的刷新**全部落定之后**
+   * 才调：它要跑一遍全量 `svn status`，与刷新里的判定并行时两遍抢磁盘，各自都慢（2026-11-24 分析方案 3）。
+   */
+  refreshHooksHealth: () => void
+  /**
    * 弹跟进报告，关掉时结束。报告里带着这次命令的用时（`FollowReport.elapsedMs`）。
    *
    * `refreshed` 给了，说明报告是抢在跟进之后的刷新前面弹的：报告里会写工作区的动作（放回 Local-Only
@@ -168,6 +173,8 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
     perfSpan('follow.refresh', async () => {
       const [git] = await Promise.allSettled([d.refreshAfterFollow(), afterSync()])
       if (git.status === 'rejected') d.reportError(git.reason)
+      // 不 await：不拖住「跟进中」和完成提示，只是错开磁盘
+      d.refreshHooksHealth()
     })
 
   /** 计一次跟进命令的用时，补进报告（`FollowReport.elapsedMs`）。只量命令本身，不含之后的刷新。 */
