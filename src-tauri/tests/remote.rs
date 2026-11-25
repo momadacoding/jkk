@@ -76,6 +76,216 @@ fn pull_brings_commits_into_working_branch() {
     assert!(b.path().join("c2.txt").exists());
 }
 
+/// 让 `dir` 里的下一次 fetch 撞上「另一个进程同时把当前分支快进了」。
+///
+/// 真实现场（2026-11-25）：app 点拉取的同时，另一个会话在同一个工作区跑了
+/// `git fetch` + `git merge origin/master`。`git pull` 开头记下的 HEAD 是旧的，
+/// fetch 完发现 HEAD 变了，就以为是自己改的，去把工作区从旧提交快进到新提交——
+/// 而工作区早被另一个进程更新好了，于是把新提交的内容全当成「本地改动」拒绝。
+///
+fn race_next_fetch_with_a_fast_forward(dir: &std::path::Path) {
+    race_next_fetch_with(dir, "git merge -q --ff-only '@{u}' >&2");
+}
+
+/// 在下一次 fetch 写入 `refs/remotes/origin/*` 的那一刻，在 `dir` 里跑一条 shell 命令。
+///
+/// 用 `reference-transaction` 钩子注入：这一刻正好落在 pull 的「记下 HEAD」与
+/// 「比较 HEAD」之间，时序与真实现场一致（pull 会等 fetch 子进程退出，不靠运气）。
+/// 只触发一次（`.git/race-started`），否则重试那次 pull 也会被它干扰。命令**成功后**
+/// 才写 `.git/race-done`：测试据此确认并发现场真的造出来了，而不是命令失败后
+/// 退化成一次普通 pull 照样通过。
+///
+/// 钩子是 pull 的子孙进程，会继承 pull 设的 `GIT_REFLOG_ACTION=pull`，不清掉的话
+/// 它做的 merge 在 reflog 里会记成 `pull: Fast-forward`，看起来像 pull 自己挪的。
+/// 真实现场里另一个进程有自己的环境，记的是 `merge …: Fast-forward`。
+fn race_next_fetch_with(dir: &std::path::Path, command: &str) {
+    let hook = dir.join(".git/hooks/reference-transaction");
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\n\
+             [ \"$1\" = committed ] || exit 0\n\
+             grep -q ' refs/remotes/origin/' || exit 0\n\
+             [ -e .git/race-started ] && exit 0\n\
+             : > .git/race-started\n\
+             unset GIT_REFLOG_ACTION\n\
+             {command} && : > .git/race-done\n\
+             exit 0\n"
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+fn assert_raced(dir: &std::path::Path) {
+    assert!(
+        dir.join(".git/race-done").exists(),
+        "钩子里的命令没有成功，测试没有造出并发现场"
+    );
+}
+
+#[test]
+fn pull_race_is_recovered_even_with_unrelated_local_edits() {
+    // 带着手里的改动点拉取是常态。和这次更新无关的改动不该让修复失效（独立 review 中危第 2 条）
+    let (_remote, a, b) = trio();
+    commit(a.path(), "c2");
+    run_git(a.path(), &["push"]);
+    let target = git_out(a.path(), &["rev-parse", "HEAD"]);
+    fs::write(b.path().join("c1.txt"), "my local edit").unwrap();
+    race_next_fetch_with_a_fast_forward(b.path());
+
+    let result = remote::pull(b.path().to_str().unwrap().to_string(), false);
+
+    assert_raced(b.path());
+    result.expect("无关的本地改动不该挡住恢复");
+    assert_eq!(git_out(b.path(), &["rev-parse", "HEAD"]), target);
+    assert_eq!(
+        fs::read_to_string(b.path().join("c1.txt")).unwrap(),
+        "my local edit"
+    );
+}
+
+#[test]
+fn pull_that_moved_the_branch_itself_and_then_failed_is_reported_as_is() {
+    // `submodule.recurse` 下，pull 先把主仓库快进了，再去检出子模块时被子模块里的
+    // 本地改动挡住。分支是 pull 自己挪的，没有别的进程——不能报成「被另一个程序
+    // 移动了」，更不能重拉吞掉子模块的失败（独立 review 中危第 1 条）
+    let (_remote, a, b) = trio();
+    let sub = TempDir::new().unwrap();
+    init(sub.path());
+    fs::write(sub.path().join("s.txt"), "v1").unwrap();
+    run_git(sub.path(), &["add", "."]);
+    run_git(sub.path(), &["commit", "-m", "s1"]);
+    let sub_url = sub.path().to_str().unwrap();
+    let file_ok = ["-c", "protocol.file.allow=always"];
+
+    run_git(
+        a.path(),
+        &[&file_ok[..], &["submodule", "add", sub_url, "sub"]].concat(),
+    );
+    run_git(a.path(), &["commit", "-m", "add sub"]);
+    run_git(a.path(), &["push"]);
+    run_git(b.path(), &["pull"]);
+    run_git(
+        b.path(),
+        &[&file_ok[..], &["submodule", "update", "--init"]].concat(),
+    );
+
+    fs::write(sub.path().join("s.txt"), "v2").unwrap();
+    run_git(sub.path(), &["commit", "-am", "s2"]);
+    let a_sub = a.path().join("sub");
+    run_git(&a_sub, &["pull"]);
+    run_git(a.path(), &["commit", "-am", "bump sub"]);
+    run_git(a.path(), &["push"]);
+
+    let b_sub = b.path().join("sub");
+    // 先把子模块的新提交取到本地，pull 里不用再走 file 协议
+    run_git(&b_sub, &["fetch"]);
+    run_git(b.path(), &["config", "submodule.recurse", "true"]);
+    run_git(b.path(), &["config", "protocol.file.allow", "always"]);
+    run_git(&b_sub, &["config", "protocol.file.allow", "always"]);
+    fs::write(b_sub.join("s.txt"), "my edit inside the submodule").unwrap();
+    let before = git_out(b.path(), &["rev-parse", "HEAD"]);
+
+    let err = remote::pull(b.path().to_str().unwrap().to_string(), false)
+        .expect_err("子模块检出被挡，pull 必须报错");
+
+    assert_ne!(
+        git_out(b.path(), &["rev-parse", "HEAD"]),
+        before,
+        "前提不成立：pull 没有先快进主仓库，测试没有造出「自己挪了又失败」的现场"
+    );
+    assert_eq!(err.code, "git_cli", "实际：{}", err.message);
+    assert_eq!(
+        fs::read_to_string(b_sub.join("s.txt")).unwrap(),
+        "my edit inside the submodule"
+    );
+}
+
+#[test]
+fn pull_does_not_retry_when_the_branch_moved_but_the_working_tree_did_not() {
+    // 另一种「fetch 期间 HEAD 变了」：分支被挪走，工作区却没跟着动（别的工具
+    // `update-ref` 了当前分支）。光是这样 git 自己能把工作区快进过去；但用户
+    // 正好改着上游也改了的文件时，快进被拒，工作区相对新 HEAD 是脏的。这时自动
+    // 重拉会因为「已经是最新」报成功，把反向改动留在工作区里——必须拒绝并说清楚。
+    let (_remote, a, b) = trio();
+    fs::write(a.path().join("c1.txt"), "upstream edit").unwrap();
+    run_git(a.path(), &["commit", "-am", "c2"]);
+    run_git(a.path(), &["push"]);
+    let target = git_out(a.path(), &["rev-parse", "HEAD"]);
+    fs::write(b.path().join("c1.txt"), "my local edit").unwrap();
+    race_next_fetch_with(b.path(), "git update-ref HEAD '@{u}'");
+
+    let err = remote::pull(b.path().to_str().unwrap().to_string(), false)
+        .expect_err("工作区没跟上新 HEAD 时不能报成功");
+
+    assert_raced(b.path());
+    assert_eq!(err.code, "pull_head_moved", "实际：{}", err.message);
+    // 不许替用户做任何恢复动作：HEAD 停在别人挪到的位置，用户的改动原样
+    assert_eq!(git_out(b.path(), &["rev-parse", "HEAD"]), target);
+    assert_eq!(
+        fs::read_to_string(b.path().join("c1.txt")).unwrap(),
+        "my local edit"
+    );
+}
+
+#[test]
+fn pull_succeeds_when_another_process_fast_forwards_the_branch_mid_fetch() {
+    let (_remote, a, b) = trio();
+    commit(a.path(), "c2");
+    run_git(a.path(), &["push"]);
+    let target = git_out(a.path(), &["rev-parse", "HEAD"]);
+    race_next_fetch_with_a_fast_forward(b.path());
+
+    let result = remote::pull(b.path().to_str().unwrap().to_string(), false);
+
+    assert_raced(b.path());
+    result.expect("分支已被别的进程快进到最新，拉取应当视为成功");
+    assert_eq!(git_out(b.path(), &["rev-parse", "HEAD"]), target);
+    assert_eq!(git_out(b.path(), &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn pull_with_rebase_succeeds_when_another_process_fast_forwards_the_branch_mid_fetch() {
+    let (_remote, a, b) = trio();
+    commit(a.path(), "c2");
+    run_git(a.path(), &["push"]);
+    let target = git_out(a.path(), &["rev-parse", "HEAD"]);
+    race_next_fetch_with_a_fast_forward(b.path());
+
+    let result = remote::pull(b.path().to_str().unwrap().to_string(), true);
+
+    assert_raced(b.path());
+    result.expect("pull --rebase 撞上同样的并发也应当成功");
+    assert_eq!(git_out(b.path(), &["rev-parse", "HEAD"]), target);
+    assert_eq!(git_out(b.path(), &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn pull_with_rebase_conflict_is_reported_as_is() {
+    // rebase 撞冲突时 HEAD 也挪了（停在中途、detached），这是 pull 自己的失败，
+    // 不能被当成「别的进程挪了分支」去重拉或换文案
+    let (_remote, a, b) = trio();
+    fs::write(a.path().join("c1.txt"), "upstream").unwrap();
+    run_git(a.path(), &["commit", "-am", "remote-side"]);
+    run_git(a.path(), &["push"]);
+    fs::write(b.path().join("c1.txt"), "local").unwrap();
+    run_git(b.path(), &["commit", "-am", "local-side"]);
+
+    let err = remote::pull(b.path().to_str().unwrap().to_string(), true).expect_err("冲突必须报错");
+
+    assert_eq!(err.code, "git_cli", "实际：{}", err.message);
+    assert_eq!(
+        app_lib::engine::repo::state(b.path().to_str().unwrap()).unwrap(),
+        "rebase",
+        "应当停在 rebase 中途等用户解决冲突"
+    );
+}
+
 #[test]
 fn pull_with_rebase_keeps_history_linear() {
     let (_remote, a, b) = trio();

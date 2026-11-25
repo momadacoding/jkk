@@ -31,12 +31,116 @@ pub fn pull(path: String, rebase: bool) -> Result<()> {
     crate::vcs::require_capability(&path, "git 远程", |c| c.remotes)?;
     // 默认不带参数，尊重用户自己的 pull.rebase 配置——
     // 这是 git 客户端最不意外的行为
-    if rebase {
-        run_git(&path, &["pull", "--rebase"])?;
+    let args: &[&str] = if rebase {
+        &["pull", "--rebase"]
     } else {
-        run_git(&path, &["pull"])?;
+        &["pull"]
+    };
+    let Some((branch, before)) = head_position(&path) else {
+        return run_git(&path, args).map(|_| ());
+    };
+    let err = match run_git(&path, args) {
+        Ok(_) => return Ok(()),
+        Err(e) => e,
+    };
+    let Some(after) = moved_by_someone_else(&path, &branch, &before) else {
+        return Err(err);
+    };
+
+    // 走到这里：pull 失败了，当前分支却在这期间被另一个进程（另一个 git 工具、另一个
+    // 会话）挪到了 `after`。git 以为是自己的 fetch 改了分支，拿旧提交去快进工作区，
+    // 而工作区早被那个进程更新好了，于是新提交的内容全被当成「本地改动」拒绝，
+    // 还建议 `git reset --hard`。这次快进被 git 整体中止，工作区一个文件都没动。
+    //
+    // 两次 HEAD 之间变了的路径在工作区里都已是新内容（那个进程做的是正常的 merge /
+    // checkout）时，从现在的状态再拉一次就是用户要的那次拉取。没跟上（别的工具只挪了
+    // ref）时绝不能重拉：重拉会因为「已是最新」报成功，把反向改动留在工作区里。
+    if changed_paths_caught_up(&path, &before, &after) {
+        run_git(&path, args)?;
+        return Ok(());
     }
-    Ok(())
+    Err(GitError::new(
+        "pull_head_moved",
+        format!(
+            "拉取期间当前分支被另一个程序移动了，工作区没有跟上新的位置，已停止拉取，\
+             没有改动工作区里的文件。请先确认工作区里的改动是不是你自己的，再决定怎么处理。\n\n\
+             git 原始输出：\n{}",
+            err.message
+        ),
+    ))
+}
+
+/// HEAD 停在哪：(所在分支的全名, 指向的提交)。detached 或还没有提交时为 `None`。
+fn head_position(path: &str) -> Option<(String, String)> {
+    let branch = run_git(path, &["symbolic-ref", "-q", "HEAD"]).ok()?;
+    let oid = run_git(path, &["rev-parse", "--verify", "-q", "HEAD"]).ok()?;
+    Some((branch.trim().to_string(), oid.trim().to_string()))
+}
+
+/// pull 失败后，当前分支是不是被**别的进程**从 `before` 挪走了；是的话返回新位置。
+///
+/// 不看 git 的报错文案（git 装了语言包会说别的话），看事实：
+/// - 还在同一条分支上，提交变了。分支被切走时不重拉——重拉会去拉另一条分支的上游
+/// - 没停在 merge / rebase 等操作中途。rebase 撞冲突时 HEAD 也会挪，那是 pull 自己的失败
+/// - 这期间分支 reflog 里新增的条目没有一条是 `pull` 开头的。pull 自己快进完又在后面
+///   失败（比如 `submodule.recurse` 下子模块检出被挡）时，挪分支的正是它自己。
+///   另一个进程恰好也是 `git pull` 时同样会被排除——那时退回原始报错，宁可不认
+fn moved_by_someone_else(path: &str, branch: &str, before: &str) -> Option<String> {
+    let (now_branch, after) = head_position(path)?;
+    if now_branch != branch || after == before {
+        return None;
+    }
+    if !matches!(crate::engine::repo::state(path), Ok("normal")) {
+        return None;
+    }
+    let repo = git2::Repository::open(path).ok()?;
+    let log = repo.reflog(branch).ok()?;
+    let before_oid = git2::Oid::from_str(before).ok()?;
+    for entry in log.iter() {
+        if entry.id_new() == before_oid {
+            return Some(after);
+        }
+        // pull 写 reflog 一定带消息；没有消息的条目（裸 `update-ref`）只可能是别人写的
+        if entry.message().is_some_and(|m| m.starts_with("pull")) {
+            return None;
+        }
+    }
+    // reflog 里找不到起点（被关掉了或被截断），无从判断是谁挪的
+    None
+}
+
+/// `before` 与 `after` 之间变了的路径，在暂存区和工作区里都已与 `after` 一致。
+///
+/// 只看这些路径：用户手里和这次更新无关的改动不该挡住重拉。未跟踪文件不算——
+/// 它们只可能是新提交删掉的文件留下的，重拉时 git 自己会拒绝覆盖未跟踪文件。
+/// 不把路径当 pathspec 传给 git：路径多了会撞 Windows 命令行长度上限，空列表又会被
+/// git 当成「全部」（`AGENTS.md` §6.2），在这里按集合过滤更稳。
+fn changed_paths_caught_up(path: &str, before: &str, after: &str) -> bool {
+    let Ok(changed) = run_git(path, &["diff", "--name-only", "-z", before, after]) else {
+        return false;
+    };
+    let changed: std::collections::HashSet<&str> =
+        changed.split('\0').filter(|p| !p.is_empty()).collect();
+    if changed.is_empty() {
+        return true;
+    }
+    let Ok(status) = run_git(
+        path,
+        &[
+            "status",
+            "--porcelain",
+            "-z",
+            "--untracked-files=no",
+            "--no-renames",
+        ],
+    ) else {
+        return false;
+    };
+    // 每条是 `XY <路径>`，-z 下不加引号；关掉改名检测后一条只有一个路径
+    !status
+        .split('\0')
+        .filter_map(|entry| entry.get(3..))
+        .any(|p| changed.contains(p))
 }
 
 #[tauri::command(async)]
