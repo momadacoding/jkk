@@ -302,6 +302,138 @@ fn a_gitignore_that_hides_w_files_is_refused_before_anything() {
     );
 }
 
+/// 用「更新」把基线推进到服务器最新，断言成功。
+fn sync_in(fx: &svn_fixtures::SvnFixture) {
+    let p = preview_sync_in(&fx.wc_str()).unwrap();
+    run_sync_in(
+        &fx.wc_str(),
+        &SyncInExpect {
+            orig_branch: p.orig_branch,
+            orig_head: p.orig_head,
+            baseline_oid: p.baseline_oid,
+            confirmed_outside: p.outside_changes,
+        },
+    )
+    .unwrap();
+}
+
+/// 2026-11-25 现场：工具目录的编译产物 `obj/*.cs` 是 SVN 忽略（或未版本控制）的，被 SVN
+/// 里的 `.gitignore` 挡在 git 之外。它们不是服务器内容，录基线时本来就剔掉——预检不该拦。
+fn preview_passes_with_gitignored_build_output(svn_ignore: bool) {
+    let fx = hybrid_with_colleague();
+    fx.colleague_adds_tool_with_gitignored_obj(svn_ignore);
+    sync_in(&fx);
+    fx.build_tool_obj();
+    fx.colleague_commits("Code/A.cs", "a2\n");
+    let before = head(&fx);
+
+    let p = preview_sync_in(&fx.wc_str()).expect("SVN 不管的编译产物不该挡住更新");
+    assert_eq!(head(&fx), before);
+
+    // 端到端：预检放行之后，录基线那道最终核对也放行，基线里没有 obj 下的文件
+    run_sync_in(
+        &fx.wc_str(),
+        &SyncInExpect {
+            orig_branch: p.orig_branch,
+            orig_head: p.orig_head,
+            baseline_oid: p.baseline_oid,
+            confirmed_outside: p.outside_changes,
+        },
+    )
+    .expect("预检放行后最终核对也该放行");
+    let tree = git(&fx, &["ls-tree", "-r", "--name-only", "svn/base"]);
+    assert!(tree.contains("Code/Tool/Main.cs"), "基线：{tree}");
+    assert!(
+        !tree.contains("/obj/"),
+        "obj 下的编译产物混进了基线：{tree}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.wc().join("Code/A.cs")).unwrap(),
+        "a2\n"
+    );
+}
+
+#[test]
+fn svn_ignored_build_output_hidden_by_a_gitignore_does_not_block_the_preview() {
+    preview_passes_with_gitignored_build_output(true);
+}
+
+#[test]
+fn unversioned_build_output_hidden_by_a_gitignore_does_not_block_the_preview() {
+    preview_passes_with_gitignored_build_output(false);
+}
+
+#[test]
+fn a_gitignore_from_svn_that_hides_a_versioned_w_file_is_still_refused() {
+    // 回归：挡住的是 SVN 里受版本控制的 `.cs`（不是 Drop），换成只读预检后照样要拦。
+    //
+    // 同事把 `.gitignore` 改成连 `*.cs` 都挡，我用 TortoiseSVN 更新拿到了它。预检从空索引
+    // 预言（与重建基线同一口径），`Main.cs` 收不进来，所以拦下。更新的 S7 从 HEAD 起步，
+    // `Main.cs` 已在基线里、不受 .gitignore 影响，单看这一次其实能录成——拦下是为了不让
+    // 基线变成一棵「下次重建就录不出来」的树（独立 review 第 4 条；改造前也是这样拦）。
+    let fx = hybrid_with_colleague();
+    fx.colleague_adds_tool_with_gitignored_obj(true);
+    sync_in(&fx);
+    fx.colleague_commits("Code/Tool/.gitignore", "obj/\n*.cs\n");
+    svn_cmd(&fx.wc(), &["update", "--non-interactive"]);
+    let err = preview_sync_in(&fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "include_set_mismatch");
+    let msg = &err.message;
+    assert!(msg.contains("Code/Tool/Main.cs"), "{msg}");
+    assert!(msg.starts_with("更新前的检查没通过"), "{msg}");
+    // 挡住它的 `.gitignore` 是 SVN 里的文件：不能再建议改它
+    assert!(msg.contains("是 SVN 里的文件，不要改它们"), "{msg}");
+    assert!(!msg.contains("挪走"), "{msg}");
+    assert!(msg.contains("TortoiseSVN"), "{msg}");
+}
+
+/// update 被打断（白名单里一个文件被独占占住），用户照提示跑了 `svn cleanup`：白名单根
+/// `Code` 停在 `item="incomplete"`。预检不该拿它去问 `classify`（会报 `svn_dirty_unknown_item`
+/// 「假基线」）——接下来的 svn update 会把它补齐（独立 review 第 2 条，2026-11-25 实测复现）。
+#[cfg(windows)]
+#[test]
+fn an_interrupted_update_after_cleanup_does_not_trip_the_include_set_precheck() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let fx = hybrid_with_colleague();
+    // 按 2026-11-25 复现出问题的形态造：先用外部 update 走到 r2，再让子目录里的文件被占住。
+    // 不先 update、只占住 `Code` 直属文件的形态实测预检本来就放行，测不到这条
+    fx.colleague_commits("Code/Sub/C.cs", "c1\n");
+    svn_cmd(&fx.wc(), &["update", "--non-interactive"]);
+    fx.colleague_commits("Code/A.cs", "a2\n");
+    fx.colleague_commits("Code/Sub/C.cs", "c2\n");
+    {
+        let _hold = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(fx.wc().join("Code/Sub/C.cs"))
+            .unwrap();
+        let ok = std::process::Command::new("svn")
+            .current_dir(fx.wc())
+            .args(["update", "--non-interactive"])
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(!ok, "fixture 前提不成立：被独占占住的文件居然更新成功了");
+    }
+    svn_cmd(&fx.wc(), &["cleanup", "--non-interactive"]);
+
+    // 改造前预览在这里放行（预检不看脏清单），改造后也该放行
+    let p = preview_sync_in(&fx.wc_str()).expect("被打断又 cleanup 过的工作副本照常能预览");
+    assert_eq!(p.target_rev, 4);
+}
+
+#[test]
+fn a_local_gitignore_that_hides_w_files_still_gets_the_move_it_advice() {
+    // 不在 SVN 里的 `.gitignore`（最常见：以前在这里用过 git，只删了 .git）照旧建议挪走
+    let fx = hybrid_with_colleague();
+    std::fs::write(fx.wc().join("Code/.gitignore"), "*.cs\n").unwrap();
+    let msg = preview_sync_in(&fx.wc_str()).unwrap_err().message;
+    assert!(msg.contains("不在 SVN 里，把它们挪走"), "{msg}");
+    assert!(!msg.contains("不要改它们"), "{msg}");
+}
+
 #[test]
 fn an_unreachable_server_is_refused_before_anything() {
     let fx = hybrid_with_colleague();

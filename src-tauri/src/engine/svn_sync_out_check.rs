@@ -3,7 +3,7 @@
 
 use crate::engine::git_cli::{run_git, run_git_code};
 use crate::engine::svn_basemap::{read_base_map, BaseMap};
-use crate::engine::svn_cli::run_svn;
+use crate::engine::svn_cli::{run_svn, with_scan_cache};
 use crate::engine::svn_config::{read_config, SvnConfig, BASELINE_BRANCH};
 use crate::engine::svn_deliver::{plan_deliver, LocalOnlyCommit};
 use crate::engine::svn_externals::detect_pinned;
@@ -61,7 +61,14 @@ pub fn preview_sync_out(repo: &str) -> Result<SyncOutPreview> {
 /// §8.1 第 0–8 条 + D0.5（对象层）+ D1 / D2。**不查锁**：持锁者在锁内复核时调它。
 ///
 /// 顺序：纯本地的先查、便宜的先查，走网络的放最后（§8.1 第 5 条）。
+///
+/// 整个检查在一个扫描缓存范围里（[`with_scan_cache`]）：失同步判定与第 8 条预检的脏清单
+/// 发的是同一条全量 `svn status`（`STATUS_SCAN`），只遍历一遍。范围里不发 SVN 写命令。
 pub(crate) fn check_sync_out(repo: &str) -> Result<SyncOutPreview> {
+    with_scan_cache(|| check_sync_out_uncached(repo))
+}
+
+fn check_sync_out_uncached(repo: &str) -> Result<SyncOutPreview> {
     if detect_repo_kind(repo) != RepoKind::SvnHybrid {
         return Err(GitError::new(
             "svn_not_hybrid",
@@ -117,7 +124,13 @@ pub(crate) fn check_sync_out(repo: &str) -> Result<SyncOutPreview> {
         return Err(nothing_to_deliver(plan.local_only.len()));
     }
 
-    precheck_include_set(repo, &WScope::for_repo(repo, &cfg)?)?; // 第 8 条
+    precheck_include_set(
+        repo,
+        &WScope::for_repo(repo, &cfg)?,
+        "交付前的检查没通过：按当前的忽略规则，git 将要收进来的文件与配置声明的不一致。\
+         还没开始交付，什么都没有改动。",
+        "本应用在这个仓库上绕不开它们，这次请改用 TortoiseSVN 提交。",
+    )?; // 第 8 条
 
     let outside_changes = outside_changes(repo, &cfg)?; // 第 2 条后半
 

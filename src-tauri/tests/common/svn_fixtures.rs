@@ -1227,6 +1227,46 @@ impl SvnFixture {
         self.dir.path().join("wc2")
     }
 
+    /// 同事提交一个工具目录 `Code/Tool`：带一份写着 `obj/` 的 `.gitignore`（是 SVN 里的文件），
+    /// `svn_ignore` 时目录上再挂 `svn:ignore obj`。只提交、不碰 wc1。
+    ///
+    /// 2026-11-25 现场的形态：工具的编译产物 `obj/*.cs` 在 SVN 里是 `I`（或 `?`），
+    /// 被 SVN 里早就有的 `.gitignore` 挡在 git 之外。
+    pub fn colleague_adds_tool_with_gitignored_obj(&self, svn_ignore: bool) {
+        let wc2 = self.wc2();
+        run(&wc2, "svn", &["update", "--non-interactive"]);
+        std::fs::create_dir_all(wc2.join("Code/Tool")).unwrap();
+        std::fs::write(wc2.join("Code/Tool/.gitignore"), "obj/\n").unwrap();
+        std::fs::write(wc2.join("Code/Tool/Main.cs"), "main\n").unwrap();
+        run(&wc2, "svn", &["add", "Code/Tool", "--non-interactive"]);
+        if svn_ignore {
+            run(
+                &wc2,
+                "svn",
+                &[
+                    "propset",
+                    "svn:ignore",
+                    "obj",
+                    "Code/Tool",
+                    "--non-interactive",
+                ],
+            );
+        }
+        run(
+            &wc2,
+            "svn",
+            &["commit", "-m", "colleague Code/Tool", "--non-interactive"],
+        );
+    }
+
+    /// 在 wc1 里造出 `Code/Tool/obj` 下的编译产物（本机编译工具的结果）。
+    pub fn build_tool_obj(&self) {
+        let obj = self.wc().join("Code/Tool/obj/Debug");
+        std::fs::create_dir_all(&obj).unwrap();
+        std::fs::write(obj.join("AssemblyInfo.cs"), "gen\n").unwrap();
+        std::fs::write(obj.join("Tool.g.cs"), "gen\n").unwrap();
+    }
+
     /// 同事在 wc2 里改（或新建）一个文件并提交——「服务器上有新提交」。
     pub fn colleague_commits(&self, rel: &str, content: &str) {
         let wc2 = self.wc2();
