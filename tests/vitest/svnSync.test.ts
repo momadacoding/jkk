@@ -13,7 +13,6 @@ import {
   describeSync,
   MIGRATE_EOL_WARNING,
   markOnBlur,
-  needsStandaloneCheck,
   recordAfterSuccess,
   runSvnSyncCheck,
   shouldMarkOnBlur,
@@ -193,47 +192,6 @@ describe('describeAudit', () => {
     const files = Array.from({ length: 20 }, (_, i) => `Code/F${i}.cs`)
     const m = describeAudit({ status: 'missing', files, total: 137 })!
     expect(m.detail).toContain('137')
-  })
-})
-
-describe('needsStandaloneCheck', () => {
-  // 2026-09-16 独立 review：体检入口原先只挂在失同步横幅里，而 describeSync
-  // 对 InSync 返回 null，于是**正常仓库根本点不到体检**。
-  // 偏偏 `Lying`（基线记的内容与服务器不符）恰恰发生在 revision 完全对得上的
-  // 时候 —— 等于只在不需要它的时候提供它。
-
-  // 第三个参数是行尾迁移状态。下面这组传 `eolDone`（规则已装）＝ 迁移不介入，
-  // 于是这组断言测的仍然是原来那条判据。迁移介入时的行为单独一组，见文件末尾。
-
-  it('同步的 SVN 仓库要有常驻入口', () => {
-    expect(needsStandaloneCheck(true, inSync, eolDone)).toBe(true)
-  })
-
-  it('还没读到状态时也要有——离线打开仓库照样得能体检', () => {
-    expect(needsStandaloneCheck(true, null, eolDone)).toBe(true)
-  })
-
-  it('普通 git 仓库不渲染', () => {
-    expect(needsStandaloneCheck(false, null, eolDone)).toBe(false)
-    expect(needsStandaloneCheck(false, inSync, eolDone)).toBe(false)
-  })
-
-  it('失同步横幅在时不重复渲染——任何时刻恰好一个入口', () => {
-    const diverged = st({ kind: 'diverged', nodeRev: 4, baselineRev: 9 }, 9, [4])
-    expect(needsStandaloneCheck(true, diverged, eolDone)).toBe(false)
-    // 前提：那条横幅自己带着体检按钮
-    expect(describeSync(diverged)!.actions.map((a) => a.id)).toContain('check')
-  })
-
-  it('pinned reset 的横幅也带体检，所以同样不重复', () => {
-    const pinned = st({ kind: 'pinnedReset', nodeRev: 4, baselineRev: 9, external: 'Code/Vendor' }, 9, [4])
-    expect(needsStandaloneCheck(true, pinned, eolDone)).toBe(false)
-    expect(describeSync(pinned)!.actions.map((a) => a.id)).toContain('check')
-  })
-
-  it('行尾状态还没读到时按「不需要迁移」处理，常驻入口照常', () => {
-    // 打开仓库的那一瞬间它是 null。此时把体检入口藏起来，等于每次打开都闪一下。
-    expect(needsStandaloneCheck(true, inSync, null)).toBe(true)
   })
 })
 
@@ -450,11 +408,6 @@ describe('迁移横幅与失同步横幅互斥', () => {
   it('pinnedReset 不让位——那条横幅指的是另一件必须先做的事', () => {
     expect(syncBannerIsSuppressed(eolNeeds, pinned)).toBe(false)
     expect(describeSync(pinned)).not.toBeNull()
-  })
-
-  it('迁移未完成时不挂常驻「体检基线」——基线本来就不可信', () => {
-    expect(needsStandaloneCheck(true, inSync, eolNeeds)).toBe(false)
-    expect(needsStandaloneCheck(true, inSync, eolDone)).toBe(true)
   })
 })
 
@@ -739,14 +692,5 @@ describe('describeMissingBaseline', () => {
 
   it('已经有新的同步结论（重建成功之后）：不挂，哪怕标记还没清', () => {
     expect(describeMissingBaseline(true, st({ kind: 'inSync' }, 1, [1]))).toBeNull()
-  })
-
-  it('基线丢了时不挂常驻体检入口：体检同样要读基线，点了只会报错', () => {
-    expect(needsStandaloneCheck(true, null, null, true)).toBe(false)
-    expect(needsStandaloneCheck(true, null, null, false)).toBe(true)
-  })
-
-  it('重建之后有了结论：标记没清，常驻体检入口也要回来', () => {
-    expect(needsStandaloneCheck(true, st({ kind: 'inSync' }, 1, [1]), null, true)).toBe(true)
   })
 })

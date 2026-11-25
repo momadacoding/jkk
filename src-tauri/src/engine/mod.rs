@@ -52,6 +52,7 @@ pub mod svn_local_only_edit;
 pub mod svn_lock;
 pub mod svn_log;
 pub mod svn_log_cache;
+pub mod svn_mismatch;
 pub mod svn_nodes;
 pub mod svn_preflight;
 pub mod svn_pristine;

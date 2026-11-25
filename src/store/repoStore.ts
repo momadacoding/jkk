@@ -69,6 +69,7 @@ import type {
   SyncAfterFollow,
 } from '../engine/svnFollow'
 import type { HookHealth, TsvnHooksStatus } from '../engine/tsvnHooks'
+import type { BaselineMismatch } from '../engine/svnMismatch'
 import type { SyncInExpect, SyncInOutcome, SyncInPreview } from '../engine/svnSyncIn'
 import type { SyncOutExpect, SyncOutOutcome, SyncOutPreview } from '../engine/svnSyncOut'
 import { nextSelection } from '../engine/selection'
@@ -169,7 +170,7 @@ export interface RepoState {
   /**
    * 最近一次失同步判定报了 `svn_no_baseline`：基线分支 `svn/base` 不存在（第 70 条）。
    * 只在判定报这个错时置位，别的失败与成功都不动它。读它的两处（`describeMissingBaseline`、
-   * `needsStandaloneCheck`）都同时看 `svnSync`：有结论就说明基线读得到，标记作废。
+   * `manualCheckBlockedReason`）都同时看 `svnSync`：有结论就说明基线读得到，标记作废。
    */
   svnBaselineMissing: boolean
   /** 服务器侧清单核对（§6.3.1 / NB-2）。走网络，失败静默。 */
@@ -499,6 +500,17 @@ export function svnPendingRestores(path: string): Promise<PendingRestore[]> {
   return invoke<PendingRestore[]>('svn_pending_restores', { path })
 }
 
+/**
+ * 「jkk 与 TortoiseSVN 看法不一致」的文件：git 说改了、SVN 说没改、分支提交没碰过（设计 2026-11-25 §6）。
+ * 后端 `svn_baseline_mismatch`。本地 `svn status`，不联网；候选为空时不起 svn 进程。
+ *
+ * ⚠️ 只在 `mismatchCheckApplies` 为真时调：别的时刻（SVN 侧有新内容、分支落后基线……）正常的文件
+ * 也满足这条判据。
+ */
+export function svnBaselineMismatch(path: string): Promise<BaselineMismatch> {
+  return invoke<BaselineMismatch>('svn_baseline_mismatch', { path })
+}
+
 /** 横幅上的「不放回」：从待放回清单删掉，不碰磁盘。 */
 export function svnDismissPendingRestores(path: string, paths: string[]): Promise<void> {
   return invoke<void>('svn_dismiss_pending_restores', { path, paths })
@@ -814,8 +826,8 @@ export function useRepoStore() {
           .then((head) => forceCheckAtHead(path, head), () => refreshSvnSync(path))
           .catch(() => undefined)
         // 同样是纯本地读，且它决定要不要挂迁移横幅——那条横幅会让失同步横幅
-        // 和常驻体检入口都让位，所以必须在第一帧之前读到，否则界面会先挂出
-        // 一条随后又被替换掉的横幅（spec §7.3.0）。
+        // 让位、「看法不一致」横幅也要等它读到才判定，所以必须在第一帧之前读到，
+        // 否则界面会先挂出一条随后又被替换掉的横幅（spec §7.3.0）。
         await refreshSvnEol(path)
         // 同理，且优先级更高：未收尾 / 同步进行中时**其余横幅全部让位**
         // （中间态下它们的结论可能是错的，出口还是危险的）。必须在第一帧之前

@@ -31,6 +31,7 @@ import {
   svnSetLocalOnly,
   svnSplitLocalOnly,
   svnPendingRestores,
+  svnBaselineMismatch,
   svnDismissPendingRestores,
   svnSetUser,
   tsvnHooksRegister,
@@ -84,6 +85,14 @@ import { computeLaneBranches, formatLaneBranch } from '../engine/laneBranch'
 import { describeHealth, describePinned, healthNeedsRebuild } from '../engine/svnInit'
 import { MIGRATE_EOL_WARNING } from '../engine/svnSync'
 import { svnSyncBlockedReason } from '@/engine/svnJournal'
+import {
+  manualCheckBlockedReason,
+  mismatchAckAfterCheck,
+  mismatchCheckApplies,
+  MISMATCH_DEBOUNCE_MS,
+  type BaselineMismatch,
+} from '../engine/svnMismatch'
+import { createSingleFlight } from '@/engine/singleFlight'
 import { samePath } from '../engine/path'
 import { isProtectedBaseline, visibleSections } from '../engine/capabilities'
 import { describeDiscard } from '../engine/discardConfirm'
@@ -273,6 +282,43 @@ export function RepoTab({
   useEffect(() => {
     void refreshPendingRestores()
   }, [refreshPendingRestores, state.status])
+  // 「jkk 与 TortoiseSVN 看法不一致」横幅（设计 2026-11-25 §6）。同「缺 Local-Only 补丁」：跟着
+  // 「本地改动」刷新查，只认最后一次查询的结果
+  const [mismatch, setMismatch] = useState<BaselineMismatch | null>(null)
+  // 体检报「基线没问题」时的那组文件（`mismatchKey`）：同一组不再挂（§6.2）
+  const [mismatchAck, setMismatchAck] = useState<string | null>(null)
+  const mismatchSeq = useRef(0)
+  // 同一时刻只跑一个查询，在跑时再来的只补跑一次（每次查询都起一个 svn 进程，2026-11-25 独立 review）
+  const mismatchFlight = useRef(createSingleFlight())
+  const mismatchApplies = mismatchCheckApplies(
+    svnTab,
+    state.svnSync,
+    state.svnEol,
+    state.svnSyncState,
+  )
+  useEffect(() => {
+    const seq = ++mismatchSeq.current
+    // 前提不成立时这条判据会误报（`mismatchCheckApplies`）；没有本地改动时必然为空，省一次 IPC
+    const empty = state.status.staged.length === 0 && state.status.unstaged.length === 0
+    if (!mismatchApplies || empty) {
+      setMismatch(null)
+      return
+    }
+    // 防抖：编辑停下来再查（`MISMATCH_DEBOUNCE_MS`）。期间又刷新了就由新的这一轮接手
+    const timer = window.setTimeout(() => {
+      mismatchFlight.current.run('mismatch', () => svnBaselineMismatch(repoPath)).then(
+        (m) => {
+          if (seq === mismatchSeq.current) setMismatch(m)
+        },
+        (err) => {
+          // 只是提醒：读不出来就不挂，不进错误条
+          console.warn('判定 jkk 与 TortoiseSVN 是否一致失败：', err)
+          if (seq === mismatchSeq.current) setMismatch(null)
+        },
+      )
+    }, MISMATCH_DEBOUNCE_MS)
+    return () => window.clearTimeout(timer)
+  }, [mismatchApplies, repoPath, state.status])
   // 试过的现场：同一个现场只试一次（见 `autoFollowKey`）。放 ref：effect 里读写，不该引起渲染。
   // 流程（svnSyncFlow）也写它：部分跟进后剩下的现场直接记成试过；被 SVN 冲突拦下的现场放掉，
   // 判定下一次写回时再试
@@ -1216,7 +1262,12 @@ export function RepoTab({
    */
   const handleCheckBaseline = async () => {
     try {
+      // 点下去那一刻横幅上的那组文件：体检报没问题、而且都覆盖到了才记下，同一组不再提示
+      // （设计 2026-11-25 §6.2，判据见 `mismatchAckAfterCheck`）
+      const shown = mismatch?.files ?? []
       const health = await svnCheckBaseline(repoPath)
+      const ack = mismatchAckAfterCheck(health, shown)
+      if (ack !== null) setMismatchAck(ack)
       // 复用向导那边的同一份翻译，不另写一套——两份文案迟早说出不同的话。
       const n = describeHealth(health)
       // 报「基线在撒谎」时必须就地给出路：那个结论只在 revision 对得上时出现，
@@ -1296,6 +1347,8 @@ export function RepoTab({
         onRestorePending={() => void handleRestorePending()}
         onDismissPending={() => void handleDismissPending()}
         restoreBusy={restoreBusy}
+        mismatch={mismatch}
+        mismatchAck={mismatchAck}
       />
       {hooksDialog && (
         <TsvnHooksDialog
@@ -1323,6 +1376,14 @@ export function RepoTab({
         onSvnUpdate={handleSvnUpdate}
         onSvnDeliver={handleSvnDeliver}
         svnBlockedReason={svnSyncBlockedReason(state.svnSyncState)}
+        onCheckBaseline={() => void handleCheckBaseline()}
+        checkBlockedReason={manualCheckBlockedReason(
+          state.svnSync,
+          state.svnEol,
+          state.svnBaselineMissing,
+          state.svnSyncState,
+        )}
+        onOpenHooks={() => void openHooks()}
       />
       <div className="repo-path-bar" title={state.path ?? ''}>{state.path} @ {state.head}</div>
       <div style={{ flex: 1, overflow: 'hidden' }}>
