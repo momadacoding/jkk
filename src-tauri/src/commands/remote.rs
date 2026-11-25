@@ -101,7 +101,11 @@ fn moved_by_someone_else(path: &str, branch: &str, before: &str) -> Option<Strin
             return Some(after);
         }
         // pull 写 reflog 一定带消息；没有消息的条目（裸 `update-ref`）只可能是别人写的
-        if entry.message().is_some_and(|m| m.starts_with("pull")) {
+        // 按字节比：消息不是 UTF-8 时 `message()` 返回 None，会被误当成「没有消息」
+        if entry
+            .message_bytes()
+            .is_some_and(|m| m.starts_with(b"pull"))
+        {
             return None;
         }
     }
@@ -116,7 +120,19 @@ fn moved_by_someone_else(path: &str, branch: &str, before: &str) -> Option<Strin
 /// 不把路径当 pathspec 传给 git：路径多了会撞 Windows 命令行长度上限，空列表又会被
 /// git 当成「全部」（`AGENTS.md` §6.2），在这里按集合过滤更稳。
 fn changed_paths_caught_up(path: &str, before: &str, after: &str) -> bool {
-    let Ok(changed) = run_git(path, &["diff", "--name-only", "-z", before, after]) else {
+    // `--no-relative`：用户配了 `diff.relative` 时路径基准要和 status 的「相对仓库根」对齐
+    let Ok(changed) = run_git(
+        path,
+        &[
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-relative",
+            "--no-renames",
+            before,
+            after,
+        ],
+    ) else {
         return false;
     };
     let changed: std::collections::HashSet<&str> =
