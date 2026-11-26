@@ -8,7 +8,16 @@ pub struct CommitNode {
     pub id: String,
     pub parents: Vec<String>,
     pub author: String,
+    /// **提交时间**（committer date）。排序、图布局、标签排序都用它，别换成作者时间。
     pub time: i64,
+    /// 作者时间（author date），**只在和 `time` 不同时才有值**。
+    ///
+    /// 跟进、rebase、cherry-pick、amend 重放提交时保留作者时间、把提交时间改成当时。
+    /// jkk 每次跟进都重放分支上的提交，只显示提交时间的话补丁永远像是刚写的
+    /// （2026-11-26 报告）。显示用它，和 `git log`、文件历史、blame 一致。
+    /// 两个时间相同时省掉：绝大多数提交如此，前端缺省退回 `time`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_time: Option<i64>,
     /// **只有标题**（`commit.summary()`，第一段且空白已折叠）。
     ///
     /// 提交列表一行一条，正文放不下也没人看。要正文里的东西请走下面两个字段，
@@ -119,11 +128,15 @@ pub fn load(path: &str) -> Result<GraphData> {
         let base = crate::engine::svn_basemap::parse_message(full);
         let single = base.as_ref().filter(|m| m.is_single());
         let mixed = base.as_ref().filter(|m| !m.is_single());
+        let author = commit.author();
+        let time = commit.time().seconds();
+        let author_time = Some(author.when().seconds()).filter(|&t| t != time);
         commits.push(CommitNode {
             id: oid.to_string(),
             parents: commit.parent_ids().map(|id| id.to_string()).collect(),
-            author: commit.author().name().unwrap_or("").to_string(),
-            time: commit.time().seconds(),
+            author: author.name().unwrap_or("").to_string(),
+            time,
+            author_time,
             message: commit.summary().unwrap_or("").to_string(),
             baseline_rev: single.map(|m| m.floor),
             baseline_floor: mixed.map(|m| m.floor),

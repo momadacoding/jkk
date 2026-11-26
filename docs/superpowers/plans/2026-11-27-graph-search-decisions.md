@@ -63,6 +63,19 @@
 | 第 5 条：Ctrl+F 只认 `key === 'f'`：非拉丁布局失效、Ctrl+Shift+F 也被占、会从别的输入框抢焦点 | nit | 修。照 `isSelectAllShortcut` 退回看 `code`；排除 Shift / Alt；焦点在别的输入框时不抢 |
 | 第 6 条：选中的命中和鼠标停着的命中底色一样 | nit | 修。选中的命中加一圈描边、底色更深，悬停的变浅 |
 
+### 合并 master（PR 206 / 207 同时改了 GraphView）
+
+冲突两个文件，用 `git merge origin/master` 解（不 rebase、不 force push）：
+
+| 位置 | 处理 |
+|---|---|
+| `GraphView.tsx` 常量 | 两边都留：`SEARCH_JUMP_DELAY` 与 PR 206 的 `SCROLL_KEYS` |
+| `GraphView.tsx` 定位 effect | 用 PR 206 的「跟随」版本，**把 `searchRevealSeq` 加进定位请求的键**。否则 PR 206 之后滚轮算用户接管、不再跟随，搜索框里对着当前那条按 Enter 就滚不回来了 |
+| `GraphView.tsx` JSX | 冲突只因外面多套了 `.graph-pane` 导致整段缩进变了；保留本分支结构，把 PR 206 新加的 `onWheel` / `onPointerDown` 搬到 `.graph-view` 上 |
+| `GraphView.test.tsx` | import 取并集；`renderGraph` 同时传 PR 206 的 `onLoadMoreSvn` 和本分支的两个搜索 props |
+
+计划没写的坑：「滚走后 Enter 滚回来」那条组件测试原来只发 `scroll` 事件，PR 206 之后用户接管按 `wheel` 认，测试补上 `wheel` 才是真实形态。已验证：去掉 `searchRevealSeq` 那一行，这条测试失败；加回去通过。
+
 ### 遗留
 
 - 后端全文 / 全历史搜索（方案 C）。

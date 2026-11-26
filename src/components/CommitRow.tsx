@@ -4,6 +4,7 @@ import { prBadge, pullRequestForRef } from '../engine/prs'
 import { laneTint } from '../engine/paths'
 import { WORKDIR_ID } from '../engine/workdir'
 import { shortHash } from '../engine/commitActions'
+import { rewrittenTitle, shownTime } from '../engine/commitTime'
 import { buildRefPills, goneUpstreamTooltip } from '../engine/refPills'
 import { mixedBaselineLabel } from '../engine/svnGraph'
 
@@ -49,7 +50,8 @@ export function CommitRow({
     )
   }
 
-  const date = new Date(node.commit.time * 1000).toLocaleString()
+  // 作者时间：跟进重放过的提交，提交时间是跟进那一刻（见 shownTime）
+  const date = new Date(shownTime(node.commit) * 1000).toLocaleString()
   // HEAD 那条伪 ref 不做成标签——整行加粗已经表达了「当前在这里」，
   // 只有游离 HEAD 时才需要一个显式标记
   // 本地分支与同一提交上的同名远程分支合成一个标签，见 buildRefPills
@@ -141,7 +143,7 @@ export function CommitRow({
         <span className="commit-hash" title={node.commit.id}>
           {isSvn ? `r${node.commit.svnRev}` : shortHash(node.commit.id)}
         </span>
-        <span className="commit-date">{date}</span>
+        <span className="commit-date" title={rewrittenTitle(node.commit)}>{date}</span>
       </span>
     </div>
   )

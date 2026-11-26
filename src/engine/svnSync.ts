@@ -27,6 +27,28 @@ export type SyncVerdict =
   | { kind: 'diverged'; nodeRev: number; baselineRev: number }
   | { kind: 'pinnedReset'; nodeRev: number; baselineRev: number; external: string }
 
+/** 被锁目录在横幅里最多列几条。 */
+const MAX_LOCKED_DIRS_SHOWN = 10
+
+/**
+ * 被锁目录拼成一句话里的片段：最多列 {@link MAX_LOCKED_DIRS_SHOWN} 条，其余写「等 N 个目录」。
+ *
+ * 后端已经把清单收敛到最上层（`svn_sync::topmost_dirs`），但递归锁下仍可能剩下
+ * 所有白名单目录（2026-11-26 使用报告里是 23 个）。与后端 `locked_dirs_text` 同一份规则。
+ */
+function lockedDirsText(dirs: string[]): string {
+  // 根被锁时后端统一给 `.`（`topmost_dirs`），不会再有别的目录
+  if (dirs.includes('.')) return '整个工作副本'
+  const shown = dirs.slice(0, MAX_LOCKED_DIRS_SHOWN).join('、')
+  return dirs.length > MAX_LOCKED_DIRS_SHOWN ? `${shown}……等 ${dirs.length} 个目录` : shown
+}
+
+/** Clean up 的对象：跟着清单说，不对着「整个工作副本」或一串目录说「该目录」。 */
+function cleanupTarget(dirs: string[]): string {
+  if (dirs.includes('.')) return '工作副本根目录'
+  return dirs.length > 1 ? '上面这些目录' : '该目录'
+}
+
 /** 后端 `svn_sync::ExternalChange`：SVN 侧有新内容的一个文件。 */
 export interface ExternalChange {
   path: string
@@ -172,9 +194,10 @@ export function describeSync(status: SyncStatus | null): BannerModel | null {
         tone: 'quiet',
         title: 'SVN 正在更新…',
         detail:
-          `工作副本被 SVN 锁着（${v.dirs.join('、')}），可能有 TortoiseSVN 操作正在进行。` +
+          `工作副本被 SVN 锁着（${lockedDirsText(v.dirs)}），` +
+          '可能有 TortoiseSVN 或 IDE（Rider、IDEA）的 SVN 操作正在进行。' +
           '等它做完这条提示会自己消失；如果一直不消失，说明上次操作中途断了，' +
-          '请在 TortoiseSVN 里对该目录执行 Clean up。',
+          `请在 TortoiseSVN 里对${cleanupTarget(v.dirs)}执行 Clean up。`,
         actions: [],
       }
 

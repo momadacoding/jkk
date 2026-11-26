@@ -928,6 +928,7 @@ Post-commit / Post-update 事件是即时信号，jkk 在后台、不在焦点�
 - 部分：F3 已测，相邻 / 重叠 hunk 的 12 个判定全对（W21），Review 2 补了同 hunk 三种漏报。钩子不走 `git apply -R --check`，与 F3 共用判定（§6.13.4）。✅「提交后恢复」时提交前看到的是删过之后的磁盘内容（H5、E2E 场景 5）
 - ✅「已全部提交」捷径：含 merge、删除、新增、mode、重命名（W20）；区间有 Local-Only 不走捷径
 - 部分：status 不报错，只有目录带 `wc-locked`（E15）。未测：真实 TortoiseSVN 半小时更新期间的表现
+  - 2026-11-26 使用报告：Rider 跑 `svn cleanup` 期间，整棵树的每个目录都带 `wc-locked`，判成 WcLocked 是对的，但横幅把几百个目录全列了出来。之后被锁清单在判定和预检时只保留最上层目录（`svn_sync::topmost_dirs`），横幅和跟进报错最多列 10 条，预检报错沿用 `shown_paths` 的 20 条
 - ✅ `<commit revision>` 在 `A`、`R`、copied 上的形状：E13、Review 1 第 4 条。未测：`svn update -r` 回退到 c(f) ≤ X < R(f) 按回退处理是否过严。目录压缩未实现，不适用
 - U7 的真实规模：一周里每天局部更新几个模块目录后，映射的条目数与分组体检的 revision 组数；条件 11 被触发的频率
 - （C2 补 notify 时）Windows notify 下 `.svn/wc.db` 的真实事件形状；TSVNCache 后台进程会不会频繁改写 wc.db；TortoiseSVN 一次提交里 wc.db 会被写几次、间隔多长，定出去抖的静默时长

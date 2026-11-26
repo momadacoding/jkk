@@ -1615,7 +1615,11 @@ fn rebuild_refuses_a_locked_subdirectory() {
         "前提：工作副本根上没有锁，{root}"
     );
 
-    assert_rebuild_refused(&fx, "svn_preflight_operation_in_progress", "Code/Deep");
+    // 锁同时在 Code 与 Code/Deep 上，报错只列最上层的 Code（2026-11-26 使用报告：
+    // 递归锁下原样列会铺满整屏；对 Code 做 Cleanup 也覆盖了 Code/Deep）
+    assert_rebuild_refused(&fx, "svn_preflight_operation_in_progress", "  - Code\n");
+    let err = rebuild_baseline(&fx.wc_str()).expect_err("必须拒绝重建");
+    assert!(!err.message.contains("Code/Deep"), "{}", err.message);
 }
 
 // —— Review 1 第 1、2 条 ——

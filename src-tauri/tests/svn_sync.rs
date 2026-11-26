@@ -393,6 +393,57 @@ fn locked_working_copy_reports_wc_locked() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn recursively_locked_working_copy_reports_only_the_topmost_dir() {
+    // 2026-11-26 使用报告：Rider 跑 svn cleanup 时整棵树每个目录都带 wc-locked，
+    // 横幅把几百个目录拼成一句话。这里用半途失败的 update 造出同样的递归锁
+    // （`Code` 与 `Code/Sub` 都被锁），断言只报最上层的 `Code`
+    use std::os::windows::fs::OpenOptionsExt;
+    let fx = svn_repo_three_revisions();
+    let seed = seed(&fx);
+    std::fs::create_dir_all(seed.join("Code/Sub")).unwrap();
+    std::fs::write(seed.join("Code/Sub/C.cs"), "v1\n").unwrap();
+    svn_cmd(&seed, &["add", "Code/Sub", "--non-interactive"]);
+    svn_cmd(&seed, &["commit", "-m", "r4", "--non-interactive"]);
+    svn_cmd(&fx.wc(), &["update", "--non-interactive"]);
+    init(&fx);
+    std::fs::write(seed.join("Code/Sub/C.cs"), "v2\n").unwrap();
+    svn_cmd(&seed, &["commit", "-m", "r5", "--non-interactive"]);
+    {
+        let _hold = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(fx.wc().join("Code/Sub/C.cs"))
+            .unwrap();
+        let ok = std::process::Command::new("svn")
+            .current_dir(fx.wc())
+            .args(["update", "--non-interactive"])
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(!ok, "前提：被独占的文件让 update 半途失败");
+    }
+    let nodes = std::process::Command::new("svn")
+        .current_dir(fx.wc())
+        .args(["status", "--xml", "-v", "Code"])
+        .output()
+        .unwrap();
+    let xml = String::from_utf8_lossy(&nodes.stdout);
+    assert!(
+        xml.matches("wc-locked=\"true\"").count() >= 2,
+        "前提：递归锁要同时锁住 Code 与 Code/Sub，否则测不到收敛：{xml}"
+    );
+
+    let st = svn_sync::check_sync(&fx.wc_str()).unwrap();
+    match &st.verdict {
+        SyncVerdict::WcLocked { dirs } => assert_eq!(dirs, &["Code".to_string()]),
+        other => panic!("应当判成 wcLocked，实际 {other:?}"),
+    }
+}
+
 #[test]
 fn changes_in_two_externals_are_both_reported() {
     // Review Focus 1：白名单落在两个工作副本里（Code 与嵌套 external Code/Vendor）。

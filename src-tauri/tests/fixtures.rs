@@ -427,6 +427,52 @@ fn graph_puts_newer_unmerged_tip_above_older_merge() {
     assert!(row("f1") < row("base"));
 }
 
+#[test]
+fn graph_carries_author_time_only_when_replay_changed_commit_time() {
+    // 跟进、rebase、cherry-pick 重放提交时保留作者时间、把提交时间改成当时（2026-11-26 报告：
+    // 11-09 写的补丁在图上显示成跟进那一刻）。这里用真实的 cherry-pick 造出这种提交，
+    // 不手写两个时间：要测的正是 git 重放之后两个时间各落在哪
+    let dir = TempDir::new().unwrap();
+    let r = dir.path();
+    run_git(r, &["init", "-q"]);
+    run_git(r, &["config", "user.email", "test@test.com"]);
+    run_git(r, &["config", "user.name", "Test"]);
+    commit_at(r, "base", "2026-01-01T00:00:00+00:00");
+    run_git(r, &["checkout", "-qb", "side"]);
+    commit_at(r, "patch", "2026-01-02T00:00:00+00:00");
+    run_git(r, &["checkout", "-q", "-"]);
+    let status = Command::new("git")
+        .current_dir(r)
+        .env("GIT_COMMITTER_DATE", "2026-01-09T00:00:00+00:00")
+        .args(["cherry-pick", "side"])
+        .status()
+        .expect("git not found");
+    assert!(status.success());
+
+    let data = engine::graph::load(r.to_str().unwrap()).unwrap();
+    let head = data
+        .commits
+        .iter()
+        .find(|c| c.message == "patch" && c.parents.len() == 1 && c.time == 1_767_916_800)
+        .expect("cherry-pick 出来的提交不在图里，或提交时间不是 01-09");
+    // time 仍是提交时间：排序、图布局都靠它，不能跟着变
+    assert_eq!(
+        head.author_time,
+        Some(1_767_312_000),
+        "作者时间应保留 01-02"
+    );
+
+    // 两个时间相同的提交不带这个字段：绝大多数提交如此，省掉白给的传输量
+    let base = data.commits.iter().find(|c| c.message == "base").unwrap();
+    assert_eq!(base.author_time, None);
+    let original = data
+        .commits
+        .iter()
+        .find(|c| c.message == "patch" && c.time == 1_767_312_000)
+        .unwrap();
+    assert_eq!(original.author_time, None);
+}
+
 /// 造一个目标不存在的链接。
 ///
 /// Windows 上用**目录联接**（junction）而不是符号链接：后者需要

@@ -1,5 +1,6 @@
 import type { Capabilities } from './capabilities'
 import type { CommitNode } from './types'
+import { shownTime } from './commitTime'
 
 /** 「仅本地，不交付」的 trailer（spec §6.7）。判定只认这一条，不新增配置。 */
 export const LOCAL_ONLY_TRAILER = 'Local-Only: true'
@@ -87,7 +88,8 @@ export function shortHash(id: string): string {
  * hash 用完整的——缩写换个仓库、换个时间点都可能不再唯一。
  */
 export function formatCommitInfo(commit: CommitNode): string {
-  const date = new Date(commit.time * 1000).toLocaleString()
+  // git show 的 Date: 是作者时间
+  const date = new Date(shownTime(commit) * 1000).toLocaleString()
   return [
     `commit ${commit.id}`,
     `Author: ${commit.author}`,

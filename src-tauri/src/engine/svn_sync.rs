@@ -236,7 +236,9 @@ fn judge_at(
         })
     })?;
     let verdict = if !j.locked.is_empty() {
-        SyncVerdict::WcLocked { dirs: j.locked }
+        SyncVerdict::WcLocked {
+            dirs: topmost_dirs(j.locked),
+        }
     } else if let Some((n, r)) = j.backward {
         match pinned_external_at(repo_root, &cfg.whitelist, n)? {
             Some(ext) => SyncVerdict::PinnedReset {
@@ -302,6 +304,61 @@ fn paths_between(repo_root: &str, a: &str, b: &str) -> Vec<String> {
             log::warn!("读不出落后基线的文件清单，提交前不按它提醒：{}", e.message);
             Vec::new()
         }
+    }
+}
+
+/// 被锁目录给人看时最多列几条，多出的写「等 N 个目录」。
+const MAX_LOCKED_DIRS_SHOWN: usize = 10;
+
+/// 只留最上层的被锁目录：祖先目录也在清单里的省掉，结果按路径排序、去重。
+///
+/// svn cleanup / update 运行期间会给整棵树递归加写锁，`svn status` 给每个目录都标
+/// `wc-locked`。原样列出就是几百条，铺满整屏（2026-11-26 使用报告：Rider 跑
+/// `svn cleanup` 时）。用户要做的只是等它结束，或对最上层的目录 Clean up，下层目录
+/// 不带任何新信息。根（`.` 或空串）会吞掉其余所有条目，并统一写成 `.`：
+/// 只让一种写法过 IPC，前端不必认两种。
+pub(crate) fn topmost_dirs(dirs: Vec<String>) -> Vec<String> {
+    let mut dirs: Vec<String> = dirs
+        .into_iter()
+        .map(|d| d.replace('\\', "/").trim_end_matches('/').to_string())
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    if dirs.iter().any(|d| d.is_empty() || d == ".") {
+        return vec![".".to_string()];
+    }
+    // 不能只和上一条比：`Code-x` 按字典序排在 `Code` 与 `Code/Sub` 之间
+    let mut kept: Vec<String> = Vec::new();
+    for d in dirs {
+        let under_kept = kept.iter().any(|k| {
+            d.strip_prefix(k.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+        });
+        if !under_kept {
+            kept.push(d);
+        }
+    }
+    kept
+}
+
+/// 被锁目录拼成一句话里的片段：最多列 [`MAX_LOCKED_DIRS_SHOWN`] 条。
+///
+/// 前端 `src/engine/svnSync.ts` 的 `lockedDirsText` 是同一份规则，改这里要一起改。
+pub(crate) fn locked_dirs_text(dirs: &[String]) -> String {
+    // 根被锁时 `topmost_dirs` 统一给 `.`
+    if dirs.iter().any(|d| d == ".") {
+        return "整个工作副本".to_string();
+    }
+    let shown = dirs
+        .iter()
+        .take(MAX_LOCKED_DIRS_SHOWN)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("、");
+    if dirs.len() > MAX_LOCKED_DIRS_SHOWN {
+        format!("{shown}……等 {} 个目录", dirs.len())
+    } else {
+        shown
     }
 }
 
@@ -630,5 +687,53 @@ mod tests {
             ["Code/C.cs", "Code/Sub/D.cs"]
         );
         assert_eq!(*asked.borrow(), ["Code", "Code/C.cs", "Code/Sub/D.cs"]);
+    }
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|p| p.to_string()).collect()
+    }
+
+    #[test]
+    fn topmost_dirs_drops_dirs_whose_ancestor_is_locked() {
+        // 2026-11-26 使用报告：svn cleanup 期间整棵树每个目录都带 wc-locked
+        let dirs = s(&["Assets", "Assets/Demo", "Assets/Demo/Sub", "Code", "Code/X"]);
+        assert_eq!(topmost_dirs(dirs), s(&["Assets", "Code"]));
+    }
+
+    #[test]
+    fn topmost_dirs_keeps_siblings_sharing_a_name_prefix() {
+        // `Code-x` 不在 `Code` 下面；按字典序它还排在 `Code` 与 `Code/Sub` 之间
+        let dirs = s(&["Code/Sub", "Code-x", "Code"]);
+        assert_eq!(topmost_dirs(dirs), s(&["Code", "Code-x"]));
+    }
+
+    #[test]
+    fn topmost_dirs_handles_backslashes_duplicates_and_empty() {
+        assert_eq!(topmost_dirs(Vec::new()), Vec::<String>::new());
+        let dirs = s(&["Code\\Sub", "Code", "Code"]);
+        assert_eq!(topmost_dirs(dirs), s(&["Code"]));
+    }
+
+    #[test]
+    fn topmost_dirs_root_swallows_everything() {
+        assert_eq!(topmost_dirs(s(&["Code", ".", "Assets/A"])), s(&["."]));
+        assert_eq!(topmost_dirs(s(&["Code", ""])), s(&["."]));
+        assert_eq!(topmost_dirs(s(&["/"])), s(&["."]));
+    }
+
+    #[test]
+    fn locked_dirs_text_caps_the_list() {
+        assert_eq!(locked_dirs_text(&s(&["A", "B"])), "A、B");
+        let many: Vec<String> = (0..23).map(|i| format!("D{i:02}")).collect();
+        let t = locked_dirs_text(&many);
+        assert!(t.starts_with("D00、D01"), "{t}");
+        assert!(t.contains("D09"), "{t}");
+        assert!(!t.contains("D10"), "{t}");
+        assert!(t.ends_with("等 23 个目录"), "{t}");
+    }
+
+    #[test]
+    fn locked_dirs_text_names_the_root() {
+        assert_eq!(locked_dirs_text(&s(&["."])), "整个工作副本");
     }
 }
