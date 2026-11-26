@@ -21,6 +21,8 @@ import type { Capabilities } from '../engine/capabilities'
 const ROW_HEIGHT = 28
 const LANE_WIDTH = 20
 const OVERSCAN = 5
+/** 浏览器拿来滚动容器的键（↑ / ↓ 归键盘导航换选中，不在这里）。 */
+const SCROLL_KEYS = new Set(['PageUp', 'PageDown', 'Home', 'End', ' '])
 
 interface GraphViewProps {
   commits: CommitNode[]
@@ -111,6 +113,9 @@ export function GraphView({
   // 标签用 display:none 隐藏时浏览器会把 scrollTop 清零，
   // 重新显示后要按记住的值还原，所以这里留一份 ref 供观察者读取。
   const scrollTopRef = useRef(0)
+  /** 隐藏的标签重新可见时加一，让定位 effect 补跑一次隐藏期间没跑成的定位。 */
+  const [shownSeq, setShownSeq] = useState(0)
+  const hiddenRef = useRef(false)
 
   // 挂载后立即量一次真实高度，并跟随面板拖动 / 标签显隐更新——
   // 否则首次滚动前一直按初始值估算可见行数。
@@ -119,9 +124,16 @@ export function GraphView({
     if (!el) return
     const update = () => {
       const h = el.clientHeight
-      if (h === 0) return // 标签被隐藏，别把高度记成 0
+      if (h === 0) {
+        hiddenRef.current = true // 标签被隐藏，别把高度记成 0
+        return
+      }
       setViewportHeight(h)
       if (el.scrollTop !== scrollTopRef.current) el.scrollTop = scrollTopRef.current
+      if (hiddenRef.current) {
+        hiddenRef.current = false
+        setShownSeq((n) => n + 1)
+      }
     }
     update()
     const observer = new ResizeObserver(update)
@@ -137,24 +149,70 @@ export function GraphView({
   // 首次打开仓库时 store 会把 selectedId 预置成该 worktree 的 HEAD，于是这里顺带
   // 完成「打开 worktree 就定位到它所在的提交」。
   //
-  // 注意 clientHeight 为 0（标签被 display:none 隐藏）时这里直接放弃，且依赖数组里
-  // 没有高度——也就是说**只有在标签可见时才会定位**。目前成立是因为 `openInNewTab`
-  // 总会把新标签设为激活；之后若加「在后台打开标签」，新标签的定位会静默失效，
-  // 届时需要让 ResizeObserver 在拿到真实高度后补一次定位。
+  // clientHeight 为 0（标签被 display:none 隐藏）时没法算位置，先放着；标签重新可见时
+  // ResizeObserver 推进 `shownSeq`，在这里补跑。
+  //
+  // **跟随**：「选中 + revealSeq」变了算一次新的定位请求，从这时起跟随选中的那一行，
+  // 直到用户自己动了这张图为止。跟随期间 commits / headHash / 视口高度变了要重新检查——
+  // SVN 历史后加载，目标可能那时才出现，或者被收进别处的 svn 节点、被新插进来的行挤出视口。
+  // 用户一动就不再跟随：文件变动触发的 refreshGraph 每次都换一个内容相同的新 commits，
+  // 跟随不停的话会把只滚动、没单击的用户拽回选中的那一行（2026-11-26 使用报告：
+  // 被拽回 HEAD，也就是图的顶部）。
+  //
+  // 「用户动了」按输入事件认（`stopFollowing`），不按 scroll 事件里的 scrollTop 认：
+  // 程序赋值也发 scroll 事件，而且事件晚一帧才到、浏览器还会因内容变短而夹紧 scrollTop、
+  // 高 DPI 下读回的值带小数，拿数值比哪一种都会认错（独立 review 第二轮第 1–3 条）。
+  const requestRef = useRef<{ selectedId: string; revealSeq: number } | null>(null)
+  const followRef = useRef(false)
   useEffect(() => {
     const el = containerRef.current
-    if (!el || !selectedId || el.clientHeight === 0) return
+    if (!el) return
+    if (!selectedId) {
+      // 清空过选中，之后再选回同一条也算新请求
+      requestRef.current = null
+      return
+    }
+    const req = requestRef.current
+    if (!req || req.selectedId !== selectedId || req.revealSeq !== revealSeq) {
+      requestRef.current = { selectedId, revealSeq }
+      followRef.current = true
+    }
+    if (!followRef.current || el.clientHeight === 0) return
     const targetId = findDelivered(commits, selectedId)?.owner.id ?? selectedId
     const idx = commits.findIndex((c) => c.id === targetId)
+    // 目标还不在图上：继续跟随，等 commits 变了再试
     if (idx < 0) return
     // 插了工作区伪行后真实提交整体下移一行
     const rowOffset = headHash ? 1 : 0
     const rowTop = (idx + rowOffset) * ROW_HEIGHT
     if (rowTop >= el.scrollTop && rowTop + ROW_HEIGHT <= el.scrollTop + el.clientHeight) return
     el.scrollTop = Math.max(0, rowTop - el.clientHeight / 2 + ROW_HEIGHT / 2)
-  }, [selectedId, revealSeq, commits, headHash])
+    // scroll 事件要晚一帧才到；这之前 ResizeObserver 先跑的话会按旧值把这次定位滚回去
+    scrollTopRef.current = el.scrollTop
+  }, [selectedId, revealSeq, commits, headHash, shownSeq, viewportHeight])
+
+  // 滚轮、在图上按下鼠标（含拖滚动条）算用户接管。单击别的行或 ↑ / ↓ 换了选中，
+  // 会紧接着产生新的定位请求、重新开始跟随，不受影响。
+  // 「加载更多 SVN 历史」除外：点它正是为了等目标提交加载出来，之后还得跟过去。
+  const stopFollowing = useCallback((e: React.SyntheticEvent) => {
+    if ((e.target as HTMLElement).closest?.('.graph-load-more')) return
+    followRef.current = false
+  }, [])
+
+  // 键盘滚动也算用户接管。graph 不可聚焦，单击一行之后按 PageDown / End / 空格，
+  // 浏览器滚的是刚点过的这个容器，但 keydown 的目标是 body，挂在容器上收不到。
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (!SCROLL_KEYS.has(e.key) || !isShown(containerRef.current) || isEditable(e.target)) return
+      followRef.current = false
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [])
 
   const handleScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {
+    // 标签被隐藏时浏览器清零 scrollTop 发来的事件：记下来的话重新显示就回不到原位
+    if (e.currentTarget.clientHeight === 0) return
     scrollTopRef.current = e.currentTarget.scrollTop
     setScrollTop(e.currentTarget.scrollTop)
     setViewportHeight(e.currentTarget.clientHeight)
@@ -218,6 +276,8 @@ export function GraphView({
       ref={containerRef}
       className="graph-view"
       onScroll={handleScroll}
+      onWheel={stopFollowing}
+      onPointerDown={stopFollowing}
       onClick={handleClick}
       onContextMenu={handleContextMenu}
       style={{ overflow: 'auto', height: '100%' }}
