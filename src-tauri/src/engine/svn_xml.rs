@@ -793,6 +793,9 @@ pub struct UpdateStatusEntry {
     /// `<repos-status props>`：带 `-u` 时才有。只改属性的远端改动是
     /// `item="none" props="modified"`（2026-09-26 实测），单看 `repos_item` 会漏掉。
     pub repos_props: Option<String>,
+    /// `<wc-status revision>` 原样，可能没有。含义同 [`StatusEntry::revision`]：
+    /// `-1` 是 `svn add` 还没提交的节点（含又从磁盘删掉的 `missing`）。
+    pub revision: Option<i64>,
 }
 
 impl UpdateStatusEntry {
@@ -858,6 +861,15 @@ pub fn parse_update_status(xml: &str) -> Result<UpdateStatus> {
                 Some(r) => (Some(attr(&r, "item")?), Some(attr(&r, "props")?)),
                 None => (None, None),
             };
+        let revision = match st.attribute("revision") {
+            Some(raw) => Some(raw.parse::<i64>().map_err(|_| {
+                GitError::new(
+                    "svn_xml",
+                    format!("entry `{path}` 的 revision 不是数字：{raw}"),
+                )
+            })?),
+            None => None,
+        };
         entries.push(UpdateStatusEntry {
             path,
             item: attr(&st, "item")?,
@@ -865,6 +877,7 @@ pub fn parse_update_status(xml: &str) -> Result<UpdateStatus> {
             tree_conflicted: st.attribute("tree-conflicted") == Some("true"),
             repos_item,
             repos_props,
+            revision,
         });
     }
     // 项目根的 <target> 在最前；external 各有自己的 <target>/<against>，
