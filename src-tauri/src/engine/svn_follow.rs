@@ -2088,9 +2088,10 @@ fn prepare(repo: &str, auto: bool, partial: Option<&Partial>, disk: DiskUse) -> 
             return Err(GitError::new(
                 "svn_follow_wc_locked",
                 format!(
-                    "工作副本被 SVN 锁着（{}），多半是更新还在进行，或者中途被杀掉了。等它结束；\
+                    "工作副本被 SVN 锁着（{}），多半是 TortoiseSVN 或 IDE（Rider、IDEA）的 SVN \
+                     操作还在进行，或者中途被杀掉了。等它结束；\
                      如果已经没有 SVN 操作在跑，用 TortoiseSVN 的 Clean up 清掉，再跟进。",
-                    dirs.join("、")
+                    crate::engine::svn_sync::locked_dirs_text(&dirs)
                 ),
             ))
         }

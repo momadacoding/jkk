@@ -184,20 +184,25 @@ fn check_recordable(dirty: &[StatusEntry], nodes: &[NodeStatus]) -> Result<()> {
             ),
         ));
     }
-    let locked: Vec<&String> = nodes
-        .iter()
-        .filter(|n| n.wc_locked)
-        .map(|n| &n.path)
-        .collect();
+    // 递归锁下每个目录都带 `L`，只列最上层的（2026-11-26 使用报告，同 `svn_sync::topmost_dirs`）
+    let locked = crate::engine::svn_sync::topmost_dirs(
+        nodes
+            .iter()
+            .filter(|n| n.wc_locked)
+            .map(|n| n.path.clone())
+            .collect(),
+    );
     if !locked.is_empty() {
+        let refs: Vec<&String> = locked.iter().collect();
         return Err(GitError::new(
             "svn_preflight_operation_in_progress",
             format!(
                 "下面这些目录上有一把没释放的写锁（svn status 的 `L`）：\n{}\n\
-                 TortoiseSVN 可能正在提交或更新，也可能上一次操作中途被杀了（两者分不出来）。\
+                 TortoiseSVN 或 IDE（Rider、IDEA）的 SVN 操作可能正在进行，\
+                 也可能上一次操作中途被杀了（两者分不出来）。\
                  这种状态下录到的可能是一棵半更新的树。等它做完再试；\
-                 确认没有 svn 操作在跑的话，先在 TortoiseSVN 里对这个目录跑一次 Cleanup。",
-                shown_paths(&locked)
+                 确认没有 svn 操作在跑的话，先在 TortoiseSVN 里对上面列出的目录跑一次 Cleanup。",
+                shown_paths(&refs)
             ),
         ));
     }
