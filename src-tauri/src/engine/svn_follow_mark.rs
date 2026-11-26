@@ -50,6 +50,9 @@ pub struct FollowMark {
     pub branch: Option<String>,
     /// `仓库相对路径 → 暂存的 blob oid`。暂存的删除记全 0 oid。
     pub staged: BTreeMap<String, String>,
+    /// 跟进收尾时记的（[`write_commit_mark`]），不是失焦时记的。旧格式没有，是失焦快照。
+    #[serde(default)]
+    pub after_follow: bool,
 }
 
 impl FollowMark {
@@ -74,6 +77,28 @@ pub fn mark_path(repo: &str) -> PathBuf {
 ///
 /// `diff-index --cached` 只比索引与树，不扫工作区，也不写索引，失焦时跑得起。
 pub fn write_mark(repo: &str) -> Result<()> {
+    write_mark_with(repo, true)
+}
+
+/// 跟进收尾时记的快照：HEAD 与基线照记，暂存记空（2026-11-26 使用报告第 6.1 节做法甲）。
+///
+/// 收尾时清掉快照、等下一次失焦再写，中间有空窗：跟进完马上去 TortoiseSVN update / 提交，失焦那
+/// 一刻判定不是一致，不写，F2 ① 就一直没有快照可用。收尾这一刻的 HEAD 是跟进刚落下的，它的祖先
+/// 一定早于此后才开始的外部提交；跟进期间就开始的提交，开始时刻早于快照，按「不是快照之后」处理。
+///
+/// 只在钩子健康时有用（[`FollowMark::after_follow`]）：先后按本机提交事件的开始时刻比。没有钩子时
+/// 跟进按「快照的基线之后才进基线的路径」认外部提交，而收尾时的基线可能并不含快照之前的所有
+/// SVN 提交（部分跟进把冲突文件留在旧基线上；跟进期间完成的提交），早于快照的提交会被当成晚于
+/// 快照，快照里晚于那次提交的新工作就会被换掉。所以没有钩子时这份快照按没有处理，与改动前相同。
+///
+/// 暂存不记：跟进期间别处暂存的内容可能晚于同一段时间里的提交。记空等于「快照里没有暂存」，暂存
+/// 一律走三方合并，与没有快照时相同。下一次判定一致时的失焦会写一份完整的快照替换它。
+pub fn write_commit_mark(repo: &str) -> Result<()> {
+    write_mark_with(repo, false)
+}
+
+/// `with_staged` 为 false 时是收尾快照（[`write_commit_mark`]）。
+fn write_mark_with(repo: &str, with_staged: bool) -> Result<()> {
     // git 会往上找外层仓库，HEAD 解析得出来不代表这里有 `.git`。这时往下建目录会凭空造出
     // 一个 `.git`，§6.1 随后把目录认成 SvnSuspicious（与 `hold_for_baseline_move` 同一理由）
     if !Path::new(repo).join(".git").is_dir() {
@@ -90,17 +115,22 @@ pub fn write_mark(repo: &str) -> Result<()> {
         .map(str::to_string);
     // 比的是上面读到的 oid 而不是 `HEAD`：快照里的 HEAD 与暂存必须来自同一个基准。
     // `--ita-invisible-in-index`：否则 i-t-a 被报成 A + 空 blob，与真的暂存了一个空文件同形
-    let raw = run_git_bytes(
-        repo,
-        &[
-            "diff-index",
-            "--cached",
-            "-z",
-            "--no-renames",
-            "--ita-invisible-in-index",
-            &head_oid,
-        ],
-    )?;
+    let staged = if with_staged {
+        let raw = run_git_bytes(
+            repo,
+            &[
+                "diff-index",
+                "--cached",
+                "-z",
+                "--no-renames",
+                "--ita-invisible-in-index",
+                &head_oid,
+            ],
+        )?;
+        parse_staged(&raw)?
+    } else {
+        BTreeMap::new()
+    };
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok();
     let mark = FollowMark {
         at: now.map_or(0, |d| d.as_secs() as i64),
@@ -108,7 +138,8 @@ pub fn write_mark(repo: &str) -> Result<()> {
         head_oid,
         base_oid,
         branch,
-        staged: parse_staged(&raw)?,
+        staged,
+        after_follow: !with_staged,
     };
     store(&mark_path(repo), &mark)
 }
@@ -183,6 +214,14 @@ pub fn read_mark(repo: &str) -> Result<Option<FollowMark>> {
             log::warn!("失焦快照坏了，按没有快照处理：{e}");
             Ok(None)
         }
+    }
+}
+
+/// 跟进收尾：换成 [`write_commit_mark`]。写不了就照旧删掉，收尾不因快照失败（快照只是线索）。
+pub fn renew_mark_after_follow(repo: &str) {
+    if let Err(e) = write_commit_mark(repo) {
+        log::warn!("跟进收尾时记快照失败，按没有快照处理：{}", e.message);
+        clear_mark(repo);
     }
 }
 

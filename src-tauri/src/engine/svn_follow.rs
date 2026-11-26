@@ -68,12 +68,12 @@ use crate::engine::svn_basemap::{read_base_map, BaseMap};
 use crate::engine::svn_changelist;
 use crate::engine::svn_cli::{bypass_scan_cache, with_scan_cache};
 use crate::engine::svn_config::{read_config, SvnConfig, BASELINE_BRANCH};
-use crate::engine::svn_follow_disk::{check_disk, DiskCheck};
+use crate::engine::svn_follow_disk::{check_disk, supersede_safe, DiskCheck};
 use crate::engine::svn_follow_index::{
     judge_staging, prepare_index, prepare_index_with, rename_lock_into_index, ComposeReport,
     PathFacts, PreparedIndex,
 };
-use crate::engine::svn_follow_mark::{clear_mark, my_svn_user, read_mark, FollowMark};
+use crate::engine::svn_follow_mark::{my_svn_user, read_mark, renew_mark_after_follow, FollowMark};
 use crate::engine::svn_health::Health;
 use crate::engine::svn_include_check::normalize_roots;
 use crate::engine::svn_init::{confirm_tombstones, record_mixed_for_follow, Recorded};
@@ -111,7 +111,7 @@ use crate::engine::tsvn_inbox::{
 use crate::error::{GitError, Result};
 use crate::vcs::{detect_repo_kind, RepoKind};
 use git2::{BranchType, Repository};
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1703,9 +1703,12 @@ impl Who {
             }
             _ => (None, None),
         };
+        // 跟进收尾记的快照只在有钩子事件时可信：没有钩子时按基线判先后，收尾时的基线不一定含快照
+        // 之前的全部 SVN 提交（部分跟进留下的冲突文件），见 `write_commit_mark`
+        let mark = read_mark(repo)?.filter(|m| !m.after_follow || events.is_some());
         Ok(Self {
             me: my_svn_user(repo, repos_root),
-            mark: read_mark(repo)?,
+            mark,
             authors: nodes
                 .iter()
                 .map(|n| (n.path.clone(), n.author.clone()))
@@ -2187,14 +2190,30 @@ fn prepare(repo: &str, auto: bool, partial: Option<&Partial>, disk: DiskUse) -> 
         Some(after) => mine.intersection(after).cloned().collect(),
         None => BTreeSet::new(),
     };
+    // 每个提交只核对一次：当前分支、试重放、其他分支都会问到同一个提交
+    let checked: RefCell<BTreeMap<String, BTreeSet<String>>> = RefCell::new(BTreeMap::new());
     let superseded = |c: &ReplayCommit| -> BTreeSet<String> {
         // Local-Only 不是中间版本：换成 SVN 版本等于把本地补丁静默扔掉（Review 2 第 2 条）。
         // 真的被带上服务器时重放会变空或冲突，由 F3 与冲突出口接手
-        if !c.local_only && before_mark.contains(&c.oid) {
-            replaceable.clone()
-        } else {
-            BTreeSet::new()
+        if c.local_only || !before_mark.contains(&c.oid) || replaceable.is_empty() {
+            return BTreeSet::new();
         }
+        if let Some(s) = checked.borrow().get(&c.oid) {
+            return s.clone();
+        }
+        // 换之前核对改动是不是全在 SVN 版本里，否则 TortoiseSVN 只提交了一部分时，没提交的那部分
+        // 会被静默去掉（2026-11-26 使用报告第 6.2 节）。核对出错按不能换：照常重放是保守的方向
+        let safe = match c.parents.as_slice() {
+            [parent] => supersede_safe(repo, &c.oid, parent, &new_base, &replaceable)
+                .unwrap_or_else(|e| {
+                    log::warn!("F2 ① 换之前的核对出错，这个提交照常重放：{}", e.message);
+                    BTreeSet::new()
+                }),
+            // 重放本来就要求线性，这里不替它报错
+            _ => BTreeSet::new(),
+        };
+        checked.borrow_mut().insert(c.oid.clone(), safe.clone());
+        safe
     };
     // 6.10：快照进来的 SVN 内容按基线走。规则按分支自己的基线算，其他分支在 `plan_other` 里另拼
     let snapshot = SnapshotRule::new(repo, &new_base);
@@ -3954,7 +3973,8 @@ fn finish(repo: &str, j: &mut Journal) -> Result<FollowOutcome> {
         }
         fault::reach(fault::Point::OtherMoved, None);
     }
-    clear_mark(repo);
+    // 换成收尾这一刻的快照，不留空窗（2026-11-26 使用报告第 2.4 节）
+    renew_mark_after_follow(repo);
     // 跟进完成：读收件箱之前到的事件都已反映在新基线里（C1h）。之后才到的留给下一次
     if let Some(cutoff) = report.evidence_cutoff_ms {
         let now = SystemTime::now()

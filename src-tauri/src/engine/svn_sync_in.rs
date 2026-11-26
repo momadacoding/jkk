@@ -28,7 +28,7 @@ use crate::engine::svn_cli::{run_svn, run_svn_code};
 use crate::engine::svn_config::{read_config, SvnConfig, BASELINE_BRANCH};
 use crate::engine::svn_dirty::read_dirty;
 use crate::engine::svn_follow_audit;
-use crate::engine::svn_follow_mark::clear_mark;
+use crate::engine::svn_follow_mark::renew_mark_after_follow;
 use crate::engine::svn_include_check::normalize_roots;
 use crate::engine::svn_init::{rebuild_baseline, record_mixed, record_server_tree_into};
 use crate::engine::svn_journal::{self, Flow, Journal, Phase};
@@ -702,8 +702,9 @@ pub(crate) fn conflict_or_error(repo: &str, e: GitError) -> Result<SyncInOutcome
 pub(crate) fn finish_forward(repo: &str, j: &mut Journal) -> Result<SyncInOutcome> {
     let manual = j.flow == Flow::FollowManual;
     if manual {
-        // 分支已经落到基线上，快照里的 HEAD 与暂存都过时了（跟进的 F6 同样清它）
-        clear_mark(repo);
+        // 分支已经落到基线上，旧快照里的 HEAD 与暂存都过时了。换成这一刻只含 commit 的快照
+        // （跟进的 F6 同样换）：放回收起的改动不动 HEAD，暂存本来就不记，放在这里与放在后面一样
+        renew_mark_after_follow(repo);
     }
     // 收尾核对只给手动跟进：更新（sync_in）自己跑了 svn update，磁盘本来就该变
     let mut audit = manual.then(Audit::default);
