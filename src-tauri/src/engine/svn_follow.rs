@@ -68,6 +68,7 @@ use crate::engine::svn_basemap::{read_base_map, BaseMap};
 use crate::engine::svn_changelist;
 use crate::engine::svn_cli::{bypass_scan_cache, with_scan_cache};
 use crate::engine::svn_config::{read_config, SvnConfig, BASELINE_BRANCH};
+use crate::engine::svn_follow_disk::{check_disk, DiskCheck};
 use crate::engine::svn_follow_index::{
     judge_staging, prepare_index, prepare_index_with, rename_lock_into_index, ComposeReport,
     PathFacts, PreparedIndex,
@@ -82,8 +83,8 @@ use crate::engine::svn_lock;
 use crate::engine::svn_nodes::{compute_map, read_node_status, NodeStatus};
 use crate::engine::svn_preflight::run_preflight_with;
 use crate::engine::svn_replay::{
-    all_committed, commit_without, commits_between, replay_onto, ReplayCodes, ReplayCommit,
-    ReplayOpts, ReplayOutcome,
+    all_committed, commit_without, commits_between, no_resolved, replay_onto, ConflictStage,
+    ReplayCodes, ReplayCommit, ReplayOpts, ReplayOutcome, Resolution,
 };
 use crate::engine::svn_restore_local_only::{
     local_only_commits, record_pending, restorable_paths, restore_locked, RestoreOutcome,
@@ -173,6 +174,11 @@ pub enum FollowOutcome {
         /// 每个冲突文件的上下文（事故分析 6.5）：SVN 上是谁、在哪个 revision 改的，冲突那几行的预览。
         /// 与 `files` 同序；`stale_disk` 时为空。
         details: Vec<ConflictDetail>,
+        /// 新基线（`svn/base`）：冲突框里「对比」的左边，SVN 的新版本。
+        base: String,
+        /// 每个冲突文件都能直接用磁盘内容，带着替换试重放整条分支也没有别的冲突：冲突框显示
+        /// 「用磁盘上的内容跟进」（设计 2026-11-25-follow-resolve-with-disk）。
+        disk_ready: bool,
     },
     /// 什么都没动：前置条件不满足，或者准备阶段失败。
     Refused {
@@ -252,6 +258,10 @@ pub struct FollowReport {
     /// 文件里没对上的 hunk 仍在 `leaks`。钩子不健康时不读事件，这里总是空的。
     #[serde(default)]
     pub acknowledged_leaks: Vec<Leak>,
+    /// (原 commit, 冲突时直接采用了磁盘内容的路径)：用户在冲突框里点了「用磁盘上的内容跟进」
+    /// （设计 2026-11-25-follow-resolve-with-disk）。这些文件在提交里就是磁盘上的样子。
+    #[serde(default)]
+    pub disk_resolved: Vec<(String, Vec<String>)>,
     /// 钉着换入之前的原始索引与暂存 blob 的 ref。没拼过索引时（只发布了基线）是 `None`。
     #[serde(default)]
     pub pinned_ref: Option<String>,
@@ -302,9 +312,12 @@ pub fn git_version_ok(text: &str) -> bool {
 }
 
 /// 跟进一次：判定为 ExternallyAdvanced 时走 F1–F6，InSync 而分支落后时走「分支跟进」入口。
+///
+/// 当前分支重放冲突时顺便探测磁盘上的内容能不能直接用，结果在 `NeedsManual` 的 `disk_ready` 与
+/// 每个文件的 `details[].disk` 里，什么都不替换（设计 2026-11-25-follow-resolve-with-disk）。
 pub fn follow(repo: &str, opid: &str) -> Result<FollowOutcome> {
     // 不算带回的判定：调用方（续跟 `resume_follow`、测试）用不上，锁内白读一遍基线树和落后清单
-    Ok(follow_carrying(repo, opid, false)?.0)
+    Ok(follow_carrying(repo, opid, DiskUse::Probe, false)?.0)
 }
 
 /// 同 [`follow`]，另外带回发布之后的判定（[`SyncAfterFollow`]）。基线发布了（完成、或当前分支冲突）
@@ -313,18 +326,45 @@ pub fn follow_with_sync(
     repo: &str,
     opid: &str,
 ) -> Result<(FollowOutcome, Option<SyncAfterFollow>)> {
-    follow_carrying(repo, opid, true)
+    follow_carrying(repo, opid, DiskUse::Probe, true)
 }
 
-/// [`follow`] 与 [`follow_with_sync`] 的本体。`carry` 为假时不算判定。
+/// 冲突框里的「用磁盘上的内容跟进」（设计 2026-11-25-follow-resolve-with-disk）：冲突文件的重放
+/// 结果直接换成磁盘内容，然后照常发布。**不写工作区**，只动 ref 与索引，与 [`follow`] 相同。
+///
+/// `files` 是冲突框里列过的文件，`base` 是冲突框给人对比时用的新基线。按此刻的磁盘重跑全部检查；
+/// 不能用、要替换的文件不在 `files` 里、或者新基线已经不是 `base`（点击之前 SVN 又前进了，用户对比
+/// 时看的左边是旧的），什么都不替换，返回新的 `NeedsManual` 让冲突框重画（设计 §11 第 6 条）。
+///
+/// 与 [`follow_with_sync`] 一样带回发布之后的判定：完成之后横幅照样不用再扫一遍 `svn status`。
+pub fn follow_with_disk(
+    repo: &str,
+    opid: &str,
+    files: &[String],
+    base: &str,
+) -> Result<(FollowOutcome, Option<SyncAfterFollow>)> {
+    let confirmed: BTreeSet<String> = files.iter().cloned().collect();
+    follow_carrying(
+        repo,
+        opid,
+        DiskUse::Apply {
+            files: &confirmed,
+            base,
+        },
+        true,
+    )
+}
+
+/// [`follow`]、[`follow_with_sync`] 与 [`follow_with_disk`] 的本体。`carry` 为假时不算判定。
 fn follow_carrying(
     repo: &str,
     opid: &str,
+    disk: DiskUse,
     carry: bool,
 ) -> Result<(FollowOutcome, Option<SyncAfterFollow>)> {
     for _ in 0..MAX_ATTEMPTS {
         // 准备阶段里同一条 svn 扫描只跑一次（性能 P2）；发布前的复核在范围外，照常读最新的
-        let plan = match with_scan_cache(|| prepare(repo, false, None)) {
+        let plan = match with_scan_cache(|| prepare(repo, false, None, disk)) {
             Ok(p) => p,
             Err(e) => return Ok((refused(e), None)),
         };
@@ -560,7 +600,7 @@ fn skipped(e: impl Into<AutoSkip>) -> AutoFollowOutcome {
 ///
 /// `Err` 就是不自动跟进的原因，一个 ref 都没动。
 fn prepare_auto(repo: &str) -> std::result::Result<Plan, AutoSkip> {
-    let plan = prepare(repo, true, None)?;
+    let plan = prepare(repo, true, None, DiskUse::Off)?;
     let Some(err) = auto_blocker(&plan) else {
         return Ok(plan);
     };
@@ -579,7 +619,7 @@ fn prepare_auto(repo: &str) -> std::result::Result<Plan, AutoSkip> {
             conflict: None,
         });
     }
-    match prepare(repo, true, Some(&Partial { rec, held })) {
+    match prepare(repo, true, Some(&Partial { rec, held }), DiskUse::Off) {
         Ok(p) if auto_blocker(&p).is_none() => Ok(p),
         Ok(_) => Err(first),
         Err(e) => {
@@ -1347,7 +1387,17 @@ fn needs_manual(m: &ManualNeeded) -> FollowOutcome {
         stale_disk: m.stale_disk,
         snapshot: m.snapshot.clone(),
         details: m.details.clone(),
+        base: m.base.clone(),
+        disk_ready: m.disk_ready,
     }
+}
+
+/// 冲突文件能不能直接用磁盘上的内容（[`crate::engine::svn_follow_disk`]）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum DiskVerdict {
+    Usable,
+    Refused { reason: String },
 }
 
 /// 冲突框里一个冲突文件的上下文（事故分析 6.5）。11-05 那次要手工跑 git log / svn log / svn cat
@@ -1364,6 +1414,13 @@ pub struct ConflictDetail {
     /// 第一处冲突块，标签换成人话，每一侧最多 [`PREVIEW_SIDE_LINES`] 行（见 [`preview_of`]）。二进制、太大、没有冲突标记（如修改与删除
     /// 撞上）时为 `None`。
     pub preview: Option<String>,
+    /// 能不能直接用磁盘上的内容。没探测（自动跟进、试重放没走到这个文件）时为 `None`。
+    #[serde(default)]
+    pub disk: Option<DiskVerdict>,
+    /// 这个文件在哪个原 commit 处冲突。试重放一路走下去时，后面的文件不在第一个冲突的 commit 上：
+    /// 冲突框「对比你的提交」的右边要取它（独立 review 低 4）。没探测时为 `None`。
+    #[serde(default)]
+    pub commit: Option<String>,
 }
 
 /// 手动跟进（分析 §6.5；计划 Task 13）：对象层重放冲突时的兜底，需要人来判断，所以**只由用户显式
@@ -1573,6 +1630,23 @@ struct ManualNeeded {
     /// 手动跟进会按 6.10 直接采用新基线版本的路径，见 [`manual_snapshot`]。
     snapshot: PathsByCommit,
     details: Vec<ConflictDetail>,
+    base: String,
+    disk_ready: bool,
+}
+
+/// 准备阶段对「用磁盘上的内容跟进」做什么（设计 2026-11-25-follow-resolve-with-disk）。
+#[derive(Clone, Copy)]
+enum DiskUse<'a> {
+    /// 不看磁盘：自动跟进（设计 §10 问题 4 推迟到第二版）。
+    Off,
+    /// 冲突时探测能不能用，结果只写进冲突框。
+    Probe,
+    /// 用户点了按钮：能用、而且替换的文件都在这份清单里（冲突框列过的），就带着替换往下走。
+    /// 新基线还得是冲突框里给人对比的那个 `base`。
+    Apply {
+        files: &'a BTreeSet<String>,
+        base: &'a str,
+    },
 }
 
 struct Plan {
@@ -1596,6 +1670,8 @@ struct Plan {
     /// 条件 11 的核对没做成（[`overlap_files`] 出错）。报告里的 `overlap` 这时为空，自动跟进
     /// 不能把它当成「没有重叠」。
     overlap_err: Option<GitError>,
+    /// 用磁盘内容替换的文件 → 准备时算的 blob。锁内复核磁盘还是这个（[`still_valid`]）。
+    disk_used: BTreeMap<String, String>,
 }
 
 /// 判定「是不是我提交的」「早于外部提交吗」的线索（计划 Task 9）。全部拿不准时走保守分支。
@@ -1984,7 +2060,7 @@ fn branch_baseline(repo: &str, head: &str, base: &str) -> Result<String> {
 ///
 /// `auto`：自动跟进只接 ExternallyAdvanced（日志 Task 1「偏离计划」），分支跟进入口在录制之前就停。
 /// `partial`：部分自动跟进的第二遍（[`prepare_auto`]）。按钮走的整次跟进恒为 `None`。
-fn prepare(repo: &str, auto: bool, partial: Option<&Partial>) -> Result<Plan> {
+fn prepare(repo: &str, auto: bool, partial: Option<&Partial>, disk: DiskUse) -> Result<Plan> {
     if detect_repo_kind(repo) != RepoKind::SvnHybrid {
         return Err(not_hybrid());
     }
@@ -2147,22 +2223,75 @@ fn prepare(repo: &str, auto: bool, partial: Option<&Partial>) -> Result<Plan> {
     // F2 当前分支。memo 跨分支共享：共享的 commit 只重放一次（R20）
     let mut memo = BTreeMap::new();
     let commits = commits_between(repo, &scope, &old_head, &FOLLOW_CODES)?;
-    let replayed = replay_branch(
-        repo, &scope, &old_head, &new_base, &commits, &current, &mut memo,
+    let first = replay_branch(
+        repo,
+        &scope,
+        &old_head,
+        &new_base,
+        &commits,
+        Rules {
+            superseded: &current,
+            resolved: &no_resolved,
+        },
+        &mut memo,
     )?;
+    // 设计 2026-11-25-follow-resolve-with-disk：冲突时看磁盘上的内容能不能直接用。替换后的重放
+    // 结果不进 memo（`ReplayOpts::resolved`），其他分支照旧
+    let mut probe = match (&first, disk) {
+        (Replayed::Conflict { .. }, DiskUse::Probe | DiskUse::Apply { .. }) => {
+            let branch = BranchReplay {
+                repo,
+                scope: &scope,
+                head: &old_head,
+                new_base: &new_base,
+                commits: &commits,
+                superseded: &current,
+            };
+            // 试重放会走到第一次重放没走到的提交，那里的意外失败（superseded 碰到目录、merge-tree
+            // 异常退出）不能把本来的冲突框变成 Refused、连基线都不发布（独立 review 中 2）
+            Some(
+                probe_disk(&branch, &mut memo, &first, &ext)
+                    .unwrap_or_else(|e| probe_failed(repo, &first, &ext, &e)),
+            )
+        }
+        _ => None,
+    };
+    let mut disk_used = BTreeMap::new();
+    let replayed = match (disk, probe.as_mut()) {
+        (DiskUse::Apply { files, base }, Some(p))
+            if p.ready.is_some()
+                && new_base == base
+                && p.used.keys().all(|f| files.contains(f)) =>
+        {
+            disk_used = std::mem::take(&mut p.used);
+            p.ready.take().unwrap_or(first)
+        }
+        _ => first,
+    };
     let stale = match &replayed {
         Replayed::Moved { tip, .. } => stale_disk_paths(repo, &scope, &old_base, &old_head, tip)?,
         Replayed::Conflict { .. } => Vec::new(),
     };
     let mut overlap_err = None;
     let (target, others) = match replayed {
-        Replayed::Conflict { at, files, tree } => {
+        Replayed::Conflict {
+            at, files, tree, ..
+        } => {
             // F3 也要算：分支没重放，但补丁可能已经上了服务器，用户要在手动跟进之前知道
             let (leaks, acknowledged_leaks) = split_acknowledged(
                 local_only_leaks(repo, &branch, &commits, &paths, &new_base)?,
                 who.acknowledged(),
             );
-            let details = conflict_details(repo, &files, &tree, &ext);
+            let (files, details, disk_ready) = match probe {
+                Some(p) => {
+                    let ready = p.ready.is_some();
+                    (p.files, p.details, ready)
+                }
+                None => {
+                    let details = conflict_details(repo, &files, &tree, &ext);
+                    (files, details, false)
+                }
+            };
             (
                 Target::Conflict(ManualNeeded {
                     at,
@@ -2172,6 +2301,8 @@ fn prepare(repo: &str, auto: bool, partial: Option<&Partial>) -> Result<Plan> {
                     stale_disk: false,
                     snapshot: manual_snapshot(&commits, &snapshot, &scope),
                     details,
+                    base: new_base.clone(),
+                    disk_ready,
                 }),
                 Vec::new(),
             )
@@ -2191,6 +2322,8 @@ fn prepare(repo: &str, auto: bool, partial: Option<&Partial>) -> Result<Plan> {
                     stale_disk: true,
                     snapshot: manual_snapshot(&commits, &snapshot, &scope),
                     details: Vec::new(),
+                    base: new_base.clone(),
+                    disk_ready: false,
                 }),
                 Vec::new(),
             )
@@ -2199,8 +2332,10 @@ fn prepare(repo: &str, auto: bool, partial: Option<&Partial>) -> Result<Plan> {
             tip,
             dropped,
             rewritten,
+            resolved,
         } => {
             report.dropped = dropped;
+            report.disk_resolved = resolved;
             let (snap, own) = split_snapshot(rewritten, &commits, &superseded, &snapshot, &scope);
             report.rewritten = own;
             report.snapshot = snap;
@@ -2273,7 +2408,167 @@ fn prepare(repo: &str, auto: bool, partial: Option<&Partial>) -> Result<Plan> {
         rec: full_rec,
         who,
         overlap_err,
+        disk_used,
     })
+}
+
+/// [`probe_disk`] 本身出错时的结论：第一次重放的冲突文件照旧列出，全部标成「核对时出错」。
+fn probe_failed(repo: &str, first: &Replayed, ext: &External, e: &GitError) -> DiskProbe {
+    log::warn!("探测能否用磁盘内容时出错：{}", e.message);
+    let (files, details) = match first {
+        Replayed::Conflict {
+            at, files, tree, ..
+        } => {
+            let mut details = conflict_details(repo, files, tree, ext);
+            for d in &mut details {
+                d.commit = Some(at.clone());
+                d.disk = Some(DiskVerdict::Refused {
+                    reason: format!("核对时出错：{}", e.message.trim()),
+                });
+            }
+            (files.clone(), details)
+        }
+        Replayed::Moved { .. } => (Vec::new(), Vec::new()),
+    };
+    DiskProbe {
+        files,
+        details,
+        ready: None,
+        used: BTreeMap::new(),
+    }
+}
+
+/// 当前分支这一次重放的输入，[`probe_disk`] 照同样的输入再重放。
+#[derive(Clone, Copy)]
+struct BranchReplay<'a> {
+    repo: &'a str,
+    scope: &'a str,
+    head: &'a str,
+    new_base: &'a str,
+    commits: &'a [ReplayCommit],
+    superseded: &'a dyn Fn(&ReplayCommit) -> BTreeSet<String>,
+}
+
+/// [`probe_disk`] 的结果。
+struct DiskProbe {
+    /// 试重放一路遇到的冲突文件，从第一个冲突的 commit 起。
+    files: Vec<String>,
+    /// 与 `files` 同序，每个都带着 [`ConflictDetail::disk`]。
+    details: Vec<ConflictDetail>,
+    /// 全部能用、带着替换把整条分支重放干净时的结果（[`Replayed::Moved`]）。
+    ready: Option<Replayed>,
+    /// 替换的文件 → 磁盘 blob。
+    used: BTreeMap<String, String>,
+}
+
+/// 冲突文件能不能用磁盘内容，能的话带着替换继续试重放（设计 2026-11-25 §11 第 5 条）：
+/// 冲突 → 判这批文件 → 全部能用就加进替换、从头再重放 → 下一个冲突。任何一个不能用就停，
+/// 第一版全有或全无（§10 问题 2）。
+///
+/// `memo` 照常传：冲突之前的 commit 命中第一次重放的结果，OID 与其他分支共用的一致；替换过的
+/// commit 及之后的不会写进去（`ReplayOpts::resolved`）。
+fn probe_disk(
+    b: &BranchReplay,
+    memo: &mut BTreeMap<String, String>,
+    first: &Replayed,
+    ext: &External,
+) -> Result<DiskProbe> {
+    let BranchReplay {
+        repo,
+        scope,
+        head,
+        new_base,
+        commits,
+        superseded,
+    } = *b;
+    let Replayed::Conflict {
+        at,
+        files,
+        tree,
+        stages,
+    } = first
+    else {
+        return Err(GitError::new(
+            FOLLOW_CODES.failed,
+            "内部错误：没有冲突却去探测磁盘",
+        ));
+    };
+    let mut round = (at.clone(), files.clone(), tree.clone(), stages.clone());
+    let mut given: BTreeMap<String, BTreeMap<String, Resolution>> = BTreeMap::new();
+    let mut probe = DiskProbe {
+        files: Vec::new(),
+        details: Vec::new(),
+        ready: None,
+        used: BTreeMap::new(),
+    };
+    // 每一轮至少解决一个 commit，轮数不会超过 commit 数
+    for _ in 0..=commits.len() {
+        let (at, files, tree, stages) = round;
+        // 没有文件条目的冲突（目录被拆到两处之类）没有可替换的东西
+        if files.is_empty() {
+            probe.used.clear();
+            return Ok(probe);
+        }
+        let wanted: BTreeMap<String, Vec<ConflictStage>> = files
+            .iter()
+            .map(|f| (f.clone(), stages.get(f).cloned().unwrap_or_default()))
+            .collect();
+        let checks = check_disk(repo, scope, head, &wanted);
+        let mut all_usable = true;
+        let mut details = conflict_details(repo, &files, &tree, ext);
+        for d in &mut details {
+            d.commit = Some(at.clone());
+            match checks.get(&d.path) {
+                Some(DiskCheck::Usable(r)) if !probe.used.contains_key(&d.path) => {
+                    d.disk = Some(DiskVerdict::Usable);
+                    probe.used.insert(d.path.clone(), r.blob.clone());
+                    given
+                        .entry(at.clone())
+                        .or_default()
+                        .insert(d.path.clone(), r.clone());
+                }
+                Some(DiskCheck::Refused(why)) => {
+                    all_usable = false;
+                    d.disk = Some(DiskVerdict::Refused {
+                        reason: why.clone(),
+                    });
+                }
+                // 替换过的文件在后面的 commit 里又冲突：前置检查保证只有一个 commit 改过它，到这里是
+                // 判断与重放对不上，不猜
+                _ => {
+                    all_usable = false;
+                    d.disk = Some(DiskVerdict::Refused {
+                        reason: "核对时出错：替换之后这个文件又冲突了".to_string(),
+                    });
+                }
+            }
+        }
+        probe.files.extend(files);
+        probe.details.extend(details);
+        if !all_usable {
+            probe.used.clear();
+            return Ok(probe);
+        }
+        let resolved = |c: &ReplayCommit| given.get(&c.oid).cloned().unwrap_or_default();
+        let rules = Rules {
+            superseded,
+            resolved: &resolved,
+        };
+        match replay_branch(repo, scope, head, new_base, commits, rules, memo)? {
+            moved @ Replayed::Moved { .. } => {
+                probe.ready = Some(moved);
+                return Ok(probe);
+            }
+            Replayed::Conflict {
+                at,
+                files,
+                tree,
+                stages,
+            } => round = (at, files, tree, stages),
+        }
+    }
+    probe.used.clear();
+    Ok(probe)
 }
 
 /// 录新基线（分析 §6.3）。候选索引从旧基线树起步、沿用真实索引的 stat，免得每次跟进都把白名单
@@ -2472,6 +2767,8 @@ fn conflict_details(
                 svn_author: change.and_then(|c| c.author.clone()),
                 svn_removed: ext.removed.contains(path),
                 preview,
+                disk: None,
+                commit: None,
             }
         })
         .collect()
@@ -2629,12 +2926,15 @@ enum Replayed {
         tip: String,
         dropped: Vec<String>,
         rewritten: Vec<(String, Vec<String>)>,
+        /// 冲突时采用了磁盘内容的 (原 commit, 路径)，见 [`ReplayOpts::resolved`]。
+        resolved: Vec<(String, Vec<String>)>,
     },
     Conflict {
         at: String,
         files: Vec<String>,
         /// merge-tree 的冲突树，见 [`ReplayOutcome::Conflict`]。
         tree: String,
+        stages: BTreeMap<String, Vec<ConflictStage>>,
     },
 }
 
@@ -2652,6 +2952,13 @@ fn require_linear(repo: &str, scope: &str, head: &str) -> Result<()> {
     })
 }
 
+/// 重放时按 commit 给出的两组路径规则，见 [`ReplayOpts::superseded`] 与 [`ReplayOpts::resolved`]。
+#[derive(Clone, Copy)]
+struct Rules<'a> {
+    superseded: &'a dyn Fn(&ReplayCommit) -> BTreeSet<String>,
+    resolved: &'a dyn Fn(&ReplayCommit) -> BTreeMap<String, Resolution>,
+}
+
 /// F2：先试「已全部提交」捷径（不要求线性），否则线性检查后逐个重放。
 fn replay_branch(
     repo: &str,
@@ -2659,20 +2966,26 @@ fn replay_branch(
     head: &str,
     new: &str,
     commits: &[ReplayCommit],
-    superseded: &dyn Fn(&ReplayCommit) -> BTreeSet<String>,
+    rules: Rules,
     memo: &mut BTreeMap<String, String>,
 ) -> Result<Replayed> {
+    let Rules {
+        superseded,
+        resolved,
+    } = rules;
     if all_committed(repo, scope, head, new)? {
         return Ok(Replayed::Moved {
             tip: new.to_string(),
             dropped: commits.iter().map(|c| c.oid.clone()).collect(),
             rewritten: Vec::new(),
+            resolved: Vec::new(),
         });
     }
     require_linear(repo, scope, head)?;
     let opts = ReplayOpts {
         drop_empty: true,
         superseded,
+        resolved,
         codes: FOLLOW_CODES,
     };
     Ok(match replay_onto(repo, new, commits, &opts, memo)? {
@@ -2680,13 +2993,25 @@ fn replay_branch(
             tip,
             dropped,
             rewritten,
+            resolved,
             ..
         } => Replayed::Moved {
             tip,
             dropped,
             rewritten,
+            resolved,
         },
-        ReplayOutcome::Conflict { at, files, tree } => Replayed::Conflict { at, files, tree },
+        ReplayOutcome::Conflict {
+            at,
+            files,
+            tree,
+            stages,
+        } => Replayed::Conflict {
+            at,
+            files,
+            tree,
+            stages,
+        },
     })
 }
 
@@ -2906,12 +3231,25 @@ fn plan_other(
         p.extend(ctx.snapshot.paths(&own, c));
         p
     };
-    let replayed = replay_branch(repo, &own, &b.oid, ctx.new_base, &commits, &sup, memo);
+    // 其他分支不用磁盘内容：磁盘只属于当前分支（设计 2026-11-25 §11 第 2 条）
+    let replayed = replay_branch(
+        repo,
+        &own,
+        &b.oid,
+        ctx.new_base,
+        &commits,
+        Rules {
+            superseded: &sup,
+            resolved: &no_resolved,
+        },
+        memo,
+    );
     match replayed {
         Ok(Replayed::Moved {
             tip,
             dropped,
             rewritten,
+            ..
         }) => {
             for d in dropped {
                 if !report.dropped.contains(&d) {
@@ -3096,6 +3434,11 @@ fn still_valid(repo: &str, plan: &Plan) -> Result<Recheck> {
             return Ok(Recheck::Changed);
         }
     }
+    // 用磁盘内容替换的文件：准备之后磁盘又变了，提交里写的就是旧的那一份。重来一次按新内容重判
+    // （设计 2026-11-25 §11 第 6 条）。改了不会丢东西（工作区不写），只是提交与用户看到的对不上
+    if !plan.disk_used.is_empty() && !disk_unchanged(repo, &plan.disk_used) {
+        return Ok(Recheck::Changed);
+    }
     let Some(map) = &plan.recorded else {
         return Ok(Recheck::Valid { nodes: None });
     };
@@ -3172,6 +3515,24 @@ fn sync_after(repo: &str, nodes: Option<&[NodeStatus]>) -> Option<SyncAfterFollo
             None
         }
     }
+}
+
+/// 这些文件磁盘上的 blob（按 `git add` 的过滤规则）仍是准备时算的那个。文件没了、算不出来都算变了。
+fn disk_unchanged(repo: &str, used: &BTreeMap<String, String>) -> bool {
+    if used.keys().any(|p| {
+        !Path::new(repo)
+            .join(p)
+            .symlink_metadata()
+            .is_ok_and(|m| m.is_file())
+    }) {
+        return false;
+    }
+    let input: String = used.keys().map(|p| format!("{p}\n")).collect();
+    let Ok(out) = run_git_stdin(repo, &["hash-object", "--stdin-paths"], input.as_bytes()) else {
+        return false;
+    };
+    let now: Vec<&str> = out.lines().map(str::trim).collect();
+    now.len() == used.len() && used.values().zip(now).all(|(a, b)| a == b)
 }
 
 /// F4（写 journal）与 F5、F6。调用方持同步锁。走到这里之后失败都是 `Err`，除非基线还没动。

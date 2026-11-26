@@ -11,6 +11,7 @@ import { SplitLocalOnlyDialog } from '@/components/SplitLocalOnlyDialog'
 import { DeleteWorktreeDialog } from '@/components/DeleteWorktreeDialog'
 import { useDeliverDialog } from '@/components/DeliverDialog'
 import { useFollowReportDialog } from '@/components/FollowReportDialog'
+import { useFollowConflictDialog } from '@/components/FollowConflictDialog'
 import { usePrompt } from '@/components/PromptDialog'
 import { SettingsDialog } from '@/components/SettingsDialog'
 import SvnInitWizard from '@/components/SvnInitWizard'
@@ -18,7 +19,7 @@ import { TabBar } from '@/components/TabBar'
 import { TsvnHooksDialog } from '@/components/TsvnHooksDialog'
 import { ALL_CAPABILITIES } from '@/engine/capabilities'
 import { describeDiscard } from '@/engine/discardConfirm'
-import type { FollowReport } from '@/engine/svnFollow'
+import { describeFollowConflictModel, type FollowReport } from '@/engine/svnFollow'
 import { describeHealth } from '@/engine/svnInit'
 import { describeSyncInPreview } from '@/engine/svnSyncIn'
 import { describeDeliverPreview } from '@/engine/svnSyncOut'
@@ -126,6 +127,54 @@ function Deliver({ fail = false }: { fail?: boolean }) {
           onMessageChange: noop,
           action: async () => {
             if (fail) throw new Error('[svn_commit_failed] 服务器拒绝了这次提交')
+          },
+        })
+      }
+    >
+      {dialog}
+    </OpenOnMount>
+  )
+}
+
+/** 跟进冲突框（设计 2026-11-25-follow-resolve-with-disk §5）：能用磁盘内容的状态，三个按钮都在。 */
+function FollowConflict() {
+  const { showFollowConflict, dialog } = useFollowConflictDialog()
+  const files = paths(40)
+  const model = describeFollowConflictModel({
+    kind: 'needsManual',
+    at: 'c'.repeat(40),
+    files,
+    baselinePublished: true,
+    leaks: [
+      {
+        branch: 'work',
+        commit: 'l'.repeat(40),
+        subject: '[Local-Only] 调试日志',
+        path: files[0],
+        hunks: [{ oldStart: 3, lines: 1, verdict: 'unknown' }],
+      },
+    ],
+    staleDisk: false,
+    snapshot: [['f'.repeat(40), paths(30)]],
+    base: 'b'.repeat(40),
+    diskReady: true,
+    details: files.map((path, i) => ({
+      path,
+      svnRev: 70760 + i,
+      svnAuthor: 'a-colleague-with-a-very-long-svn-user-name',
+      svnRemoved: false,
+      preview: null,
+      disk: { kind: 'usable' },
+    })),
+  })
+  return (
+    <OpenOnMount
+      open={() =>
+        void showFollowConflict({
+          model,
+          compare: () => ({ label: 'Beyond Compare', open: async () => {} }),
+          run: async () => {
+            throw new Error(LONG_ERROR)
           },
         })
       }
@@ -330,6 +379,8 @@ const SCENES: Record<string, () => ReactNode> = {
   'deliver-long': () => <Deliver />,
   'deliver-short-error': () => <Deliver fail />,
   'follow-report-long': () => <Follow />,
+  'follow-conflict-long': () => <FollowConflict />,
+  'follow-conflict-long-error': () => <FollowConflict />,
   'split-local-only-long': () => (
     <SplitLocalOnlyDialog
       request={{

@@ -970,7 +970,8 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     // 只测 Refused 的话，变体字段与结构体字段的 serde 属性写错都测不到
     use app_lib::engine::git_read::LineStat;
     use app_lib::engine::svn_follow::{
-        ConflictDetail, DriftRange, Evidence, FollowOutcome, FollowReport, HeldBack, OverlapFile,
+        ConflictDetail, DiskVerdict, DriftRange, Evidence, FollowOutcome, FollowReport, HeldBack,
+        OverlapFile,
     };
     use app_lib::engine::svn_follow_index::{ComposeReport, StageDecision};
     use app_lib::engine::svn_leak::{HunkLeak, Leak, LeakVerdict, StageTally};
@@ -1014,7 +1015,13 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
             svn_author: Some("li".into()),
             svn_removed: false,
             preview: Some("<<<<<<< 新基线（SVN）".into()),
+            disk: Some(DiskVerdict::Refused {
+                reason: "磁盘上还有冲突标记".into(),
+            }),
+            commit: Some("c".into()),
         }],
+        base: "b".into(),
+        disk_ready: false,
     })
     .unwrap();
     assert_eq!(
@@ -1046,8 +1053,17 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
                 "svnAuthor": "li",
                 "svnRemoved": false,
                 "preview": "<<<<<<< 新基线（SVN）",
+                "disk": { "kind": "refused", "reason": "磁盘上还有冲突标记" },
+                "commit": "c",
             }],
+            "base": "b",
+            "diskReady": false,
         })
+    );
+    // 能用时前端 `ConflictDetail.disk` 读到 `{ kind: 'usable' }`
+    assert_eq!(
+        serde_json::to_value(DiskVerdict::Usable).unwrap(),
+        serde_json::json!({ "kind": "usable" })
     );
 
     let v = serde_json::to_value(FollowOutcome::Refused {
@@ -1178,6 +1194,7 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
             moved_branches: vec!["feature".into()],
             behind_branches: vec![("old".into(), "冲突".into())],
             pinned_ref: Some("refs/mygitclient/follow/x".into()),
+            disk_resolved: vec![("c4".into(), vec!["Code/K.cs".into()])],
             evidence: Evidence::Hooks,
             evidence_cutoff_ms: Some(42),
             leaks: vec![Leak {
@@ -1259,6 +1276,11 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     assert_eq!(r["movedBranches"][0], "feature");
     assert_eq!(r["behindBranches"][0], serde_json::json!(["old", "冲突"]));
     assert_eq!(r["pinnedRef"], "refs/mygitclient/follow/x", "实际 {v}");
+    assert_eq!(
+        r["diskResolved"],
+        serde_json::json!([["c4", ["Code/K.cs"]]]),
+        "实际 {v}"
+    );
     assert_eq!(r["evidence"], "hooks", "实际 {v}");
     assert_eq!(r["evidenceCutoffMs"], 42, "实际 {v}");
     assert_eq!(r["acknowledgedLeaks"][0]["path"], "Code/J.cs", "实际 {v}");

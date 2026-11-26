@@ -47,6 +47,10 @@ export const SCENARIOS: LayoutScenario[] = [
   // 错误在内容末尾、只有一行：从顶部点交付，它最容易出在视野外或藏在按钮条下面
   { id: 'deliver-short-error', component: 'DeliverDialog', clickPrimary: true },
   { id: 'follow-report-long', component: 'FollowReportDialog' },
+  // 几十个冲突文件、长路径长原因，后面跟着泄漏与快照两段：三个按钮仍要够得着
+  { id: 'follow-conflict-long', component: 'FollowConflictDialog' },
+  // 点磁盘按钮之后后端失败：长错误挂在按钮条上方
+  { id: 'follow-conflict-long-error', component: 'FollowConflictDialog', clickPrimary: true },
   { id: 'tsvn-hooks-long', component: 'TsvnHooksDialog' },
   // 报告里那个 Local-Only commit 改了 66 个文件；勾一个、点拆分，后端失败的长错误要看得见
   {

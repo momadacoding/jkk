@@ -459,6 +459,19 @@ export function svnFollowAuto(path: string): Promise<Followed<AutoFollowOutcome>
   return invoke<Followed<AutoFollowOutcome>>('svn_follow_auto', { path })
 }
 
+/**
+ * 冲突框里的「用磁盘上的内容跟进」（设计 2026-11-25-follow-resolve-with-disk）：冲突文件直接用磁盘内容，
+ * 不写工作区。`files` 是冲突框里列过的文件，`base` 是冲突框对比用的新基线；磁盘变了、不能用、或者 SVN
+ * 又前进了时返回新的 `needsManual`，什么都不动。
+ */
+export function svnFollowWithDisk(
+  path: string,
+  files: string[],
+  base: string,
+): Promise<Followed<FollowOutcome>> {
+  return invoke<Followed<FollowOutcome>>('svn_follow_with_disk', { path, files, base })
+}
+
 /** 把崩溃留下的跟进走完，或回到一致状态后重新跟进。 */
 export function svnFollowContinue(path: string): Promise<FollowOutcome> {
   return invoke<FollowOutcome>('svn_follow_continue', { path })

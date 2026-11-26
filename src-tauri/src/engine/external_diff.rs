@@ -40,6 +40,9 @@ pub enum DiffTarget {
         #[serde(default)]
         old_file: Option<String>,
     },
+    /// 某个提交里的版本对比工作区里的真实文件。跟进冲突框里「SVN 新版本 vs 磁盘上的合并结果」用
+    /// （设计 2026-11-25-follow-resolve-with-disk）；右边是真实文件，在工具里改了就是改了。
+    Worktree { from: String, file: String },
 }
 
 impl DiffTarget {
@@ -49,7 +52,8 @@ impl DiffTarget {
             DiffTarget::Unstaged { file }
             | DiffTarget::Staged { file }
             | DiffTarget::Commit { file, .. }
-            | DiffTarget::Range { file, .. } => file,
+            | DiffTarget::Range { file, .. }
+            | DiffTarget::Worktree { file, .. } => file,
         }
     }
 }
@@ -265,6 +269,17 @@ pub fn prepare_diff(
                 file.as_str(),
                 format!("{old}（{}）", short(&from)),
                 format!("{file}（{}）", short(&to)),
+            )
+        }
+        DiffTarget::Worktree { from, file } => {
+            let from = find_commit(&repo, from)?;
+            (
+                blob_in_tree(Some(&from.tree()?), file),
+                file.as_str(),
+                workdir_side(&repo, file)?,
+                file.as_str(),
+                format!("{file}（{}）", short(&from)),
+                format!("{file}（工作区）"),
             )
         }
     };

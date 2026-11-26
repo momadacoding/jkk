@@ -227,6 +227,41 @@ fn range_uses_from_and_to() {
     ws.remove().unwrap();
 }
 
+/// 跟进冲突框的「对比」（设计 2026-11-25-follow-resolve-with-disk）：左边是某个提交里的版本，
+/// 右边是工作区里的真实文件，在工具里改了就是改了。
+#[test]
+fn worktree_uses_commit_vs_real_file() {
+    let dir = repo();
+    commit_file(dir.path(), "a.txt", b"v1\n", "c1");
+    let from = git(dir.path(), &["rev-parse", "HEAD"]);
+    commit_file(dir.path(), "a.txt", b"v2\n", "c2");
+    fs::write(dir.path().join("a.txt"), "on disk\n").unwrap();
+
+    let target = DiffTarget::Worktree {
+        from: from.clone(),
+        file: "a.txt".into(),
+    };
+    let (left, right, lt, rt, ws) = prepare(dir.path(), &target);
+    assert_eq!(left, b"v1\n", "左边取 from，不是 HEAD");
+    assert_eq!(canon(&right), canon(&dir.path().join("a.txt")));
+    assert!(lt.contains(&from[..7]), "{lt}");
+    assert!(rt.contains("工作区"), "{rt}");
+    ws.remove().unwrap();
+}
+
+#[test]
+fn worktree_target_deserializes_camel_case() {
+    let t: DiffTarget =
+        serde_json::from_str(r#"{"kind":"worktree","from":"a","file":"n.txt"}"#).unwrap();
+    assert_eq!(
+        t,
+        DiffTarget::Worktree {
+            from: "a".into(),
+            file: "n.txt".into(),
+        }
+    );
+}
+
 /// 临时文件要是工作区形态：经过 autocrlf 等过滤器，和用户 checkout 出来的一致。
 #[test]
 fn export_applies_autocrlf() {

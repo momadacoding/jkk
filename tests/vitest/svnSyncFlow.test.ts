@@ -10,6 +10,7 @@ vi.mock('@/store/repoStore', () => ({
   svnFollowAuto: vi.fn(),
   svnFollowContinue: vi.fn(),
   svnFollowManual: vi.fn(),
+  svnFollowWithDisk: vi.fn(),
 }))
 
 import * as store from '@/store/repoStore'
@@ -30,6 +31,13 @@ const preview: SyncInPreview = {
 
 /** 记下每一步的先后，断言「先清旧错误、再做事」。 */
 function deps(log: string[], confirm?: (r: ConfirmRequest) => Promise<boolean>): SvnSyncFlowDeps {
+  const ask =
+    confirm ??
+    (async (r: ConfirmRequest) => {
+      log.push(`confirm:${r.title}`)
+      await r.action?.()
+      return true
+    })
   return {
     repoPath: 'C:/wc1',
     running: { current: false },
@@ -38,13 +46,16 @@ function deps(log: string[], confirm?: (r: ConfirmRequest) => Promise<boolean>):
       log.push('guardMerge')
       return true
     },
-    confirm:
-      confirm ??
-      (async (r) => {
-        log.push(`confirm:${r.title}`)
-        await r.action?.()
-        return true
-      }),
+    confirm: ask,
+    // 冲突框在这里当成一个确认框：确认就是点「手动跟进」，取消就是 Cancel。磁盘按钮的用例自己接
+    showFollowConflict: async (model, run) => {
+      await ask({
+        title: model.title,
+        message: [model.intro, ...model.files.map((f) => f.path)].join('\n'),
+        confirmLabel: '手动跟进',
+        action: () => run('manual'),
+      })
+    },
     clearError: () => log.push('clearError'),
     reportError: (err) => log.push(`reportError:${(err as { code?: string }).code ?? String(err)}`),
     refreshSvnSyncState: async () => {
@@ -149,6 +160,7 @@ beforeEach(() => {
   vi.mocked(store.svnFollowAuto).mockReset()
   vi.mocked(store.svnFollowContinue).mockReset()
   vi.mocked(store.svnFollowManual).mockReset()
+  vi.mocked(store.svnFollowWithDisk).mockReset()
 })
 
 describe('handleAutoFollow（事故分析 6.12）', () => {
@@ -1228,6 +1240,146 @@ describe('handleFollow', () => {
     await createSvnSyncFlow(deps(log)).handleFollow()
 
     expect(log.at(-1)).toBe('confirm:手动跟进遇到冲突')
+  })
+})
+
+describe('跟进冲突框：用磁盘上的内容跟进（设计 2026-11-25-follow-resolve-with-disk）', () => {
+  const ready = {
+    ...conflict,
+    base: 'b'.repeat(40),
+    diskReady: true,
+    details: [
+      {
+        path: 'Code/A.cs',
+        svnRev: 7,
+        svnAuthor: 'li',
+        svnRemoved: false,
+        preview: null,
+        disk: { kind: 'usable' as const },
+      },
+    ],
+  }
+  const refused = {
+    ...ready,
+    diskReady: false,
+    details: [{ ...ready.details[0], disk: { kind: 'refused' as const, reason: '冲突处以外还有别的改动' } }],
+  }
+
+  /** 冲突框按 `picks` 依次点按钮，记下每次弹出时的模型。 */
+  function picking(log: string[], picks: ('disk' | 'manual' | 'cancel')[]) {
+    const d = tracked(log)
+    const seen: { diskReady: boolean; lines: (string | null)[] }[] = []
+    d.showFollowConflict = async (model, run) => {
+      seen.push({ diskReady: model.diskReady, lines: model.files.map((f) => f.diskLine) })
+      log.push(`conflict:${model.diskReady ? 'ready' : 'manualOnly'}`)
+      const pick = picks.shift() ?? 'cancel'
+      if (pick !== 'cancel') await run(pick)
+    }
+    return { d, seen }
+  }
+
+  it('点磁盘按钮：带着冲突框列过的文件发出去，不走手动跟进，完成后弹报告', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnFollow).mockResolvedValue(ready)
+    vi.mocked(store.svnFollowWithDisk).mockImplementation(async () => {
+      log.push('svnFollowWithDisk')
+      return { kind: 'done', report }
+    })
+    const { d } = picking(log, ['disk'])
+
+    await createSvnSyncFlow(d).handleFollow()
+
+    // 带上冲突框对比用的新基线：SVN 又前进了的话后端回到冲突框（独立 review 低 5）
+    expect(store.svnFollowWithDisk).toHaveBeenCalledWith('C:/wc1', ['Code/A.cs'], 'b'.repeat(40))
+    expect(store.svnFollowManual).not.toHaveBeenCalled()
+    // 命令之后再刷新一轮（第一轮是「跟进」本身的），然后弹报告；新的一次跟进清掉旧提示
+    expect(log.lastIndexOf('refreshAfterFollow')).toBeGreaterThan(log.indexOf('svnFollowWithDisk'))
+    expect(log.at(-1)).toBe('showFollowReport')
+    expect(log.filter((l) => l === 'clearAutoFollowed')).toHaveLength(2)
+  })
+
+  it('点磁盘按钮带回了判定：与「跟进」一样直接写回，号在命令发起前取', async () => {
+    const log: string[] = []
+    const applied: [SyncAfterFollow, number][] = []
+    vi.mocked(store.svnFollow).mockResolvedValue(ready)
+    let writes = 7
+    vi.mocked(store.svnFollowWithDisk).mockImplementation(async () => {
+      writes = 8
+      return { kind: 'done', report, sync: carried }
+    })
+    const { d } = picking(log, ['disk'])
+    d.svnSyncMark = () => writes
+    d.applyFollowedSync = (_path, sync, since) => {
+      applied.push([sync, since])
+      return true
+    }
+
+    await createSvnSyncFlow(d).handleFollow()
+
+    expect(applied).toEqual([[carried, 7]])
+  })
+
+  it('点了之后磁盘不能用了：按新结果重开冲突框，只剩手动跟进', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnFollow).mockResolvedValue(ready)
+    vi.mocked(store.svnFollowWithDisk).mockResolvedValue(refused)
+    const { d, seen } = picking(log, ['disk', 'cancel'])
+
+    await createSvnSyncFlow(d).handleFollow()
+
+    expect(seen.map((s) => s.diskReady)).toEqual([true, false])
+    expect(seen[1].lines[0]).toContain('冲突处以外还有别的改动')
+    expect(store.svnFollowManual).not.toHaveBeenCalled()
+    expect(log).not.toContain('showFollowReport')
+  })
+
+  it('能用磁盘内容时点手动跟进：另弹带警告的手动跟进确认框，确认了才跑', async () => {
+    const log: string[] = []
+    const asked: ConfirmRequest[] = []
+    vi.mocked(store.svnFollow).mockResolvedValue(ready)
+    vi.mocked(store.svnFollowManual).mockResolvedValue({ kind: 'done', newRev: 2 })
+    const { d } = picking(log, ['manual'])
+    d.confirm = async (r) => {
+      asked.push(r)
+      await r.action?.()
+      return true
+    }
+
+    await createSvnSyncFlow(d).handleFollow()
+
+    expect(asked[0].title).toBe('手动跟进')
+    expect(asked[0].warning).toContain('会写工作区')
+    expect(store.svnFollowManual).toHaveBeenCalledTimes(1)
+    expect(store.svnFollowWithDisk).not.toHaveBeenCalled()
+  })
+
+  it('只剩手动跟进时：冲突框本身就是确认，点了直接跑，不再弹第二个框', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnFollow).mockResolvedValue(refused)
+    vi.mocked(store.svnFollowManual).mockResolvedValue({ kind: 'done', newRev: 2 })
+    const { d } = picking(log, ['manual'])
+    const asked: string[] = []
+    d.confirm = async (r) => {
+      asked.push(r.title)
+      await r.action?.()
+      return true
+    }
+
+    await createSvnSyncFlow(d).handleFollow()
+
+    expect(store.svnFollowManual).toHaveBeenCalledTimes(1)
+    expect(asked).not.toContain('手动跟进')
+  })
+
+  it('磁盘上是旧内容（staleDisk）：不是重放冲突，照旧是手动跟进的确认框', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnFollow).mockResolvedValue({ ...conflict, staleDisk: true })
+    const { d } = picking(log, ['disk'])
+
+    await createSvnSyncFlow(d).handleFollow()
+
+    expect(log.some((l) => l.startsWith('conflict:'))).toBe(false)
+    expect(store.svnFollowWithDisk).not.toHaveBeenCalled()
   })
 })
 

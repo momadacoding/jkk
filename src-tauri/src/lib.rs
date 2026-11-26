@@ -235,6 +235,7 @@ pub fn run() {
             commands::svn_sync::svn_follow_continue,
             commands::svn_sync::svn_follow_auto,
             commands::svn_sync::svn_follow_manual,
+            commands::svn_sync::svn_follow_with_disk,
             commands::svn_sync::svn_restore_local_only,
             commands::svn_sync::svn_set_local_only,
             commands::svn_sync::svn_split_local_only,

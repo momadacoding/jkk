@@ -10,7 +10,7 @@
 use app_lib::engine::git_cli::run_git;
 use app_lib::engine::git_read;
 use app_lib::engine::svn_replay::{
-    commits_between, replay_onto, ReplayCodes, ReplayCommit, ReplayOpts, ReplayOutcome,
+    commits_between, no_resolved, replay_onto, ReplayCodes, ReplayCommit, ReplayOpts, ReplayOutcome,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -88,6 +88,7 @@ fn replay(
     let opts = ReplayOpts {
         drop_empty: true,
         superseded: &superseded,
+        resolved: &no_resolved,
         codes: CODES,
     };
     match replay_onto(repo, onto, &commits, &opts, &mut BTreeMap::new()).unwrap() {

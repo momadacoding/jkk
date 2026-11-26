@@ -236,6 +236,13 @@ pub fn run_git_code(path: &str, args: &[&str]) -> Result<(i32, String)> {
     Ok((code, String::from_utf8_lossy(&output.stdout).to_string()))
 }
 
+/// 同 [`run_git_code`]，stdout 原样给字节：`merge-file -p` 的输出是文件内容，可能不是 UTF-8
+/// （GBK 的 `.cs` / `.lua`），过一遍 `from_utf8_lossy` 就和磁盘比不上了。
+pub fn run_git_code_bytes(path: &str, args: &[&str]) -> Result<(i32, Vec<u8>)> {
+    let output = proc::output(git_command(path)?.args(args))?;
+    Ok((output.status.code().unwrap_or(-1), output.stdout))
+}
+
 /// 跑一条已经组装好的 git 命令：成功返回 stdout 字节，失败把 stderr 包成 GitError。
 ///
 /// 抽出来是为了让 [`run_git_bytes`] 和 [`run_git_env`] 共用**同一套失败映射**。
