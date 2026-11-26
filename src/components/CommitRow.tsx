@@ -4,9 +4,9 @@ import { prBadge, pullRequestForRef } from '../engine/prs'
 import { laneTint } from '../engine/paths'
 import { WORKDIR_ID } from '../engine/workdir'
 import { shortHash } from '../engine/commitActions'
-import { rewrittenTitle, shownTime } from '../engine/commitTime'
+import { rewrittenTitle } from '../engine/commitTime'
 import { buildRefPills, goneUpstreamTooltip } from '../engine/refPills'
-import { mixedBaselineLabel } from '../engine/svnGraph'
+import { commitAuthorText, commitDateText, mixedBaselineLabel } from '../engine/svnGraph'
 
 interface CommitRowProps {
   node: LayoutNode
@@ -50,8 +50,9 @@ export function CommitRow({
     )
   }
 
-  // 作者时间：跟进重放过的提交，提交时间是跟进那一刻（见 shownTime）
-  const date = new Date(shownTime(node.commit) * 1000).toLocaleString()
+  // 作者时间（跟进重放过的提交，提交时间是跟进那一刻）；svn 节点时间未知时写「时间未知」
+  const date = commitDateText(node.commit)
+  const author = commitAuthorText(node.commit)
   // HEAD 那条伪 ref 不做成标签——整行加粗已经表达了「当前在这里」，
   // 只有游离 HEAD 时才需要一个显式标记
   // 本地分支与同一提交上的同名远程分支合成一个标签，见 buildRefPills
@@ -137,7 +138,7 @@ export function CommitRow({
       {/* 三列定宽，各自左对齐——右对齐时 hash 和日期的起始位置每行都在跳，
           竖着扫一列的时候很费眼。定宽后三列各自成一条直线。 */}
       <span className="commit-meta">
-        <span className="commit-author" title={node.commit.author}>{node.commit.author}</span>
+        <span className="commit-author" title={author}>{author}</span>
         {/* svn 节点没有 hash，显示 revision 号（spec §11）。
             拿 `svn:12346` 去截短会得到一串毫无意义的 `svn:123`。 */}
         <span className="commit-hash" title={node.commit.id}>

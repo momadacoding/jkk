@@ -117,6 +117,35 @@ describe('CommitDetailView：点开收着的提交之后', () => {
   })
 })
 
+describe('CommitDetailView：SVN 没返回作者和时间的 revision', () => {
+  // 2026-11-26 报告：r67823 的 svn log 只有 revision 号，详情里显示 1970、作者空白、说明空白
+  const hidden: CommitNode = {
+    id: 'svn:67823',
+    parents: ['svn:67822'],
+    author: '',
+    time: 1_700_000_000, // 借来排序用的，不能显示出来
+    timeUnknown: true,
+    message: '',
+    vcs: 'svn',
+    svnRev: 67823,
+  }
+
+  it('写「时间未知」「SVN 未返回」，并说明为什么是空的', () => {
+    render(<CommitDetailView commit={hidden} diff={empty} repoPath="C:/r" onSelectCommit={vi.fn()} />)
+    expect(screen.getByText('时间未知')).toBeTruthy()
+    expect(screen.getByText('SVN 未返回')).toBeTruthy()
+    expect(screen.getByText(/只返回了 revision 号/)).toBeTruthy()
+    // 头像不取「SVN 未返回」的「S」：那会像一个真实作者的首字母
+    expect(document.querySelector('.commit-avatar')?.textContent).toBe('?')
+    expect(screen.queryByText(new Date(1_700_000_000 * 1000).toLocaleString())).toBeNull()
+  })
+
+  it('正常的 svn 节点没有这段说明', () => {
+    render(<CommitDetailView commit={r16([])} diff={empty} repoPath="C:/r" onSelectCommit={vi.fn()} />)
+    expect(screen.queryByText(/只返回了 revision 号/)).toBeNull()
+  })
+})
+
 describe('CommitDetailView：时间', () => {
   // 2026-11-26 报告：f024a87 是 11-09 写的，跟进重放后提交时间变成 11-26
   const written = 1_794_192_844

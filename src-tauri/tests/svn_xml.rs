@@ -733,6 +733,29 @@ fn log_treats_a_missing_author_as_empty() {
 }
 
 #[test]
+fn log_keeps_a_revision_whose_paths_are_all_unreadable_with_empty_fields() {
+    // 2026-11-27 实测（svnserve + authz，匿名读一个只改了 /secret 的 revision）：SVN 只给
+    // revision 号，author / date / msg 三个元素都不出现。2026-11-26 报告里的 r67823 就是这样。
+    // 这条要留下来（锚点靠它挂工作分支），三个字段给空；前端 `svnTimes` 认空时间，借邻居的时间排序。
+    let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n\
+<log>\r\n\
+<logentry\r\n   revision=\"2\">\r\n\
+</logentry>\r\n\
+</log>\r\n";
+    let got = parse_log(xml).unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].revision, 2);
+    assert_eq!(
+        (
+            got[0].author.as_str(),
+            got[0].date.as_str(),
+            got[0].message.as_str()
+        ),
+        ("", "", "")
+    );
+}
+
+#[test]
 fn an_empty_log_from_an_empty_repository_is_not_an_error() {
     // 实测 P9：HEAD=0 的仓库返回 exit 0 + <log></log>。空历史是合法状态。
     let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n<log>\r\n</log>\r\n";

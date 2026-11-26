@@ -80,6 +80,23 @@ describe('formatCommitInfo', () => {
     expect(lines.some((l) => l.startsWith('Date:'))).toBe(true)
   })
 
+  it('SVN 没返回作者和时间的 revision：写「时间未知」「SVN 未返回」，不复制借来排序的时间', () => {
+    // 独立 review 2026-11-27：time 是借相邻 revision 的，复制出去会被当成真实时间贴进 issue
+    const hidden: CommitNode = {
+      id: 'svn:67823',
+      parents: ['svn:67822'],
+      author: '',
+      time: commit.time,
+      timeUnknown: true,
+      message: '',
+      vcs: 'svn',
+      svnRev: 67823,
+    }
+    const lines = formatCommitInfo(hidden).split('\n')
+    expect(lines).toContain('Author: SVN 未返回')
+    expect(lines).toContain('Date:   时间未知')
+  })
+
   it('Date: 是作者时间，和 git show 一致', () => {
     // 跟进重放过的提交：time 是跟进那一刻，authorTime 才是写下的时间
     const replayed = { ...commit, time: commit.time + 86_400, authorTime: commit.time }

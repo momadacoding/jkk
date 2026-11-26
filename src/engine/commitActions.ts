@@ -1,6 +1,6 @@
 import type { Capabilities } from './capabilities'
 import type { CommitNode } from './types'
-import { shownTime } from './commitTime'
+import { commitAuthorText, commitDateText } from './svnGraph'
 
 /** 「仅本地，不交付」的 trailer（spec §6.7）。判定只认这一条，不新增配置。 */
 export const LOCAL_ONLY_TRAILER = 'Local-Only: true'
@@ -88,12 +88,12 @@ export function shortHash(id: string): string {
  * hash 用完整的——缩写换个仓库、换个时间点都可能不再唯一。
  */
 export function formatCommitInfo(commit: CommitNode): string {
-  // git show 的 Date: 是作者时间
-  const date = new Date(shownTime(commit) * 1000).toLocaleString()
+  // git show 的 Date: 是作者时间；svn 节点时间未知时 time 是借来排序的，复制出去会被当成真实时间。
+  // 两样都由 commitDateText 处理
   return [
     `commit ${commit.id}`,
-    `Author: ${commit.author}`,
-    `Date:   ${date}`,
+    `Author: ${commitAuthorText(commit)}`,
+    `Date:   ${commitDateText(commit)}`,
     '',
     commit.message,
   ].join('\n')

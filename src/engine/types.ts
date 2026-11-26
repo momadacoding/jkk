@@ -58,6 +58,11 @@ export interface CommitNode {
    */
   authorTime?: number
   /**
+   * svn 节点：SVN 没返回这个 revision 的时间（没有读权限时只给 revision 号）。
+   * 这时 `time` 是借相邻 revision 的、只给排序用，显示请用 `commitDateText`（`svnGraph.ts`）。
+   */
+  timeUnknown?: boolean
+  /**
    * **只有标题。** 后端取的是 `commit.summary()`（第一段，空白已折叠），
    * 正文不在里面。
    *

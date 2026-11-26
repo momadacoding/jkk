@@ -71,6 +71,18 @@ describe('CommitRow：混合基线', () => {
   })
 })
 
+describe('CommitRow：SVN 没返回作者和时间的 revision', () => {
+  // 2026-11-26 报告：r67823 显示成 1970-01-01、作者空白
+  it('写「时间未知」和「SVN 未返回」，不出现 1970', () => {
+    const [node] = spliceHistory([{ rev: 67823, author: '', date: '', message: '' }], [])
+    row(node, [])
+    expect(screen.getByText('时间未知')).toBeTruthy()
+    expect(screen.getByText('SVN 未返回')).toBeTruthy()
+    // 不按「1970」匹配：UTC 以西的时区里时间戳 0 显示成 1969-12-31，那样改之前也会通过
+    expect(screen.queryByText(new Date(0).toLocaleString())).toBeNull()
+  })
+})
+
 describe('CommitRow：时间', () => {
   // 2026-11-26 报告：跟进重放过的提交，列表上显示成跟进那一刻
   it('显示作者时间，不显示重放时改过的提交时间', () => {
