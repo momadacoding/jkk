@@ -50,7 +50,13 @@ export interface CommitNode {
   id: string
   parents: string[]
   author: string
+  /** 提交时间（committer date）。排序和图布局用它；显示请用 `shownTime`（`commitTime.ts`）。 */
   time: number
+  /**
+   * 作者时间（author date），**只在和 `time` 不同时才有**（后端 `graph.rs` 省掉了相同的）。
+   * 跟进、rebase 重放提交后两者不同：这个才是写下提交的时间。
+   */
+  authorTime?: number
   /**
    * **只有标题。** 后端取的是 `commit.summary()`（第一段，空白已折叠），
    * 正文不在里面。
