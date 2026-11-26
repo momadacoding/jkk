@@ -8,6 +8,8 @@ export interface MenuItem {
   children?: MenuItem[]
   /** 置灰但仍然显示，用来说明「为什么这里不能做这件事」。 */
   disabled?: boolean
+  /** 悬停说明，通常是置灰的原因（同工具栏按钮的 `title`）。 */
+  title?: string
   /** 危险操作（删除类），显示为红色。 */
   danger?: boolean
   /** 右侧灰字提示的快捷键，只是展示；按键本身由调用方自己处理。 */
@@ -114,6 +116,7 @@ function MenuItems({ items, onClose }: { items: MenuItem[]; onClose: () => void 
             key={i}
             className={`context-menu-item${item.danger ? ' danger' : ''}`}
             disabled={item.disabled}
+            title={item.title}
             // 先让菜单真的从屏幕上消失，再跑动作。同步执行的话，动作里但凡有一步
             // 卡住主线程（原生 prompt/confirm 就是），React 还没来得及重绘，
             // 菜单就会一直留在弹框后面——曾经的 "New branch from here…" 就是这样。
@@ -136,6 +139,8 @@ export function useContextMenu() {
     e.stopPropagation()
     setMenu({ x: e.clientX, y: e.clientY, items })
   }
+  /** 在指定位置弹出：下拉按钮用，菜单贴着按钮而不是鼠标落点。 */
+  const openAt = (x: number, y: number, items: MenuItem[]) => setMenu({ x, y, items })
   const close = () => setMenu(null)
-  return { menu, open, close }
+  return { menu, open, openAt, close }
 }

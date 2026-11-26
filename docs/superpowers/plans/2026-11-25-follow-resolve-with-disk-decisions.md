@@ -96,3 +96,11 @@
 - 新 fixture、新的隔离 identifier，进程核对为本 worktree 的 `app.exe`。
 - 反例：`invoke('svn_follow_with_disk', { path, files })` 不带 `base` → `missing required key base`，参数名确实生效。
 - 正例：点「跟进」→ 冲突框 → 点「用磁盘上的内容跟进」→「跟进完成」；`work~1 == svn/base`；`status -- Code` 为空；`HEAD` 与磁盘无差异；A.cs 修改时间不变（`2026-11-25T20:54:24.0606507Z`）。
+
+### 与 master 合并（2026-11-26，PR 有冲突）
+
+- master 新进了第 199～202 号 PR。冲突在 `svn_follow.rs` 与 `commands/svn_sync.rs`，来自第 201 号 PR「跟进带回发布之后的判定」：`follow` 的本体改成 `follow_carrying(repo, opid, carry)`，命令返回 `Followed<FollowOutcome>`（结局摊平，多一个可选的 `sync`），`still_valid` 改为返回 `Recheck`。
+- **怎么合的**：用 merge 而不是 rebase（AGENTS 顶部规则：rebase 要单独授权）。`DiskUse` 接进 `follow_carrying` 的参数；`follow` / `follow_with_sync` 传 `Probe`；`follow_with_disk` 传 `Apply`、`carry = true`，命令照 `svn_follow` 的样子返回 `Followed<FollowOutcome>`；`still_valid` 里磁盘复核改成返回 `Recheck::Changed`。
+- **前端**：`svnFollowWithDisk` 返回 `Followed<FollowOutcome>`；流程里点磁盘按钮与「跟进」一样先 `svnSyncMark()` 取号，再把带回的 `sync` 交给 `afterFollow`。新用例 `点磁盘按钮带回了判定：与「跟进」一样直接写回，号在命令发起前取`。
+- **计划没写的坑**：点磁盘按钮时基线已经发布，走的是分支跟进入口，按第 201 号 PR 的设计这条路没有 R3c 节点、不带回判定（`sync` 为空，前端照原来自己复查）。只有「SVN 又前进、重新录基线」那种情形才会带回。
+- **验证**：`cargo fmt --check`、`clippy --all-targets` 无告警；跟进相关与 master 改动涉及的测试二进制（`svn_follow`、`svn_follow_resolve_with_disk`、`svn_replay`、`svn_follow_disk`、`svn_follow_auto`、`svn_deliver`、`external_diff`、`commands_are_async`、`svn_backend`、`svn_sync`、`svn_sync_in`、`svn_sync_out`、`svn_health`、`remote`、`svn_follow_index`、lib）全过；`pnpm build`、`pnpm test` 1966 个全过；真实窗口里调 `svn_follow_with_disk` 返回摊平的 `{ kind, code, message }`。

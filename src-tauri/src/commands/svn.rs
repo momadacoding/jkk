@@ -28,6 +28,7 @@ use crate::engine::svn_init::{
 use crate::engine::svn_journal::{Flow, Phase};
 use crate::engine::svn_lock::LockHolder;
 use crate::engine::svn_log::{fetch_log, read_log, LogPage};
+use crate::engine::svn_mismatch::{find_baseline_mismatch, BaselineMismatch};
 use crate::engine::svn_server_set::{audit_server_set_at_baseline, ServerAudit};
 use crate::engine::svn_sync::{check_sync, read_root_revs, RootRev, SyncStatus};
 use crate::engine::svn_sync_in::new_opid;
@@ -144,6 +145,16 @@ fn refuse_while_unfinished(path: &str) -> Result<(), GitError> {
 #[tauri::command(async)]
 pub fn svn_check_baseline(path: String) -> Result<Health, GitError> {
     check_current_baseline(&path)
+}
+
+/// 「jkk 与 TortoiseSVN 看法不一致」的文件（设计 2026-11-25 §6）：git 说改了、SVN 说没改、
+/// 分支提交没碰过。**纯读**，本地 `svn status`，不联网。
+///
+/// 前端只在失同步判定为同步、分支不落后基线、没有未收尾的同步时调它
+/// （`svnSync.ts::mismatchCheckApplies`），别的时刻这条判据会误报。
+#[tauri::command(async)]
+pub fn svn_baseline_mismatch(path: String) -> Result<BaselineMismatch, GitError> {
+    find_baseline_mismatch(&path)
 }
 
 /// 行尾规则的安装状态（spec §7.3.0）。打开仓库时读一次。

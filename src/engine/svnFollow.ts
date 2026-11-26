@@ -6,7 +6,8 @@
  *
  * ⚠️ 横幅与对话框都按**纯文本**渲染：不要写 `**`。
  */
-import { externalChangeLine, type ExternalChange, type SyncVerdict } from './svnSync'
+import { externalChangeLine, type ExternalChange, type SyncStatus, type SyncVerdict } from './svnSync'
+import type { RepoInfo } from './types'
 import type { DiffTarget } from './externalTools'
 import { formatDuration } from './svnInit'
 import {
@@ -242,6 +243,21 @@ export type FollowOutcome =
 export type AutoFollowOutcome =
   | { kind: 'done'; report: FollowReport }
   | { kind: 'skipped'; code: string; message: string; conflict?: AutoFollowConflict }
+
+/**
+ * 后端 `svn_follow::SyncAfterFollow`：基线发布之后的判定，按锁内复核读到的节点算（2026-11-24 分析方案 4）。
+ * 前端拿它直接写回横幅，不再为它扫一遍 `svn status`。`head` 是后端判定之前读的 HEAD。
+ */
+export interface SyncAfterFollow {
+  status: SyncStatus
+  head: RepoInfo
+}
+
+/**
+ * 后端 `svn_follow::Followed`：`svn_follow` / `svn_follow_auto` 的返回，结局摊平在顶层，外加可选的 `sync`。
+ * 没发布基线、或者算不出来时没有 `sync`，照原来自己读。
+ */
+export type Followed<T> = T & { sync?: SyncAfterFollow }
 
 /**
  * 后端 `svn_follow::AutoConflict`：被重放冲突拦下时的冲突文件。`message` 是给托盘的一整句，横幅按这里

@@ -581,8 +581,9 @@ export function wizardErrorHint(code: string, message = ''): string {
       '在 TortoiseSVN 里对报出的路径做 Update 或「还原」，让本地与服务器一致之后再试。',
     include_set_mismatch:
       '上面的清单按「是哪条规则做的决定」分组，每组列几个样例；查不到规则的单独成组。' +
-      '被某个 .gitignore 挡掉的：把那个 .gitignore 挪走或删掉对应的行——' +
-      '最常见的来源是以前在这个目录里用过 git、只删了 .git 没删 .gitignore。' +
+      '被某个 .gitignore 挡掉的：不在 SVN 里的那个可以挪走或删掉对应的行——' +
+      '最常见的来源是以前在这个目录里用过 git、只删了 .git 没删 .gitignore；' +
+      '是 SVN 里的文件就不要改它，改了会成为一处要提交的 SVN 改动。' +
       '位于嵌套 git 仓库里的：把那个目录移出白名单，或者确认后删掉它里面的 .git。',
     svn_baseline_no_trailer: '基线分支上没有本应用写的记账信息，它不是本应用录出来的基线。请重建基线。',
     svn_gitignore_unconfirmed: '清单已经刷新，请看过之后重新点「建库」。',

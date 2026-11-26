@@ -7,6 +7,7 @@ import { ALL_CAPABILITIES, type Capabilities } from '../engine/capabilities'
 import type { WorktreeHolder } from '../engine/worktreeHolders'
 import {
   auditIsDue,
+  canApplyFollowedSync,
   idleAuditIsDue,
   type AuditMark,
   isPlainCommitOn,
@@ -61,11 +62,14 @@ import { samePath } from '../engine/path'
 import type {
   AutoFollowOutcome,
   FollowOutcome,
+  Followed,
   PendingRestore,
   RestoreOutcome,
   SvnUserInfo,
+  SyncAfterFollow,
 } from '../engine/svnFollow'
 import type { HookHealth, TsvnHooksStatus } from '../engine/tsvnHooks'
+import type { BaselineMismatch } from '../engine/svnMismatch'
 import type { SyncInExpect, SyncInOutcome, SyncInPreview } from '../engine/svnSyncIn'
 import type { SyncOutExpect, SyncOutOutcome, SyncOutPreview } from '../engine/svnSyncOut'
 import { nextSelection } from '../engine/selection'
@@ -166,7 +170,7 @@ export interface RepoState {
   /**
    * 最近一次失同步判定报了 `svn_no_baseline`：基线分支 `svn/base` 不存在（第 70 条）。
    * 只在判定报这个错时置位，别的失败与成功都不动它。读它的两处（`describeMissingBaseline`、
-   * `needsStandaloneCheck`）都同时看 `svnSync`：有结论就说明基线读得到，标记作废。
+   * `manualCheckBlockedReason`）都同时看 `svnSync`：有结论就说明基线读得到，标记作废。
    */
   svnBaselineMissing: boolean
   /** 服务器侧清单核对（§6.3.1 / NB-2）。走网络，失败静默。 */
@@ -439,17 +443,20 @@ export function svnSyncAbort(path: string): Promise<SyncInOutcome> {
   return invoke<SyncInOutcome>('svn_sync_abort', { path })
 }
 
-/** 跟进外部提交（分析 §6.5）：录新基线、对象层重放分支、发布。不写磁盘，不发 SVN 写命令。 */
-export function svnFollow(path: string): Promise<FollowOutcome> {
-  return invoke<FollowOutcome>('svn_follow', { path })
+/**
+ * 跟进外部提交（分析 §6.5）：录新基线、对象层重放分支、发布。不写磁盘，不发 SVN 写命令。
+ * 基线发布了时带回发布之后的判定（`sync`），见 `applyFollowedSync`。
+ */
+export function svnFollow(path: string): Promise<Followed<FollowOutcome>> {
+  return invoke<Followed<FollowOutcome>>('svn_follow', { path })
 }
 
 /**
  * 自动跟进（事故分析 6.12）：条件全部满足才发布，否则 `skipped`、一个 ref 都不动。设置里关掉时
- * 后端直接返回 `skipped`（`AUTO_FOLLOW_OFF`）。
+ * 后端直接返回 `skipped`（`AUTO_FOLLOW_OFF`）。完成时带回判定，同 `svnFollow`。
  */
-export function svnFollowAuto(path: string): Promise<AutoFollowOutcome> {
-  return invoke<AutoFollowOutcome>('svn_follow_auto', { path })
+export function svnFollowAuto(path: string): Promise<Followed<AutoFollowOutcome>> {
+  return invoke<Followed<AutoFollowOutcome>>('svn_follow_auto', { path })
 }
 
 /**
@@ -461,8 +468,8 @@ export function svnFollowWithDisk(
   path: string,
   files: string[],
   base: string,
-): Promise<FollowOutcome> {
-  return invoke<FollowOutcome>('svn_follow_with_disk', { path, files, base })
+): Promise<Followed<FollowOutcome>> {
+  return invoke<Followed<FollowOutcome>>('svn_follow_with_disk', { path, files, base })
 }
 
 /** 把崩溃留下的跟进走完，或回到一致状态后重新跟进。 */
@@ -504,6 +511,17 @@ export function svnLocalOnlyFiles(path: string, commit: string): Promise<string[
  */
 export function svnPendingRestores(path: string): Promise<PendingRestore[]> {
   return invoke<PendingRestore[]>('svn_pending_restores', { path })
+}
+
+/**
+ * 「jkk 与 TortoiseSVN 看法不一致」的文件：git 说改了、SVN 说没改、分支提交没碰过（设计 2026-11-25 §6）。
+ * 后端 `svn_baseline_mismatch`。本地 `svn status`，不联网；候选为空时不起 svn 进程。
+ *
+ * ⚠️ 只在 `mismatchCheckApplies` 为真时调：别的时刻（SVN 侧有新内容、分支落后基线……）正常的文件
+ * 也满足这条判据。
+ */
+export function svnBaselineMismatch(path: string): Promise<BaselineMismatch> {
+  return invoke<BaselineMismatch>('svn_baseline_mismatch', { path })
 }
 
 /** 横幅上的「不放回」：从待放回清单删掉，不碰磁盘。 */
@@ -700,6 +718,11 @@ export function useRepoStore() {
   /** 最近一次写回的完整结论，同步写。提交前的「先跟进」提醒要它（事故分析 6.6），理由同上。 */
   const latestSync = useRef<SyncStatus | null>(null)
   /**
+   * 第二档校验写回界面的次数（`applySvnSync`）。跟进发起时取一次（`svnSyncMark`），带回的判定只在这期间
+   * 没人写回过时才用（`canApplyFollowedSync`）。
+   */
+  const svnSyncWrites = useRef(0)
+  /**
    * `openRepo` 写进 state 的那个路径，同步镜像一份。
    *
    * `latestVerdict` 写回前要核对「还是不是这个仓库」（第 71 条），但不能放进 `setState` 的
@@ -816,8 +839,8 @@ export function useRepoStore() {
           .then((head) => forceCheckAtHead(path, head), () => refreshSvnSync(path))
           .catch(() => undefined)
         // 同样是纯本地读，且它决定要不要挂迁移横幅——那条横幅会让失同步横幅
-        // 和常驻体检入口都让位，所以必须在第一帧之前读到，否则界面会先挂出
-        // 一条随后又被替换掉的横幅（spec §7.3.0）。
+        // 让位、「看法不一致」横幅也要等它读到才判定，所以必须在第一帧之前读到，
+        // 否则界面会先挂出一条随后又被替换掉的横幅（spec §7.3.0）。
         await refreshSvnEol(path)
         // 同理，且优先级更高：未收尾 / 同步进行中时**其余横幅全部让位**
         // （中间态下它们的结论可能是错的，出口还是危险的）。必须在第一帧之前
@@ -1094,6 +1117,7 @@ export function useRepoStore() {
         if (toErrorCode(err) === 'svn_no_baseline') {
           // 提交前的提醒不能再按丢失之前的旧清单弹（6.6 第 2 轮 review 低危第 2 条）
           latestSync.current = null
+          svnSyncWrites.current += 1
           setState((s) => (samePath(s.path ?? '', path)
             ? { ...s, svnBaselineMissing: true, svnSync: null }
             : s))
@@ -1108,7 +1132,45 @@ export function useRepoStore() {
     if (!samePath(openedPath.current ?? '', path)) return false
     latestVerdict.current = st.verdict.kind
     latestSync.current = st
+    svnSyncWrites.current += 1
     setState((s) => (samePath(s.path ?? '', path) ? { ...s, svnSync: st } : s))
+    return true
+  }
+
+  /**
+   * 跟进命令发起前取的号：之后有没有检测写回过，`applyFollowedSync` 据此决定能不能用带回的判定。
+   */
+  const svnSyncMark = (): number => svnSyncWrites.current
+
+  /**
+   * 跟进带回的判定（`SyncAfterFollow`，2026-11-24 分析方案 4）直接写回，不再跑一轮第二档。返回写回了没有：
+   * `false` 时调用方照原来 `refreshSvnSync`。`since` 是跟进命令发起前取的号（`svnSyncMark`）。
+   *
+   * 什么时候不写、为什么，见 `canApplyFollowedSync`。写的时候：
+   *
+   * - 判定：后端按锁内复核刚读的节点、用 `check_sync` 同一个判定算的，逐项相同（Rust
+   *   `tests/svn_follow_carry_sync.rs`）。
+   * - 领 `svnSync` 闸的号：顶掉更早开跑、还没写回的检测。它们读节点时基线可能还没发布，晚到会把横幅盖回
+   *   「有新内容」；被顶掉的不记戳，跟进前的戳留着。之后才开跑的检测照常顶掉这里。
+   * - wc.db 戳**不记**：留着跟进前那次检测记的戳。它早于后端读节点，之后 wc.db 有任何变化（比如 TortoiseSVN
+   *   就在这几秒里又提交了），下一次比戳都判成变了、重跑。代价最多是跟进前 wc.db 已经变过时多跑一轮。
+   * - 记带回的 HEAD，否则补发的 `repo-changed` 读到新 HEAD 会再强制跑一轮。
+   */
+  const applyFollowedSync = (path: string, sync: SyncAfterFollow, since: number): boolean => {
+    if (!samePath(openedPath.current ?? '', path)) return false
+    const head = observedHead(sync.head)
+    const scene = {
+      writtenSinceFollow: svnSyncWrites.current !== since,
+      stampsKnown: lastWcDbStamps.current.value !== null,
+      pending: headRequested.current,
+    }
+    if (!canApplyFollowedSync(scene, head)) return false
+    refreshGate.begin('svnSync')
+    latestVerdict.current = sync.status.verdict.kind
+    latestSync.current = sync.status
+    svnSyncWrites.current += 1
+    setState((s) => (samePath(s.path ?? '', path) ? { ...s, svnSync: sync.status } : s))
+    lastCheckedHead.current.value = head
     return true
   }
 
@@ -1646,6 +1708,8 @@ export function useRepoStore() {
     refreshStashes,
     refreshPullRequests,
     refreshSvnSync,
+    svnSyncMark,
+    applyFollowedSync,
     refreshSvnEol,
     refreshSvnSyncState,
     refreshSvnBranchesBehind,

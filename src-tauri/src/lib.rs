@@ -203,6 +203,7 @@ pub fn run() {
             commands::repo::open_repo,
             commands::repo::probe_svn_environment,
             commands::svn::svn_branches_behind,
+            commands::svn::svn_baseline_mismatch,
             commands::svn::svn_check_baseline,
             commands::svn::svn_eol_status,
             commands::svn::svn_fetch_log,

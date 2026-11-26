@@ -10,6 +10,7 @@ import {
   type ToolbarAction,
 } from '../engine/toolbarActions'
 import type { Capabilities } from '../engine/capabilities'
+import { ContextMenu, useContextMenu, type MenuItem } from './ContextMenu'
 import { CustomCommandBar } from './CustomCommandBar'
 
 /**
@@ -52,6 +53,15 @@ interface ToolbarProps {
   onSvnDeliver?: () => Promise<void>
   /** 非空时「更新」「交付」都禁用，值作悬停说明（`svnSyncBlockedReason`）。 */
   svnBlockedReason?: string | null
+  /**
+   * 「SVN ▾」菜单里的「体检基线…」。原来是同步正常时常驻在顶部的一行，挪到这里：正常时界面上
+   * 不该有让人以为出了事的东西（设计 2026-11-25 §7）。没传时不渲染这一项。
+   */
+  onCheckBaseline?: () => void
+  /** 非空时「体检基线…」置灰，值作悬停说明（`manualCheckBlockedReason`）。 */
+  checkBlockedReason?: string | null
+  /** 「SVN ▾」菜单里的「TortoiseSVN 钩子…」。没传时不渲染这一项。 */
+  onOpenHooks?: () => void
 }
 
 export function Toolbar({
@@ -63,8 +73,23 @@ export function Toolbar({
   onSvnUpdate,
   onSvnDeliver,
   svnBlockedReason = null,
+  onCheckBaseline,
+  checkBlockedReason = null,
+  onOpenHooks,
 }: ToolbarProps) {
   const ctrl = useCtrlHeld()
+  const { menu: svnMenu, openAt: openSvnMenu, close: closeSvnMenu } = useContextMenu()
+  const svnMenuItems: MenuItem[] = [
+    ...(onCheckBaseline
+      ? [{
+          label: '体检基线…',
+          onSelect: onCheckBaseline,
+          disabled: checkBlockedReason !== null,
+          title: checkBlockedReason ?? '拿基线和 SVN 服务器逐个文件核对',
+        }]
+      : []),
+    ...(onOpenHooks ? [{ label: 'TortoiseSVN 钩子…', onSelect: onOpenHooks }] : []),
+  ]
   const [busy, setBusy] = useState<ToolbarAction | null>(null)
   const [updating, setUpdating] = useState(false)
   const [delivering, setDelivering] = useState(false)
@@ -124,6 +149,20 @@ export function Toolbar({
           {delivering ? '…' : '交付'}
         </button>
       )}
+      {showsSvnUpdate(capabilities) && svnMenuItems.length > 0 && (
+        <button
+          className="toolbar-button"
+          onClick={(e) => {
+            // 菜单贴着按钮左下角弹出，不跟着鼠标落点
+            const r = e.currentTarget.getBoundingClientRect()
+            openSvnMenu(r.left, r.bottom, svnMenuItems)
+          }}
+          data-action="svn-menu"
+        >
+          SVN ▾
+        </button>
+      )}
+      <ContextMenu menu={svnMenu} onClose={closeSvnMenu} />
       {visibleToolbarActions(capabilities).map((action) => {
         const plan = planToolbarAction(action, ctrl, branch)
         const count = badge(action)

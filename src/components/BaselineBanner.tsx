@@ -4,7 +4,6 @@ import {
   describeEolMigration,
   describeMissingBaseline,
   describeSync,
-  needsStandaloneCheck,
   syncBannerIsSuppressed,
   type EolStatus,
   type ServerAudit,
@@ -31,6 +30,11 @@ import type { SyncActionId } from '../engine/svnSyncIn'
 import type { SyncOutActionId } from '../engine/svnSyncOut'
 import type { BannerAction } from '../engine/svnSync'
 import { describeStaleHooks, type HookHealth } from '../engine/tsvnHooks'
+import {
+  describeBaselineMismatch,
+  mismatchCheckApplies,
+  type BaselineMismatch,
+} from '../engine/svnMismatch'
 import type { SyncActionBusy } from './svnFlowShared'
 
 /** 交付那一组按钮的 id。`BannerAction.id` 是所有横幅共用的联合类型，在这里收窄。 */
@@ -56,7 +60,7 @@ interface BaselineBannerProps {
   baselineMissing?: boolean
   /** 重建基线。调用方负责先弹确认。 */
   onRebuild: () => void
-  /** 手动体检当前基线。 */
+  /** 体检当前基线：失同步横幅与「看法不一致」横幅上的那颗按钮。 */
   onCheck: () => void
   /** 走一次行尾迁移。调用方负责先弹确认。 */
   onMigrateEol: () => void
@@ -83,7 +87,7 @@ interface BaselineBannerProps {
   followBusy?: boolean
   /** TortoiseSVN 钩子的健康状态（C1h）。`null` = 还没读到或不适用。 */
   hooks?: HookHealth | null
-  /** 打开钩子注册框。没传时不渲染入口。 */
+  /** 失效横幅上的「重新注册」：打开钩子注册框。没传时不渲染。平时的入口在工具栏「SVN ▾」里。 */
   onOpenHooks?: () => void
   /** 失效横幅上的「撤销注册」。调用方负责先弹确认。 */
   onUnregisterHooks?: () => void
@@ -118,6 +122,14 @@ interface BaselineBannerProps {
   onDismissPending?: () => void
   /** 放回执行中。 */
   restoreBusy?: boolean
+  /**
+   * 「jkk 与 TortoiseSVN 看法不一致」的文件（设计 2026-11-25 §6）。`null` = 没查或没查到。
+   * 渲染前照样过一遍 `mismatchCheckApplies`：查询跟着「本地改动」刷新，失同步结论先变时
+   * 上一次的结果还留着，那时它已经不成立了。
+   */
+  mismatch?: BaselineMismatch | null
+  /** 体检报「基线没问题」时的那组文件（`mismatchKey`）：同一组不再挂。 */
+  mismatchAck?: string | null
 }
 
 /**
@@ -135,18 +147,19 @@ interface BaselineBannerProps {
  * 失同步说的是「revision 对不上」，漏收说的是「文件根本没下来」。
  * 一个正常、另一个不正常是完全可能的组合，所以分两条渲染。
  *
- * # 体检入口必须**常驻**，不能只在失同步时出现
+ * # 同步正常时不挂体检入口，只在看到症状时提示
  *
  * revision 一致不代表基线内容正确：`Lying`（基线记的内容与服务器不符）恰恰发生在
- * revision 完全对得上的时候。把入口绑在失同步横幅里，等于只在不需要它的时候
- * 提供它（2026-09-16 独立 review）。判据下沉到 `needsStandaloneCheck`，
- * 保证任何时刻**恰好一个**体检入口。
+ * revision 完全对得上的时候（2026-09-16 独立 review）。原来的办法是同步正常时常驻一行
+ * 「体检基线」，等用户怀疑时去点；用户反馈：正常使用就不该怀疑，也不知道什么时候该怀疑
+ * （设计 2026-11-25）。现在同步正常时什么都不挂，jkk 看到「本地改动里有、TortoiseSVN 却说
+ * 没改」的文件时才提示（`describeBaselineMismatch`）；手动体检挪到工具栏「SVN ▾」。
  *
- * # 行尾迁移横幅会让另外两条让位
+ * # 行尾迁移横幅会让失同步横幅让位
  *
- * 迁移未完成时基线的**形状**就是错的（spec §7.3.0），此时失同步横幅和常驻体检
- * 入口给出的结论都不可靠，而且三者的出口都指向重建基线——挂三条只是噪音。
- * 判据在 `syncBannerIsSuppressed` / `needsStandaloneCheck` 里，不散进这里。
+ * 迁移未完成时基线的**形状**就是错的（spec §7.3.0），此时失同步横幅给出的结论不可靠，
+ * 而且两者的出口都指向重建基线——挂两条只是噪音。判据在 `syncBannerIsSuppressed` 里，
+ * 不散进这里。「看法不一致」横幅那时也不挂（`mismatchCheckApplies`）。
  *
  * 唯一的例外是 `pinnedReset`：那时 `describeEolMigration` 自己返回 `null`，
  * 失同步横幅照常渲染，因为它指的是另一件必须先做的事。
@@ -180,6 +193,8 @@ export function BaselineBanner({
   onRestorePending,
   onDismissPending,
   restoreBusy = false,
+  mismatch = null,
+  mismatchAck = null,
 }: BaselineBannerProps) {
   // 未收尾 / 同步进行中排在最前，其余一律让位：那两种状态下仓库停在中间态，
   // 别的横幅拿半推进的基线算出来的结论可能是错的，而它们的出口（重建基线）
@@ -194,7 +209,10 @@ export function BaselineBanner({
     ? null
     : missing ?? (syncBannerIsSuppressed(eol, sync) ? null : describeSync(sync))
   const auditModel = hushed ? null : describeAudit(audit)
-  const standalone = !hushed && needsStandaloneCheck(isSvn, sync, eol, baselineMissing)
+  // `mismatchCheckApplies` 自己也看 hushed（`otherBannersAreSuppressed`）
+  const mismatchModel = mismatchCheckApplies(isSvn, sync, eol, syncState)
+    ? describeBaselineMismatch(mismatch, mismatchAck)
+    : null
   // 钩子失效不受 hushed 影响：它说的是 TortoiseSVN 那边会报错，与基线的中间态无关
   const staleHooks = isSvn ? describeStaleHooks(hooks) : null
   const [copied, setCopied] = useState(false)
@@ -231,7 +249,7 @@ export function BaselineBanner({
     !eolModel &&
     !model &&
     !auditModel &&
-    !standalone &&
+    !mismatchModel &&
     !staleHooks &&
     !notice &&
     !missingPatch
@@ -414,14 +432,23 @@ export function BaselineBanner({
           </ul>
         </div>
       )}
-      {standalone && (
-        <div className="banner-baseline quiet">
-          <p className="banner-baseline-detail">
-            revision 对得上不代表基线记的内容是对的——体检会拿基线跟服务器逐个文件比一遍。
-          </p>
+      {mismatchModel && (
+        <div className={`banner-baseline ${mismatchModel.tone}`} data-banner="baseline-mismatch">
+          <div className="banner-baseline-head">
+            <strong>{mismatchModel.title}</strong>
+          </div>
+          <p className="banner-baseline-detail">{mismatchModel.detail}</p>
+          <ul className="banner-baseline-files">
+            {(mismatchModel.files ?? []).map((f) => (
+              <li key={f}>{f}</li>
+            ))}
+          </ul>
           <div className="banner-baseline-actions">
-            <button onClick={onCheck}>体检基线</button>
-            {onOpenHooks && <button onClick={onOpenHooks}>TortoiseSVN 钩子…</button>}
+            {mismatchModel.actions.map((a) => (
+              <button key={a.id} onClick={onCheck}>
+                {a.label}
+              </button>
+            ))}
           </div>
         </div>
       )}

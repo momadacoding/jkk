@@ -142,6 +142,7 @@ fn with_disk_on(fx: &SvnFixture, files: &[&str], base: &str) -> FollowOutcome {
     let files: Vec<String> = files.iter().map(|s| s.to_string()).collect();
     follow_with_disk(&fx.wc_str(), "op2", &files, base)
         .unwrap_or_else(|e| panic!("{}: {}", e.code, e.message))
+        .0
 }
 fn done(o: FollowOutcome) -> FollowReport {
     match o {

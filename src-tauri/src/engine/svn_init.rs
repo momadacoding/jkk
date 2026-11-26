@@ -2137,24 +2137,17 @@ fn rebuild_from(repo_root: &str, old_baseline: Option<String>) -> Result<Rebuild
 /// update 把 external 退回 peg、恢复流程没走完、或者基线本来就录错了），
 /// 这正是 §6.8.1 说的「让基线可被服务器证伪」。
 ///
-/// # ⚠️ 必须先校验 `check_baseline` 的前提，不能直接调
+/// # 工作副本有改动时也能用
 ///
-/// `svn_health` 的模块头写着它的前提：**「磁盘上白名单内的内容 == 基线树的内容」**。
-/// spec §6.8.5 列的另外三个时机天然满足（树刚从磁盘录出来），**这一个不满足**
-/// ——用户就在 `work` 分支上改代码，那正是他会点这个按钮的时候。
+/// `check_baseline` 比的是「磁盘 vs 服务器」，而这里要回答的是「基线 vs 服务器」。用户就在
+/// `work` 分支上改代码，那正是他会点这个按钮的时候；不处理的话，一个再普通不过的未提交改动
+/// 会被报成 `Lying`，用户会照着引导去重建、把一份好基线换掉。
 ///
-/// 不校验前提的话，`check_baseline` 比的是「当前磁盘 vs 服务器」，而结论却被当成
-/// 「基线 vs 服务器」来汇报：一个再普通不过的未提交改动会被报成 `Lying`，
-/// 而基线完全正确。指控错对象比不指控更糟——用户会照着引导去**重建基线**，
-/// 把一份好基线换掉，而他的改动还在原地。
+/// 早先的做法是「磁盘与基线树逐字节相同才下结论，否则 `NotChecked`」，结果按钮几乎永远只回答
+/// 「没法下结论」。现在按 §6.8.7：SVN 说改过的文件（`S`）从判据里豁免，并在 `unverified` 里
+/// 如实报出去；基线树与磁盘树之间解释不了的差异另算一份证据（见函数体里的注释）。
 ///
-/// 所以这里先把磁盘上的 W-file 录成一棵树，和基线树比：
-///
-/// - 一致 → 前提成立，`check_baseline` 的结论就是关于基线的，照常返回；
-/// - 不一致 → 这条检查**分辨不出**「基线撒谎」和「我有未提交改动」，
-///   按 spec §6.8.6 第三行返回 `NotChecked`。
-///
-/// 录树复用 `rebuild_baseline` 那套临时索引，全程不碰真实 index、HEAD 和磁盘。
+/// 录磁盘树复用 `rebuild_baseline` 那套临时索引，全程不碰真实 index、HEAD 和磁盘。
 pub fn check_current_baseline(repo_root: &str) -> Result<Health> {
     if detect_repo_kind(repo_root) != RepoKind::SvnHybrid {
         return Err(GitError::new(

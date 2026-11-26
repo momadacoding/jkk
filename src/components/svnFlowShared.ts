@@ -28,12 +28,14 @@ export interface AfterSyncDeps {
  * 共用一轮 `svn status`（见 `SvnSyncFlowDeps.refreshSvnSync` 与 `repoStore` 的 `refreshSvnSync`）；
  * 排在读同步状态后面的话多半要白扫一遍，
  * 同步状态读不出来也不该让复查不跑。
+ *
+ * `checked` 为真时不复查：调用方已经把命令带回的判定写回了（跟进的 `SyncAfterFollow`）。
  */
-export function createAfterSync(d: AfterSyncDeps): () => Promise<void> {
-  return async () => {
+export function createAfterSync(d: AfterSyncDeps): (checked?: boolean) => Promise<void> {
+  return async (checked = false) => {
     const results = await Promise.allSettled([
       d.refreshSvnSyncState(d.repoPath),
-      d.refreshSvnSync(d.repoPath),
+      checked ? Promise.resolve() : d.refreshSvnSync(d.repoPath),
     ])
     for (const r of results) if (r.status === 'rejected') d.reportError(r.reason)
     void d.fetchSvnLog(d.repoPath)

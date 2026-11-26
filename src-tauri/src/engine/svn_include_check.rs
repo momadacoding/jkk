@@ -9,7 +9,7 @@
 
 use crate::engine::svn_baseline::TempIndex;
 use crate::engine::svn_dirty::Fix;
-use crate::engine::svn_gitignore::{query_verdicts, GitCtx};
+use crate::engine::svn_gitignore::{display_path, is_versioned, query_verdicts, GitCtx};
 use crate::engine::svn_scope::WScope;
 use crate::error::{GitError, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -294,6 +294,9 @@ pub(crate) fn verify_include_set_listing(
             "git 实际跟踪的文件集合与配置声明的不一致。",
             &missing,
             &unexpected,
+            // 最终核对在跟进、更新的 S7、交付的 D7a、建库、重建里都会跑，下一步各不相同，
+            // 这里不替它们说
+            "",
         ),
     ))
 }
@@ -323,11 +326,38 @@ pub(crate) fn verify_include_set_listing(
 /// 本来会放行——误报阻断（2026-10-28 review 指出，`svn_init` 有用例钉住）。
 /// `touched` 必须与录制用的是同一个集合（[`crate::engine::svn_dirty::explained_paths`]）。
 ///
-/// # 与 `svn_sync_check::precheck_include_set` 不是一回事
+/// # 同步前的检查也走这里
 ///
-/// 那一个走真的 `git add`、不套修正，给同步前的磁盘检查用。名字刻意错开。
+/// `svn_sync_check::precheck_include_set`（更新 / 交付前）原来走真的 `git add`、不套修正，
+/// 于是 SVN 忽略的编译产物（`obj/*.cs`）被工作树 `.gitignore` 挡住时被报成不一致，而录基线
+/// 那道最终核对本来会放行（2026-11-25 用户现场）。现在它也调本函数，只换标题。
 pub fn dry_run_include_set(
     repo_root: &str,
+    scope: &WScope,
+    fixes: &BTreeMap<String, Fix>,
+    touched: &BTreeSet<String>,
+) -> Result<()> {
+    dry_run_include_set_titled(
+        repo_root,
+        "录制基线前预检没通过：按当前的忽略规则，git 将要收进来的文件与配置声明的不一致。\
+         还没开始录制就停下了。",
+        "",
+        scope,
+        fixes,
+        touched,
+    )
+}
+
+/// 同 [`dry_run_include_set`]，报告的标题由调用方给：更新、交付前的检查停下时什么都没改动，
+/// 不能说成「录制基线前」。
+///
+/// `versioned_tail`：挡住文件的 `.gitignore` 是 SVN 里的文件时，接在「不要改它们」后面的
+/// 下一步。只有调用方知道此刻能做什么（更新前能改用 TortoiseSVN 更新；录制半路上不能），
+/// 空串就不说。
+pub(crate) fn dry_run_include_set_titled(
+    repo_root: &str,
+    headline: &str,
+    versioned_tail: &str,
     scope: &WScope,
     fixes: &BTreeMap<String, Fix>,
     touched: &BTreeSet<String>,
@@ -357,13 +387,7 @@ pub fn dry_run_include_set(
     let unexpected: Vec<String> = actual.difference(&expected).cloned().collect();
     Err(GitError::new(
         "include_set_mismatch",
-        mismatch_report(
-            repo_root,
-            "录制基线前预检没通过：按当前的忽略规则，git 将要收进来的文件与配置声明的不一致。\
-             还没开始录制就停下了。",
-            &missing,
-            &unexpected,
-        ),
+        mismatch_report(repo_root, headline, &missing, &unexpected, versioned_tail),
     ))
 }
 
@@ -383,11 +407,14 @@ const MAX_GROUPS: usize = 10;
 ///
 /// 规则查询失败时**不阻止报告**：差异本身已经确定，规则只是帮用户定位的附加
 /// 信息。查不到的路径落进「查不到裁决规则」，用户仍然看得到是哪些文件。
+///
+/// `versioned_tail` 见 [`dry_run_include_set_titled`]。
 pub(crate) fn mismatch_report(
     repo_root: &str,
     headline: &str,
     missing: &[String],
     unexpected: &[String],
+    versioned_tail: &str,
 ) -> String {
     let all: Vec<&str> = missing
         .iter()
@@ -402,7 +429,8 @@ pub(crate) fn mismatch_report(
     });
 
     let mut msg = format!("{headline}\n");
-    let mut blamed_gitignore = false;
+    // 挡住了「应当被跟踪」文件的工作树 `.gitignore`（仓库相对路径），给末尾的建议用
+    let mut blamed: BTreeSet<String> = BTreeSet::new();
     if !missing.is_empty() {
         msg.push_str(&format!(
             "\n应当被跟踪、实际没有：共 {} 个\n",
@@ -417,7 +445,7 @@ pub(crate) fn mismatch_report(
             match verdicts.get(f) {
                 Some(v) if v.ignores() => {
                     if v.in_worktree_gitignore() {
-                        blamed_gitignore = true;
+                        blamed.insert(v.source.replace('\\', "/"));
                     }
                     format!("被 {} 挡掉", v.describe(repo_root))
                 }
@@ -449,13 +477,59 @@ pub(crate) fn mismatch_report(
         });
         push_groups(&mut msg, groups);
     }
-    if blamed_gitignore {
-        msg.push_str(
-            "\n工作树里的 .gitignore 优先级高于本应用生成的 .git/info/exclude。\
-             把上面点名的 .gitignore 挪走、或删掉对应的行之后再重试。\n",
-        );
+    if !blamed.is_empty() {
+        msg.push_str(&gitignore_advice(repo_root, &blamed, versioned_tail));
     }
     msg
+}
+
+/// 报告末尾「怎么办」那一段。
+///
+/// # SVN 里的 `.gitignore` 不能建议改
+///
+/// 原来一律建议「挪走、或删掉对应的行」。2026-11-25 用户现场被点名的两个 `.gitignore`
+/// 都是 SVN 里别人提交的：照做的话 TortoiseSVN 提交框里就多出两个被修改的文件，要么误交，
+/// 要么每次提交都得记着把它们排除。受版本控制的就说明它是 SVN 里的文件、不要改它。
+///
+/// 这个仓库建好之后，白名单、扩展名、「尊重 .gitignore」在应用里都改不了（只有建库向导能选），
+/// 所以不指向那些设置。「接下来做什么」由调用方给（`versioned_tail`）：更新 / 交付前停下时
+/// 能改用 TortoiseSVN；S7 半路上、建库、重建时那句话不对，就不说（独立 review 第 1 条）。
+///
+/// 查不出是否受版本控制（svn 起不来等）时按受版本控制处理：多一句「不要改」的代价，
+/// 比建议用户改一个团队文件小。
+fn gitignore_advice(repo_root: &str, blamed: &BTreeSet<String>, versioned_tail: &str) -> String {
+    let (versioned, local): (Vec<&String>, Vec<&String>) = blamed.iter().partition(|rel| {
+        is_versioned(repo_root, rel).unwrap_or_else(|e| {
+            log::warn!("查不出 {rel} 是否受版本控制，按受控处理：{}", e.message);
+            true
+        })
+    });
+    let show = |files: &[&String]| -> String {
+        files
+            .iter()
+            .map(|f| format!("  - {}", display_path(repo_root, f)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let mut s =
+        String::from("\n工作树里的 .gitignore 优先级高于本应用生成的 .git/info/exclude。\n");
+    if !local.is_empty() {
+        s.push_str(&format!(
+            "下面这些 .gitignore 不在 SVN 里，把它们挪走、或删掉对应的行之后再重试：\n{}\n",
+            show(&local)
+        ));
+    }
+    if !versioned.is_empty() {
+        s.push_str(&format!(
+            "下面这些 .gitignore 是 SVN 里的文件，不要改它们——改了就成了一处要提交的 SVN 改动：\n{}\n",
+            show(&versioned)
+        ));
+        if !versioned_tail.is_empty() {
+            s.push_str(versioned_tail);
+            s.push('\n');
+        }
+    }
+    s
 }
 
 /// 按 `label` 分组，组按文件数从多到少排；同数按标签排，保证输出稳定。
@@ -539,7 +613,7 @@ mod tests {
             "Code/Tools/b.exe".to_string(),
         ];
         let unexpected = ["Code/Keep.cs".to_string()];
-        let m = mismatch_report(root, "h", &missing, &unexpected);
+        let m = mismatch_report(root, "h", &missing, &unexpected, "");
 
         let want = format!(
             "2 个被 {} 第 1 行 `*.exe` 挡掉",

@@ -74,7 +74,7 @@ export type ServerAudit =
   | { status: 'missing'; files: string[]; total: number }
   | { status: 'notChecked'; reason: string }
 
-/** `quiet` 是灰色：只告知、不需要用户动手（与常驻体检入口同一套样式）。 */
+/** `quiet` 是灰色：只告知、不需要用户动手（「SVN 正在更新…」那一条）。 */
 export type BannerTone = 'warn' | 'danger' | 'quiet'
 
 export interface BannerAction {
@@ -232,39 +232,6 @@ export function describeSync(status: SyncStatus | null): BannerModel | null {
         note: REBUILD_NOTE,
       }
   }
-}
-
-/**
- * 常驻的「体检基线」入口要不要渲染。
- *
- * # 为什么不能只把它挂在失同步横幅里
- *
- * `describeSync` 对 `InSync` 返回 `null`，整条横幅不渲染，连带把唯一的体检入口
- * 也带走了（2026-09-16 独立 review）。而 **revision 一致根本不能证明基线内容
- * 正确**——`check_current_baseline` 报的 `Lying`（基线记的内容与服务器不符）
- * 恰恰发生在 revision 完全对得上的时候，`svn revert` 那类外部操作也不动 revision。
- *
- * 换句话说，把体检入口绑在失同步状态上，等于**只在不需要它的时候提供它**。
- *
- * 失同步横幅自己带了一个体检按钮，所以那时不重复渲染，保证任何时刻恰好一个入口。
- */
-export function needsStandaloneCheck(
-  isSvn: boolean,
-  sync: SyncStatus | null,
-  eol: EolStatus | null,
-  /** 基线分支不存在（第 70 条）：体检同样要读基线，入口点了只会报错，出口在恢复横幅上。 */
-  baselineMissing = false,
-): boolean {
-  // 只看「丢了且还没有结论」：标记在判定成功时不清，重建之后有了结论，入口就该回来
-  // （PR 115 review）
-  if (baselineMissing && !sync) return false
-  // 迁移没做完时基线本来就不可信，挂一个「体检基线」只会给出误导性的结论
-  // ——体检比的是磁盘与服务器，而此刻的问题出在基线自己的形状上。
-  //
-  // 第三个参数**故意不给默认值**：给了默认值，漏传的调用点会被编译器放过，
-  // 而漏传的后果正是这条规则要防的。让 tsc 把每个调用点都逼出来。
-  if (describeEolMigration(eol, sync) !== null) return false
-  return isSvn && describeSync(sync) === null
 }
 
 /**
@@ -523,6 +490,38 @@ function headKind(branch: string): 'detached' | 'baseline' | 'branch' {
  */
 export function sameHeadForSync(a: HeadObservation, b: HeadObservation): boolean {
   return a.hash === b.hash && headKind(a.branch) === headKind(b.branch)
+}
+
+/** {@link canApplyFollowedSync} 要看的现场，都是 `repoStore` 此刻的 ref。 */
+export interface FollowedSyncScene {
+  /** 跟进命令发起之后，有没有哪一轮检测把结论写回了界面。 */
+  writtenSinceFollow: boolean
+  /** wc.db 戳记过没有（`lastWcDbStamps` 不是 `null`）。 */
+  stampsKnown: boolean
+  /** 正在替哪个 HEAD 跑强制校验（`headRequested`）。 */
+  pending: HeadObservation | null
+}
+
+/**
+ * 跟进带回的判定（`SyncAfterFollow`，2026-11-24 分析方案 4）能不能直接写回、把带回的 HEAD 记成「上次校验的
+ * HEAD」。不能就照原来跑一轮第二档（`refreshSvnSync`），只是少省一次。
+ *
+ * 带回的判定按锁内复核（R3c）读的节点算，那之后工作副本还可能变。写回要顶掉别的检测（领 `svnSync` 闸的号），
+ * 所以下面三种情形都不写（独立 review 第 1–3 条）：
+ *
+ * - 命令发起之后已经有一轮检测写回了：它读节点可能晚于 R3c，还记下了那一刻的戳。盖上去的话横幅退回旧结论，
+ *   之后比戳又判没变，一直不纠正。
+ * - 戳还没记过：写回之后不会有人补记，失焦快照在戳是 `null` 时不比戳（`markOnBlur`），会把快照写在一个
+ *   没核对过的 InSync 上。
+ * - 有一轮替**别的** HEAD 排着：写回会把它顶掉、它的事件已经用掉，没人再替那个 HEAD 校验。替同一个 HEAD
+ *   排着的那轮被顶掉也无妨：结论与带回的相同，HEAD 由这里记。
+ *
+ * 带回的 HEAD 是后端判定之前读的，按 `recordAfterSuccess` 的规矩可以记。不记的话，后端跟进后补发的
+ * `repo-changed` 读到新 HEAD 会强制再跑一轮，省下的那遍 `svn status` 只是挪到了后台。
+ */
+export function canApplyFollowedSync(scene: FollowedSyncScene, carried: HeadObservation): boolean {
+  if (scene.writtenSinceFollow || !scene.stampsKnown) return false
+  return !scene.pending || sameHeadForSync(scene.pending, carried)
 }
 
 /**

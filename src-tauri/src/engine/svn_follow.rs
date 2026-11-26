@@ -60,6 +60,7 @@
 
 use crate::engine::git_cli::{run_git, run_git_bytes, run_git_code, run_git_stdin};
 use crate::engine::git_read::{self, LineStat};
+use crate::engine::repo::RepoInfo;
 use crate::engine::svn_baseline::{
     create_baseline_commit_with, git_dir, move_baseline_ref, IndexEdit, TempIndex,
 };
@@ -91,7 +92,8 @@ use crate::engine::svn_restore_local_only::{
 };
 use crate::engine::svn_snapshot::SnapshotRule;
 use crate::engine::svn_sync::{
-    check_sync_with_nodes, read_baseline_map, tree_files, ExternalChange, SyncVerdict,
+    check_sync_with_nodes, judge_nodes, read_baseline_map, tree_files, ExternalChange, SyncStatus,
+    SyncVerdict,
 };
 use crate::engine::svn_sync_check::{
     assert_linear, check_git_idle, current_branch, list_paths, rev_parse,
@@ -314,7 +316,17 @@ pub fn git_version_ok(text: &str) -> bool {
 /// 当前分支重放冲突时顺便探测磁盘上的内容能不能直接用，结果在 `NeedsManual` 的 `disk_ready` 与
 /// 每个文件的 `details[].disk` 里，什么都不替换（设计 2026-11-25-follow-resolve-with-disk）。
 pub fn follow(repo: &str, opid: &str) -> Result<FollowOutcome> {
-    follow_with(repo, opid, DiskUse::Probe)
+    // 不算带回的判定：调用方（续跟 `resume_follow`、测试）用不上，锁内白读一遍基线树和落后清单
+    Ok(follow_carrying(repo, opid, DiskUse::Probe, false)?.0)
+}
+
+/// 同 [`follow`]，另外带回发布之后的判定（[`SyncAfterFollow`]）。基线发布了（完成、或当前分支冲突）
+/// 且有 R3c 读过的节点时才有。
+pub fn follow_with_sync(
+    repo: &str,
+    opid: &str,
+) -> Result<(FollowOutcome, Option<SyncAfterFollow>)> {
+    follow_carrying(repo, opid, DiskUse::Probe, true)
 }
 
 /// 冲突框里的「用磁盘上的内容跟进」（设计 2026-11-25-follow-resolve-with-disk）：冲突文件的重放
@@ -323,63 +335,82 @@ pub fn follow(repo: &str, opid: &str) -> Result<FollowOutcome> {
 /// `files` 是冲突框里列过的文件，`base` 是冲突框给人对比时用的新基线。按此刻的磁盘重跑全部检查；
 /// 不能用、要替换的文件不在 `files` 里、或者新基线已经不是 `base`（点击之前 SVN 又前进了，用户对比
 /// 时看的左边是旧的），什么都不替换，返回新的 `NeedsManual` 让冲突框重画（设计 §11 第 6 条）。
+///
+/// 与 [`follow_with_sync`] 一样带回发布之后的判定：完成之后横幅照样不用再扫一遍 `svn status`。
 pub fn follow_with_disk(
     repo: &str,
     opid: &str,
     files: &[String],
     base: &str,
-) -> Result<FollowOutcome> {
+) -> Result<(FollowOutcome, Option<SyncAfterFollow>)> {
     let confirmed: BTreeSet<String> = files.iter().cloned().collect();
-    follow_with(
+    follow_carrying(
         repo,
         opid,
         DiskUse::Apply {
             files: &confirmed,
             base,
         },
+        true,
     )
 }
 
-fn follow_with(repo: &str, opid: &str, disk: DiskUse) -> Result<FollowOutcome> {
+/// [`follow`]、[`follow_with_sync`] 与 [`follow_with_disk`] 的本体。`carry` 为假时不算判定。
+fn follow_carrying(
+    repo: &str,
+    opid: &str,
+    disk: DiskUse,
+    carry: bool,
+) -> Result<(FollowOutcome, Option<SyncAfterFollow>)> {
     for _ in 0..MAX_ATTEMPTS {
         // 准备阶段里同一条 svn 扫描只跑一次（性能 P2）；发布前的复核在范围外，照常读最新的
         let plan = match with_scan_cache(|| prepare(repo, false, None, disk)) {
             Ok(p) => p,
-            Err(e) => return Ok(refused(e)),
+            Err(e) => return Ok((refused(e), None)),
         };
         fault::reach(fault::Point::Prepared, None);
         // 分支跟进入口上重放冲突：基线本来就在那里，没有要发布的东西
         if let (true, Target::Conflict(m)) = (plan.old_base == plan.new_base, &plan.target) {
-            return Ok(needs_manual(m));
+            return Ok((needs_manual(m), None));
         }
         // 同步锁活到 publish 返回：冲突出口这种提前返回也在 Drop 里放掉
         let _lock = match svn_lock::acquire(repo, opid) {
             Ok(l) => l,
-            Err(e) => return Ok(refused(e)),
+            Err(e) => return Ok((refused(e), None)),
         };
         match still_valid(repo, &plan) {
-            Ok(true) => {
+            Ok(Recheck::Valid { nodes }) => {
                 let auto = auto_restorable(&plan);
                 let out = publish(repo, opid, plan)?;
-                // 同步锁还拿着
-                return Ok(match out {
+                // 同步锁还拿着。判定放在放回补丁之后：放回写的是磁盘，判定要看磁盘上有哪些文件
+                let out = match out {
                     FollowOutcome::Done { mut report } => {
                         with_restore(repo, &mut report, &auto, NOT_MINE);
                         FollowOutcome::Done { report }
                     }
                     other => other,
-                });
+                };
+                let sync = match &out {
+                    FollowOutcome::Done { .. } | FollowOutcome::NeedsManual { .. } if carry => {
+                        sync_after(repo, nodes.as_deref())
+                    }
+                    _ => None,
+                };
+                return Ok((out, sync));
             }
-            Ok(false) => continue,
-            Err(e) => return Ok(refused(e)),
+            Ok(Recheck::Changed) => continue,
+            Err(e) => return Ok((refused(e), None)),
         }
     }
-    Ok(FollowOutcome::Refused {
-        code: "svn_follow_state_changed".to_string(),
-        message: "准备跟进期间仓库一直在变（有别的工具在提交或切分支？）。这次什么都没动，\
-                  等它们做完再点一次「跟进」。"
-            .to_string(),
-    })
+    Ok((
+        FollowOutcome::Refused {
+            code: "svn_follow_state_changed".to_string(),
+            message: "准备跟进期间仓库一直在变（有别的工具在提交或切分支？）。这次什么都没动，\
+                      等它们做完再点一次「跟进」。"
+                .to_string(),
+        },
+        None,
+    ))
 }
 
 /// 把崩溃留下的跟进走完，或者回到一致状态之后重新跟进。
@@ -487,38 +518,64 @@ impl From<GitError> for AutoSkip {
 /// | 12 | [`publish_auto`]：先拼索引、看过决策再发布基线 |
 /// | 13 | 没有撤销功能，恒真 |
 pub fn follow_auto(repo: &str, opid: &str) -> Result<AutoFollowOutcome> {
+    Ok(follow_auto_carrying(repo, opid, false)?.0)
+}
+
+/// 同 [`follow_auto`]，另外带回发布之后的判定（[`SyncAfterFollow`]）。只有跟进完成时才有：
+/// 被拦下时一个 ref 都没动，前端的判定本来就是对的。
+pub fn follow_auto_with_sync(
+    repo: &str,
+    opid: &str,
+) -> Result<(AutoFollowOutcome, Option<SyncAfterFollow>)> {
+    follow_auto_carrying(repo, opid, true)
+}
+
+/// [`follow_auto`] 与 [`follow_auto_with_sync`] 的本体。`carry` 为假时不算判定。
+fn follow_auto_carrying(
+    repo: &str,
+    opid: &str,
+    carry: bool,
+) -> Result<(AutoFollowOutcome, Option<SyncAfterFollow>)> {
     for _ in 0..MAX_ATTEMPTS {
         // 两遍准备都在同一个扫描缓存里：第二遍不重扫白名单
         let plan = match with_scan_cache(|| prepare_auto(repo)) {
             Ok(p) => p,
-            Err(e) => return Ok(skipped(e)),
+            Err(e) => return Ok((skipped(e), None)),
         };
         fault::reach(fault::Point::Prepared, None);
         let _lock = match svn_lock::acquire(repo, opid) {
             Ok(l) => l,
-            Err(e) => return Ok(skipped(e)),
+            Err(e) => return Ok((skipped(e), None)),
         };
         match still_valid(repo, &plan) {
-            Ok(true) => {
+            Ok(Recheck::Valid { nodes }) => {
                 let auto = auto_restorable(&plan);
                 let out = publish_auto(repo, opid, plan)?;
-                // 同步锁还拿着
+                // 同步锁还拿着。判定放在放回补丁之后，理由同 `follow_with_sync`
                 return Ok(match out {
                     AutoFollowOutcome::Done { mut report } => {
                         with_restore(repo, &mut report, &auto, NOT_MINE);
-                        AutoFollowOutcome::Done { report }
+                        let sync = if carry {
+                            sync_after(repo, nodes.as_deref())
+                        } else {
+                            None
+                        };
+                        (AutoFollowOutcome::Done { report }, sync)
                     }
-                    other => other,
+                    other => (other, None),
                 });
             }
-            Ok(false) => continue,
-            Err(e) => return Ok(skipped(e)),
+            Ok(Recheck::Changed) => continue,
+            Err(e) => return Ok((skipped(e), None)),
         }
     }
-    Ok(skipped(GitError::new(
-        "svn_follow_state_changed",
-        "准备跟进期间仓库一直在变（有别的工具在提交或切分支？），这次没有自动跟进，什么都没动。",
-    )))
+    Ok((
+        skipped(GitError::new(
+            "svn_follow_state_changed",
+            "准备跟进期间仓库一直在变（有别的工具在提交或切分支？），这次没有自动跟进，什么都没动。",
+        )),
+        None,
+    ))
 }
 
 fn skipped(e: impl Into<AutoSkip>) -> AutoFollowOutcome {
@@ -3347,8 +3404,17 @@ fn capped(items: Vec<String>, unit: &str) -> String {
 
 // —— 发布阶段 ——
 
-/// F4 锁内复核。变了返回 `false`，调用方释放锁回到 F1（最多一次）。
-fn still_valid(repo: &str, plan: &Plan) -> Result<bool> {
+/// [`still_valid`] 的结论。
+enum Recheck {
+    /// 准备之后仓库变了，调用方释放锁回到 F1（最多一次）。
+    Changed,
+    /// 没变。`nodes` 是 R3c 此刻读到的工作副本节点，发布之后拿来判定（[`sync_after`]）；没有录制
+    /// （分支跟进入口）时不重读，为 `None`。
+    Valid { nodes: Option<Vec<NodeStatus>> },
+}
+
+/// F4 锁内复核。
+fn still_valid(repo: &str, plan: &Plan) -> Result<Recheck> {
     if svn_journal::read(repo)?.is_some() {
         return Err(GitError::new(
             "svn_follow_unfinished",
@@ -3361,20 +3427,20 @@ fn still_valid(repo: &str, plan: &Plan) -> Result<bool> {
         || rev_parse(repo, "HEAD")? != plan.old_head
         || rev_parse(repo, &format!("refs/heads/{BASELINE_BRANCH}"))? != plan.old_base
     {
-        return Ok(false);
+        return Ok(Recheck::Changed);
     }
     for m in &plan.others {
         if ref_oid(repo, &m.branch)?.as_deref() != Some(m.old.as_str()) {
-            return Ok(false);
+            return Ok(Recheck::Changed);
         }
     }
     // 用磁盘内容替换的文件：准备之后磁盘又变了，提交里写的就是旧的那一份。重来一次按新内容重判
     // （设计 2026-11-25 §11 第 6 条）。改了不会丢东西（工作区不写），只是提交与用户看到的对不上
     if !plan.disk_used.is_empty() && !disk_unchanged(repo, &plan.disk_used) {
-        return Ok(false);
+        return Ok(Recheck::Changed);
     }
     let Some(map) = &plan.recorded else {
-        return Ok(true);
+        return Ok(Recheck::Valid { nodes: None });
     };
     // 跟进的 R3c 就在这里（录制里那一次不做，见 `svn_init::RecordMode::Follow`）：从录制读节点
     // 状态到现在，中间隔着取服务器内容、体检和重放。按同一规则重算，算不出来也是被改了。
@@ -3391,12 +3457,64 @@ fn still_valid(repo: &str, plan: &Plan) -> Result<bool> {
         })
     })?;
     let files = tree_files(repo, &plan.new_base)?;
-    Ok(
-        match compute_map(&map.repos_root, &map.uuid, &files, &nodes, map.gone.clone()) {
-            Ok(again) => again == *map,
-            Err(_) => false,
-        },
-    )
+    let same = matches!(
+        compute_map(&map.repos_root, &map.uuid, &files, &nodes, map.gone.clone()),
+        Ok(again) if again == *map
+    );
+    Ok(if same {
+        Recheck::Valid { nodes: Some(nodes) }
+    } else {
+        Recheck::Changed
+    })
+}
+
+/// 跟进发布之后的判定，随结局带回前端，前端不再为它扫一遍 `svn status`（2026-11-24 分析方案 4）。
+///
+/// `head` 是判定**之前**读的：前端把它记成「按它校验过的 HEAD」，之后 HEAD 再变的事件照常触发校验。
+/// 前端在命令返回之后再读的话，中间被外部工具切了分支，就会把没校验过的 HEAD 记成校验过。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncAfterFollow {
+    pub status: SyncStatus,
+    pub head: RepoInfo,
+}
+
+/// `svn_follow` / `svn_follow_auto` 返回给前端的：结局本身，外加 [`SyncAfterFollow`]。
+///
+/// 结局摊平在同一层（`flatten`），JSON 仍是 `{ kind, report, ... }`，只多一个可选的 `sync`：
+/// 前端读结局的地方一处都不用改。没有判定时不发这个字段。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Followed<T> {
+    #[serde(flatten)]
+    pub outcome: T,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SyncAfterFollow>,
+}
+
+impl<T> From<(T, Option<SyncAfterFollow>)> for Followed<T> {
+    fn from((outcome, sync): (T, Option<SyncAfterFollow>)) -> Self {
+        Followed { outcome, sync }
+    }
+}
+
+/// 按 R3c 读到的节点算发布之后的判定。调用方持同步锁，基线与分支都已落定。
+///
+/// 只是提速：没有节点（分支跟进入口）或者算出错都返回 `None`，前端照原来自己读。
+fn sync_after(repo: &str, nodes: Option<&[NodeStatus]>) -> Option<SyncAfterFollow> {
+    let nodes = nodes?;
+    let carried = crate::engine::repo::open(repo).and_then(|head| {
+        Ok(SyncAfterFollow {
+            status: judge_nodes(repo, nodes)?,
+            head,
+        })
+    });
+    match carried {
+        Ok(s) => Some(s),
+        Err(e) => {
+            log::info!("跟进之后的判定没算成，由前端照常读：{}", e.message);
+            None
+        }
+    }
 }
 
 /// 这些文件磁盘上的 blob（按 `git add` 的过滤规则）仍是准备时算的那个。文件没了、算不出来都算变了。
