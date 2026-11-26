@@ -909,9 +909,12 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
       id: 'notRewritten',
       title: '没换成 SVN 版本的路径',
       level: 'attention',
+      // 三种原因都会落到这里，文案要对每一种都成立（第二轮独立 review 第 4 条）
       note:
-        '这些路径你在 SVN 上提交过，但 commit 里还有改动不在 SVN 的版本里（比如 TortoiseSVN 只提交了一部分），' +
-        '为了不丢掉这些改动，commit 照常重放了。分支里会留着它们；如果和磁盘对不上，对比后再决定留哪一边。',
+        '这些路径你在 SVN 上提交过，但没有换成 SVN 的版本，commit 照常重放了。原因是其中之一：' +
+        'commit 里还有改动不在 SVN 的版本里（比如 TortoiseSVN 只提交了一部分）；' +
+        '更早的 commit 在同一个文件上已经照常重放，后面的只能跟着重放；核对时出错。' +
+        '分支里会留着这些改动；如果和磁盘对不上，对比后再决定留哪一边。',
       groups: (r.notRewritten ?? []).map(([c, paths]) => ({
         label: commitLabel(c),
         items: plain(paths),

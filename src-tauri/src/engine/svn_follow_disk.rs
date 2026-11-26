@@ -382,27 +382,83 @@ pub fn supersede_safe(
     Ok(out)
 }
 
+/// `parent → commit` 改过的路径里落在 `within` 的那些。进程内读不了时交回 `git diff-tree`。
+pub fn touched_paths(
+    repo: &str,
+    parent: &str,
+    commit: &str,
+    within: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let all: Vec<String> = git_read::or_cli(
+        "列 commit 改过的路径",
+        || {
+            Ok(git_read::tree_changes(repo, parent, commit)?
+                .into_iter()
+                .map(|c| c.path)
+                .collect())
+        },
+        || {
+            Ok(run_git(
+                repo,
+                &[
+                    "diff-tree",
+                    "-r",
+                    "-z",
+                    "--no-renames",
+                    "--name-only",
+                    parent,
+                    commit,
+                ],
+            )?
+            .split('\0')
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect())
+        },
+    )?;
+    Ok(all.into_iter().filter(|p| within.contains(p)).collect())
+}
+
 /// [`supersede_safe`] 的一个文件：`svn` 是新基线的 blob，`base` / `mine` 是提交前后的 blob。
+///
+/// 只走 git 命令：与 [`remerge`] 读到的是同一份内容。libgit2 在 SHA-256 仓库、有 replace ref 时读不了
+/// 或读到的不一样（第二轮独立 review 第 1 条）。先取大小：有一份超过 8 MB 时只读 SVN 那一份判二进制，
+/// 提交前后的两份不读（第 2 条）。
 fn supersede_ok(repo: &str, svn: &str, base: &str, mine: &str) -> Result<bool> {
-    let heads = [svn, base, mine]
-        .iter()
-        .map(|oid| git_read::blob_head(repo, oid, BINARY_PROBE))
-        .collect::<Result<Vec<_>>>()?;
-    if heads.iter().any(|(_, h)| wide_bom(h)) {
+    let bad = || GitError::new("svn_follow_disk", "git cat-file --batch-check 的输出读不懂");
+    let sizes = run_git_stdin(
+        repo,
+        &["cat-file", "--batch-check=%(objectsize)"],
+        format!("{svn}\n{base}\n{mine}\n").as_bytes(),
+    )?
+    .lines()
+    .map(|l| l.trim().parse::<u64>().map_err(|_| bad()))
+    .collect::<Result<Vec<u64>>>()?;
+    if sizes.len() != 3 {
+        return Err(bad());
+    }
+    let read = |oid: &str| run_git_bytes(repo, &["cat-file", "blob", oid]);
+    if sizes.iter().any(|n| *n > MAX_BYTES) {
+        // TortoiseSVN 提交的那一版是二进制（贴图、模型），就是整个提交的；是文本就不核对、不换
+        return Ok(is_binary(&read(svn)?));
+    }
+    let blobs = [read(svn)?, read(base)?, read(mine)?];
+    if blobs.iter().any(|b| wide_bom(b)) {
         return Ok(false);
     }
-    // 先判二进制再看大小：大的二进制（贴图、模型）照样只能整个提交
-    if heads.iter().any(|(_, h)| h.contains(&0)) {
+    if blobs.iter().any(|b| is_binary(b)) {
         return Ok(true);
     }
-    if heads.iter().any(|(n, _)| *n > MAX_BYTES) {
-        return Ok(false);
-    }
-    let svn_bytes = run_git_bytes(repo, &["cat-file", "blob", svn])?;
+    let [svn_bytes, ..] = blobs;
     Ok(match remerge(repo, svn, base, mine)? {
         Remerged::Clean(merged) => merged == svn_bytes,
         Remerged::Conflict(t) => t.outside_matches(&svn_bytes) == Some(true),
     })
+}
+
+/// 与 git 的 `buffer_is_binary` 相同：前 8000 字节里有 NUL。带 UTF-16 / UTF-32 BOM 的不算（那是文本）。
+fn is_binary(b: &[u8]) -> bool {
+    !wide_bom(b) && b[..b.len().min(BINARY_PROBE)].contains(&0)
 }
 
 /// UTF-16 / UTF-32 的 BOM（`FF FE` 同时盖住 UTF-32 LE）。这类文本按字节有 NUL，git 当成二进制。

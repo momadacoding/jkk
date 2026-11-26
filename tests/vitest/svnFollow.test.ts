@@ -550,6 +550,9 @@ describe('describeFollowReport', () => {
     expect(s.groups[0].label).toContain('g'.repeat(10))
     expect(texts(s.groups[0].items)).toEqual(['Code/A.cs'])
     expect(s.note).toContain('只提交了一部分')
+    // 被更早的 commit 挡住的、核对出错的也列在这里，文案不能只说「有改动不在 SVN 里」
+    expect(s.note).toContain('更早的 commit')
+    expect(s.note).toContain('核对时出错')
     // 分支里留着 SVN 上没有的改动，要用户看一眼
     expect(describeFollowReport(r).tone).toBe('attention')
   })

@@ -7,7 +7,7 @@
 | Task | 状态 | 产出文件 | 验证 |
 |---|---|---|---|
 | 1 收尾写只含 commit 的快照 | 完成 | `svn_follow_mark.rs`、`svn_follow.rs`（`finish`）、`svn_sync_in.rs`（`finish_forward`）、`tests/svn_follow_hooks.rs`、`tests/svn_follow.rs` | 新用例先红（NeedsManual，拒绝理由与现场截图相同）后绿；改过断言的 3 个用例与 `resume_after_crash_between_each_step` 等 13 个崩溃用例通过 |
-| 2 换成 SVN 版本前核对 | 完成 | `svn_follow_disk.rs`（`supersede_safe`、与冲突框共用的 `remerge`）、`svn_follow.rs`（`superseded` 按提交核对并缓存）、`tests/svn_follow_hooks.rs` | 两个「部分提交」用例先红后绿；现场形状（两个提交 + 同事改动、整个提交）放行；W14 用例记下新行为 |
+| 2 换成 SVN 版本前核对 | 完成 | `svn_follow_disk.rs`（`supersede_safe` 带 `blocked`、`supersede_ok` 只走 `git cat-file`、`touched_paths`、与冲突框共用的 `remerge`）、`svn_follow.rs`（`supersede_plan` 沿快照之前的 commit 链从旧到新预先算好，`superseded` 只查表；`FollowReport.not_rewritten`）、`svn_replay.rs`（开放 `entries_at`）、`src/engine/svnFollow.ts`（报告新节）、`tests/svn_follow_hooks.rs`、`tests/vitest/svnFollow.test.ts`、`tests/svn_backend.rs` | 两个「部分提交」用例先红后绿；现场形状放行；W14 用例记下新行为；两轮 review 后补的回归用例逐个确认去掉修复时失败 |
 | 3 现有测试与文档、验证、PR | 完成（待合并） | 本日志、`src/engine/svnFollow.ts`、`tests/vitest/svnFollow.test.ts`、`tests/svn_backend.rs` | review 修复后重跑：`cargo fmt --check`、`cargo clippy --all-targets` 无告警；`cargo test` 分批跑完 116 个集成测试二进制 + 库内 188 个单测，全部通过；`pnpm build` 通过；`pnpm test` 106 个文件 1968 个用例通过 |
 
 ## Task 1
@@ -101,7 +101,11 @@
   模型因此不再换成 SVN 版本；而且任何含 NUL 的都当二进制放行，UTF-16 文本只提交了一部分时照样丢改动。
   改成：先看 UTF-16 / UTF-32 BOM（核对不了，不换），再按 git 的规则看前 8000 字节有没有 NUL（二进制，
   放行），最后才是 8 MB 上限（只管文本）。没有 BOM 的 UTF-16 仍会被当成二进制放行，这是已知的剩余风险。
-  读开头字节用新加的 `git_read::blob_head`（libgit2 会把整个 blob 读进内存）。
+- （第二轮独立 review 第 1、2 条后改）第一轮修复时加过 `git_read::blob_head`（libgit2 读开头字节），已删掉：
+  它没有 `sha1_repo` / `no_replace` 防护、没有 git 命令兜底，SHA-256 仓库里读不了，有 blob 的 replace ref
+  时读到的和 `merge-file` 读到的不是同一份；而且会把整个大 blob 读进内存。现在 `supersede_ok` 全走
+  `git cat-file`：先 `--batch-check` 取三份的大小；有一份超过 8 MB 时只读 SVN 那一份判二进制（是二进制就
+  放行，否则不换），提交前后两份不读；都不超过时三份都读，按 BOM → 二进制 → 逐行核对的顺序判断。
 - 测试夹具的白名单只收 `.cs`：用例里的二进制、UTF-16 文件也得叫 `.cs`，否则跟进看不到它们。
 
 ### 为什么这么改是安全的
@@ -130,8 +134,24 @@
 
 第 4 条里 W14 本身的取舍（不换）没有改，只是让用户看得见。
 
+## 第二轮独立 review（`/code-review high 54f2c28..HEAD`，2026-11-27）
+
+只看第一轮修复的 diff。7 条，6 条修了，1 条（pre_existing）核对后不修：
+
+| 条 | 级别 | 问题 | 处理 |
+|---|---|---|---|
+| 1 | important | `blob_head` 只走 libgit2：SHA-256 仓库里 F2 ① 全部失效，blob 有 replace ref 时判断与合并读到的内容不同 | 删掉 `blob_head`，`supersede_ok` 全走 `git cat-file`。没有专门的回归用例：fixture 造不出 SHA-256 的混合仓库；blob 的 replace ref 只能证明「两边读到的一致」，现在两边都是 git 命令，没有第二条读取路径可比 |
+| 2 | nit | 大 blob 整个读进内存 | 先 `--batch-check` 取大小，超过 8 MB 只读 SVN 那一份。`a_large_binary_committed_whole_in_tortoise_is_still_superseded` 照旧通过 |
+| 3 | nit | 核对出错的 commit 不进报告 | 出错时用 `touched_paths`（libgit2 读不了退回 `git diff-tree`）把它改过的路径记进 `refused`。没有回归用例：要让 libgit2 与 ls-tree 都读不了树，fixture 里造不出来 |
+| 4 | nit | 被前面挡住的 commit，报告说「有改动不在 SVN 里」，不对 | 报告文案改成三种原因都覆盖（改动不在 SVN 里 / 跟着更早的 commit 照常重放 / 核对出错）；vitest 断言三种都在 |
+| 5 | nit | 6.10 快照规则换掉的路径同时出现在 `snapshot` 和 `notRewritten` | 建 `not_rewritten` 时减掉 `snapshot.paths(&scope, c)`。没有回归用例：要造「C^ 是纯 SVN、C 等于某个中间基线、新基线又部分回退」的三段基线，代价大，改动是一行集合差 |
+| 6 | pre_existing | 后面的 commit 修改 Local-Only 补丁行时，修改被换掉 | **不修**。先照建议做了「Local-Only commit 改过的路径，之后不换」，全量测试里 `svn_restore_local_only.rs` 9 个用例失败：2026-11-11 现场是用户在普通 commit 里**删掉**补丁行、再用 TortoiseSVN 提交，原设计要把那个删除换掉，让补丁重放回来、再由 9.1 放回磁盘。按内容分不开「删补丁」与「改补丁」，撤回，保留原设计，在 `supersede_plan` 注释里写明这个代价 |
+| 7 | nit | 进度总账第 2 行过时 | 已更新 |
+
 ## 遗留
 
+- 后面的 commit 修改 Local-Only 补丁行、TortoiseSVN 只提交了别处时，那处修改会被换掉（第二轮 review 第 6 条，
+  改动之前就有）。要分开「删补丁」与「改补丁」需要另外的信号（比如 TortoiseSVN 提交框里看过的警告），这次不做。
 - 报告第 7 节的未决问题：F2 ① 拿不准时在冲突框里给「换成 SVN 版本」按钮；横幅提示「磁盘上已经解决」。
   都没做。
 - ③ 冲突框支持多个提交改过同一文件：按报告延后。

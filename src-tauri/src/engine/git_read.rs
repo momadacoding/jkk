@@ -186,14 +186,6 @@ fn line_stat(r: &Repository, a: &git2::Tree, b: &git2::Tree, p: &str) -> Result<
     }))
 }
 
-/// blob 的大小与开头至多 `n` 个字节（判二进制用）。libgit2 会把整个 blob 读进内存。
-pub fn blob_head(repo: &str, oid: &str, n: usize) -> Result<(u64, Vec<u8>)> {
-    let r = open(repo)?;
-    let b = r.find_blob(git2::Oid::from_str(oid)?)?;
-    let c = b.content();
-    Ok((c.len() as u64, c[..c.len().min(n)].to_vec()))
-}
-
 /// 树里 `p` 处的 blob。子模块指针、目录算没有：numstat 对子模块写的是提交号的变化，跟进报告里不会有它们。
 fn blob_at<'r>(r: &'r Repository, t: &git2::Tree, p: &str) -> Result<Option<git2::Blob<'r>>> {
     match t.get_path(Path::new(p)) {

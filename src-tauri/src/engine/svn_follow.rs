@@ -68,7 +68,9 @@ use crate::engine::svn_basemap::{read_base_map, BaseMap};
 use crate::engine::svn_changelist;
 use crate::engine::svn_cli::{bypass_scan_cache, with_scan_cache};
 use crate::engine::svn_config::{read_config, SvnConfig, BASELINE_BRANCH};
-use crate::engine::svn_follow_disk::{check_disk, supersede_safe, DiskCheck, SupersedeCheck};
+use crate::engine::svn_follow_disk::{
+    check_disk, supersede_safe, touched_paths, DiskCheck, SupersedeCheck,
+};
 use crate::engine::svn_follow_index::{
     judge_staging, prepare_index, prepare_index_with, rename_lock_into_index, ComposeReport,
     PathFacts, PreparedIndex,
@@ -216,7 +218,8 @@ pub struct FollowReport {
     #[serde(default)]
     pub snapshot: Vec<(String, Vec<String>)>,
     /// (原 commit, 路径)：F2 ① 本来要换成 SVN 版本，但 commit 里有改动不在 SVN 版本里（比如
-    /// TortoiseSVN 只提交了一部分），照常重放了（计划 2026-11-27 Task 2）。只列当前分支的。
+    /// TortoiseSVN 只提交了一部分），或者更早的 commit 在这条路径上已经照常重放，或者核对出错，照常
+    /// 重放了（计划 2026-11-27 Task 2）。只列当前分支的；6.10 快照规则换掉的不在内。
     #[serde(default)]
     pub not_rewritten: Vec<(String, Vec<String>)>,
     /// 重放后与磁盘对不上的文件：磁盘是 SVN 的版本（= 新基线），分支 tip 却是别的内容，或者把 SVN
@@ -1967,9 +1970,14 @@ impl External {
 
 /// F2 ① 每个早于快照的 commit 换哪些路径（[`supersede_safe`]）。从旧到新依次核对：一条路径在某个
 /// commit 上没通过、照常重放了，它之后的 commit 在这条路径上也不换，否则后面的改动（比如删掉前面
-/// 加的一行）被换掉，删掉的内容又回来了（独立 review 第 1 条）。Local-Only commit 不换，也不挡后面的。
+/// 加的一行）被换掉，删掉的内容又回来了（独立 review 第 1 条）。
 ///
-/// 列不出 commit、核对本身出错：一律不换，等于没有快照。
+/// Local-Only commit 不换，也不挡后面的 commit。后面的 commit 删掉补丁那几行、再用 TortoiseSVN 提交，
+/// 是不让补丁上 SVN 的常规做法（2026-11-11 现场，`tests/svn_restore_local_only.rs`）：那个删除要被换掉，
+/// 补丁照常重放回来，再由 9.1 放回磁盘。代价是后面的 commit **修改**补丁行时，修改同样被换掉（第二轮
+/// 独立 review 第 6 条，改动之前就有）；按内容分不开「删补丁」与「改补丁」，保留原设计。
+///
+/// 列不出 commit、核对本身出错：一律不换。出错的 commit 把它改过的路径记进 `refused`，报告里看得到。
 fn supersede_plan(
     repo: &str,
     who: &Who,
@@ -2016,7 +2024,10 @@ fn supersede_plan(
         )
         .unwrap_or_else(|e| {
             log::warn!("F2 ① 换之前的核对出错，这个 commit 照常重放：{}", e.message);
-            SupersedeCheck::default()
+            SupersedeCheck {
+                safe: BTreeSet::new(),
+                refused: touched_paths(repo, parent, &c.oid, replaceable).unwrap_or_default(),
+            }
         });
         open_after.insert(c.oid.clone(), check.safe.clone());
         plan.insert(c.oid.clone(), check);
@@ -2290,11 +2301,17 @@ fn prepare(repo: &str, auto: bool, partial: Option<&Partial>, disk: DiskUse) -> 
     // F2 当前分支。memo 跨分支共享：共享的 commit 只重放一次（R20）
     let mut memo = BTreeMap::new();
     let commits = commits_between(repo, &scope, &old_head, &FOLLOW_CODES)?;
+    // 6.10 的快照规则仍可能把 F2 ① 没换的路径换掉，那些已经列在 `snapshot` 里，这里不再列，免得两节
+    // 说法相反（第二轮独立 review 第 5 条）
     report.not_rewritten = commits
         .iter()
         .filter_map(|c| plan.get(&c.oid).map(|s| (c, s)))
-        .filter(|(_, s)| !s.refused.is_empty())
-        .map(|(c, s)| (c.oid.clone(), s.refused.iter().cloned().collect()))
+        .map(|(c, s)| {
+            let by_snapshot = snapshot.paths(&scope, c);
+            let kept: Vec<String> = s.refused.difference(&by_snapshot).cloned().collect();
+            (c.oid.clone(), kept)
+        })
+        .filter(|(_, kept)| !kept.is_empty())
         .collect();
     let first = replay_branch(
         repo,
