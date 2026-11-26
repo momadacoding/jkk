@@ -120,6 +120,35 @@ describe('describeSync', () => {
     expect(m.detail).toContain('Code')
   })
 
+  it('wcLocked 目录很多时只列前 10 个，其余写「等 N 个目录」', () => {
+    // 2026-11-26 使用报告：Rider 跑 svn cleanup，几百个目录拼成一句话铺满整屏
+    const dirs = Array.from({ length: 23 }, (_, i) => `Dir${String(i).padStart(2, '0')}`)
+    const m = describeSync(st({ kind: 'wcLocked', dirs }, 4, [4]))!
+    expect(m.detail).toContain('Dir00、Dir01')
+    expect(m.detail).toContain('Dir09')
+    expect(m.detail).not.toContain('Dir10')
+    expect(m.detail).toContain('等 23 个目录')
+  })
+
+  it('wcLocked 不只说 TortoiseSVN：IDE 的 SVN 操作也会加锁', () => {
+    const m = describeSync(st({ kind: 'wcLocked', dirs: ['Code'] }, 4, [4]))!
+    expect(m.detail).toContain('Rider')
+  })
+
+  it('wcLocked 根目录被锁时说「整个工作副本」，不插值出空括号', () => {
+    const m = describeSync(st({ kind: 'wcLocked', dirs: ['.'] }, 4, [4]))!
+    expect(m.detail).toContain('整个工作副本')
+    expect(m.detail).not.toContain('（.）')
+    expect(m.detail).toContain('对工作副本根目录执行 Clean up')
+  })
+
+  it('wcLocked 的 Clean up 对象跟着清单说：多个目录不说「该目录」', () => {
+    const one = describeSync(st({ kind: 'wcLocked', dirs: ['Code'] }, 4, [4]))!
+    expect(one.detail).toContain('对该目录执行 Clean up')
+    const many = describeSync(st({ kind: 'wcLocked', dirs: ['Code', 'Assets'] }, 4, [4]))!
+    expect(many.detail).toContain('对上面这些目录执行 Clean up')
+  })
+
   it('pinned reset 给的是 svn update 那条出路，不是重建基线', () => {
     // spec §6.6.2：这两种情况的修复完全相反。
     // 对 pinned 用「重建基线」会把被钉死的**旧内容**录成一个标着新 revision 的
