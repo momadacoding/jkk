@@ -170,14 +170,43 @@ fn check_sync_in_uncached(repo_root: &str) -> Result<SyncInPreview> {
             lost_non_w.extend(ancestor_dirs(&e.path));
         }
     }
+    // 这次 update 会在这些路径上新增、删除或替换节点（不只是改内容）
+    let structural: std::collections::HashSet<&str> = st
+        .entries
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.repos_item.as_deref(),
+                Some("added" | "deleted" | "replaced")
+            )
+        })
+        .map(|e| e.path.as_str())
+        .collect();
     let mut conflicted = Vec::new();
     let mut outside = Vec::new();
+    let mut add_collisions = Vec::new();
     for e in &st.entries {
         if e.is_conflicted() {
             conflicted.push(e.path.clone());
             continue;
         }
         if w_files.contains(&e.path) {
+            // 已 `svn add` 未提交的新文件，S4 放过它（`svn_sync_in::s4_counts_as_modified`）。
+            // 但服务器这次在它本身或任何一级祖先目录上新增 / 删除 / 替换了节点时，S5 会留下
+            // 树冲突，回退时磁盘上的东西既不是 git 写的也不是基线的，回不去，用户卡在记录上
+            // （fixture 实测；独立 review 第 1–3 条：同名文件、同名目录、父目录被删）。只能在动手前拦。
+            //
+            // 剩余窗口：锁内复核（`run_sync_in` 里再跑一遍本函数）到 S5 之间有人提交了同一路径，
+            // 仍会落到这条路上。S5 不带 `-r`，窗口只有几秒
+            let path = e.path.as_str();
+            let locally_added =
+                e.item == "added" || (e.item == "missing" && e.revision == Some(-1));
+            if locally_added
+                && (structural.contains(path)
+                    || ancestor_dirs(path).any(|d| structural.contains(d)))
+            {
+                add_collisions.push(e.path.clone());
+            }
             continue; // git 管着，S1 会压进 stash
         }
         let path = e.path.as_str();
@@ -194,6 +223,18 @@ fn check_sync_in_uncached(repo_root: &str) -> Result<SyncInPreview> {
                 "工作副本里有 SVN 冲突还没处理，在它上面再 update 只会让情况更乱：\n{}\n\
                  请先用 TortoiseSVN 解决（Resolve）后再更新。",
                 list_paths(&conflicted)
+            ),
+        ));
+    }
+    if !add_collisions.is_empty() {
+        return Err(GitError::new(
+            "sync_in_added_collides",
+            format!(
+                "这次没有更新，什么都没改动。下面这些文件你在本地新建、已经 svn add 还没提交，\
+                 而服务器这次在同一位置（同名文件，或它所在的目录）新增、删除或替换了内容：\n{}\n\
+                 直接更新会留下 SVN 树冲突。请先把自己的这几个文件挪到别处，并在 TortoiseSVN 里\
+                 对它们「撤销添加」，更新完再把内容放回去或合进服务器那份。",
+                list_paths(&add_collisions)
             ),
         ));
     }

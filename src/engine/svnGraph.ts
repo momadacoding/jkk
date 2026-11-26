@@ -20,6 +20,7 @@
  * 契约由 `src-tauri/tests/svn_graph_contract.rs` 钉住。
  */
 import type { CommitNode } from './types'
+import { shownTime } from './commitTime'
 
 /** 缓存里的一条 SVN revision，字段与后端 `CachedRev` 逐一对应。 */
 export interface SvnRevNode {
@@ -422,9 +423,14 @@ function svnTimes(svnRevs: SvnRevNode[]): { time: number; unknown: boolean }[] {
   return out
 }
 
-/** 提交图和详情里的时间文字。svn 节点时间未知时写「时间未知」，不显示借来排序的那个时间。 */
+/**
+ * 提交图、详情、复制提交信息里的时间文字，显示时间只走这一个入口。
+ *
+ * - git 提交显示作者时间（`shownTime`）：跟进重放过的提交，提交时间是跟进那一刻。
+ * - svn 节点时间未知时写「时间未知」，不显示借来排序的那个时间。
+ */
 export function commitDateText(c: CommitNode): string {
-  return c.timeUnknown ? '时间未知' : new Date(c.time * 1000).toLocaleString()
+  return c.timeUnknown ? '时间未知' : new Date(shownTime(c) * 1000).toLocaleString()
 }
 
 /** 作者文字。svn 节点没有作者（SVN 没返回）时写明，不留一块空白让人以为是匿名提交。 */

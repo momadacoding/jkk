@@ -82,3 +82,21 @@ describe('CommitRow：SVN 没返回作者和时间的 revision', () => {
     expect(screen.queryByText(new Date(0).toLocaleString())).toBeNull()
   })
 })
+
+describe('CommitRow：时间', () => {
+  // 2026-11-26 报告：跟进重放过的提交，列表上显示成跟进那一刻
+  it('显示作者时间，不显示重放时改过的提交时间', () => {
+    const written = 1_794_192_844
+    const replayed = 1_795_663_503
+    row({ id: 'f024a87', parents: [], author: 'me', time: replayed, authorTime: written, message: '重新登录机制' }, [])
+    const cell = screen.getByText(new Date(written * 1000).toLocaleString())
+    expect(screen.queryByText(new Date(replayed * 1000).toLocaleString())).toBeNull()
+    // 列表按提交时间排，日期列可能「不按顺序」：悬停能看到原因
+    expect(cell.getAttribute('title')).toContain(`提交时间：${new Date(replayed * 1000).toLocaleString()}`)
+  })
+
+  it('没重放过的提交日期没有悬停提示', () => {
+    row({ id: 'abc1234', parents: [], author: 'me', time: 1_794_192_844, message: '普通提交' }, [])
+    expect(screen.getByText(new Date(1_794_192_844 * 1000).toLocaleString()).getAttribute('title')).toBeNull()
+  })
+})

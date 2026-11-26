@@ -146,6 +146,32 @@ describe('CommitDetailView：SVN 没返回作者和时间的 revision', () => {
   })
 })
 
+describe('CommitDetailView：时间', () => {
+  // 2026-11-26 报告：f024a87 是 11-09 写的，跟进重放后提交时间变成 11-26
+  const written = 1_794_192_844
+  const replayed = 1_795_663_503
+  const text = (t: number) => new Date(t * 1000).toLocaleString()
+
+  it('重放过的提交：信息条显示作者时间，下面一行说明提交时间', () => {
+    const c = { ...three[1], time: replayed, authorTime: written }
+    render(<CommitDetailView commit={c} diff={empty} repoPath="C:/r" onSelectCommit={vi.fn()} />)
+    expect(screen.getByText(text(written))).toBeTruthy()
+    expect(screen.getByText(`提交时间：${text(replayed)}`)).toBeTruthy()
+  })
+
+  it('两个时间相同：只显示一个时间，没有那一行', () => {
+    render(<CommitDetailView commit={three[1]} diff={empty} repoPath="C:/r" onSelectCommit={vi.fn()} />)
+    expect(screen.getByText(text(three[1].time))).toBeTruthy()
+    expect(screen.queryByText(/提交时间：/)).toBeNull()
+  })
+
+  it('svn 节点只有一个时间，没有那一行', () => {
+    render(<CommitDetailView commit={r16([])} diff={empty} repoPath="C:/r" onSelectCommit={vi.fn()} />)
+    expect(screen.getByText(text(1_700_000_100))).toBeTruthy()
+    expect(screen.queryByText(/提交时间：/)).toBeNull()
+  })
+})
+
 describe('CommitDetailView：所在分支', () => {
   // 2026-10-17 用户要求：车道一多，点了提交认不出它在哪条分支上
   it('信息条上显示分支，切到 Changes / File Tree 也还在', () => {

@@ -2563,6 +2563,16 @@ body {
 .commit-head-sha { font-family: monospace; color: #888; }
 .commit-head-date { color: #888; }
 
+/* 提交被重放过时信息条下面多的一行：分隔线挪到它下面，两行看起来是同一块 */
+.commit-head:has(+ .commit-head-rewritten) { border-bottom: none; }
+.commit-head-rewritten {
+  flex-shrink: 0;
+  padding: 0 8px 5px 34px; /* 34 = 头像 18 + 间距 8 + 左边距 8，和作者名对齐 */
+  border-bottom: 1px solid #333;
+  color: #888;
+  font-size: 11px;
+}
+
 /* 和标题抢宽度时让分支名先截断：标题悬停能看全文，分支名的 title 也带全名 */
 .commit-head-branch {
   flex-shrink: 1;

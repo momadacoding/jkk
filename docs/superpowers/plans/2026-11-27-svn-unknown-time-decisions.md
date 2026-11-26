@@ -77,6 +77,19 @@ fixture（全部在 scratch 目录、本机 svnserve）：匿名 checkout `/trun
 没有在 master 的构建上复现原缺陷：失败用例（`不再把更早的 git 提交顶到它上面`）在改动前失败，
 已覆盖同一形状。
 
+### 合并 master（PR 第 207 号先合进去之后）
+
+第 207 号 PR 合并后本 PR 冲突。用 `git merge origin/master` 解决（不 rebase、不强推）。
+
+- **怎么合的**：显示时间只留一个入口 `commitDateText`，它先看 `timeUnknown`，否则显示
+  `shownTime`（作者时间）。列表、`CommitHeader`、svn 详情、`formatCommitInfo` 都走它；
+  第 207 号的悬停提示（`rewrittenTitle`）和「提交时间」那一行原样保留。
+- **为什么安全**：两边的测试全部保留（作者时间 3 处、时间未知 4 处），另加一条
+  `commitDateText` 对带 `authorTime` 的 git 提交显示作者时间的用例，防止合并时把其中一边吃掉。
+  合并后 `pnpm build`、`pnpm test`（2008 条）、`cargo fmt --check`、`clippy`、
+  `cargo test --test svn_xml --test fixtures` 通过。
+- `svnGraph.ts` 新引入 `./commitTime`；`commitTime.ts` 只引入 types，没有循环依赖。
+
 ### Task 5：独立 review（`/code-review medium`）
 
 1 条 important、5 条 nit：

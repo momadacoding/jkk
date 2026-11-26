@@ -4,6 +4,7 @@ import { prBadge, pullRequestForRef } from '../engine/prs'
 import { laneTint } from '../engine/paths'
 import { WORKDIR_ID } from '../engine/workdir'
 import { shortHash } from '../engine/commitActions'
+import { rewrittenTitle } from '../engine/commitTime'
 import { buildRefPills, goneUpstreamTooltip } from '../engine/refPills'
 import { commitAuthorText, commitDateText, mixedBaselineLabel } from '../engine/svnGraph'
 
@@ -47,6 +48,7 @@ export function CommitRow({
     )
   }
 
+  // 作者时间（跟进重放过的提交，提交时间是跟进那一刻）；svn 节点时间未知时写「时间未知」
   const date = commitDateText(node.commit)
   const author = commitAuthorText(node.commit)
   // HEAD 那条伪 ref 不做成标签——整行加粗已经表达了「当前在这里」，
@@ -139,7 +141,7 @@ export function CommitRow({
         <span className="commit-hash" title={node.commit.id}>
           {isSvn ? `r${node.commit.svnRev}` : shortHash(node.commit.id)}
         </span>
-        <span className="commit-date">{date}</span>
+        <span className="commit-date" title={rewrittenTitle(node.commit)}>{date}</span>
       </span>
     </div>
   )

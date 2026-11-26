@@ -1176,6 +1176,7 @@ fn update_entry(item: &str, props: &str) -> app_lib::engine::svn_xml::UpdateStat
         tree_conflicted: false,
         repos_item: None,
         repos_props: None,
+        revision: None,
     }
 }
 

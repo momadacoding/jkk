@@ -11,6 +11,7 @@ import { historyTargetForCommit, type FileHistoryTarget } from '@/engine/fileHis
 import { fileHistoryItems } from './fileHistoryItems'
 import { buildFileTree } from '../engine/fileTree'
 import { commitAuthorText, commitDateText, deliveredNote, svnDiffGap } from '../engine/svnGraph'
+import { rewrittenTime, rewrittenTitle } from '../engine/commitTime'
 import { DiffView } from './DiffView'
 import { countChanges } from '@/engine/diffEol'
 import { useDiffPref } from '@/store/diffPrefsStore'
@@ -121,15 +122,24 @@ function avatarLetter(commit: CommitNode): string {
 /** 提交信息条：头像、作者、短 hash、时间、标题。Fork 里三个标签共用这一条。 */
 function CommitHeader({ commit, branch }: { commit: CommitNode; branch?: string | null }) {
   const subject = commit.message.split('\n')[0]
+  const rewritten = rewrittenTime(commit)
   return (
-    <div className="commit-head">
-      <span className="commit-avatar">{avatarLetter(commit)}</span>
-      <span className="commit-head-author">{commitAuthorText(commit)}</span>
-      <span className="commit-head-sha">{commit.id.slice(0, 7)}</span>
-      <span className="commit-head-date">{commitDateText(commit)}</span>
-      <BranchTag branch={branch} />
-      <span className="commit-head-subject" title={commit.message}>{subject}</span>
-    </div>
+    <>
+      <div className="commit-head">
+        <span className="commit-avatar">{avatarLetter(commit)}</span>
+        <span className="commit-head-author">{commitAuthorText(commit)}</span>
+        <span className="commit-head-sha">{commit.id.slice(0, 7)}</span>
+        <span className="commit-head-date" title={rewrittenTitle(commit)}>{commitDateText(commit)}</span>
+        <BranchTag branch={branch} />
+        <span className="commit-head-subject" title={commit.message}>{subject}</span>
+      </div>
+      {/* 只在被重放过时出现：说清楚另一个时间是什么，不然和 git log 对不上的人不知道信哪个 */}
+      {rewritten !== null && (
+        <div className="commit-head-rewritten" title="跟进、rebase、cherry-pick、amend 会把提交时间改成当时；上面显示的是写下提交的时间">
+          {`提交时间：${new Date(rewritten * 1000).toLocaleString()}`}
+        </div>
+      )}
+    </>
   )
 }
 

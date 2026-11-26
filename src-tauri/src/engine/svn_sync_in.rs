@@ -42,7 +42,7 @@ use crate::engine::svn_sync_check::{
 use crate::engine::svn_sync_stash::{self as wip, RestoreOutcome};
 use crate::engine::svn_util::{now_secs, pinned_rebase};
 use crate::engine::svn_wc::enumerate_wcs;
-use crate::engine::svn_xml::parse_update_status;
+use crate::engine::svn_xml::{parse_update_status, StatusEntry};
 use crate::error::{GitError, Result};
 use std::path::Path;
 
@@ -394,8 +394,9 @@ fn stale_error(dirty: &[String]) -> GitError {
     GitError::new(
         "sync_in_baseline_stale",
         format!(
-            "切到基线之后，下面这些文件在 SVN 看来有修改——基线记的内容与工作副本对不上\
-             （多半有人在外部改过）：\n{}\n基线没有被改动。请先处理失同步，再更新。",
+            "这次没有更新：切到基线之后，下面这些文件在 SVN 看来与基线记的内容不一样：\n{}\n\
+             基线没有被改动。先在工具栏「SVN ▾」里点「体检基线…」，看是哪里对不上；\
+             确认工作副本是对的，再用「重建基线」按服务器原版重录。",
             list_paths(dirty)
         ),
     )
@@ -1098,7 +1099,7 @@ pub(crate) fn untracked_leftovers(
 }
 
 /// S4：白名单内的 W-file 在 SVN 看来有没有修改。`?` / ignored 不算——它们不是
-/// 「base 文件被改了」，而是 SVN 不认识的文件。
+/// 「base 文件被改了」，而是 SVN 不认识的文件。判定见 [`s4_counts_as_modified`]。
 pub(crate) fn dirty_w_files(repo: &str, cfg: &SvnConfig) -> Result<Vec<String>> {
     let scope = WScope::for_repo(repo, cfg)?;
     let wcs = enumerate_wcs(repo, &cfg.whitelist)?;
@@ -1108,14 +1109,37 @@ pub(crate) fn dirty_w_files(repo: &str, cfg: &SvnConfig) -> Result<Vec<String>> 
     Ok(entries
         .into_iter()
         .filter(|e| w_files.contains(&e.path))
-        .filter(|e| {
-            !matches!(
-                e.item.as_str(),
-                "normal" | "unversioned" | "ignored" | "external" | "none"
-            ) || e.props == "modified"
-        })
+        .filter(s4_counts_as_modified)
         .map(|e| e.path)
         .collect())
+}
+
+/// S4 时（已切到基线）这一条在 SVN 看来算不算「基线记的内容与工作副本对不上」。
+///
+/// # 已 `svn add`、还没提交的文件不算
+///
+/// 分支上新建的文件基线里没有，S3 切到基线时 git 把它从磁盘删掉，SVN 看到的是
+/// `missing` + `revision="-1"`。它从没上过服务器，与基线对不对得上无关；S5 的
+/// `svn update` 不碰它，S9 重放分支时 git 把它写回来，添加标记与 changelist 全程没动
+/// （2026-11-26 现场误拦，见 `tests/svn_sync_in.rs` 对应用例）。
+///
+/// 只认 `schedule == "add"` 这一个正面证据，与 [`crate::engine::svn_dirty::classify`]
+/// 摘掉这类条目的判法相同。`replace`（`svn rm X` 后同名再加）服务器上**有**旧内容，
+/// 查不到 schedule 的说不清来源，都照旧拦下。受版本控制的文件不见了是 `revision="N"`，
+/// 走不到这里。
+///
+/// 磁盘上还在的 `added` 照旧拦：切到基线之后 git 管的新文件只可能不在磁盘上，
+/// 还在说明它不是分支带来的，来源不明。
+fn s4_counts_as_modified(e: &StatusEntry) -> bool {
+    let added_and_away =
+        e.item == "missing" && e.revision == Some(-1) && e.schedule.as_deref() == Some("add");
+    if added_and_away {
+        return false;
+    }
+    !matches!(
+        e.item.as_str(),
+        "normal" | "unversioned" | "ignored" | "external" | "none"
+    ) || e.props == "modified"
 }
 
 /// S5 之后的冲突（计划 A4：`svn update` 有冲突时仍然退出 0）。
@@ -1731,5 +1755,44 @@ mod tests {
     fn revision_moved_reads_before_then_now() {
         let moved = RevisionMoved { before: 5, now: 6 };
         assert_eq!(moved.to_string(), "r5 → r6");
+    }
+
+    fn entry(item: &str, revision: Option<i64>, schedule: Option<&str>) -> StatusEntry {
+        StatusEntry {
+            path: "Code/New.cs".to_string(),
+            item: item.to_string(),
+            props: "none".to_string(),
+            wc_locked: false,
+            revision,
+            copied: false,
+            schedule: schedule.map(str::to_string),
+        }
+    }
+
+    /// 2026-11-26 现场：已 `svn add` 的新文件被切到基线删掉，不是基线失同步。
+    #[test]
+    fn s4_lets_an_added_file_that_left_the_disk_through() {
+        assert!(!s4_counts_as_modified(&entry(
+            "missing",
+            Some(-1),
+            Some("add")
+        )));
+    }
+
+    /// 放过的只有「add 后不见了」。其余几种 `missing` 都可能是服务器上的内容丢了，照旧拦。
+    #[test]
+    fn s4_still_stops_on_every_other_kind_of_missing() {
+        // 受版本控制的文件被删
+        assert!(s4_counts_as_modified(&entry("missing", Some(1), None)));
+        // `svn rm X` 后同名再加、又删掉：服务器上有旧内容
+        assert!(s4_counts_as_modified(&entry(
+            "missing",
+            Some(-1),
+            Some("replace")
+        )));
+        // `svn info` 没说清
+        assert!(s4_counts_as_modified(&entry("missing", Some(-1), None)));
+        // 磁盘上还在的已添加文件：不是分支带来的
+        assert!(s4_counts_as_modified(&entry("added", Some(-1), None)));
     }
 }

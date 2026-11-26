@@ -88,7 +88,8 @@ export function shortHash(id: string): string {
  * hash 用完整的——缩写换个仓库、换个时间点都可能不再唯一。
  */
 export function formatCommitInfo(commit: CommitNode): string {
-  // svn 节点时间未知时 time 是借来排序的，复制出去会被当成真实时间
+  // git show 的 Date: 是作者时间；svn 节点时间未知时 time 是借来排序的，复制出去会被当成真实时间。
+  // 两样都由 commitDateText 处理
   return [
     `commit ${commit.id}`,
     `Author: ${commitAuthorText(commit)}`,

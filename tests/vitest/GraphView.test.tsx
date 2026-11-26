@@ -3,34 +3,50 @@
 // 侧边栏单击分支 / tag / worktree 要把 graph 定位到目标提交。
 // 回归：目标就是当前选中的提交（打开仓库时默认选中 HEAD）时，滚走之后再点同一个分支，
 // selectedId 没变，定位 effect 不重跑，图停在原地（2026-11-01 用户报告，Fork 会重新定位）。
-import { fireEvent, render } from '@testing-library/react'
+import { act, fireEvent, render } from '@testing-library/react'
 import { useRef } from 'react'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import { GraphView } from '@/components/GraphView'
 import { useFocusTrap } from '@/components/useFocusTrap'
 import { ALL_CAPABILITIES } from '@/engine/capabilities'
 import type { CommitNode } from '@/engine/types'
 
-globalThis.ResizeObserver ??= class {
-  observe() {}
+// jsdom 没有 ResizeObserver。记下回调，测试里手动触发，模拟标签从隐藏变为可见。
+const resizeCallbacks = new Set<() => void>()
+const originalResizeObserver = globalThis.ResizeObserver
+globalThis.ResizeObserver = class {
+  private readonly cb: () => void
+  constructor(cb: () => void) {
+    this.cb = cb
+  }
+  observe() {
+    resizeCallbacks.add(this.cb)
+  }
   unobserve() {}
-  disconnect() {}
-}
+  disconnect() {
+    resizeCallbacks.delete(this.cb)
+  }
+} as unknown as typeof ResizeObserver
 
 // jsdom 不做布局，clientHeight 恒为 0，而 GraphView 在高度为 0 时（标签被隐藏）会放弃定位。
-// 这里给一个 10 行高的视口。
+// 这里给一个 10 行高的视口；`viewport` 置 0 模拟标签被隐藏。
 const ROW_HEIGHT = 28
 const VIEWPORT = ROW_HEIGHT * 10
+let viewport = VIEWPORT
 let original: PropertyDescriptor | undefined
 beforeAll(() => {
   original = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientHeight')
   Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
     configurable: true,
-    get: () => VIEWPORT,
+    get: () => viewport,
   })
+})
+afterEach(() => {
+  viewport = VIEWPORT
 })
 afterAll(() => {
   if (original) Object.defineProperty(HTMLElement.prototype, 'clientHeight', original)
+  globalThis.ResizeObserver = originalResizeObserver
 })
 
 /** 一条 100 个提交的线性历史，新的在前。 */
@@ -45,7 +61,25 @@ const commits: CommitNode[] = Array.from({ length: 100 }, (_, i) => ({
 /** 第 idx 行滚到视口中间时的 scrollTop（无工作区伪行）。 */
 const centered = (idx: number) => idx * ROW_HEIGHT - VIEWPORT / 2 + ROW_HEIGHT / 2
 
-function renderGraph(props: { commits?: CommitNode[]; selectedId: string; revealSeq: number }) {
+/**
+ * 用户滚动：先有输入事件（滚轮），再有 scroll 事件。GraphView 按输入事件认「用户接管」，
+ * 只发 scroll 事件模拟的是程序赋值或浏览器夹紧 scrollTop。
+ */
+function userScroll(el: HTMLElement, top: number) {
+  fireEvent.wheel(el)
+  el.scrollTop = top
+  fireEvent.scroll(el)
+}
+
+function renderGraph(props: {
+  commits?: CommitNode[]
+  selectedId: string
+  revealSeq: number
+  /** 非空时图顶多一行工作区伪行（`withWorkdirRow` 只看它），真实提交整体下移一行。 */
+  headHash?: string
+  changeCount?: number
+  onLoadMoreSvn?: () => void
+}) {
   const element = (p: typeof props) => (
     <GraphView
       commits={p.commits ?? commits}
@@ -54,11 +88,12 @@ function renderGraph(props: { commits?: CommitNode[]; selectedId: string; reveal
       selectedId={p.selectedId}
       revealSeq={p.revealSeq}
       onSelect={() => {}}
-      headHash=""
-      changeCount={0}
+      headHash={p.headHash ?? ''}
+      changeCount={p.changeCount ?? 0}
       onOpenChanges={() => {}}
       onCommitAction={() => {}}
       capabilities={ALL_CAPABILITIES}
+      onLoadMoreSvn={p.onLoadMoreSvn}
     />
   )
   const view = render(element(props))
@@ -72,8 +107,7 @@ describe('GraphView 定位请求', () => {
     expect(el.scrollTop).toBe(centered(50))
 
     // 用户把图滚回顶部，目标行已经不在视口里
-    el.scrollTop = 0
-    fireEvent.scroll(el)
+    userScroll(el, 0)
 
     // 再点同一个分支：selectedId 不变，只有定位请求变了
     rerender({ selectedId: 'c50', revealSeq: 1 })
@@ -103,6 +137,168 @@ describe('GraphView 定位请求', () => {
 
     const { el } = renderGraph({ commits: withSvn, selectedId: 'local1', revealSeq: 1 })
     expect(el.scrollTop).toBe(centered(60))
+  })
+})
+
+// 回归（2026-11-26 使用报告）：工作区有文件写入时 repo-changed 触发 refreshGraph，
+// 每次都换一个内容相同的新 commits 数组；定位 effect 依赖 commits，于是把只滚动、
+// 没单击的用户拽回选中的 HEAD，也就是图的顶部。
+describe('GraphView 后台刷新不抢滚动位置', () => {
+  /** 内容相同、引用全新的 commits，模拟 refreshGraph / applySvnLog 的 merge 结果。 */
+  const refreshed = () => commits.map((c) => ({ ...c }))
+
+  it('选中 HEAD 后往下滚，后台刷新换了 commits：画面不回到顶部', () => {
+    const { el, rerender } = renderGraph({ selectedId: 'c0', revealSeq: 0 })
+    expect(el.scrollTop).toBe(0)
+
+    userScroll(el, ROW_HEIGHT * 80)
+
+    rerender({ commits: refreshed(), selectedId: 'c0', revealSeq: 0 })
+    expect(el.scrollTop).toBe(ROW_HEIGHT * 80)
+  })
+
+  it('已经定位过一次的选中，滚走之后后台刷新：不再拽回', () => {
+    const { el, rerender } = renderGraph({ selectedId: 'c50', revealSeq: 0 })
+    expect(el.scrollTop).toBe(centered(50))
+
+    userScroll(el, 0)
+
+    rerender({ commits: refreshed(), selectedId: 'c50', revealSeq: 0 })
+    expect(el.scrollTop).toBe(0)
+  })
+
+  it('目标提交当时还不在图上，后加载出来时仍然定位过去，之后的刷新不再拽回', () => {
+    // SVN 历史后加载：选中的提交要等这批数据到了才出现在图上
+    const { el, rerender } = renderGraph({
+      commits: commits.slice(0, 50),
+      selectedId: 'c80',
+      revealSeq: 0,
+    })
+    expect(el.scrollTop).toBe(0)
+
+    rerender({ commits: refreshed(), selectedId: 'c80', revealSeq: 0 })
+    expect(el.scrollTop).toBe(centered(80))
+
+    userScroll(el, 0)
+    rerender({ commits: refreshed(), selectedId: 'c80', revealSeq: 0 })
+    expect(el.scrollTop).toBe(0)
+  })
+
+  it('使用报告的真实形态：图顶有工作区伪行（headHash 非空）、选中 HEAD、往下滚，后台刷新不回顶部', () => {
+    const shape = { selectedId: 'c0', revealSeq: 0, headHash: 'c0', changeCount: 3 }
+    const { el, rerender } = renderGraph(shape)
+    expect(el.querySelector('[data-id="c0"]')).not.toBeNull()
+    expect(el.scrollTop).toBe(0)
+
+    userScroll(el, ROW_HEIGHT * 80)
+
+    rerender({ ...shape, commits: refreshed(), changeCount: 4 })
+    expect(el.scrollTop).toBe(ROW_HEIGHT * 80)
+  })
+})
+
+// 独立 review 第 1 / 2 / 3 条：用户还没滚过时，选中的那一行因为数据变化挪了位置，
+// 要继续把它留在视口里——「后台刷新不抢滚动位置」只针对用户自己滚过之后。
+describe('GraphView 用户没滚过时跟随选中的那一行', () => {
+  const ids = (n: number, prefix: string): CommitNode[] =>
+    Array.from({ length: n }, (_, i) => ({
+      id: `${prefix}${i}`,
+      parents: [],
+      author: 'me',
+      time: 1_800_000_000 - i,
+      message: `${prefix} ${i}`,
+    }))
+
+  it('新的提交插到 HEAD 上面、把它挤出视口：跟过去', () => {
+    const { el, rerender } = renderGraph({ selectedId: 'c0', revealSeq: 0 })
+    expect(el.scrollTop).toBe(0)
+
+    // 例如 SVN 历史后加载，比 HEAD 新的 revision 排在它上面
+    rerender({ commits: [...ids(30, 'n'), ...commits], selectedId: 'c0', revealSeq: 0 })
+    expect(el.scrollTop).toBe(centered(30))
+  })
+
+  it('选中的本地提交后来被收进 svn 节点：跟到收着它的节点', () => {
+    const local: CommitNode = { id: 'local1', parents: [], author: 'me', time: 1_800_000_000, message: 'local' }
+    const { el, rerender } = renderGraph({ commits: [local, ...commits], selectedId: 'local1', revealSeq: 0 })
+    expect(el.scrollTop).toBe(0)
+
+    const folded = commits.map((c, i) =>
+      i === 60 ? { ...c, id: 'svn:60', vcs: 'svn' as const, svnRev: 60, deliveredFrom: [local] } : c,
+    )
+    rerender({ commits: folded, selectedId: 'local1', revealSeq: 0 })
+    expect(el.scrollTop).toBe(centered(60))
+  })
+
+  it('标签隐藏时来的定位：重新可见时补上；之后用户滚走，后台刷新不再拽回（独立 review 第 4 条）', () => {
+    viewport = 0
+    const { el, rerender } = renderGraph({ selectedId: 'c50', revealSeq: 0 })
+    expect(el.scrollTop).toBe(0)
+
+    viewport = VIEWPORT
+    act(() => resizeCallbacks.forEach((cb) => cb()))
+    expect(el.scrollTop).toBe(centered(50))
+
+    userScroll(el, 0)
+    rerender({ commits: commits.map((c) => ({ ...c })), selectedId: 'c50', revealSeq: 0 })
+    expect(el.scrollTop).toBe(0)
+  })
+
+  it('浏览器因内容变短夹紧 scrollTop（只有 scroll 事件、没有输入）不算用户接管（第二轮 review 第 2 条）', () => {
+    const { el, rerender } = renderGraph({ selectedId: 'c80', revealSeq: 0 })
+    expect(el.scrollTop).toBe(centered(80))
+
+    // 一次刷新暂时只回来 50 条，c80 不在了，浏览器把 scrollTop 夹到新的最大值
+    rerender({ commits: commits.slice(0, 50), selectedId: 'c80', revealSeq: 0 })
+    el.scrollTop = 50 * ROW_HEIGHT - VIEWPORT
+    fireEvent.scroll(el)
+
+    rerender({ commits: commits.map((c) => ({ ...c })), selectedId: 'c80', revealSeq: 0 })
+    expect(el.scrollTop).toBe(centered(80))
+  })
+
+  it('跟随期间面板被拖矮、选中行掉出视口：重新定位（第二轮 review 第 6 条）', () => {
+    const { el } = renderGraph({ selectedId: 'c50', revealSeq: 0 })
+    expect(el.scrollTop).toBe(centered(50))
+
+    viewport = ROW_HEIGHT * 2
+    act(() => resizeCallbacks.forEach((cb) => cb()))
+    expect(el.scrollTop).toBe(50 * ROW_HEIGHT - viewport / 2 + ROW_HEIGHT / 2)
+  })
+
+  // jsdom 没有滚动条，这里只验 pointerdown 这条路径；拖滚动条会不会发 pointerdown 在真实窗口里验
+  it('在图上按下鼠标（pointerdown）算用户接管', () => {
+    const { el, rerender } = renderGraph({ selectedId: 'c50', revealSeq: 0 })
+    fireEvent.pointerDown(el)
+    el.scrollTop = 0
+    fireEvent.scroll(el)
+    rerender({ commits: commits.map((c) => ({ ...c })), selectedId: 'c50', revealSeq: 0 })
+    expect(el.scrollTop).toBe(0)
+  })
+
+  it('单击一行后用 End / PageDown 等键盘滚动：算用户接管（第三轮 review 第 1 条）', () => {
+    const { el, rerender } = renderGraph({ selectedId: 'c5', revealSeq: 0 })
+    // keydown 的目标是 body：graph 不可聚焦
+    fireEvent.keyDown(document.body, { key: 'End' })
+    el.scrollTop = 90 * ROW_HEIGHT
+    fireEvent.scroll(el)
+    rerender({ commits: commits.map((c) => ({ ...c })), selectedId: 'c5', revealSeq: 0 })
+    expect(el.scrollTop).toBe(90 * ROW_HEIGHT)
+  })
+
+  it('点「加载更多 SVN 历史」不算接管：等的提交加载出来后照样跟过去（第三轮 review 第 2 条）', () => {
+    const { el, rerender } = renderGraph({
+      commits: commits.slice(0, 50),
+      selectedId: 'c80',
+      revealSeq: 0,
+      onLoadMoreSvn: () => {},
+    })
+    const button = el.querySelector('.graph-load-more button') as HTMLButtonElement
+    fireEvent.pointerDown(button)
+    fireEvent.click(button)
+
+    rerender({ commits: commits.map((c) => ({ ...c })), selectedId: 'c80', revealSeq: 0, onLoadMoreSvn: () => {} })
+    expect(el.scrollTop).toBe(centered(80))
   })
 })
 

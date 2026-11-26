@@ -50,7 +50,13 @@ export interface CommitNode {
   id: string
   parents: string[]
   author: string
+  /** 提交时间（committer date）。排序和图布局用它；显示请用 `shownTime`（`commitTime.ts`）。 */
   time: number
+  /**
+   * 作者时间（author date），**只在和 `time` 不同时才有**（后端 `graph.rs` 省掉了相同的）。
+   * 跟进、rebase 重放提交后两者不同：这个才是写下提交的时间。
+   */
+  authorTime?: number
   /**
    * svn 节点：SVN 没返回这个 revision 的时间（没有读权限时只给 revision 号）。
    * 这时 `time` 是借相邻 revision 的、只给排序用，显示请用 `commitDateText`（`svnGraph.ts`）。

@@ -96,6 +96,13 @@ describe('formatCommitInfo', () => {
     expect(lines).toContain('Author: SVN 未返回')
     expect(lines).toContain('Date:   时间未知')
   })
+
+  it('Date: 是作者时间，和 git show 一致', () => {
+    // 跟进重放过的提交：time 是跟进那一刻，authorTime 才是写下的时间
+    const replayed = { ...commit, time: commit.time + 86_400, authorTime: commit.time }
+    const date = formatCommitInfo(replayed).split('\n').find((l) => l.startsWith('Date:'))
+    expect(date).toBe(`Date:   ${new Date(commit.time * 1000).toLocaleString()}`)
+  })
 })
 
 describe('commitMenu', () => {

@@ -843,6 +843,11 @@ describe('commitDateText / commitAuthorText', () => {
     expect(commitDateText(hiddenNode())).toBe('时间未知')
   })
 
+  it('git 提交显示作者时间（和「提交图显示作者时间」合并后两样都要生效）', () => {
+    const replayed = git('a', [], { time: 1_795_663_503, authorTime: 1_794_192_844 })
+    expect(commitDateText(replayed)).toBe(new Date(1_794_192_844 * 1000).toLocaleString())
+  })
+
   it('有时间时照常本地化显示', () => {
     const node = spliceHistory([svn(1)], [])[0]
     expect(commitDateText(node)).toBe(new Date(node.time * 1000).toLocaleString())
