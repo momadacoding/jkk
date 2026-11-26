@@ -3,9 +3,9 @@
 // 侧边栏单击分支 / tag / worktree 要把 graph 定位到目标提交。
 // 回归：目标就是当前选中的提交（打开仓库时默认选中 HEAD）时，滚走之后再点同一个分支，
 // selectedId 没变，定位 effect 不重跑，图停在原地（2026-11-01 用户报告，Fork 会重新定位）。
-import { fireEvent, render } from '@testing-library/react'
-import { useRef } from 'react'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { act, fireEvent, render } from '@testing-library/react'
+import { useRef, useState } from 'react'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { GraphView } from '@/components/GraphView'
 import { useFocusTrap } from '@/components/useFocusTrap'
 import { ALL_CAPABILITIES } from '@/engine/capabilities'
@@ -59,6 +59,8 @@ function renderGraph(props: { commits?: CommitNode[]; selectedId: string; reveal
       onOpenChanges={() => {}}
       onCommitAction={() => {}}
       capabilities={ALL_CAPABILITIES}
+      searchQuery=""
+      onSearchQueryChange={() => {}}
     />
   )
   const view = render(element(props))
@@ -132,6 +134,8 @@ describe('GraphView 键盘导航', () => {
           onOpenChanges={() => {}}
           onCommitAction={() => {}}
           capabilities={ALL_CAPABILITIES}
+          searchQuery=""
+          onSearchQueryChange={() => {}}
         />
         </div>
         {dialog && <Dialog />}
@@ -182,5 +186,216 @@ describe('GraphView 键盘导航', () => {
     input.focus()
     fireEvent.keyDown(input, { key: 'ArrowDown' })
     expect(picked).toEqual([])
+  })
+})
+
+describe('GraphView 搜索', () => {
+  // 标题带 fix 的在第 3、10、50 行；其余是 chore
+  const HITS = [3, 10, 50]
+  const searchable: CommitNode[] = commits.map((c, i) => ({
+    ...c,
+    message: HITS.includes(i) ? `fix bug ${i}` : `chore ${i}`,
+  }))
+
+  beforeEach(() => { vi.useFakeTimers() })
+  afterEach(() => { vi.useRealTimers() })
+
+  function Dialog() {
+    const ref = useRef<HTMLDivElement>(null)
+    useFocusTrap(ref)
+    return <div ref={ref} className="dialog"><button>OK</button></div>
+  }
+
+  /**
+   * 和 RepoTab 一样：选中和搜索词都由上层保管，onSelect 真的改选中；`picked` 记下每一次 onSelect。
+   * `shown = false` 模拟切到 Local Changes 时 GraphView 被卸载。
+   */
+  function renderSearch(opts: { selectedId?: string; hiddenTab?: boolean; dialog?: boolean } = {}) {
+    const picked: string[] = []
+    function Harness({ list, shown = true }: { list: CommitNode[]; shown?: boolean }) {
+      const [selected, setSelected] = useState(opts.selectedId ?? 'c5')
+      const [query, setQuery] = useState('')
+      return (
+        <>
+          <div style={{ display: opts.hiddenTab ? 'none' : 'flex' }}>
+            {shown && (
+              <GraphView
+                commits={list}
+                refs={[]}
+                pullRequests={[]}
+                selectedId={selected}
+                revealSeq={0}
+                onSelect={(id) => { picked.push(id); setSelected(id) }}
+                headHash=""
+                changeCount={0}
+                onOpenChanges={() => {}}
+                onCommitAction={() => {}}
+                capabilities={ALL_CAPABILITIES}
+                searchQuery={query}
+                onSearchQueryChange={setQuery}
+              />
+            )}
+          </div>
+          {opts.dialog && <Dialog />}
+          <input aria-label="别的输入框" />
+        </>
+      )
+    }
+    const view = render(<Harness list={searchable} />)
+    const input = view.container.querySelector('.graph-search-input') as HTMLInputElement
+    const el = view.container.querySelector('.graph-view') as HTMLDivElement
+    const unmountGraph = () => view.rerender(<Harness list={searchable} shown={false} />)
+    const remountGraph = () => view.rerender(<Harness list={searchable} />)
+    /** 输入并等过防抖。 */
+    const type = (value: string) => {
+      fireEvent.change(input, { target: { value } })
+      act(() => { vi.advanceTimersByTime(200) })
+    }
+    const count = () => view.container.querySelector('.graph-search-count')?.textContent
+    const rerender = (list: CommitNode[]) => view.rerender(<Harness list={list} />)
+    return { picked, input, el, type, count, rerender, unmountGraph, remountGraph }
+  }
+
+  it('输入停下后跳到选中处之后的第一个命中；停下之前不跳', () => {
+    const { picked, input, type } = renderSearch()
+    fireEvent.change(input, { target: { value: 'fix' } })
+    act(() => { vi.advanceTimersByTime(50) })
+    expect(picked).toEqual([])
+    type('fix')
+    expect(picked).toEqual(['c10'])
+  })
+
+  it('多打一个字、当前那条仍然命中：选中不动', () => {
+    const { picked, type } = renderSearch()
+    type('fix')
+    type('fix bug')
+    expect(picked).toEqual(['c10'])
+  })
+
+  it('Enter 下一个、走到底绕回；Shift+Enter 上一个；计数跟着走', () => {
+    const { picked, input, type, count } = renderSearch()
+    type('fix')
+    expect(count()).toBe('2 / 3')
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(count()).toBe('3 / 3')
+    fireEvent.keyDown(input, { key: 'Enter' })
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: true })
+    expect(picked).toEqual(['c10', 'c50', 'c3', 'c50'])
+  })
+
+  it('F3 / Shift+F3 在焦点不在搜索框时也能跳', () => {
+    const { picked, input, type } = renderSearch()
+    type('fix')
+    input.blur()
+    fireEvent.keyDown(window, { key: 'F3' })
+    fireEvent.keyDown(window, { key: 'F3', shiftKey: true })
+    expect(picked).toEqual(['c10', 'c50', 'c10'])
+  })
+
+  it('命中的行高亮、其余变暗；没在搜时两样都没有', () => {
+    const { el, type } = renderSearch({ selectedId: 'c0' })
+    // SVG 里的节点也带 data-id，要的是文字那一行
+    const row = (i: number) => el.querySelector(`.commit-row[data-id="c${i}"]`)!
+    expect(row(3).className).not.toMatch(/search-/)
+    type('fix')
+    expect(row(3).className).toContain('search-hit')
+    expect(row(4).className).toContain('search-miss')
+  })
+
+  it('没有命中：显示「无匹配」，选中不动', () => {
+    const { picked, type, count } = renderSearch()
+    type('nothing-like-this')
+    expect(count()).toBe('无匹配')
+    expect(picked).toEqual([])
+  })
+
+  it('唯一的命中就是当前选中、用户滚走了：Enter 把它滚回来，不重新选（不白读 diff）', () => {
+    const { picked, input, el, type } = renderSearch({ selectedId: 'c50' })
+    type('bug 50')
+    el.scrollTop = 0
+    fireEvent.scroll(el)
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(picked).toEqual([])
+    expect(el.scrollTop).toBe(centered(50))
+  })
+
+  it('图刷新不把选中拽回命中上：用户点走之后，搜索词还在也不跳', () => {
+    const { picked, el, type, rerender } = renderSearch()
+    type('fix')
+    fireEvent.click(el.querySelector('[data-id="c12"]')!)
+    rerender(searchable.map((c) => ({ ...c })))
+    act(() => { vi.advanceTimersByTime(200) })
+    expect(picked).toEqual(['c10', 'c12'])
+  })
+
+  it('Esc 第一下清空，第二下离开搜索框', () => {
+    const { input, type, count } = renderSearch()
+    type('fix')
+    input.focus()
+    fireEvent.keyDown(input, { key: 'Escape' })
+    expect(input.value).toBe('')
+    expect(count()).toBeUndefined()
+    expect(document.activeElement).toBe(input)
+    fireEvent.keyDown(input, { key: 'Escape' })
+    expect(document.activeElement).not.toBe(input)
+  })
+
+  it('Ctrl+F 聚焦搜索框', () => {
+    const { input } = renderSearch()
+    fireEvent.keyDown(window, { key: 'f', ctrlKey: true })
+    expect(document.activeElement).toBe(input)
+  })
+
+  it('Ctrl+F：隐藏标签里的 graph 不抢焦点', () => {
+    const { input } = renderSearch({ hiddenTab: true })
+    fireEvent.keyDown(window, { key: 'f', ctrlKey: true })
+    expect(document.activeElement).not.toBe(input)
+  })
+
+  it('Ctrl+F：弹框开着时不抢焦点', () => {
+    const { input } = renderSearch({ dialog: true })
+    fireEvent.keyDown(window, { key: 'f', ctrlKey: true })
+    expect(document.activeElement).not.toBe(input)
+  })
+
+  it('Ctrl+F：焦点在别的输入框里时不抢（独立 review 第 5 条）', () => {
+    const { input } = renderSearch()
+    const other = document.querySelector('input[aria-label="别的输入框"]') as HTMLInputElement
+    other.focus()
+    fireEvent.keyDown(other, { key: 'f', ctrlKey: true })
+    expect(document.activeElement).toBe(other)
+    expect(input).not.toBe(other)
+  })
+
+  it('输入法组词时按 Enter / Esc：不跳、不清空（独立 review 第 1 条）', () => {
+    const { picked, input, type } = renderSearch()
+    type('fix')
+    input.focus()
+    fireEvent.keyDown(input, { key: 'Enter', isComposing: true })
+    fireEvent.keyDown(input, { key: 'Escape', isComposing: true })
+    expect(picked).toEqual(['c10'])
+    expect(input.value).toBe('fix')
+  })
+
+  it('只多打了空格、或只改了大小写：词没变就不再跳回命中（独立 review 第 4 条）', () => {
+    const { el, type } = renderSearch()
+    type('fix')
+    el.scrollTop = 0
+    fireEvent.scroll(el)
+    type('fix ')
+    type('FIX ')
+    expect(el.scrollTop).toBe(0)
+  })
+
+  it('搜索词由上层保管：切到 Local Changes 再回来（GraphView 重新挂载）词还在、也不再自动跳（独立 review 第 3 条）', () => {
+    const { picked, type, unmountGraph, remountGraph } = renderSearch()
+    type('fix')
+    unmountGraph()
+    remountGraph()
+    act(() => { vi.advanceTimersByTime(200) })
+    const input = document.querySelector('.graph-search-input') as HTMLInputElement
+    expect(input.value).toBe('fix')
+    expect(document.querySelector('.graph-search-count')?.textContent).toBe('2 / 3')
+    expect(picked).toEqual(['c10'])
   })
 })

@@ -27,10 +27,12 @@ interface CommitRowProps {
   changeCount: number
   /** 该提交是否是 HEAD，是则整行加粗。 */
   isHead: boolean
+  /** 搜索命中与否；没在搜时为 `undefined`，整行照常显示。 */
+  searchHit?: boolean
 }
 
 export function CommitRow({
-  node, refs, prByBranch, prsByHead, selected, layoutWidth, laneColor, changeCount, isHead,
+  node, refs, prByBranch, prsByHead, selected, layoutWidth, laneColor, changeCount, isHead, searchHit,
 }: CommitRowProps) {
   if (node.commit.id === WORKDIR_ID) {
     return (
@@ -61,7 +63,8 @@ export function CommitRow({
 
   return (
     <div
-      className={`commit-row${selected ? ' selected' : ''}${isHead ? ' head' : ''}${isSvn ? ' svn' : ''}`}
+      className={`commit-row${selected ? ' selected' : ''}${isHead ? ' head' : ''}${isSvn ? ' svn' : ''}${
+        searchHit === undefined ? '' : searchHit ? ' search-hit' : ' search-miss'}`}
       style={{ height: 28, paddingLeft: layoutWidth + 8 }}
       data-id={node.commit.id}
     >

@@ -240,6 +240,9 @@ export function RepoTab({
   const [selectedWorktree, setSelectedWorktree] = useState<string | null>(null)
   // 侧边栏单击定位的请求计数，见 GraphView 的 `revealSeq`
   const [revealSeq, setRevealSeq] = useState(0)
+  // 提交图搜索框里的原文。放在这里而不是 GraphView 里：切到 Local Changes / 文件历史时
+  // GraphView 会被卸载，回来时搜索词还得在
+  const [graphSearch, setGraphSearch] = useState('')
 
   /** 选中并把 graph 滚到这个提交；选中没变（再点同一个分支）时也要重新滚。 */
   const revealCommit = useCallback((hash: string) => {
@@ -1514,6 +1517,8 @@ export function RepoTab({
                         : undefined
                     }
                     svnLogComplete={state.svnLogComplete}
+                    searchQuery={graphSearch}
+                    onSearchQueryChange={setGraphSearch}
                   />
                 </Panel>
                 <Separator style={{ height: 4, background: '#333' }} />
