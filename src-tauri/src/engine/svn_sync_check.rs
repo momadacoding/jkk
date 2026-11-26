@@ -9,19 +9,21 @@
 //! 的应当是「你在 detached HEAD 上」这种能自己修的问题，而不是一条网络错误。
 
 use crate::engine::git_cli::run_git_code;
-use crate::engine::svn_baseline::{git_dir, TempIndex};
-use crate::engine::svn_cli::run_svn;
+use crate::engine::svn_baseline::git_dir;
+use crate::engine::svn_cli::{run_svn, with_scan_cache};
 use crate::engine::svn_config::{read_config, BASELINE_BRANCH};
+use crate::engine::svn_dirty::{classify, explained_paths, read_dirty};
 use crate::engine::svn_externals::detect_pinned;
-use crate::engine::svn_include_check::verify_include_set;
+use crate::engine::svn_include_check::dry_run_include_set_titled;
+use crate::engine::svn_preflight::check_targets;
 use crate::engine::svn_scope::WScope;
 use crate::engine::svn_sync::{check_sync_with_nodes, SyncVerdict};
 use crate::engine::svn_util::short;
+use crate::engine::svn_wc::enumerate_wcs;
 use crate::engine::svn_xml::{ancestor_dirs, parse_update_status};
 use crate::engine::{svn_journal, svn_lock};
 use crate::error::{GitError, Result};
 use crate::vcs::{detect_repo_kind, RepoKind};
-use std::collections::BTreeMap;
 
 /// 预览：给确认框看的全部事实。执行时原样带回来（`SyncInExpect`）做锁内复核。
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -62,7 +64,14 @@ pub(crate) fn unfinished_error() -> GitError {
 }
 
 /// 第 1–6 条。**不查锁**：持锁者在锁内复核时调它，查锁会把自己挡住。
+///
+/// 整个检查在一个扫描缓存范围里（[`with_scan_cache`]）：失同步判定、纳入集合预检的脏清单
+/// 发的是同一条全量 `svn status`（`STATUS_SCAN`），只遍历一遍。范围里不发 SVN 写命令。
 pub(crate) fn check_sync_in(repo_root: &str) -> Result<SyncInPreview> {
+    with_scan_cache(|| check_sync_in_uncached(repo_root))
+}
+
+fn check_sync_in_uncached(repo_root: &str) -> Result<SyncInPreview> {
     if detect_repo_kind(repo_root) != RepoKind::SvnHybrid {
         return Err(GitError::new(
             "svn_not_hybrid",
@@ -120,7 +129,13 @@ pub(crate) fn check_sync_in(repo_root: &str) -> Result<SyncInPreview> {
     // 第 6 条后半：当前磁盘的纳入集合预检（§6.3.1）。放在 update 之前，是为了
     // 让「工作树里一个 `.gitignore` 挡住了 W-file」这种问题在动手前暴露——
     // 否则要到 S7 才炸，那时 svn update 已经做完，用户卡在 svn/base 上。
-    precheck_include_set(repo_root, &scope)?;
+    precheck_include_set(
+        repo_root,
+        &scope,
+        "更新前的检查没通过：按当前的忽略规则，git 将要收进来的文件与配置声明的不一致。\
+         还没开始更新，什么都没有改动。",
+        "本应用在这个仓库上绕不开它们，这次请改用 TortoiseSVN 更新。",
+    )?;
 
     // 第 4、5 条：走网络，放最后
     let xml = run_svn(repo_root, &["status", "-u", "--xml"]).map_err(|e| {
@@ -378,14 +393,50 @@ pub(crate) fn unmerged_paths(repo_root: &str) -> Result<Vec<String>> {
     crate::engine::git_read::unmerged_paths(repo_root)
 }
 
-/// 当前磁盘上的纳入集合预检：期望集合（遍历磁盘）与 `git add -A` 实际收进来的相等。
-pub(crate) fn precheck_include_set(repo_root: &str, scope: &WScope) -> Result<()> {
-    let idx = TempIndex::empty(repo_root)?;
-    idx.add_all(repo_root, scope.whitelist())?;
-    // 与录制同一口径：已在基线里、被后来的 .gitignore 挡住的文件补回来（设计 §4）
-    idx.add_paths(repo_root, &scope.hidden_tracked_on_disk()?)?;
-    // 空的 fixes：这里比的就是「磁盘现在的样子」，不是服务器的
-    verify_include_set(repo_root, &idx, scope, &BTreeMap::new())
+/// 当前磁盘上的纳入集合预检：按录基线的同一口径，预言 git 会收哪些文件，与配置声明的比。
+///
+/// # 原来走真的 `git add`、不套脏清单修正，会误报（2026-11-25 用户现场）
+///
+/// 原来的期望集合是「磁盘上白名单内、扩展名匹配的所有文件」，传给核对的修正清单是空的。
+/// 于是 SVN 忽略 / 未版本控制的编译产物（工具目录 `obj/` 下的 `AssemblyInfo.cs`）也算进了
+/// 期望集合；SVN 里早就有的 `.gitignore` 写着 `obj/`，git 不收它们，就报 69 个「应当被跟踪、
+/// 实际没有」。而录基线时 `classify` 把这些文件判成 [`crate::engine::svn_dirty::Fix::Drop`]、两边都剔掉，最终核对
+/// 本来会放行——拦下来没有保护任何东西，用户只能改用 TortoiseSVN 更新。
+///
+/// 现在与建库 / 重建基线的预检（`svn_init::dry_run_before_add`）同一套：`read_dirty` →
+/// `classify` → `explained_paths` → [`dry_run_include_set_titled`]。顺带不再写对象，更快。
+///
+/// # 只负责早点失败
+///
+/// 录进基线的只认 `git add` 之后的最终核对（`verify_include_set_listing`），那道没动。
+/// 预言与真实 `git add` 分叉时，这里放行而最终核对才拦——那时更新的 svn update 已经做完；
+/// 建库与重建基线从 2026-10-28 起就在用这道预言。
+///
+/// `classify` 认不出的工作副本状态（复制子树来源不明、`svn add` 后又删掉且说不清来历等）
+/// 原来要到 svn update 之后录基线时才报，现在在这里就报——同一个错误，提前到动手之前。
+///
+/// # `incomplete` 的目录不交给 `classify`
+///
+/// update 被打断、用户照提示跑了 `svn cleanup` 之后，白名单里的目录停在 `item="incomplete"`
+/// （2026-11-25 fixture 实测：`Code` 本身就是）。`classify` 不认识它，会报
+/// `svn_dirty_unknown_item`「假基线」——在这里是误伤：更新接下来的 `svn update` 正好把它
+/// 补齐，要接管时重建基线的 P3 也会用它自己的话拦下。改造前这道预检不看脏清单，这种
+/// 工作副本照常走到那两步。`incomplete` 是目录状态，里面的文件各有各的 item，照常分类。
+///
+/// `versioned_tail` 见 [`dry_run_include_set_titled`]。
+pub(crate) fn precheck_include_set(
+    repo_root: &str,
+    scope: &WScope,
+    headline: &str,
+    versioned_tail: &str,
+) -> Result<()> {
+    let wcs = enumerate_wcs(repo_root, scope.whitelist())?;
+    let targets = check_targets(scope.roots(), &wcs);
+    let mut dirty = read_dirty(repo_root, &targets)?;
+    dirty.retain(|e| e.item != "incomplete");
+    let fixes = classify(&dirty)?;
+    let touched = explained_paths(&fixes, scope)?;
+    dry_run_include_set_titled(repo_root, headline, versioned_tail, scope, &fixes, &touched)
 }
 
 /// 路径清单给人看：最多 20 条，多了说还有几条。`svn_sync_in` 也用它。

@@ -645,7 +645,7 @@ pub(crate) fn detect_conflicts(
 /// `资源/.gitignore` 到了 svn 那里变成 `??/.gitignore`，报「找不到节点」——若按「不受控」
 /// 处理，一个**团队提交的** `.gitignore` 就会被改名（反目标第 2 条）。工作目录走的是
 /// Unicode 的进程 API，不受代码页影响，而文件名 `.gitignore` 是纯 ASCII。
-fn is_versioned(repo_root: &str, rel: &str) -> Result<bool> {
+pub(crate) fn is_versioned(repo_root: &str, rel: &str) -> Result<bool> {
     let abs = Path::new(repo_root).join(rel);
     let (Some(dir), Some(name)) = (abs.parent(), abs.file_name()) else {
         return Ok(false);

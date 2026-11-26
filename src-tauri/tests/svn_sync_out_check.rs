@@ -84,6 +84,41 @@ fn the_preview_lists_a_m_d_and_the_local_only_patches() {
     assert!(p.outside_changes.is_empty());
 }
 
+/// 2026-11-25 现场在交付这一侧的形态：SVN 忽略的编译产物被 SVN 里的 `.gitignore` 挡住。
+/// 它们不是服务器内容，第 8 条预检不该拦。
+#[test]
+fn svn_ignored_build_output_hidden_by_a_gitignore_does_not_block_the_preview() {
+    let fx = hybrid_with_colleague();
+    fx.colleague_adds_tool_with_gitignored_obj(true);
+    update(&fx);
+    fx.build_tool_obj();
+    write(&fx, "Code/A.cs", "a2\n");
+    git(&fx, &["commit", "-qam", "work"]);
+
+    let p = preview_sync_out(&fx.wc_str()).expect("SVN 不管的编译产物不该挡住交付");
+    let got: Vec<&str> = p.changes.iter().map(|c| c.path.as_str()).collect();
+    assert_eq!(got, ["Code/A.cs"]);
+}
+
+#[test]
+fn a_gitignore_that_hides_a_versioned_w_file_still_blocks_delivery() {
+    let fx = hybrid_with_colleague();
+    fx.colleague_adds_tool_with_gitignored_obj(true);
+    update(&fx);
+    write(&fx, "Code/A.cs", "a2\n");
+    git(&fx, &["commit", "-qam", "work"]);
+    write(&fx, "Code/Tool/.gitignore", "obj/\n*.cs\n");
+
+    let err = preview_sync_out(&fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "include_set_mismatch");
+    assert!(
+        err.message.starts_with("交付前的检查没通过"),
+        "{}",
+        err.message
+    );
+    assert!(err.message.contains("Code/Tool/Main.cs"), "{}", err.message);
+}
+
 #[test]
 fn the_preview_changes_nothing_and_takes_no_lock() {
     let fx = hybrid_with_colleague();

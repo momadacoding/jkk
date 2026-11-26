@@ -522,6 +522,13 @@ describe('错误码到引导语的映射', () => {
       expect(hint).toContain('嵌套')
     }
   })
+
+  it('纳入集合不一致：只建议改不在 SVN 里的 .gitignore', () => {
+    // 2026-11-25：挡住文件的 .gitignore 常是 SVN 里别人提交的，一律建议「挪走」会让用户改团队文件
+    const hint = wizardErrorHint('include_set_mismatch', 'git 实际跟踪的文件集合与配置声明的不一致。')
+    expect(hint).toContain('不在 SVN 里的那个可以挪走')
+    expect(hint).toContain('是 SVN 里的文件就不要改它')
+  })
 })
 
 describe('healthNeedsRebuild', () => {
