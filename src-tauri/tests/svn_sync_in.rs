@@ -2022,3 +2022,201 @@ fn bytes_that_are_neither_the_branch_nor_the_baseline_are_not_overwritten() {
     assert_eq!(phase(&fx), Some(Phase::BaselineReady), "记录原样保留");
     assert_eq!(our_stashes(&fx), 1, "WIP 还在");
 }
+
+// —— 已 `svn add`、还没提交的新文件（2026-11-26 现场：sync_in_baseline_stale 误拦）——
+
+fn svn_status(fx: &SvnFixture, rel: &str) -> String {
+    let out = std::process::Command::new("svn")
+        .current_dir(fx.wc())
+        .args(["status", "--", rel])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).replace('\\', "/")
+}
+
+/// 在 `work` 上新建并提交 `rel`，再在 SVN 里 `svn add --parents`（可选挂 changelist）。
+/// 现场形态：分支上的提交新建了文件，基线里没有它，SVN 里已添加未提交。
+fn add_new_file_on_branch(fx: &SvnFixture, rel: &str, content: &str, changelist: Option<&str>) {
+    let p = fx.wc().join(rel);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, content).unwrap();
+    git(fx, &["add", "--", rel]);
+    git(fx, &["commit", "-qm", &format!("add {rel}")]);
+    svn_fixtures::svn_cmd(&fx.wc(), &["add", "--parents", rel]);
+    if let Some(cl) = changelist {
+        svn_fixtures::svn_cmd(&fx.wc(), &["changelist", cl, rel]);
+    }
+}
+
+#[test]
+fn an_added_uncommitted_file_on_the_branch_survives_an_update() {
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/A.cs", "a2\n");
+    add_new_file_on_branch(&fx, "Code/New.cs", "new\n", Some("feature"));
+    write(&fx, "Code/B.cs", "b-wip\n");
+
+    assert_eq!(sync(&fx), SyncInOutcome::Done { new_rev: 2 });
+
+    assert_eq!(read(&fx, "Code/A.cs"), "a2\n", "服务器的改动到了磁盘上");
+    assert_eq!(
+        read(&fx, "Code/New.cs"),
+        "new\n",
+        "重放分支把新文件写回来了"
+    );
+    assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
+    let st = svn_status(&fx, "Code/New.cs");
+    assert!(st.contains("A       Code/New.cs"), "仍是已添加：{st}");
+    assert!(st.contains("feature"), "changelist 还在：{st}");
+    assert_eq!(
+        git(
+            &fx,
+            &["ls-tree", "--name-only", "svn/base", "--", "Code/New.cs"]
+        ),
+        "",
+        "服务器上没有它，不能录进基线"
+    );
+    assert_eq!(baseline_rev(&fx), 2);
+    assert_eq!(phase(&fx), None);
+    assert_eq!(our_stashes(&fx), 0);
+}
+
+#[test]
+fn an_added_uncommitted_directory_on_the_branch_survives_an_update() {
+    // 新目录里只有 git 管的文件：切到基线时 git 把整个目录删掉，SVN 看到的是「已添加的目录不见了」
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/A.cs", "a2\n");
+    add_new_file_on_branch(&fx, "Code/Fresh/X.cs", "x\n", None);
+
+    assert_eq!(sync(&fx), SyncInOutcome::Done { new_rev: 2 });
+
+    assert_eq!(read(&fx, "Code/Fresh/X.cs"), "x\n");
+    let st = svn_status(&fx, "Code/Fresh");
+    assert!(st.contains("A       Code/Fresh"), "目录仍是已添加：{st}");
+    let st = svn_status(&fx, "Code/Fresh/X.cs");
+    assert!(
+        st.contains("A       Code/Fresh/X.cs"),
+        "文件仍是已添加：{st}"
+    );
+    assert_eq!(read(&fx, "Code/A.cs"), "a2\n");
+}
+
+/// 按「撞上」拒绝、而且什么都没动：还在 `work`、HEAD 不变、基线仍停在 `base_rev`、
+/// 没有同步记录与 stash。新文件内容各用例自己查。
+fn assert_refused_as_collision(
+    fx: &SvnFixture,
+    err: &app_lib::error::GitError,
+    rel: &str,
+    head: &str,
+    base_rev: u64,
+) {
+    assert_eq!(err.code, "sync_in_added_collides", "{}", err.message);
+    assert!(err.message.contains(rel), "{}", err.message);
+    assert!(err.message.starts_with("这次没有更新"), "{}", err.message);
+    assert_eq!(git(fx, &["rev-parse", "HEAD"]), head);
+    assert_eq!(git(fx, &["symbolic-ref", "--short", "HEAD"]), "work");
+    assert_eq!(baseline_rev(fx), base_rev, "基线没动");
+    assert_eq!(phase(fx), None);
+    assert_eq!(our_stashes(fx), 0);
+}
+
+#[test]
+fn a_server_add_on_the_same_path_is_refused_before_anything_moves() {
+    // 本地已添加未提交、服务器这次也新增了同一路径：S5 会把服务器那份写到磁盘、留下树冲突，
+    // 回退时不敢覆盖它（fixture 实测），所以必须在预览里就拦下，什么都不动
+    let fx = hybrid_with_colleague();
+    add_new_file_on_branch(&fx, "Code/New.cs", "mine\n", None);
+    fx.colleague_commits("Code/New.cs", "theirs\n");
+    let head = git(&fx, &["rev-parse", "HEAD"]);
+
+    let err = preview_sync_in(&fx.wc_str()).unwrap_err();
+    assert_refused_as_collision(&fx, &err, "Code/New.cs", &head, 1);
+    assert_eq!(read(&fx, "Code/New.cs"), "mine\n");
+    assert!(svn_status(&fx, "Code/New.cs").contains("A       Code/New.cs"));
+}
+
+#[test]
+fn a_server_add_into_the_same_new_directory_is_refused() {
+    // 独立 review 第 1 条：本地新目录 Code/X 下加 F.cs，服务器也新建了 Code/X（放的是 G.cs）。
+    // F.cs 自己的 repos-status 是 none，只有目录是 added + added
+    let fx = hybrid_with_colleague();
+    add_new_file_on_branch(&fx, "Code/X/F.cs", "f\n", None);
+    fx.colleague_commits("Code/X/G.cs", "g\n");
+    let head = git(&fx, &["rev-parse", "HEAD"]);
+
+    let err = preview_sync_in(&fx.wc_str()).unwrap_err();
+    assert_refused_as_collision(&fx, &err, "Code/X/F.cs", &head, 1);
+    assert_eq!(read(&fx, "Code/X/F.cs"), "f\n");
+}
+
+#[test]
+fn a_server_delete_of_the_parent_directory_is_refused() {
+    // 独立 review 第 3 条：本地往白名单里的子目录 Code/S 加了新文件，服务器把 Code/S 删了
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/S/K.cs", "k\n");
+    assert_eq!(
+        sync(&fx),
+        SyncInOutcome::Done { new_rev: 2 },
+        "先让 Code/S 进工作副本和基线"
+    );
+    add_new_file_on_branch(&fx, "Code/S/New.cs", "mine\n", None);
+    let wc2 = fx.wc2();
+    svn_fixtures::svn_cmd(&wc2, &["update", "--non-interactive"]);
+    svn_fixtures::svn_cmd(&wc2, &["rm", "Code/S"]);
+    svn_fixtures::svn_cmd(&wc2, &["commit", "-m", "rm Code/S", "--non-interactive"]);
+    let head = git(&fx, &["rev-parse", "HEAD"]);
+
+    let err = preview_sync_in(&fx.wc_str()).unwrap_err();
+    assert_refused_as_collision(&fx, &err, "Code/S/New.cs", &head, 2);
+    assert_eq!(read(&fx, "Code/S/New.cs"), "mine\n");
+    assert_eq!(read(&fx, "Code/S/K.cs"), "k\n");
+}
+
+#[test]
+fn a_server_add_next_to_a_local_add_in_an_existing_directory_is_not_refused() {
+    // 反例：服务器只是往已有的 Code 里加了别的文件（Code 的 repos-status 是 modified），
+    // 本地新加的文件在旁边，互不相干，照常更新
+    let fx = hybrid_with_colleague();
+    add_new_file_on_branch(&fx, "Code/New.cs", "mine\n", Some("feature"));
+    fx.colleague_commits("Code/Other.cs", "other\n");
+
+    assert_eq!(sync(&fx), SyncInOutcome::Done { new_rev: 2 });
+    assert_eq!(read(&fx, "Code/Other.cs"), "other\n");
+    assert_eq!(read(&fx, "Code/New.cs"), "mine\n");
+    let st = svn_status(&fx, "Code/New.cs");
+    assert!(st.contains("A       Code/New.cs"), "{st}");
+    assert!(st.contains("feature"), "{st}");
+}
+
+#[test]
+fn an_added_file_already_gone_from_disk_still_counts_for_the_collision_check() {
+    // 独立 review 第 2 条：svn add 之后文件已从磁盘删掉（wc missing、revision -1），
+    // 服务器又新增了同一路径
+    let fx = hybrid_with_colleague();
+    add_new_file_on_branch(&fx, "Code/New.cs", "mine\n", None);
+    std::fs::remove_file(fx.wc().join("Code/New.cs")).unwrap();
+    fx.colleague_commits("Code/New.cs", "theirs\n");
+    let head = git(&fx, &["rev-parse", "HEAD"]);
+
+    let err = preview_sync_in(&fx.wc_str()).unwrap_err();
+    assert_refused_as_collision(&fx, &err, "Code/New.cs", &head, 1);
+}
+
+#[test]
+fn a_server_add_after_confirmation_is_caught_by_the_in_lock_recheck() {
+    // 独立 review 第 5 条：确认框弹出之后、点执行之前同事提交了同一路径。锁内复核重跑预检
+    let fx = hybrid_with_colleague();
+    add_new_file_on_branch(&fx, "Code/New.cs", "mine\n", None);
+    let confirmed = expect(&fx);
+    fx.colleague_commits("Code/New.cs", "theirs\n");
+    let head = git(&fx, &["rev-parse", "HEAD"]);
+
+    let err = run_sync_in(&fx.wc_str(), &confirmed).unwrap_err();
+    assert_refused_as_collision(&fx, &err, "Code/New.cs", &head, 1);
+    assert_eq!(read(&fx, "Code/New.cs"), "mine\n");
+    assert!(!svn_lock::is_held(&fx.wc_str()), "锁已释放");
+}
