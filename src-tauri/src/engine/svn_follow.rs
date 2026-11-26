@@ -68,7 +68,7 @@ use crate::engine::svn_basemap::{read_base_map, BaseMap};
 use crate::engine::svn_changelist;
 use crate::engine::svn_cli::{bypass_scan_cache, with_scan_cache};
 use crate::engine::svn_config::{read_config, SvnConfig, BASELINE_BRANCH};
-use crate::engine::svn_follow_disk::{check_disk, supersede_safe, DiskCheck};
+use crate::engine::svn_follow_disk::{check_disk, supersede_safe, DiskCheck, SupersedeCheck};
 use crate::engine::svn_follow_index::{
     judge_staging, prepare_index, prepare_index_with, rename_lock_into_index, ComposeReport,
     PathFacts, PreparedIndex,
@@ -111,7 +111,7 @@ use crate::engine::tsvn_inbox::{
 use crate::error::{GitError, Result};
 use crate::vcs::{detect_repo_kind, RepoKind};
 use git2::{BranchType, Repository};
-use std::cell::{OnceCell, RefCell};
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -215,6 +215,10 @@ pub struct FollowReport {
     /// SVN 内容（事故分析 6.10，[`SnapshotRule`]）。与 `rewritten` 不重复。
     #[serde(default)]
     pub snapshot: Vec<(String, Vec<String>)>,
+    /// (原 commit, 路径)：F2 ① 本来要换成 SVN 版本，但 commit 里有改动不在 SVN 版本里（比如
+    /// TortoiseSVN 只提交了一部分），照常重放了（计划 2026-11-27 Task 2）。只列当前分支的。
+    #[serde(default)]
+    pub not_rewritten: Vec<(String, Vec<String>)>,
     /// 重放后与磁盘对不上的文件：磁盘是 SVN 的版本（= 新基线），分支 tip 却是别的内容，或者把 SVN
     /// 已删的文件带了回来。多半是重放干净却合错了（W14；PR 119 遗留）。只告警，不拦。
     #[serde(default)]
@@ -1961,6 +1965,65 @@ impl External {
     }
 }
 
+/// F2 ① 每个早于快照的 commit 换哪些路径（[`supersede_safe`]）。从旧到新依次核对：一条路径在某个
+/// commit 上没通过、照常重放了，它之后的 commit 在这条路径上也不换，否则后面的改动（比如删掉前面
+/// 加的一行）被换掉，删掉的内容又回来了（独立 review 第 1 条）。Local-Only commit 不换，也不挡后面的。
+///
+/// 列不出 commit、核对本身出错：一律不换，等于没有快照。
+fn supersede_plan(
+    repo: &str,
+    who: &Who,
+    before_mark: &BTreeSet<String>,
+    new_base: &str,
+    replaceable: &BTreeSet<String>,
+) -> BTreeMap<String, SupersedeCheck> {
+    let mut plan = BTreeMap::new();
+    let Some(mark) = who.mark.as_ref().filter(|_| !replaceable.is_empty()) else {
+        return plan;
+    };
+    let chain = match commits_between(repo, new_base, &mark.head_oid, &FOLLOW_CODES) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("F2 ①：列不出快照之前的 commit，不换：{}", e.message);
+            return plan;
+        }
+    };
+    // 每个 commit 之后还能换的路径
+    let mut open_after: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for c in chain.iter().filter(|c| before_mark.contains(&c.oid)) {
+        let [parent] = c.parents.as_slice() else {
+            // 重放本来就要求线性，这里不替它报错；之后的 commit 一律不换
+            open_after.insert(c.oid.clone(), BTreeSet::new());
+            continue;
+        };
+        let open = open_after
+            .get(parent)
+            .cloned()
+            .unwrap_or_else(|| replaceable.clone());
+        if c.local_only {
+            open_after.insert(c.oid.clone(), open);
+            continue;
+        }
+        let blocked: BTreeSet<String> = replaceable.difference(&open).cloned().collect();
+        let check = supersede_safe(
+            repo,
+            &c.oid,
+            parent,
+            new_base,
+            replaceable,
+            &blocked,
+            &FOLLOW_CODES,
+        )
+        .unwrap_or_else(|e| {
+            log::warn!("F2 ① 换之前的核对出错，这个 commit 照常重放：{}", e.message);
+            SupersedeCheck::default()
+        });
+        open_after.insert(c.oid.clone(), check.safe.clone());
+        plan.insert(c.oid.clone(), check);
+    }
+    plan
+}
+
 /// 快照 HEAD 的祖先（或者就是它），`new` 的历史除外。集合比逐个 `is-ancestor` 省进程。
 ///
 /// 没有快照、快照里的 commit 已经没了：空集，一律按拿不准处理（正常重放）。
@@ -2190,30 +2253,15 @@ fn prepare(repo: &str, auto: bool, partial: Option<&Partial>, disk: DiskUse) -> 
         Some(after) => mine.intersection(after).cloned().collect(),
         None => BTreeSet::new(),
     };
-    // 每个提交只核对一次：当前分支、试重放、其他分支都会问到同一个提交
-    let checked: RefCell<BTreeMap<String, BTreeSet<String>>> = RefCell::new(BTreeMap::new());
+    // 换之前逐个提交核对，改动不全在 SVN 版本里就不换（2026-11-26 使用报告第 6.2 节）
+    let plan = supersede_plan(repo, &who, &before_mark, &new_base, &replaceable);
     let superseded = |c: &ReplayCommit| -> BTreeSet<String> {
         // Local-Only 不是中间版本：换成 SVN 版本等于把本地补丁静默扔掉（Review 2 第 2 条）。
         // 真的被带上服务器时重放会变空或冲突，由 F3 与冲突出口接手
-        if c.local_only || !before_mark.contains(&c.oid) || replaceable.is_empty() {
+        if c.local_only {
             return BTreeSet::new();
         }
-        if let Some(s) = checked.borrow().get(&c.oid) {
-            return s.clone();
-        }
-        // 换之前核对改动是不是全在 SVN 版本里，否则 TortoiseSVN 只提交了一部分时，没提交的那部分
-        // 会被静默去掉（2026-11-26 使用报告第 6.2 节）。核对出错按不能换：照常重放是保守的方向
-        let safe = match c.parents.as_slice() {
-            [parent] => supersede_safe(repo, &c.oid, parent, &new_base, &replaceable)
-                .unwrap_or_else(|e| {
-                    log::warn!("F2 ① 换之前的核对出错，这个提交照常重放：{}", e.message);
-                    BTreeSet::new()
-                }),
-            // 重放本来就要求线性，这里不替它报错
-            _ => BTreeSet::new(),
-        };
-        checked.borrow_mut().insert(c.oid.clone(), safe.clone());
-        safe
+        plan.get(&c.oid).map(|s| s.safe.clone()).unwrap_or_default()
     };
     // 6.10：快照进来的 SVN 内容按基线走。规则按分支自己的基线算，其他分支在 `plan_other` 里另拼
     let snapshot = SnapshotRule::new(repo, &new_base);
@@ -2242,6 +2290,12 @@ fn prepare(repo: &str, auto: bool, partial: Option<&Partial>, disk: DiskUse) -> 
     // F2 当前分支。memo 跨分支共享：共享的 commit 只重放一次（R20）
     let mut memo = BTreeMap::new();
     let commits = commits_between(repo, &scope, &old_head, &FOLLOW_CODES)?;
+    report.not_rewritten = commits
+        .iter()
+        .filter_map(|c| plan.get(&c.oid).map(|s| (c, s)))
+        .filter(|(_, s)| !s.refused.is_empty())
+        .map(|(c, s)| (c.oid.clone(), s.refused.iter().cloned().collect()))
+        .collect();
     let first = replay_branch(
         repo,
         &scope,

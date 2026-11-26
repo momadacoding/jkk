@@ -8,7 +8,7 @@
 |---|---|---|---|
 | 1 收尾写只含 commit 的快照 | 完成 | `svn_follow_mark.rs`、`svn_follow.rs`（`finish`）、`svn_sync_in.rs`（`finish_forward`）、`tests/svn_follow_hooks.rs`、`tests/svn_follow.rs` | 新用例先红（NeedsManual，拒绝理由与现场截图相同）后绿；改过断言的 3 个用例与 `resume_after_crash_between_each_step` 等 13 个崩溃用例通过 |
 | 2 换成 SVN 版本前核对 | 完成 | `svn_follow_disk.rs`（`supersede_safe`、与冲突框共用的 `remerge`）、`svn_follow.rs`（`superseded` 按提交核对并缓存）、`tests/svn_follow_hooks.rs` | 两个「部分提交」用例先红后绿；现场形状（两个提交 + 同事改动、整个提交）放行；W14 用例记下新行为 |
-| 3 现有测试与文档、验证、PR | 进行中 | 本日志 | `cargo fmt --check`、`cargo clippy --all-targets` 无告警；`cargo test` 按测试二进制分批跑完 116 个集成测试二进制 + 库内单测，全部通过 |
+| 3 现有测试与文档、验证、PR | 完成（待合并） | 本日志、`src/engine/svnFollow.ts`、`tests/vitest/svnFollow.test.ts`、`tests/svn_backend.rs` | review 修复后重跑：`cargo fmt --check`、`cargo clippy --all-targets` 无告警；`cargo test` 分批跑完 116 个集成测试二进制 + 库内 188 个单测，全部通过；`pnpm build` 通过；`pnpm test` 106 个文件 1968 个用例通过 |
 
 ## Task 1
 
@@ -65,13 +65,19 @@
 - **按「提交 × 文件」逐个核对，不按报告第 6.2 节写的「多个提交合成一个算」。** 合成一个算时，合并基础取
   第一个改过它的提交的父提交，中间夹着 Local-Only 提交就把本地补丁算进「你的改动」，只能整个不放行
   （报告第 6.4 节的守卫）。逐个核对时每个提交以自己的父提交为基础，Local-Only 提交本来就不参与 F2 ①，
-  照常重放。每个「提交 × 文件」单独判断也是安全的：换掉的只是这一个提交对这个文件的改动，核对的正是
-  这份改动是否全在 SVN 版本里。代价：C1 加了 B、C2 又删掉 B、TortoiseSVN 提交的不含 B 时，C1 单独看
-  不通过（假阴性，照常重放），合成一个算则会放行。方向保守，接受。
+  照常重放。
+- **（独立 review 第 1 条后改）逐个核对，但按从旧到新的顺序传递「没通过」。** 第一版每个「提交 × 文件」各判
+  各的，我在这里写了「C1 加了 B、C2 又删掉 B 时 C1 不通过，是保守的假阴性」，**这是错的**：C1 照常重放
+  把 B 加回来，C2 单独看等于 SVN 版本、被换掉，它删 B 的改动也跟着没了，分支上又出现用户删掉的 B。
+  改成 `svn_follow::supersede_plan` 预先沿快照之前的 commit 链从旧到新算：一条路径在某个 commit 上没通过，
+  之后的 commit 在这条路径上一律不换（`supersede_safe` 的 `blocked`）。Local-Only commit 不换，也不挡后面的。
+  `superseded` 闭包只查这张表，原来的 `RefCell` 缓存去掉。
 - **「停下来问」落到现有出口，不新加界面。** 不通过就不换、照常重放：合并干净就保留改动（部分提交那篇
   希望的结果），重放结果与磁盘不同时由条件 11 拦住自动跟进、跟进报告列出对不上的文件；冲突就进冲突框，
-  冲突框里有 Beyond Compare 对比。跟进报告里没有单独列出「哪些文件 F2 ① 没换」，只写了 info 日志。
-  是否要在报告里列出来，留给后续（见下面「遗留」）。
+  冲突框里有 Beyond Compare 对比。
+- **（独立 review 第 4 条后加）跟进报告新增一节「没换成 SVN 版本的路径」。** 后端 `FollowReport.not_rewritten`
+  （JSON `notRewritten`，旧 journal 没有时为空），前端 `describeFollowReport` 的 `notRewritten` 节，级别
+  attention。用户看到 drift 或「本地改动」里多出东西时知道原因。只列当前分支的 commit。
 
 ### 计划的错误
 
@@ -88,8 +94,15 @@
   `}`、`return;` 这类常见行，会被当成挪动放行，又是静默丢改动。
 - 合并基础缺失（本地新建的文件）时用空 blob（`hash-object -w --stdin`）当基础：`merge-file --object-id` 要求
   对象存在。
-- `git_read::tree_entries` 遇到 ls-tree 另有解释的路径写法会报 unsupported（`svn_replay` 那边有 CLI 兜底），
-  这里不另写兜底：报错就是「核对出错」，这个提交照常重放。
+- （独立 review 第 3 条后改）`git_read::tree_entries` 遇到 replace ref、ls-tree 另有解释的路径写法等会报
+  unsupported。第一版不兜底，结果是一个这样的仓库里 F2 ① 整个失效。改成复用 `svn_replay` 的 ls-tree 兜底
+  （新开放的 `svn_replay::entries_at`，`ls_entries` 也改走它）。单个文件核对出错只拒绝这一个文件，不连累别的。
+- （独立 review 第 2、5 条后改）判二进制的顺序与范围：第一版先看大小（> 8 MB 不换）再看 NUL，大的贴图、
+  模型因此不再换成 SVN 版本；而且任何含 NUL 的都当二进制放行，UTF-16 文本只提交了一部分时照样丢改动。
+  改成：先看 UTF-16 / UTF-32 BOM（核对不了，不换），再按 git 的规则看前 8000 字节有没有 NUL（二进制，
+  放行），最后才是 8 MB 上限（只管文本）。没有 BOM 的 UTF-16 仍会被当成二进制放行，这是已知的剩余风险。
+  读开头字节用新加的 `git_read::blob_head`（libgit2 会把整个 blob 读进内存）。
+- 测试夹具的白名单只收 `.cs`：用例里的二进制、UTF-16 文件也得叫 `.cs`，否则跟进看不到它们。
 
 ### 为什么这么改是安全的
 
@@ -102,10 +115,23 @@
 - **与冲突框核对共用一份合并。** `judge`（冲突框）与 `supersede_ok`（F2 ①）都走 `remerge`：同一套两段式标记、
   同一种带 OID 的标签、同一个 `outside_hunks_match`。冲突框的 19 个用例与 9 个 resolve-with-disk 用例照旧通过。
 
+## 独立 review（`/code-review high`，2026-11-27）
+
+6 条，全部核对属实并修了。修法写在上面各节，这里只列对应关系：
+
+| 条 | 级别 | 问题 | 修法 | 回归用例（去掉修复时确认失败） |
+|---|---|---|---|---|
+| 1 | important | 前面的 commit 没通过、后面的被换掉，删掉的内容回来 | `supersede_plan` 沿链传递 `blocked` | `a_later_commit_is_not_superseded_on_a_path_an_earlier_commit_kept` |
+| 2 | important | > 8 MB 的二进制不再换 | 先判二进制再看大小 | `a_large_binary_committed_whole_in_tortoise_is_still_superseded` |
+| 3 | important | 进程内读不了时 F2 ① 整个失效 | 复用 ls-tree 兜底；单文件出错不连累别的 | `the_check_falls_back_to_git_when_in_process_reads_are_refused` |
+| 4 | important | W14 只在 drift 里体现，看不出原因 | 报告新增「没换成 SVN 版本的路径」 | W14 与部分提交用例加 `not_rewritten` 断言；vitest 两条 |
+| 5 | nit | UTF-16 文本当二进制放行 | 带 BOM 的不换 | `a_utf16_text_file_is_not_superseded_without_a_line_check` |
+| 6 | nit | 收尾快照没写成时旧快照留下 | `write_commit_mark` 返回是否写了，没写就删 | 无。不写的两种条件：`<repo>/.git` 不是目录（链接 worktree，这时快照路径本身就在一个文件下面，旧快照也不可能存在），或 HEAD 解析不出来（跟进收尾时 HEAD 刚被跟进写过）。都造不出「旧快照在、新快照没写」，改动只是让代码不依赖这个推理 |
+
+第 4 条里 W14 本身的取舍（不换）没有改，只是让用户看得见。
+
 ## 遗留
 
-- 跟进报告里列出「F2 ① 核对没通过、照常重放的文件」，让用户知道为什么这次出现了 drift 或冲突。要改前端，
-  这次没做。
 - 报告第 7 节的未决问题：F2 ① 拿不准时在冲突框里给「换成 SVN 版本」按钮；横幅提示「磁盘上已经解决」。
   都没做。
 - ③ 冲突框支持多个提交改过同一文件：按报告延后。

@@ -425,7 +425,7 @@ fn a_partial_tortoise_commit_keeps_the_uncommitted_part_of_the_commit() {
     let fx = hybrid_with_colleague();
     seed_lines(&fx, A);
     write(&fx, A, "mine\n2\n3\n4\n5\n6\n7\nfinal\n");
-    commit_all(&fx, "改了两处");
+    let c = commit_all(&fx, "改了两处");
     write(&fx, A, "1\n2\n3\n4\n5\n6\n7\nfinal\n");
     mark_at(&fx, 1_000);
     hook_commit(&fx, A, 2_000, 2_100);
@@ -435,6 +435,7 @@ fn a_partial_tortoise_commit_keeps_the_uncommitted_part_of_the_commit() {
     let rep = done(&fx);
 
     assert!(rep.rewritten.is_empty(), "{:?}", rep.rewritten);
+    assert_eq!(rep.not_rewritten, vec![(c, vec![A.to_string()])]);
     assert_eq!(show(&fx, "HEAD:Code/A.cs"), "mine\n2\n3\n4\n5\n6\n7\nfinal");
 }
 
@@ -484,6 +485,116 @@ fn two_commits_on_a_file_merged_and_committed_whole_in_tortoise_are_both_superse
 }
 
 #[test]
+fn a_later_commit_is_not_superseded_on_a_path_an_earlier_commit_kept() {
+    // 独立 review 第 1 条：C1 加了调试行 B，C2 删掉 B、加了 D，TortoiseSVN 提交的是只有 D 的最终版。
+    // C1 单独看不通过（B 不在 SVN 上），照常重放；C2 单独看等于 SVN 版本，换掉的话它删 B 的改动就没了，
+    // 分支上又出现 B。前面的 commit 没通过的路径，后面的也不换
+    let fx = hybrid_with_colleague();
+    seed_lines(&fx, A);
+    write(&fx, A, "1\n2\nB\n3\n4\n5\n6\n7\n8\n");
+    let c1 = commit_all(&fx, "加调试行");
+    write(&fx, A, "1\n2\n3\n4\n5\n6\n7\nD\n");
+    let c2 = commit_all(&fx, "删调试行、加 D");
+    mark_at(&fx, 1_000);
+    hook_commit(&fx, A, 2_000, 2_100);
+    let _h = healthy();
+
+    let rep = done(&fx);
+
+    assert!(rep.rewritten.is_empty(), "{:?}", rep.rewritten);
+    assert_eq!(
+        rep.not_rewritten,
+        vec![(c1, vec![A.to_string()]), (c2, vec![A.to_string()])]
+    );
+    assert_eq!(show(&fx, "HEAD:Code/A.cs"), "1\n2\n3\n4\n5\n6\n7\nD");
+}
+
+#[test]
+fn a_large_binary_committed_whole_in_tortoise_is_still_superseded() {
+    // 独立 review 第 2 条：超过 8 MB 的二进制（贴图、模型）只能整个提交，照旧换成 SVN 版本
+    let fx = hybrid_with_colleague();
+    set_me(&fx, "somebody-else");
+    let big = "Code/Big.cs";
+    let blob = |tag: u8| {
+        let mut v = vec![0u8; 9 << 20];
+        v[0] = tag;
+        v
+    };
+    std::fs::write(fx.wc().join(big), blob(1)).unwrap();
+    svn_cmd(&fx.wc(), &["add", "--non-interactive", "--", big]);
+    tortoise_commit(&fx, big);
+    svn_cmd(&fx.wc(), &["update", "--non-interactive"]);
+    let _h = healthy();
+    done(&fx);
+    std::fs::write(fx.wc().join(big), blob(2)).unwrap();
+    let c = commit_all(&fx, "中间版本");
+    std::fs::write(fx.wc().join(big), blob(3)).unwrap();
+    mark_at(&fx, 1_000);
+    hook_commit(&fx, big, 2_000, 2_100);
+
+    let rep = done(&fx);
+
+    assert_eq!(rep.rewritten, vec![(c, vec![big.to_string()])]);
+    assert!(rep.not_rewritten.is_empty(), "{:?}", rep.not_rewritten);
+}
+
+#[test]
+fn the_check_falls_back_to_git_when_in_process_reads_are_refused() {
+    // 独立 review 第 3 条：有 replace ref 时进程内读一律交回 git 命令。核对也要退回 ls-tree，
+    // 不能因此把 F2 ① 整个关掉
+    let fx = hybrid_with_colleague();
+    set_me(&fx, "somebody-else");
+    let tree = git(&fx, &["write-tree"]);
+    let x = git(&fx, &["commit-tree", &tree, "-m", "x"]);
+    let y = git(&fx, &["commit-tree", &tree, "-m", "y"]);
+    git(&fx, &["replace", &x, &y]);
+    write(&fx, A, "a2\n");
+    let c = commit_all(&fx, "中间版本");
+    write(&fx, A, "a3\n");
+    mark_at(&fx, 1_000);
+    hook_commit(&fx, A, 2_000, 2_100);
+    let _h = healthy();
+
+    let rep = done(&fx);
+
+    assert_eq!(rep.rewritten, vec![(c, vec![A.to_string()])]);
+    assert_eq!(show(&fx, "HEAD:Code/A.cs"), "a3");
+}
+
+#[test]
+fn a_utf16_text_file_is_not_superseded_without_a_line_check() {
+    // 独立 review 第 5 条：UTF-16 文本按字节有 NUL，按二进制放行的话，只提交了一部分时没提交的那部分
+    // 照样被换掉。带 BOM 的按「核对不了」处理，不换
+    let fx = hybrid_with_colleague();
+    let wide = "Code/Strings.cs";
+    let utf16 = |s: &str| {
+        let mut v = vec![0xFF, 0xFE];
+        v.extend(s.encode_utf16().flat_map(u16::to_le_bytes));
+        v
+    };
+    std::fs::write(fx.wc().join(wide), utf16("1\n2\n3\n4\n5\n6\n7\n8\n")).unwrap();
+    svn_cmd(&fx.wc(), &["add", "--non-interactive", "--", wide]);
+    tortoise_commit(&fx, wide);
+    svn_cmd(&fx.wc(), &["update", "--non-interactive"]);
+    let _h = healthy();
+    done(&fx);
+    std::fs::write(fx.wc().join(wide), utf16("mine\n2\n3\n4\n5\n6\n7\nfinal\n")).unwrap();
+    let c = commit_all(&fx, "改了两处");
+    std::fs::write(fx.wc().join(wide), utf16("1\n2\n3\n4\n5\n6\n7\nfinal\n")).unwrap();
+    mark_at(&fx, 1_000);
+    hook_commit(&fx, wide, 2_000, 2_100);
+
+    // 不换就照常重放：git 把它当二进制，两边都改了，冲突交给冲突框
+    match follow(&fx.wc_str(), "op1").unwrap() {
+        FollowOutcome::NeedsManual { at, files, .. } => {
+            assert_eq!(at, c);
+            assert_eq!(files, vec![wide.to_string()]);
+        }
+        other => panic!("应当 NeedsManual，不能整个换成 SVN 版本：{other:?}"),
+    }
+}
+
+#[test]
 fn a_line_moved_before_the_tortoise_commit_is_no_longer_superseded() {
     // W14：commit 在第 2 行后加了 foo，TortoiseSVN 提交前挪到了第 6 行后。三方合并干净、结果里 foo 有
     // 两份，与 SVN 版本不同：和「只提交了一部分」分不开，按会丢改动处理，不换（计划 Task 2 的取舍）。
@@ -491,7 +602,7 @@ fn a_line_moved_before_the_tortoise_commit_is_no_longer_superseded() {
     let fx = hybrid_with_colleague();
     seed_lines(&fx, A);
     write(&fx, A, "1\n2\nfoo\n3\n4\n5\n6\n7\n8\n");
-    commit_all(&fx, "加 foo");
+    let c = commit_all(&fx, "加 foo");
     write(&fx, A, "1\n2\n3\n4\n5\n6\nfoo\n7\n8\n");
     mark_at(&fx, 1_000);
     hook_commit(&fx, A, 2_000, 2_100);
@@ -500,6 +611,8 @@ fn a_line_moved_before_the_tortoise_commit_is_no_longer_superseded() {
     let rep = done(&fx);
 
     assert!(rep.rewritten.is_empty(), "{:?}", rep.rewritten);
+    // 独立 review 第 4 条：报告里说明为什么没换，用户看到 drift 时知道原因
+    assert_eq!(rep.not_rewritten, vec![(c, vec![A.to_string()])]);
     assert_eq!(rep.drift, vec![A.to_string()]);
     assert_eq!(rep.overlap.len(), 1);
     assert!(!rep.overlap[0].matches_disk);

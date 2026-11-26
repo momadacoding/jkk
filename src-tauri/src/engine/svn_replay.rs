@@ -430,12 +430,7 @@ fn ls_entries(
     c: &ReplayCommit,
     codes: &ReplayCodes,
 ) -> Result<BTreeMap<String, (String, String)>> {
-    let list: Vec<String> = paths.iter().cloned().collect();
-    let found = crate::engine::git_read::or_cli(
-        "列出提交里几条路径的条目",
-        || crate::engine::git_read::tree_entries(repo, rev, &list),
-        || ls_entries_by_cli(repo, rev, paths, codes),
-    )?;
+    let found = entries_at(repo, rev, paths, codes)?;
     if let Some(dir) = found
         .iter()
         .find_map(|(p, (mode, _))| (mode == "040000").then_some(p))
@@ -443,6 +438,22 @@ fn ls_entries(
         return Err(not_a_file(c, dir, codes));
     }
     Ok(found)
+}
+
+/// `rev` 的树里 `paths` 各自的 (mode, oid)，不存在的不出现。先在进程内读，读不了（路径写法 ls-tree
+/// 另有解释、replace ref 之类）交回 ls-tree。目录不拒绝，mode 给 `040000`。
+pub fn entries_at(
+    repo: &str,
+    rev: &str,
+    paths: &BTreeSet<String>,
+    codes: &ReplayCodes,
+) -> Result<BTreeMap<String, (String, String)>> {
+    let list: Vec<String> = paths.iter().cloned().collect();
+    crate::engine::git_read::or_cli(
+        "列出提交里几条路径的条目",
+        || crate::engine::git_read::tree_entries(repo, rev, &list),
+        || ls_entries_by_cli(repo, rev, paths, codes),
+    )
 }
 
 /// [`ls_entries`] 原来的 git 命令。目录照样放进结果（mode `040000`），由调用方拒绝。

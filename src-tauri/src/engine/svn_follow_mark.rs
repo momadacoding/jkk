@@ -77,7 +77,7 @@ pub fn mark_path(repo: &str) -> PathBuf {
 ///
 /// `diff-index --cached` 只比索引与树，不扫工作区，也不写索引，失焦时跑得起。
 pub fn write_mark(repo: &str) -> Result<()> {
-    write_mark_with(repo, true)
+    write_mark_with(repo, true).map(|_| ())
 }
 
 /// 跟进收尾时记的快照：HEAD 与基线照记，暂存记空（2026-11-26 使用报告第 6.1 节做法甲）。
@@ -93,19 +93,21 @@ pub fn write_mark(repo: &str) -> Result<()> {
 ///
 /// 暂存不记：跟进期间别处暂存的内容可能晚于同一段时间里的提交。记空等于「快照里没有暂存」，暂存
 /// 一律走三方合并，与没有快照时相同。下一次判定一致时的失焦会写一份完整的快照替换它。
-pub fn write_commit_mark(repo: &str) -> Result<()> {
+///
+/// 返回是否写了（HEAD 解析不出来、这里没有 `.git` 时不写）。
+pub fn write_commit_mark(repo: &str) -> Result<bool> {
     write_mark_with(repo, false)
 }
 
-/// `with_staged` 为 false 时是收尾快照（[`write_commit_mark`]）。
-fn write_mark_with(repo: &str, with_staged: bool) -> Result<()> {
+/// `with_staged` 为 false 时是收尾快照（[`write_commit_mark`]）。返回是否写了。
+fn write_mark_with(repo: &str, with_staged: bool) -> Result<bool> {
     // git 会往上找外层仓库，HEAD 解析得出来不代表这里有 `.git`。这时往下建目录会凭空造出
     // 一个 `.git`，§6.1 随后把目录认成 SvnSuspicious（与 `hold_for_baseline_move` 同一理由）
     if !Path::new(repo).join(".git").is_dir() {
-        return Ok(());
+        return Ok(false);
     }
     let Some(head_oid) = git_read::resolve(repo, "HEAD^{commit}")? else {
-        return Ok(());
+        return Ok(false);
     };
     // 在 HEAD 之后读：两次读之间基线前进时，这里偏新，只会把「快照之后」算小，走向拿不准
     let base_oid = git_read::resolve(repo, &format!("refs/heads/{BASELINE_BRANCH}^{{commit}}"))?;
@@ -141,7 +143,8 @@ fn write_mark_with(repo: &str, with_staged: bool) -> Result<()> {
         staged,
         after_follow: !with_staged,
     };
-    store(&mark_path(repo), &mark)
+    store(&mark_path(repo), &mark)?;
+    Ok(true)
 }
 
 /// 解析 `diff-index -z --no-renames`：`:<mode> <mode> <oid> <oid> <status>\0<path>\0` 重复。
@@ -217,11 +220,16 @@ pub fn read_mark(repo: &str) -> Result<Option<FollowMark>> {
     }
 }
 
-/// 跟进收尾：换成 [`write_commit_mark`]。写不了就照旧删掉，收尾不因快照失败（快照只是线索）。
+/// 跟进收尾：换成 [`write_commit_mark`]。没写成（出错、或者条件不满足没写）就照旧删掉，旧快照不能
+/// 留到跟进之后；收尾也不因快照失败（快照只是线索）。
 pub fn renew_mark_after_follow(repo: &str) {
-    if let Err(e) = write_commit_mark(repo) {
-        log::warn!("跟进收尾时记快照失败，按没有快照处理：{}", e.message);
-        clear_mark(repo);
+    match write_commit_mark(repo) {
+        Ok(true) => {}
+        Ok(false) => clear_mark(repo),
+        Err(e) => {
+            log::warn!("跟进收尾时记快照失败，按没有快照处理：{}", e.message);
+            clear_mark(repo);
+        }
     }
 }
 

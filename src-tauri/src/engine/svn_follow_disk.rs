@@ -25,7 +25,7 @@
 
 use crate::engine::git_cli::{run_git, run_git_bytes, run_git_code_bytes, run_git_stdin};
 use crate::engine::git_read;
-use crate::engine::svn_replay::{ConflictStage, Resolution};
+use crate::engine::svn_replay::{entries_at, ConflictStage, ReplayCodes, Resolution};
 use crate::error::{GitError, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -277,8 +277,20 @@ fn remerge(repo: &str, ours: &str, base: &str, theirs: &str) -> Result<Remerged>
     }
 }
 
+/// [`supersede_safe`] 的结论。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SupersedeCheck {
+    /// 可以换的路径。提交没改过的也在里面：换不换一样，留着给后面的提交继承。
+    pub safe: BTreeSet<String>,
+    /// 提交改过、却不换的路径：核对没通过、核对不了，或者更早的提交在这条路径上已经没通过。
+    pub refused: BTreeSet<String>,
+}
+
+/// 判二进制只看开头这么多字节（与 git 的 `buffer_is_binary` 相同）。
+const BINARY_PROBE: usize = 8000;
+
 /// F2 ①（自己更晚用 TortoiseSVN 提交过的路径取 SVN 版本）换之前的核对（2026-11-26 使用报告第 6.2 节，
-/// 计划 `2026-11-27-follow-mark-gap-and-supersede-check.md` Task 2）。返回 `paths` 里可以换的那些。
+/// 计划 `2026-11-27-follow-mark-gap-and-supersede-check.md` Task 2）。
 ///
 /// 换掉的是提交 `commit` 对这个文件的改动：重放时它等于没改过，文件取新基线的版本。只有改动已经
 /// 全在 SVN 版本里时这才不丢东西。以 `parent` 的版本为合并基础、新基线的版本为 ours、`commit` 的
@@ -290,53 +302,81 @@ fn remerge(repo: &str, ours: &str, base: &str, theirs: &str) -> Result<Remerged>
 ///
 /// 不通过就不换，`commit` 照常重放：干净就保留改动，冲突就进冲突框，都不会静默丢。
 ///
-/// 直接放行的几种：`commit` 没改这个文件（换不换一样）、两边已经相同、有一边删了文件或不是普通
-/// 文件（整个文件的操作，不存在只提交一部分）、二进制（TortoiseSVN 只能整个提交）。超过 8 MB 的
-/// 文本不核对，不换。
+/// `blocked`：更早的提交在这些路径上没通过、照常重放了。这个提交也不能换：前面的改动重放上去之后，
+/// 再把这个提交的改动（比如删掉前面加的一行）换掉，等于把用户删掉的内容又带回来（独立 review 第 1 条）。
+///
+/// 直接放行的几种：两边已经相同、有一边删了文件或不是普通文件（整个文件的操作，不存在只提交一部分）、
+/// 二进制（TortoiseSVN 只能整个提交）。不放行：带 UTF-16 / UTF-32 BOM 的文本（字节里有 NUL，逐行核对
+/// 不了，又不是二进制）、超过 8 MB 的文本、核对时出错。
 pub fn supersede_safe(
     repo: &str,
     commit: &str,
     parent: &str,
     new_base: &str,
     paths: &BTreeSet<String>,
-) -> Result<BTreeSet<String>> {
-    let list: Vec<String> = paths.iter().cloned().collect();
-    let in_c = git_read::tree_entries(repo, commit, &list)?;
-    let in_p = git_read::tree_entries(repo, parent, &list)?;
-    let in_n = git_read::tree_entries(repo, new_base, &list)?;
+    blocked: &BTreeSet<String>,
+    codes: &ReplayCodes,
+) -> Result<SupersedeCheck> {
+    let in_c = entries_at(repo, commit, paths, codes)?;
+    let in_p = entries_at(repo, parent, paths, codes)?;
+    let in_n = entries_at(repo, new_base, paths, codes)?;
     let regular = |e: &(String, String)| e.0 == "100644" || e.0 == "100755";
     let mut empty_blob: Option<String> = None;
-    let mut out = BTreeSet::new();
+    let mut out = SupersedeCheck::default();
     for p in paths {
         let (c, par, n) = (in_c.get(p), in_p.get(p), in_n.get(p));
-        let (Some(c), Some(n)) = (c.filter(|_| c != par), n) else {
-            out.insert(p.clone());
+        // 先看 blocked：这个提交没改它时也不能放回 `safe`，否则之后的提交又能换它了
+        if blocked.contains(p) {
+            if c != par {
+                out.refused.insert(p.clone());
+            }
+            continue;
+        }
+        if c == par {
+            out.safe.insert(p.clone());
+            continue;
+        }
+        let (Some(c), Some(n)) = (c, n) else {
+            out.safe.insert(p.clone());
             continue;
         };
         if c.1 == n.1 || !regular(c) || !regular(n) || par.is_some_and(|e| !regular(e)) {
-            out.insert(p.clone());
+            out.safe.insert(p.clone());
             continue;
         }
-        let base = match par {
-            Some(e) => e.1.clone(),
-            None => match &empty_blob {
-                Some(b) => b.clone(),
-                None => {
-                    let b = run_git_stdin(repo, &["hash-object", "-w", "--stdin"], b"")?
-                        .trim()
-                        .to_string();
-                    empty_blob = Some(b.clone());
-                    b
-                }
-            },
-        };
-        if supersede_ok(repo, &n.1, &base, &c.1)? {
-            out.insert(p.clone());
-        } else {
-            log::info!(
-                "F2 ①：{} 对 {p} 的改动不全在 SVN 版本里，不换，照常重放",
-                crate::engine::svn_util::short(commit)
-            );
+        let verdict = (|| {
+            let base = match par {
+                Some(e) => e.1.clone(),
+                None => match &empty_blob {
+                    Some(b) => b.clone(),
+                    None => {
+                        let b = run_git_stdin(repo, &["hash-object", "-w", "--stdin"], b"")?
+                            .trim()
+                            .to_string();
+                        empty_blob = Some(b.clone());
+                        b
+                    }
+                },
+            };
+            supersede_ok(repo, &n.1, &base, &c.1)
+        })();
+        let short = crate::engine::svn_util::short(commit);
+        match verdict {
+            Ok(true) => {
+                out.safe.insert(p.clone());
+            }
+            Ok(false) => {
+                log::info!("F2 ①：{short} 对 {p} 的改动不全在 SVN 版本里，不换，照常重放");
+                out.refused.insert(p.clone());
+            }
+            // 一个文件核对不了，不连累别的文件
+            Err(e) => {
+                log::warn!(
+                    "F2 ①：核对 {short} 对 {p} 的改动时出错，不换：{}",
+                    e.message
+                );
+                out.refused.insert(p.clone());
+            }
         }
     }
     Ok(out)
@@ -344,29 +384,32 @@ pub fn supersede_safe(
 
 /// [`supersede_safe`] 的一个文件：`svn` 是新基线的 blob，`base` / `mine` 是提交前后的 blob。
 fn supersede_ok(repo: &str, svn: &str, base: &str, mine: &str) -> Result<bool> {
-    let sizes = run_git_stdin(
-        repo,
-        &["cat-file", "--batch-check=%(objectsize)"],
-        format!("{svn}\n{base}\n{mine}\n").as_bytes(),
-    )?;
-    let too_big = sizes
-        .lines()
-        .any(|l| l.trim().parse::<u64>().map_or(true, |n| n > MAX_BYTES));
-    if too_big {
+    let heads = [svn, base, mine]
+        .iter()
+        .map(|oid| git_read::blob_head(repo, oid, BINARY_PROBE))
+        .collect::<Result<Vec<_>>>()?;
+    if heads.iter().any(|(_, h)| wide_bom(h)) {
         return Ok(false);
     }
-    let read = |oid: &str| run_git_bytes(repo, &["cat-file", "blob", oid]);
-    let svn_bytes = read(svn)?;
-    if [&svn_bytes, &read(base)?, &read(mine)?]
-        .iter()
-        .any(|b| b.contains(&0))
-    {
+    // 先判二进制再看大小：大的二进制（贴图、模型）照样只能整个提交
+    if heads.iter().any(|(_, h)| h.contains(&0)) {
         return Ok(true);
     }
+    if heads.iter().any(|(n, _)| *n > MAX_BYTES) {
+        return Ok(false);
+    }
+    let svn_bytes = run_git_bytes(repo, &["cat-file", "blob", svn])?;
     Ok(match remerge(repo, svn, base, mine)? {
         Remerged::Clean(merged) => merged == svn_bytes,
         Remerged::Conflict(t) => t.outside_matches(&svn_bytes) == Some(true),
     })
+}
+
+/// UTF-16 / UTF-32 的 BOM（`FF FE` 同时盖住 UTF-32 LE）。这类文本按字节有 NUL，git 当成二进制。
+fn wide_bom(head: &[u8]) -> bool {
+    head.starts_with(&[0xFF, 0xFE])
+        || head.starts_with(&[0xFE, 0xFF])
+        || head.starts_with(&[0x00, 0x00, 0xFE, 0xFF])
 }
 
 /// 一行（不含行尾）是不是 `open` / `close` 标记行。

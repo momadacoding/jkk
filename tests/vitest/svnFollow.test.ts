@@ -543,6 +543,21 @@ describe('describeFollowReport', () => {
     expect(describeFollowReport(r).tone).toBe('ok')
   })
 
+  it('计划 2026-11-27：F2 ① 核对没通过、照常重放的路径单独成节，说明为什么没换', () => {
+    const r: FollowReport = { ...report, notRewritten: [['g'.repeat(40), ['Code/A.cs']]] }
+    const s = section(r, 'notRewritten')!
+    expect(s.level).toBe('attention')
+    expect(s.groups[0].label).toContain('g'.repeat(10))
+    expect(texts(s.groups[0].items)).toEqual(['Code/A.cs'])
+    expect(s.note).toContain('只提交了一部分')
+    // 分支里留着 SVN 上没有的改动，要用户看一眼
+    expect(describeFollowReport(r).tone).toBe('attention')
+  })
+
+  it('旧后端没有 notRewritten 时不成节', () => {
+    expect(section(report, 'notRewritten')).toBeUndefined()
+  })
+
   it('6.10：快照进来的 SVN 内容单独成节，要用户看一眼', () => {
     const r: FollowReport = { ...report, snapshot: [['f'.repeat(40), ['Code/B.cs']]] }
     const s = section(r, 'snapshot')!
