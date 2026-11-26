@@ -6,6 +6,9 @@ import { computePaths, filterPathsToBand, laneColor } from '../engine/paths'
 import { createSvgRenderer } from '../engine/svgRenderer'
 import { WORKDIR_ID, withWorkdirRow } from '../engine/workdir'
 import { findDelivered } from '../engine/svnGraph'
+import {
+  buildSearchIndex, findMatches, inputSearchKey, matchPosition, parseSearch, stepMatch, windowSearchKey,
+} from '../engine/commitSearch'
 import { CommitRow } from './CommitRow'
 import { ContextMenu, useContextMenu } from './ContextMenu'
 import { anyDialogOpen, isShown } from './useFocusTrap'
@@ -21,6 +24,8 @@ import type { Capabilities } from '../engine/capabilities'
 const ROW_HEIGHT = 28
 const LANE_WIDTH = 20
 const OVERSCAN = 5
+/** 输入停下这么久才跳到命中：每跳一次都会去读那条提交的 diff，逐键跳是白读。 */
+const SEARCH_JUMP_DELAY = 150
 /** 浏览器拿来滚动容器的键（↑ / ↓ 归键盘导航换选中，不在这里）。 */
 const SCROLL_KEYS = new Set(['PageUp', 'PageDown', 'Home', 'End', ' '])
 
@@ -55,18 +60,74 @@ interface GraphViewProps {
   onLoadMoreSvn?: () => void
   /** 已经拉到 r1 了，按钮禁用。 */
   svnLogComplete?: boolean
+  /**
+   * 搜索框里的原文。由上层保管：切到 Local Changes / 文件历史时 GraphView 会被卸载，
+   * 放在组件里的话回来就没了（独立 review 第 3 条）。
+   */
+  searchQuery: string
+  onSearchQueryChange: (query: string) => void
 }
 
 const renderer = createSvgRenderer()
 
 export function GraphView({
   commits, refs, pullRequests, selectedId, revealSeq, onSelect, headHash, changeCount, onOpenChanges, onCommitAction,
-  capabilities, onLoadMoreSvn, svnLogComplete,
+  capabilities, onLoadMoreSvn, svnLogComplete, searchQuery, onSearchQueryChange,
 }: GraphViewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const { menu, open, close } = useContextMenu()
   const [scrollTop, setScrollTop] = useState(0)
   const [viewportHeight, setViewportHeight] = useState(600)
+  const searchInputRef = useRef<HTMLInputElement>(null)
+  // 跳到的命中就是当前选中的那条时 selectedId 不变，定位 effect 不重跑；
+  // 用户滚走之后再按回车也得把它滚回来，和侧边栏的 `revealSeq` 同理
+  const [searchRevealSeq, setSearchRevealSeq] = useState(0)
+
+  // 按词而不是按原文记：只多打了空格、只改了大小写时词没变，下面的自动跳转不该再跑一遍、
+  // 把用户滚走的画面拽回去（独立 review 第 4 条）。词里不含空白，用换行拼接不会混淆
+  const termsKey = parseSearch(searchQuery).join('\n')
+  const terms = useMemo(() => (termsKey ? termsKey.split('\n') : []), [termsKey])
+  const searching = terms.length > 0
+  // 索引只在搜着的时候建：没人搜的话每次刷新图都白建一遍 5000 条
+  const searchIndex = useMemo(
+    () => (searching ? buildSearchIndex(commits, refs) : []),
+    [searching, commits, refs],
+  )
+  const matches = useMemo(() => findMatches(searchIndex, terms), [searchIndex, terms])
+  const matchIds = useMemo(() => new Set(matches.map((i) => commits[i].id)), [matches, commits])
+  // 选中的可能是收进 svn 节点、不在图上的本地提交：按收着它的节点算位置
+  const selectedRow = useMemo(() => {
+    if (!selectedId) return -1
+    const targetId = findDelivered(commits, selectedId)?.owner.id ?? selectedId
+    return commits.findIndex((c) => c.id === targetId)
+  }, [commits, selectedId])
+
+  const jumpToMatch = useCallback((dir: 1 | -1, inclusive: boolean) => {
+    const idx = stepMatch(matches, selectedRow, dir, inclusive)
+    if (idx === null) return
+    // 换了选中，定位 effect 会跟着 selectedId 跑。已经选着它就不再 onSelect（重新选同一条
+    // 会白读一遍 diff），只发一次定位请求。两样都做的话，store 晚一拍更新 selectedId 时
+    // 定位会先对着旧选中跑一遍，画面先跳到旧的那条再跳过来
+    if (idx !== selectedRow) onSelect(commits[idx].id)
+    else setSearchRevealSeq((n) => n + 1)
+  }, [matches, selectedRow, onSelect, commits])
+
+  // 输入停下后跳到当前选中处及之后的第一个命中。只跟着输入走：图刷新、选中变了都不该
+  // 再把选中拽回命中上，所以函数从 ref 里取最新的。
+  //
+  // 挂载时不跳：搜索词由 RepoTab 保管，切到 Local Changes 再回来 GraphView 会重新挂载，
+  // 这时词没变，用户在别处选的提交不该被拽走。用「上次跳转时的词」判断而不是「是不是首次运行」：
+  // StrictMode 下挂载时 effect 会跑两遍，后者第二遍就会跳
+  const jumpRef = useRef(jumpToMatch)
+  jumpRef.current = jumpToMatch
+  const lastJumpKey = useRef(termsKey)
+  useEffect(() => {
+    if (termsKey === lastJumpKey.current) return
+    lastJumpKey.current = termsKey
+    if (!termsKey) return
+    const timer = setTimeout(() => jumpRef.current(1, true), SEARCH_JUMP_DELAY)
+    return () => clearTimeout(timer)
+  }, [termsKey])
 
   // 索引建一次，供视口内每一行的每个标签查。虚拟滚动下几十行同时在场，
   // 每行都遍历一遍 PR 列表是白费力气
@@ -162,7 +223,10 @@ export function GraphView({
   // 「用户动了」按输入事件认（`stopFollowing`），不按 scroll 事件里的 scrollTop 认：
   // 程序赋值也发 scroll 事件，而且事件晚一帧才到、浏览器还会因内容变短而夹紧 scrollTop、
   // 高 DPI 下读回的值带小数，拿数值比哪一种都会认错（独立 review 第二轮第 1–3 条）。
-  const requestRef = useRef<{ selectedId: string; revealSeq: number } | null>(null)
+  //
+  // 搜索框里按 Enter、命中正好就是当前选中时，选中不变，只推进 `searchRevealSeq`：它和
+  // `revealSeq` 一样算一次新的定位请求，否则用户滚走之后按 Enter 滚不回来。
+  const requestRef = useRef<{ selectedId: string; revealSeq: number; searchRevealSeq: number } | null>(null)
   const followRef = useRef(false)
   useEffect(() => {
     const el = containerRef.current
@@ -173,8 +237,11 @@ export function GraphView({
       return
     }
     const req = requestRef.current
-    if (!req || req.selectedId !== selectedId || req.revealSeq !== revealSeq) {
-      requestRef.current = { selectedId, revealSeq }
+    if (
+      !req || req.selectedId !== selectedId || req.revealSeq !== revealSeq
+      || req.searchRevealSeq !== searchRevealSeq
+    ) {
+      requestRef.current = { selectedId, revealSeq, searchRevealSeq }
       followRef.current = true
     }
     if (!followRef.current || el.clientHeight === 0) return
@@ -189,7 +256,7 @@ export function GraphView({
     el.scrollTop = Math.max(0, rowTop - el.clientHeight / 2 + ROW_HEIGHT / 2)
     // scroll 事件要晚一帧才到；这之前 ResizeObserver 先跑的话会按旧值把这次定位滚回去
     scrollTopRef.current = el.scrollTop
-  }, [selectedId, revealSeq, commits, headHash, shownSeq, viewportHeight])
+  }, [selectedId, revealSeq, searchRevealSeq, commits, headHash, shownSeq, viewportHeight])
 
   // 滚轮、在图上按下鼠标（含拖滚动条）算用户接管。单击别的行或 ↑ / ↓ 换了选中，
   // 会紧接着产生新的定位请求、重新开始跟随，不受影响。
@@ -261,6 +328,51 @@ export function GraphView({
     return () => window.removeEventListener('keydown', handler)
   }, [commits, selectedId, onSelect, menu])
 
+  // Ctrl+F 聚焦搜索框，F3 / Shift+F3 在命中间跳。所有标签都挂载着，只认看得见的这个 graph；
+  // 弹框、右键菜单开着时让路，理由同上面的方向键
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (menu || anyDialogOpen() || !isShown(containerRef.current)) return
+      const action = windowSearchKey(e, searching)
+      if (action === 'focus') {
+        // 焦点在别的输入框（侧边栏新建分支之类）里时不抢：人家正在打字（独立 review 第 5 条）。
+        // 已经在搜索框里时照常处理，再按一次是全选、方便重输
+        if (isEditable(e.target) && e.target !== searchInputRef.current) return
+        e.preventDefault()
+        searchInputRef.current?.focus()
+        searchInputRef.current?.select()
+      } else if (action) {
+        e.preventDefault()
+        jumpToMatch(action === 'prev' ? -1 : 1, false)
+      }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [menu, searching, jumpToMatch])
+
+  const onSearchKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    // isComposing 只在 nativeEvent 上，React 的合成事件没有透出来（同 LocalChangesView）
+    const action = inputSearchKey({
+      key: e.key,
+      ctrlKey: e.ctrlKey,
+      metaKey: e.metaKey,
+      shiftKey: e.shiftKey,
+      altKey: e.altKey,
+      repeat: e.repeat,
+      isComposing: e.nativeEvent.isComposing,
+    })
+    if (action === 'next' || action === 'prev') {
+      e.preventDefault()
+      jumpToMatch(action === 'prev' ? -1 : 1, false)
+    } else if (action === 'escape') {
+      // 第一下清空，第二下把焦点还给图，方向键才回到换选中
+      if (searchQuery) onSearchQueryChange('')
+      else e.currentTarget.blur()
+    }
+  }
+
+  const position = matchPosition(matches, selectedRow)
+
   const totalHeight = layout.rows.length * ROW_HEIGHT
   const layoutWidth = layout.laneCount * LANE_WIDTH
   const refByHash = useMemo(() => {
@@ -272,53 +384,111 @@ export function GraphView({
   }, [refs])
 
   return (
-    <div
-      ref={containerRef}
-      className="graph-view"
-      onScroll={handleScroll}
-      onWheel={stopFollowing}
-      onPointerDown={stopFollowing}
-      onClick={handleClick}
-      onContextMenu={handleContextMenu}
-      style={{ overflow: 'auto', height: '100%' }}
-    >
-      <div style={{ position: 'relative', height: totalHeight, minWidth: layoutWidth + 300 }}>
-        <div style={{ position: 'absolute', top: bandTop, left: 0, zIndex: 1 }}>
-          {svg}
-        </div>
-        <div style={{ position: 'absolute', top: bandTop, left: 0, right: 0, zIndex: 2 }}>
-          {visibleRows.map((node) => (
-            <CommitRow
-              key={node.commit.id}
-              node={node}
-              refs={refByHash[node.commit.id] ?? []}
-              prByBranch={prByBranch}
-              prsByHead={prsByHead}
-              selected={selectedId === node.commit.id}
-              layoutWidth={layoutWidth}
-              laneColor={laneColor(node.lane)}
-              changeCount={changeCount}
-              isHead={node.commit.id === headHash}
-            />
-          ))}
-        </div>
+    <div className="graph-pane">
+      {/* 常驻而不是按 Ctrl+F 才弹出：没人知道有快捷键的话，这个功能等于不存在 */}
+      <div className="graph-search" role="search">
+        <input
+          ref={searchInputRef}
+          className="graph-search-input"
+          value={searchQuery}
+          onChange={(e) => onSearchQueryChange(e.target.value)}
+          onKeyDown={onSearchKeyDown}
+          placeholder="搜索提交：标题、作者、hash、分支名（Ctrl+F）"
+          title={
+            `只搜图上已加载的 ${commits.length} 条提交，且只看标题，正文搜不到。\n`
+            + '多个词用空格隔开，要全部命中同一条。hash 至少输 4 位。\n'
+            + 'Enter / F3 下一个，Shift+Enter / Shift+F3 上一个，Esc 清空。'
+          }
+          aria-label="搜索提交"
+          spellCheck={false}
+        />
+        {searching && (
+          <>
+            <span
+              className={matches.length === 0 ? 'graph-search-count none' : 'graph-search-count'}
+              aria-live="polite"
+            >
+              {matches.length === 0 ? '无匹配' : `${position || '-'} / ${matches.length}`}
+            </span>
+            <button
+              className="graph-search-btn"
+              disabled={matches.length === 0}
+              onClick={() => jumpToMatch(-1, false)}
+              title="上一个（Shift+Enter）"
+              aria-label="上一个"
+            >
+              ↑
+            </button>
+            <button
+              className="graph-search-btn"
+              disabled={matches.length === 0}
+              onClick={() => jumpToMatch(1, false)}
+              title="下一个（Enter）"
+              aria-label="下一个"
+            >
+              ↓
+            </button>
+            <button
+              className="graph-search-btn"
+              onClick={() => { onSearchQueryChange(''); searchInputRef.current?.focus() }}
+              title="清空（Esc）"
+              aria-label="清空搜索"
+            >
+              ✕
+            </button>
+          </>
+        )}
       </div>
-      {onLoadMoreSvn && (
-        <div className="graph-load-more">
-          <button
-            disabled={svnLogComplete}
-            onClick={onLoadMoreSvn}
-            title={
-              svnLogComplete
-                ? '已经拉到 r1，没有更早的历史了'
-                : 'SVN 历史每次都走网络，所以按需加载（spec §10.1）'
-            }
-          >
-            {svnLogComplete ? '已到最早的 revision' : '加载更多 SVN 历史'}
-          </button>
+      <div
+        ref={containerRef}
+        className="graph-view"
+        onScroll={handleScroll}
+        onWheel={stopFollowing}
+        onPointerDown={stopFollowing}
+        onClick={handleClick}
+        onContextMenu={handleContextMenu}
+        style={{ overflow: 'auto', flex: 1, minHeight: 0 }}
+      >
+        <div style={{ position: 'relative', height: totalHeight, minWidth: layoutWidth + 300 }}>
+          <div style={{ position: 'absolute', top: bandTop, left: 0, zIndex: 1 }}>
+            {svg}
+          </div>
+          <div style={{ position: 'absolute', top: bandTop, left: 0, right: 0, zIndex: 2 }}>
+            {visibleRows.map((node) => (
+              <CommitRow
+                key={node.commit.id}
+                node={node}
+                refs={refByHash[node.commit.id] ?? []}
+                prByBranch={prByBranch}
+                prsByHead={prsByHead}
+                selected={selectedId === node.commit.id}
+                layoutWidth={layoutWidth}
+                laneColor={laneColor(node.lane)}
+                changeCount={changeCount}
+                isHead={node.commit.id === headHash}
+                // 工作区伪行不是提交，搜不到也不变暗
+                searchHit={searching && node.commit.id !== WORKDIR_ID ? matchIds.has(node.commit.id) : undefined}
+              />
+            ))}
+          </div>
         </div>
-      )}
-      <ContextMenu menu={menu} onClose={close} />
+        {onLoadMoreSvn && (
+          <div className="graph-load-more">
+            <button
+              disabled={svnLogComplete}
+              onClick={onLoadMoreSvn}
+              title={
+                svnLogComplete
+                  ? '已经拉到 r1，没有更早的历史了'
+                  : 'SVN 历史每次都走网络，所以按需加载（spec §10.1）'
+              }
+            >
+              {svnLogComplete ? '已到最早的 revision' : '加载更多 SVN 历史'}
+            </button>
+          </div>
+        )}
+        <ContextMenu menu={menu} onClose={close} />
+      </div>
     </div>
   )
 }
