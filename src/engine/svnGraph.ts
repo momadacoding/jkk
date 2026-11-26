@@ -132,13 +132,15 @@ export function spliceHistory(
   const delivered = deliveredCommits(gitCommits, deliveredTo, loaded, tips)
 
   // ① SVN 序列 → 链
+  const times = svnTimes(svnRevs)
   const svnNodes: CommitNode[] = svnRevs.map((r, i) => {
     const node: CommitNode = {
       id: svnId(r.rev),
       // 降序，所以「下一个更小的 revision」就是数组里的下一个
       parents: i + 1 < svnRevs.length ? [svnId(svnRevs[i + 1].rev)] : [],
       author: r.author,
-      time: toEpochSeconds(r.date),
+      time: times[i].time,
+      ...(times[i].unknown ? { timeUnknown: true } : {}),
       message: r.message,
       vcs: 'svn',
       svnRev: r.rev,
@@ -385,13 +387,47 @@ export function commitDiffScope(c: CommitNode | undefined): string | null {
 }
 
 /**
- * ISO8601 → 秒级时间戳，与 `CommitNode.time` 的单位一致。
+ * 每个 svn 节点排序用的时间（ISO8601 → 秒级时间戳，与 `CommitNode.time` 的单位一致）。SVN 没给时间的借相邻 revision 的，并标出来，显示时写「时间未知」。
  *
- * 解析不了时返回 0 而不是 `NaN`：`NaN` 传进 `new Date(NaN * 1000)` 会渲染成
- * `Invalid Date`，而 0 至少是一个能显示的时间。日期本身是展示用的，
- * 图的拓扑一点都不依赖它。
+ * # 为什么不能留 0
+ *
+ * 原来解析不了就给 0，注释说「日期只是展示用的，图的拓扑不依赖它」——拓扑确实不依赖，
+ * 但 `dateOrder` 的行序依赖。
+ * 没有读权限的 revision，`svn log` 只给 revision 号（2026-11-26 实测 r67823：没有 author、date、msg）。
+ * 时间是 0 就比所有提交都「旧」，`dateOrder` 会把 10-30 的分支提交排到这个 11-10 的 revision
+ * 上面，它下面的 revision 也要等它排出来才轮得到——主线被拦腰截断。
+ *
+ * # 借哪个
+ *
+ * 先往下找第一条有时间的（更早的 revision），没有再往上找。revision 号按时间递增，真实时间
+ * 夹在两个邻居之间，借哪边都只在这段间隙里可能排偏；数组里是跳号的（只有动过白名单的
+ * revision 和锚点），间隙可能有好几天，所以这是近似，不是精确。两边都找不到（整条都没时间）
+ * 就留 0。
  */
-function toEpochSeconds(iso: string): number {
-  const ms = Date.parse(iso)
-  return Number.isNaN(ms) ? 0 : Math.floor(ms / 1000)
+function svnTimes(svnRevs: SvnRevNode[]): { time: number; unknown: boolean }[] {
+  const parsed = svnRevs.map((r) => {
+    const ms = Date.parse(r.date)
+    return Number.isNaN(ms) ? null : Math.floor(ms / 1000)
+  })
+  // 两遍线性扫：每次刷新都跑，读不了大半个仓库的用户可能有成千条空记录，逐条往两边找是 O(n²)
+  const older: (number | null)[] = new Array(parsed.length).fill(null)
+  for (let i = parsed.length - 2; i >= 0; i--) older[i] = parsed[i + 1] ?? older[i + 1]
+  const out: { time: number; unknown: boolean }[] = []
+  let newer: number | null = null
+  for (let i = 0; i < parsed.length; i++) {
+    const t = parsed[i]
+    out.push(t !== null ? { time: t, unknown: false } : { time: older[i] ?? newer ?? 0, unknown: true })
+    if (t !== null) newer = t
+  }
+  return out
+}
+
+/** 提交图和详情里的时间文字。svn 节点时间未知时写「时间未知」，不显示借来排序的那个时间。 */
+export function commitDateText(c: CommitNode): string {
+  return c.timeUnknown ? '时间未知' : new Date(c.time * 1000).toLocaleString()
+}
+
+/** 作者文字。svn 节点没有作者（SVN 没返回）时写明，不留一块空白让人以为是匿名提交。 */
+export function commitAuthorText(c: CommitNode): string {
+  return c.author === '' && c.vcs === 'svn' ? 'SVN 未返回' : c.author
 }

@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
   baselineMap,
+  commitAuthorText,
+  commitDateText,
   commitDiffScope,
   deliveredNote,
   findDelivered,
@@ -771,5 +773,84 @@ describe('findDelivered', () => {
 
   it('选中它时按 oid 读 diff（只读，与 stash 同一条路）', () => {
     expect(selectionDiffScope(commits, 'c1')).toBe('commit:c1')
+  })
+})
+
+// 2026-11-26 报告第 6 节：SVN 对没有读权限的 revision 只给 revision 号（实测 r67823 的
+// `svn log --xml` 没有 author / date / msg），后端照原样把空字符串传过来。
+describe('spliceHistory：SVN 没返回时间的 revision', () => {
+  /** 后端 parse_log 对空 logentry 的产物：三个字段都是空字符串。 */
+  const hidden = (rev: number): SvnRevNode => ({ rev, author: '', date: '', message: '' })
+  const at = (rev: number, date: string): SvnRevNode => ({ rev, author: 'someone', date, message: `r${rev}` })
+  const ts = (iso: string) => Math.floor(Date.parse(iso) / 1000)
+
+  it('不再把更早的 git 提交顶到它上面', () => {
+    // 真实形状：r67826、r67822 是 11-10 的；分支上 10-30 的三个提交从 r65816 的基线分出来
+    const revs = [
+      at(67826, '2026-11-10T08:00:00Z'),
+      hidden(67823),
+      at(67822, '2026-11-10T07:00:00Z'),
+      at(65816, '2026-10-20T00:00:00Z'),
+    ]
+    const oct30 = ts('2026-10-30T00:00:00Z')
+    const commits = [
+      git('k3', ['k2'], { time: oct30 + 2 }),
+      git('k2', ['k1'], { time: oct30 + 1 }),
+      git('k1', ['b65816'], { time: oct30 }),
+      baseline('b65816', [], 65816),
+    ]
+    const out = spliceHistory(revs, commits, ['k3']).map((c) => c.id)
+    expect(out.indexOf('svn:67823')).toBe(out.indexOf('svn:67826') + 1)
+    expect(out.indexOf('svn:67822')).toBe(out.indexOf('svn:67823') + 1)
+    for (const k of ['k1', 'k2', 'k3']) expect(out.indexOf(k)).toBeGreaterThan(out.indexOf('svn:67822'))
+  })
+
+  it('排序借下一个更早 revision 的时间，并标明时间未知', () => {
+    const out = spliceHistory([at(12, '2026-11-10T08:00:00Z'), hidden(11), at(10, '2026-11-10T07:00:00Z')], [])
+    const node = out.find((c) => c.id === 'svn:11')!
+    expect(node.time).toBe(ts('2026-11-10T07:00:00Z'))
+    expect(node.timeUnknown).toBe(true)
+    expect(out.find((c) => c.id === 'svn:10')!.timeUnknown).toBeUndefined()
+  })
+
+  it('连着几条都没有时间：一直往下找到第一条有时间的', () => {
+    const out = spliceHistory(
+      [at(12, '2026-11-10T08:00:00Z'), hidden(11), hidden(10), at(9, '2026-11-09T00:00:00Z')],
+      [],
+    )
+    expect(out.find((c) => c.id === 'svn:11')!.time).toBe(ts('2026-11-09T00:00:00Z'))
+    expect(out.find((c) => c.id === 'svn:10')!.time).toBe(ts('2026-11-09T00:00:00Z'))
+  })
+
+  it('最老的一条没有时间：下面没得借，借上面那条', () => {
+    const out = spliceHistory([at(12, '2026-11-10T08:00:00Z'), hidden(11)], [])
+    expect(out.find((c) => c.id === 'svn:11')!.time).toBe(ts('2026-11-10T08:00:00Z'))
+  })
+
+  it('整条序列都没有时间：保持 0，不报错', () => {
+    const out = spliceHistory([hidden(2), hidden(1)], [])
+    expect(out.map((c) => [c.id, c.time, c.timeUnknown])).toEqual([
+      ['svn:2', 0, true],
+      ['svn:1', 0, true],
+    ])
+  })
+})
+
+describe('commitDateText / commitAuthorText', () => {
+  const hiddenNode = () => spliceHistory([{ rev: 1, author: '', date: '', message: '' }], [])[0]
+
+  it('时间未知时写「时间未知」，不显示 1970', () => {
+    expect(commitDateText(hiddenNode())).toBe('时间未知')
+  })
+
+  it('有时间时照常本地化显示', () => {
+    const node = spliceHistory([svn(1)], [])[0]
+    expect(commitDateText(node)).toBe(new Date(node.time * 1000).toLocaleString())
+  })
+
+  it('svn 节点没有作者时写「SVN 未返回」；git 提交和有作者的 svn 节点原样', () => {
+    expect(commitAuthorText(hiddenNode())).toBe('SVN 未返回')
+    expect(commitAuthorText(spliceHistory([svn(1)], [])[0])).toBe('someone')
+    expect(commitAuthorText(git('a', [], { author: '' }))).toBe('')
   })
 })

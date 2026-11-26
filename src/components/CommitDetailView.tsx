@@ -10,7 +10,7 @@ import type { CommitNode, DiffData, FileStatus } from '../engine/types'
 import { historyTargetForCommit, type FileHistoryTarget } from '@/engine/fileHistory'
 import { fileHistoryItems } from './fileHistoryItems'
 import { buildFileTree } from '../engine/fileTree'
-import { deliveredNote, svnDiffGap } from '../engine/svnGraph'
+import { commitAuthorText, commitDateText, deliveredNote, svnDiffGap } from '../engine/svnGraph'
 import { DiffView } from './DiffView'
 import { countChanges } from '@/engine/diffEol'
 import { useDiffPref } from '@/store/diffPrefsStore'
@@ -113,15 +113,20 @@ interface TreeListing {
   truncated: boolean
 }
 
+/** 头像里的字母。没有作者时用「?」：取「SVN 未返回」的「S」会像一个真实作者的首字母。 */
+function avatarLetter(commit: CommitNode): string {
+  return commit.author === '' ? '?' : commit.author.slice(0, 1).toUpperCase()
+}
+
 /** 提交信息条：头像、作者、短 hash、时间、标题。Fork 里三个标签共用这一条。 */
 function CommitHeader({ commit, branch }: { commit: CommitNode; branch?: string | null }) {
   const subject = commit.message.split('\n')[0]
   return (
     <div className="commit-head">
-      <span className="commit-avatar">{commit.author.slice(0, 1).toUpperCase()}</span>
-      <span className="commit-head-author">{commit.author}</span>
+      <span className="commit-avatar">{avatarLetter(commit)}</span>
+      <span className="commit-head-author">{commitAuthorText(commit)}</span>
       <span className="commit-head-sha">{commit.id.slice(0, 7)}</span>
-      <span className="commit-head-date">{new Date(commit.time * 1000).toLocaleString()}</span>
+      <span className="commit-head-date">{commitDateText(commit)}</span>
       <BranchTag branch={branch} />
       <span className="commit-head-subject" title={commit.message}>{subject}</span>
     </div>
@@ -267,15 +272,20 @@ export function CommitDetailView({
     return (
       <div className="commit-detail">
         <div className="commit-head">
-          <span className="commit-avatar">{commit.author.slice(0, 1).toUpperCase()}</span>
-          <span className="commit-head-author">{commit.author}</span>
+          <span className="commit-avatar">{avatarLetter(commit)}</span>
+          <span className="commit-head-author">{commitAuthorText(commit)}</span>
           <span className="commit-head-sha">r{commit.svnRev}</span>
-          <span className="commit-head-date">
-            {new Date(commit.time * 1000).toLocaleString()}
-          </span>
+          <span className="commit-head-date">{commitDateText(commit)}</span>
           <BranchTag branch={branch} />
         </div>
-        <pre className="commit-detail-message">{commit.message}</pre>
+        {/* 三样全空是 SVN 把这条藏起来了，不是谁提交了一条空说明：说清楚，免得以为数据坏了 */}
+        {commit.timeUnknown && commit.author === '' && commit.message === '' ? (
+          <p className="commit-detail-note">
+            SVN 只返回了 revision 号，没有作者、时间和说明。常见原因是这个 revision 改的路径你没有读权限。
+          </p>
+        ) : (
+          <pre className="commit-detail-message">{commit.message}</pre>
+        )}
         {delivered && (
           <div className="commit-delivered">
             <div className="commit-delivered-title">
