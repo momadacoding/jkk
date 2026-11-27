@@ -9,7 +9,7 @@
 | 0 实现日志 | 完成 | 本文件 | — |
 | 1 带超时的 svn 查询 | 完成 | `svn_cli.rs`：`run_svn_deadline`、`classify_svn_error`、`SVN_QUERY_TIMEOUT` | `cargo test --lib deadline_tests` 4/4；fmt、clippy 干净 |
 | 2 路径 → URL 共用 | 完成 | `svn_wc.rs`：`unit_of`、`server_url`、`server_url_at`、`strip_prefix_ci`、`units_cached` | `url_tests` 2/2；svn_health 五个集成测试二进制 105/105 |
-| 3 基线标注 | 未开始 | | |
+| 3 基线标注 | 完成 | `file_history.rs`：`EntrySvn` / `BaselineInfo` / `DeliveredState`、`SvnAnnotator`；`tests/file_history_svn.rs` | `file_history_svn` 7/7，`file_history` 27/27；fmt、clippy 干净 |
 | 4 分组纯函数 | 未开始 | | |
 | 5 `svn_file_history` | 未开始 | | |
 | 6 `svn_rev_file_diff` | 未开始 | | |
@@ -38,3 +38,11 @@
 - **偏离计划：** `strip_prefix_ci` 也一起挪进 `svn_wc`（`pub(crate)`）。`svn_health` 里还有别处用它，留两份会分叉。
 - **偏离计划：** `units_cached` 的缓存键多了一项「基线分支 tip」。更新 / 跟进之后可能多出新的 external，只按白名单做键，新 external 下的文件要等重启才换算得出 URL。缓存只留最近一份。
 - **为什么是安全的：** `unit_of` / `server_url_at` 原样搬家，`svn_health` 的行为不变，回归用它的五个集成测试二进制（105 个用例）全部通过。
+
+### Task 3
+
+- **偏离计划：** `BlameCommit` 除了 `baseline` 还加了 `delivered`。spec §6.3 要求 Blame 里已交付的提交显示「已交付 rN」，计划只给了 `baseline`，漏了。
+- **偏离计划：** 读提交说明不走 `git_read::commit_message`（每次都重开一次仓库，1000 条就开 1000 次），在同一个 `Repository` 上读 `message_raw_bytes`，与 `commit_message` 读的是同一份原始字节。
+- **偏离计划：** 多加了 `a_colleague_update_is_a_baseline_not_a_delivery`。`a_delivered_commit_carries_its_svn_rev` 只断言本地提交的「已交付 rN」：交付录的基线树与交付的提交相同，`git log --follow` 不列它，读不到它的标注；`Delivered-Rev` 的解析改在 `mixed_revision_baseline_uses_rev_of_not_floor` 里用自建基线断言。
+- **计划没写的坑：** Blame 里一个提交的 `file_rev` 要按路径取，`commits` 表里没有路径，取该提交第一次出现那一行的 `orig_path`。
+- **为什么判定是对的：** `svn/base` 的 first-parent 链是一条祖先线，「能到达某提交的基线」在链上是一段后缀，用二分找第一条，`graph_descendant_of` 只调 O(log n) 次。不是混合仓库时 `read_config` 失败，什么都不标，纯 git 仓库的输出只多一个 `null` 字段（`plain_git_repo_has_no_svn_annotation`）。

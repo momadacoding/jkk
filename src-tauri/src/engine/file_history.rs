@@ -44,6 +44,37 @@ pub struct FileHistoryEntry {
     pub old_path: Option<String>,
     /// 与 `FileChange::status` 同一套取值。万一某条没有 name-status，按 `modified`（见 `parse_log`）。
     pub status: String,
+    /// 混合仓库的基线 / 交付标注；纯 git 仓库恒为 None。
+    pub svn: Option<EntrySvn>,
+}
+
+/// 一条提交在混合仓库里的身份（2026-11-27 设计 §5.2）。
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EntrySvn {
+    /// 本应用录的基线提交（能解析出记账）才有。
+    pub baseline: Option<BaselineInfo>,
+    /// 非基线提交的交付状态；判不出来（基线分支之前的老提交等）为 None。
+    pub delivered: Option<DeliveredState>,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BaselineInfo {
+    /// 这个文件在该基线里对应的 revision（`BaseMap::rev_of`），不是 floor。
+    pub file_rev: u64,
+    pub floor: u64,
+    /// 交付录的基线：真正交付出去的那个 revision。
+    pub delivered_rev: Option<u64>,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum DeliveredState {
+    /// 还不是基线分支的祖先：没交付过。
+    Undelivered,
+    /// 被带 `Delivered-Rev: rev` 的那条基线收进去了。
+    Delivered { rev: u64 },
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -73,6 +104,10 @@ pub struct BlameCommit {
     pub summary: String,
     /// 「Blame 此改动之前的版本」用；根提交与边界提交没有。
     pub previous: Option<BlamePrevious>,
+    /// 混合仓库：这个提交是基线时的记账（`file_rev` 按这一提交里行所在的路径取）。
+    pub baseline: Option<BaselineInfo>,
+    /// 混合仓库：非基线提交的交付状态。
+    pub delivered: Option<DeliveredState>,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -174,6 +209,11 @@ pub fn file_history_limited(
     truncated |= merged.len() > limit;
     let mut entries: Vec<FileHistoryEntry> = merged.into_iter().map(|(_, e)| e).collect();
     entries.truncate(limit);
+    if let Some(a) = SvnAnnotator::open(repo) {
+        for e in entries.iter_mut() {
+            e.svn = Some(a.classify(&e.id, Some(&e.path)));
+        }
+    }
     Ok(FileHistory { entries, truncated })
 }
 
@@ -272,6 +312,7 @@ fn parse_log(out: &[u8], file: &str) -> Vec<(i64, FileHistoryEntry)> {
             path,
             old_path,
             status: status.to_string(),
+            svn: None,
         };
         entries.push((ctime.parse().unwrap_or(0), entry));
     }
@@ -345,7 +386,118 @@ pub fn blame_file_limited(
         data.total_lines = n;
         data.truncated = true;
     }
+    if let Some(a) = SvnAnnotator::open(repo) {
+        // 每个提交取它第一次出现的那一行的路径（一个提交里同一文件只有一个路径）
+        let mut paths: HashMap<&str, &str> = HashMap::new();
+        for l in &data.lines {
+            paths.entry(&l.commit).or_insert(&l.orig_path);
+        }
+        let paths: HashMap<String, String> = paths
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        for (id, c) in data.commits.iter_mut() {
+            let s = a.classify(id, paths.get(id).map(String::as_str));
+            c.baseline = s.baseline;
+            c.delivered = s.delivered;
+        }
+    }
     Ok(data)
+}
+
+/// 混合仓库里给提交标「基线 / 未交付 / 已交付 rN」（2026-11-27 设计 §5.2）。
+///
+/// 不是混合仓库（读不到 svn 配置）时 [`SvnAnnotator::open`] 返回 None，调用方什么都不标。
+struct SvnAnnotator {
+    repo: Repository,
+    /// `svn/base` 的 tip；没有这个分支时为 None，「交付」一律判不出来。
+    tip: Option<git2::Oid>,
+    /// `svn/base` first-parent 链上的基线提交，从旧到新，带各自的 `Delivered-Rev`。
+    chain: Vec<(git2::Oid, Option<u64>)>,
+}
+
+impl SvnAnnotator {
+    fn open(repo: &str) -> Option<Self> {
+        crate::engine::svn_config::read_config(repo).ok()?;
+        let r = Repository::open(repo).ok()?;
+        let tip = r
+            .refname_to_id(&format!(
+                "refs/heads/{}",
+                crate::engine::svn_config::BASELINE_BRANCH
+            ))
+            .ok();
+        let mut chain = Vec::new();
+        {
+            let mut cur = tip.and_then(|t| r.find_commit(t).ok());
+            while let Some(c) = cur {
+                if let Some(info) = baseline_of(&c, None) {
+                    chain.push((c.id(), info.delivered_rev));
+                }
+                cur = c.parent(0).ok();
+            }
+        }
+        chain.reverse();
+        Some(Self {
+            repo: r,
+            tip,
+            chain,
+        })
+    }
+
+    /// `path`：这个文件在该提交里的路径（改名之前是旧路径），用来取基线里它自己的 revision。
+    fn classify(&self, id: &str, path: Option<&str>) -> EntrySvn {
+        let none = EntrySvn {
+            baseline: None,
+            delivered: None,
+        };
+        let Some(c) = git2::Oid::from_str(id)
+            .ok()
+            .and_then(|o| self.repo.find_commit(o).ok())
+        else {
+            return none;
+        };
+        if let Some(info) = baseline_of(&c, path) {
+            return EntrySvn {
+                baseline: Some(info),
+                delivered: None,
+            };
+        }
+        let Some(tip) = self.tip else {
+            return none;
+        };
+        let oid = c.id();
+        let reaches =
+            |b: git2::Oid| b == oid || self.repo.graph_descendant_of(b, oid).unwrap_or(false);
+        if !reaches(tip) {
+            return EntrySvn {
+                baseline: None,
+                delivered: Some(DeliveredState::Undelivered),
+            };
+        }
+        // 链是一条祖先线：能到达 c 的基线在链上是一段后缀，找它的起点就是「第一个包含 c 的基线」
+        let first = self.chain.partition_point(|(b, _)| !reaches(*b));
+        let delivered = self
+            .chain
+            .get(first)
+            .and_then(|(_, d)| *d)
+            .map(|rev| DeliveredState::Delivered { rev });
+        EntrySvn {
+            baseline: None,
+            delivered,
+        }
+    }
+}
+
+/// 这个提交若是本应用录的基线，给出它的记账。`file_rev` 取 `path` 在这条基线里的 revision
+/// （混合版本基线里各文件不同，不能用 floor）；没给路径时退回 floor。
+fn baseline_of(c: &git2::Commit, path: Option<&str>) -> Option<BaselineInfo> {
+    let msg = std::str::from_utf8(c.message_raw_bytes()).ok()?;
+    let map = crate::engine::svn_basemap::parse_message(msg)?;
+    Some(BaselineInfo {
+        file_rev: path.map_or(map.floor, |p| map.rev_of(p)),
+        floor: map.floor,
+        delivered_rev: crate::engine::svn_baseline::parse_delivered_rev(msg),
+    })
 }
 
 /// blame 之前读一眼文件：是不是二进制、有几行。
@@ -445,6 +597,8 @@ fn parse_porcelain(out: &[u8], limit: usize) -> BlameData {
                     time: 0,
                     summary: String::new(),
                     previous: None,
+                    baseline: None,
+                    delivered: None,
                 });
             cur = Some(header);
             continue;
