@@ -13,7 +13,7 @@
 | 4 分组纯函数 | 完成 | `svn_file_history.rs`：`GroupSpec`、`Cursor`、`SvnRevEntry`、`bucket`、`next_cursor`、`PAGE` | `cargo test --lib svn_file_history` 11/11 |
 | 5 `svn_file_history` | 完成 | `svn_file_history.rs`：`svn_file_history`、`page_with_units`、进程内 LRU；命令注册 | `file_history_svn` 18/18、`--lib svn_file_history` 12/12；改坏换 peg 的变异让 2 个测试失败 |
 | 6 `svn_rev_file_diff` | 完成 | `svn_file_history.rs`：`svn_rev_file_diff`、`svn_cat`、`tree_with_file`；`svn_cli.rs`：`run_svn_deadline_bytes`；命令注册 | `file_history_svn` 23/23；去掉 mempack 的变异让 `no_object_is_written_to_the_users_git` 失败（10 ≠ 5） |
-| 7 `svn_blame_overlay` | 未开始 | | |
+| 7 `svn_blame_overlay` | 完成 | `svn_xml.rs`：`parse_blame`、`BlameRevAuthor`；`svn_file_history.rs`：`svn_blame_overlay`、`overlay_with_units`、`OverlayTarget` / `OverlayResult`；命令注册 | `file_history_svn` 28/28，`--lib blame_tests` 2/2；clippy 干净 |
 | 8 前端 store 与纯函数 | 未开始 | | |
 | 9 FileHistoryView | 未开始 | | |
 | 10 真实窗口验证与收尾 | 未开始 | | |
@@ -69,3 +69,11 @@
 - **计划里「未核实」的那条已核实：** 在这次打开的 `Repository` 的对象库上 `add_new_mempack_backend(1000)` 之后，`blob` / `treebuilder` 的写入都进内存，`.git/objects` 的文件数不变。去掉这一行，同一个测试多出 5 个对象文件，确认测试有效。不需要临时裸仓库的退路。
 - **偏离计划：** 多加了 `binary_content_is_reported_as_binary`（含 NUL 的内容按二进制显示），以及参数防护：`peg_path` 为空、`rev == 0`、`peg_rev < rev` 返回 `bad_history_args`。路径不在任何白名单单元底下返回 `svn_path_missing`。
 - **为什么是安全的：** 只读。`svn cat` 不碰工作副本，diff 的对象只在内存里，打开的 `Repository` 用完即丢。
+
+### Task 7
+
+- **计划没写的坑（svn 1.14.5 实测）：** 同事给文件设 `svn:eol-style=CRLF` 的那次提交，`svn blame` 把**没改过内容的第 1 行**也算到那次提交上。这是 svn 自己的判定，不是映射错。测试改为与 `svn blame --xml` 的直接输出逐行比对，不写死期望。行数不变，所以映射照常进行。
+- **计划没写的坑：** `svn blame --xml` 的属性逐行排列，和 `svn log` 一样必须走 DOM。真实样例贴进了 `svn_xml.rs` 的 `blame_tests`。
+- **偏离计划：** `Mismatch` 变体单独加了 `#[serde(rename_all = "camelCase")]`，字段才会以 `svnLines` / `gitLines` 送到前端（枚举上的 `rename_all` 只改变体名）。
+- **偏离计划：** 多加了 `an_unreachable_server_fails_only_that_target`，并为此拆出 `overlay_with_units`（与 Task 5 的 `page_with_units` 同一做法）。`units_cached` 失败时每个 target 都是 `Failed`，命令本身不报错。
+- **行数口径：** 基线 blob 里换行符的个数，最后一行没有换行符时再加 1，与 `git blame` 的行数一致。

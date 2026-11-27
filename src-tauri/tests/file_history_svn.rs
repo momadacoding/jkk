@@ -12,7 +12,8 @@ use app_lib::engine::svn_baseline::create_baseline_commit_with;
 use app_lib::engine::svn_basemap::read_base_map;
 use app_lib::engine::svn_cli::run_svn;
 use app_lib::engine::svn_file_history::{
-    page_with_units, svn_file_history, svn_rev_file_diff, GroupSpec,
+    overlay_with_units, page_with_units, svn_blame_overlay, svn_file_history, svn_rev_file_diff,
+    GroupSpec, OverlayResult, OverlayTarget,
 };
 use app_lib::engine::svn_sync_check::preview_sync_in;
 use app_lib::engine::svn_sync_in::{run_sync_in, SyncInExpect};
@@ -549,4 +550,136 @@ fn no_object_is_written_to_the_users_git() {
     let before = object_files(&fx);
     svn_rev_file_diff(&fx.wc_str(), A, 2, 2, &DiffViewOptions::default()).unwrap();
     assert_eq!(object_files(&fx), before);
+}
+
+// ---------------------------------------------------------------------------
+// Task 7：svn_blame_overlay
+// ---------------------------------------------------------------------------
+
+fn target(id: &str, path: &str, rev: u64) -> OverlayTarget {
+    OverlayTarget {
+        baseline_id: id.to_string(),
+        orig_path: path.to_string(),
+        file_rev: rev,
+    }
+}
+fn mapped(r: &OverlayResult) -> Vec<Option<u64>> {
+    match r {
+        OverlayResult::Mapped { lines } => {
+            lines.iter().map(|l| l.as_ref().map(|b| b.rev)).collect()
+        }
+        other => panic!("应当映射成功：{other:?}"),
+    }
+}
+
+#[test]
+fn baseline_lines_map_to_svn_blame() {
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits(A, "a1\nc\n");
+    sync(&fx);
+    let b = blame_file(&fx.wc_str(), A, None).unwrap();
+    let line2 = &b.lines[1].commit;
+    let info = b.commits[line2]
+        .baseline
+        .as_ref()
+        .expect("第 2 行归更新录的基线");
+    let line1 = &b.lines[0].commit;
+    let r = svn_blame_overlay(
+        &fx.wc_str(),
+        &[target(line2, A, info.file_rev), target(line1, A, 1)],
+    )
+    .unwrap();
+    assert_eq!(mapped(&r[0]), vec![Some(1), Some(2)]);
+    assert_eq!(mapped(&r[1]), vec![Some(1)]);
+    // 作者与 svn log 一致
+    let url = format!("{}/Code/A.cs", svn_fixtures::file_url(&fx.repo()));
+    let xml = run_svn(&fx.wc_str(), &["log", "--xml", "-r", "2", "--", &url]).unwrap();
+    let want = &app_lib::engine::svn_xml::parse_log(&xml).unwrap()[0];
+    let OverlayResult::Mapped { lines } = &r[0] else {
+        unreachable!()
+    };
+    assert_eq!(lines[1].as_ref().unwrap().author, want.author);
+}
+
+#[test]
+fn line_count_mismatch_is_reported() {
+    let fx = hybrid_with_colleague();
+    let repo = fx.wc_str();
+    // 一条记账说 A.cs 在 r1、树里却是三行的假基线：SVN 那边 A.cs@1 只有一行
+    let map = read_base_map(&repo, "svn/base").unwrap();
+    write(&fx, A, "x\ny\nz\n");
+    git(&fx, &["add", A]);
+    let tree = git(&fx, &["write-tree"]);
+    let head = git(&fx, &["rev-parse", "HEAD"]);
+    let oid = create_baseline_commit_with(&repo, &tree, Some(&head), &map, &[], None).unwrap();
+    let r = svn_blame_overlay(&repo, &[target(&oid, A, 1)]).unwrap();
+    match &r[0] {
+        OverlayResult::Mismatch {
+            svn_lines,
+            git_lines,
+        } => assert_eq!((*svn_lines, *git_lines), (1, 3)),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn keywords_and_crlf_files_still_map() {
+    let fx = hybrid_with_colleague();
+    colleague(&fx, &["update"]);
+    std::fs::write(fx.wc2().join(A), "a1\n// $Id$\nz\n").unwrap();
+    colleague(&fx, &["propset", "svn:keywords", "Id", "Code/A.cs"]);
+    colleague(&fx, &["propset", "svn:eol-style", "CRLF", "Code/A.cs"]);
+    colleague(&fx, &["commit", "-m", "kw"]);
+    sync(&fx);
+    let b = blame_file(&fx.wc_str(), A, None).unwrap();
+    let line2 = &b.lines[1].commit;
+    let rev = b.commits[line2].baseline.as_ref().unwrap().file_rev;
+    let r = svn_blame_overlay(&fx.wc_str(), &[target(line2, A, rev)]).unwrap();
+    // 以 svn 自己的 blame 为准：改 eol-style 那次 svn 把第 1 行也算成 r2（2026-11-28 实测）
+    let url = format!("{}/Code/A.cs@{rev}", svn_fixtures::file_url(&fx.repo()));
+    let xml = run_svn(&fx.wc_str(), &["blame", "--xml", "--", &url]).unwrap();
+    let want: Vec<Option<u64>> = app_lib::engine::svn_xml::parse_blame(&xml)
+        .unwrap()
+        .iter()
+        .map(|l| l.as_ref().map(|b| b.rev))
+        .collect();
+    assert_eq!(want.len(), 3);
+    assert_eq!(mapped(&r[0]), want);
+}
+
+#[test]
+fn more_than_eight_targets_are_skipped() {
+    let fx = hybrid_with_colleague();
+    let b = blame_file(&fx.wc_str(), A, None).unwrap();
+    let id = b.lines[0].commit.clone();
+    let targets: Vec<OverlayTarget> = (0..9).map(|_| target(&id, A, 1)).collect();
+    let r = svn_blame_overlay(&fx.wc_str(), &targets).unwrap();
+    assert_eq!(r.len(), 9);
+    assert!(r[..8]
+        .iter()
+        .all(|x| matches!(x, OverlayResult::Mapped { .. })));
+    assert!(matches!(r[8], OverlayResult::Skipped));
+}
+
+#[test]
+fn an_unreachable_server_fails_only_that_target() {
+    let fx = hybrid_with_colleague();
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let unit = WcIdentity {
+        wc_root: "Code".to_string(),
+        url: format!("svn://127.0.0.1:{port}/x"),
+        repos_root: format!("svn://127.0.0.1:{port}"),
+        wc_root_abspath: None,
+        uuid: "u".to_string(),
+    };
+    let b = blame_file(&fx.wc_str(), A, None).unwrap();
+    let id = b.lines[0].commit.clone();
+    let r = overlay_with_units(&fx.wc_str(), &[unit], &[target(&id, A, 1)]).unwrap();
+    match &r[0] {
+        OverlayResult::Failed { error } => assert_eq!(error.code, "svn_unreachable"),
+        other => panic!("{other:?}"),
+    }
 }

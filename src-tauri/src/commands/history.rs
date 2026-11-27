@@ -5,7 +5,9 @@
 
 use crate::engine::diff::{DiffData, DiffViewOptions};
 use crate::engine::file_history::{self, BlameData, FileHistory};
-use crate::engine::svn_file_history::{Cursor, GroupSpec, SvnHistoryPage};
+use crate::engine::svn_file_history::{
+    Cursor, GroupSpec, OverlayResult, OverlayTarget, SvnHistoryPage,
+};
 use crate::error::GitError;
 
 #[tauri::command(async)]
@@ -56,6 +58,18 @@ pub fn svn_rev_file_diff(
         rev,
         &options.unwrap_or_default(),
     )
+}
+
+/// 混合仓库：Blame 里归到基线的行，去 `svn blame` 查真实作者和版本。
+///
+/// JS 侧参数名：`{ path, targets }`，`targets` 元素 `{ baselineId, origPath, fileRev }`。结果与
+/// `targets` 同序，每项带 `kind`：`mapped` / `mismatch` / `failed` / `skipped`。
+#[tauri::command(async)]
+pub fn svn_blame_overlay(
+    path: String,
+    targets: Vec<OverlayTarget>,
+) -> Result<Vec<OverlayResult>, GitError> {
+    crate::engine::svn_file_history::svn_blame_overlay(&path, &targets)
 }
 
 /// JS 侧参数名：`{ path, rev, file, oldFile, options }`。`options` 可以不传。

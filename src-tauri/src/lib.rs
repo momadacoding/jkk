@@ -259,6 +259,7 @@ pub fn run() {
             commands::history::blame_file,
             commands::history::svn_file_history,
             commands::history::svn_rev_file_diff,
+            commands::history::svn_blame_overlay,
             commands::history::commit_file_diff,
             commands::watch::unwatch_repo,
             commands::watch::watch_repo,

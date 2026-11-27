@@ -385,6 +385,141 @@ fn tree_with_file(r: &git2::Repository, path: &str, bytes: &[u8]) -> Result<git2
     Ok(child)
 }
 
+/// 一次 Blame 最多映射几个 (基线, 路径)（设计 §6.4 的取值）。
+pub const MAX_OVERLAY_TARGETS: usize = 8;
+
+/// Blame 里归到某条基线、某个路径的那些行，要去 SVN 查出处。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayTarget {
+    pub baseline_id: String,
+    /// 这些行在那条基线里所在文件的路径（`BlameLine::orig_path`）。
+    pub orig_path: String,
+    /// 该路径在那条基线里的 revision（`BlameCommit::baseline.file_rev`）。
+    pub file_rev: u64,
+}
+
+/// 一个 target 的结果，与传入的 targets 同序。
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum OverlayResult {
+    /// 第 i 项是那条基线里第 i+1 行的出处（`BlameLine::orig_line` 从 1 起）。
+    Mapped {
+        lines: Vec<Option<crate::engine::svn_xml::BlameRevAuthor>>,
+    },
+    /// 行数对不上：不映射，这些行保持「基线 rN」，免得把行归给错的人（设计 §2 反目标、§6.4）。
+    #[serde(rename_all = "camelCase")]
+    Mismatch {
+        svn_lines: usize,
+        git_lines: usize,
+    },
+    Failed {
+        error: SvnFetchError,
+    },
+    /// 超过 [`MAX_OVERLAY_TARGETS`]，没有查。
+    Skipped,
+}
+
+/// Blame 归到基线的行 → `svn blame` 的作者和版本（设计 §6.2）。
+pub fn svn_blame_overlay(repo: &str, targets: &[OverlayTarget]) -> Result<Vec<OverlayResult>> {
+    check_targets(targets)?;
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    match crate::engine::svn_wc::units_cached(repo) {
+        Ok(units) => overlay_with_units(repo, &units, targets),
+        Err(e) => {
+            let err: SvnFetchError = e.into();
+            Ok(targets
+                .iter()
+                .map(|_| OverlayResult::Failed { error: err.clone() })
+                .collect())
+        }
+    }
+}
+
+/// [`svn_blame_overlay`] 的本体，单元由调用方给（测试用它造一个连不上的单元）。
+pub fn overlay_with_units(
+    repo: &str,
+    units: &[WcIdentity],
+    targets: &[OverlayTarget],
+) -> Result<Vec<OverlayResult>> {
+    check_targets(targets)?;
+    let r = git2::Repository::open(repo)?;
+    let mut out = Vec::with_capacity(targets.len());
+    for (i, t) in targets.iter().enumerate() {
+        if i >= MAX_OVERLAY_TARGETS {
+            out.push(OverlayResult::Skipped);
+            continue;
+        }
+        out.push(match overlay_one(repo, &r, units, t) {
+            Ok(x) => x,
+            Err(e) => OverlayResult::Failed { error: e.into() },
+        });
+    }
+    Ok(out)
+}
+
+fn check_targets(targets: &[OverlayTarget]) -> Result<()> {
+    for t in targets {
+        if t.baseline_id.is_empty() || t.orig_path.is_empty() || t.file_rev == 0 {
+            return Err(GitError::new(
+                "bad_history_args",
+                format!("Blame 映射参数不完整：{t:?}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn overlay_one(
+    repo: &str,
+    r: &git2::Repository,
+    units: &[WcIdentity],
+    t: &OverlayTarget,
+) -> Result<OverlayResult> {
+    let url = crate::engine::svn_wc::server_url(units, &t.orig_path).ok_or_else(|| {
+        GitError::new(
+            "svn_path_missing",
+            format!("{} 不在任何 SVN 白名单目录底下", t.orig_path),
+        )
+    })?;
+    let target = format!("{url}@{}", t.file_rev);
+    let key = format!("blame\u{1f}{target}");
+    let lines = match cache_get(&key) {
+        Some(CacheVal::Blame(hit)) => hit,
+        _ => {
+            let xml =
+                run_svn_deadline(repo, &["blame", "--xml", "--", &target], SVN_QUERY_TIMEOUT)?;
+            let lines = crate::engine::svn_xml::parse_blame(&xml)?;
+            cache_put(key, CacheVal::Blame(lines.clone()));
+            lines
+        }
+    };
+    let git_lines = baseline_line_count(r, &t.baseline_id, &t.orig_path)?;
+    if lines.len() != git_lines {
+        return Ok(OverlayResult::Mismatch {
+            svn_lines: lines.len(),
+            git_lines,
+        });
+    }
+    Ok(OverlayResult::Mapped { lines })
+}
+
+/// 基线提交里这个文件的行数，口径与 `git blame` 一致：最后一行没有换行符也算一行。
+fn baseline_line_count(r: &git2::Repository, id: &str, path: &str) -> Result<usize> {
+    let commit = r.find_commit(git2::Oid::from_str(id)?)?;
+    let entry = commit.tree()?.get_path(std::path::Path::new(path))?;
+    let blob = r.find_blob(entry.id())?;
+    let bytes = blob.content();
+    let n = bytes.iter().filter(|b| **b == b'\n').count();
+    Ok(if bytes.last().is_some_and(|b| *b != b'\n') {
+        n + 1
+    } else {
+        n
+    })
+}
+
 // ── 进程内缓存 ─────────────────────────────────────────────────────────────
 //
 // 键里都带着 peg revision，结果不会再变，可以一直留到进程退出；总数设上限（设计 §7）。
@@ -396,6 +531,7 @@ const CACHE_CAP: usize = 200;
 enum CacheVal {
     Log(Vec<SvnLogEntry>),
     Bytes(Vec<u8>),
+    Blame(Vec<Option<crate::engine::svn_xml::BlameRevAuthor>>),
 }
 
 #[derive(Default)]
