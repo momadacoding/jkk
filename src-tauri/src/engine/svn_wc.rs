@@ -8,6 +8,7 @@
 use crate::engine::svn_cli::{in_scan_cache, run_svn_targets, STATUS_SCAN};
 use crate::engine::svn_xml::{parse_external_roots, parse_info};
 use crate::error::{GitError, Result};
+use std::collections::HashMap;
 
 /// 一个工作副本的身份三元组。
 #[derive(Debug, Clone, PartialEq)]
@@ -205,4 +206,135 @@ pub fn check_single_repository(wcs: &[WcIdentity]) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// 大小写不敏感地剥前缀。`file:///C:/…` 里盘符的大小写不保证与配置里一致。
+pub(crate) fn strip_prefix_ci(path: &str, prefix: &str) -> Option<String> {
+    if path.len() <= prefix.len() {
+        return None;
+    }
+    // 按字节比，避免在多字节字符中间切片。前缀末尾是 `/`，字节段匹配时
+    // prefix.len() 必定落在字符边界上。
+    if path.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes()) {
+        Some(path[prefix.len()..].to_string())
+    } else {
+        None
+    }
+}
+
+/// 仓库相对路径归哪个单元：取最长的 `wc_root` 前缀（嵌套 external 比外层更具体）。
+/// 返回单元下标与相对单元根的路径（就是单元根本身时为空串）。
+pub fn unit_of(units: &[WcIdentity], path: &str) -> Option<(usize, String)> {
+    let mut best: Option<(usize, usize, String)> = None;
+    for (i, u) in units.iter().enumerate() {
+        let root = u.wc_root.trim_end_matches('/');
+        let rel = if path.eq_ignore_ascii_case(root) {
+            Some(String::new())
+        } else {
+            strip_prefix_ci(path, &format!("{root}/"))
+        };
+        if let Some(rel) = rel {
+            let longer = match &best {
+                None => true,
+                Some(b) => root.len() > b.1,
+            };
+            if longer {
+                best = Some((i, root.len(), rel));
+            }
+        }
+    }
+    best.map(|(i, _, rel)| (i, rel))
+}
+
+/// 仓库相对路径在服务器上的 URL，不带 peg。不在任何单元底下为 None。
+pub fn server_url(units: &[WcIdentity], p: &str) -> Option<String> {
+    let (i, rel) = unit_of(units, p)?;
+    let url = units[i].url.trim_end_matches('/');
+    Some(if rel.is_empty() {
+        url.to_string()
+    } else {
+        format!(
+            "{url}/{}",
+            crate::engine::svn_tombstone::encode_url_path(&rel)
+        )
+    })
+}
+
+/// 墓碑 / 待确认路径在服务器上的 `<url>@<rev>`。
+pub fn server_url_at(units: &[WcIdentity], p: &str, rev: u64) -> Option<String> {
+    Some(format!("{}@{rev}", server_url(units, p)?))
+}
+
+type UnitsKey = (String, Vec<String>, Option<git2::Oid>);
+
+fn units_cache() -> &'static std::sync::Mutex<HashMap<UnitsKey, Vec<WcIdentity>>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<UnitsKey, Vec<WcIdentity>>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// 同 [`enumerate_wcs`]（白名单取仓库配置），按 (仓库, 白名单, 基线分支 tip) 在进程内缓存。
+///
+/// 文件历史每打开一次都要换算 URL，而 `enumerate_wcs` 要起 `svn info` / `svn status`。
+/// 键里放基线 tip：更新、跟进之后可能多出新的 external，基线一动缓存就自然失效。
+pub fn units_cached(repo_root: &str) -> Result<Vec<WcIdentity>> {
+    let cfg = crate::engine::svn_config::read_config(repo_root)?;
+    let tip = git2::Repository::open(repo_root).ok().and_then(|r| {
+        r.refname_to_id(&format!(
+            "refs/heads/{}",
+            crate::engine::svn_config::BASELINE_BRANCH
+        ))
+        .ok()
+    });
+    let key = (repo_root.to_string(), cfg.whitelist.clone(), tip);
+    if let Some(hit) = units_cache().lock().ok().and_then(|c| c.get(&key).cloned()) {
+        return Ok(hit);
+    }
+    let units = enumerate_wcs(repo_root, &cfg.whitelist)?;
+    if let Ok(mut c) = units_cache().lock() {
+        // 只留最近这一份：换仓库、换基线之后旧的再也用不上
+        c.clear();
+        c.insert(key, units.clone());
+    }
+    Ok(units)
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::*;
+
+    fn unit(root: &str, url: &str) -> WcIdentity {
+        WcIdentity {
+            wc_root: root.to_string(),
+            url: url.to_string(),
+            repos_root: "file:///r".to_string(),
+            wc_root_abspath: None,
+            uuid: "u".to_string(),
+        }
+    }
+
+    #[test]
+    fn server_url_encodes_space_chinese_and_at() {
+        let units = [unit("Code", "file:///r/trunk/Code/")];
+        let url = server_url(&units, "Code/sp ace/中文@x.cs").unwrap();
+        assert!(url.starts_with("file:///r/trunk/Code/"), "{url}");
+        assert!(!url.contains(' ') && !url.contains('@'), "{url}");
+        assert_eq!(
+            server_url_at(&units, "Code/a.cs", 7).as_deref(),
+            Some("file:///r/trunk/Code/a.cs@7")
+        );
+    }
+
+    #[test]
+    fn nested_external_wins_over_outer_unit() {
+        let units = [
+            unit("Code", "file:///r/trunk/Code"),
+            unit("Code/Ext", "file:///other/lib"),
+        ];
+        assert_eq!(
+            server_url(&units, "Code/Ext/a.cs").as_deref(),
+            Some("file:///other/lib/a.cs")
+        );
+        assert_eq!(server_url(&units, "Art/x.psd"), None);
+    }
 }
