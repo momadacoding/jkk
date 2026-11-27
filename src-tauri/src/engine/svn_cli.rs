@@ -6,6 +6,7 @@ use crate::error::{GitError, Result};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 /// 构造一条指向 `path` 的 svn 命令。
 ///
@@ -75,6 +76,108 @@ fn spawn_svn(path: &str, args: &[&str]) -> Result<String> {
         return Err(GitError::new("svn_cli", stderr));
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// 混合仓库的文件历史 / Blame 去服务器查一次的超时（2026-11-27 设计 §7）。
+///
+/// 正常查询在 1 秒以内（同一份设计 §3.1 实测）；15 秒比它大一个数量级，又比 Windows
+/// 的 TCP 连接超时（约 21 秒，未实测）短，连不上时用户不必干等系统放弃。
+pub const SVN_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// 同 [`run_svn`]，但最多等 `timeout`，到点结束 svn 进程并报 `svn_unreachable`；非 0 退出时
+/// 按 [`classify_svn_error`] 给错误码，message 只留 svn 的那一句错误。
+///
+/// 不读写扫描缓存、不取预跑结果：它只给只读的服务器查询用，那两样缓存的都是工作副本状态。
+///
+/// 只结束 svn 本身，不结束它起的子进程（svn+ssh 的 ssh）：结束进程树要给 `windows` crate
+/// 加 JobObjects feature。ssh 在管道关闭后自己退出，未实测（决策日志 Task 0）。读管道的线程
+/// 在超时后不再等待，免得被这样的孙进程攥着管道拖住。
+pub fn run_svn_deadline(path: &str, args: &[&str], timeout: Duration) -> Result<String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut cmd = svn_command(path);
+    cmd.args(with_global(args))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let timer = perf::ProcTimer::start(&cmd);
+    let mut child = cmd.spawn()?;
+    let pipe = |r: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut r) = r {
+                let _ = r.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out = pipe(
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    let err = pipe(
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Some(timer) = timer {
+                let e = std::io::Error::new(std::io::ErrorKind::TimedOut, "svn timeout");
+                timer.finish(Err(&e));
+            }
+            return Err(GitError::new(
+                "svn_unreachable",
+                format!("等了 {} 秒，SVN 服务器没有响应", timeout.as_secs()),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    if let Some(timer) = timer {
+        timer.finish(Ok(&status));
+    }
+    let stdout = out.join().unwrap_or_default();
+    let stderr = String::from_utf8_lossy(&err.join().unwrap_or_default()).to_string();
+    if !status.success() {
+        let line = stderr
+            .lines()
+            .find(|l| l.contains(": E"))
+            .unwrap_or(stderr.trim())
+            .to_string();
+        return Err(GitError::new(classify_svn_error(&stderr), line));
+    }
+    Ok(String::from_utf8_lossy(&stdout).to_string())
+}
+
+/// 把 svn 的错误输出归成四类：`svn_unreachable` / `svn_auth` / `svn_path_missing` / `svn_cli`。
+///
+/// 按 svn 错误码判断，不看文案（文案随语言包变）。一次失败 svn 常常连着报好几行：认证失败
+/// 也会先报一行「连不上」（E170013），所以先认认证，再认路径，最后才认连接。
+pub fn classify_svn_error(stderr: &str) -> &'static str {
+    let has = |codes: &[&str]| codes.iter().any(|c| stderr.contains(c));
+    // 认证：未实测（fixture 造不出认证失败），按 svn 的错误码表
+    if has(&["E170001", "E215004"]) {
+        return "svn_auth";
+    }
+    if has(&["E160013", "E200009", "E170000"]) {
+        return "svn_path_missing";
+    }
+    if has(&[
+        "E170013", "E670002", "E670008", "E730060", "E730061", "E731001", "E10060", "E10061",
+        "E175002",
+    ]) {
+        return "svn_unreachable";
+    }
+    "svn_cli"
 }
 
 /// 一条多目标命令的命令行上限（字符数按 UTF-8 字节估，偏保守）。
@@ -722,4 +825,84 @@ fn dir_has_svn_exe(dir: &str) -> bool {
     // 只看文件在不在，不执行它。不展开 %SystemRoot% 这类变量：svn 的安装目录
     // 不会藏在变量后面，而展开会引入一整套转义问题。
     std::path::Path::new(dir).join("svn.exe").is_file()
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    fn tmp() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn a_server_that_never_answers_times_out() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        // 接下连接但一个字节都不回：svn 会一直等服务器的问候
+        let _keep = std::thread::spawn(move || {
+            let _c = l.accept();
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        let dir = tmp();
+        let url = format!("svn://127.0.0.1:{port}/x");
+        let t = Instant::now();
+        let e = run_svn_deadline(
+            dir.path().to_str().unwrap(),
+            &["log", "--xml", "-l", "1", &url],
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "svn_unreachable", "{}", e.message);
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn a_refused_port_is_unreachable_not_generic() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let dir = tmp();
+        let url = format!("svn://127.0.0.1:{port}/x");
+        let e = run_svn_deadline(
+            dir.path().to_str().unwrap(),
+            &["log", "--xml", "-l", "1", &url],
+            Duration::from_secs(10),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "svn_unreachable", "{}", e.message);
+    }
+
+    #[test]
+    fn a_missing_path_is_classified() {
+        let dir = tmp();
+        let st = std::process::Command::new("svnadmin")
+            .current_dir(dir.path())
+            .args(["create", "repo"])
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let p = dir.path().join("repo").to_string_lossy().replace('\\', "/");
+        let url = format!("file:///{}/nope", p.trim_start_matches('/'));
+        let e = run_svn_deadline(
+            dir.path().to_str().unwrap(),
+            &["log", "--xml", "-l", "1", &url],
+            Duration::from_secs(10),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "svn_path_missing", "{}", e.message);
+    }
+
+    #[test]
+    fn success_returns_stdout() {
+        let dir = tmp();
+        let out = run_svn_deadline(
+            dir.path().to_str().unwrap(),
+            &["--version", "--quiet"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(out.trim().starts_with('1'), "{out}");
+    }
 }
