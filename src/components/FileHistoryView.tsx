@@ -340,10 +340,13 @@ function HistoryList({ history, error, selectedId, specs, svn, onSelect, onRevea
                 <span>{e.author}</span>
                 <span>{formatDate(e.time)}</span>
                 {e.oldPath && <span className="fh-rename" title={`${e.oldPath} → ${e.path}`}>← {e.oldPath}</span>}
-                {status && (
-                  <span className={status.failed ? 'fh-svn-count failed' : 'fh-svn-count'}>{status.text}</span>
-                )}
               </div>
+              {/* 单独一行：放在上一行末尾时列表一窄就被截掉（真实窗口 E2E 看到的） */}
+              {status && (
+                <div className="fh-row-meta" title={status.text}>
+                  <span className={status.failed ? 'fh-svn-count failed' : 'fh-svn-count'}>{status.text}</span>
+                </div>
+              )}
             </div>
             {list.map((s) => {
               const key = svnKey(e.id, s.rev)

@@ -1,7 +1,8 @@
-//! 文件历史 / Blame / 单文件 diff 的命令入口，逻辑见 `engine::file_history`。
+//! 文件历史 / Blame / 单文件 diff 的命令入口，逻辑见 `engine::file_history` 与 `engine::svn_file_history`。
 //!
-//! 三个都只读，不经过 `trait Vcs`：SVN 混合仓库看的同样是 git 这边的历史（含基线提交），
-//! 不需要后端分派。
+//! 全部只读，不经过 `trait Vcs`。混合仓库先照常给 git 这边的历史（含基线提交，带基线 / 交付标注），
+//! 再由 `svn_file_history` / `svn_blame_overlay` / `svn_rev_file_diff` 把基线展开成真实 SVN 提交
+//! （2026-11-27 设计）；纯 git 仓库不调用后三个。
 
 use crate::engine::diff::{DiffData, DiffViewOptions};
 use crate::engine::file_history::{self, BlameData, FileHistory};

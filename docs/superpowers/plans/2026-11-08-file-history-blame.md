@@ -14,6 +14,7 @@
 - 不做行内 blame（编辑器里那种悬浮注释），不做 blame 的 `-C` / `-M` 跨文件移动检测参数配置。
 - 不做「历史里多选两条互比」。
 - SVN 节点（`svn:N`）本身不作为起点：它不是 git 提交。混合仓库里看的是 git 这边的历史（含基线提交）。
+  （2026-11-27 起由 `docs/superpowers/specs/2026-11-27-svn-file-history-design.md` 改为：基线提交展开成真实 SVN 提交，Blame 归到基线的行映射到 `svn blame`。）
 
 ## 设计
 

@@ -3198,7 +3198,12 @@ body {
   font-size: 11px;
 }
 .fh-svn-tag.undelivered { border-color: #a07a3c; color: #d8a657; }
-.fh-svn-count { color: #8ec07c; }
+.fh-svn-count {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #8ec07c;
+}
 .fh-svn-count.failed { color: #e06c75; }
 .fh-load-more {
   display: block;

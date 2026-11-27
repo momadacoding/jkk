@@ -79,14 +79,17 @@ fn every_subprocess_goes_through_hidden_command() {
 }
 
 /// 自己 `spawn()` 的地方及各自允许的次数：`git_cli` 的 stdin 管道手工计时，两个外部程序启动器
-/// 只记 `mark`。按次数而不是按文件放行：同一文件里再加一个 `spawn()` 也要过这里（review 第 7 条）。
+/// 只记 `mark`，`svn_cli` 的带超时查询（`run_svn_deadline_bytes`，要能中途结束进程，`output()`
+/// 做不到）同样用 `ProcTimer` 手工计时。按次数而不是按文件放行：同一文件里再加一个 `spawn()`
+/// 也要过这里（review 第 7 条）。
 ///
 /// 已知盲区：`Command::status()` 不在扫描范围内——libgit2 的 `delta.status()` 同名，按行匹配会误报。
 /// 目前 src 里非测试代码没有 `Command::status()`。
-const SPAWN_ALLOWED: [(&str, usize); 3] = [
+const SPAWN_ALLOWED: [(&str, usize); 4] = [
     ("git_cli.rs", 1),
     ("launcher.rs", 1),
     ("external_launch.rs", 1),
+    ("svn_cli.rs", 1),
 ];
 
 /// 记录模式（`--perf`）要看到每个子进程：`output()` 一律走 `engine::proc::output`，

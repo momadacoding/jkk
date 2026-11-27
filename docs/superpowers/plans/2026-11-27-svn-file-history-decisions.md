@@ -16,7 +16,7 @@
 | 7 `svn_blame_overlay` | 完成 | `svn_xml.rs`：`parse_blame`、`BlameRevAuthor`；`svn_file_history.rs`：`svn_blame_overlay`、`overlay_with_units`、`OverlayTarget` / `OverlayResult`；命令注册 | `file_history_svn` 28/28，`--lib blame_tests` 2/2；clippy 干净 |
 | 8 前端 store 与纯函数 | 完成 | `src/engine/svnHistory.ts`、`fileHistory.ts` 类型、`repoStore.ts` 三个 invoke；`tests/vitest/svnHistory.test.ts` | `pnpm test` 109 文件 / 2064 用例全过；`pnpm build` 通过 |
 | 9 FileHistoryView | 完成 | `FileHistoryView.tsx`（SVN 行、加载更多、提示、`SvnEntryDiff`、Blame 套 SVN 出处）、`svnHistory.ts` 的 `groupComplete`、`styles.css`；测试 10 个组件用例 + 2 个纯函数用例 | `pnpm test` 2076/2076；`pnpm build` 通过；去掉两处过期响应防护的变异让 2 个测试失败 |
-| 10 真实窗口验证与收尾 | 未开始 | | |
+| 10 真实窗口验证与收尾 | 完成（review 见下） | 真实窗口 E2E；计数行布局修正；旧计划非目标与 `history.rs` 注释更新；`no_console_window` 放行表 | Rust：fmt、clippy 干净，`--lib` + 116 个测试二进制分 5 批全过（1 + 144 + 875 + 214 + 225 + 第 1 批 999）；前端：`pnpm build` 通过，`pnpm test` 2076/2076 |
 
 ## 决策
 
@@ -96,3 +96,16 @@
 - **计划没写的坑：** Blame 重读后、新的 overlay 回来之前那一次渲染，不能拿旧 overlay 套新 Blame（行号对不上就会归错人）。overlay 存成 `{ blame, view }`，只在 `blame` 是同一个对象时使用；另外用 `createLatestGate` 防止晚到的旧结果把新结果冲掉。
 - **计划没写的坑：** 组件测试里的桩每次要返回新对象。返回同一个引用时 React 不重渲染，「HEAD 变了 / 工作区变了要重读」的测试会假失败或假通过。
 - **验证测试有效：** 第一版的两个过期响应测试在去掉防护后仍然通过：旧响应用了同一个 rev，被 `mergePage` 去重掉了；overlay 测试没断言新结果还在。改过之后，去掉防护的变异让这两个测试都失败。
+
+### Task 10
+
+- **真实窗口 E2E（2026-11-28）：** `pnpm tauri dev --config`（identifier `com.momadacoding.jkk.e2efh`，用完删掉两个配置目录）+ CDP。已核对进程是本 worktree 的 `src-tauri\target\debug\app.exe`。fixture 是 scratchpad 里的 `file://` 仓库：alice / bob 在初始化前提交 r1–r3，初始化后 gao 提交 r4，经窗口里的 `svn_sync_in` 更新，再本地提交一次、最后经 `svn_sync_out` 交付成 r5。逐条对照 spec §10：
+  1. History：`svn: r4` 下展开 `r4 gao 调整第三行`，初始化那条下展开 r3 / r2 / r1，作者和说明与 `svn log` 一致 —— 通过
+  2. 本地提交标「未交付」；交付后变成「已交付 r5」，r5 没有再单列一次 —— 通过
+  3. 点 r4，diff 是 `-line3 / +line3 gao`，与 `svn diff -c 4` 一致；「Blame 这一版」置灰 —— 通过
+  4. Blame：五行分别显示 r1 alice / r2 bob / r4 gao / r3 alice，本地那一行保持 git 提交 —— 通过
+  5. 把 fixture 的 `repo` 目录改名模拟断网，打开从没查过的 `B.cs`：git 列表照常出现，顶部「连不上 SVN，基线条目显示的是快照」；目录改回后点「加载更多」补出 r1 —— 通过
+  6. 四个命令按 camelCase 参数名在真实窗口里调通；参数名写错（`group` 代替 `groups`）返回 `missing required key groups` —— 通过
+- **E2E 发现并修掉的问题：** 「N 次 SVN 提交」原来接在作者、日期后面，列表一窄就被截掉看不见。改成基线行下单独一行（截图复验已显示）。jsdom 测不到布局，没有对应的自动化测试。
+- **计划没写的坑：** 本机 ACP 1252，PowerShell 里 `svn commit -m "中文"` 存进仓库的是 `?`，第一版 fixture 的说明全是问号。这是 fixture 的问题，不是程序的：改用 `-F 文件 --encoding UTF-8` 后显示正常。
+- **计划没写的坑：** `no_console_window` 守卫测试按文件数 `spawn()`。`run_svn_deadline_bytes` 要能中途结束进程，只能 `spawn()`，已用 `ProcTimer` 手工计时，与 `git_cli` 同一理由加进放行表（`svn_cli.rs` 1 次）。
