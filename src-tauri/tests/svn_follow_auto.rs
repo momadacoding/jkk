@@ -1245,6 +1245,27 @@ fn a_replay_conflict_on_one_file_leaves_only_that_file_behind() {
     assert_skipped_untouched(&fx, "svn_auto_follow_conflict");
 }
 
+#[test]
+fn work_committed_after_a_held_back_tortoise_commit_is_not_superseded_without_hooks() {
+    // 计划 2026-11-27 Task 1：部分跟进把冲突的 A 留在旧基线上，收尾快照的基线里就没有 A 的那次提交。
+    // 没有钩子时按基线判先后，会把这次早于快照的提交当成晚于快照，把之后才提交的 a4 换成 SVN 版本
+    // （冲突块整块，换之前的核对拦不住）。收尾快照在没有钩子时不用
+    let fx = hybrid_with_colleague();
+    i_commit(&fx);
+    write(&fx, A, "a3\n");
+    tortoise_commit(&fx, A);
+    write(&fx, A, "a4\n");
+    commit_all(&fx, "提交之后的新工作");
+    fx.colleague_commits(B, "b2\n");
+    svn_update(&fx, B);
+    assert_eq!(held(&done(auto(&fx))), vec![A.to_string()]);
+
+    match follow(&fx.wc_str(), "op2").unwrap() {
+        FollowOutcome::NeedsManual { files, .. } => assert_eq!(files, vec![A.to_string()]),
+        other => panic!("应当 NeedsManual，a4 不能被换掉：{other:?}"),
+    }
+}
+
 /// 计划 2026-11-22 T4 测试 b：部分跟进之前会先判一次暂存区（OLD → NEW），保不住就不跑第二遍。
 /// 暂存的正是被留在旧基线上的冲突文件时，第二遍不会动它，提前判出来的「保不住」不能算数。
 #[test]

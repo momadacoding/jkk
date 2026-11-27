@@ -24,9 +24,10 @@
 //! 只读 git 对象与磁盘；唯一的写入是把磁盘内容写成 blob（`hash-object -w`），之后拼树要用它。
 
 use crate::engine::git_cli::{run_git, run_git_bytes, run_git_code_bytes, run_git_stdin};
-use crate::engine::svn_replay::{ConflictStage, Resolution};
+use crate::engine::git_read;
+use crate::engine::svn_replay::{entries_at, ConflictStage, ReplayCodes, Resolution};
 use crate::error::{GitError, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// 超过这个大小不做逐行核对。
@@ -199,9 +200,50 @@ fn judge(repo: &str, disk: &str, s1: &str, s2: &str, s3: &str) -> Result<Option<
                 .into(),
         ));
     }
-    let open = format!("jkk-ours-{s2}");
-    let close = format!("jkk-theirs-{s3}");
-    let (code, template) = run_git_code_bytes(
+    Ok(match remerge(repo, s2, s1, s3)? {
+        Remerged::Clean(_) => Some("git 重新合并这个文件时没有冲突，和重放的结果对不上".into()),
+        Remerged::Conflict(t) => match t.outside_matches(&mine) {
+            Some(true) => None,
+            Some(false) => {
+                Some("冲突处以外还有别的改动（合并之后又改过，或者少了 SVN 的改动）".into())
+            }
+            None => Some("核对时出错：读不懂 git 重新合并的结果".into()),
+        },
+    })
+}
+
+/// [`remerge`] 的结果。
+enum Remerged {
+    /// 没有冲突：合并结果。
+    Clean(Vec<u8>),
+    Conflict(Template),
+}
+
+/// 带冲突标记的合并结果，标记行是带 OID 的唯一标签（见模块注释）。
+struct Template {
+    body: Vec<u8>,
+    open: String,
+    close: String,
+}
+
+impl Template {
+    /// `content` 在冲突块以外是否与合并结果逐行一致（[`outside_hunks_match`]）。
+    fn outside_matches(&self, content: &[u8]) -> Option<bool> {
+        outside_hunks_match(
+            &self.body,
+            content,
+            self.open.as_bytes(),
+            self.close.as_bytes(),
+        )
+    }
+}
+
+/// `git merge-file -p --object-id <ours> <base> <theirs>`，钉住两段式标记（冲突框的磁盘核对与
+/// F2 ① 的核对共用）。
+fn remerge(repo: &str, ours: &str, base: &str, theirs: &str) -> Result<Remerged> {
+    let open = format!("jkk-ours-{ours}");
+    let close = format!("jkk-theirs-{theirs}");
+    let (code, body) = run_git_code_bytes(
         repo,
         &[
             "-c",
@@ -215,37 +257,215 @@ fn judge(repo: &str, disk: &str, s1: &str, s2: &str, s3: &str) -> Result<Option<
             "jkk-base",
             "-L",
             &close,
-            s2,
-            s1,
-            s3,
+            ours,
+            base,
+            theirs,
         ],
     )?;
     match code {
+        0 => Ok(Remerged::Clean(body)),
         // 冲突个数（git 封顶 127）
-        1..=127 => {}
-        0 => {
-            return Ok(Some(
-                "git 重新合并这个文件时没有冲突，和重放的结果对不上".into(),
-            ))
+        1..=127 => Ok(Remerged::Conflict(Template {
+            body,
+            open: format!("<<<<<<< {open}"),
+            close: format!(">>>>>>> {close}"),
+        })),
+        _ => Err(GitError::new(
+            "svn_follow_disk",
+            format!("git merge-file 退出 {code}"),
+        )),
+    }
+}
+
+/// [`supersede_safe`] 的结论。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SupersedeCheck {
+    /// 可以换的路径。提交没改过的也在里面：换不换一样，留着给后面的提交继承。
+    pub safe: BTreeSet<String>,
+    /// 提交改过、却不换的路径：核对没通过、核对不了，或者更早的提交在这条路径上已经没通过。
+    pub refused: BTreeSet<String>,
+}
+
+/// 判二进制只看开头这么多字节（与 git 的 `buffer_is_binary` 相同）。
+const BINARY_PROBE: usize = 8000;
+
+/// F2 ①（自己更晚用 TortoiseSVN 提交过的路径取 SVN 版本）换之前的核对（2026-11-26 使用报告第 6.2 节，
+/// 计划 `2026-11-27-follow-mark-gap-and-supersede-check.md` Task 2）。
+///
+/// 换掉的是提交 `commit` 对这个文件的改动：重放时它等于没改过，文件取新基线的版本。只有改动已经
+/// 全在 SVN 版本里时这才不丢东西。以 `parent` 的版本为合并基础、新基线的版本为 ours、`commit` 的
+/// 版本为 theirs 合一次：
+///
+/// - 干净：合并结果必须等于 SVN 版本。不等说明 `commit` 有改动不在 SVN 上（TortoiseSVN 只提交了一部分）
+/// - 有冲突：SVN 版本在冲突块以外必须与合并结果逐行一致（与冲突框的磁盘核对同一套方法）。冲突块
+///   内部分不清，按「SVN 版本是最终版」放行，这是 F2 ① 原本的前提（中间版本 W10-R2）
+///
+/// 不通过就不换，`commit` 照常重放：干净就保留改动，冲突就进冲突框，都不会静默丢。
+///
+/// `blocked`：更早的提交在这些路径上没通过、照常重放了。这个提交也不能换：前面的改动重放上去之后，
+/// 再把这个提交的改动（比如删掉前面加的一行）换掉，等于把用户删掉的内容又带回来（独立 review 第 1 条）。
+///
+/// 直接放行的几种：两边已经相同、有一边删了文件或不是普通文件（整个文件的操作，不存在只提交一部分）、
+/// 二进制（TortoiseSVN 只能整个提交）。不放行：带 UTF-16 / UTF-32 BOM 的文本（字节里有 NUL，逐行核对
+/// 不了，又不是二进制）、超过 8 MB 的文本、核对时出错。
+pub fn supersede_safe(
+    repo: &str,
+    commit: &str,
+    parent: &str,
+    new_base: &str,
+    paths: &BTreeSet<String>,
+    blocked: &BTreeSet<String>,
+    codes: &ReplayCodes,
+) -> Result<SupersedeCheck> {
+    let in_c = entries_at(repo, commit, paths, codes)?;
+    let in_p = entries_at(repo, parent, paths, codes)?;
+    let in_n = entries_at(repo, new_base, paths, codes)?;
+    let regular = |e: &(String, String)| e.0 == "100644" || e.0 == "100755";
+    let mut empty_blob: Option<String> = None;
+    let mut out = SupersedeCheck::default();
+    for p in paths {
+        let (c, par, n) = (in_c.get(p), in_p.get(p), in_n.get(p));
+        // 先看 blocked：这个提交没改它时也不能放回 `safe`，否则之后的提交又能换它了
+        if blocked.contains(p) {
+            if c != par {
+                out.refused.insert(p.clone());
+            }
+            continue;
         }
-        _ => {
-            return Err(GitError::new(
-                "svn_follow_disk",
-                format!("git merge-file 退出 {code}"),
-            ))
+        if c == par {
+            out.safe.insert(p.clone());
+            continue;
+        }
+        let (Some(c), Some(n)) = (c, n) else {
+            out.safe.insert(p.clone());
+            continue;
+        };
+        if c.1 == n.1 || !regular(c) || !regular(n) || par.is_some_and(|e| !regular(e)) {
+            out.safe.insert(p.clone());
+            continue;
+        }
+        let verdict = (|| {
+            let base = match par {
+                Some(e) => e.1.clone(),
+                None => match &empty_blob {
+                    Some(b) => b.clone(),
+                    None => {
+                        let b = run_git_stdin(repo, &["hash-object", "-w", "--stdin"], b"")?
+                            .trim()
+                            .to_string();
+                        empty_blob = Some(b.clone());
+                        b
+                    }
+                },
+            };
+            supersede_ok(repo, &n.1, &base, &c.1)
+        })();
+        let short = crate::engine::svn_util::short(commit);
+        match verdict {
+            Ok(true) => {
+                out.safe.insert(p.clone());
+            }
+            Ok(false) => {
+                log::info!("F2 ①：{short} 对 {p} 的改动不全在 SVN 版本里，不换，照常重放");
+                out.refused.insert(p.clone());
+            }
+            // 一个文件核对不了，不连累别的文件
+            Err(e) => {
+                log::warn!(
+                    "F2 ①：核对 {short} 对 {p} 的改动时出错，不换：{}",
+                    e.message
+                );
+                out.refused.insert(p.clone());
+            }
         }
     }
-    let open = format!("<<<<<<< {open}");
-    let close = format!(">>>>>>> {close}");
-    Ok(
-        match outside_hunks_match(&template, &mine, open.as_bytes(), close.as_bytes()) {
-            Some(true) => None,
-            Some(false) => {
-                Some("冲突处以外还有别的改动（合并之后又改过，或者少了 SVN 的改动）".into())
-            }
-            None => Some("核对时出错：读不懂 git 重新合并的结果".into()),
+    Ok(out)
+}
+
+/// `parent → commit` 改过的路径里落在 `within` 的那些。进程内读不了时交回 `git diff-tree`。
+pub fn touched_paths(
+    repo: &str,
+    parent: &str,
+    commit: &str,
+    within: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let all: Vec<String> = git_read::or_cli(
+        "列 commit 改过的路径",
+        || {
+            Ok(git_read::tree_changes(repo, parent, commit)?
+                .into_iter()
+                .map(|c| c.path)
+                .collect())
         },
-    )
+        || {
+            Ok(run_git(
+                repo,
+                &[
+                    "diff-tree",
+                    "-r",
+                    "-z",
+                    "--no-renames",
+                    "--name-only",
+                    parent,
+                    commit,
+                ],
+            )?
+            .split('\0')
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect())
+        },
+    )?;
+    Ok(all.into_iter().filter(|p| within.contains(p)).collect())
+}
+
+/// [`supersede_safe`] 的一个文件：`svn` 是新基线的 blob，`base` / `mine` 是提交前后的 blob。
+///
+/// 只走 git 命令：与 [`remerge`] 读到的是同一份内容。libgit2 在 SHA-256 仓库、有 replace ref 时读不了
+/// 或读到的不一样（第二轮独立 review 第 1 条）。先取大小：有一份超过 8 MB 时只读 SVN 那一份判二进制，
+/// 提交前后的两份不读（第 2 条）。
+fn supersede_ok(repo: &str, svn: &str, base: &str, mine: &str) -> Result<bool> {
+    let bad = || GitError::new("svn_follow_disk", "git cat-file --batch-check 的输出读不懂");
+    let sizes = run_git_stdin(
+        repo,
+        &["cat-file", "--batch-check=%(objectsize)"],
+        format!("{svn}\n{base}\n{mine}\n").as_bytes(),
+    )?
+    .lines()
+    .map(|l| l.trim().parse::<u64>().map_err(|_| bad()))
+    .collect::<Result<Vec<u64>>>()?;
+    if sizes.len() != 3 {
+        return Err(bad());
+    }
+    let read = |oid: &str| run_git_bytes(repo, &["cat-file", "blob", oid]);
+    if sizes.iter().any(|n| *n > MAX_BYTES) {
+        // TortoiseSVN 提交的那一版是二进制（贴图、模型），就是整个提交的；是文本就不核对、不换
+        return Ok(is_binary(&read(svn)?));
+    }
+    let blobs = [read(svn)?, read(base)?, read(mine)?];
+    if blobs.iter().any(|b| wide_bom(b)) {
+        return Ok(false);
+    }
+    if blobs.iter().any(|b| is_binary(b)) {
+        return Ok(true);
+    }
+    let [svn_bytes, ..] = blobs;
+    Ok(match remerge(repo, svn, base, mine)? {
+        Remerged::Clean(merged) => merged == svn_bytes,
+        Remerged::Conflict(t) => t.outside_matches(&svn_bytes) == Some(true),
+    })
+}
+
+/// 与 git 的 `buffer_is_binary` 相同：前 8000 字节里有 NUL。带 UTF-16 / UTF-32 BOM 的不算（那是文本）。
+fn is_binary(b: &[u8]) -> bool {
+    !wide_bom(b) && b[..b.len().min(BINARY_PROBE)].contains(&0)
+}
+
+/// UTF-16 / UTF-32 的 BOM（`FF FE` 同时盖住 UTF-32 LE）。这类文本按字节有 NUL，git 当成二进制。
+fn wide_bom(head: &[u8]) -> bool {
+    head.starts_with(&[0xFF, 0xFE])
+        || head.starts_with(&[0xFE, 0xFF])
+        || head.starts_with(&[0x00, 0x00, 0xFE, 0xFF])
 }
 
 /// 一行（不含行尾）是不是 `open` / `close` 标记行。

@@ -67,6 +67,20 @@ fn show(fx: &SvnFixture, spec: &str) -> String {
     git(fx, &["show", spec])
 }
 
+/// 跟进收尾换成只含 commit 的快照：HEAD 是落下之后的，暂存不记（2026-11-27 计划 Task 1）。
+fn assert_commit_mark(fx: &SvnFixture, why: &str) {
+    let m = read_mark(&fx.wc_str())
+        .unwrap()
+        .unwrap_or_else(|| panic!("{why}：收尾应当记下快照"));
+    assert_eq!(m.head_oid, oid(fx, "HEAD"), "{why}");
+    assert_eq!(
+        m.base_oid.as_deref(),
+        Some(oid(fx, "svn/base").as_str()),
+        "{why}"
+    );
+    assert!(m.staged.is_empty(), "{why}：暂存不记 {:?}", m.staged);
+}
+
 /// TortoiseSVN 只提交这一个文件，不 update。返回新 revision。
 fn tortoise_commit(fx: &SvnFixture, rel: &str) -> u64 {
     svn_cmd(
@@ -284,8 +298,8 @@ fn follow_drops_intermediate_commits_of_own_svn_commit() {
         read_base_map(&fx.wc_str(), "svn/base").unwrap().rev_of(A),
         r
     );
-    assert!(read_mark(&fx.wc_str()).unwrap().is_none(), "收尾清掉快照");
-    assert!(!mark_path(&fx.wc_str()).exists());
+    assert_commit_mark(&fx, "收尾换成新快照");
+    assert!(mark_path(&fx.wc_str()).exists());
 }
 
 #[test]
@@ -2081,7 +2095,7 @@ fn assert_finished(s: &Scene, at: Point) {
     assert_eq!(read(fx, B), "b-disk\n", "{at:?}");
     assert_eq!(oid(fx, "feature^"), base, "{at:?}");
     assert_eq!(oid(fx, "plain"), base, "{at:?}");
-    assert!(read_mark(&fx.wc_str()).unwrap().is_none(), "{at:?}");
+    assert_commit_mark(fx, &format!("{at:?}"));
     assert!(matches!(
         check_sync(&fx.wc_str()).unwrap().verdict,
         SyncVerdict::InSync
@@ -3356,7 +3370,7 @@ fn manual_follow_on_a_clean_lagging_branch_needs_no_stash() {
 }
 
 #[test]
-fn manual_follow_clears_the_mark_when_the_branch_landed_and_keeps_it_on_abort() {
+fn manual_follow_renews_the_mark_when_the_branch_landed_and_keeps_it_on_abort() {
     let fx = hybrid_with_colleague();
     conflict_scene(&fx);
     write_mark(&fx.wc_str()).unwrap();
@@ -3368,10 +3382,7 @@ fn manual_follow_clears_the_mark_when_the_branch_landed_and_keeps_it_on_abort() 
     expect_rebase_conflict(&fx);
     resolve_a(&fx, "a-svn\n");
     resume(&fx);
-    assert!(
-        read_mark(&fx.wc_str()).unwrap().is_none(),
-        "分支已落到基线上"
-    );
+    assert_commit_mark(&fx, "分支已落到基线上");
 }
 
 // —— 手动跟进：分派不能串味 ——

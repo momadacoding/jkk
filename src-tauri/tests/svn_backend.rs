@@ -1139,6 +1139,7 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
             dropped: vec!["c1".into()],
             rewritten: vec![("c2".into(), vec!["Code/A.cs".into()])],
             snapshot: vec![("c3".into(), vec!["Code/B.cs".into()])],
+            not_rewritten: vec![("c4".into(), vec!["Code/F.cs".into()])],
             drift: vec!["Code/E.cs".into()],
             drift_lines: [(
                 "Code/E.cs".to_string(),
@@ -1241,6 +1242,10 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     assert_eq!(r["dropped"][0], "c1");
     assert_eq!(r["rewritten"][0], serde_json::json!(["c2", ["Code/A.cs"]]));
     assert_eq!(r["snapshot"][0], serde_json::json!(["c3", ["Code/B.cs"]]));
+    assert_eq!(
+        r["notRewritten"][0],
+        serde_json::json!(["c4", ["Code/F.cs"]])
+    );
     assert_eq!(r["drift"][0], "Code/E.cs");
     // 前端按路径取：{ added, removed, binary }
     assert_eq!(
@@ -1294,6 +1299,8 @@ fn follow_outcome_serializes_to_the_exact_names_the_frontend_reads() {
     old.as_object_mut().unwrap().remove("evidenceCutoffMs");
     // 6.10 之前的 journal 也没有 snapshot / drift
     old.as_object_mut().unwrap().remove("snapshot");
+    // 计划 2026-11-27 之前的 journal 没有 notRewritten
+    old.as_object_mut().unwrap().remove("notRewritten");
     old.as_object_mut().unwrap().remove("drift");
     // 9.1 之前的 journal 没有 restorable，自动放回之前的没有 restore
     old.as_object_mut().unwrap().remove("restorable");

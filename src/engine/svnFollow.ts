@@ -124,6 +124,11 @@ export interface FollowReport {
   rewritten: [string, string[]][]
   /** (原 commit, 换成 SVN 版本的路径)：内容与更新的某个基线逐字节相同，是快照进来的 SVN 内容（6.10）。 */
   snapshot: [string, string[]][]
+  /**
+   * (原 commit, 路径)：F2 ① 本来要换成 SVN 版本，但 commit 里有改动不在 SVN 版本里（比如 TortoiseSVN
+   * 只提交了一部分），照常重放了（计划 2026-11-27 Task 2）。旧后端没有。
+   */
+  notRewritten?: [string, string[]][]
   /** 重放后与磁盘对不上的文件：多半是重放干净却合错了（PR 119 遗留）。 */
   drift: string[]
   /**
@@ -572,6 +577,7 @@ export interface FollowReportSection {
     | 'changes'
     | 'dropped'
     | 'rewritten'
+    | 'notRewritten'
     | 'diskResolved'
     | 'snapshot'
     | 'drift'
@@ -898,6 +904,21 @@ export function describeFollowReport(r: FollowReport): FollowReportModel {
       level: 'attention',
       note: `${SNAPSHOT_NOTE}重放时直接采用了新基线的版本。`,
       groups: snapshot.map(([c, paths]) => ({ label: commitLabel(c), items: plain(paths) })),
+    },
+    {
+      id: 'notRewritten',
+      title: '没换成 SVN 版本的路径',
+      level: 'attention',
+      // 三种原因都会落到这里，文案要对每一种都成立（第二轮独立 review 第 4 条）
+      note:
+        '这些路径你在 SVN 上提交过，但没有换成 SVN 的版本，commit 照常重放了。原因是其中之一：' +
+        'commit 里还有改动不在 SVN 的版本里（比如 TortoiseSVN 只提交了一部分）；' +
+        '更早的 commit 在同一个文件上已经照常重放，后面的只能跟着重放；核对时出错。' +
+        '分支里会留着这些改动；如果和磁盘对不上，对比后再决定留哪一边。',
+      groups: (r.notRewritten ?? []).map(([c, paths]) => ({
+        label: commitLabel(c),
+        items: plain(paths),
+      })),
     },
     {
       id: 'overlapDiffers',
