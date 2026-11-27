@@ -21,6 +21,7 @@ import {
   type SyncOutOutcome,
 } from '../engine/svnSyncOut'
 import type { SyncState, SyncStateUnreadable } from '../engine/svnJournal'
+import { opensConflictList } from '../engine/svnConflicts'
 import type { ConfirmRequest } from './ConfirmDialog'
 import {
   createAfterSync,
@@ -61,6 +62,8 @@ export interface SvnSyncOutFlowDeps {
   fetchSvnLog: (path: string) => Promise<unknown>
   /** 未收尾横幅上执行中的那颗按钮，与更新流程共用（同一条横幅）。 */
   setSyncActionBusy: (busy: SyncActionBusy | null) => void
+  /** 同 `SvnSyncFlowDeps.offerSvnConflicts`：交付的前置检查报「有冲突没解决」时弹冲突列表。不等、不抛。 */
+  offerSvnConflicts: () => void
 }
 
 export function createSvnSyncOutFlow(d: SvnSyncOutFlowDeps) {
@@ -97,6 +100,7 @@ export function createSvnSyncOutFlow(d: SvnSyncOutFlowDeps) {
       preview = await svnSyncOutPreview(d.repoPath)
     } catch (err) {
       d.reportError(err)
+      if (opensConflictList(err)) d.offerSvnConflicts()
       return
     }
     // 用盒子而不是 `let outcome`：闭包里的赋值 TS 的控制流分析看不见

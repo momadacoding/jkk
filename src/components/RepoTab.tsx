@@ -34,10 +34,14 @@ import {
   svnBaselineMismatch,
   svnDismissPendingRestores,
   svnSetUser,
+  svnResolveConflict,
+  svnUpdateConflicts,
   tsvnHooksRegister,
   tsvnHooksStatus,
   tsvnHooksUnregister,
 } from '../store/repoStore'
+import { useSvnConflictsDialog } from './SvnConflictsDialog'
+import type { SvnConflict } from '../engine/svnConflicts'
 import TsvnHooksDialog from './TsvnHooksDialog'
 import { toErrorMessage } from '../engine/errors'
 import type { HookHealth, TsvnHooksStatus } from '../engine/tsvnHooks'
@@ -81,7 +85,13 @@ import {
   reconcileSelection,
   type FileSelection,
 } from '@/engine/fileSelection'
-import { openExternalDiff, openExternalMerge, useExternalToolExit, useExternalTools } from '@/store/externalToolsStore'
+import {
+  openExternalDiff,
+  openExternalMerge,
+  openSvnConflictMerge,
+  useExternalToolExit,
+  useExternalTools,
+} from '@/store/externalToolsStore'
 import type { ExternalToolsMenu } from './externalToolItems'
 import { computeLaneBranches, formatLaneBranch } from '../engine/laneBranch'
 import { describeHealth, describePinned, healthNeedsRebuild } from '../engine/svnInit'
@@ -254,6 +264,7 @@ export function RepoTab({
   const { deliver, dialog: deliverDialog } = useDeliverDialog()
   const { showFollowReport, dialog: followReportDialog } = useFollowReportDialog()
   const { showFollowConflict, dialog: followConflictDialog } = useFollowConflictDialog()
+  const { showSvnConflicts, dialog: svnConflictsDialog } = useSvnConflictsDialog()
   // 跟进执行中（svnSyncFlow 写），横幅上的按钮据此禁用
   const [following, setFollowing] = useState(false)
   // 未收尾横幅上执行中的那颗按钮（更新、交付两个流程写）：rebase 冲突时的「继续」不弹框，进度在按钮上
@@ -1128,6 +1139,37 @@ export function RepoTab({
     if (!tool) return null
     return { label: tool.label, open: () => openExternalDiff(path, tool.id, target) }
   }
+  /**
+   * SVN 冲突列表里一个文件的外部合并工具：按工具配置的规则选（`.prefab` 可以配成 UnityYAMLMerge）。
+   * 工具配置与路径按框渲染时的最新值读，理由同 {@link compareDrift}。
+   */
+  const mergeSvnConflict = (c: SvnConflict) => {
+    const cfg = toolsConfigRef.current
+    const path = statePathRef.current
+    if (!cfg || !path) return null
+    const tool = toolFor(cfg, c.path, 'merge')
+    if (!tool) return null
+    return { label: tool.label, open: () => openSvnConflictMerge(path, tool.id, c.path) }
+  }
+  /**
+   * 查一遍工作副本里的 SVN 冲突，有才弹冲突列表（设计 2026-11-28-update-conflict-resolve-in-jkk §3.2）。
+   * 不等、不抛：要跑一遍全量 `svn status`，流程已经走完了，不拖住它；查失败只记 console。
+   * 解决之后 wc.db 变了，监听补发的 `repo-changed` 会刷新同步状态，这里不另刷。
+   */
+  const offerSvnConflicts = () => {
+    const path = repoPath
+    void svnUpdateConflicts(path)
+      .then((initial) => {
+        if (initial.length === 0) return
+        return showSvnConflicts({
+          initial,
+          load: () => svnUpdateConflicts(path),
+          resolve: (file, choice) => svnResolveConflict(path, file, choice),
+          merge: mergeSvnConflict,
+        })
+      })
+      .catch((err) => console.warn('读 SVN 冲突失败：', err))
+  }
   const handleRestorePending = async () => {
     setRestoreBusy(true)
     try {
@@ -1224,6 +1266,7 @@ export function RepoTab({
     showAutoFollowed: setAutoFollowed,
     clearAutoFollowed: () => setAutoFollowed(keepOnNewFollow),
     setHeldBack: setHeldPin,
+    offerSvnConflicts,
   })
   autoFollowRef.current = handleAutoFollow
 
@@ -1242,6 +1285,7 @@ export function RepoTab({
     refreshSvnSync,
     fetchSvnLog,
     setSyncActionBusy,
+    offerSvnConflicts,
   })
 
   /**
@@ -1562,6 +1606,7 @@ export function RepoTab({
       {deliverDialog}
       {followReportDialog}
       {followConflictDialog}
+      {svnConflictsDialog}
       {splitRequest && (
         <SplitLocalOnlyDialog request={splitRequest} onClose={() => setSplitRequest(null)} />
       )}

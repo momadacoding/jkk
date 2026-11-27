@@ -107,6 +107,8 @@ function deps(log: string[], confirm?: (r: ConfirmRequest) => Promise<boolean>):
     clearAutoFollowed: () => {},
     // 不记日志，理由同上
     setHeldBack: () => {},
+    // 不记日志，理由同上；要看它的用例在「冲突列表」那一组里自己接
+    offerSvnConflicts: () => {},
   }
 }
 
@@ -1735,6 +1737,116 @@ describe('收尾之后的刷新失败（3a 最终 review 第 3 条在「更新�
     await createSvnSyncFlow(deps(log, dialog(log))).handleSvnUpdate()
 
     expect(log).toContain('dialogError:sync_in_update_failed')
+  })
+})
+
+describe('更新之后弹 SVN 冲突列表（设计 2026-11-28-update-conflict-resolve-in-jkk §3.2）', () => {
+  /** 与真对话框一样：`action` 抛错时留在原地显示错误。 */
+  const dialog =
+    (log: string[]) =>
+    async (r: ConfirmRequest): Promise<boolean> => {
+      log.push(`confirm:${r.title}`)
+      try {
+        await r.action?.()
+      } catch (e) {
+        log.push(`dialogError:${(e as { code?: string }).code}`)
+        return false
+      }
+      return true
+    }
+  const watched = (log: string[], confirm?: (r: ConfirmRequest) => Promise<boolean>) => ({
+    ...deps(log, confirm),
+    offerSvnConflicts: () => log.push('offerSvnConflicts'),
+  })
+
+  it('更新走完：结局之后查一次，排在最后', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncInPreview).mockResolvedValue(preview)
+    vi.mocked(store.svnSyncIn).mockResolvedValue({ kind: 'done', newRev: 2 })
+
+    await createSvnSyncFlow(watched(log)).handleSvnUpdate()
+
+    expect(log.filter((l) => l === 'offerSvnConflicts')).toHaveLength(1)
+    expect(log.at(-1)).toBe('offerSvnConflicts')
+  })
+
+  it('停在 rebase 冲突上：不查，等「继续」走完', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncInPreview).mockResolvedValue(preview)
+    vi.mocked(store.svnSyncIn).mockResolvedValue({ kind: 'rebaseConflict', files: ['Code/A.cs'] })
+
+    await createSvnSyncFlow(watched(log)).handleSvnUpdate()
+
+    expect(log).not.toContain('offerSvnConflicts')
+  })
+
+  it('预检报「有冲突没解决」：报错，再弹列表', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncInPreview).mockRejectedValue({ code: 'sync_in_svn_conflicted', message: 'm' })
+
+    await createSvnSyncFlow(watched(log)).handleSvnUpdate()
+
+    expect(log).toEqual(['clearError', 'guardMerge', 'reportError:sync_in_svn_conflicted', 'offerSvnConflicts'])
+  })
+
+  it('预检的其他错误：不弹', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncInPreview).mockRejectedValue({ code: 'sync_in_merge_in_range', message: 'm' })
+
+    await createSvnSyncFlow(watched(log)).handleSvnUpdate()
+
+    expect(log).not.toContain('offerSvnConflicts')
+  })
+
+  it('执行中整次回退（不能放行的冲突）：错误留在对话框里，框关掉之后弹列表', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncInPreview).mockResolvedValue(preview)
+    vi.mocked(store.svnSyncIn).mockRejectedValue({ code: 'sync_in_update_conflict' })
+
+    await createSvnSyncFlow(watched(log, dialog(log))).handleSvnUpdate()
+
+    expect(log.indexOf('dialogError:sync_in_update_conflict')).toBeGreaterThanOrEqual(0)
+    expect(log.at(-1)).toBe('offerSvnConflicts')
+  })
+
+  it('执行中别的错误：不弹', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncInPreview).mockResolvedValue(preview)
+    vi.mocked(store.svnSyncIn).mockRejectedValue({ code: 'sync_in_update_failed' })
+
+    await createSvnSyncFlow(watched(log, dialog(log))).handleSvnUpdate()
+
+    expect(log).not.toContain('offerSvnConflicts')
+  })
+
+  it('横幅上的继续走完、或停在录制被冲突拦下：都弹', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncContinue).mockResolvedValue({ kind: 'done', newRev: 2 })
+    await createSvnSyncFlow(watched(log)).handleSyncAction('syncContinue')
+    expect(log.filter((l) => l === 'offerSvnConflicts')).toHaveLength(1)
+
+    const log2: string[] = []
+    vi.mocked(store.svnSyncContinue).mockRejectedValue({ code: 'svn_preflight_conflicted' })
+    await createSvnSyncFlow(watched(log2, dialog(log2))).handleSyncAction('syncContinue')
+    expect(log2).toContain('dialogError:svn_preflight_conflicted')
+    expect(log2.at(-1)).toBe('offerSvnConflicts')
+  })
+
+  it('rebase 阶段的继续（不弹确认框）报冲突：错误进错误条，再弹列表', async () => {
+    const log: string[] = []
+    const d = {
+      ...watched(log),
+      syncState: () =>
+        ({ unfinished: { flow: 'sync_in', phase: 'rebase' } }) as unknown as ReturnType<
+          SvnSyncFlowDeps['syncState']
+        >,
+    }
+    vi.mocked(store.svnSyncContinue).mockRejectedValue({ code: 'svn_preflight_conflicted' })
+
+    await createSvnSyncFlow(d).handleSyncAction('syncContinue')
+
+    expect(log).toContain('reportError:svn_preflight_conflicted')
+    expect(log.at(-1)).toBe('offerSvnConflicts')
   })
 })
 

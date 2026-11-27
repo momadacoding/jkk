@@ -178,7 +178,8 @@ fn check_recordable(dirty: &[StatusEntry], nodes: &[NodeStatus]) -> Result<()> {
             format!(
                 "白名单内有 {} 处 SVN 冲突还没处理：\n{}\n\
                  冲突的文件磁盘上带着冲突标记，录进基线就等于把冲突当成了服务器内容。\
-                 请先在 TortoiseSVN 里解决（Resolve）后再试。",
+                 请先在 TortoiseSVN 里解决（Resolve）后再试；已初始化的仓库里，git 不管的文件\
+                 （美术、.prefab 等）上的冲突也可以在本应用的「SVN 冲突列表」里解决。",
                 list.len(),
                 shown_paths(&list)
             ),

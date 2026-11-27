@@ -388,7 +388,10 @@ fn outside_changes(repo: &str, cfg: &SvnConfig) -> Result<Vec<String>> {
         return Err(GitError::new(
             "sync_out_svn_conflicted",
             format!(
-                "白名单里有 SVN 冲突还没处理：\n{}\n请先用 TortoiseSVN 解决（Resolve）后再交付。",
+                "这次没有交付，什么都没改动。白名单里有 SVN 冲突还没处理：\n{}\n\
+                 交付完要对白名单 svn update，冲突的文件会被跳过、停在旧版本上，所以要先解决。\
+                 git 不管的文件（美术、.prefab 等）上的冲突可以在本应用的「SVN 冲突列表」里解决，\
+                 其余的请用 TortoiseSVN 解决（Resolve）。",
                 list_paths(&conflicted)
             ),
         ));

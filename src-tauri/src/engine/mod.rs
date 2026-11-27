@@ -34,6 +34,7 @@ pub mod svn_basemap;
 pub mod svn_changelist;
 pub mod svn_cli;
 pub mod svn_config;
+pub mod svn_conflict;
 pub mod svn_deliver;
 pub mod svn_dirty;
 pub mod svn_exclude;

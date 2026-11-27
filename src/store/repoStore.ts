@@ -71,6 +71,7 @@ import type {
 import type { HookHealth, TsvnHooksStatus } from '../engine/tsvnHooks'
 import type { BaselineMismatch } from '../engine/svnMismatch'
 import type { SyncInExpect, SyncInOutcome, SyncInPreview } from '../engine/svnSyncIn'
+import type { ResolveChoice, SvnConflict } from '../engine/svnConflicts'
 import type { SyncOutExpect, SyncOutOutcome, SyncOutPreview } from '../engine/svnSyncOut'
 import { nextSelection } from '../engine/selection'
 
@@ -441,6 +442,16 @@ export function svnSyncContinue(path: string): Promise<SyncInOutcome> {
 
 export function svnSyncAbort(path: string): Promise<SyncInOutcome> {
   return invoke<SyncInOutcome>('svn_sync_abort', { path })
+}
+
+/** 工作副本里的 SVN 冲突（设计 2026-11-28-update-conflict-resolve-in-jkk）。只读，跑一次全量 `svn status`。 */
+export function svnUpdateConflicts(path: string): Promise<SvnConflict[]> {
+  return invoke<SvnConflict[]>('svn_update_conflicts', { path })
+}
+
+/** 解决一个 git 不管的文件上的 SVN 冲突。后端执行前会现读一次它的冲突状态。 */
+export function svnResolveConflict(path: string, file: string, choice: ResolveChoice): Promise<void> {
+  return invoke<void>('svn_resolve_conflict', { path, file, choice })
 }
 
 /**

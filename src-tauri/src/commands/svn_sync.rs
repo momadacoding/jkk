@@ -12,6 +12,7 @@
 use crate::commands::watch::WatchSuspension;
 use crate::desktop::DesktopState;
 use crate::engine::svn_changelist;
+use crate::engine::svn_conflict::{list_conflicts, resolve_conflict, ResolveChoice, SvnConflict};
 use crate::engine::svn_follow::{
     follow_auto_with_sync, follow_with_disk, follow_with_sync, manual_follow, resume_follow,
     AutoFollowOutcome, FollowOutcome, Followed,
@@ -59,6 +60,23 @@ pub fn svn_sync_continue(handle: AppHandle, path: String) -> Result<SyncInOutcom
 #[tauri::command(async)]
 pub fn svn_sync_abort(handle: AppHandle, path: String) -> Result<SyncInOutcome, GitError> {
     with_watch_suspended(&handle, &path, || abort_sync(&path))
+}
+
+/// 工作副本里的 SVN 冲突（设计 2026-11-28-update-conflict-resolve-in-jkk §3.1）。只读。
+#[tauri::command(async)]
+pub fn svn_update_conflicts(path: String) -> Result<Vec<SvnConflict>, GitError> {
+    list_conflicts(&path)
+}
+
+/// 解决一个 git 不管的文件上的 SVN 冲突。JS 侧：`invoke('svn_resolve_conflict', { path, file, choice })`，
+/// `choice` 是 `'mine' | 'theirs' | 'merged'`。
+#[tauri::command(async)]
+pub fn svn_resolve_conflict(
+    path: String,
+    file: String,
+    choice: ResolveChoice,
+) -> Result<(), GitError> {
+    resolve_conflict(&path, &file, choice)
 }
 
 /// 交付预览：前置检查与净变更清单，**什么都不改**（Phase 3a 计划 B1）。

@@ -51,6 +51,14 @@ export const SCENARIOS: LayoutScenario[] = [
   { id: 'follow-conflict-long', component: 'FollowConflictDialog' },
   // 点磁盘按钮之后后端失败：长错误挂在按钮条上方
   { id: 'follow-conflict-long-error', component: 'FollowConflictDialog', clickPrimary: true },
+  // 几十个能解决的冲突（每行四个按钮）加一组要去 TortoiseSVN 的：按钮条仍要够得着
+  { id: 'svn-conflicts-long', component: 'SvnConflictsDialog' },
+  // 点了第一行的「用服务器的」：行内确认与提醒展开之后，确认按钮与按钮条都要够得着
+  {
+    id: 'svn-conflicts-confirm-long',
+    component: 'SvnConflictsDialog',
+    clickFirst: { selector: '.conflict-compare button >> nth=1', thenShows: '本地的改动丢掉' },
+  },
   { id: 'tsvn-hooks-long', component: 'TsvnHooksDialog' },
   // 报告里那个 Local-Only commit 改了 66 个文件；勾一个、点拆分，后端失败的长错误要看得见
   {
