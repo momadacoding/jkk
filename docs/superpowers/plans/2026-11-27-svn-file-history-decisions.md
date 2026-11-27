@@ -11,7 +11,7 @@
 | 2 路径 → URL 共用 | 完成 | `svn_wc.rs`：`unit_of`、`server_url`、`server_url_at`、`strip_prefix_ci`、`units_cached` | `url_tests` 2/2；svn_health 五个集成测试二进制 105/105 |
 | 3 基线标注 | 完成 | `file_history.rs`：`EntrySvn` / `BaselineInfo` / `DeliveredState`、`SvnAnnotator`；`tests/file_history_svn.rs` | `file_history_svn` 7/7，`file_history` 27/27；fmt、clippy 干净 |
 | 4 分组纯函数 | 完成 | `svn_file_history.rs`：`GroupSpec`、`Cursor`、`SvnRevEntry`、`bucket`、`next_cursor`、`PAGE` | `cargo test --lib svn_file_history` 11/11 |
-| 5 `svn_file_history` | 未开始 | | |
+| 5 `svn_file_history` | 完成 | `svn_file_history.rs`：`svn_file_history`、`page_with_units`、进程内 LRU；命令注册 | `file_history_svn` 18/18、`--lib svn_file_history` 12/12；改坏换 peg 的变异让 2 个测试失败 |
 | 6 `svn_rev_file_diff` | 未开始 | | |
 | 7 `svn_blame_overlay` | 未开始 | | |
 | 8 前端 store 与纯函数 | 未开始 | | |
@@ -53,3 +53,12 @@
 - **计划的错误：** 计划写「这一页一条都没查到时 O = `peg_rev + 1`」。翻过几页满页之后，这一段其实已经追到了上一页的最老那条，用 `peg_rev + 1` 会把已经查过的组当成「够不着」再查一遍。改为 O = `next_top + 1`；第一页时 `next_top == peg_rev`，与计划一致。补测试 `an_empty_page_after_full_pages_keeps_what_earlier_pages_reached`。
 - **计划没写的坑：** 换 peg 只在当前 peg 那组之后（更老的组）里找。否则一条 peg 什么都没查到时会选回自己，死循环（`an_empty_segment_does_not_requery_its_own_group`）。
 - **偏离计划：** 多加了 `a_full_page_ending_at_r1_is_exhausted`：满页但最老的已是 r1，不能再发一次 `-r 0:1`。
+
+### Task 5
+
+- **计划的错误：** `hidden` 只取基线的 `Delivered-Rev` 不够。交付录的基线树和交付的提交相同，`git log --follow` 常常不列它，于是交付的 rN 落进下一条基线的组里，和「已交付 rN」的本地提交重复出现。`hidden` 改为基线的 `deliveredRev` 加上本地提交 `delivered.rev` 的并集（测试 helper `hidden_of` 与前端同口径，Task 8 的 `hiddenRevs` 照此实现）。
+- **偏离计划：** 「初始化前已有 60 次提交」的 fixture 做不出来（`hybrid_with_colleague` 在 r1 后立刻初始化），改成初始化后同事提交 60 次再更新，测的是同一件事：一页 50、cursor 取剩下的、跨组取完后为 None（`sixty_revisions_page_by_fifty`）。
+- **偏离计划：** 「没有调 svn」用一个不存在的仓库路径证明：没有基线组时连仓库都不碰（`a_file_never_in_a_baseline_makes_no_svn_call`）。
+- **偏离计划：** 服务器上这个 peg 处没有该路径（`svn_path_missing`）当作这一段为空、继续看更老的组，不报错。
+- **计划没写的坑：** 一页内换 peg 时，后一段的 `-l` 要用这一页剩下的额度，`next_cursor` 判「满页」也用这个额度，否则一页会超过 50 条或提前截断。
+- **验证测试有效：** 把换 peg 改成永不发生，`git_rename_delivered_switches_peg`、`delete_and_recreate_switches_peg` 失败；改回后全过。

@@ -5,6 +5,7 @@
 
 use crate::engine::diff::{DiffData, DiffViewOptions};
 use crate::engine::file_history::{self, BlameData, FileHistory};
+use crate::engine::svn_file_history::{Cursor, GroupSpec, SvnHistoryPage};
 use crate::error::GitError;
 
 #[tauri::command(async)]
@@ -20,6 +21,20 @@ pub fn file_history(
 #[tauri::command(async)]
 pub fn blame_file(path: String, file: String, rev: Option<String>) -> Result<BlameData, GitError> {
     file_history::blame_file(&path, &file, rev.as_deref())
+}
+
+/// 混合仓库：把历史里的基线提交展开成真实 SVN 提交，一次一页。
+///
+/// JS 侧参数名：`{ path, groups, hidden, cursor }`，`groups` 元素 `{ id, path, fileRev }`，
+/// `cursor` 第一页传 null。SVN 出错放在结果的 `error` 里，不当成命令失败。
+#[tauri::command(async)]
+pub fn svn_file_history(
+    path: String,
+    groups: Vec<GroupSpec>,
+    hidden: Vec<u64>,
+    cursor: Option<Cursor>,
+) -> Result<SvnHistoryPage, GitError> {
+    crate::engine::svn_file_history::svn_file_history(&path, &groups, &hidden, cursor)
 }
 
 /// JS 侧参数名：`{ path, rev, file, oldFile, options }`。`options` 可以不传。

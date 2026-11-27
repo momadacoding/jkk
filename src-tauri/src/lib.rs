@@ -257,6 +257,7 @@ pub fn run() {
             commands::tree::read_blob,
             commands::history::file_history,
             commands::history::blame_file,
+            commands::history::svn_file_history,
             commands::history::commit_file_diff,
             commands::watch::unwatch_repo,
             commands::watch::watch_repo,

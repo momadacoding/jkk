@@ -3,9 +3,13 @@
 //! git 那一层（`file_history`）照旧先出；这里把其中的基线提交按记账展开成 SVN 提交。
 //! 本文件上半是纯函数（分组、翻页、换 peg），下半是去服务器查的编排。
 
+use crate::engine::svn_cli::{run_svn_deadline, SVN_QUERY_TIMEOUT};
+use crate::engine::svn_wc::WcIdentity;
 use crate::engine::svn_xml::SvnLogEntry;
+use crate::error::{GitError, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Mutex, OnceLock};
 
 /// 一页最多多少条 SVN 条目，与 TortoiseSVN Show Log 的默认一致（设计 §12）。
 pub const PAGE: usize = 50;
@@ -121,9 +125,242 @@ pub fn next_cursor(
         })
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// 去服务器查
+// ─────────────────────────────────────────────────────────────────────────
+
+/// SVN 那边没查成：不当成命令失败（git 那层照常显示），放进结果里让前端说明原因。
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SvnFetchError {
+    /// `svn_unreachable` / `svn_auth` / `svn_path_missing` / `svn_cli`（`svn_cli::classify_svn_error`）。
+    pub code: String,
+    pub message: String,
+}
+
+impl From<GitError> for SvnFetchError {
+    fn from(e: GitError) -> Self {
+        Self {
+            code: e.code,
+            message: e.message,
+        }
+    }
+}
+
+/// 一页 SVN 补全。
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SvnHistoryPage {
+    /// 基线提交 id → 这一页里归它的 SVN 提交（从新到旧）。这一页没分到的组不出现。
+    pub groups: BTreeMap<String, Vec<SvnRevEntry>>,
+    /// 下一页从哪儿查；`None` 是全部查完。出错时保留出错那一刻的位置，前端可以重试。
+    pub cursor: Option<Cursor>,
+    pub error: Option<SvnFetchError>,
+}
+
+/// 取一页（设计 §5.4）。`groups` 从新到旧；`hidden` 是已由本地提交代表的交付 revision。
+///
+/// 没有基线组时直接返回空页，一条 svn 命令都不发（这个文件从没进过基线）。SVN 出错不返回
+/// `Err`：已经拿到的分组照常给，原因放进 `error`。
+pub fn svn_file_history(
+    repo: &str,
+    groups: &[GroupSpec],
+    hidden: &[u64],
+    cursor: Option<Cursor>,
+) -> Result<SvnHistoryPage> {
+    check_groups(groups)?;
+    if groups.is_empty() {
+        return Ok(empty_page());
+    }
+    match crate::engine::svn_wc::units_cached(repo) {
+        Ok(units) => page_with_units(repo, &units, groups, hidden, cursor),
+        Err(e) => Ok(SvnHistoryPage {
+            groups: BTreeMap::new(),
+            cursor,
+            error: Some(e.into()),
+        }),
+    }
+}
+
+/// [`svn_file_history`] 的本体，单元由调用方给（测试用它造一个连不上的单元）。
+pub fn page_with_units(
+    repo: &str,
+    units: &[WcIdentity],
+    groups: &[GroupSpec],
+    hidden: &[u64],
+    cursor: Option<Cursor>,
+) -> Result<SvnHistoryPage> {
+    check_groups(groups)?;
+    let Some(first) = groups.first() else {
+        return Ok(empty_page());
+    };
+    let hidden: BTreeSet<u64> = hidden.iter().copied().collect();
+    let mut cur = cursor.unwrap_or_else(|| Cursor {
+        peg_path: first.path.clone(),
+        peg_rev: first.file_rev,
+        next_top: first.file_rev,
+    });
+    let mut collected: Vec<SvnLogEntry> = Vec::new();
+    // 一页里最多换这么多次 peg：每次都只往更老的组走，组数就是上限，这里再兜一层
+    for _ in 0..=groups.len() {
+        let limit = PAGE - collected.len().min(PAGE - 1);
+        let fetched = match fetch_segment(repo, units, &cur, limit) {
+            Ok(f) => f,
+            Err(e) => {
+                return Ok(SvnHistoryPage {
+                    groups: bucket(groups, &collected, &hidden),
+                    cursor: Some(cur),
+                    error: Some(e.into()),
+                })
+            }
+        };
+        let next = next_cursor(groups, &cur, &fetched, limit);
+        collected.extend(fetched);
+        match next {
+            Some(n) if collected.len() < PAGE => cur = n,
+            next => {
+                return Ok(SvnHistoryPage {
+                    groups: bucket(groups, &collected, &hidden),
+                    cursor: next,
+                    error: None,
+                })
+            }
+        }
+    }
+    Ok(SvnHistoryPage {
+        groups: bucket(groups, &collected, &hidden),
+        cursor: None,
+        error: None,
+    })
+}
+
+fn empty_page() -> SvnHistoryPage {
+    SvnHistoryPage {
+        groups: BTreeMap::new(),
+        cursor: None,
+        error: None,
+    }
+}
+
+fn check_groups(groups: &[GroupSpec]) -> Result<()> {
+    for g in groups {
+        // 空路径在 URL 里会变成单元根：查出整个目录的历史，而不是这个文件的
+        if g.id.is_empty() || g.path.is_empty() || g.file_rev == 0 {
+            return Err(GitError::new(
+                "bad_history_args",
+                format!("基线组参数不完整：{g:?}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 按 `cur` 查一段：`svn log --xml -r <next_top>:1 -l <limit> -- <url>@<peg_rev>`。
+///
+/// 路径不在任何白名单单元底下（git 里有、SVN 不管的文件），或者服务器上这个 peg 处没有这个路径，
+/// 都当这一段什么都没有，交给 [`next_cursor`] 去看更老的组。
+fn fetch_segment(
+    repo: &str,
+    units: &[WcIdentity],
+    cur: &Cursor,
+    limit: usize,
+) -> Result<Vec<SvnLogEntry>> {
+    let Some((i, _)) = crate::engine::svn_wc::unit_of(units, &cur.peg_path) else {
+        return Ok(Vec::new());
+    };
+    let Some(url) = crate::engine::svn_wc::server_url(units, &cur.peg_path) else {
+        return Ok(Vec::new());
+    };
+    let key = format!(
+        "log\u{1f}{}\u{1f}{url}\u{1f}{}\u{1f}{}\u{1f}{limit}",
+        units[i].uuid, cur.peg_rev, cur.next_top
+    );
+    if let Some(CacheVal::Log(hit)) = cache_get(&key) {
+        return Ok(hit);
+    }
+    let range = format!("{}:1", cur.next_top);
+    let limit_s = limit.to_string();
+    let target = format!("{url}@{}", cur.peg_rev);
+    let xml = match run_svn_deadline(
+        repo,
+        &["log", "--xml", "-r", &range, "-l", &limit_s, "--", &target],
+        SVN_QUERY_TIMEOUT,
+    ) {
+        Ok(x) => x,
+        Err(e) if e.code == "svn_path_missing" => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let entries = crate::engine::svn_xml::parse_log(&xml)?;
+    cache_put(key, CacheVal::Log(entries.clone()));
+    Ok(entries)
+}
+
+// ── 进程内缓存 ─────────────────────────────────────────────────────────────
+//
+// 键里都带着 peg revision，结果不会再变，可以一直留到进程退出；总数设上限（设计 §7）。
+
+/// 缓存上限（设计 §7 的取值）。
+const CACHE_CAP: usize = 200;
+
+#[derive(Clone)]
+enum CacheVal {
+    Log(Vec<SvnLogEntry>),
+}
+
+#[derive(Default)]
+struct Lru {
+    map: HashMap<String, (u64, CacheVal)>,
+    tick: u64,
+}
+
+fn cache() -> &'static Mutex<Lru> {
+    static C: OnceLock<Mutex<Lru>> = OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+fn cache_get(key: &str) -> Option<CacheVal> {
+    let mut c = cache().lock().ok()?;
+    c.tick += 1;
+    let t = c.tick;
+    let hit = c.map.get_mut(key)?;
+    hit.0 = t;
+    Some(hit.1.clone())
+}
+
+fn cache_put(key: String, val: CacheVal) {
+    let Ok(mut c) = cache().lock() else {
+        return;
+    };
+    c.tick += 1;
+    let t = c.tick;
+    if c.map.len() >= CACHE_CAP && !c.map.contains_key(&key) {
+        if let Some(old) = c
+            .map
+            .iter()
+            .min_by_key(|(_, v)| v.0)
+            .map(|(k, _)| k.clone())
+        {
+            c.map.remove(&old);
+        }
+    }
+    c.map.insert(key, (t, val));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cache_evicts_the_least_recently_used() {
+        for i in 0..CACHE_CAP {
+            cache_put(format!("lru-test-{i}"), CacheVal::Log(Vec::new()));
+        }
+        // 碰一下第 0 条，它就不是最久没用的了
+        assert!(cache_get("lru-test-0").is_some());
+        cache_put("lru-test-new".to_string(), CacheVal::Log(Vec::new()));
+        assert!(cache_get("lru-test-0").is_some());
+        assert!(cache().lock().unwrap().map.len() <= CACHE_CAP);
+    }
 
     fn g(id: &str, rev: u64) -> GroupSpec {
         GroupSpec {
