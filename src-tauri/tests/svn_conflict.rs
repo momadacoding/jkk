@@ -227,6 +227,21 @@ fn refuses_what_it_does_not_handle_and_touches_nothing() {
 }
 
 #[test]
+fn resolve_is_refused_while_a_merge_tool_has_the_file_open() {
+    // 独立 review：工具还开着时 svn 改写文件、删掉 .mine/.rN，用户之后在工具里一保存就盖回去
+    let fx = conflicted();
+    let held = app_lib::engine::external_launch::try_lock(&fx.wc_str(), "Art/x.psd", "BC").unwrap();
+
+    let err = resolve_conflict(&fx.wc_str(), "Art/x.psd", ResolveChoice::Theirs).unwrap_err();
+    assert_eq!(err.code, "external_tool_busy", "{}", err.message);
+    assert!(still_conflicted(&fx, "Art/x.psd"));
+
+    drop(held);
+    resolve_conflict(&fx.wc_str(), "Art/x.psd", ResolveChoice::Theirs).unwrap();
+    assert!(!still_conflicted(&fx, "Art/x.psd"));
+}
+
+#[test]
 fn prepare_merge_hands_out_svns_own_three_files() {
     let fx = conflicted();
     let m = prepare_conflict_merge(&fx.wc_str(), "Art/x.psd").unwrap();

@@ -56,6 +56,8 @@ export const CONFLICT_LIST_CODES: ReadonlySet<string> = new Set([
   'sync_in_svn_conflicted',
   'svn_preflight_conflicted',
   'sync_out_svn_conflicted',
+  // 交付提交之后 D6 对白名单 update 撞上冲突：其中 git 不管的文件同样能在列表里解决（独立 review）
+  'sync_out_update_conflict',
 ])
 
 /**
@@ -99,11 +101,15 @@ export function describeConflictList(conflicts: SvnConflict[]): ConflictListMode
   const rows = conflicts.filter((c) => c.resolvable).map(row)
   const refused = conflicts.filter((c) => !c.resolvable).map(row)
   const done = conflicts.length === 0
+  // 只剩要去 TortoiseSVN 的（更新整次回退之后常见）：不能说「这些文件 git 不管」，下面列的正是 git 管的和树冲突
+  const intro = done
+    ? '冲突都解决了。'
+    : rows.length === 0
+      ? '工作副本里还有 SVN 冲突，下面这些本应用不处理，请用 TortoiseSVN 解决。解决之后才能再「更新」或「交付」。'
+      : '下面这些文件 git 不管，SVN 更新时与服务器的版本冲突了。解决之后才能再「更新」或「交付」。'
   return {
     title: 'SVN 冲突',
-    intro: done
-      ? '冲突都解决了。'
-      : '下面这些文件 git 不管，SVN 更新时与服务器的版本冲突了。解决之后才能再「更新」或「交付」。',
+    intro,
     rows,
     refused,
     refusedNote:
@@ -115,9 +121,23 @@ export function describeConflictList(conflicts: SvnConflict[]): ConflictListMode
   }
 }
 
-/** 「用我的」「用服务器的」之前的提醒：都会改写文件，不能撤销。 */
-export function describeResolveWarning(c: SvnConflict, choice: 'mine' | 'theirs'): string {
+/** 点了要先在行里确认的操作。 */
+export type ConfirmChoice = 'mine' | 'theirs' | 'merged'
+
+/**
+ * 这个操作要不要先确认：「用我的」「用服务器的」都会改写文件，一律确认；「标记已解决」只在同时有属性冲突时
+ * 确认——`--accept working` 会把属性冲突一并按本地的值解决，服务器这次的属性改动丢掉（独立 review）。
+ */
+export function needsConfirm(c: SvnConflict, action: ConflictAction): action is ConfirmChoice {
+  return action === 'mine' || action === 'theirs' || (action === 'merged' && c.props)
+}
+
+/** 确认时的提醒。 */
+export function describeResolveWarning(c: SvnConflict, choice: ConfirmChoice): string {
   const what = c.text && c.props ? '内容和属性' : c.props ? '属性' : '内容'
+  if (choice === 'merged') {
+    return '内容用你在外部工具里保存的结果；属性冲突一并按你本地的值解决，服务器这次的属性改动丢掉。不能撤销。'
+  }
   return choice === 'mine'
     ? `整个文件的${what}用你更新前的版本，服务器这次的改动丢掉。不能撤销。`
     : `整个文件的${what}换成服务器的版本，你本地的改动丢掉。不能撤销。`

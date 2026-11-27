@@ -106,6 +106,56 @@ describe('SvnConflictsDialog', () => {
     expect(btn('Art/UI_Main.prefab：用我的')).toBeTruthy()
   })
 
+  it('一行在跑时别的行按钮也禁用，「关闭」也禁用（独立 review：两个 svn resolve 抢 wc.db）', async () => {
+    let release!: () => void
+    const Y = { ...X, path: 'Art/Other.prefab' }
+    open({
+      initial: [X, Y],
+      load: async () => [Y],
+      resolve: () => new Promise<void>((r) => (release = r)),
+    })
+    fireEvent.click(btn('Art/UI_Main.prefab：标记已解决'))
+    await waitFor(() => expect((btn('Art/Other.prefab：用我的') as HTMLButtonElement).disabled).toBe(true))
+    expect((btn('关闭') as HTMLButtonElement).disabled).toBe(true)
+    await act(async () => release())
+    await waitFor(() => expect((btn('Art/Other.prefab：用我的') as HTMLButtonElement).disabled).toBe(false))
+  })
+
+  it('同时有属性冲突时「标记已解决」先确认，说出属性按本地的值', async () => {
+    const { resolve } = open({ initial: [{ ...X, props: true }] })
+    fireEvent.click(btn('Art/UI_Main.prefab：标记已解决'))
+    expect(resolve).not.toHaveBeenCalled()
+    expect(screen.getByText(/属性冲突一并按你本地的值解决/)).toBeTruthy()
+    fireEvent.click(btn('确定标记已解决'))
+    await waitFor(() => expect(resolve).toHaveBeenCalledWith('Art/UI_Main.prefab', 'merged'))
+  })
+
+  it('开着时再弹一次：换成新的，旧的 Promise 结束', async () => {
+    let show!: (r: SvnConflictsRequest) => Promise<void>
+    function Harness() {
+      const { showSvnConflicts, dialog } = useSvnConflictsDialog()
+      show = showSvnConflicts
+      return <>{dialog}</>
+    }
+    render(<Harness />)
+    const req = (initial: SvnConflict[]): SvnConflictsRequest => ({
+      initial,
+      load: async () => initial,
+      resolve: async () => {},
+      merge: () => null,
+    })
+    let first!: Promise<void>
+    act(() => {
+      first = show(req([X]))
+    })
+    act(() => {
+      void show(req([{ ...X, path: 'Art/New.prefab' }]))
+    })
+    await expect(first).resolves.toBeUndefined()
+    expect(await screen.findByText('Art/New.prefab')).toBeTruthy()
+    expect(screen.queryByText('Art/UI_Main.prefab')).toBeNull()
+  })
+
   it('点「关闭」：框消失，Promise 结束', async () => {
     const { closed } = open()
     fireEvent.click(btn('关闭'))

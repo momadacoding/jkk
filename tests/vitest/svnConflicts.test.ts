@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   describeConflictList,
   describeResolveWarning,
+  needsConfirm,
   offerAfterOutcome,
   opensConflictList,
   type SvnConflict,
@@ -54,11 +55,31 @@ describe('describeConflictList', () => {
     expect(describeConflictList([{ ...base, props: true }]).rows[0].kind).toBe('内容和属性都冲突')
   })
 
+  it('只剩要去 TortoiseSVN 的：开头不说「git 不管」', () => {
+    const m = describeConflictList([{ ...base, path: 'Code/A.cs', gitManaged: true, resolvable: false, mergeable: false }])
+    expect(m.intro).not.toContain('git 不管')
+    expect(m.intro).toContain('TortoiseSVN')
+  })
+
   it('空清单就是都解决了，不再提 Unity', () => {
     const m = describeConflictList([])
     expect(m.done).toBe(true)
     expect(m.intro).toBe('冲突都解决了。')
     expect(m.notes).toEqual([])
+  })
+})
+
+describe('needsConfirm', () => {
+  it('用我的 / 用服务器的一律确认；标记已解决只在还有属性冲突时确认；合并工具不确认', () => {
+    expect(needsConfirm(base, 'mine')).toBe(true)
+    expect(needsConfirm(base, 'theirs')).toBe(true)
+    expect(needsConfirm(base, 'merged')).toBe(false)
+    expect(needsConfirm({ ...base, props: true }, 'merged')).toBe(true)
+    expect(needsConfirm({ ...base, props: true }, 'merge')).toBe(false)
+  })
+
+  it('标记已解决的提醒说出属性按本地的值解决', () => {
+    expect(describeResolveWarning({ ...base, props: true }, 'merged')).toContain('属性冲突一并按你本地的值解决')
   })
 })
 
@@ -90,6 +111,7 @@ describe('opensConflictList', () => {
       'sync_in_svn_conflicted',
       'svn_preflight_conflicted',
       'sync_out_svn_conflicted',
+      'sync_out_update_conflict',
     ]) {
       expect(opensConflictList({ code, message: '' })).toBe(true)
     }

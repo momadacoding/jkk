@@ -1160,7 +1160,9 @@ export function RepoTab({
     const path = repoPath
     void svnUpdateConflicts(path)
       .then((initial) => {
-        if (initial.length === 0) return
+        // 查的这几秒里用户又发起了一次同步（它的确认框正开着）：不弹在它上面抢焦点（独立 review）。
+        // 那次同步走完会再查一次
+        if (initial.length === 0 || syncFlowRunning.current) return
         return showSvnConflicts({
           initial,
           load: () => svnUpdateConflicts(path),

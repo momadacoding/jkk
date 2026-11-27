@@ -12,7 +12,7 @@
 | 4 命令与文案 | 完成 | `commands/svn_sync.rs` 两条、`commands/external.rs` 一条、`lib.rs` 注册；预检 / 录制 / 交付三处文案 | `cargo clippy --all-targets` 无告警 |
 | 5 前端纯逻辑与 store | 完成 | `src/engine/svnConflicts.ts`、`repoStore` / `externalToolsStore` 三个 invoke、两个流程接 `offerSvnConflicts` | `pnpm test`：2080 passed |
 | 6 弹框与接线 | 完成 | `SvnConflictsDialog.tsx`、`RepoTab.tsx`、`styles.css`、布局场景两个、组件测试 | `pnpm build` 通过；`pnpm test:layout`：218 passed |
-| 7 验证 | 完成（review 待做） | 决策条目 Task 7 | `cargo test`：lib 196 + 116 个测试二进制全过（分批）；`pnpm build` / `pnpm test` / `pnpm test:layout` 通过；`pnpm tauri dev` E2E 6 步通过 |
+| 7 验证 | 完成（独立 review 4 条 important 已修，见末节） | 决策条目 Task 7 | `cargo test`：lib 196 + 116 个测试二进制全过（分批）；`pnpm build` / `pnpm test` / `pnpm test:layout` 通过；`pnpm tauri dev` E2E 6 步通过 |
 
 ## 决策条目
 
@@ -71,3 +71,19 @@
   5. 还剩 `Code/ui.png` 冲突时再点「更新」：顶部报 `sync_in_svn_conflicted`（分两组列），冲突列表重新弹出。
   6. 解决最后一个后显示「冲突都解决了。」；`svn_update_conflicts` 返回空，`svn_sync_in_preview` 正常通过。
   - 没有在真 TortoiseSVN 里看（同一个 wc.db，`svn status` 已显示 `M` 而不是 `C`）。
+
+### 独立 review（`/code-review high`，2026-11-28）
+
+| 发现 | 级别 | 处理 |
+|---|---|---|
+| 一行在跑时别的行按钮仍可点，两个 `svn resolve` 并发；先完成的清掉 busy，Esc 能在另一行没结束时关框 | important | 已修：按钮按框级 `anyBusy` 禁用，`busy` 只管按钮上的字。组件测试覆盖 |
+| 内容 + 属性都冲突时「标记已解决」（`--accept working`）会把属性冲突按本地值一并解决，没有提示 | important | 已修：这种情况先在行内确认，提醒写明属性按本地值、服务器的属性改动丢掉（`needsConfirm`）。没有改成拒绝：svn 命令行不能只解决一种冲突，拒绝就等于不让合并 |
+| 外部合并工具还开着时「用我的 / 用服务器的」照样执行，之后工具一保存就把结果盖回来 | important | 已修：`resolve_conflict` 先 `try_lock`，被占时报 `external_tool_busy`。Rust 测试覆盖 |
+| `.gitignore` / `.gitattributes` 冲突被当成 git 不管的文件放行，S6–S7 按带冲突标记的规则录基线 | important | 已修：任何一级的这两个文件按 W-file 对待，整次回退。Rust 测试 `a_conflict_on_a_gitignore_still_rolls_back` |
+| 列表在别的同步确认框打开之后才弹出来，抢焦点 | nit | 已修一半：查完时有同步流程在跑就不弹（那次走完会再查）。别的非同步弹框（删分支等）开着时仍可能叠上去，没处理 |
+| 只剩要去 TortoiseSVN 的冲突时，开头仍说「这些文件 git 不管」 | nit | 已修 |
+| `setPending` 的 updater 里有副作用 | nit | 已修：当前请求放 ref，updater 只赋值 |
+| 交付执行中 D6 的 `sync_out_update_conflict` 不弹列表 | nit | 已修：加进错误码，交付执行与「继续」都接上 |
+| `svn_resolve_conflict` 没挂起监听 | nit | 已修：命令层包 `with_watch_suspended`（签名多了 `AppHandle`，JS 侧参数不变，已在 `pnpm tauri dev` 里实调一次确认） |
+
+修完之后：`cargo fmt --check`、`cargo clippy --all-targets`（0 告警）、`svn_sync_in`（91）/ `svn_conflict`（12）/ `svn_sync_check`（28）/ `svn_sync_out_check`（18）/ `commands_are_async` 通过；`pnpm build`、`pnpm test`（2088）、`pnpm test:layout`（218）通过。

@@ -70,13 +70,16 @@ pub fn svn_update_conflicts(path: String) -> Result<Vec<SvnConflict>, GitError> 
 
 /// 解决一个 git 不管的文件上的 SVN 冲突。JS 侧：`invoke('svn_resolve_conflict', { path, file, choice })`，
 /// `choice` 是 `'mine' | 'theirs' | 'merged'`。
+///
+/// 挂起监听：`svn resolve` 拿着 wc.db 写锁改写、删除文件，期间被触发的刷新跑 `svn status` 会撞上锁。
 #[tauri::command(async)]
 pub fn svn_resolve_conflict(
+    handle: AppHandle,
     path: String,
     file: String,
     choice: ResolveChoice,
 ) -> Result<(), GitError> {
-    resolve_conflict(&path, &file, choice)
+    with_watch_suspended(&handle, &path, || resolve_conflict(&path, &file, choice))
 }
 
 /// 交付预览：前置检查与净变更清单，**什么都不改**（Phase 3a 计划 B1）。

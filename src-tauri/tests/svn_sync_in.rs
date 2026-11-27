@@ -1520,6 +1520,26 @@ fn a_property_conflict_on_a_directory_still_rolls_back() {
 }
 
 #[test]
+fn a_conflict_on_a_gitignore_still_rolls_back() {
+    // 独立 review：`.gitignore` / `.gitattributes` 的扩展名不在列表里，却决定哪些是 W-file、行尾怎么归一。
+    // 带冲突标记放过去的话，S6–S7 按两边规则的混合录基线，不报任何错
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Art/.gitignore", "*.tmp\n");
+    assert_eq!(sync(&fx), SyncInOutcome::Done { new_rev: 2 });
+    write(&fx, "Art/.gitignore", "*.tmp\n*.mine-rule\n");
+    fx.colleague_commits("Art/.gitignore", "*.tmp\n*.theirs-rule\n");
+    write(&fx, "Code/B.cs", "b-wip\n");
+
+    let err = run_sync_in(&fx.wc_str(), &expect(&fx)).unwrap_err();
+
+    assert_eq!(err.code, "sync_in_update_conflict", "{}", err.message);
+    assert!(err.message.contains("Art/.gitignore"), "{}", err.message);
+    assert_eq!(baseline_rev(&fx), 2, "基线不推进");
+    assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
+    assert_eq!(phase(&fx), None);
+}
+
+#[test]
 fn the_next_update_is_refused_until_the_conflict_is_resolved() {
     // 设计 §2.2：冲突还在时 svn 会跳过它、让它停在旧 revision（预研 §5.2 实测），所以预检照旧拒绝，
     // 文案指向 jkk 的冲突列表

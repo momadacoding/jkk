@@ -99,11 +99,21 @@ pub(crate) fn read_conflicts(
         .collect())
 }
 
+/// `.gitignore` / `.gitattributes`（任何一级目录）：扩展名不在列表里，但它们决定哪些文件是 W-file、
+/// 基线怎么归一化行尾。带冲突标记时 S6–S7 会按两边规则的混合录基线，不报任何错（独立 review），
+/// 所以与 W-file 同等对待。
+fn is_git_rule_file(path: &str) -> bool {
+    matches!(
+        path.rsplit('/').next(),
+        Some(".gitignore" | ".gitattributes")
+    )
+}
+
 impl SvnConflict {
     /// 一个冲突条目分类。`w_files` 是这批条目里的 W-file（[`WScope::filter`] 的结果）。
     pub(crate) fn classify(repo: &str, e: &UpdateStatusEntry, w_files: &BTreeSet<String>) -> Self {
         let dir = Path::new(repo).join(&e.path).is_dir();
-        let git_managed = w_files.contains(&e.path);
+        let git_managed = w_files.contains(&e.path) || is_git_rule_file(&e.path);
         Self {
             path: e.path.clone(),
             text: e.item == "conflicted",
@@ -203,8 +213,13 @@ fn has_conflict_markers(abs: &Path) -> Result<bool> {
 ///
 /// 同步（更新、交付、跟进）正在跑时拒绝：S5 的 `svn update` 与这里的 `svn resolve` 会抢 wc.db 的写锁，
 /// 读冲突那一步也会读到半途的状态。
+///
+/// 外部合并工具还开着这个文件时也拒绝（与 [`open_conflict_merge`] 共用 `try_lock`）：svn 会改写工作副本里的
+/// 文件、删掉工具正在用的 `.mine` / `.rN`，用户之后在工具里一保存，合并结果又盖回来（独立 review）。
 pub fn resolve_conflict(repo: &str, file: &str, choice: ResolveChoice) -> Result<()> {
     svn_lock::assert_not_syncing(repo)?;
+    check_rel_path(file)?;
+    let _tool = try_lock(repo, file, "svn resolve")?;
     let cfg = read_config(repo)?;
     let c = current_conflict(repo, &cfg, file)?;
     if choice == ResolveChoice::Merged {

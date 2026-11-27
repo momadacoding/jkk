@@ -6,6 +6,8 @@ import {
   BUSY_LABELS,
   describeConflictList,
   describeResolveWarning,
+  needsConfirm,
+  type ConfirmChoice,
   type ConflictAction,
   type ConflictRow,
   type ResolveChoice,
@@ -34,14 +36,15 @@ interface Pending extends SvnConflictsRequest {
   id: number
 }
 
-/** 「用我的」「用服务器的」点了之后先在这一行里确认：都会改写文件，不能撤销。 */
-type Confirming = { path: string; choice: 'mine' | 'theirs' }
+/** 要先确认的操作（`needsConfirm`）点了之后在这一行里确认：都会改写文件，不能撤销。 */
+type Confirming = { path: string; choice: ConfirmChoice }
 
 function Row({
   row,
   conflict,
   merge,
   busy,
+  anyBusy,
   confirming,
   error,
   onAction,
@@ -51,8 +54,14 @@ function Row({
   row: ConflictRow
   conflict: SvnConflict
   merge: ConflictMergeAction | null
+  /** 这一行正在跑的操作（只管按钮上的字）。 */
   busy: ConflictAction | null
-  confirming: 'mine' | 'theirs' | null
+  /**
+   * 框里任何一行在跑。按钮一律按它禁用：两行同时 `svn resolve` 会抢 wc.db 的写锁，先完成的那一行还会把
+   * 「在跑」清掉，Esc 就能在另一行没结束时关框（独立 review）。
+   */
+  anyBusy: boolean
+  confirming: ConfirmChoice | null
   error: string | null
   onAction: (a: ConflictAction) => void
   onConfirm: () => void
@@ -75,7 +84,7 @@ function Row({
               className="follow-compare"
               aria-label={`${row.path}：${a === 'merge' && merge ? `用 ${merge.label} 合并` : ACTION_LABELS[a]}`}
               onClick={() => onAction(a)}
-              disabled={busy !== null || confirming !== null}
+              disabled={anyBusy || confirming !== null}
             >
               {label(a)}
             </button>
@@ -86,10 +95,10 @@ function Row({
         <div className="dlg-warning svn-conflict-confirm" role="alert">
           <div>{describeResolveWarning(conflict, confirming)}</div>
           <div className="conflict-compare">
-            <button type="button" className="follow-compare" onClick={onConfirm} disabled={busy !== null}>
+            <button type="button" className="follow-compare" onClick={onConfirm} disabled={anyBusy}>
               {busy ? BUSY_LABELS[confirming] : `确定${ACTION_LABELS[confirming]}`}
             </button>
-            <button type="button" className="follow-compare" onClick={onCancel} disabled={busy !== null}>
+            <button type="button" className="follow-compare" onClick={onCancel} disabled={anyBusy}>
               不改了
             </button>
           </div>
@@ -163,7 +172,7 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
   }
 
   const onAction = (c: SvnConflict, a: ConflictAction) => {
-    if (a === 'mine' || a === 'theirs') {
+    if (needsConfirm(c, a)) {
       setError(c.path, null)
       setConfirming({ path: c.path, choice: a })
       return
@@ -207,6 +216,7 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
                   conflict={c}
                   merge={request.merge(c)}
                   busy={busy?.path === row.path ? busy.action : null}
+                  anyBusy={busy !== null}
                   confirming={confirming?.path === row.path ? confirming.choice : null}
                   error={errors[row.path] ?? null}
                   onAction={(a) => onAction(c, a)}
@@ -263,15 +273,17 @@ function Dialog({ request, onDone }: { request: Pending; onDone: () => void }) {
 export function useSvnConflictsDialog() {
   const [pending, setPending] = useState<Pending | null>(null)
   const seq = useRef(0)
+  // 当前开着的那一次。放 ref 而不是在 setPending 的 updater 里读：updater 可能被 React 调两次，副作用不能放里面
+  const current = useRef<Pending | null>(null)
 
   const showSvnConflicts = useCallback(
     (request: SvnConflictsRequest) =>
       new Promise<void>((resolve2) => {
-        setPending((prev) => {
-          // 被换掉的那一次也算关了：等它的调用方不能永远挂着
-          prev?.resolve2()
-          return { ...request, resolve2, id: ++seq.current }
-        })
+        // 被换掉的那一次也算关了：等它的调用方不能永远挂着
+        current.current?.resolve2()
+        const next = { ...request, resolve2, id: ++seq.current }
+        current.current = next
+        setPending(next)
       }),
     [],
   )
@@ -280,7 +292,10 @@ export function useSvnConflictsDialog() {
     <Dialog
       key={pending.id}
       request={pending}
-      onDone={() => setPending((p) => (p?.id === pending.id ? null : p))}
+      onDone={() => {
+        if (current.current?.id === pending.id) current.current = null
+        setPending((p) => (p?.id === pending.id ? null : p))
+      }}
     />
   ) : null
 
