@@ -592,6 +592,13 @@ fn abort_after_the_update_keeps_the_server_content_of_files_i_never_touched() {
     assert_eq!(baseline_rev(&fx), 1, "基线没发布");
     assert_eq!(phase(&fx), None);
     assert_eq!(our_stashes(&fx), 0);
+    assert!(
+        matches!(
+            check_sync(&fx.wc_str()).unwrap().verdict,
+            SyncVerdict::ExternallyAdvanced { .. }
+        ),
+        "工作副本已在 r2、基线还是 r1——如实报 SVN 侧有新内容，横幅据此提示跟上"
+    );
 
     // 下次更新：基线跟上 r2，A.cs 这份未提交改动与新基线一致，三方合并自动抵消
     assert_eq!(sync(&fx), SyncInOutcome::Done { new_rev: 2 });
@@ -1598,6 +1605,38 @@ fn abort_after_a_half_done_update_that_deleted_a_file_does_not_bring_it_back() {
     assert_eq!(sync(&fx), SyncInOutcome::Done { new_rev: 2 });
     assert!(!fx.wc().join("Code/A.cs").exists());
     assert_eq!(git(&fx, &["status", "--porcelain", "--", "Code/A.cs"]), "");
+}
+
+#[test]
+fn abort_after_a_half_done_update_refuses_a_server_file_my_branch_also_added() {
+    // 终审 review 第 1 条：你在 work 上（只在 git 里）提交了 Code/N.cs，同事在 SVN 上新增了同名
+    // 文件。它在 svn/base 上是未跟踪文件，`checkout -f work` 会用分支的版本盖掉服务器的
+    let fx = hybrid_with_colleague();
+    write(&fx, "Code/N.cs", "mine\n");
+    git(&fx, &["add", "Code/N.cs"]);
+    commit(&fx, "local N");
+    fx.colleague_commits("Code/N.cs", "server\n");
+    s3_then_partial_update(&fx, "op-half-add", "Code/N.cs");
+    assert_eq!(read(&fx, "Code/N.cs"), "server\n");
+
+    let err = abort_sync(&fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "sync_in_update_incomplete", "{}", err.message);
+    assert!(err.message.contains("Code/N.cs"), "{}", err.message);
+    assert_eq!(read(&fx, "Code/N.cs"), "server\n", "没被分支的版本盖掉");
+    assert_svn_clean(&fx, "Code/N.cs");
+    assert_eq!(git(&fx, &["symbolic-ref", "--short", "HEAD"]), "svn/base");
+    assert_eq!(phase(&fx), Some(Phase::Stashed));
+
+    // 自动出口同理：S5 失败时也不回退
+    let repo = fx.repo();
+    let gone = fx.path().join("repo-gone");
+    std::fs::rename(&repo, &gone).unwrap();
+    let r = continue_sync(&fx.wc_str());
+    std::fs::rename(&gone, &repo).unwrap();
+    let err = r.unwrap_err();
+    assert_eq!(err.code, "sync_in_update_incomplete", "{}", err.message);
+    assert_eq!(read(&fx, "Code/N.cs"), "server\n");
+    assert_eq!(phase(&fx), Some(Phase::Stashed));
 }
 
 #[test]

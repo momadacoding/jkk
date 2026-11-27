@@ -352,12 +352,17 @@ export function continueNeedsConfirm(phase: string): boolean {
   return phase !== 'rebase'
 }
 
-// svn update 已经换掉了 git 管的文件、基线却还没跟上时（2026-11-27 现场），后端回原分支后
-// 保留这些文件的服务器内容，不写回旧版；你的提交或未提交改动也改过的，后端拒绝放弃
 const AFTER_UPDATE_ABORT =
   '回到更新前的分支，放回未提交的改动。SVN 那一侧已经更新的部分不会退回——' +
-  '如果基线还没跟上，顶部会提示失同步，用「重建基线」即可。' +
-  '已经被 svn update 换成新版本的 git 管文件保留服务器上的内容，显示为未提交的改动，下次更新时会自动对上；' +
+  '如果基线还没跟上，顶部会提示失同步，点「更新」或「重建基线」跟上即可。'
+
+// 基线还没发布、svn update 可能已经换掉了 git 管的文件（2026-11-27 现场）：后端回原分支后保留
+// 这些文件的服务器内容、不写回旧版；你的提交或未提交改动也改过的，后端拒绝放弃。
+// `stashing` 时 update 还没跑，`baseline-ready` 时基线已经发布，这两段都不会发生
+const BEFORE_PUBLISH_PHASES = new Set(['stashed', 'capturing-baseline', 'publishing-baseline'])
+const BEFORE_PUBLISH_ABORT =
+  AFTER_UPDATE_ABORT +
+  '已经被 svn update 换成新版本的 git 管文件保留服务器上的内容，显示为未提交的改动，跟上之后自动对上；' +
   '其中有你提交过或正在改的文件时不能放弃，只能点「继续」把更新跑完。'
 
 export function describeSyncAction(id: SyncActionId, phase: string): SyncConfirmModel {
@@ -377,7 +382,9 @@ export function describeSyncAction(id: SyncActionId, phase: string): SyncConfirm
         ? '中止重放，分支回到更新前的位置，放回未提交的改动。基线已经是新的，你的分支会落后于它，下次更新时再跟上。'
         : phase === 'applying-stash'
           ? '结束这次更新，不再自动放回改动。stash 里的备份（mygitclient-sync:…）会留在 stash 列表里，你可以之后自己取回。'
-          : AFTER_UPDATE_ABORT
+          : BEFORE_PUBLISH_PHASES.has(phase)
+            ? BEFORE_PUBLISH_ABORT
+            : AFTER_UPDATE_ABORT
   return {
     title: '放弃这次更新',
     message,

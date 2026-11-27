@@ -247,6 +247,14 @@ describe('describeSyncAction', () => {
     expect(m.message).toContain('「继续」')
   })
 
+  it('update 还没跑或基线已发布时，放弃不提保留服务器内容（那时不会发生）', () => {
+    for (const phase of ['stashing', 'baseline-ready']) {
+      const m = describeSyncAction('syncAbort', phase)
+      expect(m.message).toContain('重建基线')
+      expect(m.message).not.toContain('不能放弃')
+    }
+  })
+
   it('继续不是危险操作', () => {
     expect(describeSyncAction('syncContinue', 'rebase').danger).toBeFalsy()
   })
