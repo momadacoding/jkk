@@ -295,6 +295,96 @@ fn fetch_segment(
     Ok(entries)
 }
 
+/// 一条 SVN 提交里这个文件的改动（设计 §5.6）。
+///
+/// `peg_path@peg_rev` 是这条提交所在那组的 peg（前端从组里取）：`svn cat -r <rev> <url>@<peg>`
+/// 的操作版本从 peg 往回追，跟得上复制 / 改名。`rev - 1` 处还没有这个文件（新增）时旧侧为空。
+///
+/// diff 用 libgit2 算，输出与 git 提交的单文件 diff 同形、同一套 `DiffViewOptions`。两份内容只写进
+/// 一个挂在这次打开的仓库对象上的内存对象库（mempack），**不落 `.git/objects`**（设计 §2 反目标，
+/// `no_object_is_written_to_the_users_git` 实测）。
+pub fn svn_rev_file_diff(
+    repo: &str,
+    peg_path: &str,
+    peg_rev: u64,
+    rev: u64,
+    view: &crate::engine::diff::DiffViewOptions,
+) -> Result<crate::engine::diff::DiffData> {
+    if peg_path.is_empty() || rev == 0 || peg_rev < rev {
+        return Err(GitError::new(
+            "bad_history_args",
+            format!("SVN diff 参数不对：{peg_path}@{peg_rev} -c {rev}"),
+        ));
+    }
+    let units = crate::engine::svn_wc::units_cached(repo)?;
+    let url = crate::engine::svn_wc::server_url(&units, peg_path).ok_or_else(|| {
+        GitError::new(
+            "svn_path_missing",
+            format!("{peg_path} 不在任何 SVN 白名单目录底下"),
+        )
+    })?;
+    let target = format!("{url}@{peg_rev}");
+    let new = svn_cat(repo, &target, rev)?;
+    let old = if rev == 1 {
+        None
+    } else {
+        match svn_cat(repo, &target, rev - 1) {
+            Ok(b) => Some(b),
+            // 上一个版本还没有这个文件：这一条是新增
+            Err(e) if e.code == "svn_path_missing" => None,
+            Err(e) => return Err(e),
+        }
+    };
+    let r = git2::Repository::open(repo)?;
+    // 优先级高于默认的 loose（1）/ packed（2）后端：写入都落到内存里
+    r.odb()?.add_new_mempack_backend(1000)?;
+    let new_tree = tree_with_file(&r, peg_path, &new)?;
+    let old_tree = old
+        .as_deref()
+        .map(|b| tree_with_file(&r, peg_path, b))
+        .transpose()?;
+    let old_tree = old_tree.map(|o| r.find_tree(o)).transpose()?;
+    let new_tree = r.find_tree(new_tree)?;
+    let mut opts = view.options();
+    opts.pathspec(peg_path);
+    opts.disable_pathspec_match(true);
+    let diff = r.diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), Some(&mut opts))?;
+    crate::engine::diff::diff_to_data_only(diff, Some(peg_path))
+}
+
+fn svn_cat(repo: &str, target: &str, rev: u64) -> Result<Vec<u8>> {
+    let key = format!("cat\u{1f}{target}\u{1f}{rev}");
+    if let Some(CacheVal::Bytes(hit)) = cache_get(&key) {
+        return Ok(hit);
+    }
+    let r = rev.to_string();
+    let out = crate::engine::svn_cli::run_svn_deadline_bytes(
+        repo,
+        &["cat", "-r", &r, "--", target],
+        SVN_QUERY_TIMEOUT,
+    )?;
+    cache_put(key, CacheVal::Bytes(out.clone()));
+    Ok(out)
+}
+
+/// 建一棵只含 `path` 这一个文件的树（逐层建目录），返回根树的 id。
+fn tree_with_file(r: &git2::Repository, path: &str, bytes: &[u8]) -> Result<git2::Oid> {
+    let blob = r.blob(bytes)?;
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    let Some((name, dirs)) = parts.split_last() else {
+        return Err(GitError::new("bad_history_args", "空路径"));
+    };
+    let mut b = r.treebuilder(None)?;
+    b.insert(name, blob, 0o100644)?;
+    let mut child = b.write()?;
+    for d in dirs.iter().rev() {
+        let mut b = r.treebuilder(None)?;
+        b.insert(d, child, 0o040000)?;
+        child = b.write()?;
+    }
+    Ok(child)
+}
+
 // ── 进程内缓存 ─────────────────────────────────────────────────────────────
 //
 // 键里都带着 peg revision，结果不会再变，可以一直留到进程退出；总数设上限（设计 §7）。
@@ -305,6 +395,7 @@ const CACHE_CAP: usize = 200;
 #[derive(Clone)]
 enum CacheVal {
     Log(Vec<SvnLogEntry>),
+    Bytes(Vec<u8>),
 }
 
 #[derive(Default)]

@@ -12,7 +12,7 @@
 | 3 基线标注 | 完成 | `file_history.rs`：`EntrySvn` / `BaselineInfo` / `DeliveredState`、`SvnAnnotator`；`tests/file_history_svn.rs` | `file_history_svn` 7/7，`file_history` 27/27；fmt、clippy 干净 |
 | 4 分组纯函数 | 完成 | `svn_file_history.rs`：`GroupSpec`、`Cursor`、`SvnRevEntry`、`bucket`、`next_cursor`、`PAGE` | `cargo test --lib svn_file_history` 11/11 |
 | 5 `svn_file_history` | 完成 | `svn_file_history.rs`：`svn_file_history`、`page_with_units`、进程内 LRU；命令注册 | `file_history_svn` 18/18、`--lib svn_file_history` 12/12；改坏换 peg 的变异让 2 个测试失败 |
-| 6 `svn_rev_file_diff` | 未开始 | | |
+| 6 `svn_rev_file_diff` | 完成 | `svn_file_history.rs`：`svn_rev_file_diff`、`svn_cat`、`tree_with_file`；`svn_cli.rs`：`run_svn_deadline_bytes`；命令注册 | `file_history_svn` 23/23；去掉 mempack 的变异让 `no_object_is_written_to_the_users_git` 失败（10 ≠ 5） |
 | 7 `svn_blame_overlay` | 未开始 | | |
 | 8 前端 store 与纯函数 | 未开始 | | |
 | 9 FileHistoryView | 未开始 | | |
@@ -62,3 +62,10 @@
 - **偏离计划：** 服务器上这个 peg 处没有该路径（`svn_path_missing`）当作这一段为空、继续看更老的组，不报错。
 - **计划没写的坑：** 一页内换 peg 时，后一段的 `-l` 要用这一页剩下的额度，`next_cursor` 判「满页」也用这个额度，否则一页会超过 50 条或提前截断。
 - **验证测试有效：** 把换 peg 改成永不发生，`git_rename_delivered_switches_peg`、`delete_and_recreate_switches_peg` 失败；改回后全过。
+
+### Task 6
+
+- **计划没写的坑：** `run_svn_deadline` 把 stdout 有损地转成 UTF-8 字符串。`svn cat` 读的是文件内容（GBK、二进制都有），先转字符串就改了内容。新增 `run_svn_deadline_bytes`，`run_svn_deadline` 改成它的薄包装，Task 1 的 4 个测试照过。
+- **计划里「未核实」的那条已核实：** 在这次打开的 `Repository` 的对象库上 `add_new_mempack_backend(1000)` 之后，`blob` / `treebuilder` 的写入都进内存，`.git/objects` 的文件数不变。去掉这一行，同一个测试多出 5 个对象文件，确认测试有效。不需要临时裸仓库的退路。
+- **偏离计划：** 多加了 `binary_content_is_reported_as_binary`（含 NUL 的内容按二进制显示），以及参数防护：`peg_path` 为空、`rev == 0`、`peg_rev < rev` 返回 `bad_history_args`。路径不在任何白名单单元底下返回 `svn_path_missing`。
+- **为什么是安全的：** 只读。`svn cat` 不碰工作副本，diff 的对象只在内存里，打开的 `Repository` 用完即丢。

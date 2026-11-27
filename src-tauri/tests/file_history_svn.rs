@@ -5,12 +5,15 @@
 #[path = "common/svn_fixtures.rs"]
 mod svn_fixtures;
 
+use app_lib::engine::diff::{DiffData, DiffViewOptions};
 use app_lib::engine::file_history::{blame_file, file_history, DeliveredState, FileHistoryEntry};
 use app_lib::engine::git_cli::run_git;
 use app_lib::engine::svn_baseline::create_baseline_commit_with;
 use app_lib::engine::svn_basemap::read_base_map;
 use app_lib::engine::svn_cli::run_svn;
-use app_lib::engine::svn_file_history::{page_with_units, svn_file_history, GroupSpec};
+use app_lib::engine::svn_file_history::{
+    page_with_units, svn_file_history, svn_rev_file_diff, GroupSpec,
+};
 use app_lib::engine::svn_sync_check::preview_sync_in;
 use app_lib::engine::svn_sync_in::{run_sync_in, SyncInExpect};
 use app_lib::engine::svn_sync_out::{run_sync_out, SyncOutExpect};
@@ -453,4 +456,97 @@ fn unreachable_server_is_reported_in_error_not_as_err() {
     let page = page_with_units(&fx.wc_str(), &[unit], &groups, &[], None).unwrap();
     assert_eq!(page.error.as_ref().unwrap().code, "svn_unreachable");
     assert!(page.cursor.is_some(), "出错时保留游标，用户可以重试");
+}
+
+// ---------------------------------------------------------------------------
+// Task 6：svn_rev_file_diff
+// ---------------------------------------------------------------------------
+
+fn lines(d: &DiffData, origin: char) -> Vec<String> {
+    d.files
+        .iter()
+        .flat_map(|f| f.hunks.iter())
+        .flat_map(|h| h.lines.iter())
+        .filter(|l| l.origin == origin)
+        .map(|l| l.content.trim_end_matches(['\r', '\n']).to_string())
+        .collect()
+}
+/// `.git/objects` 底下的文件总数（含 pack）。
+fn object_files(fx: &SvnFixture) -> usize {
+    fn walk(p: &std::path::Path) -> usize {
+        std::fs::read_dir(p)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                if e.file_type().unwrap().is_dir() {
+                    walk(&e.path())
+                } else {
+                    1
+                }
+            })
+            .sum()
+    }
+    walk(&fx.wc().join(".git/objects"))
+}
+
+#[test]
+fn a_colleague_revision_diff_matches_svn_diff() {
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits(A, "a1\nc\n");
+    let d = svn_rev_file_diff(&fx.wc_str(), A, 2, 2, &DiffViewOptions::default()).unwrap();
+    assert_eq!(d.files.len(), 1);
+    assert_eq!(d.files[0].path, A);
+    assert_eq!(d.files[0].status, "modified");
+    let url = format!("{}/Code/A.cs", svn_fixtures::file_url(&fx.repo()));
+    let svn = run_svn(&fx.wc_str(), &["diff", "-c", "2", "--", &url]).unwrap();
+    let plus: Vec<String> = svn
+        .lines()
+        .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+        .map(|l| l[1..].to_string())
+        .collect();
+    assert_eq!(lines(&d, '+'), plus);
+    assert!(lines(&d, '-').is_empty());
+}
+
+#[test]
+fn the_add_revision_shows_the_whole_file_as_added() {
+    let fx = hybrid_with_colleague();
+    let d = svn_rev_file_diff(&fx.wc_str(), A, 1, 1, &DiffViewOptions::default()).unwrap();
+    assert_eq!(d.files[0].status, "added");
+    assert_eq!(lines(&d, '+'), vec!["a1"]);
+}
+
+#[test]
+fn ignore_whitespace_option_applies() {
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits(A, "a1   \n");
+    let plain = svn_rev_file_diff(&fx.wc_str(), A, 2, 2, &DiffViewOptions::default()).unwrap();
+    assert_eq!(lines(&plain, '+').len(), 1);
+    let ws = DiffViewOptions {
+        ignore_whitespace: true,
+        ..Default::default()
+    };
+    let d = svn_rev_file_diff(&fx.wc_str(), A, 2, 2, &ws).unwrap();
+    assert!(
+        lines(&d, '+').is_empty() && lines(&d, '-').is_empty(),
+        "{d:?}"
+    );
+}
+
+#[test]
+fn binary_content_is_reported_as_binary() {
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits(A, "a1\n\0\x01\x02\n");
+    let d = svn_rev_file_diff(&fx.wc_str(), A, 2, 2, &DiffViewOptions::default()).unwrap();
+    assert!(d.files[0].binary);
+}
+
+#[test]
+fn no_object_is_written_to_the_users_git() {
+    let fx = hybrid_with_colleague();
+    // 同事的新内容从没进过本地 git：diff 若往 .git 写 blob，这里一定多出文件
+    fx.colleague_commits(A, "a1\nnever seen by git\n");
+    let before = object_files(&fx);
+    svn_rev_file_diff(&fx.wc_str(), A, 2, 2, &DiffViewOptions::default()).unwrap();
+    assert_eq!(object_files(&fx), before);
 }

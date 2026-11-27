@@ -37,6 +37,27 @@ pub fn svn_file_history(
     crate::engine::svn_file_history::svn_file_history(&path, &groups, &hidden, cursor)
 }
 
+/// 混合仓库：一条 SVN 提交里这个文件的改动。
+///
+/// JS 侧参数名：`{ path, pegPath, pegRev, rev, options }`。`pegPath` / `pegRev` 取这条提交所在那组
+/// 基线的路径和 `fileRev`。`options` 可以不传。
+#[tauri::command(async)]
+pub fn svn_rev_file_diff(
+    path: String,
+    peg_path: String,
+    peg_rev: u64,
+    rev: u64,
+    options: Option<DiffViewOptions>,
+) -> Result<DiffData, GitError> {
+    crate::engine::svn_file_history::svn_rev_file_diff(
+        &path,
+        &peg_path,
+        peg_rev,
+        rev,
+        &options.unwrap_or_default(),
+    )
+}
+
 /// JS 侧参数名：`{ path, rev, file, oldFile, options }`。`options` 可以不传。
 #[tauri::command(async)]
 pub fn commit_file_diff(

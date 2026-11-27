@@ -93,6 +93,13 @@ pub const SVN_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
 /// 加 JobObjects feature。ssh 在管道关闭后自己退出，未实测（决策日志 Task 0）。读管道的线程
 /// 在超时后不再等待，免得被这样的孙进程攥着管道拖住。
 pub fn run_svn_deadline(path: &str, args: &[&str], timeout: Duration) -> Result<String> {
+    let out = run_svn_deadline_bytes(path, args, timeout)?;
+    Ok(String::from_utf8_lossy(&out).to_string())
+}
+
+/// 同 [`run_svn_deadline`]，stdout 原样给字节：`svn cat` 读的是文件内容，可能是 GBK 或二进制，
+/// 先转成 UTF-8 字符串就改了内容。
+pub fn run_svn_deadline_bytes(path: &str, args: &[&str], timeout: Duration) -> Result<Vec<u8>> {
     use std::io::Read;
     use std::process::Stdio;
     let mut cmd = svn_command(path);
@@ -155,7 +162,7 @@ pub fn run_svn_deadline(path: &str, args: &[&str], timeout: Duration) -> Result<
             .to_string();
         return Err(GitError::new(classify_svn_error(&stderr), line));
     }
-    Ok(String::from_utf8_lossy(&stdout).to_string())
+    Ok(stdout)
 }
 
 /// 把 svn 的错误输出归成四类：`svn_unreachable` / `svn_auth` / `svn_path_missing` / `svn_cli`。
