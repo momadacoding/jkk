@@ -6,6 +6,7 @@ import {
   hiddenRevs,
   mergePage,
   overlayTargets,
+  startCursor,
   type OverlayResult,
   type SvnRevEntry,
 } from '@/engine/svnHistory'
@@ -62,18 +63,22 @@ describe('groupSpecs / hiddenRevs', () => {
   })
 })
 
-describe('groupComplete', () => {
+describe('groupComplete / startCursor', () => {
   const specs = [
-    { id: 'b1', path: 'p', fileRev: 30 },
-    { id: 'b2', path: 'p', fileRev: 20 },
-    { id: 'b3', path: 'p', fileRev: 10 },
+    { id: 'b1', path: 'p1', fileRev: 30 },
+    { id: 'b2', path: 'p2', fileRev: 20 },
+    { id: 'b3', path: 'p3', fileRev: 10 },
   ]
   it('everything is complete when there is no cursor', () => {
-    expect([0, 1, 2].map((i) => groupComplete(specs, i, null))).toEqual([true, true, true])
+    expect([0, 1, 2].map((i) => groupComplete(i, null))).toEqual([true, true, true])
   })
-  it('a group is complete once the cursor is at or below the next older baseline', () => {
-    const cursor = { pegPath: 'p', pegRev: 30, nextTop: 15 }
-    expect([0, 1, 2].map((i) => groupComplete(specs, i, cursor))).toEqual([true, false, false])
+  it('groups before the cursor group are complete, the rest are not', () => {
+    const cursor = { group: 1, pegPath: 'p2', pegRev: 20, nextTop: 15 }
+    expect([0, 1, 2].map((i) => groupComplete(i, cursor))).toEqual([true, false, false])
+  })
+  it('startCursor starts at the newest group with its own peg', () => {
+    expect(startCursor(specs)).toEqual({ group: 0, pegPath: 'p1', pegRev: 30, nextTop: 30 })
+    expect(startCursor([])).toBeNull()
   })
 })
 

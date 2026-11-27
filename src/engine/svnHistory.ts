@@ -14,7 +14,9 @@ export interface GroupSpec {
   fileRev: number
 }
 
+/** 翻页位置：下一次查第 `group` 组（每组用自己的 peg 查自己的区间）。 */
 export interface Cursor {
+  group: number
   pegPath: string
   pegRev: number
   nextTop: number
@@ -99,14 +101,17 @@ export function hiddenRevs(entries: FileHistoryEntry[]): number[] {
 }
 
 /**
- * 第 `i` 组是否已经加载完。没有游标就是全部查完；否则游标的 `nextTop` 已经落到更老一组的 revision
- * 或以下时，这一组的区间（更老一组的 revision, 这一组的 revision]都查过了。`nextTop` 只会越来越小
- * （换 peg 也只往更老的组走），所以这个判断随翻页单调成立。
+ * 第 `i` 组是否已经加载完。后端按组从新到旧逐组查，游标停在哪一组，它之前的组就都查完了；
+ * 没有游标是全部查完（出错时后端和前端都会留一个游标，见 `startCursor`）。
  */
-export function groupComplete(specs: GroupSpec[], i: number, cursor: Cursor | null): boolean {
-  if (!cursor) return true
-  const lower = specs[i + 1]?.fileRev ?? 0
-  return cursor.nextTop <= lower
+export function groupComplete(i: number, cursor: Cursor | null): boolean {
+  return !cursor || cursor.group > i
+}
+
+/** 从最新那组开始查的游标；第一页就失败时用它重试。没有基线组时为 null。 */
+export function startCursor(specs: GroupSpec[]): Cursor | null {
+  const g = specs[0]
+  return g ? { group: 0, pegPath: g.path, pegRev: g.fileRev, nextTop: g.fileRev } : null
 }
 
 /** 把新的一页并进已加载的分组：按组追加、按 rev 去重。返回新对象。 */

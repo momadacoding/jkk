@@ -420,7 +420,7 @@ describe('FileHistoryView：混合仓库的 SVN 补全', () => {
   })
 
   it('shows load more for the oldest group and appends the next page', async () => {
-    const cursor = { pegPath: 'Code/A.cs', pegRev: 3, nextTop: 1 }
+    const cursor = { group: 1, pegPath: 'Code/A.cs', pegRev: 3, nextTop: 1 }
     store.readSvnFileHistory
       .mockResolvedValueOnce({ groups: { [I]: [svnRev(3, 'pan', '初始版本')] }, cursor, error: null })
       .mockResolvedValueOnce({ groups: { [I]: [svnRev(1, 'pan', '最早')] }, cursor: null, error: null })
@@ -436,12 +436,32 @@ describe('FileHistoryView：混合仓库的 SVN 补全', () => {
   it('shows the offline banner when the page has svn_unreachable', async () => {
     store.readSvnFileHistory.mockResolvedValue({
       groups: {},
-      cursor: { pegPath: 'Code/A.cs', pegRev: 9, nextTop: 9 },
+      cursor: { group: 0, pegPath: 'Code/A.cs', pegRev: 9, nextTop: 9 },
       error: { code: 'svn_unreachable', message: '等了 15 秒，SVN 服务器没有响应' },
     })
     mountSvn('history')
     expect(await screen.findByText('连不上 SVN，基线条目显示的是快照')).toBeTruthy()
     expect(screen.getAllByText('SVN 明细没取到：等了 15 秒，SVN 服务器没有响应')).toHaveLength(2)
+  })
+
+  it('a first page that fails says so and offers a retry instead of claiming 0 commits', async () => {
+    store.readSvnFileHistory
+      .mockReset()
+      .mockRejectedValueOnce(new Error('工作副本被锁'))
+      .mockResolvedValueOnce({ groups: { [S]: [svnRev(8, 'gao', '调整打包参数')] }, cursor: null, error: null })
+    mountSvn('history')
+    // 顶部横幅一处 + 两条基线行各一处（不是连不上服务器，横幅用同一句）
+    expect((await screen.findAllByText('SVN 明细没取到：工作副本被锁')).length).toBe(3)
+    expect(screen.queryByText('0 次 SVN 提交')).toBeNull()
+    fireEvent.click(screen.getByText('加载更多'))
+    expect(await screen.findByText('调整打包参数')).toBeTruthy()
+    // 重试从第一组起
+    expect(store.readSvnFileHistory).toHaveBeenLastCalledWith('C:/r', expect.any(Array), [7], {
+      group: 0,
+      pegPath: 'Code/A.cs',
+      pegRev: 9,
+      nextTop: 9,
+    })
   })
 
   it('clicking an svn entry reads its diff with the group peg', async () => {

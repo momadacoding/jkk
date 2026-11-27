@@ -175,7 +175,9 @@ pub fn classify_svn_error(stderr: &str) -> &'static str {
     if has(&["E170001", "E215004"]) {
         return "svn_auth";
     }
-    if has(&["E160013", "E200009", "E170000"]) {
+    // E195012：peg 处有这个节点、但往回追到的那个 revision 里还没有它（`svn cat -r <创建版 - 1>`、
+    // `svn log -r` 的区间落在创建版之前，2026-11-28 实测）——同样是「那里没有这个路径」
+    if has(&["E160013", "E200009", "E170000", "E195012"]) {
         return "svn_path_missing";
     }
     if has(&[
@@ -899,6 +901,13 @@ mod deadline_tests {
         )
         .unwrap_err();
         assert_eq!(e.code, "svn_path_missing", "{}", e.message);
+    }
+
+    #[test]
+    fn a_revision_before_the_node_existed_is_path_missing() {
+        let stderr =
+            "svn: E195012: Unable to find repository location for 'file:///r/N.cs' in revision 1\n";
+        assert_eq!(classify_svn_error(stderr), "svn_path_missing");
     }
 
     #[test]

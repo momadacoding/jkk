@@ -18,6 +18,7 @@ import {
   hiddenRevs,
   mergePage,
   overlayTargets,
+  startCursor,
   type Cursor,
   type GroupSpec,
   type OverlayView,
@@ -152,8 +153,14 @@ export function FileHistoryView({ repoPath, target, headHash, workdirVersion = n
       })
       .catch((err) => {
         if (!svnGate.isLatest(token)) return
-        // 保留游标：「加载更多」就是重试
-        setSvn((s) => ({ ...s, cursor: s.cursor ?? cursor, error: { code: 'svn_cli', message: toErrorMessage(err) }, loading: false }))
+        // 保留游标：「加载更多」就是重试。第一页就失败时没有游标，从第一组起——不留游标的话
+        // 每一组都会被当成「查完了」，显示一句假的「0 次 SVN 提交」（review 第 I1 条）
+        setSvn((s) => ({
+          ...s,
+          cursor: s.cursor ?? cursor ?? startCursor(specs),
+          error: { code: 'svn_cli', message: toErrorMessage(err) },
+          loading: false,
+        }))
       })
   }, [repoPath, specs, hidden, svnGate])
 
@@ -319,7 +326,7 @@ function HistoryList({ history, error, selectedId, specs, svn, onSelect, onRevea
         const mark = STATUS_MARK[e.status]
         const gi = specIndex.get(e.id)
         const list = gi === undefined ? [] : svn.groups[e.id] ?? []
-        const status = gi === undefined ? null : svnGroupStatus(list, groupComplete(specs, gi, svn.cursor), svn)
+        const status = gi === undefined ? null : svnGroupStatus(list, groupComplete(gi, svn.cursor), svn)
         return (
           <div key={e.id}>
             <div

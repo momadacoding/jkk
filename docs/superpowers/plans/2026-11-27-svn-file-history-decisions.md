@@ -108,4 +108,23 @@
   6. 四个命令按 camelCase 参数名在真实窗口里调通；参数名写错（`group` 代替 `groups`）返回 `missing required key groups` —— 通过
 - **E2E 发现并修掉的问题：** 「N 次 SVN 提交」原来接在作者、日期后面，列表一窄就被截掉看不见。改成基线行下单独一行（截图复验已显示）。jsdom 测不到布局，没有对应的自动化测试。
 - **计划没写的坑：** 本机 ACP 1252，PowerShell 里 `svn commit -m "中文"` 存进仓库的是 `?`，第一版 fixture 的说明全是问号。这是 fixture 的问题，不是程序的：改用 `-F 文件 --encoding UTF-8` 后显示正常。
+### 独立 review（2026-11-28，opus，只读）
+
+结论：修完 C1、C2、I1 后可以合并。逐条处理：
+
+- **C1 已修**：`svn cat -r <创建版 - 1>`、区间落在创建版之前的 `svn log` 报 `E195012`，原来归成 `svn_cli`，所以几乎每个真实文件的「新增那一版」diff 都报错；满页正好停在创建版时还会翻页卡死。现已归进 `svn_path_missing`。原测试 `the_add_revision_shows_the_whole_file_as_added` 用的是 r1，走的是 `rev == 1` 的捷径，测的不是真实形态。补了 `the_add_revision_after_r1_shows_the_whole_file_as_added`、`a_full_page_ending_at_the_creation_revision_moves_on_to_older_groups`、`a_revision_before_the_node_existed_is_path_missing`，均先 RED（E195012）后 GREEN。
+- **C2 已修，换了做法（偏离 spec §5.4 的「沿一个 peg 查、按号分组、查到头再换 peg」）**：路径被删掉、又用复制补回同名路径时，`svn log X@6` 沿复制历史列出的是另一个文件的 r2、r1，号码却落进旧 X 基线的区间，被算到旧 X 头上，而旧 X 真实的 r3、r4 不出现。这是反目标里的「归错人」。改成每组用自己的 peg 查自己的区间：`svn log <path_i>@<R_i> -r <top>:<R(i+1)+1>`，按构造就是 §5.3 的半开区间。`Cursor` 加了 `group` 字段，`bucket` 换成按组装配的 `assemble`，前端 `groupComplete` 改为按组号判断。代价是每组至少一次查询，基线数通常个位数到几十。测试 `a_path_replaced_by_a_copy_keeps_each_baseline_on_its_own_lineage` 先 RED（`[2, 1]` ≠ `[4, 3]`）后 GREEN；原有的改名后交付、删除重建等用例照过。Task 4 里「相同 `file_rev` 归最老那组」「非单调时不报错」两条裁决在新做法下仍成立：区间为空的组不发查询。
+- **I1 已修**：第一页就失败（工作副本被锁、需要 cleanup 等，`units_cached` 报错；或 invoke 被 reject）时没有游标，每一行都被当成「查完了」，显示一句假的「0 次 SVN 提交」，也没有重试按钮。现在后端与前端都在出错时给出起点游标（`start_cursor` / `startCursor`）。RTL 用例 `a first page that fails says so and offers a retry instead of claiming 0 commits` 先 RED 后 GREEN。
+- **Minor 1 升级处理**：`cat` / `blame` 的缓存键原来没带 uuid，计划写的是带，也没在日志里记。按 AGENTS.md §13 第 12 条，未记录的偏离是阻断，所以照计划补上 uuid。
+- **Minor 8 升级处理**：`readCommitFileDiff` 的 JSDoc 被新函数隔开，挂到了 `readSvnFileHistory` 头上，已挪回。
+- **延后（不在本 PR 修）**：
+  - Minor 2：`svn cat` 缓存按条数不按字节，大文件点几次 diff 会占不少内存。白名单通常只有代码文件，影响有限。
+  - Minor 3：Blame overlay 等待期间没有「正在读取 SVN 出处」提示；查询超时（长历史文件 `svn blame` > 15 秒）也被说成「连不上 SVN」；8 个查询是串行的。
+  - Minor 4：基线删掉了这个文件时（墓碑），那一组的 peg 指向不存在的路径，被当作空段，组内容不全（不会错配）。
+  - Minor 5：Local-Only 提交会一直显示「未交付」；白名单外文件也会被打交付标签，与 spec §8 不符。
+  - Minor 6：`SvnAnnotator` 在 1000 条历史、长 first-parent 链上的耗时没量过。
+  - Minor 7：HEAD 一变 SVN 补全就回到第一页，已翻过的页和选中的 SVN 条目丢失。
+  - Minor 9：真实窗口里没单独做 `svn://` 拒绝端口那一项（`file://` 目录改名验了；拒绝端口有 Rust 测试）。
+- **Declined to judge 里的一条留作后续**：用当前工作副本单元的 URL 去配旧基线的 peg，做过 `svn switch` 或改过 external URL 时，旧 peg 可能查不到（被当作 0 条）。这是 spec §5.4 的既定做法，建议另开 issue。
+
 - **计划没写的坑：** `no_console_window` 守卫测试按文件数 `spawn()`。`run_svn_deadline_bytes` 要能中途结束进程，只能 `spawn()`，已用 `ProcTimer` 手工计时，与 `git_cli` 同一理由加进放行表（`svn_cli.rs` 1 次）。

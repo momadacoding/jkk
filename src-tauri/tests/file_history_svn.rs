@@ -683,3 +683,123 @@ fn an_unreachable_server_fails_only_that_target() {
         other => panic!("{other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// 独立 review 第 C1、C2 条：文件不在 r1 创建、删除后用复制补回原路径
+// ---------------------------------------------------------------------------
+
+/// 纯 SVN 仓库（`svn_repo`：r1 有 Code/A.cs、Code/B.cs），配一个指向 `Code` 的单元。
+fn plain_svn() -> (SvnFixture, WcIdentity) {
+    let fx = svn_fixtures::svn_repo();
+    let unit = WcIdentity {
+        wc_root: "Code".to_string(),
+        url: format!("{}/Code", svn_fixtures::file_url(&fx.repo())),
+        repos_root: svn_fixtures::file_url(&fx.repo()),
+        wc_root_abspath: None,
+        uuid: "u".to_string(),
+    };
+    (fx, unit)
+}
+fn svn_wc(fx: &SvnFixture, args: &[&str]) {
+    let mut full = args.to_vec();
+    full.push("--non-interactive");
+    svn_fixtures::svn_cmd(&fx.wc(), &full);
+}
+fn edit_commit(fx: &SvnFixture, rel: &str, content: &str, msg: &str) {
+    let p = fx.wc().join(rel);
+    let new = !p.exists();
+    std::fs::write(&p, content).unwrap();
+    if new {
+        svn_wc(fx, &["add", rel]);
+    }
+    svn_wc(fx, &["commit", "-m", msg]);
+    svn_wc(fx, &["update"]);
+}
+fn spec(id: &str, path: &str, rev: u64) -> GroupSpec {
+    GroupSpec {
+        id: id.to_string(),
+        path: path.to_string(),
+        file_rev: rev,
+    }
+}
+fn revs(page: &app_lib::engine::svn_file_history::SvnHistoryPage, id: &str) -> Vec<u64> {
+    page.groups
+        .get(id)
+        .map(|v| v.iter().map(|e| e.rev).collect())
+        .unwrap_or_default()
+}
+
+#[test]
+fn the_add_revision_after_r1_shows_the_whole_file_as_added() {
+    // 真实仓库里文件几乎都不在 r1 创建：旧侧 `svn cat -r <创建版 - 1>` 报 E195012
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/N.cs", "n1\nn2\n");
+    let d =
+        svn_rev_file_diff(&fx.wc_str(), "Code/N.cs", 2, 2, &DiffViewOptions::default()).unwrap();
+    assert_eq!(d.files[0].status, "added");
+    assert_eq!(lines(&d, '+'), vec!["n1", "n2"]);
+}
+
+#[test]
+fn a_full_page_ending_at_the_creation_revision_moves_on_to_older_groups() {
+    let (fx, unit) = plain_svn();
+    edit_commit(&fx, "Code/B.cs", "b2\n", "r2"); // r2：N 还不存在
+    for i in 0..50 {
+        edit_commit(&fx, "Code/N.cs", &format!("n{i}\n"), &format!("n{i}")); // r3..r52
+    }
+    let groups = vec![spec("new", "Code/N.cs", 52), spec("old", "Code/A.cs", 1)];
+    let p1 = page_with_units(
+        &fx.wc_str(),
+        std::slice::from_ref(&unit),
+        &groups,
+        &[],
+        None,
+    )
+    .unwrap();
+    assert_eq!(revs(&p1, "new").len(), 50);
+    assert!(p1.error.is_none(), "{:?}", p1.error);
+    let p2 = page_with_units(&fx.wc_str(), &[unit], &groups, &[], p1.cursor).unwrap();
+    assert!(p2.error.is_none(), "翻到创建版之前不该报错：{:?}", p2.error);
+    assert_eq!(revs(&p2, "old"), vec![1]);
+    assert!(p2.cursor.is_none());
+}
+
+#[test]
+fn a_path_replaced_by_a_copy_keeps_each_baseline_on_its_own_lineage() {
+    // B 在 r1、r2；X 在 r3 新增、r4 修改、r5 删除；r6 把 B 复制成 X。
+    // `svn log X@6` 跟着复制历史列出 r6、r2、r1——那是 B 的提交，不能算到旧 X 的基线上
+    let (fx, unit) = plain_svn();
+    edit_commit(&fx, "Code/B.cs", "b2\n", "r2");
+    edit_commit(&fx, "Code/X.cs", "x1\n", "r3");
+    edit_commit(&fx, "Code/X.cs", "x2\n", "r4");
+    svn_wc(&fx, &["rm", "Code/X.cs"]);
+    svn_wc(&fx, &["commit", "-m", "r5"]);
+    svn_wc(&fx, &["update"]);
+    svn_wc(&fx, &["cp", "Code/B.cs", "Code/X.cs"]);
+    svn_wc(&fx, &["commit", "-m", "r6"]);
+    let groups = vec![spec("b1", "Code/X.cs", 6), spec("b2", "Code/X.cs", 4)];
+    let mut got: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    let mut cursor = None;
+    for _ in 0..5 {
+        let p = page_with_units(
+            &fx.wc_str(),
+            std::slice::from_ref(&unit),
+            &groups,
+            &[],
+            cursor,
+        )
+        .unwrap();
+        assert!(p.error.is_none(), "{:?}", p.error);
+        for (id, v) in &p.groups {
+            got.entry(id.clone())
+                .or_default()
+                .extend(v.iter().map(|e| e.rev));
+        }
+        cursor = p.cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(got.get("b1").cloned().unwrap_or_default(), vec![6]);
+    assert_eq!(got.get("b2").cloned().unwrap_or_default(), vec![4, 3]);
+}

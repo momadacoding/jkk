@@ -643,10 +643,6 @@ export function readBlame(path: string, file: string, rev: string | null): Promi
 }
 
 /**
- * 一个文件在某次提交里的 diff（对第一个父提交）。改名那一条要带上 `oldFile` 才配得成对。
- * `options` 是 diff 面板的上下文行数 / 忽略空白（`backendDiffOptions`）。
- */
-/**
  * 混合仓库：把历史里的基线提交展开成真实 SVN 提交，一次一页（`cursor` 第一页传 null）。
  * SVN 出错不 reject，原因在结果的 `error` 里。
  */
@@ -675,6 +671,10 @@ export function readSvnBlameOverlay(path: string, targets: OverlayTarget[]): Pro
   return invoke<OverlayResult[]>('svn_blame_overlay', { path, targets })
 }
 
+/**
+ * 一个文件在某次提交里的 diff（对第一个父提交）。改名那一条要带上 `oldFile` 才配得成对。
+ * `options` 是 diff 面板的上下文行数 / 忽略空白（`backendDiffOptions`）。
+ */
 export function readCommitFileDiff(
   path: string,
   rev: string,
