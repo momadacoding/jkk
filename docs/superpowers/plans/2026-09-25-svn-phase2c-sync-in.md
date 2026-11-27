@@ -41,7 +41,7 @@
 | A2 | **新增 phase `applying-stash`** 与 journal 字段 `stashApplied`。spec §7.6 没有为 S10 定义 phase：S9 成功后若只留 `rebase`，崩溃重开时分不清 stash 有没有 apply 过 | 补足 | 实测 T2：对已 apply 过的 stash 再 apply 一次，git 拒绝且不动任何文件；所以「apply 完、`stashApplied` 还没落盘」这条缝最坏是一条报错，不会破坏数据 |
 | A3 | **S10 在 apply 之前先查未跟踪文件撞名**，撞了就一个字节都不 apply，返回 `StashBlocked` | 补足 | 实测 R1：stash 里既有已跟踪改动又有撞名的未跟踪文件时，`git stash apply` **先写已跟踪部分、再在未跟踪上失败**（退出 1，无 `UU`）——半套 apply |
 | A4 | **S5 的成败不看退出码**：`svn update --accept postpone` 产生文本冲突或树冲突时**退出 0**；必须事后 `svn status --xml` 查 `item="conflicted"` 或 `tree-conflicted="true"` | 补足 | 实测 Q2 / Q3；树冲突节点的 `item` 是 `added`，只看 `item` 会漏 |
-| A5 | **S5 之后的「放弃」= 回原分支并恢复 WIP**：HEAD 在 `svn/base` 时，先断言白名单内 W-file 在 svn 看来**全部干净**（磁盘 == 服务器内容，可从服务器取回），再 `git checkout -f <origBranch>`；不干净就停下不覆盖 | 补足（用户 2026-09-25 决定） | 实测 R2：普通 `git checkout` 会把磁盘上的服务器内容**带到原分支上变成本地修改**，必须 `-f` |
+| A5 | **S5 之后的「放弃」= 回原分支并恢复 WIP**：HEAD 在 `svn/base` 时，先断言白名单内 W-file 在 svn 看来**全部干净**（磁盘 == 服务器内容，可从服务器取回），再 `git checkout -f <origBranch>`；不干净就停下不覆盖。**2026-11-28 修订**：基线还没发布、而 W-file 已被 update 换成新版（磁盘与基线 commit 对不上）时也停下，不回退，只能「继续」 | 补足（用户 2026-09-25 决定；2026-11-28 按事故报告第 ③ 条修订） | 实测 R2：普通 `git checkout` 会把磁盘上的服务器内容**带到原分支上变成本地修改**，必须 `-f`。修订原因（2026-11-27 现场）：`-f` 写回旧内容后 SVN 记的仍是新 revision，同事的改动变成「你的本地修改」；「可从服务器取回」没有任何步骤去取回，之后的跟进、重建基线都把它当未提交改动保留 |
 | A6 | 前置检查对**任何** svn 冲突态（含 W-file）都拒绝，比 §7.2 第 4 条「W-file 外」更严 | 偏离（更保守） | W-file 的冲突标记在 stash 之后仍留在 `.svn` 里，S4 必然失败；早拒绝零代价 |
 | A7 | `phase = stashed` 且 `stashOid` 缺省 ⇔ 白名单内没有可压的改动 | 补足 | 实测 P1：无可压内容时 `git stash push` 退出 **0** 且 `refs/stash` 不变——判定只能比对前后的 `refs/stash` |
 | A8 | S10 用 `git stash apply <OID>`（**不带 `--index`**，照 spec 原文）：「已暂存」这个状态会丢，内容不丢。确认框明说 | 照 spec，写明代价 | 实测 R3：`--index` 能保留，但会新增「索引冲突时拒绝」一类失败，本期不引入 |
@@ -126,8 +126,9 @@ spec 没有逐条写到、但最可能咬到真实用户的六类输入。每条
 | `sync_in_needs_reconfirm` | 执行时出现了预览里没有的「白名单外会被碰到的文件」 | 无 |
 | `sync_in_checkout_failed` | S3 / S8 / 回原分支时 checkout 没切干净（多为文件被占用，A15） | S3：已回退；S8：journal 停在 `baseline-ready`；回原分支：journal 保留 |
 | `sync_in_baseline_stale` | S4：W-file 在 svn 看来有修改 | 已回退 |
-| `sync_in_update_failed` | S5 `svn update` 非零退出 | 已回退 |
-| `sync_in_update_conflict` | S5 产生冲突（A4） | 已回退；冲突文件留给 TortoiseSVN |
+| `sync_in_update_failed` | S5 `svn update` 非零退出，且没换掉任何 W-file | 已回退 |
+| `sync_in_update_incomplete` | S5 失败时 update 已换掉了 W-file；或基线发布前「放弃」时已换掉了（2026-11-28 修订 A5） | 不回退，journal 保留，让用户「继续」 |
+| `sync_in_update_conflict` | S5 产生冲突（A4） | 没换掉 W-file：已回退；换掉了：不回退、journal 保留（2026-11-28 修订 A5）。冲突文件都留给 TortoiseSVN |
 | `sync_in_unsafe_to_return` | A5 的断言不过：不能 `-f` | journal 保留，未覆盖任何文件 |
 | `sync_in_revision_moved` | S7 录制期间 `nodeRevs` 变了 | journal 停在 `capturing-baseline` |
 | `sync_in_rebase_failed` | rebase 非零且不是冲突 | journal 停在 `rebase` |
