@@ -14,7 +14,7 @@
 | 5 `svn_file_history` | 完成 | `svn_file_history.rs`：`svn_file_history`、`page_with_units`、进程内 LRU；命令注册 | `file_history_svn` 18/18、`--lib svn_file_history` 12/12；改坏换 peg 的变异让 2 个测试失败 |
 | 6 `svn_rev_file_diff` | 完成 | `svn_file_history.rs`：`svn_rev_file_diff`、`svn_cat`、`tree_with_file`；`svn_cli.rs`：`run_svn_deadline_bytes`；命令注册 | `file_history_svn` 23/23；去掉 mempack 的变异让 `no_object_is_written_to_the_users_git` 失败（10 ≠ 5） |
 | 7 `svn_blame_overlay` | 完成 | `svn_xml.rs`：`parse_blame`、`BlameRevAuthor`；`svn_file_history.rs`：`svn_blame_overlay`、`overlay_with_units`、`OverlayTarget` / `OverlayResult`；命令注册 | `file_history_svn` 28/28，`--lib blame_tests` 2/2；clippy 干净 |
-| 8 前端 store 与纯函数 | 未开始 | | |
+| 8 前端 store 与纯函数 | 完成 | `src/engine/svnHistory.ts`、`fileHistory.ts` 类型、`repoStore.ts` 三个 invoke；`tests/vitest/svnHistory.test.ts` | `pnpm test` 109 文件 / 2064 用例全过；`pnpm build` 通过 |
 | 9 FileHistoryView | 未开始 | | |
 | 10 真实窗口验证与收尾 | 未开始 | | |
 
@@ -77,3 +77,11 @@
 - **偏离计划：** `Mismatch` 变体单独加了 `#[serde(rename_all = "camelCase")]`，字段才会以 `svnLines` / `gitLines` 送到前端（枚举上的 `rename_all` 只改变体名）。
 - **偏离计划：** 多加了 `an_unreachable_server_fails_only_that_target`，并为此拆出 `overlay_with_units`（与 Task 5 的 `page_with_units` 同一做法）。`units_cached` 失败时每个 target 都是 `Failed`，命令本身不报错。
 - **行数口径：** 基线 blob 里换行符的个数，最后一行没有换行符时再加 1，与 `git blame` 的行数一致。
+
+### Task 8
+
+- **偏离计划：** 不新写 `createRequestGate`，复用已有的 `src/engine/latestGate.ts`（`createLatestGate`），两者是同一件事。计划里的 `stale svn response is ignored` 挪到 Task 9 的组件测试里测真实的丢弃行为，不在这里再测一遍已有工具。
+- **偏离计划：** `applyOverlay` 的返回值多了 `failure`（第一个查失败的原因），Blame 顶部要据此显示「连不上 SVN」。查失败的行显示为基线，但不计入 `unmapped`：「没对上 SVN 版本」和「连不上」是两种提示。
+- **偏离计划：** 新字段在 TS 里写成可选（`svn?:`、`baseline?:`、`delivered?:`），已有测试里手写的数据不用全部补字段。
+- **已知局限：** 同一个基线提交里，同一文件出现两个 `origPath`（极少见）时，`BlameCommit.baseline.fileRev` 只按第一次出现的那个路径取，第二个路径用的 `fileRev` 可能不对。行数核对能挡住大部分错配。
+- **计划没写的坑：** worktree 里没有 `node_modules`，先 `pnpm install --frozen-lockfile`。

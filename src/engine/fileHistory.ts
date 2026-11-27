@@ -21,6 +21,24 @@ export interface FileHistoryEntry {
   /** 改名 / 复制的来源路径。 */
   oldPath: string | null
   status: FileStatus
+  /** 混合仓库的基线 / 交付标注；纯 git 仓库为 null。旧数据可能没有这个字段。 */
+  svn?: EntrySvn | null
+}
+
+/** 本应用录的基线提交的记账（`src-tauri/src/engine/file_history.rs` 的 `BaselineInfo`）。 */
+export interface BaselineInfo {
+  /** 这个文件在该基线里对应的 SVN revision（不是 floor）。 */
+  fileRev: number
+  floor: number
+  /** 交付录的基线：真正交付出去的那个 revision。 */
+  deliveredRev: number | null
+}
+
+export type DeliveredState = { kind: 'undelivered' } | { kind: 'delivered'; rev: number }
+
+export interface EntrySvn {
+  baseline: BaselineInfo | null
+  delivered: DeliveredState | null
 }
 
 export interface FileHistory {
@@ -40,6 +58,10 @@ export interface BlameCommit {
   summary: string
   /** 这个文件在这一提交之前最后一次被改的那一版；根提交没有。 */
   previous: BlamePrevious | null
+  /** 混合仓库：这个提交是基线时的记账。 */
+  baseline?: BaselineInfo | null
+  /** 混合仓库：非基线提交的交付状态。 */
+  delivered?: DeliveredState | null
 }
 
 export interface BlameLine {
