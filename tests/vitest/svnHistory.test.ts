@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   applyOverlay,
+  groupComplete,
   groupSpecs,
   hiddenRevs,
   mergePage,
@@ -58,6 +59,21 @@ describe('groupSpecs / hiddenRevs', () => {
       entry({ id: oid('3'), svn: base(5, 4) }),
     ]
     expect(hiddenRevs(entries).sort((a, b) => a - b)).toEqual([4, 7])
+  })
+})
+
+describe('groupComplete', () => {
+  const specs = [
+    { id: 'b1', path: 'p', fileRev: 30 },
+    { id: 'b2', path: 'p', fileRev: 20 },
+    { id: 'b3', path: 'p', fileRev: 10 },
+  ]
+  it('everything is complete when there is no cursor', () => {
+    expect([0, 1, 2].map((i) => groupComplete(specs, i, null))).toEqual([true, true, true])
+  })
+  it('a group is complete once the cursor is at or below the next older baseline', () => {
+    const cursor = { pegPath: 'p', pegRev: 30, nextTop: 15 }
+    expect([0, 1, 2].map((i) => groupComplete(specs, i, cursor))).toEqual([true, false, false])
   })
 })
 

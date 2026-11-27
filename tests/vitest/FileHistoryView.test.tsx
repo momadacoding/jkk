@@ -12,6 +12,9 @@ const store = vi.hoisted(() => ({
   readFileHistory: vi.fn(),
   readBlame: vi.fn(),
   readCommitFileDiff: vi.fn(),
+  readSvnFileHistory: vi.fn(),
+  readSvnRevFileDiff: vi.fn(),
+  readSvnBlameOverlay: vi.fn(),
 }))
 vi.mock('@/store/repoStore', () => store)
 
@@ -317,5 +320,214 @@ describe('入口：Local Changes', () => {
     const rows = screen.getAllByText('s.txt')
     fireEvent.contextMenu(rows[0])
     expect((screen.getByText('Blame（新文件还没有历史）') as HTMLButtonElement).disabled).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 混合仓库：SVN 补全（计划 2026-11-27-svn-file-history Task 9）
+// ---------------------------------------------------------------------------
+
+const M = 'd'.repeat(40) // 本地提交（未交付）
+const D = 'e'.repeat(40) // 本地提交（已交付 r7）
+const S = 'f'.repeat(40) // 更新录的基线，A.cs 在 r9
+const I = '1'.repeat(40) // 初始化录的基线，A.cs 在 r3
+
+const svnHistory: FileHistory = {
+  truncated: false,
+  entries: [
+    { id: M, parents: [S], author: 'me', time: 500, subject: '我的改动', path: 'Code/A.cs', oldPath: null, status: 'modified', svn: { baseline: null, delivered: { kind: 'undelivered' } } },
+    { id: S, parents: [D], author: 'me', time: 400, subject: 'svn: r9', path: 'Code/A.cs', oldPath: null, status: 'modified', svn: { baseline: { fileRev: 9, floor: 9, deliveredRev: null }, delivered: null } },
+    { id: D, parents: [I], author: 'me', time: 300, subject: '交付过的改动', path: 'Code/A.cs', oldPath: null, status: 'modified', svn: { baseline: null, delivered: { kind: 'delivered', rev: 7 } } },
+    { id: I, parents: [], author: 'me', time: 100, subject: 'svn: r3', path: 'Code/A.cs', oldPath: null, status: 'added', svn: { baseline: { fileRev: 3, floor: 3, deliveredRev: null }, delivered: null } },
+  ],
+}
+
+const svnRev = (rev: number, author: string, message: string) => ({
+  rev,
+  author,
+  date: '2026-11-20T00:00:00.000000Z',
+  message,
+})
+
+const svnTarget = (tab: 'history' | 'blame'): FileHistoryTarget => ({
+  path: 'Code/A.cs',
+  revs: ['HEAD'],
+  focus: null,
+  blame: { rev: null, path: 'Code/A.cs' },
+  tab,
+})
+
+/** 手动放行的 Promise：用来让「晚到的旧响应」真的晚到。 */
+function deferred<T>() {
+  let resolve!: (v: T) => void
+  const promise = new Promise<T>((r) => { resolve = r })
+  return { promise, resolve }
+}
+
+function mountSvn(tab: 'history' | 'blame', props: { headHash?: string; workdirVersion?: unknown } = {}) {
+  const view = (p: { headHash?: string; workdirVersion?: unknown }) => (
+    <FileHistoryView
+      repoPath="C:/r"
+      target={svnTarget(tab)}
+      headHash={p.headHash ?? M}
+      workdirVersion={p.workdirVersion ?? 1}
+      onClose={vi.fn()}
+      onRevealCommit={vi.fn()}
+    />
+  )
+  const r = render(view(props))
+  return { rerender: (p: { headHash?: string; workdirVersion?: unknown }) => r.rerender(view(p)) }
+}
+
+/** 每次读回一个新对象，与真实的 invoke 一样（同一个引用 React 不会重渲染）。 */
+const fresh = <T,>(v: T) => () => Promise.resolve(JSON.parse(JSON.stringify(v)) as T)
+
+describe('FileHistoryView：混合仓库的 SVN 补全', () => {
+  beforeEach(() => {
+    store.readFileHistory.mockReset().mockImplementation(fresh(svnHistory))
+    store.readSvnFileHistory.mockReset().mockResolvedValue({
+      groups: {
+        [S]: [svnRev(8, 'gao', '调整打包参数')],
+        [I]: [svnRev(3, 'pan', '初始版本'), svnRev(2, 'pan', '更早')],
+      },
+      cursor: null,
+      error: null,
+    })
+    store.readSvnRevFileDiff.mockReset().mockResolvedValue(emptyDiff)
+    store.readSvnBlameOverlay.mockReset().mockResolvedValue([])
+  })
+
+  it('expands a baseline row into svn entries', async () => {
+    mountSvn('history')
+    expect(await screen.findByText('调整打包参数')).toBeTruthy()
+    expect(screen.getByText('1 次 SVN 提交')).toBeTruthy()
+    expect(screen.getByText('2 次 SVN 提交')).toBeTruthy()
+    expect(store.readSvnFileHistory).toHaveBeenCalledWith(
+      'C:/r',
+      [
+        { id: S, path: 'Code/A.cs', fileRev: 9 },
+        { id: I, path: 'Code/A.cs', fileRev: 3 },
+      ],
+      [7],
+      null,
+    )
+  })
+
+  it('labels undelivered and delivered commits', async () => {
+    mountSvn('history')
+    expect(await screen.findByText('未交付')).toBeTruthy()
+    expect(screen.getByText('已交付 r7')).toBeTruthy()
+  })
+
+  it('shows load more for the oldest group and appends the next page', async () => {
+    const cursor = { pegPath: 'Code/A.cs', pegRev: 3, nextTop: 1 }
+    store.readSvnFileHistory
+      .mockResolvedValueOnce({ groups: { [I]: [svnRev(3, 'pan', '初始版本')] }, cursor, error: null })
+      .mockResolvedValueOnce({ groups: { [I]: [svnRev(1, 'pan', '最早')] }, cursor: null, error: null })
+    mountSvn('history')
+    expect(await screen.findByText('已加载 1 次 SVN 提交…')).toBeTruthy()
+    fireEvent.click(screen.getByText('加载更多'))
+    expect(await screen.findByText('最早')).toBeTruthy()
+    expect(store.readSvnFileHistory).toHaveBeenLastCalledWith('C:/r', expect.any(Array), [7], cursor)
+    expect(screen.queryByText('加载更多')).toBeNull()
+    expect(screen.getByText('2 次 SVN 提交')).toBeTruthy()
+  })
+
+  it('shows the offline banner when the page has svn_unreachable', async () => {
+    store.readSvnFileHistory.mockResolvedValue({
+      groups: {},
+      cursor: { pegPath: 'Code/A.cs', pegRev: 9, nextTop: 9 },
+      error: { code: 'svn_unreachable', message: '等了 15 秒，SVN 服务器没有响应' },
+    })
+    mountSvn('history')
+    expect(await screen.findByText('连不上 SVN，基线条目显示的是快照')).toBeTruthy()
+    expect(screen.getAllByText('SVN 明细没取到：等了 15 秒，SVN 服务器没有响应')).toHaveLength(2)
+  })
+
+  it('clicking an svn entry reads its diff with the group peg', async () => {
+    mountSvn('history')
+    fireEvent.click(await screen.findByText('调整打包参数'))
+    await waitFor(() => expect(store.readSvnRevFileDiff).toHaveBeenCalledWith('C:/r', 'Code/A.cs', 9, 8, DEFAULT_OPTIONS))
+    expect((screen.getByText('Blame 这一版') as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('stale svn response is ignored', async () => {
+    const late = deferred<unknown>()
+    store.readSvnFileHistory
+      .mockReturnValueOnce(late.promise)
+      .mockResolvedValueOnce({ groups: { [S]: [svnRev(8, 'gao', '新的那次')] }, cursor: null, error: null })
+    const { rerender } = mountSvn('history')
+    await waitFor(() => expect(store.readSvnFileHistory).toHaveBeenCalledTimes(1))
+    rerender({ headHash: 'x'.repeat(40) })
+    expect(await screen.findByText('新的那次')).toBeTruthy()
+    // 换一个 revision：同号会被 mergePage 去重，测不出丢没丢弃
+    late.resolve({ groups: { [S]: [svnRev(5, 'gao', '旧的那次')] }, cursor: null, error: null })
+    await new Promise((r) => setTimeout(r, 0))
+    expect(screen.queryByText('旧的那次')).toBeNull()
+  })
+
+  const svnBlame: BlameData = {
+    binary: false,
+    truncated: false,
+    totalLines: 3,
+    lines: [
+      { commit: I, origLine: 1, finalLine: 1, origPath: 'Code/A.cs', content: 'one' },
+      { commit: I, origLine: 2, finalLine: 2, origPath: 'Code/A.cs', content: 'two' },
+      { commit: M, origLine: 3, finalLine: 3, origPath: 'Code/A.cs', content: 'mine' },
+    ],
+    commits: {
+      [I]: { author: 'me', time: 100, summary: 'svn: r3', previous: null, baseline: { fileRev: 3, floor: 3, deliveredRev: null }, delivered: null },
+      [M]: { author: 'me', time: 500, summary: '我的改动', previous: null, baseline: null, delivered: { kind: 'undelivered' } },
+    },
+  }
+
+  it('blame maps baseline lines to svn authors and keeps git lines', async () => {
+    store.readBlame.mockReset().mockResolvedValue(svnBlame)
+    store.readSvnBlameOverlay.mockResolvedValue([
+      { kind: 'mapped', lines: [{ rev: 2, author: 'ann', date: '2026-11-01T00:00:00Z' }, { rev: 3, author: 'bob', date: '2026-11-02T00:00:00Z' }] },
+    ])
+    mountSvn('blame')
+    expect(await screen.findByText('ann')).toBeTruthy()
+    expect(screen.getByText('bob')).toBeTruthy()
+    expect(screen.getByText('r2')).toBeTruthy()
+    expect(store.readSvnBlameOverlay).toHaveBeenCalledWith('C:/r', [{ baselineId: I, origPath: 'Code/A.cs', fileRev: 3 }])
+  })
+
+  it('blame shows the mismatch note', async () => {
+    store.readBlame.mockReset().mockResolvedValue(svnBlame)
+    store.readSvnBlameOverlay.mockResolvedValue([{ kind: 'mismatch', svnLines: 1, gitLines: 2 }])
+    mountSvn('blame')
+    expect(await screen.findByText('有 2 行没对上 SVN 版本，保持基线显示')).toBeTruthy()
+  })
+
+  it('overlay is recomputed after workdir change', async () => {
+    store.readBlame.mockReset().mockImplementation(fresh(svnBlame))
+    const late = deferred<unknown>()
+    store.readSvnBlameOverlay
+      .mockReturnValueOnce(late.promise)
+      .mockResolvedValueOnce([{ kind: 'mapped', lines: [{ rev: 2, author: 'newer', date: 'd' }, { rev: 2, author: 'newer', date: 'd' }] }])
+    const { rerender } = mountSvn('blame', { workdirVersion: 1 })
+    await waitFor(() => expect(store.readSvnBlameOverlay).toHaveBeenCalledTimes(1))
+    rerender({ workdirVersion: 2 })
+    expect(await screen.findByText('newer')).toBeTruthy()
+    expect(store.readBlame).toHaveBeenCalledTimes(2)
+    late.resolve([{ kind: 'mapped', lines: [{ rev: 1, author: 'older', date: 'd' }, { rev: 1, author: 'older', date: 'd' }] }])
+    await new Promise((r) => setTimeout(r, 0))
+    expect(screen.queryByText('older')).toBeNull()
+    // 晚到的旧结果也不能把新结果冲掉
+    expect(screen.getByText('newer')).toBeTruthy()
+  })
+
+  it('plain git repo never calls the svn functions', async () => {
+    store.readFileHistory.mockReset().mockResolvedValue(history)
+    store.readBlame.mockReset().mockResolvedValue(blame)
+    const { rerender } = mountSvn('history')
+    // 列表和右侧 diff 的标题里各有一处
+    expect((await screen.findAllByText('改内容')).length).toBeGreaterThan(0)
+    rerender({})
+    fireEvent.click(screen.getByText('Blame'))
+    expect(await screen.findByText('alice')).toBeTruthy()
+    expect(store.readSvnFileHistory).not.toHaveBeenCalled()
+    expect(store.readSvnBlameOverlay).not.toHaveBeenCalled()
   })
 })

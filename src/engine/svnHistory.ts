@@ -98,6 +98,17 @@ export function hiddenRevs(entries: FileHistoryEntry[]): number[] {
   return [...out]
 }
 
+/**
+ * 第 `i` 组是否已经加载完。没有游标就是全部查完；否则游标的 `nextTop` 已经落到更老一组的 revision
+ * 或以下时，这一组的区间（更老一组的 revision, 这一组的 revision]都查过了。`nextTop` 只会越来越小
+ * （换 peg 也只往更老的组走），所以这个判断随翻页单调成立。
+ */
+export function groupComplete(specs: GroupSpec[], i: number, cursor: Cursor | null): boolean {
+  if (!cursor) return true
+  const lower = specs[i + 1]?.fileRev ?? 0
+  return cursor.nextTop <= lower
+}
+
 /** 把新的一页并进已加载的分组：按组追加、按 rev 去重。返回新对象。 */
 export function mergePage(prev: SvnGroups, page: SvnHistoryPage): SvnGroups {
   const next: SvnGroups = { ...prev }

@@ -15,7 +15,7 @@
 | 6 `svn_rev_file_diff` | 完成 | `svn_file_history.rs`：`svn_rev_file_diff`、`svn_cat`、`tree_with_file`；`svn_cli.rs`：`run_svn_deadline_bytes`；命令注册 | `file_history_svn` 23/23；去掉 mempack 的变异让 `no_object_is_written_to_the_users_git` 失败（10 ≠ 5） |
 | 7 `svn_blame_overlay` | 完成 | `svn_xml.rs`：`parse_blame`、`BlameRevAuthor`；`svn_file_history.rs`：`svn_blame_overlay`、`overlay_with_units`、`OverlayTarget` / `OverlayResult`；命令注册 | `file_history_svn` 28/28，`--lib blame_tests` 2/2；clippy 干净 |
 | 8 前端 store 与纯函数 | 完成 | `src/engine/svnHistory.ts`、`fileHistory.ts` 类型、`repoStore.ts` 三个 invoke；`tests/vitest/svnHistory.test.ts` | `pnpm test` 109 文件 / 2064 用例全过；`pnpm build` 通过 |
-| 9 FileHistoryView | 未开始 | | |
+| 9 FileHistoryView | 完成 | `FileHistoryView.tsx`（SVN 行、加载更多、提示、`SvnEntryDiff`、Blame 套 SVN 出处）、`svnHistory.ts` 的 `groupComplete`、`styles.css`；测试 10 个组件用例 + 2 个纯函数用例 | `pnpm test` 2076/2076；`pnpm build` 通过；去掉两处过期响应防护的变异让 2 个测试失败 |
 | 10 真实窗口验证与收尾 | 未开始 | | |
 
 ## 决策
@@ -85,3 +85,14 @@
 - **偏离计划：** 新字段在 TS 里写成可选（`svn?:`、`baseline?:`、`delivered?:`），已有测试里手写的数据不用全部补字段。
 - **已知局限：** 同一个基线提交里，同一文件出现两个 `origPath`（极少见）时，`BlameCommit.baseline.fileRev` 只按第一次出现的那个路径取，第二个路径用的 `fileRev` 可能不对。行数核对能挡住大部分错配。
 - **计划没写的坑：** worktree 里没有 `node_modules`，先 `pnpm install --frozen-lockfile`。
+
+### Task 9
+
+- **偏离计划：** 「加载更多」放在列表最底下，不挂在最老那一组下面。一页是跨组取的（一页可能同时填好几组），按钮放哪一组都不对；出错时它同时充当重试。
+- **偏离计划：** 每组是否加载完要有判据，补了纯函数 `groupComplete`（游标的 `nextTop` 落到更老一组的 revision 或以下即完整），并在 `svnHistory.test.ts` 加了 2 个用例。没加载完显示「已加载 N 次 SVN 提交…」，加载完显示「N 次 SVN 提交」。
+- **偏离计划：** 历史列表原本没有右键菜单，SVN 条目的「Blame 此版本」做成右侧 diff 标题里置灰的「Blame 这一版」按钮（悬停说明「SVN 条目暂不支持」）。Blame 里 SVN 那一块的右键菜单「Blame 这次改动之前的版本」置灰、带同样的说明。
+- **偏离计划：** `fileHistoryItems.ts` 不需要改（它只管入口菜单）。
+- **偏离计划：** Blame 里「已交付 rN」/「未交付」放在悬停说明里，不占左侧栏宽度。
+- **计划没写的坑：** Blame 重读后、新的 overlay 回来之前那一次渲染，不能拿旧 overlay 套新 Blame（行号对不上就会归错人）。overlay 存成 `{ blame, view }`，只在 `blame` 是同一个对象时使用；另外用 `createLatestGate` 防止晚到的旧结果把新结果冲掉。
+- **计划没写的坑：** 组件测试里的桩每次要返回新对象。返回同一个引用时 React 不重渲染，「HEAD 变了 / 工作区变了要重读」的测试会假失败或假通过。
+- **验证测试有效：** 第一版的两个过期响应测试在去掉防护后仍然通过：旧响应用了同一个 rev，被 `mergePage` 去重掉了；overlay 测试没断言新结果还在。改过之后，去掉防护的变异让这两个测试都失败。
