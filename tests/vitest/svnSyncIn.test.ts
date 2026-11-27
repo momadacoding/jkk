@@ -240,8 +240,9 @@ describe('describeSyncAction', () => {
     expect(m.message).toContain('重建基线')
   })
 
-  it('S5 之后放弃要说清 git 管的文件已被换成新版时只能继续（2026-11-28 修订 A5）', () => {
+  it('S5 之后放弃要说清已换成新版的文件保留服务器内容、碰过的只能继续（2026-11-28 修订 A5）', () => {
     const m = describeSyncAction('syncAbort', 'stashed')
+    expect(m.message).toContain('保留服务器上的内容')
     expect(m.message).toContain('不能放弃')
     expect(m.message).toContain('「继续」')
   })

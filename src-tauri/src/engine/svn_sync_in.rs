@@ -333,7 +333,8 @@ fn on_update_failed(
     j: &mut Journal,
     stderr: &str,
 ) -> Result<SyncInOutcome> {
-    let updated = updated_by_svn(repo, cfg)?;
+    let cause = update_failed_error(stderr);
+    let updated = updated_or_keep(repo, cfg, &cause)?;
     if !updated.is_empty() {
         return Err(GitError::new(
             "sync_in_update_incomplete",
@@ -342,6 +343,7 @@ fn on_update_failed(
                 stderr.trim(),
                 kept_for_continue(
                     &updated,
+                    j,
                     "请先在 TortoiseSVN 里对工作副本根目录跑一次 Clean up（清掉中断留下的锁），\
                      等网络、VPN 正常后，点顶部横幅上的「继续」把这次更新跑完。\
                      先用 TortoiseSVN 的 Update 补齐、再点「继续」也可以。",
@@ -349,13 +351,22 @@ fn on_update_failed(
             ),
         ));
     }
-    rolled_back(
-        repo,
-        cfg,
-        j,
-        Disk::MaybeUpdated,
-        update_failed_error(stderr),
-    )
+    rolled_back(repo, cfg, j, Disk::MaybeUpdated, cause)
+}
+
+/// [`updated_by_svn`]，失败时**原因在前**（与 [`rolled_back`] 同一条规矩）：核对不成就不回退，
+/// 记录留着，用户先要知道 update 为什么没成。
+fn updated_or_keep(repo: &str, cfg: &SvnConfig, cause: &GitError) -> Result<Vec<String>> {
+    updated_by_svn(repo, cfg).map_err(|e| {
+        GitError::new(
+            &cause.code,
+            format!(
+                "{}\n\n另外：没能核对 svn update 换掉了哪些 git 管的文件（{}），所以没有回退，\
+                 记录已保留。处理好之后在顶部横幅上点「继续」或「放弃」。",
+                cause.message, e.message
+            ),
+        )
+    })
 }
 
 fn on_update_conflict(
@@ -365,7 +376,8 @@ fn on_update_conflict(
     conflicts: &[String],
 ) -> Result<SyncInOutcome> {
     // update 跑完了才会走到这里，git 管的文件多半已经换成新版：回退同样会把它们写回旧内容
-    let updated = updated_by_svn(repo, cfg)?;
+    let cause = update_conflict_error(conflicts);
+    let updated = updated_or_keep(repo, cfg, &cause)?;
     if !updated.is_empty() {
         return Err(GitError::new(
             "sync_in_update_conflict",
@@ -375,18 +387,13 @@ fn on_update_conflict(
                 list_paths(conflicts),
                 kept_for_continue(
                     &updated,
+                    j,
                     "请先用 TortoiseSVN 解决（Resolve）上面的冲突，再点顶部横幅上的「继续」。",
                 )
             ),
         ));
     }
-    rolled_back(
-        repo,
-        cfg,
-        j,
-        Disk::MaybeUpdated,
-        update_conflict_error(conflicts),
-    )
+    rolled_back(repo, cfg, j, Disk::MaybeUpdated, cause)
 }
 
 /// 回退并把结果接在原因后面。**原因永远在前**：用户先要知道为什么没更新成。
@@ -487,14 +494,122 @@ fn updated_by_svn(repo: &str, cfg: &SvnConfig) -> Result<Vec<String>> {
 }
 
 /// 不回退、留给「继续」时接在原因后面的说明。`next` 是用户下一步要做的事。
-fn kept_for_continue(updated: &[String], next: &str) -> String {
+fn kept_for_continue(updated: &[String], j: &Journal, next: &str) -> String {
+    // 没有 WIP 时（计划 A7）stash 里什么都没有，不能让用户去 stash 列表里找
+    let wip = if j.stash_oid.is_some() {
+        "未提交的改动还在 stash 里，"
+    } else {
+        ""
+    };
     format!(
         "svn update 已经把下面这些 git 管的文件换成了服务器上的新版本：\n{}\n\
-         这时回到原分支，会把它们写回旧内容，而 SVN 记的已经是新版本——同事的改动会变成你的\
-         本地修改，交付时被撤掉。所以这次没有回退：分支、基线都没动，未提交的改动还在 stash 里，\
-         记录已保留。\n{next}",
+         这时直接回到原分支，会把它们写回旧内容，而 SVN 记的已经是新版本——同事的改动会变成你的\
+         本地修改，交付时被撤掉。所以这次没有回退：分支、基线都没动，{wip}记录已保留。\n{next}",
         list_paths(updated)
     )
+}
+
+/// 「放弃」时 update 已经换掉的文件里，原分支的提交或 WIP 也改过的那些（见 [`back_to_orig`]）。
+///
+/// 这些文件回原分支后要的是「你的版本 + 服务器的改动」，得做三方合并，只有「继续」做得了。
+/// 其余的文件在原分支上与旧基线一字不差，保留服务器内容就只多出「服务器的改动」这一份差异。
+fn touched_by_branch_or_wip(
+    repo: &str,
+    cfg: &SvnConfig,
+    j: &Journal,
+    updated: &[String],
+) -> Result<Vec<String>> {
+    let roots = normalize_roots(&cfg.whitelist);
+    if roots.is_empty() {
+        return Ok(updated.to_vec()); // 空 pathspec 会变成「全部」（§12.2），宁可全算碰过
+    }
+    let base = need(&j.baseline_oid_before, "baselineOidBefore")?;
+    let orig_head = need(&j.orig_head, "origHead")?;
+    let mut ranges: Vec<(String, String)> = vec![(base, orig_head)];
+    if let Some(oid) = &j.stash_oid {
+        // WIP 的工作区（`^1` → stash 自己）与暂存（`^1` → `^2`）
+        ranges.push((format!("{oid}^1"), oid.clone()));
+        ranges.push((format!("{oid}^1"), format!("{oid}^2")));
+    }
+    let mut touched: Vec<String> = Vec::new();
+    let mut collect = |out: String| {
+        for p in out.split('\0').filter(|p| !p.is_empty()) {
+            touched.push(p.to_string());
+        }
+    };
+    for (from, to) in &ranges {
+        let mut args: Vec<&str> = vec!["diff", "--name-only", "-z", "--no-renames", from, to, "--"];
+        args.extend(roots.iter().map(String::as_str));
+        collect(run_git(repo, &args)?);
+    }
+    if let Some(oid) = &j.stash_oid {
+        // `stash -u` 的未跟踪文件在 `^3`，没有未跟踪文件时它不存在
+        let third = format!("{oid}^3");
+        let (code, _) = run_git_code(repo, &["rev-parse", "-q", "--verify", &third])?;
+        if code == 0 {
+            let mut args: Vec<&str> = vec!["ls-tree", "-r", "-z", "--name-only", &third, "--"];
+            args.extend(roots.iter().map(String::as_str));
+            collect(run_git(repo, &args)?);
+        }
+    }
+    Ok(updated
+        .iter()
+        .filter(|p| touched.contains(p))
+        .cloned()
+        .collect())
+}
+
+/// update 换掉的文件此刻在磁盘上的样子：内容，或 `None`（服务器删掉了它）。
+fn read_server_content(repo: &str, updated: &[String]) -> Result<Vec<(String, Option<Vec<u8>>)>> {
+    updated
+        .iter()
+        .map(|p| {
+            let path = Path::new(repo).join(p);
+            match std::fs::read(&path) {
+                Ok(bytes) => Ok((p.clone(), Some(bytes))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((p.clone(), None)),
+                Err(e) => Err(GitError::new(
+                    "sync_in_unsafe_to_return",
+                    format!("读不了 {p}（{e}），没有回原分支，记录已保留。"),
+                )),
+            }
+        })
+        .collect()
+}
+
+/// 把 [`read_server_content`] 记下的内容写回去。写不成的指名报出来：它们此刻是原分支的旧内容，
+/// 用 TortoiseSVN 的 Revert 就能换回服务器版本（Revert 取的是 SVN 记的那个 revision）。
+fn put_back_server_content(repo: &str, saved: &[(String, Option<Vec<u8>>)]) -> Result<()> {
+    let mut failed: Vec<String> = Vec::new();
+    for (p, content) in saved {
+        let path = Path::new(repo).join(p);
+        let r = match content {
+            Some(bytes) => path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&path, bytes)),
+            None => match std::fs::remove_file(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                r => r,
+            },
+        };
+        if r.is_err() {
+            failed.push(p.clone());
+        }
+    }
+    if failed.is_empty() {
+        return Ok(());
+    }
+    Err(GitError::new(
+        "sync_in_unsafe_to_return",
+        format!(
+            "已回到原分支，但下面这些文件没能换回服务器上的版本（多半有程序占着它们），\
+             现在是原分支的旧内容：\n{}\n请关掉占用的程序，在 TortoiseSVN 里对这些文件点 Revert\
+             （换回 SVN 记的版本）。不 Revert 的话，同事的改动会显示成你的本地修改，交付时被撤掉。\
+             顶部如果还有横幅，按横幅处理未提交的改动。",
+            list_paths(&failed)
+        ),
+    ))
 }
 
 /// S6–S7：录新基线并发布（spec §7.3 S7、§7.6 录制三阶段）。
@@ -1416,6 +1531,8 @@ pub(crate) fn back_to_orig(
     let orig = need(&j.orig_branch, "origBranch")?;
     let orig_head = need(&j.orig_head, "origHead")?;
     let branch = current_branch(repo)?;
+    // update 已经换成服务器版本的文件，回原分支之后把这份内容写回去（见下）
+    let mut server_content: Vec<(String, Option<Vec<u8>>)> = Vec::new();
     if branch.as_deref() != Some(orig.as_str()) {
         if branch.as_deref() != Some(BASELINE_BRANCH) {
             return Err(state_changed(&format!(
@@ -1437,16 +1554,29 @@ pub(crate) fn back_to_orig(
                     ),
                 ));
             }
+            // 基线还没跟上、update 已经换掉了 git 管的文件（2026-11-27 现场）：`-f` 会把它们写回
+            // 旧内容，SVN 却记着新版本。原分支的提交与 WIP 都没碰过的，回去之后保留服务器内容——
+            // 它们在原分支上与旧基线一字不差，留下的差异只有「服务器的改动」，是一份如实的未提交
+            // 改动，下次更新时基线跟上、三方合并自动抵消。碰过的要三方合并，只能「继续」。
+            //
+            // 不一律拒绝放弃（独立 review 第 1 条）：update 一直跑不完时（external 失效、没有
+            // 写权限……），「继续」次次失败，记录就永远清不掉，跟进、更新、交付全被挡住
             let updated = updated_by_svn(repo, cfg)?;
             if !updated.is_empty() {
-                return Err(GitError::new(
-                    "sync_in_update_incomplete",
-                    kept_for_continue(
-                        &updated,
-                        "这次没法放弃，请点「继续」把更新跑完。「继续」时 svn update 报错的话，\
-                         先在 TortoiseSVN 里对工作副本根目录跑一次 Clean up。",
-                    ),
-                ));
+                let touched = touched_by_branch_or_wip(repo, cfg, j, &updated)?;
+                if !touched.is_empty() {
+                    return Err(GitError::new(
+                        "sync_in_update_incomplete",
+                        kept_for_continue(
+                            &touched,
+                            j,
+                            "你的提交或未提交的改动也改过这些文件，回原分支要把两边合起来，\
+                             这次没法放弃。请点「继续」把更新跑完；「继续」时 svn update 报错的话，\
+                             先在 TortoiseSVN 里对工作副本根目录跑一次 Clean up。",
+                        ),
+                    ));
+                }
+                server_content = read_server_content(repo, &updated)?;
             }
             // 上面已确认 W-file 全部干净（与 `force_back_when_w_clean` 同一道判定，不重跑 svn status）
             checkout_verified(repo, cfg, &orig, true)?;
@@ -1463,7 +1593,12 @@ pub(crate) fn back_to_orig(
     settle_checkout_residue(repo, cfg, j, &orig)?;
     // 随 restore_step 进入 applying-stash 时一起落盘（PR #49 review #3）
     j.rolling_back = true;
-    restore_step(repo, j)
+    let step = restore_step(repo, j)?;
+    // 放在核对残留与放回 WIP **之后**：服务器内容既不是分支的也不是基线的，先写回去会被核对当成
+    // 来源不明的改动，写回一半时连再点一次「放弃」都过不去。WIP 没碰过这些文件，放回不受影响。
+    // 崩在 restore_step 与这里之间，留下的就是修复前的形状（旧内容 + SVN 记新版本），窗口只有这几行
+    put_back_server_content(repo, &server_content)?;
+    Ok(step)
 }
 
 /// 用 `-f` 切回原分支（计划 A5）：能 `-f` 的前提是 W-file 在 svn 看来全部干净 = 磁盘上就是服务器内容，

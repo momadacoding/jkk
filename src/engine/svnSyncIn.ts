@@ -352,12 +352,13 @@ export function continueNeedsConfirm(phase: string): boolean {
   return phase !== 'rebase'
 }
 
-// svn update 已经换掉了 git 管的文件、基线却还没跟上时，后端拒绝放弃（2026-11-27 现场）：
-// 回原分支会把它们写回旧内容，同事的改动变成你的本地修改
+// svn update 已经换掉了 git 管的文件、基线却还没跟上时（2026-11-27 现场），后端回原分支后
+// 保留这些文件的服务器内容，不写回旧版；你的提交或未提交改动也改过的，后端拒绝放弃
 const AFTER_UPDATE_ABORT =
   '回到更新前的分支，放回未提交的改动。SVN 那一侧已经更新的部分不会退回——' +
   '如果基线还没跟上，顶部会提示失同步，用「重建基线」即可。' +
-  '但 svn update 已经把 git 管的文件换成了新版本时不能放弃（会把它们写回旧内容），只能点「继续」把更新跑完。'
+  '已经被 svn update 换成新版本的 git 管文件保留服务器上的内容，显示为未提交的改动，下次更新时会自动对上；' +
+  '其中有你提交过或正在改的文件时不能放弃，只能点「继续」把更新跑完。'
 
 export function describeSyncAction(id: SyncActionId, phase: string): SyncConfirmModel {
   if (id === 'syncContinue') {
