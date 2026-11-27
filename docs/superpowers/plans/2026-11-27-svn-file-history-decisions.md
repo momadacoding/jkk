@@ -10,7 +10,7 @@
 | 1 带超时的 svn 查询 | 完成 | `svn_cli.rs`：`run_svn_deadline`、`classify_svn_error`、`SVN_QUERY_TIMEOUT` | `cargo test --lib deadline_tests` 4/4；fmt、clippy 干净 |
 | 2 路径 → URL 共用 | 完成 | `svn_wc.rs`：`unit_of`、`server_url`、`server_url_at`、`strip_prefix_ci`、`units_cached` | `url_tests` 2/2；svn_health 五个集成测试二进制 105/105 |
 | 3 基线标注 | 完成 | `file_history.rs`：`EntrySvn` / `BaselineInfo` / `DeliveredState`、`SvnAnnotator`；`tests/file_history_svn.rs` | `file_history_svn` 7/7，`file_history` 27/27；fmt、clippy 干净 |
-| 4 分组纯函数 | 未开始 | | |
+| 4 分组纯函数 | 完成 | `svn_file_history.rs`：`GroupSpec`、`Cursor`、`SvnRevEntry`、`bucket`、`next_cursor`、`PAGE` | `cargo test --lib svn_file_history` 11/11 |
 | 5 `svn_file_history` | 未开始 | | |
 | 6 `svn_rev_file_diff` | 未开始 | | |
 | 7 `svn_blame_overlay` | 未开始 | | |
@@ -46,3 +46,10 @@
 - **偏离计划：** 多加了 `a_colleague_update_is_a_baseline_not_a_delivery`。`a_delivered_commit_carries_its_svn_rev` 只断言本地提交的「已交付 rN」：交付录的基线树与交付的提交相同，`git log --follow` 不列它，读不到它的标注；`Delivered-Rev` 的解析改在 `mixed_revision_baseline_uses_rev_of_not_floor` 里用自建基线断言。
 - **计划没写的坑：** Blame 里一个提交的 `file_rev` 要按路径取，`commits` 表里没有路径，取该提交第一次出现那一行的 `orig_path`。
 - **为什么判定是对的：** `svn/base` 的 first-parent 链是一条祖先线，「能到达某提交的基线」在链上是一段后缀，用二分找第一条，`graph_descendant_of` 只调 O(log n) 次。不是混合仓库时 `read_config` 失败，什么都不标，纯 git 仓库的输出只多一个 `null` 字段（`plain_git_repo_has_no_svn_annotation`）。
+
+### Task 4
+
+- **计划的错误：** 计划要求 `file_rev` 不严格递减时报 `bad_history_args`（测试 `non_decreasing_file_revs_are_rejected`）。这会让某些真实文件的 History 直接报错：重建基线可能录出与更早那条相同的 revision（内容回到旧版、git 里却算一次改动）。改为容错的归属规则：X 归 `file_rev ≥ X` 里最小的那条，相同时归最老的。`file_rev` 严格递减时与 spec §5.3 的半开区间完全等价。测试换成 `equal_file_revs_go_to_the_oldest_of_them`。
+- **计划的错误：** 计划写「这一页一条都没查到时 O = `peg_rev + 1`」。翻过几页满页之后，这一段其实已经追到了上一页的最老那条，用 `peg_rev + 1` 会把已经查过的组当成「够不着」再查一遍。改为 O = `next_top + 1`；第一页时 `next_top == peg_rev`，与计划一致。补测试 `an_empty_page_after_full_pages_keeps_what_earlier_pages_reached`。
+- **计划没写的坑：** 换 peg 只在当前 peg 那组之后（更老的组）里找。否则一条 peg 什么都没查到时会选回自己，死循环（`an_empty_segment_does_not_requery_its_own_group`）。
+- **偏离计划：** 多加了 `a_full_page_ending_at_r1_is_exhausted`：满页但最老的已是 r1，不能再发一次 `-r 0:1`。
