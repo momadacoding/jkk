@@ -775,3 +775,41 @@
   - **#7**：基线丢失后，把备份分支改名回 `svn/base` 会被拒，重建也因 `read_baseline_oid` 失败而走不通。与 #3 的「别的分支不许冒充基线」直接冲突，属于设计取舍，等用户定。
   - **#9**：`svn_migrate_eol` 内的 `MigrationLock` 已被同步锁覆盖。它崩溃后会留下残锁，要手工删除，这是之前就有的行为，属于重构。
 
+
+---
+
+## 2026-11-28：半截 update 后的回退（修订 A5）
+
+来源：2026-11-27 使用现场。svn update 跑到一半报 E200033 退出，回退时 `checkout -f` 把已更新到新 revision 的 git 管文件写回了旧内容。
+
+### 计划的错误
+
+- A5 的前提「W-file 在 svn 看来干净 = 磁盘上是服务器内容，覆盖掉也能从服务器取回」只说了能取回，没有任何步骤去取回。基线还没发布时，`-f` 写回旧内容之后 SVN 记的仍是新 revision：同事的改动变成了「你的本地修改」。之后的跟进、重建基线都把它当未提交改动保留（SVN 看来就是本地修改，没有别的证据能分辨），交付时会撤掉同事的提交。原测试 `abort_after_the_update_returns_to_the_original_branch` 断言的 `A.cs == "a1"` 正是这个形状。
+
+### 改成什么
+
+| 出口 | update 换掉了 git 管的文件时 | 一个都没换时 |
+|---|---|---|
+| S5 失败（`on_update_failed`） | 不回退，journal 停在 `stashed`，`sync_in_update_incomplete`，提示 Clean up 后「继续」 | 照旧回退，`sync_in_update_failed` |
+| S5 冲突（`on_update_conflict`） | 不回退，`sync_in_update_conflict`，提示 TortoiseSVN 解决后「继续」 | 照旧回退 |
+| 基线发布前「放弃」（`back_to_orig`） | 原分支提交与 WIP 都没碰过的：回原分支后写回服务器内容；碰过的：拒绝，`sync_in_update_incomplete` | 照旧回退 |
+
+「换掉了的文件」= HEAD 在 `svn/base` 时与基线 commit 对不上的被跟踪文件（含被删），加上服务器新增、原分支也跟踪着的同名路径（`updated_by_svn`）。
+
+### 计划没写的坑
+
+- `checkout -f` 会用目标分支的版本盖掉同名的未跟踪文件（终审 review 实测）。服务器新增、原分支也有的文件因此也算「换掉了」；原分支没有的不算，`-f` 不碰它们。
+- 一律拒绝放弃不行（独立 review）：update 一直跑不完时（external 失效、没有写权限），「继续」次次失败，记录永远清不掉，跟进、更新、交付全被挡住。所以没碰过的文件放弃时保留服务器内容。碰过的仍然只能「继续」：回原分支要的是「你的版本 + 服务器的改动」，要三方合并。那时工作副本本身就坏了，TortoiseSVN 的 Update 同样跑不通，要先把原因解决，提示里写了这一点。
+
+### 为什么这么改是安全的
+
+- 写回服务器内容只针对「原分支与旧基线一字不差」的文件：写回后 git 里多出的差异只有服务器的改动，是一份如实的未提交改动。下次更新时基线跟上，三方合并会把它抵消掉（`abort_after_the_update_keeps_the_server_content_of_files_i_never_touched`、`..._deleted_a_file_does_not_bring_it_back` 钉住）。
+- 写回放在核对残留与放回 WIP 之后，因为服务器内容既不是分支的也不是基线的，先写回会被核对当成来源不明的改动。`checkout -f` 之后任何一步出错也照样写回，否则内容只在栈帧里，就丢了。
+- 已知窗口：内容不落盘（journal 不记文件内容）。如果在 `checkout -f` 与写回之间崩溃，现场就回到修复前的形状。这段窗口只有几步本地 git 操作。
+- 真实形状：Windows 上用 share=Read 占住一个文件，让 svn update 真的跑到一半失败（带写锁），cleanup 后「继续」走完（`an_update_cut_off_by_a_held_file_...`）。其余用例用「单独 update 一个文件」造出相同的工作副本，只是没有写锁。
+- 旧代码下这些用例都失败：`A.cs` 被写回 `a1`，或 `N.cs` 被分支版本盖掉。
+
+### 没修、留作后续
+
+- 交付的「停止收尾」（`svn_sync_out.rs` 里的 `force_back_when_w_clean`）可能有同一形状：PostCommit 阶段 `update_whitelist` 之后 `checkout -f`。没有核对过。
+- 基线发布之后的放弃（`rebase` / `baseline-ready`）会留下「分支落后基线」，这是设计上就有的状态。这时如果绕过 jkk 直接在 TortoiseSVN 里提交，同样会撤掉同事的改动。

@@ -53,6 +53,11 @@ fn sync(fx: &SvnFixture) -> SyncInOutcome {
 fn phase(fx: &SvnFixture) -> Option<Phase> {
     svn_journal::read(&fx.wc_str()).unwrap().map(|j| j.phase)
 }
+/// SVN 看来这个文件没有本地修改：磁盘就是它记的那个 revision 的内容。
+fn assert_svn_clean(fx: &SvnFixture, rel: &str) {
+    let st = app_lib::engine::svn_cli::run_svn(&fx.wc_str(), &["status", rel]).unwrap();
+    assert!(st.trim().is_empty(), "{rel} 在 SVN 看来被改过：{st}");
+}
 fn our_stashes(fx: &SvnFixture) -> usize {
     git(fx, &["stash", "list"])
         .lines()
@@ -570,24 +575,92 @@ fn continue_from_capturing_baseline() {
 }
 
 #[test]
-fn abort_after_the_update_returns_to_the_original_branch() {
-    // A5：S5 已经做完，SVN 退不回去；回到原分支、放回 WIP，基线不动 → 失同步
+fn abort_after_the_update_keeps_the_server_content_of_files_i_never_touched() {
+    // 2026-11-27 现场：S5 已把 A.cs 更新到 r2、基线还没发布。以前（A5）照样 `checkout -f`
+    // 回原分支，A.cs 被写回 a1，而 SVN 记的已是 r2——同事的改动变成了「你的本地修改」，
+    // 之后的跟进、更新都把它当未提交改动保留，交付时会把同事的提交撤掉。
+    // 现在 A.cs 保留服务器内容：你的提交与 WIP 都没碰过它，git 里如实显示「服务器的改动」
     let fx = hybrid_with_colleague();
     with_wip(&fx);
     let j = s5(&fx, "op-cap-a");
     assert_eq!(abort_sync(&fx.wc_str()).unwrap(), SyncInOutcome::Aborted);
     assert_eq!(git(&fx, &["symbolic-ref", "--short", "HEAD"]), "work");
     assert_eq!(git(&fx, &["rev-parse", "HEAD"]), j.orig_head.unwrap());
+    assert_eq!(read(&fx, "Code/A.cs"), "a2\n", "服务器内容没被写回旧版");
+    assert_svn_clean(&fx, "Code/A.cs");
     assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
-    assert_eq!(read(&fx, "Code/A.cs"), "a1\n", "工作区回到原分支的内容");
     assert_eq!(baseline_rev(&fx), 1, "基线没发布");
+    assert_eq!(phase(&fx), None);
+    assert_eq!(our_stashes(&fx), 0);
     assert!(
         matches!(
             check_sync(&fx.wc_str()).unwrap().verdict,
             SyncVerdict::ExternallyAdvanced { .. }
         ),
-        "工作副本已在 r2、基线还是 r1——如实报 SVN 侧有新内容（计划 Task 3 起不再是 Diverged）"
+        "工作副本已在 r2、基线还是 r1——如实报 SVN 侧有新内容，横幅据此提示跟上"
     );
+
+    // 下次更新：基线跟上 r2，A.cs 这份未提交改动与新基线一致，三方合并自动抵消
+    assert_eq!(sync(&fx), SyncInOutcome::Done { new_rev: 2 });
+    assert_eq!(read(&fx, "Code/A.cs"), "a2\n");
+    assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
+    assert_eq!(git(&fx, &["status", "--porcelain", "--", "Code/A.cs"]), "");
+    assert_svn_clean(&fx, "Code/A.cs");
+}
+
+#[test]
+fn abort_after_the_update_refuses_files_my_commits_touched() {
+    // 你在 work 上提交过 A.cs、服务器也改了它：回原分支要的是「你的版本 + 服务器的改动」，
+    // 得三方合并，放弃做不了。不回退、记录留着，让用户「继续」
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/A.cs", "a2\n");
+    write(&fx, "Code/A.cs", "a-local\n");
+    commit(&fx, "local A");
+    write(&fx, "Code/B.cs", "b-wip\n");
+    s5(&fx, "op-cap-mine");
+    let err = abort_sync(&fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "sync_in_update_incomplete", "{}", err.message);
+    assert!(err.message.contains("Code/A.cs"), "{}", err.message);
+    assert!(err.message.contains("「继续」"), "{}", err.message);
+    assert_eq!(read(&fx, "Code/A.cs"), "a2\n", "服务器内容一个字节都没动");
+    assert_svn_clean(&fx, "Code/A.cs");
+    assert_eq!(git(&fx, &["symbolic-ref", "--short", "HEAD"]), "svn/base");
+    assert_eq!(phase(&fx), Some(Phase::CapturingBaseline), "记录原样保留");
+    assert!(!svn_lock::is_held(&fx.wc_str()));
+}
+
+#[test]
+fn abort_after_the_update_refuses_files_my_wip_touched() {
+    // 同上，改过 A.cs 的是还没提交的改动
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/A.cs", "a2\n");
+    write(&fx, "Code/A.cs", "a-wip\n");
+    s5(&fx, "op-cap-wip");
+    let err = abort_sync(&fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "sync_in_update_incomplete", "{}", err.message);
+    assert!(err.message.contains("Code/A.cs"), "{}", err.message);
+    assert!(
+        err.message.contains("stash"),
+        "有 WIP 时要说它在 stash 里：{}",
+        err.message
+    );
+    assert_eq!(read(&fx, "Code/A.cs"), "a2\n");
+    assert_eq!(phase(&fx), Some(Phase::CapturingBaseline));
+}
+
+#[test]
+fn abort_after_the_update_still_returns_when_no_git_file_changed() {
+    // 只更新了 git 管不到的文件：回原分支不会覆盖任何服务器内容，照旧回退（A5）
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Art/x.psd", "psd2\n");
+    write(&fx, "Code/B.cs", "b-wip\n");
+    let j = s5(&fx, "op-cap-art");
+    assert_eq!(abort_sync(&fx.wc_str()).unwrap(), SyncInOutcome::Aborted);
+    assert_eq!(git(&fx, &["symbolic-ref", "--short", "HEAD"]), "work");
+    assert_eq!(git(&fx, &["rev-parse", "HEAD"]), j.orig_head.unwrap());
+    assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
+    assert_eq!(read(&fx, "Art/x.psd"), "psd2\n");
+    assert_eq!(baseline_rev(&fx), 1, "基线没发布");
 }
 
 #[test]
@@ -1394,9 +1467,209 @@ fn update_failure_returns_to_the_original_branch() {
     assert!(!svn_lock::is_held(&fx.wc_str()));
 }
 
+/// 造「svn update 跑到一半就失败」的现场（2026-11-27：E200033 锁超时）：同事改了 A.cs（r2），
+/// 你在 work 上提交过 B.cs、手上有未提交的 B.cs 改动。S1–S3 做完之后，`svn update Code/A.cs`
+/// 只把这一个 git 管的文件更新到 r2（磁盘与 SVN 记的 revision 一起前进，SVN 看来是干净的），
+/// 其余停在 r1，phase 停在 stashed——与半截的 update 留下的工作副本形状相同，只是没有写锁。
+/// 真的跑到 S5 时 S3 一定先落盘了 `leftOrig`，这里照做。
+fn half_updated(fx: &SvnFixture, opid: &str) {
+    with_wip(fx);
+    s3_then_partial_update(fx, opid, "Code/A.cs");
+    assert_eq!(read(fx, "Code/A.cs"), "a2\n");
+}
+
+/// S1 之后按 `from_stashed` 的顺序走 S3（先落盘 `leftOrig` 再切基线），再只 update `path`。
+fn s3_then_partial_update(fx: &SvnFixture, opid: &str, path: &str) {
+    let mut j = s1(fx, opid);
+    j.left_orig = true;
+    svn_journal::write(&fx.wc_str(), &j).unwrap();
+    git(fx, &["checkout", "-q", "svn/base"]);
+    svn_fixtures::svn_cmd(&fx.wc(), &["update", path, "--non-interactive"]);
+}
+
 #[test]
-fn an_update_conflict_outside_git_rolls_back_and_points_to_tortoisesvn() {
-    // §13 第 5 行 / §7.2.1：用户确认过的美术文件在 update 时冲突
+fn a_half_done_update_that_fails_keeps_the_record_instead_of_writing_old_content_back() {
+    // 2026-11-27 现场第 ③ 条：update 失败后回原分支，`checkout -f` 把已更新到 r2 的 A.cs
+    // 写回 a1，SVN 却记着 r2，同事的改动变成了「你的本地修改」。服务器不可达造出 S5 的失败
+    let fx = hybrid_with_colleague();
+    half_updated(&fx, "op-half");
+    let repo = fx.repo();
+    let gone = fx.path().join("repo-gone");
+    std::fs::rename(&repo, &gone).unwrap();
+    let r = continue_sync(&fx.wc_str());
+    std::fs::rename(&gone, &repo).unwrap();
+
+    let err = r.unwrap_err();
+    assert_eq!(err.code, "sync_in_update_incomplete", "{}", err.message);
+    assert!(err.message.contains("Code/A.cs"), "{}", err.message);
+    assert!(err.message.contains("「继续」"), "{}", err.message);
+    assert_eq!(read(&fx, "Code/A.cs"), "a2\n", "服务器内容没被写回旧版");
+    assert_svn_clean(&fx, "Code/A.cs");
+    assert_eq!(git(&fx, &["symbolic-ref", "--short", "HEAD"]), "svn/base");
+    assert_eq!(phase(&fx), Some(Phase::Stashed), "记录留给「继续」");
+    assert_eq!(our_stashes(&fx), 1, "WIP 还在 stash 里");
+    assert_eq!(baseline_rev(&fx), 1);
+    assert!(!svn_lock::is_held(&fx.wc_str()));
+
+    // 服务器回来之后「继续」把更新跑完
+    assert_eq!(
+        continue_sync(&fx.wc_str()).unwrap(),
+        SyncInOutcome::Done { new_rev: 2 }
+    );
+    assert_eq!(git(&fx, &["symbolic-ref", "--short", "HEAD"]), "work");
+    assert_eq!(read(&fx, "Code/A.cs"), "a2\n");
+    assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
+    assert_svn_clean(&fx, "Code/A.cs");
+    assert_eq!(phase(&fx), None);
+}
+
+#[cfg(windows)]
+#[test]
+fn an_update_cut_off_by_a_held_file_keeps_the_record_and_continues_after_cleanup() {
+    // 真的让 svn update 跑到一半失败：B.cs 被别的程序以 share=Read 占着，svn 换不掉它，
+    // 而 A.cs 已经换成 r2。留下的工作副本带写锁，与现场一样要 Clean up
+    use std::os::windows::fs::OpenOptionsExt;
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/A.cs", "a2\n");
+    fx.colleague_commits("Code/B.cs", "b2\n");
+    write(&fx, "Code/New.cs", "wip\n");
+    let e = expect(&fx);
+
+    const FILE_SHARE_READ: u32 = 0x1;
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(fx.wc().join("Code/B.cs"))
+        .unwrap();
+    let r = run_sync_in(&fx.wc_str(), &e);
+    drop(held);
+
+    let err = r.unwrap_err();
+    assert_eq!(err.code, "sync_in_update_incomplete", "{}", err.message);
+    assert!(err.message.contains("Code/A.cs"), "{}", err.message);
+    assert_eq!(
+        read(&fx, "Code/A.cs"),
+        "a2\n",
+        "已换成服务器内容的不写回旧版"
+    );
+    assert_eq!(git(&fx, &["symbolic-ref", "--short", "HEAD"]), "svn/base");
+    assert_eq!(phase(&fx), Some(Phase::Stashed));
+    assert_eq!(our_stashes(&fx), 1);
+
+    svn_fixtures::svn_cmd(&fx.wc(), &["cleanup", "--non-interactive"]);
+    assert_eq!(
+        continue_sync(&fx.wc_str()).unwrap(),
+        SyncInOutcome::Done { new_rev: 3 }
+    );
+    assert_eq!(git(&fx, &["symbolic-ref", "--short", "HEAD"]), "work");
+    assert_eq!(read(&fx, "Code/A.cs"), "a2\n");
+    assert_eq!(read(&fx, "Code/B.cs"), "b2\n");
+    assert_eq!(read(&fx, "Code/New.cs"), "wip\n");
+    assert_svn_clean(&fx, "Code/A.cs");
+    assert_svn_clean(&fx, "Code/B.cs");
+}
+
+#[test]
+fn abort_after_a_half_done_update_goes_back_without_writing_old_content() {
+    // 同一现场点「放弃」：update 一直跑不完时这是唯一的出口（独立 review 第 1 条），
+    // 而 A.cs 你的提交和 WIP 都没碰过，回原分支后保留服务器内容
+    let fx = hybrid_with_colleague();
+    half_updated(&fx, "op-half-abort");
+    assert_eq!(abort_sync(&fx.wc_str()).unwrap(), SyncInOutcome::Aborted);
+    assert_eq!(git(&fx, &["symbolic-ref", "--short", "HEAD"]), "work");
+    assert_eq!(read(&fx, "Code/A.cs"), "a2\n");
+    assert_svn_clean(&fx, "Code/A.cs");
+    assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
+    assert_eq!(phase(&fx), None);
+}
+
+#[test]
+fn abort_after_a_half_done_update_that_deleted_a_file_does_not_bring_it_back() {
+    // 服务器删掉的 git 管的文件：`checkout -f` 会把它写回来，SVN 却记着已删除
+    let fx = hybrid_with_colleague();
+    let wc2 = fx.wc2();
+    svn_fixtures::svn_cmd(&wc2, &["update", "--non-interactive"]);
+    svn_fixtures::svn_cmd(&wc2, &["delete", "Code/A.cs", "--non-interactive"]);
+    svn_fixtures::svn_cmd(&wc2, &["commit", "-m", "del A", "--non-interactive"]);
+    write(&fx, "Code/B.cs", "b-wip\n");
+    s3_then_partial_update(&fx, "op-half-del", "Code/A.cs");
+    assert!(!fx.wc().join("Code/A.cs").exists());
+
+    assert_eq!(abort_sync(&fx.wc_str()).unwrap(), SyncInOutcome::Aborted);
+    assert_eq!(git(&fx, &["symbolic-ref", "--short", "HEAD"]), "work");
+    assert!(!fx.wc().join("Code/A.cs").exists(), "没被写回来");
+    assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
+    assert_eq!(phase(&fx), None);
+
+    // 下次更新：基线跟上，A.cs 的删除与新基线一致
+    assert_eq!(sync(&fx), SyncInOutcome::Done { new_rev: 2 });
+    assert!(!fx.wc().join("Code/A.cs").exists());
+    assert_eq!(git(&fx, &["status", "--porcelain", "--", "Code/A.cs"]), "");
+}
+
+#[test]
+fn abort_after_a_half_done_update_refuses_a_server_file_my_branch_also_added() {
+    // 终审 review 第 1 条：你在 work 上（只在 git 里）提交了 Code/N.cs，同事在 SVN 上新增了同名
+    // 文件。它在 svn/base 上是未跟踪文件，`checkout -f work` 会用分支的版本盖掉服务器的
+    let fx = hybrid_with_colleague();
+    write(&fx, "Code/N.cs", "mine\n");
+    git(&fx, &["add", "Code/N.cs"]);
+    commit(&fx, "local N");
+    fx.colleague_commits("Code/N.cs", "server\n");
+    s3_then_partial_update(&fx, "op-half-add", "Code/N.cs");
+    assert_eq!(read(&fx, "Code/N.cs"), "server\n");
+
+    let err = abort_sync(&fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "sync_in_update_incomplete", "{}", err.message);
+    assert!(err.message.contains("Code/N.cs"), "{}", err.message);
+    assert_eq!(read(&fx, "Code/N.cs"), "server\n", "没被分支的版本盖掉");
+    assert_svn_clean(&fx, "Code/N.cs");
+    assert_eq!(git(&fx, &["symbolic-ref", "--short", "HEAD"]), "svn/base");
+    assert_eq!(phase(&fx), Some(Phase::Stashed));
+
+    // 自动出口同理：S5 失败时也不回退
+    let repo = fx.repo();
+    let gone = fx.path().join("repo-gone");
+    std::fs::rename(&repo, &gone).unwrap();
+    let r = continue_sync(&fx.wc_str());
+    std::fs::rename(&gone, &repo).unwrap();
+    let err = r.unwrap_err();
+    assert_eq!(err.code, "sync_in_update_incomplete", "{}", err.message);
+    assert_eq!(read(&fx, "Code/N.cs"), "server\n");
+    assert_eq!(phase(&fx), Some(Phase::Stashed));
+}
+
+#[test]
+fn abort_after_a_half_done_update_that_deleted_a_file_my_commit_changed_is_refused() {
+    // 你提交过 A.cs、服务器把它删了：回原分支该留哪一边要人来定，只能「继续」
+    let fx = hybrid_with_colleague();
+    write(&fx, "Code/A.cs", "a-local\n");
+    commit(&fx, "local A");
+    let wc2 = fx.wc2();
+    svn_fixtures::svn_cmd(&wc2, &["update", "--non-interactive"]);
+    svn_fixtures::svn_cmd(&wc2, &["delete", "Code/A.cs", "--non-interactive"]);
+    svn_fixtures::svn_cmd(&wc2, &["commit", "-m", "del A", "--non-interactive"]);
+    s3_then_partial_update(&fx, "op-half-del-mine", "Code/A.cs");
+    assert!(!fx.wc().join("Code/A.cs").exists());
+
+    let err = abort_sync(&fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "sync_in_update_incomplete", "{}", err.message);
+    assert!(err.message.contains("Code/A.cs"), "{}", err.message);
+    assert!(
+        !err.message.contains("stash"),
+        "没有 WIP 时不能让用户去 stash 里找：{}",
+        err.message
+    );
+    assert!(!fx.wc().join("Code/A.cs").exists(), "没被写回来");
+    assert_eq!(git(&fx, &["symbolic-ref", "--short", "HEAD"]), "svn/base");
+    assert_eq!(phase(&fx), Some(Phase::Stashed));
+}
+
+#[test]
+fn an_update_conflict_outside_git_keeps_the_record_when_git_files_were_updated() {
+    // §13 第 5 行 / §7.2.1：用户确认过的美术文件在 update 时冲突。同一次 update 还把 A.cs
+    // 更新到了 r2：回原分支会把它写回 a1（2026-11-27 现场第 ③ 条的同一形状），所以不回退，
+    // 冲突交给 TortoiseSVN，解决后「继续」
     let fx = hybrid_with_colleague();
     write(&fx, "Art/x.psd", "psd-local\n");
     fx.colleague_commits("Art/x.psd", "psd-server\n");
@@ -1404,6 +1677,46 @@ fn an_update_conflict_outside_git_rolls_back_and_points_to_tortoisesvn() {
     write(&fx, "Code/B.cs", "b-wip\n");
     let e = expect(&fx);
     assert_eq!(e.confirmed_outside, vec!["Art/x.psd".to_string()]);
+
+    let err = run_sync_in(&fx.wc_str(), &e).unwrap_err();
+    assert_eq!(err.code, "sync_in_update_conflict");
+    assert!(err.message.contains("Art/x.psd") && err.message.contains("TortoiseSVN"));
+    assert!(err.message.contains("「继续」"), "{}", err.message);
+    assert_eq!(git(&fx, &["symbolic-ref", "--short", "HEAD"]), "svn/base");
+    assert_eq!(read(&fx, "Code/A.cs"), "a2\n");
+    assert_svn_clean(&fx, "Code/A.cs");
+    assert_eq!(baseline_rev(&fx), 1, "基线不推进");
+    assert_eq!(phase(&fx), Some(Phase::Stashed));
+    let st = app_lib::engine::svn_cli::run_svn(&fx.wc_str(), &["status", "Art/x.psd"]).unwrap();
+    assert!(st.starts_with('C'), "冲突现场原样留给 TortoiseSVN：{st}");
+
+    // 用户在 TortoiseSVN 里保留自己的版本、标记解决，再「继续」
+    svn_fixtures::svn_cmd(
+        &fx.wc(),
+        &[
+            "resolve",
+            "--accept",
+            "working",
+            "Art/x.psd",
+            "--non-interactive",
+        ],
+    );
+    assert_eq!(
+        continue_sync(&fx.wc_str()).unwrap(),
+        SyncInOutcome::Done { new_rev: 3 }
+    );
+    assert_eq!(read(&fx, "Code/A.cs"), "a2\n");
+    assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
+}
+
+#[test]
+fn an_update_conflict_outside_git_rolls_back_when_no_git_file_changed() {
+    // 只有 git 管不到的文件被更新：回退不会覆盖服务器内容，照旧回原分支（§13 第 5 行）
+    let fx = hybrid_with_colleague();
+    write(&fx, "Art/x.psd", "psd-local\n");
+    fx.colleague_commits("Art/x.psd", "psd-server\n");
+    write(&fx, "Code/B.cs", "b-wip\n");
+    let e = expect(&fx);
 
     let err = run_sync_in(&fx.wc_str(), &e).unwrap_err();
     assert_eq!(err.code, "sync_in_update_conflict");

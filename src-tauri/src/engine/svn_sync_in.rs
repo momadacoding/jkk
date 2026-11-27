@@ -325,19 +325,54 @@ fn on_stale_baseline(
     rolled_back(repo, cfg, j, disk, stale_error(dirty))
 }
 
+/// S5 失败。update 已经换掉了 git 管的文件时**不回退**（见 [`updated_by_svn`]），记录停在
+/// `stashed`，「继续」会从 S4 起重跑 update。一个都没换时照旧回原分支。
 fn on_update_failed(
     repo: &str,
     cfg: &SvnConfig,
     j: &mut Journal,
     stderr: &str,
 ) -> Result<SyncInOutcome> {
-    rolled_back(
-        repo,
-        cfg,
-        j,
-        Disk::MaybeUpdated,
-        update_failed_error(stderr),
-    )
+    let cause = update_failed_error(stderr);
+    let updated = updated_or_keep(repo, cfg, j, &cause)?;
+    if !updated.is_empty() {
+        return Err(GitError::new(
+            "sync_in_update_incomplete",
+            format!(
+                "svn update 没跑完就失败了。svn 原话：{}\n\n{}",
+                stderr.trim(),
+                kept_for_continue(
+                    &updated,
+                    j,
+                    "请先在 TortoiseSVN 里对工作副本根目录跑一次 Clean up（清掉中断留下的锁），\
+                     等网络、VPN 正常后，点顶部横幅上的「继续」把这次更新跑完。\
+                     先用 TortoiseSVN 的 Update 补齐、再点「继续」也可以。",
+                )
+            ),
+        ));
+    }
+    rolled_back(repo, cfg, j, Disk::MaybeUpdated, cause)
+}
+
+/// [`updated_by_svn`]，失败时**原因在前**（与 [`rolled_back`] 同一条规矩）：核对不成就不回退，
+/// 记录留着，用户先要知道 update 为什么没成。
+fn updated_or_keep(
+    repo: &str,
+    cfg: &SvnConfig,
+    j: &Journal,
+    cause: &GitError,
+) -> Result<Vec<String>> {
+    updated_by_svn(repo, cfg, j).map_err(|e| {
+        // 不用原因自己的错误码：`sync_in_update_failed` 约定的是「已回退」，这里记录是留着的
+        GitError::new(
+            "sync_in_update_incomplete",
+            format!(
+                "{}\n\n另外：没能核对 svn update 换掉了哪些 git 管的文件（{}），所以没有回退，\
+                 记录已保留。处理好之后在顶部横幅上点「继续」或「放弃」。",
+                cause.message, e.message
+            ),
+        )
+    })
 }
 
 fn on_update_conflict(
@@ -346,13 +381,25 @@ fn on_update_conflict(
     j: &mut Journal,
     conflicts: &[String],
 ) -> Result<SyncInOutcome> {
-    rolled_back(
-        repo,
-        cfg,
-        j,
-        Disk::MaybeUpdated,
-        update_conflict_error(conflicts),
-    )
+    // update 跑完了才会走到这里，git 管的文件多半已经换成新版：回退同样会把它们写回旧内容
+    let cause = update_conflict_error(conflicts);
+    let updated = updated_or_keep(repo, cfg, j, &cause)?;
+    if !updated.is_empty() {
+        return Err(GitError::new(
+            "sync_in_update_conflict",
+            format!(
+                "svn update 产生了冲突：\n{}\n这些文件不归 git 管（或者是目录级的树冲突），\
+                 本应用没法替你解决。\n\n{}",
+                list_paths(conflicts),
+                kept_for_continue(
+                    &updated,
+                    j,
+                    "请先用 TortoiseSVN 解决（Resolve）上面的冲突，再点顶部横幅上的「继续」。",
+                )
+            ),
+        ));
+    }
+    rolled_back(repo, cfg, j, Disk::MaybeUpdated, cause)
 }
 
 /// 回退并把结果接在原因后面。**原因永远在前**：用户先要知道为什么没更新成。
@@ -422,6 +469,178 @@ fn update_conflict_error(conflicts: &[String]) -> GitError {
             list_paths(conflicts)
         ),
     )
+}
+
+/// HEAD 在基线分支上时，`checkout -f` 回原分支会改写的、update 换掉了的 W-file：
+///
+/// - 与基线 commit 对不上的被跟踪文件（内容变了，或被删了——`-f` 会把它写回来，SVN 却记着已删除）；
+/// - 服务器新增、基线里没有、而原分支恰好也有同名文件的路径（`-f` 会用分支的版本盖掉它，终审
+///   review 第 1 条实测）。
+///
+/// 服务器新增、原分支也没有的文件不算：`-f` 不碰它们，回原分支后原样留在磁盘上，与 SVN 记的一致
+/// （同名 WIP 被它挡住时停在 `applying-stash`，见对应测试）。
+///
+/// # 为什么这就是「`svn update` 换掉了的文件」
+///
+/// S3 切到基线后磁盘 == 基线树，WIP 连同未跟踪文件（`stash -u`）都在 stash 里；S4 又确认过
+/// W-file 在 SVN 看来全部干净。之后能改这些文件的只有 S5 的 update。崩溃后重开、不知道 S5 跑没跑时
+/// 也成立：中断期间有人手改过的文件 SVN 看来不干净，调用方先用 [`dirty_w_files`] 拦下。
+///
+/// # 为什么它们在就不能回原分支（2026-11-27 现场）
+///
+/// 这些文件的磁盘内容与 SVN 记的 revision 一起前进了，而 git 的基线还停在旧版。`checkout -f`
+/// 回原分支会把它们写回旧内容，SVN 却仍记着新版本：同事的改动于是成了「你的本地修改」。之后的
+/// 跟进、重建基线都把它当未提交改动保留（SVN 看来就是本地修改，没有别的证据能分辨），交付时撤掉
+/// 同事的提交。以前的前提「覆盖掉也能从服务器取回」只在有人去取回时成立，而没有任何步骤去取回。
+///
+/// 基线已经发布（`baseline-ready` 之后）时 HEAD 就是新基线、磁盘与它一致，这里返回空：回原分支
+/// 留下的是「分支落后基线」，git 自己记得，下次更新会重放上去。
+fn updated_by_svn(repo: &str, cfg: &SvnConfig, j: &Journal) -> Result<Vec<String>> {
+    if current_branch(repo)?.as_deref() != Some(BASELINE_BRANCH) {
+        return Ok(Vec::new());
+    }
+    let mut out = tracked_changes(repo, cfg)?;
+    out.extend(added_over_branch_files(repo, cfg, j)?);
+    Ok(out)
+}
+
+/// 白名单内的未跟踪文件（此刻只可能是 update 新增的，WIP 的未跟踪文件都在 stash 里）中，
+/// 原分支也跟踪着的那些。
+fn added_over_branch_files(repo: &str, cfg: &SvnConfig, j: &Journal) -> Result<Vec<String>> {
+    let roots = normalize_roots(&cfg.whitelist);
+    if roots.is_empty() {
+        return Ok(Vec::new()); // 空 pathspec 会变成「全部」（§12.2）
+    }
+    let mut args: Vec<&str> = vec!["ls-files", "-z", "--others", "--exclude-standard", "--"];
+    args.extend(roots.iter().map(String::as_str));
+    let others = run_git(repo, &args)?;
+    let others: Vec<&str> = others.split('\0').filter(|p| !p.is_empty()).collect();
+    if others.is_empty() {
+        return Ok(Vec::new());
+    }
+    let orig_head = need(&j.orig_head, "origHead")?;
+    let mut args: Vec<&str> = vec!["ls-tree", "-r", "-z", "--name-only", &orig_head, "--"];
+    args.extend(roots.iter().map(String::as_str));
+    let on_branch = run_git(repo, &args)?;
+    let on_branch: std::collections::HashSet<&str> =
+        on_branch.split('\0').filter(|p| !p.is_empty()).collect();
+    Ok(others
+        .into_iter()
+        .filter(|p| on_branch.contains(p))
+        .map(str::to_string)
+        .collect())
+}
+
+/// 不回退、留给「继续」时接在原因后面的说明。`next` 是用户下一步要做的事。
+fn kept_for_continue(updated: &[String], j: &Journal, next: &str) -> String {
+    // 没有 WIP 时（计划 A7）stash 里什么都没有，不能让用户去 stash 列表里找
+    let wip = if j.stash_oid.is_some() {
+        "未提交的改动还在 stash 里，"
+    } else {
+        ""
+    };
+    format!(
+        "svn update 已经把下面这些 git 管的文件换成了服务器上的新版本：\n{}\n\
+         这时直接回到原分支，会把它们写回旧内容，而 SVN 记的已经是新版本——同事的改动会变成你的\
+         本地修改，交付时被撤掉。所以这次没有回退：分支、基线都没动，{wip}记录已保留。\n{next}",
+        list_paths(updated)
+    )
+}
+
+/// 「放弃」时 update 已经换掉的文件里，原分支的提交或 WIP 也改过的那些（见 [`back_to_orig`]）。
+///
+/// 这些文件回原分支后要的是「你的版本 + 服务器的改动」，得做三方合并，只有「继续」做得了。
+/// 其余的文件在原分支上与旧基线一字不差，保留服务器内容就只多出「服务器的改动」这一份差异。
+fn touched_by_branch_or_wip(
+    repo: &str,
+    cfg: &SvnConfig,
+    j: &Journal,
+    updated: &[String],
+) -> Result<Vec<String>> {
+    let roots = normalize_roots(&cfg.whitelist);
+    if roots.is_empty() {
+        return Ok(updated.to_vec()); // 空 pathspec 会变成「全部」（§12.2），宁可全算碰过
+    }
+    let base = need(&j.baseline_oid_before, "baselineOidBefore")?;
+    let orig_head = need(&j.orig_head, "origHead")?;
+    let mut ranges: Vec<(String, String)> = vec![(base, orig_head)];
+    if let Some(oid) = &j.stash_oid {
+        // WIP 的工作区（`^1` → stash 自己）与暂存（`^1` → `^2`）
+        ranges.push((format!("{oid}^1"), oid.clone()));
+        ranges.push((format!("{oid}^1"), format!("{oid}^2")));
+    }
+    let mut touched: Vec<String> = Vec::new();
+    let mut collect = |out: String| {
+        for p in out.split('\0').filter(|p| !p.is_empty()) {
+            touched.push(p.to_string());
+        }
+    };
+    // 不用看 `stash -u` 的未跟踪部分（`^3`）：`updated` 里的路径要么在旧基线里被跟踪，要么在原分支
+    // 上被跟踪（[`added_over_branch_files`]）。WIP 要在这样的路径上留一个未跟踪文件，原分支就得
+    // 不跟踪它，即原分支相对旧基线删了它——上面第一段 diff 已经把它算进来了
+    for (from, to) in &ranges {
+        let mut args: Vec<&str> = vec!["diff", "--name-only", "-z", "--no-renames", from, to, "--"];
+        args.extend(roots.iter().map(String::as_str));
+        collect(run_git(repo, &args)?);
+    }
+    Ok(updated
+        .iter()
+        .filter(|p| touched.contains(p))
+        .cloned()
+        .collect())
+}
+
+/// update 换掉的文件此刻在磁盘上的样子：内容，或 `None`（服务器删掉了它）。
+fn read_server_content(repo: &str, updated: &[String]) -> Result<Vec<(String, Option<Vec<u8>>)>> {
+    updated
+        .iter()
+        .map(|p| {
+            let path = Path::new(repo).join(p);
+            match std::fs::read(&path) {
+                Ok(bytes) => Ok((p.clone(), Some(bytes))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((p.clone(), None)),
+                Err(e) => Err(GitError::new(
+                    "sync_in_unsafe_to_return",
+                    format!("读不了 {p}（{e}），没有回原分支，记录已保留。"),
+                )),
+            }
+        })
+        .collect()
+}
+
+/// 把 [`read_server_content`] 记下的内容写回去。写不成的指名报出来：它们此刻是原分支的旧内容，
+/// 用 TortoiseSVN 的 Revert 就能换回服务器版本（Revert 取的是 SVN 记的那个 revision）。
+fn put_back_server_content(repo: &str, saved: &[(String, Option<Vec<u8>>)]) -> Result<()> {
+    let mut failed: Vec<String> = Vec::new();
+    for (p, content) in saved {
+        let path = Path::new(repo).join(p);
+        let r = match content {
+            Some(bytes) => path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&path, bytes)),
+            None => match std::fs::remove_file(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                r => r,
+            },
+        };
+        if r.is_err() {
+            failed.push(p.clone());
+        }
+    }
+    if failed.is_empty() {
+        return Ok(());
+    }
+    Err(GitError::new(
+        "sync_in_unsafe_to_return",
+        format!(
+            "下面这些文件没能换回服务器上的版本（多半有程序占着它们），\
+             磁盘上可能是原分支的旧内容：\n{}\n请关掉占用的程序，在 TortoiseSVN 里对这些文件点 Revert\
+             （换回 SVN 记的版本）。不 Revert 的话，同事的改动会显示成你的本地修改，交付时被撤掉。\
+             顶部如果还有横幅，按横幅处理未提交的改动。",
+            list_paths(&failed)
+        ),
+    ))
 }
 
 /// S6–S7：录新基线并发布（spec §7.3 S7、§7.6 录制三阶段）。
@@ -1343,6 +1562,8 @@ pub(crate) fn back_to_orig(
     let orig = need(&j.orig_branch, "origBranch")?;
     let orig_head = need(&j.orig_head, "origHead")?;
     let branch = current_branch(repo)?;
+    // update 已经换成服务器版本的文件，回原分支之后把这份内容写回去（见下）
+    let mut server_content: Vec<(String, Option<Vec<u8>>)> = Vec::new();
     if branch.as_deref() != Some(orig.as_str()) {
         if branch.as_deref() != Some(BASELINE_BRANCH) {
             return Err(state_changed(&format!(
@@ -1350,38 +1571,97 @@ pub(crate) fn back_to_orig(
             )));
         }
         if disk == Disk::MaybeUpdated {
-            force_back_when_w_clean(repo, cfg, &orig, |dirty| {
-                GitError::new(
+            // 先认「不知道是谁改的」，再认「update 换掉了的」：手改过的文件两边都会列出，
+            // 归到后者会把它说成服务器内容
+            let dirty = dirty_w_files(repo, cfg)?;
+            if !dirty.is_empty() {
+                return Err(GitError::new(
                     "sync_in_unsafe_to_return",
                     format!(
                         "要回到分支 `{orig}` 就得覆盖工作区里的文件，而下面这些文件的内容\
                          既不是 git 写的、也不是服务器上的——不知道是谁改的，不能覆盖：\n{}\n\
                          记录已保留。请先确认这些改动（需要的话自己备份），再点「放弃」。",
-                        list_paths(dirty)
+                        list_paths(&dirty)
                     ),
-                )
-            })?;
+                ));
+            }
+            // 基线还没跟上、update 已经换掉了 git 管的文件（2026-11-27 现场）：`-f` 会把它们写回
+            // 旧内容，SVN 却记着新版本。原分支的提交与 WIP 都没碰过的，回去之后保留服务器内容——
+            // 它们在原分支上与旧基线一字不差，留下的差异只有「服务器的改动」，是一份如实的未提交
+            // 改动，下次更新时基线跟上、三方合并自动抵消。碰过的要三方合并，只能「继续」。
+            //
+            // 不一律拒绝放弃（独立 review 第 1 条）：update 一直跑不完时（external 失效、没有
+            // 写权限……），「继续」次次失败，记录就永远清不掉，跟进、更新、交付全被挡住
+            let updated = updated_by_svn(repo, cfg, j)?;
+            if !updated.is_empty() {
+                let touched = touched_by_branch_or_wip(repo, cfg, j, &updated)?;
+                if !touched.is_empty() {
+                    return Err(GitError::new(
+                        "sync_in_update_incomplete",
+                        kept_for_continue(
+                            &touched,
+                            j,
+                            "你的提交或未提交的改动也改过这些文件，回原分支要把两边合起来，\
+                             这次没法放弃。请点「继续」把更新跑完；「继续」时 svn update 报错的话，\
+                             先在 TortoiseSVN 里对工作副本根目录跑一次 Clean up。一直报同一个错\
+                             （比如 external 失效、没有写权限），就先在 TortoiseSVN 里把它解决到 \
+                             Update 能跑通，再点「继续」。",
+                        ),
+                    ));
+                }
+                server_content = read_server_content(repo, &updated)?;
+            }
+            // 上面已确认 W-file 全部干净（与 `force_back_when_w_clean` 同一道判定，不重跑 svn status）。
+            // checkout 失败时可能已经写了一部分：同样把服务器内容写回去（这些文件原分支与旧基线
+            // 一字不差，HEAD 停在哪一边都不影响），见下面那段写回的说明
+            if let Err(e) = checkout_verified(repo, cfg, &orig, true) {
+                return Err(match put_back_server_content(repo, &server_content) {
+                    Ok(()) => e,
+                    Err(pe) => {
+                        GitError::new(&e.code, format!("{}\n\n另外：{}", e.message, pe.message))
+                    }
+                });
+            }
         } else {
             checkout_verified(repo, cfg, &orig, true)?;
         }
     }
-    // HEAD 仍在原分支上（S3 失败时 git 整体拒绝、一个字节没写——计划 A15）
-    // 或刚切回来：都要求分支本身没被动过
-    if rev_parse(repo, "HEAD")? != orig_head {
-        return Err(state_changed(&format!("分支 `{orig}` 的位置变了")));
+    let mut rest = || -> Result<RestoreStep> {
+        // HEAD 仍在原分支上（S3 失败时 git 整体拒绝、一个字节没写——计划 A15）
+        // 或刚切回来：都要求分支本身没被动过
+        if rev_parse(repo, "HEAD")? != orig_head {
+            return Err(state_changed(&format!("分支 `{orig}` 的位置变了")));
+        }
+        // 上一次切回原分支可能「退出 0 却没切干净」（A15 / C1）；刚才那次 checkout 已经核对过
+        settle_checkout_residue(repo, cfg, j, &orig)?;
+        // 随 restore_step 进入 applying-stash 时一起落盘（PR #49 review #3）
+        j.rolling_back = true;
+        restore_step(repo, j)
+    };
+    let step = rest();
+    // 写回放在核对残留与放回 WIP **之后**：服务器内容既不是分支的也不是基线的，先写回去会被核对
+    // 当成来源不明的改动。WIP 没碰过这些文件，放回不受影响。
+    //
+    // 上面**出错了也要写回**（终审 review 第 2 条）：内容只在这个栈帧里，`?` 提前返回就丢了，
+    // 磁盘停在旧内容、SVN 记着新版本，正是要修的形状。崩在 `checkout -f` 与这里之间同样会丢，
+    // 窗口只有这几步本地 git 操作，没有落盘（journal 不记文件内容）
+    let put = put_back_server_content(repo, &server_content);
+    match (step, put) {
+        (step, Ok(())) => step,
+        (Ok(_), Err(pe)) => Err(pe),
+        (Err(e), Err(pe)) => Err(GitError::new(
+            &e.code,
+            format!("{}\n\n另外：{}", e.message, pe.message),
+        )),
     }
-    // 上一次切回原分支可能「退出 0 却没切干净」（A15 / C1）；刚才那次 checkout 已经核对过
-    settle_checkout_residue(repo, cfg, j, &orig)?;
-    // 随 restore_step 进入 applying-stash 时一起落盘（PR #49 review #3）
-    j.rolling_back = true;
-    restore_step(repo, j)
 }
 
 /// 用 `-f` 切回原分支（计划 A5）：能 `-f` 的前提是 W-file 在 svn 看来全部干净 = 磁盘上就是服务器内容，
 /// 覆盖掉也能从服务器取回。有不干净的就用 `dirty_error` 报错、什么都不动。
 ///
-/// 更新的「放弃」与交付的「停止收尾」共用（第 77 号 issue 第二批）。报错由调用方给：两边的错误码、
-/// 横幅按钮名与措辞都不同。
+/// 原本更新的「放弃」与交付的「停止收尾」共用（第 77 号 issue 第二批），现在只剩交付用。更新那边
+/// 「能取回」不够：基线还没跟上时写回旧内容，SVN 记的却是新版本，见 [`updated_by_svn`]
+/// （2026-11-27 现场）。交付的停止收尾是否有同一形状没有核对过。报错由调用方给。
 pub(crate) fn force_back_when_w_clean(
     repo: &str,
     cfg: &SvnConfig,
