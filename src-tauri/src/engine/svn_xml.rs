@@ -1088,6 +1088,46 @@ pub fn parse_log(xml: &str) -> Result<Vec<SvnLogEntry>> {
     Ok(out)
 }
 
+/// `svn blame --xml` 里一行的出处。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlameRevAuthor {
+    pub rev: u64,
+    pub author: String,
+    /// ISO8601 原样，与 [`SvnLogEntry::date`] 同一口径。
+    pub date: String,
+}
+
+/// 解析 `svn blame --xml`：按行号顺序，每行一项。
+///
+/// 一行没有 `<commit>`（工作副本里的本地修改；target 是 `URL@REV` 时不会出现）为 `None`。
+/// 属性逐行排列，与 `svn log` 一样必须走 DOM（2026-11-28 实测样例见 `blame_tests`）。
+pub fn parse_blame(xml: &str) -> Result<Vec<Option<BlameRevAuthor>>> {
+    let doc = parse_doc(xml)?;
+    let mut out: Vec<(u64, Option<BlameRevAuthor>)> = Vec::new();
+    for entry in doc.descendants().filter(|n| n.has_tag_name("entry")) {
+        let line = entry
+            .attribute("line-number")
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or_else(|| GitError::new("svn_xml", "svn blame 的 entry 缺少 line-number"))?;
+        let commit = entry.children().find(|n| n.has_tag_name("commit"));
+        let who = match commit {
+            Some(c) => Some(BlameRevAuthor {
+                rev: c
+                    .attribute("revision")
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .ok_or_else(|| GitError::new("svn_xml", "svn blame 的 commit 缺少 revision"))?,
+                author: joined_child_text(&c, "author"),
+                date: joined_child_text(&c, "date"),
+            }),
+            None => None,
+        };
+        out.push((line, who));
+    }
+    out.sort_by_key(|(l, _)| *l);
+    Ok(out.into_iter().map(|(_, w)| w).collect())
+}
+
 /// `svn ls -R --xml` 的一条 entry。
 #[derive(Debug, Clone, PartialEq)]
 pub struct SvnListEntry {
@@ -1224,4 +1264,58 @@ fn child_text(node: &Node, tag: &str) -> Result<String> {
         .and_then(|n| n.text())
         .map(str::to_string)
         .ok_or_else(|| GitError::new("svn_xml", format!("svn 输出缺 <{tag}>")))
+}
+
+#[cfg(test)]
+mod blame_tests {
+    use super::*;
+
+    /// `svn blame --xml <url>@2` 的真实输出（2026-11-28，svn 1.14.5，路径换成了占位）：
+    /// 属性逐行排列，第 2、3 行来自 r2。
+    const SAMPLE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<blame>
+<target
+   path="file:///X/repo/a.txt">
+<entry
+   line-number="1">
+<commit
+   revision="1">
+<author>liuhao</author>
+<date>2026-11-27T16:01:47.309689Z</date>
+</commit>
+</entry>
+<entry
+   line-number="2">
+<commit
+   revision="2">
+<author>liuhao</author>
+<date>2026-11-27T16:01:47.380512Z</date>
+</commit>
+</entry>
+<entry
+   line-number="3">
+<commit
+   revision="2">
+<author>liuhao</author>
+<date>2026-11-27T16:01:47.380512Z</date>
+</commit>
+</entry>
+</target>
+</blame>"#;
+
+    #[test]
+    fn parse_blame_reads_each_line_in_order() {
+        let lines = parse_blame(SAMPLE).unwrap();
+        let revs: Vec<Option<u64>> = lines.iter().map(|l| l.as_ref().map(|b| b.rev)).collect();
+        assert_eq!(revs, vec![Some(1), Some(2), Some(2)]);
+        let first = lines[0].as_ref().unwrap();
+        assert_eq!(first.author, "liuhao");
+        assert_eq!(first.date, "2026-11-27T16:01:47.309689Z");
+    }
+
+    #[test]
+    fn a_line_without_commit_is_none() {
+        let xml = r#"<blame><target path="x"><entry line-number="1"></entry></target></blame>"#;
+        assert_eq!(parse_blame(xml).unwrap(), vec![None]);
+    }
 }

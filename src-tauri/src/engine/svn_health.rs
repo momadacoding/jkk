@@ -28,10 +28,8 @@ use crate::engine::svn_basemap::BaseMap;
 use crate::engine::svn_nodes::{read_node_status, NodeStatus};
 use crate::engine::svn_scope::WScope;
 use crate::engine::svn_tombstone::fault::{self, Point};
-use crate::engine::svn_tombstone::{
-    confirm_absent, decode_url, encode_url_path, error_codes, server_head_rev,
-};
-use crate::engine::svn_wc::WcIdentity;
+use crate::engine::svn_tombstone::{confirm_absent, decode_url, error_codes, server_head_rev};
+use crate::engine::svn_wc::{server_url_at, strip_prefix_ci, unit_of, WcIdentity};
 use crate::engine::svn_xml::{parse_diff_summary, parse_excluded_nodes, parse_list};
 use crate::error::{GitError, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -607,30 +605,6 @@ fn cmdline_len(args: &[String]) -> usize {
     cmdline_estimate(&[], args)
 }
 
-/// 仓库相对路径归哪个单元：取最长的 `wc_root` 前缀（嵌套 external 比外层更具体）。
-/// 返回单元下标与相对单元根的路径（就是单元根本身时为空串）。
-fn unit_of(units: &[WcIdentity], path: &str) -> Option<(usize, String)> {
-    let mut best: Option<(usize, usize, String)> = None;
-    for (i, u) in units.iter().enumerate() {
-        let root = u.wc_root.trim_end_matches('/');
-        let rel = if path.eq_ignore_ascii_case(root) {
-            Some(String::new())
-        } else {
-            strip_prefix_ci(path, &format!("{root}/"))
-        };
-        if let Some(rel) = rel {
-            let longer = match &best {
-                None => true,
-                Some(b) => root.len() > b.1,
-            };
-            if longer {
-                best = Some((i, root.len(), rel));
-            }
-        }
-    }
-    best.map(|(i, _, rel)| (i, rel))
-}
-
 fn outside_units(p: &str) -> GitError {
     GitError::new(
         "svn_health_path_outside_units",
@@ -639,17 +613,6 @@ fn outside_units(p: &str) -> GitError {
              白名单改过之后要先重建基线。"
         ),
     )
-}
-
-/// 墓碑 / 待确认路径在服务器上的 `<url>@<rev>`。
-fn server_url_at(units: &[WcIdentity], p: &str, rev: u64) -> Option<String> {
-    let (i, rel) = unit_of(units, p)?;
-    let url = units[i].url.trim_end_matches('/');
-    Some(if rel.is_empty() {
-        format!("{url}@{rev}")
-    } else {
-        format!("{url}/{}@{rev}", encode_url_path(&rel))
-    })
 }
 
 /// 找出被 `--set-depth=exclude` 掉的节点（仓库相对路径 → kind）。纯本地读，不写 wc.db（E19）。
@@ -1858,20 +1821,6 @@ fn whitelist_not_under_base(
 // 反向证据由 `a_lying_baseline_inside_a_nested_external_is_caught` 提供：
 // 少了它，「见到 external 就返回 Verified」也能让干净那条变绿。
 // ─────────────────────────────────────────────────────────────────────────
-
-/// 大小写不敏感地剥前缀。`file:///C:/…` 里盘符的大小写不保证与配置里一致。
-fn strip_prefix_ci(path: &str, prefix: &str) -> Option<String> {
-    if path.len() <= prefix.len() {
-        return None;
-    }
-    // 按字节比，避免在多字节字符中间切片。前缀末尾是 `/`，字节段匹配时
-    // prefix.len() 必定落在字符边界上。
-    if path.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes()) {
-        Some(path[prefix.len()..].to_string())
-    } else {
-        None
-    }
-}
 
 #[cfg(test)]
 mod tests {

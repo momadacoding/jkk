@@ -1,0 +1,145 @@
+# 混合仓库文件历史与 Blame：实现日志
+
+计划：`2026-11-27-svn-file-history.md`　设计：`../specs/2026-11-27-svn-file-history-design.md`
+
+## 进度总账
+
+| Task | 状态 | 产出 | 验证 |
+|---|---|---|---|
+| 0 实现日志 | 完成 | 本文件 | — |
+| 1 带超时的 svn 查询 | 完成 | `svn_cli.rs`：`run_svn_deadline`、`classify_svn_error`、`SVN_QUERY_TIMEOUT` | `cargo test --lib deadline_tests` 4/4；fmt、clippy 干净 |
+| 2 路径 → URL 共用 | 完成 | `svn_wc.rs`：`unit_of`、`server_url`、`server_url_at`、`strip_prefix_ci`、`units_cached` | `url_tests` 2/2；svn_health 五个集成测试二进制 105/105 |
+| 3 基线标注 | 完成 | `file_history.rs`：`EntrySvn` / `BaselineInfo` / `DeliveredState`、`SvnAnnotator`；`tests/file_history_svn.rs` | `file_history_svn` 7/7，`file_history` 27/27；fmt、clippy 干净 |
+| 4 分组纯函数 | 完成 | `svn_file_history.rs`：`GroupSpec`、`Cursor`、`SvnRevEntry`、`bucket`、`next_cursor`、`PAGE` | `cargo test --lib svn_file_history` 11/11 |
+| 5 `svn_file_history` | 完成 | `svn_file_history.rs`：`svn_file_history`、`page_with_units`、进程内 LRU；命令注册 | `file_history_svn` 18/18、`--lib svn_file_history` 12/12；改坏换 peg 的变异让 2 个测试失败 |
+| 6 `svn_rev_file_diff` | 完成 | `svn_file_history.rs`：`svn_rev_file_diff`、`svn_cat`、`tree_with_file`；`svn_cli.rs`：`run_svn_deadline_bytes`；命令注册 | `file_history_svn` 23/23；去掉 mempack 的变异让 `no_object_is_written_to_the_users_git` 失败（10 ≠ 5） |
+| 7 `svn_blame_overlay` | 完成 | `svn_xml.rs`：`parse_blame`、`BlameRevAuthor`；`svn_file_history.rs`：`svn_blame_overlay`、`overlay_with_units`、`OverlayTarget` / `OverlayResult`；命令注册 | `file_history_svn` 28/28，`--lib blame_tests` 2/2；clippy 干净 |
+| 8 前端 store 与纯函数 | 完成 | `src/engine/svnHistory.ts`、`fileHistory.ts` 类型、`repoStore.ts` 三个 invoke；`tests/vitest/svnHistory.test.ts` | `pnpm test` 109 文件 / 2064 用例全过；`pnpm build` 通过 |
+| 9 FileHistoryView | 完成 | `FileHistoryView.tsx`（SVN 行、加载更多、提示、`SvnEntryDiff`、Blame 套 SVN 出处）、`svnHistory.ts` 的 `groupComplete`、`styles.css`；测试 10 个组件用例 + 2 个纯函数用例 | `pnpm test` 2076/2076；`pnpm build` 通过；去掉两处过期响应防护的变异让 2 个测试失败 |
+| 10 真实窗口验证与收尾 | 完成（review 见下） | 真实窗口 E2E；计数行布局修正；旧计划非目标与 `history.rs` 注释更新；`no_console_window` 放行表 | Rust：fmt、clippy 干净，`--lib` + 116 个测试二进制分 5 批全过（1 + 144 + 875 + 214 + 225 + 第 1 批 999）；前端：`pnpm build` 通过，`pnpm test` 2076/2076 |
+
+## 决策
+
+### Task 0
+
+- **偏离计划（实为偏离 spec §7）：** spec 要求超时时结束 svn 进程「含子进程」。本实现只结束 svn 主进程。结束进程树要给 `windows` crate 加 `Win32_System_JobObjects` feature，计划的全局约束不加 feature。svn+ssh 下的 ssh 子进程预计在管道关闭后自行退出，**未测**，列为风险。
+
+### Task 1
+
+- **计划没写的坑（svn 1.14.5 实测 stderr）：**
+  - 拒绝连接的端口：`E170013: Unable to connect to a repository at URL …` 接着 `E730061: Can't connect to host …`
+  - `file://` 仓库里不存在的路径：`E160013: File not found: revision 0, path '/nope'`
+  - 不回应的服务器：svn 一直等，没有自己的超时，只能靠 `run_svn_deadline` 结束
+- **为什么这样分类是安全的：** 认证失败时 svn 也会先报一行 E170013，所以先查认证码（E170001 / E215004，**未实测**），再查路径码，最后才查连接码。归错类只影响提示的那句话，不影响数据。
+- **偏离计划：** 多加了一个测试 `success_returns_stdout`，确认正常路径能拿到 stdout。超时后不等读管道的线程结束（孙进程可能还攥着管道）。
+
+### Task 2
+
+- **偏离计划：** `strip_prefix_ci` 也一起挪进 `svn_wc`（`pub(crate)`）。`svn_health` 里还有别处用它，留两份会分叉。
+- **偏离计划：** `units_cached` 的缓存键多了一项「基线分支 tip」。更新 / 跟进之后可能多出新的 external，只按白名单做键，新 external 下的文件要等重启才换算得出 URL。缓存只留最近一份。
+- **为什么是安全的：** `unit_of` / `server_url_at` 原样搬家，`svn_health` 的行为不变，回归用它的五个集成测试二进制（105 个用例）全部通过。
+
+### Task 3
+
+- **偏离计划：** `BlameCommit` 除了 `baseline` 还加了 `delivered`。spec §6.3 要求 Blame 里已交付的提交显示「已交付 rN」，计划只给了 `baseline`，漏了。
+- **偏离计划：** 读提交说明不走 `git_read::commit_message`（每次都重开一次仓库，1000 条就开 1000 次），在同一个 `Repository` 上读 `message_raw_bytes`，与 `commit_message` 读的是同一份原始字节。
+- **偏离计划：** 多加了 `a_colleague_update_is_a_baseline_not_a_delivery`。`a_delivered_commit_carries_its_svn_rev` 只断言本地提交的「已交付 rN」：交付录的基线树与交付的提交相同，`git log --follow` 不列它，读不到它的标注；`Delivered-Rev` 的解析改在 `mixed_revision_baseline_uses_rev_of_not_floor` 里用自建基线断言。
+- **计划没写的坑：** Blame 里一个提交的 `file_rev` 要按路径取，`commits` 表里没有路径，取该提交第一次出现那一行的 `orig_path`。
+- **为什么判定是对的：** `svn/base` 的 first-parent 链是一条祖先线，「能到达某提交的基线」在链上是一段后缀，用二分找第一条，`graph_descendant_of` 只调 O(log n) 次。不是混合仓库时 `read_config` 失败，什么都不标，纯 git 仓库的输出只多一个 `null` 字段（`plain_git_repo_has_no_svn_annotation`）。
+
+### Task 4
+
+- **计划的错误：** 计划要求 `file_rev` 不严格递减时报 `bad_history_args`（测试 `non_decreasing_file_revs_are_rejected`）。这会让某些真实文件的 History 直接报错：重建基线可能录出与更早那条相同的 revision（内容回到旧版、git 里却算一次改动）。改为容错的归属规则：X 归 `file_rev ≥ X` 里最小的那条，相同时归最老的。`file_rev` 严格递减时与 spec §5.3 的半开区间完全等价。测试换成 `equal_file_revs_go_to_the_oldest_of_them`。
+- **计划的错误：** 计划写「这一页一条都没查到时 O = `peg_rev + 1`」。翻过几页满页之后，这一段其实已经追到了上一页的最老那条，用 `peg_rev + 1` 会把已经查过的组当成「够不着」再查一遍。改为 O = `next_top + 1`；第一页时 `next_top == peg_rev`，与计划一致。补测试 `an_empty_page_after_full_pages_keeps_what_earlier_pages_reached`。
+- **计划没写的坑：** 换 peg 只在当前 peg 那组之后（更老的组）里找。否则一条 peg 什么都没查到时会选回自己，死循环（`an_empty_segment_does_not_requery_its_own_group`）。
+- **偏离计划：** 多加了 `a_full_page_ending_at_r1_is_exhausted`：满页但最老的已是 r1，不能再发一次 `-r 0:1`。
+
+### Task 5
+
+- **计划的错误：** `hidden` 只取基线的 `Delivered-Rev` 不够。交付录的基线树和交付的提交相同，`git log --follow` 常常不列它，于是交付的 rN 落进下一条基线的组里，和「已交付 rN」的本地提交重复出现。`hidden` 改为基线的 `deliveredRev` 加上本地提交 `delivered.rev` 的并集（测试 helper `hidden_of` 与前端同口径，Task 8 的 `hiddenRevs` 照此实现）。
+- **偏离计划：** 「初始化前已有 60 次提交」的 fixture 做不出来（`hybrid_with_colleague` 在 r1 后立刻初始化），改成初始化后同事提交 60 次再更新，测的是同一件事：一页 50、cursor 取剩下的、跨组取完后为 None（`sixty_revisions_page_by_fifty`）。
+- **偏离计划：** 「没有调 svn」用一个不存在的仓库路径证明：没有基线组时连仓库都不碰（`a_file_never_in_a_baseline_makes_no_svn_call`）。
+- **偏离计划：** 服务器上这个 peg 处没有该路径（`svn_path_missing`）当作这一段为空、继续看更老的组，不报错。
+- **计划没写的坑：** 一页内换 peg 时，后一段的 `-l` 要用这一页剩下的额度，`next_cursor` 判「满页」也用这个额度，否则一页会超过 50 条或提前截断。
+- **验证测试有效：** 把换 peg 改成永不发生，`git_rename_delivered_switches_peg`、`delete_and_recreate_switches_peg` 失败；改回后全过。
+
+### Task 6
+
+- **计划没写的坑：** `run_svn_deadline` 把 stdout 有损地转成 UTF-8 字符串。`svn cat` 读的是文件内容（GBK、二进制都有），先转字符串就改了内容。新增 `run_svn_deadline_bytes`，`run_svn_deadline` 改成它的薄包装，Task 1 的 4 个测试照过。
+- **计划里「未核实」的那条已核实：** 在这次打开的 `Repository` 的对象库上 `add_new_mempack_backend(1000)` 之后，`blob` / `treebuilder` 的写入都进内存，`.git/objects` 的文件数不变。去掉这一行，同一个测试多出 5 个对象文件，确认测试有效。不需要临时裸仓库的退路。
+- **偏离计划：** 多加了 `binary_content_is_reported_as_binary`（含 NUL 的内容按二进制显示），以及参数防护：`peg_path` 为空、`rev == 0`、`peg_rev < rev` 返回 `bad_history_args`。路径不在任何白名单单元底下返回 `svn_path_missing`。
+- **为什么是安全的：** 只读。`svn cat` 不碰工作副本，diff 的对象只在内存里，打开的 `Repository` 用完即丢。
+
+### Task 7
+
+- **计划没写的坑（svn 1.14.5 实测）：** 同事给文件设 `svn:eol-style=CRLF` 的那次提交，`svn blame` 把**没改过内容的第 1 行**也算到那次提交上。这是 svn 自己的判定，不是映射错。测试改为与 `svn blame --xml` 的直接输出逐行比对，不写死期望。行数不变，所以映射照常进行。
+- **计划没写的坑：** `svn blame --xml` 的属性逐行排列，和 `svn log` 一样必须走 DOM。真实样例贴进了 `svn_xml.rs` 的 `blame_tests`。
+- **偏离计划：** `Mismatch` 变体单独加了 `#[serde(rename_all = "camelCase")]`，字段才会以 `svnLines` / `gitLines` 送到前端（枚举上的 `rename_all` 只改变体名）。
+- **偏离计划：** 多加了 `an_unreachable_server_fails_only_that_target`，并为此拆出 `overlay_with_units`（与 Task 5 的 `page_with_units` 同一做法）。`units_cached` 失败时每个 target 都是 `Failed`，命令本身不报错。
+- **行数口径：** 基线 blob 里换行符的个数，最后一行没有换行符时再加 1，与 `git blame` 的行数一致。
+
+### Task 8
+
+- **偏离计划：** 不新写 `createRequestGate`，复用已有的 `src/engine/latestGate.ts`（`createLatestGate`），两者是同一件事。计划里的 `stale svn response is ignored` 挪到 Task 9 的组件测试里测真实的丢弃行为，不在这里再测一遍已有工具。
+- **偏离计划：** `applyOverlay` 的返回值多了 `failure`（第一个查失败的原因），Blame 顶部要据此显示「连不上 SVN」。查失败的行显示为基线，但不计入 `unmapped`：「没对上 SVN 版本」和「连不上」是两种提示。
+- **偏离计划：** 新字段在 TS 里写成可选（`svn?:`、`baseline?:`、`delivered?:`），已有测试里手写的数据不用全部补字段。
+- **已知局限：** 同一个基线提交里，同一文件出现两个 `origPath`（极少见）时，`BlameCommit.baseline.fileRev` 只按第一次出现的那个路径取，第二个路径用的 `fileRev` 可能不对。行数核对能挡住大部分错配。
+- **计划没写的坑：** worktree 里没有 `node_modules`，先 `pnpm install --frozen-lockfile`。
+
+### Task 9
+
+- **偏离计划：** 「加载更多」放在列表最底下，不挂在最老那一组下面。一页是跨组取的（一页可能同时填好几组），按钮放哪一组都不对；出错时它同时充当重试。
+- **偏离计划：** 每组是否加载完要有判据，补了纯函数 `groupComplete`（游标的 `nextTop` 落到更老一组的 revision 或以下即完整），并在 `svnHistory.test.ts` 加了 2 个用例。没加载完显示「已加载 N 次 SVN 提交…」，加载完显示「N 次 SVN 提交」。
+- **偏离计划：** 历史列表原本没有右键菜单，SVN 条目的「Blame 此版本」做成右侧 diff 标题里置灰的「Blame 这一版」按钮（悬停说明「SVN 条目暂不支持」）。Blame 里 SVN 那一块的右键菜单「Blame 这次改动之前的版本」置灰、带同样的说明。
+- **偏离计划：** `fileHistoryItems.ts` 不需要改（它只管入口菜单）。
+- **偏离计划：** Blame 里「已交付 rN」/「未交付」放在悬停说明里，不占左侧栏宽度。
+- **计划没写的坑：** Blame 重读后、新的 overlay 回来之前那一次渲染，不能拿旧 overlay 套新 Blame（行号对不上就会归错人）。overlay 存成 `{ blame, view }`，只在 `blame` 是同一个对象时使用；另外用 `createLatestGate` 防止晚到的旧结果把新结果冲掉。
+- **计划没写的坑：** 组件测试里的桩每次要返回新对象。返回同一个引用时 React 不重渲染，「HEAD 变了 / 工作区变了要重读」的测试会假失败或假通过。
+- **验证测试有效：** 第一版的两个过期响应测试在去掉防护后仍然通过：旧响应用了同一个 rev，被 `mergePage` 去重掉了；overlay 测试没断言新结果还在。改过之后，去掉防护的变异让这两个测试都失败。
+
+### Task 10
+
+- **真实窗口 E2E（2026-11-28）：** `pnpm tauri dev --config`（identifier `com.momadacoding.jkk.e2efh`，用完删掉两个配置目录）+ CDP。已核对进程是本 worktree 的 `src-tauri\target\debug\app.exe`。fixture 是 scratchpad 里的 `file://` 仓库：alice / bob 在初始化前提交 r1–r3，初始化后 gao 提交 r4，经窗口里的 `svn_sync_in` 更新，再本地提交一次、最后经 `svn_sync_out` 交付成 r5。逐条对照 spec §10：
+  1. History：`svn: r4` 下展开 `r4 gao 调整第三行`，初始化那条下展开 r3 / r2 / r1，作者和说明与 `svn log` 一致 —— 通过
+  2. 本地提交标「未交付」；交付后变成「已交付 r5」，r5 没有再单列一次 —— 通过
+  3. 点 r4，diff 是 `-line3 / +line3 gao`，与 `svn diff -c 4` 一致；「Blame 这一版」置灰 —— 通过
+  4. Blame：五行分别显示 r1 alice / r2 bob / r4 gao / r3 alice，本地那一行保持 git 提交 —— 通过
+  5. 把 fixture 的 `repo` 目录改名模拟断网，打开从没查过的 `B.cs`：git 列表照常出现，顶部「连不上 SVN，基线条目显示的是快照」；目录改回后点「加载更多」补出 r1 —— 通过
+  6. 四个命令按 camelCase 参数名在真实窗口里调通；参数名写错（`group` 代替 `groups`）返回 `missing required key groups` —— 通过
+- **E2E 发现并修掉的问题：** 「N 次 SVN 提交」原来接在作者、日期后面，列表一窄就被截掉看不见。改成基线行下单独一行（截图复验已显示）。jsdom 测不到布局，没有对应的自动化测试。
+- **计划没写的坑：** 本机 ACP 1252，PowerShell 里 `svn commit -m "中文"` 存进仓库的是 `?`，第一版 fixture 的说明全是问号。这是 fixture 的问题，不是程序的：改用 `-F 文件 --encoding UTF-8` 后显示正常。
+### 独立 review（2026-11-28，opus，只读）
+
+结论：修完 C1、C2、I1 后可以合并。逐条处理：
+
+- **C1 已修**：`svn cat -r <创建版 - 1>`、区间落在创建版之前的 `svn log` 报 `E195012`，原来归成 `svn_cli`，所以几乎每个真实文件的「新增那一版」diff 都报错；满页正好停在创建版时还会翻页卡死。现已归进 `svn_path_missing`。原测试 `the_add_revision_shows_the_whole_file_as_added` 用的是 r1，走的是 `rev == 1` 的捷径，测的不是真实形态。补了 `the_add_revision_after_r1_shows_the_whole_file_as_added`、`a_full_page_ending_at_the_creation_revision_moves_on_to_older_groups`、`a_revision_before_the_node_existed_is_path_missing`，均先 RED（E195012）后 GREEN。
+- **C2 已修，换了做法（偏离 spec §5.4 的「沿一个 peg 查、按号分组、查到头再换 peg」）**：路径被删掉、又用复制补回同名路径时，`svn log X@6` 沿复制历史列出的是另一个文件的 r2、r1，号码却落进旧 X 基线的区间，被算到旧 X 头上，而旧 X 真实的 r3、r4 不出现。这是反目标里的「归错人」。改成每组用自己的 peg 查自己的区间：`svn log <path_i>@<R_i> -r <top>:<R(i+1)+1>`，按构造就是 §5.3 的半开区间。`Cursor` 加了 `group` 字段，`bucket` 换成按组装配的 `assemble`，前端 `groupComplete` 改为按组号判断。代价是每组至少一次查询，基线数通常个位数到几十。测试 `a_path_replaced_by_a_copy_keeps_each_baseline_on_its_own_lineage` 先 RED（`[2, 1]` ≠ `[4, 3]`）后 GREEN；原有的改名后交付、删除重建等用例照过。Task 4 里「相同 `file_rev` 归最老那组」「非单调时不报错」两条裁决在新做法下仍成立：区间为空的组不发查询。
+- **I1 已修**：第一页就失败（工作副本被锁、需要 cleanup 等，`units_cached` 报错；或 invoke 被 reject）时没有游标，每一行都被当成「查完了」，显示一句假的「0 次 SVN 提交」，也没有重试按钮。现在后端与前端都在出错时给出起点游标（`start_cursor` / `startCursor`）。RTL 用例 `a first page that fails says so and offers a retry instead of claiming 0 commits` 先 RED 后 GREEN。
+- **Minor 1 升级处理**：`cat` / `blame` 的缓存键原来没带 uuid，计划写的是带，也没在日志里记。按 AGENTS.md §13 第 12 条，未记录的偏离是阻断，所以照计划补上 uuid。
+- **Minor 8 升级处理**：`readCommitFileDiff` 的 JSDoc 被新函数隔开，挂到了 `readSvnFileHistory` 头上，已挪回。
+- **延后（不在本 PR 修）**：
+  - Minor 2：`svn cat` 缓存按条数不按字节，大文件点几次 diff 会占不少内存。白名单通常只有代码文件，影响有限。（后经 ultrareview 第 6 条升级修复）
+  - Minor 3：Blame overlay 等待期间没有「正在读取 SVN 出处」提示；查询超时（长历史文件 `svn blame` > 15 秒）也被说成「连不上 SVN」；8 个查询是串行的。（超时部分后经 ultrareview 第 3、5 条修复）
+  - Minor 4：基线删掉了这个文件时（墓碑），那一组的 peg 指向不存在的路径，被当作空段，组内容不全（不会错配）。
+  - Minor 5：Local-Only 提交会一直显示「未交付」；白名单外文件也会被打交付标签，与 spec §8 不符。
+  - Minor 6：`SvnAnnotator` 在 1000 条历史、长 first-parent 链上的耗时没量过。
+  - Minor 7：HEAD 一变 SVN 补全就回到第一页，已翻过的页和选中的 SVN 条目丢失。
+  - Minor 9：真实窗口里没单独做 `svn://` 拒绝端口那一项（`file://` 目录改名验了；拒绝端口有 Rust 测试）。
+- **Declined to judge 里的一条留作后续**：用当前工作副本单元的 URL 去配旧基线的 peg，做过 `svn switch` 或改过 external URL 时，旧 peg 可能查不到（被当作 0 条）。这是 spec §5.4 的既定做法，建议另开 issue。
+
+### Ultrareview（2026-11-28，云端多 agent）
+
+共 8 条。按用户实际会遇到的影响重新定级：修 6 条，延后 2 条。每条修复都先写测试并确认 RED，再改到 GREEN。
+
+- **第 1 条已修（首页在途时显示「0 次」）**：`loadSvn(null)` 把游标清成 null，`groupComplete(i, null)` 为真，第一页还没回来（最长 15 秒）时每条基线都显示「0 次 SVN 提交」。现在第一页带起点游标。RTL 用例 `while the first page is in flight every baseline row says loading, not 0 commits`。
+- **第 2 条已修（别的 SVN 库导入的 git-svn commit 被当成基线）**：`baseline_of` 原来只看提交说明能不能解析出记账。现在比对 `svn/base` tip 记账里的 `repos_root` 与 `uuid`，判据与 `svn_init::last_baseline_in_head` 一致；对不上的提交就不算基线，按普通提交标交付状态。没有 `svn/base` 时认不出是哪个库，退回原来「凡是记账都算」。**裁决**：认同一库的依据取 `svn/base` tip，不另跑 `svn info`，因为 `file_history` 不该为标注去碰服务器或工作副本。代价：tip 是别的库时（不应出现）全部基线都不认，只会少标，不会归错。用例 `a_git_svn_commit_from_another_svn_repository_is_not_a_baseline`。
+- **第 3 条已修（长历史文件的 blame 永远映射不上，每次重读都重跑）**：`run_svn_deadline` 的超时单独报 `svn_timeout`。`svn log` / `svn cat` 仍按设计 §7 当作 `svn_unreachable`；`svn blame` 的超时改为 60 秒（取值，未在公司服务器实测），超时后提示「svn blame 等了 60 秒还没算完…」。失败结果在进程内记一段时间，期间 Blame 重读不再去服务器：连不上、认证失败记 60 秒，blame 超时记 10 分钟；路径不存在和 svn 自身报错不记。用例：`a_server_that_never_answers_times_out` 改为断言 `svn_timeout`，加上 `a_log_or_cat_timeout_reads_as_unreachable`、`only_server_side_failures_are_remembered`、`a_remembered_failure_expires`。**没有测到的**：真实的 60 秒 blame 超时，测试要等一分钟，所以只测了记忆与 TTL 的逻辑。
+- **第 4 条已修（`$Id$` 等关键字被当成改动）**：`svn cat` 加了 `--ignore-keywords`。用例 `expanded_keywords_are_not_shown_as_changed`，RED 时多出的一行是 `$Id: K.cs 3 … $`。
+- **第 5 条已修（连不上时 8 个目标挨个等超时）**：一个单元报 `svn_unreachable` 或 `svn_auth` 之后，同一单元剩下的目标直接给同一个失败，不再起 svn。超时不算在内，因为多半只是这一个文件慢。用例 `an_unreachable_unit_is_asked_once_not_once_per_target_and_reload`：假服务器接下连接立刻断开，两个目标重读两次，RED 时被连了 4 次，GREEN 时 1 次。
+- **第 6 条已修（原 Minor 2 升级）**：超过 4 MB 的 `svn cat` 结果不进缓存。用例 `big_contents_are_not_cached`。单次 diff 时内容仍会整份读进内存，没有加大小上限。
+- **延后**：
+  - 第 7 条（同原 Minor 6）：`SvnAnnotator::classify` 对每条历史都做 `graph_descendant_of` 和二分查找，耗时没量过。改成一次 revwalk 建表是可行的优化，但需要先有数据说明它慢。
+  - 第 8 条：`--perf` 记录里，超时被记成 `spawnFailed`，`spawn()` 失败反而不记。只影响诊断数据，不影响用户。
+- 原 Minor 3 里的「超时被说成连不上」已随第 3 条修掉，「没有加载提示」仍然延后。
+
+- **计划没写的坑：** `no_console_window` 守卫测试按文件数 `spawn()`。`run_svn_deadline_bytes` 要能中途结束进程，只能 `spawn()`，已用 `ProcTimer` 手工计时，与 `git_cli` 同一理由加进放行表（`svn_cli.rs` 1 次）。

@@ -3193,6 +3193,35 @@ body {
   color: #8ab4d8;
 }
 
+/* 混合仓库：基线条目下展开的真实 SVN 提交（计划 2026-11-27-svn-file-history） */
+.fh-svn-row { padding-left: 28px; }
+.fh-svn-row .fh-row-meta { padding-left: 0; }
+.fh-svn-rev {
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  color: #8ec07c;
+}
+.fh-svn-tag {
+  flex-shrink: 0;
+  padding: 0 5px;
+  border: 1px solid #555;
+  border-radius: 3px;
+  color: #c8ccd4;
+  font-size: 11px;
+}
+.fh-svn-tag.undelivered { border-color: #a07a3c; color: #d8a657; }
+.fh-svn-count {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #8ec07c;
+}
+.fh-svn-count.failed { color: #e06c75; }
+.fh-load-more {
+  display: block;
+  width: calc(100% - 16px);
+  margin: 6px 8px;
+}
+
 .fh-action {
   flex-shrink: 0;
   padding: 1px 8px;
