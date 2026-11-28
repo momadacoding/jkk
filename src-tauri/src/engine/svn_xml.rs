@@ -770,6 +770,60 @@ pub fn parse_info_schedules(xml: &str) -> Result<Vec<(String, Option<String>)>> 
     Ok(out)
 }
 
+/// `svn info --xml` 里一个 `<conflict>`（设计 2026-11-28 §3.1）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InfoConflict {
+    /// `type` 属性：`text`、`property`、`tree`。
+    pub kind: String,
+    /// 三方文件的绝对路径，svn 给的原样（正斜杠）。文本冲突才有；二进制冲突没有
+    /// `prev-wc-file`：磁盘上的文件本身就是「我的」（2026-11-28 实测，svn 1.14）。
+    pub prev_base_file: Option<String>,
+    pub prev_wc_file: Option<String>,
+    pub cur_base_file: Option<String>,
+    /// `<version side="source-left">` / `source-right` 的 revision：共同祖先与服务器版本。
+    pub left_rev: Option<u64>,
+    pub right_rev: Option<u64>,
+}
+
+/// 从 `svn info --xml` 里取每个 entry 的冲突，返回 `(path, conflicts)`，path 归一成正斜杠。
+/// 没有冲突的 entry 给空清单。
+pub fn parse_info_conflicts(xml: &str) -> Result<Vec<(String, Vec<InfoConflict>)>> {
+    let doc = parse_doc(xml)?;
+    let mut out = Vec::new();
+    for entry in doc.descendants().filter(|n| n.has_tag_name("entry")) {
+        let path = norm_sep(&attr(&entry, "path")?);
+        let conflicts = entry
+            .descendants()
+            .filter(|n| n.has_tag_name("conflict"))
+            .map(|c| {
+                let text = |tag: &str| {
+                    c.children()
+                        .find(|n| n.has_tag_name(tag))
+                        .and_then(|n| n.text())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                };
+                let rev = |side: &str| {
+                    c.children()
+                        .find(|n| n.has_tag_name("version") && n.attribute("side") == Some(side))
+                        .and_then(|n| n.attribute("revision"))
+                        .and_then(|r| r.parse().ok())
+                };
+                InfoConflict {
+                    kind: c.attribute("type").unwrap_or_default().to_string(),
+                    prev_base_file: text("prev-base-file"),
+                    prev_wc_file: text("prev-wc-file"),
+                    cur_base_file: text("cur-base-file"),
+                    left_rev: rev("source-left"),
+                    right_rev: rev("source-right"),
+                }
+            })
+            .collect();
+        out.push((path, conflicts));
+    }
+    Ok(out)
+}
+
 /// `svn status [-u] --xml` 里 `sync_in` 关心的字段（spec §7.2 第 4、5 条，§7.3 S5）。
 ///
 /// 与 [`StatusEntry`] 分开：那个结构被初始化、重建、体检、失同步判定共用，

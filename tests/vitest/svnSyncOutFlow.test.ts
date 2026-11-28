@@ -76,6 +76,7 @@ function deps(log: string[], typed = '修复跳跃'): SvnSyncOutFlowDeps & { dra
     },
     // 不记日志：只有补丁落回阶段的「继续」用它，那几个用例自己接
     setSyncActionBusy: () => {},
+    offerSvnConflicts: () => log.push('offerSvnConflicts'),
   }
 }
 
@@ -91,6 +92,30 @@ describe('handleSvnDeliver', () => {
     vi.mocked(store.svnSyncOutPreview).mockRejectedValue({ code: 'sync_out_behind_baseline' })
     await createSvnSyncOutFlow(deps(log)).handleSvnDeliver()
     expect(log).toEqual(['clearError', 'guardMerge', 'reportError:sync_out_behind_baseline'])
+  })
+
+  it('执行时 D6 撞上冲突：错误留在对话框里，框关掉之后弹冲突列表（独立 review）', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncOutPreview).mockResolvedValue(preview)
+    vi.mocked(store.svnSyncOut).mockRejectedValue({ code: 'sync_out_update_conflict' })
+    await createSvnSyncOutFlow(deps(log)).handleSvnDeliver()
+    expect(log).toContain('dialogError:sync_out_update_conflict')
+    expect(log.at(-1)).toBe('offerSvnConflicts')
+  })
+
+  it('执行时别的错误：不弹', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncOutPreview).mockResolvedValue(preview)
+    vi.mocked(store.svnSyncOut).mockRejectedValue({ code: 'sync_out_commit_failed' })
+    await createSvnSyncOutFlow(deps(log)).handleSvnDeliver()
+    expect(log).not.toContain('offerSvnConflicts')
+  })
+
+  it('预览报「白名单里有 SVN 冲突」：报错，再弹冲突列表（设计 2026-11-28 §2.4）', async () => {
+    const log: string[] = []
+    vi.mocked(store.svnSyncOutPreview).mockRejectedValue({ code: 'sync_out_svn_conflicted' })
+    await createSvnSyncOutFlow(deps(log)).handleSvnDeliver()
+    expect(log).toEqual(['clearError', 'guardMerge', 'reportError:sync_out_svn_conflicted', 'offerSvnConflicts'])
   })
 
   it('成功：带着用户写的信息执行、刷新、清空草稿、弹 D9 提示', async () => {

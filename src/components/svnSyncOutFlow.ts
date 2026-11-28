@@ -21,6 +21,7 @@ import {
   type SyncOutOutcome,
 } from '../engine/svnSyncOut'
 import type { SyncState, SyncStateUnreadable } from '../engine/svnJournal'
+import { opensConflictList } from '../engine/svnConflicts'
 import type { ConfirmRequest } from './ConfirmDialog'
 import {
   createAfterSync,
@@ -61,6 +62,11 @@ export interface SvnSyncOutFlowDeps {
   fetchSvnLog: (path: string) => Promise<unknown>
   /** 未收尾横幅上执行中的那颗按钮，与更新流程共用（同一条横幅）。 */
   setSyncActionBusy: (busy: SyncActionBusy | null) => void
+  /**
+   * 同 `SvnSyncFlowDeps.offerSvnConflicts`：交付的前置检查、执行或「继续」报「有冲突没解决」（含 D6 的
+   * `sync_out_update_conflict`）时弹冲突列表。不等、不抛。
+   */
+  offerSvnConflicts: () => void
 }
 
 export function createSvnSyncOutFlow(d: SvnSyncOutFlowDeps) {
@@ -74,10 +80,12 @@ export function createSvnSyncOutFlow(d: SvnSyncOutFlowDeps) {
    * 后端无论成败都补发 `repo-changed`、监听器也会刷同步状态，所以它对最终状态不是必需的；
    * 它保证的是**先后**：用户看到错误时横幅已经是新 phase（第 77 号 issue 的确认，见决策日志）。
    */
-  const refreshing = async <T>(run: () => Promise<T>): Promise<T> => {
+  const refreshing = async <T>(run: () => Promise<T>, seen?: { conflicted: boolean }): Promise<T> => {
     try {
       return await run()
     } catch (err) {
+      // 错误留在对话框里，流程看不到错误码：「有冲突没解决」记下来，框关掉之后弹冲突列表
+      if (seen && opensConflictList(err)) seen.conflicted = true
       await afterSync()
       throw err
     }
@@ -97,10 +105,14 @@ export function createSvnSyncOutFlow(d: SvnSyncOutFlowDeps) {
       preview = await svnSyncOutPreview(d.repoPath)
     } catch (err) {
       d.reportError(err)
+      if (opensConflictList(err)) d.offerSvnConflicts()
       return
     }
     // 用盒子而不是 `let outcome`：闭包里的赋值 TS 的控制流分析看不见
-    const box: { outcome: SyncOutOutcome | null } = { outcome: null }
+    const box: { outcome: SyncOutOutcome | null; conflicted: boolean } = {
+      outcome: null,
+      conflicted: false,
+    }
     await d.deliver({
       model: describeDeliverPreview(preview),
       initialMessage: d.draft.current,
@@ -108,8 +120,9 @@ export function createSvnSyncOutFlow(d: SvnSyncOutFlowDeps) {
         d.draft.current = m
       },
       action: async (message) => {
-        box.outcome = await refreshing(() =>
-          svnSyncOut(d.repoPath, expectFromDeliverPreview(preview, message)),
+        box.outcome = await refreshing(
+          () => svnSyncOut(d.repoPath, expectFromDeliverPreview(preview, message)),
+          box,
         )
         // 只在成功后清：失败时草稿留给下一次（spec §13）
         d.draft.current = ''
@@ -117,6 +130,7 @@ export function createSvnSyncOutFlow(d: SvnSyncOutFlowDeps) {
       },
     })
     await showOutcome(box.outcome)
+    if (box.conflicted) d.offerSvnConflicts()
   }
 
   /**
@@ -131,24 +145,34 @@ export function createSvnSyncOutFlow(d: SvnSyncOutFlowDeps) {
     const phase = s && !('readError' in s) && s.unfinished ? s.unfinished.phase : 'prepare'
     const model = describeSyncOutAction(id, phase)
     if (id === 'syncOutContinue' && !syncOutContinueNeedsConfirm(phase)) {
-      // 不套 `refreshing`：`runOnBanner` 失败时自己先刷新再报
+      // 不套 `refreshing`：`runOnBanner` 失败时自己先刷新再报。错误码在这里先记下
+      const seen = { conflicted: false }
       const outcome = await runOnBanner(d, afterSync, { id, label: model.busyLabel }, () =>
-        svnSyncOutContinue(d.repoPath),
+        svnSyncOutContinue(d.repoPath).catch((err: unknown) => {
+          if (opensConflictList(err)) seen.conflicted = true
+          throw err
+        }),
       )
       await showOutcome(outcome)
+      if (seen.conflicted) d.offerSvnConflicts()
       return
     }
-    const box: { outcome: SyncOutOutcome | null } = { outcome: null }
+    const box: { outcome: SyncOutOutcome | null; conflicted: boolean } = {
+      outcome: null,
+      conflicted: false,
+    }
     await d.confirm({
       ...model,
       action: async () => {
-        box.outcome = await refreshing(() =>
-          id === 'syncOutContinue' ? svnSyncOutContinue(d.repoPath) : svnSyncOutAbort(d.repoPath),
+        box.outcome = await refreshing(
+          () => (id === 'syncOutContinue' ? svnSyncOutContinue(d.repoPath) : svnSyncOutAbort(d.repoPath)),
+          box,
         )
         await afterSync()
       },
     })
     await showOutcome(box.outcome)
+    if (box.conflicted) d.offerSvnConflicts()
   }
 
   return {

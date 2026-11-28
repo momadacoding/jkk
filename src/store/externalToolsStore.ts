@@ -70,6 +70,14 @@ export function openExternalMerge(path: string, toolId: string, file: string): P
 }
 
 /**
+ * 用外部工具合并一个 SVN 冲突（git 不管的文件）。三方文件取 svn 留下的那几份。
+ * 退出后不标记已解决：用户回到冲突列表里看过结果再点「标记已解决」。
+ */
+export function openSvnConflictMerge(path: string, toolId: string, file: string): Promise<void> {
+  return invoke('open_svn_conflict_merge', { path, toolId, file })
+}
+
+/**
  * 订阅外部工具退出事件，只认 `path` 这个仓库的（多开标签时别的仓库不受影响）。
  *
  * `onExit` 放进 ref：调用方每次渲染都传新闭包，直接放进依赖会让监听反复注销重注册，

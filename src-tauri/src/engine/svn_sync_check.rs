@@ -12,6 +12,7 @@ use crate::engine::git_cli::run_git_code;
 use crate::engine::svn_baseline::git_dir;
 use crate::engine::svn_cli::{run_svn, with_scan_cache};
 use crate::engine::svn_config::{read_config, BASELINE_BRANCH};
+use crate::engine::svn_conflict::SvnConflict;
 use crate::engine::svn_dirty::{classify, explained_paths, read_dirty};
 use crate::engine::svn_externals::detect_pinned;
 use crate::engine::svn_include_check::dry_run_include_set_titled;
@@ -187,7 +188,8 @@ fn check_sync_in_uncached(repo_root: &str) -> Result<SyncInPreview> {
     let mut add_collisions = Vec::new();
     for e in &st.entries {
         if e.is_conflicted() {
-            conflicted.push(e.path.clone());
+            // 分组只为文案（设计 2026-11-28 §2.2）：哪一种都照旧拒绝
+            conflicted.push(SvnConflict::classify(repo_root, e, &w_files));
             continue;
         }
         if w_files.contains(&e.path) {
@@ -217,12 +219,17 @@ fn check_sync_in_uncached(repo_root: &str) -> Result<SyncInPreview> {
         }
     }
     if !conflicted.is_empty() {
+        // 冲突还在时 svn 会跳过这个文件、让它停在旧 revision，解决的就成了对旧版本的冲突
+        // （预研 2026-11-25 §5.2 实测）。所以先解决再更新
         return Err(GitError::new(
             "sync_in_svn_conflicted",
             format!(
-                "工作副本里有 SVN 冲突还没处理，在它上面再 update 只会让情况更乱：\n{}\n\
-                 请先用 TortoiseSVN 解决（Resolve）后再更新。",
-                list_paths(&conflicted)
+                "这次没有更新，什么都没改动。工作副本里有 SVN 冲突还没处理：冲突的文件 svn update 会跳过，\
+                 它会停在旧版本上。请先解决，再点「更新」。\n\n{}",
+                crate::engine::svn_conflict::describe_groups(
+                    &conflicted,
+                    "请用 TortoiseSVN 解决（Resolve）。",
+                )
             ),
         ));
     }

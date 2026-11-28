@@ -12,6 +12,8 @@ import { DeleteWorktreeDialog } from '@/components/DeleteWorktreeDialog'
 import { useDeliverDialog } from '@/components/DeliverDialog'
 import { useFollowReportDialog } from '@/components/FollowReportDialog'
 import { useFollowConflictDialog } from '@/components/FollowConflictDialog'
+import { useSvnConflictsDialog } from '@/components/SvnConflictsDialog'
+import type { SvnConflict } from '@/engine/svnConflicts'
 import { usePrompt } from '@/components/PromptDialog'
 import { SettingsDialog } from '@/components/SettingsDialog'
 import SvnInitWizard from '@/components/SvnInitWizard'
@@ -176,6 +178,51 @@ function FollowConflict() {
           run: async () => {
             throw new Error(LONG_ERROR)
           },
+        })
+      }
+    >
+      {dialog}
+    </OpenOnMount>
+  )
+}
+
+/** SVN 冲突列表（设计 2026-11-28-update-conflict-resolve-in-jkk §3.2）：40 个能解决的、20 个要去 TortoiseSVN 的。 */
+function SvnConflicts() {
+  const { showSvnConflicts, dialog } = useSvnConflictsDialog()
+  const art = (n: number) =>
+    Array.from({ length: n }, (_, i) => `Assets/Art/UI/Prefabs/Battle/Skill/Very/Deep/UI_SkillEffect_${i}.prefab`)
+  const initial: SvnConflict[] = [
+    ...art(40).map((path, i) => ({
+      path,
+      text: i % 3 !== 2,
+      props: i % 3 !== 0,
+      tree: false,
+      dir: false,
+      gitManaged: false,
+      resolvable: true,
+      mergeable: i % 3 !== 2,
+    })),
+    ...paths(20).map((path, i) => ({
+      path,
+      text: true,
+      props: false,
+      tree: i % 2 === 0,
+      dir: false,
+      gitManaged: i % 2 === 1,
+      resolvable: false,
+      mergeable: false,
+    })),
+  ]
+  return (
+    <OpenOnMount
+      open={() =>
+        void showSvnConflicts({
+          initial,
+          load: async () => initial,
+          resolve: async () => {
+            throw new Error(LONG_ERROR)
+          },
+          merge: () => ({ label: 'UnityYAMLMerge', open: async () => {} }),
         })
       }
     >
@@ -381,6 +428,8 @@ const SCENES: Record<string, () => ReactNode> = {
   'follow-report-long': () => <Follow />,
   'follow-conflict-long': () => <FollowConflict />,
   'follow-conflict-long-error': () => <FollowConflict />,
+  'svn-conflicts-long': () => <SvnConflicts />,
+  'svn-conflicts-confirm-long': () => <SvnConflicts />,
   'split-local-only-long': () => (
     <SplitLocalOnlyDialog
       request={{

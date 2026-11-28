@@ -49,6 +49,7 @@ import {
   type SyncInOutcome,
 } from '../engine/svnSyncIn'
 import type { SyncState, SyncStateUnreadable } from '../engine/svnJournal'
+import { offerAfterOutcome, opensConflictList } from '../engine/svnConflicts'
 import { perfMark, perfSpan } from '../store/perf'
 import type { ConfirmRequest } from './ConfirmDialog'
 import {
@@ -174,6 +175,12 @@ export interface SvnSyncFlowDeps {
    * `null`，撤掉上一次的。这一次没跟进（被拦下、开关关着）时不调：上一次留下的照旧成立。
    */
   setHeldBack: (pin: HeldBackPin | null) => void
+  /**
+   * 查一次工作副本里的 SVN 冲突，有就弹冲突列表（设计 2026-11-28-update-conflict-resolve-in-jkk §3.2）。
+   * 更新、继续、放弃走完之后调，前置检查或执行报「有冲突没解决」时也调。不等、不抛：查冲突要跑一遍
+   * 全量 `svn status`，不该拖住 `running`。
+   */
+  offerSvnConflicts: () => void
 }
 
 /**
@@ -242,21 +249,40 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
       preview = await svnSyncInPreview(d.repoPath)
     } catch (err) {
       d.reportError(err)
+      if (opensConflictList(err)) d.offerSvnConflicts()
       return
     }
     // 用盒子而不是 `let outcome`：闭包里的赋值 TS 的控制流分析看不见，
     // `if (outcome)` 会被收窄成 never
-    const box: { outcome: SyncInOutcome | null } = { outcome: null }
+    const box: { outcome: SyncInOutcome | null; conflicted: boolean } = {
+      outcome: null,
+      conflicted: false,
+    }
     await d.confirm({
       ...describeSyncInPreview(preview),
-      action: async () => {
-        // 确认了才清；前置检查在后端没过时也已经收起了，只收安静的提示，不丢报告
-        d.clearAutoFollowed()
-        box.outcome = await svnSyncIn(d.repoPath, expectFromPreview(preview))
-        await afterSync()
-      },
+      action: () =>
+        watchConflicts(box, async () => {
+          // 确认了才清；前置检查在后端没过时也已经收起了，只收安静的提示，不丢报告
+          d.clearAutoFollowed()
+          box.outcome = await svnSyncIn(d.repoPath, expectFromPreview(preview))
+          await afterSync()
+        }),
     })
     await showOutcome(box.outcome)
+    if (offerAfterOutcome(box.outcome?.kind ?? null) || box.conflicted) d.offerSvnConflicts()
+  }
+
+  /**
+   * 执行出错时对话框留在原地显示错误，流程看不到错误码。这里记下「错误说的是有冲突没解决」，
+   * 框关掉之后照样弹冲突列表。错误原样抛回给对话框。
+   */
+  const watchConflicts = async (box: { conflicted: boolean }, run: () => Promise<void>) => {
+    try {
+      await run()
+    } catch (err) {
+      if (opensConflictList(err)) box.conflicted = true
+      throw err
+    }
   }
 
   /**
@@ -274,22 +300,33 @@ export function createSvnSyncFlow(d: SvnSyncFlowDeps) {
     const manual = unfinished?.flow === 'follow_manual'
     const model = manual ? describeManualFollowAction(id, phase) : describeSyncAction(id, phase)
     if (id === 'syncContinue' && !continueNeedsConfirm(phase)) {
+      // `runOnBanner` 自己报错、返回 null：错误码在这里先记下
+      const box = { conflicted: false }
       const outcome = await runOnBanner(d, afterSync, { id, label: model.busyLabel }, () =>
-        svnSyncContinue(d.repoPath),
+        svnSyncContinue(d.repoPath).catch((err: unknown) => {
+          if (opensConflictList(err)) box.conflicted = true
+          throw err
+        }),
       )
       await showOutcome(outcome, manual)
+      if (offerAfterOutcome(outcome?.kind ?? null) || box.conflicted) d.offerSvnConflicts()
       return
     }
-    const box: { outcome: SyncInOutcome | null } = { outcome: null }
+    const box: { outcome: SyncInOutcome | null; conflicted: boolean } = {
+      outcome: null,
+      conflicted: false,
+    }
     await d.confirm({
       ...model,
-      action: async () => {
-        box.outcome =
-          id === 'syncContinue' ? await svnSyncContinue(d.repoPath) : await svnSyncAbort(d.repoPath)
-        await afterSync()
-      },
+      action: () =>
+        watchConflicts(box, async () => {
+          box.outcome =
+            id === 'syncContinue' ? await svnSyncContinue(d.repoPath) : await svnSyncAbort(d.repoPath)
+          await afterSync()
+        }),
     })
     await showOutcome(box.outcome, manual)
+    if (offerAfterOutcome(box.outcome?.kind ?? null) || box.conflicted) d.offerSvnConflicts()
   }
 
   /**

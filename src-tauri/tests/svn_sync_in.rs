@@ -1251,9 +1251,13 @@ fn abort_while_applying_the_stash_keeps_the_stash_for_the_user() {
 
 /// S5 冲突 → 回退；服务器这次新增的 `Code/N.cs`（svn 的文件，不在旧基线里，
 /// `checkout -f` 不碰它）挡住了放回你那份同名未跟踪文件。回退停在 `applying-stash`。
+///
+/// 冲突用目录 `Art` 上的属性冲突：git 不管的文件上的内容冲突从设计 2026-11-28 起不再回退。
 fn a_rollback_blocked_by_a_server_added_file(fx: &SvnFixture) -> String {
-    write(fx, "Art/x.psd", "psd-local\n");
-    fx.colleague_commits("Art/x.psd", "psd-server\n");
+    svn_fixtures::svn_cmd(&fx.wc(), &["propset", "p", "v-local", "Art"]);
+    svn_fixtures::svn_cmd(&fx.wc2(), &["update", "--non-interactive"]);
+    svn_fixtures::svn_cmd(&fx.wc2(), &["propset", "p", "v-server", "Art"]);
+    svn_fixtures::svn_cmd(&fx.wc2(), &["commit", "-m", "prop", "--non-interactive"]);
     fx.colleague_commits("Code/N.cs", "server\n");
     write(fx, "Code/B.cs", "b-wip\n");
     write(fx, "Code/N.cs", "mine\n");
@@ -1394,9 +1398,31 @@ fn update_failure_returns_to_the_original_branch() {
     assert!(!svn_lock::is_held(&fx.wc_str()));
 }
 
+/// 一行 `svn status` 的前 7 列（状态列），路径不要。
+fn svn_status_cols(fx: &SvnFixture, rel: &str) -> String {
+    let st = app_lib::engine::svn_cli::run_svn(&fx.wc_str(), &["status", "--", rel]).unwrap();
+    st.lines()
+        .find(|l| l.ends_with(&rel.replace('/', "\\")) || l.ends_with(rel))
+        .map(|l| l[..7].to_string())
+        .unwrap_or_default()
+}
+
+/// 更新完成、基线推进、WIP 放回、journal 删掉：git 这一侧与没有冲突时完全一样。
+fn assert_update_finished(fx: &SvnFixture, out: SyncInOutcome, rev: u64) {
+    assert_eq!(out, SyncInOutcome::Done { new_rev: rev });
+    assert_eq!(baseline_rev(fx), rev, "基线推进");
+    assert_eq!(git(fx, &["symbolic-ref", "--short", "HEAD"]), "work");
+    assert_eq!(read(fx, "Code/A.cs"), "a2\n", "服务器的代码改动到了");
+    assert_eq!(read(fx, "Code/B.cs"), "b-wip\n", "WIP 回来了");
+    assert_eq!(phase(fx), None);
+    assert_eq!(our_stashes(fx), 0);
+    assert!(!svn_lock::is_held(&fx.wc_str()));
+}
+
 #[test]
-fn an_update_conflict_outside_git_rolls_back_and_points_to_tortoisesvn() {
-    // §13 第 5 行 / §7.2.1：用户确认过的美术文件在 update 时冲突
+fn a_content_conflict_outside_git_no_longer_rolls_back() {
+    // 设计 2026-11-28 §2.1：用户确认过的美术文件在 update 时冲突。git 不管它，
+    // 更新照常做完，冲突留在工作副本里交给冲突列表
     let fx = hybrid_with_colleague();
     write(&fx, "Art/x.psd", "psd-local\n");
     fx.colleague_commits("Art/x.psd", "psd-server\n");
@@ -1405,38 +1431,131 @@ fn an_update_conflict_outside_git_rolls_back_and_points_to_tortoisesvn() {
     let e = expect(&fx);
     assert_eq!(e.confirmed_outside, vec!["Art/x.psd".to_string()]);
 
-    let err = run_sync_in(&fx.wc_str(), &e).unwrap_err();
-    assert_eq!(err.code, "sync_in_update_conflict");
-    assert!(err.message.contains("Art/x.psd") && err.message.contains("TortoiseSVN"));
-    assert_eq!(git(&fx, &["symbolic-ref", "--short", "HEAD"]), "work");
-    assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
-    assert_eq!(baseline_rev(&fx), 1, "基线不推进");
-    assert_eq!(phase(&fx), None);
-    let st = app_lib::engine::svn_cli::run_svn(&fx.wc_str(), &["status", "Art/x.psd"]).unwrap();
-    assert!(st.starts_with('C'), "冲突现场原样留给 TortoiseSVN：{st}");
+    let out = run_sync_in(&fx.wc_str(), &e).unwrap();
+
+    assert_update_finished(&fx, out, 3);
+    assert_eq!(svn_status_cols(&fx, "Art/x.psd").chars().next(), Some('C'));
 }
 
 #[test]
-fn a_property_conflict_during_update_rolls_back() {
+fn a_property_conflict_outside_git_no_longer_rolls_back() {
     // PR #49 review 第三轮 #4（实测）：属性冲突时 update 退出 0，节点是
-    // `props="conflicted"`。只查内容 / 树冲突会接着录基线、报 Done，把未解决的
-    // 属性冲突留在工作副本里
+    // `props="conflicted"`。以前回退；设计 2026-11-28 起照常做完，冲突留给冲突列表
     let fx = hybrid_with_colleague();
     svn_fixtures::svn_cmd(&fx.wc(), &["propset", "p", "v-local", "Art/x.psd"]);
     svn_fixtures::svn_cmd(&fx.wc2(), &["update", "--non-interactive"]);
     svn_fixtures::svn_cmd(&fx.wc2(), &["propset", "p", "v-server", "Art/x.psd"]);
     svn_fixtures::svn_cmd(&fx.wc2(), &["commit", "-m", "prop", "--non-interactive"]);
+    fx.colleague_commits("Code/A.cs", "a2\n");
     write(&fx, "Code/B.cs", "b-wip\n");
     let e = expect(&fx);
     assert_eq!(e.confirmed_outside, vec!["Art/x.psd".to_string()]);
 
+    let out = run_sync_in(&fx.wc_str(), &e).unwrap();
+
+    assert_update_finished(&fx, out, 3);
+    assert_eq!(svn_status_cols(&fx, "Art/x.psd").chars().nth(1), Some('C'));
+}
+
+#[test]
+fn a_conflict_on_a_non_code_file_inside_the_whitelist_is_let_through() {
+    // 白名单目录里扩展名不在列表中的文件（.prefab、.meta、图片）同样不归 git 管。
+    // 基线树里不能出现它，冲突标记更不能
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/ui.png", "p1\n");
+    assert_eq!(sync(&fx), SyncInOutcome::Done { new_rev: 2 });
+    write(&fx, "Code/ui.png", "p-local\n");
+    fx.colleague_commits("Code/ui.png", "p-server\n");
+    fx.colleague_commits("Code/A.cs", "a2\n");
+    write(&fx, "Code/B.cs", "b-wip\n");
+    let e = expect(&fx);
+    assert_eq!(e.confirmed_outside, vec!["Code/ui.png".to_string()]);
+
+    let out = run_sync_in(&fx.wc_str(), &e).unwrap();
+
+    assert_update_finished(&fx, out, 4);
+    assert_eq!(
+        svn_status_cols(&fx, "Code/ui.png").chars().next(),
+        Some('C')
+    );
+    assert_eq!(
+        git(&fx, &["ls-tree", "-r", "--name-only", "svn/base"]),
+        "Code/A.cs\nCode/B.cs",
+        "基线树里只有 W-file"
+    );
+}
+
+#[test]
+fn a_property_conflict_on_a_directory_still_rolls_back() {
+    // 设计 §1：目录上的属性可能改变哪些文件受 SVN 管理（svn:externals、svn:ignore），不放过。
+    // 同时有一个可放行的文件冲突时，文案把两类分开列
+    let fx = hybrid_with_colleague();
+    svn_fixtures::svn_cmd(&fx.wc(), &["propset", "p", "v-local", "Art"]);
+    write(&fx, "Art/x.psd", "psd-local\n");
+    svn_fixtures::svn_cmd(&fx.wc2(), &["update", "--non-interactive"]);
+    svn_fixtures::svn_cmd(&fx.wc2(), &["propset", "p", "v-server", "Art"]);
+    std::fs::write(fx.wc2().join("Art/x.psd"), "psd-server\n").unwrap();
+    svn_fixtures::svn_cmd(&fx.wc2(), &["commit", "-m", "prop", "--non-interactive"]);
+    write(&fx, "Code/B.cs", "b-wip\n");
+    let e = expect(&fx);
+
     let err = run_sync_in(&fx.wc_str(), &e).unwrap_err();
+
     assert_eq!(err.code, "sync_in_update_conflict", "{}", err.message);
-    assert!(err.message.contains("Art/x.psd"), "{}", err.message);
+    let (refused, kept) = err
+        .message
+        .split_once("一起留下")
+        .unwrap_or_else(|| panic!("文案要分两组：{}", err.message));
+    assert!(
+        refused.contains("Art") && refused.contains("TortoiseSVN"),
+        "{}",
+        err.message
+    );
+    assert!(!refused.contains("Art/x.psd"), "{}", err.message);
+    assert!(kept.contains("Art/x.psd"), "{}", err.message);
     assert_eq!(git(&fx, &["symbolic-ref", "--short", "HEAD"]), "work");
     assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
     assert_eq!(baseline_rev(&fx), 1, "基线不推进");
     assert_eq!(phase(&fx), None);
+}
+
+#[test]
+fn a_conflict_on_a_gitignore_still_rolls_back() {
+    // 独立 review：`.gitignore` / `.gitattributes` 的扩展名不在列表里，却决定哪些是 W-file、行尾怎么归一。
+    // 带冲突标记放过去的话，S6–S7 按两边规则的混合录基线，不报任何错
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Art/.gitignore", "*.tmp\n");
+    assert_eq!(sync(&fx), SyncInOutcome::Done { new_rev: 2 });
+    write(&fx, "Art/.gitignore", "*.tmp\n*.mine-rule\n");
+    fx.colleague_commits("Art/.gitignore", "*.tmp\n*.theirs-rule\n");
+    write(&fx, "Code/B.cs", "b-wip\n");
+
+    let err = run_sync_in(&fx.wc_str(), &expect(&fx)).unwrap_err();
+
+    assert_eq!(err.code, "sync_in_update_conflict", "{}", err.message);
+    assert!(err.message.contains("Art/.gitignore"), "{}", err.message);
+    assert_eq!(baseline_rev(&fx), 2, "基线不推进");
+    assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
+    assert_eq!(phase(&fx), None);
+}
+
+#[test]
+fn the_next_update_is_refused_until_the_conflict_is_resolved() {
+    // 设计 §2.2：冲突还在时 svn 会跳过它、让它停在旧 revision（预研 §5.2 实测），所以预检照旧拒绝，
+    // 文案指向 jkk 的冲突列表
+    let fx = hybrid_with_colleague();
+    write(&fx, "Art/x.psd", "psd-local\n");
+    fx.colleague_commits("Art/x.psd", "psd-server\n");
+    fx.colleague_commits("Code/A.cs", "a2\n");
+    write(&fx, "Code/B.cs", "b-wip\n");
+    sync(&fx);
+    fx.colleague_commits("Code/A.cs", "a3\n");
+
+    let err = preview_sync_in(&fx.wc_str()).unwrap_err();
+
+    assert_eq!(err.code, "sync_in_svn_conflicted", "{}", err.message);
+    assert!(err.message.contains("Art/x.psd"), "{}", err.message);
+    assert!(err.message.contains("SVN 冲突列表"), "{}", err.message);
 }
 
 #[cfg(windows)]

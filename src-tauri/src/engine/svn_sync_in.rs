@@ -24,8 +24,9 @@ use crate::engine::svn_baseline::{
 };
 use crate::engine::svn_basemap::BaseMap;
 use crate::engine::svn_changelist;
-use crate::engine::svn_cli::{run_svn, run_svn_code};
+use crate::engine::svn_cli::run_svn_code;
 use crate::engine::svn_config::{read_config, SvnConfig, BASELINE_BRANCH};
+use crate::engine::svn_conflict::{describe_groups, read_conflicts, SvnConflict};
 use crate::engine::svn_dirty::read_dirty;
 use crate::engine::svn_follow_audit;
 use crate::engine::svn_follow_mark::renew_mark_after_follow;
@@ -42,7 +43,7 @@ use crate::engine::svn_sync_check::{
 use crate::engine::svn_sync_stash::{self as wip, RestoreOutcome};
 use crate::engine::svn_util::{now_secs, pinned_rebase};
 use crate::engine::svn_wc::enumerate_wcs;
-use crate::engine::svn_xml::{parse_update_status, StatusEntry};
+use crate::engine::svn_xml::StatusEntry;
 use crate::error::{GitError, Result};
 use std::path::Path;
 
@@ -288,8 +289,10 @@ pub(crate) fn from_stashed(
     if up.code != 0 {
         return on_update_failed(repo, cfg, j, &up.stderr);
     }
-    let conflicts = svn_conflicts(repo)?;
-    if !conflicts.is_empty() {
+    // 冲突读整个工作副本（不限白名单）。全是 git 不管的文件上的内容 / 属性冲突时不回退：它们不进
+    // 基线，S6–S11 碰不到它们，留给冲突列表（设计 2026-11-28 §2.1）。有一个不能放行就整次回退
+    let conflicts = read_conflicts(repo, cfg, None)?;
+    if conflicts.iter().any(|c| !c.resolvable) {
         return on_update_conflict(repo, cfg, j, &conflicts);
     }
     // S6–S7
@@ -344,7 +347,7 @@ fn on_update_conflict(
     repo: &str,
     cfg: &SvnConfig,
     j: &mut Journal,
-    conflicts: &[String],
+    conflicts: &[SvnConflict],
 ) -> Result<SyncInOutcome> {
     rolled_back(
         repo,
@@ -412,14 +415,16 @@ fn update_failed_error(stderr: &str) -> GitError {
     )
 }
 
-fn update_conflict_error(conflicts: &[String]) -> GitError {
+fn update_conflict_error(conflicts: &[SvnConflict]) -> GitError {
     GitError::new(
         "sync_in_update_conflict",
         format!(
-            "svn update 产生了冲突：\n{}\n这些文件不归 git 管（或者是目录级的树冲突），\
-             本应用没法替你解决，请用 TortoiseSVN 处理。工作副本已经更新到新 revision，\
-             但基线没有推进——处理完冲突后，用「重建基线」把基线跟上。",
-            list_paths(conflicts)
+            "svn update 产生了本应用不能放行的冲突，这次没有更新完。\n\n{}",
+            describe_groups(
+                conflicts,
+                "请用 TortoiseSVN 处理。工作副本已经更新到新 revision，但基线没有推进——\
+                 处理完冲突后，用「重建基线」把基线跟上。",
+            )
         ),
     )
 }
@@ -1141,17 +1146,6 @@ fn s4_counts_as_modified(e: &StatusEntry) -> bool {
         e.item.as_str(),
         "normal" | "unversioned" | "ignored" | "external" | "none"
     ) || e.props == "modified"
-}
-
-/// S5 之后的冲突（计划 A4：`svn update` 有冲突时仍然退出 0）。
-fn svn_conflicts(repo: &str) -> Result<Vec<String>> {
-    let xml = run_svn(repo, &["status", "--xml"])?;
-    Ok(parse_update_status(&xml)?
-        .entries
-        .into_iter()
-        .filter(|e| e.is_conflicted())
-        .map(|e| e.path)
-        .collect())
 }
 
 pub(crate) fn rebase_in_progress(repo: &str) -> Result<bool> {

@@ -1729,6 +1729,17 @@ body {
   font-size: 12px;
 }
 
+/* SVN 冲突列表（设计 2026-11-28-update-conflict-resolve-in-jkk §3.2）：确认与错误挂在那一行里，不再缩进 54px */
+.conflict-file .dlg-warning {
+  margin-left: 0;
+}
+
+.svn-conflict-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
 .follow-more:focus-visible {
   outline: 2px solid #4fc3f7;
   outline-offset: 2px;
