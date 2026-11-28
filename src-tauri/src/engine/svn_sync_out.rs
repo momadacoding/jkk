@@ -1011,6 +1011,7 @@ fn stop_after_commit(repo: &str, cfg: &SvnConfig, j: &Journal) -> Result<SyncOut
             &orig,
             "sync_out_unsafe_to_return",
             "「停止收尾」",
+            &[],
         )?;
     } else {
         // `-f` 会把 HEAD 从这里切走：中断期间在 detached HEAD 上做的提交、切去的别的分支，

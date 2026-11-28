@@ -143,6 +143,15 @@ pub struct SvnNode {
     pub dir: bool,
 }
 
+/// [`Journal::kept_server`] 的一项：路径与服务器内容的 blob，`blob` 为 `None` 表示服务器删掉了它。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeptFile {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob: Option<String>,
+}
+
 /// journal 的全部字段（spec §7.6 的 JSON 样例）。
 ///
 /// `sync_out` 的大部分字段现在就定义：本模块拥有这个文件格式，等 Phase 3 再加
@@ -223,6 +232,13 @@ pub struct Journal {
     /// 在写 journal 之前算好、一起落盘：崩在 rebase 开始之前时，继续要用同一份列表。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rebase_todo: Vec<String>,
+
+    /// 更新的「放弃」已经动手、回原分支后要写回服务器内容的 W-file（2026-11-28 修订计划 A5）。
+    ///
+    /// 内容存成原样字节的 blob（`hash-object -w --no-filters`），不放内存：大的美术文件一次读进来
+    /// 会撑爆内存，崩溃也会丢。非空 = 这次放弃还没走完：「继续」被拒，再点「放弃」接着写回。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept_server: Vec<KeptFile>,
 
     // —— 以下只有 sync_out 用（§7.6 末尾三段）——
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

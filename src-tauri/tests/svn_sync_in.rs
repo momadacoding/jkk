@@ -1556,6 +1556,12 @@ fn an_update_cut_off_by_a_held_file_keeps_the_record_and_continues_after_cleanup
     assert_eq!(phase(&fx), Some(Phase::Stashed));
     assert_eq!(our_stashes(&fx), 1);
 
+    // 没 Clean up 就点「继续」：写锁让 update 立刻失败，记录照样留着、不被当成「基线不对」
+    let err = continue_sync(&fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "sync_in_update_incomplete", "{}", err.message);
+    assert_eq!(read(&fx, "Code/A.cs"), "a2\n");
+    assert_eq!(phase(&fx), Some(Phase::Stashed));
+
     svn_fixtures::svn_cmd(&fx.wc(), &["cleanup", "--non-interactive"]);
     assert_eq!(
         continue_sync(&fx.wc_str()).unwrap(),
@@ -1605,6 +1611,81 @@ fn abort_after_a_half_done_update_that_deleted_a_file_does_not_bring_it_back() {
     assert_eq!(sync(&fx), SyncInOutcome::Done { new_rev: 2 });
     assert!(!fx.wc().join("Code/A.cs").exists());
     assert_eq!(git(&fx, &["status", "--porcelain", "--", "Code/A.cs"]), "");
+}
+
+#[cfg(windows)]
+#[test]
+fn an_abort_stopped_by_a_held_file_finishes_on_the_next_abort() {
+    // 第三轮 review 第 1 条：A.cs 被别的程序以 share=Read 占着，`checkout -f` 写不进去、
+    // 写回服务器内容也写不进去。记录里留着存下的服务器内容：此时「继续」被拒，
+    // 关掉占用的程序后再点「放弃」接着写完，不把那份服务器内容当成来源不明的改动
+    use std::os::windows::fs::OpenOptionsExt;
+    let fx = hybrid_with_colleague();
+    half_updated(&fx, "op-held-abort");
+
+    const FILE_SHARE_READ: u32 = 0x1;
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(fx.wc().join("Code/A.cs"))
+        .unwrap();
+    let first = abort_sync(&fx.wc_str());
+    let refused = continue_sync(&fx.wc_str());
+    drop(held);
+
+    let err = first.unwrap_err();
+    assert!(err.message.contains("Code/A.cs"), "{}", err.message);
+    let j = svn_journal::read(&fx.wc_str()).unwrap().unwrap();
+    assert_eq!(j.kept_server.len(), 1, "服务器内容的清单已落盘");
+    assert_eq!(
+        refused.unwrap_err().code,
+        "sync_in_abort_unfinished",
+        "放弃动了手，只能接着放弃"
+    );
+
+    assert_eq!(abort_sync(&fx.wc_str()).unwrap(), SyncInOutcome::Aborted);
+    assert_eq!(git(&fx, &["symbolic-ref", "--short", "HEAD"]), "work");
+    assert_eq!(read(&fx, "Code/A.cs"), "a2\n");
+    assert_svn_clean(&fx, "Code/A.cs");
+    assert_eq!(read(&fx, "Code/B.cs"), "b-wip\n");
+    assert_eq!(phase(&fx), None);
+}
+
+#[test]
+fn abort_after_a_half_done_update_allows_a_file_my_branch_changed_to_the_same_content() {
+    // 第三轮 review：分支把 A.cs 改成了与服务器一模一样的内容，回原分支写下的就是服务器内容，
+    // 没有要合并的，不能因此卡住放弃
+    let fx = hybrid_with_colleague();
+    write(&fx, "Code/A.cs", "a2\n");
+    commit(&fx, "same as server");
+    fx.colleague_commits("Code/A.cs", "a2\n");
+    write(&fx, "Code/B.cs", "b-wip\n");
+    s3_then_partial_update(&fx, "op-same", "Code/A.cs");
+    assert_eq!(abort_sync(&fx.wc_str()).unwrap(), SyncInOutcome::Aborted);
+    assert_eq!(git(&fx, &["symbolic-ref", "--short", "HEAD"]), "work");
+    assert_eq!(read(&fx, "Code/A.cs"), "a2\n");
+    assert_svn_clean(&fx, "Code/A.cs");
+    assert_eq!(git(&fx, &["status", "--porcelain", "--", "Code/A.cs"]), "");
+}
+
+#[test]
+fn abort_after_a_half_done_update_refuses_an_ignored_server_file_my_branch_force_added() {
+    // 第三轮 review：原分支 `add -f` 跟踪着被忽略的路径，`-f` 同样会盖掉服务器新增的同名文件
+    let fx = hybrid_with_colleague();
+    let exclude = fx.wc().join(".git/info/exclude");
+    let mut ex = std::fs::read_to_string(&exclude).unwrap_or_default();
+    ex.push_str("\nN.cs\n");
+    std::fs::write(&exclude, ex).unwrap();
+    write(&fx, "Code/N.cs", "mine\n");
+    git(&fx, &["add", "-f", "Code/N.cs"]);
+    commit(&fx, "local N");
+    fx.colleague_commits("Code/N.cs", "server\n");
+    s3_then_partial_update(&fx, "op-ignored", "Code/N.cs");
+    assert_eq!(read(&fx, "Code/N.cs"), "server\n");
+
+    let err = abort_sync(&fx.wc_str()).unwrap_err();
+    assert_eq!(err.code, "sync_in_update_incomplete", "{}", err.message);
+    assert_eq!(read(&fx, "Code/N.cs"), "server\n", "没被分支的版本盖掉");
 }
 
 #[test]

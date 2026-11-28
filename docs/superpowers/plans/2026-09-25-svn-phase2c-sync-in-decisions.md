@@ -804,10 +804,15 @@
 ### 为什么这么改是安全的
 
 - 写回服务器内容只针对「原分支与旧基线一字不差」的文件：写回后 git 里多出的差异只有服务器的改动，是一份如实的未提交改动。下次更新时基线跟上，三方合并会把它抵消掉（`abort_after_the_update_keeps_the_server_content_of_files_i_never_touched`、`..._deleted_a_file_does_not_bring_it_back` 钉住）。
-- 写回放在核对残留与放回 WIP 之后，因为服务器内容既不是分支的也不是基线的，先写回会被核对当成来源不明的改动。`checkout -f` 之后任何一步出错也照样写回，否则内容只在栈帧里，就丢了。
-- 已知窗口：内容不落盘（journal 不记文件内容）。如果在 `checkout -f` 与写回之间崩溃，现场就回到修复前的形状。这段窗口只有几步本地 git 操作。
+- 服务器内容**先落盘再 `-f`**（第三轮 review，用户跑的 `/code-review medium`）：先用 `hash-object -w --no-filters --stdin-paths` 原样存进对象库，再把路径 → blob 的清单写进 journal（新字段 `keptServer`）。这样不占内存（大美术文件一次能有几百 MB），也不怕崩溃。在这之后 checkout、核对残留、写回中任何一步出错或进程被杀，再点「放弃」都能接着写回。
+- 写回放在核对残留之后、放回 WIP 之前。核对残留时跳过 `keptServer` 里的路径：它们既不是分支的也不是基线的，不跳过会被当成来源不明的改动，第二次「放弃」就永远过不去。放在放回 WIP 之前，是为了写不成时停在那里，记录和 stash 原样留着，结局不会被吞掉。写回可以重复执行。
+- `keptServer` 非空、且不在 `applying-stash` 时，「继续」被拒（`sync_in_abort_unfinished`），只能接着放弃：往前走等于在半新半旧的现场上重跑 update。
+- 「碰过」不算「改成了与服务器一模一样」的情况（两边都删、改成同样的字节）：回原分支写下的就是服务器内容，没有要合并的。
+- 列服务器新增的同名文件时不带 `--exclude-standard`：原分支 `add -f` 跟踪着被忽略的路径时，`-f` 同样会盖掉。
+- 「继续」（`from_stashed` 的 `fresh = false`）先查工作副本根目录有没有写锁，有就保留记录、提示 Clean up。实测：没 Clean up 时，没换成功的文件在 wc.db 里已经记成新版、磁盘还是旧内容，S4 会把它当成「基线记的内容不对」去回退。
+- 已知窗口：对象库里存下的 blob 没有 ref 指着。放弃停在半路超过 `gc.pruneExpire`（默认两周）、又恰好跑了 `git gc`，blob 会被清掉，写回失败时会指名报出文件。这时在 TortoiseSVN 里对它们点 Revert 就能取回服务器版本。
 - 真实形状：Windows 上用 share=Read 占住一个文件，让 svn update 真的跑到一半失败（带写锁），cleanup 后「继续」走完（`an_update_cut_off_by_a_held_file_...`）。其余用例用「单独 update 一个文件」造出相同的工作副本，只是没有写锁。
-- 旧代码下这些用例都失败：`A.cs` 被写回 `a1`，或 `N.cs` 被分支版本盖掉。
+- 旧代码下这些用例都失败：`A.cs` 被写回 `a1`，或 `N.cs` 被分支版本盖掉。第三轮新增的 4 个用例（被占用文件挡住的放弃、改成同样内容、`add -f` 的忽略文件、没 Clean up 就继续）在上一版代码下也都失败。
 
 ### 没修、留作后续
 
