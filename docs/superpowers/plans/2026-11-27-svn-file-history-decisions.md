@@ -118,13 +118,28 @@
 - **Minor 1 升级处理**：`cat` / `blame` 的缓存键原来没带 uuid，计划写的是带，也没在日志里记。按 AGENTS.md §13 第 12 条，未记录的偏离是阻断，所以照计划补上 uuid。
 - **Minor 8 升级处理**：`readCommitFileDiff` 的 JSDoc 被新函数隔开，挂到了 `readSvnFileHistory` 头上，已挪回。
 - **延后（不在本 PR 修）**：
-  - Minor 2：`svn cat` 缓存按条数不按字节，大文件点几次 diff 会占不少内存。白名单通常只有代码文件，影响有限。
-  - Minor 3：Blame overlay 等待期间没有「正在读取 SVN 出处」提示；查询超时（长历史文件 `svn blame` > 15 秒）也被说成「连不上 SVN」；8 个查询是串行的。
+  - Minor 2：`svn cat` 缓存按条数不按字节，大文件点几次 diff 会占不少内存。白名单通常只有代码文件，影响有限。（后经 ultrareview 第 6 条升级修复）
+  - Minor 3：Blame overlay 等待期间没有「正在读取 SVN 出处」提示；查询超时（长历史文件 `svn blame` > 15 秒）也被说成「连不上 SVN」；8 个查询是串行的。（超时部分后经 ultrareview 第 3、5 条修复）
   - Minor 4：基线删掉了这个文件时（墓碑），那一组的 peg 指向不存在的路径，被当作空段，组内容不全（不会错配）。
   - Minor 5：Local-Only 提交会一直显示「未交付」；白名单外文件也会被打交付标签，与 spec §8 不符。
   - Minor 6：`SvnAnnotator` 在 1000 条历史、长 first-parent 链上的耗时没量过。
   - Minor 7：HEAD 一变 SVN 补全就回到第一页，已翻过的页和选中的 SVN 条目丢失。
   - Minor 9：真实窗口里没单独做 `svn://` 拒绝端口那一项（`file://` 目录改名验了；拒绝端口有 Rust 测试）。
 - **Declined to judge 里的一条留作后续**：用当前工作副本单元的 URL 去配旧基线的 peg，做过 `svn switch` 或改过 external URL 时，旧 peg 可能查不到（被当作 0 条）。这是 spec §5.4 的既定做法，建议另开 issue。
+
+### Ultrareview（2026-11-28，云端多 agent）
+
+共 8 条。按用户实际会遇到的影响重新定级：修 6 条，延后 2 条。每条修复都先写测试并确认 RED，再改到 GREEN。
+
+- **第 1 条已修（首页在途时显示「0 次」）**：`loadSvn(null)` 把游标清成 null，`groupComplete(i, null)` 为真，第一页还没回来（最长 15 秒）时每条基线都显示「0 次 SVN 提交」。现在第一页带起点游标。RTL 用例 `while the first page is in flight every baseline row says loading, not 0 commits`。
+- **第 2 条已修（别的 SVN 库导入的 git-svn commit 被当成基线）**：`baseline_of` 原来只看提交说明能不能解析出记账。现在比对 `svn/base` tip 记账里的 `repos_root` 与 `uuid`，判据与 `svn_init::last_baseline_in_head` 一致；对不上的提交就不算基线，按普通提交标交付状态。没有 `svn/base` 时认不出是哪个库，退回原来「凡是记账都算」。**裁决**：认同一库的依据取 `svn/base` tip，不另跑 `svn info`，因为 `file_history` 不该为标注去碰服务器或工作副本。代价：tip 是别的库时（不应出现）全部基线都不认，只会少标，不会归错。用例 `a_git_svn_commit_from_another_svn_repository_is_not_a_baseline`。
+- **第 3 条已修（长历史文件的 blame 永远映射不上，每次重读都重跑）**：`run_svn_deadline` 的超时单独报 `svn_timeout`。`svn log` / `svn cat` 仍按设计 §7 当作 `svn_unreachable`；`svn blame` 的超时改为 60 秒（取值，未在公司服务器实测），超时后提示「svn blame 等了 60 秒还没算完…」。失败结果在进程内记一段时间，期间 Blame 重读不再去服务器：连不上、认证失败记 60 秒，blame 超时记 10 分钟；路径不存在和 svn 自身报错不记。用例：`a_server_that_never_answers_times_out` 改为断言 `svn_timeout`，加上 `a_log_or_cat_timeout_reads_as_unreachable`、`only_server_side_failures_are_remembered`、`a_remembered_failure_expires`。**没有测到的**：真实的 60 秒 blame 超时，测试要等一分钟，所以只测了记忆与 TTL 的逻辑。
+- **第 4 条已修（`$Id$` 等关键字被当成改动）**：`svn cat` 加了 `--ignore-keywords`。用例 `expanded_keywords_are_not_shown_as_changed`，RED 时多出的一行是 `$Id: K.cs 3 … $`。
+- **第 5 条已修（连不上时 8 个目标挨个等超时）**：一个单元报 `svn_unreachable` 或 `svn_auth` 之后，同一单元剩下的目标直接给同一个失败，不再起 svn。超时不算在内，因为多半只是这一个文件慢。用例 `an_unreachable_unit_is_asked_once_not_once_per_target_and_reload`：假服务器接下连接立刻断开，两个目标重读两次，RED 时被连了 4 次，GREEN 时 1 次。
+- **第 6 条已修（原 Minor 2 升级）**：超过 4 MB 的 `svn cat` 结果不进缓存。用例 `big_contents_are_not_cached`。单次 diff 时内容仍会整份读进内存，没有加大小上限。
+- **延后**：
+  - 第 7 条（同原 Minor 6）：`SvnAnnotator::classify` 对每条历史都做 `graph_descendant_of` 和二分查找，耗时没量过。改成一次 revwalk 建表是可行的优化，但需要先有数据说明它慢。
+  - 第 8 条：`--perf` 记录里，超时被记成 `spawnFailed`，`spawn()` 失败反而不记。只影响诊断数据，不影响用户。
+- 原 Minor 3 里的「超时被说成连不上」已随第 3 条修掉，「没有加载提示」仍然延后。
 
 - **计划没写的坑：** `no_console_window` 守卫测试按文件数 `spawn()`。`run_svn_deadline_bytes` 要能中途结束进程，只能 `spawn()`，已用 `ProcTimer` 手工计时，与 `git_cli` 同一理由加进放行表（`svn_cli.rs` 1 次）。

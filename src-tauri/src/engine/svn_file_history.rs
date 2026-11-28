@@ -10,6 +10,7 @@ use crate::error::{GitError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// 一页最多多少条 SVN 条目，与 TortoiseSVN Show Log 的默认一致（设计 §12）。
 pub const PAGE: usize = 50;
@@ -152,7 +153,8 @@ pub fn assemble(
 #[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SvnFetchError {
-    /// `svn_unreachable` / `svn_auth` / `svn_path_missing` / `svn_cli`（`svn_cli::classify_svn_error`）。
+    /// `svn_unreachable` / `svn_auth` / `svn_path_missing` / `svn_cli`（`svn_cli::classify_svn_error`）；
+    /// Blame 映射另有 `svn_timeout`（`svn blame` 超过 [`SVN_BLAME_TIMEOUT`]）。
     pub code: String,
     pub message: String,
 }
@@ -316,7 +318,7 @@ fn fetch_segment(
     ) {
         Ok(x) => x,
         Err(e) if e.code == "svn_path_missing" => return Ok(Vec::new()),
-        Err(e) => return Err(e),
+        Err(e) => return Err(timeout_as_unreachable(e)),
     };
     let entries = crate::engine::svn_xml::parse_log(&xml)?;
     cache_put(key, CacheVal::Log(entries.clone()));
@@ -386,6 +388,8 @@ fn unit_uuid<'a>(units: &'a [WcIdentity], path: &str) -> &'a str {
     crate::engine::svn_wc::unit_of(units, path).map_or("", |(i, _)| units[i].uuid.as_str())
 }
 
+/// `--ignore-keywords`：不展开 `$Id$` 这类关键字。展开结果每个版本都不同，两侧一比就多出一行
+/// 与这次提交无关的改动，和 `svn diff -c N` 对不上（ultrareview 第 4 条）。
 fn svn_cat(repo: &str, uuid: &str, target: &str, rev: u64) -> Result<Vec<u8>> {
     let key = format!("cat\u{1f}{uuid}\u{1f}{target}\u{1f}{rev}");
     if let Some(CacheVal::Bytes(hit)) = cache_get(&key) {
@@ -394,11 +398,21 @@ fn svn_cat(repo: &str, uuid: &str, target: &str, rev: u64) -> Result<Vec<u8>> {
     let r = rev.to_string();
     let out = crate::engine::svn_cli::run_svn_deadline_bytes(
         repo,
-        &["cat", "-r", &r, "--", target],
+        &["cat", "--ignore-keywords", "-r", &r, "--", target],
         SVN_QUERY_TIMEOUT,
-    )?;
+    )
+    .map_err(timeout_as_unreachable)?;
     cache_put(key, CacheVal::Bytes(out.clone()));
     Ok(out)
+}
+
+/// `svn log` / `svn cat` 15 秒都没回：按设计 §7 当成连不上。只有 blame 的超时另说。
+fn timeout_as_unreachable(e: GitError) -> GitError {
+    if e.code == "svn_timeout" {
+        GitError::new("svn_unreachable", e.message)
+    } else {
+        e
+    }
 }
 
 /// 建一棵只含 `path` 这一个文件的树（逐层建目录），返回根树的 id。
@@ -421,6 +435,11 @@ fn tree_with_file(r: &git2::Repository, path: &str, bytes: &[u8]) -> Result<git2
 
 /// 一次 Blame 最多映射几个 (基线, 路径)（设计 §6.4 的取值）。
 pub const MAX_OVERLAY_TARGETS: usize = 8;
+
+/// `svn blame` 的超时。它要从 r1 起取这个文件的每一个版本，长历史的文件在远端服务器上正常
+/// 就要几十秒，与 `log` / `cat` 共用 15 秒的话这类文件永远映射不上（ultrareview 第 3 条）。
+/// 60 秒是取值，未在公司服务器上实测。
+pub const SVN_BLAME_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Blame 里归到某条基线、某个路径的那些行，要去 SVN 查出处。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -481,14 +500,30 @@ pub fn overlay_with_units(
     check_targets(targets)?;
     let r = git2::Repository::open(repo)?;
     let mut out = Vec::with_capacity(targets.len());
+    // 某个单元连不上 / 认证不过之后，同一单元剩下的目标不再逐个等超时（ultrareview 第 5 条）。
+    // 超时不算：那多半是这一个文件的 blame 慢，别的文件未必
+    let mut down: HashMap<usize, SvnFetchError> = HashMap::new();
     for (i, t) in targets.iter().enumerate() {
         if i >= MAX_OVERLAY_TARGETS {
             out.push(OverlayResult::Skipped);
             continue;
         }
+        let unit = crate::engine::svn_wc::unit_of(units, &t.orig_path).map(|(u, _)| u);
+        if let Some(error) = unit.and_then(|u| down.get(&u)) {
+            out.push(OverlayResult::Failed {
+                error: error.clone(),
+            });
+            continue;
+        }
         out.push(match overlay_one(repo, &r, units, t) {
             Ok(x) => x,
-            Err(e) => OverlayResult::Failed { error: e.into() },
+            Err(e) => {
+                let error: SvnFetchError = e.into();
+                if let (Some(u), "svn_unreachable" | "svn_auth") = (unit, error.code.as_str()) {
+                    down.insert(u, error.clone());
+                }
+                OverlayResult::Failed { error }
+            }
         });
     }
     Ok(out)
@@ -523,11 +558,33 @@ fn overlay_one(
         "blame\u{1f}{}\u{1f}{target}",
         unit_uuid(units, &t.orig_path)
     );
+    // Blame 每次重读（看工作区时每次保存都会）都会再要一遍映射：刚失败过的不再去服务器
+    if let Some(e) = remembered_failure(&key) {
+        return Err(GitError::new(&e.code, e.message));
+    }
     let lines = match cache_get(&key) {
         Some(CacheVal::Blame(hit)) => hit,
         _ => {
-            let xml =
-                run_svn_deadline(repo, &["blame", "--xml", "--", &target], SVN_QUERY_TIMEOUT)?;
+            let xml = run_svn_deadline(
+                repo,
+                &["blame", "--xml", "--", &target],
+                SVN_BLAME_TIMEOUT,
+            )
+            .map_err(|e| {
+                let e = if e.code == "svn_timeout" {
+                    GitError::new(
+                        "svn_timeout",
+                        format!(
+                            "svn blame 等了 {} 秒还没算完（这个文件的 SVN 历史太长），这些行保持基线显示",
+                            SVN_BLAME_TIMEOUT.as_secs()
+                        ),
+                    )
+                } else {
+                    e
+                };
+                remember_failure(key.clone(), &e);
+                e
+            })?;
             let lines = crate::engine::svn_xml::parse_blame(&xml)?;
             cache_put(key, CacheVal::Blame(lines.clone()));
             lines
@@ -560,15 +617,52 @@ fn baseline_line_count(r: &git2::Repository, id: &str, path: &str) -> Result<usi
 // ── 进程内缓存 ─────────────────────────────────────────────────────────────
 //
 // 键里都带着 peg revision，结果不会再变，可以一直留到进程退出；总数设上限（设计 §7）。
+// 失败只记一小会儿（见 [`failure_ttl`]）。
 
 /// 缓存上限（设计 §7 的取值）。
 const CACHE_CAP: usize = 200;
+
+/// 超过这个大小的 `svn cat` 结果不缓存：200 条都是几十 MB 的美术文件时会攥住几个 GB
+/// （ultrareview 第 6 条）。代码文件远小于它，照常缓存。
+const MAX_CACHED_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone)]
 enum CacheVal {
     Log(Vec<SvnLogEntry>),
     Bytes(Vec<u8>),
     Blame(Vec<Option<crate::engine::svn_xml::BlameRevAuthor>>),
+    /// 这个查询刚失败过、失败的时刻。
+    Failed(SvnFetchError, Instant),
+}
+
+/// 哪些失败要记、记多久。只记服务器那边的：连不上、认证不过一分钟内多半还是那样；
+/// blame 超时再跑一遍也还是慢，记十分钟。路径不存在、svn 自己报错不记，下次照常查。
+fn failure_ttl(code: &str) -> Option<Duration> {
+    match code {
+        "svn_unreachable" | "svn_auth" => Some(Duration::from_secs(60)),
+        "svn_timeout" => Some(Duration::from_secs(600)),
+        _ => None,
+    }
+}
+
+fn remember_failure(key: String, e: &GitError) {
+    if failure_ttl(&e.code).is_some() {
+        let err = SvnFetchError {
+            code: e.code.clone(),
+            message: e.message.clone(),
+        };
+        cache_put(key, CacheVal::Failed(err, Instant::now()));
+    }
+}
+
+/// 还没过期的失败。
+fn remembered_failure(key: &str) -> Option<SvnFetchError> {
+    match cache_get(key)? {
+        CacheVal::Failed(e, at) if failure_ttl(&e.code).is_some_and(|ttl| at.elapsed() < ttl) => {
+            Some(e)
+        }
+        _ => None,
+    }
 }
 
 #[derive(Default)]
@@ -592,6 +686,9 @@ fn cache_get(key: &str) -> Option<CacheVal> {
 }
 
 fn cache_put(key: String, val: CacheVal) {
+    if matches!(&val, CacheVal::Bytes(b) if b.len() > MAX_CACHED_BYTES) {
+        return;
+    }
     let Ok(mut c) = cache().lock() else {
         return;
     };
@@ -613,6 +710,55 @@ fn cache_put(key: String, val: CacheVal) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_log_or_cat_timeout_reads_as_unreachable() {
+        let e = timeout_as_unreachable(GitError::new("svn_timeout", "等了 15 秒"));
+        assert_eq!(e.code, "svn_unreachable");
+        let e = timeout_as_unreachable(GitError::new("svn_cli", "x"));
+        assert_eq!(e.code, "svn_cli");
+    }
+
+    #[test]
+    fn only_server_side_failures_are_remembered() {
+        assert!(failure_ttl("svn_unreachable").is_some());
+        assert!(failure_ttl("svn_auth").is_some());
+        // 慢的 blame 再跑一遍也还是慢：记得更久
+        assert!(failure_ttl("svn_timeout") > failure_ttl("svn_unreachable"));
+        assert!(failure_ttl("svn_path_missing").is_none());
+        assert!(failure_ttl("svn_cli").is_none());
+    }
+
+    #[test]
+    fn a_remembered_failure_expires() {
+        let key = "fail-test-expire".to_string();
+        let old = std::time::Instant::now() - Duration::from_secs(3600);
+        cache_put(
+            key.clone(),
+            CacheVal::Failed(
+                SvnFetchError {
+                    code: "svn_unreachable".into(),
+                    message: "x".into(),
+                },
+                old,
+            ),
+        );
+        assert!(remembered_failure(&key).is_none());
+        remember_failure(key.clone(), &GitError::new("svn_unreachable", "y"));
+        assert_eq!(remembered_failure(&key).unwrap().message, "y");
+        // 不是服务器那边的问题不记
+        remember_failure("fail-test-cli".into(), &GitError::new("svn_cli", "z"));
+        assert!(remembered_failure("fail-test-cli").is_none());
+    }
+
+    #[test]
+    fn big_contents_are_not_cached() {
+        let key = "cat-test-big".to_string();
+        cache_put(key.clone(), CacheVal::Bytes(vec![0; MAX_CACHED_BYTES + 1]));
+        assert!(cache_get(&key).is_none());
+        cache_put(key.clone(), CacheVal::Bytes(vec![0; 16]));
+        assert!(cache_get(&key).is_some());
+    }
 
     #[test]
     fn the_cache_evicts_the_least_recently_used() {

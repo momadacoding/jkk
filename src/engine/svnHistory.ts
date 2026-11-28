@@ -31,7 +31,7 @@ export interface SvnRevEntry {
 }
 
 export interface SvnFetchError {
-  /** `svn_unreachable` / `svn_auth` / `svn_path_missing` / `svn_cli` */
+  /** `svn_unreachable` / `svn_auth` / `svn_path_missing` / `svn_cli`；Blame 映射另有 `svn_timeout` */
   code: string
   message: string
 }

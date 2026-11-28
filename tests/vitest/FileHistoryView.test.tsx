@@ -464,6 +464,18 @@ describe('FileHistoryView：混合仓库的 SVN 补全', () => {
     })
   })
 
+  it('while the first page is in flight every baseline row says loading, not 0 commits', async () => {
+    const pending = deferred<unknown>()
+    store.readSvnFileHistory.mockReset().mockReturnValueOnce(pending.promise)
+    mountSvn('history')
+    // 两条基线行各一处
+    expect((await screen.findAllByText('正在读取 SVN 日志…')).length).toBe(2)
+    expect(screen.queryByText('0 次 SVN 提交')).toBeNull()
+    pending.resolve({ groups: { [S]: [svnRev(8, 'gao', '调整打包参数')] }, cursor: null, error: null })
+    expect(await screen.findByText('1 次 SVN 提交')).toBeTruthy()
+    expect(screen.getByText('0 次 SVN 提交')).toBeTruthy()
+  })
+
   it('clicking an svn entry reads its diff with the group peg', async () => {
     mountSvn('history')
     fireEvent.click(await screen.findByText('调整打包参数'))

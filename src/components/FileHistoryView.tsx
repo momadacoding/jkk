@@ -145,7 +145,11 @@ export function FileHistoryView({ repoPath, target, headHash, workdirVersion = n
 
   const loadSvn = useCallback((cursor: Cursor | null) => {
     const token = svnGate.begin()
-    setSvn((s) => (cursor ? { ...s, loading: true, error: null } : { ...NO_SVN, loading: true }))
+    // 第一页也要带上起始游标：游标为空表示「全部查完」，在途时每一组都会显示「0 次 SVN 提交」
+    // （ultrareview 第 1 条）
+    setSvn((s) => (cursor
+      ? { ...s, loading: true, error: null }
+      : { ...NO_SVN, cursor: startCursor(specs), loading: true }))
     readSvnFileHistory(repoPath, specs, hidden, cursor)
       .then((page) => {
         if (!svnGate.isLatest(token)) return

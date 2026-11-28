@@ -123,6 +123,28 @@ fn a_delivered_commit_carries_its_svn_rev() {
 }
 
 #[test]
+fn a_git_svn_commit_from_another_svn_repository_is_not_a_baseline() {
+    // 工作分支历史里可能混着别的 SVN 库导入的 git-svn commit（见 svn_init::last_baseline_in_head）。
+    // 当成基线的话，它的 revision 会拿去查当前服务器，列出无关的人（ultrareview 第 2 条）
+    let fx = hybrid_with_colleague();
+    write(&fx, A, "a1\nold server\n");
+    commit(
+        &fx,
+        "imported\n\ngit-svn-id: https://old.example/svn/proj/trunk@40 \
+         0f0e0d0c-0b0a-0908-0706-050403020100",
+    );
+    let h = history(&fx, A);
+    let imported = h.iter().find(|e| e.subject == "imported").unwrap();
+    let svn = imported.svn.as_ref().unwrap();
+    assert!(svn.baseline.is_none(), "别的 SVN 库的提交不是基线");
+    assert_eq!(svn.delivered, Some(DeliveredState::Undelivered));
+    // 自己的初始化基线照旧是基线
+    assert!(h.last().unwrap().svn.as_ref().unwrap().baseline.is_some());
+    let blame = blame_file(&fx.wc_str(), A, None).unwrap();
+    assert!(blame.commits[&imported.id].baseline.is_none());
+}
+
+#[test]
 fn a_colleague_update_is_a_baseline_not_a_delivery() {
     let fx = hybrid_with_colleague();
     fx.colleague_commits(A, "a1\ncolleague\n");
@@ -510,6 +532,22 @@ fn a_colleague_revision_diff_matches_svn_diff() {
 }
 
 #[test]
+fn expanded_keywords_are_not_shown_as_changed() {
+    // `svn cat` 默认展开 $Id$：每个版本的展开结果都不同，diff 会多出一行与这次提交无关的改动，
+    // 和 `svn diff -c N`、TortoiseSVN 看到的不一致（ultrareview 第 4 条）
+    let fx = hybrid_with_colleague();
+    fx.colleague_commits("Code/K.cs", "$Id$\nk1\n");
+    colleague(&fx, &["propset", "svn:keywords", "Id", "Code/K.cs"]);
+    colleague(&fx, &["commit", "-m", "keywords"]);
+    fx.colleague_commits("Code/K.cs", "$Id$\nk2\n");
+    let n = server_head(&fx);
+    let d =
+        svn_rev_file_diff(&fx.wc_str(), "Code/K.cs", n, n, &DiffViewOptions::default()).unwrap();
+    assert_eq!(lines(&d, '-'), vec!["k1"]);
+    assert_eq!(lines(&d, '+'), vec!["k2"]);
+}
+
+#[test]
 fn the_add_revision_shows_the_whole_file_as_added() {
     let fx = hybrid_with_colleague();
     let d = svn_rev_file_diff(&fx.wc_str(), A, 1, 1, &DiffViewOptions::default()).unwrap();
@@ -682,6 +720,45 @@ fn an_unreachable_server_fails_only_that_target() {
         OverlayResult::Failed { error } => assert_eq!(error.code, "svn_unreachable"),
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn an_unreachable_unit_is_asked_once_not_once_per_target_and_reload() {
+    // 连不上时，同一单元剩下的目标不再逐个等超时；Blame 重读（每次保存都会）也不再去连
+    // （ultrareview 第 3、5 条）。假服务器接下连接就断开，数它被连了几次
+    let fx = hybrid_with_colleague();
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = hits.clone();
+    std::thread::spawn(move || {
+        for c in l.incoming() {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(c);
+        }
+    });
+    let unit = WcIdentity {
+        wc_root: "Code".to_string(),
+        url: format!("svn://127.0.0.1:{port}/x"),
+        repos_root: format!("svn://127.0.0.1:{port}"),
+        wc_root_abspath: None,
+        uuid: format!("drop-{port}"),
+    };
+    let b = blame_file(&fx.wc_str(), A, None).unwrap();
+    let id = b.lines[0].commit.clone();
+    let targets = [target(&id, A, 1), target(&id, "Code/B.cs", 1)];
+    for _ in 0..2 {
+        let r = overlay_with_units(&fx.wc_str(), std::slice::from_ref(&unit), &targets).unwrap();
+        for x in &r {
+            match x {
+                OverlayResult::Failed { error } => {
+                    assert_eq!(error.code, "svn_unreachable", "{}", error.message)
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 // ---------------------------------------------------------------------------

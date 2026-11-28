@@ -84,7 +84,7 @@ fn spawn_svn(path: &str, args: &[&str]) -> Result<String> {
 /// 的 TCP 连接超时（约 21 秒，未实测）短，连不上时用户不必干等系统放弃。
 pub const SVN_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// 同 [`run_svn`]，但最多等 `timeout`，到点结束 svn 进程并报 `svn_unreachable`；非 0 退出时
+/// 同 [`run_svn`]，但最多等 `timeout`，到点结束 svn 进程并报 `svn_timeout`；非 0 退出时
 /// 按 [`classify_svn_error`] 给错误码，message 只留 svn 的那一句错误。
 ///
 /// 不读写扫描缓存、不取预跑结果：它只给只读的服务器查询用，那两样缓存的都是工作副本状态。
@@ -142,8 +142,10 @@ pub fn run_svn_deadline_bytes(path: &str, args: &[&str], timeout: Duration) -> R
                 let e = std::io::Error::new(std::io::ErrorKind::TimedOut, "svn timeout");
                 timer.finish(Err(&e));
             }
+            // 单列一个码，不直接说「连不上」：慢的 `svn blame` 也会走到这里（ultrareview 第 3 条）。
+            // 怎么跟用户说由调用方定
             return Err(GitError::new(
-                "svn_unreachable",
+                "svn_timeout",
                 format!("等了 {} 秒，SVN 服务器没有响应", timeout.as_secs()),
             ));
         }
@@ -862,7 +864,8 @@ mod deadline_tests {
             Duration::from_secs(1),
         )
         .unwrap_err();
-        assert_eq!(e.code, "svn_unreachable", "{}", e.message);
+        // 超时单列一个码：调用方要分得清「服务器不应答」与「这次查询本身太慢」（ultrareview 第 3 条）
+        assert_eq!(e.code, "svn_timeout", "{}", e.message);
         assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
     }
 

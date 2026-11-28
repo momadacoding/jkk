@@ -414,7 +414,12 @@ struct SvnAnnotator {
     tip: Option<git2::Oid>,
     /// `svn/base` first-parent 链上的基线提交，从旧到新，带各自的 `Delivered-Rev`。
     chain: Vec<(git2::Oid, Option<u64>)>,
+    /// 这个混合仓库跟的 SVN 库：`svn/base` tip 记账里的 (repos_root, uuid)。
+    identity: Option<SvnIdentity>,
 }
+
+/// (repos_root, uuid)。
+type SvnIdentity = (String, String);
 
 impl SvnAnnotator {
     fn open(repo: &str) -> Option<Self> {
@@ -426,11 +431,21 @@ impl SvnAnnotator {
                 crate::engine::svn_config::BASELINE_BRANCH
             ))
             .ok();
+        // 工作分支历史里可能混着别的 SVN 库导入的 git-svn commit：只认同一个库的记账，
+        // 与 svn_init::last_baseline_in_head 的判据一致（ultrareview 第 2 条）。
+        // 没有 `svn/base` 时认不出是哪个库，退回「凡是记账都算」
+        let identity = tip
+            .and_then(|t| r.find_commit(t).ok())
+            .and_then(|c| {
+                let msg = std::str::from_utf8(c.message_raw_bytes()).ok()?;
+                crate::engine::svn_basemap::parse_message(msg)
+            })
+            .map(|m| (m.repos_root, m.uuid));
         let mut chain = Vec::new();
         {
             let mut cur = tip.and_then(|t| r.find_commit(t).ok());
             while let Some(c) = cur {
-                if let Some(info) = baseline_of(&c, None) {
+                if let Some(info) = baseline_of(&c, None, identity.as_ref()) {
                     chain.push((c.id(), info.delivered_rev));
                 }
                 cur = c.parent(0).ok();
@@ -441,6 +456,7 @@ impl SvnAnnotator {
             repo: r,
             tip,
             chain,
+            identity,
         })
     }
 
@@ -456,7 +472,7 @@ impl SvnAnnotator {
         else {
             return none;
         };
-        if let Some(info) = baseline_of(&c, path) {
+        if let Some(info) = baseline_of(&c, path, self.identity.as_ref()) {
             return EntrySvn {
                 baseline: Some(info),
                 delivered: None,
@@ -490,9 +506,17 @@ impl SvnAnnotator {
 
 /// 这个提交若是本应用录的基线，给出它的记账。`file_rev` 取 `path` 在这条基线里的 revision
 /// （混合版本基线里各文件不同，不能用 floor）；没给路径时退回 floor。
-fn baseline_of(c: &git2::Commit, path: Option<&str>) -> Option<BaselineInfo> {
+/// `identity` 给了时，记账来自别的 SVN 库就不算基线。
+fn baseline_of(
+    c: &git2::Commit,
+    path: Option<&str>,
+    identity: Option<&SvnIdentity>,
+) -> Option<BaselineInfo> {
     let msg = std::str::from_utf8(c.message_raw_bytes()).ok()?;
     let map = crate::engine::svn_basemap::parse_message(msg)?;
+    if identity.is_some_and(|(root, uuid)| map.repos_root != *root || map.uuid != *uuid) {
+        return None;
+    }
     Some(BaselineInfo {
         file_rev: path.map_or(map.floor, |p| map.rev_of(p)),
         floor: map.floor,
